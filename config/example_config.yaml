@@ -1,0 +1,52 @@
+# Example configuration for federated query engine
+
+datasources:
+  # PostgreSQL data source
+  postgres_prod:
+    type: postgresql
+    host: localhost
+    port: 5432
+    database: analytics
+    user: postgres
+    password: postgres
+    schemas: [public, staging]
+    capabilities:
+      - aggregations
+      - joins
+      - window_functions
+      - subqueries
+      - cte
+
+  # DuckDB data source
+  local_duckdb:
+    type: duckdb
+    path: /data/analytics.duckdb
+    read_only: true
+    capabilities:
+      - aggregations
+      - joins
+      - window_functions
+      - subqueries
+      - cte
+
+# Optimizer configuration
+optimizer:
+  enable_predicate_pushdown: true
+  enable_projection_pushdown: true
+  enable_join_reordering: true
+  enable_decorrelation: true
+  max_join_reorder_size: 10  # Use DP for <= 10 tables, greedy for more
+
+# Executor configuration
+executor:
+  max_memory_mb: 2048        # Maximum memory for hash tables, sorts, etc.
+  batch_size: 10000          # Record batch size
+  max_threads: 8             # Maximum parallel threads
+  enable_parallel_fetch: true # Fetch from multiple sources in parallel
+
+# Cost model parameters
+cost:
+  cpu_tuple_cost: 0.01       # Cost per tuple for CPU operations
+  io_page_cost: 1.0          # Cost per page for I/O
+  network_byte_cost: 0.0001  # Cost per byte transferred over network
+  network_rtt_ms: 10.0       # Network round-trip time in milliseconds

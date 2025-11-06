@@ -1,0 +1,521 @@
+# Federated Query Engine - Implementation Tasks
+
+## Overview
+
+This document breaks down the implementation into phases. Each phase builds on the previous one, aiming for a working end-to-end system early, then adding optimizations and advanced features.
+
+## Phase 0: Foundation (Week 1)
+
+**Goal**: Set up project structure and basic infrastructure
+
+- [x] Create project structure and directories
+- [x] Set up dependencies (sqlglot, psycopg2, duckdb, pyarrow)
+- [x] Create configuration system (YAML-based)
+- [ ] Implement data source catalog
+- [ ] Create basic logging and error handling
+- [ ] Set up testing framework (pytest)
+- [ ] Create development environment (Docker compose with PostgreSQL)
+
+**Deliverable**: Project skeleton with configuration loading
+
+---
+
+## Phase 1: Basic Query Execution (Week 2-3)
+
+**Goal**: Execute simple single-table queries on remote sources
+
+### 1.1 Parser and AST Conversion
+- [ ] Integrate sqlglot parser
+- [ ] Create logical plan node base classes
+- [ ] Implement AST to logical plan converter
+- [ ] Support basic operations: Scan, Project, Filter, Limit
+
+### 1.2 Catalog and Binder
+- [ ] Implement catalog interface
+- [ ] Create schema metadata classes (Table, Column, Type)
+- [ ] Implement binder to resolve table/column references
+- [ ] Add type checking and validation
+- [ ] Support multi-schema (datasource.schema.table)
+
+### 1.3 Data Source Connectors
+- [ ] Create DataSource abstract interface
+- [ ] Implement PostgreSQL connector
+  - [ ] Connection pooling
+  - [ ] Query execution
+  - [ ] Result fetching as Arrow tables
+  - [ ] Metadata discovery (tables, columns, types)
+- [ ] Implement DuckDB connector
+  - [ ] Database connection
+  - [ ] Query execution
+  - [ ] Result fetching as Arrow tables
+  - [ ] Metadata discovery
+
+### 1.4 Basic Executor
+- [ ] Create physical plan node base classes
+- [ ] Implement physical scan operator
+- [ ] Implement iterator-based execution model
+- [ ] Create simple executor (no optimization)
+- [ ] Convert logical plan to physical plan (1:1 mapping)
+
+### 1.5 Testing
+- [ ] Test single-table SELECT queries
+- [ ] Test WHERE clause pushdown
+- [ ] Test column projection
+- [ ] Test LIMIT pushdown
+
+**Deliverable**: Execute `SELECT col1, col2 FROM datasource.table WHERE col1 > 10 LIMIT 100`
+
+---
+
+## Phase 2: Joins and Multi-Table Queries (Week 4-5)
+
+**Goal**: Execute joins across data sources
+
+### 2.1 Logical Plan - Joins
+- [ ] Add Join logical plan node
+- [ ] Support join types (INNER, LEFT, RIGHT, FULL, CROSS)
+- [ ] Parse ON conditions and extract join predicates
+- [ ] Handle multi-way joins
+
+### 2.2 Physical Join Operators
+- [ ] Implement Hash Join
+  - [ ] Build hash table from right side
+  - [ ] Probe with left side
+  - [ ] Handle NULL values correctly
+- [ ] Implement Nested Loop Join (fallback for non-equi joins)
+- [ ] Implement cross-product handling
+
+### 2.3 Data Gathering
+- [ ] Implement Gather operator (fetch remote data)
+- [ ] Handle parallel fetching from multiple sources
+- [ ] Implement streaming for large results
+- [ ] Add memory management (spill to disk if needed)
+
+### 2.4 Join Strategy Selection (Basic)
+- [ ] Detect when join can be pushed to single data source
+- [ ] Implement remote join pushdown
+- [ ] Fetch and join locally when sources differ
+- [ ] Choose join side for hash join (smaller side builds)
+
+### 2.5 Testing
+- [ ] Test joins on same data source (pushdown)
+- [ ] Test joins across different data sources
+- [ ] Test different join types
+- [ ] Test multi-way joins
+- [ ] Verify correctness against ground truth
+
+**Deliverable**: Execute `SELECT * FROM pg.orders o JOIN duck.customers c ON o.customer_id = c.id`
+
+---
+
+## Phase 3: Aggregations and Grouping (Week 6)
+
+**Goal**: Support GROUP BY and aggregation functions
+
+### 3.1 Logical Plan - Aggregations
+- [ ] Add Aggregate logical plan node
+- [ ] Parse GROUP BY clauses
+- [ ] Parse aggregate functions (SUM, COUNT, AVG, MIN, MAX)
+- [ ] Handle HAVING clauses
+
+### 3.2 Physical Aggregate Operators
+- [ ] Implement Hash Aggregate
+- [ ] Support grouping by multiple columns
+- [ ] Implement aggregation functions
+- [ ] Handle NULL values in aggregations
+
+### 3.3 Aggregate Pushdown
+- [ ] Detect when aggregation can be pushed to data source
+- [ ] Implement partial aggregation strategy
+  - [ ] Partial aggregate on each source
+  - [ ] Final aggregate locally
+- [ ] Handle DISTINCT aggregates
+
+### 3.4 Testing
+- [ ] Test simple aggregations (COUNT, SUM, AVG)
+- [ ] Test GROUP BY with multiple columns
+- [ ] Test HAVING clauses
+- [ ] Test aggregation pushdown
+- [ ] Test partial aggregation across sources
+
+**Deliverable**: Execute `SELECT region, COUNT(*), AVG(amount) FROM orders GROUP BY region HAVING COUNT(*) > 100`
+
+---
+
+## Phase 4: Pre-Optimization and Expression Handling (Week 7)
+
+**Goal**: Simplify expressions and perform basic optimizations
+
+### 4.1 Expression System
+- [ ] Create expression node classes
+  - [ ] Literals, Column references
+  - [ ] Binary/Unary operators
+  - [ ] Function calls
+  - [ ] CASE expressions
+- [ ] Implement expression evaluator
+- [ ] Type inference for expressions
+
+### 4.2 Pre-Optimization Rules
+- [ ] Constant folding (`1 + 2` → `3`)
+- [ ] Expression simplification
+  - [ ] `x AND TRUE` → `x`
+  - [ ] `x OR FALSE` → `x`
+  - [ ] `NOT (NOT x)` → `x`
+- [ ] Predicate normalization (CNF conversion)
+- [ ] Null handling simplification
+
+### 4.3 Testing
+- [ ] Test constant folding
+- [ ] Test expression simplification
+- [ ] Test complex WHERE clauses
+
+**Deliverable**: Queries with complex expressions are simplified before execution
+
+---
+
+## Phase 5: Statistics and Cost Model (Week 8)
+
+**Goal**: Implement statistics collection and cost estimation
+
+### 5.1 Statistics Collection
+- [ ] Define statistics schema (TableStats, ColumnStats)
+- [ ] Implement statistics collector
+  - [ ] Row counts
+  - [ ] Column cardinality (NDV)
+  - [ ] Null fractions
+  - [ ] Data size estimation
+- [ ] Statistics caching with TTL
+- [ ] Support for sampling large tables
+
+### 5.2 Cost Model
+- [ ] Define cost model parameters (CPU, IO, Network costs)
+- [ ] Implement cost estimation for each operator
+  - [ ] Scan cost
+  - [ ] Filter cost (with selectivity)
+  - [ ] Join cost (nested loop, hash join)
+  - [ ] Aggregate cost
+- [ ] Implement cardinality estimation
+  - [ ] Filter selectivity estimation
+  - [ ] Join selectivity estimation
+  - [ ] Independence assumption
+
+### 5.3 Selectivity Estimation
+- [ ] Implement selectivity for comparison operators
+  - [ ] Equality: `1 / num_distinct`
+  - [ ] Inequality: heuristic-based
+- [ ] Implement selectivity for AND/OR
+- [ ] Use histograms if available
+
+### 5.4 Testing
+- [ ] Test statistics collection
+- [ ] Verify cost estimation for simple queries
+- [ ] Compare estimated vs actual cardinalities
+
+**Deliverable**: Cost estimates for all query plans
+
+---
+
+## Phase 6: Logical Optimization (Week 9-10)
+
+**Goal**: Implement rule-based logical optimizations
+
+### 6.1 Optimization Framework
+- [ ] Create optimization rule interface
+- [ ] Implement rule application engine
+- [ ] Support multiple optimization passes
+- [ ] Add rule ordering and fixed-point iteration
+
+### 6.2 Predicate Pushdown
+- [ ] Push filters through projections
+- [ ] Push filters below joins
+  - [ ] Handle join conditions correctly
+  - [ ] Preserve semantics for outer joins
+- [ ] Push filters to data sources (remote pushdown)
+- [ ] Split complex predicates (conjunctions)
+
+### 6.3 Projection Pushdown
+- [ ] Column pruning (remove unused columns)
+- [ ] Push projections through filters
+- [ ] Push projections to data sources
+
+### 6.4 Join Reordering
+- [ ] Implement dynamic programming for small join graphs (< 10 tables)
+- [ ] Implement greedy heuristic for large join graphs
+- [ ] Consider selectivity and cardinality
+- [ ] Preserve join semantics (left/right outer joins)
+
+### 6.5 Other Optimizations
+- [ ] Limit pushdown through projections and filters
+- [ ] Redundant join elimination
+- [ ] Common subexpression elimination
+- [ ] Filter merging and simplification
+
+### 6.6 Testing
+- [ ] Test each optimization rule independently
+- [ ] Test combined optimizations
+- [ ] Verify plan correctness after optimization
+- [ ] Benchmark query performance improvement
+
+**Deliverable**: Optimized query plans with significant performance improvements
+
+---
+
+## Phase 7: Decorrelation (Week 11)
+
+**Goal**: Remove correlated subqueries
+
+### 7.1 Subquery Support
+- [ ] Add Subquery logical plan node
+- [ ] Parse scalar subqueries
+- [ ] Parse EXISTS/NOT EXISTS
+- [ ] Parse IN/NOT IN with subqueries
+- [ ] Parse ANY/ALL
+
+### 7.2 Decorrelation Transforms
+- [ ] Detect correlated columns
+- [ ] Transform EXISTS to SEMI JOIN
+- [ ] Transform NOT EXISTS to ANTI JOIN
+- [ ] Transform IN to SEMI JOIN
+- [ ] Convert scalar subqueries to LEFT OUTER JOIN
+- [ ] Handle ANY/ALL with aggregations
+
+### 7.3 Testing
+- [ ] Test correlated subqueries before/after decorrelation
+- [ ] Verify correctness of transformations
+- [ ] Test nested subqueries
+- [ ] Performance comparison
+
+**Deliverable**: Efficient execution of queries with subqueries
+
+---
+
+## Phase 8: Physical Planning and Join Strategies (Week 12-13)
+
+**Goal**: Generate multiple physical plans and choose the best
+
+### 8.1 Physical Plan Generation
+- [ ] Create physical plan generator
+- [ ] Enumerate join strategies for each join
+  - [ ] Hash join (left/right build)
+  - [ ] Nested loop join
+  - [ ] Broadcast join
+- [ ] Enumerate scan strategies
+  - [ ] Remote scan
+  - [ ] Remote scan with filters
+  - [ ] Cached scan
+
+### 8.2 Broadcast Join
+- [ ] Implement broadcast operator
+- [ ] Detect when to use broadcast (small table)
+- [ ] Handle multiple broadcasts efficiently
+- [ ] Memory management for broadcasted data
+
+### 8.3 Remote Pushdown Planning
+- [ ] Detect subplans that can execute on single source
+- [ ] Generate SQL for pushed-down subplans
+- [ ] Handle data source capabilities
+- [ ] Fallback when pushdown not possible
+
+### 8.4 Plan Selection
+- [ ] Estimate cost for each physical plan
+- [ ] Choose minimum cost plan
+- [ ] Implement plan comparison and ranking
+
+### 8.5 Testing
+- [ ] Test physical plan generation
+- [ ] Verify join strategy selection
+- [ ] Test broadcast join with small tables
+- [ ] Benchmark different strategies
+
+**Deliverable**: Best physical plan selected based on cost model
+
+---
+
+## Phase 9: Advanced Execution Features (Week 14)
+
+**Goal**: Improve execution performance
+
+### 9.1 Parallel Execution
+- [ ] Parallel data fetching from multiple sources
+- [ ] Parallel hash join build
+- [ ] Thread pool for execution
+
+### 9.2 Streaming and Pipelining
+- [ ] Implement batched iteration (Arrow record batches)
+- [ ] Pipeline compatible operators
+- [ ] Streaming aggregation where possible
+
+### 9.3 Memory Management
+- [ ] Track memory usage
+- [ ] Implement spill-to-disk for hash join
+- [ ] Implement spill-to-disk for hash aggregate
+- [ ] Configurable memory limits
+
+### 9.4 Testing
+- [ ] Test parallel execution correctness
+- [ ] Test memory limits and spilling
+- [ ] Benchmark parallel vs sequential
+
+**Deliverable**: Efficient parallel execution with memory management
+
+---
+
+## Phase 10: Additional SQL Features (Week 15)
+
+**Goal**: Support more SQL features
+
+### 10.1 Sorting
+- [ ] Add Sort logical/physical plan nodes
+- [ ] Implement sort operator (external sort if needed)
+- [ ] Push ORDER BY to data sources
+- [ ] Combine with LIMIT for Top-N optimization
+
+### 10.2 Set Operations
+- [ ] Support UNION / UNION ALL
+- [ ] Support INTERSECT
+- [ ] Support EXCEPT
+- [ ] Implement as hash-based operators
+
+### 10.3 Window Functions
+- [ ] Parse window functions
+- [ ] Add Window logical/physical plan nodes
+- [ ] Implement window function evaluation
+- [ ] Push to data sources when possible
+
+### 10.4 CTEs (Common Table Expressions)
+- [ ] Parse WITH clauses
+- [ ] Implement CTE evaluation strategies
+  - [ ] Inline small CTEs
+  - [ ] Materialize large CTEs
+- [ ] Handle recursive CTEs (future)
+
+### 10.5 Testing
+- [ ] Test ORDER BY with various expressions
+- [ ] Test set operations
+- [ ] Test window functions
+- [ ] Test CTEs
+
+**Deliverable**: Support for advanced SQL features
+
+---
+
+## Phase 11: Production Readiness (Week 16)
+
+**Goal**: Make the engine production-ready
+
+### 11.1 Error Handling
+- [ ] Comprehensive error messages
+- [ ] Graceful degradation
+- [ ] Connection retry logic
+- [ ] Transaction rollback on errors
+
+### 11.2 Logging and Observability
+- [ ] Structured logging
+- [ ] Query plan logging (EXPLAIN)
+- [ ] Execution statistics
+- [ ] Performance metrics (latency, throughput)
+
+### 11.3 Configuration and Tuning
+- [ ] Expose tuning parameters
+  - [ ] Memory limits
+  - [ ] Parallelism degree
+  - [ ] Cost model parameters
+- [ ] Configuration validation
+- [ ] Environment variable support
+
+### 11.4 Documentation
+- [ ] API documentation
+- [ ] Configuration guide
+- [ ] Query optimization guide
+- [ ] Examples and tutorials
+
+### 11.5 Performance Testing
+- [ ] Create benchmark suite
+- [ ] TPC-H style queries
+- [ ] Measure and optimize hot paths
+- [ ] Profiling and optimization
+
+### 11.6 Testing
+- [ ] Integration tests for all features
+- [ ] Edge case tests
+- [ ] Stress tests
+- [ ] Fuzzing tests
+
+**Deliverable**: Production-ready federated query engine
+
+---
+
+## Phase 12: Advanced Features (Future)
+
+**Goal**: Advanced optimizations and features
+
+### 12.1 Adaptive Query Execution
+- [ ] Collect runtime statistics
+- [ ] Re-optimize during execution
+- [ ] Switch join strategies dynamically
+
+### 12.2 Query Result Caching
+- [ ] Cache small query results
+- [ ] Cache invalidation strategy
+- [ ] Materialized views
+
+### 12.3 More Data Sources
+- [ ] MySQL connector
+- [ ] SQLite connector
+- [ ] REST API connector
+- [ ] CSV/Parquet file connector
+
+### 12.4 Write Operations
+- [ ] INSERT support
+- [ ] UPDATE support
+- [ ] DELETE support
+- [ ] Distributed transactions (2PC)
+
+### 12.5 Advanced Optimizations
+- [ ] Semi-join pushdown (reduce data transfer)
+- [ ] Bloom filter pushdown
+- [ ] Dynamic filter pushdown
+- [ ] Query compilation (LLVM)
+
+---
+
+## Milestones
+
+1. **Milestone 1** (Week 3): Single-table queries work
+2. **Milestone 2** (Week 5): Joins across data sources work
+3. **Milestone 3** (Week 6): Aggregations work
+4. **Milestone 4** (Week 10): Full optimization pipeline
+5. **Milestone 5** (Week 13): Cost-based physical planning
+6. **Milestone 6** (Week 16): Production-ready
+
+---
+
+## Development Principles
+
+1. **Test-Driven**: Write tests before/during implementation
+2. **Incremental**: Each phase should produce working software
+3. **Measurable**: Benchmark performance at each phase
+4. **Correctness First**: Get it right, then make it fast
+5. **Simplicity**: Start simple, add complexity only when needed
+
+---
+
+## Success Metrics
+
+- **Correctness**: 100% of test queries return correct results
+- **Performance**:
+  - Single-table queries: <100ms latency
+  - Join queries: <500ms for typical workloads
+  - Aggregation queries: <1s for typical workloads
+- **Optimization**:
+  - 90%+ of filters pushed down
+  - Optimal join order for <10 table joins
+  - Correct join strategy selection 95%+ of time
+- **Scalability**:
+  - Handle queries with 10+ tables
+  - Handle result sets with 1M+ rows
+  - Support 100+ concurrent queries
+
+---
+
+This task breakdown provides a clear roadmap from basic functionality to a production-ready federated query engine. Each phase builds on the previous one, with clear deliverables and testing requirements.
