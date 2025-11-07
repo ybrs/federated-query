@@ -182,14 +182,11 @@ class DataSource(ABC):
         """Ensure data source is connected.
 
         Raises:
-            RuntimeError: If connection cannot be established
+            ConnectionError: If connection cannot be established
         """
         if not self.is_connected():
-            try:
-                self.connect()
-                self._connected = True
-            except Exception as e:
-                raise RuntimeError(f"Failed to connect to {self.name}: {e}") from e
+            self.connect()
+            self._connected = True
 
     def __enter__(self):
         """Context manager entry."""
