@@ -74,6 +74,8 @@ class DataSource(ABC):
         """
         self.name = name
         self.config = config
+        self.connection = None
+        self._connected = False
 
     @abstractmethod
     def connect(self) -> None:
@@ -167,6 +169,38 @@ class DataSource(ABC):
             True if supported, False otherwise
         """
         return capability in self.get_capabilities()
+
+    def is_connected(self) -> bool:
+        """Check if data source is connected.
+
+        Returns:
+            True if connected, False otherwise
+        """
+        return self._connected
+
+    def ensure_connected(self) -> None:
+        """Ensure data source is connected.
+
+        Raises:
+            RuntimeError: If connection cannot be established
+        """
+        if not self.is_connected():
+            try:
+                self.connect()
+                self._connected = True
+            except Exception as e:
+                raise RuntimeError(f"Failed to connect to {self.name}: {e}") from e
+
+    def __enter__(self):
+        """Context manager entry."""
+        self.ensure_connected()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
+        self.disconnect()
+        self._connected = False
+        return False
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(name={self.name})"
