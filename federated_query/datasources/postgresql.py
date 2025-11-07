@@ -67,15 +67,11 @@ class PostgreSQLDataSource(DataSource):
     def disconnect(self) -> None:
         """Close all connections in the pool."""
         if self._pool:
-            try:
-                self._pool.closeall()
-                logger.info(f"Disconnected from PostgreSQL: {self.name}")
-            except Exception as e:
-                logger.warning(f"Error closing PostgreSQL connection pool: {e}")
-            finally:
-                self._pool = None
-                self.connection = None
-                self._connected = False
+            self._pool.closeall()
+            logger.info(f"Disconnected from PostgreSQL: {self.name}")
+            self._pool = None
+            self.connection = None
+            self._connected = False
 
     def _get_connection(self):
         """Get a connection from the pool."""
@@ -119,7 +115,11 @@ class PostgreSQLDataSource(DataSource):
                     """,
                     (schema,),
                 )
-                return [row[0] for row in cursor.fetchall()]
+                rows = cursor.fetchall()
+                tables = []
+                for row in rows:
+                    tables.append(row[0])
+                return tables
         except psycopg2.Error as e:
             logger.error(f"Error listing tables in schema {schema}: {e}")
             raise
@@ -214,7 +214,7 @@ class PostgreSQLDataSource(DataSource):
                     total_size_bytes=row_count * 100,  # Rough estimate
                     column_stats=column_stats,
                 )
-        except Exception as e:
+        except psycopg2.Error as e:
             logger.warning(f"Could not get statistics for {schema}.{table}: {e}")
             return None
         finally:
@@ -228,23 +228,15 @@ class PostgreSQLDataSource(DataSource):
                 logger.debug(f"Executing query on {self.name}: {query[:100]}...")
                 cursor.execute(query)
 
-                # Get column names
-                columns = [desc[0] for desc in cursor.description]
+                columns = self._extract_column_names(cursor.description)
 
-                # Fetch in batches
                 batch_size = 10000
                 while True:
                     rows = cursor.fetchmany(batch_size)
                     if not rows:
                         break
 
-                    # Convert to Arrow
-                    # TODO: Proper type mapping
-                    data = {col: [] for col in columns}
-                    for row in rows:
-                        for i, col in enumerate(columns):
-                            data[col].append(row[i])
-
+                    data = self._build_column_data(columns, rows)
                     batch = pa.RecordBatch.from_pydict(data)
                     yield batch
         except psycopg2.Error as e:
@@ -257,16 +249,39 @@ class PostgreSQLDataSource(DataSource):
         """Get query schema without executing."""
         conn = self._get_connection()
         try:
-            # Use LIMIT 0 to get schema without data
             with conn.cursor() as cursor:
                 cursor.execute(f"SELECT * FROM ({query}) AS q LIMIT 0")
-                columns = [desc[0] for desc in cursor.description]
-
-                # TODO: Proper type mapping from PostgreSQL to Arrow
-                fields = [pa.field(col, pa.string()) for col in columns]
+                columns = self._extract_column_names(cursor.description)
+                fields = self._build_arrow_fields(columns)
                 return pa.schema(fields)
         except psycopg2.Error as e:
             logger.error(f"Failed to get query schema: {e}")
             raise
         finally:
             self._return_connection(conn)
+
+    def _extract_column_names(self, description) -> List[str]:
+        """Extract column names from cursor description."""
+        columns = []
+        for desc in description:
+            columns.append(desc[0])
+        return columns
+
+    def _build_arrow_fields(self, columns: List[str]) -> List[pa.Field]:
+        """Build Arrow fields from column names."""
+        fields = []
+        for col in columns:
+            fields.append(pa.field(col, pa.string()))
+        return fields
+
+    def _build_column_data(self, columns: List[str], rows: List) -> Dict[str, List]:
+        """Build column data dictionary from rows."""
+        data = {}
+        for col in columns:
+            data[col] = []
+
+        for row in rows:
+            for i, col in enumerate(columns):
+                data[col].append(row[i])
+
+        return data

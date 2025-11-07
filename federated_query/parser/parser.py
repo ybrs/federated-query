@@ -22,11 +22,8 @@ class Parser:
         Returns:
             sqlglot expression tree
         """
-        try:
-            parsed = sqlglot.parse_one(sql, dialect=self.dialect)
-            return parsed
-        except Exception as e:
-            raise ValueError(f"Failed to parse SQL: {e}")
+        parsed = sqlglot.parse_one(sql, dialect=self.dialect)
+        return parsed
 
     def ast_to_logical_plan(self, ast: exp.Expression) -> LogicalPlanNode:
         """Convert sqlglot AST to logical plan.
