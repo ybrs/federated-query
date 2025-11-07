@@ -45,6 +45,11 @@ htmlcov/
 *.db
 *.duckdb
 *.sqlite
+data/
+
+# Logs
+*.log
+logs/
 
 # Configuration (exclude sensitive configs)
 config.yaml

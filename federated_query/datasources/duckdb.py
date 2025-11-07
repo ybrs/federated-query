@@ -3,6 +3,7 @@
 from typing import List, Dict, Any, Iterator, Optional
 import pyarrow as pa
 import duckdb
+import logging
 
 from .base import (
     DataSource,
@@ -12,6 +13,8 @@ from .base import (
     TableStatistics,
     ColumnStatistics,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class DuckDBDataSource(DataSource):
@@ -31,13 +34,26 @@ class DuckDBDataSource(DataSource):
 
     def connect(self) -> None:
         """Establish connection to DuckDB."""
-        self.connection = duckdb.connect(self.db_path, read_only=self.read_only)
+        try:
+            logger.info(f"Connecting to DuckDB at '{self.db_path}'")
+            self.connection = duckdb.connect(self.db_path, read_only=self.read_only)
+            self._connected = True
+            logger.info(f"Successfully connected to DuckDB: {self.name}")
+        except Exception as e:
+            logger.error(f"Failed to connect to DuckDB {self.name}: {e}")
+            raise ConnectionError(f"DuckDB connection failed: {e}") from e
 
     def disconnect(self) -> None:
         """Close DuckDB connection."""
         if self.connection:
-            self.connection.close()
-            self.connection = None
+            try:
+                self.connection.close()
+                logger.info(f"Disconnected from DuckDB: {self.name}")
+            except Exception as e:
+                logger.warning(f"Error closing DuckDB connection: {e}")
+            finally:
+                self.connection = None
+                self._connected = False
 
     def get_capabilities(self) -> List[DataSourceCapability]:
         """DuckDB supports most SQL features."""
@@ -54,50 +70,62 @@ class DuckDBDataSource(DataSource):
 
     def list_schemas(self) -> List[str]:
         """List available schemas."""
-        result = self.connection.execute(
-            "SELECT schema_name FROM information_schema.schemata"
-        ).fetchall()
-        return [row[0] for row in result]
+        try:
+            result = self.connection.execute(
+                "SELECT schema_name FROM information_schema.schemata"
+            ).fetchall()
+            return [row[0] for row in result]
+        except Exception as e:
+            logger.error(f"Error listing schemas: {e}")
+            raise
 
     def list_tables(self, schema: str) -> List[str]:
         """List tables in a schema."""
-        result = self.connection.execute(
-            """
-            SELECT table_name
-            FROM information_schema.tables
-            WHERE table_schema = ? AND table_type = 'BASE TABLE'
-            ORDER BY table_name
-            """,
-            [schema],
-        ).fetchall()
-        return [row[0] for row in result]
+        try:
+            result = self.connection.execute(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = ? AND table_type = 'BASE TABLE'
+                ORDER BY table_name
+                """,
+                [schema],
+            ).fetchall()
+            return [row[0] for row in result]
+        except Exception as e:
+            logger.error(f"Error listing tables in schema {schema}: {e}")
+            raise
 
     def get_table_metadata(self, schema: str, table: str) -> TableMetadata:
         """Get table metadata."""
-        result = self.connection.execute(
-            """
-            SELECT
-                column_name,
-                data_type,
-                is_nullable
-            FROM information_schema.columns
-            WHERE table_schema = ? AND table_name = ?
-            ORDER BY ordinal_position
-            """,
-            [schema, table],
-        ).fetchall()
+        try:
+            result = self.connection.execute(
+                """
+                SELECT
+                    column_name,
+                    data_type,
+                    is_nullable
+                FROM information_schema.columns
+                WHERE table_schema = ? AND table_name = ?
+                ORDER BY ordinal_position
+                """,
+                [schema, table],
+            ).fetchall()
 
-        columns = []
-        for row in result:
-            columns.append(
-                ColumnMetadata(
-                    name=row[0],
-                    data_type=row[1],
-                    nullable=row[2] == "YES",
+            columns = []
+            for row in result:
+                columns.append(
+                    ColumnMetadata(
+                        name=row[0],
+                        data_type=row[1],
+                        nullable=row[2] == "YES",
+                    )
                 )
-            )
 
-        return TableMetadata(schema_name=schema, table_name=table, columns=columns)
+            return TableMetadata(schema_name=schema, table_name=table, columns=columns)
+        except Exception as e:
+            logger.error(f"Error getting metadata for {schema}.{table}: {e}")
+            raise
 
     def get_table_statistics(
         self, schema: str, table: str
@@ -139,33 +167,43 @@ class DuckDBDataSource(DataSource):
                 total_size_bytes=row_count * 100,  # Rough estimate
                 column_stats=column_stats,
             )
-
         except Exception as e:
+            logger.warning(f"Could not get statistics for {schema}.{table}: {e}")
             return None
 
     def execute_query(self, query: str) -> Iterator[pa.RecordBatch]:
         """Execute query and yield Arrow record batches."""
-        # DuckDB has excellent Arrow support
-        result = self.connection.execute(query)
+        try:
+            logger.debug(f"Executing query on {self.name}: {query[:100]}...")
+            # DuckDB has excellent Arrow support
+            result = self.connection.execute(query)
 
-        # Fetch in batches
-        while True:
-            batch = result.fetch_record_batch(rows_per_batch=10000)
-            if batch is None or len(batch) == 0:
-                break
-            yield batch
+            # Fetch Arrow table and convert to batches
+            arrow_table = result.fetch_arrow_table()
+
+            # Convert table to batches
+            batch_size = 10000
+            for batch in arrow_table.to_batches(max_chunksize=batch_size):
+                yield batch
+        except Exception as e:
+            logger.error(f"Query execution failed on {self.name}: {e}")
+            raise
 
     def get_query_schema(self, query: str) -> pa.Schema:
         """Get query schema without executing."""
-        # DuckDB can describe queries
-        result = self.connection.execute(f"DESCRIBE {query}")
-        rows = result.fetchall()
+        try:
+            # DuckDB can describe queries
+            result = self.connection.execute(f"DESCRIBE {query}")
+            rows = result.fetchall()
 
-        fields = []
-        for row in rows:
-            col_name = row[0]
-            col_type = row[1]
-            # TODO: Proper type mapping from DuckDB to Arrow
-            fields.append(pa.field(col_name, pa.string()))
+            fields = []
+            for row in rows:
+                col_name = row[0]
+                col_type = row[1]
+                # TODO: Proper type mapping from DuckDB to Arrow
+                fields.append(pa.field(col_name, pa.string()))
 
-        return pa.schema(fields)
+            return pa.schema(fields)
+        except Exception as e:
+            logger.error(f"Failed to get query schema: {e}")
+            raise

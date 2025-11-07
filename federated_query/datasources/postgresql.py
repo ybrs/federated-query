@@ -3,7 +3,9 @@
 from typing import List, Dict, Any, Iterator, Optional
 import pyarrow as pa
 import psycopg2
+from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
+import logging
 
 from .base import (
     DataSource,
@@ -14,9 +16,11 @@ from .base import (
     ColumnStatistics,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class PostgreSQLDataSource(DataSource):
-    """PostgreSQL data source connector."""
+    """PostgreSQL data source connector with connection pooling."""
 
     def __init__(self, name: str, config: Dict[str, Any]):
         """Initialize PostgreSQL data source.
@@ -28,26 +32,61 @@ class PostgreSQLDataSource(DataSource):
             - user: Username
             - password: Password
             - schemas: List of schemas to include (optional)
+            - min_connections: Minimum connections in pool (default: 1)
+            - max_connections: Maximum connections in pool (default: 5)
         """
         super().__init__(name, config)
-        self.connection = None
         self.schemas = config.get("schemas", ["public"])
+        self._pool = None
+        self._min_connections = config.get("min_connections", 1)
+        self._max_connections = config.get("max_connections", 5)
 
     def connect(self) -> None:
-        """Establish connection to PostgreSQL."""
-        self.connection = psycopg2.connect(
-            host=self.config["host"],
-            port=self.config.get("port", 5432),
-            database=self.config["database"],
-            user=self.config["user"],
-            password=self.config["password"],
-        )
+        """Establish connection pool to PostgreSQL."""
+        try:
+            logger.info(f"Connecting to PostgreSQL database '{self.config['database']}' at {self.config['host']}")
+            self._pool = pool.ThreadedConnectionPool(
+                self._min_connections,
+                self._max_connections,
+                host=self.config["host"],
+                port=self.config.get("port", 5432),
+                database=self.config["database"],
+                user=self.config["user"],
+                password=self.config["password"],
+            )
+            # Get a test connection to verify it works
+            conn = self._pool.getconn()
+            self._pool.putconn(conn)
+            self.connection = conn  # Store for compatibility
+            self._connected = True
+            logger.info(f"Successfully connected to PostgreSQL: {self.name}")
+        except psycopg2.Error as e:
+            logger.error(f"Failed to connect to PostgreSQL {self.name}: {e}")
+            raise ConnectionError(f"PostgreSQL connection failed: {e}") from e
 
     def disconnect(self) -> None:
-        """Close PostgreSQL connection."""
-        if self.connection:
-            self.connection.close()
-            self.connection = None
+        """Close all connections in the pool."""
+        if self._pool:
+            try:
+                self._pool.closeall()
+                logger.info(f"Disconnected from PostgreSQL: {self.name}")
+            except Exception as e:
+                logger.warning(f"Error closing PostgreSQL connection pool: {e}")
+            finally:
+                self._pool = None
+                self.connection = None
+                self._connected = False
+
+    def _get_connection(self):
+        """Get a connection from the pool."""
+        if not self._pool:
+            raise RuntimeError(f"Not connected to {self.name}")
+        return self._pool.getconn()
+
+    def _return_connection(self, conn):
+        """Return a connection to the pool."""
+        if self._pool:
+            self._pool.putconn(conn)
 
     def get_capabilities(self) -> List[DataSourceCapability]:
         """PostgreSQL supports most SQL features."""
@@ -68,56 +107,71 @@ class PostgreSQLDataSource(DataSource):
 
     def list_tables(self, schema: str) -> List[str]:
         """List tables in a schema."""
-        with self.connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT table_name
-                FROM information_schema.tables
-                WHERE table_schema = %s AND table_type = 'BASE TABLE'
-                ORDER BY table_name
-                """,
-                (schema,),
-            )
-            return [row[0] for row in cursor.fetchall()]
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = %s AND table_type = 'BASE TABLE'
+                    ORDER BY table_name
+                    """,
+                    (schema,),
+                )
+                return [row[0] for row in cursor.fetchall()]
+        except psycopg2.Error as e:
+            logger.error(f"Error listing tables in schema {schema}: {e}")
+            raise
+        finally:
+            self._return_connection(conn)
 
     def get_table_metadata(self, schema: str, table: str) -> TableMetadata:
         """Get table metadata from information_schema."""
-        with self.connection.cursor(cursor_factory=RealDictCursor) as cursor:
-            # Get columns
-            cursor.execute(
-                """
-                SELECT
-                    column_name,
-                    data_type,
-                    is_nullable,
-                    column_default
-                FROM information_schema.columns
-                WHERE table_schema = %s AND table_name = %s
-                ORDER BY ordinal_position
-                """,
-                (schema, table),
-            )
-
-            columns = []
-            for row in cursor.fetchall():
-                columns.append(
-                    ColumnMetadata(
-                        name=row["column_name"],
-                        data_type=row["data_type"],
-                        nullable=row["is_nullable"] == "YES",
-                    )
+        conn = self._get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                # Get columns
+                cursor.execute(
+                    """
+                    SELECT
+                        column_name,
+                        data_type,
+                        is_nullable,
+                        column_default
+                    FROM information_schema.columns
+                    WHERE table_schema = %s AND table_name = %s
+                    ORDER BY ordinal_position
+                    """,
+                    (schema, table),
                 )
 
-            return TableMetadata(
-                schema_name=schema, table_name=table, columns=columns
-            )
+                columns = []
+                for row in cursor.fetchall():
+                    columns.append(
+                        ColumnMetadata(
+                            name=row["column_name"],
+                            data_type=row["data_type"],
+                            nullable=row["is_nullable"] == "YES",
+                        )
+                    )
+
+                return TableMetadata(
+                    schema_name=schema, table_name=table, columns=columns
+                )
+        except psycopg2.Error as e:
+            logger.error(f"Error getting metadata for {schema}.{table}: {e}")
+            raise
+        finally:
+            self._return_connection(conn)
 
     def get_table_statistics(
         self, schema: str, table: str
     ) -> Optional[TableStatistics]:
         """Get table statistics from pg_stats."""
+        conn = self._get_connection()
         try:
-            with self.connection.cursor(cursor_factory=RealDictCursor) as cursor:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 # Get row count
                 cursor.execute(
                     f"SELECT reltuples::bigint as row_count FROM pg_class WHERE relname = %s",
@@ -160,45 +214,59 @@ class PostgreSQLDataSource(DataSource):
                     total_size_bytes=row_count * 100,  # Rough estimate
                     column_stats=column_stats,
                 )
-
         except Exception as e:
-            # Statistics may not be available
+            logger.warning(f"Could not get statistics for {schema}.{table}: {e}")
             return None
+        finally:
+            self._return_connection(conn)
 
     def execute_query(self, query: str) -> Iterator[pa.RecordBatch]:
         """Execute query and yield Arrow record batches."""
-        # TODO: Implement streaming with Arrow
-        # For now, fetch all and convert
-        with self.connection.cursor() as cursor:
-            cursor.execute(query)
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                logger.debug(f"Executing query on {self.name}: {query[:100]}...")
+                cursor.execute(query)
 
-            # Get column names
-            columns = [desc[0] for desc in cursor.description]
+                # Get column names
+                columns = [desc[0] for desc in cursor.description]
 
-            # Fetch in batches
-            batch_size = 10000
-            while True:
-                rows = cursor.fetchmany(batch_size)
-                if not rows:
-                    break
+                # Fetch in batches
+                batch_size = 10000
+                while True:
+                    rows = cursor.fetchmany(batch_size)
+                    if not rows:
+                        break
 
-                # Convert to Arrow
-                # TODO: Proper type mapping
-                data = {col: [] for col in columns}
-                for row in rows:
-                    for i, col in enumerate(columns):
-                        data[col].append(row[i])
+                    # Convert to Arrow
+                    # TODO: Proper type mapping
+                    data = {col: [] for col in columns}
+                    for row in rows:
+                        for i, col in enumerate(columns):
+                            data[col].append(row[i])
 
-                batch = pa.RecordBatch.from_pydict(data)
-                yield batch
+                    batch = pa.RecordBatch.from_pydict(data)
+                    yield batch
+        except psycopg2.Error as e:
+            logger.error(f"Query execution failed on {self.name}: {e}")
+            raise
+        finally:
+            self._return_connection(conn)
 
     def get_query_schema(self, query: str) -> pa.Schema:
         """Get query schema without executing."""
-        # Use LIMIT 0 to get schema without data
-        with self.connection.cursor() as cursor:
-            cursor.execute(f"SELECT * FROM ({query}) AS q LIMIT 0")
-            columns = [desc[0] for desc in cursor.description]
+        conn = self._get_connection()
+        try:
+            # Use LIMIT 0 to get schema without data
+            with conn.cursor() as cursor:
+                cursor.execute(f"SELECT * FROM ({query}) AS q LIMIT 0")
+                columns = [desc[0] for desc in cursor.description]
 
-            # TODO: Proper type mapping from PostgreSQL to Arrow
-            fields = [pa.field(col, pa.string()) for col in columns]
-            return pa.schema(fields)
+                # TODO: Proper type mapping from PostgreSQL to Arrow
+                fields = [pa.field(col, pa.string()) for col in columns]
+                return pa.schema(fields)
+        except psycopg2.Error as e:
+            logger.error(f"Failed to get query schema: {e}")
+            raise
+        finally:
+            self._return_connection(conn)
