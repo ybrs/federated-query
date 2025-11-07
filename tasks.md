@@ -4,66 +4,108 @@
 
 This document breaks down the implementation into phases. Each phase builds on the previous one, aiming for a working end-to-end system early, then adding optimizations and advanced features.
 
-## Phase 0: Foundation (Week 1)
+## Phase 0: Foundation ✅ COMPLETED
 
 **Goal**: Set up project structure and basic infrastructure
 
 - [x] Create project structure and directories
 - [x] Set up dependencies (sqlglot, psycopg2, duckdb, pyarrow)
 - [x] Create configuration system (YAML-based)
-- [ ] Implement data source catalog
-- [ ] Create basic logging and error handling
-- [ ] Set up testing framework (pytest)
-- [ ] Create development environment (Docker compose with PostgreSQL)
+- [x] Implement data source catalog
+- [x] Create basic logging and error handling
+- [x] Set up testing framework (pytest)
+- [x] Create development environment (Docker compose with PostgreSQL)
 
-**Deliverable**: Project skeleton with configuration loading
+**Deliverable**: ✅ Project skeleton with configuration loading
+
+**Notes**:
+- All 50 tests passing
+- PostgreSQL and DuckDB connectors fully implemented with connection pooling
+- Catalog supports metadata discovery and table resolution
+- Structured logging with JSON formatter available
+- Skeleton classes created for parser, binder, executor, and plan nodes
 
 ---
 
-## Phase 1: Basic Query Execution (Week 2-3)
+## Phase 1: Basic Query Execution 🔄 IN PROGRESS
 
 **Goal**: Execute simple single-table queries on remote sources
 
+**Status**: Starting implementation
+
+**Implementation Plan**:
+
+We'll implement Phase 1 in careful steps, ensuring each piece works before moving to the next.
+The goal is to execute: `SELECT col1, col2 FROM datasource.table WHERE col1 > 10 LIMIT 100`
+
+**Order of Implementation**:
+1. First, implement AST to logical plan conversion for simple queries
+2. Then, implement the binder to resolve references
+3. Next, implement physical plan nodes with execute() methods
+4. Finally, wire everything together with the executor
+
 ### 1.1 Parser and AST Conversion
-- [ ] Integrate sqlglot parser
-- [ ] Create logical plan node base classes
-- [ ] Implement AST to logical plan converter
-- [ ] Support basic operations: Scan, Project, Filter, Limit
+- [x] Integrate sqlglot parser (already done - can parse SQL to AST)
+- [x] Create logical plan node base classes (already done - Scan, Project, Filter, Limit exist)
+- [ ] Implement AST to logical plan converter (parser.py:ast_to_logical_plan)
+  - [ ] Handle SELECT statements
+  - [ ] Handle FROM clauses (create Scan nodes)
+  - [ ] Handle WHERE clauses (create Filter nodes)
+  - [ ] Handle column selections (create Project nodes)
+  - [ ] Handle LIMIT clauses
+- [ ] Test parser with various simple queries
 
 ### 1.2 Catalog and Binder
-- [ ] Implement catalog interface
-- [ ] Create schema metadata classes (Table, Column, Type)
-- [ ] Implement binder to resolve table/column references
-- [ ] Add type checking and validation
-- [ ] Support multi-schema (datasource.schema.table)
+- [x] Implement catalog interface (already done - Catalog class works)
+- [x] Create schema metadata classes (already done - Table, Column, Type)
+- [ ] Implement binder to resolve table/column references (binder.py:bind)
+  - [ ] Resolve table references using catalog
+  - [ ] Resolve column references
+  - [ ] Validate column existence
+  - [ ] Add data type information to expressions
+- [x] Support multi-schema (datasource.schema.table) (already done in catalog)
+- [ ] Test binding with various table/column references
 
 ### 1.3 Data Source Connectors
-- [ ] Create DataSource abstract interface
-- [ ] Implement PostgreSQL connector
-  - [ ] Connection pooling
-  - [ ] Query execution
-  - [ ] Result fetching as Arrow tables
-  - [ ] Metadata discovery (tables, columns, types)
-- [ ] Implement DuckDB connector
-  - [ ] Database connection
-  - [ ] Query execution
-  - [ ] Result fetching as Arrow tables
-  - [ ] Metadata discovery
+- [x] Create DataSource abstract interface (already done)
+- [x] Implement PostgreSQL connector (already done)
+  - [x] Connection pooling
+  - [x] Query execution
+  - [x] Result fetching as Arrow tables
+  - [x] Metadata discovery (tables, columns, types)
+- [x] Implement DuckDB connector (already done)
+  - [x] Database connection
+  - [x] Query execution
+  - [x] Result fetching as Arrow tables
+  - [x] Metadata discovery
 
 ### 1.4 Basic Executor
-- [ ] Create physical plan node base classes
-- [ ] Implement physical scan operator
-- [ ] Implement iterator-based execution model
-- [ ] Create simple executor (no optimization)
-- [ ] Convert logical plan to physical plan (1:1 mapping)
+- [x] Create physical plan node base classes (already done in physical.py)
+- [ ] Implement physical scan operator (PhysicalScan.execute())
+  - [ ] Generate SQL from scan parameters
+  - [ ] Execute on remote data source
+  - [ ] Stream results as Arrow batches
+- [ ] Implement physical filter operator (PhysicalFilter.execute())
+  - [ ] Evaluate filter expressions locally (for non-pushed filters)
+  - [ ] Filter Arrow batches
+- [ ] Implement physical project operator (PhysicalProject.execute())
+  - [ ] Project/select columns from input batches
+  - [ ] Evaluate expressions
+- [ ] Implement physical limit operator (PhysicalLimit.execute())
+  - [ ] Limit output rows
+- [ ] Create simple physical planner (logical to physical, 1:1 mapping)
+- [x] Executor infrastructure (already done - just calls plan.execute())
 
 ### 1.5 Testing
 - [ ] Test single-table SELECT queries
 - [ ] Test WHERE clause pushdown
 - [ ] Test column projection
 - [ ] Test LIMIT pushdown
+- [ ] Test end-to-end: SQL -> logical plan -> physical plan -> execution -> results
 
 **Deliverable**: Execute `SELECT col1, col2 FROM datasource.table WHERE col1 > 10 LIMIT 100`
+
+**Current Blockers**: None - ready to start implementation
 
 ---
 
