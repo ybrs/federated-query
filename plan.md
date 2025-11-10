@@ -4,6 +4,18 @@
 
 This is a production-grade federated query engine that executes SQL queries across multiple heterogeneous data sources (PostgreSQL, DuckDB) in an optimal way. The engine parses SQL, optimizes execution plans, and coordinates data movement to minimize latency and network transfer.
 
+## Implementation Status
+
+**Current Implementation State**: Phase 2 Complete, Phase 3 Starting
+
+- ✅ **Phase 0**: Foundation - Project structure, configuration, catalog, data sources
+- ✅ **Phase 1**: Basic Query Execution - Single-table SELECT queries with filters and limits
+- ✅ **Phase 2**: Joins - Multi-table queries with hash joins and nested loop joins
+- 🚧 **Phase 3**: Aggregations - GROUP BY and aggregate functions (IN PROGRESS)
+- ⏳ **Future Phases**: Optimization, cost-based planning, decorrelation, advanced features
+
+**Test Status**: 70 tests passing
+
 ## Goals
 
 1. **Performance**: Execute federated queries with minimal data movement
