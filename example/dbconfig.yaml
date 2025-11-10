@@ -1,18 +1,8 @@
 datasources:
-  postgres_prod:
-    type: postgresql
-    host: localhost
-    port: 5432
-    database: postgres
-    user: postgres
-    password: postgres
-    schemas: [public]
-    capabilities: [aggregations, joins, window_functions]
-
   local_duckdb:
     type: duckdb
-    path: /data/analytics.duckdb
-    read_only: true
+    path: ":memory:"
+    read_only: false
     capabilities: [aggregations, joins]
 
 optimizer:
