@@ -2,13 +2,16 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional, Iterator, Any
+from typing import List, Optional, Iterator, Any, TYPE_CHECKING
 from enum import Enum
 
 import pyarrow as pa
 
 from .expressions import Expression
 from .logical import JoinType
+
+if TYPE_CHECKING:
+    from .expressions import FunctionCall
 
 
 class PhysicalPlanNode(ABC):
@@ -591,10 +594,210 @@ class PhysicalHashAggregate(PhysicalPlanNode):
 
     def execute(self) -> Iterator[pa.RecordBatch]:
         """Execute hash aggregation."""
-        raise NotImplementedError("Execute not yet implemented")
+        from collections import defaultdict
+
+        hash_table = defaultdict(lambda: self._create_accumulator())
+
+        for batch in self.input.execute():
+            self._accumulate_batch(batch, hash_table)
+
+        result_batch = self._finalize_aggregates(hash_table)
+        if result_batch.num_rows > 0:
+            yield result_batch
+
+    def _create_accumulator(self) -> dict:
+        """Create accumulator for aggregate functions."""
+        accumulator = {}
+        for i, expr in enumerate(self.aggregates):
+            accumulator[i] = self._create_single_accumulator(expr)
+        return accumulator
+
+    def _create_single_accumulator(self, expr: Expression) -> dict:
+        """Create accumulator for a single aggregate."""
+        from .expressions import FunctionCall
+
+        if isinstance(expr, FunctionCall) and expr.is_aggregate:
+            func_name = expr.function_name.upper()
+            return {"type": func_name, "count": 0, "sum": 0, "min": None, "max": None}
+
+        return {"type": "VALUE", "value": None}
+
+    def _accumulate_batch(self, batch: pa.RecordBatch, hash_table: dict):
+        """Accumulate values from a batch."""
+        for row_idx in range(batch.num_rows):
+            group_key = self._extract_group_key(batch, row_idx)
+            self._accumulate_row(batch, row_idx, hash_table[group_key])
+
+    def _extract_group_key(self, batch: pa.RecordBatch, row_idx: int) -> tuple:
+        """Extract grouping key from a row."""
+        from .expressions import ColumnRef
+
+        if len(self.group_by) == 0:
+            return ()
+
+        key_values = []
+        for expr in self.group_by:
+            if isinstance(expr, ColumnRef):
+                col = batch.column(expr.column)
+                value = col[row_idx].as_py()
+                key_values.append(value)
+        return tuple(key_values)
+
+    def _accumulate_row(self, batch: pa.RecordBatch, row_idx: int, accumulator: dict):
+        """Accumulate values from a single row."""
+        for i, expr in enumerate(self.aggregates):
+            value = self._extract_value_from_row(batch, row_idx, expr)
+            self._update_accumulator(accumulator[i], value)
+
+    def _extract_value_from_row(self, batch: pa.RecordBatch, row_idx: int, expr: Expression):
+        """Extract value for an expression from a row."""
+        from .expressions import ColumnRef, FunctionCall
+
+        if isinstance(expr, ColumnRef):
+            if expr.column == "*":
+                return 1
+            col = batch.column(expr.column)
+            return col[row_idx].as_py()
+
+        if isinstance(expr, FunctionCall) and expr.is_aggregate:
+            if len(expr.args) == 0:
+                return 1
+            arg = expr.args[0]
+            return self._extract_value_from_row(batch, row_idx, arg)
+
+        return None
+
+    def _update_accumulator(self, acc: dict, value):
+        """Update accumulator with a value."""
+        acc_type = acc["type"]
+
+        if acc_type == "VALUE":
+            acc["value"] = value
+            return
+
+        if acc_type == "COUNT":
+            acc["count"] += 1
+            return
+
+        if value is None:
+            return
+
+        self._update_numeric_accumulator(acc, value, acc_type)
+
+    def _update_numeric_accumulator(self, acc: dict, value, acc_type: str):
+        """Update numeric accumulator (SUM, AVG, MIN, MAX)."""
+        acc["count"] += 1
+        numeric_val = float(value) if value is not None else 0
+
+        if acc_type in ("SUM", "AVG"):
+            acc["sum"] += numeric_val
+
+        if acc_type in ("MIN", "MAX"):
+            self._update_min_max(acc, numeric_val, acc_type)
+
+    def _update_min_max(self, acc: dict, value: float, acc_type: str):
+        """Update min/max accumulator."""
+        if acc["min"] is None:
+            acc["min"] = value
+            acc["max"] = value
+        else:
+            if acc_type == "MIN":
+                acc["min"] = min(acc["min"], value)
+            if acc_type == "MAX":
+                acc["max"] = max(acc["max"], value)
+
+    def _finalize_aggregates(self, hash_table: dict) -> pa.RecordBatch:
+        """Convert hash table to record batch."""
+        if len(hash_table) == 0:
+            return self._create_empty_batch()
+
+        columns = []
+        for i in range(len(self.output_names)):
+            col_values = self._extract_column_values(hash_table, i)
+            columns.append(col_values)
+
+        return pa.RecordBatch.from_arrays(columns, names=self.output_names)
+
+    def _extract_column_values(self, hash_table: dict, col_idx: int) -> pa.Array:
+        """Extract values for a column."""
+        values = []
+        for group_key, accumulators in hash_table.items():
+            if col_idx < len(self.group_by):
+                values.append(group_key[col_idx])
+            else:
+                agg_idx = col_idx
+                value = self._finalize_accumulator(accumulators[agg_idx])
+                values.append(value)
+
+        return pa.array(values)
+
+    def _finalize_accumulator(self, acc: dict):
+        """Finalize accumulator to get final value."""
+        acc_type = acc["type"]
+
+        if acc_type == "VALUE":
+            return acc["value"]
+        if acc_type == "COUNT":
+            return acc["count"]
+        if acc_type == "SUM":
+            return acc["sum"]
+        if acc_type == "AVG":
+            return acc["sum"] / acc["count"] if acc["count"] > 0 else None
+        if acc_type == "MIN":
+            return acc["min"]
+        if acc_type == "MAX":
+            return acc["max"]
+
+        return None
+
+    def _create_empty_batch(self) -> pa.RecordBatch:
+        """Create empty batch with proper schema."""
+        arrays = []
+        for _ in self.output_names:
+            arrays.append(pa.array([]))
+        return pa.RecordBatch.from_arrays(arrays, names=self.output_names)
 
     def schema(self) -> pa.Schema:
-        raise NotImplementedError("Schema resolution not yet implemented")
+        """Get output schema."""
+        from .expressions import FunctionCall, ColumnRef
+
+        input_schema = self.input.schema()
+        fields = []
+
+        for i, expr in enumerate(self.aggregates):
+            name = self.output_names[i]
+            field_type = self._infer_output_type(expr, input_schema)
+            fields.append(pa.field(name, field_type))
+
+        return pa.schema(fields)
+
+    def _infer_output_type(self, expr: Expression, input_schema: pa.Schema) -> pa.DataType:
+        """Infer output type for an expression."""
+        from .expressions import FunctionCall, ColumnRef
+
+        if isinstance(expr, ColumnRef):
+            field_index = input_schema.get_field_index(expr.column)
+            return input_schema.field(field_index).type
+
+        if isinstance(expr, FunctionCall) and expr.is_aggregate:
+            return self._infer_aggregate_type(expr)
+
+        return pa.int64()
+
+    def _infer_aggregate_type(self, func: "FunctionCall") -> pa.DataType:
+        """Infer output type for aggregate function."""
+        func_name = func.function_name.upper()
+
+        if func_name in ("COUNT"):
+            return pa.int64()
+        if func_name in ("SUM"):
+            return pa.float64()
+        if func_name in ("AVG"):
+            return pa.float64()
+        if func_name in ("MIN", "MAX"):
+            return pa.float64()
+
+        return pa.int64()
 
     def estimated_cost(self) -> float:
         raise NotImplementedError("Cost estimation not yet implemented")

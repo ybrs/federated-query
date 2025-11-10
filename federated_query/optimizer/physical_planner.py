@@ -10,6 +10,7 @@ from ..plan.logical import (
     Filter,
     Limit,
     Join,
+    Aggregate,
 )
 from ..plan.physical import (
     PhysicalPlanNode,
@@ -19,6 +20,7 @@ from ..plan.physical import (
     PhysicalLimit,
     PhysicalHashJoin,
     PhysicalNestedLoopJoin,
+    PhysicalHashAggregate,
 )
 from ..plan.expressions import BinaryOp, BinaryOpType, ColumnRef
 from typing import List, Tuple, Optional
@@ -58,6 +60,8 @@ class PhysicalPlanner:
             return self._plan_limit(node)
         if isinstance(node, Join):
             return self._plan_join(node)
+        if isinstance(node, Aggregate):
+            return self._plan_aggregate(node)
 
         raise ValueError(f"Unsupported logical plan node: {type(node)}")
 
@@ -95,6 +99,16 @@ class PhysicalPlanner:
         input_plan = self._plan_node(limit.input)
         return PhysicalLimit(
             input=input_plan, limit=limit.limit, offset=limit.offset
+        )
+
+    def _plan_aggregate(self, aggregate: Aggregate) -> PhysicalHashAggregate:
+        """Plan an aggregate node."""
+        input_plan = self._plan_node(aggregate.input)
+        return PhysicalHashAggregate(
+            input=input_plan,
+            group_by=aggregate.group_by,
+            aggregates=aggregate.aggregates,
+            output_names=aggregate.output_names,
         )
 
     def _plan_join(self, join: Join) -> PhysicalPlanNode:
