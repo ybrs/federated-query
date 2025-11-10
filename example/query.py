@@ -7,6 +7,16 @@ from federated_query.config.config import load_config
 from federated_query.catalog.catalog import Catalog
 from federated_query.datasources.duckdb import DuckDBDataSource
 from federated_query.datasources.postgresql import PostgreSQLDataSource
+import duckdb
+import pyarrow as pa
+from federated_query.catalog import Catalog
+from federated_query.catalog.schema import Schema, Table, Column, DataType
+from federated_query.datasources.duckdb import DuckDBDataSource
+from federated_query.parser import Parser, Binder
+from federated_query.optimizer.physical_planner import PhysicalPlanner
+from federated_query.executor.executor import Executor
+from federated_query.config.config import ExecutorConfig
+
 
 
 def create_postgres_sample_data(datasource):
@@ -140,6 +150,26 @@ def main():
     print("\nYou can now execute federated queries across:")
     for ds_name in catalog.datasources.keys():
         print(f"  - {ds_name}")
+
+
+    sql = """
+        SELECT c.name, o.amount
+        FROM local_duckdb.main.customers c
+        JOIN postgres_prod.public.orders o ON c.id = o.customer_id
+    """
+    parser = Parser()
+    binder = Binder(catalog)
+    planner = PhysicalPlanner(catalog)
+    executor = Executor(ExecutorConfig())
+
+    ast = parser.parse(sql)
+    logical_plan = parser.ast_to_logical_plan(ast)
+    bound_plan = binder.bind(logical_plan)
+    physical_plan = planner.plan(bound_plan)
+
+    result_table = executor.execute_to_table(physical_plan)
+
+    print("result table", result_table)    
 
     print("\nCleaning up connections...")
     for datasource in catalog.datasources.values():

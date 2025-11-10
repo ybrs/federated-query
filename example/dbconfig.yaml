@@ -2,10 +2,10 @@ datasources:
   postgres_prod:
     type: postgresql
     host: localhost
-    port: 5432
+    port: 5466
     database: analytics
-    user: postgres
-    password: postgres
+    user: abadur
+    password: ''
     schemas: [public]
     capabilities: [aggregations, joins, window_functions]
 
