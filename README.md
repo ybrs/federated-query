@@ -153,20 +153,36 @@ print(results)
 
 This project is under active development. See `tasks.md` for the implementation roadmap.
 
-### Completed
+### Completed Phases
+
+**Phase 0: Foundation** ✅
 - ✅ Project structure and skeleton
 - ✅ Core abstractions (plans, expressions, data sources)
 - ✅ Configuration system
 - ✅ Basic catalog structure
+- ✅ Data source connectors (PostgreSQL, DuckDB)
+- ✅ Test infrastructure
 
-### In Progress (Phase 1)
-- 🚧 Parser: AST to logical plan conversion
-- 🚧 Binder: Reference resolution
-- 🚧 Data source connectors: Query execution
-- 🚧 Basic executor: Single-table queries
+**Phase 1: Basic Query Execution** ✅
+- ✅ Parser: AST to logical plan conversion
+- ✅ Binder: Reference resolution with catalog integration
+- ✅ Physical operators: Scan, Filter, Project, Limit
+- ✅ Basic executor: Single-table queries
+- ✅ End-to-end pipeline for simple SELECT queries
+- ✅ All 65 tests passing
+
+**Query Example (Phase 1):**
+```sql
+SELECT col1, col2 FROM datasource.schema.table WHERE col1 > 10 LIMIT 100
+```
+
+### Current Phase (Phase 2)
+- 🚧 Joins across data sources
+- 🚧 Hash join and nested loop join operators
+- 🚧 Data gathering from multiple sources
+- 🚧 Join strategy selection
 
 ### Planned
-- Joins across data sources
 - Aggregations and grouping
 - Query optimization (pushdown, reordering)
 - Cost-based planning

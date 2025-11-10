@@ -9,6 +9,7 @@ from ..plan.logical import (
     Project,
     Filter,
     Limit,
+    Join,
 )
 from ..plan.physical import (
     PhysicalPlanNode,
@@ -16,7 +17,11 @@ from ..plan.physical import (
     PhysicalProject,
     PhysicalFilter,
     PhysicalLimit,
+    PhysicalHashJoin,
+    PhysicalNestedLoopJoin,
 )
+from ..plan.expressions import BinaryOp, BinaryOpType, ColumnRef
+from typing import List, Tuple, Optional
 
 
 class PhysicalPlanner:
@@ -51,6 +56,8 @@ class PhysicalPlanner:
             return self._plan_project(node)
         if isinstance(node, Limit):
             return self._plan_limit(node)
+        if isinstance(node, Join):
+            return self._plan_join(node)
 
         raise ValueError(f"Unsupported logical plan node: {type(node)}")
 
@@ -89,6 +96,72 @@ class PhysicalPlanner:
         return PhysicalLimit(
             input=input_plan, limit=limit.limit, offset=limit.offset
         )
+
+    def _plan_join(self, join: Join) -> PhysicalPlanNode:
+        """Plan a join node."""
+        left_plan = self._plan_node(join.left)
+        right_plan = self._plan_node(join.right)
+
+        if join.condition is None:
+            return PhysicalNestedLoopJoin(
+                left=left_plan,
+                right=right_plan,
+                join_type=join.join_type,
+                condition=None,
+            )
+
+        join_keys = self._extract_join_keys(join.condition)
+        if join_keys:
+            left_keys, right_keys = join_keys
+            return PhysicalHashJoin(
+                left=left_plan,
+                right=right_plan,
+                join_type=join.join_type,
+                left_keys=left_keys,
+                right_keys=right_keys,
+                build_side="right",
+            )
+
+        return PhysicalNestedLoopJoin(
+            left=left_plan,
+            right=right_plan,
+            join_type=join.join_type,
+            condition=join.condition,
+        )
+
+    def _extract_join_keys(
+        self, condition: Optional[BinaryOp]
+    ) -> Optional[Tuple[List[ColumnRef], List[ColumnRef]]]:
+        """Extract equi-join keys from condition.
+
+        Returns:
+            Tuple of (left_keys, right_keys) if this is an equi-join,
+            None otherwise
+        """
+        if condition is None:
+            return None
+
+        if not isinstance(condition, BinaryOp):
+            return None
+
+        if condition.op == BinaryOpType.EQ:
+            left_expr = condition.left
+            right_expr = condition.right
+
+            if isinstance(left_expr, ColumnRef) and isinstance(right_expr, ColumnRef):
+                return ([left_expr], [right_expr])
+
+        if condition.op == BinaryOpType.AND:
+            left_keys = self._extract_join_keys(condition.left)
+            right_keys = self._extract_join_keys(condition.right)
+
+            if left_keys and right_keys:
+                return (
+                    left_keys[0] + right_keys[0],
+                    left_keys[1] + right_keys[1],
+                )
+
+        return None
 
     def __repr__(self) -> str:
         return "PhysicalPlanner()"
