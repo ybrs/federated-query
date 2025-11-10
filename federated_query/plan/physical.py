@@ -48,18 +48,62 @@ class PhysicalScan(PhysicalPlanNode):
     columns: List[str]
     filters: Optional[Expression] = None
     datasource_connection: Any = None  # Set during planning
+    _schema: Optional[pa.Schema] = None  # Cached schema
 
     def children(self) -> List[PhysicalPlanNode]:
         return []
 
     def execute(self) -> Iterator[pa.RecordBatch]:
         """Execute scan on remote data source."""
-        # Implementation will fetch data from data source
-        raise NotImplementedError("Execute not yet implemented")
+        if self.datasource_connection is None:
+            raise RuntimeError("Data source connection not set")
+
+        query = self._build_query()
+
+        self.datasource_connection.ensure_connected()
+        batches = self.datasource_connection.execute_query(query)
+
+        for batch in batches:
+            yield batch
+
+    def _build_query(self) -> str:
+        """Build SQL query for this scan."""
+        cols = self._format_columns()
+        table_ref = self._format_table_ref()
+        query = f"SELECT {cols} FROM {table_ref}"
+
+        if self.filters:
+            where_clause = self.filters.to_sql()
+            query = f"{query} WHERE {where_clause}"
+
+        return query
+
+    def _format_columns(self) -> str:
+        """Format column list for SQL."""
+        if "*" in self.columns:
+            return "*"
+
+        quoted_cols = []
+        for col in self.columns:
+            quoted_cols.append(f'"{col}"')
+
+        return ", ".join(quoted_cols)
+
+    def _format_table_ref(self) -> str:
+        """Format table reference for SQL."""
+        return f'"{self.schema_name}"."{self.table_name}"'
 
     def schema(self) -> pa.Schema:
-        # Schema needs to be resolved from catalog
-        raise NotImplementedError("Schema resolution not yet implemented")
+        """Get output schema."""
+        if self._schema is not None:
+            return self._schema
+
+        if self.datasource_connection is None:
+            raise RuntimeError("Data source connection not set")
+
+        query = self._build_query()
+        self._schema = self.datasource_connection.get_query_schema(query)
+        return self._schema
 
     def estimated_cost(self) -> float:
         # Cost based on table statistics
@@ -83,10 +127,51 @@ class PhysicalProject(PhysicalPlanNode):
 
     def execute(self) -> Iterator[pa.RecordBatch]:
         """Execute projection."""
-        raise NotImplementedError("Execute not yet implemented")
+        for batch in self.input.execute():
+            projected = self._project_batch(batch)
+            yield projected
+
+    def _project_batch(self, batch: pa.RecordBatch) -> pa.RecordBatch:
+        """Project a single batch."""
+        from .expressions import ColumnRef
+
+        columns = []
+        for expr in self.expressions:
+            if isinstance(expr, ColumnRef):
+                if expr.column == "*":
+                    return batch
+                column_data = batch.column(expr.column)
+                columns.append(column_data)
+            else:
+                evaluated = self._evaluate_expression(expr, batch)
+                columns.append(evaluated)
+
+        return pa.RecordBatch.from_arrays(columns, names=self.output_names)
+
+    def _evaluate_expression(self, expr: Expression, batch: pa.RecordBatch) -> pa.Array:
+        """Evaluate expression on batch."""
+        raise NotImplementedError(f"Expression evaluation not yet implemented for {type(expr)}")
 
     def schema(self) -> pa.Schema:
-        raise NotImplementedError("Schema resolution not yet implemented")
+        """Get output schema."""
+        from .expressions import ColumnRef
+
+        input_schema = self.input.schema()
+        fields = []
+
+        for i, expr in enumerate(self.expressions):
+            if isinstance(expr, ColumnRef):
+                if expr.column == "*":
+                    return input_schema
+
+                field_index = input_schema.get_field_index(expr.column)
+                field = input_schema.field(field_index)
+                new_field = pa.field(self.output_names[i], field.type)
+                fields.append(new_field)
+            else:
+                raise NotImplementedError(f"Schema inference not implemented for {type(expr)}")
+
+        return pa.schema(fields)
 
     def estimated_cost(self) -> float:
         # Cost is input cost + projection cost
@@ -108,7 +193,61 @@ class PhysicalFilter(PhysicalPlanNode):
 
     def execute(self) -> Iterator[pa.RecordBatch]:
         """Execute filter."""
-        raise NotImplementedError("Execute not yet implemented")
+        import pyarrow.compute as pc
+
+        for batch in self.input.execute():
+            mask = self._evaluate_predicate(batch)
+            filtered = batch.filter(mask)
+            if filtered.num_rows > 0:
+                yield filtered
+
+    def _evaluate_predicate(self, batch: pa.RecordBatch) -> pa.Array:
+        """Evaluate predicate on batch and return boolean mask."""
+        import pyarrow.compute as pc
+        from .expressions import BinaryOp, BinaryOpType, ColumnRef, Literal
+
+        if isinstance(self.predicate, BinaryOp):
+            return self._evaluate_binary_op(self.predicate, batch)
+
+        raise NotImplementedError(f"Filter evaluation not implemented for {type(self.predicate)}")
+
+    def _evaluate_binary_op(self, op: "BinaryOp", batch: pa.RecordBatch) -> pa.Array:
+        """Evaluate binary operation."""
+        import pyarrow.compute as pc
+        from .expressions import BinaryOpType, ColumnRef, Literal
+
+        left_val = self._evaluate_value(op.left, batch)
+        right_val = self._evaluate_value(op.right, batch)
+
+        op_map = {
+            BinaryOpType.EQ: pc.equal,
+            BinaryOpType.NEQ: pc.not_equal,
+            BinaryOpType.LT: pc.less,
+            BinaryOpType.LTE: pc.less_equal,
+            BinaryOpType.GT: pc.greater,
+            BinaryOpType.GTE: pc.greater_equal,
+            BinaryOpType.AND: pc.and_,
+            BinaryOpType.OR: pc.or_,
+        }
+
+        compute_func = op_map.get(op.op)
+        if compute_func is None:
+            raise NotImplementedError(f"Operator {op.op} not supported in filter")
+
+        return compute_func(left_val, right_val)
+
+    def _evaluate_value(self, expr: Expression, batch: pa.RecordBatch):
+        """Evaluate an expression to a value."""
+        from .expressions import ColumnRef, Literal, BinaryOp
+
+        if isinstance(expr, ColumnRef):
+            return batch.column(expr.column)
+        if isinstance(expr, Literal):
+            return pa.scalar(expr.value)
+        if isinstance(expr, BinaryOp):
+            return self._evaluate_binary_op(expr, batch)
+
+        raise NotImplementedError(f"Value evaluation not implemented for {type(expr)}")
 
     def schema(self) -> pa.Schema:
         return self.input.schema()
@@ -239,7 +378,30 @@ class PhysicalLimit(PhysicalPlanNode):
 
     def execute(self) -> Iterator[pa.RecordBatch]:
         """Execute limit."""
-        raise NotImplementedError("Execute not yet implemented")
+        rows_emitted = 0
+        rows_skipped = 0
+
+        for batch in self.input.execute():
+            batch_size = batch.num_rows
+
+            if rows_skipped < self.offset:
+                skip_count = min(self.offset - rows_skipped, batch_size)
+                rows_skipped += skip_count
+                if rows_skipped < self.offset:
+                    continue
+                batch = batch.slice(skip_count)
+
+            if rows_emitted >= self.limit:
+                break
+
+            remaining = self.limit - rows_emitted
+            if batch.num_rows <= remaining:
+                yield batch
+                rows_emitted += batch.num_rows
+            else:
+                yield batch.slice(0, remaining)
+                rows_emitted += remaining
+                break
 
     def schema(self) -> pa.Schema:
         return self.input.schema()

@@ -47,10 +47,12 @@ class ColumnRef(Expression):
 
     table: Optional[str]  # Can be None for unqualified references
     column: str
+    data_type: Optional[DataType] = None  # Set during binding
 
     def get_type(self) -> DataType:
-        # Type needs to be resolved by binder
-        raise NotImplementedError("Type must be set during binding")
+        if self.data_type is None:
+            raise NotImplementedError("Type must be set during binding")
+        return self.data_type
 
     def accept(self, visitor):
         return visitor.visit_column_ref(self)

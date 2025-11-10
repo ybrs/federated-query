@@ -272,19 +272,30 @@ class Parser:
 
     def _convert_literal(self, lit: exp.Literal) -> Literal:
         """Convert sqlglot Literal to our Literal."""
-        value = lit.this
-        data_type = self._infer_literal_type(value)
-        return Literal(value=value, data_type=data_type)
+        value_str = lit.this
+        data_type = self._infer_literal_type(value_str)
+        converted_value = self._convert_literal_value(value_str, data_type)
+        return Literal(value=converted_value, data_type=data_type)
 
     def _infer_literal_type(self, value: str) -> DataType:
         """Infer data type from literal value."""
-        if value.isdigit():
+        if value.isdigit() or (value.startswith("-") and value[1:].isdigit()):
             return DataType.INTEGER
-        if value.replace(".", "", 1).isdigit():
+        if value.replace(".", "", 1).replace("-", "", 1).isdigit():
             return DataType.DOUBLE
         if value.lower() in ("true", "false"):
             return DataType.BOOLEAN
         return DataType.VARCHAR
+
+    def _convert_literal_value(self, value_str: str, data_type: DataType):
+        """Convert literal string to proper Python type."""
+        if data_type == DataType.INTEGER:
+            return int(value_str)
+        if data_type == DataType.DOUBLE:
+            return float(value_str)
+        if data_type == DataType.BOOLEAN:
+            return value_str.lower() == "true"
+        return value_str
 
     def _convert_binary(self, binary: exp.Binary) -> BinaryOp:
         """Convert sqlglot binary operation."""
