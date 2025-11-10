@@ -3,7 +3,7 @@
 import sqlglot
 from sqlglot import exp
 from typing import Optional, List, Tuple
-from ..plan.logical import LogicalPlanNode, Scan, Project, Filter, Limit
+from ..plan.logical import LogicalPlanNode, Scan, Project, Filter, Limit, Join, JoinType
 from ..plan.expressions import (
     Expression,
     ColumnRef,
@@ -70,13 +70,18 @@ class Parser:
             select: sqlglot Select node
 
         Returns:
-            Scan node
+            Scan node or Join node
         """
         from_clause = select.args.get("from")
         if not from_clause:
             raise ValueError("SELECT must have FROM clause")
 
         table_expr = from_clause.this
+
+        joins = select.args.get("joins")
+        if joins:
+            return self._build_join_plan(select, table_expr, joins)
+
         table_parts = self._extract_table_parts(table_expr)
         all_columns = self._collect_needed_columns(select)
 
@@ -90,6 +95,124 @@ class Parser:
             table_name=table_name,
             columns=all_columns,
         )
+
+    def _build_join_plan(
+        self, select: exp.Select, left_table: exp.Table, joins: List[exp.Join]
+    ) -> LogicalPlanNode:
+        """Build join plan from FROM and JOIN clauses.
+
+        Args:
+            select: sqlglot Select node
+            left_table: Left table from FROM clause
+            joins: List of JOIN clauses
+
+        Returns:
+            Join node
+        """
+        left_table_parts = self._extract_table_parts(left_table)
+        left_table_alias = self._extract_table_alias(left_table)
+
+        left_plan = Scan(
+            datasource=left_table_parts[0],
+            schema_name=left_table_parts[1],
+            table_name=left_table_parts[2],
+            columns=["*"],
+        )
+
+        current_plan = left_plan
+
+        for join_clause in joins:
+            right_table = join_clause.this
+            right_table_parts = self._extract_table_parts(right_table)
+            right_table_alias = self._extract_table_alias(right_table)
+
+            right_plan = Scan(
+                datasource=right_table_parts[0],
+                schema_name=right_table_parts[1],
+                table_name=right_table_parts[2],
+                columns=["*"],
+            )
+
+            join_type = self._extract_join_type(join_clause)
+            join_condition = None
+            if join_clause.args.get("on"):
+                join_condition = self._convert_expression(join_clause.args["on"])
+
+            current_plan = Join(
+                left=current_plan,
+                right=right_plan,
+                join_type=join_type,
+                condition=join_condition,
+            )
+
+        return current_plan
+
+    def _extract_table_alias(self, table_expr: exp.Table) -> Optional[str]:
+        """Extract table alias if present.
+
+        Args:
+            table_expr: sqlglot Table node
+
+        Returns:
+            Table alias or table name if no alias
+        """
+        if table_expr.alias:
+            return table_expr.alias
+        return table_expr.name
+
+    def _filter_columns_for_table(
+        self, columns: List[str], table_alias: Optional[str]
+    ) -> List[str]:
+        """Filter columns that belong to a specific table.
+
+        Args:
+            columns: All column names
+            table_alias: Table alias to filter by
+
+        Returns:
+            List of columns for this table
+        """
+        if "*" in columns:
+            return ["*"]
+
+        filtered = []
+        for col in columns:
+            if "." in col:
+                table_part, col_part = col.split(".", 1)
+                if table_part == table_alias:
+                    filtered.append(col_part)
+            else:
+                filtered.append(col)
+
+        return filtered
+
+    def _extract_join_type(self, join_clause: exp.Join) -> JoinType:
+        """Extract join type from JOIN clause.
+
+        Args:
+            join_clause: sqlglot Join node
+
+        Returns:
+            JoinType enum value
+        """
+        kind = join_clause.args.get("kind")
+        side = join_clause.args.get("side")
+
+        if not kind:
+            return JoinType.INNER
+
+        if kind.upper() == "CROSS":
+            return JoinType.CROSS
+        if side:
+            side_upper = side.upper()
+            if side_upper == "LEFT":
+                return JoinType.LEFT
+            if side_upper == "RIGHT":
+                return JoinType.RIGHT
+            if side_upper == "FULL":
+                return JoinType.FULL
+
+        return JoinType.INNER
 
     def _extract_table_parts(self, table_expr: exp.Table) -> Tuple[str, str, str]:
         """Extract datasource, schema, and table name.

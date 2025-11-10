@@ -275,11 +275,115 @@ class PhysicalHashJoin(PhysicalPlanNode):
 
     def execute(self) -> Iterator[pa.RecordBatch]:
         """Execute hash join."""
-        raise NotImplementedError("Execute not yet implemented")
+        from collections import defaultdict
+        from .expressions import ColumnRef
+
+        if self.build_side == "right":
+            build_node = self.right
+            probe_node = self.left
+            build_keys = self.right_keys
+            probe_keys = self.left_keys
+        else:
+            build_node = self.left
+            probe_node = self.right
+            build_keys = self.left_keys
+            probe_keys = self.right_keys
+
+        hash_table = defaultdict(list)
+        build_batches = []
+
+        for batch in build_node.execute():
+            build_batches.append(batch)
+            key_values = self._extract_key_values(batch, build_keys)
+
+            for row_idx in range(batch.num_rows):
+                key = tuple(val[row_idx].as_py() for val in key_values)
+                hash_table[key].append((len(build_batches) - 1, row_idx))
+
+        if len(hash_table) == 0:
+            if self.join_type in (JoinType.LEFT, JoinType.FULL):
+                for batch in probe_node.execute():
+                    yield self._create_left_outer_batch(batch)
+            return
+
+        for probe_batch in probe_node.execute():
+            probe_key_values = self._extract_key_values(probe_batch, probe_keys)
+
+            for probe_row_idx in range(probe_batch.num_rows):
+                probe_key = tuple(val[probe_row_idx].as_py() for val in probe_key_values)
+
+                if probe_key in hash_table:
+                    build_rows = hash_table[probe_key]
+                    for build_batch_idx, build_row_idx in build_rows:
+                        build_batch = build_batches[build_batch_idx]
+                        joined = self._join_rows(
+                            probe_batch, probe_row_idx, build_batch, build_row_idx
+                        )
+                        yield joined
+                else:
+                    if self.join_type in (JoinType.LEFT, JoinType.FULL):
+                        yield self._create_left_outer_row(probe_batch, probe_row_idx)
+
+    def _extract_key_values(
+        self, batch: pa.RecordBatch, keys: List[Expression]
+    ) -> List[pa.Array]:
+        """Extract key column values from batch."""
+        from .expressions import ColumnRef
+
+        key_arrays = []
+        for key in keys:
+            if isinstance(key, ColumnRef):
+                key_arrays.append(batch.column(key.column))
+            else:
+                raise NotImplementedError(f"Key extraction not implemented for {type(key)}")
+
+        return key_arrays
+
+    def _join_rows(
+        self,
+        left_batch: pa.RecordBatch,
+        left_row_idx: int,
+        right_batch: pa.RecordBatch,
+        right_row_idx: int,
+    ) -> pa.RecordBatch:
+        """Join two rows into a single batch."""
+        arrays = []
+        names = []
+
+        for i in range(left_batch.num_columns):
+            col = left_batch.column(i)
+            arrays.append(pa.array([col[left_row_idx].as_py()]))
+            names.append(left_batch.schema.field(i).name)
+
+        for i in range(right_batch.num_columns):
+            col = right_batch.column(i)
+            arrays.append(pa.array([col[right_row_idx].as_py()]))
+            names.append(right_batch.schema.field(i).name)
+
+        return pa.RecordBatch.from_arrays(arrays, names=names)
+
+    def _create_left_outer_batch(self, left_batch: pa.RecordBatch) -> pa.RecordBatch:
+        """Create batch with NULLs for right side (for LEFT OUTER JOIN)."""
+        raise NotImplementedError("LEFT OUTER JOIN not yet fully implemented")
+
+    def _create_left_outer_row(
+        self, left_batch: pa.RecordBatch, left_row_idx: int
+    ) -> pa.RecordBatch:
+        """Create single row with NULLs for right side."""
+        raise NotImplementedError("LEFT OUTER JOIN not yet fully implemented")
 
     def schema(self) -> pa.Schema:
-        # Combine schemas from both sides
-        raise NotImplementedError("Schema resolution not yet implemented")
+        """Combine schemas from both sides."""
+        left_schema = self.left.schema()
+        right_schema = self.right.schema()
+
+        fields = []
+        for field in left_schema:
+            fields.append(field)
+        for field in right_schema:
+            fields.append(field)
+
+        return pa.schema(fields)
 
     def estimated_cost(self) -> float:
         raise NotImplementedError("Cost estimation not yet implemented")
@@ -302,10 +406,131 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
 
     def execute(self) -> Iterator[pa.RecordBatch]:
         """Execute nested loop join."""
-        raise NotImplementedError("Execute not yet implemented")
+        import pyarrow.compute as pc
+
+        right_batches = []
+        for batch in self.right.execute():
+            right_batches.append(batch)
+
+        if len(right_batches) == 0:
+            if self.join_type in (JoinType.LEFT, JoinType.FULL):
+                for batch in self.left.execute():
+                    yield self._create_left_outer_batch(batch)
+            return
+
+        for left_batch in self.left.execute():
+            for left_row_idx in range(left_batch.num_rows):
+                matched = False
+
+                for right_batch in right_batches:
+                    for right_row_idx in range(right_batch.num_rows):
+                        if self.condition is None or self._evaluate_condition(
+                            left_batch, left_row_idx, right_batch, right_row_idx
+                        ):
+                            yield self._join_rows(
+                                left_batch, left_row_idx, right_batch, right_row_idx
+                            )
+                            matched = True
+
+                if not matched and self.join_type in (JoinType.LEFT, JoinType.FULL):
+                    yield self._create_left_outer_row(left_batch, left_row_idx)
+
+    def _evaluate_condition(
+        self,
+        left_batch: pa.RecordBatch,
+        left_row_idx: int,
+        right_batch: pa.RecordBatch,
+        right_row_idx: int,
+    ) -> bool:
+        """Evaluate join condition for two rows."""
+        from .expressions import BinaryOp, BinaryOpType, ColumnRef, Literal
+        import pyarrow.compute as pc
+
+        if self.condition is None:
+            return True
+
+        joined = self._join_rows(left_batch, left_row_idx, right_batch, right_row_idx)
+        result = self._evaluate_expression_on_batch(self.condition, joined)
+
+        return result[0].as_py() if result.length() > 0 else False
+
+    def _evaluate_expression_on_batch(
+        self, expr: Expression, batch: pa.RecordBatch
+    ) -> pa.Array:
+        """Evaluate expression on a batch."""
+        from .expressions import BinaryOp, BinaryOpType, ColumnRef, Literal
+        import pyarrow.compute as pc
+
+        if isinstance(expr, ColumnRef):
+            return batch.column(expr.column)
+        if isinstance(expr, Literal):
+            return pa.array([expr.value])
+        if isinstance(expr, BinaryOp):
+            left_val = self._evaluate_expression_on_batch(expr.left, batch)
+            right_val = self._evaluate_expression_on_batch(expr.right, batch)
+
+            op_map = {
+                BinaryOpType.EQ: pc.equal,
+                BinaryOpType.NEQ: pc.not_equal,
+                BinaryOpType.LT: pc.less,
+                BinaryOpType.LTE: pc.less_equal,
+                BinaryOpType.GT: pc.greater,
+                BinaryOpType.GTE: pc.greater_equal,
+                BinaryOpType.AND: pc.and_,
+                BinaryOpType.OR: pc.or_,
+            }
+
+            compute_func = op_map.get(expr.op)
+            if compute_func:
+                return compute_func(left_val, right_val)
+
+        raise NotImplementedError(f"Expression evaluation not implemented for {type(expr)}")
+
+    def _join_rows(
+        self,
+        left_batch: pa.RecordBatch,
+        left_row_idx: int,
+        right_batch: pa.RecordBatch,
+        right_row_idx: int,
+    ) -> pa.RecordBatch:
+        """Join two rows into a single batch."""
+        arrays = []
+        names = []
+
+        for i in range(left_batch.num_columns):
+            col = left_batch.column(i)
+            arrays.append(pa.array([col[left_row_idx].as_py()]))
+            names.append(left_batch.schema.field(i).name)
+
+        for i in range(right_batch.num_columns):
+            col = right_batch.column(i)
+            arrays.append(pa.array([col[right_row_idx].as_py()]))
+            names.append(right_batch.schema.field(i).name)
+
+        return pa.RecordBatch.from_arrays(arrays, names=names)
+
+    def _create_left_outer_batch(self, left_batch: pa.RecordBatch) -> pa.RecordBatch:
+        """Create batch with NULLs for right side."""
+        raise NotImplementedError("LEFT OUTER JOIN not yet fully implemented")
+
+    def _create_left_outer_row(
+        self, left_batch: pa.RecordBatch, left_row_idx: int
+    ) -> pa.RecordBatch:
+        """Create single row with NULLs for right side."""
+        raise NotImplementedError("LEFT OUTER JOIN not yet fully implemented")
 
     def schema(self) -> pa.Schema:
-        raise NotImplementedError("Schema resolution not yet implemented")
+        """Combine schemas from both sides."""
+        left_schema = self.left.schema()
+        right_schema = self.right.schema()
+
+        fields = []
+        for field in left_schema:
+            fields.append(field)
+        for field in right_schema:
+            fields.append(field)
+
+        return pa.schema(fields)
 
     def estimated_cost(self) -> float:
         raise NotImplementedError("Cost estimation not yet implemented")
