@@ -153,10 +153,11 @@ def main():
 
 
     sql = """
-        SELECT c.name, o.amount
+        SELECT c.name, c.id, o.amount
         FROM local_duckdb.main.customers c
         JOIN postgres_prod.public.orders o ON c.id = o.customer_id
     """
+    
     parser = Parser()
     binder = Binder(catalog)
     planner = PhysicalPlanner(catalog)
