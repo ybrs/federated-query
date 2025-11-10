@@ -352,13 +352,24 @@ class PhysicalHashJoin(PhysicalPlanNode):
 
         for i in range(left_batch.num_columns):
             col = left_batch.column(i)
-            arrays.append(pa.array([col[left_row_idx].as_py()]))
-            names.append(left_batch.schema.field(i).name)
+            field = left_batch.schema.field(i)
+            scalar_val = col[left_row_idx]
+            arr = pa.array([scalar_val.as_py()], type=field.type)
+            arrays.append(arr)
+            names.append(field.name)
 
         for i in range(right_batch.num_columns):
             col = right_batch.column(i)
-            arrays.append(pa.array([col[right_row_idx].as_py()]))
-            names.append(right_batch.schema.field(i).name)
+            field = right_batch.schema.field(i)
+            name = field.name
+
+            if name in names:
+                name = f"right_{name}"
+
+            scalar_val = col[right_row_idx]
+            arr = pa.array([scalar_val.as_py()], type=field.type)
+            arrays.append(arr)
+            names.append(name)
 
         return pa.RecordBatch.from_arrays(arrays, names=names)
 
@@ -378,10 +389,18 @@ class PhysicalHashJoin(PhysicalPlanNode):
         right_schema = self.right.schema()
 
         fields = []
+        names = []
+
         for field in left_schema:
             fields.append(field)
+            names.append(field.name)
+
         for field in right_schema:
-            fields.append(field)
+            name = field.name
+            if name in names:
+                name = f"right_{name}"
+            fields.append(pa.field(name, field.type, nullable=field.nullable))
+            names.append(name)
 
         return pa.schema(fields)
 
@@ -499,13 +518,24 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
 
         for i in range(left_batch.num_columns):
             col = left_batch.column(i)
-            arrays.append(pa.array([col[left_row_idx].as_py()]))
-            names.append(left_batch.schema.field(i).name)
+            field = left_batch.schema.field(i)
+            scalar_val = col[left_row_idx]
+            arr = pa.array([scalar_val.as_py()], type=field.type)
+            arrays.append(arr)
+            names.append(field.name)
 
         for i in range(right_batch.num_columns):
             col = right_batch.column(i)
-            arrays.append(pa.array([col[right_row_idx].as_py()]))
-            names.append(right_batch.schema.field(i).name)
+            field = right_batch.schema.field(i)
+            name = field.name
+
+            if name in names:
+                name = f"right_{name}"
+
+            scalar_val = col[right_row_idx]
+            arr = pa.array([scalar_val.as_py()], type=field.type)
+            arrays.append(arr)
+            names.append(name)
 
         return pa.RecordBatch.from_arrays(arrays, names=names)
 
@@ -525,10 +555,18 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
         right_schema = self.right.schema()
 
         fields = []
+        names = []
+
         for field in left_schema:
             fields.append(field)
+            names.append(field.name)
+
         for field in right_schema:
-            fields.append(field)
+            name = field.name
+            if name in names:
+                name = f"right_{name}"
+            fields.append(pa.field(name, field.type, nullable=field.nullable))
+            names.append(name)
 
         return pa.schema(fields)
 
