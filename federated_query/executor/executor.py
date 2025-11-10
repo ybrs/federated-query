@@ -1,6 +1,6 @@
 """Query executor."""
 
-from typing import Iterator
+from typing import Iterator, Optional
 import pyarrow as pa
 from ..plan.physical import PhysicalPlanNode
 from ..config.config import ExecutorConfig
@@ -9,12 +9,14 @@ from ..config.config import ExecutorConfig
 class Executor:
     """Query executor that runs physical plans."""
 
-    def __init__(self, config: ExecutorConfig):
+    def __init__(self, config: Optional[ExecutorConfig] = None):
         """Initialize executor.
 
         Args:
-            config: Executor configuration
+            config: Executor configuration (uses defaults if not provided)
         """
+        if config is None:
+            config = ExecutorConfig()
         self.config = config
 
     def execute(self, plan: PhysicalPlanNode) -> Iterator[pa.RecordBatch]:
