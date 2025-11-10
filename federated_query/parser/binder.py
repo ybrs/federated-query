@@ -10,6 +10,7 @@ from ..plan.logical import (
     Filter,
     Limit,
     Join,
+    Aggregate,
 )
 from ..plan.expressions import (
     Expression,
@@ -63,6 +64,8 @@ class Binder:
             return self._bind_limit(plan)
         if isinstance(plan, Join):
             return self._bind_join(plan)
+        if isinstance(plan, Aggregate):
+            return self._bind_aggregate(plan)
 
         raise BindingError(f"Unsupported plan node type: {type(plan)}")
 
@@ -183,6 +186,52 @@ class Binder:
             join_type=join.join_type,
             condition=bound_condition,
         )
+
+    def _bind_aggregate(self, aggregate: Aggregate) -> Aggregate:
+        """Bind an Aggregate node."""
+        bound_input = self.bind(aggregate.input)
+        table = self._get_table_from_plan(bound_input)
+
+        bound_group_by = self._bind_aggregate_expressions(aggregate.group_by, table)
+        bound_aggregates = self._bind_aggregate_expressions(aggregate.aggregates, table)
+
+        return Aggregate(
+            input=bound_input,
+            group_by=bound_group_by,
+            aggregates=bound_aggregates,
+            output_names=aggregate.output_names,
+        )
+
+    def _bind_aggregate_expressions(
+        self, expressions: List[Expression], table: Optional[Table]
+    ) -> List[Expression]:
+        """Bind aggregate expressions (including FunctionCall)."""
+        from ..plan.expressions import FunctionCall
+
+        bound = []
+        for expr in expressions:
+            bound_expr = self._bind_aggregate_expression(expr, table)
+            bound.append(bound_expr)
+        return bound
+
+    def _bind_aggregate_expression(
+        self, expr: Expression, table: Optional[Table]
+    ) -> Expression:
+        """Bind a single aggregate expression."""
+        from ..plan.expressions import FunctionCall
+
+        if isinstance(expr, FunctionCall):
+            bound_args = []
+            for arg in expr.args:
+                bound_arg = self._bind_expression(arg, table)
+                bound_args.append(bound_arg)
+            return FunctionCall(
+                function_name=expr.function_name,
+                args=bound_args,
+                is_aggregate=expr.is_aggregate,
+            )
+
+        return self._bind_expression(expr, table)
 
     def _get_tables_from_join(
         self, left: LogicalPlanNode, right: LogicalPlanNode

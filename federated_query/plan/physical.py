@@ -591,10 +591,173 @@ class PhysicalHashAggregate(PhysicalPlanNode):
 
     def execute(self) -> Iterator[pa.RecordBatch]:
         """Execute hash aggregation."""
-        raise NotImplementedError("Execute not yet implemented")
+        from collections import defaultdict
+        from .expressions import ColumnRef, FunctionCall
+
+        input_table = self._materialize_input()
+        groups = self._build_groups(input_table)
+        result_batch = self._compute_result(input_table, groups)
+        yield result_batch
+
+    def _materialize_input(self) -> pa.Table:
+        """Materialize all input batches into a table."""
+        batches = []
+        for batch in self.input.execute():
+            batches.append(batch)
+        return pa.Table.from_batches(batches)
+
+    def _build_groups(self, table: pa.Table) -> dict:
+        """Build hash table of group keys to row indices."""
+        from collections import defaultdict
+        from .expressions import ColumnRef
+
+        groups = defaultdict(list)
+
+        for row_idx in range(table.num_rows):
+            key = self._extract_group_key(table, row_idx)
+            groups[key].append(row_idx)
+
+        return groups
+
+    def _extract_group_key(self, table: pa.Table, row_idx: int) -> tuple:
+        """Extract grouping key for a row."""
+        from .expressions import ColumnRef
+
+        if len(self.group_by) == 0:
+            return ()
+
+        key_values = []
+        for group_expr in self.group_by:
+            if isinstance(group_expr, ColumnRef):
+                col_data = table.column(group_expr.column)
+                value = col_data[row_idx].as_py()
+                key_values.append(value)
+
+        return tuple(key_values)
+
+    def _compute_result(self, table: pa.Table, groups: dict) -> pa.RecordBatch:
+        """Compute aggregate results for all groups."""
+        import pyarrow.compute as pc
+        from .expressions import FunctionCall, ColumnRef
+
+        result_arrays = []
+
+        for group_key, row_indices in groups.items():
+            row_data = self._compute_group_row(table, group_key, row_indices)
+            result_arrays.append(row_data)
+
+        return self._arrays_to_batch(result_arrays)
+
+    def _compute_group_row(self, table: pa.Table, group_key: tuple, row_indices: List[int]) -> List:
+        """Compute one result row for a group."""
+        from .expressions import FunctionCall, ColumnRef
+        import pyarrow.compute as pc
+
+        row_data = []
+
+        for agg_expr in self.aggregates:
+            if isinstance(agg_expr, ColumnRef):
+                if len(group_key) > 0:
+                    idx = self._find_group_by_index(agg_expr)
+                    row_data.append(group_key[idx])
+                else:
+                    row_data.append(None)
+            elif isinstance(agg_expr, FunctionCall):
+                value = self._compute_aggregate(table, agg_expr, row_indices)
+                row_data.append(value)
+
+        return row_data
+
+    def _find_group_by_index(self, col_ref: "ColumnRef") -> int:
+        """Find index of column in group_by list."""
+        from .expressions import ColumnRef
+
+        for idx, group_expr in enumerate(self.group_by):
+            if isinstance(group_expr, ColumnRef):
+                if group_expr.column == col_ref.column:
+                    return idx
+
+        return 0
+
+    def _compute_aggregate(self, table: pa.Table, func: "FunctionCall", row_indices: List[int]) -> Any:
+        """Compute aggregate function value."""
+        import pyarrow.compute as pc
+        from .expressions import ColumnRef
+
+        func_name = func.function_name.upper()
+
+        if func_name == "COUNT":
+            return len(row_indices)
+
+        if len(func.args) == 0:
+            return len(row_indices)
+
+        arg = func.args[0]
+        if not isinstance(arg, ColumnRef):
+            return None
+
+        col_name = arg.column
+        if col_name == "*":
+            return len(row_indices)
+
+        column = table.column(col_name)
+        subset = column.take(row_indices)
+
+        if func_name == "SUM":
+            return pc.sum(subset).as_py()
+        if func_name == "AVG":
+            return pc.mean(subset).as_py()
+        if func_name == "MIN":
+            return pc.min(subset).as_py()
+        if func_name == "MAX":
+            return pc.max(subset).as_py()
+
+        return None
+
+    def _arrays_to_batch(self, result_arrays: List[List]) -> pa.RecordBatch:
+        """Convert list of row data to RecordBatch."""
+        if len(result_arrays) == 0:
+            return pa.RecordBatch.from_arrays([], names=self.output_names)
+
+        num_cols = len(result_arrays[0])
+        columns = []
+
+        for col_idx in range(num_cols):
+            col_data = []
+            for row in result_arrays:
+                col_data.append(row[col_idx])
+            columns.append(col_data)
+
+        arrays = []
+        for col_data in columns:
+            arrays.append(pa.array(col_data))
+
+        return pa.RecordBatch.from_arrays(arrays, names=self.output_names)
 
     def schema(self) -> pa.Schema:
-        raise NotImplementedError("Schema resolution not yet implemented")
+        """Get output schema."""
+        from .expressions import FunctionCall, ColumnRef
+
+        input_schema = self.input.schema()
+        fields = []
+
+        for idx, agg_expr in enumerate(self.aggregates):
+            name = self.output_names[idx]
+
+            if isinstance(agg_expr, ColumnRef):
+                field_index = input_schema.get_field_index(agg_expr.column)
+                field = input_schema.field(field_index)
+                fields.append(pa.field(name, field.type))
+            elif isinstance(agg_expr, FunctionCall):
+                func_name = agg_expr.function_name.upper()
+                if func_name in ("COUNT", "SUM"):
+                    fields.append(pa.field(name, pa.int64()))
+                elif func_name == "AVG":
+                    fields.append(pa.field(name, pa.float64()))
+                else:
+                    fields.append(pa.field(name, pa.float64()))
+
+        return pa.schema(fields)
 
     def estimated_cost(self) -> float:
         raise NotImplementedError("Cost estimation not yet implemented")
