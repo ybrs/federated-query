@@ -1,104 +1,146 @@
 """Example aggregation queries demonstrating Phase 3 functionality with federated sources."""
 
 from pathlib import Path
-from federated_query.config.config import load_config
-from federated_query.catalog import Catalog
+
+from federated_query.catalog.catalog import Catalog
+from federated_query.config.config import ExecutorConfig, load_config
 from federated_query.datasources.duckdb import DuckDBDataSource
 from federated_query.datasources.postgresql import PostgreSQLDataSource
-from federated_query.parser import Parser, Binder
-from federated_query.optimizer.physical_planner import PhysicalPlanner
 from federated_query.executor.executor import Executor
-from federated_query.config.config import ExecutorConfig
+from federated_query.optimizer.physical_planner import PhysicalPlanner
+from federated_query.parser import Binder, Parser
 
 
-def setup_federated_data():
-    """Set up PostgreSQL and DuckDB with related data for federated aggregations."""
-    catalog = Catalog()
+def create_datasource(name, ds_config):
+    """Instantiate a datasource from config entry."""
+    if ds_config.type == "duckdb":
+        return DuckDBDataSource(name, ds_config.config)
+    if ds_config.type == "postgresql":
+        return PostgreSQLDataSource(name, ds_config.config)
+    raise ValueError(f"Unsupported datasource type: {ds_config.type}")
 
-    duckdb_config = {
-        "database": ":memory:",
-        "read_only": False,
-    }
-    duckdb_ds = DuckDBDataSource(name="analytics_db", config=duckdb_config)
-    duckdb_ds.connect()
 
-    duckdb_ds.connection.execute("""
+def create_duckdb_sample_data(datasource):
+    """Create sample DuckDB tables used by the aggregation examples."""
+    conn = datasource.connection
+
+    conn.execute("DROP TABLE IF EXISTS products")
+    conn.execute(
+        """
         CREATE TABLE products (
             product_id INTEGER,
             product_name VARCHAR,
             category VARCHAR,
             unit_price DOUBLE
         )
-    """)
-
-    duckdb_ds.connection.execute("""
+        """
+    )
+    conn.execute(
+        """
         INSERT INTO products VALUES
         (1, 'Widget Pro', 'Electronics', 25.99),
         (2, 'Gadget Plus', 'Electronics', 45.50),
         (3, 'Tool Kit', 'Hardware', 89.99),
         (4, 'Smart Device', 'Electronics', 199.99),
         (5, 'Premium Tool', 'Hardware', 149.99)
-    """)
+        """
+    )
 
-    catalog.register_datasource(duckdb_ds)
 
-    pg_config = {
-        "host": "localhost",
-        "port": 5466,
-        "database": "analytics",
-        "user": "aybarsb",
-        "password": "",
-    }
-
-    pg_ds = PostgreSQLDataSource(name="sales_db", config=pg_config)
-    pg_ds.connect()
-
+def create_postgres_sample_data(datasource):
+    """Create sample PostgreSQL tables used by the aggregation examples."""
+    conn = datasource._get_connection()
     try:
+        with conn.cursor() as cursor:
+            cursor.execute("DROP TABLE IF EXISTS orders CASCADE")
+            cursor.execute(
+                """
+                CREATE TABLE orders (
+                    order_id INTEGER PRIMARY KEY,
+                    product_id INTEGER,
+                    region VARCHAR(50),
+                    quantity INTEGER,
+                    order_date DATE
+                )
+                """
+            )
+            cursor.execute(
+                """
+                INSERT INTO orders VALUES
+                (101, 1, 'North', 5, '2024-01-15'),
+                (102, 2, 'South', 3, '2024-01-16'),
+                (103, 1, 'North', 8, '2024-01-17'),
+                (104, 3, 'East', 2, '2024-01-18'),
+                (105, 2, 'South', 6, '2024-01-19'),
+                (106, 4, 'North', 1, '2024-01-20'),
+                (107, 1, 'East', 4, '2024-01-21'),
+                (108, 5, 'West', 2, '2024-01-22'),
+                (109, 3, 'West', 3, '2024-01-23'),
+                (110, 2, 'North', 7, '2024-01-24')
+                """
+            )
+            conn.commit()
+            print("  Created orders table in PostgreSQL")
+    finally:
+        datasource._return_connection(conn)
 
-        conn = pg_ds._get_connection()
+
+def setup_federated_data():
+    """Set up datasources defined in dbconfig.yaml and seed sample data."""
+    config_path = Path(__file__).parent / "dbconfig.yaml"
+    config = load_config(str(config_path))
+
+    print(f"Loaded config with {len(config.datasources)} datasource(s)\n")
+
+    catalog = Catalog()
+    duckdb_ds = None
+    postgres_ds = None
+
+    for ds_name, ds_config in config.datasources.items():
+        print(f"Setting up datasource: {ds_name} ({ds_config.type})")
+        datasource = None
+
         try:
-            with conn.cursor() as cursor:
-                cursor.execute("DROP TABLE IF EXISTS orders CASCADE")
+            datasource = create_datasource(ds_name, ds_config)
+            datasource.connect()
 
-                cursor.execute("""
-                    CREATE TABLE orders (
-                        order_id INTEGER PRIMARY KEY,
-                        product_id INTEGER,
-                        region VARCHAR(50),
-                        quantity INTEGER,
-                        order_date DATE
-                    )
-                """)
+            if ds_config.type == "duckdb":
+                create_duckdb_sample_data(datasource)
+                duckdb_ds = datasource
+                print("  Seeded products table in DuckDB")
+            elif ds_config.type == "postgresql":
+                create_postgres_sample_data(datasource)
+                postgres_ds = datasource
 
-                cursor.execute("""
-                    INSERT INTO orders VALUES
-                    (101, 1, 'North', 5, '2024-01-15'),
-                    (102, 2, 'South', 3, '2024-01-16'),
-                    (103, 1, 'North', 8, '2024-01-17'),
-                    (104, 3, 'East', 2, '2024-01-18'),
-                    (105, 2, 'South', 6, '2024-01-19'),
-                    (106, 4, 'North', 1, '2024-01-20'),
-                    (107, 1, 'East', 4, '2024-01-21'),
-                    (108, 5, 'West', 2, '2024-01-22'),
-                    (109, 3, 'West', 3, '2024-01-23'),
-                    (110, 2, 'North', 7, '2024-01-24')
-                """)
+            catalog.register_datasource(datasource)
+            print(f"  Successfully registered {ds_name}")
 
-                conn.commit()
-                print("  Created orders table in PostgreSQL")
-        finally:
-            pg_ds._return_connection(conn)
+        except Exception as e:
+            print(f"  WARNING: Could not set up {ds_name}: {e}")
+            if datasource is not None:
+                try:
+                    datasource.disconnect()
+                except Exception:
+                    pass
+            print("  Continuing without this datasource\n")
+            continue
 
-        catalog.register_datasource(pg_ds)
-        has_postgres = True
+        print()
 
-    except Exception as e:
-        print(f"  WARNING: Could not connect to PostgreSQL: {e}")
-        print("  Running with DuckDB only (federated examples will be skipped)")
-        has_postgres = False
+    if duckdb_ds is None:
+        raise RuntimeError(
+            "DuckDB datasource is required for aggregation examples. "
+            "Please ensure dbconfig.yaml defines an accessible DuckDB datasource."
+        )
 
+    if not catalog.datasources:
+        raise RuntimeError("No datasources were successfully registered.")
+
+    print("Loading metadata from datasources...")
     catalog.load_metadata()
-    return catalog, duckdb_ds, has_postgres
+    print()
+
+    return catalog, duckdb_ds, postgres_ds
 
 
 def execute_query(catalog, sql, description):
@@ -129,7 +171,7 @@ def execute_query(catalog, sql, description):
         print()
 
 
-def run_single_source_examples(catalog):
+def run_single_source_examples(catalog, duckdb_name):
     """Run aggregation examples on single data source."""
     print("\n" + "="*80)
     print("SECTION 1: SINGLE-SOURCE AGGREGATIONS")
@@ -137,30 +179,30 @@ def run_single_source_examples(catalog):
 
     execute_query(
         catalog,
-        """
+        f"""
         SELECT COUNT(*) as total_products
-        FROM analytics_db.main.products
+        FROM {duckdb_name}.main.products
         """,
         "Simple COUNT - Total number of products"
     )
 
     execute_query(
         catalog,
-        """
+        f"""
         SELECT
             category,
             COUNT(*) as product_count,
             AVG(unit_price) as avg_price,
             MIN(unit_price) as min_price,
             MAX(unit_price) as max_price
-        FROM analytics_db.main.products
+        FROM {duckdb_name}.main.products
         GROUP BY category
         """,
         "GROUP BY category - Product statistics by category"
     )
 
 
-def run_federated_aggregation_examples(catalog):
+def run_federated_aggregation_examples(catalog, duckdb_name, postgres_name):
     """Run federated JOIN + aggregation examples."""
     print("\n" + "="*80)
     print("SECTION 2: FEDERATED JOIN + AGGREGATION")
@@ -168,14 +210,14 @@ def run_federated_aggregation_examples(catalog):
 
     execute_query(
         catalog,
-        """
+        f"""
         SELECT
             p.category,
             COUNT(*) as order_count,
             SUM(o.quantity) as total_quantity,
             AVG(o.quantity) as avg_quantity
-        FROM sales_db.public.orders o
-        JOIN analytics_db.main.products p ON o.product_id = p.product_id
+        FROM {postgres_name}.public.orders o
+        JOIN {duckdb_name}.main.products p ON o.product_id = p.product_id
         GROUP BY p.category
         """,
         "Federated JOIN + GROUP BY - Orders by product category"
@@ -183,14 +225,14 @@ def run_federated_aggregation_examples(catalog):
 
     execute_query(
         catalog,
-        """
+        f"""
         SELECT
             o.region,
             p.category,
             COUNT(*) as order_count,
             SUM(o.quantity) as total_items
-        FROM sales_db.public.orders o
-        JOIN analytics_db.main.products p ON o.product_id = p.product_id
+        FROM {postgres_name}.public.orders o
+        JOIN {duckdb_name}.main.products p ON o.product_id = p.product_id
         GROUP BY o.region, p.category
         """,
         "Multi-column GROUP BY - Orders by region and category"
@@ -198,14 +240,14 @@ def run_federated_aggregation_examples(catalog):
 
     execute_query(
         catalog,
-        """
+        f"""
         SELECT
             p.product_name,
             COUNT(*) as times_ordered,
             SUM(o.quantity) as total_sold,
             AVG(o.quantity) as avg_order_size
-        FROM sales_db.public.orders o
-        JOIN analytics_db.main.products p ON o.product_id = p.product_id
+        FROM {postgres_name}.public.orders o
+        JOIN {duckdb_name}.main.products p ON o.product_id = p.product_id
         GROUP BY p.product_name
         """,
         "Product popularity - Aggregated sales by product"
@@ -213,14 +255,14 @@ def run_federated_aggregation_examples(catalog):
 
     execute_query(
         catalog,
-        """
+        f"""
         SELECT
             o.region,
             COUNT(DISTINCT o.product_id) as unique_products,
             COUNT(*) as total_orders,
             SUM(o.quantity) as total_items
-        FROM sales_db.public.orders o
-        JOIN analytics_db.main.products p ON o.product_id = p.product_id
+        FROM {postgres_name}.public.orders o
+        JOIN {duckdb_name}.main.products p ON o.product_id = p.product_id
         WHERE p.category = 'Electronics'
         GROUP BY o.region
         """,
@@ -228,8 +270,11 @@ def run_federated_aggregation_examples(catalog):
     )
 
 
-def show_aggregation_pushdown_examples():
+def show_aggregation_pushdown_examples(duckdb_name, postgres_name):
     """Show aggregation pushdown examples (future optimization)."""
+    duckdb_label = duckdb_name or "DuckDB"
+    postgres_label = postgres_name or "PostgreSQL"
+
     print("\n" + "="*80)
     print("SECTION 3: AGGREGATION PUSHDOWN (FUTURE OPTIMIZATION)")
     print("="*80)
@@ -241,16 +286,16 @@ def show_aggregation_pushdown_examples():
     print("="*80)
     print("EXAMPLE: Single-source aggregation pushdown")
     print("="*80)
-    print("""
+    print(f"""
 Current behavior:
-  1. Scan all rows from PostgreSQL orders table
+  1. Scan all rows from {postgres_label}.public.orders table
   2. Transfer all data to query engine
   3. Perform aggregation in query engine
 
 Optimized behavior (with pushdown):
-  1. Push aggregation to PostgreSQL
-  2. PostgreSQL executes: SELECT region, COUNT(*), SUM(quantity)
-                         FROM orders GROUP BY region
+  1. Push aggregation to {postgres_label}
+  2. {postgres_label} executes: SELECT region, COUNT(*), SUM(quantity)
+                                FROM orders GROUP BY region
   3. Transfer only aggregated results (much smaller)
 
 SQL:
@@ -258,7 +303,7 @@ SELECT
     region,
     COUNT(*) as order_count,
     SUM(quantity) as total_quantity
-FROM sales_db.public.orders
+FROM {postgres_label}.public.orders
 GROUP BY region
 
 Benefits:
@@ -270,19 +315,19 @@ Benefits:
     print("\n" + "="*80)
     print("EXAMPLE: Partial aggregation pushdown")
     print("="*80)
-    print("""
+    print(f"""
 Current behavior:
-  1. Scan all orders from PostgreSQL
-  2. Scan all products from DuckDB
+  1. Scan all orders from {postgres_label}
+  2. Scan all products from {duckdb_label}
   3. JOIN in query engine
   4. Aggregate in query engine
 
 Optimized behavior (with partial pushdown):
-  1. Push partial aggregation to PostgreSQL:
+  1. Push partial aggregation to {postgres_label}:
      SELECT product_id, SUM(quantity) as qty_sum, COUNT(*) as cnt
      FROM orders GROUP BY product_id
   2. Transfer pre-aggregated data (5 rows instead of 10)
-  3. JOIN with products table in DuckDB
+  3. JOIN with products table in {duckdb_label}
   4. Final aggregation in query engine
 
 SQL:
@@ -290,12 +335,12 @@ SELECT
     p.category,
     SUM(o.quantity) as total_quantity,
     COUNT(*) as order_count
-FROM sales_db.public.orders o
-JOIN analytics_db.main.products p ON o.product_id = p.product_id
+FROM {postgres_label}.public.orders o
+JOIN {duckdb_label}.main.products p ON o.product_id = p.product_id
 GROUP BY p.category
 
 Benefits:
-  - Reduces data transfer from PostgreSQL (5 rows instead of 10)
+  - Reduces data transfer from {postgres_label} (5 rows instead of 10)
   - Some aggregation work offloaded to source database
   - More efficient when source has many rows per group
 """)
@@ -303,7 +348,7 @@ Benefits:
     print("\n" + "="*80)
     print("EXAMPLE: Multi-stage aggregation pushdown")
     print("="*80)
-    print("""
+    print(f"""
 For queries with aggregations on both sides of a JOIN, we could push
 aggregations to both sources:
 
@@ -315,11 +360,11 @@ SELECT
     category_stats.product_count
 FROM
     (SELECT region, COUNT(*) as order_count
-     FROM sales_db.public.orders
+     FROM {postgres_label}.public.orders
      GROUP BY region) region_stats
 CROSS JOIN
     (SELECT category, COUNT(*) as product_count
-     FROM analytics_db.main.products
+     FROM {duckdb_label}.main.products
      GROUP BY category) category_stats
 
 This would push both GROUP BYs to their respective sources before the JOIN.
@@ -351,19 +396,22 @@ def main():
     print("  - Future aggregation pushdown optimization opportunities")
     print()
 
-    catalog, duckdb_ds, has_postgres = setup_federated_data()
+    catalog, duckdb_ds, postgres_ds = setup_federated_data()
+    duckdb_name = duckdb_ds.name
+    has_postgres = postgres_ds is not None
+    postgres_name = postgres_ds.name if has_postgres else None
 
     print(f"\nSetup complete:")
-    print(f"  - DuckDB: products table (5 rows)")
+    print(f"  - DuckDB ({duckdb_name}): products table (5 rows)")
     if has_postgres:
-        print(f"  - PostgreSQL: orders table (10 rows)")
+        print(f"  - PostgreSQL ({postgres_name}): orders table (10 rows)")
     else:
         print(f"  - PostgreSQL: NOT AVAILABLE")
 
-    run_single_source_examples(catalog)
+    run_single_source_examples(catalog, duckdb_name)
 
     if has_postgres:
-        run_federated_aggregation_examples(catalog)
+        run_federated_aggregation_examples(catalog, duckdb_name, postgres_name)
     else:
         print("\n" + "="*80)
         print("SECTION 2: FEDERATED JOIN + AGGREGATION")
@@ -372,54 +420,57 @@ def main():
         print("\nTo run federated examples, start PostgreSQL:")
         print("  docker-compose up -d postgres")
 
-    show_aggregation_pushdown_examples()
+    show_aggregation_pushdown_examples(duckdb_name, postgres_name)
 
     print("\n" + "=" * 70)
     print("HAVING CLAUSE EXAMPLES")
     print("=" * 70)
 
-    execute_query(
-        catalog,
-        """
-        SELECT
-            region,
-            COUNT(*) as order_count,
-            SUM(quantity) as total_items
-        FROM sales_db.public.orders
-        GROUP BY region
-        HAVING COUNT(*) > 5
-        """,
-        "HAVING with COUNT - Regions with many orders"
-    )
+    if has_postgres:
+        execute_query(
+            catalog,
+            f"""
+            SELECT
+                region,
+                COUNT(*) as order_count,
+                SUM(quantity) as total_items
+            FROM {postgres_name}.public.orders
+            GROUP BY region
+            HAVING COUNT(*) > 1
+            """,
+            "HAVING with COUNT - Regions with many orders"
+        )
 
-    execute_query(
-        catalog,
-        """
-        SELECT
-            product_id,
-            SUM(quantity) as total_quantity,
-            AVG(quantity) as avg_quantity
-        FROM sales_db.public.orders
-        GROUP BY product_id
-        HAVING SUM(quantity) >= 100
-        """,
-        "HAVING with SUM - High-volume products"
-    )
+        execute_query(
+            catalog,
+            f"""
+            SELECT
+                product_id,
+                SUM(quantity) as total_quantity,
+                AVG(quantity) as avg_quantity
+            FROM {postgres_name}.public.orders
+            GROUP BY product_id
+            HAVING SUM(quantity) >= 10
+            """,
+            "HAVING with SUM - High-volume products"
+        )
 
-    execute_query(
-        catalog,
-        """
-        SELECT
-            p.category,
-            COUNT(*) as order_count,
-            AVG(o.quantity) as avg_order_size
-        FROM sales_db.public.orders o
-        JOIN analytics_db.main.products p ON o.product_id = p.product_id
-        GROUP BY p.category
-        HAVING AVG(o.quantity) > 5
-        """,
-        "HAVING with AVG - Categories with large average orders"
-    )
+        execute_query(
+            catalog,
+            f"""
+            SELECT
+                p.category,
+                COUNT(*) as order_count,
+                AVG(o.quantity) as avg_order_size
+            FROM {postgres_name}.public.orders o
+            JOIN {duckdb_name}.main.products p ON o.product_id = p.product_id
+            GROUP BY p.category
+            HAVING AVG(o.quantity) > 2
+            """,
+            "HAVING with AVG - Categories with large average orders"
+        )
+    else:
+        print("Skipping HAVING clause examples (PostgreSQL not available)")
 
     print("\n" + "="*80)
     print("SUMMARY")
