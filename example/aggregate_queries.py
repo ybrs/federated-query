@@ -373,6 +373,53 @@ def main():
 
     show_aggregation_pushdown_examples()
 
+    print("\n" + "=" * 70)
+    print("HAVING CLAUSE EXAMPLES")
+    print("=" * 70)
+
+    execute_query(
+        catalog,
+        """
+        SELECT
+            region,
+            COUNT(*) as order_count,
+            SUM(quantity) as total_items
+        FROM sales_db.public.orders
+        GROUP BY region
+        HAVING COUNT(*) > 5
+        """,
+        "HAVING with COUNT - Regions with many orders"
+    )
+
+    execute_query(
+        catalog,
+        """
+        SELECT
+            product_id,
+            SUM(quantity) as total_quantity,
+            AVG(quantity) as avg_quantity
+        FROM sales_db.public.orders
+        GROUP BY product_id
+        HAVING SUM(quantity) >= 100
+        """,
+        "HAVING with SUM - High-volume products"
+    )
+
+    execute_query(
+        catalog,
+        """
+        SELECT
+            p.category,
+            COUNT(*) as order_count,
+            AVG(o.quantity) as avg_order_size
+        FROM sales_db.public.orders o
+        JOIN analytics_db.main.products p ON o.product_id = p.product_id
+        GROUP BY p.category
+        HAVING AVG(o.quantity) > 5
+        """,
+        "HAVING with AVG - Categories with large average orders"
+    )
+
     print("\n" + "="*80)
     print("SUMMARY")
     print("="*80)
@@ -383,6 +430,7 @@ def main():
     print("  ✓ Multiple aggregate functions in single query")
     print("  ✓ Hash-based aggregation for efficient execution")
     print("  ✓ Federated JOIN + aggregation (cross-database)")
+    print("  ✓ HAVING clause for filtering aggregated results")
     print()
     print("Future optimizations:")
     print("  ⏳ Aggregation pushdown to source databases")

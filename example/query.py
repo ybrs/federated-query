@@ -209,6 +209,37 @@ def run_example_queries(catalog):
         show_sql=True,
     )
 
+    execute_query(
+        catalog,
+        """
+        SELECT
+            region,
+            COUNT(*) as order_count,
+            SUM(amount) as total_revenue
+        FROM postgres_prod.public.orders
+        GROUP BY region
+        HAVING COUNT(*) > 1
+        """,
+        "HAVING clause - Regions with multiple orders",
+        show_sql=True,
+    )
+
+    execute_query(
+        catalog,
+        """
+        SELECT
+            c.name,
+            COUNT(*) as order_count,
+            SUM(o.amount) as total_spent
+        FROM local_duckdb.main.customers c
+        JOIN postgres_prod.public.orders o ON c.id = o.customer_id
+        GROUP BY c.name
+        HAVING SUM(o.amount) > 2000
+        """,
+        "Federated JOIN + Aggregation + HAVING - High-value customers",
+        show_sql=True,
+    )
+
 
 def run_legacy_queries(catalog):
     """Replay legacy ad-hoc queries from the original example script."""
