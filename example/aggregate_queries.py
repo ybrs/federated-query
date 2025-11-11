@@ -44,15 +44,16 @@ def setup_federated_data():
 
     pg_config = {
         "host": "localhost",
-        "port": 5432,
-        "database": "testdb",
-        "user": "testuser",
-        "password": "testpass",
+        "port": 5466,
+        "database": "analytics",
+        "user": "aybarsb",
+        "password": "",
     }
 
+    pg_ds = PostgreSQLDataSource(name="sales_db", config=pg_config)
+    pg_ds.connect()
+
     try:
-        pg_ds = PostgreSQLDataSource(name="sales_db", config=pg_config)
-        pg_ds.connect()
 
         conn = pg_ds._get_connection()
         try:
