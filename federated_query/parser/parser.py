@@ -355,7 +355,7 @@ class Parser:
         Returns:
             True if expression contains aggregate function
         """
-        if isinstance(expr, exp.AggFunc):
+        if self._is_aggregate_function(expr):
             return True
 
         for child in expr.iter_expressions():
@@ -363,6 +363,11 @@ class Parser:
                 return True
 
         return False
+
+    def _is_aggregate_function(self, expr: exp.Expression) -> bool:
+        """Check if an expression represents an aggregate function."""
+        aggregate_types = (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)
+        return isinstance(expr, exp.AggFunc) or isinstance(expr, aggregate_types)
 
     def _create_aggregate_node_without_grouping(
         self, select: exp.Select, input_plan: LogicalPlanNode
@@ -477,18 +482,9 @@ class Parser:
     def _build_select_clause(
         self, select: exp.Select, input_plan: LogicalPlanNode
     ) -> LogicalPlanNode:
-        """Build project node from SELECT clause.
-
-        Args:
-            select: sqlglot Select node
-            input_plan: Input logical plan
-
-        Returns:
-            Logical plan with projection
-        """
+        """Build project node from SELECT clause."""
         if isinstance(input_plan, Aggregate):
             return input_plan
-
         expressions = []
         aliases = []
 
@@ -556,7 +552,7 @@ class Parser:
             return self._convert_expression(expr.this)
         if isinstance(expr, exp.Star):
             return ColumnRef(table=None, column="*")
-        if isinstance(expr, exp.AggFunc):
+        if self._is_aggregate_function(expr):
             return self._convert_aggregate_function(expr)
 
         raise ValueError(f"Unsupported expression type: {type(expr)}")
@@ -662,6 +658,9 @@ class Parser:
         if hasattr(func, "this") and func.this:
             arg = self._convert_expression(func.this)
             args.append(arg)
+        elif isinstance(func, exp.Count):
+            # Handle COUNT(*) style functions where sqlglot leaves arg empty
+            args.append(ColumnRef(table=None, column="*"))
         return args
 
     def parse_to_logical_plan(self, sql: str) -> LogicalPlanNode:

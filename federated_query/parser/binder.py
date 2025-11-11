@@ -191,10 +191,18 @@ class Binder:
     def _bind_aggregate(self, aggregate: Aggregate) -> Aggregate:
         """Bind an Aggregate node."""
         bound_input = self.bind(aggregate.input)
-        table = self._get_table_from_plan(bound_input)
-
-        bound_group_by = self._bind_group_by_expressions(aggregate.group_by, table)
-        bound_aggregates = self._bind_aggregate_expressions(aggregate.aggregates, table)
+        if self._contains_join(bound_input):
+            tables = self._extract_tables_from_tree(bound_input)
+            bound_group_by = self._bind_group_by_multi_table(aggregate.group_by, tables)
+            bound_aggregates = self._bind_aggregate_expressions_multi_table(
+                aggregate.aggregates, tables
+            )
+        else:
+            table = self._get_table_from_plan(bound_input)
+            bound_group_by = self._bind_group_by_expressions(aggregate.group_by, table)
+            bound_aggregates = self._bind_aggregate_expressions(
+                aggregate.aggregates, table
+            )
 
         return Aggregate(
             input=bound_input,
@@ -223,19 +231,50 @@ class Binder:
             bound.append(bound_expr)
         return bound
 
+    def _bind_group_by_multi_table(
+        self, expressions: List[Expression], tables: Dict[Optional[str], Table]
+    ) -> List[Expression]:
+        """Bind GROUP BY expressions referencing multiple tables."""
+        return [self._bind_expression_multi_table(expr, tables) for expr in expressions]
+
+    def _bind_aggregate_expressions_multi_table(
+        self, expressions: List[Expression], tables: Dict[Optional[str], Table]
+    ) -> List[Expression]:
+        """Bind aggregate expressions when multiple tables are available."""
+        bound = []
+        for expr in expressions:
+            bound.append(self._bind_aggregate_expression_multi_table(expr, tables))
+        return bound
+
     def _bind_aggregate_expression(
         self, expr: Expression, table: Optional[Table]
     ) -> Expression:
         """Bind an aggregate expression."""
-        if isinstance(expr, FunctionCall) and expr.is_aggregate:
+        if isinstance(expr, FunctionCall):
             bound_args = self._bind_expressions(expr.args, table)
             return FunctionCall(
                 function_name=expr.function_name,
                 args=bound_args,
-                is_aggregate=True,
+                is_aggregate=expr.is_aggregate,
             )
 
         return self._bind_expression(expr, table)
+
+    def _bind_aggregate_expression_multi_table(
+        self, expr: Expression, tables: Dict[Optional[str], Table]
+    ) -> Expression:
+        """Bind aggregate expression referencing multiple tables."""
+        if isinstance(expr, FunctionCall):
+            bound_args = [
+                self._bind_expression_multi_table(arg, tables) for arg in expr.args
+            ]
+            return FunctionCall(
+                function_name=expr.function_name,
+                args=bound_args,
+                is_aggregate=expr.is_aggregate,
+            )
+
+        return self._bind_expression_multi_table(expr, tables)
 
     def _get_tables_from_join(
         self, left: LogicalPlanNode, right: LogicalPlanNode
@@ -389,12 +428,12 @@ class Binder:
             return col_ref
 
         if table is None:
-            raise BindingError(f"Cannot resolve column {col_ref.column}: no table context")
+            raise BindingError(f"Can not resolve column '{col_ref.column}'': no table context")
 
         column = table.get_column(col_ref.column)
         if column is None:
             raise BindingError(
-                f"Column '{col_ref.column}' not found in table {table.name}"
+                f"Column '{col_ref.column}' not found in table '{table.name}'"
             )
 
         return ColumnRef(
