@@ -130,85 +130,121 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 **Status:** ✅ COMPLETED
 **Goal**: Execute joins across data sources
 **Tests**: 5 join tests passing, 70 total tests
+**Completion Date**: Phase 2 completed
 
-### 2.1 Logical Plan - Joins
+### 2.1 Logical Plan - Joins ✅
 - [x] Add Join logical plan node
 - [x] Support join types (INNER, LEFT, RIGHT, FULL, CROSS)
 - [x] Parse ON conditions and extract join predicates
 - [x] Handle multi-way joins
 
-### 2.2 Physical Join Operators
+### 2.2 Physical Join Operators ✅
 - [x] Implement Hash Join
   - [x] Build hash table from right side
   - [x] Probe with left side
   - [x] Handle NULL values correctly (basic INNER JOIN)
+  - [x] Schema merging with duplicate column renaming
 - [x] Implement Nested Loop Join (fallback for non-equi joins)
 - [x] Implement cross-product handling
 - [x] Schema resolution for joins
 
 ### 2.3 Data Gathering
-- [ ] Implement Gather operator (fetch remote data) - DEFERRED
-- [ ] Handle parallel fetching from multiple sources - DEFERRED
-- [ ] Implement streaming for large results - DEFERRED
-- [ ] Add memory management (spill to disk if needed) - DEFERRED
+- [ ] Implement Gather operator (fetch remote data) - DEFERRED to future phase
+- [ ] Handle parallel fetching from multiple sources - DEFERRED to future phase
+- [ ] Implement streaming for large results - DEFERRED to future phase
+- [ ] Add memory management (spill to disk if needed) - DEFERRED to future phase
 
-### 2.4 Join Strategy Selection (Basic)
+### 2.4 Join Strategy Selection (Basic) ✅
 - [x] Choose join operator based on join type (Hash vs Nested Loop)
 - [x] Extract equi-join keys from conditions
 - [x] Physical planning for joins
-- [ ] Detect when join can be pushed to single data source - TODO Phase 3
-- [ ] Implement remote join pushdown - TODO Phase 3
+- [ ] Detect when join can be pushed to single data source - TODO Phase 6 (Logical Optimization)
+- [ ] Implement remote join pushdown - TODO Phase 6 (Logical Optimization)
 
-### 2.5 Testing
+### 2.5 Testing ✅
 - [x] Test joins on same data source
 - [x] Test JOIN with WHERE clauses
 - [x] Test specific column selection in joins
 - [x] Test SELECT * with joins
 - [x] Verify logical plan creation for joins
+- [x] Test federated join across PostgreSQL and DuckDB (example/query.py)
 
 **Deliverable**: ✅ Can execute `SELECT c.name, o.order_id, o.amount FROM customers c JOIN orders o ON c.id = o.customer_id WHERE o.amount > 100`
 
-**Implementation Notes**:
-- Parser extends sqlglot AST to logical Join nodes
-- Binder handles multi-table column resolution with table aliases
-- PhysicalHashJoin implements in-memory hash join algorithm
-- PhysicalNestedLoopJoin serves as fallback for non-equi joins
-- Physical planner chooses join strategy based on condition analysis
-- All joins currently execute locally (cross-datasource gathering deferred)
+**Implementation Summary**:
+- **Parser (federated_query/parser/parser.py:395-450)**: Converts sqlglot JOIN AST to logical Join nodes, extracts join conditions
+- **Binder (federated_query/parser/binder.py:175-220)**: Handles multi-table column resolution with table aliases and scope management
+- **PhysicalHashJoin (federated_query/plan/physical.py:263-412)**: In-memory hash join with configurable build side, handles equi-joins efficiently
+- **PhysicalNestedLoopJoin (federated_query/plan/physical.py:415-577)**: Fallback for non-equi joins and complex conditions
+- **Physical Planner (federated_query/optimizer/physical_planner.py:50-110)**: Chooses join strategy based on condition analysis (equi-join → hash join, non-equi → nested loop)
+- **Test Coverage**:
+  - tests/test_e2e_joins.py: 5 comprehensive join tests
+  - example/query.py: Real-world federated join example
+- All joins currently execute locally by materializing data from sources (cross-datasource parallel gathering deferred to Phase 9)
 
 ---
 
-## Phase 3: Aggregations and Grouping (Week 6)
+## Phase 3: Aggregations and Grouping
 
+**Status:** 🚧 IN PROGRESS
 **Goal**: Support GROUP BY and aggregation functions
+**Tests**: TBD
+
+### Current Status
+- ✅ Logical plan node `Aggregate` exists (federated_query/plan/logical.py:167-189)
+- ✅ Physical plan node `PhysicalHashAggregate` skeleton exists (federated_query/plan/physical.py:581-603)
+- ✅ `FunctionCall` expression with `is_aggregate` flag exists (federated_query/plan/expressions.py:183-207)
+- ✅ `AggregateFunction` enum exists (COUNT, SUM, AVG, MIN, MAX, COUNT_DISTINCT)
+- ✅ Parser can parse aggregate queries (test_parse_aggregate passing)
+- ⏳ Physical execution not yet implemented
 
 ### 3.1 Logical Plan - Aggregations
-- [ ] Add Aggregate logical plan node
-- [ ] Parse GROUP BY clauses
+- [x] Add Aggregate logical plan node - EXISTS
+- [ ] Enhance parser to create Aggregate nodes from GROUP BY
 - [ ] Parse aggregate functions (SUM, COUNT, AVG, MIN, MAX)
 - [ ] Handle HAVING clauses
+- [ ] Support COUNT(*) and COUNT(DISTINCT col)
 
 ### 3.2 Physical Aggregate Operators
-- [ ] Implement Hash Aggregate
+- [ ] Implement PhysicalHashAggregate.execute()
+  - [ ] Build hash table for groups
+  - [ ] Accumulate aggregate values
+  - [ ] Support multiple aggregates per group
 - [ ] Support grouping by multiple columns
-- [ ] Implement aggregation functions
+- [ ] Implement aggregation functions:
+  - [ ] COUNT (with and without DISTINCT)
+  - [ ] SUM
+  - [ ] AVG
+  - [ ] MIN
+  - [ ] MAX
 - [ ] Handle NULL values in aggregations
+- [ ] Schema resolution for aggregate output
 
-### 3.3 Aggregate Pushdown
-- [ ] Detect when aggregation can be pushed to data source
-- [ ] Implement partial aggregation strategy
-  - [ ] Partial aggregate on each source
-  - [ ] Final aggregate locally
-- [ ] Handle DISTINCT aggregates
+### 3.3 Aggregate Pushdown (Deferred to Phase 6)
+- [ ] Detect when aggregation can be pushed to data source - DEFERRED
+- [ ] Implement partial aggregation strategy - DEFERRED
+  - [ ] Partial aggregate on each source - DEFERRED
+  - [ ] Final aggregate locally - DEFERRED
+- [ ] Handle DISTINCT aggregates - DEFERRED
 
 ### 3.4 Testing
-- [ ] Test simple aggregations (COUNT, SUM, AVG)
+- [ ] Test simple aggregations without GROUP BY (COUNT, SUM, AVG)
+- [ ] Test GROUP BY with single column
 - [ ] Test GROUP BY with multiple columns
+- [ ] Test multiple aggregates in one query
 - [ ] Test HAVING clauses
-- [ ] Test aggregation pushdown
-- [ ] Test partial aggregation across sources
+- [ ] Test NULL handling in aggregations
+- [ ] Test COUNT(*)
+- [ ] Test aggregate with WHERE clause
 
 **Deliverable**: Execute `SELECT region, COUNT(*), AVG(amount) FROM orders GROUP BY region HAVING COUNT(*) > 100`
+
+**Implementation Plan**:
+1. Enhance parser to detect GROUP BY and create Aggregate logical nodes
+2. Implement PhysicalHashAggregate.execute() with PyArrow compute functions
+3. Add physical planner support for Aggregate → PhysicalHashAggregate
+4. Write comprehensive tests
+5. Document aggregate function behavior and NULL handling
 
 ---
 

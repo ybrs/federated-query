@@ -169,25 +169,42 @@ This project is under active development. See `tasks.md` for the implementation 
 - ✅ Physical operators: Scan, Filter, Project, Limit
 - ✅ Basic executor: Single-table queries
 - ✅ End-to-end pipeline for simple SELECT queries
-- ✅ All 65 tests passing
 
 **Query Example (Phase 1):**
 ```sql
 SELECT col1, col2 FROM datasource.schema.table WHERE col1 > 10 LIMIT 100
 ```
 
-### Current Phase (Phase 2)
-- 🚧 Joins across data sources
-- 🚧 Hash join and nested loop join operators
-- 🚧 Data gathering from multiple sources
-- 🚧 Join strategy selection
+**Phase 2: Joins and Multi-Table Queries** ✅
+- ✅ Logical Join plan node with all join types
+- ✅ Physical HashJoin implementation
+- ✅ Physical NestedLoopJoin implementation
+- ✅ Parser support for JOIN clauses
+- ✅ Binder support for multi-table column resolution
+- ✅ Physical planner join strategy selection
+- ✅ All 70 tests passing (including 5 join tests)
+- ✅ Federated join example working (DuckDB + PostgreSQL)
+
+**Query Example (Phase 2):**
+```sql
+SELECT c.name, o.order_id, o.amount
+FROM duckdb.customers c
+JOIN postgres.orders o ON c.id = o.customer_id
+WHERE o.amount > 1000
+```
+
+### Current Phase (Phase 3)
+- 🚧 Aggregations and grouping
+- 🚧 GROUP BY clause support
+- 🚧 Aggregate functions (COUNT, SUM, AVG, MIN, MAX)
+- 🚧 HAVING clause support
 
 ### Planned
-- Aggregations and grouping
-- Query optimization (pushdown, reordering)
+- Aggregation pushdown optimization
+- Query optimization (predicate pushdown, join reordering)
 - Cost-based planning
 - Decorrelation
-- Advanced features (window functions, CTEs)
+- Advanced features (window functions, CTEs, sorting)
 
 ## Testing
 

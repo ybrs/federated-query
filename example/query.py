@@ -18,6 +18,34 @@ from federated_query.executor.executor import Executor
 from federated_query.config.config import ExecutorConfig
 
 
+def print_pa_table(table):
+    cols = [c.name for c in table.schema]
+    rows = list(zip(*[table[c].to_pylist() for c in cols]))
+
+    widths = [max(len(str(x)) for x in [name] + [r[i] for r in rows]) for i, name in enumerate(cols)]
+    print(" | ".join(f"{name:<{widths[i]}}" for i, name in enumerate(cols)))
+    print("-+-".join("-" * w for w in widths))
+    for r in rows:
+        print(" | ".join(f"{str(x):<{widths[i]}}" for i, x in enumerate(r)))
+
+
+def execute_query(catalog, query):
+    parser = Parser()
+    binder = Binder(catalog)
+    planner = PhysicalPlanner(catalog)
+    executor = Executor(ExecutorConfig())
+
+    ast = parser.parse(query)
+    logical_plan = parser.ast_to_logical_plan(ast)
+    bound_plan = binder.bind(logical_plan)
+    physical_plan = planner.plan(bound_plan)
+
+    result_table = executor.execute_to_table(physical_plan)
+    
+    print("\nResult: \n===")
+    print_pa_table(result_table)    
+    print("===")
+
 
 def create_postgres_sample_data(datasource):
     """Create sample tables in PostgreSQL for demonstration."""
@@ -152,25 +180,36 @@ def main():
         print(f"  - {ds_name}")
 
 
+    # works now 
     sql = """
         SELECT c.name, c.id, o.amount
         FROM local_duckdb.main.customers c
         JOIN postgres_prod.public.orders o ON c.id = o.customer_id
     """
-    
-    parser = Parser()
-    binder = Binder(catalog)
-    planner = PhysicalPlanner(catalog)
-    executor = Executor(ExecutorConfig())
+    execute_query(catalog, sql)
 
-    ast = parser.parse(sql)
-    logical_plan = parser.ast_to_logical_plan(ast)
-    bound_plan = binder.bind(logical_plan)
-    physical_plan = planner.plan(bound_plan)
+    # works now
+    sql = """
+        SELECT count(*), O.customer_id from postgres_prod.public.orders O group by O.customer_id
+    """
+    execute_query(catalog, sql)
 
-    result_table = executor.execute_to_table(physical_plan)
+    sql = """
+        SELECT c.name, c.id, sum(o.amount)
+        FROM local_duckdb.main.customers c
+        JOIN postgres_prod.public.orders o ON c.id = o.customer_id
+        group by c.id, c.name
+    """
+    # execute_query(catalog, sql)
 
-    print("result table", result_table)    
+
+    sql = """
+        select C.name,
+            (SELECT count(*) from postgres_prod.public.orders O where O.customer_id=C.id group by O.customer_id)        
+        from local_duckdb.main.customers C
+    """
+    # execute_query(catalog, sql)
+
 
     print("\nCleaning up connections...")
     for datasource in catalog.datasources.values():
