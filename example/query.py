@@ -31,15 +31,19 @@ def create_postgres_sample_data(datasource):
                     id INTEGER PRIMARY KEY,
                     customer_id INTEGER,
                     amount DECIMAL(10,2),
+                    region VARCHAR(50),
                     order_date DATE
                 )
             """)
 
             cursor.execute("""
                 INSERT INTO orders VALUES
-                (101, 1, 1500.00, '2024-01-15'),
-                (102, 2, 750.00, '2024-01-16'),
-                (103, 1, 2200.00, '2024-01-17')
+                (101, 1, 1500.00, 'North', '2024-01-15'),
+                (102, 2, 750.00, 'South', '2024-01-16'),
+                (103, 1, 2200.00, 'North', '2024-01-17'),
+                (104, 3, 1200.00, 'East', '2024-01-18'),
+                (105, 2, 900.00, 'South', '2024-01-19'),
+                (106, 1, 1800.00, 'North', '2024-01-20')
             """)
 
             conn.commit()
@@ -83,6 +87,100 @@ def create_datasource(name, ds_config):
         return PostgreSQLDataSource(name, ds_config.config)
 
     raise ValueError(f"Unsupported datasource type: {ds_type}")
+
+
+def execute_query(catalog, sql, description):
+    """Execute a query and display results."""
+    print(f"\n{'='*70}")
+    print(f"EXAMPLE: {description}")
+    print(f"{'='*70}")
+    print(f"SQL:\n{sql}\n")
+
+    parser = Parser()
+    binder = Binder(catalog)
+    planner = PhysicalPlanner(catalog)
+    executor = Executor(ExecutorConfig())
+
+    ast = parser.parse(sql)
+    logical_plan = parser.ast_to_logical_plan(ast)
+    bound_plan = binder.bind(logical_plan)
+    physical_plan = planner.plan(bound_plan)
+
+    result_table = executor.execute_to_table(physical_plan)
+
+    print(f"Results ({result_table.num_rows} rows):")
+    print(result_table)
+    print()
+
+
+def run_example_queries(catalog):
+    """Run example queries demonstrating engine capabilities."""
+    print("\n" + "="*70)
+    print("RUNNING EXAMPLE QUERIES")
+    print("="*70)
+
+    execute_query(
+        catalog,
+        """
+        SELECT c.name, c.id, o.amount, o.region
+        FROM local_duckdb.main.customers c
+        JOIN postgres_prod.public.orders o ON c.id = o.customer_id
+        """,
+        "Federated JOIN - Customers with their orders"
+    )
+
+    execute_query(
+        catalog,
+        """
+        SELECT c.name, o.amount
+        FROM local_duckdb.main.customers c
+        JOIN postgres_prod.public.orders o ON c.id = o.customer_id
+        WHERE o.amount > 1000
+        """,
+        "JOIN with WHERE clause - High-value orders"
+    )
+
+    execute_query(
+        catalog,
+        """
+        SELECT
+            region,
+            COUNT(*) as order_count,
+            SUM(amount) as total_revenue,
+            AVG(amount) as avg_order_value
+        FROM postgres_prod.public.orders
+        GROUP BY region
+        """,
+        "Aggregation - Sales by region"
+    )
+
+    execute_query(
+        catalog,
+        """
+        SELECT
+            c.name,
+            COUNT(*) as order_count,
+            SUM(o.amount) as total_spent
+        FROM local_duckdb.main.customers c
+        JOIN postgres_prod.public.orders o ON c.id = o.customer_id
+        GROUP BY c.name
+        """,
+        "Federated JOIN + Aggregation - Customer spending summary"
+    )
+
+    execute_query(
+        catalog,
+        """
+        SELECT
+            COUNT(*) as total_orders,
+            SUM(amount) as total_revenue,
+            AVG(amount) as average_order,
+            MIN(amount) as smallest_order,
+            MAX(amount) as largest_order
+        FROM postgres_prod.public.orders
+        """,
+        "Global aggregation - Overall sales statistics"
+    )
 
 
 def main():
@@ -151,26 +249,7 @@ def main():
     for ds_name in catalog.datasources.keys():
         print(f"  - {ds_name}")
 
-
-    sql = """
-        SELECT c.name, c.id, o.amount
-        FROM local_duckdb.main.customers c
-        JOIN postgres_prod.public.orders o ON c.id = o.customer_id
-    """
-    
-    parser = Parser()
-    binder = Binder(catalog)
-    planner = PhysicalPlanner(catalog)
-    executor = Executor(ExecutorConfig())
-
-    ast = parser.parse(sql)
-    logical_plan = parser.ast_to_logical_plan(ast)
-    bound_plan = binder.bind(logical_plan)
-    physical_plan = planner.plan(bound_plan)
-
-    result_table = executor.execute_to_table(physical_plan)
-
-    print("result table", result_table)    
+    run_example_queries(catalog)
 
     print("\nCleaning up connections...")
     for datasource in catalog.datasources.values():
