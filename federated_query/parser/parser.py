@@ -309,13 +309,182 @@ class Parser:
         predicate = self._convert_expression(where.this)
         return Filter(input=input_plan, predicate=predicate)
 
+    def _build_group_by_clause(
+        self, select: exp.Select, input_plan: LogicalPlanNode
+    ) -> LogicalPlanNode:
+        """Build aggregate node from GROUP BY clause.
+
+        Args:
+            select: sqlglot Select node
+            input_plan: Input logical plan
+
+        Returns:
+            Logical plan with aggregate (or original if no GROUP BY)
+        """
+        group = select.args.get("group")
+        has_aggregates = self._has_aggregate_functions(select)
+
+        if group:
+            return self._create_aggregate_node(select, input_plan, group)
+
+        if has_aggregates:
+            return self._create_aggregate_node_without_grouping(select, input_plan)
+
+        return input_plan
+
+    def _has_aggregate_functions(self, select: exp.Select) -> bool:
+        """Check if SELECT has aggregate functions.
+
+        Args:
+            select: sqlglot Select node
+
+        Returns:
+            True if SELECT contains aggregate functions
+        """
+        for expr in select.expressions:
+            if self._contains_aggregate_function(expr):
+                return True
+        return False
+
+    def _contains_aggregate_function(self, expr: exp.Expression) -> bool:
+        """Check if expression contains aggregate function.
+
+        Args:
+            expr: sqlglot expression
+
+        Returns:
+            True if expression contains aggregate function
+        """
+        if self._is_aggregate_function(expr):
+            return True
+
+        for child in expr.iter_expressions():
+            if self._contains_aggregate_function(child):
+                return True
+
+        return False
+
+    def _is_aggregate_function(self, expr: exp.Expression) -> bool:
+        """Check if an expression represents an aggregate function."""
+        aggregate_types = (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)
+        return isinstance(expr, exp.AggFunc) or isinstance(expr, aggregate_types)
+
+    def _create_aggregate_node_without_grouping(
+        self, select: exp.Select, input_plan: LogicalPlanNode
+    ) -> Aggregate:
+        """Create aggregate node without GROUP BY.
+
+        Args:
+            select: sqlglot Select node
+            input_plan: Input logical plan
+
+        Returns:
+            Aggregate node with empty group_by
+        """
+        aggregates = self._extract_aggregates_from_select(select)
+        output_names = self._extract_output_names(select)
+
+        return Aggregate(
+            input=input_plan,
+            group_by=[],
+            aggregates=aggregates,
+            output_names=output_names,
+        )
+
+    def _create_aggregate_node(
+        self, select: exp.Select, input_plan: LogicalPlanNode, group: exp.Group
+    ) -> Aggregate:
+        """Create aggregate node from SELECT and GROUP BY.
+
+        Args:
+            select: sqlglot Select node
+            input_plan: Input logical plan
+            group: sqlglot Group node
+
+        Returns:
+            Aggregate node
+        """
+        group_by_exprs = self._extract_group_by_exprs(group)
+        aggregates = self._extract_aggregates_from_select(select)
+        output_names = self._extract_output_names(select)
+
+        return Aggregate(
+            input=input_plan,
+            group_by=group_by_exprs,
+            aggregates=aggregates,
+            output_names=output_names,
+        )
+
+    def _extract_group_by_exprs(self, group: exp.Group) -> List[Expression]:
+        """Extract grouping expressions.
+
+        Args:
+            group: sqlglot Group node
+
+        Returns:
+            List of grouping expressions
+        """
+        expressions = []
+        for expr in group.expressions:
+            converted = self._convert_expression(expr)
+            expressions.append(converted)
+        return expressions
+
+    def _extract_aggregates_from_select(self, select: exp.Select) -> List[Expression]:
+        """Extract all expressions from SELECT for aggregation.
+
+        Args:
+            select: sqlglot Select node
+
+        Returns:
+            List of expressions (both group keys and aggregates)
+        """
+        expressions = []
+        for expr in select.expressions:
+            converted = self._convert_expression(expr)
+            expressions.append(converted)
+        return expressions
+
+    def _extract_output_names(self, select: exp.Select) -> List[str]:
+        """Extract output column names from SELECT.
+
+        Args:
+            select: sqlglot Select node
+
+        Returns:
+            List of output names
+        """
+        names = []
+        for expr in select.expressions:
+            alias = self._get_alias(expr)
+            names.append(alias)
+        return names
+
+    def _build_having_clause(
+        self, select: exp.Select, input_plan: LogicalPlanNode
+    ) -> LogicalPlanNode:
+        """Build filter node from HAVING clause.
+
+        Args:
+            select: sqlglot Select node
+            input_plan: Input logical plan
+
+        Returns:
+            Logical plan with filter (or original if no HAVING)
+        """
+        having = select.args.get("having")
+        if not having:
+            return input_plan
+
+        predicate = self._convert_expression(having.this)
+        return Filter(input=input_plan, predicate=predicate)
+
     def _build_select_clause(
         self, select: exp.Select, input_plan: LogicalPlanNode
     ) -> LogicalPlanNode:
         """Build project node from SELECT clause."""
         if isinstance(input_plan, Aggregate):
             return input_plan
-
         expressions = []
         aliases = []
 
@@ -384,7 +553,7 @@ class Parser:
         if isinstance(expr, exp.Star):
             return ColumnRef(table=None, column="*")
         if self._is_aggregate_function(expr):
-            return self._convert_function(expr)
+            return self._convert_aggregate_function(expr)
 
         raise ValueError(f"Unsupported expression type: {type(expr)}")
 
@@ -463,104 +632,36 @@ class Parser:
         }
         return mapping.get(type_name, UnaryOpType.NOT)
 
-    def _build_group_by_clause(
-        self, select: exp.Select, input_plan: LogicalPlanNode
-    ) -> LogicalPlanNode:
-        """Build aggregate node from GROUP BY clause or aggregate functions."""
-        has_group_by = select.args.get("group") is not None
-        has_aggregates = self._has_aggregate_functions(select)
+    def _convert_aggregate_function(self, func: exp.AggFunc) -> FunctionCall:
+        """Convert sqlglot aggregate function.
 
-        if not has_group_by and not has_aggregates:
-            return input_plan
+        Args:
+            func: sqlglot AggFunc node
 
-        group_exprs = []
-        if has_group_by:
-            group_exprs = self._extract_group_by_expressions(select.args["group"])
+        Returns:
+            FunctionCall expression
+        """
+        func_name = type(func).__name__.upper()
+        args = self._extract_function_args(func)
+        return FunctionCall(function_name=func_name, args=args, is_aggregate=True)
 
-        agg_exprs, output_names = self._extract_aggregate_expressions(select)
+    def _extract_function_args(self, func: exp.AggFunc) -> List[Expression]:
+        """Extract arguments from function.
 
-        return Aggregate(
-            input=input_plan,
-            group_by=group_exprs,
-            aggregates=agg_exprs,
-            output_names=output_names,
-        )
+        Args:
+            func: sqlglot AggFunc node
 
-    def _extract_group_by_expressions(self, group_by: exp.Group) -> List[Expression]:
-        """Extract grouping expressions from GROUP BY clause."""
-        expressions = []
-        for group_expr in group_by.expressions:
-            expr = self._convert_expression(group_expr)
-            expressions.append(expr)
-        return expressions
-
-    def _extract_aggregate_expressions(self, select: exp.Select) -> Tuple[List[Expression], List[str]]:
-        """Extract aggregate expressions and output names."""
-        agg_exprs = []
-        output_names = []
-
-        for select_expr in select.expressions:
-            alias = self._get_alias(select_expr)
-            output_names.append(alias)
-
-            if isinstance(select_expr, exp.Alias):
-                expr = self._convert_expression(select_expr.this)
-            else:
-                expr = self._convert_expression(select_expr)
-
-            agg_exprs.append(expr)
-
-        return agg_exprs, output_names
-
-    def _build_having_clause(
-        self, select: exp.Select, input_plan: LogicalPlanNode
-    ) -> LogicalPlanNode:
-        """Build filter node from HAVING clause."""
-        having = select.args.get("having")
-        if not having:
-            return input_plan
-
-        predicate = self._convert_expression(having.this)
-        return Filter(input=input_plan, predicate=predicate)
-
-    def _has_aggregate_functions(self, select: exp.Select) -> bool:
-        """Check if SELECT clause contains aggregate functions."""
-        for select_expr in select.expressions:
-            if self._contains_aggregate(select_expr):
-                return True
-        return False
-
-    def _contains_aggregate(self, expr: exp.Expression) -> bool:
-        """Check if expression contains aggregate functions."""
-        if self._is_aggregate_function(expr):
-            return True
-
-        for child in expr.iter_expressions():
-            if self._contains_aggregate(child):
-                return True
-
-        return False
-
-    def _is_aggregate_function(self, expr: exp.Expression) -> bool:
-        """Check if expression is an aggregate function."""
-        aggregate_types = (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)
-        return isinstance(expr, aggregate_types)
-
-    def _convert_function(self, func_expr: exp.Expression) -> FunctionCall:
-        """Convert aggregate function expression."""
-        func_name = type(func_expr).__name__.upper()
+        Returns:
+            List of argument expressions
+        """
         args = []
-
-        if hasattr(func_expr, 'this') and func_expr.this:
-            args.append(self._convert_expression(func_expr.this))
-        elif isinstance(func_expr, exp.Count) and not func_expr.this:
+        if hasattr(func, "this") and func.this:
+            arg = self._convert_expression(func.this)
+            args.append(arg)
+        elif isinstance(func, exp.Count):
+            # Handle COUNT(*) style functions where sqlglot leaves arg empty
             args.append(ColumnRef(table=None, column="*"))
-
-        return FunctionCall(
-            function_name=func_name,
-            args=args,
-            is_aggregate=True,
-        )
+        return args
 
     def parse_to_logical_plan(self, sql: str) -> LogicalPlanNode:
         """Parse SQL directly to logical plan.

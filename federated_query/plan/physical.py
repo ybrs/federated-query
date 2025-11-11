@@ -2,13 +2,16 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional, Iterator, Any
+from typing import List, Optional, Iterator, Any, TYPE_CHECKING
 from enum import Enum
 
 import pyarrow as pa
 
 from .expressions import Expression
 from .logical import JoinType
+
+if TYPE_CHECKING:
+    from .expressions import FunctionCall
 
 
 class PhysicalPlanNode(ABC):
@@ -591,70 +594,225 @@ class PhysicalHashAggregate(PhysicalPlanNode):
 
     def execute(self) -> Iterator[pa.RecordBatch]:
         """Execute hash aggregation."""
-        from collections import defaultdict
+        if self._supports_streaming():
+            result_batch = self._execute_streaming()
+        else:
+            result_batch = self._execute_materialized()
+
+        if result_batch.num_rows > 0:
+            yield result_batch
+
+    def _supports_streaming(self) -> bool:
+        """Return True when streaming aggregation can evaluate all expressions."""
         from .expressions import ColumnRef, FunctionCall
 
-        input_table = self._materialize_input()
-        groups = self._build_groups(input_table)
-        result_batch = self._compute_result(input_table, groups)
-        yield result_batch
+        def is_supported(expr: Expression) -> bool:
+            if isinstance(expr, ColumnRef):
+                return True
+            if isinstance(expr, FunctionCall) and expr.is_aggregate:
+                return all(is_supported(arg) for arg in expr.args)
+            return False
 
-    def _materialize_input(self) -> pa.Table:
-        """Materialize all input batches into a table."""
-        batches = []
-        for batch in self.input.execute():
-            batches.append(batch)
-        return pa.Table.from_batches(batches)
+        return all(is_supported(expr) for expr in self.aggregates)
 
-    def _build_groups(self, table: pa.Table) -> dict:
-        """Build hash table of group keys to row indices."""
+    def _execute_streaming(self) -> pa.RecordBatch:
         from collections import defaultdict
-        from .expressions import ColumnRef
 
-        groups = defaultdict(list)
+        hash_table = defaultdict(lambda: self._create_accumulator())
 
-        for row_idx in range(table.num_rows):
-            key = self._extract_group_key(table, row_idx)
-            groups[key].append(row_idx)
+        for batch in self.input.execute():
+            self._accumulate_batch(batch, hash_table)
 
-        return groups
+        return self._finalize_aggregates(hash_table)
 
-    def _extract_group_key(self, table: pa.Table, row_idx: int) -> tuple:
-        """Extract grouping key for a row."""
+    def _create_accumulator(self) -> dict:
+        """Create accumulator for aggregate functions."""
+        accumulator = {}
+        for i, expr in enumerate(self.aggregates):
+            accumulator[i] = self._create_single_accumulator(expr)
+        return accumulator
+
+    def _create_single_accumulator(self, expr: Expression) -> dict:
+        """Create accumulator for a single aggregate."""
+        from .expressions import FunctionCall
+
+        if isinstance(expr, FunctionCall) and expr.is_aggregate:
+            func_name = expr.function_name.upper()
+            return {"type": func_name, "count": 0, "sum": 0, "min": None, "max": None}
+
+        return {"type": "VALUE", "value": None}
+
+    def _accumulate_batch(self, batch: pa.RecordBatch, hash_table: dict):
+        """Accumulate values from a batch."""
+        for row_idx in range(batch.num_rows):
+            group_key = self._extract_group_key(batch, row_idx)
+            self._accumulate_row(batch, row_idx, hash_table[group_key])
+
+    def _extract_group_key(self, batch: pa.RecordBatch, row_idx: int) -> tuple:
+        """Extract grouping key from a row."""
         from .expressions import ColumnRef
 
         if len(self.group_by) == 0:
             return ()
 
         key_values = []
-        for group_expr in self.group_by:
-            if isinstance(group_expr, ColumnRef):
-                col_data = table.column(group_expr.column)
-                value = col_data[row_idx].as_py()
+        for expr in self.group_by:
+            if isinstance(expr, ColumnRef):
+                col = batch.column(expr.column)
+                value = col[row_idx].as_py()
                 key_values.append(value)
-
         return tuple(key_values)
+
+    def _accumulate_row(self, batch: pa.RecordBatch, row_idx: int, accumulator: dict):
+        """Accumulate values from a single row."""
+        for i, expr in enumerate(self.aggregates):
+            value = self._extract_value_from_row(batch, row_idx, expr)
+            self._update_accumulator(accumulator[i], value)
+
+    def _extract_value_from_row(self, batch: pa.RecordBatch, row_idx: int, expr: Expression):
+        """Extract value for an expression from a row."""
+        from .expressions import ColumnRef, FunctionCall
+
+        if isinstance(expr, ColumnRef):
+            if expr.column == "*":
+                return 1
+            col = batch.column(expr.column)
+            return col[row_idx].as_py()
+
+        if isinstance(expr, FunctionCall) and expr.is_aggregate:
+            if len(expr.args) == 0:
+                return 1
+            arg = expr.args[0]
+            return self._extract_value_from_row(batch, row_idx, arg)
+
+        return None
+
+    def _update_accumulator(self, acc: dict, value):
+        """Update accumulator with a value."""
+        acc_type = acc["type"]
+
+        if acc_type == "VALUE":
+            acc["value"] = value
+            return
+
+        if acc_type == "COUNT":
+            acc["count"] += 1
+            return
+
+        if value is None:
+            return
+
+        self._update_numeric_accumulator(acc, value, acc_type)
+
+    def _update_numeric_accumulator(self, acc: dict, value, acc_type: str):
+        """Update numeric accumulator (SUM, AVG, MIN, MAX)."""
+        acc["count"] += 1
+        numeric_val = float(value) if value is not None else 0
+
+        if acc_type in ("SUM", "AVG"):
+            acc["sum"] += numeric_val
+
+        if acc_type in ("MIN", "MAX"):
+            self._update_min_max(acc, numeric_val, acc_type)
+
+    def _update_min_max(self, acc: dict, value: float, acc_type: str):
+        """Update min/max accumulator."""
+        if acc["min"] is None:
+            acc["min"] = value
+            acc["max"] = value
+        else:
+            if acc_type == "MIN":
+                acc["min"] = min(acc["min"], value)
+            if acc_type == "MAX":
+                acc["max"] = max(acc["max"], value)
+
+    def _finalize_aggregates(self, hash_table: dict) -> pa.RecordBatch:
+        """Convert hash table to record batch."""
+        if len(hash_table) == 0:
+            return self._create_empty_batch()
+
+        columns = []
+        for i in range(len(self.output_names)):
+            col_values = self._extract_column_values(hash_table, i)
+            columns.append(col_values)
+
+        return pa.RecordBatch.from_arrays(columns, names=self.output_names)
+
+    def _extract_column_values(self, hash_table: dict, col_idx: int) -> pa.Array:
+        """Extract values for a column."""
+        values = []
+        for group_key, accumulators in hash_table.items():
+            if col_idx < len(self.group_by):
+                values.append(group_key[col_idx] if group_key else None)
+            else:
+                agg_idx = col_idx
+                value = self._finalize_accumulator(accumulators[agg_idx])
+                values.append(value)
+
+        return pa.array(values)
+
+    def _finalize_accumulator(self, acc: dict):
+        """Finalize accumulator to get final value."""
+        acc_type = acc["type"]
+
+        if acc_type == "VALUE":
+            return acc["value"]
+        if acc_type == "COUNT":
+            return acc["count"]
+        if acc_type == "SUM":
+            return acc["sum"]
+        if acc_type == "AVG":
+            return acc["sum"] / acc["count"] if acc["count"] > 0 else None
+        if acc_type == "MIN":
+            return acc["min"]
+        if acc_type == "MAX":
+            return acc["max"]
+
+        return None
+
+    def _create_empty_batch(self) -> pa.RecordBatch:
+        """Create empty batch with proper schema."""
+        arrays = []
+        for _ in self.output_names:
+            arrays.append(pa.array([]))
+        return pa.RecordBatch.from_arrays(arrays, names=self.output_names)
+
+    def _execute_materialized(self) -> pa.RecordBatch:
+        """Fallback aggregation that materializes input and uses pyarrow compute."""
+        input_table = self._materialize_input()
+        groups = self._build_groups(input_table)
+        return self._compute_result(input_table, groups)
+
+    def _materialize_input(self) -> pa.Table:
+        """Materialize all input batches into a pyarrow.Table."""
+        batches = [batch for batch in self.input.execute()]
+        if not batches:
+            return pa.Table.from_arrays([], names=[])
+        return pa.Table.from_batches(batches)
+
+    def _build_groups(self, table: pa.Table) -> dict:
+        """Build hash table of group keys to row indices."""
+        from collections import defaultdict
+
+        groups = defaultdict(list)
+        for row_idx in range(table.num_rows):
+            key = self._extract_group_key(table, row_idx)
+            groups[key].append(row_idx)
+        return groups
 
     def _compute_result(self, table: pa.Table, groups: dict) -> pa.RecordBatch:
         """Compute aggregate results for all groups."""
-        import pyarrow.compute as pc
-        from .expressions import FunctionCall, ColumnRef
-
-        result_arrays = []
-
+        result_rows = []
         for group_key, row_indices in groups.items():
-            row_data = self._compute_group_row(table, group_key, row_indices)
-            result_arrays.append(row_data)
-
-        return self._arrays_to_batch(result_arrays)
+            row = self._compute_group_row(table, group_key, row_indices)
+            result_rows.append(row)
+        return self._arrays_to_batch(result_rows)
 
     def _compute_group_row(self, table: pa.Table, group_key: tuple, row_indices: List[int]) -> List:
-        """Compute one result row for a group."""
-        from .expressions import FunctionCall, ColumnRef
-        import pyarrow.compute as pc
+        """Compute one output row for a single group."""
+        from .expressions import ColumnRef, FunctionCall
 
         row_data = []
-
         for agg_expr in self.aggregates:
             if isinstance(agg_expr, ColumnRef):
                 if len(group_key) > 0:
@@ -665,28 +823,27 @@ class PhysicalHashAggregate(PhysicalPlanNode):
             elif isinstance(agg_expr, FunctionCall):
                 value = self._compute_aggregate(table, agg_expr, row_indices)
                 row_data.append(value)
-
+            else:
+                row_data.append(None)
         return row_data
 
     def _find_group_by_index(self, col_ref: "ColumnRef") -> int:
-        """Find index of column in group_by list."""
+        """Find the offset of a ColumnRef inside group_by expressions."""
         from .expressions import ColumnRef
 
         for idx, group_expr in enumerate(self.group_by):
-            if isinstance(group_expr, ColumnRef):
-                if group_expr.column == col_ref.column:
-                    return idx
-
+            if isinstance(group_expr, ColumnRef) and group_expr.column == col_ref.column:
+                return idx
         return 0
 
-    def _compute_aggregate(self, table: pa.Table, func: "FunctionCall", row_indices: List[int]) -> Any:
-        """Compute aggregate function value."""
+    def _compute_aggregate(self, table: pa.Table, func: "FunctionCall", row_indices: List[int]):
+        """Compute an aggregate function using pyarrow compute helpers."""
         import pyarrow.compute as pc
         from .expressions import ColumnRef
 
         func_name = func.function_name.upper()
 
-        if func_name == "COUNT":
+        if func_name == "COUNT" and (len(func.args) == 0 or getattr(func.args[0], "column", "*") == "*"):
             return len(row_indices)
 
         if len(func.args) == 0:
@@ -697,9 +854,6 @@ class PhysicalHashAggregate(PhysicalPlanNode):
             return None
 
         col_name = arg.column
-        if col_name == "*":
-            return len(row_indices)
-
         column = table.column(col_name)
         subset = column.take(row_indices)
 
@@ -714,22 +868,15 @@ class PhysicalHashAggregate(PhysicalPlanNode):
 
         return None
 
-    def _arrays_to_batch(self, result_arrays: List[List]) -> pa.RecordBatch:
-        """Convert list of row data to RecordBatch."""
-        if len(result_arrays) == 0:
-            return pa.RecordBatch.from_arrays([], names=self.output_names)
+    def _arrays_to_batch(self, rows: List[List]) -> pa.RecordBatch:
+        """Convert list of row data to a RecordBatch with correct names."""
+        if len(rows) == 0:
+            return self._create_empty_batch()
 
-        num_cols = len(result_arrays[0])
-        columns = []
-
-        for col_idx in range(num_cols):
-            col_data = []
-            for row in result_arrays:
-                col_data.append(row[col_idx])
-            columns.append(col_data)
-
+        num_cols = len(rows[0])
         arrays = []
-        for col_data in columns:
+        for col_idx in range(num_cols):
+            col_data = [row[col_idx] for row in rows]
             arrays.append(pa.array(col_data))
 
         return pa.RecordBatch.from_arrays(arrays, names=self.output_names)
@@ -741,23 +888,46 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         input_schema = self.input.schema()
         fields = []
 
-        for idx, agg_expr in enumerate(self.aggregates):
-            name = self.output_names[idx]
-
-            if isinstance(agg_expr, ColumnRef):
-                field_index = input_schema.get_field_index(agg_expr.column)
-                field = input_schema.field(field_index)
-                fields.append(pa.field(name, field.type))
-            elif isinstance(agg_expr, FunctionCall):
-                func_name = agg_expr.function_name.upper()
-                if func_name in ("COUNT", "SUM"):
-                    fields.append(pa.field(name, pa.int64()))
-                elif func_name == "AVG":
-                    fields.append(pa.field(name, pa.float64()))
-                else:
-                    fields.append(pa.field(name, pa.float64()))
+        for i, expr in enumerate(self.aggregates):
+            name = self.output_names[i]
+            field_type = self._infer_output_type(expr, input_schema)
+            fields.append(pa.field(name, field_type))
 
         return pa.schema(fields)
+
+    def _infer_output_type(self, expr: Expression, input_schema: pa.Schema) -> pa.DataType:
+        """Infer output type for an expression."""
+        from .expressions import ColumnRef, FunctionCall
+
+        if isinstance(expr, ColumnRef):
+            field_index = input_schema.get_field_index(expr.column)
+            return input_schema.field(field_index).type
+
+        if isinstance(expr, FunctionCall) and expr.is_aggregate:
+            return self._infer_aggregate_type(expr, input_schema)
+
+        return pa.int64()
+
+    def _infer_aggregate_type(self, func: "FunctionCall", input_schema: pa.Schema) -> pa.DataType:
+        """Infer output type for aggregate function."""
+        from .expressions import ColumnRef
+
+        func_name = func.function_name.upper()
+        arg_type = pa.float64()
+        if func.args and isinstance(func.args[0], ColumnRef):
+            field_index = input_schema.get_field_index(func.args[0].column)
+            arg_type = input_schema.field(field_index).type
+
+        if func_name == "COUNT":
+            return pa.int64()
+        if func_name == "SUM":
+            return arg_type if pa.types.is_integer(arg_type) else pa.float64()
+        if func_name == "AVG":
+            return pa.float64()
+        if func_name in ("MIN", "MAX"):
+            return arg_type
+
+        return pa.float64()
 
     def estimated_cost(self) -> float:
         raise NotImplementedError("Cost estimation not yet implemented")
