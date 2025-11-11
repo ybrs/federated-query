@@ -186,15 +186,15 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 
 ## Phase 3: Aggregations and Grouping ✅ COMPLETED
 
-**Status:** ✅ COMPLETED (with documented limitations)
+**Status:** ✅ FULLY COMPLETED
 **Goal**: Support GROUP BY and aggregation functions
-**Tests**: 7/9 aggregation tests passing, 77 total tests (2 HAVING tests skipped)
+**Tests**: 9/9 aggregation tests passing, 79 total tests
 
-### 3.1 Logical Plan - Aggregations
+### 3.1 Logical Plan - Aggregations ✅
 - [x] Add Aggregate logical plan node
 - [x] Parse GROUP BY clauses (single and multiple columns)
 - [x] Parse aggregate functions (SUM, COUNT, AVG, MIN, MAX)
-- [x] Handle HAVING clauses (parsing only - evaluation deferred to Phase 4)
+- [x] Handle HAVING clauses with expression rewriting
 
 ### 3.2 Physical Aggregate Operators
 - [x] Implement Hash Aggregate (PhysicalHashAggregate)
@@ -212,17 +212,17 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
   - [ ] Final aggregate locally
 - [ ] Handle DISTINCT aggregates
 
-### 3.4 Testing
+### 3.4 Testing ✅
 - [x] Test simple aggregations (COUNT, SUM, AVG)
 - [x] Test GROUP BY with multiple columns
 - [x] Test global aggregations (without GROUP BY)
 - [x] Test multiple aggregates in single query
 - [x] Test federated JOIN + aggregation
-- [ ] Test HAVING clause evaluation - DEFERRED (2 tests skipped)
-- [ ] Test aggregation pushdown - DEFERRED
-- [ ] Test partial aggregation across sources - DEFERRED
+- [x] Test HAVING clause evaluation (both COUNT and SUM)
+- [ ] Test aggregation pushdown - DEFERRED to Phase 4+
+- [ ] Test partial aggregation across sources - DEFERRED to Phase 4+
 
-**Deliverable**: ✅ Can execute `SELECT region, COUNT(*), AVG(amount) FROM orders GROUP BY region`
+**Deliverable**: ✅ Can execute `SELECT region, COUNT(*), AVG(amount) FROM orders GROUP BY region HAVING COUNT(*) > 2`
 
 **Implementation Notes**:
 - Parser converts sqlglot AggFunc nodes to FunctionCall expressions
@@ -231,14 +231,22 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - Physical planner converts Aggregate logical nodes to PhysicalHashAggregate
 - All aggregate functions handle NULL values correctly
 - Supports federated aggregations over JOINs across PostgreSQL and DuckDB
-- Comprehensive examples in `example/aggregate_queries.py`
+- **HAVING clause** support with expression rewriting (parser rewrites aggregate functions to column references)
+- Binder handles HAVING predicates referencing aggregate output columns
+- Comprehensive examples in `example/aggregate_queries.py` and `example/query.py`
 - Documentation in `PHASE_3_COMPLETION.md` and `FEDERATED_AGGREGATION_EXAMPLES.md`
 
-**Known Limitations** (to be addressed in Phase 4):
-- HAVING clause evaluation requires expression rewriting (2 tests skipped)
-- Aggregation pushdown not yet implemented (documented roadmap exists)
-- COUNT(DISTINCT) not yet supported
-- Advanced aggregates (STDDEV, PERCENTILE, etc.) not yet supported
+**Implementation Details - HAVING Clause**:
+- Parser rewrites HAVING expressions to reference aggregate output columns
+- Expression rewriter maps aggregate functions (e.g., `COUNT(*)`) to output column names (e.g., `order_count`)
+- Binder validates HAVING predicates against aggregate output schema
+- Filter node applies after aggregation completes
+
+**Future Enhancements** (to be addressed in Phase 4+):
+- Aggregation pushdown to source databases (documented roadmap exists)
+- COUNT(DISTINCT) support
+- Advanced aggregates (STDDEV, VARIANCE, PERCENTILE, etc.)
+- Partial aggregation for distributed execution
 
 **Implementation Plan**:
 1. Enhance parser to detect GROUP BY and create Aggregate logical nodes

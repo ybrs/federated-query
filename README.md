@@ -193,18 +193,31 @@ JOIN postgres.orders o ON c.id = o.customer_id
 WHERE o.amount > 1000
 ```
 
-### Current Phase (Phase 3)
-- 🚧 Aggregations and grouping
-- 🚧 GROUP BY clause support
-- 🚧 Aggregate functions (COUNT, SUM, AVG, MIN, MAX)
-- 🚧 HAVING clause support
+**Phase 3: Aggregations and Grouping** ✅
+- ✅ Aggregations and grouping
+- ✅ GROUP BY clause support (single and multiple columns)
+- ✅ Aggregate functions (COUNT, SUM, AVG, MIN, MAX)
+- ✅ HAVING clause support with expression rewriting
+- ✅ Global aggregations (without GROUP BY)
+- ✅ Federated aggregations across data sources
 
-### Planned
-- Aggregation pushdown optimization
-- Query optimization (predicate pushdown, join reordering)
-- Cost-based planning
-- Decorrelation
-- Advanced features (window functions, CTEs, sorting)
+**Query Example (Phase 3):**
+```sql
+SELECT c.name, COUNT(*) as order_count, SUM(o.amount) as total_spent
+FROM duckdb.customers c
+JOIN postgres.orders o ON c.id = o.customer_id
+GROUP BY c.name
+HAVING SUM(o.amount) > 2000
+```
+
+### Next Phases
+- **Phase 4**: Pre-optimization and expression handling (constant folding, simplification)
+- **Phase 5**: Statistics and cost model
+- **Phase 6**: Logical optimization (predicate pushdown, join reordering)
+- **Phase 7**: Subquery decorrelation
+- **Phase 8**: Physical planning and advanced join strategies
+- **Phase 9**: Parallel execution and memory management
+- **Phase 10**: Advanced SQL features (ORDER BY, window functions, CTEs)
 
 ## Testing
 

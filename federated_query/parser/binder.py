@@ -103,7 +103,9 @@ class Binder:
         """Bind a Filter node."""
         bound_input = self.bind(filter_node.input)
 
-        if isinstance(bound_input, Join):
+        if isinstance(bound_input, Aggregate):
+            bound_predicate = self._bind_having_predicate(filter_node.predicate, bound_input)
+        elif isinstance(bound_input, Join):
             tables = self._get_tables_from_join(bound_input.left, bound_input.right)
             bound_predicate = self._bind_join_condition(filter_node.predicate, tables)
         else:
@@ -275,6 +277,50 @@ class Binder:
             )
 
         return self._bind_expression_multi_table(expr, tables)
+
+    def _bind_having_predicate(
+        self, predicate: Expression, aggregate: Aggregate
+    ) -> Expression:
+        """Bind HAVING predicate against aggregate output schema.
+
+        Args:
+            predicate: HAVING predicate expression
+            aggregate: Aggregate node providing output schema
+
+        Returns:
+            Bound predicate expression
+        """
+        return self._bind_having_expression(predicate, aggregate.output_names)
+
+    def _bind_having_expression(
+        self, expr: Expression, output_names: List[str]
+    ) -> Expression:
+        """Bind expression against aggregate output columns.
+
+        Args:
+            expr: Expression to bind
+            output_names: List of output column names from aggregate
+
+        Returns:
+            Bound expression
+        """
+        if isinstance(expr, ColumnRef):
+            if expr.column not in output_names:
+                raise BindingError(
+                    f"Column '{expr.column}' not found in aggregate output"
+                )
+            return expr
+
+        if isinstance(expr, BinaryOp):
+            left = self._bind_having_expression(expr.left, output_names)
+            right = self._bind_having_expression(expr.right, output_names)
+            return BinaryOp(op=expr.op, left=left, right=right)
+
+        if isinstance(expr, UnaryOp):
+            operand = self._bind_having_expression(expr.operand, output_names)
+            return UnaryOp(op=expr.op, operand=operand)
+
+        return expr
 
     def _get_tables_from_join(
         self, left: LogicalPlanNode, right: LogicalPlanNode

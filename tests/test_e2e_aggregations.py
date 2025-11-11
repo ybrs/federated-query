@@ -251,7 +251,6 @@ def test_group_by_multiple_aggregates(setup_test_db):
     assert result_table.num_columns == 4
 
 
-@pytest.mark.skip(reason="HAVING clause evaluation not yet implemented - planned for Phase 4")
 def test_having_clause(setup_test_db):
     """Test HAVING clause with aggregation."""
     catalog, datasource = setup_test_db
@@ -284,7 +283,6 @@ def test_having_clause(setup_test_db):
     assert count == 3
 
 
-@pytest.mark.skip(reason="HAVING clause evaluation not yet implemented - planned for Phase 4")
 def test_having_with_sum(setup_test_db):
     """Test HAVING clause with SUM."""
     catalog, datasource = setup_test_db
