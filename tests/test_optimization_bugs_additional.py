@@ -431,3 +431,229 @@ class TestColumnDetectionForWrappedJoins:
             (isinstance(result.left.input, Scan) and result.left.input.filters is not None)
         )
         assert has_filter, "Filter should have been pushed below projection"
+
+
+class TestTableQualifierBug:
+    """Test that table qualifiers are respected in predicate pushdown.
+
+    Bug: When both join inputs have columns with the same name (e.g., orders.id
+    and customers.id), filters with qualified references are incorrectly pushed
+    to the wrong side because _extract_column_refs ignores table qualifiers.
+    """
+
+    def test_filter_with_qualified_column_pushes_to_correct_side(self):
+        """Test filter with qualified column name pushes to correct side.
+
+        SELECT * FROM orders o
+        JOIN customers c ON o.customer_id = c.id
+        WHERE customers.id > 100
+
+        Both tables have "id" column. The filter explicitly references
+        customers.id, so it MUST push to right side only.
+
+        BUG: Currently _extract_column_refs returns {"id"} and _get_column_names
+        returns {"id", "customer_id", ...} for left and {"id", "name", ...} for
+        right. Since "id" is in both, pred_left_only = True (checked first),
+        and filter incorrectly pushes to LEFT (orders.id > 100) instead of
+        RIGHT (customers.id > 100).
+        """
+        left_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "customer_id", "amount"]
+        )
+        right_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="customers",
+            columns=["id", "name", "credit_limit"]
+        )
+        join_condition = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
+            right=ColumnRef("customers", "id", DataType.INTEGER)
+        )
+        join = Join(
+            left=left_scan,
+            right=right_scan,
+            join_type=JoinType.INNER,
+            condition=join_condition
+        )
+
+        # Filter: customers.id > 100 (QUALIFIED reference to right side)
+        predicate = BinaryOp(
+            op=BinaryOpType.GT,
+            left=ColumnRef("customers", "id", DataType.INTEGER),
+            right=Literal(100, DataType.INTEGER)
+        )
+        filter_node = Filter(join, predicate)
+
+        rule = PredicatePushdownRule()
+        result = rule.apply(filter_node)
+
+        # Filter MUST push to RIGHT side (customers), not left (orders)
+        assert isinstance(result, Join), f"Expected Join, got {type(result).__name__}"
+
+        # Right side should have the filter
+        assert isinstance(result.right, Scan)
+        assert result.right.filters is not None, "Filter should push to RIGHT side (customers)"
+
+        # Left side should NOT have this filter
+        assert isinstance(result.left, Scan)
+        # Left side can have other filters, but not THIS one
+        # We can't directly check this without inspecting filter content
+
+    def test_filter_with_left_qualified_column_pushes_to_left(self):
+        """Test filter with left-qualified column pushes to left side.
+
+        SELECT * FROM orders o
+        JOIN customers c ON o.customer_id = c.id
+        WHERE orders.id > 100
+
+        Both tables have "id". Filter references orders.id, so must push LEFT.
+        """
+        left_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "customer_id", "amount"]
+        )
+        right_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="customers",
+            columns=["id", "name", "credit_limit"]
+        )
+        join_condition = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
+            right=ColumnRef("customers", "id", DataType.INTEGER)
+        )
+        join = Join(
+            left=left_scan,
+            right=right_scan,
+            join_type=JoinType.INNER,
+            condition=join_condition
+        )
+
+        # Filter: orders.id > 100 (QUALIFIED reference to left side)
+        predicate = BinaryOp(
+            op=BinaryOpType.GT,
+            left=ColumnRef("orders", "id", DataType.INTEGER),
+            right=Literal(100, DataType.INTEGER)
+        )
+        filter_node = Filter(join, predicate)
+
+        rule = PredicatePushdownRule()
+        result = rule.apply(filter_node)
+
+        # Filter MUST push to LEFT side (orders), not right
+        assert isinstance(result, Join)
+
+        # Left side should have the filter
+        assert isinstance(result.left, Scan)
+        assert result.left.filters is not None, "Filter should push to LEFT side (orders)"
+
+    def test_unqualified_column_with_collision_stays_above_join(self):
+        """Test unqualified column reference with name collision stays above join.
+
+        SELECT * FROM orders o
+        JOIN customers c ON o.customer_id = c.id
+        WHERE id > 100  -- Ambiguous! Could be orders.id or customers.id
+
+        When column name is ambiguous and not qualified, safest behavior is to
+        keep filter ABOVE join to avoid incorrect results.
+        """
+        left_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "customer_id", "amount"]
+        )
+        right_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="customers",
+            columns=["id", "name", "credit_limit"]
+        )
+        join_condition = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
+            right=ColumnRef("customers", "id", DataType.INTEGER)
+        )
+        join = Join(
+            left=left_scan,
+            right=right_scan,
+            join_type=JoinType.INNER,
+            condition=join_condition
+        )
+
+        # Filter: id > 100 (UNQUALIFIED - ambiguous!)
+        predicate = BinaryOp(
+            op=BinaryOpType.GT,
+            left=ColumnRef(None, "id", DataType.INTEGER),  # No table qualifier!
+            right=Literal(100, DataType.INTEGER)
+        )
+        filter_node = Filter(join, predicate)
+
+        rule = PredicatePushdownRule()
+        result = rule.apply(filter_node)
+
+        # Filter should stay ABOVE join (ambiguous column reference)
+        assert isinstance(result, Filter), "Ambiguous filter should stay above join"
+        assert isinstance(result.input, Join)
+
+    def test_qualified_column_in_complex_expression(self):
+        """Test qualified columns in complex expression push correctly.
+
+        SELECT * FROM orders o
+        JOIN customers c ON o.customer_id = c.id
+        WHERE orders.amount + customers.credit_limit > 1000
+
+        Predicate references BOTH sides (orders.amount, customers.credit_limit),
+        so must stay ABOVE join.
+        """
+        left_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "customer_id", "amount"]
+        )
+        right_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="customers",
+            columns=["id", "name", "credit_limit"]
+        )
+        join_condition = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
+            right=ColumnRef("customers", "id", DataType.INTEGER)
+        )
+        join = Join(
+            left=left_scan,
+            right=right_scan,
+            join_type=JoinType.INNER,
+            condition=join_condition
+        )
+
+        # orders.amount + customers.credit_limit > 1000
+        sum_expr = BinaryOp(
+            op=BinaryOpType.ADD,
+            left=ColumnRef("orders", "amount", DataType.DECIMAL),
+            right=ColumnRef("customers", "credit_limit", DataType.DECIMAL)
+        )
+        predicate = BinaryOp(
+            op=BinaryOpType.GT,
+            left=sum_expr,
+            right=Literal(1000, DataType.DECIMAL)
+        )
+        filter_node = Filter(join, predicate)
+
+        rule = PredicatePushdownRule()
+        result = rule.apply(filter_node)
+
+        # Filter references BOTH sides, must stay above join
+        assert isinstance(result, Filter)
+        assert isinstance(result.input, Join)

@@ -138,6 +138,35 @@ class PredicatePushdownRule(OptimizationRule):
         new_filter = Filter(inner.input, merged_predicate)
         return self._push_down(new_filter)
 
+    def _can_evaluate_predicate(
+        self,
+        pred_cols: set,
+        available_cols: set
+    ) -> bool:
+        """Check if predicate columns can be evaluated with available columns.
+
+        Handles both qualified (table.column) and unqualified (column) references.
+        An unqualified predicate column matches if there's a qualified column
+        ending with that bare name.
+        """
+        for pred_col in pred_cols:
+            if pred_col in available_cols:
+                continue
+
+            if "." not in pred_col:
+                matched = False
+                for avail_col in available_cols:
+                    if avail_col.endswith(f".{pred_col}") or avail_col == pred_col:
+                        matched = True
+                        break
+                if matched:
+                    continue
+                return False
+
+            return False
+
+        return True
+
     def _push_filter_through_project(
         self,
         filter_node: Filter,
@@ -152,7 +181,7 @@ class PredicatePushdownRule(OptimizationRule):
         input_cols = self._get_column_names(project.input)
 
         # Can we evaluate predicate using columns from input?
-        can_push = predicate_cols.issubset(input_cols) if predicate_cols else True
+        can_push = self._can_evaluate_predicate(predicate_cols, input_cols)
 
         if can_push:
             # Push filter BELOW projection: Project(Filter(input, pred), ...)
@@ -195,6 +224,41 @@ class PredicatePushdownRule(OptimizationRule):
             filters=filter_node.predicate
         )
 
+    def _predicate_matches_side(
+        self,
+        pred_cols: set,
+        side_cols: set,
+        other_cols: set
+    ) -> bool:
+        """Check if predicate columns match exactly one side of join.
+
+        Handles both qualified and unqualified column references.
+        For unqualified refs, checks if they uniquely belong to this side.
+        """
+        for pred_col in pred_cols:
+            if pred_col in side_cols:
+                continue
+
+            if "." not in pred_col:
+                left_match = False
+                right_match = False
+                for col in side_cols:
+                    if col.endswith(f".{pred_col}"):
+                        left_match = True
+                        break
+                for col in other_cols:
+                    if col.endswith(f".{pred_col}"):
+                        right_match = True
+                        break
+
+                if left_match and not right_match:
+                    continue
+                return False
+
+            return False
+
+        return True
+
     def _push_filter_below_join(
         self,
         filter_node: Filter,
@@ -217,8 +281,8 @@ class PredicatePushdownRule(OptimizationRule):
 
         pred_cols = self._extract_column_refs(predicate)
 
-        pred_left_only = all(c in left_cols for c in pred_cols)
-        pred_right_only = all(c in right_cols for c in pred_cols)
+        pred_left_only = self._predicate_matches_side(pred_cols, left_cols, right_cols)
+        pred_right_only = self._predicate_matches_side(pred_cols, right_cols, left_cols)
 
         # Only push for INNER joins
         if join.join_type != JoinType.INNER:
@@ -265,10 +329,19 @@ class PredicatePushdownRule(OptimizationRule):
     def _get_column_names(self, plan: LogicalPlanNode) -> set:
         """Get all column names available from a plan node.
 
+        Returns qualified column names (e.g., "orders.id") for Scan nodes to
+        enable correct filter pushdown when multiple tables have columns with
+        the same name.
+
         Recursively handles wrapped nodes (Filter, Limit, etc).
         """
         if isinstance(plan, Scan):
-            return set(plan.columns)
+            # Return qualified column names: "table.column"
+            # This prevents ambiguity when multiple tables have same column names
+            qualified = set()
+            for col in plan.columns:
+                qualified.add(f"{plan.table_name}.{col}")
+            return qualified
 
         if isinstance(plan, Project):
             return set(plan.aliases)
@@ -291,10 +364,20 @@ class PredicatePushdownRule(OptimizationRule):
         return set()
 
     def _extract_column_refs(self, expr: Expression) -> set:
-        """Extract column names from expression."""
+        """Extract qualified column names from expression.
+
+        Returns column names with table qualifier when available (e.g., "orders.id"),
+        or bare column names if no qualifier present (e.g., "id").
+
+        This is critical for join filter pushdown: when both join inputs have
+        columns with the same name, we must respect table qualifiers to avoid
+        pushing filters to the wrong side.
+        """
         from ..plan.expressions import ColumnRef, BinaryOp, UnaryOp, FunctionCall
 
         if isinstance(expr, ColumnRef):
+            if expr.table:
+                return {f"{expr.table}.{expr.column}"}
             return {expr.column}
 
         if isinstance(expr, BinaryOp):
