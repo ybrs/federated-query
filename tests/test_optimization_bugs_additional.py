@@ -1325,3 +1325,180 @@ class TestAggregateColumnPruningBug:
         assert isinstance(right_node, Scan)
         assert "customer_id" in right_node.columns, "orders.customer_id needed for join"
         assert "status" in right_node.columns, "orders.status needed for filter"
+
+
+class TestParserAliasNotPopulatedBug:
+    """Test that predicate pushdown works when parser doesn't populate Scan.alias.
+
+    Bug: While we added Scan.alias field and updated _get_column_names to use it,
+    the parser never actually populates this field when creating Scan nodes.
+    When a query uses aliases (FROM users u WHERE u.age > 18), the parser creates:
+    - Scan(table_name="users", alias=None)  # alias NOT populated!
+    - ColumnRef("u", "age")  # but column refs USE the alias
+
+    _get_column_names returns "users.age" (physical name) but the predicate has
+    "u.age" (alias), causing mismatch and preventing pushdown even though it's safe.
+    """
+
+    def test_alias_in_columnref_but_not_in_scan(self):
+        """Test filter pushdown when ColumnRef uses alias but Scan.alias is None.
+
+        This simulates what the parser actually creates:
+        SELECT * FROM users u WHERE u.age > 18
+
+        Parser creates:
+        - Scan(table_name="users")  # alias=None (default)
+        - ColumnRef("u", "age")     # uses alias "u"
+
+        The filter should still push to scan.
+        """
+        # Scan WITHOUT alias field populated (as parser would create)
+        scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="users",
+            columns=["id", "name", "age"]
+            # NO alias parameter - defaults to None
+        )
+
+        # Filter uses alias "u" (as parser would create)
+        predicate = BinaryOp(
+            op=BinaryOpType.GT,
+            left=ColumnRef("u", "age", DataType.INTEGER),
+            right=Literal(18, DataType.INTEGER)
+        )
+        filter_node = Filter(scan, predicate)
+
+        rule = PredicatePushdownRule()
+        result = rule.apply(filter_node)
+
+        # Filter should push to scan despite alias mismatch
+        assert isinstance(result, Scan), f"Expected Scan with filter, got {type(result).__name__}"
+        assert result.filters is not None, "Filter should push to scan even with alias in ColumnRef"
+
+    def test_join_with_aliases_in_columnref_but_not_in_scan(self):
+        """Test join filter pushdown when aliases are in ColumnRef but not Scan.
+
+        SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id
+        WHERE o.amount > 100
+
+        Parser would create:
+        - Scan(table_name="orders", alias=None)
+        - Scan(table_name="customers", alias=None)
+        - ColumnRef("o", "amount")
+        - Join condition with ColumnRef("o", ...) and ColumnRef("c", ...)
+        """
+        # Scans WITHOUT alias populated
+        left_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "customer_id", "amount"]
+            # NO alias - defaults to None
+        )
+        right_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="customers",
+            columns=["id", "name", "credit_limit"]
+            # NO alias - defaults to None
+        )
+
+        # Join condition uses aliases "o" and "c"
+        join_condition = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef("o", "customer_id", DataType.INTEGER),
+            right=ColumnRef("c", "id", DataType.INTEGER)
+        )
+
+        join = Join(
+            left=left_scan,
+            right=right_scan,
+            join_type=JoinType.INNER,
+            condition=join_condition
+        )
+
+        # Filter uses alias "o"
+        predicate = BinaryOp(
+            op=BinaryOpType.GT,
+            left=ColumnRef("o", "amount", DataType.DECIMAL),
+            right=Literal(100, DataType.DECIMAL)
+        )
+        filter_node = Filter(join, predicate)
+
+        rule = PredicatePushdownRule()
+        result = rule.apply(filter_node)
+
+        # Filter should push to left side despite alias mismatch
+        assert isinstance(result, Join), f"Expected Join, got {type(result).__name__}"
+        assert isinstance(result.left, Scan)
+        assert result.left.filters is not None, "Filter should push to left side even with alias in ColumnRef"
+
+    def test_aggregate_with_aliases_in_columnref_but_not_in_scan(self):
+        """Test column pruning for aggregate when aliases in ColumnRef but not Scan.
+
+        SELECT c.country, SUM(o.total)
+        FROM customers c JOIN orders o ON c.id = o.customer_id
+        GROUP BY c.country
+
+        Parser would create Scan nodes with alias=None but ColumnRefs with aliases.
+        Column pruning should still preserve join keys.
+        """
+        from federated_query.optimizer.rules import ProjectionPushdownRule
+        from federated_query.plan.logical import Aggregate
+
+        # Scans WITHOUT alias populated
+        left_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="customers",
+            columns=["id", "name", "country"]
+            # NO alias
+        )
+        right_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "customer_id", "total"]
+            # NO alias
+        )
+
+        # Join condition uses aliases "c" and "o"
+        join_condition = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef("c", "id", DataType.INTEGER),
+            right=ColumnRef("o", "customer_id", DataType.INTEGER)
+        )
+
+        join = Join(
+            left=left_scan,
+            right=right_scan,
+            join_type=JoinType.INNER,
+            condition=join_condition
+        )
+
+        # Aggregate uses aliases
+        group_by_expr = ColumnRef("c", "country", DataType.VARCHAR)
+        sum_expr = ColumnRef("o", "total", DataType.DECIMAL)
+
+        aggregate = Aggregate(
+            input=join,
+            group_by=[group_by_expr],
+            aggregates=[sum_expr],
+            output_names=["country", "sum_total"]
+        )
+
+        rule = ProjectionPushdownRule()
+        result = rule.apply(aggregate)
+
+        # Join keys should be preserved despite alias mismatch
+        assert isinstance(result, Aggregate)
+        assert isinstance(result.input, Join)
+        join_node = result.input
+
+        # Both scans should have join keys preserved
+        assert isinstance(join_node.left, Scan)
+        assert "id" in join_node.left.columns, "customers.id must be preserved for join key"
+
+        assert isinstance(join_node.right, Scan)
+        assert "customer_id" in join_node.right.columns, "orders.customer_id must be preserved for join key"

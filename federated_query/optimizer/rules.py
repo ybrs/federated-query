@@ -235,28 +235,44 @@ class PredicatePushdownRule(OptimizationRule):
         """Check if predicate columns match exactly one side of join.
 
         Handles both qualified and unqualified column references.
-        For unqualified refs, checks if they uniquely belong to this side.
+        Also handles alias vs physical name mismatches (e.g., "o.amount" vs "orders.amount").
+        For both qualified and unqualified refs, checks if column uniquely belongs to this side.
         """
         for pred_col in pred_cols:
+            # Exact match - pred_col is directly in side_cols
             if pred_col in side_cols:
                 continue
 
-            if "." not in pred_col:
-                left_match = False
-                right_match = False
-                for col in side_cols:
-                    if col.endswith(f".{pred_col}"):
-                        left_match = True
-                        break
-                for col in other_cols:
-                    if col.endswith(f".{pred_col}"):
-                        right_match = True
-                        break
+            # Extract bare column name (part after last ".")
+            if "." in pred_col:
+                # Qualified reference like "o.amount" or "orders.amount"
+                bare_col = pred_col.split(".")[-1]
+            else:
+                # Unqualified reference like "amount"
+                bare_col = pred_col
 
-                if left_match and not right_match:
-                    continue
-                return False
+            # Check if bare column name uniquely belongs to this side
+            # This handles:
+            # - Unqualified refs: "amount" matching "orders.amount"
+            # - Alias mismatches: "o.amount" matching "orders.amount"
+            side_has_col = False
+            other_has_col = False
 
+            for col in side_cols:
+                if col.endswith(f".{bare_col}") or col == bare_col:
+                    side_has_col = True
+                    break
+
+            for col in other_cols:
+                if col.endswith(f".{bare_col}") or col == bare_col:
+                    other_has_col = True
+                    break
+
+            # Column must be on this side only (not on other side)
+            if side_has_col and not other_has_col:
+                continue
+
+            # Column is not uniquely on this side
             return False
 
         return True
