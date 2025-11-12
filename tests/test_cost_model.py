@@ -437,3 +437,185 @@ class TestCostModelWithStatistics:
         cardinality = cost_model.estimate_cardinality(scan)
         expected = 1000 * (1.0 / 5)
         assert cardinality == int(expected)
+
+
+class TestOperatorCostEstimation:
+    """Test cost estimation for various operators."""
+
+    def test_scan_cost(self, cost_model):
+        """Test scan cost estimation."""
+        scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="users",
+            columns=["id", "name"]
+        )
+        cost = cost_model.estimate_logical_plan_cost(scan)
+        assert cost > 0
+        assert cost < 10000
+
+    def test_filter_cost(self, cost_model):
+        """Test filter cost includes input cost plus processing."""
+        scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="users",
+            columns=["id", "name"]
+        )
+        predicate = BinaryOp(
+            op=BinaryOpType.GT,
+            left=ColumnRef(None, "id", DataType.INTEGER),
+            right=Literal(100, DataType.INTEGER)
+        )
+        filter_node = Filter(input=scan, predicate=predicate)
+
+        scan_cost = cost_model.estimate_logical_plan_cost(scan)
+        filter_cost = cost_model.estimate_logical_plan_cost(filter_node)
+        assert filter_cost > scan_cost
+
+    def test_project_cost(self, cost_model):
+        """Test projection cost estimation."""
+        scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="users",
+            columns=["id", "name", "email"]
+        )
+        project = Project(
+            input=scan,
+            expressions=[
+                ColumnRef(None, "id", DataType.INTEGER),
+                ColumnRef(None, "name", DataType.VARCHAR)
+            ],
+            aliases=["id", "name"]
+        )
+
+        scan_cost = cost_model.estimate_logical_plan_cost(scan)
+        project_cost = cost_model.estimate_logical_plan_cost(project)
+        assert project_cost > scan_cost
+
+    def test_join_cost(self, cost_model):
+        """Test join cost estimation."""
+        left_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "customer_id"]
+        )
+        right_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="customers",
+            columns=["id", "name"]
+        )
+        condition = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
+            right=ColumnRef("customers", "id", DataType.INTEGER)
+        )
+        join = Join(
+            left=left_scan,
+            right=right_scan,
+            join_type=JoinType.INNER,
+            condition=condition
+        )
+
+        left_cost = cost_model.estimate_logical_plan_cost(left_scan)
+        right_cost = cost_model.estimate_logical_plan_cost(right_scan)
+        join_cost = cost_model.estimate_logical_plan_cost(join)
+        assert join_cost > left_cost + right_cost
+
+    def test_aggregate_cost(self, cost_model):
+        """Test aggregation cost estimation."""
+        scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["customer_id", "amount"]
+        )
+        agg = Aggregate(
+            input=scan,
+            group_by=[ColumnRef(None, "customer_id", DataType.INTEGER)],
+            aggregates=[],
+            output_names=["customer_id"]
+        )
+
+        scan_cost = cost_model.estimate_logical_plan_cost(scan)
+        agg_cost = cost_model.estimate_logical_plan_cost(agg)
+        assert agg_cost > scan_cost
+
+    def test_limit_cost(self, cost_model):
+        """Test limit cost is minimal."""
+        scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="users",
+            columns=["id", "name"]
+        )
+        limit = Limit(input=scan, limit=10)
+
+        limit_cost = cost_model.estimate_logical_plan_cost(limit)
+        assert limit_cost > 0
+        assert limit_cost < 100
+
+    def test_complex_plan_cost(self, cost_model):
+        """Test cost of complex plan with multiple operators."""
+        scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="users",
+            columns=["id", "name", "status"]
+        )
+        predicate = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef(None, "status", DataType.VARCHAR),
+            right=Literal("active", DataType.VARCHAR)
+        )
+        filter_node = Filter(input=scan, predicate=predicate)
+        project = Project(
+            input=filter_node,
+            expressions=[ColumnRef(None, "id", DataType.INTEGER)],
+            aliases=["id"]
+        )
+        limit = Limit(input=project, limit=100)
+
+        cost = cost_model.estimate_logical_plan_cost(limit)
+        assert cost > 0
+
+    def test_cost_increases_with_cardinality(self, cost_config, table_stats):
+        """Test that cost increases with larger tables."""
+        catalog = Catalog()
+        stats_collector = StatisticsCollector(catalog)
+
+        small_stats = TableStatistics(
+            row_count=100,
+            total_size_bytes=10000,
+            column_stats=table_stats.column_stats
+        )
+        large_stats = TableStatistics(
+            row_count=10000,
+            total_size_bytes=1000000,
+            column_stats=table_stats.column_stats
+        )
+
+        stats_collector.cache[("test_ds", "public", "small")] = small_stats
+        stats_collector.cache[("test_ds", "public", "large")] = large_stats
+
+        cost_model = CostModel(cost_config, stats_collector)
+
+        small_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="small",
+            columns=["id"]
+        )
+        large_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="large",
+            columns=["id"]
+        )
+
+        small_cost = cost_model.estimate_logical_plan_cost(small_scan)
+        large_cost = cost_model.estimate_logical_plan_cost(large_scan)
+        assert large_cost > small_cost

@@ -292,5 +292,127 @@ class CostModel:
 
         return stats.column_stats[col_name].null_fraction
 
+    def estimate_logical_plan_cost(self, plan: LogicalPlanNode) -> float:
+        """Estimate cost of a logical plan.
+
+        Args:
+            plan: Logical plan node
+
+        Returns:
+            Estimated cost
+        """
+        if isinstance(plan, Scan):
+            return self._estimate_scan_cost(plan)
+        if isinstance(plan, Filter):
+            return self._estimate_filter_cost(plan)
+        if isinstance(plan, Project):
+            return self._estimate_project_cost(plan)
+        if isinstance(plan, Join):
+            return self._estimate_join_cost(plan)
+        if isinstance(plan, Aggregate):
+            return self._estimate_aggregate_cost(plan)
+        if isinstance(plan, Limit):
+            return self._estimate_limit_cost(plan)
+
+        return 1000.0
+
+    def _estimate_scan_cost(self, scan: Scan) -> float:
+        """Estimate cost of scanning a table."""
+        cardinality = self._estimate_scan_cardinality(scan)
+        io_cost = cardinality * self.config.io_page_cost / 100
+        cpu_cost = cardinality * self.config.cpu_tuple_cost
+        network_cost = cardinality * 100 * self.config.network_byte_cost
+        return io_cost + cpu_cost + network_cost
+
+    def _estimate_filter_cost(self, filter_node: Filter) -> float:
+        """Estimate cost of filtering."""
+        input_cost = self.estimate_logical_plan_cost(filter_node.input)
+        input_card = self.estimate_cardinality(filter_node.input)
+        cpu_cost = input_card * self.config.cpu_tuple_cost * 2
+        return input_cost + cpu_cost
+
+    def _estimate_project_cost(self, project: Project) -> float:
+        """Estimate cost of projection."""
+        input_cost = self.estimate_logical_plan_cost(project.input)
+        input_card = self.estimate_cardinality(project.input)
+        num_exprs = len(project.expressions)
+        cpu_cost = input_card * num_exprs * self.config.cpu_tuple_cost
+        return input_cost + cpu_cost
+
+    def _estimate_join_cost(self, join: Join) -> float:
+        """Estimate cost of join operation."""
+        left_cost = self.estimate_logical_plan_cost(join.left)
+        right_cost = self.estimate_logical_plan_cost(join.right)
+        left_card = self.estimate_cardinality(join.left)
+        right_card = self.estimate_cardinality(join.right)
+        build_cost = right_card * self.config.cpu_tuple_cost * 3
+        probe_cost = left_card * self.config.cpu_tuple_cost * 2
+        return left_cost + right_cost + build_cost + probe_cost
+
+    def _estimate_aggregate_cost(self, agg: Aggregate) -> float:
+        """Estimate cost of aggregation."""
+        input_cost = self.estimate_logical_plan_cost(agg.input)
+        input_card = self.estimate_cardinality(agg.input)
+        output_card = self._estimate_aggregate_cardinality(agg)
+        hash_build_cost = input_card * self.config.cpu_tuple_cost * 2
+        finalize_cost = output_card * self.config.cpu_tuple_cost
+        return input_cost + hash_build_cost + finalize_cost
+
+    def _estimate_limit_cost(self, limit: Limit) -> float:
+        """Estimate cost of limit operation."""
+        input_cost = self.estimate_logical_plan_cost(limit.input)
+        output_card = self._estimate_limit_cardinality(limit)
+        cpu_cost = output_card * self.config.cpu_tuple_cost
+        return cpu_cost
+
+    def estimate_physical_plan_cost(self, plan: PhysicalPlanNode) -> float:
+        """Estimate cost of a physical plan.
+
+        Args:
+            plan: Physical plan node
+
+        Returns:
+            Estimated cost
+        """
+        plan_name = plan.__class__.__name__
+        if "Scan" in plan_name:
+            return self._estimate_physical_scan_cost(plan)
+        if "Filter" in plan_name:
+            return self._estimate_physical_filter_cost(plan)
+        if "Project" in plan_name:
+            return self._estimate_physical_project_cost(plan)
+        if "Join" in plan_name:
+            return self._estimate_physical_join_cost(plan)
+        if "Aggregate" in plan_name:
+            return self._estimate_physical_aggregate_cost(plan)
+        if "Limit" in plan_name:
+            return self._estimate_physical_limit_cost(plan)
+
+        return 1000.0
+
+    def _estimate_physical_scan_cost(self, scan) -> float:
+        """Estimate cost of physical scan."""
+        return 100.0
+
+    def _estimate_physical_filter_cost(self, filter_node) -> float:
+        """Estimate cost of physical filter."""
+        return 50.0
+
+    def _estimate_physical_project_cost(self, project) -> float:
+        """Estimate cost of physical project."""
+        return 30.0
+
+    def _estimate_physical_join_cost(self, join) -> float:
+        """Estimate cost of physical join."""
+        return 500.0
+
+    def _estimate_physical_aggregate_cost(self, agg) -> float:
+        """Estimate cost of physical aggregate."""
+        return 200.0
+
+    def _estimate_physical_limit_cost(self, limit) -> float:
+        """Estimate cost of physical limit."""
+        return 10.0
+
     def __repr__(self) -> str:
         return "CostModel()"
