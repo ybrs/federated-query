@@ -3,6 +3,7 @@
 import pytest
 from federated_query.optimizer.rules import (
     PredicatePushdownRule,
+    LimitPushdownRule,
 )
 from federated_query.plan.logical import (
     Scan,
@@ -10,6 +11,7 @@ from federated_query.plan.logical import (
     Project,
     Join,
     JoinType,
+    Limit,
 )
 from federated_query.plan.expressions import (
     BinaryOp,
@@ -1502,3 +1504,199 @@ class TestParserAliasNotPopulatedBug:
 
         assert isinstance(join_node.right, Scan)
         assert "customer_id" in join_node.right.columns, "orders.customer_id must be preserved for join key"
+
+
+class TestLimitPushdownNotRecursing:
+    """Test Bug #12: LimitPushdownRule doesn't recurse into non-Limit/Project nodes.
+
+    The rule only descends into Limit and Project nodes. If the root plan is a Filter,
+    Join, or other operator, _push_limit returns without visiting children. This means
+    limits embedded inside subqueries (e.g., Filter(Limit(Project(Scan)))) are never
+    considered for pushdown even though moving the limit below the projection is safe.
+    """
+
+    def test_limit_nested_under_filter_not_optimized(self):
+        """Test that limit nested under filter is not being optimized.
+
+        Plan shape: Filter(Limit(Project(Scan)))
+
+        The Limit should be able to push below the Project to become:
+        Filter(Project(Limit(Scan)))
+
+        But currently the rule never visits the Limit because it stops at Filter.
+        """
+        scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="users",
+            columns=["id", "name", "age", "email"]
+        )
+
+        # Project: SELECT id, name, age FROM ...
+        project = Project(
+            input=scan,
+            expressions=[
+                ColumnRef(None, "id", DataType.INTEGER),
+                ColumnRef(None, "name", DataType.VARCHAR),
+                ColumnRef(None, "age", DataType.INTEGER),
+            ],
+            aliases=["id", "name", "age"]
+        )
+
+        # Limit: ... LIMIT 10
+        limit = Limit(input=project, limit=10, offset=0)
+
+        # Filter: WHERE age > 18
+        predicate = BinaryOp(
+            op=BinaryOpType.GT,
+            left=ColumnRef(None, "age", DataType.INTEGER),
+            right=Literal(18, DataType.INTEGER)
+        )
+        filter_node = Filter(input=limit, predicate=predicate)
+
+        # Apply limit pushdown
+        rule = LimitPushdownRule()
+        result = rule.apply(filter_node)
+
+        # Currently the rule doesn't recurse into Filter, so nothing changes
+        # After fix: should have Filter(Project(Limit(Scan)))
+        assert isinstance(result, Filter), "Should still be Filter at root"
+        assert isinstance(result.input, Project), "Should have Project after pushing limit down"
+        assert isinstance(result.input.input, Limit), "Limit should have pushed below Project"
+        assert isinstance(result.input.input.input, Scan), "Limit should be above Scan"
+
+    def test_limit_nested_under_join_not_optimized(self):
+        """Test that limit nested in join child is not being optimized.
+
+        Plan shape: Join(Limit(Project(Scan)), Scan)
+
+        The Limit in the left child should be able to push below the Project,
+        but currently the rule doesn't recurse into Join children.
+        """
+        # Left side: Limit(Project(Scan))
+        left_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "customer_id", "amount"]
+        )
+
+        left_project = Project(
+            input=left_scan,
+            expressions=[
+                ColumnRef(None, "customer_id", DataType.INTEGER),
+                ColumnRef(None, "amount", DataType.DECIMAL),
+            ],
+            aliases=["customer_id", "amount"]
+        )
+
+        left_limit = Limit(input=left_project, limit=100, offset=0)
+
+        # Right side: plain Scan
+        right_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="customers",
+            columns=["id", "name"]
+        )
+
+        # Join
+        join_condition = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef(None, "customer_id", DataType.INTEGER),
+            right=ColumnRef(None, "id", DataType.INTEGER)
+        )
+
+        join = Join(
+            left=left_limit,
+            right=right_scan,
+            join_type=JoinType.INNER,
+            condition=join_condition
+        )
+
+        # Apply limit pushdown
+        rule = LimitPushdownRule()
+        result = rule.apply(join)
+
+        # Currently the rule doesn't recurse into Join, so nothing changes
+        # After fix: left child should be Project(Limit(Scan))
+        assert isinstance(result, Join), "Should still be Join at root"
+        assert isinstance(result.left, Project), "Left child should have Project after pushing limit"
+        assert isinstance(result.left.input, Limit), "Limit should have pushed below Project"
+        assert isinstance(result.left.input.input, Scan), "Limit should be above Scan"
+
+    def test_deeply_nested_limit_not_optimized(self):
+        """Test that deeply nested limit is not being optimized.
+
+        Plan shape: Filter(Join(Filter(Limit(Project(Scan))), Scan))
+
+        The deeply nested Limit should still be optimized even though it's
+        nested under multiple layers of non-Limit/Project nodes.
+        """
+        # Deep left side: Filter(Limit(Project(Scan)))
+        inner_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="products",
+            columns=["id", "category", "price", "stock"]
+        )
+
+        inner_project = Project(
+            input=inner_scan,
+            expressions=[
+                ColumnRef(None, "id", DataType.INTEGER),
+                ColumnRef(None, "price", DataType.DECIMAL),
+            ],
+            aliases=["id", "price"]
+        )
+
+        inner_limit = Limit(input=inner_project, limit=50, offset=0)
+
+        inner_predicate = BinaryOp(
+            op=BinaryOpType.GT,
+            left=ColumnRef(None, "price", DataType.DECIMAL),
+            right=Literal(10.0, DataType.DECIMAL)
+        )
+        inner_filter = Filter(input=inner_limit, predicate=inner_predicate)
+
+        # Right side
+        right_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "product_id", "quantity"]
+        )
+
+        # Join
+        join_condition = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef(None, "id", DataType.INTEGER),
+            right=ColumnRef(None, "product_id", DataType.INTEGER)
+        )
+
+        join = Join(
+            left=inner_filter,
+            right=right_scan,
+            join_type=JoinType.INNER,
+            condition=join_condition
+        )
+
+        # Outer filter
+        outer_predicate = BinaryOp(
+            op=BinaryOpType.GT,
+            left=ColumnRef(None, "quantity", DataType.INTEGER),
+            right=Literal(5, DataType.INTEGER)
+        )
+        outer_filter = Filter(input=join, predicate=outer_predicate)
+
+        # Apply limit pushdown
+        rule = LimitPushdownRule()
+        result = rule.apply(outer_filter)
+
+        # After fix: the deeply nested Limit should have pushed below Project
+        assert isinstance(result, Filter), "Root should still be Filter"
+        assert isinstance(result.input, Join), "Should have Join"
+        assert isinstance(result.input.left, Filter), "Left should be Filter"
+        assert isinstance(result.input.left.input, Project), "Should have Project after pushing"
+        assert isinstance(result.input.left.input.input, Limit), "Limit should be below Project"
+        assert isinstance(result.input.left.input.input.input, Scan), "Limit should be above Scan"

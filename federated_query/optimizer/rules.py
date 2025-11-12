@@ -661,21 +661,114 @@ class LimitPushdownRule(OptimizationRule):
         return self._push_limit(plan)
 
     def _push_limit(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Recursively push limits down.
+        """Recursively push limits down and visit all nodes.
 
         Only pushes through projections (safe).
-        Does not push through filters, joins, or aggregates.
+        For other nodes, recurses into children but doesn't push limits through.
         """
         if isinstance(plan, Limit):
             return self._try_push_limit(plan)
 
         if isinstance(plan, Project):
-            new_input = self._push_limit(plan.input)
-            if new_input != plan.input:
-                return Project(new_input, plan.expressions, plan.aliases)
+            return self._recurse_project(plan)
+
+        # For all other node types, recurse into children
+        return self._recurse_children(plan)
+
+    def _recurse_project(self, plan: Project) -> LogicalPlanNode:
+        """Recurse into project node."""
+        new_input = self._push_limit(plan.input)
+        if new_input != plan.input:
+            return Project(new_input, plan.expressions, plan.aliases)
+        return plan
+
+    def _recurse_children(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Recurse into children of node without pushing limits through."""
+        from ..plan.logical import Filter, Join, Aggregate, Sort, Union, Explain
+
+        if isinstance(plan, (Filter, Aggregate, Sort)):
+            return self._recurse_unary_node(plan)
+
+        if isinstance(plan, (Join, Union)):
+            return self._recurse_binary_node(plan)
+
+        if isinstance(plan, Explain):
+            return self._recurse_explain(plan)
+
+        # Scan or other leaf node - return as-is
+        return plan
+
+    def _recurse_unary_node(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Recurse into unary node (Filter, Aggregate, Sort)."""
+        from ..plan.logical import Filter, Aggregate, Sort
+
+        new_input = self._push_limit(plan.input)
+        if new_input == plan.input:
             return plan
 
-        # Don't recurse through filters - limit shouldn't push below
+        if isinstance(plan, Filter):
+            return Filter(new_input, plan.predicate)
+
+        if isinstance(plan, Aggregate):
+            return self._rebuild_aggregate(plan, new_input)
+
+        if isinstance(plan, Sort):
+            return Sort(new_input, plan.sort_keys, plan.sort_directions)
+
+        return plan
+
+    def _rebuild_aggregate(
+        self,
+        plan: Aggregate,
+        new_input: LogicalPlanNode
+    ) -> Aggregate:
+        """Rebuild aggregate with new input."""
+        return Aggregate(
+            input=new_input,
+            group_by=plan.group_by,
+            aggregates=plan.aggregates,
+            output_names=plan.output_names
+        )
+
+    def _recurse_binary_node(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Recurse into binary node (Join, Union)."""
+        from ..plan.logical import Join, Union
+
+        new_left = self._push_limit(plan.left)
+        new_right = self._push_limit(plan.right)
+
+        if new_left == plan.left and new_right == plan.right:
+            return plan
+
+        if isinstance(plan, Join):
+            return self._rebuild_join(plan, new_left, new_right)
+
+        if isinstance(plan, Union):
+            return Union(new_left, new_right)
+
+        return plan
+
+    def _rebuild_join(
+        self,
+        plan: Join,
+        new_left: LogicalPlanNode,
+        new_right: LogicalPlanNode
+    ) -> Join:
+        """Rebuild join with new children."""
+        return Join(
+            left=new_left,
+            right=new_right,
+            join_type=plan.join_type,
+            condition=plan.condition
+        )
+
+    def _recurse_explain(self, plan) -> LogicalPlanNode:
+        """Recurse into explain node."""
+        from ..plan.logical import Explain
+
+        new_plan = self._push_limit(plan.plan)
+        if new_plan != plan.plan:
+            return Explain(new_plan)
         return plan
 
     def _try_push_limit(self, limit: Limit) -> LogicalPlanNode:
