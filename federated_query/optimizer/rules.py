@@ -292,7 +292,7 @@ class PredicatePushdownRule(OptimizationRule):
 
     def _extract_column_refs(self, expr: Expression) -> set:
         """Extract column names from expression."""
-        from ..plan.expressions import ColumnRef, BinaryOp, UnaryOp
+        from ..plan.expressions import ColumnRef, BinaryOp, UnaryOp, FunctionCall
 
         if isinstance(expr, ColumnRef):
             return {expr.column}
@@ -304,6 +304,12 @@ class PredicatePushdownRule(OptimizationRule):
 
         if isinstance(expr, UnaryOp):
             return self._extract_column_refs(expr.operand)
+
+        if isinstance(expr, FunctionCall):
+            columns = set()
+            for arg in expr.args:
+                columns.update(self._extract_column_refs(arg))
+            return columns
 
         return set()
 

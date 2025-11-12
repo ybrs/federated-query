@@ -475,7 +475,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 ### 6.3 Projection Pushdown ✅
 - [x] Column analysis infrastructure - Implemented
   - [x] Analyze column usage throughout plan tree
-  - [x] Extract columns from expressions (binary, unary, function calls)
+  - [x] Extract columns from expressions (binary, unary, **function calls**)
 - [x] Column pruning (remove unused columns early) - Implemented
   - [x] Remove unused columns from Scan nodes - Implemented
   - [x] Propagate required columns through filters - Implemented
@@ -540,9 +540,9 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 **Note**: Requires SQL generation infrastructure, deferred
 
 ### 6.9 Testing ✅
-- [x] Test each optimization rule independently - 32 tests passing
+- [x] Test each optimization rule independently - 35 tests passing
 - [x] **NEW**: Test optimization bug fixes - 7 tests (test_optimization_bugs.py)
-- [x] **NEW**: Test additional optimization bugs - 4 tests (test_optimization_bugs_additional.py)
+- [x] **NEW**: Test additional optimization bugs - 7 tests (test_optimization_bugs_additional.py)
 - [x] Test predicate pushdown with various filters - 7 tests
   - [x] Test push to scan - 1 test
   - [x] Test merge adjacent filters - 1 test
@@ -568,7 +568,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - [ ] Benchmark query performance improvement - Deferred
 - [ ] Compare optimized vs unoptimized execution times - Deferred
 
-**Deliverable**: ✅ **Substantially Complete** - Core optimization rules (predicate, projection, limit pushdown + join filter pushdown + column pruning) implemented with 32 comprehensive tests, all 5 critical bugs fixed
+**Deliverable**: ✅ **Substantially Complete** - Core optimization rules (predicate, projection, limit pushdown + join filter pushdown + column pruning) implemented with 35 comprehensive tests, all 6 critical bugs fixed
 
 **Implementation Summary**:
 - **PredicatePushdownRule** (federated_query/optimizer/rules.py:47-275):
@@ -595,10 +595,11 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
     - Limit pushdown semantics (2 tests)
     - Column pruning with SELECT * (2 tests)
     - Outer join filter pushdown safety (3 tests)
-  - **NEW**: tests/test_optimization_bugs_additional.py: 4 additional bug fix tests
+  - **NEW**: tests/test_optimization_bugs_additional.py: 7 additional bug fix tests
     - Filter through projection pushdown (2 tests)
     - Column detection for wrapped joins (2 tests)
-  - Total: 32 tests, all passing
+    - FunctionCall column extraction (3 tests)
+  - Total: 35 tests, all passing
 
 **Bug Fixes Implemented**:
 1. **Limit Pushdown**: Fixed incorrect pushdown through filters that changed query semantics
@@ -606,6 +607,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 3. **Outer Join Safety**: Fixed unsafe filter pushdown below outer joins
 4. **Filter Through Projection**: Fixed filter never actually pushing below projection
 5. **Wrapped Join Column Detection**: Fixed empty column sets for Filter/Limit wrapped joins
+6. **FunctionCall Column Extraction**: Fixed _extract_column_refs ignoring FunctionCall expressions, causing incorrect join filter pushdown
 
 **Future Work** (remaining Phase 6 tasks):
 - Implement join reordering with cost model integration

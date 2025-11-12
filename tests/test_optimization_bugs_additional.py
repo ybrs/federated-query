@@ -17,7 +17,183 @@ from federated_query.plan.expressions import (
     Literal,
     BinaryOpType,
     DataType,
+    FunctionCall,
 )
+
+
+class TestFunctionCallColumnExtraction:
+    """Test that column extraction handles FunctionCall expressions."""
+
+    def test_filter_with_function_call_should_not_push_incorrectly(self):
+        """Test that filter with FunctionCall doesn't push incorrectly.
+
+        SELECT * FROM orders o
+        JOIN customers c ON o.customer_id = c.id
+        WHERE ABS(o.amount - c.credit_limit) > 100
+
+        The predicate references BOTH sides (o.amount and c.credit_limit).
+        Currently _extract_column_refs returns empty set for FunctionCall,
+        so pred_cols = {} and all(c in left_cols for c in {}) = True,
+        causing the filter to push to left side incorrectly!
+
+        The filter should stay ABOVE the join since it references both sides.
+        """
+        left_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "customer_id", "amount"]
+        )
+        right_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="customers",
+            columns=["id", "name", "credit_limit"]
+        )
+        join_condition = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
+            right=ColumnRef("customers", "id", DataType.INTEGER)
+        )
+        join = Join(
+            left=left_scan,
+            right=right_scan,
+            join_type=JoinType.INNER,
+            condition=join_condition
+        )
+
+        # Filter with FunctionCall: ABS(o.amount - c.credit_limit) > 100
+        abs_arg = BinaryOp(
+            op=BinaryOpType.SUBTRACT,
+            left=ColumnRef(None, "amount", DataType.DECIMAL),
+            right=ColumnRef(None, "credit_limit", DataType.DECIMAL)
+        )
+        abs_call = FunctionCall(
+            function_name="ABS",
+            args=[abs_arg]
+        )
+        predicate = BinaryOp(
+            op=BinaryOpType.GT,
+            left=abs_call,
+            right=Literal(100, DataType.DECIMAL)
+        )
+        filter_node = Filter(join, predicate)
+
+        rule = PredicatePushdownRule()
+        result = rule.apply(filter_node)
+
+        # Filter should stay ABOVE join (references both sides)
+        assert isinstance(result, Filter), f"Expected Filter above join, got {type(result).__name__}"
+        assert isinstance(result.input, Join), f"Expected Join below filter, got {type(result.input).__name__}"
+
+    def test_filter_with_coalesce_referencing_both_sides(self):
+        """Test COALESCE with columns from both join sides.
+
+        SELECT * FROM orders o
+        JOIN customers c ON o.customer_id = c.id
+        WHERE COALESCE(o.priority, c.default_priority) = 'high'
+
+        COALESCE references both o.priority and c.default_priority.
+        Should NOT push below join.
+        """
+        left_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "customer_id", "priority"]
+        )
+        right_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="customers",
+            columns=["id", "name", "default_priority"]
+        )
+        join_condition = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
+            right=ColumnRef("customers", "id", DataType.INTEGER)
+        )
+        join = Join(
+            left=left_scan,
+            right=right_scan,
+            join_type=JoinType.INNER,
+            condition=join_condition
+        )
+
+        # COALESCE(o.priority, c.default_priority) = 'high'
+        coalesce_call = FunctionCall(
+            function_name="COALESCE",
+            args=[
+                ColumnRef(None, "priority", DataType.VARCHAR),
+                ColumnRef(None, "default_priority", DataType.VARCHAR)
+            ]
+        )
+        predicate = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=coalesce_call,
+            right=Literal("high", DataType.VARCHAR)
+        )
+        filter_node = Filter(join, predicate)
+
+        rule = PredicatePushdownRule()
+        result = rule.apply(filter_node)
+
+        # Filter should stay ABOVE join
+        assert isinstance(result, Filter)
+        assert isinstance(result.input, Join)
+
+    def test_filter_with_function_call_single_side_can_push(self):
+        """Test that FunctionCall referencing only one side CAN push.
+
+        SELECT * FROM orders o
+        JOIN customers c ON o.customer_id = c.id
+        WHERE UPPER(c.name) = 'ACME'
+
+        UPPER(c.name) only references right side, so it CAN push to right.
+        """
+        left_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "customer_id"]
+        )
+        right_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="customers",
+            columns=["id", "name"]
+        )
+        join_condition = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
+            right=ColumnRef("customers", "id", DataType.INTEGER)
+        )
+        join = Join(
+            left=left_scan,
+            right=right_scan,
+            join_type=JoinType.INNER,
+            condition=join_condition
+        )
+
+        # UPPER(c.name) = 'ACME'
+        upper_call = FunctionCall(
+            function_name="UPPER",
+            args=[ColumnRef(None, "name", DataType.VARCHAR)]
+        )
+        predicate = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=upper_call,
+            right=Literal("ACME", DataType.VARCHAR)
+        )
+        filter_node = Filter(join, predicate)
+
+        rule = PredicatePushdownRule()
+        result = rule.apply(filter_node)
+
+        # Filter should push to right side
+        assert isinstance(result, Join)
+        assert isinstance(result.right, Scan)
+        assert result.right.filters is not None
 
 
 class TestFilterThroughProjectionBug:
