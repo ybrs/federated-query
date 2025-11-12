@@ -295,13 +295,9 @@ class ProjectionPushdownRule(OptimizationRule):
         plan: LogicalPlanNode
     ) -> set:
         """Collect all required column names from plan."""
-        from ..plan.expressions import ColumnRef
-
         columns = set()
 
         if isinstance(plan, Scan):
-            for col in plan.columns:
-                columns.add(col)
             if plan.filters:
                 columns.update(self._extract_columns(plan.filters))
             return columns
@@ -309,7 +305,6 @@ class ProjectionPushdownRule(OptimizationRule):
         if isinstance(plan, Project):
             for expr in plan.expressions:
                 columns.update(self._extract_columns(expr))
-            columns.update(self._collect_required_columns(plan.input))
             return columns
 
         if isinstance(plan, Filter):
@@ -329,7 +324,6 @@ class ProjectionPushdownRule(OptimizationRule):
                 columns.update(self._extract_columns(expr))
             for expr in plan.aggregates:
                 columns.update(self._extract_columns(expr))
-            columns.update(self._collect_required_columns(plan.input))
             return columns
 
         if isinstance(plan, Limit):
@@ -370,7 +364,100 @@ class ProjectionPushdownRule(OptimizationRule):
         required: set
     ) -> LogicalPlanNode:
         """Prune unused columns from plan."""
+        if isinstance(plan, Scan):
+            return self._prune_scan_columns(plan, required)
+
+        if isinstance(plan, Project):
+            new_input = self._prune_columns(plan.input, required)
+            if new_input != plan.input:
+                return Project(new_input, plan.expressions, plan.aliases)
+            return plan
+
+        if isinstance(plan, Filter):
+            filter_cols = self._extract_columns(plan.predicate)
+            combined_required = required.union(filter_cols)
+            new_input = self._prune_columns(plan.input, combined_required)
+            if new_input != plan.input:
+                return Filter(new_input, plan.predicate)
+            return plan
+
+        if isinstance(plan, Join):
+            left_req = self._get_required_for_subtree(plan.left, required)
+            right_req = self._get_required_for_subtree(plan.right, required)
+            new_left = self._prune_columns(plan.left, left_req)
+            new_right = self._prune_columns(plan.right, right_req)
+            if new_left != plan.left or new_right != plan.right:
+                return Join(
+                    new_left,
+                    new_right,
+                    plan.join_type,
+                    plan.condition
+                )
+            return plan
+
+        if isinstance(plan, Aggregate):
+            new_input = self._prune_columns(plan.input, required)
+            if new_input != plan.input:
+                return Aggregate(
+                    new_input,
+                    plan.group_by,
+                    plan.aggregates,
+                    plan.output_names
+                )
+            return plan
+
+        if isinstance(plan, Limit):
+            new_input = self._prune_columns(plan.input, required)
+            if new_input != plan.input:
+                return Limit(new_input, plan.limit, plan.offset)
+            return plan
+
         return plan
+
+    def _prune_scan_columns(
+        self,
+        scan: Scan,
+        required: set
+    ) -> Scan:
+        """Prune columns from scan node."""
+        available = set(scan.columns)
+        needed = available.intersection(required)
+
+        if not needed:
+            needed = available
+
+        if needed != available:
+            pruned_cols = []
+            for col in scan.columns:
+                if col in needed:
+                    pruned_cols.append(col)
+
+            return Scan(
+                datasource=scan.datasource,
+                schema_name=scan.schema_name,
+                table_name=scan.table_name,
+                columns=pruned_cols,
+                filters=scan.filters
+            )
+
+        return scan
+
+    def _get_required_for_subtree(
+        self,
+        plan: LogicalPlanNode,
+        parent_required: set
+    ) -> set:
+        """Get required columns for a subtree."""
+        local_required = set()
+
+        if isinstance(plan, Scan):
+            if plan.filters:
+                local_required.update(self._extract_columns(plan.filters))
+
+        if isinstance(plan, Filter):
+            local_required.update(self._extract_columns(plan.predicate))
+
+        return local_required.union(parent_required)
 
     def name(self) -> str:
         return "ProjectionPushdown"

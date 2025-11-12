@@ -248,21 +248,79 @@ class TestPredicatePushdown:
 class TestProjectionPushdown:
     """Test projection pushdown optimization."""
 
-    def test_collect_required_columns_from_scan(self):
-        """Test collecting columns from scan."""
+    def test_collect_required_columns_from_scan_with_filter(self):
+        """Test collecting columns from scan with filter."""
+        predicate = BinaryOp(
+            op=BinaryOpType.GT,
+            left=ColumnRef(None, "age", DataType.INTEGER),
+            right=Literal(18, DataType.INTEGER)
+        )
+        scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="users",
+            columns=["id", "name", "age"],
+            filters=predicate
+        )
+
+        rule = ProjectionPushdownRule()
+        columns = rule._collect_required_columns(scan)
+
+        assert "age" in columns
+
+    def test_prune_unused_columns_from_scan(self):
+        """Test pruning unused columns from scan."""
+        scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="users",
+            columns=["id", "name", "age", "email", "phone"]
+        )
+        project = Project(
+            input=scan,
+            expressions=[
+                ColumnRef(None, "id", DataType.INTEGER),
+                ColumnRef(None, "name", DataType.VARCHAR)
+            ],
+            aliases=["id", "name"]
+        )
+
+        rule = ProjectionPushdownRule()
+        result = rule.apply(project)
+
+        assert isinstance(result, Project)
+        assert isinstance(result.input, Scan)
+        assert set(result.input.columns) == {"id", "name"}
+
+    def test_keep_columns_needed_by_filter(self):
+        """Test columns needed by filter are not pruned."""
         scan = Scan(
             datasource="test_ds",
             schema_name="public",
             table_name="users",
             columns=["id", "name", "age"]
         )
+        predicate = BinaryOp(
+            op=BinaryOpType.GT,
+            left=ColumnRef(None, "age", DataType.INTEGER),
+            right=Literal(18, DataType.INTEGER)
+        )
+        filter_node = Filter(scan, predicate)
+        project = Project(
+            input=filter_node,
+            expressions=[ColumnRef(None, "name", DataType.VARCHAR)],
+            aliases=["name"]
+        )
 
         rule = ProjectionPushdownRule()
-        columns = rule._collect_required_columns(scan)
+        result = rule.apply(project)
 
-        assert "id" in columns
-        assert "name" in columns
-        assert "age" in columns
+        assert isinstance(result, Project)
+        assert isinstance(result.input, Filter)
+        assert isinstance(result.input.input, Scan)
+        scan_cols = set(result.input.input.columns)
+        assert "name" in scan_cols
+        assert "age" in scan_cols
 
     def test_collect_required_columns_from_project(self):
         """Test collecting columns from projection."""
