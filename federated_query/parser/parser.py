@@ -3,7 +3,17 @@
 import sqlglot
 from sqlglot import exp
 from typing import Dict, List, Optional, Tuple
-from ..plan.logical import LogicalPlanNode, Scan, Project, Filter, Limit, Join, JoinType, Aggregate
+from ..plan.logical import (
+    LogicalPlanNode,
+    Scan,
+    Project,
+    Filter,
+    Limit,
+    Join,
+    JoinType,
+    Aggregate,
+    Explain,
+)
 from ..plan.expressions import (
     Expression,
     ColumnRef,
@@ -47,6 +57,8 @@ class Parser:
         """
         if isinstance(ast, exp.Select):
             return self._convert_select(ast)
+        if isinstance(ast, exp.Command) and self._is_explain_command(ast):
+            return self._convert_explain(ast)
         raise ValueError(f"Unsupported AST node type: {type(ast)}")
 
     def _convert_select(self, select: exp.Select) -> LogicalPlanNode:
@@ -65,6 +77,31 @@ class Parser:
         plan = self._build_select_clause(select, plan)
         plan = self._build_limit_clause(select, plan)
         return plan
+
+    def _convert_explain(self, command: exp.Command) -> LogicalPlanNode:
+        """Convert EXPLAIN statement to logical plan."""
+        query_ast = self._extract_explain_expression(command)
+        child_plan = self.ast_to_logical_plan(query_ast)
+        return Explain(input=child_plan)
+
+    def _extract_explain_expression(self, command: exp.Command) -> exp.Expression:
+        """Extract the statement wrapped by EXPLAIN."""
+        expression = command.args.get("expression")
+        if expression is None:
+            raise ValueError("EXPLAIN requires a statement to describe")
+        if isinstance(expression, exp.Literal) and expression.is_string:
+            sql_text = expression.this
+            return sqlglot.parse_one(sql_text, dialect=self.dialect)
+        if isinstance(expression, exp.Expression):
+            return expression
+        raise ValueError(f"Unsupported EXPLAIN expression: {type(expression)}")
+
+    def _is_explain_command(self, command: exp.Command) -> bool:
+        """Check if a sqlglot Command represents EXPLAIN."""
+        keyword = command.args.get("this")
+        if keyword is None:
+            return False
+        return str(keyword).upper() == "EXPLAIN"
 
     def _build_from_clause(self, select: exp.Select) -> LogicalPlanNode:
         """Build scan node from FROM clause.

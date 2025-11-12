@@ -149,6 +149,33 @@ results = executor.execute_to_table(physical_plan)
 print(results)
 ```
 
+### Explain Plans
+
+Use `EXPLAIN` to inspect how a query will run without touching the underlying data sources:
+
+```sql
+EXPLAIN SELECT id, name FROM duckdb.main.users WHERE age > 30;
+```
+
+The engine returns a single-column result where each row is a formatted physical operator (including stubbed cost values, row estimates, and key attributes) so you can understand join order, predicates, and data source usage before executing the statement.
+
+### Interactive CLI (`fedq`)
+
+Install the package in editable mode to expose the `fedq` console script:
+
+```bash
+pip install -e .
+fedq  # starts an interactive shell
+```
+
+By default the CLI starts an in-memory DuckDB data source populated with a `demo_users` table so you can experiment immediately:
+
+```
+fedq> SELECT * FROM duckdb_mem.main.demo_users WHERE age > 30;
+```
+
+Pass `--config path/to/config.yaml` to point the CLI at your own catalog configuration. The shell accepts multi-line statements terminated by `;` and supports `\q` to exit.
+
 ## Development Status
 
 This project is under active development. See `tasks.md` for the implementation roadmap.
