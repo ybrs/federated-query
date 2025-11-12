@@ -819,3 +819,265 @@ class TestTableAliasBug:
         # (This is a complex case - ideally both predicates would split and push)
         # For now, at minimum, the rule should not fail
         assert result is not None
+
+
+class TestColumnPruningJoinKeyBug:
+    """Test that column pruning preserves columns needed by join conditions.
+
+    Bug: _collect_required_columns stops at Project nodes and doesn't recurse
+    into plan.input. This means columns needed by downstream operators (like
+    join keys) are omitted from the required set. When _prune_scan_columns runs,
+    it can drop join condition columns, breaking the join.
+    """
+
+    def test_projection_over_join_preserves_join_keys(self):
+        """Test that join keys are preserved even when not in projection.
+
+        SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id
+
+        The projection only references u.name, but the join needs u.id and
+        o.user_id. Currently _collect_required_columns stops at the Project
+        and only records {name}, causing u.id to be pruned from the scan.
+
+        This makes the join impossible to execute!
+        """
+        from federated_query.optimizer.rules import ProjectionPushdownRule
+
+        # Left scan: users
+        left_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="users",
+            columns=["id", "name", "email"],
+            alias="u"
+        )
+
+        # Right scan: orders
+        right_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "user_id", "amount"],
+            alias="o"
+        )
+
+        # Join condition: u.id = o.user_id
+        join_condition = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef("u", "id", DataType.INTEGER),
+            right=ColumnRef("o", "user_id", DataType.INTEGER)
+        )
+
+        join = Join(
+            left=left_scan,
+            right=right_scan,
+            join_type=JoinType.INNER,
+            condition=join_condition
+        )
+
+        # Project: SELECT u.name (only projects name, not id!)
+        project = Project(
+            input=join,
+            expressions=[ColumnRef("u", "name", DataType.VARCHAR)],
+            aliases=["name"]
+        )
+
+        rule = ProjectionPushdownRule()
+        result = rule.apply(project)
+
+        # Result should still be a projection
+        assert isinstance(result, Project)
+
+        # The join should still have both join key columns
+        # Navigate: Project -> Join -> left/right scans
+        assert isinstance(result.input, Join)
+        resulting_join = result.input
+
+        # Left side (users) must have 'id' column for join condition
+        assert isinstance(resulting_join.left, Scan)
+        assert "id" in resulting_join.left.columns, "users.id must be preserved for join key"
+        assert "name" in resulting_join.left.columns, "users.name needed for projection"
+
+        # Right side (orders) must have 'user_id' column for join condition
+        assert isinstance(resulting_join.right, Scan)
+        assert "user_id" in resulting_join.right.columns, "orders.user_id must be preserved for join key"
+
+    def test_projection_over_filtered_join_preserves_filter_and_join_columns(self):
+        """Test that both filter and join columns are preserved.
+
+        SELECT u.name FROM users u
+        JOIN orders o ON u.id = o.user_id
+        WHERE o.amount > 100
+
+        Projection needs: u.name
+        Filter needs: o.amount
+        Join needs: u.id, o.user_id
+
+        All must be preserved even though only u.name is in the final projection.
+        """
+        from federated_query.optimizer.rules import ProjectionPushdownRule
+
+        # Left scan: users
+        left_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="users",
+            columns=["id", "name", "email"],
+            alias="u"
+        )
+
+        # Right scan: orders
+        right_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "user_id", "amount"],
+            alias="o"
+        )
+
+        # Join condition: u.id = o.user_id
+        join_condition = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef("u", "id", DataType.INTEGER),
+            right=ColumnRef("o", "user_id", DataType.INTEGER)
+        )
+
+        join = Join(
+            left=left_scan,
+            right=right_scan,
+            join_type=JoinType.INNER,
+            condition=join_condition
+        )
+
+        # Filter: o.amount > 100
+        filter_pred = BinaryOp(
+            op=BinaryOpType.GT,
+            left=ColumnRef("o", "amount", DataType.DECIMAL),
+            right=Literal(100, DataType.DECIMAL)
+        )
+        filter_node = Filter(join, filter_pred)
+
+        # Project: SELECT u.name
+        project = Project(
+            input=filter_node,
+            expressions=[ColumnRef("u", "name", DataType.VARCHAR)],
+            aliases=["name"]
+        )
+
+        rule = ProjectionPushdownRule()
+        result = rule.apply(project)
+
+        # Find the scans (may be wrapped in filters)
+        assert isinstance(result, Project)
+
+        # Navigate down to find scans
+        # Could be: Project -> Filter -> Join -> Scans
+        # Or: Project -> Join -> Scans (if filter pushed down)
+        current = result.input
+        if isinstance(current, Filter):
+            current = current.input
+
+        assert isinstance(current, Join)
+        join_node = current
+
+        # Check left side (users) - may be wrapped in filter
+        left_node = join_node.left
+        if isinstance(left_node, Filter):
+            left_node = left_node.input
+        assert isinstance(left_node, Scan)
+        assert "id" in left_node.columns, "users.id needed for join"
+        assert "name" in left_node.columns, "users.name needed for projection"
+
+        # Check right side (orders) - may be wrapped in filter
+        right_node = join_node.right
+        if isinstance(right_node, Filter):
+            right_node = right_node.input
+        assert isinstance(right_node, Scan)
+        assert "user_id" in right_node.columns, "orders.user_id needed for join"
+        assert "amount" in right_node.columns, "orders.amount needed for filter"
+
+    def test_nested_projections_preserve_all_needed_columns(self):
+        """Test nested projections preserve columns needed at each level.
+
+        SELECT name FROM (
+          SELECT u.name, u.id FROM users u
+          JOIN orders o ON u.id = o.user_id
+        )
+
+        Inner projection needs: u.name, u.id (and join keys)
+        Outer projection needs: name
+        Join needs: u.id, o.user_id
+
+        The u.id column is in the inner projection but not the outer one.
+        It should still be preserved for the join.
+        """
+        from federated_query.optimizer.rules import ProjectionPushdownRule
+
+        # Left scan: users
+        left_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="users",
+            columns=["id", "name", "email"],
+            alias="u"
+        )
+
+        # Right scan: orders
+        right_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "user_id", "amount"],
+            alias="o"
+        )
+
+        # Join condition: u.id = o.user_id
+        join_condition = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef("u", "id", DataType.INTEGER),
+            right=ColumnRef("o", "user_id", DataType.INTEGER)
+        )
+
+        join = Join(
+            left=left_scan,
+            right=right_scan,
+            join_type=JoinType.INNER,
+            condition=join_condition
+        )
+
+        # Inner projection: SELECT u.name, u.id
+        inner_project = Project(
+            input=join,
+            expressions=[
+                ColumnRef("u", "name", DataType.VARCHAR),
+                ColumnRef("u", "id", DataType.INTEGER)
+            ],
+            aliases=["name", "id"]
+        )
+
+        # Outer projection: SELECT name
+        outer_project = Project(
+            input=inner_project,
+            expressions=[ColumnRef(None, "name", DataType.VARCHAR)],
+            aliases=["name"]
+        )
+
+        rule = ProjectionPushdownRule()
+        result = rule.apply(outer_project)
+
+        # Navigate down to find the join and scans
+        current = result
+        while isinstance(current, Project):
+            current = current.input
+
+        assert isinstance(current, Join)
+        join_node = current
+
+        # Left side must have both id and name
+        assert isinstance(join_node.left, Scan)
+        assert "id" in join_node.left.columns, "users.id needed for join"
+        assert "name" in join_node.left.columns, "users.name needed for projection"
+
+        # Right side must have user_id
+        assert isinstance(join_node.right, Scan)
+        assert "user_id" in join_node.right.columns, "orders.user_id needed for join"

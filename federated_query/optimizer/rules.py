@@ -453,8 +453,13 @@ class ProjectionPushdownRule(OptimizationRule):
             return columns
 
         if isinstance(plan, Project):
+            # Collect columns from projection expressions
             for expr in plan.expressions:
                 columns.update(self._extract_columns(expr))
+            # CRITICAL: Must recurse into input to collect columns needed by
+            # downstream operators (e.g., join keys, filter columns)
+            # Otherwise those columns will be pruned and break the query!
+            columns.update(self._collect_required_columns(plan.input))
             return columns
 
         if isinstance(plan, Filter):

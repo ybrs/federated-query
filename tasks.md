@@ -540,9 +540,9 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 **Note**: Requires SQL generation infrastructure, deferred
 
 ### 6.9 Testing ✅
-- [x] Test each optimization rule independently - 42 tests passing
+- [x] Test each optimization rule independently - 45 tests passing
 - [x] **NEW**: Test optimization bug fixes - 7 tests (test_optimization_bugs.py)
-- [x] **NEW**: Test additional optimization bugs - 14 tests (test_optimization_bugs_additional.py)
+- [x] **NEW**: Test additional optimization bugs - 17 tests (test_optimization_bugs_additional.py)
 - [x] Test predicate pushdown with various filters - 7 tests
   - [x] Test push to scan - 1 test
   - [x] Test merge adjacent filters - 1 test
@@ -568,7 +568,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - [ ] Benchmark query performance improvement - Deferred
 - [ ] Compare optimized vs unoptimized execution times - Deferred
 
-**Deliverable**: ✅ **Substantially Complete** - Core optimization rules (predicate, projection, limit pushdown + join filter pushdown + column pruning) implemented with 42 comprehensive tests, all 8 critical bugs fixed
+**Deliverable**: ✅ **Substantially Complete** - Core optimization rules (predicate, projection, limit pushdown + join filter pushdown + column pruning) implemented with 45 comprehensive tests, all 9 critical bugs fixed
 
 **Implementation Summary**:
 - **PredicatePushdownRule** (federated_query/optimizer/rules.py:47-275):
@@ -595,13 +595,14 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
     - Limit pushdown semantics (2 tests)
     - Column pruning with SELECT * (2 tests)
     - Outer join filter pushdown safety (3 tests)
-  - **NEW**: tests/test_optimization_bugs_additional.py: 14 additional bug fix tests
+  - **NEW**: tests/test_optimization_bugs_additional.py: 17 additional bug fix tests
     - Filter through projection pushdown (2 tests)
     - Column detection for wrapped joins (2 tests)
     - FunctionCall column extraction (3 tests)
     - Table qualifier handling (4 tests)
     - Table alias handling (3 tests)
-  - Total: 42 tests, all passing
+    - Column pruning preserving join keys (3 tests)
+  - Total: 45 tests, all passing
 
 **Bug Fixes Implemented**:
 1. **Limit Pushdown**: Fixed incorrect pushdown through filters that changed query semantics
@@ -612,6 +613,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 6. **FunctionCall Column Extraction**: Fixed _extract_column_refs ignoring FunctionCall expressions, causing incorrect join filter pushdown
 7. **Table Qualifier Handling**: Fixed predicate pushdown ignoring table qualifiers, causing filters on same-named columns (orders.id vs customers.id) to be misrouted to wrong side of join
 8. **Table Alias Handling**: Fixed predicate pushdown failing for aliased tables (FROM users u WHERE u.age > 18) by adding alias field to Scan nodes and using alias when qualifying column names
+9. **Column Pruning Join Keys**: Fixed _collect_required_columns stopping at Project nodes without recursing into input, causing join keys and filter columns to be pruned from scans and breaking queries like SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id
 
 **Future Work** (remaining Phase 6 tasks):
 - Implement join reordering with cost model integration
