@@ -3,6 +3,7 @@ sqlglot>=20.0.0
 pyarrow>=14.0.0
 pyyaml>=6.0
 click>=8.1.0
+prompt_toolkit>=3.0.0
 
 # Data source connectors
 psycopg2-binary>=2.9.0
