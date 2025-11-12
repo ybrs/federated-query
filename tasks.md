@@ -14,7 +14,7 @@ This document breaks down the implementation into phases. Each phase builds on t
 | **Phase 3** | ✅ Complete | Aggregations and GROUP BY | 9 tests |
 | **Phase 4** | ✅ Complete | Pre-optimization and expression handling | 42 tests |
 | **Phase 5** | ✅ Complete | Statistics and cost model | 30 tests |
-| **Phase 6** | ✅ Substantially Complete | Logical optimization (pushdown, reordering) | 28 tests |
+| **Phase 6** | ✅ Substantially Complete | Logical optimization (pushdown, reordering) | 32 tests |
 | **Phase 7** | ⏳ Not Started | Decorrelation (subqueries) | - |
 | **Phase 8** | ⏳ Not Started | Physical planning and join strategies | - |
 | **Phase 9** | ⏳ Not Started | Advanced execution (parallel, memory mgmt) | - |
@@ -22,7 +22,7 @@ This document breaks down the implementation into phases. Each phase builds on t
 | **Phase 11** | ⏳ Not Started | Production readiness | - |
 | **Phase 12** | ⏳ Future | Advanced features (adaptive execution, caching) | - |
 
-**Current Status**: 182 tests passing, Phases 0-5 complete, Phase 6 substantially complete (predicate/projection/limit pushdown with bug fixes)
+**Current Status**: 186 tests passing, Phases 0-5 complete, Phase 6 substantially complete (all critical bugs fixed)
 
 ## Phase 0: Foundation ✅ COMPLETED
 
@@ -444,7 +444,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 
 **Status:** ✅ SUBSTANTIALLY COMPLETE
 **Goal**: Implement rule-based logical optimizations
-**Tests**: 28 tests passing, 182 total tests
+**Tests**: 32 tests passing, 186 total tests
 
 **Prerequisites**: ✅ Optimization infrastructure already exists:
 - OptimizationRule base class (federated_query/optimizer/rules.py)
@@ -540,8 +540,9 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 **Note**: Requires SQL generation infrastructure, deferred
 
 ### 6.9 Testing ✅
-- [x] Test each optimization rule independently - 28 tests passing
+- [x] Test each optimization rule independently - 32 tests passing
 - [x] **NEW**: Test optimization bug fixes - 7 tests (test_optimization_bugs.py)
+- [x] **NEW**: Test additional optimization bugs - 4 tests (test_optimization_bugs_additional.py)
 - [x] Test predicate pushdown with various filters - 7 tests
   - [x] Test push to scan - 1 test
   - [x] Test merge adjacent filters - 1 test
@@ -567,7 +568,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - [ ] Benchmark query performance improvement - Deferred
 - [ ] Compare optimized vs unoptimized execution times - Deferred
 
-**Deliverable**: ✅ **Substantially Complete** - Core optimization rules (predicate, projection, limit pushdown + join filter pushdown + column pruning) implemented with 28 comprehensive tests, all critical bugs fixed
+**Deliverable**: ✅ **Substantially Complete** - Core optimization rules (predicate, projection, limit pushdown + join filter pushdown + column pruning) implemented with 32 comprehensive tests, all 5 critical bugs fixed
 
 **Implementation Summary**:
 - **PredicatePushdownRule** (federated_query/optimizer/rules.py:47-275):
@@ -590,16 +591,21 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
   - 49 lines, cyclomatic complexity ≤ 4 per function
 - **Test Coverage**:
   - tests/test_logical_optimization.py: 21 tests across 5 test classes
-  - **NEW**: tests/test_optimization_bugs.py: 7 critical bug fix tests
+  - tests/test_optimization_bugs.py: 7 critical bug fix tests
     - Limit pushdown semantics (2 tests)
     - Column pruning with SELECT * (2 tests)
     - Outer join filter pushdown safety (3 tests)
-  - Total: 28 tests, all passing
+  - **NEW**: tests/test_optimization_bugs_additional.py: 4 additional bug fix tests
+    - Filter through projection pushdown (2 tests)
+    - Column detection for wrapped joins (2 tests)
+  - Total: 32 tests, all passing
 
 **Bug Fixes Implemented**:
 1. **Limit Pushdown**: Fixed incorrect pushdown through filters that changed query semantics
 2. **Column Pruning**: Fixed SELECT * losing columns when filters present
 3. **Outer Join Safety**: Fixed unsafe filter pushdown below outer joins
+4. **Filter Through Projection**: Fixed filter never actually pushing below projection
+5. **Wrapped Join Column Detection**: Fixed empty column sets for Filter/Limit wrapped joins
 
 **Future Work** (remaining Phase 6 tasks):
 - Implement join reordering with cost model integration

@@ -143,14 +143,25 @@ class PredicatePushdownRule(OptimizationRule):
         filter_node: Filter,
         project: Project
     ) -> LogicalPlanNode:
-        """Push filter through projection if possible."""
+        """Push filter through projection if possible.
+
+        Push filter BELOW projection if the predicate can be evaluated
+        using columns available in the projection's input.
+        """
+        predicate_cols = self._extract_column_refs(filter_node.predicate)
+        input_cols = self._get_column_names(project.input)
+
+        # Can we evaluate predicate using columns from input?
+        can_push = predicate_cols.issubset(input_cols) if predicate_cols else True
+
+        if can_push:
+            # Push filter BELOW projection: Project(Filter(input, pred), ...)
+            new_filter = Filter(project.input, filter_node.predicate)
+            new_filter = self._push_down(new_filter)
+            return Project(new_filter, project.expressions, project.aliases)
+
+        # Filter references columns not available in input, keep above
         new_input = self._push_down(project.input)
-
-        if self._can_push_through_project(filter_node.predicate, project):
-            new_project = Project(new_input, project.expressions, project.aliases)
-            new_filter = Filter(new_project, filter_node.predicate)
-            return new_filter
-
         new_project = Project(new_input, project.expressions, project.aliases)
         return Filter(new_project, filter_node.predicate)
 
@@ -252,7 +263,10 @@ class PredicatePushdownRule(OptimizationRule):
         return Filter(new_join, predicate)
 
     def _get_column_names(self, plan: LogicalPlanNode) -> set:
-        """Get all column names available from a plan node."""
+        """Get all column names available from a plan node.
+
+        Recursively handles wrapped nodes (Filter, Limit, etc).
+        """
         if isinstance(plan, Scan):
             return set(plan.columns)
 
@@ -263,6 +277,16 @@ class PredicatePushdownRule(OptimizationRule):
             left_cols = self._get_column_names(plan.left)
             right_cols = self._get_column_names(plan.right)
             return left_cols.union(right_cols)
+
+        if isinstance(plan, Filter):
+            return self._get_column_names(plan.input)
+
+        if isinstance(plan, Limit):
+            return self._get_column_names(plan.input)
+
+        if isinstance(plan, Aggregate):
+            # Aggregate changes schema - return output columns
+            return set(plan.output_names)
 
         return set()
 
@@ -282,14 +306,6 @@ class PredicatePushdownRule(OptimizationRule):
             return self._extract_column_refs(expr.operand)
 
         return set()
-
-    def _can_push_through_project(
-        self,
-        predicate: Expression,
-        project: Project
-    ) -> bool:
-        """Check if predicate references only projected columns."""
-        return True
 
     def name(self) -> str:
         return "PredicatePushdown"
