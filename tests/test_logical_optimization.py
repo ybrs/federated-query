@@ -125,6 +125,125 @@ class TestPredicatePushdown:
 
         assert result == scan
 
+    def test_push_filter_below_join_left_side(self):
+        """Test pushing filter below join to left side."""
+        left_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "customer_id", "amount"]
+        )
+        right_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="customers",
+            columns=["id", "name"]
+        )
+        join_condition = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
+            right=ColumnRef("customers", "id", DataType.INTEGER)
+        )
+        join = Join(
+            left=left_scan,
+            right=right_scan,
+            join_type=JoinType.INNER,
+            condition=join_condition
+        )
+
+        predicate = BinaryOp(
+            op=BinaryOpType.GT,
+            left=ColumnRef(None, "amount", DataType.DECIMAL),
+            right=Literal(100, DataType.DECIMAL)
+        )
+        filter_node = Filter(join, predicate)
+
+        rule = PredicatePushdownRule()
+        result = rule.apply(filter_node)
+
+        assert isinstance(result, Join)
+        assert isinstance(result.left, Scan)
+        assert result.left.filters is not None
+
+    def test_push_filter_below_join_right_side(self):
+        """Test pushing filter below join to right side."""
+        left_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "customer_id"]
+        )
+        right_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="customers",
+            columns=["id", "name", "status"]
+        )
+        join_condition = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
+            right=ColumnRef("customers", "id", DataType.INTEGER)
+        )
+        join = Join(
+            left=left_scan,
+            right=right_scan,
+            join_type=JoinType.INNER,
+            condition=join_condition
+        )
+
+        predicate = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef(None, "status", DataType.VARCHAR),
+            right=Literal("active", DataType.VARCHAR)
+        )
+        filter_node = Filter(join, predicate)
+
+        rule = PredicatePushdownRule()
+        result = rule.apply(filter_node)
+
+        assert isinstance(result, Join)
+        assert isinstance(result.right, Scan)
+        assert result.right.filters is not None
+
+    def test_filter_above_join_references_both_sides(self):
+        """Test filter stays above join when referencing both sides."""
+        left_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "customer_id", "amount"]
+        )
+        right_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="customers",
+            columns=["id", "name", "credit_limit"]
+        )
+        join_condition = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
+            right=ColumnRef("customers", "id", DataType.INTEGER)
+        )
+        join = Join(
+            left=left_scan,
+            right=right_scan,
+            join_type=JoinType.INNER,
+            condition=join_condition
+        )
+
+        predicate = BinaryOp(
+            op=BinaryOpType.LT,
+            left=ColumnRef(None, "amount", DataType.DECIMAL),
+            right=ColumnRef(None, "credit_limit", DataType.DECIMAL)
+        )
+        filter_node = Filter(join, predicate)
+
+        rule = PredicatePushdownRule()
+        result = rule.apply(filter_node)
+
+        assert isinstance(result, Filter)
+        assert isinstance(result.input, Join)
+
 
 class TestProjectionPushdown:
     """Test projection pushdown optimization."""

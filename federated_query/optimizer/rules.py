@@ -109,6 +109,9 @@ class PredicatePushdownRule(OptimizationRule):
                 input_plan
             )
 
+        if isinstance(input_plan, Join):
+            return self._push_filter_below_join(filter_node, input_plan)
+
         if isinstance(input_plan, Scan):
             return self._push_filter_to_scan(filter_node, input_plan)
 
@@ -180,6 +183,85 @@ class PredicatePushdownRule(OptimizationRule):
             columns=scan.columns,
             filters=filter_node.predicate
         )
+
+    def _push_filter_below_join(
+        self,
+        filter_node: Filter,
+        join: Join
+    ) -> LogicalPlanNode:
+        """Push filter below join when possible."""
+        from ..plan.expressions import BinaryOp, BinaryOpType, ColumnRef
+
+        predicate = filter_node.predicate
+        left_cols = self._get_column_names(join.left)
+        right_cols = self._get_column_names(join.right)
+
+        pred_cols = self._extract_column_refs(predicate)
+
+        pred_left_only = all(c in left_cols for c in pred_cols)
+        pred_right_only = all(c in right_cols for c in pred_cols)
+
+        if pred_left_only:
+            new_left = Filter(join.left, predicate)
+            new_left = self._push_down(new_left)
+            new_join = Join(
+                new_left,
+                self._push_down(join.right),
+                join.join_type,
+                join.condition
+            )
+            return new_join
+
+        if pred_right_only:
+            new_right = Filter(join.right, predicate)
+            new_right = self._push_down(new_right)
+            new_join = Join(
+                self._push_down(join.left),
+                new_right,
+                join.join_type,
+                join.condition
+            )
+            return new_join
+
+        new_join = Join(
+            self._push_down(join.left),
+            self._push_down(join.right),
+            join.join_type,
+            join.condition
+        )
+        return Filter(new_join, predicate)
+
+    def _get_column_names(self, plan: LogicalPlanNode) -> set:
+        """Get all column names available from a plan node."""
+        if isinstance(plan, Scan):
+            return set(plan.columns)
+
+        if isinstance(plan, Project):
+            return set(plan.aliases)
+
+        if isinstance(plan, Join):
+            left_cols = self._get_column_names(plan.left)
+            right_cols = self._get_column_names(plan.right)
+            return left_cols.union(right_cols)
+
+        return set()
+
+    def _extract_column_refs(self, expr: Expression) -> set:
+        """Extract column names from expression."""
+        from ..plan.expressions import ColumnRef, BinaryOp, UnaryOp
+
+        if isinstance(expr, ColumnRef):
+            return {expr.column}
+
+        if isinstance(expr, BinaryOp):
+            left = self._extract_column_refs(expr.left)
+            right = self._extract_column_refs(expr.right)
+            return left.union(right)
+
+        if isinstance(expr, UnaryOp):
+            return self._extract_column_refs(expr.operand)
+
+        return set()
 
     def _can_push_through_project(
         self,

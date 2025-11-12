@@ -14,7 +14,7 @@ This document breaks down the implementation into phases. Each phase builds on t
 | **Phase 3** | ✅ Complete | Aggregations and GROUP BY | 9 tests |
 | **Phase 4** | ✅ Complete | Pre-optimization and expression handling | 42 tests |
 | **Phase 5** | ✅ Complete | Statistics and cost model | 30 tests |
-| **Phase 6** | 🚧 In Progress | Logical optimization (pushdown, reordering) | 16 tests |
+| **Phase 6** | 🚧 In Progress | Logical optimization (pushdown, reordering) | 19 tests |
 | **Phase 7** | ⏳ Not Started | Decorrelation (subqueries) | - |
 | **Phase 8** | ⏳ Not Started | Physical planning and join strategies | - |
 | **Phase 9** | ⏳ Not Started | Advanced execution (parallel, memory mgmt) | - |
@@ -22,7 +22,7 @@ This document breaks down the implementation into phases. Each phase builds on t
 | **Phase 11** | ⏳ Not Started | Production readiness | - |
 | **Phase 12** | ⏳ Future | Advanced features (adaptive execution, caching) | - |
 
-**Current Status**: 170 tests passing, Phases 0-5 complete, Phase 6 in progress (predicate/projection/limit pushdown implemented)
+**Current Status**: 173 tests passing, Phases 0-5 complete, Phase 6 in progress (predicate/projection/limit pushdown + join filter pushdown)
 
 ## Phase 0: Foundation ✅ COMPLETED
 
@@ -455,7 +455,7 @@ All aggregate pushdown optimization tasks have been deferred to **Phase 6: Logic
 
 **Status:** 🚧 IN PROGRESS
 **Goal**: Implement rule-based logical optimizations
-**Tests**: 16 tests passing, 170 total tests
+**Tests**: 19 tests passing, 173 total tests
 
 **Prerequisites**: ✅ Optimization infrastructure already exists:
 - OptimizationRule base class (federated_query/optimizer/rules.py)
@@ -473,9 +473,12 @@ All aggregate pushdown optimization tasks have been deferred to **Phase 6: Logic
 - [x] Push filters through projections - Implemented
 - [x] Push filters to data sources (integrate with Scan node) - Implemented
 - [x] Merge adjacent filters - Implemented
-- [ ] Push filters below joins
-  - [ ] Handle join conditions correctly (split predicates by join side)
-  - [ ] Preserve semantics for outer joins (don't push below null-generating side)
+- [x] Push filters below joins - Implemented
+  - [x] Split predicates by join side (left-only, right-only, both) - Implemented
+  - [x] Push left-only predicates to left side - Implemented
+  - [x] Push right-only predicates to right side - Implemented
+  - [x] Keep predicates referencing both sides above join - Implemented
+  - [ ] Preserve semantics for outer joins (don't push below null-generating side) - TODO
 - [ ] Split complex predicates (break up AND conjunctions) - Deferred
 - [ ] Convert filter expressions to SQL - Deferred to execution
 - [ ] Handle datasource capabilities - Deferred to execution
@@ -547,8 +550,15 @@ All aggregate pushdown optimization tasks have been deferred to **Phase 6: Logic
 **Note**: Requires SQL generation infrastructure, deferred
 
 ### 6.9 Testing ✅
-- [x] Test each optimization rule independently - 16 tests passing
-- [x] Test predicate pushdown with various filters - 4 tests
+- [x] Test each optimization rule independently - 19 tests passing
+- [x] Test predicate pushdown with various filters - 7 tests
+  - [x] Test push to scan - 1 test
+  - [x] Test merge adjacent filters - 1 test
+  - [x] Test push through projection - 1 test
+  - [x] Test push below join (left side) - 1 test
+  - [x] Test push below join (right side) - 1 test
+  - [x] Test keep above join (both sides) - 1 test
+  - [x] Test no pushdown needed - 1 test
 - [x] Test projection pushdown and column pruning - 4 tests
 - [x] Test limit pushdown - 3 tests
 - [x] Test combined optimizations (multiple rules) - 2 tests
@@ -560,14 +570,16 @@ All aggregate pushdown optimization tasks have been deferred to **Phase 6: Logic
 - [ ] Benchmark query performance improvement - Deferred
 - [ ] Compare optimized vs unoptimized execution times - Deferred
 
-**Deliverable**: ✅ **Partially Complete** - Core optimization rules (predicate, projection, limit pushdown) implemented with 16 comprehensive tests
+**Deliverable**: ✅ **Partially Complete** - Core optimization rules (predicate, projection, limit pushdown + join filter pushdown) implemented with 19 comprehensive tests
 
 **Implementation Summary**:
-- **PredicatePushdownRule** (federated_query/optimizer/rules.py:47-193):
+- **PredicatePushdownRule** (federated_query/optimizer/rules.py:47-275):
   - Pushes filters to scan nodes
   - Merges adjacent filters
   - Pushes filters through projections
-  - 147 lines, cyclomatic complexity ≤ 4 per function
+  - **NEW**: Pushes filters below joins (split by join side)
+  - 229 lines, cyclomatic complexity ≤ 4 per function
+  - Helper methods for column extraction and join side analysis
 - **ProjectionPushdownRule** (federated_query/optimizer/rules.py:196-294):
   - Collects required columns from plan tree
   - Extracts columns from expressions
@@ -577,9 +589,10 @@ All aggregate pushdown optimization tasks have been deferred to **Phase 6: Logic
   - Pushes limits through projections and filters
   - Handles limit with offset
   - 49 lines, cyclomatic complexity ≤ 4 per function
-- **Test Coverage** (tests/test_phase6_optimization.py):
-  - 16 comprehensive tests across 5 test classes
+- **Test Coverage** (tests/test_logical_optimization.py):
+  - 19 comprehensive tests across 5 test classes
   - Covers basic and complex optimization scenarios
+  - Includes 3 new tests for join filter pushdown
   - All tests passing
 
 **Future Work** (remaining Phase 6 tasks):
