@@ -249,3 +249,41 @@ def test_full_pipeline(setup_duckdb):
     # Should get Bob (30) and Charlie (35)
     assert len(ids) == 2
     assert set(ids) == {2, 3}
+
+
+def test_explain_returns_plan(setup_duckdb):
+    """EXPLAIN should return textual plan rows instead of executing."""
+    catalog, datasource = setup_duckdb
+
+    parser = Parser()
+    sql = "EXPLAIN SELECT id FROM testdb.main.users WHERE age > 25"
+    logical_plan = parser.parse_to_logical_plan(sql)
+
+    binder = Binder(catalog)
+    bound_plan = binder.bind(logical_plan)
+
+    planner = PhysicalPlanner(catalog)
+    physical_plan = planner.plan(bound_plan)
+
+    executor = Executor()
+    batches = list(executor.execute(physical_plan))
+
+    assert len(batches) == 1
+    batch = batches[0]
+    assert batch.schema.names == ["plan"]
+
+    plan_lines = []
+    column = batch.column(0)
+    for entry in column.to_pylist():
+        plan_lines.append(entry)
+
+    assert len(plan_lines) > 0
+    assert plan_lines[0].startswith("PhysicalProject")
+
+    has_scan = False
+    for line in plan_lines:
+        if "PhysicalScan" in line:
+            has_scan = True
+            break
+
+    assert has_scan

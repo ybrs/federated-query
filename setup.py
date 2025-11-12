@@ -41,4 +41,9 @@ setup(
             "mypy>=1.7.0",
         ],
     },
+    entry_points={
+        "console_scripts": [
+            "fedq=federated_query.cli.fedq:cli",
+        ],
+    },
 )

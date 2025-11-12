@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional, Iterator, Any, TYPE_CHECKING
+from typing import List, Optional, Iterator, Any, TYPE_CHECKING, Dict, Callable
 from enum import Enum
 
 import pyarrow as pa
@@ -1010,6 +1010,33 @@ class PhysicalLimit(PhysicalPlanNode):
 
 
 @dataclass
+class PhysicalExplain(PhysicalPlanNode):
+    """Explain a physical plan without executing it."""
+
+    child: PhysicalPlanNode
+
+    def children(self) -> List[PhysicalPlanNode]:
+        return [self.child]
+
+    def execute(self) -> Iterator[pa.RecordBatch]:
+        """Return textual representation of the plan."""
+        formatter = _PlanFormatter()
+        lines = formatter.format(self.child)
+        array = pa.array(lines)
+        batch = pa.RecordBatch.from_arrays([array], names=["plan"])
+        yield batch
+
+    def schema(self) -> pa.Schema:
+        return pa.schema([pa.field("plan", pa.string())])
+
+    def estimated_cost(self) -> float:
+        return -1.0
+
+    def __repr__(self) -> str:
+        return "PhysicalExplain()"
+
+
+@dataclass
 class Gather(PhysicalPlanNode):
     """Gather data from a remote data source.
 
@@ -1037,3 +1064,125 @@ class Gather(PhysicalPlanNode):
 
     def __repr__(self) -> str:
         return f"Gather(from={self.datasource})"
+
+
+class _PlanFormatter:
+    """Utility to format physical plans as text."""
+
+    def __init__(self):
+        self._detail_builders: Dict[type, Callable[[PhysicalPlanNode], str]] = {}
+        self._detail_builders[PhysicalScan] = self._scan_detail
+        self._detail_builders[PhysicalProject] = self._project_detail
+        self._detail_builders[PhysicalFilter] = self._filter_detail
+        self._detail_builders[PhysicalLimit] = self._limit_detail
+        self._detail_builders[PhysicalHashJoin] = self._hash_join_detail
+        self._detail_builders[PhysicalNestedLoopJoin] = self._nested_loop_join_detail
+        self._detail_builders[PhysicalHashAggregate] = self._aggregate_detail
+        self._detail_builders[PhysicalSort] = self._sort_detail
+
+    def format(self, node: PhysicalPlanNode) -> List[str]:
+        lines: List[str] = []
+        self._append_node_line(node, 0, lines)
+        return lines
+
+    def _append_node_line(self, node: PhysicalPlanNode, depth: int, lines: List[str]) -> None:
+        indent = self._build_indent(depth)
+        header = self._build_header(node)
+        lines.append(f"{indent}{header}")
+        children = node.children()
+        for child in children:
+            self._append_node_line(child, depth + 1, lines)
+
+    def _build_indent(self, depth: int) -> str:
+        if depth == 0:
+            return ""
+        return f"{'  ' * depth}-> "
+
+    def _build_header(self, node: PhysicalPlanNode) -> str:
+        name = node.__class__.__name__
+        cost = self._safe_cost(node)
+        detail = self._detail_for(node)
+        if detail:
+            return f"{name} cost={cost} rows=-1 details={detail}"
+        return f"{name} cost={cost} rows=-1"
+
+    def _detail_for(self, node: PhysicalPlanNode) -> str:
+        builder = self._detail_builders.get(type(node))
+        if builder is None:
+            return ""
+        return builder(node)
+
+    def _safe_cost(self, node: PhysicalPlanNode) -> float:
+        try:
+            return node.estimated_cost()
+        except NotImplementedError:
+            return -1.0
+
+    def _scan_detail(self, node: PhysicalScan) -> str:
+        table = f"{node.datasource}.{node.schema_name}.{node.table_name}"
+        columns = self._format_column_list(node.columns)
+        detail = f"table={table}"
+        if columns:
+            detail = f"{detail} columns={columns}"
+        if node.filters:
+            detail = f"{detail} filter={node.filters}"
+        return detail
+
+    def _project_detail(self, node: PhysicalProject) -> str:
+        names = self._format_column_list(node.output_names)
+        if names:
+            return f"columns={names}"
+        return ""
+
+    def _filter_detail(self, node: PhysicalFilter) -> str:
+        return f"predicate={node.predicate}"
+
+    def _limit_detail(self, node: PhysicalLimit) -> str:
+        return f"limit={node.limit} offset={node.offset}"
+
+    def _hash_join_detail(self, node: PhysicalHashJoin) -> str:
+        left_keys = self._format_expression_list(node.left_keys)
+        right_keys = self._format_expression_list(node.right_keys)
+        info = f"type={node.join_type.value}"
+        if left_keys:
+            info = f"{info} left_keys={left_keys}"
+        if right_keys:
+            info = f"{info} right_keys={right_keys}"
+        return f"{info} build_side={node.build_side}"
+
+    def _nested_loop_join_detail(self, node: PhysicalNestedLoopJoin) -> str:
+        info = f"type={node.join_type.value}"
+        if node.condition:
+            return f"{info} condition={node.condition}"
+        return info
+
+    def _aggregate_detail(self, node: PhysicalHashAggregate) -> str:
+        groups = self._format_expression_list(node.group_by)
+        aggs = self._format_expression_list(node.aggregates)
+        info = ""
+        if groups:
+            info = f"group_by={groups}"
+        if aggs:
+            if info:
+                info = f"{info} aggregates={aggs}"
+            else:
+                info = f"aggregates={aggs}"
+        return info
+
+    def _sort_detail(self, node: PhysicalSort) -> str:
+        keys = self._format_expression_list(node.sort_keys)
+        return f"keys={keys}"
+
+    def _format_expression_list(self, expressions: List[Expression]) -> str:
+        parts: List[str] = []
+        for expr in expressions:
+            parts.append(str(expr))
+        return ",".join(parts)
+
+    def _format_column_list(self, columns: List[str]) -> str:
+        if not columns:
+            return ""
+        buffer: List[str] = []
+        for column in columns:
+            buffer.append(column)
+        return ",".join(buffer)

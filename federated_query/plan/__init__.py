@@ -10,6 +10,7 @@ from .logical import (
     Sort,
     Limit,
     Union,
+    Explain,
 )
 from .physical import (
     PhysicalPlanNode,
@@ -22,6 +23,7 @@ from .physical import (
     PhysicalSort,
     PhysicalLimit,
     Gather,
+    PhysicalExplain,
 )
 from .expressions import (
     Expression,
@@ -44,6 +46,7 @@ __all__ = [
     "Sort",
     "Limit",
     "Union",
+    "Explain",
     # Physical nodes
     "PhysicalPlanNode",
     "PhysicalScan",
@@ -55,6 +58,7 @@ __all__ = [
     "PhysicalSort",
     "PhysicalLimit",
     "Gather",
+    "PhysicalExplain",
     # Expressions
     "Expression",
     "ColumnRef",
