@@ -235,6 +235,53 @@ If a function exceeds 20 lines of actual code, refactor it into smaller function
 - Use snake_case for functions and variables
 - Use PascalCase for classes
 
+### 7. Descriptive Naming
+
+**ALL names must be descriptive and explain what the code does.**
+
+This applies to:
+- File names
+- Test file names
+- Class names
+- Function names
+- Variable names
+
+❌ **WRONG:**
+```python
+# Test file named: test_phase6_optimization.py
+# This tells us NOTHING about what's being tested
+```
+
+✅ **CORRECT:**
+```python
+# Test file named: test_logical_optimization.py
+# This clearly indicates it tests logical optimization rules
+```
+
+❌ **WRONG:**
+```python
+# Test file named: test_part2.py
+# Generic, meaningless naming
+```
+
+✅ **CORRECT:**
+```python
+# Test file named: test_join_execution.py
+# Descriptive, tells us exactly what's being tested
+```
+
+**Rules for test file names:**
+- Name after what functionality is being tested, not phase numbers
+- Use domain terminology (e.g., `test_predicate_pushdown.py`, `test_cost_estimation.py`)
+- Be specific about the component (e.g., `test_hash_join_operator.py` not `test_operators.py`)
+- Group related tests by feature, not by development phase
+
+**Rules for class/function names:**
+- Must clearly state what the code does
+- Use full words, avoid abbreviations unless they're standard (e.g., SQL, HTTP)
+- Test class names should describe the test scenario
+- Test method names should be sentences explaining the test case
+
 ## Development Workflow
 
 1. **Before making changes:** Run tests to ensure baseline works

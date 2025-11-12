@@ -48,8 +48,374 @@ class PredicatePushdownRule(OptimizationRule):
     """Push filters closer to data sources."""
 
     def apply(self, plan: LogicalPlanNode) -> Optional[LogicalPlanNode]:
-        # TODO: Implement predicate pushdown
-        raise NotImplementedError()
+        """Apply predicate pushdown optimization.
+
+        Args:
+            plan: Input plan node
+
+        Returns:
+            Transformed plan with pushed-down predicates
+        """
+        return self._push_down(plan)
+
+    def _push_down(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Recursively push predicates down the plan tree."""
+        if isinstance(plan, Filter):
+            return self._push_filter(plan)
+
+        if isinstance(plan, Project):
+            new_input = self._push_down(plan.input)
+            if new_input != plan.input:
+                return Project(new_input, plan.expressions, plan.aliases)
+            return plan
+
+        if isinstance(plan, Join):
+            new_left = self._push_down(plan.left)
+            new_right = self._push_down(plan.right)
+            if new_left != plan.left or new_right != plan.right:
+                return Join(new_left, new_right, plan.join_type, plan.condition)
+            return plan
+
+        if isinstance(plan, Aggregate):
+            new_input = self._push_down(plan.input)
+            if new_input != plan.input:
+                return Aggregate(
+                    new_input,
+                    plan.group_by,
+                    plan.aggregates,
+                    plan.output_names
+                )
+            return plan
+
+        if isinstance(plan, Limit):
+            new_input = self._push_down(plan.input)
+            if new_input != plan.input:
+                return Limit(new_input, plan.limit, plan.offset)
+            return plan
+
+        return plan
+
+    def _push_filter(self, filter_node: Filter) -> LogicalPlanNode:
+        """Push a filter node down."""
+        input_plan = filter_node.input
+        predicate = filter_node.predicate
+
+        if isinstance(input_plan, Filter):
+            return self._merge_filters(filter_node, input_plan)
+
+        if isinstance(input_plan, Project):
+            return self._push_filter_through_project(
+                filter_node,
+                input_plan
+            )
+
+        if isinstance(input_plan, Join):
+            return self._push_filter_below_join(filter_node, input_plan)
+
+        if isinstance(input_plan, Scan):
+            return self._push_filter_to_scan(filter_node, input_plan)
+
+        new_input = self._push_down(input_plan)
+        if new_input != input_plan:
+            return Filter(new_input, predicate)
+
+        return filter_node
+
+    def _merge_filters(
+        self,
+        outer: Filter,
+        inner: Filter
+    ) -> LogicalPlanNode:
+        """Merge two adjacent filters."""
+        from ..plan.expressions import BinaryOp, BinaryOpType
+
+        merged_predicate = BinaryOp(
+            op=BinaryOpType.AND,
+            left=outer.predicate,
+            right=inner.predicate
+        )
+
+        new_filter = Filter(inner.input, merged_predicate)
+        return self._push_down(new_filter)
+
+    def _can_evaluate_predicate(
+        self,
+        pred_cols: set,
+        available_cols: set
+    ) -> bool:
+        """Check if predicate columns can be evaluated with available columns.
+
+        Handles both qualified (table.column) and unqualified (column) references.
+        An unqualified predicate column matches if there's a qualified column
+        ending with that bare name.
+        """
+        for pred_col in pred_cols:
+            if pred_col in available_cols:
+                continue
+
+            if "." not in pred_col:
+                matched = False
+                for avail_col in available_cols:
+                    if avail_col.endswith(f".{pred_col}") or avail_col == pred_col:
+                        matched = True
+                        break
+                if matched:
+                    continue
+                return False
+
+            return False
+
+        return True
+
+    def _push_filter_through_project(
+        self,
+        filter_node: Filter,
+        project: Project
+    ) -> LogicalPlanNode:
+        """Push filter through projection if possible.
+
+        Push filter BELOW projection if the predicate can be evaluated
+        using columns available in the projection's input.
+        """
+        predicate_cols = self._extract_column_refs(filter_node.predicate)
+        input_cols = self._get_column_names(project.input)
+
+        # Can we evaluate predicate using columns from input?
+        can_push = self._can_evaluate_predicate(predicate_cols, input_cols)
+
+        if can_push:
+            # Push filter BELOW projection: Project(Filter(input, pred), ...)
+            new_filter = Filter(project.input, filter_node.predicate)
+            new_filter = self._push_down(new_filter)
+            return Project(new_filter, project.expressions, project.aliases)
+
+        # Filter references columns not available in input, keep above
+        new_input = self._push_down(project.input)
+        new_project = Project(new_input, project.expressions, project.aliases)
+        return Filter(new_project, filter_node.predicate)
+
+    def _push_filter_to_scan(
+        self,
+        filter_node: Filter,
+        scan: Scan
+    ) -> LogicalPlanNode:
+        """Push filter into scan node."""
+        from ..plan.expressions import BinaryOp, BinaryOpType
+
+        if scan.filters:
+            merged = BinaryOp(
+                op=BinaryOpType.AND,
+                left=scan.filters,
+                right=filter_node.predicate
+            )
+            return Scan(
+                datasource=scan.datasource,
+                schema_name=scan.schema_name,
+                table_name=scan.table_name,
+                columns=scan.columns,
+                filters=merged,
+                alias=scan.alias
+            )
+
+        return Scan(
+            datasource=scan.datasource,
+            schema_name=scan.schema_name,
+            table_name=scan.table_name,
+            columns=scan.columns,
+            filters=filter_node.predicate,
+            alias=scan.alias
+        )
+
+    def _predicate_matches_side(
+        self,
+        pred_cols: set,
+        side_cols: set,
+        other_cols: set
+    ) -> bool:
+        """Check if predicate columns match exactly one side of join.
+
+        Handles both qualified and unqualified column references.
+        Also handles alias vs physical name mismatches (e.g., "o.amount" vs "orders.amount").
+        For both qualified and unqualified refs, checks if column uniquely belongs to this side.
+        """
+        for pred_col in pred_cols:
+            # Exact match - pred_col is directly in side_cols
+            if pred_col in side_cols:
+                continue
+
+            # Extract bare column name (part after last ".")
+            if "." in pred_col:
+                # Qualified reference like "o.amount" or "orders.amount"
+                bare_col = pred_col.split(".")[-1]
+            else:
+                # Unqualified reference like "amount"
+                bare_col = pred_col
+
+            # Check if bare column name uniquely belongs to this side
+            # This handles:
+            # - Unqualified refs: "amount" matching "orders.amount"
+            # - Alias mismatches: "o.amount" matching "orders.amount"
+            side_has_col = False
+            other_has_col = False
+
+            for col in side_cols:
+                if col.endswith(f".{bare_col}") or col == bare_col:
+                    side_has_col = True
+                    break
+
+            for col in other_cols:
+                if col.endswith(f".{bare_col}") or col == bare_col:
+                    other_has_col = True
+                    break
+
+            # Column must be on this side only (not on other side)
+            if side_has_col and not other_has_col:
+                continue
+
+            # Column is not uniquely on this side
+            return False
+
+        return True
+
+    def _push_filter_below_join(
+        self,
+        filter_node: Filter,
+        join: Join
+    ) -> LogicalPlanNode:
+        """Push filter below join when safe.
+
+        Only safe for INNER joins. For outer joins, pushing filters
+        below the join changes semantics:
+        - LEFT OUTER: Can't push right-side filters (changes NULL rows)
+        - RIGHT OUTER: Can't push left-side filters (changes NULL rows)
+        - FULL OUTER: Can't push any filters
+        """
+        from ..plan.expressions import BinaryOp, BinaryOpType, ColumnRef
+        from ..plan.logical import JoinType
+
+        predicate = filter_node.predicate
+        left_cols = self._get_column_names(join.left)
+        right_cols = self._get_column_names(join.right)
+
+        pred_cols = self._extract_column_refs(predicate)
+
+        pred_left_only = self._predicate_matches_side(pred_cols, left_cols, right_cols)
+        pred_right_only = self._predicate_matches_side(pred_cols, right_cols, left_cols)
+
+        # Only push for INNER joins
+        if join.join_type != JoinType.INNER:
+            # For outer joins, keep filter above join
+            new_join = Join(
+                self._push_down(join.left),
+                self._push_down(join.right),
+                join.join_type,
+                join.condition
+            )
+            return Filter(new_join, predicate)
+
+        # INNER JOIN: safe to push
+        if pred_left_only:
+            new_left = Filter(join.left, predicate)
+            new_left = self._push_down(new_left)
+            new_join = Join(
+                new_left,
+                self._push_down(join.right),
+                join.join_type,
+                join.condition
+            )
+            return new_join
+
+        if pred_right_only:
+            new_right = Filter(join.right, predicate)
+            new_right = self._push_down(new_right)
+            new_join = Join(
+                self._push_down(join.left),
+                new_right,
+                join.join_type,
+                join.condition
+            )
+            return new_join
+
+        new_join = Join(
+            self._push_down(join.left),
+            self._push_down(join.right),
+            join.join_type,
+            join.condition
+        )
+        return Filter(new_join, predicate)
+
+    def _get_column_names(self, plan: LogicalPlanNode) -> set:
+        """Get all column names available from a plan node.
+
+        Returns qualified column names (e.g., "orders.id") for Scan nodes to
+        enable correct filter pushdown when multiple tables have columns with
+        the same name.
+
+        Recursively handles wrapped nodes (Filter, Limit, etc).
+        """
+        if isinstance(plan, Scan):
+            # Return qualified column names: "table.column" or "alias.column"
+            # Use alias if present (e.g., "u" from "FROM users u")
+            # Otherwise use physical table name
+            # This prevents ambiguity when multiple tables have same column names
+            table_ref = plan.alias if plan.alias else plan.table_name
+            qualified = set()
+            for col in plan.columns:
+                qualified.add(f"{table_ref}.{col}")
+            return qualified
+
+        if isinstance(plan, Project):
+            return set(plan.aliases)
+
+        if isinstance(plan, Join):
+            left_cols = self._get_column_names(plan.left)
+            right_cols = self._get_column_names(plan.right)
+            return left_cols.union(right_cols)
+
+        if isinstance(plan, Filter):
+            return self._get_column_names(plan.input)
+
+        if isinstance(plan, Limit):
+            return self._get_column_names(plan.input)
+
+        if isinstance(plan, Aggregate):
+            # Aggregate changes schema - return output columns
+            return set(plan.output_names)
+
+        return set()
+
+    def _extract_column_refs(self, expr: Expression) -> set:
+        """Extract qualified column names from expression.
+
+        Returns column names with table qualifier when available (e.g., "orders.id"),
+        or bare column names if no qualifier present (e.g., "id").
+
+        This is critical for join filter pushdown: when both join inputs have
+        columns with the same name, we must respect table qualifiers to avoid
+        pushing filters to the wrong side.
+        """
+        from ..plan.expressions import ColumnRef, BinaryOp, UnaryOp, FunctionCall
+
+        if isinstance(expr, ColumnRef):
+            if expr.table:
+                return {f"{expr.table}.{expr.column}"}
+            return {expr.column}
+
+        if isinstance(expr, BinaryOp):
+            left = self._extract_column_refs(expr.left)
+            right = self._extract_column_refs(expr.right)
+            return left.union(right)
+
+        if isinstance(expr, UnaryOp):
+            return self._extract_column_refs(expr.operand)
+
+        if isinstance(expr, FunctionCall):
+            columns = set()
+            for arg in expr.args:
+                columns.update(self._extract_column_refs(arg))
+            return columns
+
+        return set()
 
     def name(self) -> str:
         return "PredicatePushdown"
@@ -59,18 +425,381 @@ class ProjectionPushdownRule(OptimizationRule):
     """Push projections to eliminate unused columns early."""
 
     def apply(self, plan: LogicalPlanNode) -> Optional[LogicalPlanNode]:
-        # TODO: Implement projection pushdown
-        raise NotImplementedError()
+        """Apply projection pushdown optimization.
+
+        Args:
+            plan: Input plan node
+
+        Returns:
+            Transformed plan with column pruning
+        """
+        has_explicit_projection = self._has_explicit_projection(plan)
+
+        if not has_explicit_projection:
+            # No explicit projection means SELECT *
+            # Don't prune columns - user wants all of them
+            return plan
+
+        required_columns = self._collect_required_columns(plan)
+        return self._prune_columns(plan, required_columns)
+
+    def _has_explicit_projection(self, plan: LogicalPlanNode) -> bool:
+        """Check if plan has explicit projection (not SELECT *)."""
+        if isinstance(plan, Project):
+            return True
+
+        if isinstance(plan, Aggregate):
+            # Aggregates have explicit output schema (group_by + aggregates)
+            # so column pruning should be applied
+            return True
+
+        if isinstance(plan, Filter):
+            return self._has_explicit_projection(plan.input)
+
+        if isinstance(plan, Limit):
+            return self._has_explicit_projection(plan.input)
+
+        return False
+
+    def _collect_required_columns(
+        self,
+        plan: LogicalPlanNode
+    ) -> set:
+        """Collect all required column names from plan."""
+        columns = set()
+
+        if isinstance(plan, Scan):
+            if plan.filters:
+                columns.update(self._extract_columns(plan.filters))
+            return columns
+
+        if isinstance(plan, Project):
+            # Collect columns from projection expressions
+            for expr in plan.expressions:
+                columns.update(self._extract_columns(expr))
+            # CRITICAL: Must recurse into input to collect columns needed by
+            # downstream operators (e.g., join keys, filter columns)
+            # Otherwise those columns will be pruned and break the query!
+            columns.update(self._collect_required_columns(plan.input))
+            return columns
+
+        if isinstance(plan, Filter):
+            columns.update(self._extract_columns(plan.predicate))
+            columns.update(self._collect_required_columns(plan.input))
+            return columns
+
+        if isinstance(plan, Join):
+            if plan.condition:
+                columns.update(self._extract_columns(plan.condition))
+            columns.update(self._collect_required_columns(plan.left))
+            columns.update(self._collect_required_columns(plan.right))
+            return columns
+
+        if isinstance(plan, Aggregate):
+            # Collect columns from group by expressions
+            for expr in plan.group_by:
+                columns.update(self._extract_columns(expr))
+            # Collect columns from aggregate expressions
+            for expr in plan.aggregates:
+                columns.update(self._extract_columns(expr))
+            # CRITICAL: Must recurse into input to collect columns needed by
+            # downstream operators (e.g., join keys, filter columns)
+            # Otherwise those columns will be pruned and break the query!
+            columns.update(self._collect_required_columns(plan.input))
+            return columns
+
+        if isinstance(plan, Limit):
+            columns.update(self._collect_required_columns(plan.input))
+            return columns
+
+        return columns
+
+    def _extract_columns(self, expr: Expression) -> set:
+        """Extract column names from expression."""
+        from ..plan.expressions import ColumnRef, BinaryOp, UnaryOp, FunctionCall
+
+        columns = set()
+
+        if isinstance(expr, ColumnRef):
+            columns.add(expr.column)
+            return columns
+
+        if isinstance(expr, BinaryOp):
+            columns.update(self._extract_columns(expr.left))
+            columns.update(self._extract_columns(expr.right))
+            return columns
+
+        if isinstance(expr, UnaryOp):
+            columns.update(self._extract_columns(expr.operand))
+            return columns
+
+        if isinstance(expr, FunctionCall):
+            for arg in expr.args:
+                columns.update(self._extract_columns(arg))
+            return columns
+
+        return columns
+
+    def _prune_columns(
+        self,
+        plan: LogicalPlanNode,
+        required: set
+    ) -> LogicalPlanNode:
+        """Prune unused columns from plan."""
+        if isinstance(plan, Scan):
+            return self._prune_scan_columns(plan, required)
+
+        if isinstance(plan, Project):
+            new_input = self._prune_columns(plan.input, required)
+            if new_input != plan.input:
+                return Project(new_input, plan.expressions, plan.aliases)
+            return plan
+
+        if isinstance(plan, Filter):
+            filter_cols = self._extract_columns(plan.predicate)
+            combined_required = required.union(filter_cols)
+            new_input = self._prune_columns(plan.input, combined_required)
+            if new_input != plan.input:
+                return Filter(new_input, plan.predicate)
+            return plan
+
+        if isinstance(plan, Join):
+            left_req = self._get_required_for_subtree(plan.left, required)
+            right_req = self._get_required_for_subtree(plan.right, required)
+            new_left = self._prune_columns(plan.left, left_req)
+            new_right = self._prune_columns(plan.right, right_req)
+            if new_left != plan.left or new_right != plan.right:
+                return Join(
+                    new_left,
+                    new_right,
+                    plan.join_type,
+                    plan.condition
+                )
+            return plan
+
+        if isinstance(plan, Aggregate):
+            new_input = self._prune_columns(plan.input, required)
+            if new_input != plan.input:
+                return Aggregate(
+                    new_input,
+                    plan.group_by,
+                    plan.aggregates,
+                    plan.output_names
+                )
+            return plan
+
+        if isinstance(plan, Limit):
+            new_input = self._prune_columns(plan.input, required)
+            if new_input != plan.input:
+                return Limit(new_input, plan.limit, plan.offset)
+            return plan
+
+        return plan
+
+    def _prune_scan_columns(
+        self,
+        scan: Scan,
+        required: set
+    ) -> Scan:
+        """Prune columns from scan node."""
+        available = set(scan.columns)
+        needed = available.intersection(required)
+
+        if not needed:
+            needed = available
+
+        if needed != available:
+            pruned_cols = []
+            for col in scan.columns:
+                if col in needed:
+                    pruned_cols.append(col)
+
+            return Scan(
+                datasource=scan.datasource,
+                schema_name=scan.schema_name,
+                table_name=scan.table_name,
+                columns=pruned_cols,
+                filters=scan.filters,
+                alias=scan.alias
+            )
+
+        return scan
+
+    def _get_required_for_subtree(
+        self,
+        plan: LogicalPlanNode,
+        parent_required: set
+    ) -> set:
+        """Get required columns for a subtree."""
+        local_required = set()
+
+        if isinstance(plan, Scan):
+            if plan.filters:
+                local_required.update(self._extract_columns(plan.filters))
+
+        if isinstance(plan, Filter):
+            local_required.update(self._extract_columns(plan.predicate))
+
+        return local_required.union(parent_required)
 
     def name(self) -> str:
         return "ProjectionPushdown"
+
+
+class LimitPushdownRule(OptimizationRule):
+    """Push LIMIT operators closer to data sources when safe."""
+
+    def apply(self, plan: LogicalPlanNode) -> Optional[LogicalPlanNode]:
+        """Apply limit pushdown optimization.
+
+        Args:
+            plan: Input plan node
+
+        Returns:
+            Transformed plan with pushed-down limits
+        """
+        return self._push_limit(plan)
+
+    def _push_limit(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Recursively push limits down and visit all nodes.
+
+        Only pushes through projections (safe).
+        For other nodes, recurses into children but doesn't push limits through.
+        """
+        if isinstance(plan, Limit):
+            return self._try_push_limit(plan)
+
+        if isinstance(plan, Project):
+            return self._recurse_project(plan)
+
+        # For all other node types, recurse into children
+        return self._recurse_children(plan)
+
+    def _recurse_project(self, plan: Project) -> LogicalPlanNode:
+        """Recurse into project node."""
+        new_input = self._push_limit(plan.input)
+        if new_input != plan.input:
+            return Project(new_input, plan.expressions, plan.aliases)
+        return plan
+
+    def _recurse_children(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Recurse into children of node without pushing limits through."""
+        from ..plan.logical import Filter, Join, Aggregate, Sort, Union, Explain
+
+        if isinstance(plan, (Filter, Aggregate, Sort)):
+            return self._recurse_unary_node(plan)
+
+        if isinstance(plan, (Join, Union)):
+            return self._recurse_binary_node(plan)
+
+        if isinstance(plan, Explain):
+            return self._recurse_explain(plan)
+
+        # Scan or other leaf node - return as-is
+        return plan
+
+    def _recurse_unary_node(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Recurse into unary node (Filter, Aggregate, Sort)."""
+        from ..plan.logical import Filter, Aggregate, Sort
+
+        new_input = self._push_limit(plan.input)
+        if new_input == plan.input:
+            return plan
+
+        if isinstance(plan, Filter):
+            return Filter(new_input, plan.predicate)
+
+        if isinstance(plan, Aggregate):
+            return self._rebuild_aggregate(plan, new_input)
+
+        if isinstance(plan, Sort):
+            return Sort(new_input, plan.sort_keys, plan.sort_directions)
+
+        return plan
+
+    def _rebuild_aggregate(
+        self,
+        plan: Aggregate,
+        new_input: LogicalPlanNode
+    ) -> Aggregate:
+        """Rebuild aggregate with new input."""
+        return Aggregate(
+            input=new_input,
+            group_by=plan.group_by,
+            aggregates=plan.aggregates,
+            output_names=plan.output_names
+        )
+
+    def _recurse_binary_node(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Recurse into binary node (Join, Union)."""
+        from ..plan.logical import Join, Union
+
+        new_left = self._push_limit(plan.left)
+        new_right = self._push_limit(plan.right)
+
+        if new_left == plan.left and new_right == plan.right:
+            return plan
+
+        if isinstance(plan, Join):
+            return self._rebuild_join(plan, new_left, new_right)
+
+        if isinstance(plan, Union):
+            return Union(new_left, new_right)
+
+        return plan
+
+    def _rebuild_join(
+        self,
+        plan: Join,
+        new_left: LogicalPlanNode,
+        new_right: LogicalPlanNode
+    ) -> Join:
+        """Rebuild join with new children."""
+        return Join(
+            left=new_left,
+            right=new_right,
+            join_type=plan.join_type,
+            condition=plan.condition
+        )
+
+    def _recurse_explain(self, plan) -> LogicalPlanNode:
+        """Recurse into explain node."""
+        from ..plan.logical import Explain
+
+        new_plan = self._push_limit(plan.plan)
+        if new_plan != plan.plan:
+            return Explain(new_plan)
+        return plan
+
+    def _try_push_limit(self, limit: Limit) -> LogicalPlanNode:
+        """Try to push limit through input.
+
+        Only push through operations that don't change row count.
+        Safe: Projection (1:1 mapping)
+        Unsafe: Filter (reduces rows), Join (changes row count)
+        """
+        input_plan = limit.input
+
+        if isinstance(input_plan, Project):
+            new_input = Limit(input_plan.input, limit.limit, limit.offset)
+            return Project(new_input, input_plan.expressions, input_plan.aliases)
+
+        # Don't push through filters - changes semantics
+        # Don't push through joins - changes semantics
+        # Don't push through aggregates - changes semantics
+
+        return limit
+
+    def name(self) -> str:
+        return "LimitPushdown"
 
 
 class JoinReorderingRule(OptimizationRule):
     """Reorder joins for better performance."""
 
     def apply(self, plan: LogicalPlanNode) -> Optional[LogicalPlanNode]:
-        # TODO: Implement join reordering
+        # TODO: Implement cost-based join reordering
+        # Requires integration with Phase 5 cost model
         raise NotImplementedError()
 
     def name(self) -> str:
@@ -108,7 +837,8 @@ class ExpressionSimplificationRule(OptimizationRule):
                         schema_name=plan.schema_name,
                         table_name=plan.table_name,
                         columns=plan.columns,
-                        filters=rewritten_filter
+                        filters=rewritten_filter,
+                        alias=plan.alias
                     )
             return plan
 

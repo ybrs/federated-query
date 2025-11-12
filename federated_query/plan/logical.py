@@ -67,6 +67,7 @@ class Scan(LogicalPlanNode):
     table_name: str
     columns: List[str]  # Columns to read
     filters: Optional[Expression] = None  # Optional pushed-down filters
+    alias: Optional[str] = None  # Table alias (e.g., "u" in "FROM users u")
 
     def children(self) -> List[LogicalPlanNode]:
         return []
