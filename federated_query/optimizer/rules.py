@@ -189,8 +189,16 @@ class PredicatePushdownRule(OptimizationRule):
         filter_node: Filter,
         join: Join
     ) -> LogicalPlanNode:
-        """Push filter below join when possible."""
+        """Push filter below join when safe.
+
+        Only safe for INNER joins. For outer joins, pushing filters
+        below the join changes semantics:
+        - LEFT OUTER: Can't push right-side filters (changes NULL rows)
+        - RIGHT OUTER: Can't push left-side filters (changes NULL rows)
+        - FULL OUTER: Can't push any filters
+        """
         from ..plan.expressions import BinaryOp, BinaryOpType, ColumnRef
+        from ..plan.logical import JoinType
 
         predicate = filter_node.predicate
         left_cols = self._get_column_names(join.left)
@@ -201,6 +209,18 @@ class PredicatePushdownRule(OptimizationRule):
         pred_left_only = all(c in left_cols for c in pred_cols)
         pred_right_only = all(c in right_cols for c in pred_cols)
 
+        # Only push for INNER joins
+        if join.join_type != JoinType.INNER:
+            # For outer joins, keep filter above join
+            new_join = Join(
+                self._push_down(join.left),
+                self._push_down(join.right),
+                join.join_type,
+                join.condition
+            )
+            return Filter(new_join, predicate)
+
+        # INNER JOIN: safe to push
         if pred_left_only:
             new_left = Filter(join.left, predicate)
             new_left = self._push_down(new_left)
@@ -287,8 +307,28 @@ class ProjectionPushdownRule(OptimizationRule):
         Returns:
             Transformed plan with column pruning
         """
+        has_explicit_projection = self._has_explicit_projection(plan)
+
+        if not has_explicit_projection:
+            # No explicit projection means SELECT *
+            # Don't prune columns - user wants all of them
+            return plan
+
         required_columns = self._collect_required_columns(plan)
         return self._prune_columns(plan, required_columns)
+
+    def _has_explicit_projection(self, plan: LogicalPlanNode) -> bool:
+        """Check if plan has explicit projection (not SELECT *)."""
+        if isinstance(plan, Project):
+            return True
+
+        if isinstance(plan, Filter):
+            return self._has_explicit_projection(plan.input)
+
+        if isinstance(plan, Limit):
+            return self._has_explicit_projection(plan.input)
+
+        return False
 
     def _collect_required_columns(
         self,
@@ -478,7 +518,11 @@ class LimitPushdownRule(OptimizationRule):
         return self._push_limit(plan)
 
     def _push_limit(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Recursively push limits down."""
+        """Recursively push limits down.
+
+        Only pushes through projections (safe).
+        Does not push through filters, joins, or aggregates.
+        """
         if isinstance(plan, Limit):
             return self._try_push_limit(plan)
 
@@ -488,25 +532,25 @@ class LimitPushdownRule(OptimizationRule):
                 return Project(new_input, plan.expressions, plan.aliases)
             return plan
 
-        if isinstance(plan, Filter):
-            new_input = self._push_limit(plan.input)
-            if new_input != plan.input:
-                return Filter(new_input, plan.predicate)
-            return plan
-
+        # Don't recurse through filters - limit shouldn't push below
         return plan
 
     def _try_push_limit(self, limit: Limit) -> LogicalPlanNode:
-        """Try to push limit through input."""
+        """Try to push limit through input.
+
+        Only push through operations that don't change row count.
+        Safe: Projection (1:1 mapping)
+        Unsafe: Filter (reduces rows), Join (changes row count)
+        """
         input_plan = limit.input
 
         if isinstance(input_plan, Project):
             new_input = Limit(input_plan.input, limit.limit, limit.offset)
             return Project(new_input, input_plan.expressions, input_plan.aliases)
 
-        if isinstance(input_plan, Filter):
-            new_inner = Limit(input_plan.input, limit.limit, limit.offset)
-            return Filter(new_inner, input_plan.predicate)
+        # Don't push through filters - changes semantics
+        # Don't push through joins - changes semantics
+        # Don't push through aggregates - changes semantics
 
         return limit
 

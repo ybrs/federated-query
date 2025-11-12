@@ -14,7 +14,7 @@ This document breaks down the implementation into phases. Each phase builds on t
 | **Phase 3** | ✅ Complete | Aggregations and GROUP BY | 9 tests |
 | **Phase 4** | ✅ Complete | Pre-optimization and expression handling | 42 tests |
 | **Phase 5** | ✅ Complete | Statistics and cost model | 30 tests |
-| **Phase 6** | 🚧 In Progress | Logical optimization (pushdown, reordering) | 21 tests |
+| **Phase 6** | ✅ Substantially Complete | Logical optimization (pushdown, reordering) | 28 tests |
 | **Phase 7** | ⏳ Not Started | Decorrelation (subqueries) | - |
 | **Phase 8** | ⏳ Not Started | Physical planning and join strategies | - |
 | **Phase 9** | ⏳ Not Started | Advanced execution (parallel, memory mgmt) | - |
@@ -22,7 +22,7 @@ This document breaks down the implementation into phases. Each phase builds on t
 | **Phase 11** | ⏳ Not Started | Production readiness | - |
 | **Phase 12** | ⏳ Future | Advanced features (adaptive execution, caching) | - |
 
-**Current Status**: 175 tests passing, Phases 0-5 complete, Phase 6 in progress (predicate/projection/limit pushdown + join filter pushdown + column pruning)
+**Current Status**: 182 tests passing, Phases 0-5 complete, Phase 6 substantially complete (predicate/projection/limit pushdown with bug fixes)
 
 ## Phase 0: Foundation ✅ COMPLETED
 
@@ -442,9 +442,9 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 
 ## Phase 6: Logical Optimization
 
-**Status:** 🚧 IN PROGRESS
+**Status:** ✅ SUBSTANTIALLY COMPLETE
 **Goal**: Implement rule-based logical optimizations
-**Tests**: 21 tests passing, 175 total tests
+**Tests**: 28 tests passing, 182 total tests
 
 **Prerequisites**: ✅ Optimization infrastructure already exists:
 - OptimizationRule base class (federated_query/optimizer/rules.py)
@@ -467,7 +467,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
   - [x] Push left-only predicates to left side - Implemented
   - [x] Push right-only predicates to right side - Implemented
   - [x] Keep predicates referencing both sides above join - Implemented
-  - [ ] Preserve semantics for outer joins (don't push below null-generating side) - TODO
+  - [x] Preserve semantics for outer joins (don't push below null-generating side) - Implemented
 - [ ] Split complex predicates (break up AND conjunctions) - Deferred
 - [ ] Convert filter expressions to SQL - Deferred to execution
 - [ ] Handle datasource capabilities - Deferred to execution
@@ -499,10 +499,10 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 
 ### 6.5 Limit Pushdown ✅
 - [x] Push LIMIT through projections - Implemented
-- [x] Push LIMIT through filters - Implemented
+- [x] **FIXED**: Do NOT push LIMIT through filters (changes semantics) - Implemented
 - [x] Handle LIMIT with offset - Implemented
-- [ ] Cannot push LIMIT through joins (in general) - Noted in implementation
-- [ ] Cannot push LIMIT through aggregations - Noted in implementation
+- [x] Cannot push LIMIT through joins (in general) - Implemented
+- [x] Cannot push LIMIT through aggregations - Implemented
 - [ ] Top-N optimization (LIMIT + ORDER BY) - Deferred to Phase 10
 
 ### 6.6 Other Optimizations ⏳
@@ -540,7 +540,8 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 **Note**: Requires SQL generation infrastructure, deferred
 
 ### 6.9 Testing ✅
-- [x] Test each optimization rule independently - 21 tests passing
+- [x] Test each optimization rule independently - 28 tests passing
+- [x] **NEW**: Test optimization bug fixes - 7 tests (test_optimization_bugs.py)
 - [x] Test predicate pushdown with various filters - 7 tests
   - [x] Test push to scan - 1 test
   - [x] Test merge adjacent filters - 1 test
@@ -566,7 +567,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - [ ] Benchmark query performance improvement - Deferred
 - [ ] Compare optimized vs unoptimized execution times - Deferred
 
-**Deliverable**: ✅ **Substantially Complete** - Core optimization rules (predicate, projection, limit pushdown + join filter pushdown + column pruning) implemented with 21 comprehensive tests
+**Deliverable**: ✅ **Substantially Complete** - Core optimization rules (predicate, projection, limit pushdown + join filter pushdown + column pruning) implemented with 28 comprehensive tests, all critical bugs fixed
 
 **Implementation Summary**:
 - **PredicatePushdownRule** (federated_query/optimizer/rules.py:47-275):
@@ -587,15 +588,20 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
   - Pushes limits through projections and filters
   - Handles limit with offset
   - 49 lines, cyclomatic complexity ≤ 4 per function
-- **Test Coverage** (tests/test_logical_optimization.py):
-  - 21 comprehensive tests across 5 test classes
-  - Covers basic and complex optimization scenarios
-  - Includes 3 tests for join filter pushdown
-  - Includes 2 new tests for column pruning
-  - All tests passing
+- **Test Coverage**:
+  - tests/test_logical_optimization.py: 21 tests across 5 test classes
+  - **NEW**: tests/test_optimization_bugs.py: 7 critical bug fix tests
+    - Limit pushdown semantics (2 tests)
+    - Column pruning with SELECT * (2 tests)
+    - Outer join filter pushdown safety (3 tests)
+  - Total: 28 tests, all passing
+
+**Bug Fixes Implemented**:
+1. **Limit Pushdown**: Fixed incorrect pushdown through filters that changed query semantics
+2. **Column Pruning**: Fixed SELECT * losing columns when filters present
+3. **Outer Join Safety**: Fixed unsafe filter pushdown below outer joins
 
 **Future Work** (remaining Phase 6 tasks):
-- Complete projection pushdown column pruning logic
 - Implement join reordering with cost model integration
 - Implement join pushdown to same datasource (requires SQL generation)
 - Implement aggregate pushdown (requires SQL generation)

@@ -407,8 +407,11 @@ class TestLimitPushdown:
         assert isinstance(result.input, Limit)
         assert result.input.limit == 10
 
-    def test_push_limit_through_filter(self):
-        """Test pushing limit through filter."""
+    def test_limit_does_not_push_through_filter(self):
+        """Test that limit does NOT push through filter.
+
+        This would change query semantics - filter must execute first.
+        """
         scan = Scan(
             datasource="test_ds",
             schema_name="public",
@@ -426,9 +429,10 @@ class TestLimitPushdown:
         rule = LimitPushdownRule()
         result = rule.apply(limit)
 
-        assert isinstance(result, Filter)
-        assert isinstance(result.input, Limit)
-        assert result.input.limit == 10
+        # Limit should stay above filter
+        assert isinstance(result, Limit)
+        assert isinstance(result.input, Filter)
+        assert result.limit == 10
 
     def test_limit_with_offset(self):
         """Test limit pushdown with offset."""
