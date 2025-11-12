@@ -4,14 +4,14 @@ datasources:
     host: localhost
     port: 5466
     database: analytics
-    user: aybarsb
+    user: abadur
     password: ''
     schemas: [public]
     capabilities: [aggregations, joins, window_functions]
 
   local_duckdb:
     type: duckdb
-    path: ":memory:"
+    path: "products.duckdb"
     read_only: false
     capabilities: [aggregations, joins]
 

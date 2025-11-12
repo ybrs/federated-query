@@ -2,8 +2,25 @@
 
 from abc import ABC, abstractmethod
 from typing import List, Optional
-from ..plan.logical import LogicalPlanNode
+from ..plan.logical import (
+    LogicalPlanNode,
+    Scan,
+    Project,
+    Filter,
+    Join,
+    Aggregate,
+    Sort,
+    Limit,
+    Union,
+)
+from ..plan.expressions import Expression
 from ..catalog.catalog import Catalog
+from .expression_rewriter import (
+    ExpressionRewriter,
+    ConstantFoldingRewriter,
+    ExpressionSimplificationRewriter,
+    CompositeExpressionRewriter,
+)
 
 
 class OptimizationRule(ABC):
@@ -58,6 +75,160 @@ class JoinReorderingRule(OptimizationRule):
 
     def name(self) -> str:
         return "JoinReordering"
+
+
+class ExpressionSimplificationRule(OptimizationRule):
+    """Apply expression simplification and constant folding to plan."""
+
+    def __init__(self):
+        """Initialize expression simplification rule."""
+        self.rewriter = CompositeExpressionRewriter()
+        self.rewriter.add_rewriter(ConstantFoldingRewriter())
+        self.rewriter.add_rewriter(ExpressionSimplificationRewriter())
+
+    def apply(self, plan: LogicalPlanNode) -> Optional[LogicalPlanNode]:
+        """Apply expression rewriting to all expressions in the plan.
+
+        Args:
+            plan: Input plan node
+
+        Returns:
+            Transformed plan with simplified expressions
+        """
+        return self._rewrite_plan(plan)
+
+    def _rewrite_plan(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Recursively rewrite expressions in plan."""
+        if isinstance(plan, Scan):
+            if plan.filters:
+                rewritten_filter = self.rewriter.rewrite(plan.filters)
+                if rewritten_filter != plan.filters:
+                    return Scan(
+                        datasource=plan.datasource,
+                        schema_name=plan.schema_name,
+                        table_name=plan.table_name,
+                        columns=plan.columns,
+                        filters=rewritten_filter
+                    )
+            return plan
+
+        if isinstance(plan, Project):
+            rewritten_input = self._rewrite_plan(plan.input)
+            rewritten_exprs = []
+            changed = False
+
+            for expr in plan.expressions:
+                rewritten = self.rewriter.rewrite(expr)
+                rewritten_exprs.append(rewritten)
+                if rewritten != expr:
+                    changed = True
+
+            if changed or rewritten_input != plan.input:
+                return Project(rewritten_input, rewritten_exprs, plan.aliases)
+            return plan
+
+        if isinstance(plan, Filter):
+            rewritten_input = self._rewrite_plan(plan.input)
+            rewritten_predicate = self.rewriter.rewrite(plan.predicate)
+
+            if rewritten_predicate != plan.predicate or rewritten_input != plan.input:
+                return Filter(rewritten_input, rewritten_predicate)
+            return plan
+
+        if isinstance(plan, Join):
+            rewritten_left = self._rewrite_plan(plan.left)
+            rewritten_right = self._rewrite_plan(plan.right)
+            rewritten_condition = None
+
+            if plan.condition:
+                rewritten_condition = self.rewriter.rewrite(plan.condition)
+
+            if (rewritten_left != plan.left or
+                rewritten_right != plan.right or
+                rewritten_condition != plan.condition):
+                return Join(rewritten_left, rewritten_right, plan.join_type, rewritten_condition)
+            return plan
+
+        if isinstance(plan, Aggregate):
+            rewritten_input = self._rewrite_plan(plan.input)
+            rewritten_group_by = []
+            group_by_changed = False
+
+            for expr in plan.group_by:
+                rewritten = self.rewriter.rewrite(expr)
+                rewritten_group_by.append(rewritten)
+                if rewritten != expr:
+                    group_by_changed = True
+
+            rewritten_aggs = []
+            aggs_changed = False
+
+            for expr in plan.aggregates:
+                rewritten = self.rewriter.rewrite(expr)
+                rewritten_aggs.append(rewritten)
+                if rewritten != expr:
+                    aggs_changed = True
+
+            if (rewritten_input != plan.input or
+                group_by_changed or
+                aggs_changed):
+                return Aggregate(rewritten_input, rewritten_group_by, rewritten_aggs, plan.output_names)
+            return plan
+
+        if isinstance(plan, Sort):
+            rewritten_input = self._rewrite_plan(plan.input)
+            rewritten_keys = []
+            changed = False
+
+            for key in plan.sort_keys:
+                rewritten = self.rewriter.rewrite(key)
+                rewritten_keys.append(rewritten)
+                if rewritten != key:
+                    changed = True
+
+            if changed or rewritten_input != plan.input:
+                return Sort(rewritten_input, rewritten_keys, plan.ascending)
+            return plan
+
+        if isinstance(plan, Limit):
+            rewritten_input = self._rewrite_plan(plan.input)
+            if rewritten_input != plan.input:
+                return Limit(rewritten_input, plan.limit, plan.offset)
+            return plan
+
+        if isinstance(plan, Union):
+            rewritten_inputs = []
+            changed = False
+
+            for input_plan in plan.inputs:
+                rewritten = self._rewrite_plan(input_plan)
+                rewritten_inputs.append(rewritten)
+                if rewritten != input_plan:
+                    changed = True
+
+            if changed:
+                return Union(rewritten_inputs, plan.distinct)
+            return plan
+
+        children = plan.children()
+        if not children:
+            return plan
+
+        rewritten_children = []
+        changed = False
+
+        for child in children:
+            rewritten = self._rewrite_plan(child)
+            rewritten_children.append(rewritten)
+            if rewritten != child:
+                changed = True
+
+        if changed:
+            return plan.with_children(rewritten_children)
+        return plan
+
+    def name(self) -> str:
+        return "ExpressionSimplification"
 
 
 class RuleBasedOptimizer:

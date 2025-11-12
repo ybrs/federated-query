@@ -8,6 +8,9 @@ from typing import List, Optional, Tuple
 import click
 import duckdb
 import pyarrow as pa
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from sqlglot import errors as sqlglot_errors
 
 from ..catalog import Catalog
@@ -138,38 +141,138 @@ class ResultPrinter:
         return str(value)
 
 
-class FedQRepl:
-    """Interactive loop similar to psql."""
+class CatalogPrinter:
+    """Prints catalog metadata in a readable format."""
 
-    def __init__(self, runtime: FedQRuntime, printer: ResultPrinter):
+    def __init__(self, emit):
+        self.emit = emit
+
+    def display_catalog(self, catalog: Catalog) -> None:
+        if not catalog.schemas:
+            self.emit("Catalog is empty.")
+            return
+        self.emit("\nCatalog Contents:")
+        self.emit("=" * 80)
+        self._print_schemas(catalog)
+
+    def _print_schemas(self, catalog: Catalog) -> None:
+        for key in sorted(catalog.schemas.keys()):
+            datasource, schema_name = key
+            schema = catalog.schemas[key]
+            self._print_schema_header(datasource, schema_name)
+            self._print_tables(datasource, schema_name, schema)
+            self.emit("")
+
+    def _print_schema_header(self, datasource: str, schema_name: str) -> None:
+        header = f"\nData Source: {datasource}, Schema: {schema_name}"
+        self.emit(header)
+        self.emit("-" * len(header))
+
+    def _print_tables(self, datasource: str, schema_name: str, schema) -> None:
+        for table_name in sorted(schema.tables.keys()):
+            table = schema.tables[table_name]
+            full_name = f"{datasource}.{schema_name}.{table_name}"
+            self.emit(f"\nTable: {full_name}")
+            self._print_columns(table)
+
+    def _print_columns(self, table) -> None:
+        self.emit("  Columns:")
+        for column in table.columns:
+            nullable = "NULL" if column.nullable else "NOT NULL"
+            self.emit(f"    - {column.name}: {column.data_type.name} {nullable}")
+
+
+class FedQRepl:
+    """Interactive loop with full terminal support."""
+
+    def __init__(
+        self,
+        runtime: FedQRuntime,
+        printer: ResultPrinter,
+        catalog_printer: CatalogPrinter,
+        catalog: Catalog,
+    ):
         self.runtime = runtime
         self.printer = printer
+        self.catalog_printer = catalog_printer
+        self.catalog = catalog
+        self.session = self._create_session()
+
+    def _create_session(self) -> PromptSession:
+        history = InMemoryHistory()
+        auto_suggest = AutoSuggestFromHistory()
+        session = PromptSession(history=history, auto_suggest=auto_suggest)
+        return session
 
     def run(self) -> None:
         buffer: List[str] = []
         while True:
-            line, status = self._read_line(buffer)
-            if status == "exit":
+            line, should_continue = self._read_line(buffer)
+            if not should_continue:
                 break
-            if status == "skip":
-                continue
             if line is None:
                 continue
-            trimmed = line.strip()
-            if not trimmed:
-                continue
-            if self._should_exit(trimmed):
+            if self._is_exit_command(line):
                 break
+            if self._is_shortcut_command(line):
+                self._execute_shortcut(line)
+                continue
             buffer.append(line)
-            if self._statement_complete(trimmed):
-                statement = self._merge_buffer(buffer)
+            if self._is_complete_statement(line):
+                statement = self._build_statement(buffer)
                 buffer.clear()
-                self._execute_statement(statement)
+                self._execute_query(statement)
 
-    def _execute_statement(self, statement: str) -> None:
-        clean = statement.strip()
-        if clean.endswith(";"):
-            clean = clean[:-1].rstrip()
+    def _read_line(self, buffer: List[str]) -> Tuple[Optional[str], bool]:
+        prompt = self._get_prompt(buffer)
+        try:
+            line = self.session.prompt(prompt)
+            return line, True
+        except EOFError:
+            click.echo("")
+            return None, False
+        except KeyboardInterrupt:
+            click.echo("")
+            buffer.clear()
+            return None, True
+
+    def _get_prompt(self, buffer: List[str]) -> str:
+        if buffer:
+            return "...> "
+        return "fedq> "
+
+    def _is_exit_command(self, line: str) -> bool:
+        trimmed = line.strip().lower()
+        exit_commands = ["\\q", "quit", "exit"]
+        for command in exit_commands:
+            if trimmed == command:
+                return True
+        return False
+
+    def _is_shortcut_command(self, line: str) -> bool:
+        trimmed = line.strip()
+        return trimmed.startswith(".")
+
+    def _execute_shortcut(self, line: str) -> None:
+        trimmed = line.strip().lower()
+        if trimmed == ".catalog":
+            self.catalog_printer.display_catalog(self.catalog)
+        else:
+            click.echo(f"Unknown shortcut: {line.strip()}")
+            click.echo("Available shortcuts: .catalog")
+
+    def _is_complete_statement(self, line: str) -> bool:
+        return line.strip().endswith(";")
+
+    def _build_statement(self, buffer: List[str]) -> str:
+        parts: List[str] = []
+        for chunk in buffer:
+            parts.append(chunk)
+        statement = "\n".join(parts)
+        return statement
+
+    def _execute_query(self, statement: str) -> None:
+        clean = self._clean_statement(statement)
         if not clean:
             return
         try:
@@ -186,50 +289,23 @@ class FedQRepl:
         ) as exc:
             click.echo(f"error: {exc}")
 
-    def _read_line(self, buffer: List[str]) -> Tuple[Optional[str], str]:
-        prompt = self._prompt_for_buffer(buffer)
-        try:
-            line = input(prompt)
-            return line, "ok"
-        except EOFError:
-            click.echo("")
-            return None, "exit"
-        except KeyboardInterrupt:
-            click.echo("")
-            buffer.clear()
-            return None, "skip"
-
-    def _prompt_for_buffer(self, buffer: List[str]) -> str:
-        if buffer:
-            return "...> "
-        return "fedq> "
-
-    def _should_exit(self, line: str) -> bool:
-        commands = ["\\q", "quit", "exit"]
-        for command in commands:
-            if line.lower() == command or line == command:
-                return True
-        return False
-
-    def _statement_complete(self, line: str) -> bool:
-        return line.endswith(";")
-
-    def _merge_buffer(self, buffer: List[str]) -> str:
-        parts: List[str] = []
-        for chunk in buffer:
-            parts.append(chunk)
-        statement = "\n".join(parts)
-        return statement
+    def _clean_statement(self, statement: str) -> str:
+        clean = statement.strip()
+        if clean.endswith(";"):
+            clean = clean[:-1].rstrip()
+        return clean
 
 
-def _prepare_runtime(config_path: Optional[str]) -> Tuple[FedQRuntime, str]:
+def _prepare_runtime(
+    config_path: Optional[str],
+) -> Tuple[FedQRuntime, Catalog, str]:
     config, message = _load_config_bundle(config_path)
     catalog = _build_catalog(config, message is not None)
     runtime = FedQRuntime(catalog, config.executor)
     note = ""
     if message:
         note = message
-    return runtime, note
+    return runtime, catalog, note
 
 
 def _load_config_bundle(config_path: Optional[str]) -> Tuple[Config, Optional[str]]:
@@ -316,10 +392,12 @@ def _insert_demo_users(connection) -> None:
 )
 def cli(config_path: Optional[str]) -> None:
     """Entry point for the fedq CLI."""
-    runtime, note = _prepare_runtime(config_path)
+    runtime, catalog, note = _prepare_runtime(config_path)
     printer = ResultPrinter(click.echo)
+    catalog_printer = CatalogPrinter(click.echo)
     if note:
         click.echo(note)
     click.echo("Type SQL statements terminated by ';'. Use \\q to exit.")
-    repl = FedQRepl(runtime, printer)
+    click.echo("Use .catalog to view available tables.")
+    repl = FedQRepl(runtime, printer, catalog_printer, catalog)
     repl.run()
