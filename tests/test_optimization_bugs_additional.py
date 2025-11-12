@@ -657,3 +657,165 @@ class TestTableQualifierBug:
         # Filter references BOTH sides, must stay above join
         assert isinstance(result, Filter)
         assert isinstance(result.input, Join)
+
+
+class TestTableAliasBug:
+    """Test that table aliases are handled correctly in predicate pushdown.
+
+    Bug: _get_column_names qualifies scan columns with plan.table_name (physical name),
+    but ColumnRef.table carries the alias used in the query. When a table is aliased
+    (e.g., FROM users u WHERE u.age > 18), _can_evaluate_predicate compares the
+    predicate column "u.age" against available names "users.age" and refuses to push
+    the filter, leaving filters above scans and hurting performance.
+    """
+
+    def test_filter_with_aliased_table_should_push(self):
+        """Test filter with aliased table reference pushes to scan.
+
+        SELECT * FROM users u WHERE u.age > 18
+
+        The table is aliased as "u", and the predicate uses the alias.
+        Currently:
+        - _get_column_names returns {"users.id", "users.name", "users.age"}
+        - _extract_column_refs returns {"u.age"}
+        - _can_evaluate_predicate compares "u.age" against "users.age" and fails
+        - Filter stays above scan instead of pushing down
+
+        The filter should push to the scan for better performance.
+        """
+        scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="users",
+            columns=["id", "name", "age"],
+            alias="u"  # Table is aliased as "u"
+        )
+
+        # Filter: u.age > 18 (uses alias "u")
+        predicate = BinaryOp(
+            op=BinaryOpType.GT,
+            left=ColumnRef("u", "age", DataType.INTEGER),
+            right=Literal(18, DataType.INTEGER)
+        )
+        filter_node = Filter(scan, predicate)
+
+        rule = PredicatePushdownRule()
+        result = rule.apply(filter_node)
+
+        # Filter should push to scan
+        assert isinstance(result, Scan), f"Expected Scan with filter, got {type(result).__name__}"
+        assert result.filters is not None, "Filter should push to scan"
+
+    def test_aliased_join_filter_should_push(self):
+        """Test filter on aliased join pushes correctly.
+
+        SELECT * FROM orders o
+        JOIN customers c ON o.customer_id = c.id
+        WHERE o.amount > 100
+
+        Both tables are aliased. The filter uses the alias "o".
+        Currently fails to push because "o.amount" doesn't match "orders.amount".
+        """
+        left_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "customer_id", "amount"],
+            alias="o"  # Table is aliased as "o"
+        )
+        right_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="customers",
+            columns=["id", "name", "credit_limit"],
+            alias="c"  # Table is aliased as "c"
+        )
+        join_condition = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef("o", "customer_id", DataType.INTEGER),
+            right=ColumnRef("c", "id", DataType.INTEGER)
+        )
+        join = Join(
+            left=left_scan,
+            right=right_scan,
+            join_type=JoinType.INNER,
+            condition=join_condition
+        )
+
+        # Filter: o.amount > 100 (uses alias "o")
+        predicate = BinaryOp(
+            op=BinaryOpType.GT,
+            left=ColumnRef("o", "amount", DataType.DECIMAL),
+            right=Literal(100, DataType.DECIMAL)
+        )
+        filter_node = Filter(join, predicate)
+
+        rule = PredicatePushdownRule()
+        result = rule.apply(filter_node)
+
+        # Filter should push to left side (orders)
+        assert isinstance(result, Join), f"Expected Join, got {type(result).__name__}"
+        assert isinstance(result.left, Scan)
+        assert result.left.filters is not None, "Filter should push to left side (orders)"
+
+    def test_mixed_alias_and_physical_name(self):
+        """Test query mixing physical names and aliases.
+
+        SELECT * FROM orders o
+        JOIN customers ON o.customer_id = customers.id
+        WHERE o.amount > 100 AND customers.status = 'active'
+
+        Left table is aliased, right table is not.
+        Both filters should push correctly.
+        """
+        left_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "customer_id", "amount"],
+            alias="o"  # Table is aliased as "o"
+        )
+        right_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="customers",
+            columns=["id", "name", "status"]
+            # No alias - uses physical table name
+        )
+        join_condition = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef("o", "customer_id", DataType.INTEGER),
+            right=ColumnRef("customers", "id", DataType.INTEGER)
+        )
+        join = Join(
+            left=left_scan,
+            right=right_scan,
+            join_type=JoinType.INNER,
+            condition=join_condition
+        )
+
+        # Filter: o.amount > 100 AND customers.status = 'active'
+        left_pred = BinaryOp(
+            op=BinaryOpType.GT,
+            left=ColumnRef("o", "amount", DataType.DECIMAL),
+            right=Literal(100, DataType.DECIMAL)
+        )
+        right_pred = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef("customers", "status", DataType.VARCHAR),
+            right=Literal("active", DataType.VARCHAR)
+        )
+        predicate = BinaryOp(
+            op=BinaryOpType.AND,
+            left=left_pred,
+            right=right_pred
+        )
+        filter_node = Filter(join, predicate)
+
+        rule = PredicatePushdownRule()
+        result = rule.apply(filter_node)
+
+        # Both filters should push to their respective sides
+        # (This is a complex case - ideally both predicates would split and push)
+        # For now, at minimum, the rule should not fail
+        assert result is not None

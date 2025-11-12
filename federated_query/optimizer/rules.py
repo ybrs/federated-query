@@ -213,7 +213,8 @@ class PredicatePushdownRule(OptimizationRule):
                 schema_name=scan.schema_name,
                 table_name=scan.table_name,
                 columns=scan.columns,
-                filters=merged
+                filters=merged,
+                alias=scan.alias
             )
 
         return Scan(
@@ -221,7 +222,8 @@ class PredicatePushdownRule(OptimizationRule):
             schema_name=scan.schema_name,
             table_name=scan.table_name,
             columns=scan.columns,
-            filters=filter_node.predicate
+            filters=filter_node.predicate,
+            alias=scan.alias
         )
 
     def _predicate_matches_side(
@@ -336,11 +338,14 @@ class PredicatePushdownRule(OptimizationRule):
         Recursively handles wrapped nodes (Filter, Limit, etc).
         """
         if isinstance(plan, Scan):
-            # Return qualified column names: "table.column"
+            # Return qualified column names: "table.column" or "alias.column"
+            # Use alias if present (e.g., "u" from "FROM users u")
+            # Otherwise use physical table name
             # This prevents ambiguity when multiple tables have same column names
+            table_ref = plan.alias if plan.alias else plan.table_name
             qualified = set()
             for col in plan.columns:
-                qualified.add(f"{plan.table_name}.{col}")
+                qualified.add(f"{table_ref}.{col}")
             return qualified
 
         if isinstance(plan, Project):
@@ -582,7 +587,8 @@ class ProjectionPushdownRule(OptimizationRule):
                 schema_name=scan.schema_name,
                 table_name=scan.table_name,
                 columns=pruned_cols,
-                filters=scan.filters
+                filters=scan.filters,
+                alias=scan.alias
             )
 
         return scan
@@ -706,7 +712,8 @@ class ExpressionSimplificationRule(OptimizationRule):
                         schema_name=plan.schema_name,
                         table_name=plan.table_name,
                         columns=plan.columns,
-                        filters=rewritten_filter
+                        filters=rewritten_filter,
+                        alias=plan.alias
                     )
             return plan
 
