@@ -11,6 +11,7 @@ from ..plan.logical import (
     Limit,
     Join,
     Aggregate,
+    Explain,
 )
 from ..plan.expressions import (
     Expression,
@@ -55,6 +56,8 @@ class Binder:
         Raises:
             BindingError: If binding fails
         """
+        if isinstance(plan, Explain):
+            return self._bind_explain(plan)
         if isinstance(plan, Scan):
             return self._bind_scan(plan)
         if isinstance(plan, Filter):
@@ -189,6 +192,11 @@ class Binder:
             join_type=join.join_type,
             condition=bound_condition,
         )
+
+    def _bind_explain(self, explain: Explain) -> Explain:
+        """Bind an Explain node."""
+        bound_child = self.bind(explain.input)
+        return Explain(input=bound_child)
 
     def _bind_aggregate(self, aggregate: Aggregate) -> Aggregate:
         """Bind an Aggregate node."""

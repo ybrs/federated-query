@@ -264,6 +264,29 @@ class Union(LogicalPlanNode):
         return f"{union_type}({len(self.inputs)} inputs)"
 
 
+@dataclass(frozen=True)
+class Explain(LogicalPlanNode):
+    """Explain wrapper around another plan."""
+
+    input: LogicalPlanNode
+
+    def children(self) -> List[LogicalPlanNode]:
+        return [self.input]
+
+    def with_children(self, children: List[LogicalPlanNode]) -> "Explain":
+        assert len(children) == 1
+        return Explain(children[0])
+
+    def accept(self, visitor):
+        return visitor.visit_explain(self)
+
+    def schema(self) -> List[str]:
+        return ["plan"]
+
+    def __repr__(self) -> str:
+        return "Explain()"
+
+
 class LogicalPlanVisitor(ABC):
     """Visitor interface for logical plan nodes."""
 
@@ -297,4 +320,8 @@ class LogicalPlanVisitor(ABC):
 
     @abstractmethod
     def visit_union(self, node: Union):
+        pass
+
+    @abstractmethod
+    def visit_explain(self, node: Explain):
         pass
