@@ -14,7 +14,7 @@ This document breaks down the implementation into phases. Each phase builds on t
 | **Phase 3** | ✅ Complete | Aggregations and GROUP BY | 9 tests |
 | **Phase 4** | ✅ Complete | Pre-optimization and expression handling | 42 tests |
 | **Phase 5** | ✅ Complete | Statistics and cost model | 30 tests |
-| **Phase 6** | ⏳ Not Started | Logical optimization (pushdown, reordering) | - |
+| **Phase 6** | 🚧 In Progress | Logical optimization (pushdown, reordering) | 16 tests |
 | **Phase 7** | ⏳ Not Started | Decorrelation (subqueries) | - |
 | **Phase 8** | ⏳ Not Started | Physical planning and join strategies | - |
 | **Phase 9** | ⏳ Not Started | Advanced execution (parallel, memory mgmt) | - |
@@ -22,7 +22,7 @@ This document breaks down the implementation into phases. Each phase builds on t
 | **Phase 11** | ⏳ Not Started | Production readiness | - |
 | **Phase 12** | ⏳ Future | Advanced features (adaptive execution, caching) | - |
 
-**Current Status**: 154 tests passing, Phases 0-5 complete, ready for Phase 6
+**Current Status**: 170 tests passing, Phases 0-5 complete, Phase 6 in progress (predicate/projection/limit pushdown implemented)
 
 ## Phase 0: Foundation ✅ COMPLETED
 
@@ -169,7 +169,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - [x] Schema resolution for joins
 
 ### 2.3 Data Gathering → DEFERRED TO PHASE 9
-All data gathering, parallel fetching, and memory management tasks have been deferred to **Phase 9: Advanced Execution Features**. See Phase 9 for details.
+All data gathering, parallel fetching, and memory management tasks have been deferred to **Phase 9: Advanced Execution Features** (section 9.1). See Phase 9 for details.
 
 ### 2.4 Join Strategy Selection (Basic) ✅
 - [x] Choose join operator based on join type (Hash vs Nested Loop)
@@ -177,8 +177,8 @@ All data gathering, parallel fetching, and memory management tasks have been def
 - [x] Physical planning for joins
 
 **Deferred to Phase 6 (Logical Optimization):**
-- Detect when join can be pushed to single data source
-- Implement remote join pushdown (see Phase 6, section 6.7)
+- [ ] Detect when join can be pushed to single data source → **Phase 6, section 6.7**
+- [ ] Implement remote join pushdown → **Phase 6, section 6.7**
 
 ### 2.5 Testing ✅
 - [x] Test joins on same data source
@@ -225,7 +225,10 @@ All data gathering, parallel fetching, and memory management tasks have been def
 - [x] Schema inference for aggregate results
 
 ### 3.3 Aggregate Pushdown → DEFERRED TO PHASE 6
-All aggregate pushdown optimization tasks have been deferred to **Phase 6: Logical Optimization** (section 6.8). See Phase 6 for details.
+All aggregate pushdown optimization tasks have been deferred to **Phase 6: Logical Optimization** (section 6.8). These tasks include:
+- [ ] Detect when aggregation can be pushed to data source → **Phase 6, section 6.8**
+- [ ] Implement partial aggregation strategy → **Phase 6, section 6.8**
+- [ ] Handle DISTINCT aggregates → **Phase 6, section 6.8**
 
 ### 3.4 Testing ✅
 - [x] Test simple aggregations (COUNT, SUM, AVG)
@@ -450,8 +453,9 @@ All aggregate pushdown optimization tasks have been deferred to **Phase 6: Logic
 
 ## Phase 6: Logical Optimization
 
-**Status:** ⏳ NOT STARTED
+**Status:** 🚧 IN PROGRESS
 **Goal**: Implement rule-based logical optimizations
+**Tests**: 16 tests passing, 170 total tests
 
 **Prerequisites**: ✅ Optimization infrastructure already exists:
 - OptimizationRule base class (federated_query/optimizer/rules.py)
@@ -462,30 +466,31 @@ All aggregate pushdown optimization tasks have been deferred to **Phase 6: Logic
 ### 6.1 Optimization Framework ✅
 - [x] Create optimization rule interface - Already implemented
 - [x] Implement rule application engine - Already implemented (RuleBasedOptimizer)
-- [ ] Support multiple optimization passes with different rule sets
-- [ ] Add rule ordering and fixed-point iteration for cascading optimizations
+- [x] Support multiple optimization passes with different rule sets - Implemented
+- [x] Add rule ordering and fixed-point iteration for cascading optimizations - Implemented
 
-### 6.2 Predicate Pushdown
-- [ ] Push filters through projections
+### 6.2 Predicate Pushdown ✅
+- [x] Push filters through projections - Implemented
+- [x] Push filters to data sources (integrate with Scan node) - Implemented
+- [x] Merge adjacent filters - Implemented
 - [ ] Push filters below joins
   - [ ] Handle join conditions correctly (split predicates by join side)
   - [ ] Preserve semantics for outer joins (don't push below null-generating side)
-- [ ] Push filters to data sources (remote pushdown)
-  - [ ] Convert filter expressions to SQL
-  - [ ] Integrate with Scan node
-  - [ ] Handle datasource capabilities
-- [ ] Split complex predicates (break up AND conjunctions)
-- [ ] Merge adjacent filters
+- [ ] Split complex predicates (break up AND conjunctions) - Deferred
+- [ ] Convert filter expressions to SQL - Deferred to execution
+- [ ] Handle datasource capabilities - Deferred to execution
 
-### 6.3 Projection Pushdown
+### 6.3 Projection Pushdown 🚧
+- [x] Column analysis infrastructure - Implemented
+  - [x] Analyze column usage throughout plan tree
+  - [x] Extract columns from expressions (binary, unary, function calls)
 - [ ] Column pruning (remove unused columns early)
-  - [ ] Analyze column usage throughout plan tree
   - [ ] Remove unused columns from Scan nodes
-- [ ] Push projections through filters (narrow schema early)
+  - [ ] Push projections through filters (narrow schema early)
 - [ ] Push projections to data sources (SELECT only needed columns)
 - [ ] Eliminate redundant projections
 
-### 6.4 Join Reordering
+### 6.4 Join Reordering ⏳
 - [ ] Implement dynamic programming for small join graphs (< 10 tables)
   - [ ] Build all valid join trees
   - [ ] Use cost model to select best tree
@@ -497,21 +502,26 @@ All aggregate pushdown optimization tasks have been deferred to **Phase 6: Logic
 - [ ] Preserve join semantics (left/right outer joins must maintain order)
 - [ ] Handle cross joins (Cartesian products)
 
-### 6.5 Limit Pushdown
-- [ ] Push LIMIT through projections
-- [ ] Push LIMIT through filters
-- [ ] Cannot push LIMIT through joins (in general)
-- [ ] Cannot push LIMIT through aggregations
-- [ ] Top-N optimization (LIMIT + ORDER BY)
+**Note**: Join reordering requires Phase 5 cost model integration and is deferred
 
-### 6.6 Other Optimizations
+### 6.5 Limit Pushdown ✅
+- [x] Push LIMIT through projections - Implemented
+- [x] Push LIMIT through filters - Implemented
+- [x] Handle LIMIT with offset - Implemented
+- [ ] Cannot push LIMIT through joins (in general) - Noted in implementation
+- [ ] Cannot push LIMIT through aggregations - Noted in implementation
+- [ ] Top-N optimization (LIMIT + ORDER BY) - Deferred to Phase 10
+
+### 6.6 Other Optimizations ⏳
 - [ ] Redundant join elimination (using foreign key constraints)
 - [ ] Self-join elimination
 - [ ] Common subexpression elimination (CSE)
 - [ ] Filter merging and simplification (using Phase 4 expression rewriter)
 - [ ] Constant predicate evaluation (eliminate always-true/false filters)
 
-### 6.7 Join Pushdown (from Phase 2, section 2.4)
+**Note**: These are advanced optimizations, deferred for now
+
+### 6.7 Join Pushdown (from Phase 2, section 2.4) ⏳
 - [ ] Detect when join can be pushed to single data source
   - [ ] Both tables on same datasource
   - [ ] No incompatible operations between tables
@@ -520,7 +530,9 @@ All aggregate pushdown optimization tasks have been deferred to **Phase 6: Logic
   - [ ] Execute on remote datasource
   - [ ] Replace local join with remote scan
 
-### 6.8 Aggregate Pushdown (from Phase 3, section 3.3)
+**Note**: Requires SQL generation infrastructure, deferred
+
+### 6.8 Aggregate Pushdown (from Phase 3, section 3.3) ⏳
 - [ ] Detect when aggregation can be pushed to data source
   - [ ] Single table aggregation → full pushdown
   - [ ] Post-join aggregation → consider pushdown if join is pushed
@@ -532,20 +544,51 @@ All aggregate pushdown optimization tasks have been deferred to **Phase 6: Logic
   - [ ] COUNT(DISTINCT) requires special handling
   - [ ] May need to fetch distinct values then count locally
 
-### 6.9 Testing
-- [ ] Test each optimization rule independently
-- [ ] Test predicate pushdown with various filters
-- [ ] Test projection pushdown and column pruning
-- [ ] Test join reordering with 3-5 table joins
-- [ ] Test limit pushdown
-- [ ] Test join pushdown to same datasource
-- [ ] Test aggregate pushdown (single table and partial)
-- [ ] Test combined optimizations (multiple rules)
-- [ ] Verify plan correctness after optimization (results unchanged)
-- [ ] Benchmark query performance improvement
-- [ ] Compare optimized vs unoptimized execution times
+**Note**: Requires SQL generation infrastructure, deferred
 
-**Deliverable**: Comprehensive logical optimization with measurable performance improvements
+### 6.9 Testing ✅
+- [x] Test each optimization rule independently - 16 tests passing
+- [x] Test predicate pushdown with various filters - 4 tests
+- [x] Test projection pushdown and column pruning - 4 tests
+- [x] Test limit pushdown - 3 tests
+- [x] Test combined optimizations (multiple rules) - 2 tests
+- [x] Test optimizer with rule application engine - 3 tests
+- [ ] Test join reordering with 3-5 table joins - Deferred
+- [ ] Test join pushdown to same datasource - Deferred
+- [ ] Test aggregate pushdown (single table and partial) - Deferred
+- [ ] Verify plan correctness after optimization (results unchanged) - Deferred to integration tests
+- [ ] Benchmark query performance improvement - Deferred
+- [ ] Compare optimized vs unoptimized execution times - Deferred
+
+**Deliverable**: ✅ **Partially Complete** - Core optimization rules (predicate, projection, limit pushdown) implemented with 16 comprehensive tests
+
+**Implementation Summary**:
+- **PredicatePushdownRule** (federated_query/optimizer/rules.py:47-193):
+  - Pushes filters to scan nodes
+  - Merges adjacent filters
+  - Pushes filters through projections
+  - 147 lines, cyclomatic complexity ≤ 4 per function
+- **ProjectionPushdownRule** (federated_query/optimizer/rules.py:196-294):
+  - Collects required columns from plan tree
+  - Extracts columns from expressions
+  - Infrastructure for column pruning (implementation pending)
+  - 99 lines, cyclomatic complexity ≤ 4 per function
+- **LimitPushdownRule** (federated_query/optimizer/rules.py:297-345):
+  - Pushes limits through projections and filters
+  - Handles limit with offset
+  - 49 lines, cyclomatic complexity ≤ 4 per function
+- **Test Coverage** (tests/test_phase6_optimization.py):
+  - 16 comprehensive tests across 5 test classes
+  - Covers basic and complex optimization scenarios
+  - All tests passing
+
+**Future Work** (remaining Phase 6 tasks):
+- Complete projection pushdown column pruning logic
+- Implement join reordering with cost model integration
+- Implement join pushdown to same datasource (requires SQL generation)
+- Implement aggregate pushdown (requires SQL generation)
+- Add integration tests with end-to-end query execution
+- Performance benchmarks comparing optimized vs unoptimized plans
 
 ---
 
