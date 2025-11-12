@@ -1081,3 +1081,247 @@ class TestColumnPruningJoinKeyBug:
         # Right side must have user_id
         assert isinstance(join_node.right, Scan)
         assert "user_id" in join_node.right.columns, "orders.user_id needed for join"
+
+
+class TestAggregateColumnPruningBug:
+    """Test that column pruning preserves columns needed by aggregate children.
+
+    Bug: _collect_required_columns stops at Aggregate nodes and doesn't recurse
+    into plan.input. This means columns needed by downstream operators (like
+    join keys, filter columns) are omitted from the required set. When
+    _prune_scan_columns runs, it can drop these columns, breaking the query.
+    """
+
+    def test_aggregate_over_join_preserves_join_keys(self):
+        """Test that join keys are preserved for aggregates over joins.
+
+        SELECT c.country, SUM(o.total)
+        FROM customers c
+        JOIN orders o ON c.id = o.customer_id
+        GROUP BY c.country
+
+        The aggregate collects c.country and o.total, but the join needs
+        c.id and o.customer_id. Without recursion, these join keys are
+        pruned and the join becomes impossible to execute!
+        """
+        from federated_query.optimizer.rules import ProjectionPushdownRule
+        from federated_query.plan.logical import Aggregate
+
+        # Left scan: customers
+        left_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="customers",
+            columns=["id", "name", "country"],
+            alias="c"
+        )
+
+        # Right scan: orders
+        right_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "customer_id", "total"],
+            alias="o"
+        )
+
+        # Join condition: c.id = o.customer_id
+        join_condition = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef("c", "id", DataType.INTEGER),
+            right=ColumnRef("o", "customer_id", DataType.INTEGER)
+        )
+
+        join = Join(
+            left=left_scan,
+            right=right_scan,
+            join_type=JoinType.INNER,
+            condition=join_condition
+        )
+
+        # Aggregate: SELECT c.country, SUM(o.total) GROUP BY c.country
+        # For testing purposes, just use column refs for aggregates
+        group_by_expr = ColumnRef("c", "country", DataType.VARCHAR)
+        sum_expr = ColumnRef("o", "total", DataType.DECIMAL)
+
+        aggregate = Aggregate(
+            input=join,
+            group_by=[group_by_expr],
+            aggregates=[sum_expr],
+            output_names=["country", "sum_total"]
+        )
+
+        rule = ProjectionPushdownRule()
+        result = rule.apply(aggregate)
+
+        # Result should still be an aggregate
+        assert isinstance(result, Aggregate)
+
+        # Navigate to the join
+        assert isinstance(result.input, Join)
+        join_node = result.input
+
+        # Left side (customers) must have 'id' column for join
+        assert isinstance(join_node.left, Scan)
+        assert "id" in join_node.left.columns, "customers.id must be preserved for join key"
+        assert "country" in join_node.left.columns, "customers.country needed for group by"
+
+        # Right side (orders) must have 'customer_id' column for join
+        assert isinstance(join_node.right, Scan)
+        assert "customer_id" in join_node.right.columns, "orders.customer_id must be preserved for join key"
+        assert "total" in join_node.right.columns, "orders.total needed for SUM"
+
+    def test_aggregate_over_filter_preserves_filter_columns(self):
+        """Test that filter columns are preserved for aggregates over filters.
+
+        SELECT COUNT(*)
+        FROM (SELECT * FROM orders WHERE status = 'pending') AS pending_orders
+
+        The aggregate is just COUNT(*), contributing no columns. Without
+        recursion into the filter, the 'status' column is not marked as
+        required and gets pruned, making the filter impossible to evaluate!
+        """
+        from federated_query.optimizer.rules import ProjectionPushdownRule
+        from federated_query.plan.logical import Aggregate
+
+        # Scan: orders
+        scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "customer_id", "status", "total"]
+        )
+
+        # Filter: WHERE status = 'pending'
+        filter_pred = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef(None, "status", DataType.VARCHAR),
+            right=Literal("pending", DataType.VARCHAR)
+        )
+        filter_node = Filter(scan, filter_pred)
+
+        # Aggregate: SELECT COUNT(*)
+        # For testing purposes, use a simple literal for COUNT(*)
+        count_expr = Literal(1, DataType.INTEGER)
+
+        aggregate = Aggregate(
+            input=filter_node,
+            group_by=[],
+            aggregates=[count_expr],
+            output_names=["count"]
+        )
+
+        rule = ProjectionPushdownRule()
+        result = rule.apply(aggregate)
+
+        # Result should still be an aggregate
+        assert isinstance(result, Aggregate)
+
+        # Navigate to find the scan (may be wrapped in filter)
+        current = result.input
+        if isinstance(current, Filter):
+            current = current.input
+
+        assert isinstance(current, Scan)
+        # The 'status' column MUST be preserved for the filter
+        assert "status" in current.columns, "orders.status must be preserved for filter"
+
+    def test_aggregate_over_filtered_join_preserves_all_columns(self):
+        """Test that all columns are preserved for complex aggregate queries.
+
+        SELECT c.country, COUNT(*)
+        FROM customers c
+        JOIN orders o ON c.id = o.customer_id
+        WHERE o.status = 'completed'
+        GROUP BY c.country
+
+        Needs:
+        - Group by: c.country
+        - Join keys: c.id, o.customer_id
+        - Filter: o.status
+
+        All must be preserved!
+        """
+        from federated_query.optimizer.rules import ProjectionPushdownRule
+        from federated_query.plan.logical import Aggregate
+
+        # Left scan: customers
+        left_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="customers",
+            columns=["id", "name", "country"],
+            alias="c"
+        )
+
+        # Right scan: orders
+        right_scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "customer_id", "status", "total"],
+            alias="o"
+        )
+
+        # Join condition: c.id = o.customer_id
+        join_condition = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef("c", "id", DataType.INTEGER),
+            right=ColumnRef("o", "customer_id", DataType.INTEGER)
+        )
+
+        join = Join(
+            left=left_scan,
+            right=right_scan,
+            join_type=JoinType.INNER,
+            condition=join_condition
+        )
+
+        # Filter: WHERE o.status = 'completed'
+        filter_pred = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef("o", "status", DataType.VARCHAR),
+            right=Literal("completed", DataType.VARCHAR)
+        )
+        filter_node = Filter(join, filter_pred)
+
+        # Aggregate: SELECT c.country, COUNT(*) GROUP BY c.country
+        group_by_expr = ColumnRef("c", "country", DataType.VARCHAR)
+        count_expr = Literal(1, DataType.INTEGER)  # COUNT(*)
+
+        aggregate = Aggregate(
+            input=filter_node,
+            group_by=[group_by_expr],
+            aggregates=[count_expr],
+            output_names=["country", "count"]
+        )
+
+        rule = ProjectionPushdownRule()
+        result = rule.apply(aggregate)
+
+        # Result should still be an aggregate
+        assert isinstance(result, Aggregate)
+
+        # Navigate down to find the join (may have filter between)
+        current = result.input
+        if isinstance(current, Filter):
+            current = current.input
+
+        assert isinstance(current, Join)
+        join_node = current
+
+        # Check left side (customers)
+        left_node = join_node.left
+        if isinstance(left_node, Filter):
+            left_node = left_node.input
+        assert isinstance(left_node, Scan)
+        assert "id" in left_node.columns, "customers.id needed for join"
+        assert "country" in left_node.columns, "customers.country needed for group by"
+
+        # Check right side (orders)
+        right_node = join_node.right
+        if isinstance(right_node, Filter):
+            right_node = right_node.input
+        assert isinstance(right_node, Scan)
+        assert "customer_id" in right_node.columns, "orders.customer_id needed for join"
+        assert "status" in right_node.columns, "orders.status needed for filter"

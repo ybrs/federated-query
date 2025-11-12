@@ -432,6 +432,11 @@ class ProjectionPushdownRule(OptimizationRule):
         if isinstance(plan, Project):
             return True
 
+        if isinstance(plan, Aggregate):
+            # Aggregates have explicit output schema (group_by + aggregates)
+            # so column pruning should be applied
+            return True
+
         if isinstance(plan, Filter):
             return self._has_explicit_projection(plan.input)
 
@@ -475,10 +480,16 @@ class ProjectionPushdownRule(OptimizationRule):
             return columns
 
         if isinstance(plan, Aggregate):
+            # Collect columns from group by expressions
             for expr in plan.group_by:
                 columns.update(self._extract_columns(expr))
+            # Collect columns from aggregate expressions
             for expr in plan.aggregates:
                 columns.update(self._extract_columns(expr))
+            # CRITICAL: Must recurse into input to collect columns needed by
+            # downstream operators (e.g., join keys, filter columns)
+            # Otherwise those columns will be pruned and break the query!
+            columns.update(self._collect_required_columns(plan.input))
             return columns
 
         if isinstance(plan, Limit):
