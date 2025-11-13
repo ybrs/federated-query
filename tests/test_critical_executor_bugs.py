@@ -521,3 +521,217 @@ class TestBug3LeftFullJoinNotImplemented:
         non_null_amounts = [r for r in rows if r["amount"] is not None]
         assert len(non_null_amounts) == 1
         assert non_null_amounts[0]["amount"] == 200.0
+
+
+class TestBug4FullJoinMissingRightRows:
+    """Test Bug #4: FULL OUTER JOIN doesn't emit unmatched right rows."""
+
+    def test_hash_full_join_with_unmatched_right_rows(self, setup_two_datasources):
+        """Test FULL OUTER JOIN where right table has unmatched rows.
+
+        Bug: PhysicalHashJoin only emits unmatched left (probe) rows but never
+        emits unmatched right (build) rows.
+
+        Setup: 4 customers, 4 orders for only 2 customers.
+        Expected: All 4 customers + 0 extra orders = 6 total rows
+        (2 customers with 2 orders each = 4 rows, 2 customers with NULL = 2 rows)
+        """
+        catalog, ds_customers, ds_orders = setup_two_datasources
+
+        parser = Parser()
+        sql = """
+            SELECT c.id AS cust_id, c.name, o.order_id, o.amount
+            FROM db1.main.customers c
+            FULL OUTER JOIN db2.main.orders o ON c.id = o.customer_id
+        """
+        logical_plan = parser.parse_to_logical_plan(sql)
+
+        binder = Binder(catalog)
+        bound_plan = binder.bind(logical_plan)
+
+        planner = PhysicalPlanner(catalog)
+        physical_plan = planner.plan(bound_plan)
+
+        executor = Executor()
+        results = executor.execute(physical_plan)
+
+        rows = []
+        for batch in results:
+            result_dict = batch.to_pydict()
+            for i in range(batch.num_rows):
+                rows.append({
+                    "cust_id": result_dict.get("cust_id", [None] * batch.num_rows)[i],
+                    "name": result_dict.get("name", [None] * batch.num_rows)[i],
+                    "order_id": result_dict.get("order_id", [None] * batch.num_rows)[i],
+                    "amount": result_dict.get("amount", [None] * batch.num_rows)[i]
+                })
+
+        assert len(rows) == 6, f"Expected 6 rows (4 matched + 2 unmatched customers), got {len(rows)}"
+
+        unmatched_customers = [r for r in rows if r["order_id"] is None]
+        assert len(unmatched_customers) == 2, \
+            f"Expected 2 customers with no orders, got {len(unmatched_customers)}"
+
+        customer_names = {r["name"] for r in unmatched_customers}
+        assert "Charlie" in customer_names
+        assert "Diana" in customer_names
+
+        matched_rows = [r for r in rows if r["order_id"] is not None]
+        assert len(matched_rows) == 4
+
+    def test_hash_full_join_with_unmatched_both_sides(self):
+        """Test FULL OUTER JOIN where both sides have unmatched rows.
+
+        Bug: Only left unmatched rows are emitted, right unmatched rows are dropped.
+
+        Setup: 3 customers (1,2,3), 3 orders for customers (2,3,4)
+        Expected: Customer 1 with NULL order, Customers 2&3 with their orders,
+                  and orphan order for customer 4 with NULL customer info.
+        """
+        config_customers = {
+            "database": ":memory:",
+            "read_only": False,
+        }
+        ds_customers = DuckDBDataSource(name="db1", config=config_customers)
+        ds_customers.connect()
+
+        ds_customers.connection.execute("""
+            CREATE TABLE customers (
+                id INTEGER,
+                name VARCHAR,
+                city VARCHAR
+            )
+        """)
+
+        ds_customers.connection.execute("""
+            INSERT INTO customers VALUES
+            (1, 'Alice', 'NYC'),
+            (2, 'Bob', 'LA'),
+            (3, 'Charlie', 'SF')
+        """)
+
+        config_orders = {
+            "database": ":memory:",
+            "read_only": False,
+        }
+        ds_orders = DuckDBDataSource(name="db2", config=config_orders)
+        ds_orders.connect()
+
+        ds_orders.connection.execute("""
+            CREATE TABLE orders (
+                order_id INTEGER,
+                customer_id INTEGER,
+                amount DOUBLE
+            )
+        """)
+
+        ds_orders.connection.execute("""
+            INSERT INTO orders VALUES
+            (101, 2, 100.0),
+            (102, 3, 200.0),
+            (103, 4, 300.0)
+        """)
+
+        catalog = Catalog()
+        catalog.register_datasource(ds_customers)
+        catalog.register_datasource(ds_orders)
+        catalog.load_metadata()
+
+        parser = Parser()
+        sql = """
+            SELECT c.id AS cust_id, c.name, o.order_id, o.customer_id AS order_cust_id
+            FROM db1.main.customers c
+            FULL OUTER JOIN db2.main.orders o ON c.id = o.customer_id
+        """
+        logical_plan = parser.parse_to_logical_plan(sql)
+
+        binder = Binder(catalog)
+        bound_plan = binder.bind(logical_plan)
+
+        planner = PhysicalPlanner(catalog)
+        physical_plan = planner.plan(bound_plan)
+
+        executor = Executor()
+        results = executor.execute(physical_plan)
+
+        rows = []
+        for batch in results:
+            result_dict = batch.to_pydict()
+            for i in range(batch.num_rows):
+                rows.append({
+                    "cust_id": result_dict.get("cust_id", [None] * batch.num_rows)[i],
+                    "name": result_dict.get("name", [None] * batch.num_rows)[i],
+                    "order_id": result_dict.get("order_id", [None] * batch.num_rows)[i],
+                    "order_cust_id": result_dict.get("order_cust_id", [None] * batch.num_rows)[i]
+                })
+
+        ds_customers.disconnect()
+        ds_orders.disconnect()
+
+        assert len(rows) == 4, \
+            f"Expected 4 rows (1 unmatched left, 2 matched, 1 unmatched right), got {len(rows)}"
+
+        alice_row = [r for r in rows if r.get("name") == "Alice"]
+        assert len(alice_row) == 1, "Alice (customer 1) should appear once"
+        assert alice_row[0]["order_id"] is None, "Alice should have NULL order"
+
+        bob_row = [r for r in rows if r.get("name") == "Bob"]
+        assert len(bob_row) == 1, "Bob should appear once"
+        assert bob_row[0]["order_id"] == 101
+
+        charlie_row = [r for r in rows if r.get("name") == "Charlie"]
+        assert len(charlie_row) == 1, "Charlie should appear once"
+        assert charlie_row[0]["order_id"] == 102
+
+        orphan_order = [r for r in rows if r["order_id"] == 103]
+        assert len(orphan_order) == 1, "Order 103 (for non-existent customer 4) should appear"
+        assert orphan_order[0]["cust_id"] is None, "Orphan order should have NULL customer id"
+        assert orphan_order[0]["name"] is None, "Orphan order should have NULL customer name"
+        assert orphan_order[0]["order_cust_id"] == 4
+
+    def test_nested_loop_full_join_with_unmatched_right_rows(self, setup_two_datasources):
+        """Test nested loop FULL OUTER JOIN with unmatched right rows.
+
+        Bug: PhysicalNestedLoopJoin only emits unmatched left rows but never
+        emits unmatched right rows.
+        """
+        catalog, ds_customers, ds_orders = setup_two_datasources
+
+        parser = Parser()
+        sql = """
+            SELECT c.name, o.order_id
+            FROM db1.main.customers c
+            FULL OUTER JOIN db2.main.orders o ON c.id = o.customer_id AND o.amount > 75
+        """
+        logical_plan = parser.parse_to_logical_plan(sql)
+
+        binder = Binder(catalog)
+        bound_plan = binder.bind(logical_plan)
+
+        planner = PhysicalPlanner(catalog)
+        physical_plan = planner.plan(bound_plan)
+
+        executor = Executor()
+        results = executor.execute(physical_plan)
+
+        rows = []
+        for batch in results:
+            result_dict = batch.to_pydict()
+            for i in range(batch.num_rows):
+                rows.append({
+                    "name": result_dict.get("name", [None] * batch.num_rows)[i],
+                    "order_id": result_dict.get("order_id", [None] * batch.num_rows)[i]
+                })
+
+        assert len(rows) >= 4, f"Should have at least 4 customers, got {len(rows)}"
+
+        unmatched_customers = [r for r in rows if r["order_id"] is None and r["name"] is not None]
+        assert len(unmatched_customers) >= 2, "Should have unmatched customers (Charlie, Diana, maybe others)"
+
+        customer_names = {r["name"] for r in unmatched_customers}
+        assert "Charlie" in customer_names
+        assert "Diana" in customer_names
+
+        unmatched_orders = [r for r in rows if r["name"] is None and r["order_id"] is not None]
+        assert len(unmatched_orders) > 0, \
+            "Should have unmatched orders (those that don't meet amount > 75 or other criteria)"

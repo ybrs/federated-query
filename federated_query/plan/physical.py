@@ -302,6 +302,7 @@ class PhysicalHashJoin(PhysicalPlanNode):
 
         hash_table = defaultdict(list)
         build_batches = []
+        matched_build_rows = set()
 
         for batch in build_node.execute():
             build_batches.append(batch)
@@ -327,6 +328,7 @@ class PhysicalHashJoin(PhysicalPlanNode):
                     build_rows = hash_table[probe_key]
                     for build_batch_idx, build_row_idx in build_rows:
                         build_batch = build_batches[build_batch_idx]
+                        matched_build_rows.add((build_batch_idx, build_row_idx))
                         joined = self._join_rows(
                             probe_batch, probe_row_idx, build_batch, build_row_idx
                         )
@@ -334,6 +336,12 @@ class PhysicalHashJoin(PhysicalPlanNode):
                 else:
                     if self.join_type in (JoinType.LEFT, JoinType.FULL):
                         yield self._create_left_outer_row(probe_batch, probe_row_idx)
+
+        if self.join_type == JoinType.FULL:
+            for build_batch_idx, build_batch in enumerate(build_batches):
+                for build_row_idx in range(build_batch.num_rows):
+                    if (build_batch_idx, build_row_idx) not in matched_build_rows:
+                        yield self._create_right_outer_row(build_batch, build_row_idx)
 
     def _extract_key_values(
         self, batch: pa.RecordBatch, keys: List[Expression]
@@ -433,6 +441,35 @@ class PhysicalHashJoin(PhysicalPlanNode):
 
         return pa.RecordBatch.from_arrays(arrays, names=names)
 
+    def _create_right_outer_row(
+        self, right_batch: pa.RecordBatch, right_row_idx: int
+    ) -> pa.RecordBatch:
+        """Create single row with NULLs for left side and data from right side."""
+        left_schema = self.left.schema()
+
+        arrays = []
+        names = []
+
+        for field in left_schema:
+            null_array = pa.array([None], type=field.type)
+            arrays.append(null_array)
+            names.append(field.name)
+
+        for i in range(right_batch.num_columns):
+            col = right_batch.column(i)
+            field = right_batch.schema.field(i)
+            name = field.name
+
+            if name in names:
+                name = f"right_{name}"
+
+            scalar_val = col[right_row_idx]
+            arr = pa.array([scalar_val.as_py()], type=field.type)
+            arrays.append(arr)
+            names.append(name)
+
+        return pa.RecordBatch.from_arrays(arrays, names=names)
+
     def schema(self) -> pa.Schema:
         """Combine schemas from both sides."""
         left_schema = self.left.schema()
@@ -487,11 +524,13 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
                     yield self._create_left_outer_batch(batch)
             return
 
+        matched_right_rows = set()
+
         for left_batch in self.left.execute():
             for left_row_idx in range(left_batch.num_rows):
                 matched = False
 
-                for right_batch in right_batches:
+                for right_batch_idx, right_batch in enumerate(right_batches):
                     for right_row_idx in range(right_batch.num_rows):
                         if self.condition is None or self._evaluate_condition(
                             left_batch, left_row_idx, right_batch, right_row_idx
@@ -500,9 +539,16 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
                                 left_batch, left_row_idx, right_batch, right_row_idx
                             )
                             matched = True
+                            matched_right_rows.add((right_batch_idx, right_row_idx))
 
                 if not matched and self.join_type in (JoinType.LEFT, JoinType.FULL):
                     yield self._create_left_outer_row(left_batch, left_row_idx)
+
+        if self.join_type == JoinType.FULL:
+            for right_batch_idx, right_batch in enumerate(right_batches):
+                for right_row_idx in range(right_batch.num_rows):
+                    if (right_batch_idx, right_row_idx) not in matched_right_rows:
+                        yield self._create_right_outer_row(right_batch, right_row_idx)
 
     def _evaluate_condition(
         self,
@@ -634,6 +680,35 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
                 name = f"right_{name}"
             null_array = pa.array([None], type=field.type)
             arrays.append(null_array)
+            names.append(name)
+
+        return pa.RecordBatch.from_arrays(arrays, names=names)
+
+    def _create_right_outer_row(
+        self, right_batch: pa.RecordBatch, right_row_idx: int
+    ) -> pa.RecordBatch:
+        """Create single row with NULLs for left side and data from right side."""
+        left_schema = self.left.schema()
+
+        arrays = []
+        names = []
+
+        for field in left_schema:
+            null_array = pa.array([None], type=field.type)
+            arrays.append(null_array)
+            names.append(field.name)
+
+        for i in range(right_batch.num_columns):
+            col = right_batch.column(i)
+            field = right_batch.schema.field(i)
+            name = field.name
+
+            if name in names:
+                name = f"right_{name}"
+
+            scalar_val = col[right_row_idx]
+            arr = pa.array([scalar_val.as_py()], type=field.type)
+            arrays.append(arr)
             names.append(name)
 
         return pa.RecordBatch.from_arrays(arrays, names=names)
