@@ -123,6 +123,7 @@ class Parser:
             return self._build_join_plan(select, table_expr, joins)
 
         table_parts = self._extract_table_parts(table_expr)
+        table_alias = self._extract_table_alias(table_expr)
         all_columns = self._collect_needed_columns(select)
 
         datasource = table_parts[0]
@@ -134,6 +135,7 @@ class Parser:
             schema_name=schema_name,
             table_name=table_name,
             columns=all_columns,
+            alias=table_alias,
         )
 
     def _build_join_plan(
@@ -157,6 +159,7 @@ class Parser:
             schema_name=left_table_parts[1],
             table_name=left_table_parts[2],
             columns=["*"],
+            alias=left_table_alias,
         )
 
         current_plan = left_plan
@@ -171,6 +174,7 @@ class Parser:
                 schema_name=right_table_parts[1],
                 table_name=right_table_parts[2],
                 columns=["*"],
+                alias=right_table_alias,
             )
 
             join_type = self._extract_join_type(join_clause)
@@ -196,9 +200,10 @@ class Parser:
         Returns:
             Table alias or table name if no alias
         """
-        if table_expr.alias:
-            return table_expr.alias
-        return table_expr.name
+        alias = table_expr.alias
+        if alias:
+            return str(alias)
+        return str(table_expr.alias_or_name)
 
     def _filter_columns_for_table(
         self, columns: List[str], table_alias: Optional[str]

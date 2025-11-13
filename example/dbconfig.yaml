@@ -4,7 +4,7 @@ datasources:
     host: localhost
     port: 5466
     database: analytics
-    user: abadur
+    user: aybarsb
     password: ''
     schemas: [public]
     capabilities: [aggregations, joins, window_functions]

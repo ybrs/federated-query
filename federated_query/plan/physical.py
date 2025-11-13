@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional, Iterator, Any, TYPE_CHECKING, Dict, Callable
+from typing import List, Optional, Iterator, Any, TYPE_CHECKING, Dict, Callable, Set
 from enum import Enum
 
 import pyarrow as pa
@@ -61,6 +61,7 @@ class PhysicalScan(PhysicalPlanNode):
     group_by: Optional[List[Expression]] = None  # Optional GROUP BY expressions
     aggregates: Optional[List[Expression]] = None  # Optional aggregate expressions
     output_names: Optional[List[str]] = None  # Output column names when using aggregates
+    alias: Optional[str] = None  # Table alias (if any)
 
     def children(self) -> List[PhysicalPlanNode]:
         return []
@@ -121,7 +122,10 @@ class PhysicalScan(PhysicalPlanNode):
 
     def _format_table_ref(self) -> str:
         """Format table reference for SQL."""
-        return f'"{self.schema_name}"."{self.table_name}"'
+        ref = f'"{self.schema_name}"."{self.table_name}"'
+        if self.alias:
+            return f'{ref} AS {self.alias}'
+        return ref
 
     def _format_group_by(self) -> str:
         """Format GROUP BY clause."""
@@ -152,6 +156,8 @@ class PhysicalScan(PhysicalPlanNode):
 
     def __repr__(self) -> str:
         table_ref = f"{self.datasource}.{self.schema_name}.{self.table_name}"
+        if self.alias:
+            return f"PhysicalScan({table_ref} AS {self.alias})"
         return f"PhysicalScan({table_ref})"
 
 
@@ -609,6 +615,128 @@ class PhysicalHashJoin(PhysicalPlanNode):
 
     def __repr__(self) -> str:
         return f"PhysicalHashJoin({self.join_type.value}, build={self.build_side})"
+
+
+@dataclass
+class PhysicalRemoteJoin(PhysicalPlanNode):
+    """Join executed directly on a single data source."""
+
+    left: PhysicalScan
+    right: PhysicalScan
+    join_type: JoinType
+    condition: Expression
+    datasource_connection: Any
+    _schema: Optional[pa.Schema] = None
+
+    def children(self) -> List[PhysicalPlanNode]:
+        return []
+
+    def execute(self) -> Iterator[pa.RecordBatch]:
+        query = self._build_query()
+        self.datasource_connection.ensure_connected()
+        batches = self.datasource_connection.execute_query(query)
+        for batch in batches:
+            yield batch
+
+    def schema(self) -> pa.Schema:
+        if self._schema is None:
+            query = self._build_query()
+            self._schema = self.datasource_connection.get_query_schema(query)
+        return self._schema
+
+    def estimated_cost(self) -> float:
+        raise NotImplementedError("Cost estimation not yet implemented")
+
+    def __repr__(self) -> str:
+        return f"PhysicalRemoteJoin({self.join_type.value})"
+
+    def _build_query(self) -> str:
+        select_clause = self._build_select_clause()
+        from_clause = self._build_from_clause()
+        join_clause = self._build_join_clause()
+        where_clause = self._build_where_clause()
+        query = f"SELECT {select_clause} {from_clause} {join_clause}"
+        if where_clause:
+            query = f"{query} WHERE {where_clause}"
+        return query
+
+    def _build_select_clause(self) -> str:
+        items = []
+        seen = set()
+        self._append_select_items(self.left, items, seen, False)
+        self._append_select_items(self.right, items, seen, True)
+        return ", ".join(items)
+
+    def _append_select_items(
+        self,
+        scan: PhysicalScan,
+        items: List[str],
+        seen: Set[str],
+        is_right: bool
+    ) -> None:
+        columns = self._resolve_columns(scan)
+        alias = self._scan_alias(scan)
+        for column in columns:
+            source = self._format_column(alias, column)
+            output = self._select_output_name(column, seen, is_right)
+            items.append(f'{source} AS "{output}"')
+            seen.add(output)
+
+    def _resolve_columns(self, scan: PhysicalScan) -> List[str]:
+        if scan.columns and "*" in scan.columns:
+            schema = scan.schema()
+            names = []
+            for field in schema:
+                names.append(field.name)
+            return names
+        return scan.columns
+
+    def _format_column(self, alias: str, column: str) -> str:
+        return f'{alias}."{column}"'
+
+    def _select_output_name(
+        self,
+        column: str,
+        seen: Set[str],
+        is_right: bool
+    ) -> str:
+        name = column
+        if is_right and name in seen:
+            name = f"right_{name}"
+        return name
+
+    def _build_from_clause(self) -> str:
+        return f"FROM {self.left._format_table_ref()}"
+
+    def _build_join_clause(self) -> str:
+        keyword = self._join_keyword()
+        table_ref = self.right._format_table_ref()
+        return f"{keyword} {table_ref} ON {self.condition.to_sql()}"
+
+    def _join_keyword(self) -> str:
+        return f"{self.join_type.value} JOIN"
+
+    def _build_where_clause(self) -> str:
+        predicates = []
+        self._append_filter(self.left.filters, predicates)
+        self._append_filter(self.right.filters, predicates)
+        if not predicates:
+            return ""
+        return " AND ".join(predicates)
+
+    def _append_filter(
+        self,
+        expr: Optional[Expression],
+        predicates: List[str]
+    ) -> None:
+        if expr is None:
+            return
+        predicates.append(f"({expr.to_sql()})")
+
+    def _scan_alias(self, scan: PhysicalScan) -> str:
+        if scan.alias:
+            return scan.alias
+        return scan.table_name
 
 
 @dataclass
@@ -1380,6 +1508,7 @@ class _PlanFormatter:
         self._detail_builders[PhysicalFilter] = self._filter_detail
         self._detail_builders[PhysicalLimit] = self._limit_detail
         self._detail_builders[PhysicalHashJoin] = self._hash_join_detail
+        self._detail_builders[PhysicalRemoteJoin] = self._remote_join_detail
         self._detail_builders[PhysicalNestedLoopJoin] = self._nested_loop_join_detail
         self._detail_builders[PhysicalHashAggregate] = self._aggregate_detail
         self._detail_builders[PhysicalSort] = self._sort_detail
@@ -1453,6 +1582,11 @@ class _PlanFormatter:
         if right_keys:
             info = f"{info} right_keys={right_keys}"
         return f"{info} build_side={node.build_side}"
+
+    def _remote_join_detail(self, node: PhysicalRemoteJoin) -> str:
+        left = f"{node.left.schema_name}.{node.left.table_name}"
+        right = f"{node.right.schema_name}.{node.right.table_name}"
+        return f"type={node.join_type.value} sources={left}⨝{right}"
 
     def _nested_loop_join_detail(self, node: PhysicalNestedLoopJoin) -> str:
         info = f"type={node.join_type.value}"

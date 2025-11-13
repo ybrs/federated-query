@@ -67,6 +67,15 @@ def setup_capturing_db():
         )
     """)
 
+    # Create customers table for join tests
+    ds.connection.execute("""
+        CREATE TABLE customers (
+            customer_id INTEGER,
+            name VARCHAR,
+            region VARCHAR
+        )
+    """)
+
     ds.connection.execute("""
         INSERT INTO orders VALUES
         (1, 100, 50.0, 'completed'),
@@ -79,6 +88,14 @@ def setup_capturing_db():
         (8, 100, 75.0, 'completed'),
         (9, 105, 300.0, 'completed'),
         (10, 102, 50.0, 'completed')
+    """)
+
+    ds.connection.execute("""
+        INSERT INTO customers VALUES
+        (100, 'Alice', 'East'),
+        (101, 'Bob', 'West'),
+        (102, 'Carol', 'West'),
+        (103, 'Derek', 'East')
     """)
 
     catalog = Catalog()
@@ -496,3 +513,48 @@ class TestBuggyAggregates:
 
         # Only WHERE should be pushed
         assert "WHERE" in query.upper(), f"WHERE should still be pushed: {query}"
+
+
+class TestJoinPushdownReal:
+    """Real tests for join pushdown behavior."""
+
+    def test_inner_join_executes_single_remote_query(self, setup_capturing_db):
+        """INNER JOIN on same source should run as one query."""
+        catalog, ds = setup_capturing_db
+        sql = """
+            SELECT c.customer_id, o.order_id
+            FROM testdb.main.customers c
+            JOIN testdb.main.orders o ON c.customer_id = o.customer_id
+        """
+        query, results = execute_and_capture(sql, catalog, ds)
+        assert len(ds.captured_queries) == 1, "Join should run as single query"
+        assert "JOIN" in query.upper(), f"Expected JOIN in pushed SQL: {query}"
+        rows = []
+        for batch in results:
+            data = batch.to_pydict()
+            for idx in range(batch.num_rows):
+                row = (data["customer_id"][idx], data["order_id"][idx])
+                rows.append(row)
+        assert len(rows) == 8, f"Expected 8 joined rows, got {len(rows)}"
+        for customer_id, _ in rows:
+            assert customer_id != 104, "Unmatched customers should not appear in INNER JOIN results"
+
+    def test_left_join_falls_back_to_local_execution(self, setup_capturing_db):
+        """LEFT JOIN should still use local execution (no pushdown)."""
+        catalog, ds = setup_capturing_db
+        sql = """
+            SELECT c.customer_id, o.order_id
+            FROM testdb.main.customers c
+            LEFT JOIN testdb.main.orders o ON c.customer_id = o.customer_id
+        """
+        _, results = execute_and_capture(sql, catalog, ds)
+        assert len(ds.captured_queries) == 2, "Fallback should query each table separately"
+        saw_join_sql = False
+        for text in ds.captured_queries:
+            if "JOIN" in text.upper():
+                saw_join_sql = True
+        assert not saw_join_sql, "Fallback path should not issue JOIN SQL"
+        total_rows = 0
+        for batch in results:
+            total_rows += batch.num_rows
+        assert total_rows == 8, f"Expected 8 rows from LEFT JOIN, got {total_rows}"

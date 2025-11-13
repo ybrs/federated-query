@@ -2,7 +2,7 @@
 
 from typing import Dict
 from ..catalog.catalog import Catalog
-from ..datasources.base import DataSource
+from ..datasources.base import DataSource, DataSourceCapability
 from ..plan.logical import (
     LogicalPlanNode,
     Scan,
@@ -12,6 +12,7 @@ from ..plan.logical import (
     Join,
     Aggregate,
     Explain,
+    JoinType,
 )
 from ..plan.physical import (
     PhysicalPlanNode,
@@ -20,6 +21,7 @@ from ..plan.physical import (
     PhysicalFilter,
     PhysicalLimit,
     PhysicalHashJoin,
+    PhysicalRemoteJoin,
     PhysicalNestedLoopJoin,
     PhysicalHashAggregate,
     PhysicalExplain,
@@ -85,6 +87,7 @@ class PhysicalPlanner:
             group_by=scan.group_by,
             aggregates=scan.aggregates,
             output_names=scan.output_names,
+            alias=scan.alias,
         )
 
     def _plan_filter(self, filter_node: Filter) -> PhysicalFilter:
@@ -128,6 +131,10 @@ class PhysicalPlanner:
         left_plan = self._plan_node(join.left)
         right_plan = self._plan_node(join.right)
 
+        remote = self._try_plan_remote_join(join, left_plan, right_plan)
+        if remote:
+            return remote
+
         if join.condition is None:
             return PhysicalNestedLoopJoin(
                 left=left_plan,
@@ -154,6 +161,47 @@ class PhysicalPlanner:
             join_type=join.join_type,
             condition=join.condition,
         )
+
+    def _try_plan_remote_join(
+        self,
+        join: Join,
+        left_plan: PhysicalPlanNode,
+        right_plan: PhysicalPlanNode
+    ) -> Optional[PhysicalPlanNode]:
+        if not self._is_remote_join_candidate(join, left_plan, right_plan):
+            return None
+        return PhysicalRemoteJoin(
+            left=left_plan,
+            right=right_plan,
+            join_type=join.join_type,
+            condition=join.condition,
+            datasource_connection=left_plan.datasource_connection,
+        )
+
+    def _is_remote_join_candidate(
+        self,
+        join: Join,
+        left_plan: PhysicalPlanNode,
+        right_plan: PhysicalPlanNode
+    ) -> bool:
+        if join.join_type != JoinType.INNER or join.condition is None:
+            return False
+        if not isinstance(left_plan, PhysicalScan):
+            return False
+        if not isinstance(right_plan, PhysicalScan):
+            return False
+        if left_plan.datasource != right_plan.datasource:
+            return False
+        ds = left_plan.datasource_connection
+        if ds is None or ds != right_plan.datasource_connection:
+            return False
+        if not ds.supports_capability(DataSourceCapability.JOINS):
+            return False
+        if left_plan.group_by or left_plan.aggregates:
+            return False
+        if right_plan.group_by or right_plan.aggregates:
+            return False
+        return self._extract_join_keys(join.condition) is not None
 
     def _extract_join_keys(
         self, condition: Optional[BinaryOp]
