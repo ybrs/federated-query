@@ -422,3 +422,78 @@ class TestBuggyAggregates:
         }
 
         assert customer_sums == expected, f"Expected {expected}, got {customer_sums}"
+
+    def test_exact_user_query_count_order_id_group_by(self, setup_capturing_db):
+        """Test the EXACT query the user is sending in CLI.
+
+        Query: SELECT COUNT(order_id) FROM orders WHERE order_id > 1 GROUP BY order_id
+
+        This test MUST verify that COUNT and GROUP BY are pushed to the data source.
+        If they are NOT pushed, this test will FAIL.
+        """
+        catalog, ds = setup_capturing_db
+
+        sql = "SELECT COUNT(order_id) FROM testdb.main.orders WHERE order_id > 1 GROUP BY order_id"
+        query, results = execute_and_capture(sql, catalog, ds)
+
+        print(f"\nDEBUG: SQL sent to data source: {query}")
+
+        # CRITICAL: COUNT must be in the query sent to data source
+        assert "COUNT" in query.upper(), f"COUNT was NOT pushed down! Query: {query}"
+
+        # CRITICAL: GROUP BY must be in the query sent to data source
+        assert "GROUP BY" in query.upper(), f"GROUP BY was NOT pushed down! Query: {query}"
+
+        # Verify WHERE is also pushed
+        assert "WHERE" in query.upper(), f"WHERE was NOT pushed down! Query: {query}"
+        assert "order_id" in query, f"order_id not in query: {query}"
+
+        print(f"SUCCESS: Query correctly pushed COUNT, GROUP BY, and WHERE to data source")
+
+    def test_exact_user_query_WITHOUT_aggregate_pushdown_rule(self, setup_capturing_db):
+        """Test the EXACT query the user is sending - using CLI's optimizer setup.
+
+        THIS TEST WILL FAIL because the CLI doesn't use AggregatePushdownRule!
+
+        Query: SELECT COUNT(order_id) FROM orders WHERE order_id > 1 GROUP BY order_id
+
+        This replicates the EXACT optimizer setup from fedq.py lines 45-48.
+        """
+        catalog, ds = setup_capturing_db
+
+        sql = "SELECT COUNT(order_id) FROM testdb.main.orders WHERE order_id > 1 GROUP BY order_id"
+
+        ds.clear_queries()
+
+        parser = Parser()
+        logical_plan = parser.parse_to_logical_plan(sql)
+
+        binder = Binder(catalog)
+        bound_plan = binder.bind(logical_plan)
+
+        # THIS IS THE EXACT SETUP FROM CLI (fedq.py lines 45-48)
+        # NOTE: AggregatePushdownRule is MISSING!
+        optimizer = RuleBasedOptimizer(catalog)
+        optimizer.add_rule(ExpressionSimplificationRule())
+        optimizer.add_rule(PredicatePushdownRule())
+        optimizer.add_rule(ProjectionPushdownRule())
+        optimizer.add_rule(LimitPushdownRule())
+        # <-- AggregatePushdownRule is NOT added (same as CLI)
+        optimized_plan = optimizer.optimize(bound_plan)
+
+        planner = PhysicalPlanner(catalog)
+        physical_plan = planner.plan(optimized_plan)
+
+        executor = Executor()
+        results = list(executor.execute(physical_plan))
+
+        query = ds.get_last_query()
+
+        print(f"\nDEBUG: SQL sent to data source: {query}")
+        print(f"THIS IS WHAT THE CLI SENDS (WITHOUT AggregatePushdownRule)")
+
+        # THIS WILL FAIL - COUNT is NOT pushed down
+        assert "COUNT" in query.upper(), f"COUNT was NOT pushed down! Query: {query}"
+
+        # THIS WILL FAIL - GROUP BY is NOT pushed down
+        assert "GROUP BY" in query.upper(), f"GROUP BY was NOT pushed down! Query: {query}"
