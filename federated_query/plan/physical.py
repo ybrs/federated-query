@@ -139,17 +139,24 @@ class PhysicalProject(PhysicalPlanNode):
         from .expressions import ColumnRef
 
         columns = []
-        for expr in self.expressions:
+        output_names = []
+
+        for i, expr in enumerate(self.expressions):
             if isinstance(expr, ColumnRef):
                 if expr.column == "*":
-                    return batch
-                column_data = batch.column(expr.column)
-                columns.append(column_data)
+                    for col_idx in range(batch.num_columns):
+                        columns.append(batch.column(col_idx))
+                        output_names.append(batch.schema.field(col_idx).name)
+                else:
+                    column_data = batch.column(expr.column)
+                    columns.append(column_data)
+                    output_names.append(self.output_names[i])
             else:
                 evaluated = self._evaluate_expression(expr, batch)
                 columns.append(evaluated)
+                output_names.append(self.output_names[i])
 
-        return pa.RecordBatch.from_arrays(columns, names=self.output_names)
+        return pa.RecordBatch.from_arrays(columns, names=output_names)
 
     def _evaluate_expression(self, expr: Expression, batch: pa.RecordBatch) -> pa.Array:
         """Evaluate expression on batch."""
@@ -165,12 +172,13 @@ class PhysicalProject(PhysicalPlanNode):
         for i, expr in enumerate(self.expressions):
             if isinstance(expr, ColumnRef):
                 if expr.column == "*":
-                    return input_schema
-
-                field_index = input_schema.get_field_index(expr.column)
-                field = input_schema.field(field_index)
-                new_field = pa.field(self.output_names[i], field.type)
-                fields.append(new_field)
+                    for field in input_schema:
+                        fields.append(field)
+                else:
+                    field_index = input_schema.get_field_index(expr.column)
+                    field = input_schema.field(field_index)
+                    new_field = pa.field(self.output_names[i], field.type)
+                    fields.append(new_field)
             else:
                 raise NotImplementedError(f"Schema inference not implemented for {type(expr)}")
 
@@ -286,14 +294,17 @@ class PhysicalHashJoin(PhysicalPlanNode):
             probe_node = self.left
             build_keys = self.right_keys
             probe_keys = self.left_keys
+            probe_is_left = True
         else:
             build_node = self.left
             probe_node = self.right
             build_keys = self.left_keys
             probe_keys = self.right_keys
+            probe_is_left = False
 
         hash_table = defaultdict(list)
         build_batches = []
+        matched_build_rows = set()
 
         for batch in build_node.execute():
             build_batches.append(batch)
@@ -304,9 +315,17 @@ class PhysicalHashJoin(PhysicalPlanNode):
                 hash_table[key].append((len(build_batches) - 1, row_idx))
 
         if len(hash_table) == 0:
-            if self.join_type in (JoinType.LEFT, JoinType.FULL):
+            need_probe_outer = (
+                (self.join_type == JoinType.LEFT and probe_is_left) or
+                (self.join_type == JoinType.RIGHT and not probe_is_left) or
+                (self.join_type == JoinType.FULL)
+            )
+            if need_probe_outer:
                 for batch in probe_node.execute():
-                    yield self._create_left_outer_batch(batch)
+                    if probe_is_left:
+                        yield self._create_left_outer_batch(batch)
+                    else:
+                        yield self._create_right_outer_batch(batch)
             return
 
         for probe_batch in probe_node.execute():
@@ -319,13 +338,36 @@ class PhysicalHashJoin(PhysicalPlanNode):
                     build_rows = hash_table[probe_key]
                     for build_batch_idx, build_row_idx in build_rows:
                         build_batch = build_batches[build_batch_idx]
+                        matched_build_rows.add((build_batch_idx, build_row_idx))
                         joined = self._join_rows(
                             probe_batch, probe_row_idx, build_batch, build_row_idx
                         )
                         yield joined
                 else:
-                    if self.join_type in (JoinType.LEFT, JoinType.FULL):
-                        yield self._create_left_outer_row(probe_batch, probe_row_idx)
+                    need_probe_outer = (
+                        (self.join_type == JoinType.LEFT and probe_is_left) or
+                        (self.join_type == JoinType.RIGHT and not probe_is_left) or
+                        (self.join_type == JoinType.FULL)
+                    )
+                    if need_probe_outer:
+                        if probe_is_left:
+                            yield self._create_left_outer_row(probe_batch, probe_row_idx)
+                        else:
+                            yield self._create_right_outer_row(probe_batch, probe_row_idx)
+
+        need_build_outer = (
+            (self.join_type == JoinType.RIGHT and probe_is_left) or
+            (self.join_type == JoinType.LEFT and not probe_is_left) or
+            (self.join_type == JoinType.FULL)
+        )
+        if need_build_outer:
+            for build_batch_idx, build_batch in enumerate(build_batches):
+                for build_row_idx in range(build_batch.num_rows):
+                    if (build_batch_idx, build_row_idx) not in matched_build_rows:
+                        if probe_is_left:
+                            yield self._create_right_outer_row(build_batch, build_row_idx)
+                        else:
+                            yield self._create_left_outer_row_from_batch(build_batch, build_row_idx)
 
     def _extract_key_values(
         self, batch: pa.RecordBatch, keys: List[Expression]
@@ -378,13 +420,130 @@ class PhysicalHashJoin(PhysicalPlanNode):
 
     def _create_left_outer_batch(self, left_batch: pa.RecordBatch) -> pa.RecordBatch:
         """Create batch with NULLs for right side (for LEFT OUTER JOIN)."""
-        raise NotImplementedError("LEFT OUTER JOIN not yet fully implemented")
+        right_schema = self.right.schema()
+
+        arrays = []
+        names = []
+
+        for i in range(left_batch.num_columns):
+            arrays.append(left_batch.column(i))
+            field = left_batch.schema.field(i)
+            names.append(field.name)
+
+        for field in right_schema:
+            name = field.name
+            if name in names:
+                name = f"right_{name}"
+            null_array = pa.array([None] * left_batch.num_rows, type=field.type)
+            arrays.append(null_array)
+            names.append(name)
+
+        return pa.RecordBatch.from_arrays(arrays, names=names)
 
     def _create_left_outer_row(
         self, left_batch: pa.RecordBatch, left_row_idx: int
     ) -> pa.RecordBatch:
         """Create single row with NULLs for right side."""
-        raise NotImplementedError("LEFT OUTER JOIN not yet fully implemented")
+        right_schema = self.right.schema()
+
+        arrays = []
+        names = []
+
+        for i in range(left_batch.num_columns):
+            col = left_batch.column(i)
+            field = left_batch.schema.field(i)
+            scalar_val = col[left_row_idx]
+            arr = pa.array([scalar_val.as_py()], type=field.type)
+            arrays.append(arr)
+            names.append(field.name)
+
+        for field in right_schema:
+            name = field.name
+            if name in names:
+                name = f"right_{name}"
+            null_array = pa.array([None], type=field.type)
+            arrays.append(null_array)
+            names.append(name)
+
+        return pa.RecordBatch.from_arrays(arrays, names=names)
+
+    def _create_right_outer_row(
+        self, right_batch: pa.RecordBatch, right_row_idx: int
+    ) -> pa.RecordBatch:
+        """Create single row with NULLs for left side and data from right side."""
+        left_schema = self.left.schema()
+
+        arrays = []
+        names = []
+
+        for field in left_schema:
+            null_array = pa.array([None], type=field.type)
+            arrays.append(null_array)
+            names.append(field.name)
+
+        for i in range(right_batch.num_columns):
+            col = right_batch.column(i)
+            field = right_batch.schema.field(i)
+            name = field.name
+
+            if name in names:
+                name = f"right_{name}"
+
+            scalar_val = col[right_row_idx]
+            arr = pa.array([scalar_val.as_py()], type=field.type)
+            arrays.append(arr)
+            names.append(name)
+
+        return pa.RecordBatch.from_arrays(arrays, names=names)
+
+    def _create_right_outer_batch(self, right_batch: pa.RecordBatch) -> pa.RecordBatch:
+        """Create batch with NULLs for left side (for RIGHT OUTER JOIN)."""
+        left_schema = self.left.schema()
+
+        arrays = []
+        names = []
+
+        for field in left_schema:
+            null_array = pa.array([None] * right_batch.num_rows, type=field.type)
+            arrays.append(null_array)
+            names.append(field.name)
+
+        for i in range(right_batch.num_columns):
+            field = right_batch.schema.field(i)
+            name = field.name
+            if name in names:
+                name = f"right_{name}"
+            arrays.append(right_batch.column(i))
+            names.append(name)
+
+        return pa.RecordBatch.from_arrays(arrays, names=names)
+
+    def _create_left_outer_row_from_batch(
+        self, left_batch: pa.RecordBatch, left_row_idx: int
+    ) -> pa.RecordBatch:
+        """Create single row from left batch with NULLs for right side."""
+        right_schema = self.right.schema()
+
+        arrays = []
+        names = []
+
+        for i in range(left_batch.num_columns):
+            col = left_batch.column(i)
+            field = left_batch.schema.field(i)
+            scalar_val = col[left_row_idx]
+            arr = pa.array([scalar_val.as_py()], type=field.type)
+            arrays.append(arr)
+            names.append(field.name)
+
+        for field in right_schema:
+            name = field.name
+            if name in names:
+                name = f"right_{name}"
+            null_array = pa.array([None], type=field.type)
+            arrays.append(null_array)
+            names.append(name)
+
+        return pa.RecordBatch.from_arrays(arrays, names=names)
 
     def schema(self) -> pa.Schema:
         """Combine schemas from both sides."""
@@ -440,11 +599,13 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
                     yield self._create_left_outer_batch(batch)
             return
 
+        matched_right_rows = set()
+
         for left_batch in self.left.execute():
             for left_row_idx in range(left_batch.num_rows):
                 matched = False
 
-                for right_batch in right_batches:
+                for right_batch_idx, right_batch in enumerate(right_batches):
                     for right_row_idx in range(right_batch.num_rows):
                         if self.condition is None or self._evaluate_condition(
                             left_batch, left_row_idx, right_batch, right_row_idx
@@ -453,9 +614,16 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
                                 left_batch, left_row_idx, right_batch, right_row_idx
                             )
                             matched = True
+                            matched_right_rows.add((right_batch_idx, right_row_idx))
 
                 if not matched and self.join_type in (JoinType.LEFT, JoinType.FULL):
                     yield self._create_left_outer_row(left_batch, left_row_idx)
+
+        if self.join_type in (JoinType.RIGHT, JoinType.FULL):
+            for right_batch_idx, right_batch in enumerate(right_batches):
+                for right_row_idx in range(right_batch.num_rows):
+                    if (right_batch_idx, right_row_idx) not in matched_right_rows:
+                        yield self._create_right_outer_row(right_batch, right_row_idx)
 
     def _evaluate_condition(
         self,
@@ -474,7 +642,7 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
         joined = self._join_rows(left_batch, left_row_idx, right_batch, right_row_idx)
         result = self._evaluate_expression_on_batch(self.condition, joined)
 
-        return result[0].as_py() if result.length() > 0 else False
+        return result[0].as_py() if len(result) > 0 else False
 
     def _evaluate_expression_on_batch(
         self, expr: Expression, batch: pa.RecordBatch
@@ -544,13 +712,81 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
 
     def _create_left_outer_batch(self, left_batch: pa.RecordBatch) -> pa.RecordBatch:
         """Create batch with NULLs for right side."""
-        raise NotImplementedError("LEFT OUTER JOIN not yet fully implemented")
+        right_schema = self.right.schema()
+
+        arrays = []
+        names = []
+
+        for i in range(left_batch.num_columns):
+            arrays.append(left_batch.column(i))
+            field = left_batch.schema.field(i)
+            names.append(field.name)
+
+        for field in right_schema:
+            name = field.name
+            if name in names:
+                name = f"right_{name}"
+            null_array = pa.array([None] * left_batch.num_rows, type=field.type)
+            arrays.append(null_array)
+            names.append(name)
+
+        return pa.RecordBatch.from_arrays(arrays, names=names)
 
     def _create_left_outer_row(
         self, left_batch: pa.RecordBatch, left_row_idx: int
     ) -> pa.RecordBatch:
         """Create single row with NULLs for right side."""
-        raise NotImplementedError("LEFT OUTER JOIN not yet fully implemented")
+        right_schema = self.right.schema()
+
+        arrays = []
+        names = []
+
+        for i in range(left_batch.num_columns):
+            col = left_batch.column(i)
+            field = left_batch.schema.field(i)
+            scalar_val = col[left_row_idx]
+            arr = pa.array([scalar_val.as_py()], type=field.type)
+            arrays.append(arr)
+            names.append(field.name)
+
+        for field in right_schema:
+            name = field.name
+            if name in names:
+                name = f"right_{name}"
+            null_array = pa.array([None], type=field.type)
+            arrays.append(null_array)
+            names.append(name)
+
+        return pa.RecordBatch.from_arrays(arrays, names=names)
+
+    def _create_right_outer_row(
+        self, right_batch: pa.RecordBatch, right_row_idx: int
+    ) -> pa.RecordBatch:
+        """Create single row with NULLs for left side and data from right side."""
+        left_schema = self.left.schema()
+
+        arrays = []
+        names = []
+
+        for field in left_schema:
+            null_array = pa.array([None], type=field.type)
+            arrays.append(null_array)
+            names.append(field.name)
+
+        for i in range(right_batch.num_columns):
+            col = right_batch.column(i)
+            field = right_batch.schema.field(i)
+            name = field.name
+
+            if name in names:
+                name = f"right_{name}"
+
+            scalar_val = col[right_row_idx]
+            arr = pa.array([scalar_val.as_py()], type=field.type)
+            arrays.append(arr)
+            names.append(name)
+
+        return pa.RecordBatch.from_arrays(arrays, names=names)
 
     def schema(self) -> pa.Schema:
         """Combine schemas from both sides."""
