@@ -451,13 +451,13 @@ class TestBuggyAggregates:
         print(f"SUCCESS: Query correctly pushed COUNT, GROUP BY, and WHERE to data source")
 
     def test_exact_user_query_WITHOUT_aggregate_pushdown_rule(self, setup_capturing_db):
-        """Test the EXACT query the user is sending - using CLI's optimizer setup.
+        """Test what happens WITHOUT AggregatePushdownRule.
 
-        THIS TEST WILL FAIL because the CLI doesn't use AggregatePushdownRule!
+        This documents the broken behavior that existed before the CLI was fixed.
+        The CLI NOW includes AggregatePushdownRule, so this test just documents
+        what WOULD happen if you don't use it.
 
         Query: SELECT COUNT(order_id) FROM orders WHERE order_id > 1 GROUP BY order_id
-
-        This replicates the EXACT optimizer setup from fedq.py lines 45-48.
         """
         catalog, ds = setup_capturing_db
 
@@ -471,14 +471,13 @@ class TestBuggyAggregates:
         binder = Binder(catalog)
         bound_plan = binder.bind(logical_plan)
 
-        # THIS IS THE EXACT SETUP FROM CLI (fedq.py lines 45-48)
-        # NOTE: AggregatePushdownRule is MISSING!
+        # Optimizer WITHOUT AggregatePushdownRule (the old broken behavior)
         optimizer = RuleBasedOptimizer(catalog)
         optimizer.add_rule(ExpressionSimplificationRule())
         optimizer.add_rule(PredicatePushdownRule())
         optimizer.add_rule(ProjectionPushdownRule())
         optimizer.add_rule(LimitPushdownRule())
-        # <-- AggregatePushdownRule is NOT added (same as CLI)
+        # <-- AggregatePushdownRule is NOT added
         optimized_plan = optimizer.optimize(bound_plan)
 
         planner = PhysicalPlanner(catalog)
@@ -489,11 +488,11 @@ class TestBuggyAggregates:
 
         query = ds.get_last_query()
 
-        print(f"\nDEBUG: SQL sent to data source: {query}")
-        print(f"THIS IS WHAT THE CLI SENDS (WITHOUT AggregatePushdownRule)")
+        print(f"\nDEBUG: SQL WITHOUT AggregatePushdownRule: {query}")
 
-        # THIS WILL FAIL - COUNT is NOT pushed down
-        assert "COUNT" in query.upper(), f"COUNT was NOT pushed down! Query: {query}"
+        # Verify the broken behavior: COUNT and GROUP BY are NOT pushed
+        assert "COUNT" not in query.upper(), f"COUNT should NOT be pushed without rule! Query: {query}"
+        assert "GROUP BY" not in query.upper(), f"GROUP BY should NOT be pushed without rule! Query: {query}"
 
-        # THIS WILL FAIL - GROUP BY is NOT pushed down
-        assert "GROUP BY" in query.upper(), f"GROUP BY was NOT pushed down! Query: {query}"
+        # Only WHERE should be pushed
+        assert "WHERE" in query.upper(), f"WHERE should still be pushed: {query}"
