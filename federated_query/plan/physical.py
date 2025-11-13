@@ -975,17 +975,47 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         return pa.RecordBatch.from_arrays(columns, names=self.output_names)
 
     def _extract_column_values(self, hash_table: dict, col_idx: int) -> pa.Array:
-        """Extract values for a column."""
+        """Extract values for a column.
+
+        The aggregates list contains ALL expressions from SELECT clause:
+        - Non-aggregate columns (ColumnRef) - these match group_by expressions
+        - Aggregate functions (FunctionCall with is_aggregate=True)
+
+        Accumulators are indexed by position in aggregates (accumulator[i] for aggregates[i]).
+        """
+        from .expressions import FunctionCall
+
+        expr = self.aggregates[col_idx]
+
         values = []
         for group_key, accumulators in hash_table.items():
-            if col_idx < len(self.group_by):
-                values.append(group_key[col_idx] if group_key else None)
-            else:
-                agg_idx = col_idx
-                value = self._finalize_accumulator(accumulators[agg_idx])
+            # Check if this is an aggregate function
+            if isinstance(expr, FunctionCall) and expr.is_aggregate:
+                # Accumulators are indexed by position in aggregates
+                value = self._finalize_accumulator(accumulators[col_idx])
                 values.append(value)
+            else:
+                # This is a group-by column - find which one
+                group_idx = self._find_group_by_index(expr)
+                if group_idx is not None:
+                    values.append(group_key[group_idx] if group_key else None)
+                else:
+                    # Fallback: might be a constant or expression
+                    values.append(None)
 
         return pa.array(values)
+
+    def _find_group_by_index(self, expr: Expression) -> int:
+        """Find which group_by expression this matches."""
+        from .expressions import ColumnRef
+
+        # For now, simple match by column name
+        if isinstance(expr, ColumnRef):
+            for i, group_expr in enumerate(self.group_by):
+                if isinstance(group_expr, ColumnRef) and group_expr.column == expr.column:
+                    return i
+
+        return None
 
     def _finalize_accumulator(self, acc: dict):
         """Finalize accumulator to get final value."""

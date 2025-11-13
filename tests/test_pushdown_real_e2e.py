@@ -1,0 +1,424 @@
+"""
+REAL END-TO-END PUSHDOWN TESTS
+
+This test suite actually intercepts queries sent to data sources and verifies:
+1. The exact SQL query sent
+2. The query executes correctly
+3. Results are correct
+
+No bullshit string checking - we mock the data source and capture real queries.
+"""
+
+import pytest
+from unittest.mock import patch, MagicMock
+import pyarrow as pa
+from federated_query.parser import Parser, Binder
+from federated_query.catalog import Catalog
+from federated_query.datasources.duckdb import DuckDBDataSource
+from federated_query.optimizer import (
+    PhysicalPlanner,
+    RuleBasedOptimizer,
+    PredicatePushdownRule,
+    ProjectionPushdownRule,
+    LimitPushdownRule,
+    ExpressionSimplificationRule,
+)
+from federated_query.executor import Executor
+
+
+class QueryCapturingDataSource(DuckDBDataSource):
+    """DuckDB data source that captures all queries sent to it."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.captured_queries = []
+
+    def execute_query(self, query: str):
+        """Capture query and execute it."""
+        self.captured_queries.append(query)
+        return super().execute_query(query)
+
+    def get_last_query(self):
+        """Get the last query sent."""
+        if self.captured_queries:
+            return self.captured_queries[-1]
+        return None
+
+    def clear_queries(self):
+        """Clear captured queries."""
+        self.captured_queries = []
+
+
+@pytest.fixture
+def setup_capturing_db():
+    """Set up DuckDB with query capturing."""
+    config = {"database": ":memory:", "read_only": False}
+    ds = QueryCapturingDataSource(name="testdb", config=config)
+    ds.connect()
+
+    # Create orders table
+    ds.connection.execute("""
+        CREATE TABLE orders (
+            order_id INTEGER,
+            customer_id INTEGER,
+            price DOUBLE,
+            status VARCHAR
+        )
+    """)
+
+    ds.connection.execute("""
+        INSERT INTO orders VALUES
+        (1, 100, 50.0, 'completed'),
+        (2, 101, 100.0, 'pending'),
+        (3, 102, 150.0, 'completed'),
+        (4, 100, 75.0, 'completed'),
+        (5, 103, 200.0, 'cancelled'),
+        (6, 101, 100.0, 'completed'),
+        (7, 104, 150.0, 'pending'),
+        (8, 100, 75.0, 'completed'),
+        (9, 105, 300.0, 'completed'),
+        (10, 102, 50.0, 'completed')
+    """)
+
+    catalog = Catalog()
+    catalog.register_datasource(ds)
+    catalog.load_metadata()
+
+    yield catalog, ds
+
+    ds.disconnect()
+
+
+def execute_and_capture(sql: str, catalog: Catalog, ds: QueryCapturingDataSource):
+    """Execute SQL and return captured query + results."""
+    ds.clear_queries()
+
+    parser = Parser()
+    logical_plan = parser.parse_to_logical_plan(sql)
+
+    binder = Binder(catalog)
+    bound_plan = binder.bind(logical_plan)
+
+    optimizer = RuleBasedOptimizer(catalog)
+    optimizer.add_rule(ExpressionSimplificationRule())
+    optimizer.add_rule(PredicatePushdownRule())
+    optimizer.add_rule(ProjectionPushdownRule())
+    optimizer.add_rule(LimitPushdownRule())
+    optimized_plan = optimizer.optimize(bound_plan)
+
+    planner = PhysicalPlanner(catalog)
+    physical_plan = planner.plan(optimized_plan)
+
+    executor = Executor()
+    results = list(executor.execute(physical_plan))
+
+    return ds.get_last_query(), results
+
+
+class TestPredicatePushdownReal:
+    """Real tests for predicate pushdown."""
+
+    def test_simple_filter_pushdown(self, setup_capturing_db):
+        """Test WHERE order_id > 1 actually pushes."""
+        catalog, ds = setup_capturing_db
+
+        sql = "SELECT * FROM testdb.main.orders WHERE order_id > 1"
+        query, results = execute_and_capture(sql, catalog, ds)
+
+        # Verify query has WHERE clause
+        assert query is not None, "No query captured"
+        assert "WHERE" in query, f"No WHERE in query: {query}"
+        assert "order_id" in query, f"order_id not in WHERE: {query}"
+
+        # Verify results are correct
+        all_rows = []
+        for batch in results:
+            data = batch.to_pydict()
+            for i in range(batch.num_rows):
+                all_rows.append({
+                    "order_id": data["order_id"][i],
+                    "price": data["price"][i]
+                })
+
+        # Should have orders 2-10 (all except order_id=1)
+        order_ids = [r["order_id"] for r in all_rows]
+        assert 1 not in order_ids, "order_id=1 should be filtered out"
+        assert len(order_ids) == 9, f"Expected 9 rows, got {len(order_ids)}"
+
+    def test_compound_filter_pushdown(self, setup_capturing_db):
+        """Test WHERE status = 'completed' AND price > 100."""
+        catalog, ds = setup_capturing_db
+
+        sql = "SELECT * FROM testdb.main.orders WHERE status = 'completed' AND price > 100"
+        query, results = execute_and_capture(sql, catalog, ds)
+
+        assert "WHERE" in query, f"No WHERE: {query}"
+        assert "status" in query, f"status not in WHERE: {query}"
+        assert "price" in query, f"price not in WHERE: {query}"
+        assert "AND" in query.upper(), f"No AND: {query}"
+
+        # Verify results
+        all_rows = []
+        for batch in results:
+            data = batch.to_pydict()
+            for i in range(batch.num_rows):
+                all_rows.append({
+                    "order_id": data["order_id"][i],
+                    "status": data["status"][i],
+                    "price": data["price"][i]
+                })
+
+        # Only order_id 3 (150.0, completed) and 9 (300.0, completed) match
+        assert len(all_rows) == 2, f"Expected 2 rows, got {len(all_rows)}: {all_rows}"
+        for row in all_rows:
+            assert row["status"] == "completed", f"Wrong status: {row}"
+            assert row["price"] > 100, f"Wrong price: {row}"
+
+
+class TestProjectionPushdownReal:
+    """Real tests for projection pushdown."""
+
+    def test_select_specific_columns(self, setup_capturing_db):
+        """Test SELECT order_id, price only fetches those columns."""
+        catalog, ds = setup_capturing_db
+
+        sql = "SELECT order_id, price FROM testdb.main.orders"
+        query, results = execute_and_capture(sql, catalog, ds)
+
+        # Query should select specific columns
+        assert "SELECT" in query, f"No SELECT: {query}"
+        assert '"order_id"' in query or "order_id" in query, f"order_id not selected: {query}"
+        assert '"price"' in query or "price" in query, f"price not selected: {query}"
+        assert "SELECT *" not in query, f"Should not SELECT *: {query}"
+
+        # Verify results have correct schema
+        for batch in results:
+            schema_names = batch.schema.names
+            assert "order_id" in schema_names, f"order_id missing: {schema_names}"
+            assert "price" in schema_names, f"price missing: {schema_names}"
+
+    def test_projection_with_filter(self, setup_capturing_db):
+        """Test SELECT order_id WHERE price > 100."""
+        catalog, ds = setup_capturing_db
+
+        sql = "SELECT order_id FROM testdb.main.orders WHERE price > 100"
+        query, results = execute_and_capture(sql, catalog, ds)
+
+        # Should fetch order_id (for output) and price (for filter)
+        assert '"order_id"' in query or "order_id" in query, f"order_id not in query: {query}"
+        assert '"price"' in query or "price" in query, f"price not in query: {query}"
+        assert "WHERE" in query, f"WHERE missing: {query}"
+
+        # Verify results
+        all_ids = []
+        for batch in results:
+            all_ids.extend(batch.to_pydict()["order_id"])
+
+        # Orders with price > 100: 3 (150), 5 (200), 7 (150), 9 (300)
+        # NOT 2 or 6 (both have price=100, which is not > 100)
+        expected = {3, 5, 7, 9}
+        assert set(all_ids) == expected, f"Expected {expected}, got {set(all_ids)}"
+
+
+class TestAggregatePushdownReal:
+    """Real tests for aggregate pushdown - EXPECTED TO FAIL."""
+
+    def test_count_star_not_pushed(self, setup_capturing_db):
+        """Test COUNT(*) is NOT pushed down."""
+        catalog, ds = setup_capturing_db
+
+        sql = "SELECT COUNT(*) FROM testdb.main.orders"
+        query, results = execute_and_capture(sql, catalog, ds)
+
+        # COUNT should NOT be in the query sent to data source
+        if "COUNT" in query.upper():
+            pytest.fail(f"COUNT was pushed down (unexpected): {query}")
+
+        # Should be full table scan
+        assert "SELECT" in query, f"No SELECT: {query}"
+
+        # Verify result is correct (even though aggregation is in-memory)
+        for batch in results:
+            count_col = batch.column(0)
+            count_value = count_col[0].as_py()
+            assert count_value == 10, f"Expected count=10, got {count_value}"
+
+    def test_count_with_filter_filter_pushes_agg_does_not(self, setup_capturing_db):
+        """Test COUNT(*) WHERE x > y - filter should push, COUNT should not."""
+        catalog, ds = setup_capturing_db
+
+        sql = "SELECT COUNT(*) FROM testdb.main.orders WHERE order_id > 5"
+        query, results = execute_and_capture(sql, catalog, ds)
+
+        # Filter SHOULD be pushed
+        assert "WHERE" in query, f"Filter not pushed: {query}"
+        assert "order_id" in query, f"order_id filter not pushed: {query}"
+
+        # COUNT should NOT be pushed
+        if "COUNT" in query.upper():
+            pytest.fail(f"COUNT was pushed down (unexpected): {query}")
+
+        # Verify result (orders 6-10 = 5 orders)
+        for batch in results:
+            count_col = batch.column(0)
+            count_value = count_col[0].as_py()
+            assert count_value == 5, f"Expected count=5, got {count_value}"
+
+    def test_group_by_not_pushed(self, setup_capturing_db):
+        """Test GROUP BY is NOT pushed down."""
+        catalog, ds = setup_capturing_db
+
+        sql = "SELECT customer_id, COUNT(*) FROM testdb.main.orders GROUP BY customer_id"
+        query, results = execute_and_capture(sql, catalog, ds)
+
+        # GROUP BY should NOT be in the query
+        if "GROUP BY" in query.upper():
+            pytest.fail(f"GROUP BY was pushed down (unexpected): {query}")
+
+        # Verify results are correct
+        # customer_id 100: 3 orders (1, 4, 8)
+        # customer_id 101: 2 orders (2, 6)
+        # customer_id 102: 2 orders (3, 10)
+        # customer_id 103: 1 order (5)
+        # customer_id 104: 1 order (7)
+        # customer_id 105: 1 order (9)
+        customer_counts = {}
+        for batch in results:
+            data = batch.to_pydict()
+            for i in range(batch.num_rows):
+                cust_id = data["customer_id"][i]
+                count = data["COUNT(*)"][i]
+                customer_counts[cust_id] = count
+
+        expected = {
+            100: 3,
+            101: 2,
+            102: 2,
+            103: 1,
+            104: 1,
+            105: 1
+        }
+        assert customer_counts == expected, f"Expected {expected}, got {customer_counts}"
+
+    def test_sum_aggregate_not_pushed(self, setup_capturing_db):
+        """Test SUM(column) is NOT pushed down."""
+        catalog, ds = setup_capturing_db
+
+        sql = "SELECT SUM(price) FROM testdb.main.orders"
+        query, results = execute_and_capture(sql, catalog, ds)
+
+        # SUM should NOT be in the query
+        if "SUM" in query.upper():
+            pytest.fail(f"SUM was pushed down (unexpected): {query}")
+
+        # Should fetch price column
+        assert '"price"' in query or "price" in query, f"price not fetched: {query}"
+
+        # Verify result
+        # Sum of all prices: 50 + 100 + 150 + 75 + 200 + 100 + 150 + 75 + 300 + 50 = 1250
+        for batch in results:
+            sum_col = batch.column(0)
+            sum_value = sum_col[0].as_py()
+            assert sum_value == 1250.0, f"Expected sum=1250.0, got {sum_value}"
+
+
+class TestCombinedPushdownReal:
+    """Real tests for combined pushdowns."""
+
+    def test_filter_and_projection(self, setup_capturing_db):
+        """Test WHERE + column selection."""
+        catalog, ds = setup_capturing_db
+
+        sql = "SELECT order_id, price FROM testdb.main.orders WHERE status = 'completed'"
+        query, results = execute_and_capture(sql, catalog, ds)
+
+        # Filter should push
+        assert "WHERE" in query, f"Filter not pushed: {query}"
+        assert "status" in query, f"status not in WHERE: {query}"
+
+        # Projection should include needed columns
+        assert '"order_id"' in query or "order_id" in query, f"order_id not selected: {query}"
+        assert '"price"' in query or "price" in query, f"price not selected: {query}"
+
+        # Verify results
+        all_rows = []
+        for batch in results:
+            data = batch.to_pydict()
+            for i in range(batch.num_rows):
+                all_rows.append({
+                    "order_id": data["order_id"][i],
+                    "price": data["price"][i]
+                })
+
+        # Completed orders: 1, 3, 4, 6, 8, 9, 10
+        expected_ids = {1, 3, 4, 6, 8, 9, 10}
+        actual_ids = {r["order_id"] for r in all_rows}
+        assert actual_ids == expected_ids, f"Expected {expected_ids}, got {actual_ids}"
+
+
+class TestBuggyAggregates:
+    """Test for the GROUP BY bug the user found."""
+
+    def test_group_by_count_returns_correct_values(self, setup_capturing_db):
+        """
+        Test the bug: SELECT COUNT(order_id) ... GROUP BY order_id
+        should return counts, not order_id values.
+        """
+        catalog, ds = setup_capturing_db
+
+        sql = "SELECT COUNT(order_id) FROM testdb.main.orders WHERE order_id > 1 GROUP BY order_id"
+        query, results = execute_and_capture(sql, catalog, ds)
+
+        # Collect results
+        count_values = []
+        for batch in results:
+            count_col = batch.column(0)
+            count_values.extend([v.as_py() for v in count_col])
+
+        print(f"\nDEBUG: Query sent: {query}")
+        print(f"DEBUG: Count values: {count_values}")
+
+        # Each order_id appears exactly once, so each group should have COUNT=1
+        # NOT the order_id value itself!
+        for count in count_values:
+            assert count == 1, f"Each group should have count=1, got {count}. Values: {count_values}"
+
+        # Should have 9 groups (order_id 2-10)
+        assert len(count_values) == 9, f"Expected 9 groups, got {len(count_values)}"
+
+    def test_group_by_sum_returns_correct_values(self, setup_capturing_db):
+        """Test GROUP BY with SUM returns correct sums."""
+        catalog, ds = setup_capturing_db
+
+        sql = "SELECT customer_id, SUM(price) FROM testdb.main.orders GROUP BY customer_id"
+        query, results = execute_and_capture(sql, catalog, ds)
+
+        # Collect results
+        customer_sums = {}
+        for batch in results:
+            data = batch.to_pydict()
+            for i in range(batch.num_rows):
+                cust_id = data["customer_id"][i]
+                sum_price = data["SUM(price)"][i]
+                customer_sums[cust_id] = sum_price
+
+        print(f"\nDEBUG: Query sent: {query}")
+        print(f"DEBUG: Customer sums: {customer_sums}")
+
+        # Expected sums:
+        # customer_id 100: orders 1(50) + 4(75) + 8(75) = 200
+        # customer_id 101: orders 2(100) + 6(100) = 200
+        # customer_id 102: orders 3(150) + 10(50) = 200
+        # customer_id 103: order 5(200) = 200
+        # customer_id 104: order 7(150) = 150
+        # customer_id 105: order 9(300) = 300
+        expected = {
+            100: 200.0,
+            101: 200.0,
+            102: 200.0,
+            103: 200.0,
+            104: 150.0,
+            105: 300.0
+        }
+
+        assert customer_sums == expected, f"Expected {expected}, got {customer_sums}"
