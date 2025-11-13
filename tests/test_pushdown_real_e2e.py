@@ -20,6 +20,7 @@ from federated_query.optimizer import (
     RuleBasedOptimizer,
     PredicatePushdownRule,
     ProjectionPushdownRule,
+    AggregatePushdownRule,
     LimitPushdownRule,
     ExpressionSimplificationRule,
 )
@@ -103,6 +104,7 @@ def execute_and_capture(sql: str, catalog: Catalog, ds: QueryCapturingDataSource
     optimizer.add_rule(ExpressionSimplificationRule())
     optimizer.add_rule(PredicatePushdownRule())
     optimizer.add_rule(ProjectionPushdownRule())
+    optimizer.add_rule(AggregatePushdownRule())
     optimizer.add_rule(LimitPushdownRule())
     optimized_plan = optimizer.optimize(bound_plan)
 
@@ -221,42 +223,38 @@ class TestProjectionPushdownReal:
 
 
 class TestAggregatePushdownReal:
-    """Real tests for aggregate pushdown - EXPECTED TO FAIL."""
+    """Real tests for aggregate pushdown - verify aggregates ARE pushed down!"""
 
-    def test_count_star_not_pushed(self, setup_capturing_db):
-        """Test COUNT(*) is NOT pushed down."""
+    def test_count_star_pushed(self, setup_capturing_db):
+        """Test COUNT(*) IS pushed down to data source."""
         catalog, ds = setup_capturing_db
 
         sql = "SELECT COUNT(*) FROM testdb.main.orders"
         query, results = execute_and_capture(sql, catalog, ds)
 
-        # COUNT should NOT be in the query sent to data source
-        if "COUNT" in query.upper():
-            pytest.fail(f"COUNT was pushed down (unexpected): {query}")
-
-        # Should be full table scan
+        # COUNT MUST be in the query sent to data source
+        assert "COUNT" in query.upper(), f"COUNT was NOT pushed down: {query}"
         assert "SELECT" in query, f"No SELECT: {query}"
 
-        # Verify result is correct (even though aggregation is in-memory)
+        # Verify result is correct
         for batch in results:
             count_col = batch.column(0)
             count_value = count_col[0].as_py()
             assert count_value == 10, f"Expected count=10, got {count_value}"
 
-    def test_count_with_filter_filter_pushes_agg_does_not(self, setup_capturing_db):
-        """Test COUNT(*) WHERE x > y - filter should push, COUNT should not."""
+    def test_count_with_filter_both_pushed(self, setup_capturing_db):
+        """Test COUNT(*) WHERE x > y - BOTH filter and COUNT should push."""
         catalog, ds = setup_capturing_db
 
         sql = "SELECT COUNT(*) FROM testdb.main.orders WHERE order_id > 5"
         query, results = execute_and_capture(sql, catalog, ds)
 
-        # Filter SHOULD be pushed
+        # Filter MUST be pushed
         assert "WHERE" in query, f"Filter not pushed: {query}"
         assert "order_id" in query, f"order_id filter not pushed: {query}"
 
-        # COUNT should NOT be pushed
-        if "COUNT" in query.upper():
-            pytest.fail(f"COUNT was pushed down (unexpected): {query}")
+        # COUNT MUST be pushed
+        assert "COUNT" in query.upper(), f"COUNT was NOT pushed down: {query}"
 
         # Verify result (orders 6-10 = 5 orders)
         for batch in results:
@@ -264,16 +262,17 @@ class TestAggregatePushdownReal:
             count_value = count_col[0].as_py()
             assert count_value == 5, f"Expected count=5, got {count_value}"
 
-    def test_group_by_not_pushed(self, setup_capturing_db):
-        """Test GROUP BY is NOT pushed down."""
+    def test_group_by_pushed(self, setup_capturing_db):
+        """Test GROUP BY IS pushed down to data source."""
         catalog, ds = setup_capturing_db
 
         sql = "SELECT customer_id, COUNT(*) FROM testdb.main.orders GROUP BY customer_id"
         query, results = execute_and_capture(sql, catalog, ds)
 
-        # GROUP BY should NOT be in the query
-        if "GROUP BY" in query.upper():
-            pytest.fail(f"GROUP BY was pushed down (unexpected): {query}")
+        # GROUP BY MUST be in the query
+        assert "GROUP BY" in query.upper(), f"GROUP BY was NOT pushed down: {query}"
+        assert "COUNT" in query.upper(), f"COUNT was NOT pushed down: {query}"
+        assert "customer_id" in query, f"customer_id not in query: {query}"
 
         # Verify results are correct
         # customer_id 100: 3 orders (1, 4, 8)
@@ -285,9 +284,11 @@ class TestAggregatePushdownReal:
         customer_counts = {}
         for batch in results:
             data = batch.to_pydict()
+            # DuckDB returns lowercase column names like count_star()
+            count_col = "count_star()" if "count_star()" in data else "COUNT(*)"
             for i in range(batch.num_rows):
                 cust_id = data["customer_id"][i]
-                count = data["COUNT(*)"][i]
+                count = data[count_col][i]
                 customer_counts[cust_id] = count
 
         expected = {
@@ -300,19 +301,16 @@ class TestAggregatePushdownReal:
         }
         assert customer_counts == expected, f"Expected {expected}, got {customer_counts}"
 
-    def test_sum_aggregate_not_pushed(self, setup_capturing_db):
-        """Test SUM(column) is NOT pushed down."""
+    def test_sum_aggregate_pushed(self, setup_capturing_db):
+        """Test SUM(column) IS pushed down to data source."""
         catalog, ds = setup_capturing_db
 
         sql = "SELECT SUM(price) FROM testdb.main.orders"
         query, results = execute_and_capture(sql, catalog, ds)
 
-        # SUM should NOT be in the query
-        if "SUM" in query.upper():
-            pytest.fail(f"SUM was pushed down (unexpected): {query}")
-
-        # Should fetch price column
-        assert '"price"' in query or "price" in query, f"price not fetched: {query}"
+        # SUM MUST be in the query
+        assert "SUM" in query.upper(), f"SUM was NOT pushed down: {query}"
+        assert "price" in query.lower(), f"price not in query: {query}"
 
         # Verify result
         # Sum of all prices: 50 + 100 + 150 + 75 + 200 + 100 + 150 + 75 + 300 + 50 = 1250
@@ -397,9 +395,11 @@ class TestBuggyAggregates:
         customer_sums = {}
         for batch in results:
             data = batch.to_pydict()
+            # DuckDB returns lowercase column names like sum(price)
+            sum_col = "sum(price)" if "sum(price)" in data else "SUM(price)"
             for i in range(batch.num_rows):
                 cust_id = data["customer_id"][i]
-                sum_price = data["SUM(price)"][i]
+                sum_price = data[sum_col][i]
                 customer_sums[cust_id] = sum_price
 
         print(f"\nDEBUG: Query sent: {query}")

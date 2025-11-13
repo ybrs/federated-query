@@ -43,7 +43,13 @@ class PhysicalPlanNode(ABC):
 
 @dataclass
 class PhysicalScan(PhysicalPlanNode):
-    """Scan a table from a data source."""
+    """Scan a table from a data source.
+
+    Can represent:
+    - Simple scan: SELECT columns FROM table
+    - Scan with filter: SELECT columns FROM table WHERE filter
+    - Scan with aggregates: SELECT group_by, agg_funcs FROM table WHERE filter GROUP BY group_by
+    """
 
     datasource: str
     schema_name: str
@@ -52,6 +58,9 @@ class PhysicalScan(PhysicalPlanNode):
     filters: Optional[Expression] = None
     datasource_connection: Any = None  # Set during planning
     _schema: Optional[pa.Schema] = None  # Cached schema
+    group_by: Optional[List[Expression]] = None  # Optional GROUP BY expressions
+    aggregates: Optional[List[Expression]] = None  # Optional aggregate expressions
+    output_names: Optional[List[str]] = None  # Output column names when using aggregates
 
     def children(self) -> List[PhysicalPlanNode]:
         return []
@@ -79,10 +88,28 @@ class PhysicalScan(PhysicalPlanNode):
             where_clause = self.filters.to_sql()
             query = f"{query} WHERE {where_clause}"
 
+        if self.group_by:
+            group_clause = self._format_group_by()
+            query = f"{query} GROUP BY {group_clause}"
+
         return query
 
     def _format_columns(self) -> str:
-        """Format column list for SQL."""
+        """Format column list for SQL.
+
+        If aggregates are present, use them directly.
+        The aggregates list contains ALL SELECT expressions in order:
+        - GROUP BY columns first
+        - Then aggregate functions (COUNT, SUM, etc.)
+
+        Otherwise format simple column list.
+        """
+        if self.aggregates:
+            select_items = []
+            for expr in self.aggregates:
+                select_items.append(expr.to_sql())
+            return ", ".join(select_items)
+
         if "*" in self.columns:
             return "*"
 
@@ -95,6 +122,17 @@ class PhysicalScan(PhysicalPlanNode):
     def _format_table_ref(self) -> str:
         """Format table reference for SQL."""
         return f'"{self.schema_name}"."{self.table_name}"'
+
+    def _format_group_by(self) -> str:
+        """Format GROUP BY clause."""
+        if not self.group_by:
+            return ""
+
+        group_items = []
+        for expr in self.group_by:
+            group_items.append(expr.to_sql())
+
+        return ", ".join(group_items)
 
     def schema(self) -> pa.Schema:
         """Get output schema."""

@@ -806,6 +806,122 @@ class JoinReorderingRule(OptimizationRule):
         return "JoinReordering"
 
 
+class AggregatePushdownRule(OptimizationRule):
+    """Push aggregates to data sources when possible.
+
+    Transforms:
+        Aggregate(Filter?(Scan)) → Scan(with aggregates)
+
+    This pushes GROUP BY and aggregate functions (COUNT, SUM, etc.)
+    to the data source for execution, reducing data transfer.
+    """
+
+    def apply(self, plan: LogicalPlanNode) -> Optional[LogicalPlanNode]:
+        """Apply aggregate pushdown optimization."""
+        return self._push_aggregate(plan)
+
+    def _push_aggregate(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Recursively push aggregates down the plan tree."""
+        if isinstance(plan, Aggregate):
+            return self._try_push_aggregate(plan)
+
+        return self._recurse_node(plan)
+
+    def _try_push_aggregate(self, agg: Aggregate) -> LogicalPlanNode:
+        """Try to push aggregate into its input."""
+        input_node = agg.input
+
+        if isinstance(input_node, Scan):
+            return self._push_to_scan(agg, input_node, None)
+
+        if isinstance(input_node, Filter):
+            filter_input = input_node.input
+            if isinstance(filter_input, Scan):
+                return self._push_to_scan(agg, filter_input, input_node.predicate)
+
+        return agg
+
+    def _push_to_scan(
+        self,
+        agg: Aggregate,
+        scan: Scan,
+        filter_expr: Optional[Expression]
+    ) -> Scan:
+        """Push aggregate into scan node."""
+        merged_filters = self._merge_filters(scan.filters, filter_expr)
+
+        return Scan(
+            datasource=scan.datasource,
+            schema_name=scan.schema_name,
+            table_name=scan.table_name,
+            columns=scan.columns,
+            filters=merged_filters,
+            alias=scan.alias,
+            group_by=agg.group_by,
+            aggregates=agg.aggregates,
+            output_names=agg.output_names,
+        )
+
+    def _merge_filters(
+        self,
+        scan_filter: Optional[Expression],
+        filter_filter: Optional[Expression]
+    ) -> Optional[Expression]:
+        """Merge filters from scan and filter node."""
+        if scan_filter is None:
+            return filter_filter
+
+        if filter_filter is None:
+            return scan_filter
+
+        from ..plan.expressions import BinaryOp, BinaryOpType
+        return BinaryOp(
+            op=BinaryOpType.AND,
+            left=scan_filter,
+            right=filter_filter
+        )
+
+    def _recurse_node(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Recurse into node children."""
+        if isinstance(plan, (Project, Filter, Limit)):
+            return self._recurse_unary(plan)
+
+        if isinstance(plan, Join):
+            return self._recurse_join(plan)
+
+        return plan
+
+    def _recurse_unary(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Recurse into unary node."""
+        new_input = self._push_aggregate(plan.input)
+        if new_input == plan.input:
+            return plan
+
+        if isinstance(plan, Project):
+            return Project(new_input, plan.expressions, plan.aliases)
+
+        if isinstance(plan, Filter):
+            return Filter(new_input, plan.predicate)
+
+        if isinstance(plan, Limit):
+            return Limit(new_input, plan.limit, plan.offset)
+
+        return plan
+
+    def _recurse_join(self, join: Join) -> LogicalPlanNode:
+        """Recurse into join node."""
+        new_left = self._push_aggregate(join.left)
+        new_right = self._push_aggregate(join.right)
+
+        if new_left == join.left and new_right == join.right:
+            return join
+
+        return Join(new_left, new_right, join.join_type, join.condition)
+
+    def name(self) -> str:
+        return "AggregatePushdown"
+
+
 class ExpressionSimplificationRule(OptimizationRule):
     """Apply expression simplification and constant folding to plan."""
 

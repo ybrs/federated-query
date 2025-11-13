@@ -82,6 +82,9 @@ class PhysicalPlanner:
             columns=scan.columns,
             filters=scan.filters,
             datasource_connection=datasource,
+            group_by=scan.group_by,
+            aggregates=scan.aggregates,
+            output_names=scan.output_names,
         )
 
     def _plan_filter(self, filter_node: Filter) -> PhysicalFilter:

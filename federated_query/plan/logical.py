@@ -60,7 +60,13 @@ class LogicalPlanNode(ABC):
 
 @dataclass(frozen=True)
 class Scan(LogicalPlanNode):
-    """Scan a table from a data source."""
+    """Scan a table from a data source.
+
+    Can represent:
+    - Simple scan: SELECT columns FROM table
+    - Scan with filter: SELECT columns FROM table WHERE filter
+    - Scan with aggregates: SELECT group_by, agg_funcs FROM table WHERE filter GROUP BY group_by
+    """
 
     datasource: str
     schema_name: str
@@ -68,6 +74,9 @@ class Scan(LogicalPlanNode):
     columns: List[str]  # Columns to read
     filters: Optional[Expression] = None  # Optional pushed-down filters
     alias: Optional[str] = None  # Table alias (e.g., "u" in "FROM users u")
+    group_by: Optional[List[Expression]] = None  # Optional GROUP BY expressions
+    aggregates: Optional[List[Expression]] = None  # Optional aggregate expressions
+    output_names: Optional[List[str]] = None  # Output column names when using aggregates
 
     def children(self) -> List[LogicalPlanNode]:
         return []
@@ -80,12 +89,19 @@ class Scan(LogicalPlanNode):
         return visitor.visit_scan(self)
 
     def schema(self) -> List[str]:
+        if self.output_names:
+            return self.output_names
         return self.columns
 
     def __repr__(self) -> str:
         table_ref = f"{self.datasource}.{self.schema_name}.{self.table_name}"
         filter_str = f" WHERE {self.filters}" if self.filters else ""
-        return f"Scan({table_ref}, cols={len(self.columns)}{filter_str})"
+        agg_str = ""
+        if self.aggregates:
+            agg_str = f", aggs={len(self.aggregates)}"
+        if self.group_by:
+            agg_str += f", group_by={len(self.group_by)}"
+        return f"Scan({table_ref}, cols={len(self.columns)}{filter_str}{agg_str})"
 
 
 @dataclass(frozen=True)
