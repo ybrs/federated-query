@@ -1,8 +1,8 @@
 """Physical plan nodes."""
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import List, Optional, Iterator, Any, TYPE_CHECKING, Dict, Callable, Set
+from dataclasses import dataclass, field
+from typing import List, Optional, Iterator, Any, TYPE_CHECKING, Dict, Callable, Set, Tuple
 from enum import Enum
 
 import pyarrow as pa
@@ -39,6 +39,10 @@ class PhysicalPlanNode(ABC):
 
     def __repr__(self) -> str:
         return self.__class__.__name__
+
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        """Optional mapping from (table, column) to physical column name."""
+        return {}
 
 
 @dataclass
@@ -184,6 +188,7 @@ class PhysicalProject(PhysicalPlanNode):
 
         columns = []
         output_names = []
+        alias_map = self.column_aliases()
 
         for i, expr in enumerate(self.expressions):
             if isinstance(expr, ColumnRef):
@@ -192,7 +197,7 @@ class PhysicalProject(PhysicalPlanNode):
                         columns.append(batch.column(col_idx))
                         output_names.append(batch.schema.field(col_idx).name)
                 else:
-                    column_data = batch.column(expr.column)
+                    column_data = self._resolve_column(expr, batch, alias_map)
                     columns.append(column_data)
                     output_names.append(self.output_names[i])
             else:
@@ -234,6 +239,52 @@ class PhysicalProject(PhysicalPlanNode):
 
     def __repr__(self) -> str:
         return f"PhysicalProject({len(self.expressions)} exprs)"
+
+    def _resolve_column(
+        self,
+        expr: Expression,
+        batch: pa.RecordBatch,
+        alias_map: Dict[Tuple[Optional[str], str], str]
+    ) -> pa.Array:
+        """Resolve column, including alias fallbacks."""
+        from .expressions import ColumnRef
+
+        if not isinstance(expr, ColumnRef):
+            raise ValueError("Expected ColumnRef")
+
+        mapped = None
+        if expr.table is not None:
+            mapped = self._lookup_alias(expr, alias_map)
+            if mapped is not None:
+                return batch.column(mapped)
+
+        try:
+            return batch.column(expr.column)
+        except KeyError:
+            if mapped is None:
+                mapped = self._lookup_alias(expr, alias_map)
+            if mapped is None:
+                raise
+            return batch.column(mapped)
+
+    def _lookup_alias(
+        self,
+        expr: Expression,
+        alias_map: Dict[Tuple[Optional[str], str], str]
+    ) -> Optional[str]:
+        from .expressions import ColumnRef
+
+        if not isinstance(expr, ColumnRef):
+            return None
+
+        if expr.table is None:
+            return None
+
+        key = (expr.table, expr.column)
+        return alias_map.get(key)
+
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        return self.input.column_aliases()
 
 
 @dataclass
@@ -312,6 +363,9 @@ class PhysicalFilter(PhysicalPlanNode):
 
     def __repr__(self) -> str:
         return f"PhysicalFilter({self.predicate})"
+
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        return self.input.column_aliases()
 
 
 @dataclass
@@ -627,6 +681,7 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
     condition: Expression
     datasource_connection: Any
     _schema: Optional[pa.Schema] = None
+    _column_alias_map: Dict[Tuple[Optional[str], str], str] = field(default_factory=dict, init=False)
 
     def children(self) -> List[PhysicalPlanNode]:
         return []
@@ -651,14 +706,13 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
         return f"PhysicalRemoteJoin({self.join_type.value})"
 
     def _build_query(self) -> str:
+        self._column_alias_map = {}
         select_clause = self._build_select_clause()
-        from_clause = self._build_from_clause()
-        join_clause = self._build_join_clause()
-        where_clause = self._build_where_clause()
-        query = f"SELECT {select_clause} {from_clause} {join_clause}"
-        if where_clause:
-            query = f"{query} WHERE {where_clause}"
-        return query
+        left_source = self._build_source(self.left)
+        right_source = self._build_source(self.right)
+        join_keyword = self._join_keyword()
+        condition_sql = self.condition.to_sql()
+        return f"SELECT {select_clause} FROM {left_source} {join_keyword} {right_source} ON {condition_sql}"
 
     def _build_select_clause(self) -> str:
         items = []
@@ -681,6 +735,7 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
             output = self._select_output_name(column, seen, is_right)
             items.append(f'{source} AS "{output}"')
             seen.add(output)
+            self._register_column_alias(scan, column, output)
 
     def _resolve_columns(self, scan: PhysicalScan) -> List[str]:
         if scan.columns and "*" in scan.columns:
@@ -705,38 +760,42 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
             name = f"right_{name}"
         return name
 
-    def _build_from_clause(self) -> str:
-        return f"FROM {self.left._format_table_ref()}"
-
-    def _build_join_clause(self) -> str:
-        keyword = self._join_keyword()
-        table_ref = self.right._format_table_ref()
-        return f"{keyword} {table_ref} ON {self.condition.to_sql()}"
-
     def _join_keyword(self) -> str:
         return f"{self.join_type.value} JOIN"
-
-    def _build_where_clause(self) -> str:
-        predicates = []
-        self._append_filter(self.left.filters, predicates)
-        self._append_filter(self.right.filters, predicates)
-        if not predicates:
-            return ""
-        return " AND ".join(predicates)
-
-    def _append_filter(
-        self,
-        expr: Optional[Expression],
-        predicates: List[str]
-    ) -> None:
-        if expr is None:
-            return
-        predicates.append(f"({expr.to_sql()})")
 
     def _scan_alias(self, scan: PhysicalScan) -> str:
         if scan.alias:
             return scan.alias
         return scan.table_name
+
+    def _build_source(self, scan: PhysicalScan) -> str:
+        table_ref = f'"{scan.schema_name}"."{scan.table_name}"'
+        alias = scan.alias
+        if scan.filters is None:
+            if alias:
+                return f"{table_ref} AS {alias}"
+            return table_ref
+        alias_name = alias if alias else scan.table_name
+        filter_sql = scan.filters.to_sql()
+        return f"(SELECT * FROM {table_ref} AS {alias_name} WHERE {filter_sql}) AS {alias_name}"
+
+    def _register_column_alias(
+        self,
+        scan: PhysicalScan,
+        column: str,
+        output: str
+    ) -> None:
+        identifiers = set()
+        if scan.alias:
+            identifiers.add(scan.alias)
+        identifiers.add(scan.table_name)
+
+        for ident in identifiers:
+            if ident:
+                self._column_alias_map[(ident, column)] = output
+
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        return self._column_alias_map
 
 
 @dataclass
@@ -1367,6 +1426,9 @@ class PhysicalHashAggregate(PhysicalPlanNode):
     def __repr__(self) -> str:
         return f"PhysicalHashAggregate(groups={len(self.group_by)}, aggs={len(self.aggregates)})"
 
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        return self.input.column_aliases()
+
 
 @dataclass
 class PhysicalSort(PhysicalPlanNode):
@@ -1391,6 +1453,9 @@ class PhysicalSort(PhysicalPlanNode):
 
     def __repr__(self) -> str:
         return f"PhysicalSort({len(self.sort_keys)} keys)"
+
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        return self.input.column_aliases()
 
 
 @dataclass
@@ -1439,6 +1504,9 @@ class PhysicalLimit(PhysicalPlanNode):
 
     def __repr__(self) -> str:
         return f"PhysicalLimit({self.limit})"
+
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        return self.input.column_aliases()
 
 
 @dataclass

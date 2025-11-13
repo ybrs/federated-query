@@ -184,7 +184,8 @@ class PhysicalPlanner:
         left_plan: PhysicalPlanNode,
         right_plan: PhysicalPlanNode
     ) -> bool:
-        if join.join_type != JoinType.INNER or join.condition is None:
+        allowed = {JoinType.INNER, JoinType.LEFT, JoinType.RIGHT}
+        if join.join_type not in allowed or join.condition is None:
             return False
         if not isinstance(left_plan, PhysicalScan):
             return False

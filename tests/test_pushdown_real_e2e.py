@@ -95,7 +95,8 @@ def setup_capturing_db():
         (100, 'Alice', 'East'),
         (101, 'Bob', 'West'),
         (102, 'Carol', 'West'),
-        (103, 'Derek', 'East')
+        (103, 'Derek', 'East'),
+        (106, 'Eve', 'North')
     """)
 
     catalog = Catalog()
@@ -528,7 +529,7 @@ class TestJoinPushdownReal:
         """
         query, results = execute_and_capture(sql, catalog, ds)
         assert len(ds.captured_queries) == 1, "Join should run as single query"
-        assert "JOIN" in query.upper(), f"Expected JOIN in pushed SQL: {query}"
+        assert "INNER JOIN" in query.upper(), f"Expected INNER JOIN in pushed SQL: {query}"
         rows = []
         for batch in results:
             data = batch.to_pydict()
@@ -539,22 +540,71 @@ class TestJoinPushdownReal:
         for customer_id, _ in rows:
             assert customer_id != 104, "Unmatched customers should not appear in INNER JOIN results"
 
-    def test_left_join_falls_back_to_local_execution(self, setup_capturing_db):
-        """LEFT JOIN should still use local execution (no pushdown)."""
+    def test_left_join_pushdown_preserves_unmatched_rows(self, setup_capturing_db):
+        """LEFT JOIN should be pushed down and keep unmatched customers."""
         catalog, ds = setup_capturing_db
         sql = """
             SELECT c.customer_id, o.order_id
             FROM testdb.main.customers c
             LEFT JOIN testdb.main.orders o ON c.customer_id = o.customer_id
         """
+        query, results = execute_and_capture(sql, catalog, ds)
+        assert len(ds.captured_queries) == 1, "LEFT JOIN should run remotely"
+        assert "LEFT JOIN" in query.upper(), f"Expected LEFT JOIN in SQL: {query}"
+        left_rows = []
+        for batch in results:
+            data = batch.to_pydict()
+            for idx in range(batch.num_rows):
+                left_rows.append({
+                    "customer_id": data["customer_id"][idx],
+                    "order_id": data["order_id"][idx],
+                })
+        has_unmatched = False
+        for row in left_rows:
+            if row["customer_id"] == 106 and row["order_id"] is None:
+                has_unmatched = True
+        assert has_unmatched, "Expected unmatched customer 106 with NULL orders"
+        assert len(left_rows) == 9, f"Expected 9 rows (including unmatched), got {len(left_rows)}"
+
+    def test_right_join_pushdown_preserves_unmatched_rows(self, setup_capturing_db):
+        """RIGHT JOIN should be pushed down and keep unmatched orders."""
+        catalog, ds = setup_capturing_db
+        sql = """
+            SELECT o.customer_id, c.name
+            FROM testdb.main.customers c
+            RIGHT JOIN testdb.main.orders o ON c.customer_id = o.customer_id
+        """
+        query, results = execute_and_capture(sql, catalog, ds)
+        assert len(ds.captured_queries) == 1, "RIGHT JOIN should run remotely"
+        assert "RIGHT JOIN" in query.upper(), f"Expected RIGHT JOIN in SQL: {query}"
+        rows = []
+        for batch in results:
+            data = batch.to_pydict()
+            for idx in range(batch.num_rows):
+                rows.append({
+                    "customer_id": data["customer_id"][idx],
+                    "name": data["name"][idx],
+                })
+        saw_unmatched = False
+        for row in rows:
+            if row["customer_id"] in (104, 105) and row["name"] is None:
+                saw_unmatched = True
+        assert saw_unmatched, "Expected unmatched orders 104/105 with NULL customer names"
+        assert len(rows) == 10, f"Expected 10 rows (all orders), got {len(rows)}"
+
+    def test_full_join_not_pushed_down(self, setup_capturing_db):
+        """FULL JOIN should fall back to local execution."""
+        catalog, ds = setup_capturing_db
+        sql = """
+            SELECT c.customer_id, o.order_id
+            FROM testdb.main.customers c
+            FULL JOIN testdb.main.orders o ON c.customer_id = o.customer_id
+        """
         _, results = execute_and_capture(sql, catalog, ds)
-        assert len(ds.captured_queries) == 2, "Fallback should query each table separately"
-        saw_join_sql = False
-        for text in ds.captured_queries:
-            if "JOIN" in text.upper():
-                saw_join_sql = True
-        assert not saw_join_sql, "Fallback path should not issue JOIN SQL"
+        assert len(ds.captured_queries) == 2, "FULL JOIN should execute scans separately"
+        for query in ds.captured_queries:
+            assert "JOIN" not in query.upper(), "Fallback scans should not issue JOIN SQL"
         total_rows = 0
         for batch in results:
             total_rows += batch.num_rows
-        assert total_rows == 8, f"Expected 8 rows from LEFT JOIN, got {total_rows}"
+        assert total_rows == 11, f"Expected 11 rows from FULL JOIN, got {total_rows}"

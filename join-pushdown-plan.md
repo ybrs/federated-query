@@ -30,7 +30,7 @@
 
 5. **Testing**
    - Unit: parser alias propagation, planner join detection, SQL string builder edge cases.
-   - E2E: extend `tests/test_pushdown_real_e2e.py` with same-source joins and assert captured SQL contains JOIN clauses; verify result correctness against baseline.
+   - E2E: extend `tests/test_pushdown_real_e2e.py` with INNER/LEFT/RIGHT scenarios and assert captured SQL contains JOIN clauses; verify result correctness (especially NULL handling) against baseline.
    - Regression: ensure non-pushdown paths still work by covering mixed-datasource joins and unsupported join types.
 
 ## Execution Steps
