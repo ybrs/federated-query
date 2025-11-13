@@ -139,17 +139,24 @@ class PhysicalProject(PhysicalPlanNode):
         from .expressions import ColumnRef
 
         columns = []
-        for expr in self.expressions:
+        output_names = []
+
+        for i, expr in enumerate(self.expressions):
             if isinstance(expr, ColumnRef):
                 if expr.column == "*":
-                    return batch
-                column_data = batch.column(expr.column)
-                columns.append(column_data)
+                    for col_idx in range(batch.num_columns):
+                        columns.append(batch.column(col_idx))
+                        output_names.append(batch.schema.field(col_idx).name)
+                else:
+                    column_data = batch.column(expr.column)
+                    columns.append(column_data)
+                    output_names.append(self.output_names[i])
             else:
                 evaluated = self._evaluate_expression(expr, batch)
                 columns.append(evaluated)
+                output_names.append(self.output_names[i])
 
-        return pa.RecordBatch.from_arrays(columns, names=self.output_names)
+        return pa.RecordBatch.from_arrays(columns, names=output_names)
 
     def _evaluate_expression(self, expr: Expression, batch: pa.RecordBatch) -> pa.Array:
         """Evaluate expression on batch."""
@@ -165,12 +172,13 @@ class PhysicalProject(PhysicalPlanNode):
         for i, expr in enumerate(self.expressions):
             if isinstance(expr, ColumnRef):
                 if expr.column == "*":
-                    return input_schema
-
-                field_index = input_schema.get_field_index(expr.column)
-                field = input_schema.field(field_index)
-                new_field = pa.field(self.output_names[i], field.type)
-                fields.append(new_field)
+                    for field in input_schema:
+                        fields.append(field)
+                else:
+                    field_index = input_schema.get_field_index(expr.column)
+                    field = input_schema.field(field_index)
+                    new_field = pa.field(self.output_names[i], field.type)
+                    fields.append(new_field)
             else:
                 raise NotImplementedError(f"Schema inference not implemented for {type(expr)}")
 
@@ -378,13 +386,52 @@ class PhysicalHashJoin(PhysicalPlanNode):
 
     def _create_left_outer_batch(self, left_batch: pa.RecordBatch) -> pa.RecordBatch:
         """Create batch with NULLs for right side (for LEFT OUTER JOIN)."""
-        raise NotImplementedError("LEFT OUTER JOIN not yet fully implemented")
+        right_schema = self.right.schema()
+
+        arrays = []
+        names = []
+
+        for i in range(left_batch.num_columns):
+            arrays.append(left_batch.column(i))
+            field = left_batch.schema.field(i)
+            names.append(field.name)
+
+        for field in right_schema:
+            name = field.name
+            if name in names:
+                name = f"right_{name}"
+            null_array = pa.array([None] * left_batch.num_rows, type=field.type)
+            arrays.append(null_array)
+            names.append(name)
+
+        return pa.RecordBatch.from_arrays(arrays, names=names)
 
     def _create_left_outer_row(
         self, left_batch: pa.RecordBatch, left_row_idx: int
     ) -> pa.RecordBatch:
         """Create single row with NULLs for right side."""
-        raise NotImplementedError("LEFT OUTER JOIN not yet fully implemented")
+        right_schema = self.right.schema()
+
+        arrays = []
+        names = []
+
+        for i in range(left_batch.num_columns):
+            col = left_batch.column(i)
+            field = left_batch.schema.field(i)
+            scalar_val = col[left_row_idx]
+            arr = pa.array([scalar_val.as_py()], type=field.type)
+            arrays.append(arr)
+            names.append(field.name)
+
+        for field in right_schema:
+            name = field.name
+            if name in names:
+                name = f"right_{name}"
+            null_array = pa.array([None], type=field.type)
+            arrays.append(null_array)
+            names.append(name)
+
+        return pa.RecordBatch.from_arrays(arrays, names=names)
 
     def schema(self) -> pa.Schema:
         """Combine schemas from both sides."""
@@ -474,7 +521,7 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
         joined = self._join_rows(left_batch, left_row_idx, right_batch, right_row_idx)
         result = self._evaluate_expression_on_batch(self.condition, joined)
 
-        return result[0].as_py() if result.length() > 0 else False
+        return result[0].as_py() if len(result) > 0 else False
 
     def _evaluate_expression_on_batch(
         self, expr: Expression, batch: pa.RecordBatch
@@ -544,13 +591,52 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
 
     def _create_left_outer_batch(self, left_batch: pa.RecordBatch) -> pa.RecordBatch:
         """Create batch with NULLs for right side."""
-        raise NotImplementedError("LEFT OUTER JOIN not yet fully implemented")
+        right_schema = self.right.schema()
+
+        arrays = []
+        names = []
+
+        for i in range(left_batch.num_columns):
+            arrays.append(left_batch.column(i))
+            field = left_batch.schema.field(i)
+            names.append(field.name)
+
+        for field in right_schema:
+            name = field.name
+            if name in names:
+                name = f"right_{name}"
+            null_array = pa.array([None] * left_batch.num_rows, type=field.type)
+            arrays.append(null_array)
+            names.append(name)
+
+        return pa.RecordBatch.from_arrays(arrays, names=names)
 
     def _create_left_outer_row(
         self, left_batch: pa.RecordBatch, left_row_idx: int
     ) -> pa.RecordBatch:
         """Create single row with NULLs for right side."""
-        raise NotImplementedError("LEFT OUTER JOIN not yet fully implemented")
+        right_schema = self.right.schema()
+
+        arrays = []
+        names = []
+
+        for i in range(left_batch.num_columns):
+            col = left_batch.column(i)
+            field = left_batch.schema.field(i)
+            scalar_val = col[left_row_idx]
+            arr = pa.array([scalar_val.as_py()], type=field.type)
+            arrays.append(arr)
+            names.append(field.name)
+
+        for field in right_schema:
+            name = field.name
+            if name in names:
+                name = f"right_{name}"
+            null_array = pa.array([None], type=field.type)
+            arrays.append(null_array)
+            names.append(name)
+
+        return pa.RecordBatch.from_arrays(arrays, names=names)
 
     def schema(self) -> pa.Schema:
         """Combine schemas from both sides."""

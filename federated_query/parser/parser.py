@@ -238,11 +238,6 @@ class Parser:
         kind = join_clause.args.get("kind")
         side = join_clause.args.get("side")
 
-        if not kind:
-            return JoinType.INNER
-
-        if kind.upper() == "CROSS":
-            return JoinType.CROSS
         if side:
             side_upper = side.upper()
             if side_upper == "LEFT":
@@ -251,6 +246,10 @@ class Parser:
                 return JoinType.RIGHT
             if side_upper == "FULL":
                 return JoinType.FULL
+
+        if kind:
+            if kind.upper() == "CROSS":
+                return JoinType.CROSS
 
         return JoinType.INNER
 
