@@ -766,9 +766,9 @@ class LimitPushdownRule(OptimizationRule):
         """Recurse into explain node."""
         from ..plan.logical import Explain
 
-        new_plan = self._push_limit(plan.plan)
-        if new_plan != plan.plan:
-            return Explain(new_plan)
+        new_input = self._push_limit(plan.input)
+        if new_input != plan.input:
+            return Explain(new_input)
         return plan
 
     def _try_push_limit(self, limit: Limit) -> LogicalPlanNode:

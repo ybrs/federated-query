@@ -5,8 +5,25 @@ import pyarrow as pa
 from federated_query.parser import Parser, Binder
 from federated_query.catalog import Catalog
 from federated_query.datasources.duckdb import DuckDBDataSource
-from federated_query.optimizer import PhysicalPlanner
+from federated_query.optimizer import (
+    PhysicalPlanner,
+    RuleBasedOptimizer,
+    PredicatePushdownRule,
+    ProjectionPushdownRule,
+    LimitPushdownRule,
+    ExpressionSimplificationRule,
+)
 from federated_query.executor import Executor
+
+
+def create_optimizer(catalog: Catalog) -> RuleBasedOptimizer:
+    """Create optimizer with standard rules."""
+    optimizer = RuleBasedOptimizer(catalog)
+    optimizer.add_rule(ExpressionSimplificationRule())
+    optimizer.add_rule(PredicatePushdownRule())
+    optimizer.add_rule(ProjectionPushdownRule())
+    optimizer.add_rule(LimitPushdownRule())
+    return optimizer
 
 
 @pytest.fixture
@@ -63,9 +80,13 @@ def test_simple_select_all(setup_duckdb):
     binder = Binder(catalog)
     bound_plan = binder.bind(logical_plan)
 
+    # Optimize
+    optimizer = create_optimizer(catalog)
+    optimized_plan = optimizer.optimize(bound_plan)
+
     # Physical planning
     planner = PhysicalPlanner(catalog)
-    physical_plan = planner.plan(bound_plan)
+    physical_plan = planner.plan(optimized_plan)
 
     # Execute
     executor = Executor()
@@ -92,8 +113,11 @@ def test_select_specific_columns(setup_duckdb):
     binder = Binder(catalog)
     bound_plan = binder.bind(logical_plan)
 
+    optimizer = create_optimizer(catalog)
+    optimized_plan = optimizer.optimize(bound_plan)
+
     planner = PhysicalPlanner(catalog)
-    physical_plan = planner.plan(bound_plan)
+    physical_plan = planner.plan(optimized_plan)
 
     executor = Executor()
     results = executor.execute(physical_plan)
@@ -119,8 +143,11 @@ def test_select_with_where(setup_duckdb):
     binder = Binder(catalog)
     bound_plan = binder.bind(logical_plan)
 
+    optimizer = create_optimizer(catalog)
+    optimized_plan = optimizer.optimize(bound_plan)
+
     planner = PhysicalPlanner(catalog)
-    physical_plan = planner.plan(bound_plan)
+    physical_plan = planner.plan(optimized_plan)
 
     executor = Executor()
     results = executor.execute(physical_plan)
@@ -146,8 +173,11 @@ def test_select_with_limit(setup_duckdb):
     binder = Binder(catalog)
     bound_plan = binder.bind(logical_plan)
 
+    optimizer = create_optimizer(catalog)
+    optimized_plan = optimizer.optimize(bound_plan)
+
     planner = PhysicalPlanner(catalog)
-    physical_plan = planner.plan(bound_plan)
+    physical_plan = planner.plan(optimized_plan)
 
     executor = Executor()
     results = executor.execute(physical_plan)
@@ -172,8 +202,11 @@ def test_select_with_where_and_limit(setup_duckdb):
     binder = Binder(catalog)
     bound_plan = binder.bind(logical_plan)
 
+    optimizer = create_optimizer(catalog)
+    optimized_plan = optimizer.optimize(bound_plan)
+
     planner = PhysicalPlanner(catalog)
-    physical_plan = planner.plan(bound_plan)
+    physical_plan = planner.plan(optimized_plan)
 
     executor = Executor()
     results = executor.execute(physical_plan)
@@ -198,8 +231,11 @@ def test_select_with_complex_where(setup_duckdb):
     binder = Binder(catalog)
     bound_plan = binder.bind(logical_plan)
 
+    optimizer = create_optimizer(catalog)
+    optimized_plan = optimizer.optimize(bound_plan)
+
     planner = PhysicalPlanner(catalog)
-    physical_plan = planner.plan(bound_plan)
+    physical_plan = planner.plan(optimized_plan)
 
     executor = Executor()
     results = executor.execute(physical_plan)
@@ -262,8 +298,11 @@ def test_explain_returns_plan(setup_duckdb):
     binder = Binder(catalog)
     bound_plan = binder.bind(logical_plan)
 
+    optimizer = create_optimizer(catalog)
+    optimized_plan = optimizer.optimize(bound_plan)
+
     planner = PhysicalPlanner(catalog)
-    physical_plan = planner.plan(bound_plan)
+    physical_plan = planner.plan(optimized_plan)
 
     executor = Executor()
     batches = list(executor.execute(physical_plan))

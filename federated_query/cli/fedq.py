@@ -19,24 +19,41 @@ from ..datasources.duckdb import DuckDBDataSource
 from ..datasources.postgresql import PostgreSQLDataSource
 from ..executor import Executor
 from ..parser import Binder, Parser, BindingError
-from ..optimizer import PhysicalPlanner
+from ..optimizer import (
+    PhysicalPlanner,
+    RuleBasedOptimizer,
+    PredicatePushdownRule,
+    ProjectionPushdownRule,
+    LimitPushdownRule,
+    ExpressionSimplificationRule,
+)
 
 
 class FedQRuntime:
-    """Wraps the parse → bind → plan → execute pipeline."""
+    """Wraps the parse → bind → optimize → plan → execute pipeline."""
 
     def __init__(self, catalog: Catalog, executor_config: ExecutorConfig):
         self.parser = Parser()
         self.binder = Binder(catalog)
+        self.optimizer = RuleBasedOptimizer(catalog)
+        self._register_optimization_rules()
         self.planner = PhysicalPlanner(catalog)
         self.executor = Executor(executor_config)
+
+    def _register_optimization_rules(self) -> None:
+        """Register optimization rules in the correct order."""
+        self.optimizer.add_rule(ExpressionSimplificationRule())
+        self.optimizer.add_rule(PredicatePushdownRule())
+        self.optimizer.add_rule(ProjectionPushdownRule())
+        self.optimizer.add_rule(LimitPushdownRule())
 
     def execute(self, sql: str) -> pa.Table:
         """Run a SQL statement and return results as a table."""
         ast = self.parser.parse(sql)
         logical_plan = self.parser.ast_to_logical_plan(ast)
         bound_plan = self.binder.bind(logical_plan)
-        physical_plan = self.planner.plan(bound_plan)
+        optimized_plan = self.optimizer.optimize(bound_plan)
+        physical_plan = self.planner.plan(optimized_plan)
         return self.executor.execute_to_table(physical_plan)
 
 
