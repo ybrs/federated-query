@@ -3,6 +3,15 @@
 The goal is to cover every meaningful pushdown scenario with explicit SQL + expectation tests. The suite will be implemented incrementally in the buckets below. Each bucket enumerates the specific combinations to cover, along with notes on expected behavior (whether pushdown should happen, where it should not, and how many datasources are involved).
 
 ---
+## 0. Foundation
+
+* What we want is to see the real queries sent to datasources. To do that we need these following
+- In datasources add a method named "parse_query", this will just get the query and return an AST by using sqlglot
+- In the engine when we call "EXPLAIN query" it will parse/plan etc. and then will call datasources' parse_query method and in the end of the explain output it will show the queries sent to datasources.
+- When we send query "EXPLAIN (FORMAT JSON) ..." the engine will return a json document with "queries": [{"datasource_name": ..., query: "... rewritten sql..."}]
+- This "explain (format json) ..." when called from the code, should return a dictionary and queries should be the asts. when sending to client we can turn them into sql's
+- We need this part first to start the rest of these tasks. So in tests we'll use this, first send "Explain (format json) ..." and get the queries then check if they have proper structure.
+- We need at least 2 basic tests for pushdown predicate to see this path is working.  
 
 ## 1. Baseline Selects & Predicates (Single Table)
 * Simple `SELECT *` with/without `WHERE`

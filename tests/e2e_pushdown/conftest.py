@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional
+
+import sqlglot
 
 import pytest
 
@@ -11,19 +13,22 @@ from federated_query.catalog import Catalog
 from federated_query.datasources.duckdb import DuckDBDataSource
 
 
-class QueryCapturingDataSource(DuckDBDataSource):
-    """DuckDB source that records every executed query for pushdown assertions."""
+class ProxyingDuckDBDataSource(DuckDBDataSource):
+    """DuckDB source that captures the most recent query AST for assertions."""
 
     def __init__(self, name: str, config: Dict[str, str]):
         super().__init__(name, config)
-        self.captured_queries: List[str] = []
+        self._last_ast: Optional[sqlglot.exp.Expression] = None
 
     def execute_query(self, query: str):
-        self.captured_queries.append(query)
+        self._last_ast = sqlglot.parse_one(query)
         return super().execute_query(query)
 
-    def clear_queries(self) -> None:
-        self.captured_queries = []
+    def reset_tracking(self) -> None:
+        self._last_ast = None
+
+    def last_query_ast(self) -> Optional[sqlglot.exp.Expression]:
+        return self._last_ast
 
 
 @dataclass
@@ -31,14 +36,19 @@ class QueryEnvironment:
     """Wrapper containing catalog + datasources for pushdown tests."""
 
     catalog: Catalog
-    datasources: List[QueryCapturingDataSource]
+    datasources: List[ProxyingDuckDBDataSource]
 
-    def clear_queries(self) -> None:
+    def reset_datasources(self) -> None:
         for ds in self.datasources:
-            ds.clear_queries()
+            ds.reset_tracking()
 
-    def query_log(self) -> Dict[str, List[str]]:
-        return {ds.name: list(ds.captured_queries) for ds in self.datasources}
+    def snapshot_asts(self) -> Dict[str, sqlglot.exp.Expression]:
+        asts: Dict[str, sqlglot.exp.Expression] = {}
+        for ds in self.datasources:
+            ast = ds.last_query_ast()
+            if ast is not None:
+                asts[ds.name] = ast
+        return asts
 
 
 def _seed_orders(cursor) -> None:
@@ -123,7 +133,7 @@ def _seed_customers(cursor) -> None:
 
 def _build_datasource(name: str) -> QueryCapturingDataSource:
     config = {"database": ":memory:", "read_only": False}
-    ds = QueryCapturingDataSource(name=name, config=config)
+    ds = ProxyingDuckDBDataSource(name=name, config=config)
     ds.connect()
     return ds
 
