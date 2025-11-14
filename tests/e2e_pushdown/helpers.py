@@ -1,6 +1,6 @@
 """Shared utilities for pushdown end-to-end tests."""
 
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from sqlglot import exp
 
@@ -111,3 +111,13 @@ def find_alias_expression(
         if alias_name == alias and isinstance(expression, exp.Alias):
             return expression.this
     return None
+
+
+def datasource_query_map(document: Dict[str, object]) -> Dict[str, exp.Select]:
+    """Map datasource names to their captured SELECT ASTs."""
+    mapping: Dict[str, exp.Select] = {}
+    queries = document.get("queries", [])
+    for entry in queries:
+        datasource = entry["datasource_name"]
+        mapping[str(datasource)] = entry["query"]
+    return mapping
