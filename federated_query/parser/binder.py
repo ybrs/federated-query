@@ -21,6 +21,9 @@ from ..plan.expressions import (
     UnaryOp,
     DataType,
     FunctionCall,
+    InList,
+    BetweenExpression,
+    CaseExpr,
 )
 
 
@@ -168,6 +171,12 @@ class Binder:
         if isinstance(expr, UnaryOp):
             operand = self._bind_expression_multi_table(expr.operand, tables)
             return UnaryOp(op=expr.op, operand=operand)
+        if isinstance(expr, InList):
+            return self._bind_in_list_multi(expr, tables)
+        if isinstance(expr, BetweenExpression):
+            return self._bind_between_multi(expr, tables)
+        if isinstance(expr, CaseExpr):
+            return self._bind_case_expr_multi(expr, tables)
 
         return expr
 
@@ -196,7 +205,7 @@ class Binder:
     def _bind_explain(self, explain: Explain) -> Explain:
         """Bind an Explain node."""
         bound_child = self.bind(explain.input)
-        return Explain(input=bound_child)
+        return Explain(input=bound_child, format=explain.format)
 
     def _bind_aggregate(self, aggregate: Aggregate) -> Aggregate:
         """Bind an Aggregate node."""
@@ -471,6 +480,12 @@ class Binder:
             return self._bind_binary_op(expr, table)
         if isinstance(expr, UnaryOp):
             return self._bind_unary_op(expr, table)
+        if isinstance(expr, InList):
+            return self._bind_in_list(expr, table)
+        if isinstance(expr, BetweenExpression):
+            return self._bind_between(expr, table)
+        if isinstance(expr, CaseExpr):
+            return self._bind_case_expr(expr, table)
 
         return expr
 
@@ -506,6 +521,88 @@ class Binder:
         """Bind a unary operation."""
         operand = self._bind_expression(unary_op.operand, table)
         return UnaryOp(op=unary_op.op, operand=operand)
+
+    def _bind_in_list(
+        self,
+        expr: InList,
+        table: Optional[Table]
+    ) -> InList:
+        bound_value = self._bind_expression(expr.value, table)
+        bound_options: List[Expression] = []
+        for option in expr.options:
+            bound_option = self._bind_expression(option, table)
+            bound_options.append(bound_option)
+        return InList(value=bound_value, options=bound_options)
+
+    def _bind_in_list_multi(
+        self,
+        expr: InList,
+        tables: Dict[Optional[str], Table]
+    ) -> InList:
+        bound_value = self._bind_expression_multi_table(expr.value, tables)
+        bound_options: List[Expression] = []
+        for option in expr.options:
+            bound_option = self._bind_expression_multi_table(option, tables)
+            bound_options.append(bound_option)
+        return InList(value=bound_value, options=bound_options)
+
+    def _bind_between(
+        self,
+        expr: BetweenExpression,
+        table: Optional[Table]
+    ) -> BetweenExpression:
+        bound_value = self._bind_expression(expr.value, table)
+        bound_lower = self._bind_expression(expr.lower, table)
+        bound_upper = self._bind_expression(expr.upper, table)
+        return BetweenExpression(
+            value=bound_value,
+            lower=bound_lower,
+            upper=bound_upper,
+        )
+
+    def _bind_between_multi(
+        self,
+        expr: BetweenExpression,
+        tables: Dict[Optional[str], Table]
+    ) -> BetweenExpression:
+        bound_value = self._bind_expression_multi_table(expr.value, tables)
+        bound_lower = self._bind_expression_multi_table(expr.lower, tables)
+        bound_upper = self._bind_expression_multi_table(expr.upper, tables)
+        return BetweenExpression(
+            value=bound_value,
+            lower=bound_lower,
+            upper=bound_upper,
+        )
+
+    def _bind_case_expr(
+        self,
+        expr: CaseExpr,
+        table: Optional[Table]
+    ) -> CaseExpr:
+        bound_when = []
+        for condition, result in expr.when_clauses:
+            bound_condition = self._bind_expression(condition, table)
+            bound_result = self._bind_expression(result, table)
+            bound_when.append((bound_condition, bound_result))
+        bound_else = None
+        if expr.else_result is not None:
+            bound_else = self._bind_expression(expr.else_result, table)
+        return CaseExpr(when_clauses=bound_when, else_result=bound_else)
+
+    def _bind_case_expr_multi(
+        self,
+        expr: CaseExpr,
+        tables: Dict[Optional[str], Table]
+    ) -> CaseExpr:
+        bound_when = []
+        for condition, result in expr.when_clauses:
+            bound_condition = self._bind_expression_multi_table(condition, tables)
+            bound_result = self._bind_expression_multi_table(result, tables)
+            bound_when.append((bound_condition, bound_result))
+        bound_else = None
+        if expr.else_result is not None:
+            bound_else = self._bind_expression_multi_table(expr.else_result, tables)
+        return CaseExpr(when_clauses=bound_when, else_result=bound_else)
 
     def __repr__(self) -> str:
         return "Binder()"

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import time
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import click
 import duckdb
@@ -19,24 +20,90 @@ from ..datasources.duckdb import DuckDBDataSource
 from ..datasources.postgresql import PostgreSQLDataSource
 from ..executor import Executor
 from ..parser import Binder, Parser, BindingError
-from ..optimizer import PhysicalPlanner
+from ..optimizer import (
+    PhysicalPlanner,
+    RuleBasedOptimizer,
+    PredicatePushdownRule,
+    ProjectionPushdownRule,
+    AggregatePushdownRule,
+    LimitPushdownRule,
+    ExpressionSimplificationRule,
+)
+from ..plan import PhysicalExplain, ExplainFormat
+
+
+def build_json_explain_table(document: Dict[str, Any]) -> pa.Table:
+    """Convert explain document to single-column Arrow table with JSON text."""
+    serializable = _serialize_explain_document(document)
+    json_text = json.dumps(serializable, indent=2)
+    array = pa.array([json_text])
+    table = pa.Table.from_arrays([array], names=["plan"])
+    return table
+
+
+def _serialize_explain_document(document: Dict[str, Any]) -> Dict[str, Any]:
+    """Produce JSON-safe copy without mutating the original document."""
+    output: Dict[str, Any] = {}
+    for key in document:
+        if key == "queries":
+            entries = document[key]
+            output["queries"] = _serialize_queries(entries)
+        else:
+            output[key] = document[key]
+    return output
+
+
+def _serialize_queries(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    serialized: List[Dict[str, Any]] = []
+    for entry in entries:
+        datasource = entry.get("datasource_name")
+        query_value = entry.get("query")
+        query_text = _stringify_query_value(query_value)
+        converted = {
+            "datasource_name": datasource,
+            "query": query_text,
+        }
+        serialized.append(converted)
+    return serialized
+
+
+def _stringify_query_value(query_value: Any) -> str:
+    if hasattr(query_value, "sql"):
+        return query_value.sql(dialect="postgres")
+    if query_value is None:
+        return "NULL"
+    return str(query_value)
 
 
 class FedQRuntime:
-    """Wraps the parse → bind → plan → execute pipeline."""
+    """Wraps the parse → bind → optimize → plan → execute pipeline."""
 
     def __init__(self, catalog: Catalog, executor_config: ExecutorConfig):
         self.parser = Parser()
         self.binder = Binder(catalog)
+        self.optimizer = RuleBasedOptimizer(catalog)
+        self._register_optimization_rules()
         self.planner = PhysicalPlanner(catalog)
         self.executor = Executor(executor_config)
 
-    def execute(self, sql: str) -> pa.Table:
-        """Run a SQL statement and return results as a table."""
+    def _register_optimization_rules(self) -> None:
+        """Register optimization rules in the correct order."""
+        self.optimizer.add_rule(ExpressionSimplificationRule())
+        self.optimizer.add_rule(PredicatePushdownRule())
+        self.optimizer.add_rule(ProjectionPushdownRule())
+        self.optimizer.add_rule(AggregatePushdownRule())
+        self.optimizer.add_rule(LimitPushdownRule())
+
+    def execute(self, sql: str) -> Union[pa.Table, Dict[str, Any]]:
+        """Run a SQL statement and return results."""
         ast = self.parser.parse(sql)
         logical_plan = self.parser.ast_to_logical_plan(ast)
         bound_plan = self.binder.bind(logical_plan)
-        physical_plan = self.planner.plan(bound_plan)
+        optimized_plan = self.optimizer.optimize(bound_plan)
+        physical_plan = self.planner.plan(optimized_plan)
+        if isinstance(physical_plan, PhysicalExplain):
+            if physical_plan.format == ExplainFormat.JSON:
+                return physical_plan.build_document(stringify_queries=False)
         return self.executor.execute_to_table(physical_plan)
 
 
@@ -277,9 +344,14 @@ class FedQRepl:
             return
         try:
             start = time.time()
-            table = self.runtime.execute(clean)
+            result = self.runtime.execute(clean)
             elapsed = (time.time() - start) * 1000
-            self.printer.display(table, elapsed)
+            if isinstance(result, dict):
+                json_table = build_json_explain_table(result)
+                self.printer.display(json_table, elapsed)
+                click.echo(f"EXPLAIN completed in {elapsed:.2f} ms")
+            else:
+                self.printer.display(result, elapsed)
         except (
             ValueError,
             RuntimeError,

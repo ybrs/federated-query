@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import List, Dict, Any, Iterator, Optional
 from enum import Enum
 import pyarrow as pa
+import sqlglot
 
 
 class DataSourceCapability(Enum):
@@ -158,6 +159,10 @@ class DataSource(ABC):
             Arrow schema
         """
         pass
+
+    def parse_query(self, query: str):
+        """Parse query text into a sqlglot AST."""
+        return sqlglot.parse_one(query, dialect="postgres")
 
     def supports_capability(self, capability: DataSourceCapability) -> bool:
         """Check if data source supports a capability.

@@ -238,6 +238,54 @@ class CaseExpr(Expression):
         return f"CaseExpr(when_count={len(self.when_clauses)})"
 
 
+@dataclass(frozen=True)
+class InList(Expression):
+    """IN list expression."""
+
+    value: Expression
+    options: List[Expression]
+
+    def get_type(self) -> DataType:
+        return DataType.BOOLEAN
+
+    def accept(self, visitor):
+        return visitor.visit_in_list(self)
+
+    def to_sql(self) -> str:
+        values = []
+        for option in self.options:
+            values.append(option.to_sql())
+        joined = ", ".join(values)
+        return f"({self.value.to_sql()} IN ({joined}))"
+
+    def __repr__(self) -> str:
+        return f"InList(options={len(self.options)})"
+
+
+@dataclass(frozen=True)
+class BetweenExpression(Expression):
+    """BETWEEN expression."""
+
+    value: Expression
+    lower: Expression
+    upper: Expression
+
+    def get_type(self) -> DataType:
+        return DataType.BOOLEAN
+
+    def accept(self, visitor):
+        return visitor.visit_between(self)
+
+    def to_sql(self) -> str:
+        value_sql = self.value.to_sql()
+        lower_sql = self.lower.to_sql()
+        upper_sql = self.upper.to_sql()
+        return f"({value_sql} BETWEEN {lower_sql} AND {upper_sql})"
+
+    def __repr__(self) -> str:
+        return "BetweenExpression()"
+
+
 class ExpressionVisitor(ABC):
     """Visitor interface for expressions."""
 
@@ -263,4 +311,12 @@ class ExpressionVisitor(ABC):
 
     @abstractmethod
     def visit_case_expr(self, expr: CaseExpr):
+        pass
+
+    @abstractmethod
+    def visit_in_list(self, expr: InList):
+        pass
+
+    @abstractmethod
+    def visit_between(self, expr: BetweenExpression):
         pass

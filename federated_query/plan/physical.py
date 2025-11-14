@@ -1,14 +1,15 @@
 """Physical plan nodes."""
 
+import json
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import List, Optional, Iterator, Any, TYPE_CHECKING, Dict, Callable
+from dataclasses import dataclass, field
+from typing import List, Optional, Iterator, Any, TYPE_CHECKING, Dict, Callable, Set, Tuple
 from enum import Enum
 
 import pyarrow as pa
 
 from .expressions import Expression
-from .logical import JoinType
+from .logical import JoinType, ExplainFormat
 
 if TYPE_CHECKING:
     from .expressions import FunctionCall
@@ -40,10 +41,20 @@ class PhysicalPlanNode(ABC):
     def __repr__(self) -> str:
         return self.__class__.__name__
 
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        """Optional mapping from (table, column) to physical column name."""
+        return {}
+
 
 @dataclass
 class PhysicalScan(PhysicalPlanNode):
-    """Scan a table from a data source."""
+    """Scan a table from a data source.
+
+    Can represent:
+    - Simple scan: SELECT columns FROM table
+    - Scan with filter: SELECT columns FROM table WHERE filter
+    - Scan with aggregates: SELECT group_by, agg_funcs FROM table WHERE filter GROUP BY group_by
+    """
 
     datasource: str
     schema_name: str
@@ -52,6 +63,12 @@ class PhysicalScan(PhysicalPlanNode):
     filters: Optional[Expression] = None
     datasource_connection: Any = None  # Set during planning
     _schema: Optional[pa.Schema] = None  # Cached schema
+    group_by: Optional[List[Expression]] = None  # Optional GROUP BY expressions
+    aggregates: Optional[List[Expression]] = None  # Optional aggregate expressions
+    output_names: Optional[List[str]] = None  # Output column names when using aggregates
+    alias: Optional[str] = None  # Table alias (if any)
+    limit: Optional[int] = None
+    offset: int = 0
 
     def children(self) -> List[PhysicalPlanNode]:
         return []
@@ -79,10 +96,33 @@ class PhysicalScan(PhysicalPlanNode):
             where_clause = self.filters.to_sql()
             query = f"{query} WHERE {where_clause}"
 
+        if self.group_by:
+            group_clause = self._format_group_by()
+            query = f"{query} GROUP BY {group_clause}"
+
+        if self.limit is not None:
+            query = f"{query} LIMIT {self.limit}"
+            if self.offset:
+                query = f"{query} OFFSET {self.offset}"
+
         return query
 
     def _format_columns(self) -> str:
-        """Format column list for SQL."""
+        """Format column list for SQL.
+
+        If aggregates are present, use them directly.
+        The aggregates list contains ALL SELECT expressions in order:
+        - GROUP BY columns first
+        - Then aggregate functions (COUNT, SUM, etc.)
+
+        Otherwise format simple column list.
+        """
+        if self.aggregates:
+            select_items = []
+            for expr in self.aggregates:
+                select_items.append(expr.to_sql())
+            return ", ".join(select_items)
+
         if "*" in self.columns:
             return "*"
 
@@ -94,7 +134,21 @@ class PhysicalScan(PhysicalPlanNode):
 
     def _format_table_ref(self) -> str:
         """Format table reference for SQL."""
-        return f'"{self.schema_name}"."{self.table_name}"'
+        ref = f'"{self.schema_name}"."{self.table_name}"'
+        if self.alias:
+            return f'{ref} AS {self.alias}'
+        return ref
+
+    def _format_group_by(self) -> str:
+        """Format GROUP BY clause."""
+        if not self.group_by:
+            return ""
+
+        group_items = []
+        for expr in self.group_by:
+            group_items.append(expr.to_sql())
+
+        return ", ".join(group_items)
 
     def schema(self) -> pa.Schema:
         """Get output schema."""
@@ -114,6 +168,8 @@ class PhysicalScan(PhysicalPlanNode):
 
     def __repr__(self) -> str:
         table_ref = f"{self.datasource}.{self.schema_name}.{self.table_name}"
+        if self.alias:
+            return f"PhysicalScan({table_ref} AS {self.alias})"
         return f"PhysicalScan({table_ref})"
 
 
@@ -140,6 +196,7 @@ class PhysicalProject(PhysicalPlanNode):
 
         columns = []
         output_names = []
+        alias_map = self.column_aliases()
 
         for i, expr in enumerate(self.expressions):
             if isinstance(expr, ColumnRef):
@@ -148,7 +205,7 @@ class PhysicalProject(PhysicalPlanNode):
                         columns.append(batch.column(col_idx))
                         output_names.append(batch.schema.field(col_idx).name)
                 else:
-                    column_data = batch.column(expr.column)
+                    column_data = self._resolve_column(expr, batch, alias_map)
                     columns.append(column_data)
                     output_names.append(self.output_names[i])
             else:
@@ -190,6 +247,52 @@ class PhysicalProject(PhysicalPlanNode):
 
     def __repr__(self) -> str:
         return f"PhysicalProject({len(self.expressions)} exprs)"
+
+    def _resolve_column(
+        self,
+        expr: Expression,
+        batch: pa.RecordBatch,
+        alias_map: Dict[Tuple[Optional[str], str], str]
+    ) -> pa.Array:
+        """Resolve column, including alias fallbacks."""
+        from .expressions import ColumnRef
+
+        if not isinstance(expr, ColumnRef):
+            raise ValueError("Expected ColumnRef")
+
+        mapped = None
+        if expr.table is not None:
+            mapped = self._lookup_alias(expr, alias_map)
+            if mapped is not None:
+                return batch.column(mapped)
+
+        try:
+            return batch.column(expr.column)
+        except KeyError:
+            if mapped is None:
+                mapped = self._lookup_alias(expr, alias_map)
+            if mapped is None:
+                raise
+            return batch.column(mapped)
+
+    def _lookup_alias(
+        self,
+        expr: Expression,
+        alias_map: Dict[Tuple[Optional[str], str], str]
+    ) -> Optional[str]:
+        from .expressions import ColumnRef
+
+        if not isinstance(expr, ColumnRef):
+            return None
+
+        if expr.table is None:
+            return None
+
+        key = (expr.table, expr.column)
+        return alias_map.get(key)
+
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        return self.input.column_aliases()
 
 
 @dataclass
@@ -268,6 +371,9 @@ class PhysicalFilter(PhysicalPlanNode):
 
     def __repr__(self) -> str:
         return f"PhysicalFilter({self.predicate})"
+
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        return self.input.column_aliases()
 
 
 @dataclass
@@ -571,6 +677,168 @@ class PhysicalHashJoin(PhysicalPlanNode):
 
     def __repr__(self) -> str:
         return f"PhysicalHashJoin({self.join_type.value}, build={self.build_side})"
+
+
+@dataclass
+class PhysicalRemoteJoin(PhysicalPlanNode):
+    """Join executed directly on a single data source."""
+
+    left: PhysicalScan
+    right: PhysicalScan
+    join_type: JoinType
+    condition: Expression
+    datasource_connection: Any
+    group_by: Optional[List[Expression]] = None
+    aggregates: Optional[List[Expression]] = None
+    output_names: Optional[List[str]] = None
+    _schema: Optional[pa.Schema] = None
+    _column_alias_map: Dict[Tuple[Optional[str], str], str] = field(default_factory=dict, init=False)
+
+    def children(self) -> List[PhysicalPlanNode]:
+        return []
+
+    def execute(self) -> Iterator[pa.RecordBatch]:
+        query = self._build_query()
+        self.datasource_connection.ensure_connected()
+        batches = self.datasource_connection.execute_query(query)
+        for batch in batches:
+            yield batch
+
+    def schema(self) -> pa.Schema:
+        if self._schema is None:
+            query = self._build_query()
+            self._schema = self.datasource_connection.get_query_schema(query)
+        return self._schema
+
+    def estimated_cost(self) -> float:
+        raise NotImplementedError("Cost estimation not yet implemented")
+
+    def __repr__(self) -> str:
+        return f"PhysicalRemoteJoin({self.join_type.value})"
+
+    def _build_query(self) -> str:
+        self._column_alias_map = {}
+        select_clause = self._build_select_clause()
+        left_source = self._build_source(self.left)
+        right_source = self._build_source(self.right)
+        join_keyword = self._join_keyword()
+        condition_sql = self.condition.to_sql()
+        query = f"SELECT {select_clause} FROM {left_source} {join_keyword} {right_source} ON {condition_sql}"
+        if self.group_by:
+            group_clause = self._build_group_by_clause()
+            query = f"{query} GROUP BY {group_clause}"
+        return query
+
+    def _build_select_clause(self) -> str:
+        if self.aggregates:
+            return self._build_aggregate_select_clause()
+        items = []
+        seen = set()
+        self._append_select_items(self.left, items, seen, False)
+        self._append_select_items(self.right, items, seen, True)
+        return ", ".join(items)
+
+    def _build_aggregate_select_clause(self) -> str:
+        items = []
+        names = self.output_names or []
+        expressions = self.aggregates or []
+        index = 0
+        while index < len(expressions):
+            expr_sql = expressions[index].to_sql()
+            alias = names[index] if index < len(names) else None
+            if alias:
+                items.append(f'{expr_sql} AS "{alias}"')
+            else:
+                items.append(expr_sql)
+            index += 1
+        return ", ".join(items)
+
+    def _build_group_by_clause(self) -> str:
+        parts = []
+        for expr in self.group_by or []:
+            parts.append(expr.to_sql())
+        return ", ".join(parts)
+
+    def _append_select_items(
+        self,
+        scan: PhysicalScan,
+        items: List[str],
+        seen: Set[str],
+        is_right: bool
+    ) -> None:
+        columns = self._resolve_columns(scan)
+        alias = self._scan_alias(scan)
+        for column in columns:
+            source = self._format_column(alias, column)
+            output = self._select_output_name(column, seen, is_right)
+            items.append(f'{source} AS "{output}"')
+            seen.add(output)
+            self._register_column_alias(scan, column, output)
+
+    def _resolve_columns(self, scan: PhysicalScan) -> List[str]:
+        if scan.columns and "*" in scan.columns:
+            schema = scan.schema()
+            names = []
+            for field in schema:
+                names.append(field.name)
+            return names
+        return scan.columns
+
+    def _format_column(self, alias: str, column: str) -> str:
+        return f'{alias}."{column}"'
+
+    def _select_output_name(
+        self,
+        column: str,
+        seen: Set[str],
+        is_right: bool
+    ) -> str:
+        name = column
+        if is_right and name in seen:
+            name = f"right_{name}"
+        return name
+
+    def _join_keyword(self) -> str:
+        return f"{self.join_type.value} JOIN"
+
+    def _scan_alias(self, scan: PhysicalScan) -> str:
+        if scan.alias:
+            return scan.alias
+        return scan.table_name
+
+    def _build_source(self, scan: PhysicalScan) -> str:
+        table_ref = f'"{scan.schema_name}"."{scan.table_name}"'
+        alias = scan.alias
+        if scan.filters is None:
+            if alias:
+                return f"{table_ref} AS {alias}"
+            return table_ref
+        alias_name = alias if alias else scan.table_name
+        filter_sql = scan.filters.to_sql()
+        return f"(SELECT * FROM {table_ref} AS {alias_name} WHERE {filter_sql}) AS {alias_name}"
+
+    def _register_column_alias(
+        self,
+        scan: PhysicalScan,
+        column: str,
+        output: str
+    ) -> None:
+        identifiers = set()
+        if scan.alias:
+            identifiers.add(scan.alias)
+        identifiers.add(scan.table_name)
+
+        for ident in identifiers:
+            if ident:
+                self._column_alias_map[(ident, column)] = output
+
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        if self.aggregates and self.output_names:
+            alias_map: Dict[Tuple[Optional[str], str], str] = {}
+            for name in self.output_names:
+                alias_map[(None, name)] = name
+            return alias_map
+        return self._column_alias_map
 
 
 @dataclass
@@ -975,17 +1243,47 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         return pa.RecordBatch.from_arrays(columns, names=self.output_names)
 
     def _extract_column_values(self, hash_table: dict, col_idx: int) -> pa.Array:
-        """Extract values for a column."""
+        """Extract values for a column.
+
+        The aggregates list contains ALL expressions from SELECT clause:
+        - Non-aggregate columns (ColumnRef) - these match group_by expressions
+        - Aggregate functions (FunctionCall with is_aggregate=True)
+
+        Accumulators are indexed by position in aggregates (accumulator[i] for aggregates[i]).
+        """
+        from .expressions import FunctionCall
+
+        expr = self.aggregates[col_idx]
+
         values = []
         for group_key, accumulators in hash_table.items():
-            if col_idx < len(self.group_by):
-                values.append(group_key[col_idx] if group_key else None)
-            else:
-                agg_idx = col_idx
-                value = self._finalize_accumulator(accumulators[agg_idx])
+            # Check if this is an aggregate function
+            if isinstance(expr, FunctionCall) and expr.is_aggregate:
+                # Accumulators are indexed by position in aggregates
+                value = self._finalize_accumulator(accumulators[col_idx])
                 values.append(value)
+            else:
+                # This is a group-by column - find which one
+                group_idx = self._find_group_by_index(expr)
+                if group_idx is not None:
+                    values.append(group_key[group_idx] if group_key else None)
+                else:
+                    # Fallback: might be a constant or expression
+                    values.append(None)
 
         return pa.array(values)
+
+    def _find_group_by_index(self, expr: Expression) -> int:
+        """Find which group_by expression this matches."""
+        from .expressions import ColumnRef
+
+        # For now, simple match by column name
+        if isinstance(expr, ColumnRef):
+            for i, group_expr in enumerate(self.group_by):
+                if isinstance(group_expr, ColumnRef) and group_expr.column == expr.column:
+                    return i
+
+        return None
 
     def _finalize_accumulator(self, acc: dict):
         """Finalize accumulator to get final value."""
@@ -1171,6 +1469,9 @@ class PhysicalHashAggregate(PhysicalPlanNode):
     def __repr__(self) -> str:
         return f"PhysicalHashAggregate(groups={len(self.group_by)}, aggs={len(self.aggregates)})"
 
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        return self.input.column_aliases()
+
 
 @dataclass
 class PhysicalSort(PhysicalPlanNode):
@@ -1195,6 +1496,9 @@ class PhysicalSort(PhysicalPlanNode):
 
     def __repr__(self) -> str:
         return f"PhysicalSort({len(self.sort_keys)} keys)"
+
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        return self.input.column_aliases()
 
 
 @dataclass
@@ -1244,23 +1548,36 @@ class PhysicalLimit(PhysicalPlanNode):
     def __repr__(self) -> str:
         return f"PhysicalLimit({self.limit})"
 
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        return self.input.column_aliases()
+
 
 @dataclass
 class PhysicalExplain(PhysicalPlanNode):
     """Explain a physical plan without executing it."""
 
     child: PhysicalPlanNode
+    format: ExplainFormat = ExplainFormat.TEXT
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.child]
 
     def execute(self) -> Iterator[pa.RecordBatch]:
-        """Return textual representation of the plan."""
-        formatter = _PlanFormatter()
-        lines = formatter.format(self.child)
-        array = pa.array(lines)
-        batch = pa.RecordBatch.from_arrays([array], names=["plan"])
+        """Return representation of the plan."""
+        if self.format == ExplainFormat.JSON:
+            batch = self._build_json_batch()
+            yield batch
+            return
+        batch = self._build_text_batch()
         yield batch
+
+    def build_document(self, stringify_queries: bool = False) -> Dict[str, Any]:
+        """Build structured plan + query metadata."""
+        formatter = _PlanFormatter()
+        plan_lines = formatter.format(self.child)
+        entries = self._build_query_entries(stringify_queries)
+        document = {"plan": plan_lines, "queries": entries}
+        return document
 
     def schema(self) -> pa.Schema:
         return pa.schema([pa.field("plan", pa.string())])
@@ -1269,7 +1586,60 @@ class PhysicalExplain(PhysicalPlanNode):
         return -1.0
 
     def __repr__(self) -> str:
-        return "PhysicalExplain()"
+        return f"PhysicalExplain(format={self.format.value})"
+
+    def _build_text_batch(self) -> pa.RecordBatch:
+        formatter = _PlanFormatter()
+        lines = formatter.format(self.child)
+        self._append_query_lines(lines)
+        array = pa.array(lines)
+        return pa.RecordBatch.from_arrays([array], names=["plan"])
+
+    def _build_json_batch(self) -> pa.RecordBatch:
+        document = self.build_document(stringify_queries=True)
+        json_text = json.dumps(document, indent=2)
+        array = pa.array([json_text])
+        return pa.RecordBatch.from_arrays([array], names=["plan"])
+
+    def _append_query_lines(self, lines: List[str]) -> None:
+        queries = self._collect_queries()
+        if not queries:
+            return
+        lines.append("")
+        lines.append("Queries:")
+        for snapshot in queries:
+            text = f"- {snapshot.datasource_name}: {snapshot.sql}"
+            lines.append(text)
+
+    def _build_query_entries(self, stringify_queries: bool) -> List[Dict[str, Any]]:
+        queries = self._collect_queries()
+        entries: List[Dict[str, Any]] = []
+        for snapshot in queries:
+            query_value: Any = snapshot.query_ast
+            if stringify_queries:
+                if snapshot.query_ast is not None:
+                    query_value = snapshot.query_ast.sql(dialect="postgres")
+                else:
+                    query_value = snapshot.sql
+            entry = {
+                "datasource_name": snapshot.datasource_name,
+                "query": query_value,
+            }
+            entries.append(entry)
+        return entries
+
+    def _collect_queries(self) -> List["_DatasourceQuerySnapshot"]:
+        collector = _DatasourceQueryCollector()
+        return collector.collect(self.child)
+
+
+@dataclass
+class _DatasourceQuerySnapshot:
+    """Captured query metadata for a single datasource call."""
+
+    datasource_name: str
+    sql: str
+    query_ast: Any
 
 
 @dataclass
@@ -1312,6 +1682,7 @@ class _PlanFormatter:
         self._detail_builders[PhysicalFilter] = self._filter_detail
         self._detail_builders[PhysicalLimit] = self._limit_detail
         self._detail_builders[PhysicalHashJoin] = self._hash_join_detail
+        self._detail_builders[PhysicalRemoteJoin] = self._remote_join_detail
         self._detail_builders[PhysicalNestedLoopJoin] = self._nested_loop_join_detail
         self._detail_builders[PhysicalHashAggregate] = self._aggregate_detail
         self._detail_builders[PhysicalSort] = self._sort_detail
@@ -1386,6 +1757,11 @@ class _PlanFormatter:
             info = f"{info} right_keys={right_keys}"
         return f"{info} build_side={node.build_side}"
 
+    def _remote_join_detail(self, node: PhysicalRemoteJoin) -> str:
+        left = f"{node.left.schema_name}.{node.left.table_name}"
+        right = f"{node.right.schema_name}.{node.right.table_name}"
+        return f"type={node.join_type.value} sources={left}⨝{right}"
+
     def _nested_loop_join_detail(self, node: PhysicalNestedLoopJoin) -> str:
         info = f"type={node.join_type.value}"
         if node.condition:
@@ -1422,3 +1798,59 @@ class _PlanFormatter:
         for column in columns:
             buffer.append(column)
         return ",".join(buffer)
+
+
+
+class _DatasourceQueryCollector:
+    """Collect queries issued by physical plan nodes."""
+
+    def collect(self, node: PhysicalPlanNode) -> List[_DatasourceQuerySnapshot]:
+        snapshots: List[_DatasourceQuerySnapshot] = []
+        self._visit(node, snapshots)
+        return snapshots
+
+    def _visit(
+        self,
+        node: PhysicalPlanNode,
+        snapshots: List[_DatasourceQuerySnapshot]
+    ) -> None:
+        self._record_node(node, snapshots)
+        children = node.children()
+        for child in children:
+            self._visit(child, snapshots)
+
+    def _record_node(
+        self,
+        node: PhysicalPlanNode,
+        snapshots: List[_DatasourceQuerySnapshot]
+    ) -> None:
+        if isinstance(node, PhysicalScan):
+            self._record_scan(node, snapshots)
+        elif isinstance(node, PhysicalRemoteJoin):
+            self._record_remote_join(node, snapshots)
+
+    def _record_scan(
+        self,
+        scan: PhysicalScan,
+        snapshots: List[_DatasourceQuerySnapshot]
+    ) -> None:
+        datasource = scan.datasource_connection
+        if datasource is None:
+            return
+        sql = scan._build_query()
+        query_ast = datasource.parse_query(sql)
+        snapshot = _DatasourceQuerySnapshot(scan.datasource, sql, query_ast)
+        snapshots.append(snapshot)
+
+    def _record_remote_join(
+        self,
+        join: PhysicalRemoteJoin,
+        snapshots: List[_DatasourceQuerySnapshot]
+    ) -> None:
+        datasource = join.datasource_connection
+        if datasource is None:
+            return
+        sql = join._build_query()
+        query_ast = datasource.parse_query(sql)
+        snapshot = _DatasourceQuerySnapshot(join.left.datasource, sql, query_ast)
+        snapshots.append(snapshot)

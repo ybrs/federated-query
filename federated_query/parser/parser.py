@@ -13,6 +13,7 @@ from ..plan.logical import (
     JoinType,
     Aggregate,
     Explain,
+    ExplainFormat,
 )
 from ..plan.expressions import (
     Expression,
@@ -24,6 +25,9 @@ from ..plan.expressions import (
     UnaryOpType,
     DataType,
     FunctionCall,
+    InList,
+    BetweenExpression,
+    CaseExpr,
 )
 
 
@@ -80,21 +84,74 @@ class Parser:
 
     def _convert_explain(self, command: exp.Command) -> LogicalPlanNode:
         """Convert EXPLAIN statement to logical plan."""
-        query_ast = self._extract_explain_expression(command)
+        query_ast, explain_format = self._extract_explain_parts(command)
         child_plan = self.ast_to_logical_plan(query_ast)
-        return Explain(input=child_plan)
+        return Explain(input=child_plan, format=explain_format)
 
-    def _extract_explain_expression(self, command: exp.Command) -> exp.Expression:
-        """Extract the statement wrapped by EXPLAIN."""
+    def _extract_explain_parts(
+        self, command: exp.Command
+    ) -> Tuple[exp.Expression, ExplainFormat]:
+        """Extract wrapped statement and format."""
         expression = command.args.get("expression")
         if expression is None:
             raise ValueError("EXPLAIN requires a statement to describe")
         if isinstance(expression, exp.Literal) and expression.is_string:
-            sql_text = expression.this
-            return sqlglot.parse_one(sql_text, dialect=self.dialect)
+            sql_text = expression.this.strip()
+            explain_format, sql_body = self._parse_explain_options(sql_text)
+            parsed = sqlglot.parse_one(sql_body, dialect=self.dialect)
+            return parsed, explain_format
         if isinstance(expression, exp.Expression):
-            return expression
+            return expression, ExplainFormat.TEXT
         raise ValueError(f"Unsupported EXPLAIN expression: {type(expression)}")
+
+    def _parse_explain_options(
+        self, sql_text: str
+    ) -> Tuple[ExplainFormat, str]:
+        """Parse optional EXPLAIN options prefix."""
+        if not sql_text.startswith("("):
+            return ExplainFormat.TEXT, sql_text
+        options, remainder = self._split_option_clause(sql_text)
+        explain_format = self._resolve_explain_format(options)
+        cleaned_sql = remainder.strip()
+        return explain_format, cleaned_sql
+
+    def _split_option_clause(self, sql_text: str) -> Tuple[str, str]:
+        """Split '(...) rest' into option text and remainder."""
+        depth = 0
+        start_index = -1
+        end_index = -1
+        for position, char in enumerate(sql_text):
+            if char == "(":
+                if depth == 0:
+                    start_index = position
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    end_index = position
+                    break
+        if end_index == -1 or start_index == -1:
+            raise ValueError("EXPLAIN options missing closing parenthesis")
+        options = sql_text[start_index + 1 : end_index]
+        remainder = sql_text[end_index + 1 :]
+        return options, remainder
+
+    def _resolve_explain_format(self, options: str) -> ExplainFormat:
+        """Determine requested EXPLAIN format."""
+        normalized = options.replace("=", " ")
+        normalized = normalized.replace(",", " ")
+        tokens = normalized.split()
+        index = 0
+        while index < len(tokens):
+            token = tokens[index].upper()
+            if token in ("FORMAT", "AS") and index + 1 < len(tokens):
+                value = tokens[index + 1].upper()
+                if value == "JSON":
+                    return ExplainFormat.JSON
+                if value == "TEXT":
+                    return ExplainFormat.TEXT
+            index += 1
+        return ExplainFormat.TEXT
 
     def _is_explain_command(self, command: exp.Command) -> bool:
         """Check if a sqlglot Command represents EXPLAIN."""
@@ -123,6 +180,7 @@ class Parser:
             return self._build_join_plan(select, table_expr, joins)
 
         table_parts = self._extract_table_parts(table_expr)
+        table_alias = self._extract_table_alias(table_expr)
         all_columns = self._collect_needed_columns(select)
 
         datasource = table_parts[0]
@@ -134,6 +192,7 @@ class Parser:
             schema_name=schema_name,
             table_name=table_name,
             columns=all_columns,
+            alias=table_alias,
         )
 
     def _build_join_plan(
@@ -149,14 +208,20 @@ class Parser:
         Returns:
             Join node
         """
+        column_usage = self._collect_join_column_usage(select)
+
         left_table_parts = self._extract_table_parts(left_table)
         left_table_alias = self._extract_table_alias(left_table)
+        left_columns = self._columns_for_join_table(
+            column_usage, left_table_alias
+        )
 
         left_plan = Scan(
             datasource=left_table_parts[0],
             schema_name=left_table_parts[1],
             table_name=left_table_parts[2],
-            columns=["*"],
+            columns=left_columns,
+            alias=left_table_alias,
         )
 
         current_plan = left_plan
@@ -165,12 +230,16 @@ class Parser:
             right_table = join_clause.this
             right_table_parts = self._extract_table_parts(right_table)
             right_table_alias = self._extract_table_alias(right_table)
+            right_columns = self._columns_for_join_table(
+                column_usage, right_table_alias
+            )
 
             right_plan = Scan(
                 datasource=right_table_parts[0],
                 schema_name=right_table_parts[1],
                 table_name=right_table_parts[2],
-                columns=["*"],
+                columns=right_columns,
+                alias=right_table_alias,
             )
 
             join_type = self._extract_join_type(join_clause)
@@ -196,9 +265,10 @@ class Parser:
         Returns:
             Table alias or table name if no alias
         """
-        if table_expr.alias:
-            return table_expr.alias
-        return table_expr.name
+        alias = table_expr.alias
+        if alias:
+            return str(alias)
+        return str(table_expr.alias_or_name)
 
     def _filter_columns_for_table(
         self, columns: List[str], table_alias: Optional[str]
@@ -225,6 +295,42 @@ class Parser:
                 filtered.append(col)
 
         return filtered
+
+    def _collect_join_column_usage(
+        self, select: exp.Select
+    ) -> Dict[Optional[str], List[str]]:
+        """Collect column usage grouped by table alias for join planning."""
+        usage: Dict[Optional[str], List[str]] = {}
+        for column in select.find_all(exp.Column):
+            table_name = column.table
+            column_name = column.name
+            if not column_name:
+                continue
+            if table_name is None:
+                bucket = usage.setdefault(None, [])
+                if column_name not in bucket:
+                    bucket.append(column_name)
+                continue
+            bucket = usage.setdefault(table_name, [])
+            if column_name not in bucket:
+                bucket.append(column_name)
+        return usage
+
+    def _columns_for_join_table(
+        self,
+        usage: Dict[Optional[str], List[str]],
+        table_alias: Optional[str],
+    ) -> List[str]:
+        """Return column list for a specific table in a join."""
+        key = table_alias
+        if key in usage:
+            columns = usage[key]
+            if "*" in columns:
+                return ["*"]
+            return list(columns)
+        if None in usage and usage[None]:
+            return ["*"]
+        return ["*"]
 
     def _extract_join_type(self, join_clause: exp.Join) -> JoinType:
         """Extract join type from JOIN clause.
@@ -573,7 +679,11 @@ class Parser:
             return input_plan
 
         limit_value = int(limit_expr.expression.this)
-        return Limit(input=input_plan, limit=limit_value)
+        offset_value = 0
+        offset_expr = select.args.get("offset")
+        if offset_expr is not None:
+            offset_value = int(offset_expr.expression.this)
+        return Limit(input=input_plan, limit=limit_value, offset=offset_value)
 
     def _convert_expression(self, expr: exp.Expression) -> Expression:
         """Convert sqlglot expression to our Expression.
@@ -584,10 +694,16 @@ class Parser:
         Returns:
             Our Expression object
         """
+        if isinstance(expr, exp.In):
+            return self._convert_in_expression(expr)
+        if isinstance(expr, exp.Between):
+            return self._convert_between_expression(expr)
         if isinstance(expr, exp.Column):
             return self._convert_column(expr)
         if isinstance(expr, exp.Literal):
             return self._convert_literal(expr)
+        if isinstance(expr, exp.Null):
+            return Literal(value=None, data_type=DataType.NULL)
         if isinstance(expr, exp.Binary):
             return self._convert_binary(expr)
         if isinstance(expr, exp.Unary):
@@ -596,10 +712,42 @@ class Parser:
             return self._convert_expression(expr.this)
         if isinstance(expr, exp.Star):
             return ColumnRef(table=None, column="*")
+        if isinstance(expr, exp.Case):
+            return self._convert_case_expression(expr)
         if self._is_aggregate_function(expr):
             return self._convert_aggregate_function(expr)
 
         raise ValueError(f"Unsupported expression type: {type(expr)}")
+
+    def _convert_in_expression(self, expr: exp.In) -> Expression:
+        """Convert IN list to expression node."""
+        value_expr = self._convert_expression(expr.this)
+        options: List[Expression] = []
+        for option in expr.expressions:
+            converted = self._convert_expression(option)
+            options.append(converted)
+        return InList(value=value_expr, options=options)
+
+    def _convert_between_expression(self, expr: exp.Between) -> Expression:
+        """Convert BETWEEN to expression node."""
+        value_expr = self._convert_expression(expr.this)
+        low_expr = self._convert_expression(expr.args["low"])
+        high_expr = self._convert_expression(expr.args["high"])
+        return BetweenExpression(value=value_expr, lower=low_expr, upper=high_expr)
+
+    def _convert_case_expression(self, expr: exp.Case) -> Expression:
+        """Convert CASE expression."""
+        when_clauses = []
+        for if_clause in expr.args.get("ifs") or []:
+            condition = self._convert_expression(if_clause.this)
+            result_expr = if_clause.args.get("true")
+            result = self._convert_expression(result_expr) if result_expr is not None else Literal(value=None, data_type=DataType.NULL)
+            when_clauses.append((condition, result))
+        else_expr = None
+        default_expr = expr.args.get("default")
+        if default_expr is not None:
+            else_expr = self._convert_expression(default_expr)
+        return CaseExpr(when_clauses=when_clauses, else_result=else_expr)
 
     def _convert_column(self, col: exp.Column) -> ColumnRef:
         """Convert sqlglot Column to ColumnRef."""

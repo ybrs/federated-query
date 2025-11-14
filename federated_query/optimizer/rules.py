@@ -12,8 +12,9 @@ from ..plan.logical import (
     Sort,
     Limit,
     Union,
+    Explain,
 )
-from ..plan.expressions import Expression
+from ..plan.expressions import Expression, InList, BetweenExpression
 from ..catalog.catalog import Catalog
 from .expression_rewriter import (
     ExpressionRewriter,
@@ -99,6 +100,16 @@ class PredicatePushdownRule(OptimizationRule):
         """Push a filter node down."""
         input_plan = filter_node.input
         predicate = filter_node.predicate
+
+        from ..plan.expressions import BinaryOp, BinaryOpType
+
+        if isinstance(predicate, BinaryOp) and predicate.op == BinaryOpType.AND:
+            left_result = self._push_filter(
+                Filter(input_plan, predicate.left)
+            )
+            return self._push_filter(
+                Filter(left_result, predicate.right)
+            )
 
         if isinstance(input_plan, Filter):
             return self._merge_filters(filter_node, input_plan)
@@ -214,7 +225,12 @@ class PredicatePushdownRule(OptimizationRule):
                 table_name=scan.table_name,
                 columns=scan.columns,
                 filters=merged,
-                alias=scan.alias
+                alias=scan.alias,
+                group_by=scan.group_by,
+                aggregates=scan.aggregates,
+                output_names=scan.output_names,
+                limit=scan.limit,
+                offset=scan.offset,
             )
 
         return Scan(
@@ -223,7 +239,12 @@ class PredicatePushdownRule(OptimizationRule):
             table_name=scan.table_name,
             columns=scan.columns,
             filters=filter_node.predicate,
-            alias=scan.alias
+            alias=scan.alias,
+            group_by=scan.group_by,
+            aggregates=scan.aggregates,
+            output_names=scan.output_names,
+            limit=scan.limit,
+            offset=scan.offset,
         )
 
     def _predicate_matches_side(
@@ -538,6 +559,18 @@ class ProjectionPushdownRule(OptimizationRule):
                 columns.update(self._extract_columns(arg))
             return columns
 
+        if isinstance(expr, InList):
+            columns.update(self._extract_columns(expr.value))
+            for option in expr.options:
+                columns.update(self._extract_columns(option))
+            return columns
+
+        if isinstance(expr, BetweenExpression):
+            columns.update(self._extract_columns(expr.value))
+            columns.update(self._extract_columns(expr.lower))
+            columns.update(self._extract_columns(expr.upper))
+            return columns
+
         return columns
 
     def _prune_columns(
@@ -620,7 +653,12 @@ class ProjectionPushdownRule(OptimizationRule):
                 table_name=scan.table_name,
                 columns=pruned_cols,
                 filters=scan.filters,
-                alias=scan.alias
+                alias=scan.alias,
+                group_by=scan.group_by,
+                aggregates=scan.aggregates,
+                output_names=scan.output_names,
+                limit=scan.limit,
+                offset=scan.offset,
             )
 
         return scan
@@ -766,29 +804,89 @@ class LimitPushdownRule(OptimizationRule):
         """Recurse into explain node."""
         from ..plan.logical import Explain
 
-        new_plan = self._push_limit(plan.plan)
-        if new_plan != plan.plan:
-            return Explain(new_plan)
+        new_input = self._push_limit(plan.input)
+        if new_input != plan.input:
+            return Explain(new_input, plan.format)
         return plan
 
     def _try_push_limit(self, limit: Limit) -> LogicalPlanNode:
         """Try to push limit through input.
 
-        Only push through operations that don't change row count.
-        Safe: Projection (1:1 mapping)
-        Unsafe: Filter (reduces rows), Join (changes row count)
+        Pushes through projections and filters until reaching scans.
         """
-        input_plan = limit.input
+        pushed = self._push_limit_into_plan(limit.input, limit.limit, limit.offset)
+        if pushed is None:
+            new_input = self._push_limit(limit.input)
+            if new_input != limit.input:
+                return Limit(new_input, limit.limit, limit.offset)
+            return limit
+        return pushed
 
-        if isinstance(input_plan, Project):
-            new_input = Limit(input_plan.input, limit.limit, limit.offset)
-            return Project(new_input, input_plan.expressions, input_plan.aliases)
+    def _push_limit_into_plan(
+        self,
+        plan: LogicalPlanNode,
+        limit_value: int,
+        offset_value: int
+    ) -> Optional[LogicalPlanNode]:
+        """Push limit into plan if possible."""
+        from ..plan.logical import Project, Filter, Scan
 
-        # Don't push through filters - changes semantics
-        # Don't push through joins - changes semantics
-        # Don't push through aggregates - changes semantics
+        if isinstance(plan, Project):
+            new_child = self._push_limit_into_plan(
+                plan.input,
+                limit_value,
+                offset_value,
+            )
+            if new_child is None:
+                return None
+            return Project(new_child, plan.expressions, plan.aliases)
 
-        return limit
+        if isinstance(plan, Filter):
+            new_child = self._push_limit_into_plan(
+                plan.input,
+                limit_value,
+                offset_value,
+            )
+            if new_child is None:
+                return None
+            return Filter(new_child, plan.predicate)
+
+        if isinstance(plan, Scan):
+            return self._apply_limit_to_scan(plan, limit_value, offset_value)
+
+        return None
+
+    def _apply_limit_to_scan(
+        self,
+        scan: Scan,
+        limit_value: int,
+        offset_value: int
+    ) -> Scan:
+        """Return new scan with limit and offset applied."""
+        effective_limit = limit_value
+        effective_offset = offset_value
+
+        if scan.limit is not None:
+            if scan.limit < effective_limit:
+                effective_limit = scan.limit
+            effective_offset += scan.offset
+        else:
+            if scan.offset:
+                effective_offset = scan.offset + offset_value
+
+        return Scan(
+            datasource=scan.datasource,
+            schema_name=scan.schema_name,
+            table_name=scan.table_name,
+            columns=scan.columns,
+            filters=scan.filters,
+            alias=scan.alias,
+            group_by=scan.group_by,
+            aggregates=scan.aggregates,
+            output_names=scan.output_names,
+            limit=effective_limit,
+            offset=effective_offset,
+        )
 
     def name(self) -> str:
         return "LimitPushdown"
@@ -804,6 +902,124 @@ class JoinReorderingRule(OptimizationRule):
 
     def name(self) -> str:
         return "JoinReordering"
+
+
+class AggregatePushdownRule(OptimizationRule):
+    """Push aggregates to data sources when possible.
+
+    Transforms:
+        Aggregate(Filter?(Scan)) → Scan(with aggregates)
+
+    This pushes GROUP BY and aggregate functions (COUNT, SUM, etc.)
+    to the data source for execution, reducing data transfer.
+    """
+
+    def apply(self, plan: LogicalPlanNode) -> Optional[LogicalPlanNode]:
+        """Apply aggregate pushdown optimization."""
+        return self._push_aggregate(plan)
+
+    def _push_aggregate(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Recursively push aggregates down the plan tree."""
+        if isinstance(plan, Aggregate):
+            return self._try_push_aggregate(plan)
+
+        return self._recurse_node(plan)
+
+    def _try_push_aggregate(self, agg: Aggregate) -> LogicalPlanNode:
+        """Try to push aggregate into its input."""
+        input_node = agg.input
+
+        if isinstance(input_node, Scan):
+            return self._push_to_scan(agg, input_node, None)
+
+        if isinstance(input_node, Filter):
+            filter_input = input_node.input
+            if isinstance(filter_input, Scan):
+                return self._push_to_scan(agg, filter_input, input_node.predicate)
+
+        return agg
+
+    def _push_to_scan(
+        self,
+        agg: Aggregate,
+        scan: Scan,
+        filter_expr: Optional[Expression]
+    ) -> Scan:
+        """Push aggregate into scan node."""
+        merged_filters = self._merge_filters(scan.filters, filter_expr)
+
+        return Scan(
+            datasource=scan.datasource,
+            schema_name=scan.schema_name,
+            table_name=scan.table_name,
+            columns=scan.columns,
+            filters=merged_filters,
+            alias=scan.alias,
+            group_by=agg.group_by,
+            aggregates=agg.aggregates,
+            output_names=agg.output_names,
+            limit=scan.limit,
+            offset=scan.offset,
+        )
+
+    def _merge_filters(
+        self,
+        scan_filter: Optional[Expression],
+        filter_filter: Optional[Expression]
+    ) -> Optional[Expression]:
+        """Merge filters from scan and filter node."""
+        if scan_filter is None:
+            return filter_filter
+
+        if filter_filter is None:
+            return scan_filter
+
+        from ..plan.expressions import BinaryOp, BinaryOpType
+        return BinaryOp(
+            op=BinaryOpType.AND,
+            left=scan_filter,
+            right=filter_filter
+        )
+
+    def _recurse_node(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Recurse into node children."""
+        if isinstance(plan, (Project, Filter, Limit)):
+            return self._recurse_unary(plan)
+
+        if isinstance(plan, Join):
+            return self._recurse_join(plan)
+
+        return plan
+
+    def _recurse_unary(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Recurse into unary node."""
+        new_input = self._push_aggregate(plan.input)
+        if new_input == plan.input:
+            return plan
+
+        if isinstance(plan, Project):
+            return Project(new_input, plan.expressions, plan.aliases)
+
+        if isinstance(plan, Filter):
+            return Filter(new_input, plan.predicate)
+
+        if isinstance(plan, Limit):
+            return Limit(new_input, plan.limit, plan.offset)
+
+        return plan
+
+    def _recurse_join(self, join: Join) -> LogicalPlanNode:
+        """Recurse into join node."""
+        new_left = self._push_aggregate(join.left)
+        new_right = self._push_aggregate(join.right)
+
+        if new_left == join.left and new_right == join.right:
+            return join
+
+        return Join(new_left, new_right, join.join_type, join.condition)
+
+    def name(self) -> str:
+        return "AggregatePushdown"
 
 
 class ExpressionSimplificationRule(OptimizationRule):
@@ -838,7 +1054,12 @@ class ExpressionSimplificationRule(OptimizationRule):
                         table_name=plan.table_name,
                         columns=plan.columns,
                         filters=rewritten_filter,
-                        alias=plan.alias
+                        alias=plan.alias,
+                        group_by=plan.group_by,
+                        aggregates=plan.aggregates,
+                        output_names=plan.output_names,
+                        limit=plan.limit,
+                        offset=plan.offset,
                     )
             return plan
 
@@ -993,6 +1214,10 @@ class RuleBasedOptimizer:
         Returns:
             Optimized logical plan
         """
+        if isinstance(plan, Explain):
+            optimized_child = self.optimize(plan.input, max_iterations)
+            return Explain(optimized_child, plan.format)
+
         current_plan = plan
         iteration = 0
 

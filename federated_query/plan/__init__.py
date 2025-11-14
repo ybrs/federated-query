@@ -11,6 +11,7 @@ from .logical import (
     Limit,
     Union,
     Explain,
+    ExplainFormat,
 )
 from .physical import (
     PhysicalPlanNode,
@@ -47,6 +48,7 @@ __all__ = [
     "Limit",
     "Union",
     "Explain",
+    "ExplainFormat",
     # Physical nodes
     "PhysicalPlanNode",
     "PhysicalScan",

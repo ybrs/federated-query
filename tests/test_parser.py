@@ -2,6 +2,7 @@
 
 import pytest
 from federated_query.parser import Parser
+from federated_query.plan.logical import Project, Scan, Join, Explain, ExplainFormat
 
 
 def test_parser_initialization():
@@ -45,3 +46,40 @@ def test_parse_aggregate():
 
     ast = parser.parse(sql)
     assert ast is not None
+
+
+def test_scan_alias_set_for_from_clause():
+    """Parser should populate Scan.alias for simple FROM."""
+    parser = Parser()
+    sql = "SELECT c.id FROM testdb.main.customers c"
+    plan = parser.parse_to_logical_plan(sql)
+    assert isinstance(plan, Project)
+    assert isinstance(plan.input, Scan)
+    assert plan.input.alias == "c"
+
+
+def test_scan_alias_set_for_join_tables():
+    """Parser should set aliases on both sides of joins."""
+    parser = Parser()
+    sql = """
+        SELECT c.id, o.order_id
+        FROM testdb.main.customers c
+        JOIN testdb.main.orders o ON c.id = o.customer_id
+    """
+    plan = parser.parse_to_logical_plan(sql)
+    assert isinstance(plan, Project)
+    join = plan.input
+    assert isinstance(join, Join)
+    assert isinstance(join.left, Scan)
+    assert isinstance(join.right, Scan)
+    assert join.left.alias == "c"
+    assert join.right.alias == "o"
+
+
+def test_explain_as_json_detected():
+    """Parser should treat EXPLAIN (AS JSON) as JSON format."""
+    parser = Parser()
+    sql = "EXPLAIN (AS JSON) SELECT id FROM testdb.main.users"
+    plan = parser.parse_to_logical_plan(sql)
+    assert isinstance(plan, Explain)
+    assert plan.format == ExplainFormat.JSON
