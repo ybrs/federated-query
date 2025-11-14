@@ -84,6 +84,8 @@ class Scan(LogicalPlanNode):
     group_by: Optional[List[Expression]] = None  # Optional GROUP BY expressions
     aggregates: Optional[List[Expression]] = None  # Optional aggregate expressions
     output_names: Optional[List[str]] = None  # Output column names when using aggregates
+    limit: Optional[int] = None
+    offset: int = 0
 
     def children(self) -> List[LogicalPlanNode]:
         return []
@@ -108,7 +110,10 @@ class Scan(LogicalPlanNode):
             agg_str = f", aggs={len(self.aggregates)}"
         if self.group_by:
             agg_str += f", group_by={len(self.group_by)}"
-        return f"Scan({table_ref}, cols={len(self.columns)}{filter_str}{agg_str})"
+        limit_str = ""
+        if self.limit is not None:
+            limit_str = f", limit={self.limit}, offset={self.offset}"
+        return f"Scan({table_ref}, cols={len(self.columns)}{filter_str}{agg_str}{limit_str})"
 
 
 @dataclass(frozen=True)

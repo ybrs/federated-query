@@ -67,6 +67,8 @@ class PhysicalScan(PhysicalPlanNode):
     aggregates: Optional[List[Expression]] = None  # Optional aggregate expressions
     output_names: Optional[List[str]] = None  # Output column names when using aggregates
     alias: Optional[str] = None  # Table alias (if any)
+    limit: Optional[int] = None
+    offset: int = 0
 
     def children(self) -> List[PhysicalPlanNode]:
         return []
@@ -97,6 +99,11 @@ class PhysicalScan(PhysicalPlanNode):
         if self.group_by:
             group_clause = self._format_group_by()
             query = f"{query} GROUP BY {group_clause}"
+
+        if self.limit is not None:
+            query = f"{query} LIMIT {self.limit}"
+            if self.offset:
+                query = f"{query} OFFSET {self.offset}"
 
         return query
 
@@ -681,6 +688,9 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
     join_type: JoinType
     condition: Expression
     datasource_connection: Any
+    group_by: Optional[List[Expression]] = None
+    aggregates: Optional[List[Expression]] = None
+    output_names: Optional[List[str]] = None
     _schema: Optional[pa.Schema] = None
     _column_alias_map: Dict[Tuple[Optional[str], str], str] = field(default_factory=dict, init=False)
 
@@ -713,14 +723,41 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
         right_source = self._build_source(self.right)
         join_keyword = self._join_keyword()
         condition_sql = self.condition.to_sql()
-        return f"SELECT {select_clause} FROM {left_source} {join_keyword} {right_source} ON {condition_sql}"
+        query = f"SELECT {select_clause} FROM {left_source} {join_keyword} {right_source} ON {condition_sql}"
+        if self.group_by:
+            group_clause = self._build_group_by_clause()
+            query = f"{query} GROUP BY {group_clause}"
+        return query
 
     def _build_select_clause(self) -> str:
+        if self.aggregates:
+            return self._build_aggregate_select_clause()
         items = []
         seen = set()
         self._append_select_items(self.left, items, seen, False)
         self._append_select_items(self.right, items, seen, True)
         return ", ".join(items)
+
+    def _build_aggregate_select_clause(self) -> str:
+        items = []
+        names = self.output_names or []
+        expressions = self.aggregates or []
+        index = 0
+        while index < len(expressions):
+            expr_sql = expressions[index].to_sql()
+            alias = names[index] if index < len(names) else None
+            if alias:
+                items.append(f'{expr_sql} AS "{alias}"')
+            else:
+                items.append(expr_sql)
+            index += 1
+        return ", ".join(items)
+
+    def _build_group_by_clause(self) -> str:
+        parts = []
+        for expr in self.group_by or []:
+            parts.append(expr.to_sql())
+        return ", ".join(parts)
 
     def _append_select_items(
         self,
@@ -796,6 +833,11 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
                 self._column_alias_map[(ident, column)] = output
 
     def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        if self.aggregates and self.output_names:
+            alias_map: Dict[Tuple[Optional[str], str], str] = {}
+            for name in self.output_names:
+                alias_map[(None, name)] = name
+            return alias_map
         return self._column_alias_map
 
 

@@ -88,6 +88,8 @@ class PhysicalPlanner:
             aggregates=scan.aggregates,
             output_names=scan.output_names,
             alias=scan.alias,
+            limit=scan.limit,
+            offset=scan.offset,
         )
 
     def _plan_filter(self, filter_node: Filter) -> PhysicalFilter:
@@ -111,11 +113,29 @@ class PhysicalPlanner:
             input=input_plan, limit=limit.limit, offset=limit.offset
         )
 
-    def _plan_aggregate(self, aggregate: Aggregate) -> PhysicalHashAggregate:
+    def _plan_aggregate(self, aggregate: Aggregate) -> PhysicalPlanNode:
         """Plan an aggregate node."""
         input_plan = self._plan_node(aggregate.input)
+        if isinstance(input_plan, PhysicalRemoteJoin):
+            return self._plan_remote_join_aggregate(aggregate, input_plan)
         return PhysicalHashAggregate(
             input=input_plan,
+            group_by=aggregate.group_by,
+            aggregates=aggregate.aggregates,
+            output_names=aggregate.output_names,
+        )
+
+    def _plan_remote_join_aggregate(
+        self,
+        aggregate: Aggregate,
+        remote_join: PhysicalRemoteJoin
+    ) -> PhysicalRemoteJoin:
+        return PhysicalRemoteJoin(
+            left=remote_join.left,
+            right=remote_join.right,
+            join_type=remote_join.join_type,
+            condition=remote_join.condition,
+            datasource_connection=remote_join.datasource_connection,
             group_by=aggregate.group_by,
             aggregates=aggregate.aggregates,
             output_names=aggregate.output_names,

@@ -17,6 +17,8 @@ from ..plan.expressions import (
     FunctionCall,
     CaseExpr,
     DataType,
+    InList,
+    BetweenExpression,
 )
 
 
@@ -101,6 +103,42 @@ class ExpressionRewriter(ABC):
             else_result=rewritten_else
         )
 
+    def rewrite_in_list(self, expr: InList) -> Expression:
+        """Rewrite IN list expression."""
+        rewritten_value = self.rewrite(expr.value)
+        changed = rewritten_value != expr.value
+        rewritten_options = []
+
+        for option in expr.options:
+            rewritten_option = self.rewrite(option)
+            rewritten_options.append(rewritten_option)
+            if rewritten_option != option:
+                changed = True
+
+        if not changed:
+            return expr
+
+        return InList(value=rewritten_value, options=rewritten_options)
+
+    def rewrite_between(self, expr: BetweenExpression) -> Expression:
+        """Rewrite BETWEEN expression."""
+        rewritten_value = self.rewrite(expr.value)
+        rewritten_lower = self.rewrite(expr.lower)
+        rewritten_upper = self.rewrite(expr.upper)
+
+        if (
+            rewritten_value == expr.value
+            and rewritten_lower == expr.lower
+            and rewritten_upper == expr.upper
+        ):
+            return expr
+
+        return BetweenExpression(
+            value=rewritten_value,
+            lower=rewritten_lower,
+            upper=rewritten_upper,
+        )
+
 
 class ConstantFoldingRewriter(ExpressionRewriter):
     """Fold constant expressions at compile time."""
@@ -124,6 +162,12 @@ class ConstantFoldingRewriter(ExpressionRewriter):
 
         if isinstance(expr, CaseExpr):
             return self.rewrite_case_expr(expr)
+
+        if isinstance(expr, InList):
+            return self.rewrite_in_list(expr)
+
+        if isinstance(expr, BetweenExpression):
+            return self.rewrite_between(expr)
 
         return expr
 
@@ -265,6 +309,12 @@ class ExpressionSimplificationRewriter(ExpressionRewriter):
 
         if isinstance(expr, CaseExpr):
             return self.rewrite_case_expr(expr)
+
+        if isinstance(expr, InList):
+            return self.rewrite_in_list(expr)
+
+        if isinstance(expr, BetweenExpression):
+            return self.rewrite_between(expr)
 
         return expr
 

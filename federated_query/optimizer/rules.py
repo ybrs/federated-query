@@ -14,7 +14,7 @@ from ..plan.logical import (
     Union,
     Explain,
 )
-from ..plan.expressions import Expression
+from ..plan.expressions import Expression, InList, BetweenExpression
 from ..catalog.catalog import Catalog
 from .expression_rewriter import (
     ExpressionRewriter,
@@ -215,7 +215,12 @@ class PredicatePushdownRule(OptimizationRule):
                 table_name=scan.table_name,
                 columns=scan.columns,
                 filters=merged,
-                alias=scan.alias
+                alias=scan.alias,
+                group_by=scan.group_by,
+                aggregates=scan.aggregates,
+                output_names=scan.output_names,
+                limit=scan.limit,
+                offset=scan.offset,
             )
 
         return Scan(
@@ -224,7 +229,12 @@ class PredicatePushdownRule(OptimizationRule):
             table_name=scan.table_name,
             columns=scan.columns,
             filters=filter_node.predicate,
-            alias=scan.alias
+            alias=scan.alias,
+            group_by=scan.group_by,
+            aggregates=scan.aggregates,
+            output_names=scan.output_names,
+            limit=scan.limit,
+            offset=scan.offset,
         )
 
     def _predicate_matches_side(
@@ -539,6 +549,18 @@ class ProjectionPushdownRule(OptimizationRule):
                 columns.update(self._extract_columns(arg))
             return columns
 
+        if isinstance(expr, InList):
+            columns.update(self._extract_columns(expr.value))
+            for option in expr.options:
+                columns.update(self._extract_columns(option))
+            return columns
+
+        if isinstance(expr, BetweenExpression):
+            columns.update(self._extract_columns(expr.value))
+            columns.update(self._extract_columns(expr.lower))
+            columns.update(self._extract_columns(expr.upper))
+            return columns
+
         return columns
 
     def _prune_columns(
@@ -621,7 +643,12 @@ class ProjectionPushdownRule(OptimizationRule):
                 table_name=scan.table_name,
                 columns=pruned_cols,
                 filters=scan.filters,
-                alias=scan.alias
+                alias=scan.alias,
+                group_by=scan.group_by,
+                aggregates=scan.aggregates,
+                output_names=scan.output_names,
+                limit=scan.limit,
+                offset=scan.offset,
             )
 
         return scan
@@ -775,21 +802,81 @@ class LimitPushdownRule(OptimizationRule):
     def _try_push_limit(self, limit: Limit) -> LogicalPlanNode:
         """Try to push limit through input.
 
-        Only push through operations that don't change row count.
-        Safe: Projection (1:1 mapping)
-        Unsafe: Filter (reduces rows), Join (changes row count)
+        Pushes through projections and filters until reaching scans.
         """
-        input_plan = limit.input
+        pushed = self._push_limit_into_plan(limit.input, limit.limit, limit.offset)
+        if pushed is None:
+            new_input = self._push_limit(limit.input)
+            if new_input != limit.input:
+                return Limit(new_input, limit.limit, limit.offset)
+            return limit
+        return pushed
 
-        if isinstance(input_plan, Project):
-            new_input = Limit(input_plan.input, limit.limit, limit.offset)
-            return Project(new_input, input_plan.expressions, input_plan.aliases)
+    def _push_limit_into_plan(
+        self,
+        plan: LogicalPlanNode,
+        limit_value: int,
+        offset_value: int
+    ) -> Optional[LogicalPlanNode]:
+        """Push limit into plan if possible."""
+        from ..plan.logical import Project, Filter, Scan
 
-        # Don't push through filters - changes semantics
-        # Don't push through joins - changes semantics
-        # Don't push through aggregates - changes semantics
+        if isinstance(plan, Project):
+            new_child = self._push_limit_into_plan(
+                plan.input,
+                limit_value,
+                offset_value,
+            )
+            if new_child is None:
+                return None
+            return Project(new_child, plan.expressions, plan.aliases)
 
-        return limit
+        if isinstance(plan, Filter):
+            new_child = self._push_limit_into_plan(
+                plan.input,
+                limit_value,
+                offset_value,
+            )
+            if new_child is None:
+                return None
+            return Filter(new_child, plan.predicate)
+
+        if isinstance(plan, Scan):
+            return self._apply_limit_to_scan(plan, limit_value, offset_value)
+
+        return None
+
+    def _apply_limit_to_scan(
+        self,
+        scan: Scan,
+        limit_value: int,
+        offset_value: int
+    ) -> Scan:
+        """Return new scan with limit and offset applied."""
+        effective_limit = limit_value
+        effective_offset = offset_value
+
+        if scan.limit is not None:
+            if scan.limit < effective_limit:
+                effective_limit = scan.limit
+            effective_offset += scan.offset
+        else:
+            if scan.offset:
+                effective_offset = scan.offset + offset_value
+
+        return Scan(
+            datasource=scan.datasource,
+            schema_name=scan.schema_name,
+            table_name=scan.table_name,
+            columns=scan.columns,
+            filters=scan.filters,
+            alias=scan.alias,
+            group_by=scan.group_by,
+            aggregates=scan.aggregates,
+            output_names=scan.output_names,
+            limit=effective_limit,
+            offset=effective_offset,
+        )
 
     def name(self) -> str:
         return "LimitPushdown"
@@ -861,6 +948,8 @@ class AggregatePushdownRule(OptimizationRule):
             group_by=agg.group_by,
             aggregates=agg.aggregates,
             output_names=agg.output_names,
+            limit=scan.limit,
+            offset=scan.offset,
         )
 
     def _merge_filters(
@@ -955,7 +1044,12 @@ class ExpressionSimplificationRule(OptimizationRule):
                         table_name=plan.table_name,
                         columns=plan.columns,
                         filters=rewritten_filter,
-                        alias=plan.alias
+                        alias=plan.alias,
+                        group_by=plan.group_by,
+                        aggregates=plan.aggregates,
+                        output_names=plan.output_names,
+                        limit=plan.limit,
+                        offset=plan.offset,
                     )
             return plan
 

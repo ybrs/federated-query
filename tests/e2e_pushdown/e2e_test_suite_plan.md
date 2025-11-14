@@ -2,7 +2,23 @@
 
 The goal is to cover every meaningful pushdown scenario with explicit SQL + expectation tests. The suite will be implemented incrementally in the buckets below. Each bucket enumerates the specific combinations to cover, along with notes on expected behavior (whether pushdown should happen, where it should not, and how many datasources are involved).
 
+
+VERY IMPORTANT: in this exercise you can't use "string in string" checks. That is NOT allowed. Also regular expressions are forbidden. You get AST from data sources, use the ast to check exactly what is needed !!!
+
 ---
+### Current Status
+
+- ✅ **Section 0 – Foundation:** `tests/e2e_pushdown/test_foundation.py` (2 tests, 2 explain-json queries)
+- ✅ **Section 1 – Single-table predicates:** `tests/e2e_pushdown/test_single_table_predicates.py` (12 tests)
+- ✅ **Section 2 – Single-table aggregations:** `tests/e2e_pushdown/test_single_table_aggregations.py` (6 tests)
+- ✅ **Section 3 – Two-table joins & join+agg/order:** `tests/e2e_pushdown/test_single_source_joins.py` (10 tests), `tests/e2e_pushdown/test_join_aggregations_and_order.py` (6 tests)
+- ✅ **Section 4 – Three-table joins:** `tests/e2e_pushdown/test_multi_table_joins.py` (4 tests documenting remote + local join split)
+- ✅ **Section 5 – Combined pushdowns:** `tests/e2e_pushdown/test_combined_pushdowns.py` (5 tests)
+- ⏳ **Section 6 – Multi-datasource guardrails:** _not implemented yet_
+- ⏳ **Section 7 – Edge cases & negatives:** _not implemented yet_
+
+**Totals so far:** 45 automated E2E pushdown tests that validate ~50 datasource queries captured via `EXPLAIN (FORMAT JSON)`.
+
 ## 0. Foundation
 
 * What we want is to see the real queries sent to datasources. To do that we need these following

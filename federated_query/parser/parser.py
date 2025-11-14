@@ -25,6 +25,9 @@ from ..plan.expressions import (
     UnaryOpType,
     DataType,
     FunctionCall,
+    InList,
+    BetweenExpression,
+    CaseExpr,
 )
 
 
@@ -632,7 +635,11 @@ class Parser:
             return input_plan
 
         limit_value = int(limit_expr.expression.this)
-        return Limit(input=input_plan, limit=limit_value)
+        offset_value = 0
+        offset_expr = select.args.get("offset")
+        if offset_expr is not None:
+            offset_value = int(offset_expr.expression.this)
+        return Limit(input=input_plan, limit=limit_value, offset=offset_value)
 
     def _convert_expression(self, expr: exp.Expression) -> Expression:
         """Convert sqlglot expression to our Expression.
@@ -643,10 +650,16 @@ class Parser:
         Returns:
             Our Expression object
         """
+        if isinstance(expr, exp.In):
+            return self._convert_in_expression(expr)
+        if isinstance(expr, exp.Between):
+            return self._convert_between_expression(expr)
         if isinstance(expr, exp.Column):
             return self._convert_column(expr)
         if isinstance(expr, exp.Literal):
             return self._convert_literal(expr)
+        if isinstance(expr, exp.Null):
+            return Literal(value=None, data_type=DataType.NULL)
         if isinstance(expr, exp.Binary):
             return self._convert_binary(expr)
         if isinstance(expr, exp.Unary):
@@ -655,10 +668,42 @@ class Parser:
             return self._convert_expression(expr.this)
         if isinstance(expr, exp.Star):
             return ColumnRef(table=None, column="*")
+        if isinstance(expr, exp.Case):
+            return self._convert_case_expression(expr)
         if self._is_aggregate_function(expr):
             return self._convert_aggregate_function(expr)
 
         raise ValueError(f"Unsupported expression type: {type(expr)}")
+
+    def _convert_in_expression(self, expr: exp.In) -> Expression:
+        """Convert IN list to expression node."""
+        value_expr = self._convert_expression(expr.this)
+        options: List[Expression] = []
+        for option in expr.expressions:
+            converted = self._convert_expression(option)
+            options.append(converted)
+        return InList(value=value_expr, options=options)
+
+    def _convert_between_expression(self, expr: exp.Between) -> Expression:
+        """Convert BETWEEN to expression node."""
+        value_expr = self._convert_expression(expr.this)
+        low_expr = self._convert_expression(expr.args["low"])
+        high_expr = self._convert_expression(expr.args["high"])
+        return BetweenExpression(value=value_expr, lower=low_expr, upper=high_expr)
+
+    def _convert_case_expression(self, expr: exp.Case) -> Expression:
+        """Convert CASE expression."""
+        when_clauses = []
+        for if_clause in expr.args.get("ifs") or []:
+            condition = self._convert_expression(if_clause.this)
+            result_expr = if_clause.args.get("true")
+            result = self._convert_expression(result_expr) if result_expr is not None else Literal(value=None, data_type=DataType.NULL)
+            when_clauses.append((condition, result))
+        else_expr = None
+        default_expr = expr.args.get("default")
+        if default_expr is not None:
+            else_expr = self._convert_expression(default_expr)
+        return CaseExpr(when_clauses=when_clauses, else_result=else_expr)
 
     def _convert_column(self, col: exp.Column) -> ColumnRef:
         """Convert sqlglot Column to ColumnRef."""
