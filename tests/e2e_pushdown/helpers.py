@@ -25,6 +25,14 @@ def explain_datasource_query(runtime: FedQRuntime, sql: str) -> exp.Expression:
     return entry["query"]
 
 
+def explain_document(runtime: FedQRuntime, sql: str) -> Dict[str, object]:
+    """Execute EXPLAIN (FORMAT JSON) and return the document."""
+    statement = f"EXPLAIN (FORMAT JSON) {sql}"
+    document = runtime.execute(statement)
+    assert isinstance(document, dict)
+    return document
+
+
 def unwrap_parens(expression):
     """Remove redundant Paren wrappers from sqlglot expressions."""
     current = expression

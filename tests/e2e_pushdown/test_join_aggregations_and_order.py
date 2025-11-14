@@ -5,6 +5,7 @@ from sqlglot import exp
 from tests.e2e_pushdown.helpers import (
     build_runtime,
     explain_datasource_query,
+    explain_document,
     find_in_select,
     group_column_names,
     select_column_names,
@@ -104,7 +105,7 @@ def test_join_having_with_alias_adds_filter(single_source_env):
         "GROUP BY O.region "
         "HAVING total_cost > 25"
     )
-    document = _explain_document(runtime, sql)
+    document = explain_document(runtime, sql)
     query = document["queries"][0]["query"]
     assert query.args.get("where") is None
 
@@ -119,14 +120,8 @@ def test_join_order_by_multiple_columns(single_source_env):
         "ON O.product_id = P.id "
         "ORDER BY O.region DESC, P.category ASC LIMIT 3"
     )
-    document = _explain_document(runtime, sql)
+    document = explain_document(runtime, sql)
     query = document["queries"][0]["query"]
     joins = query.args.get("joins") or []
     assert joins, "expected remote join for order/limit query"
 
-
-def _explain_document(runtime, sql: str):
-    statement = f"EXPLAIN (FORMAT JSON) {sql}"
-    document = runtime.execute(statement)
-    assert isinstance(document, dict)
-    return document

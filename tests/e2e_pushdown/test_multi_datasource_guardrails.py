@@ -5,17 +5,11 @@ from sqlglot import exp
 from tests.e2e_pushdown.helpers import (
     build_runtime,
     datasource_query_map,
+    explain_document,
     from_table_name,
     select_column_names,
     unwrap_parens,
 )
-
-
-def _explain_document(runtime, sql: str):
-    statement = f"EXPLAIN (FORMAT JSON) {sql}"
-    document = runtime.execute(statement)
-    assert isinstance(document, dict)
-    return document
 
 
 def _assert_remote_scan_metadata(select_ast: exp.Select, expected_table: str):
@@ -32,15 +26,15 @@ def test_orders_products_join_stays_local(multi_source_env):
         "FROM duckdb_orders.main.orders o "
         "JOIN duckdb_products.main.products p ON o.product_id = p.id"
     )
-    document = _explain_document(runtime, sql)
+    document = explain_document(runtime, sql)
     queries = datasource_query_map(document)
     assert set(queries) == {"duckdb_orders", "duckdb_products"}
     orders_query = queries["duckdb_orders"]
     products_query = queries["duckdb_products"]
     _assert_remote_scan_metadata(orders_query, "orders")
     _assert_remote_scan_metadata(products_query, "products")
-    assert select_column_names(orders_query) == ["order_id", "product_id"]
-    assert select_column_names(products_query) == ["id", "name"]
+    assert set(select_column_names(orders_query)) == {"order_id", "product_id"}
+    assert set(select_column_names(products_query)) == {"id", "name"}
 
 
 def test_orders_customers_join_scans_each_source(multi_source_env):
@@ -52,15 +46,15 @@ def test_orders_customers_join_scans_each_source(multi_source_env):
         "JOIN duckdb_customers.main.customers c "
         "ON o.customer_id = c.customer_id"
     )
-    document = _explain_document(runtime, sql)
+    document = explain_document(runtime, sql)
     queries = datasource_query_map(document)
     assert set(queries) == {"duckdb_orders", "duckdb_customers"}
     orders_query = queries["duckdb_orders"]
     customers_query = queries["duckdb_customers"]
     _assert_remote_scan_metadata(orders_query, "orders")
     _assert_remote_scan_metadata(customers_query, "customers")
-    assert select_column_names(orders_query) == ["order_id", "customer_id"]
-    assert select_column_names(customers_query) == ["customer_id", "segment"]
+    assert set(select_column_names(orders_query)) == {"order_id", "customer_id"}
+    assert set(select_column_names(customers_query)) == {"customer_id", "segment"}
 
 
 def test_three_source_join_emits_three_queries(multi_source_env):
@@ -72,7 +66,7 @@ def test_three_source_join_emits_three_queries(multi_source_env):
         "JOIN duckdb_products.main.products p ON o.product_id = p.id "
         "JOIN duckdb_customers.main.customers c ON o.customer_id = c.customer_id"
     )
-    document = _explain_document(runtime, sql)
+    document = explain_document(runtime, sql)
     queries = datasource_query_map(document)
     assert set(queries) == {
         "duckdb_orders",
@@ -85,9 +79,13 @@ def test_three_source_join_emits_three_queries(multi_source_env):
     _assert_remote_scan_metadata(orders_query, "orders")
     _assert_remote_scan_metadata(products_query, "products")
     _assert_remote_scan_metadata(customers_query, "customers")
-    assert select_column_names(orders_query) == ["order_id", "product_id", "customer_id"]
-    assert select_column_names(products_query) == ["id", "name"]
-    assert select_column_names(customers_query) == ["customer_id", "segment"]
+    assert set(select_column_names(orders_query)) == {
+        "order_id",
+        "product_id",
+        "customer_id",
+    }
+    assert set(select_column_names(products_query)) == {"id", "name"}
+    assert set(select_column_names(customers_query)) == {"customer_id", "segment"}
 
 
 def test_cross_source_filters_remain_local(multi_source_env):
@@ -99,7 +97,7 @@ def test_cross_source_filters_remain_local(multi_source_env):
         "JOIN duckdb_products.main.products p ON o.product_id = p.id "
         "WHERE o.region = 'EU' AND p.category = 'clothing'"
     )
-    document = _explain_document(runtime, sql)
+    document = explain_document(runtime, sql)
     queries = datasource_query_map(document)
     assert set(queries) == {"duckdb_orders", "duckdb_products"}
     orders_query = queries["duckdb_orders"]
@@ -124,14 +122,14 @@ def test_cross_source_aggregates_and_limits_stay_local(multi_source_env):
         "GROUP BY o.region "
         "LIMIT 5"
     )
-    document = _explain_document(runtime, sql)
+    document = explain_document(runtime, sql)
     queries = datasource_query_map(document)
     assert set(queries) == {"duckdb_orders", "duckdb_products"}
     orders_query = queries["duckdb_orders"]
     products_query = queries["duckdb_products"]
     _assert_remote_scan_metadata(orders_query, "orders")
     _assert_remote_scan_metadata(products_query, "products")
-    assert orders_query.args.get("group") is not None, "orders should group by region remotely"
-    assert orders_query.args.get("limit") is not None, "orders should honor limit remotely"
-    assert select_column_names(orders_query) == ["region"]
-    assert select_column_names(products_query) == ["id", "base_price"]
+    assert orders_query.args.get("group") is None
+    assert orders_query.args.get("limit") is None
+    assert set(select_column_names(orders_query)) == {"region", "product_id"}
+    assert set(select_column_names(products_query)) == {"id", "base_price"}

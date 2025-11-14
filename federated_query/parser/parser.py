@@ -208,14 +208,19 @@ class Parser:
         Returns:
             Join node
         """
+        column_usage = self._collect_join_column_usage(select)
+
         left_table_parts = self._extract_table_parts(left_table)
         left_table_alias = self._extract_table_alias(left_table)
+        left_columns = self._columns_for_join_table(
+            column_usage, left_table_alias
+        )
 
         left_plan = Scan(
             datasource=left_table_parts[0],
             schema_name=left_table_parts[1],
             table_name=left_table_parts[2],
-            columns=["*"],
+            columns=left_columns,
             alias=left_table_alias,
         )
 
@@ -225,12 +230,15 @@ class Parser:
             right_table = join_clause.this
             right_table_parts = self._extract_table_parts(right_table)
             right_table_alias = self._extract_table_alias(right_table)
+            right_columns = self._columns_for_join_table(
+                column_usage, right_table_alias
+            )
 
             right_plan = Scan(
                 datasource=right_table_parts[0],
                 schema_name=right_table_parts[1],
                 table_name=right_table_parts[2],
-                columns=["*"],
+                columns=right_columns,
                 alias=right_table_alias,
             )
 
@@ -287,6 +295,42 @@ class Parser:
                 filtered.append(col)
 
         return filtered
+
+    def _collect_join_column_usage(
+        self, select: exp.Select
+    ) -> Dict[Optional[str], List[str]]:
+        """Collect column usage grouped by table alias for join planning."""
+        usage: Dict[Optional[str], List[str]] = {}
+        for column in select.find_all(exp.Column):
+            table_name = column.table
+            column_name = column.name
+            if not column_name:
+                continue
+            if table_name is None:
+                bucket = usage.setdefault(None, [])
+                if column_name not in bucket:
+                    bucket.append(column_name)
+                continue
+            bucket = usage.setdefault(table_name, [])
+            if column_name not in bucket:
+                bucket.append(column_name)
+        return usage
+
+    def _columns_for_join_table(
+        self,
+        usage: Dict[Optional[str], List[str]],
+        table_alias: Optional[str],
+    ) -> List[str]:
+        """Return column list for a specific table in a join."""
+        key = table_alias
+        if key in usage:
+            columns = usage[key]
+            if "*" in columns:
+                return ["*"]
+            return list(columns)
+        if None in usage and usage[None]:
+            return ["*"]
+        return ["*"]
 
     def _extract_join_type(self, join_clause: exp.Join) -> JoinType:
         """Extract join type from JOIN clause.

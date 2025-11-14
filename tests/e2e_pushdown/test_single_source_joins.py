@@ -5,16 +5,10 @@ from sqlglot import exp
 from tests.e2e_pushdown.helpers import (
     build_runtime,
     explain_datasource_query,
+    explain_document,
     from_table_name,
     join_table_names,
 )
-
-
-def _explain_document(runtime, sql: str):
-    statement = f"EXPLAIN (FORMAT JSON) {sql}"
-    document = runtime.execute(statement)
-    assert isinstance(document, dict)
-    return document
 
 
 def _get_join_node(select_ast: exp.Select) -> exp.Join:
@@ -115,7 +109,7 @@ def test_inner_join_comma_syntax(single_source_env):
         "FROM duckdb_primary.main.orders O, duckdb_primary.main.products P "
         "WHERE O.product_id = P.id"
     )
-    document = _explain_document(runtime, sql)
+    document = explain_document(runtime, sql)
     queries = document["queries"]
     assert len(queries) == 2
     seen_tables = []
@@ -137,7 +131,7 @@ def test_inner_join_non_equi_falls_back(single_source_env):
         "JOIN duckdb_primary.main.products P "
         "ON O.product_id > P.id"
     )
-    document = _explain_document(runtime, sql)
+    document = explain_document(runtime, sql)
     queries = document["queries"]
     assert len(queries) == 2
     seen_tables = []
@@ -158,7 +152,7 @@ def test_cross_join_generates_multiple_queries(single_source_env):
         "FROM duckdb_primary.main.orders O "
         "CROSS JOIN duckdb_primary.main.products P"
     )
-    document = _explain_document(runtime, sql)
+    document = explain_document(runtime, sql)
     queries = document["queries"]
     assert len(queries) == 2
     seen_tables = []
@@ -181,7 +175,7 @@ def test_left_join_filter_on_right_side(single_source_env):
         "ON O.product_id = products.id "
         "WHERE products.name IS NULL"
     )
-    document = _explain_document(runtime, sql)
+    document = explain_document(runtime, sql)
     first_query = document["queries"][0]["query"]
     joins = first_query.args.get("joins") or []
     assert joins, "expected remote join"

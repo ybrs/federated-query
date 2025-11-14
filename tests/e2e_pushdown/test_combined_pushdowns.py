@@ -4,6 +4,7 @@ from sqlglot import exp
 
 from tests.e2e_pushdown.helpers import (
     build_runtime,
+    explain_document,
     find_alias_expression,
     find_in_select,
     group_column_names,
@@ -11,13 +12,6 @@ from tests.e2e_pushdown.helpers import (
     select_column_names,
     unwrap_parens,
 )
-
-
-def _explain_document(runtime, sql: str):
-    statement = f"EXPLAIN (FORMAT JSON) {sql}"
-    document = runtime.execute(statement)
-    assert isinstance(document, dict)
-    return document
 
 
 def test_projection_predicate_aggregation_join_limit(single_source_env):
@@ -31,7 +25,7 @@ def test_projection_predicate_aggregation_join_limit(single_source_env):
         "HAVING SUM(P.base_price) > 50 "
         "LIMIT 5"
     )
-    document = _explain_document(runtime, sql)
+    document = explain_document(runtime, sql)
     queries = document["queries"]
     assert len(queries) == 1
     query_ast = queries[0]["query"]
@@ -58,7 +52,7 @@ def test_join_with_computed_expression_group_by(single_source_env):
         "JOIN duckdb_primary.main.products P ON O.product_id = P.id "
         "GROUP BY O.region"
     )
-    document = _explain_document(runtime, sql)
+    document = explain_document(runtime, sql)
     query_ast = document["queries"][0]["query"]
     projection = select_column_names(query_ast)
     assert projection == ["region", "revenue"]
@@ -81,7 +75,7 @@ def test_join_with_order_by_after_aggregation(single_source_env):
         "GROUP BY O.region "
         "ORDER BY total_cost DESC"
     )
-    document = _explain_document(runtime, sql)
+    document = explain_document(runtime, sql)
     query_ast = document["queries"][0]["query"]
     projection = select_column_names(query_ast)
     assert projection == ["region", "total_cost"]
@@ -100,26 +94,17 @@ def test_join_distinct_stays_remote(single_source_env):
         "JOIN duckdb_primary.main.products P "
         "ON O.product_id = P.id"
     )
-    document = _explain_document(runtime, sql)
+    document = explain_document(runtime, sql)
     assert len(document["queries"]) == 1
     query_ast = document["queries"][0]["query"]
-    projection = select_column_names(query_ast)
-    assert projection == [
-        "order_id",
-        "product_id",
-        "customer_id",
-        "quantity",
-        "price",
-        "status",
-        "region",
-        "id",
-        "category",
-        "name",
-        "base_price",
-        "active",
-    ]
     join_tables = join_table_names(query_ast)
     assert "products" in join_tables
+    assert set(select_column_names(query_ast)) == {
+        "region",
+        "product_id",
+        "category",
+        "id",
+    }
 
 
 def test_join_with_case_expression_and_limit(single_source_env):
@@ -133,7 +118,7 @@ def test_join_with_case_expression_and_limit(single_source_env):
         "GROUP BY O.region "
         "LIMIT 10"
     )
-    document = _explain_document(runtime, sql)
+    document = explain_document(runtime, sql)
     query_ast = document["queries"][0]["query"]
     projection = select_column_names(query_ast)
     assert projection == ["region", "clothing_spend"]

@@ -101,6 +101,16 @@ class PredicatePushdownRule(OptimizationRule):
         input_plan = filter_node.input
         predicate = filter_node.predicate
 
+        from ..plan.expressions import BinaryOp, BinaryOpType
+
+        if isinstance(predicate, BinaryOp) and predicate.op == BinaryOpType.AND:
+            left_result = self._push_filter(
+                Filter(input_plan, predicate.left)
+            )
+            return self._push_filter(
+                Filter(left_result, predicate.right)
+            )
+
         if isinstance(input_plan, Filter):
             return self._merge_filters(filter_node, input_plan)
 
