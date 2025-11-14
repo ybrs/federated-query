@@ -19,7 +19,21 @@ def _get_join_node(select_ast: exp.Select, index: int = 0) -> exp.Join:
 
 
 def _normalize_join_kind(join_expr: exp.Join) -> str:
-    """Normalize sqlglot join metadata into INNER/LEFT/RIGHT/FULL strings."""
+    """Extract join type from sqlglot Join node and normalize to standard string.
+
+    sqlglot stores join types inconsistently across different SQL dialects:
+    - Some use join_expr.args["kind"] (e.g., "INNER", "FULL OUTER")
+    - Some use join_expr.args["side"] (e.g., "LEFT", "RIGHT")
+    - Default INNER joins may have neither set
+
+    Examples:
+        INNER JOIN -> returns "INNER"
+        LEFT JOIN -> returns "LEFT" (from side)
+        FULL OUTER JOIN -> returns "FULL" (from kind)
+        JOIN (no keyword) -> returns "INNER" (default)
+
+    This normalizes all variants to uppercase strings: INNER, LEFT, RIGHT, FULL.
+    """
     kind = join_expr.args.get("kind")
     if kind is not None:
         if hasattr(kind, "value"):

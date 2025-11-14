@@ -5,6 +5,7 @@ from sqlglot import exp
 from tests.e2e_pushdown.helpers import (
     build_runtime,
     explain_datasource_query,
+    find_alias_expression,
     select_column_names,
     unwrap_parens,
 )
@@ -18,13 +19,21 @@ def test_upper_function_in_where(single_source_env):
         "WHERE UPPER(status) = 'PROCESSING'"
     )
     ast = explain_datasource_query(runtime, sql)
+
     where_clause = ast.args.get("where")
     assert where_clause is not None
     predicate = unwrap_parens(where_clause.this)
     assert isinstance(predicate, exp.EQ)
+
     left = unwrap_parens(predicate.left)
     assert isinstance(left, exp.Upper)
-    assert isinstance(left.this, exp.Column)
+    col = unwrap_parens(left.this)
+    assert isinstance(col, exp.Column)
+    assert col.name.lower() == "status"
+
+    right = unwrap_parens(predicate.right)
+    assert isinstance(right, exp.Literal)
+    assert right.this == "PROCESSING"
 
 
 def test_lower_function_with_like(single_source_env):
@@ -35,12 +44,21 @@ def test_lower_function_with_like(single_source_env):
         "WHERE LOWER(region) LIKE '%eu%'"
     )
     ast = explain_datasource_query(runtime, sql)
+
     where_clause = ast.args.get("where")
     assert where_clause is not None
     predicate = unwrap_parens(where_clause.this)
     assert isinstance(predicate, exp.Like)
+
     left = unwrap_parens(predicate.this)
     assert isinstance(left, exp.Lower)
+    col = unwrap_parens(left.this)
+    assert isinstance(col, exp.Column)
+    assert col.name.lower() == "region"
+
+    pattern = predicate.expression
+    assert isinstance(pattern, exp.Literal)
+    assert pattern.this == "%eu%"
 
 
 def test_length_function_comparison(single_source_env):
@@ -51,12 +69,21 @@ def test_length_function_comparison(single_source_env):
         "WHERE LENGTH(name) > 10"
     )
     ast = explain_datasource_query(runtime, sql)
+
     where_clause = ast.args.get("where")
     assert where_clause is not None
     predicate = unwrap_parens(where_clause.this)
     assert isinstance(predicate, exp.GT)
+
     left = unwrap_parens(predicate.left)
     assert isinstance(left, exp.Length)
+    col = unwrap_parens(left.this)
+    assert isinstance(col, exp.Column)
+    assert col.name.lower() == "name"
+
+    right = unwrap_parens(predicate.right)
+    assert isinstance(right, exp.Literal)
+    assert int(right.this) == 10
 
 
 def test_substring_function_in_where(single_source_env):
@@ -67,12 +94,17 @@ def test_substring_function_in_where(single_source_env):
         "WHERE SUBSTRING(name, 1, 3) = 'Pro'"
     )
     ast = explain_datasource_query(runtime, sql)
+
     where_clause = ast.args.get("where")
     assert where_clause is not None
     predicate = unwrap_parens(where_clause.this)
     assert isinstance(predicate, exp.EQ)
+
     left = unwrap_parens(predicate.left)
     assert isinstance(left, exp.Substring)
+    col = unwrap_parens(left.this)
+    assert isinstance(col, exp.Column)
+    assert col.name.lower() == "name"
 
 
 def test_trim_function_in_where(single_source_env):
@@ -83,12 +115,21 @@ def test_trim_function_in_where(single_source_env):
         "WHERE TRIM(region) = 'EU'"
     )
     ast = explain_datasource_query(runtime, sql)
+
     where_clause = ast.args.get("where")
     assert where_clause is not None
     predicate = unwrap_parens(where_clause.this)
     assert isinstance(predicate, exp.EQ)
+
     left = unwrap_parens(predicate.left)
     assert isinstance(left, exp.Trim)
+    col = unwrap_parens(left.this)
+    assert isinstance(col, exp.Column)
+    assert col.name.lower() == "region"
+
+    right = unwrap_parens(predicate.right)
+    assert isinstance(right, exp.Literal)
+    assert right.this == "EU"
 
 
 def test_string_concatenation_operator(single_source_env):
@@ -101,15 +142,10 @@ def test_string_concatenation_operator(single_source_env):
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
     assert "labeled_name" in projection
-    found_concat = False
-    for expression in ast.expressions:
-        node = expression
-        if isinstance(expression, exp.Alias):
-            node = expression.this
-        if isinstance(node, (exp.Concat, exp.DPipe)):
-            found_concat = True
-            break
-    assert found_concat
+
+    concat_expr = find_alias_expression(ast, "labeled_name")
+    assert concat_expr is not None
+    assert isinstance(concat_expr, (exp.Concat, exp.DPipe))
 
 
 def test_concat_function_multiple_columns(single_source_env):
@@ -122,15 +158,10 @@ def test_concat_function_multiple_columns(single_source_env):
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
     assert "full_label" in projection
-    found_concat = False
-    for expression in ast.expressions:
-        node = expression
-        if isinstance(expression, exp.Alias):
-            node = expression.this
-        if isinstance(node, exp.Concat):
-            found_concat = True
-            break
-    assert found_concat
+
+    concat_expr = find_alias_expression(ast, "full_label")
+    assert concat_expr is not None
+    assert isinstance(concat_expr, exp.Concat)
 
 
 def test_string_functions_in_select_projection(single_source_env):
@@ -144,17 +175,20 @@ def test_string_functions_in_select_projection(single_source_env):
     projection = select_column_names(ast)
     assert "status_upper" in projection
     assert "region_lower" in projection
-    found_upper = False
-    found_lower = False
-    for expression in ast.expressions:
-        node = expression
-        if isinstance(expression, exp.Alias):
-            node = expression.this
-        if isinstance(node, exp.Upper):
-            found_upper = True
-        if isinstance(node, exp.Lower):
-            found_lower = True
-    assert found_upper and found_lower
+
+    upper_expr = find_alias_expression(ast, "status_upper")
+    assert upper_expr is not None
+    assert isinstance(upper_expr, exp.Upper)
+    upper_col = unwrap_parens(upper_expr.this)
+    assert isinstance(upper_col, exp.Column)
+    assert upper_col.name.lower() == "status"
+
+    lower_expr = find_alias_expression(ast, "region_lower")
+    assert lower_expr is not None
+    assert isinstance(lower_expr, exp.Lower)
+    lower_col = unwrap_parens(lower_expr.this)
+    assert isinstance(lower_col, exp.Column)
+    assert lower_col.name.lower() == "region"
 
 
 def test_string_function_in_group_by(single_source_env):
@@ -168,15 +202,17 @@ def test_string_function_in_group_by(single_source_env):
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
     assert "status_norm" in projection
+
     group_clause = ast.args.get("group")
     assert group_clause is not None
-    found_upper = False
-    for expression in group_clause.expressions:
-        node = unwrap_parens(expression)
-        if isinstance(node, exp.Upper):
-            found_upper = True
-            break
-    assert found_upper
+    expressions = group_clause.expressions or []
+    assert len(expressions) == 1
+
+    group_expr = unwrap_parens(expressions[0])
+    assert isinstance(group_expr, exp.Upper)
+    col = unwrap_parens(group_expr.this)
+    assert isinstance(col, exp.Column)
+    assert col.name.lower() == "status"
 
 
 def test_string_function_in_order_by(single_source_env):
@@ -187,10 +223,15 @@ def test_string_function_in_order_by(single_source_env):
         "ORDER BY LOWER(name)"
     )
     ast = explain_datasource_query(runtime, sql)
+
     order_clause = ast.args.get("order")
     assert order_clause is not None
     expressions = order_clause.expressions
-    assert len(expressions) > 0
+    assert len(expressions) == 1
+
     first_order = expressions[0]
     order_expr = unwrap_parens(first_order.this)
     assert isinstance(order_expr, exp.Lower)
+    col = unwrap_parens(order_expr.this)
+    assert isinstance(col, exp.Column)
+    assert col.name.lower() == "name"
