@@ -548,3 +548,26 @@ def test_exists_with_complex_predicates(single_source_env):
 
     subquery_predicate = unwrap_parens(subquery_where.this)
     assert isinstance(subquery_predicate, exp.And)
+
+
+# Cross-Datasource Subquery Fallback
+
+
+def test_cross_datasource_subquery_fallback(multi_source_env):
+    """Documents cross-datasource subquery behavior (fallback expected)."""
+    runtime = build_runtime(multi_source_env)
+    sql = (
+        "SELECT order_id FROM duckdb_primary.main.orders "
+        "WHERE product_id IN ("
+        "  SELECT user_id FROM postgres_secondary.public.users WHERE active = true"
+        ")"
+    )
+
+    doc = runtime.explain(sql)
+    datasources = doc.get("datasources") or {}
+
+    duckdb_queries = datasources.get("duckdb_primary", [])
+    postgres_queries = datasources.get("postgres_secondary", [])
+
+    assert len(duckdb_queries) >= 1
+    assert len(postgres_queries) >= 1
