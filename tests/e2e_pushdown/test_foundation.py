@@ -32,6 +32,7 @@ def _unwrap_parens(expression):
 
 
 def test_explain_json_tracks_simple_predicate(single_source_env):
+    """Ensures EXPLAIN JSON captures datasource plus a single equality predicate."""
     runtime = _build_runtime(single_source_env)
     sql = (
         "EXPLAIN (FORMAT JSON) "
@@ -53,6 +54,7 @@ def test_explain_json_tracks_simple_predicate(single_source_env):
 
 
 def test_explain_json_tracks_compound_predicate(single_source_env):
+    """Confirms AND predicates appear exactly once with both child comparisons."""
     runtime = _build_runtime(single_source_env)
     sql = (
         "EXPLAIN (FORMAT JSON) "

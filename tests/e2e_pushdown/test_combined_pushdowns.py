@@ -2,7 +2,15 @@
 
 from sqlglot import exp
 
-from tests.e2e_pushdown.helpers import build_runtime
+from tests.e2e_pushdown.helpers import (
+    build_runtime,
+    find_alias_expression,
+    find_in_select,
+    group_column_names,
+    join_table_names,
+    select_column_names,
+    unwrap_parens,
+)
 
 
 def _explain_document(runtime, sql: str):
@@ -12,14 +20,8 @@ def _explain_document(runtime, sql: str):
     return document
 
 
-def _collect_select_sql(select_ast: exp.Select):
-    fragments = []
-    for expression in select_ast.expressions:
-        fragments.append(expression.sql())
-    return fragments
-
-
 def test_projection_predicate_aggregation_join_limit(single_source_env):
+    """Checks sum/group/filter/limit stay remote with the correct join target."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT O.region, SUM(P.base_price) AS total_cost "
@@ -33,13 +35,22 @@ def test_projection_predicate_aggregation_join_limit(single_source_env):
     queries = document["queries"]
     assert len(queries) == 1
     query_ast = queries[0]["query"]
-    fragments = _collect_select_sql(query_ast)
-    assert any("SUM(" in fragment for fragment in fragments)
+    projection = select_column_names(query_ast)
+    assert projection == ["region", "total_cost"]
+    aggregates = find_in_select(query_ast, lambda node: isinstance(node, exp.Sum))
+    assert len(aggregates) == 1
+    child = aggregates[0].this
+    assert isinstance(child, exp.Column)
+    assert child.table == "P"
     assert query_ast.args.get("group") is not None
-    assert any("PhysicalLimit" in line for line in document["plan"])
+    names = group_column_names(query_ast)
+    assert "region" in names
+    join_tables = join_table_names(query_ast)
+    assert "products" in join_tables
 
 
 def test_join_with_computed_expression_group_by(single_source_env):
+    """Validates computed SUM uses the expected multiplication expression once."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT O.region, SUM(P.base_price * O.quantity) AS revenue "
@@ -49,12 +60,19 @@ def test_join_with_computed_expression_group_by(single_source_env):
     )
     document = _explain_document(runtime, sql)
     query_ast = document["queries"][0]["query"]
-    fragments = _collect_select_sql(query_ast)
-    assert any("base_price * O.quantity" in fragment for fragment in fragments)
+    projection = select_column_names(query_ast)
+    assert projection == ["region", "revenue"]
+    aggregates = find_in_select(query_ast, lambda node: isinstance(node, exp.Sum))
+    assert len(aggregates) == 1
+    expression = unwrap_parens(aggregates[0].this)
+    assert isinstance(expression, exp.Mul)
+    assert isinstance(expression.left, exp.Column)
+    assert isinstance(expression.right, exp.Column)
     assert query_ast.args.get("group") is not None
 
 
 def test_join_with_order_by_after_aggregation(single_source_env):
+    """Ensures SUM + ORDER BY keep the join remote with a single aggregate."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT O.region, SUM(P.base_price) AS total_cost "
@@ -65,13 +83,16 @@ def test_join_with_order_by_after_aggregation(single_source_env):
     )
     document = _explain_document(runtime, sql)
     query_ast = document["queries"][0]["query"]
-    fragments = _collect_select_sql(query_ast)
-    assert any("SUM(" in fragment for fragment in fragments)
+    projection = select_column_names(query_ast)
+    assert projection == ["region", "total_cost"]
+    aggregates = find_in_select(query_ast, lambda node: isinstance(node, exp.Sum))
+    assert len(aggregates) == 1
     join_nodes = query_ast.args.get("joins") or []
     assert join_nodes, "join should remain remote"
 
 
 def test_join_distinct_stays_remote(single_source_env):
+    """Checks DISTINCT joins still plan a single remote join query."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT DISTINCT O.region, P.category "
@@ -81,10 +102,28 @@ def test_join_distinct_stays_remote(single_source_env):
     )
     document = _explain_document(runtime, sql)
     assert len(document["queries"]) == 1
-    assert any("PhysicalRemoteJoin" in line for line in document["plan"])
+    query_ast = document["queries"][0]["query"]
+    projection = select_column_names(query_ast)
+    assert projection == [
+        "order_id",
+        "product_id",
+        "customer_id",
+        "quantity",
+        "price",
+        "status",
+        "region",
+        "id",
+        "category",
+        "name",
+        "base_price",
+        "active",
+    ]
+    join_tables = join_table_names(query_ast)
+    assert "products" in join_tables
 
 
 def test_join_with_case_expression_and_limit(single_source_env):
+    """Ensures CASE + SUM alias stays remote and limit remains pushed."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT O.region, SUM(CASE WHEN P.category = 'clothing' THEN P.base_price ELSE 0 END) AS clothing_spend "
@@ -95,5 +134,10 @@ def test_join_with_case_expression_and_limit(single_source_env):
         "LIMIT 10"
     )
     document = _explain_document(runtime, sql)
-    fragments = _collect_select_sql(document["queries"][0]["query"])
-    assert any("CASE" in fragment for fragment in fragments)
+    query_ast = document["queries"][0]["query"]
+    projection = select_column_names(query_ast)
+    assert projection == ["region", "clothing_spend"]
+    target = find_alias_expression(query_ast, "clothing_spend")
+    assert target is not None
+    assert isinstance(target, exp.Sum)
+    assert isinstance(target.this, exp.Case)

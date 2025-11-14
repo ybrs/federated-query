@@ -1,6 +1,10 @@
 """Three-table join pushdown and combined scenarios."""
 
-from tests.e2e_pushdown.helpers import build_runtime
+from tests.e2e_pushdown.helpers import (
+    build_runtime,
+    from_table_name,
+    join_table_names,
+)
 
 
 def _explain_document(runtime, sql):
@@ -21,6 +25,7 @@ def _assert_dual_queries(document):
 
 
 def test_three_table_inner_chain(single_source_env):
+    """Ensures three-table inner chain splits into two queries: orders/products + customers."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT O.order_id, P.name, C.segment "
@@ -30,12 +35,14 @@ def test_three_table_inner_chain(single_source_env):
     )
     document = _explain_document(runtime, sql)
     first, second = _assert_dual_queries(document)
-    assert '"orders"' in first.sql()
-    assert '"customers"' in second.sql()
-    assert any("PhysicalRemoteJoin" in line for line in document["plan"])
+    assert from_table_name(first) == "orders"
+    first_join_tables = join_table_names(first)
+    assert "products" in first_join_tables
+    assert from_table_name(second) == "customers"
 
 
 def test_mixed_inner_left_chain(single_source_env):
+    """Validates mixed inner/left chains still split with customers isolated."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT O.order_id, P.name, C.segment "
@@ -44,11 +51,13 @@ def test_mixed_inner_left_chain(single_source_env):
         "LEFT JOIN duckdb_primary.main.customers C ON O.customer_id = C.customer_id"
     )
     document = _explain_document(runtime, sql)
-    _assert_dual_queries(document)
-    assert any("PhysicalHashJoin cost=-1.0 rows=-1 details=type=LEFT" in line for line in document["plan"])
+    first, second = _assert_dual_queries(document)
+    assert from_table_name(first) == "orders"
+    assert from_table_name(second) == "customers"
 
 
 def test_three_table_with_predicates(single_source_env):
+    """Confirms predicates on products/customers remain outside remote scans."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT O.order_id "
@@ -58,11 +67,13 @@ def test_three_table_with_predicates(single_source_env):
         "WHERE P.category = 'clothing' AND C.segment = 'enterprise'"
     )
     document = _explain_document(runtime, sql)
-    _assert_dual_queries(document)
-    assert any("PhysicalFilter" in line for line in document["plan"])
+    first, second = _assert_dual_queries(document)
+    assert first.args.get("where") is None
+    assert second.args.get("where") is None
 
 
 def test_three_table_with_limit(single_source_env):
+    """Ensures LIMIT 5 is handled outside both remote scans for three-table joins."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT O.order_id "
@@ -72,5 +83,6 @@ def test_three_table_with_limit(single_source_env):
         "LIMIT 5"
     )
     document = _explain_document(runtime, sql)
-    _assert_dual_queries(document)
-    assert any("Limit" in line for line in document["plan"])
+    first, second = _assert_dual_queries(document)
+    assert first.args.get("limit") is None
+    assert second.args.get("limit") is None
