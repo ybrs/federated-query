@@ -9,6 +9,7 @@ from sqlglot import exp
 from tests.e2e_pushdown.helpers import (
     build_runtime,
     explain_datasource_query,
+    find_alias_expression,
     select_column_names,
     unwrap_parens,
 )
@@ -22,12 +23,18 @@ def test_extract_year_in_where(single_source_env):
         "WHERE EXTRACT(YEAR FROM created_at) = 2024"
     )
     ast = explain_datasource_query(runtime, sql)
+
     where_clause = ast.args.get("where")
     assert where_clause is not None
     predicate = unwrap_parens(where_clause.this)
     assert isinstance(predicate, exp.EQ)
+
     left = unwrap_parens(predicate.left)
     assert isinstance(left, exp.Extract)
+
+    right = unwrap_parens(predicate.right)
+    assert isinstance(right, exp.Literal)
+    assert int(right.this) == 2024
 
 
 def test_date_trunc_function(single_source_env):
@@ -41,15 +48,15 @@ def test_date_trunc_function(single_source_env):
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
     assert "month" in projection
+    assert "cnt" in projection
+
     group_clause = ast.args.get("group")
     assert group_clause is not None
-    found_trunc = False
-    for expression in group_clause.expressions:
-        node = unwrap_parens(expression)
-        if isinstance(node, exp.DateTrunc):
-            found_trunc = True
-            break
-    assert found_trunc
+    expressions = group_clause.expressions or []
+    assert len(expressions) == 1
+
+    group_expr = unwrap_parens(expressions[0])
+    assert isinstance(group_expr, exp.DateTrunc)
 
 
 def test_date_arithmetic_addition(single_source_env):
@@ -60,10 +67,18 @@ def test_date_arithmetic_addition(single_source_env):
         "WHERE created_at > CURRENT_DATE - INTERVAL '30 days'"
     )
     ast = explain_datasource_query(runtime, sql)
+
     where_clause = ast.args.get("where")
     assert where_clause is not None
     predicate = unwrap_parens(where_clause.this)
     assert isinstance(predicate, exp.GT)
+
+    left = unwrap_parens(predicate.left)
+    assert isinstance(left, exp.Column)
+    assert left.name.lower() == "created_at"
+
+    right = unwrap_parens(predicate.right)
+    assert isinstance(right, exp.Sub)
 
 
 def test_date_between_range(single_source_env):
@@ -74,10 +89,15 @@ def test_date_between_range(single_source_env):
         "WHERE created_at BETWEEN '2024-01-01' AND '2024-12-31'"
     )
     ast = explain_datasource_query(runtime, sql)
+
     where_clause = ast.args.get("where")
     assert where_clause is not None
     predicate = unwrap_parens(where_clause.this)
     assert isinstance(predicate, exp.Between)
+
+    col = unwrap_parens(predicate.this)
+    assert isinstance(col, exp.Column)
+    assert col.name.lower() == "created_at"
 
 
 def test_age_function_interval_comparison(single_source_env):
@@ -88,10 +108,14 @@ def test_age_function_interval_comparison(single_source_env):
         "WHERE AGE(CURRENT_DATE, created_at) > INTERVAL '30 days'"
     )
     ast = explain_datasource_query(runtime, sql)
+
     where_clause = ast.args.get("where")
     assert where_clause is not None
     predicate = unwrap_parens(where_clause.this)
     assert isinstance(predicate, exp.GT)
+
+    left = unwrap_parens(predicate.left)
+    assert isinstance(left, exp.Anonymous) or hasattr(left, 'name')
 
 
 def test_current_date_in_select(single_source_env):
@@ -103,16 +127,12 @@ def test_current_date_in_select(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
+    assert "order_id" in projection
     assert "today" in projection
-    found_current_date = False
-    for expression in ast.expressions:
-        node = expression
-        if isinstance(expression, exp.Alias):
-            node = expression.this
-        if isinstance(node, (exp.CurrentDate, exp.CurrentTimestamp)):
-            found_current_date = True
-            break
-    assert found_current_date
+
+    today_expr = find_alias_expression(ast, "today")
+    assert today_expr is not None
+    assert isinstance(today_expr, (exp.CurrentDate, exp.CurrentTimestamp))
 
 
 def test_extract_in_group_by(single_source_env):
@@ -124,15 +144,16 @@ def test_extract_in_group_by(single_source_env):
         "GROUP BY EXTRACT(MONTH FROM created_at)"
     )
     ast = explain_datasource_query(runtime, sql)
+    projection = select_column_names(ast)
+    assert "month" in projection
+
     group_clause = ast.args.get("group")
     assert group_clause is not None
-    found_extract = False
-    for expression in group_clause.expressions:
-        node = unwrap_parens(expression)
-        if isinstance(node, exp.Extract):
-            found_extract = True
-            break
-    assert found_extract
+    expressions = group_clause.expressions or []
+    assert len(expressions) == 1
+
+    group_expr = unwrap_parens(expressions[0])
+    assert isinstance(group_expr, exp.Extract)
 
 
 def test_date_function_in_order_by(single_source_env):
@@ -144,13 +165,17 @@ def test_date_function_in_order_by(single_source_env):
         "ORDER BY DATE_TRUNC('day', created_at) DESC"
     )
     ast = explain_datasource_query(runtime, sql)
+
     order_clause = ast.args.get("order")
     assert order_clause is not None
     expressions = order_clause.expressions
-    assert len(expressions) > 0
+    assert len(expressions) == 1
+
     first_order = expressions[0]
     order_expr = unwrap_parens(first_order.this)
     assert isinstance(order_expr, exp.DateTrunc)
+
+    assert first_order.args.get("desc") is True
 
 
 def test_timestamp_comparison(single_source_env):
@@ -161,10 +186,15 @@ def test_timestamp_comparison(single_source_env):
         "WHERE created_at >= '2024-01-01 00:00:00'::timestamp"
     )
     ast = explain_datasource_query(runtime, sql)
+
     where_clause = ast.args.get("where")
     assert where_clause is not None
     predicate = unwrap_parens(where_clause.this)
     assert isinstance(predicate, exp.GTE)
+
+    left = unwrap_parens(predicate.left)
+    assert isinstance(left, exp.Column)
+    assert left.name.lower() == "created_at"
 
 
 def test_date_arithmetic_edge_cases(single_source_env):
@@ -175,9 +205,15 @@ def test_date_arithmetic_edge_cases(single_source_env):
         "WHERE created_at + INTERVAL '1 year' < CURRENT_DATE"
     )
     ast = explain_datasource_query(runtime, sql)
+
     where_clause = ast.args.get("where")
     assert where_clause is not None
     predicate = unwrap_parens(where_clause.this)
     assert isinstance(predicate, exp.LT)
+
     left = unwrap_parens(predicate.left)
     assert isinstance(left, exp.Add)
+
+    add_left = unwrap_parens(left.left)
+    assert isinstance(add_left, exp.Column)
+    assert add_left.name.lower() == "created_at"
