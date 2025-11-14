@@ -195,3 +195,234 @@ def test_limit_offset_pushdown(single_source_env):
     assert offset_clause is not None
     offset_value = int(offset_clause.expression.this)
     assert offset_value == 1
+
+
+def test_less_than_predicate(single_source_env):
+    """Verifies less than predicates push as LT over the quantity column."""
+    runtime = build_runtime(single_source_env)
+    sql = "SELECT * FROM duckdb_primary.main.orders WHERE quantity < 5"
+    ast = explain_datasource_query(runtime, sql)
+    projection = select_column_names(ast)
+    assert projection == ["*"]
+    where_clause = ast.args.get("where")
+    assert where_clause is not None
+    predicate = unwrap_parens(where_clause.this)
+    assert isinstance(predicate, exp.LT)
+    assert predicate.left.name.lower() == "quantity"
+
+
+def test_less_than_or_equal_predicate(single_source_env):
+    """Verifies less than or equal predicates push as LTE correctly."""
+    runtime = build_runtime(single_source_env)
+    sql = "SELECT * FROM duckdb_primary.main.orders WHERE quantity <= 3"
+    ast = explain_datasource_query(runtime, sql)
+    projection = select_column_names(ast)
+    assert projection == ["*"]
+    where_clause = ast.args.get("where")
+    assert where_clause is not None
+    predicate = unwrap_parens(where_clause.this)
+    assert isinstance(predicate, exp.LTE)
+    assert predicate.left.name.lower() == "quantity"
+
+
+def test_greater_than_or_equal_predicate(single_source_env):
+    """Verifies greater than or equal predicates push as GTE correctly."""
+    runtime = build_runtime(single_source_env)
+    sql = "SELECT * FROM duckdb_primary.main.orders WHERE quantity >= 2"
+    ast = explain_datasource_query(runtime, sql)
+    projection = select_column_names(ast)
+    assert projection == ["*"]
+    where_clause = ast.args.get("where")
+    assert where_clause is not None
+    predicate = unwrap_parens(where_clause.this)
+    assert isinstance(predicate, exp.GTE)
+    assert predicate.left.name.lower() == "quantity"
+
+
+def test_not_equal_predicate(single_source_env):
+    """Validates not equal predicates push as NEQ for status filtering."""
+    runtime = build_runtime(single_source_env)
+    sql = "SELECT * FROM duckdb_primary.main.orders WHERE status != 'cancelled'"
+    ast = explain_datasource_query(runtime, sql)
+    projection = select_column_names(ast)
+    assert projection == ["*"]
+    where_clause = ast.args.get("where")
+    assert where_clause is not None
+    predicate = unwrap_parens(where_clause.this)
+    assert isinstance(predicate, exp.NEQ)
+    assert predicate.left.name.lower() == "status"
+
+
+def test_is_null_predicate(single_source_env):
+    """Ensures IS NULL predicates push correctly to detect null values."""
+    runtime = build_runtime(single_source_env)
+    sql = "SELECT * FROM duckdb_primary.main.orders WHERE region IS NULL"
+    ast = explain_datasource_query(runtime, sql)
+    projection = select_column_names(ast)
+    assert projection == ["*"]
+    where_clause = ast.args.get("where")
+    assert where_clause is not None
+    predicate = unwrap_parens(where_clause.this)
+    assert isinstance(predicate, exp.Is)
+    assert predicate.this.name.lower() == "region"
+    assert isinstance(predicate.expression, exp.Null)
+
+
+def test_is_not_null_predicate(single_source_env):
+    """Ensures IS NOT NULL predicates push correctly to filter out nulls."""
+    runtime = build_runtime(single_source_env)
+    sql = "SELECT * FROM duckdb_primary.main.orders WHERE region IS NOT NULL"
+    ast = explain_datasource_query(runtime, sql)
+    projection = select_column_names(ast)
+    assert projection == ["*"]
+    where_clause = ast.args.get("where")
+    assert where_clause is not None
+    predicate = unwrap_parens(where_clause.this)
+    assert isinstance(predicate, exp.Is)
+    assert predicate.this.name.lower() == "region"
+    assert isinstance(predicate.expression, exp.Not)
+
+
+def test_not_in_predicate(single_source_env):
+    """Validates NOT IN predicates push correctly with negated list check."""
+    runtime = build_runtime(single_source_env)
+    sql = (
+        "SELECT order_id FROM duckdb_primary.main.orders "
+        "WHERE status NOT IN ('cancelled', 'returned')"
+    )
+    ast = explain_datasource_query(runtime, sql)
+    projection = select_column_names(ast)
+    assert projection == ["order_id", "status"]
+    where_clause = ast.args.get("where")
+    assert where_clause is not None
+    predicate = unwrap_parens(where_clause.this)
+    assert isinstance(predicate, exp.Not)
+    inner = unwrap_parens(predicate.this)
+    assert isinstance(inner, exp.In)
+    assert inner.this.name.lower() == "status"
+
+
+def test_not_between_predicate(single_source_env):
+    """Validates NOT BETWEEN pushes correctly with negated range check."""
+    runtime = build_runtime(single_source_env)
+    sql = (
+        "SELECT order_id FROM duckdb_primary.main.orders "
+        "WHERE quantity NOT BETWEEN 3 AND 7"
+    )
+    ast = explain_datasource_query(runtime, sql)
+    projection = select_column_names(ast)
+    assert projection == ["order_id", "quantity"]
+    where_clause = ast.args.get("where")
+    assert where_clause is not None
+    predicate = unwrap_parens(where_clause.this)
+    assert isinstance(predicate, exp.Not)
+    inner = unwrap_parens(predicate.this)
+    assert isinstance(inner, exp.Between)
+    assert inner.this.name.lower() == "quantity"
+
+
+def test_not_like_predicate(single_source_env):
+    """Checks NOT LIKE predicates push correctly with pattern negation."""
+    runtime = build_runtime(single_source_env)
+    sql = (
+        "SELECT name FROM duckdb_primary.main.products "
+        "WHERE name NOT LIKE 'temp%'"
+    )
+    ast = explain_datasource_query(runtime, sql)
+    projection = select_column_names(ast)
+    assert projection == ["name"]
+    where_clause = ast.args.get("where")
+    assert where_clause is not None
+    predicate = unwrap_parens(where_clause.this)
+    assert isinstance(predicate, exp.Not)
+    inner = unwrap_parens(predicate.this)
+    assert isinstance(inner, exp.Like)
+
+
+def test_not_operator_with_equality(single_source_env):
+    """Validates NOT operator wraps equality predicates correctly."""
+    runtime = build_runtime(single_source_env)
+    sql = (
+        "SELECT order_id FROM duckdb_primary.main.orders "
+        "WHERE NOT (status = 'cancelled')"
+    )
+    ast = explain_datasource_query(runtime, sql)
+    projection = select_column_names(ast)
+    assert projection == ["order_id", "status"]
+    where_clause = ast.args.get("where")
+    assert where_clause is not None
+    predicate = unwrap_parens(where_clause.this)
+    assert isinstance(predicate, exp.Not)
+    inner = unwrap_parens(predicate.this)
+    assert isinstance(inner, exp.EQ)
+
+
+def test_three_way_and_predicate(single_source_env):
+    """Ensures three-way AND predicates push all conditions together."""
+    runtime = build_runtime(single_source_env)
+    sql = (
+        "SELECT order_id FROM duckdb_primary.main.orders "
+        "WHERE region = 'EU' AND status = 'processing' AND quantity > 2"
+    )
+    ast = explain_datasource_query(runtime, sql)
+    projection = select_column_names(ast)
+    assert set(projection) == {"order_id", "region", "status", "quantity"}
+    where_clause = ast.args.get("where")
+    assert where_clause is not None
+    predicate = unwrap_parens(where_clause.this)
+    assert isinstance(predicate, exp.And)
+
+
+def test_three_way_or_predicate(single_source_env):
+    """Ensures three-way OR predicates push all alternatives together."""
+    runtime = build_runtime(single_source_env)
+    sql = (
+        "SELECT order_id FROM duckdb_primary.main.orders "
+        "WHERE region = 'EU' OR region = 'APAC' OR region = 'NA'"
+    )
+    ast = explain_datasource_query(runtime, sql)
+    projection = select_column_names(ast)
+    assert projection == ["order_id", "region"]
+    where_clause = ast.args.get("where")
+    assert where_clause is not None
+    predicate = unwrap_parens(where_clause.this)
+    assert isinstance(predicate, exp.Or)
+
+
+def test_nested_and_or_combination(single_source_env):
+    """Validates nested (a AND b) OR (c AND d) structure pushes correctly."""
+    runtime = build_runtime(single_source_env)
+    sql = (
+        "SELECT order_id FROM duckdb_primary.main.orders "
+        "WHERE (region = 'EU' AND status = 'processing') "
+        "OR (region = 'APAC' AND status = 'shipped')"
+    )
+    ast = explain_datasource_query(runtime, sql)
+    projection = select_column_names(ast)
+    assert set(projection) == {"order_id", "region", "status"}
+    where_clause = ast.args.get("where")
+    assert where_clause is not None
+    predicate = unwrap_parens(where_clause.this)
+    assert isinstance(predicate, exp.Or)
+    left = unwrap_parens(predicate.left)
+    right = unwrap_parens(predicate.right)
+    assert isinstance(left, exp.And)
+    assert isinstance(right, exp.And)
+
+
+def test_complex_nested_logic(single_source_env):
+    """Checks complex ((a OR b) AND c) structure maintains hierarchy."""
+    runtime = build_runtime(single_source_env)
+    sql = (
+        "SELECT order_id FROM duckdb_primary.main.orders "
+        "WHERE ((region = 'EU' OR region = 'APAC') AND status = 'processing')"
+    )
+    ast = explain_datasource_query(runtime, sql)
+    projection = select_column_names(ast)
+    assert set(projection) == {"order_id", "region", "status"}
+    where_clause = ast.args.get("where")
+    assert where_clause is not None
+    predicate = unwrap_parens(where_clause.this)
+    assert isinstance(predicate, exp.And)
+    left = unwrap_parens(predicate.left)
+    assert isinstance(left, exp.Or)
