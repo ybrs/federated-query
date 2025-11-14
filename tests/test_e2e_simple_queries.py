@@ -326,3 +326,13 @@ def test_explain_returns_plan(setup_duckdb):
             break
 
     assert has_scan
+
+    saw_queries_header = False
+    saw_query_line = False
+    for line in plan_lines:
+        if line == "Queries:":
+            saw_queries_header = True
+        if line.startswith("- testdb"):
+            saw_query_line = True
+    assert saw_queries_header
+    assert saw_query_line

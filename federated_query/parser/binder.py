@@ -196,7 +196,7 @@ class Binder:
     def _bind_explain(self, explain: Explain) -> Explain:
         """Bind an Explain node."""
         bound_child = self.bind(explain.input)
-        return Explain(input=bound_child)
+        return Explain(input=bound_child, format=explain.format)
 
     def _bind_aggregate(self, aggregate: Aggregate) -> Aggregate:
         """Bind an Aggregate node."""

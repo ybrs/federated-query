@@ -2,7 +2,7 @@
 
 import pytest
 from federated_query.parser import Parser
-from federated_query.plan.logical import Project, Scan, Join
+from federated_query.plan.logical import Project, Scan, Join, Explain, ExplainFormat
 
 
 def test_parser_initialization():
@@ -74,3 +74,12 @@ def test_scan_alias_set_for_join_tables():
     assert isinstance(join.right, Scan)
     assert join.left.alias == "c"
     assert join.right.alias == "o"
+
+
+def test_explain_as_json_detected():
+    """Parser should treat EXPLAIN (AS JSON) as JSON format."""
+    parser = Parser()
+    sql = "EXPLAIN (AS JSON) SELECT id FROM testdb.main.users"
+    plan = parser.parse_to_logical_plan(sql)
+    assert isinstance(plan, Explain)
+    assert plan.format == ExplainFormat.JSON

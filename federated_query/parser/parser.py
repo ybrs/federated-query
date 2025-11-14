@@ -13,6 +13,7 @@ from ..plan.logical import (
     JoinType,
     Aggregate,
     Explain,
+    ExplainFormat,
 )
 from ..plan.expressions import (
     Expression,
@@ -80,21 +81,74 @@ class Parser:
 
     def _convert_explain(self, command: exp.Command) -> LogicalPlanNode:
         """Convert EXPLAIN statement to logical plan."""
-        query_ast = self._extract_explain_expression(command)
+        query_ast, explain_format = self._extract_explain_parts(command)
         child_plan = self.ast_to_logical_plan(query_ast)
-        return Explain(input=child_plan)
+        return Explain(input=child_plan, format=explain_format)
 
-    def _extract_explain_expression(self, command: exp.Command) -> exp.Expression:
-        """Extract the statement wrapped by EXPLAIN."""
+    def _extract_explain_parts(
+        self, command: exp.Command
+    ) -> Tuple[exp.Expression, ExplainFormat]:
+        """Extract wrapped statement and format."""
         expression = command.args.get("expression")
         if expression is None:
             raise ValueError("EXPLAIN requires a statement to describe")
         if isinstance(expression, exp.Literal) and expression.is_string:
-            sql_text = expression.this
-            return sqlglot.parse_one(sql_text, dialect=self.dialect)
+            sql_text = expression.this.strip()
+            explain_format, sql_body = self._parse_explain_options(sql_text)
+            parsed = sqlglot.parse_one(sql_body, dialect=self.dialect)
+            return parsed, explain_format
         if isinstance(expression, exp.Expression):
-            return expression
+            return expression, ExplainFormat.TEXT
         raise ValueError(f"Unsupported EXPLAIN expression: {type(expression)}")
+
+    def _parse_explain_options(
+        self, sql_text: str
+    ) -> Tuple[ExplainFormat, str]:
+        """Parse optional EXPLAIN options prefix."""
+        if not sql_text.startswith("("):
+            return ExplainFormat.TEXT, sql_text
+        options, remainder = self._split_option_clause(sql_text)
+        explain_format = self._resolve_explain_format(options)
+        cleaned_sql = remainder.strip()
+        return explain_format, cleaned_sql
+
+    def _split_option_clause(self, sql_text: str) -> Tuple[str, str]:
+        """Split '(...) rest' into option text and remainder."""
+        depth = 0
+        start_index = -1
+        end_index = -1
+        for position, char in enumerate(sql_text):
+            if char == "(":
+                if depth == 0:
+                    start_index = position
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    end_index = position
+                    break
+        if end_index == -1 or start_index == -1:
+            raise ValueError("EXPLAIN options missing closing parenthesis")
+        options = sql_text[start_index + 1 : end_index]
+        remainder = sql_text[end_index + 1 :]
+        return options, remainder
+
+    def _resolve_explain_format(self, options: str) -> ExplainFormat:
+        """Determine requested EXPLAIN format."""
+        normalized = options.replace("=", " ")
+        normalized = normalized.replace(",", " ")
+        tokens = normalized.split()
+        index = 0
+        while index < len(tokens):
+            token = tokens[index].upper()
+            if token in ("FORMAT", "AS") and index + 1 < len(tokens):
+                value = tokens[index + 1].upper()
+                if value == "JSON":
+                    return ExplainFormat.JSON
+                if value == "TEXT":
+                    return ExplainFormat.TEXT
+            index += 1
+        return ExplainFormat.TEXT
 
     def _is_explain_command(self, command: exp.Command) -> bool:
         """Check if a sqlglot Command represents EXPLAIN."""

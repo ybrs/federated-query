@@ -124,7 +124,7 @@ class PhysicalPlanner:
     def _plan_explain(self, explain: Explain) -> PhysicalExplain:
         """Plan an explain node."""
         child_plan = self._plan_node(explain.input)
-        return PhysicalExplain(child=child_plan)
+        return PhysicalExplain(child=child_plan, format=explain.format)
 
     def _plan_join(self, join: Join) -> PhysicalPlanNode:
         """Plan a join node."""

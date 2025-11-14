@@ -12,6 +12,7 @@ from ..plan.logical import (
     Sort,
     Limit,
     Union,
+    Explain,
 )
 from ..plan.expressions import Expression
 from ..catalog.catalog import Catalog
@@ -768,7 +769,7 @@ class LimitPushdownRule(OptimizationRule):
 
         new_input = self._push_limit(plan.input)
         if new_input != plan.input:
-            return Explain(new_input)
+            return Explain(new_input, plan.format)
         return plan
 
     def _try_push_limit(self, limit: Limit) -> LogicalPlanNode:
@@ -1109,6 +1110,10 @@ class RuleBasedOptimizer:
         Returns:
             Optimized logical plan
         """
+        if isinstance(plan, Explain):
+            optimized_child = self.optimize(plan.input, max_iterations)
+            return Explain(optimized_child, plan.format)
+
         current_plan = plan
         iteration = 0
 

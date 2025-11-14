@@ -31,6 +31,13 @@ class AggregateFunction(Enum):
     COUNT_DISTINCT = "COUNT_DISTINCT"
 
 
+class ExplainFormat(Enum):
+    """Supported EXPLAIN output formats."""
+
+    TEXT = "TEXT"
+    JSON = "JSON"
+
+
 class LogicalPlanNode(ABC):
     """Base class for logical plan nodes."""
 
@@ -286,13 +293,14 @@ class Explain(LogicalPlanNode):
     """Explain wrapper around another plan."""
 
     input: LogicalPlanNode
+    format: ExplainFormat = ExplainFormat.TEXT
 
     def children(self) -> List[LogicalPlanNode]:
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Explain":
         assert len(children) == 1
-        return Explain(children[0])
+        return Explain(children[0], self.format)
 
     def accept(self, visitor):
         return visitor.visit_explain(self)
@@ -301,7 +309,7 @@ class Explain(LogicalPlanNode):
         return ["plan"]
 
     def __repr__(self) -> str:
-        return "Explain()"
+        return f"Explain(format={self.format.value})"
 
 
 class LogicalPlanVisitor(ABC):

@@ -1,5 +1,6 @@
 """Physical plan nodes."""
 
+import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import List, Optional, Iterator, Any, TYPE_CHECKING, Dict, Callable, Set, Tuple
@@ -8,7 +9,7 @@ from enum import Enum
 import pyarrow as pa
 
 from .expressions import Expression
-from .logical import JoinType
+from .logical import JoinType, ExplainFormat
 
 if TYPE_CHECKING:
     from .expressions import FunctionCall
@@ -1514,17 +1515,27 @@ class PhysicalExplain(PhysicalPlanNode):
     """Explain a physical plan without executing it."""
 
     child: PhysicalPlanNode
+    format: ExplainFormat = ExplainFormat.TEXT
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.child]
 
     def execute(self) -> Iterator[pa.RecordBatch]:
-        """Return textual representation of the plan."""
-        formatter = _PlanFormatter()
-        lines = formatter.format(self.child)
-        array = pa.array(lines)
-        batch = pa.RecordBatch.from_arrays([array], names=["plan"])
+        """Return representation of the plan."""
+        if self.format == ExplainFormat.JSON:
+            batch = self._build_json_batch()
+            yield batch
+            return
+        batch = self._build_text_batch()
         yield batch
+
+    def build_document(self, stringify_queries: bool = False) -> Dict[str, Any]:
+        """Build structured plan + query metadata."""
+        formatter = _PlanFormatter()
+        plan_lines = formatter.format(self.child)
+        entries = self._build_query_entries(stringify_queries)
+        document = {"plan": plan_lines, "queries": entries}
+        return document
 
     def schema(self) -> pa.Schema:
         return pa.schema([pa.field("plan", pa.string())])
@@ -1533,7 +1544,60 @@ class PhysicalExplain(PhysicalPlanNode):
         return -1.0
 
     def __repr__(self) -> str:
-        return "PhysicalExplain()"
+        return f"PhysicalExplain(format={self.format.value})"
+
+    def _build_text_batch(self) -> pa.RecordBatch:
+        formatter = _PlanFormatter()
+        lines = formatter.format(self.child)
+        self._append_query_lines(lines)
+        array = pa.array(lines)
+        return pa.RecordBatch.from_arrays([array], names=["plan"])
+
+    def _build_json_batch(self) -> pa.RecordBatch:
+        document = self.build_document(stringify_queries=True)
+        json_text = json.dumps(document, indent=2)
+        array = pa.array([json_text])
+        return pa.RecordBatch.from_arrays([array], names=["plan"])
+
+    def _append_query_lines(self, lines: List[str]) -> None:
+        queries = self._collect_queries()
+        if not queries:
+            return
+        lines.append("")
+        lines.append("Queries:")
+        for snapshot in queries:
+            text = f"- {snapshot.datasource_name}: {snapshot.sql}"
+            lines.append(text)
+
+    def _build_query_entries(self, stringify_queries: bool) -> List[Dict[str, Any]]:
+        queries = self._collect_queries()
+        entries: List[Dict[str, Any]] = []
+        for snapshot in queries:
+            query_value: Any = snapshot.query_ast
+            if stringify_queries:
+                if snapshot.query_ast is not None:
+                    query_value = snapshot.query_ast.sql(dialect="postgres")
+                else:
+                    query_value = snapshot.sql
+            entry = {
+                "datasource_name": snapshot.datasource_name,
+                "query": query_value,
+            }
+            entries.append(entry)
+        return entries
+
+    def _collect_queries(self) -> List["_DatasourceQuerySnapshot"]:
+        collector = _DatasourceQueryCollector()
+        return collector.collect(self.child)
+
+
+@dataclass
+class _DatasourceQuerySnapshot:
+    """Captured query metadata for a single datasource call."""
+
+    datasource_name: str
+    sql: str
+    query_ast: Any
 
 
 @dataclass
@@ -1692,3 +1756,59 @@ class _PlanFormatter:
         for column in columns:
             buffer.append(column)
         return ",".join(buffer)
+
+
+
+class _DatasourceQueryCollector:
+    """Collect queries issued by physical plan nodes."""
+
+    def collect(self, node: PhysicalPlanNode) -> List[_DatasourceQuerySnapshot]:
+        snapshots: List[_DatasourceQuerySnapshot] = []
+        self._visit(node, snapshots)
+        return snapshots
+
+    def _visit(
+        self,
+        node: PhysicalPlanNode,
+        snapshots: List[_DatasourceQuerySnapshot]
+    ) -> None:
+        self._record_node(node, snapshots)
+        children = node.children()
+        for child in children:
+            self._visit(child, snapshots)
+
+    def _record_node(
+        self,
+        node: PhysicalPlanNode,
+        snapshots: List[_DatasourceQuerySnapshot]
+    ) -> None:
+        if isinstance(node, PhysicalScan):
+            self._record_scan(node, snapshots)
+        elif isinstance(node, PhysicalRemoteJoin):
+            self._record_remote_join(node, snapshots)
+
+    def _record_scan(
+        self,
+        scan: PhysicalScan,
+        snapshots: List[_DatasourceQuerySnapshot]
+    ) -> None:
+        datasource = scan.datasource_connection
+        if datasource is None:
+            return
+        sql = scan._build_query()
+        query_ast = datasource.parse_query(sql)
+        snapshot = _DatasourceQuerySnapshot(scan.datasource, sql, query_ast)
+        snapshots.append(snapshot)
+
+    def _record_remote_join(
+        self,
+        join: PhysicalRemoteJoin,
+        snapshots: List[_DatasourceQuerySnapshot]
+    ) -> None:
+        datasource = join.datasource_connection
+        if datasource is None:
+            return
+        sql = join._build_query()
+        query_ast = datasource.parse_query(sql)
+        snapshot = _DatasourceQuerySnapshot(join.left.datasource, sql, query_ast)
+        snapshots.append(snapshot)
