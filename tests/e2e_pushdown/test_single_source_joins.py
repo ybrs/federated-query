@@ -12,12 +12,14 @@ from tests.e2e_pushdown.helpers import (
 
 
 def _get_join_node(select_ast: exp.Select) -> exp.Join:
+    """Return the first JOIN child from a SELECT, asserting it exists."""
     joins = select_ast.args.get("joins") or []
     assert joins, "expected remote join SQL"
     return joins[0]
 
 
 def _normalize_join_kind(join_expr: exp.Join) -> str:
+    """Normalize sqlglot join metadata into INNER/LEFT/RIGHT strings."""
     kind = join_expr.args.get("kind")
     if kind is not None:
         if hasattr(kind, "value"):
@@ -30,6 +32,7 @@ def _normalize_join_kind(join_expr: exp.Join) -> str:
 
 
 def _assert_join_type(select_ast: exp.Select, expected: str) -> None:
+    """Assert the remote SQL join matches the required join type."""
     join = _get_join_node(select_ast)
     actual = _normalize_join_kind(join)
     assert actual == expected

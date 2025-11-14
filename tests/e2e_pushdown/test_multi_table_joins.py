@@ -11,6 +11,7 @@ from tests.e2e_pushdown.helpers import (
 
 
 def _assert_dual_queries(document):
+    """Verify the split plan produced exactly two remote scans and return them."""
     queries = document.get("queries", [])
     assert len(queries) == 2
     first = queries[0]["query"]
@@ -21,6 +22,7 @@ def _assert_dual_queries(document):
 
 
 def _select_contains_where(select_ast: exp.Select) -> bool:
+    """Return True if a SELECT (or nested subqueries) contains a WHERE clause."""
     """Return True if a SELECT or any nested subquery has a WHERE clause."""
     if select_ast.args.get("where"):
         return True

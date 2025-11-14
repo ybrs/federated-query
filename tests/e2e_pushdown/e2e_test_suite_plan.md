@@ -14,10 +14,10 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
 - ✅ **Section 3 – Two-table joins & join+agg/order:** `tests/e2e_pushdown/test_single_source_joins.py` (10 tests), `tests/e2e_pushdown/test_join_aggregations_and_order.py` (6 tests)
 - ✅ **Section 4 – Three-table joins:** `tests/e2e_pushdown/test_multi_table_joins.py` (4 tests documenting remote + local join split)
 - ✅ **Section 5 – Combined pushdowns:** `tests/e2e_pushdown/test_combined_pushdowns.py` (5 tests)
-- ⏳ **Section 6 – Multi-datasource guardrails:** _not implemented yet_
-- ⏳ **Section 7 – Edge cases & negatives:** _not implemented yet_
+- ✅ **Section 6 – Multi-datasource guardrails:** `tests/e2e_pushdown/test_multi_datasource_guardrails.py` (5 tests covering cross-source joins, filters, aggregates)
+- ✅ **Section 7 – Edge cases & negatives:** `tests/e2e_pushdown/test_edge_cases_negatives.py` (3 tests capturing unsupported features and fallbacks)
 
-**Totals so far:** 45 automated E2E pushdown tests that validate ~50 datasource queries captured via `EXPLAIN (FORMAT JSON)`.
+**Totals so far:** 53 automated E2E pushdown tests that validate ~58 datasource queries captured via `EXPLAIN (FORMAT JSON)`.
 
 ## 0. Foundation
 

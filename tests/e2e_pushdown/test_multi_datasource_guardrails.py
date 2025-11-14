@@ -12,7 +12,8 @@ from tests.e2e_pushdown.helpers import (
 )
 
 
-def _assert_remote_scan_metadata(select_ast: exp.Select, expected_table: str):
+def _assert_single_source_scan(select_ast: exp.Select, expected_table: str):
+    """Ensure a SELECT represents a single-table scan against the given table."""
     joins = select_ast.args.get("joins") or []
     assert not joins, "cross-source remote joins must not occur"
     assert from_table_name(select_ast) == expected_table
@@ -31,8 +32,8 @@ def test_orders_products_join_stays_local(multi_source_env):
     assert set(queries) == {"duckdb_orders", "duckdb_products"}
     orders_query = queries["duckdb_orders"]
     products_query = queries["duckdb_products"]
-    _assert_remote_scan_metadata(orders_query, "orders")
-    _assert_remote_scan_metadata(products_query, "products")
+    _assert_single_source_scan(orders_query, "orders")
+    _assert_single_source_scan(products_query, "products")
     assert set(select_column_names(orders_query)) == {"order_id", "product_id"}
     assert set(select_column_names(products_query)) == {"id", "name"}
 
@@ -51,8 +52,8 @@ def test_orders_customers_join_scans_each_source(multi_source_env):
     assert set(queries) == {"duckdb_orders", "duckdb_customers"}
     orders_query = queries["duckdb_orders"]
     customers_query = queries["duckdb_customers"]
-    _assert_remote_scan_metadata(orders_query, "orders")
-    _assert_remote_scan_metadata(customers_query, "customers")
+    _assert_single_source_scan(orders_query, "orders")
+    _assert_single_source_scan(customers_query, "customers")
     assert set(select_column_names(orders_query)) == {"order_id", "customer_id"}
     assert set(select_column_names(customers_query)) == {"customer_id", "segment"}
 
@@ -76,9 +77,9 @@ def test_three_source_join_emits_three_queries(multi_source_env):
     orders_query = queries["duckdb_orders"]
     products_query = queries["duckdb_products"]
     customers_query = queries["duckdb_customers"]
-    _assert_remote_scan_metadata(orders_query, "orders")
-    _assert_remote_scan_metadata(products_query, "products")
-    _assert_remote_scan_metadata(customers_query, "customers")
+    _assert_single_source_scan(orders_query, "orders")
+    _assert_single_source_scan(products_query, "products")
+    _assert_single_source_scan(customers_query, "customers")
     assert set(select_column_names(orders_query)) == {
         "order_id",
         "product_id",
@@ -102,8 +103,8 @@ def test_cross_source_filters_remain_local(multi_source_env):
     assert set(queries) == {"duckdb_orders", "duckdb_products"}
     orders_query = queries["duckdb_orders"]
     products_query = queries["duckdb_products"]
-    _assert_remote_scan_metadata(orders_query, "orders")
-    _assert_remote_scan_metadata(products_query, "products")
+    _assert_single_source_scan(orders_query, "orders")
+    _assert_single_source_scan(products_query, "products")
     orders_where = orders_query.args.get("where")
     products_where = products_query.args.get("where")
     assert orders_where is not None, "orders filter should push down"
@@ -127,8 +128,8 @@ def test_cross_source_aggregates_and_limits_stay_local(multi_source_env):
     assert set(queries) == {"duckdb_orders", "duckdb_products"}
     orders_query = queries["duckdb_orders"]
     products_query = queries["duckdb_products"]
-    _assert_remote_scan_metadata(orders_query, "orders")
-    _assert_remote_scan_metadata(products_query, "products")
+    _assert_single_source_scan(orders_query, "orders")
+    _assert_single_source_scan(products_query, "products")
     assert orders_query.args.get("group") is None
     assert orders_query.args.get("limit") is None
     assert set(select_column_names(orders_query)) == {"region", "product_id"}

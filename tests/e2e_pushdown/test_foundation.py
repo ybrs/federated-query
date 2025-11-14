@@ -7,17 +7,20 @@ from federated_query.config import ExecutorConfig
 
 
 def _build_runtime(env):
+    """Instantiate a FedQ runtime for the provided catalog fixture."""
     runtime = FedQRuntime(env.catalog, ExecutorConfig())
     return runtime
 
 
 def _run_explain_json(runtime: FedQRuntime, sql: str):
+    """Execute EXPLAIN ... JSON and validate the returned document."""
     document = runtime.execute(sql)
     assert isinstance(document, dict)
     return document
 
 
 def _single_query_entry(document):
+    """Extract the single datasource/query pair from an explain document."""
     queries = document.get("queries", [])
     assert len(queries) == 1
     entry = queries[0]
@@ -25,6 +28,7 @@ def _single_query_entry(document):
 
 
 def _unwrap_parens(expression):
+    """Strip sqlglot Paren wrappers so predicate inspection is easier."""
     current = expression
     while isinstance(current, exp.Paren):
         current = current.this
