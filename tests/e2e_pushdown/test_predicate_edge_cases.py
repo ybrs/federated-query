@@ -166,12 +166,9 @@ def test_regex_operators_behavior(single_source_env):
         "WHERE region ~ '^E[UW]$'"
     )
 
-    try:
-        ast = explain_datasource_query(runtime, sql)
+    ast = explain_datasource_query(runtime, sql)
 
-        where_clause = ast.args.get("where")
-        assert where_clause is not None
-        predicate = unwrap_parens(where_clause.this)
-        assert isinstance(predicate, (exp.RegexpLike, exp.Binary))
-    except Exception:
-        pass
+    where_clause = ast.args.get("where")
+    assert where_clause is not None
+    predicate = unwrap_parens(where_clause.this)
+    assert isinstance(predicate, (exp.RegexpLike, exp.Binary))

@@ -45,17 +45,14 @@ def test_string_agg_function(single_source_env):
         "GROUP BY region"
     )
 
-    try:
-        ast = explain_datasource_query(runtime, sql)
+    ast = explain_datasource_query(runtime, sql)
 
-        projection = select_column_names(ast)
-        assert "region" in projection
-        assert "all_statuses" in projection
+    projection = select_column_names(ast)
+    assert "region" in projection
+    assert "all_statuses" in projection
 
-        agg_expr = find_alias_expression(ast, "all_statuses")
-        assert agg_expr is not None
-    except Exception:
-        pass
+    agg_expr = find_alias_expression(ast, "all_statuses")
+    assert agg_expr is not None
 
 
 def test_array_agg_function(single_source_env):
@@ -67,17 +64,14 @@ def test_array_agg_function(single_source_env):
         "GROUP BY region"
     )
 
-    try:
-        ast = explain_datasource_query(runtime, sql)
+    ast = explain_datasource_query(runtime, sql)
 
-        projection = select_column_names(ast)
-        assert "region" in projection
-        assert "order_ids" in projection
+    projection = select_column_names(ast)
+    assert "region" in projection
+    assert "order_ids" in projection
 
-        agg_expr = find_alias_expression(ast, "order_ids")
-        assert agg_expr is not None
-    except Exception:
-        pass
+    agg_expr = find_alias_expression(ast, "order_ids")
+    assert agg_expr is not None
 
 
 def test_aggregate_distinct_with_expression(single_source_env):
@@ -140,18 +134,15 @@ def test_multiple_aggregates_different_filters(single_source_env):
         "GROUP BY region"
     )
 
-    try:
-        ast = explain_datasource_query(runtime, sql)
+    ast = explain_datasource_query(runtime, sql)
 
-        projection = select_column_names(ast)
-        assert "region" in projection
-        assert "expensive_count" in projection
-        assert "cheap_count" in projection
+    projection = select_column_names(ast)
+    assert "region" in projection
+    assert "expensive_count" in projection
+    assert "cheap_count" in projection
 
-        expressions = ast.expressions
-        assert len(expressions) >= 3
-    except Exception:
-        pass
+    expressions = ast.expressions
+    assert len(expressions) >= 3
 
 
 def test_stddev_variance_functions(single_source_env):
@@ -165,20 +156,17 @@ def test_stddev_variance_functions(single_source_env):
         "GROUP BY region"
     )
 
-    try:
-        ast = explain_datasource_query(runtime, sql)
+    ast = explain_datasource_query(runtime, sql)
 
-        projection = select_column_names(ast)
-        assert "region" in projection
-        assert "price_stddev" in projection
-        assert "price_variance" in projection
+    projection = select_column_names(ast)
+    assert "region" in projection
+    assert "price_stddev" in projection
+    assert "price_variance" in projection
 
-        stddev_expr = find_alias_expression(ast, "price_stddev")
-        variance_expr = find_alias_expression(ast, "price_variance")
+    stddev_expr = find_alias_expression(ast, "price_stddev")
+    variance_expr = find_alias_expression(ast, "price_variance")
 
-        assert stddev_expr is not None or variance_expr is not None
-    except Exception:
-        pass
+    assert stddev_expr is not None or variance_expr is not None
 
 
 def test_nested_aggregate_via_subquery(single_source_env):

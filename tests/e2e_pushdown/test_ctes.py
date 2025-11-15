@@ -293,16 +293,13 @@ def test_recursive_cte_behavior(single_source_env):
         "SELECT n FROM counter"
     )
 
-    try:
-        ast = explain_datasource_query(runtime, sql)
+    ast = explain_datasource_query(runtime, sql)
 
-        with_clause = ast.args.get("with")
-        assert with_clause is not None
+    with_clause = ast.args.get("with")
+    assert with_clause is not None
 
-        ctes = with_clause.expressions
-        assert len(ctes) == 1
+    ctes = with_clause.expressions
+    assert len(ctes) == 1
 
-        cte = ctes[0]
-        assert isinstance(cte, exp.CTE)
-    except Exception:
-        pass
+    cte = ctes[0]
+    assert isinstance(cte, exp.CTE)

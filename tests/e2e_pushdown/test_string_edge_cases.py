@@ -187,15 +187,12 @@ def test_ilike_case_insensitive(single_source_env):
         "WHERE region ILIKE 'eu%'"
     )
 
-    try:
-        ast = explain_datasource_query(runtime, sql)
+    ast = explain_datasource_query(runtime, sql)
 
-        where_clause = ast.args.get("where")
-        assert where_clause is not None
-        predicate = unwrap_parens(where_clause.this)
-        assert isinstance(predicate, exp.ILike)
-    except Exception:
-        pass
+    where_clause = ast.args.get("where")
+    assert where_clause is not None
+    predicate = unwrap_parens(where_clause.this)
+    assert isinstance(predicate, exp.ILike)
 
 
 def test_strings_with_double_quotes(single_source_env):

@@ -42,12 +42,9 @@ def test_column_names_sql_keywords(single_source_env):
     runtime = build_runtime(single_source_env)
     sql = 'SELECT "order_id", "select" FROM duckdb_primary.main.orders'
 
-    try:
-        ast = explain_datasource_query(runtime, sql)
-        projection = select_column_names(ast)
-        assert len(projection) >= 1
-    except Exception:
-        pass
+    ast = explain_datasource_query(runtime, sql)
+    projection = select_column_names(ast)
+    assert len(projection) >= 1
 
 
 def test_column_names_with_spaces(single_source_env):
@@ -67,12 +64,9 @@ def test_quoted_identifiers_case_sensitive(single_source_env):
     runtime = build_runtime(single_source_env)
     sql = 'SELECT "Order_ID" FROM duckdb_primary.main.orders'
 
-    try:
-        ast = explain_datasource_query(runtime, sql)
-        expressions = ast.expressions
-        assert len(expressions) == 1
-    except Exception:
-        pass
+    ast = explain_datasource_query(runtime, sql)
+    expressions = ast.expressions
+    assert len(expressions) == 1
 
 
 def test_very_wide_select(single_source_env):
@@ -142,9 +136,6 @@ def test_column_special_characters(single_source_env):
     runtime = build_runtime(single_source_env)
     sql = 'SELECT order_id AS "order@id" FROM duckdb_primary.main.orders'
 
-    try:
-        ast = explain_datasource_query(runtime, sql)
-        expressions = ast.expressions
-        assert len(expressions) == 1
-    except Exception:
-        pass
+    ast = explain_datasource_query(runtime, sql)
+    expressions = ast.expressions
+    assert len(expressions) == 1

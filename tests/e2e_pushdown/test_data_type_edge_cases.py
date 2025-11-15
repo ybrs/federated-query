@@ -69,13 +69,10 @@ def test_float_special_values_infinity(single_source_env):
         "WHERE price < 'Infinity'::FLOAT"
     )
 
-    try:
-        ast = explain_datasource_query(runtime, sql)
+    ast = explain_datasource_query(runtime, sql)
 
-        where_clause = ast.args.get("where")
-        assert where_clause is not None
-    except Exception:
-        pass
+    where_clause = ast.args.get("where")
+    assert where_clause is not None
 
 
 def test_decimal_precision(single_source_env):
@@ -104,13 +101,10 @@ def test_division_by_zero_behavior(single_source_env):
         "FROM duckdb_primary.main.orders"
     )
 
-    try:
-        ast = explain_datasource_query(runtime, sql)
+    ast = explain_datasource_query(runtime, sql)
 
-        expressions = ast.expressions
-        assert len(expressions) == 2
-    except Exception:
-        pass
+    expressions = ast.expressions
+    assert len(expressions) == 2
 
 
 def test_negative_number_operations(single_source_env):
@@ -210,13 +204,10 @@ def test_timestamp_timezone_comparison(single_source_env):
         "WHERE created_at > TIMESTAMP '2024-01-01 00:00:00'"
     )
 
-    try:
-        ast = explain_datasource_query(runtime, sql)
+    ast = explain_datasource_query(runtime, sql)
 
-        where_clause = ast.args.get("where")
-        assert where_clause is not None
-    except Exception:
-        pass
+    where_clause = ast.args.get("where")
+    assert where_clause is not None
 
 
 def test_mixed_numeric_types(single_source_env):
