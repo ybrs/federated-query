@@ -54,6 +54,7 @@ We also don't want pointless fuck as follows
 ```py
    class Foo:
       def __init__(self, processors):
+         # WRONG BECAUSE ITS POINTLESS FUCK
          self.processors: List[QueryProcessor] = []
          if processors:
             index = 0
@@ -66,10 +67,34 @@ This is pointless fuck because we can simply do this
 ```py
    class Foo:
       def __init__(self, processors:List[QueryProcessor]):
+         # RIGHT
          self.processors: List[QueryProcessor] = processors
 ```
 
 We also don't want `while index <.... ` type loops. Use for loops. Iterate over lists.
+
+```py
+      if isinstance(value, list):
+         # WRONG BECAUSE ITS POINTLESS FUCK
+         index = 0
+         while index < len(value):
+            entry = value[index]
+            if isinstance(entry, exp.Expression):
+               self._rewrite_expression(entry, context, False)
+            index += 1
+```
+
+This is right 
+
+```py
+      if isinstance(value, list):
+         # right, because value is a list, we can loop over it.
+         for entry in value:
+            if isinstance(entry, exp.Expression):
+               self._rewrite_expression(entry, context, False)
+```
+
+Seeing any pointless fuck in the code will result in immediate fail in task and ending your contract, you'll be fired on the spot. So think carefully before you write any code. We don't tolerate bullshit.
 
 
 ## Repository Overview
