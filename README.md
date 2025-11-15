@@ -1,3 +1,9 @@
+# Disclaimer
+
+This is an experiment for building a federated query engine in python and rust using datafusion and duckdb.
+
+We have just bootstrapped the project and have tests covering areas. The document below and documents in the repo can mean anything else, but this is very early phase of the project.
+
 # Federated Query Engine
 
 A production-grade federated query engine written in Python that executes SQL queries across multiple heterogeneous data sources (PostgreSQL, DuckDB) in an optimal way.
