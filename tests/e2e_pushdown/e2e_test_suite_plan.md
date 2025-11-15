@@ -2,7 +2,12 @@
 
 The goal is to cover every meaningful pushdown scenario with explicit SQL + expectation tests. The suite will be implemented incrementally in the buckets below. Each bucket enumerates the specific combinations to cover, along with notes on expected behavior (whether pushdown should happen, where it should not, and how many datasources are involved).
 
+We need these tests to fail if the expectation is not working. Shouldn't fail silently or shouldn't be skipped or marked as fail. 
+
+The point of this work is to see if the engine covers the areas. You can't fail the tests silently. Try/except: pass pattern is forbidden. Marking tests with skip, fail etc. is forbidden. If tests should fail for whatever reason, they will fail.  
+
 VERY IMPORTANT: in this exercise you can't use "string in string" checks. That is NOT allowed. Also regular expressions are forbidden. You get AST from data sources, use the ast to check exactly what is needed !!!
+
 
 ---
 
