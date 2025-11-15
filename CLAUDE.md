@@ -2,10 +2,35 @@
 
 This document provides an overview of the codebase structure, key classes, compilation instructions, and coding standards for AI-assisted development.
 
-
 ## Coding Rules
 
 Never fail silently. If something breaks it should throw an error. We don't want silent fails. You can only catch exceptions when we show it to the user in the cli. Otherwise all exceptions should be thrown. 
+
+Follow Python PEP8
+
+use meaningful names
+
+every function/method needs a comment with explaining what it does.
+
+This project is not a toy/homework project. Do real production quality software development. We need real-query-engine level behaviour.
+
+Eg: the following task is correct.
+```
+# SELECT * Expansion Contract
+
+- All star projections (`*` or `alias.*`) MUST be expanded into explicit column references **before** the logical plan reaches the parser/binder. No star survives into the engine.
+- Expansion is performed by the preprocessor using catalog metadata and generates an **internal column name** (`internal_name`) alongside the user-visible name (`visible_name`). Example mapping:
+  - SQL: `SELECT * FROM pg.users`
+  - Internal projection: `pg.users.id` (`internal_name`) with `id` (`visible_name`)
+  - Engine uses `internal_name` for planning/execution; results presented to the user show `visible_name`.
+- Queries with user aliases (`SELECT foo AS alias_1 FROM pg.users`) map as:
+  - `internal_name = pg.users.foo`
+  - `visible_name = alias_1`
+  - Execution works exclusively on the internal name; final result column is `alias_1`.
+- Expansion fails fast (raises StarExpansionError) when a star cannot be resolved (missing table metadata, unsupported source, etc.).
+```
+
+This is wrong """All star projections (`*` or `alias.*`) MUST be expanded. If the table is not aliased we bail out and pass * to underlying engine. """ or """all star projections will only work for aliased tables and we raise an exception, we don't support subqueries""" these are unacceptable. When planning a feature we want real engine-level planning.
 
 We also don't want wrapping exceptions with beatiful messages or whatever you think is better. So the next example is wrong
 
@@ -24,7 +49,6 @@ What we want is this
 ```
 
 Simply fail if there is an exception unless otherwise requested. 
-
 
 ## Repository Overview
 
@@ -258,53 +282,6 @@ If a function exceeds 20 lines of actual code, refactor it into smaller function
 - Import order: standard library, third-party, local
 - Use snake_case for functions and variables
 - Use PascalCase for classes
-
-### 7. Descriptive Naming
-
-**ALL names must be descriptive and explain what the code does.**
-
-This applies to:
-- File names
-- Test file names
-- Class names
-- Function names
-- Variable names
-
-❌ **WRONG:**
-```python
-# Test file named: test_phase6_optimization.py
-# This tells us NOTHING about what's being tested
-```
-
-✅ **CORRECT:**
-```python
-# Test file named: test_logical_optimization.py
-# This clearly indicates it tests logical optimization rules
-```
-
-❌ **WRONG:**
-```python
-# Test file named: test_part2.py
-# Generic, meaningless naming
-```
-
-✅ **CORRECT:**
-```python
-# Test file named: test_join_execution.py
-# Descriptive, tells us exactly what's being tested
-```
-
-**Rules for test file names:**
-- Name after what functionality is being tested, not phase numbers
-- Use domain terminology (e.g., `test_predicate_pushdown.py`, `test_cost_estimation.py`)
-- Be specific about the component (e.g., `test_hash_join_operator.py` not `test_operators.py`)
-- Group related tests by feature, not by development phase
-
-**Rules for class/function names:**
-- Must clearly state what the code does
-- Use full words, avoid abbreviations unless they're standard (e.g., SQL, HTTP)
-- Test class names should describe the test scenario
-- Test method names should be sentences explaining the test case
 
 ## Development Workflow
 
