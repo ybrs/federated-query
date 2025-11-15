@@ -2,6 +2,28 @@
 
 This document provides an overview of the codebase structure, key classes, compilation instructions, and coding standards for AI-assisted development.
 
+## Coding Rules
+
+Never fail silently. If something breaks it should throw an error. We don't want silent fails. You can only catch exceptions when we show it to the user in the cli. Otherwise all exceptions should be thrown. 
+
+We also don't want wrapping exceptions with beatiful messages or whatever you think is better. So the next example is wrong
+
+```python
+try:
+   something()
+except Exception:
+   raise Exception('some error happened')
+
+```
+
+What we want is this
+
+```
+   something()
+```
+
+Simply fail if there is an exception unless otherwise requested. 
+
 ## Repository Overview
 
 This is a production-grade federated query engine that executes SQL queries across multiple heterogeneous data sources (PostgreSQL, DuckDB) with intelligent optimization.
