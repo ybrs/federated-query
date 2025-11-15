@@ -41,6 +41,8 @@ def _normalize_join_kind(join_expr: exp.Join) -> str:
         return str(kind).upper()
     side = join_expr.args.get("side")
     if side is not None:
+        if hasattr(side, "value"):
+            return str(side.value).upper()
         return str(side).upper()
     return "INNER"
 
