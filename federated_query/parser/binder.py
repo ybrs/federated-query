@@ -73,7 +73,6 @@ class Binder:
             return self._bind_join(plan)
         if isinstance(plan, Aggregate):
             return self._bind_aggregate(plan)
-
         raise BindingError(f"Unsupported plan node type: {type(plan)}")
 
     def _bind_scan(self, scan: Scan) -> Scan:

@@ -92,8 +92,7 @@ def test_simple_inner_join():
     planner = PhysicalPlanner(catalog)
     executor = Executor(ExecutorConfig())
 
-    ast = parser.parse(sql)
-    logical_plan = parser.ast_to_logical_plan(ast)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
     bound_plan = binder.bind(logical_plan)
     physical_plan = planner.plan(bound_plan)
 
@@ -126,8 +125,7 @@ def test_join_with_where():
     planner = PhysicalPlanner(catalog)
     executor = Executor(ExecutorConfig())
 
-    ast = parser.parse(sql)
-    logical_plan = parser.ast_to_logical_plan(ast)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
     bound_plan = binder.bind(logical_plan)
     physical_plan = planner.plan(bound_plan)
 
@@ -157,8 +155,7 @@ def test_join_specific_columns():
     planner = PhysicalPlanner(catalog)
     executor = Executor(ExecutorConfig())
 
-    ast = parser.parse(sql)
-    logical_plan = parser.ast_to_logical_plan(ast)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
     bound_plan = binder.bind(logical_plan)
     physical_plan = planner.plan(bound_plan)
 
@@ -188,8 +185,7 @@ def test_join_all_columns():
     planner = PhysicalPlanner(catalog)
     executor = Executor(ExecutorConfig())
 
-    ast = parser.parse(sql)
-    logical_plan = parser.ast_to_logical_plan(ast)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
     bound_plan = binder.bind(logical_plan)
     physical_plan = planner.plan(bound_plan)
 
@@ -213,8 +209,7 @@ def test_parser_creates_join_plan():
     """
 
     parser = Parser()
-    ast = parser.parse(sql)
-    logical_plan = parser.ast_to_logical_plan(ast)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
     from federated_query.plan.logical import Join, Project
 

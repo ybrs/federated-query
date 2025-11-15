@@ -139,8 +139,7 @@ sql = """
 """
 
 # Parse → Bind → Optimize → Execute
-ast = parser.parse(sql)
-logical_plan = parser.ast_to_logical_plan(ast)
+logical_plan = parser.parse_to_logical_plan(sql, catalog)
 bound_plan = binder.bind(logical_plan)
 optimized_plan = optimizer.optimize(bound_plan)
 # ... generate physical plan ...

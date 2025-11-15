@@ -15,6 +15,7 @@ from ..plan.logical import (
     Explain,
     ExplainFormat,
 )
+from ..catalog.catalog import Catalog
 from ..plan.expressions import (
     Expression,
     ColumnRef,
@@ -940,7 +941,156 @@ class Parser:
 
         return expr
 
-    def parse_to_logical_plan(self, sql: str) -> LogicalPlanNode:
+    def _expand_select_stars(
+        self,
+        ast: exp.Expression,
+        catalog: Catalog
+    ) -> exp.Expression:
+        rewritten = ast.copy()
+        for select in rewritten.find_all(exp.Select):
+            table_order, alias_map = self._collect_table_metadata(select, catalog)
+            if len(table_order) == 0:
+                continue
+            expressions = self._rewrite_select_expressions(
+                select.expressions,
+                table_order,
+                alias_map,
+            )
+            select.set("expressions", expressions)
+        return rewritten
+
+    def _collect_table_metadata(
+        self,
+        select: exp.Select,
+        catalog: Catalog
+    ) -> Tuple[List[str], Dict[str, List[str]]]:
+        table_order: List[str] = []
+        alias_map: Dict[str, List[str]] = {}
+        for table_expr in self._iter_table_expressions(select):
+            alias = self._extract_table_alias(table_expr)
+            parts = self._extract_table_parts(table_expr)
+            columns = self._lookup_table_columns(parts, catalog)
+            table_order.append(alias)
+            alias_map[alias] = columns
+        return table_order, alias_map
+
+    def _iter_table_expressions(self, select: exp.Select) -> List[exp.Expression]:
+        tables: List[exp.Expression] = []
+        from_clause = select.args.get("from")
+        if from_clause:
+            main_table = getattr(from_clause, "this", None)
+            if isinstance(main_table, exp.Table):
+                tables.append(main_table)
+            for expr in from_clause.expressions or []:
+                if isinstance(expr, exp.Table):
+                    tables.append(expr)
+        joins = select.args.get("joins") or []
+        for join in joins:
+            table_expr = getattr(join, "this", None)
+            if isinstance(table_expr, exp.Table):
+                tables.append(table_expr)
+        return tables
+
+    def _lookup_table_columns(
+        self,
+        parts: Tuple[str, str, str],
+        catalog: Catalog
+    ) -> List[str]:
+        datasource, schema_name, table_name = parts
+        table = catalog.get_table(datasource, schema_name, table_name)
+        if table is None:
+            raise ValueError(
+                f"Table metadata not found for {datasource}.{schema_name}.{table_name}"
+            )
+        names: List[str] = []
+        for column in table.columns:
+            names.append(column.name)
+        return names
+
+    def _rewrite_select_expressions(
+        self,
+        expressions: List[exp.Expression],
+        table_order: List[str],
+        alias_map: Dict[str, List[str]],
+    ) -> List[exp.Expression]:
+        rewritten: List[exp.Expression] = []
+        for expr in expressions:
+            replacements = self._expand_select_expression(
+                expr,
+                table_order,
+                alias_map,
+            )
+            for item in replacements:
+                rewritten.append(item)
+        return rewritten
+
+    def _expand_select_expression(
+        self,
+        expr: exp.Expression,
+        table_order: List[str],
+        alias_map: Dict[str, List[str]],
+    ) -> List[exp.Expression]:
+        if isinstance(expr, exp.Star):
+            return self._expand_unqualified_star(table_order, alias_map)
+        if self._is_qualified_star(expr):
+            alias = self._column_identifier(expr.table)
+            return self._expand_qualified_star(alias, alias_map)
+        return [expr]
+
+    def _is_qualified_star(self, expr: exp.Expression) -> bool:
+        if not isinstance(expr, exp.Column):
+            return False
+        return isinstance(expr.this, exp.Star)
+
+    def _expand_unqualified_star(
+        self,
+        table_order: List[str],
+        alias_map: Dict[str, List[str]],
+    ) -> List[exp.Expression]:
+        columns: List[exp.Expression] = []
+        for alias in table_order:
+            expanded = self._build_column_list(alias, alias_map.get(alias, []))
+            for col in expanded:
+                columns.append(col)
+        return columns
+
+    def _expand_qualified_star(
+        self,
+        alias: Optional[str],
+        alias_map: Dict[str, List[str]],
+    ) -> List[exp.Expression]:
+        if alias is None:
+            raise ValueError("Qualified star missing alias")
+        if alias not in alias_map:
+            raise ValueError(f"Alias '{alias}' not found for SELECT * expansion")
+        return self._build_column_list(alias, alias_map[alias])
+
+    def _build_column_list(
+        self,
+        alias: str,
+        column_names: List[str],
+    ) -> List[exp.Expression]:
+        columns: List[exp.Expression] = []
+        for name in column_names:
+            column_expr = exp.Column(
+                this=exp.Identifier(this=name, quoted=True),
+                table=exp.Identifier(this=alias, quoted=False),
+            )
+            columns.append(column_expr)
+        return columns
+
+    def _column_identifier(self, identifier) -> Optional[str]:
+        if identifier is None:
+            return None
+        if hasattr(identifier, "this"):
+            return identifier.this
+        return str(identifier)
+
+    def parse_to_logical_plan(
+        self,
+        sql: str,
+        catalog: Optional[Catalog] = None
+    ) -> LogicalPlanNode:
         """Parse SQL directly to logical plan.
 
         Args:
@@ -950,6 +1100,8 @@ class Parser:
             Logical plan root node
         """
         ast = self.parse(sql)
+        if catalog is not None:
+            ast = self._expand_select_stars(ast, catalog)
         return self.ast_to_logical_plan(ast)
 
     def __repr__(self) -> str:

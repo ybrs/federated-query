@@ -65,8 +65,7 @@ def test_simple_count(setup_test_db):
     planner = PhysicalPlanner(catalog)
     executor = Executor(ExecutorConfig())
 
-    ast = parser.parse(sql)
-    logical_plan = parser.ast_to_logical_plan(ast)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
     bound_plan = binder.bind(logical_plan)
     physical_plan = planner.plan(bound_plan)
 
@@ -91,8 +90,7 @@ def test_group_by_with_count(setup_test_db):
     planner = PhysicalPlanner(catalog)
     executor = Executor(ExecutorConfig())
 
-    ast = parser.parse(sql)
-    logical_plan = parser.ast_to_logical_plan(ast)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
     bound_plan = binder.bind(logical_plan)
     physical_plan = planner.plan(bound_plan)
 
@@ -127,8 +125,7 @@ def test_group_by_with_sum(setup_test_db):
     planner = PhysicalPlanner(catalog)
     executor = Executor(ExecutorConfig())
 
-    ast = parser.parse(sql)
-    logical_plan = parser.ast_to_logical_plan(ast)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
     bound_plan = binder.bind(logical_plan)
     physical_plan = planner.plan(bound_plan)
 
@@ -163,8 +160,7 @@ def test_group_by_with_avg(setup_test_db):
     planner = PhysicalPlanner(catalog)
     executor = Executor(ExecutorConfig())
 
-    ast = parser.parse(sql)
-    logical_plan = parser.ast_to_logical_plan(ast)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
     bound_plan = binder.bind(logical_plan)
     physical_plan = planner.plan(bound_plan)
 
@@ -199,8 +195,7 @@ def test_group_by_with_min_max(setup_test_db):
     planner = PhysicalPlanner(catalog)
     executor = Executor(ExecutorConfig())
 
-    ast = parser.parse(sql)
-    logical_plan = parser.ast_to_logical_plan(ast)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
     bound_plan = binder.bind(logical_plan)
     physical_plan = planner.plan(bound_plan)
 
@@ -240,8 +235,7 @@ def test_group_by_multiple_aggregates(setup_test_db):
     planner = PhysicalPlanner(catalog)
     executor = Executor(ExecutorConfig())
 
-    ast = parser.parse(sql)
-    logical_plan = parser.ast_to_logical_plan(ast)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
     bound_plan = binder.bind(logical_plan)
     physical_plan = planner.plan(bound_plan)
 
@@ -267,8 +261,7 @@ def test_having_clause(setup_test_db):
     planner = PhysicalPlanner(catalog)
     executor = Executor(ExecutorConfig())
 
-    ast = parser.parse(sql)
-    logical_plan = parser.ast_to_logical_plan(ast)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
     bound_plan = binder.bind(logical_plan)
     physical_plan = planner.plan(bound_plan)
 
@@ -299,8 +292,7 @@ def test_having_with_sum(setup_test_db):
     planner = PhysicalPlanner(catalog)
     executor = Executor(ExecutorConfig())
 
-    ast = parser.parse(sql)
-    logical_plan = parser.ast_to_logical_plan(ast)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
     bound_plan = binder.bind(logical_plan)
     physical_plan = planner.plan(bound_plan)
 
@@ -329,8 +321,7 @@ def test_aggregation_without_group_by(setup_test_db):
     planner = PhysicalPlanner(catalog)
     executor = Executor(ExecutorConfig())
 
-    ast = parser.parse(sql)
-    logical_plan = parser.ast_to_logical_plan(ast)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
     bound_plan = binder.bind(logical_plan)
     physical_plan = planner.plan(bound_plan)
 

@@ -74,7 +74,7 @@ def test_simple_select_all(setup_duckdb):
     # Parse
     parser = Parser()
     sql = "SELECT * FROM testdb.main.users"
-    logical_plan = parser.parse_to_logical_plan(sql)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
     # Bind
     binder = Binder(catalog)
@@ -108,7 +108,7 @@ def test_select_specific_columns(setup_duckdb):
 
     parser = Parser()
     sql = "SELECT id, name FROM testdb.main.users"
-    logical_plan = parser.parse_to_logical_plan(sql)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
     binder = Binder(catalog)
     bound_plan = binder.bind(logical_plan)
@@ -138,7 +138,7 @@ def test_select_with_where(setup_duckdb):
 
     parser = Parser()
     sql = "SELECT id, name FROM testdb.main.users WHERE age > 25"
-    logical_plan = parser.parse_to_logical_plan(sql)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
     binder = Binder(catalog)
     bound_plan = binder.bind(logical_plan)
@@ -168,7 +168,7 @@ def test_select_with_limit(setup_duckdb):
 
     parser = Parser()
     sql = "SELECT id FROM testdb.main.users LIMIT 2"
-    logical_plan = parser.parse_to_logical_plan(sql)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
     binder = Binder(catalog)
     bound_plan = binder.bind(logical_plan)
@@ -197,7 +197,7 @@ def test_select_with_where_and_limit(setup_duckdb):
 
     parser = Parser()
     sql = "SELECT id FROM testdb.main.users WHERE age > 25 LIMIT 2"
-    logical_plan = parser.parse_to_logical_plan(sql)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
     binder = Binder(catalog)
     bound_plan = binder.bind(logical_plan)
@@ -226,7 +226,7 @@ def test_select_with_complex_where(setup_duckdb):
 
     parser = Parser()
     sql = "SELECT name FROM testdb.main.users WHERE age > 20 AND age < 30"
-    logical_plan = parser.parse_to_logical_plan(sql)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
     binder = Binder(catalog)
     bound_plan = binder.bind(logical_plan)
@@ -263,7 +263,7 @@ def test_full_pipeline(setup_duckdb):
     sql = "SELECT id, name, age FROM testdb.main.users WHERE age >= 30"
 
     # Step 1: Parse
-    logical_plan = parser.parse_to_logical_plan(sql)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
     assert logical_plan is not None
 
     # Step 2: Bind
@@ -293,7 +293,7 @@ def test_explain_returns_plan(setup_duckdb):
 
     parser = Parser()
     sql = "EXPLAIN SELECT id FROM testdb.main.users WHERE age > 25"
-    logical_plan = parser.parse_to_logical_plan(sql)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
     binder = Binder(catalog)
     bound_plan = binder.bind(logical_plan)

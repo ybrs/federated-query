@@ -107,7 +107,7 @@ def get_pushed_sql(sql: str, catalog: Catalog) -> str:
     This extracts the actual SQL query that was pushed down to the database.
     """
     parser = Parser()
-    logical_plan = parser.parse_to_logical_plan(sql)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
     binder = Binder(catalog)
     bound_plan = binder.bind(logical_plan)
@@ -424,7 +424,7 @@ class TestEndToEndResults:
         sql = "SELECT order_id FROM testdb.main.orders WHERE price > 100"
 
         parser = Parser()
-        logical_plan = parser.parse_to_logical_plan(sql)
+        logical_plan = parser.parse_to_logical_plan(sql, catalog)
         binder = Binder(catalog)
         bound_plan = binder.bind(logical_plan)
         optimizer = create_optimizer(catalog)
@@ -450,7 +450,7 @@ class TestEndToEndResults:
         sql = "SELECT order_id, price FROM testdb.main.orders LIMIT 1"
 
         parser = Parser()
-        logical_plan = parser.parse_to_logical_plan(sql)
+        logical_plan = parser.parse_to_logical_plan(sql, catalog)
         binder = Binder(catalog)
         bound_plan = binder.bind(logical_plan)
         optimizer = create_optimizer(catalog)

@@ -40,7 +40,7 @@ def test_bind_simple_scan(catalog_with_test_data):
 
     # Parse SQL
     sql = "SELECT id, name FROM testdb.public.users"
-    plan = parser.parse_to_logical_plan(sql)
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
 
     # Bind the plan
     bound_plan = binder.bind(plan)
@@ -56,7 +56,7 @@ def test_bind_scan_with_invalid_table(catalog_with_test_data):
 
     # Parse SQL with invalid table
     sql = "SELECT id FROM testdb.public.nonexistent"
-    plan = parser.parse_to_logical_plan(sql)
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
 
     # Should raise BindingError
     with pytest.raises(BindingError) as exc_info:
@@ -72,7 +72,7 @@ def test_bind_scan_with_invalid_column(catalog_with_test_data):
 
     # Parse SQL with invalid column
     sql = "SELECT id, invalid_column FROM testdb.public.users"
-    plan = parser.parse_to_logical_plan(sql)
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
 
     # Should raise BindingError
     with pytest.raises(BindingError) as exc_info:
@@ -89,7 +89,7 @@ def test_bind_with_where_clause(catalog_with_test_data):
 
     # Parse SQL with WHERE
     sql = "SELECT name, age FROM testdb.public.users WHERE age > 18"
-    plan = parser.parse_to_logical_plan(sql)
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
 
     # Bind the plan
     bound_plan = binder.bind(plan)
@@ -104,7 +104,7 @@ def test_bind_resolves_column_types(catalog_with_test_data):
 
     # Parse SQL
     sql = "SELECT id, name FROM testdb.public.users"
-    plan = parser.parse_to_logical_plan(sql)
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
 
     # Bind the plan
     bound_plan = binder.bind(plan)
@@ -133,7 +133,7 @@ def test_bind_with_limit(catalog_with_test_data):
 
     # Parse SQL with LIMIT
     sql = "SELECT id, name FROM testdb.public.users LIMIT 10"
-    plan = parser.parse_to_logical_plan(sql)
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
 
     # Bind the plan
     bound_plan = binder.bind(plan)
@@ -148,7 +148,7 @@ def test_bind_with_star_column(catalog_with_test_data):
 
     # Parse SQL with *
     sql = "SELECT * FROM testdb.public.users"
-    plan = parser.parse_to_logical_plan(sql)
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
 
     # Bind the plan - should not fail even with *
     bound_plan = binder.bind(plan)
@@ -163,7 +163,7 @@ def test_bind_complex_where(catalog_with_test_data):
 
     # Parse SQL with complex WHERE
     sql = "SELECT name FROM testdb.public.users WHERE age > 18 AND name LIKE 'John%'"
-    plan = parser.parse_to_logical_plan(sql)
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
 
     # Bind the plan
     bound_plan = binder.bind(plan)

@@ -79,6 +79,7 @@ class FedQRuntime:
     """Wraps the parse → bind → optimize → plan → execute pipeline."""
 
     def __init__(self, catalog: Catalog, executor_config: ExecutorConfig):
+        self.catalog = catalog
         self.parser = Parser()
         self.binder = Binder(catalog)
         self.optimizer = RuleBasedOptimizer(catalog)
@@ -96,8 +97,7 @@ class FedQRuntime:
 
     def execute(self, sql: str) -> Union[pa.Table, Dict[str, Any]]:
         """Run a SQL statement and return results."""
-        ast = self.parser.parse(sql)
-        logical_plan = self.parser.ast_to_logical_plan(ast)
+        logical_plan = self.parser.parse_to_logical_plan(sql, self.catalog)
         bound_plan = self.binder.bind(logical_plan)
         optimized_plan = self.optimizer.optimize(bound_plan)
         physical_plan = self.planner.plan(optimized_plan)

@@ -76,8 +76,7 @@ def main():
     print(sql1)
 
     try:
-        ast = parser.parse(sql1)
-        logical_plan = parser.ast_to_logical_plan(ast)
+        logical_plan = parser.parse_to_logical_plan(sql1, catalog)
         bound_plan = binder.bind(logical_plan)
         physical_plan = planner.plan(bound_plan)
         result = executor.execute_to_table(physical_plan)
@@ -100,8 +99,7 @@ def main():
     print(sql2)
 
     try:
-        ast = parser.parse(sql2)
-        logical_plan = parser.ast_to_logical_plan(ast)
+        logical_plan = parser.parse_to_logical_plan(sql2, catalog)
         bound_plan = binder.bind(logical_plan)
         physical_plan = planner.plan(bound_plan)
         result = executor.execute_to_table(physical_plan)
@@ -124,8 +122,7 @@ def main():
     print(sql3)
 
     try:
-        ast = parser.parse(sql3)
-        logical_plan = parser.ast_to_logical_plan(ast)
+        logical_plan = parser.parse_to_logical_plan(sql3, catalog)
         bound_plan = binder.bind(logical_plan)
         physical_plan = planner.plan(bound_plan)
         result = executor.execute_to_table(physical_plan)

@@ -81,8 +81,7 @@ def run_query(catalog, sql, query_name):
     planner = PhysicalPlanner(catalog)
     executor = Executor(ExecutorConfig())
 
-    ast = parser.parse(sql)
-    logical_plan = parser.ast_to_logical_plan(ast)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
     bound_plan = binder.bind(logical_plan)
     physical_plan = planner.plan(bound_plan)
 
