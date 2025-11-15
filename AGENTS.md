@@ -50,6 +50,28 @@ What we want is this
 
 Simply fail if there is an exception unless otherwise requested. 
 
+We also don't want pointless fuck as follows
+```py
+   class Foo:
+      def __init__(self, processors):
+         self.processors: List[QueryProcessor] = []
+         if processors:
+            index = 0
+            while index < len(processors):
+               self.processors.append(processors[index])
+               index += 1
+```
+This is pointless fuck because we can simply do this
+
+```py
+   class Foo:
+      def __init__(self, processors:List[QueryProcessor]):
+         self.processors: List[QueryProcessor] = processors
+```
+
+We also don't want `while index <.... ` type loops. Use for loops. Iterate over lists.
+
+
 ## Repository Overview
 
 This is a production-grade federated query engine that executes SQL queries across multiple heterogeneous data sources (PostgreSQL, DuckDB) with intelligent optimization.
