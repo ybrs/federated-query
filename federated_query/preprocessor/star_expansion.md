@@ -1,4 +1,4 @@
-## Rewrite Flow
+## Middleware Flow
 
 We rewrite queries before it hits the engine. We currently have the following
 - Star expansion: We replace star (select * ...) with real column names 
