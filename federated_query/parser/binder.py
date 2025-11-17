@@ -1,6 +1,6 @@
 """Binder resolves references and validates types."""
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, TYPE_CHECKING
 from ..catalog.catalog import Catalog
 from ..catalog.schema import Table, Column
 from ..plan.logical import (
@@ -26,6 +26,9 @@ from ..plan.expressions import (
     CaseExpr,
 )
 
+if TYPE_CHECKING:
+    from ..processor.query_executor import QueryExecutor
+
 
 class BindingError(Exception):
     """Exception raised during binding."""
@@ -44,7 +47,11 @@ class Binder:
         """
         self.catalog = catalog
 
-    def bind(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+    def bind(
+        self,
+        plan: LogicalPlanNode,
+        query_executor: Optional["QueryExecutor"] = None,
+    ) -> LogicalPlanNode:
         """Bind a logical plan.
 
         This resolves all table and column references, validates types,

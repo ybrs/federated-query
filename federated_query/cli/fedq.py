@@ -29,7 +29,7 @@ from ..optimizer import (
     LimitPushdownRule,
     ExpressionSimplificationRule,
 )
-from ..plan import PhysicalExplain, ExplainFormat
+from ..processor import QueryExecutor, StarExpansionProcessor
 
 
 def build_json_explain_table(document: Dict[str, Any]) -> pa.Table:
@@ -85,7 +85,19 @@ class FedQRuntime:
         self.optimizer = RuleBasedOptimizer(catalog)
         self._register_optimization_rules()
         self.planner = PhysicalPlanner(catalog)
-        self.executor = Executor(executor_config)
+        physical_executor = Executor(executor_config)
+        processors = [
+            StarExpansionProcessor(catalog, dialect=self.parser.dialect)
+        ]
+        self.query_executor = QueryExecutor(
+            catalog=catalog,
+            parser=self.parser,
+            binder=self.binder,
+            optimizer=self.optimizer,
+            planner=self.planner,
+            physical_executor=physical_executor,
+            processors=processors,
+        )
 
     def _register_optimization_rules(self) -> None:
         """Register optimization rules in the correct order."""
@@ -97,14 +109,7 @@ class FedQRuntime:
 
     def execute(self, sql: str) -> Union[pa.Table, Dict[str, Any]]:
         """Run a SQL statement and return results."""
-        logical_plan = self.parser.parse_to_logical_plan(sql, self.catalog)
-        bound_plan = self.binder.bind(logical_plan)
-        optimized_plan = self.optimizer.optimize(bound_plan)
-        physical_plan = self.planner.plan(optimized_plan)
-        if isinstance(physical_plan, PhysicalExplain):
-            if physical_plan.format == ExplainFormat.JSON:
-                return physical_plan.build_document(stringify_queries=False)
-        return self.executor.execute_to_table(physical_plan)
+        return self.query_executor.execute(sql)
 
 
 class ResultPrinter:

@@ -1,6 +1,6 @@
 """Physical planner converts logical plans to physical plans."""
 
-from typing import Dict
+from typing import Dict, Optional, TYPE_CHECKING
 from ..catalog.catalog import Catalog
 from ..datasources.base import DataSource, DataSourceCapability
 from ..plan.logical import (
@@ -27,7 +27,10 @@ from ..plan.physical import (
     PhysicalExplain,
 )
 from ..plan.expressions import BinaryOp, BinaryOpType, ColumnRef
-from typing import List, Tuple, Optional
+from typing import List, Tuple
+
+if TYPE_CHECKING:
+    from ..processor.query_executor import QueryExecutor
 
 
 class PhysicalPlanner:
@@ -41,11 +44,16 @@ class PhysicalPlanner:
         """
         self.catalog = catalog
 
-    def plan(self, logical_plan: LogicalPlanNode) -> PhysicalPlanNode:
+    def plan(
+        self,
+        logical_plan: LogicalPlanNode,
+        query_executor: Optional["QueryExecutor"] = None,
+    ) -> PhysicalPlanNode:
         """Convert logical plan to physical plan.
 
         Args:
             logical_plan: Logical plan to convert
+            query_executor: Optional executor reference for context sharing
 
         Returns:
             Physical plan ready for execution

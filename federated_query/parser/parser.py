@@ -1,8 +1,10 @@
 """SQL parser using sqlglot."""
 
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
+
 import sqlglot
 from sqlglot import exp
-from typing import Dict, List, Optional, Tuple
+
 from ..plan.logical import (
     LogicalPlanNode,
     Scan,
@@ -30,6 +32,9 @@ from ..plan.expressions import (
     BetweenExpression,
     CaseExpr,
 )
+
+if TYPE_CHECKING:
+    from ..processor.query_executor import QueryExecutor
 
 
 class Parser:
@@ -944,7 +949,8 @@ class Parser:
     def parse_to_logical_plan(
         self,
         sql: str,
-        catalog: Optional[Catalog] = None
+        catalog: Optional[Catalog] = None,
+        query_executor: Optional["QueryExecutor"] = None,
     ) -> LogicalPlanNode:
         """Parse SQL directly to logical plan.
 
@@ -954,11 +960,6 @@ class Parser:
         Returns:
             Logical plan root node
         """
-        if catalog is not None:
-            from ..preprocessor import QueryPreprocessor
-
-            preprocessor = QueryPreprocessor(catalog, dialect=self.dialect)
-            sql = preprocessor.preprocess(sql)
         ast = self.parse(sql)
         return self.ast_to_logical_plan(ast)
 
