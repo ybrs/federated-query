@@ -98,6 +98,8 @@ class QueryPreprocessor:
         is_root: bool,
     ) -> None:
         """Rewrite a SELECT node."""
+        if not self._select_requires_expansion(select):
+            return
         sources = self._collect_sources(select)
         expanded: List[exp.Expression] = []
         metadata: List[ColumnMapping] = []
@@ -348,6 +350,21 @@ class QueryPreprocessor:
     ) -> str:
         """Build internal column name used inside the engine."""
         return f"{source.internal_prefix}.{column_name}"
+
+    def _select_requires_expansion(self, select: exp.Select) -> bool:
+        """Check if select contains projection stars."""
+        for expression in select.expressions:
+            if self._is_projection_star(expression):
+                return True
+        return False
+
+    def _is_projection_star(self, expression: exp.Expression) -> bool:
+        """Check if expression is '*' or alias.*."""
+        if isinstance(expression, exp.Star):
+            return True
+        if isinstance(expression, exp.Column) and isinstance(expression.this, exp.Star):
+            return True
+        return False
 
     def _build_column_expression(
         self,

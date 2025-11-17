@@ -30,7 +30,7 @@ def _create_duckdb_catalog() -> Tuple[Catalog, DuckDBDataSource]:
     """Create a catalog with an in-memory DuckDB datasource."""
     datasource = DuckDBDataSource(
         name="testdb",
-        config={"database": ":memory:", "read_only": False},
+        config={"path": ":memory:", "read_only": False},
     )
     datasource.connect()
     datasource.connection.execute(_CREATE_USERS_SQL)
