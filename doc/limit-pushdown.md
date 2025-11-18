@@ -40,10 +40,16 @@ A federated query engine must minimize data transfer from remote sources. Withou
 - **PRESERVE** NULL handling semantics (NULLS FIRST/LAST)
 - **MAINTAIN** sort stability when required
 
-### 2. ORDER BY + LIMIT Dependency
+### 2. ORDER BY Pushdown is MANDATORY
+- **ORDER BY pushdown is REQUIRED for correctness, not optional**
+- **Many use cases depend on ORDER BY without LIMIT**:
+  - Opening cursors for sequential processing (timeseries data)
+  - Streaming results in deterministic order
+  - Processing data in chronological/sorted order
+  - Merge operations requiring sorted inputs
+- **ORDER BY alone MUST be pushed down** when query has ORDER BY clause
+- **LIMIT + ORDER BY together** provide additional optimization (reduce rows transferred)
 - **LIMIT ALONE is unsafe for pushdown in multi-node scenarios** (non-deterministic results)
-- **LIMIT + ORDER BY together are safe** (deterministic ordering)
-- **ORDER BY alone is optional** (optimization, not correctness requirement)
 
 ### 3. Pushdown Boundaries
 - **Can push through**: `Project`, `Filter` (if all sort columns are available)
@@ -807,17 +813,31 @@ SELECT * FROM products LIMIT -1  -- ERROR
 
 ### Benchmark Scenarios
 
-| Query Pattern | Without Pushdown | With Pushdown | Improvement |
-|---------------|------------------|---------------|-------------|
-| ORDER BY only | Fetch all rows, sort locally | Fetch all rows, sorted remotely | ~10% (remote sort faster) |
-| LIMIT only | Fetch all rows, limit locally | Fetch N rows | 100-1000x |
-| ORDER BY + LIMIT | Fetch all rows, sort, limit | Fetch N rows, sorted | 1000-10000x |
-| ORDER BY + LIMIT + Filter | Fetch all rows, filter, sort, limit | Remote filter, sort, limit | 1000-10000x |
+| Query Pattern | Without Pushdown | With Pushdown | Improvement | Notes |
+|---------------|------------------|---------------|-------------|-------|
+| ORDER BY only | Fetch all rows, sort locally | Fetch all rows, sorted remotely | Critical for correctness | Required for cursors, timeseries |
+| LIMIT only | Fetch all rows, limit locally | Fetch N rows | 100-1000x | Unsafe without ORDER BY |
+| ORDER BY + LIMIT | Fetch all rows, sort, limit | Fetch N rows, sorted | 1000-10000x | Most critical optimization |
+| ORDER BY + LIMIT + Filter | Fetch all rows, filter, sort, limit | Remote filter, sort, limit | 1000-10000x | Common pattern |
 
-**Critical Case**: `SELECT * FROM large_table ORDER BY col LIMIT 10`
-- Without pushdown: Fetch 1,000,000 rows, sort locally, take 10
-- With pushdown: Fetch 10 rows pre-sorted
-- **Impact**: 100,000x reduction in data transfer
+**Critical Cases**:
+
+1. **ORDER BY for cursors/timeseries** (MANDATORY):
+   ```sql
+   SELECT * FROM events ORDER BY timestamp
+   -- Used by: cursor processing, streaming, chronological order
+   ```
+   - Without pushdown: Database returns unsorted → client gets wrong order
+   - With pushdown: Database returns properly sorted → correct behavior
+   - **Impact**: Correctness requirement, not optimization
+
+2. **ORDER BY + LIMIT for pagination** (OPTIMIZATION):
+   ```sql
+   SELECT * FROM large_table ORDER BY col LIMIT 10
+   ```
+   - Without pushdown: Fetch 1,000,000 rows, sort locally, take 10
+   - With pushdown: Fetch 10 rows pre-sorted
+   - **Impact**: 100,000x reduction in data transfer
 
 ## Migration Notes
 
