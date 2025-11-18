@@ -85,6 +85,7 @@ class Parser:
         plan = self._build_group_by_clause(select, plan)
         plan = self._build_having_clause(select, plan)
         plan = self._build_select_clause(select, plan)
+        plan = self._build_order_by_clause(select, plan)
         plan = self._build_limit_clause(select, plan)
         return plan
 
@@ -667,6 +668,48 @@ class Parser:
         if isinstance(expr, exp.Column):
             return expr.name
         return str(expr)
+
+    def _build_order_by_clause(
+        self, select: exp.Select, input_plan: LogicalPlanNode
+    ) -> LogicalPlanNode:
+        """Build Sort node from ORDER BY clause.
+
+        Args:
+            select: sqlglot Select node
+            input_plan: Input logical plan
+
+        Returns:
+            Logical plan with Sort node (or original if no ORDER BY)
+        """
+        from ..plan.logical import Sort
+
+        order = select.args.get("order")
+        if not order:
+            return input_plan
+
+        sort_keys = []
+        ascending = []
+        nulls_order = []
+
+        for ordered in order.expressions:
+            expr = self._convert_expression(ordered.this)
+            sort_keys.append(expr)
+
+            is_desc = ordered.args.get("desc", False)
+            ascending.append(not is_desc)
+
+            nulls = ordered.args.get("nulls_first")
+            if nulls is not None:
+                nulls_order.append("FIRST" if nulls else "LAST")
+            else:
+                nulls_order.append(None)
+
+        return Sort(
+            input=input_plan,
+            sort_keys=sort_keys,
+            ascending=ascending,
+            nulls_order=nulls_order
+        )
 
     def _build_limit_clause(
         self, select: exp.Select, input_plan: LogicalPlanNode
