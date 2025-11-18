@@ -1516,8 +1516,36 @@ class PhysicalSort(PhysicalPlanNode):
         return [self.input]
 
     def execute(self) -> Iterator[pa.RecordBatch]:
-        """Execute sort."""
-        raise NotImplementedError("Execute not yet implemented")
+        """Execute sort by materializing input and sorting."""
+        batches = []
+        for batch in self.input.execute():
+            batches.append(batch)
+
+        if not batches:
+            return
+
+        table = pa.Table.from_batches(batches)
+
+        sort_keys = []
+        for i in range(len(self.sort_keys)):
+            col_name = self._extract_column_name(self.sort_keys[i])
+            order = "ascending" if self.ascending[i] else "descending"
+            sort_keys.append((col_name, order))
+
+        indices = pa.compute.sort_indices(table, sort_keys=sort_keys)
+        sorted_table = table.take(indices)
+
+        for batch in sorted_table.to_batches():
+            yield batch
+
+    def _extract_column_name(self, expr: Expression) -> str:
+        """Extract column name from expression."""
+        from .expressions import ColumnRef
+        if isinstance(expr, ColumnRef):
+            return expr.column
+        raise NotImplementedError(
+            f"ORDER BY on complex expressions not yet supported: {expr}"
+        )
 
     def schema(self) -> pa.Schema:
         return self.input.schema()
