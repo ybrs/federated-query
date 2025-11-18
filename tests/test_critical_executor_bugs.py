@@ -126,7 +126,7 @@ class TestBug1PyArrowColumnAccess:
 
         parser = Parser()
         sql = "SELECT id, name FROM testdb.main.products WHERE price > 100"
-        logical_plan = parser.parse_to_logical_plan(sql)
+        logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
         binder = Binder(catalog)
         bound_plan = binder.bind(logical_plan)
@@ -154,7 +154,7 @@ class TestBug1PyArrowColumnAccess:
 
         parser = Parser()
         sql = "SELECT name, price FROM testdb.main.products"
-        logical_plan = parser.parse_to_logical_plan(sql)
+        logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
         binder = Binder(catalog)
         bound_plan = binder.bind(logical_plan)
@@ -187,7 +187,7 @@ class TestBug1PyArrowColumnAccess:
             FROM db1.main.customers c
             INNER JOIN db2.main.orders o ON c.id = o.customer_id
         """
-        logical_plan = parser.parse_to_logical_plan(sql)
+        logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
         binder = Binder(catalog)
         bound_plan = binder.bind(logical_plan)
@@ -223,7 +223,7 @@ class TestBug1PyArrowColumnAccess:
 
         parser = Parser()
         sql = "SELECT category, COUNT(*) as cnt FROM testdb.main.products GROUP BY category"
-        logical_plan = parser.parse_to_logical_plan(sql)
+        logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
         binder = Binder(catalog)
         bound_plan = binder.bind(logical_plan)
@@ -259,7 +259,7 @@ class TestBug1PyArrowColumnAccess:
             FROM db1.main.customers c, db2.main.orders o
             WHERE c.id = o.customer_id AND o.amount > 100
         """
-        logical_plan = parser.parse_to_logical_plan(sql)
+        logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
         binder = Binder(catalog)
         bound_plan = binder.bind(logical_plan)
@@ -297,7 +297,7 @@ class TestBug2StarProjectionDropsExpressions:
 
         parser = Parser()
         sql = "SELECT *, id AS id_copy FROM testdb.main.products"
-        logical_plan = parser.parse_to_logical_plan(sql)
+        logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
         binder = Binder(catalog)
         bound_plan = binder.bind(logical_plan)
@@ -335,7 +335,7 @@ class TestBug2StarProjectionDropsExpressions:
             FROM testdb.main.products
             WHERE id < 3
         """
-        logical_plan = parser.parse_to_logical_plan(sql)
+        logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
         binder = Binder(catalog)
         bound_plan = binder.bind(logical_plan)
@@ -368,7 +368,7 @@ class TestBug2StarProjectionDropsExpressions:
 
         parser = Parser()
         sql = "SELECT *, name AS product_name FROM testdb.main.products LIMIT 2"
-        logical_plan = parser.parse_to_logical_plan(sql)
+        logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
         binder = Binder(catalog)
         bound_plan = binder.bind(logical_plan)
@@ -409,7 +409,7 @@ class TestBug3LeftFullJoinNotImplemented:
             FROM db1.main.customers c
             LEFT JOIN db2.main.orders o ON c.id = o.customer_id
         """
-        logical_plan = parser.parse_to_logical_plan(sql)
+        logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
         binder = Binder(catalog)
         bound_plan = binder.bind(logical_plan)
@@ -456,7 +456,7 @@ class TestBug3LeftFullJoinNotImplemented:
             LEFT JOIN db2.main.orders o ON c.id = o.customer_id
             WHERE c.city = 'SF'
         """
-        logical_plan = parser.parse_to_logical_plan(sql)
+        logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
         binder = Binder(catalog)
         bound_plan = binder.bind(logical_plan)
@@ -493,7 +493,7 @@ class TestBug3LeftFullJoinNotImplemented:
             FROM db1.main.customers c
             LEFT JOIN db2.main.orders o ON c.id = o.customer_id AND o.amount > 150
         """
-        logical_plan = parser.parse_to_logical_plan(sql)
+        logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
         binder = Binder(catalog)
         bound_plan = binder.bind(logical_plan)
@@ -544,7 +544,7 @@ class TestBug4FullJoinMissingRightRows:
             FROM db1.main.customers c
             FULL OUTER JOIN db2.main.orders o ON c.id = o.customer_id
         """
-        logical_plan = parser.parse_to_logical_plan(sql)
+        logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
         binder = Binder(catalog)
         bound_plan = binder.bind(logical_plan)
@@ -643,7 +643,7 @@ class TestBug4FullJoinMissingRightRows:
             FROM db1.main.customers c
             FULL OUTER JOIN db2.main.orders o ON c.id = o.customer_id
         """
-        logical_plan = parser.parse_to_logical_plan(sql)
+        logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
         binder = Binder(catalog)
         bound_plan = binder.bind(logical_plan)
@@ -703,7 +703,7 @@ class TestBug4FullJoinMissingRightRows:
             FROM db1.main.customers c
             FULL OUTER JOIN db2.main.orders o ON c.id = o.customer_id AND o.amount > 75
         """
-        logical_plan = parser.parse_to_logical_plan(sql)
+        logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
         binder = Binder(catalog)
         bound_plan = binder.bind(logical_plan)
@@ -758,7 +758,7 @@ class TestBug5RightJoinMissingUnmatchedRows:
             FROM db1.main.customers c
             RIGHT JOIN db2.main.orders o ON c.id = o.customer_id
         """
-        logical_plan = parser.parse_to_logical_plan(sql)
+        logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
         binder = Binder(catalog)
         bound_plan = binder.bind(logical_plan)
@@ -851,7 +851,7 @@ class TestBug5RightJoinMissingUnmatchedRows:
             FROM db1.main.customers c
             RIGHT JOIN db2.main.orders o ON c.id = o.customer_id
         """
-        logical_plan = parser.parse_to_logical_plan(sql)
+        logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
         binder = Binder(catalog)
         bound_plan = binder.bind(logical_plan)
@@ -909,7 +909,7 @@ class TestBug5RightJoinMissingUnmatchedRows:
             FROM db1.main.customers c
             RIGHT JOIN db2.main.orders o ON c.id = o.customer_id AND o.amount > 75
         """
-        logical_plan = parser.parse_to_logical_plan(sql)
+        logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
         binder = Binder(catalog)
         bound_plan = binder.bind(logical_plan)

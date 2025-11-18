@@ -113,7 +113,7 @@ def execute_and_capture(sql: str, catalog: Catalog, ds: QueryCapturingDataSource
     ds.clear_queries()
 
     parser = Parser()
-    logical_plan = parser.parse_to_logical_plan(sql)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
     binder = Binder(catalog)
     bound_plan = binder.bind(logical_plan)
@@ -484,7 +484,7 @@ class TestBuggyAggregates:
         ds.clear_queries()
 
         parser = Parser()
-        logical_plan = parser.parse_to_logical_plan(sql)
+        logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
         binder = Binder(catalog)
         bound_plan = binder.bind(logical_plan)

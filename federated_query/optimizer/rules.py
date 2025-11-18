@@ -1,7 +1,7 @@
 """Optimization rules for logical plans."""
 
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import List, Optional, TYPE_CHECKING
 from ..plan.logical import (
     LogicalPlanNode,
     Scan,
@@ -22,6 +22,9 @@ from .expression_rewriter import (
     ExpressionSimplificationRewriter,
     CompositeExpressionRewriter,
 )
+
+if TYPE_CHECKING:
+    from ..processor.query_executor import QueryExecutor
 
 
 class OptimizationRule(ABC):
@@ -1202,7 +1205,12 @@ class RuleBasedOptimizer:
         """
         self.rules.append(rule)
 
-    def optimize(self, plan: LogicalPlanNode, max_iterations: int = 10) -> LogicalPlanNode:
+    def optimize(
+        self,
+        plan: LogicalPlanNode,
+        max_iterations: int = 10,
+        query_executor: Optional["QueryExecutor"] = None,
+    ) -> LogicalPlanNode:
         """Optimize a logical plan using registered rules.
 
         Applies rules iteratively until fixed point or max iterations.
@@ -1210,12 +1218,17 @@ class RuleBasedOptimizer:
         Args:
             plan: Input logical plan
             max_iterations: Maximum number of optimization passes
+            query_executor: Optional executor reference for context
 
         Returns:
             Optimized logical plan
         """
         if isinstance(plan, Explain):
-            optimized_child = self.optimize(plan.input, max_iterations)
+            optimized_child = self.optimize(
+                plan.input,
+                max_iterations,
+                query_executor=query_executor,
+            )
             return Explain(optimized_child, plan.format)
 
         current_plan = plan

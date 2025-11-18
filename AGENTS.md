@@ -6,6 +6,32 @@ This document provides an overview of the codebase structure, key classes, compi
 
 Never fail silently. If something breaks it should throw an error. We don't want silent fails. You can only catch exceptions when we show it to the user in the cli. Otherwise all exceptions should be thrown. 
 
+Follow Python PEP8
+
+use meaningful names
+
+every function/method needs a comment with explaining what it does.
+
+This project is not a toy/homework project. Do real production quality software development. We need real-query-engine level behaviour.
+
+Eg: the following task is correct.
+```
+# SELECT * Expansion Contract
+
+- All star projections (`*` or `alias.*`) MUST be expanded into explicit column references **before** the logical plan reaches the parser/binder. No star survives into the engine.
+- Expansion is performed by the preprocessor using catalog metadata and generates an **internal column name** (`internal_name`) alongside the user-visible name (`visible_name`). Example mapping:
+  - SQL: `SELECT * FROM pg.users`
+  - Internal projection: `pg.users.id` (`internal_name`) with `id` (`visible_name`)
+  - Engine uses `internal_name` for planning/execution; results presented to the user show `visible_name`.
+- Queries with user aliases (`SELECT foo AS alias_1 FROM pg.users`) map as:
+  - `internal_name = pg.users.foo`
+  - `visible_name = alias_1`
+  - Execution works exclusively on the internal name; final result column is `alias_1`.
+- Expansion fails fast (raises StarExpansionError) when a star cannot be resolved (missing table metadata, unsupported source, etc.).
+```
+
+This is wrong """All star projections (`*` or `alias.*`) MUST be expanded. If the table is not aliased we bail out and pass * to underlying engine. """ or """all star projections will only work for aliased tables and we raise an exception, we don't support subqueries""" these are unacceptable. When planning a feature we want real engine-level planning.
+
 We also don't want wrapping exceptions with beatiful messages or whatever you think is better. So the next example is wrong
 
 ```python
@@ -23,6 +49,53 @@ What we want is this
 ```
 
 Simply fail if there is an exception unless otherwise requested. 
+
+We also don't want pointless fuck as follows
+```py
+   class Foo:
+      def __init__(self, processors):
+         # WRONG BECAUSE ITS POINTLESS FUCK
+         self.processors: List[QueryProcessor] = []
+         if processors:
+            index = 0
+            while index < len(processors):
+               self.processors.append(processors[index])
+               index += 1
+```
+This is pointless fuck because we can simply do this
+
+```py
+   class Foo:
+      def __init__(self, processors:List[QueryProcessor]):
+         # RIGHT
+         self.processors: List[QueryProcessor] = processors
+```
+
+We also don't want `while index <.... ` type loops. Use for loops. Iterate over lists.
+
+```py
+      if isinstance(value, list):
+         # WRONG BECAUSE ITS POINTLESS FUCK
+         index = 0
+         while index < len(value):
+            entry = value[index]
+            if isinstance(entry, exp.Expression):
+               self._rewrite_expression(entry, context, False)
+            index += 1
+```
+
+This is right 
+
+```py
+      if isinstance(value, list):
+         # right, because value is a list, we can loop over it.
+         for entry in value:
+            if isinstance(entry, exp.Expression):
+               self._rewrite_expression(entry, context, False)
+```
+
+Seeing any pointless fuck in the code will result in immediate fail in task and ending your contract, you'll be fired on the spot. So think carefully before you write any code. We don't tolerate bullshit.
+
 
 ## Repository Overview
 

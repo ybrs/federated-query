@@ -50,6 +50,7 @@ data/
 # Logs
 *.log
 logs/
+.history
 
 # Configuration (exclude sensitive configs)
 config.yaml

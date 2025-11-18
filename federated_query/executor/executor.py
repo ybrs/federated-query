@@ -1,9 +1,12 @@
 """Query executor."""
 
-from typing import Iterator, Optional
+from typing import Iterator, Optional, TYPE_CHECKING
 import pyarrow as pa
 from ..plan.physical import PhysicalPlanNode
 from ..config.config import ExecutorConfig
+
+if TYPE_CHECKING:
+    from ..processor.query_executor import QueryExecutor
 
 
 class Executor:
@@ -19,7 +22,11 @@ class Executor:
             config = ExecutorConfig()
         self.config = config
 
-    def execute(self, plan: PhysicalPlanNode) -> Iterator[pa.RecordBatch]:
+    def execute(
+        self,
+        plan: PhysicalPlanNode,
+        query_executor: Optional["QueryExecutor"] = None,
+    ) -> Iterator[pa.RecordBatch]:
         """Execute a physical plan.
 
         Args:
@@ -32,7 +39,11 @@ class Executor:
         # The plan nodes themselves implement execute() which yields batches
         yield from plan.execute()
 
-    def execute_to_table(self, plan: PhysicalPlanNode) -> pa.Table:
+    def execute_to_table(
+        self,
+        plan: PhysicalPlanNode,
+        query_executor: Optional["QueryExecutor"] = None,
+    ) -> pa.Table:
         """Execute a physical plan and materialize as Arrow table.
 
         Args:
@@ -41,7 +52,7 @@ class Executor:
         Returns:
             Arrow table with all results
         """
-        batches = list(self.execute(plan))
+        batches = list(self.execute(plan, query_executor=query_executor))
         if not batches:
             # Return empty table with schema
             return pa.Table.from_batches([], schema=plan.schema())

@@ -9,6 +9,9 @@ from federated_query.parser import Parser, Binder
 from federated_query.optimizer.physical_planner import PhysicalPlanner
 from federated_query.executor.executor import Executor
 from federated_query.config.config import ExecutorConfig
+from federated_query.optimizer import RuleBasedOptimizer
+from federated_query.processor import QueryExecutor as PipelineExecutor
+from federated_query.processor import StarExpansionProcessor
 
 
 def setup_test_db():
@@ -76,6 +79,25 @@ def setup_catalog(conn):
     return catalog
 
 
+def build_query_executor(catalog: Catalog) -> PipelineExecutor:
+    """Construct a QueryExecutor with star expansion middleware."""
+    parser = Parser()
+    binder = Binder(catalog)
+    optimizer = RuleBasedOptimizer(catalog)
+    planner = PhysicalPlanner(catalog)
+    physical_executor = Executor(ExecutorConfig())
+    processors = [StarExpansionProcessor(catalog, dialect=parser.dialect)]
+    return PipelineExecutor(
+        catalog=catalog,
+        parser=parser,
+        binder=binder,
+        optimizer=optimizer,
+        planner=planner,
+        physical_executor=physical_executor,
+        processors=processors,
+    )
+
+
 def test_simple_inner_join():
     """Test simple INNER JOIN query."""
     conn = setup_test_db()
@@ -87,21 +109,13 @@ def test_simple_inner_join():
         JOIN testdb.main.orders o ON c.id = o.customer_id
     """
 
-    parser = Parser()
-    binder = Binder(catalog)
-    planner = PhysicalPlanner(catalog)
-    executor = Executor(ExecutorConfig())
+    executor = build_query_executor(catalog)
+    result = executor.execute(sql)
+    assert isinstance(result, pa.Table)
 
-    ast = parser.parse(sql)
-    logical_plan = parser.ast_to_logical_plan(ast)
-    bound_plan = binder.bind(logical_plan)
-    physical_plan = planner.plan(bound_plan)
+    assert result.num_rows == 4
 
-    result_table = executor.execute_to_table(physical_plan)
-
-    assert result_table.num_rows == 4
-
-    names = [row.as_py() for row in result_table.column("name")]
+    names = [row.as_py() for row in result.column("name")]
     assert "Alice" in names
     assert "Bob" in names
     assert "Charlie" in names
@@ -121,21 +135,13 @@ def test_join_with_where():
         WHERE o.amount > 100
     """
 
-    parser = Parser()
-    binder = Binder(catalog)
-    planner = PhysicalPlanner(catalog)
-    executor = Executor(ExecutorConfig())
+    executor = build_query_executor(catalog)
+    result = executor.execute(sql)
+    assert isinstance(result, pa.Table)
 
-    ast = parser.parse(sql)
-    logical_plan = parser.ast_to_logical_plan(ast)
-    bound_plan = binder.bind(logical_plan)
-    physical_plan = planner.plan(bound_plan)
+    assert result.num_rows == 2
 
-    result_table = executor.execute_to_table(physical_plan)
-
-    assert result_table.num_rows == 2
-
-    amounts = [row.as_py() for row in result_table.column("amount")]
+    amounts = [row.as_py() for row in result.column("amount")]
     assert all(amt > 100 for amt in amounts)
 
     conn.close()
@@ -152,22 +158,14 @@ def test_join_specific_columns():
         JOIN testdb.main.orders o ON c.id = o.customer_id
     """
 
-    parser = Parser()
-    binder = Binder(catalog)
-    planner = PhysicalPlanner(catalog)
-    executor = Executor(ExecutorConfig())
+    executor = build_query_executor(catalog)
+    result = executor.execute(sql)
+    assert isinstance(result, pa.Table)
 
-    ast = parser.parse(sql)
-    logical_plan = parser.ast_to_logical_plan(ast)
-    bound_plan = binder.bind(logical_plan)
-    physical_plan = planner.plan(bound_plan)
+    assert result.num_rows == 4
+    assert result.num_columns == 3
 
-    result_table = executor.execute_to_table(physical_plan)
-
-    assert result_table.num_rows == 4
-    assert result_table.num_columns == 3
-
-    assert result_table.schema.names == ["id", "name", "order_id"]
+    assert result.schema.names == ["id", "name", "order_id"]
 
     conn.close()
 
@@ -183,20 +181,12 @@ def test_join_all_columns():
         JOIN testdb.main.orders o ON c.id = o.customer_id
     """
 
-    parser = Parser()
-    binder = Binder(catalog)
-    planner = PhysicalPlanner(catalog)
-    executor = Executor(ExecutorConfig())
+    executor = build_query_executor(catalog)
+    result = executor.execute(sql)
+    assert isinstance(result, pa.Table)
 
-    ast = parser.parse(sql)
-    logical_plan = parser.ast_to_logical_plan(ast)
-    bound_plan = binder.bind(logical_plan)
-    physical_plan = planner.plan(bound_plan)
-
-    result_table = executor.execute_to_table(physical_plan)
-
-    assert result_table.num_rows == 4
-    assert result_table.num_columns == 7
+    assert result.num_rows == 4
+    assert result.num_columns == 7
 
     conn.close()
 
@@ -213,8 +203,7 @@ def test_parser_creates_join_plan():
     """
 
     parser = Parser()
-    ast = parser.parse(sql)
-    logical_plan = parser.ast_to_logical_plan(ast)
+    logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
     from federated_query.plan.logical import Join, Project
 
