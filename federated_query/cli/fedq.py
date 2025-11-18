@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import click
 import duckdb
 import pyarrow as pa
 from prompt_toolkit import PromptSession
-from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from sqlglot import errors as sqlglot_errors
 
@@ -29,7 +30,7 @@ from ..optimizer import (
     LimitPushdownRule,
     ExpressionSimplificationRule,
 )
-from ..processor import QueryExecutor, StarExpansionProcessor
+from ..processor import QueryExecutor, StarExpansionError, StarExpansionProcessor
 
 
 def build_json_explain_table(document: Dict[str, Any]) -> pa.Table:
@@ -271,10 +272,19 @@ class FedQRepl:
         self.session = self._create_session()
 
     def _create_session(self) -> PromptSession:
-        history = InMemoryHistory()
+        """Create prompt session backed by persistent history."""
+        history_file = self._history_path()
+        history = FileHistory(str(history_file))
         auto_suggest = AutoSuggestFromHistory()
         session = PromptSession(history=history, auto_suggest=auto_suggest)
         return session
+
+    def _history_path(self) -> Path:
+        """Return history file path, creating the file when necessary."""
+        history_path = Path(".history")
+        if not history_path.exists():
+            history_path.touch()
+        return history_path
 
     def run(self) -> None:
         buffer: List[str] = []
@@ -363,8 +373,11 @@ class FedQRepl:
             BindingError,
             duckdb.Error,
             sqlglot_errors.ParseError,
+            StarExpansionError,
         ) as exc:
             click.echo(f"error: {exc}")
+        except Exception as exc:
+            click.echo(f"unexpected error: {exc}")
 
     def _clean_statement(self, statement: str) -> str:
         clean = statement.strip()
