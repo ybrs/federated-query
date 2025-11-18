@@ -824,8 +824,12 @@ class LimitPushdownRule(OptimizationRule):
     def _try_push_limit(self, limit: Limit) -> LogicalPlanNode:
         """Try to push limit through input.
 
-        Pushes through projections and filters until reaching scans.
+        Special handling for Limit(Sort(...)): push both together to scan.
+        This is the most critical optimization for pagination queries.
         """
+        if isinstance(limit.input, Sort):
+            return self._push_limit_with_sort(limit, limit.input)
+
         pushed = self._push_limit_into_plan(limit.input, limit.limit, limit.offset)
         if pushed is None:
             new_input = self._push_limit(limit.input)
@@ -833,6 +837,90 @@ class LimitPushdownRule(OptimizationRule):
                 return Limit(new_input, limit.limit, limit.offset)
             return limit
         return pushed
+
+    def _push_limit_with_sort(self, limit: Limit, sort: Sort) -> LogicalPlanNode:
+        """Push LIMIT and ORDER BY together to scan.
+
+        This is critical for pagination: SELECT * FROM t ORDER BY col LIMIT 10
+        transforms to Scan(t, order_by=col, limit=10) instead of fetching all rows.
+        """
+        sort_input = sort.input
+
+        if isinstance(sort_input, Scan):
+            return Scan(
+                datasource=sort_input.datasource,
+                schema_name=sort_input.schema_name,
+                table_name=sort_input.table_name,
+                columns=sort_input.columns,
+                filters=sort_input.filters,
+                alias=sort_input.alias,
+                group_by=sort_input.group_by,
+                aggregates=sort_input.aggregates,
+                output_names=sort_input.output_names,
+                order_by_keys=sort.sort_keys,
+                order_by_ascending=sort.ascending,
+                order_by_nulls=sort.nulls_order,
+                limit=limit.limit,
+                offset=limit.offset,
+            )
+
+        if isinstance(sort_input, Project):
+            return self._push_limit_sort_through_project(limit, sort, sort_input)
+
+        if isinstance(sort_input, Filter):
+            return self._push_limit_sort_through_filter(limit, sort, sort_input)
+
+        return limit
+
+    def _push_limit_sort_through_project(
+        self, limit: Limit, sort: Sort, project: Project
+    ) -> LogicalPlanNode:
+        """Push LIMIT+ORDER BY through projection."""
+        if isinstance(project.input, Scan):
+            new_scan = Scan(
+                datasource=project.input.datasource,
+                schema_name=project.input.schema_name,
+                table_name=project.input.table_name,
+                columns=project.input.columns,
+                filters=project.input.filters,
+                alias=project.input.alias,
+                group_by=project.input.group_by,
+                aggregates=project.input.aggregates,
+                output_names=project.input.output_names,
+                order_by_keys=sort.sort_keys,
+                order_by_ascending=sort.ascending,
+                order_by_nulls=sort.nulls_order,
+                limit=limit.limit,
+                offset=limit.offset,
+            )
+            return Project(new_scan, project.expressions, project.aliases)
+
+        return limit
+
+    def _push_limit_sort_through_filter(
+        self, limit: Limit, sort: Sort, filter_node: Filter
+    ) -> LogicalPlanNode:
+        """Push LIMIT+ORDER BY through filter."""
+        if isinstance(filter_node.input, Scan):
+            new_scan = Scan(
+                datasource=filter_node.input.datasource,
+                schema_name=filter_node.input.schema_name,
+                table_name=filter_node.input.table_name,
+                columns=filter_node.input.columns,
+                filters=filter_node.input.filters,
+                alias=filter_node.input.alias,
+                group_by=filter_node.input.group_by,
+                aggregates=filter_node.input.aggregates,
+                output_names=filter_node.input.output_names,
+                order_by_keys=sort.sort_keys,
+                order_by_ascending=sort.ascending,
+                order_by_nulls=sort.nulls_order,
+                limit=limit.limit,
+                offset=limit.offset,
+            )
+            return Filter(new_scan, filter_node.predicate)
+
+        return limit
 
     def _push_limit_into_plan(
         self,
