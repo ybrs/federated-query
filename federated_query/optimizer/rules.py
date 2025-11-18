@@ -234,6 +234,9 @@ class PredicatePushdownRule(OptimizationRule):
                 output_names=scan.output_names,
                 limit=scan.limit,
                 offset=scan.offset,
+                order_by_keys=scan.order_by_keys,
+                order_by_ascending=scan.order_by_ascending,
+                order_by_nulls=scan.order_by_nulls,
             )
 
         return Scan(
@@ -248,6 +251,9 @@ class PredicatePushdownRule(OptimizationRule):
             output_names=scan.output_names,
             limit=scan.limit,
             offset=scan.offset,
+            order_by_keys=scan.order_by_keys,
+            order_by_ascending=scan.order_by_ascending,
+            order_by_nulls=scan.order_by_nulls,
         )
 
     def _predicate_matches_side(
@@ -662,6 +668,9 @@ class ProjectionPushdownRule(OptimizationRule):
                 output_names=scan.output_names,
                 limit=scan.limit,
                 offset=scan.offset,
+                order_by_keys=scan.order_by_keys,
+                order_by_ascending=scan.order_by_ascending,
+                order_by_nulls=scan.order_by_nulls,
             )
 
         return scan
@@ -889,6 +898,9 @@ class LimitPushdownRule(OptimizationRule):
             output_names=scan.output_names,
             limit=effective_limit,
             offset=effective_offset,
+            order_by_keys=scan.order_by_keys,
+            order_by_ascending=scan.order_by_ascending,
+            order_by_nulls=scan.order_by_nulls,
         )
 
     def name(self) -> str:
@@ -905,6 +917,167 @@ class JoinReorderingRule(OptimizationRule):
 
     def name(self) -> str:
         return "JoinReordering"
+
+
+class OrderByPushdownRule(OptimizationRule):
+    """Push ORDER BY clauses to data sources when safe.
+
+    Transforms:
+        Sort(Project?(Filter?(Scan))) → Project?(Filter?(Scan(with order by)))
+
+    This pushes ORDER BY to the data source for execution.
+    ORDER BY pushdown is mandatory for correctness in many use cases:
+    - Cursor processing over timeseries data
+    - Streaming results in deterministic order
+    - Sequential data processing
+    """
+
+    def apply(self, plan: LogicalPlanNode) -> Optional[LogicalPlanNode]:
+        """Apply ORDER BY pushdown optimization."""
+        return self._push_order_by(plan)
+
+    def _push_order_by(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Recursively push ORDER BY down the plan tree."""
+        if isinstance(plan, Sort):
+            return self._try_push_sort(plan)
+
+        return self._recurse_node(plan)
+
+    def _try_push_sort(self, sort: Sort) -> LogicalPlanNode:
+        """Try to push sort into its input."""
+        input_node = sort.input
+
+        if isinstance(input_node, Project):
+            return self._push_through_project(sort, input_node)
+
+        if isinstance(input_node, Filter):
+            return self._push_through_filter(sort, input_node)
+
+        if isinstance(input_node, Scan):
+            return self._push_to_scan(sort, input_node)
+
+        return sort
+
+    def _push_to_scan(self, sort: Sort, scan: Scan) -> Scan:
+        """Push ORDER BY into scan node."""
+        return Scan(
+            datasource=scan.datasource,
+            schema_name=scan.schema_name,
+            table_name=scan.table_name,
+            columns=scan.columns,
+            filters=scan.filters,
+            alias=scan.alias,
+            group_by=scan.group_by,
+            aggregates=scan.aggregates,
+            output_names=scan.output_names,
+            limit=scan.limit,
+            offset=scan.offset,
+            order_by_keys=sort.sort_keys,
+            order_by_ascending=sort.ascending,
+            order_by_nulls=sort.nulls_order,
+        )
+
+    def _push_through_project(self, sort: Sort, project: Project) -> LogicalPlanNode:
+        """Push ORDER BY through projection if all sort columns available."""
+        input_cols = self._get_available_columns(project.input)
+        sort_cols = self._extract_sort_columns(sort)
+
+        if not sort_cols.issubset(input_cols):
+            return sort
+
+        new_input = self._push_order_by(project.input)
+        if isinstance(new_input, Scan) and new_input.order_by_keys:
+            return Project(new_input, project.expressions, project.aliases)
+
+        return sort
+
+    def _push_through_filter(self, sort: Sort, filter_node: Filter) -> LogicalPlanNode:
+        """Push ORDER BY through filter (always safe)."""
+        new_input = self._push_order_by(filter_node.input)
+        if isinstance(new_input, Scan) and new_input.order_by_keys:
+            return Filter(new_input, filter_node.predicate)
+
+        return sort
+
+    def _get_available_columns(self, plan: LogicalPlanNode) -> set:
+        """Get all column names available from a plan node."""
+        if isinstance(plan, Scan):
+            return set(plan.columns)
+
+        if isinstance(plan, Project):
+            return set(plan.aliases)
+
+        if isinstance(plan, Filter):
+            return self._get_available_columns(plan.input)
+
+        return set()
+
+    def _extract_sort_columns(self, sort: Sort) -> set:
+        """Extract column names from sort keys."""
+        from ..plan.expressions import ColumnRef
+
+        columns = set()
+        for key in sort.sort_keys:
+            if isinstance(key, ColumnRef):
+                columns.add(key.column)
+
+        return columns
+
+    def _recurse_node(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Recurse into node children."""
+        if isinstance(plan, (Project, Filter, Limit)):
+            return self._recurse_unary(plan)
+
+        if isinstance(plan, Join):
+            return self._recurse_join(plan)
+
+        if isinstance(plan, Aggregate):
+            return self._recurse_aggregate(plan)
+
+        return plan
+
+    def _recurse_unary(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Recurse into unary node."""
+        new_input = self._push_order_by(plan.input)
+        if new_input == plan.input:
+            return plan
+
+        if isinstance(plan, Project):
+            return Project(new_input, plan.expressions, plan.aliases)
+
+        if isinstance(plan, Filter):
+            return Filter(new_input, plan.predicate)
+
+        if isinstance(plan, Limit):
+            return Limit(new_input, plan.limit, plan.offset)
+
+        return plan
+
+    def _recurse_join(self, join: Join) -> LogicalPlanNode:
+        """Recurse into join node."""
+        new_left = self._push_order_by(join.left)
+        new_right = self._push_order_by(join.right)
+
+        if new_left == join.left and new_right == join.right:
+            return join
+
+        return Join(new_left, new_right, join.join_type, join.condition)
+
+    def _recurse_aggregate(self, agg: Aggregate) -> LogicalPlanNode:
+        """Recurse into aggregate node."""
+        new_input = self._push_order_by(agg.input)
+        if new_input == agg.input:
+            return agg
+
+        return Aggregate(
+            new_input,
+            agg.group_by,
+            agg.aggregates,
+            agg.output_names
+        )
+
+    def name(self) -> str:
+        return "OrderByPushdown"
 
 
 class AggregatePushdownRule(OptimizationRule):
@@ -963,6 +1136,9 @@ class AggregatePushdownRule(OptimizationRule):
             output_names=agg.output_names,
             limit=scan.limit,
             offset=scan.offset,
+            order_by_keys=scan.order_by_keys,
+            order_by_ascending=scan.order_by_ascending,
+            order_by_nulls=scan.order_by_nulls,
         )
 
     def _merge_filters(
@@ -1063,6 +1239,9 @@ class ExpressionSimplificationRule(OptimizationRule):
                         output_names=plan.output_names,
                         limit=plan.limit,
                         offset=plan.offset,
+                        order_by_keys=plan.order_by_keys,
+                        order_by_ascending=plan.order_by_ascending,
+                        order_by_nulls=plan.order_by_nulls,
                     )
             return plan
 
