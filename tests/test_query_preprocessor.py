@@ -176,6 +176,39 @@ def test_preprocess_skips_cte_without_star() -> None:
     assert not context.columns
 
 
+def test_preprocess_cte_with_star_records_columns() -> None:
+    """Ensure outer SELECT after CTE records column metadata."""
+    catalog = _build_catalog()
+    context = QueryContext(
+        """
+        WITH recent_orders AS (
+            SELECT user_id, COUNT(*) AS order_count
+            FROM testdb.main.orders
+            GROUP BY user_id
+        )
+        SELECT * FROM testdb.main.users
+        """
+    )
+    preprocessor = QueryPreprocessor(catalog)
+    preprocessor.preprocess(context.original_sql, context)
+    assert len(context.columns) == 4
+
+
+def test_preprocess_union_star_records_columns() -> None:
+    """Ensure union roots still capture column metadata."""
+    catalog = _build_catalog()
+    context = QueryContext(
+        """
+        SELECT * FROM testdb.main.users
+        UNION
+        SELECT * FROM testdb.main.users
+        """
+    )
+    preprocessor = QueryPreprocessor(catalog)
+    preprocessor.preprocess(context.original_sql, context)
+    assert len(context.columns) == 4
+
+
 def test_preprocess_expands_join_alias_star() -> None:
     """Expand table2.* in joins without altering order."""
     catalog = _build_catalog()

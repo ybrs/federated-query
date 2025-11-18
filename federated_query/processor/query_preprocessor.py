@@ -78,18 +78,45 @@ class QueryPreprocessor:
         """Traverse AST and rewrite every SELECT."""
         if isinstance(node, exp.Select):
             self._rewrite_select(node, context, is_root)
-        for value in node.args.values():
-            self._visit_child(value, context)
+        for key, value in node.args.items():
+            child_is_root = self._child_is_root(node, key, is_root)
+            self._visit_child(key, value, context, child_is_root)
 
-    def _visit_child(self, value: Union[exp.Expression, List[exp.Expression]], context: QueryContext) -> None:
+    def _visit_child(
+        self,
+        key: str,
+        value: Union[exp.Expression, List[exp.Expression]],
+        context: QueryContext,
+        is_root: bool,
+    ) -> None:
         """Visit child expressions."""
         if isinstance(value, exp.Expression):
-            self._rewrite_expression_tree(value, context, is_root=False)
+            self._rewrite_expression_tree(value, context, is_root=is_root)
             return
         if isinstance(value, list):
             for child in value:
                 if isinstance(child, exp.Expression):
                     self._rewrite_expression_tree(child, context, is_root=False)
+
+    def _child_is_root(
+        self,
+        parent: exp.Expression,
+        arg_key: str,
+        parent_is_root: bool,
+    ) -> bool:
+        """Determine if child should inherit root status."""
+        if not parent_is_root:
+            return False
+        if isinstance(parent, exp.With) and arg_key == "this":
+            return True
+        if isinstance(parent, exp.Command) and arg_key in ("expression", "this"):
+            return True
+        set_operations = (exp.Union, exp.Except, exp.Intersect)
+        if isinstance(parent, set_operations) and arg_key == "this":
+            return True
+        if isinstance(parent, exp.Paren) and arg_key == "this":
+            return True
+        return False
 
     def _rewrite_select(
         self,
