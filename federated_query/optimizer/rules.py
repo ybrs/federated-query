@@ -931,6 +931,9 @@ class OrderByPushdownRule(OptimizationRule):
 
     def _try_push_sort(self, sort: Sort) -> LogicalPlanNode:
         """Try to push sort into its input."""
+        if not self._sort_is_pushable(sort):
+            return sort
+
         input_node = sort.input
 
         if isinstance(input_node, Project):
@@ -938,6 +941,12 @@ class OrderByPushdownRule(OptimizationRule):
 
         if isinstance(input_node, Filter):
             return self._push_through_filter(sort, input_node)
+
+        if isinstance(input_node, Join):
+            return self._push_through_join(sort, input_node)
+
+        if isinstance(input_node, Aggregate):
+            return self._push_through_aggregate(sort, input_node)
 
         if isinstance(input_node, Scan):
             return self._push_to_scan(sort, input_node)
@@ -1004,16 +1013,115 @@ class OrderByPushdownRule(OptimizationRule):
 
         return sort
 
+    def _push_through_join(self, sort: Sort, join: Join) -> LogicalPlanNode:
+        """Push ORDER BY metadata into a single join side when safe."""
+        sort_cols = self._extract_sort_columns(sort)
+        left_cols = self._get_available_columns(join.left)
+        right_cols = self._get_available_columns(join.right)
+
+        left_only = self._columns_match_side(sort_cols, left_cols, right_cols)
+        right_only = self._columns_match_side(sort_cols, right_cols, left_cols)
+
+        new_left = self._push_sort_into_child(sort, join.left) if left_only else join.left
+        new_right = self._push_sort_into_child(sort, join.right) if right_only else join.right
+
+        rebuilt = Join(new_left, new_right, join.join_type, join.condition)
+        return Sort(
+            input=rebuilt,
+            sort_keys=sort.sort_keys,
+            ascending=sort.ascending,
+            nulls_order=sort.nulls_order,
+        )
+
+    def _push_sort_into_child(
+        self,
+        sort: Sort,
+        child: LogicalPlanNode,
+    ) -> LogicalPlanNode:
+        """Push sort keys into a specific child and return transformed child."""
+        injected = Sort(
+            input=child,
+            sort_keys=sort.sort_keys,
+            ascending=sort.ascending,
+            nulls_order=sort.nulls_order,
+        )
+        pushed = self._push_order_by(injected)
+        if isinstance(pushed, Sort):
+            return pushed.input
+        return pushed
+
+    def _columns_match_side(
+        self,
+        sort_cols: set,
+        side_cols: set,
+        other_cols: set,
+    ) -> bool:
+        """Check if sort columns belong exclusively to one join side."""
+        for col in sort_cols:
+            if col in side_cols:
+                continue
+
+            bare = col.split(".")[-1]
+            side_has = any(entry.endswith(f".{bare}") or entry == bare for entry in side_cols)
+            other_has = any(entry.endswith(f".{bare}") or entry == bare for entry in other_cols)
+
+            if side_has and not other_has:
+                continue
+
+            return False
+
+        return True
+
+    def _push_through_aggregate(self, sort: Sort, aggregate: Aggregate) -> LogicalPlanNode:
+        """Push ORDER BY through aggregate when keys align with aggregate output."""
+        sort_cols = self._extract_sort_columns(sort)
+        output_cols = set(aggregate.output_names)
+        if not sort_cols.issubset(output_cols):
+            return sort
+
+        pushed_child = self._push_order_by(aggregate.input)
+        new_agg = Aggregate(
+            input=pushed_child,
+            group_by=aggregate.group_by,
+            aggregates=aggregate.aggregates,
+            output_names=aggregate.output_names,
+        )
+        return Sort(
+            input=new_agg,
+            sort_keys=sort.sort_keys,
+            ascending=sort.ascending,
+            nulls_order=sort.nulls_order,
+        )
+
     def _get_available_columns(self, plan: LogicalPlanNode) -> set:
         """Get all column names available from a plan node."""
         if isinstance(plan, Scan):
-            return set(plan.columns)
+            columns = set()
+            table_ref = plan.alias if plan.alias else plan.table_name
+            for col in plan.columns:
+                columns.add(col)
+                columns.add(f"{table_ref}.{col}")
+            return columns
 
         if isinstance(plan, Project):
-            alias_set = set(plan.aliases)
-            if "*" in alias_set:
+            columns = set()
+            for alias in plan.aliases:
+                columns.add(alias)
+
+            if "*" in columns:
                 return self._get_available_columns(plan.input)
-            return alias_set
+
+            index = 0
+            for expr in plan.expressions:
+                from ..plan.expressions import ColumnRef
+
+                if isinstance(expr, ColumnRef):
+                    if expr.table:
+                        columns.add(f"{expr.table}.{expr.column}")
+                    columns.add(expr.column)
+                index += 1
+
+            return columns
 
         if isinstance(plan, Filter):
             return self._get_available_columns(plan.input)
@@ -1027,9 +1135,20 @@ class OrderByPushdownRule(OptimizationRule):
         columns = set()
         for key in sort.sort_keys:
             if isinstance(key, ColumnRef):
+                if key.table:
+                    columns.add(f"{key.table}.{key.column}")
                 columns.add(key.column)
 
         return columns
+
+    def _sort_is_pushable(self, sort: Sort) -> bool:
+        """Only push sorts composed of simple column references."""
+        from ..plan.expressions import ColumnRef
+
+        for key in sort.sort_keys:
+            if not isinstance(key, ColumnRef):
+                return False
+        return True
 
     def _recurse_node(self, plan: LogicalPlanNode) -> LogicalPlanNode:
         """Recurse into node children."""
