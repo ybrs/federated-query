@@ -234,6 +234,9 @@ class PredicatePushdownRule(OptimizationRule):
                 output_names=scan.output_names,
                 limit=scan.limit,
                 offset=scan.offset,
+                order_by_keys=scan.order_by_keys,
+                order_by_ascending=scan.order_by_ascending,
+                order_by_nulls=scan.order_by_nulls,
             )
 
         return Scan(
@@ -248,6 +251,9 @@ class PredicatePushdownRule(OptimizationRule):
             output_names=scan.output_names,
             limit=scan.limit,
             offset=scan.offset,
+            order_by_keys=scan.order_by_keys,
+            order_by_ascending=scan.order_by_ascending,
+            order_by_nulls=scan.order_by_nulls,
         )
 
     def _predicate_matches_side(
@@ -662,6 +668,9 @@ class ProjectionPushdownRule(OptimizationRule):
                 output_names=scan.output_names,
                 limit=scan.limit,
                 offset=scan.offset,
+                order_by_keys=scan.order_by_keys,
+                order_by_ascending=scan.order_by_ascending,
+                order_by_nulls=scan.order_by_nulls,
             )
 
         return scan
@@ -699,165 +708,153 @@ class LimitPushdownRule(OptimizationRule):
         Returns:
             Transformed plan with pushed-down limits
         """
-        return self._push_limit(plan)
+        return self._rewrite_plan(plan)
 
-    def _push_limit(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Recursively push limits down and visit all nodes.
-
-        Only pushes through projections (safe).
-        For other nodes, recurses into children but doesn't push limits through.
-        """
-        if isinstance(plan, Limit):
-            return self._try_push_limit(plan)
-
-        if isinstance(plan, Project):
-            return self._recurse_project(plan)
-
-        # For all other node types, recurse into children
-        return self._recurse_children(plan)
-
-    def _recurse_project(self, plan: Project) -> LogicalPlanNode:
-        """Recurse into project node."""
-        new_input = self._push_limit(plan.input)
-        if new_input != plan.input:
-            return Project(new_input, plan.expressions, plan.aliases)
-        return plan
-
-    def _recurse_children(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Recurse into children of node without pushing limits through."""
-        from ..plan.logical import Filter, Join, Aggregate, Sort, Union, Explain
-
-        if isinstance(plan, (Filter, Aggregate, Sort)):
-            return self._recurse_unary_node(plan)
-
-        if isinstance(plan, (Join, Union)):
-            return self._recurse_binary_node(plan)
-
-        if isinstance(plan, Explain):
-            return self._recurse_explain(plan)
-
-        # Scan or other leaf node - return as-is
-        return plan
-
-    def _recurse_unary_node(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Recurse into unary node (Filter, Aggregate, Sort)."""
-        from ..plan.logical import Filter, Aggregate, Sort
-
-        new_input = self._push_limit(plan.input)
-        if new_input == plan.input:
+    def _rewrite_plan(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Recursively rewrite plan, pushing limits when safe."""
+        handler = self._get_rewrite_handler(plan)
+        if handler is None:
             return plan
+        return handler(plan)
 
-        if isinstance(plan, Filter):
-            return Filter(new_input, plan.predicate)
+    def _get_rewrite_handler(self, plan: LogicalPlanNode):
+        """Return rewrite handler for plan type."""
+        handlers = {
+            Limit: self._push_limit_node,
+            Project: self._rewrite_project,
+            Filter: self._rewrite_filter,
+            Sort: self._rewrite_sort,
+            Aggregate: self._rewrite_aggregate,
+            Join: self._rewrite_join,
+            Union: self._rewrite_union,
+            Explain: self._rewrite_explain,
+        }
+        return handlers.get(type(plan))
 
-        if isinstance(plan, Aggregate):
-            return self._rebuild_aggregate(plan, new_input)
+    def _rewrite_project(self, project: Project) -> LogicalPlanNode:
+        """Rewrite project child."""
+        new_input = self._rewrite_plan(project.input)
+        if new_input != project.input:
+            return Project(new_input, project.expressions, project.aliases)
+        return project
 
-        if isinstance(plan, Sort):
-            return Sort(new_input, plan.sort_keys, plan.sort_directions)
+    def _rewrite_filter(self, filter_node: Filter) -> LogicalPlanNode:
+        """Rewrite filter child."""
+        new_input = self._rewrite_plan(filter_node.input)
+        if new_input != filter_node.input:
+            return Filter(new_input, filter_node.predicate)
+        return filter_node
 
-        return plan
+    def _rewrite_sort(self, sort: Sort) -> LogicalPlanNode:
+        """Rewrite sort child."""
+        new_input = self._rewrite_plan(sort.input)
+        if new_input != sort.input:
+            return Sort(new_input, sort.sort_keys, sort.ascending, sort.nulls_order)
+        return sort
 
-    def _rebuild_aggregate(
-        self,
-        plan: Aggregate,
-        new_input: LogicalPlanNode
-    ) -> Aggregate:
-        """Rebuild aggregate with new input."""
-        return Aggregate(
-            input=new_input,
-            group_by=plan.group_by,
-            aggregates=plan.aggregates,
-            output_names=plan.output_names
+    def _rewrite_aggregate(self, aggregate: Aggregate) -> LogicalPlanNode:
+        """Rewrite aggregate child."""
+        new_input = self._rewrite_plan(aggregate.input)
+        if new_input != aggregate.input:
+            return Aggregate(
+                input=new_input,
+                group_by=aggregate.group_by,
+                aggregates=aggregate.aggregates,
+                output_names=aggregate.output_names
+            )
+        return aggregate
+
+    def _rewrite_join(self, join: Join) -> LogicalPlanNode:
+        """Rewrite join children."""
+        new_left = self._rewrite_plan(join.left)
+        new_right = self._rewrite_plan(join.right)
+        if new_left != join.left or new_right != join.right:
+            return Join(new_left, new_right, join.join_type, join.condition)
+        return join
+
+    def _rewrite_union(self, union: Union) -> LogicalPlanNode:
+        """Rewrite union inputs."""
+        new_inputs = []
+        changed = False
+        for child in union.inputs:
+            rewritten = self._rewrite_plan(child)
+            new_inputs.append(rewritten)
+            if rewritten != child:
+                changed = True
+        if changed:
+            return Union(new_inputs, union.distinct)
+        return union
+
+    def _rewrite_explain(self, explain: Explain) -> LogicalPlanNode:
+        """Rewrite explain child."""
+        new_input = self._rewrite_plan(explain.input)
+        if new_input != explain.input:
+            return Explain(new_input, explain.format)
+        return explain
+
+    def _push_limit_node(self, limit: Limit) -> LogicalPlanNode:
+        """Push a single Limit node downward when safe."""
+        input_node = self._rewrite_plan(limit.input)
+
+        if isinstance(input_node, Project):
+            return self._push_through_project(limit, input_node)
+
+        if isinstance(input_node, Sort):
+            return self._push_limit_with_sort(limit, input_node)
+
+        if isinstance(input_node, Scan):
+            scan_with_limit = self._apply_limit_metadata(input_node, limit.limit, limit.offset)
+            return Limit(scan_with_limit, limit.limit, limit.offset)
+
+        return Limit(input_node, limit.limit, limit.offset)
+
+    def _push_through_project(self, limit: Limit, project: Project) -> LogicalPlanNode:
+        """Move limit below project."""
+        pushed_child = self._apply_limit_metadata(project.input, limit.limit, limit.offset)
+        limited = Limit(pushed_child, limit.limit, limit.offset)
+        return Project(limited, project.expressions, project.aliases)
+
+    def _push_limit_with_sort(self, limit: Limit, sort: Sort) -> LogicalPlanNode:
+        """Move limit below sort and attach metadata to scan when possible."""
+        sorted_input = self._rewrite_plan(sort.input)
+
+        if isinstance(sorted_input, Scan):
+            new_scan = Scan(
+                datasource=sorted_input.datasource,
+                schema_name=sorted_input.schema_name,
+                table_name=sorted_input.table_name,
+                columns=sorted_input.columns,
+                filters=sorted_input.filters,
+                alias=sorted_input.alias,
+                group_by=sorted_input.group_by,
+                aggregates=sorted_input.aggregates,
+                output_names=sorted_input.output_names,
+                order_by_keys=sort.sort_keys,
+                order_by_ascending=sort.ascending,
+                order_by_nulls=sort.nulls_order,
+                limit=limit.limit,
+                offset=limit.offset,
+            )
+            return Limit(new_scan, limit.limit, limit.offset)
+
+        new_sort = Sort(
+            input=sorted_input,
+            sort_keys=sort.sort_keys,
+            ascending=sort.ascending,
+            nulls_order=sort.nulls_order,
         )
+        return Limit(new_sort, limit.limit, limit.offset)
 
-    def _recurse_binary_node(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Recurse into binary node (Join, Union)."""
-        from ..plan.logical import Join, Union
-
-        new_left = self._push_limit(plan.left)
-        new_right = self._push_limit(plan.right)
-
-        if new_left == plan.left and new_right == plan.right:
-            return plan
-
-        if isinstance(plan, Join):
-            return self._rebuild_join(plan, new_left, new_right)
-
-        if isinstance(plan, Union):
-            return Union(new_left, new_right)
-
-        return plan
-
-    def _rebuild_join(
+    def _apply_limit_metadata(
         self,
-        plan: Join,
-        new_left: LogicalPlanNode,
-        new_right: LogicalPlanNode
-    ) -> Join:
-        """Rebuild join with new children."""
-        return Join(
-            left=new_left,
-            right=new_right,
-            join_type=plan.join_type,
-            condition=plan.condition
-        )
-
-    def _recurse_explain(self, plan) -> LogicalPlanNode:
-        """Recurse into explain node."""
-        from ..plan.logical import Explain
-
-        new_input = self._push_limit(plan.input)
-        if new_input != plan.input:
-            return Explain(new_input, plan.format)
-        return plan
-
-    def _try_push_limit(self, limit: Limit) -> LogicalPlanNode:
-        """Try to push limit through input.
-
-        Pushes through projections and filters until reaching scans.
-        """
-        pushed = self._push_limit_into_plan(limit.input, limit.limit, limit.offset)
-        if pushed is None:
-            new_input = self._push_limit(limit.input)
-            if new_input != limit.input:
-                return Limit(new_input, limit.limit, limit.offset)
-            return limit
-        return pushed
-
-    def _push_limit_into_plan(
-        self,
-        plan: LogicalPlanNode,
+        node: LogicalPlanNode,
         limit_value: int,
         offset_value: int
-    ) -> Optional[LogicalPlanNode]:
-        """Push limit into plan if possible."""
-        from ..plan.logical import Project, Filter, Scan
-
-        if isinstance(plan, Project):
-            new_child = self._push_limit_into_plan(
-                plan.input,
-                limit_value,
-                offset_value,
-            )
-            if new_child is None:
-                return None
-            return Project(new_child, plan.expressions, plan.aliases)
-
-        if isinstance(plan, Filter):
-            new_child = self._push_limit_into_plan(
-                plan.input,
-                limit_value,
-                offset_value,
-            )
-            if new_child is None:
-                return None
-            return Filter(new_child, plan.predicate)
-
-        if isinstance(plan, Scan):
-            return self._apply_limit_to_scan(plan, limit_value, offset_value)
-
-        return None
+    ) -> LogicalPlanNode:
+        """Attach limit/offset metadata to scan while keeping plan shape."""
+        if isinstance(node, Scan):
+            return self._apply_limit_to_scan(node, limit_value, offset_value)
+        return node
 
     def _apply_limit_to_scan(
         self,
@@ -865,17 +862,15 @@ class LimitPushdownRule(OptimizationRule):
         limit_value: int,
         offset_value: int
     ) -> Scan:
-        """Return new scan with limit and offset applied."""
+        """Return new scan with updated limit metadata."""
         effective_limit = limit_value
         effective_offset = offset_value
 
-        if scan.limit is not None:
-            if scan.limit < effective_limit:
-                effective_limit = scan.limit
-            effective_offset += scan.offset
-        else:
-            if scan.offset:
-                effective_offset = scan.offset + offset_value
+        if scan.limit is not None and scan.limit < effective_limit:
+            effective_limit = scan.limit
+            effective_offset = scan.offset + offset_value
+        elif scan.offset:
+            effective_offset = scan.offset + offset_value
 
         return Scan(
             datasource=scan.datasource,
@@ -889,6 +884,9 @@ class LimitPushdownRule(OptimizationRule):
             output_names=scan.output_names,
             limit=effective_limit,
             offset=effective_offset,
+            order_by_keys=scan.order_by_keys,
+            order_by_ascending=scan.order_by_ascending,
+            order_by_nulls=scan.order_by_nulls,
         )
 
     def name(self) -> str:
@@ -905,6 +903,351 @@ class JoinReorderingRule(OptimizationRule):
 
     def name(self) -> str:
         return "JoinReordering"
+
+
+class OrderByPushdownRule(OptimizationRule):
+    """Push ORDER BY clauses to data sources when safe.
+
+    Transforms:
+        Sort(Project?(Filter?(Scan))) → Project?(Filter?(Scan(with order by)))
+
+    This pushes ORDER BY to the data source for execution.
+    ORDER BY pushdown is mandatory for correctness in many use cases:
+    - Cursor processing over timeseries data
+    - Streaming results in deterministic order
+    - Sequential data processing
+    """
+
+    def apply(self, plan: LogicalPlanNode) -> Optional[LogicalPlanNode]:
+        """Apply ORDER BY pushdown optimization."""
+        return self._push_order_by(plan)
+
+    def _push_order_by(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Recursively push ORDER BY down the plan tree."""
+        if isinstance(plan, Sort):
+            return self._try_push_sort(plan)
+
+        return self._recurse_node(plan)
+
+    def _try_push_sort(self, sort: Sort) -> LogicalPlanNode:
+        """Try to push sort into its input."""
+        if not self._sort_is_pushable(sort):
+            return sort
+
+        input_node = sort.input
+
+        if isinstance(input_node, Project):
+            return self._push_through_project(sort, input_node)
+
+        if isinstance(input_node, Filter):
+            return self._push_through_filter(sort, input_node)
+
+        if isinstance(input_node, Join):
+            return self._push_through_join(sort, input_node)
+
+        if isinstance(input_node, Aggregate):
+            return self._push_through_aggregate(sort, input_node)
+
+        if isinstance(input_node, Union):
+            return self._push_through_union(sort, input_node)
+
+        if isinstance(input_node, Scan):
+            return self._push_to_scan(sort, input_node)
+
+        return sort
+
+    def _push_to_scan(self, sort: Sort, scan: Scan) -> Scan:
+        """Push ORDER BY into scan node."""
+        return Scan(
+            datasource=scan.datasource,
+            schema_name=scan.schema_name,
+            table_name=scan.table_name,
+            columns=scan.columns,
+            filters=scan.filters,
+            alias=scan.alias,
+            group_by=scan.group_by,
+            aggregates=scan.aggregates,
+            output_names=scan.output_names,
+            limit=scan.limit,
+            offset=scan.offset,
+            order_by_keys=sort.sort_keys,
+            order_by_ascending=sort.ascending,
+            order_by_nulls=sort.nulls_order,
+        )
+
+    def _push_through_project(self, sort: Sort, project: Project) -> LogicalPlanNode:
+        """Push ORDER BY through projection if all sort columns available."""
+        input_cols = self._get_available_columns(project.input)
+        sort_cols = self._extract_sort_columns(sort)
+
+        can_push = False
+        if "*" in input_cols:
+            can_push = True
+        else:
+            all_present = True
+            for col in sort_cols:
+                if col not in input_cols:
+                    all_present = False
+                    break
+            can_push = all_present
+
+        if not can_push:
+            return sort
+
+        if isinstance(project.input, Scan):
+            pushed_scan = self._push_to_scan(sort, project.input)
+            return Project(pushed_scan, project.expressions, project.aliases)
+
+        new_input = self._push_order_by(project.input)
+        if isinstance(new_input, Scan) and new_input.order_by_keys:
+            return Project(new_input, project.expressions, project.aliases)
+
+        return sort
+
+    def _push_through_filter(self, sort: Sort, filter_node: Filter) -> LogicalPlanNode:
+        """Push ORDER BY through filter (always safe)."""
+        if isinstance(filter_node.input, Scan):
+            pushed_scan = self._push_to_scan(sort, filter_node.input)
+            return Filter(pushed_scan, filter_node.predicate)
+
+        new_input = self._push_order_by(filter_node.input)
+        if isinstance(new_input, Scan) and new_input.order_by_keys:
+            return Filter(new_input, filter_node.predicate)
+
+        return sort
+
+    def _push_through_join(self, sort: Sort, join: Join) -> LogicalPlanNode:
+        """Push ORDER BY metadata into a single join side when safe."""
+        sort_cols = self._extract_sort_columns(sort)
+        left_cols = self._get_available_columns(join.left)
+        right_cols = self._get_available_columns(join.right)
+
+        left_only = self._columns_match_side(sort_cols, left_cols, right_cols)
+        right_only = self._columns_match_side(sort_cols, right_cols, left_cols)
+
+        new_left = self._push_sort_into_child(sort, join.left) if left_only else join.left
+        new_right = self._push_sort_into_child(sort, join.right) if right_only else join.right
+
+        rebuilt = Join(new_left, new_right, join.join_type, join.condition)
+        return Sort(
+            input=rebuilt,
+            sort_keys=sort.sort_keys,
+            ascending=sort.ascending,
+            nulls_order=sort.nulls_order,
+        )
+
+    def _push_sort_into_child(
+        self,
+        sort: Sort,
+        child: LogicalPlanNode,
+    ) -> LogicalPlanNode:
+        """Push sort keys into a specific child and return transformed child."""
+        injected = Sort(
+            input=child,
+            sort_keys=sort.sort_keys,
+            ascending=sort.ascending,
+            nulls_order=sort.nulls_order,
+        )
+        pushed = self._push_order_by(injected)
+        if isinstance(pushed, Sort):
+            return pushed.input
+        return pushed
+
+    def _columns_match_side(
+        self,
+        sort_cols: set,
+        side_cols: set,
+        other_cols: set,
+    ) -> bool:
+        """Check if sort columns belong exclusively to one join side."""
+        for col in sort_cols:
+            if col in side_cols:
+                continue
+
+            bare = col.split(".")[-1]
+            side_has = any(entry.endswith(f".{bare}") or entry == bare for entry in side_cols)
+            other_has = any(entry.endswith(f".{bare}") or entry == bare for entry in other_cols)
+
+            if side_has and not other_has:
+                continue
+
+            return False
+
+        return True
+
+    def _push_through_aggregate(self, sort: Sort, aggregate: Aggregate) -> LogicalPlanNode:
+        """Push ORDER BY through aggregate when keys align with aggregate output."""
+        sort_cols = self._extract_sort_columns(sort)
+        output_cols = set(aggregate.output_names)
+        if not sort_cols.issubset(output_cols):
+            return sort
+
+        group_cols = self._extract_group_columns(aggregate.group_by)
+        if not sort_cols.issubset(group_cols):
+            return sort
+
+        pushed_child = self._push_sort_into_child(sort, aggregate.input)
+        new_agg = Aggregate(
+            input=pushed_child,
+            group_by=aggregate.group_by,
+            aggregates=aggregate.aggregates,
+            output_names=aggregate.output_names,
+        )
+        return Sort(
+            input=new_agg,
+            sort_keys=sort.sort_keys,
+            ascending=sort.ascending,
+            nulls_order=sort.nulls_order,
+        )
+
+    def _extract_group_columns(self, group_by: List[Expression]) -> set:
+        """Extract column names from group by expressions."""
+        from ..plan.expressions import ColumnRef
+
+        columns = set()
+        for expr in group_by:
+            if isinstance(expr, ColumnRef):
+                if expr.table:
+                    columns.add(f"{expr.table}.{expr.column}")
+                columns.add(expr.column)
+        return columns
+
+    def _push_through_union(self, sort: Sort, union: Union) -> LogicalPlanNode:
+        """Propagate sort metadata into union inputs while keeping top sort."""
+        new_inputs = []
+        for child in union.inputs:
+            injected = Sort(
+                input=child,
+                sort_keys=sort.sort_keys,
+                ascending=sort.ascending,
+                nulls_order=sort.nulls_order,
+            )
+            pushed_child = self._push_order_by(injected)
+            if isinstance(pushed_child, Sort):
+                new_inputs.append(pushed_child.input)
+            else:
+                new_inputs.append(pushed_child)
+
+        new_union = Union(new_inputs, union.distinct)
+        return Sort(
+            input=new_union,
+            sort_keys=sort.sort_keys,
+            ascending=sort.ascending,
+            nulls_order=sort.nulls_order,
+        )
+
+    def _get_available_columns(self, plan: LogicalPlanNode) -> set:
+        """Get all column names available from a plan node."""
+        if isinstance(plan, Scan):
+            columns = set()
+            table_ref = plan.alias if plan.alias else plan.table_name
+            for col in plan.columns:
+                columns.add(col)
+                columns.add(f"{table_ref}.{col}")
+            return columns
+
+        if isinstance(plan, Project):
+            columns = set()
+            for alias in plan.aliases:
+                columns.add(alias)
+
+            if "*" in columns:
+                return self._get_available_columns(plan.input)
+
+            index = 0
+            for expr in plan.expressions:
+                from ..plan.expressions import ColumnRef
+
+                if isinstance(expr, ColumnRef):
+                    if expr.table:
+                        columns.add(f"{expr.table}.{expr.column}")
+                    columns.add(expr.column)
+                index += 1
+
+            return columns
+
+        if isinstance(plan, Filter):
+            return self._get_available_columns(plan.input)
+
+        return set()
+
+    def _extract_sort_columns(self, sort: Sort) -> set:
+        """Extract column names from sort keys."""
+        from ..plan.expressions import ColumnRef
+
+        columns = set()
+        for key in sort.sort_keys:
+            if isinstance(key, ColumnRef):
+                if key.table:
+                    columns.add(f"{key.table}.{key.column}")
+                columns.add(key.column)
+
+        return columns
+
+    def _sort_is_pushable(self, sort: Sort) -> bool:
+        """Only push sorts composed of simple column references."""
+        from ..plan.expressions import ColumnRef
+
+        for key in sort.sort_keys:
+            if not isinstance(key, ColumnRef):
+                return False
+        return True
+
+    def _recurse_node(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Recurse into node children."""
+        if isinstance(plan, (Project, Filter, Limit)):
+            return self._recurse_unary(plan)
+
+        if isinstance(plan, Join):
+            return self._recurse_join(plan)
+
+        if isinstance(plan, Aggregate):
+            return self._recurse_aggregate(plan)
+
+        return plan
+
+    def _recurse_unary(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Recurse into unary node."""
+        new_input = self._push_order_by(plan.input)
+        if new_input == plan.input:
+            return plan
+
+        if isinstance(plan, Project):
+            return Project(new_input, plan.expressions, plan.aliases)
+
+        if isinstance(plan, Filter):
+            return Filter(new_input, plan.predicate)
+
+        if isinstance(plan, Limit):
+            return Limit(new_input, plan.limit, plan.offset)
+
+        return plan
+
+    def _recurse_join(self, join: Join) -> LogicalPlanNode:
+        """Recurse into join node."""
+        new_left = self._push_order_by(join.left)
+        new_right = self._push_order_by(join.right)
+
+        if new_left == join.left and new_right == join.right:
+            return join
+
+        return Join(new_left, new_right, join.join_type, join.condition)
+
+    def _recurse_aggregate(self, agg: Aggregate) -> LogicalPlanNode:
+        """Recurse into aggregate node."""
+        new_input = self._push_order_by(agg.input)
+        if new_input == agg.input:
+            return agg
+
+        return Aggregate(
+            new_input,
+            agg.group_by,
+            agg.aggregates,
+            agg.output_names
+        )
+
+    def name(self) -> str:
+        return "OrderByPushdown"
 
 
 class AggregatePushdownRule(OptimizationRule):
@@ -963,6 +1306,9 @@ class AggregatePushdownRule(OptimizationRule):
             output_names=agg.output_names,
             limit=scan.limit,
             offset=scan.offset,
+            order_by_keys=scan.order_by_keys,
+            order_by_ascending=scan.order_by_ascending,
+            order_by_nulls=scan.order_by_nulls,
         )
 
     def _merge_filters(
@@ -1063,6 +1409,9 @@ class ExpressionSimplificationRule(OptimizationRule):
                         output_names=plan.output_names,
                         limit=plan.limit,
                         offset=plan.offset,
+                        order_by_keys=plan.order_by_keys,
+                        order_by_ascending=plan.order_by_ascending,
+                        order_by_nulls=plan.order_by_nulls,
                     )
             return plan
 

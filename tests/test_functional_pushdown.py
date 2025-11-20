@@ -20,6 +20,7 @@ from federated_query.optimizer import (
     RuleBasedOptimizer,
     PredicatePushdownRule,
     ProjectionPushdownRule,
+    OrderByPushdownRule,
     LimitPushdownRule,
     ExpressionSimplificationRule,
 )
@@ -32,6 +33,7 @@ def create_optimizer(catalog: Catalog) -> RuleBasedOptimizer:
     optimizer.add_rule(ExpressionSimplificationRule())
     optimizer.add_rule(PredicatePushdownRule())
     optimizer.add_rule(ProjectionPushdownRule())
+    optimizer.add_rule(OrderByPushdownRule())
     optimizer.add_rule(LimitPushdownRule())
     return optimizer
 

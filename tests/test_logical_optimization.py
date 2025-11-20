@@ -4,6 +4,7 @@ import pytest
 from federated_query.optimizer.rules import (
     PredicatePushdownRule,
     ProjectionPushdownRule,
+    OrderByPushdownRule,
     LimitPushdownRule,
     RuleBasedOptimizer,
 )
@@ -15,6 +16,9 @@ from federated_query.plan.logical import (
     Limit,
     Join,
     JoinType,
+    Sort,
+    Aggregate,
+    Union,
 )
 from federated_query.plan.expressions import (
     BinaryOp,
@@ -450,6 +454,162 @@ class TestLimitPushdown:
         assert isinstance(result, Limit)
         assert result.limit == 10
         assert result.offset == 5
+
+
+class TestOrderByPushdown:
+    """Test ORDER BY pushdown optimization."""
+
+    def test_order_by_alias_pushdown(self):
+        """Sort on alias should push to scan."""
+        scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["order_id", "amount"]
+        )
+        project = Project(
+            input=scan,
+            expressions=[ColumnRef(None, "order_id", DataType.INTEGER)],
+            aliases=["oid"]
+        )
+        sort = Sort(
+            input=project,
+            sort_keys=[ColumnRef(None, "order_id", DataType.INTEGER)],
+            ascending=[True],
+            nulls_order=[None],
+        )
+
+        rule = OrderByPushdownRule()
+        result = rule.apply(sort)
+
+        assert isinstance(result, Project)
+        assert isinstance(result.input, Scan)
+        assert result.input.order_by_keys is not None
+        assert result.input.order_by_keys[0].column == "order_id"
+
+    def test_order_by_join_side_pushdown(self):
+        """Sort on one join side should annotate that side but keep top sort."""
+        left = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "cid"]
+        )
+        right = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="customers",
+            columns=["id", "name"]
+        )
+        join = Join(left, right, JoinType.INNER, None)
+        sort = Sort(
+            input=join,
+            sort_keys=[ColumnRef("orders", "id", DataType.INTEGER)],
+            ascending=[True],
+            nulls_order=[None],
+        )
+
+        rule = OrderByPushdownRule()
+        result = rule.apply(sort)
+
+        assert isinstance(result, Sort)
+        assert isinstance(result.input, Join)
+        assert isinstance(result.input.left, Scan)
+        assert result.input.left.order_by_keys is not None
+        assert result.input.left.order_by_keys[0].column == "id"
+        assert result.input.right.order_by_keys is None
+
+    def test_order_by_expression_not_pushed(self):
+        """Non-column sort keys should not be pushed."""
+        scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["amount"]
+        )
+        from federated_query.plan.expressions import BinaryOp, BinaryOpType
+        expr = BinaryOp(
+            op=BinaryOpType.ADD,
+            left=ColumnRef(None, "amount", DataType.INTEGER),
+            right=Literal(1, DataType.INTEGER),
+        )
+        sort = Sort(
+            input=scan,
+            sort_keys=[expr],
+            ascending=[True],
+            nulls_order=[None],
+        )
+
+        rule = OrderByPushdownRule()
+        result = rule.apply(sort)
+
+        assert isinstance(result, Sort)
+        assert isinstance(result.input, Scan)
+        assert result.input.order_by_keys is None
+
+    def test_order_by_group_by_pushdown(self):
+        """Sort on group-by column should annotate scan when aggregate is pushed."""
+        scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["cid", "amount"]
+        )
+        agg = Aggregate(
+            input=scan,
+            group_by=[ColumnRef(None, "cid", DataType.INTEGER)],
+            aggregates=[
+                ColumnRef(None, "cid", DataType.INTEGER),
+            ],
+            output_names=["cid"],
+        )
+        sort = Sort(
+            input=agg,
+            sort_keys=[ColumnRef(None, "cid", DataType.INTEGER)],
+            ascending=[True],
+            nulls_order=[None],
+        )
+
+        rule = OrderByPushdownRule()
+        result = rule.apply(sort)
+
+        assert isinstance(result, Sort)
+        assert isinstance(result.input, Aggregate)
+        assert isinstance(result.input.input, Scan)
+        assert result.input.input.order_by_keys is not None
+        assert result.input.input.order_by_keys[0].column == "cid"
+
+    def test_order_by_union_pushdown(self):
+        """Sort above UNION should propagate metadata into children."""
+        left = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["cid"],
+        )
+        right = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders_backup",
+            columns=["cid"],
+        )
+        union = Union([left, right], distinct=True)
+        sort = Sort(
+            input=union,
+            sort_keys=[ColumnRef(None, "cid", DataType.INTEGER)],
+            ascending=[True],
+            nulls_order=[None],
+        )
+
+        rule = OrderByPushdownRule()
+        result = rule.apply(sort)
+
+        assert isinstance(result, Sort)
+        assert isinstance(result.input, Union)
+        for child in result.input.inputs:
+            assert isinstance(child, Scan)
+            if child.order_by_keys:
+                assert child.order_by_keys[0].column == "cid"
 
 
 class TestRuleBasedOptimizer:

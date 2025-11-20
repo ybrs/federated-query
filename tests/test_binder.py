@@ -27,6 +27,15 @@ def catalog_with_test_data():
     )
     schema.add_table(users_table)
 
+    orders_table = Table(
+        name="orders",
+        columns=[
+            Column(name="order_id", data_type=DataType.INTEGER, nullable=False),
+            Column(name="amount", data_type=DataType.INTEGER, nullable=True),
+        ],
+    )
+    schema.add_table(orders_table)
+
     # Register schema
     catalog.schemas[("testdb", "public")] = schema
 
@@ -169,3 +178,22 @@ def test_bind_complex_where(catalog_with_test_data):
     bound_plan = binder.bind(plan)
 
     assert bound_plan is not None
+
+
+def test_bind_order_by_alias(catalog_with_test_data):
+    """Binder should resolve ORDER BY alias to source column."""
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+
+    sql = "SELECT order_id AS oid FROM testdb.public.orders ORDER BY oid"
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
+    bound_plan = binder.bind(plan)
+
+    from federated_query.plan.logical import Project, Sort
+
+    assert isinstance(bound_plan, Sort)
+    assert isinstance(bound_plan.input, Project)
+    sort_node = bound_plan
+    project = bound_plan.input
+    assert isinstance(sort_node.sort_keys[0], type(project.expressions[0]))
+    assert sort_node.sort_keys[0].column == "order_id"

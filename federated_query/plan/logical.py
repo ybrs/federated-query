@@ -73,6 +73,7 @@ class Scan(LogicalPlanNode):
     - Simple scan: SELECT columns FROM table
     - Scan with filter: SELECT columns FROM table WHERE filter
     - Scan with aggregates: SELECT group_by, agg_funcs FROM table WHERE filter GROUP BY group_by
+    - Scan with order by: SELECT columns FROM table ORDER BY sort_keys
     """
 
     datasource: str
@@ -86,6 +87,9 @@ class Scan(LogicalPlanNode):
     output_names: Optional[List[str]] = None  # Output column names when using aggregates
     limit: Optional[int] = None
     offset: int = 0
+    order_by_keys: Optional[List[Expression]] = None  # ORDER BY expressions
+    order_by_ascending: Optional[List[bool]] = None  # ASC/DESC for each key
+    order_by_nulls: Optional[List[Optional[str]]] = None  # NULLS FIRST/LAST for each key
 
     def children(self) -> List[LogicalPlanNode]:
         return []
@@ -103,6 +107,7 @@ class Scan(LogicalPlanNode):
         return self.columns
 
     def __repr__(self) -> str:
+        """Return string representation of Scan node."""
         table_ref = f"{self.datasource}.{self.schema_name}.{self.table_name}"
         filter_str = f" WHERE {self.filters}" if self.filters else ""
         agg_str = ""
@@ -110,10 +115,13 @@ class Scan(LogicalPlanNode):
             agg_str = f", aggs={len(self.aggregates)}"
         if self.group_by:
             agg_str += f", group_by={len(self.group_by)}"
+        order_str = ""
+        if self.order_by_keys:
+            order_str = f", order_by={len(self.order_by_keys)} keys"
         limit_str = ""
         if self.limit is not None:
             limit_str = f", limit={self.limit}, offset={self.offset}"
-        return f"Scan({table_ref}, cols={len(self.columns)}{filter_str}{agg_str}{limit_str})"
+        return f"Scan({table_ref}, cols={len(self.columns)}{filter_str}{agg_str}{order_str}{limit_str})"
 
 
 @dataclass(frozen=True)
@@ -225,13 +233,14 @@ class Sort(LogicalPlanNode):
     input: LogicalPlanNode
     sort_keys: List[Expression]
     ascending: List[bool]  # One per sort key
+    nulls_order: Optional[List[Optional[str]]] = None  # NULLS FIRST/LAST for each key
 
     def children(self) -> List[LogicalPlanNode]:
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Sort":
         assert len(children) == 1
-        return Sort(children[0], self.sort_keys, self.ascending)
+        return Sort(children[0], self.sort_keys, self.ascending, self.nulls_order)
 
     def accept(self, visitor):
         return visitor.visit_sort(self)

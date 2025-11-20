@@ -54,6 +54,7 @@ class PhysicalScan(PhysicalPlanNode):
     - Simple scan: SELECT columns FROM table
     - Scan with filter: SELECT columns FROM table WHERE filter
     - Scan with aggregates: SELECT group_by, agg_funcs FROM table WHERE filter GROUP BY group_by
+    - Scan with order by: SELECT columns FROM table ORDER BY sort_keys
     """
 
     datasource: str
@@ -69,6 +70,9 @@ class PhysicalScan(PhysicalPlanNode):
     alias: Optional[str] = None  # Table alias (if any)
     limit: Optional[int] = None
     offset: int = 0
+    order_by_keys: Optional[List[Expression]] = None  # ORDER BY expressions
+    order_by_ascending: Optional[List[bool]] = None  # ASC/DESC for each key
+    order_by_nulls: Optional[List[Optional[str]]] = None  # NULLS FIRST/LAST for each key
 
     def children(self) -> List[PhysicalPlanNode]:
         return []
@@ -99,6 +103,10 @@ class PhysicalScan(PhysicalPlanNode):
         if self.group_by:
             group_clause = self._format_group_by()
             query = f"{query} GROUP BY {group_clause}"
+
+        if self.order_by_keys:
+            order_clause = self._format_order_by()
+            query = f"{query} ORDER BY {order_clause}"
 
         if self.limit is not None:
             query = f"{query} LIMIT {self.limit}"
@@ -149,6 +157,29 @@ class PhysicalScan(PhysicalPlanNode):
             group_items.append(expr.to_sql())
 
         return ", ".join(group_items)
+
+    def _format_order_by(self) -> str:
+        """Format ORDER BY clause for SQL."""
+        if not self.order_by_keys:
+            return ""
+
+        items = []
+        for i in range(len(self.order_by_keys)):
+            expr = self.order_by_keys[i]
+            item = expr.to_sql()
+
+            if self.order_by_ascending and i < len(self.order_by_ascending):
+                if not self.order_by_ascending[i]:
+                    item = f"{item} DESC"
+
+            if self.order_by_nulls and i < len(self.order_by_nulls):
+                nulls_spec = self.order_by_nulls[i]
+                if nulls_spec:
+                    item = f"{item} NULLS {nulls_spec}"
+
+            items.append(item)
+
+        return ", ".join(items)
 
     def schema(self) -> pa.Schema:
         """Get output schema."""
@@ -1485,8 +1516,36 @@ class PhysicalSort(PhysicalPlanNode):
         return [self.input]
 
     def execute(self) -> Iterator[pa.RecordBatch]:
-        """Execute sort."""
-        raise NotImplementedError("Execute not yet implemented")
+        """Execute sort by materializing input and sorting."""
+        batches = []
+        for batch in self.input.execute():
+            batches.append(batch)
+
+        if not batches:
+            return
+
+        table = pa.Table.from_batches(batches)
+
+        sort_keys = []
+        for i in range(len(self.sort_keys)):
+            col_name = self._extract_column_name(self.sort_keys[i])
+            order = "ascending" if self.ascending[i] else "descending"
+            sort_keys.append((col_name, order))
+
+        indices = pa.compute.sort_indices(table, sort_keys=sort_keys)
+        sorted_table = table.take(indices)
+
+        for batch in sorted_table.to_batches():
+            yield batch
+
+    def _extract_column_name(self, expr: Expression) -> str:
+        """Extract column name from expression."""
+        from .expressions import ColumnRef
+        if isinstance(expr, ColumnRef):
+            return expr.column
+        raise NotImplementedError(
+            f"ORDER BY on complex expressions not yet supported: {expr}"
+        )
 
     def schema(self) -> pa.Schema:
         return self.input.schema()

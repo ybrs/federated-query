@@ -7,6 +7,7 @@ from .rules import (
     PredicatePushdownRule,
     ProjectionPushdownRule,
     AggregatePushdownRule,
+    OrderByPushdownRule,
     LimitPushdownRule,
     JoinReorderingRule,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "PredicatePushdownRule",
     "ProjectionPushdownRule",
     "AggregatePushdownRule",
+    "OrderByPushdownRule",
     "LimitPushdownRule",
     "JoinReorderingRule",
     "CostModel",

@@ -12,6 +12,7 @@ from ..plan.logical import (
     Join,
     Aggregate,
     Explain,
+    Sort,
     JoinType,
 )
 from ..plan.physical import (
@@ -25,6 +26,7 @@ from ..plan.physical import (
     PhysicalNestedLoopJoin,
     PhysicalHashAggregate,
     PhysicalExplain,
+    PhysicalSort,
 )
 from ..plan.expressions import BinaryOp, BinaryOpType, ColumnRef
 from typing import List, Tuple
@@ -70,6 +72,8 @@ class PhysicalPlanner:
             return self._plan_project(node)
         if isinstance(node, Limit):
             return self._plan_limit(node)
+        if isinstance(node, Sort):
+            return self._plan_sort(node)
         if isinstance(node, Join):
             return self._plan_join(node)
         if isinstance(node, Aggregate):
@@ -98,6 +102,9 @@ class PhysicalPlanner:
             alias=scan.alias,
             limit=scan.limit,
             offset=scan.offset,
+            order_by_keys=scan.order_by_keys,
+            order_by_ascending=scan.order_by_ascending,
+            order_by_nulls=scan.order_by_nulls,
         )
 
     def _plan_filter(self, filter_node: Filter) -> PhysicalFilter:
@@ -119,6 +126,23 @@ class PhysicalPlanner:
         input_plan = self._plan_node(limit.input)
         return PhysicalLimit(
             input=input_plan, limit=limit.limit, offset=limit.offset
+        )
+
+    def _plan_sort(self, sort: Sort) -> PhysicalPlanNode:
+        """Plan a sort node."""
+        input_plan = self._plan_node(sort.input)
+
+        if isinstance(input_plan, PhysicalScan):
+            datasource = input_plan.datasource_connection
+            if datasource and datasource.supports_capability(
+                DataSourceCapability.ORDER_BY
+            ):
+                return input_plan
+
+        return PhysicalSort(
+            input=input_plan,
+            sort_keys=sort.sort_keys,
+            ascending=sort.ascending,
         )
 
     def _plan_aggregate(self, aggregate: Aggregate) -> PhysicalPlanNode:
