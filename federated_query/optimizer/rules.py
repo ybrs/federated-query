@@ -708,253 +708,153 @@ class LimitPushdownRule(OptimizationRule):
         Returns:
             Transformed plan with pushed-down limits
         """
-        return self._push_limit(plan)
+        return self._rewrite_plan(plan)
 
-    def _push_limit(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Recursively push limits down and visit all nodes.
-
-        Only pushes through projections (safe).
-        For other nodes, recurses into children but doesn't push limits through.
-        """
-        if isinstance(plan, Limit):
-            return self._try_push_limit(plan)
-
-        if isinstance(plan, Project):
-            return self._recurse_project(plan)
-
-        # For all other node types, recurse into children
-        return self._recurse_children(plan)
-
-    def _recurse_project(self, plan: Project) -> LogicalPlanNode:
-        """Recurse into project node."""
-        new_input = self._push_limit(plan.input)
-        if new_input != plan.input:
-            return Project(new_input, plan.expressions, plan.aliases)
-        return plan
-
-    def _recurse_children(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Recurse into children of node without pushing limits through."""
-        from ..plan.logical import Filter, Join, Aggregate, Sort, Union, Explain
-
-        if isinstance(plan, (Filter, Aggregate, Sort)):
-            return self._recurse_unary_node(plan)
-
-        if isinstance(plan, (Join, Union)):
-            return self._recurse_binary_node(plan)
-
-        if isinstance(plan, Explain):
-            return self._recurse_explain(plan)
-
-        # Scan or other leaf node - return as-is
-        return plan
-
-    def _recurse_unary_node(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Recurse into unary node (Filter, Aggregate, Sort)."""
-        from ..plan.logical import Filter, Aggregate, Sort
-
-        new_input = self._push_limit(plan.input)
-        if new_input == plan.input:
+    def _rewrite_plan(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Recursively rewrite plan, pushing limits when safe."""
+        handler = self._get_rewrite_handler(plan)
+        if handler is None:
             return plan
+        return handler(plan)
 
-        if isinstance(plan, Filter):
-            return Filter(new_input, plan.predicate)
+    def _get_rewrite_handler(self, plan: LogicalPlanNode):
+        """Return rewrite handler for plan type."""
+        handlers = {
+            Limit: self._push_limit_node,
+            Project: self._rewrite_project,
+            Filter: self._rewrite_filter,
+            Sort: self._rewrite_sort,
+            Aggregate: self._rewrite_aggregate,
+            Join: self._rewrite_join,
+            Union: self._rewrite_union,
+            Explain: self._rewrite_explain,
+        }
+        return handlers.get(type(plan))
 
-        if isinstance(plan, Aggregate):
-            return self._rebuild_aggregate(plan, new_input)
+    def _rewrite_project(self, project: Project) -> LogicalPlanNode:
+        """Rewrite project child."""
+        new_input = self._rewrite_plan(project.input)
+        if new_input != project.input:
+            return Project(new_input, project.expressions, project.aliases)
+        return project
 
-        if isinstance(plan, Sort):
-            return Sort(new_input, plan.sort_keys, plan.sort_directions)
+    def _rewrite_filter(self, filter_node: Filter) -> LogicalPlanNode:
+        """Rewrite filter child."""
+        new_input = self._rewrite_plan(filter_node.input)
+        if new_input != filter_node.input:
+            return Filter(new_input, filter_node.predicate)
+        return filter_node
 
-        return plan
+    def _rewrite_sort(self, sort: Sort) -> LogicalPlanNode:
+        """Rewrite sort child."""
+        new_input = self._rewrite_plan(sort.input)
+        if new_input != sort.input:
+            return Sort(new_input, sort.sort_keys, sort.ascending, sort.nulls_order)
+        return sort
 
-    def _rebuild_aggregate(
-        self,
-        plan: Aggregate,
-        new_input: LogicalPlanNode
-    ) -> Aggregate:
-        """Rebuild aggregate with new input."""
-        return Aggregate(
-            input=new_input,
-            group_by=plan.group_by,
-            aggregates=plan.aggregates,
-            output_names=plan.output_names
-        )
+    def _rewrite_aggregate(self, aggregate: Aggregate) -> LogicalPlanNode:
+        """Rewrite aggregate child."""
+        new_input = self._rewrite_plan(aggregate.input)
+        if new_input != aggregate.input:
+            return Aggregate(
+                input=new_input,
+                group_by=aggregate.group_by,
+                aggregates=aggregate.aggregates,
+                output_names=aggregate.output_names
+            )
+        return aggregate
 
-    def _recurse_binary_node(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Recurse into binary node (Join, Union)."""
-        from ..plan.logical import Join, Union
+    def _rewrite_join(self, join: Join) -> LogicalPlanNode:
+        """Rewrite join children."""
+        new_left = self._rewrite_plan(join.left)
+        new_right = self._rewrite_plan(join.right)
+        if new_left != join.left or new_right != join.right:
+            return Join(new_left, new_right, join.join_type, join.condition)
+        return join
 
-        new_left = self._push_limit(plan.left)
-        new_right = self._push_limit(plan.right)
+    def _rewrite_union(self, union: Union) -> LogicalPlanNode:
+        """Rewrite union inputs."""
+        new_inputs = []
+        changed = False
+        for child in union.inputs:
+            rewritten = self._rewrite_plan(child)
+            new_inputs.append(rewritten)
+            if rewritten != child:
+                changed = True
+        if changed:
+            return Union(new_inputs, union.distinct)
+        return union
 
-        if new_left == plan.left and new_right == plan.right:
-            return plan
+    def _rewrite_explain(self, explain: Explain) -> LogicalPlanNode:
+        """Rewrite explain child."""
+        new_input = self._rewrite_plan(explain.input)
+        if new_input != explain.input:
+            return Explain(new_input, explain.format)
+        return explain
 
-        if isinstance(plan, Join):
-            return self._rebuild_join(plan, new_left, new_right)
+    def _push_limit_node(self, limit: Limit) -> LogicalPlanNode:
+        """Push a single Limit node downward when safe."""
+        input_node = self._rewrite_plan(limit.input)
 
-        if isinstance(plan, Union):
-            return Union(new_left, new_right)
+        if isinstance(input_node, Project):
+            return self._push_through_project(limit, input_node)
 
-        return plan
+        if isinstance(input_node, Sort):
+            return self._push_limit_with_sort(limit, input_node)
 
-    def _rebuild_join(
-        self,
-        plan: Join,
-        new_left: LogicalPlanNode,
-        new_right: LogicalPlanNode
-    ) -> Join:
-        """Rebuild join with new children."""
-        return Join(
-            left=new_left,
-            right=new_right,
-            join_type=plan.join_type,
-            condition=plan.condition
-        )
+        if isinstance(input_node, Scan):
+            scan_with_limit = self._apply_limit_metadata(input_node, limit.limit, limit.offset)
+            return Limit(scan_with_limit, limit.limit, limit.offset)
 
-    def _recurse_explain(self, plan) -> LogicalPlanNode:
-        """Recurse into explain node."""
-        from ..plan.logical import Explain
+        return Limit(input_node, limit.limit, limit.offset)
 
-        new_input = self._push_limit(plan.input)
-        if new_input != plan.input:
-            return Explain(new_input, plan.format)
-        return plan
-
-    def _try_push_limit(self, limit: Limit) -> LogicalPlanNode:
-        """Try to push limit through input.
-
-        Special handling for Limit(Sort(...)): push both together to scan.
-        This is the most critical optimization for pagination queries.
-        """
-        if isinstance(limit.input, Sort):
-            return self._push_limit_with_sort(limit, limit.input)
-
-        pushed = self._push_limit_into_plan(limit.input, limit.limit, limit.offset)
-        if pushed is None:
-            new_input = self._push_limit(limit.input)
-            if new_input != limit.input:
-                return Limit(new_input, limit.limit, limit.offset)
-            return limit
-        return pushed
+    def _push_through_project(self, limit: Limit, project: Project) -> LogicalPlanNode:
+        """Move limit below project."""
+        pushed_child = self._apply_limit_metadata(project.input, limit.limit, limit.offset)
+        limited = Limit(pushed_child, limit.limit, limit.offset)
+        return Project(limited, project.expressions, project.aliases)
 
     def _push_limit_with_sort(self, limit: Limit, sort: Sort) -> LogicalPlanNode:
-        """Push LIMIT and ORDER BY together to scan.
+        """Move limit below sort and attach metadata to scan when possible."""
+        sorted_input = self._rewrite_plan(sort.input)
 
-        This is critical for pagination: SELECT * FROM t ORDER BY col LIMIT 10
-        transforms to Scan(t, order_by=col, limit=10) instead of fetching all rows.
-        """
-        sort_input = sort.input
-
-        if isinstance(sort_input, Scan):
-            return Scan(
-                datasource=sort_input.datasource,
-                schema_name=sort_input.schema_name,
-                table_name=sort_input.table_name,
-                columns=sort_input.columns,
-                filters=sort_input.filters,
-                alias=sort_input.alias,
-                group_by=sort_input.group_by,
-                aggregates=sort_input.aggregates,
-                output_names=sort_input.output_names,
-                order_by_keys=sort.sort_keys,
-                order_by_ascending=sort.ascending,
-                order_by_nulls=sort.nulls_order,
-                limit=limit.limit,
-                offset=limit.offset,
-            )
-
-        if isinstance(sort_input, Project):
-            return self._push_limit_sort_through_project(limit, sort, sort_input)
-
-        if isinstance(sort_input, Filter):
-            return self._push_limit_sort_through_filter(limit, sort, sort_input)
-
-        return limit
-
-    def _push_limit_sort_through_project(
-        self, limit: Limit, sort: Sort, project: Project
-    ) -> LogicalPlanNode:
-        """Push LIMIT+ORDER BY through projection."""
-        if isinstance(project.input, Scan):
+        if isinstance(sorted_input, Scan):
             new_scan = Scan(
-                datasource=project.input.datasource,
-                schema_name=project.input.schema_name,
-                table_name=project.input.table_name,
-                columns=project.input.columns,
-                filters=project.input.filters,
-                alias=project.input.alias,
-                group_by=project.input.group_by,
-                aggregates=project.input.aggregates,
-                output_names=project.input.output_names,
+                datasource=sorted_input.datasource,
+                schema_name=sorted_input.schema_name,
+                table_name=sorted_input.table_name,
+                columns=sorted_input.columns,
+                filters=sorted_input.filters,
+                alias=sorted_input.alias,
+                group_by=sorted_input.group_by,
+                aggregates=sorted_input.aggregates,
+                output_names=sorted_input.output_names,
                 order_by_keys=sort.sort_keys,
                 order_by_ascending=sort.ascending,
                 order_by_nulls=sort.nulls_order,
                 limit=limit.limit,
                 offset=limit.offset,
             )
-            return Project(new_scan, project.expressions, project.aliases)
+            return Limit(new_scan, limit.limit, limit.offset)
 
-        return limit
+        new_sort = Sort(
+            input=sorted_input,
+            sort_keys=sort.sort_keys,
+            ascending=sort.ascending,
+            nulls_order=sort.nulls_order,
+        )
+        return Limit(new_sort, limit.limit, limit.offset)
 
-    def _push_limit_sort_through_filter(
-        self, limit: Limit, sort: Sort, filter_node: Filter
-    ) -> LogicalPlanNode:
-        """Push LIMIT+ORDER BY through filter."""
-        if isinstance(filter_node.input, Scan):
-            new_scan = Scan(
-                datasource=filter_node.input.datasource,
-                schema_name=filter_node.input.schema_name,
-                table_name=filter_node.input.table_name,
-                columns=filter_node.input.columns,
-                filters=filter_node.input.filters,
-                alias=filter_node.input.alias,
-                group_by=filter_node.input.group_by,
-                aggregates=filter_node.input.aggregates,
-                output_names=filter_node.input.output_names,
-                order_by_keys=sort.sort_keys,
-                order_by_ascending=sort.ascending,
-                order_by_nulls=sort.nulls_order,
-                limit=limit.limit,
-                offset=limit.offset,
-            )
-            return Filter(new_scan, filter_node.predicate)
-
-        return limit
-
-    def _push_limit_into_plan(
+    def _apply_limit_metadata(
         self,
-        plan: LogicalPlanNode,
+        node: LogicalPlanNode,
         limit_value: int,
         offset_value: int
-    ) -> Optional[LogicalPlanNode]:
-        """Push limit into plan if possible."""
-        from ..plan.logical import Project, Filter, Scan
-
-        if isinstance(plan, Project):
-            new_child = self._push_limit_into_plan(
-                plan.input,
-                limit_value,
-                offset_value,
-            )
-            if new_child is None:
-                return None
-            return Project(new_child, plan.expressions, plan.aliases)
-
-        if isinstance(plan, Filter):
-            new_child = self._push_limit_into_plan(
-                plan.input,
-                limit_value,
-                offset_value,
-            )
-            if new_child is None:
-                return None
-            return Filter(new_child, plan.predicate)
-
-        if isinstance(plan, Scan):
-            return self._apply_limit_to_scan(plan, limit_value, offset_value)
-
-        return None
+    ) -> LogicalPlanNode:
+        """Attach limit/offset metadata to scan while keeping plan shape."""
+        if isinstance(node, Scan):
+            return self._apply_limit_to_scan(node, limit_value, offset_value)
+        return node
 
     def _apply_limit_to_scan(
         self,
@@ -962,17 +862,15 @@ class LimitPushdownRule(OptimizationRule):
         limit_value: int,
         offset_value: int
     ) -> Scan:
-        """Return new scan with limit and offset applied."""
+        """Return new scan with updated limit metadata."""
         effective_limit = limit_value
         effective_offset = offset_value
 
-        if scan.limit is not None:
-            if scan.limit < effective_limit:
-                effective_limit = scan.limit
-            effective_offset += scan.offset
-        else:
-            if scan.offset:
-                effective_offset = scan.offset + offset_value
+        if scan.limit is not None and scan.limit < effective_limit:
+            effective_limit = scan.limit
+            effective_offset = scan.offset + offset_value
+        elif scan.offset:
+            effective_offset = scan.offset + offset_value
 
         return Scan(
             datasource=scan.datasource,
@@ -1070,8 +968,23 @@ class OrderByPushdownRule(OptimizationRule):
         input_cols = self._get_available_columns(project.input)
         sort_cols = self._extract_sort_columns(sort)
 
-        if not sort_cols.issubset(input_cols):
+        can_push = False
+        if "*" in input_cols:
+            can_push = True
+        else:
+            all_present = True
+            for col in sort_cols:
+                if col not in input_cols:
+                    all_present = False
+                    break
+            can_push = all_present
+
+        if not can_push:
             return sort
+
+        if isinstance(project.input, Scan):
+            pushed_scan = self._push_to_scan(sort, project.input)
+            return Project(pushed_scan, project.expressions, project.aliases)
 
         new_input = self._push_order_by(project.input)
         if isinstance(new_input, Scan) and new_input.order_by_keys:
@@ -1081,6 +994,10 @@ class OrderByPushdownRule(OptimizationRule):
 
     def _push_through_filter(self, sort: Sort, filter_node: Filter) -> LogicalPlanNode:
         """Push ORDER BY through filter (always safe)."""
+        if isinstance(filter_node.input, Scan):
+            pushed_scan = self._push_to_scan(sort, filter_node.input)
+            return Filter(pushed_scan, filter_node.predicate)
+
         new_input = self._push_order_by(filter_node.input)
         if isinstance(new_input, Scan) and new_input.order_by_keys:
             return Filter(new_input, filter_node.predicate)
@@ -1093,7 +1010,10 @@ class OrderByPushdownRule(OptimizationRule):
             return set(plan.columns)
 
         if isinstance(plan, Project):
-            return set(plan.aliases)
+            alias_set = set(plan.aliases)
+            if "*" in alias_set:
+                return self._get_available_columns(plan.input)
+            return alias_set
 
         if isinstance(plan, Filter):
             return self._get_available_columns(plan.input)

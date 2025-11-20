@@ -2,13 +2,14 @@
 
 from typing import Dict, List, Optional, TYPE_CHECKING
 from ..catalog.catalog import Catalog
-from ..catalog.schema import Table, Column
+from ..catalog.schema import Table
 from ..plan.logical import (
     LogicalPlanNode,
     Scan,
     Project,
     Filter,
     Limit,
+    Sort,
     Join,
     Aggregate,
     Explain,
@@ -74,6 +75,8 @@ class Binder:
             return self._bind_filter(plan)
         if isinstance(plan, Project):
             return self._bind_project(plan)
+        if isinstance(plan, Sort):
+            return self._bind_sort(plan)
         if isinstance(plan, Limit):
             return self._bind_limit(plan)
         if isinstance(plan, Join):
@@ -145,6 +148,118 @@ class Binder:
             expressions=bound_expressions,
             aliases=project.aliases,
         )
+
+    def _bind_sort(self, sort: Sort) -> Sort:
+        """Bind a Sort node."""
+        bound_input = self.bind(sort.input)
+
+        if isinstance(bound_input, Project):
+            bound_keys = self._bind_sort_keys_for_project(sort.sort_keys, bound_input)
+            return Sort(
+                input=bound_input,
+                sort_keys=bound_keys,
+                ascending=sort.ascending,
+                nulls_order=sort.nulls_order,
+            )
+
+        if self._contains_join(bound_input):
+            tables = self._extract_tables_from_tree(bound_input)
+            bound_keys = self._bind_sort_keys_multi(sort.sort_keys, tables)
+            return Sort(
+                input=bound_input,
+                sort_keys=bound_keys,
+                ascending=sort.ascending,
+                nulls_order=sort.nulls_order,
+            )
+
+        table = self._get_table_from_plan(bound_input)
+        bound_keys = self._bind_sort_keys(sort.sort_keys, table)
+        return Sort(
+            input=bound_input,
+            sort_keys=bound_keys,
+            ascending=sort.ascending,
+            nulls_order=sort.nulls_order,
+        )
+
+    def _bind_sort_keys(
+        self, sort_keys: List[Expression], table: Optional[Table]
+    ) -> List[Expression]:
+        """Bind ORDER BY expressions for a single table."""
+        bound_keys: List[Expression] = []
+        for key in sort_keys:
+            bound_key = self._bind_expression(key, table)
+            bound_keys.append(bound_key)
+        return bound_keys
+
+    def _bind_sort_keys_multi(
+        self,
+        sort_keys: List[Expression],
+        tables: Dict[Optional[str], Table],
+    ) -> List[Expression]:
+        """Bind ORDER BY expressions referencing multiple tables."""
+        bound_keys: List[Expression] = []
+        for key in sort_keys:
+            bound_key = self._bind_expression_multi_table(key, tables)
+            bound_keys.append(bound_key)
+        return bound_keys
+
+    def _bind_sort_keys_for_project(
+        self,
+        sort_keys: List[Expression],
+        project: Project,
+    ) -> List[Expression]:
+        """Bind ORDER BY keys when input is a Project (supports aliases)."""
+        alias_map = self._build_alias_expression_map(project)
+        tables = None
+        if self._contains_join(project.input):
+            tables = self._extract_tables_from_tree(project.input)
+        table = self._get_table_from_plan(project.input)
+
+        bound_keys: List[Expression] = []
+        for key in sort_keys:
+            bound_key = self._bind_project_sort_key(
+                key=key,
+                alias_map=alias_map,
+                table=table,
+                tables=tables,
+            )
+            bound_keys.append(bound_key)
+        return bound_keys
+
+    def _bind_project_sort_key(
+        self,
+        key: Expression,
+        alias_map: Dict[str, Expression],
+        table: Optional[Table],
+        tables: Optional[Dict[Optional[str], Table]],
+    ) -> Expression:
+        """Bind a single ORDER BY expression that may reference a select alias."""
+        from ..plan.expressions import ColumnRef
+
+        if isinstance(key, ColumnRef) and key.table is None:
+            if key.column in alias_map:
+                source_expr = alias_map[key.column]
+                return ColumnRef(
+                    table=None,
+                    column=key.column,
+                    data_type=source_expr.get_type(),
+                )
+
+        if tables is not None:
+            return self._bind_expression_multi_table(key, tables)
+
+        return self._bind_expression(key, table)
+
+    def _build_alias_expression_map(
+        self, project: Project
+    ) -> Dict[str, Expression]:
+        """Map output aliases to their bound expressions."""
+        alias_map: Dict[str, Expression] = {}
+        for index in range(len(project.aliases)):
+            alias = project.aliases[index]
+            expression = project.expressions[index]
+            alias_map[alias] = expression
+        return alias_map
 
     def _contains_join(self, plan: LogicalPlanNode) -> bool:
         """Check if plan tree contains a Join node."""

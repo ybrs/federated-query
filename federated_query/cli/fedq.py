@@ -27,6 +27,7 @@ from ..optimizer import (
     PredicatePushdownRule,
     ProjectionPushdownRule,
     AggregatePushdownRule,
+    OrderByPushdownRule,
     LimitPushdownRule,
     ExpressionSimplificationRule,
 )
@@ -106,6 +107,7 @@ class FedQRuntime:
         self.optimizer.add_rule(PredicatePushdownRule())
         self.optimizer.add_rule(ProjectionPushdownRule())
         self.optimizer.add_rule(AggregatePushdownRule())
+        self.optimizer.add_rule(OrderByPushdownRule())
         self.optimizer.add_rule(LimitPushdownRule())
 
     def execute(self, sql: str) -> Union[pa.Table, Dict[str, Any]]:

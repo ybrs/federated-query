@@ -21,6 +21,7 @@ from federated_query.optimizer import (
     PredicatePushdownRule,
     ProjectionPushdownRule,
     AggregatePushdownRule,
+    OrderByPushdownRule,
     LimitPushdownRule,
     ExpressionSimplificationRule,
 )
@@ -123,6 +124,7 @@ def execute_and_capture(sql: str, catalog: Catalog, ds: QueryCapturingDataSource
     optimizer.add_rule(PredicatePushdownRule())
     optimizer.add_rule(ProjectionPushdownRule())
     optimizer.add_rule(AggregatePushdownRule())
+    optimizer.add_rule(OrderByPushdownRule())
     optimizer.add_rule(LimitPushdownRule())
     optimized_plan = optimizer.optimize(bound_plan)
 
