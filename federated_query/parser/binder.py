@@ -239,6 +239,13 @@ class Binder:
         if isinstance(key, ColumnRef) and key.table is None:
             if key.column in alias_map:
                 source_expr = alias_map[key.column]
+                from ..plan.expressions import ColumnRef as BoundColumnRef
+                if isinstance(source_expr, BoundColumnRef):
+                    return ColumnRef(
+                        table=source_expr.table,
+                        column=source_expr.column,
+                        data_type=source_expr.data_type,
+                    )
                 return ColumnRef(
                     table=None,
                     column=key.column,
