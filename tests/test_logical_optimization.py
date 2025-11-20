@@ -18,6 +18,7 @@ from federated_query.plan.logical import (
     JoinType,
     Sort,
     Aggregate,
+    Union,
 )
 from federated_query.plan.expressions import (
     BinaryOp,
@@ -577,6 +578,38 @@ class TestOrderByPushdown:
         assert isinstance(result.input.input, Scan)
         assert result.input.input.order_by_keys is not None
         assert result.input.input.order_by_keys[0].column == "cid"
+
+    def test_order_by_union_pushdown(self):
+        """Sort above UNION should propagate metadata into children."""
+        left = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["cid"],
+        )
+        right = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders_backup",
+            columns=["cid"],
+        )
+        union = Union([left, right], distinct=True)
+        sort = Sort(
+            input=union,
+            sort_keys=[ColumnRef(None, "cid", DataType.INTEGER)],
+            ascending=[True],
+            nulls_order=[None],
+        )
+
+        rule = OrderByPushdownRule()
+        result = rule.apply(sort)
+
+        assert isinstance(result, Sort)
+        assert isinstance(result.input, Union)
+        for child in result.input.inputs:
+            assert isinstance(child, Scan)
+            if child.order_by_keys:
+                assert child.order_by_keys[0].column == "cid"
 
 
 class TestRuleBasedOptimizer:

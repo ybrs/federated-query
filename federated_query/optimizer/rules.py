@@ -948,6 +948,9 @@ class OrderByPushdownRule(OptimizationRule):
         if isinstance(input_node, Aggregate):
             return self._push_through_aggregate(sort, input_node)
 
+        if isinstance(input_node, Union):
+            return self._push_through_union(sort, input_node)
+
         if isinstance(input_node, Scan):
             return self._push_to_scan(sort, input_node)
 
@@ -1108,6 +1111,30 @@ class OrderByPushdownRule(OptimizationRule):
                     columns.add(f"{expr.table}.{expr.column}")
                 columns.add(expr.column)
         return columns
+
+    def _push_through_union(self, sort: Sort, union: Union) -> LogicalPlanNode:
+        """Propagate sort metadata into union inputs while keeping top sort."""
+        new_inputs = []
+        for child in union.inputs:
+            injected = Sort(
+                input=child,
+                sort_keys=sort.sort_keys,
+                ascending=sort.ascending,
+                nulls_order=sort.nulls_order,
+            )
+            pushed_child = self._push_order_by(injected)
+            if isinstance(pushed_child, Sort):
+                new_inputs.append(pushed_child.input)
+            else:
+                new_inputs.append(pushed_child)
+
+        new_union = Union(new_inputs, union.distinct)
+        return Sort(
+            input=new_union,
+            sort_keys=sort.sort_keys,
+            ascending=sort.ascending,
+            nulls_order=sort.nulls_order,
+        )
 
     def _get_available_columns(self, plan: LogicalPlanNode) -> set:
         """Get all column names available from a plan node."""
