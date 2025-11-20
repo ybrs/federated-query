@@ -3,7 +3,7 @@ Plan: Close ORDER BY pushdown gaps
 Goal: broaden ORDER BY pushdown beyond the current “Sort → Project/Filter → Scan” shape and ensure alias/star handling is robust.
 
 Current gaps (updated)
-- Sort on aggregates: Sort above Aggregate still stays local; if sort keys align with group-by columns on a pushed-down aggregate, we should annotate the Scan.
+- Sort on aggregates: pushdown implemented only when sort keys align with group-by columns; deeper aggregate pushdown to scans still limited to simple group-by.
 - Sort inside subqueries/CTEs: parser doesn’t build plans for WITH/subselects; no pushdown possible until parser support exists.
 - Sort across set operations: UNION/INTERSECT/EXCEPT return Sort unchanged; evaluate if/when to push.
 - NULLS FIRST/LAST fidelity: metadata captured but not validated per datasource; could diverge from backend behavior.

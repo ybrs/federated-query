@@ -1079,7 +1079,11 @@ class OrderByPushdownRule(OptimizationRule):
         if not sort_cols.issubset(output_cols):
             return sort
 
-        pushed_child = self._push_order_by(aggregate.input)
+        group_cols = self._extract_group_columns(aggregate.group_by)
+        if not sort_cols.issubset(group_cols):
+            return sort
+
+        pushed_child = self._push_sort_into_child(sort, aggregate.input)
         new_agg = Aggregate(
             input=pushed_child,
             group_by=aggregate.group_by,
@@ -1092,6 +1096,18 @@ class OrderByPushdownRule(OptimizationRule):
             ascending=sort.ascending,
             nulls_order=sort.nulls_order,
         )
+
+    def _extract_group_columns(self, group_by: List[Expression]) -> set:
+        """Extract column names from group by expressions."""
+        from ..plan.expressions import ColumnRef
+
+        columns = set()
+        for expr in group_by:
+            if isinstance(expr, ColumnRef):
+                if expr.table:
+                    columns.add(f"{expr.table}.{expr.column}")
+                columns.add(expr.column)
+        return columns
 
     def _get_available_columns(self, plan: LogicalPlanNode) -> set:
         """Get all column names available from a plan node."""

@@ -17,6 +17,7 @@ from federated_query.plan.logical import (
     Join,
     JoinType,
     Sort,
+    Aggregate,
 )
 from federated_query.plan.expressions import (
     BinaryOp,
@@ -544,6 +545,38 @@ class TestOrderByPushdown:
         assert isinstance(result, Sort)
         assert isinstance(result.input, Scan)
         assert result.input.order_by_keys is None
+
+    def test_order_by_group_by_pushdown(self):
+        """Sort on group-by column should annotate scan when aggregate is pushed."""
+        scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["cid", "amount"]
+        )
+        agg = Aggregate(
+            input=scan,
+            group_by=[ColumnRef(None, "cid", DataType.INTEGER)],
+            aggregates=[
+                ColumnRef(None, "cid", DataType.INTEGER),
+            ],
+            output_names=["cid"],
+        )
+        sort = Sort(
+            input=agg,
+            sort_keys=[ColumnRef(None, "cid", DataType.INTEGER)],
+            ascending=[True],
+            nulls_order=[None],
+        )
+
+        rule = OrderByPushdownRule()
+        result = rule.apply(sort)
+
+        assert isinstance(result, Sort)
+        assert isinstance(result.input, Aggregate)
+        assert isinstance(result.input.input, Scan)
+        assert result.input.input.order_by_keys is not None
+        assert result.input.input.order_by_keys[0].column == "cid"
 
 
 class TestRuleBasedOptimizer:
