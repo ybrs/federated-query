@@ -101,13 +101,22 @@ class PhysicalScan(PhysicalPlanNode):
             select_kw = "SELECT DISTINCT"
         query = f"{select_kw} {cols} FROM {table_ref}"
 
+        use_having = False
         if self.filters:
-            where_clause = self.filters.to_sql()
-            query = f"{query} WHERE {where_clause}"
+            use_having = (self.group_by or self.aggregates) and self._predicate_uses_aggregates(
+                self.filters
+            )
+            if not use_having:
+                where_clause = self.filters.to_sql()
+                query = f"{query} WHERE {where_clause}"
 
         if self.group_by:
             group_clause = self._format_group_by()
             query = f"{query} GROUP BY {group_clause}"
+
+        if self.filters and use_having:
+            clause_sql = self.filters.to_sql()
+            query = f"{query} HAVING {clause_sql}"
 
         if self.order_by_keys:
             order_clause = self._format_order_by()
@@ -195,6 +204,41 @@ class PhysicalScan(PhysicalPlanNode):
             items.append(item)
 
         return ", ".join(items)
+
+    def _predicate_uses_aggregates(self, expr: Expression) -> bool:
+        """Check if predicate references aggregate functions."""
+        from .expressions import FunctionCall, BinaryOp, UnaryOp, InList, BetweenExpression, ColumnRef
+
+        if isinstance(expr, FunctionCall):
+            if expr.is_aggregate:
+                return True
+            for arg in expr.args:
+                if self._predicate_uses_aggregates(arg):
+                    return True
+            return False
+
+        if isinstance(expr, BinaryOp):
+            return self._predicate_uses_aggregates(expr.left) or self._predicate_uses_aggregates(expr.right)
+
+        if isinstance(expr, UnaryOp):
+            return self._predicate_uses_aggregates(expr.operand)
+
+        if isinstance(expr, InList):
+            if self._predicate_uses_aggregates(expr.value):
+                return True
+            for option in expr.options:
+                if self._predicate_uses_aggregates(option):
+                    return True
+            return False
+
+        if isinstance(expr, BetweenExpression):
+            return (
+                self._predicate_uses_aggregates(expr.value)
+                or self._predicate_uses_aggregates(expr.lower)
+                or self._predicate_uses_aggregates(expr.upper)
+            )
+
+        return False
 
     def schema(self) -> pa.Schema:
         """Get output schema."""
@@ -739,6 +783,9 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
     aggregates: Optional[List[Expression]] = None
     output_names: Optional[List[str]] = None
     distinct: bool = False
+    order_by_keys: Optional[List[Expression]] = None
+    order_by_ascending: Optional[List[bool]] = None
+    order_by_nulls: Optional[List[Optional[str]]] = None
     _schema: Optional[pa.Schema] = None
     _column_alias_map: Dict[Tuple[Optional[str], str], str] = field(default_factory=dict, init=False)
 
@@ -778,12 +825,27 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
             predicates.append(self.left.filters.to_sql())
         if self.right.filters:
             predicates.append(self.right.filters.to_sql())
-        if predicates:
-            combined = " AND ".join(predicates)
-            query = f"{query} WHERE {combined}"
         if self.group_by:
             group_clause = self._build_group_by_clause()
             query = f"{query} GROUP BY {group_clause}"
+        if predicates:
+            combined = " AND ".join(predicates)
+            query = f"{query} WHERE {combined}"
+        if self.order_by_keys:
+            order_items = []
+            for index in range(len(self.order_by_keys)):
+                expr = self.order_by_keys[index]
+                item = expr.to_sql()
+                if self.order_by_ascending and index < len(self.order_by_ascending):
+                    if not self.order_by_ascending[index]:
+                        item = f"{item} DESC"
+                if self.order_by_nulls and index < len(self.order_by_nulls):
+                    nulls_spec = self.order_by_nulls[index]
+                    if nulls_spec:
+                        item = f"{item} NULLS {nulls_spec}"
+                order_items.append(item)
+            order_clause = ", ".join(order_items)
+            query = f"{query} ORDER BY {order_clause}"
         return query
 
     def _build_select_clause(self) -> str:

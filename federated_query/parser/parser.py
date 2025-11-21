@@ -773,6 +773,8 @@ class Parser:
             return self._convert_case_expression(expr)
         if self._is_aggregate_function(expr):
             return self._convert_aggregate_function(expr)
+        if isinstance(expr, (exp.Anonymous, exp.Func, exp.Upper)):
+            return self._convert_function_call(expr)
 
         raise ValueError(f"Unsupported expression type: {type(expr)}")
 
@@ -937,6 +939,16 @@ class Parser:
         elif isinstance(func, exp.Count):
             args.append(ColumnRef(table=None, column="*"))
         return args
+
+    def _convert_function_call(self, func: exp.Expression) -> FunctionCall:
+        """Convert generic function expressions."""
+        name = func.sql_name().upper()
+        args: List[Expression] = []
+        if hasattr(func, "this") and func.this is not None:
+            args.append(self._convert_expression(func.this))
+        for child in func.expressions or []:
+            args.append(self._convert_expression(child))
+        return FunctionCall(function_name=name, args=args, is_aggregate=False)
 
     def _rewrite_having_predicate(
         self, predicate: Expression, aggregate: Aggregate

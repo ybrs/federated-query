@@ -149,11 +149,16 @@ class PhysicalPlanner:
         input_plan = self._plan_node(sort.input)
 
         if isinstance(input_plan, PhysicalScan):
-            datasource = input_plan.datasource_connection
-            if datasource and datasource.supports_capability(
-                DataSourceCapability.ORDER_BY
-            ):
-                return input_plan
+            input_plan.order_by_keys = sort.sort_keys
+            input_plan.order_by_ascending = sort.ascending
+            input_plan.order_by_nulls = sort.nulls_order
+            return input_plan
+
+        if isinstance(input_plan, PhysicalRemoteJoin):
+            input_plan.order_by_keys = sort.sort_keys
+            input_plan.order_by_ascending = sort.ascending
+            input_plan.order_by_nulls = sort.nulls_order
+            return input_plan
 
         return PhysicalSort(
             input=input_plan,
@@ -238,12 +243,26 @@ class PhysicalPlanner:
     ) -> Optional[PhysicalPlanNode]:
         if not self._is_remote_join_candidate(join, left_plan, right_plan):
             return None
+        order_keys = None
+        order_asc = None
+        order_nulls = None
+        if isinstance(left_plan, PhysicalScan) and left_plan.order_by_keys:
+            order_keys = left_plan.order_by_keys
+            order_asc = left_plan.order_by_ascending
+            order_nulls = left_plan.order_by_nulls
+        if isinstance(right_plan, PhysicalScan) and right_plan.order_by_keys and order_keys is None:
+            order_keys = right_plan.order_by_keys
+            order_asc = right_plan.order_by_ascending
+            order_nulls = right_plan.order_by_nulls
         return PhysicalRemoteJoin(
             left=left_plan,
             right=right_plan,
             join_type=join.join_type,
             condition=join.condition,
             datasource_connection=left_plan.datasource_connection,
+            order_by_keys=order_keys,
+            order_by_ascending=order_asc,
+            order_by_nulls=order_nulls,
         )
 
     def _is_remote_join_candidate(
