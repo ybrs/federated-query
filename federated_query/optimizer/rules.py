@@ -732,11 +732,11 @@ class LimitPushdownRule(OptimizationRule):
         return handlers.get(type(plan))
 
     def _rewrite_projection(self, projection: Projection) -> LogicalPlanNode:
-        """Rewrite project child."""
+        """Rewrite projection child."""
         new_input = self._rewrite_plan(projection.input)
         if new_input != projection.input:
             return Projection(new_input, projection.expressions, projection.aliases)
-        return project
+        return projection
 
     def _rewrite_filter(self, filter_node: Filter) -> LogicalPlanNode:
         """Rewrite filter child."""
