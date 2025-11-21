@@ -520,7 +520,7 @@ class TestOrderByPushdown:
         assert result.input.right.order_by_keys is None
 
     def test_order_by_expression_not_pushed(self):
-        """Non-column sort keys should not be pushed."""
+        """Non-column sort keys keep the top Sort but annotate scan metadata."""
         scan = Scan(
             datasource="test_ds",
             schema_name="public",
@@ -545,7 +545,8 @@ class TestOrderByPushdown:
 
         assert isinstance(result, Sort)
         assert isinstance(result.input, Scan)
-        assert result.input.order_by_keys is None
+        assert result.input.order_by_keys is not None
+        assert result.input.order_by_keys[0] == expr
 
     def test_order_by_group_by_pushdown(self):
         """Sort on group-by column should annotate scan when aggregate is pushed."""
