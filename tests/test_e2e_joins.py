@@ -205,9 +205,9 @@ def test_parser_creates_join_plan():
     parser = Parser()
     logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
-    from federated_query.plan.logical import Join, Project
+    from federated_query.plan.logical import Join, Projection
 
-    assert isinstance(logical_plan, Project)
+    assert isinstance(logical_plan, Projection)
     assert isinstance(logical_plan.input, Join)
 
     join_node = logical_plan.input

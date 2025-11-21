@@ -8,7 +8,7 @@ from federated_query.optimizer.rules import (
 from federated_query.plan.logical import (
     Scan,
     Filter,
-    Project,
+    Projection,
     Join,
     JoinType,
     Limit,
@@ -206,13 +206,13 @@ class TestFilterThroughProjectionBug:
 
         SELECT id FROM users WHERE id > 10
 
-        Logical plan: Filter(Project(Scan(id, name, age), [id]), id > 10)
+        Logical plan: Filter(Projection(Scan(id, name, age), [id]), id > 10)
 
-        Should optimize to: Project(Filter(Scan(id, name, age), id > 10), [id])
+        Should optimize to: Projection(Filter(Scan(id, name, age), id > 10), [id])
 
         This evaluates the filter BEFORE projection, which is more efficient.
         Currently BOTH branches of _push_filter_through_project return
-        Filter(Project(...), predicate) so filter never moves below.
+        Filter(Projection(...), predicate) so filter never moves below.
         """
         scan = Scan(
             datasource="test_ds",
@@ -220,7 +220,7 @@ class TestFilterThroughProjectionBug:
             table_name="users",
             columns=["id", "name", "age"]
         )
-        project = Project(
+        project = Projection(
             input=scan,
             expressions=[ColumnRef(None, "id", DataType.INTEGER)],
             aliases=["id"]
@@ -236,10 +236,10 @@ class TestFilterThroughProjectionBug:
         result = rule.apply(filter_node)
 
         # Filter should be BELOW projection
-        assert isinstance(result, Project), f"Expected Project, got {type(result).__name__}"
+        assert isinstance(result, Projection), f"Expected Projection, got {type(result).__name__}"
 
         # Filter should be pushed down (either as Filter node or merged into Scan)
-        # Both Project(Filter(Scan)) and Project(Scan with filters) are valid
+        # Both Projection(Filter(Scan)) and Projection(Scan with filters) are valid
         is_pushed = (
             isinstance(result.input, Filter) or
             (isinstance(result.input, Scan) and result.input.filters is not None)
@@ -254,7 +254,7 @@ class TestFilterThroughProjectionBug:
         Even though 'age' is not projected, it's available in the scan input,
         so filter CAN and SHOULD push below projection to evaluate earlier.
 
-        Result: Project(Filter(Scan) or Scan with filters, [id])
+        Result: Projection(Filter(Scan) or Scan with filters, [id])
         """
         scan = Scan(
             datasource="test_ds",
@@ -262,7 +262,7 @@ class TestFilterThroughProjectionBug:
             table_name="users",
             columns=["id", "name", "age"]
         )
-        project = Project(
+        project = Projection(
             input=scan,
             expressions=[ColumnRef(None, "id", DataType.INTEGER)],
             aliases=["id"]
@@ -278,7 +278,7 @@ class TestFilterThroughProjectionBug:
         result = rule.apply(filter_node)
 
         # Filter should push below projection (age available in scan)
-        assert isinstance(result, Project)
+        assert isinstance(result, Projection)
         # Either Filter(Scan) or Scan with filters
         is_pushed = (
             isinstance(result.input, Filter) or
@@ -364,17 +364,17 @@ class TestColumnDetectionForWrappedJoins:
           ON o.customer_id = c.id
         WHERE o.customer_id > 100
 
-        Currently _get_column_names returns columns only for Project,
+        Currently _get_column_names returns columns only for Projection,
         but not for other wrappers. Need to handle this.
         """
-        # Left side: Project(Scan(...))
+        # Left side: Projection(Scan(...))
         left_scan = Scan(
             datasource="test_ds",
             schema_name="public",
             table_name="orders",
             columns=["id", "customer_id", "amount"]
         )
-        left_project = Project(
+        left_project = Projection(
             input=left_scan,
             expressions=[
                 ColumnRef(None, "id", DataType.INTEGER),
@@ -383,14 +383,14 @@ class TestColumnDetectionForWrappedJoins:
             aliases=["id", "customer_id"]
         )
 
-        # Right side: Project(Scan(...))
+        # Right side: Projection(Scan(...))
         right_scan = Scan(
             datasource="test_ds",
             schema_name="public",
             table_name="customers",
             columns=["id", "name", "status"]
         )
-        right_project = Project(
+        right_project = Projection(
             input=right_scan,
             expressions=[
                 ColumnRef(None, "id", DataType.INTEGER),
@@ -424,10 +424,10 @@ class TestColumnDetectionForWrappedJoins:
 
         # Filter should push to left side
         assert isinstance(result, Join)
-        # Left side should be Project(Filter(Scan))
-        assert isinstance(result.left, Project)
+        # Left side should be Projection(Filter(Scan))
+        assert isinstance(result.left, Projection)
         # The filter should be below the project or in the scan
-        # Either Project(Filter(Scan)) or Project(Scan with filters)
+        # Either Projection(Filter(Scan)) or Projection(Scan with filters)
         has_filter = (
             isinstance(result.left.input, Filter) or
             (isinstance(result.left.input, Scan) and result.left.input.filters is not None)
@@ -826,7 +826,7 @@ class TestTableAliasBug:
 class TestColumnPruningJoinKeyBug:
     """Test that column pruning preserves columns needed by join conditions.
 
-    Bug: _collect_required_columns stops at Project nodes and doesn't recurse
+    Bug: _collect_required_columns stops at Projection nodes and doesn't recurse
     into plan.input. This means columns needed by downstream operators (like
     join keys) are omitted from the required set. When _prune_scan_columns runs,
     it can drop join condition columns, breaking the join.
@@ -838,7 +838,7 @@ class TestColumnPruningJoinKeyBug:
         SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id
 
         The projection only references u.name, but the join needs u.id and
-        o.user_id. Currently _collect_required_columns stops at the Project
+        o.user_id. Currently _collect_required_columns stops at the Projection
         and only records {name}, causing u.id to be pruned from the scan.
 
         This makes the join impossible to execute!
@@ -877,8 +877,8 @@ class TestColumnPruningJoinKeyBug:
             condition=join_condition
         )
 
-        # Project: SELECT u.name (only projects name, not id!)
-        project = Project(
+        # Projection: SELECT u.name (only projects name, not id!)
+        project = Projection(
             input=join,
             expressions=[ColumnRef("u", "name", DataType.VARCHAR)],
             aliases=["name"]
@@ -888,10 +888,10 @@ class TestColumnPruningJoinKeyBug:
         result = rule.apply(project)
 
         # Result should still be a projection
-        assert isinstance(result, Project)
+        assert isinstance(result, Projection)
 
         # The join should still have both join key columns
-        # Navigate: Project -> Join -> left/right scans
+        # Navigate: Projection -> Join -> left/right scans
         assert isinstance(result.input, Join)
         resulting_join = result.input
 
@@ -959,8 +959,8 @@ class TestColumnPruningJoinKeyBug:
         )
         filter_node = Filter(join, filter_pred)
 
-        # Project: SELECT u.name
-        project = Project(
+        # Projection: SELECT u.name
+        project = Projection(
             input=filter_node,
             expressions=[ColumnRef("u", "name", DataType.VARCHAR)],
             aliases=["name"]
@@ -970,11 +970,11 @@ class TestColumnPruningJoinKeyBug:
         result = rule.apply(project)
 
         # Find the scans (may be wrapped in filters)
-        assert isinstance(result, Project)
+        assert isinstance(result, Projection)
 
         # Navigate down to find scans
-        # Could be: Project -> Filter -> Join -> Scans
-        # Or: Project -> Join -> Scans (if filter pushed down)
+        # Could be: Projection -> Filter -> Join -> Scans
+        # Or: Projection -> Join -> Scans (if filter pushed down)
         current = result.input
         if isinstance(current, Filter):
             current = current.input
@@ -1048,7 +1048,7 @@ class TestColumnPruningJoinKeyBug:
         )
 
         # Inner projection: SELECT u.name, u.id
-        inner_project = Project(
+        inner_project = Projection(
             input=join,
             expressions=[
                 ColumnRef("u", "name", DataType.VARCHAR),
@@ -1058,7 +1058,7 @@ class TestColumnPruningJoinKeyBug:
         )
 
         # Outer projection: SELECT name
-        outer_project = Project(
+        outer_project = Projection(
             input=inner_project,
             expressions=[ColumnRef(None, "name", DataType.VARCHAR)],
             aliases=["name"]
@@ -1069,7 +1069,7 @@ class TestColumnPruningJoinKeyBug:
 
         # Navigate down to find the join and scans
         current = result
-        while isinstance(current, Project):
+        while isinstance(current, Projection):
             current = current.input
 
         assert isinstance(current, Join)
@@ -1507,21 +1507,21 @@ class TestParserAliasNotPopulatedBug:
 
 
 class TestLimitPushdownNotRecursing:
-    """Test Bug #12: LimitPushdownRule doesn't recurse into non-Limit/Project nodes.
+    """Test Bug #12: LimitPushdownRule doesn't recurse into non-Limit/Projection nodes.
 
-    The rule only descends into Limit and Project nodes. If the root plan is a Filter,
+    The rule only descends into Limit and Projection nodes. If the root plan is a Filter,
     Join, or other operator, _push_limit returns without visiting children. This means
-    limits embedded inside subqueries (e.g., Filter(Limit(Project(Scan)))) are never
+    limits embedded inside subqueries (e.g., Filter(Limit(Projection(Scan)))) are never
     considered for pushdown even though moving the limit below the projection is safe.
     """
 
     def test_limit_nested_under_filter_not_optimized(self):
         """Test that limit nested under filter is not being optimized.
 
-        Plan shape: Filter(Limit(Project(Scan)))
+        Plan shape: Filter(Limit(Projection(Scan)))
 
-        The Limit should be able to push below the Project to become:
-        Filter(Project(Limit(Scan)))
+        The Limit should be able to push below the Projection to become:
+        Filter(Projection(Limit(Scan)))
 
         But currently the rule never visits the Limit because it stops at Filter.
         """
@@ -1532,8 +1532,8 @@ class TestLimitPushdownNotRecursing:
             columns=["id", "name", "age", "email"]
         )
 
-        # Project: SELECT id, name, age FROM ...
-        project = Project(
+        # Projection: SELECT id, name, age FROM ...
+        project = Projection(
             input=scan,
             expressions=[
                 ColumnRef(None, "id", DataType.INTEGER),
@@ -1559,21 +1559,21 @@ class TestLimitPushdownNotRecursing:
         result = rule.apply(filter_node)
 
         # Currently the rule doesn't recurse into Filter, so nothing changes
-        # After fix: should have Filter(Project(Limit(Scan)))
+        # After fix: should have Filter(Projection(Limit(Scan)))
         assert isinstance(result, Filter), "Should still be Filter at root"
-        assert isinstance(result.input, Project), "Should have Project after pushing limit down"
+        assert isinstance(result.input, Projection), "Should have Project after pushing limit down"
         assert isinstance(result.input.input, Limit), "Limit should have pushed below Project"
         assert isinstance(result.input.input.input, Scan), "Limit should be above Scan"
 
     def test_limit_nested_under_join_not_optimized(self):
         """Test that limit nested in join child is not being optimized.
 
-        Plan shape: Join(Limit(Project(Scan)), Scan)
+        Plan shape: Join(Limit(Projection(Scan)), Scan)
 
-        The Limit in the left child should be able to push below the Project,
+        The Limit in the left child should be able to push below the Projection,
         but currently the rule doesn't recurse into Join children.
         """
-        # Left side: Limit(Project(Scan))
+        # Left side: Limit(Projection(Scan))
         left_scan = Scan(
             datasource="test_ds",
             schema_name="public",
@@ -1581,7 +1581,7 @@ class TestLimitPushdownNotRecursing:
             columns=["id", "customer_id", "amount"]
         )
 
-        left_project = Project(
+        left_project = Projection(
             input=left_scan,
             expressions=[
                 ColumnRef(None, "customer_id", DataType.INTEGER),
@@ -1619,21 +1619,21 @@ class TestLimitPushdownNotRecursing:
         result = rule.apply(join)
 
         # Currently the rule doesn't recurse into Join, so nothing changes
-        # After fix: left child should be Project(Limit(Scan))
+        # After fix: left child should be Projection(Limit(Scan))
         assert isinstance(result, Join), "Should still be Join at root"
-        assert isinstance(result.left, Project), "Left child should have Project after pushing limit"
+        assert isinstance(result.left, Projection), "Left child should have Project after pushing limit"
         assert isinstance(result.left.input, Limit), "Limit should have pushed below Project"
         assert isinstance(result.left.input.input, Scan), "Limit should be above Scan"
 
     def test_deeply_nested_limit_not_optimized(self):
         """Test that deeply nested limit is not being optimized.
 
-        Plan shape: Filter(Join(Filter(Limit(Project(Scan))), Scan))
+        Plan shape: Filter(Join(Filter(Limit(Projection(Scan))), Scan))
 
         The deeply nested Limit should still be optimized even though it's
-        nested under multiple layers of non-Limit/Project nodes.
+        nested under multiple layers of non-Limit/Projection nodes.
         """
-        # Deep left side: Filter(Limit(Project(Scan)))
+        # Deep left side: Filter(Limit(Projection(Scan)))
         inner_scan = Scan(
             datasource="test_ds",
             schema_name="public",
@@ -1641,7 +1641,7 @@ class TestLimitPushdownNotRecursing:
             columns=["id", "category", "price", "stock"]
         )
 
-        inner_project = Project(
+        inner_project = Projection(
             input=inner_scan,
             expressions=[
                 ColumnRef(None, "id", DataType.INTEGER),
@@ -1697,6 +1697,6 @@ class TestLimitPushdownNotRecursing:
         assert isinstance(result, Filter), "Root should still be Filter"
         assert isinstance(result.input, Join), "Should have Join"
         assert isinstance(result.input.left, Filter), "Left should be Filter"
-        assert isinstance(result.input.left.input, Project), "Should have Project after pushing"
+        assert isinstance(result.input.left.input, Projection), "Should have Project after pushing"
         assert isinstance(result.input.left.input.input, Limit), "Limit should be below Project"
         assert isinstance(result.input.left.input.input.input, Scan), "Limit should be above Scan"

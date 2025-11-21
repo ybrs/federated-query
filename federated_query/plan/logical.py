@@ -125,8 +125,8 @@ class Scan(LogicalPlanNode):
 
 
 @dataclass(frozen=True)
-class Project(LogicalPlanNode):
-    """Project (select) specific expressions."""
+class Projection(LogicalPlanNode):
+    """Projection (select) specific expressions."""
 
     input: LogicalPlanNode
     expressions: List[Expression]
@@ -135,18 +135,18 @@ class Project(LogicalPlanNode):
     def children(self) -> List[LogicalPlanNode]:
         return [self.input]
 
-    def with_children(self, children: List[LogicalPlanNode]) -> "Project":
+    def with_children(self, children: List[LogicalPlanNode]) -> "Projection":
         assert len(children) == 1
-        return Project(children[0], self.expressions, self.aliases)
+        return Projection(children[0], self.expressions, self.aliases)
 
     def accept(self, visitor):
-        return visitor.visit_project(self)
+        return visitor.visit_projection(self)
 
     def schema(self) -> List[str]:
         return self.aliases
 
     def __repr__(self) -> str:
-        return f"Project({len(self.expressions)} expressions)"
+        return f"Projection({len(self.expressions)} expressions)"
 
 
 @dataclass(frozen=True)
@@ -334,7 +334,7 @@ class LogicalPlanVisitor(ABC):
         pass
 
     @abstractmethod
-    def visit_project(self, node: Project):
+    def visit_projection(self, node: Projection):
         pass
 
     @abstractmethod
