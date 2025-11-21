@@ -863,6 +863,9 @@ class LimitPushdownRule(OptimizationRule):
         offset_value: int
     ) -> Scan:
         """Return new scan with updated limit metadata."""
+        if scan.limit == limit_value and scan.offset == offset_value:
+            return scan
+
         effective_limit = limit_value
         effective_offset = offset_value
 
