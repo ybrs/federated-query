@@ -147,6 +147,7 @@ class Binder:
             input=bound_input,
             expressions=bound_expressions,
             aliases=project.aliases,
+            distinct=project.distinct,
         )
 
     def _bind_sort(self, sort: Sort) -> Sort:
@@ -382,7 +383,11 @@ class Binder:
         self, expressions: List[Expression], tables: Dict[Optional[str], Table]
     ) -> List[Expression]:
         """Bind GROUP BY expressions referencing multiple tables."""
-        return [self._bind_expression_multi_table(expr, tables) for expr in expressions]
+        bound: List[Expression] = []
+        for expr in expressions:
+            bound_expr = self._bind_expression_multi_table(expr, tables)
+            bound.append(bound_expr)
+        return bound
 
     def _bind_aggregate_expressions_multi_table(
         self, expressions: List[Expression], tables: Dict[Optional[str], Table]
@@ -403,6 +408,7 @@ class Binder:
                 function_name=expr.function_name,
                 args=bound_args,
                 is_aggregate=expr.is_aggregate,
+                distinct=expr.distinct,
             )
 
         return self._bind_expression(expr, table)
@@ -412,13 +418,15 @@ class Binder:
     ) -> Expression:
         """Bind aggregate expression referencing multiple tables."""
         if isinstance(expr, FunctionCall):
-            bound_args = [
-                self._bind_expression_multi_table(arg, tables) for arg in expr.args
-            ]
+            bound_args = []
+            for arg in expr.args:
+                bound_arg = self._bind_expression_multi_table(arg, tables)
+                bound_args.append(bound_arg)
             return FunctionCall(
                 function_name=expr.function_name,
                 args=bound_args,
                 is_aggregate=expr.is_aggregate,
+                distinct=expr.distinct,
             )
 
         return self._bind_expression_multi_table(expr, tables)

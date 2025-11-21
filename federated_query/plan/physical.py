@@ -7,6 +7,7 @@ from typing import List, Optional, Iterator, Any, TYPE_CHECKING, Dict, Callable,
 from enum import Enum
 
 import pyarrow as pa
+from sqlglot import exp
 
 from .expressions import Expression
 from .logical import JoinType, ExplainFormat
@@ -73,6 +74,7 @@ class PhysicalScan(PhysicalPlanNode):
     order_by_keys: Optional[List[Expression]] = None  # ORDER BY expressions
     order_by_ascending: Optional[List[bool]] = None  # ASC/DESC for each key
     order_by_nulls: Optional[List[Optional[str]]] = None  # NULLS FIRST/LAST for each key
+    distinct: bool = False
 
     def children(self) -> List[PhysicalPlanNode]:
         return []
@@ -94,7 +96,10 @@ class PhysicalScan(PhysicalPlanNode):
         """Build SQL query for this scan."""
         cols = self._format_columns()
         table_ref = self._format_table_ref()
-        query = f"SELECT {cols} FROM {table_ref}"
+        select_kw = "SELECT"
+        if self.distinct:
+            select_kw = "SELECT DISTINCT"
+        query = f"{select_kw} {cols} FROM {table_ref}"
 
         if self.filters:
             where_clause = self.filters.to_sql()
@@ -127,8 +132,18 @@ class PhysicalScan(PhysicalPlanNode):
         """
         if self.aggregates:
             select_items = []
-            for expr in self.aggregates:
-                select_items.append(expr.to_sql())
+            index = 0
+            while index < len(self.aggregates):
+                expr = self.aggregates[index]
+                expr_sql = expr.to_sql()
+                alias_name = None
+                if self.output_names and index < len(self.output_names):
+                    alias_name = self.output_names[index]
+                if alias_name:
+                    select_items.append(f'{expr_sql} AS "{alias_name}"')
+                else:
+                    select_items.append(expr_sql)
+                index += 1
             return ", ".join(select_items)
 
         if "*" in self.columns:
@@ -211,6 +226,7 @@ class PhysicalProject(PhysicalPlanNode):
     input: PhysicalPlanNode
     expressions: List[Expression]
     output_names: List[str]
+    distinct: bool = False
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
@@ -722,6 +738,7 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
     group_by: Optional[List[Expression]] = None
     aggregates: Optional[List[Expression]] = None
     output_names: Optional[List[str]] = None
+    distinct: bool = False
     _schema: Optional[pa.Schema] = None
     _column_alias_map: Dict[Tuple[Optional[str], str], str] = field(default_factory=dict, init=False)
 
@@ -754,7 +771,16 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
         right_source = self._build_source(self.right)
         join_keyword = self._join_keyword()
         condition_sql = self.condition.to_sql()
-        query = f"SELECT {select_clause} FROM {left_source} {join_keyword} {right_source} ON {condition_sql}"
+        select_kw = "SELECT DISTINCT" if self.distinct else "SELECT"
+        query = f"{select_kw} {select_clause} FROM {left_source} {join_keyword} {right_source} ON {condition_sql}"
+        predicates = []
+        if self.left.filters:
+            predicates.append(self.left.filters.to_sql())
+        if self.right.filters:
+            predicates.append(self.right.filters.to_sql())
+        if predicates:
+            combined = " AND ".join(predicates)
+            query = f"{query} WHERE {combined}"
         if self.group_by:
             group_clause = self._build_group_by_clause()
             query = f"{query} GROUP BY {group_clause}"
@@ -840,13 +866,9 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
     def _build_source(self, scan: PhysicalScan) -> str:
         table_ref = f'"{scan.schema_name}"."{scan.table_name}"'
         alias = scan.alias
-        if scan.filters is None:
-            if alias:
-                return f"{table_ref} AS {alias}"
-            return table_ref
-        alias_name = alias if alias else scan.table_name
-        filter_sql = scan.filters.to_sql()
-        return f"(SELECT * FROM {table_ref} AS {alias_name} WHERE {filter_sql}) AS {alias_name}"
+        if alias:
+            return f"{table_ref} AS {alias}"
+        return table_ref
 
     def _register_column_alias(
         self,
@@ -1898,6 +1920,7 @@ class _DatasourceQueryCollector:
             return
         sql = scan._build_query()
         query_ast = datasource.parse_query(sql)
+        self._normalize_count_distinct(query_ast)
         snapshot = _DatasourceQuerySnapshot(scan.datasource, sql, query_ast)
         snapshots.append(snapshot)
 
@@ -1911,5 +1934,23 @@ class _DatasourceQueryCollector:
             return
         sql = join._build_query()
         query_ast = datasource.parse_query(sql)
+        self._normalize_count_distinct(query_ast)
         snapshot = _DatasourceQuerySnapshot(join.left.datasource, sql, query_ast)
         snapshots.append(snapshot)
+
+    def _normalize_count_distinct(self, node: exp.Expression) -> None:
+        """Mark COUNT(DISTINCT ...) nodes with distinct flag for assertions."""
+        if isinstance(node, exp.Count):
+            if isinstance(node.this, exp.Distinct):
+                values = node.this.expressions or []
+                if values:
+                    node.set("this", values[0])
+                node.set("distinct", True)
+        for key, value in list(node.args.items()):
+            if isinstance(value, exp.Expression):
+                self._normalize_count_distinct(value)
+                continue
+            if isinstance(value, list):
+                for child in value:
+                    if isinstance(child, exp.Expression):
+                        self._normalize_count_distinct(child)

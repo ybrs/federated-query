@@ -105,6 +105,7 @@ class PhysicalPlanner:
             order_by_keys=scan.order_by_keys,
             order_by_ascending=scan.order_by_ascending,
             order_by_nulls=scan.order_by_nulls,
+            distinct=scan.distinct,
         )
 
     def _plan_filter(self, filter_node: Filter) -> PhysicalFilter:
@@ -115,11 +116,26 @@ class PhysicalPlanner:
     def _plan_project(self, project: Project) -> PhysicalProject:
         """Plan a project node."""
         input_plan = self._plan_node(project.input)
+        if project.distinct:
+            self._propagate_distinct(input_plan)
         return PhysicalProject(
             input=input_plan,
             expressions=project.expressions,
             output_names=project.aliases,
+            distinct=project.distinct,
         )
+
+    def _propagate_distinct(self, node: PhysicalPlanNode) -> None:
+        """Mark the lowest scan-like node to emit DISTINCT."""
+        if isinstance(node, PhysicalScan):
+            node.distinct = True
+            return
+        if isinstance(node, PhysicalRemoteJoin):
+            node.distinct = True
+            return
+        child = getattr(node, "input", None)
+        if isinstance(child, PhysicalPlanNode):
+            self._propagate_distinct(child)
 
     def _plan_limit(self, limit: Limit) -> PhysicalLimit:
         """Plan a limit node."""

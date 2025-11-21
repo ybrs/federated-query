@@ -652,7 +652,13 @@ class Parser:
             alias = self._get_alias(select_expr)
             aliases.append(alias)
 
-        return Project(input=input_plan, expressions=expressions, aliases=aliases)
+        has_distinct = select.args.get("distinct") is not None
+        return Project(
+            input=input_plan,
+            expressions=expressions,
+            aliases=aliases,
+            distinct=has_distinct,
+        )
 
     def _get_alias(self, expr: exp.Expression) -> str:
         """Get alias for expression.
@@ -898,24 +904,37 @@ class Parser:
             FunctionCall expression
         """
         func_name = type(func).__name__.upper()
-        args = self._extract_function_args(func)
-        return FunctionCall(function_name=func_name, args=args, is_aggregate=True)
+        distinct = bool(func.args.get("distinct"))
+        if isinstance(func.this, exp.Distinct):
+            distinct = True
+        args = self._extract_function_args(func, distinct)
+        return FunctionCall(
+            function_name=func_name,
+            args=args,
+            is_aggregate=True,
+            distinct=distinct,
+        )
 
-    def _extract_function_args(self, func: exp.AggFunc) -> List[Expression]:
+    def _extract_function_args(self, func: exp.AggFunc, distinct: bool) -> List[Expression]:
         """Extract arguments from function.
 
         Args:
             func: sqlglot AggFunc node
+            distinct: True if DISTINCT modifier is present
 
         Returns:
             List of argument expressions
         """
         args = []
-        if hasattr(func, "this") and func.this:
-            arg = self._convert_expression(func.this)
+        value = getattr(func, "this", None)
+        if isinstance(value, exp.Distinct):
+            for child in value.expressions or []:
+                converted = self._convert_expression(child)
+                args.append(converted)
+        elif value is not None:
+            arg = self._convert_expression(value)
             args.append(arg)
         elif isinstance(func, exp.Count):
-            # Handle COUNT(*) style functions where sqlglot leaves arg empty
             args.append(ColumnRef(table=None, column="*"))
         return args
 

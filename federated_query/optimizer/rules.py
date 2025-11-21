@@ -70,7 +70,12 @@ class PredicatePushdownRule(OptimizationRule):
         if isinstance(plan, Project):
             new_input = self._push_down(plan.input)
             if new_input != plan.input:
-                return Project(new_input, plan.expressions, plan.aliases)
+                return Project(
+                    new_input,
+                    plan.expressions,
+                    plan.aliases,
+                    plan.distinct,
+                )
             return plan
 
         if isinstance(plan, Join):
@@ -201,11 +206,21 @@ class PredicatePushdownRule(OptimizationRule):
             # Push filter BELOW projection: Project(Filter(input, pred), ...)
             new_filter = Filter(project.input, filter_node.predicate)
             new_filter = self._push_down(new_filter)
-            return Project(new_filter, project.expressions, project.aliases)
+            return Project(
+                new_filter,
+                project.expressions,
+                project.aliases,
+                project.distinct,
+            )
 
         # Filter references columns not available in input, keep above
         new_input = self._push_down(project.input)
-        new_project = Project(new_input, project.expressions, project.aliases)
+        new_project = Project(
+            new_input,
+            project.expressions,
+            project.aliases,
+            project.distinct,
+        )
         return Filter(new_project, filter_node.predicate)
 
     def _push_filter_to_scan(
@@ -237,6 +252,7 @@ class PredicatePushdownRule(OptimizationRule):
                 order_by_keys=scan.order_by_keys,
                 order_by_ascending=scan.order_by_ascending,
                 order_by_nulls=scan.order_by_nulls,
+                distinct=scan.distinct,
             )
 
         return Scan(
@@ -254,6 +270,7 @@ class PredicatePushdownRule(OptimizationRule):
             order_by_keys=scan.order_by_keys,
             order_by_ascending=scan.order_by_ascending,
             order_by_nulls=scan.order_by_nulls,
+            distinct=scan.distinct,
         )
 
     def _predicate_matches_side(
@@ -594,7 +611,12 @@ class ProjectionPushdownRule(OptimizationRule):
         if isinstance(plan, Project):
             new_input = self._prune_columns(plan.input, required)
             if new_input != plan.input:
-                return Project(new_input, plan.expressions, plan.aliases)
+                return Project(
+                    new_input,
+                    plan.expressions,
+                    plan.aliases,
+                    plan.distinct,
+                )
             return plan
 
         if isinstance(plan, Filter):
@@ -671,6 +693,7 @@ class ProjectionPushdownRule(OptimizationRule):
                 order_by_keys=scan.order_by_keys,
                 order_by_ascending=scan.order_by_ascending,
                 order_by_nulls=scan.order_by_nulls,
+                distinct=scan.distinct,
             )
 
         return scan
@@ -735,7 +758,12 @@ class LimitPushdownRule(OptimizationRule):
         """Rewrite project child."""
         new_input = self._rewrite_plan(project.input)
         if new_input != project.input:
-            return Project(new_input, project.expressions, project.aliases)
+            return Project(
+                new_input,
+                project.expressions,
+                project.aliases,
+                project.distinct,
+            )
         return project
 
     def _rewrite_filter(self, filter_node: Filter) -> LogicalPlanNode:
@@ -812,7 +840,12 @@ class LimitPushdownRule(OptimizationRule):
         """Move limit below project."""
         pushed_child = self._apply_limit_metadata(project.input, limit.limit, limit.offset)
         limited = Limit(pushed_child, limit.limit, limit.offset)
-        return Project(limited, project.expressions, project.aliases)
+        return Project(
+            limited,
+            project.expressions,
+            project.aliases,
+            project.distinct,
+        )
 
     def _push_limit_with_sort(self, limit: Limit, sort: Sort) -> LogicalPlanNode:
         """Move limit below sort and attach metadata to scan when possible."""
@@ -890,6 +923,7 @@ class LimitPushdownRule(OptimizationRule):
             order_by_keys=scan.order_by_keys,
             order_by_ascending=scan.order_by_ascending,
             order_by_nulls=scan.order_by_nulls,
+            distinct=scan.distinct,
         )
 
     def name(self) -> str:
@@ -976,6 +1010,7 @@ class OrderByPushdownRule(OptimizationRule):
             order_by_keys=sort.sort_keys,
             order_by_ascending=sort.ascending,
             order_by_nulls=sort.nulls_order,
+            distinct=scan.distinct,
         )
 
     def _push_through_project(self, sort: Sort, project: Project) -> LogicalPlanNode:
@@ -999,11 +1034,21 @@ class OrderByPushdownRule(OptimizationRule):
 
         if isinstance(project.input, Scan):
             pushed_scan = self._push_to_scan(sort, project.input)
-            return Project(pushed_scan, project.expressions, project.aliases)
+            return Project(
+                pushed_scan,
+                project.expressions,
+                project.aliases,
+                project.distinct,
+            )
 
         new_input = self._push_order_by(project.input)
         if isinstance(new_input, Scan) and new_input.order_by_keys:
-            return Project(new_input, project.expressions, project.aliases)
+            return Project(
+                new_input,
+                project.expressions,
+                project.aliases,
+                project.distinct,
+            )
 
         return sort
 
@@ -1216,7 +1261,12 @@ class OrderByPushdownRule(OptimizationRule):
             return plan
 
         if isinstance(plan, Project):
-            return Project(new_input, plan.expressions, plan.aliases)
+            return Project(
+                new_input,
+                plan.expressions,
+                plan.aliases,
+                plan.distinct,
+            )
 
         if isinstance(plan, Filter):
             return Filter(new_input, plan.predicate)
@@ -1312,6 +1362,7 @@ class AggregatePushdownRule(OptimizationRule):
             order_by_keys=scan.order_by_keys,
             order_by_ascending=scan.order_by_ascending,
             order_by_nulls=scan.order_by_nulls,
+            distinct=scan.distinct,
         )
 
     def _merge_filters(
@@ -1350,7 +1401,12 @@ class AggregatePushdownRule(OptimizationRule):
             return plan
 
         if isinstance(plan, Project):
-            return Project(new_input, plan.expressions, plan.aliases)
+            return Project(
+                new_input,
+                plan.expressions,
+                plan.aliases,
+                plan.distinct,
+            )
 
         if isinstance(plan, Filter):
             return Filter(new_input, plan.predicate)
@@ -1415,6 +1471,7 @@ class ExpressionSimplificationRule(OptimizationRule):
                         order_by_keys=plan.order_by_keys,
                         order_by_ascending=plan.order_by_ascending,
                         order_by_nulls=plan.order_by_nulls,
+                        distinct=getattr(plan, "distinct", False),
                     )
             return plan
 
@@ -1430,7 +1487,12 @@ class ExpressionSimplificationRule(OptimizationRule):
                     changed = True
 
             if changed or rewritten_input != plan.input:
-                return Project(rewritten_input, rewritten_exprs, plan.aliases)
+                return Project(
+                    rewritten_input,
+                    rewritten_exprs,
+                    plan.aliases,
+                    plan.distinct,
+                )
             return plan
 
         if isinstance(plan, Filter):

@@ -73,7 +73,8 @@ class ExpressionRewriter(ABC):
         return FunctionCall(
             function_name=expr.function_name,
             args=rewritten_args,
-            is_aggregate=expr.is_aggregate
+            is_aggregate=expr.is_aggregate,
+            distinct=expr.distinct
         )
 
     def rewrite_case_expr(self, expr: CaseExpr) -> Expression:
