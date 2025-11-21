@@ -749,6 +749,8 @@ class Parser:
             return self._convert_between_expression(expr)
         if isinstance(expr, exp.Column):
             return self._convert_column(expr)
+        if isinstance(expr, exp.Is):
+            return self._convert_is_expression(expr)
         if isinstance(expr, exp.Literal):
             return self._convert_literal(expr)
         if isinstance(expr, exp.Null):
@@ -783,6 +785,16 @@ class Parser:
         low_expr = self._convert_expression(expr.args["low"])
         high_expr = self._convert_expression(expr.args["high"])
         return BetweenExpression(value=value_expr, lower=low_expr, upper=high_expr)
+
+    def _convert_is_expression(self, expr: exp.Is) -> Expression:
+        """Convert IS and IS NOT comparisons into unary operations."""
+        operand = self._convert_expression(expr.this)
+        comparison = expr.expression
+        if isinstance(comparison, exp.Null):
+            return UnaryOp(op=UnaryOpType.IS_NULL, operand=operand)
+        if isinstance(comparison, exp.Not) and isinstance(comparison.this, exp.Null):
+            return UnaryOp(op=UnaryOpType.IS_NOT_NULL, operand=operand)
+        raise ValueError("IS comparison supports only NULL and NOT NULL")
 
     def _convert_case_expression(self, expr: exp.Case) -> Expression:
         """Convert CASE expression."""
@@ -860,6 +872,9 @@ class Parser:
 
     def _convert_unary(self, unary: exp.Unary) -> UnaryOp:
         """Convert sqlglot unary operation."""
+        if isinstance(unary, exp.Paren):
+            return self._convert_expression(unary.this)
+
         operand = self._convert_expression(unary.this)
         op = self._map_unary_op(unary)
         return UnaryOp(op=op, operand=operand)
