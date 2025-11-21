@@ -635,7 +635,7 @@ class Parser:
     def _build_select_clause(
         self, select: exp.Select, input_plan: LogicalPlanNode
     ) -> LogicalPlanNode:
-        """Build project node from SELECT clause."""
+        """Build projection node from SELECT clause."""
         if isinstance(input_plan, Aggregate):
             return input_plan
 

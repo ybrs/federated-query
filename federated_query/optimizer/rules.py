@@ -205,7 +205,7 @@ class PredicatePushdownRule(OptimizationRule):
 
         # Filter references columns not available in input, keep above
         new_input = self._push_down(projection.input)
-        new_project = Project(new_input, projection.expressions, projection.aliases)
+        new_project = Projection(new_input, projection.expressions, projection.aliases)
         return Filter(new_project, filter_node.predicate)
 
     def _push_filter_to_scan(
@@ -809,7 +809,7 @@ class LimitPushdownRule(OptimizationRule):
         return Limit(input_node, limit.limit, limit.offset)
 
     def _push_through_projection(self, limit: Limit, projection: Projection) -> LogicalPlanNode:
-        """Move limit below project."""
+        """Move limit below projection."""
         pushed_child = self._apply_limit_metadata(projection.input, limit.limit, limit.offset)
         limited = Limit(pushed_child, limit.limit, limit.offset)
         return Projection(limited, projection.expressions, projection.aliases)
@@ -912,7 +912,7 @@ class OrderByPushdownRule(OptimizationRule):
     """Push ORDER BY clauses to data sources when safe.
 
     Transforms:
-        Sort(Project?(Filter?(Scan))) → Project?(Filter?(Scan(with order by)))
+        Sort(Projection?(Filter?(Scan))) → Projection?(Filter?(Scan(with order by)))
 
     This pushes ORDER BY to the data source for execution.
     ORDER BY pushdown is mandatory for correctness in many use cases:
