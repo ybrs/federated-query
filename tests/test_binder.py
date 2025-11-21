@@ -118,7 +118,7 @@ def test_bind_resolves_column_types(catalog_with_test_data):
     # Bind the plan
     bound_plan = binder.bind(plan)
 
-    # Extract the Projectionion node
+    # Extract the Projection node
     from federated_query.plan.logical import Projection, Filter, Limit
 
     # Traverse to find Projection

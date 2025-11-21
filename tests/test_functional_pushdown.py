@@ -324,7 +324,7 @@ class TestCombinedPushdowns:
         assert "quantity" in pushed_sql, f"quantity filter missing: {pushed_sql}"
         assert "status" in pushed_sql, f"status filter missing: {pushed_sql}"
 
-        # Projectionion pushdown
+        # Projection pushdown
         assert "order_id" in pushed_sql, f"order_id not selected: {pushed_sql}"
         assert "customer_id" in pushed_sql, f"customer_id not selected: {pushed_sql}"
         assert "price" in pushed_sql, f"price not selected: {pushed_sql}"

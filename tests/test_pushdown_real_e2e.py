@@ -354,7 +354,7 @@ class TestCombinedPushdownReal:
         assert "WHERE" in query, f"Filter not pushed: {query}"
         assert "status" in query, f"status not in WHERE: {query}"
 
-        # Projectionion should include needed columns
+        # Projection should include needed columns
         assert '"order_id"' in query or "order_id" in query, f"order_id not selected: {query}"
         assert '"price"' in query or "price" in query, f"price not selected: {query}"
 

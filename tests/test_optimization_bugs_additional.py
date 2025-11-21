@@ -1507,7 +1507,7 @@ class TestParserAliasNotPopulatedBug:
 
 
 class TestLimitPushdownNotRecursing:
-    """Test Bug #12: LimitPushdownRule doesn't recurse into non-Limit/Projectionion nodes.
+    """Test Bug #12: LimitPushdownRule doesn't recurse into non-Limit/Projection nodes.
 
     The rule only descends into Limit and Projection nodes. If the root plan is a Filter,
     Join, or other operator, _push_limit returns without visiting children. This means
@@ -1570,7 +1570,7 @@ class TestLimitPushdownNotRecursing:
 
         Plan shape: Join(Limit(Projection(Scan)), Scan)
 
-        The Limit in the left child should be able to push below the Projectionion,
+        The Limit in the left child should be able to push below the Projection,
         but currently the rule doesn't recurse into Join children.
         """
         # Left side: Limit(Projection(Scan))
@@ -1631,7 +1631,7 @@ class TestLimitPushdownNotRecursing:
         Plan shape: Filter(Join(Filter(Limit(Projection(Scan))), Scan))
 
         The deeply nested Limit should still be optimized even though it's
-        nested under multiple layers of non-Limit/Projectionion nodes.
+        nested under multiple layers of non-Limit/Projection nodes.
         """
         # Deep left side: Filter(Limit(Projection(Scan)))
         inner_scan = Scan(
