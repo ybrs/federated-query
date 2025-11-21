@@ -467,6 +467,6 @@ class TestEndToEndResults:
             # Should only have the requested columns
             assert "order_id" in schema_names, f"order_id missing: {schema_names}"
             assert "price" in schema_names, f"price missing: {schema_names}"
-            # Projectionion pushdown means we shouldn't fetch unrequested columns
+            # Projection pushdown means we shouldn't fetch unrequested columns
             # (though they might appear if pushdown failed)
             break
