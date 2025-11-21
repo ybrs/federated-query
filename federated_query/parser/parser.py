@@ -8,7 +8,7 @@ from sqlglot import exp
 from ..plan.logical import (
     LogicalPlanNode,
     Scan,
-    Project,
+    Projection,
     Filter,
     Limit,
     Join,
@@ -652,7 +652,7 @@ class Parser:
             alias = self._get_alias(select_expr)
             aliases.append(alias)
 
-        return Project(input=input_plan, expressions=expressions, aliases=aliases)
+        return Projection(input=input_plan, expressions=expressions, aliases=aliases)
 
     def _get_alias(self, expr: exp.Expression) -> str:
         """Get alias for expression.

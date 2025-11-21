@@ -8,7 +8,7 @@ from federated_query.catalog.catalog import Catalog
 from federated_query.plan.logical import (
     Scan,
     Filter,
-    Project,
+    Projection,
     Join,
     Aggregate,
     Limit,
@@ -237,7 +237,7 @@ class TestCardinalityEstimation:
             table_name="users",
             columns=["id", "name"]
         )
-        project = Project(
+        project = Projection(
             input=scan,
             expressions=[ColumnRef(None, "id", DataType.INTEGER)],
             aliases=["id"]
@@ -481,7 +481,7 @@ class TestOperatorCostEstimation:
             table_name="users",
             columns=["id", "name", "email"]
         )
-        project = Project(
+        project = Projection(
             input=scan,
             expressions=[
                 ColumnRef(None, "id", DataType.INTEGER),
@@ -572,7 +572,7 @@ class TestOperatorCostEstimation:
             right=Literal("active", DataType.VARCHAR)
         )
         filter_node = Filter(input=scan, predicate=predicate)
-        project = Project(
+        project = Projection(
             input=filter_node,
             expressions=[ColumnRef(None, "id", DataType.INTEGER)],
             aliases=["id"]

@@ -2,7 +2,7 @@
 
 import pytest
 from federated_query.parser import Parser
-from federated_query.plan.logical import Project, Scan, Join, Explain, ExplainFormat
+from federated_query.plan.logical import Projection, Scan, Join, Explain, ExplainFormat
 
 
 def test_parser_initialization():
@@ -53,7 +53,7 @@ def test_scan_alias_set_for_from_clause():
     parser = Parser()
     sql = "SELECT c.id FROM testdb.main.customers c"
     plan = parser.parse_to_logical_plan(sql)
-    assert isinstance(plan, Project)
+    assert isinstance(plan, Projection)
     assert isinstance(plan.input, Scan)
     assert plan.input.alias == "c"
 
@@ -67,7 +67,7 @@ def test_scan_alias_set_for_join_tables():
         JOIN testdb.main.orders o ON c.id = o.customer_id
     """
     plan = parser.parse_to_logical_plan(sql)
-    assert isinstance(plan, Project)
+    assert isinstance(plan, Projection)
     join = plan.input
     assert isinstance(join, Join)
     assert isinstance(join.left, Scan)

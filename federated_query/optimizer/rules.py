@@ -5,7 +5,7 @@ from typing import List, Optional, TYPE_CHECKING
 from ..plan.logical import (
     LogicalPlanNode,
     Scan,
-    Project,
+    Projection,
     Filter,
     Join,
     Aggregate,
@@ -67,10 +67,10 @@ class PredicatePushdownRule(OptimizationRule):
         if isinstance(plan, Filter):
             return self._push_filter(plan)
 
-        if isinstance(plan, Project):
+        if isinstance(plan, Projection):
             new_input = self._push_down(plan.input)
             if new_input != plan.input:
-                return Project(new_input, plan.expressions, plan.aliases)
+                return Projection(new_input, plan.expressions, plan.aliases)
             return plan
 
         if isinstance(plan, Join):
@@ -117,8 +117,8 @@ class PredicatePushdownRule(OptimizationRule):
         if isinstance(input_plan, Filter):
             return self._merge_filters(filter_node, input_plan)
 
-        if isinstance(input_plan, Project):
-            return self._push_filter_through_project(
+        if isinstance(input_plan, Projection):
+            return self._push_filter_through_projection(
                 filter_node,
                 input_plan
             )
@@ -181,10 +181,10 @@ class PredicatePushdownRule(OptimizationRule):
 
         return True
 
-    def _push_filter_through_project(
+    def _push_filter_through_projection(
         self,
         filter_node: Filter,
-        project: Project
+        projection: Projection
     ) -> LogicalPlanNode:
         """Push filter through projection if possible.
 
@@ -192,20 +192,20 @@ class PredicatePushdownRule(OptimizationRule):
         using columns available in the projection's input.
         """
         predicate_cols = self._extract_column_refs(filter_node.predicate)
-        input_cols = self._get_column_names(project.input)
+        input_cols = self._get_column_names(projection.input)
 
         # Can we evaluate predicate using columns from input?
         can_push = self._can_evaluate_predicate(predicate_cols, input_cols)
 
         if can_push:
             # Push filter BELOW projection: Project(Filter(input, pred), ...)
-            new_filter = Filter(project.input, filter_node.predicate)
+            new_filter = Filter(projection.input, filter_node.predicate)
             new_filter = self._push_down(new_filter)
-            return Project(new_filter, project.expressions, project.aliases)
+            return Projection(new_filter, projection.expressions, projection.aliases)
 
         # Filter references columns not available in input, keep above
-        new_input = self._push_down(project.input)
-        new_project = Project(new_input, project.expressions, project.aliases)
+        new_input = self._push_down(projection.input)
+        new_project = Project(new_input, projection.expressions, projection.aliases)
         return Filter(new_project, filter_node.predicate)
 
     def _push_filter_to_scan(
@@ -394,7 +394,7 @@ class PredicatePushdownRule(OptimizationRule):
                 qualified.add(f"{table_ref}.{col}")
             return qualified
 
-        if isinstance(plan, Project):
+        if isinstance(plan, Projection):
             return set(plan.aliases)
 
         if isinstance(plan, Join):
@@ -475,7 +475,7 @@ class ProjectionPushdownRule(OptimizationRule):
 
     def _has_explicit_projection(self, plan: LogicalPlanNode) -> bool:
         """Check if plan has explicit projection (not SELECT *)."""
-        if isinstance(plan, Project):
+        if isinstance(plan, Projection):
             return True
 
         if isinstance(plan, Aggregate):
@@ -503,7 +503,7 @@ class ProjectionPushdownRule(OptimizationRule):
                 columns.update(self._extract_columns(plan.filters))
             return columns
 
-        if isinstance(plan, Project):
+        if isinstance(plan, Projection):
             # Collect columns from projection expressions
             for expr in plan.expressions:
                 columns.update(self._extract_columns(expr))
@@ -591,10 +591,10 @@ class ProjectionPushdownRule(OptimizationRule):
         if isinstance(plan, Scan):
             return self._prune_scan_columns(plan, required)
 
-        if isinstance(plan, Project):
+        if isinstance(plan, Projection):
             new_input = self._prune_columns(plan.input, required)
             if new_input != plan.input:
-                return Project(new_input, plan.expressions, plan.aliases)
+                return Projection(new_input, plan.expressions, plan.aliases)
             return plan
 
         if isinstance(plan, Filter):
@@ -721,7 +721,7 @@ class LimitPushdownRule(OptimizationRule):
         """Return rewrite handler for plan type."""
         handlers = {
             Limit: self._push_limit_node,
-            Project: self._rewrite_project,
+            Projection: self._rewrite_projection,
             Filter: self._rewrite_filter,
             Sort: self._rewrite_sort,
             Aggregate: self._rewrite_aggregate,
@@ -731,11 +731,11 @@ class LimitPushdownRule(OptimizationRule):
         }
         return handlers.get(type(plan))
 
-    def _rewrite_project(self, project: Project) -> LogicalPlanNode:
+    def _rewrite_projection(self, projection: Projection) -> LogicalPlanNode:
         """Rewrite project child."""
-        new_input = self._rewrite_plan(project.input)
-        if new_input != project.input:
-            return Project(new_input, project.expressions, project.aliases)
+        new_input = self._rewrite_plan(projection.input)
+        if new_input != projection.input:
+            return Projection(new_input, projection.expressions, projection.aliases)
         return project
 
     def _rewrite_filter(self, filter_node: Filter) -> LogicalPlanNode:
@@ -796,8 +796,8 @@ class LimitPushdownRule(OptimizationRule):
         """Push a single Limit node downward when safe."""
         input_node = self._rewrite_plan(limit.input)
 
-        if isinstance(input_node, Project):
-            return self._push_through_project(limit, input_node)
+        if isinstance(input_node, Projection):
+            return self._push_through_projection(limit, input_node)
 
         if isinstance(input_node, Sort):
             return self._push_limit_with_sort(limit, input_node)
@@ -808,11 +808,11 @@ class LimitPushdownRule(OptimizationRule):
 
         return Limit(input_node, limit.limit, limit.offset)
 
-    def _push_through_project(self, limit: Limit, project: Project) -> LogicalPlanNode:
+    def _push_through_projection(self, limit: Limit, projection: Projection) -> LogicalPlanNode:
         """Move limit below project."""
-        pushed_child = self._apply_limit_metadata(project.input, limit.limit, limit.offset)
+        pushed_child = self._apply_limit_metadata(projection.input, limit.limit, limit.offset)
         limited = Limit(pushed_child, limit.limit, limit.offset)
-        return Project(limited, project.expressions, project.aliases)
+        return Projection(limited, projection.expressions, projection.aliases)
 
     def _push_limit_with_sort(self, limit: Limit, sort: Sort) -> LogicalPlanNode:
         """Move limit below sort and attach metadata to scan when possible."""
@@ -939,8 +939,8 @@ class OrderByPushdownRule(OptimizationRule):
 
         input_node = sort.input
 
-        if isinstance(input_node, Project):
-            return self._push_through_project(sort, input_node)
+        if isinstance(input_node, Projection):
+            return self._push_through_projection(sort, input_node)
 
         if isinstance(input_node, Filter):
             return self._push_through_filter(sort, input_node)
@@ -978,9 +978,9 @@ class OrderByPushdownRule(OptimizationRule):
             order_by_nulls=sort.nulls_order,
         )
 
-    def _push_through_project(self, sort: Sort, project: Project) -> LogicalPlanNode:
+    def _push_through_projection(self, sort: Sort, projection: Projection) -> LogicalPlanNode:
         """Push ORDER BY through projection if all sort columns available."""
-        input_cols = self._get_available_columns(project.input)
+        input_cols = self._get_available_columns(projection.input)
         sort_cols = self._extract_sort_columns(sort)
 
         can_push = False
@@ -997,13 +997,13 @@ class OrderByPushdownRule(OptimizationRule):
         if not can_push:
             return sort
 
-        if isinstance(project.input, Scan):
-            pushed_scan = self._push_to_scan(sort, project.input)
-            return Project(pushed_scan, project.expressions, project.aliases)
+        if isinstance(projection.input, Scan):
+            pushed_scan = self._push_to_scan(sort, projection.input)
+            return Projection(pushed_scan, projection.expressions, projection.aliases)
 
-        new_input = self._push_order_by(project.input)
+        new_input = self._push_order_by(projection.input)
         if isinstance(new_input, Scan) and new_input.order_by_keys:
-            return Project(new_input, project.expressions, project.aliases)
+            return Projection(new_input, projection.expressions, projection.aliases)
 
         return sort
 
@@ -1149,7 +1149,7 @@ class OrderByPushdownRule(OptimizationRule):
                 columns.add(f"{table_ref}.{col}")
             return columns
 
-        if isinstance(plan, Project):
+        if isinstance(plan, Projection):
             columns = set()
             for alias in plan.aliases:
                 columns.add(alias)
@@ -1198,7 +1198,7 @@ class OrderByPushdownRule(OptimizationRule):
 
     def _recurse_node(self, plan: LogicalPlanNode) -> LogicalPlanNode:
         """Recurse into node children."""
-        if isinstance(plan, (Project, Filter, Limit)):
+        if isinstance(plan, (Projection, Filter, Limit)):
             return self._recurse_unary(plan)
 
         if isinstance(plan, Join):
@@ -1215,8 +1215,8 @@ class OrderByPushdownRule(OptimizationRule):
         if new_input == plan.input:
             return plan
 
-        if isinstance(plan, Project):
-            return Project(new_input, plan.expressions, plan.aliases)
+        if isinstance(plan, Projection):
+            return Projection(new_input, plan.expressions, plan.aliases)
 
         if isinstance(plan, Filter):
             return Filter(new_input, plan.predicate)
@@ -1335,7 +1335,7 @@ class AggregatePushdownRule(OptimizationRule):
 
     def _recurse_node(self, plan: LogicalPlanNode) -> LogicalPlanNode:
         """Recurse into node children."""
-        if isinstance(plan, (Project, Filter, Limit)):
+        if isinstance(plan, (Projection, Filter, Limit)):
             return self._recurse_unary(plan)
 
         if isinstance(plan, Join):
@@ -1349,8 +1349,8 @@ class AggregatePushdownRule(OptimizationRule):
         if new_input == plan.input:
             return plan
 
-        if isinstance(plan, Project):
-            return Project(new_input, plan.expressions, plan.aliases)
+        if isinstance(plan, Projection):
+            return Projection(new_input, plan.expressions, plan.aliases)
 
         if isinstance(plan, Filter):
             return Filter(new_input, plan.predicate)
@@ -1418,7 +1418,7 @@ class ExpressionSimplificationRule(OptimizationRule):
                     )
             return plan
 
-        if isinstance(plan, Project):
+        if isinstance(plan, Projection):
             rewritten_input = self._rewrite_plan(plan.input)
             rewritten_exprs = []
             changed = False
@@ -1430,7 +1430,7 @@ class ExpressionSimplificationRule(OptimizationRule):
                     changed = True
 
             if changed or rewritten_input != plan.input:
-                return Project(rewritten_input, rewritten_exprs, plan.aliases)
+                return Projection(rewritten_input, rewritten_exprs, plan.aliases)
             return plan
 
         if isinstance(plan, Filter):

@@ -324,7 +324,7 @@ class TestCombinedPushdowns:
         assert "quantity" in pushed_sql, f"quantity filter missing: {pushed_sql}"
         assert "status" in pushed_sql, f"status filter missing: {pushed_sql}"
 
-        # Projection pushdown
+        # Projectionion pushdown
         assert "order_id" in pushed_sql, f"order_id not selected: {pushed_sql}"
         assert "customer_id" in pushed_sql, f"customer_id not selected: {pushed_sql}"
         assert "price" in pushed_sql, f"price not selected: {pushed_sql}"
@@ -467,6 +467,6 @@ class TestEndToEndResults:
             # Should only have the requested columns
             assert "order_id" in schema_names, f"order_id missing: {schema_names}"
             assert "price" in schema_names, f"price missing: {schema_names}"
-            # Projection pushdown means we shouldn't fetch unrequested columns
+            # Projectionion pushdown means we shouldn't fetch unrequested columns
             # (though they might appear if pushdown failed)
             break

@@ -145,9 +145,9 @@ class TestBug1PyArrowColumnAccess:
         assert set(ids) == {1, 3, 4, 5}
 
     def test_projection_with_column_reference(self, setup_single_datasource):
-        """Test that PhysicalProject can access columns by name.
+        """Test that PhysicalProjection can access columns by name.
 
-        Bug: batch.column(expr.column) in PhysicalProject._project_batch
+        Bug: batch.column(expr.column) in PhysicalProjection._project_batch
         calls with string name instead of integer index.
         """
         catalog, datasource = setup_single_datasource
@@ -290,7 +290,7 @@ class TestBug2StarProjectionDropsExpressions:
     def test_star_with_additional_column(self, setup_single_datasource):
         """Test SELECT *, id AS id_copy.
 
-        Bug: PhysicalProject._project_batch returns early when encountering *,
+        Bug: PhysicalProjection._project_batch returns early when encountering *,
         dropping the id_copy column reference.
         """
         catalog, datasource = setup_single_datasource

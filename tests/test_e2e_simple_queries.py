@@ -319,7 +319,7 @@ def test_explain_returns_plan(setup_duckdb):
         plan_lines.append(entry)
 
     assert len(plan_lines) > 0
-    assert plan_lines[0].startswith("PhysicalProject")
+    assert plan_lines[0].startswith("PhysicalProjection")
 
     has_scan = False
     for line in plan_lines:
