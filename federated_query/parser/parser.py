@@ -652,7 +652,8 @@ class Parser:
             alias = self._get_alias(select_expr)
             aliases.append(alias)
 
-        has_distinct = select.args.get("distinct") is not None
+        distinct_arg = select.args.get("distinct")
+        has_distinct = bool(distinct_arg)
         return Projection(
             input=input_plan,
             expressions=expressions,

@@ -83,3 +83,21 @@ def test_explain_as_json_detected():
     plan = parser.parse_to_logical_plan(sql)
     assert isinstance(plan, Explain)
     assert plan.format == ExplainFormat.JSON
+
+
+def test_projection_distinct_flag_set():
+    """Parser should mark Projection.distinct when SELECT DISTINCT is used."""
+    parser = Parser()
+    sql = "SELECT DISTINCT region FROM testdb.main.orders"
+    plan = parser.parse_to_logical_plan(sql)
+    assert isinstance(plan, Projection)
+    assert plan.distinct is True
+
+
+def test_projection_distinct_flag_not_set():
+    """Parser should keep Projection.distinct False when DISTINCT is absent."""
+    parser = Parser()
+    sql = "SELECT region FROM testdb.main.orders"
+    plan = parser.parse_to_logical_plan(sql)
+    assert isinstance(plan, Projection)
+    assert plan.distinct is False
