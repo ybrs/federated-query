@@ -198,7 +198,7 @@ This project is under active development. See `tasks.md` for the implementation 
 **Phase 1: Basic Query Execution** ✅
 - ✅ Parser: AST to logical plan conversion
 - ✅ Binder: Reference resolution with catalog integration
-- ✅ Physical operators: Scan, Filter, Project, Limit
+- ✅ Physical operators: Scan, Filter, Projection, Limit
 - ✅ Basic executor: Single-table queries
 - ✅ End-to-end pipeline for simple SELECT queries
 

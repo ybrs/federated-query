@@ -1072,7 +1072,35 @@ class OrderByPushdownRule(OptimizationRule):
 
     def _push_through_projection(self, sort: Sort, projection: Projection) -> LogicalPlanNode:
         """Push ORDER BY through projection if all sort columns available."""
-        pushed_child = self._push_sort_into_child(sort, projection.input)
+        rewritten_keys = self._rewrite_sort_keys_for_projection(
+            sort.sort_keys,
+            projection,
+        )
+        if rewritten_keys is None:
+            return sort
+
+        rewritten_sort = Sort(
+            input=projection.input,
+            sort_keys=rewritten_keys,
+            ascending=sort.ascending,
+            nulls_order=sort.nulls_order,
+        )
+        pushed_child = self._push_order_by(rewritten_sort)
+
+        if isinstance(pushed_child, Sort):
+            rebuilt_projection = Projection(
+                pushed_child.input,
+                projection.expressions,
+                projection.aliases,
+                projection.distinct,
+            )
+            return Sort(
+                input=rebuilt_projection,
+                sort_keys=sort.sort_keys,
+                ascending=sort.ascending,
+                nulls_order=sort.nulls_order,
+            )
+
         return Projection(
             pushed_child,
             projection.expressions,
@@ -1255,6 +1283,70 @@ class OrderByPushdownRule(OptimizationRule):
                 columns.add(key.column)
 
         return columns
+
+    def _rewrite_sort_keys_for_projection(
+        self,
+        sort_keys: List[Expression],
+        projection: Projection,
+    ) -> Optional[List[Expression]]:
+        """Rewrite projection sort keys to input expressions when aliases are used."""
+        alias_map = self._build_projection_alias_map(projection)
+        available = self._get_available_columns(projection.input)
+        rewritten: List[Expression] = []
+        from ..plan.expressions import ColumnRef
+
+        for key in sort_keys:
+            if isinstance(key, ColumnRef):
+                mapped = self._map_projection_sort_column(
+                    key,
+                    alias_map,
+                    available,
+                )
+                if mapped is None:
+                    return None
+                rewritten.append(mapped)
+                continue
+            rewritten.append(key)
+
+        return rewritten
+
+    def _build_projection_alias_map(
+        self,
+        projection: Projection,
+    ) -> dict:
+        """Build a mapping from projection aliases to expressions."""
+        alias_map = {}
+        index = 0
+        for alias in projection.aliases:
+            expr = projection.expressions[index]
+            alias_map[alias] = expr
+            index += 1
+        return alias_map
+
+    def _map_projection_sort_column(
+        self,
+        key: Expression,
+        alias_map: dict,
+        available: set,
+    ) -> Optional[Expression]:
+        """Map a projection sort column to an input expression if possible."""
+        from ..plan.expressions import ColumnRef
+
+        if not isinstance(key, ColumnRef):
+            return key
+
+        if key.table is None and key.column in alias_map:
+            return alias_map[key.column]
+
+        if key.table:
+            qualified = f"{key.table}.{key.column}"
+            if qualified in available:
+                return key
+
+        if key.column in available:
+            return key
+
+        return None
 
     def _recurse_node(self, plan: LogicalPlanNode) -> LogicalPlanNode:
         """Recurse into node children."""

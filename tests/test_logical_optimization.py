@@ -487,6 +487,39 @@ class TestOrderByPushdown:
         assert result.input.order_by_keys is not None
         assert result.input.order_by_keys[0].column == "order_id"
 
+    def test_order_by_alias_expression_pushdown(self):
+        """ORDER BY alias on computed expression rewrites for pushdown."""
+        scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["order_id"]
+        )
+        expr = BinaryOp(
+            op=BinaryOpType.ADD,
+            left=ColumnRef(None, "order_id", DataType.INTEGER),
+            right=Literal(100, DataType.INTEGER),
+        )
+        project = Projection(scan, [expr], ["oid"])
+        sort = Sort(
+            input=project,
+            sort_keys=[ColumnRef(None, "oid", DataType.INTEGER)],
+            ascending=[True],
+            nulls_order=[None],
+        )
+
+        rule = OrderByPushdownRule()
+        result = rule.apply(sort)
+
+        assert isinstance(result, Sort)
+        assert isinstance(result.input, Projection)
+        assert isinstance(result.input.input, Scan)
+        assert result.input.input.order_by_keys is not None
+        key = result.input.input.order_by_keys[0]
+        assert isinstance(key, BinaryOp)
+        assert isinstance(key.left, ColumnRef)
+        assert key.left.column == "order_id"
+
     def test_order_by_join_side_pushdown(self):
         """Sort on one join side should annotate that side but keep top sort."""
         left = Scan(
