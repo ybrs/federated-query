@@ -1115,8 +1115,10 @@ class OrderByPushdownRule(OptimizationRule):
 
     def _push_through_join(self, sort: Sort, join: Join) -> LogicalPlanNode:
         """Push ORDER BY metadata into a single join side when safe."""
-        if isinstance(join.left, Scan) and isinstance(join.right, Scan):
-            if join.left.datasource != join.right.datasource:
+        left_scan = self._resolve_scan(join.left)
+        right_scan = self._resolve_scan(join.right)
+        if left_scan is not None and right_scan is not None:
+            if left_scan.datasource != right_scan.datasource:
                 return sort
         sort_cols = self._extract_sort_columns(sort)
         left_cols = self._get_available_columns(join.left)
@@ -1360,6 +1362,29 @@ class OrderByPushdownRule(OptimizationRule):
             return self._recurse_aggregate(plan)
 
         return plan
+
+    def _resolve_scan(self, node: LogicalPlanNode) -> Optional[Scan]:
+        """Return the first Scan found under wrappers (Projection/Filter/Limit/Sort/Aggregate)."""
+        current = node
+        while True:
+            if isinstance(current, Scan):
+                return current
+            if isinstance(current, Projection):
+                current = current.input
+                continue
+            if isinstance(current, Filter):
+                current = current.input
+                continue
+            if isinstance(current, Limit):
+                current = current.input
+                continue
+            if isinstance(current, Sort):
+                current = current.input
+                continue
+            if isinstance(current, Aggregate):
+                current = current.input
+                continue
+            return None
 
     def _recurse_unary(self, plan: LogicalPlanNode) -> LogicalPlanNode:
         """Recurse into unary node."""

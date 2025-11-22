@@ -586,6 +586,56 @@ class TestOrderByPushdown:
         assert result.input.left.order_by_keys[0].column == "id"
         assert result.input.right.order_by_keys is None
 
+    def test_order_by_join_cross_datasource_avoids_pushdown(self):
+        """ORDER BY not pushed into scans when join spans different datasources.
+
+        Example SQL:
+            SELECT o.id
+            FROM ds1.public.orders o
+            JOIN ds2.public.customers c ON o.id = c.id
+            ORDER BY o.id;
+        """
+        left = Projection(
+            input=Scan(
+                datasource="ds1",
+                schema_name="public",
+                table_name="orders",
+                columns=["id"],
+            ),
+            expressions=[ColumnRef(None, "id", DataType.INTEGER)],
+            aliases=["id"],
+        )
+        right = Projection(
+            input=Scan(
+                datasource="ds2",
+                schema_name="public",
+                table_name="customers",
+                columns=["id"],
+            ),
+            expressions=[ColumnRef(None, "id", DataType.INTEGER)],
+            aliases=["id"],
+        )
+        join = Join(left, right, JoinType.INNER, None)
+        sort = Sort(
+            input=join,
+            sort_keys=[ColumnRef("orders", "id", DataType.INTEGER)],
+            ascending=[True],
+            nulls_order=[None],
+        )
+
+        rule = OrderByPushdownRule()
+        result = rule.apply(sort)
+
+        assert isinstance(result, Sort)
+        assert isinstance(result.input, Join)
+        # Metadata should not be pushed into either side
+        assert isinstance(result.input.left, Projection)
+        assert isinstance(result.input.left.input, Scan)
+        assert result.input.left.input.order_by_keys is None
+        assert isinstance(result.input.right, Projection)
+        assert isinstance(result.input.right.input, Scan)
+        assert result.input.right.input.order_by_keys is None
+
     def test_order_by_expression_not_pushed(self):
         """Non-column sort keys keep the top Sort but annotate scan metadata."""
         scan = Scan(
