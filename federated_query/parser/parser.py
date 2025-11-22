@@ -8,7 +8,7 @@ from sqlglot import exp
 from ..plan.logical import (
     LogicalPlanNode,
     Scan,
-    Project,
+    Projection,
     Filter,
     Limit,
     Join,
@@ -635,7 +635,7 @@ class Parser:
     def _build_select_clause(
         self, select: exp.Select, input_plan: LogicalPlanNode
     ) -> LogicalPlanNode:
-        """Build project node from SELECT clause."""
+        """Build projection node from SELECT clause."""
         if isinstance(input_plan, Aggregate):
             return input_plan
 
@@ -653,7 +653,7 @@ class Parser:
             aliases.append(alias)
 
         has_distinct = select.args.get("distinct") is not None
-        return Project(
+        return Projection(
             input=input_plan,
             expressions=expressions,
             aliases=aliases,

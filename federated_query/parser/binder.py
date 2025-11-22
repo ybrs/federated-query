@@ -6,7 +6,7 @@ from ..catalog.schema import Table
 from ..plan.logical import (
     LogicalPlanNode,
     Scan,
-    Project,
+    Projection,
     Filter,
     Limit,
     Sort,
@@ -73,8 +73,8 @@ class Binder:
             return self._bind_scan(plan)
         if isinstance(plan, Filter):
             return self._bind_filter(plan)
-        if isinstance(plan, Project):
-            return self._bind_project(plan)
+        if isinstance(plan, Projection):
+            return self._bind_projection(plan)
         if isinstance(plan, Sort):
             return self._bind_sort(plan)
         if isinstance(plan, Limit):
@@ -119,7 +119,10 @@ class Binder:
         bound_input = self.bind(filter_node.input)
 
         if isinstance(bound_input, Aggregate):
-            bound_predicate = self._bind_having_predicate(filter_node.predicate, bound_input)
+            bound_predicate = self._bind_having_predicate(
+                filter_node.predicate,
+                bound_input,
+            )
         elif isinstance(bound_input, Join):
             tables = self._get_tables_from_join(bound_input.left, bound_input.right)
             bound_predicate = self._bind_join_condition(filter_node.predicate, tables)
@@ -129,33 +132,33 @@ class Binder:
 
         return Filter(input=bound_input, predicate=bound_predicate)
 
-    def _bind_project(self, project: Project) -> Project:
-        """Bind a Project node."""
-        bound_input = self.bind(project.input)
+    def _bind_projection(self, projection: Projection) -> Projection:
+        """Bind a Projection node."""
+        bound_input = self.bind(projection.input)
 
         if self._contains_join(bound_input):
             tables = self._extract_tables_from_tree(bound_input)
             bound_expressions = []
-            for expr in project.expressions:
+            for expr in projection.expressions:
                 bound_expr = self._bind_expression_multi_table(expr, tables)
                 bound_expressions.append(bound_expr)
         else:
             table = self._get_table_from_plan(bound_input)
-            bound_expressions = self._bind_expressions(project.expressions, table)
+            bound_expressions = self._bind_expressions(projection.expressions, table)
 
-        return Project(
+        return Projection(
             input=bound_input,
             expressions=bound_expressions,
-            aliases=project.aliases,
-            distinct=project.distinct,
+            aliases=projection.aliases,
+            distinct=projection.distinct,
         )
 
     def _bind_sort(self, sort: Sort) -> Sort:
         """Bind a Sort node."""
         bound_input = self.bind(sort.input)
 
-        if isinstance(bound_input, Project):
-            bound_keys = self._bind_sort_keys_for_project(sort.sort_keys, bound_input)
+        if isinstance(bound_input, Projection):
+            bound_keys = self._bind_sort_keys_for_projection(sort.sort_keys, bound_input)
             return Sort(
                 input=bound_input,
                 sort_keys=bound_keys,
@@ -254,21 +257,21 @@ class Binder:
             bound_keys.append(bound_key)
         return bound_keys
 
-    def _bind_sort_keys_for_project(
+    def _bind_sort_keys_for_projection(
         self,
         sort_keys: List[Expression],
-        project: Project,
+        projection: Projection,
     ) -> List[Expression]:
-        """Bind ORDER BY keys when input is a Project (supports aliases)."""
-        alias_map = self._build_alias_expression_map(project)
+        """Bind ORDER BY keys when input is a Projection (supports aliases)."""
+        alias_map = self._build_alias_expression_map(projection)
         tables = None
-        if self._contains_join(project.input):
-            tables = self._extract_tables_from_tree(project.input)
-        table = self._get_table_from_plan(project.input)
+        if self._contains_join(projection.input):
+            tables = self._extract_tables_from_tree(projection.input)
+        table = self._get_table_from_plan(projection.input)
 
         bound_keys: List[Expression] = []
         for key in sort_keys:
-            bound_key = self._bind_project_sort_key(
+            bound_key = self._bind_projection_sort_key(
                 key=key,
                 alias_map=alias_map,
                 table=table,
@@ -277,7 +280,7 @@ class Binder:
             bound_keys.append(bound_key)
         return bound_keys
 
-    def _bind_project_sort_key(
+    def _bind_projection_sort_key(
         self,
         key: Expression,
         alias_map: Dict[str, Expression],
@@ -309,13 +312,13 @@ class Binder:
         return self._bind_expression(key, table)
 
     def _build_alias_expression_map(
-        self, project: Project
+        self, projection: Projection
     ) -> Dict[str, Expression]:
         """Map output aliases to their bound expressions."""
         alias_map: Dict[str, Expression] = {}
-        for index in range(len(project.aliases)):
-            alias = project.aliases[index]
-            expression = project.expressions[index]
+        for index in range(len(projection.aliases)):
+            alias = projection.aliases[index]
+            expression = projection.expressions[index]
             alias_map[alias] = expression
         return alias_map
 

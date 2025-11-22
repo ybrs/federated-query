@@ -118,15 +118,15 @@ def test_bind_resolves_column_types(catalog_with_test_data):
     # Bind the plan
     bound_plan = binder.bind(plan)
 
-    # Extract the Project node
-    from federated_query.plan.logical import Project, Filter, Limit
+    # Extract the Projection node
+    from federated_query.plan.logical import Projection, Filter, Limit
 
-    # Traverse to find Project
+    # Traverse to find Projection
     current = bound_plan
     while isinstance(current, Limit):
         current = current.input
 
-    if isinstance(current, Project):
+    if isinstance(current, Projection):
         # Check that expressions have types
         for expr in current.expressions:
             from federated_query.plan.expressions import ColumnRef
@@ -189,10 +189,10 @@ def test_bind_order_by_alias(catalog_with_test_data):
     plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
     bound_plan = binder.bind(plan)
 
-    from federated_query.plan.logical import Project, Sort
+    from federated_query.plan.logical import Projection, Sort
 
     assert isinstance(bound_plan, Sort)
-    assert isinstance(bound_plan.input, Project)
+    assert isinstance(bound_plan.input, Projection)
     sort_node = bound_plan
     project = bound_plan.input
     assert isinstance(sort_node.sort_keys[0], type(project.expressions[0]))

@@ -4,7 +4,7 @@ import pytest
 from federated_query.plan.logical import (
     Scan,
     Filter,
-    Project,
+    Projection,
     Join,
     JoinType,
     Aggregate,
@@ -96,10 +96,10 @@ class TestExpressionSimplificationRule:
             right=Literal(0, DataType.BIGINT)
         )
 
-        project = Project(scan, [expr], ["age_plus_zero"])
+        project = Projection(scan, [expr], ["age_plus_zero"])
 
         result = rule.apply(project)
-        assert isinstance(result, Project)
+        assert isinstance(result, Projection)
         assert result.expressions[0] == col
 
     def test_simplify_join_condition(self):

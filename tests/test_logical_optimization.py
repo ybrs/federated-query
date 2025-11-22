@@ -12,7 +12,7 @@ from federated_query.catalog.catalog import Catalog
 from federated_query.plan.logical import (
     Scan,
     Filter,
-    Project,
+    Projection,
     Limit,
     Join,
     JoinType,
@@ -95,7 +95,7 @@ class TestPredicatePushdown:
             table_name="users",
             columns=["id", "name", "age"]
         )
-        project = Project(
+        project = Projection(
             input=scan,
             expressions=[
                 ColumnRef(None, "id", DataType.INTEGER),
@@ -280,7 +280,7 @@ class TestProjectionPushdown:
             table_name="users",
             columns=["id", "name", "age", "email", "phone"]
         )
-        project = Project(
+        project = Projection(
             input=scan,
             expressions=[
                 ColumnRef(None, "id", DataType.INTEGER),
@@ -292,7 +292,7 @@ class TestProjectionPushdown:
         rule = ProjectionPushdownRule()
         result = rule.apply(project)
 
-        assert isinstance(result, Project)
+        assert isinstance(result, Projection)
         assert isinstance(result.input, Scan)
         assert set(result.input.columns) == {"id", "name"}
 
@@ -310,7 +310,7 @@ class TestProjectionPushdown:
             right=Literal(18, DataType.INTEGER)
         )
         filter_node = Filter(scan, predicate)
-        project = Project(
+        project = Projection(
             input=filter_node,
             expressions=[ColumnRef(None, "name", DataType.VARCHAR)],
             aliases=["name"]
@@ -319,7 +319,7 @@ class TestProjectionPushdown:
         rule = ProjectionPushdownRule()
         result = rule.apply(project)
 
-        assert isinstance(result, Project)
+        assert isinstance(result, Projection)
         assert isinstance(result.input, Filter)
         assert isinstance(result.input.input, Scan)
         scan_cols = set(result.input.input.columns)
@@ -334,7 +334,7 @@ class TestProjectionPushdown:
             table_name="users",
             columns=["id", "name", "age"]
         )
-        project = Project(
+        project = Projection(
             input=scan,
             expressions=[
                 ColumnRef(None, "id", DataType.INTEGER),
@@ -397,7 +397,7 @@ class TestLimitPushdown:
             table_name="users",
             columns=["id", "name"]
         )
-        project = Project(
+        project = Projection(
             input=scan,
             expressions=[ColumnRef(None, "id", DataType.INTEGER)],
             aliases=["id"]
@@ -407,7 +407,7 @@ class TestLimitPushdown:
         rule = LimitPushdownRule()
         result = rule.apply(limit)
 
-        assert isinstance(result, Project)
+        assert isinstance(result, Projection)
         assert isinstance(result.input, Limit)
         assert result.input.limit == 10
 
@@ -467,7 +467,7 @@ class TestOrderByPushdown:
             table_name="orders",
             columns=["order_id", "amount"]
         )
-        project = Project(
+        project = Projection(
             input=scan,
             expressions=[ColumnRef(None, "order_id", DataType.INTEGER)],
             aliases=["oid"]
@@ -482,7 +482,7 @@ class TestOrderByPushdown:
         rule = OrderByPushdownRule()
         result = rule.apply(sort)
 
-        assert isinstance(result, Project)
+        assert isinstance(result, Projection)
         assert isinstance(result.input, Scan)
         assert result.input.order_by_keys is not None
         assert result.input.order_by_keys[0].column == "order_id"
@@ -647,7 +647,7 @@ class TestRuleBasedOptimizer:
             table_name="users",
             columns=["id", "name", "age"]
         )
-        project = Project(
+        project = Projection(
             input=scan,
             expressions=[ColumnRef(None, "id", DataType.INTEGER)],
             aliases=["id"]
@@ -659,7 +659,7 @@ class TestRuleBasedOptimizer:
 
         result = optimizer.optimize(limit)
 
-        assert isinstance(result, Project)
+        assert isinstance(result, Projection)
         assert isinstance(result.input, Limit)
 
     def test_optimizer_reaches_fixed_point(self, catalog):
@@ -696,7 +696,7 @@ class TestComplexOptimizations:
             right=Literal(18, DataType.INTEGER)
         )
         filter_node = Filter(scan, predicate)
-        project = Project(
+        project = Projection(
             input=filter_node,
             expressions=[ColumnRef(None, "id", DataType.INTEGER)],
             aliases=["id"]

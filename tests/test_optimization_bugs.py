@@ -9,7 +9,7 @@ from federated_query.optimizer.rules import (
 from federated_query.plan.logical import (
     Scan,
     Filter,
-    Project,
+    Projection,
     Limit,
     Join,
     JoinType,
@@ -70,7 +70,7 @@ class TestLimitPushdownSemantics:
             table_name="users",
             columns=["id", "name", "age"]
         )
-        project = Project(
+        project = Projection(
             input=scan,
             expressions=[
                 ColumnRef(None, "id", DataType.INTEGER),
@@ -84,7 +84,7 @@ class TestLimitPushdownSemantics:
         result = rule.apply(limit)
 
         # Limit should push below projection
-        assert isinstance(result, Project)
+        assert isinstance(result, Projection)
         assert isinstance(result.input, Limit)
         assert result.input.limit == 10
 
@@ -142,7 +142,7 @@ class TestColumnPruningWithSelectStar:
             right=Literal(18, DataType.INTEGER)
         )
         filter_node = Filter(scan, predicate)
-        project = Project(
+        project = Projection(
             input=filter_node,
             expressions=[
                 ColumnRef(None, "id", DataType.INTEGER),
@@ -155,7 +155,7 @@ class TestColumnPruningWithSelectStar:
         result = rule.apply(project)
 
         # Should only keep id, name, age (not email, phone)
-        assert isinstance(result, Project)
+        assert isinstance(result, Projection)
         assert isinstance(result.input, Filter)
         assert isinstance(result.input.input, Scan)
         scan_cols = set(result.input.input.columns)

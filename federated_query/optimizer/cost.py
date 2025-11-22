@@ -4,7 +4,7 @@ from typing import Dict, Any, Optional
 from ..plan.logical import (
     LogicalPlanNode,
     Scan,
-    Project,
+    Projection,
     Filter,
     Join,
     Aggregate,
@@ -58,8 +58,8 @@ class CostModel:
             return self._estimate_scan_cardinality(plan)
         if isinstance(plan, Filter):
             return self._estimate_filter_cardinality(plan)
-        if isinstance(plan, Project):
-            return self._estimate_project_cardinality(plan)
+        if isinstance(plan, Projection):
+            return self._estimate_projection_cardinality(plan)
         if isinstance(plan, Join):
             return self._estimate_join_cardinality(plan)
         if isinstance(plan, Aggregate):
@@ -101,9 +101,9 @@ class CostModel:
         )
         return max(1, int(input_card * selectivity))
 
-    def _estimate_project_cardinality(self, project: Project) -> int:
+    def _estimate_projection_cardinality(self, projection: Projection) -> int:
         """Estimate cardinality of projection (same as input)."""
-        return self.estimate_cardinality(project.input)
+        return self.estimate_cardinality(projection.input)
 
     def _estimate_join_cardinality(self, join: Join) -> int:
         """Estimate cardinality of a join."""
@@ -305,8 +305,8 @@ class CostModel:
             return self._estimate_scan_cost(plan)
         if isinstance(plan, Filter):
             return self._estimate_filter_cost(plan)
-        if isinstance(plan, Project):
-            return self._estimate_project_cost(plan)
+        if isinstance(plan, Projection):
+            return self._estimate_projection_cost(plan)
         if isinstance(plan, Join):
             return self._estimate_join_cost(plan)
         if isinstance(plan, Aggregate):
@@ -331,11 +331,11 @@ class CostModel:
         cpu_cost = input_card * self.config.cpu_tuple_cost * 2
         return input_cost + cpu_cost
 
-    def _estimate_project_cost(self, project: Project) -> float:
+    def _estimate_projection_cost(self, projection: Projection) -> float:
         """Estimate cost of projection."""
-        input_cost = self.estimate_logical_plan_cost(project.input)
-        input_card = self.estimate_cardinality(project.input)
-        num_exprs = len(project.expressions)
+        input_cost = self.estimate_logical_plan_cost(projection.input)
+        input_card = self.estimate_cardinality(projection.input)
+        num_exprs = len(projection.expressions)
         cpu_cost = input_card * num_exprs * self.config.cpu_tuple_cost
         return input_cost + cpu_cost
 
@@ -379,8 +379,8 @@ class CostModel:
             return self._estimate_physical_scan_cost(plan)
         if "Filter" in plan_name:
             return self._estimate_physical_filter_cost(plan)
-        if "Project" in plan_name:
-            return self._estimate_physical_project_cost(plan)
+        if "Projection" in plan_name:
+            return self._estimate_physical_projection_cost(plan)
         if "Join" in plan_name:
             return self._estimate_physical_join_cost(plan)
         if "Aggregate" in plan_name:
@@ -398,8 +398,8 @@ class CostModel:
         """Estimate cost of physical filter."""
         return 50.0
 
-    def _estimate_physical_project_cost(self, project) -> float:
-        """Estimate cost of physical project."""
+    def _estimate_physical_projection_cost(self, projection) -> float:
+        """Estimate cost of physical projection."""
         return 30.0
 
     def _estimate_physical_join_cost(self, join) -> float:

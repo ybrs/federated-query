@@ -3,7 +3,7 @@
 from .logical import (
     LogicalPlanNode,
     Scan,
-    Project,
+    Projection,
     Filter,
     Join,
     Aggregate,
@@ -16,7 +16,7 @@ from .logical import (
 from .physical import (
     PhysicalPlanNode,
     PhysicalScan,
-    PhysicalProject,
+    PhysicalProjection,
     PhysicalFilter,
     PhysicalHashJoin,
     PhysicalNestedLoopJoin,
@@ -40,7 +40,7 @@ __all__ = [
     # Logical nodes
     "LogicalPlanNode",
     "Scan",
-    "Project",
+    "Projection",
     "Filter",
     "Join",
     "Aggregate",
@@ -52,7 +52,7 @@ __all__ = [
     # Physical nodes
     "PhysicalPlanNode",
     "PhysicalScan",
-    "PhysicalProject",
+    "PhysicalProjection",
     "PhysicalFilter",
     "PhysicalHashJoin",
     "PhysicalNestedLoopJoin",

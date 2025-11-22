@@ -264,8 +264,8 @@ class PhysicalScan(PhysicalPlanNode):
 
 
 @dataclass
-class PhysicalProject(PhysicalPlanNode):
-    """Project expressions."""
+class PhysicalProjection(PhysicalPlanNode):
+    """Projection expressions."""
 
     input: PhysicalPlanNode
     expressions: List[Expression]
@@ -337,7 +337,7 @@ class PhysicalProject(PhysicalPlanNode):
         raise NotImplementedError("Cost estimation not yet implemented")
 
     def __repr__(self) -> str:
-        return f"PhysicalProject({len(self.expressions)} exprs)"
+        return f"PhysicalProjection({len(self.expressions)} exprs)"
 
     def _resolve_column(
         self,
@@ -1855,7 +1855,7 @@ class _PlanFormatter:
     def __init__(self):
         self._detail_builders: Dict[type, Callable[[PhysicalPlanNode], str]] = {}
         self._detail_builders[PhysicalScan] = self._scan_detail
-        self._detail_builders[PhysicalProject] = self._project_detail
+        self._detail_builders[PhysicalProjection] = self._projection_detail
         self._detail_builders[PhysicalFilter] = self._filter_detail
         self._detail_builders[PhysicalLimit] = self._limit_detail
         self._detail_builders[PhysicalHashJoin] = self._hash_join_detail
@@ -1912,7 +1912,7 @@ class _PlanFormatter:
             detail = f"{detail} filter={node.filters}"
         return detail
 
-    def _project_detail(self, node: PhysicalProject) -> str:
+    def _projection_detail(self, node: PhysicalProjection) -> str:
         names = self._format_column_list(node.output_names)
         if names:
             return f"columns={names}"

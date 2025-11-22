@@ -6,7 +6,7 @@ from ..datasources.base import DataSource, DataSourceCapability
 from ..plan.logical import (
     LogicalPlanNode,
     Scan,
-    Project,
+    Projection,
     Filter,
     Limit,
     Join,
@@ -18,7 +18,7 @@ from ..plan.logical import (
 from ..plan.physical import (
     PhysicalPlanNode,
     PhysicalScan,
-    PhysicalProject,
+    PhysicalProjection,
     PhysicalFilter,
     PhysicalLimit,
     PhysicalHashJoin,
@@ -68,8 +68,8 @@ class PhysicalPlanner:
             return self._plan_scan(node)
         if isinstance(node, Filter):
             return self._plan_filter(node)
-        if isinstance(node, Project):
-            return self._plan_project(node)
+        if isinstance(node, Projection):
+            return self._plan_projection(node)
         if isinstance(node, Limit):
             return self._plan_limit(node)
         if isinstance(node, Sort):
@@ -113,16 +113,16 @@ class PhysicalPlanner:
         input_plan = self._plan_node(filter_node.input)
         return PhysicalFilter(input=input_plan, predicate=filter_node.predicate)
 
-    def _plan_project(self, project: Project) -> PhysicalProject:
-        """Plan a project node."""
-        input_plan = self._plan_node(project.input)
-        if project.distinct:
+    def _plan_projection(self, projection: Projection) -> PhysicalProjection:
+        """Plan a projection node."""
+        input_plan = self._plan_node(projection.input)
+        if projection.distinct:
             self._propagate_distinct(input_plan)
-        return PhysicalProject(
+        return PhysicalProjection(
             input=input_plan,
-            expressions=project.expressions,
-            output_names=project.aliases,
-            distinct=project.distinct,
+            expressions=projection.expressions,
+            output_names=projection.aliases,
+            distinct=projection.distinct,
         )
 
     def _propagate_distinct(self, node: PhysicalPlanNode) -> None:
