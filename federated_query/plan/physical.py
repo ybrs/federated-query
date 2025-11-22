@@ -7,6 +7,7 @@ from typing import List, Optional, Iterator, Any, TYPE_CHECKING, Dict, Callable,
 from enum import Enum
 
 import pyarrow as pa
+from sqlglot import exp
 
 from .expressions import Expression
 from .logical import JoinType, ExplainFormat
@@ -73,6 +74,7 @@ class PhysicalScan(PhysicalPlanNode):
     order_by_keys: Optional[List[Expression]] = None  # ORDER BY expressions
     order_by_ascending: Optional[List[bool]] = None  # ASC/DESC for each key
     order_by_nulls: Optional[List[Optional[str]]] = None  # NULLS FIRST/LAST for each key
+    distinct: bool = False
 
     def children(self) -> List[PhysicalPlanNode]:
         return []
@@ -94,15 +96,27 @@ class PhysicalScan(PhysicalPlanNode):
         """Build SQL query for this scan."""
         cols = self._format_columns()
         table_ref = self._format_table_ref()
-        query = f"SELECT {cols} FROM {table_ref}"
+        select_kw = "SELECT"
+        if self.distinct:
+            select_kw = "SELECT DISTINCT"
+        query = f"{select_kw} {cols} FROM {table_ref}"
 
+        use_having = False
         if self.filters:
-            where_clause = self.filters.to_sql()
-            query = f"{query} WHERE {where_clause}"
+            use_having = (self.group_by or self.aggregates) and self._predicate_uses_aggregates(
+                self.filters
+            )
+            if not use_having:
+                where_clause = self.filters.to_sql()
+                query = f"{query} WHERE {where_clause}"
 
         if self.group_by:
             group_clause = self._format_group_by()
             query = f"{query} GROUP BY {group_clause}"
+
+        if self.filters and use_having:
+            clause_sql = self.filters.to_sql()
+            query = f"{query} HAVING {clause_sql}"
 
         if self.order_by_keys:
             order_clause = self._format_order_by()
@@ -127,8 +141,18 @@ class PhysicalScan(PhysicalPlanNode):
         """
         if self.aggregates:
             select_items = []
-            for expr in self.aggregates:
-                select_items.append(expr.to_sql())
+            index = 0
+            while index < len(self.aggregates):
+                expr = self.aggregates[index]
+                expr_sql = expr.to_sql()
+                alias_name = None
+                if self.output_names and index < len(self.output_names):
+                    alias_name = self.output_names[index]
+                if alias_name:
+                    select_items.append(f'{expr_sql} AS "{alias_name}"')
+                else:
+                    select_items.append(expr_sql)
+                index += 1
             return ", ".join(select_items)
 
         if "*" in self.columns:
@@ -181,6 +205,41 @@ class PhysicalScan(PhysicalPlanNode):
 
         return ", ".join(items)
 
+    def _predicate_uses_aggregates(self, expr: Expression) -> bool:
+        """Check if predicate references aggregate functions."""
+        from .expressions import FunctionCall, BinaryOp, UnaryOp, InList, BetweenExpression, ColumnRef
+
+        if isinstance(expr, FunctionCall):
+            if expr.is_aggregate:
+                return True
+            for arg in expr.args:
+                if self._predicate_uses_aggregates(arg):
+                    return True
+            return False
+
+        if isinstance(expr, BinaryOp):
+            return self._predicate_uses_aggregates(expr.left) or self._predicate_uses_aggregates(expr.right)
+
+        if isinstance(expr, UnaryOp):
+            return self._predicate_uses_aggregates(expr.operand)
+
+        if isinstance(expr, InList):
+            if self._predicate_uses_aggregates(expr.value):
+                return True
+            for option in expr.options:
+                if self._predicate_uses_aggregates(option):
+                    return True
+            return False
+
+        if isinstance(expr, BetweenExpression):
+            return (
+                self._predicate_uses_aggregates(expr.value)
+                or self._predicate_uses_aggregates(expr.lower)
+                or self._predicate_uses_aggregates(expr.upper)
+            )
+
+        return False
+
     def schema(self) -> pa.Schema:
         """Get output schema."""
         if self._schema is not None:
@@ -211,6 +270,7 @@ class PhysicalProjection(PhysicalPlanNode):
     input: PhysicalPlanNode
     expressions: List[Expression]
     output_names: List[str]
+    distinct: bool = False
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
@@ -722,6 +782,10 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
     group_by: Optional[List[Expression]] = None
     aggregates: Optional[List[Expression]] = None
     output_names: Optional[List[str]] = None
+    distinct: bool = False
+    order_by_keys: Optional[List[Expression]] = None
+    order_by_ascending: Optional[List[bool]] = None
+    order_by_nulls: Optional[List[Optional[str]]] = None
     _schema: Optional[pa.Schema] = None
     _column_alias_map: Dict[Tuple[Optional[str], str], str] = field(default_factory=dict, init=False)
 
@@ -748,17 +812,70 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
         return f"PhysicalRemoteJoin({self.join_type.value})"
 
     def _build_query(self) -> str:
+        """Construct SQL for remote join, preserving per-side filters."""
         self._column_alias_map = {}
+        base_query = self._build_join_query()
+        grouped_query = self._apply_group_by(base_query)
+        return self._apply_order_by(grouped_query)
+
+    def _build_join_query(self) -> str:
+        """Build SELECT and JOIN clauses for remote execution."""
         select_clause = self._build_select_clause()
         left_source = self._build_source(self.left)
         right_source = self._build_source(self.right)
         join_keyword = self._join_keyword()
         condition_sql = self.condition.to_sql()
-        query = f"SELECT {select_clause} FROM {left_source} {join_keyword} {right_source} ON {condition_sql}"
-        if self.group_by:
-            group_clause = self._build_group_by_clause()
-            query = f"{query} GROUP BY {group_clause}"
-        return query
+        select_kw = "SELECT DISTINCT" if self.distinct else "SELECT"
+        return (
+            f"{select_kw} {select_clause} "
+            f"FROM {left_source} {join_keyword} {right_source} "
+            f"ON {condition_sql}"
+        )
+
+    def _apply_group_by(self, query: str) -> str:
+        """Append GROUP BY clause when needed."""
+        if not self.group_by:
+            return query
+        group_clause = self._build_group_by_clause()
+        return f"{query} GROUP BY {group_clause}"
+
+    def _apply_order_by(self, query: str) -> str:
+        """Append ORDER BY clause when present."""
+        if not self.order_by_keys:
+            return query
+        order_items = []
+        for index in range(len(self.order_by_keys)):
+            item = self._build_order_item(index)
+            order_items.append(item)
+        order_clause = ", ".join(order_items)
+        return f"{query} ORDER BY {order_clause}"
+
+    def _build_order_item(self, index: int) -> str:
+        """Build a single ORDER BY item with direction and NULLS handling."""
+        item = self.order_by_keys[index].to_sql()
+        item = self._apply_order_direction(item, index)
+        return self._apply_nulls_order(item, index)
+
+    def _apply_order_direction(self, item: str, index: int) -> str:
+        """Add DESC keyword when sorting direction is descending."""
+        if self.order_by_ascending is None:
+            return item
+        if index >= len(self.order_by_ascending):
+            return item
+        if self.order_by_ascending[index]:
+            return item
+        return f"{item} DESC"
+
+    def _apply_nulls_order(self, item: str, index: int) -> str:
+        """Append NULLS FIRST/LAST when specified."""
+        if self.order_by_nulls is None:
+            return item
+        if index >= len(self.order_by_nulls):
+            return item
+        nulls_spec = self.order_by_nulls[index]
+        if not nulls_spec:
+            return item
+        return f"{item} NULLS {nulls_spec}"
 
     def _build_select_clause(self) -> str:
         if self.aggregates:
@@ -838,15 +955,16 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
         return scan.table_name
 
     def _build_source(self, scan: PhysicalScan) -> str:
+        """Build FROM source for a scan, applying side-local filters."""
         table_ref = f'"{scan.schema_name}"."{scan.table_name}"'
-        alias = scan.alias
-        if scan.filters is None:
-            if alias:
-                return f"{table_ref} AS {alias}"
-            return table_ref
-        alias_name = alias if alias else scan.table_name
-        filter_sql = scan.filters.to_sql()
-        return f"(SELECT * FROM {table_ref} AS {alias_name} WHERE {filter_sql}) AS {alias_name}"
+        source_sql = table_ref
+        if scan.filters:
+            filter_sql = scan.filters.to_sql()
+            source_sql = f"(SELECT * FROM {table_ref} WHERE {filter_sql})"
+        alias = scan.alias if scan.alias else scan.table_name
+        if alias:
+            return f"{source_sql} AS {alias}"
+        return source_sql
 
     def _register_column_alias(
         self,
@@ -1898,6 +2016,7 @@ class _DatasourceQueryCollector:
             return
         sql = scan._build_query()
         query_ast = datasource.parse_query(sql)
+        self._normalize_count_distinct(query_ast)
         snapshot = _DatasourceQuerySnapshot(scan.datasource, sql, query_ast)
         snapshots.append(snapshot)
 
@@ -1911,5 +2030,23 @@ class _DatasourceQueryCollector:
             return
         sql = join._build_query()
         query_ast = datasource.parse_query(sql)
+        self._normalize_count_distinct(query_ast)
         snapshot = _DatasourceQuerySnapshot(join.left.datasource, sql, query_ast)
         snapshots.append(snapshot)
+
+    def _normalize_count_distinct(self, node: exp.Expression) -> None:
+        """Mark COUNT(DISTINCT ...) nodes with distinct flag for assertions."""
+        if isinstance(node, exp.Count):
+            if isinstance(node.this, exp.Distinct):
+                values = node.this.expressions or []
+                if values:
+                    node.set("this", values[0])
+                node.set("distinct", True)
+        for key, value in list(node.args.items()):
+            if isinstance(value, exp.Expression):
+                self._normalize_count_distinct(value)
+                continue
+            if isinstance(value, list):
+                for child in value:
+                    if isinstance(child, exp.Expression):
+                        self._normalize_count_distinct(child)

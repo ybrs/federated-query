@@ -68,7 +68,7 @@ datasources:
 
 **Logical Plan Nodes**:
 - `Scan`: Read from a table (with optional filters)
-- `Project`: Column projection and expression evaluation
+- `Projection`: Column projection and expression evaluation
 - `Filter`: Row filtering with predicates
 - `Join`: Join operations (inner, left, right, full, cross)
 - `Aggregate`: Grouping and aggregation

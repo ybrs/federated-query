@@ -52,7 +52,7 @@ A federated query engine must minimize data transfer from remote sources. Withou
 - **LIMIT ALONE is unsafe for pushdown in multi-node scenarios** (non-deterministic results)
 
 ### 3. Pushdown Boundaries
-- **Can push through**: `Project`, `Filter` (if all sort columns are available)
+- **Can push through**: `Projection`, `Filter` (if all sort columns are available)
 - **Cannot push through**: `Join`, `Aggregate`, `Union` (changes row order or aggregates data)
 - **Target**: Always push to `Scan` when possible
 
@@ -82,8 +82,8 @@ SELECT name, price FROM products ORDER BY price
 ```
 **Transformation**:
 ```
-Before: Sort(Project(Scan(products)))
-After:  Project(Scan(products, order_by=[price]))
+Before: Sort(Projection(Scan(products)))
+After:  Projection(Scan(products, order_by=[price]))
 ```
 
 #### 1.3 ORDER BY Through Filter
@@ -189,8 +189,8 @@ SELECT name, price FROM products LIMIT 10
 ```
 **Transformation**:
 ```
-Before: Limit(Project(Scan(products)))
-After:  Project(Scan(products, limit=10))
+Before: Limit(Projection(Scan(products)))
+After:  Projection(Scan(products, limit=10))
 ```
 
 #### 2.4 LIMIT Through Filter
@@ -299,8 +299,8 @@ LIMIT 10
 ```
 **Transformation**:
 ```
-Before: Limit(Sort(Project(Filter(Scan(orders)))))
-After:  Project(Filter(Scan(orders, order_by=[total DESC], limit=10)))
+Before: Limit(Sort(Projection(Filter(Scan(orders)))))
+After:  Projection(Filter(Scan(orders, order_by=[total DESC], limit=10)))
 ```
 
 #### 3.3 Partial Pushdown (ORDER BY Stops at Join)
@@ -351,7 +351,7 @@ SELECT price, price * 1.1 as price_with_tax FROM products ORDER BY price_with_ta
 ```
 **Transformation**: Keep Sort above Scan
 ```
-Sort(Project(Scan(products)))
+Sort(Projection(Scan(products)))
 ```
 **Exception**: If data source supports computed ORDER BY expressions, can push the expression
 
@@ -557,9 +557,9 @@ SELECT * FROM products LIMIT -1  -- ERROR
            """Try to push sort into its input."""
            input_node = sort.input
 
-           # Can push through Project if all sort keys available in input
-           if isinstance(input_node, Project):
-               return self._push_through_project(sort, input_node)
+           # Can push through Projection if all sort keys available in input
+           if isinstance(input_node, Projection):
+               return self._push_through_projection(sort, input_node)
 
            # Can push through Filter (always safe)
            if isinstance(input_node, Filter):
@@ -593,25 +593,25 @@ SELECT * FROM products LIMIT -1  -- ERROR
                order_nulls=sort.nulls_order,
            )
 
-       def _push_through_project(
-           self, sort: Sort, project: Project
+       def _push_through_projection(
+           self, sort: Sort, projection: Projection
        ) -> LogicalPlanNode:
            """Push ORDER BY through projection if all sort columns available."""
            # Check if all sort columns are available in projection input
-           input_cols = self._get_available_columns(project.input)
+           input_cols = self._get_available_columns(projection.input)
            sort_cols = self._extract_sort_columns(sort)
 
            if not sort_cols.issubset(input_cols):
                # Cannot push - sort columns not all available in input
-               # Keep Sort above Project
+               # Keep Sort above Projection
                return sort
 
-           # Push Sort below Project
-           new_input = self._push_order_by(project.input)
+           # Push Sort below Projection
+           new_input = self._push_order_by(projection.input)
            if isinstance(new_input, Scan):
                # Successfully pushed to scan, wrap with project
                new_scan = self._push_to_scan(sort, new_input)
-               return Project(new_scan, project.expressions, project.aliases)
+               return Projection(new_scan, projection.expressions, projection.aliases)
 
            # Could not push to scan, keep original structure
            return sort

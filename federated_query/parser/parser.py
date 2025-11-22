@@ -652,7 +652,14 @@ class Parser:
             alias = self._get_alias(select_expr)
             aliases.append(alias)
 
-        return Projection(input=input_plan, expressions=expressions, aliases=aliases)
+        distinct_arg = select.args.get("distinct")
+        has_distinct = bool(distinct_arg)
+        return Projection(
+            input=input_plan,
+            expressions=expressions,
+            aliases=aliases,
+            distinct=has_distinct,
+        )
 
     def _get_alias(self, expr: exp.Expression) -> str:
         """Get alias for expression.
@@ -749,6 +756,8 @@ class Parser:
             return self._convert_between_expression(expr)
         if isinstance(expr, exp.Column):
             return self._convert_column(expr)
+        if isinstance(expr, exp.Is):
+            return self._convert_is_expression(expr)
         if isinstance(expr, exp.Literal):
             return self._convert_literal(expr)
         if isinstance(expr, exp.Null):
@@ -765,6 +774,8 @@ class Parser:
             return self._convert_case_expression(expr)
         if self._is_aggregate_function(expr):
             return self._convert_aggregate_function(expr)
+        if isinstance(expr, (exp.Anonymous, exp.Func, exp.Upper)):
+            return self._convert_function_call(expr)
 
         raise ValueError(f"Unsupported expression type: {type(expr)}")
 
@@ -783,6 +794,16 @@ class Parser:
         low_expr = self._convert_expression(expr.args["low"])
         high_expr = self._convert_expression(expr.args["high"])
         return BetweenExpression(value=value_expr, lower=low_expr, upper=high_expr)
+
+    def _convert_is_expression(self, expr: exp.Is) -> Expression:
+        """Convert IS and IS NOT comparisons into unary operations."""
+        operand = self._convert_expression(expr.this)
+        comparison = expr.expression
+        if isinstance(comparison, exp.Null):
+            return UnaryOp(op=UnaryOpType.IS_NULL, operand=operand)
+        if isinstance(comparison, exp.Not) and isinstance(comparison.this, exp.Null):
+            return UnaryOp(op=UnaryOpType.IS_NOT_NULL, operand=operand)
+        raise ValueError("IS comparison supports only NULL and NOT NULL")
 
     def _convert_case_expression(self, expr: exp.Case) -> Expression:
         """Convert CASE expression."""
@@ -860,6 +881,9 @@ class Parser:
 
     def _convert_unary(self, unary: exp.Unary) -> UnaryOp:
         """Convert sqlglot unary operation."""
+        if isinstance(unary, exp.Paren):
+            return self._convert_expression(unary.this)
+
         operand = self._convert_expression(unary.this)
         op = self._map_unary_op(unary)
         return UnaryOp(op=op, operand=operand)
@@ -883,26 +907,49 @@ class Parser:
             FunctionCall expression
         """
         func_name = type(func).__name__.upper()
-        args = self._extract_function_args(func)
-        return FunctionCall(function_name=func_name, args=args, is_aggregate=True)
+        distinct = bool(func.args.get("distinct"))
+        if isinstance(func.this, exp.Distinct):
+            distinct = True
+        args = self._extract_function_args(func, distinct)
+        return FunctionCall(
+            function_name=func_name,
+            args=args,
+            is_aggregate=True,
+            distinct=distinct,
+        )
 
-    def _extract_function_args(self, func: exp.AggFunc) -> List[Expression]:
+    def _extract_function_args(self, func: exp.AggFunc, distinct: bool) -> List[Expression]:
         """Extract arguments from function.
 
         Args:
             func: sqlglot AggFunc node
+            distinct: True if DISTINCT modifier is present
 
         Returns:
             List of argument expressions
         """
         args = []
-        if hasattr(func, "this") and func.this:
-            arg = self._convert_expression(func.this)
+        value = getattr(func, "this", None)
+        if isinstance(value, exp.Distinct):
+            for child in value.expressions or []:
+                converted = self._convert_expression(child)
+                args.append(converted)
+        elif value is not None:
+            arg = self._convert_expression(value)
             args.append(arg)
         elif isinstance(func, exp.Count):
-            # Handle COUNT(*) style functions where sqlglot leaves arg empty
             args.append(ColumnRef(table=None, column="*"))
         return args
+
+    def _convert_function_call(self, func: exp.Expression) -> FunctionCall:
+        """Convert generic function expressions."""
+        name = func.sql_name().upper()
+        args: List[Expression] = []
+        if hasattr(func, "this") and func.this is not None:
+            args.append(self._convert_expression(func.this))
+        for child in func.expressions or []:
+            args.append(self._convert_expression(child))
+        return FunctionCall(function_name=name, args=args, is_aggregate=False)
 
     def _rewrite_having_predicate(
         self, predicate: Expression, aggregate: Aggregate

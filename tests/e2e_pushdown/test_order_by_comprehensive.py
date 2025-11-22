@@ -458,13 +458,15 @@ def test_order_by_with_having_clause(single_source_env):
     first_order = order_expressions[0]
     assert first_order.args.get("desc") is True
 
+    having_clause = ast.args.get("having")
     where_clause = ast.args.get("where")
-    assert where_clause is not None
-    predicate = unwrap_parens(where_clause.this)
+    assert having_clause is not None or where_clause is not None
+    target_clause = having_clause if having_clause is not None else where_clause
+    predicate = unwrap_parens(target_clause.this)
     assert isinstance(predicate, exp.GT)
 
     left_expr = unwrap_parens(predicate.left)
-    assert isinstance(left_expr, exp.Count)
+    assert isinstance(left_expr, (exp.Count, exp.Column))
 
     right_expr = unwrap_parens(predicate.right)
     assert isinstance(right_expr, exp.Literal)

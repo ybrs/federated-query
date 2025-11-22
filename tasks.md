@@ -60,12 +60,12 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 
 ### 1.1 Parser and AST Conversion ✅
 - [x] Integrate sqlglot parser (can parse SQL to AST)
-- [x] Create logical plan node base classes (Scan, Project, Filter, Limit)
+- [x] Create logical plan node base classes (Scan, Projection, Filter, Limit)
 - [x] Implement AST to logical plan converter (parser.py:ast_to_logical_plan)
   - [x] Handle SELECT statements
   - [x] Handle FROM clauses (create Scan nodes)
   - [x] Handle WHERE clauses (create Filter nodes)
-  - [x] Handle column selections (create Project nodes)
+  - [x] Handle column selections (create Projection nodes)
   - [x] Handle LIMIT clauses
 - [x] Test parser with various simple queries (4 tests passing)
 
@@ -104,8 +104,8 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
   - [x] Filter Arrow batches
   - [x] Support comparison operators (=, !=, <, <=, >, >=)
   - [x] Support logical operators (AND, OR)
-- [x] Implement physical project operator (PhysicalProject.execute())
-  - [x] Project/select columns from input batches
+- [x] Implement physical projection operator (PhysicalProjection.execute())
+  - [x] Perform column projection on input batches
   - [x] Handle column references
 - [x] Implement physical limit operator (PhysicalLimit.execute())
   - [x] Limit output rows
@@ -354,7 +354,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
   - [x] Filter cost (input cost + CPU processing)
   - [x] Join cost (build + probe costs)
   - [x] Aggregate cost (hash build + finalize)
-  - [x] Project cost (input cost + expression eval)
+  - [x] Projection cost (input cost + expression eval)
   - [x] Limit cost (minimal CPU cost)
 - [x] Implement cardinality estimation
   - [x] Base table cardinality (from statistics)
@@ -402,7 +402,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - **Cardinality Estimation** (federated_query/optimizer/cost.py:48-161):
   - Scan: Uses table statistics or defaults to 1000
   - Filter: Applies selectivity to input cardinality
-  - Project: Same as input (no row reduction)
+  - Projection: Same as input (no row reduction)
   - Join: Type-aware estimation (INNER, LEFT, RIGHT, FULL, CROSS)
   - Aggregate: 1 for global, estimated groups for GROUP BY
   - Limit: min(input_card, offset + limit)
@@ -614,7 +614,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 6. **FunctionCall Column Extraction**: Fixed _extract_column_refs ignoring FunctionCall expressions, causing incorrect join filter pushdown
 7. **Table Qualifier Handling**: Fixed predicate pushdown ignoring table qualifiers, causing filters on same-named columns (orders.id vs customers.id) to be misrouted to wrong side of join
 8. **Table Alias Handling**: Fixed predicate pushdown failing for aliased tables (FROM users u WHERE u.age > 18) by adding alias field to Scan nodes and using alias when qualifying column names
-9. **Column Pruning Join Keys**: Fixed _collect_required_columns stopping at Project nodes without recursing into input, causing join keys and filter columns to be pruned from scans and breaking queries like SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id
+9. **Column Pruning Join Keys**: Fixed _collect_required_columns stopping at Projection nodes without recursing into input, causing join keys and filter columns to be pruned from scans and breaking queries like SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id
 10. **Aggregate Column Pruning**: Fixed _collect_required_columns stopping at Aggregate nodes without recursing into input, causing join keys and filter columns from aggregate children to be pruned (e.g., SELECT c.country, SUM(o.total) FROM customers c JOIN orders o ON c.id = o.customer_id GROUP BY c.country would lose join keys)
 
 **Future Work** (remaining Phase 6 tasks):

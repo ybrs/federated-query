@@ -90,6 +90,7 @@ class Scan(LogicalPlanNode):
     order_by_keys: Optional[List[Expression]] = None  # ORDER BY expressions
     order_by_ascending: Optional[List[bool]] = None  # ASC/DESC for each key
     order_by_nulls: Optional[List[Optional[str]]] = None  # NULLS FIRST/LAST for each key
+    distinct: bool = False
 
     def children(self) -> List[LogicalPlanNode]:
         return []
@@ -121,7 +122,13 @@ class Scan(LogicalPlanNode):
         limit_str = ""
         if self.limit is not None:
             limit_str = f", limit={self.limit}, offset={self.offset}"
-        return f"Scan({table_ref}, cols={len(self.columns)}{filter_str}{agg_str}{order_str}{limit_str})"
+        distinct_str = ""
+        if self.distinct:
+            distinct_str = ", distinct"
+        return (
+            f"Scan({table_ref}, cols={len(self.columns)}{filter_str}"
+            f"{agg_str}{order_str}{limit_str}{distinct_str})"
+        )
 
 
 @dataclass(frozen=True)
@@ -131,13 +138,14 @@ class Projection(LogicalPlanNode):
     input: LogicalPlanNode
     expressions: List[Expression]
     aliases: List[str]  # Output column names
+    distinct: bool = False
 
     def children(self) -> List[LogicalPlanNode]:
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Projection":
         assert len(children) == 1
-        return Projection(children[0], self.expressions, self.aliases)
+        return Projection(children[0], self.expressions, self.aliases, self.distinct)
 
     def accept(self, visitor):
         return visitor.visit_projection(self)
@@ -146,7 +154,8 @@ class Projection(LogicalPlanNode):
         return self.aliases
 
     def __repr__(self) -> str:
-        return f"Projection({len(self.expressions)} expressions)"
+        prefix = "Distinct " if self.distinct else ""
+        return f"{prefix}Projection({len(self.expressions)} expressions)"
 
 
 @dataclass(frozen=True)

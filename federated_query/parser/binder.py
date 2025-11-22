@@ -119,7 +119,10 @@ class Binder:
         bound_input = self.bind(filter_node.input)
 
         if isinstance(bound_input, Aggregate):
-            bound_predicate = self._bind_having_predicate(filter_node.predicate, bound_input)
+            bound_predicate = self._bind_having_predicate(
+                filter_node.predicate,
+                bound_input,
+            )
         elif isinstance(bound_input, Join):
             tables = self._get_tables_from_join(bound_input.left, bound_input.right)
             bound_predicate = self._bind_join_condition(filter_node.predicate, tables)
@@ -147,6 +150,7 @@ class Binder:
             input=bound_input,
             expressions=bound_expressions,
             aliases=projection.aliases,
+            distinct=projection.distinct,
         )
 
     def _bind_sort(self, sort: Sort) -> Sort:
@@ -155,6 +159,27 @@ class Binder:
 
         if isinstance(bound_input, Projection):
             bound_keys = self._bind_sort_keys_for_projection(sort.sort_keys, bound_input)
+            return Sort(
+                input=bound_input,
+                sort_keys=bound_keys,
+                ascending=sort.ascending,
+                nulls_order=sort.nulls_order,
+            )
+
+        if isinstance(bound_input, Aggregate):
+            bound_keys = self._bind_sort_keys_for_aggregate(sort.sort_keys, bound_input)
+            return Sort(
+                input=bound_input,
+                sort_keys=bound_keys,
+                ascending=sort.ascending,
+                nulls_order=sort.nulls_order,
+            )
+
+        if isinstance(bound_input, Filter) and isinstance(bound_input.input, Aggregate):
+            bound_keys = self._bind_sort_keys_for_aggregate(
+                sort.sort_keys,
+                bound_input.input,
+            )
             return Sort(
                 input=bound_input,
                 sort_keys=bound_keys,
@@ -189,6 +214,35 @@ class Binder:
         for key in sort_keys:
             bound_key = self._bind_expression(key, table)
             bound_keys.append(bound_key)
+        return bound_keys
+
+    def _bind_sort_keys_for_aggregate(
+        self,
+        sort_keys: List[Expression],
+        aggregate: Aggregate,
+    ) -> List[Expression]:
+        """Bind ORDER BY keys when input is an Aggregate (supports output aliases)."""
+        alias_map: Dict[str, Expression] = {}
+        for index in range(len(aggregate.output_names)):
+            alias = aggregate.output_names[index]
+            expr = aggregate.aggregates[index]
+            alias_map[alias] = expr
+
+        bound_keys: List[Expression] = []
+        table = self._get_table_from_plan(aggregate.input)
+        for key in sort_keys:
+            if isinstance(key, ColumnRef) and key.table is None:
+                if key.column in alias_map:
+                    expr = alias_map[key.column]
+                    bound_keys.append(
+                        ColumnRef(
+                            table=None,
+                            column=key.column,
+                            data_type=expr.get_type(),
+                        )
+                    )
+                    continue
+            bound_keys.append(self._bind_expression(key, table))
         return bound_keys
 
     def _bind_sort_keys_multi(
@@ -382,7 +436,11 @@ class Binder:
         self, expressions: List[Expression], tables: Dict[Optional[str], Table]
     ) -> List[Expression]:
         """Bind GROUP BY expressions referencing multiple tables."""
-        return [self._bind_expression_multi_table(expr, tables) for expr in expressions]
+        bound: List[Expression] = []
+        for expr in expressions:
+            bound_expr = self._bind_expression_multi_table(expr, tables)
+            bound.append(bound_expr)
+        return bound
 
     def _bind_aggregate_expressions_multi_table(
         self, expressions: List[Expression], tables: Dict[Optional[str], Table]
@@ -403,6 +461,7 @@ class Binder:
                 function_name=expr.function_name,
                 args=bound_args,
                 is_aggregate=expr.is_aggregate,
+                distinct=expr.distinct,
             )
 
         return self._bind_expression(expr, table)
@@ -412,13 +471,15 @@ class Binder:
     ) -> Expression:
         """Bind aggregate expression referencing multiple tables."""
         if isinstance(expr, FunctionCall):
-            bound_args = [
-                self._bind_expression_multi_table(arg, tables) for arg in expr.args
-            ]
+            bound_args = []
+            for arg in expr.args:
+                bound_arg = self._bind_expression_multi_table(arg, tables)
+                bound_args.append(bound_arg)
             return FunctionCall(
                 function_name=expr.function_name,
                 args=bound_args,
                 is_aggregate=expr.is_aggregate,
+                distinct=expr.distinct,
             )
 
         return self._bind_expression_multi_table(expr, tables)
@@ -426,43 +487,33 @@ class Binder:
     def _bind_having_predicate(
         self, predicate: Expression, aggregate: Aggregate
     ) -> Expression:
-        """Bind HAVING predicate against aggregate output schema.
-
-        Args:
-            predicate: HAVING predicate expression
-            aggregate: Aggregate node providing output schema
-
-        Returns:
-            Bound predicate expression
-        """
-        return self._bind_having_expression(predicate, aggregate.output_names)
+        """Bind HAVING predicate against aggregate output schema."""
+        alias_map: Dict[str, Expression] = {}
+        for i in range(len(aggregate.output_names)):
+            alias_map[aggregate.output_names[i]] = aggregate.aggregates[i]
+        return self._bind_having_expression(predicate, alias_map)
 
     def _bind_having_expression(
-        self, expr: Expression, output_names: List[str]
+        self, expr: Expression, alias_map: Dict[str, Expression]
     ) -> Expression:
-        """Bind expression against aggregate output columns.
-
-        Args:
-            expr: Expression to bind
-            output_names: List of output column names from aggregate
-
-        Returns:
-            Bound expression
-        """
+        """Bind expression against aggregate output columns."""
         if isinstance(expr, ColumnRef):
-            if expr.column not in output_names:
-                raise BindingError(
-                    f"Column '{expr.column}' not found in aggregate output"
+            if expr.column in alias_map:
+                source = alias_map[expr.column]
+                return ColumnRef(
+                    table=None,
+                    column=expr.column,
+                    data_type=source.get_type(),
                 )
-            return expr
+            raise BindingError(f"Column '{expr.column}' not found in aggregate output")
 
         if isinstance(expr, BinaryOp):
-            left = self._bind_having_expression(expr.left, output_names)
-            right = self._bind_having_expression(expr.right, output_names)
+            left = self._bind_having_expression(expr.left, alias_map)
+            right = self._bind_having_expression(expr.right, alias_map)
             return BinaryOp(op=expr.op, left=left, right=right)
 
         if isinstance(expr, UnaryOp):
-            operand = self._bind_having_expression(expr.operand, output_names)
+            operand = self._bind_having_expression(expr.operand, alias_map)
             return UnaryOp(op=expr.op, operand=operand)
 
         return expr

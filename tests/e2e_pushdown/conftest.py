@@ -89,6 +89,7 @@ def _seed_products(cursor) -> None:
             id INTEGER,
             category VARCHAR,
             name VARCHAR,
+            price DOUBLE,
             base_price DOUBLE,
             active BOOLEAN
         )
@@ -97,14 +98,14 @@ def _seed_products(cursor) -> None:
     cursor.execute(
         """
         INSERT INTO products VALUES
-        (101, 'clothing', 'jacket', 20.0, TRUE),
-        (102, 'clothing', 'shirt', 30.0, TRUE),
-        (103, 'electronics', 'tablet', 150.0, TRUE),
-        (104, 'electronics', 'phone', 300.0, TRUE),
-        (105, 'home', 'lamp', 40.0, FALSE),
-        (106, 'home', 'desk', 220.0, TRUE),
-        (107, 'home', 'chair', 90.0, TRUE),
-        (108, 'food', 'coffee', 12.0, TRUE)
+        (101, 'clothing', 'jacket', 20.0, 20.0, TRUE),
+        (102, 'clothing', 'shirt', 30.0, 30.0, TRUE),
+        (103, 'electronics', 'tablet', 150.0, 150.0, TRUE),
+        (104, 'electronics', 'phone', 300.0, 300.0, TRUE),
+        (105, 'home', 'lamp', 40.0, 40.0, FALSE),
+        (106, 'home', 'desk', 220.0, 220.0, TRUE),
+        (107, 'home', 'chair', 90.0, 90.0, TRUE),
+        (108, 'food', 'coffee', 12.0, 12.0, TRUE)
         """
     )
 

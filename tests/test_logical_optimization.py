@@ -410,6 +410,30 @@ class TestLimitPushdown:
         assert isinstance(result, Projection)
         assert isinstance(result.input, Limit)
         assert result.input.limit == 10
+        assert result.input.offset == 0
+
+    def test_limit_pushdown_preserves_offset_once(self):
+        """Limit pushdown should not apply offset twice."""
+        scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="users",
+            columns=["id"],
+        )
+        project = Projection(
+            input=scan,
+            expressions=[ColumnRef(None, "id", DataType.INTEGER)],
+            aliases=["id"],
+            distinct=True,
+        )
+        limit = Limit(project, limit=1, offset=1)
+
+        rule = LimitPushdownRule()
+        result = rule.apply(limit)
+
+        assert isinstance(result, Projection)
+        assert isinstance(result.input, Limit)
+        assert result.input.offset == 0
 
     def test_limit_does_not_push_through_filter(self):
         """Test that limit does NOT push through filter.
@@ -439,7 +463,14 @@ class TestLimitPushdown:
         assert result.limit == 10
 
     def test_limit_with_offset(self):
-        """Test limit pushdown with offset."""
+        """SELECT ... LIMIT 10 OFFSET 5 pushdown keeps semantics.
+
+        Logical shape: Limit(Scan, limit=10, offset=5).
+        Optimization: attach limit=10, offset=5 to the scan when the data source
+        supports pushdown, and set the outer Limit offset to 0 so the offset
+        is not applied twice. If pushdown were unsupported, the outer Limit
+        would stay limit=10, offset=5 and the scan would have offset=0.
+        """
         scan = Scan(
             datasource="test_ds",
             schema_name="public",
@@ -451,9 +482,12 @@ class TestLimitPushdown:
         rule = LimitPushdownRule()
         result = rule.apply(limit)
 
+        # Offset is pushed into the scan; outer limit offset resets to 0 to avoid double-application.
         assert isinstance(result, Limit)
         assert result.limit == 10
-        assert result.offset == 5
+        assert result.offset == 0
+        assert isinstance(result.input, Scan)
+        assert result.input.offset == 5
 
 
 class TestOrderByPushdown:
@@ -487,6 +521,39 @@ class TestOrderByPushdown:
         assert result.input.order_by_keys is not None
         assert result.input.order_by_keys[0].column == "order_id"
 
+    def test_order_by_alias_expression_pushdown(self):
+        """ORDER BY alias on computed expression rewrites for pushdown."""
+        scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["order_id"]
+        )
+        expr = BinaryOp(
+            op=BinaryOpType.ADD,
+            left=ColumnRef(None, "order_id", DataType.INTEGER),
+            right=Literal(100, DataType.INTEGER),
+        )
+        project = Projection(scan, [expr], ["oid"])
+        sort = Sort(
+            input=project,
+            sort_keys=[ColumnRef(None, "oid", DataType.INTEGER)],
+            ascending=[True],
+            nulls_order=[None],
+        )
+
+        rule = OrderByPushdownRule()
+        result = rule.apply(sort)
+
+        assert isinstance(result, Sort)
+        assert isinstance(result.input, Projection)
+        assert isinstance(result.input.input, Scan)
+        assert result.input.input.order_by_keys is not None
+        key = result.input.input.order_by_keys[0]
+        assert isinstance(key, BinaryOp)
+        assert isinstance(key.left, ColumnRef)
+        assert key.left.column == "order_id"
+
     def test_order_by_join_side_pushdown(self):
         """Sort on one join side should annotate that side but keep top sort."""
         left = Scan(
@@ -519,8 +586,58 @@ class TestOrderByPushdown:
         assert result.input.left.order_by_keys[0].column == "id"
         assert result.input.right.order_by_keys is None
 
+    def test_order_by_join_cross_datasource_avoids_pushdown(self):
+        """ORDER BY not pushed into scans when join spans different datasources.
+
+        Example SQL:
+            SELECT o.id
+            FROM ds1.public.orders o
+            JOIN ds2.public.customers c ON o.id = c.id
+            ORDER BY o.id;
+        """
+        left = Projection(
+            input=Scan(
+                datasource="ds1",
+                schema_name="public",
+                table_name="orders",
+                columns=["id"],
+            ),
+            expressions=[ColumnRef(None, "id", DataType.INTEGER)],
+            aliases=["id"],
+        )
+        right = Projection(
+            input=Scan(
+                datasource="ds2",
+                schema_name="public",
+                table_name="customers",
+                columns=["id"],
+            ),
+            expressions=[ColumnRef(None, "id", DataType.INTEGER)],
+            aliases=["id"],
+        )
+        join = Join(left, right, JoinType.INNER, None)
+        sort = Sort(
+            input=join,
+            sort_keys=[ColumnRef("orders", "id", DataType.INTEGER)],
+            ascending=[True],
+            nulls_order=[None],
+        )
+
+        rule = OrderByPushdownRule()
+        result = rule.apply(sort)
+
+        assert isinstance(result, Sort)
+        assert isinstance(result.input, Join)
+        # Metadata should not be pushed into either side
+        assert isinstance(result.input.left, Projection)
+        assert isinstance(result.input.left.input, Scan)
+        assert result.input.left.input.order_by_keys is None
+        assert isinstance(result.input.right, Projection)
+        assert isinstance(result.input.right.input, Scan)
+        assert result.input.right.input.order_by_keys is None
+
     def test_order_by_expression_not_pushed(self):
-        """Non-column sort keys should not be pushed."""
+        """Non-column sort keys keep the top Sort but annotate scan metadata."""
         scan = Scan(
             datasource="test_ds",
             schema_name="public",
@@ -545,7 +662,8 @@ class TestOrderByPushdown:
 
         assert isinstance(result, Sort)
         assert isinstance(result.input, Scan)
-        assert result.input.order_by_keys is None
+        assert result.input.order_by_keys is not None
+        assert result.input.order_by_keys[0] == expr
 
     def test_order_by_group_by_pushdown(self):
         """Sort on group-by column should annotate scan when aggregate is pushed."""

@@ -186,6 +186,7 @@ class FunctionCall(Expression):
     function_name: str
     args: List[Expression]
     is_aggregate: bool = False
+    distinct: bool = False
 
     def get_type(self) -> DataType:
         # Type depends on function - needs catalog lookup
@@ -200,8 +201,14 @@ class FunctionCall(Expression):
         return visitor.visit_function_call(self)
 
     def to_sql(self) -> str:
-        args_sql = ", ".join(arg.to_sql() for arg in self.args)
-        return f"{self.function_name}({args_sql})"
+        args_sql_parts = []
+        for arg in self.args:
+            args_sql_parts.append(arg.to_sql())
+        args_sql = ", ".join(args_sql_parts)
+        prefix = ""
+        if self.distinct:
+            prefix = "DISTINCT "
+        return f"{self.function_name}({prefix}{args_sql})"
 
     def __repr__(self) -> str:
         return f"FunctionCall({self.function_name}, {self.args})"

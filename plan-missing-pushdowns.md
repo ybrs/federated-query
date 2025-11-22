@@ -1,6 +1,6 @@
 Plan: Close ORDER BY pushdown gaps
 
-Goal: broaden ORDER BY pushdown beyond the current “Sort → Project/Filter → Scan” shape and ensure alias/star handling is robust.
+Goal: broaden ORDER BY pushdown beyond the current “Sort → Projection/Filter → Scan” shape and ensure alias/star handling is robust.
 
 Current gaps (updated)
 - Sort on aggregates: pushdown now annotates scans when sort keys align with group-by columns; still limited to simple group-by scans.

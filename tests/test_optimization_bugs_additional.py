@@ -1561,8 +1561,8 @@ class TestLimitPushdownNotRecursing:
         # Currently the rule doesn't recurse into Filter, so nothing changes
         # After fix: should have Filter(Projection(Limit(Scan)))
         assert isinstance(result, Filter), "Should still be Filter at root"
-        assert isinstance(result.input, Projection), "Should have Project after pushing limit down"
-        assert isinstance(result.input.input, Limit), "Limit should have pushed below Project"
+        assert isinstance(result.input, Projection), "Should have Projection after pushing limit down"
+        assert isinstance(result.input.input, Limit), "Limit should have pushed below Projection"
         assert isinstance(result.input.input.input, Scan), "Limit should be above Scan"
 
     def test_limit_nested_under_join_not_optimized(self):
@@ -1621,8 +1621,8 @@ class TestLimitPushdownNotRecursing:
         # Currently the rule doesn't recurse into Join, so nothing changes
         # After fix: left child should be Projection(Limit(Scan))
         assert isinstance(result, Join), "Should still be Join at root"
-        assert isinstance(result.left, Projection), "Left child should have Project after pushing limit"
-        assert isinstance(result.left.input, Limit), "Limit should have pushed below Project"
+        assert isinstance(result.left, Projection), "Left child should have Projection after pushing limit"
+        assert isinstance(result.left.input, Limit), "Limit should have pushed below Projection"
         assert isinstance(result.left.input.input, Scan), "Limit should be above Scan"
 
     def test_deeply_nested_limit_not_optimized(self):
@@ -1693,10 +1693,10 @@ class TestLimitPushdownNotRecursing:
         rule = LimitPushdownRule()
         result = rule.apply(outer_filter)
 
-        # After fix: the deeply nested Limit should have pushed below Project
+        # After fix: the deeply nested Limit should have pushed below Projection
         assert isinstance(result, Filter), "Root should still be Filter"
         assert isinstance(result.input, Join), "Should have Join"
         assert isinstance(result.input.left, Filter), "Left should be Filter"
-        assert isinstance(result.input.left.input, Projection), "Should have Project after pushing"
-        assert isinstance(result.input.left.input.input, Limit), "Limit should be below Project"
+        assert isinstance(result.input.left.input, Projection), "Should have Projection after pushing"
+        assert isinstance(result.input.left.input.input, Limit), "Limit should be below Projection"
         assert isinstance(result.input.left.input.input.input, Scan), "Limit should be above Scan"

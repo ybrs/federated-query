@@ -278,9 +278,11 @@ def test_is_not_null_predicate(single_source_env):
     where_clause = ast.args.get("where")
     assert where_clause is not None
     predicate = unwrap_parens(where_clause.this)
-    assert isinstance(predicate, exp.Is)
-    assert predicate.this.name.lower() == "region"
-    assert isinstance(predicate.expression, exp.Not)
+    assert isinstance(predicate, exp.Not)
+    inner = unwrap_parens(predicate.this)
+    assert isinstance(inner, exp.Is)
+    assert inner.this.name.lower() == "region"
+    assert isinstance(inner.expression, exp.Null)
 
 
 def test_not_in_predicate(single_source_env):

@@ -134,3 +134,23 @@ def test_cross_source_aggregates_and_limits_stay_local(multi_source_env):
     assert orders_query.args.get("limit") is None
     assert set(select_column_names(orders_query)) == {"region", "product_id"}
     assert set(select_column_names(products_query)) == {"id", "base_price"}
+
+
+def test_cross_source_order_by_stays_local(multi_source_env):
+    """ORDER BY across datasources must not push into remote scans."""
+    runtime = build_runtime(multi_source_env)
+    sql = (
+        "SELECT o.order_id, p.name "
+        "FROM duckdb_orders.main.orders o "
+        "JOIN duckdb_products.main.products p ON o.product_id = p.id "
+        "ORDER BY p.name"
+    )
+    document = explain_document(runtime, sql)
+    queries = datasource_query_map(document)
+    assert set(queries) == {"duckdb_orders", "duckdb_products"}
+    orders_query = queries["duckdb_orders"]
+    products_query = queries["duckdb_products"]
+    _assert_single_source_scan(orders_query, "orders")
+    _assert_single_source_scan(products_query, "products")
+    assert orders_query.args.get("order") is None
+    assert products_query.args.get("order") is None
