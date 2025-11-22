@@ -410,6 +410,30 @@ class TestLimitPushdown:
         assert isinstance(result, Projection)
         assert isinstance(result.input, Limit)
         assert result.input.limit == 10
+        assert result.input.offset == 0
+
+    def test_limit_pushdown_preserves_offset_once(self):
+        """Limit pushdown should not apply offset twice."""
+        scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="users",
+            columns=["id"],
+        )
+        project = Projection(
+            input=scan,
+            expressions=[ColumnRef(None, "id", DataType.INTEGER)],
+            aliases=["id"],
+            distinct=True,
+        )
+        limit = Limit(project, limit=1, offset=1)
+
+        rule = LimitPushdownRule()
+        result = rule.apply(limit)
+
+        assert isinstance(result, Projection)
+        assert isinstance(result.input, Limit)
+        assert result.input.offset == 0
 
     def test_limit_does_not_push_through_filter(self):
         """Test that limit does NOT push through filter.
@@ -439,7 +463,14 @@ class TestLimitPushdown:
         assert result.limit == 10
 
     def test_limit_with_offset(self):
-        """Test limit pushdown with offset."""
+        """SELECT ... LIMIT 10 OFFSET 5 pushdown keeps semantics.
+
+        Logical shape: Limit(Scan, limit=10, offset=5).
+        Optimization: attach limit=10, offset=5 to the scan when the data source
+        supports pushdown, and set the outer Limit offset to 0 so the offset
+        is not applied twice. If pushdown were unsupported, the outer Limit
+        would stay limit=10, offset=5 and the scan would have offset=0.
+        """
         scan = Scan(
             datasource="test_ds",
             schema_name="public",
@@ -451,9 +482,12 @@ class TestLimitPushdown:
         rule = LimitPushdownRule()
         result = rule.apply(limit)
 
+        # Offset is pushed into the scan; outer limit offset resets to 0 to avoid double-application.
         assert isinstance(result, Limit)
         assert result.limit == 10
-        assert result.offset == 5
+        assert result.offset == 0
+        assert isinstance(result.input, Scan)
+        assert result.input.offset == 5
 
 
 class TestOrderByPushdown:

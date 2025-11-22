@@ -832,7 +832,7 @@ class LimitPushdownRule(OptimizationRule):
 
         if isinstance(input_node, Scan):
             scan_with_limit = self._apply_limit_metadata(input_node, limit.limit, limit.offset)
-            return Limit(scan_with_limit, limit.limit, limit.offset)
+            return Limit(scan_with_limit, limit.limit, 0)
 
         return Limit(input_node, limit.limit, limit.offset)
 
@@ -843,7 +843,7 @@ class LimitPushdownRule(OptimizationRule):
             limit.limit,
             limit.offset,
         )
-        limited = Limit(pushed_child, limit.limit, limit.offset)
+        limited = Limit(pushed_child, limit.limit, 0)
         return Projection(
             limited,
             projection.expressions,
@@ -872,7 +872,7 @@ class LimitPushdownRule(OptimizationRule):
                 limit=limit.limit,
                 offset=limit.offset,
             )
-            return Limit(new_scan, limit.limit, limit.offset)
+            return Limit(new_scan, limit.limit, 0)
 
         new_sort = Sort(
             input=sorted_input,
