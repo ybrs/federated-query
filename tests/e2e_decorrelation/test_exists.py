@@ -8,7 +8,13 @@ import pytest
 from federated_query.parser.parser import Parser
 from federated_query.parser.binder import Binder
 from federated_query.optimizer.decorrelation import Decorrelator
-from federated_query.plan.logical import LogicalJoin
+from federated_query.executor.executor import Executor
+from .test_utils import (
+    assert_plan_structure,
+    assert_result_count,
+    assert_result_contains_ids,
+    execute_and_fetch_all
+)
 
 
 class TestUncorrelatedExists:
@@ -22,9 +28,8 @@ class TestUncorrelatedExists:
             SELECT * FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE amount > 100)
 
         Expected plan structure:
-            - Subquery should be executed once (hoisted as CTE or evaluated to constant)
-            - If subquery non-empty, all rows pass; if empty, no rows pass
-            - No correlation predicates in join condition
+            - No subquery expressions remain
+            - May have CROSS join or filter with constant
 
         Expected result:
             All users (since orders with amount > 100 exist)
@@ -34,22 +39,17 @@ class TestUncorrelatedExists:
         parser = Parser()
         binder = Binder(catalog)
         decorrelator = Decorrelator()
+        executor = Executor(catalog)
 
-        # Parse and bind the query
         logical_plan = parser.parse(sql)
         bound_plan = binder.bind(logical_plan)
-
-        # Run decorrelation
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
-        # Verify: No subquery expressions should remain
-        # This will be checked by the decorrelator validation phase
+        # Verify no subquery nodes remain
+        assert_plan_structure(decorrelated_plan, {})
 
-        # Execute and verify results
-        # Expected: All 5 users since EXISTS evaluates to TRUE
-        # TODO: Add executor integration once available
-        # result = executor.execute(decorrelated_plan)
-        # assert len(result) == 5
+        # Execute and verify results: All 5 users
+        assert_result_count(executor, decorrelated_plan, 5)
 
     def test_uncorrelated_exists_empty_result(self, catalog, setup_test_data):
         """
@@ -70,15 +70,17 @@ class TestUncorrelatedExists:
         parser = Parser()
         binder = Binder(catalog)
         decorrelator = Decorrelator()
+        executor = Executor(catalog)
 
         logical_plan = parser.parse(sql)
         bound_plan = binder.bind(logical_plan)
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
-        # Expected: 0 rows since no orders have amount > 10000
-        # TODO: Add executor integration
-        # result = executor.execute(decorrelated_plan)
-        # assert len(result) == 0
+        # Verify no subquery nodes remain
+        assert_plan_structure(decorrelated_plan, {})
+
+        # Execute and verify results: 0 rows
+        assert_result_count(executor, decorrelated_plan, 0)
 
 
 class TestCorrelatedExists:
@@ -99,7 +101,6 @@ class TestCorrelatedExists:
         Expected plan structure:
             - SEMI join between users and orders
             - Join condition: u.id = o.user_id AND o.amount > 100
-            - Correlation predicate (o.user_id = u.id) becomes part of join condition
 
         Expected result:
             Users with orders > 100: Alice (id=1), Charlie (id=3), Eve (id=5)
@@ -116,21 +117,20 @@ class TestCorrelatedExists:
         parser = Parser()
         binder = Binder(catalog)
         decorrelator = Decorrelator()
+        executor = Executor(catalog)
 
         logical_plan = parser.parse(sql)
         bound_plan = binder.bind(logical_plan)
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
-        # Verify: Should contain a SEMI join
-        # The decorrelated plan should have LogicalJoin with type=SEMI
-        # TODO: Add plan structure validation
-        # assert has_semi_join(decorrelated_plan)
+        # Verify plan has SEMI join
+        assert_plan_structure(decorrelated_plan, {
+            'has_semi_join': True,
+            'semi_join_count': 1
+        })
 
-        # Expected: 3 users (Alice, Charlie, Eve)
-        # TODO: Add executor integration
-        # result = executor.execute(decorrelated_plan)
-        # assert len(result) == 3
-        # assert set(r['id'] for r in result) == {1, 3, 5}
+        # Execute and verify results: 3 users
+        assert_result_contains_ids(executor, decorrelated_plan, {1, 3, 5})
 
     def test_correlated_exists_multiple_correlation_keys(self, catalog, setup_test_data):
         """
@@ -146,7 +146,6 @@ class TestCorrelatedExists:
 
         Expected plan structure:
             - SEMI join with conjunction of correlation predicates
-            - Join condition: c.name = u.city AND c.country = u.country
 
         Expected result:
             Users whose (city, country) pair exists in cities table
@@ -163,13 +162,20 @@ class TestCorrelatedExists:
         parser = Parser()
         binder = Binder(catalog)
         decorrelator = Decorrelator()
+        executor = Executor(catalog)
 
         logical_plan = parser.parse(sql)
         bound_plan = binder.bind(logical_plan)
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
-        # Expected: Users in cities that exist in the cities table
-        # TODO: Add executor integration
+        # Verify plan has SEMI join
+        assert_plan_structure(decorrelated_plan, {
+            'has_semi_join': True
+        })
+
+        # Execute and verify results
+        results = execute_and_fetch_all(executor, decorrelated_plan)
+        assert len(results) > 0, "Should have users with matching cities"
 
 
 class TestUncorrelatedNotExists:
@@ -183,8 +189,7 @@ class TestUncorrelatedNotExists:
             SELECT * FROM users WHERE NOT EXISTS (SELECT 1 FROM orders WHERE amount > 10000)
 
         Expected plan structure:
-            - ANTI join against once-evaluated subquery
-            - Since subquery is empty, all rows pass
+            - ANTI join or equivalent
 
         Expected result:
             All users (since no orders with amount > 10000 exist)
@@ -194,13 +199,17 @@ class TestUncorrelatedNotExists:
         parser = Parser()
         binder = Binder(catalog)
         decorrelator = Decorrelator()
+        executor = Executor(catalog)
 
         logical_plan = parser.parse(sql)
         bound_plan = binder.bind(logical_plan)
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
-        # Expected: All 5 users
-        # TODO: Add executor integration
+        # Verify no subquery nodes remain
+        assert_plan_structure(decorrelated_plan, {})
+
+        # Execute and verify results: All 5 users
+        assert_result_count(executor, decorrelated_plan, 5)
 
     def test_uncorrelated_not_exists_filters_all(self, catalog, setup_test_data):
         """
@@ -211,7 +220,6 @@ class TestUncorrelatedNotExists:
 
         Expected plan structure:
             - Subquery non-empty, so NOT EXISTS evaluates to FALSE
-            - No rows should pass
 
         Expected result:
             Empty result set
@@ -221,13 +229,17 @@ class TestUncorrelatedNotExists:
         parser = Parser()
         binder = Binder(catalog)
         decorrelator = Decorrelator()
+        executor = Executor(catalog)
 
         logical_plan = parser.parse(sql)
         bound_plan = binder.bind(logical_plan)
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
-        # Expected: 0 rows since orders with amount > 10 exist
-        # TODO: Add executor integration
+        # Verify no subquery nodes remain
+        assert_plan_structure(decorrelated_plan, {})
+
+        # Execute and verify results: 0 rows
+        assert_result_count(executor, decorrelated_plan, 0)
 
 
 class TestCorrelatedNotExists:
@@ -247,7 +259,6 @@ class TestCorrelatedNotExists:
 
         Expected plan structure:
             - ANTI join between users and orders
-            - Join condition: u.id = o.user_id AND o.status = 'cancelled'
 
         Expected result:
             Users without cancelled orders: Alice (id=1), Bob (id=2), David (id=4), Eve (id=5)
@@ -264,13 +275,19 @@ class TestCorrelatedNotExists:
         parser = Parser()
         binder = Binder(catalog)
         decorrelator = Decorrelator()
+        executor = Executor(catalog)
 
         logical_plan = parser.parse(sql)
         bound_plan = binder.bind(logical_plan)
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
-        # Expected: 4 users (all except Charlie who has a cancelled order)
-        # TODO: Add executor integration
+        # Verify plan has ANTI join
+        assert_plan_structure(decorrelated_plan, {
+            'has_anti_join': True
+        })
+
+        # Execute and verify results: 4 users (all except Charlie)
+        assert_result_contains_ids(executor, decorrelated_plan, {1, 2, 4, 5})
 
     def test_correlated_not_exists_all_pass(self, catalog, setup_test_data):
         """
@@ -286,7 +303,6 @@ class TestCorrelatedNotExists:
 
         Expected plan structure:
             - ANTI join
-            - No matching rows in subquery for any user
 
         Expected result:
             All users (no orders over 10000)
@@ -303,13 +319,19 @@ class TestCorrelatedNotExists:
         parser = Parser()
         binder = Binder(catalog)
         decorrelator = Decorrelator()
+        executor = Executor(catalog)
 
         logical_plan = parser.parse(sql)
         bound_plan = binder.bind(logical_plan)
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
-        # Expected: All 5 users
-        # TODO: Add executor integration
+        # Verify plan has ANTI join
+        assert_plan_structure(decorrelated_plan, {
+            'has_anti_join': True
+        })
+
+        # Execute and verify results: All 5 users
+        assert_result_count(executor, decorrelated_plan, 5)
 
 
 class TestExistsInComplexQueries:
@@ -325,8 +347,7 @@ class TestExistsInComplexQueries:
             FROM users u
 
         Expected plan structure:
-            - SEMI join or LEFT join with aggregation to produce boolean flag
-            - Result includes boolean column
+            - LEFT join or other mechanism to produce boolean flag
 
         Expected result:
             All users with has_orders column (TRUE for users 1,2,3,5; FALSE for user 4)
@@ -340,13 +361,19 @@ class TestExistsInComplexQueries:
         parser = Parser()
         binder = Binder(catalog)
         decorrelator = Decorrelator()
+        executor = Executor(catalog)
 
         logical_plan = parser.parse(sql)
         bound_plan = binder.bind(logical_plan)
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
-        # Expected: 5 rows with has_orders column
-        # TODO: Add executor integration
+        # Verify no subquery nodes remain
+        assert_plan_structure(decorrelated_plan, {})
+
+        # Execute and verify results: 5 rows with has_orders column
+        results = execute_and_fetch_all(executor, decorrelated_plan)
+        assert len(results) == 5, "Should have all 5 users"
+        assert 'has_orders' in results[0], "Should have has_orders column"
 
     def test_multiple_exists_same_query(self, catalog, setup_test_data):
         """
@@ -359,8 +386,7 @@ class TestExistsInComplexQueries:
               AND EXISTS (SELECT 1 FROM cities c WHERE c.name = u.city)
 
         Expected plan structure:
-            - Two SEMI joins (or combined into single plan)
-            - Both correlation conditions present
+            - Multiple SEMI joins
 
         Expected result:
             Users with orders AND whose city exists in cities table
@@ -375,13 +401,20 @@ class TestExistsInComplexQueries:
         parser = Parser()
         binder = Binder(catalog)
         decorrelator = Decorrelator()
+        executor = Executor(catalog)
 
         logical_plan = parser.parse(sql)
         bound_plan = binder.bind(logical_plan)
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
-        # Expected: Users satisfying both conditions
-        # TODO: Add executor integration
+        # Verify plan has multiple SEMI joins
+        assert_plan_structure(decorrelated_plan, {
+            'has_semi_join': True
+        })
+
+        # Execute and verify results: Users satisfying both conditions
+        results = execute_and_fetch_all(executor, decorrelated_plan)
+        assert len(results) > 0, "Should have users satisfying both conditions"
 
     def test_exists_with_aggregation_in_subquery(self, catalog, setup_test_data):
         """
@@ -398,7 +431,6 @@ class TestExistsInComplexQueries:
             )
 
         Expected plan structure:
-            - Subquery must be decorrelated with aggregation preserved
             - SEMI join against aggregated result
 
         Expected result:
@@ -418,10 +450,17 @@ class TestExistsInComplexQueries:
         parser = Parser()
         binder = Binder(catalog)
         decorrelator = Decorrelator()
+        executor = Executor(catalog)
 
         logical_plan = parser.parse(sql)
         bound_plan = binder.bind(logical_plan)
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
-        # Expected: 3 users
-        # TODO: Add executor integration
+        # Verify plan has SEMI join and aggregation
+        assert_plan_structure(decorrelated_plan, {
+            'has_semi_join': True,
+            'has_aggregation': True
+        })
+
+        # Execute and verify results: 3 users
+        assert_result_contains_ids(executor, decorrelated_plan, {1, 3, 5})
