@@ -622,3 +622,43 @@ class TestQuantifiedComplexQueries:
         # Execute and verify
         results = execute_and_fetch_all(executor, decorrelated_plan)
         assert len(results) >= 0, "Query should execute successfully"
+
+    def test_all_in_select_list_boolean(self, catalog, setup_test_data):
+        """
+        Test: ALL comparison used as boolean in SELECT list.
+
+        Input SQL:
+            SELECT s.id,
+                   s.price <= ALL(
+                       SELECT l.cap FROM limits l WHERE l.region = s.region
+                   ) AS within_cap
+            FROM sales s
+
+        Expected plan structure:
+            - ANTI join to detect violations
+            - Boolean column produced in projection
+        """
+        sql = """
+            SELECT s.id,
+                   s.price <= ALL(
+                       SELECT l.cap FROM pg.limits l WHERE l.region = s.region
+                   ) AS within_cap
+            FROM pg.sales s
+        """
+
+        parser = Parser()
+        binder = Binder(catalog)
+        decorrelator = Decorrelator()
+        executor = Executor(catalog)
+
+        logical_plan = parser.parse(sql)
+        bound_plan = binder.bind(logical_plan)
+        decorrelated_plan = decorrelator.decorrelate(bound_plan)
+
+        assert_plan_structure(decorrelated_plan, {
+            'has_anti_join': True
+        })
+
+        results = execute_and_fetch_all(executor, decorrelated_plan)
+        assert len(results) == 4, "Should produce boolean for each sale"
+        assert 'within_cap' in results[0], "Boolean column should exist"

@@ -780,3 +780,49 @@ class TestComplexNullScenarios:
         # Execute and verify
         results = execute_and_fetch_all(executor, decorrelated_plan)
         assert len(results) >= 0, "Query should execute successfully"
+
+    def test_correlated_not_in_with_null_guard(self, catalog, setup_null_test_data):
+        """
+        Test: Correlated NOT IN when subquery can emit NULL.
+
+        Input SQL:
+            SELECT u.id
+            FROM users u
+            WHERE 999 NOT IN (
+                SELECT o.amount FROM orders o WHERE o.user_id = u.id
+            )
+
+        Expected plan structure:
+            - ANTI join with NULL guard on subquery output
+            - Users whose correlated subquery has NULL should be filtered
+
+        Expected result:
+            Users 2,3,4,5,10 pass; user 1 filtered due to NULL amount
+        """
+        sql = """
+            SELECT u.id
+            FROM pg.users u
+            WHERE 999 NOT IN (
+                SELECT o.amount FROM pg.orders o WHERE o.user_id = u.id
+            )
+            ORDER BY u.id
+        """
+
+        parser = Parser()
+        binder = Binder(catalog)
+        decorrelator = Decorrelator()
+        executor = Executor(catalog)
+
+        logical_plan = parser.parse(sql)
+        bound_plan = binder.bind(logical_plan)
+        decorrelated_plan = decorrelator.decorrelate(bound_plan)
+
+        assert_plan_structure(decorrelated_plan, {
+            'has_anti_join': True
+        })
+
+        results = execute_and_fetch_all(executor, decorrelated_plan)
+        ids = set()
+        for row in results:
+            ids.add(row['id'])
+        assert ids == {2, 3, 4, 5, 10}, f"Unexpected ids {ids}"

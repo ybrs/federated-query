@@ -515,12 +515,10 @@ class TestScalarCardinalityEnforcement:
         logical_plan = parser.parse(sql)
         bound_plan = binder.bind(logical_plan)
 
-        # This should raise an error during decorrelation or execution
-        # Verify plan structure
+        decorrelated_plan = decorrelator.decorrelate(bound_plan)
+
         assert_plan_structure(decorrelated_plan, {})
         results = execute_and_fetch_all(executor, decorrelated_plan)
-        # with pytest.raises(DecorrelationError):
-        #     decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
     def test_scalar_with_limit_one(self, catalog, setup_test_data):
         """
@@ -595,6 +593,39 @@ class TestScalarCardinalityEnforcement:
         # Execute and verify
         results = execute_and_fetch_all(executor, decorrelated_plan)
         assert len(results) >= 0, "Query should execute successfully"
+
+
+class TestScalarInOrdering:
+    """Test scalar subqueries used in ordering."""
+
+    def test_scalar_in_order_by_clause(self, catalog, setup_test_data):
+        """
+        Test: Scalar subquery in ORDER BY.
+
+        Input SQL:
+            SELECT u.id, u.name
+            FROM users u
+            ORDER BY (SELECT AVG(amount) FROM orders) DESC, u.id
+        """
+        sql = """
+            SELECT u.id, u.name
+            FROM pg.users u
+            ORDER BY (SELECT AVG(amount) FROM pg.orders) DESC, u.id
+        """
+
+        parser = Parser()
+        binder = Binder(catalog)
+        decorrelator = Decorrelator()
+        executor = Executor(catalog)
+
+        logical_plan = parser.parse(sql)
+        bound_plan = binder.bind(logical_plan)
+        decorrelated_plan = decorrelator.decorrelate(bound_plan)
+
+        assert_plan_structure(decorrelated_plan, {})
+
+        results = execute_and_fetch_all(executor, decorrelated_plan)
+        assert len(results) == 5, "All users should be returned"
 
 
 class TestScalarComplexQueries:

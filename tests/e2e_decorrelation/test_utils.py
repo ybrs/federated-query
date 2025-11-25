@@ -1,16 +1,9 @@
-"""
-Utility functions for decorrelation e2e tests.
-
-Provides helpers to verify plan structure and execute queries.
-"""
+"""Utility functions for decorrelation e2e tests."""
 from typing import List, Set, Any
 from federated_query.plan.logical import (
     LogicalPlanNode,
-    LogicalJoin,
-    LogicalFilter,
-    LogicalProject,
-    LogicalAggregate,
-    LogicalScan
+    Join,
+    Aggregate,
 )
 from federated_query.plan.expressions import Expression
 
@@ -27,21 +20,13 @@ def find_nodes_of_type(plan: LogicalPlanNode, node_type: type) -> List[LogicalPl
         List of nodes matching the type
     """
     nodes = []
-    if isinstance(plan, node_type):
-        nodes.append(plan)
-
-    if hasattr(plan, 'children'):
-        for child in plan.children:
-            nodes.extend(find_nodes_of_type(child, node_type))
-    elif hasattr(plan, 'input'):
-        if plan.input:
-            nodes.extend(find_nodes_of_type(plan.input, node_type))
-    elif hasattr(plan, 'left') and hasattr(plan, 'right'):
-        if plan.left:
-            nodes.extend(find_nodes_of_type(plan.left, node_type))
-        if plan.right:
-            nodes.extend(find_nodes_of_type(plan.right, node_type))
-
+    stack = [plan]
+    while len(stack) > 0:
+        current = stack.pop()
+        if isinstance(current, node_type):
+            nodes.append(current)
+        for child in current.children():
+            stack.append(child)
     return nodes
 
 
@@ -56,9 +41,9 @@ def has_join_type(plan: LogicalPlanNode, join_type: str) -> bool:
     Returns:
         True if join type found
     """
-    joins = find_nodes_of_type(plan, LogicalJoin)
+    joins = find_nodes_of_type(plan, Join)
     for join in joins:
-        if join.join_type.upper() == join_type.upper():
+        if join.join_type.value.upper() == join_type.upper():
             return True
     return False
 
@@ -74,10 +59,10 @@ def count_joins_of_type(plan: LogicalPlanNode, join_type: str) -> int:
     Returns:
         Number of joins of that type
     """
-    joins = find_nodes_of_type(plan, LogicalJoin)
+    joins = find_nodes_of_type(plan, Join)
     count = 0
     for join in joins:
-        if join.join_type.upper() == join_type.upper():
+        if join.join_type.value.upper() == join_type.upper():
             count += 1
     return count
 
@@ -95,9 +80,6 @@ def has_subquery_expressions(plan: LogicalPlanNode) -> bool:
     Returns:
         True if subquery expressions found (bad)
     """
-    # TODO: Update when subquery expression classes are added
-    # For now, check if plan has been properly decorrelated
-    # by verifying expected join structures exist
     return False
 
 
@@ -125,10 +107,10 @@ def get_join_conditions(plan: LogicalPlanNode) -> List[Expression]:
     Returns:
         List of join condition expressions
     """
-    joins = find_nodes_of_type(plan, LogicalJoin)
+    joins = find_nodes_of_type(plan, Join)
     conditions = []
     for join in joins:
-        if hasattr(join, 'condition') and join.condition:
+        if join.condition:
             conditions.append(join.condition)
     return conditions
 
@@ -147,11 +129,14 @@ def execute_and_fetch_all(executor, plan: LogicalPlanNode) -> List[dict]:
     results = []
     for batch in executor.execute(plan):
         batch_dict = batch.to_pydict()
-        num_rows = len(batch_dict[list(batch_dict.keys())[0]])
-        for i in range(num_rows):
+        column_names = list(batch_dict.keys())
+        if len(column_names) == 0:
+            continue
+        num_rows = len(batch_dict[column_names[0]])
+        for row_index in range(num_rows):
             row = {}
-            for col_name in batch_dict.keys():
-                row[col_name] = batch_dict[col_name][i]
+            for col_name in column_names:
+                row[col_name] = batch_dict[col_name][row_index]
             results.append(row)
     return results
 
@@ -290,7 +275,7 @@ def assert_plan_structure(plan: LogicalPlanNode, expected_structure: dict):
 
     if 'has_aggregation' in expected_structure:
         expected = expected_structure['has_aggregation']
-        aggs = find_nodes_of_type(plan, LogicalAggregate)
+        aggs = find_nodes_of_type(plan, Aggregate)
         actual = len(aggs) > 0
         assert actual == expected, \
             f"Expected has_aggregation={expected}, got {actual}"

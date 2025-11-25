@@ -464,3 +464,52 @@ class TestExistsInComplexQueries:
 
         # Execute and verify results: 3 users
         assert_result_contains_ids(executor, decorrelated_plan, {1, 3, 5})
+
+    def test_exists_under_or_predicate(self, catalog, setup_test_data):
+        """
+        Test: Correlated EXISTS combined with OR condition.
+
+        Input SQL:
+            SELECT u.id
+            FROM users u
+            WHERE u.country = 'FR'
+               OR EXISTS (
+                   SELECT 1 FROM orders o
+                   WHERE o.user_id = u.id AND o.amount > 250
+               )
+
+        Expected plan structure:
+            - SEMI join for EXISTS branch
+            - Predicate retains OR logic
+
+        Expected result:
+            Users from FR or with orders > 250 (ids 1,3,4,5)
+        """
+        sql = """
+            SELECT u.id
+            FROM pg.users u
+            WHERE u.country = 'FR'
+               OR EXISTS (
+                   SELECT 1 FROM pg.orders o
+                   WHERE o.user_id = u.id AND o.amount > 250
+               )
+        """
+
+        parser = Parser()
+        binder = Binder(catalog)
+        decorrelator = Decorrelator()
+        executor = Executor(catalog)
+
+        logical_plan = parser.parse(sql)
+        bound_plan = binder.bind(logical_plan)
+        decorrelated_plan = decorrelator.decorrelate(bound_plan)
+
+        assert_plan_structure(decorrelated_plan, {
+            'has_semi_join': True
+        })
+
+        results = execute_and_fetch_all(executor, decorrelated_plan)
+        ids = set()
+        for row in results:
+            ids.add(row['id'])
+        assert ids == {1, 3, 4, 5}, f"Unexpected ids {ids}"

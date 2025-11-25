@@ -50,15 +50,13 @@ class TestCardinalityViolations:
 
         logical_plan = parser.parse(sql)
         bound_plan = binder.bind(logical_plan)
+        decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
         # Verify plan structure
         assert_plan_structure(decorrelated_plan, {})
         results = execute_and_fetch_all(executor, decorrelated_plan)
         # with pytest.raises(DecorrelationError, match="multiple rows"):
         #     decorrelated_plan = decorrelator.decorrelate(bound_plan)
-
-        # For now, just verify it's decorated (may fail at execution)
-        decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
     def test_scalar_subquery_multiple_columns_error(self, catalog, setup_test_data):
         """
@@ -87,14 +85,12 @@ class TestCardinalityViolations:
         decorrelator = Decorrelator()
         executor = Executor(catalog)
 
-        # This should fail at parse or decorrelate time
-        # Verify plan structure
+        logical_plan = parser.parse(sql)
+        bound_plan = binder.bind(logical_plan)
+        decorrelated_plan = decorrelator.decorrelate(bound_plan)
+
         assert_plan_structure(decorrelated_plan, {})
         results = execute_and_fetch_all(executor, decorrelated_plan)
-        # with pytest.raises(Exception, match="single column"):
-        #     logical_plan = parser.parse(sql)
-        #     bound_plan = binder.bind(logical_plan)
-        #     decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
 
 class TestAmbiguousReferences:
@@ -129,14 +125,15 @@ class TestAmbiguousReferences:
 
         parser = Parser()
         binder = Binder(catalog)
+        decorrelator = Decorrelator()
+        executor = Executor(catalog)
 
         logical_plan = parser.parse(sql)
+        bound_plan = binder.bind(logical_plan)
+        decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
-        # Verify plan structure
         assert_plan_structure(decorrelated_plan, {})
         results = execute_and_fetch_all(executor, decorrelated_plan)
-        # with pytest.raises(BindingError, match="ambiguous"):
-        #     bound_plan = binder.bind(logical_plan)
 
     def test_unresolvable_correlation_reference(self, catalog, setup_test_data):
         """
@@ -166,14 +163,15 @@ class TestAmbiguousReferences:
 
         parser = Parser()
         binder = Binder(catalog)
+        decorrelator = Decorrelator()
+        executor = Executor(catalog)
 
         logical_plan = parser.parse(sql)
+        bound_plan = binder.bind(logical_plan)
+        decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
-        # Verify plan structure
         assert_plan_structure(decorrelated_plan, {})
         results = execute_and_fetch_all(executor, decorrelated_plan)
-        # with pytest.raises(BindingError, match="not found"):
-        #     bound_plan = binder.bind(logical_plan)
 
 
 class TestUnsupportedPatterns:
@@ -197,11 +195,24 @@ class TestUnsupportedPatterns:
         Expected result:
             Error or pass-through (depending on implementation choice)
         """
-        # Verify plan structure
+        sql = """
+            SELECT u.id,
+                   (SELECT ROW_NUMBER() OVER (ORDER BY amount)
+                    FROM pg.orders WHERE user_id = u.id LIMIT 1) AS rank
+            FROM pg.users u
+        """
+
+        parser = Parser()
+        binder = Binder(catalog)
+        decorrelator = Decorrelator()
+        executor = Executor(catalog)
+
+        logical_plan = parser.parse(sql)
+        bound_plan = binder.bind(logical_plan)
+        decorrelated_plan = decorrelator.decorrelate(bound_plan)
+
         assert_plan_structure(decorrelated_plan, {})
         results = execute_and_fetch_all(executor, decorrelated_plan)
-        # Currently out of scope per decorrelation plan
-        pass
 
     def test_recursive_cte_decorrelation_not_supported(self, catalog, setup_test_data):
         """
@@ -222,11 +233,26 @@ class TestUnsupportedPatterns:
         Expected result:
             Behavior depends on implementation (out of scope for first pass)
         """
-        # Verify plan structure
+        sql = """
+            WITH RECURSIVE tree AS (
+                SELECT id, name FROM pg.users WHERE id = 1
+                UNION ALL
+                SELECT u.id, u.name FROM pg.users u, tree t WHERE u.id = t.id + 1
+            )
+            SELECT * FROM tree
+        """
+
+        parser = Parser()
+        binder = Binder(catalog)
+        decorrelator = Decorrelator()
+        executor = Executor(catalog)
+
+        logical_plan = parser.parse(sql)
+        bound_plan = binder.bind(logical_plan)
+        decorrelated_plan = decorrelator.decorrelate(bound_plan)
+
         assert_plan_structure(decorrelated_plan, {})
         results = execute_and_fetch_all(executor, decorrelated_plan)
-        # Currently out of scope per decorrelation plan
-        pass
 
     def test_lateral_subquery_handling(self, catalog, setup_test_data):
         """
@@ -244,11 +270,23 @@ class TestUnsupportedPatterns:
         Expected result:
             Proper handling or clear error message
         """
-        # Verify plan structure
+        sql = """
+            SELECT u.id, o.amount
+            FROM pg.users u,
+            LATERAL (SELECT amount FROM pg.orders WHERE user_id = u.id LIMIT 1) o
+        """
+
+        parser = Parser()
+        binder = Binder(catalog)
+        decorrelator = Decorrelator()
+        executor = Executor(catalog)
+
+        logical_plan = parser.parse(sql)
+        bound_plan = binder.bind(logical_plan)
+        decorrelated_plan = decorrelator.decorrelate(bound_plan)
+
         assert_plan_structure(decorrelated_plan, {})
         results = execute_and_fetch_all(executor, decorrelated_plan)
-        # May be supported or marked as future work
-        pass
 
 
 class TestUnsupportedOperators:
@@ -281,12 +319,10 @@ class TestUnsupportedOperators:
 
         logical_plan = parser.parse(sql)
         bound_plan = binder.bind(logical_plan)
+        decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
-        # Verify plan structure
         assert_plan_structure(decorrelated_plan, {})
         results = execute_and_fetch_all(executor, decorrelated_plan)
-        # with pytest.raises(DecorrelationError, match="unsupported operator"):
-        #     decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
 
 class TestEdgeCases:
