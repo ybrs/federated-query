@@ -34,6 +34,13 @@ from .expressions import (
     UnaryOp,
     FunctionCall,
     CaseExpr,
+    InList,
+    BetweenExpression,
+    SubqueryExpression,
+    ExistsExpression,
+    InSubquery,
+    QuantifiedComparison,
+    Quantifier,
 )
 
 __all__ = [
@@ -69,4 +76,11 @@ __all__ = [
     "UnaryOp",
     "FunctionCall",
     "CaseExpr",
+    "InList",
+    "BetweenExpression",
+    "SubqueryExpression",
+    "ExistsExpression",
+    "InSubquery",
+    "QuantifiedComparison",
+    "Quantifier",
 ]

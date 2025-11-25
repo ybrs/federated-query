@@ -9,6 +9,7 @@ import pyarrow as pa
 from ..catalog import Catalog
 from ..executor import Executor
 from ..optimizer import PhysicalPlanner, RuleBasedOptimizer
+from ..optimizer.decorrelation import Decorrelator
 from ..parser import Binder, Parser
 from ..plan import PhysicalExplain, ExplainFormat
 from ..plan.logical import LogicalPlanNode
@@ -42,6 +43,7 @@ class QueryExecutor:
         planner: PhysicalPlanner,
         physical_executor: Executor,
         processors: Optional[List[QueryProcessor]] = None,
+        decorrelator: Optional[Decorrelator] = None,
     ):
         """Initialize dependencies."""
         self.catalog = catalog
@@ -53,6 +55,9 @@ class QueryExecutor:
         if processors is None:
             processors = []
         self.processors = processors
+        if decorrelator is None:
+            decorrelator = Decorrelator()
+        self.decorrelator = decorrelator
         self.input_query = ""
         self.query_context = QueryContext("")
 
@@ -63,7 +68,8 @@ class QueryExecutor:
         rewritten_sql = self._run_before_processors(sql)
         logical_plan = self._parse_query(rewritten_sql)
         bound_plan = self._bind_plan(logical_plan)
-        optimized_plan = self._optimize_plan(bound_plan)
+        decorrelated_plan = self._decorrelate_plan(bound_plan)
+        optimized_plan = self._optimize_plan(decorrelated_plan)
         physical_plan = self._build_physical_plan(optimized_plan)
         raw_result = self._run_physical_plan(physical_plan)
         return self._run_after_processors(raw_result)
@@ -84,6 +90,10 @@ class QueryExecutor:
     def _bind_plan(self, plan: LogicalPlanNode) -> LogicalPlanNode:
         """Bind logical plan with catalog metadata."""
         return self.binder.bind(plan, query_executor=self)
+
+    def _decorrelate_plan(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Run decorrelation pass on a bound plan."""
+        return self.decorrelator.decorrelate(plan)
 
     def _optimize_plan(self, plan: LogicalPlanNode) -> LogicalPlanNode:
         """Apply optimizer rules to the bound plan."""
