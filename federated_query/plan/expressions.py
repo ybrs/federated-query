@@ -2,8 +2,11 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, TYPE_CHECKING
 from enum import Enum
+
+if TYPE_CHECKING:
+    from .logical import LogicalPlanNode
 
 
 class DataType(Enum):
@@ -63,7 +66,9 @@ class ColumnRef(Expression):
         return self.column
 
     def __repr__(self) -> str:
-        return f"ColumnRef({self.table}.{self.column})" if self.table else f"ColumnRef({self.column})"
+        if self.table:
+            return f"ColumnRef({self.table}.{self.column})"
+        return f"ColumnRef({self.column})"
 
 
 @dataclass(frozen=True)
@@ -327,3 +332,119 @@ class ExpressionVisitor(ABC):
     @abstractmethod
     def visit_between(self, expr: BetweenExpression):
         pass
+
+    @abstractmethod
+    def visit_subquery(self, expr: "SubqueryExpression"):
+        pass
+
+    @abstractmethod
+    def visit_exists(self, expr: "ExistsExpression"):
+        pass
+
+    @abstractmethod
+    def visit_in_subquery(self, expr: "InSubquery"):
+        pass
+
+    @abstractmethod
+    def visit_quantified_comparison(self, expr: "QuantifiedComparison"):
+        pass
+
+
+class Quantifier(Enum):
+    """Quantifiers for quantified comparisons."""
+
+    ANY = "ANY"
+    SOME = "SOME"
+    ALL = "ALL"
+
+
+@dataclass(frozen=True)
+class SubqueryExpression(Expression):
+    """Scalar subquery expression."""
+
+    subquery: "LogicalPlanNode"
+
+    def get_type(self) -> DataType:
+        return DataType.NULL
+
+    def accept(self, visitor):
+        return visitor.visit_subquery(self)
+
+    def to_sql(self) -> str:
+        return f"({self.subquery})"
+
+    def __repr__(self) -> str:
+        return "SubqueryExpression()"
+
+
+@dataclass(frozen=True)
+class ExistsExpression(Expression):
+    """EXISTS or NOT EXISTS predicate."""
+
+    subquery: "LogicalPlanNode"
+    negated: bool = False
+
+    def get_type(self) -> DataType:
+        return DataType.BOOLEAN
+
+    def accept(self, visitor):
+        return visitor.visit_exists(self)
+
+    def to_sql(self) -> str:
+        prefix = "NOT " if self.negated else ""
+        return f"{prefix}EXISTS({self.subquery})"
+
+    def __repr__(self) -> str:
+        prefix = "NOT " if self.negated else ""
+        return f"{prefix}ExistsExpression()"
+
+
+@dataclass(frozen=True)
+class InSubquery(Expression):
+    """IN or NOT IN predicate with subquery."""
+
+    value: Expression
+    subquery: "LogicalPlanNode"
+    negated: bool = False
+
+    def get_type(self) -> DataType:
+        return DataType.BOOLEAN
+
+    def accept(self, visitor):
+        return visitor.visit_in_subquery(self)
+
+    def to_sql(self) -> str:
+        prefix = "NOT " if self.negated else ""
+        return f"({self.value.to_sql()} {prefix}IN ({self.subquery}))"
+
+    def __repr__(self) -> str:
+        prefix = "NOT " if self.negated else ""
+        return f"{prefix}InSubquery()"
+
+
+@dataclass(frozen=True)
+class QuantifiedComparison(Expression):
+    """Quantified comparison such as > ANY or = ALL."""
+
+    operator: BinaryOpType
+    quantifier: Quantifier
+    left: Expression
+    subquery: "LogicalPlanNode"
+
+    def get_type(self) -> DataType:
+        return DataType.BOOLEAN
+
+    def accept(self, visitor):
+        return visitor.visit_quantified_comparison(self)
+
+    def to_sql(self) -> str:
+        return (
+            f"({self.left.to_sql()} {self.operator.value} "
+            f"{self.quantifier.value} ({self.subquery}))"
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"QuantifiedComparison({self.operator.value}, "
+            f"{self.quantifier.value})"
+        )

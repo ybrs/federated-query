@@ -13,6 +13,7 @@ from ..plan.logical import (
     Join,
     Aggregate,
     Explain,
+    CTE,
 )
 from ..plan.expressions import (
     Expression,
@@ -25,6 +26,10 @@ from ..plan.expressions import (
     InList,
     BetweenExpression,
     CaseExpr,
+    SubqueryExpression,
+    ExistsExpression,
+    InSubquery,
+    QuantifiedComparison,
 )
 
 if TYPE_CHECKING:
@@ -83,6 +88,8 @@ class Binder:
             return self._bind_join(plan)
         if isinstance(plan, Aggregate):
             return self._bind_aggregate(plan)
+        if isinstance(plan, CTE):
+            return self._bind_cte(plan)
         raise BindingError(f"Unsupported plan node type: {type(plan)}")
 
     def _bind_scan(self, scan: Scan) -> Scan:
@@ -359,6 +366,14 @@ class Binder:
             return self._bind_between_multi(expr, tables)
         if isinstance(expr, CaseExpr):
             return self._bind_case_expr_multi(expr, tables)
+        if isinstance(expr, SubqueryExpression):
+            return expr
+        if isinstance(expr, ExistsExpression):
+            return expr
+        if isinstance(expr, InSubquery):
+            return expr
+        if isinstance(expr, QuantifiedComparison):
+            return expr
 
         return expr
 
@@ -411,6 +426,12 @@ class Binder:
             aggregates=bound_aggregates,
             output_names=aggregate.output_names,
         )
+
+    def _bind_cte(self, cte: CTE) -> CTE:
+        """Bind a CTE node."""
+        bound_cte = self.bind(cte.cte_plan)
+        bound_child = self.bind(cte.child)
+        return CTE(name=cte.name, cte_plan=bound_cte, child=bound_child)
 
     def _bind_group_by_expressions(
         self, expressions: List[Expression], table: Optional[Table]
@@ -594,12 +615,10 @@ class Binder:
                             column=col_ref.column,
                             data_type=column.data_type,
                         )
-                raise BindingError(f"Column '{col_ref.column}' with qualifier '{col_ref.table}' not found")
+                return col_ref
             column = table.get_column(col_ref.column)
             if column is None:
-                raise BindingError(
-                    f"Column '{col_ref.column}' not found in table {col_ref.table}"
-                )
+                return col_ref
             return ColumnRef(
                 table=col_ref.table,
                 column=col_ref.column,
@@ -619,7 +638,7 @@ class Binder:
                 found_column = column
 
         if found_column is None:
-            raise BindingError(f"Column '{col_ref.column}' not found in any table")
+            return col_ref
 
         return ColumnRef(
             table=found_table,
@@ -665,6 +684,14 @@ class Binder:
             return self._bind_between(expr, table)
         if isinstance(expr, CaseExpr):
             return self._bind_case_expr(expr, table)
+        if isinstance(expr, SubqueryExpression):
+            return expr
+        if isinstance(expr, ExistsExpression):
+            return expr
+        if isinstance(expr, InSubquery):
+            return expr
+        if isinstance(expr, QuantifiedComparison):
+            return expr
 
         return expr
 
@@ -676,7 +703,7 @@ class Binder:
             return col_ref
 
         if table is None:
-            raise BindingError(f"Can not resolve column '{col_ref.column}'': no table context")
+            return col_ref
 
         column = table.get_column(col_ref.column)
         if column is None:

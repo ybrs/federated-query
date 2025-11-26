@@ -31,6 +31,11 @@ from ..plan.expressions import (
     InList,
     BetweenExpression,
     CaseExpr,
+    SubqueryExpression,
+    ExistsExpression,
+    InSubquery,
+    QuantifiedComparison,
+    Quantifier,
 )
 
 if TYPE_CHECKING:
@@ -44,17 +49,21 @@ class Parser:
         """Initialize parser."""
         self.dialect = "postgres"  # Default dialect
 
-    def parse(self, sql: str) -> exp.Expression:
-        """Parse SQL string to sqlglot AST.
+    def parse(self, sql: str) -> LogicalPlanNode:
+        """Parse SQL string to an unbound logical plan.
 
         Args:
             sql: SQL query string
 
         Returns:
-            sqlglot expression tree
+            Logical plan root node
         """
-        parsed = sqlglot.parse_one(sql, dialect=self.dialect)
-        return parsed
+        parsed_ast = sqlglot.parse_one(sql, dialect=self.dialect)
+        return self.ast_to_logical_plan(parsed_ast)
+
+    def parse_ast(self, sql: str) -> exp.Expression:
+        """Parse SQL string to sqlglot AST without conversion."""
+        return sqlglot.parse_one(sql, dialect=self.dialect)
 
     def ast_to_logical_plan(self, ast: exp.Expression) -> LogicalPlanNode:
         """Convert sqlglot AST to logical plan.
@@ -762,6 +771,10 @@ class Parser:
             return self._convert_literal(expr)
         if isinstance(expr, exp.Null):
             return Literal(value=None, data_type=DataType.NULL)
+        if isinstance(expr, exp.Exists):
+            return self._convert_exists_expression(expr, False)
+        if isinstance(expr, exp.Subquery):
+            return self._convert_subquery_expression(expr)
         if isinstance(expr, exp.Binary):
             return self._convert_binary(expr)
         if isinstance(expr, exp.Unary):
@@ -782,6 +795,14 @@ class Parser:
     def _convert_in_expression(self, expr: exp.In) -> Expression:
         """Convert IN list to expression node."""
         value_expr = self._convert_expression(expr.this)
+        query = expr.args.get("query")
+        if query is not None:
+            subquery_plan = self._extract_subquery_plan(query)
+            return InSubquery(
+                value=value_expr,
+                subquery=subquery_plan,
+                negated=False,
+            )
         options: List[Expression] = []
         for option in expr.expressions:
             converted = self._convert_expression(option)
@@ -811,7 +832,10 @@ class Parser:
         for if_clause in expr.args.get("ifs") or []:
             condition = self._convert_expression(if_clause.this)
             result_expr = if_clause.args.get("true")
-            result = self._convert_expression(result_expr) if result_expr is not None else Literal(value=None, data_type=DataType.NULL)
+            if result_expr is not None:
+                result = self._convert_expression(result_expr)
+            else:
+                result = Literal(value=None, data_type=DataType.NULL)
             when_clauses.append((condition, result))
         else_expr = None
         default_expr = expr.args.get("default")
@@ -853,6 +877,12 @@ class Parser:
 
     def _convert_binary(self, binary: exp.Binary) -> BinaryOp:
         """Convert sqlglot binary operation."""
+        if isinstance(binary.right, exp.Any):
+            return self._build_quantified_comparison(binary, Quantifier.ANY)
+        if hasattr(exp, "Some") and isinstance(binary.right, exp.Some):
+            return self._build_quantified_comparison(binary, Quantifier.SOME)
+        if isinstance(binary.right, exp.All):
+            return self._build_quantified_comparison(binary, Quantifier.ALL)
         left = self._convert_expression(binary.left)
         right = self._convert_expression(binary.right)
         op = self._map_binary_op(binary)
@@ -884,6 +914,20 @@ class Parser:
         if isinstance(unary, exp.Paren):
             return self._convert_expression(unary.this)
 
+        if isinstance(unary, exp.Not):
+            if isinstance(unary.this, exp.Exists):
+                return self._convert_exists_expression(unary.this, True)
+            if isinstance(unary.this, exp.In):
+                query = unary.this.args.get("query")
+                if query is not None:
+                    value_expr = self._convert_expression(unary.this.this)
+                    subquery_plan = self._extract_subquery_plan(query)
+                    return InSubquery(
+                        value=value_expr,
+                        subquery=subquery_plan,
+                        negated=True,
+                    )
+
         operand = self._convert_expression(unary.this)
         op = self._map_unary_op(unary)
         return UnaryOp(op=op, operand=operand)
@@ -896,6 +940,50 @@ class Parser:
             "Neg": UnaryOpType.NEGATE,
         }
         return mapping.get(type_name, UnaryOpType.NOT)
+
+    def _convert_exists_expression(
+        self,
+        exists_expr: exp.Exists,
+        negated: bool,
+    ) -> ExistsExpression:
+        """Convert EXISTS/NOT EXISTS expression."""
+        subquery_plan = self._extract_subquery_plan(exists_expr.this)
+        return ExistsExpression(subquery=subquery_plan, negated=negated)
+
+    def _convert_subquery_expression(
+        self,
+        subquery: exp.Subquery,
+    ) -> SubqueryExpression:
+        """Convert scalar subquery expression."""
+        subquery_plan = self._extract_subquery_plan(subquery)
+        return SubqueryExpression(subquery=subquery_plan)
+
+    def _build_quantified_comparison(
+        self,
+        binary: exp.Binary,
+        quantifier: Quantifier,
+    ) -> QuantifiedComparison:
+        """Convert quantified comparison such as > ANY or = ALL."""
+        left_expr = self._convert_expression(binary.left)
+        subquery_plan = self._extract_subquery_plan(binary.right.this)
+        operator = self._map_binary_op(binary)
+        return QuantifiedComparison(
+            operator=operator,
+            quantifier=quantifier,
+            left=left_expr,
+            subquery=subquery_plan,
+        )
+
+    def _extract_subquery_plan(
+        self,
+        subquery_expr: exp.Expression,
+    ) -> "LogicalPlanNode":
+        """Extract logical plan from sqlglot subquery expression."""
+        if isinstance(subquery_expr, exp.Subquery):
+            return self.ast_to_logical_plan(subquery_expr.this)
+        if isinstance(subquery_expr, exp.Select):
+            return self.ast_to_logical_plan(subquery_expr)
+        raise ValueError(f"Unsupported subquery expression: {type(subquery_expr)}")
 
     def _convert_aggregate_function(self, func: exp.AggFunc) -> FunctionCall:
         """Convert sqlglot aggregate function.
@@ -918,7 +1006,11 @@ class Parser:
             distinct=distinct,
         )
 
-    def _extract_function_args(self, func: exp.AggFunc, distinct: bool) -> List[Expression]:
+    def _extract_function_args(
+        self,
+        func: exp.AggFunc,
+        distinct: bool,
+    ) -> List[Expression]:
         """Extract arguments from function.
 
         Args:
@@ -1050,8 +1142,7 @@ class Parser:
         Returns:
             Logical plan root node
         """
-        ast = self.parse(sql)
-        return self.ast_to_logical_plan(ast)
+        return self.parse(sql)
 
     def __repr__(self) -> str:
         return f"Parser(dialect={self.dialect})"

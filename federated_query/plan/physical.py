@@ -486,6 +486,11 @@ class PhysicalHashJoin(PhysicalPlanNode):
         from collections import defaultdict
         from .expressions import ColumnRef
 
+        if self.join_type in (JoinType.SEMI, JoinType.ANTI):
+            for batch in self._execute_semi_anti():
+                yield batch
+            return
+
         if self.build_side == "right":
             build_node = self.right
             probe_node = self.left
@@ -580,6 +585,27 @@ class PhysicalHashJoin(PhysicalPlanNode):
                 raise NotImplementedError(f"Key extraction not implemented for {type(key)}")
 
         return key_arrays
+
+    def _execute_semi_anti(self) -> Iterator[pa.RecordBatch]:
+        """Execute SEMI or ANTI hash join."""
+        from collections import defaultdict
+
+        hash_table = defaultdict(bool)
+        for batch in self.right.execute():
+            key_values = self._extract_key_values(batch, self.right_keys)
+            for row_idx in range(batch.num_rows):
+                key = tuple(val[row_idx].as_py() for val in key_values)
+                hash_table[key] = True
+
+        for left_batch in self.left.execute():
+            left_keys = self._extract_key_values(left_batch, self.left_keys)
+            for left_idx in range(left_batch.num_rows):
+                key = tuple(val[left_idx].as_py() for val in left_keys)
+                match = key in hash_table
+                if self.join_type == JoinType.SEMI and match:
+                    yield self._left_row_batch(left_batch, left_idx)
+                if self.join_type == JoinType.ANTI and not match:
+                    yield self._left_row_batch(left_batch, left_idx)
 
     def _join_rows(
         self,
@@ -740,6 +766,23 @@ class PhysicalHashJoin(PhysicalPlanNode):
             arrays.append(null_array)
             names.append(name)
 
+        return pa.RecordBatch.from_arrays(arrays, names=names)
+
+    def _left_row_batch(
+        self,
+        batch: pa.RecordBatch,
+        row_idx: int,
+    ) -> pa.RecordBatch:
+        """Create single-row batch with only left columns."""
+        arrays = []
+        names = []
+        for i in range(batch.num_columns):
+            col = batch.column(i)
+            field = batch.schema.field(i)
+            scalar_val = col[row_idx]
+            arr = pa.array([scalar_val.as_py()], type=field.type)
+            arrays.append(arr)
+            names.append(field.name)
         return pa.RecordBatch.from_arrays(arrays, names=names)
 
     def schema(self) -> pa.Schema:
@@ -1006,6 +1049,11 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
         """Execute nested loop join."""
         import pyarrow.compute as pc
 
+        if self.join_type in (JoinType.SEMI, JoinType.ANTI):
+            for batch in self._execute_semi_anti():
+                yield batch
+            return
+
         right_batches = []
         for batch in self.right.execute():
             right_batches.append(batch)
@@ -1041,6 +1089,28 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
                 for right_row_idx in range(right_batch.num_rows):
                     if (right_batch_idx, right_row_idx) not in matched_right_rows:
                         yield self._create_right_outer_row(right_batch, right_row_idx)
+
+    def _execute_semi_anti(self) -> Iterator[pa.RecordBatch]:
+        """Execute SEMI or ANTI nested loop join."""
+        for left_batch in self.left.execute():
+            for left_row_idx in range(left_batch.num_rows):
+                matched = False
+                for right_batch in self.right.execute():
+                    for right_row_idx in range(right_batch.num_rows):
+                        if self.condition is None or self._evaluate_condition(
+                            left_batch,
+                            left_row_idx,
+                            right_batch,
+                            right_row_idx,
+                        ):
+                            matched = True
+                            break
+                    if matched:
+                        break
+                if self.join_type == JoinType.SEMI and matched:
+                    yield self._left_row_batch(left_batch, left_row_idx)
+                if self.join_type == JoinType.ANTI and not matched:
+                    yield self._left_row_batch(left_batch, left_row_idx)
 
     def _evaluate_condition(
         self,
@@ -1205,6 +1275,23 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
 
         return pa.RecordBatch.from_arrays(arrays, names=names)
 
+    def _left_row_batch(
+        self,
+        batch: pa.RecordBatch,
+        row_idx: int,
+    ) -> pa.RecordBatch:
+        """Create single-row batch with only left columns."""
+        arrays = []
+        names = []
+        for i in range(batch.num_columns):
+            col = batch.column(i)
+            field = batch.schema.field(i)
+            scalar_val = col[row_idx]
+            arr = pa.array([scalar_val.as_py()], type=field.type)
+            arrays.append(arr)
+            names.append(field.name)
+        return pa.RecordBatch.from_arrays(arrays, names=names)
+
     def schema(self) -> pa.Schema:
         """Combine schemas from both sides."""
         left_schema = self.left.schema()
@@ -1231,6 +1318,23 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
 
     def __repr__(self) -> str:
         return f"PhysicalNestedLoopJoin({self.join_type.value})"
+
+    def _left_row_batch(
+        self,
+        batch: pa.RecordBatch,
+        row_idx: int,
+    ) -> pa.RecordBatch:
+        """Create single-row batch with only left columns."""
+        arrays = []
+        names = []
+        for i in range(batch.num_columns):
+            col = batch.column(i)
+            field = batch.schema.field(i)
+            scalar_val = col[row_idx]
+            arr = pa.array([scalar_val.as_py()], type=field.type)
+            arrays.append(arr)
+            names.append(field.name)
+        return pa.RecordBatch.from_arrays(arrays, names=names)
 
 
 @dataclass
