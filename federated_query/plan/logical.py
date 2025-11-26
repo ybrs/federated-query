@@ -20,34 +20,6 @@ class JoinType(Enum):
     ANTI = "ANTI"  # For NOT EXISTS
 
 
-@dataclass(frozen=True)
-class CTE(LogicalPlanNode):
-    """Common table expression wrapper.
-
-    Holds a list of named subplans and a root plan that can reference them.
-    """
-
-    name: str
-    cte_plan: LogicalPlanNode
-    child: LogicalPlanNode
-
-    def children(self) -> List[LogicalPlanNode]:
-        return [self.cte_plan, self.child]
-
-    def with_children(self, children: List[LogicalPlanNode]) -> "CTE":
-        assert len(children) == 2
-        return CTE(name=self.name, cte_plan=children[0], child=children[1])
-
-    def accept(self, visitor):
-        return visitor.visit_cte(self)
-
-    def schema(self) -> List[str]:
-        return self.child.schema()
-
-    def __repr__(self) -> str:
-        return f"CTE({self.name})"
-
-
 class AggregateFunction(Enum):
     """Aggregate function types."""
 
@@ -361,6 +333,34 @@ class Explain(LogicalPlanNode):
 
     def __repr__(self) -> str:
         return f"Explain(format={self.format.value})"
+
+
+@dataclass(frozen=True)
+class CTE(LogicalPlanNode):
+    """Common table expression wrapper.
+
+    Holds a named subplan and a root plan that can reference it.
+    """
+
+    name: str
+    cte_plan: LogicalPlanNode
+    child: LogicalPlanNode
+
+    def children(self) -> List[LogicalPlanNode]:
+        return [self.cte_plan, self.child]
+
+    def with_children(self, children: List[LogicalPlanNode]) -> "CTE":
+        assert len(children) == 2
+        return CTE(name=self.name, cte_plan=children[0], child=children[1])
+
+    def accept(self, visitor):
+        return visitor.visit_cte(self)
+
+    def schema(self) -> List[str]:
+        return self.child.schema()
+
+    def __repr__(self) -> str:
+        return f"CTE({self.name})"
 
 
 class LogicalPlanVisitor(ABC):

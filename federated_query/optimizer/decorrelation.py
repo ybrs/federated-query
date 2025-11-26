@@ -126,7 +126,7 @@ class CorrelationAnalyzer:
         outer: Set[str],
     ) -> bool:
         if col_ref.table is None:
-            return True
+            return False
         if col_ref.table in inner:
             return False
         return True
@@ -201,30 +201,97 @@ class Decorrelator:
         self._raise_if_subquery_expression(decorrelated)
         return decorrelated
 
+    def _raise_if_subquery_expression(self, plan: LogicalPlanNode) -> None:
+        """Raise if any subquery expression is found in the plan."""
+        expressions = self._collect_plan_expressions(plan)
+        for expr in expressions:
+            if self._expression_contains_subquery(expr):
+                raise DecorrelationError("Decorrelation not yet implemented")
+        for child in plan.children():
+            self._raise_if_subquery_expression(child)
 
-class NullSafeBuilder:
-    """Builds null-safe comparison expressions."""
+    def _expression_contains_subquery(self, expr: Expression) -> bool:
+        """Check expression tree for subquery nodes."""
+        checkers = [
+            self._is_direct_subquery,
+            self._binary_has_subquery,
+            self._unary_has_subquery,
+            self._function_has_subquery,
+            self._case_has_subquery,
+            self._inlist_has_subquery,
+        ]
+        for checker in checkers:
+            if checker(expr):
+                return True
+        return False
 
-    def build_equality(self, left: Expression, right: Expression) -> BinaryOp:
-        from ..plan.expressions import BinaryOpType
+    def _is_direct_subquery(self, expr: Expression) -> bool:
+        if isinstance(expr, SubqueryExpression):
+            return True
+        if isinstance(expr, ExistsExpression):
+            return True
+        if isinstance(expr, InSubquery):
+            return True
+        if isinstance(expr, QuantifiedComparison):
+            return True
+        return False
 
-        return BinaryOp(op=BinaryOpType.EQ, left=left, right=right)
+    def _binary_has_subquery(self, expr: Expression) -> bool:
+        from ..plan.expressions import BinaryOp
 
+        if not isinstance(expr, BinaryOp):
+            return False
+        if self._expression_contains_subquery(expr.left):
+            return True
+        return self._expression_contains_subquery(expr.right)
 
-class CTEHoister:
-    """Hoists uncorrelated subqueries into deterministic CTEs."""
+    def _unary_has_subquery(self, expr: Expression) -> bool:
+        from ..plan.expressions import UnaryOp
 
-    def __init__(self) -> None:
-        self.counter = 0
+        if not isinstance(expr, UnaryOp):
+            return False
+        return self._expression_contains_subquery(expr.operand)
 
-    def hoist(self, subquery: LogicalPlanNode, parent: LogicalPlanNode) -> CTE:
-        name = self._next_name()
-        return CTE(name=name, cte_plan=subquery, child=parent)
+    def _function_has_subquery(self, expr: Expression) -> bool:
+        from ..plan.expressions import FunctionCall
 
-    def _next_name(self) -> str:
-        name = f"cte_subq_{self.counter}"
-        self.counter += 1
-        return name
+        if not isinstance(expr, FunctionCall):
+            return False
+        for arg in expr.args:
+            if self._expression_contains_subquery(arg):
+                return True
+        return False
+
+    def _case_has_subquery(self, expr: Expression) -> bool:
+        from ..plan.expressions import CaseExpr
+
+        if not isinstance(expr, CaseExpr):
+            return False
+        if self._case_when_contains(expr.when_clauses):
+            return True
+        if expr.else_result and self._expression_contains_subquery(expr.else_result):
+            return True
+        return False
+
+    def _case_when_contains(self, clauses) -> bool:
+        for condition, result in clauses:
+            if self._expression_contains_subquery(condition):
+                return True
+            if self._expression_contains_subquery(result):
+                return True
+        return False
+
+    def _inlist_has_subquery(self, expr: Expression) -> bool:
+        from ..plan.expressions import InList
+
+        if not isinstance(expr, InList):
+            return False
+        if self._expression_contains_subquery(expr.value):
+            return True
+        for option in expr.options:
+            if self._expression_contains_subquery(option):
+                return True
+        return False
 
     def _rewrite_plan(
         self,
@@ -308,7 +375,6 @@ class CTEHoister:
         if isinstance(plan, Explain):
             return Explain(input=rewritten_children[0], format=plan.format)
 
-        # For Scan and other leaf nodes
         if len(rewritten_children) == 0:
             return plan
 
@@ -475,6 +541,43 @@ class CTEHoister:
         if isinstance(plan, Join):
             if plan.condition:
                 expressions.append(plan.condition)
+
+
+class NullSafeBuilder:
+    """Builds null-safe comparison expressions."""
+
+    def build_equality(self, left: Expression, right: Expression) -> BinaryOp:
+        from ..plan.expressions import BinaryOpType
+
+        return BinaryOp(op=BinaryOpType.EQ, left=left, right=right)
+
+
+class CTEHoister:
+    """
+    Hoists uncorrelated subqueries into deterministic CTEs.
+
+    This lets us evaluate an uncorrelated subquery once and reuse it. Example:
+        input plan: Project(users, expr=(SELECT MAX(x) FROM t))
+        hoist: CTE(name=cte_subq_0, cte_plan=Scan(t), child=Project(...cross cte...))
+
+    Naming is stable (`cte_subq_<n>`) so tests can assert on plan shapes.
+    """
+
+    def __init__(self) -> None:
+        self.counter = 0
+
+    def hoist(self, subquery: LogicalPlanNode, parent: LogicalPlanNode) -> CTE:
+        name = self._next_name()
+        return CTE(name=name, cte_plan=subquery, child=parent)
+
+    def _next_name(self) -> str:
+        name = f"cte_subq_{self.counter}"
+        self.counter += 1
+        return name
+
+    def __repr__(self) -> str:
+        return "CTEHoister()"
+
 
     def _expression_contains_subquery(self, expr: Expression) -> bool:
         """Check if expression tree contains any subquery node."""
