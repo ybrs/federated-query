@@ -61,6 +61,10 @@ class Parser:
         parsed_ast = sqlglot.parse_one(sql, dialect=self.dialect)
         return self.ast_to_logical_plan(parsed_ast)
 
+    def parse_ast(self, sql: str) -> exp.Expression:
+        """Parse SQL string to sqlglot AST without conversion."""
+        return sqlglot.parse_one(sql, dialect=self.dialect)
+
     def ast_to_logical_plan(self, ast: exp.Expression) -> LogicalPlanNode:
         """Convert sqlglot AST to logical plan.
 

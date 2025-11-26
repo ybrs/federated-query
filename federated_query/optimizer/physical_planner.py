@@ -14,6 +14,7 @@ from ..plan.logical import (
     Explain,
     Sort,
     JoinType,
+    CTE,
 )
 from ..plan.physical import (
     PhysicalPlanNode,
@@ -80,6 +81,8 @@ class PhysicalPlanner:
             return self._plan_aggregate(node)
         if isinstance(node, Explain):
             return self._plan_explain(node)
+        if isinstance(node, CTE):
+            return self._plan_cte(node)
 
         raise ValueError(f"Unsupported logical plan node: {type(node)}")
 
@@ -198,6 +201,14 @@ class PhysicalPlanner:
         """Plan an explain node."""
         child_plan = self._plan_node(explain.input)
         return PhysicalExplain(child=child_plan, format=explain.format)
+
+    def _plan_cte(self, cte: CTE) -> PhysicalPlanNode:
+        """Plan a CTE by planning its child; execution layer should inline."""
+        cte_plan = self._plan_node(cte.cte_plan)
+        child_plan = self._plan_node(cte.child)
+        # For now, ignore the cte name and return the child plan.
+        # Physical execution layer currently lacks explicit CTE support.
+        return child_plan
 
     def _plan_join(self, join: Join) -> PhysicalPlanNode:
         """Plan a join node."""

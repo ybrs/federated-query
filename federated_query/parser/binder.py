@@ -13,6 +13,7 @@ from ..plan.logical import (
     Join,
     Aggregate,
     Explain,
+    CTE,
 )
 from ..plan.expressions import (
     Expression,
@@ -87,6 +88,8 @@ class Binder:
             return self._bind_join(plan)
         if isinstance(plan, Aggregate):
             return self._bind_aggregate(plan)
+        if isinstance(plan, CTE):
+            return self._bind_cte(plan)
         raise BindingError(f"Unsupported plan node type: {type(plan)}")
 
     def _bind_scan(self, scan: Scan) -> Scan:
@@ -423,6 +426,12 @@ class Binder:
             aggregates=bound_aggregates,
             output_names=aggregate.output_names,
         )
+
+    def _bind_cte(self, cte: CTE) -> CTE:
+        """Bind a CTE node."""
+        bound_cte = self.bind(cte.cte_plan)
+        bound_child = self.bind(cte.child)
+        return CTE(name=cte.name, cte_plan=bound_cte, child=bound_child)
 
     def _bind_group_by_expressions(
         self, expressions: List[Expression], table: Optional[Table]
