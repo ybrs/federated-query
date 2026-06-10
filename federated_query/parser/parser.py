@@ -58,12 +58,23 @@ class Parser:
         Returns:
             Logical plan root node
         """
-        parsed_ast = sqlglot.parse_one(sql, dialect=self.dialect)
+        parsed_ast = self._parse_one(sql)
         return self.ast_to_logical_plan(parsed_ast)
 
     def parse_ast(self, sql: str) -> exp.Expression:
         """Parse SQL string to sqlglot AST without conversion."""
-        return sqlglot.parse_one(sql, dialect=self.dialect)
+        return self._parse_one(sql)
+
+    def _parse_one(self, sql: str) -> exp.Expression:
+        """Parse a single statement, unwrapping multi-statement blocks.
+
+        sqlglot wraps semicolon-separated input in a ``Block``; mirror the
+        documented ``parse_one`` contract by returning the first statement.
+        """
+        parsed = sqlglot.parse_one(sql, dialect=self.dialect)
+        if isinstance(parsed, exp.Block):
+            return parsed.expressions[0]
+        return parsed
 
     def ast_to_logical_plan(self, ast: exp.Expression) -> LogicalPlanNode:
         """Convert sqlglot AST to logical plan.
@@ -114,7 +125,7 @@ class Parser:
         if isinstance(expression, exp.Literal) and expression.is_string:
             sql_text = expression.this.strip()
             explain_format, sql_body = self._parse_explain_options(sql_text)
-            parsed = sqlglot.parse_one(sql_body, dialect=self.dialect)
+            parsed = self._parse_one(sql_body)
             return parsed, explain_format
         if isinstance(expression, exp.Expression):
             return expression, ExplainFormat.TEXT
@@ -185,7 +196,7 @@ class Parser:
         Returns:
             Scan node or Join node
         """
-        from_clause = select.args.get("from")
+        from_clause = select.args.get("from_")
         if not from_clause:
             raise ValueError("SELECT must have FROM clause")
 
@@ -775,6 +786,8 @@ class Parser:
             return self._convert_exists_expression(expr, False)
         if isinstance(expr, exp.Subquery):
             return self._convert_subquery_expression(expr)
+        if isinstance(expr, exp.Like):
+            return self._convert_like_predicate(expr)
         if isinstance(expr, exp.Binary):
             return self._convert_binary(expr)
         if isinstance(expr, exp.Unary):
@@ -874,6 +887,20 @@ class Parser:
         if data_type == DataType.BOOLEAN:
             return value_str.lower() == "true"
         return value_str
+
+    def _convert_like_predicate(self, like: exp.Like) -> Expression:
+        """Convert LIKE, wrapping in NOT when sqlglot marks it negated.
+
+        sqlglot represents ``NOT LIKE`` as a ``Like`` node carrying a
+        ``negate`` flag rather than a wrapping ``Not`` node, so the flag
+        must be honored here to preserve the negation.
+        """
+        left = self._convert_expression(like.this)
+        right = self._convert_expression(like.expression)
+        comparison = BinaryOp(op=BinaryOpType.LIKE, left=left, right=right)
+        if like.args.get("negate"):
+            return UnaryOp(op=UnaryOpType.NOT, operand=comparison)
+        return comparison
 
     def _convert_binary(self, binary: exp.Binary) -> BinaryOp:
         """Convert sqlglot binary operation."""

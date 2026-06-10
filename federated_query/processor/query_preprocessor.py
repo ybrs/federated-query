@@ -265,7 +265,7 @@ class QueryPreprocessor:
     def _collect_sources(self, select: exp.Select) -> List[_SelectSource]:
         """Collect table metadata needed for expansion."""
         sources: List[_SelectSource] = []
-        from_clause = select.args.get("from")
+        from_clause = select.args.get("from_")
         if from_clause is None:
             return sources
         sources.append(self._build_source(from_clause.this))

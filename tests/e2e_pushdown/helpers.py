@@ -75,7 +75,7 @@ def select_column_names(select_ast: exp.Select) -> List[str]:
 
 def from_table_name(select_ast: exp.Select) -> str:
     """Return the base table referenced by the FROM clause."""
-    from_clause = select_ast.args.get("from")
+    from_clause = select_ast.args.get("from_")
     assert from_clause is not None
     table = from_clause.this
     assert isinstance(table, exp.Table)

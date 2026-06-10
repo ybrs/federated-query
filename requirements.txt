@@ -1,5 +1,5 @@
 # Core dependencies
-sqlglot>=20.0.0
+sqlglot>=30.0.0
 pyarrow>=14.0.0
 pyyaml>=6.0
 click>=8.1.0
