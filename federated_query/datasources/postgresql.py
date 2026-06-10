@@ -1,5 +1,6 @@
 """PostgreSQL data source implementation."""
 
+from contextlib import contextmanager
 from typing import List, Dict, Any, Iterator, Optional
 import pyarrow as pa
 import psycopg2
@@ -83,6 +84,19 @@ class PostgreSQLDataSource(DataSource):
         """Return a connection to the pool."""
         if self._pool:
             self._pool.putconn(conn)
+
+    @contextmanager
+    def get_connection(self) -> Iterator[Any]:
+        """Yield a pooled connection, returning it to the pool on exit.
+
+        Intended for callers that need a raw psycopg2 connection (for
+        example, test fixtures issuing DDL) without managing the pool.
+        """
+        conn = self._get_connection()
+        try:
+            yield conn
+        finally:
+            self._return_connection(conn)
 
     def get_capabilities(self) -> List[DataSourceCapability]:
         """PostgreSQL supports most SQL features."""

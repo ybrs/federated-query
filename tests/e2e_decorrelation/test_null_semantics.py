@@ -24,6 +24,7 @@ def setup_null_test_data(pg_datasource, setup_test_data):
     """
     with pg_datasource.get_connection() as conn:
         with conn.cursor() as cursor:
+            cursor.execute("SET search_path TO pg")
             # Add user with NULL country
             cursor.execute("""
                 INSERT INTO users (id, name, country, city) VALUES
@@ -55,6 +56,7 @@ def setup_null_test_data(pg_datasource, setup_test_data):
     # Cleanup
     with pg_datasource.get_connection() as conn:
         with conn.cursor() as cursor:
+            cursor.execute("SET search_path TO pg")
             cursor.execute("DELETE FROM orders WHERE id = 10")
             cursor.execute("DELETE FROM products WHERE id = 10")
             cursor.execute("DELETE FROM cities WHERE id = 10")

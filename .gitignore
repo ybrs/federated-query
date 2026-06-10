@@ -56,6 +56,11 @@ logs/
 config.yaml
 secrets.yaml
 
+# Local PostgreSQL test harness (downloaded binaries + cluster data)
+postgres-17/
+postgres-data/
+postgres-server.log
+
 # OS
 .DS_Store
 Thumbs.db
