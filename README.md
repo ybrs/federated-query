@@ -1,6 +1,6 @@
 # Disclaimer
 
-This is an experiment for building a federated query engine in python and rust using datafusion and duckdb.
+This is an experiment for building a federated query engine in python and rust.
 
 We have just bootstrapped the project and have tests covering areas. The document below and documents in the repo can mean anything else, but this is very early phase of the project.
 
