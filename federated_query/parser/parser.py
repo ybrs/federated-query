@@ -16,6 +16,8 @@ from ..plan.logical import (
     Aggregate,
     Explain,
     ExplainFormat,
+    Values,
+    SubqueryScan,
 )
 from ..catalog.catalog import Catalog
 from ..plan.expressions import (
@@ -36,6 +38,7 @@ from ..plan.expressions import (
     InSubquery,
     QuantifiedComparison,
     Quantifier,
+    TupleExpression,
 )
 
 if TYPE_CHECKING:
@@ -100,6 +103,10 @@ class Parser:
         Returns:
             Logical plan node
         """
+        if select.args.get("with_"):
+            raise ValueError("WITH clauses (CTEs) are not supported yet")
+        if select.args.get("from_") is None:
+            return self._build_values_select(select)
         plan = self._build_from_clause(select)
         plan = self._build_where_clause(select, plan)
         plan = self._build_group_by_clause(select, plan)
@@ -108,6 +115,25 @@ class Parser:
         plan = self._build_order_by_clause(select, plan)
         plan = self._build_limit_clause(select, plan)
         return plan
+
+    def _build_values_select(self, select: exp.Select) -> LogicalPlanNode:
+        """Build a single-row Values plan for a FROM-less SELECT.
+
+        Supports constant projections such as ``SELECT 42`` or
+        ``SELECT 'completed'``; clauses that require an input relation are
+        rejected.
+        """
+        for clause in ("where", "group", "having", "order", "joins"):
+            if select.args.get(clause):
+                raise ValueError(
+                    f"FROM-less SELECT does not support a {clause.upper()} clause"
+                )
+        row = []
+        names = []
+        for select_expr in select.expressions:
+            row.append(self._convert_expression(select_expr))
+            names.append(self._get_alias(select_expr))
+        return Values(rows=[row], output_names=names)
 
     def _convert_explain(self, command: exp.Command) -> LogicalPlanNode:
         """Convert EXPLAIN statement to logical plan."""
@@ -206,6 +232,10 @@ class Parser:
         if joins:
             return self._build_join_plan(select, table_expr, joins)
 
+        if isinstance(table_expr, exp.Subquery):
+            return self._build_derived_table(table_expr)
+        self._reject_unsupported_relation(table_expr)
+
         table_parts = self._extract_table_parts(table_expr)
         table_alias = self._extract_table_alias(table_expr)
         all_columns = self._collect_needed_columns(select)
@@ -222,6 +252,41 @@ class Parser:
             alias=table_alias,
         )
 
+    def _build_join_input(
+        self, table_expr: exp.Expression, column_usage: Dict[str, List[str]]
+    ) -> LogicalPlanNode:
+        """Build the plan for one input relation of a join."""
+        if isinstance(table_expr, exp.Subquery):
+            return self._build_derived_table(table_expr)
+        self._reject_unsupported_relation(table_expr)
+        table_parts = self._extract_table_parts(table_expr)
+        table_alias = self._extract_table_alias(table_expr)
+        columns = self._columns_for_join_table(column_usage, table_alias)
+        return Scan(
+            datasource=table_parts[0],
+            schema_name=table_parts[1],
+            table_name=table_parts[2],
+            columns=columns,
+            alias=table_alias,
+        )
+
+    def _build_derived_table(self, subquery: exp.Subquery) -> SubqueryScan:
+        """Build a SubqueryScan for a derived table in FROM."""
+        alias = subquery.alias
+        if not alias:
+            raise ValueError("Derived tables require an alias")
+        inner_plan = self.ast_to_logical_plan(subquery.this)
+        return SubqueryScan(input=inner_plan, alias=alias)
+
+    def _reject_unsupported_relation(self, table_expr: exp.Expression) -> None:
+        """Fail fast on FROM items the engine cannot plan."""
+        if isinstance(table_expr, exp.Lateral):
+            raise ValueError("LATERAL subqueries are not supported yet")
+        if not isinstance(table_expr, exp.Table):
+            raise ValueError(
+                f"Unsupported FROM item: {type(table_expr).__name__}"
+            )
+
     def _build_join_plan(
         self, select: exp.Select, left_table: exp.Table, joins: List[exp.Join]
     ) -> LogicalPlanNode:
@@ -237,37 +302,12 @@ class Parser:
         """
         column_usage = self._collect_join_column_usage(select)
 
-        left_table_parts = self._extract_table_parts(left_table)
-        left_table_alias = self._extract_table_alias(left_table)
-        left_columns = self._columns_for_join_table(
-            column_usage, left_table_alias
-        )
-
-        left_plan = Scan(
-            datasource=left_table_parts[0],
-            schema_name=left_table_parts[1],
-            table_name=left_table_parts[2],
-            columns=left_columns,
-            alias=left_table_alias,
-        )
+        left_plan = self._build_join_input(left_table, column_usage)
 
         current_plan = left_plan
 
         for join_clause in joins:
-            right_table = join_clause.this
-            right_table_parts = self._extract_table_parts(right_table)
-            right_table_alias = self._extract_table_alias(right_table)
-            right_columns = self._columns_for_join_table(
-                column_usage, right_table_alias
-            )
-
-            right_plan = Scan(
-                datasource=right_table_parts[0],
-                schema_name=right_table_parts[1],
-                table_name=right_table_parts[2],
-                columns=right_columns,
-                alias=right_table_alias,
-            )
+            right_plan = self._build_join_input(join_clause.this, column_usage)
 
             join_type = self._extract_join_type(join_clause)
             join_condition = None
@@ -425,9 +465,11 @@ class Parser:
                 if col_name not in columns:
                     columns.append(col_name)
 
-        where = select.args.get("where")
-        if where:
-            col_names = self._extract_column_names(where.this)
+        for clause in ("where", "group", "having", "order"):
+            clause_expr = select.args.get(clause)
+            if clause_expr is None:
+                continue
+            col_names = self._extract_column_names(clause_expr)
             for col_name in col_names:
                 if col_name not in columns:
                     columns.append(col_name)
@@ -518,6 +560,9 @@ class Parser:
     def _contains_aggregate_function(self, expr: exp.Expression) -> bool:
         """Check if expression contains aggregate function.
 
+        Aggregates inside a nested SELECT belong to that subquery, not to
+        the current query block, so traversal stops at subquery boundaries.
+
         Args:
             expr: sqlglot expression
 
@@ -526,6 +571,9 @@ class Parser:
         """
         if self._is_aggregate_function(expr):
             return True
+
+        if isinstance(expr, (exp.Select, exp.Subquery)):
+            return False
 
         for child in expr.iter_expressions():
             if self._contains_aggregate_function(child):
@@ -780,8 +828,12 @@ class Parser:
             return self._convert_is_expression(expr)
         if isinstance(expr, exp.Literal):
             return self._convert_literal(expr)
+        if isinstance(expr, exp.Boolean):
+            return Literal(value=bool(expr.this), data_type=DataType.BOOLEAN)
         if isinstance(expr, exp.Null):
             return Literal(value=None, data_type=DataType.NULL)
+        if isinstance(expr, exp.Tuple):
+            return self._convert_tuple_expression(expr)
         if isinstance(expr, exp.Exists):
             return self._convert_exists_expression(expr, False)
         if isinstance(expr, exp.Subquery):
@@ -888,6 +940,13 @@ class Parser:
             return value_str.lower() == "true"
         return value_str
 
+    def _convert_tuple_expression(self, tuple_expr: exp.Tuple) -> Expression:
+        """Convert a row value constructor such as ``(a, b)``."""
+        items = []
+        for item in tuple_expr.expressions:
+            items.append(self._convert_expression(item))
+        return TupleExpression(items=tuple(items))
+
     def _convert_like_predicate(self, like: exp.Like) -> Expression:
         """Convert LIKE, wrapping in NOT when sqlglot marks it negated.
 
@@ -895,12 +954,33 @@ class Parser:
         ``negate`` flag rather than a wrapping ``Not`` node, so the flag
         must be honored here to preserve the negation.
         """
+        quantified = self._convert_quantified_like(like)
+        if quantified is not None:
+            return quantified
         left = self._convert_expression(like.this)
         right = self._convert_expression(like.expression)
         comparison = BinaryOp(op=BinaryOpType.LIKE, left=left, right=right)
         if like.args.get("negate"):
             return UnaryOp(op=UnaryOpType.NOT, operand=comparison)
         return comparison
+
+    def _convert_quantified_like(self, like: exp.Like) -> Optional[Expression]:
+        """Convert ``LIKE ANY/ALL (subquery)`` to a quantified comparison."""
+        quantifiers = [
+            (exp.Any, Quantifier.ANY),
+            (exp.All, Quantifier.ALL),
+        ]
+        for node_type, quantifier in quantifiers:
+            if isinstance(like.expression, node_type):
+                left = self._convert_expression(like.this)
+                subquery_plan = self._extract_subquery_plan(like.expression.this)
+                return QuantifiedComparison(
+                    operator=BinaryOpType.LIKE,
+                    quantifier=quantifier,
+                    left=left,
+                    subquery=subquery_plan,
+                )
+        return None
 
     def _convert_binary(self, binary: exp.Binary) -> BinaryOp:
         """Convert sqlglot binary operation."""

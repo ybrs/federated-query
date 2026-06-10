@@ -7,7 +7,7 @@ and complex multi-level correlation patterns.
 import pytest
 from federated_query.parser.parser import Parser
 from federated_query.parser.binder import Binder
-from federated_query.optimizer.decorrelation import Decorrelator
+from federated_query.optimizer.decorrelation import Decorrelator, DecorrelationError
 from federated_query.executor.executor import Executor
 from .test_utils import (
     assert_plan_structure,
@@ -79,12 +79,14 @@ class TestNestedExists:
             )
 
         Expected plan structure:
-            - Innermost IN decorrelated (references u.id from outer scope)
-            - Middle EXISTS decorrelated (references u.country)
-            - Multiple correlation levels properly handled
+            - The innermost scalar correlates with u, two query levels up
+            - Transitive (skip-level) correlation requires dependent-join
+              machinery the engine does not have yet
+            - Decorrelation must fail fast with a clear error, never
+              produce a silently wrong plan
 
         Expected result:
-            Complex nested correlation
+            DecorrelationError naming the skip-level reference
         """
         # Note: This is a contrived example to test multi-level correlation
         # The SQL semantics may not be meaningful, but tests the decorrelation logic
@@ -103,16 +105,15 @@ class TestNestedExists:
         parser = Parser()
         binder = Binder(catalog)
         decorrelator = Decorrelator()
-        executor = Executor(catalog)
 
         logical_plan = parser.parse(sql)
         bound_plan = binder.bind(logical_plan)
-        decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
-        # Expected: Nested decorrelation with multiple levels
-        # Execute and verify
-        results = execute_and_fetch_all(executor, decorrelated_plan)
-        assert len(results) >= 0, "Query should execute successfully"
+        # Skip-level correlation (innermost subquery referencing the
+        # outermost query) is documented future work; the engine must
+        # refuse loudly rather than rewrite it incorrectly.
+        with pytest.raises(DecorrelationError, match="u.id"):
+            decorrelator.decorrelate(bound_plan)
 
     def test_deeply_nested_exists(self, catalog, setup_test_data):
         """

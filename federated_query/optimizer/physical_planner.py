@@ -15,6 +15,11 @@ from ..plan.logical import (
     Sort,
     JoinType,
     CTE,
+    Union,
+    Values,
+    SubqueryScan,
+    SingleRowGuard,
+    GroupedLimit,
 )
 from ..plan.physical import (
     PhysicalPlanNode,
@@ -28,6 +33,10 @@ from ..plan.physical import (
     PhysicalHashAggregate,
     PhysicalExplain,
     PhysicalSort,
+    PhysicalUnion,
+    PhysicalValues,
+    PhysicalSingleRowGuard,
+    PhysicalGroupedLimit,
 )
 from ..plan.expressions import BinaryOp, BinaryOpType, ColumnRef
 from typing import List, Tuple
@@ -84,6 +93,31 @@ class PhysicalPlanner:
         if isinstance(node, CTE):
             return self._plan_cte(node)
 
+        return self._plan_decorrelation_node(node)
+
+    def _plan_decorrelation_node(self, node: LogicalPlanNode) -> PhysicalPlanNode:
+        """Plan nodes produced by subquery decorrelation."""
+        if isinstance(node, Union):
+            inputs = []
+            for child in node.inputs:
+                inputs.append(self._plan_node(child))
+            return PhysicalUnion(inputs=inputs, distinct=node.distinct)
+        if isinstance(node, Values):
+            return PhysicalValues(rows=node.rows, output_names=node.output_names)
+        if isinstance(node, SubqueryScan):
+            return self._plan_node(node.input)
+        return self._plan_guard_node(node)
+
+    def _plan_guard_node(self, node: LogicalPlanNode) -> PhysicalPlanNode:
+        """Plan cardinality guard and per-key limit nodes."""
+        if isinstance(node, SingleRowGuard):
+            return PhysicalSingleRowGuard(
+                input=self._plan_node(node.input), keys=node.keys
+            )
+        if isinstance(node, GroupedLimit):
+            return PhysicalGroupedLimit(
+                input=self._plan_node(node.input), keys=node.keys, limit=node.limit
+            )
         raise ValueError(f"Unsupported logical plan node: {type(node)}")
 
     def _plan_scan(self, scan: Scan) -> PhysicalScan:
@@ -203,12 +237,11 @@ class PhysicalPlanner:
         return PhysicalExplain(child=child_plan, format=explain.format)
 
     def _plan_cte(self, cte: CTE) -> PhysicalPlanNode:
-        """Plan a CTE by planning its child; execution layer should inline."""
-        cte_plan = self._plan_node(cte.cte_plan)
-        child_plan = self._plan_node(cte.child)
-        # For now, ignore the cte name and return the child plan.
-        # Physical execution layer currently lacks explicit CTE support.
-        return child_plan
+        """CTE execution is not implemented; fail instead of dropping it."""
+        raise ValueError(
+            f"CTE '{cte.name}' cannot be executed: the physical layer has "
+            "no CTE support yet"
+        )
 
     def _plan_join(self, join: Join) -> PhysicalPlanNode:
         """Plan a join node."""
@@ -229,7 +262,7 @@ class PhysicalPlanner:
 
         join_keys = self._extract_join_keys(join.condition)
         if join_keys:
-            left_keys, right_keys = join_keys
+            left_keys, right_keys = self._orient_join_keys(join_keys, join)
             return PhysicalHashJoin(
                 left=left_plan,
                 right=right_plan,
@@ -245,6 +278,46 @@ class PhysicalPlanner:
             join_type=join.join_type,
             condition=join.condition,
         )
+
+    def _orient_join_keys(
+        self,
+        join_keys: Tuple[List[ColumnRef], List[ColumnRef]],
+        join: Join,
+    ) -> Tuple[List[ColumnRef], List[ColumnRef]]:
+        """Assign each equality's columns to the join side that has them.
+
+        Join conditions do not guarantee that the equality's left
+        expression references the join's left input (decorrelated
+        conditions often have the opposite orientation). Each pair is
+        checked against the logical inputs' output column names and
+        swapped when needed; pairs that cannot be placed by name keep
+        their original orientation.
+        """
+        left_names = set(join.left.schema())
+        right_names = set(join.right.schema())
+        left_keys: List[ColumnRef] = []
+        right_keys: List[ColumnRef] = []
+        for index in range(len(join_keys[0])):
+            first, second = self._orient_key_pair(
+                join_keys[0][index], join_keys[1][index], left_names, right_names
+            )
+            left_keys.append(first)
+            right_keys.append(second)
+        return left_keys, right_keys
+
+    def _orient_key_pair(
+        self,
+        first: ColumnRef,
+        second: ColumnRef,
+        left_names: set,
+        right_names: set,
+    ) -> Tuple[ColumnRef, ColumnRef]:
+        """Place one equality's columns onto the (left, right) sides."""
+        if first.column in left_names and second.column in right_names:
+            return first, second
+        if first.column in right_names and second.column in left_names:
+            return second, first
+        return first, second
 
     def _try_plan_remote_join(
         self,

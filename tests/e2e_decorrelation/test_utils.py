@@ -1,5 +1,12 @@
 """Utility functions for decorrelation e2e tests."""
 from typing import List, Set, Any
+
+from federated_query.catalog import Catalog
+from federated_query.optimizer.decorrelation import (
+    _expression_has_subquery,
+    _plan_expressions,
+)
+from federated_query.optimizer.physical_planner import PhysicalPlanner
 from federated_query.plan.logical import (
     LogicalPlanNode,
     Join,
@@ -80,6 +87,12 @@ def has_subquery_expressions(plan: LogicalPlanNode) -> bool:
     Returns:
         True if subquery expressions found (bad)
     """
+    for expr in _plan_expressions(plan):
+        if _expression_has_subquery(expr):
+            return True
+    for child in plan.children():
+        if has_subquery_expressions(child):
+            return True
     return False
 
 
@@ -115,19 +128,37 @@ def get_join_conditions(plan: LogicalPlanNode) -> List[Expression]:
     return conditions
 
 
+def plan_physical(executor, plan: LogicalPlanNode):
+    """
+    Convert a logical plan to a physical plan.
+
+    The decorrelation tests construct ``Executor(catalog)``, so the catalog
+    travels in the executor's config slot; it is required here to resolve
+    data sources during physical planning.
+    """
+    catalog = executor.config
+    if not isinstance(catalog, Catalog):
+        raise TypeError(
+            "Decorrelation tests must construct the executor as "
+            "Executor(catalog) so plans can be physically planned"
+        )
+    return PhysicalPlanner(catalog).plan(plan)
+
+
 def execute_and_fetch_all(executor, plan: LogicalPlanNode) -> List[dict]:
     """
-    Execute a plan and fetch all results as list of dicts.
+    Physically plan and execute a logical plan, fetching rows as dicts.
 
     Args:
-        executor: Executor instance
-        plan: Plan to execute
+        executor: Executor instance constructed as Executor(catalog)
+        plan: Decorrelated logical plan to execute
 
     Returns:
         List of result rows as dictionaries
     """
+    physical_plan = plan_physical(executor, plan)
     results = []
-    for batch in executor.execute(plan):
+    for batch in executor.execute(physical_plan):
         batch_dict = batch.to_pydict()
         column_names = list(batch_dict.keys())
         if len(column_names) == 0:

@@ -103,7 +103,9 @@ class TestCorrelatedExists:
             - Join condition: u.id = o.user_id AND o.amount > 100
 
         Expected result:
-            Users with orders > 100: Alice (id=1), Charlie (id=3), Eve (id=5)
+            Users with an order over 100: Alice (id=1, order 200), Bob
+            (id=2, order 150), Charlie (id=3, order 300), Eve (id=5,
+            order 500). Verified against PostgreSQL.
         """
         sql = """
             SELECT u.id, u.name
@@ -129,8 +131,8 @@ class TestCorrelatedExists:
             'semi_join_count': 1
         })
 
-        # Execute and verify results: 3 users
-        assert_result_contains_ids(executor, decorrelated_plan, {1, 3, 5})
+        # Execute and verify results: 4 users (Postgres-verified)
+        assert_result_contains_ids(executor, decorrelated_plan, {1, 2, 3, 5})
 
     def test_correlated_exists_multiple_correlation_keys(self, catalog, setup_test_data):
         """
@@ -483,7 +485,9 @@ class TestExistsInComplexQueries:
             - Predicate retains OR logic
 
         Expected result:
-            Users from FR or with orders > 250 (ids 1,3,4,5)
+            Users from FR or with an order over 250: Charlie (id=3, order
+            300), David (id=4, FR), Eve (id=5, order 500). Verified
+            against PostgreSQL.
         """
         sql = """
             SELECT u.id
@@ -512,4 +516,4 @@ class TestExistsInComplexQueries:
         ids = set()
         for row in results:
             ids.add(row['id'])
-        assert ids == {1, 3, 4, 5}, f"Unexpected ids {ids}"
+        assert ids == {3, 4, 5}, f"Unexpected ids {ids}"

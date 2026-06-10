@@ -9,6 +9,7 @@ from federated_query.parser.parser import Parser
 from federated_query.parser.binder import Binder
 from federated_query.optimizer.decorrelation import Decorrelator
 from federated_query.executor.executor import Executor
+from federated_query.plan.physical import CardinalityViolationError
 from .test_utils import (
     assert_plan_structure,
     assert_result_count,
@@ -518,7 +519,10 @@ class TestScalarCardinalityEnforcement:
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
         assert_plan_structure(decorrelated_plan, {})
-        results = execute_and_fetch_all(executor, decorrelated_plan)
+        # Real engines raise at execution when a scalar subquery yields
+        # more than one row per correlation key (users 1 and 3 do here).
+        with pytest.raises(CardinalityViolationError, match="more than one row"):
+            execute_and_fetch_all(executor, decorrelated_plan)
 
     def test_scalar_with_limit_one(self, catalog, setup_test_data):
         """

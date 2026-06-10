@@ -423,6 +423,34 @@ class InSubquery(Expression):
 
 
 @dataclass(frozen=True)
+class TupleExpression(Expression):
+    """Row value constructor such as ``(u.city, u.country)``.
+
+    Only meaningful as the left-hand side of a tuple IN subquery; the
+    decorrelator expands it into per-column predicates. It is never
+    evaluated directly.
+    """
+
+    items: Tuple[Expression, ...]
+
+    def get_type(self) -> DataType:
+        return DataType.NULL
+
+    def accept(self, visitor):
+        return visitor.visit_tuple(self)
+
+    def to_sql(self) -> str:
+        parts = []
+        for item in self.items:
+            parts.append(item.to_sql())
+        joined = ", ".join(parts)
+        return f"({joined})"
+
+    def __repr__(self) -> str:
+        return f"TupleExpression({len(self.items)} items)"
+
+
+@dataclass(frozen=True)
 class QuantifiedComparison(Expression):
     """Quantified comparison such as > ANY or = ALL."""
 

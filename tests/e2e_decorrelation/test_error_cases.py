@@ -7,7 +7,9 @@ and other exceptional scenarios that should raise clear errors.
 import pytest
 from federated_query.parser.parser import Parser
 from federated_query.parser.binder import Binder
-from federated_query.optimizer.decorrelation import Decorrelator
+from federated_query.optimizer.decorrelation import Decorrelator, DecorrelationError
+from federated_query.parser.binder import BindingError
+from federated_query.plan.physical import CardinalityViolationError
 from federated_query.executor.executor import Executor
 from .test_utils import (
     assert_plan_structure,
@@ -52,11 +54,11 @@ class TestCardinalityViolations:
         bound_plan = binder.bind(logical_plan)
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
-        # Verify plan structure
+        # Verify plan structure, then assert the runtime cardinality guard
+        # fires (users 1 and 3 have multiple orders).
         assert_plan_structure(decorrelated_plan, {})
-        results = execute_and_fetch_all(executor, decorrelated_plan)
-        # with pytest.raises(DecorrelationError, match="multiple rows"):
-        #     decorrelated_plan = decorrelator.decorrelate(bound_plan)
+        with pytest.raises(CardinalityViolationError, match="more than one row"):
+            execute_and_fetch_all(executor, decorrelated_plan)
 
     def test_scalar_subquery_multiple_columns_error(self, catalog, setup_test_data):
         """
@@ -87,10 +89,9 @@ class TestCardinalityViolations:
 
         logical_plan = parser.parse(sql)
         bound_plan = binder.bind(logical_plan)
-        decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
-        assert_plan_structure(decorrelated_plan, {})
-        results = execute_and_fetch_all(executor, decorrelated_plan)
+        with pytest.raises(DecorrelationError, match="one column"):
+            decorrelator.decorrelate(bound_plan)
 
 
 class TestAmbiguousReferences:
@@ -167,11 +168,9 @@ class TestAmbiguousReferences:
         executor = Executor(catalog)
 
         logical_plan = parser.parse(sql)
-        bound_plan = binder.bind(logical_plan)
-        decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
-        assert_plan_structure(decorrelated_plan, {})
-        results = execute_and_fetch_all(executor, decorrelated_plan)
+        with pytest.raises(BindingError, match="nonexistent"):
+            binder.bind(logical_plan)
 
 
 class TestUnsupportedPatterns:
@@ -207,12 +206,8 @@ class TestUnsupportedPatterns:
         decorrelator = Decorrelator()
         executor = Executor(catalog)
 
-        logical_plan = parser.parse(sql)
-        bound_plan = binder.bind(logical_plan)
-        decorrelated_plan = decorrelator.decorrelate(bound_plan)
-
-        assert_plan_structure(decorrelated_plan, {})
-        results = execute_and_fetch_all(executor, decorrelated_plan)
+        with pytest.raises(ValueError, match="Window"):
+            parser.parse(sql)
 
     def test_recursive_cte_decorrelation_not_supported(self, catalog, setup_test_data):
         """
@@ -247,12 +242,8 @@ class TestUnsupportedPatterns:
         decorrelator = Decorrelator()
         executor = Executor(catalog)
 
-        logical_plan = parser.parse(sql)
-        bound_plan = binder.bind(logical_plan)
-        decorrelated_plan = decorrelator.decorrelate(bound_plan)
-
-        assert_plan_structure(decorrelated_plan, {})
-        results = execute_and_fetch_all(executor, decorrelated_plan)
+        with pytest.raises(ValueError, match="WITH"):
+            parser.parse(sql)
 
     def test_lateral_subquery_handling(self, catalog, setup_test_data):
         """
@@ -281,12 +272,8 @@ class TestUnsupportedPatterns:
         decorrelator = Decorrelator()
         executor = Executor(catalog)
 
-        logical_plan = parser.parse(sql)
-        bound_plan = binder.bind(logical_plan)
-        decorrelated_plan = decorrelator.decorrelate(bound_plan)
-
-        assert_plan_structure(decorrelated_plan, {})
-        results = execute_and_fetch_all(executor, decorrelated_plan)
+        with pytest.raises(ValueError, match="LATERAL"):
+            parser.parse(sql)
 
 
 class TestUnsupportedOperators:

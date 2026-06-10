@@ -363,6 +363,121 @@ class CTE(LogicalPlanNode):
         return f"CTE({self.name})"
 
 
+@dataclass(frozen=True)
+class Values(LogicalPlanNode):
+    """In-memory rows built from constant expressions.
+
+    Represents a FROM-less SELECT such as ``SELECT 42``: one or more rows,
+    each a list of expressions evaluated without input columns.
+    """
+
+    rows: List[List[Expression]]
+    output_names: List[str]
+
+    def children(self) -> List[LogicalPlanNode]:
+        return []
+
+    def with_children(self, children: List[LogicalPlanNode]) -> "Values":
+        assert len(children) == 0
+        return self
+
+    def accept(self, visitor):
+        return visitor.visit_values(self)
+
+    def schema(self) -> List[str]:
+        return self.output_names
+
+    def __repr__(self) -> str:
+        return f"Values({len(self.rows)} rows)"
+
+
+@dataclass(frozen=True)
+class SubqueryScan(LogicalPlanNode):
+    """A derived table: a subplan exposed under an alias.
+
+    ``FROM (SELECT ...) dt`` becomes SubqueryScan(input=subplan, alias="dt");
+    the output columns are the subplan's output columns.
+    """
+
+    input: LogicalPlanNode
+    alias: str
+
+    def children(self) -> List[LogicalPlanNode]:
+        return [self.input]
+
+    def with_children(self, children: List[LogicalPlanNode]) -> "SubqueryScan":
+        assert len(children) == 1
+        return SubqueryScan(input=children[0], alias=self.alias)
+
+    def accept(self, visitor):
+        return visitor.visit_subquery_scan(self)
+
+    def schema(self) -> List[str]:
+        return self.input.schema()
+
+    def __repr__(self) -> str:
+        return f"SubqueryScan({self.alias})"
+
+
+@dataclass(frozen=True)
+class SingleRowGuard(LogicalPlanNode):
+    """Runtime cardinality guard for decorrelated scalar subqueries.
+
+    With no keys, the input may produce at most one row in total. With
+    keys, each distinct key tuple may appear at most once. Violations
+    raise at execution time, mirroring real engines' scalar subquery
+    errors.
+    """
+
+    input: LogicalPlanNode
+    keys: List[Expression]
+
+    def children(self) -> List[LogicalPlanNode]:
+        return [self.input]
+
+    def with_children(self, children: List[LogicalPlanNode]) -> "SingleRowGuard":
+        assert len(children) == 1
+        return SingleRowGuard(input=children[0], keys=self.keys)
+
+    def accept(self, visitor):
+        return visitor.visit_single_row_guard(self)
+
+    def schema(self) -> List[str]:
+        return self.input.schema()
+
+    def __repr__(self) -> str:
+        return f"SingleRowGuard(keys={len(self.keys)})"
+
+
+@dataclass(frozen=True)
+class GroupedLimit(LogicalPlanNode):
+    """Per-key LIMIT produced by decorrelating a correlated LIMIT.
+
+    A correlated subquery's LIMIT applies once per outer row; after
+    decorrelation it becomes "at most N rows per correlation key".
+    """
+
+    input: LogicalPlanNode
+    keys: List[Expression]
+    limit: int
+
+    def children(self) -> List[LogicalPlanNode]:
+        return [self.input]
+
+    def with_children(self, children: List[LogicalPlanNode]) -> "GroupedLimit":
+        assert len(children) == 1
+        return GroupedLimit(input=children[0], keys=self.keys, limit=self.limit)
+
+    def accept(self, visitor):
+        return visitor.visit_grouped_limit(self)
+
+    def schema(self) -> List[str]:
+        return self.input.schema()
+
+    def __repr__(self) -> str:
+        return f"GroupedLimit(limit={self.limit}, keys={len(self.keys)})"
+
+
 class LogicalPlanVisitor(ABC):
     """Visitor interface for logical plan nodes."""
 
@@ -404,4 +519,20 @@ class LogicalPlanVisitor(ABC):
 
     @abstractmethod
     def visit_cte(self, node: "CTE"):
+        pass
+
+    @abstractmethod
+    def visit_values(self, node: "Values"):
+        pass
+
+    @abstractmethod
+    def visit_subquery_scan(self, node: "SubqueryScan"):
+        pass
+
+    @abstractmethod
+    def visit_single_row_guard(self, node: "SingleRowGuard"):
+        pass
+
+    @abstractmethod
+    def visit_grouped_limit(self, node: "GroupedLimit"):
         pass
