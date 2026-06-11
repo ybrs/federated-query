@@ -31,6 +31,14 @@ class AggregateFunction(Enum):
     COUNT_DISTINCT = "COUNT_DISTINCT"
 
 
+class SetOpKind(Enum):
+    """SQL set-operation kinds."""
+
+    UNION = "UNION"
+    INTERSECT = "INTERSECT"
+    EXCEPT = "EXCEPT"
+
+
 class ExplainFormat(Enum):
     """Supported EXPLAIN output formats."""
 
@@ -334,6 +342,39 @@ class Union(LogicalPlanNode):
 
 
 @dataclass(frozen=True)
+class SetOperation(LogicalPlanNode):
+    """Binary SQL set operation (UNION / INTERSECT / EXCEPT).
+
+    ``distinct`` is True for the bare form (which removes duplicates) and
+    False for the ``ALL`` form (which preserves row multiplicity). Chained
+    set operations nest left-associatively, mirroring the parser AST.
+    """
+
+    left: LogicalPlanNode
+    right: LogicalPlanNode
+    kind: SetOpKind
+    distinct: bool
+
+    def children(self) -> List[LogicalPlanNode]:
+        return [self.left, self.right]
+
+    def with_children(self, children: List[LogicalPlanNode]) -> "SetOperation":
+        assert len(children) == 2
+        return SetOperation(children[0], children[1], self.kind, self.distinct)
+
+    def accept(self, visitor):
+        return visitor.visit_set_operation(self)
+
+    def schema(self) -> List[str]:
+        # Both branches share a schema; the left branch names the result.
+        return self.left.schema()
+
+    def __repr__(self) -> str:
+        suffix = "" if self.distinct else " ALL"
+        return f"{self.kind.value}{suffix}(left, right)"
+
+
+@dataclass(frozen=True)
 class Explain(LogicalPlanNode):
     """Explain wrapper around another plan."""
 
@@ -533,6 +574,10 @@ class LogicalPlanVisitor(ABC):
 
     @abstractmethod
     def visit_union(self, node: Union):
+        pass
+
+    @abstractmethod
+    def visit_set_operation(self, node: "SetOperation"):
         pass
 
     @abstractmethod

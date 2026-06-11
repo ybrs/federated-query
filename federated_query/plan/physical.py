@@ -20,7 +20,7 @@ import pyarrow as pa
 from sqlglot import exp
 
 from .expressions import Expression
-from .logical import JoinType, ExplainFormat
+from .logical import JoinType, ExplainFormat, SetOpKind
 
 if TYPE_CHECKING:
     from .expressions import FunctionCall
@@ -2122,6 +2122,236 @@ def _batch_row_tuple(batch: pa.RecordBatch, row_index: int) -> tuple:
     return tuple(values)
 
 
+_SET_OP_EXP = {
+    SetOpKind.UNION: exp.Union,
+    SetOpKind.INTERSECT: exp.Intersect,
+    SetOpKind.EXCEPT: exp.Except,
+}
+
+
+@dataclass
+class PhysicalRemoteSetOp(PhysicalPlanNode):
+    """Set operation pushed to a single data source as one remote query.
+
+    Both branches resolve to the same datasource, so the whole
+    UNION/INTERSECT/EXCEPT is sent remotely. A trailing ORDER BY / LIMIT
+    applies to the combined result and is rendered by wrapping the set
+    operation in an outer ``SELECT * FROM (...)``.
+    """
+
+    left: PhysicalPlanNode
+    right: PhysicalPlanNode
+    kind: SetOpKind
+    distinct: bool
+    datasource: str
+    datasource_connection: Any
+    order_by_keys: Optional[List[Expression]] = None
+    order_by_ascending: Optional[List[bool]] = None
+    order_by_nulls: Optional[List[Optional[str]]] = None
+    limit: Optional[int] = None
+    offset: int = 0
+    _schema: Optional[pa.Schema] = None
+
+    def children(self) -> List[PhysicalPlanNode]:
+        return []
+
+    def execute(self) -> Iterator[pa.RecordBatch]:
+        query = self._build_query()
+        self.datasource_connection.ensure_connected()
+        for batch in self.datasource_connection.execute_query(query):
+            yield batch
+
+    def schema(self) -> pa.Schema:
+        if self._schema is None:
+            self._schema = self.datasource_connection.get_query_schema(
+                self._build_query()
+            )
+        return self._schema
+
+    def estimated_cost(self) -> float:
+        raise NotImplementedError("Cost estimation not yet implemented")
+
+    def __repr__(self) -> str:
+        suffix = "" if self.distinct else " ALL"
+        return f"PhysicalRemoteSetOp({self.kind.value}{suffix})"
+
+    def _build_query(self) -> str:
+        """Render the remote SQL string for this set operation."""
+        return self.build_remote_ast().sql(dialect="postgres")
+
+    def build_remote_ast(self) -> exp.Expression:
+        """Build the sqlglot AST sent to the data source.
+
+        Set operations are left-associative in sqlglot, so combining the
+        branch ASTs directly produces the same nesting as the original query
+        without needing parentheses.
+        """
+        set_op_ast = self._combine(
+            self._branch_ast(self.left), self._branch_ast(self.right)
+        )
+        if not self.order_by_keys and self.limit is None and not self.offset:
+            return set_op_ast
+        return self._wrap_order_limit(set_op_ast)
+
+    def _branch_ast(self, branch: PhysicalPlanNode) -> exp.Expression:
+        """Build the AST for one branch (a scan or a nested set operation)."""
+        if isinstance(branch, PhysicalRemoteSetOp):
+            return branch.build_remote_ast()
+        return self.datasource_connection.parse_query(branch._build_query())
+
+    def _combine(
+        self, left_ast: exp.Expression, right_ast: exp.Expression
+    ) -> exp.Expression:
+        """Wrap two branch ASTs in the matching set-operation node."""
+        node_cls = _SET_OP_EXP[self.kind]
+        return node_cls(this=left_ast, expression=right_ast, distinct=self.distinct)
+
+    def _wrap_order_limit(self, set_op_ast: exp.Expression) -> exp.Expression:
+        """Wrap the set operation in an outer SELECT carrying ORDER BY/LIMIT."""
+        inner_sql = set_op_ast.sql(dialect="postgres")
+        wrapped = f"SELECT * FROM ({inner_sql}) AS _setop"
+        wrapped = self._append_order_by(wrapped)
+        wrapped = self._append_limit_offset(wrapped)
+        return self.datasource_connection.parse_query(wrapped)
+
+    def _append_order_by(self, query: str) -> str:
+        """Append the ORDER BY clause built from the folded sort keys."""
+        if not self.order_by_keys:
+            return query
+        items = []
+        for index in range(len(self.order_by_keys)):
+            items.append(self._order_item(index))
+        return f"{query} ORDER BY {', '.join(items)}"
+
+    def _order_item(self, index: int) -> str:
+        """Render one ORDER BY item with direction and NULLS handling."""
+        item = self.order_by_keys[index].to_sql()
+        item = self._with_direction(item, index)
+        return self._with_nulls(item, index)
+
+    def _with_direction(self, item: str, index: int) -> str:
+        """Add DESC when the sort direction for this key is descending."""
+        if not self.order_by_ascending:
+            return item
+        if index < len(self.order_by_ascending) and not self.order_by_ascending[index]:
+            return f"{item} DESC"
+        return item
+
+    def _with_nulls(self, item: str, index: int) -> str:
+        """Append NULLS FIRST/LAST when specified for this key."""
+        if not self.order_by_nulls:
+            return item
+        if index >= len(self.order_by_nulls):
+            return item
+        spec = self.order_by_nulls[index]
+        if not spec:
+            return item
+        return f"{item} NULLS {spec}"
+
+    def _append_limit_offset(self, query: str) -> str:
+        """Append LIMIT and/or OFFSET clauses when present."""
+        if self.limit is not None:
+            query = f"{query} LIMIT {self.limit}"
+        if self.offset:
+            query = f"{query} OFFSET {self.offset}"
+        return query
+
+
+@dataclass
+class PhysicalSetOperation(PhysicalPlanNode):
+    """Locally evaluated INTERSECT / EXCEPT over two materialized inputs.
+
+    Used when the branches do not share one data source. Multiset semantics
+    follow SQL: the ``distinct`` form deduplicates the result, while the
+    ``ALL`` form keeps min/difference multiplicities per distinct row.
+    """
+
+    left: PhysicalPlanNode
+    right: PhysicalPlanNode
+    kind: SetOpKind
+    distinct: bool
+
+    def children(self) -> List[PhysicalPlanNode]:
+        return [self.left, self.right]
+
+    def execute(self) -> Iterator[pa.RecordBatch]:
+        """Yield the combined rows honoring INTERSECT/EXCEPT semantics."""
+        right_counts = self._row_counts(self.right)
+        emitted: Set[tuple] = set()
+        for batch in self.left.execute():
+            kept = self._select_rows(batch, right_counts, emitted)
+            if kept.num_rows > 0:
+                yield kept
+
+    def _select_rows(
+        self,
+        batch: pa.RecordBatch,
+        right_counts: Dict[tuple, int],
+        emitted: Set[tuple],
+    ) -> pa.RecordBatch:
+        """Build the keep-mask for one left batch under the set-op rules."""
+        keep_mask = []
+        for row_index in range(batch.num_rows):
+            row = _batch_row_tuple(batch, row_index)
+            keep_mask.append(self._keep_row(row, right_counts, emitted))
+        return batch.filter(pa.array(keep_mask))
+
+    def _keep_row(
+        self, row: tuple, right_counts: Dict[tuple, int], emitted: Set[tuple]
+    ) -> bool:
+        """Decide whether one left row belongs in the result."""
+        if self.distinct:
+            return self._keep_distinct(row, right_counts, emitted)
+        return self._keep_all(row, right_counts)
+
+    def _keep_distinct(
+        self, row: tuple, right_counts: Dict[tuple, int], emitted: Set[tuple]
+    ) -> bool:
+        """Distinct INTERSECT/EXCEPT: emit each qualifying row once."""
+        if row in emitted:
+            return False
+        present_on_right = right_counts.get(row, 0) > 0
+        qualifies = present_on_right
+        if self.kind == SetOpKind.EXCEPT:
+            qualifies = not present_on_right
+        if not qualifies:
+            return False
+        emitted.add(row)
+        return True
+
+    def _keep_all(self, row: tuple, right_counts: Dict[tuple, int]) -> bool:
+        """ALL form: consume right multiplicity per matched row."""
+        available = right_counts.get(row, 0)
+        if self.kind == SetOpKind.INTERSECT:
+            if available > 0:
+                right_counts[row] = available - 1
+                return True
+            return False
+        if available > 0:
+            right_counts[row] = available - 1
+            return False
+        return True
+
+    def _row_counts(self, node: PhysicalPlanNode) -> Dict[tuple, int]:
+        """Materialize one input as a multiset of row tuples."""
+        counts: Dict[tuple, int] = {}
+        for batch in node.execute():
+            for row_index in range(batch.num_rows):
+                row = _batch_row_tuple(batch, row_index)
+                counts[row] = counts.get(row, 0) + 1
+        return counts
+
+    def schema(self) -> pa.Schema:
+        return self.left.schema()
+
+    def estimated_cost(self) -> float:
+        raise NotImplementedError("Cost estimation not yet implemented")
+
+    def __repr__(self) -> str:
+        suffix = "" if self.distinct else " ALL"
+        return f"PhysicalSetOperation({self.kind.value}{suffix})"
+
+
 @dataclass
 class PhysicalSingleRowGuard(PhysicalPlanNode):
     """Enforces scalar-subquery cardinality at execution time.
@@ -2532,6 +2762,8 @@ class _DatasourceQueryCollector:
             self._record_scan(node, snapshots)
         elif isinstance(node, PhysicalRemoteJoin):
             self._record_remote_join(node, snapshots)
+        elif isinstance(node, PhysicalRemoteSetOp):
+            self._record_remote_set_op(node, snapshots)
 
     def _record_scan(
         self, scan: PhysicalScan, snapshots: List[_DatasourceQuerySnapshot]
@@ -2553,4 +2785,14 @@ class _DatasourceQueryCollector:
         sql = join._build_query()
         query_ast = datasource.parse_query(sql)
         snapshot = _DatasourceQuerySnapshot(join.left.datasource, sql, query_ast)
+        snapshots.append(snapshot)
+
+    def _record_remote_set_op(
+        self, set_op: "PhysicalRemoteSetOp", snapshots: List[_DatasourceQuerySnapshot]
+    ) -> None:
+        if set_op.datasource_connection is None:
+            return
+        query_ast = set_op.build_remote_ast()
+        sql = query_ast.sql(dialect="postgres")
+        snapshot = _DatasourceQuerySnapshot(set_op.datasource, sql, query_ast)
         snapshots.append(snapshot)

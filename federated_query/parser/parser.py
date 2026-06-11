@@ -19,6 +19,8 @@ from ..plan.logical import (
     ExplainFormat,
     Values,
     SubqueryScan,
+    SetOperation,
+    SetOpKind,
 )
 from ..catalog.catalog import Catalog
 from ..plan.expressions import (
@@ -100,7 +102,54 @@ class Parser:
             return self._convert_select(ast)
         if isinstance(ast, exp.Describe):
             return self._convert_explain(ast)
+        if isinstance(ast, (exp.Union, exp.Intersect, exp.Except)):
+            return self._convert_set_operation(ast)
         raise ValueError(f"Unsupported AST node type: {type(ast)}")
+
+    _SET_OP_KINDS = {
+        exp.Union: SetOpKind.UNION,
+        exp.Intersect: SetOpKind.INTERSECT,
+        exp.Except: SetOpKind.EXCEPT,
+    }
+
+    def _convert_set_operation(self, set_op: exp.SetOperation) -> LogicalPlanNode:
+        """Convert a sqlglot set operation (UNION/INTERSECT/EXCEPT) to a plan.
+
+        The two branches become a binary ``SetOperation``; any trailing
+        ORDER BY / LIMIT that sqlglot attaches to the set-operation node wraps
+        the whole result, so it is layered on top after the branches combine.
+        """
+        kind = self._SET_OP_KINDS[type(set_op)]
+        distinct = bool(set_op.args.get("distinct"))
+        left = self._convert_set_branch(set_op.this)
+        right = self._convert_set_branch(set_op.expression)
+        plan: LogicalPlanNode = SetOperation(
+            left=left, right=right, kind=kind, distinct=distinct
+        )
+        plan = self._build_order_by_clause(set_op, plan)
+        plan = self._build_limit_clause(set_op, plan)
+        return plan
+
+    def _convert_set_branch(self, branch: exp.Expression) -> LogicalPlanNode:
+        """Convert one branch of a set operation into a logical plan."""
+        branch = self._unwrap_set_branch(branch)
+        if isinstance(branch, exp.Select):
+            return self._convert_select(branch)
+        if isinstance(branch, (exp.Union, exp.Intersect, exp.Except)):
+            return self._convert_set_operation(branch)
+        raise ValueError(f"Unsupported set-operation branch: {type(branch)}")
+
+    def _unwrap_set_branch(self, branch: exp.Expression) -> exp.Expression:
+        """Strip anonymous parentheses/subquery wrappers around a branch.
+
+        ``(SELECT ... UNION SELECT ...)`` parenthesizes a nested set operation
+        for grouping; the wrapper carries no projection of its own and must be
+        peeled to reach the inner query. An aliased derived table is a real
+        relation and is left intact.
+        """
+        while isinstance(branch, exp.Subquery) and not branch.alias:
+            branch = branch.this
+        return branch
 
     def _convert_select(self, select: exp.Select) -> LogicalPlanNode:
         """Convert SELECT statement to logical plan.
@@ -693,12 +742,12 @@ class Parser:
         return str(expr)
 
     def _build_order_by_clause(
-        self, select: exp.Select, input_plan: LogicalPlanNode
+        self, select: exp.Query, input_plan: LogicalPlanNode
     ) -> LogicalPlanNode:
         """Build Sort node from ORDER BY clause.
 
         Args:
-            select: sqlglot Select node
+            select: sqlglot Select or set-operation node
             input_plan: Input logical plan
 
         Returns:
@@ -735,12 +784,12 @@ class Parser:
         )
 
     def _build_limit_clause(
-        self, select: exp.Select, input_plan: LogicalPlanNode
+        self, select: exp.Query, input_plan: LogicalPlanNode
     ) -> LogicalPlanNode:
         """Build limit node from LIMIT clause.
 
         Args:
-            select: sqlglot Select node
+            select: sqlglot Select or set-operation node
             input_plan: Input logical plan
 
         Returns:

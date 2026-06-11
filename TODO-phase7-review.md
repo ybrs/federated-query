@@ -10,8 +10,9 @@ inspection.
 
 ## STATUS (updated 2026-06-11, branch `parsing_explain`)
 
-675 passed / 95 failed (from 645/125 baseline); decorrelation suite green;
-remaining failures are dominated by **G1–G8** feature work. Verified
+689 passed / 85 failed (from 645/125 baseline); decorrelation suite green;
+**G4 set operations done** (10 e2e_pushdown tests green, no regressions);
+remaining failures are dominated by **G1–G3, G5–G8** feature work. Verified
 correctness/silent-fail items are checked off. PARTIAL = some sub-cases remain
 (noted inline); DEFERRED = moderate/decision/perf/architectural, none are
 silent corruption (they raise clean errors or are documented deviations).
@@ -281,9 +282,20 @@ execution. All were failing before Phase 7.
   rule + capability checks.
 - [ ] **G3. CTEs (10 tests)** — parser raises (fail-fast added in Phase 7;
   previously silently dropped). Needs parser+binder+planner support.
-- [ ] **G4. Set operations (10 tests)** — UNION/INTERSECT/EXCEPT unsupported in
-  parser; logical Union + PhysicalUnion now exist (Phase 7), so parser/binder
-  wiring is the remaining work.
+- [x] **G4. Set operations (10 tests)** — DONE. UNION/INTERSECT/EXCEPT now
+  parse to a binary `SetOperation` logical node (kind + distinct), bound with a
+  branch-arity check. The pushdown rules (predicate/aggregate/order-by) recurse
+  into branches so each collapses to a single scan; the planner emits one
+  `PhysicalRemoteSetOp` (remote SQL built by combining branch ASTs — sqlglot's
+  left-associative set ops reproduce the original nesting) when both branches
+  share a source, folding a trailing ORDER BY/LIMIT into an outer
+  `SELECT * FROM (...)`. Cross-source falls back to local `PhysicalUnion`
+  (UNION) or `PhysicalSetOperation` (INTERSECT/EXCEPT, multiset semantics
+  verified vs PostgreSQL). Two test-suite bugs fixed (`args.get("from")` →
+  `"from_"`; cross-source fixture used nonexistent datasource names).
+  NOTE: a UNION used as an IN-subquery *body* (test_subqueries
+  `test_subquery_with_union`) still raises a clean BindingError — that is G8
+  subquery work, not set-op pushdown.
 - [ ] **G5. CAST broken (8 tests)** — parser drops the target type via generic
   function conversion → emits invalid `CAST(quantity)`. Real bug, not just
   missing pushdown.

@@ -12,6 +12,7 @@ from ..plan.logical import (
     Sort,
     Limit,
     Union,
+    SetOperation,
     Explain,
 )
 from ..plan.expressions import Expression, InList, BetweenExpression
@@ -25,6 +26,19 @@ from .expression_rewriter import (
 
 if TYPE_CHECKING:
     from ..processor.query_executor import QueryExecutor
+
+
+def _rewrite_set_operation_branches(set_op: SetOperation, rewrite) -> SetOperation:
+    """Apply a recursive rewrite to both branches of a set operation.
+
+    Pushdown rules descend the tree by node type; a set operation is opaque to
+    them otherwise, so its branches (each a full subquery) would never be
+    optimized. Rebuilding with the rewritten branches keeps every rule reaching
+    inside UNION/INTERSECT/EXCEPT.
+    """
+    new_left = rewrite(set_op.left)
+    new_right = rewrite(set_op.right)
+    return SetOperation(new_left, new_right, set_op.kind, set_op.distinct)
 
 
 class OptimizationRule(ABC):
@@ -98,6 +112,15 @@ class PredicatePushdownRule(OptimizationRule):
             if new_input != plan.input:
                 return Limit(new_input, plan.limit, plan.offset)
             return plan
+
+        if isinstance(plan, Sort):
+            new_input = self._push_down(plan.input)
+            if new_input != plan.input:
+                return Sort(new_input, plan.sort_keys, plan.ascending, plan.nulls_order)
+            return plan
+
+        if isinstance(plan, SetOperation):
+            return _rewrite_set_operation_branches(plan, self._push_down)
 
         return plan
 
@@ -1365,6 +1388,9 @@ class OrderByPushdownRule(OptimizationRule):
         if isinstance(plan, Aggregate):
             return self._recurse_aggregate(plan)
 
+        if isinstance(plan, SetOperation):
+            return _rewrite_set_operation_branches(plan, self._push_order_by)
+
         return plan
 
     def _resolve_scan(self, node: LogicalPlanNode) -> Optional[Scan]:
@@ -1541,6 +1567,9 @@ class AggregatePushdownRule(OptimizationRule):
 
         if isinstance(plan, Join):
             return self._recurse_join(plan)
+
+        if isinstance(plan, SetOperation):
+            return _rewrite_set_operation_branches(plan, self._push_aggregate)
 
         return plan
 

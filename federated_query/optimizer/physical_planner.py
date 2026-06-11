@@ -16,6 +16,8 @@ from ..plan.logical import (
     JoinType,
     CTE,
     Union,
+    SetOperation,
+    SetOpKind,
     Values,
     SubqueryScan,
     SingleRowGuard,
@@ -34,6 +36,8 @@ from ..plan.physical import (
     PhysicalExplain,
     PhysicalSort,
     PhysicalUnion,
+    PhysicalRemoteSetOp,
+    PhysicalSetOperation,
     PhysicalValues,
     PhysicalSingleRowGuard,
     PhysicalGroupedLimit,
@@ -108,6 +112,8 @@ class PhysicalPlanner:
 
     def _plan_decorrelation_node(self, node: LogicalPlanNode) -> PhysicalPlanNode:
         """Plan nodes produced by subquery decorrelation."""
+        if isinstance(node, SetOperation):
+            return self._plan_set_operation(node)
         if isinstance(node, Union):
             inputs = []
             for child in node.inputs:
@@ -185,9 +191,13 @@ class PhysicalPlanner:
         if isinstance(child, PhysicalPlanNode):
             self._propagate_distinct(child)
 
-    def _plan_limit(self, limit: Limit) -> PhysicalLimit:
-        """Plan a limit node."""
+    def _plan_limit(self, limit: Limit) -> PhysicalPlanNode:
+        """Plan a limit node, folding it into a pushed-down set operation."""
         input_plan = self._plan_node(limit.input)
+        if isinstance(input_plan, PhysicalRemoteSetOp):
+            input_plan.limit = limit.limit
+            input_plan.offset = limit.offset
+            return input_plan
         return PhysicalLimit(input=input_plan, limit=limit.limit, offset=limit.offset)
 
     def _plan_sort(self, sort: Sort) -> PhysicalPlanNode:
@@ -201,6 +211,12 @@ class PhysicalPlanner:
             return input_plan
 
         if isinstance(input_plan, PhysicalRemoteJoin):
+            input_plan.order_by_keys = sort.sort_keys
+            input_plan.order_by_ascending = sort.ascending
+            input_plan.order_by_nulls = sort.nulls_order
+            return input_plan
+
+        if isinstance(input_plan, PhysicalRemoteSetOp):
             input_plan.order_by_keys = sort.sort_keys
             input_plan.order_by_ascending = sort.ascending
             input_plan.order_by_nulls = sort.nulls_order
@@ -459,6 +475,122 @@ class PhysicalPlanner:
                 )
 
         return None
+
+    def _plan_set_operation(self, set_op: SetOperation) -> PhysicalPlanNode:
+        """Plan a set operation, pushing it down when both branches share a source."""
+        left = self._plan_node(set_op.left)
+        right = self._plan_node(set_op.right)
+        remote = self._try_plan_remote_set_op(set_op, left, right)
+        if remote is not None:
+            return remote
+        return self._plan_local_set_op(set_op, left, right)
+
+    def _try_plan_remote_set_op(
+        self,
+        set_op: SetOperation,
+        left: PhysicalPlanNode,
+        right: PhysicalPlanNode,
+    ) -> Optional[PhysicalPlanNode]:
+        """Build a single remote set operation when both branches push together."""
+        left_branch = self._as_pushable_set_branch(left)
+        right_branch = self._as_pushable_set_branch(right)
+        if left_branch is None or right_branch is None:
+            return None
+        if left_branch.datasource != right_branch.datasource:
+            return None
+        connection = left_branch.datasource_connection
+        if connection is None or connection != right_branch.datasource_connection:
+            return None
+        return PhysicalRemoteSetOp(
+            left=left_branch,
+            right=right_branch,
+            kind=set_op.kind,
+            distinct=set_op.distinct,
+            datasource=left_branch.datasource,
+            datasource_connection=connection,
+        )
+
+    def _as_pushable_set_branch(
+        self, node: PhysicalPlanNode
+    ) -> Optional[PhysicalPlanNode]:
+        """Return a single-source branch (scan or nested remote set op) or None."""
+        if isinstance(node, (PhysicalScan, PhysicalRemoteSetOp)):
+            return node
+        if isinstance(node, PhysicalProjection):
+            return self._collapse_projection_scan(node)
+        return None
+
+    def _collapse_projection_scan(
+        self, projection: PhysicalProjection
+    ) -> Optional[PhysicalScan]:
+        """Fold a plain-column projection over a scan into one scan.
+
+        A set-operation branch plans to a projection over a scan that
+        over-selects filter columns. When the projection only renames nothing
+        and selects bare columns, those columns become the scan's output and
+        the projection disappears. Computed or aliased projections are left
+        for local execution (G2 covers their pushdown).
+        """
+        scan = projection.input
+        if not isinstance(scan, PhysicalScan):
+            return None
+        if scan.group_by or scan.aggregates:
+            return None
+        columns = self._bare_projection_columns(projection)
+        if columns is None:
+            return None
+        return self._scan_with_columns(scan, columns)
+
+    def _bare_projection_columns(
+        self, projection: PhysicalProjection
+    ) -> Optional[List[str]]:
+        """Return projected column names when every item is an unaliased column."""
+        names = projection.output_names or []
+        columns: List[str] = []
+        for index in range(len(projection.expressions)):
+            expression = projection.expressions[index]
+            if not isinstance(expression, ColumnRef):
+                return None
+            if index < len(names) and names[index] != expression.column:
+                return None
+            columns.append(expression.column)
+        return columns
+
+    def _scan_with_columns(
+        self, scan: PhysicalScan, columns: List[str]
+    ) -> PhysicalScan:
+        """Clone a scan, replacing its projected column list."""
+        return PhysicalScan(
+            datasource=scan.datasource,
+            schema_name=scan.schema_name,
+            table_name=scan.table_name,
+            columns=columns,
+            filters=scan.filters,
+            datasource_connection=scan.datasource_connection,
+            group_by=scan.group_by,
+            aggregates=scan.aggregates,
+            output_names=scan.output_names,
+            alias=scan.alias,
+            limit=scan.limit,
+            offset=scan.offset,
+            order_by_keys=scan.order_by_keys,
+            order_by_ascending=scan.order_by_ascending,
+            order_by_nulls=scan.order_by_nulls,
+            distinct=scan.distinct,
+        )
+
+    def _plan_local_set_op(
+        self,
+        set_op: SetOperation,
+        left: PhysicalPlanNode,
+        right: PhysicalPlanNode,
+    ) -> PhysicalPlanNode:
+        """Evaluate a set operation locally when it cannot be pushed down."""
+        if set_op.kind == SetOpKind.UNION:
+            return PhysicalUnion(inputs=[left, right], distinct=set_op.distinct)
+        return PhysicalSetOperation(
+            left=left, right=right, kind=set_op.kind, distinct=set_op.distinct
+        )
 
     def __repr__(self) -> str:
         return "PhysicalPlanner()"

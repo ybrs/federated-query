@@ -16,6 +16,7 @@ from ..plan.logical import (
     CTE,
     Values,
     SubqueryScan,
+    SetOperation,
 )
 from ..plan.expressions import (
     Expression,
@@ -130,7 +131,38 @@ class Binder:
             return self._bind_values(plan)
         if isinstance(plan, SubqueryScan):
             return self._bind_subquery_scan(plan)
+        if isinstance(plan, SetOperation):
+            return self._bind_set_operation(plan)
         raise BindingError(f"Unsupported plan node type: {type(plan)}")
+
+    def _bind_set_operation(self, set_op: SetOperation) -> SetOperation:
+        """Bind both branches of a set operation and check their arity.
+
+        SQL requires the branches of a UNION/INTERSECT/EXCEPT to have the same
+        number of output columns; a mismatch is a binding error, not a runtime
+        surprise.
+        """
+        bound_left = self.bind(set_op.left)
+        bound_right = self.bind(set_op.right)
+        self._check_set_branch_arity(bound_left, bound_right)
+        return SetOperation(
+            left=bound_left,
+            right=bound_right,
+            kind=set_op.kind,
+            distinct=set_op.distinct,
+        )
+
+    def _check_set_branch_arity(
+        self, left: LogicalPlanNode, right: LogicalPlanNode
+    ) -> None:
+        """Raise when set-operation branches expose differing column counts."""
+        left_width = len(left.schema())
+        right_width = len(right.schema())
+        if left_width != right_width:
+            raise BindingError(
+                "Set-operation branches have different column counts: "
+                f"{left_width} vs {right_width}"
+            )
 
     def _bind_values(self, values: Values) -> Values:
         """Bind a constant Values node (no input columns to resolve)."""
