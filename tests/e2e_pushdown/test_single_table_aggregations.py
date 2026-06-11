@@ -36,7 +36,9 @@ def test_multiple_aggregates_with_aliases(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
-    assert projection == ["SUM(quantity)", "AVG(price)"]
+    # The remote SQL preserves the user aliases so result columns keep their
+    # names; the projection therefore lists the aliases, not the raw calls.
+    assert projection == ["total_qty", "avg_price"]
     sum_matches = find_in_select(
         ast,
         lambda node: isinstance(node, exp.Sum)
@@ -66,7 +68,7 @@ def test_group_by_single_column(single_source_env):
     names = group_column_names(ast)
     assert names == ["region"]
     projection = select_column_names(ast)
-    assert projection == ["region", "COUNT(*)"]
+    assert projection == ["region", "cnt"]
 
 
 def test_group_by_multiple_columns(single_source_env):
@@ -98,7 +100,7 @@ def test_having_clause_translated_to_remote_filter(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
-    assert projection == ["region", "SUM(quantity)"]
+    assert projection == ["region", "total_qty"]
     where_clause = ast.args.get("where")
     assert where_clause is not None
     predicate = unwrap_parens(where_clause.this)
@@ -115,17 +117,17 @@ def test_min_max_with_limit(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
-    assert projection == ["MIN(price)", "MAX(price)"]
+    assert projection == ["min_price", "max_price"]
     min_matches = find_in_select(
         ast,
         lambda node: isinstance(node, exp.Min)
-        and isinstance(node, exp.Column)
+        and isinstance(node.this, exp.Column)
         and node.this.name.lower() == "price",
     )
     max_matches = find_in_select(
         ast,
         lambda node: isinstance(node, exp.Max)
-        and isinstance(node, exp.Column)
+        and isinstance(node.this, exp.Column)
         and node.this.name.lower() == "price",
     )
     assert len(min_matches) == 1
@@ -207,7 +209,8 @@ def test_aggregate_on_expression(single_source_env):
     assert projection == ["SUM(quantity * price)"]
     matches = find_in_select(
         ast,
-        lambda node: isinstance(node, exp.Sum) and isinstance(node.this, exp.Mul),
+        lambda node: isinstance(node, exp.Sum)
+        and isinstance(unwrap_parens(node.this), exp.Mul),
     )
     assert len(matches) == 1
 
@@ -244,7 +247,7 @@ def test_having_with_multiple_conditions(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
-    assert set(projection) == {"region", "SUM(quantity)", "AVG(price)"}
+    assert set(projection) == {"region", "total_qty", "avg_price"}
     where_clause = ast.args.get("where")
     assert where_clause is not None
     predicate = unwrap_parens(where_clause.this)
@@ -282,7 +285,7 @@ def test_min_max_on_strings(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
-    assert projection == ["MIN(status)", "MAX(status)"]
+    assert projection == ["min_status", "max_status"]
     min_matches = find_in_select(
         ast,
         lambda node: isinstance(node, exp.Min)

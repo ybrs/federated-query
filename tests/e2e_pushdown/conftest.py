@@ -61,23 +61,24 @@ def _seed_orders(cursor) -> None:
             quantity INTEGER,
             price DOUBLE,
             status VARCHAR,
-            region VARCHAR
+            region VARCHAR,
+            created_at TIMESTAMP
         )
         """
     )
     cursor.execute(
         """
         INSERT INTO orders VALUES
-        (1, 101, 1, 3, 25.0, 'processing', 'NA'),
-        (2, 102, 2, 5, 50.0, 'shipped', 'EU'),
-        (3, 103, 3, 2, 75.0, 'processing', 'APAC'),
-        (4, 104, 4, 1, 125.0, 'returned', 'NA'),
-        (5, 101, 5, 4, 60.0, 'processing', 'EU'),
-        (6, 102, 1, 7, 35.0, 'processing', 'NA'),
-        (7, 103, 2, 3, 90.0, 'cancelled', 'APAC'),
-        (8, 104, 3, 6, 15.0, 'shipped', 'EU'),
-        (9, 105, 4, 9, 10.0, 'processing', 'NA'),
-        (10, 106, 5, 8, 200.0, 'processing', 'EU')
+        (1, 101, 1, 3, 25.0, 'processing', 'NA', TIMESTAMP '2024-01-05 09:00:00'),
+        (2, 102, 2, 5, 50.0, 'shipped', 'EU', TIMESTAMP '2024-02-10 12:30:00'),
+        (3, 103, 3, 2, 75.0, 'processing', 'APAC', TIMESTAMP '2024-02-20 08:15:00'),
+        (4, 104, 4, 1, 125.0, 'returned', 'NA', TIMESTAMP '2024-03-01 17:45:00'),
+        (5, 101, 5, 4, 60.0, 'processing', 'EU', TIMESTAMP '2024-03-15 11:00:00'),
+        (6, 102, 1, 7, 35.0, 'processing', 'NA', TIMESTAMP '2024-04-02 14:20:00'),
+        (7, 103, 2, 3, 90.0, 'cancelled', 'APAC', TIMESTAMP '2024-04-18 10:05:00'),
+        (8, 104, 3, 6, 15.0, 'shipped', 'EU', TIMESTAMP '2024-05-09 16:40:00'),
+        (9, 105, 4, 9, 10.0, 'processing', 'NA', TIMESTAMP '2024-05-22 07:55:00'),
+        (10, 106, 5, 8, 200.0, 'processing', 'EU', TIMESTAMP '2024-06-01 13:10:00')
         """
     )
 
@@ -91,21 +92,22 @@ def _seed_products(cursor) -> None:
             name VARCHAR,
             price DOUBLE,
             base_price DOUBLE,
-            active BOOLEAN
+            active BOOLEAN,
+            status VARCHAR
         )
         """
     )
     cursor.execute(
         """
         INSERT INTO products VALUES
-        (101, 'clothing', 'jacket', 20.0, 20.0, TRUE),
-        (102, 'clothing', 'shirt', 30.0, 30.0, TRUE),
-        (103, 'electronics', 'tablet', 150.0, 150.0, TRUE),
-        (104, 'electronics', 'phone', 300.0, 300.0, TRUE),
-        (105, 'home', 'lamp', 40.0, 40.0, FALSE),
-        (106, 'home', 'desk', 220.0, 220.0, TRUE),
-        (107, 'home', 'chair', 90.0, 90.0, TRUE),
-        (108, 'food', 'coffee', 12.0, 12.0, TRUE)
+        (101, 'clothing', 'jacket', 20.0, 20.0, TRUE, 'active'),
+        (102, 'clothing', 'shirt', 30.0, 30.0, TRUE, 'active'),
+        (103, 'electronics', 'tablet', 150.0, 150.0, TRUE, 'premium'),
+        (104, 'electronics', 'phone', 300.0, 300.0, TRUE, 'premium'),
+        (105, 'home', 'lamp', 40.0, 40.0, FALSE, 'discontinued'),
+        (106, 'home', 'desk', 220.0, 220.0, TRUE, 'active'),
+        (107, 'home', 'chair', 90.0, 90.0, TRUE, 'active'),
+        (108, 'food', 'coffee', 12.0, 12.0, TRUE, 'discontinued')
         """
     )
 

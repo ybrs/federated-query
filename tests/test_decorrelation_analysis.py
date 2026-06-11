@@ -42,7 +42,9 @@ def test_correlation_analyzer_detects_correlated_subquery():
     assert result.is_correlated is True
     assert len(result.outer_references) == 1
     assert result.outer_references[0].table == "u"
-    assert "orders" in result.inner_tables
+    # An explicit alias hides the base table name in SQL scope, so the
+    # analyzer tracks the relation by its alias only.
+    assert "orders" not in result.inner_tables
     assert "o" in result.inner_tables
 
 
@@ -69,7 +71,8 @@ def test_correlation_analyzer_uncorrelated_subquery():
     assert isinstance(result, CorrelationResult)
     assert result.is_correlated is False
     assert len(result.outer_references) == 0
-    assert "cities" in result.inner_tables
+    # The alias hides the base table name in SQL scope.
+    assert "cities" not in result.inner_tables
     assert "c" in result.inner_tables
 
 

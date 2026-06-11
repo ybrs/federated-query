@@ -220,8 +220,13 @@ def test_correlated_limit_becomes_grouped_limit(catalog):
     assert len(grouped[0].keys) == 1
 
 
-def test_or_with_subquery_expands_to_distinct_union(catalog):
-    """OR over a subquery branch expands into a deduplicating union."""
+def test_or_with_subquery_expands_to_flag_filter(catalog):
+    """OR over a subquery branch expands into a per-disjunct flag filter.
+
+    A distinct union would merge full-duplicate source rows, so the
+    subquery disjunct is turned into a boolean flag (a SEMI/ANTI split that
+    preserves row multiplicity) and OR'd with the plain predicate.
+    """
     plan = decorrelate(
         catalog,
         "SELECT id FROM pg.users u WHERE u.country = 'FR' "
@@ -229,8 +234,9 @@ def test_or_with_subquery_expands_to_distinct_union(catalog):
     )
     unions = find_all(plan, Union)
     assert len(unions) == 1
-    assert unions[0].distinct is True
+    assert unions[0].distinct is False
     the_join(plan, JoinType.SEMI)
+    the_join(plan, JoinType.ANTI)
 
 
 def test_exists_in_select_list_builds_flag_union(catalog):

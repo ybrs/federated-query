@@ -124,7 +124,9 @@ class DataSource(ABC):
         pass
 
     @abstractmethod
-    def get_table_statistics(self, schema: str, table: str) -> Optional[TableStatistics]:
+    def get_table_statistics(
+        self, schema: str, table: str
+    ) -> Optional[TableStatistics]:
         """Get statistics for a table.
 
         Args:
@@ -162,7 +164,9 @@ class DataSource(ABC):
 
     def parse_query(self, query: str):
         """Parse query text into a sqlglot AST."""
-        return sqlglot.parse_one(query, dialect="postgres")
+        from ..parser.dialect import FedQPostgres
+
+        return sqlglot.parse_one(query, dialect=FedQPostgres)
 
     def supports_capability(self, capability: DataSourceCapability) -> bool:
         """Check if data source supports a capability.

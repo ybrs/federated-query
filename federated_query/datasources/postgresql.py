@@ -43,27 +43,30 @@ class PostgreSQLDataSource(DataSource):
         self._max_connections = config.get("max_connections", 5)
 
     def connect(self) -> None:
-        """Establish connection pool to PostgreSQL."""
-        try:
-            logger.info(f"Connecting to PostgreSQL database '{self.config['database']}' at {self.config['host']}")
-            self._pool = pool.ThreadedConnectionPool(
-                self._min_connections,
-                self._max_connections,
-                host=self.config["host"],
-                port=self.config.get("port", 5432),
-                database=self.config["database"],
-                user=self.config["user"],
-                password=self.config["password"],
-            )
-            # Get a test connection to verify it works
-            conn = self._pool.getconn()
-            self._pool.putconn(conn)
-            self.connection = conn  # Store for compatibility
-            self._connected = True
-            logger.info(f"Successfully connected to PostgreSQL: {self.name}")
-        except psycopg2.Error as e:
-            logger.error(f"Failed to connect to PostgreSQL {self.name}: {e}")
-            raise ConnectionError(f"PostgreSQL connection failed: {e}") from e
+        """Establish connection pool to PostgreSQL.
+
+        psycopg2 errors are allowed to propagate unchanged; wrapping them in
+        a ConnectionError would hide the real cause (CLAUDE.md rule #1).
+        """
+        logger.info(
+            f"Connecting to PostgreSQL database '{self.config['database']}' "
+            f"at {self.config['host']}"
+        )
+        self._pool = pool.ThreadedConnectionPool(
+            self._min_connections,
+            self._max_connections,
+            host=self.config["host"],
+            port=self.config.get("port", 5432),
+            database=self.config["database"],
+            user=self.config["user"],
+            password=self.config["password"],
+        )
+        # Get a test connection to verify it works.
+        conn = self._pool.getconn()
+        self._pool.putconn(conn)
+        self.connection = conn  # Store for compatibility
+        self._connected = True
+        logger.info(f"Successfully connected to PostgreSQL: {self.name}")
 
     def disconnect(self) -> None:
         """Close all connections in the pool."""
@@ -228,9 +231,6 @@ class PostgreSQLDataSource(DataSource):
                     total_size_bytes=row_count * 100,  # Rough estimate
                     column_stats=column_stats,
                 )
-        except psycopg2.Error as e:
-            logger.warning(f"Could not get statistics for {schema}.{table}: {e}")
-            return None
         finally:
             self._return_connection(conn)
 
@@ -285,18 +285,18 @@ class PostgreSQLDataSource(DataSource):
     # PostgreSQL type OIDs -> Arrow types. NUMERIC maps to float64: the
     # engine computes over floats, so sources surface decimals as doubles.
     _OID_TO_ARROW = {
-        16: pa.bool_(),       # bool
-        20: pa.int64(),       # int8
-        21: pa.int64(),       # int2
-        23: pa.int64(),       # int4
-        700: pa.float64(),    # float4
-        701: pa.float64(),    # float8
-        1700: pa.float64(),   # numeric
-        25: pa.string(),      # text
-        1042: pa.string(),    # bpchar
-        1043: pa.string(),    # varchar
-        1082: pa.date32(),    # date
-        1114: pa.timestamp("us"),   # timestamp
+        16: pa.bool_(),  # bool
+        20: pa.int64(),  # int8
+        21: pa.int64(),  # int2
+        23: pa.int64(),  # int4
+        700: pa.float64(),  # float4
+        701: pa.float64(),  # float8
+        1700: pa.float64(),  # numeric
+        25: pa.string(),  # text
+        1042: pa.string(),  # bpchar
+        1043: pa.string(),  # varchar
+        1082: pa.date32(),  # date
+        1114: pa.timestamp("us"),  # timestamp
         1184: pa.timestamp("us", tz="UTC"),  # timestamptz
     }
 

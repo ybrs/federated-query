@@ -90,9 +90,7 @@ class FedQRuntime:
         self.planner = PhysicalPlanner(catalog)
         self.decorrelator = Decorrelator()
         physical_executor = Executor(executor_config)
-        processors = [
-            StarExpansionProcessor(catalog, dialect=self.parser.dialect)
-        ]
+        processors = [StarExpansionProcessor(catalog, dialect=self.parser.dialect)]
         self.query_executor = QueryExecutor(
             catalog=catalog,
             parser=self.parser,
@@ -116,6 +114,13 @@ class FedQRuntime:
     def execute(self, sql: str) -> Union[pa.Table, Dict[str, Any]]:
         """Run a SQL statement and return results."""
         return self.query_executor.execute(sql)
+
+    def explain(self, sql: str) -> Dict[str, Any]:
+        """Return the JSON EXPLAIN document (plan + remote queries) for a query."""
+        document = self.execute(f"EXPLAIN (FORMAT JSON) {sql}")
+        if not isinstance(document, dict):
+            raise RuntimeError("EXPLAIN did not produce a JSON document")
+        return document
 
 
 class ResultPrinter:

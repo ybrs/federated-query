@@ -65,7 +65,9 @@ def test_remote_join_keeps_side_filters_before_join():
     assert query.count(" WHERE ") == 2
     parts_after_on = query.split(" ON ", 1)[1]
     assert " WHERE " not in parts_after_on
+    # The table is aliased inside the derived table so a qualified side
+    # filter would resolve; the alias is applied unconditionally.
     assert (
-        '(SELECT * FROM "public"."right_table" WHERE (active = True)) AS r'
+        '(SELECT * FROM "public"."right_table" AS r WHERE (active = True)) AS r'
         in query
     )

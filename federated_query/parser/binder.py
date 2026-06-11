@@ -27,6 +27,7 @@ from ..plan.expressions import (
     FunctionCall,
     InList,
     BetweenExpression,
+    Cast,
     CaseExpr,
     SubqueryExpression,
     ExistsExpression,
@@ -43,6 +44,34 @@ class BindingError(Exception):
     """Exception raised during binding."""
 
     pass
+
+
+# Maps the leading keyword of a SQL CAST target type to the engine DataType.
+_CAST_TYPE_KEYWORDS = {
+    "INT": DataType.INTEGER,
+    "INTEGER": DataType.INTEGER,
+    "INT4": DataType.INTEGER,
+    "SMALLINT": DataType.INTEGER,
+    "INT2": DataType.INTEGER,
+    "BIGINT": DataType.BIGINT,
+    "INT8": DataType.BIGINT,
+    "FLOAT": DataType.FLOAT,
+    "FLOAT4": DataType.FLOAT,
+    "REAL": DataType.FLOAT,
+    "DOUBLE": DataType.DOUBLE,
+    "FLOAT8": DataType.DOUBLE,
+    "DECIMAL": DataType.DECIMAL,
+    "NUMERIC": DataType.DECIMAL,
+    "VARCHAR": DataType.VARCHAR,
+    "CHAR": DataType.VARCHAR,
+    "CHARACTER": DataType.VARCHAR,
+    "TEXT": DataType.TEXT,
+    "BOOLEAN": DataType.BOOLEAN,
+    "BOOL": DataType.BOOLEAN,
+    "DATE": DataType.DATE,
+    "TIMESTAMP": DataType.TIMESTAMP,
+    "DATETIME": DataType.TIMESTAMP,
+}
 
 
 class Binder:
@@ -223,7 +252,9 @@ class Binder:
     def _bind_sort_with_input(self, sort: Sort, bound_input: LogicalPlanNode) -> Sort:
         """Bind sort keys against the already-bound input plan."""
         if isinstance(bound_input, Projection):
-            bound_keys = self._bind_sort_keys_for_projection(sort.sort_keys, bound_input)
+            bound_keys = self._bind_sort_keys_for_projection(
+                sort.sort_keys, bound_input
+            )
             return Sort(
                 input=bound_input,
                 sort_keys=bound_keys,
@@ -359,6 +390,7 @@ class Binder:
             if key.column in alias_map:
                 source_expr = alias_map[key.column]
                 from ..plan.expressions import ColumnRef as BoundColumnRef
+
                 if isinstance(source_expr, BoundColumnRef):
                     return ColumnRef(
                         table=source_expr.table,
@@ -395,7 +427,9 @@ class Binder:
             return self._contains_join(plan.input)
         return False
 
-    def _extract_tables_from_tree(self, plan: LogicalPlanNode) -> Dict[Optional[str], Table]:
+    def _extract_tables_from_tree(
+        self, plan: LogicalPlanNode
+    ) -> Dict[Optional[str], Table]:
         """Extract all tables from plan tree."""
         if isinstance(plan, Join):
             return self._get_tables_from_join(plan.left, plan.right)
@@ -424,6 +458,10 @@ class Binder:
             return self._bind_between_multi(expr, tables)
         if isinstance(expr, CaseExpr):
             return self._bind_case_expr_multi(expr, tables)
+        if isinstance(expr, Cast):
+            return self._bind_cast(
+                expr, lambda value: self._bind_expression_multi_table(value, tables)
+            )
         if isinstance(expr, FunctionCall):
             return self._bind_function_args(
                 expr, lambda value: self._bind_expression_multi_table(value, tables)
@@ -631,7 +669,9 @@ class Binder:
         """Pop the innermost relation scope."""
         self._scope_stack.pop()
 
-    def _add_plan_to_scope(self, plan: LogicalPlanNode, scope: Dict[str, Table]) -> None:
+    def _add_plan_to_scope(
+        self, plan: LogicalPlanNode, scope: Dict[str, Table]
+    ) -> None:
         """Collect alias -> Table entries from a bound plan subtree."""
         if isinstance(plan, Scan):
             self._add_scan_to_scope(plan, scope)
@@ -834,10 +874,10 @@ class Binder:
                             column=col_ref.column,
                             data_type=column.data_type,
                         )
-                return col_ref
+                return self._unresolved_or_raise(col_ref)
             column = table.get_column(col_ref.column)
             if column is None:
-                return col_ref
+                return self._unresolved_or_raise(col_ref)
             return ColumnRef(
                 table=col_ref.table,
                 column=col_ref.column,
@@ -857,13 +897,43 @@ class Binder:
                 found_column = column
 
         if found_column is None:
-            return col_ref
+            return self._unresolved_or_raise(col_ref)
 
         return ColumnRef(
             table=found_table,
             column=col_ref.column,
             data_type=found_column.data_type,
         )
+
+    def _unresolved_or_raise(self, col_ref: ColumnRef) -> ColumnRef:
+        """Keep a column unbound only if an enclosing scope defines it.
+
+        A reference that resolves in no in-scope or enclosing relation is a
+        typo and must raise at bind time, not slip through to a KeyError or a
+        remote UndefinedColumn at execution.
+        """
+        if self._resolves_in_scope_stack(col_ref):
+            return col_ref
+        raise BindingError(
+            f"Column '{col_ref.to_sql()}' not found in any table in scope"
+        )
+
+    def _resolves_in_scope_stack(self, col_ref: ColumnRef) -> bool:
+        """Whether a reference resolves against any enclosing query scope."""
+        for scope in self._scope_stack:
+            if self._scope_defines(scope, col_ref):
+                return True
+        return False
+
+    def _scope_defines(self, scope: Dict[str, Table], col_ref: ColumnRef) -> bool:
+        """Whether a relation scope defines the referenced column."""
+        if col_ref.table is not None:
+            table = scope.get(col_ref.table)
+            return table is not None and table.get_column(col_ref.column) is not None
+        for table in scope.values():
+            if table.get_column(col_ref.column) is not None:
+                return True
+        return False
 
     def _get_table_from_plan(self, plan: LogicalPlanNode) -> Optional[Table]:
         """Extract table metadata from a plan node."""
@@ -887,9 +957,7 @@ class Binder:
             bound.append(bound_expr)
         return bound
 
-    def _bind_expression(
-        self, expr: Expression, table: Optional[Table]
-    ) -> Expression:
+    def _bind_expression(self, expr: Expression, table: Optional[Table]) -> Expression:
         """Bind an expression."""
         if isinstance(expr, ColumnRef):
             return self._bind_column_ref(expr, table)
@@ -905,6 +973,10 @@ class Binder:
             return self._bind_between(expr, table)
         if isinstance(expr, CaseExpr):
             return self._bind_case_expr(expr, table)
+        if isinstance(expr, Cast):
+            return self._bind_cast(
+                expr, lambda value: self._bind_expression(value, table)
+            )
         if isinstance(expr, FunctionCall):
             return self._bind_function_args(
                 expr, lambda value: self._bind_expression(value, table)
@@ -919,6 +991,28 @@ class Binder:
             )
 
         return expr
+
+    def _bind_cast(
+        self,
+        expr: Cast,
+        bind_value: Callable[[Expression], Expression],
+    ) -> Cast:
+        """Bind a CAST's inner expression and resolve its engine type."""
+        bound_inner = bind_value(expr.expr)
+        data_type = self._resolve_cast_type(expr.target_type)
+        return Cast(
+            expr=bound_inner,
+            target_type=expr.target_type,
+            data_type=data_type,
+        )
+
+    def _resolve_cast_type(self, target_type: str) -> DataType:
+        """Map a SQL type text such as ``DECIMAL(10, 2)`` to a DataType."""
+        keyword = target_type.split("(")[0].strip().upper()
+        leading = keyword.split()[0] if keyword else ""
+        if leading not in _CAST_TYPE_KEYWORDS:
+            raise BindingError(f"Unsupported CAST target type: {target_type}")
+        return _CAST_TYPE_KEYWORDS[leading]
 
     def _bind_function_args(
         self,
@@ -957,9 +1051,7 @@ class Binder:
             bound_items.append(bind_value(item))
         return TupleExpression(items=tuple(bound_items))
 
-    def _bind_column_ref(
-        self, col_ref: ColumnRef, table: Optional[Table]
-    ) -> ColumnRef:
+    def _bind_column_ref(self, col_ref: ColumnRef, table: Optional[Table]) -> ColumnRef:
         """Bind a column reference."""
         if col_ref.column == "*":
             return col_ref
@@ -990,11 +1082,7 @@ class Binder:
         operand = self._bind_expression(unary_op.operand, table)
         return UnaryOp(op=unary_op.op, operand=operand)
 
-    def _bind_in_list(
-        self,
-        expr: InList,
-        table: Optional[Table]
-    ) -> InList:
+    def _bind_in_list(self, expr: InList, table: Optional[Table]) -> InList:
         bound_value = self._bind_expression(expr.value, table)
         bound_options: List[Expression] = []
         for option in expr.options:
@@ -1003,9 +1091,7 @@ class Binder:
         return InList(value=bound_value, options=bound_options)
 
     def _bind_in_list_multi(
-        self,
-        expr: InList,
-        tables: Dict[Optional[str], Table]
+        self, expr: InList, tables: Dict[Optional[str], Table]
     ) -> InList:
         bound_value = self._bind_expression_multi_table(expr.value, tables)
         bound_options: List[Expression] = []
@@ -1015,9 +1101,7 @@ class Binder:
         return InList(value=bound_value, options=bound_options)
 
     def _bind_between(
-        self,
-        expr: BetweenExpression,
-        table: Optional[Table]
+        self, expr: BetweenExpression, table: Optional[Table]
     ) -> BetweenExpression:
         bound_value = self._bind_expression(expr.value, table)
         bound_lower = self._bind_expression(expr.lower, table)
@@ -1029,9 +1113,7 @@ class Binder:
         )
 
     def _bind_between_multi(
-        self,
-        expr: BetweenExpression,
-        tables: Dict[Optional[str], Table]
+        self, expr: BetweenExpression, tables: Dict[Optional[str], Table]
     ) -> BetweenExpression:
         bound_value = self._bind_expression_multi_table(expr.value, tables)
         bound_lower = self._bind_expression_multi_table(expr.lower, tables)
@@ -1042,11 +1124,7 @@ class Binder:
             upper=bound_upper,
         )
 
-    def _bind_case_expr(
-        self,
-        expr: CaseExpr,
-        table: Optional[Table]
-    ) -> CaseExpr:
+    def _bind_case_expr(self, expr: CaseExpr, table: Optional[Table]) -> CaseExpr:
         bound_when = []
         for condition, result in expr.when_clauses:
             bound_condition = self._bind_expression(condition, table)
@@ -1058,9 +1136,7 @@ class Binder:
         return CaseExpr(when_clauses=bound_when, else_result=bound_else)
 
     def _bind_case_expr_multi(
-        self,
-        expr: CaseExpr,
-        tables: Dict[Optional[str], Table]
+        self, expr: CaseExpr, tables: Dict[Optional[str], Table]
     ) -> CaseExpr:
         bound_when = []
         for condition, result in expr.when_clauses:
@@ -1120,9 +1196,7 @@ class SubqueryPlanBinder:
             return Limit(input=bound_input, limit=plan.limit, offset=plan.offset)
         if isinstance(plan, Join):
             return self._bind_join(plan)
-        raise BindingError(
-            f"Unsupported plan node in subquery: {type(plan).__name__}"
-        )
+        raise BindingError(f"Unsupported plan node in subquery: {type(plan).__name__}")
 
     def _bind_scan(self, scan: Scan) -> Scan:
         """Bind a subquery scan via the host's lenient column filtering."""
@@ -1324,9 +1398,7 @@ class SubqueryPlanBinder:
                 lambda value: self._bind_expr(value, scopes),
                 scopes=list(scopes),
             )
-        raise BindingError(
-            f"Unsupported expression in subquery: {type(expr).__name__}"
-        )
+        raise BindingError(f"Unsupported expression in subquery: {type(expr).__name__}")
 
     def _bind_case(self, expr: CaseExpr, scopes: List[Dict[str, Table]]) -> CaseExpr:
         """Bind all branches of a CASE expression."""
@@ -1378,9 +1450,7 @@ class SubqueryPlanBinder:
             match = self._match_in_scope(col_ref.column, scope)
             if match is not None:
                 return match
-        raise BindingError(
-            f"Column '{col_ref.column}' not found in any visible scope"
-        )
+        raise BindingError(f"Column '{col_ref.column}' not found in any visible scope")
 
     def _match_in_scope(
         self, column_name: str, scope: Dict[str, Table]

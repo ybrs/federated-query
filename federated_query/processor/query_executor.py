@@ -103,16 +103,12 @@ class QueryExecutor:
         """Construct a physical plan."""
         return self.planner.plan(plan, query_executor=self)
 
-    def _run_physical_plan(
-        self, plan: PhysicalPlanNode
-    ) -> Union[pa.Table, dict]:
+    def _run_physical_plan(self, plan: PhysicalPlanNode) -> Union[pa.Table, dict]:
         """Execute the physical plan or build EXPLAIN output."""
         if isinstance(plan, PhysicalExplain):
             if plan.format == ExplainFormat.JSON:
                 return plan.build_document(stringify_queries=False)
-        return self.physical_executor.execute_to_table(
-            plan, query_executor=self
-        )
+        return self.physical_executor.execute_to_table(plan, query_executor=self)
 
     def _run_after_processors(
         self, result: Union[pa.Table, dict]

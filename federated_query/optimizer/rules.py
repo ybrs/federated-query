@@ -89,10 +89,7 @@ class PredicatePushdownRule(OptimizationRule):
             new_input = self._push_down(plan.input)
             if new_input != plan.input:
                 return Aggregate(
-                    new_input,
-                    plan.group_by,
-                    plan.aggregates,
-                    plan.output_names
+                    new_input, plan.group_by, plan.aggregates, plan.output_names
                 )
             return plan
 
@@ -111,22 +108,18 @@ class PredicatePushdownRule(OptimizationRule):
 
         from ..plan.expressions import BinaryOp, BinaryOpType
 
-        if isinstance(predicate, BinaryOp) and predicate.op == BinaryOpType.AND:
-            left_result = self._push_filter(
-                Filter(input_plan, predicate.left)
-            )
-            return self._push_filter(
-                Filter(left_result, predicate.right)
-            )
+        is_conjunction = (
+            isinstance(predicate, BinaryOp) and predicate.op == BinaryOpType.AND
+        )
+        if is_conjunction and self._can_absorb_split(input_plan):
+            left_result = self._push_filter(Filter(input_plan, predicate.left))
+            return self._push_filter(Filter(left_result, predicate.right))
 
         if isinstance(input_plan, Filter):
             return self._merge_filters(filter_node, input_plan)
 
         if isinstance(input_plan, Projection):
-            return self._push_filter_through_projection(
-                filter_node,
-                input_plan
-            )
+            return self._push_filter_through_projection(filter_node, input_plan)
 
         if isinstance(input_plan, Join):
             return self._push_filter_below_join(filter_node, input_plan)
@@ -140,28 +133,28 @@ class PredicatePushdownRule(OptimizationRule):
 
         return filter_node
 
-    def _merge_filters(
-        self,
-        outer: Filter,
-        inner: Filter
-    ) -> LogicalPlanNode:
+    def _can_absorb_split(self, input_plan: LogicalPlanNode) -> bool:
+        """Whether splitting a conjunction helps for this input.
+
+        Splitting distributes conjuncts into a join's sides or pushes them
+        into a scan/projection. Over any other input (e.g. an Aggregate
+        carrying HAVING) the parts cannot descend, and splitting then merging
+        them back would recurse forever.
+        """
+        return isinstance(input_plan, (Join, Scan, Projection))
+
+    def _merge_filters(self, outer: Filter, inner: Filter) -> LogicalPlanNode:
         """Merge two adjacent filters."""
         from ..plan.expressions import BinaryOp, BinaryOpType
 
         merged_predicate = BinaryOp(
-            op=BinaryOpType.AND,
-            left=outer.predicate,
-            right=inner.predicate
+            op=BinaryOpType.AND, left=outer.predicate, right=inner.predicate
         )
 
         new_filter = Filter(inner.input, merged_predicate)
         return self._push_down(new_filter)
 
-    def _can_evaluate_predicate(
-        self,
-        pred_cols: set,
-        available_cols: set
-    ) -> bool:
+    def _can_evaluate_predicate(self, pred_cols: set, available_cols: set) -> bool:
         """Check if predicate columns can be evaluated with available columns.
 
         Handles both qualified (table.column) and unqualified (column) references.
@@ -187,9 +180,7 @@ class PredicatePushdownRule(OptimizationRule):
         return True
 
     def _push_filter_through_projection(
-        self,
-        filter_node: Filter,
-        projection: Projection
+        self, filter_node: Filter, projection: Projection
     ) -> LogicalPlanNode:
         """Push filter through projection if possible.
 
@@ -223,19 +214,13 @@ class PredicatePushdownRule(OptimizationRule):
         )
         return Filter(new_project, filter_node.predicate)
 
-    def _push_filter_to_scan(
-        self,
-        filter_node: Filter,
-        scan: Scan
-    ) -> LogicalPlanNode:
+    def _push_filter_to_scan(self, filter_node: Filter, scan: Scan) -> LogicalPlanNode:
         """Push filter into scan node."""
         from ..plan.expressions import BinaryOp, BinaryOpType
 
         if scan.filters:
             merged = BinaryOp(
-                op=BinaryOpType.AND,
-                left=scan.filters,
-                right=filter_node.predicate
+                op=BinaryOpType.AND, left=scan.filters, right=filter_node.predicate
             )
             return Scan(
                 datasource=scan.datasource,
@@ -274,10 +259,7 @@ class PredicatePushdownRule(OptimizationRule):
         )
 
     def _predicate_matches_side(
-        self,
-        pred_cols: set,
-        side_cols: set,
-        other_cols: set
+        self, pred_cols: set, side_cols: set, other_cols: set
     ) -> bool:
         """Check if predicate columns match exactly one side of join.
 
@@ -325,9 +307,7 @@ class PredicatePushdownRule(OptimizationRule):
         return True
 
     def _push_filter_below_join(
-        self,
-        filter_node: Filter,
-        join: Join
+        self, filter_node: Filter, join: Join
     ) -> LogicalPlanNode:
         """Push filter below join when safe.
 
@@ -356,7 +336,7 @@ class PredicatePushdownRule(OptimizationRule):
                 self._push_down(join.left),
                 self._push_down(join.right),
                 join.join_type,
-                join.condition
+                join.condition,
             )
             return Filter(new_join, predicate)
 
@@ -365,10 +345,7 @@ class PredicatePushdownRule(OptimizationRule):
             new_left = Filter(join.left, predicate)
             new_left = self._push_down(new_left)
             new_join = Join(
-                new_left,
-                self._push_down(join.right),
-                join.join_type,
-                join.condition
+                new_left, self._push_down(join.right), join.join_type, join.condition
             )
             return new_join
 
@@ -376,10 +353,7 @@ class PredicatePushdownRule(OptimizationRule):
             new_right = Filter(join.right, predicate)
             new_right = self._push_down(new_right)
             new_join = Join(
-                self._push_down(join.left),
-                new_right,
-                join.join_type,
-                join.condition
+                self._push_down(join.left), new_right, join.join_type, join.condition
             )
             return new_join
 
@@ -387,7 +361,7 @@ class PredicatePushdownRule(OptimizationRule):
             self._push_down(join.left),
             self._push_down(join.right),
             join.join_type,
-            join.condition
+            join.condition,
         )
         return Filter(new_join, predicate)
 
@@ -441,28 +415,58 @@ class PredicatePushdownRule(OptimizationRule):
         columns with the same name, we must respect table qualifiers to avoid
         pushing filters to the wrong side.
         """
-        from ..plan.expressions import ColumnRef, BinaryOp, UnaryOp, FunctionCall
+        from ..plan.expressions import ColumnRef
 
         if isinstance(expr, ColumnRef):
             if expr.table:
                 return {f"{expr.table}.{expr.column}"}
             return {expr.column}
 
+        columns = set()
+        for child in self._predicate_children(expr):
+            columns.update(self._extract_column_refs(child))
+        return columns
+
+    def _predicate_children(self, expr: Expression) -> list:
+        """Direct sub-expressions of a predicate node (for column extraction).
+
+        CASE/IN/BETWEEN/CAST must be traversed too; returning no children for
+        them made predicates that reference real columns look column-free and
+        get pushed down vacuously.
+        """
+        from ..plan.expressions import BinaryOp, UnaryOp, FunctionCall, Cast
+
         if isinstance(expr, BinaryOp):
-            left = self._extract_column_refs(expr.left)
-            right = self._extract_column_refs(expr.right)
-            return left.union(right)
-
+            return [expr.left, expr.right]
         if isinstance(expr, UnaryOp):
-            return self._extract_column_refs(expr.operand)
-
+            return [expr.operand]
         if isinstance(expr, FunctionCall):
-            columns = set()
-            for arg in expr.args:
-                columns.update(self._extract_column_refs(arg))
-            return columns
+            return list(expr.args)
+        if isinstance(expr, Cast):
+            return [expr.expr]
+        return self._container_predicate_children(expr)
 
-        return set()
+    def _container_predicate_children(self, expr: Expression) -> list:
+        """Sub-expressions of container predicate nodes (IN / BETWEEN / CASE)."""
+        from ..plan.expressions import InList, BetweenExpression, CaseExpr
+
+        if isinstance(expr, InList):
+            return [expr.value] + list(expr.options)
+        if isinstance(expr, BetweenExpression):
+            return [expr.value, expr.lower, expr.upper]
+        if isinstance(expr, CaseExpr):
+            return self._case_predicate_children(expr)
+        return []
+
+    def _case_predicate_children(self, expr) -> list:
+        """Condition/result sub-expressions of a CASE node."""
+        children = []
+        for condition, result in expr.when_clauses:
+            children.append(condition)
+            children.append(result)
+        if expr.else_result is not None:
+            children.append(expr.else_result)
+        return children
 
     def name(self) -> str:
         return "PredicatePushdown"
@@ -508,10 +512,7 @@ class ProjectionPushdownRule(OptimizationRule):
 
         return False
 
-    def _collect_required_columns(
-        self,
-        plan: LogicalPlanNode
-    ) -> set:
+    def _collect_required_columns(self, plan: LogicalPlanNode) -> set:
         """Collect all required column names from plan."""
         columns = set()
 
@@ -599,11 +600,7 @@ class ProjectionPushdownRule(OptimizationRule):
 
         return columns
 
-    def _prune_columns(
-        self,
-        plan: LogicalPlanNode,
-        required: set
-    ) -> LogicalPlanNode:
+    def _prune_columns(self, plan: LogicalPlanNode, required: set) -> LogicalPlanNode:
         """Prune unused columns from plan."""
         if isinstance(plan, Scan):
             return self._prune_scan_columns(plan, required)
@@ -633,22 +630,14 @@ class ProjectionPushdownRule(OptimizationRule):
             new_left = self._prune_columns(plan.left, left_req)
             new_right = self._prune_columns(plan.right, right_req)
             if new_left != plan.left or new_right != plan.right:
-                return Join(
-                    new_left,
-                    new_right,
-                    plan.join_type,
-                    plan.condition
-                )
+                return Join(new_left, new_right, plan.join_type, plan.condition)
             return plan
 
         if isinstance(plan, Aggregate):
             new_input = self._prune_columns(plan.input, required)
             if new_input != plan.input:
                 return Aggregate(
-                    new_input,
-                    plan.group_by,
-                    plan.aggregates,
-                    plan.output_names
+                    new_input, plan.group_by, plan.aggregates, plan.output_names
                 )
             return plan
 
@@ -660,11 +649,7 @@ class ProjectionPushdownRule(OptimizationRule):
 
         return plan
 
-    def _prune_scan_columns(
-        self,
-        scan: Scan,
-        required: set
-    ) -> Scan:
+    def _prune_scan_columns(self, scan: Scan, required: set) -> Scan:
         """Prune columns from scan node."""
         available = set(scan.columns)
         needed = available.intersection(required)
@@ -699,9 +684,7 @@ class ProjectionPushdownRule(OptimizationRule):
         return scan
 
     def _get_required_for_subtree(
-        self,
-        plan: LogicalPlanNode,
-        parent_required: set
+        self, plan: LogicalPlanNode, parent_required: set
     ) -> set:
         """Get required columns for a subtree."""
         local_required = set()
@@ -788,7 +771,7 @@ class LimitPushdownRule(OptimizationRule):
                 input=new_input,
                 group_by=aggregate.group_by,
                 aggregates=aggregate.aggregates,
-                output_names=aggregate.output_names
+                output_names=aggregate.output_names,
             )
         return aggregate
 
@@ -831,19 +814,29 @@ class LimitPushdownRule(OptimizationRule):
             return self._push_limit_with_sort(limit, input_node)
 
         if isinstance(input_node, Scan):
-            scan_with_limit = self._apply_limit_metadata(input_node, limit.limit, limit.offset)
+            scan_with_limit = self._apply_limit_metadata(
+                input_node, limit.limit, limit.offset
+            )
             return Limit(scan_with_limit, limit.limit, 0)
 
         return Limit(input_node, limit.limit, limit.offset)
 
-    def _push_through_projection(self, limit: Limit, projection: Projection) -> LogicalPlanNode:
-        """Move limit below projection."""
+    def _push_through_projection(
+        self, limit: Limit, projection: Projection
+    ) -> LogicalPlanNode:
+        """Move limit below projection.
+
+        The OFFSET is consumed by the scan only when the child is a scan; if
+        it is not, the outer Limit must retain the offset rather than zero a
+        value that was never pushed down (which would corrupt pagination).
+        """
         pushed_child = self._apply_limit_metadata(
             projection.input,
             limit.limit,
             limit.offset,
         )
-        limited = Limit(pushed_child, limit.limit, 0)
+        retained_offset = 0 if isinstance(projection.input, Scan) else limit.offset
+        limited = Limit(pushed_child, limit.limit, retained_offset)
         return Projection(
             limited,
             projection.expressions,
@@ -883,10 +876,7 @@ class LimitPushdownRule(OptimizationRule):
         return Limit(new_sort, limit.limit, limit.offset)
 
     def _apply_limit_metadata(
-        self,
-        node: LogicalPlanNode,
-        limit_value: int,
-        offset_value: int
+        self, node: LogicalPlanNode, limit_value: int, offset_value: int
     ) -> LogicalPlanNode:
         """Attach limit/offset metadata to scan while keeping plan shape."""
         if isinstance(node, Scan):
@@ -894,10 +884,7 @@ class LimitPushdownRule(OptimizationRule):
         return node
 
     def _apply_limit_to_scan(
-        self,
-        scan: Scan,
-        limit_value: int,
-        offset_value: int
+        self, scan: Scan, limit_value: int, offset_value: int
     ) -> Scan:
         """Return new scan with updated limit metadata."""
         if scan.limit == limit_value and scan.offset == offset_value:
@@ -906,7 +893,10 @@ class LimitPushdownRule(OptimizationRule):
         effective_limit = limit_value
         effective_offset = offset_value
 
-        if scan.limit is not None and scan.limit < effective_limit:
+        scan_limit_tighter = scan.limit is not None and (
+            limit_value is None or scan.limit < limit_value
+        )
+        if scan_limit_tighter:
             effective_limit = scan.limit
             effective_offset = scan.offset + offset_value
         elif scan.offset:
@@ -1042,7 +1032,9 @@ class OrderByPushdownRule(OptimizationRule):
 
         if isinstance(node, Aggregate):
             new_input = self._attach_order_metadata(node.input, sort)
-            return Aggregate(new_input, node.group_by, node.aggregates, node.output_names)
+            return Aggregate(
+                new_input, node.group_by, node.aggregates, node.output_names
+            )
 
         if isinstance(node, Sort):
             new_input = self._attach_order_metadata(node.input, sort)
@@ -1070,7 +1062,9 @@ class OrderByPushdownRule(OptimizationRule):
             distinct=scan.distinct,
         )
 
-    def _push_through_projection(self, sort: Sort, projection: Projection) -> LogicalPlanNode:
+    def _push_through_projection(
+        self, sort: Sort, projection: Projection
+    ) -> LogicalPlanNode:
         """Push ORDER BY through projection if all sort columns available."""
         rewritten_keys = self._rewrite_sort_keys_for_projection(
             sort.sort_keys,
@@ -1127,8 +1121,12 @@ class OrderByPushdownRule(OptimizationRule):
         left_only = self._columns_match_side(sort_cols, left_cols, right_cols)
         right_only = self._columns_match_side(sort_cols, right_cols, left_cols)
 
-        new_left = self._push_sort_into_child(sort, join.left) if left_only else join.left
-        new_right = self._push_sort_into_child(sort, join.right) if right_only else join.right
+        new_left = (
+            self._push_sort_into_child(sort, join.left) if left_only else join.left
+        )
+        new_right = (
+            self._push_sort_into_child(sort, join.right) if right_only else join.right
+        )
 
         rebuilt = Join(new_left, new_right, join.join_type, join.condition)
         return Sort(
@@ -1167,8 +1165,12 @@ class OrderByPushdownRule(OptimizationRule):
                 continue
 
             bare = col.split(".")[-1]
-            side_has = any(entry.endswith(f".{bare}") or entry == bare for entry in side_cols)
-            other_has = any(entry.endswith(f".{bare}") or entry == bare for entry in other_cols)
+            side_has = any(
+                entry.endswith(f".{bare}") or entry == bare for entry in side_cols
+            )
+            other_has = any(
+                entry.endswith(f".{bare}") or entry == bare for entry in other_cols
+            )
 
             if side_has and not other_has:
                 continue
@@ -1177,7 +1179,9 @@ class OrderByPushdownRule(OptimizationRule):
 
         return True
 
-    def _push_through_aggregate(self, sort: Sort, aggregate: Aggregate) -> LogicalPlanNode:
+    def _push_through_aggregate(
+        self, sort: Sort, aggregate: Aggregate
+    ) -> LogicalPlanNode:
         """Push ORDER BY through aggregate when keys align with aggregate output."""
         sort_cols = self._extract_sort_columns(sort)
         output_cols = set(aggregate.output_names)
@@ -1451,12 +1455,7 @@ class OrderByPushdownRule(OptimizationRule):
         if new_input == agg.input:
             return agg
 
-        return Aggregate(
-            new_input,
-            agg.group_by,
-            agg.aggregates,
-            agg.output_names
-        )
+        return Aggregate(new_input, agg.group_by, agg.aggregates, agg.output_names)
 
     def name(self) -> str:
         return "OrderByPushdown"
@@ -1498,10 +1497,7 @@ class AggregatePushdownRule(OptimizationRule):
         return agg
 
     def _push_to_scan(
-        self,
-        agg: Aggregate,
-        scan: Scan,
-        filter_expr: Optional[Expression]
+        self, agg: Aggregate, scan: Scan, filter_expr: Optional[Expression]
     ) -> Scan:
         """Push aggregate into scan node."""
         merged_filters = self._merge_filters(scan.filters, filter_expr)
@@ -1525,9 +1521,7 @@ class AggregatePushdownRule(OptimizationRule):
         )
 
     def _merge_filters(
-        self,
-        scan_filter: Optional[Expression],
-        filter_filter: Optional[Expression]
+        self, scan_filter: Optional[Expression], filter_filter: Optional[Expression]
     ) -> Optional[Expression]:
         """Merge filters from scan and filter node."""
         if scan_filter is None:
@@ -1537,11 +1531,8 @@ class AggregatePushdownRule(OptimizationRule):
             return scan_filter
 
         from ..plan.expressions import BinaryOp, BinaryOpType
-        return BinaryOp(
-            op=BinaryOpType.AND,
-            left=scan_filter,
-            right=filter_filter
-        )
+
+        return BinaryOp(op=BinaryOpType.AND, left=scan_filter, right=filter_filter)
 
     def _recurse_node(self, plan: LogicalPlanNode) -> LogicalPlanNode:
         """Recurse into node children."""
@@ -1673,10 +1664,14 @@ class ExpressionSimplificationRule(OptimizationRule):
             if plan.condition:
                 rewritten_condition = self.rewriter.rewrite(plan.condition)
 
-            if (rewritten_left != plan.left or
-                rewritten_right != plan.right or
-                rewritten_condition != plan.condition):
-                return Join(rewritten_left, rewritten_right, plan.join_type, rewritten_condition)
+            if (
+                rewritten_left != plan.left
+                or rewritten_right != plan.right
+                or rewritten_condition != plan.condition
+            ):
+                return Join(
+                    rewritten_left, rewritten_right, plan.join_type, rewritten_condition
+                )
             return plan
 
         if isinstance(plan, Aggregate):
@@ -1699,10 +1694,13 @@ class ExpressionSimplificationRule(OptimizationRule):
                 if rewritten != expr:
                     aggs_changed = True
 
-            if (rewritten_input != plan.input or
-                group_by_changed or
-                aggs_changed):
-                return Aggregate(rewritten_input, rewritten_group_by, rewritten_aggs, plan.output_names)
+            if rewritten_input != plan.input or group_by_changed or aggs_changed:
+                return Aggregate(
+                    rewritten_input,
+                    rewritten_group_by,
+                    rewritten_aggs,
+                    plan.output_names,
+                )
             return plan
 
         if isinstance(plan, Sort):

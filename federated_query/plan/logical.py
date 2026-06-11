@@ -84,12 +84,16 @@ class Scan(LogicalPlanNode):
     alias: Optional[str] = None  # Table alias (e.g., "u" in "FROM users u")
     group_by: Optional[List[Expression]] = None  # Optional GROUP BY expressions
     aggregates: Optional[List[Expression]] = None  # Optional aggregate expressions
-    output_names: Optional[List[str]] = None  # Output column names when using aggregates
+    output_names: Optional[List[str]] = (
+        None  # Output column names when using aggregates
+    )
     limit: Optional[int] = None
     offset: int = 0
     order_by_keys: Optional[List[Expression]] = None  # ORDER BY expressions
     order_by_ascending: Optional[List[bool]] = None  # ASC/DESC for each key
-    order_by_nulls: Optional[List[Optional[str]]] = None  # NULLS FIRST/LAST for each key
+    order_by_nulls: Optional[List[Optional[str]]] = (
+        None  # NULLS FIRST/LAST for each key
+    )
     distinct: bool = False
 
     def children(self) -> List[LogicalPlanNode]:
@@ -151,7 +155,18 @@ class Projection(LogicalPlanNode):
         return visitor.visit_projection(self)
 
     def schema(self) -> List[str]:
-        return self.aliases
+        # A ``*`` alias stands in for the input's columns; expand it so the
+        # projection reports concrete names (joins above need them to orient
+        # keys and to resolve qualified references).
+        if "*" not in self.aliases:
+            return self.aliases
+        names: List[str] = []
+        for alias in self.aliases:
+            if alias == "*":
+                names.extend(self.input.schema())
+            else:
+                names.append(alias)
+        return names
 
     def __repr__(self) -> str:
         prefix = "Distinct " if self.distinct else ""
@@ -202,7 +217,10 @@ class Join(LogicalPlanNode):
         return visitor.visit_join(self)
 
     def schema(self) -> List[str]:
-        # Combine schemas from both sides
+        # SEMI/ANTI joins are existential filters: they emit only the left
+        # input's columns, never the right side's.
+        if self.join_type in (JoinType.SEMI, JoinType.ANTI):
+            return self.left.schema()
         return self.left.schema() + self.right.schema()
 
     def __repr__(self) -> str:
@@ -263,10 +281,14 @@ class Sort(LogicalPlanNode):
 
 @dataclass(frozen=True)
 class Limit(LogicalPlanNode):
-    """Limit number of rows."""
+    """Limit number of rows.
+
+    ``limit`` is None for an OFFSET without a row cap (``OFFSET n`` alone),
+    which still skips rows and must not be discarded.
+    """
 
     input: LogicalPlanNode
-    limit: int
+    limit: Optional[int]
     offset: int = 0
 
     def children(self) -> List[LogicalPlanNode]:

@@ -88,7 +88,10 @@ class Literal(Expression):
         if self.value is None:
             return "NULL"
         if self.data_type in (DataType.VARCHAR, DataType.TEXT):
-            return f"'{self.value}'"
+            # Escape embedded single quotes (O'Brien -> 'O''Brien') so the
+            # remote SQL stays valid and is not an injection vector.
+            escaped = str(self.value).replace("'", "''")
+            return f"'{escaped}'"
         return str(self.value)
 
     def __repr__(self) -> str:
@@ -113,6 +116,10 @@ class BinaryOpType(Enum):
     GT = ">"
     GTE = ">="
 
+    # Null-safe comparison (NULL is treated as a comparable value)
+    NULL_SAFE_EQ = "IS NOT DISTINCT FROM"
+    NULL_SAFE_NEQ = "IS DISTINCT FROM"
+
     # Logical
     AND = "AND"
     OR = "OR"
@@ -120,6 +127,9 @@ class BinaryOpType(Enum):
     # String
     CONCAT = "||"
     LIKE = "LIKE"
+    ILIKE = "ILIKE"
+    REGEX_MATCH = "~"  # POSIX regex match
+    REGEX_IMATCH = "~*"  # case-insensitive POSIX regex match
 
 
 @dataclass(frozen=True)
@@ -132,10 +142,27 @@ class BinaryOp(Expression):
 
     def get_type(self) -> DataType:
         # Logical and comparison operators return boolean
-        if self.op in (BinaryOpType.AND, BinaryOpType.OR, BinaryOpType.EQ,
-                       BinaryOpType.NEQ, BinaryOpType.LT, BinaryOpType.LTE,
-                       BinaryOpType.GT, BinaryOpType.GTE, BinaryOpType.LIKE):
+        if self.op in (
+            BinaryOpType.AND,
+            BinaryOpType.OR,
+            BinaryOpType.EQ,
+            BinaryOpType.NEQ,
+            BinaryOpType.LT,
+            BinaryOpType.LTE,
+            BinaryOpType.GT,
+            BinaryOpType.GTE,
+            BinaryOpType.LIKE,
+            BinaryOpType.ILIKE,
+            BinaryOpType.NULL_SAFE_EQ,
+            BinaryOpType.NULL_SAFE_NEQ,
+            BinaryOpType.REGEX_MATCH,
+            BinaryOpType.REGEX_IMATCH,
+        ):
             return DataType.BOOLEAN
+
+        # String concatenation always produces text
+        if self.op == BinaryOpType.CONCAT:
+            return DataType.VARCHAR
 
         # Arithmetic operators inherit type from operands
         # (simplified - real implementation needs type coercion)
@@ -298,6 +325,35 @@ class BetweenExpression(Expression):
         return "BetweenExpression()"
 
 
+@dataclass(frozen=True)
+class Cast(Expression):
+    """``CAST(expr AS target_type)`` type conversion.
+
+    ``target_type`` keeps the original SQL type text (e.g. ``VARCHAR`` or
+    ``DECIMAL(10, 2)``) so the cast re-renders verbatim when pushed to a
+    remote source. ``data_type`` holds the resolved engine type, set during
+    binding for local evaluation.
+    """
+
+    expr: Expression
+    target_type: str
+    data_type: Optional[DataType] = None
+
+    def get_type(self) -> DataType:
+        if self.data_type is None:
+            raise NotImplementedError("Cast type must be set during binding")
+        return self.data_type
+
+    def accept(self, visitor):
+        return visitor.visit_cast(self)
+
+    def to_sql(self) -> str:
+        return f"CAST({self.expr.to_sql()} AS {self.target_type})"
+
+    def __repr__(self) -> str:
+        return f"Cast({self.expr} AS {self.target_type})"
+
+
 class ExpressionVisitor(ABC):
     """Visitor interface for expressions."""
 
@@ -331,6 +387,10 @@ class ExpressionVisitor(ABC):
 
     @abstractmethod
     def visit_between(self, expr: BetweenExpression):
+        pass
+
+    @abstractmethod
+    def visit_cast(self, expr: "Cast"):
         pass
 
     @abstractmethod
@@ -473,6 +533,5 @@ class QuantifiedComparison(Expression):
 
     def __repr__(self) -> str:
         return (
-            f"QuantifiedComparison({self.operator.value}, "
-            f"{self.quantifier.value})"
+            f"QuantifiedComparison({self.operator.value}, " f"{self.quantifier.value})"
         )

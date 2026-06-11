@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 import sqlglot
 from sqlglot import exp
 
+from .dialect import FedQPostgres
 from ..plan.logical import (
     LogicalPlanNode,
     Scan,
@@ -32,6 +33,7 @@ from ..plan.expressions import (
     FunctionCall,
     InList,
     BetweenExpression,
+    Cast,
     CaseExpr,
     SubqueryExpression,
     ExistsExpression,
@@ -50,7 +52,7 @@ class Parser:
 
     def __init__(self):
         """Initialize parser."""
-        self.dialect = "postgres"  # Default dialect
+        self.dialect = FedQPostgres  # Custom Postgres dialect with native EXPLAIN
 
     def parse(self, sql: str) -> LogicalPlanNode:
         """Parse SQL string to an unbound logical plan.
@@ -69,13 +71,19 @@ class Parser:
         return self._parse_one(sql)
 
     def _parse_one(self, sql: str) -> exp.Expression:
-        """Parse a single statement, unwrapping multi-statement blocks.
+        """Parse exactly one statement, rejecting multi-statement input.
 
-        sqlglot wraps semicolon-separated input in a ``Block``; mirror the
-        documented ``parse_one`` contract by returning the first statement.
+        sqlglot wraps semicolon-separated input in a ``Block``; silently
+        running only the first statement would drop the rest, so a block with
+        more than one statement is an error.
         """
         parsed = sqlglot.parse_one(sql, dialect=self.dialect)
         if isinstance(parsed, exp.Block):
+            if len(parsed.expressions) != 1:
+                raise ValueError(
+                    "Multi-statement input is not supported; "
+                    "submit one statement at a time"
+                )
             return parsed.expressions[0]
         return parsed
 
@@ -90,7 +98,7 @@ class Parser:
         """
         if isinstance(ast, exp.Select):
             return self._convert_select(ast)
-        if isinstance(ast, exp.Command) and self._is_explain_command(ast):
+        if isinstance(ast, exp.Describe):
             return self._convert_explain(ast)
         raise ValueError(f"Unsupported AST node type: {type(ast)}")
 
@@ -135,83 +143,25 @@ class Parser:
             names.append(self._get_alias(select_expr))
         return Values(rows=[row], output_names=names)
 
-    def _convert_explain(self, command: exp.Command) -> LogicalPlanNode:
-        """Convert EXPLAIN statement to logical plan."""
-        query_ast, explain_format = self._extract_explain_parts(command)
-        child_plan = self.ast_to_logical_plan(query_ast)
+    def _convert_explain(self, describe: exp.Describe) -> LogicalPlanNode:
+        """Convert a native ``exp.Describe`` (EXPLAIN) node to a logical plan.
+
+        The wrapped statement is already a parsed AST, so no SQL text is
+        re-scanned; the output format comes from the dialect's ``as_json``
+        flag set while consuming the EXPLAIN option list.
+        """
+        inner_statement = describe.this
+        if inner_statement is None:
+            raise ValueError("EXPLAIN requires a statement to describe")
+        child_plan = self.ast_to_logical_plan(inner_statement)
+        explain_format = self._explain_format(describe)
         return Explain(input=child_plan, format=explain_format)
 
-    def _extract_explain_parts(
-        self, command: exp.Command
-    ) -> Tuple[exp.Expression, ExplainFormat]:
-        """Extract wrapped statement and format."""
-        expression = command.args.get("expression")
-        if expression is None:
-            raise ValueError("EXPLAIN requires a statement to describe")
-        if isinstance(expression, exp.Literal) and expression.is_string:
-            sql_text = expression.this.strip()
-            explain_format, sql_body = self._parse_explain_options(sql_text)
-            parsed = self._parse_one(sql_body)
-            return parsed, explain_format
-        if isinstance(expression, exp.Expression):
-            return expression, ExplainFormat.TEXT
-        raise ValueError(f"Unsupported EXPLAIN expression: {type(expression)}")
-
-    def _parse_explain_options(
-        self, sql_text: str
-    ) -> Tuple[ExplainFormat, str]:
-        """Parse optional EXPLAIN options prefix."""
-        if not sql_text.startswith("("):
-            return ExplainFormat.TEXT, sql_text
-        options, remainder = self._split_option_clause(sql_text)
-        explain_format = self._resolve_explain_format(options)
-        cleaned_sql = remainder.strip()
-        return explain_format, cleaned_sql
-
-    def _split_option_clause(self, sql_text: str) -> Tuple[str, str]:
-        """Split '(...) rest' into option text and remainder."""
-        depth = 0
-        start_index = -1
-        end_index = -1
-        for position, char in enumerate(sql_text):
-            if char == "(":
-                if depth == 0:
-                    start_index = position
-                depth += 1
-            elif char == ")":
-                depth -= 1
-                if depth == 0:
-                    end_index = position
-                    break
-        if end_index == -1 or start_index == -1:
-            raise ValueError("EXPLAIN options missing closing parenthesis")
-        options = sql_text[start_index + 1 : end_index]
-        remainder = sql_text[end_index + 1 :]
-        return options, remainder
-
-    def _resolve_explain_format(self, options: str) -> ExplainFormat:
-        """Determine requested EXPLAIN format."""
-        normalized = options.replace("=", " ")
-        normalized = normalized.replace(",", " ")
-        tokens = normalized.split()
-        index = 0
-        while index < len(tokens):
-            token = tokens[index].upper()
-            if token in ("FORMAT", "AS") and index + 1 < len(tokens):
-                value = tokens[index + 1].upper()
-                if value == "JSON":
-                    return ExplainFormat.JSON
-                if value == "TEXT":
-                    return ExplainFormat.TEXT
-            index += 1
+    def _explain_format(self, describe: exp.Describe) -> ExplainFormat:
+        """Map the dialect's JSON flag to an ExplainFormat."""
+        if describe.args.get("as_json"):
+            return ExplainFormat.JSON
         return ExplainFormat.TEXT
-
-    def _is_explain_command(self, command: exp.Command) -> bool:
-        """Check if a sqlglot Command represents EXPLAIN."""
-        keyword = command.args.get("this")
-        if keyword is None:
-            return False
-        return str(keyword).upper() == "EXPLAIN"
 
     def _build_from_clause(self, select: exp.Select) -> LogicalPlanNode:
         """Build scan node from FROM clause.
@@ -283,9 +233,7 @@ class Parser:
         if isinstance(table_expr, exp.Lateral):
             raise ValueError("LATERAL subqueries are not supported yet")
         if not isinstance(table_expr, exp.Table):
-            raise ValueError(
-                f"Unsupported FROM item: {type(table_expr).__name__}"
-            )
+            raise ValueError(f"Unsupported FROM item: {type(table_expr).__name__}")
 
     def _build_join_plan(
         self, select: exp.Select, left_table: exp.Table, joins: List[exp.Join]
@@ -783,7 +731,7 @@ class Parser:
             input=input_plan,
             sort_keys=sort_keys,
             ascending=ascending,
-            nulls_order=nulls_order
+            nulls_order=nulls_order,
         )
 
     def _build_limit_clause(
@@ -799,12 +747,12 @@ class Parser:
             Logical plan with limit (or original if no LIMIT)
         """
         limit_expr = select.args.get("limit")
-        if not limit_expr:
+        offset_expr = select.args.get("offset")
+        if not limit_expr and offset_expr is None:
             return input_plan
 
-        limit_value = int(limit_expr.expression.this)
+        limit_value = int(limit_expr.expression.this) if limit_expr else None
         offset_value = 0
-        offset_expr = select.args.get("offset")
         if offset_expr is not None:
             offset_value = int(offset_expr.expression.this)
         return Limit(input=input_plan, limit=limit_value, offset=offset_value)
@@ -838,8 +786,12 @@ class Parser:
             return self._convert_exists_expression(expr, False)
         if isinstance(expr, exp.Subquery):
             return self._convert_subquery_expression(expr)
+        if isinstance(expr, exp.ILike):
+            return self._convert_ilike_predicate(expr)
         if isinstance(expr, exp.Like):
             return self._convert_like_predicate(expr)
+        if isinstance(expr, exp.Cast):
+            return self._convert_cast(expr)
         if isinstance(expr, exp.Binary):
             return self._convert_binary(expr)
         if isinstance(expr, exp.Unary):
@@ -914,8 +866,15 @@ class Parser:
         return ColumnRef(table=table, column=col.name)
 
     def _convert_literal(self, lit: exp.Literal) -> Literal:
-        """Convert sqlglot Literal to our Literal."""
+        """Convert sqlglot Literal to our Literal.
+
+        A quoted literal is always a string, even when it looks numeric
+        (``'2'`` is the text ``2``, not the integer ``2``); honoring
+        ``is_string`` keeps it from being coerced and mistyped in remote SQL.
+        """
         value_str = lit.this
+        if lit.is_string:
+            return Literal(value=value_str, data_type=DataType.VARCHAR)
         data_type = self._infer_literal_type(value_str)
         converted_value = self._convert_literal_value(value_str, data_type)
         return Literal(value=converted_value, data_type=data_type)
@@ -964,6 +923,25 @@ class Parser:
             return UnaryOp(op=UnaryOpType.NOT, operand=comparison)
         return comparison
 
+    def _convert_ilike_predicate(self, ilike: exp.ILike) -> Expression:
+        """Convert ILIKE / NOT ILIKE into a case-insensitive comparison.
+
+        sqlglot models ``NOT ILIKE`` as an ``ILike`` node carrying a
+        ``negate`` flag, so the negation is honored here.
+        """
+        left = self._convert_expression(ilike.this)
+        right = self._convert_expression(ilike.expression)
+        comparison = BinaryOp(op=BinaryOpType.ILIKE, left=left, right=right)
+        if ilike.args.get("negate"):
+            return UnaryOp(op=UnaryOpType.NOT, operand=comparison)
+        return comparison
+
+    def _convert_cast(self, cast: exp.Cast) -> Cast:
+        """Convert CAST(expr AS type), preserving the target type text."""
+        inner = self._convert_expression(cast.this)
+        target_type = cast.args["to"].sql(dialect=self.dialect)
+        return Cast(expr=inner, target_type=target_type)
+
     def _convert_quantified_like(self, like: exp.Like) -> Optional[Expression]:
         """Convert ``LIKE ANY/ALL (subquery)`` to a quantified comparison."""
         quantifiers = [
@@ -996,7 +974,7 @@ class Parser:
         return BinaryOp(op=op, left=left, right=right)
 
     def _map_binary_op(self, binary: exp.Binary) -> BinaryOpType:
-        """Map sqlglot binary op to our BinaryOpType."""
+        """Map sqlglot binary op to our BinaryOpType, failing on unknowns."""
         type_name = type(binary).__name__
         mapping = {
             "Add": BinaryOpType.ADD,
@@ -1013,8 +991,16 @@ class Parser:
             "And": BinaryOpType.AND,
             "Or": BinaryOpType.OR,
             "Like": BinaryOpType.LIKE,
+            "ILike": BinaryOpType.ILIKE,
+            "DPipe": BinaryOpType.CONCAT,
+            "NullSafeEQ": BinaryOpType.NULL_SAFE_EQ,
+            "NullSafeNEQ": BinaryOpType.NULL_SAFE_NEQ,
+            "RegexpLike": BinaryOpType.REGEX_MATCH,
+            "RegexpILike": BinaryOpType.REGEX_IMATCH,
         }
-        return mapping.get(type_name, BinaryOpType.EQ)
+        if type_name not in mapping:
+            raise ValueError(f"Unsupported binary operator: {type_name}")
+        return mapping[type_name]
 
     def _convert_unary(self, unary: exp.Unary) -> UnaryOp:
         """Convert sqlglot unary operation."""
@@ -1040,13 +1026,15 @@ class Parser:
         return UnaryOp(op=op, operand=operand)
 
     def _map_unary_op(self, unary: exp.Unary) -> UnaryOpType:
-        """Map sqlglot unary op to our UnaryOpType."""
+        """Map sqlglot unary op to our UnaryOpType, failing on unknowns."""
         type_name = type(unary).__name__
         mapping = {
             "Not": UnaryOpType.NOT,
             "Neg": UnaryOpType.NEGATE,
         }
-        return mapping.get(type_name, UnaryOpType.NOT)
+        if type_name not in mapping:
+            raise ValueError(f"Unsupported unary operator: {type_name}")
+        return mapping[type_name]
 
     def _convert_exists_expression(
         self,

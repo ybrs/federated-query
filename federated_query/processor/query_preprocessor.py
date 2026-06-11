@@ -11,6 +11,7 @@ from sqlglot import exp
 
 from ..catalog import Catalog
 from ..catalog.schema import Table
+from ..parser.dialect import FedQPostgres
 from .query_context import ColumnMapping, QueryContext
 from .query_executor import QueryExecutor, QueryProcessor
 
@@ -58,7 +59,7 @@ class _SelectSource:
 class QueryPreprocessor:
     """Expands SELECT * and captures column metadata."""
 
-    def __init__(self, catalog: Catalog, dialect: str = "postgres"):
+    def __init__(self, catalog: Catalog, dialect=FedQPostgres):
         """Initialize with catalog metadata and SQL dialect."""
         self.catalog = catalog
         self.dialect = dialect
@@ -109,7 +110,7 @@ class QueryPreprocessor:
             return False
         if isinstance(parent, exp.With) and arg_key == "this":
             return True
-        if isinstance(parent, exp.Command) and arg_key in ("expression", "this"):
+        if isinstance(parent, exp.Describe) and arg_key == "this":
             return True
         set_operations = (exp.Union, exp.Except, exp.Intersect)
         if isinstance(parent, set_operations) and arg_key == "this":
@@ -189,7 +190,9 @@ class QueryPreprocessor:
             if source.matches(qualifier):
                 matched.append(source)
         if not matched:
-            raise StarExpansionError(f"Unknown table alias '{qualifier}' in star projection")
+            raise StarExpansionError(
+                f"Unknown table alias '{qualifier}' in star projection"
+            )
         return matched
 
     def _column_mappings_for_expression(
@@ -286,7 +289,9 @@ class QueryPreprocessor:
             raise StarExpansionError(f"Missing catalog metadata for {qualified}")
         alias = self._parse_alias(table_expr)
         sql_qualifier = self._sql_qualifier(datasource, schema_name, table_name, alias)
-        internal_prefix = self._internal_prefix(datasource, schema_name, table_name, alias)
+        internal_prefix = self._internal_prefix(
+            datasource, schema_name, table_name, alias
+        )
         columns = self._column_names(table)
         return _SelectSource(
             datasource=datasource,
@@ -407,7 +412,7 @@ class QueryPreprocessor:
 class StarExpansionProcessor(QueryProcessor):
     """Middleware that performs star expansion and column renaming."""
 
-    def __init__(self, catalog: Catalog, dialect: str = "postgres"):
+    def __init__(self, catalog: Catalog, dialect=FedQPostgres):
         """Initialize processor with catalog metadata."""
         self.preprocessor = QueryPreprocessor(catalog, dialect=dialect)
 
