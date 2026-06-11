@@ -75,7 +75,10 @@ class DataSource(ABC):
         """
         self.name = name
         self.config = config
-        self.connection = None
+        # NOTE: the base intentionally has no `connection` attribute. A single
+        # connection is an implementation detail of single-connection sources
+        # (DuckDB declares its own); pooled sources (PostgreSQL) borrow per
+        # operation. Connectedness is tracked by `_connected`/is_connected().
         self._connected = False
 
     @abstractmethod

@@ -31,8 +31,9 @@ class Catalog:
         This discovers all schemas, tables, and columns from each data source.
         """
         for ds_name, datasource in self.datasources.items():
-            # Ensure connection
-            if datasource.connection is None:
+            # Ensure the source is connected (pooled sources have no single
+            # `connection` attribute, so ask the source itself).
+            if not datasource.is_connected():
                 datasource.connect()
 
             # Load schemas

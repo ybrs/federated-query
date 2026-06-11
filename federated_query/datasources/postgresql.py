@@ -52,6 +52,10 @@ class PostgreSQLDataSource(DataSource):
             f"Connecting to PostgreSQL database '{self.config['database']}' "
             f"at {self.config['host']}"
         )
+        # Constructing the pool eagerly opens ``min_connections``, so it fails
+        # loudly here if the server is unreachable; no separate smoke test or
+        # stored connection is needed (this source is pool-based, not
+        # single-connection).
         self._pool = pool.ThreadedConnectionPool(
             self._min_connections,
             self._max_connections,
@@ -61,10 +65,6 @@ class PostgreSQLDataSource(DataSource):
             user=self.config["user"],
             password=self.config["password"],
         )
-        # Get a test connection to verify it works.
-        conn = self._pool.getconn()
-        self._pool.putconn(conn)
-        self.connection = conn  # Store for compatibility
         self._connected = True
         logger.info(f"Successfully connected to PostgreSQL: {self.name}")
 
@@ -74,7 +74,6 @@ class PostgreSQLDataSource(DataSource):
             self._pool.closeall()
             logger.info(f"Disconnected from PostgreSQL: {self.name}")
             self._pool = None
-            self.connection = None
             self._connected = False
 
     def _get_connection(self):
