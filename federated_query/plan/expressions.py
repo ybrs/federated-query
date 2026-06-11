@@ -2,8 +2,11 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, TYPE_CHECKING
 from enum import Enum
+
+if TYPE_CHECKING:
+    from .logical import LogicalPlanNode
 
 
 class DataType(Enum):
@@ -63,7 +66,9 @@ class ColumnRef(Expression):
         return self.column
 
     def __repr__(self) -> str:
-        return f"ColumnRef({self.table}.{self.column})" if self.table else f"ColumnRef({self.column})"
+        if self.table:
+            return f"ColumnRef({self.table}.{self.column})"
+        return f"ColumnRef({self.column})"
 
 
 @dataclass(frozen=True)
@@ -83,7 +88,10 @@ class Literal(Expression):
         if self.value is None:
             return "NULL"
         if self.data_type in (DataType.VARCHAR, DataType.TEXT):
-            return f"'{self.value}'"
+            # Escape embedded single quotes (O'Brien -> 'O''Brien') so the
+            # remote SQL stays valid and is not an injection vector.
+            escaped = str(self.value).replace("'", "''")
+            return f"'{escaped}'"
         return str(self.value)
 
     def __repr__(self) -> str:
@@ -108,6 +116,10 @@ class BinaryOpType(Enum):
     GT = ">"
     GTE = ">="
 
+    # Null-safe comparison (NULL is treated as a comparable value)
+    NULL_SAFE_EQ = "IS NOT DISTINCT FROM"
+    NULL_SAFE_NEQ = "IS DISTINCT FROM"
+
     # Logical
     AND = "AND"
     OR = "OR"
@@ -115,6 +127,9 @@ class BinaryOpType(Enum):
     # String
     CONCAT = "||"
     LIKE = "LIKE"
+    ILIKE = "ILIKE"
+    REGEX_MATCH = "~"  # POSIX regex match
+    REGEX_IMATCH = "~*"  # case-insensitive POSIX regex match
 
 
 @dataclass(frozen=True)
@@ -127,10 +142,27 @@ class BinaryOp(Expression):
 
     def get_type(self) -> DataType:
         # Logical and comparison operators return boolean
-        if self.op in (BinaryOpType.AND, BinaryOpType.OR, BinaryOpType.EQ,
-                       BinaryOpType.NEQ, BinaryOpType.LT, BinaryOpType.LTE,
-                       BinaryOpType.GT, BinaryOpType.GTE, BinaryOpType.LIKE):
+        if self.op in (
+            BinaryOpType.AND,
+            BinaryOpType.OR,
+            BinaryOpType.EQ,
+            BinaryOpType.NEQ,
+            BinaryOpType.LT,
+            BinaryOpType.LTE,
+            BinaryOpType.GT,
+            BinaryOpType.GTE,
+            BinaryOpType.LIKE,
+            BinaryOpType.ILIKE,
+            BinaryOpType.NULL_SAFE_EQ,
+            BinaryOpType.NULL_SAFE_NEQ,
+            BinaryOpType.REGEX_MATCH,
+            BinaryOpType.REGEX_IMATCH,
+        ):
             return DataType.BOOLEAN
+
+        # String concatenation always produces text
+        if self.op == BinaryOpType.CONCAT:
+            return DataType.VARCHAR
 
         # Arithmetic operators inherit type from operands
         # (simplified - real implementation needs type coercion)
@@ -293,6 +325,35 @@ class BetweenExpression(Expression):
         return "BetweenExpression()"
 
 
+@dataclass(frozen=True)
+class Cast(Expression):
+    """``CAST(expr AS target_type)`` type conversion.
+
+    ``target_type`` keeps the original SQL type text (e.g. ``VARCHAR`` or
+    ``DECIMAL(10, 2)``) so the cast re-renders verbatim when pushed to a
+    remote source. ``data_type`` holds the resolved engine type, set during
+    binding for local evaluation.
+    """
+
+    expr: Expression
+    target_type: str
+    data_type: Optional[DataType] = None
+
+    def get_type(self) -> DataType:
+        if self.data_type is None:
+            raise NotImplementedError("Cast type must be set during binding")
+        return self.data_type
+
+    def accept(self, visitor):
+        return visitor.visit_cast(self)
+
+    def to_sql(self) -> str:
+        return f"CAST({self.expr.to_sql()} AS {self.target_type})"
+
+    def __repr__(self) -> str:
+        return f"Cast({self.expr} AS {self.target_type})"
+
+
 class ExpressionVisitor(ABC):
     """Visitor interface for expressions."""
 
@@ -327,3 +388,154 @@ class ExpressionVisitor(ABC):
     @abstractmethod
     def visit_between(self, expr: BetweenExpression):
         pass
+
+    @abstractmethod
+    def visit_cast(self, expr: "Cast"):
+        pass
+
+    @abstractmethod
+    def visit_subquery(self, expr: "SubqueryExpression"):
+        pass
+
+    @abstractmethod
+    def visit_exists(self, expr: "ExistsExpression"):
+        pass
+
+    @abstractmethod
+    def visit_in_subquery(self, expr: "InSubquery"):
+        pass
+
+    @abstractmethod
+    def visit_quantified_comparison(self, expr: "QuantifiedComparison"):
+        pass
+
+    @abstractmethod
+    def visit_tuple(self, expr: "TupleExpression"):
+        pass
+
+
+class Quantifier(Enum):
+    """Quantifiers for quantified comparisons."""
+
+    ANY = "ANY"
+    SOME = "SOME"
+    ALL = "ALL"
+
+
+@dataclass(frozen=True)
+class SubqueryExpression(Expression):
+    """Scalar subquery expression."""
+
+    subquery: "LogicalPlanNode"
+
+    def get_type(self) -> DataType:
+        return DataType.NULL
+
+    def accept(self, visitor):
+        return visitor.visit_subquery(self)
+
+    def to_sql(self) -> str:
+        return f"({self.subquery})"
+
+    def __repr__(self) -> str:
+        return "SubqueryExpression()"
+
+
+@dataclass(frozen=True)
+class ExistsExpression(Expression):
+    """EXISTS or NOT EXISTS predicate."""
+
+    subquery: "LogicalPlanNode"
+    negated: bool = False
+
+    def get_type(self) -> DataType:
+        return DataType.BOOLEAN
+
+    def accept(self, visitor):
+        return visitor.visit_exists(self)
+
+    def to_sql(self) -> str:
+        prefix = "NOT " if self.negated else ""
+        return f"{prefix}EXISTS({self.subquery})"
+
+    def __repr__(self) -> str:
+        prefix = "NOT " if self.negated else ""
+        return f"{prefix}ExistsExpression()"
+
+
+@dataclass(frozen=True)
+class InSubquery(Expression):
+    """IN or NOT IN predicate with subquery."""
+
+    value: Expression
+    subquery: "LogicalPlanNode"
+    negated: bool = False
+
+    def get_type(self) -> DataType:
+        return DataType.BOOLEAN
+
+    def accept(self, visitor):
+        return visitor.visit_in_subquery(self)
+
+    def to_sql(self) -> str:
+        prefix = "NOT " if self.negated else ""
+        return f"({self.value.to_sql()} {prefix}IN ({self.subquery}))"
+
+    def __repr__(self) -> str:
+        prefix = "NOT " if self.negated else ""
+        return f"{prefix}InSubquery()"
+
+
+@dataclass(frozen=True)
+class TupleExpression(Expression):
+    """Row value constructor such as ``(u.city, u.country)``.
+
+    Only meaningful as the left-hand side of a tuple IN subquery; the
+    decorrelator expands it into per-column predicates. It is never
+    evaluated directly.
+    """
+
+    items: Tuple[Expression, ...]
+
+    def get_type(self) -> DataType:
+        return DataType.NULL
+
+    def accept(self, visitor):
+        return visitor.visit_tuple(self)
+
+    def to_sql(self) -> str:
+        parts = []
+        for item in self.items:
+            parts.append(item.to_sql())
+        joined = ", ".join(parts)
+        return f"({joined})"
+
+    def __repr__(self) -> str:
+        return f"TupleExpression({len(self.items)} items)"
+
+
+@dataclass(frozen=True)
+class QuantifiedComparison(Expression):
+    """Quantified comparison such as > ANY or = ALL."""
+
+    operator: BinaryOpType
+    quantifier: Quantifier
+    left: Expression
+    subquery: "LogicalPlanNode"
+
+    def get_type(self) -> DataType:
+        return DataType.BOOLEAN
+
+    def accept(self, visitor):
+        return visitor.visit_quantified_comparison(self)
+
+    def to_sql(self) -> str:
+        return (
+            f"({self.left.to_sql()} {self.operator.value} "
+            f"{self.quantifier.value} ({self.subquery}))"
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"QuantifiedComparison({self.operator.value}, " f"{self.quantifier.value})"
+        )

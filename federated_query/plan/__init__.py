@@ -11,6 +11,7 @@ from .logical import (
     Limit,
     Union,
     Explain,
+    CTE,
     ExplainFormat,
 )
 from .physical import (
@@ -34,6 +35,13 @@ from .expressions import (
     UnaryOp,
     FunctionCall,
     CaseExpr,
+    InList,
+    BetweenExpression,
+    SubqueryExpression,
+    ExistsExpression,
+    InSubquery,
+    QuantifiedComparison,
+    Quantifier,
 )
 
 __all__ = [
@@ -48,6 +56,7 @@ __all__ = [
     "Limit",
     "Union",
     "Explain",
+    "CTE",
     "ExplainFormat",
     # Physical nodes
     "PhysicalPlanNode",
@@ -69,4 +78,11 @@ __all__ = [
     "UnaryOp",
     "FunctionCall",
     "CaseExpr",
+    "InList",
+    "BetweenExpression",
+    "SubqueryExpression",
+    "ExistsExpression",
+    "InSubquery",
+    "QuantifiedComparison",
+    "Quantifier",
 ]

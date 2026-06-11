@@ -9,9 +9,24 @@ from tests.e2e_pushdown.helpers import (
     unwrap_parens,
 )
 
+# SELECT * is expanded to explicit columns before the engine (the SELECT *
+# Expansion Contract), so the remote query lists every orders column in
+# schema order rather than carrying a literal star.
+ORDERS_COLUMNS = [
+    "order_id",
+    "product_id",
+    "customer_id",
+    "quantity",
+    "price",
+    "status",
+    "region",
+    "created_at",
+    "select",
+]
+
 
 def test_select_all_no_filter(single_source_env):
-    """Checks SELECT * stays a single column star with no WHERE clause."""
+    """Checks SELECT * expands to explicit columns with no WHERE clause."""
     runtime = build_runtime(single_source_env)
     sql = "SELECT * FROM duckdb_primary.main.orders"
     ast = explain_datasource_query(runtime, sql)
@@ -19,8 +34,7 @@ def test_select_all_no_filter(single_source_env):
     where_clause = ast.args.get("where")
     assert where_clause is None
     projection = select_column_names(ast)
-    assert len(projection) == 1
-    assert projection[0] == "*"
+    assert projection == ORDERS_COLUMNS
 
 
 def test_projection_subset_columns(single_source_env):
@@ -38,7 +52,7 @@ def test_numeric_predicate_pushdown(single_source_env):
     sql = "SELECT * FROM duckdb_primary.main.orders WHERE quantity > 4"
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
-    assert projection == ["*"]
+    assert projection == ORDERS_COLUMNS
     where_clause = ast.args.get("where")
     assert where_clause is not None
     predicate = unwrap_parens(where_clause.this)
@@ -52,7 +66,7 @@ def test_string_predicate_pushdown(single_source_env):
     sql = "SELECT * FROM duckdb_primary.main.orders WHERE status = 'processing'"
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
-    assert projection == ["*"]
+    assert projection == ORDERS_COLUMNS
     where_clause = ast.args.get("where")
     assert where_clause is not None
     predicate = unwrap_parens(where_clause.this)
@@ -203,7 +217,7 @@ def test_less_than_predicate(single_source_env):
     sql = "SELECT * FROM duckdb_primary.main.orders WHERE quantity < 5"
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
-    assert projection == ["*"]
+    assert projection == ORDERS_COLUMNS
     where_clause = ast.args.get("where")
     assert where_clause is not None
     predicate = unwrap_parens(where_clause.this)
@@ -217,7 +231,7 @@ def test_less_than_or_equal_predicate(single_source_env):
     sql = "SELECT * FROM duckdb_primary.main.orders WHERE quantity <= 3"
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
-    assert projection == ["*"]
+    assert projection == ORDERS_COLUMNS
     where_clause = ast.args.get("where")
     assert where_clause is not None
     predicate = unwrap_parens(where_clause.this)
@@ -231,7 +245,7 @@ def test_greater_than_or_equal_predicate(single_source_env):
     sql = "SELECT * FROM duckdb_primary.main.orders WHERE quantity >= 2"
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
-    assert projection == ["*"]
+    assert projection == ORDERS_COLUMNS
     where_clause = ast.args.get("where")
     assert where_clause is not None
     predicate = unwrap_parens(where_clause.this)
@@ -245,7 +259,7 @@ def test_not_equal_predicate(single_source_env):
     sql = "SELECT * FROM duckdb_primary.main.orders WHERE status != 'cancelled'"
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
-    assert projection == ["*"]
+    assert projection == ORDERS_COLUMNS
     where_clause = ast.args.get("where")
     assert where_clause is not None
     predicate = unwrap_parens(where_clause.this)
@@ -259,7 +273,7 @@ def test_is_null_predicate(single_source_env):
     sql = "SELECT * FROM duckdb_primary.main.orders WHERE region IS NULL"
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
-    assert projection == ["*"]
+    assert projection == ORDERS_COLUMNS
     where_clause = ast.args.get("where")
     assert where_clause is not None
     predicate = unwrap_parens(where_clause.this)
@@ -274,7 +288,7 @@ def test_is_not_null_predicate(single_source_env):
     sql = "SELECT * FROM duckdb_primary.main.orders WHERE region IS NOT NULL"
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
-    assert projection == ["*"]
+    assert projection == ORDERS_COLUMNS
     where_clause = ast.args.get("where")
     assert where_clause is not None
     predicate = unwrap_parens(where_clause.this)

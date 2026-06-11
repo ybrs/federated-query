@@ -7,8 +7,10 @@ from federated_query.plan.logical import Projection, Scan, Join, Explain, Explai
 
 def test_parser_initialization():
     """Test parser initialization."""
+    from federated_query.parser.dialect import FedQPostgres
+
     parser = Parser()
-    assert parser.dialect == "postgres"
+    assert parser.dialect is FedQPostgres
 
 
 def test_parse_simple_select():

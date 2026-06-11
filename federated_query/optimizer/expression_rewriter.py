@@ -74,7 +74,7 @@ class ExpressionRewriter(ABC):
             function_name=expr.function_name,
             args=rewritten_args,
             is_aggregate=expr.is_aggregate,
-            distinct=expr.distinct
+            distinct=expr.distinct,
         )
 
     def rewrite_case_expr(self, expr: CaseExpr) -> Expression:
@@ -99,10 +99,7 @@ class ExpressionRewriter(ABC):
         if not changed:
             return expr
 
-        return CaseExpr(
-            when_clauses=rewritten_when_clauses,
-            else_result=rewritten_else
-        )
+        return CaseExpr(when_clauses=rewritten_when_clauses, else_result=rewritten_else)
 
     def rewrite_in_list(self, expr: InList) -> Expression:
         """Rewrite IN list expression."""

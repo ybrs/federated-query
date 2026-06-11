@@ -29,22 +29,28 @@ def _normalize_join_kind(join_expr: exp.Join) -> str:
     Examples:
         INNER JOIN -> returns "INNER"
         LEFT JOIN -> returns "LEFT" (from side)
-        FULL OUTER JOIN -> returns "FULL" (from kind)
+        FULL OUTER JOIN -> returns "FULL" (from side)
         JOIN (no keyword) -> returns "INNER" (default)
 
     This normalizes all variants to uppercase strings: INNER, LEFT, RIGHT, FULL.
     """
-    kind = join_expr.args.get("kind")
-    if kind is not None:
-        if hasattr(kind, "value"):
-            return str(kind.value).upper()
-        return str(kind).upper()
+    # ``side`` carries the directional keyword (LEFT/RIGHT/FULL) and must be
+    # checked first: sqlglot stores FULL OUTER JOIN as side=FULL, kind=OUTER,
+    # so reading ``kind`` first would mislabel it "OUTER".
     side = join_expr.args.get("side")
     if side is not None:
-        if hasattr(side, "value"):
-            return str(side.value).upper()
-        return str(side).upper()
+        return _enum_text(side)
+    kind = join_expr.args.get("kind")
+    if kind is not None:
+        return _enum_text(kind)
     return "INNER"
+
+
+def _enum_text(value) -> str:
+    """Upper-case the string form of a sqlglot kind/side token."""
+    if hasattr(value, "value"):
+        return str(value.value).upper()
+    return str(value).upper()
 
 
 def _assert_join_type(select_ast: exp.Select, expected: str, index: int = 0) -> None:

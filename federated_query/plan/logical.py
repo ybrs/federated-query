@@ -84,12 +84,16 @@ class Scan(LogicalPlanNode):
     alias: Optional[str] = None  # Table alias (e.g., "u" in "FROM users u")
     group_by: Optional[List[Expression]] = None  # Optional GROUP BY expressions
     aggregates: Optional[List[Expression]] = None  # Optional aggregate expressions
-    output_names: Optional[List[str]] = None  # Output column names when using aggregates
+    output_names: Optional[List[str]] = (
+        None  # Output column names when using aggregates
+    )
     limit: Optional[int] = None
     offset: int = 0
     order_by_keys: Optional[List[Expression]] = None  # ORDER BY expressions
     order_by_ascending: Optional[List[bool]] = None  # ASC/DESC for each key
-    order_by_nulls: Optional[List[Optional[str]]] = None  # NULLS FIRST/LAST for each key
+    order_by_nulls: Optional[List[Optional[str]]] = (
+        None  # NULLS FIRST/LAST for each key
+    )
     distinct: bool = False
 
     def children(self) -> List[LogicalPlanNode]:
@@ -151,7 +155,18 @@ class Projection(LogicalPlanNode):
         return visitor.visit_projection(self)
 
     def schema(self) -> List[str]:
-        return self.aliases
+        # A ``*`` alias stands in for the input's columns; expand it so the
+        # projection reports concrete names (joins above need them to orient
+        # keys and to resolve qualified references).
+        if "*" not in self.aliases:
+            return self.aliases
+        names: List[str] = []
+        for alias in self.aliases:
+            if alias == "*":
+                names.extend(self.input.schema())
+            else:
+                names.append(alias)
+        return names
 
     def __repr__(self) -> str:
         prefix = "Distinct " if self.distinct else ""
@@ -202,7 +217,10 @@ class Join(LogicalPlanNode):
         return visitor.visit_join(self)
 
     def schema(self) -> List[str]:
-        # Combine schemas from both sides
+        # SEMI/ANTI joins are existential filters: they emit only the left
+        # input's columns, never the right side's.
+        if self.join_type in (JoinType.SEMI, JoinType.ANTI):
+            return self.left.schema()
         return self.left.schema() + self.right.schema()
 
     def __repr__(self) -> str:
@@ -263,10 +281,14 @@ class Sort(LogicalPlanNode):
 
 @dataclass(frozen=True)
 class Limit(LogicalPlanNode):
-    """Limit number of rows."""
+    """Limit number of rows.
+
+    ``limit`` is None for an OFFSET without a row cap (``OFFSET n`` alone),
+    which still skips rows and must not be discarded.
+    """
 
     input: LogicalPlanNode
-    limit: int
+    limit: Optional[int]
     offset: int = 0
 
     def children(self) -> List[LogicalPlanNode]:
@@ -335,6 +357,149 @@ class Explain(LogicalPlanNode):
         return f"Explain(format={self.format.value})"
 
 
+@dataclass(frozen=True)
+class CTE(LogicalPlanNode):
+    """Common table expression wrapper.
+
+    Holds a named subplan and a root plan that can reference it.
+    """
+
+    name: str
+    cte_plan: LogicalPlanNode
+    child: LogicalPlanNode
+
+    def children(self) -> List[LogicalPlanNode]:
+        return [self.cte_plan, self.child]
+
+    def with_children(self, children: List[LogicalPlanNode]) -> "CTE":
+        assert len(children) == 2
+        return CTE(name=self.name, cte_plan=children[0], child=children[1])
+
+    def accept(self, visitor):
+        return visitor.visit_cte(self)
+
+    def schema(self) -> List[str]:
+        return self.child.schema()
+
+    def __repr__(self) -> str:
+        return f"CTE({self.name})"
+
+
+@dataclass(frozen=True)
+class Values(LogicalPlanNode):
+    """In-memory rows built from constant expressions.
+
+    Represents a FROM-less SELECT such as ``SELECT 42``: one or more rows,
+    each a list of expressions evaluated without input columns.
+    """
+
+    rows: List[List[Expression]]
+    output_names: List[str]
+
+    def children(self) -> List[LogicalPlanNode]:
+        return []
+
+    def with_children(self, children: List[LogicalPlanNode]) -> "Values":
+        assert len(children) == 0
+        return self
+
+    def accept(self, visitor):
+        return visitor.visit_values(self)
+
+    def schema(self) -> List[str]:
+        return self.output_names
+
+    def __repr__(self) -> str:
+        return f"Values({len(self.rows)} rows)"
+
+
+@dataclass(frozen=True)
+class SubqueryScan(LogicalPlanNode):
+    """A derived table: a subplan exposed under an alias.
+
+    ``FROM (SELECT ...) dt`` becomes SubqueryScan(input=subplan, alias="dt");
+    the output columns are the subplan's output columns.
+    """
+
+    input: LogicalPlanNode
+    alias: str
+
+    def children(self) -> List[LogicalPlanNode]:
+        return [self.input]
+
+    def with_children(self, children: List[LogicalPlanNode]) -> "SubqueryScan":
+        assert len(children) == 1
+        return SubqueryScan(input=children[0], alias=self.alias)
+
+    def accept(self, visitor):
+        return visitor.visit_subquery_scan(self)
+
+    def schema(self) -> List[str]:
+        return self.input.schema()
+
+    def __repr__(self) -> str:
+        return f"SubqueryScan({self.alias})"
+
+
+@dataclass(frozen=True)
+class SingleRowGuard(LogicalPlanNode):
+    """Runtime cardinality guard for decorrelated scalar subqueries.
+
+    With no keys, the input may produce at most one row in total. With
+    keys, each distinct key tuple may appear at most once. Violations
+    raise at execution time, mirroring real engines' scalar subquery
+    errors.
+    """
+
+    input: LogicalPlanNode
+    keys: List[Expression]
+
+    def children(self) -> List[LogicalPlanNode]:
+        return [self.input]
+
+    def with_children(self, children: List[LogicalPlanNode]) -> "SingleRowGuard":
+        assert len(children) == 1
+        return SingleRowGuard(input=children[0], keys=self.keys)
+
+    def accept(self, visitor):
+        return visitor.visit_single_row_guard(self)
+
+    def schema(self) -> List[str]:
+        return self.input.schema()
+
+    def __repr__(self) -> str:
+        return f"SingleRowGuard(keys={len(self.keys)})"
+
+
+@dataclass(frozen=True)
+class GroupedLimit(LogicalPlanNode):
+    """Per-key LIMIT produced by decorrelating a correlated LIMIT.
+
+    A correlated subquery's LIMIT applies once per outer row; after
+    decorrelation it becomes "at most N rows per correlation key".
+    """
+
+    input: LogicalPlanNode
+    keys: List[Expression]
+    limit: int
+
+    def children(self) -> List[LogicalPlanNode]:
+        return [self.input]
+
+    def with_children(self, children: List[LogicalPlanNode]) -> "GroupedLimit":
+        assert len(children) == 1
+        return GroupedLimit(input=children[0], keys=self.keys, limit=self.limit)
+
+    def accept(self, visitor):
+        return visitor.visit_grouped_limit(self)
+
+    def schema(self) -> List[str]:
+        return self.input.schema()
+
+    def __repr__(self) -> str:
+        return f"GroupedLimit(limit={self.limit}, keys={len(self.keys)})"
+
+
 class LogicalPlanVisitor(ABC):
     """Visitor interface for logical plan nodes."""
 
@@ -372,4 +537,24 @@ class LogicalPlanVisitor(ABC):
 
     @abstractmethod
     def visit_explain(self, node: Explain):
+        pass
+
+    @abstractmethod
+    def visit_cte(self, node: "CTE"):
+        pass
+
+    @abstractmethod
+    def visit_values(self, node: "Values"):
+        pass
+
+    @abstractmethod
+    def visit_subquery_scan(self, node: "SubqueryScan"):
+        pass
+
+    @abstractmethod
+    def visit_single_row_guard(self, node: "SingleRowGuard"):
+        pass
+
+    @abstractmethod
+    def visit_grouped_limit(self, node: "GroupedLimit"):
         pass

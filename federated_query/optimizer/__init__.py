@@ -20,6 +20,7 @@ from .expression_rewriter import (
     ExpressionSimplificationRewriter,
     CompositeExpressionRewriter,
 )
+from .decorrelation import Decorrelator, DecorrelationError
 
 __all__ = [
     "OptimizationRule",
@@ -38,4 +39,6 @@ __all__ = [
     "ConstantFoldingRewriter",
     "ExpressionSimplificationRewriter",
     "CompositeExpressionRewriter",
+    "Decorrelator",
+    "DecorrelationError",
 ]

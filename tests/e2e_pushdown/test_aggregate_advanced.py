@@ -91,9 +91,11 @@ def test_aggregate_distinct_with_expression(single_source_env):
     count_expr = find_alias_expression(ast, "unique_totals")
     assert count_expr is not None
     assert isinstance(count_expr, exp.Count)
-    assert count_expr.args.get("distinct") is True
+    # sqlglot models COUNT(DISTINCT x) as Count(this=Distinct(expressions=[x])).
+    distinct = count_expr.this
+    assert isinstance(distinct, exp.Distinct)
 
-    count_arg = unwrap_parens(count_expr.this)
+    count_arg = unwrap_parens(distinct.expressions[0])
     assert isinstance(count_arg, exp.Mul)
 
 

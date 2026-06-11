@@ -1,5 +1,6 @@
 """PostgreSQL data source implementation."""
 
+from contextlib import contextmanager
 from typing import List, Dict, Any, Iterator, Optional
 import pyarrow as pa
 import psycopg2
@@ -42,27 +43,30 @@ class PostgreSQLDataSource(DataSource):
         self._max_connections = config.get("max_connections", 5)
 
     def connect(self) -> None:
-        """Establish connection pool to PostgreSQL."""
-        try:
-            logger.info(f"Connecting to PostgreSQL database '{self.config['database']}' at {self.config['host']}")
-            self._pool = pool.ThreadedConnectionPool(
-                self._min_connections,
-                self._max_connections,
-                host=self.config["host"],
-                port=self.config.get("port", 5432),
-                database=self.config["database"],
-                user=self.config["user"],
-                password=self.config["password"],
-            )
-            # Get a test connection to verify it works
-            conn = self._pool.getconn()
-            self._pool.putconn(conn)
-            self.connection = conn  # Store for compatibility
-            self._connected = True
-            logger.info(f"Successfully connected to PostgreSQL: {self.name}")
-        except psycopg2.Error as e:
-            logger.error(f"Failed to connect to PostgreSQL {self.name}: {e}")
-            raise ConnectionError(f"PostgreSQL connection failed: {e}") from e
+        """Establish connection pool to PostgreSQL.
+
+        psycopg2 errors are allowed to propagate unchanged; wrapping them in
+        a ConnectionError would hide the real cause (CLAUDE.md rule #1).
+        """
+        logger.info(
+            f"Connecting to PostgreSQL database '{self.config['database']}' "
+            f"at {self.config['host']}"
+        )
+        # Constructing the pool eagerly opens ``min_connections``, so it fails
+        # loudly here if the server is unreachable; no separate smoke test or
+        # stored connection is needed (this source is pool-based, not
+        # single-connection).
+        self._pool = pool.ThreadedConnectionPool(
+            self._min_connections,
+            self._max_connections,
+            host=self.config["host"],
+            port=self.config.get("port", 5432),
+            database=self.config["database"],
+            user=self.config["user"],
+            password=self.config["password"],
+        )
+        self._connected = True
+        logger.info(f"Successfully connected to PostgreSQL: {self.name}")
 
     def disconnect(self) -> None:
         """Close all connections in the pool."""
@@ -70,7 +74,6 @@ class PostgreSQLDataSource(DataSource):
             self._pool.closeall()
             logger.info(f"Disconnected from PostgreSQL: {self.name}")
             self._pool = None
-            self.connection = None
             self._connected = False
 
     def _get_connection(self):
@@ -83,6 +86,19 @@ class PostgreSQLDataSource(DataSource):
         """Return a connection to the pool."""
         if self._pool:
             self._pool.putconn(conn)
+
+    @contextmanager
+    def get_connection(self) -> Iterator[Any]:
+        """Yield a pooled connection, returning it to the pool on exit.
+
+        Intended for callers that need a raw psycopg2 connection (for
+        example, test fixtures issuing DDL) without managing the pool.
+        """
+        conn = self._get_connection()
+        try:
+            yield conn
+        finally:
+            self._return_connection(conn)
 
     def get_capabilities(self) -> List[DataSourceCapability]:
         """PostgreSQL supports most SQL features."""
@@ -214,9 +230,6 @@ class PostgreSQLDataSource(DataSource):
                     total_size_bytes=row_count * 100,  # Rough estimate
                     column_stats=column_stats,
                 )
-        except psycopg2.Error as e:
-            logger.warning(f"Could not get statistics for {schema}.{table}: {e}")
-            return None
         finally:
             self._return_connection(conn)
 
@@ -229,6 +242,7 @@ class PostgreSQLDataSource(DataSource):
                 cursor.execute(query)
 
                 columns = self._extract_column_names(cursor.description)
+                schema = pa.schema(self._build_arrow_fields(cursor.description))
 
                 batch_size = 10000
                 while True:
@@ -237,7 +251,8 @@ class PostgreSQLDataSource(DataSource):
                         break
 
                     data = self._build_column_data(columns, rows)
-                    batch = pa.RecordBatch.from_pydict(data)
+                    self._coerce_floats(data, schema)
+                    batch = pa.RecordBatch.from_pydict(data, schema=schema)
                     yield batch
         except psycopg2.Error as e:
             logger.error(f"Query execution failed on {self.name}: {e}")
@@ -251,8 +266,7 @@ class PostgreSQLDataSource(DataSource):
         try:
             with conn.cursor() as cursor:
                 cursor.execute(f"SELECT * FROM ({query}) AS q LIMIT 0")
-                columns = self._extract_column_names(cursor.description)
-                fields = self._build_arrow_fields(columns)
+                fields = self._build_arrow_fields(cursor.description)
                 return pa.schema(fields)
         except psycopg2.Error as e:
             logger.error(f"Failed to get query schema: {e}")
@@ -267,12 +281,45 @@ class PostgreSQLDataSource(DataSource):
             columns.append(desc[0])
         return columns
 
-    def _build_arrow_fields(self, columns: List[str]) -> List[pa.Field]:
-        """Build Arrow fields from column names."""
+    # PostgreSQL type OIDs -> Arrow types. NUMERIC maps to float64: the
+    # engine computes over floats, so sources surface decimals as doubles.
+    _OID_TO_ARROW = {
+        16: pa.bool_(),  # bool
+        20: pa.int64(),  # int8
+        21: pa.int64(),  # int2
+        23: pa.int64(),  # int4
+        700: pa.float64(),  # float4
+        701: pa.float64(),  # float8
+        1700: pa.float64(),  # numeric
+        25: pa.string(),  # text
+        1042: pa.string(),  # bpchar
+        1043: pa.string(),  # varchar
+        1082: pa.date32(),  # date
+        1114: pa.timestamp("us"),  # timestamp
+        1184: pa.timestamp("us", tz="UTC"),  # timestamptz
+    }
+
+    def _build_arrow_fields(self, description) -> List[pa.Field]:
+        """Build typed Arrow fields from a cursor description."""
         fields = []
-        for col in columns:
-            fields.append(pa.field(col, pa.string()))
+        for column in description:
+            arrow_type = self._OID_TO_ARROW.get(column[1], pa.string())
+            fields.append(pa.field(column[0], arrow_type))
         return fields
+
+    def _coerce_floats(self, data: Dict[str, List], schema: pa.Schema) -> None:
+        """Convert Decimal values to float for float64-typed columns.
+
+        Arrow refuses to place ``decimal.Decimal`` values into float64
+        arrays, and NUMERIC columns surface as float64 in this engine.
+        """
+        for field in schema:
+            if not pa.types.is_float64(field.type):
+                continue
+            values = data[field.name]
+            for index in range(len(values)):
+                if values[index] is not None:
+                    values[index] = float(values[index])
 
     def _build_column_data(self, columns: List[str], rows: List) -> Dict[str, List]:
         """Build column data dictionary from rows."""

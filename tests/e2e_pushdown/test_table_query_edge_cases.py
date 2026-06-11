@@ -11,7 +11,7 @@ from tests.e2e_pushdown.helpers import (
 
 
 def test_query_on_empty_table_behavior(single_source_env):
-    """Documents query behavior on empty table (0 rows)."""
+    """A constant-false predicate is folded to FALSE before pushdown."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id FROM duckdb_primary.main.orders "
@@ -21,8 +21,11 @@ def test_query_on_empty_table_behavior(single_source_env):
 
     where_clause = ast.args.get("where")
     assert where_clause is not None
+    # The optimizer constant-folds ``1 = 0`` to FALSE, as a real engine does,
+    # so the remote SQL carries a boolean constant, not an equality.
     predicate = unwrap_parens(where_clause.this)
-    assert isinstance(predicate, exp.EQ)
+    assert isinstance(predicate, exp.Boolean)
+    assert predicate.this is False
 
 
 def test_query_single_row_with_limit_one(single_source_env):
@@ -48,15 +51,18 @@ def test_column_names_sql_keywords(single_source_env):
 
 
 def test_column_names_with_spaces(single_source_env):
-    """Ensures column names with spaces (quoted) push correctly."""
+    """A quoted space-alias pushes the internal column and renames locally.
+
+    The remote query fetches the internal column name; the visible "order id"
+    name is applied locally, so the pushed projection is the bare column.
+    """
     runtime = build_runtime(single_source_env)
     sql = 'SELECT order_id AS "order id" FROM duckdb_primary.main.orders'
     ast = explain_datasource_query(runtime, sql)
 
-    expressions = ast.expressions
-    assert len(expressions) == 1
-    first_expr = expressions[0]
-    assert isinstance(first_expr, exp.Alias)
+    assert select_column_names(ast) == ["order_id"]
+    result = runtime.execute(sql)
+    assert result.schema.names == ["order id"]
 
 
 def test_quoted_identifiers_case_sensitive(single_source_env):
@@ -70,33 +76,35 @@ def test_quoted_identifiers_case_sensitive(single_source_env):
 
 
 def test_very_wide_select(single_source_env):
-    """Checks SELECT with many columns (wide projection) pushes correctly."""
+    """A wide projection of one repeated column dedups remotely, 20 cols locally.
+
+    The remote query fetches ``order_id`` once; the 20 aliases are produced by
+    the local projection, so the final result has all 20 columns.
+    """
     runtime = build_runtime(single_source_env)
     columns = ", ".join([f"order_id AS col{i}" for i in range(20)])
     sql = f"SELECT {columns} FROM duckdb_primary.main.orders"
-    ast = explain_datasource_query(runtime, sql)
 
-    expressions = ast.expressions
-    assert len(expressions) == 20
+    result = runtime.execute(sql)
+    assert len(result.schema.names) == 20
 
 
 def test_select_duplicate_column_names(single_source_env):
-    """Ensures SELECT with duplicate column names via aliasing pushes."""
+    """Two columns aliased to one name push as their distinct internal columns.
+
+    The shared visible name ``id`` is applied locally, so the remote query
+    selects the two underlying columns and the result has two ``id`` columns.
+    """
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id AS id, product_id AS id "
         "FROM duckdb_primary.main.orders"
     )
     ast = explain_datasource_query(runtime, sql)
+    assert select_column_names(ast) == ["order_id", "product_id"]
 
-    expressions = ast.expressions
-    assert len(expressions) == 2
-
-    first_alias = expressions[0]
-    assert isinstance(first_alias, exp.Alias)
-
-    second_alias = expressions[1]
-    assert isinstance(second_alias, exp.Alias)
+    result = runtime.execute(sql)
+    assert result.schema.names == ["id", "id"]
 
 
 def test_all_nulls_column_with_aggregate(single_source_env):
@@ -111,7 +119,11 @@ def test_all_nulls_column_with_aggregate(single_source_env):
     expressions = ast.expressions
     assert len(expressions) == 2
 
+    # The aggregate is pushed with its generated alias (COUNT(region) AS ...),
+    # so unwrap the alias before checking the underlying call.
     first_expr = unwrap_parens(expressions[0])
+    if isinstance(first_expr, exp.Alias):
+        first_expr = first_expr.this
     assert isinstance(first_expr, exp.Count)
 
 

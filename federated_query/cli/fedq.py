@@ -31,6 +31,7 @@ from ..optimizer import (
     LimitPushdownRule,
     ExpressionSimplificationRule,
 )
+from ..optimizer.decorrelation import Decorrelator
 from ..processor import QueryExecutor, StarExpansionError, StarExpansionProcessor
 
 
@@ -87,10 +88,9 @@ class FedQRuntime:
         self.optimizer = RuleBasedOptimizer(catalog)
         self._register_optimization_rules()
         self.planner = PhysicalPlanner(catalog)
+        self.decorrelator = Decorrelator()
         physical_executor = Executor(executor_config)
-        processors = [
-            StarExpansionProcessor(catalog, dialect=self.parser.dialect)
-        ]
+        processors = [StarExpansionProcessor(catalog, dialect=self.parser.dialect)]
         self.query_executor = QueryExecutor(
             catalog=catalog,
             parser=self.parser,
@@ -99,6 +99,7 @@ class FedQRuntime:
             planner=self.planner,
             physical_executor=physical_executor,
             processors=processors,
+            decorrelator=self.decorrelator,
         )
 
     def _register_optimization_rules(self) -> None:
@@ -113,6 +114,13 @@ class FedQRuntime:
     def execute(self, sql: str) -> Union[pa.Table, Dict[str, Any]]:
         """Run a SQL statement and return results."""
         return self.query_executor.execute(sql)
+
+    def explain(self, sql: str) -> Dict[str, Any]:
+        """Return the JSON EXPLAIN document (plan + remote queries) for a query."""
+        document = self.execute(f"EXPLAIN (FORMAT JSON) {sql}")
+        if not isinstance(document, dict):
+            raise RuntimeError("EXPLAIN did not produce a JSON document")
+        return document
 
 
 class ResultPrinter:
@@ -166,7 +174,11 @@ class ResultPrinter:
         lines.append(border)
         return lines
 
-    def _compute_widths(self, headers: List[str], rows: List[List[object]]) -> List[int]:
+    def _compute_widths(
+        self,
+        headers: List[str],
+        rows: List[List[object]],
+    ) -> List[int]:
         widths: List[int] = []
         index = 0
         while index < len(headers):

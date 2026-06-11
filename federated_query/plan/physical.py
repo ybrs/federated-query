@@ -3,7 +3,17 @@
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import List, Optional, Iterator, Any, TYPE_CHECKING, Dict, Callable, Set, Tuple
+from typing import (
+    List,
+    Optional,
+    Iterator,
+    Any,
+    TYPE_CHECKING,
+    Dict,
+    Callable,
+    Set,
+    Tuple,
+)
 from enum import Enum
 
 import pyarrow as pa
@@ -47,6 +57,33 @@ class PhysicalPlanNode(ABC):
         return {}
 
 
+def _row_key_tuple(key_values, row_index: int) -> tuple:
+    """Build a hashable key tuple from per-column arrays at one row index."""
+    values = []
+    for array in key_values:
+        values.append(array[row_index].as_py())
+    return tuple(values)
+
+
+def _join_output_aliases(
+    left: "PhysicalPlanNode", right: "PhysicalPlanNode"
+) -> Dict[Tuple[Optional[str], str], str]:
+    """Build a (table, column) -> output-name map for a binary join.
+
+    Left columns keep their names; right columns whose names collide with a
+    left column are renamed with a ``right_`` prefix, mirroring the renaming
+    in ``_join_rows`` so qualified references resolve to the correct side.
+    """
+    alias_map: Dict[Tuple[Optional[str], str], str] = dict(left.column_aliases())
+    left_names = set(left.schema().names)
+    for key, physical_name in right.column_aliases().items():
+        if physical_name in left_names:
+            alias_map[key] = f"right_{physical_name}"
+        else:
+            alias_map[key] = physical_name
+    return alias_map
+
+
 @dataclass
 class PhysicalScan(PhysicalPlanNode):
     """Scan a table from a data source.
@@ -67,17 +104,34 @@ class PhysicalScan(PhysicalPlanNode):
     _schema: Optional[pa.Schema] = None  # Cached schema
     group_by: Optional[List[Expression]] = None  # Optional GROUP BY expressions
     aggregates: Optional[List[Expression]] = None  # Optional aggregate expressions
-    output_names: Optional[List[str]] = None  # Output column names when using aggregates
+    output_names: Optional[List[str]] = (
+        None  # Output column names when using aggregates
+    )
     alias: Optional[str] = None  # Table alias (if any)
     limit: Optional[int] = None
     offset: int = 0
     order_by_keys: Optional[List[Expression]] = None  # ORDER BY expressions
     order_by_ascending: Optional[List[bool]] = None  # ASC/DESC for each key
-    order_by_nulls: Optional[List[Optional[str]]] = None  # NULLS FIRST/LAST for each key
+    order_by_nulls: Optional[List[Optional[str]]] = (
+        None  # NULLS FIRST/LAST for each key
+    )
     distinct: bool = False
 
     def children(self) -> List[PhysicalPlanNode]:
         return []
+
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        """Expose this scan's columns under its table alias.
+
+        Lets a join above resolve qualified references (``o.id``) even when
+        another relation in the join exposes a column of the same name.
+        """
+        if self.alias is None:
+            return {}
+        mapping: Dict[Tuple[Optional[str], str], str] = {}
+        for name in self.schema().names:
+            mapping[(self.alias, name)] = name
+        return mapping
 
     def execute(self) -> Iterator[pa.RecordBatch]:
         """Execute scan on remote data source."""
@@ -94,40 +148,71 @@ class PhysicalScan(PhysicalPlanNode):
 
     def _build_query(self) -> str:
         """Build SQL query for this scan."""
-        cols = self._format_columns()
-        table_ref = self._format_table_ref()
-        select_kw = "SELECT"
-        if self.distinct:
-            select_kw = "SELECT DISTINCT"
-        query = f"{select_kw} {cols} FROM {table_ref}"
-
-        use_having = False
-        if self.filters:
-            use_having = (self.group_by or self.aggregates) and self._predicate_uses_aggregates(
-                self.filters
-            )
-            if not use_having:
-                where_clause = self.filters.to_sql()
-                query = f"{query} WHERE {where_clause}"
-
+        select_kw = "SELECT DISTINCT" if self.distinct else "SELECT"
+        query = f"{select_kw} {self._format_columns()} FROM {self._format_table_ref()}"
+        where_pred, having_pred = self._split_where_having()
+        if where_pred is not None:
+            query = f"{query} WHERE {where_pred.to_sql()}"
         if self.group_by:
-            group_clause = self._format_group_by()
-            query = f"{query} GROUP BY {group_clause}"
+            query = f"{query} GROUP BY {self._format_group_by()}"
+        if having_pred is not None:
+            query = f"{query} HAVING {having_pred.to_sql()}"
+        return self._append_order_limit(query)
 
-        if self.filters and use_having:
-            clause_sql = self.filters.to_sql()
-            query = f"{query} HAVING {clause_sql}"
-
+    def _append_order_limit(self, query: str) -> str:
+        """Append ORDER BY / LIMIT / OFFSET clauses to a query."""
         if self.order_by_keys:
-            order_clause = self._format_order_by()
-            query = f"{query} ORDER BY {order_clause}"
-
+            query = f"{query} ORDER BY {self._format_order_by()}"
         if self.limit is not None:
             query = f"{query} LIMIT {self.limit}"
-            if self.offset:
-                query = f"{query} OFFSET {self.offset}"
-
+        # OFFSET is independent of LIMIT: ``OFFSET n`` alone is valid SQL and
+        # must not be dropped just because there is no row cap.
+        if self.offset:
+            query = f"{query} OFFSET {self.offset}"
         return query
+
+    def _split_where_having(self):
+        """Partition the filter into pre-aggregate WHERE and HAVING predicates.
+
+        A predicate merged from WHERE and HAVING must be split by conjunct:
+        aggregate-bearing conjuncts belong in HAVING, the rest in WHERE.
+        Routing the whole conjunction to one clause produces invalid SQL.
+        """
+        if not self.filters:
+            return None, None
+        if not (self.group_by or self.aggregates):
+            return self.filters, None
+        return self._partition_conjuncts(self.filters)
+
+    def _partition_conjuncts(self, predicate: Expression):
+        """Split top-level conjuncts into (WHERE predicate, HAVING predicate)."""
+        where_terms = []
+        having_terms = []
+        for conjunct in self._split_and(predicate):
+            if self._predicate_uses_aggregates(conjunct):
+                having_terms.append(conjunct)
+            else:
+                where_terms.append(conjunct)
+        return self._join_and(where_terms), self._join_and(having_terms)
+
+    def _split_and(self, predicate: Expression):
+        """Flatten a predicate into its top-level AND conjuncts."""
+        from .expressions import BinaryOp, BinaryOpType
+
+        if isinstance(predicate, BinaryOp) and predicate.op == BinaryOpType.AND:
+            return self._split_and(predicate.left) + self._split_and(predicate.right)
+        return [predicate]
+
+    def _join_and(self, terms):
+        """Recombine conjuncts into one AND expression, or None when empty."""
+        from .expressions import BinaryOp, BinaryOpType
+
+        if not terms:
+            return None
+        result = terms[0]
+        for term in terms[1:]:
+            result = BinaryOp(op=BinaryOpType.AND, left=result, right=term)
+        return result
 
     def _format_columns(self) -> str:
         """Format column list for SQL.
@@ -168,7 +253,7 @@ class PhysicalScan(PhysicalPlanNode):
         """Format table reference for SQL."""
         ref = f'"{self.schema_name}"."{self.table_name}"'
         if self.alias:
-            return f'{ref} AS {self.alias}'
+            return f"{ref} AS {self.alias}"
         return ref
 
     def _format_group_by(self) -> str:
@@ -207,7 +292,14 @@ class PhysicalScan(PhysicalPlanNode):
 
     def _predicate_uses_aggregates(self, expr: Expression) -> bool:
         """Check if predicate references aggregate functions."""
-        from .expressions import FunctionCall, BinaryOp, UnaryOp, InList, BetweenExpression, ColumnRef
+        from .expressions import (
+            FunctionCall,
+            BinaryOp,
+            UnaryOp,
+            InList,
+            BetweenExpression,
+            ColumnRef,
+        )
 
         if isinstance(expr, FunctionCall):
             if expr.is_aggregate:
@@ -218,7 +310,9 @@ class PhysicalScan(PhysicalPlanNode):
             return False
 
         if isinstance(expr, BinaryOp):
-            return self._predicate_uses_aggregates(expr.left) or self._predicate_uses_aggregates(expr.right)
+            return self._predicate_uses_aggregates(
+                expr.left
+            ) or self._predicate_uses_aggregates(expr.right)
 
         if isinstance(expr, UnaryOp):
             return self._predicate_uses_aggregates(expr.operand)
@@ -276,10 +370,29 @@ class PhysicalProjection(PhysicalPlanNode):
         return [self.input]
 
     def execute(self) -> Iterator[pa.RecordBatch]:
-        """Execute projection."""
+        """Execute projection, de-duplicating rows when SELECT DISTINCT."""
+        if not self.distinct:
+            for batch in self.input.execute():
+                yield self._project_batch(batch)
+            return
+        yield from self._execute_distinct()
+
+    def _execute_distinct(self) -> Iterator[pa.RecordBatch]:
+        """Project all input, then emit only distinct rows.
+
+        Local DISTINCT used to be a no-op (the flag was decorative), so a
+        query executed locally returned duplicates; grouping by every output
+        column collapses them while preserving each column's type.
+        """
+        batches = []
         for batch in self.input.execute():
-            projected = self._project_batch(batch)
-            yield projected
+            batches.append(self._project_batch(batch))
+        if len(batches) == 0:
+            return
+        table = pa.Table.from_batches(batches)
+        deduped = table.group_by(table.column_names).aggregate([])
+        for batch in deduped.select(table.column_names).to_batches():
+            yield batch
 
     def _project_batch(self, batch: pa.RecordBatch) -> pa.RecordBatch:
         """Project a single batch."""
@@ -308,7 +421,10 @@ class PhysicalProjection(PhysicalPlanNode):
 
     def _evaluate_expression(self, expr: Expression, batch: pa.RecordBatch) -> pa.Array:
         """Evaluate expression on batch."""
-        raise NotImplementedError(f"Expression evaluation not yet implemented for {type(expr)}")
+        from ..executor.expression_evaluator import ExpressionEvaluator
+
+        evaluator = ExpressionEvaluator(batch, alias_map=self.column_aliases())
+        return evaluator.evaluate(expr)
 
     def schema(self) -> pa.Schema:
         """Get output schema."""
@@ -328,9 +444,21 @@ class PhysicalProjection(PhysicalPlanNode):
                     new_field = pa.field(self.output_names[i], field.type)
                     fields.append(new_field)
             else:
-                raise NotImplementedError(f"Schema inference not implemented for {type(expr)}")
+                inferred = self._infer_expression_type(expr, input_schema)
+                fields.append(pa.field(self.output_names[i], inferred))
 
         return pa.schema(fields)
+
+    def _infer_expression_type(
+        self, expr: Expression, input_schema: pa.Schema
+    ) -> pa.DataType:
+        """Infer a computed expression's Arrow type by evaluating it
+        against an empty batch with the input schema."""
+        from ..executor.expression_evaluator import ExpressionEvaluator
+
+        empty_batch = pa.RecordBatch.from_pylist([], schema=input_schema)
+        evaluator = ExpressionEvaluator(empty_batch, alias_map=self.column_aliases())
+        return evaluator.evaluate(expr).type
 
     def estimated_cost(self) -> float:
         # Cost is input cost + projection cost
@@ -343,7 +471,7 @@ class PhysicalProjection(PhysicalPlanNode):
         self,
         expr: Expression,
         batch: pa.RecordBatch,
-        alias_map: Dict[Tuple[Optional[str], str], str]
+        alias_map: Dict[Tuple[Optional[str], str], str],
     ) -> pa.Array:
         """Resolve column, including alias fallbacks."""
         from .expressions import ColumnRef
@@ -367,9 +495,7 @@ class PhysicalProjection(PhysicalPlanNode):
             return batch.column(mapped)
 
     def _lookup_alias(
-        self,
-        expr: Expression,
-        alias_map: Dict[Tuple[Optional[str], str], str]
+        self, expr: Expression, alias_map: Dict[Tuple[Optional[str], str], str]
     ) -> Optional[str]:
         from .expressions import ColumnRef
 
@@ -408,51 +534,10 @@ class PhysicalFilter(PhysicalPlanNode):
 
     def _evaluate_predicate(self, batch: pa.RecordBatch) -> pa.Array:
         """Evaluate predicate on batch and return boolean mask."""
-        import pyarrow.compute as pc
-        from .expressions import BinaryOp, BinaryOpType, ColumnRef, Literal
+        from ..executor.expression_evaluator import ExpressionEvaluator
 
-        if isinstance(self.predicate, BinaryOp):
-            return self._evaluate_binary_op(self.predicate, batch)
-
-        raise NotImplementedError(f"Filter evaluation not implemented for {type(self.predicate)}")
-
-    def _evaluate_binary_op(self, op: "BinaryOp", batch: pa.RecordBatch) -> pa.Array:
-        """Evaluate binary operation."""
-        import pyarrow.compute as pc
-        from .expressions import BinaryOpType, ColumnRef, Literal
-
-        left_val = self._evaluate_value(op.left, batch)
-        right_val = self._evaluate_value(op.right, batch)
-
-        op_map = {
-            BinaryOpType.EQ: pc.equal,
-            BinaryOpType.NEQ: pc.not_equal,
-            BinaryOpType.LT: pc.less,
-            BinaryOpType.LTE: pc.less_equal,
-            BinaryOpType.GT: pc.greater,
-            BinaryOpType.GTE: pc.greater_equal,
-            BinaryOpType.AND: pc.and_,
-            BinaryOpType.OR: pc.or_,
-        }
-
-        compute_func = op_map.get(op.op)
-        if compute_func is None:
-            raise NotImplementedError(f"Operator {op.op} not supported in filter")
-
-        return compute_func(left_val, right_val)
-
-    def _evaluate_value(self, expr: Expression, batch: pa.RecordBatch):
-        """Evaluate an expression to a value."""
-        from .expressions import ColumnRef, Literal, BinaryOp
-
-        if isinstance(expr, ColumnRef):
-            return batch.column(expr.column)
-        if isinstance(expr, Literal):
-            return pa.scalar(expr.value)
-        if isinstance(expr, BinaryOp):
-            return self._evaluate_binary_op(expr, batch)
-
-        raise NotImplementedError(f"Value evaluation not implemented for {type(expr)}")
+        evaluator = ExpressionEvaluator(batch, alias_map=self.column_aliases())
+        return evaluator.evaluate(self.predicate)
 
     def schema(self) -> pa.Schema:
         return self.input.schema()
@@ -486,6 +571,11 @@ class PhysicalHashJoin(PhysicalPlanNode):
         from collections import defaultdict
         from .expressions import ColumnRef
 
+        if self.join_type in (JoinType.SEMI, JoinType.ANTI):
+            for batch in self._execute_semi_anti():
+                yield batch
+            return
+
         if self.build_side == "right":
             build_node = self.right
             probe_node = self.left
@@ -508,14 +598,17 @@ class PhysicalHashJoin(PhysicalPlanNode):
             key_values = self._extract_key_values(batch, build_keys)
 
             for row_idx in range(batch.num_rows):
-                key = tuple(val[row_idx].as_py() for val in key_values)
-                hash_table[key].append((len(build_batches) - 1, row_idx))
+                key = _row_key_tuple(key_values, row_idx)
+                # SQL equality never matches NULL keys, so rows with a NULL
+                # key component are not indexed for matching.
+                if None not in key:
+                    hash_table[key].append((len(build_batches) - 1, row_idx))
 
-        if len(hash_table) == 0:
+        if len(build_batches) == 0:
             need_probe_outer = (
-                (self.join_type == JoinType.LEFT and probe_is_left) or
-                (self.join_type == JoinType.RIGHT and not probe_is_left) or
-                (self.join_type == JoinType.FULL)
+                (self.join_type == JoinType.LEFT and probe_is_left)
+                or (self.join_type == JoinType.RIGHT and not probe_is_left)
+                or (self.join_type == JoinType.FULL)
             )
             if need_probe_outer:
                 for batch in probe_node.execute():
@@ -529,9 +622,10 @@ class PhysicalHashJoin(PhysicalPlanNode):
             probe_key_values = self._extract_key_values(probe_batch, probe_keys)
 
             for probe_row_idx in range(probe_batch.num_rows):
-                probe_key = tuple(val[probe_row_idx].as_py() for val in probe_key_values)
+                probe_key = _row_key_tuple(probe_key_values, probe_row_idx)
 
-                if probe_key in hash_table:
+                # A NULL key component can never satisfy SQL equality.
+                if None not in probe_key and probe_key in hash_table:
                     build_rows = hash_table[probe_key]
                     for build_batch_idx, build_row_idx in build_rows:
                         build_batch = build_batches[build_batch_idx]
@@ -542,29 +636,37 @@ class PhysicalHashJoin(PhysicalPlanNode):
                         yield joined
                 else:
                     need_probe_outer = (
-                        (self.join_type == JoinType.LEFT and probe_is_left) or
-                        (self.join_type == JoinType.RIGHT and not probe_is_left) or
-                        (self.join_type == JoinType.FULL)
+                        (self.join_type == JoinType.LEFT and probe_is_left)
+                        or (self.join_type == JoinType.RIGHT and not probe_is_left)
+                        or (self.join_type == JoinType.FULL)
                     )
                     if need_probe_outer:
                         if probe_is_left:
-                            yield self._create_left_outer_row(probe_batch, probe_row_idx)
+                            yield self._create_left_outer_row(
+                                probe_batch, probe_row_idx
+                            )
                         else:
-                            yield self._create_right_outer_row(probe_batch, probe_row_idx)
+                            yield self._create_right_outer_row(
+                                probe_batch, probe_row_idx
+                            )
 
         need_build_outer = (
-            (self.join_type == JoinType.RIGHT and probe_is_left) or
-            (self.join_type == JoinType.LEFT and not probe_is_left) or
-            (self.join_type == JoinType.FULL)
+            (self.join_type == JoinType.RIGHT and probe_is_left)
+            or (self.join_type == JoinType.LEFT and not probe_is_left)
+            or (self.join_type == JoinType.FULL)
         )
         if need_build_outer:
             for build_batch_idx, build_batch in enumerate(build_batches):
                 for build_row_idx in range(build_batch.num_rows):
                     if (build_batch_idx, build_row_idx) not in matched_build_rows:
                         if probe_is_left:
-                            yield self._create_right_outer_row(build_batch, build_row_idx)
+                            yield self._create_right_outer_row(
+                                build_batch, build_row_idx
+                            )
                         else:
-                            yield self._create_left_outer_row_from_batch(build_batch, build_row_idx)
+                            yield self._create_left_outer_row_from_batch(
+                                build_batch, build_row_idx
+                            )
 
     def _extract_key_values(
         self, batch: pa.RecordBatch, keys: List[Expression]
@@ -577,9 +679,34 @@ class PhysicalHashJoin(PhysicalPlanNode):
             if isinstance(key, ColumnRef):
                 key_arrays.append(batch.column(key.column))
             else:
-                raise NotImplementedError(f"Key extraction not implemented for {type(key)}")
+                raise NotImplementedError(
+                    f"Key extraction not implemented for {type(key)}"
+                )
 
         return key_arrays
+
+    def _execute_semi_anti(self) -> Iterator[pa.RecordBatch]:
+        """Execute SEMI or ANTI hash join."""
+        from collections import defaultdict
+
+        hash_table = defaultdict(bool)
+        for batch in self.right.execute():
+            key_values = self._extract_key_values(batch, self.right_keys)
+            for row_idx in range(batch.num_rows):
+                key = _row_key_tuple(key_values, row_idx)
+                # SQL equality never matches NULL keys.
+                if None not in key:
+                    hash_table[key] = True
+
+        for left_batch in self.left.execute():
+            left_keys = self._extract_key_values(left_batch, self.left_keys)
+            for left_idx in range(left_batch.num_rows):
+                key = _row_key_tuple(left_keys, left_idx)
+                match = None not in key and key in hash_table
+                if self.join_type == JoinType.SEMI and match:
+                    yield self._left_row_batch(left_batch, left_idx)
+                if self.join_type == JoinType.ANTI and not match:
+                    yield self._left_row_batch(left_batch, left_idx)
 
     def _join_rows(
         self,
@@ -742,6 +869,23 @@ class PhysicalHashJoin(PhysicalPlanNode):
 
         return pa.RecordBatch.from_arrays(arrays, names=names)
 
+    def _left_row_batch(
+        self,
+        batch: pa.RecordBatch,
+        row_idx: int,
+    ) -> pa.RecordBatch:
+        """Create single-row batch with only left columns."""
+        arrays = []
+        names = []
+        for i in range(batch.num_columns):
+            col = batch.column(i)
+            field = batch.schema.field(i)
+            scalar_val = col[row_idx]
+            arr = pa.array([scalar_val.as_py()], type=field.type)
+            arrays.append(arr)
+            names.append(field.name)
+        return pa.RecordBatch.from_arrays(arrays, names=names)
+
     def schema(self) -> pa.Schema:
         """Combine schemas from both sides."""
         left_schema = self.left.schema()
@@ -762,6 +906,10 @@ class PhysicalHashJoin(PhysicalPlanNode):
             names.append(name)
 
         return pa.schema(fields)
+
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        """Map qualified columns to their (possibly renamed) output names."""
+        return _join_output_aliases(self.left, self.right)
 
     def estimated_cost(self) -> float:
         raise NotImplementedError("Cost estimation not yet implemented")
@@ -787,7 +935,9 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
     order_by_ascending: Optional[List[bool]] = None
     order_by_nulls: Optional[List[Optional[str]]] = None
     _schema: Optional[pa.Schema] = None
-    _column_alias_map: Dict[Tuple[Optional[str], str], str] = field(default_factory=dict, init=False)
+    _column_alias_map: Dict[Tuple[Optional[str], str], str] = field(
+        default_factory=dict, init=False
+    )
 
     def children(self) -> List[PhysicalPlanNode]:
         return []
@@ -908,11 +1058,7 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
         return ", ".join(parts)
 
     def _append_select_items(
-        self,
-        scan: PhysicalScan,
-        items: List[str],
-        seen: Set[str],
-        is_right: bool
+        self, scan: PhysicalScan, items: List[str], seen: Set[str], is_right: bool
     ) -> None:
         columns = self._resolve_columns(scan)
         alias = self._scan_alias(scan)
@@ -935,12 +1081,7 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
     def _format_column(self, alias: str, column: str) -> str:
         return f'{alias}."{column}"'
 
-    def _select_output_name(
-        self,
-        column: str,
-        seen: Set[str],
-        is_right: bool
-    ) -> str:
+    def _select_output_name(self, column: str, seen: Set[str], is_right: bool) -> str:
         name = column
         if is_right and name in seen:
             name = f"right_{name}"
@@ -955,22 +1096,30 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
         return scan.table_name
 
     def _build_source(self, scan: PhysicalScan) -> str:
-        """Build FROM source for a scan, applying side-local filters."""
+        """Build a FROM source for a scan, applying side-local filters.
+
+        A side filter may be written against the join alias (``p.category``).
+        The alias must therefore be applied to the table INSIDE the derived
+        table as well, since the outer alias is not in scope within the
+        subquery — otherwise the remote engine raises a binder error.
+        """
         table_ref = f'"{scan.schema_name}"."{scan.table_name}"'
-        source_sql = table_ref
-        if scan.filters:
-            filter_sql = scan.filters.to_sql()
-            source_sql = f"(SELECT * FROM {table_ref} WHERE {filter_sql})"
         alias = scan.alias if scan.alias else scan.table_name
+        if not scan.filters:
+            return self._aliased(table_ref, alias)
+        inner = self._aliased(table_ref, alias)
+        filter_sql = scan.filters.to_sql()
+        derived = f"(SELECT * FROM {inner} WHERE {filter_sql})"
+        return self._aliased(derived, alias)
+
+    def _aliased(self, source: str, alias: Optional[str]) -> str:
+        """Append an ``AS alias`` suffix when an alias is present."""
         if alias:
-            return f"{source_sql} AS {alias}"
-        return source_sql
+            return f"{source} AS {alias}"
+        return source
 
     def _register_column_alias(
-        self,
-        scan: PhysicalScan,
-        column: str,
-        output: str
+        self, scan: PhysicalScan, column: str, output: str
     ) -> None:
         identifiers = set()
         if scan.alias:
@@ -1005,6 +1154,11 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
     def execute(self) -> Iterator[pa.RecordBatch]:
         """Execute nested loop join."""
         import pyarrow.compute as pc
+
+        if self.join_type in (JoinType.SEMI, JoinType.ANTI):
+            for batch in self._execute_semi_anti():
+                yield batch
+            return
 
         right_batches = []
         for batch in self.right.execute():
@@ -1042,6 +1196,28 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
                     if (right_batch_idx, right_row_idx) not in matched_right_rows:
                         yield self._create_right_outer_row(right_batch, right_row_idx)
 
+    def _execute_semi_anti(self) -> Iterator[pa.RecordBatch]:
+        """Execute SEMI or ANTI nested loop join."""
+        for left_batch in self.left.execute():
+            for left_row_idx in range(left_batch.num_rows):
+                matched = False
+                for right_batch in self.right.execute():
+                    for right_row_idx in range(right_batch.num_rows):
+                        if self.condition is None or self._evaluate_condition(
+                            left_batch,
+                            left_row_idx,
+                            right_batch,
+                            right_row_idx,
+                        ):
+                            matched = True
+                            break
+                    if matched:
+                        break
+                if self.join_type == JoinType.SEMI and matched:
+                    yield self._left_row_batch(left_batch, left_row_idx)
+                if self.join_type == JoinType.ANTI and not matched:
+                    yield self._left_row_batch(left_batch, left_row_idx)
+
     def _evaluate_condition(
         self,
         left_batch: pa.RecordBatch,
@@ -1065,33 +1241,10 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
         self, expr: Expression, batch: pa.RecordBatch
     ) -> pa.Array:
         """Evaluate expression on a batch."""
-        from .expressions import BinaryOp, BinaryOpType, ColumnRef, Literal
-        import pyarrow.compute as pc
+        from ..executor.expression_evaluator import ExpressionEvaluator
 
-        if isinstance(expr, ColumnRef):
-            return batch.column(expr.column)
-        if isinstance(expr, Literal):
-            return pa.array([expr.value])
-        if isinstance(expr, BinaryOp):
-            left_val = self._evaluate_expression_on_batch(expr.left, batch)
-            right_val = self._evaluate_expression_on_batch(expr.right, batch)
-
-            op_map = {
-                BinaryOpType.EQ: pc.equal,
-                BinaryOpType.NEQ: pc.not_equal,
-                BinaryOpType.LT: pc.less,
-                BinaryOpType.LTE: pc.less_equal,
-                BinaryOpType.GT: pc.greater,
-                BinaryOpType.GTE: pc.greater_equal,
-                BinaryOpType.AND: pc.and_,
-                BinaryOpType.OR: pc.or_,
-            }
-
-            compute_func = op_map.get(expr.op)
-            if compute_func:
-                return compute_func(left_val, right_val)
-
-        raise NotImplementedError(f"Expression evaluation not implemented for {type(expr)}")
+        evaluator = ExpressionEvaluator(batch)
+        return evaluator.evaluate(expr)
 
     def _join_rows(
         self,
@@ -1205,6 +1358,23 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
 
         return pa.RecordBatch.from_arrays(arrays, names=names)
 
+    def _left_row_batch(
+        self,
+        batch: pa.RecordBatch,
+        row_idx: int,
+    ) -> pa.RecordBatch:
+        """Create single-row batch with only left columns."""
+        arrays = []
+        names = []
+        for i in range(batch.num_columns):
+            col = batch.column(i)
+            field = batch.schema.field(i)
+            scalar_val = col[row_idx]
+            arr = pa.array([scalar_val.as_py()], type=field.type)
+            arrays.append(arr)
+            names.append(field.name)
+        return pa.RecordBatch.from_arrays(arrays, names=names)
+
     def schema(self) -> pa.Schema:
         """Combine schemas from both sides."""
         left_schema = self.left.schema()
@@ -1226,11 +1396,32 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
 
         return pa.schema(fields)
 
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        """Map qualified columns to their (possibly renamed) output names."""
+        return _join_output_aliases(self.left, self.right)
+
     def estimated_cost(self) -> float:
         raise NotImplementedError("Cost estimation not yet implemented")
 
     def __repr__(self) -> str:
         return f"PhysicalNestedLoopJoin({self.join_type.value})"
+
+    def _left_row_batch(
+        self,
+        batch: pa.RecordBatch,
+        row_idx: int,
+    ) -> pa.RecordBatch:
+        """Create single-row batch with only left columns."""
+        arrays = []
+        names = []
+        for i in range(batch.num_columns):
+            col = batch.column(i)
+            field = batch.schema.field(i)
+            scalar_val = col[row_idx]
+            arr = pa.array([scalar_val.as_py()], type=field.type)
+            arrays.append(arr)
+            names.append(field.name)
+        return pa.RecordBatch.from_arrays(arrays, names=names)
 
 
 @dataclass
@@ -1291,7 +1482,15 @@ class PhysicalHashAggregate(PhysicalPlanNode):
 
         if isinstance(expr, FunctionCall) and expr.is_aggregate:
             func_name = expr.function_name.upper()
-            return {"type": func_name, "count": 0, "sum": 0, "min": None, "max": None}
+            return {
+                "type": func_name,
+                "count": 0,
+                "sum": 0,
+                "min": None,
+                "max": None,
+                "distinct": expr.distinct,
+                "seen": set(),
+            }
 
         return {"type": "VALUE", "value": None}
 
@@ -1322,7 +1521,9 @@ class PhysicalHashAggregate(PhysicalPlanNode):
             value = self._extract_value_from_row(batch, row_idx, expr)
             self._update_accumulator(accumulator[i], value)
 
-    def _extract_value_from_row(self, batch: pa.RecordBatch, row_idx: int, expr: Expression):
+    def _extract_value_from_row(
+        self, batch: pa.RecordBatch, row_idx: int, expr: Expression
+    ):
         """Extract value for an expression from a row."""
         from .expressions import ColumnRef, FunctionCall
 
@@ -1338,7 +1539,19 @@ class PhysicalHashAggregate(PhysicalPlanNode):
             arg = expr.args[0]
             return self._extract_value_from_row(batch, row_idx, arg)
 
-        return None
+        return self._evaluate_scalar(batch, row_idx, expr)
+
+    def _evaluate_scalar(self, batch: pa.RecordBatch, row_idx: int, expr: Expression):
+        """Evaluate a non-trivial aggregate argument (e.g. ``price * qty``).
+
+        Computing it through the shared evaluator avoids silently dropping
+        the value to None, which would corrupt SUM/AVG over expressions.
+        """
+        from ..executor.expression_evaluator import ExpressionEvaluator
+
+        row = batch.slice(row_idx, 1)
+        result = ExpressionEvaluator(row).evaluate(expr)
+        return result[0].as_py()
 
     def _update_accumulator(self, acc: dict, value):
         """Update accumulator with a value."""
@@ -1348,8 +1561,13 @@ class PhysicalHashAggregate(PhysicalPlanNode):
             acc["value"] = value
             return
 
+        if not self._distinct_admits(acc, value):
+            return
+
         if acc_type == "COUNT":
-            acc["count"] += 1
+            # SQL COUNT skips NULLs; COUNT(*) always accumulates a literal 1.
+            if value is not None:
+                acc["count"] += 1
             return
 
         if value is None:
@@ -1357,19 +1575,36 @@ class PhysicalHashAggregate(PhysicalPlanNode):
 
         self._update_numeric_accumulator(acc, value, acc_type)
 
+    def _distinct_admits(self, acc: dict, value) -> bool:
+        """For a DISTINCT aggregate, accept each non-NULL value only once.
+
+        NULLs are passed through here and dropped by the per-aggregate NULL
+        handling, matching SQL's exclusion of NULLs from DISTINCT aggregates.
+        """
+        if not acc.get("distinct"):
+            return True
+        if value is None:
+            return True
+        if value in acc["seen"]:
+            return False
+        acc["seen"].add(value)
+        return True
+
     def _update_numeric_accumulator(self, acc: dict, value, acc_type: str):
-        """Update numeric accumulator (SUM, AVG, MIN, MAX)."""
+        """Update a SUM/AVG (numeric) or MIN/MAX (any comparable) accumulator.
+
+        MIN/MAX keep the value's native type so string columns (``MIN(status)``)
+        compare correctly; SUM keeps integer inputs integral rather than
+        forcing float64.
+        """
         acc["count"] += 1
-        numeric_val = float(value) if value is not None else 0
-
         if acc_type in ("SUM", "AVG"):
-            acc["sum"] += numeric_val
-
+            acc["sum"] += value
         if acc_type in ("MIN", "MAX"):
-            self._update_min_max(acc, numeric_val, acc_type)
+            self._update_min_max(acc, value, acc_type)
 
-    def _update_min_max(self, acc: dict, value: float, acc_type: str):
-        """Update min/max accumulator."""
+    def _update_min_max(self, acc: dict, value, acc_type: str):
+        """Update min/max accumulator over natively comparable values."""
         if acc["min"] is None:
             acc["min"] = value
             acc["max"] = value
@@ -1381,6 +1616,10 @@ class PhysicalHashAggregate(PhysicalPlanNode):
 
     def _finalize_aggregates(self, hash_table: dict) -> pa.RecordBatch:
         """Convert hash table to record batch."""
+        if len(hash_table) == 0 and len(self.group_by) == 0:
+            # SQL: a global aggregate over empty input yields exactly one
+            # row (COUNT = 0, other aggregates NULL).
+            hash_table[()] = self._create_accumulator()
         if len(hash_table) == 0:
             return self._create_empty_batch()
 
@@ -1429,7 +1668,10 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         # For now, simple match by column name
         if isinstance(expr, ColumnRef):
             for i, group_expr in enumerate(self.group_by):
-                if isinstance(group_expr, ColumnRef) and group_expr.column == expr.column:
+                if (
+                    isinstance(group_expr, ColumnRef)
+                    and group_expr.column == expr.column
+                ):
                     return i
 
         return None
@@ -1443,7 +1685,8 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         if acc_type == "COUNT":
             return acc["count"]
         if acc_type == "SUM":
-            return acc["sum"]
+            # SQL SUM over zero accumulated values is NULL, not 0.
+            return acc["sum"] if acc["count"] > 0 else None
         if acc_type == "AVG":
             return acc["sum"] / acc["count"] if acc["count"] > 0 else None
         if acc_type == "MIN":
@@ -1451,7 +1694,7 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         if acc_type == "MAX":
             return acc["max"]
 
-        return None
+        raise NotImplementedError(f"Local aggregate function not supported: {acc_type}")
 
     def _create_empty_batch(self) -> pa.RecordBatch:
         """Create empty batch with proper schema."""
@@ -1485,21 +1728,26 @@ class PhysicalHashAggregate(PhysicalPlanNode):
 
     def _compute_result(self, table: pa.Table, groups: dict) -> pa.RecordBatch:
         """Compute aggregate results for all groups."""
+        if len(groups) == 0 and len(self.group_by) == 0:
+            # SQL: a global aggregate over empty input yields one row.
+            groups = {(): []}
         result_rows = []
         for group_key, row_indices in groups.items():
             row = self._compute_group_row(table, group_key, row_indices)
             result_rows.append(row)
         return self._arrays_to_batch(result_rows)
 
-    def _compute_group_row(self, table: pa.Table, group_key: tuple, row_indices: List[int]) -> List:
+    def _compute_group_row(
+        self, table: pa.Table, group_key: tuple, row_indices: List[int]
+    ) -> List:
         """Compute one output row for a single group."""
         from .expressions import ColumnRef, FunctionCall
 
         row_data = []
         for agg_expr in self.aggregates:
             if isinstance(agg_expr, ColumnRef):
-                if len(group_key) > 0:
-                    idx = self._find_group_by_index(agg_expr)
+                idx = self._find_group_by_index(agg_expr)
+                if idx is not None and len(group_key) > 0:
                     row_data.append(group_key[idx])
                 else:
                     row_data.append(None)
@@ -1510,36 +1758,32 @@ class PhysicalHashAggregate(PhysicalPlanNode):
                 row_data.append(None)
         return row_data
 
-    def _find_group_by_index(self, col_ref: "ColumnRef") -> int:
-        """Find the offset of a ColumnRef inside group_by expressions."""
-        from .expressions import ColumnRef
-
-        for idx, group_expr in enumerate(self.group_by):
-            if isinstance(group_expr, ColumnRef) and group_expr.column == col_ref.column:
-                return idx
-        return 0
-
-    def _compute_aggregate(self, table: pa.Table, func: "FunctionCall", row_indices: List[int]):
+    def _compute_aggregate(
+        self, table: pa.Table, func: "FunctionCall", row_indices: List[int]
+    ):
         """Compute an aggregate function using pyarrow compute helpers."""
         import pyarrow.compute as pc
         from .expressions import ColumnRef
 
         func_name = func.function_name.upper()
 
-        if func_name == "COUNT" and (len(func.args) == 0 or getattr(func.args[0], "column", "*") == "*"):
+        if func_name == "COUNT" and (
+            len(func.args) == 0 or getattr(func.args[0], "column", "*") == "*"
+        ):
             return len(row_indices)
 
         if len(func.args) == 0:
             return len(row_indices)
 
-        arg = func.args[0]
-        if not isinstance(arg, ColumnRef):
-            return None
+        if len(row_indices) == 0:
+            # No input rows: COUNT(col) is 0, every other aggregate is NULL.
+            return 0 if func_name == "COUNT" else None
 
-        col_name = arg.column
-        column = table.column(col_name)
+        column = self._aggregate_input_column(table, func.args[0])
         subset = column.take(row_indices)
 
+        if func_name == "COUNT":
+            return len(subset) - subset.null_count
         if func_name == "SUM":
             return pc.sum(subset).as_py()
         if func_name == "AVG":
@@ -1549,7 +1793,21 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         if func_name == "MAX":
             return pc.max(subset).as_py()
 
-        return None
+        raise ValueError(f"Unsupported aggregate function: {func_name}")
+
+    def _aggregate_input_column(self, table: pa.Table, arg: Expression):
+        """Resolve an aggregate's argument to a column, evaluating expressions.
+
+        A non-column argument (``SUM(price * quantity)``) is computed through
+        the shared evaluator rather than silently dropped to None.
+        """
+        from .expressions import ColumnRef
+        from ..executor.expression_evaluator import ExpressionEvaluator
+
+        if isinstance(arg, ColumnRef):
+            return table.column(arg.column)
+        batch = table.combine_chunks().to_batches()[0]
+        return ExpressionEvaluator(batch).evaluate(arg)
 
     def _arrays_to_batch(self, rows: List[List]) -> pa.RecordBatch:
         """Convert list of row data to a RecordBatch with correct names."""
@@ -1578,7 +1836,9 @@ class PhysicalHashAggregate(PhysicalPlanNode):
 
         return pa.schema(fields)
 
-    def _infer_output_type(self, expr: Expression, input_schema: pa.Schema) -> pa.DataType:
+    def _infer_output_type(
+        self, expr: Expression, input_schema: pa.Schema
+    ) -> pa.DataType:
         """Infer output type for an expression."""
         from .expressions import ColumnRef, FunctionCall
 
@@ -1591,7 +1851,9 @@ class PhysicalHashAggregate(PhysicalPlanNode):
 
         return pa.int64()
 
-    def _infer_aggregate_type(self, func: "FunctionCall", input_schema: pa.Schema) -> pa.DataType:
+    def _infer_aggregate_type(
+        self, func: "FunctionCall", input_schema: pa.Schema
+    ) -> pa.DataType:
         """Infer output type for aggregate function."""
         from .expressions import ColumnRef
 
@@ -1603,12 +1865,10 @@ class PhysicalHashAggregate(PhysicalPlanNode):
 
         if func_name == "COUNT":
             return pa.int64()
-        if func_name == "SUM":
-            return arg_type if pa.types.is_integer(arg_type) else pa.float64()
-        if func_name == "AVG":
+        if func_name in ("SUM", "AVG", "MIN", "MAX"):
+            # Numeric accumulators compute in float64; the declared type
+            # must match what execution actually produces.
             return pa.float64()
-        if func_name in ("MIN", "MAX"):
-            return arg_type
 
         return pa.float64()
 
@@ -1629,6 +1889,7 @@ class PhysicalSort(PhysicalPlanNode):
     input: PhysicalPlanNode
     sort_keys: List[Expression]
     ascending: List[bool]
+    nulls_order: Optional[List[Optional[str]]] = None
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
@@ -1650,15 +1911,31 @@ class PhysicalSort(PhysicalPlanNode):
             order = "ascending" if self.ascending[i] else "descending"
             sort_keys.append((col_name, order))
 
-        indices = pa.compute.sort_indices(table, sort_keys=sort_keys)
+        indices = pa.compute.sort_indices(
+            table, sort_keys=sort_keys, null_placement=self._null_placement()
+        )
         sorted_table = table.take(indices)
 
         for batch in sorted_table.to_batches():
             yield batch
 
+    def _null_placement(self) -> str:
+        """NULL placement for the first key, defaulting to Postgres semantics.
+
+        Postgres orders NULLS LAST for ascending and NULLS FIRST for
+        descending unless an explicit ``NULLS FIRST/LAST`` is given.
+        """
+        nulls = self.nulls_order[0] if self.nulls_order else None
+        if nulls == "FIRST":
+            return "at_start"
+        if nulls == "LAST":
+            return "at_end"
+        return "at_end" if self.ascending[0] else "at_start"
+
     def _extract_column_name(self, expr: Expression) -> str:
         """Extract column name from expression."""
         from .expressions import ColumnRef
+
         if isinstance(expr, ColumnRef):
             return expr.column
         raise NotImplementedError(
@@ -1680,41 +1957,46 @@ class PhysicalSort(PhysicalPlanNode):
 
 @dataclass
 class PhysicalLimit(PhysicalPlanNode):
-    """Limit rows."""
+    """Limit rows. ``limit`` is None for an OFFSET with no row cap."""
 
     input: PhysicalPlanNode
-    limit: int
+    limit: Optional[int]
     offset: int = 0
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
 
     def execute(self) -> Iterator[pa.RecordBatch]:
-        """Execute limit."""
+        """Execute limit, skipping the offset then capping at the limit."""
         rows_emitted = 0
         rows_skipped = 0
-
         for batch in self.input.execute():
-            batch_size = batch.num_rows
+            batch, rows_skipped = self._skip_offset(batch, rows_skipped)
+            if batch.num_rows == 0 or self._limit_reached(rows_emitted):
+                continue
+            out = self._take(batch, rows_emitted)
+            rows_emitted += out.num_rows
+            yield out
 
-            if rows_skipped < self.offset:
-                skip_count = min(self.offset - rows_skipped, batch_size)
-                rows_skipped += skip_count
-                if rows_skipped < self.offset:
-                    continue
-                batch = batch.slice(skip_count)
+    def _skip_offset(self, batch: pa.RecordBatch, rows_skipped: int):
+        """Drop leading rows until the offset has been consumed."""
+        if rows_skipped >= self.offset:
+            return batch, rows_skipped
+        skip = min(self.offset - rows_skipped, batch.num_rows)
+        return batch.slice(skip), rows_skipped + skip
 
-            if rows_emitted >= self.limit:
-                break
+    def _limit_reached(self, rows_emitted: int) -> bool:
+        """True once the row cap (if any) has been met."""
+        return self.limit is not None and rows_emitted >= self.limit
 
-            remaining = self.limit - rows_emitted
-            if batch.num_rows <= remaining:
-                yield batch
-                rows_emitted += batch.num_rows
-            else:
-                yield batch.slice(0, remaining)
-                rows_emitted += remaining
-                break
+    def _take(self, batch: pa.RecordBatch, rows_emitted: int) -> pa.RecordBatch:
+        """Slice a batch down to the remaining row allowance."""
+        if self.limit is None:
+            return batch
+        remaining = self.limit - rows_emitted
+        if batch.num_rows <= remaining:
+            return batch
+        return batch.slice(0, remaining)
 
     def schema(self) -> pa.Schema:
         return self.input.schema()
@@ -1724,6 +2006,243 @@ class PhysicalLimit(PhysicalPlanNode):
 
     def __repr__(self) -> str:
         return f"PhysicalLimit({self.limit})"
+
+
+class CardinalityViolationError(Exception):
+    """Raised when a scalar subquery produces more than one row."""
+
+
+@dataclass
+class PhysicalValues(PhysicalPlanNode):
+    """Emits in-memory rows built from constant expressions.
+
+    Used for FROM-less SELECTs such as ``SELECT 42``: each row is a list of
+    expressions evaluated without any input columns.
+    """
+
+    rows: List[List[Expression]]
+    output_names: List[str]
+
+    def children(self) -> List[PhysicalPlanNode]:
+        return []
+
+    def execute(self) -> Iterator[pa.RecordBatch]:
+        """Evaluate the constant rows into a single batch."""
+        from ..executor.expression_evaluator import ExpressionEvaluator
+
+        columns = []
+        for column_index in range(len(self.output_names)):
+            values = []
+            for row in self.rows:
+                evaluator = ExpressionEvaluator(_one_row_dummy_batch())
+                values.append(evaluator.evaluate(row[column_index])[0].as_py())
+            columns.append(pa.array(values))
+        yield pa.RecordBatch.from_arrays(columns, names=self.output_names)
+
+    def schema(self) -> pa.Schema:
+        """Infer schema by evaluating the first row."""
+        from ..executor.expression_evaluator import ExpressionEvaluator
+
+        fields = []
+        for column_index in range(len(self.output_names)):
+            evaluator = ExpressionEvaluator(_one_row_dummy_batch())
+            value = evaluator.evaluate(self.rows[0][column_index])
+            fields.append(pa.field(self.output_names[column_index], value.type))
+        return pa.schema(fields)
+
+    def estimated_cost(self) -> float:
+        return 0.0
+
+    def __repr__(self) -> str:
+        return f"PhysicalValues({len(self.rows)} rows)"
+
+
+def _one_row_dummy_batch() -> pa.RecordBatch:
+    """Build a one-row batch so constant expressions broadcast to one row."""
+    return pa.RecordBatch.from_pydict({"__dummy": pa.array([0])})
+
+
+@dataclass
+class PhysicalUnion(PhysicalPlanNode):
+    """Concatenates input streams; optionally removes duplicate rows."""
+
+    inputs: List[PhysicalPlanNode]
+    distinct: bool
+
+    def children(self) -> List[PhysicalPlanNode]:
+        return self.inputs
+
+    def execute(self) -> Iterator[pa.RecordBatch]:
+        """Yield all input batches, deduplicating rows when distinct."""
+        if self.distinct:
+            yield from self._execute_distinct()
+            return
+        for input_node in self.inputs:
+            yield from input_node.execute()
+
+    def _execute_distinct(self) -> Iterator[pa.RecordBatch]:
+        """Yield input batches with duplicate rows removed."""
+        seen_rows: Set[tuple] = set()
+        for input_node in self.inputs:
+            for batch in input_node.execute():
+                deduplicated = self._drop_seen_rows(batch, seen_rows)
+                if deduplicated.num_rows > 0:
+                    yield deduplicated
+
+    def _drop_seen_rows(
+        self, batch: pa.RecordBatch, seen_rows: Set[tuple]
+    ) -> pa.RecordBatch:
+        """Filter out rows whose full tuple was already emitted."""
+        keep_mask = []
+        for row_index in range(batch.num_rows):
+            row = _batch_row_tuple(batch, row_index)
+            if row in seen_rows:
+                keep_mask.append(False)
+            else:
+                seen_rows.add(row)
+                keep_mask.append(True)
+        return batch.filter(pa.array(keep_mask))
+
+    def schema(self) -> pa.Schema:
+        return self.inputs[0].schema()
+
+    def estimated_cost(self) -> float:
+        raise NotImplementedError("Cost estimation not yet implemented")
+
+    def __repr__(self) -> str:
+        kind = "DISTINCT" if self.distinct else "ALL"
+        return f"PhysicalUnion({kind}, {len(self.inputs)} inputs)"
+
+
+def _batch_row_tuple(batch: pa.RecordBatch, row_index: int) -> tuple:
+    """Extract one row of a batch as a hashable Python tuple."""
+    values = []
+    for column_index in range(batch.num_columns):
+        values.append(batch.column(column_index)[row_index].as_py())
+    return tuple(values)
+
+
+@dataclass
+class PhysicalSingleRowGuard(PhysicalPlanNode):
+    """Enforces scalar-subquery cardinality at execution time.
+
+    With no keys, more than one input row in total raises. With keys, a
+    repeated key value raises — this guards decorrelated correlated scalar
+    subqueries, where each key admits at most one row.
+    """
+
+    input: PhysicalPlanNode
+    keys: List[Expression]
+
+    def children(self) -> List[PhysicalPlanNode]:
+        return [self.input]
+
+    def execute(self) -> Iterator[pa.RecordBatch]:
+        """Stream input batches, raising on any cardinality violation."""
+        seen_keys: Set[tuple] = set()
+        total_rows = 0
+        for batch in self.input.execute():
+            total_rows += batch.num_rows
+            if len(self.keys) == 0 and total_rows > 1:
+                raise CardinalityViolationError(
+                    "Scalar subquery returned more than one row"
+                )
+            if len(self.keys) > 0:
+                self._check_key_uniqueness(batch, seen_keys)
+            yield batch
+
+    def _check_key_uniqueness(
+        self, batch: pa.RecordBatch, seen_keys: Set[tuple]
+    ) -> None:
+        """Raise when a non-NULL guard key value appears more than once.
+
+        A key containing NULL can never satisfy SQL equality, so duplicate
+        NULL-keyed inner rows can never match an outer row and must not be
+        treated as a cardinality violation.
+        """
+        key_arrays = []
+        for key in self.keys:
+            key_arrays.append(batch.column(key.column))
+        for row_index in range(batch.num_rows):
+            self._check_row_key(key_arrays, row_index, seen_keys)
+
+    def _check_row_key(self, key_arrays, row_index: int, seen_keys: Set[tuple]) -> None:
+        """Record one row's key and raise on a repeated non-NULL key."""
+        key_values = []
+        for array in key_arrays:
+            key_values.append(array[row_index].as_py())
+        key = tuple(key_values)
+        if None in key:
+            return
+        if key in seen_keys:
+            raise CardinalityViolationError(
+                "Scalar subquery returned more than one row for a "
+                f"correlation key {key}"
+            )
+        seen_keys.add(key)
+
+    def schema(self) -> pa.Schema:
+        return self.input.schema()
+
+    def estimated_cost(self) -> float:
+        raise NotImplementedError("Cost estimation not yet implemented")
+
+    def __repr__(self) -> str:
+        return f"PhysicalSingleRowGuard(keys={len(self.keys)})"
+
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        return self.input.column_aliases()
+
+
+@dataclass
+class PhysicalGroupedLimit(PhysicalPlanNode):
+    """Emits at most ``limit`` rows per distinct key tuple.
+
+    This implements a correlated subquery LIMIT after decorrelation: the
+    original per-outer-row LIMIT becomes a per-correlation-key limit.
+    """
+
+    input: PhysicalPlanNode
+    keys: List[Expression]
+    limit: int
+
+    def children(self) -> List[PhysicalPlanNode]:
+        return [self.input]
+
+    def execute(self) -> Iterator[pa.RecordBatch]:
+        """Stream input, keeping the first ``limit`` rows of each key."""
+        emitted_counts: Dict[tuple, int] = {}
+        for batch in self.input.execute():
+            filtered = self._limit_batch(batch, emitted_counts)
+            if filtered.num_rows > 0:
+                yield filtered
+
+    def _limit_batch(
+        self, batch: pa.RecordBatch, emitted_counts: Dict[tuple, int]
+    ) -> pa.RecordBatch:
+        """Build the per-key limited slice of one batch."""
+        key_arrays = []
+        for key in self.keys:
+            key_arrays.append(batch.column(key.column))
+        keep_mask = []
+        for row_index in range(batch.num_rows):
+            key_values = []
+            for array in key_arrays:
+                key_values.append(array[row_index].as_py())
+            key = tuple(key_values)
+            count = emitted_counts.get(key, 0)
+            keep_mask.append(count < self.limit)
+            emitted_counts[key] = count + 1
+        return batch.filter(pa.array(keep_mask))
+
+    def schema(self) -> pa.Schema:
+        return self.input.schema()
+
+    def estimated_cost(self) -> float:
+        raise NotImplementedError("Cost estimation not yet implemented")
+
+    def __repr__(self) -> str:
+        return f"PhysicalGroupedLimit(limit={self.limit}, keys={len(self.keys)})"
 
     def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
         return self.input.column_aliases()
@@ -1753,8 +2272,19 @@ class PhysicalExplain(PhysicalPlanNode):
         formatter = _PlanFormatter()
         plan_lines = formatter.format(self.child)
         entries = self._build_query_entries(stringify_queries)
-        document = {"plan": plan_lines, "queries": entries}
+        document = {
+            "plan": plan_lines,
+            "queries": entries,
+            "datasources": self._group_by_datasource(entries),
+        }
         return document
+
+    def _group_by_datasource(self, entries: List[Dict[str, Any]]) -> Dict[str, list]:
+        """Group remote query values by the datasource that runs them."""
+        grouped: Dict[str, list] = {}
+        for entry in entries:
+            grouped.setdefault(entry["datasource_name"], []).append(entry["query"])
+        return grouped
 
     def schema(self) -> pa.Schema:
         return pa.schema([pa.field("plan", pa.string())])
@@ -1869,7 +2399,9 @@ class _PlanFormatter:
         self._append_node_line(node, 0, lines)
         return lines
 
-    def _append_node_line(self, node: PhysicalPlanNode, depth: int, lines: List[str]) -> None:
+    def _append_node_line(
+        self, node: PhysicalPlanNode, depth: int, lines: List[str]
+    ) -> None:
         indent = self._build_indent(depth)
         header = self._build_header(node)
         lines.append(f"{indent}{header}")
@@ -1977,7 +2509,6 @@ class _PlanFormatter:
         return ",".join(buffer)
 
 
-
 class _DatasourceQueryCollector:
     """Collect queries issued by physical plan nodes."""
 
@@ -1987,9 +2518,7 @@ class _DatasourceQueryCollector:
         return snapshots
 
     def _visit(
-        self,
-        node: PhysicalPlanNode,
-        snapshots: List[_DatasourceQuerySnapshot]
+        self, node: PhysicalPlanNode, snapshots: List[_DatasourceQuerySnapshot]
     ) -> None:
         self._record_node(node, snapshots)
         children = node.children()
@@ -1997,9 +2526,7 @@ class _DatasourceQueryCollector:
             self._visit(child, snapshots)
 
     def _record_node(
-        self,
-        node: PhysicalPlanNode,
-        snapshots: List[_DatasourceQuerySnapshot]
+        self, node: PhysicalPlanNode, snapshots: List[_DatasourceQuerySnapshot]
     ) -> None:
         if isinstance(node, PhysicalScan):
             self._record_scan(node, snapshots)
@@ -2007,46 +2534,23 @@ class _DatasourceQueryCollector:
             self._record_remote_join(node, snapshots)
 
     def _record_scan(
-        self,
-        scan: PhysicalScan,
-        snapshots: List[_DatasourceQuerySnapshot]
+        self, scan: PhysicalScan, snapshots: List[_DatasourceQuerySnapshot]
     ) -> None:
         datasource = scan.datasource_connection
         if datasource is None:
             return
         sql = scan._build_query()
         query_ast = datasource.parse_query(sql)
-        self._normalize_count_distinct(query_ast)
         snapshot = _DatasourceQuerySnapshot(scan.datasource, sql, query_ast)
         snapshots.append(snapshot)
 
     def _record_remote_join(
-        self,
-        join: PhysicalRemoteJoin,
-        snapshots: List[_DatasourceQuerySnapshot]
+        self, join: PhysicalRemoteJoin, snapshots: List[_DatasourceQuerySnapshot]
     ) -> None:
         datasource = join.datasource_connection
         if datasource is None:
             return
         sql = join._build_query()
         query_ast = datasource.parse_query(sql)
-        self._normalize_count_distinct(query_ast)
         snapshot = _DatasourceQuerySnapshot(join.left.datasource, sql, query_ast)
         snapshots.append(snapshot)
-
-    def _normalize_count_distinct(self, node: exp.Expression) -> None:
-        """Mark COUNT(DISTINCT ...) nodes with distinct flag for assertions."""
-        if isinstance(node, exp.Count):
-            if isinstance(node.this, exp.Distinct):
-                values = node.this.expressions or []
-                if values:
-                    node.set("this", values[0])
-                node.set("distinct", True)
-        for key, value in list(node.args.items()):
-            if isinstance(value, exp.Expression):
-                self._normalize_count_distinct(value)
-                continue
-            if isinstance(value, list):
-                for child in value:
-                    if isinstance(child, exp.Expression):
-                        self._normalize_count_distinct(child)

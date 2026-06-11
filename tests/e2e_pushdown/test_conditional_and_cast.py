@@ -99,8 +99,11 @@ def test_coalesce_in_where(single_source_env):
 
     left = unwrap_parens(predicate.left)
     assert isinstance(left, exp.Coalesce)
-    coalesce_args = left.expressions
-    assert len(coalesce_args) == 2
+    # sqlglot keeps the first COALESCE argument in `this` and the remaining
+    # arguments in `expressions`, so a two-argument COALESCE has exactly one
+    # trailing expression.
+    assert left.this is not None
+    assert len(left.expressions) == 1
 
     right = unwrap_parens(predicate.right)
     assert isinstance(right, exp.Literal)

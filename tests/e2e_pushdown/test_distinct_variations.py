@@ -118,7 +118,8 @@ def test_distinct_with_aggregation(single_source_env):
     if isinstance(count_expr, exp.Alias):
         count_func = unwrap_parens(count_expr.this)
         assert isinstance(count_func, exp.Count)
-        assert count_func.args.get("distinct") is True
+        # COUNT(DISTINCT x) is Count(this=Distinct(...)) in sqlglot.
+        assert isinstance(count_func.this, exp.Distinct)
 
 
 def test_distinct_with_order_by_not_in_select(single_source_env):
@@ -174,7 +175,7 @@ def test_distinct_with_limit_offset(single_source_env):
 
 
 def test_distinct_star(single_source_env):
-    """Ensures DISTINCT * (all columns) pushes correctly."""
+    """Ensures DISTINCT * expands to explicit columns and stays DISTINCT."""
     runtime = build_runtime(single_source_env)
     sql = "SELECT DISTINCT * FROM duckdb_primary.main.orders"
     ast = explain_datasource_query(runtime, sql)
@@ -182,7 +183,9 @@ def test_distinct_star(single_source_env):
     distinct = ast.args.get("distinct")
     assert distinct is not None
 
+    # SELECT * is expanded before the engine, so the remote DISTINCT query
+    # enumerates every orders column instead of carrying a literal star.
     expressions = ast.expressions
-    assert len(expressions) == 1
-    star_expr = expressions[0]
-    assert isinstance(star_expr, exp.Star)
+    assert len(expressions) == 9
+    for column_expr in expressions:
+        assert isinstance(column_expr, exp.Column)

@@ -6,6 +6,8 @@ This document provides an overview of the codebase structure, key classes, compi
 
 Never fail silently. If something breaks it should throw an error. We don't want silent fails. You can only catch exceptions when we show it to the user in the cli. Otherwise all exceptions should be thrown. 
 
+No legacy / compatibility cruft. This is a system we are building from scratch — there is no legacy code, no old callers, no external API to stay compatible with. Never add "store for compatibility" fields, shim attributes, dead aliases, or back-compat branches. If something is no longer needed, delete it; if an abstraction doesn't fit (e.g. a base attribute that a subclass can't honor), fix the abstraction and its callers, don't paper over it. A comment like "kept for compatibility" is a red flag to remove, not preserve.
+
 Follow Python PEP8
 
 use meaningful names

@@ -242,14 +242,31 @@ GROUP BY c.name
 HAVING SUM(o.amount) > 2000
 ```
 
+**Phase 7: Subquery Decorrelation** ✅
+- ✅ EXISTS / NOT EXISTS → SEMI / ANTI joins
+- ✅ IN / NOT IN → SEMI / ANTI joins with exact NULL semantics (incl. tuple IN)
+- ✅ ANY / SOME / ALL quantified comparisons (incl. LIKE ALL)
+- ✅ Scalar subqueries → LEFT joins with aggregation, COALESCE for COUNT,
+  runtime cardinality guards, per-key limits for correlated LIMIT
+- ✅ Boolean subqueries in SELECT lists (flag columns via SEMI/ANTI unions)
+- ✅ OR-of-subqueries via union expansion; nested subqueries innermost-first
+- ✅ Derived tables and subqueries in INNER join conditions
+- ✅ Scoped subquery binding (correlated references resolved by the binder)
+- ✅ All 116 decorrelation e2e tests passing against PostgreSQL
+
+**Query Example (Phase 7):**
+```sql
+SELECT u.id, u.name,
+       (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) AS order_count
+FROM users u
+WHERE u.country IN (SELECT code FROM countries WHERE enabled)
+  AND EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.amount > 100)
+```
+
 ### Next Phases
-- **Phase 4**: Pre-optimization and expression handling (constant folding, simplification)
-- **Phase 5**: Statistics and cost model
-- **Phase 6**: Logical optimization (predicate pushdown, join reordering)
-- **Phase 7**: Subquery decorrelation
 - **Phase 8**: Physical planning and advanced join strategies
 - **Phase 9**: Parallel execution and memory management
-- **Phase 10**: Advanced SQL features (ORDER BY, window functions, CTEs)
+- **Phase 10**: Advanced SQL features (window functions, CTEs, set operations)
 
 ## Testing
 

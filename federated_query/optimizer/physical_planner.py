@@ -14,6 +14,12 @@ from ..plan.logical import (
     Explain,
     Sort,
     JoinType,
+    CTE,
+    Union,
+    Values,
+    SubqueryScan,
+    SingleRowGuard,
+    GroupedLimit,
 )
 from ..plan.physical import (
     PhysicalPlanNode,
@@ -27,12 +33,27 @@ from ..plan.physical import (
     PhysicalHashAggregate,
     PhysicalExplain,
     PhysicalSort,
+    PhysicalUnion,
+    PhysicalValues,
+    PhysicalSingleRowGuard,
+    PhysicalGroupedLimit,
 )
 from ..plan.expressions import BinaryOp, BinaryOpType, ColumnRef
 from typing import List, Tuple
+from dataclasses import dataclass
 
 if TYPE_CHECKING:
     from ..processor.query_executor import QueryExecutor
+
+
+@dataclass(frozen=True)
+class _JoinSides:
+    """Relation qualifiers and bare column names exposed by each join side."""
+
+    left_aliases: set
+    right_aliases: set
+    left_names: set
+    right_names: set
 
 
 class PhysicalPlanner:
@@ -80,7 +101,34 @@ class PhysicalPlanner:
             return self._plan_aggregate(node)
         if isinstance(node, Explain):
             return self._plan_explain(node)
+        if isinstance(node, CTE):
+            return self._plan_cte(node)
 
+        return self._plan_decorrelation_node(node)
+
+    def _plan_decorrelation_node(self, node: LogicalPlanNode) -> PhysicalPlanNode:
+        """Plan nodes produced by subquery decorrelation."""
+        if isinstance(node, Union):
+            inputs = []
+            for child in node.inputs:
+                inputs.append(self._plan_node(child))
+            return PhysicalUnion(inputs=inputs, distinct=node.distinct)
+        if isinstance(node, Values):
+            return PhysicalValues(rows=node.rows, output_names=node.output_names)
+        if isinstance(node, SubqueryScan):
+            return self._plan_node(node.input)
+        return self._plan_guard_node(node)
+
+    def _plan_guard_node(self, node: LogicalPlanNode) -> PhysicalPlanNode:
+        """Plan cardinality guard and per-key limit nodes."""
+        if isinstance(node, SingleRowGuard):
+            return PhysicalSingleRowGuard(
+                input=self._plan_node(node.input), keys=node.keys
+            )
+        if isinstance(node, GroupedLimit):
+            return PhysicalGroupedLimit(
+                input=self._plan_node(node.input), keys=node.keys, limit=node.limit
+            )
         raise ValueError(f"Unsupported logical plan node: {type(node)}")
 
     def _plan_scan(self, scan: Scan) -> PhysicalScan:
@@ -140,9 +188,7 @@ class PhysicalPlanner:
     def _plan_limit(self, limit: Limit) -> PhysicalLimit:
         """Plan a limit node."""
         input_plan = self._plan_node(limit.input)
-        return PhysicalLimit(
-            input=input_plan, limit=limit.limit, offset=limit.offset
-        )
+        return PhysicalLimit(input=input_plan, limit=limit.limit, offset=limit.offset)
 
     def _plan_sort(self, sort: Sort) -> PhysicalPlanNode:
         """Plan a sort node."""
@@ -164,6 +210,7 @@ class PhysicalPlanner:
             input=input_plan,
             sort_keys=sort.sort_keys,
             ascending=sort.ascending,
+            nulls_order=sort.nulls_order,
         )
 
     def _plan_aggregate(self, aggregate: Aggregate) -> PhysicalPlanNode:
@@ -179,9 +226,7 @@ class PhysicalPlanner:
         )
 
     def _plan_remote_join_aggregate(
-        self,
-        aggregate: Aggregate,
-        remote_join: PhysicalRemoteJoin
+        self, aggregate: Aggregate, remote_join: PhysicalRemoteJoin
     ) -> PhysicalRemoteJoin:
         return PhysicalRemoteJoin(
             left=remote_join.left,
@@ -198,6 +243,13 @@ class PhysicalPlanner:
         """Plan an explain node."""
         child_plan = self._plan_node(explain.input)
         return PhysicalExplain(child=child_plan, format=explain.format)
+
+    def _plan_cte(self, cte: CTE) -> PhysicalPlanNode:
+        """CTE execution is not implemented; fail instead of dropping it."""
+        raise ValueError(
+            f"CTE '{cte.name}' cannot be executed: the physical layer has "
+            "no CTE support yet"
+        )
 
     def _plan_join(self, join: Join) -> PhysicalPlanNode:
         """Plan a join node."""
@@ -218,7 +270,7 @@ class PhysicalPlanner:
 
         join_keys = self._extract_join_keys(join.condition)
         if join_keys:
-            left_keys, right_keys = join_keys
+            left_keys, right_keys = self._orient_join_keys(join_keys, join)
             return PhysicalHashJoin(
                 left=left_plan,
                 right=right_plan,
@@ -235,11 +287,93 @@ class PhysicalPlanner:
             condition=join.condition,
         )
 
-    def _try_plan_remote_join(
+    def _orient_join_keys(
         self,
+        join_keys: Tuple[List[ColumnRef], List[ColumnRef]],
         join: Join,
-        left_plan: PhysicalPlanNode,
-        right_plan: PhysicalPlanNode
+    ) -> Tuple[List[ColumnRef], List[ColumnRef]]:
+        """Assign each equality's columns to the join side that has them.
+
+        Join conditions do not guarantee that the equality's left
+        expression references the join's left input (decorrelated
+        conditions often have the opposite orientation). Each pair is
+        checked against the logical inputs' output column names and
+        swapped when needed; pairs that cannot be placed by name keep
+        their original orientation.
+        """
+        sides = _JoinSides(
+            left_aliases=self._relation_aliases(join.left),
+            right_aliases=self._relation_aliases(join.right),
+            left_names=set(join.left.schema()),
+            right_names=set(join.right.schema()),
+        )
+        left_keys: List[ColumnRef] = []
+        right_keys: List[ColumnRef] = []
+        for index in range(len(join_keys[0])):
+            first, second = self._orient_key_pair(
+                join_keys[0][index], join_keys[1][index], sides
+            )
+            left_keys.append(first)
+            right_keys.append(second)
+        return left_keys, right_keys
+
+    def _orient_key_pair(
+        self,
+        first: ColumnRef,
+        second: ColumnRef,
+        sides: "_JoinSides",
+    ) -> Tuple[ColumnRef, ColumnRef]:
+        """Place one equality's columns onto the (left, right) sides.
+
+        Table qualifiers are authoritative: when both inputs expose the same
+        bare column names, only the alias disambiguates which side a column
+        belongs to. Unqualified columns (e.g. decorrelation-renamed keys)
+        fall back to matching by bare column name.
+        """
+        by_alias = self._orient_by_alias(first, second, sides)
+        if by_alias is not None:
+            return by_alias
+        return self._orient_by_name(first, second, sides)
+
+    def _orient_by_alias(
+        self, first: ColumnRef, second: ColumnRef, sides: "_JoinSides"
+    ) -> Optional[Tuple[ColumnRef, ColumnRef]]:
+        """Orient using the columns' table qualifiers, if both are known."""
+        if first.table in sides.left_aliases and second.table in sides.right_aliases:
+            return first, second
+        if first.table in sides.right_aliases and second.table in sides.left_aliases:
+            return second, first
+        return None
+
+    def _orient_by_name(
+        self, first: ColumnRef, second: ColumnRef, sides: "_JoinSides"
+    ) -> Tuple[ColumnRef, ColumnRef]:
+        """Orient using bare column names when qualifiers do not resolve."""
+        if first.column in sides.left_names and second.column in sides.right_names:
+            return first, second
+        if first.column in sides.right_names and second.column in sides.left_names:
+            return second, first
+        return first, second
+
+    def _relation_aliases(self, plan) -> set:
+        """Collect the relation aliases/names a plan subtree exposes."""
+        aliases: set = set()
+        self._collect_relation_aliases(plan, aliases)
+        return aliases
+
+    def _collect_relation_aliases(self, plan, aliases: set) -> None:
+        """Recursively gather Scan/SubqueryScan qualifiers from a subtree."""
+        if isinstance(plan, Scan):
+            aliases.add(plan.alias if plan.alias else plan.table_name)
+            return
+        if isinstance(plan, SubqueryScan):
+            aliases.add(plan.alias)
+            return
+        for child in plan.children():
+            self._collect_relation_aliases(child, aliases)
+
+    def _try_plan_remote_join(
+        self, join: Join, left_plan: PhysicalPlanNode, right_plan: PhysicalPlanNode
     ) -> Optional[PhysicalPlanNode]:
         if not self._is_remote_join_candidate(join, left_plan, right_plan):
             return None
@@ -250,7 +384,11 @@ class PhysicalPlanner:
             order_keys = left_plan.order_by_keys
             order_asc = left_plan.order_by_ascending
             order_nulls = left_plan.order_by_nulls
-        if isinstance(right_plan, PhysicalScan) and right_plan.order_by_keys and order_keys is None:
+        if (
+            isinstance(right_plan, PhysicalScan)
+            and right_plan.order_by_keys
+            and order_keys is None
+        ):
             order_keys = right_plan.order_by_keys
             order_asc = right_plan.order_by_ascending
             order_nulls = right_plan.order_by_nulls
@@ -266,10 +404,7 @@ class PhysicalPlanner:
         )
 
     def _is_remote_join_candidate(
-        self,
-        join: Join,
-        left_plan: PhysicalPlanNode,
-        right_plan: PhysicalPlanNode
+        self, join: Join, left_plan: PhysicalPlanNode, right_plan: PhysicalPlanNode
     ) -> bool:
         allowed = {JoinType.INNER, JoinType.LEFT, JoinType.RIGHT}
         if join.join_type not in allowed or join.condition is None:

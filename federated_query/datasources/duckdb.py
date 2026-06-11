@@ -123,7 +123,9 @@ class DuckDBDataSource(DataSource):
         row_count = result[0] if result else 0
 
         metadata = self.get_table_metadata(schema, table)
-        column_stats = self._collect_column_statistics(schema, table, metadata, row_count)
+        column_stats = self._collect_column_statistics(
+            schema, table, metadata, row_count
+        )
 
         return TableStatistics(
             row_count=row_count,
@@ -164,21 +166,20 @@ class DuckDBDataSource(DataSource):
         """Execute query and yield Arrow record batches."""
         logger.debug(f"Executing query on {self.name}: {query[:100]}...")
         result = self.connection.execute(query)
-        arrow_table = result.fetch_arrow_table()
+        arrow_table = result.to_arrow_table()
 
         batch_size = 10000
         for batch in arrow_table.to_batches(max_chunksize=batch_size):
             yield batch
 
     def get_query_schema(self, query: str) -> pa.Schema:
-        """Get query schema without executing."""
-        result = self.connection.execute(f"DESCRIBE {query}")
-        rows = result.fetchall()
+        """Get a query's real Arrow schema without materializing rows.
 
-        fields = []
-        for row in rows:
-            col_name = row[0]
-            col_type = row[1]
-            fields.append(pa.field(col_name, pa.string()))
-
-        return pa.schema(fields)
+        Running the query under ``LIMIT 0`` lets DuckDB report the exact
+        column types (int, double, timestamp, ...). Typing every column as
+        string instead — the previous behavior — produced schemas that
+        mismatched the executed data and crashed FULL OUTER joins.
+        """
+        result = self.connection.execute(f"SELECT * FROM ({query}) AS q LIMIT 0")
+        empty_table = result.to_arrow_table()
+        return empty_table.schema

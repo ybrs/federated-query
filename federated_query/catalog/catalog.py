@@ -12,7 +12,9 @@ class Catalog:
     def __init__(self):
         """Initialize catalog."""
         self.datasources: Dict[str, DataSource] = {}
-        self.schemas: Dict[Tuple[str, str], Schema] = {}  # (datasource, schema_name) -> Schema
+        self.schemas: Dict[Tuple[str, str], Schema] = (
+            {}
+        )  # (datasource, schema_name) -> Schema
         self._metadata_loaded = False
 
     def register_datasource(self, datasource: DataSource) -> None:
@@ -29,8 +31,9 @@ class Catalog:
         This discovers all schemas, tables, and columns from each data source.
         """
         for ds_name, datasource in self.datasources.items():
-            # Ensure connection
-            if datasource.connection is None:
+            # Ensure the source is connected (pooled sources have no single
+            # `connection` attribute, so ask the source itself).
+            if not datasource.is_connected():
                 datasource.connect()
 
             # Load schemas
@@ -148,46 +151,60 @@ class Catalog:
         return None
 
     def _map_type(self, type_str: str) -> DataType:
-        """Map database type string to DataType enum.
+        """Map a database type string to a DataType, most specific first.
 
-        Args:
-            type_str: Database type string
-
-        Returns:
-            Mapped DataType
+        Ordering matters: TIMESTAMP/DATETIME must be matched before DATE (else
+        ``DATETIME`` mis-maps to DATE), and integer matching must be word-aware
+        so ``POINT`` (which contains ``INT``) is not read as an integer.
         """
-        type_str = type_str.upper()
+        normalized = type_str.upper().split("(")[0].strip()
+        temporal = self._map_temporal_type(normalized)
+        if temporal is not None:
+            return temporal
+        numeric = self._map_numeric_type(normalized)
+        if numeric is not None:
+            return numeric
+        return self._map_textual_type(normalized)
 
-        # Integer types
-        if "INT" in type_str or "SERIAL" in type_str:
-            if "BIG" in type_str:
-                return DataType.BIGINT
-            return DataType.INTEGER
-
-        # Float types
-        if "FLOAT" in type_str or "REAL" in type_str:
-            return DataType.FLOAT
-        if "DOUBLE" in type_str or "NUMERIC" in type_str or "DECIMAL" in type_str:
-            return DataType.DOUBLE
-
-        # String types
-        if "CHAR" in type_str or "TEXT" in type_str or "STRING" in type_str:
-            if "VAR" in type_str:
-                return DataType.VARCHAR
-            return DataType.TEXT
-
-        # Boolean
-        if "BOOL" in type_str:
-            return DataType.BOOLEAN
-
-        # Date/Time
+    def _map_temporal_type(self, type_str: str) -> Optional[DataType]:
+        """Map date/time types, checking TIMESTAMP/DATETIME before DATE."""
+        if "TIMESTAMP" in type_str or "DATETIME" in type_str:
+            return DataType.TIMESTAMP
         if "DATE" in type_str:
             return DataType.DATE
         if "TIME" in type_str:
             return DataType.TIMESTAMP
+        return None
 
-        # Default
+    def _map_numeric_type(self, type_str: str) -> Optional[DataType]:
+        """Map numeric types; integer match avoids the POINT/INT trap."""
+        if "DOUBLE" in type_str or "NUMERIC" in type_str or "DECIMAL" in type_str:
+            return DataType.DOUBLE
+        if "FLOAT" in type_str or "REAL" in type_str:
+            return DataType.FLOAT
+        if "BIGINT" in type_str or "INT8" in type_str or "BIGSERIAL" in type_str:
+            return DataType.BIGINT
+        if self._is_integer_type(type_str):
+            return DataType.INTEGER
+        return None
+
+    def _is_integer_type(self, type_str: str) -> bool:
+        """Whether a type name denotes an integer (word-aware, not POINT)."""
+        return type_str.startswith("INT") or type_str in (
+            "SMALLINT",
+            "SERIAL",
+            "INTEGER",
+        )
+
+    def _map_textual_type(self, type_str: str) -> DataType:
+        """Map boolean and string types, defaulting unknowns to VARCHAR."""
+        if "BOOL" in type_str:
+            return DataType.BOOLEAN
+        if "CHAR" in type_str or "TEXT" in type_str or "STRING" in type_str:
+            return DataType.VARCHAR if "VAR" in type_str else DataType.TEXT
         return DataType.VARCHAR
 
     def __repr__(self) -> str:
-        return f"Catalog(datasources={len(self.datasources)}, schemas={len(self.schemas)})"
+        return (
+            f"Catalog(datasources={len(self.datasources)}, schemas={len(self.schemas)})"
+        )
