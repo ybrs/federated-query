@@ -314,6 +314,58 @@ class TestUnsupportedOperators:
         results = execute_and_fetch_all(executor, decorrelated_plan)
         assert results == []
 
+    def test_unsupported_negated_quantified_operator(self, catalog, setup_test_data):
+        """
+        Test: an unsupported operator in a negated quantified comparison.
+
+        Input SQL:
+            SELECT name FROM products
+            WHERE NOT (name LIKE ALL(SELECT name FROM products))
+
+        Expected behavior:
+            - LIKE has no single negated binary operator, so pushing the NOT
+              through the quantified comparison (De Morgan) is not possible;
+              decorrelation must raise DecorrelationError instead of silently
+              producing wrong rows.
+        """
+        sql = """
+            SELECT name FROM pg.products
+            WHERE NOT (name LIKE ALL(SELECT name FROM pg.products))
+        """
+
+        parser = Parser()
+        binder = Binder(catalog)
+        decorrelator = Decorrelator()
+
+        bound_plan = binder.bind(parser.parse(sql))
+        with pytest.raises(DecorrelationError, match="negate quantified operator"):
+            decorrelator.decorrelate(bound_plan)
+
+    def test_quantified_comparison_multi_column_subquery(self, catalog, setup_test_data):
+        """
+        Test: a quantified comparison whose subquery returns multiple columns.
+
+        Input SQL:
+            SELECT name FROM products
+            WHERE price = ALL(SELECT name, price FROM products)
+
+        Expected behavior:
+            - A scalar/quantified comparison needs a single-column subquery;
+              a multi-column subquery raises DecorrelationError.
+        """
+        sql = """
+            SELECT name FROM pg.products
+            WHERE price = ALL(SELECT name, price FROM pg.products)
+        """
+
+        parser = Parser()
+        binder = Binder(catalog)
+        decorrelator = Decorrelator()
+
+        bound_plan = binder.bind(parser.parse(sql))
+        with pytest.raises(DecorrelationError, match="must return one column"):
+            decorrelator.decorrelate(bound_plan)
+
 
 class TestEdgeCases:
     """Test edge cases and boundary conditions."""
