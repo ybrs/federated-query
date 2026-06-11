@@ -409,6 +409,10 @@ class ExpressionVisitor(ABC):
     def visit_quantified_comparison(self, expr: "QuantifiedComparison"):
         pass
 
+    @abstractmethod
+    def visit_tuple(self, expr: "TupleExpression"):
+        pass
+
 
 class Quantifier(Enum):
     """Quantifiers for quantified comparisons."""
