@@ -403,10 +403,34 @@ class QueryPreprocessor:
         source: _SelectSource,
         column_name: str,
     ) -> exp.Column:
-        """Create a Column expression bound to a table qualifier."""
+        """Create a Column expression bound to a table qualifier.
+
+        A column whose name is a reserved word (e.g. ``select``) must be
+        quoted, otherwise the rewritten SQL fails to re-parse.
+        """
         table_identifier = exp.to_identifier(source.sql_qualifier)
-        column_identifier = exp.to_identifier(column_name)
+        column_identifier = exp.to_identifier(
+            column_name, quoted=self._is_reserved_word(column_name)
+        )
         return exp.Column(this=column_identifier, table=table_identifier)
+
+    def _is_reserved_word(self, name: str) -> bool:
+        """Whether a bare name must be quoted to survive a re-parse.
+
+        Checked by re-parsing ``SELECT <name>``: a truly reserved word (e.g.
+        ``select``) fails or does not yield a plain column, so it needs
+        quoting; ordinary names like ``name`` parse cleanly and do not.
+        """
+        from sqlglot.errors import ParseError
+
+        try:
+            parsed = sqlglot.parse_one(f"SELECT {name}", dialect=self.dialect)
+        except ParseError:
+            return True
+        selected = parsed.expressions[0] if parsed.expressions else None
+        return not (
+            isinstance(selected, exp.Column) and selected.name.upper() == name.upper()
+        )
 
 
 class StarExpansionProcessor(QueryProcessor):

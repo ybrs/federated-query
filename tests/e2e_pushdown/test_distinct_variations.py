@@ -186,6 +186,6 @@ def test_distinct_star(single_source_env):
     # SELECT * is expanded before the engine, so the remote DISTINCT query
     # enumerates every orders column instead of carrying a literal star.
     expressions = ast.expressions
-    assert len(expressions) == 8
+    assert len(expressions) == 9
     for column_expr in expressions:
         assert isinstance(column_expr, exp.Column)

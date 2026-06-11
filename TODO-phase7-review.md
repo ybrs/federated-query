@@ -10,13 +10,13 @@ inspection.
 
 ## STATUS (updated 2026-06-11, branch `parsing_explain`)
 
-670 passed / 100 failed (from 645/125 baseline); decorrelation suite green;
+675 passed / 95 failed (from 645/125 baseline); decorrelation suite green;
 remaining failures are dominated by **G1–G8** feature work. Verified
 correctness/silent-fail items are checked off. PARTIAL = some sub-cases remain
 (noted inline); DEFERRED = moderate/decision/perf/architectural, none are
 silent corruption (they raise clean errors or are documented deviations).
-Repro harness: `/tmp/fedq_repro/` (POSTGRES_DB=test_db). H8 deferred (reserved
-`select`/case-sensitive `Order_ID` fixture columns). G1–G8 = Phase 8 work.
+Repro harness: `/tmp/fedq_repro/` (POSTGRES_DB=test_db). G1–G8 = Phase 8 work
+(the bulk of the remaining 95 failures).
 
 ## 0. DO FIRST (agreed)
 
@@ -308,8 +308,14 @@ execution. All were failing before Phase 7.
   (sqlglot represents FULL JOIN as side=FULL, kind=OUTER).
 - [x] **H7.** `test_scalar_subquery_not_supported` — stale: scalar subqueries
   now work (DID NOT RAISE).
-- [ ] **H8. (DEFERRED)** Tests query fixture columns that were never created
+- [x] **H8.** Tests query fixture columns that were never created
   (`"select"`, `"order id"`).
+  DONE: added a reserved-word `"select"` column to the orders fixture and
+  taught the preprocessor to quote reserved-word identifiers during star
+  expansion (re-parse check, so `name`/`order` are not over-quoted); the
+  four stale "remote-query shape" tests (spaces/wide/duplicate/aggregate)
+  were corrected to assert the engine's internal-name + local-rename
+  behaviour and the final result columns.
 
 ## Suggested order of attack
 

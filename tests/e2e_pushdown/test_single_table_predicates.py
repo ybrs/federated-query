@@ -21,6 +21,7 @@ ORDERS_COLUMNS = [
     "status",
     "region",
     "created_at",
+    "select",
 ]
 
 

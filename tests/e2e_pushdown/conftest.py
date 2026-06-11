@@ -62,23 +62,24 @@ def _seed_orders(cursor) -> None:
             price DOUBLE,
             status VARCHAR,
             region VARCHAR,
-            created_at TIMESTAMP
+            created_at TIMESTAMP,
+            "select" INTEGER
         )
         """
     )
     cursor.execute(
         """
         INSERT INTO orders VALUES
-        (1, 101, 1, 3, 25.0, 'processing', 'NA', TIMESTAMP '2024-01-05 09:00:00'),
-        (2, 102, 2, 5, 50.0, 'shipped', 'EU', TIMESTAMP '2024-02-10 12:30:00'),
-        (3, 103, 3, 2, 75.0, 'processing', 'APAC', TIMESTAMP '2024-02-20 08:15:00'),
-        (4, 104, 4, 1, 125.0, 'returned', 'NA', TIMESTAMP '2024-03-01 17:45:00'),
-        (5, 101, 5, 4, 60.0, 'processing', 'EU', TIMESTAMP '2024-03-15 11:00:00'),
-        (6, 102, 1, 7, 35.0, 'processing', 'NA', TIMESTAMP '2024-04-02 14:20:00'),
-        (7, 103, 2, 3, 90.0, 'cancelled', 'APAC', TIMESTAMP '2024-04-18 10:05:00'),
-        (8, 104, 3, 6, 15.0, 'shipped', 'EU', TIMESTAMP '2024-05-09 16:40:00'),
-        (9, 105, 4, 9, 10.0, 'processing', 'NA', TIMESTAMP '2024-05-22 07:55:00'),
-        (10, 106, 5, 8, 200.0, 'processing', 'EU', TIMESTAMP '2024-06-01 13:10:00')
+        (1, 101, 1, 3, 25.0, 'processing', 'NA', TIMESTAMP '2024-01-05 09:00:00', 0),
+        (2, 102, 2, 5, 50.0, 'shipped', 'EU', TIMESTAMP '2024-02-10 12:30:00', 1),
+        (3, 103, 3, 2, 75.0, 'processing', 'APAC', TIMESTAMP '2024-02-20 08:15:00', 0),
+        (4, 104, 4, 1, 125.0, 'returned', 'NA', TIMESTAMP '2024-03-01 17:45:00', 1),
+        (5, 101, 5, 4, 60.0, 'processing', 'EU', TIMESTAMP '2024-03-15 11:00:00', 0),
+        (6, 102, 1, 7, 35.0, 'processing', 'NA', TIMESTAMP '2024-04-02 14:20:00', 1),
+        (7, 103, 2, 3, 90.0, 'cancelled', 'APAC', TIMESTAMP '2024-04-18 10:05:00', 0),
+        (8, 104, 3, 6, 15.0, 'shipped', 'EU', TIMESTAMP '2024-05-09 16:40:00', 1),
+        (9, 105, 4, 9, 10.0, 'processing', 'NA', TIMESTAMP '2024-05-22 07:55:00', 0),
+        (10, 106, 5, 8, 200.0, 'processing', 'EU', TIMESTAMP '2024-06-01 13:10:00', 1)
         """
     )
 
