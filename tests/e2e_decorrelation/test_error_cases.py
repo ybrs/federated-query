@@ -279,23 +279,25 @@ class TestUnsupportedPatterns:
 class TestUnsupportedOperators:
     """Test unsupported operators in quantified comparisons."""
 
-    def test_unsupported_quantified_operator(self, catalog, setup_test_data):
+    def test_like_all_quantified_operator_supported(self, catalog, setup_test_data):
         """
-        Test: Unsupported operator in quantified comparison.
+        Test: LIKE as the operator of a quantified (ALL) comparison.
 
         Input SQL:
             SELECT * FROM products WHERE name LIKE ALL(SELECT name FROM products)
 
         Expected behavior:
-            - Decorrelator detects unsupported operator (LIKE with ALL)
-            - Raises DecorrelationError
+            - LIKE ALL is supported: the quantified comparison decorrelates to
+              an ANTI join keeping rows that violate no `name LIKE <pattern>`,
+              with each inner name used as a LIKE pattern.
 
         Expected result:
-            Error raised with message about unsupported operator
+            The product names are distinct literals with no wildcards, so no
+            name LIKE-matches every other name; the result is empty (verified
+            against PostgreSQL).
         """
-        # Note: LIKE ALL may or may not be supported depending on implementation
         sql = """
-            SELECT * FROM pg.products
+            SELECT name FROM pg.products
             WHERE name LIKE ALL(SELECT name FROM pg.products)
         """
 
@@ -310,6 +312,7 @@ class TestUnsupportedOperators:
 
         assert_plan_structure(decorrelated_plan, {})
         results = execute_and_fetch_all(executor, decorrelated_plan)
+        assert results == []
 
 
 class TestEdgeCases:
