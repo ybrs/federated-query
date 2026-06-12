@@ -8,7 +8,7 @@ detects such subtrees and builds the remote query; anything it cannot render
 back to local execution.
 """
 
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from ..catalog.catalog import Catalog
 from ..datasources.base import DataSourceCapability
@@ -52,6 +52,13 @@ class _PushContext:
         self.has_join: bool = False
         self.has_computed: bool = False
         self.has_aggregate: bool = False
+        # (table qualifier, column) -> unique output name, so an operator above
+        # a pushed multi-table query can resolve a qualified reference even when
+        # two source columns share a name (e.g. both tables expose ``id``).
+        self.column_aliases: Dict[Tuple[Optional[str], str], str] = {}
+        # Leaf scans, in FROM order, used to expand ``*`` when no projection
+        # supplied an explicit (and unique) column list.
+        self.scans: List[Scan] = []
 
 
 class SingleSourcePushdown:
@@ -73,7 +80,37 @@ class SingleSourcePushdown:
             return None
         if not self._should_push(context):
             return None
+        if not context.select_items and not self._expand_star_select(context):
+            return None
         return self._finish(context)
+
+    def _expand_star_select(self, context: _PushContext) -> bool:
+        """Build a unique-aliased SELECT list from every scanned column.
+
+        Used when no projection supplied the columns (a bare ``SELECT *`` over a
+        join). Emitting ``*`` would yield duplicate column names that a parent
+        operator cannot resolve, so each table's columns are listed explicitly
+        with unique aliases and recorded for qualified resolution.
+        """
+        seen: set = set()
+        for scan in context.scans:
+            table = self.catalog.get_table(
+                scan.datasource, scan.schema_name, scan.table_name
+            )
+            if table is None:
+                return False
+            self._expand_scan_columns(scan, table, seen, context)
+        return True
+
+    def _expand_scan_columns(self, scan, table, seen: set, context) -> None:
+        """Append one scan's columns as unique-aliased SELECT items."""
+        alias = scan.alias if scan.alias else scan.table_name
+        for column in table.columns:
+            unique = self._unique_name(column.name, seen)
+            seen.add(unique)
+            context.output_names.append(unique)
+            context.select_items.append(f'{alias}."{column.name}" AS "{unique}"')
+            context.column_aliases[(alias, column.name)] = unique
 
     def _should_push(self, context: _PushContext) -> bool:
         """Whether this subtree is worth replacing with one remote query."""
@@ -95,6 +132,7 @@ class SingleSourcePushdown:
             datasource_connection=connection,
             query_ast=ast,
             output_names=context.output_names,
+            column_alias_map=context.column_aliases,
         )
 
     def _absorb(self, node: LogicalPlanNode, context: _PushContext) -> bool:
@@ -204,25 +242,51 @@ class SingleSourcePushdown:
             return False
         if scan.filters is not None:
             context.where_terms.append(scan.filters.to_sql())
+        context.scans.append(scan)
         return True
 
     def _set_select(self, expressions, names, context: _PushContext) -> None:
-        """Render a SELECT list, aliasing each item with its output name."""
-        output_names: List[str] = []
+        """Render the SELECT list with unique output names per column.
+
+        Output names are made unique (``id``, ``id_1`` ...) so a result with
+        columns from several tables never has two fields of the same name —
+        otherwise a parent operator could not address one of them and the
+        connector could not decode them. Each column reference also records a
+        (qualifier, column) -> unique name entry for qualified resolution.
+        """
+        seen: set = set()
         items: List[str] = []
+        output_names: List[str] = []
         for index in range(len(expressions)):
-            name = names[index] if names and index < len(names) else None
-            items.append(self._select_item(expressions[index], name))
-            output_names.append(name if name else expressions[index].to_sql())
+            expression = expressions[index]
+            base = self._base_name(expression, names, index)
+            unique = self._unique_name(base, seen)
+            seen.add(unique)
+            output_names.append(unique)
+            items.append(f'{expression.to_sql()} AS "{unique}"')
+            self._record_alias(expression, unique, context)
         context.select_items = items
         context.output_names = output_names
 
-    def _select_item(self, expression, name: Optional[str]) -> str:
-        """Render one projection item, adding an AS alias when one is given."""
-        expression_sql = expression.to_sql()
-        if name:
-            return f'{expression_sql} AS "{name}"'
-        return expression_sql
+    def _base_name(self, expression, names, index: int) -> str:
+        """The desired (pre-dedup) output name for a projection item."""
+        if names and index < len(names) and names[index]:
+            return names[index]
+        return expression.to_sql()
+
+    def _unique_name(self, base: str, seen: set) -> str:
+        """Return ``base`` or the first free ``base_N`` not already used."""
+        if base not in seen:
+            return base
+        suffix = 1
+        while f"{base}_{suffix}" in seen:
+            suffix += 1
+        return f"{base}_{suffix}"
+
+    def _record_alias(self, expression, unique: str, context: _PushContext) -> None:
+        """Map a column reference's (qualifier, column) to its output name."""
+        if isinstance(expression, ColumnRef):
+            context.column_aliases[(expression.table, expression.column)] = unique
 
     def _scan_ref(self, scan: Scan) -> str:
         """Render a table reference with its alias for the FROM clause."""

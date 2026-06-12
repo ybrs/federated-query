@@ -359,11 +359,22 @@ execution. All were failing before Phase 7.
   non-matching probe rows), single-column keys, `_DYNAMIC_FILTER_MAX_KEYS`=2000
   cap with an info-level log on fallback, NULL keys already excluded (not
   indexed in the hash table), empty build ⇒ no probe.
+  **Build-side selection (heuristic) DONE (2026-06-12):** `_plan_join` now picks
+  the build via `_choose_build_side` — the side whose scan has a `column =
+  literal` filter (likely small) is built, so the *other* (big) side is the one
+  reduced, regardless of FROM order. INNER-only (SEMI/ANTI/outer keep build_side
+  "right" for correctness). Two supporting fixes: `PhysicalHashJoin` now emits
+  matched rows in stable left-then-right order via `_join_matched_rows` (output
+  no longer depends on which side is built), and `_mark_dynamic_filter` /
+  EXPLAIN prefetch resolve the probe from `build_side`. EXPLAIN also shows the
+  real build values (`IN (101, ...)`, capped at 5) by reading a few rows from
+  the build side. NOTE: a stray method insertion briefly orphaned the
+  non-equi-join fallback `return` in `_plan_join` (54 decorrelation tests went
+  red with `NoneType.execute`); restored.
   REMAINING (follow-ups, not blocking): probe injection for `PhysicalRemoteQuery`
   (pushed-subtree probes), composite-key `(a,b) IN (...)`, more literal types
-  (date/decimal), and **cost-based build-side selection** (currently
-  `build_side` is hard-coded "right"; choosing the smaller/more-filtered side is
-  its own large task — see `selective-pushdown.md`).
+  (date/decimal), and full **cost-based** build-side selection (the current
+  heuristic only keys off a literal-equality filter — see `selective-pushdown.md`).
   Original problem statement:
   When a join spans
   two data sources it cannot be pushed to one engine, so today BOTH sides are

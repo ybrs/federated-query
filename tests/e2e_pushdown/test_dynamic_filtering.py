@@ -74,3 +74,23 @@ def test_explain_shows_dynamic_filter_with_real_values(multi_source_env):
     plan_text = "\n".join(row["plan"] for row in table.to_pylist())
     # the build (products) is filtered to id 101, so the probe IN shows it
     assert "product_id IN (101)" in plan_text
+
+
+def test_build_side_chosen_by_filter_regardless_of_order(multi_source_env):
+    """The filtered table is built from even when it is the left input, so the
+    big side is still the one reduced — and column order is preserved."""
+    runtime = build_runtime(multi_source_env)
+    # filtered table (products) written FIRST (left input)
+    sql = (
+        "SELECT P.name, O.order_id "
+        "FROM duckdb_products.main.products P, duckdb_orders.main.orders O "
+        "WHERE O.product_id = P.id AND P.id = 101"
+    )
+    table = runtime.execute(sql)
+    assert table.schema.names == ["name", "order_id"]
+
+    plan = "\n".join(
+        row["plan"] for row in runtime.execute("EXPLAIN " + sql).to_pylist()
+    )
+    # orders (the big, unfiltered side) is the one carrying the IN filter
+    assert "product_id IN (101)" in plan

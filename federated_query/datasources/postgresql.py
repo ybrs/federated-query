@@ -241,7 +241,6 @@ class PostgreSQLDataSource(DataSource):
                 logger.debug(f"Executing query on {self.name}: {query[:100]}...")
                 cursor.execute(query)
 
-                columns = self._extract_column_names(cursor.description)
                 schema = pa.schema(self._build_arrow_fields(cursor.description))
 
                 batch_size = 10000
@@ -250,9 +249,8 @@ class PostgreSQLDataSource(DataSource):
                     if not rows:
                         break
 
-                    data = self._build_column_data(columns, rows)
-                    self._coerce_floats(data, schema)
-                    batch = pa.RecordBatch.from_pydict(data, schema=schema)
+                    arrays = self._build_column_arrays(rows, schema)
+                    batch = pa.RecordBatch.from_arrays(arrays, schema=schema)
                     yield batch
         except psycopg2.Error as e:
             logger.error(f"Query execution failed on {self.name}: {e}")
@@ -307,28 +305,32 @@ class PostgreSQLDataSource(DataSource):
             fields.append(pa.field(column[0], arrow_type))
         return fields
 
-    def _coerce_floats(self, data: Dict[str, List], schema: pa.Schema) -> None:
-        """Convert Decimal values to float for float64-typed columns.
+    def _build_column_arrays(self, rows: List, schema: pa.Schema) -> List[pa.Array]:
+        """Build one Arrow array per column position.
 
-        Arrow refuses to place ``decimal.Decimal`` values into float64
-        arrays, and NUMERIC columns surface as float64 in this engine.
+        Indexing by position (not by name) is what lets a result with duplicate
+        column names — e.g. ``SELECT *`` over a join where both tables expose an
+        ``id`` column — round-trip faithfully instead of collapsing the
+        same-named columns together.
         """
-        for field in schema:
-            if not pa.types.is_float64(field.type):
-                continue
-            values = data[field.name]
-            for index in range(len(values)):
-                if values[index] is not None:
-                    values[index] = float(values[index])
+        arrays: List[pa.Array] = []
+        for column_index in range(len(schema.names)):
+            field = schema.field(column_index)
+            values = self._column_values(rows, column_index, field)
+            arrays.append(pa.array(values, type=field.type))
+        return arrays
 
-    def _build_column_data(self, columns: List[str], rows: List) -> Dict[str, List]:
-        """Build column data dictionary from rows."""
-        data = {}
-        for col in columns:
-            data[col] = []
+    def _column_values(self, rows: List, column_index: int, field: pa.Field) -> List:
+        """Collect one column's values, coercing Decimal to float for float64.
 
+        Arrow refuses to place ``decimal.Decimal`` values into float64 arrays,
+        and NUMERIC columns surface as float64 in this engine.
+        """
+        coerce = pa.types.is_float64(field.type)
+        values = []
         for row in rows:
-            for i, col in enumerate(columns):
-                data[col].append(row[i])
-
-        return data
+            value = row[column_index]
+            if coerce and value is not None:
+                value = float(value)
+            values.append(value)
+        return values

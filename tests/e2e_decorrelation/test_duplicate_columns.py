@@ -1,0 +1,45 @@
+"""Regression: SELECT * over a same-source join with overlapping column names.
+
+Both ``users`` and ``orders`` expose an ``id`` column, so a pushed-down
+``SELECT *`` join returns two columns named ``id``. The PostgreSQL connector
+must build the result positionally so the duplicate names round-trip instead of
+collapsing (which previously raised "Arrays were not all the same length").
+"""
+
+from federated_query.cli.fedq import FedQRuntime
+from federated_query.config import ExecutorConfig
+
+
+def test_select_star_join_with_duplicate_column_names(catalog, setup_test_data):
+    runtime = FedQRuntime(catalog, ExecutorConfig())
+    sql = (
+        "SELECT * FROM default.pg.users U, default.pg.orders O "
+        "WHERE O.user_id = U.id LIMIT 1"
+    )
+    table = runtime.execute(sql)
+
+    assert table.num_rows == 1
+    # both id columns survive (users.id and orders.id), like PostgreSQL
+    assert table.schema.names.count("id") == 2
+    assert table.num_columns == 8
+
+
+def test_cross_source_join_over_pushed_duplicate_columns(
+    catalog, setup_test_data, duckdb_datasource
+):
+    """A same-source join that produces two ``id`` columns is pushed down, then
+    joined cross-source on one of them. The pushed query must expose unique
+    output names so the outer join can resolve the qualified key."""
+    connection = duckdb_datasource.connection
+    connection.execute("CREATE TABLE file_access (file_id INTEGER, label VARCHAR)")
+    connection.execute("INSERT INTO file_access VALUES (1, 'a'), (2, 'b')")
+    catalog.load_metadata()
+
+    runtime = FedQRuntime(catalog, ExecutorConfig())
+    sql = (
+        "SELECT count(*) "
+        "FROM default.pg.users U, default.pg.orders O, duckdb.main.file_access A "
+        "WHERE O.user_id = U.id AND U.id = 1 AND O.id = A.file_id"
+    )
+    table = runtime.execute(sql)
+    assert table.to_pylist() == [{"COUNT(*)": 2}]

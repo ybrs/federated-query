@@ -685,9 +685,11 @@ class PhysicalHashJoin(PhysicalPlanNode):
         build_batches = []
         matched_build_rows = set()
 
+        build_aliases = build_node.column_aliases()
+        probe_aliases = probe_node.column_aliases()
         for batch in build_node.execute():
             build_batches.append(batch)
-            key_values = self._extract_key_values(batch, build_keys)
+            key_values = self._extract_key_values(batch, build_keys, build_aliases)
 
             for row_idx in range(batch.num_rows):
                 key = _row_key_tuple(key_values, row_idx)
@@ -713,7 +715,9 @@ class PhysicalHashJoin(PhysicalPlanNode):
         self._maybe_reduce_probe(probe_node, probe_keys, hash_table)
 
         for probe_batch in probe_node.execute():
-            probe_key_values = self._extract_key_values(probe_batch, probe_keys)
+            probe_key_values = self._extract_key_values(
+                probe_batch, probe_keys, probe_aliases
+            )
 
             for probe_row_idx in range(probe_batch.num_rows):
                 probe_key = _row_key_tuple(probe_key_values, probe_row_idx)
@@ -724,10 +728,13 @@ class PhysicalHashJoin(PhysicalPlanNode):
                     for build_batch_idx, build_row_idx in build_rows:
                         build_batch = build_batches[build_batch_idx]
                         matched_build_rows.add((build_batch_idx, build_row_idx))
-                        joined = self._join_rows(
-                            probe_batch, probe_row_idx, build_batch, build_row_idx
+                        yield self._join_matched_rows(
+                            probe_batch,
+                            probe_row_idx,
+                            build_batch,
+                            build_row_idx,
+                            probe_is_left,
                         )
-                        yield joined
                 else:
                     need_probe_outer = (
                         (self.join_type == JoinType.LEFT and probe_is_left)
@@ -793,29 +800,45 @@ class PhysicalHashJoin(PhysicalPlanNode):
         return True
 
     def _extract_key_values(
-        self, batch: pa.RecordBatch, keys: List[Expression]
+        self, batch: pa.RecordBatch, keys: List[Expression], aliases=None
     ) -> List[pa.Array]:
-        """Extract key column values from batch."""
+        """Extract key column values from a batch, resolving qualified names.
+
+        When the input is a pushed multi-table query, two source columns may
+        share a name; ``aliases`` maps a key's (table, column) to the unique
+        output column so the right one is selected instead of failing on an
+        ambiguous bare name.
+        """
         from .expressions import ColumnRef
 
         key_arrays = []
         for key in keys:
-            if isinstance(key, ColumnRef):
-                key_arrays.append(batch.column(key.column))
-            else:
+            if not isinstance(key, ColumnRef):
                 raise NotImplementedError(
                     f"Key extraction not implemented for {type(key)}"
                 )
+            name = self._resolve_key_name(key, aliases)
+            key_arrays.append(batch.column(name))
 
         return key_arrays
+
+    def _resolve_key_name(self, key, aliases) -> str:
+        """Map a key column reference to its physical output column name."""
+        if aliases:
+            resolved = aliases.get((key.table, key.column))
+            if resolved is not None:
+                return resolved
+        return key.column
 
     def _execute_semi_anti(self) -> Iterator[pa.RecordBatch]:
         """Execute SEMI or ANTI hash join."""
         from collections import defaultdict
 
+        right_aliases = self.right.column_aliases()
+        left_aliases = self.left.column_aliases()
         hash_table = defaultdict(bool)
         for batch in self.right.execute():
-            key_values = self._extract_key_values(batch, self.right_keys)
+            key_values = self._extract_key_values(batch, self.right_keys, right_aliases)
             for row_idx in range(batch.num_rows):
                 key = _row_key_tuple(key_values, row_idx)
                 # SQL equality never matches NULL keys.
@@ -823,7 +846,9 @@ class PhysicalHashJoin(PhysicalPlanNode):
                     hash_table[key] = True
 
         for left_batch in self.left.execute():
-            left_keys = self._extract_key_values(left_batch, self.left_keys)
+            left_keys = self._extract_key_values(
+                left_batch, self.left_keys, left_aliases
+            )
             for left_idx in range(left_batch.num_rows):
                 key = _row_key_tuple(left_keys, left_idx)
                 match = None not in key and key in hash_table
@@ -831,6 +856,26 @@ class PhysicalHashJoin(PhysicalPlanNode):
                     yield self._left_row_batch(left_batch, left_idx)
                 if self.join_type == JoinType.ANTI and not match:
                     yield self._left_row_batch(left_batch, left_idx)
+
+    def _join_matched_rows(
+        self,
+        probe_batch: pa.RecordBatch,
+        probe_row_idx: int,
+        build_batch: pa.RecordBatch,
+        build_row_idx: int,
+        probe_is_left: bool,
+    ) -> pa.RecordBatch:
+        """Join a matched probe/build row pair, always in left-then-right order.
+
+        The build side may be either input (chosen for performance), so order
+        the output by which input is logically the left one to keep the column
+        order independent of the build/probe choice.
+        """
+        if probe_is_left:
+            return self._join_rows(
+                probe_batch, probe_row_idx, build_batch, build_row_idx
+            )
+        return self._join_rows(build_batch, build_row_idx, probe_batch, probe_row_idx)
 
     def _join_rows(
         self,
@@ -2214,10 +2259,15 @@ class PhysicalRemoteQuery(PhysicalPlanNode):
     datasource_connection: Any
     query_ast: Any
     output_names: List[str]
+    column_alias_map: Dict[Tuple[Optional[str], str], str] = field(default_factory=dict)
     _schema: Optional[pa.Schema] = None
 
     def children(self) -> List[PhysicalPlanNode]:
         return []
+
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        """Resolve a qualified reference to this query's unique output name."""
+        return self.column_alias_map
 
     def execute(self) -> Iterator[pa.RecordBatch]:
         self.datasource_connection.ensure_connected()
@@ -2950,40 +3000,57 @@ class _DatasourceQueryCollector:
     def _prefetch_dynamic_filter(self, hash_join: "PhysicalHashJoin") -> None:
         """Fetch the build side's distinct keys so EXPLAIN shows real values.
 
-        The build side (right input) is executed and read until a few distinct
-        keys are gathered, which are stashed on the marked probe scan. Visited
-        before the probe child, so the probe's query renders with the values.
+        The build side is executed and read until a few distinct keys are
+        gathered, which are stashed on the marked probe scan. Visited before the
+        probe child, so the probe's query renders with the values.
         """
-        probe = hash_join.left
+        if hash_join.build_side == "right":
+            probe, build_node, build_keys = (
+                hash_join.left,
+                hash_join.right,
+                hash_join.right_keys,
+            )
+        else:
+            probe, build_node, build_keys = (
+                hash_join.right,
+                hash_join.left,
+                hash_join.left_keys,
+            )
         if not isinstance(probe, PhysicalScan) or not probe.dynamic_filter_keys:
             return
         probe.dynamic_filter_values = self._collect_build_values(
-            hash_join.right, hash_join.right_keys
+            build_node, build_keys, build_node.column_aliases()
         )
 
     def _collect_build_values(
-        self, build_node: PhysicalPlanNode, build_keys: List[Expression]
+        self,
+        build_node: PhysicalPlanNode,
+        build_keys: List[Expression],
+        aliases,
     ) -> List[tuple]:
         """Read distinct, NULL-free build-key tuples, stopping once past five."""
         distinct: List[tuple] = []
         seen: Set[tuple] = set()
         for batch in build_node.execute():
-            key_arrays = self._build_key_arrays(batch, build_keys)
+            key_arrays = self._build_key_arrays(batch, build_keys, aliases)
             for row_index in range(batch.num_rows):
                 self._add_distinct_key(key_arrays, row_index, seen, distinct)
                 if len(distinct) > 5:
                     return distinct
         return distinct
 
-    def _build_key_arrays(self, batch, build_keys):
-        """Collect the build-key column arrays from a batch by column name."""
+    def _build_key_arrays(self, batch, build_keys, aliases):
+        """Collect the build-key column arrays, resolving qualified names."""
         from .expressions import ColumnRef
 
         arrays = []
         for key in build_keys:
             if not isinstance(key, ColumnRef):
                 return []
-            arrays.append(batch.column(key.column))
+            name = key.column
+            if aliases:
+                name = aliases.get((key.table, key.column), key.column)
+            arrays.append(batch.column(name))
         return arrays
 
     def _add_distinct_key(self, key_arrays, row_index, seen, distinct) -> None:

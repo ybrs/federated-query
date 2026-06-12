@@ -64,3 +64,4 @@ postgres-server.log
 # OS
 .DS_Store
 Thumbs.db
+local-config.yaml

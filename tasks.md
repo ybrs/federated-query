@@ -821,6 +821,43 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - [ ] Connection retry logic
 - [ ] Transaction rollback on errors
 
+#### 11.1.1 Structured error codes (`error_codes.md`)
+**Goal**: Every engine error carries a stable, numbered code so a failure can be
+pinpointed to its origin instead of surfacing as "error: <free text>". Mirrors
+how real databases do it — MySQL numeric codes (e.g. `ER_DUP_FIELDNAME 1060`) +
+SQLSTATE, PostgreSQL 5-char SQLSTATE classes, DuckDB typed exceptions
+(`BinderException`, `ConversionException`, ...). The CLI should print something
+like `error FEDQ-1402: duplicate output column 'id' in pushed join`.
+
+- [ ] Define a code scheme. Proposal: `FEDQ-<NNNN>` where the leading digit(s)
+      bucket by subsystem so the number alone tells you where it came from:
+  - `1xxx` parser / dialect
+  - `2xxx` binder / catalog / type mapping
+  - `3xxx` decorrelation
+  - `4xxx` logical optimizer / planner / pushdown
+  - `5xxx` physical execution (operators, joins, aggregates)
+  - `6xxx` datasource / remote query (connection, result decoding)
+  - `9xxx` internal invariant / "should not happen"
+- [ ] Introduce a base `FedQError(code, message, *, context=None)` (and a small
+      hierarchy: `ParseError`, `BindingError`, `DecorrelationError`,
+      `PlanningError`, `ExecutionError`, `DataSourceError`) so each raise site
+      passes a code. Keep the fail-fast rule (CLAUDE.md) — codes annotate, they
+      do not add swallowing/wrapping.
+- [ ] Replace raw `raise ValueError(...)` / `RuntimeError(...)` / ad-hoc
+      messages on the user-facing paths with coded errors. The CLI formats them
+      as `error FEDQ-NNNN: <message>` (and shows context/origin when present).
+- [ ] Maintain `error_codes.md` at the repo root: a table of every allocated
+      code with its meaning, subsystem, and a one-line cause/fix note. New
+      errors get the next free code in their bucket; codes are never reused.
+- [ ] Add a test that asserts no two raise sites share a code and that every
+      code in the catalog is referenced (and vice versa).
+
+NOTE (2026-06-12): the duplicate-column crash ("Arrays were not all the same
+length: 1 vs 2", PostgreSQL connector collapsing same-named result columns) is
+already fixed, so it gets no code retroactively — it is the motivating example
+for why this scheme is needed. When implemented, that class of datasource
+result-decoding error would live in the `6xxx` bucket.
+
 ### 11.2 Logging and Observability
 - [ ] Structured logging
 - [ ] Query plan logging (EXPLAIN)

@@ -42,7 +42,7 @@ from ..plan.physical import (
     PhysicalSingleRowGuard,
     PhysicalGroupedLimit,
 )
-from ..plan.expressions import BinaryOp, BinaryOpType, ColumnRef
+from ..plan.expressions import BinaryOp, BinaryOpType, ColumnRef, Literal
 from .single_source_pushdown import SingleSourcePushdown
 from typing import List, Tuple
 from dataclasses import dataclass
@@ -298,7 +298,9 @@ class PhysicalPlanner:
                 join_type=join.join_type,
                 left_keys=left_keys,
                 right_keys=right_keys,
-                build_side="right",
+                build_side=self._choose_build_side(
+                    join.join_type, left_plan, right_plan
+                ),
             )
             self._mark_dynamic_filter(hash_join)
             return hash_join
@@ -310,21 +312,95 @@ class PhysicalPlanner:
             condition=join.condition,
         )
 
+    def _choose_build_side(
+        self,
+        join_type: JoinType,
+        left_plan: PhysicalPlanNode,
+        right_plan: PhysicalPlanNode,
+    ) -> str:
+        """Build from the side with a selective equality filter (likely small).
+
+        That side becomes the hash-table build input and the other becomes the
+        probe that the dynamic filter reduces. Only INNER joins are eligible —
+        for SEMI/ANTI/outer joins the build side is fixed by semantics (the
+        right input is the inner/built side). Defaults to the right input when
+        neither (or both) side has such a filter.
+        """
+        if join_type != JoinType.INNER:
+            return "right"
+        if self._has_selective_filter(left_plan) and not self._has_selective_filter(
+            right_plan
+        ):
+            return "left"
+        return "right"
+
+    def _has_selective_filter(self, plan: PhysicalPlanNode) -> bool:
+        """Whether the plan's underlying scan filters on a column = literal."""
+        scan = self._find_scan(plan)
+        if scan is None:
+            return False
+        return self._filter_has_literal_equality(scan.filters)
+
+    def _find_scan(self, plan: PhysicalPlanNode) -> Optional[PhysicalScan]:
+        """Descend single-child wrappers to the underlying scan, if any."""
+        current = plan
+        while True:
+            if isinstance(current, PhysicalScan):
+                return current
+            children = current.children()
+            if len(children) != 1:
+                return None
+            current = children[0]
+
+    def _filter_has_literal_equality(self, predicate) -> bool:
+        """Whether a predicate contains a ``column = literal`` conjunct."""
+        if not isinstance(predicate, BinaryOp):
+            return False
+        if predicate.op == BinaryOpType.EQ:
+            return self._is_column_literal_eq(predicate)
+        if predicate.op == BinaryOpType.AND:
+            return self._and_has_literal_equality(predicate)
+        return False
+
+    def _and_has_literal_equality(self, predicate: BinaryOp) -> bool:
+        """Recurse into both sides of an AND for a column = literal conjunct."""
+        if self._filter_has_literal_equality(predicate.left):
+            return True
+        return self._filter_has_literal_equality(predicate.right)
+
+    def _is_column_literal_eq(self, predicate: BinaryOp) -> bool:
+        """Whether an equality compares a column reference to a literal."""
+        return {type(predicate.left), type(predicate.right)} == {ColumnRef, Literal}
+
+        return PhysicalNestedLoopJoin(
+            left=left_plan,
+            right=right_plan,
+            join_type=join.join_type,
+            condition=join.condition,
+        )
+
     def _mark_dynamic_filter(self, hash_join: PhysicalHashJoin) -> None:
         """Mark the probe-side scan that will receive a runtime IN filter.
 
-        Mirrors the join's runtime reduction (INNER, single-column key, the
-        probe side — which is the left input since build_side is "right"). The
-        mark lets EXPLAIN show the dynamic filter even though its values are
-        only known at execution time.
+        The probe is the side that is not the build side. Marking lets EXPLAIN
+        show the dynamic filter even though its values are only known at
+        execution time. Only INNER joins with a single-column key qualify.
         """
         if hash_join.join_type != JoinType.INNER:
             return
-        if len(hash_join.left_keys) != 1:
+        probe, probe_keys = self._probe_side(hash_join)
+        if len(probe_keys) != 1:
             return
-        probe = hash_join.left
         if isinstance(probe, PhysicalScan):
-            probe.dynamic_filter_keys = list(hash_join.left_keys)
+            probe.dynamic_filter_keys = list(probe_keys)
+
+    def _probe_side(
+        self, hash_join: PhysicalHashJoin
+    ) -> Tuple[PhysicalPlanNode, List[ColumnRef]]:
+        """Return the (probe node, probe keys) — the input that is not built."""
+        if hash_join.build_side == "right":
+            return hash_join.left, hash_join.left_keys
+        return hash_join.right, hash_join.right_keys
 
     def _orient_join_keys(
         self,
