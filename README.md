@@ -164,7 +164,7 @@ Use `EXPLAIN` to inspect how a query will run without touching the underlying da
 EXPLAIN SELECT id, name FROM duckdb.main.users WHERE age > 30;
 ```
 
-The engine returns a single-column result where each row is a formatted physical operator (including stubbed cost values, row estimates, and key attributes) so you can understand join order, predicates, and data source usage before executing the statement.
+The engine returns a single-column result where each row is a formatted physical operator (including stubbed cost values, row estimates, and key attributes) so you can understand join order, predicates, and data source usage before executing the statement. The `Queries:` section shows the exact SQL sent to each source. For a cross-source join with dynamic filtering, the probe-side query shows the runtime `key IN (...)` predicate with real build-side values — to print those, EXPLAIN reads a few rows from the build side (capped, so it never scans a large table just to render the plan).
 
 ### Interactive CLI (`fedq`)
 

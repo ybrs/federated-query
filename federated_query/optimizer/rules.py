@@ -380,6 +380,19 @@ class PredicatePushdownRule(OptimizationRule):
             )
             return new_join
 
+        # Predicate spans both sides of an INNER join. A cross-side equality is
+        # a join key: fold it into the ON condition so a comma/cross join
+        # becomes an equi-join (hash join) instead of a Cartesian product with a
+        # filter on top. Non-equi cross-side predicates stay as a filter.
+        if self._is_equi_predicate(predicate):
+            merged_condition = self._merge_join_condition(join.condition, predicate)
+            return Join(
+                self._push_down(join.left),
+                self._push_down(join.right),
+                join.join_type,
+                merged_condition,
+            )
+
         new_join = Join(
             self._push_down(join.left),
             self._push_down(join.right),
@@ -387,6 +400,27 @@ class PredicatePushdownRule(OptimizationRule):
             join.condition,
         )
         return Filter(new_join, predicate)
+
+    def _is_equi_predicate(self, predicate: Expression) -> bool:
+        """Whether a predicate is a column-to-column equality (a join key)."""
+        from ..plan.expressions import BinaryOp, BinaryOpType, ColumnRef
+
+        return (
+            isinstance(predicate, BinaryOp)
+            and predicate.op == BinaryOpType.EQ
+            and isinstance(predicate.left, ColumnRef)
+            and isinstance(predicate.right, ColumnRef)
+        )
+
+    def _merge_join_condition(
+        self, existing: Optional[Expression], predicate: Expression
+    ) -> Expression:
+        """AND a freshly inferred equi-condition into a join's ON clause."""
+        from ..plan.expressions import BinaryOp, BinaryOpType
+
+        if existing is None:
+            return predicate
+        return BinaryOp(op=BinaryOpType.AND, left=existing, right=predicate)
 
     def _get_column_names(self, plan: LogicalPlanNode) -> set:
         """Get all column names available from a plan node.

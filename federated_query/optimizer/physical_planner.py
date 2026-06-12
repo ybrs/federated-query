@@ -292,7 +292,7 @@ class PhysicalPlanner:
         join_keys = self._extract_join_keys(join.condition)
         if join_keys:
             left_keys, right_keys = self._orient_join_keys(join_keys, join)
-            return PhysicalHashJoin(
+            hash_join = PhysicalHashJoin(
                 left=left_plan,
                 right=right_plan,
                 join_type=join.join_type,
@@ -300,6 +300,8 @@ class PhysicalPlanner:
                 right_keys=right_keys,
                 build_side="right",
             )
+            self._mark_dynamic_filter(hash_join)
+            return hash_join
 
         return PhysicalNestedLoopJoin(
             left=left_plan,
@@ -307,6 +309,22 @@ class PhysicalPlanner:
             join_type=join.join_type,
             condition=join.condition,
         )
+
+    def _mark_dynamic_filter(self, hash_join: PhysicalHashJoin) -> None:
+        """Mark the probe-side scan that will receive a runtime IN filter.
+
+        Mirrors the join's runtime reduction (INNER, single-column key, the
+        probe side — which is the left input since build_side is "right"). The
+        mark lets EXPLAIN show the dynamic filter even though its values are
+        only known at execution time.
+        """
+        if hash_join.join_type != JoinType.INNER:
+            return
+        if len(hash_join.left_keys) != 1:
+            return
+        probe = hash_join.left
+        if isinstance(probe, PhysicalScan):
+            probe.dynamic_filter_keys = list(hash_join.left_keys)
 
     def _orient_join_keys(
         self,

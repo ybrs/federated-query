@@ -106,7 +106,8 @@ def test_right_join_pushdown(single_source_env):
 
 
 def test_inner_join_comma_syntax(single_source_env):
-    """Validates comma joins split into two remote scans without joins."""
+    """A same-source comma join with a join equality folds into an equi-join
+    and pushes as one remote query, just like the explicit JOIN ... ON form."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT O.order_id "
@@ -115,15 +116,11 @@ def test_inner_join_comma_syntax(single_source_env):
     )
     document = explain_document(runtime, sql)
     queries = document["queries"]
-    assert len(queries) == 2
-    seen_tables = []
-    for entry in queries:
-        select_ast = entry["query"]
-        joins = select_ast.args.get("joins") or []
-        assert not joins
-        seen_tables.append(from_table_name(select_ast))
-    assert len(seen_tables) == 2
-    assert set(seen_tables) == {"orders", "products"}
+    assert len(queries) == 1
+    ast = queries[0]["query"]
+    join_node = _get_join_node(ast)
+    condition = unwrap_parens(join_node.args.get("on"))
+    assert isinstance(condition, exp.EQ)
 
 
 def test_inner_join_non_equi_pushes_down(single_source_env):

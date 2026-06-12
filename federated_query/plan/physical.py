@@ -21,9 +21,19 @@ from sqlglot import exp
 
 from .expressions import Expression
 from .logical import JoinType, ExplainFormat, SetOpKind
+from ..utils.logging import get_logger
 
 if TYPE_CHECKING:
     from .expressions import FunctionCall
+
+
+_LOGGER = get_logger(__name__)
+
+# Cap on distinct build-side keys for which a hash join pushes a dynamic IN
+# filter into the probe side. Above this the IN list is not worth the round
+# trip, so the probe is fetched in full (logged, never silently dropped). A
+# cost-based choice would replace this constant later.
+_DYNAMIC_FILTER_MAX_KEYS = 2000
 
 
 class PhysicalPlanNode(ABC):
@@ -56,6 +66,18 @@ class PhysicalPlanNode(ABC):
         """Optional mapping from (table, column) to physical column name."""
         return {}
 
+    def apply_dynamic_filter(
+        self, key_columns: List[Expression], value_tuples: List[tuple]
+    ) -> bool:
+        """Constrain this input to rows whose join keys appear in ``value_tuples``.
+
+        Used by a hash join to push the build side's distinct key values into
+        the probe side as a runtime ``IN`` filter (semi-join reduction). Most
+        nodes cannot accept such a filter; they return False and the join probes
+        in full. ``PhysicalScan`` overrides this.
+        """
+        return False
+
 
 def _row_key_tuple(key_values, row_index: int) -> tuple:
     """Build a hashable key tuple from per-column arrays at one row index."""
@@ -63,6 +85,37 @@ def _row_key_tuple(key_values, row_index: int) -> tuple:
     for array in key_values:
         values.append(array[row_index].as_py())
     return tuple(values)
+
+
+def _and_filters(existing: Optional[Expression], new_filter: Expression) -> Expression:
+    """Combine an existing scan filter with an additional predicate via AND."""
+    from .expressions import BinaryOp, BinaryOpType
+
+    if existing is None:
+        return new_filter
+    return BinaryOp(op=BinaryOpType.AND, left=existing, right=new_filter)
+
+
+def _literal_for_value(value):
+    """Wrap a Python join-key value as a typed Literal, or None if unsupported.
+
+    Keyed on the exact type so ``bool`` (a subclass of ``int``) is not misread
+    as an integer. Unsupported types (date, decimal, bytes) decline.
+    """
+    from .expressions import Literal, DataType
+
+    if value is None:
+        return None
+    type_map = {
+        bool: DataType.BOOLEAN,
+        int: DataType.INTEGER,
+        float: DataType.DOUBLE,
+        str: DataType.VARCHAR,
+    }
+    data_type = type_map.get(type(value))
+    if data_type is None:
+        return None
+    return Literal(value=value, data_type=data_type)
 
 
 def _join_output_aliases(
@@ -116,9 +169,48 @@ class PhysicalScan(PhysicalPlanNode):
         None  # NULLS FIRST/LAST for each key
     )
     distinct: bool = False
+    # Probe-side join keys that a hash join will constrain with the build side's
+    # values at runtime (semi-join reduction). Set at plan time so EXPLAIN can
+    # show the dynamic filter; the actual IN list is injected during execution.
+    dynamic_filter_keys: Optional[List[Expression]] = None
+    # Distinct build-side key values fetched during EXPLAIN so the dynamic
+    # filter renders with real values; None outside EXPLAIN.
+    dynamic_filter_values: Optional[List[tuple]] = None
 
     def children(self) -> List[PhysicalPlanNode]:
         return []
+
+    def apply_dynamic_filter(
+        self, key_columns: List[Expression], value_tuples: List[tuple]
+    ) -> bool:
+        """Add a runtime ``key IN (...)`` filter from a join's build-side keys.
+
+        Only single-column keys with renderable literal values are handled; a
+        composite key or an untypable value declines (the join probes in full).
+        The filter mutates this scan in place — its SQL is rebuilt at execute
+        time — and does not change the output schema.
+        """
+        if len(key_columns) != 1:
+            return False
+        in_filter = self._build_in_filter(key_columns[0], value_tuples)
+        if in_filter is None:
+            return False
+        self.filters = _and_filters(self.filters, in_filter)
+        return True
+
+    def _build_in_filter(self, key_column: Expression, value_tuples: List[tuple]):
+        """Build ``key_column IN (<distinct values>)`` or None if any is untypable."""
+        from .expressions import InList
+
+        options = []
+        for value_tuple in value_tuples:
+            literal = _literal_for_value(value_tuple[0])
+            if literal is None:
+                return None
+            options.append(literal)
+        if not options:
+            return None
+        return InList(value=key_column, options=options)
 
     def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
         """Expose this scan's columns under its table alias.
@@ -618,6 +710,8 @@ class PhysicalHashJoin(PhysicalPlanNode):
                         yield self._create_right_outer_batch(batch)
             return
 
+        self._maybe_reduce_probe(probe_node, probe_keys, hash_table)
+
         for probe_batch in probe_node.execute():
             probe_key_values = self._extract_key_values(probe_batch, probe_keys)
 
@@ -667,6 +761,36 @@ class PhysicalHashJoin(PhysicalPlanNode):
                             yield self._create_left_outer_row_from_batch(
                                 build_batch, build_row_idx
                             )
+
+    def _maybe_reduce_probe(self, probe_node, probe_keys, hash_table) -> None:
+        """Push the build side's distinct keys into the probe as an IN filter.
+
+        Semi-join reduction: an INNER join only emits probe rows whose key
+        matches a build key, so constraining the probe to those keys is safe and
+        avoids fetching unmatched rows (the win for a remote probe). Restricted
+        to INNER joins — outer joins must keep their non-matching probe rows —
+        and to a key set within the cap.
+        """
+        if self.join_type != JoinType.INNER:
+            return
+        keys = list(hash_table.keys())
+        if not self._dynamic_filter_worth_it(keys):
+            return
+        if probe_node.apply_dynamic_filter(probe_keys, keys):
+            _LOGGER.debug("dynamic filter applied to probe: %d keys", len(keys))
+
+    def _dynamic_filter_worth_it(self, keys: List[tuple]) -> bool:
+        """Whether the build-key set is non-empty and within the IN-list cap."""
+        if not keys:
+            return False
+        if len(keys) > _DYNAMIC_FILTER_MAX_KEYS:
+            _LOGGER.info(
+                "dynamic filter skipped: %d build keys exceed cap %d",
+                len(keys),
+                _DYNAMIC_FILTER_MAX_KEYS,
+            )
+            return False
+        return True
 
     def _extract_key_values(
         self, batch: pa.RecordBatch, keys: List[Expression]
@@ -2820,6 +2944,57 @@ class _DatasourceQueryCollector:
             self._record_remote_set_op(node, snapshots)
         elif isinstance(node, PhysicalRemoteQuery):
             self._record_remote_query(node, snapshots)
+        elif isinstance(node, PhysicalHashJoin):
+            self._prefetch_dynamic_filter(node)
+
+    def _prefetch_dynamic_filter(self, hash_join: "PhysicalHashJoin") -> None:
+        """Fetch the build side's distinct keys so EXPLAIN shows real values.
+
+        The build side (right input) is executed and read until a few distinct
+        keys are gathered, which are stashed on the marked probe scan. Visited
+        before the probe child, so the probe's query renders with the values.
+        """
+        probe = hash_join.left
+        if not isinstance(probe, PhysicalScan) or not probe.dynamic_filter_keys:
+            return
+        probe.dynamic_filter_values = self._collect_build_values(
+            hash_join.right, hash_join.right_keys
+        )
+
+    def _collect_build_values(
+        self, build_node: PhysicalPlanNode, build_keys: List[Expression]
+    ) -> List[tuple]:
+        """Read distinct, NULL-free build-key tuples, stopping once past five."""
+        distinct: List[tuple] = []
+        seen: Set[tuple] = set()
+        for batch in build_node.execute():
+            key_arrays = self._build_key_arrays(batch, build_keys)
+            for row_index in range(batch.num_rows):
+                self._add_distinct_key(key_arrays, row_index, seen, distinct)
+                if len(distinct) > 5:
+                    return distinct
+        return distinct
+
+    def _build_key_arrays(self, batch, build_keys):
+        """Collect the build-key column arrays from a batch by column name."""
+        from .expressions import ColumnRef
+
+        arrays = []
+        for key in build_keys:
+            if not isinstance(key, ColumnRef):
+                return []
+            arrays.append(batch.column(key.column))
+        return arrays
+
+    def _add_distinct_key(self, key_arrays, row_index, seen, distinct) -> None:
+        """Append a row's key tuple to ``distinct`` if new and free of NULLs."""
+        if not key_arrays:
+            return
+        key = _row_key_tuple(key_arrays, row_index)
+        if None in key or key in seen:
+            return
+        seen.add(key)
+        distinct.append(key)
 
     def _record_scan(
         self, scan: PhysicalScan, snapshots: List[_DatasourceQuerySnapshot]
@@ -2827,10 +3002,51 @@ class _DatasourceQueryCollector:
         datasource = scan.datasource_connection
         if datasource is None:
             return
-        sql = scan._build_query()
-        query_ast = datasource.parse_query(sql)
+        base_sql = scan._build_query()
+        query_ast = datasource.parse_query(base_sql)
+        sql = self._annotate_dynamic_filter(scan, base_sql)
         snapshot = _DatasourceQuerySnapshot(scan.datasource, sql, query_ast)
         snapshots.append(snapshot)
+
+    def _annotate_dynamic_filter(self, scan: PhysicalScan, sql: str) -> str:
+        """Render the runtime IN filter as a real predicate in the EXPLAIN SQL.
+
+        The build-side values are only known at execution time, so the value
+        list shows as ``(...)``. Only single-column keys are marked, and the
+        probe scan is a plain ``SELECT ... FROM ... [WHERE ...]``, so the
+        predicate appends cleanly to the WHERE clause.
+        """
+        keys = scan.dynamic_filter_keys
+        if not keys:
+            return sql
+        predicate = f"{keys[0].to_sql()} IN ({self._render_in_values(scan)})"
+        if " WHERE " in sql:
+            return f"{sql} AND {predicate}"
+        return f"{sql} WHERE {predicate}"
+
+    def _render_in_values(self, scan: PhysicalScan) -> str:
+        """Render up to five real build values, then ``...`` if more exist.
+
+        Falls back to ``...`` when the values were not fetched (no EXPLAIN
+        prefetch) so the predicate stays readable.
+        """
+        values = scan.dynamic_filter_values
+        if not values:
+            return "..."
+        items = []
+        for value_tuple in values[:5]:
+            items.append(self._render_value(value_tuple[0]))
+        rendered = ", ".join(items)
+        if len(values) > 5:
+            return f"{rendered}, ..."
+        return rendered
+
+    def _render_value(self, value) -> str:
+        """Render a single value as a SQL literal (quoted/escaped as needed)."""
+        literal = _literal_for_value(value)
+        if literal is None:
+            return str(value)
+        return literal.to_sql()
 
     def _record_remote_join(
         self, join: PhysicalRemoteJoin, snapshots: List[_DatasourceQuerySnapshot]

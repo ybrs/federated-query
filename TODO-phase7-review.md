@@ -10,12 +10,11 @@ inspection.
 
 ## STATUS (updated 2026-06-11, branch `parsing_explain`)
 
-726 passed / 48 failed (from 645/125 baseline); decorrelation suite green;
-**G4 set operations + G1 join breadth + G2 computed projections done** (no
-regressions); remaining failures are **G3 CTEs (10), G6 date/time (7),
-subqueries/G8 (20), G7 aggregate FILTER, NATURAL/USING (3), and assorted
-null/edge cases**. G9 (cross-source dynamic filtering) is still untracked-by-
-tests real-world work. Verified
+729 passed / 48 failed (from 645/125 baseline); decorrelation suite green.
+**Done: G4 set ops, G1 join breadth, G2 computed projections, G9 cross-source
+dynamic filtering (first version).** Remaining failures are **G3 CTEs (10),
+G6 date/time (7), subqueries/G8 (20, deferred — see `decorrelation-gaps.md`),
+G7 aggregate FILTER, NATURAL/USING (3), and assorted null/edge cases**. Verified
 correctness/silent-fail items are checked off. PARTIAL = some sub-cases remain
 (noted inline); DEFERRED = moderate/decision/perf/architectural, none are
 silent corruption (they raise clean errors or are documented deviations).
@@ -328,14 +327,45 @@ execution. All were failing before Phase 7.
 - [ ] **G6. Date/time gaps (~6 tests)** — EXTRACT (exp.Var), INTERVAL, AGE,
   CURRENT_DATE pushdown.
 - [ ] **G7. Aggregate FILTER clause (2 tests)**.
-- [ ] **G8. IN-subquery bodies ending in Filter/Sort (3 tests)** — overlaps B4.
-  Includes a UNION used as an IN-subquery body (`test_subquery_with_union`),
-  which currently raises a clean `BindingError` from the subquery binder
-  ("Unsupported plan node in subquery: SetOperation"); the subquery binder +
-  IN-subquery decorrelation must learn to handle a `SetOperation` body.
+- [ ] **G8. Subqueries (20 `test_subqueries` tests) — DEFERRED (big task).**
+  Re-triaged: ~14 of these are NOT decorrelation failures — they decorrelate
+  correctly and return right answers but execute as a *local* join (2+ remote
+  scans) while the test wants ONE pushed remote query; that bucket is a pushdown
+  extension of G1 (push decorrelated SEMI/ANTI/scalar joins). ~4 are genuine
+  decorrelation coverage gaps (subquery body topped by Filter/Sort; `SetOperation`
+  body) and ~2 are binding gaps.
+  **Strategic direction (per owner):** the goal is a *subquery-free* logical
+  plan — fully unnest every subquery during logical planning so the physical
+  planner only ever sees a flat join/aggregate/set-op plan (DuckDB-style;
+  Neumann & Kemper general dependent join). We then push the resulting joins
+  like any other (G1). Physical subquery planning stays only as a last-resort
+  fallback for genuinely un-decorrelatable cases. This is a large rewrite
+  (pattern-based → general dependent-join decorrelation), so G8 is intentionally
+  deferred. Full gap inventory, code/test references, and sequencing live in
+  **`decorrelation-gaps.md`** — start there before picking this up.
 
-- [ ] **G9. Cross-source dynamic filtering / semi-join reduction (NO test
-  coverage yet — real-world usability, not a shape test).** When a join spans
+- [x] **G9. Cross-source dynamic filtering / semi-join reduction — FIRST
+  VERSION DONE (2026-06-12).** G9a + G9b shipped; `tests/e2e_pushdown/
+  test_dynamic_filtering.py` verifies it end-to-end (probe carries
+  `WHERE key IN (build keys)`; comma + explicit join; results unchanged).
+  G9a: `PredicatePushdownRule._push_filter_below_join` folds a cross-side
+  `ColumnRef = ColumnRef` equality into an INNER join's ON condition
+  (`_is_equi_predicate`/`_merge_join_condition`) so comma/cross joins become
+  hash joins (one same-source comma-join test updated: it now pushes as one
+  query). G9b: `PhysicalHashJoin._maybe_reduce_probe` runs after the build
+  hash table is built and calls `probe.apply_dynamic_filter(keys, values)`;
+  `PhysicalScan` implements it (mutates `self.filters` with an `InList`; SQL is
+  rebuilt at execute time). Guards: INNER-only (outer joins must keep
+  non-matching probe rows), single-column keys, `_DYNAMIC_FILTER_MAX_KEYS`=2000
+  cap with an info-level log on fallback, NULL keys already excluded (not
+  indexed in the hash table), empty build ⇒ no probe.
+  REMAINING (follow-ups, not blocking): probe injection for `PhysicalRemoteQuery`
+  (pushed-subtree probes), composite-key `(a,b) IN (...)`, more literal types
+  (date/decimal), and **cost-based build-side selection** (currently
+  `build_side` is hard-coded "right"; choosing the smaller/more-filtered side is
+  its own large task — see `selective-pushdown.md`).
+  Original problem statement:
+  When a join spans
   two data sources it cannot be pushed to one engine, so today BOTH sides are
   fetched in full and joined locally — the probe side ships its entire table
   over the network. A real federated engine constrains the probe side with the
