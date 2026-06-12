@@ -1,5 +1,16 @@
 # Phase 7 Review — TODO
 
+> ## ★ TOP PRIORITY — Physical Merge Engine (DuckDB local execution)
+> The local physical operators run row-at-a-time in Python and dominate
+> cross-source query time (profiled: ~80% of a 3-table query). Replace them with
+> an in-memory **DuckDB coordinator** fed the Arrow streams (streamed, not
+> materialized; spills to disk under `memory_limit`). NO change to
+> parser/binder/decorrelation/planner/pushdown — only operator `execute()`.
+> **Full design: `plan-physical-merge-engine.md`.** Start with `PhysicalHashJoin`.
+> Related: P4 (vectorize local execution) and G9 v2.1 are complementary.
+
+---
+
 Findings from an adversarial review of the Phase 7 decorrelation work plus an
 audit of the pre-existing engine. Every item marked VERIFIED was reproduced
 against the live engine and cross-checked with PostgreSQL 17; repro scripts
@@ -371,10 +382,45 @@ execution. All were failing before Phase 7.
   the build side. NOTE: a stray method insertion briefly orphaned the
   non-equi-join fallback `return` in `_plan_join` (54 decorrelation tests went
   red with `NoneType.execute`); restored.
-  REMAINING (follow-ups, not blocking): probe injection for `PhysicalRemoteQuery`
-  (pushed-subtree probes), composite-key `(a,b) IN (...)`, more literal types
-  (date/decimal), and full **cost-based** build-side selection (the current
-  heuristic only keys off a literal-equality filter — see `selective-pushdown.md`).
+  Also fixed (duplicate-column family, found via real queries): the
+  PostgreSQL connector decodes results positionally (duplicate result column
+  names no longer collapse — "Arrays were not all the same length"); the
+  single-source generator emits UNIQUE column aliases + a `(table,col)->name`
+  alias map and expands bare `SELECT *` joins explicitly; `PhysicalHashJoin`
+  key extraction resolves qualified keys through that map ("Field id exists 2
+  times in schema").
+
+  **G9 v2 — incremental coverage (no cost model required):**
+  - [ ] **v2.1 Inject into `PhysicalRemoteQuery` probes.** Today only a *bare*
+    `PhysicalScan` probe receives the IN filter (`apply_dynamic_filter` is a
+    `PhysicalScan`-only override; the base returns False). When the probe is a
+    pushed subtree (e.g. a same-source join already rendered as one remote
+    SELECT) it gets nothing — so a cross-source join whose big side is itself a
+    pushdown is NOT reduced. Implement `PhysicalRemoteQuery.apply_dynamic_filter`
+    (AND an `IN` into its AST / wrap it). Highest-value v2 item.
+  - [ ] **v2.2 Composite keys** — `(a, b) IN ((..),(..))`; v1 is single-column.
+  - [ ] **v2.3 More literal types** — date / timestamp / decimal / uuid in the
+    IN list (`_literal_for_value` currently does int/float/str/bool only;
+    others fall back to a full fetch).
+  - [ ] **v2.4 See filters inside pushed subqueries for build-side choice.**
+    `_choose_build_side`/`_has_selective_filter` only inspect
+    `PhysicalScan.filters`, so a selective filter buried in a
+    `PhysicalRemoteQuery` is invisible and that side can't be chosen as build.
+  - [ ] **v2.5 Config-drive the threshold** — `_DYNAMIC_FILTER_MAX_KEYS=2000` is
+    a hard-coded constant.
+  - [ ] **v2.6 Safe outer cases** — v1 is INNER-only; SEMI/ANTI and the
+    outer-join cases where the probe is the inner side can also reduce.
+
+  **G9 v3 — optimization phase (needs the cost model / new operators; see
+  `selective-pushdown.md`):**
+  - [ ] **v3.1 Large build side → don't use IN.** Above some cardinality an IN
+    list is the wrong tool; pick a merge / streamed / partitioned join instead
+    of materializing keys (v1 just falls back to a full probe fetch).
+  - [ ] **v3.2 Full cost-based build-side selection** — replace the
+    literal-equality heuristic with cardinality/stats to choose the build side
+    and to decide whether dynamic filtering even beats the alternative.
+  - [ ] **v3.3 Range (min/max) pushdown for non-equi joins** — band/range joins
+    can push `BETWEEN min AND max` instead of an IN; v1 only helps equi joins.
   Original problem statement:
   When a join spans
   two data sources it cannot be pushed to one engine, so today BOTH sides are
@@ -413,6 +459,88 @@ execution. All were failing before Phase 7.
   Sequencing decision (2026-06-11): tackle **G1 + G2 first** (same-source join
   pushdown is foundational and shares the equi-key machinery G9a needs), then
   G9.
+
+## P. Data-path performance (measured 2026-06-13)
+
+Found while profiling a real cross-source query
+(`count(*)` over `catalog_tables ⨝ catalog_files ⨝ file_access`, ~87 ms): the
+same-source `T ⨝ F` returns ~11,041 rows and we pull all of them across the
+wire to find 1 match. Two concrete, measured levers (microbench on 11,041 rows,
+in the bundled `perf_files` test table; Rust harness in `/workspace/fedqrs`):
+
+- [x] **P1. Projection pruning into pushed sub-queries — DONE (2026-06-13).**
+  Root cause was localized: projection pushdown *already* prunes the logical
+  scans (e.g. `users → [id]`, `orders → [id, user_id]`), but the generator's
+  `_expand_star_select` ignored `scan.columns` and enumerated the whole catalog
+  table. Fixed `_scan_output_columns` to emit each scan's pruned column list
+  (falling back to the catalog only for a true `*`). Result for the 3-table
+  repro: pushed query went from 8 wide columns (incl. `name`/`amount`/text) to
+  the 3 join-key columns; for the real query that's all-13 → just `F.id`. No
+  semantics change, no regressions; regression test in
+  `tests/e2e_decorrelation/test_duplicate_columns.py`.
+
+- [x] **P2. Faster PostgreSQL connector (ADBC) — DONE (2026-06-13).** Opt-in via
+  `driver: adbc` on a postgres datasource: `execute_query`/`get_query_schema`
+  fetch through `adbc_driver_postgresql` (Arrow straight off the wire, no
+  per-cell Python objects); metadata/stats stay on psycopg2. It's a true
+  drop-in — `_normalize_table` aligns ADBC's Arrow types with the psycopg2
+  path's: uuid (opaque binary) → canonical string (**vectorized** numpy
+  hex/dash, null-safe — a per-row loop made uuid columns *slower* than
+  psycopg2), numeric (opaque string) → float64, every integer width → int64,
+  real → float64. `autocommit=True` so read fetches don't sit idle-in-
+  transaction holding locks. Correctness test:
+  `tests/e2e_decorrelation/test_adbc_connector.py` (byte-identical to psycopg2,
+  incl. nulls + schema).
+  MEASURED (Python, 11,041 rows): non-uuid wide **psycopg2 20.6 ms vs adbc
+  4.3 ms (~4.8×)**; mixed wide 29 vs 22 ms; **uuid-only narrow 4.4 vs 9.5 ms —
+  psycopg2 wins** (the uuid→string normalization the engine requires costs more
+  than the tiny fetch saves). So ADBC is a big win for wide/non-uuid results and
+  a loss for narrow-uuid-only fetches — it's per-datasource opt-in, not a
+  universal default. The deeper fix (let uuid stay native instead of forcing
+  string) is a larger engine change.
+  Cross-language benchmark harness lives in `/workspace/fedqrs` (rust-postgres,
+  ADBC, connectorx). connectorx was measured but **not** adopted — high fixed
+  per-query cost makes it slower on small results in both Python and Rust.
+
+- [ ] **P3. FIX COLUMN TYPES — native type fidelity end-to-end (owner-flagged,
+  high priority).** Every column type must be respected, not flattened to a
+  lowest-common-denominator. Today the engine coerces aggressively and
+  lossily: **uuid → string** (an incidental psycopg2 wart nobody chose),
+  **numeric/decimal → float64** (loses precision — unacceptable for money),
+  **all integer widths → int64**, **real → double**, and the catalog
+  `_map_type` does substring matching (E8). Wanted: a real type system where a
+  uuid is a uuid, a decimal is a decimal, an int32 is an int32, etc., preserved
+  from source metadata through the catalog, the Arrow runtime types, comparisons,
+  and results. Spans: catalog `_map_type`; psycopg2 `_OID_TO_ARROW` +
+  `_column_values`; the ADBC `_normalize_table` (which only exists to *match*
+  the psycopg2 lossiness — it should instead preserve native types); and
+  cross-source comparison/join-key compatibility (a pg uuid and a duckdb uuid
+  must compare as uuids). NOTE: per the P-section profiling, this is a
+  CORRECTNESS/cleanliness fix, not the cause of the slow cross-source query
+  (that's P4/G9 v2.1).
+
+- [ ] **P4. Vectorize local execution (was D3) — the dominant cost of
+  cross-source queries.** PROFILED on the 3-table cross-source `count(*)`
+  (total 24.5 ms): pg fetch of 11,041 rows = 5.1 ms (~20%), **local processing
+  = 19.5 ms (~80%)**. `PhysicalHashJoin` builds a Python dict keyed by per-row
+  `.as_py()` tuples, probes row-by-row, and `_join_rows` allocates a fresh
+  one-row `RecordBatch` per matched row — pure row-at-a-time Python over every
+  intermediate row. Same shape in `PhysicalUnion`/`PhysicalSetOperation`/
+  `PhysicalGroupedLimit`/aggregates. Paths to evaluate (see the discussion in
+  the design notes):
+  - **A. `pyarrow.Table.join` / pyarrow.compute** — replace each operator with
+    Arrow's vectorized C++ kernels. Incremental, low risk; must verify SQL
+    semantics (NULL-aware anti-joins, the `right_` dup-name convention, the
+    dynamic-filter hook).
+  - **B. DuckDB as the local execution engine** — register the fetched Arrow
+    tables in a coordinator in-memory DuckDB (zero-copy) and run the post-
+    pushdown plan there; vectorized joins/aggregates/sorts/window with correct
+    SQL semantics for free (we already depend on DuckDB). Bigger architectural
+    shift; the custom semi/anti + guards + dynamic-filter logic must integrate.
+  - **C. Hand-vectorize** with pyarrow primitives — most work, least benefit.
+  Note: **G9 v2.1** (push the probe-side keys into the *pushed* remote query)
+  sidesteps this for the common case by making the remote return ~1 row instead
+  of 11k — so v2.1 + P4 together kill this query's cost; either alone helps.
 
 ## H. Test-suite bugs (cheap wins, ~28 of the 125)
 

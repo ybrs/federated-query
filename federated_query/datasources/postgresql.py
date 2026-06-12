@@ -2,7 +2,9 @@
 
 from contextlib import contextmanager
 from typing import List, Dict, Any, Iterator, Optional
+import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
@@ -18,6 +20,18 @@ from .base import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _hex_byte_table() -> np.ndarray:
+    """Build the 256-entry table of two-hex-char strings, one per byte value."""
+    table = []
+    for value in range(256):
+        table.append("%02x" % value)
+    return np.array(table, dtype="U2")
+
+
+# Used to format uuid bytes vectorized (no per-row Python uuid/hex call).
+_HEX256 = _hex_byte_table()
 
 
 class PostgreSQLDataSource(DataSource):
@@ -41,6 +55,11 @@ class PostgreSQLDataSource(DataSource):
         self._pool = None
         self._min_connections = config.get("min_connections", 1)
         self._max_connections = config.get("max_connections", 5)
+        # Optional Arrow-native data path. ``driver: adbc`` fetches query
+        # results through the ADBC PostgreSQL driver (postgres wire -> Arrow,
+        # no per-cell Python objects); metadata/stats still use psycopg2.
+        self._use_adbc = config.get("driver") == "adbc"
+        self._adbc_conn = None
 
     def connect(self) -> None:
         """Establish connection pool to PostgreSQL.
@@ -69,7 +88,10 @@ class PostgreSQLDataSource(DataSource):
         logger.info(f"Successfully connected to PostgreSQL: {self.name}")
 
     def disconnect(self) -> None:
-        """Close all connections in the pool."""
+        """Close all connections in the pool (and the ADBC connection)."""
+        if self._adbc_conn is not None:
+            self._adbc_conn.close()
+            self._adbc_conn = None
         if self._pool:
             self._pool.closeall()
             logger.info(f"Disconnected from PostgreSQL: {self.name}")
@@ -234,7 +256,13 @@ class PostgreSQLDataSource(DataSource):
             self._return_connection(conn)
 
     def execute_query(self, query: str) -> Iterator[pa.RecordBatch]:
-        """Execute query and yield Arrow record batches."""
+        """Execute a query and yield Arrow record batches."""
+        if self._use_adbc:
+            return self._execute_query_adbc(query)
+        return self._execute_query_psycopg2(query)
+
+    def _execute_query_psycopg2(self, query: str) -> Iterator[pa.RecordBatch]:
+        """Execute via psycopg2, building Arrow batches per fetched chunk."""
         conn = self._get_connection()
         try:
             with conn.cursor() as cursor:
@@ -258,12 +286,22 @@ class PostgreSQLDataSource(DataSource):
         finally:
             self._return_connection(conn)
 
+    def _execute_query_adbc(self, query: str) -> Iterator[pa.RecordBatch]:
+        """Execute via the ADBC driver, returning Arrow directly."""
+        logger.debug(f"Executing query (adbc) on {self.name}: {query[:100]}...")
+        table = self._adbc_fetch(query)
+        for batch in table.to_batches(max_chunksize=10000):
+            yield batch
+
     def get_query_schema(self, query: str) -> pa.Schema:
-        """Get query schema without executing."""
+        """Get a query's Arrow schema without materializing rows."""
+        wrapped = f"SELECT * FROM ({query}) AS q LIMIT 0"
+        if self._use_adbc:
+            return self._adbc_fetch(wrapped).schema
         conn = self._get_connection()
         try:
             with conn.cursor() as cursor:
-                cursor.execute(f"SELECT * FROM ({query}) AS q LIMIT 0")
+                cursor.execute(wrapped)
                 fields = self._build_arrow_fields(cursor.description)
                 return pa.schema(fields)
         except psycopg2.Error as e:
@@ -271,6 +309,111 @@ class PostgreSQLDataSource(DataSource):
             raise
         finally:
             self._return_connection(conn)
+
+    def _adbc_uri(self) -> str:
+        """Build a libpq URI for the ADBC PostgreSQL driver from the config."""
+        user = self.config["user"]
+        password = self.config.get("password")
+        auth = f"{user}:{password}" if password else user
+        host = self.config["host"]
+        port = self.config.get("port", 5432)
+        database = self.config["database"]
+        return f"postgresql://{auth}@{host}:{port}/{database}"
+
+    def _adbc_connection(self):
+        """Lazily open (and cache) the ADBC connection.
+
+        ``autocommit=True`` keeps read-only fetches from leaving the connection
+        idle in a transaction holding locks on the scanned tables.
+        """
+        if self._adbc_conn is None:
+            from adbc_driver_postgresql import dbapi
+
+            self._adbc_conn = dbapi.connect(self._adbc_uri(), autocommit=True)
+        return self._adbc_conn
+
+    def _adbc_fetch(self, query: str) -> pa.Table:
+        """Run a query through ADBC and normalize its Arrow types."""
+        cursor = self._adbc_connection().cursor()
+        try:
+            cursor.execute(query)
+            table = cursor.fetch_arrow_table()
+        finally:
+            cursor.close()
+        return self._normalize_table(table)
+
+    def _normalize_table(self, table: pa.Table) -> pa.Table:
+        """Align ADBC's Arrow types with the psycopg2 path's, so the driver is
+        a drop-in: uuid->string, numeric->float64, every integer width->int64,
+        and real(float32)->float64. Anything already matching is left untouched.
+        """
+        columns = []
+        for index in range(table.num_columns):
+            field = table.schema.field(index)
+            columns.append(self._normalize_column(table.column(index), field.type))
+        return pa.Table.from_arrays(columns, names=table.schema.names)
+
+    def _normalize_column(self, column, column_type):
+        """Convert one column from ADBC's type to the engine's expected type."""
+        if getattr(column_type, "extension_name", None) == "arrow.opaque":
+            return self._normalize_opaque(column, column_type)
+        if pa.types.is_decimal(column_type):
+            return pc.cast(column, pa.float64())
+        if pa.types.is_integer(column_type) and not pa.types.is_int64(column_type):
+            return pc.cast(column, pa.int64())
+        if pa.types.is_floating(column_type) and not pa.types.is_float64(column_type):
+            return pc.cast(column, pa.float64())
+        return column
+
+    def _normalize_opaque(self, column, column_type):
+        """Convert an ADBC opaque extension column to the engine's type.
+
+        Postgres ``uuid`` arrives as opaque binary and ``numeric`` as an opaque
+        string; the engine wants a canonical uuid string and a float64
+        respectively (matching psycopg2). Unknown opaque types fall back to
+        their string storage.
+        """
+        type_name = getattr(column_type, "type_name", "")
+        storage = column.combine_chunks().storage
+        if type_name == "uuid":
+            return self._uuid_bytes_to_string(storage)
+        if type_name == "numeric":
+            return pc.cast(storage, pa.float64())
+        return storage
+
+    def _uuid_bytes_to_string(self, storage) -> pa.Array:
+        """Format a binary(16) uuid column to canonical strings, vectorized.
+
+        Reshapes the contiguous bytes to (n, 16), maps each byte through the hex
+        table, and joins the dashed groups with numpy string ops — no per-row
+        Python loop. NULL slots carry garbage bytes, masked back out at the end.
+        """
+        count = len(storage)
+        fixed = pc.cast(storage, pa.binary(16))
+        raw = np.frombuffer(fixed.buffers()[1], dtype=np.uint8)
+        start = fixed.offset * 16
+        matrix = raw[start : start + count * 16].reshape(count, 16)
+        text = self._join_uuid_groups(_HEX256[matrix])
+        mask = pc.is_null(fixed).to_numpy(zero_copy_only=False)
+        return pa.array(text, mask=mask, type=pa.string())
+
+    def _join_uuid_groups(self, pairs: np.ndarray) -> np.ndarray:
+        """Join the 8-4-4-4-12 hex groups of each row into a dashed uuid."""
+        groups = [(0, 4), (4, 6), (6, 8), (8, 10), (10, 16)]
+        rendered = []
+        for start, stop in groups:
+            rendered.append(self._concat_columns(pairs, start, stop))
+        out = rendered[0]
+        for group in rendered[1:]:
+            out = np.char.add(np.char.add(out, "-"), group)
+        return out
+
+    def _concat_columns(self, pairs: np.ndarray, start: int, stop: int) -> np.ndarray:
+        """Concatenate the hex-pair columns ``[start, stop)`` row-wise."""
+        out = pairs[:, start]
+        for index in range(start + 1, stop):
+            out = np.char.add(out, pairs[:, index])
+        return out
 
     def _extract_column_names(self, description) -> List[str]:
         """Extract column names from cursor description."""

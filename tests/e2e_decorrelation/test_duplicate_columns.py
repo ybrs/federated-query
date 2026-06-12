@@ -43,3 +43,31 @@ def test_cross_source_join_over_pushed_duplicate_columns(
     )
     table = runtime.execute(sql)
     assert table.to_pylist() == [{"COUNT(*)": 2}]
+
+
+def test_pushed_subquery_only_fetches_needed_columns(
+    catalog, setup_test_data, duckdb_datasource
+):
+    """A pushed cross-source sub-join must emit only the columns later operators
+    need (its join keys), not every table column (projection pruning, P1)."""
+    connection = duckdb_datasource.connection
+    connection.execute("CREATE TABLE file_access2 (file_id INTEGER, label VARCHAR)")
+    connection.execute("INSERT INTO file_access2 VALUES (1, 'a')")
+    catalog.load_metadata()
+
+    runtime = FedQRuntime(catalog, ExecutorConfig())
+    sql = (
+        "SELECT count(*) "
+        "FROM default.pg.users U, default.pg.orders O, duckdb.main.file_access2 A "
+        "WHERE O.user_id = U.id AND U.id = 1 AND O.id = A.file_id"
+    )
+    plan = "\n".join(
+        row["plan"] for row in runtime.execute("EXPLAIN " + sql).to_pylist()
+    )
+    pg_line = next(
+        line for line in plan.splitlines() if "pg" in line and "SELECT" in line
+    )
+    # only the join-key columns are fetched; the wide columns are pruned away
+    assert "user_id" in pg_line
+    for pruned in ("name", "country", "city", "amount", "status"):
+        assert pruned not in pg_line, f"{pruned} should have been pruned: {pg_line}"

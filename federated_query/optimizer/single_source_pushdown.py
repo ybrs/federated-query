@@ -85,32 +85,47 @@ class SingleSourcePushdown:
         return self._finish(context)
 
     def _expand_star_select(self, context: _PushContext) -> bool:
-        """Build a unique-aliased SELECT list from every scanned column.
+        """Build a unique-aliased SELECT list from each scan's needed columns.
 
         Used when no projection supplied the columns (a bare ``SELECT *`` over a
         join). Emitting ``*`` would yield duplicate column names that a parent
-        operator cannot resolve, so each table's columns are listed explicitly
-        with unique aliases and recorded for qualified resolution.
+        operator cannot resolve, so the columns are listed explicitly with
+        unique aliases and recorded for qualified resolution. Each scan already
+        carries the columns projection pushdown found necessary, so only those
+        are emitted (not the whole table) — a true ``*`` falls back to the
+        catalog.
         """
         seen: set = set()
         for scan in context.scans:
-            table = self.catalog.get_table(
-                scan.datasource, scan.schema_name, scan.table_name
-            )
-            if table is None:
+            names = self._scan_output_columns(scan)
+            if names is None:
                 return False
-            self._expand_scan_columns(scan, table, seen, context)
+            self._expand_scan_columns(scan, names, seen, context)
         return True
 
-    def _expand_scan_columns(self, scan, table, seen: set, context) -> None:
-        """Append one scan's columns as unique-aliased SELECT items."""
-        alias = scan.alias if scan.alias else scan.table_name
+    def _scan_output_columns(self, scan) -> Optional[List[str]]:
+        """Columns a scan must emit: its pruned list, or all when it is ``*``."""
+        if scan.columns and "*" not in scan.columns:
+            return scan.columns
+        table = self.catalog.get_table(
+            scan.datasource, scan.schema_name, scan.table_name
+        )
+        if table is None:
+            return None
+        names: List[str] = []
         for column in table.columns:
-            unique = self._unique_name(column.name, seen)
+            names.append(column.name)
+        return names
+
+    def _expand_scan_columns(self, scan, names: List[str], seen: set, context) -> None:
+        """Append a scan's named columns as unique-aliased SELECT items."""
+        alias = scan.alias if scan.alias else scan.table_name
+        for name in names:
+            unique = self._unique_name(name, seen)
             seen.add(unique)
             context.output_names.append(unique)
-            context.select_items.append(f'{alias}."{column.name}" AS "{unique}"')
-            context.column_aliases[(alias, column.name)] = unique
+            context.select_items.append(f'{alias}."{name}" AS "{unique}"')
+            context.column_aliases[(alias, name)] = unique
 
     def _should_push(self, context: _PushContext) -> bool:
         """Whether this subtree is worth replacing with one remote query."""

@@ -100,6 +100,15 @@ the engine does not have yet:
 3. **A bind / lookup (dependent) join node** for the dynamic-filtering strategy in
    case 1 — this is **G9** in `TODO-phase7-review.md`.
 
+G9 v1 (dynamic filtering for INNER equi-joins, bare-scan probes, single-column
+keys, filter-heuristic build-side selection) is done. The remaining work is
+tracked as a **G9 v2 / v3 checklist** under the G9 entry in
+`TODO-phase7-review.md`: v2 = coverage/correctness (inject into pushed-query
+probes, composite keys, more literal types, see filters inside pushed
+subqueries, config threshold, safe outer cases); v3 = the cost-based /
+new-operator work described above (large build side → merge/streamed join,
+cost-based build-side selection, range pushdown for non-equi joins).
+
 `PhysicalRemoteJoin` is retained as the reference for per-side remote SQL
 generation that partial pushdown (case 2, the accelerator) will reuse. It is a
 candidate for refactor — not deletion — when that work lands. Do not remove it
