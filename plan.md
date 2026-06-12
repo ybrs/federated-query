@@ -6,15 +6,30 @@ This is a production-grade federated query engine that executes SQL queries acro
 
 ## Implementation Status
 
-**Current Implementation State**: Phase 2 Complete, Phase 3 Starting
+**Current Implementation State**: Phases 0–7 complete; Phase 8 (pushdown
+breadth + advanced features) in progress.
 
-- ✅ **Phase 0**: Foundation - Project structure, configuration, catalog, data sources
-- ✅ **Phase 1**: Basic Query Execution - Single-table SELECT queries with filters and limits
-- ✅ **Phase 2**: Joins - Multi-table queries with hash joins and nested loop joins
-- 🚧 **Phase 3**: Aggregations - GROUP BY and aggregate functions (IN PROGRESS)
-- ⏳ **Future Phases**: Optimization, cost-based planning, decorrelation, advanced features
+- ✅ **Phase 0**: Foundation — project structure, configuration, catalog, data sources
+- ✅ **Phase 1**: Basic query execution — single-table SELECT with filters and limits
+- ✅ **Phase 2**: Joins — multi-table queries with hash and nested-loop joins
+- ✅ **Phase 3**: Aggregations — GROUP BY, aggregate functions, HAVING, global aggregates
+- ✅ **Phases 4–6**: Optimizer rules (predicate/projection/aggregate/order-by/limit pushdown,
+  expression simplification), cost stubs, native `EXPLAIN`, statistics scaffolding
+- ✅ **Phase 7**: Subquery decorrelation — EXISTS/IN/ANY/ALL/scalar → joins with exact
+  three-valued NULL semantics; 116/116 decorrelation e2e tests green
+- 🚧 **Phase 8**: Pushdown breadth and advanced SQL (see `TODO-phase7-review.md` section G)
+  - ✅ Set operations (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`) — pushdown + local
+  - ⏳ G1 same-source join breadth, G2 computed-projection pushdown, G3 CTEs,
+    G5 `CAST`, G6 date/time, G7 aggregate `FILTER`, G8 IN-subquery bodies
+  - ⏳ **G9**: cross-source dynamic filtering / semi-join reduction (top usability gap —
+    cross-source joins currently fetch both sides in full)
 
-**Test Status**: 70 tests passing
+**Test Status**: 689 passing / 85 failing (the 85 are the open G-series pushdown-shape
+and feature tests above; no correctness regressions).
+
+**Known limitation**: cross-source joins do not yet use the build side's keys to
+constrain the probe side (no dynamic filtering) — the most important optimization still
+missing for real-world cross-source usability. See G9.
 
 ## Goals
 
@@ -375,11 +390,14 @@ Results (Arrow format)
 - **Solution**: Aggressive pushdown, use partial aggregation, fetch only needed columns
 
 ### 2. Join Strategy Selection
-- **Broadcast Join**: For small tables (< 10K rows or < 10MB)
-- **Shuffle Join**: For large tables with good partitioning key
-- **Semi-Join Pushdown**: Send join keys to reduce data fetched
+- ✅ **Hash Join / Nested-Loop Join**: local strategies, chosen by the planner
+- ✅ **Remote Join**: same-source joins pushed to the source as one query
+- ⏳ **Semi-Join Pushdown** (a.k.a. dynamic filtering): send the build side's
+  join keys to constrain the probe side and reduce data fetched — **not yet
+  implemented; tracked as G9** and the top cross-source usability gap
+- ⏳ **Broadcast / Shuffle Join**: not yet implemented
 
-### 3. Parallel Execution
+### 3. Parallel Execution (⏳ not yet implemented)
 - Fetch from multiple data sources in parallel
 - Pipeline operators where possible
 - Parallel hash join build/probe

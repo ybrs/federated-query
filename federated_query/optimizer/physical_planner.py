@@ -43,6 +43,7 @@ from ..plan.physical import (
     PhysicalGroupedLimit,
 )
 from ..plan.expressions import BinaryOp, BinaryOpType, ColumnRef
+from .single_source_pushdown import SingleSourcePushdown
 from typing import List, Tuple
 from dataclasses import dataclass
 
@@ -70,6 +71,7 @@ class PhysicalPlanner:
             catalog: Catalog for looking up data sources
         """
         self.catalog = catalog
+        self.single_source = SingleSourcePushdown(catalog)
 
     def plan(
         self,
@@ -89,6 +91,9 @@ class PhysicalPlanner:
 
     def _plan_node(self, node: LogicalPlanNode) -> PhysicalPlanNode:
         """Plan a single node."""
+        remote = self.single_source.try_build(node)
+        if remote is not None:
+            return remote
         if isinstance(node, Scan):
             return self._plan_scan(node)
         if isinstance(node, Filter):

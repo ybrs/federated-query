@@ -594,8 +594,8 @@ class TestJoinPushdownReal:
         assert saw_unmatched, "Expected unmatched orders 104/105 with NULL customer names"
         assert len(rows) == 10, f"Expected 10 rows (all orders), got {len(rows)}"
 
-    def test_full_join_not_pushed_down(self, setup_capturing_db):
-        """FULL JOIN should fall back to local execution."""
+    def test_full_join_pushed_down(self, setup_capturing_db):
+        """A same-source FULL OUTER JOIN pushes to the source as one query."""
         catalog, ds = setup_capturing_db
         sql = """
             SELECT c.customer_id, o.order_id
@@ -603,9 +603,8 @@ class TestJoinPushdownReal:
             FULL JOIN testdb.main.orders o ON c.customer_id = o.customer_id
         """
         _, results = execute_and_capture(sql, catalog, ds)
-        assert len(ds.captured_queries) == 2, "FULL JOIN should execute scans separately"
-        for query in ds.captured_queries:
-            assert "JOIN" not in query.upper(), "Fallback scans should not issue JOIN SQL"
+        assert len(ds.captured_queries) == 1, "FULL JOIN should push as one query"
+        assert "JOIN" in ds.captured_queries[0].upper()
         total_rows = 0
         for batch in results:
             total_rows += batch.num_rows

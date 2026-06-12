@@ -42,8 +42,8 @@ def test_scalar_subquery_in_projection_supported(single_source_env):
     assert len(queries) == 2
 
 
-def test_join_condition_with_or_falls_back(single_source_env):
-    """Confirms non-equi OR join predicates fall back to independent scans."""
+def test_join_condition_with_or_pushes_down(single_source_env):
+    """A same-source join with an OR condition pushes as one remote query."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT O.order_id "
@@ -53,8 +53,6 @@ def test_join_condition_with_or_falls_back(single_source_env):
     )
     document = explain_document(runtime, sql)
     queries = document.get("queries", [])
-    assert len(queries) == 2, "unsupported OR join should not stay remote"
-    for entry in queries:
-        select_ast = entry["query"]
-        joins = select_ast.args.get("joins") or []
-        assert not joins
+    assert len(queries) == 1, "single-source OR join should push down"
+    joins = queries[0]["query"].args.get("joins") or []
+    assert len(joins) == 1

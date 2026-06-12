@@ -1178,14 +1178,38 @@ class Parser:
         return args
 
     def _convert_function_call(self, func: exp.Expression) -> FunctionCall:
-        """Convert generic function expressions."""
+        """Convert generic function expressions, preserving every argument."""
         name = func.sql_name().upper()
         args: List[Expression] = []
-        if hasattr(func, "this") and func.this is not None:
-            args.append(self._convert_expression(func.this))
-        for child in func.expressions or []:
-            args.append(self._convert_expression(child))
+        self._collect_function_args(func, args)
         return FunctionCall(function_name=name, args=args, is_aggregate=False)
+
+    def _collect_function_args(
+        self, func: exp.Expression, args: List[Expression]
+    ) -> None:
+        """Gather a function's argument expressions in declaration order.
+
+        Typed functions store arguments under named keys (e.g. NULLIF uses
+        ``this`` and ``expression``), so iterate the node's ``arg_types``. An
+        Anonymous call keeps the function name in ``this``, so only its
+        ``expressions`` list holds real arguments.
+        """
+        if isinstance(func, exp.Anonymous):
+            for child in func.expressions or []:
+                args.append(self._convert_expression(child))
+            return
+        for key in func.arg_types:
+            self._append_function_arg(func.args.get(key), args)
+
+    def _append_function_arg(self, value, args: List[Expression]) -> None:
+        """Convert one argument slot, which may be a node or a list of nodes."""
+        if isinstance(value, exp.Expression):
+            args.append(self._convert_expression(value))
+            return
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, exp.Expression):
+                    args.append(self._convert_expression(item))
 
     def _rewrite_having_predicate(
         self, predicate: Expression, aggregate: Aggregate

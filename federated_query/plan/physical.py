@@ -920,7 +920,21 @@ class PhysicalHashJoin(PhysicalPlanNode):
 
 @dataclass
 class PhysicalRemoteJoin(PhysicalPlanNode):
-    """Join executed directly on a single data source."""
+    """Join executed directly on a single data source.
+
+    NOT dead code — intentionally retained for future selective pushdown.
+    The G1 single-source generator (``optimizer/single_source_pushdown.py``,
+    surfaced as ``PhysicalRemoteQuery``) currently pushes the *whole* maximal
+    same-source subtree, so the planner no longer constructs this node (verified
+    by instrumentation: 0 hits across the suite). It stays because that greedy
+    "push everything" policy breaks down once part of the data lives on the
+    coordinator — most importantly when we run as a query accelerator with a
+    large table cached locally and want to push only the remote portion of a
+    join (e.g. a 3-table join where one table is cached on our side). Reviving
+    selective/partial pushdown will reuse this node's per-side SQL building.
+    See ``selective-pushdown.md`` for the cases and the planned machinery.
+    Do not delete without sign-off.
+    """
 
     left: PhysicalScan
     right: PhysicalScan
@@ -2063,6 +2077,46 @@ def _one_row_dummy_batch() -> pa.RecordBatch:
 
 
 @dataclass
+class PhysicalRemoteQuery(PhysicalPlanNode):
+    """A pushable single-source subtree rendered as one remote SQL query.
+
+    Carries a fully built sqlglot AST (joins, filters, projection, grouping,
+    ordering, and limit all included) that the data source executes in one
+    round trip. ``output_names`` records the result column order so an operator
+    above a cross-source boundary can resolve the produced columns.
+    """
+
+    datasource: str
+    datasource_connection: Any
+    query_ast: Any
+    output_names: List[str]
+    _schema: Optional[pa.Schema] = None
+
+    def children(self) -> List[PhysicalPlanNode]:
+        return []
+
+    def execute(self) -> Iterator[pa.RecordBatch]:
+        self.datasource_connection.ensure_connected()
+        for batch in self.datasource_connection.execute_query(self._sql()):
+            yield batch
+
+    def schema(self) -> pa.Schema:
+        if self._schema is None:
+            self._schema = self.datasource_connection.get_query_schema(self._sql())
+        return self._schema
+
+    def _sql(self) -> str:
+        """Render the carried AST as a Postgres-dialect SQL string."""
+        return self.query_ast.sql(dialect="postgres")
+
+    def estimated_cost(self) -> float:
+        raise NotImplementedError("Cost estimation not yet implemented")
+
+    def __repr__(self) -> str:
+        return f"PhysicalRemoteQuery({self.datasource})"
+
+
+@dataclass
 class PhysicalUnion(PhysicalPlanNode):
     """Concatenates input streams; optionally removes duplicate rows."""
 
@@ -2764,6 +2818,8 @@ class _DatasourceQueryCollector:
             self._record_remote_join(node, snapshots)
         elif isinstance(node, PhysicalRemoteSetOp):
             self._record_remote_set_op(node, snapshots)
+        elif isinstance(node, PhysicalRemoteQuery):
+            self._record_remote_query(node, snapshots)
 
     def _record_scan(
         self, scan: PhysicalScan, snapshots: List[_DatasourceQuerySnapshot]
@@ -2795,4 +2851,13 @@ class _DatasourceQueryCollector:
         query_ast = set_op.build_remote_ast()
         sql = query_ast.sql(dialect="postgres")
         snapshot = _DatasourceQuerySnapshot(set_op.datasource, sql, query_ast)
+        snapshots.append(snapshot)
+
+    def _record_remote_query(
+        self, node: "PhysicalRemoteQuery", snapshots: List[_DatasourceQuerySnapshot]
+    ) -> None:
+        if node.datasource_connection is None:
+            return
+        sql = node.query_ast.sql(dialect="postgres")
+        snapshot = _DatasourceQuerySnapshot(node.datasource, sql, node.query_ast)
         snapshots.append(snapshot)

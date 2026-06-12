@@ -155,10 +155,12 @@ def test_arithmetic_with_null_handling(single_source_env):
     predicate = unwrap_parens(where_clause.this)
     assert isinstance(predicate, exp.And)
 
+    # ``x IS NOT NULL`` is represented as NOT(x IS NULL); sqlglot parses that
+    # rendered form back into exp.Not wrapping the null check.
     left_pred = unwrap_parens(predicate.left)
     right_pred = unwrap_parens(predicate.right)
-    assert isinstance(left_pred, exp.Is)
-    assert isinstance(right_pred, exp.Is)
+    assert isinstance(left_pred, exp.Not)
+    assert isinstance(right_pred, exp.Not)
 
 
 def test_arithmetic_in_select_projection(single_source_env):

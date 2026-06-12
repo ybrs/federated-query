@@ -10,9 +10,12 @@ inspection.
 
 ## STATUS (updated 2026-06-11, branch `parsing_explain`)
 
-689 passed / 85 failed (from 645/125 baseline); decorrelation suite green;
-**G4 set operations done** (10 e2e_pushdown tests green, no regressions);
-remaining failures are dominated by **G1–G3, G5–G8** feature work. Verified
+726 passed / 48 failed (from 645/125 baseline); decorrelation suite green;
+**G4 set operations + G1 join breadth + G2 computed projections done** (no
+regressions); remaining failures are **G3 CTEs (10), G6 date/time (7),
+subqueries/G8 (20), G7 aggregate FILTER, NATURAL/USING (3), and assorted
+null/edge cases**. G9 (cross-source dynamic filtering) is still untracked-by-
+tests real-world work. Verified
 correctness/silent-fail items are checked off. PARTIAL = some sub-cases remain
 (noted inline); DEFERRED = moderate/decision/perf/architectural, none are
 silent corruption (they raise clean errors or are documented deviations).
@@ -271,15 +274,38 @@ These tests assert PUSHDOWN SHAPES (the remote SQL sent to the datasource),
 not result correctness — many produce correct results today via local
 execution. All were failing before Phase 7.
 
-- [ ] **G1. Join pushdown too narrow (~37 tests)** — `_is_remote_join_candidate`
-  only pushes Scan⨝Scan INNER/LEFT/RIGHT equi-joins. Needed: multi-table
-  same-source joins, SEMI/ANTI (decorrelated subqueries → single remote
-  query), non-equi conditions, FULL OUTER, computed keys. Phase 8 work;
-  depends on F3.
-- [ ] **G2. Computed projection pushdown (~14 tests)** — `SELECT UPPER(x) AS y`
-  fetches base columns and computes locally; tests assert the alias appears
-  in remote SQL. Results are correct; needs a projection-expression pushdown
-  rule + capability checks.
+- [x] **G1. Join pushdown breadth — DONE except NATURAL/USING (3 tests).**
+  Replaced the narrow binary `_is_remote_join_candidate` path with a unified
+  single-source SQL generator: `federated_query/optimizer/single_source_pushdown.py`
+  (`SingleSourcePushdown`) renders any same-source subtree
+  (projection / aggregate / left-deep join-tree / filtered scans) into ONE flat
+  remote `SELECT`, surfaced as a new `PhysicalRemoteQuery` node. Invoked at the
+  top of `PhysicalPlanner._plan_node`, so it fires for the maximal pushable
+  subtree and leaves cross-source boundaries to local operators. Now pushes:
+  multi-table (N-way) same-source joins, FULL OUTER, self-joins, non-equi/OR/
+  computed join conditions, and top-level WHERE (WHERE pushes; HAVING stays
+  local, matching the established aggregate convention). Several tests that
+  enshrined the old 2-table-only / split-query / FULL-not-pushed behavior were
+  updated to assert the improved single-query pushdown.
+  REMAINING: NATURAL JOIN and `USING (...)` (3 tests in test_advanced_join_types)
+  — the logical `Join` node has only `condition`, so these need new
+  natural/using fields through parser+binder+generator; deferred (niche, and
+  test_join_with_using_single_column even uses a column absent from one table,
+  so it is shape-only). NOTE: the planner no longer constructs
+  `PhysicalRemoteJoin` (the generator handles every single-source join), but it
+  is **intentionally retained** — not deleted — for future selective/partial
+  pushdown (query accelerator with locally-cached tables: push only the remote
+  portion of a join). See `selective-pushdown.md` and the class comment.
+- [x] **G2. Computed projection pushdown — DONE.** The same generator pushes a
+  computed, non-aggregate projection (`UPPER(x)`, `a || b`, `price*quantity`,
+  CASE/CAST) into the remote `SELECT` for single-table queries too (gated on a
+  computed expression so plain bare-column scans keep the existing path). Also
+  fixed two enabling bugs: `ColumnRef.to_sql` now quotes reserved-word
+  identifiers (memoized re-parse check — `"select"` was emitting invalid SQL),
+  and `Parser._convert_function_call` now collects every argument via the
+  function's `arg_types` (NULLIF/typed funcs were dropping their 2nd arg).
+  Test-helper `find_alias_expression`/`find_in_select` now unwrap parens
+  (BinaryOp.to_sql parenthesizes for precedence).
 - [ ] **G3. CTEs (10 tests)** — parser raises (fail-fast added in Phase 7;
   previously silently dropped). Needs parser+binder+planner support.
 - [x] **G4. Set operations (10 tests)** — DONE. UNION/INTERSECT/EXCEPT now
@@ -303,6 +329,49 @@ execution. All were failing before Phase 7.
   CURRENT_DATE pushdown.
 - [ ] **G7. Aggregate FILTER clause (2 tests)**.
 - [ ] **G8. IN-subquery bodies ending in Filter/Sort (3 tests)** — overlaps B4.
+  Includes a UNION used as an IN-subquery body (`test_subquery_with_union`),
+  which currently raises a clean `BindingError` from the subquery binder
+  ("Unsupported plan node in subquery: SetOperation"); the subquery binder +
+  IN-subquery decorrelation must learn to handle a `SetOperation` body.
+
+- [ ] **G9. Cross-source dynamic filtering / semi-join reduction (NO test
+  coverage yet — real-world usability, not a shape test).** When a join spans
+  two data sources it cannot be pushed to one engine, so today BOTH sides are
+  fetched in full and joined locally — the probe side ships its entire table
+  over the network. A real federated engine constrains the probe side with the
+  build side's join keys (Trino calls this *dynamic filtering*; the literature,
+  *semi-join reduction* / *sideways information passing*). This is the single
+  most important optimization for cross-source usability and is currently
+  absent (grep: no dynamic-filter/reducer/IN-injection infra anywhere).
+  Observed:
+  ```
+  SELECT count(*) FROM postgres_prod.public.catalog C,
+                       local_duckdb.main.catalog_access A
+   WHERE A.catalog_id = C.id AND C.id = '661c…';
+  -- postgres_prod: SELECT "id" FROM catalog WHERE id = '661c…'   (1 row)
+  -- local_duckdb:  SELECT "catalog_id" FROM catalog_access       (WHOLE TABLE)
+  ```
+  Wanted: `local_duckdb: SELECT "catalog_id" FROM catalog_access WHERE
+  "catalog_id" IN (<keys from the postgres side>)`.
+  Two coupled parts:
+  - **G9a (prerequisite).** A comma/cross join with a two-sided equi-predicate
+    in WHERE is left as `Filter(a.x=b.y)` over a condition-less `Join`
+    (`PredicatePushdownRule._push_filter_below_join`, rules.py:383, only pushes
+    single-side predicates), so it plans to a `PhysicalNestedLoopJoin`
+    (Cartesian product) + filter instead of a hash join. Promote a two-sided
+    equality into the join condition so it becomes a `PhysicalHashJoin` with
+    real keys — also the prerequisite for G9b (the reducer needs the keys).
+  - **G9b.** Execute the build side first, collect its distinct join-key
+    values, inject `WHERE probe_key IN (…)` into the probe-side scan's remote
+    SQL at runtime (a dynamic filter). Needs executor build-before-probe
+    ordering and a `PhysicalScan` that accepts a runtime-injected predicate.
+    Guards: build-side cardinality threshold (fall back to full fetch when the
+    key set is too large — `log` the fallback, never silently truncate), plain
+    column keys only, probe side is a remote scan, NULL-key handling, and an
+    empty key set ⇒ probe yields nothing.
+  Sequencing decision (2026-06-11): tackle **G1 + G2 first** (same-source join
+  pushdown is foundational and shares the equi-key machinery G9a needs), then
+  G9.
 
 ## H. Test-suite bugs (cheap wins, ~28 of the 125)
 

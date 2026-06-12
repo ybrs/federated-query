@@ -2,11 +2,43 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, List, Optional, Tuple, TYPE_CHECKING
 from enum import Enum
 
 if TYPE_CHECKING:
     from .logical import LogicalPlanNode
+
+
+@lru_cache(maxsize=None)
+def _identifier_needs_quoting(name: str) -> bool:
+    """Whether a bare identifier must be quoted to be valid SQL.
+
+    A reserved word (e.g. ``select``, ``order``) does not round-trip as a plain
+    column name, so it must be double-quoted. Checked once per name by
+    re-parsing ``SELECT <name>`` and caching the result.
+    """
+    import sqlglot
+    from sqlglot import exp
+    from sqlglot.errors import ParseError
+
+    try:
+        parsed = sqlglot.parse_one(f"SELECT {name}")
+    except ParseError:
+        return True
+    selected = parsed.expressions[0] if parsed.expressions else None
+    return not (
+        isinstance(selected, exp.Column) and selected.name.upper() == name.upper()
+    )
+
+
+def render_identifier(name: str) -> str:
+    """Render a column/identifier name, quoting it when SQL requires it."""
+    if name == "*":
+        return name
+    if _identifier_needs_quoting(name):
+        return f'"{name}"'
+    return name
 
 
 class DataType(Enum):
@@ -61,9 +93,10 @@ class ColumnRef(Expression):
         return visitor.visit_column_ref(self)
 
     def to_sql(self) -> str:
+        column = render_identifier(self.column)
         if self.table:
-            return f"{self.table}.{self.column}"
-        return self.column
+            return f"{self.table}.{column}"
+        return column
 
     def __repr__(self) -> str:
         if self.table:

@@ -86,7 +86,7 @@ def test_join_with_order_by_after_aggregation(single_source_env):
 
 
 def test_join_distinct_stays_remote(single_source_env):
-    """Checks DISTINCT joins still plan a single remote join query."""
+    """Checks a DISTINCT join pushes the exact projection with remote DISTINCT."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT DISTINCT O.region, P.category "
@@ -99,12 +99,8 @@ def test_join_distinct_stays_remote(single_source_env):
     query_ast = document["queries"][0]["query"]
     join_tables = join_table_names(query_ast)
     assert "products" in join_tables
-    assert set(select_column_names(query_ast)) == {
-        "region",
-        "product_id",
-        "category",
-        "id",
-    }
+    assert query_ast.args.get("distinct") is not None
+    assert set(select_column_names(query_ast)) == {"region", "category"}
 
 
 def test_join_with_case_expression_and_limit(single_source_env):
