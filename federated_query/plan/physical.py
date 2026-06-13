@@ -35,6 +35,12 @@ _LOGGER = get_logger(__name__)
 # cost-based choice would replace this constant later.
 _DYNAMIC_FILTER_MAX_KEYS = 2000
 
+# Names under which a hash join registers its two inputs with the merge engine.
+# Each join runs on its own DuckDB cursor, so these fixed names never collide
+# across nested joins.
+_MERGE_LEFT_RELATION = "in_left"
+_MERGE_RIGHT_RELATION = "in_right"
+
 
 class PhysicalPlanNode(ABC):
     """Base class for physical plan nodes."""
@@ -65,6 +71,14 @@ class PhysicalPlanNode(ABC):
     def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
         """Optional mapping from (table, column) to physical column name."""
         return {}
+
+    def set_merge_engine(self, engine: Any) -> None:
+        """Attach the per-query DuckDB merge engine used for local execution."""
+        self._merge_engine = engine
+
+    def merge_engine(self) -> Any:
+        """Return the attached merge engine, or None when none was attached."""
+        return getattr(self, "_merge_engine", None)
 
     def apply_dynamic_filter(
         self, key_columns: List[Expression], value_tuples: List[tuple]
@@ -116,6 +130,36 @@ def _literal_for_value(value):
     if data_type is None:
         return None
     return Literal(value=value, data_type=data_type)
+
+
+def _table_from_batches(batches: List[pa.RecordBatch], schema: pa.Schema) -> pa.Table:
+    """Build an Arrow table from batches, falling back to an empty typed table."""
+    if not batches:
+        return schema.empty_table()
+    return pa.Table.from_batches(batches)
+
+
+def _prepend_batch(first: pa.RecordBatch, rest) -> Iterator[pa.RecordBatch]:
+    """Yield an already-pulled first batch, then the remaining batches."""
+    yield first
+    yield from rest
+
+
+def _streaming_reader(node: "PhysicalPlanNode") -> pa.RecordBatchReader:
+    """Expose a node's output as a lazy reader without materializing it.
+
+    DuckDB pulls batches from this reader on demand, so the (often large) probe
+    side is streamed, never drained into a table by us. A single batch is peeked
+    to learn the real output schema (a node's declared ``schema()`` can drift
+    from what it actually yields); the rest stay lazy.
+    """
+    batches = node.execute()
+    first = next(batches, None)
+    if first is None:
+        return pa.RecordBatchReader.from_batches(node.schema(), iter(()))
+    return pa.RecordBatchReader.from_batches(
+        first.schema, _prepend_batch(first, batches)
+    )
 
 
 def _join_output_aliases(
@@ -668,6 +712,12 @@ class PhysicalHashJoin(PhysicalPlanNode):
                 yield batch
             return
 
+        engine = self.merge_engine()
+        if engine is not None and self.join_type == JoinType.INNER:
+            for batch in self._execute_inner_merge(engine):
+                yield batch
+            return
+
         if self.build_side == "right":
             build_node = self.right
             probe_node = self.left
@@ -798,6 +848,124 @@ class PhysicalHashJoin(PhysicalPlanNode):
             )
             return False
         return True
+
+    def _execute_inner_merge(self, engine) -> Iterator[pa.RecordBatch]:
+        """Run an INNER equi-join through the DuckDB merge engine.
+
+        The build side is materialized once (its keys feed the G9 dynamic probe
+        filter, and a hash join must read all build rows anyway). The output is
+        rendered from the actual materialized input schemas, so its column names
+        and types match the row-at-a-time path the engine relies on. The result
+        streams back from DuckDB.
+        """
+        build_batches = self._materialize_build()
+        if not build_batches:
+            return iter(())
+        self._reduce_probe_from_build(build_batches)
+        inputs = self._merge_inputs(build_batches)
+        left_schema = inputs[_MERGE_LEFT_RELATION].schema
+        right_schema = inputs[_MERGE_RIGHT_RELATION].schema
+        sql = self._inner_join_sql(left_schema, right_schema)
+        return engine.run(sql, inputs)
+
+    def _build_probe_sides(self):
+        """Return (build_node, probe_node, build_keys, probe_keys) per build_side."""
+        if self.build_side == "right":
+            return self.right, self.left, self.right_keys, self.left_keys
+        return self.left, self.right, self.left_keys, self.right_keys
+
+    def _materialize_build(self) -> List[pa.RecordBatch]:
+        """Read the build side fully into a list of batches."""
+        build_node = self._build_probe_sides()[0]
+        batches = []
+        for batch in build_node.execute():
+            batches.append(batch)
+        return batches
+
+    def _reduce_probe_from_build(self, build_batches: List[pa.RecordBatch]) -> None:
+        """Push the build side's distinct keys into the probe as an IN filter."""
+        build_node, probe_node, build_keys, probe_keys = self._build_probe_sides()
+        key_set = self._distinct_build_keys(build_batches, build_node, build_keys)
+        self._maybe_reduce_probe(probe_node, probe_keys, key_set)
+
+    def _distinct_build_keys(
+        self, build_batches: List[pa.RecordBatch], build_node, build_keys
+    ) -> Dict[tuple, bool]:
+        """Collect distinct non-NULL build-key tuples from materialized batches."""
+        aliases = build_node.column_aliases()
+        keys: Dict[tuple, bool] = {}
+        for batch in build_batches:
+            values = self._extract_key_values(batch, build_keys, aliases)
+            for row_idx in range(batch.num_rows):
+                key = _row_key_tuple(values, row_idx)
+                if None not in key:
+                    keys[key] = True
+        return keys
+
+    def _merge_inputs(self, build_batches: List[pa.RecordBatch]) -> Dict[str, object]:
+        """Map self.left/self.right to the DuckDB relations under stable names.
+
+        ``self.left`` always registers as the left relation and ``self.right``
+        as the right, regardless of which side is built, so the output column
+        order does not depend on the build/probe choice. The build side is
+        already materialized (a hash join must read all build rows, and its keys
+        feed the G9 probe filter); the probe side is handed to DuckDB as a lazy
+        streaming reader and is never drained into a table by us.
+        """
+        build_node, probe_node, _, _ = self._build_probe_sides()
+        build_table = _table_from_batches(build_batches, build_node.schema())
+        probe_reader = _streaming_reader(probe_node)
+        if self.build_side == "right":
+            return {
+                _MERGE_LEFT_RELATION: probe_reader,
+                _MERGE_RIGHT_RELATION: build_table,
+            }
+        return {
+            _MERGE_LEFT_RELATION: build_table,
+            _MERGE_RIGHT_RELATION: probe_reader,
+        }
+
+    def _inner_join_sql(self, left_schema: pa.Schema, right_schema: pa.Schema) -> str:
+        """Render the INNER equi-join SELECT over the registered relations."""
+        return (
+            f"SELECT {self._merge_select_list(left_schema, right_schema)} "
+            f"FROM {_MERGE_LEFT_RELATION} AS l "
+            f"INNER JOIN {_MERGE_RIGHT_RELATION} AS r "
+            f"ON {self._merge_on_clause()}"
+        )
+
+    def _merge_select_list(
+        self, left_schema: pa.Schema, right_schema: pa.Schema
+    ) -> str:
+        """Alias left then right columns to reproduce the join output schema.
+
+        The actual materialized input schemas are used (not ``schema()``) so the
+        output matches the row-at-a-time path, which reads real batch fields;
+        a right column whose name collides with a left one is renamed with the
+        ``right_`` prefix, exactly as ``_join_rows`` does.
+        """
+        left_names = left_schema.names
+        left_name_set = set(left_names)
+        parts = []
+        for name in left_names:
+            parts.append(f'l."{name}" AS "{name}"')
+        for field in right_schema:
+            output_name = field.name
+            if output_name in left_name_set:
+                output_name = f"right_{output_name}"
+            parts.append(f'r."{field.name}" AS "{output_name}"')
+        return ", ".join(parts)
+
+    def _merge_on_clause(self) -> str:
+        """Render the equi-join condition as l.key = r.key conjuncts."""
+        left_aliases = self.left.column_aliases()
+        right_aliases = self.right.column_aliases()
+        conjuncts = []
+        for left_key, right_key in zip(self.left_keys, self.right_keys):
+            left_name = self._resolve_key_name(left_key, left_aliases)
+            right_name = self._resolve_key_name(right_key, right_aliases)
+            conjuncts.append(f'l."{left_name}" = r."{right_name}"')
+        return " AND ".join(conjuncts)
 
     def _extract_key_values(
         self, batch: pa.RecordBatch, keys: List[Expression], aliases=None

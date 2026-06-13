@@ -8,6 +8,7 @@ import pyarrow as pa
 
 from ..catalog import Catalog
 from ..executor import Executor
+from ..executor.profiling import QueryProfiler, profiling_enabled, stage_timer
 from ..optimizer import PhysicalPlanner, RuleBasedOptimizer
 from ..optimizer.decorrelation import Decorrelator
 from ..parser import Binder, Parser
@@ -60,19 +61,44 @@ class QueryExecutor:
         self.decorrelator = decorrelator
         self.input_query = ""
         self.query_context = QueryContext("")
+        self.last_profile_report: Optional[str] = None
 
     def execute(self, sql: str) -> Union[pa.Table, dict]:
         """Run the full query pipeline with middleware hooks."""
         self.input_query = sql
         self.query_context = QueryContext(sql)
-        rewritten_sql = self._run_before_processors(sql)
-        logical_plan = self._parse_query(rewritten_sql)
-        bound_plan = self._bind_plan(logical_plan)
-        decorrelated_plan = self._decorrelate_plan(bound_plan)
-        optimized_plan = self._optimize_plan(decorrelated_plan)
-        physical_plan = self._build_physical_plan(optimized_plan)
-        raw_result = self._run_physical_plan(physical_plan)
+        profiler = QueryProfiler() if profiling_enabled() else None
+        result = self._execute_pipeline(sql, profiler)
+        self.last_profile_report = profiler.report() if profiler else None
+        return result
+
+    def _execute_pipeline(
+        self, sql: str, profiler: Optional[QueryProfiler]
+    ) -> Union[pa.Table, dict]:
+        """Run parse → bind → decorrelate → optimize → plan → execute, timed."""
+        physical_plan = self._plan_pipeline(sql, profiler)
+        if profiler is not None:
+            profiler.instrument(physical_plan)
+        with stage_timer(profiler, "execute"):
+            raw_result = self._run_physical_plan(physical_plan)
         return self._run_after_processors(raw_result)
+
+    def _plan_pipeline(
+        self, sql: str, profiler: Optional[QueryProfiler]
+    ) -> PhysicalPlanNode:
+        """Run and time the planning stages, returning the physical plan."""
+        with stage_timer(profiler, "before"):
+            rewritten_sql = self._run_before_processors(sql)
+        with stage_timer(profiler, "parse"):
+            logical_plan = self._parse_query(rewritten_sql)
+        with stage_timer(profiler, "bind"):
+            bound_plan = self._bind_plan(logical_plan)
+        with stage_timer(profiler, "decorrelate"):
+            decorrelated_plan = self._decorrelate_plan(bound_plan)
+        with stage_timer(profiler, "optimize"):
+            optimized_plan = self._optimize_plan(decorrelated_plan)
+        with stage_timer(profiler, "plan"):
+            return self._build_physical_plan(optimized_plan)
 
     def _run_before_processors(self, sql: str) -> str:
         """Execute processor hooks before planning."""

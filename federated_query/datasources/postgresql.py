@@ -23,15 +23,18 @@ logger = logging.getLogger(__name__)
 
 
 def _hex_byte_table() -> np.ndarray:
-    """Build the 256-entry table of two-hex-char strings, one per byte value."""
+    """Build the 256-entry table of two-hex-char ascii bytes, one per byte value."""
     table = []
     for value in range(256):
-        table.append("%02x" % value)
-    return np.array(table, dtype="U2")
+        table.append(b"%02x" % value)
+    return np.array(table, dtype="S2")
 
 
 # Used to format uuid bytes vectorized (no per-row Python uuid/hex call).
 _HEX256 = _hex_byte_table()
+# Canonical uuid text is 32 hex chars plus 4 dashes (8-4-4-4-12).
+_UUID_TEXT_WIDTH = 36
+_DASH = ord("-")
 
 
 class PostgreSQLDataSource(DataSource):
@@ -262,8 +265,16 @@ class PostgreSQLDataSource(DataSource):
         return self._execute_query_psycopg2(query)
 
     def _execute_query_psycopg2(self, query: str) -> Iterator[pa.RecordBatch]:
-        """Execute via psycopg2, building Arrow batches per fetched chunk."""
+        """Execute via psycopg2, building Arrow batches per fetched chunk.
+
+        The read runs in autocommit mode so the SELECT does not leave the
+        connection idle-in-transaction holding an AccessShareLock. The result is
+        streamed (handed to the merge engine as a lazy reader), so it may be
+        abandoned on an upstream early stop; without autocommit that lingering
+        lock would block later DDL such as DROP. The ADBC path does the same.
+        """
         conn = self._get_connection()
+        conn.autocommit = True
         try:
             with conn.cursor() as cursor:
                 logger.debug(f"Executing query on {self.name}: {query[:100]}...")
@@ -284,7 +295,12 @@ class PostgreSQLDataSource(DataSource):
             logger.error(f"Query execution failed on {self.name}: {e}")
             raise
         finally:
-            self._return_connection(conn)
+            self._release_read_connection(conn)
+
+    def _release_read_connection(self, conn) -> None:
+        """Restore transactional mode and return a read connection to the pool."""
+        conn.autocommit = False
+        self._return_connection(conn)
 
     def _execute_query_adbc(self, query: str) -> Iterator[pa.RecordBatch]:
         """Execute via the ADBC driver, returning Arrow directly."""
@@ -384,36 +400,50 @@ class PostgreSQLDataSource(DataSource):
     def _uuid_bytes_to_string(self, storage) -> pa.Array:
         """Format a binary(16) uuid column to canonical strings, vectorized.
 
-        Reshapes the contiguous bytes to (n, 16), maps each byte through the hex
-        table, and joins the dashed groups with numpy string ops — no per-row
-        Python loop. NULL slots carry garbage bytes, masked back out at the end.
+        Renders every row's 36-char text into one contiguous byte buffer (hex
+        bytes via a lookup table, dashes at the fixed positions) and wraps it as
+        a string array through fixed-width offsets — no per-row Python and no
+        slow numpy string concatenation. NULLs are restored at the end.
         """
-        count = len(storage)
         fixed = pc.cast(storage, pa.binary(16))
+        count = len(fixed)
+        text = self._render_uuid_text(fixed, count)
+        array = self._string_array_from_fixed_width(text, count)
+        return self._restore_nulls(array, fixed)
+
+    def _render_uuid_text(self, fixed, count: int) -> np.ndarray:
+        """Render ``count`` uuids into a contiguous (count, 36) byte matrix."""
         raw = np.frombuffer(fixed.buffers()[1], dtype=np.uint8)
         start = fixed.offset * 16
         matrix = raw[start : start + count * 16].reshape(count, 16)
-        text = self._join_uuid_groups(_HEX256[matrix])
+        hex_bytes = np.frombuffer(_HEX256[matrix].tobytes(), dtype=np.uint8)
+        return self._lay_out_uuid(hex_bytes.reshape(count, 32), count)
+
+    def _lay_out_uuid(self, hex_bytes: np.ndarray, count: int) -> np.ndarray:
+        """Place 32 hex bytes and 4 dashes into the 8-4-4-4-12 canonical layout."""
+        out = np.empty((count, _UUID_TEXT_WIDTH), dtype=np.uint8)
+        out[:, 8] = out[:, 13] = out[:, 18] = out[:, 23] = _DASH
+        out[:, 0:8] = hex_bytes[:, 0:8]
+        out[:, 9:13] = hex_bytes[:, 8:12]
+        out[:, 14:18] = hex_bytes[:, 12:16]
+        out[:, 19:23] = hex_bytes[:, 16:20]
+        out[:, 24:36] = hex_bytes[:, 20:32]
+        return out
+
+    def _string_array_from_fixed_width(self, text: np.ndarray, count: int) -> pa.Array:
+        """Wrap a (count, width) byte matrix as a UTF-8 string array."""
+        width = _UUID_TEXT_WIDTH
+        offsets = np.arange(0, width * (count + 1), width, dtype=np.int32)
+        return pa.StringArray.from_buffers(
+            count, pa.py_buffer(offsets.tobytes()), pa.py_buffer(text.tobytes())
+        )
+
+    def _restore_nulls(self, array: pa.Array, fixed) -> pa.Array:
+        """Mark rows null wherever the source uuid column was null."""
         mask = pc.is_null(fixed).to_numpy(zero_copy_only=False)
-        return pa.array(text, mask=mask, type=pa.string())
-
-    def _join_uuid_groups(self, pairs: np.ndarray) -> np.ndarray:
-        """Join the 8-4-4-4-12 hex groups of each row into a dashed uuid."""
-        groups = [(0, 4), (4, 6), (6, 8), (8, 10), (10, 16)]
-        rendered = []
-        for start, stop in groups:
-            rendered.append(self._concat_columns(pairs, start, stop))
-        out = rendered[0]
-        for group in rendered[1:]:
-            out = np.char.add(np.char.add(out, "-"), group)
-        return out
-
-    def _concat_columns(self, pairs: np.ndarray, start: int, stop: int) -> np.ndarray:
-        """Concatenate the hex-pair columns ``[start, stop)`` row-wise."""
-        out = pairs[:, start]
-        for index in range(start + 1, stop):
-            out = np.char.add(out, pairs[:, index])
-        return out
+        if not mask.any():
+            return array
+        return pc.if_else(pa.array(~mask), array, pa.scalar(None, type=pa.string()))
 
     def _extract_column_names(self, description) -> List[str]:
         """Extract column names from cursor description."""

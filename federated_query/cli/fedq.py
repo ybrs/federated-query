@@ -90,6 +90,9 @@ class FedQRuntime:
         self.planner = PhysicalPlanner(catalog)
         self.decorrelator = Decorrelator()
         physical_executor = Executor(executor_config)
+        # Warm the local merge engine now so the first query in the session does
+        # not absorb DuckDB's one-time thread-pool / operator setup cost.
+        physical_executor.warmup()
         processors = [StarExpansionProcessor(catalog, dialect=self.parser.dialect)]
         self.query_executor = QueryExecutor(
             catalog=catalog,
@@ -381,6 +384,7 @@ class FedQRepl:
                 click.echo(f"EXPLAIN completed in {elapsed:.2f} ms")
             else:
                 self.printer.display(result, elapsed)
+            self._emit_profile()
         except (
             ValueError,
             RuntimeError,
@@ -392,6 +396,12 @@ class FedQRepl:
             click.echo(f"error: {exc}")
         except Exception as exc:
             click.echo(f"unexpected error: {exc}")
+
+    def _emit_profile(self) -> None:
+        """Print the per-query profiling breakdown when FEDQ_PROFILE is set."""
+        report = self.runtime.query_executor.last_profile_report
+        if report:
+            click.echo(report)
 
     def _clean_statement(self, statement: str) -> str:
         clean = statement.strip()
