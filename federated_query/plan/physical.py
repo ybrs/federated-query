@@ -40,6 +40,10 @@ _DYNAMIC_FILTER_MAX_KEYS = 2000
 # across nested joins.
 _MERGE_LEFT_RELATION = "in_left"
 _MERGE_RIGHT_RELATION = "in_right"
+# Name under which an aggregate registers its single input with the merge engine.
+_MERGE_AGG_RELATION = "in_agg"
+# Name under which a sort registers its single input with the merge engine.
+_MERGE_SORT_RELATION = "in_sort"
 
 
 class PhysicalPlanNode(ABC):
@@ -137,6 +141,25 @@ def _table_from_batches(batches: List[pa.RecordBatch], schema: pa.Schema) -> pa.
     if not batches:
         return schema.empty_table()
     return pa.Table.from_batches(batches)
+
+
+def _cast_batch_to_schema(batch: pa.RecordBatch, target: pa.Schema) -> pa.RecordBatch:
+    """Cast each column of a batch to the target schema's types.
+
+    DuckDB may return a different-but-compatible type for an aggregate (e.g.
+    a wide SUM); aligning to the operator's declared schema keeps the output
+    contract stable for parent operators.
+    """
+    import pyarrow.compute as pc
+
+    arrays = []
+    for index, field in enumerate(target):
+        column = batch.column(index)
+        if column.type == field.type:
+            arrays.append(column)
+        else:
+            arrays.append(pc.cast(column, field.type))
+    return pa.RecordBatch.from_arrays(arrays, names=list(target.names))
 
 
 def _prepend_batch(first: pa.RecordBatch, rest) -> Iterator[pa.RecordBatch]:
@@ -703,20 +726,19 @@ class PhysicalHashJoin(PhysicalPlanNode):
         return [self.left, self.right]
 
     def execute(self) -> Iterator[pa.RecordBatch]:
-        """Execute hash join."""
-        from collections import defaultdict
-        from .expressions import ColumnRef
-
-        if self.join_type in (JoinType.SEMI, JoinType.ANTI):
-            for batch in self._execute_semi_anti():
-                yield batch
-            return
-
+        """Execute the hash join, via the merge engine when one is attached."""
         engine = self.merge_engine()
-        if engine is not None and self.join_type == JoinType.INNER:
-            for batch in self._execute_inner_merge(engine):
-                yield batch
+        if engine is not None:
+            yield from self._execute_merge(engine)
             return
+        if self.join_type in (JoinType.SEMI, JoinType.ANTI):
+            yield from self._execute_semi_anti()
+            return
+        yield from self._execute_row_loop()
+
+    def _execute_row_loop(self) -> Iterator[pa.RecordBatch]:
+        """Row-at-a-time hash join (fallback when no merge engine is attached)."""
+        from collections import defaultdict
 
         if self.build_side == "right":
             build_node = self.right
@@ -849,6 +871,33 @@ class PhysicalHashJoin(PhysicalPlanNode):
             return False
         return True
 
+    def _execute_merge(self, engine) -> Iterator[pa.RecordBatch]:
+        """Run the join through DuckDB; INNER keeps the G9 build-materialize path."""
+        if self.join_type == JoinType.INNER:
+            return self._execute_inner_merge(engine)
+        return self._execute_streamed_merge(engine)
+
+    def _execute_streamed_merge(self, engine) -> Iterator[pa.RecordBatch]:
+        """Run a non-INNER join (LEFT/RIGHT/FULL/SEMI/ANTI) through DuckDB.
+
+        These keep every non-matching row, so the G9 probe reduction does not
+        apply. The right side is drained into a table first — exactly as the
+        row-at-a-time path drains the build side — so its source connection is
+        released before the left side streams; otherwise deeply nested joins
+        hold a connection open at every level and exhaust the pool. The left
+        side streams.
+        """
+        right_table = _table_from_batches(
+            list(self.right.execute()), self.right.schema()
+        )
+        left_reader = _streaming_reader(self.left)
+        inputs = {
+            _MERGE_LEFT_RELATION: left_reader,
+            _MERGE_RIGHT_RELATION: right_table,
+        }
+        sql = self._join_sql(left_reader.schema, right_table.schema)
+        return engine.run(sql, inputs)
+
     def _execute_inner_merge(self, engine) -> Iterator[pa.RecordBatch]:
         """Run an INNER equi-join through the DuckDB merge engine.
 
@@ -865,7 +914,7 @@ class PhysicalHashJoin(PhysicalPlanNode):
         inputs = self._merge_inputs(build_batches)
         left_schema = inputs[_MERGE_LEFT_RELATION].schema
         right_schema = inputs[_MERGE_RIGHT_RELATION].schema
-        sql = self._inner_join_sql(left_schema, right_schema)
+        sql = self._join_sql(left_schema, right_schema)
         return engine.run(sql, inputs)
 
     def _build_probe_sides(self):
@@ -925,14 +974,42 @@ class PhysicalHashJoin(PhysicalPlanNode):
             _MERGE_RIGHT_RELATION: probe_reader,
         }
 
-    def _inner_join_sql(self, left_schema: pa.Schema, right_schema: pa.Schema) -> str:
-        """Render the INNER equi-join SELECT over the registered relations."""
+    def _join_sql(self, left_schema: pa.Schema, right_schema: pa.Schema) -> str:
+        """Render the join SELECT for this join type over the registered relations."""
+        select_list = self._merge_select_list_for_type(left_schema, right_schema)
         return (
-            f"SELECT {self._merge_select_list(left_schema, right_schema)} "
+            f"SELECT {select_list} "
             f"FROM {_MERGE_LEFT_RELATION} AS l "
-            f"INNER JOIN {_MERGE_RIGHT_RELATION} AS r "
+            f"{self._merge_join_keyword()} {_MERGE_RIGHT_RELATION} AS r "
             f"ON {self._merge_on_clause()}"
         )
+
+    def _merge_join_keyword(self) -> str:
+        """Map the join type to its DuckDB SQL join keyword."""
+        keywords = {
+            JoinType.INNER: "INNER JOIN",
+            JoinType.LEFT: "LEFT JOIN",
+            JoinType.RIGHT: "RIGHT JOIN",
+            JoinType.FULL: "FULL JOIN",
+            JoinType.SEMI: "SEMI JOIN",
+            JoinType.ANTI: "ANTI JOIN",
+        }
+        return keywords[self.join_type]
+
+    def _merge_select_list_for_type(
+        self, left_schema: pa.Schema, right_schema: pa.Schema
+    ) -> str:
+        """SEMI/ANTI emit only the left columns; other joins emit both sides."""
+        if self.join_type in (JoinType.SEMI, JoinType.ANTI):
+            return self._merge_left_select_list(left_schema)
+        return self._merge_select_list(left_schema, right_schema)
+
+    def _merge_left_select_list(self, left_schema: pa.Schema) -> str:
+        """Alias only the left columns, for SEMI/ANTI output."""
+        parts = []
+        for name in left_schema.names:
+            parts.append(f'l."{name}" AS "{name}"')
+        return ", ".join(parts)
 
     def _merge_select_list(
         self, left_schema: pa.Schema, right_schema: pa.Schema
@@ -1503,7 +1580,18 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
         return [self.left, self.right]
 
     def execute(self) -> Iterator[pa.RecordBatch]:
-        """Execute nested loop join."""
+        """Execute nested loop join (row-at-a-time, intentionally not migrated).
+
+        This stays on the row loop rather than going through the merge engine.
+        Its ``condition`` is an arbitrary predicate over the *joined* schema and,
+        in practice, is the null-aware SEMI/ANTI/LEFT predicate decorrelation
+        produces (``x = v OR x IS NULL OR v IS NULL``); rendering that to DuckDB
+        needs a side-resolving expression renderer (each column mapped to the
+        left or right input, with mixed bare/qualified references). The risk of
+        subtly changing those exact NULL semantics outweighs the gain, since
+        non-equi/cross inputs are rare and small. The vectorized win lives in
+        the equi joins, aggregate, sort and set operations, which are migrated.
+        """
         import pyarrow.compute as pc
 
         if self.join_type in (JoinType.SEMI, JoinType.ANTI):
@@ -1788,7 +1876,12 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         return [self.input]
 
     def execute(self) -> Iterator[pa.RecordBatch]:
-        """Execute hash aggregation."""
+        """Execute hash aggregation, via the merge engine when one is attached."""
+        engine = self.merge_engine()
+        if engine is not None and self._can_merge_aggregate():
+            yield from self._execute_merge_aggregate(engine)
+            return
+
         if self._supports_streaming():
             result_batch = self._execute_streaming()
         else:
@@ -1796,6 +1889,105 @@ class PhysicalHashAggregate(PhysicalPlanNode):
 
         if result_batch.num_rows > 0:
             yield result_batch
+
+    def _can_merge_aggregate(self) -> bool:
+        """Whether group-bys and aggregates are simple enough to render to SQL."""
+        return self._group_by_renderable() and self._aggregates_renderable()
+
+    def _group_by_renderable(self) -> bool:
+        """True when every group-by key is a plain column reference."""
+        from .expressions import ColumnRef
+
+        for expr in self.group_by:
+            if not isinstance(expr, ColumnRef):
+                return False
+        return True
+
+    def _aggregates_renderable(self) -> bool:
+        """True when every SELECT expression is a column or a column aggregate."""
+        for expr in self.aggregates:
+            if not self._agg_expr_renderable(expr):
+                return False
+        return True
+
+    def _agg_expr_renderable(self, expr: Expression) -> bool:
+        """A group column, or an aggregate function over plain column arguments."""
+        from .expressions import ColumnRef, FunctionCall
+
+        if isinstance(expr, ColumnRef):
+            return True
+        return (
+            isinstance(expr, FunctionCall)
+            and expr.is_aggregate
+            and self._args_are_columns(expr)
+        )
+
+    def _args_are_columns(self, func: "FunctionCall") -> bool:
+        """True when every aggregate argument is a plain column reference."""
+        from .expressions import ColumnRef
+
+        for arg in func.args:
+            if not isinstance(arg, ColumnRef):
+                return False
+        return True
+
+    def _execute_merge_aggregate(self, engine) -> Iterator[pa.RecordBatch]:
+        """Run the GROUP BY through DuckDB, casting output to the declared schema."""
+        reader = _streaming_reader(self.input)
+        sql = self._aggregate_sql(self.input.column_aliases())
+        target = self.schema()
+        for batch in engine.run(sql, {_MERGE_AGG_RELATION: reader}):
+            yield _cast_batch_to_schema(batch, target)
+
+    def _aggregate_sql(self, aliases) -> str:
+        """Render ``SELECT <aggs> FROM in_agg [GROUP BY <keys>]``."""
+        select_list = self._aggregate_select_list(aliases)
+        sql = f"SELECT {select_list} FROM {_MERGE_AGG_RELATION}"
+        group_list = self._aggregate_group_list(aliases)
+        if group_list:
+            sql += f" GROUP BY {group_list}"
+        return sql
+
+    def _aggregate_select_list(self, aliases) -> str:
+        """Alias each SELECT expression to its output name."""
+        parts = []
+        for expr, name in zip(self.aggregates, self.output_names):
+            parts.append(f'{self._render_agg_expr(expr, aliases)} AS "{name}"')
+        return ", ".join(parts)
+
+    def _aggregate_group_list(self, aliases) -> str:
+        """Render the GROUP BY keys, or empty for a global aggregate."""
+        parts = []
+        for expr in self.group_by:
+            parts.append(self._render_agg_expr(expr, aliases))
+        return ", ".join(parts)
+
+    def _render_agg_expr(self, expr: Expression, aliases) -> str:
+        """Render a column or aggregate against the input's physical column names."""
+        from .expressions import ColumnRef
+
+        if isinstance(expr, ColumnRef):
+            if expr.column == "*":
+                return "*"
+            return f'"{self._resolve_agg_column(expr, aliases)}"'
+        return self._render_agg_function(expr, aliases)
+
+    def _resolve_agg_column(self, expr, aliases) -> str:
+        """Resolve a column reference to its physical name in the input relation."""
+        if aliases:
+            resolved = aliases.get((expr.table, expr.column))
+            if resolved is not None:
+                return resolved
+        return expr.column
+
+    def _render_agg_function(self, func: "FunctionCall", aliases) -> str:
+        """Render an aggregate call, preserving DISTINCT and COUNT(*)."""
+        name = func.function_name.upper()
+        distinct = "DISTINCT " if func.distinct else ""
+        inner = "*"
+        if func.args:
+            inner = self._render_agg_expr(func.args[0], aliases)
+        return f"{name}({distinct}{inner})"
 
     def _supports_streaming(self) -> bool:
         """Return True when streaming aggregation can evaluate all expressions."""
@@ -2246,7 +2438,61 @@ class PhysicalSort(PhysicalPlanNode):
         return [self.input]
 
     def execute(self) -> Iterator[pa.RecordBatch]:
-        """Execute sort by materializing input and sorting."""
+        """Execute sort, via the merge engine when one is attached."""
+        engine = self.merge_engine()
+        if engine is not None and self._can_merge_sort():
+            yield from self._execute_merge_sort(engine)
+            return
+        yield from self._execute_pyarrow_sort()
+
+    def _can_merge_sort(self) -> bool:
+        """True when every sort key is a plain column reference."""
+        from .expressions import ColumnRef
+
+        for key in self.sort_keys:
+            if not isinstance(key, ColumnRef):
+                return False
+        return True
+
+    def _execute_merge_sort(self, engine) -> Iterator[pa.RecordBatch]:
+        """Sort through DuckDB, with per-key NULLS FIRST/LAST placement."""
+        reader = _streaming_reader(self.input)
+        order = self._sort_order_clause(self.input.column_aliases())
+        sql = f"SELECT * FROM {_MERGE_SORT_RELATION} ORDER BY {order}"
+        return engine.run(sql, {_MERGE_SORT_RELATION: reader})
+
+    def _sort_order_clause(self, aliases) -> str:
+        """Render every ORDER BY key with its direction and NULLS placement."""
+        parts = []
+        for index, key in enumerate(self.sort_keys):
+            parts.append(self._sort_key_sql(key, index, aliases))
+        return ", ".join(parts)
+
+    def _sort_key_sql(self, key, index: int, aliases) -> str:
+        """Render one sort key: ``"col" ASC|DESC NULLS FIRST|LAST``."""
+        name = self._resolve_sort_column(key, aliases)
+        direction = "ASC" if self.ascending[index] else "DESC"
+        return f'"{name}" {direction} NULLS {self._nulls_keyword(index)}'
+
+    def _nulls_keyword(self, index: int) -> str:
+        """NULLS placement: explicit if given, else Postgres default by direction."""
+        explicit = None
+        if self.nulls_order and index < len(self.nulls_order):
+            explicit = self.nulls_order[index]
+        if explicit in ("FIRST", "LAST"):
+            return explicit
+        return "LAST" if self.ascending[index] else "FIRST"
+
+    def _resolve_sort_column(self, key, aliases) -> str:
+        """Resolve a sort column to its physical name in the input relation."""
+        if aliases:
+            resolved = aliases.get((key.table, key.column))
+            if resolved is not None:
+                return resolved
+        return key.column
+
+    def _execute_pyarrow_sort(self) -> Iterator[pa.RecordBatch]:
+        """Materialize the input and sort it with pyarrow (fallback path)."""
         batches = []
         for batch in self.input.execute():
             batches.append(batch)
@@ -2471,10 +2717,29 @@ class PhysicalUnion(PhysicalPlanNode):
     def execute(self) -> Iterator[pa.RecordBatch]:
         """Yield all input batches, deduplicating rows when distinct."""
         if self.distinct:
-            yield from self._execute_distinct()
+            engine = self.merge_engine()
+            if engine is not None:
+                yield from self._execute_merge_distinct(engine)
+            else:
+                yield from self._execute_distinct()
             return
         for input_node in self.inputs:
             yield from input_node.execute()
+
+    def _execute_merge_distinct(self, engine) -> Iterator[pa.RecordBatch]:
+        """Deduplicate the unioned inputs via DuckDB UNION (vectorized, type-aware).
+
+        Each branch is drained into a table first so its source connection is
+        released before the next branch is read (UNION DISTINCT must see every
+        row anyway, so DuckDB would buffer them regardless).
+        """
+        inputs = {}
+        selects = []
+        for index, node in enumerate(self.inputs):
+            name = f"in_union_{index}"
+            inputs[name] = _table_from_batches(list(node.execute()), node.schema())
+            selects.append(f"SELECT * FROM {name}")
+        return engine.run(" UNION ".join(selects), inputs)
 
     def _execute_distinct(self) -> Iterator[pa.RecordBatch]:
         """Yield input batches with duplicate rows removed."""
@@ -2672,6 +2937,38 @@ class PhysicalSetOperation(PhysicalPlanNode):
 
     def execute(self) -> Iterator[pa.RecordBatch]:
         """Yield the combined rows honoring INTERSECT/EXCEPT semantics."""
+        engine = self.merge_engine()
+        if engine is not None:
+            yield from self._execute_merge_setop(engine)
+            return
+        yield from self._execute_row_loop()
+
+    def _execute_merge_setop(self, engine) -> Iterator[pa.RecordBatch]:
+        """Run INTERSECT/EXCEPT (distinct or ALL) through DuckDB.
+
+        Both inputs are drained into tables first (releasing their source
+        connections); DuckDB applies the multiset semantics natively.
+        """
+        left_table = _table_from_batches(list(self.left.execute()), self.left.schema())
+        right_table = _table_from_batches(
+            list(self.right.execute()), self.right.schema()
+        )
+        sql = (
+            f"SELECT * FROM {_MERGE_LEFT_RELATION} {self._setop_keyword()} "
+            f"SELECT * FROM {_MERGE_RIGHT_RELATION}"
+        )
+        return engine.run(
+            sql,
+            {_MERGE_LEFT_RELATION: left_table, _MERGE_RIGHT_RELATION: right_table},
+        )
+
+    def _setop_keyword(self) -> str:
+        """DuckDB keyword for this set operation and multiset mode."""
+        base = "INTERSECT" if self.kind == SetOpKind.INTERSECT else "EXCEPT"
+        return base if self.distinct else f"{base} ALL"
+
+    def _execute_row_loop(self) -> Iterator[pa.RecordBatch]:
+        """Row-at-a-time INTERSECT/EXCEPT (fallback when no engine is attached)."""
         right_counts = self._row_counts(self.right)
         emitted: Set[tuple] = set()
         for batch in self.left.execute():
@@ -2836,7 +3133,13 @@ class PhysicalGroupedLimit(PhysicalPlanNode):
         return [self.input]
 
     def execute(self) -> Iterator[pa.RecordBatch]:
-        """Stream input, keeping the first ``limit`` rows of each key."""
+        """Stream input, keeping the first ``limit`` rows of each key.
+
+        This stays row-at-a-time rather than going through the merge engine: it
+        depends on the input's row order (the latest-row-per-key idiom relies on
+        an ORDER BY in a child operator), and DuckDB window functions would not
+        preserve that order without an explicit sort key this node does not have.
+        """
         emitted_counts: Dict[tuple, int] = {}
         for batch in self.input.execute():
             filtered = self._limit_batch(batch, emitted_counts)

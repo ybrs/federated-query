@@ -1,13 +1,18 @@
 # Phase 7 Review — TODO
 
-> ## ★ TOP PRIORITY — Physical Merge Engine (DuckDB local execution)
-> The local physical operators run row-at-a-time in Python and dominate
-> cross-source query time (profiled: ~80% of a 3-table query). Replace them with
-> an in-memory **DuckDB coordinator** fed the Arrow streams (streamed, not
-> materialized; spills to disk under `memory_limit`). NO change to
-> parser/binder/decorrelation/planner/pushdown — only operator `execute()`.
-> **Full design: `plan-physical-merge-engine.md`.** Start with `PhysicalHashJoin`.
-> Related: P4 (vectorize local execution) and G9 v2.1 are complementary.
+> ## ★ Physical Merge Engine (DuckDB local execution) — **DONE (2026-06-15)**
+> The local row-at-a-time Python operators now run vectorized in a reused
+> in-memory **DuckDB coordinator** (`executor/merge_engine.py`). Migrated
+> `execute()`s (all gated, row-loop fallback when no engine attached):
+> PhysicalHashJoin (ALL shapes — INNER keeps G9 build-materialize+probe-stream;
+> LEFT/RIGHT/FULL/SEMI/ANTI stream left + materialize right), PhysicalHashAggregate
+> (column aggregates, output cast to `schema()`), PhysicalSort (per-key NULLS
+> FIRST/LAST), PhysicalUnion DISTINCT + PhysicalSetOperation INTERSECT/EXCEPT[ALL].
+> **Deliberately NOT migrated:** PhysicalGroupedLimit (order-dependent) and
+> PhysicalNestedLoopJoin (null-aware decorrelation condition over the joined
+> schema — side-resolving renderer too risky) — both documented in code.
+> No change to parser/binder/decorrelation/planner/pushdown. **Full design:
+> `plan-physical-merge-engine.md`.** Remaining complement: **G9 v2.1**.
 
 ---
 
@@ -19,11 +24,13 @@ inspection.
 
 ---
 
-## STATUS (updated 2026-06-11, branch `parsing_explain`)
+## STATUS (updated 2026-06-15, branch `parsing_explain`)
 
-729 passed / 48 failed (from 645/125 baseline); decorrelation suite green.
+743 passed / 48 failed (from 645/125 baseline); decorrelation suite 122/122 green.
 **Done: G4 set ops, G1 join breadth, G2 computed projections, G9 cross-source
-dynamic filtering (first version).** Remaining failures are **G3 CTEs (10),
+dynamic filtering (first version), P1 projection pruning, P2 ADBC connector, and
+the Physical Merge Engine (P4 — all local operators except GroupedLimit/NLJ now
+run vectorized in DuckDB).** Remaining failures are **G3 CTEs (10),
 G6 date/time (7), subqueries/G8 (20, deferred — see `decorrelation-gaps.md`),
 G7 aggregate FILTER, NATURAL/USING (3), and assorted null/edge cases**. Verified
 correctness/silent-fail items are checked off. PARTIAL = some sub-cases remain
@@ -519,8 +526,25 @@ in the bundled `perf_files` test table; Rust harness in `/workspace/fedqrs`):
   CORRECTNESS/cleanliness fix, not the cause of the slow cross-source query
   (that's P4/G9 v2.1).
 
-- [ ] **P4. Vectorize local execution (was D3) — the dominant cost of
-  cross-source queries.** PROFILED on the 3-table cross-source `count(*)`
+- [x] **P4. Vectorize local execution (was D3) — DONE (2026-06-15) via option B.**
+  Chose **DuckDB as the local execution engine** (`executor/merge_engine.py`
+  `MergeEngine`, reused per `Executor`, warmed at CLI startup). Migrated operator
+  `execute()`s (gated, row-loop fallback): PhysicalHashJoin ALL shapes (INNER
+  keeps the G9 build-materialize+probe-stream path; LEFT/RIGHT/FULL/SEMI/ANTI
+  stream the left + materialize the right; DuckDB NULL/anti semantics verified ==
+  row loop), PhysicalHashAggregate (column aggregates; output cast to `schema()`),
+  PhysicalSort (per-key NULLS FIRST/LAST — strictly more correct than the old
+  single-placement pyarrow path), PhysicalUnion DISTINCT + PhysicalSetOperation
+  INTERSECT/EXCEPT[ALL] (also fixes C6 type-coercion). NOT migrated: PhysicalGroupedLimit
+  (order-dependent) and PhysicalNestedLoopJoin (null-aware condition over joined
+  schema — risk > reward). Probe is STREAMED not materialized (regression-tested);
+  psycopg2 reads autocommit (no teardown lock-hang); non-INNER drains right side
+  first (else nested joins exhaust the pool). 743 pass / 48 fail; decorrelation
+  122/122. Tests: `test_merge_engine_streaming.py`, `test_merge_set_ops.py`. The
+  original profiling/analysis below is retained for context.
+
+  ORIGINAL PROBLEM STATEMENT (kept):
+  PROFILED on the 3-table cross-source `count(*)`
   (total 24.5 ms): pg fetch of 11,041 rows = 5.1 ms (~20%), **local processing
   = 19.5 ms (~80%)**. `PhysicalHashJoin` builds a Python dict keyed by per-row
   `.as_py()` tuples, probes row-by-row, and `_join_rows` allocates a fresh
