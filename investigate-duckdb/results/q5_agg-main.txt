@@ -1,0 +1,41 @@
+######## DuckDB result (q5_agg-main) ########
+┌─────────────┬───────┬──────────┐
+│ category_id │   n   │  total   │
+│    int32    │ int64 │  int128  │
+├─────────────┼───────┼──────────┤
+│       49133 │     8 │ 39210464 │
+│       49160 │     8 │ 40920968 │
+│       49171 │     8 │ 41617840 │
+│       49212 │     8 │ 44215272 │
+│       49234 │     8 │ 45609016 │
+└─────────────┴───────┴──────────┘
+
+######## Statements PostgreSQL received (q5_agg-main) ########
+SELECT version(), (SELECT COUNT(*) FROM pg_settings WHERE name LIKE 'rds%')
+SELECT 1
+DISCARD ALL
+SELECT 1
+SELECT to_regclass('duckdb_secrets')
+SELECT 1
+DISCARD ALL
+SELECT 1
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SELECT pg_is_in_recovery(), pg_export_snapshot(), (select count(*) from pg_stat_wal_receiver)
+COPY (SELECT "category_id", "size_bytes" FROM "public"."files" WHERE ctid BETWEEN '(0,0)'::tid AND '(1000,0)'::tid) TO STDOUT (FORMAT "binary");
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY
+SET TRANSACTION SNAPSHOT '0000001E-00000538-1'
+SET TRANSACTION SNAPSHOT '0000001E-00000538-1'
+COPY (SELECT "category_id", "size_bytes" FROM "public"."files" WHERE ctid BETWEEN '(1000,0)'::tid AND '(2000,0)'::tid) TO STDOUT (FORMAT "binary");
+COPY (SELECT "category_id", "size_bytes" FROM "public"."files" WHERE ctid BETWEEN '(2000,0)'::tid AND '(3000,0)'::tid) TO STDOUT (FORMAT "binary");
+COPY (SELECT "category_id", "size_bytes" FROM "public"."files" WHERE ctid BETWEEN '(3000,0)'::tid AND '(4294967295,0)'::tid) TO STDOUT (FORMAT "binary");
+SELECT 1
+ROLLBACK
+DISCARD ALL
+SELECT 1
+ROLLBACK
+DISCARD ALL
+COMMIT
+SELECT 1
+DISCARD ALL
+######## end (q5_agg-main) ########

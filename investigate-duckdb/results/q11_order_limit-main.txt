@@ -1,0 +1,33 @@
+######## DuckDB result (q11_order_limit-main) ########
+┌────────┬────────────┐
+│   id   │ size_bytes │
+│ int32  │   int64    │
+├────────┼────────────┤
+│ 382624 │    9999456 │
+│ 364945 │    9999455 │
+│ 347266 │    9999454 │
+│ 329587 │    9999453 │
+│ 311908 │    9999452 │
+│ 294229 │    9999451 │
+│ 276550 │    9999450 │
+│ 258871 │    9999449 │
+│ 241192 │    9999448 │
+│ 223513 │    9999447 │
+└────────┴────────────┘
+  10 rows   2 columns
+
+######## Statements PostgreSQL received (q11_order_limit-main) ########
+SELECT version(), (SELECT COUNT(*) FROM pg_settings WHERE name LIKE 'rds%')
+SELECT 1
+DISCARD ALL
+SELECT 1
+SELECT to_regclass('duckdb_secrets')
+SELECT 1
+DISCARD ALL
+SELECT 1
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
+COPY (SELECT "id", "size_bytes" FROM "public"."files"  ORDER BY "size_bytes" DESC NULLS LAST LIMIT 10) TO STDOUT (FORMAT "binary");
+COMMIT
+SELECT 1
+DISCARD ALL
+######## end (q11_order_limit-main) ########

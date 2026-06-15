@@ -1,0 +1,42 @@
+######## fedq result (fedq_q2_filter) ########
+
+
+
+
+
+
+       fedq> SELECT id, category_id, size_bytes FROM pg.public.files
+
+
+
+
+
+
+                                                             fedq> SELECT id, category_id, size_bytes FROM pg.public.files
+...> WHERE category_id = 42 AND size_bytes > 5000000;                                                     ...> WHERE category_id = 42 AND size_bytes > 5000000;
++--------+-------------+------------+
+| id     | category_id | size_bytes |
++--------+-------------+------------+
+| 150041 | 42          | 8174679    |
+| 300041 | 42          | 6024679    |
+| 50041  | 42          | 6274679    |
++--------+-------------+------------+
+3 rows in 6.80 ms
+fedq>      fedq>
+...> \q       ...> \q
+
+######## Statements PostgreSQL received (fedq_q2_filter) ########
+BEGIN
+
+ROLLBACK
+BEGIN
+
+ROLLBACK
+BEGIN
+
+ROLLBACK
+SELECT "id", "category_id", "size_bytes" FROM "public"."files" AS files WHERE ((category_id = 42) AND (size_bytes > 5000000))
+BEGIN
+SELECT * FROM (SELECT "id", "category_id", "size_bytes" FROM "public"."files" AS files WHERE ((category_id = 42) AND (size_bytes > 5000000))) AS q LIMIT 0
+ROLLBACK
+######## end (fedq_q2_filter) ########

@@ -1,0 +1,36 @@
+######## fedq result (fedq_q4_pgjoin) ########
+
+
+
+
+
+
+       fedq> SELECT c.name, count(*) AS n
+...> FROM pg.public.files f JOIN pg.public.categories c ON c.id = f.category_id                                                                               ...> FROM pg.public.files f JOIN pg.public.categories c ON c.id = f.category_id
+...> WHERE c.is_active = true                             ...> WHERE c.is_active = true
+...> GROUP BY c.name ORDER BY n DESC LIMIT 5;                                             ...> GROUP BY c.name ORDER BY n DESC LIMIT 5;
++----------------+---+
+| name           | n |
++----------------+---+
+| category_1202  | 8 |
+| category_27544 | 8 |
+| category_3965  | 8 |
+| category_27078 | 8 |
+| category_2284  | 8 |
++----------------+---+
+5 rows in 118.87 ms
+fedq>      fedq>
+...> \q       ...> \q
+
+######## Statements PostgreSQL received (fedq_q4_pgjoin) ########
+BEGIN
+
+ROLLBACK
+BEGIN
+
+ROLLBACK
+BEGIN
+
+ROLLBACK
+SELECT c.name AS "name", COUNT(*) AS "n" FROM "public"."files" AS f INNER JOIN "public"."categories" AS c ON (c.id = f.category_id) WHERE (c.is_active = TRUE) GROUP BY c.name ORDER BY n DESC LIMIT 5
+######## end (fedq_q4_pgjoin) ########

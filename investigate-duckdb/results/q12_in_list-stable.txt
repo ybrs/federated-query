@@ -1,0 +1,25 @@
+######## DuckDB result (q12_in_list-stable) ########
+┌────────┬─────────────┐
+│   id   │ category_id │
+│ int32  │    int32    │
+├────────┼─────────────┤
+│     10 │          11 │
+│    250 │         251 │
+│    999 │        1000 │
+│  40000 │       40001 │
+│ 123456 │       23457 │
+└────────┴─────────────┘
+
+######## Statements PostgreSQL received (q12_in_list-stable) ########
+DISCARD ALL
+SELECT to_regclass('duckdb_secrets')
+DISCARD ALL
+SELECT pg_is_in_recovery(), pg_export_snapshot(), (select count(*) from pg_stat_wal_receiver)
+COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(0,0)'::tid AND '(1000,0)'::tid AND "id" IN ('10', '250', '999', '40000', '123456')) TO STDOUT (FORMAT "binary");
+COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(1000,0)'::tid AND '(2000,0)'::tid AND "id" IN ('10', '250', '999', '40000', '123456')) TO STDOUT (FORMAT "binary");
+COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(2000,0)'::tid AND '(3000,0)'::tid AND "id" IN ('10', '250', '999', '40000', '123456')) TO STDOUT (FORMAT "binary");
+COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(3000,0)'::tid AND '(4294967295,0)'::tid AND "id" IN ('10', '250', '999', '40000', '123456')) TO STDOUT (FORMAT "binary");
+DISCARD ALL
+DISCARD ALL
+DISCARD ALL
+######## end (q12_in_list-stable) ########

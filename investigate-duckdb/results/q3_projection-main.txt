@@ -1,0 +1,81 @@
+######## DuckDB result (q3_projection-main) ########
+┌─────────────┐
+│ category_id │
+│    int32    │
+├─────────────┤
+│           2 │
+│           3 │
+│           4 │
+│           5 │
+│           6 │
+│           7 │
+│           8 │
+│           9 │
+│          10 │
+│          11 │
+│          12 │
+│          13 │
+│          14 │
+│          15 │
+│          16 │
+│          17 │
+│          18 │
+│          19 │
+│          20 │
+│          21 │
+│           · │
+│           · │
+│           · │
+│          81 │
+│          82 │
+│          83 │
+│          84 │
+│          85 │
+│          86 │
+│          87 │
+│          88 │
+│          89 │
+│          90 │
+│          91 │
+│          92 │
+│          93 │
+│          94 │
+│          95 │
+│          96 │
+│          97 │
+│          98 │
+│          99 │
+│         100 │
+└─────────────┘
+    99 rows  
+  (40 shown)  
+
+######## Statements PostgreSQL received (q3_projection-main) ########
+SELECT version(), (SELECT COUNT(*) FROM pg_settings WHERE name LIKE 'rds%')
+SELECT 1
+DISCARD ALL
+SELECT 1
+SELECT to_regclass('duckdb_secrets')
+SELECT 1
+DISCARD ALL
+SELECT 1
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SELECT pg_is_in_recovery(), pg_export_snapshot(), (select count(*) from pg_stat_wal_receiver)
+COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(0,0)'::tid AND '(1000,0)'::tid AND "id" < 100) TO STDOUT (FORMAT "binary");
+COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(1000,0)'::tid AND '(2000,0)'::tid AND "id" < 100) TO STDOUT (FORMAT "binary");
+COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(2000,0)'::tid AND '(3000,0)'::tid AND "id" < 100) TO STDOUT (FORMAT "binary");
+COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(3000,0)'::tid AND '(4294967295,0)'::tid AND "id" < 100) TO STDOUT (FORMAT "binary");
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY
+SET TRANSACTION SNAPSHOT '00000016-00000509-1'
+SET TRANSACTION SNAPSHOT '00000016-00000509-1'
+SELECT 1
+SELECT 1
+ROLLBACK
+DISCARD ALL
+ROLLBACK
+DISCARD ALL
+COMMIT
+SELECT 1
+DISCARD ALL
+######## end (q3_projection-main) ########

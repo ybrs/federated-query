@@ -1,0 +1,61 @@
+######## DuckDB result (q1_headline-main) ########
+┌────────────┬────────────┬──────────┬───────┐
+│    day     │  category  │ accesses │  rnk  │
+│    date    │  varchar   │  int64   │ int64 │
+├────────────┼────────────┼──────────┼───────┤
+│ 2026-02-01 │ category_2 │      115 │     1 │
+│ 2026-02-01 │ category_3 │       76 │     2 │
+│ 2026-02-01 │ category_4 │       68 │     3 │
+│ 2026-02-02 │ category_2 │      125 │     1 │
+│ 2026-02-02 │ category_3 │       90 │     2 │
+│ 2026-02-02 │ category_4 │       67 │     3 │
+│ 2026-02-03 │ category_2 │      137 │     1 │
+│ 2026-02-03 │ category_3 │       88 │     2 │
+│ 2026-02-03 │ category_4 │       77 │     3 │
+│ 2026-02-04 │ category_2 │      136 │     1 │
+│ 2026-02-04 │ category_3 │       95 │     2 │
+│ 2026-02-04 │ category_4 │       83 │     3 │
+│ 2026-02-05 │ category_2 │      149 │     1 │
+│ 2026-02-05 │ category_3 │       70 │     2 │
+│ 2026-02-05 │ category_4 │       62 │     3 │
+│ 2026-02-06 │ category_2 │      120 │     1 │
+│ 2026-02-06 │ category_3 │       86 │     2 │
+│ 2026-02-06 │ category_4 │       73 │     3 │
+│ 2026-02-07 │ category_2 │      141 │     1 │
+│ 2026-02-07 │ category_3 │       87 │     2 │
+│ 2026-02-07 │ category_4 │       58 │     3 │
+└────────────┴────────────┴──────────┴───────┘
+  21 rows                          4 columns
+
+######## Statements PostgreSQL received (q1_headline-main) ########
+SELECT version(), (SELECT COUNT(*) FROM pg_settings WHERE name LIKE 'rds%')
+SELECT 1
+DISCARD ALL
+SELECT 1
+SELECT to_regclass('duckdb_secrets')
+SELECT 1
+DISCARD ALL
+SELECT 1
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SELECT pg_is_in_recovery(), pg_export_snapshot(), (select count(*) from pg_stat_wal_receiver)
+COPY (SELECT "id", "name" FROM "public"."categories" WHERE ctid BETWEEN '(0,0)'::tid AND '(4294967295,0)'::tid) TO STDOUT (FORMAT "binary");
+COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(0,0)'::tid AND '(1000,0)'::tid) TO STDOUT (FORMAT "binary");
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY
+SET TRANSACTION SNAPSHOT '00000004-00000655-1'
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY
+COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(1000,0)'::tid AND '(2000,0)'::tid) TO STDOUT (FORMAT "binary");
+SET TRANSACTION SNAPSHOT '00000004-00000655-1'
+COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(2000,0)'::tid AND '(3000,0)'::tid) TO STDOUT (FORMAT "binary");
+COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(3000,0)'::tid AND '(4294967295,0)'::tid) TO STDOUT (FORMAT "binary");
+SELECT 1
+ROLLBACK
+DISCARD ALL
+SELECT 1
+ROLLBACK
+DISCARD ALL
+SELECT 1
+DISCARD ALL
+COMMIT
+SELECT 1
+DISCARD ALL
+######## end (q1_headline-main) ########

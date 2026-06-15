@@ -1,0 +1,41 @@
+######## DuckDB result (q12_in_list-main) ########
+┌────────┬─────────────┐
+│   id   │ category_id │
+│ int32  │    int32    │
+├────────┼─────────────┤
+│     10 │          11 │
+│    250 │         251 │
+│    999 │        1000 │
+│  40000 │       40001 │
+│ 123456 │       23457 │
+└────────┴─────────────┘
+
+######## Statements PostgreSQL received (q12_in_list-main) ########
+SELECT version(), (SELECT COUNT(*) FROM pg_settings WHERE name LIKE 'rds%')
+SELECT 1
+DISCARD ALL
+SELECT 1
+SELECT to_regclass('duckdb_secrets')
+SELECT 1
+DISCARD ALL
+SELECT 1
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SELECT pg_is_in_recovery(), pg_export_snapshot(), (select count(*) from pg_stat_wal_receiver)
+COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(0,0)'::tid AND '(1000,0)'::tid AND "id" IN (10, 250, 999, 40000, 123456)) TO STDOUT (FORMAT "binary");
+COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(1000,0)'::tid AND '(2000,0)'::tid AND "id" IN (10, 250, 999, 40000, 123456)) TO STDOUT (FORMAT "binary");
+COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(2000,0)'::tid AND '(3000,0)'::tid AND "id" IN (10, 250, 999, 40000, 123456)) TO STDOUT (FORMAT "binary");
+COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(3000,0)'::tid AND '(4294967295,0)'::tid AND "id" IN (10, 250, 999, 40000, 123456)) TO STDOUT (FORMAT "binary");
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY
+SET TRANSACTION SNAPSHOT '0000005C-0000047D-1'
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY
+SELECT 1
+SET TRANSACTION SNAPSHOT '0000005C-0000047D-1'
+ROLLBACK
+SELECT 1
+DISCARD ALL
+ROLLBACK
+DISCARD ALL
+COMMIT
+SELECT 1
+DISCARD ALL
+######## end (q12_in_list-main) ########

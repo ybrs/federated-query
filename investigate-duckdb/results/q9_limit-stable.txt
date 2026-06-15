@@ -1,0 +1,33 @@
+######## DuckDB result (q9_limit-stable) ########
+┌────────┬─────────────────┐
+│   id   │    filename     │
+│ int32  │     varchar     │
+├────────┼─────────────────┤
+│ 134885 │ file_134885.dat │
+│ 134886 │ file_134886.dat │
+│ 134887 │ file_134887.dat │
+│ 134888 │ file_134888.dat │
+│ 134889 │ file_134889.dat │
+│ 134890 │ file_134890.dat │
+│ 134891 │ file_134891.dat │
+│ 134892 │ file_134892.dat │
+│ 134893 │ file_134893.dat │
+│ 134894 │ file_134894.dat │
+└────────┴─────────────────┘
+  10 rows        2 columns
+
+######## Statements PostgreSQL received (q9_limit-stable) ########
+SELECT version(), (SELECT COUNT(*) FROM pg_settings WHERE name LIKE 'rds%')
+SELECT 1
+DISCARD ALL
+SELECT 1
+SELECT to_regclass('duckdb_secrets')
+SELECT 1
+DISCARD ALL
+SELECT 1
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
+COPY (SELECT "id", "filename" FROM "public"."files"  LIMIT 10) TO STDOUT (FORMAT "binary");
+COMMIT
+SELECT 1
+DISCARD ALL
+######## end (q9_limit-stable) ########
