@@ -105,6 +105,50 @@ def _row_key_tuple(key_values, row_index: int) -> tuple:
     return tuple(values)
 
 
+def _key_column_names(num_keys: int) -> List[str]:
+    """Stable column names k0..k(n-1) for a join's key columns."""
+    names = []
+    for index in range(num_keys):
+        names.append(f"k{index}")
+    return names
+
+
+def _within_dynamic_filter_cap(num_keys: int) -> bool:
+    """Whether a build-key count is non-empty and within the IN-list cap.
+
+    Logs at INFO when an over-cap set is skipped so the decision is observable.
+    """
+    if num_keys == 0:
+        return False
+    if num_keys > _DYNAMIC_FILTER_MAX_KEYS:
+        _LOGGER.info(
+            "dynamic filter skipped: %d build keys exceed cap %d",
+            num_keys,
+            _DYNAMIC_FILTER_MAX_KEYS,
+        )
+        return False
+    return True
+
+
+def _key_tuples_from_table(table: "pa.Table") -> List[tuple]:
+    """Convert a distinct-key table (already within the cap) to value tuples."""
+    columns = []
+    for name in table.column_names:
+        columns.append(table.column(name).to_pylist())
+    return _zip_columns_to_tuples(columns, table.num_rows)
+
+
+def _zip_columns_to_tuples(columns: List[list], num_rows: int) -> List[tuple]:
+    """Row-wise zip of per-column value lists into hashable key tuples."""
+    tuples = []
+    for row_index in range(num_rows):
+        values = []
+        for column in columns:
+            values.append(column[row_index])
+        tuples.append(tuple(values))
+    return tuples
+
+
 def _and_filters(existing: Optional[Expression], new_filter: Expression) -> Expression:
     """Combine an existing scan filter with an additional predicate via AND."""
     from .expressions import BinaryOp, BinaryOpType
@@ -841,36 +885,6 @@ class PhysicalHashJoin(PhysicalPlanNode):
                                 build_batch, build_row_idx
                             )
 
-    def _maybe_reduce_probe(self, probe_node, probe_keys, hash_table) -> None:
-        """Push the build side's distinct keys into the probe as an IN filter.
-
-        Semi-join reduction: an INNER join only emits probe rows whose key
-        matches a build key, so constraining the probe to those keys is safe and
-        avoids fetching unmatched rows (the win for a remote probe). Restricted
-        to INNER joins — outer joins must keep their non-matching probe rows —
-        and to a key set within the cap.
-        """
-        if self.join_type != JoinType.INNER:
-            return
-        keys = list(hash_table.keys())
-        if not self._dynamic_filter_worth_it(keys):
-            return
-        if probe_node.apply_dynamic_filter(probe_keys, keys):
-            _LOGGER.debug("dynamic filter applied to probe: %d keys", len(keys))
-
-    def _dynamic_filter_worth_it(self, keys: List[tuple]) -> bool:
-        """Whether the build-key set is non-empty and within the IN-list cap."""
-        if not keys:
-            return False
-        if len(keys) > _DYNAMIC_FILTER_MAX_KEYS:
-            _LOGGER.info(
-                "dynamic filter skipped: %d build keys exceed cap %d",
-                len(keys),
-                _DYNAMIC_FILTER_MAX_KEYS,
-            )
-            return False
-        return True
-
     def _execute_merge(self, engine) -> Iterator[pa.RecordBatch]:
         """Run the join through DuckDB; INNER keeps the G9 build-materialize path."""
         if self.join_type == JoinType.INNER:
@@ -931,25 +945,70 @@ class PhysicalHashJoin(PhysicalPlanNode):
             batches.append(batch)
         return batches
 
+    def _maybe_reduce_probe(self, probe_node, probe_keys, hash_table) -> None:
+        """Push an already-built hash table's keys into the probe (row-loop path).
+
+        The row-at-a-time join has already materialized ``hash_table`` (its keys
+        are the distinct non-NULL build keys), so reading them back is free here
+        — no extra pass. INNER only; outer joins keep non-matching probe rows.
+        The vectorized merge path uses ``_distinct_build_keys`` instead.
+        """
+        if self.join_type != JoinType.INNER:
+            return
+        keys = list(hash_table.keys())
+        if not _within_dynamic_filter_cap(len(keys)):
+            return
+        if probe_node.apply_dynamic_filter(probe_keys, keys):
+            _LOGGER.debug("dynamic filter applied to probe: %d keys", len(keys))
+
     def _reduce_probe_from_build(self, build_batches: List[pa.RecordBatch]) -> None:
-        """Push the build side's distinct keys into the probe as an IN filter."""
+        """Push the build side's distinct keys into the probe as an IN filter.
+
+        Semi-join reduction: an INNER join only emits probe rows whose key
+        matches a build key, so constraining the probe to those keys is safe and
+        avoids fetching unmatched rows (the win for a remote probe). Limited to
+        INNER joins; the distinct-key set is computed vectorized and skipped when
+        empty or above the cap, so an over-cap build pays no per-row Python cost.
+        """
+        if self.join_type != JoinType.INNER:
+            return
         build_node, probe_node, build_keys, probe_keys = self._build_probe_sides()
-        key_set = self._distinct_build_keys(build_batches, build_node, build_keys)
-        self._maybe_reduce_probe(probe_node, probe_keys, key_set)
+        value_tuples = self._distinct_build_keys(build_batches, build_node, build_keys)
+        if value_tuples is None:
+            return
+        if probe_node.apply_dynamic_filter(probe_keys, value_tuples):
+            _LOGGER.debug("dynamic filter applied to probe: %d keys", len(value_tuples))
 
     def _distinct_build_keys(
         self, build_batches: List[pa.RecordBatch], build_node, build_keys
-    ) -> Dict[tuple, bool]:
-        """Collect distinct non-NULL build-key tuples from materialized batches."""
+    ) -> Optional[List[tuple]]:
+        """Distinct non-NULL build-key tuples, or None if empty or above the cap.
+
+        Distinct values are computed with pyarrow, so the cap is enforced on the
+        vectorized distinct count: an over-cap build — which the probe would
+        reject anyway — never pays the per-row Python boxing the row-at-a-time
+        path would. Only the surviving (<= cap) keys are turned into tuples.
+        """
         aliases = build_node.column_aliases()
-        keys: Dict[tuple, bool] = {}
+        table = self._build_key_table(build_batches, build_keys, aliases)
+        if not _within_dynamic_filter_cap(table.num_rows):
+            return None
+        return _key_tuples_from_table(table)
+
+    def _build_key_table(self, build_batches, build_keys, aliases) -> "pa.Table":
+        """Distinct non-NULL build-key combinations as a table (vectorized).
+
+        Each batch's key columns are collected as-is and concatenated, then
+        DuckDB-style deduplicated via ``drop_null().group_by(...).aggregate([])``
+        — all in pyarrow's C++ kernels, no Python per row.
+        """
+        names = _key_column_names(len(build_keys))
+        key_tables = []
         for batch in build_batches:
-            values = self._extract_key_values(batch, build_keys, aliases)
-            for row_idx in range(batch.num_rows):
-                key = _row_key_tuple(values, row_idx)
-                if None not in key:
-                    keys[key] = True
-        return keys
+            arrays = self._extract_key_values(batch, build_keys, aliases)
+            key_tables.append(pa.table(arrays, names=names))
+        combined = pa.concat_tables(key_tables)
+        return combined.drop_null().group_by(names).aggregate([])
 
     def _merge_inputs(self, build_batches: List[pa.RecordBatch]) -> Dict[str, object]:
         """Map self.left/self.right to the DuckDB relations under stable names.

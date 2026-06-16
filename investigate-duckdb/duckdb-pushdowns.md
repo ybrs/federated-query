@@ -532,9 +532,30 @@ box. "Rows pulled from PG" is the qualitative driver behind the numbers.
   trips + the `LIMIT 0` schema probes, ~100 ms) dominates. The data-movement win
   would likely flip this **over a real network** (latency/bandwidth/egress), which
   localhost hides.
-- **Q1 (non-selective): fedq ~6× slower** — both pull the same data, but fedq
-  materializes 305k result rows through Python/Arrow + its merge engine, vs
-  DuckDB's C++ vectorized engine.
+- **Q1 (non-selective): fedq ~6× slower — and ~⅓ of that is a fixable waste, not
+  inherent.** Profiled (`FEDQ_PROFILE=1`): the join + aggregate *do* run
+  vectorized in the DuckDB merge engine; the result printing is **not** in the
+  measured time (the REPL timer stops before display). The real culprit: the
+  INNER-join merge path (`_execute_inner_merge` → `_reduce_probe_from_build` →
+  `_distinct_build_keys` → `_row_key_tuple`) extracts **every build-side row's
+  join key into a Python tuple via per-cell `array[i].as_py()`** to build the G9
+  semi-join `IN`-filter — a row-at-a-time Python loop — and it runs
+  **unconditionally, before the size check**. On Q1 the build side is `files`
+  (≈400k keys), which exceeds `_DYNAMIC_FILTER_MAX_KEYS = 2000`, so the filter is
+  **discarded after** the extraction. Measured cost of that wasted loop:
+
+  | Q1 (best of 3) | time |
+  |---|--:|
+  | baseline (G9 probe-reduction on) | 766 ms |
+  | with `_reduce_probe_from_build` no-op'd | **494 ms** |
+
+  i.e. **~272 ms (35 %) is Python key-boxing for a filter that's thrown away.**
+  Cheap fixes: (1) gate the extraction on build-side cardinality *first* — if the
+  build already exceeds the cap, skip it; (2) compute distinct keys vectorized
+  (`pyarrow.compute.unique` / a DuckDB `SELECT DISTINCT`) instead of per-cell
+  `.as_py()`. The residual gap to DuckDB (494 ms vs ~130 ms) is the merge engine
+  running each operator as a *separate* DuckDB query with Arrow materialized
+  between operators, rather than one fused pipeline.
 
 **Net:** DuckDB's C++ engine + binary-COPY transport is faster in raw wall-clock
 at localhost/small scale (2 of 3 here). fedq's structural advantage is **how much

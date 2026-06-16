@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Iterator, Optional
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
+import warnings
 import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
@@ -35,6 +36,10 @@ _HEX256 = _hex_byte_table()
 # Canonical uuid text is 32 hex chars plus 4 dashes (8-4-4-4-12).
 _UUID_TEXT_WIDTH = 36
 _DASH = ord("-")
+
+# Cap each streamed ADBC batch so a huge scan yields many bounded batches rather
+# than one giant one — keeps peak memory flat and lets the consumer pull lazily.
+_ADBC_BATCH_BYTES = 4 * 1024 * 1024
 
 
 class PostgreSQLDataSource(DataSource):
@@ -303,11 +308,45 @@ class PostgreSQLDataSource(DataSource):
         self._return_connection(conn)
 
     def _execute_query_adbc(self, query: str) -> Iterator[pa.RecordBatch]:
-        """Execute via the ADBC driver, returning Arrow directly."""
+        """Execute via ADBC and STREAM the result, never draining it ourselves.
+
+        The result is yielded from a lazy ``RecordBatchReader`` so the consumer
+        (the coordinator DuckDB) pulls batches on demand — it drives the fetch
+        and can spill or stop early, instead of us buffering the whole scan into
+        an Arrow table first. The cursor stays open for the life of the stream;
+        ``finally`` closes it when the stream is exhausted or the consumer stops.
+        """
         logger.debug(f"Executing query (adbc) on {self.name}: {query[:100]}...")
-        table = self._adbc_fetch(query)
-        for batch in table.to_batches(max_chunksize=10000):
-            yield batch
+        cursor = self._adbc_connection().cursor()
+        try:
+            self._bound_adbc_batch_size(cursor)
+            cursor.execute(query)
+            for batch in self._adbc_record_batches(cursor):
+                yield from self._normalize_batch(batch)
+        finally:
+            cursor.close()
+
+    def _bound_adbc_batch_size(self, cursor) -> None:
+        """Cap the streamed batch size; best-effort if the option is unsupported."""
+        import adbc_driver_manager
+
+        try:
+            cursor.adbc_statement.set_options(
+                **{"adbc.postgresql.batch_size_hint_bytes": str(_ADBC_BATCH_BYTES)}
+            )
+        except adbc_driver_manager.Error:
+            pass
+
+    def _adbc_record_batches(self, cursor) -> Iterator[pa.RecordBatch]:
+        """Lazy ``RecordBatchReader`` for an executed cursor (no full drain)."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            return cursor.fetch_record_batch()
+
+    def _normalize_batch(self, batch: pa.RecordBatch) -> Iterator[pa.RecordBatch]:
+        """Apply the ADBC->engine type normalization to a single streamed batch."""
+        normalized = self._normalize_table(pa.Table.from_batches([batch]))
+        yield from normalized.to_batches()
 
     def get_query_schema(self, query: str) -> pa.Schema:
         """Get a query's Arrow schema without materializing rows."""
