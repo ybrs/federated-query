@@ -212,14 +212,26 @@ class Join(LogicalPlanNode):
     left: LogicalPlanNode
     right: LogicalPlanNode
     join_type: JoinType
-    condition: Optional[Expression]  # None for cross join
+    condition: Optional[Expression]  # None for cross/NATURAL/USING joins
+    # NATURAL and USING joins carry no ON predicate: the source matches columns
+    # by name. ``natural`` flags a NATURAL JOIN; ``using`` lists the shared
+    # column names of a USING join.
+    natural: bool = False
+    using: Optional[List[str]] = None
 
     def children(self) -> List[LogicalPlanNode]:
         return [self.left, self.right]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Join":
         assert len(children) == 2
-        return Join(children[0], children[1], self.join_type, self.condition)
+        return Join(
+            children[0],
+            children[1],
+            self.join_type,
+            self.condition,
+            self.natural,
+            self.using,
+        )
 
     def accept(self, visitor):
         return visitor.visit_join(self)

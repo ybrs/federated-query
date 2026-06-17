@@ -233,7 +233,7 @@ class SingleSourcePushdown:
     def _absorb_join(self, join: Join, context: _PushContext) -> bool:
         """Add one join (right side must be a base scan in a left-deep tree)."""
         keyword = _JOIN_KEYWORDS.get(join.join_type)
-        if keyword is None or join.condition is None:
+        if keyword is None or not self._join_is_pushable(join):
             return False
         if not isinstance(join.right, Scan):
             return False
@@ -241,11 +241,23 @@ class SingleSourcePushdown:
             return False
         if not self._claim_scan(join.right, context):
             return False
-        condition_sql = join.condition.to_sql()
-        right_ref = self._scan_ref(join.right)
-        context.joins.append(f"{keyword} {right_ref} ON {condition_sql}")
+        context.joins.append(self._render_join_clause(join, keyword))
         context.has_join = True
         return True
+
+    def _join_is_pushable(self, join: Join) -> bool:
+        """A join pushes when it has an ON condition, or is NATURAL/USING."""
+        return join.condition is not None or join.natural or join.using is not None
+
+    def _render_join_clause(self, join: Join, keyword: str) -> str:
+        """Render one join clause using ON, USING, or NATURAL syntax."""
+        right_ref = self._scan_ref(join.right)
+        if join.natural:
+            return f"NATURAL {keyword} {right_ref}"
+        if join.using is not None:
+            columns = ", ".join(join.using)
+            return f"{keyword} {right_ref} USING ({columns})"
+        return f"{keyword} {right_ref} ON {join.condition.to_sql()}"
 
     def _claim_scan(self, scan: Scan, context: _PushContext) -> bool:
         """Confirm the scan shares the subtree's data source and collect filters."""

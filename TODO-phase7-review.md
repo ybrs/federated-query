@@ -26,15 +26,17 @@ inspection.
 
 ## STATUS (updated 2026-06-17, branch `phase8`)
 
-771 passed / 41 failed (from 645/125 baseline); decorrelation suite green.
+776 passed / 36 failed (from 645/125 baseline); decorrelation suite green.
 **Done: G4 set ops, G1 join breadth, G2 computed projections, G9 cross-source
 dynamic filtering (first version), P1 projection pruning, P2 ADBC connector,
 the Physical Merge Engine (P4 — all local operators except GroupedLimit/NLJ now
-run vectorized in DuckDB), and G6 date/time (EXTRACT, DATE_TRUNC, INTERVAL
-arithmetic, CURRENT_DATE, AGE now parse, bind and push down).** Remaining
+run vectorized in DuckDB), G6 date/time (EXTRACT, DATE_TRUNC, INTERVAL
+arithmetic, CURRENT_DATE, AGE now parse, bind and push down), and G7 aggregate
+FILTER + NATURAL/USING joins (single-source push).** Remaining
 failures are **G3 CTEs (10), subqueries/G8 (20, deferred — see
-`decorrelation-gaps.md`), G7 aggregate FILTER, NATURAL/USING (3), and assorted
-null/edge cases**. Verified
+`decorrelation-gaps.md`), and assorted null/edge cases (5) + the one
+nested-aggregate-via-subquery test (derived-table-in-FROM pushdown, folded into
+the nested-structure work with CTEs/G8)**. Verified
 correctness/silent-fail items are checked off. PARTIAL = some sub-cases remain
 (noted inline); DEFERRED = moderate/decision/perf/architectural, none are
 silent corruption (they raise clean errors or are documented deviations).
@@ -352,7 +354,17 @@ execution. All were failing before Phase 7.
   literals; binder resolves the inner column of EXTRACT. AGE/CURRENT_DATE
   already flowed through the generic function-call path — only the `INTERVAL`
   operand was blocking them. All push down via `to_sql`; 0 regressions.
-- [ ] **G7. Aggregate FILTER clause (2 tests)**.
+- [x] **G7. Aggregate FILTER clause + NATURAL/USING joins (5 tests) — DONE
+  (2026-06-17).** FILTER: parser rewrites `agg(x) FILTER (WHERE p)` into
+  `agg(CASE WHEN p THEN x END)` (`THEN 1` for `COUNT(*)`) — portable, keeps the
+  aggregate node intact, reuses `CaseExpr` (no new node/binder/renderer work).
+  NATURAL/USING: `Join` now carries `natural`/`using`; parser captures them
+  (previously silently dropped → unconditioned cross join), decorrelation and
+  pushdown preserve them, the single-source renderer emits `NATURAL JOIN` /
+  `JOIN … USING (…)`, and `parse_query` marks NATURAL joins with an explicit
+  `natural` flag. Cross-source NATURAL/USING (expand to common-column
+  equi-join) deferred. The 6th aggregate test (nested-aggregate-via-subquery)
+  is derived-table-in-FROM pushdown — folded into the nested-structure work.
 - [ ] **G8. Subqueries (20 `test_subqueries` tests) — DEFERRED (big task).**
   Re-triaged: ~14 of these are NOT decorrelation failures — they decorrelate
   correctly and return right answers but execute as a *local* join (2+ remote

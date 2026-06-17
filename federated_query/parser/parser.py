@@ -318,9 +318,26 @@ class Parser:
                 right=right_plan,
                 join_type=join_type,
                 condition=join_condition,
+                natural=self._is_natural_join(join_clause),
+                using=self._extract_using_columns(join_clause),
             )
 
         return current_plan
+
+    def _is_natural_join(self, join_clause: exp.Join) -> bool:
+        """Whether the JOIN carries the NATURAL method keyword."""
+        method = join_clause.args.get("method")
+        return bool(method) and str(method).upper() == "NATURAL"
+
+    def _extract_using_columns(self, join_clause: exp.Join) -> Optional[List[str]]:
+        """Return the USING column names, or None when there is no USING."""
+        using = join_clause.args.get("using")
+        if not using:
+            return None
+        columns: List[str] = []
+        for identifier in using:
+            columns.append(identifier.name)
+        return columns
 
     def _extract_table_alias(self, table_expr: exp.Table) -> Optional[str]:
         """Extract table alias if present.
@@ -859,6 +876,8 @@ class Parser:
             return self._convert_date_trunc(expr)
         if isinstance(expr, exp.Interval):
             return self._convert_interval(expr)
+        if isinstance(expr, exp.Filter):
+            return self._convert_filter_aggregate(expr)
         if self._is_aggregate_function(expr):
             return self._convert_aggregate_function(expr)
         if isinstance(expr, (exp.Anonymous, exp.Func, exp.Upper)):
@@ -916,6 +935,38 @@ class Parser:
         if default_expr is not None:
             else_expr = self._convert_expression(default_expr)
         return CaseExpr(when_clauses=when_clauses, else_result=else_expr)
+
+    def _convert_filter_aggregate(self, filter_expr: exp.Filter) -> FunctionCall:
+        """Convert ``AGG(...) FILTER (WHERE p)`` into a CASE-guarded aggregate.
+
+        Sources need not support the FILTER syntax: ``agg(x) FILTER (WHERE p)``
+        equals ``agg(CASE WHEN p THEN x END)`` (``THEN 1`` for ``COUNT(*)``),
+        which pushes down portably and keeps the aggregate node intact.
+        """
+        aggregate = self._convert_expression(filter_expr.this)
+        predicate = self._convert_expression(filter_expr.expression.this)
+        return self._guard_aggregate_args(aggregate, predicate)
+
+    def _guard_aggregate_args(
+        self, aggregate: FunctionCall, predicate: Expression
+    ) -> FunctionCall:
+        """Rebuild an aggregate with each argument gated by a filter predicate."""
+        guarded_args: List[Expression] = []
+        for arg in aggregate.args:
+            guarded_args.append(self._guard_one_arg(arg, predicate))
+        return FunctionCall(
+            function_name=aggregate.function_name,
+            args=guarded_args,
+            is_aggregate=aggregate.is_aggregate,
+            distinct=aggregate.distinct,
+        )
+
+    def _guard_one_arg(self, arg: Expression, predicate: Expression) -> CaseExpr:
+        """Build ``CASE WHEN predicate THEN arg END``, using 1 for COUNT(*)."""
+        result = arg
+        if isinstance(arg, ColumnRef) and arg.column == "*":
+            result = Literal(value=1, data_type=DataType.INTEGER)
+        return CaseExpr(when_clauses=[(predicate, result)], else_result=None)
 
     def _convert_extract(self, extract: exp.Extract) -> Extract:
         """Convert EXTRACT(field FROM source), keeping the field keyword.

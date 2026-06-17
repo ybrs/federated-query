@@ -1471,6 +1471,8 @@ class Decorrelator:
                 right=right,
                 join_type=node.join_type,
                 condition=node.condition,
+                natural=node.natural,
+                using=node.using,
             )
         if node.join_type != JoinType.INNER:
             raise DecorrelationError(

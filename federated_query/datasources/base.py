@@ -166,10 +166,23 @@ class DataSource(ABC):
         pass
 
     def parse_query(self, query: str):
-        """Parse query text into a sqlglot AST."""
+        """Parse query text into a sqlglot AST with NATURAL joins marked."""
         from ..parser.dialect import FedQPostgres
 
-        return sqlglot.parse_one(query, dialect=FedQPostgres)
+        ast = sqlglot.parse_one(query, dialect=FedQPostgres)
+        self._mark_natural_joins(ast)
+        return ast
+
+    def _mark_natural_joins(self, ast) -> None:
+        """Set an explicit ``natural`` flag on NATURAL joins in the AST.
+
+        sqlglot records a NATURAL join only as ``method='NATURAL'``; exposing a
+        boolean ``natural`` arg gives callers a uniform way to detect one.
+        """
+        for join in ast.find_all(sqlglot.exp.Join):
+            method = join.args.get("method")
+            if method and str(method).upper() == "NATURAL":
+                join.set("natural", True)
 
     def supports_capability(self, capability: DataSourceCapability) -> bool:
         """Check if data source supports a capability.

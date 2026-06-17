@@ -541,6 +541,8 @@ class Binder:
             right=bound_right,
             join_type=join.join_type,
             condition=bound_condition,
+            natural=join.natural,
+            using=join.using,
         )
 
     def _bind_explain(self, explain: Explain) -> Explain:
