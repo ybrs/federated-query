@@ -19,6 +19,7 @@ from ..catalog import Catalog
 from ..config import Config, DataSourceConfig, ExecutorConfig, load_config
 from ..datasources.duckdb import DuckDBDataSource
 from ..datasources.postgresql import PostgreSQLDataSource
+from ..datasources.clickhouse import ClickHouseDataSource
 from ..executor import Executor
 from ..parser import Binder, Parser, BindingError
 from ..optimizer import (
@@ -460,6 +461,8 @@ def _create_datasource(ds_config: DataSourceConfig):
         return DuckDBDataSource(ds_config.name, ds_config.config)
     if ds_config.type == "postgresql":
         return PostgreSQLDataSource(ds_config.name, ds_config.config)
+    if ds_config.type == "clickhouse":
+        return ClickHouseDataSource(ds_config.name, ds_config.config)
     raise ValueError(f"Unsupported data source type: {ds_config.type}")
 
 

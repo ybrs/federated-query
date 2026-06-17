@@ -154,7 +154,7 @@ def block(qid, desc, incoming, duck_sql, fedq_sql):
               f"the scans runs in DuckDB's own C++ engine.",
               f"**DuckDB total: {dms:.0f} ms**", "",
               f"**Head-to-head — fedq {total:.0f} ms · DuckDB {dms:.0f} ms**", "", "---", ""]
-    return "\n".join(lines)
+    return "\n".join(lines), total, dms
 
 
 QUERIES = [
@@ -208,10 +208,53 @@ QUERIES = [
      "SELECT id,category_id FROM pg.public.files WHERE id IN (10,250,999,40000,123456);"),
 ]
 
+HEADER = """# PostgreSQL + DuckDB sources — fedq vs DuckDB
+
+**DuckDB's best case.** Here the 10M-row fact table `access_logs` lives in a
+**local DuckDB file**, and the `files`/`categories` dimensions live in
+**PostgreSQL**. For DuckDB this is home turf: the fact table is *inside the very
+engine doing the join*, so it pays **nothing** to "fetch" it — only the
+PostgreSQL dimensions cross the wire. fedq, by contrast, must move `access_logs`
+out of its DuckDB source into the merge engine. So DuckDB's numbers here are
+flattering; the apples-to-apples version (fact table in an external store both
+must reach) is
+[`postgresql-clickhouse-sources-compare.md`](postgresql-clickhouse-sources-compare.md).
+
+For each query: the incoming SQL, what fedq sends to each source (DuckDB
+`analytics` + PostgreSQL `pg`) with a per-source timing split, what DuckDB sends
+to PostgreSQL plus its internal plan, and the head-to-head total. SQL is verbatim
+from the PG log / fedq EXPLAIN; fedq timing is one profiled run, DuckDB is median
+of 5. Regenerate: `./gen_perf_doc.py`.
+
+> Note on fedq's split: it **streams** the remote sources lazily, so much of the
+> real fetch time is charged to *local combine* rather than the per-source lines
+> — trust the **total**, not the split, for fedq.
+
+---
+
+"""
+
+def _summary(rows):
+    """Summary table over all queries, in order, from measured totals."""
+    lines = ["## Summary — all queries", "",
+             "| Q | what it tests | fedq | DuckDB | winner |",
+             "|---|---|--:|--:|:--:|"]
+    for qid, desc, ftotal, dtotal in rows:
+        winner = "**fedq**" if ftotal < dtotal else "DuckDB"
+        lines.append(f"| {qid} | {desc.rstrip('.')} | {ftotal:.0f} ms | {dtotal:.0f} ms | {winner} |")
+    lines += ["", "DuckDB leads the cross-source queries here **because the fact table is "
+              "inside its engine** — see the ClickHouse doc for the fair version.", ""]
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
-    parts = []
+    parts = [HEADER]
+    summary_rows = []
     for qid, desc, incoming, duck_sql, fedq_sql in QUERIES:
-        parts.append(block(qid, desc, incoming, duck_sql, fedq_sql))
-    with open(f"{ROOT}/_perquery.md", "w") as handle:
+        markdown, ftotal, dtotal = block(qid, desc, incoming, duck_sql, fedq_sql)
+        parts.append(markdown)
+        summary_rows.append((qid, desc, ftotal, dtotal))
+    parts.append(_summary(summary_rows))
+    with open(f"{ROOT}/postgresql-duckdb-sources-compare.md", "w") as handle:
         handle.write("\n".join(parts))
-    print("wrote _perquery.md")
+    print("wrote postgresql-duckdb-sources-compare.md")

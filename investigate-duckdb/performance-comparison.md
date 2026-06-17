@@ -4,6 +4,14 @@
 PostgreSQL on the same queries + data, with full timings and a correctness check.
 Deep mechanics: [`duckdb-pushdowns.md`](duckdb-pushdowns.md).
 
+**Two scenarios, two detailed docs** (this file is the overview):
+- **[postgresql-duckdb-sources-compare.md](postgresql-duckdb-sources-compare.md)** —
+  fact table in a *local DuckDB* (DuckDB's best case). Per-query: what each engine
+  sends to each source, with timings.
+- **[postgresql-clickhouse-sources-compare.md](postgresql-clickhouse-sources-compare.md)** —
+  fact table in an *external ClickHouse* (the fair comparison). Per-query: what
+  each engine sends to ClickHouse + Postgres, and the time spent on ClickHouse.
+
 ## Setup
 
 | source | table | rows | columns |
@@ -60,424 +68,32 @@ DuckDB queries with Arrow between operators vs DuckDB's single C++ pipeline) and
 wins where it pushes work down (**Q0** `COUNT(*)`, **Q7** selective `IN`, **Q5**
 aggregate). fedq's edge is *data moved*, not local CPU.
 
----
-
-## Per-query breakdown — incoming query, what each engine sends, and timings
-
-For every query: a one-line description, the **incoming SQL**, **what fedq sends
-to each source** (DuckDB `analytics` + PostgreSQL `pg`) with a per-source timing
-split, **what DuckDB sends to PostgreSQL** plus its internal plan, and the
-head-to-head total. All SQL is verbatim from the PG log / fedq EXPLAIN; timings
-are warm (fedq = one measured run with `FEDQ_PROFILE`; DuckDB = median of 5).
-Regenerate with `./gen_perf_doc.py`.
-
-### Q0 — Count every file in PostgreSQL.
-
-**Incoming query**
-```sql
-SELECT count(*) FROM files;
-```
-
-**fedq — what it sends to each source:**
-
-- → PostgreSQL · `pg`
-  ```sql
-  SELECT COUNT(*) AS "COUNT(*)" FROM "public"."files" AS files
-  ```
-
-**fedq timing:** DuckDB fetch **0 ms** · PostgreSQL fetch **9 ms** · local combine **1 ms** · **total 10 ms**
-
-**DuckDB — what it sends to PostgreSQL:**
-```sql
-COPY (SELECT NULL FROM "public"."files" WHERE ctid BETWEEN '(0,0)'::tid AND '(1000,0)'::tid) TO STDOUT (FORMAT "binary");
-COPY (SELECT NULL FROM "public"."files" WHERE ctid BETWEEN '(1000,0)'::tid AND '(2000,0)'::tid) TO STDOUT (FORMAT "binary");
-COPY (SELECT NULL FROM "public"."files" WHERE ctid BETWEEN '(2000,0)'::tid AND '(3000,0)'::tid) TO STDOUT (FORMAT "binary");
-COPY (SELECT NULL FROM "public"."files" WHERE ctid BETWEEN '(3000,0)'::tid AND '(4294967295,0)'::tid) TO STDOUT (FORMAT "binary");
-```
-internal DuckDB plan (root ← leaves): `UNGROUPED_AGGREGATE <- POSTGRES_SCAN` — everything above the scans runs in DuckDB's own C++ engine.
-**DuckDB total: 23 ms**
-
-**Head-to-head — fedq 10 ms · DuckDB 23 ms**
+> **Caveat — this table is apples-to-oranges in DuckDB's favour.** `access_logs`
+> lives *inside* the DuckDB doing the join, so DuckDB pays nothing to "fetch" the
+> 10M-row fact table; fedq moves it out of one DuckDB into another. The
+> ClickHouse section below removes that home-field advantage.
 
 ---
 
-### Q1 — Daily access counts per category for one week (10M-row fact joined to both PG dimensions).
-
-**Incoming query**
-```sql
-SELECT a.day, c.name, count(*) AS n
-FROM access_logs a
-JOIN files f ON f.id = a.file_id
-JOIN categories c ON c.id = f.category_id
-WHERE a.day BETWEEN DATE '2026-02-01' AND DATE '2026-02-07'
-GROUP BY a.day, c.name;
-```
-
-**fedq — what it sends to each source:**
-
-- → DuckDB · `analytics`
-  ```sql
-  SELECT "day", "file_id" FROM "main"."access_logs" AS a WHERE (a.day BETWEEN CAST('2026-02-01' AS DATE) AND CAST('2026-02-07' AS DATE))
-  ```
-- → PostgreSQL · `pg`
-  ```sql
-  SELECT "id", "category_id" FROM "public"."files" AS f
-  ```
-- → PostgreSQL · `pg`
-  ```sql
-  SELECT "name", "id" FROM "public"."categories" AS c
-  ```
-
-**fedq timing:** DuckDB fetch **60 ms** · PostgreSQL fetch **197 ms** · local combine **291 ms** · **total 548 ms**
-
-**DuckDB — what it sends to PostgreSQL:**
-```sql
-COPY (SELECT "id", "name" FROM "public"."categories" WHERE ctid BETWEEN '(0,0)'::tid AND '(4294967295,0)'::tid) TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(0,0)'::tid AND '(1000,0)'::tid) TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(2000,0)'::tid AND '(3000,0)'::tid) TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(1000,0)'::tid AND '(2000,0)'::tid) TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(3000,0)'::tid AND '(4294967295,0)'::tid) TO STDOUT (FORMAT "binary");
-```
-internal DuckDB plan (root ← leaves): `HASH_GROUP_BY <- PROJECTION <- HASH_JOIN <- SEQ_SCAN <- HASH_JOIN <- POSTGRES_SCAN` — everything above the scans runs in DuckDB's own C++ engine.
-**DuckDB total: 118 ms**
-
-**Head-to-head — fedq 548 ms · DuckDB 118 ms**
-
----
-
-### Q2 — Find big files in one category (two-predicate filter on a single table).
-
-**Incoming query**
-```sql
-SELECT id, category_id, size_bytes FROM files
-WHERE category_id = 42 AND size_bytes > 5000000;
-```
-
-**fedq — what it sends to each source:**
-
-- → PostgreSQL · `pg`
-  ```sql
-  SELECT "id", "category_id", "size_bytes" FROM "public"."files" AS files WHERE ((category_id = 42) AND (size_bytes > 5000000))
-  ```
-
-**fedq timing:** DuckDB fetch **0 ms** · PostgreSQL fetch **1 ms** · local combine **5 ms** · **total 6 ms**
-
-**DuckDB — what it sends to PostgreSQL:**
-```sql
-COPY (SELECT "category_id", "size_bytes", "id" FROM "public"."files" WHERE ctid BETWEEN '(0,0)'::tid AND '(1000,0)'::tid AND "category_id" = '42' AND "size_bytes" > '5000000') TO STDOUT (FORMAT "binary");
-COPY (SELECT "category_id", "size_bytes", "id" FROM "public"."files" WHERE ctid BETWEEN '(1000,0)'::tid AND '(2000,0)'::tid AND "category_id" = '42' AND "size_bytes" > '5000000') TO STDOUT (FORMAT "binary");
-COPY (SELECT "category_id", "size_bytes", "id" FROM "public"."files" WHERE ctid BETWEEN '(2000,0)'::tid AND '(3000,0)'::tid AND "category_id" = '42' AND "size_bytes" > '5000000') TO STDOUT (FORMAT "binary");
-COPY (SELECT "category_id", "size_bytes", "id" FROM "public"."files" WHERE ctid BETWEEN '(3000,0)'::tid AND '(4294967295,0)'::tid AND "category_id" = '42' AND "size_bytes" > '5000000') TO STDOUT (FORMAT "binary");
-```
-internal DuckDB plan (root ← leaves): `PROJECTION <- POSTGRES_SCAN` — everything above the scans runs in DuckDB's own C++ engine.
-**DuckDB total: 3 ms**
-
-**Head-to-head — fedq 6 ms · DuckDB 3 ms**
-
----
-
-### Q3 — Read one column for the first 99 files (projection + range filter).
-
-**Incoming query**
-```sql
-SELECT category_id FROM files WHERE id < 100;
-```
-
-**fedq — what it sends to each source:**
-
-- → PostgreSQL · `pg`
-  ```sql
-  SELECT "category_id", "id" FROM "public"."files" AS files WHERE (id < 100)
-  ```
-
-**fedq timing:** DuckDB fetch **0 ms** · PostgreSQL fetch **1 ms** · local combine **5 ms** · **total 5 ms**
-
-**DuckDB — what it sends to PostgreSQL:**
-```sql
-COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(0,0)'::tid AND '(1000,0)'::tid AND "id" < '100') TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(1000,0)'::tid AND '(2000,0)'::tid AND "id" < '100') TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(2000,0)'::tid AND '(3000,0)'::tid AND "id" < '100') TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(3000,0)'::tid AND '(4294967295,0)'::tid AND "id" < '100') TO STDOUT (FORMAT "binary");
-```
-internal DuckDB plan (root ← leaves): `PROJECTION <- POSTGRES_SCAN` — everything above the scans runs in DuckDB's own C++ engine.
-**DuckDB total: 2 ms**
-
-**Head-to-head — fedq 5 ms · DuckDB 2 ms**
-
----
-
-### Q4 — Top-5 active categories by file count — both tables in PostgreSQL.
-
-**Incoming query**
-```sql
-SELECT c.name, count(*) AS n
-FROM files f JOIN categories c ON c.id = f.category_id
-WHERE c.is_active = true
-GROUP BY c.name ORDER BY n DESC LIMIT 5;
-```
-
-**fedq — what it sends to each source:**
-
-- → PostgreSQL · `pg`
-  ```sql
-  SELECT c.name AS "name", COUNT(*) AS "n" FROM "public"."files" AS f INNER JOIN "public"."categories" AS c ON (c.id = f.category_id) WHERE (c.is_active = TRUE) GROUP BY c.name ORDER BY n DESC LIMIT 5
-  ```
-
-**fedq timing:** DuckDB fetch **0 ms** · PostgreSQL fetch **0 ms** · local combine **119 ms** · **total 119 ms**
-
-**DuckDB — what it sends to PostgreSQL:**
-```sql
-COPY (SELECT "id", "is_active", "name" FROM "public"."categories" WHERE ctid BETWEEN '(0,0)'::tid AND '(4294967295,0)'::tid AND "is_active" = 'true') TO STDOUT (FORMAT "binary");
-COPY (SELECT "category_id" FROM "public"."files" WHERE ctid BETWEEN '(0,0)'::tid AND '(1000,0)'::tid) TO STDOUT (FORMAT "binary");
-COPY (SELECT "category_id" FROM "public"."files" WHERE ctid BETWEEN '(1000,0)'::tid AND '(2000,0)'::tid) TO STDOUT (FORMAT "binary");
-COPY (SELECT "category_id" FROM "public"."files" WHERE ctid BETWEEN '(2000,0)'::tid AND '(3000,0)'::tid) TO STDOUT (FORMAT "binary");
-COPY (SELECT "category_id" FROM "public"."files" WHERE ctid BETWEEN '(3000,0)'::tid AND '(4294967295,0)'::tid) TO STDOUT (FORMAT "binary");
-```
-internal DuckDB plan (root ← leaves): `TOP_N <- HASH_GROUP_BY <- PROJECTION <- HASH_JOIN <- POSTGRES_SCAN` — everything above the scans runs in DuckDB's own C++ engine.
-**DuckDB total: 52 ms**
-
-**Head-to-head — fedq 119 ms · DuckDB 52 ms**
-
----
-
-### Q5 — Top-5 categories by file count + total size — single-table aggregate.
-
-**Incoming query**
-```sql
-SELECT category_id, count(*) AS n, sum(size_bytes) AS t
-FROM files GROUP BY category_id ORDER BY n DESC LIMIT 5;
-```
-
-**fedq — what it sends to each source:**
-
-- → PostgreSQL · `pg`
-  ```sql
-  SELECT category_id AS "category_id", COUNT(*) AS "n", SUM(size_bytes) AS "t" FROM "public"."files" AS files GROUP BY category_id ORDER BY n DESC NULLS FIRST LIMIT 5
-  ```
-
-**fedq timing:** DuckDB fetch **0 ms** · PostgreSQL fetch **127 ms** · local combine **2 ms** · **total 129 ms**
-
-**DuckDB — what it sends to PostgreSQL:**
-```sql
-COPY (SELECT "category_id", "size_bytes" FROM "public"."files" WHERE ctid BETWEEN '(0,0)'::tid AND '(1000,0)'::tid) TO STDOUT (FORMAT "binary");
-COPY (SELECT "category_id", "size_bytes" FROM "public"."files" WHERE ctid BETWEEN '(1000,0)'::tid AND '(2000,0)'::tid) TO STDOUT (FORMAT "binary");
-COPY (SELECT "category_id", "size_bytes" FROM "public"."files" WHERE ctid BETWEEN '(2000,0)'::tid AND '(3000,0)'::tid) TO STDOUT (FORMAT "binary");
-COPY (SELECT "category_id", "size_bytes" FROM "public"."files" WHERE ctid BETWEEN '(3000,0)'::tid AND '(4294967295,0)'::tid) TO STDOUT (FORMAT "binary");
-```
-internal DuckDB plan (root ← leaves): `TOP_N <- HASH_GROUP_BY <- PROJECTION <- POSTGRES_SCAN` — everything above the scans runs in DuckDB's own C++ engine.
-**DuckDB total: 46 ms**
-
-**Head-to-head — fedq 129 ms · DuckDB 46 ms**
-
----
-
-### Q6 — Top-5 categories by download events — cross-source, but ~all files match.
-
-**Incoming query**
-```sql
-SELECT c.name, count(*) AS n
-FROM access_logs a JOIN files f ON f.id = a.file_id JOIN categories c ON c.id = f.category_id
-WHERE a.action = 'download'
-GROUP BY c.name ORDER BY n DESC LIMIT 5;
-```
-
-**fedq — what it sends to each source:**
-
-- → DuckDB · `analytics`
-  ```sql
-  SELECT "file_id", "action" FROM "main"."access_logs" AS a WHERE (a.action = 'download')
-  ```
-- → PostgreSQL · `pg`
-  ```sql
-  SELECT "id", "category_id" FROM "public"."files" AS f
-  ```
-- → PostgreSQL · `pg`
-  ```sql
-  SELECT "name", "id" FROM "public"."categories" AS c
-  ```
-
-**fedq timing:** DuckDB fetch **212 ms** · PostgreSQL fetch **193 ms** · local combine **727 ms** · **total 1132 ms**
-
-**DuckDB — what it sends to PostgreSQL:**
-```sql
-COPY (SELECT "id", "name" FROM "public"."categories" WHERE ctid BETWEEN '(0,0)'::tid AND '(4294967295,0)'::tid) TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(0,0)'::tid AND '(1000,0)'::tid) TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(2000,0)'::tid AND '(3000,0)'::tid) TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(1000,0)'::tid AND '(2000,0)'::tid) TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(3000,0)'::tid AND '(4294967295,0)'::tid) TO STDOUT (FORMAT "binary");
-```
-internal DuckDB plan (root ← leaves): `TOP_N <- HASH_GROUP_BY <- PROJECTION <- HASH_JOIN <- SEQ_SCAN <- HASH_JOIN <- POSTGRES_SCAN` — everything above the scans runs in DuckDB's own C++ engine.
-**DuckDB total: 239 ms**
-
-**Head-to-head — fedq 1132 ms · DuckDB 239 ms**
-
----
-
-### Q7 — Top categories accessed by one user on one day — highly selective cross-source join.
-
-**Incoming query**
-```sql
-SELECT f.category_id, count(*) AS n
-FROM access_logs a JOIN files f ON f.id = a.file_id
-WHERE a.day = DATE '2026-02-01' AND a.user_id = 7
-GROUP BY f.category_id ORDER BY n DESC LIMIT 5;
-```
-
-**fedq — what it sends to each source:**
-
-- → DuckDB · `analytics`
-  ```sql
-  SELECT "file_id", "day", "user_id" FROM "main"."access_logs" AS a WHERE ((a.day = CAST('2026-02-01' AS DATE)) AND (a.user_id = 7))
-  ```
-- → PostgreSQL · `pg`
-  ```sql
-  SELECT "category_id", "id" FROM "public"."files" AS f WHERE (f.id IN (145330, 339870, 127891, 150143, 21692, 68308, 37793, 353438, 318784, 338877))
-  ```
-
-**fedq timing:** DuckDB fetch **5 ms** · PostgreSQL fetch **1 ms** · local combine **19 ms** · **total 24 ms**
-
-**DuckDB — what it sends to PostgreSQL:**
-```sql
-COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(0,0)'::tid AND '(1000,0)'::tid) TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(2000,0)'::tid AND '(3000,0)'::tid) TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(1000,0)'::tid AND '(2000,0)'::tid) TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(3000,0)'::tid AND '(4294967295,0)'::tid) TO STDOUT (FORMAT "binary");
-```
-internal DuckDB plan (root ← leaves): `TOP_N <- HASH_GROUP_BY <- PROJECTION <- HASH_JOIN <- POSTGRES_SCAN <- SEQ_SCAN` — everything above the scans runs in DuckDB's own C++ engine.
-**DuckDB total: 60 ms**
-
-**Head-to-head — fedq 24 ms · DuckDB 60 ms**
-
----
-
-### Q8 — Top categories for large downloaded files — cross-source with remote-column filters.
-
-**Incoming query**
-```sql
-SELECT c.name, count(*) AS n
-FROM access_logs a JOIN files f ON f.id = a.file_id JOIN categories c ON c.id = f.category_id
-WHERE f.size_bytes > 9000000 AND c.is_active = true
-GROUP BY c.name ORDER BY n DESC LIMIT 5;
-```
-
-**fedq — what it sends to each source:**
-
-- → DuckDB · `analytics`
-  ```sql
-  SELECT "file_id" FROM "main"."access_logs" AS a
-  ```
-- → PostgreSQL · `pg`
-  ```sql
-  SELECT "id", "category_id", "size_bytes" FROM "public"."files" AS f WHERE (f.size_bytes > 9000000)
-  ```
-- → PostgreSQL · `pg`
-  ```sql
-  SELECT "name", "id", "is_active" FROM "public"."categories" AS c WHERE (c.is_active = True)
-  ```
-
-**fedq timing:** DuckDB fetch **43 ms** · PostgreSQL fetch **71 ms** · local combine **351 ms** · **total 466 ms**
-
-**DuckDB — what it sends to PostgreSQL:**
-```sql
-COPY (SELECT "id", "is_active", "name" FROM "public"."categories" WHERE ctid BETWEEN '(0,0)'::tid AND '(4294967295,0)'::tid AND "is_active" = 'true') TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "category_id", "size_bytes" FROM "public"."files" WHERE ctid BETWEEN '(0,0)'::tid AND '(1000,0)'::tid AND "size_bytes" > '9000000') TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "category_id", "size_bytes" FROM "public"."files" WHERE ctid BETWEEN '(1000,0)'::tid AND '(2000,0)'::tid AND "size_bytes" > '9000000') TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "category_id", "size_bytes" FROM "public"."files" WHERE ctid BETWEEN '(2000,0)'::tid AND '(3000,0)'::tid AND "size_bytes" > '9000000') TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "category_id", "size_bytes" FROM "public"."files" WHERE ctid BETWEEN '(3000,0)'::tid AND '(4294967295,0)'::tid AND "size_bytes" > '9000000') TO STDOUT (FORMAT "binary");
-```
-internal DuckDB plan (root ← leaves): `TOP_N <- HASH_GROUP_BY <- PROJECTION <- HASH_JOIN <- SEQ_SCAN <- HASH_JOIN <- POSTGRES_SCAN` — everything above the scans runs in DuckDB's own C++ engine.
-**DuckDB total: 62 ms**
-
-**Head-to-head — fedq 466 ms · DuckDB 62 ms**
-
----
-
-### Q9 — Grab any 10 files (LIMIT, no order).
-
-**Incoming query**
-```sql
-SELECT id, filename FROM files LIMIT 10;
-```
-
-**fedq — what it sends to each source:**
-
-- → PostgreSQL · `pg`
-  ```sql
-  SELECT "id", "filename" FROM "public"."files" AS files LIMIT 10
-  ```
-
-**fedq timing:** DuckDB fetch **0 ms** · PostgreSQL fetch **0 ms** · local combine **1 ms** · **total 1 ms**
-
-**DuckDB — what it sends to PostgreSQL:**
-```sql
-COPY (SELECT "id", "filename" FROM "public"."files"  LIMIT 10) TO STDOUT (FORMAT "binary");
-```
-internal DuckDB plan (root ← leaves): `POSTGRES_SCAN` — everything above the scans runs in DuckDB's own C++ engine.
-**DuckDB total: 1 ms**
-
-**Head-to-head — fedq 1 ms · DuckDB 1 ms**
-
----
-
-### Q11 — The 10 largest files (ORDER BY + LIMIT).
-
-**Incoming query**
-```sql
-SELECT id, size_bytes FROM files ORDER BY size_bytes DESC LIMIT 10;
-```
-
-**fedq — what it sends to each source:**
-
-- → PostgreSQL · `pg`
-  ```sql
-  SELECT "id", "size_bytes" FROM "public"."files" AS files ORDER BY size_bytes DESC NULLS FIRST LIMIT 10
-  ```
-
-**fedq timing:** DuckDB fetch **0 ms** · PostgreSQL fetch **20 ms** · local combine **1 ms** · **total 21 ms**
-
-**DuckDB — what it sends to PostgreSQL:**
-```sql
-COPY (SELECT "id", "size_bytes" FROM "public"."files" WHERE ctid BETWEEN '(0,0)'::tid AND '(1000,0)'::tid) TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "size_bytes" FROM "public"."files" WHERE ctid BETWEEN '(1000,0)'::tid AND '(2000,0)'::tid) TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "size_bytes" FROM "public"."files" WHERE ctid BETWEEN '(2000,0)'::tid AND '(3000,0)'::tid) TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "size_bytes" FROM "public"."files" WHERE ctid BETWEEN '(3000,0)'::tid AND '(4294967295,0)'::tid) TO STDOUT (FORMAT "binary");
-```
-internal DuckDB plan (root ← leaves): `TOP_N <- POSTGRES_SCAN` — everything above the scans runs in DuckDB's own C++ engine.
-**DuckDB total: 46 ms**
-
-**Head-to-head — fedq 21 ms · DuckDB 46 ms**
-
----
-
-### Q12 — Fetch five files by explicit id list (literal IN).
-
-**Incoming query**
-```sql
-SELECT id, category_id FROM files WHERE id IN (10, 250, 999, 40000, 123456);
-```
-
-**fedq — what it sends to each source:**
-
-- → PostgreSQL · `pg`
-  ```sql
-  SELECT "id", "category_id" FROM "public"."files" AS files WHERE (id IN (10, 250, 999, 40000, 123456))
-  ```
-
-**fedq timing:** DuckDB fetch **0 ms** · PostgreSQL fetch **1 ms** · local combine **5 ms** · **total 6 ms**
-
-**DuckDB — what it sends to PostgreSQL:**
-```sql
-COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(0,0)'::tid AND '(1000,0)'::tid AND "id" IN ('10', '250', '999', '40000', '123456')) TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(1000,0)'::tid AND '(2000,0)'::tid AND "id" IN ('10', '250', '999', '40000', '123456')) TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(2000,0)'::tid AND '(3000,0)'::tid AND "id" IN ('10', '250', '999', '40000', '123456')) TO STDOUT (FORMAT "binary");
-COPY (SELECT "id", "category_id" FROM "public"."files" WHERE ctid BETWEEN '(3000,0)'::tid AND '(4294967295,0)'::tid AND "id" IN ('10', '250', '999', '40000', '123456')) TO STDOUT (FORMAT "binary");
-```
-internal DuckDB plan (root ← leaves): `PROJECTION <- FILTER <- HASH_JOIN <- POSTGRES_SCAN` — everything above the scans runs in DuckDB's own C++ engine.
-**DuckDB total: 2 ms**
-
-**Head-to-head — fedq 6 ms · DuckDB 2 ms**
-
----
+## The fair comparison (fact table in ClickHouse) — summary
+
+Full per-query breakdown in
+[postgresql-clickhouse-sources-compare.md](postgresql-clickhouse-sources-compare.md).
+With the fact table external (both engines pull it over the wire), **fedq wins 3
+of 4** — the opposite of the local-DuckDB table above:
+
+| Q | shape | fedq | DuckDB | why |
+|---|---|--:|--:|---|
+| Q7 | selective (10 keys) | **22 ms** | 55 ms | fedq reads CH in 5 ms (native Arrow) + pushes 10-key `IN` to PG; DuckDB's httpfs/Parquet read is 50 ms and it pulls all 400k files |
+| Q1 | week (308k keys) | **444 ms** | 606 ms | DuckDB's CH read alone is 429 ms (httpfs+Parquet of 776k rows) |
+| Q6 | non-selective (394k keys) | 1116 ms | **732 ms** | heavy join; DuckDB's single C++ pipeline beats fedq's operator-by-operator merge |
+| Q8 | 10M scanned | **616 ms** | 723 ms | DuckDB's CH read is 709 ms |
+
+**Key finding:** DuckDB has *no native ClickHouse scanner* — its only path is an
+HTTP/`FORMAT Parquet` hatch (50 ms even for 10 rows; 429–786 ms for the big
+results), whereas fedq connects to ClickHouse natively. The "DuckDB is 4× faster"
+impression comes only from the local-DuckDB table, where DuckDB doesn't pay to
+fetch the fact table at all.
 
 ## Correctness — verified identical
 
@@ -579,6 +195,9 @@ make binaries              # download stable CLI + build main from source
 make bench                 # the full timing table (stable / main / fedq)
 make bench-drivers         # psycopg2 SELECT vs ADBC binary COPY
 make verify                # fedq-vs-DuckDB correctness
-make perfdoc               # regenerate the per-query breakdown
+make perfdoc               # regenerate postgresql-duckdb-sources-compare.md
+make ch-start ch-data      # bring up ClickHouse + load the fact table
+make bench-clickhouse      # the fair CH+PG benchmark
+make chdoc                 # regenerate postgresql-clickhouse-sources-compare.md
 make test-streaming        # the streaming-contract test
 ```

@@ -68,3 +68,4 @@ local-config.yaml
 investigate-duckdb/duckdb-src/
 investigate-duckdb/pg-scanner-src/
 investigate-duckdb/bin/
+investigate-duckdb/clickhouse/

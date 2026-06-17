@@ -97,11 +97,45 @@ bench-core: pg-check ## Timing for the 3 headline queries (Q4/Q7/Q1)
 bench-drivers: pg-check ## COPY vs direct SQL: psycopg2 SELECT vs ADBC binary COPY
 	$(PYTHON) bench-drivers.py
 
+# ---- ClickHouse (fair-comparison fact store: access_logs lives outside both engines) ----
+CH_DIR ?= clickhouse
+CH     ?= $(CH_DIR)/clickhouse client --host 127.0.0.1
+
+ch-download: ## Download the ClickHouse single binary + the python client
+	mkdir -p $(CH_DIR)/logs $(CH_DIR)/data/user_files
+	cd $(CH_DIR) && curl -sSL https://clickhouse.com/ | sh
+	$(PYTHON) -m pip install -q clickhouse-connect
+
+ch-start: ## Start the local ClickHouse server in the background (config.xml provided)
+	mkdir -p $(CH_DIR)/logs $(CH_DIR)/data/user_files
+	cd $(CH_DIR) && nohup ./clickhouse server --config-file=config.xml > logs/server.out 2>&1 &
+	@for i in $$(seq 1 25); do $(CH) -q "SELECT 1" >/dev/null 2>&1 && { echo "ClickHouse up"; exit 0; }; sleep 1; done; \
+	  echo "ClickHouse did not come up — see $(CH_DIR)/logs/"; exit 1
+
+ch-stop: ## Stop the local ClickHouse server
+	-pkill -f "clickhouse server --config-file"
+
+ch-data: $(STABLE_BIN) ## Load access_logs (10M) into ClickHouse from the DuckDB fixture
+	$(STABLE_BIN) $(ANALYTICS_DB) -c "COPY (SELECT * FROM access_logs) TO '$(CH_DIR)/data/user_files/access_logs.parquet' (FORMAT parquet);"
+	$(CH) -q "DROP TABLE IF EXISTS access_logs"
+	$(CH) -q "CREATE TABLE access_logs (id Int64, file_id Int64, accessed_at DateTime, action String, bytes_sent Int64, user_id Int32, day Date) ENGINE=MergeTree ORDER BY (day,file_id)"
+	$(CH) -q "INSERT INTO access_logs SELECT * FROM file('access_logs.parquet', Parquet)"
+	@$(CH) -q "SELECT 'access_logs='||count() FROM access_logs"
+
+bench-clickhouse: pg-check ## FAIR bench: fact in ClickHouse — fedq(CH+PG) vs DuckDB(CH+PG)
+	$(PYTHON) bench-clickhouse.py
+
+test-clickhouse: ## Run the ClickHouse connector test
+	cd /workspace/federated-query && $(PYTHON) -m pytest tests/test_clickhouse_connector.py -v
+
 verify: pg-check ## Assert fedq and DuckDB return identical rows (Q4/Q7/Q1)
 	./verify-correctness.sh
 
-perfdoc: pg-check ## Regenerate the per-query breakdown section
+perfdoc: pg-check ## Regenerate postgresql-duckdb-sources-compare.md (DuckDB-local fact)
 	$(PYTHON) gen_perf_doc.py
+
+chdoc: pg-check ## Regenerate postgresql-clickhouse-sources-compare.md (CH fact, fair)
+	$(PYTHON) gen_ch_doc.py
 
 pushdowns: pg-check ## Capture the SQL each engine sends to PostgreSQL (full text)
 	./dump-fulltext.sh > /tmp/fulltext.md && echo "wrote /tmp/fulltext.md"
@@ -118,4 +152,5 @@ clean: ## Remove built binaries, the DuckDB fixture, and clones
 	rm -rf bin $(ANALYTICS_DB) $(MAIN_SRC) duckdb-src
 
 .PHONY: help all data binaries bench bench-core bench-drivers verify perfdoc \
-        pushdowns pg-check pg-data duck-data test-streaming clean clean-build
+        pushdowns pg-check pg-data duck-data test-streaming clean clean-build \
+        ch-download ch-start ch-stop ch-data bench-clickhouse test-clickhouse
