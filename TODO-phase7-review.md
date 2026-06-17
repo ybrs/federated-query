@@ -24,15 +24,17 @@ inspection.
 
 ---
 
-## STATUS (updated 2026-06-15, branch `parsing_explain`)
+## STATUS (updated 2026-06-17, branch `phase8`)
 
-743 passed / 48 failed (from 645/125 baseline); decorrelation suite 122/122 green.
+771 passed / 41 failed (from 645/125 baseline); decorrelation suite green.
 **Done: G4 set ops, G1 join breadth, G2 computed projections, G9 cross-source
-dynamic filtering (first version), P1 projection pruning, P2 ADBC connector, and
+dynamic filtering (first version), P1 projection pruning, P2 ADBC connector,
 the Physical Merge Engine (P4 — all local operators except GroupedLimit/NLJ now
-run vectorized in DuckDB).** Remaining failures are **G3 CTEs (10),
-G6 date/time (7), subqueries/G8 (20, deferred — see `decorrelation-gaps.md`),
-G7 aggregate FILTER, NATURAL/USING (3), and assorted null/edge cases**. Verified
+run vectorized in DuckDB), and G6 date/time (EXTRACT, DATE_TRUNC, INTERVAL
+arithmetic, CURRENT_DATE, AGE now parse, bind and push down).** Remaining
+failures are **G3 CTEs (10), subqueries/G8 (20, deferred — see
+`decorrelation-gaps.md`), G7 aggregate FILTER, NATURAL/USING (3), and assorted
+null/edge cases**. Verified
 correctness/silent-fail items are checked off. PARTIAL = some sub-cases remain
 (noted inline); DEFERRED = moderate/decision/perf/architectural, none are
 silent corruption (they raise clean errors or are documented deviations).
@@ -342,8 +344,14 @@ execution. All were failing before Phase 7.
 - [ ] **G5. CAST broken (8 tests)** — parser drops the target type via generic
   function conversion → emits invalid `CAST(quantity)`. Real bug, not just
   missing pushdown.
-- [ ] **G6. Date/time gaps (~6 tests)** — EXTRACT (exp.Var), INTERVAL, AGE,
-  CURRENT_DATE pushdown.
+- [x] **G6. Date/time gaps (7 tests) — DONE (2026-06-17).** Added `Extract`
+  and `Interval` expression nodes (with visitor hooks) plus parser converters
+  for `EXTRACT(field FROM src)`, `DATE_TRUNC` (Postgres normalises it to its
+  `TimestampTrunc` alias; the parser re-materialises the canonical call and the
+  `FedQPostgres` dialect now builds `exp.DateTrunc` directly), and `INTERVAL`
+  literals; binder resolves the inner column of EXTRACT. AGE/CURRENT_DATE
+  already flowed through the generic function-call path — only the `INTERVAL`
+  operand was blocking them. All push down via `to_sql`; 0 regressions.
 - [ ] **G7. Aggregate FILTER clause (2 tests)**.
 - [ ] **G8. Subqueries (20 `test_subqueries` tests) — DEFERRED (big task).**
   Re-triaged: ~14 of these are NOT decorrelation failures — they decorrelate

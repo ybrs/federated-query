@@ -29,6 +29,8 @@ from ..plan.expressions import (
     InList,
     BetweenExpression,
     Cast,
+    Extract,
+    Interval,
     CaseExpr,
     SubqueryExpression,
     ExistsExpression,
@@ -494,6 +496,12 @@ class Binder:
             return self._bind_cast(
                 expr, lambda value: self._bind_expression_multi_table(value, tables)
             )
+        if isinstance(expr, Extract):
+            return self._bind_extract(
+                expr, lambda value: self._bind_expression_multi_table(value, tables)
+            )
+        if isinstance(expr, Interval):
+            return expr
         if isinstance(expr, FunctionCall):
             return self._bind_function_args(
                 expr, lambda value: self._bind_expression_multi_table(value, tables)
@@ -1009,6 +1017,12 @@ class Binder:
             return self._bind_cast(
                 expr, lambda value: self._bind_expression(value, table)
             )
+        if isinstance(expr, Extract):
+            return self._bind_extract(
+                expr, lambda value: self._bind_expression(value, table)
+            )
+        if isinstance(expr, Interval):
+            return expr
         if isinstance(expr, FunctionCall):
             return self._bind_function_args(
                 expr, lambda value: self._bind_expression(value, table)
@@ -1037,6 +1051,15 @@ class Binder:
             target_type=expr.target_type,
             data_type=data_type,
         )
+
+    def _bind_extract(
+        self,
+        expr: Extract,
+        bind_value: Callable[[Expression], Expression],
+    ) -> Extract:
+        """Bind the source of an EXTRACT while preserving its field keyword."""
+        bound_source = bind_value(expr.source)
+        return Extract(field=expr.field, source=bound_source)
 
     def _resolve_cast_type(self, target_type: str) -> DataType:
         """Map a SQL type text such as ``DECIMAL(10, 2)`` to a DataType."""

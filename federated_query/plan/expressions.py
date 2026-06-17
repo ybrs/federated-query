@@ -54,6 +54,7 @@ class DataType(Enum):
     BOOLEAN = "BOOLEAN"
     DATE = "DATE"
     TIMESTAMP = "TIMESTAMP"
+    INTERVAL = "INTERVAL"
     NULL = "NULL"
 
 
@@ -387,6 +388,63 @@ class Cast(Expression):
         return f"Cast({self.expr} AS {self.target_type})"
 
 
+@dataclass(frozen=True)
+class Extract(Expression):
+    """``EXTRACT(field FROM source)`` date/time field extraction.
+
+    ``field`` is the unit keyword (``YEAR``, ``MONTH`` ...); ``source`` is the
+    date/time expression it is taken from. The result is a numeric value.
+    """
+
+    field: str
+    source: Expression
+
+    def get_type(self) -> DataType:
+        """EXTRACT yields a numeric component, modelled as a double."""
+        return DataType.DOUBLE
+
+    def accept(self, visitor):
+        """Dispatch to the visitor's extract hook."""
+        return visitor.visit_extract(self)
+
+    def to_sql(self) -> str:
+        """Render the keyword-argument EXTRACT syntax."""
+        return f"EXTRACT({self.field} FROM {self.source.to_sql()})"
+
+    def __repr__(self) -> str:
+        return f"Extract({self.field} FROM {self.source})"
+
+
+@dataclass(frozen=True)
+class Interval(Expression):
+    """An ``INTERVAL 'value unit'`` literal such as ``INTERVAL '30 days'``.
+
+    ``value`` is the magnitude text (``'30'``) and ``unit`` the optional unit
+    keyword (``DAYS``); some intervals carry the whole specification in
+    ``value`` and leave ``unit`` as ``None``.
+    """
+
+    value: str
+    unit: Optional[str]
+
+    def get_type(self) -> DataType:
+        """Interval literals carry the INTERVAL type."""
+        return DataType.INTERVAL
+
+    def accept(self, visitor):
+        """Dispatch to the visitor's interval hook."""
+        return visitor.visit_interval(self)
+
+    def to_sql(self) -> str:
+        """Render the INTERVAL literal with its unit when present."""
+        if self.unit:
+            return f"INTERVAL '{self.value} {self.unit}'"
+        return f"INTERVAL '{self.value}'"
+
+    def __repr__(self) -> str:
+        return f"Interval({self.value} {self.unit})"
+
+
 class ExpressionVisitor(ABC):
     """Visitor interface for expressions."""
 
@@ -424,6 +482,14 @@ class ExpressionVisitor(ABC):
 
     @abstractmethod
     def visit_cast(self, expr: "Cast"):
+        pass
+
+    @abstractmethod
+    def visit_extract(self, expr: "Extract"):
+        pass
+
+    @abstractmethod
+    def visit_interval(self, expr: "Interval"):
         pass
 
     @abstractmethod

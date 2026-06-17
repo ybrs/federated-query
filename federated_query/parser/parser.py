@@ -36,6 +36,8 @@ from ..plan.expressions import (
     InList,
     BetweenExpression,
     Cast,
+    Extract,
+    Interval,
     CaseExpr,
     SubqueryExpression,
     ExistsExpression,
@@ -851,6 +853,12 @@ class Parser:
             return ColumnRef(table=None, column="*")
         if isinstance(expr, exp.Case):
             return self._convert_case_expression(expr)
+        if isinstance(expr, exp.Extract):
+            return self._convert_extract(expr)
+        if isinstance(expr, (exp.TimestampTrunc, exp.DateTrunc)):
+            return self._convert_date_trunc(expr)
+        if isinstance(expr, exp.Interval):
+            return self._convert_interval(expr)
         if self._is_aggregate_function(expr):
             return self._convert_aggregate_function(expr)
         if isinstance(expr, (exp.Anonymous, exp.Func, exp.Upper)):
@@ -908,6 +916,39 @@ class Parser:
         if default_expr is not None:
             else_expr = self._convert_expression(default_expr)
         return CaseExpr(when_clauses=when_clauses, else_result=else_expr)
+
+    def _convert_extract(self, extract: exp.Extract) -> Extract:
+        """Convert EXTRACT(field FROM source), keeping the field keyword.
+
+        sqlglot stores the field as a ``Var`` node (``YEAR``, ``MONTH`` ...) in
+        ``this`` and the source date/time expression in ``expression``.
+        """
+        field = extract.this.name
+        source = self._convert_expression(extract.expression)
+        return Extract(field=field, source=source)
+
+    def _convert_date_trunc(self, trunc: exp.Func) -> FunctionCall:
+        """Convert DATE_TRUNC into a portable two-argument function call.
+
+        The Postgres dialect normalises ``DATE_TRUNC('month', col)`` to a
+        ``TimestampTrunc`` node holding the unit as a ``Var`` under ``unit`` and
+        the source under ``this``; we re-materialise the standard call shape.
+        """
+        unit = trunc.args["unit"].name
+        source = self._convert_expression(trunc.this)
+        unit_literal = Literal(value=unit, data_type=DataType.VARCHAR)
+        return FunctionCall(function_name="DATE_TRUNC", args=[unit_literal, source])
+
+    def _convert_interval(self, interval: exp.Interval) -> Interval:
+        """Convert an INTERVAL literal, preserving its magnitude and unit.
+
+        sqlglot keeps the magnitude literal in ``this`` and the optional unit
+        keyword as a ``Var`` under ``unit`` (absent for multi-field intervals).
+        """
+        value = interval.this.name
+        unit_node = interval.args.get("unit")
+        unit = unit_node.name if unit_node is not None else None
+        return Interval(value=value, unit=unit)
 
     def _convert_column(self, col: exp.Column) -> ColumnRef:
         """Convert sqlglot Column to ColumnRef."""
