@@ -10,21 +10,23 @@ med() { sort -n | awk '{v[NR]=$1} END{print (NR%2)? v[(NR+1)/2] : (v[NR/2]+v[NR/
 duck_time() { # $1=binary(+flags)  $2=loadstmt  $3=query
   { echo ".timer on"; echo "$2"; echo "$ATTACH"; for i in 1 2 3 4 5; do echo "$3"; done; } \
    | $1 analytics-poc.duckdb 2>/dev/null | grep "Run Time" | tail -5 | awk '{print $5*1000}' | med; }
-fedq_time() { # $1=query ; prints "<ms> <rows>"
+fedq_time() { # $1=query $2=config ; prints "<ms> <rows>"
   out=$({ for i in 1 2 3 4 5; do echo "$1"; done; printf '\\q\n'; } \
-        | /workspace/venv-fedq/bin/fedq -c fedq-poc-config.yaml 2>&1 | grep "rows in")
+        | /workspace/venv-fedq/bin/fedq -c "$2" 2>&1 | grep "rows in")
   ms=$(echo "$out" | awk '{print $(NF-1)}' | med)
   rows=$(echo "$out" | head -1 | awk '{print $1}')
   echo "$ms $rows"; }
 
-printf "%-4s %-34s %8s %8s %8s %8s\n" "Q" "what it tests" "rows" "stable" "main" "fedq"
-printf "%-4s %-34s %8s %8s %8s %8s\n" "--" "----------------------------------" "------" "------" "------" "------"
+H="%-4s %-32s %7s %7s %7s %10s %9s\n"
+printf "$H" "Q" "what it tests" "rows" "stable" "main" "fedq-psyco" "fedq-adbc"
+printf "$H" "--" "------------------------------" "-----" "------" "------" "--------" "--------"
 
 row() { # $1=id $2=desc $3=duck_sql $4=fedq_sql
   s=$(duck_time "./bin/duckdb-stable" "LOAD postgres;" "$3")
   m=$(duck_time "pg-scanner-src/build/release/duckdb -unsigned" "LOAD '$EXT';" "$3")
-  read fms frows < <(fedq_time "$4")
-  printf "%-4s %-34s %8s %8s %8s %8s\n" "$1" "$2" "${frows:-?}" "$s" "$m" "$fms"
+  read pms prows < <(fedq_time "$4" fedq-poc-config.yaml)       # psycopg2 (plain SELECT)
+  read ams arows < <(fedq_time "$4" fedq-poc-config-adbc.yaml)  # ADBC (binary COPY)
+  printf "$H" "$1" "$2" "${prows:-?}" "$s" "$m" "$pms" "$ams"
 }
 
 row Q0 "count(*) on remote"               "SELECT count(*) FROM pg.files;" \

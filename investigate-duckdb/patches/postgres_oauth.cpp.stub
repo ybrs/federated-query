@@ -1,0 +1,28 @@
+//===----------------------------------------------------------------------===//
+// POC build stub for postgres_oauth.cpp
+//
+// The upstream implementation uses the libpq-18 OAuth bearer-token API
+// (PQauthDataHook_type / PGoauthBearerRequest / PQ{get,set}AuthDataHook). The
+// libpq available in this environment is PostgreSQL 17, which predates that
+// API, so the real file does not compile here. This investigation connects to
+// PostgreSQL with trust auth and never exercises OAuth, so we stub the three
+// symbols the header declares. Behaviour under test (scan/filter/aggregate
+// pushdown) is unaffected.
+//===----------------------------------------------------------------------===//
+
+#include "postgres_oauth.hpp"
+
+namespace duckdb {
+
+OAuthTokenHolder::~OAuthTokenHolder() {
+}
+
+void PostgresInitOAuthHook() {
+}
+
+OAuthTokenHolder SetThreadLocalOAuthTokenFromSessionOption(ClientContext &ctx) {
+	(void)ctx;
+	return OAuthTokenHolder();
+}
+
+} // namespace duckdb

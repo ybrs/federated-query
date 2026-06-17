@@ -67,7 +67,11 @@ class PostgreSQLDataSource(DataSource):
         # results through the ADBC PostgreSQL driver (postgres wire -> Arrow,
         # no per-cell Python objects); metadata/stats still use psycopg2.
         self._use_adbc = config.get("driver") == "adbc"
-        self._adbc_conn = None
+        # Pool of idle ADBC connections. A streamed COPY keeps its connection
+        # busy for the life of the reader, and libpq allows only one COPY per
+        # connection, so concurrent scans (e.g. both sides of a join) each need
+        # their own — a single shared connection would collide.
+        self._adbc_idle: List[Any] = []
 
     def connect(self) -> None:
         """Establish connection pool to PostgreSQL.
@@ -97,9 +101,9 @@ class PostgreSQLDataSource(DataSource):
 
     def disconnect(self) -> None:
         """Close all connections in the pool (and the ADBC connection)."""
-        if self._adbc_conn is not None:
-            self._adbc_conn.close()
-            self._adbc_conn = None
+        for connection in self._adbc_idle:
+            connection.close()
+        self._adbc_idle = []
         if self._pool:
             self._pool.closeall()
             logger.info(f"Disconnected from PostgreSQL: {self.name}")
@@ -317,7 +321,8 @@ class PostgreSQLDataSource(DataSource):
         ``finally`` closes it when the stream is exhausted or the consumer stops.
         """
         logger.debug(f"Executing query (adbc) on {self.name}: {query[:100]}...")
-        cursor = self._adbc_connection().cursor()
+        connection = self._acquire_adbc()
+        cursor = connection.cursor()
         try:
             self._bound_adbc_batch_size(cursor)
             cursor.execute(query)
@@ -325,6 +330,7 @@ class PostgreSQLDataSource(DataSource):
                 yield from self._normalize_batch(batch)
         finally:
             cursor.close()
+            self._release_adbc(connection)
 
     def _bound_adbc_batch_size(self, cursor) -> None:
         """Cap the streamed batch size; best-effort if the option is unsupported."""
@@ -375,26 +381,36 @@ class PostgreSQLDataSource(DataSource):
         database = self.config["database"]
         return f"postgresql://{auth}@{host}:{port}/{database}"
 
-    def _adbc_connection(self):
-        """Lazily open (and cache) the ADBC connection.
+    def _acquire_adbc(self):
+        """Take an idle ADBC connection from the pool, or open a new one.
 
         ``autocommit=True`` keeps read-only fetches from leaving the connection
         idle in a transaction holding locks on the scanned tables.
         """
-        if self._adbc_conn is None:
-            from adbc_driver_postgresql import dbapi
+        if self._adbc_idle:
+            return self._adbc_idle.pop()
+        from adbc_driver_postgresql import dbapi
 
-            self._adbc_conn = dbapi.connect(self._adbc_uri(), autocommit=True)
-        return self._adbc_conn
+        return dbapi.connect(self._adbc_uri(), autocommit=True)
+
+    def _release_adbc(self, connection) -> None:
+        """Return a connection to the idle pool for reuse by the next scan."""
+        self._adbc_idle.append(connection)
 
     def _adbc_fetch(self, query: str) -> pa.Table:
-        """Run a query through ADBC and normalize its Arrow types."""
-        cursor = self._adbc_connection().cursor()
+        """Run a query through ADBC and normalize its Arrow types (drains fully).
+
+        Used for the small schema-probe (``LIMIT 0``); the streamed data path is
+        ``_execute_query_adbc``.
+        """
+        connection = self._acquire_adbc()
+        cursor = connection.cursor()
         try:
             cursor.execute(query)
             table = cursor.fetch_arrow_table()
         finally:
             cursor.close()
+            self._release_adbc(connection)
         return self._normalize_table(table)
 
     def _normalize_table(self, table: pa.Table) -> pa.Table:

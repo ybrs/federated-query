@@ -1,0 +1,24 @@
+datasources:
+  pg:
+    type: postgresql
+    driver: adbc
+    host: localhost
+    port: 5432
+    database: duckpoc
+    user: postgres
+    password: ''
+    schemas: [public]
+    capabilities: [aggregations, joins, window_functions, subqueries, cte]
+  analytics:
+    type: duckdb
+    path: "/workspace/federated-query/investigate-duckdb/analytics-poc.duckdb"
+    read_only: true
+    capabilities: [aggregations, joins, window_functions, subqueries, cte]
+optimizer:
+  enable_predicate_pushdown: true
+  enable_projection_pushdown: true
+  enable_join_reordering: true
+  enable_decorrelation: true
+executor:
+  max_memory_mb: 2048
+  batch_size: 10000
