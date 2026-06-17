@@ -89,11 +89,14 @@ of 4** — the opposite of the local-DuckDB table above:
 | Q6 | non-selective (394k keys) | 1116 ms | **732 ms** | heavy join; DuckDB's single C++ pipeline beats fedq's operator-by-operator merge |
 | Q8 | 10M scanned | **616 ms** | 723 ms | DuckDB's CH read is 709 ms |
 
-**Key finding:** DuckDB has *no native ClickHouse scanner* — its only path is an
-HTTP/`FORMAT Parquet` hatch (50 ms even for 10 rows; 429–786 ms for the big
-results), whereas fedq connects to ClickHouse natively. The "DuckDB is 4× faster"
-impression comes only from the local-DuckDB table, where DuckDB doesn't pay to
-fetch the fact table at all.
+**Key finding:** DuckDB has *no production-ready ClickHouse connector*. The
+httpfs/`FORMAT Parquet` hatch works but is fragile (Range mismatch truncates big
+results), and the `chsql_native` community extension lags 2 DuckDB releases and
+**silently corrupts data** (Int64→0). fedq connects natively via the official
+`clickhouse-connect` client — a ~150-line Python connector, correct and current.
+The "DuckDB is 4× faster" impression comes only from the local-DuckDB table,
+where DuckDB doesn't pay to fetch the fact table at all. **fedq's edge is
+connector breadth — cheap in Python, expensive/fragile as a C++ extension.**
 
 ## Correctness — verified identical
 

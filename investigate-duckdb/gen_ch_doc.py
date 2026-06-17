@@ -295,10 +295,23 @@ How each engine reaches ClickHouse:
 - **fedq** — a native ClickHouse connector (`type: clickhouse`,
   `clickhouse-connect` Arrow stream) + ADBC Postgres, and it pushes the **G9
   dynamic `IN`-list from ClickHouse keys into Postgres**.
-- **DuckDB** — has **no native ClickHouse scanner** (`mysql_scanner` fails: CH
-  has no transactions). The only working path is **httpfs reading ClickHouse's
-  HTTP `FORMAT Parquet`** output (the static filter embedded in the CH query) +
-  `postgres_scanner` for the dimensions.
+- **DuckDB** — has **no production-ready ClickHouse connector**; all paths are
+  inadequate:
+  - **httpfs + `FORMAT Parquet` over HTTP** (used below) — correct when it
+    completes, but fragile: DuckDB Range-reads the response as a static file,
+    while ClickHouse's `?query=` endpoint ignores Range and returns a *different
+    byte layout each request*, so large results intermittently truncate
+    (`No magic bytes`). Static filter embedded in the CH query, dims via
+    `postgres_scanner`.
+  - **`chsql_native` community extension** (native protocol) — lags 2 DuckDB
+    releases (max v1.3.2 vs 1.5.3) and **silently corrupts data**: `Int64`→0,
+    `Float64`→garbage, `Date`→wrong (verified — `file_id` comes back all zeros),
+    so joins would be wrong. Unusable.
+  - `mysql_scanner` against CH's MySQL port — fails (CH has no transactions).
+
+  A *correct* DuckDB↔ClickHouse connector means a maintained C++ extension; fedq's
+  is ~150 lines of Python on the official `clickhouse-connect` client — correct,
+  current, easy. **That connector flexibility, not per-query speed, is the point.**
 
 ### How to read the timings
 - **DuckDB → ClickHouse "X ms to read"** is the real HTTP transfer time (from
