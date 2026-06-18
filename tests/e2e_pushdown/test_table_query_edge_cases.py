@@ -11,7 +11,7 @@ from tests.e2e_pushdown.helpers import (
 
 
 def test_query_on_empty_table_behavior(single_source_env):
-    """A constant-false predicate is folded to FALSE before pushdown."""
+    """A constant-false predicate is pushed to the source unevaluated."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id FROM duckdb_primary.main.orders "
@@ -21,11 +21,14 @@ def test_query_on_empty_table_behavior(single_source_env):
 
     where_clause = ast.args.get("where")
     assert where_clause is not None
-    # The optimizer constant-folds ``1 = 0`` to FALSE, as a real engine does,
-    # so the remote SQL carries a boolean constant, not an equality.
+    # fedq does not constant-fold: the source owns the data and evaluates
+    # ``1 = 0`` itself, so the remote SQL carries the equality verbatim.
     predicate = unwrap_parens(where_clause.this)
-    assert isinstance(predicate, exp.Boolean)
-    assert predicate.this is False
+    assert isinstance(predicate, exp.EQ)
+    left = unwrap_parens(predicate.left)
+    right = unwrap_parens(predicate.right)
+    assert isinstance(left, exp.Literal) and int(left.this) == 1
+    assert isinstance(right, exp.Literal) and int(right.this) == 0
 
 
 def test_query_single_row_with_limit_one(single_source_env):

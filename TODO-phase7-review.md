@@ -24,24 +24,29 @@ inspection.
 
 ---
 
-## STATUS (updated 2026-06-17, branch `phase8`)
+## STATUS (updated 2026-06-18, branch `phase8`)
 
-779 passed / 33 failed (from 645/125 baseline); decorrelation suite green.
+739 passed / 31 failed (from 645/125 baseline); decorrelation suite green.
+(Total test count dropped because the constant-folding feature and its two
+dedicated test files were removed — see below.)
 **Done: G4 set ops, G1 join breadth, G2 computed projections, G9 cross-source
 dynamic filtering (first version), P1 projection pruning, P2 ADBC connector,
 the Physical Merge Engine (P4 — all local operators except GroupedLimit/NLJ now
 run vectorized in DuckDB), G6 date/time (EXTRACT, DATE_TRUNC, INTERVAL
 arithmetic, CURRENT_DATE, AGE now parse, bind and push down), and G7 aggregate
-FILTER + NATURAL/USING joins (single-source push).** Three edge-case tests
-were corrected to match real engine behavior (COALESCE operand count vs
-sqlglot's this/expressions split; pushed user aliases; multi-statement
-injection is rejected, not parsed). Remaining failures are **G3 CTEs (10),
-subqueries/G8 (20, deferred — see `decorrelation-gaps.md`), the
-nested-aggregate-via-subquery test (derived-table-in-FROM pushdown), and 2
-constant-folding edge cases (`0.1 + 0.2` folded; `price - price = 0 AND
-quantity * 0 = 0` folded to TRUE — the latter is also a NULL-correctness bug in
-`ExpressionSimplificationRule`)**. The first three buckets are the
-nested-structure pushdown work. Verified
+FILTER + NATURAL/USING joins (single-source push).** Edge-case tests were
+corrected to match real engine behavior (COALESCE operand count vs sqlglot's
+this/expressions split; pushed user aliases; multi-statement injection is
+rejected, not parsed; constant arithmetic is pushed unevaluated, not folded).
+**Removed fedq-side constant folding / expression simplification
+(`ExpressionSimplificationRule` + its rewriters): it baked Python float
+semantics into pushed SQL and folded `x - x = 0`-style predicates to TRUE
+(a NULL-correctness bug). Sources fold pushed exprs; the DuckDB merge engine
+folds local ones; the Arrow evaluator handles pure-local `SELECT 1+2`.**
+Remaining failures are **G3 CTEs (10), subqueries/G8 (20, deferred — see
+`decorrelation-gaps.md`), and the nested-aggregate-via-subquery test
+(derived-table-in-FROM pushdown)** — all the nested-structure pushdown work.
+Verified
 correctness/silent-fail items are checked off. PARTIAL = some sub-cases remain
 (noted inline); DEFERRED = moderate/decision/perf/architectural, none are
 silent corruption (they raise clean errors or are documented deviations).

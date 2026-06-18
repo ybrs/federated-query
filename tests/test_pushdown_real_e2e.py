@@ -23,7 +23,6 @@ from federated_query.optimizer import (
     AggregatePushdownRule,
     OrderByPushdownRule,
     LimitPushdownRule,
-    ExpressionSimplificationRule,
 )
 from federated_query.executor import Executor
 
@@ -120,7 +119,6 @@ def execute_and_capture(sql: str, catalog: Catalog, ds: QueryCapturingDataSource
     bound_plan = binder.bind(logical_plan)
 
     optimizer = RuleBasedOptimizer(catalog)
-    optimizer.add_rule(ExpressionSimplificationRule())
     optimizer.add_rule(PredicatePushdownRule())
     optimizer.add_rule(ProjectionPushdownRule())
     optimizer.add_rule(AggregatePushdownRule())
@@ -493,7 +491,6 @@ class TestBuggyAggregates:
 
         # Optimizer WITHOUT AggregatePushdownRule (the old broken behavior)
         optimizer = RuleBasedOptimizer(catalog)
-        optimizer.add_rule(ExpressionSimplificationRule())
         optimizer.add_rule(PredicatePushdownRule())
         optimizer.add_rule(ProjectionPushdownRule())
         optimizer.add_rule(LimitPushdownRule())

@@ -30,7 +30,6 @@ from ..optimizer import (
     AggregatePushdownRule,
     OrderByPushdownRule,
     LimitPushdownRule,
-    ExpressionSimplificationRule,
 )
 from ..optimizer.decorrelation import Decorrelator
 from ..processor import QueryExecutor, StarExpansionError, StarExpansionProcessor
@@ -108,7 +107,6 @@ class FedQRuntime:
 
     def _register_optimization_rules(self) -> None:
         """Register optimization rules in the correct order."""
-        self.optimizer.add_rule(ExpressionSimplificationRule())
         self.optimizer.add_rule(PredicatePushdownRule())
         self.optimizer.add_rule(ProjectionPushdownRule())
         self.optimizer.add_rule(AggregatePushdownRule())
