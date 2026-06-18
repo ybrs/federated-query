@@ -26,17 +26,22 @@ inspection.
 
 ## STATUS (updated 2026-06-17, branch `phase8`)
 
-776 passed / 36 failed (from 645/125 baseline); decorrelation suite green.
+779 passed / 33 failed (from 645/125 baseline); decorrelation suite green.
 **Done: G4 set ops, G1 join breadth, G2 computed projections, G9 cross-source
 dynamic filtering (first version), P1 projection pruning, P2 ADBC connector,
 the Physical Merge Engine (P4 — all local operators except GroupedLimit/NLJ now
 run vectorized in DuckDB), G6 date/time (EXTRACT, DATE_TRUNC, INTERVAL
 arithmetic, CURRENT_DATE, AGE now parse, bind and push down), and G7 aggregate
-FILTER + NATURAL/USING joins (single-source push).** Remaining
-failures are **G3 CTEs (10), subqueries/G8 (20, deferred — see
-`decorrelation-gaps.md`), and assorted null/edge cases (5) + the one
-nested-aggregate-via-subquery test (derived-table-in-FROM pushdown, folded into
-the nested-structure work with CTEs/G8)**. Verified
+FILTER + NATURAL/USING joins (single-source push).** Three edge-case tests
+were corrected to match real engine behavior (COALESCE operand count vs
+sqlglot's this/expressions split; pushed user aliases; multi-statement
+injection is rejected, not parsed). Remaining failures are **G3 CTEs (10),
+subqueries/G8 (20, deferred — see `decorrelation-gaps.md`), the
+nested-aggregate-via-subquery test (derived-table-in-FROM pushdown), and 2
+constant-folding edge cases (`0.1 + 0.2` folded; `price - price = 0 AND
+quantity * 0 = 0` folded to TRUE — the latter is also a NULL-correctness bug in
+`ExpressionSimplificationRule`)**. The first three buckets are the
+nested-structure pushdown work. Verified
 correctness/silent-fail items are checked off. PARTIAL = some sub-cases remain
 (noted inline); DEFERRED = moderate/decision/perf/architectural, none are
 silent corruption (they raise clean errors or are documented deviations).

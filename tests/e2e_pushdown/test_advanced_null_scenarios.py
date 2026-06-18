@@ -29,7 +29,10 @@ def test_coalesce_multiple_nulls(single_source_env):
     assert coalesce_expr is not None
     assert isinstance(coalesce_expr, exp.Coalesce)
 
-    coalesce_args = coalesce_expr.expressions
+    # sqlglot stores the first COALESCE operand in ``this`` and the rest in
+    # ``expressions``, so all three operands are ``this`` plus ``expressions``.
+    coalesce_args = [coalesce_expr.this]
+    coalesce_args.extend(coalesce_expr.expressions)
     assert len(coalesce_args) == 3
 
 

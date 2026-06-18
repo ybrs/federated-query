@@ -1,5 +1,7 @@
 """String edge cases pushdown tests."""
 
+import pytest
+
 from sqlglot import exp
 
 from tests.e2e_pushdown.helpers import (
@@ -131,22 +133,21 @@ def test_very_long_strings(single_source_env):
     assert len(right.this) == 2000
 
 
-def test_sql_injection_patterns_escaped(single_source_env):
-    """Validates SQL injection patterns are properly escaped in pushdown."""
+def test_sql_injection_patterns_rejected(single_source_env):
+    """A multi-statement injection attempt is rejected, never executed.
+
+    Here ``''`` closes the string and ``; DROP TABLE orders; --`` is a second
+    statement, so the input is genuinely multi-statement. The engine relies on
+    the parser to reject multi-statement input rather than trying to sanitize
+    it, which is the safe outcome.
+    """
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id FROM duckdb_primary.main.orders "
         "WHERE region = ''; DROP TABLE orders; --'"
     )
-    ast = explain_datasource_query(runtime, sql)
-
-    where_clause = ast.args.get("where")
-    assert where_clause is not None
-    predicate = unwrap_parens(where_clause.this)
-    assert isinstance(predicate, exp.EQ)
-
-    right = unwrap_parens(predicate.right)
-    assert isinstance(right, exp.Literal)
+    with pytest.raises(ValueError):
+        explain_datasource_query(runtime, sql)
 
 
 def test_case_sensitivity_in_comparisons(single_source_env):

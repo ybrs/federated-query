@@ -84,8 +84,10 @@ def test_count_star_vs_count_column_with_nulls(single_source_env):
         "FROM duckdb_primary.main.orders"
     )
     ast = explain_datasource_query(runtime, sql)
+    # User aliases are pushed to the source, so the projection surfaces the
+    # alias names; the COUNT shapes are verified directly below.
     projection = select_column_names(ast)
-    assert set(projection) == {"COUNT(*)", "COUNT(region)"}
+    assert set(projection) == {"total", "non_null_regions"}
     count_star = find_in_select(
         ast,
         lambda node: isinstance(node, exp.Count) and isinstance(node.this, exp.Star),
