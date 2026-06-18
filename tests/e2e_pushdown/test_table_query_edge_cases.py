@@ -31,6 +31,22 @@ def test_query_on_empty_table_behavior(single_source_env):
     assert isinstance(right, exp.Literal) and int(right.this) == 0
 
 
+def test_constant_false_predicate_returns_no_rows(single_source_env):
+    """A ``WHERE 1 = 0`` query executes and returns an empty result.
+
+    The source evaluates the constant-false predicate; whether or not fedq ever
+    folds it, the end result must be a zero-row table. This guards that contract
+    independently of the pushed predicate's shape.
+    """
+    runtime = build_runtime(single_source_env)
+    sql = (
+        "SELECT order_id FROM duckdb_primary.main.orders "
+        "WHERE 1 = 0"
+    )
+    table = runtime.execute(sql)
+    assert table.num_rows == 0
+
+
 def test_query_single_row_with_limit_one(single_source_env):
     """Validates query on effectively single-row result pushes correctly."""
     runtime = build_runtime(single_source_env)
