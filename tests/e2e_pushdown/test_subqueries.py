@@ -554,7 +554,7 @@ def test_exists_with_complex_predicates(single_source_env):
         "  SELECT 1 FROM duckdb_primary.main.products P "
         "  WHERE P.id = O.product_id "
         "    AND (P.price > 100 OR P.status = 'premium') "
-        "    AND P.quantity > 0"
+        "    AND P.base_price > 0"
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
