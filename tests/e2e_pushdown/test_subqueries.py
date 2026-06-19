@@ -15,6 +15,25 @@ from tests.e2e_pushdown.helpers import (
 )
 
 
+def _exists_predicate(ast, negated):
+    """Return the inner Select of a pushed ``[NOT] EXISTS`` WHERE predicate.
+
+    Decorrelation canonicalizes EXISTS/IN/ANY (and the negated NOT EXISTS/
+    NOT IN/ALL) into a SEMI/ANTI join, which the single-source generator pushes
+    back down as a correlated ``EXISTS`` / ``NOT EXISTS`` subquery.
+    """
+    where_clause = ast.args.get("where")
+    assert where_clause is not None
+    predicate = unwrap_parens(where_clause.this)
+    if negated:
+        assert isinstance(predicate, exp.Not)
+        predicate = unwrap_parens(predicate.this)
+    assert isinstance(predicate, exp.Exists)
+    subquery = predicate.this
+    assert isinstance(subquery, exp.Select)
+    return subquery
+
+
 # EXISTS Subqueries
 
 
@@ -78,19 +97,8 @@ def test_where_in_subquery(single_source_env):
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
-
-    where_clause = ast.args.get("where")
-    assert where_clause is not None
-    predicate = unwrap_parens(where_clause.this)
-    assert isinstance(predicate, exp.In)
-
-    subquery_expr = predicate.args.get("query")
-    assert isinstance(subquery_expr, exp.Subquery)
-    subquery = subquery_expr.this
-    assert isinstance(subquery, exp.Select)
-
-    subquery_where = subquery.args.get("where")
-    assert subquery_where is not None
+    subquery = _exists_predicate(ast, negated=False)
+    assert subquery.args.get("where") is not None
 
 
 def test_where_not_in_subquery(single_source_env):
@@ -103,17 +111,7 @@ def test_where_not_in_subquery(single_source_env):
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
-
-    where_clause = ast.args.get("where")
-    assert where_clause is not None
-    predicate = unwrap_parens(where_clause.this)
-    assert isinstance(predicate, exp.Not)
-
-    in_expr = unwrap_parens(predicate.this)
-    assert isinstance(in_expr, exp.In)
-
-    subquery_expr = in_expr.args.get("query")
-    assert isinstance(subquery_expr, exp.Subquery)
+    _exists_predicate(ast, negated=True)
 
 
 # Scalar Subqueries
@@ -267,14 +265,8 @@ def test_where_any_operator(single_source_env):
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
-
-    where_clause = ast.args.get("where")
-    assert where_clause is not None
-    predicate = unwrap_parens(where_clause.this)
-    assert isinstance(predicate, exp.Any)
-
-    subquery_expr = predicate.this
-    assert isinstance(subquery_expr, exp.Subquery)
+    subquery = _exists_predicate(ast, negated=False)
+    assert subquery.args.get("where") is not None
 
 
 def test_where_all_operator(single_source_env):
@@ -287,17 +279,7 @@ def test_where_all_operator(single_source_env):
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
-
-    where_clause = ast.args.get("where")
-    assert where_clause is not None
-    predicate = unwrap_parens(where_clause.this)
-    assert isinstance(predicate, exp.GT)
-
-    right = unwrap_parens(predicate.right)
-    assert isinstance(right, exp.All)
-
-    subquery_expr = right.this
-    assert isinstance(subquery_expr, exp.Subquery)
+    _exists_predicate(ast, negated=True)
 
 
 # Nested Subqueries

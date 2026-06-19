@@ -23,7 +23,14 @@ from ..plan.logical import (
     Sort,
     Limit,
 )
-from ..plan.expressions import ColumnRef
+from ..plan.expressions import (
+    ColumnRef,
+    BinaryOp,
+    UnaryOp,
+    FunctionCall,
+    Cast,
+    Expression,
+)
 from ..plan.physical import PhysicalRemoteQuery
 
 _JOIN_KEYWORDS = {
@@ -178,12 +185,26 @@ class SingleSourcePushdown:
         return self._absorb(sort.input, context)
 
     def _absorb_projection(self, projection: Projection, context: _PushContext) -> bool:
-        """Record the SELECT list (with aliases), then descend."""
+        """Record the SELECT list (with aliases), then descend.
+
+        An unexpanded ``*`` projection is declined: the preprocessor normally
+        expands stars before planning, so one surviving here cannot be rendered
+        faithfully (``* AS "*"`` is invalid SQL) and is left to local execution.
+        """
         context.distinct = projection.distinct
+        if self._has_star(projection.expressions):
+            return False
         if self._has_computed_expression(projection.expressions):
             context.has_computed = True
         self._set_select(projection.expressions, projection.aliases, context)
         return self._absorb(projection.input, context)
+
+    def _has_star(self, expressions) -> bool:
+        """Whether any projection item is an unexpanded ``*`` reference."""
+        for expression in expressions:
+            if isinstance(expression, ColumnRef) and expression.column == "*":
+                return True
+        return False
 
     def _has_computed_expression(self, expressions) -> bool:
         """Whether any projection item is more than a bare column reference."""
@@ -232,6 +253,8 @@ class SingleSourcePushdown:
 
     def _absorb_join(self, join: Join, context: _PushContext) -> bool:
         """Add one join (right side must be a base scan in a left-deep tree)."""
+        if join.join_type in (JoinType.SEMI, JoinType.ANTI):
+            return self._absorb_semi_anti_join(join, context)
         keyword = _JOIN_KEYWORDS.get(join.join_type)
         if keyword is None or not self._join_is_pushable(join):
             return False
@@ -258,6 +281,190 @@ class SingleSourcePushdown:
             columns = ", ".join(join.using)
             return f"{keyword} {right_ref} USING ({columns})"
         return f"{keyword} {right_ref} ON {join.condition.to_sql()}"
+
+    def _absorb_semi_anti_join(self, join: Join, context: _PushContext) -> bool:
+        """Render a decorrelated SEMI/ANTI join as a ``[NOT] EXISTS`` predicate.
+
+        Decorrelation turns EXISTS/IN/ANY into a SEMI join (ANTI for the negated
+        forms) whose right side is a key projection. Re-correlating it back to an
+        ``EXISTS`` subquery lets the whole thing push to one source as one query.
+        Only fires at the outer-query level: a SEMI join nested under an
+        aggregate keeps running in the merge engine (re-rendering it there would
+        strand the aggregate's output columns).
+        """
+        if context.has_aggregate:
+            return False
+        if not self._absorb_from(join.left, context):
+            return False
+        subquery = self._render_existence_subquery(join, context)
+        if subquery is None:
+            return False
+        prefix = "NOT " if join.join_type == JoinType.ANTI else ""
+        context.where_terms.append(f"{prefix}EXISTS ({subquery})")
+        context.has_join = True
+        return True
+
+    def _render_existence_subquery(
+        self, join: Join, context: _PushContext
+    ) -> Optional[str]:
+        """Build the ``SELECT 1 FROM ... WHERE ...`` body of the EXISTS subquery.
+
+        Outer columns are qualified with the outer alias. Only when the subquery
+        scans the *same* alias as the outer table is it given a fresh alias (and
+        its columns re-qualified) so a self-referential subquery keeps the two
+        sides distinct; otherwise the existing aliases already disambiguate.
+        """
+        right = join.right
+        if not isinstance(right, Projection):
+            return None
+        if not self._is_simple_subquery_relation(right.input):
+            return None
+        outer_alias = self._sole_outer_alias(context)
+        scan = self._subquery_scan(right.input)
+        if outer_alias is None or scan.datasource != context.datasource:
+            return None
+        orig = scan.alias if scan.alias else scan.table_name
+        inner_alias = orig
+        if orig == outer_alias:
+            inner_alias = self._fresh_subquery_alias(scan.table_name, outer_alias)
+        return self._compose_exists_select(
+            join, right, scan, orig, inner_alias, outer_alias
+        )
+
+    def _compose_exists_select(
+        self, join, projection, scan, orig, inner_alias, outer_alias
+    ) -> str:
+        """Assemble the EXISTS body from the re-aliased scan and correlation."""
+        key_map = self._build_key_map(projection, orig, inner_alias)
+        condition = self._substitute_keys(join.condition, key_map, outer_alias)
+        terms = self._inner_where_terms(join.right.input, orig, inner_alias)
+        terms.append(condition.to_sql())
+        from_sql = f'"{scan.schema_name}"."{scan.table_name}" AS {inner_alias}'
+        return f"SELECT 1 FROM {from_sql} WHERE {' AND '.join(terms)}"
+
+    def _subquery_scan(self, node: LogicalPlanNode) -> Scan:
+        """The base scan of a simple subquery body (unwrapping a Filter)."""
+        if isinstance(node, Filter):
+            return node.input
+        return node
+
+    def _fresh_subquery_alias(self, table_name: str, outer_alias: str) -> str:
+        """A subquery alias distinct from the outer alias to avoid collisions."""
+        candidate = f"{table_name}_sq"
+        if candidate == outer_alias:
+            return f"{table_name}_sq2"
+        return candidate
+
+    def _inner_where_terms(
+        self, node: LogicalPlanNode, orig: str, inner_alias: str
+    ) -> List[str]:
+        """The subquery's own filters, re-qualified to its fresh alias."""
+        terms: List[str] = []
+        if isinstance(node, Filter):
+            terms.append(self._requalify(node.predicate, orig, inner_alias).to_sql())
+            node = node.input
+        if node.filters is not None:
+            terms.append(self._requalify(node.filters, orig, inner_alias).to_sql())
+        return terms
+
+    def _requalify(self, expr: Expression, orig: str, inner_alias: str) -> Expression:
+        """Re-qualify a subquery-local expression's columns to its scan alias."""
+        return self._map_columns(
+            expr, lambda col: self._requalify_column(col, orig, inner_alias)
+        )
+
+    def _requalify_column(
+        self, column: ColumnRef, orig: str, inner_alias: str
+    ) -> Expression:
+        """Re-qualify one column that belongs to the subquery's own scan."""
+        if column.table == orig or column.table is None:
+            return ColumnRef(table=inner_alias, column=column.column)
+        return column
+
+    def _map_columns(self, expr: Expression, leaf) -> Expression:
+        """Rebuild an expression, applying ``leaf`` to every ColumnRef it holds."""
+        if isinstance(expr, ColumnRef):
+            return leaf(expr)
+        if isinstance(expr, BinaryOp):
+            left = self._map_columns(expr.left, leaf)
+            right = self._map_columns(expr.right, leaf)
+            return BinaryOp(op=expr.op, left=left, right=right)
+        if isinstance(expr, UnaryOp):
+            return UnaryOp(op=expr.op, operand=self._map_columns(expr.operand, leaf))
+        return self._map_compound_columns(expr, leaf)
+
+    def _map_compound_columns(self, expr: Expression, leaf) -> Expression:
+        """Map columns inside a Cast or function-call wrapper."""
+        if isinstance(expr, Cast):
+            inner = self._map_columns(expr.expr, leaf)
+            return Cast(
+                expr=inner, target_type=expr.target_type, data_type=expr.data_type
+            )
+        if isinstance(expr, FunctionCall):
+            args: List[Expression] = []
+            for arg in expr.args:
+                args.append(self._map_columns(arg, leaf))
+            return FunctionCall(
+                function_name=expr.function_name,
+                args=args,
+                is_aggregate=expr.is_aggregate,
+                distinct=expr.distinct,
+            )
+        return expr
+
+    def _sole_outer_alias(self, context: _PushContext) -> Optional[str]:
+        """The single outer scan's alias, used to qualify correlation columns.
+
+        Returns None when the outer side has several scans, where an unqualified
+        correlation column cannot be safely attributed to one of them.
+        """
+        if len(context.scans) != 1:
+            return None
+        scan = context.scans[0]
+        return scan.alias if scan.alias else scan.table_name
+
+    def _is_simple_subquery_relation(self, node: LogicalPlanNode) -> bool:
+        """Whether a subquery body is a single plain scan we can re-render safely.
+
+        Restricts EXISTS rendering to ``Scan`` or ``Filter`` over ``Scan`` with
+        no aggregate/group; aggregates, joins, or further nesting inside the
+        subquery are declined so they keep running in the merge engine.
+        """
+        if isinstance(node, Filter):
+            node = node.input
+        return isinstance(node, Scan) and not node.group_by and not node.aggregates
+
+    def _build_key_map(
+        self, projection: Projection, orig: str, inner_alias: str
+    ) -> Dict[str, Expression]:
+        """Map each key alias to its source expression, re-qualified to the alias."""
+        mapping: Dict[str, Expression] = {}
+        for index in range(len(projection.aliases)):
+            expr = self._requalify(projection.expressions[index], orig, inner_alias)
+            mapping[projection.aliases[index]] = expr
+        return mapping
+
+    def _substitute_keys(
+        self, expr: Expression, key_map: Dict[str, Expression], outer_alias: str
+    ) -> Expression:
+        """Rewrite a correlation condition for use inside the EXISTS subquery.
+
+        A synthetic key alias becomes its source expression; any other bare
+        column is an outer reference and is qualified with ``outer_alias``.
+        """
+        return self._map_columns(
+            expr, lambda col: self._substitute_column(col, key_map, outer_alias)
+        )
+
+    def _substitute_column(
+        self, column: ColumnRef, key_map: Dict[str, Expression], outer_alias: str
+    ) -> Expression:
+        """Resolve one column ref to a key definition or a qualified outer ref."""
+        if column.table is not None:
+            return column
+        if column.column in key_map:
+            return key_map[column.column]
+        return ColumnRef(table=outer_alias, column=column.column)
 
     def _claim_scan(self, scan: Scan, context: _PushContext) -> bool:
         """Confirm the scan shares the subtree's data source and collect filters."""
