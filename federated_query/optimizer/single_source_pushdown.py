@@ -8,7 +8,8 @@ detects such subtrees and builds the remote query; anything it cannot render
 back to local execution.
 """
 
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Set, Tuple
 
 from ..catalog.catalog import Catalog
 from ..datasources.base import DataSourceCapability
@@ -22,6 +23,7 @@ from ..plan.logical import (
     Aggregate,
     Sort,
     Limit,
+    SingleRowGuard,
 )
 from ..plan.expressions import (
     ColumnRef,
@@ -39,6 +41,21 @@ _JOIN_KEYWORDS = {
     JoinType.RIGHT: "RIGHT JOIN",
     JoinType.FULL: "FULL OUTER JOIN",
 }
+
+
+@dataclass(frozen=True)
+class _InlineSql:
+    """A render-only stand-in carrying precomputed SQL for an inlined scalar.
+
+    It is spliced into an expression tree in place of a decorrelated scalar's
+    value column; only ``to_sql()`` is ever called on it during rendering.
+    """
+
+    sql: str
+
+    def to_sql(self) -> str:
+        """Return the precomputed scalar-subquery SQL verbatim."""
+        return self.sql
 
 
 class _PushContext:
@@ -59,6 +76,9 @@ class _PushContext:
         self.has_join: bool = False
         self.has_computed: bool = False
         self.has_aggregate: bool = False
+        # True once a decorrelated scalar subquery has been inlined into the
+        # WHERE/SELECT, so the whole statement is worth pushing as one query.
+        self.has_scalar: bool = False
         # (table qualifier, column) -> unique output name, so an operator above
         # a pushed multi-table query can resolve a qualified reference even when
         # two source columns share a name (e.g. both tables expose ``id``).
@@ -82,7 +102,9 @@ class SingleSourcePushdown:
         non-aggregate projection (G2 — e.g. ``UPPER(x)``, ``a || b``); plain
         single-table scans keep using the existing scan-pushdown path.
         """
+        node, scalar_map = self._inline_scalars(node)
         context = _PushContext()
+        context.has_scalar = bool(scalar_map)
         if not self._absorb(node, context):
             return None
         if not self._should_push(context):
@@ -136,7 +158,7 @@ class SingleSourcePushdown:
 
     def _should_push(self, context: _PushContext) -> bool:
         """Whether this subtree is worth replacing with one remote query."""
-        if context.has_join:
+        if context.has_join or context.has_scalar:
             return True
         return context.has_computed and not context.has_aggregate
 
@@ -377,6 +399,8 @@ class SingleSourcePushdown:
         self, column: ColumnRef, orig: str, inner_alias: str
     ) -> Expression:
         """Re-qualify one column that belongs to the subquery's own scan."""
+        if column.column == "*":
+            return column
         if column.table == orig or column.table is None:
             return ColumnRef(table=inner_alias, column=column.column)
         return column
@@ -465,6 +489,170 @@ class SingleSourcePushdown:
         if column.column in key_map:
             return key_map[column.column]
         return ColumnRef(table=outer_alias, column=column.column)
+
+    # --- scalar subquery inlining (decorrelated LEFT join to a keyed aggregate)
+
+    def _inline_scalars(self, node: LogicalPlanNode):
+        """Strip scalar LEFT joins, inlining each as a scalar subquery upward.
+
+        Returns the rewritten node and a map of value-alias -> inlined SQL that
+        ancestor expressions referencing the scalar's value column apply. Bottom
+        up: a stripped join hands its value upward to the Filter/Projection that
+        used it.
+        """
+        scalar_map: Dict[str, _InlineSql] = {}
+        new_children = []
+        for child in node.children():
+            rewritten, child_map = self._inline_scalars(child)
+            new_children.append(rewritten)
+            scalar_map.update(child_map)
+        if new_children:
+            node = node.with_children(new_children)
+        node = self._apply_scalar_map(node, scalar_map)
+        return self._maybe_strip_scalar_join(node, scalar_map)
+
+    def _maybe_strip_scalar_join(self, node: LogicalPlanNode, scalar_map):
+        """Replace an inlinable scalar LEFT join with its left input."""
+        if not self._is_scalar_join(node):
+            return node, scalar_map
+        inline, value_alias = self._build_scalar_inline(node)
+        if inline is None:
+            return node, scalar_map
+        scalar_map[value_alias] = inline
+        return node.left, scalar_map
+
+    def _apply_scalar_map(self, node: LogicalPlanNode, scalar_map):
+        """Substitute inlined scalars for value columns in a node's expressions."""
+        if not scalar_map:
+            return node
+        if isinstance(node, Filter):
+            predicate = self._sub_scalars(node.predicate, scalar_map)
+            return Filter(input=node.input, predicate=predicate)
+        if isinstance(node, Projection):
+            return self._apply_scalar_projection(node, scalar_map)
+        return node
+
+    def _apply_scalar_projection(self, node: Projection, scalar_map):
+        """Substitute inlined scalars into each projection expression."""
+        expressions = []
+        for expression in node.expressions:
+            expressions.append(self._sub_scalars(expression, scalar_map))
+        return Projection(
+            input=node.input,
+            expressions=expressions,
+            aliases=node.aliases,
+            distinct=node.distinct,
+        )
+
+    def _sub_scalars(self, expr: Expression, scalar_map):
+        """Replace a value-column ColumnRef with its inlined scalar placeholder."""
+        return self._map_columns(expr, lambda col: scalar_map.get(col.column, col))
+
+    def _is_scalar_join(self, node: LogicalPlanNode) -> bool:
+        """Whether a node is an inlinable decorrelated scalar LEFT join.
+
+        A ``SingleRowGuard`` right side marks a scalar decorrelation could not
+        prove returns at most one row; that is kept local so the engine raises a
+        typed ``CardinalityViolationError`` rather than delegating the check to a
+        source-specific error.
+        """
+        if not isinstance(node, Join) or node.join_type != JoinType.LEFT:
+            return False
+        if isinstance(node.right, SingleRowGuard):
+            return False
+        return isinstance(node.right, Projection)
+
+    def _build_scalar_inline(self, join: Join):
+        """Build an ``_InlineSql`` for a scalar LEFT join, or ``(None, None)``."""
+        right = join.right
+        scan = self._subquery_scan(right.input)
+        outer = self._leftmost_scan(join.left)
+        if not isinstance(scan, Scan) or outer is None:
+            return None, None
+        if scan.datasource != outer.datasource:
+            return None, None
+        value_alias = self._scalar_value_alias(right, join.condition)
+        if value_alias is None:
+            return None, None
+        return self._assemble_scalar(join, right, scan, outer, value_alias)
+
+    def _assemble_scalar(self, join, projection, scan, outer, value_alias):
+        """Render ``(SELECT value FROM table [WHERE correlation/filters])``."""
+        outer_alias = outer.alias if outer.alias else outer.table_name
+        orig = scan.alias if scan.alias else scan.table_name
+        inner_alias = orig
+        if orig == outer_alias:
+            inner_alias = self._fresh_subquery_alias(scan.table_name, outer_alias)
+        sources = self._scalar_sources(projection, scan, orig, inner_alias)
+        terms = self._scalar_where_terms(
+            join, projection, sources, value_alias, orig, inner_alias, outer_alias
+        )
+        from_sql = f'"{scan.schema_name}"."{scan.table_name}" AS {inner_alias}'
+        where = f" WHERE {' AND '.join(terms)}" if terms else ""
+        body = f"SELECT {sources[value_alias].to_sql()} FROM {from_sql}{where}"
+        return _InlineSql(f"({body})"), value_alias
+
+    def _scalar_sources(self, projection, scan, orig, inner_alias):
+        """Map each projection alias to its requalified source expression."""
+        sources: Dict[str, Expression] = {}
+        for index in range(len(projection.aliases)):
+            source = self._resolve_source(projection.expressions[index], scan)
+            sources[projection.aliases[index]] = self._requalify(
+                source, orig, inner_alias
+            )
+        return sources
+
+    def _resolve_source(self, expr: Expression, scan: Scan) -> Expression:
+        """Resolve a projection column to the scan's aggregate behind it, if any."""
+        if isinstance(expr, ColumnRef) and scan.aggregates and scan.output_names:
+            if expr.column in scan.output_names:
+                return scan.aggregates[scan.output_names.index(expr.column)]
+        return expr
+
+    def _scalar_where_terms(
+        self, join, projection, sources, value_alias, orig, inner_alias, outer_alias
+    ):
+        """Correlation predicate (keys -> sources) plus the subquery's filters."""
+        terms: List[str] = []
+        key_map: Dict[str, Expression] = {}
+        for alias in projection.aliases:
+            if alias != value_alias:
+                key_map[alias] = sources[alias]
+        if key_map:
+            correlation = self._substitute_keys(join.condition, key_map, outer_alias)
+            terms.append(correlation.to_sql())
+        terms.extend(self._inner_where_terms(projection.input, orig, inner_alias))
+        return terms
+
+    def _scalar_value_alias(self, projection: Projection, condition) -> Optional[str]:
+        """The single projection alias not used as a correlation key, or None."""
+        used = self._columns_in(condition)
+        values = []
+        for alias in projection.aliases:
+            if alias not in used:
+                values.append(alias)
+        return values[0] if len(values) == 1 else None
+
+    def _columns_in(self, expr: Optional[Expression]) -> Set[str]:
+        """Collect every column name referenced in an expression."""
+        found: Set[str] = set()
+        if expr is not None:
+            self._map_columns(expr, lambda col: self._note_column(found, col))
+        return found
+
+    def _note_column(self, found: Set[str], column: ColumnRef) -> ColumnRef:
+        """Record a column name during traversal, leaving the ref unchanged."""
+        found.add(column.column)
+        return column
+
+    def _leftmost_scan(self, node: LogicalPlanNode) -> Optional[Scan]:
+        """The leftmost base scan of a subtree, used to find the outer source."""
+        if isinstance(node, Scan):
+            return node
+        children = node.children()
+        if not children:
+            return None
+        return self._leftmost_scan(children[0])
 
     def _claim_scan(self, scan: Scan, context: _PushContext) -> bool:
         """Confirm the scan shares the subtree's data source and collect filters."""

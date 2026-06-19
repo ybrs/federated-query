@@ -34,6 +34,24 @@ def _exists_predicate(ast, negated):
     return subquery
 
 
+def _assert_push_matches_source(single_source_env, sql):
+    """Assert a query pushes as one remote query and matches the raw source.
+
+    The engine result is compared against running the same SQL directly on the
+    underlying DuckDB connection, so the re-correlated pushed query is verified
+    for correctness, not just shape.
+    """
+    runtime = build_runtime(single_source_env)
+    explain_datasource_query(runtime, sql)
+    engine_rows = runtime.execute(sql).column(0).to_pylist()
+    raw_sql = sql.replace("duckdb_primary.main.", "main.")
+    source = single_source_env.datasources[0].connection
+    expected = []
+    for row in source.execute(raw_sql).fetchall():
+        expected.append(row[0])
+    assert sorted(engine_rows) == sorted(expected)
+
+
 # EXISTS Subqueries
 
 
@@ -248,8 +266,10 @@ def test_correlated_subquery_in_select(single_source_env):
 
     second_expr = expressions[1]
     if isinstance(second_expr, exp.Alias):
-        subquery_expr = unwrap_parens(second_expr.this)
-        assert isinstance(subquery_expr, exp.Subquery)
+        # A correlated COUNT scalar is pushed as COALESCE((SELECT COUNT(*) ...),
+        # 0), so the scalar subquery is nested inside rather than at the top.
+        subquery_expr = second_expr.this.find(exp.Subquery)
+        assert subquery_expr is not None
 
 
 # ANY / ALL Operators
@@ -282,6 +302,39 @@ def test_where_all_operator(single_source_env):
     _exists_predicate(ast, negated=True)
 
 
+# Pushed-subquery execution correctness (re-correlated query vs the source)
+
+
+def test_exists_pushed_result_matches_source(single_source_env):
+    """A pushed EXISTS returns the rows the source computes for it."""
+    sql = (
+        "SELECT order_id FROM duckdb_primary.main.orders o "
+        "WHERE EXISTS (SELECT 1 FROM duckdb_primary.main.products p "
+        "              WHERE p.id = o.product_id AND p.price > 50)"
+    )
+    _assert_push_matches_source(single_source_env, sql)
+
+
+def test_correlated_scalar_pushed_result_matches_source(single_source_env):
+    """A pushed correlated scalar subquery matches the source's own result."""
+    sql = (
+        "SELECT order_id FROM duckdb_primary.main.orders o "
+        "WHERE price > (SELECT AVG(price) FROM duckdb_primary.main.products p "
+        "               WHERE p.category = o.status)"
+    )
+    _assert_push_matches_source(single_source_env, sql)
+
+
+def test_correlated_count_scalar_pushed_result_matches_source(single_source_env):
+    """A pushed correlated COUNT scalar (COALESCE-wrapped) matches the source."""
+    sql = (
+        "SELECT order_id FROM duckdb_primary.main.orders o "
+        "WHERE quantity >= (SELECT COUNT(*) FROM duckdb_primary.main.products p "
+        "                   WHERE p.category = o.status)"
+    )
+    _assert_push_matches_source(single_source_env, sql)
+
+
 # Nested Subqueries
 
 
@@ -299,23 +352,15 @@ def test_nested_subqueries(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
 
-    where_clause = ast.args.get("where")
-    assert where_clause is not None
-    predicate = unwrap_parens(where_clause.this)
-    assert isinstance(predicate, exp.In)
-
-    outer_subquery_expr = predicate.args.get("query")
-    assert isinstance(outer_subquery_expr, exp.Subquery)
-    outer_subquery = outer_subquery_expr.this
-    assert isinstance(outer_subquery, exp.Select)
-
+    # The outer IN decorrelates to a correlated EXISTS; the inner scalar
+    # subquery survives inside that EXISTS body.
+    outer_subquery = _exists_predicate(ast, negated=False)
     inner_where = outer_subquery.args.get("where")
     assert inner_where is not None
-    inner_predicate = unwrap_parens(inner_where.this)
-    assert isinstance(inner_predicate, exp.GT)
 
-    inner_subquery_expr = unwrap_parens(inner_predicate.right)
-    assert isinstance(inner_subquery_expr, exp.Subquery)
+    inner_subquery_expr = outer_subquery.find(exp.Subquery)
+    assert inner_subquery_expr is not None
+    assert isinstance(inner_subquery_expr.this, exp.Select)
 
 
 # Derived Tables (Subquery in FROM)
@@ -396,15 +441,11 @@ def test_multiple_subqueries_in_where(single_source_env):
     predicate = unwrap_parens(where_clause.this)
     assert isinstance(predicate, exp.And)
 
-    left_pred = unwrap_parens(predicate.left)
-    assert isinstance(left_pred, exp.In)
-    left_subquery = left_pred.args.get("query")
-    assert isinstance(left_subquery, exp.Subquery)
-
-    right_pred = unwrap_parens(predicate.right)
-    assert isinstance(right_pred, exp.In)
-    right_subquery = right_pred.args.get("query")
-    assert isinstance(right_subquery, exp.Subquery)
+    # Both IN subqueries decorrelate to correlated EXISTS predicates.
+    for side in (predicate.left, predicate.right):
+        node = unwrap_parens(side)
+        assert isinstance(node, exp.Exists)
+        assert isinstance(node.this, exp.Select)
 
 
 # Subqueries with Aggregation
