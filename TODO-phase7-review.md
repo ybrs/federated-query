@@ -26,7 +26,7 @@ inspection.
 
 ## STATUS (updated 2026-06-19, branch `phase8`)
 
-759 passed / 25 failed (from 645/125 baseline); decorrelation suite 128 green.
+766 passed / 19 failed (from 645/125 baseline); decorrelation suite 128 green.
 (Total test count dropped earlier because the constant-folding feature and its
 two dedicated test files were removed — see below.)
 **Done: G4 set ops, G1 join breadth, G2 computed projections, G9 cross-source
@@ -47,11 +47,15 @@ folds local ones; the Arrow evaluator handles pure-local `SELECT 1+2`.**
 (`doc/decorrelation-capabilities.md`) and the six fail-fast gaps pinned with
 tests. Phase 2a: single-source SEMI/ANTI joins now push as one correlated
 `[NOT] EXISTS` query (EXISTS/NOT EXISTS/IN/NOT IN/ANY/ALL — 6 tests),
-re-correlating decorrelation's output and handling self-correlation aliasing.**
-Remaining failures are **G3 CTEs (10); scalar subqueries (LEFT-join → scalar
-subquery, Phase 2b); derived tables; the nested-aggregate-via-subquery test;
-and the decorrelation shape gaps (Sort/Filter/UNION body)** — the
-nested-structure pushdown work.
+re-correlating decorrelation's output and handling self-correlation aliasing.
+Phase 2b: single-source scalar subqueries (correlated + uncorrelated, COUNT)
+push as one query via inlined `(SELECT ...)` subqueries, with
+execution-correctness tests vs the raw source; guard-wrapped (not-provably-
+single-row) scalars stay local for the typed CardinalityViolationError.**
+Remaining failures are **G3 CTEs (10); derived tables (Phase 2c); scalar-in-
+HAVING (needs HAVING-clause pushdown); the nested-aggregate-via-subquery test;
+and the decorrelation shape gaps (Sort/Filter/UNION body, deferred to the
+dependent-join rewrite)**.
 Verified
 correctness/silent-fail items are checked off. PARTIAL = some sub-cases remain
 (noted inline); DEFERRED = moderate/decision/perf/architectural, none are
