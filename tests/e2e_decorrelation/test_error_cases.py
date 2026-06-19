@@ -4,6 +4,7 @@ E2E tests for decorrelation error cases and edge cases.
 Tests error handling, unsupported patterns, cardinality violations,
 and other exceptional scenarios that should raise clear errors.
 """
+
 import pytest
 from federated_query.parser.parser import Parser
 from federated_query.parser.binder import Binder
@@ -15,7 +16,7 @@ from .test_utils import (
     assert_plan_structure,
     assert_result_count,
     assert_result_contains_ids,
-    execute_and_fetch_all
+    execute_and_fetch_all,
 )
 
 
@@ -341,7 +342,9 @@ class TestUnsupportedOperators:
         with pytest.raises(DecorrelationError, match="negate quantified operator"):
             decorrelator.decorrelate(bound_plan)
 
-    def test_quantified_comparison_multi_column_subquery(self, catalog, setup_test_data):
+    def test_quantified_comparison_multi_column_subquery(
+        self, catalog, setup_test_data
+    ):
         """
         Test: a quantified comparison whose subquery returns multiple columns.
 
@@ -791,3 +794,95 @@ class TestValidationPhase:
         assert_plan_structure(decorrelated_plan, {})
         results = execute_and_fetch_all(executor, decorrelated_plan)
         # decorrelator.validate_correlation_coverage(decorrelated_plan)
+
+
+class TestUnsupportedSubqueryShapes:
+    """Pin the decorrelation engine's known fail-fast gaps.
+
+    Each pattern is unnestable in principle (a general dependent join would
+    handle it) but the current pattern-based decorrelator rejects it with a
+    clear error rather than producing a wrong answer. These tests document
+    exactly what is unsupported today; when a gap is closed, flip its test.
+    """
+
+    def _decorrelate(self, catalog, sql):
+        """Parse, bind, and decorrelate a SQL string for a raises-assertion."""
+        bound = Binder(catalog).bind(Parser().parse(sql))
+        return Decorrelator().decorrelate(bound)
+
+    def test_sort_topped_subquery_body(self, catalog, setup_test_data):
+        """A subquery body topped by ORDER BY ... LIMIT (Sort) is rejected.
+
+        The ``latest-row-per-key`` idiom needs a Sort+Limit peel the engine
+        does not have yet (decorrelation-gaps.md A).
+        """
+        sql = (
+            "SELECT u.id FROM pg.users u WHERE u.id = ("
+            "  SELECT o.user_id FROM pg.orders o WHERE o.user_id = u.id "
+            "  ORDER BY o.amount DESC LIMIT 1)"
+        )
+        with pytest.raises(
+            DecorrelationError, match="Unsupported subquery output shape"
+        ):
+            self._decorrelate(catalog, sql)
+
+    def test_set_operation_subquery_body(self, catalog, setup_test_data):
+        """A UNION/INTERSECT/EXCEPT subquery body is rejected at binding.
+
+        The subquery binder does not accept a SetOperation body yet
+        (decorrelation-gaps.md B).
+        """
+        sql = (
+            "SELECT u.id FROM pg.users u WHERE u.id IN ("
+            "  SELECT user_id FROM pg.orders WHERE status = 'paid' "
+            "  UNION SELECT user_id FROM pg.orders WHERE status = 'shipped')"
+        )
+        with pytest.raises(BindingError, match="SetOperation"):
+            self._decorrelate(catalog, sql)
+
+    def test_offset_in_correlated_subquery(self, catalog, setup_test_data):
+        """OFFSET inside a correlated subquery is rejected.
+
+        Decorrelating an offset per correlation key is unsupported
+        (decorrelation-gaps.md D).
+        """
+        sql = (
+            "SELECT u.id FROM pg.users u WHERE u.id = ("
+            "  SELECT o.user_id FROM pg.orders o WHERE o.user_id = u.id "
+            "  ORDER BY o.amount LIMIT 1 OFFSET 2)"
+        )
+        with pytest.raises(DecorrelationError, match="OFFSET"):
+            self._decorrelate(catalog, sql)
+
+    def test_subquery_in_group_by(self, catalog, setup_test_data):
+        """A subquery in a GROUP BY position is rejected (decorrelation-gaps.md E)."""
+        sql = (
+            "SELECT COUNT(*) FROM pg.users u "
+            "GROUP BY (SELECT MAX(price) FROM pg.products)"
+        )
+        with pytest.raises(DecorrelationError, match="GROUP BY"):
+            self._decorrelate(catalog, sql)
+
+    def test_skip_level_correlation(self, catalog, setup_test_data):
+        """A subquery correlating two levels up is rejected.
+
+        The inner subquery references ``u`` (the outermost query), skipping the
+        middle relation -- the canonical dependent-join case the pattern-based
+        engine cannot handle yet (decorrelation-gaps.md C).
+        """
+        sql = (
+            "SELECT u.id FROM pg.users u WHERE EXISTS ("
+            "  SELECT 1 FROM pg.orders o WHERE EXISTS ("
+            "    SELECT 1 FROM pg.products p WHERE p.id = u.id))"
+        )
+        with pytest.raises(DecorrelationError, match="unsupported position"):
+            self._decorrelate(catalog, sql)
+
+    def test_select_star_value_subquery(self, catalog, setup_test_data):
+        """A ``SELECT *`` scalar/value subquery is rejected (decorrelation-gaps.md F)."""
+        sql = (
+            "SELECT u.id FROM pg.users u WHERE u.id > ("
+            "  SELECT * FROM pg.orders o WHERE o.user_id = u.id)"
+        )
+        with pytest.raises(DecorrelationError):
+            self._decorrelate(catalog, sql)
