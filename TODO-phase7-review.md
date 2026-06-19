@@ -24,11 +24,11 @@ inspection.
 
 ---
 
-## STATUS (updated 2026-06-18, branch `phase8`)
+## STATUS (updated 2026-06-19, branch `phase8`)
 
-739 passed / 31 failed (from 645/125 baseline); decorrelation suite green.
-(Total test count dropped because the constant-folding feature and its two
-dedicated test files were removed — see below.)
+759 passed / 25 failed (from 645/125 baseline); decorrelation suite 128 green.
+(Total test count dropped earlier because the constant-folding feature and its
+two dedicated test files were removed — see below.)
 **Done: G4 set ops, G1 join breadth, G2 computed projections, G9 cross-source
 dynamic filtering (first version), P1 projection pruning, P2 ADBC connector,
 the Physical Merge Engine (P4 — all local operators except GroupedLimit/NLJ now
@@ -43,9 +43,15 @@ rejected, not parsed; constant arithmetic is pushed unevaluated, not folded).
 semantics into pushed SQL and folded `x - x = 0`-style predicates to TRUE
 (a NULL-correctness bug). Sources fold pushed exprs; the DuckDB merge engine
 folds local ones; the Arrow evaluator handles pure-local `SELECT 1+2`.**
-Remaining failures are **G3 CTEs (10), subqueries/G8 (20, deferred — see
-`decorrelation-gaps.md`), and the nested-aggregate-via-subquery test
-(derived-table-in-FROM pushdown)** — all the nested-structure pushdown work.
+**Phase 1 (subqueries): decorrelation capability matrix inventoried
+(`doc/decorrelation-capabilities.md`) and the six fail-fast gaps pinned with
+tests. Phase 2a: single-source SEMI/ANTI joins now push as one correlated
+`[NOT] EXISTS` query (EXISTS/NOT EXISTS/IN/NOT IN/ANY/ALL — 6 tests),
+re-correlating decorrelation's output and handling self-correlation aliasing.**
+Remaining failures are **G3 CTEs (10); scalar subqueries (LEFT-join → scalar
+subquery, Phase 2b); derived tables; the nested-aggregate-via-subquery test;
+and the decorrelation shape gaps (Sort/Filter/UNION body)** — the
+nested-structure pushdown work.
 Verified
 correctness/silent-fail items are checked off. PARTIAL = some sub-cases remain
 (noted inline); DEFERRED = moderate/decision/perf/architectural, none are
