@@ -8,8 +8,7 @@ detects such subtrees and builds the remote query; anything it cannot render
 back to local execution.
 """
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ..catalog.catalog import Catalog
 from ..datasources.base import DataSourceCapability
@@ -23,16 +22,8 @@ from ..plan.logical import (
     Aggregate,
     Sort,
     Limit,
-    SingleRowGuard,
 )
-from ..plan.expressions import (
-    ColumnRef,
-    BinaryOp,
-    UnaryOp,
-    FunctionCall,
-    Cast,
-    Expression,
-)
+from ..plan.expressions import ColumnRef
 from ..plan.physical import PhysicalRemoteQuery
 
 _JOIN_KEYWORDS = {
@@ -40,22 +31,9 @@ _JOIN_KEYWORDS = {
     JoinType.LEFT: "LEFT JOIN",
     JoinType.RIGHT: "RIGHT JOIN",
     JoinType.FULL: "FULL OUTER JOIN",
+    JoinType.SEMI: "SEMI JOIN",
+    JoinType.ANTI: "ANTI JOIN",
 }
-
-
-@dataclass(frozen=True)
-class _InlineSql:
-    """A render-only stand-in carrying precomputed SQL for an inlined scalar.
-
-    It is spliced into an expression tree in place of a decorrelated scalar's
-    value column; only ``to_sql()`` is ever called on it during rendering.
-    """
-
-    sql: str
-
-    def to_sql(self) -> str:
-        """Return the precomputed scalar-subquery SQL verbatim."""
-        return self.sql
 
 
 class _PushContext:
@@ -76,9 +54,13 @@ class _PushContext:
         self.has_join: bool = False
         self.has_computed: bool = False
         self.has_aggregate: bool = False
-        # True once a decorrelated scalar subquery has been inlined into the
-        # WHERE/SELECT, so the whole statement is worth pushing as one query.
-        self.has_scalar: bool = False
+        # Number of derived-table relations emitted so far, used to give each a
+        # unique relation alias (``subq_0``, ``subq_1`` ...).
+        self.derived_count: int = 0
+        # True once a column-contributing join (LEFT/INNER) absorbs a derived
+        # relation, so a bare ``*`` cannot be faithfully expanded from the base
+        # scans alone and the whole subtree declines to push.
+        self.has_derived_columns: bool = False
         # (table qualifier, column) -> unique output name, so an operator above
         # a pushed multi-table query can resolve a qualified reference even when
         # two source columns share a name (e.g. both tables expose ``id``).
@@ -102,9 +84,7 @@ class SingleSourcePushdown:
         non-aggregate projection (G2 — e.g. ``UPPER(x)``, ``a || b``); plain
         single-table scans keep using the existing scan-pushdown path.
         """
-        node, scalar_map = self._inline_scalars(node)
         context = _PushContext()
-        context.has_scalar = bool(scalar_map)
         if not self._absorb(node, context):
             return None
         if not self._should_push(context):
@@ -123,7 +103,13 @@ class SingleSourcePushdown:
         carries the columns projection pushdown found necessary, so only those
         are emitted (not the whole table) — a true ``*`` falls back to the
         catalog.
+
+        Declines when a column-contributing join pulled in a derived relation:
+        its synthetic columns are not among the base scans, so a base-scan-only
+        expansion would silently drop them.
         """
+        if context.has_derived_columns:
+            return False
         seen: set = set()
         for scan in context.scans:
             names = self._scan_output_columns(scan)
@@ -158,7 +144,7 @@ class SingleSourcePushdown:
 
     def _should_push(self, context: _PushContext) -> bool:
         """Whether this subtree is worth replacing with one remote query."""
-        if context.has_join or context.has_scalar:
+        if context.has_join:
             return True
         return context.has_computed and not context.has_aggregate
 
@@ -216,10 +202,65 @@ class SingleSourcePushdown:
         context.distinct = projection.distinct
         if self._has_star(projection.expressions):
             return False
+        if self._is_columns_over_aggregate(projection):
+            return self._absorb_aggregate_projection(projection, context)
         if self._has_computed_expression(projection.expressions):
             context.has_computed = True
         self._set_select(projection.expressions, projection.aliases, context)
         return self._absorb(projection.input, context)
+
+    def _absorb_aggregate_projection(
+        self, projection: Projection, context: _PushContext
+    ) -> bool:
+        """Render a projection that selects (and often renames) an aggregate's outputs.
+
+        Decorrelation projects an aggregate's outputs under synthetic names
+        (``AVG(amount)`` re-aliased to ``__subq_0_v0``). Each selected column is
+        replaced by the aggregate's real expression and emitted under the
+        projection's alias, so the relation renders ``AVG(amount) AS __subq_0_v0``
+        rather than selecting a non-existent base column. The aggregate child
+        then renders its own GROUP BY and source.
+        """
+        resolved = self._resolve_against_aggregate(
+            projection.expressions, projection.input
+        )
+        self._set_select(resolved, projection.aliases, context)
+        return self._absorb(projection.input, context)
+
+    def _resolve_against_aggregate(self, expressions, child):
+        """Map each projected column to its aggregate child's source expression."""
+        outputs = self._aggregate_outputs(child)
+        aggregates = child.aggregates
+        resolved = []
+        for expression in expressions:
+            resolved.append(aggregates[outputs.index(expression.column)])
+        return resolved
+
+    def _is_columns_over_aggregate(self, projection: Projection) -> bool:
+        """Whether a projection selects only column refs of an aggregate child."""
+        outputs = self._aggregate_outputs(projection.input)
+        if outputs is None:
+            return False
+        return self._all_output_refs(projection.expressions, outputs)
+
+    def _aggregate_outputs(self, node: LogicalPlanNode):
+        """Output names of an aggregate-producing child (Aggregate or agg scan)."""
+        if isinstance(node, Aggregate):
+            return node.output_names
+        if isinstance(node, Scan) and node.aggregates:
+            return node.output_names
+        return None
+
+    def _all_output_refs(self, expressions, outputs) -> bool:
+        """Whether every item is a bare column ref naming an aggregate output."""
+        for expression in expressions:
+            if not self._is_output_ref(expression, outputs):
+                return False
+        return True
+
+    def _is_output_ref(self, expression, outputs) -> bool:
+        """Whether expression is a column ref to one of the aggregate outputs."""
+        return isinstance(expression, ColumnRef) and expression.column in outputs
 
     def _has_star(self, expressions) -> bool:
         """Whether any projection item is an unexpanded ``*`` reference."""
@@ -268,25 +309,50 @@ class SingleSourcePushdown:
 
     def _absorb_base_scan(self, scan: Scan, context: _PushContext) -> bool:
         """Set the leftmost FROM source and collect its filter."""
+        if scan.aggregates or scan.group_by:
+            return self._absorb_aggregate_scan(scan, context)
         if not self._claim_scan(scan, context):
             return False
         context.from_sql = self._scan_ref(scan)
         return True
 
+    def _absorb_aggregate_scan(self, scan: Scan, context: _PushContext) -> bool:
+        """Render a scan carrying folded aggregates/GROUP BY as the FROM source.
+
+        The optimizer collapses a single-table aggregate sub-relation (such as a
+        scalar subquery's keyed aggregate) into one scan; here its aggregates
+        become the SELECT list and its grouping the GROUP BY, so the relation
+        pushes as ordinary aggregate SQL rather than a re-correlated subquery.
+        """
+        if not self._claim_source(scan, context):
+            return False
+        if not context.select_items:
+            self._set_select(scan.aggregates, scan.output_names, context)
+        context.group_sql = self._render_group_by(scan)
+        context.from_sql = self._scan_ref(scan)
+        context.has_aggregate = True
+        return True
+
     def _absorb_join(self, join: Join, context: _PushContext) -> bool:
-        """Add one join (right side must be a base scan in a left-deep tree)."""
-        if join.join_type in (JoinType.SEMI, JoinType.ANTI):
-            return self._absorb_semi_anti_join(join, context)
+        """Add one join to a left-deep tree, rendering its right relation.
+
+        Every join type — including the SEMI/ANTI/LEFT joins that decorrelation
+        produces from EXISTS/IN/scalar subqueries — pushes as a real SQL join.
+        The right side is rendered as a relation: a base scan stays a table
+        reference, a projected sub-relation becomes a derived table. No subquery
+        expression is ever re-created.
+        """
         keyword = _JOIN_KEYWORDS.get(join.join_type)
         if keyword is None or not self._join_is_pushable(join):
             return False
-        if not isinstance(join.right, Scan):
-            return False
         if not self._absorb_from(join.left, context):
             return False
-        if not self._claim_scan(join.right, context):
+        right_ref = self._render_relation(join.right, context)
+        if right_ref is None:
             return False
-        context.joins.append(self._render_join_clause(join, keyword))
+        if self._contributes_columns(join):
+            context.has_derived_columns = True
+        context.joins.append(self._render_join_clause(join, keyword, right_ref))
         context.has_join = True
         return True
 
@@ -294,9 +360,67 @@ class SingleSourcePushdown:
         """A join pushes when it has an ON condition, or is NATURAL/USING."""
         return join.condition is not None or join.natural or join.using is not None
 
-    def _render_join_clause(self, join: Join, keyword: str) -> str:
+    def _contributes_columns(self, join: Join) -> bool:
+        """Whether a join adds its right relation's columns to a ``*`` projection.
+
+        SEMI/ANTI joins are existence filters and contribute no columns; any
+        other join exposes the right side, and when that side is a derived
+        relation its synthetic columns escape base-scan star expansion.
+        """
+        if join.join_type in (JoinType.SEMI, JoinType.ANTI):
+            return False
+        return self._is_derived_relation(join.right)
+
+    def _is_derived_relation(self, node: LogicalPlanNode) -> bool:
+        """Whether a node renders as a derived table rather than a base table ref."""
+        if isinstance(node, Scan):
+            return bool(node.aggregates or node.group_by)
+        return True
+
+    def _render_relation(
+        self, node: LogicalPlanNode, context: _PushContext
+    ) -> Optional[str]:
+        """Render a join's right side as a FROM/JOIN relation reference.
+
+        A base scan renders as its table reference; anything projected (the
+        decorrelated key/value relation, or a user derived table) renders as a
+        parenthesized derived table with a fresh alias.
+        """
+        if not self._is_derived_relation(node):
+            if not self._claim_scan(node, context):
+                return None
+            return self._scan_ref(node)
+        return self._render_derived(node, context)
+
+    def _render_derived(
+        self, node: LogicalPlanNode, context: _PushContext
+    ) -> Optional[str]:
+        """Render a projected sub-relation as ``(SELECT ...) AS alias``.
+
+        The sub-relation is rendered by an independent push context, so it
+        carries its own SELECT/WHERE/GROUP BY; it must resolve to the same data
+        source as the enclosing query. Its projection aliases (the synthetic
+        decorrelation keys) are preserved verbatim so the join condition above
+        still resolves them.
+        """
+        inner = _PushContext()
+        if not self._absorb(node, inner) or not inner.select_items:
+            return None
+        if context.datasource is not None and inner.datasource != context.datasource:
+            return None
+        if context.datasource is None:
+            context.datasource = inner.datasource
+        alias = self._derived_alias(context)
+        return f"({self._render(inner)}) AS {alias}"
+
+    def _derived_alias(self, context: _PushContext) -> str:
+        """Return a unique relation alias for the next derived table."""
+        alias = f"subq_{context.derived_count}"
+        context.derived_count += 1
+        return alias
+
+    def _render_join_clause(self, join: Join, keyword: str, right_ref: str) -> str:
         """Render one join clause using ON, USING, or NATURAL syntax."""
-        right_ref = self._scan_ref(join.right)
         if join.natural:
             return f"NATURAL {keyword} {right_ref}"
         if join.using is not None:
@@ -304,360 +428,14 @@ class SingleSourcePushdown:
             return f"{keyword} {right_ref} USING ({columns})"
         return f"{keyword} {right_ref} ON {join.condition.to_sql()}"
 
-    def _absorb_semi_anti_join(self, join: Join, context: _PushContext) -> bool:
-        """Render a decorrelated SEMI/ANTI join as a ``[NOT] EXISTS`` predicate.
-
-        Decorrelation turns EXISTS/IN/ANY into a SEMI join (ANTI for the negated
-        forms) whose right side is a key projection. Re-correlating it back to an
-        ``EXISTS`` subquery lets the whole thing push to one source as one query.
-        Only fires at the outer-query level: a SEMI join nested under an
-        aggregate keeps running in the merge engine (re-rendering it there would
-        strand the aggregate's output columns).
-        """
-        if context.has_aggregate:
-            return False
-        if not self._absorb_from(join.left, context):
-            return False
-        subquery = self._render_existence_subquery(join, context)
-        if subquery is None:
-            return False
-        prefix = "NOT " if join.join_type == JoinType.ANTI else ""
-        context.where_terms.append(f"{prefix}EXISTS ({subquery})")
-        context.has_join = True
-        return True
-
-    def _render_existence_subquery(
-        self, join: Join, context: _PushContext
-    ) -> Optional[str]:
-        """Build the ``SELECT 1 FROM ... WHERE ...`` body of the EXISTS subquery.
-
-        Outer columns are qualified with the outer alias. Only when the subquery
-        scans the *same* alias as the outer table is it given a fresh alias (and
-        its columns re-qualified) so a self-referential subquery keeps the two
-        sides distinct; otherwise the existing aliases already disambiguate.
-        """
-        right = join.right
-        if not isinstance(right, Projection):
-            return None
-        if not self._is_simple_subquery_relation(right.input):
-            return None
-        outer_alias = self._sole_outer_alias(context)
-        scan = self._subquery_scan(right.input)
-        if outer_alias is None or scan.datasource != context.datasource:
-            return None
-        orig = scan.alias if scan.alias else scan.table_name
-        inner_alias = orig
-        if orig == outer_alias:
-            inner_alias = self._fresh_subquery_alias(scan.table_name, outer_alias)
-        return self._compose_exists_select(
-            join, right, scan, orig, inner_alias, outer_alias
-        )
-
-    def _compose_exists_select(
-        self, join, projection, scan, orig, inner_alias, outer_alias
-    ) -> str:
-        """Assemble the EXISTS body from the re-aliased scan and correlation."""
-        key_map = self._build_key_map(projection, orig, inner_alias)
-        condition = self._substitute_keys(join.condition, key_map, outer_alias)
-        terms = self._inner_where_terms(join.right.input, orig, inner_alias)
-        terms.append(condition.to_sql())
-        from_sql = f'"{scan.schema_name}"."{scan.table_name}" AS {inner_alias}'
-        return f"SELECT 1 FROM {from_sql} WHERE {' AND '.join(terms)}"
-
-    def _subquery_scan(self, node: LogicalPlanNode) -> Scan:
-        """The base scan of a simple subquery body (unwrapping a Filter)."""
-        if isinstance(node, Filter):
-            return node.input
-        return node
-
-    def _fresh_subquery_alias(self, table_name: str, outer_alias: str) -> str:
-        """A subquery alias distinct from the outer alias to avoid collisions."""
-        candidate = f"{table_name}_sq"
-        if candidate == outer_alias:
-            return f"{table_name}_sq2"
-        return candidate
-
-    def _inner_where_terms(
-        self, node: LogicalPlanNode, orig: str, inner_alias: str
-    ) -> List[str]:
-        """The subquery's own filters, re-qualified to its fresh alias."""
-        terms: List[str] = []
-        if isinstance(node, Filter):
-            terms.append(self._requalify(node.predicate, orig, inner_alias).to_sql())
-            node = node.input
-        if node.filters is not None:
-            terms.append(self._requalify(node.filters, orig, inner_alias).to_sql())
-        return terms
-
-    def _requalify(self, expr: Expression, orig: str, inner_alias: str) -> Expression:
-        """Re-qualify a subquery-local expression's columns to its scan alias."""
-        return self._map_columns(
-            expr, lambda col: self._requalify_column(col, orig, inner_alias)
-        )
-
-    def _requalify_column(
-        self, column: ColumnRef, orig: str, inner_alias: str
-    ) -> Expression:
-        """Re-qualify one column that belongs to the subquery's own scan."""
-        if column.column == "*":
-            return column
-        if column.table == orig or column.table is None:
-            return ColumnRef(table=inner_alias, column=column.column)
-        return column
-
-    def _map_columns(self, expr: Expression, leaf) -> Expression:
-        """Rebuild an expression, applying ``leaf`` to every ColumnRef it holds."""
-        if isinstance(expr, ColumnRef):
-            return leaf(expr)
-        if isinstance(expr, BinaryOp):
-            left = self._map_columns(expr.left, leaf)
-            right = self._map_columns(expr.right, leaf)
-            return BinaryOp(op=expr.op, left=left, right=right)
-        if isinstance(expr, UnaryOp):
-            return UnaryOp(op=expr.op, operand=self._map_columns(expr.operand, leaf))
-        return self._map_compound_columns(expr, leaf)
-
-    def _map_compound_columns(self, expr: Expression, leaf) -> Expression:
-        """Map columns inside a Cast or function-call wrapper."""
-        if isinstance(expr, Cast):
-            inner = self._map_columns(expr.expr, leaf)
-            return Cast(
-                expr=inner, target_type=expr.target_type, data_type=expr.data_type
-            )
-        if isinstance(expr, FunctionCall):
-            args: List[Expression] = []
-            for arg in expr.args:
-                args.append(self._map_columns(arg, leaf))
-            return FunctionCall(
-                function_name=expr.function_name,
-                args=args,
-                is_aggregate=expr.is_aggregate,
-                distinct=expr.distinct,
-            )
-        return expr
-
-    def _sole_outer_alias(self, context: _PushContext) -> Optional[str]:
-        """The single outer scan's alias, used to qualify correlation columns.
-
-        Returns None when the outer side has several scans, where an unqualified
-        correlation column cannot be safely attributed to one of them.
-        """
-        if len(context.scans) != 1:
-            return None
-        scan = context.scans[0]
-        return scan.alias if scan.alias else scan.table_name
-
-    def _is_simple_subquery_relation(self, node: LogicalPlanNode) -> bool:
-        """Whether a subquery body is a single plain scan we can re-render safely.
-
-        Restricts EXISTS rendering to ``Scan`` or ``Filter`` over ``Scan`` with
-        no aggregate/group; aggregates, joins, or further nesting inside the
-        subquery are declined so they keep running in the merge engine.
-        """
-        if isinstance(node, Filter):
-            node = node.input
-        return isinstance(node, Scan) and not node.group_by and not node.aggregates
-
-    def _build_key_map(
-        self, projection: Projection, orig: str, inner_alias: str
-    ) -> Dict[str, Expression]:
-        """Map each key alias to its source expression, re-qualified to the alias."""
-        mapping: Dict[str, Expression] = {}
-        for index in range(len(projection.aliases)):
-            expr = self._requalify(projection.expressions[index], orig, inner_alias)
-            mapping[projection.aliases[index]] = expr
-        return mapping
-
-    def _substitute_keys(
-        self, expr: Expression, key_map: Dict[str, Expression], outer_alias: str
-    ) -> Expression:
-        """Rewrite a correlation condition for use inside the EXISTS subquery.
-
-        A synthetic key alias becomes its source expression; any other bare
-        column is an outer reference and is qualified with ``outer_alias``.
-        """
-        return self._map_columns(
-            expr, lambda col: self._substitute_column(col, key_map, outer_alias)
-        )
-
-    def _substitute_column(
-        self, column: ColumnRef, key_map: Dict[str, Expression], outer_alias: str
-    ) -> Expression:
-        """Resolve one column ref to a key definition or a qualified outer ref."""
-        if column.table is not None:
-            return column
-        if column.column in key_map:
-            return key_map[column.column]
-        return ColumnRef(table=outer_alias, column=column.column)
-
-    # --- scalar subquery inlining (decorrelated LEFT join to a keyed aggregate)
-
-    def _inline_scalars(self, node: LogicalPlanNode):
-        """Strip scalar LEFT joins, inlining each as a scalar subquery upward.
-
-        Returns the rewritten node and a map of value-alias -> inlined SQL that
-        ancestor expressions referencing the scalar's value column apply. Bottom
-        up: a stripped join hands its value upward to the Filter/Projection that
-        used it.
-        """
-        scalar_map: Dict[str, _InlineSql] = {}
-        new_children = []
-        for child in node.children():
-            rewritten, child_map = self._inline_scalars(child)
-            new_children.append(rewritten)
-            scalar_map.update(child_map)
-        if new_children:
-            node = node.with_children(new_children)
-        node = self._apply_scalar_map(node, scalar_map)
-        return self._maybe_strip_scalar_join(node, scalar_map)
-
-    def _maybe_strip_scalar_join(self, node: LogicalPlanNode, scalar_map):
-        """Replace an inlinable scalar LEFT join with its left input."""
-        if not self._is_scalar_join(node):
-            return node, scalar_map
-        inline, value_alias = self._build_scalar_inline(node)
-        if inline is None:
-            return node, scalar_map
-        scalar_map[value_alias] = inline
-        return node.left, scalar_map
-
-    def _apply_scalar_map(self, node: LogicalPlanNode, scalar_map):
-        """Substitute inlined scalars for value columns in a node's expressions."""
-        if not scalar_map:
-            return node
-        if isinstance(node, Filter):
-            predicate = self._sub_scalars(node.predicate, scalar_map)
-            return Filter(input=node.input, predicate=predicate)
-        if isinstance(node, Projection):
-            return self._apply_scalar_projection(node, scalar_map)
-        return node
-
-    def _apply_scalar_projection(self, node: Projection, scalar_map):
-        """Substitute inlined scalars into each projection expression."""
-        expressions = []
-        for expression in node.expressions:
-            expressions.append(self._sub_scalars(expression, scalar_map))
-        return Projection(
-            input=node.input,
-            expressions=expressions,
-            aliases=node.aliases,
-            distinct=node.distinct,
-        )
-
-    def _sub_scalars(self, expr: Expression, scalar_map):
-        """Replace a value-column ColumnRef with its inlined scalar placeholder."""
-        return self._map_columns(expr, lambda col: scalar_map.get(col.column, col))
-
-    def _is_scalar_join(self, node: LogicalPlanNode) -> bool:
-        """Whether a node is an inlinable decorrelated scalar LEFT join.
-
-        A ``SingleRowGuard`` right side marks a scalar decorrelation could not
-        prove returns at most one row; that is kept local so the engine raises a
-        typed ``CardinalityViolationError`` rather than delegating the check to a
-        source-specific error.
-        """
-        if not isinstance(node, Join) or node.join_type != JoinType.LEFT:
-            return False
-        if isinstance(node.right, SingleRowGuard):
-            return False
-        return isinstance(node.right, Projection)
-
-    def _build_scalar_inline(self, join: Join):
-        """Build an ``_InlineSql`` for a scalar LEFT join, or ``(None, None)``."""
-        right = join.right
-        scan = self._subquery_scan(right.input)
-        outer = self._leftmost_scan(join.left)
-        if not isinstance(scan, Scan) or outer is None:
-            return None, None
-        if scan.datasource != outer.datasource:
-            return None, None
-        value_alias = self._scalar_value_alias(right, join.condition)
-        if value_alias is None:
-            return None, None
-        return self._assemble_scalar(join, right, scan, outer, value_alias)
-
-    def _assemble_scalar(self, join, projection, scan, outer, value_alias):
-        """Render ``(SELECT value FROM table [WHERE correlation/filters])``."""
-        outer_alias = outer.alias if outer.alias else outer.table_name
-        orig = scan.alias if scan.alias else scan.table_name
-        inner_alias = orig
-        if orig == outer_alias:
-            inner_alias = self._fresh_subquery_alias(scan.table_name, outer_alias)
-        sources = self._scalar_sources(projection, scan, orig, inner_alias)
-        terms = self._scalar_where_terms(
-            join, projection, sources, value_alias, orig, inner_alias, outer_alias
-        )
-        from_sql = f'"{scan.schema_name}"."{scan.table_name}" AS {inner_alias}'
-        where = f" WHERE {' AND '.join(terms)}" if terms else ""
-        body = f"SELECT {sources[value_alias].to_sql()} FROM {from_sql}{where}"
-        return _InlineSql(f"({body})"), value_alias
-
-    def _scalar_sources(self, projection, scan, orig, inner_alias):
-        """Map each projection alias to its requalified source expression."""
-        sources: Dict[str, Expression] = {}
-        for index in range(len(projection.aliases)):
-            source = self._resolve_source(projection.expressions[index], scan)
-            sources[projection.aliases[index]] = self._requalify(
-                source, orig, inner_alias
-            )
-        return sources
-
-    def _resolve_source(self, expr: Expression, scan: Scan) -> Expression:
-        """Resolve a projection column to the scan's aggregate behind it, if any."""
-        if isinstance(expr, ColumnRef) and scan.aggregates and scan.output_names:
-            if expr.column in scan.output_names:
-                return scan.aggregates[scan.output_names.index(expr.column)]
-        return expr
-
-    def _scalar_where_terms(
-        self, join, projection, sources, value_alias, orig, inner_alias, outer_alias
-    ):
-        """Correlation predicate (keys -> sources) plus the subquery's filters."""
-        terms: List[str] = []
-        key_map: Dict[str, Expression] = {}
-        for alias in projection.aliases:
-            if alias != value_alias:
-                key_map[alias] = sources[alias]
-        if key_map:
-            correlation = self._substitute_keys(join.condition, key_map, outer_alias)
-            terms.append(correlation.to_sql())
-        terms.extend(self._inner_where_terms(projection.input, orig, inner_alias))
-        return terms
-
-    def _scalar_value_alias(self, projection: Projection, condition) -> Optional[str]:
-        """The single projection alias not used as a correlation key, or None."""
-        used = self._columns_in(condition)
-        values = []
-        for alias in projection.aliases:
-            if alias not in used:
-                values.append(alias)
-        return values[0] if len(values) == 1 else None
-
-    def _columns_in(self, expr: Optional[Expression]) -> Set[str]:
-        """Collect every column name referenced in an expression."""
-        found: Set[str] = set()
-        if expr is not None:
-            self._map_columns(expr, lambda col: self._note_column(found, col))
-        return found
-
-    def _note_column(self, found: Set[str], column: ColumnRef) -> ColumnRef:
-        """Record a column name during traversal, leaving the ref unchanged."""
-        found.add(column.column)
-        return column
-
-    def _leftmost_scan(self, node: LogicalPlanNode) -> Optional[Scan]:
-        """The leftmost base scan of a subtree, used to find the outer source."""
-        if isinstance(node, Scan):
-            return node
-        children = node.children()
-        if not children:
-            return None
-        return self._leftmost_scan(children[0])
-
     def _claim_scan(self, scan: Scan, context: _PushContext) -> bool:
-        """Confirm the scan shares the subtree's data source and collect filters."""
+        """Confirm a plain (non-aggregate) scan shares the data source."""
         if scan.group_by or scan.aggregates:
             return False
+        return self._claim_source(scan, context)
+
+    def _claim_source(self, scan: Scan, context: _PushContext) -> bool:
+        """Bind the scan's data source and collect its filters into the context."""
         if context.datasource is None:
             context.datasource = scan.datasource
         elif context.datasource != scan.datasource:

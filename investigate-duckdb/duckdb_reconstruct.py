@@ -44,6 +44,7 @@ class RelationSql:
     filters: tuple[str, ...]
     aliases: tuple[str, ...]
     mapping: tuple[str, ...]
+    output_columns: tuple[str, ...] = tuple()
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,14 @@ class DuckDBNodeRegistry:
         raise PlanReconstructionError(f"Unknown DuckDB plan node: {node.name}")
 
 
+@dataclass
+class AutoSchemaTable:
+    """Holds best-effort table and column definitions for auto schema mode."""
+
+    name: str
+    columns: dict[str, str]
+
+
 class SqlSurface:
     """Provides alias and clause text recovered from the original SQL."""
 
@@ -85,6 +94,10 @@ class SqlSurface:
         self.sql = sql
         self.expression = sqlglot.parse_one(sql, read="duckdb")
         self.connection = connection
+        self.cte_names = collect_cte_names(self.expression)
+        self.cte_output_names = collect_cte_output_names(self.expression)
+        self.cte_base_tables = collect_cte_base_tables(self.expression)
+        self.cte_join_names = collect_cte_join_names(self.expression, self.cte_names)
         self.alias_to_table: dict[str, str] = {}
         self.table_to_alias: dict[str, str] = {}
         self.table_columns: dict[str, set[str]] = {}
@@ -113,6 +126,34 @@ class SqlSurface:
             return None
         return limit.sql(dialect="duckdb")
 
+    def decorrelated_join_condition(self) -> Optional[str]:
+        """Return the first original equality predicate across table aliases."""
+        for equality in self.expression.find_all(sqlglot.expressions.EQ):
+            condition = self._equality_sql_if_cross_alias(equality)
+            if condition:
+                return condition
+        return None
+
+    def aggregate_alias_for_relation(
+        self, relation: RelationSql
+    ) -> tuple[Optional[str], tuple[str, ...]]:
+        """Return a CTE alias and output names for an aggregate relation."""
+        for cte_name in self.cte_join_names:
+            base_tables = self.cte_base_tables.get(cte_name, set())
+            if relation_uses_any_table(relation, base_tables):
+                return cte_name, self.cte_output_names.get(cte_name, tuple())
+        return None, tuple()
+
+    def inlined_cte_relation(self, relation: RelationSql) -> Optional[RelationSql]:
+        """Return a relation aliased as its original CTE name when inlined."""
+        if relation_is_aggregate_derived(relation):
+            return None
+        for cte_name in self.cte_join_names:
+            base_tables = self.cte_base_tables.get(cte_name, set())
+            if relation_uses_any_table(relation, base_tables):
+                return alias_relation_as_cte(relation, cte_name)
+        return None
+
     def alias_for_table(self, plan_table: str) -> str:
         """Return a display alias for a DuckDB plan table name."""
         table_name = plan_table.split(".")[-1]
@@ -140,6 +181,8 @@ class SqlSurface:
     def _load_table_aliases(self) -> None:
         """Load table aliases from the original SQL AST."""
         for table in self.expression.find_all(sqlglot.expressions.Table):
+            if table.name in self.cte_names:
+                continue
             table_name = table.name
             alias = table.alias_or_name
             self.alias_to_table[alias] = table_name
@@ -155,6 +198,20 @@ class SqlSurface:
             for row in rows:
                 columns.add(str(row[1]))
             self.table_columns[table_name] = columns
+
+    def _equality_sql_if_cross_alias(
+        self, equality: sqlglot.expressions.EQ
+    ) -> Optional[str]:
+        """Return equality SQL when both sides reference different aliases."""
+        left = equality.left
+        right = equality.right
+        if not isinstance(left, sqlglot.expressions.Column):
+            return None
+        if not isinstance(right, sqlglot.expressions.Column):
+            return None
+        if left.table and right.table and left.table != right.table:
+            return f"{left.sql(dialect='duckdb')} = {right.sql(dialect='duckdb')}"
+        return None
 
 
 def read_logical_node_registry() -> DuckDBNodeRegistry:
@@ -299,6 +356,375 @@ def parse_plan_node(raw_node: dict[str, Any]) -> PlanNode:
     )
 
 
+def apply_auto_schema(connection: duckdb.DuckDBPyConnection, sql: str) -> None:
+    """Create missing tables and columns needed to bind one SQL statement."""
+    expression = sqlglot.parse_one(sql, read="duckdb")
+    tables, alias_to_table = collect_auto_schema_tables(expression)
+    cte_names = collect_cte_names(expression)
+    collect_auto_schema_columns(expression, tables, alias_to_table, cte_names)
+    infer_auto_schema_types(expression, tables, alias_to_table, cte_names)
+    ensure_auto_schema_tables(connection, tables)
+
+
+def collect_cte_names(expression: sqlglot.expressions.Expression) -> set[str]:
+    """Collect CTE names that should not be treated as base tables."""
+    cte_names = set()
+    for cte in expression.find_all(sqlglot.expressions.CTE):
+        cte_names.add(cte.alias_or_name)
+    return cte_names
+
+
+def collect_cte_output_names(
+    expression: sqlglot.expressions.Expression,
+) -> dict[str, tuple[str, ...]]:
+    """Collect output names for each CTE body."""
+    output_names = {}
+    for cte in expression.find_all(sqlglot.expressions.CTE):
+        names = []
+        for select_expression in cte.this.expressions:
+            names.append(select_expression.alias_or_name)
+        output_names[cte.alias_or_name] = tuple(names)
+    return output_names
+
+
+def collect_cte_base_tables(
+    expression: sqlglot.expressions.Expression,
+) -> dict[str, set[str]]:
+    """Collect base table names referenced inside each CTE body."""
+    cte_base_tables = {}
+    for cte in expression.find_all(sqlglot.expressions.CTE):
+        base_tables = set()
+        for table in cte.this.find_all(sqlglot.expressions.Table):
+            base_tables.add(table.name)
+        cte_base_tables[cte.alias_or_name] = base_tables
+    return cte_base_tables
+
+
+def collect_cte_join_names(
+    expression: sqlglot.expressions.Expression, cte_names: set[str]
+) -> tuple[str, ...]:
+    """Collect CTE names used directly as join relations."""
+    join_names = []
+    for join in expression.find_all(sqlglot.expressions.Join):
+        relation = join.this
+        if isinstance(relation, sqlglot.expressions.Table):
+            if relation.name in cte_names:
+                join_names.append(relation.name)
+    return tuple(join_names)
+
+
+def collect_auto_schema_tables(
+    expression: sqlglot.expressions.Expression,
+) -> tuple[dict[str, AutoSchemaTable], dict[str, str]]:
+    """Collect table names and aliases from a SQL expression."""
+    tables: dict[str, AutoSchemaTable] = {}
+    alias_to_table: dict[str, str] = {}
+    cte_names = collect_cte_names(expression)
+    for table in expression.find_all(sqlglot.expressions.Table):
+        if table.name in cte_names:
+            continue
+        table_name = table.name
+        tables[table_name] = AutoSchemaTable(table_name, {})
+        alias_to_table[table.alias_or_name] = table_name
+    return tables, alias_to_table
+
+
+def collect_auto_schema_columns(
+    expression: sqlglot.expressions.Expression,
+    tables: dict[str, AutoSchemaTable],
+    alias_to_table: dict[str, str],
+    cte_names: set[str],
+) -> None:
+    """Collect referenced columns and assign default types."""
+    for column in expression.find_all(sqlglot.expressions.Column):
+        add_cte_projected_column_to_base_tables(column, expression, tables, cte_names)
+        table_names = resolve_auto_schema_column_tables(
+            column, tables, alias_to_table, cte_names
+        )
+        for table_name in table_names:
+            tables[table_name].columns.setdefault(column.name, "BIGINT")
+    add_dummy_columns_for_star_only_tables(tables)
+
+
+def add_cte_projected_column_to_base_tables(
+    column: sqlglot.expressions.Column,
+    expression: sqlglot.expressions.Expression,
+    tables: dict[str, AutoSchemaTable],
+    cte_names: set[str],
+) -> None:
+    """Propagate cte.column references through simple star CTE bodies."""
+    if not column.table:
+        return
+    if column.table not in cte_names:
+        return
+    base_tables = collect_cte_base_tables(expression).get(column.table, set())
+    if len(base_tables) != 1:
+        return
+    for base_table in base_tables:
+        if base_table in tables:
+            tables[base_table].columns.setdefault(column.name, "BIGINT")
+
+
+def resolve_auto_schema_column_tables(
+    column: sqlglot.expressions.Column,
+    tables: dict[str, AutoSchemaTable],
+    alias_to_table: dict[str, str],
+    cte_names: set[str],
+) -> tuple[str, ...]:
+    """Resolve a column reference to one or more auto schema tables."""
+    if column.table:
+        table_name = alias_to_table.get(column.table, column.table)
+        if table_name in cte_names:
+            return tuple()
+        if table_name not in tables:
+            return tuple()
+        return (table_name,)
+    if len(tables) == 1:
+        for table_name in tables:
+            return (table_name,)
+    table_names = []
+    for table_name in tables:
+        table_names.append(table_name)
+    return tuple(table_names)
+
+
+def add_dummy_columns_for_star_only_tables(
+    tables: dict[str, AutoSchemaTable]
+) -> None:
+    """Add one column to tables that are only referenced through stars."""
+    for table in tables.values():
+        if not table.columns:
+            table.columns["_auto_col"] = "BIGINT"
+
+
+def infer_auto_schema_types(
+    expression: sqlglot.expressions.Expression,
+    tables: dict[str, AutoSchemaTable],
+    alias_to_table: dict[str, str],
+    cte_names: set[str],
+) -> None:
+    """Infer simple column types from nearby SQL literals."""
+    for comparison in comparison_expressions(expression):
+        infer_comparison_types(comparison, tables, alias_to_table, cte_names)
+    for in_expression in expression.find_all(sqlglot.expressions.In):
+        infer_in_expression_types(in_expression, tables, alias_to_table, cte_names)
+
+
+def comparison_expressions(
+    expression: sqlglot.expressions.Expression,
+) -> tuple[sqlglot.expressions.Expression, ...]:
+    """Return comparison expressions that can imply column types."""
+    comparisons = []
+    comparison_types = (
+        sqlglot.expressions.EQ,
+        sqlglot.expressions.NEQ,
+        sqlglot.expressions.GT,
+        sqlglot.expressions.GTE,
+        sqlglot.expressions.LT,
+        sqlglot.expressions.LTE,
+    )
+    for comparison_type in comparison_types:
+        for comparison in expression.find_all(comparison_type):
+            comparisons.append(comparison)
+    return tuple(comparisons)
+
+
+def infer_comparison_types(
+    comparison: sqlglot.expressions.Expression,
+    tables: dict[str, AutoSchemaTable],
+    alias_to_table: dict[str, str],
+    cte_names: set[str],
+) -> None:
+    """Infer types for columns compared directly with literals."""
+    infer_column_type_from_pair(
+        comparison.left, comparison.right, tables, alias_to_table, cte_names
+    )
+    infer_column_type_from_pair(
+        comparison.right, comparison.left, tables, alias_to_table, cte_names
+    )
+
+
+def infer_in_expression_types(
+    expression: sqlglot.expressions.In,
+    tables: dict[str, AutoSchemaTable],
+    alias_to_table: dict[str, str],
+    cte_names: set[str],
+) -> None:
+    """Infer a column type from literal values in an IN expression."""
+    column = expression.this
+    if not isinstance(column, sqlglot.expressions.Column):
+        return
+    for value in expression.expressions:
+        inferred_type = infer_literal_type(value)
+        if inferred_type:
+            set_auto_schema_column_type(
+                column, inferred_type, tables, alias_to_table, cte_names
+            )
+
+
+def infer_column_type_from_pair(
+    column_candidate: sqlglot.expressions.Expression,
+    literal_candidate: sqlglot.expressions.Expression,
+    tables: dict[str, AutoSchemaTable],
+    alias_to_table: dict[str, str],
+    cte_names: set[str],
+) -> None:
+    """Infer one column type from a column/literal expression pair."""
+    if not isinstance(column_candidate, sqlglot.expressions.Column):
+        return
+    inferred_type = infer_literal_type(literal_candidate)
+    if inferred_type:
+        set_auto_schema_column_type(
+            column_candidate, inferred_type, tables, alias_to_table, cte_names
+        )
+
+
+def infer_literal_type(expression: sqlglot.expressions.Expression) -> Optional[str]:
+    """Infer a DuckDB type from a literal-like SQL expression."""
+    if isinstance(expression, sqlglot.expressions.Literal):
+        return infer_basic_literal_type(expression)
+    if isinstance(expression, sqlglot.expressions.Boolean):
+        return "BOOLEAN"
+    if isinstance(expression, sqlglot.expressions.Date):
+        return "DATE"
+    return None
+
+
+def infer_basic_literal_type(expression: sqlglot.expressions.Literal) -> str:
+    """Infer a DuckDB type from a sqlglot literal."""
+    if expression.is_string:
+        return "VARCHAR"
+    if "." in expression.this:
+        return "DOUBLE"
+    return "BIGINT"
+
+
+def set_auto_schema_column_type(
+    column: sqlglot.expressions.Column,
+    inferred_type: str,
+    tables: dict[str, AutoSchemaTable],
+    alias_to_table: dict[str, str],
+    cte_names: set[str],
+) -> None:
+    """Set an inferred type for every resolved column table."""
+    table_names = resolve_auto_schema_column_tables(
+        column, tables, alias_to_table, cte_names
+    )
+    for table_name in table_names:
+        table = tables[table_name]
+        current_type = table.columns.get(column.name, "BIGINT")
+        table.columns[column.name] = wider_auto_schema_type(current_type, inferred_type)
+
+
+def wider_auto_schema_type(current_type: str, inferred_type: str) -> str:
+    """Return the safer type when multiple inferences disagree."""
+    precedence = {"BIGINT": 1, "DOUBLE": 2, "DATE": 3, "BOOLEAN": 3, "VARCHAR": 4}
+    if precedence[inferred_type] > precedence[current_type]:
+        return inferred_type
+    return current_type
+
+
+def ensure_auto_schema_tables(
+    connection: duckdb.DuckDBPyConnection,
+    tables: dict[str, AutoSchemaTable],
+) -> None:
+    """Create missing tables and add missing columns for auto schema mode."""
+    for table in tables.values():
+        if auto_schema_table_exists(connection, table.name):
+            ensure_auto_schema_columns(connection, table)
+        else:
+            create_auto_schema_table(connection, table)
+            seed_auto_schema_table(connection, table)
+
+
+def auto_schema_table_exists(
+    connection: duckdb.DuckDBPyConnection, table_name: str
+) -> bool:
+    """Return true when a table exists in the active DuckDB connection."""
+    rows = connection.execute(
+        "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
+        [table_name],
+    ).fetchone()
+    return rows[0] > 0
+
+
+def ensure_auto_schema_columns(
+    connection: duckdb.DuckDBPyConnection, table: AutoSchemaTable
+) -> None:
+    """Add missing columns to an existing auto schema table."""
+    existing_columns = read_existing_columns(connection, table.name)
+    for column_name, column_type in table.columns.items():
+        if column_name not in existing_columns:
+            connection.execute(
+                f"ALTER TABLE {quote_identifier(table.name)} "
+                f"ADD COLUMN {quote_identifier(column_name)} {column_type}"
+            )
+
+
+def read_existing_columns(
+    connection: duckdb.DuckDBPyConnection, table_name: str
+) -> set[str]:
+    """Return existing column names for a table."""
+    rows = connection.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+    columns = set()
+    for row in rows:
+        columns.add(str(row[1]))
+    return columns
+
+
+def create_auto_schema_table(
+    connection: duckdb.DuckDBPyConnection, table: AutoSchemaTable
+) -> None:
+    """Create a best-effort table for auto schema mode."""
+    column_sql = format_auto_schema_columns(table)
+    connection.execute(f"CREATE TABLE {quote_identifier(table.name)} ({column_sql})")
+
+
+def format_auto_schema_columns(table: AutoSchemaTable) -> str:
+    """Format column definitions for CREATE TABLE."""
+    column_parts = []
+    for column_name, column_type in table.columns.items():
+        column_parts.append(f"{quote_identifier(column_name)} {column_type}")
+    return ", ".join(column_parts)
+
+
+def seed_auto_schema_table(
+    connection: duckdb.DuckDBPyConnection, table: AutoSchemaTable
+) -> None:
+    """Insert rows into auto-created tables so optimizer plans stay meaningful."""
+    column_names = []
+    values = []
+    for column_name, column_type in table.columns.items():
+        column_names.append(quote_identifier(column_name))
+        values.append(auto_schema_value_sql(column_type))
+    column_sql = ", ".join(column_names)
+    value_sql = ", ".join(values)
+    for _ in range(20):
+        connection.execute(
+            f"INSERT INTO {quote_identifier(table.name)} ({column_sql}) "
+            f"VALUES ({value_sql})"
+        )
+
+
+def auto_schema_value_sql(column_type: str) -> str:
+    """Return a literal value for one auto schema column type."""
+    if column_type == "VARCHAR":
+        return "'x'"
+    if column_type == "DOUBLE":
+        return "150.0"
+    if column_type == "DATE":
+        return "DATE '2026-01-01'"
+    if column_type == "BOOLEAN":
+        return "TRUE"
+    return "150"
+
+
+def quote_identifier(identifier: str) -> str:
+    """Quote a DuckDB identifier."""
+    escaped_identifier = identifier.replace('"', '""')
+    return f'"{escaped_identifier}"'
+
+
 def is_scan_node(node: PlanNode) -> bool:
     """Return true when a dynamic LogicalGet node looks like a scan."""
     if "Table" in node.extra_info:
@@ -311,9 +737,12 @@ def reconstruct_sql(
     sql: str,
     include_raw_json: bool,
     quiet: bool,
+    auto_schema: bool = False,
 ) -> str:
     """Return reconstructed SQL and optional verbose reconstruction details."""
     registry = read_logical_node_registry()
+    if auto_schema:
+        apply_auto_schema(connection, sql)
     surface = SqlSurface(sql, connection)
     root = explain_optimized_json(connection, sql)
     validate_tree(root, registry)
@@ -354,13 +783,13 @@ def relation_handlers() -> dict[str, Any]:
         "JOIN": reconstruct_join,
         "ANY_JOIN": reconstruct_join,
         "CROSS_PRODUCT": reconstruct_cross_product,
-        "AGGREGATE": reconstruct_unary_passthrough,
+        "AGGREGATE": reconstruct_aggregate,
         "DISTINCT": reconstruct_unary_passthrough,
         "LIMIT": reconstruct_unary_passthrough,
         "ORDER_BY": reconstruct_unary_passthrough,
         "TOP_N": reconstruct_unary_passthrough,
         "EMPTY_RESULT": reconstruct_empty_result,
-        "DUMMY_SCAN": reconstruct_empty_result,
+        "DUMMY_SCAN": reconstruct_dummy_scan,
         "DELIM_GET": reconstruct_delim_get,
     }
 
@@ -369,6 +798,7 @@ def reconstruct_scan(node: PlanNode, surface: SqlSurface) -> RelationSql:
     """Reconstruct a base scan and pushed filters."""
     plan_table = str(node.extra_info.get("Table", node.name))
     alias = surface.alias_for_table(plan_table)
+    table_name = plan_table.split(".")[-1]
     filters = normalize_filters(node.extra_info.get("Filters", ""))
     qualified_filters = qualify_filters(filters, surface, (alias,))
     mapping = (f"{node.name} -> FROM {surface.display_table(plan_table)}",)
@@ -377,6 +807,7 @@ def reconstruct_scan(node: PlanNode, surface: SqlSurface) -> RelationSql:
         qualified_filters,
         (alias,),
         mapping,
+        tuple(surface.table_columns.get(table_name, tuple())),
     )
 
 
@@ -387,7 +818,13 @@ def reconstruct_unary_passthrough(
     child = only_child(node)
     relation = reconstruct_relation(child, surface, registry)
     mapping = relation.mapping + (f"{node.name} -> preserved in SELECT shape",)
-    return RelationSql(relation.from_sql, relation.filters, relation.aliases, mapping)
+    return RelationSql(
+        relation.from_sql,
+        relation.filters,
+        relation.aliases,
+        mapping,
+        relation.output_columns,
+    )
 
 
 def reconstruct_filter(
@@ -397,6 +834,8 @@ def reconstruct_filter(
     child = only_child(node)
     relation = reconstruct_relation(child, surface, registry)
     filters = normalize_filters(node.extra_info.get("Expressions", ""))
+    if relation_is_aggregate_derived(relation):
+        return add_having_to_aggregate_relation(relation, filters)
     qualified = qualify_filters(filters, surface, relation.aliases)
     mapping = relation.mapping + (f"FILTER -> WHERE {' AND '.join(qualified)}",)
     return RelationSql(
@@ -404,7 +843,116 @@ def reconstruct_filter(
         relation.filters + qualified,
         relation.aliases,
         mapping,
+        relation.output_columns,
     )
+
+
+def relation_is_aggregate_derived(relation: RelationSql) -> bool:
+    """Return true when a relation was produced from an aggregate node."""
+    for mapping_line in relation.mapping:
+        if mapping_line.startswith("AGGREGATE -> derived table"):
+            return True
+    return False
+
+
+def add_having_to_aggregate_relation(
+    relation: RelationSql, filters: tuple[str, ...]
+) -> RelationSql:
+    """Fold a filter above an aggregate node into the derived table HAVING."""
+    if not filters:
+        return relation
+    having_sql = " AND ".join(filters)
+    from_sql = relation.from_sql.replace(") AS ", f"\nHAVING {having_sql}) AS ", 1)
+    mapping = relation.mapping + (f"FILTER -> HAVING {having_sql}",)
+    return RelationSql(
+        from_sql,
+        relation.filters,
+        relation.aliases,
+        mapping,
+        relation.output_columns,
+    )
+
+
+def reconstruct_aggregate(
+    node: PlanNode, surface: SqlSurface, registry: DuckDBNodeRegistry
+) -> RelationSql:
+    """Reconstruct an aggregate node as a derived relation."""
+    child = only_child(node)
+    child_relation = reconstruct_relation(child, surface, registry)
+    groups = normalize_filters(node.extra_info.get("Groups", ""))
+    aggregates = normalize_filters(node.extra_info.get("Expressions", ""))
+    alias, output_names = surface.aggregate_alias_for_relation(child_relation)
+    select_parts = aggregate_select_parts(groups, aggregates, output_names)
+    output_columns = aggregate_output_columns(groups, aggregates, output_names)
+    from_sql = aggregate_from_sql(child_relation, select_parts, groups)
+    relation_alias = alias or "__duckdb_agg"
+    mapping = child_relation.mapping + (
+        f"AGGREGATE -> derived table {relation_alias}",
+    )
+    return RelationSql(
+        f"({from_sql}) AS {relation_alias}",
+        tuple(),
+        (relation_alias,),
+        mapping,
+        output_columns,
+    )
+
+
+def aggregate_output_columns(
+    groups: tuple[str, ...],
+    aggregates: tuple[str, ...],
+    output_names: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Return output column names for an aggregate derived relation."""
+    if output_names:
+        return output_names
+    output_columns = []
+    for group in groups:
+        output_columns.append(group)
+    for aggregate in aggregates:
+        output_columns.append(aggregate)
+    return tuple(output_columns)
+
+
+def aggregate_select_parts(
+    groups: tuple[str, ...],
+    aggregates: tuple[str, ...],
+    output_names: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Return SELECT expressions for an aggregate derived relation."""
+    select_parts = []
+    for group in groups:
+        select_parts.append(group)
+    for aggregate in aggregates:
+        select_parts.append(aggregate_with_output_alias(aggregate, select_parts, output_names))
+    return tuple(select_parts)
+
+
+def aggregate_with_output_alias(
+    aggregate: str, select_parts: list[str], output_names: tuple[str, ...]
+) -> str:
+    """Attach an output alias to an aggregate expression when available."""
+    output_index = len(select_parts)
+    if output_index >= len(output_names):
+        return aggregate
+    output_name = output_names[output_index]
+    if not output_name or output_name == aggregate:
+        return aggregate
+    return f"{aggregate} AS {output_name}"
+
+
+def aggregate_from_sql(
+    child_relation: RelationSql,
+    select_parts: tuple[str, ...],
+    groups: tuple[str, ...],
+) -> str:
+    """Format a derived aggregate SQL query."""
+    lines = [f"SELECT {', '.join(select_parts)}", f"FROM {child_relation.from_sql}"]
+    if child_relation.filters:
+        lines.append("WHERE " + " AND ".join(child_relation.filters))
+    if groups:
+        lines.append("GROUP BY " + ", ".join(groups))
+    return "\n".join(lines)
 
 
 def reconstruct_cross_product(
@@ -428,6 +976,10 @@ def reconstruct_join(
     left, right = two_children(node)
     left_relation = reconstruct_relation(left, surface, registry)
     right_relation = reconstruct_relation(right, surface, registry)
+    right_relation = replace_inlined_cte_relation(surface, right_relation)
+    empty_relation = reconstruct_empty_join(node, left_relation, right_relation)
+    if empty_relation:
+        return empty_relation
     join_keyword = join_type_keyword(node)
     condition = best_join_condition(node, left_relation, right_relation, surface)
     from_sql = join_from_sql(left_relation, right_relation, join_keyword, condition)
@@ -437,11 +989,105 @@ def reconstruct_join(
     return RelationSql(from_sql, filters, aliases, mapping)
 
 
+def replace_inlined_cte_relation(
+    surface: SqlSurface, right_relation: RelationSql
+) -> RelationSql:
+    """Alias an inlined CTE relation with its original CTE name."""
+    cte_relation = surface.inlined_cte_relation(right_relation)
+    if cte_relation:
+        return cte_relation
+    return right_relation
+
+
+def alias_relation_as_cte(relation: RelationSql, cte_name: str) -> RelationSql:
+    """Return a relation displayed under an inlined CTE alias."""
+    from_sql = add_alias_to_relation_sql(relation.from_sql, cte_name)
+    mapping = relation.mapping + (f"CTE {cte_name} -> inlined relation alias",)
+    return RelationSql(
+        from_sql,
+        relation.filters,
+        (cte_name,),
+        mapping,
+        relation.output_columns,
+    )
+
+
+def add_alias_to_relation_sql(from_sql: str, alias: str) -> str:
+    """Add a SQL alias to a relation fragment."""
+    if " AS " in from_sql:
+        return from_sql
+    if "\n" in from_sql or from_sql.startswith("("):
+        return f"({from_sql}) AS {alias}"
+    return f"{from_sql} AS {alias}"
+
+
+def reconstruct_empty_join(
+    node: PlanNode, left_relation: RelationSql, right_relation: RelationSql
+) -> Optional[RelationSql]:
+    """Reconstruct joins where one optimized side is EMPTY_RESULT."""
+    join_type = str(node.extra_info.get("Join Type", "INNER")).upper()
+    if relation_is_empty(left_relation):
+        return empty_join_result(node, left_relation, right_relation)
+    if not relation_is_empty(right_relation):
+        return None
+    if join_type == "ANTI":
+        mapping = left_relation.mapping + right_relation.mapping
+        return RelationSql(left_relation.from_sql, left_relation.filters, left_relation.aliases, mapping)
+    if join_type == "SEMI":
+        return left_relation_with_false_filter(node, left_relation, right_relation)
+    if join_type == "INNER":
+        return empty_join_result(node, left_relation, right_relation)
+    return None
+
+
+def relation_is_empty(relation: RelationSql) -> bool:
+    """Return true when a relation represents DuckDB EMPTY_RESULT."""
+    return relation.from_sql == "(SELECT * WHERE FALSE)"
+
+
+def relation_uses_any_table(relation: RelationSql, table_names: set[str]) -> bool:
+    """Return true when relation SQL references any supplied table name."""
+    for table_name in table_names:
+        if re.search(rf"\b{re.escape(table_name)}\b", relation.from_sql):
+            return True
+    return False
+
+
+def empty_join_result(
+    node: PlanNode, left_relation: RelationSql, right_relation: RelationSql
+) -> RelationSql:
+    """Return an empty relation for joins that cannot produce rows."""
+    mapping = left_relation.mapping + right_relation.mapping
+    mapping += (f"{node.name} -> empty result because one join side is empty",)
+    return RelationSql("(SELECT * WHERE FALSE)", tuple(), tuple(), mapping)
+
+
+def left_relation_with_false_filter(
+    node: PlanNode, left_relation: RelationSql, right_relation: RelationSql
+) -> RelationSql:
+    """Return the left relation with a false predicate for empty SEMI joins."""
+    mapping = left_relation.mapping + right_relation.mapping
+    mapping += (f"{node.name} -> WHERE FALSE because SEMI JOIN RHS is empty",)
+    return RelationSql(
+        left_relation.from_sql,
+        left_relation.filters + ("FALSE",),
+        left_relation.aliases,
+        mapping,
+    )
+
+
 def reconstruct_empty_result(
     node: PlanNode, surface: SqlSurface, registry: DuckDBNodeRegistry
 ) -> RelationSql:
     """Reconstruct an empty result placeholder."""
     return RelationSql("(SELECT * WHERE FALSE)", tuple(), tuple(), (f"{node.name} -> empty result",))
+
+
+def reconstruct_dummy_scan(
+    node: PlanNode, surface: SqlSurface, registry: DuckDBNodeRegistry
+) -> RelationSql:
+    """Reconstruct a dummy scan as a SELECT without a FROM clause."""
+    return RelationSql("", tuple(), tuple(), ("DUMMY_SCAN -> no FROM",))
 
 
 def reconstruct_delim_get(
@@ -458,6 +1104,9 @@ def best_join_condition(
     surface: SqlSurface,
 ) -> str:
     """Return the most readable condition for a join node."""
+    original_condition = original_condition_for_semantic_join(node, surface)
+    if original_condition:
+        return original_condition
     inner_condition = find_inner_join_condition(node)
     if inner_condition and node.name == "DELIM_JOIN":
         return qualify_binary_condition(
@@ -467,12 +1116,60 @@ def best_join_condition(
             surface,
         )
     condition = first_extra_value(node.extra_info.get("Conditions", ""))
-    return qualify_binary_condition(
-        condition,
-        left_relation.aliases,
-        right_relation.aliases,
-        surface,
-    )
+    return qualify_join_condition(condition, left_relation, right_relation, surface)
+
+
+def qualify_join_condition(
+    condition: str,
+    left_relation: RelationSql,
+    right_relation: RelationSql,
+    surface: SqlSurface,
+) -> str:
+    """Qualify a binary join condition using relation metadata."""
+    clean_condition = strip_wrapping_parentheses(condition)
+    operator = find_binary_operator(clean_condition)
+    if not operator:
+        aliases = left_relation.aliases + right_relation.aliases
+        return qualify_expression(clean_condition, surface, aliases)
+    left_text, right_text = split_binary_condition(clean_condition, operator)
+    left_sql = resolve_condition_term(left_text.strip(), left_relation, surface)
+    right_sql = resolve_condition_term(right_text.strip(), right_relation, surface)
+    return f"{left_sql} {operator} {right_sql}"
+
+
+def resolve_condition_term(
+    term: str, relation: RelationSql, surface: SqlSurface
+) -> str:
+    """Resolve one side of a join condition against a relation."""
+    slot_column = resolve_slot_reference(term, relation)
+    if slot_column:
+        return slot_column
+    return surface.qualify_column(term, relation.aliases)
+
+
+def resolve_slot_reference(term: str, relation: RelationSql) -> Optional[str]:
+    """Resolve a DuckDB #N slot reference against relation output columns."""
+    if not term.startswith("#"):
+        return None
+    slot_text = term[1:]
+    if not slot_text.isdigit():
+        return None
+    slot_index = int(slot_text)
+    if slot_index >= len(relation.output_columns):
+        return None
+    if not relation.aliases:
+        return relation.output_columns[slot_index]
+    return f"{relation.aliases[0]}.{relation.output_columns[slot_index]}"
+
+
+def original_condition_for_semantic_join(
+    node: PlanNode, surface: SqlSurface
+) -> Optional[str]:
+    """Return original cross-relation predicate for semantic joins."""
+    join_type = str(node.extra_info.get("Join Type", "")).upper()
+    if join_type not in ("INNER", "LEFT", "RIGHT", "FULL", "SEMI", "ANTI"):
+        return None
+    return surface.decorrelated_join_condition()
 
 
 def find_inner_join_condition(node: PlanNode) -> Optional[str]:
@@ -663,7 +1360,9 @@ def two_children(node: PlanNode) -> tuple[PlanNode, PlanNode]:
 
 def format_select_sql(surface: SqlSurface, relation: RelationSql) -> str:
     """Format the final reconstructed SELECT statement."""
-    lines = [f"SELECT {surface.projection_sql()}", f"FROM {relation.from_sql}"]
+    lines = [f"SELECT {surface.projection_sql()}"]
+    if relation.from_sql:
+        lines.append(f"FROM {relation.from_sql}")
     if relation.filters:
         lines.append("WHERE " + " AND ".join(relation.filters))
     order_sql = surface.order_sql()
@@ -746,6 +1445,7 @@ def cli() -> None:
 @click.option("--sql-file")
 @click.option("--json", "include_raw_json", is_flag=True)
 @click.option("--quiet", is_flag=True)
+@click.option("--auto-schema", is_flag=True)
 def render(
     database: str,
     setup: str,
@@ -754,13 +1454,16 @@ def render(
     sql_file: Optional[str],
     include_raw_json: bool,
     quiet: bool,
+    auto_schema: bool,
 ) -> None:
     """Render one SQL query from DuckDB optimized JSON."""
     connection = duckdb.connect(database)
     setup_sql = combine_setup_sql(setup, setup_file)
     query_sql = read_query_sql(sql, sql_file)
     apply_setup_sql(connection, setup_sql)
-    click.echo(reconstruct_sql(connection, query_sql, include_raw_json, quiet))
+    click.echo(
+        reconstruct_sql(connection, query_sql, include_raw_json, quiet, auto_schema)
+    )
 
 
 @cli.command()
@@ -769,18 +1472,20 @@ def render(
 @click.option("--setup-file")
 @click.option("--json", "include_raw_json", is_flag=True)
 @click.option("--quiet", is_flag=True)
+@click.option("--auto-schema", is_flag=True)
 def repl(
     database: str,
     setup: str,
     setup_file: Optional[str],
     include_raw_json: bool,
     quiet: bool,
+    auto_schema: bool,
 ) -> None:
     """Start a multiline REPL for optimized SQL reconstruction."""
     connection = duckdb.connect(database)
     apply_setup_sql(connection, combine_setup_sql(setup, setup_file))
-    session = PromptSession(multiline=True)
-    run_repl(session, connection, include_raw_json, quiet)
+    session = PromptSession()
+    run_repl(session, connection, include_raw_json, quiet, auto_schema)
 
 
 def run_repl(
@@ -788,15 +1493,57 @@ def run_repl(
     connection: duckdb.DuckDBPyConnection,
     include_raw_json: bool,
     quiet: bool,
+    auto_schema: bool = False,
 ) -> None:
-    """Read SQL statements and print reconstructed output until quit."""
+    """Read SQL lines until semicolon and print reconstructed output."""
+    pending_lines: list[str] = []
     while True:
-        sql = session.prompt("duckdb-reconstruct> ").strip()
-        if sql in (":quit", ":exit"):
+        prompt_text = repl_prompt(pending_lines)
+        line = session.prompt(prompt_text).strip()
+        if should_exit_repl(line, pending_lines):
             return
-        if not sql:
+        if not line:
             continue
-        click.echo(reconstruct_sql(connection, sql, include_raw_json, quiet))
+        pending_lines.append(line)
+        if line.endswith(";"):
+            execute_repl_statement(
+                "\n".join(pending_lines),
+                connection,
+                include_raw_json,
+                quiet,
+                auto_schema,
+            )
+            pending_lines = []
+
+
+def repl_prompt(pending_lines: list[str]) -> str:
+    """Return the primary or continuation REPL prompt."""
+    if pending_lines:
+        return "              ...> "
+    return "duckdb-reconstruct> "
+
+
+def should_exit_repl(line: str, pending_lines: list[str]) -> bool:
+    """Return true when the user requested REPL exit."""
+    if pending_lines:
+        return False
+    return line in (":quit", ":exit")
+
+
+def execute_repl_statement(
+    sql: str,
+    connection: duckdb.DuckDBPyConnection,
+    include_raw_json: bool,
+    quiet: bool,
+    auto_schema: bool = False,
+) -> None:
+    """Execute one REPL statement and print either output or an error."""
+    try:
+        output = reconstruct_sql(connection, sql, include_raw_json, quiet, auto_schema)
+    except Exception as error:
+        click.echo(f"ERROR: {error}")
+        return
+    click.echo(output)
 
 
 if __name__ == "__main__":

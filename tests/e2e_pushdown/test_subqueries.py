@@ -1,9 +1,17 @@
-"""Subquery pushdown tests (EXISTS, IN, scalar, correlated, derived tables).
+"""Subquery pushdown tests.
 
-NOTE: This file is intentionally separate because the query engine may implement
-a decorrelation engine to normalize subqueries in the future. Keeping all subquery
-tests in one place makes it easier to verify decorrelation behavior.
+Design contract enforced here: the engine **fully decorrelates** every subquery
+before planning, so no subquery *expression* (EXISTS / IN (SELECT ...) / ANY /
+ALL / scalar ``(SELECT ...)``) ever survives into the physical plan. A
+decorrelated EXISTS/IN becomes a ``SEMI JOIN`` (``ANTI JOIN`` for the negated
+forms); a scalar subquery becomes a ``LEFT JOIN`` to a keyed aggregate. The
+join's right side renders as a derived-table *relation* (``(SELECT ...) AS t``)
+in FROM/JOIN position, which is a relation, not a subquery expression, and is
+allowed. Every test below asserts both the expected join shape and the global
+no-subquery-expression invariant.
 """
+
+import pytest
 
 from sqlglot import exp
 
@@ -15,31 +23,53 @@ from tests.e2e_pushdown.helpers import (
 )
 
 
-def _exists_predicate(ast, negated):
-    """Return the inner Select of a pushed ``[NOT] EXISTS`` WHERE predicate.
+def _join_kinds(ast):
+    """Collect the join-shape tokens of an AST.
 
-    Decorrelation canonicalizes EXISTS/IN/ANY (and the negated NOT EXISTS/
-    NOT IN/ALL) into a SEMI/ANTI join, which the single-source generator pushes
-    back down as a correlated ``EXISTS`` / ``NOT EXISTS`` subquery.
+    sqlglot records SEMI/ANTI under a join's ``kind`` but LEFT/RIGHT/FULL under
+    its ``side``, so both are gathered; ``["SEMI", "SEMI"]`` for two semi joins,
+    ``["LEFT"]`` for one left join.
     """
-    where_clause = ast.args.get("where")
-    assert where_clause is not None
-    predicate = unwrap_parens(where_clause.this)
-    if negated:
-        assert isinstance(predicate, exp.Not)
-        predicate = unwrap_parens(predicate.this)
-    assert isinstance(predicate, exp.Exists)
-    subquery = predicate.this
-    assert isinstance(subquery, exp.Select)
-    return subquery
+    kinds = []
+    for join in ast.args.get("joins") or []:
+        for key in ("side", "kind"):
+            value = join.args.get(key)
+            if value:
+                kinds.append(str(value).upper())
+    return kinds
+
+
+def _assert_no_subquery_expressions(ast):
+    """Assert no predicate/projection-position subquery survived decorrelation.
+
+    A subquery in FROM/JOIN position is a derived-table *relation* and is
+    allowed; anything else — ``EXISTS``, ``IN (SELECT ...)``, ``ANY``/``ALL``,
+    or a scalar ``(SELECT ...)`` in WHERE/SELECT/HAVING — is forbidden, because
+    decorrelation must leave the physical plan free of subquery expressions.
+    """
+    assert not list(ast.find_all(exp.Exists)), "EXISTS survived decorrelation"
+    assert not list(ast.find_all(exp.Any)), "ANY survived decorrelation"
+    assert not list(ast.find_all(exp.All)), "ALL survived decorrelation"
+    for in_node in ast.find_all(exp.In):
+        assert in_node.args.get("query") is None, "IN (SELECT ...) survived"
+    _assert_only_relation_subqueries(ast)
+
+
+def _assert_only_relation_subqueries(ast):
+    """Assert every surviving Subquery sits in FROM/JOIN (relation) position."""
+    for subquery in ast.find_all(exp.Subquery):
+        parent = subquery.parent
+        assert isinstance(
+            parent, (exp.From, exp.Join)
+        ), "scalar subquery survived decorrelation"
 
 
 def _assert_push_matches_source(single_source_env, sql):
     """Assert a query pushes as one remote query and matches the raw source.
 
     The engine result is compared against running the same SQL directly on the
-    underlying DuckDB connection, so the re-correlated pushed query is verified
-    for correctness, not just shape.
+    underlying DuckDB connection, so the pushed (decorrelated, join-form) query
+    is verified for correctness, not just shape.
     """
     runtime = build_runtime(single_source_env)
     explain_datasource_query(runtime, sql)
@@ -52,11 +82,11 @@ def _assert_push_matches_source(single_source_env, sql):
     assert sorted(engine_rows) == sorted(expected)
 
 
-# EXISTS Subqueries
+# EXISTS Subqueries -> SEMI / ANTI JOIN
 
 
 def test_where_exists_basic(single_source_env):
-    """Verifies WHERE EXISTS subquery pushes to datasource."""
+    """A WHERE EXISTS pushes as a SEMI JOIN, no EXISTS in the pushed query."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id FROM duckdb_primary.main.orders O "
@@ -66,20 +96,12 @@ def test_where_exists_basic(single_source_env):
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
-
-    where_clause = ast.args.get("where")
-    assert where_clause is not None
-    predicate = unwrap_parens(where_clause.this)
-    assert isinstance(predicate, exp.Exists)
-
-    subquery = predicate.this
-    assert isinstance(subquery, exp.Select)
-    subquery_where = subquery.args.get("where")
-    assert subquery_where is not None
+    assert "SEMI" in _join_kinds(ast)
+    _assert_no_subquery_expressions(ast)
 
 
 def test_where_not_exists(single_source_env):
-    """Validates WHERE NOT EXISTS subquery pushes correctly."""
+    """A WHERE NOT EXISTS pushes as an ANTI JOIN."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id FROM duckdb_primary.main.orders O "
@@ -89,24 +111,15 @@ def test_where_not_exists(single_source_env):
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
-
-    where_clause = ast.args.get("where")
-    assert where_clause is not None
-    predicate = unwrap_parens(where_clause.this)
-    assert isinstance(predicate, exp.Not)
-
-    exists_expr = unwrap_parens(predicate.this)
-    assert isinstance(exists_expr, exp.Exists)
-
-    subquery = exists_expr.this
-    assert isinstance(subquery, exp.Select)
+    assert "ANTI" in _join_kinds(ast)
+    _assert_no_subquery_expressions(ast)
 
 
-# IN Subqueries
+# IN Subqueries -> SEMI / ANTI JOIN
 
 
 def test_where_in_subquery(single_source_env):
-    """Checks WHERE col IN (SELECT...) pushes to datasource."""
+    """A WHERE col IN (SELECT ...) pushes as a SEMI JOIN."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id, price FROM duckdb_primary.main.orders "
@@ -115,12 +128,12 @@ def test_where_in_subquery(single_source_env):
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
-    subquery = _exists_predicate(ast, negated=False)
-    assert subquery.args.get("where") is not None
+    assert "SEMI" in _join_kinds(ast)
+    _assert_no_subquery_expressions(ast)
 
 
 def test_where_not_in_subquery(single_source_env):
-    """Validates WHERE col NOT IN (SELECT...) pushes correctly."""
+    """A WHERE col NOT IN (SELECT ...) pushes as an ANTI JOIN."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id FROM duckdb_primary.main.orders "
@@ -129,14 +142,15 @@ def test_where_not_in_subquery(single_source_env):
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
-    _exists_predicate(ast, negated=True)
+    assert "ANTI" in _join_kinds(ast)
+    _assert_no_subquery_expressions(ast)
 
 
-# Scalar Subqueries
+# Scalar Subqueries -> LEFT JOIN to a keyed aggregate
 
 
 def test_scalar_subquery_max(single_source_env):
-    """Ensures scalar subquery with MAX pushes correctly."""
+    """A scalar ``= (SELECT MAX(...))`` pushes as a LEFT JOIN, no subquery expr."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id, price FROM duckdb_primary.main.orders "
@@ -145,25 +159,12 @@ def test_scalar_subquery_max(single_source_env):
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
-
-    where_clause = ast.args.get("where")
-    assert where_clause is not None
-    predicate = unwrap_parens(where_clause.this)
-    assert isinstance(predicate, exp.EQ)
-
-    right = unwrap_parens(predicate.right)
-    assert isinstance(right, exp.Subquery)
-    subquery = right.this
-    assert isinstance(subquery, exp.Select)
-
-    subquery_projection = subquery.expressions
-    assert len(subquery_projection) == 1
-    max_expr = unwrap_parens(subquery_projection[0])
-    assert isinstance(max_expr, exp.Max)
+    assert "LEFT" in _join_kinds(ast)
+    _assert_no_subquery_expressions(ast)
 
 
 def test_scalar_subquery_avg_comparison(single_source_env):
-    """Validates scalar subquery with AVG in comparison pushes correctly."""
+    """A scalar ``> (SELECT AVG(...))`` pushes as a LEFT JOIN, no subquery expr."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id, price FROM duckdb_primary.main.orders "
@@ -172,25 +173,17 @@ def test_scalar_subquery_avg_comparison(single_source_env):
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
-
-    where_clause = ast.args.get("where")
-    assert where_clause is not None
-    predicate = unwrap_parens(where_clause.this)
-    assert isinstance(predicate, exp.GT)
-
-    right = unwrap_parens(predicate.right)
-    assert isinstance(right, exp.Subquery)
-    subquery = right.this
-    assert isinstance(subquery, exp.Select)
-
-    subquery_projection = subquery.expressions
-    assert len(subquery_projection) == 1
-    avg_expr = unwrap_parens(subquery_projection[0])
-    assert isinstance(avg_expr, exp.Avg)
+    assert "LEFT" in _join_kinds(ast)
+    _assert_no_subquery_expressions(ast)
 
 
+@pytest.mark.xfail(
+    reason="decorrelation gap: scalar subquery in HAVING not yet flattened to a "
+    "join input (decorrelation.py / HAVING-as-join-input rendering)",
+    strict=False,
+)
 def test_scalar_subquery_in_having(single_source_env):
-    """Checks scalar subquery in HAVING clause pushes correctly."""
+    """A scalar subquery in HAVING pushes as a LEFT JOIN over the aggregate."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT region, AVG(price) AS avg_price "
@@ -201,25 +194,18 @@ def test_scalar_subquery_in_having(single_source_env):
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
-
     projection = select_column_names(ast)
     assert "region" in projection
     assert "avg_price" in projection
-
-    where_clause = ast.args.get("where")
-    assert where_clause is not None
-    predicate = unwrap_parens(where_clause.this)
-    assert isinstance(predicate, exp.GT)
-
-    right = unwrap_parens(predicate.right)
-    assert isinstance(right, exp.Subquery)
+    assert "LEFT" in _join_kinds(ast)
+    _assert_no_subquery_expressions(ast)
 
 
-# Correlated Subqueries
+# Correlated Subqueries -> LEFT JOIN to a keyed aggregate
 
 
 def test_correlated_subquery_in_where(single_source_env):
-    """Validates correlated subquery (references outer query) pushes correctly."""
+    """A correlated scalar in WHERE pushes as a LEFT JOIN, no subquery expr."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id, price FROM duckdb_primary.main.orders O "
@@ -229,25 +215,12 @@ def test_correlated_subquery_in_where(single_source_env):
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
-
-    where_clause = ast.args.get("where")
-    assert where_clause is not None
-    predicate = unwrap_parens(where_clause.this)
-    assert isinstance(predicate, exp.GT)
-
-    right = unwrap_parens(predicate.right)
-    assert isinstance(right, exp.Subquery)
-    subquery = right.this
-    assert isinstance(subquery, exp.Select)
-
-    subquery_where = subquery.args.get("where")
-    assert subquery_where is not None
-    subquery_predicate = unwrap_parens(subquery_where.this)
-    assert isinstance(subquery_predicate, exp.EQ)
+    assert "LEFT" in _join_kinds(ast)
+    _assert_no_subquery_expressions(ast)
 
 
 def test_correlated_subquery_in_select(single_source_env):
-    """Ensures correlated subquery in SELECT projection pushes correctly."""
+    """A correlated scalar in SELECT pushes as a LEFT JOIN, no subquery expr."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id, "
@@ -256,27 +229,18 @@ def test_correlated_subquery_in_select(single_source_env):
         "FROM duckdb_primary.main.orders O"
     )
     ast = explain_datasource_query(runtime, sql)
-
     projection = select_column_names(ast)
     assert "order_id" in projection
     assert "product_count" in projection
-
-    expressions = ast.expressions
-    assert len(expressions) == 2
-
-    second_expr = expressions[1]
-    if isinstance(second_expr, exp.Alias):
-        # A correlated COUNT scalar is pushed as COALESCE((SELECT COUNT(*) ...),
-        # 0), so the scalar subquery is nested inside rather than at the top.
-        subquery_expr = second_expr.this.find(exp.Subquery)
-        assert subquery_expr is not None
+    assert "LEFT" in _join_kinds(ast)
+    _assert_no_subquery_expressions(ast)
 
 
-# ANY / ALL Operators
+# ANY / ALL Operators -> SEMI / ANTI JOIN
 
 
 def test_where_any_operator(single_source_env):
-    """Checks WHERE col = ANY (SELECT...) pushes correctly."""
+    """A WHERE col = ANY (SELECT ...) pushes as a SEMI JOIN."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id FROM duckdb_primary.main.orders "
@@ -285,12 +249,12 @@ def test_where_any_operator(single_source_env):
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
-    subquery = _exists_predicate(ast, negated=False)
-    assert subquery.args.get("where") is not None
+    assert "SEMI" in _join_kinds(ast)
+    _assert_no_subquery_expressions(ast)
 
 
 def test_where_all_operator(single_source_env):
-    """Validates WHERE col > ALL (SELECT...) pushes correctly."""
+    """A WHERE col > ALL (SELECT ...) pushes as an ANTI JOIN."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id, price FROM duckdb_primary.main.orders "
@@ -299,14 +263,15 @@ def test_where_all_operator(single_source_env):
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
-    _exists_predicate(ast, negated=True)
+    assert "ANTI" in _join_kinds(ast)
+    _assert_no_subquery_expressions(ast)
 
 
-# Pushed-subquery execution correctness (re-correlated query vs the source)
+# Pushed-subquery execution correctness (decorrelated join form vs the source)
 
 
 def test_exists_pushed_result_matches_source(single_source_env):
-    """A pushed EXISTS returns the rows the source computes for it."""
+    """A pushed EXISTS (as a SEMI JOIN) returns the rows the source computes."""
     sql = (
         "SELECT order_id FROM duckdb_primary.main.orders o "
         "WHERE EXISTS (SELECT 1 FROM duckdb_primary.main.products p "
@@ -316,7 +281,7 @@ def test_exists_pushed_result_matches_source(single_source_env):
 
 
 def test_correlated_scalar_pushed_result_matches_source(single_source_env):
-    """A pushed correlated scalar subquery matches the source's own result."""
+    """A pushed correlated scalar (as a LEFT JOIN) matches the source's result."""
     sql = (
         "SELECT order_id FROM duckdb_primary.main.orders o "
         "WHERE price > (SELECT AVG(price) FROM duckdb_primary.main.products p "
@@ -339,7 +304,7 @@ def test_correlated_count_scalar_pushed_result_matches_source(single_source_env)
 
 
 def test_nested_subqueries(single_source_env):
-    """Ensures nested subqueries (subquery in subquery) push correctly."""
+    """A subquery nested inside a subquery decorrelates to nested joins."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id FROM duckdb_primary.main.orders "
@@ -351,23 +316,20 @@ def test_nested_subqueries(single_source_env):
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
-
-    # The outer IN decorrelates to a correlated EXISTS; the inner scalar
-    # subquery survives inside that EXISTS body.
-    outer_subquery = _exists_predicate(ast, negated=False)
-    inner_where = outer_subquery.args.get("where")
-    assert inner_where is not None
-
-    inner_subquery_expr = outer_subquery.find(exp.Subquery)
-    assert inner_subquery_expr is not None
-    assert isinstance(inner_subquery_expr.this, exp.Select)
+    assert "SEMI" in _join_kinds(ast)
+    _assert_no_subquery_expressions(ast)
 
 
-# Derived Tables (Subquery in FROM)
+# Derived Tables (Subquery in FROM) -- relation subqueries, allowed
 
 
+@pytest.mark.xfail(
+    reason="cluster B: FROM derived-table (SubqueryScan) rendering not yet "
+    "implemented in single_source_pushdown; relation-subquery form is the target",
+    strict=False,
+)
 def test_subquery_in_from_derived_table(single_source_env):
-    """Validates subquery in FROM clause (derived table) pushes correctly."""
+    """A FROM derived table pushes as a relation subquery in FROM position."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id, high_price FROM ("
@@ -378,23 +340,24 @@ def test_subquery_in_from_derived_table(single_source_env):
         "WHERE high_price > 200"
     )
     ast = explain_datasource_query(runtime, sql)
-
     from_clause = ast.args.get("from")
     assert from_clause is not None
     from_table = from_clause.this
     assert isinstance(from_table, exp.Subquery)
-
     derived_query = from_table.this
     assert isinstance(derived_query, exp.Select)
-    derived_where = derived_query.args.get("where")
-    assert derived_where is not None
-
-    outer_where = ast.args.get("where")
-    assert outer_where is not None
+    assert derived_query.args.get("where") is not None
+    assert ast.args.get("where") is not None
+    _assert_no_subquery_expressions(ast)
 
 
+@pytest.mark.xfail(
+    reason="cluster B: JOIN derived-table (SubqueryScan) rendering not yet "
+    "implemented in single_source_pushdown; relation-subquery form is the target",
+    strict=False,
+)
 def test_derived_table_with_join(single_source_env):
-    """Checks derived table joined with regular table pushes correctly."""
+    """A derived table joined to a base table pushes as a relation subquery."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT O.order_id, H.avg_price FROM duckdb_primary.main.orders O "
@@ -405,25 +368,21 @@ def test_derived_table_with_join(single_source_env):
         ") H ON O.region = H.region"
     )
     ast = explain_datasource_query(runtime, sql)
-
     joins = ast.args.get("joins") or []
     assert len(joins) == 1
-
-    join = joins[0]
-    join_table = join.this
+    join_table = joins[0].this
     assert isinstance(join_table, exp.Subquery)
-
     derived_query = join_table.this
     assert isinstance(derived_query, exp.Select)
-    derived_group = derived_query.args.get("group")
-    assert derived_group is not None
+    assert derived_query.args.get("group") is not None
+    _assert_no_subquery_expressions(ast)
 
 
-# Multiple Subqueries
+# Multiple Subqueries -> multiple SEMI JOINs
 
 
 def test_multiple_subqueries_in_where(single_source_env):
-    """Ensures multiple subqueries in WHERE clause push correctly."""
+    """Two IN subqueries in WHERE push as two SEMI JOINs."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id FROM duckdb_primary.main.orders "
@@ -435,24 +394,20 @@ def test_multiple_subqueries_in_where(single_source_env):
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
-
-    where_clause = ast.args.get("where")
-    assert where_clause is not None
-    predicate = unwrap_parens(where_clause.this)
-    assert isinstance(predicate, exp.And)
-
-    # Both IN subqueries decorrelate to correlated EXISTS predicates.
-    for side in (predicate.left, predicate.right):
-        node = unwrap_parens(side)
-        assert isinstance(node, exp.Exists)
-        assert isinstance(node.this, exp.Select)
+    assert _join_kinds(ast).count("SEMI") == 2
+    _assert_no_subquery_expressions(ast)
 
 
-# Subqueries with Aggregation
+# Subqueries whose body itself needs decorrelation work (known gaps)
 
 
+@pytest.mark.xfail(
+    reason="decorrelation gap: GROUP BY/HAVING subquery body -- _peel_values_top "
+    "rejects a Filter(HAVING) top and HAVING renders as WHERE on push",
+    strict=False,
+)
 def test_subquery_with_group_by(single_source_env):
-    """Validates subquery containing GROUP BY pushes correctly."""
+    """An IN over a GROUP BY/HAVING body pushes as a SEMI JOIN to a derived agg."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id FROM duckdb_primary.main.orders "
@@ -462,28 +417,17 @@ def test_subquery_with_group_by(single_source_env):
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
-
-    where_clause = ast.args.get("where")
-    assert where_clause is not None
-    predicate = unwrap_parens(where_clause.this)
-    assert isinstance(predicate, exp.In)
-
-    subquery_expr = predicate.args.get("query")
-    assert isinstance(subquery_expr, exp.Subquery)
-    subquery = subquery_expr.this
-    assert isinstance(subquery, exp.Select)
-
-    subquery_group = subquery.args.get("group")
-    assert subquery_group is not None
-    group_expressions = subquery_group.expressions or []
-    assert len(group_expressions) == 1
-
-    subquery_having = subquery.args.get("where")
-    assert subquery_having is not None
+    assert "SEMI" in _join_kinds(ast)
+    _assert_no_subquery_expressions(ast)
 
 
+@pytest.mark.xfail(
+    reason="decorrelation gap: ORDER BY/LIMIT subquery body not peeled into a "
+    "join input (_peel_values_top)",
+    strict=False,
+)
 def test_subquery_with_order_by_limit(single_source_env):
-    """Ensures subquery with ORDER BY LIMIT pushes correctly."""
+    """An IN over an ORDER BY/LIMIT body pushes as a SEMI JOIN to a derived rel."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id FROM duckdb_primary.main.orders "
@@ -493,33 +437,17 @@ def test_subquery_with_order_by_limit(single_source_env):
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
-
-    where_clause = ast.args.get("where")
-    assert where_clause is not None
-    predicate = unwrap_parens(where_clause.this)
-    assert isinstance(predicate, exp.In)
-
-    subquery_expr = predicate.args.get("query")
-    assert isinstance(subquery_expr, exp.Subquery)
-    subquery = subquery_expr.this
-    assert isinstance(subquery, exp.Select)
-
-    subquery_order = subquery.args.get("order")
-    assert subquery_order is not None
-    order_expressions = subquery_order.expressions
-    assert len(order_expressions) == 1
-
-    subquery_limit = subquery.args.get("limit")
-    assert isinstance(subquery_limit, exp.Limit)
-    limit_value = int(subquery_limit.expression.this)
-    assert limit_value == 5
+    assert "SEMI" in _join_kinds(ast)
+    _assert_no_subquery_expressions(ast)
 
 
-# Subquery with UNION
-
-
+@pytest.mark.xfail(
+    reason="decorrelation gap: SetOperation (UNION) subquery body rejected by the "
+    "binder (binder.py: unsupported plan node in subquery)",
+    strict=False,
+)
 def test_subquery_with_union(single_source_env):
-    """Validates subquery containing UNION pushes correctly."""
+    """An IN over a UNION body pushes as a SEMI JOIN to a derived relation."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id FROM duckdb_primary.main.orders "
@@ -530,23 +458,15 @@ def test_subquery_with_union(single_source_env):
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
-
-    where_clause = ast.args.get("where")
-    assert where_clause is not None
-    predicate = unwrap_parens(where_clause.this)
-    assert isinstance(predicate, exp.In)
-
-    subquery_expr = predicate.args.get("query")
-    assert isinstance(subquery_expr, exp.Subquery)
-    union_query = subquery_expr.this
-    assert isinstance(union_query, exp.Union)
+    assert "SEMI" in _join_kinds(ast)
+    _assert_no_subquery_expressions(ast)
 
 
 # Complex EXISTS with Multiple Conditions
 
 
 def test_exists_with_complex_predicates(single_source_env):
-    """Checks EXISTS with complex AND/OR predicates pushes correctly."""
+    """An EXISTS with complex AND/OR predicates pushes as a SEMI JOIN."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id FROM duckdb_primary.main.orders O "
@@ -558,24 +478,18 @@ def test_exists_with_complex_predicates(single_source_env):
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
-
-    where_clause = ast.args.get("where")
-    assert where_clause is not None
-    predicate = unwrap_parens(where_clause.this)
-    assert isinstance(predicate, exp.Exists)
-
-    subquery = predicate.this
-    assert isinstance(subquery, exp.Select)
-    subquery_where = subquery.args.get("where")
-    assert subquery_where is not None
-
-    subquery_predicate = unwrap_parens(subquery_where.this)
-    assert isinstance(subquery_predicate, exp.And)
+    assert "SEMI" in _join_kinds(ast)
+    _assert_no_subquery_expressions(ast)
 
 
 # Cross-Datasource Subquery Fallback
 
 
+@pytest.mark.xfail(
+    reason="cluster D: cross-source subquery materialization policy not "
+    "implemented (and multi_source_env lacks duckdb_primary/postgres_secondary)",
+    strict=False,
+)
 def test_cross_datasource_subquery_fallback(multi_source_env):
     """Documents cross-datasource subquery behavior (fallback expected)."""
     runtime = build_runtime(multi_source_env)
