@@ -3187,23 +3187,64 @@ class PhysicalGroupedLimit(PhysicalPlanNode):
     input: PhysicalPlanNode
     keys: List[Expression]
     limit: int
+    # Optional per-key ordering; when set, each key group is sorted by these
+    # keys before its first ``limit`` rows are kept.
+    order_by_keys: Optional[List[Expression]] = None
+    order_by_ascending: Optional[List[bool]] = None
+    order_by_nulls: Optional[List[Optional[str]]] = None
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
 
     def execute(self) -> Iterator[pa.RecordBatch]:
-        """Stream input, keeping the first ``limit`` rows of each key.
+        """Keep the first ``limit`` rows of each key.
 
-        This stays row-at-a-time rather than going through the merge engine: it
-        depends on the input's row order (the latest-row-per-key idiom relies on
-        an ORDER BY in a child operator), and DuckDB window functions would not
-        preserve that order without an explicit sort key this node does not have.
+        Without an ordering the input row order decides which rows survive
+        (row-at-a-time streaming). With an ordering the input is materialized
+        and each key group is sorted first, implementing the first/latest-row-
+        per-key idiom without depending on a child operator's order.
         """
+        if self.order_by_keys:
+            yield from self._execute_ordered()
+            return
         emitted_counts: Dict[tuple, int] = {}
         for batch in self.input.execute():
             filtered = self._limit_batch(batch, emitted_counts)
             if filtered.num_rows > 0:
                 yield filtered
+
+    def _execute_ordered(self) -> Iterator[pa.RecordBatch]:
+        """Materialize, sort within each key, and emit each key's first rows."""
+        table = self._sorted_input_table()
+        emitted_counts: Dict[tuple, int] = {}
+        for batch in table.to_batches():
+            filtered = self._limit_batch(batch, emitted_counts)
+            if filtered.num_rows > 0:
+                yield filtered
+
+    def _sorted_input_table(self) -> pa.Table:
+        """Collect the input and sort it by key then by the ordering keys."""
+        batches = list(self.input.execute())
+        table = pa.Table.from_batches(batches, schema=self.input.schema())
+        return table.sort_by(self._sort_directives())
+
+    def _sort_directives(self) -> List[Tuple[str, str]]:
+        """Sort by every key (to group rows) then by each ordering key."""
+        directives: List[Tuple[str, str]] = []
+        for key in self.keys:
+            directives.append((key.column, "ascending"))
+        for index in range(len(self.order_by_keys)):
+            directives.append(
+                (self.order_by_keys[index].column, self._direction(index))
+            )
+        return directives
+
+    def _direction(self, index: int) -> str:
+        """The pyarrow sort direction for one ordering key."""
+        ascending = self.order_by_ascending
+        if ascending is None or ascending[index]:
+            return "ascending"
+        return "descending"
 
     def _limit_batch(
         self, batch: pa.RecordBatch, emitted_counts: Dict[tuple, int]

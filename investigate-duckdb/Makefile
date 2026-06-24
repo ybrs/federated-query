@@ -38,6 +38,24 @@ MAIN_SRC     = pg-scanner-src
 MAIN_BIN     = $(MAIN_SRC)/build/release/duckdb
 ANALYTICS_DB = analytics-poc.duckdb
 
+PLAN_DUMP_CXX      ?= g++
+PLAN_DUMP_SRC      ?= duckdb_plan_dump.cpp
+PLAN_DUMP_BIN      ?= duckdb_plan_dump
+PLAN_DUMP_DUCKDB   ?= duckdb-src
+PLAN_DUMP_LIB_DIR  ?= $(PLAN_DUMP_DUCKDB)/build/release/src
+PLAN_DUMP_LIB      ?= $(PLAN_DUMP_LIB_DIR)/libduckdb.so
+PLAN_DUMP_INCLUDES = \
+	-I $(PLAN_DUMP_DUCKDB)/src/include \
+	-I $(PLAN_DUMP_DUCKDB)/third_party/fmt/include \
+	-I $(PLAN_DUMP_DUCKDB)/third_party/utf8proc/include \
+	-I $(PLAN_DUMP_DUCKDB)/third_party/yyjson/include \
+	-I $(PLAN_DUMP_DUCKDB)/third_party/fastpforlib \
+	-I $(PLAN_DUMP_DUCKDB)/third_party/fast_float \
+	-I $(PLAN_DUMP_DUCKDB)/third_party/re2 \
+	-I $(PLAN_DUMP_DUCKDB)/third_party/miniz \
+	-I $(PLAN_DUMP_DUCKDB)/third_party/concurrentqueue \
+	-I $(PLAN_DUMP_DUCKDB)/third_party/pcg
+
 .DEFAULT_GOAL := help
 
 # ---------------------------------------------------------------------------
@@ -86,6 +104,34 @@ $(MAIN_BIN): $(MAIN_SRC) ## Build the main DuckDB + postgres scanner from source
 	cp patches/postgres_oauth.cpp.stub $(MAIN_SRC)/src/postgres_oauth.cpp
 	cd $(MAIN_SRC) && PATH="$(VENV_BIN):$$PATH" GEN=ninja $(MAKE) release -j$$(nproc)
 	$(MAIN_BIN) -unsigned -c "LOAD '$(CURDIR)/$(MAIN_SRC)/build/release/extension/postgres_scanner/postgres_scanner.duckdb_extension'; SELECT 'main ok';" 2>&1 | tail -1
+
+# ---- DuckDB logical plan dumper ------------------------------------------
+plan-dump-duckdb: $(PLAN_DUMP_LIB) ## Build the local DuckDB shared library needed by duckdb_plan_dump
+
+$(PLAN_DUMP_LIB):
+	cd $(PLAN_DUMP_DUCKDB) && GEN=ninja $(MAKE) release -j$$(nproc)
+
+plan-dump: $(PLAN_DUMP_BIN) ## Build duckdb_plan_dump, the ExtractPlan helper used by duckdb_reconstruct.py
+
+$(PLAN_DUMP_BIN): $(PLAN_DUMP_SRC) $(PLAN_DUMP_LIB)
+	$(PLAN_DUMP_CXX) -std=c++17 $(PLAN_DUMP_SRC) $(PLAN_DUMP_INCLUDES) \
+	  -L $(PLAN_DUMP_LIB_DIR) -lduckdb -Wl,-rpath,$(CURDIR)/$(PLAN_DUMP_LIB_DIR) \
+	  -o $(PLAN_DUMP_BIN)
+
+plan-dump-smoke: plan-dump ## Smoke test duckdb_plan_dump against a root derived subquery
+	mkdir -p tmp
+	printf '%s\n' 'CREATE TABLE bar(x INTEGER);' > tmp/plan_dump_setup.sql
+	printf '%s\n' 'SELECT foo FROM (SELECT 1 AS foo FROM bar);' > tmp/plan_dump_query.sql
+	./$(PLAN_DUMP_BIN) --setup-file tmp/plan_dump_setup.sql --sql-file tmp/plan_dump_query.sql
+
+reconstruct-test: plan-dump ## Run the Python reconstructor tests
+	python -m pytest tests/test_duckdb_reconstruct.py -q
+
+duckdb-node-manifest: ## Print source-derived DuckDB logical node manifest as JSON
+	python duckdb_node_manifest.py
+
+plan-dump-clean: ## Remove the duckdb_plan_dump helper binary
+	rm -f $(PLAN_DUMP_BIN)
 
 # ---- benchmarks / outputs -------------------------------------------------
 bench: pg-check ## Full timing sweep across all queries (stable / main / fedq)
@@ -153,4 +199,6 @@ clean: ## Remove built binaries, the DuckDB fixture, and clones
 
 .PHONY: help all data binaries bench bench-core bench-drivers verify perfdoc \
         pushdowns pg-check pg-data duck-data test-streaming clean clean-build \
-        ch-download ch-start ch-stop ch-data bench-clickhouse test-clickhouse
+        ch-download ch-start ch-stop ch-data bench-clickhouse test-clickhouse \
+        plan-dump-duckdb plan-dump plan-dump-smoke reconstruct-test \
+        duckdb-node-manifest plan-dump-clean

@@ -535,13 +535,26 @@ class GroupedLimit(LogicalPlanNode):
     input: LogicalPlanNode
     keys: List[Expression]
     limit: int
+    # Optional per-key ordering: when set, each key group is sorted by these
+    # keys before its first ``limit`` rows are kept (the "first/latest row per
+    # key" idiom). When None, rows are kept in input order.
+    order_by_keys: Optional[List[Expression]] = None
+    order_by_ascending: Optional[List[bool]] = None
+    order_by_nulls: Optional[List[Optional[str]]] = None
 
     def children(self) -> List[LogicalPlanNode]:
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "GroupedLimit":
         assert len(children) == 1
-        return GroupedLimit(input=children[0], keys=self.keys, limit=self.limit)
+        return GroupedLimit(
+            input=children[0],
+            keys=self.keys,
+            limit=self.limit,
+            order_by_keys=self.order_by_keys,
+            order_by_ascending=self.order_by_ascending,
+            order_by_nulls=self.order_by_nulls,
+        )
 
     def accept(self, visitor):
         return visitor.visit_grouped_limit(self)
@@ -551,6 +564,40 @@ class GroupedLimit(LogicalPlanNode):
 
     def __repr__(self) -> str:
         return f"GroupedLimit(limit={self.limit}, keys={len(self.keys)})"
+
+
+@dataclass(frozen=True)
+class LateralJoin(LogicalPlanNode):
+    """A dependent (lateral) join: the right side may reference left columns.
+
+    This is the decorrelation fallback for a correlated subquery that cannot be
+    flattened into a set-based join — a non-equality correlation crossing an
+    aggregate or LIMIT, or a skip-level correlation. The right side is a
+    correlated subquery subtree (with the outer references kept) that is
+    evaluated per left row; the executing engine — a pushed-to source, or the
+    in-memory DuckDB merge engine — decorrelates and runs it. ``join_type`` is
+    LEFT so an outer row with no subquery match still survives (value NULL).
+    """
+
+    left: LogicalPlanNode
+    right: LogicalPlanNode
+    join_type: JoinType
+
+    def children(self) -> List[LogicalPlanNode]:
+        return [self.left, self.right]
+
+    def with_children(self, children: List[LogicalPlanNode]) -> "LateralJoin":
+        assert len(children) == 2
+        return LateralJoin(children[0], children[1], self.join_type)
+
+    def accept(self, visitor):
+        return visitor.visit_lateral_join(self)
+
+    def schema(self) -> List[str]:
+        return self.left.schema() + self.right.schema()
+
+    def __repr__(self) -> str:
+        return f"LateralJoin({self.join_type.name})"
 
 
 class LogicalPlanVisitor(ABC):
@@ -614,4 +661,7 @@ class LogicalPlanVisitor(ABC):
 
     @abstractmethod
     def visit_grouped_limit(self, node: "GroupedLimit"):
+        pass
+
+    def visit_lateral_join(self, node: "LateralJoin"):
         pass

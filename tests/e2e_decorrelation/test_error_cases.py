@@ -10,6 +10,7 @@ from federated_query.parser.parser import Parser
 from federated_query.parser.binder import Binder
 from federated_query.optimizer.decorrelation import Decorrelator, DecorrelationError
 from federated_query.parser.binder import BindingError
+from federated_query.plan.logical import GroupedLimit, LateralJoin
 from federated_query.plan.physical import CardinalityViolationError
 from federated_query.executor.executor import Executor
 from .test_utils import (
@@ -810,21 +811,61 @@ class TestUnsupportedSubqueryShapes:
         bound = Binder(catalog).bind(Parser().parse(sql))
         return Decorrelator().decorrelate(bound)
 
-    def test_sort_topped_subquery_body(self, catalog, setup_test_data):
-        """A subquery body topped by ORDER BY ... LIMIT (Sort) is rejected.
+    def _find_grouped_limit(self, node):
+        """Return the first GroupedLimit in a plan, or None."""
+        if isinstance(node, GroupedLimit):
+            return node
+        for child in node.children():
+            found = self._find_grouped_limit(child)
+            if found is not None:
+                return found
+        return None
 
-        The ``latest-row-per-key`` idiom needs a Sort+Limit peel the engine
-        does not have yet (decorrelation-gaps.md A).
+    def test_sort_topped_correlated_scalar(self, catalog, setup_test_data):
+        """A correlated scalar ``ORDER BY ... LIMIT 1`` (latest-row-per-key) now
+        decorrelates to an order-aware per-key limit (gap A, closed).
+
+        The ORDER BY column (``o.amount``) is not the selected value
+        (``o.user_id``), so it is exposed as an extra projected column the
+        GroupedLimit sorts on. LIMIT 1 makes it provably single-row, so no
+        cardinality guard is added.
         """
         sql = (
             "SELECT u.id FROM pg.users u WHERE u.id = ("
             "  SELECT o.user_id FROM pg.orders o WHERE o.user_id = u.id "
             "  ORDER BY o.amount DESC LIMIT 1)"
         )
-        with pytest.raises(
-            DecorrelationError, match="Unsupported subquery output shape"
-        ):
-            self._decorrelate(catalog, sql)
+        plan = self._decorrelate(catalog, sql)
+        grouped = self._find_grouped_limit(plan)
+        assert grouped is not None
+        assert grouped.limit == 1
+        assert grouped.order_by_keys
+
+    def test_non_equi_correlated_limit_subquery_uses_lateral(
+        self, catalog, setup_test_data
+    ):
+        """A non-equi correlated ``ORDER BY ... LIMIT`` scalar cannot become a
+        per-key limit (a ``<``/``>`` correlation matches many groups), so it
+        falls back to a LATERAL join evaluated per outer row — never a wrong
+        per-key answer.
+        """
+        sql = (
+            "SELECT u.id, (SELECT o.user_id FROM pg.orders o "
+            "  WHERE o.amount > u.id ORDER BY o.amount LIMIT 1) AS x "
+            "FROM pg.users u"
+        )
+        plan = self._decorrelate(catalog, sql)
+        assert self._find_lateral_join(plan) is not None
+
+    def _find_lateral_join(self, node):
+        """Return the first LateralJoin in a plan, or None."""
+        if isinstance(node, LateralJoin):
+            return node
+        for child in node.children():
+            found = self._find_lateral_join(child)
+            if found is not None:
+                return found
+        return None
 
     def test_set_operation_subquery_body(self, catalog, setup_test_data):
         """A UNION/INTERSECT/EXCEPT subquery body is rejected at binding.

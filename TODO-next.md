@@ -7,7 +7,7 @@ single-source pushdown renders it as **SQL joins**, never re-correlated
 
 ## Current test state
 
-- Full suite: **763 passed / 17 xfailed / 1 xpassed / 0 failed**
+- Full suite: **766 passed / 15 xfailed / 0 failed**
   (`POSTGRES_DB=duckpoc /workspace/venv-fedq/bin/python -m pytest tests/ -q`;
   needs `make pg-start`).
 - `tests/e2e_decorrelation/`: green.
@@ -46,13 +46,37 @@ single-source pushdown renders it as **SQL joins**, never re-correlated
   derived-table render that preserves the `SubqueryScan` alias for outer column
   resolution. Target shape: a relation subquery (`exp.Subquery` in FROM/JOIN) —
   allowed by the invariant.
-- **Cluster A — decorrelation gaps** (subquery *body* doesn't decorrelate yet):
-  `test_subquery_with_group_by` (Filter/HAVING top — `_peel_values_top`),
-  `test_subquery_with_order_by_limit` (Sort/Limit top),
-  `test_subquery_with_union` (SetOperation body rejected by the binder),
-  `test_scalar_subquery_in_having` (xpasses now — HAVING scalar; revisit).
-  These fail *before* rendering, in `optimizer/decorrelation.py` /
-  `parser/binder.py`.
+- **Cluster A — decorrelation gaps**: 3 of 4 now CLOSED.
+  - DONE `test_scalar_subquery_in_having` — already worked; xfail removed.
+  - DONE `test_subquery_with_order_by_limit` — `_peel_values_top` keeps `Sort`
+    wrappers (uncorrelated only); single_source renders a scan's folded
+    `order_by_keys` (the optimizer folds the Sort into the Scan).
+  - DONE `test_subquery_with_group_by` — `_peel_values_top` keeps `Filter`
+    (HAVING) wrappers; single_source `_split_scan_filter` routes a folded
+    aggregate-scan filter into WHERE vs HAVING and substitutes decorrelation's
+    hoisted aggregate aliases (`__subq_0_h1`) back to the real expression.
+  - The `Sort`/`Filter` peel is gated to **uncorrelated** subqueries
+    (`prepare_values`: `allow_wrappers = not self._is_correlated(plan)`).
+  - DONE correlated scalar `ORDER BY … LIMIT n` (pick-one/dedup): decorrelates to
+    a LEFT join + order-aware `GroupedLimit` (sort within each correlation key,
+    take n). Added `order_by_*` to `GroupedLimit` (logical + physical + planner),
+    `prepare_scalar` captures the Sort, `_assemble`/`_apply_pending_limit` build
+    the ordered per-key limit, and the `SingleRowGuard` is skipped for LIMIT 1.
+    Equi-correlation only; non-equi needs a general dependent join. Follow-up:
+    semi-join reduction / dynamic filter pushdown so the inner scan stays narrow.
+  - DONE non-equi correlated scalar (aggregate/LIMIT) → LATERAL (dependent) join.
+    New `LateralJoin` logical node; `decorrelation._join_scalar` falls back to it
+    when pattern-flattening fails (`_needs_lateral`); `single_source_pushdown`
+    renders `LEFT JOIN LATERAL (...) ON TRUE` for same-source push (the source /
+    DuckDB merge engine decorrelates it). Cross-source LATERAL fails fast
+    (`physical_planner._plan_lateral_join`) — TODO: cross-source dependent-join
+    executor (materialize the distinct correlation domain, one batched query per
+    source, join locally — the magic-set / dynamic-filter approach).
+  - TODO `test_subquery_with_union` — UNION needs 3 layers: bind a
+    `SetOperation` body (`SubqueryPlanBinder._bind_other` rejects it), let
+    `_peel_values_top` accept a `SetOperation` value relation, and add a
+    `SetOperation`/`Union` derived-relation render path to single_source (none
+    exists). ~60-80 lines; INTERSECT/EXCEPT scope TBD.
 - **Cluster C — CTEs** (whole `test_ctes.py` xfailed): parser hard-rejects
   `WITH` (`parser.py`: "WITH clauses (CTEs) are not supported yet"). A CTE is a
   named relation, not a correlated subquery — separate feature, deferred.

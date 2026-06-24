@@ -22,9 +22,15 @@ from ..plan.logical import (
     Aggregate,
     Sort,
     Limit,
+    LateralJoin,
 )
-from ..plan.expressions import ColumnRef
+from ..plan.expressions import ColumnRef, Expression, FunctionCall
 from ..plan.physical import PhysicalRemoteQuery
+from .decorrelation import (
+    _split_conjuncts,
+    _rebuild_expression,
+    _expression_column_refs,
+)
 
 _JOIN_KEYWORDS = {
     JoinType.INNER: "INNER JOIN",
@@ -46,6 +52,7 @@ class _PushContext:
         self.from_sql: Optional[str] = None
         self.joins: List[str] = []
         self.where_terms: List[str] = []
+        self.having_terms: List[str] = []
         self.group_sql: Optional[str] = None
         self.order_sql: Optional[str] = None
         self.limit: Optional[int] = None
@@ -177,9 +184,30 @@ class SingleSourcePushdown:
             return self._absorb_aggregate(node, context)
         if isinstance(node, Filter):
             return self._absorb_filter(node, context)
+        if isinstance(node, LateralJoin):
+            return self._absorb_lateral_join(node, context)
         if isinstance(node, (Join, Scan)):
             return self._absorb_from(node, context)
         return False
+
+    def _absorb_lateral_join(self, node: LateralJoin, context: _PushContext) -> bool:
+        """Render a dependent join as ``LEFT JOIN LATERAL (...) ON TRUE``.
+
+        The right side renders as a derived relation that keeps its outer
+        column references; in LATERAL scope the source (or the DuckDB merge
+        engine) evaluates it per left row. Same-source only — a cross-source
+        right side fails the data-source check and declines to push.
+        """
+        if not self._absorb_from(node.left, context):
+            return False
+        right_ref = self._render_relation(node.right, context)
+        if right_ref is None:
+            return False
+        keyword = _JOIN_KEYWORDS[node.join_type]
+        context.joins.append(f"{keyword} LATERAL {right_ref} ON TRUE")
+        context.has_join = True
+        context.has_derived_columns = True
+        return True
 
     def _absorb_limit(self, limit: Limit, context: _PushContext) -> bool:
         """Record LIMIT / OFFSET, then descend."""
@@ -314,7 +342,28 @@ class SingleSourcePushdown:
         if not self._claim_scan(scan, context):
             return False
         context.from_sql = self._scan_ref(scan)
+        self._absorb_scan_modifiers(scan, context)
         return True
+
+    def _absorb_scan_modifiers(self, scan: Scan, context: _PushContext) -> None:
+        """Render an ORDER BY / LIMIT the optimizer folded onto a base scan.
+
+        A folded sort or row-limit leaves no Sort/Limit node, so it is read
+        straight off the scan; an explicit node above already populated these,
+        so a clause that is present is never overwritten.
+        """
+        self._adopt_scan_order(scan, context)
+        self._adopt_scan_limit(scan, context)
+
+    def _adopt_scan_order(self, scan: Scan, context: _PushContext) -> None:
+        """Adopt a scan's folded ORDER BY unless a Sort node already set one."""
+        if scan.order_by_keys and context.order_sql is None:
+            context.order_sql = self._scan_order_sql(scan)
+
+    def _adopt_scan_limit(self, scan: Scan, context: _PushContext) -> None:
+        """Adopt a scan's folded LIMIT unless a Limit node already set one."""
+        if scan.limit is not None and context.limit is None:
+            context.limit = scan.limit
 
     def _absorb_aggregate_scan(self, scan: Scan, context: _PushContext) -> bool:
         """Render a scan carrying folded aggregates/GROUP BY as the FROM source.
@@ -328,10 +377,58 @@ class SingleSourcePushdown:
             return False
         if not context.select_items:
             self._set_select(scan.aggregates, scan.output_names, context)
+        self._split_scan_filter(scan, context)
         context.group_sql = self._render_group_by(scan)
         context.from_sql = self._scan_ref(scan)
         context.has_aggregate = True
         return True
+
+    def _split_scan_filter(self, scan: Scan, context: _PushContext) -> None:
+        """Route a folded aggregate-scan filter into WHERE or HAVING.
+
+        The optimizer folds both WHERE and HAVING into one scan filter.
+        A conjunct that references an aggregate output is a HAVING term; its
+        synthetic output references (e.g. ``__subq_0_h1``, which decorrelation
+        hoisted out of ``COUNT(*)``) are substituted back to the aggregate
+        expression so the source sees ``HAVING COUNT(*) > 10``.
+        """
+        if scan.filters is None:
+            return
+        aggregate_map = self._aggregate_expr_map(scan)
+        for conjunct in _split_conjuncts(scan.filters):
+            self._route_conjunct(conjunct, aggregate_map, context)
+
+    def _route_conjunct(self, conjunct, aggregate_map, context: _PushContext) -> None:
+        """Place one conjunct in HAVING (aggregate refs resolved) or in WHERE."""
+        if self._references_aggregate(conjunct, aggregate_map):
+            resolved = self._substitute_aggregate_refs(conjunct, aggregate_map)
+            context.having_terms.append(resolved.to_sql())
+        else:
+            context.where_terms.append(conjunct.to_sql())
+
+    def _aggregate_expr_map(self, scan: Scan) -> Dict[str, Expression]:
+        """Map each aggregate-function output name to its aggregate expression."""
+        mapping: Dict[str, Expression] = {}
+        for index in range(len(scan.output_names)):
+            expression = scan.aggregates[index]
+            if isinstance(expression, FunctionCall) and expression.is_aggregate:
+                mapping[scan.output_names[index]] = expression
+        return mapping
+
+    def _references_aggregate(self, expr: Expression, aggregate_map) -> bool:
+        """Whether an expression references any aggregate-output column."""
+        for ref in _expression_column_refs(expr):
+            if ref.column in aggregate_map:
+                return True
+        return False
+
+    def _substitute_aggregate_refs(self, expr: Expression, aggregate_map) -> Expression:
+        """Replace aggregate-output column refs with their aggregate expressions."""
+        if isinstance(expr, ColumnRef):
+            return aggregate_map.get(expr.column, expr)
+        return _rebuild_expression(
+            expr, lambda child: self._substitute_aggregate_refs(child, aggregate_map)
+        )
 
     def _absorb_join(self, join: Join, context: _PushContext) -> bool:
         """Add one join to a left-deep tree, rendering its right relation.
@@ -432,16 +529,22 @@ class SingleSourcePushdown:
         """Confirm a plain (non-aggregate) scan shares the data source."""
         if scan.group_by or scan.aggregates:
             return False
-        return self._claim_source(scan, context)
+        if not self._claim_source(scan, context):
+            return False
+        self._claim_scan_filters(scan, context)
+        return True
+
+    def _claim_scan_filters(self, scan: Scan, context: _PushContext) -> None:
+        """Collect a plain scan's filters as WHERE terms."""
+        if scan.filters is not None:
+            context.where_terms.append(scan.filters.to_sql())
 
     def _claim_source(self, scan: Scan, context: _PushContext) -> bool:
-        """Bind the scan's data source and collect its filters into the context."""
+        """Bind the scan's data source; reject a cross-source scan."""
         if context.datasource is None:
             context.datasource = scan.datasource
         elif context.datasource != scan.datasource:
             return False
-        if scan.filters is not None:
-            context.where_terms.append(scan.filters.to_sql())
         context.scans.append(scan)
         return True
 
@@ -495,27 +598,34 @@ class SingleSourcePushdown:
         return f"{reference} AS {alias}"
 
     def _render_order(self, sort: Sort) -> str:
-        """Render the ORDER BY items with direction and NULLS handling."""
+        """Render a Sort node's ORDER BY items with direction and NULLS."""
+        return self._render_order_keys(sort.sort_keys, sort.ascending, sort.nulls_order)
+
+    def _scan_order_sql(self, scan: Scan) -> str:
+        """Render an ORDER BY the optimizer folded onto a scan."""
+        return self._render_order_keys(
+            scan.order_by_keys, scan.order_by_ascending, scan.order_by_nulls
+        )
+
+    def _render_order_keys(self, keys, ascending, nulls) -> str:
+        """Render ORDER BY items from key, direction, and NULLS-order lists."""
         items: List[str] = []
-        for index in range(len(sort.sort_keys)):
-            items.append(self._order_item(sort, index))
+        for index in range(len(keys)):
+            items.append(self._order_key_item(keys, ascending, nulls, index))
         return ", ".join(items)
 
-    def _order_item(self, sort: Sort, index: int) -> str:
-        """Render a single ORDER BY key with ASC/DESC and NULLS placement."""
-        item = sort.sort_keys[index].to_sql()
-        if sort.ascending and not sort.ascending[index]:
+    def _order_key_item(self, keys, ascending, nulls, index: int) -> str:
+        """Render one ORDER BY key with ASC/DESC and NULLS placement."""
+        item = keys[index].to_sql()
+        if ascending and not ascending[index]:
             item = f"{item} DESC"
-        return self._with_nulls(item, sort, index)
+        return self._order_key_nulls(item, nulls, index)
 
-    def _with_nulls(self, item: str, sort: Sort, index: int) -> str:
+    def _order_key_nulls(self, item: str, nulls, index: int) -> str:
         """Append NULLS FIRST/LAST to an ORDER BY item when specified."""
-        if not sort.nulls_order or index >= len(sort.nulls_order):
+        if not nulls or index >= len(nulls) or not nulls[index]:
             return item
-        spec = sort.nulls_order[index]
-        if not spec:
-            return item
-        return f"{item} NULLS {spec}"
+        return f"{item} NULLS {nulls[index]}"
 
     def _render_group_by(self, aggregate: Aggregate) -> Optional[str]:
         """Render the GROUP BY clause, or None when the aggregate is global."""
@@ -534,6 +644,7 @@ class SingleSourcePushdown:
         query = f"{select_kw} {select_list} FROM {from_sql}"
         query = self._append_where(query, context)
         query = self._append_group_by(query, context)
+        query = self._append_having(query, context)
         return self._append_order_limit(query, context)
 
     def _from_clause(self, context: _PushContext) -> str:
@@ -555,6 +666,13 @@ class SingleSourcePushdown:
         if context.group_sql:
             query = f"{query} GROUP BY {context.group_sql}"
         return query
+
+    def _append_having(self, query: str, context: _PushContext) -> str:
+        """Append the HAVING clause from collected post-aggregate terms."""
+        if not context.having_terms:
+            return query
+        predicate = " AND ".join(context.having_terms)
+        return f"{query} HAVING {predicate}"
 
     def _append_order_limit(self, query: str, context: _PushContext) -> str:
         """Append ORDER BY, LIMIT, and OFFSET clauses when present."""

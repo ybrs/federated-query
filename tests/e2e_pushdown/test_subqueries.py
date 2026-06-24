@@ -56,11 +56,15 @@ def _assert_no_subquery_expressions(ast):
 
 
 def _assert_only_relation_subqueries(ast):
-    """Assert every surviving Subquery sits in FROM/JOIN (relation) position."""
+    """Assert every surviving Subquery sits in a relation position.
+
+    FROM/JOIN derived tables and the derived table of a ``LATERAL`` (dependent)
+    join are relations, not subquery expressions, and are allowed.
+    """
     for subquery in ast.find_all(exp.Subquery):
         parent = subquery.parent
         assert isinstance(
-            parent, (exp.From, exp.Join)
+            parent, (exp.From, exp.Join, exp.Lateral)
         ), "scalar subquery survived decorrelation"
 
 
@@ -177,11 +181,6 @@ def test_scalar_subquery_avg_comparison(single_source_env):
     _assert_no_subquery_expressions(ast)
 
 
-@pytest.mark.xfail(
-    reason="decorrelation gap: scalar subquery in HAVING not yet flattened to a "
-    "join input (decorrelation.py / HAVING-as-join-input rendering)",
-    strict=False,
-)
 def test_scalar_subquery_in_having(single_source_env):
     """A scalar subquery in HAVING pushes as a LEFT JOIN over the aggregate."""
     runtime = build_runtime(single_source_env)
@@ -300,6 +299,75 @@ def test_correlated_count_scalar_pushed_result_matches_source(single_source_env)
     _assert_push_matches_source(single_source_env, sql)
 
 
+def test_correlated_scalar_order_limit_matches_source(single_source_env):
+    """A correlated scalar ``ORDER BY … LIMIT 1`` (pick-one) matches the source.
+
+    Decorrelates to a LEFT JOIN with an order-aware per-key limit; verified by
+    comparing engine output to the same SQL on the raw source.
+    """
+    runtime = build_runtime(single_source_env)
+    sql = (
+        "SELECT o.order_id, "
+        "  (SELECT p.name FROM duckdb_primary.main.products p "
+        "   WHERE p.id = o.product_id ORDER BY p.name LIMIT 1) AS pname "
+        "FROM duckdb_primary.main.orders o"
+    )
+    result = runtime.execute(sql)
+    engine_rows = list(zip(result.column(0).to_pylist(), result.column(1).to_pylist()))
+    raw_sql = sql.replace("duckdb_primary.main.", "main.")
+    source = single_source_env.datasources[0].connection
+    raw_rows = source.execute(raw_sql).fetchall()
+    assert sorted(engine_rows) == sorted(raw_rows)
+
+
+def _assert_two_col_matches_source(single_source_env, sql):
+    """Run a two-column query in the engine and compare to the raw source."""
+    runtime = build_runtime(single_source_env)
+    result = runtime.execute(sql)
+    engine_rows = list(zip(result.column(0).to_pylist(), result.column(1).to_pylist()))
+    source = single_source_env.datasources[0].connection
+    raw_rows = source.execute(sql.replace("duckdb_primary.main.", "main.")).fetchall()
+    assert sorted(engine_rows) == sorted(raw_rows)
+
+
+# Non-equi correlated scalars -> LATERAL join (dependent join), same source
+
+
+def test_non_equi_scalar_aggregate_in_where_lateral(single_source_env):
+    """A non-equi correlated scalar aggregate in WHERE pushes as a LATERAL join."""
+    runtime = build_runtime(single_source_env)
+    sql = (
+        "SELECT order_id FROM duckdb_primary.main.orders o "
+        "WHERE price < (SELECT MAX(p.price) FROM duckdb_primary.main.products p "
+        "               WHERE p.price < o.price)"
+    )
+    ast = explain_datasource_query(runtime, sql)
+    assert ast.find(exp.Lateral) is not None
+    _assert_no_subquery_expressions(ast)
+
+
+def test_non_equi_scalar_aggregate_in_select_matches_source(single_source_env):
+    """A non-equi correlated scalar SUM in SELECT matches the raw source."""
+    sql = (
+        "SELECT o.order_id, "
+        "  (SELECT SUM(p.price) FROM duckdb_primary.main.products p "
+        "   WHERE p.id > o.product_id) AS total "
+        "FROM duckdb_primary.main.orders o"
+    )
+    _assert_two_col_matches_source(single_source_env, sql)
+
+
+def test_non_equi_scalar_order_limit_matches_source(single_source_env):
+    """A non-equi correlated ``ORDER BY … LIMIT 1`` scalar matches the source."""
+    sql = (
+        "SELECT o.order_id, "
+        "  (SELECT p.name FROM duckdb_primary.main.products p "
+        "   WHERE p.price < o.price ORDER BY p.name LIMIT 1) AS pname "
+        "FROM duckdb_primary.main.orders o"
+    )
+    _assert_two_col_matches_source(single_source_env, sql)
+
+
 # Nested Subqueries
 
 
@@ -401,11 +469,6 @@ def test_multiple_subqueries_in_where(single_source_env):
 # Subqueries whose body itself needs decorrelation work (known gaps)
 
 
-@pytest.mark.xfail(
-    reason="decorrelation gap: GROUP BY/HAVING subquery body -- _peel_values_top "
-    "rejects a Filter(HAVING) top and HAVING renders as WHERE on push",
-    strict=False,
-)
 def test_subquery_with_group_by(single_source_env):
     """An IN over a GROUP BY/HAVING body pushes as a SEMI JOIN to a derived agg."""
     runtime = build_runtime(single_source_env)
@@ -421,11 +484,6 @@ def test_subquery_with_group_by(single_source_env):
     _assert_no_subquery_expressions(ast)
 
 
-@pytest.mark.xfail(
-    reason="decorrelation gap: ORDER BY/LIMIT subquery body not peeled into a "
-    "join input (_peel_values_top)",
-    strict=False,
-)
 def test_subquery_with_order_by_limit(single_source_env):
     """An IN over an ORDER BY/LIMIT body pushes as a SEMI JOIN to a derived rel."""
     runtime = build_runtime(single_source_env)

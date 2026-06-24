@@ -22,6 +22,7 @@ from ..plan.logical import (
     SubqueryScan,
     SingleRowGuard,
     GroupedLimit,
+    LateralJoin,
 )
 from ..plan.physical import (
     PhysicalPlanNode,
@@ -128,7 +129,23 @@ class PhysicalPlanner:
             return PhysicalValues(rows=node.rows, output_names=node.output_names)
         if isinstance(node, SubqueryScan):
             return self._plan_node(node.input)
+        if isinstance(node, LateralJoin):
+            return self._plan_lateral_join(node)
         return self._plan_guard_node(node)
+
+    def _plan_lateral_join(self, node: LateralJoin) -> PhysicalPlanNode:
+        """A LATERAL (dependent) join only runs when pushed to a single source.
+
+        Same-source lateral joins are rendered into one remote query by
+        single-source pushdown before reaching here. A lateral whose two sides
+        live on different sources needs a cross-source dependent-join executor
+        (materialize the inner relation's domain, batch one query per source),
+        which is not built yet — so it fails fast rather than guessing.
+        """
+        raise ValueError(
+            "Cross-source LATERAL (dependent join) is not supported yet: the "
+            "correlated subquery and its outer query are on different sources"
+        )
 
     def _plan_guard_node(self, node: LogicalPlanNode) -> PhysicalPlanNode:
         """Plan cardinality guard and per-key limit nodes."""
@@ -138,7 +155,12 @@ class PhysicalPlanner:
             )
         if isinstance(node, GroupedLimit):
             return PhysicalGroupedLimit(
-                input=self._plan_node(node.input), keys=node.keys, limit=node.limit
+                input=self._plan_node(node.input),
+                keys=node.keys,
+                limit=node.limit,
+                order_by_keys=node.order_by_keys,
+                order_by_ascending=node.order_by_ascending,
+                order_by_nulls=node.order_by_nulls,
             )
         raise ValueError(f"Unsupported logical plan node: {type(node)}")
 

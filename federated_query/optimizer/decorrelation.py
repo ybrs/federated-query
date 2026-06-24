@@ -47,6 +47,7 @@ from ..plan.logical import (
     SubqueryScan,
     SingleRowGuard,
     GroupedLimit,
+    LateralJoin,
 )
 from ..plan.expressions import (
     Expression,
@@ -190,6 +191,15 @@ def _split_conjuncts(expr: Expression) -> List[Expression]:
     if isinstance(expr, BinaryOp) and expr.op == BinaryOpType.AND:
         return _split_conjuncts(expr.left) + _split_conjuncts(expr.right)
     return [expr]
+
+
+def _needs_lateral(error: "DecorrelationError") -> bool:
+    """Whether a flattening failure should fall back to a LATERAL join.
+
+    A non-equality correlation crossing an aggregate or LIMIT cannot become a
+    set-based per-key join, but a LATERAL evaluates it correctly per outer row.
+    """
+    return "equality correlation predicates can cross" in str(error)
 
 
 def _split_disjuncts(expr: Expression) -> List[Expression]:
@@ -462,6 +472,9 @@ class _SubqueryPreparer:
         self.inner_aliases: Set[str] = set()
         self.pulled: List[Expression] = []
         self.pending_limit: Optional[int] = None
+        # ORDER BY a recorded LIMIT caps, captured for the per-key limit so a
+        # correlated "ORDER BY ... LIMIT n" keeps the first n rows per key.
+        self.pending_order: Optional[Sort] = None
 
     def prepare_exists(self, subquery: LogicalPlanNode) -> _PreparedSubquery:
         """Prepare an EXISTS subquery: only correlation columns matter."""
@@ -490,7 +503,8 @@ class _SubqueryPreparer:
         """Prepare an IN/ANY/ALL subquery: expose its value columns."""
         plan = self.decorrelator._rewrite_plan(subquery)
         self.inner_aliases = _collect_inner_aliases(plan)
-        core, value_exprs = self._peel_values_top(plan)
+        allow_wrappers = not self._is_correlated(plan)
+        core, value_exprs = self._peel_values_top(plan, allow_wrappers)
         for value_expr in value_exprs:
             if self._references_outer(value_expr):
                 raise DecorrelationError(
@@ -506,12 +520,25 @@ class _SubqueryPreparer:
         """Prepare a scalar subquery: single value plus cardinality rules."""
         plan = self.decorrelator._rewrite_plan(subquery)
         self.inner_aliases = _collect_inner_aliases(plan)
-        if isinstance(plan, Limit):
-            self._record_limit(plan)
-            plan = plan.input
+        plan = self._peel_scalar_limit_order(plan)
         if isinstance(plan, Aggregate):
             return self._prepare_scalar_aggregate(plan)
         return self._prepare_scalar_row(plan)
+
+    def _peel_scalar_limit_order(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Peel a top LIMIT and the ORDER BY it caps into pending state.
+
+        ``SELECT … WHERE k = outer.k ORDER BY c LIMIT n`` becomes a per-key
+        limit: the LIMIT count and the ORDER BY are recorded here and reattached
+        as an order-aware GroupedLimit once the join side is assembled.
+        """
+        if isinstance(plan, Limit):
+            self._record_limit(plan)
+            plan = plan.input
+        if self.pending_limit is not None and isinstance(plan, Sort):
+            self.pending_order = plan
+            plan = plan.input
+        return plan
 
     def _record_limit(self, limit: Limit) -> None:
         """Record a subquery-level LIMIT for later placement."""
@@ -597,7 +624,7 @@ class _SubqueryPreparer:
         stripped = self._strip(core)
         value_name = f"{self.prefix}_v0"
         prepared = self._assemble(stripped, value_exprs, [value_name])
-        guarded = self._guard_scalar(prepared, needs_guard=True)
+        guarded = self._guard_scalar(prepared, needs_guard=self.pending_limit != 1)
         return _PreparedScalar(
             plan=guarded,
             condition=prepared.condition,
@@ -633,12 +660,19 @@ class _SubqueryPreparer:
         return names
 
     def _peel_values_top(
-        self, plan: LogicalPlanNode
+        self, plan: LogicalPlanNode, allow_wrappers: bool = False
     ) -> Tuple[LogicalPlanNode, List[Expression]]:
-        """Split a subquery into its core and its output value expressions."""
+        """Split a subquery into its core and its output value expressions.
+
+        ``allow_wrappers`` keeps a Sort or HAVING filter as part of the value
+        relation; it is enabled only for uncorrelated value subqueries, where
+        an ORDER BY/LIMIT or HAVING applies to the whole result set. A
+        correlated subquery would need per-key handling the engine lacks, so it
+        keeps failing fast rather than producing a wrong answer.
+        """
         if isinstance(plan, Limit):
             self._record_limit(plan)
-            return self._peel_values_top(plan.input)
+            return self._peel_values_top(plan.input, allow_wrappers)
         if isinstance(plan, Projection):
             self._reject_star_values(plan.expressions)
             return plan.input, list(plan.expressions)
@@ -646,9 +680,23 @@ class _SubqueryPreparer:
             return self._peel_values_node(plan)
         if isinstance(plan, Aggregate):
             return plan, self._aggregate_value_refs(plan)
+        if allow_wrappers and isinstance(plan, (Sort, Filter)):
+            return self._peel_values_wrapper(plan)
         raise DecorrelationError(
             f"Unsupported subquery output shape: {type(plan).__name__}"
         )
+
+    def _peel_values_wrapper(
+        self, plan: LogicalPlanNode
+    ) -> Tuple[LogicalPlanNode, List[Expression]]:
+        """Peel a Sort or HAVING filter, keeping it wrapped around the core.
+
+        An ORDER BY/LIMIT or a HAVING clause shapes the subquery's result set,
+        so unlike a value projection it cannot be discarded — it stays as part
+        of the value relation while the value columns are taken from below it.
+        """
+        inner_core, value_exprs = self._peel_values_top(plan.input, True)
+        return replace(plan, input=inner_core), value_exprs
 
     def _reject_star_values(self, expressions: List[Expression]) -> None:
         """A star projection has no determinate value columns."""
@@ -913,11 +961,44 @@ class _SubqueryPreparer:
         aliases.extend(value_names)
         if len(expressions) == 0:
             raise DecorrelationError("Subquery rewrite produced no output columns")
+        non_keys = list(value_names)
+        order = self._build_order(expressions, aliases, non_keys)
         plan: LogicalPlanNode = Projection(
             input=core, expressions=expressions, aliases=aliases
         )
-        plan = self._apply_pending_limit(plan, aliases, value_names)
+        plan = self._apply_pending_limit(plan, aliases, non_keys, order)
         return _PreparedSubquery(plan=plan, condition=condition, values=value_names)
+
+    def _build_order(self, expressions, aliases, non_keys):
+        """Map a pending ORDER BY onto projected aliases, projecting any missing.
+
+        Returns ``(order_keys, ascending, nulls)`` referencing output aliases, or
+        None. An ordering column that is not already selected is added as an
+        extra projected output (and marked a non-key so it is not grouped on).
+        """
+        if self.pending_order is None:
+            return None
+        order_keys: List[Expression] = []
+        for sort_key in self.pending_order.sort_keys:
+            alias = self._order_alias(sort_key, expressions, aliases, non_keys)
+            order_keys.append(ColumnRef(table=None, column=alias))
+        return (
+            order_keys,
+            self.pending_order.ascending,
+            self.pending_order.nulls_order,
+        )
+
+    def _order_alias(self, sort_key, expressions, aliases, non_keys) -> str:
+        """Alias of a projected ORDER BY column, projecting it as an extra if absent."""
+        target = sort_key.to_sql()
+        for index in range(len(expressions)):
+            if expressions[index].to_sql() == target:
+                return aliases[index]
+        alias = f"{self.prefix}_o{len(aliases)}"
+        expressions.append(sort_key)
+        aliases.append(alias)
+        non_keys.append(alias)
+        return alias
 
     def _expose_correlation_columns(
         self,
@@ -980,18 +1061,56 @@ class _SubqueryPreparer:
         self,
         plan: LogicalPlanNode,
         aliases: List[str],
-        value_names: List[str],
+        non_keys: List[str],
+        order,
     ) -> LogicalPlanNode:
         """Re-attach a recorded subquery LIMIT, per-key when correlated."""
         if self.pending_limit is None:
             return plan
         keys: List[Expression] = []
         for alias in aliases:
-            if alias not in value_names:
+            if alias not in non_keys:
                 keys.append(ColumnRef(table=None, column=alias))
         if len(keys) == 0:
-            return Limit(input=plan, limit=self.pending_limit, offset=0)
-        return GroupedLimit(input=plan, keys=keys, limit=self.pending_limit)
+            return self._unkeyed_limit(plan, order)
+        self._require_equi_correlation_for_limit()
+        return self._keyed_limit(plan, keys, order)
+
+    def _require_equi_correlation_for_limit(self) -> None:
+        """A per-key LIMIT is only correct under equi-correlation.
+
+        Each outer row must map to exactly one key group; a non-equality
+        correlation (``p.price < o.price``) matches many groups, so a per-key
+        limit would not be a per-outer-row limit. Such a shape needs a general
+        dependent join and is rejected rather than answered wrongly.
+        """
+        for predicate in self.pulled:
+            if not isinstance(predicate, BinaryOp) or predicate.op != BinaryOpType.EQ:
+                raise DecorrelationError(
+                    "Only equality correlation predicates can cross an "
+                    f"aggregate or limit, got: {predicate.to_sql()}"
+                )
+
+    def _unkeyed_limit(self, plan: LogicalPlanNode, order) -> LogicalPlanNode:
+        """A plain LIMIT, ordered when the subquery had ORDER BY ... LIMIT."""
+        if order is not None:
+            plan = Sort(
+                input=plan, sort_keys=order[0], ascending=order[1], nulls_order=order[2]
+            )
+        return Limit(input=plan, limit=self.pending_limit, offset=0)
+
+    def _keyed_limit(self, plan: LogicalPlanNode, keys, order) -> LogicalPlanNode:
+        """A per-key (grouped) LIMIT, ordered within each key when requested."""
+        if order is None:
+            return GroupedLimit(input=plan, keys=keys, limit=self.pending_limit)
+        return GroupedLimit(
+            input=plan,
+            keys=keys,
+            limit=self.pending_limit,
+            order_by_keys=order[0],
+            order_by_ascending=order[1],
+            order_by_nulls=order[2],
+        )
 
 
 class Decorrelator:
@@ -1537,8 +1656,18 @@ class Decorrelator:
     def _join_scalar(
         self, expr: SubqueryExpression, plan: LogicalPlanNode
     ) -> Tuple[Expression, LogicalPlanNode]:
-        """LEFT-join a scalar subquery's value onto the plan."""
-        prepared = self._preparer().prepare_scalar(expr.subquery)
+        """LEFT-join a scalar subquery's value onto the plan.
+
+        Pattern-based flattening is tried first; a correlation that cannot be
+        flattened to a set-based join (non-equality crossing an aggregate or
+        LIMIT) falls back to a LATERAL join the executing engine decorrelates.
+        """
+        try:
+            prepared = self._preparer().prepare_scalar(expr.subquery)
+        except DecorrelationError as error:
+            if not _needs_lateral(error):
+                raise
+            return self._lateral_scalar(expr, plan)
         condition = prepared.condition
         if condition is None:
             condition = Literal(value=True, data_type=DataType.BOOLEAN)
@@ -1549,6 +1678,34 @@ class Decorrelator:
             condition=condition,
         )
         return prepared.replacement, joined
+
+    def _lateral_scalar(
+        self, expr: SubqueryExpression, plan: LogicalPlanNode
+    ) -> Tuple[Expression, LogicalPlanNode]:
+        """Build a LATERAL join for a correlated scalar that cannot flatten.
+
+        The subquery's own inner subqueries are decorrelated, its single value
+        is projected under a fresh name, and the outer correlation is left in
+        place for the LATERAL to evaluate per left row.
+        """
+        body = self._rewrite_plan(expr.subquery)
+        value_name = f"{self._next_prefix()}_v0"
+        right = self._project_lateral_value(body, value_name)
+        joined = LateralJoin(left=plan, right=right, join_type=JoinType.LEFT)
+        return ColumnRef(table=None, column=value_name), joined
+
+    def _project_lateral_value(
+        self, node: LogicalPlanNode, value_name: str
+    ) -> LogicalPlanNode:
+        """Rename a single-column subquery body's output to ``value_name``."""
+        if isinstance(node, Projection):
+            return replace(node, aliases=[value_name])
+        if isinstance(node, Aggregate):
+            return replace(node, output_names=[value_name])
+        if isinstance(node, (Limit, Sort, Filter)):
+            inner = self._project_lateral_value(node.input, value_name)
+            return node.with_children([inner])
+        raise DecorrelationError("Unsupported scalar subquery body for LATERAL")
 
     def _join_flag(
         self, expr: Expression, plan: LogicalPlanNode

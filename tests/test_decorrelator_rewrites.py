@@ -18,6 +18,7 @@ from federated_query.plan.logical import (
     Union,
     SingleRowGuard,
     GroupedLimit,
+    LateralJoin,
     Projection,
 )
 from federated_query.plan.expressions import (
@@ -147,8 +148,7 @@ def test_any_becomes_semi_join_with_operator(catalog):
     """op ANY keeps the comparison operator in the SEMI condition."""
     plan = decorrelate(
         catalog,
-        "SELECT id FROM pg.users "
-        "WHERE id > ANY (SELECT user_id FROM pg.orders)",
+        "SELECT id FROM pg.users " "WHERE id > ANY (SELECT user_id FROM pg.orders)",
     )
     join = the_join(plan, JoinType.SEMI)
     assert ">" in condition_sql(join)
@@ -158,8 +158,7 @@ def test_all_becomes_anti_join_over_violations(catalog):
     """op ALL anti-joins against violations with NULL guards."""
     plan = decorrelate(
         catalog,
-        "SELECT id FROM pg.users "
-        "WHERE id <= ALL (SELECT user_id FROM pg.orders)",
+        "SELECT id FROM pg.users " "WHERE id <= ALL (SELECT user_id FROM pg.orders)",
     )
     join = the_join(plan, JoinType.ANTI)
     sql = condition_sql(join)
@@ -288,11 +287,13 @@ def test_plan_without_subqueries_unchanged_in_shape(catalog):
     assert repr(rewritten.input) == repr(bound.input)
 
 
-def test_correlated_non_equality_through_aggregate_rejected(catalog):
-    """Non-equality correlation cannot legally cross an aggregate."""
-    with pytest.raises(DecorrelationError, match="equality"):
-        decorrelate(
-            catalog,
-            "SELECT u.id, (SELECT SUM(o.amount) FROM pg.orders o "
-            "WHERE o.user_id > u.id) AS total FROM pg.users u",
-        )
+def test_correlated_non_equality_through_aggregate_uses_lateral(catalog):
+    """Non-equality correlation across an aggregate can't flatten to a set-based
+    join, so it falls back to a LATERAL join (the engine evaluates it per row).
+    """
+    plan = decorrelate(
+        catalog,
+        "SELECT u.id, (SELECT SUM(o.amount) FROM pg.orders o "
+        "WHERE o.user_id > u.id) AS total FROM pg.users u",
+    )
+    assert len(find_all(plan, LateralJoin)) == 1
