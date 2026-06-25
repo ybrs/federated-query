@@ -11,6 +11,8 @@ from federated_query.config import ExecutorConfig
 
 
 def test_select_star_join_with_duplicate_column_names(catalog, setup_test_data):
+    """SELECT * over a join keeps duplicate column names (both id columns),
+    matching PostgreSQL, and returns the expected row/column counts."""
     runtime = FedQRuntime(catalog, ExecutorConfig())
     sql = (
         "SELECT * FROM default.pg.users U, default.pg.orders O "

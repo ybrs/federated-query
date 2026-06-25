@@ -1274,6 +1274,7 @@ class Binder:
         return UnaryOp(op=unary_op.op, operand=operand)
 
     def _bind_in_list(self, expr: InList, table: Optional[Table]) -> InList:
+        """Bind an IN-list's value and each option against a single table."""
         bound_value = self._bind_expression(expr.value, table)
         bound_options: List[Expression] = []
         for option in expr.options:
@@ -1284,6 +1285,7 @@ class Binder:
     def _bind_in_list_multi(
         self, expr: InList, tables: Dict[Optional[str], Table]
     ) -> InList:
+        """Bind an IN-list across multiple tables (multi-relation scope)."""
         bound_value = self._bind_expression_multi_table(expr.value, tables)
         bound_options: List[Expression] = []
         for option in expr.options:
@@ -1294,6 +1296,7 @@ class Binder:
     def _bind_between(
         self, expr: BetweenExpression, table: Optional[Table]
     ) -> BetweenExpression:
+        """Bind a BETWEEN's value/lower/upper operands against a single table."""
         bound_value = self._bind_expression(expr.value, table)
         bound_lower = self._bind_expression(expr.lower, table)
         bound_upper = self._bind_expression(expr.upper, table)
@@ -1306,6 +1309,7 @@ class Binder:
     def _bind_between_multi(
         self, expr: BetweenExpression, tables: Dict[Optional[str], Table]
     ) -> BetweenExpression:
+        """Bind a BETWEEN expression across multiple tables (multi-relation scope)."""
         bound_value = self._bind_expression_multi_table(expr.value, tables)
         bound_lower = self._bind_expression_multi_table(expr.lower, tables)
         bound_upper = self._bind_expression_multi_table(expr.upper, tables)
@@ -1316,6 +1320,7 @@ class Binder:
         )
 
     def _bind_case_expr(self, expr: CaseExpr, table: Optional[Table]) -> CaseExpr:
+        """Bind a CASE expression's WHEN conditions/results and ELSE on one table."""
         bound_when = []
         for condition, result in expr.when_clauses:
             bound_condition = self._bind_expression(condition, table)
@@ -1329,6 +1334,7 @@ class Binder:
     def _bind_case_expr_multi(
         self, expr: CaseExpr, tables: Dict[Optional[str], Table]
     ) -> CaseExpr:
+        """Bind a CASE expression across multiple tables (multi-relation scope)."""
         bound_when = []
         for condition, result in expr.when_clauses:
             bound_condition = self._bind_expression_multi_table(condition, tables)

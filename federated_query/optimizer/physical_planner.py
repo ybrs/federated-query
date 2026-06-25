@@ -403,6 +403,7 @@ class PhysicalPlanner:
     def _plan_remote_join_aggregate(
         self, aggregate: Aggregate, remote_join: PhysicalRemoteJoin
     ) -> PhysicalRemoteJoin:
+        """Fold an aggregate onto a remote join so both push as one remote query."""
         return PhysicalRemoteJoin(
             left=remote_join.left,
             right=remote_join.right,
@@ -489,38 +490,43 @@ class PhysicalPlanner:
         return scans
 
     def _plan_join(self, join: Join) -> PhysicalPlanNode:
-        """Plan a join node."""
+        """Plan a join: try remote pushdown, then a hash join, else nested loop."""
         left_plan = self._plan_node(join.left)
         right_plan = self._plan_node(join.right)
 
         remote = self._try_plan_remote_join(join, left_plan, right_plan)
         if remote:
             return remote
-
-        if join.condition is None:
-            return PhysicalNestedLoopJoin(
-                left=left_plan,
-                right=right_plan,
-                join_type=join.join_type,
-                condition=None,
-            )
-
-        join_keys = self._extract_join_keys(join.condition)
-        if join_keys:
-            left_keys, right_keys = self._orient_join_keys(join_keys, join)
-            hash_join = PhysicalHashJoin(
-                left=left_plan,
-                right=right_plan,
-                join_type=join.join_type,
-                left_keys=left_keys,
-                right_keys=right_keys,
-                build_side=self._choose_build_side(
-                    join.join_type, left_plan, right_plan
-                ),
-            )
-            self._mark_dynamic_filter(hash_join)
+        hash_join = self._plan_hash_join_or_none(join, left_plan, right_plan)
+        if hash_join:
             return hash_join
+        return self._plan_nested_loop(join, left_plan, right_plan)
 
+    def _plan_hash_join_or_none(
+        self, join: Join, left_plan: PhysicalPlanNode, right_plan: PhysicalPlanNode
+    ) -> Optional[PhysicalPlanNode]:
+        """Build a hash join when the condition yields equi-join keys, else None."""
+        if join.condition is None:
+            return None
+        join_keys = self._extract_join_keys(join.condition)
+        if not join_keys:
+            return None
+        left_keys, right_keys = self._orient_join_keys(join_keys, join)
+        hash_join = PhysicalHashJoin(
+            left=left_plan,
+            right=right_plan,
+            join_type=join.join_type,
+            left_keys=left_keys,
+            right_keys=right_keys,
+            build_side=self._choose_build_side(join.join_type, left_plan, right_plan),
+        )
+        self._mark_dynamic_filter(hash_join)
+        return hash_join
+
+    def _plan_nested_loop(
+        self, join: Join, left_plan: PhysicalPlanNode, right_plan: PhysicalPlanNode
+    ) -> PhysicalNestedLoopJoin:
+        """Fall back to a nested-loop join (no equi-keys, or no join condition)."""
         return PhysicalNestedLoopJoin(
             left=left_plan,
             right=right_plan,
@@ -706,6 +712,11 @@ class PhysicalPlanner:
     def _try_plan_remote_join(
         self, join: Join, left_plan: PhysicalPlanNode, right_plan: PhysicalPlanNode
     ) -> Optional[PhysicalPlanNode]:
+        """Build a single-source PhysicalRemoteJoin when both sides allow it.
+
+        Carries either side's pushed ORDER BY onto the remote join; returns None
+        when the join is not a same-source candidate (see _is_remote_join_candidate).
+        """
         if not self._is_remote_join_candidate(join, left_plan, right_plan):
             return None
         order_keys = None
@@ -737,6 +748,8 @@ class PhysicalPlanner:
     def _is_remote_join_candidate(
         self, join: Join, left_plan: PhysicalPlanNode, right_plan: PhysicalPlanNode
     ) -> bool:
+        """Whether a join can run on one source: INNER/LEFT/RIGHT with a condition
+        and both sides plain scans on the same datasource and connection."""
         allowed = {JoinType.INNER, JoinType.LEFT, JoinType.RIGHT}
         if join.join_type not in allowed or join.condition is None:
             return False

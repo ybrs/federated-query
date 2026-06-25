@@ -14,6 +14,11 @@ from federated_query.datasources.postgresql import PostgreSQLDataSource
 
 
 def _fetch(datasource, query) -> pa.Table:
+    """Run query on datasource and collect its Arrow batches into one Table.
+
+    Calls datasource.execute_query(query) (an iterator of pyarrow RecordBatches)
+    and returns them assembled as a single pyarrow.Table for easy comparison.
+    """
     return pa.Table.from_batches(list(datasource.execute_query(query)))
 
 

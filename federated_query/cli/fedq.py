@@ -57,6 +57,7 @@ def _serialize_explain_document(document: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _serialize_queries(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert each remote-query entry to a datasource name plus SQL string."""
     serialized: List[Dict[str, Any]] = []
     for entry in entries:
         datasource = entry.get("datasource_name")
@@ -71,6 +72,7 @@ def _serialize_queries(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _stringify_query_value(query_value: Any) -> str:
+    """Render a query value as Postgres SQL text, or "NULL" when missing."""
     if hasattr(query_value, "sql"):
         return query_value.sql(dialect="postgres")
     if query_value is None:
@@ -82,6 +84,7 @@ class FedQRuntime:
     """Wraps the parse → bind → optimize → plan → execute pipeline."""
 
     def __init__(self, catalog: Catalog, executor_config: ExecutorConfig):
+        """Assemble and warm up the full query-execution pipeline."""
         self.catalog = catalog
         self.parser = Parser()
         self.binder = Binder(catalog)
@@ -129,9 +132,11 @@ class ResultPrinter:
     """Formats Arrow tables for CLI display."""
 
     def __init__(self, emit):
+        """Store the callable used to emit each output line."""
         self.emit = emit
 
     def display(self, table: pa.Table, elapsed_ms: float) -> None:
+        """Render the table as an ASCII grid and emit a row count and timing."""
         rows = self._build_rows(table)
         headers = list(table.schema.names)
         lines = self._format_table(headers, rows)
@@ -141,6 +146,7 @@ class ResultPrinter:
         self.emit(summary)
 
     def _build_rows(self, table: pa.Table) -> List[List[object]]:
+        """Transpose the table's columns into a list of row value lists."""
         columns = self._collect_columns(table)
         rows: List[List[object]] = []
         row_index = 0
@@ -155,6 +161,7 @@ class ResultPrinter:
         return rows
 
     def _collect_columns(self, table: pa.Table) -> List[List[object]]:
+        """Materialize each table column as a Python list of values."""
         columns: List[List[object]] = []
         column_index = 0
         while column_index < table.num_columns:
@@ -164,6 +171,7 @@ class ResultPrinter:
         return columns
 
     def _format_table(self, headers: List[str], rows: List[List[object]]) -> List[str]:
+        """Build the bordered header-and-rows lines for the ASCII grid."""
         widths = self._compute_widths(headers, rows)
         border = self._build_border(widths)
         lines: List[str] = []
@@ -181,6 +189,7 @@ class ResultPrinter:
         headers: List[str],
         rows: List[List[object]],
     ) -> List[int]:
+        """Compute each column's width as the longest header or cell text."""
         widths: List[int] = []
         index = 0
         while index < len(headers):
@@ -197,6 +206,7 @@ class ResultPrinter:
         return widths
 
     def _build_border(self, widths: List[int]) -> str:
+        """Render the horizontal border row for the table at the given column widths."""
         parts: List[str] = []
         parts.append("+")
         index = 0
@@ -207,6 +217,7 @@ class ResultPrinter:
         return "".join(parts)
 
     def _format_row(self, values: List[str], widths: List[int]) -> str:
+        """Render one pipe-delimited row with each value left-padded to its width."""
         parts: List[str] = []
         parts.append("|")
         index = 0
@@ -219,12 +230,14 @@ class ResultPrinter:
         return "".join(parts)
 
     def _stringify_row(self, row: List[object]) -> List[str]:
+        """Convert every cell in a row to its display string."""
         string_values: List[str] = []
         for value in row:
             string_values.append(self._stringify_cell(value))
         return string_values
 
     def _stringify_cell(self, value: object) -> str:
+        """Render a single cell value as text, showing None as "NULL"."""
         if value is None:
             return "NULL"
         return str(value)
@@ -234,9 +247,11 @@ class CatalogPrinter:
     """Prints catalog metadata in a readable format."""
 
     def __init__(self, emit):
+        """Store the callable used to emit each output line."""
         self.emit = emit
 
     def display_catalog(self, catalog: Catalog) -> None:
+        """Print all catalog schemas, or a notice when the catalog is empty."""
         if not catalog.schemas:
             self.emit("Catalog is empty.")
             return
@@ -245,6 +260,7 @@ class CatalogPrinter:
         self._print_schemas(catalog)
 
     def _print_schemas(self, catalog: Catalog) -> None:
+        """Print each schema's header and tables in sorted datasource/schema order."""
         for key in sorted(catalog.schemas.keys()):
             datasource, schema_name = key
             schema = catalog.schemas[key]
@@ -253,11 +269,13 @@ class CatalogPrinter:
             self.emit("")
 
     def _print_schema_header(self, datasource: str, schema_name: str) -> None:
+        """Print the data source and schema name with an underline rule."""
         header = f"\nData Source: {datasource}, Schema: {schema_name}"
         self.emit(header)
         self.emit("-" * len(header))
 
     def _print_tables(self, datasource: str, schema_name: str, schema) -> None:
+        """Print each table's fully qualified name and columns in sorted order."""
         for table_name in sorted(schema.tables.keys()):
             table = schema.tables[table_name]
             full_name = f"{datasource}.{schema_name}.{table_name}"
@@ -265,6 +283,7 @@ class CatalogPrinter:
             self._print_columns(table)
 
     def _print_columns(self, table) -> None:
+        """Print each column's name, data type, and nullability for the table."""
         self.emit("  Columns:")
         for column in table.columns:
             nullable = "NULL" if column.nullable else "NOT NULL"
@@ -281,6 +300,7 @@ class FedQRepl:
         catalog_printer: CatalogPrinter,
         catalog: Catalog,
     ):
+        """Store the runtime, printers, and catalog, and open a prompt session."""
         self.runtime = runtime
         self.printer = printer
         self.catalog_printer = catalog_printer
@@ -303,6 +323,7 @@ class FedQRepl:
         return history_path
 
     def run(self) -> None:
+        """Run the read-eval-print loop, dispatching exits, shortcuts, and SQL."""
         buffer: List[str] = []
         while True:
             line, should_continue = self._read_line(buffer)
@@ -322,6 +343,10 @@ class FedQRepl:
                 self._execute_query(statement)
 
     def _read_line(self, buffer: List[str]) -> Tuple[Optional[str], bool]:
+        """Read one prompt line, returning the line and whether to keep looping.
+
+        EOF stops the loop; an interrupt clears the buffer and continues.
+        """
         prompt = self._get_prompt(buffer)
         try:
             line = self.session.prompt(prompt)
@@ -335,11 +360,13 @@ class FedQRepl:
             return None, True
 
     def _get_prompt(self, buffer: List[str]) -> str:
+        """Return the continuation prompt mid-statement, else the primary prompt."""
         if buffer:
             return "...> "
         return "fedq> "
 
     def _is_exit_command(self, line: str) -> bool:
+        """Return whether the line is one of the recognized exit commands."""
         trimmed = line.strip().lower()
         exit_commands = ["\\q", "quit", "exit"]
         for command in exit_commands:
@@ -348,10 +375,12 @@ class FedQRepl:
         return False
 
     def _is_shortcut_command(self, line: str) -> bool:
+        """Return whether the line is a dot-prefixed shortcut command."""
         trimmed = line.strip()
         return trimmed.startswith(".")
 
     def _execute_shortcut(self, line: str) -> None:
+        """Run the .catalog shortcut, or report an unknown shortcut."""
         trimmed = line.strip().lower()
         if trimmed == ".catalog":
             self.catalog_printer.display_catalog(self.catalog)
@@ -360,9 +389,11 @@ class FedQRepl:
             click.echo("Available shortcuts: .catalog")
 
     def _is_complete_statement(self, line: str) -> bool:
+        """Return whether the line ends with a semicolon terminating a statement."""
         return line.strip().endswith(";")
 
     def _build_statement(self, buffer: List[str]) -> str:
+        """Join the buffered input lines into a single newline-separated statement."""
         parts: List[str] = []
         for chunk in buffer:
             parts.append(chunk)
@@ -370,6 +401,7 @@ class FedQRepl:
         return statement
 
     def _execute_query(self, statement: str) -> None:
+        """Run a statement, display its result or EXPLAIN output, and report errors."""
         clean = self._clean_statement(statement)
         if not clean:
             return
@@ -403,6 +435,7 @@ class FedQRepl:
             click.echo(report)
 
     def _clean_statement(self, statement: str) -> str:
+        """Strip surrounding whitespace and the trailing semicolon from a statement."""
         clean = statement.strip()
         if clean.endswith(";"):
             clean = clean[:-1].rstrip()
@@ -412,6 +445,7 @@ class FedQRepl:
 def _prepare_runtime(
     config_path: Optional[str],
 ) -> Tuple[FedQRuntime, Catalog, str]:
+    """Load config, build the catalog and runtime, and return them with any note."""
     config, message = _load_config_bundle(config_path)
     catalog = _build_catalog(config, message is not None)
     runtime = FedQRuntime(catalog, config.executor)
@@ -422,6 +456,7 @@ def _prepare_runtime(
 
 
 def _load_config_bundle(config_path: Optional[str]) -> Tuple[Config, Optional[str]]:
+    """Load config from the given path, or fall back to the in-memory demo config."""
     if config_path:
         config = load_config(config_path)
         return config, None
@@ -431,6 +466,7 @@ def _load_config_bundle(config_path: Optional[str]) -> Tuple[Config, Optional[st
 
 
 def _build_default_config() -> Config:
+    """Build a config with a single in-memory DuckDB data source for the demo."""
     config = Config()
     ds_config = DataSourceConfig(
         name="duckdb_mem",
@@ -443,6 +479,7 @@ def _build_default_config() -> Config:
 
 
 def _build_catalog(config: Config, seed_demo: bool) -> Catalog:
+    """Connect each configured data source, optionally seed demo data, and load metadata."""
     catalog = Catalog()
     for ds_config in config.datasources.values():
         datasource = _create_datasource(ds_config)
@@ -455,6 +492,7 @@ def _build_catalog(config: Config, seed_demo: bool) -> Catalog:
 
 
 def _create_datasource(ds_config: DataSourceConfig):
+    """Instantiate the data source connector matching the config type."""
     if ds_config.type == "duckdb":
         return DuckDBDataSource(ds_config.name, ds_config.config)
     if ds_config.type == "postgresql":
@@ -465,6 +503,7 @@ def _create_datasource(ds_config: DataSourceConfig):
 
 
 def _seed_demo_data(datasource: DuckDBDataSource) -> None:
+    """Create and populate the demo_users table on the data source's connection."""
     connection = datasource.connection
     if connection is None:
         return
@@ -473,6 +512,7 @@ def _seed_demo_data(datasource: DuckDBDataSource) -> None:
 
 
 def _create_demo_users(connection) -> None:
+    """Create the demo_users table if it does not already exist."""
     sql = """
         CREATE TABLE IF NOT EXISTS demo_users (
             id INTEGER,
@@ -485,6 +525,7 @@ def _create_demo_users(connection) -> None:
 
 
 def _insert_demo_users(connection) -> None:
+    """Replace the demo_users rows with the fixed set of demo records."""
     sql = """
         INSERT INTO demo_users VALUES
         (1, 'Alice', 30, 'New York'),

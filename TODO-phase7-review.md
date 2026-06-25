@@ -1,5 +1,11 @@
 # Phase 7 Review — TODO
 
+> HISTORICAL SNAPSHOT. This is a running review log from the Phase 7/8 work; the
+> pass/fail counts scattered through it (766/19, 743/48, "remaining 95", "125
+> failing", etc.) are stale snapshots from different points in time and do NOT
+> agree with each other by design. Current status is 809 passing / 0 failed /
+> 0 xfailed — see `tasks.md` for the authoritative roadmap and state.
+
 > ## Physical Merge Engine (DuckDB local execution) — **DONE (2026-06-15)**
 > The local row-at-a-time Python operators now run vectorized in a reused
 > in-memory **DuckDB coordinator** (`executor/merge_engine.py`). Migrated

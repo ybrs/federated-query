@@ -520,6 +520,7 @@ class PredicatePushdownRule(OptimizationRule):
         return children
 
     def name(self) -> str:
+        """Return this rule's identifier (used in logging and EXPLAIN)."""
         return "PredicatePushdown"
 
 
@@ -750,6 +751,7 @@ class ProjectionPushdownRule(OptimizationRule):
         return local_required.union(parent_required)
 
     def name(self) -> str:
+        """Return this rule's identifier (used in logging and EXPLAIN)."""
         return "ProjectionPushdown"
 
 
@@ -972,6 +974,7 @@ class LimitPushdownRule(OptimizationRule):
         )
 
     def name(self) -> str:
+        """Return this rule's identifier (used in logging and EXPLAIN)."""
         return "LimitPushdown"
 
 
@@ -979,11 +982,13 @@ class JoinReorderingRule(OptimizationRule):
     """Reorder joins for better performance."""
 
     def apply(self, plan: LogicalPlanNode) -> Optional[LogicalPlanNode]:
+        """Reorder joins by cost. Not yet implemented (deferred to Phase 10)."""
         # TODO: Implement cost-based join reordering
         # Requires integration with Phase 5 cost model
         raise NotImplementedError()
 
     def name(self) -> str:
+        """Return this rule's identifier (used in logging and EXPLAIN)."""
         return "JoinReordering"
 
 
@@ -1512,6 +1517,7 @@ class OrderByPushdownRule(OptimizationRule):
         return Aggregate(new_input, agg.group_by, agg.aggregates, agg.output_names)
 
     def name(self) -> str:
+        """Return this rule's identifier (used in logging and EXPLAIN)."""
         return "OrderByPushdown"
 
 
@@ -1637,6 +1643,7 @@ class AggregatePushdownRule(OptimizationRule):
         return Join(new_left, new_right, join.join_type, join.condition)
 
     def name(self) -> str:
+        """Return this rule's identifier (used in logging and EXPLAIN)."""
         return "AggregatePushdown"
 
 
