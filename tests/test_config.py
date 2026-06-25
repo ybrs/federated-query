@@ -59,7 +59,7 @@ datasources:
     user: test
     password: test
 """
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
         f.write(minimal_yaml)
         config_path = f.name
 
@@ -99,7 +99,7 @@ datasources:
       - joins
       - window_functions
 """
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
         f.write(config_yaml)
         config_path = f.name
 
@@ -136,7 +136,7 @@ datasources:
     type: duckdb
     path: /path/to/db.duckdb
 """
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
         f.write(config_yaml)
         config_path = f.name
 
@@ -171,7 +171,7 @@ optimizer:
   enable_join_reordering: false
   max_join_reorder_size: 20
 """
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
         f.write(config_yaml)
         config_path = f.name
 
@@ -201,7 +201,7 @@ executor:
   batch_size: 50000
   max_threads: 16
 """
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
         f.write(config_yaml)
         config_path = f.name
 

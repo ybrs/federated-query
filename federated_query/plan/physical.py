@@ -393,18 +393,20 @@ def _resolved_column_ref(expr, aliases):
 
 
 def _resolve_function_columns(expr, aliases):
-    """Rebuild a FunctionCall with each argument's columns resolved."""
-    from .expressions import FunctionCall
+    """Rebuild a FunctionCall with each argument's columns resolved.
+
+    ``replace`` preserves every other field (including the ordered-set WITHIN
+    GROUP key, which is also resolved), so no field is silently dropped.
+    """
+    from dataclasses import replace
 
     new_args = []
     for arg in expr.args:
         new_args.append(_resolve_window_columns(arg, aliases))
-    return FunctionCall(
-        function_name=expr.function_name,
-        args=new_args,
-        is_aggregate=expr.is_aggregate,
-        distinct=expr.distinct,
-    )
+    new_key = expr.within_group_key
+    if new_key is not None:
+        new_key = _resolve_window_columns(new_key, aliases)
+    return replace(expr, args=new_args, within_group_key=new_key)
 
 
 def _resolve_window_expr(expr, aliases):
@@ -826,12 +828,24 @@ class PhysicalProjection(PhysicalPlanNode):
     expressions: List[Expression]
     output_names: List[str]
     distinct: bool = False
+    distinct_on: Optional[List[Expression]] = None
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
 
     def execute(self) -> Iterator[pa.RecordBatch]:
-        """Execute projection, de-duplicating rows when SELECT DISTINCT."""
+        """Execute projection, de-duplicating rows when SELECT DISTINCT.
+
+        DISTINCT ON is only correct when pushed to a source (or the merge
+        engine), where ORDER BY chooses the surviving row; the local pyarrow
+        path cannot honor that, so it fails fast rather than guess.
+        """
+        if self.distinct_on is not None:
+            from ..parser.errors import UnsupportedSQLError
+
+            raise UnsupportedSQLError(
+                "DISTINCT ON is only supported when the query pushes to a single source"
+            )
         if not self.distinct:
             for batch in self.input.execute():
                 yield self._project_batch(batch)
@@ -2345,25 +2359,39 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         return True
 
     def _agg_expr_renderable(self, expr: Expression) -> bool:
-        """A group column, or an aggregate function over plain column arguments."""
+        """A group column, or an aggregate the merge engine can render to SQL."""
         from .expressions import ColumnRef, FunctionCall
 
         if isinstance(expr, ColumnRef):
             return True
-        return (
-            isinstance(expr, FunctionCall)
-            and expr.is_aggregate
-            and self._args_are_columns(expr)
-        )
+        if not isinstance(expr, FunctionCall):
+            return False
+        return self._function_renderable(expr)
 
-    def _args_are_columns(self, func: "FunctionCall") -> bool:
-        """True when every aggregate argument is a plain column reference."""
-        from .expressions import ColumnRef
+    def _function_renderable(self, func: "FunctionCall") -> bool:
+        """An aggregate with renderable args and, if ordered-set, a column sort key."""
+        if not func.is_aggregate:
+            return False
+        if not self._args_are_renderable(func):
+            return False
+        return self._within_group_renderable(func)
+
+    def _args_are_renderable(self, func: "FunctionCall") -> bool:
+        """True when every aggregate argument is a plain column or a literal."""
+        from .expressions import ColumnRef, Literal
 
         for arg in func.args:
-            if not isinstance(arg, ColumnRef):
+            if not isinstance(arg, (ColumnRef, Literal)):
                 return False
         return True
+
+    def _within_group_renderable(self, func: "FunctionCall") -> bool:
+        """An ordered-set aggregate is renderable when its sort key is a column."""
+        from .expressions import ColumnRef
+
+        if func.within_group_key is None:
+            return True
+        return isinstance(func.within_group_key, ColumnRef)
 
     def _execute_merge_aggregate(self, engine) -> Iterator[pa.RecordBatch]:
         """Run the GROUP BY through DuckDB, casting output to the declared schema."""
@@ -2398,12 +2426,14 @@ class PhysicalHashAggregate(PhysicalPlanNode):
 
     def _render_agg_expr(self, expr: Expression, aliases) -> str:
         """Render a column or aggregate against the input's physical column names."""
-        from .expressions import ColumnRef
+        from .expressions import ColumnRef, Literal
 
         if isinstance(expr, ColumnRef):
             if expr.column == "*":
                 return "*"
             return f'"{self._resolve_agg_column(expr, aliases)}"'
+        if isinstance(expr, Literal):
+            return expr.to_sql()
         return self._render_agg_function(expr, aliases)
 
     def _resolve_agg_column(self, expr, aliases) -> str:
@@ -2415,13 +2445,27 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         return expr.column
 
     def _render_agg_function(self, func: "FunctionCall", aliases) -> str:
-        """Render an aggregate call, preserving DISTINCT and COUNT(*)."""
+        """Render an aggregate call (DISTINCT, COUNT(*), and WITHIN GROUP)."""
         name = func.function_name.upper()
         distinct = "DISTINCT " if func.distinct else ""
-        inner = "*"
+        call = f"{name}({distinct}{self._render_agg_inner(func, aliases)})"
+        if func.within_group_key is None:
+            return call
+        order = self._render_within_group_order(func, aliases)
+        return f"{call} WITHIN GROUP (ORDER BY {order})"
+
+    def _render_agg_inner(self, func: "FunctionCall", aliases) -> str:
+        """Render an aggregate's direct arguments (empty for MODE, '*' for COUNT)."""
         if func.args:
-            inner = self._render_agg_expr(func.args[0], aliases)
-        return f"{name}({distinct}{inner})"
+            return self._render_agg_expr(func.args[0], aliases)
+        if func.within_group_key is not None:
+            return ""
+        return "*"
+
+    def _render_within_group_order(self, func: "FunctionCall", aliases) -> str:
+        """Render the ORDER BY key of an ordered-set aggregate for the merge engine."""
+        direction = " DESC" if func.within_group_desc else ""
+        return f"{self._render_agg_expr(func.within_group_key, aliases)}{direction}"
 
     def _supports_streaming(self) -> bool:
         """Return True when streaming aggregation can evaluate all expressions."""
@@ -2431,6 +2475,8 @@ class PhysicalHashAggregate(PhysicalPlanNode):
             if isinstance(expr, ColumnRef):
                 return True
             if isinstance(expr, FunctionCall) and expr.is_aggregate:
+                if expr.within_group_key is not None:
+                    return False
                 return all(is_supported(arg) for arg in expr.args)
             return False
 

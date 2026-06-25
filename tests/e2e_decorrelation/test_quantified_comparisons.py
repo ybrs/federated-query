@@ -4,6 +4,7 @@ E2E tests for quantified comparison decorrelation (ANY/SOME/ALL).
 Tests ALL, ANY, and SOME quantified comparisons with various operators,
 focusing on NULL handling and duplicate semantics.
 """
+
 import pytest
 from federated_query.parser.parser import Parser
 from federated_query.parser.binder import Binder
@@ -13,7 +14,7 @@ from .test_utils import (
     assert_plan_structure,
     assert_result_count,
     assert_result_contains_ids,
-    execute_and_fetch_all
+    execute_and_fetch_all,
 )
 
 
@@ -655,10 +656,8 @@ class TestQuantifiedComplexQueries:
         bound_plan = binder.bind(logical_plan)
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
-        assert_plan_structure(decorrelated_plan, {
-            'has_anti_join': True
-        })
+        assert_plan_structure(decorrelated_plan, {"has_anti_join": True})
 
         results = execute_and_fetch_all(executor, decorrelated_plan)
         assert len(results) == 4, "Should produce boolean for each sale"
-        assert 'within_cap' in results[0], "Boolean column should exist"
+        assert "within_cap" in results[0], "Boolean column should exist"

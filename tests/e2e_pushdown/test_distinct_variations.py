@@ -42,10 +42,7 @@ def test_distinct_multiple_columns(single_source_env):
 def test_distinct_with_where(single_source_env):
     """Checks DISTINCT combined with WHERE clause pushes together."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT DISTINCT region FROM duckdb_primary.main.orders "
-        "WHERE price > 100"
-    )
+    sql = "SELECT DISTINCT region FROM duckdb_primary.main.orders " "WHERE price > 100"
     ast = explain_datasource_query(runtime, sql)
 
     distinct = ast.args.get("distinct")
@@ -125,10 +122,7 @@ def test_distinct_with_aggregation(single_source_env):
 def test_distinct_with_order_by_not_in_select(single_source_env):
     """Checks DISTINCT with ORDER BY on column not in SELECT."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT DISTINCT region FROM duckdb_primary.main.orders "
-        "ORDER BY region"
-    )
+    sql = "SELECT DISTINCT region FROM duckdb_primary.main.orders " "ORDER BY region"
     ast = explain_datasource_query(runtime, sql)
 
     distinct = ast.args.get("distinct")

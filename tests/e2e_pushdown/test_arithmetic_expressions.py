@@ -68,10 +68,7 @@ def test_complex_arithmetic_expression(single_source_env):
 def test_modulo_operator_in_predicate(single_source_env):
     """Ensures modulo operator pushes down for filtering even/odd values."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE quantity % 2 = 0"
-    )
+    sql = "SELECT order_id FROM duckdb_primary.main.orders " "WHERE quantity % 2 = 0"
     ast = explain_datasource_query(runtime, sql)
 
     where_clause = ast.args.get("where")
@@ -94,8 +91,7 @@ def test_division_in_where_clause(single_source_env):
     """Validates division expression pushes down correctly."""
     runtime = build_runtime(single_source_env)
     sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE price / quantity < 10"
+        "SELECT order_id FROM duckdb_primary.main.orders " "WHERE price / quantity < 10"
     )
     ast = explain_datasource_query(runtime, sql)
 
@@ -117,10 +113,7 @@ def test_division_in_where_clause(single_source_env):
 def test_unary_minus_operator(single_source_env):
     """Checks unary minus operator pushes down for negation."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE -price < -50"
-    )
+    sql = "SELECT order_id FROM duckdb_primary.main.orders " "WHERE -price < -50"
     ast = explain_datasource_query(runtime, sql)
 
     where_clause = ast.args.get("where")

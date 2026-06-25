@@ -130,6 +130,7 @@ def test_bind_resolves_column_types(catalog_with_test_data):
         # Check that expressions have types
         for expr in current.expressions:
             from federated_query.plan.expressions import ColumnRef
+
             if isinstance(expr, ColumnRef):
                 # Should have type set
                 assert expr.data_type is not None

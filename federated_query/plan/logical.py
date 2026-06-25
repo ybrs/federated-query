@@ -151,13 +151,22 @@ class Projection(LogicalPlanNode):
     expressions: List[Expression]
     aliases: List[str]  # Output column names
     distinct: bool = False
+    # DISTINCT ON (keys): keep one row per key combination (chosen by ORDER BY).
+    # None for a plain projection; an empty/non-empty list implies DISTINCT ON.
+    distinct_on: Optional[List[Expression]] = None
 
     def children(self) -> List[LogicalPlanNode]:
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Projection":
         assert len(children) == 1
-        return Projection(children[0], self.expressions, self.aliases, self.distinct)
+        return Projection(
+            children[0],
+            self.expressions,
+            self.aliases,
+            self.distinct,
+            self.distinct_on,
+        )
 
     def accept(self, visitor):
         return visitor.visit_projection(self)

@@ -44,40 +44,35 @@ class TestFunctionCallColumnExtraction:
             datasource="test_ds",
             schema_name="public",
             table_name="orders",
-            columns=["id", "customer_id", "amount"]
+            columns=["id", "customer_id", "amount"],
         )
         right_scan = Scan(
             datasource="test_ds",
             schema_name="public",
             table_name="customers",
-            columns=["id", "name", "credit_limit"]
+            columns=["id", "name", "credit_limit"],
         )
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER)
+            right=ColumnRef("customers", "id", DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
             right=right_scan,
             join_type=JoinType.INNER,
-            condition=join_condition
+            condition=join_condition,
         )
 
         # Filter with FunctionCall: ABS(o.amount - c.credit_limit) > 100
         abs_arg = BinaryOp(
             op=BinaryOpType.SUBTRACT,
             left=ColumnRef(None, "amount", DataType.DECIMAL),
-            right=ColumnRef(None, "credit_limit", DataType.DECIMAL)
+            right=ColumnRef(None, "credit_limit", DataType.DECIMAL),
         )
-        abs_call = FunctionCall(
-            function_name="ABS",
-            args=[abs_arg]
-        )
+        abs_call = FunctionCall(function_name="ABS", args=[abs_arg])
         predicate = BinaryOp(
-            op=BinaryOpType.GT,
-            left=abs_call,
-            right=Literal(100, DataType.DECIMAL)
+            op=BinaryOpType.GT, left=abs_call, right=Literal(100, DataType.DECIMAL)
         )
         filter_node = Filter(join, predicate)
 
@@ -85,8 +80,12 @@ class TestFunctionCallColumnExtraction:
         result = rule.apply(filter_node)
 
         # Filter should stay ABOVE join (references both sides)
-        assert isinstance(result, Filter), f"Expected Filter above join, got {type(result).__name__}"
-        assert isinstance(result.input, Join), f"Expected Join below filter, got {type(result.input).__name__}"
+        assert isinstance(
+            result, Filter
+        ), f"Expected Filter above join, got {type(result).__name__}"
+        assert isinstance(
+            result.input, Join
+        ), f"Expected Join below filter, got {type(result.input).__name__}"
 
     def test_filter_with_coalesce_referencing_both_sides(self):
         """Test COALESCE with columns from both join sides.
@@ -102,24 +101,24 @@ class TestFunctionCallColumnExtraction:
             datasource="test_ds",
             schema_name="public",
             table_name="orders",
-            columns=["id", "customer_id", "priority"]
+            columns=["id", "customer_id", "priority"],
         )
         right_scan = Scan(
             datasource="test_ds",
             schema_name="public",
             table_name="customers",
-            columns=["id", "name", "default_priority"]
+            columns=["id", "name", "default_priority"],
         )
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER)
+            right=ColumnRef("customers", "id", DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
             right=right_scan,
             join_type=JoinType.INNER,
-            condition=join_condition
+            condition=join_condition,
         )
 
         # COALESCE(o.priority, c.default_priority) = 'high'
@@ -127,13 +126,13 @@ class TestFunctionCallColumnExtraction:
             function_name="COALESCE",
             args=[
                 ColumnRef(None, "priority", DataType.VARCHAR),
-                ColumnRef(None, "default_priority", DataType.VARCHAR)
-            ]
+                ColumnRef(None, "default_priority", DataType.VARCHAR),
+            ],
         )
         predicate = BinaryOp(
             op=BinaryOpType.EQ,
             left=coalesce_call,
-            right=Literal("high", DataType.VARCHAR)
+            right=Literal("high", DataType.VARCHAR),
         )
         filter_node = Filter(join, predicate)
 
@@ -157,35 +156,32 @@ class TestFunctionCallColumnExtraction:
             datasource="test_ds",
             schema_name="public",
             table_name="orders",
-            columns=["id", "customer_id"]
+            columns=["id", "customer_id"],
         )
         right_scan = Scan(
             datasource="test_ds",
             schema_name="public",
             table_name="customers",
-            columns=["id", "name"]
+            columns=["id", "name"],
         )
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER)
+            right=ColumnRef("customers", "id", DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
             right=right_scan,
             join_type=JoinType.INNER,
-            condition=join_condition
+            condition=join_condition,
         )
 
         # UPPER(c.name) = 'ACME'
         upper_call = FunctionCall(
-            function_name="UPPER",
-            args=[ColumnRef(None, "name", DataType.VARCHAR)]
+            function_name="UPPER", args=[ColumnRef(None, "name", DataType.VARCHAR)]
         )
         predicate = BinaryOp(
-            op=BinaryOpType.EQ,
-            left=upper_call,
-            right=Literal("ACME", DataType.VARCHAR)
+            op=BinaryOpType.EQ, left=upper_call, right=Literal("ACME", DataType.VARCHAR)
         )
         filter_node = Filter(join, predicate)
 
@@ -218,17 +214,17 @@ class TestFilterThroughProjectionBug:
             datasource="test_ds",
             schema_name="public",
             table_name="users",
-            columns=["id", "name", "age"]
+            columns=["id", "name", "age"],
         )
         project = Projection(
             input=scan,
             expressions=[ColumnRef(None, "id", DataType.INTEGER)],
-            aliases=["id"]
+            aliases=["id"],
         )
         predicate = BinaryOp(
             op=BinaryOpType.GT,
             left=ColumnRef(None, "id", DataType.INTEGER),
-            right=Literal(10, DataType.INTEGER)
+            right=Literal(10, DataType.INTEGER),
         )
         filter_node = Filter(project, predicate)
 
@@ -236,15 +232,18 @@ class TestFilterThroughProjectionBug:
         result = rule.apply(filter_node)
 
         # Filter should be BELOW projection
-        assert isinstance(result, Projection), f"Expected Projection, got {type(result).__name__}"
+        assert isinstance(
+            result, Projection
+        ), f"Expected Projection, got {type(result).__name__}"
 
         # Filter should be pushed down (either as Filter node or merged into Scan)
         # Both Projection(Filter(Scan)) and Projection(Scan with filters) are valid
-        is_pushed = (
-            isinstance(result.input, Filter) or
-            (isinstance(result.input, Scan) and result.input.filters is not None)
+        is_pushed = isinstance(result.input, Filter) or (
+            isinstance(result.input, Scan) and result.input.filters is not None
         )
-        assert is_pushed, f"Filter should be pushed below projection, got {type(result.input).__name__}"
+        assert (
+            is_pushed
+        ), f"Filter should be pushed below projection, got {type(result.input).__name__}"
 
     def test_filter_on_unprojected_column_pushes_below(self):
         """Test that filter on column available in input pushes below projection.
@@ -260,17 +259,17 @@ class TestFilterThroughProjectionBug:
             datasource="test_ds",
             schema_name="public",
             table_name="users",
-            columns=["id", "name", "age"]
+            columns=["id", "name", "age"],
         )
         project = Projection(
             input=scan,
             expressions=[ColumnRef(None, "id", DataType.INTEGER)],
-            aliases=["id"]
+            aliases=["id"],
         )
         predicate = BinaryOp(
             op=BinaryOpType.GT,
             left=ColumnRef(None, "age", DataType.INTEGER),
-            right=Literal(18, DataType.INTEGER)
+            right=Literal(18, DataType.INTEGER),
         )
         filter_node = Filter(project, predicate)
 
@@ -280,9 +279,8 @@ class TestFilterThroughProjectionBug:
         # Filter should push below projection (age available in scan)
         assert isinstance(result, Projection)
         # Either Filter(Scan) or Scan with filters
-        is_pushed = (
-            isinstance(result.input, Filter) or
-            (isinstance(result.input, Scan) and result.input.filters is not None)
+        is_pushed = isinstance(result.input, Filter) or (
+            isinstance(result.input, Scan) and result.input.filters is not None
         )
         assert is_pushed, "Filter should push below projection"
 
@@ -309,12 +307,12 @@ class TestColumnDetectionForWrappedJoins:
             datasource="test_ds",
             schema_name="public",
             table_name="orders",
-            columns=["id", "customer_id", "amount"]
+            columns=["id", "customer_id", "amount"],
         )
         left_predicate = BinaryOp(
             op=BinaryOpType.GT,
             left=ColumnRef(None, "amount", DataType.DECIMAL),
-            right=Literal(50, DataType.DECIMAL)
+            right=Literal(50, DataType.DECIMAL),
         )
         left_filtered = Filter(left_scan, left_predicate)
 
@@ -323,26 +321,26 @@ class TestColumnDetectionForWrappedJoins:
             datasource="test_ds",
             schema_name="public",
             table_name="customers",
-            columns=["id", "name", "status"]
+            columns=["id", "name", "status"],
         )
 
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER)
+            right=ColumnRef("customers", "id", DataType.INTEGER),
         )
         join = Join(
             left=left_filtered,  # Wrapped in Filter!
             right=right_scan,
             join_type=JoinType.INNER,
-            condition=join_condition
+            condition=join_condition,
         )
 
         # Filter on right side
         predicate = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("active", DataType.VARCHAR)
+            right=Literal("active", DataType.VARCHAR),
         )
         filter_node = Filter(join, predicate)
 
@@ -372,15 +370,15 @@ class TestColumnDetectionForWrappedJoins:
             datasource="test_ds",
             schema_name="public",
             table_name="orders",
-            columns=["id", "customer_id", "amount"]
+            columns=["id", "customer_id", "amount"],
         )
         left_project = Projection(
             input=left_scan,
             expressions=[
                 ColumnRef(None, "id", DataType.INTEGER),
-                ColumnRef(None, "customer_id", DataType.INTEGER)
+                ColumnRef(None, "customer_id", DataType.INTEGER),
             ],
-            aliases=["id", "customer_id"]
+            aliases=["id", "customer_id"],
         )
 
         # Right side: Projection(Scan(...))
@@ -388,34 +386,34 @@ class TestColumnDetectionForWrappedJoins:
             datasource="test_ds",
             schema_name="public",
             table_name="customers",
-            columns=["id", "name", "status"]
+            columns=["id", "name", "status"],
         )
         right_project = Projection(
             input=right_scan,
             expressions=[
                 ColumnRef(None, "id", DataType.INTEGER),
-                ColumnRef(None, "name", DataType.VARCHAR)
+                ColumnRef(None, "name", DataType.VARCHAR),
             ],
-            aliases=["id", "name"]
+            aliases=["id", "name"],
         )
 
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER)
+            right=ColumnRef("customers", "id", DataType.INTEGER),
         )
         join = Join(
             left=left_project,
             right=right_project,
             join_type=JoinType.INNER,
-            condition=join_condition
+            condition=join_condition,
         )
 
         # Filter on left side column
         predicate = BinaryOp(
             op=BinaryOpType.GT,
             left=ColumnRef(None, "customer_id", DataType.INTEGER),
-            right=Literal(100, DataType.INTEGER)
+            right=Literal(100, DataType.INTEGER),
         )
         filter_node = Filter(join, predicate)
 
@@ -428,9 +426,9 @@ class TestColumnDetectionForWrappedJoins:
         assert isinstance(result.left, Projection)
         # The filter should be below the project or in the scan
         # Either Projection(Filter(Scan)) or Projection(Scan with filters)
-        has_filter = (
-            isinstance(result.left.input, Filter) or
-            (isinstance(result.left.input, Scan) and result.left.input.filters is not None)
+        has_filter = isinstance(result.left.input, Filter) or (
+            isinstance(result.left.input, Scan)
+            and result.left.input.filters is not None
         )
         assert has_filter, "Filter should have been pushed below projection"
 
@@ -463,31 +461,31 @@ class TestTableQualifierBug:
             datasource="test_ds",
             schema_name="public",
             table_name="orders",
-            columns=["id", "customer_id", "amount"]
+            columns=["id", "customer_id", "amount"],
         )
         right_scan = Scan(
             datasource="test_ds",
             schema_name="public",
             table_name="customers",
-            columns=["id", "name", "credit_limit"]
+            columns=["id", "name", "credit_limit"],
         )
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER)
+            right=ColumnRef("customers", "id", DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
             right=right_scan,
             join_type=JoinType.INNER,
-            condition=join_condition
+            condition=join_condition,
         )
 
         # Filter: customers.id > 100 (QUALIFIED reference to right side)
         predicate = BinaryOp(
             op=BinaryOpType.GT,
             left=ColumnRef("customers", "id", DataType.INTEGER),
-            right=Literal(100, DataType.INTEGER)
+            right=Literal(100, DataType.INTEGER),
         )
         filter_node = Filter(join, predicate)
 
@@ -499,7 +497,9 @@ class TestTableQualifierBug:
 
         # Right side should have the filter
         assert isinstance(result.right, Scan)
-        assert result.right.filters is not None, "Filter should push to RIGHT side (customers)"
+        assert (
+            result.right.filters is not None
+        ), "Filter should push to RIGHT side (customers)"
 
         # Left side should NOT have this filter
         assert isinstance(result.left, Scan)
@@ -519,31 +519,31 @@ class TestTableQualifierBug:
             datasource="test_ds",
             schema_name="public",
             table_name="orders",
-            columns=["id", "customer_id", "amount"]
+            columns=["id", "customer_id", "amount"],
         )
         right_scan = Scan(
             datasource="test_ds",
             schema_name="public",
             table_name="customers",
-            columns=["id", "name", "credit_limit"]
+            columns=["id", "name", "credit_limit"],
         )
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER)
+            right=ColumnRef("customers", "id", DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
             right=right_scan,
             join_type=JoinType.INNER,
-            condition=join_condition
+            condition=join_condition,
         )
 
         # Filter: orders.id > 100 (QUALIFIED reference to left side)
         predicate = BinaryOp(
             op=BinaryOpType.GT,
             left=ColumnRef("orders", "id", DataType.INTEGER),
-            right=Literal(100, DataType.INTEGER)
+            right=Literal(100, DataType.INTEGER),
         )
         filter_node = Filter(join, predicate)
 
@@ -555,7 +555,9 @@ class TestTableQualifierBug:
 
         # Left side should have the filter
         assert isinstance(result.left, Scan)
-        assert result.left.filters is not None, "Filter should push to LEFT side (orders)"
+        assert (
+            result.left.filters is not None
+        ), "Filter should push to LEFT side (orders)"
 
     def test_unqualified_column_with_collision_stays_above_join(self):
         """Test unqualified column reference with name collision stays above join.
@@ -571,31 +573,31 @@ class TestTableQualifierBug:
             datasource="test_ds",
             schema_name="public",
             table_name="orders",
-            columns=["id", "customer_id", "amount"]
+            columns=["id", "customer_id", "amount"],
         )
         right_scan = Scan(
             datasource="test_ds",
             schema_name="public",
             table_name="customers",
-            columns=["id", "name", "credit_limit"]
+            columns=["id", "name", "credit_limit"],
         )
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER)
+            right=ColumnRef("customers", "id", DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
             right=right_scan,
             join_type=JoinType.INNER,
-            condition=join_condition
+            condition=join_condition,
         )
 
         # Filter: id > 100 (UNQUALIFIED - ambiguous!)
         predicate = BinaryOp(
             op=BinaryOpType.GT,
             left=ColumnRef(None, "id", DataType.INTEGER),  # No table qualifier!
-            right=Literal(100, DataType.INTEGER)
+            right=Literal(100, DataType.INTEGER),
         )
         filter_node = Filter(join, predicate)
 
@@ -620,36 +622,34 @@ class TestTableQualifierBug:
             datasource="test_ds",
             schema_name="public",
             table_name="orders",
-            columns=["id", "customer_id", "amount"]
+            columns=["id", "customer_id", "amount"],
         )
         right_scan = Scan(
             datasource="test_ds",
             schema_name="public",
             table_name="customers",
-            columns=["id", "name", "credit_limit"]
+            columns=["id", "name", "credit_limit"],
         )
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER)
+            right=ColumnRef("customers", "id", DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
             right=right_scan,
             join_type=JoinType.INNER,
-            condition=join_condition
+            condition=join_condition,
         )
 
         # orders.amount + customers.credit_limit > 1000
         sum_expr = BinaryOp(
             op=BinaryOpType.ADD,
             left=ColumnRef("orders", "amount", DataType.DECIMAL),
-            right=ColumnRef("customers", "credit_limit", DataType.DECIMAL)
+            right=ColumnRef("customers", "credit_limit", DataType.DECIMAL),
         )
         predicate = BinaryOp(
-            op=BinaryOpType.GT,
-            left=sum_expr,
-            right=Literal(1000, DataType.DECIMAL)
+            op=BinaryOpType.GT, left=sum_expr, right=Literal(1000, DataType.DECIMAL)
         )
         filter_node = Filter(join, predicate)
 
@@ -690,14 +690,14 @@ class TestTableAliasBug:
             schema_name="public",
             table_name="users",
             columns=["id", "name", "age"],
-            alias="u"  # Table is aliased as "u"
+            alias="u",  # Table is aliased as "u"
         )
 
         # Filter: u.age > 18 (uses alias "u")
         predicate = BinaryOp(
             op=BinaryOpType.GT,
             left=ColumnRef("u", "age", DataType.INTEGER),
-            right=Literal(18, DataType.INTEGER)
+            right=Literal(18, DataType.INTEGER),
         )
         filter_node = Filter(scan, predicate)
 
@@ -705,7 +705,9 @@ class TestTableAliasBug:
         result = rule.apply(filter_node)
 
         # Filter should push to scan
-        assert isinstance(result, Scan), f"Expected Scan with filter, got {type(result).__name__}"
+        assert isinstance(
+            result, Scan
+        ), f"Expected Scan with filter, got {type(result).__name__}"
         assert result.filters is not None, "Filter should push to scan"
 
     def test_aliased_join_filter_should_push(self):
@@ -723,32 +725,32 @@ class TestTableAliasBug:
             schema_name="public",
             table_name="orders",
             columns=["id", "customer_id", "amount"],
-            alias="o"  # Table is aliased as "o"
+            alias="o",  # Table is aliased as "o"
         )
         right_scan = Scan(
             datasource="test_ds",
             schema_name="public",
             table_name="customers",
             columns=["id", "name", "credit_limit"],
-            alias="c"  # Table is aliased as "c"
+            alias="c",  # Table is aliased as "c"
         )
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef("o", "customer_id", DataType.INTEGER),
-            right=ColumnRef("c", "id", DataType.INTEGER)
+            right=ColumnRef("c", "id", DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
             right=right_scan,
             join_type=JoinType.INNER,
-            condition=join_condition
+            condition=join_condition,
         )
 
         # Filter: o.amount > 100 (uses alias "o")
         predicate = BinaryOp(
             op=BinaryOpType.GT,
             left=ColumnRef("o", "amount", DataType.DECIMAL),
-            right=Literal(100, DataType.DECIMAL)
+            right=Literal(100, DataType.DECIMAL),
         )
         filter_node = Filter(join, predicate)
 
@@ -758,7 +760,9 @@ class TestTableAliasBug:
         # Filter should push to left side (orders)
         assert isinstance(result, Join), f"Expected Join, got {type(result).__name__}"
         assert isinstance(result.left, Scan)
-        assert result.left.filters is not None, "Filter should push to left side (orders)"
+        assert (
+            result.left.filters is not None
+        ), "Filter should push to left side (orders)"
 
     def test_mixed_alias_and_physical_name(self):
         """Test query mixing physical names and aliases.
@@ -775,43 +779,39 @@ class TestTableAliasBug:
             schema_name="public",
             table_name="orders",
             columns=["id", "customer_id", "amount"],
-            alias="o"  # Table is aliased as "o"
+            alias="o",  # Table is aliased as "o"
         )
         right_scan = Scan(
             datasource="test_ds",
             schema_name="public",
             table_name="customers",
-            columns=["id", "name", "status"]
+            columns=["id", "name", "status"],
             # No alias - uses physical table name
         )
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef("o", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER)
+            right=ColumnRef("customers", "id", DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
             right=right_scan,
             join_type=JoinType.INNER,
-            condition=join_condition
+            condition=join_condition,
         )
 
         # Filter: o.amount > 100 AND customers.status = 'active'
         left_pred = BinaryOp(
             op=BinaryOpType.GT,
             left=ColumnRef("o", "amount", DataType.DECIMAL),
-            right=Literal(100, DataType.DECIMAL)
+            right=Literal(100, DataType.DECIMAL),
         )
         right_pred = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef("customers", "status", DataType.VARCHAR),
-            right=Literal("active", DataType.VARCHAR)
+            right=Literal("active", DataType.VARCHAR),
         )
-        predicate = BinaryOp(
-            op=BinaryOpType.AND,
-            left=left_pred,
-            right=right_pred
-        )
+        predicate = BinaryOp(op=BinaryOpType.AND, left=left_pred, right=right_pred)
         filter_node = Filter(join, predicate)
 
         rule = PredicatePushdownRule()
@@ -851,7 +851,7 @@ class TestColumnPruningJoinKeyBug:
             schema_name="public",
             table_name="users",
             columns=["id", "name", "email"],
-            alias="u"
+            alias="u",
         )
 
         # Right scan: orders
@@ -860,28 +860,28 @@ class TestColumnPruningJoinKeyBug:
             schema_name="public",
             table_name="orders",
             columns=["id", "user_id", "amount"],
-            alias="o"
+            alias="o",
         )
 
         # Join condition: u.id = o.user_id
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef("u", "id", DataType.INTEGER),
-            right=ColumnRef("o", "user_id", DataType.INTEGER)
+            right=ColumnRef("o", "user_id", DataType.INTEGER),
         )
 
         join = Join(
             left=left_scan,
             right=right_scan,
             join_type=JoinType.INNER,
-            condition=join_condition
+            condition=join_condition,
         )
 
         # Projection: SELECT u.name (only projects name, not id!)
         project = Projection(
             input=join,
             expressions=[ColumnRef("u", "name", DataType.VARCHAR)],
-            aliases=["name"]
+            aliases=["name"],
         )
 
         rule = ProjectionPushdownRule()
@@ -897,12 +897,16 @@ class TestColumnPruningJoinKeyBug:
 
         # Left side (users) must have 'id' column for join condition
         assert isinstance(resulting_join.left, Scan)
-        assert "id" in resulting_join.left.columns, "users.id must be preserved for join key"
+        assert (
+            "id" in resulting_join.left.columns
+        ), "users.id must be preserved for join key"
         assert "name" in resulting_join.left.columns, "users.name needed for projection"
 
         # Right side (orders) must have 'user_id' column for join condition
         assert isinstance(resulting_join.right, Scan)
-        assert "user_id" in resulting_join.right.columns, "orders.user_id must be preserved for join key"
+        assert (
+            "user_id" in resulting_join.right.columns
+        ), "orders.user_id must be preserved for join key"
 
     def test_projection_over_filtered_join_preserves_filter_and_join_columns(self):
         """Test that both filter and join columns are preserved.
@@ -925,7 +929,7 @@ class TestColumnPruningJoinKeyBug:
             schema_name="public",
             table_name="users",
             columns=["id", "name", "email"],
-            alias="u"
+            alias="u",
         )
 
         # Right scan: orders
@@ -934,28 +938,28 @@ class TestColumnPruningJoinKeyBug:
             schema_name="public",
             table_name="orders",
             columns=["id", "user_id", "amount"],
-            alias="o"
+            alias="o",
         )
 
         # Join condition: u.id = o.user_id
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef("u", "id", DataType.INTEGER),
-            right=ColumnRef("o", "user_id", DataType.INTEGER)
+            right=ColumnRef("o", "user_id", DataType.INTEGER),
         )
 
         join = Join(
             left=left_scan,
             right=right_scan,
             join_type=JoinType.INNER,
-            condition=join_condition
+            condition=join_condition,
         )
 
         # Filter: o.amount > 100
         filter_pred = BinaryOp(
             op=BinaryOpType.GT,
             left=ColumnRef("o", "amount", DataType.DECIMAL),
-            right=Literal(100, DataType.DECIMAL)
+            right=Literal(100, DataType.DECIMAL),
         )
         filter_node = Filter(join, filter_pred)
 
@@ -963,7 +967,7 @@ class TestColumnPruningJoinKeyBug:
         project = Projection(
             input=filter_node,
             expressions=[ColumnRef("u", "name", DataType.VARCHAR)],
-            aliases=["name"]
+            aliases=["name"],
         )
 
         rule = ProjectionPushdownRule()
@@ -1021,7 +1025,7 @@ class TestColumnPruningJoinKeyBug:
             schema_name="public",
             table_name="users",
             columns=["id", "name", "email"],
-            alias="u"
+            alias="u",
         )
 
         # Right scan: orders
@@ -1030,21 +1034,21 @@ class TestColumnPruningJoinKeyBug:
             schema_name="public",
             table_name="orders",
             columns=["id", "user_id", "amount"],
-            alias="o"
+            alias="o",
         )
 
         # Join condition: u.id = o.user_id
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef("u", "id", DataType.INTEGER),
-            right=ColumnRef("o", "user_id", DataType.INTEGER)
+            right=ColumnRef("o", "user_id", DataType.INTEGER),
         )
 
         join = Join(
             left=left_scan,
             right=right_scan,
             join_type=JoinType.INNER,
-            condition=join_condition
+            condition=join_condition,
         )
 
         # Inner projection: SELECT u.name, u.id
@@ -1052,16 +1056,16 @@ class TestColumnPruningJoinKeyBug:
             input=join,
             expressions=[
                 ColumnRef("u", "name", DataType.VARCHAR),
-                ColumnRef("u", "id", DataType.INTEGER)
+                ColumnRef("u", "id", DataType.INTEGER),
             ],
-            aliases=["name", "id"]
+            aliases=["name", "id"],
         )
 
         # Outer projection: SELECT name
         outer_project = Projection(
             input=inner_project,
             expressions=[ColumnRef(None, "name", DataType.VARCHAR)],
-            aliases=["name"]
+            aliases=["name"],
         )
 
         rule = ProjectionPushdownRule()
@@ -1115,7 +1119,7 @@ class TestAggregateColumnPruningBug:
             schema_name="public",
             table_name="customers",
             columns=["id", "name", "country"],
-            alias="c"
+            alias="c",
         )
 
         # Right scan: orders
@@ -1124,21 +1128,21 @@ class TestAggregateColumnPruningBug:
             schema_name="public",
             table_name="orders",
             columns=["id", "customer_id", "total"],
-            alias="o"
+            alias="o",
         )
 
         # Join condition: c.id = o.customer_id
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef("c", "id", DataType.INTEGER),
-            right=ColumnRef("o", "customer_id", DataType.INTEGER)
+            right=ColumnRef("o", "customer_id", DataType.INTEGER),
         )
 
         join = Join(
             left=left_scan,
             right=right_scan,
             join_type=JoinType.INNER,
-            condition=join_condition
+            condition=join_condition,
         )
 
         # Aggregate: SELECT c.country, SUM(o.total) GROUP BY c.country
@@ -1150,7 +1154,7 @@ class TestAggregateColumnPruningBug:
             input=join,
             group_by=[group_by_expr],
             aggregates=[sum_expr],
-            output_names=["country", "sum_total"]
+            output_names=["country", "sum_total"],
         )
 
         rule = ProjectionPushdownRule()
@@ -1165,12 +1169,18 @@ class TestAggregateColumnPruningBug:
 
         # Left side (customers) must have 'id' column for join
         assert isinstance(join_node.left, Scan)
-        assert "id" in join_node.left.columns, "customers.id must be preserved for join key"
-        assert "country" in join_node.left.columns, "customers.country needed for group by"
+        assert (
+            "id" in join_node.left.columns
+        ), "customers.id must be preserved for join key"
+        assert (
+            "country" in join_node.left.columns
+        ), "customers.country needed for group by"
 
         # Right side (orders) must have 'customer_id' column for join
         assert isinstance(join_node.right, Scan)
-        assert "customer_id" in join_node.right.columns, "orders.customer_id must be preserved for join key"
+        assert (
+            "customer_id" in join_node.right.columns
+        ), "orders.customer_id must be preserved for join key"
         assert "total" in join_node.right.columns, "orders.total needed for SUM"
 
     def test_aggregate_over_filter_preserves_filter_columns(self):
@@ -1191,14 +1201,14 @@ class TestAggregateColumnPruningBug:
             datasource="test_ds",
             schema_name="public",
             table_name="orders",
-            columns=["id", "customer_id", "status", "total"]
+            columns=["id", "customer_id", "status", "total"],
         )
 
         # Filter: WHERE status = 'pending'
         filter_pred = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("pending", DataType.VARCHAR)
+            right=Literal("pending", DataType.VARCHAR),
         )
         filter_node = Filter(scan, filter_pred)
 
@@ -1210,7 +1220,7 @@ class TestAggregateColumnPruningBug:
             input=filter_node,
             group_by=[],
             aggregates=[count_expr],
-            output_names=["count"]
+            output_names=["count"],
         )
 
         rule = ProjectionPushdownRule()
@@ -1253,7 +1263,7 @@ class TestAggregateColumnPruningBug:
             schema_name="public",
             table_name="customers",
             columns=["id", "name", "country"],
-            alias="c"
+            alias="c",
         )
 
         # Right scan: orders
@@ -1262,28 +1272,28 @@ class TestAggregateColumnPruningBug:
             schema_name="public",
             table_name="orders",
             columns=["id", "customer_id", "status", "total"],
-            alias="o"
+            alias="o",
         )
 
         # Join condition: c.id = o.customer_id
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef("c", "id", DataType.INTEGER),
-            right=ColumnRef("o", "customer_id", DataType.INTEGER)
+            right=ColumnRef("o", "customer_id", DataType.INTEGER),
         )
 
         join = Join(
             left=left_scan,
             right=right_scan,
             join_type=JoinType.INNER,
-            condition=join_condition
+            condition=join_condition,
         )
 
         # Filter: WHERE o.status = 'completed'
         filter_pred = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef("o", "status", DataType.VARCHAR),
-            right=Literal("completed", DataType.VARCHAR)
+            right=Literal("completed", DataType.VARCHAR),
         )
         filter_node = Filter(join, filter_pred)
 
@@ -1295,7 +1305,7 @@ class TestAggregateColumnPruningBug:
             input=filter_node,
             group_by=[group_by_expr],
             aggregates=[count_expr],
-            output_names=["country", "count"]
+            output_names=["country", "count"],
         )
 
         rule = ProjectionPushdownRule()
@@ -1359,7 +1369,7 @@ class TestParserAliasNotPopulatedBug:
             datasource="test_ds",
             schema_name="public",
             table_name="users",
-            columns=["id", "name", "age"]
+            columns=["id", "name", "age"],
             # NO alias parameter - defaults to None
         )
 
@@ -1367,7 +1377,7 @@ class TestParserAliasNotPopulatedBug:
         predicate = BinaryOp(
             op=BinaryOpType.GT,
             left=ColumnRef("u", "age", DataType.INTEGER),
-            right=Literal(18, DataType.INTEGER)
+            right=Literal(18, DataType.INTEGER),
         )
         filter_node = Filter(scan, predicate)
 
@@ -1375,8 +1385,12 @@ class TestParserAliasNotPopulatedBug:
         result = rule.apply(filter_node)
 
         # Filter should push to scan despite alias mismatch
-        assert isinstance(result, Scan), f"Expected Scan with filter, got {type(result).__name__}"
-        assert result.filters is not None, "Filter should push to scan even with alias in ColumnRef"
+        assert isinstance(
+            result, Scan
+        ), f"Expected Scan with filter, got {type(result).__name__}"
+        assert (
+            result.filters is not None
+        ), "Filter should push to scan even with alias in ColumnRef"
 
     def test_join_with_aliases_in_columnref_but_not_in_scan(self):
         """Test join filter pushdown when aliases are in ColumnRef but not Scan.
@@ -1395,14 +1409,14 @@ class TestParserAliasNotPopulatedBug:
             datasource="test_ds",
             schema_name="public",
             table_name="orders",
-            columns=["id", "customer_id", "amount"]
+            columns=["id", "customer_id", "amount"],
             # NO alias - defaults to None
         )
         right_scan = Scan(
             datasource="test_ds",
             schema_name="public",
             table_name="customers",
-            columns=["id", "name", "credit_limit"]
+            columns=["id", "name", "credit_limit"],
             # NO alias - defaults to None
         )
 
@@ -1410,21 +1424,21 @@ class TestParserAliasNotPopulatedBug:
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef("o", "customer_id", DataType.INTEGER),
-            right=ColumnRef("c", "id", DataType.INTEGER)
+            right=ColumnRef("c", "id", DataType.INTEGER),
         )
 
         join = Join(
             left=left_scan,
             right=right_scan,
             join_type=JoinType.INNER,
-            condition=join_condition
+            condition=join_condition,
         )
 
         # Filter uses alias "o"
         predicate = BinaryOp(
             op=BinaryOpType.GT,
             left=ColumnRef("o", "amount", DataType.DECIMAL),
-            right=Literal(100, DataType.DECIMAL)
+            right=Literal(100, DataType.DECIMAL),
         )
         filter_node = Filter(join, predicate)
 
@@ -1434,7 +1448,9 @@ class TestParserAliasNotPopulatedBug:
         # Filter should push to left side despite alias mismatch
         assert isinstance(result, Join), f"Expected Join, got {type(result).__name__}"
         assert isinstance(result.left, Scan)
-        assert result.left.filters is not None, "Filter should push to left side even with alias in ColumnRef"
+        assert (
+            result.left.filters is not None
+        ), "Filter should push to left side even with alias in ColumnRef"
 
     def test_aggregate_with_aliases_in_columnref_but_not_in_scan(self):
         """Test column pruning for aggregate when aliases in ColumnRef but not Scan.
@@ -1454,14 +1470,14 @@ class TestParserAliasNotPopulatedBug:
             datasource="test_ds",
             schema_name="public",
             table_name="customers",
-            columns=["id", "name", "country"]
+            columns=["id", "name", "country"],
             # NO alias
         )
         right_scan = Scan(
             datasource="test_ds",
             schema_name="public",
             table_name="orders",
-            columns=["id", "customer_id", "total"]
+            columns=["id", "customer_id", "total"],
             # NO alias
         )
 
@@ -1469,14 +1485,14 @@ class TestParserAliasNotPopulatedBug:
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef("c", "id", DataType.INTEGER),
-            right=ColumnRef("o", "customer_id", DataType.INTEGER)
+            right=ColumnRef("o", "customer_id", DataType.INTEGER),
         )
 
         join = Join(
             left=left_scan,
             right=right_scan,
             join_type=JoinType.INNER,
-            condition=join_condition
+            condition=join_condition,
         )
 
         # Aggregate uses aliases
@@ -1487,7 +1503,7 @@ class TestParserAliasNotPopulatedBug:
             input=join,
             group_by=[group_by_expr],
             aggregates=[sum_expr],
-            output_names=["country", "sum_total"]
+            output_names=["country", "sum_total"],
         )
 
         rule = ProjectionPushdownRule()
@@ -1500,10 +1516,14 @@ class TestParserAliasNotPopulatedBug:
 
         # Both scans should have join keys preserved
         assert isinstance(join_node.left, Scan)
-        assert "id" in join_node.left.columns, "customers.id must be preserved for join key"
+        assert (
+            "id" in join_node.left.columns
+        ), "customers.id must be preserved for join key"
 
         assert isinstance(join_node.right, Scan)
-        assert "customer_id" in join_node.right.columns, "orders.customer_id must be preserved for join key"
+        assert (
+            "customer_id" in join_node.right.columns
+        ), "orders.customer_id must be preserved for join key"
 
 
 class TestLimitPushdownNotRecursing:
@@ -1529,7 +1549,7 @@ class TestLimitPushdownNotRecursing:
             datasource="test_ds",
             schema_name="public",
             table_name="users",
-            columns=["id", "name", "age", "email"]
+            columns=["id", "name", "age", "email"],
         )
 
         # Projection: SELECT id, name, age FROM ...
@@ -1540,7 +1560,7 @@ class TestLimitPushdownNotRecursing:
                 ColumnRef(None, "name", DataType.VARCHAR),
                 ColumnRef(None, "age", DataType.INTEGER),
             ],
-            aliases=["id", "name", "age"]
+            aliases=["id", "name", "age"],
         )
 
         # Limit: ... LIMIT 10
@@ -1550,7 +1570,7 @@ class TestLimitPushdownNotRecursing:
         predicate = BinaryOp(
             op=BinaryOpType.GT,
             left=ColumnRef(None, "age", DataType.INTEGER),
-            right=Literal(18, DataType.INTEGER)
+            right=Literal(18, DataType.INTEGER),
         )
         filter_node = Filter(input=limit, predicate=predicate)
 
@@ -1561,8 +1581,12 @@ class TestLimitPushdownNotRecursing:
         # Currently the rule doesn't recurse into Filter, so nothing changes
         # After fix: should have Filter(Projection(Limit(Scan)))
         assert isinstance(result, Filter), "Should still be Filter at root"
-        assert isinstance(result.input, Projection), "Should have Projection after pushing limit down"
-        assert isinstance(result.input.input, Limit), "Limit should have pushed below Projection"
+        assert isinstance(
+            result.input, Projection
+        ), "Should have Projection after pushing limit down"
+        assert isinstance(
+            result.input.input, Limit
+        ), "Limit should have pushed below Projection"
         assert isinstance(result.input.input.input, Scan), "Limit should be above Scan"
 
     def test_limit_nested_under_join_not_optimized(self):
@@ -1578,7 +1602,7 @@ class TestLimitPushdownNotRecursing:
             datasource="test_ds",
             schema_name="public",
             table_name="orders",
-            columns=["id", "customer_id", "amount"]
+            columns=["id", "customer_id", "amount"],
         )
 
         left_project = Projection(
@@ -1587,7 +1611,7 @@ class TestLimitPushdownNotRecursing:
                 ColumnRef(None, "customer_id", DataType.INTEGER),
                 ColumnRef(None, "amount", DataType.DECIMAL),
             ],
-            aliases=["customer_id", "amount"]
+            aliases=["customer_id", "amount"],
         )
 
         left_limit = Limit(input=left_project, limit=100, offset=0)
@@ -1597,21 +1621,21 @@ class TestLimitPushdownNotRecursing:
             datasource="test_ds",
             schema_name="public",
             table_name="customers",
-            columns=["id", "name"]
+            columns=["id", "name"],
         )
 
         # Join
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef(None, "customer_id", DataType.INTEGER),
-            right=ColumnRef(None, "id", DataType.INTEGER)
+            right=ColumnRef(None, "id", DataType.INTEGER),
         )
 
         join = Join(
             left=left_limit,
             right=right_scan,
             join_type=JoinType.INNER,
-            condition=join_condition
+            condition=join_condition,
         )
 
         # Apply limit pushdown
@@ -1621,8 +1645,12 @@ class TestLimitPushdownNotRecursing:
         # Currently the rule doesn't recurse into Join, so nothing changes
         # After fix: left child should be Projection(Limit(Scan))
         assert isinstance(result, Join), "Should still be Join at root"
-        assert isinstance(result.left, Projection), "Left child should have Projection after pushing limit"
-        assert isinstance(result.left.input, Limit), "Limit should have pushed below Projection"
+        assert isinstance(
+            result.left, Projection
+        ), "Left child should have Projection after pushing limit"
+        assert isinstance(
+            result.left.input, Limit
+        ), "Limit should have pushed below Projection"
         assert isinstance(result.left.input.input, Scan), "Limit should be above Scan"
 
     def test_deeply_nested_limit_not_optimized(self):
@@ -1638,7 +1666,7 @@ class TestLimitPushdownNotRecursing:
             datasource="test_ds",
             schema_name="public",
             table_name="products",
-            columns=["id", "category", "price", "stock"]
+            columns=["id", "category", "price", "stock"],
         )
 
         inner_project = Projection(
@@ -1647,7 +1675,7 @@ class TestLimitPushdownNotRecursing:
                 ColumnRef(None, "id", DataType.INTEGER),
                 ColumnRef(None, "price", DataType.DECIMAL),
             ],
-            aliases=["id", "price"]
+            aliases=["id", "price"],
         )
 
         inner_limit = Limit(input=inner_project, limit=50, offset=0)
@@ -1655,7 +1683,7 @@ class TestLimitPushdownNotRecursing:
         inner_predicate = BinaryOp(
             op=BinaryOpType.GT,
             left=ColumnRef(None, "price", DataType.DECIMAL),
-            right=Literal(10.0, DataType.DECIMAL)
+            right=Literal(10.0, DataType.DECIMAL),
         )
         inner_filter = Filter(input=inner_limit, predicate=inner_predicate)
 
@@ -1664,28 +1692,28 @@ class TestLimitPushdownNotRecursing:
             datasource="test_ds",
             schema_name="public",
             table_name="orders",
-            columns=["id", "product_id", "quantity"]
+            columns=["id", "product_id", "quantity"],
         )
 
         # Join
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
             left=ColumnRef(None, "id", DataType.INTEGER),
-            right=ColumnRef(None, "product_id", DataType.INTEGER)
+            right=ColumnRef(None, "product_id", DataType.INTEGER),
         )
 
         join = Join(
             left=inner_filter,
             right=right_scan,
             join_type=JoinType.INNER,
-            condition=join_condition
+            condition=join_condition,
         )
 
         # Outer filter
         outer_predicate = BinaryOp(
             op=BinaryOpType.GT,
             left=ColumnRef(None, "quantity", DataType.INTEGER),
-            right=Literal(5, DataType.INTEGER)
+            right=Literal(5, DataType.INTEGER),
         )
         outer_filter = Filter(input=join, predicate=outer_predicate)
 
@@ -1697,6 +1725,12 @@ class TestLimitPushdownNotRecursing:
         assert isinstance(result, Filter), "Root should still be Filter"
         assert isinstance(result.input, Join), "Should have Join"
         assert isinstance(result.input.left, Filter), "Left should be Filter"
-        assert isinstance(result.input.left.input, Projection), "Should have Projection after pushing"
-        assert isinstance(result.input.left.input.input, Limit), "Limit should be below Projection"
-        assert isinstance(result.input.left.input.input.input, Scan), "Limit should be above Scan"
+        assert isinstance(
+            result.input.left.input, Projection
+        ), "Should have Projection after pushing"
+        assert isinstance(
+            result.input.left.input.input, Limit
+        ), "Limit should be below Projection"
+        assert isinstance(
+            result.input.left.input.input.input, Scan
+        ), "Limit should be above Scan"

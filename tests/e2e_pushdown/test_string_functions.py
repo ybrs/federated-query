@@ -64,10 +64,7 @@ def test_lower_function_with_like(single_source_env):
 def test_length_function_comparison(single_source_env):
     """Ensures LENGTH() function pushes down for string length checks."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT name FROM duckdb_primary.main.products "
-        "WHERE LENGTH(name) > 10"
-    )
+    sql = "SELECT name FROM duckdb_primary.main.products " "WHERE LENGTH(name) > 10"
     ast = explain_datasource_query(runtime, sql)
 
     where_clause = ast.args.get("where")
@@ -110,10 +107,7 @@ def test_substring_function_in_where(single_source_env):
 def test_trim_function_in_where(single_source_env):
     """Checks TRIM() function pushes for whitespace removal."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE TRIM(region) = 'EU'"
-    )
+    sql = "SELECT order_id FROM duckdb_primary.main.orders " "WHERE TRIM(region) = 'EU'"
     ast = explain_datasource_query(runtime, sql)
 
     where_clause = ast.args.get("where")
@@ -218,10 +212,7 @@ def test_string_function_in_group_by(single_source_env):
 def test_string_function_in_order_by(single_source_env):
     """Ensures string functions push down in ORDER BY clause."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT name FROM duckdb_primary.main.products "
-        "ORDER BY LOWER(name)"
-    )
+    sql = "SELECT name FROM duckdb_primary.main.products " "ORDER BY LOWER(name)"
     ast = explain_datasource_query(runtime, sql)
 
     order_clause = ast.args.get("order")

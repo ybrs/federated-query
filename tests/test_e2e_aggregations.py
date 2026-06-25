@@ -105,9 +105,9 @@ def test_group_by_with_count(setup_test_db):
         counts.append(result_table.column(1)[i].as_py())
 
     region_counts = dict(zip(regions, counts))
-    assert region_counts['North'] == 3
-    assert region_counts['South'] == 2
-    assert region_counts['East'] == 2
+    assert region_counts["North"] == 3
+    assert region_counts["South"] == 2
+    assert region_counts["East"] == 2
 
 
 def test_group_by_with_sum(setup_test_db):
@@ -140,9 +140,9 @@ def test_group_by_with_sum(setup_test_db):
         sums.append(result_table.column(1)[i].as_py())
 
     region_sums = dict(zip(regions, sums))
-    assert region_sums['North'] == 430.0
-    assert region_sums['South'] == 450.0
-    assert region_sums['East'] == 520.0
+    assert region_sums["North"] == 430.0
+    assert region_sums["South"] == 450.0
+    assert region_sums["East"] == 520.0
 
 
 def test_group_by_with_avg(setup_test_db):
@@ -175,9 +175,9 @@ def test_group_by_with_avg(setup_test_db):
         avgs.append(result_table.column(1)[i].as_py())
 
     region_avgs = dict(zip(regions, avgs))
-    assert abs(region_avgs['North'] - 143.33) < 0.01
-    assert abs(region_avgs['South'] - 225.0) < 0.01
-    assert abs(region_avgs['East'] - 260.0) < 0.01
+    assert abs(region_avgs["North"] - 143.33) < 0.01
+    assert abs(region_avgs["South"] - 225.0) < 0.01
+    assert abs(region_avgs["East"] - 260.0) < 0.01
 
 
 def test_group_by_with_min_max(setup_test_db):
@@ -215,9 +215,9 @@ def test_group_by_with_min_max(setup_test_db):
     for i in range(len(regions)):
         region_data[regions[i]] = (mins[i], maxs[i])
 
-    assert region_data['North'] == (100.0, 180.0)
-    assert region_data['South'] == (200.0, 250.0)
-    assert region_data['East'] == (220.0, 300.0)
+    assert region_data["North"] == (100.0, 180.0)
+    assert region_data["South"] == (200.0, 250.0)
+    assert region_data["East"] == (220.0, 300.0)
 
 
 def test_group_by_multiple_aggregates(setup_test_db):
@@ -272,7 +272,7 @@ def test_having_clause(setup_test_db):
     region = result_table.column(0)[0].as_py()
     count = result_table.column(1)[0].as_py()
 
-    assert region == 'North'
+    assert region == "North"
     assert count == 3
 
 
@@ -303,7 +303,7 @@ def test_having_with_sum(setup_test_db):
     region = result_table.column(0)[0].as_py()
     total = result_table.column(1)[0].as_py()
 
-    assert region == 'East'
+    assert region == "East"
     assert total == 520.0
 
 

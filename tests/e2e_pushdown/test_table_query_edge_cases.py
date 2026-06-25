@@ -13,10 +13,7 @@ from tests.e2e_pushdown.helpers import (
 def test_query_on_empty_table_behavior(single_source_env):
     """A constant-false predicate is pushed to the source unevaluated."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE 1 = 0"
-    )
+    sql = "SELECT order_id FROM duckdb_primary.main.orders " "WHERE 1 = 0"
     ast = explain_datasource_query(runtime, sql)
 
     where_clause = ast.args.get("where")
@@ -39,10 +36,7 @@ def test_constant_false_predicate_returns_no_rows(single_source_env):
     independently of the pushed predicate's shape.
     """
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE 1 = 0"
-    )
+    sql = "SELECT order_id FROM duckdb_primary.main.orders " "WHERE 1 = 0"
     table = runtime.execute(sql)
     assert table.num_rows == 0
 
@@ -115,10 +109,7 @@ def test_select_duplicate_column_names(single_source_env):
     selects the two underlying columns and the result has two ``id`` columns.
     """
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id AS id, product_id AS id "
-        "FROM duckdb_primary.main.orders"
-    )
+    sql = "SELECT order_id AS id, product_id AS id " "FROM duckdb_primary.main.orders"
     ast = explain_datasource_query(runtime, sql)
     assert select_column_names(ast) == ["order_id", "product_id"]
 

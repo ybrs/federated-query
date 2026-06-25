@@ -120,14 +120,12 @@ def test_star_processor_renames_results() -> None:
 def test_preprocess_skips_subquery_without_star() -> None:
     """Ensure derived tables without stars pass through unchanged."""
     catalog = _build_catalog()
-    context = QueryContext(
-        """
+    context = QueryContext("""
         SELECT id, name
         FROM (
             SELECT id, name, email FROM testdb.main.users WHERE active = true
         ) AS active_users
-        """
-    )
+        """)
     preprocessor = QueryPreprocessor(catalog)
     rewritten = preprocessor.preprocess(context.original_sql, context)
     assert "active_users" in rewritten
@@ -137,8 +135,7 @@ def test_preprocess_skips_subquery_without_star() -> None:
 def test_preprocess_skips_join_with_subquery_without_star() -> None:
     """Ensure joins with derived tables work when no star exists."""
     catalog = _build_catalog()
-    context = QueryContext(
-        """
+    context = QueryContext("""
         SELECT u.id, u.name, o.total
         FROM testdb.main.users u
         JOIN (
@@ -146,8 +143,7 @@ def test_preprocess_skips_join_with_subquery_without_star() -> None:
             FROM testdb.main.orders
             GROUP BY user_id
         ) o ON u.id = o.user_id
-        """
-    )
+        """)
     preprocessor = QueryPreprocessor(catalog)
     rewritten = preprocessor.preprocess(context.original_sql, context)
     assert "o.total" in rewritten
@@ -157,8 +153,7 @@ def test_preprocess_skips_join_with_subquery_without_star() -> None:
 def test_preprocess_skips_cte_without_star() -> None:
     """Ensure CTEs without stars do not raise errors."""
     catalog = _build_catalog()
-    context = QueryContext(
-        """
+    context = QueryContext("""
         WITH recent_orders AS (
             SELECT user_id, COUNT(*) AS order_count
             FROM testdb.main.orders
@@ -168,8 +163,7 @@ def test_preprocess_skips_cte_without_star() -> None:
         SELECT u.id, u.name, r.order_count
         FROM testdb.main.users u
         JOIN recent_orders r ON u.id = r.user_id
-        """
-    )
+        """)
     preprocessor = QueryPreprocessor(catalog)
     rewritten = preprocessor.preprocess(context.original_sql, context)
     assert "recent_orders" in rewritten
@@ -179,16 +173,14 @@ def test_preprocess_skips_cte_without_star() -> None:
 def test_preprocess_cte_with_star_records_columns() -> None:
     """Ensure outer SELECT after CTE records column metadata."""
     catalog = _build_catalog()
-    context = QueryContext(
-        """
+    context = QueryContext("""
         WITH recent_orders AS (
             SELECT user_id, COUNT(*) AS order_count
             FROM testdb.main.orders
             GROUP BY user_id
         )
         SELECT * FROM testdb.main.users
-        """
-    )
+        """)
     preprocessor = QueryPreprocessor(catalog)
     preprocessor.preprocess(context.original_sql, context)
     assert len(context.columns) == 4
@@ -197,13 +189,11 @@ def test_preprocess_cte_with_star_records_columns() -> None:
 def test_preprocess_union_star_records_columns() -> None:
     """Ensure union roots still capture column metadata."""
     catalog = _build_catalog()
-    context = QueryContext(
-        """
+    context = QueryContext("""
         SELECT * FROM testdb.main.users
         UNION
         SELECT * FROM testdb.main.users
-        """
-    )
+        """)
     preprocessor = QueryPreprocessor(catalog)
     preprocessor.preprocess(context.original_sql, context)
     assert len(context.columns) == 4
@@ -212,13 +202,11 @@ def test_preprocess_union_star_records_columns() -> None:
 def test_preprocess_expands_join_alias_star() -> None:
     """Expand table2.* in joins without altering order."""
     catalog = _build_catalog()
-    context = QueryContext(
-        """
+    context = QueryContext("""
         SELECT u.id, o.*
         FROM testdb.main.users u
         JOIN testdb.main.orders o ON u.id = o.user_id
-        """
-    )
+        """)
     preprocessor = QueryPreprocessor(catalog)
     rewritten = preprocessor.preprocess(context.original_sql, context)
     assert "o.order_id" in rewritten
@@ -231,9 +219,7 @@ def test_preprocess_expands_join_alias_star() -> None:
 def test_preprocess_expands_prefix_suffix_stars() -> None:
     """Ensure explicit columns before and after '*' are preserved."""
     catalog = _build_catalog()
-    context = QueryContext(
-        "SELECT order_id, *, order_id FROM testdb.main.orders"
-    )
+    context = QueryContext("SELECT order_id, *, order_id FROM testdb.main.orders")
     preprocessor = QueryPreprocessor(catalog)
     rewritten = preprocessor.preprocess(context.original_sql, context)
     prefix = rewritten.split("FROM")[0]

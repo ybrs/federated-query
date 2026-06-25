@@ -814,6 +814,118 @@ natively), reusing the set-op/aggregate machinery.
 **Deliverable**: Window-function support (incl. the common correlated-window case
 via partition-lift); all other advanced SQL surface already shipped in Phase 8.
 
+### 9.7 SQL surface hardening + breadth (audit verified 2026-06-25)
+
+Verified live: each feature was run through the engine over a single DuckDB
+source and compared against the same query on a raw DuckDB holding identical
+data (ground truth). Harness: `sql_surface_probe.py`. Root cause of most issues:
+the parser reads a fixed set of clauses and silently ignores the rest, both at
+the Select level (it reads only distinct, from_, group, having, joins, limit,
+offset, order, where, with_, expressions) and at sub-node level (it reads
+`distinct` as a bool and ignores `distinct.on`, ignores `table.sample`,
+`group.rollup/cube/grouping_sets`, `star.except_/replace`). This violates the
+never-fail-silently rule.
+
+NOTE for the future: do not trust parse-layer inference here. The live run
+corrected two guesses - QUALIFY actually WORKS (the engine rewrites it to a
+window subquery + outer WHERE), and the function-rendering bug below was only
+visible by executing.
+
+Batch 1 - correctness only, no new features: DONE (verified 2026-06-25, 836 pass).
+- [x] Dialect-aware function rendering. The aggregate parser stored
+      `type(func).__name__.upper()` (a sqlglot class name), so a whole family of
+      standard aggregates was mangled and rejected by the source: VAR_POP ->
+      VARIANCEPOP, STDDEV_POP -> STDDEVPOP, STDDEV_SAMP -> STDDEVSAMP, STRING_AGG
+      -> GROUPCONCAT, ARRAY_AGG -> ARRAYAGG, BOOL_AND -> LOGICALAND, BOOL_OR ->
+      LOGICALOR. Fixed by `Parser._aggregate_sql_name`, which renders the node in
+      the engine dialect (`func.sql(dialect=self.dialect)`) and takes the function
+      head, so the name is always valid SQL. SUM/AVG/MIN/MAX/COUNT are unchanged
+      (the streaming executor still matches them). Tests:
+      `tests/e2e_pushdown/test_aggregate_rendering.py` (executes and compares to
+      raw DuckDB - EXPLAIN-only tests missed the bug).
+- [x] Parser safety sweep: fail-fast with `UnsupportedSQLError`
+      (`federated_query/parser/errors.py`) on any clause or sub-arg the parser
+      does not consume. `Parser._reject_unsupported_select_clauses` rejects unknown
+      top-level Select args (against `SUPPORTED_SELECT_ARGS`), DISTINCT ON,
+      GROUP BY ROLLUP/CUBE/GROUPING SETS/TOTALS, and FETCH FIRST;
+      `_reject_unsupported_relation` rejects TABLESAMPLE and PIVOT on a table; the
+      preprocessor's `_reject_star_modifiers` rejects SELECT * EXCEPT/EXCLUDE/
+      REPLACE. Tests: `tests/e2e_pushdown/test_sql_safety_sweep.py`.
+
+Silent wrong answers the sweep now stops (all raise UnsupportedSQLError):
+- [x] `DISTINCT ON (...)` - was pushed as plain `SELECT DISTINCT col, col`.
+- [x] named `WINDOW w AS (...)` - was dropped (rejected as unknown clause `windows`).
+- [x] `SELECT * EXCLUDE/REPLACE (...)` - was dropped during star expansion.
+- [x] `TABLESAMPLE` - was dropped, returned the full table.
+
+Crashes / opaque errors the sweep now turns into clean fail-fast:
+- [x] `GROUP BY ROLLUP/CUBE/GROUPING SETS` - was an opaque source BinderException.
+- [x] `FETCH FIRST ...` (ONLY and WITH TIES) - was an AttributeError in the limit
+      converter.
+
+Note: QUALIFY is NOT rejected - it works, because the preprocessor's
+postgres-dialect re-render rewrites it into a window subquery + outer WHERE
+before the parser sees it. Verified live.
+
+Confirmed working, no action: QUALIFY (single-source rewrite), STDDEV, VARIANCE,
+VAR_SAMP, COUNT(DISTINCT), window functions.
+
+Batch 2 - high-value breadth (implement natively, source + merge engine), in
+progress:
+- [x] DISTINCT ON - single-source pushes `SELECT DISTINCT ON (keys) ... ORDER BY`
+      to the source (which picks the surviving row); cross-source fails fast
+      (`UnsupportedSQLError`) because the local pyarrow path cannot honor the
+      ORDER BY tie-break. `Projection`/`PhysicalProjection` carry `distinct_on`;
+      `_should_push` always pushes a DISTINCT ON. Tests:
+      `tests/e2e_pushdown/test_distinct_on.py` (single-source correctness incl.
+      row order + WHERE; cross-source fail-fast).
+      ROOT-CAUSE FIX (silent field drops): the recurring "rebuild drops a new
+      field" bug (distinct_on, within_group_key) is eliminated by reconstructing
+      frozen-dataclass nodes with `dataclasses.replace(...)` instead of re-listing
+      fields. Converted 34 optimizer/decorrelation rebuilds + the binder/physical
+      expression rebuilds. New rule in CLAUDE.md/AGENTS.md, and a guard test
+      `tests/test_node_field_preservation.py` pins the `with_children` contract for
+      every node type with children (a dropped field fails the round-trip).
+- [ ] GROUP BY ROLLUP / CUBE / GROUPING SETS + the GROUPING() function - NOT YET
+      DONE; remains a clean fail-fast (`UnsupportedSQLError` via
+      `_reject_grouping_extensions`), so no wrong answers. This is the one large
+      structural item left: unlike the other Batch-2 features it is not a flag but
+      a grouping-structure change with combinatoric semantics, the GROUPING()
+      function, and multi-row NULL output the local pyarrow path cannot produce.
+      Plan: add `Aggregate.grouping_sets` (explicit list of sets; expand
+      ROLLUP/CUBE into sets at parse), render `GROUP BY GROUPING SETS (...)` for
+      single-source pushdown and the DuckDB merge engine (both support it), bind
+      and project-collect the set keys, route the `Grouping` node through the
+      function path, and fail fast on the pyarrow path. DuckDB and Postgres both
+      support the native syntax (verified).
+- [x] named WINDOW w AS (...) - the preprocessor inlines each named window into
+      its `OVER w` references (adopting partition/order/frame, keeping reference
+      extensions like `OVER (w ORDER BY ...)`) and drops the WINDOW clause, so the
+      parser sees explicit windows. Tests: `tests/e2e_pushdown/test_named_windows.py`.
+- [x] SELECT * EXCLUDE / REPLACE - the star expander honors EXCLUDE/EXCEPT (drop
+      columns) and REPLACE (substitute in place). Tests:
+      `tests/e2e_pushdown/test_star_modifiers.py`.
+- [x] Ordered-set aggregates via WITHIN GROUP: PERCENTILE_CONT/DISC, MEDIAN, MODE.
+      FunctionCall carries `within_group_key`/`within_group_desc`; parser converts
+      `exp.WithinGroup` (MEDIAN arrives pre-rewritten by the preprocessor); renders
+      for both single-source pushdown and the DuckDB merge engine; binder,
+      decorrelation, and projection-pushdown preserve/collect the sort key. Tests:
+      `tests/e2e_pushdown/test_ordered_set_aggregates.py` (single + cross-source).
+- [x] FETCH FIRST - `FETCH FIRST n ROWS ONLY` maps to a plain `Limit` (works
+      everywhere). `WITH TIES` fails fast (`UnsupportedSQLError`): DuckDB, a
+      primary source and the test backend, does not support the syntax, so it
+      cannot be pushed or ground-truth-tested. Tests:
+      `tests/e2e_pushdown/test_sql_safety_sweep.py`.
+
+Batch 3 - remaining breadth:
+- [ ] VALUES (...) AS v(a,b) as a table source (today "Unsupported FROM item: Values")
+- [ ] TABLESAMPLE (render to source; cross-source can fail-fast initially)
+- [ ] PIVOT / UNPIVOT
+
+Out of scope, but the safety sweep must fail-fast explicitly (not silently drop):
+FOR UPDATE/SHARE locks, SELECT INTO, optimizer hints, ClickHouse SETTINGS/PREWHERE,
+DISTRIBUTE/CLUSTER/SORT BY, CONNECT BY.
+
 ---
 
 ## Phase 10: General Dependent-Join Decorrelation + Cross-Source Correlated Fallback

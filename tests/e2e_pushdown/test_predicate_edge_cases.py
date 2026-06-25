@@ -115,10 +115,7 @@ def test_between_inverted_bounds(single_source_env):
 def test_like_only_wildcards(single_source_env):
     """Checks LIKE with only wildcards (LIKE '%%') pushes correctly."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE region LIKE '%%'"
-    )
+    sql = "SELECT order_id FROM duckdb_primary.main.orders " "WHERE region LIKE '%%'"
     ast = explain_datasource_query(runtime, sql)
 
     where_clause = ast.args.get("where")
@@ -161,10 +158,7 @@ def test_like_escaped_wildcards(single_source_env):
 def test_regex_operators_behavior(single_source_env):
     """Documents regex operators ~ and !~ behavior (if supported)."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE region ~ '^E[UW]$'"
-    )
+    sql = "SELECT order_id FROM duckdb_primary.main.orders " "WHERE region ~ '^E[UW]$'"
 
     ast = explain_datasource_query(runtime, sql)
 

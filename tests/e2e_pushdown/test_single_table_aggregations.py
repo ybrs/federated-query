@@ -178,8 +178,7 @@ def test_sum_distinct_pushdown(single_source_env):
     assert projection == ["SUM(DISTINCT quantity)"]
     matches = find_in_select(
         ast,
-        lambda node: isinstance(node, exp.Sum)
-        and isinstance(node.this, exp.Distinct),
+        lambda node: isinstance(node, exp.Sum) and isinstance(node.this, exp.Distinct),
     )
     assert len(matches) == 1
 

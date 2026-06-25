@@ -6,6 +6,7 @@ import sqlglot
 from sqlglot import exp
 
 from .dialect import FedQPostgres
+from .errors import UnsupportedSQLError
 from ..plan.logical import (
     LogicalPlanNode,
     Scan,
@@ -57,6 +58,25 @@ if TYPE_CHECKING:
 
 class Parser:
     """SQL parser that converts SQL to logical plan."""
+
+    # SELECT clauses the converter actually consumes. Any other clause that
+    # sqlglot attaches to a Select (windows, qualify, pivots, locks, into,
+    # connect, sample, ...) is rejected so it can never be silently dropped.
+    SUPPORTED_SELECT_ARGS = frozenset(
+        {
+            "expressions",
+            "from_",
+            "where",
+            "group",
+            "having",
+            "joins",
+            "order",
+            "limit",
+            "offset",
+            "distinct",
+            "with_",
+        }
+    )
 
     def __init__(self):
         """Initialize parser."""
@@ -174,8 +194,36 @@ class Parser:
             return self._convert_with(select, with_clause)
         return self._convert_plain_select(select)
 
+    def _reject_unsupported_select_clauses(self, select: exp.Select) -> None:
+        """Fail fast on SELECT clauses the converter does not consume.
+
+        Without this the parser would silently ignore clauses such as DISTINCT
+        ON, named WINDOW, GROUP BY ROLLUP/CUBE/GROUPING SETS, or FETCH FIRST ...
+        WITH TIES and return a wrong answer or crash deep in the engine.
+        """
+        self._reject_unknown_select_args(select)
+        self._reject_grouping_extensions(select)
+
+    def _reject_unknown_select_args(self, select: exp.Select) -> None:
+        """Raise on any SELECT clause not in SUPPORTED_SELECT_ARGS."""
+        for name, value in select.args.items():
+            if not value:
+                continue
+            if name not in self.SUPPORTED_SELECT_ARGS:
+                raise UnsupportedSQLError(f"Unsupported SQL clause: {name}")
+
+    def _reject_grouping_extensions(self, select: exp.Select) -> None:
+        """Reject GROUP BY ROLLUP / CUBE / GROUPING SETS / WITH TOTALS."""
+        group = select.args.get("group")
+        if group is None:
+            return
+        for kind in ("rollup", "cube", "grouping_sets", "totals"):
+            if group.args.get(kind):
+                raise UnsupportedSQLError(f"GROUP BY {kind.upper()} is not supported")
+
     def _convert_plain_select(self, select: exp.Select) -> LogicalPlanNode:
         """Convert a SELECT body (without its WITH clause) to a logical plan."""
+        self._reject_unsupported_select_clauses(select)
         if select.args.get("from_") is None:
             return self._build_values_select(select)
         plan = self._build_from_clause(select)
@@ -374,6 +422,10 @@ class Parser:
         """
         if not isinstance(table_expr, exp.Table):
             raise ValueError(f"Unsupported FROM item: {type(table_expr).__name__}")
+        if table_expr.args.get("sample"):
+            raise UnsupportedSQLError("TABLESAMPLE is not supported")
+        if table_expr.args.get("pivots"):
+            raise UnsupportedSQLError("PIVOT/UNPIVOT is not supported")
 
     def _build_join_plan(
         self, select: exp.Select, left_table: exp.Table, joins: List[exp.Join]
@@ -856,7 +908,20 @@ class Parser:
             expressions=expressions,
             aliases=aliases,
             distinct=has_distinct,
+            distinct_on=self._distinct_on_keys(distinct_arg),
         )
+
+    def _distinct_on_keys(self, distinct_arg) -> Optional[List[Expression]]:
+        """Convert the key expressions of a DISTINCT ON, or None for plain DISTINCT."""
+        if distinct_arg is None:
+            return None
+        on = distinct_arg.args.get("on")
+        if on is None:
+            return None
+        keys = []
+        for key_expr in on.expressions:
+            keys.append(self._convert_expression(key_expr))
+        return keys
 
     def _get_alias(self, expr: exp.Expression) -> str:
         """Get alias for expression.
@@ -932,11 +997,30 @@ class Parser:
         if not limit_expr and offset_expr is None:
             return input_plan
 
-        limit_value = int(limit_expr.expression.this) if limit_expr else None
+        limit_value = self._limit_count(limit_expr)
         offset_value = 0
         if offset_expr is not None:
             offset_value = int(offset_expr.expression.this)
         return Limit(input=input_plan, limit=limit_value, offset=offset_value)
+
+    def _limit_count(self, limit_expr) -> Optional[int]:
+        """Return the row cap from a LIMIT or FETCH clause (None for OFFSET-only)."""
+        if limit_expr is None:
+            return None
+        if isinstance(limit_expr, exp.Fetch):
+            return self._fetch_count(limit_expr)
+        return int(limit_expr.expression.this)
+
+    def _fetch_count(self, fetch: exp.Fetch) -> int:
+        """Return the count of FETCH FIRST n ROWS ONLY; reject WITH TIES.
+
+        WITH TIES needs the source's ORDER BY tie semantics; the DuckDB source
+        does not support the syntax, so it fails fast rather than mislead.
+        """
+        options = fetch.args.get("limit_options")
+        if options is not None and options.args.get("with_ties"):
+            raise UnsupportedSQLError("FETCH FIRST ... WITH TIES is not supported")
+        return int(fetch.args["count"].this)
 
     def _convert_expression(self, expr: exp.Expression) -> Expression:
         """Convert sqlglot expression to our Expression.
@@ -993,6 +1077,8 @@ class Parser:
             return self._convert_filter_aggregate(expr)
         if isinstance(expr, exp.Window):
             return self._convert_window(expr)
+        if isinstance(expr, exp.WithinGroup):
+            return self._convert_within_group(expr)
         if self._is_aggregate_function(expr):
             return self._convert_aggregate_function(expr)
         if isinstance(expr, (exp.Anonymous, exp.Func, exp.Upper)):
@@ -1345,7 +1431,7 @@ class Parser:
         Returns:
             FunctionCall expression
         """
-        func_name = type(func).__name__.upper()
+        func_name = self._aggregate_sql_name(func)
         distinct = bool(func.args.get("distinct"))
         if isinstance(func.this, exp.Distinct):
             distinct = True
@@ -1356,6 +1442,49 @@ class Parser:
             is_aggregate=True,
             distinct=distinct,
         )
+
+    def _aggregate_sql_name(self, func: exp.AggFunc) -> str:
+        """Return an aggregate's real SQL name in the engine dialect.
+
+        ``type(func).__name__`` is a sqlglot class name (e.g. VariancePop),
+        which is not a valid SQL function in any source. Rendering the node in
+        the engine dialect yields the correct token (e.g. VAR_POP); the function
+        head is everything before the first argument parenthesis.
+        """
+        rendered = func.sql(dialect=self.dialect)
+        return rendered.split("(", 1)[0].strip().upper()
+
+    def _convert_within_group(self, expr: exp.WithinGroup) -> FunctionCall:
+        """Convert an ordered-set aggregate: f(args) WITHIN GROUP (ORDER BY key).
+
+        Covers PERCENTILE_CONT/PERCENTILE_DISC/MODE (and MEDIAN, which the
+        preprocessor re-renders to PERCENTILE_CONT(0.5) WITHIN GROUP).
+        """
+        aggregate = expr.this
+        key, descending = self._within_group_order(expr.expression)
+        return FunctionCall(
+            function_name=self._aggregate_sql_name(aggregate),
+            args=self._ordered_set_direct_args(aggregate),
+            is_aggregate=True,
+            within_group_key=key,
+            within_group_desc=descending,
+        )
+
+    def _ordered_set_direct_args(self, aggregate: exp.AggFunc) -> List[Expression]:
+        """Convert the direct arguments of an ordered-set aggregate.
+
+        PERCENTILE_CONT/DISC carry a fraction in ``this``; MODE carries nothing.
+        """
+        if aggregate.this is None:
+            return []
+        return [self._convert_expression(aggregate.this)]
+
+    def _within_group_order(self, order: exp.Order) -> Tuple[Expression, bool]:
+        """Return the (key, descending) of a single-column WITHIN GROUP order."""
+        ordered = order.expressions[0]
+        key = self._convert_expression(ordered.this)
+        descending = bool(ordered.args.get("desc"))
+        return key, descending
 
     def _extract_function_args(
         self,

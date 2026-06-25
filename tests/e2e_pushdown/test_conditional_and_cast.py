@@ -10,7 +10,6 @@ from tests.e2e_pushdown.helpers import (
     unwrap_parens,
 )
 
-
 # Conditional Expressions
 
 
@@ -161,10 +160,7 @@ def test_cast_in_where_clause(single_source_env):
 def test_postgres_cast_syntax(single_source_env):
     """Validates PostgreSQL :: cast syntax pushes correctly."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE price::INTEGER > 50"
-    )
+    sql = "SELECT order_id FROM duckdb_primary.main.orders " "WHERE price::INTEGER > 50"
     ast = explain_datasource_query(runtime, sql)
     where_clause = ast.args.get("where")
     assert where_clause is not None

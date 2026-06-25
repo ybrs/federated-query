@@ -343,6 +343,7 @@ class PhysicalPlanner:
             expressions=projection.expressions,
             output_names=projection.aliases,
             distinct=projection.distinct,
+            distinct_on=projection.distinct_on,
         )
 
     def _projection_has_window(self, projection: Projection) -> bool:

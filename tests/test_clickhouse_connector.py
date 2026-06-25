@@ -5,6 +5,7 @@ reachable (host/port from ``CLICKHOUSE_HOST`` / ``CLICKHOUSE_PORT``, default
 127.0.0.1:8123). Builds a small temp table, then exercises the connector's
 execute_query (streamed Arrow), schema probe, and catalog metadata.
 """
+
 import os
 
 import pyarrow as pa
@@ -47,7 +48,9 @@ def ch_source():
 
 def test_execute_query_yields_arrow_batches(ch_source):
     """execute_query streams Arrow record batches with the real values."""
-    batches = list(ch_source.execute_query("SELECT id, name FROM conn_probe ORDER BY id"))
+    batches = list(
+        ch_source.execute_query("SELECT id, name FROM conn_probe ORDER BY id")
+    )
     assert all(isinstance(batch, pa.RecordBatch) for batch in batches)
     table = pa.Table.from_batches(batches)
     assert table.num_rows == 3

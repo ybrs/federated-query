@@ -153,8 +153,7 @@ def test_in_subquery_value_bound_in_outer_context(catalog):
     """The IN value binds against the outer table, the plan inside."""
     bound = bind(
         catalog,
-        "SELECT * FROM pg.users WHERE country IN "
-        "(SELECT status FROM pg.orders)",
+        "SELECT * FROM pg.users WHERE country IN " "(SELECT status FROM pg.orders)",
     )
     predicate = find_filter(bound).predicate
     assert isinstance(predicate, InSubquery)

@@ -1,6 +1,7 @@
 """Optimization rules for logical plans."""
 
 from abc import ABC, abstractmethod
+from dataclasses import replace
 from typing import List, Optional, TYPE_CHECKING
 from ..plan.logical import (
     LogicalPlanNode,
@@ -32,7 +33,7 @@ def _rewrite_set_operation_branches(set_op: SetOperation, rewrite) -> SetOperati
     """
     new_left = rewrite(set_op.left)
     new_right = rewrite(set_op.right)
-    return SetOperation(new_left, new_right, set_op.kind, set_op.distinct)
+    return replace(set_op, left=new_left, right=new_right)
 
 
 class OptimizationRule(ABC):
@@ -78,39 +79,32 @@ class PredicatePushdownRule(OptimizationRule):
         if isinstance(plan, Projection):
             new_input = self._push_down(plan.input)
             if new_input != plan.input:
-                return Projection(
-                    new_input,
-                    plan.expressions,
-                    plan.aliases,
-                    plan.distinct,
-                )
+                return replace(plan, input=new_input)
             return plan
 
         if isinstance(plan, Join):
             new_left = self._push_down(plan.left)
             new_right = self._push_down(plan.right)
             if new_left != plan.left or new_right != plan.right:
-                return Join(new_left, new_right, plan.join_type, plan.condition)
+                return replace(plan, left=new_left, right=new_right)
             return plan
 
         if isinstance(plan, Aggregate):
             new_input = self._push_down(plan.input)
             if new_input != plan.input:
-                return Aggregate(
-                    new_input, plan.group_by, plan.aggregates, plan.output_names
-                )
+                return replace(plan, input=new_input)
             return plan
 
         if isinstance(plan, Limit):
             new_input = self._push_down(plan.input)
             if new_input != plan.input:
-                return Limit(new_input, plan.limit, plan.offset)
+                return replace(plan, input=new_input)
             return plan
 
         if isinstance(plan, Sort):
             new_input = self._push_down(plan.input)
             if new_input != plan.input:
-                return Sort(new_input, plan.sort_keys, plan.ascending, plan.nulls_order)
+                return replace(plan, input=new_input)
             return plan
 
         if isinstance(plan, SetOperation):
@@ -214,21 +208,11 @@ class PredicatePushdownRule(OptimizationRule):
             # Push filter BELOW projection: Projection(Filter(input, pred), ...)
             new_filter = Filter(projection.input, filter_node.predicate)
             new_filter = self._push_down(new_filter)
-            return Projection(
-                new_filter,
-                projection.expressions,
-                projection.aliases,
-                projection.distinct,
-            )
+            return replace(projection, input=new_filter)
 
         # Filter references columns not available in input, keep above
         new_input = self._push_down(projection.input)
-        new_project = Projection(
-            new_input,
-            projection.expressions,
-            projection.aliases,
-            projection.distinct,
-        )
+        new_project = replace(projection, input=new_input)
         return Filter(new_project, filter_node.predicate)
 
     def _push_filter_to_scan(self, filter_node: Filter, scan: Scan) -> LogicalPlanNode:
@@ -492,7 +476,10 @@ class PredicatePushdownRule(OptimizationRule):
         if isinstance(expr, UnaryOp):
             return [expr.operand]
         if isinstance(expr, FunctionCall):
-            return list(expr.args)
+            children = list(expr.args)
+            if expr.within_group_key is not None:
+                children.append(expr.within_group_key)
+            return children
         if isinstance(expr, Cast):
             return [expr.expr]
         return self._container_predicate_children(expr)
@@ -647,6 +634,8 @@ class ProjectionPushdownRule(OptimizationRule):
         if isinstance(expr, FunctionCall):
             for arg in expr.args:
                 columns.update(self._extract_columns(arg))
+            if expr.within_group_key is not None:
+                columns.update(self._extract_columns(expr.within_group_key))
             return columns
 
         if isinstance(expr, InList):
@@ -678,12 +667,7 @@ class ProjectionPushdownRule(OptimizationRule):
         if isinstance(plan, Projection):
             new_input = self._prune_columns(plan.input, required)
             if new_input != plan.input:
-                return Projection(
-                    new_input,
-                    plan.expressions,
-                    plan.aliases,
-                    plan.distinct,
-                )
+                return replace(plan, input=new_input)
             return plan
 
         if isinstance(plan, Filter):
@@ -700,21 +684,19 @@ class ProjectionPushdownRule(OptimizationRule):
             new_left = self._prune_columns(plan.left, left_req)
             new_right = self._prune_columns(plan.right, right_req)
             if new_left != plan.left or new_right != plan.right:
-                return Join(new_left, new_right, plan.join_type, plan.condition)
+                return replace(plan, left=new_left, right=new_right)
             return plan
 
         if isinstance(plan, Aggregate):
             new_input = self._prune_columns(plan.input, required)
             if new_input != plan.input:
-                return Aggregate(
-                    new_input, plan.group_by, plan.aggregates, plan.output_names
-                )
+                return replace(plan, input=new_input)
             return plan
 
         if isinstance(plan, Limit):
             new_input = self._prune_columns(plan.input, required)
             if new_input != plan.input:
-                return Limit(new_input, plan.limit, plan.offset)
+                return replace(plan, input=new_input)
             return plan
 
         return plan
@@ -812,12 +794,7 @@ class LimitPushdownRule(OptimizationRule):
         """Rewrite projection child."""
         new_input = self._rewrite_plan(projection.input)
         if new_input != projection.input:
-            return Projection(
-                new_input,
-                projection.expressions,
-                projection.aliases,
-                projection.distinct,
-            )
+            return replace(projection, input=new_input)
         return projection
 
     def _rewrite_filter(self, filter_node: Filter) -> LogicalPlanNode:
@@ -831,7 +808,7 @@ class LimitPushdownRule(OptimizationRule):
         """Rewrite sort child."""
         new_input = self._rewrite_plan(sort.input)
         if new_input != sort.input:
-            return Sort(new_input, sort.sort_keys, sort.ascending, sort.nulls_order)
+            return replace(sort, input=new_input)
         return sort
 
     def _rewrite_aggregate(self, aggregate: Aggregate) -> LogicalPlanNode:
@@ -851,7 +828,7 @@ class LimitPushdownRule(OptimizationRule):
         new_left = self._rewrite_plan(join.left)
         new_right = self._rewrite_plan(join.right)
         if new_left != join.left or new_right != join.right:
-            return Join(new_left, new_right, join.join_type, join.condition)
+            return replace(join, left=new_left, right=new_right)
         return join
 
     def _rewrite_union(self, union: Union) -> LogicalPlanNode:
@@ -890,7 +867,7 @@ class LimitPushdownRule(OptimizationRule):
             )
             return Limit(scan_with_limit, limit.limit, 0)
 
-        return Limit(input_node, limit.limit, limit.offset)
+        return replace(limit, input=input_node)
 
     def _push_through_projection(
         self, limit: Limit, projection: Projection
@@ -908,12 +885,7 @@ class LimitPushdownRule(OptimizationRule):
         )
         retained_offset = 0 if isinstance(projection.input, Scan) else limit.offset
         limited = Limit(pushed_child, limit.limit, retained_offset)
-        return Projection(
-            limited,
-            projection.expressions,
-            projection.aliases,
-            projection.distinct,
-        )
+        return replace(projection, input=limited)
 
     def _push_limit_with_sort(self, limit: Limit, sort: Sort) -> LogicalPlanNode:
         """Move limit below sort and attach metadata to scan when possible."""
@@ -944,7 +916,7 @@ class LimitPushdownRule(OptimizationRule):
             ascending=sort.ascending,
             nulls_order=sort.nulls_order,
         )
-        return Limit(new_sort, limit.limit, limit.offset)
+        return replace(limit, input=new_sort)
 
     def _apply_limit_metadata(
         self, node: LogicalPlanNode, limit_value: int, offset_value: int
@@ -1094,7 +1066,7 @@ class OrderByPushdownRule(OptimizationRule):
 
         if isinstance(node, Projection):
             new_input = self._attach_order_metadata(node.input, sort)
-            return Projection(new_input, node.expressions, node.aliases, node.distinct)
+            return replace(node, input=new_input)
 
         if isinstance(node, Filter):
             new_input = self._attach_order_metadata(node.input, sort)
@@ -1102,17 +1074,15 @@ class OrderByPushdownRule(OptimizationRule):
 
         if isinstance(node, Limit):
             new_input = self._attach_order_metadata(node.input, sort)
-            return Limit(new_input, node.limit, node.offset)
+            return replace(node, input=new_input)
 
         if isinstance(node, Aggregate):
             new_input = self._attach_order_metadata(node.input, sort)
-            return Aggregate(
-                new_input, node.group_by, node.aggregates, node.output_names
-            )
+            return replace(node, input=new_input)
 
         if isinstance(node, Sort):
             new_input = self._attach_order_metadata(node.input, sort)
-            return Sort(new_input, node.sort_keys, node.ascending, node.nulls_order)
+            return replace(node, input=new_input)
 
         return node
 
@@ -1156,12 +1126,7 @@ class OrderByPushdownRule(OptimizationRule):
         pushed_child = self._push_order_by(rewritten_sort)
 
         if isinstance(pushed_child, Sort):
-            rebuilt_projection = Projection(
-                pushed_child.input,
-                projection.expressions,
-                projection.aliases,
-                projection.distinct,
-            )
+            rebuilt_projection = replace(projection, input=pushed_child.input)
             return Sort(
                 input=rebuilt_projection,
                 sort_keys=sort.sort_keys,
@@ -1169,12 +1134,7 @@ class OrderByPushdownRule(OptimizationRule):
                 nulls_order=sort.nulls_order,
             )
 
-        return Projection(
-            pushed_child,
-            projection.expressions,
-            projection.aliases,
-            projection.distinct,
-        )
+        return replace(projection, input=pushed_child)
 
     def _push_through_filter(self, sort: Sort, filter_node: Filter) -> LogicalPlanNode:
         """Push ORDER BY through filter (always safe)."""
@@ -1202,7 +1162,7 @@ class OrderByPushdownRule(OptimizationRule):
             self._push_sort_into_child(sort, join.right) if right_only else join.right
         )
 
-        rebuilt = Join(new_left, new_right, join.join_type, join.condition)
+        rebuilt = replace(join, left=new_left, right=new_right)
         return Sort(
             input=rebuilt,
             sort_keys=sort.sort_keys,
@@ -1474,12 +1434,7 @@ class OrderByPushdownRule(OptimizationRule):
             return plan
 
         if isinstance(plan, Projection):
-            return Projection(
-                new_input,
-                plan.expressions,
-                plan.aliases,
-                plan.distinct,
-            )
+            return replace(plan, input=new_input)
 
         if isinstance(plan, Filter):
             if isinstance(new_input, Scan) and new_input.aggregates:
@@ -1504,7 +1459,7 @@ class OrderByPushdownRule(OptimizationRule):
             return Filter(new_input, plan.predicate)
 
         if isinstance(plan, Limit):
-            return Limit(new_input, plan.limit, plan.offset)
+            return replace(plan, input=new_input)
 
         if isinstance(plan, Sort):
             return Sort(
@@ -1524,7 +1479,7 @@ class OrderByPushdownRule(OptimizationRule):
         if new_left == join.left and new_right == join.right:
             return join
 
-        return Join(new_left, new_right, join.join_type, join.condition)
+        return replace(join, left=new_left, right=new_right)
 
     def _recurse_aggregate(self, agg: Aggregate) -> LogicalPlanNode:
         """Recurse into aggregate node."""
@@ -1532,7 +1487,7 @@ class OrderByPushdownRule(OptimizationRule):
         if new_input == agg.input:
             return agg
 
-        return Aggregate(new_input, agg.group_by, agg.aggregates, agg.output_names)
+        return replace(agg, input=new_input)
 
     def name(self) -> str:
         """Return this rule's identifier (used in logging and EXPLAIN)."""
@@ -1632,21 +1587,16 @@ class AggregatePushdownRule(OptimizationRule):
             return plan
 
         if isinstance(plan, Projection):
-            return Projection(
-                new_input,
-                plan.expressions,
-                plan.aliases,
-                plan.distinct,
-            )
+            return replace(plan, input=new_input)
 
         if isinstance(plan, Filter):
             return Filter(new_input, plan.predicate)
 
         if isinstance(plan, Limit):
-            return Limit(new_input, plan.limit, plan.offset)
+            return replace(plan, input=new_input)
 
         if isinstance(plan, Sort):
-            return Sort(new_input, plan.sort_keys, plan.ascending, plan.nulls_order)
+            return replace(plan, input=new_input)
 
         return plan
 
@@ -1658,7 +1608,7 @@ class AggregatePushdownRule(OptimizationRule):
         if new_left == join.left and new_right == join.right:
             return join
 
-        return Join(new_left, new_right, join.join_type, join.condition)
+        return replace(join, left=new_left, right=new_right)
 
     def name(self) -> str:
         """Return this rule's identifier (used in logging and EXPLAIN)."""

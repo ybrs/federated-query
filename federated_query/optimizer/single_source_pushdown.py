@@ -63,6 +63,7 @@ class _PushContext:
         self.limit: Optional[int] = None
         self.offset: int = 0
         self.distinct: bool = False
+        self.distinct_on: Optional[List[Expression]] = None
         self.has_join: bool = False
         self.has_computed: bool = False
         self.has_aggregate: bool = False
@@ -198,6 +199,10 @@ class SingleSourcePushdown:
             return True
         if context.has_join or context.has_subquery_relation:
             return True
+        if context.distinct_on is not None:
+            # DISTINCT ON is only correct at the source (ORDER BY picks the row);
+            # the local pyarrow path cannot do it, so always push it.
+            return True
         return context.has_computed and not context.has_aggregate
 
     def _finish(self, context: _PushContext) -> Optional[PhysicalRemoteQuery]:
@@ -311,6 +316,7 @@ class SingleSourcePushdown:
         faithfully (``* AS "*"`` is invalid SQL) and is left to local execution.
         """
         context.distinct = projection.distinct
+        context.distinct_on = projection.distinct_on
         if self._has_star(projection.expressions):
             return False
         if self._is_columns_over_aggregate(projection):
@@ -914,9 +920,20 @@ class SingleSourcePushdown:
             parts.append(expression.to_sql())
         return ", ".join(parts)
 
+    def _distinct_keyword(self, context: _PushContext) -> str:
+        """Render SELECT, SELECT DISTINCT, or SELECT DISTINCT ON (keys)."""
+        if context.distinct_on is not None:
+            keys = []
+            for key in context.distinct_on:
+                keys.append(key.to_sql())
+            return f"SELECT DISTINCT ON ({', '.join(keys)})"
+        if context.distinct:
+            return "SELECT DISTINCT"
+        return "SELECT"
+
     def _render(self, context: _PushContext) -> str:
         """Assemble the full remote SELECT statement from the context."""
-        select_kw = "SELECT DISTINCT" if context.distinct else "SELECT"
+        select_kw = self._distinct_keyword(context)
         select_list = ", ".join(context.select_items) if context.select_items else "*"
         from_sql = self._from_clause(context)
         query = f"{select_kw} {select_list} FROM {from_sql}"

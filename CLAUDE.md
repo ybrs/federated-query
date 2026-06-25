@@ -32,6 +32,8 @@ asserts on). Nothing else, anywhere.
 
 Never fail silently. If something breaks it should throw an error. We don't want silent fails. You can only catch exceptions when we show it to the user in the cli. Otherwise all exceptions should be thrown. 
 
+No silent field drops when rebuilding nodes. Plan and expression nodes are frozen dataclasses rebuilt in many places (binder, optimizer, decorrelation, physical planner). NEVER reconstruct a node by re-listing its fields by hand, e.g. `Projection(new_input, node.expressions, node.aliases, node.distinct)`. If a field is forgotten it silently reverts to its default and the query returns a wrong answer with no error. ALWAYS rebuild with `dataclasses.replace(node, input=new_child)` (or the node's `with_children`), which copies every field and changes only what you name, so fields added later are preserved automatically. The same applies to expressions: `replace(func, args=bound_args)`, never re-list `FunctionCall(function_name=..., args=..., is_aggregate=...)`. The test `tests/test_node_field_preservation.py` pins the `with_children` contract for every node type with children; a new node field that a hand-written reconstruction drops will fail it.
+
 No legacy / compatibility cruft. This is a system we are building from scratch - there is no legacy code, no old callers, no external API to stay compatible with. Never add "store for compatibility" fields, shim attributes, dead aliases, or back-compat branches. If something is no longer needed, delete it; if an abstraction doesn't fit (e.g. a base attribute that a subclass can't honor), fix the abstraction and its callers, don't paper over it. A comment like "kept for compatibility" is a red flag to remove, not preserve.
 
 Follow Python PEP8

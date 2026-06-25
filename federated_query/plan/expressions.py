@@ -253,6 +253,10 @@ class FunctionCall(Expression):
     args: List[Expression]
     is_aggregate: bool = False
     distinct: bool = False
+    # Ordered-set aggregates (e.g. PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x))
+    # carry their sort key here; None for ordinary aggregates.
+    within_group_key: Optional[Expression] = None
+    within_group_desc: bool = False
 
     def get_type(self) -> DataType:
         # Type depends on function - needs catalog lookup
@@ -274,7 +278,15 @@ class FunctionCall(Expression):
         prefix = ""
         if self.distinct:
             prefix = "DISTINCT "
-        return f"{self.function_name}({prefix}{args_sql})"
+        call = f"{self.function_name}({prefix}{args_sql})"
+        if self.within_group_key is None:
+            return call
+        return f"{call} WITHIN GROUP (ORDER BY {self._within_group_order_sql()})"
+
+    def _within_group_order_sql(self) -> str:
+        """Render the ORDER BY key of an ordered-set aggregate's WITHIN GROUP."""
+        direction = " DESC" if self.within_group_desc else ""
+        return f"{self.within_group_key.to_sql()}{direction}"
 
     def __repr__(self) -> str:
         return f"FunctionCall({self.function_name}, {self.args})"

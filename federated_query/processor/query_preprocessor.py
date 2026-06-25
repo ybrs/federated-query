@@ -78,6 +78,7 @@ class QueryPreprocessor:
     ) -> None:
         """Traverse AST and rewrite every SELECT."""
         if isinstance(node, exp.Select):
+            self._inline_named_windows(node)
             self._rewrite_select(node, context, is_root)
         for key, value in node.args.items():
             child_is_root = self._child_is_root(node, key, is_root)
@@ -149,33 +150,126 @@ class QueryPreprocessor:
     ) -> Tuple[List[exp.Expression], List[ColumnMapping]]:
         """Rewrite an individual SELECT expression."""
         if isinstance(expression, exp.Star):
-            return self._expand_wildcard(None, sources)
+            return self._expand_wildcard(None, sources, expression)
         if isinstance(expression, exp.Column) and isinstance(expression.this, exp.Star):
             qualifier = self._identifier_to_str(expression.table)
-            return self._expand_wildcard(qualifier, sources)
+            return self._expand_wildcard(qualifier, sources, expression.this)
         replacements: List[exp.Expression] = [expression]
         metadata = self._column_mappings_for_expression(expression, sources)
         return replacements, metadata
+
+    def _inline_named_windows(self, select: exp.Select) -> None:
+        """Inline named windows (WINDOW w AS (...)) into their OVER w references.
+
+        After inlining, every window reference carries its own spec and the
+        WINDOW clause is removed, so the parser sees only explicit OVER (...).
+        """
+        named = select.args.get("windows")
+        if not named:
+            return
+        definitions = self._named_window_map(named)
+        for window in select.find_all(exp.Window):
+            self._resolve_window_reference(window, definitions)
+        select.set("windows", None)
+
+    def _named_window_map(self, named: List[exp.Window]) -> dict:
+        """Map each WINDOW name to its definition node."""
+        definitions = {}
+        for definition in named:
+            definitions[definition.this.name.lower()] = definition
+        return definitions
+
+    def _resolve_window_reference(self, window: exp.Window, definitions: dict) -> None:
+        """Merge a named window's spec into an ``OVER name`` reference."""
+        alias = window.args.get("alias")
+        if alias is None:
+            return
+        definition = definitions.get(alias.name.lower())
+        if definition is None:
+            raise StarExpansionError(f"Unknown window name '{alias.name}'")
+        self._merge_window_definition(window, definition)
+
+    def _merge_window_definition(
+        self, window: exp.Window, definition: exp.Window
+    ) -> None:
+        """Adopt the definition's partition/order/frame, keeping reference extras."""
+        window.set("alias", None)
+        self._inherit_window_arg(window, definition, "partition_by")
+        self._inherit_window_arg(window, definition, "order")
+        self._inherit_window_arg(window, definition, "spec")
+
+    def _inherit_window_arg(
+        self, window: exp.Window, definition: exp.Window, key: str
+    ) -> None:
+        """Copy one window-spec arg from the definition if the reference lacks it."""
+        if window.args.get(key):
+            return
+        source = definition.args.get(key)
+        if source is None:
+            return
+        window.set(key, self._copy_window_arg(source))
+
+    def _copy_window_arg(self, source):
+        """Copy a window-spec arg, which may be a node or a list of nodes."""
+        if isinstance(source, list):
+            copied = []
+            for item in source:
+                copied.append(item.copy())
+            return copied
+        return source.copy()
 
     def _expand_wildcard(
         self,
         qualifier: Optional[str],
         sources: List[_SelectSource],
+        star: exp.Star,
     ) -> Tuple[List[exp.Expression], List[ColumnMapping]]:
-        """Expand '*' or alias.* into explicit columns."""
+        """Expand '*' or alias.* into explicit columns, honoring EXCLUDE/REPLACE.
+
+        EXCLUDE/EXCEPT drops the listed columns; REPLACE substitutes a column's
+        output with the given ``expr AS name`` expression, keeping its position.
+        """
         targets = self._targets_for_wildcard(qualifier, sources)
-        replacements: List[exp.Expression] = []
+        excluded = self._excluded_column_names(star)
+        replacements = self._replacement_expressions(star)
+        columns: List[exp.Expression] = []
         metadata: List[ColumnMapping] = []
         for source in targets:
             for column in source.columns:
-                column_expr = self._build_column_expression(source, column)
-                replacements.append(column_expr)
-                mapping = ColumnMapping(
-                    internal_name=self._build_internal_name(source, column),
-                    visible_name=column,
+                if column.lower() in excluded:
+                    continue
+                self._append_wildcard_column(
+                    source, column, replacements, columns, metadata
                 )
-                metadata.append(mapping)
-        return replacements, metadata
+        return columns, metadata
+
+    def _append_wildcard_column(self, source, column, replacements, columns, metadata):
+        """Append one expanded column, or its REPLACE expression, plus metadata."""
+        replacement = replacements.get(column.lower())
+        if replacement is not None:
+            columns.append(replacement.copy())
+            return
+        columns.append(self._build_column_expression(source, column))
+        metadata.append(
+            ColumnMapping(
+                internal_name=self._build_internal_name(source, column),
+                visible_name=column,
+            )
+        )
+
+    def _excluded_column_names(self, star: exp.Star) -> set:
+        """Return the lowercased column names listed in a star's EXCEPT/EXCLUDE."""
+        names = set()
+        for column in star.args.get("except_") or []:
+            names.add(column.name.lower())
+        return names
+
+    def _replacement_expressions(self, star: exp.Star) -> dict:
+        """Map a lowercased column name to its REPLACE ``expr AS name`` node."""
+        mapping = {}
+        for alias in star.args.get("replace") or []:
+            mapping[alias.alias.lower()] = alias
+        return mapping
 
     def _targets_for_wildcard(
         self,

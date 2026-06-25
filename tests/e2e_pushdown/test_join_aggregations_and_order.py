@@ -124,4 +124,3 @@ def test_join_order_by_multiple_columns(single_source_env):
     query = document["queries"][0]["query"]
     joins = query.args.get("joins") or []
     assert joins, "expected remote join for order/limit query"
-

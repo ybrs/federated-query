@@ -14,10 +14,7 @@ from tests.e2e_pushdown.helpers import (
 def test_integer_very_large_positive(single_source_env):
     """Verifies very large integer values push correctly."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE price > 2147483647"
-    )
+    sql = "SELECT order_id FROM duckdb_primary.main.orders " "WHERE price > 2147483647"
     ast = explain_datasource_query(runtime, sql)
 
     where_clause = ast.args.get("where")
@@ -33,10 +30,7 @@ def test_integer_very_large_positive(single_source_env):
 def test_integer_very_large_negative(single_source_env):
     """Validates very negative integer values push correctly."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE price < -2147483648"
-    )
+    sql = "SELECT order_id FROM duckdb_primary.main.orders " "WHERE price < -2147483648"
     ast = explain_datasource_query(runtime, sql)
 
     where_clause = ast.args.get("where")
@@ -48,10 +42,7 @@ def test_integer_very_large_negative(single_source_env):
 def test_float_precision(single_source_env):
     """Checks float precision edge cases (0.1 + 0.2) push correctly."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE price = 0.1 + 0.2"
-    )
+    sql = "SELECT order_id FROM duckdb_primary.main.orders " "WHERE price = 0.1 + 0.2"
     ast = explain_datasource_query(runtime, sql)
 
     where_clause = ast.args.get("where")
@@ -71,10 +62,7 @@ def test_float_addition_computed_by_source(single_source_env):
     than the ``0.30000000000000004`` a Python float fold would have produced.
     """
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT 0.1 + 0.2 AS s "
-        "FROM duckdb_primary.main.orders LIMIT 1"
-    )
+    sql = "SELECT 0.1 + 0.2 AS s " "FROM duckdb_primary.main.orders LIMIT 1"
     table = runtime.execute(sql)
     values = table.column("s").to_pylist()
     assert values == [Decimal("0.3")]
@@ -129,10 +117,7 @@ def test_division_by_zero_behavior(single_source_env):
 def test_negative_number_operations(single_source_env):
     """Ensures negative number arithmetic pushes correctly."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE price * -1 < -100"
-    )
+    sql = "SELECT order_id FROM duckdb_primary.main.orders " "WHERE price * -1 < -100"
     ast = explain_datasource_query(runtime, sql)
 
     where_clause = ast.args.get("where")
@@ -147,10 +132,7 @@ def test_negative_number_operations(single_source_env):
 def test_very_small_decimals(single_source_env):
     """Validates very small decimal values (0.000001) push correctly."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE price > 0.000001"
-    )
+    sql = "SELECT order_id FROM duckdb_primary.main.orders " "WHERE price > 0.000001"
     ast = explain_datasource_query(runtime, sql)
 
     where_clause = ast.args.get("where")
@@ -204,8 +186,7 @@ def test_boolean_null_handling(single_source_env):
     """Ensures boolean NULL handling pushes correctly."""
     runtime = build_runtime(single_source_env)
     sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE (price > 100) IS NULL"
+        "SELECT order_id FROM duckdb_primary.main.orders " "WHERE (price > 100) IS NULL"
     )
     ast = explain_datasource_query(runtime, sql)
 
@@ -232,10 +213,7 @@ def test_timestamp_timezone_comparison(single_source_env):
 def test_mixed_numeric_types(single_source_env):
     """Checks mixed numeric type operations (INT + FLOAT) push correctly."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE quantity + 1.5 > 10"
-    )
+    sql = "SELECT order_id FROM duckdb_primary.main.orders " "WHERE quantity + 1.5 > 10"
     ast = explain_datasource_query(runtime, sql)
 
     where_clause = ast.args.get("where")
@@ -253,10 +231,7 @@ def test_mixed_numeric_types(single_source_env):
 def test_scientific_notation(single_source_env):
     """Ensures scientific notation numbers push correctly."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE price > 1.5e10"
-    )
+    sql = "SELECT order_id FROM duckdb_primary.main.orders " "WHERE price > 1.5e10"
     ast = explain_datasource_query(runtime, sql)
 
     where_clause = ast.args.get("where")

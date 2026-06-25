@@ -40,8 +40,7 @@ def test_null_in_arithmetic(single_source_env):
     """Validates NULL propagation in arithmetic (5 + NULL) pushes correctly."""
     runtime = build_runtime(single_source_env)
     sql = (
-        "SELECT order_id, price + quantity AS total "
-        "FROM duckdb_primary.main.orders"
+        "SELECT order_id, price + quantity AS total " "FROM duckdb_primary.main.orders"
     )
     ast = explain_datasource_query(runtime, sql)
 

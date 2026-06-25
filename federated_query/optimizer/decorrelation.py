@@ -262,7 +262,10 @@ def _expression_children(expr: Expression) -> List[Expression]:
 def _container_expression_children(expr: Expression) -> List[Expression]:
     """Child expressions of container-style expression nodes."""
     if isinstance(expr, FunctionCall):
-        return list(expr.args)
+        children = list(expr.args)
+        if expr.within_group_key is not None:
+            children.append(expr.within_group_key)
+        return children
     if isinstance(expr, TupleExpression):
         return list(expr.items)
     if isinstance(expr, InList):
@@ -387,12 +390,10 @@ def _rebuild_expression(expr: Expression, rebuild_child) -> Expression:
         rebuilt_args = []
         for arg in expr.args:
             rebuilt_args.append(rebuild_child(arg))
-        return FunctionCall(
-            function_name=expr.function_name,
-            args=rebuilt_args,
-            is_aggregate=expr.is_aggregate,
-            distinct=expr.distinct,
-        )
+        rebuilt_key = None
+        if expr.within_group_key is not None:
+            rebuilt_key = rebuild_child(expr.within_group_key)
+        return replace(expr, args=rebuilt_args, within_group_key=rebuilt_key)
     return _rebuild_container_expression(expr, rebuild_child)
 
 
@@ -1514,12 +1515,7 @@ class Decorrelator:
         for expr in node.expressions:
             rewritten, plan = self._rewrite_value_expr(expr, plan)
             expressions.append(rewritten)
-        return Projection(
-            input=plan,
-            expressions=expressions,
-            aliases=node.aliases,
-            distinct=node.distinct,
-        )
+        return replace(node, input=plan, expressions=expressions)
 
     def _rewrite_sort(self, node: Sort) -> LogicalPlanNode:
         """Rewrite sort keys; prune helper columns added for subqueries."""

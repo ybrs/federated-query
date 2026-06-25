@@ -52,6 +52,21 @@ class BindingError(Exception):
     pass
 
 
+def _rebuild_function_call(expr, bound_args, bind_one) -> FunctionCall:
+    """Rebuild a bound FunctionCall, preserving every field except the args.
+
+    ``replace`` copies all other fields (is_aggregate, distinct, WITHIN GROUP
+    info, and any field added later), so binding can never silently drop one.
+    ``bind_one`` binds the WITHIN GROUP sort key of an ordered-set aggregate.
+    """
+    from dataclasses import replace
+
+    bound_key = None
+    if expr.within_group_key is not None:
+        bound_key = bind_one(expr.within_group_key)
+    return replace(expr, args=bound_args, within_group_key=bound_key)
+
+
 # Maps the leading keyword of a SQL CAST target type to the engine DataType.
 _CAST_TYPE_KEYWORDS = {
     "INT": DataType.INTEGER,
@@ -260,6 +275,9 @@ class Binder:
             bound_expressions = self._bind_projection_expressions(
                 projection.expressions, bound_input
             )
+            bound_distinct_on = self._bind_distinct_on(
+                projection.distinct_on, bound_input
+            )
         finally:
             self._pop_scope()
 
@@ -268,7 +286,14 @@ class Binder:
             expressions=bound_expressions,
             aliases=projection.aliases,
             distinct=projection.distinct,
+            distinct_on=bound_distinct_on,
         )
+
+    def _bind_distinct_on(self, keys, bound_input) -> Optional[List[Expression]]:
+        """Bind the DISTINCT ON key expressions, or None for a plain projection."""
+        if keys is None:
+            return None
+        return self._bind_projection_expressions(keys, bound_input)
 
     def _bind_projection_expressions(
         self, expressions: List[Expression], bound_input: LogicalPlanNode
@@ -747,11 +772,8 @@ class Binder:
         """Bind an aggregate expression."""
         if isinstance(expr, FunctionCall):
             bound_args = self._bind_expressions(expr.args, table)
-            return FunctionCall(
-                function_name=expr.function_name,
-                args=bound_args,
-                is_aggregate=expr.is_aggregate,
-                distinct=expr.distinct,
+            return _rebuild_function_call(
+                expr, bound_args, lambda e: self._bind_expression(e, table)
             )
 
         return self._bind_expression(expr, table)
@@ -765,11 +787,8 @@ class Binder:
             for arg in expr.args:
                 bound_arg = self._bind_expression_multi_table(arg, tables)
                 bound_args.append(bound_arg)
-            return FunctionCall(
-                function_name=expr.function_name,
-                args=bound_args,
-                is_aggregate=expr.is_aggregate,
-                distinct=expr.distinct,
+            return _rebuild_function_call(
+                expr, bound_args, lambda e: self._bind_expression_multi_table(e, tables)
             )
 
         return self._bind_expression_multi_table(expr, tables)
@@ -1223,12 +1242,7 @@ class Binder:
         bound_args = []
         for arg in expr.args:
             bound_args.append(bind_value(arg))
-        return FunctionCall(
-            function_name=expr.function_name,
-            args=bound_args,
-            is_aggregate=expr.is_aggregate,
-            distinct=expr.distinct,
-        )
+        return _rebuild_function_call(expr, bound_args, bind_value)
 
     def _is_subquery_expression(self, expr: Expression) -> bool:
         """Check whether an expression node carries a subquery plan."""
@@ -1475,7 +1489,17 @@ class SubqueryPlanBinder:
             expressions=bound_expressions,
             aliases=projection.aliases,
             distinct=projection.distinct,
+            distinct_on=self._bind_subquery_distinct_on(projection, bound_input),
         )
+
+    def _bind_subquery_distinct_on(self, projection, bound_input):
+        """Bind a subquery projection's DISTINCT ON keys, or None if absent."""
+        if projection.distinct_on is None:
+            return None
+        bound = []
+        for key in projection.distinct_on:
+            bound.append(self._bind_expr_for(key, bound_input))
+        return bound
 
     def _bind_aggregate(self, aggregate: Aggregate) -> Aggregate:
         """Bind group-by and aggregate expressions."""
@@ -1598,11 +1622,8 @@ class SubqueryPlanBinder:
             bound_args = []
             for arg in expr.args:
                 bound_args.append(self._bind_expr(arg, scopes))
-            return FunctionCall(
-                function_name=expr.function_name,
-                args=bound_args,
-                is_aggregate=expr.is_aggregate,
-                distinct=expr.distinct,
+            return _rebuild_function_call(
+                expr, bound_args, lambda e: self._bind_expr(e, scopes)
             )
         if isinstance(expr, WindowExpr):
             return self._bind_window(expr, scopes)

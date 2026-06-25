@@ -67,6 +67,15 @@ def test_normalize_join_kind_no_enum_string_pollution():
     assert len(joins) == 1
     result = _normalize_join_kind(joins[0])
 
-    assert "JOINSIDE" not in result, f"Result should not contain 'JOINSIDE', got '{result}'"
-    assert "JOINKIND" not in result, f"Result should not contain 'JOINKIND', got '{result}'"
-    assert result in ["LEFT", "RIGHT", "FULL", "INNER"], f"Result must be clean join type, got '{result}'"
+    assert (
+        "JOINSIDE" not in result
+    ), f"Result should not contain 'JOINSIDE', got '{result}'"
+    assert (
+        "JOINKIND" not in result
+    ), f"Result should not contain 'JOINKIND', got '{result}'"
+    assert result in [
+        "LEFT",
+        "RIGHT",
+        "FULL",
+        "INNER",
+    ], f"Result must be clean join type, got '{result}'"

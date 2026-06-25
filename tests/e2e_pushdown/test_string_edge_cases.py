@@ -53,10 +53,7 @@ def test_unicode_strings(single_source_env):
 def test_strings_with_single_quotes(single_source_env):
     """Checks strings with single quotes (O'Brien) push correctly."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE region = 'O''Brien'"
-    )
+    sql = "SELECT order_id FROM duckdb_primary.main.orders " "WHERE region = 'O''Brien'"
     ast = explain_datasource_query(runtime, sql)
 
     where_clause = ast.args.get("where")
@@ -102,8 +99,7 @@ def test_strings_with_tabs(single_source_env):
     """Checks strings with tab characters push correctly."""
     runtime = build_runtime(single_source_env)
     sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE region = 'Col1\tCol2'"
+        "SELECT order_id FROM duckdb_primary.main.orders " "WHERE region = 'Col1\tCol2'"
     )
     ast = explain_datasource_query(runtime, sql)
 
@@ -183,10 +179,7 @@ def test_like_wildcards_various_positions(single_source_env):
 def test_ilike_case_insensitive(single_source_env):
     """Ensures ILIKE (case-insensitive LIKE) pushes correctly if supported."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE region ILIKE 'eu%'"
-    )
+    sql = "SELECT order_id FROM duckdb_primary.main.orders " "WHERE region ILIKE 'eu%'"
 
     ast = explain_datasource_query(runtime, sql)
 

@@ -65,9 +65,7 @@ def test_null_in_group_by(single_source_env):
     """Validates GROUP BY treats NULL as a distinct group value."""
     runtime = build_runtime(single_source_env)
     sql = (
-        "SELECT region, COUNT(*) "
-        "FROM duckdb_primary.main.orders "
-        "GROUP BY region"
+        "SELECT region, COUNT(*) " "FROM duckdb_primary.main.orders " "GROUP BY region"
     )
     ast = explain_datasource_query(runtime, sql)
     group_clause = ast.args.get("group")
@@ -94,8 +92,7 @@ def test_count_star_vs_count_column_with_nulls(single_source_env):
     )
     count_col = find_in_select(
         ast,
-        lambda node: isinstance(node, exp.Count)
-        and isinstance(node.this, exp.Column),
+        lambda node: isinstance(node, exp.Count) and isinstance(node.this, exp.Column),
     )
     assert len(count_star) == 1
     assert len(count_col) == 1
@@ -200,10 +197,7 @@ def test_not_in_with_null_semantics(single_source_env):
 def test_null_equality_comparison(single_source_env):
     """Verifies NULL = NULL evaluates to NULL not TRUE per SQL standard."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE region IS NULL"
-    )
+    sql = "SELECT order_id FROM duckdb_primary.main.orders " "WHERE region IS NULL"
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
     assert projection == ["order_id", "region"]

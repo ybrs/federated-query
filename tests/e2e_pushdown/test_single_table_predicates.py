@@ -164,10 +164,7 @@ def test_between_predicate(single_source_env):
 def test_like_predicate(single_source_env):
     """Checks LIKE predicates stay remote with their pattern intact."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT name FROM duckdb_primary.main.products "
-        "WHERE name LIKE 'c%'"
-    )
+    sql = "SELECT name FROM duckdb_primary.main.products " "WHERE name LIKE 'c%'"
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
     assert projection == ["name"]
@@ -181,8 +178,7 @@ def test_limit_pushdown(single_source_env):
     """Ensures LIMIT clause of 3 is part of the remote AST."""
     runtime = build_runtime(single_source_env)
     sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE region = 'EU' LIMIT 3"
+        "SELECT order_id FROM duckdb_primary.main.orders " "WHERE region = 'EU' LIMIT 3"
     )
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
@@ -196,10 +192,7 @@ def test_limit_pushdown(single_source_env):
 def test_limit_offset_pushdown(single_source_env):
     """Confirms LIMIT/OFFSET clauses retain expected numeric values remotely."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "LIMIT 2 OFFSET 1"
-    )
+    sql = "SELECT order_id FROM duckdb_primary.main.orders " "LIMIT 2 OFFSET 1"
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
     assert projection == ["order_id"]
@@ -340,10 +333,7 @@ def test_not_between_predicate(single_source_env):
 def test_not_like_predicate(single_source_env):
     """Checks NOT LIKE predicates push correctly with pattern negation."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT name FROM duckdb_primary.main.products "
-        "WHERE name NOT LIKE 'temp%'"
-    )
+    sql = "SELECT name FROM duckdb_primary.main.products " "WHERE name NOT LIKE 'temp%'"
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
     assert projection == ["name"]

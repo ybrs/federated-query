@@ -27,13 +27,28 @@ logger = logging.getLogger(__name__)
 # consistent with the duckdb/postgres connectors. Wrappers (Nullable, etc.) and
 # parameters (DateTime64(3), FixedString(16)) are stripped before lookup.
 _CH_TO_SQL = {
-    "Int8": "SMALLINT", "Int16": "SMALLINT", "Int32": "INTEGER", "Int64": "BIGINT",
-    "Int128": "BIGINT", "Int256": "BIGINT",
-    "UInt8": "SMALLINT", "UInt16": "INTEGER", "UInt32": "BIGINT", "UInt64": "BIGINT",
-    "Float32": "REAL", "Float64": "DOUBLE", "Decimal": "DOUBLE",
-    "String": "VARCHAR", "FixedString": "VARCHAR", "UUID": "VARCHAR", "Enum8": "VARCHAR",
+    "Int8": "SMALLINT",
+    "Int16": "SMALLINT",
+    "Int32": "INTEGER",
+    "Int64": "BIGINT",
+    "Int128": "BIGINT",
+    "Int256": "BIGINT",
+    "UInt8": "SMALLINT",
+    "UInt16": "INTEGER",
+    "UInt32": "BIGINT",
+    "UInt64": "BIGINT",
+    "Float32": "REAL",
+    "Float64": "DOUBLE",
+    "Decimal": "DOUBLE",
+    "String": "VARCHAR",
+    "FixedString": "VARCHAR",
+    "UUID": "VARCHAR",
+    "Enum8": "VARCHAR",
     "Enum16": "VARCHAR",
-    "Date": "DATE", "Date32": "DATE", "DateTime": "TIMESTAMP", "DateTime64": "TIMESTAMP",
+    "Date": "DATE",
+    "Date32": "DATE",
+    "DateTime": "TIMESTAMP",
+    "DateTime64": "TIMESTAMP",
     "Bool": "BOOLEAN",
 }
 
@@ -43,7 +58,7 @@ def _strip_ch_type(ch_type: str) -> str:
     base = ch_type
     for wrapper in ("Nullable(", "LowCardinality("):
         if base.startswith(wrapper):
-            base = base[len(wrapper):-1]
+            base = base[len(wrapper) : -1]
     paren = base.find("(")
     if paren != -1:
         base = base[:paren]
@@ -73,8 +88,11 @@ class ClickHouseDataSource(DataSource):
         # shared ClickHouse session serializes them and raises SESSION_IS_LOCKED.
         # Without a session each HTTP query is independent over the client's pool.
         self._client = clickhouse_connect.get_client(
-            host=self.host, port=self.port, username=self.username,
-            password=self.password, database=self.database,
+            host=self.host,
+            port=self.port,
+            username=self.username,
+            password=self.password,
+            database=self.database,
             autogenerate_session_id=False,
         )
         self._connected = True
@@ -129,8 +147,11 @@ class ClickHouseDataSource(DataSource):
         for name, ch_type in rows:
             sql_type = _CH_TO_SQL.get(_strip_ch_type(ch_type), "VARCHAR")
             columns.append(
-                ColumnMetadata(name=name, data_type=sql_type,
-                               nullable=ch_type.startswith("Nullable("))
+                ColumnMetadata(
+                    name=name,
+                    data_type=sql_type,
+                    nullable=ch_type.startswith("Nullable("),
+                )
             )
         return TableMetadata(schema_name=schema, table_name=table, columns=columns)
 

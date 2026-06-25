@@ -120,15 +120,15 @@ def get_pushed_sql(sql: str, catalog: Catalog) -> str:
 
     # Find PhysicalScan node
     def find_scan(node):
-        if node.__class__.__name__ == 'PhysicalScan':
+        if node.__class__.__name__ == "PhysicalScan":
             return node
-        if hasattr(node, 'input'):
+        if hasattr(node, "input"):
             return find_scan(node.input)
-        if hasattr(node, 'left'):
+        if hasattr(node, "left"):
             left_scan = find_scan(node.left)
             if left_scan:
                 return left_scan
-        if hasattr(node, 'right'):
+        if hasattr(node, "right"):
             return find_scan(node.right)
         return None
 
@@ -151,7 +151,9 @@ class TestPredicatePushdown:
         assert pushed_sql is not None, "No SQL was generated"
         assert "WHERE" in pushed_sql, f"No WHERE clause in: {pushed_sql}"
         assert "order_id" in pushed_sql, f"Predicate not pushed: {pushed_sql}"
-        assert "5" in pushed_sql or "= 5" in pushed_sql, f"Value not in predicate: {pushed_sql}"
+        assert (
+            "5" in pushed_sql or "= 5" in pushed_sql
+        ), f"Value not in predicate: {pushed_sql}"
 
     def test_comparison_filter(self, setup_test_db):
         """Test WHERE column > value pushdown."""
@@ -162,20 +164,26 @@ class TestPredicatePushdown:
 
         assert "WHERE" in pushed_sql, f"No WHERE clause: {pushed_sql}"
         assert "quantity" in pushed_sql, f"Column not in WHERE: {pushed_sql}"
-        assert ">" in pushed_sql or "2" in pushed_sql, f"Comparison not pushed: {pushed_sql}"
+        assert (
+            ">" in pushed_sql or "2" in pushed_sql
+        ), f"Comparison not pushed: {pushed_sql}"
 
     def test_compound_and_filter(self, setup_test_db):
         """Test WHERE col1 = val1 AND col2 > val2 pushdown."""
         catalog, ds = setup_test_db
 
-        sql = "SELECT * FROM testdb.main.orders WHERE status = 'completed' AND price > 50"
+        sql = (
+            "SELECT * FROM testdb.main.orders WHERE status = 'completed' AND price > 50"
+        )
         pushed_sql = get_pushed_sql(sql, catalog)
 
         assert "WHERE" in pushed_sql, f"No WHERE clause: {pushed_sql}"
         assert "status" in pushed_sql, f"status not in WHERE: {pushed_sql}"
         assert "price" in pushed_sql, f"price not in WHERE: {pushed_sql}"
         # Should have AND (or equivalent conjunction)
-        assert "AND" in pushed_sql.upper() or ")" in pushed_sql, f"Compound filter not preserved: {pushed_sql}"
+        assert (
+            "AND" in pushed_sql.upper() or ")" in pushed_sql
+        ), f"Compound filter not preserved: {pushed_sql}"
 
     def test_string_filter(self, setup_test_db):
         """Test WHERE string_column = 'value' pushdown."""
@@ -342,7 +350,9 @@ class TestCombinedPushdowns:
         assert "WHERE" in pushed_sql, f"Predicate not pushed: {pushed_sql}"
         # Should have the columns involved in predicates
         assert "price" in pushed_sql, f"price not in query: {pushed_sql}"
-        assert "quantity" in pushed_sql or "status" in pushed_sql, f"Filter columns missing: {pushed_sql}"
+        assert (
+            "quantity" in pushed_sql or "status" in pushed_sql
+        ), f"Filter columns missing: {pushed_sql}"
 
 
 class TestAggregatePushdown:
@@ -363,8 +373,9 @@ class TestAggregatePushdown:
             pytest.skip("Aggregate pushdown is implemented (unexpected)")
         else:
             # Expected: Full table scan, no COUNT pushed down
-            assert "SELECT *" in pushed_sql or "SELECT" in pushed_sql, \
-                f"Should do table scan: {pushed_sql}"
+            assert (
+                "SELECT *" in pushed_sql or "SELECT" in pushed_sql
+            ), f"Should do table scan: {pushed_sql}"
 
     def test_sum_aggregate(self, setup_test_db):
         """Test SUM(column) pushdown - EXPECTED TO FAIL."""
@@ -405,7 +416,9 @@ class TestAggregatePushdown:
         pushed_sql = get_pushed_sql(sql, catalog)
 
         # Filter SHOULD push down
-        assert "WHERE" in pushed_sql, f"Filter should push even without aggregate pushdown: {pushed_sql}"
+        assert (
+            "WHERE" in pushed_sql
+        ), f"Filter should push even without aggregate pushdown: {pushed_sql}"
         assert "status" in pushed_sql, f"status filter missing: {pushed_sql}"
 
         # Aggregate should NOT push down

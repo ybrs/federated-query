@@ -4,6 +4,7 @@ E2E tests for NULL semantics in decorrelation.
 Tests proper NULL handling across all subquery patterns, including
 three-valued logic, null-safe comparisons, and NULL propagation.
 """
+
 import pytest
 from federated_query.parser.parser import Parser
 from federated_query.parser.binder import Binder
@@ -13,7 +14,7 @@ from .test_utils import (
     assert_plan_structure,
     assert_result_count,
     assert_result_contains_ids,
-    execute_and_fetch_all
+    execute_and_fetch_all,
 )
 
 
@@ -819,12 +820,10 @@ class TestComplexNullScenarios:
         bound_plan = binder.bind(logical_plan)
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
-        assert_plan_structure(decorrelated_plan, {
-            'has_anti_join': True
-        })
+        assert_plan_structure(decorrelated_plan, {"has_anti_join": True})
 
         results = execute_and_fetch_all(executor, decorrelated_plan)
         ids = set()
         for row in results:
-            ids.add(row['id'])
+            ids.add(row["id"])
         assert ids == {2, 3, 4, 5, 10}, f"Unexpected ids {ids}"
