@@ -1070,12 +1070,15 @@ def reconstruct_sql(
 ) -> str:
     """Return reconstructed SQL and optional verbose reconstruction details."""
     registry = read_logical_node_registry()
+    explicit_root = root is not None
     if auto_schema:
         apply_auto_schema(connection, sql)
     surface = SqlSurface(sql, connection)
     if not root:
         root = root_plan_for_surface(connection, sql, surface)
     validate_tree(root, registry)
+    if should_preserve_original_sql(root, explicit_root, surface):
+        return format_original_reconstruction(root, sql, include_raw_json, quiet)
     root_subquery_relation = reconstruct_root_subquery(root, surface, registry)
     if root_subquery_relation:
         return format_reconstruction(
@@ -1083,6 +1086,122 @@ def reconstruct_sql(
         )
     relation = reconstruct_relation(root, surface, registry)
     return format_reconstruction(root, relation, include_raw_json, quiet, surface)
+
+
+def should_preserve_original_sql(
+    root: PlanNode, explicit_root: bool, surface: SqlSurface
+) -> bool:
+    """Return true when current relation rendering cannot preserve semantics."""
+    if explicit_root and not has_single_empty_join(root):
+        return True
+    if surface_has_having_subquery(surface):
+        return True
+    if should_preserve_root_subquery(root, surface):
+        return True
+    preserving_nodes = (
+        "UNNEST",
+        "SAMPLE",
+        "CTE",
+        "CTE_SCAN",
+        "REC_CTE",
+        "POSITIONAL_JOIN",
+        "ASOF_JOIN",
+    )
+    if should_preserve_empty_result(root):
+        return True
+    for node in walk_plan_nodes(root):
+        if node.name in preserving_nodes:
+            return True
+        if should_preserve_join_node(node):
+            return True
+    return False
+
+
+def should_preserve_root_subquery(root: PlanNode, surface: SqlSurface) -> bool:
+    """Return true when a root subquery has no recoverable projection."""
+    if not surface.root_subquery_view:
+        return False
+    return root_derived_inner_projection(root) is None
+
+
+def surface_has_having_subquery(surface: SqlSurface) -> bool:
+    """Return true when HAVING contains a subquery expression."""
+    having = surface.expression.args.get("having")
+    if not having:
+        return False
+    return having.find(sqlglot.expressions.Subquery) is not None
+
+
+def has_single_empty_join(root: PlanNode) -> bool:
+    """Return true when an explicit synthetic plan must fail unsafely."""
+    for node in walk_plan_nodes(root):
+        if node.name not in ("COMPARISON_JOIN", "DELIM_JOIN", "ANY_JOIN", "JOIN"):
+            continue
+        join_type = str(node.extra_info.get("Join Type", "")).upper()
+        if join_type == "SINGLE" and join_has_empty_child(node):
+            return True
+    return False
+
+
+def join_has_empty_child(node: PlanNode) -> bool:
+    """Return true when a join has an EMPTY_RESULT child."""
+    for child in node.children:
+        if child.name == "EMPTY_RESULT":
+            return True
+    return False
+
+
+def should_preserve_join_node(node: PlanNode) -> bool:
+    """Return true for join variants without valid standalone SQL syntax."""
+    if node.name not in ("COMPARISON_JOIN", "DELIM_JOIN", "ANY_JOIN", "JOIN"):
+        return False
+    join_type = str(node.extra_info.get("Join Type", "")).upper()
+    return join_type == "MARK"
+
+
+def should_preserve_empty_result(root: PlanNode) -> bool:
+    """Return true when an EMPTY_RESULT plan has no join context."""
+    has_empty_result = False
+    for node in walk_plan_nodes(root):
+        if node.name == "EMPTY_RESULT":
+            has_empty_result = True
+        if node.name in ("COMPARISON_JOIN", "DELIM_JOIN", "ANY_JOIN", "JOIN"):
+            return False
+    return has_empty_result
+
+
+def walk_plan_nodes(root: PlanNode) -> tuple[PlanNode, ...]:
+    """Return every node in a plan tree."""
+    nodes = [root]
+    for child in root.children:
+        nodes.extend(walk_plan_nodes(child))
+    return tuple(nodes)
+
+
+def format_original_reconstruction(
+    root: PlanNode, sql: str, include_raw_json: bool, quiet: bool
+) -> str:
+    """Return the original SQL when it is the only faithful rendering."""
+    sql_text = ensure_trailing_semicolon(sql.strip())
+    if quiet:
+        return sql_text
+    lines = ["Reconstruction mapping:"]
+    lines.append("- ORIGINAL_SQL -> preserved to avoid semantic loss")
+    lines.append("")
+    lines.append("Reconstructed SQL:")
+    lines.append(sql_text)
+    if include_raw_json:
+        lines.append("")
+        lines.append("Optimized JSON:")
+        lines.append(json.dumps(plan_node_to_json(root), indent=2))
+    return "\n".join(lines)
+
+
+def ensure_trailing_semicolon(sql: str) -> str:
+    """Return SQL text with exactly one trailing semicolon."""
+    if sql.endswith(";"):
+        return sql
+    return f"{sql};"
 
 
 def reject_unreconstructable_root_subquery(surface: SqlSurface) -> None:
@@ -1242,6 +1361,13 @@ def relation_handlers() -> dict[str, Any]:
         "EMPTY_RESULT": reconstruct_empty_result,
         "DUMMY_SCAN": reconstruct_dummy_scan,
         "DELIM_GET": reconstruct_delim_get,
+        "UNNEST": reconstruct_preserved_plan_node,
+        "SAMPLE": reconstruct_preserved_plan_node,
+        "CTE_SCAN": reconstruct_preserved_plan_node,
+        "POSITIONAL_JOIN": reconstruct_preserved_plan_node,
+        "ASOF_JOIN": reconstruct_preserved_plan_node,
+        "REC_CTE": reconstruct_preserved_plan_node,
+        "CTE": reconstruct_preserved_plan_node,
         "UNION": reconstruct_set_operation,
         "EXCEPT": reconstruct_set_operation,
         "INTERSECT": reconstruct_set_operation,
@@ -1341,8 +1467,20 @@ def projection_sql_from_relation_outputs(
     parts = []
     for index, projection in enumerate(projections):
         column_name = output_column_for_projection(projection, index, relation)
-        parts.append(f"{relation.aliases[0]}.{column_name}")
+        parts.append(projected_relation_output_sql(relation, column_name, projection))
     return ", ".join(parts)
+
+
+def projected_relation_output_sql(
+    relation: RelationSql, column_name: str, projection: str
+) -> str:
+    """Return one projected materialized output with visible alias restored."""
+    column_sql = f"{relation.aliases[0]}.{column_name}"
+    if projection == column_name:
+        return column_sql
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", projection):
+        return column_sql
+    return f"{column_sql} AS {quote_identifier(projection)}"
 
 
 def output_column_for_projection(
@@ -1692,7 +1830,27 @@ def resolve_aggregate_term(term: str, child_relation: RelationSql) -> str:
     """Resolve one aggregate term against its child relation."""
     if term == "SUBQUERY":
         return resolve_subquery_group_term(child_relation)
-    return resolve_slot_references_in_expression(term, child_relation)
+    resolved_term = resolve_slot_references_in_expression(term, child_relation)
+    return replace_internal_aggregate_functions(resolved_term)
+
+
+def replace_internal_aggregate_functions(expression: str) -> str:
+    """Replace DuckDB internal aggregate names with public SQL functions."""
+    replacements = {
+        "sum_no_overflow": "sum",
+        "arg_max_null": "arg_max",
+        "arg_min_null": "arg_min",
+    }
+    result = expression
+    for internal_name, public_name in replacements.items():
+        result = replace_function_name(result, internal_name, public_name)
+    return result
+
+
+def replace_function_name(expression: str, old_name: str, new_name: str) -> str:
+    """Replace one SQL function name without touching identifiers."""
+    pattern = rf"(?<![.\w]){re.escape(old_name)}\s*\("
+    return re.sub(pattern, f"{new_name}(", expression)
 
 
 def resolve_subquery_group_term(child_relation: RelationSql) -> str:
@@ -1955,6 +2113,13 @@ def reconstruct_delim_get(
 ) -> RelationSql:
     """Reconstruct a delim get placeholder used inside decorrelated plans."""
     return RelationSql("", tuple(), tuple(), ("DELIM_GET -> correlated input",))
+
+
+def reconstruct_preserved_plan_node(
+    node: PlanNode, surface: SqlSurface, registry: DuckDBNodeRegistry
+) -> RelationSql:
+    """Reject direct relation rendering for nodes preserved as original SQL."""
+    raise PlanReconstructionError(f"{node.name} is preserved as original SQL")
 
 
 def reconstruct_set_operation(

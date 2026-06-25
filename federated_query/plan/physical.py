@@ -187,6 +187,61 @@ def _table_from_batches(batches: List[pa.RecordBatch], schema: pa.Schema) -> pa.
     return pa.Table.from_batches(batches)
 
 
+_MERGE_JOIN_KEYWORDS = {
+    JoinType.INNER: "INNER JOIN",
+    JoinType.LEFT: "LEFT JOIN",
+    JoinType.RIGHT: "RIGHT JOIN",
+    JoinType.FULL: "FULL JOIN",
+    JoinType.SEMI: "SEMI JOIN",
+    JoinType.ANTI: "ANTI JOIN",
+}
+
+
+def _qualify_join_condition(condition, left_names, right_names):
+    """Rebuild a join condition qualifying each column ref by its side.
+
+    A column whose name belongs to the left input is qualified ``l.``, one on
+    the right ``r.``; this lets an arbitrary (non-equi, NULL-aware) predicate be
+    rendered against the two registered merge-engine relations without ambiguity.
+    """
+    from .expressions import ColumnRef, BinaryOp, UnaryOp
+
+    if isinstance(condition, ColumnRef):
+        if condition.column in left_names:
+            return ColumnRef(table="l", column=condition.column)
+        if condition.column in right_names:
+            return ColumnRef(table="r", column=condition.column)
+        return condition
+    if isinstance(condition, BinaryOp):
+        return BinaryOp(
+            op=condition.op,
+            left=_qualify_join_condition(condition.left, left_names, right_names),
+            right=_qualify_join_condition(condition.right, left_names, right_names),
+        )
+    if isinstance(condition, UnaryOp):
+        return UnaryOp(
+            op=condition.op,
+            operand=_qualify_join_condition(condition.operand, left_names, right_names),
+        )
+    return condition
+
+
+def _merge_join_select_list(join_type, left_schema, right_schema) -> str:
+    """SELECT list reproducing the join output: left only for SEMI/ANTI, else both."""
+    parts = []
+    for name in left_schema.names:
+        parts.append(f'l."{name}" AS "{name}"')
+    if join_type in (JoinType.SEMI, JoinType.ANTI):
+        return ", ".join(parts)
+    left_name_set = set(left_schema.names)
+    for field in right_schema:
+        output_name = field.name
+        if output_name in left_name_set:
+            output_name = f"right_{output_name}"
+        parts.append(f'r."{field.name}" AS "{output_name}"')
+    return ", ".join(parts)
+
+
 def _cast_batch_to_schema(batch: pa.RecordBatch, target: pa.Schema) -> pa.RecordBatch:
     """Cast each column of a batch to the target schema's types.
 
@@ -894,16 +949,19 @@ class PhysicalHashJoin(PhysicalPlanNode):
     def _execute_streamed_merge(self, engine) -> Iterator[pa.RecordBatch]:
         """Run a non-INNER join (LEFT/RIGHT/FULL/SEMI/ANTI) through DuckDB.
 
-        These keep every non-matching row, so the G9 probe reduction does not
-        apply. The right side is drained into a table first — exactly as the
+        Outer joins (LEFT/RIGHT/FULL) and ANTI keep non-matching rows, so the
+        probe reduction does not apply; a SEMI join keeps only matching left
+        rows, so the right's keys are pushed into the left as a semi-join
+        reduction. The right side is drained into a table first — exactly as the
         row-at-a-time path drains the build side — so its source connection is
         released before the left side streams; otherwise deeply nested joins
         hold a connection open at every level and exhaust the pool. The left
         side streams.
         """
-        right_table = _table_from_batches(
-            list(self.right.execute()), self.right.schema()
-        )
+        right_batches = list(self.right.execute())
+        if self.join_type == JoinType.SEMI:
+            self._reduce_left_for_semi(right_batches)
+        right_table = _table_from_batches(right_batches, self.right.schema())
         left_reader = _streaming_reader(self.left)
         inputs = {
             _MERGE_LEFT_RELATION: left_reader,
@@ -911,6 +969,24 @@ class PhysicalHashJoin(PhysicalPlanNode):
         }
         sql = self._join_sql(left_reader.schema, right_table.schema)
         return engine.run(sql, inputs)
+
+    def _reduce_left_for_semi(self, right_batches: List[pa.RecordBatch]) -> None:
+        """Push the right's distinct keys into the left scan (semi-join reduction).
+
+        A SEMI join keeps only left rows whose key matches a right key, so
+        constraining the left to those keys drops no result row and avoids
+        fetching unmatched rows from the left's (often remote) source. ANTI is
+        excluded — it keeps non-matching rows, which this filter would remove.
+        """
+        value_tuples = self._distinct_build_keys(
+            right_batches, self.right, self.right_keys
+        )
+        if value_tuples is None:
+            return
+        if self.left.apply_dynamic_filter(self.left_keys, value_tuples):
+            _LOGGER.debug(
+                "semi-join reduction: %d keys pushed to left", len(value_tuples)
+            )
 
     def _execute_inner_merge(self, engine) -> Iterator[pa.RecordBatch]:
         """Run an INNER equi-join through the DuckDB merge engine.
@@ -1639,18 +1715,52 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
         return [self.left, self.right]
 
     def execute(self) -> Iterator[pa.RecordBatch]:
-        """Execute nested loop join (row-at-a-time, intentionally not migrated).
+        """Run the join in the merge engine (DuckDB), or a Python loop if absent.
 
-        This stays on the row loop rather than going through the merge engine.
-        Its ``condition`` is an arbitrary predicate over the *joined* schema and,
-        in practice, is the null-aware SEMI/ANTI/LEFT predicate decorrelation
-        produces (``x = v OR x IS NULL OR v IS NULL``); rendering that to DuckDB
-        needs a side-resolving expression renderer (each column mapped to the
-        left or right input, with mixed bare/qualified references). The risk of
-        subtly changing those exact NULL semantics outweighs the gain, since
-        non-equi/cross inputs are rare and small. The vectorized win lives in
-        the equi joins, aggregate, sort and set operations, which are migrated.
+        The arbitrary ``condition`` (in practice the null-aware SEMI/ANTI/LEFT
+        predicate decorrelation produces, ``x = v OR x IS NULL OR v IS NULL``) is
+        rendered to DuckDB with each column resolved to the left or right input.
+        DuckDB materializes each side once and joins set-based — so the inner
+        side is never re-scanned per outer row (which, cross-source, would be a
+        remote query per row). The Python loop remains only as a no-engine path.
         """
+        engine = self.merge_engine()
+        if engine is not None:
+            yield from self._execute_merge(engine)
+            return
+        yield from self._execute_python()
+
+    def _execute_merge(self, engine) -> Iterator[pa.RecordBatch]:
+        """Materialize the right, stream the left, and join in DuckDB."""
+        right_table = _table_from_batches(
+            list(self.right.execute()), self.right.schema()
+        )
+        left_reader = _streaming_reader(self.left)
+        inputs = {
+            _MERGE_LEFT_RELATION: left_reader,
+            _MERGE_RIGHT_RELATION: right_table,
+        }
+        sql = self._merge_sql(left_reader.schema, right_table.schema)
+        return engine.run(sql, inputs)
+
+    def _merge_sql(self, left_schema: pa.Schema, right_schema: pa.Schema) -> str:
+        """Render the join SELECT over the two registered merge relations."""
+        select_list = _merge_join_select_list(self.join_type, left_schema, right_schema)
+        on_clause = "TRUE"
+        if self.condition is not None:
+            qualified = _qualify_join_condition(
+                self.condition, set(left_schema.names), set(right_schema.names)
+            )
+            on_clause = qualified.to_sql()
+        return (
+            f"SELECT {select_list} "
+            f"FROM {_MERGE_LEFT_RELATION} AS l "
+            f"{_MERGE_JOIN_KEYWORDS[self.join_type]} {_MERGE_RIGHT_RELATION} AS r "
+            f"ON {on_clause}"
+        )
+
+    def _execute_python(self) -> Iterator[pa.RecordBatch]:
+        """Row-at-a-time nested loop, used only when no merge engine is attached."""
         import pyarrow.compute as pc
 
         if self.join_type in (JoinType.SEMI, JoinType.ANTI):
@@ -3275,6 +3385,149 @@ class PhysicalGroupedLimit(PhysicalPlanNode):
 
     def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
         return self.input.column_aliases()
+
+
+@dataclass
+class PhysicalLateralJoin(PhysicalPlanNode):
+    """Cross-source dependent (LATERAL) join, run in the merge engine.
+
+    The left side and the right's base relation are materialized into Arrow and
+    registered in the in-memory DuckDB, which decorrelates and runs the LATERAL
+    SQL. The base relation is first reduced to the left's correlation *domain*
+    (a dynamic filter pushed to the base's source) so only relevant rows cross
+    the network; correctness is unaffected because the merge engine re-applies
+    the exact correlation.
+    """
+
+    left: PhysicalPlanNode
+    left_name: str
+    left_alias: str
+    base_scan: PhysicalPlanNode
+    base_name: str
+    lateral_sql: str
+    output_names: List[str]
+    join_type: JoinType
+    # (inner column, comparison op, outer column) correlation terms used to
+    # derive the dynamic filter pushed into the base relation.
+    correlations: List[Tuple[str, Any, str]]
+
+    def children(self) -> List[PhysicalPlanNode]:
+        return [self.left, self.base_scan]
+
+    def execute(self) -> Iterator[pa.RecordBatch]:
+        """Materialize both sides, register them, run the LATERAL in DuckDB."""
+        engine = self.merge_engine()
+        yield from engine.run(self.lateral_sql, self._inputs())
+
+    def _inputs(self) -> Dict[str, pa.Table]:
+        """Build the registered Arrow inputs: the left and the reduced base."""
+        left_table = _table_from_batches(list(self.left.execute()), self.left.schema())
+        base_table = self._reduced_base(left_table)
+        return {self.left_name: left_table, self.base_name: base_table}
+
+    def _reduced_base(self, left_table: pa.Table) -> pa.Table:
+        """Execute the base relation, restricted to the left's correlation domain."""
+        scan = self._apply_domain_filter(left_table)
+        return _table_from_batches(list(scan.execute()), scan.schema())
+
+    def _apply_domain_filter(self, left_table: pa.Table) -> PhysicalPlanNode:
+        """Add a sound dynamic filter (domain restriction) to the base scan.
+
+        The filter may be loose (a superset) — the merge engine re-checks the
+        exact correlation — so it only shrinks the rows the base source returns.
+        """
+        from dataclasses import replace
+
+        if not isinstance(self.base_scan, PhysicalScan):
+            return self.base_scan
+        term = _derive_domain_filter(self.correlations, left_table)
+        if term is None:
+            return self.base_scan
+        combined = term
+        if self.base_scan.filters is not None:
+            combined = _and_expr(self.base_scan.filters, term)
+        return replace(self.base_scan, filters=combined)
+
+    def schema(self) -> pa.Schema:
+        """Run an empty LATERAL to learn the (left + value) output schema."""
+        engine = self.merge_engine()
+        probe = f"SELECT * FROM ({self.lateral_sql}) AS _s LIMIT 0"
+        for batch in engine.run(probe, self._inputs()):
+            return batch.schema
+        return pa.schema([])
+
+    def estimated_cost(self) -> float:
+        raise NotImplementedError("Cost estimation not yet implemented")
+
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        return {}
+
+    def __repr__(self) -> str:
+        return f"PhysicalLateralJoin({self.join_type.name}, base={self.base_name})"
+
+
+def _and_expr(left: Expression, right: Expression) -> Expression:
+    """Combine two predicates with AND."""
+    from .expressions import BinaryOp, BinaryOpType
+
+    return BinaryOp(op=BinaryOpType.AND, left=left, right=right)
+
+
+def _derive_domain_filter(correlations, left_table: pa.Table) -> Optional[Expression]:
+    """Derive a sound base-relation filter from the left's correlation domain.
+
+    ``=`` becomes ``inner IN (domain)``; ``<``/``<=`` a ``< max(domain)`` bound;
+    ``>``/``>=`` a ``> min(domain)`` bound. Any other shape contributes no term
+    (the base is fetched in full — still correct, just not reduced).
+    """
+    from .expressions import BinaryOp, BinaryOpType, InList, ColumnRef
+
+    terms: List[Expression] = []
+    for inner_col, op, outer_col in correlations:
+        if outer_col not in left_table.schema.names:
+            continue
+        domain = left_table.column(outer_col).combine_chunks().unique().drop_null()
+        values = domain.to_pylist()
+        if not values:
+            continue
+        column = ColumnRef(table=None, column=inner_col)
+        term = _domain_term(column, op, values)
+        if term is not None:
+            terms.append(term)
+    if not terms:
+        return None
+    combined = terms[0]
+    for term in terms[1:]:
+        combined = _and_expr(combined, term)
+    return combined
+
+
+def _domain_term(column, op, values) -> Optional[Expression]:
+    """Build one sound dynamic-filter term for a correlation operator."""
+    from .expressions import BinaryOp, BinaryOpType, InList
+
+    if op == BinaryOpType.EQ:
+        if not _within_dynamic_filter_cap(len(values)):
+            return None
+        return InList(value=column, options=[_literal(v) for v in values])
+    if op in (BinaryOpType.LT, BinaryOpType.LTE):
+        return BinaryOp(op=op, left=column, right=_literal(max(values)))
+    if op in (BinaryOpType.GT, BinaryOpType.GTE):
+        return BinaryOp(op=op, left=column, right=_literal(min(values)))
+    return None
+
+
+def _literal(value) -> Expression:
+    """Wrap a Python domain value as a typed literal."""
+    from .expressions import Literal, DataType
+
+    if isinstance(value, bool):
+        return Literal(value=value, data_type=DataType.BOOLEAN)
+    if isinstance(value, int):
+        return Literal(value=value, data_type=DataType.BIGINT)
+    if isinstance(value, float):
+        return Literal(value=value, data_type=DataType.DOUBLE)
+    return Literal(value=value, data_type=DataType.VARCHAR)
 
 
 @dataclass

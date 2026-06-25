@@ -10,7 +10,7 @@ from federated_query.parser.parser import Parser
 from federated_query.parser.binder import Binder
 from federated_query.optimizer.decorrelation import Decorrelator, DecorrelationError
 from federated_query.parser.binder import BindingError
-from federated_query.plan.logical import GroupedLimit, LateralJoin
+from federated_query.plan.logical import GroupedLimit, LateralJoin, SetOperation
 from federated_query.plan.physical import CardinalityViolationError
 from federated_query.executor.executor import Executor
 from .test_utils import (
@@ -858,18 +858,22 @@ class TestUnsupportedSubqueryShapes:
         return None
 
     def test_set_operation_subquery_body(self, catalog, setup_test_data):
-        """A UNION/INTERSECT/EXCEPT subquery body is rejected at binding.
-
-        The subquery binder does not accept a SetOperation body yet
-        (decorrelation-gaps.md B).
+        """A UNION subquery body now decorrelates to a SEMI join over the union
+        relation, which is kept intact as the join's value relation (gap closed).
         """
         sql = (
             "SELECT u.id FROM pg.users u WHERE u.id IN ("
             "  SELECT user_id FROM pg.orders WHERE status = 'paid' "
             "  UNION SELECT user_id FROM pg.orders WHERE status = 'shipped')"
         )
-        with pytest.raises(BindingError, match="SetOperation"):
-            self._decorrelate(catalog, sql)
+        plan = self._decorrelate(catalog, sql)
+
+        def has_set_op(node):
+            if isinstance(node, SetOperation):
+                return True
+            return any(has_set_op(child) for child in node.children())
+
+        assert has_set_op(plan)
 
     def test_offset_in_correlated_subquery(self, catalog, setup_test_data):
         """OFFSET inside a correlated subquery is rejected.

@@ -42,11 +42,37 @@ from ..plan.physical import (
     PhysicalValues,
     PhysicalSingleRowGuard,
     PhysicalGroupedLimit,
+    PhysicalLateralJoin,
 )
-from ..plan.expressions import BinaryOp, BinaryOpType, ColumnRef, Literal
+from ..plan.expressions import BinaryOp, BinaryOpType, ColumnRef, Literal, Expression
 from .single_source_pushdown import SingleSourcePushdown
 from typing import List, Tuple
 from dataclasses import dataclass
+
+# Comparison operators a LATERAL correlation can use to derive a domain filter.
+_COMPARISONS = {
+    BinaryOpType.EQ,
+    BinaryOpType.LT,
+    BinaryOpType.LTE,
+    BinaryOpType.GT,
+    BinaryOpType.GTE,
+}
+# Operator flip when the inner column is on the right of the comparison.
+_FLIP_OP = {
+    BinaryOpType.EQ: BinaryOpType.EQ,
+    BinaryOpType.LT: BinaryOpType.GT,
+    BinaryOpType.LTE: BinaryOpType.GTE,
+    BinaryOpType.GT: BinaryOpType.LT,
+    BinaryOpType.GTE: BinaryOpType.LTE,
+}
+
+
+def _split_and(expr: Expression) -> List[Expression]:
+    """Flatten a predicate into its top-level AND conjuncts."""
+    if isinstance(expr, BinaryOp) and expr.op == BinaryOpType.AND:
+        return _split_and(expr.left) + _split_and(expr.right)
+    return [expr]
+
 
 if TYPE_CHECKING:
     from ..processor.query_executor import QueryExecutor
@@ -134,18 +160,115 @@ class PhysicalPlanner:
         return self._plan_guard_node(node)
 
     def _plan_lateral_join(self, node: LateralJoin) -> PhysicalPlanNode:
-        """A LATERAL (dependent) join only runs when pushed to a single source.
+        """Plan a cross-source LATERAL as a merge-engine dependent join.
 
-        Same-source lateral joins are rendered into one remote query by
-        single-source pushdown before reaching here. A lateral whose two sides
-        live on different sources needs a cross-source dependent-join executor
-        (materialize the inner relation's domain, batch one query per source),
-        which is not built yet — so it fails fast rather than guessing.
+        Same-source laterals were already pushed as one remote query by
+        single-source pushdown. Here the two sides live on different sources:
+        the left and the right's base relation are materialized into Arrow and
+        the LATERAL runs in the in-memory DuckDB, with the base reduced to the
+        left's correlation domain (a dynamic filter) before transfer.
         """
-        raise ValueError(
-            "Cross-source LATERAL (dependent join) is not supported yet: the "
-            "correlated subquery and its outer query are on different sources"
+        base_scans = self._lateral_base_scans(node.right)
+        if len(base_scans) != 1:
+            raise ValueError(
+                "Cross-source LATERAL with multiple base relations is not "
+                "supported yet"
+            )
+        base = base_scans[0]
+        base_name = "lat_b0"
+        right_sql = self.single_source.render_correlated_sql(
+            node.right, {id(base): base_name}
         )
+        if right_sql is None:
+            raise ValueError("Cross-source LATERAL right side is not renderable")
+        outer_alias = self._lateral_outer_alias(node)
+        base_alias = base.alias if base.alias else base.table_name
+        return PhysicalLateralJoin(
+            left=self._plan_node(node.left),
+            left_name="lat_left",
+            left_alias=outer_alias,
+            base_scan=self._plan_node(base),
+            base_name=base_name,
+            lateral_sql=self._lateral_sql(node, outer_alias, right_sql),
+            output_names=node.schema(),
+            join_type=node.join_type,
+            correlations=self._lateral_correlations(
+                node.right, base_alias, outer_alias
+            ),
+        )
+
+    def _lateral_base_scans(self, node: LogicalPlanNode) -> List[Scan]:
+        """Collect the base scans of a LATERAL right side."""
+        if isinstance(node, Scan):
+            return [node]
+        scans: List[Scan] = []
+        for child in node.children():
+            scans.extend(self._lateral_base_scans(child))
+        return scans
+
+    def _lateral_outer_alias(self, node: LateralJoin) -> str:
+        """The left relation's alias, referenced by the right's correlation."""
+        scan = self._leftmost_scan(node.left)
+        if scan is None:
+            return "lat_left"
+        return scan.alias if scan.alias else scan.table_name
+
+    def _leftmost_scan(self, node: LogicalPlanNode) -> Optional[Scan]:
+        """The leftmost base scan of a subtree."""
+        if isinstance(node, Scan):
+            return node
+        children = node.children()
+        if not children:
+            return None
+        return self._leftmost_scan(children[0])
+
+    def _lateral_sql(self, node: LateralJoin, outer_alias: str, right_sql: str) -> str:
+        """Build the merge-engine LATERAL SQL over the registered relations."""
+        items: List[str] = []
+        for column in node.left.schema():
+            items.append(f'{outer_alias}."{column}"')
+        for column in node.right.schema():
+            items.append(f'sub."{column}"')
+        keyword = "LEFT JOIN" if node.join_type == JoinType.LEFT else "INNER JOIN"
+        return (
+            f"SELECT {', '.join(items)} FROM lat_left AS {outer_alias} "
+            f"{keyword} LATERAL ({right_sql}) AS sub ON TRUE"
+        )
+
+    def _lateral_correlations(
+        self, right: LogicalPlanNode, base_alias: str, outer_alias: str
+    ) -> List[Tuple[str, BinaryOpType, str]]:
+        """Extract (inner col, op, outer col) terms for the dynamic filter."""
+        terms: List[Tuple[str, BinaryOpType, str]] = []
+        for predicate in self._lateral_predicates(right):
+            term = self._correlation_term(predicate, base_alias, outer_alias)
+            if term is not None:
+                terms.append(term)
+        return terms
+
+    def _lateral_predicates(self, node: LogicalPlanNode) -> List[Expression]:
+        """All conjuncts of every Filter in a subtree."""
+        predicates: List[Expression] = []
+        if isinstance(node, Filter):
+            predicates.extend(_split_and(node.predicate))
+        for child in node.children():
+            predicates.extend(self._lateral_predicates(child))
+        return predicates
+
+    def _correlation_term(self, predicate, base_alias, outer_alias):
+        """Decompose ``inner OP outer`` into a normalized (inner, op, outer)."""
+        if not isinstance(predicate, BinaryOp) or predicate.op not in _COMPARISONS:
+            return None
+        left, right, op = predicate.left, predicate.right, predicate.op
+        if self._is_ref(left, base_alias) and self._is_ref(right, outer_alias):
+            return (left.column, op, right.column)
+        if self._is_ref(left, outer_alias) and self._is_ref(right, base_alias):
+            return (right.column, _FLIP_OP[op], left.column)
+        return None
+
+    def _is_ref(self, expr, alias: str) -> bool:
+        """Whether expr is a column ref qualified by the given alias."""
+        return isinstance(expr, ColumnRef) and expr.table == alias
 
     def _plan_guard_node(self, node: LogicalPlanNode) -> PhysicalPlanNode:
         """Plan cardinality guard and per-key limit nodes."""

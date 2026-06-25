@@ -48,6 +48,7 @@ from ..plan.logical import (
     SingleRowGuard,
     GroupedLimit,
     LateralJoin,
+    SetOperation,
 )
 from ..plan.expressions import (
     Expression,
@@ -682,6 +683,8 @@ class _SubqueryPreparer:
             return plan, self._aggregate_value_refs(plan)
         if allow_wrappers and isinstance(plan, (Sort, Filter)):
             return self._peel_values_wrapper(plan)
+        if allow_wrappers and isinstance(plan, SetOperation):
+            return plan, self._relation_value_refs(plan)
         raise DecorrelationError(
             f"Unsupported subquery output shape: {type(plan).__name__}"
         )
@@ -721,6 +724,13 @@ class _SubqueryPreparer:
         """References to an aggregate subquery's output columns."""
         refs: List[Expression] = []
         for name in plan.output_names:
+            refs.append(ColumnRef(table=None, column=name))
+        return refs
+
+    def _relation_value_refs(self, plan: LogicalPlanNode) -> List[Expression]:
+        """References to a relation's output columns (e.g. a set-operation body)."""
+        refs: List[Expression] = []
+        for name in plan.schema():
             refs.append(ColumnRef(table=None, column=name))
         return refs
 

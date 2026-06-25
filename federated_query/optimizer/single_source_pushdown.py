@@ -24,6 +24,7 @@ from ..plan.logical import (
     Limit,
     LateralJoin,
     SubqueryScan,
+    SetOperation,
 )
 from ..plan.expressions import ColumnRef, Expression, FunctionCall
 from ..plan.physical import PhysicalRemoteQuery
@@ -79,6 +80,14 @@ class _PushContext:
         # Leaf scans, in FROM order, used to expand ``*`` when no projection
         # supplied an explicit (and unique) column list.
         self.scans: List[Scan] = []
+        # Optional {id(scan): registered name} map used when rendering a
+        # cross-source LATERAL right side for the merge engine: base scans
+        # render as their registered Arrow relation name, not ``schema.table``.
+        self.scan_names: Optional[Dict[int, str]] = None
+        # True inside a derived-relation sub-render, where a set operation may
+        # be wrapped as ``(... UNION ...) AS u``. A top-level set operation
+        # (the query body) is left to the planner's set-operation path.
+        self.in_derived: bool = False
 
 
 class SingleSourcePushdown:
@@ -103,6 +112,21 @@ class SingleSourcePushdown:
         if not context.select_items and not self._expand_star_select(context):
             return None
         return self._finish(context)
+
+    def render_correlated_sql(self, node: LogicalPlanNode, scan_names) -> Optional[str]:
+        """Render a single-source subtree to SQL with base scans named for the
+        merge engine.
+
+        ``scan_names`` maps ``id(scan)`` to the registered Arrow relation name a
+        scan should render as (instead of ``"schema"."table"``). Outer column
+        references (the LATERAL correlation) are kept verbatim. Returns the SQL
+        text, or None when the subtree is not renderable as one query.
+        """
+        context = _PushContext()
+        context.scan_names = scan_names
+        if not self._absorb(node, context):
+            return None
+        return self._render(context)
 
     def _expand_star_select(self, context: _PushContext) -> bool:
         """Build a unique-aliased SELECT list from each scan's needed columns.
@@ -190,7 +214,7 @@ class SingleSourcePushdown:
             return self._absorb_filter(node, context)
         if isinstance(node, LateralJoin):
             return self._absorb_lateral_join(node, context)
-        if isinstance(node, (Join, Scan, SubqueryScan)):
+        if isinstance(node, (Join, Scan, SubqueryScan, SetOperation)):
             return self._absorb_from(node, context)
         return False
 
@@ -337,9 +361,56 @@ class SingleSourcePushdown:
             return self._absorb_base_scan(node, context)
         if isinstance(node, SubqueryScan):
             return self._absorb_subquery_scan_base(node, context)
+        if isinstance(node, SetOperation):
+            return self._absorb_set_operation_base(node, context)
         if isinstance(node, Join):
             return self._absorb_join(node, context)
         return False
+
+    def _absorb_set_operation_base(
+        self, node: SetOperation, context: _PushContext
+    ) -> bool:
+        """Set a UNION/INTERSECT/EXCEPT as the FROM source: ``(... UNION ...) AS u``.
+
+        Only inside a derived sub-render; a top-level set operation (the query
+        body) is declined so the planner renders it as a bare ``UNION`` rather
+        than ``SELECT * FROM (...)``.
+        """
+        if not context.in_derived:
+            return False
+        rendered = self._render_set_operation(node, context)
+        if rendered is None:
+            return False
+        context.from_sql = rendered
+        context.has_subquery_relation = True
+        return True
+
+    def _render_set_operation(
+        self, node: SetOperation, context: _PushContext
+    ) -> Optional[str]:
+        """Render a set operation as a derived relation combining its branches."""
+        left_sql = self._render_branch(node.left, context)
+        right_sql = self._render_branch(node.right, context)
+        if left_sql is None or right_sql is None:
+            return None
+        keyword = node.kind.name if node.distinct else f"{node.kind.name} ALL"
+        alias = self._derived_alias(context)
+        return f"({left_sql} {keyword} {right_sql}) AS {alias}"
+
+    def _render_branch(
+        self, node: LogicalPlanNode, context: _PushContext
+    ) -> Optional[str]:
+        """Render one set-operation branch as a standalone SELECT, same source."""
+        inner = _PushContext()
+        inner.scan_names = context.scan_names
+        inner.in_derived = True
+        if not self._absorb(node, inner) or not inner.select_items:
+            return None
+        if context.datasource is not None and inner.datasource != context.datasource:
+            return None
+        if context.datasource is None:
+            context.datasource = inner.datasource
+        return self._render(inner)
 
     def _absorb_subquery_scan_base(
         self, node: SubqueryScan, context: _PushContext
@@ -358,7 +429,7 @@ class SingleSourcePushdown:
             return self._absorb_aggregate_scan(scan, context)
         if not self._claim_scan(scan, context):
             return False
-        context.from_sql = self._scan_ref(scan)
+        context.from_sql = self._scan_ref(scan, context)
         self._absorb_scan_modifiers(scan, context)
         return True
 
@@ -396,7 +467,7 @@ class SingleSourcePushdown:
             self._set_select(scan.aggregates, scan.output_names, context)
         self._split_scan_filter(scan, context)
         context.group_sql = self._render_group_by(scan)
-        context.from_sql = self._scan_ref(scan)
+        context.from_sql = self._scan_ref(scan, context)
         context.has_aggregate = True
         return True
 
@@ -505,7 +576,7 @@ class SingleSourcePushdown:
         if not self._is_derived_relation(node):
             if not self._claim_scan(node, context):
                 return None
-            return self._scan_ref(node)
+            return self._scan_ref(node, context)
         return self._render_derived(node, context)
 
     def _render_subquery_scan(
@@ -518,6 +589,8 @@ class SingleSourcePushdown:
         alias is preserved instead of a generated ``subq_N``.
         """
         inner = _PushContext()
+        inner.scan_names = context.scan_names
+        inner.in_derived = True
         if not self._absorb(node.input, inner) or not inner.select_items:
             return None
         if context.datasource is not None and inner.datasource != context.datasource:
@@ -538,6 +611,8 @@ class SingleSourcePushdown:
         still resolves them.
         """
         inner = _PushContext()
+        inner.scan_names = context.scan_names
+        inner.in_derived = True
         if not self._absorb(node, inner) or not inner.select_items:
             return None
         if context.datasource is not None and inner.datasource != context.datasource:
@@ -628,9 +703,17 @@ class SingleSourcePushdown:
         if isinstance(expression, ColumnRef):
             context.column_aliases[(expression.table, expression.column)] = unique
 
-    def _scan_ref(self, scan: Scan) -> str:
-        """Render a table reference with its alias for the FROM clause."""
-        reference = f'"{scan.schema_name}"."{scan.table_name}"'
+    def _scan_ref(self, scan: Scan, context: _PushContext) -> str:
+        """Render a table reference with its alias for the FROM clause.
+
+        When the context carries a scan-name map (cross-source LATERAL rendering
+        for the merge engine), a base scan renders as its registered relation
+        name instead of ``"schema"."table"``.
+        """
+        registered = None
+        if context.scan_names is not None:
+            registered = context.scan_names.get(id(scan))
+        reference = registered or f'"{scan.schema_name}"."{scan.table_name}"'
         alias = scan.alias if scan.alias else scan.table_name
         return f"{reference} AS {alias}"
 

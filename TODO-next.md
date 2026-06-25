@@ -5,6 +5,21 @@ Physical Plan" rule is now enforced: decorrelation produces a flat join plan and
 single-source pushdown renders it as **SQL joins**, never re-correlated
 `EXISTS`/`IN`/scalar `(SELECT …)`.
 
+## REVIEW TASK — push joins to the merge engine, not Python
+
+We keep finding cross-source joins executed in Python row loops instead of being
+handed to the DuckDB merge engine. Principle: **local joins run set-based in the
+merge engine; we should not hand-roll join/group/sort logic in Python.** Audit
+every physical operator for Python-side processing that DuckDB should own:
+- `PhysicalNestedLoopJoin` — DONE (now routes through the merge engine; the
+  Python loop is only a no-engine fallback). It used to re-execute its inner
+  side once per outer row (a remote query per row, cross-source).
+- Re-check `PhysicalHashJoin` row-loop fallbacks, `PhysicalGroupedLimit`
+  (per-key limit done in Python), `PhysicalSingleRowGuard`, set-operation /
+  union dedup, and any operator with an `_execute_*` Python path.
+- For each: confirm it materializes inputs once and pushes the operation to the
+  merge engine (or document why a Python path is genuinely required).
+
 ## Current test state
 
 - Full suite: **766 passed / 15 xfailed / 0 failed**
@@ -66,16 +81,24 @@ single-source pushdown renders it as **SQL joins**, never re-correlated
   - DONE non-equi correlated scalar (aggregate/LIMIT) → LATERAL (dependent) join.
     New `LateralJoin` logical node; `decorrelation._join_scalar` falls back to it
     when pattern-flattening fails (`_needs_lateral`); `single_source_pushdown`
-    renders `LEFT JOIN LATERAL (...) ON TRUE` for same-source push (the source /
-    DuckDB merge engine decorrelates it). Cross-source LATERAL fails fast
-    (`physical_planner._plan_lateral_join`) — TODO: cross-source dependent-join
-    executor (materialize the distinct correlation domain, one batched query per
-    source, join locally — the magic-set / dynamic-filter approach).
-  - TODO `test_subquery_with_union` — UNION needs 3 layers: bind a
-    `SetOperation` body (`SubqueryPlanBinder._bind_other` rejects it), let
-    `_peel_values_top` accept a `SetOperation` value relation, and add a
-    `SetOperation`/`Union` derived-relation render path to single_source (none
-    exists). ~60-80 lines; INTERSECT/EXCEPT scope TBD.
+    renders `LEFT JOIN LATERAL (...) ON TRUE` for same-source push.
+  - DONE user-written LATERAL (parse + bind lateral scope + render).
+  - DONE cross-source LATERAL: `PhysicalLateralJoin` runs it in the merge-engine
+    DuckDB (materialize left + right base as Arrow, register, decorrelate). The
+    base is reduced to the left's correlation domain — `=`→`IN`, `<`/`>`→range
+    bound (`_derive_domain_filter`), a sound superset. `render_correlated_sql`
+    maps base scans → register names. Single base relation only; multi-base fails
+    fast. Tests: `test_cross_source_lateral.py`. Follow-up: the same domain /
+    dynamic-filter mechanism is what cross-source subquery fallback (cluster D)
+    and skip-level correlation will reuse.
+  - DONE `test_subquery_with_union` — UNION/INTERSECT/EXCEPT subquery body. Three
+    layers: `SubqueryPlanBinder._bind_set_operation` binds both branches;
+    decorrelation `_peel_values_top` keeps a `SetOperation` value relation intact
+    (uncorrelated); single_source `_absorb_set_operation_base` renders it as a
+    derived `(... UNION ...) AS u` — gated by `context.in_derived` so a top-level
+    set op is still left to the planner's bare-UNION path. Cross-source works via
+    the merge engine (the planner's `_plan_set_operation`). Tested same- and
+    cross-source.
 - **Cluster C — CTEs** (whole `test_ctes.py` xfailed): parser hard-rejects
   `WITH` (`parser.py`: "WITH clauses (CTEs) are not supported yet"). A CTE is a
   named relation, not a correlated subquery — separate feature, deferred.

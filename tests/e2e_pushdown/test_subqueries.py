@@ -11,10 +11,12 @@ allowed. Every test below asserts both the expected join shape and the global
 no-subquery-expression invariant.
 """
 
+import duckdb
 import pytest
 
 from sqlglot import exp
 
+from tests.e2e_pushdown.conftest import _seed_orders, _seed_products
 from tests.e2e_pushdown.helpers import (
     build_runtime,
     explain_datasource_query,
@@ -519,11 +521,6 @@ def test_subquery_with_order_by_limit(single_source_env):
     _assert_no_subquery_expressions(ast)
 
 
-@pytest.mark.xfail(
-    reason="decorrelation gap: SetOperation (UNION) subquery body rejected by the "
-    "binder (binder.py: unsupported plan node in subquery)",
-    strict=False,
-)
 def test_subquery_with_union(single_source_env):
     """An IN over a UNION body pushes as a SEMI JOIN to a derived relation."""
     runtime = build_runtime(single_source_env)
@@ -563,26 +560,110 @@ def test_exists_with_complex_predicates(single_source_env):
 # Cross-Datasource Subquery Fallback
 
 
-@pytest.mark.xfail(
-    reason="cluster D: cross-source subquery materialization policy not "
-    "implemented (and multi_source_env lacks duckdb_primary/postgres_secondary)",
-    strict=False,
-)
 def test_cross_datasource_subquery_fallback(multi_source_env):
-    """Documents cross-datasource subquery behavior (fallback expected)."""
+    """A cross-source ``IN`` subquery decorrelates to a SEMI join run across
+    sources: each side pushes to its own source and the join runs in the merge
+    engine. Verified against a single combined DuckDB seeded identically.
+    """
     runtime = build_runtime(multi_source_env)
     sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
+        "SELECT order_id FROM duckdb_orders.main.orders "
         "WHERE product_id IN ("
-        "  SELECT user_id FROM postgres_secondary.public.users WHERE active = true"
+        "  SELECT id FROM duckdb_products.main.products WHERE price > 50"
         ")"
     )
 
+    # both sources receive a query (the cross-source fallback)
     doc = runtime.explain(sql)
     datasources = doc.get("datasources") or {}
+    assert len(datasources.get("duckdb_orders", [])) >= 1
+    assert len(datasources.get("duckdb_products", [])) >= 1
 
-    duckdb_queries = datasources.get("duckdb_primary", [])
-    postgres_queries = datasources.get("postgres_secondary", [])
+    # and the result matches the same query on one combined database
+    engine_rows = sorted(runtime.execute(sql).column(0).to_pylist())
+    reference = duckdb.connect()
+    _seed_orders(reference)
+    _seed_products(reference)
+    expected = sorted(
+        row[0]
+        for row in reference.execute(
+            "SELECT order_id FROM orders "
+            "WHERE product_id IN (SELECT id FROM products WHERE price > 50)"
+        ).fetchall()
+    )
+    reference.close()
+    assert engine_rows == expected
 
-    assert len(duckdb_queries) >= 1
-    assert len(postgres_queries) >= 1
+
+def test_cross_source_semi_join_reduction(multi_source_env):
+    """A cross-source ``IN`` (SEMI join) pushes the subquery's distinct keys into
+    the outer scan as a dynamic ``IN`` filter, so the outer source returns only
+    rows whose key can match (semi-join reduction)."""
+    runtime = build_runtime(multi_source_env)
+    multi_source_env.reset_datasources()
+    sql = (
+        "SELECT order_id FROM duckdb_orders.main.orders "
+        "WHERE product_id IN ("
+        "  SELECT id FROM duckdb_products.main.products WHERE price > 50"
+        ")"
+    )
+    runtime.execute(sql)
+
+    orders_source = multi_source_env.datasources[0]
+    orders_ast = orders_source.last_query_ast()
+    assert orders_ast is not None
+    in_filters = list(orders_ast.find_all(exp.In))
+    assert any(
+        node.args.get("expressions") for node in in_filters
+    ), "expected a dynamic IN (...) filter pushed to the orders source"
+
+
+def test_cross_source_union_subquery_matches_source(multi_source_env):
+    """A cross-source ``IN`` over a UNION body: the union pushes to its source
+    and the SEMI join runs in the merge engine. Verified vs a combined DB."""
+    runtime = build_runtime(multi_source_env)
+    sql = (
+        "SELECT order_id FROM duckdb_orders.main.orders WHERE product_id IN ("
+        "  SELECT id FROM duckdb_products.main.products WHERE price > 50 "
+        "  UNION SELECT id FROM duckdb_products.main.products WHERE base_price > 30"
+        ")"
+    )
+    engine_rows = sorted(runtime.execute(sql).column(0).to_pylist())
+    reference = duckdb.connect()
+    _seed_orders(reference)
+    _seed_products(reference)
+    expected = sorted(
+        row[0]
+        for row in reference.execute(
+            "SELECT order_id FROM orders WHERE product_id IN ("
+            "  SELECT id FROM products WHERE price > 50 "
+            "  UNION SELECT id FROM products WHERE base_price > 30)"
+        ).fetchall()
+    )
+    reference.close()
+    assert engine_rows == expected
+
+
+def test_cross_source_not_in_matches_source(multi_source_env):
+    """A cross-source ``NOT IN`` (ANTI join) runs in the merge engine (DuckDB),
+    not a Python re-scanning loop, and matches the same query on one database."""
+    runtime = build_runtime(multi_source_env)
+    sql = (
+        "SELECT order_id FROM duckdb_orders.main.orders "
+        "WHERE product_id NOT IN ("
+        "  SELECT id FROM duckdb_products.main.products WHERE price > 50"
+        ")"
+    )
+    engine_rows = sorted(runtime.execute(sql).column(0).to_pylist())
+    reference = duckdb.connect()
+    _seed_orders(reference)
+    _seed_products(reference)
+    expected = sorted(
+        row[0]
+        for row in reference.execute(
+            "SELECT order_id FROM orders "
+            "WHERE product_id NOT IN (SELECT id FROM products WHERE price > 50)"
+        ).fetchall()
+    )
+    reference.close()
+    assert engine_rows == expected

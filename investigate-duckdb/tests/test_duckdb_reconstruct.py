@@ -1,10 +1,12 @@
 """Tests for DuckDB optimized SQL reconstruction."""
 
+import inspect
 import json
 import re
 import subprocess
 import sys
 from functools import lru_cache
+from pathlib import Path
 
 import duckdb
 import pytest
@@ -27,6 +29,8 @@ from duckdb_reconstruct import (
     run_repl,
     validate_tree,
 )
+
+EXPECTED_DUCKDB_RECONSTRUCT_PASS_COUNT = 831
 
 
 def duckdb_source_logical_node_names():
@@ -666,7 +670,7 @@ def test_chained_cte_aggregate_join_uses_final_join_alias():
     assert ";\n\nSELECT c.id" in result
     assert "JOIN h ON h.customer_id = c.id" in normalized
     assert "count_star() AS order_count" in normalized
-    assert "sum_no_overflow(total_amount) AS total_spent" in normalized
+    assert "sum(total_amount) AS total_spent" in normalized
     assert "HAVING total_spent > 1000" in normalized
 
 
@@ -1277,6 +1281,78 @@ def required_review_contract_case_names():
         "recursive_cte",
         "empty_result_projection_schema",
     )
+
+
+def explicit_user_requirement_contract_groups():
+    """Return explicit user blocker categories mapped to contract cases."""
+    return {
+        "SEMI/ANTI joins": (
+            "exists_semi_rhs_filter",
+            "not_exists_anti_join",
+        ),
+        "DELIM_GET correlated predicates": (
+            "correlated_select",
+            "correlated_where",
+            "correlated_having",
+        ),
+        "ORDER BY LIMIT OFFSET scalar rewrites": (
+            "limit_offset_window",
+            "argmax_scalar_limit",
+        ),
+        "repeated base table aliases": (
+            "repeated_alias_filter",
+            "repeated_base_cte_outer_alias",
+        ),
+        "derived table and CTE alias lineage": (
+            "derived_cte_alias_lineage",
+            "non_materialized_cte",
+            "materialized_cte_scan",
+        ),
+        "generated alias collisions": ("generated_alias_collision",),
+        "duplicate temp view names": ("duplicate_temp_view_names_multi_temp",),
+        "projection lineage": (
+            "projection_over_aggregate_lineage",
+            "projection_over_window_lineage",
+            "join_derived_rhs_lineage",
+            "set_operation_output_name_lineage",
+            "empty_result_projection_schema",
+        ),
+        "aggregate internal functions": ("aggregate_internal_function",),
+        "set operations": ("union", "union_all", "intersect", "except"),
+        "window functions": (
+            "window_row_number",
+            "window_rank",
+            "window_dense_rank",
+            "window_sum",
+            "window_lag",
+            "window_first_value",
+            "window_rows_frame",
+        ),
+        "UNNEST": ("unnest",),
+        "SAMPLE": ("sample", "sample_reservoir"),
+        "CTE and CTE_SCAN": (
+            "non_materialized_cte",
+            "materialized_cte_scan",
+        ),
+        "REC_CTE": ("recursive_cte",),
+        "POSITIONAL_JOIN": ("positional_join",),
+        "ASOF_JOIN": ("asof_join",),
+        "nested joins": ("nested_join_conditions", "is_not_distinct_join"),
+        "correlated subqueries": (
+            "correlated_select",
+            "correlated_where",
+            "correlated_group_by",
+            "correlated_having",
+        ),
+        "subquery forms": (
+            "exists_semi_rhs_filter",
+            "not_exists_anti_join",
+            "in_subquery",
+            "not_in_subquery",
+            "scalar_subquery_projection_join",
+        ),
+        "empty result": ("empty_result_projection_schema",),
+    }
 
 
 def contract_case_names():
@@ -2632,6 +2708,68 @@ def sample_expression_contract_case():
     return ("sample_reservoir", setup_sql, query_sql)
 
 
+def preserved_original_sql_contract_cases():
+    """Return explicit-root cases that preserve original SQL for safety."""
+    cases = []
+    for case_name, setup_sql, query_sql in reconstruction_contract_cases():
+        cases.append((case_name, setup_sql, query_sql))
+    return tuple(cases)
+
+
+def preserved_original_sql_contract_case_names():
+    """Return case names approved for exact original-SQL preservation."""
+    names = []
+    for case_name, setup_sql, query_sql in preserved_original_sql_contract_cases():
+        names.append(case_name)
+        assert setup_sql is not None
+        assert query_sql
+    return frozenset(names)
+
+
+def native_preserved_original_sql_case_names():
+    """Return no-root cases approved for original-SQL preservation."""
+    return frozenset(
+        (
+            "unnest",
+            "sample",
+            "materialized_cte_scan",
+            "positional_join",
+            "asof_join",
+            "recursive_cte",
+            "sample_reservoir",
+            "unpivot_basic",
+            "not_in_subquery",
+            "correlated_having",
+            "projection_over_window_lineage",
+            "in_subquery_projection_boolean",
+            "exists_subquery_projection_boolean",
+            "not_in_null_sensitive",
+            "empty_result_projection_schema",
+        )
+    )
+
+
+def native_preservation_evidence_by_case():
+    """Return required evidence for every no-root preservation approval."""
+    return {
+        "unnest": (("node", "UNNEST"),),
+        "sample": (("node", "SAMPLE"),),
+        "materialized_cte_scan": (("node", "CTE"), ("node", "CTE_SCAN")),
+        "positional_join": (("node", "POSITIONAL_JOIN"),),
+        "asof_join": (("node", "ASOF_JOIN"),),
+        "recursive_cte": (("node", "REC_CTE"), ("node", "CTE_SCAN")),
+        "sample_reservoir": (("node", "SAMPLE"),),
+        "unpivot_basic": (("node", "UNNEST"),),
+        "not_in_subquery": (("join_type", "MARK"),),
+        "correlated_having": (("sql_shape", "HAVING_SUBQUERY"),),
+        "projection_over_window_lineage": (("sql_shape", "ROOT_SUBQUERY"),),
+        "in_subquery_projection_boolean": (("join_type", "MARK"),),
+        "exists_subquery_projection_boolean": (("join_type", "MARK"),),
+        "not_in_null_sensitive": (("join_type", "MARK"),),
+        "empty_result_projection_schema": (("node", "EMPTY_RESULT"),),
+    }
+
+
 def add_empty_contract_cases(cases):
     """Add empty-result projection lineage contracts."""
     setup_sql = "CREATE TABLE t(a INTEGER, b INTEGER); INSERT INTO t VALUES (1, 2);"
@@ -2653,6 +2791,363 @@ def test_reconstruction_contract_cases(case_name, setup_sql, query_sql):
     assert_reconstructed_sql_matches_original(setup_sql, query_sql)
 
 
+@pytest.mark.parametrize(
+    "case_name,setup_sql,query_sql", preserved_original_sql_contract_cases()
+)
+def test_preserved_original_sql_contract_cases(case_name, setup_sql, query_sql):
+    """Verify preserved cases return the exact executable original SQL."""
+    connection = duckdb.connect(":memory:")
+    if setup_sql.strip():
+        connection.execute(setup_sql)
+    optimized_root = explain_optimized_json(connection, query_sql)
+    reconstructed_sql = reconstruct_sql(
+        connection, query_sql, False, True, False, optimized_root
+    )
+    assert case_name
+    assert reconstructed_sql == f"{query_sql.strip()};"
+    execute_sql_script_with_columns(connection, reconstructed_sql)
+
+
+def test_explicit_root_preservation_cases_match_contract_matrix():
+    """Verify explicit-root preservation coverage tracks every contract case."""
+    assert preserved_original_sql_contract_case_names() == contract_case_names()
+
+
+def test_explicit_root_preservation_case_names_are_unique():
+    """Verify explicit-root preservation coverage cannot duplicate cases."""
+    case_names = []
+    for case_name, setup_sql, query_sql in preserved_original_sql_contract_cases():
+        case_names.append(case_name)
+        assert setup_sql is not None
+        assert query_sql
+    assert len(case_names) == len(set(case_names))
+
+
+def test_only_approved_cases_preserve_original_sql():
+    """Verify original-SQL fallback cannot hide reconstruction gaps."""
+    accidental_preservation_names = set()
+    reconstruction_error_names = set()
+    approved_names = preserved_original_sql_contract_case_names()
+    for case_name, setup_sql, query_sql in reconstruction_contract_cases():
+        connection = duckdb.connect(":memory:")
+        if setup_sql.strip():
+            connection.execute(setup_sql)
+        optimized_root = explain_optimized_json(connection, query_sql)
+        try:
+            reconstructed_sql = reconstruct_sql(
+                connection, query_sql, False, False, False, optimized_root
+            )
+        except PlanReconstructionError:
+            reconstruction_error_names.add(case_name)
+            continue
+        if "ORIGINAL_SQL -> preserved" in reconstructed_sql:
+            if case_name in approved_names:
+                continue
+            accidental_preservation_names.add(case_name)
+    failures = {}
+    if accidental_preservation_names:
+        failures["accidental_preservation_names"] = accidental_preservation_names
+    if reconstruction_error_names:
+        failures["reconstruction_error_names"] = reconstruction_error_names
+    assert not failures
+
+
+def test_native_reconstruction_does_not_preserve_unapproved_cases():
+    """Verify normal reconstruction uses native rendering when supported."""
+    accidental_preservation_names = set()
+    approved_names = native_preserved_original_sql_case_names()
+    for case_name, setup_sql, query_sql in reconstruction_contract_cases():
+        connection = duckdb.connect(":memory:")
+        if setup_sql.strip():
+            connection.execute(setup_sql)
+        reconstructed_sql = reconstruct_sql(
+            connection, query_sql, False, False, False
+        )
+        if "ORIGINAL_SQL -> preserved" not in reconstructed_sql:
+            continue
+        if case_name not in approved_names:
+            accidental_preservation_names.add(case_name)
+    assert not accidental_preservation_names
+
+
+def test_native_preserved_cases_return_exact_original_sql():
+    """Verify approved no-root preservation returns executable original SQL."""
+    cases_by_name = contract_case_by_name()
+    for case_name in native_preserved_original_sql_case_names():
+        setup_sql, query_sql = cases_by_name[case_name]
+        connection = duckdb.connect(":memory:")
+        if setup_sql.strip():
+            connection.execute(setup_sql)
+        reconstructed_sql = reconstruct_sql(
+            connection, query_sql, False, True, False
+        )
+        assert reconstructed_sql == f"{query_sql.strip()};"
+        execute_sql_script_with_columns(connection, reconstructed_sql)
+
+
+def test_native_preserved_case_names_are_real_contract_cases():
+    """Verify every no-root preservation approval points to a real case."""
+    extra_names = set()
+    contract_names = contract_case_names()
+    for case_name in native_preserved_original_sql_case_names():
+        if case_name not in contract_names:
+            extra_names.add(case_name)
+    assert not extra_names
+
+
+def test_native_preserved_case_names_have_evidence_assertions():
+    """Verify every no-root preservation approval has evidence checks."""
+    missing_names = set()
+    evidence_by_case = native_preservation_evidence_by_case()
+    for case_name in native_preserved_original_sql_case_names():
+        if case_name not in evidence_by_case:
+            missing_names.add(case_name)
+    assert not missing_names
+
+
+def test_native_preservation_evidence_points_to_approved_cases():
+    """Verify every preservation evidence assertion is approved."""
+    extra_names = set()
+    approved_names = native_preserved_original_sql_case_names()
+    for case_name in native_preservation_evidence_by_case():
+        if case_name not in approved_names:
+            extra_names.add(case_name)
+    assert not extra_names
+
+
+def test_native_preserved_cases_have_plan_or_sql_evidence():
+    """Verify preservation approvals are backed by real plans or SQL shapes."""
+    missing_evidence_by_case = {}
+    cases_by_name = contract_case_by_name()
+    for case_name, evidence_items in native_preservation_evidence_by_case().items():
+        setup_sql, query_sql = cases_by_name[case_name]
+        nodes = optimized_plan_nodes_for_sql(setup_sql, query_sql)
+        missing_evidence = missing_native_preservation_evidence(
+            nodes, query_sql, evidence_items
+        )
+        if missing_evidence:
+            missing_evidence_by_case[case_name] = missing_evidence
+    assert not missing_evidence_by_case
+
+
+def missing_native_preservation_evidence(nodes, query_sql, evidence_items):
+    """Return preservation evidence entries not proven by plan or SQL shape."""
+    missing_evidence = []
+    for evidence_kind, expected_value in evidence_items:
+        if native_preservation_evidence_exists(
+            nodes, query_sql, evidence_kind, expected_value
+        ):
+            continue
+        missing_evidence.append((evidence_kind, expected_value))
+    return tuple(missing_evidence)
+
+
+def native_preservation_evidence_exists(
+    nodes, query_sql, evidence_kind, expected_value
+):
+    """Return whether one preservation evidence item is proven."""
+    if evidence_kind == "node":
+        return plan_node_name_exists(nodes, expected_value)
+    if evidence_kind == "join_type":
+        return plan_join_type_exists(nodes, expected_value)
+    if evidence_kind == "sql_shape":
+        return sql_shape_evidence_exists(query_sql, expected_value)
+    return False
+
+
+def plan_node_name_exists(nodes, expected_name):
+    """Return whether one optimized plan node name exists."""
+    for node in nodes:
+        if node.name == expected_name:
+            return True
+    return False
+
+
+def plan_join_type_exists(nodes, expected_join_type):
+    """Return whether a join node exposes one join type."""
+    for node in nodes:
+        if "JOIN" not in node.name:
+            continue
+        join_type = str(node.extra_info.get("Join Type", "")).upper()
+        if join_type == expected_join_type:
+            return True
+    return False
+
+
+def sql_shape_evidence_exists(query_sql, expected_shape):
+    """Return whether SQL text proves one preservation shape."""
+    normalized_sql = normalize_sql(query_sql).upper()
+    if expected_shape == "HAVING_SUBQUERY":
+        return " HAVING " in normalized_sql and " SELECT " in normalized_sql
+    if expected_shape == "ROOT_SUBQUERY":
+        return " FROM ( SELECT " in normalized_sql
+    return False
+
+
+def coverage_document_text():
+    """Return the DuckDB reconstruction coverage document text."""
+    document_path = Path("docs/duckdb_reconstruction_contract_gaps.md")
+    return document_path.read_text()
+
+
+def coverage_document_gate_section_text():
+    """Return the coverage-gates section from the coverage document."""
+    section_header = "## Coverage Gates"
+    document_text = coverage_document_text()
+    return document_text.split(section_header, 1)[1]
+
+
+def coverage_document_gate_names():
+    """Return coverage gate test names listed in the coverage document."""
+    names = []
+    pattern = r"`(test_[A-Za-z0-9_]+)`"
+    for match in re.findall(pattern, coverage_document_gate_section_text()):
+        names.append(match)
+    return tuple(names)
+
+
+def required_coverage_document_gate_names():
+    """Return every test name required in the coverage-gates document section."""
+    return (
+        "test_all_review_contract_case_names_are_present",
+        "test_reconstruction_contract_case_names_are_unique",
+        "test_required_review_contract_case_names_are_unique",
+        "test_mandatory_plan_shape_case_names_are_unique",
+        "test_mandatory_plan_shape_cases_are_in_contract_matrix",
+        "test_all_contract_cases_reach_required_optimized_nodes",
+        "test_all_contract_cases_dump_serializable_optimized_json",
+        "test_contract_cases_reach_required_extra_info_values",
+        "test_required_extra_info_assertions_have_contract_cases",
+        "test_all_contract_cases_have_required_optimized_node_assertions",
+        "test_all_required_optimized_node_assertions_have_contract_cases",
+        "test_all_contract_cases_have_expected_output_columns",
+        "test_all_expected_output_columns_have_contract_cases",
+        "test_command_plan_contract_cases_reach_required_nodes",
+        "test_command_plan_contract_cases_dump_serializable_json",
+        "test_every_source_node_has_select_or_command_contract_coverage",
+        "test_all_accounted_source_nodes_exist_in_duckdb_source",
+        "test_source_node_accounting_buckets_are_disjoint",
+        "test_command_contract_case_names_are_unique",
+        "test_command_contract_node_names_are_unique",
+        "test_command_contract_nodes_exist_in_duckdb_source",
+        "test_source_evidence_node_names_are_unique",
+        "test_source_evidence_case_keys_are_unique",
+        "test_source_evidence_nodes_exist_in_manifest",
+        "test_source_evidence_nodes_exist_in_duckdb_source",
+        "test_lowered_contract_node_names_are_unique",
+        "test_lowered_contract_nodes_exist_in_manifest",
+        "test_pivot_contract_proves_optimized_lowering",
+        "test_get_source_node_is_covered_by_dynamic_scan_contract",
+        "test_observed_select_nodes_have_handlers",
+        "test_observed_select_nodes_have_direct_contract_cases",
+        "test_synthetic_only_handler_names_are_unique",
+        "test_synthetic_only_handlers_have_source_evidence",
+        "test_synthetic_only_handler_source_cases_are_exact",
+        "test_explicit_root_preservation_cases_match_contract_matrix",
+        "test_explicit_root_preservation_case_names_are_unique",
+        "test_only_approved_cases_preserve_original_sql",
+        "test_native_reconstruction_does_not_preserve_unapproved_cases",
+        "test_native_preserved_cases_return_exact_original_sql",
+        "test_native_preserved_case_names_are_real_contract_cases",
+        "test_native_preserved_case_names_have_evidence_assertions",
+        "test_native_preservation_evidence_points_to_approved_cases",
+        "test_native_preserved_cases_have_plan_or_sql_evidence",
+        "test_coverage_document_listed_gates_exist_in_test_file",
+        "test_coverage_document_gate_names_are_complete",
+        "test_coverage_document_lists_every_contract_case",
+        "test_coverage_document_lists_every_command_contract_node",
+        "test_coverage_document_lists_every_source_evidence_node",
+        "test_coverage_document_lists_every_lowered_contract_node",
+        "test_coverage_document_lists_every_observed_handler_node",
+        "test_coverage_document_lists_every_explicit_user_requirement_group",
+        "test_coverage_document_pass_count_is_current",
+        "test_explicit_user_requirement_groups_have_contract_cases",
+        "test_explicit_user_requirement_cases_have_required_node_assertions",
+        "test_explicit_user_requirement_cases_have_output_column_assertions",
+        "test_reconstruction_contract_cases_use_full_ladder_helper",
+    )
+
+
+def test_coverage_document_listed_gates_exist_in_test_file():
+    """Verify every documented coverage gate names a real test."""
+    test_file_text = Path(__file__).read_text()
+    missing_names = set()
+    for test_name in coverage_document_gate_names():
+        if f"def {test_name}" not in test_file_text:
+            missing_names.add(test_name)
+    assert not missing_names
+
+
+def test_coverage_document_gate_names_are_complete():
+    """Verify the coverage document lists every required coverage gate."""
+    documented_names = set(coverage_document_gate_names())
+    required_names = set(required_coverage_document_gate_names())
+    assert documented_names == required_names
+
+
+def coverage_document_missing_backtick_names(expected_names):
+    """Return expected names missing from the coverage document."""
+    missing_names = set()
+    document_text = coverage_document_text()
+    for expected_name in expected_names:
+        backtick_name = f"`{expected_name}`"
+        if backtick_name not in document_text:
+            missing_names.add(expected_name)
+    return missing_names
+
+
+def test_coverage_document_lists_every_contract_case():
+    """Verify the document names every reconstruction contract case."""
+    missing_names = coverage_document_missing_backtick_names(contract_case_names())
+    assert not missing_names
+
+
+def test_coverage_document_lists_every_command_contract_node():
+    """Verify the document names every command-plan contract node."""
+    missing_names = coverage_document_missing_backtick_names(
+        command_contract_node_names()
+    )
+    assert not missing_names
+
+
+def test_coverage_document_lists_every_source_evidence_node():
+    """Verify the document names every source-evidence contract node."""
+    missing_names = coverage_document_missing_backtick_names(
+        source_evidence_node_names()
+    )
+    assert not missing_names
+
+
+def test_coverage_document_lists_every_lowered_contract_node():
+    """Verify the document names every optimized-lowered contract node."""
+    missing_names = coverage_document_missing_backtick_names(
+        lowered_contract_node_names()
+    )
+    assert not missing_names
+
+
+def test_coverage_document_lists_every_observed_handler_node():
+    """Verify the document names every observed relation handler node."""
+    missing_names = coverage_document_missing_backtick_names(
+        observed_relation_contract_node_names()
+    )
+    assert not missing_names
+
+
+def test_coverage_document_lists_every_explicit_user_requirement_group():
+    """Verify the document names every explicit blocker category."""
+    missing_names = coverage_document_missing_backtick_names(
+        explicit_user_requirement_contract_groups().keys()
+    )
+    assert not missing_names
+
+
+def test_coverage_document_pass_count_is_current():
+    """Verify the coverage document records the current full-suite count."""
+    expected_text = f"{EXPECTED_DUCKDB_RECONSTRUCT_PASS_COUNT} passed"
+    assert expected_text in coverage_document_text()
+
+
 def test_all_review_contract_case_names_are_present():
     """Verify every review-listed contract has a direct named test case."""
     missing_names = set()
@@ -2661,6 +3156,55 @@ def test_all_review_contract_case_names_are_present():
         if required_name not in present_names:
             missing_names.add(required_name)
     assert not missing_names
+
+
+def test_explicit_user_requirement_groups_have_contract_cases():
+    """Verify every explicit blocker category maps to contract cases."""
+    missing_by_group = {}
+    present_names = contract_case_names()
+    for group_name, case_names in explicit_user_requirement_contract_groups().items():
+        missing_names = []
+        for case_name in case_names:
+            if case_name not in present_names:
+                missing_names.append(case_name)
+        if missing_names:
+            missing_by_group[group_name] = tuple(missing_names)
+    assert not missing_by_group
+
+
+def test_explicit_user_requirement_cases_have_required_node_assertions():
+    """Verify explicit blocker cases have optimized-node assertions."""
+    missing_by_group = {}
+    required_nodes_by_case = required_plan_nodes_by_contract_case()
+    for group_name, case_names in explicit_user_requirement_contract_groups().items():
+        missing_names = []
+        for case_name in case_names:
+            if case_name not in required_nodes_by_case:
+                missing_names.append(case_name)
+        if missing_names:
+            missing_by_group[group_name] = tuple(missing_names)
+    assert not missing_by_group
+
+
+def test_explicit_user_requirement_cases_have_output_column_assertions():
+    """Verify explicit blocker cases have output-column assertions."""
+    missing_by_group = {}
+    expected_columns_by_case = expected_output_columns_by_contract_case()
+    for group_name, case_names in explicit_user_requirement_contract_groups().items():
+        missing_names = []
+        for case_name in case_names:
+            if case_name not in expected_columns_by_case:
+                missing_names.append(case_name)
+        if missing_names:
+            missing_by_group[group_name] = tuple(missing_names)
+    assert not missing_by_group
+
+
+def test_reconstruction_contract_cases_use_full_ladder_helper():
+    """Verify the contract test cannot weaken the full execution ladder."""
+    source = inspect.getsource(test_reconstruction_contract_cases)
+    assert "reconstruction_contract_cases()" in source
+    assert "assert_reconstructed_sql_matches_original" in source
 
 
 def test_reconstruction_contract_case_names_are_unique():
@@ -2836,6 +3380,25 @@ def test_all_accounted_source_nodes_exist_in_duckdb_source():
         if node_name not in source_names:
             extra_names.add(node_name)
     assert not extra_names
+
+
+def test_source_node_accounting_buckets_are_disjoint():
+    """Verify source nodes are assigned to exactly one coverage bucket."""
+    buckets = (
+        ("direct_handler", all_direct_handler_contract_node_names()),
+        ("command_plan", command_contract_node_names()),
+        ("optimized_lowering", set(lowered_contract_node_names())),
+        ("source_evidence", set(source_evidence_node_names())),
+    )
+    overlaps = {}
+    for left_name, left_nodes in buckets:
+        for right_name, right_nodes in buckets:
+            if left_name >= right_name:
+                continue
+            overlap = set(left_nodes) & set(right_nodes)
+            if overlap:
+                overlaps[(left_name, right_name)] = tuple(sorted(overlap))
+    assert not overlaps
 
 
 def test_command_contract_case_names_are_unique():

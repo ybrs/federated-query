@@ -1272,7 +1272,25 @@ class SubqueryPlanBinder:
             return Limit(input=bound_input, limit=plan.limit, offset=plan.offset)
         if isinstance(plan, Join):
             return self._bind_join(plan)
+        if isinstance(plan, SetOperation):
+            return self._bind_set_operation(plan)
         raise BindingError(f"Unsupported plan node in subquery: {type(plan).__name__}")
+
+    def _bind_set_operation(self, set_op: SetOperation) -> SetOperation:
+        """Bind both branches of a set-operation subquery body.
+
+        Each branch is bound with the enclosing scopes still visible (a branch
+        may correlate to an outer relation); their output arity must match.
+        """
+        bound_left = self.bind(set_op.left)
+        bound_right = self.bind(set_op.right)
+        self.host._check_set_branch_arity(bound_left, bound_right)
+        return SetOperation(
+            left=bound_left,
+            right=bound_right,
+            kind=set_op.kind,
+            distinct=set_op.distinct,
+        )
 
     def _bind_scan(self, scan: Scan) -> Scan:
         """Bind a subquery scan via the host's lenient column filtering."""

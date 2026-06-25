@@ -300,10 +300,15 @@ LEFT JOIN LATERAL (SELECT MAX(p.price) AS "__subq_1_v0"
   ON TRUE;
 ```
 
-Scope: **same-source** today (the whole query pushes to one source, which
-decorrelates the `LATERAL`). Cross-source `LATERAL` fails fast (see
-[Correlation limits](#correlation-limits)) until the cross-source dependent-join
-executor lands.
+Scope: **same-source** pushes the whole `LATERAL` to the one source. A
+**cross-source** `LATERAL` (left on A, subquery on B) runs in the in-memory
+DuckDB **merge engine**: the left and the right's base relation are materialized
+into Arrow and the merge engine decorrelates the `LATERAL`. The base relation is
+first reduced to the left's correlation **domain** — `=` → `IN (domain)`, `<`/`>`
+→ a range bound — so only relevant rows cross the network. The reduction is a
+*sound superset* (the merge engine re-applies the exact correlation), so it only
+shrinks transfer, never the answer. Only a single base relation per cross-source
+`LATERAL` is supported today; more than one fails fast.
 
 A **user-written** `LATERAL` is also accepted (parsed to the same `LateralJoin`
 node) and bound with the left relation in scope, so its correlation resolves:
@@ -359,6 +364,32 @@ FROM "main"."orders" AS orders
 SEMI JOIN (SELECT products.id AS "__subq_10_v0" FROM "main"."products" AS products
            ORDER BY products.price DESC NULLS FIRST LIMIT 5) AS subq_0
   ON (product_id = __subq_10_v0);
+```
+
+### `IN` over `UNION` / `INTERSECT` / `EXCEPT` → SEMI JOIN to a derived relation
+
+A set-operation subquery body is bound (both branches), kept intact through
+decorrelation, and rendered as a derived relation; the engine's
+no-subquery-expression invariant still holds (the set operation is a relation).
+Cross-source — a union on a different source from the outer — runs the set op on
+its source and the SEMI join in the merge engine.
+
+```sql
+-- input
+SELECT order_id FROM orders
+WHERE region IN (SELECT region FROM orders WHERE price > 100
+                 UNION
+                 SELECT region FROM orders WHERE quantity > 10);
+
+-- decorrelated
+SELECT order_id AS "order_id"
+FROM "main"."orders" AS orders
+SEMI JOIN (SELECT region AS "__subq_0_v0"
+           FROM (SELECT orders.region FROM "main"."orders" AS orders WHERE (orders.price > 100)
+                 UNION
+                 SELECT orders.region FROM "main"."orders" AS orders WHERE (orders.quantity > 10)
+                ) AS subq_0) AS subq_0
+  ON (region = __subq_0_v0);
 ```
 
 ---
@@ -440,17 +471,6 @@ error it raises; each is pinned by a test in
 
 ### Shape / structure limits
 
-**Subquery body is a set operation** (`UNION` / `INTERSECT` / `EXCEPT`).
-
-```sql
-SELECT order_id FROM orders
-WHERE region IN (SELECT region FROM orders WHERE price > 100
-                 UNION
-                 SELECT region FROM orders WHERE quantity > 10);
--- BindingError: Unsupported plan node in subquery: SetOperation
--- Needs: bind a SetOperation subquery body, keep it as a value relation in decorrelation, and render a UNION derived relation in pushdown.
-```
-
 **`OFFSET` inside a correlated subquery** — an offset per correlation key is
 unsupported.
 
@@ -489,19 +509,6 @@ SELECT COUNT(*) FROM orders GROUP BY (SELECT MAX(price) FROM products);
 ```
 
 ### Correlation limits
-
-**Cross-source LATERAL** — a non-equi correlated scalar (see
-[the supported LATERAL case](#non-equi-correlated-scalar--lateral-dependent-join))
-whose subquery and outer query live on **different** sources.
-
-```sql
--- orders on source A, products on source B
-SELECT o.order_id, (SELECT MAX(p.price) FROM products p WHERE p.price < o.price)
-FROM orders o;
--- ValueError: Cross-source LATERAL (dependent join) is not supported yet ...
--- Needs: a cross-source dependent-join executor — materialize the distinct correlation
---   "domain" from the outer side, push one batched query per source, join locally.
-```
 
 **Skip-level correlation** — an inner subquery referencing a relation two or more
 levels up (the canonical dependent-join case).
