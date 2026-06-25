@@ -15,14 +15,14 @@ This document breaks down the implementation into phases. Each phase builds on t
 | **Phase 4** | ✅ Complete | Pre-optimization and expression handling | 42 tests |
 | **Phase 5** | ✅ Complete | Statistics and cost model | 30 tests |
 | **Phase 6** | ✅ Substantially Complete | Logical optimization (pushdown, reordering) | 32 tests |
-| **Phase 7** | ⏳ Not Started | Decorrelation (subqueries) | - |
-| **Phase 8** | ⏳ Not Started | Physical planning and join strategies | - |
-| **Phase 9** | ⏳ Not Started | Advanced execution (parallel, memory mgmt) | - |
-| **Phase 10** | ⏳ Not Started | Additional SQL features (ORDER BY, UNION, CTEs) | - |
+| **Phase 7** | ✅ Complete | Decorrelation (subqueries) → SEMI/ANTI/LEFT joins | green |
+| **Phase 8** | ✅ Complete | Pushdown breadth, merge engine, set ops, dynamic filtering, LATERAL, CTEs (single + cross-source) | 809 passing |
+| **Phase 9** | ⏳ Not Started | General dependent-join decorrelation + cross-source subquery fallback (§9.6); parallel exec + memory mgmt | - |
+| **Phase 10** | ⏳ Not Started | Additional SQL features (window functions, date/time, FILTER, NATURAL/USING) | - |
 | **Phase 11** | ⏳ Not Started | Production readiness | - |
 | **Phase 12** | ⏳ Future | Advanced features (adaptive execution, caching) | - |
 
-**Current Status**: 186 tests passing, Phases 0-5 complete, Phase 6 substantially complete (all critical bugs fixed)
+**Current Status**: Phases 0–8 complete (branch `phase8`), full suite **809 passing / 0 failed / 0 xfailed**. See `TODO-next.md` (live handoff), `pushdown-status.md` (pushdown capabilities), and `decorrelation-gaps.md` (remaining subquery gaps → Phase 9).
 
 ## Phase 0: Foundation ✅ COMPLETED
 
@@ -767,6 +767,31 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - [ ] Benchmark parallel vs sequential execution
 - [ ] Benchmark with and without spilling
 - [ ] Stress test with very large datasets
+
+### 9.6 General dependent-join decorrelation + cross-source subquery fallback
+
+Detailed plan and the precise remaining gaps live in `decorrelation-gaps.md`.
+Today decorrelation is **pattern-based**: recognized subquery shapes become
+SEMI/ANTI/LEFT joins, LATERAL dependent joins, or pushed CTEs; everything else
+**fails fast** with `DecorrelationError` (never wrong answers). Phase 9 adds the
+general fallback so nothing is left un-unnested.
+
+- [ ] Implement a general **dependent join** (Neumann & Kemper 2015): emit the
+      dependent join, push it down algebraically until the correlation vanishes.
+- [ ] Subsume the remaining fail-fast gaps (each has a test in
+      `tests/e2e_decorrelation/test_error_cases.py`):
+  - [ ] Skip-level correlation (references a relation 2+ levels up)
+  - [ ] Subquery in `GROUP BY` / aggregate-argument position
+  - [ ] `OFFSET` in a correlated subquery
+  - [ ] Multi-column scalar / quantified subquery; `SELECT *` value subquery
+  - [ ] Subquery in a non-INNER join `ON`; multi-row `VALUES` subquery
+  - [ ] Two correlation equalities over a global (ungrouped) aggregate
+- [ ] **Cross-source correlated-subquery fallback** (old "cluster D"): a
+      correlated subquery that can't decorrelate same-source falls back to the
+      cross-source dependent-join path, reusing the LATERAL / CTE
+      materialize-and-register + domain-reduction machinery
+      (`PhysicalLateralJoin`, `PhysicalCTE*`). Needs a `multi_source_env` fixture
+      + tests.
 
 **Deliverable**: Production-ready parallel execution engine with robust memory management
 

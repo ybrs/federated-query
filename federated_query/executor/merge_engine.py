@@ -54,6 +54,21 @@ class MergeEngine:
         for batch in reader:
             yield batch
 
+    def schema(self, sql: str, inputs: Dict[str, object]) -> pa.Schema:
+        """Return a query's result schema without fetching its rows.
+
+        The Arrow reader exposes its schema before any batch is pulled, so an
+        empty result (or a ``LIMIT 0``) still yields the correct column types —
+        unlike reading the first batch, which an empty result never produces.
+        """
+        cursor = self._connection.cursor()
+        try:
+            for name, arrow_input in inputs.items():
+                cursor.register(name, arrow_input)
+            return cursor.execute(sql).to_arrow_reader().schema
+        finally:
+            cursor.close()
+
     def warmup(self) -> None:
         """Run a trivial join so the first real query pays no DuckDB setup cost.
 

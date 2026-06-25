@@ -29,85 +29,68 @@ it only if a construct is provably un-decorrelatable (none of the gaps below
 are — they are all unnestable with a general dependent join; today they just hit
 pattern-coverage limits and fail fast).
 
-## Current state (pattern-based decorrelation, Phase 7)
+## Current state (pattern-based decorrelation, Phases 7–8)
 
-Covered and green (116/116 decorrelation e2e tests): `EXISTS`/`NOT EXISTS` →
-SEMI/ANTI; `IN`/`NOT IN` (incl. tuple IN) with exact three-valued NULL
-semantics; `ANY`/`SOME`/`ALL`; correlated and uncorrelated scalar subqueries →
-LEFT join to a keyed aggregate (+ COALESCE for COUNT, runtime cardinality guard,
-per-key limit for correlated LIMIT); boolean subqueries in SELECT lists;
-OR-of-subqueries via union expansion; nested subqueries innermost-first; derived
-tables; INNER-join-condition subqueries. Unsupported patterns **fail fast** with
-`DecorrelationError` (never silently wrong).
+All decorrelation e2e tests are green (full suite **809 passed / 0 xfailed /
+0 failed**). Covered today:
 
-## The gaps (grounded in code + failing tests)
+- `EXISTS`/`NOT EXISTS` → SEMI/ANTI; `IN`/`NOT IN` (incl. tuple IN) with exact
+  three-valued NULL semantics; `ANY`/`SOME`/`ALL`.
+- Correlated and uncorrelated scalar subqueries → LEFT join to a keyed aggregate
+  (+ COALESCE for COUNT, runtime cardinality guard).
+- Correlated `ORDER BY … LIMIT n` (pick-one / latest-per-key) → LEFT join +
+  order-aware `GroupedLimit` (now pushed to the merge engine as a
+  `ROW_NUMBER() OVER (PARTITION BY …)` window).
+- **Value/scalar output shapes** — body topped by `Filter` (HAVING) or `Sort`
+  (ORDER BY/LIMIT) now peel (uncorrelated). *(gap A — CLOSED)*
+- **Set-operation subquery body** (`UNION`/`INTERSECT`/`EXCEPT`) binds and
+  decorrelates. *(gap B — CLOSED)*
+- **Non-equality correlation through an aggregate/limit** → `LateralJoin`
+  (dependent join); same-source pushes `LEFT JOIN LATERAL`, cross-source runs in
+  the merge engine with domain reduction. User-written `LATERAL` also supported.
+- **CTEs** (`WITH`, incl. `RECURSIVE`) — single-source pushed as one remote
+  `WITH`; cross-source via materialize-once producer / merge-engine recursion.
 
-Each item is a place where pattern-based decorrelation gives up today. All are
-unnestable in principle via a general dependent join.
+Unsupported patterns still **fail fast** with `DecorrelationError` (never
+silently wrong) — each has a test in
+`tests/e2e_decorrelation/test_error_cases.py`.
 
-### A. Value/scalar subquery output shapes — `_peel_values_top`
-`federated_query/optimizer/decorrelation.py:635` only peels a subquery body that
-is topped by `Limit`, `Projection`, `Values`, or `Aggregate`. Other tops raise
-`DecorrelationError: Unsupported subquery output shape: <Node>`:
-- **Body topped by `Filter`** — `test_subqueries::test_subquery_with_group_by`.
-- **Body topped by `Sort`** (ORDER BY / LIMIT inside the subquery) —
-  `test_subqueries::test_subquery_with_order_by_limit`. The
-  "latest-row-per-key" idiom (`ORDER BY ... LIMIT 1`) needs a Sort+Limit peel
-  combined with the existing `GroupedLimit`.
+## Remaining gaps (all fail-fast)
 
-### B. Set-operation subquery body — subquery binder
-`federated_query/parser/binder.py:1231` raises
-`Unsupported plan node in subquery: SetOperation` for a `UNION`/`INTERSECT`/
-`EXCEPT` used as a subquery body — `test_subqueries::test_subquery_with_union`.
-The subquery binder + IN/EXISTS rewrite must accept a `SetOperation` body.
+These are the patterns pattern-based decorrelation still gives up on. Each
+raises `DecorrelationError`; none can return a wrong answer. All are unnestable
+in principle via a general dependent join (the Phase 9 plan below). Tests live
+in `tests/e2e_decorrelation/test_error_cases.py`.
 
-### C. Skip-level correlation (the canonical dependent-join case)
-A subquery that references a relation **two or more levels up**. Needs real
-dependent-join machinery; documented unsupported in `decorrelation-tasks.md`.
+| Gap | Behavior | Test |
+|-----|----------|------|
+| **Skip-level correlation** (subquery references a relation 2+ levels up) | fail-fast | `test_skip_level_correlation` |
+| **Subquery in `GROUP BY` / aggregate-argument position** | fail-fast | `test_subquery_in_group_by` |
+| **`OFFSET` in a correlated subquery** | fail-fast | `test_offset_in_correlated_subquery` |
+| **Multi-column scalar / quantified subquery** | fail-fast | `test_quantified_comparison_multi_column_subquery` |
+| **`SELECT *` value subquery** | fail-fast | `test_select_star_value_subquery` |
+| **Subquery in a non-INNER join `ON`; multi-row `VALUES` subquery; two correlation equalities over a global aggregate** | fail-fast | guarded in `decorrelation.py`; no dedicated test yet |
 
-### D. Correlation through aggregates / limits
-- **Non-equality** correlation pushed through an aggregate or limit.
-- **Two correlation equalities over a global (ungrouped) aggregate** — the
-  key-widening rewrite can't tell its own added keys from original GROUP BY keys.
-- **`OFFSET` in a correlated subquery** — `decorrelation.py:519`.
+## Phase 9 — general dependent-join decorrelation (the big rewrite)
 
-### E. Subqueries in disallowed positions
-- In `GROUP BY` or aggregate arguments.
-- In a **non-INNER** join `ON` condition.
-- (Both documented unsupported in `decorrelation-tasks.md`.)
+The end state moves from pattern-based decorrelation (fast paths per recognized
+shape) to a **general dependent join** (Neumann & Kemper, *"Unnesting Arbitrary
+Queries"*, 2015): emit a dependent join, then push it down with algebraic rules
+until the correlation disappears. The pattern fast-paths stay as optimizations;
+the general fallback removes every "unsupported shape" fail-fast above and
+guarantees a subquery-free physical plan unconditionally.
 
-### F. Value-subquery shape restrictions
-- **Multi-column** scalar subquery — `decorrelation.py:527` /`:595`.
-- **`SELECT *`** value subquery — `decorrelation.py:657`.
-- **Multi-row `VALUES`** subquery — `decorrelation.py:666`.
+Scope for Phase 9:
 
-### G. Binding gap to investigate
-`test_subqueries::test_exists_with_complex_predicates` fails with
-`BindingError: Column 'quantity' not found in table 'P'`. Unlike the others this
-is a *binding* failure, not a clean decorrelation fail-fast — likely a
-scope/resolution bug (or a stale fixture reference). Triage separately.
+1. **General dependent join** subsuming the remaining gaps (skip-level,
+   two-equality global aggregate, non-INNER `ON`, multi-column / `SELECT *` /
+   multi-row value subqueries, `OFFSET`, GROUP-BY-position).
+2. **Cross-source correlated-subquery fallback** (the old "cluster D"): a
+   correlated subquery that cannot decorrelate same-source falls back to the
+   cross-source dependent-join path, reusing the existing LATERAL / CTE
+   materialize-and-register + domain-reduction machinery (`PhysicalLateralJoin`,
+   `PhysicalCTE*`). No test/fixture exists yet.
 
-## Relationship to G8
-
-The 20 red `test_subqueries` tests split three ways:
-- **~14** decorrelate correctly and return right answers, but execute as a
-  **local** join (2+ remote scans) while the test wants **one** pushed remote
-  query — a *pushdown* gap (push decorrelated SEMI/ANTI/scalar joins), a natural
-  extension of G1, **not** a decorrelation gap.
-- **~4** are real decorrelation coverage gaps above (A, B, D).
-- **~2** are binding gaps (B, G).
-
-So "finish G8" = (1) extend the single-source generator to push decorrelated
-semi/anti/scalar joins, and (2) close the decorrelation/binding gaps in this
-doc. The strategic version of (2) is to move from pattern-based to general
-dependent-join decorrelation — a **large** task, deferred deliberately.
-
-## Suggested sequencing (when picked up)
-
-1. Cheap coverage wins first: A (Filter/Sort peel) and B (SetOperation body).
-2. Fix the G-bucket binding error.
-3. Generalize to a dependent join (C/D/E) — the big rewrite that removes the
-   "unsupported shape" failures wholesale and guarantees a subquery-free
-   physical plan.
-4. Pushdown of decorrelated semi/anti/scalar joins (the G8 shape bucket) — folds
-   into the G1 generator once those joins are in scope.
+This is a **large, deliberately-deferred** task. Phase 8 (pushdown breadth,
+decorrelation coverage, CTEs) is closed; the items here are the next phase, not
+blockers.

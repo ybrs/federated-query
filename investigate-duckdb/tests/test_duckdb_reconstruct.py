@@ -18,6 +18,7 @@ from duckdb_node_manifest import (
 from duckdb_reconstruct import (
     PlanNode,
     PlanReconstructionError,
+    apply_auto_schema,
     create_repl_session,
     default_repl_history_file,
     explain_optimized_json,
@@ -217,6 +218,32 @@ def assert_reconstructed_sql_matches_original(setup_sql, query_sql, auto_schema=
     optimized_root = explain_optimized_json(reconstructed_connection, query_sql)
     reconstructed_sql = reconstruct_sql(
         reconstructed_connection, query_sql, False, True, auto_schema, optimized_root
+    )
+    assert_no_internal_placeholders(reconstructed_sql)
+    assert_temp_views_are_unique(reconstructed_sql)
+    actual_rows, actual_columns = execute_reconstructed_sql_contract(
+        reconstructed_connection, reconstructed_sql
+    )
+    assert actual_rows == expected_rows
+    assert actual_columns == expected_columns
+
+
+def assert_native_reconstructed_sql_matches_original(
+    setup_sql, query_sql, auto_schema=False
+):
+    """Assert native reconstruction returns original rows and columns."""
+    original_connection = duckdb.connect(":memory:")
+    reconstructed_connection = duckdb.connect(":memory:")
+    if setup_sql.strip():
+        original_connection.execute(setup_sql)
+        reconstructed_connection.execute(setup_sql)
+    if auto_schema:
+        apply_auto_schema(original_connection, query_sql)
+    expected_rows, expected_columns = execute_sql_script_with_columns(
+        original_connection, query_sql
+    )
+    reconstructed_sql = reconstruct_sql(
+        reconstructed_connection, query_sql, False, True, auto_schema
     )
     assert_no_internal_placeholders(reconstructed_sql)
     assert_temp_views_are_unique(reconstructed_sql)
@@ -743,6 +770,178 @@ def test_repl_root_derived_subquery_uses_live_connection_schema(capsys):
     assert "SELECT 1 AS foo" in output
     assert "FROM bar;" in output
     assert "ERROR:" not in output
+
+
+def root_derived_semantic_setup_sql():
+    """Return setup SQL for root-derived semantic contracts."""
+    return """
+        CREATE TABLE base(id INTEGER, value INTEGER, grp VARCHAR, flag BOOLEAN);
+        CREATE TABLE side(id INTEGER, label VARCHAR);
+        INSERT INTO base VALUES
+            (1, 10, 'a', TRUE),
+            (2, 20, 'a', FALSE),
+            (3, 15, 'b', TRUE);
+        INSERT INTO side VALUES (1, 'x'), (2, 'y'), (4, 'z');
+    """
+
+
+def root_derived_semantic_contract_cases():
+    """Return all native root-derived semantic operator contracts."""
+    setup_sql = root_derived_semantic_setup_sql()
+    return (
+        ("projection", setup_sql, root_derived_projection_sql(), False),
+        ("filter", setup_sql, root_derived_filter_sql(), False),
+        ("limit_one", setup_sql, root_derived_limit_sql(1), False),
+        ("limit_two", setup_sql, root_derived_limit_sql(2), False),
+        ("offset", setup_sql, root_derived_offset_sql(), False),
+        ("order_by", setup_sql, root_derived_order_by_sql(), False),
+        ("order_by_limit", setup_sql, root_derived_order_by_limit_sql(), False),
+        ("distinct", setup_sql, root_derived_distinct_sql(), False),
+        ("aggregate", setup_sql, root_derived_aggregate_sql(), False),
+        ("window", setup_sql, root_derived_window_sql(), False),
+        ("join", setup_sql, root_derived_join_sql(), False),
+        ("cross_product", setup_sql, root_derived_cross_product_sql(), False),
+        ("union", setup_sql, root_derived_set_sql("UNION"), False),
+        ("union_all", setup_sql, root_derived_set_sql("UNION ALL"), False),
+        ("intersect", setup_sql, root_derived_set_sql("INTERSECT"), False),
+        ("except", setup_sql, root_derived_set_sql("EXCEPT"), False),
+        ("empty_result", setup_sql, root_derived_empty_result_sql(), False),
+        ("unnest", "", root_derived_unnest_sql(), False),
+        ("cte", setup_sql, root_derived_cte_sql(), False),
+        ("recursive_cte", "", root_derived_recursive_cte_sql(), False),
+        ("auto_schema_limit_one", "", root_derived_auto_schema_limit_sql(1), True),
+        ("auto_schema_limit_two", "", root_derived_auto_schema_limit_sql(2), True),
+    )
+
+
+def root_derived_projection_sql():
+    """Return a root-derived projection query."""
+    return "SELECT out_id FROM (SELECT id AS out_id FROM base) t ORDER BY out_id"
+
+
+def root_derived_filter_sql():
+    """Return a root-derived filter query."""
+    return "SELECT id FROM (SELECT id FROM base WHERE flag) t ORDER BY id"
+
+
+def root_derived_limit_sql(limit_value):
+    """Return a root-derived limit query."""
+    return (
+        "SELECT id FROM "
+        f"(SELECT id FROM base ORDER BY id LIMIT {limit_value}) t ORDER BY id"
+    )
+
+
+def root_derived_offset_sql():
+    """Return a root-derived offset query."""
+    return "SELECT id FROM (SELECT id FROM base ORDER BY id OFFSET 1) t ORDER BY id"
+
+
+def root_derived_order_by_sql():
+    """Return a root-derived order query."""
+    return "SELECT id FROM (SELECT id FROM base ORDER BY value DESC) t"
+
+
+def root_derived_order_by_limit_sql():
+    """Return a root-derived top-n query."""
+    return "SELECT id FROM (SELECT id FROM base ORDER BY value DESC LIMIT 1) t"
+
+
+def root_derived_distinct_sql():
+    """Return a root-derived distinct query."""
+    return "SELECT grp FROM (SELECT DISTINCT grp FROM base) t ORDER BY grp"
+
+
+def root_derived_aggregate_sql():
+    """Return a root-derived aggregate query."""
+    return (
+        "SELECT grp, total FROM "
+        "(SELECT grp, sum(value) AS total FROM base GROUP BY grp) t ORDER BY grp"
+    )
+
+
+def root_derived_window_sql():
+    """Return a root-derived window query."""
+    return (
+        "SELECT id, rn FROM "
+        "(SELECT id, row_number() OVER (ORDER BY value) AS rn FROM base) t "
+        "ORDER BY id"
+    )
+
+
+def root_derived_join_sql():
+    """Return a root-derived join query."""
+    return (
+        "SELECT id, label FROM "
+        "(SELECT base.id, side.label FROM base JOIN side ON side.id = base.id) t "
+        "ORDER BY id"
+    )
+
+
+def root_derived_cross_product_sql():
+    """Return a root-derived cross product query."""
+    return (
+        "SELECT id, label FROM "
+        "(SELECT base.id, side.label FROM base CROSS JOIN side WHERE base.id = 1) t "
+        "ORDER BY label"
+    )
+
+
+def root_derived_set_sql(operator):
+    """Return a root-derived set operation query."""
+    return (
+        "SELECT id FROM "
+        f"(SELECT id FROM base WHERE id <= 2 {operator} "
+        "SELECT id FROM base WHERE id >= 2) t ORDER BY id"
+    )
+
+
+def root_derived_empty_result_sql():
+    """Return a root-derived empty result query."""
+    return "SELECT id FROM (SELECT id FROM base WHERE id > 99) t ORDER BY id"
+
+
+def root_derived_unnest_sql():
+    """Return a root-derived unnest query."""
+    return "SELECT value FROM (SELECT unnest([1, 2]) AS value) t ORDER BY value"
+
+
+def root_derived_cte_sql():
+    """Return a root-derived CTE query."""
+    return (
+        "SELECT id FROM "
+        "(WITH c AS (SELECT id FROM base WHERE flag) SELECT id FROM c) t "
+        "ORDER BY id"
+    )
+
+
+def root_derived_recursive_cte_sql():
+    """Return a root-derived recursive CTE query."""
+    return (
+        "SELECT i FROM "
+        "(WITH RECURSIVE r(i) AS ("
+        "SELECT 1 UNION ALL SELECT i + 1 FROM r WHERE i < 3"
+        ") SELECT i FROM r) t ORDER BY i"
+    )
+
+
+def root_derived_auto_schema_limit_sql(limit_value):
+    """Return the auto-schema root-derived limit regression query."""
+    return f"SELECT b FROM (SELECT TRUE AS b FROM dual LIMIT {limit_value}) t"
+
+
+@pytest.mark.parametrize(
+    "case_name,setup_sql,query_sql,auto_schema",
+    root_derived_semantic_contract_cases(),
+)
+def test_root_derived_semantic_contract_cases(
+    case_name, setup_sql, query_sql, auto_schema
+):
+    """Verify native root-derived reconstruction preserves each operator."""
+    assert case_name
+    assert_native_reconstructed_sql_matches_original(
+        setup_sql, query_sql, auto_schema
+    )
 
 
 def test_union_reconstructs_set_operation():

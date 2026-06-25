@@ -6,8 +6,9 @@ This is a production-grade federated query engine that executes SQL queries acro
 
 ## Implementation Status
 
-**Current Implementation State**: Phases 0–7 complete; Phase 8 (pushdown
-breadth + advanced features) in progress.
+**Current Implementation State**: Phases 0–8 complete. Phase 9 (general
+dependent-join decorrelation + cross-source subquery fallback; parallel
+execution + memory management) not started — see `decorrelation-gaps.md`.
 
 - ✅ **Phase 0**: Foundation — project structure, configuration, catalog, data sources
 - ✅ **Phase 1**: Basic query execution — single-table SELECT with filters and limits
@@ -16,20 +17,20 @@ breadth + advanced features) in progress.
 - ✅ **Phases 4–6**: Optimizer rules (predicate/projection/aggregate/order-by/limit pushdown,
   expression simplification), cost stubs, native `EXPLAIN`, statistics scaffolding
 - ✅ **Phase 7**: Subquery decorrelation — EXISTS/IN/ANY/ALL/scalar → joins with exact
-  three-valued NULL semantics; 116/116 decorrelation e2e tests green
-- 🚧 **Phase 8**: Pushdown breadth and advanced SQL (see `TODO-phase7-review.md` section G)
-  - ✅ Set operations (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`) — pushdown + local
-  - ⏳ G1 same-source join breadth, G2 computed-projection pushdown, G3 CTEs,
-    G5 `CAST`, G6 date/time, G7 aggregate `FILTER`, G8 IN-subquery bodies
-  - ⏳ **G9**: cross-source dynamic filtering / semi-join reduction (top usability gap —
-    cross-source joins currently fetch both sides in full)
+  three-valued NULL semantics
+- ✅ **Phase 8**: Pushdown breadth and advanced SQL
+  - ✅ Single-source generator pushes any same-source subtree as one remote query
+    (joins of every shape incl. SEMI/ANTI/LEFT, computed projections, derived tables)
+  - ✅ Set operations, `CAST`, decorrelation gaps A/B, `LATERAL` (same + cross-source)
+  - ✅ **CTEs** (`WITH`, incl. `RECURSIVE`) — single-source and cross-source
+  - ✅ Cross-source dynamic filtering / semi-join reduction (G9)
+  - ✅ Local set-based work runs in the DuckDB merge engine (no Python row-loop joins)
 
-**Test Status**: 689 passing / 85 failing (the 85 are the open G-series pushdown-shape
-and feature tests above; no correctness regressions).
+**Test Status**: 809 passing / 0 failing / 0 xfailed.
 
-**Known limitation**: cross-source joins do not yet use the build side's keys to
-constrain the probe side (no dynamic filtering) — the most important optimization still
-missing for real-world cross-source usability. See G9.
+**Deferred to Phase 9**: general dependent-join decorrelation (the remaining
+fail-fast subquery shapes), cross-source correlated-subquery fallback, date/time
+breadth, aggregate `FILTER`, `NATURAL`/`USING`, cost-based plan selection.
 
 ## Goals
 

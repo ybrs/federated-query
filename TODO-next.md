@@ -5,24 +5,29 @@ Physical Plan" rule is now enforced: decorrelation produces a flat join plan and
 single-source pushdown renders it as **SQL joins**, never re-correlated
 `EXISTS`/`IN`/scalar `(SELECT …)`.
 
-## REVIEW TASK — push joins to the merge engine, not Python
+## REVIEW TASK — push joins to the merge engine, not Python — DONE
 
-We keep finding cross-source joins executed in Python row loops instead of being
-handed to the DuckDB merge engine. Principle: **local joins run set-based in the
-merge engine; we should not hand-roll join/group/sort logic in Python.** Audit
-every physical operator for Python-side processing that DuckDB should own:
-- `PhysicalNestedLoopJoin` — DONE (now routes through the merge engine; the
-  Python loop is only a no-engine fallback). It used to re-execute its inner
-  side once per outer row (a remote query per row, cross-source).
-- Re-check `PhysicalHashJoin` row-loop fallbacks, `PhysicalGroupedLimit`
-  (per-key limit done in Python), `PhysicalSingleRowGuard`, set-operation /
-  union dedup, and any operator with an `_execute_*` Python path.
-- For each: confirm it materializes inputs once and pushes the operation to the
-  merge engine (or document why a Python path is genuinely required).
+Audited every physical operator (full per-operator table was produced). Result:
+local set-based work runs in the DuckDB merge engine; Python paths remain only as
+a no-engine fallback or for genuinely un-renderable expressions.
+- `PhysicalNestedLoopJoin`, `PhysicalHashJoin`, `PhysicalHashAggregate`,
+  `PhysicalSort`, `PhysicalUnion`, `PhysicalSetOperation` — merge engine when
+  attached; Python only when no engine / un-renderable expression (sound).
+- `PhysicalGroupedLimit` — **was the last violation** (per-key limit entirely in
+  Python). Now pushed as `ROW_NUMBER() OVER (PARTITION BY keys ORDER BY …)
+  WHERE rn <= limit`, with a synthetic input-order index as the final ORDER BY
+  tiebreaker so the merge path returns identical rows *and order* to the Python
+  streaming path. Parity tests in `test_physical_decorrelation_operators.py`.
+- `PhysicalSingleRowGuard` — a pure cardinality guard, no set-based work; N/A.
+- `PhysicalRemoteJoin` — pushes the whole join to the source as SQL; N/A.
 
 ## Current test state
 
-- Full suite: **798 passed / 0 xfailed / 0 failed**
+- Full suite: **809 passed / 0 xfailed / 0 failed**
+- Coverage (numpy 2.4 + coverage crash on C-ext reimport): use the pre-import
+  shim `/tmp/covrun.py` (imports duckdb/numpy/pyarrow before `coverage.start()`)
+  with the `/workspace/venv-cov` venv (numpy 2.3.5). Plain pytest-cov dies on
+  `import duckdb` under instrumentation.
   (`POSTGRES_DB=duckpoc /workspace/venv-fedq/bin/python -m pytest tests/ -q`;
   needs `make pg-start`).
 - `tests/e2e_decorrelation/`: green.
@@ -131,7 +136,25 @@ every physical operator for Python-side processing that DuckDB should own:
     `PhysicalCTEMergeQuery`. Tests: `test_cross_source_ctes.py` (4, vs combined
     DuckDB): body-single-source/child-joins-other, body-cross-source,
     multi-ref-materialize-once (asserts one shared producer), recursive
-    cross-source (asserts `PhysicalCTEMergeQuery` with 2 registered sources).
+    cross-source (asserts `PhysicalCTEMergeQuery` with 2 registered sources),
+    cross-source explicit-column-list (relabel), and a recursive hierarchy
+    traversal over a real `employees(id, manager_id, name)` self-join in one
+    source joined to `bonuses` in a second (local `hierarchy_env` fixture).
+  - Edge coverage in `test_ctes.py`: non-recursive explicit column list
+    (`WITH t(oid, p) AS …`) and a constant FROM-less body (`WITH x AS
+    (SELECT 1 AS n) …`, exercises the sole-source default).
+  - Coverage-driven follow-ups (`test_cross_source_ctes.py`): producer
+    materialize-once + `execute()`/`repr`, `_plan_cte_ref` in-scope invariant,
+    constant CTE in a multi-source catalog (no sole-source default → producer
+    path), recursive-unrenderable fail-fast, and `PhysicalCTEMergeQuery.schema()`.
+  - **Bug fixed while covering `schema()`:** `PhysicalCTEMergeQuery.schema()` AND
+    the pre-existing `PhysicalLateralJoin.schema()` used a `… LIMIT 0` probe and
+    read the schema off the *first batch* — but `LIMIT 0` yields **zero**
+    batches, so both returned an empty schema. Added `MergeEngine.schema(sql,
+    inputs)` which reads `to_arrow_reader().schema` (available before any batch);
+    both operators now use it. Latent because neither `schema()` is called when
+    the operator is the plan root (execution builds the schema from real
+    batches); it only bites when the operator is nested under another.
 - **Cluster D — cross-source** (`test_cross_datasource_subquery_fallback`):
   needs the cross-source materialization policy; the `multi_source_env` fixture
   also lacks the tables the test names.

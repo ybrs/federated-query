@@ -44,6 +44,12 @@ _MERGE_RIGHT_RELATION = "in_right"
 _MERGE_AGG_RELATION = "in_agg"
 # Name under which a sort registers its single input with the merge engine.
 _MERGE_SORT_RELATION = "in_sort"
+# Name under which a grouped-limit registers its single input, plus the synthetic
+# columns it adds: a row-order index (stable tiebreak so the merge path keeps the
+# same rows as the Python streaming path) and the per-key row number.
+_MERGE_GROUPED_LIMIT_RELATION = "in_grouped_limit"
+_GROUPED_LIMIT_INDEX_COL = "__gl_idx"
+_GROUPED_LIMIT_RN_COL = "__gl_rn"
 
 
 class PhysicalPlanNode(ABC):
@@ -295,12 +301,9 @@ class PhysicalCTEMergeQuery(PhysicalPlanNode):
         return tables
 
     def schema(self) -> pa.Schema:
-        """Probe the WITH with no rows to learn the output schema."""
+        """Output schema of the WITH, read from the result without fetching rows."""
         engine = self.merge_engine()
-        probe = f"SELECT * FROM ({self.sql}) AS _cte_schema LIMIT 0"
-        for batch in engine.run(probe, self._materialized_inputs()):
-            return batch.schema
-        return pa.schema([])
+        return engine.schema(self.sql, self._materialized_inputs())
 
     def estimated_cost(self) -> float:
         raise NotImplementedError("Cost estimation not yet implemented")
@@ -3429,12 +3432,23 @@ class PhysicalGroupedLimit(PhysicalPlanNode):
         return [self.input]
 
     def execute(self) -> Iterator[pa.RecordBatch]:
-        """Keep the first ``limit`` rows of each key.
+        """Keep at most ``limit`` rows per key.
 
-        Without an ordering the input row order decides which rows survive
-        (row-at-a-time streaming). With an ordering the input is materialized
-        and each key group is sorted first, implementing the first/latest-row-
-        per-key idiom without depending on a child operator's order.
+        Pushed to the merge engine as a ``ROW_NUMBER() OVER (PARTITION BY keys
+        …)`` window when keys are plain columns; otherwise the Python streaming
+        path applies the per-key limit in row order.
+        """
+        engine = self.merge_engine()
+        if engine is not None and self._can_merge():
+            yield from self._execute_merge(engine)
+        else:
+            yield from self._execute_python()
+
+    def _execute_python(self) -> Iterator[pa.RecordBatch]:
+        """Apply the per-key limit in Python (no merge engine attached).
+
+        Without an ordering the input row order decides which rows survive; with
+        one the input is materialized and each key group is sorted first.
         """
         if self.order_by_keys:
             yield from self._execute_ordered()
@@ -3444,6 +3458,94 @@ class PhysicalGroupedLimit(PhysicalPlanNode):
             filtered = self._limit_batch(batch, emitted_counts)
             if filtered.num_rows > 0:
                 yield filtered
+
+    def _can_merge(self) -> bool:
+        """True when every partition and ordering key is a plain column."""
+        return self._all_columns(self.keys) and self._all_columns(
+            self.order_by_keys or []
+        )
+
+    def _all_columns(self, expressions: List[Expression]) -> bool:
+        """Whether every expression is a bare column reference."""
+        from .expressions import ColumnRef
+
+        for expression in expressions:
+            if not isinstance(expression, ColumnRef):
+                return False
+        return True
+
+    def _execute_merge(self, engine) -> Iterator[pa.RecordBatch]:
+        """Run the per-key limit as a windowed query in the merge engine."""
+        table = self._indexed_input_table()
+        sql = self._grouped_limit_sql(self.input.schema().names)
+        return engine.run(sql, {_MERGE_GROUPED_LIMIT_RELATION: table})
+
+    def _indexed_input_table(self) -> pa.Table:
+        """Materialize the input and append a stable row-order index column."""
+        table = pa.Table.from_batches(
+            list(self.input.execute()), schema=self.input.schema()
+        )
+        index = pa.array(range(table.num_rows), type=pa.int64())
+        return table.append_column(_GROUPED_LIMIT_INDEX_COL, index)
+
+    def _grouped_limit_sql(self, names: List[str]) -> str:
+        """Render the ``ROW_NUMBER`` window and keep each key's first rows."""
+        window = (
+            f"ROW_NUMBER() OVER (PARTITION BY {self._partition_clause()} "
+            f"ORDER BY {self._merge_order_clause()})"
+        )
+        inner = (
+            f"SELECT *, {window} AS {_GROUPED_LIMIT_RN_COL} "
+            f"FROM {_MERGE_GROUPED_LIMIT_RELATION}"
+        )
+        select_list = self._merge_select_list(names)
+        return (
+            f"SELECT {select_list} FROM ({inner}) AS _t "
+            f"WHERE {_GROUPED_LIMIT_RN_COL} <= {self.limit} "
+            f'ORDER BY "{_GROUPED_LIMIT_INDEX_COL}"'
+        )
+
+    def _merge_select_list(self, names: List[str]) -> str:
+        """Quote the original output columns (drops the synthetic columns)."""
+        parts = []
+        for name in names:
+            parts.append(f'"{name}"')
+        return ", ".join(parts)
+
+    def _partition_clause(self) -> str:
+        """Render the PARTITION BY list from the per-key columns."""
+        parts = []
+        for key in self.keys:
+            parts.append(f'"{key.column}"')
+        return ", ".join(parts)
+
+    def _merge_order_clause(self) -> str:
+        """Order each partition by the ordering keys, then the row index.
+
+        The trailing row-index keeps ties in input order, so the same rows
+        survive as the streaming Python path.
+        """
+        parts = []
+        if self.order_by_keys:
+            for index in range(len(self.order_by_keys)):
+                parts.append(self._merge_order_key(index))
+        parts.append(f'"{_GROUPED_LIMIT_INDEX_COL}" ASC')
+        return ", ".join(parts)
+
+    def _merge_order_key(self, index: int) -> str:
+        """Render one ordering key: ``"col" ASC|DESC [NULLS FIRST|LAST]``."""
+        ascending = self.order_by_ascending
+        descending = ascending is not None and not ascending[index]
+        direction = "DESC" if descending else "ASC"
+        name = self.order_by_keys[index].column
+        return f'"{name}" {direction}{self._merge_nulls_suffix(index)}'
+
+    def _merge_nulls_suffix(self, index: int) -> str:
+        """Render an explicit NULLS placement when the plan supplies one."""
+        nulls = self.order_by_nulls
+        if nulls is None or nulls[index] is None:
+            return ""
+        return f" NULLS {nulls[index].upper()}"
 
     def _execute_ordered(self) -> Iterator[pa.RecordBatch]:
         """Materialize, sort within each key, and emit each key's first rows."""
@@ -3571,12 +3673,14 @@ class PhysicalLateralJoin(PhysicalPlanNode):
         return replace(self.base_scan, filters=combined)
 
     def schema(self) -> pa.Schema:
-        """Run an empty LATERAL to learn the (left + value) output schema."""
+        """The (left + value) output schema, read without fetching rows.
+
+        Taken from the LATERAL result's Arrow reader, which exposes the schema
+        before any batch — so an empty join still yields the right columns (a
+        ``LIMIT 0`` probe produces zero batches and would lose the schema).
+        """
         engine = self.merge_engine()
-        probe = f"SELECT * FROM ({self.lateral_sql}) AS _s LIMIT 0"
-        for batch in engine.run(probe, self._inputs()):
-            return batch.schema
-        return pa.schema([])
+        return engine.schema(self.lateral_sql, self._inputs())
 
     def estimated_cost(self) -> float:
         raise NotImplementedError("Cost estimation not yet implemented")
