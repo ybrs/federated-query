@@ -1,27 +1,18 @@
 """CTE (WITH clause) pushdown tests.
 
-CTEs are not supported yet: the parser rejects ``WITH`` outright
-(``parser.py``: "WITH clauses (CTEs) are not supported yet"). A CTE is a named
-relation, not a correlated subquery, so it is a separate feature from the
-decorrelation work and is deferred. The whole module is marked xfail until CTE
-binding/pushdown lands.
+A CTE is a named relation: the parser converts ``WITH`` into ``CTE`` nodes with
+``CTERef`` leaves for name references, the binder registers each name as a
+relation, and single-source pushdown renders the whole query as a ``WITH``
+statement pushed to the source (recursion and multi-reference materialization
+included). These tests assert the pushed datasource AST keeps the WITH shape.
 """
-
-import pytest
 
 from sqlglot import exp
 
 from tests.e2e_pushdown.helpers import (
     build_runtime,
     explain_datasource_query,
-    select_column_names,
     unwrap_parens,
-)
-
-pytestmark = pytest.mark.xfail(
-    reason="CTEs (WITH) not supported yet: parser rejects WITH; named-relation "
-    "binding/pushdown is a separate, deferred feature",
-    strict=False,
 )
 
 
@@ -36,7 +27,7 @@ def test_simple_cte_referenced_once(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
 
-    with_clause = ast.args.get("with")
+    with_clause = ast.args.get("with_")
     assert with_clause is not None
 
     ctes = with_clause.expressions
@@ -65,7 +56,7 @@ def test_cte_referenced_multiple_times(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
 
-    with_clause = ast.args.get("with")
+    with_clause = ast.args.get("with_")
     assert with_clause is not None
 
     ctes = with_clause.expressions
@@ -95,7 +86,7 @@ def test_multiple_ctes(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
 
-    with_clause = ast.args.get("with")
+    with_clause = ast.args.get("with_")
     assert with_clause is not None
 
     ctes = with_clause.expressions
@@ -126,7 +117,7 @@ def test_cte_with_join(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
 
-    with_clause = ast.args.get("with")
+    with_clause = ast.args.get("with_")
     assert with_clause is not None
 
     ctes = with_clause.expressions
@@ -154,7 +145,7 @@ def test_cte_with_aggregation(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
 
-    with_clause = ast.args.get("with")
+    with_clause = ast.args.get("with_")
     assert with_clause is not None
 
     ctes = with_clause.expressions
@@ -184,7 +175,7 @@ def test_cte_with_where(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
 
-    with_clause = ast.args.get("with")
+    with_clause = ast.args.get("with_")
     assert with_clause is not None
 
     ctes = with_clause.expressions
@@ -218,7 +209,7 @@ def test_nested_cte(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
 
-    with_clause = ast.args.get("with")
+    with_clause = ast.args.get("with_")
     assert with_clause is not None
 
     ctes = with_clause.expressions
@@ -234,7 +225,7 @@ def test_nested_cte(single_source_env):
 
     second_cte_query = second_cte.this
     assert isinstance(second_cte_query, exp.Select)
-    second_from = second_cte_query.args.get("from")
+    second_from = second_cte_query.args.get("from_")
     assert second_from is not None
 
 
@@ -251,7 +242,7 @@ def test_cte_with_union(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
 
-    with_clause = ast.args.get("with")
+    with_clause = ast.args.get("with_")
     assert with_clause is not None
 
     ctes = with_clause.expressions
@@ -275,7 +266,7 @@ def test_cte_with_order_by_limit(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
 
-    with_clause = ast.args.get("with")
+    with_clause = ast.args.get("with_")
     assert with_clause is not None
 
     ctes = with_clause.expressions
@@ -310,7 +301,7 @@ def test_recursive_cte_behavior(single_source_env):
 
     ast = explain_datasource_query(runtime, sql)
 
-    with_clause = ast.args.get("with")
+    with_clause = ast.args.get("with_")
     assert with_clause is not None
 
     ctes = with_clause.expressions

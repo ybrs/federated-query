@@ -14,6 +14,7 @@ from ..plan.logical import (
     Aggregate,
     Explain,
     CTE,
+    CTERef,
     Values,
     SubqueryScan,
     SetOperation,
@@ -92,6 +93,10 @@ class Binder:
         # enclosing query block. Subquery plans are bound with this stack
         # so correlated references resolve against outer relations.
         self._scope_stack: List[Dict[str, Table]] = []
+        # CTE name -> synthetic Table describing its output columns, registered
+        # while a WITH body and its children bind so a CTERef resolves like a
+        # relation without a catalog lookup.
+        self._cte_tables: Dict[str, Table] = {}
 
     def bind(
         self,
@@ -132,6 +137,8 @@ class Binder:
             return self._bind_aggregate(plan)
         if isinstance(plan, CTE):
             return self._bind_cte(plan)
+        if isinstance(plan, CTERef):
+            return self._bind_cte_ref(plan)
         if isinstance(plan, Values):
             return self._bind_values(plan)
         if isinstance(plan, SubqueryScan):
@@ -603,10 +610,92 @@ class Binder:
         )
 
     def _bind_cte(self, cte: CTE) -> CTE:
-        """Bind a CTE node."""
-        bound_cte = self.bind(cte.cte_plan)
+        """Bind a CTE: register its name as a relation, then bind body and child.
+
+        The name is registered for the child (and any later CTE) to resolve a
+        ``CTERef`` against the body's output columns; for ``WITH RECURSIVE`` the
+        name is registered before the body binds so it can reference itself.
+        """
+        if cte.recursive:
+            return self._bind_recursive_cte(cte)
+        bound_plan = self.bind(cte.cte_plan)
+        table = self._cte_table(cte, bound_plan)
+        saved = self._cte_tables.get(cte.name)
+        self._cte_tables[cte.name] = table
         bound_child = self.bind(cte.child)
-        return CTE(name=cte.name, cte_plan=bound_cte, child=bound_child)
+        self._restore_cte(cte.name, saved)
+        return CTE(
+            name=cte.name,
+            cte_plan=bound_plan,
+            child=bound_child,
+            column_names=cte.column_names,
+        )
+
+    def _bind_recursive_cte(self, cte: CTE) -> CTE:
+        """Bind a recursive CTE; its name is in scope while its own body binds."""
+        if not cte.column_names:
+            raise BindingError(
+                f"Recursive CTE '{cte.name}' requires an explicit column list"
+            )
+        table = Table(name=cte.name, columns=self._named_columns(cte.column_names))
+        saved = self._cte_tables.get(cte.name)
+        self._cte_tables[cte.name] = table
+        bound_plan = self.bind(cte.cte_plan)
+        bound_child = self.bind(cte.child)
+        self._restore_cte(cte.name, saved)
+        return CTE(
+            name=cte.name,
+            cte_plan=bound_plan,
+            child=bound_child,
+            recursive=True,
+            column_names=cte.column_names,
+        )
+
+    def _bind_cte_ref(self, node: CTERef) -> CTERef:
+        """Resolve a CTE reference to the registered CTE's output column names."""
+        table = self._cte_tables.get(node.name)
+        if table is None:
+            raise BindingError(f"CTE not found: {node.name}")
+        names = []
+        for column in table.columns:
+            names.append(column.name)
+        return CTERef(
+            name=node.name,
+            alias=node.alias,
+            columns=node.columns,
+            output_names=names,
+        )
+
+    def _cte_table(self, cte: CTE, bound_plan: LogicalPlanNode) -> Table:
+        """Build a Table describing a CTE's output columns."""
+        columns = self._plan_output_columns(bound_plan)
+        if cte.column_names:
+            columns = self._rename_columns(cte.column_names, columns)
+        return Table(name=cte.name, columns=columns)
+
+    def _rename_columns(self, names: List[str], columns: List[Column]) -> List[Column]:
+        """Re-label output columns with an explicit CTE column list."""
+        renamed = []
+        for index in range(len(names)):
+            data_type = columns[index].data_type
+            renamed.append(
+                Column(name=names[index], data_type=data_type, nullable=True)
+            )
+        return renamed
+
+    def _named_columns(self, names: List[str]) -> List[Column]:
+        """Build placeholder columns for a name-only schema (recursive CTE)."""
+        columns = []
+        for name in names:
+            columns.append(Column(name=name, data_type=DataType.NULL, nullable=True))
+        return columns
+
+    def _restore_cte(self, name: str, saved: Optional[Table]) -> None:
+        """Restore the CTE registry entry after binding a WITH block."""
+        if saved is None:
+            del self._cte_tables[name]
+        else:
+            self._cte_tables[name] = saved
 
     def _bind_group_by_expressions(
         self, expressions: List[Expression], table: Optional[Table]
@@ -740,8 +829,19 @@ class Binder:
         if isinstance(plan, SubqueryScan):
             scope[plan.alias] = self._synthetic_table(plan)
             return
+        if isinstance(plan, CTERef):
+            self._add_cte_ref_to_scope(plan, scope)
+            return
         for child in plan.children():
             self._add_plan_to_scope(child, scope)
+
+    def _add_cte_ref_to_scope(self, node: CTERef, scope: Dict[str, Table]) -> None:
+        """Register a CTE reference under its alias (or CTE name)."""
+        table = self._cte_tables.get(node.name)
+        if table is None:
+            raise BindingError(f"CTE not found: {node.name}")
+        name = node.alias if node.alias else node.name
+        scope[name] = table
 
     def _add_scan_to_scope(self, scan: Scan, scope: Dict[str, Table]) -> None:
         """Register a scan under its alias (or table name)."""
@@ -768,6 +868,8 @@ class Binder:
             return self._expression_columns(plan.output_names, plan.aggregates)
         if isinstance(plan, Values):
             return self._expression_columns(plan.output_names, plan.rows[0])
+        if isinstance(plan, SetOperation):
+            return self._plan_output_columns(plan.left)
         return self._plan_output_columns_from_children(plan)
 
     def _plan_output_columns_from_children(self, plan: LogicalPlanNode) -> List[Column]:
@@ -777,6 +879,11 @@ class Binder:
         if isinstance(plan, Join):
             left_columns = self._plan_output_columns(plan.left)
             return left_columns + self._plan_output_columns(plan.right)
+        if isinstance(plan, CTERef):
+            table = self._cte_tables.get(plan.name)
+            if table is None:
+                raise BindingError(f"CTE not found: {plan.name}")
+            return list(table.columns)
         children = plan.children()
         if len(children) == 1:
             return self._plan_output_columns(children[0])
@@ -881,6 +988,12 @@ class Binder:
 
         if isinstance(plan, SubqueryScan):
             tables[plan.alias] = self._synthetic_table(plan)
+            return tables
+
+        if isinstance(plan, CTERef):
+            table = self._cte_tables.get(plan.name)
+            if table is not None:
+                tables[plan.alias if plan.alias else plan.name] = table
             return tables
 
         if isinstance(plan, Join):
@@ -1004,6 +1117,8 @@ class Binder:
             )
         if isinstance(plan, SubqueryScan):
             return self._synthetic_table(plan)
+        if isinstance(plan, CTERef):
+            return self._cte_tables.get(plan.name)
         if hasattr(plan, "input"):
             return self._get_table_from_plan(plan.input)
         return None

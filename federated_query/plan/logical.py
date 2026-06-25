@@ -414,19 +414,29 @@ class Explain(LogicalPlanNode):
 class CTE(LogicalPlanNode):
     """Common table expression wrapper.
 
-    Holds a named subplan and a root plan that can reference it.
+    Holds a named subplan and a root plan that can reference it. ``recursive``
+    marks a ``WITH RECURSIVE`` whose body references its own name;
+    ``column_names`` carries an explicit output column list (``counter(n)``).
     """
 
     name: str
     cte_plan: LogicalPlanNode
     child: LogicalPlanNode
+    recursive: bool = False
+    column_names: Optional[List[str]] = None
 
     def children(self) -> List[LogicalPlanNode]:
         return [self.cte_plan, self.child]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "CTE":
         assert len(children) == 2
-        return CTE(name=self.name, cte_plan=children[0], child=children[1])
+        return CTE(
+            name=self.name,
+            cte_plan=children[0],
+            child=children[1],
+            recursive=self.recursive,
+            column_names=self.column_names,
+        )
 
     def accept(self, visitor):
         return visitor.visit_cte(self)
@@ -436,6 +446,39 @@ class CTE(LogicalPlanNode):
 
     def __repr__(self) -> str:
         return f"CTE({self.name})"
+
+
+@dataclass(frozen=True)
+class CTERef(LogicalPlanNode):
+    """A reference to a CTE by name, used in a FROM/JOIN position.
+
+    A dedicated leaf node (not a ``Scan``) so optimizer passes can recognize a
+    CTE reference distinctly from a catalog table. ``alias`` is how the
+    reference is addressed in the query; ``columns`` are the referenced column
+    names and ``output_names`` (filled by the binder) are the CTE's full output
+    schema.
+    """
+
+    name: str
+    alias: Optional[str] = None
+    columns: Optional[List[str]] = None
+    output_names: Optional[List[str]] = None
+
+    def children(self) -> List[LogicalPlanNode]:
+        return []
+
+    def with_children(self, children: List[LogicalPlanNode]) -> "CTERef":
+        assert len(children) == 0
+        return self
+
+    def accept(self, visitor):
+        return visitor.visit_cte_ref(self)
+
+    def schema(self) -> List[str]:
+        return self.output_names or self.columns or []
+
+    def __repr__(self) -> str:
+        return f"CTERef({self.name})"
 
 
 @dataclass(frozen=True)
@@ -664,4 +707,7 @@ class LogicalPlanVisitor(ABC):
         pass
 
     def visit_lateral_join(self, node: "LateralJoin"):
+        pass
+
+    def visit_cte_ref(self, node: "CTERef"):
         pass

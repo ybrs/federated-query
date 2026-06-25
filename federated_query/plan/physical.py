@@ -187,6 +187,128 @@ def _table_from_batches(batches: List[pa.RecordBatch], schema: pa.Schema) -> pa.
     return pa.Table.from_batches(batches)
 
 
+@dataclass
+class PhysicalCTE(PhysicalPlanNode):
+    """Materializes a cross-source CTE body once, shared by every reference.
+
+    A CTE is a named relation: its body is executed a single time into an Arrow
+    table that every reference reads, so the work is never repeated even when
+    the CTE is referenced many times. Single-source CTEs never reach here — they
+    are pushed whole as a remote ``WITH``; this is the cross-source path.
+    """
+
+    name: str
+    body: PhysicalPlanNode
+    column_names: Optional[List[str]] = None
+
+    def children(self) -> List[PhysicalPlanNode]:
+        return [self.body]
+
+    def materialize(self) -> pa.Table:
+        """Execute the body once and cache its rows as an Arrow table."""
+        cached = getattr(self, "_cached", None)
+        if cached is not None:
+            return cached
+        table = _table_from_batches(list(self.body.execute()), self.body.schema())
+        self._cached = self._relabel(table)
+        return self._cached
+
+    def _relabel(self, table: pa.Table) -> pa.Table:
+        """Apply an explicit CTE column list to the output column names."""
+        if not self.column_names or list(table.column_names) == self.column_names:
+            return table
+        return table.rename_columns(self.column_names)
+
+    def execute(self) -> Iterator[pa.RecordBatch]:
+        """Yield the materialized rows (computed once)."""
+        yield from self.materialize().to_batches()
+
+    def schema(self) -> pa.Schema:
+        """Output schema, taken from the body and relabeled if a list is set."""
+        base = self.body.schema()
+        if not self.column_names or list(base.names) == self.column_names:
+            return base
+        fields = []
+        for index in range(len(self.column_names)):
+            fields.append(pa.field(self.column_names[index], base.field(index).type))
+        return pa.schema(fields)
+
+    def estimated_cost(self) -> float:
+        raise NotImplementedError("Cost estimation not yet implemented")
+
+    def __repr__(self) -> str:
+        return f"PhysicalCTE({self.name})"
+
+
+@dataclass
+class PhysicalCTEScan(PhysicalPlanNode):
+    """Reads a materialized CTE's rows; one per reference, shares the producer."""
+
+    producer: PhysicalCTE
+    alias: Optional[str] = None
+
+    def children(self) -> List[PhysicalPlanNode]:
+        return [self.producer]
+
+    def execute(self) -> Iterator[pa.RecordBatch]:
+        """Yield the producer's materialized rows."""
+        yield from self.producer.materialize().to_batches()
+
+    def schema(self) -> pa.Schema:
+        return self.producer.schema()
+
+    def estimated_cost(self) -> float:
+        raise NotImplementedError("Cost estimation not yet implemented")
+
+    def __repr__(self) -> str:
+        return f"PhysicalCTEScan({self.producer.name})"
+
+
+@dataclass
+class PhysicalCTEMergeQuery(PhysicalPlanNode):
+    """Runs a whole (possibly recursive) WITH inside the merge engine.
+
+    Every base source relation in the CTE is materialized into Arrow and
+    registered under a generated name; the rendered WITH references those names
+    so the in-memory DuckDB runs the recursion (and any multi-reference)
+    locally. Used when a recursive CTE spans data sources — the fixpoint needs a
+    single engine.
+    """
+
+    sql: str
+    inputs: Dict[str, PhysicalPlanNode]
+    output_names: List[str]
+
+    def children(self) -> List[PhysicalPlanNode]:
+        return list(self.inputs.values())
+
+    def execute(self) -> Iterator[pa.RecordBatch]:
+        """Materialize the registered sources, then run the WITH in DuckDB."""
+        engine = self.merge_engine()
+        yield from engine.run(self.sql, self._materialized_inputs())
+
+    def _materialized_inputs(self) -> Dict[str, pa.Table]:
+        """Execute each base-source subtree into a registered Arrow table."""
+        tables = {}
+        for name, node in self.inputs.items():
+            tables[name] = _table_from_batches(list(node.execute()), node.schema())
+        return tables
+
+    def schema(self) -> pa.Schema:
+        """Probe the WITH with no rows to learn the output schema."""
+        engine = self.merge_engine()
+        probe = f"SELECT * FROM ({self.sql}) AS _cte_schema LIMIT 0"
+        for batch in engine.run(probe, self._materialized_inputs()):
+            return batch.schema
+        return pa.schema([])
+
+    def estimated_cost(self) -> float:
+        raise NotImplementedError("Cost estimation not yet implemented")
+
+    def __repr__(self) -> str:
+        return f"PhysicalCTEMergeQuery({len(self.inputs)} sources)"
+
+
 _MERGE_JOIN_KEYWORDS = {
     JoinType.INNER: "INNER JOIN",
     JoinType.LEFT: "LEFT JOIN",

@@ -10,7 +10,7 @@ from federated_query.parser.parser import Parser
 from federated_query.parser.binder import Binder
 from federated_query.optimizer.decorrelation import Decorrelator, DecorrelationError
 from federated_query.parser.binder import BindingError
-from federated_query.plan.logical import GroupedLimit, LateralJoin, SetOperation
+from federated_query.plan.logical import GroupedLimit, LateralJoin, SetOperation, CTE
 from federated_query.plan.physical import CardinalityViolationError
 from federated_query.executor.executor import Executor
 from .test_utils import (
@@ -211,9 +211,11 @@ class TestUnsupportedPatterns:
         with pytest.raises(ValueError, match="Window"):
             parser.parse(sql)
 
-    def test_recursive_cte_decorrelation_not_supported(self, catalog, setup_test_data):
+    def test_recursive_cte_without_column_list_fails_fast(
+        self, catalog, setup_test_data
+    ):
         """
-        Test: Recursive CTEs (marked as future work).
+        Test: a recursive CTE missing its explicit column list.
 
         Input SQL:
             WITH RECURSIVE tree AS (
@@ -221,14 +223,12 @@ class TestUnsupportedPatterns:
                 UNION ALL
                 SELECT u.id, u.name FROM users u, tree t WHERE u.id = t.id + 1
             )
-            SELECT * FROM tree
+            SELECT id FROM tree
 
         Expected behavior:
-            - Decorrelator detects recursive CTE
-            - May raise error or pass through
-
-        Expected result:
-            Behavior depends on implementation (out of scope for first pass)
+            - The WITH RECURSIVE parses into a recursive CTE node.
+            - Binding fails fast: the self-reference cannot resolve its columns
+              without the declared list (``tree(id, name)``).
         """
         sql = """
             WITH RECURSIVE tree AS (
@@ -236,16 +236,17 @@ class TestUnsupportedPatterns:
                 UNION ALL
                 SELECT u.id, u.name FROM pg.users u, tree t WHERE u.id = t.id + 1
             )
-            SELECT * FROM tree
+            SELECT id FROM tree
         """
 
         parser = Parser()
         binder = Binder(catalog)
-        decorrelator = Decorrelator()
-        executor = Executor(catalog)
 
-        with pytest.raises(ValueError, match="WITH"):
-            parser.parse(sql)
+        plan = parser.parse(sql)
+        assert isinstance(plan, CTE)
+        assert plan.recursive is True
+        with pytest.raises(BindingError, match="column list"):
+            binder.bind(plan)
 
     def test_lateral_subquery_handling(self, catalog, setup_test_data):
         """A user-written LATERAL parses, binds, and decorrelates to a

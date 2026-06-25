@@ -15,6 +15,7 @@ from ..plan.logical import (
     Sort,
     JoinType,
     CTE,
+    CTERef,
     Union,
     SetOperation,
     SetOpKind,
@@ -43,6 +44,9 @@ from ..plan.physical import (
     PhysicalSingleRowGuard,
     PhysicalGroupedLimit,
     PhysicalLateralJoin,
+    PhysicalCTE,
+    PhysicalCTEScan,
+    PhysicalCTEMergeQuery,
 )
 from ..plan.expressions import BinaryOp, BinaryOpType, ColumnRef, Literal, Expression
 from .single_source_pushdown import SingleSourcePushdown
@@ -99,6 +103,9 @@ class PhysicalPlanner:
         """
         self.catalog = catalog
         self.single_source = SingleSourcePushdown(catalog)
+        # CTE name -> its materializing producer, registered while a cross-source
+        # CTE's child is planned so each CTERef resolves to a shared scan.
+        self._cte_producers: Dict[str, PhysicalCTE] = {}
 
     def plan(
         self,
@@ -139,6 +146,8 @@ class PhysicalPlanner:
             return self._plan_explain(node)
         if isinstance(node, CTE):
             return self._plan_cte(node)
+        if isinstance(node, CTERef):
+            return self._plan_cte_ref(node)
 
         return self._plan_decorrelation_node(node)
 
@@ -411,11 +420,73 @@ class PhysicalPlanner:
         return PhysicalExplain(child=child_plan, format=explain.format)
 
     def _plan_cte(self, cte: CTE) -> PhysicalPlanNode:
-        """CTE execution is not implemented; fail instead of dropping it."""
-        raise ValueError(
-            f"CTE '{cte.name}' cannot be executed: the physical layer has "
-            "no CTE support yet"
+        """Plan a CTE that single-source pushdown declined (it spans sources).
+
+        A same-source CTE is pushed whole as a remote ``WITH`` before this
+        point. A recursive cross-source CTE runs entirely in the merge engine
+        (the fixpoint needs one engine); a non-recursive one materializes its
+        body once and feeds every reference.
+        """
+        if cte.recursive:
+            return self._plan_recursive_cte_merge(cte)
+        return self._plan_cross_source_cte(cte)
+
+    def _plan_cross_source_cte(self, cte: CTE) -> PhysicalPlanNode:
+        """Materialize the body once; plan the child with the name in scope."""
+        producer = PhysicalCTE(
+            name=cte.name,
+            body=self._plan_node(cte.cte_plan),
+            column_names=cte.column_names,
         )
+        saved = self._cte_producers.get(cte.name)
+        self._cte_producers[cte.name] = producer
+        child_plan = self._plan_node(cte.child)
+        self._restore_cte_producer(cte.name, saved)
+        return child_plan
+
+    def _restore_cte_producer(self, name: str, saved: Optional[PhysicalCTE]) -> None:
+        """Restore the producer registry after planning a CTE's child."""
+        if saved is None:
+            del self._cte_producers[name]
+        else:
+            self._cte_producers[name] = saved
+
+    def _plan_cte_ref(self, node: CTERef) -> PhysicalPlanNode:
+        """Resolve a CTE reference to a scan over its materialized producer."""
+        producer = self._cte_producers.get(node.name)
+        if producer is None:
+            raise ValueError(f"CTE '{node.name}' is not in scope")
+        return PhysicalCTEScan(producer=producer, alias=node.alias)
+
+    def _plan_recursive_cte_merge(self, cte: CTE) -> PhysicalPlanNode:
+        """Run a cross-source recursive CTE wholly in the merge engine.
+
+        Every base source relation in the CTE is materialized into Arrow under a
+        generated name; the rendered ``WITH RECURSIVE`` references those names so
+        the in-memory DuckDB runs the recursion locally.
+        """
+        scans = self._collect_base_scans(cte)
+        scan_names = {}
+        inputs = {}
+        for index in range(len(scans)):
+            register_name = f"cte_src_{index}"
+            scan_names[id(scans[index])] = register_name
+            inputs[register_name] = self._plan_node(scans[index])
+        sql = self.single_source.render_correlated_sql(cte, scan_names)
+        if sql is None:
+            raise ValueError(
+                f"Recursive CTE '{cte.name}' is not renderable for the merge engine"
+            )
+        return PhysicalCTEMergeQuery(sql=sql, inputs=inputs, output_names=cte.schema())
+
+    def _collect_base_scans(self, node: LogicalPlanNode) -> List[Scan]:
+        """Collect every base ``Scan`` in a subtree (CTE references excluded)."""
+        if isinstance(node, Scan):
+            return [node]
+        scans: List[Scan] = []
+        for child in node.children():
+            scans.extend(self._collect_base_scans(child))
+        return scans
 
     def _plan_join(self, join: Join) -> PhysicalPlanNode:
         """Plan a join node."""

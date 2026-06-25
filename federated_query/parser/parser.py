@@ -22,6 +22,8 @@ from ..plan.logical import (
     SetOperation,
     SetOpKind,
     LateralJoin,
+    CTE,
+    CTERef,
 )
 from ..catalog.catalog import Catalog
 from ..plan.expressions import (
@@ -58,6 +60,9 @@ class Parser:
     def __init__(self):
         """Initialize parser."""
         self.dialect = FedQPostgres  # Custom Postgres dialect with native EXPLAIN
+        # Names of CTEs visible at the current point of conversion; a bare table
+        # reference matching one of these is a CTE reference, not a catalog table.
+        self._cte_names: List[str] = []
 
     def parse(self, sql: str) -> LogicalPlanNode:
         """Parse SQL string to an unbound logical plan.
@@ -163,8 +168,13 @@ class Parser:
         Returns:
             Logical plan node
         """
-        if select.args.get("with_"):
-            raise ValueError("WITH clauses (CTEs) are not supported yet")
+        with_clause = select.args.get("with_")
+        if with_clause is not None:
+            return self._convert_with(select, with_clause)
+        return self._convert_plain_select(select)
+
+    def _convert_plain_select(self, select: exp.Select) -> LogicalPlanNode:
+        """Convert a SELECT body (without its WITH clause) to a logical plan."""
         if select.args.get("from_") is None:
             return self._build_values_select(select)
         plan = self._build_from_clause(select)
@@ -175,6 +185,75 @@ class Parser:
         plan = self._build_order_by_clause(select, plan)
         plan = self._build_limit_clause(select, plan)
         return plan
+
+    def _convert_with(
+        self, select: exp.Select, with_clause: exp.With
+    ) -> LogicalPlanNode:
+        """Convert a ``WITH`` query into nested CTE nodes wrapping the body.
+
+        Each CTE name is brought into scope before the body is converted so a
+        later CTE (and, for ``WITH RECURSIVE``, the CTE's own body) resolves a
+        bare reference to a ``CTERef`` rather than a catalog table. The scope is
+        restored afterwards so sibling subqueries do not see these names.
+        """
+        recursive = bool(with_clause.args.get("recursive"))
+        scope_mark = len(self._cte_names)
+        definitions = self._convert_cte_definitions(with_clause, recursive)
+        child = self._convert_plain_select(select)
+        plan = self._wrap_ctes(definitions, child, recursive)
+        del self._cte_names[scope_mark:]
+        return plan
+
+    def _convert_cte_definitions(self, with_clause, recursive):
+        """Convert each CTE body in order, registering names as they bind."""
+        definitions = []
+        for cte in with_clause.expressions:
+            name = cte.alias
+            columns = self._cte_column_names(cte)
+            if recursive:
+                self._cte_names.append(name)
+            cte_plan = self.ast_to_logical_plan(cte.this)
+            if not recursive:
+                self._cte_names.append(name)
+            definitions.append((name, columns, cte_plan))
+        return definitions
+
+    def _wrap_ctes(self, definitions, child, recursive):
+        """Nest CTE definitions around the body, innermost binding last."""
+        plan = child
+        for name, columns, cte_plan in reversed(definitions):
+            plan = CTE(
+                name=name,
+                cte_plan=cte_plan,
+                child=plan,
+                recursive=recursive,
+                column_names=columns,
+            )
+        return plan
+
+    def _cte_column_names(self, cte: exp.CTE) -> Optional[List[str]]:
+        """Return an explicit CTE output column list (``counter(n)``), if any."""
+        alias_node = cte.args.get("alias")
+        if alias_node is None:
+            return None
+        columns = alias_node.args.get("columns")
+        if not columns:
+            return None
+        names = []
+        for identifier in columns:
+            names.append(identifier.name)
+        return names
+
+    def _maybe_cte_ref(
+        self, table_expr: exp.Table, columns: List[str]
+    ) -> Optional[CTERef]:
+        """Build a CTERef when a bare table name matches an in-scope CTE."""
+        if table_expr.catalog or table_expr.db:
+            return None
+        if table_expr.name not in self._cte_names:
+            return None
+        alias = self._extract_table_alias(table_expr)
+        return CTERef(name=table_expr.name, alias=alias, columns=columns)
 
     def _build_values_select(self, select: exp.Select) -> LogicalPlanNode:
         """Build a single-row Values plan for a FROM-less SELECT.
@@ -238,9 +317,13 @@ class Parser:
             return self._build_derived_table(table_expr)
         self._reject_unsupported_relation(table_expr)
 
+        all_columns = self._collect_needed_columns(select)
+        cte_ref = self._maybe_cte_ref(table_expr, all_columns)
+        if cte_ref is not None:
+            return cte_ref
+
         table_parts = self._extract_table_parts(table_expr)
         table_alias = self._extract_table_alias(table_expr)
-        all_columns = self._collect_needed_columns(select)
 
         datasource = table_parts[0]
         schema_name = table_parts[1]
@@ -261,9 +344,12 @@ class Parser:
         if isinstance(table_expr, exp.Subquery):
             return self._build_derived_table(table_expr)
         self._reject_unsupported_relation(table_expr)
-        table_parts = self._extract_table_parts(table_expr)
         table_alias = self._extract_table_alias(table_expr)
         columns = self._columns_for_join_table(column_usage, table_alias)
+        cte_ref = self._maybe_cte_ref(table_expr, columns)
+        if cte_ref is not None:
+            return cte_ref
+        table_parts = self._extract_table_parts(table_expr)
         return Scan(
             datasource=table_parts[0],
             schema_name=table_parts[1],

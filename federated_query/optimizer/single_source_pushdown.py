@@ -25,6 +25,9 @@ from ..plan.logical import (
     LateralJoin,
     SubqueryScan,
     SetOperation,
+    CTE,
+    CTERef,
+    Values,
 )
 from ..plan.expressions import ColumnRef, Expression, FunctionCall
 from ..plan.physical import PhysicalRemoteQuery
@@ -88,6 +91,18 @@ class _PushContext:
         # be wrapped as ``(... UNION ...) AS u``. A top-level set operation
         # (the query body) is left to the planner's set-operation path.
         self.in_derived: bool = False
+        # CTE definitions to emit as a leading WITH clause, in declaration
+        # order: each is (name, column_names, body_sql).
+        self.ctes: List[Tuple[str, Optional[List[str]], str]] = []
+        # CTE names defined by an enclosing WITH (so a body or derived sub-render
+        # can reference an earlier sibling, or itself when recursive) without
+        # re-emitting their definitions here.
+        self.visible_ctes: List[str] = []
+        # True once a CTE (WITH) wraps the query, which makes the whole subtree
+        # worth pushing as one remote statement even without a join.
+        self.has_cte: bool = False
+        # True when any CTE in the WITH is recursive (renders WITH RECURSIVE).
+        self.has_recursive_cte: bool = False
 
 
 class SingleSourcePushdown:
@@ -179,13 +194,18 @@ class SingleSourcePushdown:
 
     def _should_push(self, context: _PushContext) -> bool:
         """Whether this subtree is worth replacing with one remote query."""
+        if context.has_cte:
+            return True
         if context.has_join or context.has_subquery_relation:
             return True
         return context.has_computed and not context.has_aggregate
 
     def _finish(self, context: _PushContext) -> Optional[PhysicalRemoteQuery]:
         """Resolve the connection, render SQL, and build the physical node."""
-        connection = self.catalog.get_datasource(context.datasource)
+        datasource = self._resolve_datasource(context)
+        if datasource is None:
+            return None
+        connection = self.catalog.get_datasource(datasource)
         if connection is None:
             return None
         if not connection.supports_capability(DataSourceCapability.JOINS):
@@ -199,6 +219,20 @@ class SingleSourcePushdown:
             output_names=context.output_names,
             column_alias_map=context.column_aliases,
         )
+
+    def _resolve_datasource(self, context: _PushContext) -> Optional[str]:
+        """Pick the target source, defaulting a pure-computation CTE.
+
+        A recursive or constant-only CTE has no table scan, so no source was
+        claimed; when exactly one source exists it owns the computation.
+        """
+        if context.datasource is not None:
+            return context.datasource
+        if not context.has_cte or len(self.catalog.datasources) != 1:
+            return None
+        only = next(iter(self.catalog.datasources))
+        context.datasource = only
+        return only
 
     def _absorb(self, node: LogicalPlanNode, context: _PushContext) -> bool:
         """Fold one plan node's clause into the context; recurse into its input."""
@@ -214,9 +248,30 @@ class SingleSourcePushdown:
             return self._absorb_filter(node, context)
         if isinstance(node, LateralJoin):
             return self._absorb_lateral_join(node, context)
-        if isinstance(node, (Join, Scan, SubqueryScan, SetOperation)):
+        if isinstance(node, CTE):
+            return self._absorb_cte(node, context)
+        if isinstance(node, (Join, Scan, SubqueryScan, SetOperation, CTERef)):
             return self._absorb_from(node, context)
         return False
+
+    def _absorb_cte(self, node: CTE, context: _PushContext) -> bool:
+        """Render a CTE body, record it as a WITH definition, then descend.
+
+        The body becomes ``name [(cols)] AS (<sql>)`` in a leading WITH clause;
+        the child query is folded normally and any reference to the CTE renders
+        as the bare CTE name. The source executes the CTE (multi-reference
+        materialization and, for ``WITH RECURSIVE``, the fixpoint).
+        """
+        if node.recursive:
+            context.visible_ctes.append(node.name)
+        body_sql = self._render_cte_body(node, context)
+        if body_sql is None:
+            return False
+        context.ctes.append((node.name, node.column_names, body_sql))
+        context.has_cte = True
+        if node.recursive:
+            context.has_recursive_cte = True
+        return self._absorb(node.child, context)
 
     def _absorb_lateral_join(self, node: LateralJoin, context: _PushContext) -> bool:
         """Render a dependent join as ``LEFT JOIN LATERAL (...) ON TRUE``.
@@ -363,9 +418,46 @@ class SingleSourcePushdown:
             return self._absorb_subquery_scan_base(node, context)
         if isinstance(node, SetOperation):
             return self._absorb_set_operation_base(node, context)
+        if isinstance(node, CTERef):
+            return self._absorb_cte_ref_base(node, context)
         if isinstance(node, Join):
             return self._absorb_join(node, context)
         return False
+
+    def _absorb_cte_ref_base(self, node: CTERef, context: _PushContext) -> bool:
+        """Set a CTE reference as the FROM source: the bare CTE name.
+
+        Only a CTE defined within this same pushed WITH can render as a bare
+        name; a reference to a CTE materialized elsewhere (a cross-source CTE
+        the planner produces separately) declines so the subtree plans
+        structurally and reads the materialized relation instead.
+        """
+        if not self._cte_defined(node.name, context):
+            return False
+        context.from_sql = self._cte_ref_sql(node)
+        return True
+
+    def _cte_defined(self, name: str, context: _PushContext) -> bool:
+        """Whether a CTE name is defined here or in an enclosing WITH."""
+        if name in context.visible_ctes:
+            return True
+        for cte_name, _, _ in context.ctes:
+            if cte_name == name:
+                return True
+        return False
+
+    def _visible_names(self, context: _PushContext) -> List[str]:
+        """CTE names a sub-render may reference: enclosing plus locally defined."""
+        names = list(context.visible_ctes)
+        for cte_name, _, _ in context.ctes:
+            names.append(cte_name)
+        return names
+
+    def _cte_ref_sql(self, node: CTERef) -> str:
+        """Render a CTE reference as its name, keeping a distinct alias."""
+        if node.alias and node.alias != node.name:
+            return f"{node.name} AS {node.alias}"
+        return node.name
 
     def _absorb_set_operation_base(
         self, node: SetOperation, context: _PushContext
@@ -401,16 +493,66 @@ class SingleSourcePushdown:
         self, node: LogicalPlanNode, context: _PushContext
     ) -> Optional[str]:
         """Render one set-operation branch as a standalone SELECT, same source."""
+        if isinstance(node, Values):
+            return self._render_values_branch(node)
         inner = _PushContext()
         inner.scan_names = context.scan_names
         inner.in_derived = True
+        inner.visible_ctes = self._visible_names(context)
         if not self._absorb(node, inner) or not inner.select_items:
             return None
-        if context.datasource is not None and inner.datasource != context.datasource:
+        if not self._branch_source_compatible(inner, context):
             return None
-        if context.datasource is None:
-            context.datasource = inner.datasource
         return self._render(inner)
+
+    def _branch_source_compatible(
+        self, inner: _PushContext, context: _PushContext
+    ) -> bool:
+        """Confirm a branch shares the source, adopting it when one is unset.
+
+        A branch that references only CTEs has no scan and so no source of its
+        own; it is compatible with any enclosing source.
+        """
+        if inner.datasource is None:
+            return True
+        if context.datasource is not None and inner.datasource != context.datasource:
+            return False
+        context.datasource = inner.datasource
+        return True
+
+    def _render_values_branch(self, node: Values) -> Optional[str]:
+        """Render a single constant row as a FROM-less ``SELECT`` branch.
+
+        Used for the base case of a recursive CTE (``SELECT 1``); a trailing
+        alias is added only when it differs from the rendered expression.
+        """
+        if len(node.rows) != 1:
+            return None
+        items = []
+        for expr, name in zip(node.rows[0], node.output_names):
+            sql = expr.to_sql()
+            if name and name != sql:
+                sql = f"{sql} AS {name}"
+            items.append(sql)
+        return "SELECT " + ", ".join(items)
+
+    def _render_cte_body(self, node: CTE, context: _PushContext) -> Optional[str]:
+        """Render a CTE's body as the bare SQL inside ``name AS (<sql>)``."""
+        body = node.cte_plan
+        if isinstance(body, SetOperation):
+            return self._render_cte_set_body(body, context)
+        return self._render_branch(body, context)
+
+    def _render_cte_set_body(
+        self, node: SetOperation, context: _PushContext
+    ) -> Optional[str]:
+        """Render a set-operation CTE body unwrapped (no derived-table alias)."""
+        left_sql = self._render_branch(node.left, context)
+        right_sql = self._render_branch(node.right, context)
+        if left_sql is None or right_sql is None:
+            return None
+        keyword = node.kind.name if node.distinct else f"{node.kind.name} ALL"
+        return f"{left_sql} {keyword} {right_sql}"
 
     def _absorb_subquery_scan_base(
         self, node: SubqueryScan, context: _PushContext
@@ -573,6 +715,10 @@ class SingleSourcePushdown:
         """
         if isinstance(node, SubqueryScan):
             return self._render_subquery_scan(node, context)
+        if isinstance(node, CTERef):
+            if not self._cte_defined(node.name, context):
+                return None
+            return self._cte_ref_sql(node)
         if not self._is_derived_relation(node):
             if not self._claim_scan(node, context):
                 return None
@@ -591,6 +737,7 @@ class SingleSourcePushdown:
         inner = _PushContext()
         inner.scan_names = context.scan_names
         inner.in_derived = True
+        inner.visible_ctes = self._visible_names(context)
         if not self._absorb(node.input, inner) or not inner.select_items:
             return None
         if context.datasource is not None and inner.datasource != context.datasource:
@@ -613,6 +760,7 @@ class SingleSourcePushdown:
         inner = _PushContext()
         inner.scan_names = context.scan_names
         inner.in_derived = True
+        inner.visible_ctes = self._visible_names(context)
         if not self._absorb(node, inner) or not inner.select_items:
             return None
         if context.datasource is not None and inner.datasource != context.datasource:
@@ -652,13 +800,23 @@ class SingleSourcePushdown:
             context.where_terms.append(scan.filters.to_sql())
 
     def _claim_source(self, scan: Scan, context: _PushContext) -> bool:
-        """Bind the scan's data source; reject a cross-source scan."""
+        """Bind the scan's data source; reject a cross-source scan when pushing.
+
+        In merge-engine rendering mode (``scan_names`` set) every scan becomes a
+        registered Arrow relation, so scans from several sources are allowed.
+        """
+        if not self._source_compatible(scan, context):
+            return False
         if context.datasource is None:
             context.datasource = scan.datasource
-        elif context.datasource != scan.datasource:
-            return False
         context.scans.append(scan)
         return True
+
+    def _source_compatible(self, scan: Scan, context: _PushContext) -> bool:
+        """Whether a scan may join this push (always true when merge-rendering)."""
+        if context.scan_names is not None:
+            return True
+        return context.datasource is None or context.datasource == scan.datasource
 
     def _set_select(self, expressions, names, context: _PushContext) -> None:
         """Render the SELECT list with unique output names per column.
@@ -765,7 +923,26 @@ class SingleSourcePushdown:
         query = self._append_where(query, context)
         query = self._append_group_by(query, context)
         query = self._append_having(query, context)
-        return self._append_order_limit(query, context)
+        query = self._append_order_limit(query, context)
+        return self._prepend_with(query, context)
+
+    def _prepend_with(self, body: str, context: _PushContext) -> str:
+        """Prepend a leading WITH clause built from collected CTE definitions."""
+        if not context.ctes:
+            return body
+        keyword = "WITH RECURSIVE" if context.has_recursive_cte else "WITH"
+        definitions = self._cte_definitions_sql(context.ctes)
+        return f"{keyword} {definitions} {body}"
+
+    def _cte_definitions_sql(self, ctes) -> str:
+        """Render the comma-separated ``name [(cols)] AS (<sql>)`` definitions."""
+        parts = []
+        for name, columns, body_sql in ctes:
+            header = name
+            if columns:
+                header = f"{name}({', '.join(columns)})"
+            parts.append(f"{header} AS ({body_sql})")
+        return ", ".join(parts)
 
     def _from_clause(self, context: _PushContext) -> str:
         """Join the base source and its join chain into a FROM clause."""

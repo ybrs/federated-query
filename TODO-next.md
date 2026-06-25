@@ -22,7 +22,7 @@ every physical operator for Python-side processing that DuckDB should own:
 
 ## Current test state
 
-- Full suite: **766 passed / 15 xfailed / 0 failed**
+- Full suite: **798 passed / 0 xfailed / 0 failed**
   (`POSTGRES_DB=duckpoc /workspace/venv-fedq/bin/python -m pytest tests/ -q`;
   needs `make pg-start`).
 - `tests/e2e_decorrelation/`: green.
@@ -99,9 +99,39 @@ every physical operator for Python-side processing that DuckDB should own:
     set op is still left to the planner's bare-UNION path. Cross-source works via
     the merge engine (the planner's `_plan_set_operation`). Tested same- and
     cross-source.
-- **Cluster C — CTEs** (whole `test_ctes.py` xfailed): parser hard-rejects
-  `WITH` (`parser.py`: "WITH clauses (CTEs) are not supported yet"). A CTE is a
-  named relation, not a correlated subquery — separate feature, deferred.
+- **Cluster C — CTEs** (`test_ctes.py`): CLOSED for single-source. A `WITH`
+  parses into `CTE(name, cte_plan, child, recursive, column_names)` nodes with a
+  dedicated `CTERef` leaf for each name reference (parser tracks in-scope CTE
+  names). The binder registers each name as a synthetic relation (recursive:
+  before binding its own body, requires an explicit column list) so a `CTERef`
+  resolves like a table without a catalog lookup. `single_source_pushdown`
+  renders the whole query as a pushed `WITH [RECURSIVE] name [(cols)] AS (body)
+  child` statement — `_absorb_cte` collects each body, `CTERef` renders as the
+  bare name, `_should_push` fires on `has_cte`, and `_resolve_datasource`
+  defaults a pure-computation CTE (recursive counter, no scan) to the sole
+  source. Verified vs DuckDB (simple/agg/union/join/multi-ref/nested/recursive).
+  **Cross-source CTEs: CLOSED.** `_plan_cte` now branches by strategy:
+  - **Non-recursive** → materialize-once producer/consumer. `_plan_cross_source_cte`
+    plans the body to a `PhysicalCTE` (memoizes the body to one Arrow table),
+    registers `name → producer` in `self._cte_producers`, plans the child, and
+    each `CTERef` becomes a `PhysicalCTEScan` over the shared producer
+    (`_plan_cte_ref`). The child's CTE-vs-other-source joins run in the merge
+    engine. So a CTE referenced N times executes its body once.
+  - **Recursive** → `_plan_recursive_cte_merge` runs the whole `WITH RECURSIVE`
+    in the merge engine: `_collect_base_scans` gathers every base `Scan`,
+    materializes each to Arrow under a generated name, and
+    `render_correlated_sql(cte, scan_names)` renders the full WITH with those
+    names; `PhysicalCTEMergeQuery` registers them and DuckDB computes the
+    fixpoint locally.
+  - Enablers: `single_source._claim_source` skips the single-datasource check in
+    merge-render mode (`scan_names` set) so a multi-source WITH renders;
+    `_cte_defined`/`visible_ctes` guard makes a child referencing a materialized
+    (external) CTE decline to push so it plans structurally and reads the
+    producer instead. New ops: `PhysicalCTE`, `PhysicalCTEScan`,
+    `PhysicalCTEMergeQuery`. Tests: `test_cross_source_ctes.py` (4, vs combined
+    DuckDB): body-single-source/child-joins-other, body-cross-source,
+    multi-ref-materialize-once (asserts one shared producer), recursive
+    cross-source (asserts `PhysicalCTEMergeQuery` with 2 registered sources).
 - **Cluster D — cross-source** (`test_cross_datasource_subquery_fallback`):
   needs the cross-source materialization policy; the `multi_source_env` fixture
   also lacks the tables the test names.
