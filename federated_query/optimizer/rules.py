@@ -982,7 +982,7 @@ class JoinReorderingRule(OptimizationRule):
     """Reorder joins for better performance."""
 
     def apply(self, plan: LogicalPlanNode) -> Optional[LogicalPlanNode]:
-        """Reorder joins by cost. Not yet implemented (deferred to Phase 10)."""
+        """Reorder joins by cost. Not yet implemented (cost-based optimization phase)."""
         # TODO: Implement cost-based join reordering
         # Requires integration with Phase 5 cost model
         raise NotImplementedError()
