@@ -38,14 +38,13 @@ single-source pushdown renders it as **SQL joins**, never re-correlated
 
 ## Remaining work (all xfailed with reasons, not failing)
 
-- **Cluster B — derived tables / FROM-subqueries** (`SubqueryScan` rendering):
-  `test_subqueries.py::test_subquery_in_from_derived_table`,
-  `::test_derived_table_with_join`,
-  `test_aggregate_advanced.py::test_nested_aggregate_via_subquery`.
-  `single_source_pushdown` has no `SubqueryScan` handler; needs a FROM/JOIN
-  derived-table render that preserves the `SubqueryScan` alias for outer column
-  resolution. Target shape: a relation subquery (`exp.Subquery` in FROM/JOIN) —
-  allowed by the invariant.
+- **Cluster B — derived tables / FROM-subqueries**: CLOSED. `single_source`
+  renders a `SubqueryScan` as `(SELECT ...) AS alias` keeping the user alias:
+  `_render_subquery_scan` (JOIN/LATERAL right side) + `_absorb_subquery_scan_base`
+  (FROM base) + `has_subquery_relation` so a derived-table FROM pushes even
+  without a join. Multi-source derived-table joins already worked via the merge
+  engine (the planner unwraps `SubqueryScan` and pushes each single-source piece
+  as an Arrow stream); cluster B was only the single-source one-query push.
 - **Cluster A — decorrelation gaps**: 3 of 4 now CLOSED.
   - DONE `test_scalar_subquery_in_having` — already worked; xfail removed.
   - DONE `test_subquery_with_order_by_limit` — `_peel_values_top` keeps `Sort`

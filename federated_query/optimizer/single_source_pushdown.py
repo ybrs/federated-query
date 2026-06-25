@@ -23,6 +23,7 @@ from ..plan.logical import (
     Sort,
     Limit,
     LateralJoin,
+    SubqueryScan,
 )
 from ..plan.expressions import ColumnRef, Expression, FunctionCall
 from ..plan.physical import PhysicalRemoteQuery
@@ -61,6 +62,9 @@ class _PushContext:
         self.has_join: bool = False
         self.has_computed: bool = False
         self.has_aggregate: bool = False
+        # True once a derived table (``FROM (SELECT ...) AS t``) is the FROM
+        # source, which is worth pushing as one query even without a join.
+        self.has_subquery_relation: bool = False
         # Number of derived-table relations emitted so far, used to give each a
         # unique relation alias (``subq_0``, ``subq_1`` ...).
         self.derived_count: int = 0
@@ -151,7 +155,7 @@ class SingleSourcePushdown:
 
     def _should_push(self, context: _PushContext) -> bool:
         """Whether this subtree is worth replacing with one remote query."""
-        if context.has_join:
+        if context.has_join or context.has_subquery_relation:
             return True
         return context.has_computed and not context.has_aggregate
 
@@ -186,7 +190,7 @@ class SingleSourcePushdown:
             return self._absorb_filter(node, context)
         if isinstance(node, LateralJoin):
             return self._absorb_lateral_join(node, context)
-        if isinstance(node, (Join, Scan)):
+        if isinstance(node, (Join, Scan, SubqueryScan)):
             return self._absorb_from(node, context)
         return False
 
@@ -328,12 +332,25 @@ class SingleSourcePushdown:
         return self._absorb(filter_node.input, context)
 
     def _absorb_from(self, node: LogicalPlanNode, context: _PushContext) -> bool:
-        """Build the FROM clause from a left-deep join tree or a base scan."""
+        """Build the FROM clause from a join tree, base scan, or derived table."""
         if isinstance(node, Scan):
             return self._absorb_base_scan(node, context)
+        if isinstance(node, SubqueryScan):
+            return self._absorb_subquery_scan_base(node, context)
         if isinstance(node, Join):
             return self._absorb_join(node, context)
         return False
+
+    def _absorb_subquery_scan_base(
+        self, node: SubqueryScan, context: _PushContext
+    ) -> bool:
+        """Set a derived table as the FROM source: ``(SELECT ...) AS alias``."""
+        rendered = self._render_subquery_scan(node, context)
+        if rendered is None:
+            return False
+        context.from_sql = rendered
+        context.has_subquery_relation = True
+        return True
 
     def _absorb_base_scan(self, scan: Scan, context: _PushContext) -> bool:
         """Set the leftmost FROM source and collect its filter."""
@@ -483,11 +500,31 @@ class SingleSourcePushdown:
         decorrelated key/value relation, or a user derived table) renders as a
         parenthesized derived table with a fresh alias.
         """
+        if isinstance(node, SubqueryScan):
+            return self._render_subquery_scan(node, context)
         if not self._is_derived_relation(node):
             if not self._claim_scan(node, context):
                 return None
             return self._scan_ref(node)
         return self._render_derived(node, context)
+
+    def _render_subquery_scan(
+        self, node: SubqueryScan, context: _PushContext
+    ) -> Optional[str]:
+        """Render a derived table ``(SELECT ...) AS alias`` keeping its own alias.
+
+        Unlike a synthetic decorrelation relation, a ``SubqueryScan`` carries a
+        user-visible alias that outer columns reference (``o.amount``), so the
+        alias is preserved instead of a generated ``subq_N``.
+        """
+        inner = _PushContext()
+        if not self._absorb(node.input, inner) or not inner.select_items:
+            return None
+        if context.datasource is not None and inner.datasource != context.datasource:
+            return None
+        if context.datasource is None:
+            context.datasource = inner.datasource
+        return f"({self._render(inner)}) AS {node.alias}"
 
     def _render_derived(
         self, node: LogicalPlanNode, context: _PushContext

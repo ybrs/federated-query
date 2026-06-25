@@ -248,34 +248,24 @@ class TestUnsupportedPatterns:
             parser.parse(sql)
 
     def test_lateral_subquery_handling(self, catalog, setup_test_data):
-        """
-        Test: LATERAL subqueries (explicit correlation).
-
-        Input SQL:
-            SELECT u.id, o.amount
-            FROM users u,
-            LATERAL (SELECT amount FROM orders WHERE user_id = u.id LIMIT 1) o
-
-        Expected behavior:
-            - LATERAL makes correlation explicit
-            - Decorrelator should handle or raise clear error
-
-        Expected result:
-            Proper handling or clear error message
+        """A user-written LATERAL parses, binds, and decorrelates to a
+        LateralJoin (dependent join) — the explicit correlation is kept and
+        evaluated per outer row by the executing engine.
         """
         sql = """
             SELECT u.id, o.amount
             FROM pg.users u,
             LATERAL (SELECT amount FROM pg.orders WHERE user_id = u.id LIMIT 1) o
         """
+        bound = Binder(catalog).bind(Parser().parse(sql))
+        plan = Decorrelator().decorrelate(bound)
 
-        parser = Parser()
-        binder = Binder(catalog)
-        decorrelator = Decorrelator()
-        executor = Executor(catalog)
+        def has_lateral(node):
+            if isinstance(node, LateralJoin):
+                return True
+            return any(has_lateral(child) for child in node.children())
 
-        with pytest.raises(ValueError, match="LATERAL"):
-            parser.parse(sql)
+        assert has_lateral(plan)
 
 
 class TestUnsupportedOperators:

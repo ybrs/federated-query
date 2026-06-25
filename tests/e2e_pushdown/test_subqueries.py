@@ -368,6 +368,36 @@ def test_non_equi_scalar_order_limit_matches_source(single_source_env):
     _assert_two_col_matches_source(single_source_env, sql)
 
 
+# User-written LATERAL (dependent join), same source
+
+
+def test_user_left_join_lateral_matches_source(single_source_env):
+    """A user ``LEFT JOIN LATERAL`` pushes as one query and matches the source."""
+    runtime = build_runtime(single_source_env)
+    sql = (
+        "SELECT o.order_id, t.name FROM duckdb_primary.main.orders o "
+        "LEFT JOIN LATERAL ("
+        "  SELECT p.name FROM duckdb_primary.main.products p "
+        "  WHERE p.id = o.product_id ORDER BY p.name LIMIT 1"
+        ") t ON true"
+    )
+    ast = explain_datasource_query(runtime, sql)
+    assert ast.find(exp.Lateral) is not None
+    _assert_two_col_matches_source(single_source_env, sql)
+
+
+def test_user_comma_lateral_matches_source(single_source_env):
+    """A user comma ``LATERAL`` (INNER) pushes as one query and matches source."""
+    sql = (
+        "SELECT o.order_id, t.name FROM duckdb_primary.main.orders o, "
+        "LATERAL ("
+        "  SELECT p.name FROM duckdb_primary.main.products p "
+        "  WHERE p.id = o.product_id ORDER BY p.name LIMIT 1"
+        ") t"
+    )
+    _assert_two_col_matches_source(single_source_env, sql)
+
+
 # Nested Subqueries
 
 
@@ -391,11 +421,6 @@ def test_nested_subqueries(single_source_env):
 # Derived Tables (Subquery in FROM) -- relation subqueries, allowed
 
 
-@pytest.mark.xfail(
-    reason="cluster B: FROM derived-table (SubqueryScan) rendering not yet "
-    "implemented in single_source_pushdown; relation-subquery form is the target",
-    strict=False,
-)
 def test_subquery_in_from_derived_table(single_source_env):
     """A FROM derived table pushes as a relation subquery in FROM position."""
     runtime = build_runtime(single_source_env)
@@ -408,7 +433,7 @@ def test_subquery_in_from_derived_table(single_source_env):
         "WHERE high_price > 200"
     )
     ast = explain_datasource_query(runtime, sql)
-    from_clause = ast.args.get("from")
+    from_clause = ast.find(exp.From)
     assert from_clause is not None
     from_table = from_clause.this
     assert isinstance(from_table, exp.Subquery)
@@ -419,11 +444,6 @@ def test_subquery_in_from_derived_table(single_source_env):
     _assert_no_subquery_expressions(ast)
 
 
-@pytest.mark.xfail(
-    reason="cluster B: JOIN derived-table (SubqueryScan) rendering not yet "
-    "implemented in single_source_pushdown; relation-subquery form is the target",
-    strict=False,
-)
 def test_derived_table_with_join(single_source_env):
     """A derived table joined to a base table pushes as a relation subquery."""
     runtime = build_runtime(single_source_env)

@@ -173,11 +173,6 @@ def test_stddev_variance_functions(single_source_env):
     assert stddev_expr is not None or variance_expr is not None
 
 
-@pytest.mark.xfail(
-    reason="cluster B: FROM derived-table (SubqueryScan) rendering not yet "
-    "implemented in single_source_pushdown; relation-subquery form is the target",
-    strict=False,
-)
 def test_nested_aggregate_via_subquery(single_source_env):
     """Ensures nested aggregates (aggregate on aggregate) via subquery push."""
     runtime = build_runtime(single_source_env)
@@ -197,7 +192,7 @@ def test_nested_aggregate_via_subquery(single_source_env):
     assert avg_expr is not None
     assert isinstance(avg_expr, exp.Avg)
 
-    from_clause = ast.args.get("from")
+    from_clause = ast.find(exp.From)
     assert from_clause is not None
     from_table = from_clause.this
     assert isinstance(from_table, exp.Subquery)

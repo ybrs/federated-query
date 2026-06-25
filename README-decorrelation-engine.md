@@ -305,6 +305,18 @@ decorrelates the `LATERAL`). Cross-source `LATERAL` fails fast (see
 [Correlation limits](#correlation-limits)) until the cross-source dependent-join
 executor lands.
 
+A **user-written** `LATERAL` is also accepted (parsed to the same `LateralJoin`
+node) and bound with the left relation in scope, so its correlation resolves:
+
+```sql
+SELECT o.order_id, t.name
+FROM orders o
+LEFT JOIN LATERAL (SELECT p.name FROM products p
+                   WHERE p.id = o.product_id ORDER BY p.name LIMIT 1) t ON true;
+-- LEFT JOIN LATERAL keeps non-matching outer rows (value NULL); a comma /
+-- CROSS lateral drops them (INNER). Same-source push only, as above.
+```
+
 ---
 
 ## Value subqueries with a shaped body
@@ -545,12 +557,6 @@ SELECT order_id,
 FROM orders O;
 -- ValueError: Unsupported expression type: <class 'sqlglot.expressions.query.Window'>
 -- Needs: window-function binding (OVER) and a physical window operator.
-
--- LATERAL join
-SELECT o.order_id, p.price
-FROM orders o, LATERAL (SELECT price FROM products WHERE id = o.product_id LIMIT 1) p;
--- ValueError: LATERAL subqueries are not supported yet
--- Needs: lateral scoping (expose outer FROM columns to the subquery) plus a dependent-join/apply operator.
 
 -- CTE (any WITH, including recursive)
 WITH RECURSIVE t AS (

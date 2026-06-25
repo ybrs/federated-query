@@ -17,6 +17,7 @@ from ..plan.logical import (
     Values,
     SubqueryScan,
     SetOperation,
+    LateralJoin,
 )
 from ..plan.expressions import (
     Expression,
@@ -125,6 +126,8 @@ class Binder:
             return self._bind_limit(plan)
         if isinstance(plan, Join):
             return self._bind_join(plan)
+        if isinstance(plan, LateralJoin):
+            return self._bind_lateral_join(plan)
         if isinstance(plan, Aggregate):
             return self._bind_aggregate(plan)
         if isinstance(plan, CTE):
@@ -544,6 +547,22 @@ class Binder:
             natural=join.natural,
             using=join.using,
         )
+
+    def _bind_lateral_join(self, join: LateralJoin) -> LateralJoin:
+        """Bind a LATERAL join, binding the right with the left in scope.
+
+        Unlike a plain join, the right side may reference the left's columns
+        (the dependent correlation), so the left's relation scope is pushed
+        while the right is bound.
+        """
+        bound_left = self.bind(join.left)
+        self._push_scope_for(bound_left)
+        try:
+            plan_binder = SubqueryPlanBinder(self, list(self._scope_stack))
+            bound_right = plan_binder.bind(join.right)
+        finally:
+            self._pop_scope()
+        return LateralJoin(left=bound_left, right=bound_right, join_type=join.join_type)
 
     def _bind_explain(self, explain: Explain) -> Explain:
         """Bind an Explain node."""

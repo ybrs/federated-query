@@ -21,6 +21,7 @@ from ..plan.logical import (
     SubqueryScan,
     SetOperation,
     SetOpKind,
+    LateralJoin,
 )
 from ..catalog.catalog import Catalog
 from ..plan.expressions import (
@@ -280,9 +281,10 @@ class Parser:
         return SubqueryScan(input=inner_plan, alias=alias)
 
     def _reject_unsupported_relation(self, table_expr: exp.Expression) -> None:
-        """Fail fast on FROM items the engine cannot plan."""
-        if isinstance(table_expr, exp.Lateral):
-            raise ValueError("LATERAL subqueries are not supported yet")
+        """Fail fast on FROM items the engine cannot plan.
+
+        LATERAL joins are handled before this point (see ``_build_lateral_join``).
+        """
         if not isinstance(table_expr, exp.Table):
             raise ValueError(f"Unsupported FROM item: {type(table_expr).__name__}")
 
@@ -306,6 +308,9 @@ class Parser:
         current_plan = left_plan
 
         for join_clause in joins:
+            if isinstance(join_clause.this, exp.Lateral):
+                current_plan = self._build_lateral_join(current_plan, join_clause)
+                continue
             right_plan = self._build_join_input(join_clause.this, column_usage)
 
             join_type = self._extract_join_type(join_clause)
@@ -323,6 +328,27 @@ class Parser:
             )
 
         return current_plan
+
+    def _build_lateral_join(
+        self, left_plan: LogicalPlanNode, join_clause: exp.Join
+    ) -> LateralJoin:
+        """Build a LATERAL (dependent) join: the right may reference the left.
+
+        The right is a derived table aliased like any other; a ``LEFT JOIN
+        LATERAL`` keeps non-matching outer rows, while a comma/``CROSS`` lateral
+        drops them (INNER). The binder later resolves the right's correlated
+        references against the left's columns.
+        """
+        lateral = join_clause.this
+        alias = lateral.alias
+        if not alias:
+            raise ValueError("LATERAL derived tables require an alias")
+        right = SubqueryScan(
+            input=self.ast_to_logical_plan(lateral.this.this), alias=alias
+        )
+        side = join_clause.args.get("side")
+        join_type = JoinType.LEFT if side else JoinType.INNER
+        return LateralJoin(left=left_plan, right=right, join_type=join_type)
 
     def _is_natural_join(self, join_clause: exp.Join) -> bool:
         """Whether the JOIN carries the NATURAL method keyword."""
