@@ -227,16 +227,16 @@ These tests are written before the decorrelation implementation to serve as:
 
 | Pattern | Uncorrelated | Correlated | With NULL | In SELECT | In WHERE | Nested |
 |---------|-------------|------------|-----------|-----------|----------|--------|
-| EXISTS | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| NOT EXISTS | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| IN | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| NOT IN | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| = ANY | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| > ANY | ✓ | ✓ | ✓ | - | ✓ | ✓ |
-| < ANY | ✓ | ✓ | ✓ | - | ✓ | - |
-| = ALL | ✓ | ✓ | ✓ | - | ✓ | - |
-| <> ALL | ✓ | ✓ | ✓ | - | ✓ | - |
-| Scalar | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| EXISTS | yes | yes | yes | yes | yes | yes |
+| NOT EXISTS | yes | yes | yes | yes | yes | yes |
+| IN | yes | yes | yes | yes | yes | yes |
+| NOT IN | yes | yes | yes | yes | yes | yes |
+| = ANY | yes | yes | yes | yes | yes | yes |
+| > ANY | yes | yes | yes | - | yes | yes |
+| < ANY | yes | yes | yes | - | yes | - |
+| = ALL | yes | yes | yes | - | yes | - |
+| <> ALL | yes | yes | yes | - | yes | - |
+| Scalar | yes | yes | yes | yes | yes | yes |
 
 ## References
 

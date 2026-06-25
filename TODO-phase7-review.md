@@ -1,6 +1,6 @@
 # Phase 7 Review — TODO
 
-> ## ★ Physical Merge Engine (DuckDB local execution) — **DONE (2026-06-15)**
+> ## Physical Merge Engine (DuckDB local execution) — **DONE (2026-06-15)**
 > The local row-at-a-time Python operators now run vectorized in a reused
 > in-memory **DuckDB coordinator** (`executor/merge_engine.py`). Migrated
 > `execute()`s (all gated, row-loop fallback when no engine attached):

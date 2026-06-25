@@ -189,35 +189,35 @@ This project is under active development. See `tasks.md` for the implementation 
 
 ### Completed Phases
 
-**Phase 0: Foundation** ✅
-- ✅ Project structure and skeleton
-- ✅ Core abstractions (plans, expressions, data sources)
-- ✅ Configuration system
-- ✅ Basic catalog structure
-- ✅ Data source connectors (PostgreSQL, DuckDB)
-- ✅ Test infrastructure
+**Phase 0: Foundation** (done)
+- Project structure and skeleton
+- Core abstractions (plans, expressions, data sources)
+- Configuration system
+- Basic catalog structure
+- Data source connectors (PostgreSQL, DuckDB)
+- Test infrastructure
 
-**Phase 1: Basic Query Execution** ✅
-- ✅ Parser: AST to logical plan conversion
-- ✅ Binder: Reference resolution with catalog integration
-- ✅ Physical operators: Scan, Filter, Projection, Limit
-- ✅ Basic executor: Single-table queries
-- ✅ End-to-end pipeline for simple SELECT queries
+**Phase 1: Basic Query Execution** (done)
+- Parser: AST to logical plan conversion
+- Binder: Reference resolution with catalog integration
+- Physical operators: Scan, Filter, Projection, Limit
+- Basic executor: Single-table queries
+- End-to-end pipeline for simple SELECT queries
 
 **Query Example (Phase 1):**
 ```sql
 SELECT col1, col2 FROM datasource.schema.table WHERE col1 > 10 LIMIT 100
 ```
 
-**Phase 2: Joins and Multi-Table Queries** ✅
-- ✅ Logical Join plan node with all join types
-- ✅ Physical HashJoin implementation
-- ✅ Physical NestedLoopJoin implementation
-- ✅ Parser support for JOIN clauses
-- ✅ Binder support for multi-table column resolution
-- ✅ Physical planner join strategy selection
-- ✅ All 70 tests passing (including 5 join tests)
-- ✅ Federated join example working (DuckDB + PostgreSQL)
+**Phase 2: Joins and Multi-Table Queries** (done)
+- Logical Join plan node with all join types
+- Physical HashJoin implementation
+- Physical NestedLoopJoin implementation
+- Parser support for JOIN clauses
+- Binder support for multi-table column resolution
+- Physical planner join strategy selection
+- All 70 tests passing (including 5 join tests)
+- Federated join example working (DuckDB + PostgreSQL)
 
 **Query Example (Phase 2):**
 ```sql
@@ -227,13 +227,13 @@ JOIN postgres.orders o ON c.id = o.customer_id
 WHERE o.amount > 1000
 ```
 
-**Phase 3: Aggregations and Grouping** ✅
-- ✅ Aggregations and grouping
-- ✅ GROUP BY clause support (single and multiple columns)
-- ✅ Aggregate functions (COUNT, SUM, AVG, MIN, MAX)
-- ✅ HAVING clause support with expression rewriting
-- ✅ Global aggregations (without GROUP BY)
-- ✅ Federated aggregations across data sources
+**Phase 3: Aggregations and Grouping** (done)
+- Aggregations and grouping
+- GROUP BY clause support (single and multiple columns)
+- Aggregate functions (COUNT, SUM, AVG, MIN, MAX)
+- HAVING clause support with expression rewriting
+- Global aggregations (without GROUP BY)
+- Federated aggregations across data sources
 
 **Query Example (Phase 3):**
 ```sql
@@ -244,17 +244,17 @@ GROUP BY c.name
 HAVING SUM(o.amount) > 2000
 ```
 
-**Phase 7: Subquery Decorrelation** ✅
-- ✅ EXISTS / NOT EXISTS → SEMI / ANTI joins
-- ✅ IN / NOT IN → SEMI / ANTI joins with exact NULL semantics (incl. tuple IN)
-- ✅ ANY / SOME / ALL quantified comparisons (incl. LIKE ALL)
-- ✅ Scalar subqueries → LEFT joins with aggregation, COALESCE for COUNT,
+**Phase 7: Subquery Decorrelation** (done)
+- EXISTS / NOT EXISTS → SEMI / ANTI joins
+- IN / NOT IN → SEMI / ANTI joins with exact NULL semantics (incl. tuple IN)
+- ANY / SOME / ALL quantified comparisons (incl. LIKE ALL)
+- Scalar subqueries → LEFT joins with aggregation, COALESCE for COUNT,
   runtime cardinality guards, per-key limits for correlated LIMIT
-- ✅ Boolean subqueries in SELECT lists (flag columns via SEMI/ANTI unions)
-- ✅ OR-of-subqueries via union expansion; nested subqueries innermost-first
-- ✅ Derived tables and subqueries in INNER join conditions
-- ✅ Scoped subquery binding (correlated references resolved by the binder)
-- ✅ All 116 decorrelation e2e tests passing against PostgreSQL
+- Boolean subqueries in SELECT lists (flag columns via SEMI/ANTI unions)
+- OR-of-subqueries via union expansion; nested subqueries innermost-first
+- Derived tables and subqueries in INNER join conditions
+- Scoped subquery binding (correlated references resolved by the binder)
+- All 116 decorrelation e2e tests passing against PostgreSQL
 
 **Query Example (Phase 7):**
 ```sql
@@ -265,20 +265,20 @@ WHERE u.country IN (SELECT code FROM countries WHERE enabled)
   AND EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.amount > 100)
 ```
 
-**Phase 7 Review + Phase 8 (in progress)** 🚧
-- ✅ Native `EXPLAIN (FORMAT ...)` via a custom sqlglot dialect (no more
+**Phase 7 Review + Phase 8 (in progress)**
+- Native `EXPLAIN (FORMAT ...)` via a custom sqlglot dialect (no more
   Command-string fallback)
-- ✅ Operator/cast correctness: `||`/`CONCAT`/`ILIKE`/`CAST`, string escaping,
+- Operator/cast correctness: `||`/`CONCAT`/`ILIKE`/`CAST`, string escaping,
   typed literals, OFFSET-without-LIMIT, NULL-aware comparisons
-- ✅ Decorrelation correctness fixes (self-join aliasing, `NOT (subquery)`
+- Decorrelation correctness fixes (self-join aliasing, `NOT (subquery)`
   three-valued logic, EXISTS-over-global-aggregate, OR-expansion multiplicity,
   COUNT(DISTINCT), hash-join key orientation)
-- ✅ Many pre-existing silent-fail / correctness fixes (DuckDB typed schemas,
+- Many pre-existing silent-fail / correctness fixes (DuckDB typed schemas,
   remote-join side filters, predicate-pushdown recursion, WHERE/HAVING split,
   NULLS FIRST/LAST, MIN/MAX type preservation)
-- ✅ **Set operations** (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`) — parse,
+- **Set operations** (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`) — parse,
   bind, single-source pushdown, and local multiset execution
-- 🚧 In progress (tracked in `TODO-phase7-review.md`, section G): broader
+- In progress (tracked in `TODO-phase7-review.md`, section G): broader
   same-source join pushdown (G1), computed-projection pushdown (G2), CTEs (G3),
   `CAST` target types (G5), date/time functions (G6), aggregate `FILTER` (G7)
 

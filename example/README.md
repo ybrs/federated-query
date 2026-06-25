@@ -225,13 +225,13 @@ After understanding this federated setup, you can:
 
 ## Supported Features
 
-### Phase 2: JOINs ✅
+### Phase 2: JOINs (done)
 - INNER JOIN, LEFT JOIN, RIGHT JOIN, FULL OUTER JOIN
 - Cross-database JOINs (federated)
 - Multi-table JOINs
 - JOIN with WHERE clause filtering
 
-### Phase 3: Aggregations ✅
+### Phase 3: Aggregations (done)
 - Aggregate functions: COUNT, SUM, AVG, MIN, MAX
 - GROUP BY with single or multiple columns
 - Global aggregations (without GROUP BY)

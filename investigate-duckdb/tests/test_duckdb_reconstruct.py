@@ -31,7 +31,9 @@ from duckdb_reconstruct import (
     validate_tree,
 )
 
-EXPECTED_DUCKDB_RECONSTRUCT_PASS_COUNT = 831
+EXPECTED_DUCKDB_RECONSTRUCT_PASS_COUNT = 1857
+EXPECTED_DUCKDB_SQL_KEYWORD_ENTRY_COUNT = 522
+EXPECTED_DUCKDB_KEYWORD_STRESS_CASE_COUNT = 1000
 
 
 def duckdb_source_logical_node_names():
@@ -772,6 +774,210 @@ def test_repl_root_derived_subquery_uses_live_connection_schema(capsys):
     assert "ERROR:" not in output
 
 
+def duckdb_sql_keyword_entries():
+    """Return keyword entries from DuckDB PEG grammar source lists."""
+    keyword_dir = DEFAULT_DUCKDB_SOURCE_ROOT / "src/parser/peg/grammar/keywords"
+    entries = []
+    for keyword_path in sorted(keyword_dir.glob("*.list")):
+        for line_number, line in enumerate(keyword_path.read_text().splitlines(), 1):
+            keyword = line.strip()
+            if keyword:
+                entries.append((keyword_path.name, line_number, keyword))
+    return tuple(entries)
+
+
+def keyword_identifier(prefix, index, keyword):
+    """Return a quoted identifier derived from one DuckDB keyword."""
+    safe_keyword = keyword.lower().replace("_", "_")
+    return f'"{prefix}_{index}_{safe_keyword}"'
+
+
+def keyword_stress_contract_cases():
+    """Return 1000 keyword-driven native reconstruction contract cases."""
+    keyword_entries = duckdb_sql_keyword_entries()
+    cases = []
+    for index in range(EXPECTED_DUCKDB_KEYWORD_STRESS_CASE_COUNT):
+        keyword_source, line_number, keyword = keyword_entries[
+            index % len(keyword_entries)
+        ]
+        cases.append(
+            keyword_stress_contract_case(index, keyword_source, line_number, keyword)
+        )
+    return tuple(cases)
+
+
+def keyword_stress_contract_case(index, keyword_source, line_number, keyword):
+    """Return one keyword-driven reconstruction contract case."""
+    shape_index = index % 10
+    case_name = f"{keyword_source}:{line_number}:{keyword}:shape-{shape_index}"
+    column_name = keyword_identifier("col", index, keyword)
+    cte_name = keyword_identifier("cte", index, keyword)
+    subquery_name = keyword_identifier("subq", index, keyword)
+    limit_value = (index % 5) + 1
+    query_sql = keyword_stress_query_sql(
+        shape_index, column_name, cte_name, subquery_name, limit_value, keyword
+    )
+    return (case_name, "", query_sql, True)
+
+
+def keyword_stress_query_sql(
+    shape_index, column_name, cte_name, subquery_name, limit_value, keyword
+):
+    """Return one keyword-driven SQL query for a shape index."""
+    if shape_index == 0:
+        return keyword_root_derived_limit_sql(column_name, subquery_name, limit_value)
+    if shape_index == 1:
+        return keyword_root_derived_offset_sql(column_name, subquery_name)
+    if shape_index == 2:
+        return keyword_cte_root_derived_limit_sql(
+            column_name, cte_name, subquery_name, limit_value
+        )
+    if shape_index == 3:
+        return keyword_nested_subquery_limit_sql(column_name, subquery_name)
+    if shape_index == 4:
+        return keyword_scalar_subquery_limit_sql(column_name)
+    if shape_index == 5:
+        return keyword_cte_having_subquery_sql(column_name, cte_name)
+    if shape_index == 6:
+        return keyword_root_derived_order_limit_sql(
+            column_name, subquery_name, limit_value
+        )
+    if shape_index == 7:
+        return keyword_exists_limit_sql(column_name, keyword, limit_value)
+    if shape_index == 8:
+        return keyword_in_limit_sql(column_name, keyword, limit_value)
+    return keyword_cte_nested_limit_sql(column_name, cte_name, subquery_name)
+
+
+def keyword_root_derived_limit_sql(column_name, subquery_name, limit_value):
+    """Return a keyword query with LIMIT inside a root derived subquery."""
+    return (
+        f"SELECT {column_name} FROM "
+        f"(SELECT TRUE AS {column_name} FROM dual LIMIT {limit_value}) "
+        f"{subquery_name}"
+    )
+
+
+def keyword_root_derived_offset_sql(column_name, subquery_name):
+    """Return a keyword query with OFFSET inside a root derived subquery."""
+    return (
+        f"SELECT {column_name} FROM "
+        f"(SELECT TRUE AS {column_name} FROM dual OFFSET 1) {subquery_name}"
+    )
+
+
+def keyword_cte_root_derived_limit_sql(
+    column_name, cte_name, subquery_name, limit_value
+):
+    """Return a keyword query with CTE and root-derived LIMIT."""
+    return (
+        f"WITH {cte_name} AS ("
+        f"SELECT {column_name} FROM "
+        f"(SELECT TRUE AS {column_name} FROM dual LIMIT {limit_value}) "
+        f"{subquery_name}) "
+        f"SELECT {column_name} FROM {cte_name}"
+    )
+
+
+def keyword_nested_subquery_limit_sql(column_name, subquery_name):
+    """Return a keyword query with a nested FROM subquery LIMIT."""
+    return (
+        f"SELECT {column_name} FROM ("
+        f"SELECT TRUE AS {column_name} FROM "
+        f"(SELECT 1 AS seed FROM dual LIMIT 1) {subquery_name}"
+        ") outer_subq"
+    )
+
+
+def keyword_scalar_subquery_limit_sql(column_name):
+    """Return a keyword query with scalar subquery LIMIT."""
+    return f"SELECT (SELECT TRUE FROM dual LIMIT 1) AS {column_name}"
+
+
+def keyword_cte_having_subquery_sql(column_name, cte_name):
+    """Return a keyword query with HAVING inside a CTE."""
+    return (
+        f"WITH {cte_name} AS ("
+        f"SELECT TRUE AS {column_name} FROM dual "
+        f"GROUP BY TRUE HAVING count(*) > 1"
+        f") SELECT {column_name} FROM {cte_name}"
+    )
+
+
+def keyword_root_derived_order_limit_sql(column_name, subquery_name, limit_value):
+    """Return a keyword query with ORDER BY LIMIT in a root subquery."""
+    return (
+        f"SELECT {column_name} FROM ("
+        f"SELECT TRUE AS {column_name} FROM dual ORDER BY 1 LIMIT {limit_value}"
+        f") {subquery_name}"
+    )
+
+
+def keyword_exists_limit_sql(column_name, keyword, limit_value):
+    """Return a keyword query with EXISTS and LIMIT."""
+    return (
+        f"SELECT TRUE AS {column_name} "
+        f"WHERE EXISTS (SELECT '{keyword}' FROM dual LIMIT {limit_value})"
+    )
+
+
+def keyword_in_limit_sql(column_name, keyword, limit_value):
+    """Return a keyword query with IN and LIMIT."""
+    return (
+        f"SELECT TRUE AS {column_name} "
+        f"WHERE '{keyword}' IN (SELECT '{keyword}' FROM dual LIMIT {limit_value})"
+    )
+
+
+def keyword_cte_nested_limit_sql(column_name, cte_name, subquery_name):
+    """Return a keyword query with CTE and nested LIMIT subquery."""
+    return (
+        f"WITH {cte_name} AS ("
+        f"SELECT TRUE AS {column_name} FROM "
+        f"(SELECT 1 AS seed FROM dual LIMIT 1) {subquery_name}"
+        f") SELECT {column_name} FROM {cte_name}"
+    )
+
+
+def test_duckdb_sql_keyword_entry_count_is_current():
+    """Verify the keyword stress corpus uses all DuckDB keyword entries."""
+    keyword_entries = duckdb_sql_keyword_entries()
+    assert len(keyword_entries) == EXPECTED_DUCKDB_SQL_KEYWORD_ENTRY_COUNT
+
+
+def test_keyword_stress_contract_case_count_is_1000():
+    """Verify the keyword stress corpus contains exactly 1000 queries."""
+    cases = keyword_stress_contract_cases()
+    assert len(cases) == EXPECTED_DUCKDB_KEYWORD_STRESS_CASE_COUNT
+
+
+def test_keyword_stress_contract_cases_cover_all_keyword_entries():
+    """Verify every DuckDB keyword entry appears in the stress corpus."""
+    covered_entries = set()
+    for case_name, setup_sql, query_sql, auto_schema in keyword_stress_contract_cases():
+        keyword_source, line_number, keyword, shape_name = case_name.split(":", 3)
+        covered_entries.add((keyword_source, int(line_number), keyword))
+        assert setup_sql == ""
+        assert query_sql
+        assert auto_schema
+        assert shape_name
+    assert covered_entries == set(duckdb_sql_keyword_entries())
+
+
+@pytest.mark.parametrize(
+    "case_name,setup_sql,query_sql,auto_schema",
+    keyword_stress_contract_cases(),
+)
+def test_keyword_stress_native_reconstruction_contract_cases(
+    case_name, setup_sql, query_sql, auto_schema
+):
+    """Verify keyword-driven queries preserve native reconstruction semantics."""
+    assert case_name
+    assert_native_reconstructed_sql_matches_original(
+        setup_sql, query_sql, auto_schema
+    )
+
+
 def root_derived_semantic_setup_sql():
     """Return setup SQL for root-derived semantic contracts."""
     return """
@@ -1321,6 +1527,27 @@ def test_audit_aggregate_internal_functions_are_executable():
         ORDER BY product_id
     """
     assert_reconstructed_sql_matches_original(setup_sql, query_sql)
+
+
+def test_audit_qualify_window_does_not_leak_bracketed_slot_refs():
+    """Audit QUALIFY window rewrites resolve bracketed slot references."""
+    setup_sql = """
+        CREATE TABLE t(id INTEGER, grp VARCHAR, score INTEGER, flag BOOLEAN);
+        INSERT INTO t VALUES
+            (1, 'a', 10, TRUE),
+            (2, 'a', 20, FALSE),
+            (3, 'b', 5, TRUE);
+    """
+    query_sql = """
+        SELECT id,
+               row_number() OVER (
+                   PARTITION BY grp ORDER BY score DESC
+               ) AS rn
+        FROM t
+        QUALIFY rn = 1
+        ORDER BY id
+    """
+    assert_native_reconstructed_sql_matches_original(setup_sql, query_sql)
 
 
 def test_audit_empty_result_preserves_projection_schema():
@@ -3264,6 +3491,10 @@ def required_coverage_document_gate_names():
         "test_explicit_user_requirement_cases_have_required_node_assertions",
         "test_explicit_user_requirement_cases_have_output_column_assertions",
         "test_reconstruction_contract_cases_use_full_ladder_helper",
+        "test_duckdb_sql_keyword_entry_count_is_current",
+        "test_keyword_stress_contract_case_count_is_1000",
+        "test_keyword_stress_contract_cases_cover_all_keyword_entries",
+        "test_keyword_stress_native_reconstruction_contract_cases",
     )
 
 

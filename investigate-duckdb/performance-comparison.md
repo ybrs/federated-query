@@ -105,9 +105,9 @@ fedq vs DuckDB, full (un-limited) aggregations, `diff`ed row-for-row
 
 | query | rows compared | result |
 |---|--:|---|
-| Q1 headline | 305,524 | ✅ identical |
-| Q4 same-source | 42,858 | ✅ identical |
-| Q7 selective | 10 | ✅ identical |
+| Q1 headline | 305,524 | identical |
+| Q4 same-source | 42,858 | identical |
+| Q7 selective | 10 | identical |
 
 Q1 integrity: `sum(accesses) = 776,684` on both = the week's total `access_logs`
 count. No row differs.
@@ -118,16 +118,16 @@ count. No row differs.
 
 | pushdown / behavior | fedq | DuckDB stable | DuckDB main |
 |---|:--:|:--:|:--:|
-| filter + projection (Q2, Q3) | ✅ | ✅ | ✅ |
-| `LIMIT` (Q9) | ✅ | ✅ | ✅ |
-| literal `IN (…)` (Q12) | ✅ | ✅ | ✅ |
-| `ORDER BY` + `LIMIT` (Q11) | ✅ | ❌ | ✅ |
-| remote aggregate / `count(*)` (Q0, Q5) | ✅ | ❌ | ❌ |
-| same-source join pushdown (Q4) | ✅ | ❌ | ❌ |
-| dynamic cross-source semi-join `IN` (Q7) | ✅ | ❌ | ❌ |
-| cost-based: skip dynamic filter when non-selective (Q1) | ✅ | n/a | n/a |
-| transport: binary COPY · ctid parallelism · shared snapshot | ❌ | ✅ | ✅ |
-| raw local-CPU speed (embedded C++ engine) | — | ✅ | ✅ |
+| filter + projection (Q2, Q3) | | | |
+| `LIMIT` (Q9) | | | |
+| literal `IN (…)` (Q12) | | | |
+| `ORDER BY` + `LIMIT` (Q11) | | | |
+| remote aggregate / `count(*)` (Q0, Q5) | | | |
+| same-source join pushdown (Q4) | | | |
+| dynamic cross-source semi-join `IN` (Q7) | | | |
+| cost-based: skip dynamic filter when non-selective (Q1) | | n/a | n/a |
+| transport: binary COPY · ctid parallelism · shared snapshot | | | |
+| raw local-CPU speed (embedded C++ engine) | — | | |
 
 > DuckDB main already unwraps `OptionalFilter`/`SelectivityOptionalFilter` in its
 > scanner, so join-derived dynamic pushdown is *plausibly* coming; today it drops

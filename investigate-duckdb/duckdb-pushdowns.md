@@ -26,14 +26,14 @@ sub-plan pushdown engine. It pushes down, per remote table:
 
 | Pushdown | Pushed? | Notes |
 |---|---|---|
-| **Projection** (column pruning) | ✅ yes | only referenced columns; `count(*)` → `SELECT NULL` |
-| **Filter** — constant comparisons (`=,<,>,<=,>=`, `col = true`) | ✅ yes | pushed even when the table is inside a join |
-| **Filter** — bare boolean column (`WHERE is_active`) | ❌ no | must be written `is_active = true` to push |
-| **LIMIT** (no ORDER BY) | ✅ yes | both stable and main |
-| **ORDER BY (+ LIMIT)** | ⬆️ **main only** | stable pulls all + sorts locally; main pushes `ORDER BY … LIMIT` (`pg_order_pushdown`, default on) |
-| **Aggregate** (`GROUP BY`, `count`, `sum`) | ❌ no | rows pulled, aggregated locally in DuckDB (optimizer exists in main's connector lib but **not wired** to PG) |
-| **Join** (even same-source PG↔PG) | ❌ no | both tables pulled in full, joined in DuckDB |
-| **Cross-source dynamic filter / semi-join / IN-list** | ❌ no | a selective local filter is **never** turned into a remote `IN (...)`; the full dimension table is pulled every time |
+| **Projection** (column pruning) | yes | only referenced columns; `count(*)` → `SELECT NULL` |
+| **Filter** — constant comparisons (`=,<,>,<=,>=`, `col = true`) | yes | pushed even when the table is inside a join |
+| **Filter** — bare boolean column (`WHERE is_active`) | no | must be written `is_active = true` to push |
+| **LIMIT** (no ORDER BY) | yes | both stable and main |
+| **ORDER BY (+ LIMIT)** | **main only** | stable pulls all + sorts locally; main pushes `ORDER BY … LIMIT` (`pg_order_pushdown`, default on) |
+| **Aggregate** (`GROUP BY`, `count`, `sum`) | no | rows pulled, aggregated locally in DuckDB (optimizer exists in main's connector lib but **not wired** to PG) |
+| **Join** (even same-source PG↔PG) | no | both tables pulled in full, joined in DuckDB |
+| **Cross-source dynamic filter / semi-join / IN-list** | no | a selective local filter is **never** turned into a remote `IN (...)`; the full dimension table is pulled every time |
 
 **The single most important result for us:** for the headline query *"most
 accessed categories daily"* — a 10M-row local fact table joined to a 400k-row
@@ -399,11 +399,11 @@ a runtime min/max isn't known until the build side finishes — after the COPYs 
 already issued. Real dynamic pushdown would need **deferred/lazy COPY generation**.
 
 ### Bottom line
-- ✅ Literal `IN (...)` → pushed (stable + main).
-- ✅ Recent rewrite *recognizes* `Optional`/`Selectivity` runtime-filter wrappers
+- Literal `IN (...)` → pushed (stable + main).
+- Recent rewrite *recognizes* `Optional`/`Selectivity` runtime-filter wrappers
   and can push their materialized child — groundwork, shared across the
   mysql/sqlite/odbc connectors too.
-- ❌ True **join-derived dynamic filter** (sideways-information-passing IN-list /
+- True **join-derived dynamic filter** (sideways-information-passing IN-list /
   min-max) to PostgreSQL is **not enabled** on main; the selective cross-source
   join still transfers the whole dimension table.
 
@@ -496,14 +496,14 @@ when not), not an unconditional rewrite.
 
 | query shape | fedq | DuckDB (stable & main) |
 |---|---|---|
-| filter + projection pushdown | ✅ | ✅ |
-| LIMIT pushdown | ✅ | ✅ |
-| ORDER BY pushdown | ✅ | ⬆️ main only |
-| literal `IN (…)` pushdown | ✅ | ✅ |
-| **same-source join pushdown** | ✅ one query | ❌ pulls both tables |
-| **same-source aggregate pushdown** | ✅ | ❌ |
-| **dynamic cross-source semi-join (`IN` of join keys)** | ✅ G9 | ❌ |
-| **cost-based: skip dynamic filter when non-selective** | ✅ | n/a (never does it) |
+| filter + projection pushdown | | |
+| LIMIT pushdown | | |
+| ORDER BY pushdown | | main only |
+| literal `IN (…)` pushdown | | |
+| **same-source join pushdown** | one query | pulls both tables |
+| **same-source aggregate pushdown** | | |
+| **dynamic cross-source semi-join (`IN` of join keys)** | G9 | |
+| **cost-based: skip dynamic filter when non-selective** | | n/a (never does it) |
 
 **Takeaway:** on the basics fedq and DuckDB are even. On the two things that
 dominate cost for federated analytics — *pushing a same-source join/aggregate as
@@ -571,9 +571,9 @@ aggregation, normalized and `diff`ed row-for-row:
 
 | query | rows compared | result |
 |---|--:|---|
-| Q7 selective (`GROUP BY category_id`) | 10 | ✅ identical |
-| Q4 same-source (`GROUP BY name`, all active) | 42,858 | ✅ identical |
-| Q1 headline (`GROUP BY day, name`, full week) | 305,524 | ✅ identical |
+| Q7 selective (`GROUP BY category_id`) | 10 | identical |
+| Q4 same-source (`GROUP BY name`, all active) | 42,858 | identical |
+| Q1 headline (`GROUP BY day, name`, full week) | 305,524 | identical |
 
 Integrity check on Q1: `sum(accesses) = 776,684` on both engines, which equals the
 independently-counted number of `access_logs` rows in that week — every event maps

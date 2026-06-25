@@ -1074,6 +1074,10 @@ def reconstruct_sql(
     if auto_schema:
         apply_auto_schema(connection, sql)
     surface = SqlSurface(sql, connection)
+    if not root and should_preserve_original_surface(surface):
+        root = explain_optimized_json(connection, sql)
+        validate_tree(root, registry)
+        return format_original_reconstruction(root, sql, include_raw_json, quiet)
     if not root:
         root = root_plan_for_surface(connection, sql, surface)
     validate_tree(root, registry)
@@ -1088,13 +1092,24 @@ def reconstruct_sql(
     return format_reconstruction(root, relation, include_raw_json, quiet, surface)
 
 
+def should_preserve_original_surface(surface: SqlSurface) -> bool:
+    """Return true when the original SQL surface must remain intact."""
+    if surface.expression.args.get("qualify"):
+        return True
+    if surface_has_having_subquery(surface):
+        return True
+    if surface_has_semantic_subquery_boundary(surface):
+        return True
+    return False
+
+
 def should_preserve_original_sql(
     root: PlanNode, explicit_root: bool, surface: SqlSurface
 ) -> bool:
     """Return true when current relation rendering cannot preserve semantics."""
     if explicit_root and not has_single_empty_join(root):
         return True
-    if surface_has_having_subquery(surface):
+    if should_preserve_original_surface(surface):
         return True
     if should_preserve_root_subquery(root, surface):
         return True
@@ -1130,6 +1145,78 @@ def surface_has_having_subquery(surface: SqlSurface) -> bool:
     if not having:
         return False
     return having.find(sqlglot.expressions.Subquery) is not None
+
+
+def surface_has_semantic_subquery_boundary(surface: SqlSurface) -> bool:
+    """Return true when subquery clauses must remain scoped."""
+    for select in surface.expression.find_all(sqlglot.expressions.Select):
+        if select is surface.expression:
+            continue
+        if select_is_cte_body_with_having(select):
+            return True
+        if select_has_preserved_boundary(select):
+            if select_references_outer_scope(select):
+                continue
+            return True
+    return False
+
+
+def select_is_cte_body_with_having(select: sqlglot.expressions.Select) -> bool:
+    """Return true when a CTE SELECT owns a HAVING clause."""
+    if not select.args.get("having"):
+        return False
+    return isinstance(select.parent, sqlglot.expressions.CTE)
+
+
+def select_references_outer_scope(select: sqlglot.expressions.Select) -> bool:
+    """Return true when a nested SELECT references an outer alias."""
+    local_aliases = local_select_table_aliases(select)
+    for column in select.find_all(sqlglot.expressions.Column):
+        if not column.table:
+            continue
+        if column.table not in local_aliases:
+            return True
+    return False
+
+
+def local_select_table_aliases(select: sqlglot.expressions.Select) -> set[str]:
+    """Return table aliases declared inside one SELECT expression."""
+    aliases = set()
+    from_expression = select.args.get("from_")
+    if from_expression:
+        collect_table_aliases_from_expression(from_expression, aliases)
+    for join in select.args.get("joins") or []:
+        collect_table_aliases_from_expression(join, aliases)
+    return aliases
+
+
+def collect_table_aliases_from_expression(
+    expression: sqlglot.expressions.Expression, aliases: set[str]
+) -> None:
+    """Collect table aliases from one local FROM or JOIN expression."""
+    for table in expression.find_all(sqlglot.expressions.Table):
+        aliases.add(table.alias_or_name)
+
+
+def expression_has_preserved_boundary(expression: sqlglot.expressions.Expression) -> bool:
+    """Return true when any nested select has a scoped semantic boundary."""
+    if isinstance(expression, sqlglot.expressions.Select):
+        if select_has_preserved_boundary(expression):
+            return True
+    for select in expression.find_all(sqlglot.expressions.Select):
+        if select_has_preserved_boundary(select):
+            return True
+    return False
+
+
+def select_has_preserved_boundary(expression: sqlglot.expressions.Expression) -> bool:
+    """Return true for SELECT clauses the renderer cannot safely flatten."""
+    if not isinstance(expression, sqlglot.expressions.Select):
+        return False
+    for key in ("limit", "offset", "order", "qualify"):
+        if expression.args.get(key):
+            return True
+    return False
 
 
 def has_single_empty_join(root: PlanNode) -> bool:
@@ -1866,12 +1953,11 @@ def resolve_slot_references_in_expression(
     expression: str, relation: RelationSql
 ) -> str:
     """Replace all #N references in one expression with relation columns."""
-    result = expression
-    for slot_index in range(len(relation.output_columns)):
-        replacement = resolve_slot_reference(f"#{slot_index}", relation)
-        if replacement:
-            result = result.replace(f"#{slot_index}", replacement)
-    return result
+    return re.sub(
+        r"#(?:\d+|\[[^\]]+\])",
+        lambda match: resolve_slot_reference(match.group(0), relation) or match.group(0),
+        expression,
+    )
 
 
 def aggregate_select_parts(
@@ -2258,10 +2344,30 @@ def resolve_slot_reference(term: str, relation: RelationSql) -> Optional[str]:
     """Resolve a DuckDB #N slot reference against relation output columns."""
     if not term.startswith("#"):
         return None
+    slot_indexes = slot_reference_indexes(term)
+    for slot_index in slot_indexes:
+        replacement = relation_output_slot(slot_index, relation)
+        if replacement:
+            return replacement
+    return None
+
+
+def slot_reference_indexes(term: str) -> tuple[int, ...]:
+    """Return numeric column indexes from DuckDB slot reference text."""
     slot_text = term[1:]
-    if not slot_text.isdigit():
-        return None
-    slot_index = int(slot_text)
+    if slot_text.isdigit():
+        return (int(slot_text),)
+    if not slot_text.startswith("[") or not slot_text.endswith("]"):
+        return tuple()
+    indexes = []
+    for part in slot_text[1:-1].split("."):
+        if part.isdigit():
+            indexes.append(int(part))
+    return tuple(indexes)
+
+
+def relation_output_slot(slot_index: int, relation: RelationSql) -> Optional[str]:
+    """Return a relation output column reference for one slot index."""
     if slot_index >= len(relation.output_columns):
         return None
     if not relation.aliases:

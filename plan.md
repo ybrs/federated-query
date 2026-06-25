@@ -10,21 +10,21 @@ This is a production-grade federated query engine that executes SQL queries acro
 dependent-join decorrelation + cross-source subquery fallback; parallel
 execution + memory management) not started — see `decorrelation-gaps.md`.
 
-- ✅ **Phase 0**: Foundation — project structure, configuration, catalog, data sources
-- ✅ **Phase 1**: Basic query execution — single-table SELECT with filters and limits
-- ✅ **Phase 2**: Joins — multi-table queries with hash and nested-loop joins
-- ✅ **Phase 3**: Aggregations — GROUP BY, aggregate functions, HAVING, global aggregates
-- ✅ **Phases 4–6**: Optimizer rules (predicate/projection/aggregate/order-by/limit pushdown,
+- **Phase 0**: Foundation — project structure, configuration, catalog, data sources
+- **Phase 1**: Basic query execution — single-table SELECT with filters and limits
+- **Phase 2**: Joins — multi-table queries with hash and nested-loop joins
+- **Phase 3**: Aggregations — GROUP BY, aggregate functions, HAVING, global aggregates
+- **Phases 4–6**: Optimizer rules (predicate/projection/aggregate/order-by/limit pushdown,
   expression simplification), cost stubs, native `EXPLAIN`, statistics scaffolding
-- ✅ **Phase 7**: Subquery decorrelation — EXISTS/IN/ANY/ALL/scalar → joins with exact
+- **Phase 7**: Subquery decorrelation — EXISTS/IN/ANY/ALL/scalar → joins with exact
   three-valued NULL semantics
-- ✅ **Phase 8**: Pushdown breadth and advanced SQL
-  - ✅ Single-source generator pushes any same-source subtree as one remote query
+- **Phase 8**: Pushdown breadth and advanced SQL
+  - Single-source generator pushes any same-source subtree as one remote query
     (joins of every shape incl. SEMI/ANTI/LEFT, computed projections, derived tables)
-  - ✅ Set operations, `CAST`, decorrelation gaps A/B, `LATERAL` (same + cross-source)
-  - ✅ **CTEs** (`WITH`, incl. `RECURSIVE`) — single-source and cross-source
-  - ✅ Cross-source dynamic filtering / semi-join reduction (G9)
-  - ✅ Local set-based work runs in the DuckDB merge engine (no Python row-loop joins)
+  - Set operations, `CAST`, decorrelation gaps A/B, `LATERAL` (same + cross-source)
+  - **CTEs** (`WITH`, incl. `RECURSIVE`) — single-source and cross-source
+  - Cross-source dynamic filtering / semi-join reduction (G9)
+  - Local set-based work runs in the DuckDB merge engine (no Python row-loop joins)
 
 **Test Status**: 809 passing / 0 failing / 0 xfailed.
 
@@ -391,14 +391,14 @@ Results (Arrow format)
 - **Solution**: Aggressive pushdown, use partial aggregation, fetch only needed columns
 
 ### 2. Join Strategy Selection
-- ✅ **Hash Join / Nested-Loop Join**: local strategies, chosen by the planner
-- ✅ **Remote Join**: same-source joins pushed to the source as one query
-- ⏳ **Semi-Join Pushdown** (a.k.a. dynamic filtering): send the build side's
+- **Hash Join / Nested-Loop Join**: local strategies, chosen by the planner
+- **Remote Join**: same-source joins pushed to the source as one query
+- **Semi-Join Pushdown** (a.k.a. dynamic filtering): send the build side's
   join keys to constrain the probe side and reduce data fetched — **not yet
   implemented; tracked as G9** and the top cross-source usability gap
-- ⏳ **Broadcast / Shuffle Join**: not yet implemented
+- **Broadcast / Shuffle Join**: not yet implemented
 
-### 3. Parallel Execution (⏳ not yet implemented)
+### 3. Parallel Execution (not yet implemented)
 - Fetch from multiple data sources in parallel
 - Pipeline operators where possible
 - Parallel hash join build/probe

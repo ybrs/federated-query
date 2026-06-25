@@ -8,23 +8,27 @@ This document breaks down the implementation into phases. Each phase builds on t
 
 | Phase | Status | Description | Tests |
 |-------|--------|-------------|-------|
-| **Phase 0** | ✅ Complete | Foundation and infrastructure | 50 tests |
-| **Phase 1** | ✅ Complete | Basic query execution (single-table SELECT) | 19 tests |
-| **Phase 2** | ✅ Complete | Joins and multi-table queries | 5 tests |
-| **Phase 3** | ✅ Complete | Aggregations and GROUP BY | 9 tests |
-| **Phase 4** | ✅ Complete | Pre-optimization and expression handling | 42 tests |
-| **Phase 5** | ✅ Complete | Statistics and cost model | 30 tests |
-| **Phase 6** | ✅ Substantially Complete | Logical optimization (pushdown, reordering) | 32 tests |
-| **Phase 7** | ✅ Complete | Decorrelation (subqueries) → SEMI/ANTI/LEFT joins | green |
-| **Phase 8** | ✅ Complete | Pushdown breadth, merge engine, set ops, dynamic filtering, LATERAL, CTEs (single + cross-source) | 809 passing |
-| **Phase 9** | ⏳ Not Started | General dependent-join decorrelation + cross-source subquery fallback (§9.6); parallel exec + memory mgmt | - |
-| **Phase 10** | ⏳ Not Started | Additional SQL features (window functions, date/time, FILTER, NATURAL/USING) | - |
-| **Phase 11** | ⏳ Not Started | Production readiness | - |
-| **Phase 12** | ⏳ Future | Advanced features (adaptive execution, caching) | - |
+| **Phase 0** | Complete | Foundation and infrastructure | 50 tests |
+| **Phase 1** | Complete | Basic query execution (single-table SELECT) | 19 tests |
+| **Phase 2** | Complete | Joins and multi-table queries | 5 tests |
+| **Phase 3** | Complete | Aggregations and GROUP BY | 9 tests |
+| **Phase 4** | Complete | Pre-optimization and expression handling | 42 tests |
+| **Phase 5** | Complete | Statistics and cost model | 30 tests |
+| **Phase 6** | Substantially Complete | Logical optimization (predicate/projection/limit pushdown, column pruning); join reordering deferred to Phase 10 | 48 tests |
+| **Phase 7** | Complete | Decorrelation (subqueries) → SEMI/ANTI/LEFT/LATERAL joins | green |
+| **Phase 8** | Complete | Pushdown breadth, merge engine, set ops, dynamic filtering, LATERAL, CTEs (single + cross-source), date/time + FILTER + NATURAL/USING | 809 passing |
+| **Phase 9** | Not Started | General dependent-join decorrelation + cross-source correlated-subquery fallback (cluster D) — the unnest machinery + tests, **before** the cost work | - |
+| **Phase 10** | Not Started | Cost-based optimization: cost-driven physical-plan selection, join reordering, broadcast join | - |
+| **Phase 11** | Not Started | Advanced execution: parallel fetch/join, memory mgmt + spill-to-disk, streaming/pipelining | - |
+| **Phase 12** | Not Started | Window functions + remaining SQL breadth | - |
+| **Phase 13** | Not Started | Production readiness (structured error codes, observability, tuning, benchmarks) | - |
+| **Phase 14** | Future | Advanced features (adaptive execution, result caching, more sources, write ops) | - |
 
-**Current Status**: Phases 0–8 complete (branch `phase8`), full suite **809 passing / 0 failed / 0 xfailed**. See `TODO-next.md` (live handoff), `pushdown-status.md` (pushdown capabilities), and `decorrelation-gaps.md` (remaining subquery gaps → Phase 9).
+**Current Status**: Phases 0–8 complete (branch `phase8`), full suite **809 passing / 0 failed / 0 xfailed** (re-verified 2026-06-25 against live Postgres). The live handoff, pushdown-capability matrix, and decorrelation-gap notes that used to live in `TODO-next.md` / `pushdown-status.md` / `decorrelation-gaps.md` are now merged into this file — see Phase 8 (delivered), Phase 9 (remaining decorrelation gaps), and the **Architecture Quick Map & Current Capabilities** appendix at the end.
 
-## Phase 0: Foundation ✅ COMPLETED
+> **Phase renumber note (2026-06-25):** what shipped under the "Phase 8" label was pushdown breadth + decorrelation + CTEs — *not* the original §8.1–8.5 "cost-based physical planning" plan. Cost-based plan selection turned out to be a phase of its own and now lives in **Phase 10** (with join reordering, which depends on it). The general dependent-join unnest machinery (old §9.6) is pulled forward to **Phase 9** because its cases and tests are prerequisites for cost-based planning. The old Phase 9 (parallel exec / memory) → Phase 11; old Phase 10 (SQL features) → Phase 12; old Phase 11/12 → Phase 13/14.
+
+## Phase 0: Foundation COMPLETED
 
 **Goal**: Set up project structure and basic infrastructure
 
@@ -36,7 +40,7 @@ This document breaks down the implementation into phases. Each phase builds on t
 - [x] Set up testing framework (pytest)
 - [x] Create development environment (Docker compose with PostgreSQL)
 
-**Deliverable**: ✅ Project skeleton with configuration loading
+**Deliverable**: Project skeleton with configuration loading
 
 **Notes**:
 - All 50 tests passing
@@ -47,7 +51,7 @@ This document breaks down the implementation into phases. Each phase builds on t
 
 ---
 
-## Phase 1: Basic Query Execution ✅ COMPLETED
+## Phase 1: Basic Query Execution COMPLETED
 
 **Goal**: Execute simple single-table queries on remote sources
 
@@ -58,7 +62,7 @@ This document breaks down the implementation into phases. Each phase builds on t
 All Phase 1 components have been successfully implemented with comprehensive test coverage.
 The system can now execute queries like: `SELECT col1, col2 FROM datasource.table WHERE col1 > 10 LIMIT 100`
 
-### 1.1 Parser and AST Conversion ✅
+### 1.1 Parser and AST Conversion (done)
 - [x] Integrate sqlglot parser (can parse SQL to AST)
 - [x] Create logical plan node base classes (Scan, Projection, Filter, Limit)
 - [x] Implement AST to logical plan converter (parser.py:ast_to_logical_plan)
@@ -69,7 +73,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
   - [x] Handle LIMIT clauses
 - [x] Test parser with various simple queries (4 tests passing)
 
-### 1.2 Catalog and Binder ✅
+### 1.2 Catalog and Binder (done)
 - [x] Implement catalog interface (Catalog class works)
 - [x] Create schema metadata classes (Table, Column, Type)
 - [x] Implement binder to resolve table/column references (binder.py:bind)
@@ -80,7 +84,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - [x] Support multi-schema (datasource.schema.table)
 - [x] Test binding with various table/column references (8 tests passing)
 
-### 1.3 Data Source Connectors ✅
+### 1.3 Data Source Connectors (done)
 - [x] Create DataSource abstract interface
 - [x] Implement PostgreSQL connector
   - [x] Connection pooling
@@ -93,7 +97,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
   - [x] Result fetching as Arrow tables
   - [x] Metadata discovery
 
-### 1.4 Basic Executor ✅
+### 1.4 Basic Executor (done)
 - [x] Create physical plan node base classes
 - [x] Implement physical scan operator (PhysicalScan.execute())
   - [x] Generate SQL from scan parameters
@@ -113,14 +117,14 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - [x] Create simple physical planner (logical to physical, 1:1 mapping)
 - [x] Executor infrastructure (calls plan.execute())
 
-### 1.5 Testing ✅
+### 1.5 Testing (done)
 - [x] Test single-table SELECT queries (7 end-to-end tests passing)
 - [x] Test WHERE clause execution
 - [x] Test column projection
 - [x] Test LIMIT execution
 - [x] Test end-to-end: SQL -> logical plan -> physical plan -> execution -> results
 
-**Deliverable**: ✅ Fully functional - can execute `SELECT col1, col2 FROM datasource.table WHERE col1 > 10 LIMIT 100`
+**Deliverable**: Fully functional - can execute `SELECT col1, col2 FROM datasource.table WHERE col1 > 10 LIMIT 100`
 
 **Implementation Notes**:
 - All physical operators stream results as Arrow RecordBatches for memory efficiency
@@ -147,18 +151,18 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 
 ## Phase 2: Joins and Multi-Table Queries
 
-**Status:** ✅ COMPLETED
+**Status:** COMPLETED
 **Goal**: Execute joins across data sources
 **Tests**: 5 join tests passing, 70 total tests
 **Completion Date**: Phase 2 completed
 
-### 2.1 Logical Plan - Joins ✅
+### 2.1 Logical Plan - Joins (done)
 - [x] Add Join logical plan node
 - [x] Support join types (INNER, LEFT, RIGHT, FULL, CROSS)
 - [x] Parse ON conditions and extract join predicates
 - [x] Handle multi-way joins
 
-### 2.2 Physical Join Operators ✅
+### 2.2 Physical Join Operators (done)
 - [x] Implement Hash Join
   - [x] Build hash table from right side
   - [x] Probe with left side
@@ -168,7 +172,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - [x] Implement cross-product handling
 - [x] Schema resolution for joins
 
-### 2.3 Join Strategy Selection (Basic) ✅
+### 2.3 Join Strategy Selection (Basic) (done)
 - [x] Choose join operator based on join type (Hash vs Nested Loop)
 - [x] Extract equi-join keys from conditions
 - [x] Physical planning for joins
@@ -177,7 +181,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - Data gathering and parallel fetching → **Phase 9, section 9.1**
 - Join pushdown to same datasource → **Phase 6, section 6.7**
 
-### 2.4 Testing ✅
+### 2.4 Testing (done)
 - [x] Test joins on same data source
 - [x] Test JOIN with WHERE clauses
 - [x] Test specific column selection in joins
@@ -185,7 +189,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - [x] Verify logical plan creation for joins
 - [x] Test federated join across PostgreSQL and DuckDB (example/query.py)
 
-**Deliverable**: ✅ Can execute `SELECT c.name, o.order_id, o.amount FROM customers c JOIN orders o ON c.id = o.customer_id WHERE o.amount > 100`
+**Deliverable**: Can execute `SELECT c.name, o.order_id, o.amount FROM customers c JOIN orders o ON c.id = o.customer_id WHERE o.amount > 100`
 
 **Implementation Summary**:
 - **Parser (federated_query/parser/parser.py:395-450)**: Converts sqlglot JOIN AST to logical Join nodes, extracts join conditions
@@ -200,13 +204,13 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 
 ---
 
-## Phase 3: Aggregations and Grouping ✅ COMPLETED
+## Phase 3: Aggregations and Grouping COMPLETED
 
-**Status:** ✅ FULLY COMPLETED
+**Status:** FULLY COMPLETED
 **Goal**: Support GROUP BY and aggregation functions
 **Tests**: 9/9 aggregation tests passing, 79 total tests
 
-### 3.1 Logical Plan - Aggregations ✅
+### 3.1 Logical Plan - Aggregations (done)
 - [x] Add Aggregate logical plan node
 - [x] Parse GROUP BY clauses (single and multiple columns)
 - [x] Parse aggregate functions (SUM, COUNT, AVG, MIN, MAX)
@@ -221,7 +225,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - [x] COUNT(*) support
 - [x] Schema inference for aggregate results
 
-### 3.3 Testing ✅
+### 3.3 Testing (done)
 - [x] Test simple aggregations (COUNT, SUM, AVG)
 - [x] Test GROUP BY with multiple columns
 - [x] Test global aggregations (without GROUP BY)
@@ -231,7 +235,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 
 **Note**: Aggregate pushdown optimization deferred to **Phase 6, section 6.8**
 
-**Deliverable**: ✅ Can execute `SELECT region, COUNT(*), AVG(amount) FROM orders GROUP BY region HAVING COUNT(*) > 2`
+**Deliverable**: Can execute `SELECT region, COUNT(*), AVG(amount) FROM orders GROUP BY region HAVING COUNT(*) > 2`
 
 **Implementation Notes**:
 - Parser converts sqlglot AggFunc nodes to FunctionCall expressions
@@ -259,13 +263,13 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 
 ---
 
-## Phase 4: Pre-Optimization and Expression Handling ✅ COMPLETED
+## Phase 4: Pre-Optimization and Expression Handling COMPLETED
 
-**Status:** ✅ FULLY COMPLETED
+**Status:** FULLY COMPLETED
 **Goal**: Simplify expressions and perform basic optimizations
 **Tests**: 42 new tests (33 expression rewriter + 9 optimization rules), 121 total tests passing
 
-### 4.1 Expression System ✅
+### 4.1 Expression System (done)
 - [x] Create expression node classes
   - [x] Literals, Column references
   - [x] Binary/Unary operators
@@ -274,7 +278,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - [x] Implement expression evaluator (via expression rewriter)
 - [x] Type inference for expressions
 
-### 4.2 Pre-Optimization Rules ✅
+### 4.2 Pre-Optimization Rules (done)
 - [x] Constant folding (`1 + 2` → `3`)
 - [x] Expression simplification
   - [x] `x AND TRUE` → `x`
@@ -286,14 +290,14 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - [x] Arithmetic simplification
 - [x] Null handling simplification (IS NULL, IS NOT NULL)
 
-### 4.3 Testing ✅
+### 4.3 Testing (done)
 - [x] Test constant folding (18 tests)
 - [x] Test expression simplification (13 tests)
 - [x] Test composite rewriter (2 tests)
 - [x] Test optimization rule on logical plans (9 tests)
 - [x] Test complex WHERE clauses
 
-**Deliverable**: ✅ Queries with complex expressions are simplified before execution
+**Deliverable**: Queries with complex expressions are simplified before execution
 
 **Implementation Summary**:
 - **ExpressionRewriter** (federated_query/optimizer/expression_rewriter.py): Base class and visitor pattern for expression transformation
@@ -320,20 +324,20 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 
 ---
 
-## Phase 5: Statistics and Cost Model ✅ COMPLETED
+## Phase 5: Statistics and Cost Model COMPLETED
 
-**Status:** ✅ FULLY COMPLETED
+**Status:** FULLY COMPLETED
 **Goal**: Implement statistics collection and cost estimation
 **Tests**: 30 comprehensive cost model tests, 154 total tests passing
 
-**Prerequisites**: ✅ Statistics infrastructure already exists:
+**Prerequisites**: Statistics infrastructure already exists:
 - TableStatistics and ColumnStatistics data classes (federated_query/datasources/base.py)
 - StatisticsCollector class with caching (federated_query/optimizer/statistics.py)
 - Both PostgreSQL and DuckDB implement get_table_statistics()
 - CostConfig with cost parameters (federated_query/config/config.py)
 - CostModel fully implemented (federated_query/optimizer/cost.py)
 
-### 5.1 Statistics Collection ✅
+### 5.1 Statistics Collection (done)
 - [x] Define statistics schema (TableStats, ColumnStats) - Already implemented
 - [x] Implement statistics collector infrastructure - Already implemented
   - [x] Row counts - Implemented in datasources
@@ -347,7 +351,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - Histogram collection for key columns
 - Most common values tracking
 
-### 5.2 Cost Model Implementation ✅
+### 5.2 Cost Model Implementation (done)
 - [x] Define cost model parameters (CPU, IO, Network costs) - Already in CostConfig
 - [x] Implement cost estimation for each operator
   - [x] Scan cost (IO + CPU + network costs)
@@ -363,7 +367,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
   - [x] Aggregate cardinality estimation
   - [x] Independence assumption for multiple predicates
 
-### 5.3 Selectivity Estimation ✅
+### 5.3 Selectivity Estimation (done)
 - [x] Implement selectivity for comparison operators
   - [x] Equality: `1 / num_distinct` (with bounds checking)
   - [x] Inequality (<, >, <=, >=): heuristic (default 0.33)
@@ -385,7 +389,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - [ ] Cost-based join strategy selection - DEFERRED to Phase 8
 - [ ] Annotate physical plans with costs - DEFERRED to Phase 8
 
-### 5.5 Testing ✅
+### 5.5 Testing (done)
 - [x] Test statistics collection from both PostgreSQL and DuckDB
 - [x] Test statistics caching and refresh logic
 - [x] Verify cost estimation for simple queries (scan, filter, project)
@@ -396,7 +400,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - [x] Test cost increases with cardinality
 - [x] Test complex multi-operator plans
 
-**Deliverable**: ✅ Fully functional cost model with cardinality and selectivity estimation
+**Deliverable**: Fully functional cost model with cardinality and selectivity estimation
 
 **Implementation Summary**:
 - **Cardinality Estimation** (federated_query/optimizer/cost.py:48-161):
@@ -442,23 +446,23 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 
 ## Phase 6: Logical Optimization
 
-**Status:** ✅ SUBSTANTIALLY COMPLETE
+**Status:** SUBSTANTIALLY COMPLETE
 **Goal**: Implement rule-based logical optimizations
 **Tests**: 32 tests passing, 186 total tests
 
-**Prerequisites**: ✅ Optimization infrastructure already exists:
+**Prerequisites**: Optimization infrastructure already exists:
 - OptimizationRule base class (federated_query/optimizer/rules.py)
 - RuleBasedOptimizer with rule application engine
 - ExpressionSimplificationRule (fully implemented in Phase 4)
 - Skeleton rules: PredicatePushdownRule, ProjectionPushdownRule, JoinReorderingRule
 
-### 6.1 Optimization Framework ✅
+### 6.1 Optimization Framework (done)
 - [x] Create optimization rule interface - Already implemented
 - [x] Implement rule application engine - Already implemented (RuleBasedOptimizer)
 - [x] Support multiple optimization passes with different rule sets - Implemented
 - [x] Add rule ordering and fixed-point iteration for cascading optimizations - Implemented
 
-### 6.2 Predicate Pushdown ✅
+### 6.2 Predicate Pushdown (done)
 - [x] Push filters through projections - Implemented
 - [x] Push filters to data sources (integrate with Scan node) - Implemented
 - [x] Merge adjacent filters - Implemented
@@ -472,7 +476,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - [ ] Convert filter expressions to SQL - Deferred to execution
 - [ ] Handle datasource capabilities - Deferred to execution
 
-### 6.3 Projection Pushdown ✅
+### 6.3 Projection Pushdown (done)
 - [x] Column analysis infrastructure - Implemented
   - [x] Analyze column usage throughout plan tree
   - [x] Extract columns from expressions (binary, unary, **function calls**)
@@ -483,7 +487,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - [ ] Push projections to data sources (SELECT only needed columns) - Deferred to execution
 - [ ] Eliminate redundant projections - Deferred
 
-### 6.4 Join Reordering ⏳
+### 6.4 Join Reordering (pending)
 - [ ] Implement dynamic programming for small join graphs (< 10 tables)
   - [ ] Build all valid join trees
   - [ ] Use cost model to select best tree
@@ -495,17 +499,17 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - [ ] Preserve join semantics (left/right outer joins must maintain order)
 - [ ] Handle cross joins (Cartesian products)
 
-**Note**: Join reordering requires Phase 5 cost model integration and is deferred
+**Note**: Join reordering requires Phase 5 cost model integration → moved to **Phase 10** (Cost-Based Optimization)
 
-### 6.5 Limit Pushdown ✅
+### 6.5 Limit Pushdown (done)
 - [x] Push LIMIT through projections - Implemented
 - [x] **FIXED**: Do NOT push LIMIT through filters (changes semantics) - Implemented
 - [x] Handle LIMIT with offset - Implemented
 - [x] Cannot push LIMIT through joins (in general) - Implemented
 - [x] Cannot push LIMIT through aggregations - Implemented
-- [ ] Top-N optimization (LIMIT + ORDER BY) - Deferred to Phase 10
+- [x] Top-N optimization (LIMIT + ORDER BY) - Delivered in Phase 8 (folded onto the scan / pushed as `ORDER BY … LIMIT`)
 
-### 6.6 Other Optimizations ⏳
+### 6.6 Other Optimizations (pending)
 - [ ] Redundant join elimination (using foreign key constraints)
 - [ ] Self-join elimination
 - [ ] Common subexpression elimination (CSE)
@@ -514,32 +518,37 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 
 **Note**: These are advanced optimizations, deferred for now
 
-### 6.7 Join Pushdown (from Phase 2, section 2.4) ⏳
-- [ ] Detect when join can be pushed to single data source
-  - [ ] Both tables on same datasource
-  - [ ] No incompatible operations between tables
-- [ ] Implement remote join pushdown
-  - [ ] Generate SQL for entire join subplan
-  - [ ] Execute on remote datasource
-  - [ ] Replace local join with remote scan
+### 6.7 Join Pushdown (from Phase 2, section 2.4) (done)
+- [x] Detect when join can be pushed to single data source
+  - [x] Both tables on same datasource
+  - [x] No incompatible operations between tables
+- [x] Implement remote join pushdown
+  - [x] Generate SQL for entire join subplan
+  - [x] Execute on remote datasource
+  - [x] Replace local join with remote scan
 
-**Note**: Requires SQL generation infrastructure, deferred
+**Note**: Delivered in Phase 8 via `optimizer/single_source_pushdown.py`
+(`SingleSourcePushdown.try_build` → `PhysicalRemoteQuery`) — pushes the largest
+same-source subtree (all join shapes incl. SEMI/ANTI/LEFT) as one remote query.
 
-### 6.8 Aggregate Pushdown (from Phase 3, section 3.3) ⏳
-- [ ] Detect when aggregation can be pushed to data source
-  - [ ] Single table aggregation → full pushdown
-  - [ ] Post-join aggregation → consider pushdown if join is pushed
-- [ ] Implement partial aggregation strategy
+### 6.8 Aggregate Pushdown (from Phase 3, section 3.3) (partial-aggregation split deferred)
+- [x] Detect when aggregation can be pushed to data source
+  - [x] Single table aggregation → full pushdown
+  - [x] Post-join aggregation → pushed when the whole join+aggregate is single-source
+- [ ] Implement partial aggregation strategy → moved to **Phase 10** (cost-based)
   - [ ] Partial aggregate on each source (local aggregation)
   - [ ] Final aggregate locally (combine partial results)
   - [ ] Works for SUM, COUNT, MIN, MAX (not AVG directly)
-- [ ] Handle DISTINCT aggregates
+- [ ] Handle DISTINCT aggregates → moved to **Phase 10**
   - [ ] COUNT(DISTINCT) requires special handling
   - [ ] May need to fetch distinct values then count locally
 
-**Note**: Requires SQL generation infrastructure, deferred
+**Note**: Single-source aggregate pushdown delivered in Phase 8. Cross-source
+*partial* aggregation (push partials to each source, combine locally) is a
+cost-driven choice and is deferred to Phase 10; today a cross-source aggregate
+runs in the merge engine after materializing its inputs.
 
-### 6.9 Testing ✅
+### 6.9 Testing (done)
 - [x] Test each optimization rule independently - 48 tests passing
 - [x] **NEW**: Test optimization bug fixes - 7 tests (test_optimization_bugs.py)
 - [x] **NEW**: Test additional optimization bugs - 20 tests (test_optimization_bugs_additional.py)
@@ -568,7 +577,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - [ ] Benchmark query performance improvement - Deferred
 - [ ] Compare optimized vs unoptimized execution times - Deferred
 
-**Deliverable**: ✅ **Substantially Complete** - Core optimization rules (predicate, projection, limit pushdown + join filter pushdown + column pruning) implemented with 48 comprehensive tests, all 10 critical bugs fixed
+**Deliverable**: **Substantially Complete** - Core optimization rules (predicate, projection, limit pushdown + join filter pushdown + column pruning) implemented with 48 comprehensive tests, all 10 critical bugs fixed
 
 **Implementation Summary**:
 - **PredicatePushdownRule** (federated_query/optimizer/rules.py:47-275):
@@ -626,80 +635,204 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 
 ---
 
-## Phase 7: Decorrelation (Week 11)
+## Phase 7: Decorrelation (Week 11) COMPLETED
+
+**Status:** COMPLETE — pattern-based decorrelation in
+`optimizer/decorrelation.py`. Recognized subquery shapes become flat joins;
+unsupported shapes **fail fast** with `DecorrelationError` (never wrong answers).
+The remaining general-fallback work is Phase 9.
 
 **Goal**: Remove correlated subqueries
 
-### 7.1 Subquery Support
-- [ ] Add Subquery logical plan node
-- [ ] Parse scalar subqueries
-- [ ] Parse EXISTS/NOT EXISTS
-- [ ] Parse IN/NOT IN with subqueries
-- [ ] Parse ANY/ALL
+### 7.1 Subquery Support (done)
+- [x] Add Subquery logical plan node
+- [x] Parse scalar subqueries
+- [x] Parse EXISTS/NOT EXISTS
+- [x] Parse IN/NOT IN with subqueries
+- [x] Parse ANY/ALL
 
-### 7.2 Decorrelation Transforms
-- [ ] Detect correlated columns
-- [ ] Transform EXISTS to SEMI JOIN
-- [ ] Transform NOT EXISTS to ANTI JOIN
-- [ ] Transform IN to SEMI JOIN
-- [ ] Convert scalar subqueries to LEFT OUTER JOIN
-- [ ] Handle ANY/ALL with aggregations
+### 7.2 Decorrelation Transforms (done)
+- [x] Detect correlated columns
+- [x] Transform EXISTS to SEMI JOIN
+- [x] Transform NOT EXISTS to ANTI JOIN
+- [x] Transform IN to SEMI JOIN (with exact three-valued NULL semantics for NOT IN)
+- [x] Convert scalar subqueries to LEFT OUTER JOIN (keyed aggregate + cardinality guard)
+- [x] Handle ANY/ALL with aggregations
 
-### 7.3 Testing
-- [ ] Test correlated subqueries before/after decorrelation
-- [ ] Verify correctness of transformations
-- [ ] Test nested subqueries
-- [ ] Performance comparison
+### 7.3 Testing (done)
+- [x] Test correlated subqueries before/after decorrelation (`tests/e2e_decorrelation/`)
+- [x] Verify correctness of transformations
+- [x] Test nested subqueries
+- [x] Fail-fast tests for every unsupported shape (`test_error_cases.py`)
 
 **Deliverable**: Efficient execution of queries with subqueries
 
 ---
 
-## Phase 8: Physical Planning and Join Strategies (Week 12-13)
+## Phase 8: Pushdown Breadth, Decorrelation & Merge Engine COMPLETED
 
-**Goal**: Generate multiple physical plans and choose the best
+**Status:** COMPLETE — full suite **809 passing / 0 failed / 0 xfailed**.
 
-### 8.1 Physical Plan Generation
-- [ ] Create physical plan generator
-- [ ] Enumerate join strategies for each join
-  - [ ] Hash join (left/right build)
-  - [ ] Nested loop join
-  - [ ] Broadcast join
-- [ ] Enumerate scan strategies
-  - [ ] Remote scan
-  - [ ] Remote scan with filters
-  - [ ] Cached scan
+> **Scope note:** the original §8.1–8.5 plan ("generate multiple physical plans
+> and choose the best") was cost-based physical planning. That turned out to be a
+> phase of its own and has moved to **Phase 10**. What actually shipped here is
+> pushdown breadth + decorrelation coverage + CTEs + the merge engine, captured
+> below. The core principle delivered is **"No Subqueries in the Physical Plan"**:
+> decorrelation produces a flat join plan and single-source pushdown renders it as
+> SQL joins — never a re-correlated `EXISTS`/`IN`/scalar `(SELECT …)`.
 
-### 8.2 Broadcast Join
-- [ ] Implement broadcast operator
-- [ ] Detect when to use broadcast (small table)
-- [ ] Handle multiple broadcasts efficiently
-- [ ] Memory management for broadcasted data
+### 8.1 Single-source pushdown (largest same-source subtree → one remote query) (done)
+The planner tries, top-down, to render the largest same-source subtree as one
+remote SQL query via `optimizer/single_source_pushdown.py`
+(`SingleSourcePushdown.try_build` → `PhysicalRemoteQuery`). What pushes:
+- [x] Filters (`WHERE`) and projections (column pruning), incl. computed
+      projections (`UPPER`, `||`, `*`, `CASE`, `CAST`).
+- [x] Aggregates + `GROUP BY` + `HAVING`.
+- [x] Joins of every shape — N-way, `FULL OUTER`, self-joins, non-equi / `OR` /
+      computed conditions, and the `SEMI`/`ANTI`/`LEFT` joins decorrelation
+      produces. No subquery expression is ever re-created in the pushed SQL.
+- [x] Derived tables (`FROM (SELECT …) AS t`), same-source `LATERAL`, and set
+      operations (`UNION`/`INTERSECT`/`EXCEPT`) as a subquery body.
+- [x] CTEs (`WITH`, incl. `RECURSIVE`) — a same-source `WITH` pushed whole.
+- [x] `ORDER BY` / `LIMIT` (incl. Top-N folded onto a scan).
 
-### 8.3 Remote Pushdown Planning
-- [ ] Detect subplans that can execute on single source
-- [ ] Generate SQL for pushed-down subplans
-- [ ] Handle data source capabilities
-- [ ] Fallback when pushdown not possible
+### 8.2 Decorrelation coverage (pattern-based) (done)
+- [x] `EXISTS`/`NOT EXISTS` → SEMI/ANTI; `IN`/`NOT IN` (incl. tuple IN) with exact
+      three-valued NULL semantics; `ANY`/`SOME`/`ALL`.
+- [x] Correlated & uncorrelated scalar subqueries → LEFT join to a keyed aggregate
+      (+ COALESCE for COUNT, runtime cardinality guard).
+- [x] Correlated `ORDER BY … LIMIT n` (pick-one / latest-per-key) → LEFT join +
+      order-aware `GroupedLimit` (pushed to the merge engine as
+      `ROW_NUMBER() OVER (PARTITION BY …)`).
+- [x] Value/scalar bodies topped by `Filter` (HAVING) or `Sort` (ORDER BY/LIMIT)
+      peel (uncorrelated). *(old gap A)*
+- [x] Set-operation subquery body binds & decorrelates. *(old gap B)*
+- [x] Non-equality correlation through an aggregate/limit → `LateralJoin`
+      (dependent join); user-written `LATERAL` supported; cross-source LATERAL
+      runs in the merge engine with domain reduction.
 
-### 8.4 Plan Selection
-- [ ] Estimate cost for each physical plan
-- [ ] Choose minimum cost plan
-- [ ] Implement plan comparison and ranking
+### 8.3 Merge engine for cross-source set work (done)
+Each operator materializes inputs as Arrow once, registers them, and runs SQL in
+an in-memory DuckDB (`executor/merge_engine.py`) — never hand-rolled Python loops.
+- [x] `PhysicalHashJoin` / `PhysicalNestedLoopJoin` (all shapes) with cross-source
+      **dynamic filtering / semi-join reduction** (build-side keys pushed into the
+      probe as `IN`/range).
+- [x] `PhysicalHashAggregate`, `PhysicalSort`, `PhysicalUnion`,
+      `PhysicalSetOperation`, `PhysicalGroupedLimit` (per-key limit as a window).
+- [x] `PhysicalLateralJoin` (cross-source dependent join, domain reduction) and
+      `PhysicalCTE` / `PhysicalCTEScan` / `PhysicalCTEMergeQuery` (cross-source
+      CTEs: materialize-once producer, or whole-`WITH` recursion in the engine).
+- [x] Python paths remain only as a no-engine fallback or for genuinely
+      un-renderable expressions (e.g. `SUM(a*b)` in a `GROUP BY` key) — sound
+      degradations, not the default.
 
-### 8.5 Testing
-- [ ] Test physical plan generation
-- [ ] Verify join strategy selection
-- [ ] Test broadcast join with small tables
-- [ ] Benchmark different strategies
+### 8.4 Additional SQL surface delivered here (done)
+- [x] Date/time pushdown (G6): `EXTRACT`, `DATE_TRUNC`, `INTERVAL`, `AGE`,
+      `CURRENT_DATE`.
+- [x] Aggregate `FILTER (WHERE …)` and `NATURAL` / `USING` join pushdown (G7).
 
-**Deliverable**: Best physical plan selected based on cost model
+### 8.5 Testing (done)
+- [x] `tests/e2e_pushdown/test_subqueries.py` asserts the join shape + a global
+      no-subquery-expression invariant (`_assert_no_subquery_expressions`).
+- [x] `tests/e2e_decorrelation/` green; per-operator merge-engine parity tests.
+- [x] Cross-source LATERAL & CTE suites (`test_cross_source_lateral.py`,
+      `test_cross_source_ctes.py`).
+
+**Deliverable**: A subquery-free physical plan, uniform single-source pushdown
+of joins/aggregates/CTEs/set-ops, and a merge engine for all cross-source work.
 
 ---
 
-## Phase 9: Advanced Execution Features
+## Phase 9: General Dependent-Join Decorrelation + Cross-Source Correlated Fallback
 
-**Status:** ⏳ NOT STARTED
+**Status:** NOT STARTED — **next phase; lands before the cost work (Phase 10)**
+because its cases and tests are the machinery cost-based planning builds on.
+
+**Goal**: Move from pattern-based decorrelation (fast paths per recognized shape)
+to a **general dependent join** (Neumann & Kemper, *"Unnesting Arbitrary Queries"*,
+2015): emit a dependent join, then push it down with algebraic rules until the
+correlation disappears. The pattern fast-paths stay as optimizations; the general
+fallback removes every "unsupported shape" fail-fast and guarantees a
+subquery-free physical plan unconditionally. **Physical subquery planning stays a
+last resort** — ideally never reached.
+
+### 9.1 General dependent join
+- [ ] Implement the general dependent join + algebraic push-down rules.
+- [ ] Keep the pattern fast-paths; route only un-flattenable shapes to the fallback.
+
+### 9.2 Subsume the remaining fail-fast gaps
+Each raises `DecorrelationError` today (never a wrong answer) and has a test in
+`tests/e2e_decorrelation/test_error_cases.py`:
+- [ ] Skip-level correlation (references a relation 2+ levels up) — `test_skip_level_correlation`
+- [ ] Subquery in `GROUP BY` / aggregate-argument position — `test_subquery_in_group_by`
+- [ ] `OFFSET` in a correlated subquery — `test_offset_in_correlated_subquery`
+- [ ] Multi-column scalar / quantified subquery — `test_quantified_comparison_multi_column_subquery`
+- [ ] `SELECT *` value subquery — `test_select_star_value_subquery`
+- [ ] Subquery in a non-INNER join `ON`; multi-row `VALUES` subquery; two
+      correlation equalities over a global (ungrouped) aggregate — guarded in
+      `decorrelation.py`, no dedicated test yet
+
+### 9.3 Cross-source correlated-subquery fallback (old "cluster D")
+- [ ] A correlated subquery that can't decorrelate same-source falls back to the
+      cross-source dependent-join path, reusing the LATERAL / CTE
+      materialize-and-register + domain-reduction machinery (`PhysicalLateralJoin`,
+      `PhysicalCTE*`).
+- [ ] **Build the missing test scaffold first**: the `multi_source_env` fixture
+      lacks the tables `test_cross_datasource_subquery_fallback` names — add the
+      fixture + tests before the implementation.
+
+**Deliverable**: No correlated subquery is ever left un-unnested; cross-source
+correlated subqueries execute via the dependent-join fallback.
+
+---
+
+## Phase 10: Cost-Based Optimization
+
+**Status:** NOT STARTED — the real "choose the best physical plan" work
+(originally mis-scoped as Phase 8 §8.1–8.5). Bigger than first thought; depends on
+the Phase 5 cost model and the Phase 9 machinery/tests.
+
+**Goal**: Generate candidate physical plans and choose the minimum-cost one;
+reorder joins and pick join strategies using the cost model.
+
+### 10.1 Physical plan generation & selection
+- [ ] Physical plan generator that enumerates candidates (not 1:1 logical→physical).
+- [ ] Enumerate join strategies per join: hash (left/right build), nested-loop,
+      broadcast.
+- [ ] Enumerate scan strategies: remote scan, remote scan + filters, cached scan.
+- [ ] Estimate cost per candidate (Phase 5 cost model) and choose the minimum;
+      plan comparison + ranking.
+
+### 10.2 Join reordering (needs the cost model)
+- [ ] DP for small join graphs (<10 tables): build valid join trees, cost them,
+      memoize. *(`JoinReorderingRule` currently `raise NotImplementedError()` and
+      is not registered in any pipeline — wire it once the cost integration lands.)*
+- [ ] Greedy heuristic for large graphs (≥10 tables) using Phase 5 cardinality.
+- [ ] Preserve join semantics (outer-join order); handle cross joins.
+
+### 10.3 Broadcast join
+- [ ] Implement a broadcast operator (no `PhysicalBroadcastJoin` exists yet despite
+      the CLAUDE.md reference).
+- [ ] Detect when to broadcast (small build side); handle multiple broadcasts;
+      memory management for broadcast data.
+
+### 10.4 Cost-driven aggregate pushdown
+- [ ] Partial aggregation split (partial on each source → combine locally) for
+      SUM/COUNT/MIN/MAX; `COUNT(DISTINCT)` handling. *(carried from Phase 6.8.)*
+
+### 10.5 Testing
+- [ ] Test physical-plan generation & min-cost selection.
+- [ ] Verify join-strategy selection and reordering on 3–5 table joins.
+- [ ] Benchmark different strategies (note: engine is I/O-bound — validate that
+      cost-based selection actually moves wall-clock before over-investing).
+
+**Deliverable**: Best physical plan selected based on the cost model.
+
+---
+
+## Phase 11: Advanced Execution Features
+
+**Status:** NOT STARTED
 **Goal**: Improve execution performance with parallel execution and advanced memory management
 
 **Prerequisites**:
@@ -707,7 +840,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - Join operators from Phase 2 (working)
 - Aggregation operators from Phase 3 (working)
 
-### 9.1 Data Gathering (from Phase 2, section 2.3)
+### 11.1 Data Gathering (from Phase 2, section 2.3)
 - [ ] Implement Gather operator (fetch remote data into local execution)
   - [ ] Fetch data from datasource as Arrow batches
   - [ ] Support streaming (don't materialize all at once)
@@ -720,7 +853,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
   - [ ] Configurable batch size
   - [ ] Lazy evaluation where possible
 
-### 9.2 Parallel Execution
+### 11.2 Parallel Execution
 - [ ] Parallel data fetching from multiple sources (expand 9.1)
 - [ ] Parallel hash join build
   - [ ] Parallelize hash table construction
@@ -730,7 +863,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
   - [ ] Work-stealing scheduler
   - [ ] Avoid thread contention
 
-### 9.3 Memory Management
+### 11.3 Memory Management
 - [ ] Track memory usage per operator
   - [ ] Monitor hash table sizes
   - [ ] Monitor buffer sizes
@@ -748,7 +881,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
   - [ ] Per-operator memory limits
   - [ ] Graceful degradation when limits hit
 
-### 9.4 Streaming and Pipelining
+### 11.4 Streaming and Pipelining
 - [ ] Implement batched iteration (Arrow record batches) - Already partially done
 - [ ] Pipeline compatible operators
   - [ ] Identify pipeline breakers (sort, hash join build, aggregate)
@@ -757,7 +890,7 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
   - [ ] Streaming for pre-sorted inputs
   - [ ] Hybrid hash/streaming aggregate
 
-### 9.5 Testing
+### 11.5 Testing
 - [ ] Test Gather operator with various table sizes
 - [ ] Test parallel fetching from multiple datasources
 - [ ] Test parallel execution correctness (results match sequential)
@@ -768,85 +901,68 @@ The system can now execute queries like: `SELECT col1, col2 FROM datasource.tabl
 - [ ] Benchmark with and without spilling
 - [ ] Stress test with very large datasets
 
-### 9.6 General dependent-join decorrelation + cross-source subquery fallback
-
-Detailed plan and the precise remaining gaps live in `decorrelation-gaps.md`.
-Today decorrelation is **pattern-based**: recognized subquery shapes become
-SEMI/ANTI/LEFT joins, LATERAL dependent joins, or pushed CTEs; everything else
-**fails fast** with `DecorrelationError` (never wrong answers). Phase 9 adds the
-general fallback so nothing is left un-unnested.
-
-- [ ] Implement a general **dependent join** (Neumann & Kemper 2015): emit the
-      dependent join, push it down algebraically until the correlation vanishes.
-- [ ] Subsume the remaining fail-fast gaps (each has a test in
-      `tests/e2e_decorrelation/test_error_cases.py`):
-  - [ ] Skip-level correlation (references a relation 2+ levels up)
-  - [ ] Subquery in `GROUP BY` / aggregate-argument position
-  - [ ] `OFFSET` in a correlated subquery
-  - [ ] Multi-column scalar / quantified subquery; `SELECT *` value subquery
-  - [ ] Subquery in a non-INNER join `ON`; multi-row `VALUES` subquery
-  - [ ] Two correlation equalities over a global (ungrouped) aggregate
-- [ ] **Cross-source correlated-subquery fallback** (old "cluster D"): a
-      correlated subquery that can't decorrelate same-source falls back to the
-      cross-source dependent-join path, reusing the LATERAL / CTE
-      materialize-and-register + domain-reduction machinery
-      (`PhysicalLateralJoin`, `PhysicalCTE*`). Needs a `multi_source_env` fixture
-      + tests.
+> Note: general dependent-join decorrelation + cross-source correlated-subquery
+> fallback (the old §9.6) moved **up** to **Phase 9** — it precedes the cost work.
 
 **Deliverable**: Production-ready parallel execution engine with robust memory management
 
 ---
 
-## Phase 10: Additional SQL Features (Week 15)
+## Phase 12: Window Functions + Remaining SQL Breadth (Week 15)
 
-**Goal**: Support more SQL features
+**Goal**: Close the remaining SQL surface. Most of this phase's original scope
+(sorting, set ops, CTEs, date/time, FILTER, NATURAL/USING) shipped in Phase 8;
+**user-facing window functions are the only real gap left.**
 
-### 10.1 Sorting
-- [ ] Add Sort logical/physical plan nodes
-- [ ] Implement sort operator (external sort if needed)
-- [ ] Push ORDER BY to data sources
-- [ ] Combine with LIMIT for Top-N optimization
+### 12.1 Sorting (delivered in Phase 8)
+- [x] Add Sort logical/physical plan nodes
+- [x] Implement sort operator (external sort handled by the merge engine / DuckDB)
+- [x] Push ORDER BY to data sources
+- [x] Combine with LIMIT for Top-N optimization
 
-### 10.2 Set Operations
-- [ ] Support UNION / UNION ALL
-- [ ] Support INTERSECT
-- [ ] Support EXCEPT
-- [ ] Implement as hash-based operators
+### 12.2 Set Operations (delivered in Phase 8)
+- [x] Support UNION / UNION ALL
+- [x] Support INTERSECT
+- [x] Support EXCEPT
+- [x] Implemented via the merge engine (`PhysicalUnion` / `PhysicalSetOperation`)
 
-### 10.3 Window Functions
-- [ ] Parse window functions
+### 12.3 Window Functions (the remaining gap)
+- [ ] Parse window functions (user-facing; `ROW_NUMBER()` is used internally for
+      `GroupedLimit` but window functions are not yet a user feature —
+      `test_windowed_subquery_not_supported` currently fails fast)
 - [ ] Add Window logical/physical plan nodes
 - [ ] Implement window function evaluation
 - [ ] Push to data sources when possible
 
-### 10.4 CTEs (Common Table Expressions)
-- [ ] Parse WITH clauses
-- [ ] Implement CTE evaluation strategies
-  - [ ] Inline small CTEs
-  - [ ] Materialize large CTEs
-- [ ] Handle recursive CTEs (future)
+### 12.4 CTEs (Common Table Expressions) (delivered in Phase 8)
+- [x] Parse WITH clauses
+- [x] CTE evaluation strategies
+  - [x] Inline / push same-source CTEs as one remote `WITH`
+  - [x] Materialize-once producer for cross-source CTEs
+- [x] Handle recursive CTEs (`WITH RECURSIVE`, incl. cross-source via the merge engine)
 
-### 10.5 Testing
-- [ ] Test ORDER BY with various expressions
-- [ ] Test set operations
+### 12.5 Testing
+- [x] Test ORDER BY with various expressions
+- [x] Test set operations
 - [ ] Test window functions
-- [ ] Test CTEs
+- [x] Test CTEs (`test_ctes.py`, `test_cross_source_ctes.py`)
 
-**Deliverable**: Support for advanced SQL features
+**Deliverable**: Window-function support; all other advanced SQL surface already
+shipped in Phase 8.
 
 ---
 
-## Phase 11: Production Readiness (Week 16)
+## Phase 13: Production Readiness (Week 16)
 
 **Goal**: Make the engine production-ready
 
-### 11.1 Error Handling
+### 13.1 Error Handling
 - [ ] Comprehensive error messages
 - [ ] Graceful degradation
 - [ ] Connection retry logic
 - [ ] Transaction rollback on errors
 
-#### 11.1.1 Structured error codes (`error_codes.md`)
+#### 13.1.1 Structured error codes (`error_codes.md`)
 **Goal**: Every engine error carries a stable, numbered code so a failure can be
 pinpointed to its origin instead of surfacing as "error: <free text>". Mirrors
 how real databases do it — MySQL numeric codes (e.g. `ER_DUP_FIELDNAME 1060`) +
@@ -883,13 +999,13 @@ already fixed, so it gets no code retroactively — it is the motivating example
 for why this scheme is needed. When implemented, that class of datasource
 result-decoding error would live in the `6xxx` bucket.
 
-### 11.2 Logging and Observability
+### 13.2 Logging and Observability
 - [ ] Structured logging
 - [ ] Query plan logging (EXPLAIN)
 - [ ] Execution statistics
 - [ ] Performance metrics (latency, throughput)
 
-### 11.3 Configuration and Tuning
+### 13.3 Configuration and Tuning
 - [ ] Expose tuning parameters
   - [ ] Memory limits
   - [ ] Parallelism degree
@@ -897,19 +1013,19 @@ result-decoding error would live in the `6xxx` bucket.
 - [ ] Configuration validation
 - [ ] Environment variable support
 
-### 11.4 Documentation
+### 13.4 Documentation
 - [ ] API documentation
 - [ ] Configuration guide
 - [ ] Query optimization guide
 - [ ] Examples and tutorials
 
-### 11.5 Performance Testing
+### 13.5 Performance Testing
 - [ ] Create benchmark suite
 - [ ] TPC-H style queries
 - [ ] Measure and optimize hot paths
 - [ ] Profiling and optimization
 
-### 11.6 Testing
+### 13.6 Testing
 - [ ] Integration tests for all features
 - [ ] Edge case tests
 - [ ] Stress tests
@@ -919,51 +1035,54 @@ result-decoding error would live in the `6xxx` bucket.
 
 ---
 
-## Phase 12: Advanced Features (Future)
+## Phase 14: Advanced Features (Future)
 
 **Goal**: Advanced optimizations and features
 
-### 12.1 Adaptive Query Execution
+### 14.1 Adaptive Query Execution
 - [ ] Collect runtime statistics
 - [ ] Re-optimize during execution
 - [ ] Switch join strategies dynamically
 
-### 12.2 Query Result Caching
+### 14.2 Query Result Caching
 - [ ] Cache small query results
 - [ ] Cache invalidation strategy
 - [ ] Materialized views
 
-### 12.3 More Data Sources
+### 14.3 More Data Sources
 - [ ] MySQL connector
 - [ ] SQLite connector
 - [ ] REST API connector
 - [ ] CSV/Parquet file connector
 
-### 12.4 Write Operations
+### 14.4 Write Operations
 - [ ] INSERT support
 - [ ] UPDATE support
 - [ ] DELETE support
 - [ ] Distributed transactions (2PC)
 
-### 12.5 Advanced Optimizations
-- [ ] Semi-join pushdown (reduce data transfer)
+### 14.5 Advanced Optimizations
+- [x] Semi-join pushdown (reduce data transfer) — delivered in Phase 8 (build-side
+      keys pushed into the probe as `IN`/range)
 - [ ] Bloom filter pushdown
-- [ ] Dynamic filter pushdown
+- [x] Dynamic filter pushdown — delivered in Phase 8 (cross-source dynamic filtering)
 - [ ] Query compilation (LLVM)
 
 ---
 
 ## Milestones
 
-1. **Milestone 1** ✅ COMPLETED (Phase 1): Single-table queries work
-2. **Milestone 2** ✅ COMPLETED (Phase 2): Joins across data sources work
-3. **Milestone 3** ✅ COMPLETED (Phase 3): Aggregations work
-4. **Milestone 4** ✅ COMPLETED (Phase 4): Expression optimization work
-5. **Milestone 5** ✅ COMPLETED (Phase 5): Cost model and statistics collection
-6. **Milestone 6** ⏳ PLANNED (Phase 6): Logical optimization pipeline (pushdown, reordering)
-7. **Milestone 7** ⏳ PLANNED (Phase 7-8): Cost-based physical planning
-8. **Milestone 8** ⏳ PLANNED (Phase 9): Advanced execution with parallelism
-9. **Milestone 9** ⏳ PLANNED (Phase 10-11): Production-ready with full SQL support
+1. **Milestone 1** COMPLETED (Phase 1): Single-table queries work
+2. **Milestone 2** COMPLETED (Phase 2): Joins across data sources work
+3. **Milestone 3** COMPLETED (Phase 3): Aggregations work
+4. **Milestone 4** COMPLETED (Phase 4): Expression optimization work
+5. **Milestone 5** COMPLETED (Phase 5): Cost model and statistics collection
+6. **Milestone 6** COMPLETED (Phase 6): Logical optimization pipeline (predicate/projection/limit pushdown, column pruning)
+7. **Milestone 7** COMPLETED (Phase 7–8): Decorrelation + uniform single-source pushdown + merge engine + CTEs ("No Subqueries in the Physical Plan")
+8. **Milestone 8** PLANNED (Phase 9): General dependent-join decorrelation + cross-source correlated-subquery fallback
+9. **Milestone 9** PLANNED (Phase 10): Cost-based physical planning (plan selection, join reordering, broadcast)
+10. **Milestone 10** PLANNED (Phase 11): Advanced execution with parallelism + memory management
+11. **Milestone 11** PLANNED (Phase 12–13): Window functions + production readiness
 
 ---
 
@@ -996,3 +1115,85 @@ result-decoding error would live in the `6xxx` bucket.
 ---
 
 This task breakdown provides a clear roadmap from basic functionality to a production-ready federated query engine. Each phase builds on the previous one, with clear deliverables and testing requirements.
+
+---
+
+# Appendix: Architecture Quick Map & Current Capabilities
+
+*(Merged 2026-06-25 from the former `TODO-next.md`, `pushdown-status.md`, and
+`decorrelation-gaps.md` handoff docs — this is now the single source of truth.)*
+
+## Pipeline
+
+`processor/query_executor.py::_plan_pipeline`:
+**preprocess → parse → bind → decorrelate → optimize → physical plan.**
+
+- **Decorrelation** — `optimizer/decorrelation.py` (pattern-based; emits
+  SEMI/ANTI/LEFT/LATERAL joins; fail-fast `DecorrelationError` on unsupported
+  shapes). The general dependent-join fallback is Phase 9.
+- **Single-source pushdown** — `optimizer/single_source_pushdown.py`, invoked by
+  `optimizer/physical_planner.py::_plan_node` via `try_build` (top-down). Renders
+  the largest same-source subtree as one `PhysicalRemoteQuery`.
+- **Merge engine** — `executor/merge_engine.py` (in-memory DuckDB). Each
+  cross-source operator materializes inputs as Arrow once, registers them, runs
+  SQL. `MergeEngine.schema(sql, inputs)` reads the Arrow reader schema (do **not**
+  use a `LIMIT 0` probe — it yields zero batches and an empty schema).
+- Remote SQL is built as a string then re-parsed via `datasource.parse_query` for
+  the EXPLAIN document; on execution it is re-rendered to the source dialect.
+
+## Pushdown capability matrix
+
+**Pushes to a single source (one remote query):** filters; projections incl.
+computed; aggregates + GROUP BY + HAVING; joins of every shape incl.
+SEMI/ANTI/LEFT from decorrelation (no subquery expression re-created); derived
+tables; same-source LATERAL; set operations as a subquery body; CTEs incl.
+RECURSIVE; ORDER BY / LIMIT incl. Top-N folded onto a scan; date/time functions;
+aggregate FILTER; NATURAL/USING joins.
+
+**Runs locally in the merge engine (cross-source):** hash / nested-loop joins
+(all shapes) with dynamic filtering / semi-join reduction; hash aggregate; sort;
+union; set operation; per-key grouped limit (window); cross-source LATERAL
+(dependent join with domain reduction); cross-source CTEs (materialize-once
+producer / whole-`WITH` recursion). Python row-loops remain only as a no-engine
+fallback or for genuinely un-renderable expressions.
+
+**Not yet pushed / out of scope:** see Phase 9 (dependent-join gaps + cross-source
+correlated fallback), Phase 10 (cost-based plan selection, join reordering,
+partial aggregation), Phase 12 (window functions).
+
+## Decorrelation north star & remaining gaps
+
+**North star:** the logical phase should fully unnest every subquery so the
+physical planner never sees a subquery expression — a flat relational plan
+(scans, joins incl. semi/anti, aggregates, set ops), exactly the shape DuckDB
+feeds its executor. Reference: Neumann & Kemper, *"Unnesting Arbitrary Queries"*
+(2015). Physical subquery planning is a last resort, ideally never reached.
+
+**Remaining fail-fast gaps** (all raise `DecorrelationError`, never wrong
+answers; tests in `tests/e2e_decorrelation/test_error_cases.py`) — closed by
+Phase 9:
+
+| Gap | Test |
+|-----|------|
+| Skip-level correlation (relation 2+ levels up) | `test_skip_level_correlation` |
+| Subquery in `GROUP BY` / aggregate-argument position | `test_subquery_in_group_by` |
+| `OFFSET` in a correlated subquery | `test_offset_in_correlated_subquery` |
+| Multi-column scalar / quantified subquery | `test_quantified_comparison_multi_column_subquery` |
+| `SELECT *` value subquery | `test_select_star_value_subquery` |
+| Non-INNER join `ON` subquery; multi-row `VALUES`; two equalities over a global aggregate | guarded in `decorrelation.py` (no dedicated test yet) |
+
+## Running tests / coverage
+
+- Full suite: `make pg-start` then
+  `POSTGRES_DB=duckpoc /workspace/venv-fedq/bin/python -m pytest tests/ -q`
+  (809 passing as of 2026-06-25).
+- Coverage: plain `pytest-cov` dies on `import duckdb` under instrumentation
+  (numpy 2.4 + coverage C-ext reimport crash). Use the pre-import shim
+  `/tmp/covrun.py` (imports duckdb/numpy/pyarrow before `coverage.start()`) with
+  the `/workspace/venv-cov` venv (numpy 2.3.5).
+
+## Coding rules (CLAUDE.md / AGENTS.md) — enforce
+
+No list comprehensions; no bare except; ≤20 lines & cyclomatic ≤4 per function;
+comment every function; no "pointless" verbose code; `black` clean; fail fast,
+don't wrap exceptions; no compat cruft (delete, don't shim).

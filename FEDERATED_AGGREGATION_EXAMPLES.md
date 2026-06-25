@@ -242,9 +242,9 @@ PYTHONPATH=/home/user/federated-query python example/aggregate_queries.py
 ```
 
 Output:
-- Section 1: Single-source aggregations ✓
+- Section 1: Single-source aggregations yes
 - Section 2: Skipped (PostgreSQL not available)
-- Section 3: Pushdown documentation ✓
+- Section 3: Pushdown documentation yes
 
 ### With PostgreSQL
 ```bash
@@ -256,24 +256,24 @@ PYTHONPATH=/home/user/federated-query python example/aggregate_queries.py
 ```
 
 Output:
-- Section 1: Single-source aggregations ✓
-- Section 2: Federated JOIN + aggregation ✓ (4 queries)
-- Section 3: Pushdown documentation ✓
+- Section 1: Single-source aggregations yes
+- Section 2: Federated JOIN + aggregation yes (4 queries)
+- Section 3: Pushdown documentation yes
 
 ## Key Takeaways
 
 ### What Works Now (Phase 3)
-✅ **Federated aggregations** - JOIN data from different databases, then aggregate
-✅ **All standard aggregate functions** - COUNT, SUM, AVG, MIN, MAX
-✅ **Complex GROUP BY** - Single or multiple columns
-✅ **Filtered aggregations** - WHERE + JOIN + GROUP BY
-✅ **Production-ready** - Handles real-world analytics queries
+**Federated aggregations** - JOIN data from different databases, then aggregate
+**All standard aggregate functions** - COUNT, SUM, AVG, MIN, MAX
+**Complex GROUP BY** - Single or multiple columns
+**Filtered aggregations** - WHERE + JOIN + GROUP BY
+**Production-ready** - Handles real-world analytics queries
 
 ### What's Coming (Phase 4)
-⏳ **Aggregation pushdown** - Execute aggregations at source databases
-⏳ **Partial pre-aggregation** - Reduce data transfer before JOINs
-⏳ **Cost-based optimization** - Choose best aggregation strategy
-⏳ **Multi-stage pushdown** - Push to multiple sources in parallel
+**Aggregation pushdown** - Execute aggregations at source databases
+**Partial pre-aggregation** - Reduce data transfer before JOINs
+**Cost-based optimization** - Choose best aggregation strategy
+**Multi-stage pushdown** - Push to multiple sources in parallel
 
 ## Performance Characteristics
 

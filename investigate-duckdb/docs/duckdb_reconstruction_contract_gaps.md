@@ -4,7 +4,7 @@ This document records the source-derived reconstruction contracts enforced by
 `tests/test_duckdb_reconstruct.py`. The full file currently passes with:
 
 ```text
-831 passed
+1857 passed
 ```
 
 ## SELECT-Reachable Handler Contracts
@@ -187,3 +187,7 @@ optimized JSON, or not tied to output-column assertions.
 - `test_explicit_user_requirement_cases_have_required_node_assertions`
 - `test_explicit_user_requirement_cases_have_output_column_assertions`
 - `test_reconstruction_contract_cases_use_full_ladder_helper`
+- `test_duckdb_sql_keyword_entry_count_is_current`
+- `test_keyword_stress_contract_case_count_is_1000`
+- `test_keyword_stress_contract_cases_cover_all_keyword_entries`
+- `test_keyword_stress_native_reconstruction_contract_cases`
