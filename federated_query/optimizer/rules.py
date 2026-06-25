@@ -12,19 +12,27 @@ from ..plan.logical import (
     Sort,
     Limit,
     Union,
+    SetOperation,
     Explain,
 )
 from ..plan.expressions import Expression, InList, BetweenExpression
 from ..catalog.catalog import Catalog
-from .expression_rewriter import (
-    ExpressionRewriter,
-    ConstantFoldingRewriter,
-    ExpressionSimplificationRewriter,
-    CompositeExpressionRewriter,
-)
 
 if TYPE_CHECKING:
     from ..processor.query_executor import QueryExecutor
+
+
+def _rewrite_set_operation_branches(set_op: SetOperation, rewrite) -> SetOperation:
+    """Apply a recursive rewrite to both branches of a set operation.
+
+    Pushdown rules descend the tree by node type; a set operation is opaque to
+    them otherwise, so its branches (each a full subquery) would never be
+    optimized. Rebuilding with the rewritten branches keeps every rule reaching
+    inside UNION/INTERSECT/EXCEPT.
+    """
+    new_left = rewrite(set_op.left)
+    new_right = rewrite(set_op.right)
+    return SetOperation(new_left, new_right, set_op.kind, set_op.distinct)
 
 
 class OptimizationRule(ABC):
@@ -98,6 +106,15 @@ class PredicatePushdownRule(OptimizationRule):
             if new_input != plan.input:
                 return Limit(new_input, plan.limit, plan.offset)
             return plan
+
+        if isinstance(plan, Sort):
+            new_input = self._push_down(plan.input)
+            if new_input != plan.input:
+                return Sort(new_input, plan.sort_keys, plan.ascending, plan.nulls_order)
+            return plan
+
+        if isinstance(plan, SetOperation):
+            return _rewrite_set_operation_branches(plan, self._push_down)
 
         return plan
 
@@ -357,6 +374,19 @@ class PredicatePushdownRule(OptimizationRule):
             )
             return new_join
 
+        # Predicate spans both sides of an INNER join. A cross-side equality is
+        # a join key: fold it into the ON condition so a comma/cross join
+        # becomes an equi-join (hash join) instead of a Cartesian product with a
+        # filter on top. Non-equi cross-side predicates stay as a filter.
+        if self._is_equi_predicate(predicate):
+            merged_condition = self._merge_join_condition(join.condition, predicate)
+            return Join(
+                self._push_down(join.left),
+                self._push_down(join.right),
+                join.join_type,
+                merged_condition,
+            )
+
         new_join = Join(
             self._push_down(join.left),
             self._push_down(join.right),
@@ -364,6 +394,27 @@ class PredicatePushdownRule(OptimizationRule):
             join.condition,
         )
         return Filter(new_join, predicate)
+
+    def _is_equi_predicate(self, predicate: Expression) -> bool:
+        """Whether a predicate is a column-to-column equality (a join key)."""
+        from ..plan.expressions import BinaryOp, BinaryOpType, ColumnRef
+
+        return (
+            isinstance(predicate, BinaryOp)
+            and predicate.op == BinaryOpType.EQ
+            and isinstance(predicate.left, ColumnRef)
+            and isinstance(predicate.right, ColumnRef)
+        )
+
+    def _merge_join_condition(
+        self, existing: Optional[Expression], predicate: Expression
+    ) -> Expression:
+        """AND a freshly inferred equi-condition into a join's ON clause."""
+        from ..plan.expressions import BinaryOp, BinaryOpType
+
+        if existing is None:
+            return predicate
+        return BinaryOp(op=BinaryOpType.AND, left=existing, right=predicate)
 
     def _get_column_names(self, plan: LogicalPlanNode) -> set:
         """Get all column names available from a plan node.
@@ -469,6 +520,7 @@ class PredicatePushdownRule(OptimizationRule):
         return children
 
     def name(self) -> str:
+        """Return this rule's identifier (used in logging and EXPLAIN)."""
         return "PredicatePushdown"
 
 
@@ -699,6 +751,7 @@ class ProjectionPushdownRule(OptimizationRule):
         return local_required.union(parent_required)
 
     def name(self) -> str:
+        """Return this rule's identifier (used in logging and EXPLAIN)."""
         return "ProjectionPushdown"
 
 
@@ -921,6 +974,7 @@ class LimitPushdownRule(OptimizationRule):
         )
 
     def name(self) -> str:
+        """Return this rule's identifier (used in logging and EXPLAIN)."""
         return "LimitPushdown"
 
 
@@ -928,11 +982,13 @@ class JoinReorderingRule(OptimizationRule):
     """Reorder joins for better performance."""
 
     def apply(self, plan: LogicalPlanNode) -> Optional[LogicalPlanNode]:
+        """Reorder joins by cost. Not yet implemented (deferred to Phase 10)."""
         # TODO: Implement cost-based join reordering
         # Requires integration with Phase 5 cost model
         raise NotImplementedError()
 
     def name(self) -> str:
+        """Return this rule's identifier (used in logging and EXPLAIN)."""
         return "JoinReordering"
 
 
@@ -1365,6 +1421,9 @@ class OrderByPushdownRule(OptimizationRule):
         if isinstance(plan, Aggregate):
             return self._recurse_aggregate(plan)
 
+        if isinstance(plan, SetOperation):
+            return _rewrite_set_operation_branches(plan, self._push_order_by)
+
         return plan
 
     def _resolve_scan(self, node: LogicalPlanNode) -> Optional[Scan]:
@@ -1458,6 +1517,7 @@ class OrderByPushdownRule(OptimizationRule):
         return Aggregate(new_input, agg.group_by, agg.aggregates, agg.output_names)
 
     def name(self) -> str:
+        """Return this rule's identifier (used in logging and EXPLAIN)."""
         return "OrderByPushdown"
 
 
@@ -1542,6 +1602,9 @@ class AggregatePushdownRule(OptimizationRule):
         if isinstance(plan, Join):
             return self._recurse_join(plan)
 
+        if isinstance(plan, SetOperation):
+            return _rewrite_set_operation_branches(plan, self._push_aggregate)
+
         return plan
 
     def _recurse_unary(self, plan: LogicalPlanNode) -> LogicalPlanNode:
@@ -1580,183 +1643,8 @@ class AggregatePushdownRule(OptimizationRule):
         return Join(new_left, new_right, join.join_type, join.condition)
 
     def name(self) -> str:
+        """Return this rule's identifier (used in logging and EXPLAIN)."""
         return "AggregatePushdown"
-
-
-class ExpressionSimplificationRule(OptimizationRule):
-    """Apply expression simplification and constant folding to plan."""
-
-    def __init__(self):
-        """Initialize expression simplification rule."""
-        self.rewriter = CompositeExpressionRewriter()
-        self.rewriter.add_rewriter(ConstantFoldingRewriter())
-        self.rewriter.add_rewriter(ExpressionSimplificationRewriter())
-
-    def apply(self, plan: LogicalPlanNode) -> Optional[LogicalPlanNode]:
-        """Apply expression rewriting to all expressions in the plan.
-
-        Args:
-            plan: Input plan node
-
-        Returns:
-            Transformed plan with simplified expressions
-        """
-        return self._rewrite_plan(plan)
-
-    def _rewrite_plan(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Recursively rewrite expressions in plan."""
-        if isinstance(plan, Scan):
-            if plan.filters:
-                rewritten_filter = self.rewriter.rewrite(plan.filters)
-                if rewritten_filter != plan.filters:
-                    return Scan(
-                        datasource=plan.datasource,
-                        schema_name=plan.schema_name,
-                        table_name=plan.table_name,
-                        columns=plan.columns,
-                        filters=rewritten_filter,
-                        alias=plan.alias,
-                        group_by=plan.group_by,
-                        aggregates=plan.aggregates,
-                        output_names=plan.output_names,
-                        limit=plan.limit,
-                        offset=plan.offset,
-                        order_by_keys=plan.order_by_keys,
-                        order_by_ascending=plan.order_by_ascending,
-                        order_by_nulls=plan.order_by_nulls,
-                        distinct=getattr(plan, "distinct", False),
-                    )
-            return plan
-
-        if isinstance(plan, Projection):
-            rewritten_input = self._rewrite_plan(plan.input)
-            rewritten_exprs = []
-            changed = False
-
-            for expr in plan.expressions:
-                rewritten = self.rewriter.rewrite(expr)
-                rewritten_exprs.append(rewritten)
-                if rewritten != expr:
-                    changed = True
-
-            if changed or rewritten_input != plan.input:
-                return Projection(
-                    rewritten_input,
-                    rewritten_exprs,
-                    plan.aliases,
-                    plan.distinct,
-                )
-            return plan
-
-        if isinstance(plan, Filter):
-            rewritten_input = self._rewrite_plan(plan.input)
-            rewritten_predicate = self.rewriter.rewrite(plan.predicate)
-
-            if rewritten_predicate != plan.predicate or rewritten_input != plan.input:
-                return Filter(rewritten_input, rewritten_predicate)
-            return plan
-
-        if isinstance(plan, Join):
-            rewritten_left = self._rewrite_plan(plan.left)
-            rewritten_right = self._rewrite_plan(plan.right)
-            rewritten_condition = None
-
-            if plan.condition:
-                rewritten_condition = self.rewriter.rewrite(plan.condition)
-
-            if (
-                rewritten_left != plan.left
-                or rewritten_right != plan.right
-                or rewritten_condition != plan.condition
-            ):
-                return Join(
-                    rewritten_left, rewritten_right, plan.join_type, rewritten_condition
-                )
-            return plan
-
-        if isinstance(plan, Aggregate):
-            rewritten_input = self._rewrite_plan(plan.input)
-            rewritten_group_by = []
-            group_by_changed = False
-
-            for expr in plan.group_by:
-                rewritten = self.rewriter.rewrite(expr)
-                rewritten_group_by.append(rewritten)
-                if rewritten != expr:
-                    group_by_changed = True
-
-            rewritten_aggs = []
-            aggs_changed = False
-
-            for expr in plan.aggregates:
-                rewritten = self.rewriter.rewrite(expr)
-                rewritten_aggs.append(rewritten)
-                if rewritten != expr:
-                    aggs_changed = True
-
-            if rewritten_input != plan.input or group_by_changed or aggs_changed:
-                return Aggregate(
-                    rewritten_input,
-                    rewritten_group_by,
-                    rewritten_aggs,
-                    plan.output_names,
-                )
-            return plan
-
-        if isinstance(plan, Sort):
-            rewritten_input = self._rewrite_plan(plan.input)
-            rewritten_keys = []
-            changed = False
-
-            for key in plan.sort_keys:
-                rewritten = self.rewriter.rewrite(key)
-                rewritten_keys.append(rewritten)
-                if rewritten != key:
-                    changed = True
-
-            if changed or rewritten_input != plan.input:
-                return Sort(rewritten_input, rewritten_keys, plan.ascending)
-            return plan
-
-        if isinstance(plan, Limit):
-            rewritten_input = self._rewrite_plan(plan.input)
-            if rewritten_input != plan.input:
-                return Limit(rewritten_input, plan.limit, plan.offset)
-            return plan
-
-        if isinstance(plan, Union):
-            rewritten_inputs = []
-            changed = False
-
-            for input_plan in plan.inputs:
-                rewritten = self._rewrite_plan(input_plan)
-                rewritten_inputs.append(rewritten)
-                if rewritten != input_plan:
-                    changed = True
-
-            if changed:
-                return Union(rewritten_inputs, plan.distinct)
-            return plan
-
-        children = plan.children()
-        if not children:
-            return plan
-
-        rewritten_children = []
-        changed = False
-
-        for child in children:
-            rewritten = self._rewrite_plan(child)
-            rewritten_children.append(rewritten)
-            if rewritten != child:
-                changed = True
-
-        if changed:
-            return plan.with_children(rewritten_children)
-        return plan
-
-    def name(self) -> str:
-        return "ExpressionSimplification"
 
 
 class RuleBasedOptimizer:

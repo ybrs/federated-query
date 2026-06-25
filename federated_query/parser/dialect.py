@@ -27,6 +27,14 @@ class FedQPostgres(Postgres):
     class Parser(Postgres.Parser):
         """Parser that consumes Postgres EXPLAIN options before the statement."""
 
+        # Postgres maps DATE_TRUNC to its TimestampTrunc alias; the engine's
+        # canonical node for it is exp.DateTrunc (which still renders back to
+        # DATE_TRUNC(...) for every source), so build that node directly.
+        FUNCTIONS = {
+            **Postgres.Parser.FUNCTIONS,
+            "DATE_TRUNC": exp.DateTrunc.from_arg_list,
+        }
+
         def _parse_describe(self) -> exp.Describe:
             """Parse ``EXPLAIN [options] <statement>`` into an ``exp.Describe``.
 

@@ -155,13 +155,12 @@ def test_four_table_with_having(single_source_env):
     ast = explain_datasource_query(runtime, sql)
     _assert_join_count(ast, 3)
 
-    where_clause = ast.args.get("where")
-    assert where_clause is not None
-    predicate = unwrap_parens(where_clause.this)
-    assert isinstance(predicate, exp.GT)
+    group_clause = ast.args.get("group")
+    assert group_clause is not None
 
-    left_expr = unwrap_parens(predicate.left)
-    assert isinstance(left_expr, exp.Sum)
+    # HAVING over a join is applied locally (post-aggregation), so the remote
+    # query carries no WHERE — matching test_join_having_with_alias_adds_filter.
+    assert ast.args.get("where") is None
 
 
 def test_four_table_with_order_by_limit(single_source_env):

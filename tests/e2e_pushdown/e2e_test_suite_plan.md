@@ -49,15 +49,15 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
 
 ### Implemented Test Files:
 
-- ✅ **Section 0 – Foundation:** `tests/e2e_pushdown/test_foundation.py` (2 tests)
-- ✅ **Section 1 – Single-table predicates:** `tests/e2e_pushdown/test_single_table_predicates.py` (**26 tests**, not 12)
+- **Section 0 – Foundation:** `tests/e2e_pushdown/test_foundation.py` (2 tests)
+- **Section 1 – Single-table predicates:** `tests/e2e_pushdown/test_single_table_predicates.py` (**26 tests**, not 12)
   - Covers: SELECT *, projections, all comparison operators (=, !=, <, >, <=, >=)
   - Covers: AND, OR, NOT, IN, NOT IN, BETWEEN, NOT BETWEEN, LIKE, NOT LIKE
   - Covers: IS NULL, IS NOT NULL
   - Covers: 3-way AND/OR, nested (a AND b) OR (c AND d), complex logic
   - Covers: LIMIT, OFFSET
 
-- ✅ **Section 2 – Single-table aggregations:** `tests/e2e_pushdown/test_single_table_aggregations.py` (**15 tests**, not 6)
+- **Section 2 – Single-table aggregations:** `tests/e2e_pushdown/test_single_table_aggregations.py` (**15 tests**, not 6)
   - Covers: COUNT(*), COUNT(col), COUNT(DISTINCT), SUM, SUM(DISTINCT), AVG, MIN, MAX
   - Covers: GROUP BY single/multiple columns
   - Covers: HAVING, HAVING with multiple conditions
@@ -65,7 +65,7 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
   - Covers: Aggregates on expressions (SUM(a * b))
   - Covers: MIN/MAX on strings
 
-- ✅ **Section 3 – NULL Handling:** `tests/e2e_pushdown/test_null_handling.py` (**13 tests** - MISSING FROM ORIGINAL DOC!)
+- **Section 3 – NULL Handling:** `tests/e2e_pushdown/test_null_handling.py` (**13 tests** - MISSING FROM ORIGINAL DOC!)
   - Covers: IS NULL / IS NOT NULL
   - Covers: NULL in AND/OR logic (three-valued logic)
   - Covers: NULL in JOIN keys
@@ -76,36 +76,36 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
   - Covers: NULL equality comparison
   - Covers: Complex boolean logic with NULL
 
-- ✅ **Section 4 – Two-table joins:** `tests/e2e_pushdown/test_single_source_joins.py` (10 tests)
+- **Section 4 – Two-table joins:** `tests/e2e_pushdown/test_single_source_joins.py` (10 tests)
   - Covers: INNER, LEFT, RIGHT, CROSS joins
   - Covers: JOIN with filters, LIMIT
   - Covers: Comma syntax
   - Covers: Non-equi join fallback
 
-- ✅ **Section 5 – Join + aggregation/order:** `tests/e2e_pushdown/test_join_aggregations_and_order.py` (6 tests)
+- **Section 5 – Join + aggregation/order:** `tests/e2e_pushdown/test_join_aggregations_and_order.py` (6 tests)
   - Covers: JOIN + GROUP BY, HAVING
   - Covers: JOIN + ORDER BY, LIMIT
   - Covers: Multiple group columns
 
-- ✅ **Section 6 – Three-table joins:** `tests/e2e_pushdown/test_multi_table_joins.py` (4 tests)
+- **Section 6 – Three-table joins:** `tests/e2e_pushdown/test_multi_table_joins.py` (4 tests)
   - Covers: 3-table inner chains
   - Covers: Mixed INNER/LEFT
   - Covers: 3-table with predicates, LIMIT
 
-- ✅ **Section 7 – Combined pushdowns:** `tests/e2e_pushdown/test_combined_pushdowns.py` (5 tests)
+- **Section 7 – Combined pushdowns:** `tests/e2e_pushdown/test_combined_pushdowns.py` (5 tests)
   - Covers: Projection + predicate + aggregation + join + limit
   - Covers: Computed expressions + GROUP BY
   - Covers: ORDER BY after aggregation
   - Covers: DISTINCT with JOIN
   - Covers: CASE expressions in aggregates
 
-- ✅ **Section 8 – Multi-datasource guardrails:** `tests/e2e_pushdown/test_multi_datasource_guardrails.py` (5 tests)
+- **Section 8 – Multi-datasource guardrails:** `tests/e2e_pushdown/test_multi_datasource_guardrails.py` (5 tests)
   - Covers: Same-source join pushdown
   - Covers: Cross-source join fallback
   - Covers: 3-source joins
   - Covers: Cross-source filters, aggregates
 
-- ✅ **Section 9 – Edge cases & negatives:** `tests/e2e_pushdown/test_edge_cases_negatives.py` (3 tests)
+- **Section 9 – Edge cases & negatives:** `tests/e2e_pushdown/test_edge_cases_negatives.py` (3 tests)
   - Covers: Window functions (unsupported, errors)
   - Covers: Scalar subqueries (unsupported, errors)
   - Covers: OR in join condition (fallback)
@@ -120,7 +120,7 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
 
 ### Categories That Need Work
 
-#### 1. Expression Pushdown (0/40 tests = 0%) 🔴 CRITICAL
+#### 1. Expression Pushdown (0/40 tests = 0%) CRITICAL
 
 **Missing:**
 
@@ -174,7 +174,7 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
 - CAST in GROUP BY
 - CAST in ORDER BY
 
-#### 2. ORDER BY Comprehensive (0/20 tests = 0%) 🔴 CRITICAL
+#### 2. ORDER BY Comprehensive (0/20 tests = 0%) CRITICAL
 
 **Missing:**
 - ORDER BY col ASC (explicit)
@@ -198,7 +198,7 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
 - ORDER BY with GROUP BY
 - ORDER BY with HAVING
 
-#### 3. Advanced Join Types (0/15 tests = 0%) 🔴 CRITICAL
+#### 3. Advanced Join Types (0/15 tests = 0%) CRITICAL
 
 **Missing:**
 - FULL OUTER JOIN basic
@@ -217,7 +217,7 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
 - Chained LEFT/RIGHT combinations (5+ variations)
 - Mixed INNER/FULL/LEFT/RIGHT in single query
 
-#### 4. Four+ Table Joins (0/10 tests = 0%) 🔴 CRITICAL
+#### 4. Four+ Table Joins (0/10 tests = 0%) CRITICAL
 
 **Missing:**
 - 4-table INNER join chain
@@ -231,7 +231,7 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
 - 6+ table join
 - Complex multi-table with subquery filters
 
-#### 5. Subqueries (0/20 tests = 0%) 🟡 HIGH PRIORITY
+#### 5. Subqueries (0/20 tests = 0%) HIGH PRIORITY
 
 **Missing:**
 - WHERE EXISTS (SELECT ...)
@@ -255,7 +255,7 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
 - EXISTS with complex predicates
 - Subquery with UNION
 
-#### 6. Set Operations (0/10 tests = 0%) 🟡 HIGH PRIORITY
+#### 6. Set Operations (0/10 tests = 0%) HIGH PRIORITY
 
 **Missing:**
 - UNION ALL basic
@@ -269,7 +269,7 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
 - Set operations with aggregation
 - Cross-datasource UNION fallback
 
-#### 7. CTEs (WITH clause) (0/10 tests = 0%) 🟡 HIGH PRIORITY
+#### 7. CTEs (WITH clause) (0/10 tests = 0%) HIGH PRIORITY
 
 **Missing:**
 - Simple CTE, referenced once
@@ -283,7 +283,7 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
 - CTE with ORDER BY LIMIT
 - Recursive CTE (if supported/fallback behavior)
 
-#### 8. DISTINCT Variations (0/8 tests = 0%) 🟢 MEDIUM
+#### 8. DISTINCT Variations (0/8 tests = 0%) MEDIUM
 
 **Missing:**
 - DISTINCT single column
@@ -295,7 +295,7 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
 - DISTINCT with LIMIT/OFFSET
 - DISTINCT *
 
-#### 9. LIMIT/OFFSET Edge Cases (2/10 tests = 20%) 🟢 MEDIUM
+#### 9. LIMIT/OFFSET Edge Cases (2/10 tests = 20%) MEDIUM
 
 **Implemented:**
 - Basic LIMIT
@@ -311,7 +311,7 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
 - Pagination pattern (multiple LIMIT/OFFSET combinations)
 - LIMIT with ORDER BY (multiple scenarios)
 
-#### 10. Data Type Edge Cases (0/15 tests = 0%) 🟢 MEDIUM
+#### 10. Data Type Edge Cases (0/15 tests = 0%) MEDIUM
 
 **Missing:**
 - Integer overflow (very large numbers)
@@ -330,7 +330,7 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
 - Mixed numeric types (INT + FLOAT)
 - Scientific notation
 
-#### 11. String Edge Cases (0/12 tests = 0%) 🟢 MEDIUM
+#### 11. String Edge Cases (0/12 tests = 0%) MEDIUM
 
 **Missing:**
 - Empty string vs NULL distinction
@@ -346,7 +346,7 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
 - LIKE with % and _ wildcards (various positions)
 - ILIKE (case-insensitive LIKE)
 
-#### 12. Table/Query Edge Cases (0/10 tests = 0%) 🟢 MEDIUM
+#### 12. Table/Query Edge Cases (0/10 tests = 0%) MEDIUM
 
 **Missing:**
 - Query on empty table (0 rows)
@@ -360,7 +360,7 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
 - Very wide SELECT (50+ columns)
 - SELECT with duplicate column names (aliasing)
 
-#### 13. Error Handling & Validation (2/10 tests = 20%) 🔴 CRITICAL
+#### 13. Error Handling & Validation (2/10 tests = 20%) CRITICAL
 
 **Implemented:**
 - Window function error handling
@@ -376,7 +376,7 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
 - Invalid date format
 - Connection failure simulation
 
-#### 14. Advanced NULL Scenarios (13/18 tests = 72%) 🟢 MEDIUM
+#### 14. Advanced NULL Scenarios (13/18 tests = 72%) MEDIUM
 
 **Implemented:** (via test_null_handling.py)
 - IS NULL / IS NOT NULL
@@ -394,7 +394,7 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
 - NULL in CASE expressions
 - Complex NULL propagation
 
-#### 15. Multi-Datasource Advanced (5/15 tests = 33%) 🟡 HIGH PRIORITY
+#### 15. Multi-Datasource Advanced (5/15 tests = 33%) HIGH PRIORITY
 
 **Implemented:**
 - Same-source join pushdown
@@ -414,7 +414,7 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
 - Cross-source with computed columns
 - Cross-source with complex WHERE
 
-#### 16. Aggregate Advanced Features (0/8 tests = 0%) 🟡 HIGH PRIORITY
+#### 16. Aggregate Advanced Features (0/8 tests = 0%) HIGH PRIORITY
 
 **Missing:**
 - FILTER clause (COUNT(*) FILTER (WHERE ...))
@@ -426,7 +426,7 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
 - STDDEV, VARIANCE (if supported)
 - Aggregate on aggregate (nested, via subquery)
 
-#### 17. Predicate Edge Cases (0/8 tests = 0%) 🟢 MEDIUM
+#### 17. Predicate Edge Cases (0/8 tests = 0%) MEDIUM
 
 **Missing:**
 - Empty IN list: WHERE col IN ()
@@ -555,55 +555,55 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
 ## Success Metrics
 
 ### After Sprint 1 (149 tests total):
-- ✅ All basic expressions pushdown correctly
-- ✅ ORDER BY fully functional
-- ✅ String/date functions working
-- ✅ Type casting supported
+- All basic expressions pushdown correctly
+- ORDER BY fully functional
+- String/date functions working
+- Type casting supported
 
 ### After Sprint 2 (204 tests total):
-- ✅ All join types covered
-- ✅ Large multi-table queries work
-- ✅ Set operations functional
-- ✅ CTEs working
+- All join types covered
+- Large multi-table queries work
+- Set operations functional
+- CTEs working
 
 ### After Sprint 3 (259 tests total):
-- ✅ Subqueries comprehensive
-- ✅ All edge cases covered
-- ✅ Error handling robust
-- ✅ Data types hardened
+- Subqueries comprehensive
+- All edge cases covered
+- Error handling robust
+- Data types hardened
 
 ### After Sprint 4 (295 tests total):
-- ✅ Production-ready test suite
-- ✅ Multi-datasource comprehensive
-- ✅ All SQL features covered or documented as unsupported
-- ✅ 295 tests = GOAL ACHIEVED!
+- Production-ready test suite
+- Multi-datasource comprehensive
+- All SQL features covered or documented as unsupported
+- 295 tests = GOAL ACHIEVED!
 
 ---
 
 ## Test Quality Standards
 
 All tests MUST:
-1. ✅ Use AST-based verification (no string matching!)
-2. ✅ Use sqlglot `exp.*` types for inspection
-3. ✅ Have descriptive docstrings
-4. ✅ Test one specific behavior
-5. ✅ Verify pushdown happened (or didn't) as expected
-6. ✅ Check query structure, not just execution success
+1. Use AST-based verification (no string matching!)
+2. Use sqlglot `exp.*` types for inspection
+3. Have descriptive docstrings
+4. Test one specific behavior
+5. Verify pushdown happened (or didn't) as expected
+6. Check query structure, not just execution success
 
 ---
 
 ## Summary
 
 **Current State:**
-- ✅ 89 high-quality tests (not 53!)
-- ✅ Excellent AST-based verification methodology
-- ✅ Strong foundation in predicates, aggregates, joins, NULL handling
-- ⚠️ Documentation was outdated and inaccurate
+- 89 high-quality tests (not 53!)
+- Excellent AST-based verification methodology
+- Strong foundation in predicates, aggregates, joins, NULL handling
+- Documentation was outdated and inaccurate
 
 **Required Work:**
-- 🔴 206 additional tests needed to reach 295
-- 🔴 4 sprints recommended (7-8 weeks)
-- 🔴 Focus on: expressions, ORDER BY, advanced joins, subqueries
+- 206 additional tests needed to reach 295
+- 4 sprints recommended (7-8 weeks)
+- Focus on: expressions, ORDER BY, advanced joins, subqueries
 
 **Critical Priorities (Sprint 1):**
 1. Expression pushdown (arithmetic, string, date)
@@ -619,4 +619,4 @@ All tests MUST:
 
 **Document Updated:** 2025-11-14
 **Reviewed By:** Claude (Comprehensive Review)
-**Status:** ✅ Accurate - Ready for Sprint 1 Planning
+**Status:** Accurate - Ready for Sprint 1 Planning

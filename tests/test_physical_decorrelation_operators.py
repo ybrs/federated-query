@@ -99,17 +99,13 @@ def test_union_distinct_deduplicates():
 
 def test_single_row_guard_passes_one_row():
     """A single global row flows through the guard untouched."""
-    node = PhysicalSingleRowGuard(
-        input=StaticSource([batch_of(v=[10])]), keys=[]
-    )
+    node = PhysicalSingleRowGuard(input=StaticSource([batch_of(v=[10])]), keys=[])
     assert rows_of(node) == [{"v": 10}]
 
 
 def test_single_row_guard_raises_on_second_row():
     """Two global rows must raise a cardinality error."""
-    node = PhysicalSingleRowGuard(
-        input=StaticSource([batch_of(v=[10, 20])]), keys=[]
-    )
+    node = PhysicalSingleRowGuard(input=StaticSource([batch_of(v=[10, 20])]), keys=[])
     with pytest.raises(CardinalityViolationError):
         rows_of(node)
 
@@ -136,6 +132,49 @@ def test_grouped_limit_keeps_first_row_per_key():
         {"k": 2, "v": 20},
         {"k": 3, "v": 30},
     ]
+
+
+def _merge_engine():
+    """An in-memory merge engine for exercising the DuckDB push path."""
+    from federated_query.executor.merge_engine import MergeEngine
+
+    return MergeEngine("1GB", None)
+
+
+def test_grouped_limit_merge_path_matches_python():
+    """The merge-engine ROW_NUMBER push keeps the same rows and order as Python."""
+    rows = batch_of(k=[1, 1, 1, 2, 2, 3], v=[10, 11, 12, 20, 21, 30])
+    python_node = PhysicalGroupedLimit(
+        input=StaticSource([rows]), keys=[col("k")], limit=2
+    )
+    merge_node = PhysicalGroupedLimit(
+        input=StaticSource([rows]), keys=[col("k")], limit=2
+    )
+    merge_node.set_merge_engine(_merge_engine())
+    assert rows_of(merge_node) == rows_of(python_node)
+    assert rows_of(merge_node) == [
+        {"k": 1, "v": 10},
+        {"k": 1, "v": 11},
+        {"k": 2, "v": 20},
+        {"k": 2, "v": 21},
+        {"k": 3, "v": 30},
+    ]
+
+
+def test_grouped_limit_merge_path_ordered_latest_per_key():
+    """An ordered per-key limit (latest row) matches between merge and Python."""
+    rows = batch_of(k=[1, 1, 1, 2, 2], v=[10, 12, 11, 20, 21])
+    fields = dict(
+        keys=[col("k")],
+        limit=1,
+        order_by_keys=[col("v")],
+        order_by_ascending=[False],
+    )
+    python_node = PhysicalGroupedLimit(input=StaticSource([rows]), **fields)
+    merge_node = PhysicalGroupedLimit(input=StaticSource([rows]), **fields)
+    merge_node.set_merge_engine(_merge_engine())
+    assert rows_of(merge_node) == rows_of(python_node)
+    assert rows_of(merge_node) == [{"k": 1, "v": 12}, {"k": 2, "v": 21}]
 
 
 def test_hash_semi_join_null_keys_never_match():
@@ -189,12 +228,8 @@ def test_left_hash_join_null_probe_key_emits_outer_row():
 def test_global_aggregate_over_empty_input_emits_one_row():
     """SQL: SELECT COUNT(*), MAX(v) over no rows is one row (0, NULL)."""
     empty = StaticSource([])
-    count_star = FunctionCall(
-        function_name="COUNT", args=[], is_aggregate=True
-    )
-    max_v = FunctionCall(
-        function_name="MAX", args=[col("v")], is_aggregate=True
-    )
+    count_star = FunctionCall(function_name="COUNT", args=[], is_aggregate=True)
+    max_v = FunctionCall(function_name="MAX", args=[col("v")], is_aggregate=True)
     node = PhysicalHashAggregate(
         input=empty,
         group_by=[],
@@ -217,9 +252,7 @@ def test_sum_over_empty_input_is_null():
 def test_count_column_skips_nulls():
     """SQL: COUNT(col) counts only non-NULL values."""
     source = StaticSource([batch_of(v=[1, None, 3])])
-    count_v = FunctionCall(
-        function_name="COUNT", args=[col("v")], is_aggregate=True
-    )
+    count_v = FunctionCall(function_name="COUNT", args=[col("v")], is_aggregate=True)
     node = PhysicalHashAggregate(
         input=source, group_by=[], aggregates=[count_v], output_names=["cnt"]
     )

@@ -19,6 +19,11 @@ from ..plan.logical import (
     ExplainFormat,
     Values,
     SubqueryScan,
+    SetOperation,
+    SetOpKind,
+    LateralJoin,
+    CTE,
+    CTERef,
 )
 from ..catalog.catalog import Catalog
 from ..plan.expressions import (
@@ -34,6 +39,8 @@ from ..plan.expressions import (
     InList,
     BetweenExpression,
     Cast,
+    Extract,
+    Interval,
     CaseExpr,
     SubqueryExpression,
     ExistsExpression,
@@ -53,6 +60,9 @@ class Parser:
     def __init__(self):
         """Initialize parser."""
         self.dialect = FedQPostgres  # Custom Postgres dialect with native EXPLAIN
+        # Names of CTEs visible at the current point of conversion; a bare table
+        # reference matching one of these is a CTE reference, not a catalog table.
+        self._cte_names: List[str] = []
 
     def parse(self, sql: str) -> LogicalPlanNode:
         """Parse SQL string to an unbound logical plan.
@@ -100,7 +110,54 @@ class Parser:
             return self._convert_select(ast)
         if isinstance(ast, exp.Describe):
             return self._convert_explain(ast)
+        if isinstance(ast, (exp.Union, exp.Intersect, exp.Except)):
+            return self._convert_set_operation(ast)
         raise ValueError(f"Unsupported AST node type: {type(ast)}")
+
+    _SET_OP_KINDS = {
+        exp.Union: SetOpKind.UNION,
+        exp.Intersect: SetOpKind.INTERSECT,
+        exp.Except: SetOpKind.EXCEPT,
+    }
+
+    def _convert_set_operation(self, set_op: exp.SetOperation) -> LogicalPlanNode:
+        """Convert a sqlglot set operation (UNION/INTERSECT/EXCEPT) to a plan.
+
+        The two branches become a binary ``SetOperation``; any trailing
+        ORDER BY / LIMIT that sqlglot attaches to the set-operation node wraps
+        the whole result, so it is layered on top after the branches combine.
+        """
+        kind = self._SET_OP_KINDS[type(set_op)]
+        distinct = bool(set_op.args.get("distinct"))
+        left = self._convert_set_branch(set_op.this)
+        right = self._convert_set_branch(set_op.expression)
+        plan: LogicalPlanNode = SetOperation(
+            left=left, right=right, kind=kind, distinct=distinct
+        )
+        plan = self._build_order_by_clause(set_op, plan)
+        plan = self._build_limit_clause(set_op, plan)
+        return plan
+
+    def _convert_set_branch(self, branch: exp.Expression) -> LogicalPlanNode:
+        """Convert one branch of a set operation into a logical plan."""
+        branch = self._unwrap_set_branch(branch)
+        if isinstance(branch, exp.Select):
+            return self._convert_select(branch)
+        if isinstance(branch, (exp.Union, exp.Intersect, exp.Except)):
+            return self._convert_set_operation(branch)
+        raise ValueError(f"Unsupported set-operation branch: {type(branch)}")
+
+    def _unwrap_set_branch(self, branch: exp.Expression) -> exp.Expression:
+        """Strip anonymous parentheses/subquery wrappers around a branch.
+
+        ``(SELECT ... UNION SELECT ...)`` parenthesizes a nested set operation
+        for grouping; the wrapper carries no projection of its own and must be
+        peeled to reach the inner query. An aliased derived table is a real
+        relation and is left intact.
+        """
+        while isinstance(branch, exp.Subquery) and not branch.alias:
+            branch = branch.this
+        return branch
 
     def _convert_select(self, select: exp.Select) -> LogicalPlanNode:
         """Convert SELECT statement to logical plan.
@@ -111,8 +168,13 @@ class Parser:
         Returns:
             Logical plan node
         """
-        if select.args.get("with_"):
-            raise ValueError("WITH clauses (CTEs) are not supported yet")
+        with_clause = select.args.get("with_")
+        if with_clause is not None:
+            return self._convert_with(select, with_clause)
+        return self._convert_plain_select(select)
+
+    def _convert_plain_select(self, select: exp.Select) -> LogicalPlanNode:
+        """Convert a SELECT body (without its WITH clause) to a logical plan."""
         if select.args.get("from_") is None:
             return self._build_values_select(select)
         plan = self._build_from_clause(select)
@@ -123,6 +185,75 @@ class Parser:
         plan = self._build_order_by_clause(select, plan)
         plan = self._build_limit_clause(select, plan)
         return plan
+
+    def _convert_with(
+        self, select: exp.Select, with_clause: exp.With
+    ) -> LogicalPlanNode:
+        """Convert a ``WITH`` query into nested CTE nodes wrapping the body.
+
+        Each CTE name is brought into scope before the body is converted so a
+        later CTE (and, for ``WITH RECURSIVE``, the CTE's own body) resolves a
+        bare reference to a ``CTERef`` rather than a catalog table. The scope is
+        restored afterwards so sibling subqueries do not see these names.
+        """
+        recursive = bool(with_clause.args.get("recursive"))
+        scope_mark = len(self._cte_names)
+        definitions = self._convert_cte_definitions(with_clause, recursive)
+        child = self._convert_plain_select(select)
+        plan = self._wrap_ctes(definitions, child, recursive)
+        del self._cte_names[scope_mark:]
+        return plan
+
+    def _convert_cte_definitions(self, with_clause, recursive):
+        """Convert each CTE body in order, registering names as they bind."""
+        definitions = []
+        for cte in with_clause.expressions:
+            name = cte.alias
+            columns = self._cte_column_names(cte)
+            if recursive:
+                self._cte_names.append(name)
+            cte_plan = self.ast_to_logical_plan(cte.this)
+            if not recursive:
+                self._cte_names.append(name)
+            definitions.append((name, columns, cte_plan))
+        return definitions
+
+    def _wrap_ctes(self, definitions, child, recursive):
+        """Nest CTE definitions around the body, innermost binding last."""
+        plan = child
+        for name, columns, cte_plan in reversed(definitions):
+            plan = CTE(
+                name=name,
+                cte_plan=cte_plan,
+                child=plan,
+                recursive=recursive,
+                column_names=columns,
+            )
+        return plan
+
+    def _cte_column_names(self, cte: exp.CTE) -> Optional[List[str]]:
+        """Return an explicit CTE output column list (``counter(n)``), if any."""
+        alias_node = cte.args.get("alias")
+        if alias_node is None:
+            return None
+        columns = alias_node.args.get("columns")
+        if not columns:
+            return None
+        names = []
+        for identifier in columns:
+            names.append(identifier.name)
+        return names
+
+    def _maybe_cte_ref(
+        self, table_expr: exp.Table, columns: List[str]
+    ) -> Optional[CTERef]:
+        """Build a CTERef when a bare table name matches an in-scope CTE."""
+        if table_expr.catalog or table_expr.db:
+            return None
+        if table_expr.name not in self._cte_names:
+            return None
+        alias = self._extract_table_alias(table_expr)
+        return CTERef(name=table_expr.name, alias=alias, columns=columns)
 
     def _build_values_select(self, select: exp.Select) -> LogicalPlanNode:
         """Build a single-row Values plan for a FROM-less SELECT.
@@ -186,9 +317,13 @@ class Parser:
             return self._build_derived_table(table_expr)
         self._reject_unsupported_relation(table_expr)
 
+        all_columns = self._collect_needed_columns(select)
+        cte_ref = self._maybe_cte_ref(table_expr, all_columns)
+        if cte_ref is not None:
+            return cte_ref
+
         table_parts = self._extract_table_parts(table_expr)
         table_alias = self._extract_table_alias(table_expr)
-        all_columns = self._collect_needed_columns(select)
 
         datasource = table_parts[0]
         schema_name = table_parts[1]
@@ -209,9 +344,12 @@ class Parser:
         if isinstance(table_expr, exp.Subquery):
             return self._build_derived_table(table_expr)
         self._reject_unsupported_relation(table_expr)
-        table_parts = self._extract_table_parts(table_expr)
         table_alias = self._extract_table_alias(table_expr)
         columns = self._columns_for_join_table(column_usage, table_alias)
+        cte_ref = self._maybe_cte_ref(table_expr, columns)
+        if cte_ref is not None:
+            return cte_ref
+        table_parts = self._extract_table_parts(table_expr)
         return Scan(
             datasource=table_parts[0],
             schema_name=table_parts[1],
@@ -229,9 +367,10 @@ class Parser:
         return SubqueryScan(input=inner_plan, alias=alias)
 
     def _reject_unsupported_relation(self, table_expr: exp.Expression) -> None:
-        """Fail fast on FROM items the engine cannot plan."""
-        if isinstance(table_expr, exp.Lateral):
-            raise ValueError("LATERAL subqueries are not supported yet")
+        """Fail fast on FROM items the engine cannot plan.
+
+        LATERAL joins are handled before this point (see ``_build_lateral_join``).
+        """
         if not isinstance(table_expr, exp.Table):
             raise ValueError(f"Unsupported FROM item: {type(table_expr).__name__}")
 
@@ -255,6 +394,9 @@ class Parser:
         current_plan = left_plan
 
         for join_clause in joins:
+            if isinstance(join_clause.this, exp.Lateral):
+                current_plan = self._build_lateral_join(current_plan, join_clause)
+                continue
             right_plan = self._build_join_input(join_clause.this, column_usage)
 
             join_type = self._extract_join_type(join_clause)
@@ -267,9 +409,47 @@ class Parser:
                 right=right_plan,
                 join_type=join_type,
                 condition=join_condition,
+                natural=self._is_natural_join(join_clause),
+                using=self._extract_using_columns(join_clause),
             )
 
         return current_plan
+
+    def _build_lateral_join(
+        self, left_plan: LogicalPlanNode, join_clause: exp.Join
+    ) -> LateralJoin:
+        """Build a LATERAL (dependent) join: the right may reference the left.
+
+        The right is a derived table aliased like any other; a ``LEFT JOIN
+        LATERAL`` keeps non-matching outer rows, while a comma/``CROSS`` lateral
+        drops them (INNER). The binder later resolves the right's correlated
+        references against the left's columns.
+        """
+        lateral = join_clause.this
+        alias = lateral.alias
+        if not alias:
+            raise ValueError("LATERAL derived tables require an alias")
+        right = SubqueryScan(
+            input=self.ast_to_logical_plan(lateral.this.this), alias=alias
+        )
+        side = join_clause.args.get("side")
+        join_type = JoinType.LEFT if side else JoinType.INNER
+        return LateralJoin(left=left_plan, right=right, join_type=join_type)
+
+    def _is_natural_join(self, join_clause: exp.Join) -> bool:
+        """Whether the JOIN carries the NATURAL method keyword."""
+        method = join_clause.args.get("method")
+        return bool(method) and str(method).upper() == "NATURAL"
+
+    def _extract_using_columns(self, join_clause: exp.Join) -> Optional[List[str]]:
+        """Return the USING column names, or None when there is no USING."""
+        using = join_clause.args.get("using")
+        if not using:
+            return None
+        columns: List[str] = []
+        for identifier in using:
+            columns.append(identifier.name)
+        return columns
 
     def _extract_table_alias(self, table_expr: exp.Table) -> Optional[str]:
         """Extract table alias if present.
@@ -693,12 +873,12 @@ class Parser:
         return str(expr)
 
     def _build_order_by_clause(
-        self, select: exp.Select, input_plan: LogicalPlanNode
+        self, select: exp.Query, input_plan: LogicalPlanNode
     ) -> LogicalPlanNode:
         """Build Sort node from ORDER BY clause.
 
         Args:
-            select: sqlglot Select node
+            select: sqlglot Select or set-operation node
             input_plan: Input logical plan
 
         Returns:
@@ -735,12 +915,12 @@ class Parser:
         )
 
     def _build_limit_clause(
-        self, select: exp.Select, input_plan: LogicalPlanNode
+        self, select: exp.Query, input_plan: LogicalPlanNode
     ) -> LogicalPlanNode:
         """Build limit node from LIMIT clause.
 
         Args:
-            select: sqlglot Select node
+            select: sqlglot Select or set-operation node
             input_plan: Input logical plan
 
         Returns:
@@ -802,6 +982,14 @@ class Parser:
             return ColumnRef(table=None, column="*")
         if isinstance(expr, exp.Case):
             return self._convert_case_expression(expr)
+        if isinstance(expr, exp.Extract):
+            return self._convert_extract(expr)
+        if isinstance(expr, (exp.TimestampTrunc, exp.DateTrunc)):
+            return self._convert_date_trunc(expr)
+        if isinstance(expr, exp.Interval):
+            return self._convert_interval(expr)
+        if isinstance(expr, exp.Filter):
+            return self._convert_filter_aggregate(expr)
         if self._is_aggregate_function(expr):
             return self._convert_aggregate_function(expr)
         if isinstance(expr, (exp.Anonymous, exp.Func, exp.Upper)):
@@ -859,6 +1047,71 @@ class Parser:
         if default_expr is not None:
             else_expr = self._convert_expression(default_expr)
         return CaseExpr(when_clauses=when_clauses, else_result=else_expr)
+
+    def _convert_filter_aggregate(self, filter_expr: exp.Filter) -> FunctionCall:
+        """Convert ``AGG(...) FILTER (WHERE p)`` into a CASE-guarded aggregate.
+
+        Sources need not support the FILTER syntax: ``agg(x) FILTER (WHERE p)``
+        equals ``agg(CASE WHEN p THEN x END)`` (``THEN 1`` for ``COUNT(*)``),
+        which pushes down portably and keeps the aggregate node intact.
+        """
+        aggregate = self._convert_expression(filter_expr.this)
+        predicate = self._convert_expression(filter_expr.expression.this)
+        return self._guard_aggregate_args(aggregate, predicate)
+
+    def _guard_aggregate_args(
+        self, aggregate: FunctionCall, predicate: Expression
+    ) -> FunctionCall:
+        """Rebuild an aggregate with each argument gated by a filter predicate."""
+        guarded_args: List[Expression] = []
+        for arg in aggregate.args:
+            guarded_args.append(self._guard_one_arg(arg, predicate))
+        return FunctionCall(
+            function_name=aggregate.function_name,
+            args=guarded_args,
+            is_aggregate=aggregate.is_aggregate,
+            distinct=aggregate.distinct,
+        )
+
+    def _guard_one_arg(self, arg: Expression, predicate: Expression) -> CaseExpr:
+        """Build ``CASE WHEN predicate THEN arg END``, using 1 for COUNT(*)."""
+        result = arg
+        if isinstance(arg, ColumnRef) and arg.column == "*":
+            result = Literal(value=1, data_type=DataType.INTEGER)
+        return CaseExpr(when_clauses=[(predicate, result)], else_result=None)
+
+    def _convert_extract(self, extract: exp.Extract) -> Extract:
+        """Convert EXTRACT(field FROM source), keeping the field keyword.
+
+        sqlglot stores the field as a ``Var`` node (``YEAR``, ``MONTH`` ...) in
+        ``this`` and the source date/time expression in ``expression``.
+        """
+        field = extract.this.name
+        source = self._convert_expression(extract.expression)
+        return Extract(field=field, source=source)
+
+    def _convert_date_trunc(self, trunc: exp.Func) -> FunctionCall:
+        """Convert DATE_TRUNC into a portable two-argument function call.
+
+        The Postgres dialect normalises ``DATE_TRUNC('month', col)`` to a
+        ``TimestampTrunc`` node holding the unit as a ``Var`` under ``unit`` and
+        the source under ``this``; we re-materialise the standard call shape.
+        """
+        unit = trunc.args["unit"].name
+        source = self._convert_expression(trunc.this)
+        unit_literal = Literal(value=unit, data_type=DataType.VARCHAR)
+        return FunctionCall(function_name="DATE_TRUNC", args=[unit_literal, source])
+
+    def _convert_interval(self, interval: exp.Interval) -> Interval:
+        """Convert an INTERVAL literal, preserving its magnitude and unit.
+
+        sqlglot keeps the magnitude literal in ``this`` and the optional unit
+        keyword as a ``Var`` under ``unit`` (absent for multi-field intervals).
+        """
+        value = interval.this.name
+        unit_node = interval.args.get("unit")
+        unit = unit_node.name if unit_node is not None else None
+        return Interval(value=value, unit=unit)
 
     def _convert_column(self, col: exp.Column) -> ColumnRef:
         """Convert sqlglot Column to ColumnRef."""
@@ -1129,14 +1382,38 @@ class Parser:
         return args
 
     def _convert_function_call(self, func: exp.Expression) -> FunctionCall:
-        """Convert generic function expressions."""
+        """Convert generic function expressions, preserving every argument."""
         name = func.sql_name().upper()
         args: List[Expression] = []
-        if hasattr(func, "this") and func.this is not None:
-            args.append(self._convert_expression(func.this))
-        for child in func.expressions or []:
-            args.append(self._convert_expression(child))
+        self._collect_function_args(func, args)
         return FunctionCall(function_name=name, args=args, is_aggregate=False)
+
+    def _collect_function_args(
+        self, func: exp.Expression, args: List[Expression]
+    ) -> None:
+        """Gather a function's argument expressions in declaration order.
+
+        Typed functions store arguments under named keys (e.g. NULLIF uses
+        ``this`` and ``expression``), so iterate the node's ``arg_types``. An
+        Anonymous call keeps the function name in ``this``, so only its
+        ``expressions`` list holds real arguments.
+        """
+        if isinstance(func, exp.Anonymous):
+            for child in func.expressions or []:
+                args.append(self._convert_expression(child))
+            return
+        for key in func.arg_types:
+            self._append_function_arg(func.args.get(key), args)
+
+    def _append_function_arg(self, value, args: List[Expression]) -> None:
+        """Convert one argument slot, which may be a node or a list of nodes."""
+        if isinstance(value, exp.Expression):
+            args.append(self._convert_expression(value))
+            return
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, exp.Expression):
+                    args.append(self._convert_expression(item))
 
     def _rewrite_having_predicate(
         self, predicate: Expression, aggregate: Aggregate

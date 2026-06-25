@@ -9,6 +9,9 @@ from federated_query.plan.logical import (
     Filter,
     Projection,
     Scan,
+    LateralJoin,
+    CTE,
+    CTERef,
 )
 from federated_query.plan.expressions import (
     Literal,
@@ -94,31 +97,49 @@ def test_like_all_parses_to_quantified_comparison():
     assert predicate.quantifier == Quantifier.ALL
 
 
-def test_lateral_rejected_with_clear_error():
-    """LATERAL must fail with a clear message, not an AttributeError."""
-    with pytest.raises(ValueError, match="LATERAL"):
-        parse(
-            "SELECT u.id, o.amount FROM pg.users u, "
-            "LATERAL (SELECT amount FROM pg.orders WHERE user_id = u.id LIMIT 1) o"
-        )
+def _plan_has(plan, node_type):
+    """Whether a node of the given type appears anywhere in a plan."""
+    if isinstance(plan, node_type):
+        return True
+    for child in plan.children():
+        if _plan_has(child, node_type):
+            return True
+    return False
 
 
-def test_with_clause_rejected_with_clear_error():
-    """WITH (CTE) must fail fast instead of being silently dropped."""
-    with pytest.raises(ValueError, match="WITH"):
-        parse("WITH t AS (SELECT id FROM pg.users) SELECT * FROM t")
+def test_lateral_parses_to_lateral_join():
+    """LATERAL parses into a LateralJoin (dependent join) node."""
+    plan = parse(
+        "SELECT u.id, o.amount FROM pg.users u, "
+        "LATERAL (SELECT amount FROM pg.orders WHERE user_id = u.id LIMIT 1) o"
+    )
+    assert _plan_has(plan, LateralJoin)
 
 
-def test_recursive_cte_rejected_with_clear_error():
-    """WITH RECURSIVE must fail fast."""
-    with pytest.raises(ValueError, match="WITH"):
-        parse(
-            "WITH RECURSIVE tree AS ("
-            " SELECT id, name FROM pg.users WHERE id = 1"
-            " UNION ALL"
-            " SELECT u.id, u.name FROM pg.users u, tree t WHERE u.id = t.id + 1)"
-            " SELECT * FROM tree"
-        )
+def test_with_clause_parsed_as_cte():
+    """A WITH clause becomes a CTE node whose name reference is a CTERef."""
+    plan = parse("WITH t AS (SELECT id FROM pg.users) SELECT id FROM t")
+    assert isinstance(plan, CTE)
+    assert plan.name == "t"
+    child = plan.child
+    while not isinstance(child, CTERef) and hasattr(child, "input"):
+        child = child.input
+    assert isinstance(child, CTERef)
+    assert child.name == "t"
+
+
+def test_recursive_cte_parsed_with_flag():
+    """WITH RECURSIVE sets the recursive flag and the explicit column list."""
+    plan = parse(
+        "WITH RECURSIVE tree(id, name) AS ("
+        " SELECT id, name FROM pg.users WHERE id = 1"
+        " UNION ALL"
+        " SELECT u.id, u.name FROM pg.users u, tree t WHERE u.id = t.id + 1)"
+        " SELECT id FROM tree"
+    )
+    assert isinstance(plan, CTE)
+    assert plan.recursive is True
+    assert plan.column_names == ["id", "name"]
 
 
 def test_fromless_select_with_where_rejected():

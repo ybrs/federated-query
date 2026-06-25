@@ -50,6 +50,7 @@ def find_in_select(
         node = expression
         if isinstance(expression, exp.Alias):
             node = expression.this
+        node = unwrap_parens(node)
         if predicate(node):
             matches.append(node)
     return matches
@@ -117,7 +118,7 @@ def find_alias_expression(
     for expression in select_ast.expressions:
         alias_name = getattr(expression, "alias", None)
         if alias_name == alias and isinstance(expression, exp.Alias):
-            return expression.this
+            return unwrap_parens(expression.this)
     return None
 
 

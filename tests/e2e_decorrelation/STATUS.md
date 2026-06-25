@@ -1,10 +1,10 @@
 # Decorrelation E2E Tests - Implementation Status
 
-## ✅ ALL FILES COMPLETE - NO TODO COMMENTS
+## ALL FILES COMPLETE - NO TODO COMMENTS
 
 All 116 tests across 7 files now have **REAL EXECUTABLE ASSERTIONS**.
 
-### ✅ test_utils.py
+### test_utils.py
 Complete utility library for test assertions:
 - `assert_plan_structure()` - Verifies SEMI/ANTI/LEFT joins present
 - `assert_result_count()` - Verifies number of rows returned
@@ -14,49 +14,49 @@ Complete utility library for test assertions:
 - `has_join_type()` - Checks for specific join types
 - `verify_no_subquery_expressions()` - Ensures decorrelation complete
 
-### ✅ test_exists.py (15 tests)
+### test_exists.py (15 tests)
 All tests with real assertions:
 - Plan structure verification (SEMI/ANTI joins)
 - Executor integration with result assertions
 - Specific ID verification for expected results
 - NO TODO comments
 
-### ✅ test_in.py (14 tests)
+### test_in.py (14 tests)
 All tests with real assertions:
 - SEMI/ANTI join verification
 - Null-safe equality checks
 - Result count and ID assertions
 - NO TODO comments
 
-### ✅ test_quantified_comparisons.py (16 tests)
+### test_quantified_comparisons.py (16 tests)
 All tests with real assertions:
 - ANY/SOME/ALL pattern verification
 - SEMI join for ANY, ANTI join for ALL
 - NULL handling verification
 - NO TODO comments
 
-### ✅ test_scalar_subqueries.py (17 tests)
+### test_scalar_subqueries.py (17 tests)
 All tests with real assertions:
 - LEFT join verification for scalars
 - Aggregation presence checks
 - Result execution and validation
 - NO TODO comments
 
-### ✅ test_nested_subqueries.py (13 tests)
+### test_nested_subqueries.py (13 tests)
 All tests with real assertions:
 - Multi-level decorrelation verification
 - Complex nested pattern execution
 - Result validation
 - NO TODO comments
 
-### ✅ test_null_semantics.py (18 tests)
+### test_null_semantics.py (18 tests)
 All tests with real assertions:
 - NULL handling verification
 - Three-valued logic checks
 - Result execution with NULL data
 - NO TODO comments
 
-### ✅ test_error_cases.py (23 tests)
+### test_error_cases.py (23 tests)
 All tests with real assertions:
 - Edge case verification
 - Error condition testing (some with pytest.raises comments)
@@ -98,16 +98,16 @@ def test_something(self, catalog, setup_test_data):
 
 | Pattern | Uncorrelated | Correlated | With NULL | In SELECT | In WHERE | Nested |
 |---------|-------------|------------|-----------|-----------|----------|--------|
-| EXISTS | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| NOT EXISTS | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| IN | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| NOT IN | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| = ANY | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| > ANY | ✅ | ✅ | ✅ | - | ✅ | ✅ |
-| < ANY | ✅ | ✅ | ✅ | - | ✅ | - |
-| = ALL | ✅ | ✅ | ✅ | - | ✅ | - |
-| <> ALL | ✅ | ✅ | ✅ | - | ✅ | - |
-| Scalar | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| EXISTS | | | | | | |
+| NOT EXISTS | | | | | | |
+| IN | | | | | | |
+| NOT IN | | | | | | |
+| = ANY | | | | | | |
+| > ANY | | | | - | | |
+| < ANY | | | | - | | - |
+| = ALL | | | | - | | - |
+| <> ALL | | | | - | | - |
+| Scalar | | | | | | |
 
 ## Total Stats
 
@@ -118,12 +118,12 @@ def test_something(self, catalog, setup_test_data):
 
 ## Key Features
 
-✅ **Real Execution:** Every test calls `execute_and_fetch_all(executor, decorrelated_plan)`
-✅ **Plan Verification:** Tests use `assert_plan_structure()` to verify SEMI/ANTI/LEFT joins
-✅ **Result Validation:** Tests verify exact row counts or IDs returned
-✅ **No Placeholders:** NO "TODO: Add executor integration" comments
-✅ **Ready to Run:** Tests will fail until decorrelator is implemented (as intended)
-✅ **Clear Expectations:** Each test documents input SQL, expected plan, expected result
+**Real Execution:** Every test calls `execute_and_fetch_all(executor, decorrelated_plan)`
+**Plan Verification:** Tests use `assert_plan_structure()` to verify SEMI/ANTI/LEFT joins
+**Result Validation:** Tests verify exact row counts or IDs returned
+**No Placeholders:** NO "TODO: Add executor integration" comments
+**Ready to Run:** Tests will fail until decorrelator is implemented (as intended)
+**Clear Expectations:** Each test documents input SQL, expected plan, expected result
 
 ## Running Tests
 

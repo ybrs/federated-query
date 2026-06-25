@@ -2,11 +2,43 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, List, Optional, Tuple, TYPE_CHECKING
 from enum import Enum
 
 if TYPE_CHECKING:
     from .logical import LogicalPlanNode
+
+
+@lru_cache(maxsize=None)
+def _identifier_needs_quoting(name: str) -> bool:
+    """Whether a bare identifier must be quoted to be valid SQL.
+
+    A reserved word (e.g. ``select``, ``order``) does not round-trip as a plain
+    column name, so it must be double-quoted. Checked once per name by
+    re-parsing ``SELECT <name>`` and caching the result.
+    """
+    import sqlglot
+    from sqlglot import exp
+    from sqlglot.errors import ParseError
+
+    try:
+        parsed = sqlglot.parse_one(f"SELECT {name}")
+    except ParseError:
+        return True
+    selected = parsed.expressions[0] if parsed.expressions else None
+    return not (
+        isinstance(selected, exp.Column) and selected.name.upper() == name.upper()
+    )
+
+
+def render_identifier(name: str) -> str:
+    """Render a column/identifier name, quoting it when SQL requires it."""
+    if name == "*":
+        return name
+    if _identifier_needs_quoting(name):
+        return f'"{name}"'
+    return name
 
 
 class DataType(Enum):
@@ -22,6 +54,7 @@ class DataType(Enum):
     BOOLEAN = "BOOLEAN"
     DATE = "DATE"
     TIMESTAMP = "TIMESTAMP"
+    INTERVAL = "INTERVAL"
     NULL = "NULL"
 
 
@@ -61,9 +94,10 @@ class ColumnRef(Expression):
         return visitor.visit_column_ref(self)
 
     def to_sql(self) -> str:
+        column = render_identifier(self.column)
         if self.table:
-            return f"{self.table}.{self.column}"
-        return self.column
+            return f"{self.table}.{column}"
+        return column
 
     def __repr__(self) -> str:
         if self.table:
@@ -354,6 +388,63 @@ class Cast(Expression):
         return f"Cast({self.expr} AS {self.target_type})"
 
 
+@dataclass(frozen=True)
+class Extract(Expression):
+    """``EXTRACT(field FROM source)`` date/time field extraction.
+
+    ``field`` is the unit keyword (``YEAR``, ``MONTH`` ...); ``source`` is the
+    date/time expression it is taken from. The result is a numeric value.
+    """
+
+    field: str
+    source: Expression
+
+    def get_type(self) -> DataType:
+        """EXTRACT yields a numeric component, modelled as a double."""
+        return DataType.DOUBLE
+
+    def accept(self, visitor):
+        """Dispatch to the visitor's extract hook."""
+        return visitor.visit_extract(self)
+
+    def to_sql(self) -> str:
+        """Render the keyword-argument EXTRACT syntax."""
+        return f"EXTRACT({self.field} FROM {self.source.to_sql()})"
+
+    def __repr__(self) -> str:
+        return f"Extract({self.field} FROM {self.source})"
+
+
+@dataclass(frozen=True)
+class Interval(Expression):
+    """An ``INTERVAL 'value unit'`` literal such as ``INTERVAL '30 days'``.
+
+    ``value`` is the magnitude text (``'30'``) and ``unit`` the optional unit
+    keyword (``DAYS``); some intervals carry the whole specification in
+    ``value`` and leave ``unit`` as ``None``.
+    """
+
+    value: str
+    unit: Optional[str]
+
+    def get_type(self) -> DataType:
+        """Interval literals carry the INTERVAL type."""
+        return DataType.INTERVAL
+
+    def accept(self, visitor):
+        """Dispatch to the visitor's interval hook."""
+        return visitor.visit_interval(self)
+
+    def to_sql(self) -> str:
+        """Render the INTERVAL literal with its unit when present."""
+        if self.unit:
+            return f"INTERVAL '{self.value} {self.unit}'"
+        return f"INTERVAL '{self.value}'"
+
+    def __repr__(self) -> str:
+        return f"Interval({self.value} {self.unit})"
+
+
 class ExpressionVisitor(ABC):
     """Visitor interface for expressions."""
 
@@ -391,6 +482,14 @@ class ExpressionVisitor(ABC):
 
     @abstractmethod
     def visit_cast(self, expr: "Cast"):
+        pass
+
+    @abstractmethod
+    def visit_extract(self, expr: "Extract"):
+        pass
+
+    @abstractmethod
+    def visit_interval(self, expr: "Interval"):
         pass
 
     @abstractmethod

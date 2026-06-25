@@ -31,6 +31,14 @@ class AggregateFunction(Enum):
     COUNT_DISTINCT = "COUNT_DISTINCT"
 
 
+class SetOpKind(Enum):
+    """SQL set-operation kinds."""
+
+    UNION = "UNION"
+    INTERSECT = "INTERSECT"
+    EXCEPT = "EXCEPT"
+
+
 class ExplainFormat(Enum):
     """Supported EXPLAIN output formats."""
 
@@ -204,14 +212,26 @@ class Join(LogicalPlanNode):
     left: LogicalPlanNode
     right: LogicalPlanNode
     join_type: JoinType
-    condition: Optional[Expression]  # None for cross join
+    condition: Optional[Expression]  # None for cross/NATURAL/USING joins
+    # NATURAL and USING joins carry no ON predicate: the source matches columns
+    # by name. ``natural`` flags a NATURAL JOIN; ``using`` lists the shared
+    # column names of a USING join.
+    natural: bool = False
+    using: Optional[List[str]] = None
 
     def children(self) -> List[LogicalPlanNode]:
         return [self.left, self.right]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Join":
         assert len(children) == 2
-        return Join(children[0], children[1], self.join_type, self.condition)
+        return Join(
+            children[0],
+            children[1],
+            self.join_type,
+            self.condition,
+            self.natural,
+            self.using,
+        )
 
     def accept(self, visitor):
         return visitor.visit_join(self)
@@ -334,6 +354,39 @@ class Union(LogicalPlanNode):
 
 
 @dataclass(frozen=True)
+class SetOperation(LogicalPlanNode):
+    """Binary SQL set operation (UNION / INTERSECT / EXCEPT).
+
+    ``distinct`` is True for the bare form (which removes duplicates) and
+    False for the ``ALL`` form (which preserves row multiplicity). Chained
+    set operations nest left-associatively, mirroring the parser AST.
+    """
+
+    left: LogicalPlanNode
+    right: LogicalPlanNode
+    kind: SetOpKind
+    distinct: bool
+
+    def children(self) -> List[LogicalPlanNode]:
+        return [self.left, self.right]
+
+    def with_children(self, children: List[LogicalPlanNode]) -> "SetOperation":
+        assert len(children) == 2
+        return SetOperation(children[0], children[1], self.kind, self.distinct)
+
+    def accept(self, visitor):
+        return visitor.visit_set_operation(self)
+
+    def schema(self) -> List[str]:
+        # Both branches share a schema; the left branch names the result.
+        return self.left.schema()
+
+    def __repr__(self) -> str:
+        suffix = "" if self.distinct else " ALL"
+        return f"{self.kind.value}{suffix}(left, right)"
+
+
+@dataclass(frozen=True)
 class Explain(LogicalPlanNode):
     """Explain wrapper around another plan."""
 
@@ -361,19 +414,29 @@ class Explain(LogicalPlanNode):
 class CTE(LogicalPlanNode):
     """Common table expression wrapper.
 
-    Holds a named subplan and a root plan that can reference it.
+    Holds a named subplan and a root plan that can reference it. ``recursive``
+    marks a ``WITH RECURSIVE`` whose body references its own name;
+    ``column_names`` carries an explicit output column list (``counter(n)``).
     """
 
     name: str
     cte_plan: LogicalPlanNode
     child: LogicalPlanNode
+    recursive: bool = False
+    column_names: Optional[List[str]] = None
 
     def children(self) -> List[LogicalPlanNode]:
         return [self.cte_plan, self.child]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "CTE":
         assert len(children) == 2
-        return CTE(name=self.name, cte_plan=children[0], child=children[1])
+        return CTE(
+            name=self.name,
+            cte_plan=children[0],
+            child=children[1],
+            recursive=self.recursive,
+            column_names=self.column_names,
+        )
 
     def accept(self, visitor):
         return visitor.visit_cte(self)
@@ -383,6 +446,39 @@ class CTE(LogicalPlanNode):
 
     def __repr__(self) -> str:
         return f"CTE({self.name})"
+
+
+@dataclass(frozen=True)
+class CTERef(LogicalPlanNode):
+    """A reference to a CTE by name, used in a FROM/JOIN position.
+
+    A dedicated leaf node (not a ``Scan``) so optimizer passes can recognize a
+    CTE reference distinctly from a catalog table. ``alias`` is how the
+    reference is addressed in the query; ``columns`` are the referenced column
+    names and ``output_names`` (filled by the binder) are the CTE's full output
+    schema.
+    """
+
+    name: str
+    alias: Optional[str] = None
+    columns: Optional[List[str]] = None
+    output_names: Optional[List[str]] = None
+
+    def children(self) -> List[LogicalPlanNode]:
+        return []
+
+    def with_children(self, children: List[LogicalPlanNode]) -> "CTERef":
+        assert len(children) == 0
+        return self
+
+    def accept(self, visitor):
+        return visitor.visit_cte_ref(self)
+
+    def schema(self) -> List[str]:
+        return self.output_names or self.columns or []
+
+    def __repr__(self) -> str:
+        return f"CTERef({self.name})"
 
 
 @dataclass(frozen=True)
@@ -482,13 +578,26 @@ class GroupedLimit(LogicalPlanNode):
     input: LogicalPlanNode
     keys: List[Expression]
     limit: int
+    # Optional per-key ordering: when set, each key group is sorted by these
+    # keys before its first ``limit`` rows are kept (the "first/latest row per
+    # key" idiom). When None, rows are kept in input order.
+    order_by_keys: Optional[List[Expression]] = None
+    order_by_ascending: Optional[List[bool]] = None
+    order_by_nulls: Optional[List[Optional[str]]] = None
 
     def children(self) -> List[LogicalPlanNode]:
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "GroupedLimit":
         assert len(children) == 1
-        return GroupedLimit(input=children[0], keys=self.keys, limit=self.limit)
+        return GroupedLimit(
+            input=children[0],
+            keys=self.keys,
+            limit=self.limit,
+            order_by_keys=self.order_by_keys,
+            order_by_ascending=self.order_by_ascending,
+            order_by_nulls=self.order_by_nulls,
+        )
 
     def accept(self, visitor):
         return visitor.visit_grouped_limit(self)
@@ -498,6 +607,40 @@ class GroupedLimit(LogicalPlanNode):
 
     def __repr__(self) -> str:
         return f"GroupedLimit(limit={self.limit}, keys={len(self.keys)})"
+
+
+@dataclass(frozen=True)
+class LateralJoin(LogicalPlanNode):
+    """A dependent (lateral) join: the right side may reference left columns.
+
+    This is the decorrelation fallback for a correlated subquery that cannot be
+    flattened into a set-based join — a non-equality correlation crossing an
+    aggregate or LIMIT, or a skip-level correlation. The right side is a
+    correlated subquery subtree (with the outer references kept) that is
+    evaluated per left row; the executing engine — a pushed-to source, or the
+    in-memory DuckDB merge engine — decorrelates and runs it. ``join_type`` is
+    LEFT so an outer row with no subquery match still survives (value NULL).
+    """
+
+    left: LogicalPlanNode
+    right: LogicalPlanNode
+    join_type: JoinType
+
+    def children(self) -> List[LogicalPlanNode]:
+        return [self.left, self.right]
+
+    def with_children(self, children: List[LogicalPlanNode]) -> "LateralJoin":
+        assert len(children) == 2
+        return LateralJoin(children[0], children[1], self.join_type)
+
+    def accept(self, visitor):
+        return visitor.visit_lateral_join(self)
+
+    def schema(self) -> List[str]:
+        return self.left.schema() + self.right.schema()
+
+    def __repr__(self) -> str:
+        return f"LateralJoin({self.join_type.name})"
 
 
 class LogicalPlanVisitor(ABC):
@@ -536,6 +679,10 @@ class LogicalPlanVisitor(ABC):
         pass
 
     @abstractmethod
+    def visit_set_operation(self, node: "SetOperation"):
+        pass
+
+    @abstractmethod
     def visit_explain(self, node: Explain):
         pass
 
@@ -557,4 +704,10 @@ class LogicalPlanVisitor(ABC):
 
     @abstractmethod
     def visit_grouped_limit(self, node: "GroupedLimit"):
+        pass
+
+    def visit_lateral_join(self, node: "LateralJoin"):
+        pass
+
+    def visit_cte_ref(self, node: "CTERef"):
         pass

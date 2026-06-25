@@ -4,6 +4,8 @@ This document provides an overview of the codebase structure, key classes, compi
 
 ## Coding Rules
 
+No emoji, emoticons, or status glyphs anywhere — not in docs, comments, commit messages, log output, or code. Never use symbols like a green check, an hourglass, colored circles (red/yellow/green dots), a construction sign, a warning triangle, stars, or any pictographic character to convey status or decoration. Write the plain word instead: "DONE", "COMPLETE", "NOT STARTED", "PENDING", "IN PROGRESS", "PASS", "FAIL", "WARNING", "CRITICAL", "yes"/"no". Markdown task checkboxes (`- [x]` / `- [ ]`) are fine because they are plain text. The only acceptable non-ASCII characters are ones that are genuinely part of readable text or required test data (e.g. accented names, CJK/Arabic strings in a test fixture). Status must be readable as words.
+
 Never fail silently. If something breaks it should throw an error. We don't want silent fails. You can only catch exceptions when we show it to the user in the cli. Otherwise all exceptions should be thrown. 
 
 No legacy / compatibility cruft. This is a system we are building from scratch — there is no legacy code, no old callers, no external API to stay compatible with. Never add "store for compatibility" fields, shim attributes, dead aliases, or back-compat branches. If something is no longer needed, delete it; if an abstraction doesn't fit (e.g. a base attribute that a subclass can't honor), fix the abstraction and its callers, don't paper over it. A comment like "kept for compatibility" is a red flag to remove, not preserve.
@@ -251,7 +253,7 @@ When working on this codebase, **strictly adhere** to the following rules:
 
 **NEVER catch bare exceptions.** We want to see exceptions at higher levels. Don't catch exceptions unnecessarily.
 
-❌ **WRONG:**
+**WRONG:**
 ```python
 def parse(self, sql: str) -> exp.Expression:
     try:
@@ -263,7 +265,7 @@ def parse(self, sql: str) -> exp.Expression:
 
 This is wrong because it adds complexity and hides the correct cause of the parse error.
 
-✅ **CORRECT:**
+**CORRECT:**
 ```python
 def parse(self, sql: str) -> exp.Expression:
     parsed = sqlglot.parse_one(sql, dialect=self.dialect)
@@ -276,12 +278,12 @@ def parse(self, sql: str) -> exp.Expression:
 
 **NEVER use list comprehensions.** Always use explicit loops for clarity and debuggability.
 
-❌ **WRONG:**
+**WRONG:**
 ```python
 columns = [desc[0] for desc in cursor.description]
 ```
 
-✅ **CORRECT:**
+**CORRECT:**
 ```python
 columns = []
 for desc in cursor.description:
@@ -344,12 +346,12 @@ If a function exceeds 20 lines of actual code, refactor it into smaller function
 ## Current Development Status
 
 This project is in **Phase 0** (completed) with basic infrastructure:
-- ✅ Project structure and skeleton
-- ✅ Core abstractions (plans, expressions, data sources)
-- ✅ Configuration system
-- ✅ Basic catalog structure
-- ✅ Test infrastructure
-- ✅ Data source connectors (PostgreSQL, DuckDB)
+- Project structure and skeleton
+- Core abstractions (plans, expressions, data sources)
+- Configuration system
+- Basic catalog structure
+- Test infrastructure
+- Data source connectors (PostgreSQL, DuckDB)
 
 See `tasks.md` for the full roadmap.
 

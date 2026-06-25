@@ -18,6 +18,8 @@ from federated_query.plan.expressions import (
     DataType,
     FunctionCall,
     Cast,
+    Extract,
+    Interval,
     CaseExpr,
     InList,
     BetweenExpression,
@@ -54,6 +56,8 @@ def _one_of_each_expression():
         (InList(value=col, options=[lit]), "in_list"),
         (BetweenExpression(value=col, lower=lit, upper=lit), "between"),
         (Cast(expr=col, target_type="VARCHAR"), "cast"),
+        (Extract(field="YEAR", source=col), "extract"),
+        (Interval(value="30", unit="DAYS"), "interval"),
         (SubqueryExpression(subquery=plan), "subquery"),
         (ExistsExpression(subquery=plan), "exists"),
         (InSubquery(value=col, subquery=plan), "in_subquery"),
@@ -99,6 +103,12 @@ class _LabelVisitor(ExpressionVisitor):
 
     def visit_cast(self, expr):
         return "cast"
+
+    def visit_extract(self, expr):
+        return "extract"
+
+    def visit_interval(self, expr):
+        return "interval"
 
     def visit_subquery(self, expr):
         return "subquery"
@@ -159,6 +169,12 @@ class _ColumnCollector(ExpressionVisitor):
 
     def visit_cast(self, expr):
         expr.expr.accept(self)
+
+    def visit_extract(self, expr):
+        expr.source.accept(self)
+
+    def visit_interval(self, expr):
+        return None
 
     def visit_tuple(self, expr):
         for item in expr.items:

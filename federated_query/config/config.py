@@ -1,7 +1,7 @@
 """Configuration management for federated query engine."""
 
 from dataclasses import dataclass, field
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import yaml
 from pathlib import Path
 
@@ -35,6 +35,13 @@ class ExecutorConfig:
     batch_size: int = 10000
     max_threads: int = 4
     enable_parallel_fetch: bool = True
+    # Local "merge engine" (in-memory DuckDB coordinator) settings. The engine
+    # merges the Arrow streams returned by remote sources; it buffers only what
+    # the algorithm requires and spills to ``merge_engine_temp_directory`` once
+    # it exceeds ``merge_engine_memory_limit``. The temp directory is left to
+    # DuckDB's default when None.
+    merge_engine_memory_limit: str = "1GB"
+    merge_engine_temp_directory: Optional[str] = None
 
 
 @dataclass

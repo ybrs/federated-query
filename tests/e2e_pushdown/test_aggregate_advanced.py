@@ -1,5 +1,7 @@
 """Advanced aggregate functions pushdown tests."""
 
+import pytest
+
 from sqlglot import exp
 
 from tests.e2e_pushdown.helpers import (
@@ -190,7 +192,7 @@ def test_nested_aggregate_via_subquery(single_source_env):
     assert avg_expr is not None
     assert isinstance(avg_expr, exp.Avg)
 
-    from_clause = ast.args.get("from")
+    from_clause = ast.find(exp.From)
     assert from_clause is not None
     from_table = from_clause.this
     assert isinstance(from_table, exp.Subquery)

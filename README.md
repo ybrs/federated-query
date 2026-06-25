@@ -11,11 +11,13 @@ A production-grade federated query engine written in Python that executes SQL qu
 ## Features
 
 - **Multi-Source Querying**: Execute SQL queries across PostgreSQL and DuckDB data sources
-- **Intelligent Optimization**: Cost-based query optimization with predicate pushdown, projection pushdown, and join reordering
-- **Decorrelation**: Automatic transformation of correlated subqueries into efficient joins
-- **Flexible Execution**: Support for broadcast joins, hash joins, and nested loop joins
+- **Pushdown Optimization**: Predicate, projection, aggregate, order-by, and limit pushdown; same-source joins and set operations pushed to the source as a single remote query
+- **Set Operations**: `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT`, pushed down when single-source and evaluated locally (multiset semantics) when cross-source
+- **Decorrelation**: Automatic transformation of correlated subqueries (EXISTS/IN/ANY/ALL/scalar) into efficient joins with exact three-valued-logic NULL semantics
+- **Flexible Execution**: Hash joins, nested-loop joins, and remote (single-source) joins
+- **Native EXPLAIN**: Inspect the physical plan and the exact remote SQL each source will run, without touching the data
 - **Arrow-Based**: Uses Apache Arrow for efficient in-memory data representation and transfer
-- **Production-Ready**: Comprehensive error handling, logging, and configuration
+- **Fail-Fast**: Errors surface instead of being silently swallowed or producing wrong results
 
 ## Architecture
 
@@ -162,7 +164,7 @@ Use `EXPLAIN` to inspect how a query will run without touching the underlying da
 EXPLAIN SELECT id, name FROM duckdb.main.users WHERE age > 30;
 ```
 
-The engine returns a single-column result where each row is a formatted physical operator (including stubbed cost values, row estimates, and key attributes) so you can understand join order, predicates, and data source usage before executing the statement.
+The engine returns a single-column result where each row is a formatted physical operator (including stubbed cost values, row estimates, and key attributes) so you can understand join order, predicates, and data source usage before executing the statement. The `Queries:` section shows the exact SQL sent to each source. For a cross-source join with dynamic filtering, the probe-side query shows the runtime `key IN (...)` predicate with real build-side values — to print those, EXPLAIN reads a few rows from the build side (capped, so it never scans a large table just to render the plan).
 
 ### Interactive CLI (`fedq`)
 
@@ -187,35 +189,35 @@ This project is under active development. See `tasks.md` for the implementation 
 
 ### Completed Phases
 
-**Phase 0: Foundation** ✅
-- ✅ Project structure and skeleton
-- ✅ Core abstractions (plans, expressions, data sources)
-- ✅ Configuration system
-- ✅ Basic catalog structure
-- ✅ Data source connectors (PostgreSQL, DuckDB)
-- ✅ Test infrastructure
+**Phase 0: Foundation** (done)
+- Project structure and skeleton
+- Core abstractions (plans, expressions, data sources)
+- Configuration system
+- Basic catalog structure
+- Data source connectors (PostgreSQL, DuckDB)
+- Test infrastructure
 
-**Phase 1: Basic Query Execution** ✅
-- ✅ Parser: AST to logical plan conversion
-- ✅ Binder: Reference resolution with catalog integration
-- ✅ Physical operators: Scan, Filter, Projection, Limit
-- ✅ Basic executor: Single-table queries
-- ✅ End-to-end pipeline for simple SELECT queries
+**Phase 1: Basic Query Execution** (done)
+- Parser: AST to logical plan conversion
+- Binder: Reference resolution with catalog integration
+- Physical operators: Scan, Filter, Projection, Limit
+- Basic executor: Single-table queries
+- End-to-end pipeline for simple SELECT queries
 
 **Query Example (Phase 1):**
 ```sql
 SELECT col1, col2 FROM datasource.schema.table WHERE col1 > 10 LIMIT 100
 ```
 
-**Phase 2: Joins and Multi-Table Queries** ✅
-- ✅ Logical Join plan node with all join types
-- ✅ Physical HashJoin implementation
-- ✅ Physical NestedLoopJoin implementation
-- ✅ Parser support for JOIN clauses
-- ✅ Binder support for multi-table column resolution
-- ✅ Physical planner join strategy selection
-- ✅ All 70 tests passing (including 5 join tests)
-- ✅ Federated join example working (DuckDB + PostgreSQL)
+**Phase 2: Joins and Multi-Table Queries** (done)
+- Logical Join plan node with all join types
+- Physical HashJoin implementation
+- Physical NestedLoopJoin implementation
+- Parser support for JOIN clauses
+- Binder support for multi-table column resolution
+- Physical planner join strategy selection
+- All 70 tests passing (including 5 join tests)
+- Federated join example working (DuckDB + PostgreSQL)
 
 **Query Example (Phase 2):**
 ```sql
@@ -225,13 +227,13 @@ JOIN postgres.orders o ON c.id = o.customer_id
 WHERE o.amount > 1000
 ```
 
-**Phase 3: Aggregations and Grouping** ✅
-- ✅ Aggregations and grouping
-- ✅ GROUP BY clause support (single and multiple columns)
-- ✅ Aggregate functions (COUNT, SUM, AVG, MIN, MAX)
-- ✅ HAVING clause support with expression rewriting
-- ✅ Global aggregations (without GROUP BY)
-- ✅ Federated aggregations across data sources
+**Phase 3: Aggregations and Grouping** (done)
+- Aggregations and grouping
+- GROUP BY clause support (single and multiple columns)
+- Aggregate functions (COUNT, SUM, AVG, MIN, MAX)
+- HAVING clause support with expression rewriting
+- Global aggregations (without GROUP BY)
+- Federated aggregations across data sources
 
 **Query Example (Phase 3):**
 ```sql
@@ -242,17 +244,17 @@ GROUP BY c.name
 HAVING SUM(o.amount) > 2000
 ```
 
-**Phase 7: Subquery Decorrelation** ✅
-- ✅ EXISTS / NOT EXISTS → SEMI / ANTI joins
-- ✅ IN / NOT IN → SEMI / ANTI joins with exact NULL semantics (incl. tuple IN)
-- ✅ ANY / SOME / ALL quantified comparisons (incl. LIKE ALL)
-- ✅ Scalar subqueries → LEFT joins with aggregation, COALESCE for COUNT,
+**Phase 7: Subquery Decorrelation** (done)
+- EXISTS / NOT EXISTS → SEMI / ANTI joins
+- IN / NOT IN → SEMI / ANTI joins with exact NULL semantics (incl. tuple IN)
+- ANY / SOME / ALL quantified comparisons (incl. LIKE ALL)
+- Scalar subqueries → LEFT joins with aggregation, COALESCE for COUNT,
   runtime cardinality guards, per-key limits for correlated LIMIT
-- ✅ Boolean subqueries in SELECT lists (flag columns via SEMI/ANTI unions)
-- ✅ OR-of-subqueries via union expansion; nested subqueries innermost-first
-- ✅ Derived tables and subqueries in INNER join conditions
-- ✅ Scoped subquery binding (correlated references resolved by the binder)
-- ✅ All 116 decorrelation e2e tests passing against PostgreSQL
+- Boolean subqueries in SELECT lists (flag columns via SEMI/ANTI unions)
+- OR-of-subqueries via union expansion; nested subqueries innermost-first
+- Derived tables and subqueries in INNER join conditions
+- Scoped subquery binding (correlated references resolved by the binder)
+- All 116 decorrelation e2e tests passing against PostgreSQL
 
 **Query Example (Phase 7):**
 ```sql
@@ -263,10 +265,36 @@ WHERE u.country IN (SELECT code FROM countries WHERE enabled)
   AND EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.amount > 100)
 ```
 
+**Phase 7 Review + Phase 8 (in progress)**
+- Native `EXPLAIN (FORMAT ...)` via a custom sqlglot dialect (no more
+  Command-string fallback)
+- Operator/cast correctness: `||`/`CONCAT`/`ILIKE`/`CAST`, string escaping,
+  typed literals, OFFSET-without-LIMIT, NULL-aware comparisons
+- Decorrelation correctness fixes (self-join aliasing, `NOT (subquery)`
+  three-valued logic, EXISTS-over-global-aggregate, OR-expansion multiplicity,
+  COUNT(DISTINCT), hash-join key orientation)
+- Many pre-existing silent-fail / correctness fixes (DuckDB typed schemas,
+  remote-join side filters, predicate-pushdown recursion, WHERE/HAVING split,
+  NULLS FIRST/LAST, MIN/MAX type preservation)
+- **Set operations** (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`) — parse,
+  bind, single-source pushdown, and local multiset execution
+- In progress (tracked in `TODO-phase7-review.md`, section G): broader
+  same-source join pushdown (G1), computed-projection pushdown (G2), CTEs (G3),
+  `CAST` target types (G5), date/time functions (G6), aggregate `FILTER` (G7)
+
+### Known Limitations
+- **Cross-source joins fetch both sides in full** and join locally — there is
+  no dynamic filtering / semi-join reduction yet, so the probe side ships its
+  entire table over the network. This is the top usability gap, tracked as
+  **G9** in `TODO-phase7-review.md`.
+- A comma/cross join with a two-sided equality in `WHERE` currently plans to a
+  nested-loop (Cartesian) join + filter rather than a hash join (G9a).
+
 ### Next Phases
-- **Phase 8**: Physical planning and advanced join strategies
+- **Phase 8**: Pushdown breadth (joins, projections), CTEs, date/time, and
+  cross-source dynamic filtering (semi-join reduction)
 - **Phase 9**: Parallel execution and memory management
-- **Phase 10**: Advanced SQL features (window functions, CTEs, set operations)
+- **Phase 10**: Window functions and remaining advanced SQL
 
 ## Testing
 
@@ -296,11 +324,16 @@ pytest tests/test_parser.py
 
 ## Performance Considerations
 
+Implemented today:
 - **Predicate Pushdown**: Filters are pushed to data sources whenever possible
 - **Projection Pushdown**: Only required columns are fetched from sources
-- **Join Strategy Selection**: Automatically chooses between broadcast, hash, and nested loop joins
-- **Parallel Execution**: Fetches from multiple data sources in parallel
-- **Memory Management**: Spills to disk when memory limits are exceeded
+- **Same-Source Pushdown**: Single-source joins and set operations are sent to the source as one remote query
+- **Join Strategy Selection**: Chooses between hash and nested-loop joins (remote join when both sides share a source)
+
+Not yet implemented (roadmap):
+- **Cross-Source Dynamic Filtering** (semi-join reduction) — see G9; today cross-source joins fetch both sides in full
+- **Parallel Execution** — sources are currently fetched sequentially
+- **Memory Management / spill-to-disk** — execution is in-memory
 
 ## Contributing
 

@@ -44,14 +44,14 @@ def test_cli():
 
         # Check if .catalog output is present
         if "Catalog Contents:" in stdout or "Table:" in stdout:
-            print("\n✓ .catalog command works correctly")
+            print("\n[OK] .catalog command works correctly")
         else:
-            print("\n✗ .catalog command may not be working")
+            print("\n[FAIL] .catalog command may not be working")
 
         if "demo_users" in stdout:
-            print("✓ Query execution works correctly")
+            print("[OK] Query execution works correctly")
         else:
-            print("✗ Query execution may not be working")
+            print("[FAIL] Query execution may not be working")
 
     except subprocess.TimeoutExpired:
         print("Test timed out!")

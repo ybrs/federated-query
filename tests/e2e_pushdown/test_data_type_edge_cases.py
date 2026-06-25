@@ -1,5 +1,7 @@
 """Data type edge cases pushdown tests."""
 
+from decimal import Decimal
+
 from sqlglot import exp
 
 from tests.e2e_pushdown.helpers import (
@@ -59,6 +61,23 @@ def test_float_precision(single_source_env):
 
     right = unwrap_parens(predicate.right)
     assert isinstance(right, exp.Add)
+
+
+def test_float_addition_computed_by_source(single_source_env):
+    """The source evaluates ``0.1 + 0.2``, not fedq's Python float arithmetic.
+
+    Because fedq does not constant-fold, ``0.1 + 0.2`` is pushed unevaluated and
+    DuckDB computes it with DECIMAL arithmetic, yielding an exact ``0.3`` rather
+    than the ``0.30000000000000004`` a Python float fold would have produced.
+    """
+    runtime = build_runtime(single_source_env)
+    sql = (
+        "SELECT 0.1 + 0.2 AS s "
+        "FROM duckdb_primary.main.orders LIMIT 1"
+    )
+    table = runtime.execute(sql)
+    values = table.column("s").to_pylist()
+    assert values == [Decimal("0.3")]
 
 
 def test_float_special_values_infinity(single_source_env):

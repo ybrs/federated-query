@@ -14,8 +14,11 @@ from ..plan.logical import (
     Aggregate,
     Explain,
     CTE,
+    CTERef,
     Values,
     SubqueryScan,
+    SetOperation,
+    LateralJoin,
 )
 from ..plan.expressions import (
     Expression,
@@ -28,6 +31,8 @@ from ..plan.expressions import (
     InList,
     BetweenExpression,
     Cast,
+    Extract,
+    Interval,
     CaseExpr,
     SubqueryExpression,
     ExistsExpression,
@@ -88,6 +93,10 @@ class Binder:
         # enclosing query block. Subquery plans are bound with this stack
         # so correlated references resolve against outer relations.
         self._scope_stack: List[Dict[str, Table]] = []
+        # CTE name -> synthetic Table describing its output columns, registered
+        # while a WITH body and its children bind so a CTERef resolves like a
+        # relation without a catalog lookup.
+        self._cte_tables: Dict[str, Table] = {}
 
     def bind(
         self,
@@ -122,15 +131,50 @@ class Binder:
             return self._bind_limit(plan)
         if isinstance(plan, Join):
             return self._bind_join(plan)
+        if isinstance(plan, LateralJoin):
+            return self._bind_lateral_join(plan)
         if isinstance(plan, Aggregate):
             return self._bind_aggregate(plan)
         if isinstance(plan, CTE):
             return self._bind_cte(plan)
+        if isinstance(plan, CTERef):
+            return self._bind_cte_ref(plan)
         if isinstance(plan, Values):
             return self._bind_values(plan)
         if isinstance(plan, SubqueryScan):
             return self._bind_subquery_scan(plan)
+        if isinstance(plan, SetOperation):
+            return self._bind_set_operation(plan)
         raise BindingError(f"Unsupported plan node type: {type(plan)}")
+
+    def _bind_set_operation(self, set_op: SetOperation) -> SetOperation:
+        """Bind both branches of a set operation and check their arity.
+
+        SQL requires the branches of a UNION/INTERSECT/EXCEPT to have the same
+        number of output columns; a mismatch is a binding error, not a runtime
+        surprise.
+        """
+        bound_left = self.bind(set_op.left)
+        bound_right = self.bind(set_op.right)
+        self._check_set_branch_arity(bound_left, bound_right)
+        return SetOperation(
+            left=bound_left,
+            right=bound_right,
+            kind=set_op.kind,
+            distinct=set_op.distinct,
+        )
+
+    def _check_set_branch_arity(
+        self, left: LogicalPlanNode, right: LogicalPlanNode
+    ) -> None:
+        """Raise when set-operation branches expose differing column counts."""
+        left_width = len(left.schema())
+        right_width = len(right.schema())
+        if left_width != right_width:
+            raise BindingError(
+                "Set-operation branches have different column counts: "
+                f"{left_width} vs {right_width}"
+            )
 
     def _bind_values(self, values: Values) -> Values:
         """Bind a constant Values node (no input columns to resolve)."""
@@ -462,6 +506,12 @@ class Binder:
             return self._bind_cast(
                 expr, lambda value: self._bind_expression_multi_table(value, tables)
             )
+        if isinstance(expr, Extract):
+            return self._bind_extract(
+                expr, lambda value: self._bind_expression_multi_table(value, tables)
+            )
+        if isinstance(expr, Interval):
+            return expr
         if isinstance(expr, FunctionCall):
             return self._bind_function_args(
                 expr, lambda value: self._bind_expression_multi_table(value, tables)
@@ -501,7 +551,25 @@ class Binder:
             right=bound_right,
             join_type=join.join_type,
             condition=bound_condition,
+            natural=join.natural,
+            using=join.using,
         )
+
+    def _bind_lateral_join(self, join: LateralJoin) -> LateralJoin:
+        """Bind a LATERAL join, binding the right with the left in scope.
+
+        Unlike a plain join, the right side may reference the left's columns
+        (the dependent correlation), so the left's relation scope is pushed
+        while the right is bound.
+        """
+        bound_left = self.bind(join.left)
+        self._push_scope_for(bound_left)
+        try:
+            plan_binder = SubqueryPlanBinder(self, list(self._scope_stack))
+            bound_right = plan_binder.bind(join.right)
+        finally:
+            self._pop_scope()
+        return LateralJoin(left=bound_left, right=bound_right, join_type=join.join_type)
 
     def _bind_explain(self, explain: Explain) -> Explain:
         """Bind an Explain node."""
@@ -542,10 +610,92 @@ class Binder:
         )
 
     def _bind_cte(self, cte: CTE) -> CTE:
-        """Bind a CTE node."""
-        bound_cte = self.bind(cte.cte_plan)
+        """Bind a CTE: register its name as a relation, then bind body and child.
+
+        The name is registered for the child (and any later CTE) to resolve a
+        ``CTERef`` against the body's output columns; for ``WITH RECURSIVE`` the
+        name is registered before the body binds so it can reference itself.
+        """
+        if cte.recursive:
+            return self._bind_recursive_cte(cte)
+        bound_plan = self.bind(cte.cte_plan)
+        table = self._cte_table(cte, bound_plan)
+        saved = self._cte_tables.get(cte.name)
+        self._cte_tables[cte.name] = table
         bound_child = self.bind(cte.child)
-        return CTE(name=cte.name, cte_plan=bound_cte, child=bound_child)
+        self._restore_cte(cte.name, saved)
+        return CTE(
+            name=cte.name,
+            cte_plan=bound_plan,
+            child=bound_child,
+            column_names=cte.column_names,
+        )
+
+    def _bind_recursive_cte(self, cte: CTE) -> CTE:
+        """Bind a recursive CTE; its name is in scope while its own body binds."""
+        if not cte.column_names:
+            raise BindingError(
+                f"Recursive CTE '{cte.name}' requires an explicit column list"
+            )
+        table = Table(name=cte.name, columns=self._named_columns(cte.column_names))
+        saved = self._cte_tables.get(cte.name)
+        self._cte_tables[cte.name] = table
+        bound_plan = self.bind(cte.cte_plan)
+        bound_child = self.bind(cte.child)
+        self._restore_cte(cte.name, saved)
+        return CTE(
+            name=cte.name,
+            cte_plan=bound_plan,
+            child=bound_child,
+            recursive=True,
+            column_names=cte.column_names,
+        )
+
+    def _bind_cte_ref(self, node: CTERef) -> CTERef:
+        """Resolve a CTE reference to the registered CTE's output column names."""
+        table = self._cte_tables.get(node.name)
+        if table is None:
+            raise BindingError(f"CTE not found: {node.name}")
+        names = []
+        for column in table.columns:
+            names.append(column.name)
+        return CTERef(
+            name=node.name,
+            alias=node.alias,
+            columns=node.columns,
+            output_names=names,
+        )
+
+    def _cte_table(self, cte: CTE, bound_plan: LogicalPlanNode) -> Table:
+        """Build a Table describing a CTE's output columns."""
+        columns = self._plan_output_columns(bound_plan)
+        if cte.column_names:
+            columns = self._rename_columns(cte.column_names, columns)
+        return Table(name=cte.name, columns=columns)
+
+    def _rename_columns(self, names: List[str], columns: List[Column]) -> List[Column]:
+        """Re-label output columns with an explicit CTE column list."""
+        renamed = []
+        for index in range(len(names)):
+            data_type = columns[index].data_type
+            renamed.append(
+                Column(name=names[index], data_type=data_type, nullable=True)
+            )
+        return renamed
+
+    def _named_columns(self, names: List[str]) -> List[Column]:
+        """Build placeholder columns for a name-only schema (recursive CTE)."""
+        columns = []
+        for name in names:
+            columns.append(Column(name=name, data_type=DataType.NULL, nullable=True))
+        return columns
+
+    def _restore_cte(self, name: str, saved: Optional[Table]) -> None:
+        """Restore the CTE registry entry after binding a WITH block."""
+        if saved is None:
+            del self._cte_tables[name]
+        else:
+            self._cte_tables[name] = saved
 
     def _bind_group_by_expressions(
         self, expressions: List[Expression], table: Optional[Table]
@@ -679,8 +829,19 @@ class Binder:
         if isinstance(plan, SubqueryScan):
             scope[plan.alias] = self._synthetic_table(plan)
             return
+        if isinstance(plan, CTERef):
+            self._add_cte_ref_to_scope(plan, scope)
+            return
         for child in plan.children():
             self._add_plan_to_scope(child, scope)
+
+    def _add_cte_ref_to_scope(self, node: CTERef, scope: Dict[str, Table]) -> None:
+        """Register a CTE reference under its alias (or CTE name)."""
+        table = self._cte_tables.get(node.name)
+        if table is None:
+            raise BindingError(f"CTE not found: {node.name}")
+        name = node.alias if node.alias else node.name
+        scope[name] = table
 
     def _add_scan_to_scope(self, scan: Scan, scope: Dict[str, Table]) -> None:
         """Register a scan under its alias (or table name)."""
@@ -707,6 +868,8 @@ class Binder:
             return self._expression_columns(plan.output_names, plan.aggregates)
         if isinstance(plan, Values):
             return self._expression_columns(plan.output_names, plan.rows[0])
+        if isinstance(plan, SetOperation):
+            return self._plan_output_columns(plan.left)
         return self._plan_output_columns_from_children(plan)
 
     def _plan_output_columns_from_children(self, plan: LogicalPlanNode) -> List[Column]:
@@ -716,6 +879,11 @@ class Binder:
         if isinstance(plan, Join):
             left_columns = self._plan_output_columns(plan.left)
             return left_columns + self._plan_output_columns(plan.right)
+        if isinstance(plan, CTERef):
+            table = self._cte_tables.get(plan.name)
+            if table is None:
+                raise BindingError(f"CTE not found: {plan.name}")
+            return list(table.columns)
         children = plan.children()
         if len(children) == 1:
             return self._plan_output_columns(children[0])
@@ -820,6 +988,12 @@ class Binder:
 
         if isinstance(plan, SubqueryScan):
             tables[plan.alias] = self._synthetic_table(plan)
+            return tables
+
+        if isinstance(plan, CTERef):
+            table = self._cte_tables.get(plan.name)
+            if table is not None:
+                tables[plan.alias if plan.alias else plan.name] = table
             return tables
 
         if isinstance(plan, Join):
@@ -943,6 +1117,8 @@ class Binder:
             )
         if isinstance(plan, SubqueryScan):
             return self._synthetic_table(plan)
+        if isinstance(plan, CTERef):
+            return self._cte_tables.get(plan.name)
         if hasattr(plan, "input"):
             return self._get_table_from_plan(plan.input)
         return None
@@ -977,6 +1153,12 @@ class Binder:
             return self._bind_cast(
                 expr, lambda value: self._bind_expression(value, table)
             )
+        if isinstance(expr, Extract):
+            return self._bind_extract(
+                expr, lambda value: self._bind_expression(value, table)
+            )
+        if isinstance(expr, Interval):
+            return expr
         if isinstance(expr, FunctionCall):
             return self._bind_function_args(
                 expr, lambda value: self._bind_expression(value, table)
@@ -1005,6 +1187,15 @@ class Binder:
             target_type=expr.target_type,
             data_type=data_type,
         )
+
+    def _bind_extract(
+        self,
+        expr: Extract,
+        bind_value: Callable[[Expression], Expression],
+    ) -> Extract:
+        """Bind the source of an EXTRACT while preserving its field keyword."""
+        bound_source = bind_value(expr.source)
+        return Extract(field=expr.field, source=bound_source)
 
     def _resolve_cast_type(self, target_type: str) -> DataType:
         """Map a SQL type text such as ``DECIMAL(10, 2)`` to a DataType."""
@@ -1083,6 +1274,7 @@ class Binder:
         return UnaryOp(op=unary_op.op, operand=operand)
 
     def _bind_in_list(self, expr: InList, table: Optional[Table]) -> InList:
+        """Bind an IN-list's value and each option against a single table."""
         bound_value = self._bind_expression(expr.value, table)
         bound_options: List[Expression] = []
         for option in expr.options:
@@ -1093,6 +1285,7 @@ class Binder:
     def _bind_in_list_multi(
         self, expr: InList, tables: Dict[Optional[str], Table]
     ) -> InList:
+        """Bind an IN-list across multiple tables (multi-relation scope)."""
         bound_value = self._bind_expression_multi_table(expr.value, tables)
         bound_options: List[Expression] = []
         for option in expr.options:
@@ -1103,6 +1296,7 @@ class Binder:
     def _bind_between(
         self, expr: BetweenExpression, table: Optional[Table]
     ) -> BetweenExpression:
+        """Bind a BETWEEN's value/lower/upper operands against a single table."""
         bound_value = self._bind_expression(expr.value, table)
         bound_lower = self._bind_expression(expr.lower, table)
         bound_upper = self._bind_expression(expr.upper, table)
@@ -1115,6 +1309,7 @@ class Binder:
     def _bind_between_multi(
         self, expr: BetweenExpression, tables: Dict[Optional[str], Table]
     ) -> BetweenExpression:
+        """Bind a BETWEEN expression across multiple tables (multi-relation scope)."""
         bound_value = self._bind_expression_multi_table(expr.value, tables)
         bound_lower = self._bind_expression_multi_table(expr.lower, tables)
         bound_upper = self._bind_expression_multi_table(expr.upper, tables)
@@ -1125,6 +1320,7 @@ class Binder:
         )
 
     def _bind_case_expr(self, expr: CaseExpr, table: Optional[Table]) -> CaseExpr:
+        """Bind a CASE expression's WHEN conditions/results and ELSE on one table."""
         bound_when = []
         for condition, result in expr.when_clauses:
             bound_condition = self._bind_expression(condition, table)
@@ -1138,6 +1334,7 @@ class Binder:
     def _bind_case_expr_multi(
         self, expr: CaseExpr, tables: Dict[Optional[str], Table]
     ) -> CaseExpr:
+        """Bind a CASE expression across multiple tables (multi-relation scope)."""
         bound_when = []
         for condition, result in expr.when_clauses:
             bound_condition = self._bind_expression_multi_table(condition, tables)
@@ -1196,7 +1393,25 @@ class SubqueryPlanBinder:
             return Limit(input=bound_input, limit=plan.limit, offset=plan.offset)
         if isinstance(plan, Join):
             return self._bind_join(plan)
+        if isinstance(plan, SetOperation):
+            return self._bind_set_operation(plan)
         raise BindingError(f"Unsupported plan node in subquery: {type(plan).__name__}")
+
+    def _bind_set_operation(self, set_op: SetOperation) -> SetOperation:
+        """Bind both branches of a set-operation subquery body.
+
+        Each branch is bound with the enclosing scopes still visible (a branch
+        may correlate to an outer relation); their output arity must match.
+        """
+        bound_left = self.bind(set_op.left)
+        bound_right = self.bind(set_op.right)
+        self.host._check_set_branch_arity(bound_left, bound_right)
+        return SetOperation(
+            left=bound_left,
+            right=bound_right,
+            kind=set_op.kind,
+            distinct=set_op.distinct,
+        )
 
     def _bind_scan(self, scan: Scan) -> Scan:
         """Bind a subquery scan via the host's lenient column filtering."""

@@ -2,6 +2,8 @@
 
 import pytest
 
+from sqlglot import exp
+
 from tests.e2e_pushdown.helpers import (
     build_runtime,
     explain_document,
@@ -26,11 +28,11 @@ def test_window_function_not_supported(single_source_env):
 
 
 def test_scalar_subquery_in_projection_supported(single_source_env):
-    """A scalar subquery in the projection decorrelates into its own scan.
+    """A single-source scalar subquery in the projection pushes as one query.
 
-    Scalar subqueries are supported now (they did not used to be): the
-    uncorrelated aggregate becomes a separate remote query joined onto the
-    outer scan, rather than raising a "not supported" error.
+    The decorrelated scalar is re-correlated and inlined into the projection, so
+    the whole statement ships to the source as a single remote query carrying
+    the scalar subquery, rather than a separate remote query joined locally.
     """
     runtime = build_runtime(single_source_env)
     sql = (
@@ -39,11 +41,12 @@ def test_scalar_subquery_in_projection_supported(single_source_env):
     )
     document = explain_document(runtime, sql)
     queries = document.get("queries", [])
-    assert len(queries) == 2
+    assert len(queries) == 1
+    assert queries[0]["query"].find(exp.Subquery) is not None
 
 
-def test_join_condition_with_or_falls_back(single_source_env):
-    """Confirms non-equi OR join predicates fall back to independent scans."""
+def test_join_condition_with_or_pushes_down(single_source_env):
+    """A same-source join with an OR condition pushes as one remote query."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT O.order_id "
@@ -53,8 +56,6 @@ def test_join_condition_with_or_falls_back(single_source_env):
     )
     document = explain_document(runtime, sql)
     queries = document.get("queries", [])
-    assert len(queries) == 2, "unsupported OR join should not stay remote"
-    for entry in queries:
-        select_ast = entry["query"]
-        joins = select_ast.args.get("joins") or []
-        assert not joins
+    assert len(queries) == 1, "single-source OR join should push down"
+    joins = queries[0]["query"].args.get("joins") or []
+    assert len(joins) == 1

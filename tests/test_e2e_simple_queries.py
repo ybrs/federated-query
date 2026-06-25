@@ -12,7 +12,6 @@ from federated_query.optimizer import (
     ProjectionPushdownRule,
     OrderByPushdownRule,
     LimitPushdownRule,
-    ExpressionSimplificationRule,
 )
 from federated_query.executor import Executor
 
@@ -20,7 +19,6 @@ from federated_query.executor import Executor
 def create_optimizer(catalog: Catalog) -> RuleBasedOptimizer:
     """Create optimizer with standard rules."""
     optimizer = RuleBasedOptimizer(catalog)
-    optimizer.add_rule(ExpressionSimplificationRule())
     optimizer.add_rule(PredicatePushdownRule())
     optimizer.add_rule(ProjectionPushdownRule())
     optimizer.add_rule(OrderByPushdownRule())

@@ -84,9 +84,9 @@ def main():
         print(f"\nResult ({result.num_rows} rows, {result.num_columns} columns):")
         print(f"Schema: {result.schema}")
         print(result)
-        print("\n✓ Test 1 PASSED - Decimal precision preserved")
+        print("\n[OK] Test 1 PASSED - Decimal precision preserved")
     except Exception as e:
-        print(f"\n✗ Test 1 FAILED: {e}")
+        print(f"\n[FAIL] Test 1 FAILED: {e}")
 
     print("\n" + "="*60)
     print("TEST 2: Duplicate column name fix")
@@ -107,9 +107,9 @@ def main():
         print(f"\nResult ({result.num_rows} rows, {result.num_columns} columns):")
         print(f"Schema: {result.schema}")
         print(result)
-        print("\n✓ Test 2 PASSED - Duplicate column names handled")
+        print("\n[OK] Test 2 PASSED - Duplicate column names handled")
     except Exception as e:
-        print(f"\n✗ Test 2 FAILED: {e}")
+        print(f"\n[FAIL] Test 2 FAILED: {e}")
 
     print("\n" + "="*60)
     print("TEST 3: Both id columns selected")
@@ -130,9 +130,9 @@ def main():
         print(f"\nResult ({result.num_rows} rows, {result.num_columns} columns):")
         print(f"Schema: {result.schema}")
         print(result)
-        print("\n✓ Test 3 PASSED - Both id columns accessible")
+        print("\n[OK] Test 3 PASSED - Both id columns accessible")
     except Exception as e:
-        print(f"\n✗ Test 3 FAILED: {e}")
+        print(f"\n[FAIL] Test 3 FAILED: {e}")
 
     db1.disconnect()
     db2.disconnect()

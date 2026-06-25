@@ -8,6 +8,7 @@ from tests.e2e_pushdown.helpers import (
     explain_document,
     from_table_name,
     join_table_names,
+    unwrap_parens,
 )
 
 
@@ -105,7 +106,8 @@ def test_right_join_pushdown(single_source_env):
 
 
 def test_inner_join_comma_syntax(single_source_env):
-    """Validates comma joins split into two remote scans without joins."""
+    """A same-source comma join with a join equality folds into an equi-join
+    and pushes as one remote query, just like the explicit JOIN ... ON form."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT O.order_id "
@@ -114,19 +116,15 @@ def test_inner_join_comma_syntax(single_source_env):
     )
     document = explain_document(runtime, sql)
     queries = document["queries"]
-    assert len(queries) == 2
-    seen_tables = []
-    for entry in queries:
-        select_ast = entry["query"]
-        joins = select_ast.args.get("joins") or []
-        assert not joins
-        seen_tables.append(from_table_name(select_ast))
-    assert len(seen_tables) == 2
-    assert set(seen_tables) == {"orders", "products"}
+    assert len(queries) == 1
+    ast = queries[0]["query"]
+    join_node = _get_join_node(ast)
+    condition = unwrap_parens(join_node.args.get("on"))
+    assert isinstance(condition, exp.EQ)
 
 
-def test_inner_join_non_equi_falls_back(single_source_env):
-    """Ensures non-equi joins break into separate scans with no join nodes."""
+def test_inner_join_non_equi_pushes_down(single_source_env):
+    """Ensures a same-source non-equi join pushes as one remote query."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT O.order_id, P.name "
@@ -136,15 +134,11 @@ def test_inner_join_non_equi_falls_back(single_source_env):
     )
     document = explain_document(runtime, sql)
     queries = document["queries"]
-    assert len(queries) == 2
-    seen_tables = []
-    for entry in queries:
-        select_ast = entry["query"]
-        joins = select_ast.args.get("joins") or []
-        assert not joins
-        seen_tables.append(from_table_name(select_ast))
-    assert len(seen_tables) == 2
-    assert set(seen_tables) == {"orders", "products"}
+    assert len(queries) == 1
+    ast = queries[0]["query"]
+    join_node = _get_join_node(ast)
+    condition = unwrap_parens(join_node.args.get("on"))
+    assert isinstance(condition, exp.GT)
 
 
 def test_cross_join_generates_multiple_queries(single_source_env):
@@ -169,7 +163,8 @@ def test_cross_join_generates_multiple_queries(single_source_env):
 
 
 def test_left_join_filter_on_right_side(single_source_env):
-    """Validates IS NULL filters on right table stay local (no remote WHERE)."""
+    """Validates a single-source LEFT JOIN with a right-side IS NULL filter
+    pushes the whole query (join + WHERE) to the source as one remote query."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT O.order_id "
@@ -179,13 +174,15 @@ def test_left_join_filter_on_right_side(single_source_env):
         "WHERE products.name IS NULL"
     )
     document = explain_document(runtime, sql)
+    assert len(document["queries"]) == 1
     first_query = document["queries"][0]["query"]
     joins = first_query.args.get("joins") or []
     assert joins, "expected remote join"
     join_tables = join_table_names(first_query)
     assert "products" in join_tables
+    # The entire single-source query is pushed down, including the WHERE.
     where_clause = first_query.args.get("where")
-    assert where_clause is None
+    assert where_clause is not None
 
 
 def test_right_join_with_limit(single_source_env):

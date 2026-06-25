@@ -1,11 +1,17 @@
-"""CTE (WITH clause) pushdown tests."""
+"""CTE (WITH clause) pushdown tests.
+
+A CTE is a named relation: the parser converts ``WITH`` into ``CTE`` nodes with
+``CTERef`` leaves for name references, the binder registers each name as a
+relation, and single-source pushdown renders the whole query as a ``WITH``
+statement pushed to the source (recursion and multi-reference materialization
+included). These tests assert the pushed datasource AST keeps the WITH shape.
+"""
 
 from sqlglot import exp
 
 from tests.e2e_pushdown.helpers import (
     build_runtime,
     explain_datasource_query,
-    select_column_names,
     unwrap_parens,
 )
 
@@ -21,7 +27,7 @@ def test_simple_cte_referenced_once(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
 
-    with_clause = ast.args.get("with")
+    with_clause = ast.args.get("with_")
     assert with_clause is not None
 
     ctes = with_clause.expressions
@@ -50,7 +56,7 @@ def test_cte_referenced_multiple_times(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
 
-    with_clause = ast.args.get("with")
+    with_clause = ast.args.get("with_")
     assert with_clause is not None
 
     ctes = with_clause.expressions
@@ -80,7 +86,7 @@ def test_multiple_ctes(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
 
-    with_clause = ast.args.get("with")
+    with_clause = ast.args.get("with_")
     assert with_clause is not None
 
     ctes = with_clause.expressions
@@ -111,7 +117,7 @@ def test_cte_with_join(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
 
-    with_clause = ast.args.get("with")
+    with_clause = ast.args.get("with_")
     assert with_clause is not None
 
     ctes = with_clause.expressions
@@ -139,7 +145,7 @@ def test_cte_with_aggregation(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
 
-    with_clause = ast.args.get("with")
+    with_clause = ast.args.get("with_")
     assert with_clause is not None
 
     ctes = with_clause.expressions
@@ -169,7 +175,7 @@ def test_cte_with_where(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
 
-    with_clause = ast.args.get("with")
+    with_clause = ast.args.get("with_")
     assert with_clause is not None
 
     ctes = with_clause.expressions
@@ -203,7 +209,7 @@ def test_nested_cte(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
 
-    with_clause = ast.args.get("with")
+    with_clause = ast.args.get("with_")
     assert with_clause is not None
 
     ctes = with_clause.expressions
@@ -219,7 +225,7 @@ def test_nested_cte(single_source_env):
 
     second_cte_query = second_cte.this
     assert isinstance(second_cte_query, exp.Select)
-    second_from = second_cte_query.args.get("from")
+    second_from = second_cte_query.args.get("from_")
     assert second_from is not None
 
 
@@ -236,7 +242,7 @@ def test_cte_with_union(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
 
-    with_clause = ast.args.get("with")
+    with_clause = ast.args.get("with_")
     assert with_clause is not None
 
     ctes = with_clause.expressions
@@ -260,7 +266,7 @@ def test_cte_with_order_by_limit(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
 
-    with_clause = ast.args.get("with")
+    with_clause = ast.args.get("with_")
     assert with_clause is not None
 
     ctes = with_clause.expressions
@@ -295,7 +301,7 @@ def test_recursive_cte_behavior(single_source_env):
 
     ast = explain_datasource_query(runtime, sql)
 
-    with_clause = ast.args.get("with")
+    with_clause = ast.args.get("with_")
     assert with_clause is not None
 
     ctes = with_clause.expressions
@@ -303,3 +309,44 @@ def test_recursive_cte_behavior(single_source_env):
 
     cte = ctes[0]
     assert isinstance(cte, exp.CTE)
+
+
+def test_cte_with_explicit_column_list(single_source_env):
+    """A non-recursive CTE with an explicit column list pushes that list."""
+    runtime = build_runtime(single_source_env)
+    sql = (
+        "WITH t(oid, p) AS ("
+        "  SELECT order_id, price FROM duckdb_primary.main.orders WHERE price > 100"
+        ") "
+        "SELECT oid FROM t WHERE p > 200"
+    )
+    ast = explain_datasource_query(runtime, sql)
+
+    with_clause = ast.args.get("with_")
+    assert with_clause is not None
+
+    cte = with_clause.expressions[0]
+    assert isinstance(cte, exp.CTE)
+    alias = cte.args.get("alias")
+    column_identifiers = alias.args.get("columns")
+    column_names = []
+    for identifier in column_identifiers:
+        column_names.append(identifier.name)
+    assert column_names == ["oid", "p"]
+
+
+def test_cte_constant_body(single_source_env):
+    """A constant (FROM-less) CTE body pushes; the sole source owns it."""
+    runtime = build_runtime(single_source_env)
+    sql = "WITH x AS (SELECT 1 AS n) SELECT n FROM x"
+    ast = explain_datasource_query(runtime, sql)
+
+    with_clause = ast.args.get("with_")
+    assert with_clause is not None
+
+    cte = with_clause.expressions[0]
+    assert isinstance(cte, exp.CTE)
+    cte_query = cte.this
+    assert isinstance(cte_query, exp.Select)
+    # The constant projection survives into the pushed body (no FROM clause).
+    assert cte_query.args.get("from_") is None

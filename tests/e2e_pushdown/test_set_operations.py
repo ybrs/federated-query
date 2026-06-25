@@ -145,7 +145,7 @@ def test_union_with_order_by(single_source_env):
     assert order_col.name.lower() == "price"
     assert first_order.args.get("desc") is True
 
-    from_clause = ast.args.get("from")
+    from_clause = ast.args.get("from_")
     assert from_clause is not None
     subquery = from_clause.this
     assert isinstance(subquery, exp.Subquery)
@@ -169,7 +169,7 @@ def test_union_with_limit(single_source_env):
     limit_value = int(limit_clause.expression.this)
     assert limit_value == 20
 
-    from_clause = ast.args.get("from")
+    from_clause = ast.args.get("from_")
     assert from_clause is not None
     subquery = from_clause.this
     assert isinstance(subquery, exp.Subquery)
@@ -231,16 +231,16 @@ def test_cross_datasource_union_fallback(multi_source_env):
     """Validates cross-datasource UNION does NOT push to single source."""
     runtime = build_runtime(multi_source_env)
     sql = (
-        "SELECT id FROM duckdb_primary.main.products "
+        "SELECT id FROM duckdb_products.main.products "
         "UNION ALL "
-        "SELECT user_id FROM postgres_secondary.public.users"
+        "SELECT customer_id FROM duckdb_customers.main.customers"
     )
 
     doc = runtime.explain(sql)
     datasources = doc.get("datasources") or {}
 
-    duckdb_queries = datasources.get("duckdb_primary", [])
-    postgres_queries = datasources.get("postgres_secondary", [])
+    products_queries = datasources.get("duckdb_products", [])
+    customers_queries = datasources.get("duckdb_customers", [])
 
-    assert len(duckdb_queries) >= 1
-    assert len(postgres_queries) >= 1
+    assert len(products_queries) >= 1
+    assert len(customers_queries) >= 1

@@ -4,18 +4,20 @@ E2E tests for decorrelation error cases and edge cases.
 Tests error handling, unsupported patterns, cardinality violations,
 and other exceptional scenarios that should raise clear errors.
 """
+
 import pytest
 from federated_query.parser.parser import Parser
 from federated_query.parser.binder import Binder
 from federated_query.optimizer.decorrelation import Decorrelator, DecorrelationError
 from federated_query.parser.binder import BindingError
+from federated_query.plan.logical import GroupedLimit, LateralJoin, SetOperation, CTE
 from federated_query.plan.physical import CardinalityViolationError
 from federated_query.executor.executor import Executor
 from .test_utils import (
     assert_plan_structure,
     assert_result_count,
     assert_result_contains_ids,
-    execute_and_fetch_all
+    execute_and_fetch_all,
 )
 
 
@@ -209,9 +211,11 @@ class TestUnsupportedPatterns:
         with pytest.raises(ValueError, match="Window"):
             parser.parse(sql)
 
-    def test_recursive_cte_decorrelation_not_supported(self, catalog, setup_test_data):
+    def test_recursive_cte_without_column_list_fails_fast(
+        self, catalog, setup_test_data
+    ):
         """
-        Test: Recursive CTEs (marked as future work).
+        Test: a recursive CTE missing its explicit column list.
 
         Input SQL:
             WITH RECURSIVE tree AS (
@@ -219,14 +223,12 @@ class TestUnsupportedPatterns:
                 UNION ALL
                 SELECT u.id, u.name FROM users u, tree t WHERE u.id = t.id + 1
             )
-            SELECT * FROM tree
+            SELECT id FROM tree
 
         Expected behavior:
-            - Decorrelator detects recursive CTE
-            - May raise error or pass through
-
-        Expected result:
-            Behavior depends on implementation (out of scope for first pass)
+            - The WITH RECURSIVE parses into a recursive CTE node.
+            - Binding fails fast: the self-reference cannot resolve its columns
+              without the declared list (``tree(id, name)``).
         """
         sql = """
             WITH RECURSIVE tree AS (
@@ -234,46 +236,37 @@ class TestUnsupportedPatterns:
                 UNION ALL
                 SELECT u.id, u.name FROM pg.users u, tree t WHERE u.id = t.id + 1
             )
-            SELECT * FROM tree
+            SELECT id FROM tree
         """
 
         parser = Parser()
         binder = Binder(catalog)
-        decorrelator = Decorrelator()
-        executor = Executor(catalog)
 
-        with pytest.raises(ValueError, match="WITH"):
-            parser.parse(sql)
+        plan = parser.parse(sql)
+        assert isinstance(plan, CTE)
+        assert plan.recursive is True
+        with pytest.raises(BindingError, match="column list"):
+            binder.bind(plan)
 
     def test_lateral_subquery_handling(self, catalog, setup_test_data):
-        """
-        Test: LATERAL subqueries (explicit correlation).
-
-        Input SQL:
-            SELECT u.id, o.amount
-            FROM users u,
-            LATERAL (SELECT amount FROM orders WHERE user_id = u.id LIMIT 1) o
-
-        Expected behavior:
-            - LATERAL makes correlation explicit
-            - Decorrelator should handle or raise clear error
-
-        Expected result:
-            Proper handling or clear error message
+        """A user-written LATERAL parses, binds, and decorrelates to a
+        LateralJoin (dependent join) — the explicit correlation is kept and
+        evaluated per outer row by the executing engine.
         """
         sql = """
             SELECT u.id, o.amount
             FROM pg.users u,
             LATERAL (SELECT amount FROM pg.orders WHERE user_id = u.id LIMIT 1) o
         """
+        bound = Binder(catalog).bind(Parser().parse(sql))
+        plan = Decorrelator().decorrelate(bound)
 
-        parser = Parser()
-        binder = Binder(catalog)
-        decorrelator = Decorrelator()
-        executor = Executor(catalog)
+        def has_lateral(node):
+            if isinstance(node, LateralJoin):
+                return True
+            return any(has_lateral(child) for child in node.children())
 
-        with pytest.raises(ValueError, match="LATERAL"):
-            parser.parse(sql)
+        assert has_lateral(plan)
 
 
 class TestUnsupportedOperators:
@@ -341,7 +334,9 @@ class TestUnsupportedOperators:
         with pytest.raises(DecorrelationError, match="negate quantified operator"):
             decorrelator.decorrelate(bound_plan)
 
-    def test_quantified_comparison_multi_column_subquery(self, catalog, setup_test_data):
+    def test_quantified_comparison_multi_column_subquery(
+        self, catalog, setup_test_data
+    ):
         """
         Test: a quantified comparison whose subquery returns multiple columns.
 
@@ -791,3 +786,139 @@ class TestValidationPhase:
         assert_plan_structure(decorrelated_plan, {})
         results = execute_and_fetch_all(executor, decorrelated_plan)
         # decorrelator.validate_correlation_coverage(decorrelated_plan)
+
+
+class TestUnsupportedSubqueryShapes:
+    """Pin the decorrelation engine's known fail-fast gaps.
+
+    Each pattern is unnestable in principle (a general dependent join would
+    handle it) but the current pattern-based decorrelator rejects it with a
+    clear error rather than producing a wrong answer. These tests document
+    exactly what is unsupported today; when a gap is closed, flip its test.
+    """
+
+    def _decorrelate(self, catalog, sql):
+        """Parse, bind, and decorrelate a SQL string for a raises-assertion."""
+        bound = Binder(catalog).bind(Parser().parse(sql))
+        return Decorrelator().decorrelate(bound)
+
+    def _find_grouped_limit(self, node):
+        """Return the first GroupedLimit in a plan, or None."""
+        if isinstance(node, GroupedLimit):
+            return node
+        for child in node.children():
+            found = self._find_grouped_limit(child)
+            if found is not None:
+                return found
+        return None
+
+    def test_sort_topped_correlated_scalar(self, catalog, setup_test_data):
+        """A correlated scalar ``ORDER BY ... LIMIT 1`` (latest-row-per-key) now
+        decorrelates to an order-aware per-key limit (gap A, closed).
+
+        The ORDER BY column (``o.amount``) is not the selected value
+        (``o.user_id``), so it is exposed as an extra projected column the
+        GroupedLimit sorts on. LIMIT 1 makes it provably single-row, so no
+        cardinality guard is added.
+        """
+        sql = (
+            "SELECT u.id FROM pg.users u WHERE u.id = ("
+            "  SELECT o.user_id FROM pg.orders o WHERE o.user_id = u.id "
+            "  ORDER BY o.amount DESC LIMIT 1)"
+        )
+        plan = self._decorrelate(catalog, sql)
+        grouped = self._find_grouped_limit(plan)
+        assert grouped is not None
+        assert grouped.limit == 1
+        assert grouped.order_by_keys
+
+    def test_non_equi_correlated_limit_subquery_uses_lateral(
+        self, catalog, setup_test_data
+    ):
+        """A non-equi correlated ``ORDER BY ... LIMIT`` scalar cannot become a
+        per-key limit (a ``<``/``>`` correlation matches many groups), so it
+        falls back to a LATERAL join evaluated per outer row — never a wrong
+        per-key answer.
+        """
+        sql = (
+            "SELECT u.id, (SELECT o.user_id FROM pg.orders o "
+            "  WHERE o.amount > u.id ORDER BY o.amount LIMIT 1) AS x "
+            "FROM pg.users u"
+        )
+        plan = self._decorrelate(catalog, sql)
+        assert self._find_lateral_join(plan) is not None
+
+    def _find_lateral_join(self, node):
+        """Return the first LateralJoin in a plan, or None."""
+        if isinstance(node, LateralJoin):
+            return node
+        for child in node.children():
+            found = self._find_lateral_join(child)
+            if found is not None:
+                return found
+        return None
+
+    def test_set_operation_subquery_body(self, catalog, setup_test_data):
+        """A UNION subquery body now decorrelates to a SEMI join over the union
+        relation, which is kept intact as the join's value relation (gap closed).
+        """
+        sql = (
+            "SELECT u.id FROM pg.users u WHERE u.id IN ("
+            "  SELECT user_id FROM pg.orders WHERE status = 'paid' "
+            "  UNION SELECT user_id FROM pg.orders WHERE status = 'shipped')"
+        )
+        plan = self._decorrelate(catalog, sql)
+
+        def has_set_op(node):
+            if isinstance(node, SetOperation):
+                return True
+            return any(has_set_op(child) for child in node.children())
+
+        assert has_set_op(plan)
+
+    def test_offset_in_correlated_subquery(self, catalog, setup_test_data):
+        """OFFSET inside a correlated subquery is rejected.
+
+        Decorrelating an offset per correlation key is unsupported
+        (decorrelation-gaps.md D).
+        """
+        sql = (
+            "SELECT u.id FROM pg.users u WHERE u.id = ("
+            "  SELECT o.user_id FROM pg.orders o WHERE o.user_id = u.id "
+            "  ORDER BY o.amount LIMIT 1 OFFSET 2)"
+        )
+        with pytest.raises(DecorrelationError, match="OFFSET"):
+            self._decorrelate(catalog, sql)
+
+    def test_subquery_in_group_by(self, catalog, setup_test_data):
+        """A subquery in a GROUP BY position is rejected (decorrelation-gaps.md E)."""
+        sql = (
+            "SELECT COUNT(*) FROM pg.users u "
+            "GROUP BY (SELECT MAX(price) FROM pg.products)"
+        )
+        with pytest.raises(DecorrelationError, match="GROUP BY"):
+            self._decorrelate(catalog, sql)
+
+    def test_skip_level_correlation(self, catalog, setup_test_data):
+        """A subquery correlating two levels up is rejected.
+
+        The inner subquery references ``u`` (the outermost query), skipping the
+        middle relation -- the canonical dependent-join case the pattern-based
+        engine cannot handle yet (decorrelation-gaps.md C).
+        """
+        sql = (
+            "SELECT u.id FROM pg.users u WHERE EXISTS ("
+            "  SELECT 1 FROM pg.orders o WHERE EXISTS ("
+            "    SELECT 1 FROM pg.products p WHERE p.id = u.id))"
+        )
+        with pytest.raises(DecorrelationError, match="unsupported position"):
+            self._decorrelate(catalog, sql)
+
+    def test_select_star_value_subquery(self, catalog, setup_test_data):
+        """A ``SELECT *`` scalar/value subquery is rejected (decorrelation-gaps.md F)."""
+        sql = (
+            "SELECT u.id FROM pg.users u WHERE u.id > ("
+            "  SELECT * FROM pg.orders o WHERE o.user_id = u.id)"
+        )
+        with pytest.raises(DecorrelationError):
+            self._decorrelate(catalog, sql)
