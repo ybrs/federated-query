@@ -44,6 +44,8 @@ _MERGE_RIGHT_RELATION = "in_right"
 _MERGE_AGG_RELATION = "in_agg"
 # Name under which a sort registers its single input with the merge engine.
 _MERGE_SORT_RELATION = "in_sort"
+# Name under which a window operator registers its single input with the merge engine.
+_MERGE_WINDOW_RELATION = "in_window"
 # Name under which a grouped-limit registers its single input, plus the synthetic
 # columns it adds: a row-order index (stable tiebreak so the merge path keeps the
 # same rows as the Python streaming path) and the per-key row number.
@@ -349,6 +351,82 @@ def _qualify_join_condition(condition, left_names, right_names):
             operand=_qualify_join_condition(condition.operand, left_names, right_names),
         )
     return condition
+
+
+def _resolve_window_columns(expr, aliases):
+    """Rebuild an expression with each ColumnRef resolved to its physical name.
+
+    After a merge-engine join the registered relation has flat physical column
+    names; ``aliases`` maps each logical ``(table, column)`` to that name.
+    Rewriting the tree and then calling ``to_sql()`` renders the expression
+    against the registered relation without qualifier ambiguity.
+    """
+    from .expressions import ColumnRef, BinaryOp, UnaryOp, FunctionCall, WindowExpr
+
+    if isinstance(expr, ColumnRef):
+        return _resolved_column_ref(expr, aliases)
+    if isinstance(expr, WindowExpr):
+        return _resolve_window_expr(expr, aliases)
+    if isinstance(expr, FunctionCall):
+        return _resolve_function_columns(expr, aliases)
+    if isinstance(expr, BinaryOp):
+        return BinaryOp(
+            op=expr.op,
+            left=_resolve_window_columns(expr.left, aliases),
+            right=_resolve_window_columns(expr.right, aliases),
+        )
+    if isinstance(expr, UnaryOp):
+        return UnaryOp(
+            op=expr.op, operand=_resolve_window_columns(expr.operand, aliases)
+        )
+    return expr
+
+
+def _resolved_column_ref(expr, aliases):
+    """Map a ColumnRef to a bare ColumnRef using the input's physical names."""
+    from .expressions import ColumnRef
+
+    if expr.column == "*":
+        return expr
+    resolved = aliases.get((expr.table, expr.column)) if aliases else None
+    return ColumnRef(table=None, column=resolved or expr.column)
+
+
+def _resolve_function_columns(expr, aliases):
+    """Rebuild a FunctionCall with each argument's columns resolved."""
+    from .expressions import FunctionCall
+
+    new_args = []
+    for arg in expr.args:
+        new_args.append(_resolve_window_columns(arg, aliases))
+    return FunctionCall(
+        function_name=expr.function_name,
+        args=new_args,
+        is_aggregate=expr.is_aggregate,
+        distinct=expr.distinct,
+    )
+
+
+def _resolve_window_expr(expr, aliases):
+    """Rebuild a WindowExpr with its function/partition/order columns resolved."""
+    from .expressions import WindowExpr
+
+    return WindowExpr(
+        function=_resolve_window_columns(expr.function, aliases),
+        partition_by=_resolve_window_list(expr.partition_by, aliases),
+        order_keys=_resolve_window_list(expr.order_keys, aliases),
+        order_ascending=expr.order_ascending,
+        order_nulls=expr.order_nulls,
+        frame=expr.frame,
+    )
+
+
+def _resolve_window_list(items, aliases):
+    """Resolve columns across a list of expressions (partition or order keys)."""
+    resolved = []
+    for item in items:
+        resolved.append(_resolve_window_columns(item, aliases))
+    return resolved
 
 
 def _merge_join_select_list(join_type, left_schema, right_schema) -> str:
@@ -893,6 +971,68 @@ class PhysicalProjection(PhysicalPlanNode):
 
     def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
         return self.input.column_aliases()
+
+
+@dataclass
+class PhysicalWindow(PhysicalPlanNode):
+    """Evaluate a window-bearing projection in the merge engine.
+
+    Runs ``SELECT <projection exprs> FROM input`` in DuckDB, which computes the
+    window functions natively. Used on the cross-source path, when a projection
+    containing a window sits over a non-pushable input; the single-source path
+    renders the window straight into the remote query instead, so this operator
+    is never built there. Window functions cannot be evaluated row-at-a-time, so
+    a merge engine is required.
+    """
+
+    input: PhysicalPlanNode
+    expressions: List[Expression]
+    output_names: List[str]
+
+    def children(self) -> List[PhysicalPlanNode]:
+        return [self.input]
+
+    def execute(self) -> Iterator[pa.RecordBatch]:
+        """Stream the input through DuckDB, which evaluates the window SQL."""
+        engine = self.merge_engine()
+        if engine is None:
+            raise ValueError("window functions require the merge engine")
+        reader = _streaming_reader(self.input)
+        sql = self._window_sql(self.input.column_aliases())
+        yield from engine.run(sql, {_MERGE_WINDOW_RELATION: reader})
+
+    def _window_sql(self, aliases) -> str:
+        """Render ``SELECT <exprs> AS <names> FROM in_window``."""
+        select_list = self._window_select_list(aliases)
+        return f"SELECT {select_list} FROM {_MERGE_WINDOW_RELATION}"
+
+    def _window_select_list(self, aliases) -> str:
+        """Alias each projection expression, resolving columns to physical names."""
+        parts = []
+        for expr, name in zip(self.expressions, self.output_names):
+            resolved = _resolve_window_columns(expr, aliases)
+            parts.append(f'{resolved.to_sql()} AS "{name}"')
+        return ", ".join(parts)
+
+    def schema(self) -> pa.Schema:
+        """Output schema, read from DuckDB so window result types are exact."""
+        engine = self.merge_engine()
+        materialized = pa.Table.from_batches(list(self.input.execute()))
+        sql = self._window_sql(self.input.column_aliases())
+        return engine.schema(sql, {_MERGE_WINDOW_RELATION: materialized})
+
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        """Each output column is exposed by its bare output name."""
+        result = {}
+        for name in self.output_names:
+            result[(None, name)] = name
+        return result
+
+    def estimated_cost(self) -> float:
+        raise NotImplementedError("Cost estimation not yet implemented")
+
+    def __repr__(self) -> str:
+        return f"PhysicalWindow({len(self.expressions)} exprs)"
 
 
 @dataclass

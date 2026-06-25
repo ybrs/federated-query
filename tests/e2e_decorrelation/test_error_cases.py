@@ -178,38 +178,9 @@ class TestAmbiguousReferences:
 class TestUnsupportedPatterns:
     """Test unsupported decorrelation patterns (future work)."""
 
-    def test_windowed_subquery_not_supported(self, catalog, setup_test_data):
-        """
-        Test: Window functions in subqueries (marked as future work).
-
-        Input SQL:
-            SELECT u.id,
-                   (SELECT ROW_NUMBER() OVER (ORDER BY amount)
-                    FROM orders WHERE user_id = u.id LIMIT 1) AS rank
-            FROM users u
-
-        Expected behavior:
-            - Decorrelator detects unsupported window function
-            - Raises DecorrelationError with clear message
-            - Or passes through to engine if not decorrelating windows
-
-        Expected result:
-            Error or pass-through (depending on implementation choice)
-        """
-        sql = """
-            SELECT u.id,
-                   (SELECT ROW_NUMBER() OVER (ORDER BY amount)
-                    FROM pg.orders WHERE user_id = u.id LIMIT 1) AS rank
-            FROM pg.users u
-        """
-
-        parser = Parser()
-        binder = Binder(catalog)
-        decorrelator = Decorrelator()
-        executor = Executor(catalog)
-
-        with pytest.raises(ValueError, match="Window"):
-            parser.parse(sql)
+    # NOTE: window functions inside a correlated scalar subquery are now
+    # SUPPORTED (Phase 9 section 9.4, partition-lift decorrelation). Positive +
+    # fail-fast coverage moved to test_window_subqueries.py.
 
     def test_recursive_cte_without_column_list_fails_fast(
         self, catalog, setup_test_data

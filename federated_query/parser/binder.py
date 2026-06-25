@@ -34,6 +34,7 @@ from ..plan.expressions import (
     Extract,
     Interval,
     CaseExpr,
+    WindowExpr,
     SubqueryExpression,
     ExistsExpression,
     InSubquery,
@@ -514,6 +515,10 @@ class Binder:
             return expr
         if isinstance(expr, FunctionCall):
             return self._bind_function_args(
+                expr, lambda value: self._bind_expression_multi_table(value, tables)
+            )
+        if isinstance(expr, WindowExpr):
+            return self._bind_window_expr(
                 expr, lambda value: self._bind_expression_multi_table(value, tables)
             )
         if self._is_subquery_expression(expr):
@@ -1163,6 +1168,10 @@ class Binder:
             return self._bind_function_args(
                 expr, lambda value: self._bind_expression(value, table)
             )
+        if isinstance(expr, WindowExpr):
+            return self._bind_window_expr(
+                expr, lambda value: self._bind_expression(value, table)
+            )
         if self._is_subquery_expression(expr):
             return self._bind_subquery_expr(
                 expr, lambda value: self._bind_expression(value, table)
@@ -1344,6 +1353,25 @@ class Binder:
         if expr.else_result is not None:
             bound_else = self._bind_expression_multi_table(expr.else_result, tables)
         return CaseExpr(when_clauses=bound_when, else_result=bound_else)
+
+    def _bind_window_expr(
+        self, expr: WindowExpr, bind: Callable[[Expression], Expression]
+    ) -> WindowExpr:
+        """Bind a window's inner function, partition keys, and order keys."""
+        bound_partition = []
+        for part in expr.partition_by:
+            bound_partition.append(bind(part))
+        bound_order = []
+        for key in expr.order_keys:
+            bound_order.append(bind(key))
+        return WindowExpr(
+            function=bind(expr.function),
+            partition_by=bound_partition,
+            order_keys=bound_order,
+            order_ascending=expr.order_ascending,
+            order_nulls=expr.order_nulls,
+            frame=expr.frame,
+        )
 
     def __repr__(self) -> str:
         return "Binder()"
@@ -1576,7 +1604,28 @@ class SubqueryPlanBinder:
                 is_aggregate=expr.is_aggregate,
                 distinct=expr.distinct,
             )
+        if isinstance(expr, WindowExpr):
+            return self._bind_window(expr, scopes)
         return self._bind_special_expr(expr, scopes)
+
+    def _bind_window(
+        self, expr: WindowExpr, scopes: List[Dict[str, Table]]
+    ) -> WindowExpr:
+        """Bind a window's function, partition keys, and order keys in scope."""
+        partition = []
+        for part in expr.partition_by:
+            partition.append(self._bind_expr(part, scopes))
+        order = []
+        for key in expr.order_keys:
+            order.append(self._bind_expr(key, scopes))
+        return WindowExpr(
+            function=self._bind_expr(expr.function, scopes),
+            partition_by=partition,
+            order_keys=order,
+            order_ascending=expr.order_ascending,
+            order_nulls=expr.order_nulls,
+            frame=expr.frame,
+        )
 
     def _bind_special_expr(
         self, expr: Expression, scopes: List[Dict[str, Table]]

@@ -616,12 +616,23 @@ class ProjectionPushdownRule(OptimizationRule):
 
     def _extract_columns(self, expr: Expression) -> set:
         """Extract column names from expression."""
-        from ..plan.expressions import ColumnRef, BinaryOp, UnaryOp, FunctionCall
+        from ..plan.expressions import (
+            ColumnRef,
+            BinaryOp,
+            UnaryOp,
+            FunctionCall,
+            WindowExpr,
+        )
 
         columns = set()
 
         if isinstance(expr, ColumnRef):
             columns.add(expr.column)
+            return columns
+
+        if isinstance(expr, WindowExpr):
+            for child in self._window_children(expr):
+                columns.update(self._extract_columns(child))
             return columns
 
         if isinstance(expr, BinaryOp):
@@ -651,6 +662,13 @@ class ProjectionPushdownRule(OptimizationRule):
             return columns
 
         return columns
+
+    def _window_children(self, expr) -> list:
+        """A window's column-bearing sub-expressions: function, partition, order."""
+        children = [expr.function]
+        children.extend(expr.partition_by)
+        children.extend(expr.order_keys)
+        return children
 
     def _prune_columns(self, plan: LogicalPlanNode, required: set) -> LogicalPlanNode:
         """Prune unused columns from plan."""

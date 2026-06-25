@@ -69,6 +69,7 @@ from ..plan.expressions import (
     InList,
     BetweenExpression,
     TupleExpression,
+    WindowExpr,
 )
 
 
@@ -962,6 +963,7 @@ class _SubqueryPreparer:
         """Build the renamed right side and the join condition."""
         exposures, condition = self._expose_correlation_columns()
         self._validate_no_outer_left(core)
+        value_exprs = self._partition_window_values(value_exprs, exposures)
         expressions: List[Expression] = []
         aliases: List[str] = []
         for expr, alias in exposures:
@@ -978,6 +980,38 @@ class _SubqueryPreparer:
         )
         plan = self._apply_pending_limit(plan, aliases, non_keys, order)
         return _PreparedSubquery(plan=plan, condition=condition, values=value_names)
+
+    def _partition_window_values(self, value_exprs, exposures):
+        """Partition any window value by the correlation key columns.
+
+        A window inside a correlated subquery is implicitly partitioned by the
+        correlation: once the equality filter is pulled out, the window must
+        ``PARTITION BY`` those key columns so each outer row still sees only its
+        own group. Without this the window would range over the whole scan.
+        """
+        keys = []
+        for expr, _ in exposures:
+            keys.append(expr)
+        rewritten = []
+        for expr in value_exprs:
+            rewritten.append(self._partition_window_expr(expr, keys))
+        return rewritten
+
+    def _partition_window_expr(self, expr, keys):
+        """Prepend correlation keys to a WindowExpr's partition, else pass through."""
+        if not isinstance(expr, WindowExpr) or len(keys) == 0:
+            return expr
+        self._reject_non_equi_window()
+        return replace(expr, partition_by=list(keys) + list(expr.partition_by))
+
+    def _reject_non_equi_window(self) -> None:
+        """A correlated window only lifts to PARTITION BY under equi-correlation."""
+        for predicate in self.pulled:
+            if not isinstance(predicate, BinaryOp) or predicate.op != BinaryOpType.EQ:
+                raise DecorrelationError(
+                    "Only equality correlation can partition a window; "
+                    f"got: {predicate.to_sql()}"
+                )
 
     def _build_order(self, expressions, aliases, non_keys):
         """Map a pending ORDER BY onto projected aliases, projecting any missing.

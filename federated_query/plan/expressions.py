@@ -389,6 +389,75 @@ class Cast(Expression):
 
 
 @dataclass(frozen=True)
+class WindowExpr(Expression):
+    """A window function: ``function OVER (PARTITION BY ... ORDER BY ... <frame>)``.
+
+    Renders verbatim to SQL so it pushes to a source or runs in the merge engine
+    unchanged (Postgres/ClickHouse/DuckDB all evaluate window SQL natively).
+    Ordering mirrors the Sort node: parallel ``order_keys`` / ``order_ascending``
+    / ``order_nulls`` lists. ``frame`` keeps the raw frame clause text (``ROWS
+    BETWEEN ...``) for verbatim re-rendering, or None when absent.
+    """
+
+    function: Expression
+    partition_by: List[Expression]
+    order_keys: List[Expression]
+    order_ascending: List[bool]
+    order_nulls: List[Optional[str]]
+    frame: Optional[str] = None
+
+    def get_type(self) -> DataType:
+        """The window's type is the type of its underlying function."""
+        return self.function.get_type()
+
+    def accept(self, visitor):
+        """Dispatch to the visitor's window hook."""
+        return visitor.visit_window_expr(self)
+
+    def to_sql(self) -> str:
+        """Render ``function OVER (PARTITION BY ... ORDER BY ... <frame>)``."""
+        return f"{self.function.to_sql()} OVER ({self._over_clause()})"
+
+    def _over_clause(self) -> str:
+        """Assemble the PARTITION BY / ORDER BY / frame body of the OVER clause."""
+        parts = []
+        if self.partition_by:
+            parts.append(f"PARTITION BY {self._partition_sql()}")
+        if self.order_keys:
+            parts.append(f"ORDER BY {self._order_sql()}")
+        if self.frame:
+            parts.append(self.frame)
+        return " ".join(parts)
+
+    def _partition_sql(self) -> str:
+        """Render the comma-separated PARTITION BY expressions."""
+        items = []
+        for expr in self.partition_by:
+            items.append(expr.to_sql())
+        return ", ".join(items)
+
+    def _order_sql(self) -> str:
+        """Render the comma-separated ORDER BY items with direction and NULLS."""
+        items = []
+        for index, key in enumerate(self.order_keys):
+            items.append(self._order_item_sql(index, key))
+        return ", ".join(items)
+
+    def _order_item_sql(self, index: int, key: Expression) -> str:
+        """Render one ORDER BY item: ``expr [DESC] [NULLS FIRST|LAST]``."""
+        text = key.to_sql()
+        if not self.order_ascending[index]:
+            text += " DESC"
+        nulls = self.order_nulls[index]
+        if nulls is not None:
+            text += f" NULLS {nulls}"
+        return text
+
+    def __repr__(self) -> str:
+        return f"WindowExpr({self.function})"
+
+
+@dataclass(frozen=True)
 class Extract(Expression):
     """``EXTRACT(field FROM source)`` date/time field extraction.
 

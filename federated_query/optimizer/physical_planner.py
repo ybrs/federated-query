@@ -29,6 +29,7 @@ from ..plan.physical import (
     PhysicalPlanNode,
     PhysicalScan,
     PhysicalProjection,
+    PhysicalWindow,
     PhysicalFilter,
     PhysicalLimit,
     PhysicalHashJoin,
@@ -326,9 +327,15 @@ class PhysicalPlanner:
         input_plan = self._plan_node(filter_node.input)
         return PhysicalFilter(input=input_plan, predicate=filter_node.predicate)
 
-    def _plan_projection(self, projection: Projection) -> PhysicalProjection:
-        """Plan a projection node."""
+    def _plan_projection(self, projection: Projection) -> PhysicalPlanNode:
+        """Plan a projection; window-bearing ones run in the merge engine."""
         input_plan = self._plan_node(projection.input)
+        if self._projection_has_window(projection):
+            return PhysicalWindow(
+                input=input_plan,
+                expressions=projection.expressions,
+                output_names=projection.aliases,
+            )
         if projection.distinct:
             self._propagate_distinct(input_plan)
         return PhysicalProjection(
@@ -337,6 +344,15 @@ class PhysicalPlanner:
             output_names=projection.aliases,
             distinct=projection.distinct,
         )
+
+    def _projection_has_window(self, projection: Projection) -> bool:
+        """Whether any projection expression is a window function."""
+        from ..plan.expressions import WindowExpr
+
+        for expr in projection.expressions:
+            if isinstance(expr, WindowExpr):
+                return True
+        return False
 
     def _propagate_distinct(self, node: PhysicalPlanNode) -> None:
         """Mark the lowest scan-like node to emit DISTINCT."""

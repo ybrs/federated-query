@@ -42,6 +42,7 @@ from ..plan.expressions import (
     Extract,
     Interval,
     CaseExpr,
+    WindowExpr,
     SubqueryExpression,
     ExistsExpression,
     InSubquery,
@@ -990,6 +991,8 @@ class Parser:
             return self._convert_interval(expr)
         if isinstance(expr, exp.Filter):
             return self._convert_filter_aggregate(expr)
+        if isinstance(expr, exp.Window):
+            return self._convert_window(expr)
         if self._is_aggregate_function(expr):
             return self._convert_aggregate_function(expr)
         if isinstance(expr, (exp.Anonymous, exp.Func, exp.Upper)):
@@ -1387,6 +1390,55 @@ class Parser:
         args: List[Expression] = []
         self._collect_function_args(func, args)
         return FunctionCall(function_name=name, args=args, is_aggregate=False)
+
+    def _convert_window(self, win: exp.Window) -> WindowExpr:
+        """Convert a sqlglot Window (``func OVER (...)``) into a WindowExpr."""
+        function = self._convert_expression(win.this)
+        partition_by = self._convert_partition_by(win)
+        order_keys, ascending, nulls = self._convert_window_order(win)
+        return WindowExpr(
+            function=function,
+            partition_by=partition_by,
+            order_keys=order_keys,
+            order_ascending=ascending,
+            order_nulls=nulls,
+            frame=self._render_window_frame(win),
+        )
+
+    def _convert_partition_by(self, win: exp.Window) -> List[Expression]:
+        """Convert a window's PARTITION BY expressions."""
+        result: List[Expression] = []
+        for part in win.args.get("partition_by") or []:
+            result.append(self._convert_expression(part))
+        return result
+
+    def _convert_window_order(self, win: exp.Window):
+        """Convert a window's ORDER BY into (keys, ascending, nulls) lists."""
+        keys: List[Expression] = []
+        ascending: List[bool] = []
+        nulls: List[Optional[str]] = []
+        order = win.args.get("order")
+        if order is None:
+            return keys, ascending, nulls
+        for ordered in order.expressions:
+            keys.append(self._convert_expression(ordered.this))
+            ascending.append(not ordered.args.get("desc", False))
+            nulls.append(self._window_nulls(ordered))
+        return keys, ascending, nulls
+
+    def _window_nulls(self, ordered: exp.Ordered) -> Optional[str]:
+        """Map an Ordered node's NULLS placement to 'FIRST'/'LAST'/None."""
+        nulls = ordered.args.get("nulls_first")
+        if nulls is None:
+            return None
+        return "FIRST" if nulls else "LAST"
+
+    def _render_window_frame(self, win: exp.Window) -> Optional[str]:
+        """Render the frame spec (``ROWS/RANGE ...``) verbatim, or None."""
+        spec = win.args.get("spec")
+        if spec is None:
+            return None
+        return spec.sql(dialect=self.dialect)
 
     def _collect_function_args(
         self, func: exp.Expression, args: List[Expression]
