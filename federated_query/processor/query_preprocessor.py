@@ -12,6 +12,7 @@ from sqlglot import exp
 from ..catalog import Catalog
 from ..catalog.schema import Table
 from ..parser.dialect import FedQPostgres
+from ..parser.errors import UnsupportedSQLError
 from .query_context import ColumnMapping, QueryContext
 from .query_executor import QueryExecutor, QueryProcessor
 
@@ -78,6 +79,7 @@ class QueryPreprocessor:
     ) -> None:
         """Traverse AST and rewrite every SELECT."""
         if isinstance(node, exp.Select):
+            self._rewrite_pivot(node)
             self._inline_named_windows(node)
             self._rewrite_select(node, context, is_root)
         for key, value in node.args.items():
@@ -157,6 +159,122 @@ class QueryPreprocessor:
         replacements: List[exp.Expression] = [expression]
         metadata = self._column_mappings_for_expression(expression, sources)
         return replacements, metadata
+
+    def _rewrite_pivot(self, select: exp.Select) -> None:
+        """Expand a single-aggregate static PIVOT into conditional aggregation.
+
+        PIVOT is not expressible in the engine's Postgres internal SQL, so it is
+        rewritten to portable ``agg(CASE WHEN k = value THEN x END)`` that every
+        source supports. Shapes the rewrite cannot handle fail fast.
+        """
+        pivot = self._single_pivot(select)
+        if pivot is None:
+            return
+        self._reject_unsupported_pivot(select, pivot)
+        table = select.args["from_"].this
+        columns = self._build_source(table).columns
+        self._apply_pivot_rewrite(select, table, pivot, columns)
+
+    def _single_pivot(self, select: exp.Select):
+        """Return the FROM table's pivot node, or None when there is none."""
+        from_clause = select.args.get("from_")
+        if from_clause is None:
+            return None
+        table = from_clause.this
+        if not isinstance(table, exp.Table):
+            return None
+        pivots = table.args.get("pivots")
+        if not pivots:
+            return None
+        return pivots[0]
+
+    def _reject_unsupported_pivot(self, select: exp.Select, pivot: exp.Pivot) -> None:
+        """Fail fast on pivot shapes the conditional-aggregation rewrite cannot do."""
+        if pivot.args.get("unpivot"):
+            raise UnsupportedSQLError("UNPIVOT is not supported")
+        if len(pivot.expressions) != 1:
+            raise UnsupportedSQLError("PIVOT with multiple aggregates is not supported")
+        if select.args.get("joins") or not self._is_star_select(select):
+            raise UnsupportedSQLError("PIVOT requires SELECT * over a single table")
+        self._reject_unsupported_pivot_field(pivot)
+
+    def _reject_unsupported_pivot_field(self, pivot: exp.Pivot) -> None:
+        """Require a static IN list of literals and a column aggregate argument."""
+        field = pivot.args["fields"][0]
+        if not isinstance(field, exp.In) or not field.expressions:
+            raise UnsupportedSQLError("PIVOT requires a static IN value list")
+        for value in field.expressions:
+            if not isinstance(value, exp.Literal):
+                raise UnsupportedSQLError("PIVOT IN values must be literals")
+        agg_input = self._pivot_agg_func(pivot.expressions[0]).this
+        if not isinstance(agg_input, exp.Column):
+            raise UnsupportedSQLError("PIVOT aggregate must be over a single column")
+
+    def _is_star_select(self, select: exp.Select) -> bool:
+        """True when the projection is a single bare ``*``."""
+        expressions = select.expressions
+        return len(expressions) == 1 and isinstance(expressions[0], exp.Star)
+
+    def _pivot_agg_func(self, aggregate: exp.Expression) -> exp.Expression:
+        """Return the aggregate function node, unwrapping an output alias."""
+        if isinstance(aggregate, exp.Alias):
+            return aggregate.this
+        return aggregate
+
+    def _apply_pivot_rewrite(self, select, table, pivot, columns) -> None:
+        """Replace SELECT * ... PIVOT(...) with conditional-aggregation SQL."""
+        field = pivot.args["fields"][0]
+        agg_func = self._pivot_agg_func(pivot.expressions[0])
+        group_cols = self._pivot_group_columns(columns, field.this.name, agg_func)
+        projections = self._pivot_projections(group_cols, pivot, field, agg_func)
+        table.set("pivots", None)
+        select.set("expressions", projections)
+        keys = []
+        for column in group_cols:
+            keys.append(exp.column(column, quoted=True))
+        select.set("group", exp.Group(expressions=keys))
+
+    def _pivot_group_columns(self, columns, pivot_col, agg_func) -> List[str]:
+        """Columns that stay grouped: all table columns minus pivot/value columns."""
+        consumed = {pivot_col.lower()}
+        for column in agg_func.find_all(exp.Column):
+            consumed.add(column.name.lower())
+        group_cols = []
+        for column in columns:
+            if column.lower() not in consumed:
+                group_cols.append(column)
+        return group_cols
+
+    def _pivot_projections(self, group_cols, pivot, field, agg_func):
+        """Group columns plus one conditional aggregate per IN value."""
+        projections = []
+        for column in group_cols:
+            projections.append(exp.column(column, quoted=True))
+        names = self._pivot_output_names(pivot, field)
+        for value, out_name in zip(field.expressions, names):
+            projections.append(
+                self._pivot_case_aggregate(field.this, value, agg_func, out_name)
+            )
+        return projections
+
+    def _pivot_output_names(self, pivot: exp.Pivot, field: exp.In) -> List[str]:
+        """Output column names sqlglot computed, or the IN value text as fallback."""
+        names = []
+        for column in pivot.args.get("columns") or []:
+            names.append(column.name)
+        if len(names) == len(field.expressions):
+            return names
+        names = []
+        for value in field.expressions:
+            names.append(value.name)
+        return names
+
+    def _pivot_case_aggregate(self, pivot_col, value, agg_func, out_name):
+        """Build ``agg(CASE WHEN pivot_col = value THEN <arg> END) AS out_name``."""
+        condition = exp.EQ(this=pivot_col.copy(), expression=value.copy())
+        case = exp.Case(ifs=[exp.If(this=condition, true=agg_func.this.copy())])
+        new_agg = agg_func.__class__(this=case)
+        return exp.alias_(new_agg, out_name)
 
     def _inline_named_windows(self, select: exp.Select) -> None:
         """Inline named windows (WINDOW w AS (...)) into their OVER w references.

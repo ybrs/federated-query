@@ -197,12 +197,12 @@ class Parser:
     def _reject_unsupported_select_clauses(self, select: exp.Select) -> None:
         """Fail fast on SELECT clauses the converter does not consume.
 
-        Without this the parser would silently ignore clauses such as DISTINCT
-        ON, named WINDOW, GROUP BY ROLLUP/CUBE/GROUPING SETS, or FETCH FIRST ...
-        WITH TIES and return a wrong answer or crash deep in the engine.
+        Without this the parser would silently ignore clauses such as named
+        WINDOW, pivots, locks, or sample and return a wrong answer or crash deep
+        in the engine. Clauses we now support (DISTINCT ON, GROUP BY ROLLUP/CUBE/
+        GROUPING SETS, FETCH FIRST) are handled by their own converters.
         """
         self._reject_unknown_select_args(select)
-        self._reject_grouping_extensions(select)
 
     def _reject_unknown_select_args(self, select: exp.Select) -> None:
         """Raise on any SELECT clause not in SUPPORTED_SELECT_ARGS."""
@@ -211,15 +211,6 @@ class Parser:
                 continue
             if name not in self.SUPPORTED_SELECT_ARGS:
                 raise UnsupportedSQLError(f"Unsupported SQL clause: {name}")
-
-    def _reject_grouping_extensions(self, select: exp.Select) -> None:
-        """Reject GROUP BY ROLLUP / CUBE / GROUPING SETS / WITH TOTALS."""
-        group = select.args.get("group")
-        if group is None:
-            return
-        for kind in ("rollup", "cube", "grouping_sets", "totals"):
-            if group.args.get(kind):
-                raise UnsupportedSQLError(f"GROUP BY {kind.upper()} is not supported")
 
     def _convert_plain_select(self, select: exp.Select) -> LogicalPlanNode:
         """Convert a SELECT body (without its WITH clause) to a logical plan."""
@@ -364,6 +355,8 @@ class Parser:
 
         if isinstance(table_expr, exp.Subquery):
             return self._build_derived_table(table_expr)
+        if isinstance(table_expr, exp.Values):
+            return self._values_relation(table_expr)
         self._reject_unsupported_relation(table_expr)
 
         all_columns = self._collect_needed_columns(select)
@@ -384,7 +377,19 @@ class Parser:
             table_name=table_name,
             columns=all_columns,
             alias=table_alias,
+            sample=self._table_sample_sql(table_expr),
         )
+
+    def _table_sample_sql(self, table_expr: exp.Expression) -> Optional[str]:
+        """Render a table's TABLESAMPLE clause as Postgres-form SQL, or None.
+
+        The source dialect transpile at render time turns this into the form the
+        target accepts (e.g. DuckDB's ``BERNOULLI (10 PERCENT)``).
+        """
+        sample = table_expr.args.get("sample")
+        if sample is None:
+            return None
+        return sample.sql(dialect=self.dialect)
 
     def _build_join_input(
         self, table_expr: exp.Expression, column_usage: Dict[str, List[str]]
@@ -392,6 +397,8 @@ class Parser:
         """Build the plan for one input relation of a join."""
         if isinstance(table_expr, exp.Subquery):
             return self._build_derived_table(table_expr)
+        if isinstance(table_expr, exp.Values):
+            return self._values_relation(table_expr)
         self._reject_unsupported_relation(table_expr)
         table_alias = self._extract_table_alias(table_expr)
         columns = self._columns_for_join_table(column_usage, table_alias)
@@ -405,6 +412,7 @@ class Parser:
             table_name=table_parts[2],
             columns=columns,
             alias=table_alias,
+            sample=self._table_sample_sql(table_expr),
         )
 
     def _build_derived_table(self, subquery: exp.Subquery) -> SubqueryScan:
@@ -415,6 +423,47 @@ class Parser:
         inner_plan = self.ast_to_logical_plan(subquery.this)
         return SubqueryScan(input=inner_plan, alias=alias)
 
+    def _values_relation(self, values: exp.Values) -> SubqueryScan:
+        """Build a derived table from a VALUES list: ``(VALUES ...) AS v(a, b)``.
+
+        The constant rows become a Values relation; the table alias and column
+        aliases name it, so the rest of the engine treats it like any other
+        derived table.
+        """
+        alias = values.alias
+        if not alias:
+            raise ValueError("VALUES in FROM requires an alias")
+        rows = self._convert_values_rows(values)
+        names = self._values_column_names(values, rows)
+        return SubqueryScan(input=Values(rows=rows, output_names=names), alias=alias)
+
+    def _convert_values_rows(self, values: exp.Values) -> List[List[Expression]]:
+        """Convert each VALUES row (a tuple of constants) into expressions."""
+        rows = []
+        for row_expr in values.expressions:
+            row = []
+            for cell in row_expr.expressions:
+                row.append(self._convert_expression(cell))
+            rows.append(row)
+        return rows
+
+    def _values_column_names(
+        self, values: exp.Values, rows: List[List[Expression]]
+    ) -> List[str]:
+        """Return VALUES column names from the alias, or column1..N by default."""
+        alias_node = values.args.get("alias")
+        columns = alias_node.args.get("columns") if alias_node else None
+        if columns:
+            names = []
+            for column in columns:
+                names.append(column.name)
+            return names
+        width = len(rows[0]) if rows else 0
+        names = []
+        for index in range(width):
+            names.append(f"column{index + 1}")
+        return names
+
     def _reject_unsupported_relation(self, table_expr: exp.Expression) -> None:
         """Fail fast on FROM items the engine cannot plan.
 
@@ -422,8 +471,6 @@ class Parser:
         """
         if not isinstance(table_expr, exp.Table):
             raise ValueError(f"Unsupported FROM item: {type(table_expr).__name__}")
-        if table_expr.args.get("sample"):
-            raise UnsupportedSQLError("TABLESAMPLE is not supported")
         if table_expr.args.get("pivots"):
             raise UnsupportedSQLError("PIVOT/UNPIVOT is not supported")
 
@@ -802,7 +849,8 @@ class Parser:
         Returns:
             Aggregate node
         """
-        group_by_exprs = self._extract_group_by_exprs(group)
+        grouping_sets = self._extract_grouping_sets(group)
+        group_by_exprs = self._extract_group_by_exprs(group, grouping_sets)
         aggregates = self._extract_aggregates_from_select(select)
         output_names = self._extract_output_names(select)
 
@@ -811,22 +859,125 @@ class Parser:
             group_by=group_by_exprs,
             aggregates=aggregates,
             output_names=output_names,
+            grouping_sets=grouping_sets,
         )
 
-    def _extract_group_by_exprs(self, group: exp.Group) -> List[Expression]:
-        """Extract grouping expressions.
+    def _extract_group_by_exprs(
+        self, group: exp.Group, grouping_sets: Optional[List[List[Expression]]] = None
+    ) -> List[Expression]:
+        """Extract the flat grouping expressions used for column resolution.
 
-        Args:
-            group: sqlglot Group node
-
-        Returns:
-            List of grouping expressions
+        For ROLLUP/CUBE/GROUPING SETS this is the distinct union of the keys
+        across all grouping sets; for an ordinary GROUP BY it is the key list.
         """
-        expressions = []
-        for expr in group.expressions:
-            converted = self._convert_expression(expr)
-            expressions.append(converted)
-        return expressions
+        if grouping_sets is not None:
+            return self._union_grouping_keys(grouping_sets)
+        return self._convert_group_expressions(group.expressions)
+
+    def _convert_group_expressions(
+        self, expressions: List[exp.Expression]
+    ) -> List[Expression]:
+        """Convert a list of grouping key expressions."""
+        converted = []
+        for expr in expressions:
+            converted.append(self._convert_expression(expr))
+        return converted
+
+    def _union_grouping_keys(
+        self, grouping_sets: List[List[Expression]]
+    ) -> List[Expression]:
+        """Distinct grouping keys across every grouping set, preserving order."""
+        seen = []
+        keys = []
+        for grouping_set in grouping_sets:
+            for expr in grouping_set:
+                token = expr.to_sql()
+                if token not in seen:
+                    seen.append(token)
+                    keys.append(expr)
+        return keys
+
+    def _extract_grouping_sets(
+        self, group: exp.Group
+    ) -> Optional[List[List[Expression]]]:
+        """Expand GROUP BY ROLLUP/CUBE/GROUPING SETS into explicit grouping sets.
+
+        Returns None for an ordinary single-level GROUP BY. Supports leading
+        normal keys plus exactly one ROLLUP/CUBE/GROUPING SETS construct; richer
+        combinations fail fast rather than risk a wrong expansion.
+        """
+        construct = self._single_grouping_construct(group)
+        if construct is None:
+            return None
+        normal_keys = self._convert_group_expressions(group.expressions)
+        sets = []
+        for construct_set in self._expand_grouping_construct(construct):
+            sets.append(normal_keys + construct_set)
+        return sets
+
+    def _single_grouping_construct(self, group: exp.Group):
+        """Return the one ROLLUP/CUBE/GROUPING SETS node, or None; reject mixes."""
+        if group.args.get("totals"):
+            raise UnsupportedSQLError("GROUP BY ... WITH TOTALS is not supported")
+        present = []
+        for kind in ("rollup", "cube", "grouping_sets"):
+            present.extend(group.args.get(kind) or [])
+        if not present:
+            return None
+        if len(present) > 1:
+            raise UnsupportedSQLError(
+                "Combining multiple ROLLUP/CUBE/GROUPING SETS is not supported"
+            )
+        return present[0]
+
+    def _expand_grouping_construct(self, construct) -> List[List[Expression]]:
+        """Expand one ROLLUP/CUBE/GROUPING SETS node into a list of grouping sets."""
+        if isinstance(construct, exp.Rollup):
+            return self._rollup_sets(
+                self._convert_group_expressions(construct.expressions)
+            )
+        if isinstance(construct, exp.Cube):
+            return self._cube_sets(
+                self._convert_group_expressions(construct.expressions)
+            )
+        return self._explicit_grouping_sets(construct)
+
+    def _rollup_sets(self, keys: List[Expression]) -> List[List[Expression]]:
+        """ROLLUP(k1..kn): the n+1 prefixes [k1..kn], ..., [k1], []."""
+        sets = []
+        for size in range(len(keys), -1, -1):
+            sets.append(list(keys[:size]))
+        return sets
+
+    def _cube_sets(self, keys: List[Expression]) -> List[List[Expression]]:
+        """CUBE(k1..kn): every subset of the keys."""
+        sets = []
+        for mask in range(2 ** len(keys)):
+            sets.append(self._subset_for_mask(keys, mask))
+        return sets
+
+    def _subset_for_mask(self, keys: List[Expression], mask: int) -> List[Expression]:
+        """Pick the keys whose bit is set in the bitmask."""
+        subset = []
+        for index, key in enumerate(keys):
+            if mask & (1 << index):
+                subset.append(key)
+        return subset
+
+    def _explicit_grouping_sets(self, grouping_sets) -> List[List[Expression]]:
+        """Convert an explicit GROUPING SETS node into lists of expressions."""
+        sets = []
+        for element in grouping_sets.expressions:
+            sets.append(self._grouping_set_columns(element))
+        return sets
+
+    def _grouping_set_columns(self, element: exp.Expression) -> List[Expression]:
+        """Return one grouping-set element's columns (handles (), (a), (a, b))."""
+        if isinstance(element, exp.Tuple):
+            return self._convert_group_expressions(element.expressions)
+        if isinstance(element, exp.Paren):
+            return [self._convert_expression(element.this)]
+        return [self._convert_expression(element)]
 
     def _extract_aggregates_from_select(self, select: exp.Select) -> List[Expression]:
         """Extract all expressions from SELECT for aggregation.
@@ -1079,6 +1230,8 @@ class Parser:
             return self._convert_window(expr)
         if isinstance(expr, exp.WithinGroup):
             return self._convert_within_group(expr)
+        if isinstance(expr, exp.Grouping):
+            return self._convert_grouping(expr)
         if self._is_aggregate_function(expr):
             return self._convert_aggregate_function(expr)
         if isinstance(expr, (exp.Anonymous, exp.Func, exp.Upper)):
@@ -1453,6 +1606,18 @@ class Parser:
         """
         rendered = func.sql(dialect=self.dialect)
         return rendered.split("(", 1)[0].strip().upper()
+
+    def _convert_grouping(self, expr: exp.Grouping) -> FunctionCall:
+        """Convert GROUPING(a, ...) into an aggregate-context FunctionCall.
+
+        GROUPING reports whether each argument was rolled up in the current
+        grouping set; it is only valid with GROUP BY, so it is marked aggregate.
+        """
+        return FunctionCall(
+            function_name="GROUPING",
+            args=self._convert_group_expressions(expr.expressions),
+            is_aggregate=True,
+        )
 
     def _convert_within_group(self, expr: exp.WithinGroup) -> FunctionCall:
         """Convert an ordered-set aggregate: f(args) WITHIN GROUP (ORDER BY key).

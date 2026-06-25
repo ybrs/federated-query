@@ -18,11 +18,9 @@ TABLE = "duckdb_primary.main.orders"
 
 # Each case is a SQL fragment the engine must reject rather than misinterpret.
 REJECTED_SQL = [
-    f"SELECT region, SUM(price) FROM {TABLE} GROUP BY ROLLUP (region)",
-    f"SELECT region, status, SUM(price) FROM {TABLE} GROUP BY CUBE (region, status)",
-    f"SELECT region, SUM(price) FROM {TABLE} GROUP BY GROUPING SETS ((region), ())",
-    f"SELECT order_id FROM {TABLE} TABLESAMPLE BERNOULLI (50)",
     f"SELECT order_id FROM {TABLE} ORDER BY price DESC FETCH FIRST 2 ROWS WITH TIES",
+    f"SELECT region FROM {TABLE} GROUP BY ROLLUP (region), CUBE (status)",
+    f"SELECT * FROM {TABLE} UNPIVOT (val FOR col IN (price, quantity))",
 ]
 
 

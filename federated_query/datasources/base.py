@@ -66,6 +66,13 @@ class ColumnStatistics:
 class DataSource(ABC):
     """Abstract base class for data sources."""
 
+    # sqlglot dialect a pushed query is rendered in for this source. The engine
+    # generates Postgres-flavored SQL internally; rendering it through the
+    # source's own dialect transpiles dialect-divergent syntax (function names,
+    # TABLESAMPLE, ordered-set aggregates) to what the source actually accepts.
+    # Subclasses override this; the default suits Postgres-compatible sources.
+    render_dialect = "postgres"
+
     def __init__(self, name: str, config: Dict[str, Any]):
         """Initialize data source.
 

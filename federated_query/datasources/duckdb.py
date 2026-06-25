@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 class DuckDBDataSource(DataSource):
     """DuckDB data source connector."""
 
+    render_dialect = "duckdb"
+
     def __init__(self, name: str, config: Dict[str, Any]):
         """Initialize DuckDB data source.
 

@@ -166,6 +166,34 @@ def _and_filters(existing: Optional[Expression], new_filter: Expression) -> Expr
     return BinaryOp(op=BinaryOpType.AND, left=existing, right=new_filter)
 
 
+def to_source_sql(connection, postgres_sql: str) -> str:
+    """Transpile the engine's Postgres-form SQL into the source's own dialect.
+
+    String-building nodes (scans, remote joins) generate Postgres-flavored SQL;
+    re-parsing and rendering it through the source dialect transpiles
+    dialect-divergent syntax (function names, TABLESAMPLE, ordered-set
+    aggregates) to what the source actually accepts.
+    """
+    ast = connection.parse_query(postgres_sql)
+    return ast.sql(dialect=connection.render_dialect)
+
+
+def render_grouping_sets(grouping_sets, render_expr) -> str:
+    """Render ``GROUPING SETS ((a, b), (a), ())`` from explicit grouping sets.
+
+    ``render_expr`` turns one key expression into SQL (plain ``to_sql`` for
+    pushdown, alias-resolved for the merge engine), so both render paths share
+    one structure.
+    """
+    rendered_sets = []
+    for grouping_set in grouping_sets:
+        columns = []
+        for expr in grouping_set:
+            columns.append(render_expr(expr))
+        rendered_sets.append("(" + ", ".join(columns) + ")")
+    return "GROUPING SETS (" + ", ".join(rendered_sets) + ")"
+
+
 def _literal_for_value(value):
     """Wrap a Python join-key value as a typed Literal, or None if unsupported.
 
@@ -526,7 +554,9 @@ class PhysicalScan(PhysicalPlanNode):
     filters: Optional[Expression] = None
     datasource_connection: Any = None  # Set during planning
     _schema: Optional[pa.Schema] = None  # Cached schema
+    sample: Optional[str] = None  # TABLESAMPLE clause (Postgres-form SQL)
     group_by: Optional[List[Expression]] = None  # Optional GROUP BY expressions
+    grouping_sets: Optional[List[List[Expression]]] = None  # ROLLUP/CUBE/GROUPING SETS
     aggregates: Optional[List[Expression]] = None  # Optional aggregate expressions
     output_names: Optional[List[str]] = (
         None  # Output column names when using aggregates
@@ -601,7 +631,7 @@ class PhysicalScan(PhysicalPlanNode):
         if self.datasource_connection is None:
             raise RuntimeError("Data source connection not set")
 
-        query = self._build_query()
+        query = to_source_sql(self.datasource_connection, self._build_query())
 
         self.datasource_connection.ensure_connected()
         batches = self.datasource_connection.execute_query(query)
@@ -616,7 +646,7 @@ class PhysicalScan(PhysicalPlanNode):
         where_pred, having_pred = self._split_where_having()
         if where_pred is not None:
             query = f"{query} WHERE {where_pred.to_sql()}"
-        if self.group_by:
+        if self.group_by or self.grouping_sets is not None:
             query = f"{query} GROUP BY {self._format_group_by()}"
         if having_pred is not None:
             query = f"{query} HAVING {having_pred.to_sql()}"
@@ -713,14 +743,18 @@ class PhysicalScan(PhysicalPlanNode):
         return ", ".join(quoted_cols)
 
     def _format_table_ref(self) -> str:
-        """Format table reference for SQL."""
+        """Format table reference for SQL, including any TABLESAMPLE clause."""
         ref = f'"{self.schema_name}"."{self.table_name}"'
         if self.alias:
-            return f"{ref} AS {self.alias}"
+            ref = f"{ref} AS {self.alias}"
+        if self.sample:
+            ref = f"{ref} {self.sample}"
         return ref
 
     def _format_group_by(self) -> str:
-        """Format GROUP BY clause."""
+        """Format GROUP BY clause (GROUPING SETS for ROLLUP/CUBE/GROUPING SETS)."""
+        if self.grouping_sets is not None:
+            return render_grouping_sets(self.grouping_sets, lambda e: e.to_sql())
         if not self.group_by:
             return ""
 
@@ -805,7 +839,7 @@ class PhysicalScan(PhysicalPlanNode):
         if self.datasource_connection is None:
             raise RuntimeError("Data source connection not set")
 
-        query = self._build_query()
+        query = to_source_sql(self.datasource_connection, self._build_query())
         self._schema = self.datasource_connection.get_query_schema(query)
         return self._schema
 
@@ -1785,7 +1819,7 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
         return []
 
     def execute(self) -> Iterator[pa.RecordBatch]:
-        query = self._build_query()
+        query = to_source_sql(self.datasource_connection, self._build_query())
         self.datasource_connection.ensure_connected()
         batches = self.datasource_connection.execute_query(query)
         for batch in batches:
@@ -1793,7 +1827,7 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
 
     def schema(self) -> pa.Schema:
         if self._schema is None:
-            query = self._build_query()
+            query = to_source_sql(self.datasource_connection, self._build_query())
             self._schema = self.datasource_connection.get_query_schema(query)
         return self._schema
 
@@ -2319,6 +2353,7 @@ class PhysicalHashAggregate(PhysicalPlanNode):
     group_by: List[Expression]
     aggregates: List[Expression]
     output_names: List[str]
+    grouping_sets: Optional[List[List[Expression]]] = None
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
@@ -2329,6 +2364,14 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         if engine is not None and self._can_merge_aggregate():
             yield from self._execute_merge_aggregate(engine)
             return
+
+        if self.grouping_sets is not None:
+            from ..parser.errors import UnsupportedSQLError
+
+            raise UnsupportedSQLError(
+                "GROUP BY ROLLUP/CUBE/GROUPING SETS is only supported when the "
+                "aggregate pushes to a source or runs in the merge engine"
+            )
 
         if self._supports_streaming():
             result_batch = self._execute_streaming()
@@ -2418,7 +2461,11 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         return ", ".join(parts)
 
     def _aggregate_group_list(self, aliases) -> str:
-        """Render the GROUP BY keys, or empty for a global aggregate."""
+        """Render the GROUP BY keys (GROUPING SETS for ROLLUP/CUBE/GROUPING SETS)."""
+        if self.grouping_sets is not None:
+            return render_grouping_sets(
+                self.grouping_sets, lambda e: self._render_agg_expr(e, aliases)
+            )
         parts = []
         for expr in self.group_by:
             parts.append(self._render_agg_expr(expr, aliases))
@@ -3174,8 +3221,8 @@ class PhysicalRemoteQuery(PhysicalPlanNode):
         return self._schema
 
     def _sql(self) -> str:
-        """Render the carried AST as a Postgres-dialect SQL string."""
-        return self.query_ast.sql(dialect="postgres")
+        """Render the carried AST in the target source's dialect."""
+        return self.query_ast.sql(dialect=self.datasource_connection.render_dialect)
 
     def estimated_cost(self) -> float:
         raise NotImplementedError("Cost estimation not yet implemented")
@@ -3317,8 +3364,10 @@ class PhysicalRemoteSetOp(PhysicalPlanNode):
         return f"PhysicalRemoteSetOp({self.kind.value}{suffix})"
 
     def _build_query(self) -> str:
-        """Render the remote SQL string for this set operation."""
-        return self.build_remote_ast().sql(dialect="postgres")
+        """Render the remote SQL string for this set operation in the source dialect."""
+        return self.build_remote_ast().sql(
+            dialect=self.datasource_connection.render_dialect
+        )
 
     def build_remote_ast(self) -> exp.Expression:
         """Build the sqlglot AST sent to the data source.
@@ -4018,10 +4067,9 @@ class PhysicalExplain(PhysicalPlanNode):
         for snapshot in queries:
             query_value: Any = snapshot.query_ast
             if stringify_queries:
-                if snapshot.query_ast is not None:
-                    query_value = snapshot.query_ast.sql(dialect="postgres")
-                else:
-                    query_value = snapshot.sql
+                # snapshot.sql is already rendered in the source's dialect by the
+                # recorder, so EXPLAIN shows exactly what is sent to the source.
+                query_value = snapshot.sql
             entry = {
                 "datasource_name": snapshot.datasource_name,
                 "query": query_value,
@@ -4307,7 +4355,8 @@ class _DatasourceQueryCollector:
             return
         base_sql = scan._build_query()
         query_ast = datasource.parse_query(base_sql)
-        sql = self._annotate_dynamic_filter(scan, base_sql)
+        native_sql = to_source_sql(datasource, base_sql)
+        sql = self._annotate_dynamic_filter(scan, native_sql)
         snapshot = _DatasourceQuerySnapshot(scan.datasource, sql, query_ast)
         snapshots.append(snapshot)
 
@@ -4357,9 +4406,10 @@ class _DatasourceQueryCollector:
         datasource = join.datasource_connection
         if datasource is None:
             return
-        sql = join._build_query()
-        query_ast = datasource.parse_query(sql)
-        snapshot = _DatasourceQuerySnapshot(join.left.datasource, sql, query_ast)
+        postgres_sql = join._build_query()
+        query_ast = datasource.parse_query(postgres_sql)
+        native_sql = to_source_sql(datasource, postgres_sql)
+        snapshot = _DatasourceQuerySnapshot(join.left.datasource, native_sql, query_ast)
         snapshots.append(snapshot)
 
     def _record_remote_set_op(
@@ -4368,7 +4418,7 @@ class _DatasourceQueryCollector:
         if set_op.datasource_connection is None:
             return
         query_ast = set_op.build_remote_ast()
-        sql = query_ast.sql(dialect="postgres")
+        sql = query_ast.sql(dialect=set_op.datasource_connection.render_dialect)
         snapshot = _DatasourceQuerySnapshot(set_op.datasource, sql, query_ast)
         snapshots.append(snapshot)
 
@@ -4377,6 +4427,6 @@ class _DatasourceQueryCollector:
     ) -> None:
         if node.datasource_connection is None:
             return
-        sql = node.query_ast.sql(dialect="postgres")
+        sql = node.query_ast.sql(dialect=node.datasource_connection.render_dialect)
         snapshot = _DatasourceQuerySnapshot(node.datasource, sql, node.query_ast)
         snapshots.append(snapshot)

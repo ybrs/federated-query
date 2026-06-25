@@ -1535,22 +1535,13 @@ class AggregatePushdownRule(OptimizationRule):
         """Push aggregate into scan node."""
         merged_filters = self._merge_filters(scan.filters, filter_expr)
 
-        return Scan(
-            datasource=scan.datasource,
-            schema_name=scan.schema_name,
-            table_name=scan.table_name,
-            columns=scan.columns,
+        return replace(
+            scan,
             filters=merged_filters,
-            alias=scan.alias,
             group_by=agg.group_by,
+            grouping_sets=agg.grouping_sets,
             aggregates=agg.aggregates,
             output_names=agg.output_names,
-            limit=scan.limit,
-            offset=scan.offset,
-            order_by_keys=scan.order_by_keys,
-            order_by_ascending=scan.order_by_ascending,
-            order_by_nulls=scan.order_by_nulls,
-            distinct=scan.distinct,
         )
 
     def _merge_filters(

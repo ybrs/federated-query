@@ -1,7 +1,7 @@
 """Logical plan nodes."""
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional, Dict, Any
 from enum import Enum
 
@@ -90,7 +90,12 @@ class Scan(LogicalPlanNode):
     columns: List[str]  # Columns to read
     filters: Optional[Expression] = None  # Optional pushed-down filters
     alias: Optional[str] = None  # Table alias (e.g., "u" in "FROM users u")
+    # TABLESAMPLE clause as Postgres-form SQL (e.g. "TABLESAMPLE BERNOULLI (10)");
+    # transpiled to the source dialect when the scan is rendered.
+    sample: Optional[str] = None
     group_by: Optional[List[Expression]] = None  # Optional GROUP BY expressions
+    # GROUP BY ROLLUP/CUBE/GROUPING SETS folded onto the scan, as explicit sets.
+    grouping_sets: Optional[List[List[Expression]]] = None
     aggregates: Optional[List[Expression]] = None  # Optional aggregate expressions
     output_names: Optional[List[str]] = (
         None  # Output column names when using aggregates
@@ -261,16 +266,20 @@ class Aggregate(LogicalPlanNode):
     """Aggregate with grouping."""
 
     input: LogicalPlanNode
-    group_by: List[Expression]  # Grouping expressions
+    group_by: List[Expression]  # Grouping expressions (union of all grouping sets)
     aggregates: List[Expression]  # Aggregate expressions
     output_names: List[str]  # Output column names
+    # GROUP BY ROLLUP/CUBE/GROUPING SETS, expanded to explicit grouping sets.
+    # Each inner list is one set's expressions ([] is the grand total). None for
+    # an ordinary single-level GROUP BY.
+    grouping_sets: Optional[List[List[Expression]]] = None
 
     def children(self) -> List[LogicalPlanNode]:
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Aggregate":
         assert len(children) == 1
-        return Aggregate(children[0], self.group_by, self.aggregates, self.output_names)
+        return replace(self, input=children[0])
 
     def accept(self, visitor):
         return visitor.visit_aggregate(self)

@@ -68,6 +68,8 @@ def _strip_ch_type(ch_type: str) -> str:
 class ClickHouseDataSource(DataSource):
     """ClickHouse connector that fetches results as streamed Arrow batches."""
 
+    render_dialect = "clickhouse"
+
     def __init__(self, name: str, config: Dict[str, Any]):
         """Config: host, port (HTTP, default 8123), user, password, database."""
         super().__init__(name, config)

@@ -886,18 +886,15 @@ progress:
       expression rebuilds. New rule in CLAUDE.md/AGENTS.md, and a guard test
       `tests/test_node_field_preservation.py` pins the `with_children` contract for
       every node type with children (a dropped field fails the round-trip).
-- [ ] GROUP BY ROLLUP / CUBE / GROUPING SETS + the GROUPING() function - NOT YET
-      DONE; remains a clean fail-fast (`UnsupportedSQLError` via
-      `_reject_grouping_extensions`), so no wrong answers. This is the one large
-      structural item left: unlike the other Batch-2 features it is not a flag but
-      a grouping-structure change with combinatoric semantics, the GROUPING()
-      function, and multi-row NULL output the local pyarrow path cannot produce.
-      Plan: add `Aggregate.grouping_sets` (explicit list of sets; expand
-      ROLLUP/CUBE into sets at parse), render `GROUP BY GROUPING SETS (...)` for
-      single-source pushdown and the DuckDB merge engine (both support it), bind
-      and project-collect the set keys, route the `Grouping` node through the
-      function path, and fail fast on the pyarrow path. DuckDB and Postgres both
-      support the native syntax (verified).
+- [x] GROUP BY ROLLUP / CUBE / GROUPING SETS + the GROUPING() function. ROLLUP/CUBE
+      are expanded into explicit grouping sets at parse (supports leading normal
+      keys + one construct; combining several constructs fails fast).
+      `Aggregate`/`Scan`/`PhysicalScan`/`PhysicalHashAggregate` carry
+      `grouping_sets`; a shared `render_grouping_sets` emits `GROUP BY GROUPING
+      SETS (...)` for both single-source pushdown and the DuckDB merge engine;
+      `GROUPING()` flows through the function path; the local pyarrow path fails
+      fast (no merge engine). Tests: `tests/e2e_pushdown/test_grouping_sets.py`
+      (single + cross-source, GROUPING(), multi-construct fail-fast).
 - [x] named WINDOW w AS (...) - the preprocessor inlines each named window into
       its `OVER w` references (adopting partition/order/frame, keeping reference
       extensions like `OVER (w ORDER BY ...)`) and drops the WINDOW clause, so the
@@ -917,10 +914,43 @@ progress:
       cannot be pushed or ground-truth-tested. Tests:
       `tests/e2e_pushdown/test_sql_safety_sweep.py`.
 
+Per-source dialect-aware pushdown rendering (DONE): the engine generates
+Postgres-form SQL internally, and every SQL-sending path now transpiles it to the
+target source's own dialect before sending. Each `DataSource` declares a
+`render_dialect` ("postgres"/"duckdb"/"clickhouse"); `physical.to_source_sql`
+re-parses and renders our SQL in that dialect. Wired into PhysicalScan,
+PhysicalRemoteJoin, PhysicalRemoteQuery, PhysicalRemoteSetOp (execute + schema +
+EXPLAIN). Input parsing stays FedQPostgres; the merge engine stays DuckDB. Tests:
+`tests/test_dialect_rendering.py`. This transpiles divergent syntax (function
+names like STRING_AGG -> LISTAGG, TABLESAMPLE forms, ordered-set aggregates) to
+what each source accepts.
+
 Batch 3 - remaining breadth:
-- [ ] VALUES (...) AS v(a,b) as a table source (today "Unsupported FROM item: Values")
-- [ ] TABLESAMPLE (render to source; cross-source can fail-fast initially)
-- [ ] PIVOT / UNPIVOT
+- [x] VALUES (...) AS v(a,b) as a table source. The constant rows become a Values
+      relation wrapped in a SubqueryScan (alias + column names), so it works
+      standalone, with WHERE, and joined to a real table. `SELECT *` over a VALUES
+      (or any derived) relation stays a clean fail-fast - a separate, pre-existing
+      star-expander limit (base tables only), not VALUES-specific. Tests:
+      `tests/e2e_pushdown/test_values_source.py`.
+- [x] TABLESAMPLE. Carried on the scan as Postgres-form SQL; per-source rendering
+      transpiles it (e.g. DuckDB `BERNOULLI (10 PERCENT)`). Tests:
+      `tests/e2e_pushdown/test_tablesample.py`.
+- [x] PIVOT (single aggregate, static IN list, SELECT *). The preprocessor
+      expands it into portable conditional aggregation
+      (`agg(CASE WHEN k = value THEN x END) ... GROUP BY <rest>`), which every
+      source supports and which fits the Postgres-form pipeline (Postgres itself
+      has no PIVOT). Output column names come from sqlglot's computed pivot
+      columns; generated identifiers are quoted (the orders fixture has a
+      reserved-word `select` column). Unsupported shapes fail fast: UNPIVOT,
+      multiple aggregates, COUNT(*) / non-column aggregate argument, dynamic IN
+      (subquery / non-literal), JOIN, or a non-`*` projection. This also replaced
+      the earlier blanket pivot guard, so a pivot is never silently dropped by the
+      Postgres re-render. Tests: `tests/e2e_pushdown/test_pivot.py` (vs DuckDB
+      native PIVOT + fail-fast shapes).
+      UNPIVOT (rows-from-columns, a different shape) remains a clean fail-fast.
+- [ ] FETCH FIRST ... WITH TIES - DuckDB has no WITH TIES at all (not just
+      different syntax), so it cannot be pushed to or tested against a DuckDB
+      source. Stays fail-fast.
 
 Out of scope, but the safety sweep must fail-fast explicitly (not silently drop):
 FOR UPDATE/SHARE locks, SELECT INTO, optimizer hints, ClickHouse SETTINGS/PREWHERE,

@@ -55,7 +55,7 @@ NODES = [
     Filter(_leaf(), COL),
     Sort(_leaf(), [COL], [False], ["LAST"]),
     Limit(_leaf(), 5, 2),
-    Aggregate(_leaf(), [COL], [COL], ["c"]),
+    Aggregate(_leaf(), [COL], [COL], ["c"], grouping_sets=[[COL], []]),
     Join(_leaf("l"), _leaf("r"), JoinType.LEFT, COL, natural=True, using=["c"]),
     LateralJoin(_leaf("l"), _leaf("r"), JoinType.LEFT),
     SetOperation(_leaf("l"), _leaf("r"), SetOpKind.UNION, distinct=True),

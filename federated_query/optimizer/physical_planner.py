@@ -311,9 +311,11 @@ class PhysicalPlanner:
             filters=scan.filters,
             datasource_connection=datasource,
             group_by=scan.group_by,
+            grouping_sets=scan.grouping_sets,
             aggregates=scan.aggregates,
             output_names=scan.output_names,
             alias=scan.alias,
+            sample=scan.sample,
             limit=scan.limit,
             offset=scan.offset,
             order_by_keys=scan.order_by_keys,
@@ -415,6 +417,7 @@ class PhysicalPlanner:
             group_by=aggregate.group_by,
             aggregates=aggregate.aggregates,
             output_names=aggregate.output_names,
+            grouping_sets=aggregate.grouping_sets,
         )
 
     def _plan_remote_join_aggregate(

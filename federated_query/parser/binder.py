@@ -1,5 +1,6 @@
 """Binder resolves references and validates types."""
 
+from dataclasses import replace
 from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 from ..catalog.catalog import Catalog
 from ..catalog.schema import Table, Column
@@ -625,19 +626,31 @@ class Binder:
             bound_aggregates = self._bind_aggregate_expressions_multi_table(
                 aggregate.aggregates, tables
             )
+            bind_set = lambda s: self._bind_group_by_multi_table(s, tables)
         else:
             table = self._get_table_from_plan(bound_input)
             bound_group_by = self._bind_group_by_expressions(aggregate.group_by, table)
             bound_aggregates = self._bind_aggregate_expressions(
                 aggregate.aggregates, table
             )
+            bind_set = lambda s: self._bind_group_by_expressions(s, table)
 
-        return Aggregate(
+        return replace(
+            aggregate,
             input=bound_input,
             group_by=bound_group_by,
             aggregates=bound_aggregates,
-            output_names=aggregate.output_names,
+            grouping_sets=self._bind_grouping_sets(aggregate.grouping_sets, bind_set),
         )
+
+    def _bind_grouping_sets(self, grouping_sets, bind_set):
+        """Bind each grouping set's key expressions, or None for a flat GROUP BY."""
+        if grouping_sets is None:
+            return None
+        bound = []
+        for grouping_set in grouping_sets:
+            bound.append(bind_set(grouping_set))
+        return bound
 
     def _bind_cte(self, cte: CTE) -> CTE:
         """Bind a CTE: register its name as a relation, then bind body and child.
@@ -1510,12 +1523,29 @@ class SubqueryPlanBinder:
         bound_aggregates = []
         for expr in aggregate.aggregates:
             bound_aggregates.append(self._bind_expr_for(expr, bound_input))
-        return Aggregate(
+
+        def bind_set(grouping_set):
+            bound_keys = []
+            for expr in grouping_set:
+                bound_keys.append(self._bind_expr_for(expr, bound_input))
+            return bound_keys
+
+        return replace(
+            aggregate,
             input=bound_input,
             group_by=bound_group_by,
             aggregates=bound_aggregates,
-            output_names=aggregate.output_names,
+            grouping_sets=self._bind_grouping_sets(aggregate.grouping_sets, bind_set),
         )
+
+    def _bind_grouping_sets(self, grouping_sets, bind_set):
+        """Bind each grouping set's keys, or None for a flat GROUP BY."""
+        if grouping_sets is None:
+            return None
+        bound = []
+        for grouping_set in grouping_sets:
+            bound.append(bind_set(grouping_set))
+        return bound
 
     def _bind_sort(self, sort: Sort) -> Sort:
         """Bind sort keys against the subquery's relations."""
