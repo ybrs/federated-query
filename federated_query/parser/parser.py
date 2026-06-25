@@ -194,18 +194,29 @@ class Parser:
             return self._convert_with(select, with_clause)
         return self._convert_plain_select(select)
 
-    def _reject_unsupported_select_clauses(self, select: exp.Select) -> None:
-        """Fail fast on SELECT clauses the converter does not consume.
+    def _reject_distinct_window(self, select: exp.Select) -> None:
+        """Reject SELECT DISTINCT over a window function (silent-drop guard).
+
+        A windowed aggregate routes through the aggregate path, which ignores
+        DISTINCT, so DISTINCT would be silently dropped and return duplicate
+        rows. Checked on the raw AST so every downstream path is covered.
+        """
+        if not select.args.get("distinct"):
+            return
+        for projection in select.expressions:
+            if projection.find(exp.Window) is not None:
+                raise UnsupportedSQLError(
+                    "SELECT DISTINCT with window functions is not supported"
+                )
+
+    def _reject_unknown_select_args(self, select: exp.Select) -> None:
+        """Fail fast on any SELECT clause the converter does not consume.
 
         Without this the parser would silently ignore clauses such as named
         WINDOW, pivots, locks, or sample and return a wrong answer or crash deep
         in the engine. Clauses we now support (DISTINCT ON, GROUP BY ROLLUP/CUBE/
         GROUPING SETS, FETCH FIRST) are handled by their own converters.
         """
-        self._reject_unknown_select_args(select)
-
-    def _reject_unknown_select_args(self, select: exp.Select) -> None:
-        """Raise on any SELECT clause not in SUPPORTED_SELECT_ARGS."""
         for name, value in select.args.items():
             if not value:
                 continue
@@ -214,7 +225,8 @@ class Parser:
 
     def _convert_plain_select(self, select: exp.Select) -> LogicalPlanNode:
         """Convert a SELECT body (without its WITH clause) to a logical plan."""
-        self._reject_unsupported_select_clauses(select)
+        self._reject_unknown_select_args(select)
+        self._reject_distinct_window(select)
         if select.args.get("from_") is None:
             return self._build_values_select(select)
         plan = self._build_from_clause(select)
@@ -451,14 +463,27 @@ class Parser:
         self, values: exp.Values, rows: List[List[Expression]]
     ) -> List[str]:
         """Return VALUES column names from the alias, or column1..N by default."""
-        alias_node = values.args.get("alias")
-        columns = alias_node.args.get("columns") if alias_node else None
-        if columns:
-            names = []
-            for column in columns:
-                names.append(column.name)
+        names = self._values_alias_columns(values)
+        if names is not None:
             return names
         width = len(rows[0]) if rows else 0
+        return self._default_value_columns(width)
+
+    def _values_alias_columns(self, values: exp.Values) -> Optional[List[str]]:
+        """Column names from the table alias's column list, or None if absent."""
+        alias_node = values.args.get("alias")
+        if alias_node is None:
+            return None
+        columns = alias_node.args.get("columns")
+        if not columns:
+            return None
+        names = []
+        for column in columns:
+            names.append(column.name)
+        return names
+
+    def _default_value_columns(self, width: int) -> List[str]:
+        """Default column1..columnN names when VALUES has no column aliases."""
         names = []
         for index in range(width):
             names.append(f"column{index + 1}")
@@ -919,9 +944,7 @@ class Parser:
         """Return the one ROLLUP/CUBE/GROUPING SETS node, or None; reject mixes."""
         if group.args.get("totals"):
             raise UnsupportedSQLError("GROUP BY ... WITH TOTALS is not supported")
-        present = []
-        for kind in ("rollup", "cube", "grouping_sets"):
-            present.extend(group.args.get(kind) or [])
+        present = self._grouping_constructs(group)
         if not present:
             return None
         if len(present) > 1:
@@ -929,6 +952,13 @@ class Parser:
                 "Combining multiple ROLLUP/CUBE/GROUPING SETS is not supported"
             )
         return present[0]
+
+    def _grouping_constructs(self, group: exp.Group) -> List[exp.Expression]:
+        """Collect the ROLLUP/CUBE/GROUPING SETS nodes attached to a GROUP BY."""
+        present = []
+        for kind in ("rollup", "cube", "grouping_sets"):
+            present.extend(group.args.get(kind) or [])
+        return present
 
     def _expand_grouping_construct(self, construct) -> List[List[Expression]]:
         """Expand one ROLLUP/CUBE/GROUPING SETS node into a list of grouping sets."""
@@ -1163,15 +1193,22 @@ class Parser:
         return int(limit_expr.expression.this)
 
     def _fetch_count(self, fetch: exp.Fetch) -> int:
-        """Return the count of FETCH FIRST n ROWS ONLY; reject WITH TIES.
+        """Return the row count of FETCH FIRST n ROWS ONLY.
 
-        WITH TIES needs the source's ORDER BY tie semantics; the DuckDB source
-        does not support the syntax, so it fails fast rather than mislead.
+        WITH TIES and PERCENT change the meaning of the count and are not
+        supported, so they fail fast rather than be read as a plain row cap.
         """
-        options = fetch.args.get("limit_options")
-        if options is not None and options.args.get("with_ties"):
-            raise UnsupportedSQLError("FETCH FIRST ... WITH TIES is not supported")
+        self._reject_fetch_options(fetch.args.get("limit_options"))
         return int(fetch.args["count"].this)
+
+    def _reject_fetch_options(self, options) -> None:
+        """Reject FETCH FIRST modifiers the engine does not implement."""
+        if options is None:
+            return
+        if options.args.get("with_ties"):
+            raise UnsupportedSQLError("FETCH FIRST ... WITH TIES is not supported")
+        if options.args.get("percent"):
+            raise UnsupportedSQLError("FETCH FIRST ... PERCENT is not supported")
 
     def _convert_expression(self, expr: exp.Expression) -> Expression:
         """Convert sqlglot expression to our Expression.

@@ -194,21 +194,32 @@ class QueryPreprocessor:
             raise UnsupportedSQLError("UNPIVOT is not supported")
         if len(pivot.expressions) != 1:
             raise UnsupportedSQLError("PIVOT with multiple aggregates is not supported")
+        self._reject_non_star_pivot(select)
+        self._reject_unsupported_pivot_field(pivot)
+
+    def _reject_non_star_pivot(self, select: exp.Select) -> None:
+        """PIVOT requires SELECT * over a single table (no joins)."""
         if select.args.get("joins") or not self._is_star_select(select):
             raise UnsupportedSQLError("PIVOT requires SELECT * over a single table")
-        self._reject_unsupported_pivot_field(pivot)
 
     def _reject_unsupported_pivot_field(self, pivot: exp.Pivot) -> None:
         """Require a static IN list of literals and a column aggregate argument."""
-        field = pivot.args["fields"][0]
-        if not isinstance(field, exp.In) or not field.expressions:
-            raise UnsupportedSQLError("PIVOT requires a static IN value list")
-        for value in field.expressions:
-            if not isinstance(value, exp.Literal):
-                raise UnsupportedSQLError("PIVOT IN values must be literals")
+        self._reject_non_static_in(pivot.args["fields"][0])
         agg_input = self._pivot_agg_func(pivot.expressions[0]).this
         if not isinstance(agg_input, exp.Column):
             raise UnsupportedSQLError("PIVOT aggregate must be over a single column")
+
+    def _reject_non_static_in(self, field: exp.Expression) -> None:
+        """The pivot's FOR ... IN must be a static list of literal values."""
+        if not isinstance(field, exp.In) or not field.expressions:
+            raise UnsupportedSQLError("PIVOT requires a static IN value list")
+        self._reject_non_literal_values(field.expressions)
+
+    def _reject_non_literal_values(self, values) -> None:
+        """Require every pivot IN value to be a literal (no subquery/expression)."""
+        for value in values:
+            if not isinstance(value, exp.Literal):
+                raise UnsupportedSQLError("PIVOT IN values must be literals")
 
     def _is_star_select(self, select: exp.Select) -> bool:
         """True when the projection is a single bare ``*``."""

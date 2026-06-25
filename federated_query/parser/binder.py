@@ -60,8 +60,6 @@ def _rebuild_function_call(expr, bound_args, bind_one) -> FunctionCall:
     info, and any field added later), so binding can never silently drop one.
     ``bind_one`` binds the WITHIN GROUP sort key of an ordered-set aggregate.
     """
-    from dataclasses import replace
-
     bound_key = None
     if expr.within_group_key is not None:
         bound_key = bind_one(expr.within_group_key)
@@ -1391,13 +1389,11 @@ class Binder:
         bound_order = []
         for key in expr.order_keys:
             bound_order.append(bind(key))
-        return WindowExpr(
+        return replace(
+            expr,
             function=bind(expr.function),
             partition_by=bound_partition,
             order_keys=bound_order,
-            order_ascending=expr.order_ascending,
-            order_nulls=expr.order_nulls,
-            frame=expr.frame,
         )
 
     def __repr__(self) -> str:
@@ -1669,13 +1665,11 @@ class SubqueryPlanBinder:
         order = []
         for key in expr.order_keys:
             order.append(self._bind_expr(key, scopes))
-        return WindowExpr(
+        return replace(
+            expr,
             function=self._bind_expr(expr.function, scopes),
             partition_by=partition,
             order_keys=order,
-            order_ascending=expr.order_ascending,
-            order_nulls=expr.order_nulls,
-            frame=expr.frame,
         )
 
     def _bind_special_expr(

@@ -431,6 +431,7 @@ class PhysicalPlanner:
             condition=remote_join.condition,
             datasource_connection=remote_join.datasource_connection,
             group_by=aggregate.group_by,
+            grouping_sets=aggregate.grouping_sets,
             aggregates=aggregate.aggregates,
             output_names=aggregate.output_names,
         )

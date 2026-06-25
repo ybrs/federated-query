@@ -37,6 +37,19 @@ def test_tablesample_executes_and_returns_subset(single_source_env):
     assert 0 <= sampled <= full
 
 
+def test_tablesample_survives_order_by_pushdown(single_source_env):
+    """ORDER BY pushdown must not drop the sample (the scan rebuild lost it).
+
+    Regression for the optimizer rebuilding a sampled scan and dropping `sample`.
+    """
+    runtime = build_runtime(single_source_env)
+    ast = explain_datasource_query(
+        runtime,
+        f"SELECT order_id FROM {TABLE} TABLESAMPLE BERNOULLI (10) ORDER BY order_id",
+    )
+    assert ast.find(exp.TableSample) is not None
+
+
 def test_tablesample_explain_ast_is_valid(single_source_env):
     """EXPLAIN still produces a parseable single pushed query for the sampled scan."""
     runtime = build_runtime(single_source_env)

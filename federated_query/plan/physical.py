@@ -389,7 +389,7 @@ def _resolve_window_columns(expr, aliases):
     Rewriting the tree and then calling ``to_sql()`` renders the expression
     against the registered relation without qualifier ambiguity.
     """
-    from .expressions import ColumnRef, BinaryOp, UnaryOp, FunctionCall, WindowExpr
+    from .expressions import ColumnRef, FunctionCall, WindowExpr
 
     if isinstance(expr, ColumnRef):
         return _resolved_column_ref(expr, aliases)
@@ -397,6 +397,13 @@ def _resolve_window_columns(expr, aliases):
         return _resolve_window_expr(expr, aliases)
     if isinstance(expr, FunctionCall):
         return _resolve_function_columns(expr, aliases)
+    return _resolve_window_operands(expr, aliases)
+
+
+def _resolve_window_operands(expr, aliases):
+    """Resolve columns inside a binary/unary expression; pass anything else through."""
+    from .expressions import BinaryOp, UnaryOp
+
     if isinstance(expr, BinaryOp):
         return BinaryOp(
             op=expr.op,
@@ -439,15 +446,13 @@ def _resolve_function_columns(expr, aliases):
 
 def _resolve_window_expr(expr, aliases):
     """Rebuild a WindowExpr with its function/partition/order columns resolved."""
-    from .expressions import WindowExpr
+    from dataclasses import replace
 
-    return WindowExpr(
+    return replace(
+        expr,
         function=_resolve_window_columns(expr.function, aliases),
         partition_by=_resolve_window_list(expr.partition_by, aliases),
         order_keys=_resolve_window_list(expr.order_keys, aliases),
-        order_ascending=expr.order_ascending,
-        order_nulls=expr.order_nulls,
-        frame=expr.frame,
     )
 
 
@@ -1804,6 +1809,7 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
     condition: Expression
     datasource_connection: Any
     group_by: Optional[List[Expression]] = None
+    grouping_sets: Optional[List[List[Expression]]] = None  # ROLLUP/CUBE/GROUPING SETS
     aggregates: Optional[List[Expression]] = None
     output_names: Optional[List[str]] = None
     distinct: bool = False
@@ -1860,7 +1866,7 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
 
     def _apply_group_by(self, query: str) -> str:
         """Append GROUP BY clause when needed."""
-        if not self.group_by:
+        if not self.group_by and self.grouping_sets is None:
             return query
         group_clause = self._build_group_by_clause()
         return f"{query} GROUP BY {group_clause}"
@@ -1928,6 +1934,9 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
         return ", ".join(items)
 
     def _build_group_by_clause(self) -> str:
+        """Render the GROUP BY keys (GROUPING SETS for ROLLUP/CUBE/GROUPING SETS)."""
+        if self.grouping_sets is not None:
+            return render_grouping_sets(self.grouping_sets, lambda e: e.to_sql())
         parts = []
         for expr in self.group_by or []:
             parts.append(expr.to_sql())

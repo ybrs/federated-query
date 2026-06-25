@@ -165,13 +165,7 @@ class Projection(LogicalPlanNode):
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Projection":
         assert len(children) == 1
-        return Projection(
-            children[0],
-            self.expressions,
-            self.aliases,
-            self.distinct,
-            self.distinct_on,
-        )
+        return replace(self, input=children[0])
 
     def accept(self, visitor):
         return visitor.visit_projection(self)

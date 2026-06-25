@@ -1,11 +1,29 @@
 """Window-function pushdown tests (Phase 9, section 9.3)."""
 
+import pytest
 from sqlglot import exp
 
+from federated_query.parser.errors import UnsupportedSQLError
 from tests.e2e_pushdown.helpers import (
     build_runtime,
     explain_datasource_query,
 )
+
+
+def test_distinct_over_window_fails_fast(single_source_env):
+    """SELECT DISTINCT over a window must not silently drop the DISTINCT.
+
+    The window path runs in the merge engine and does not apply DISTINCT, so it
+    fails fast rather than return duplicate rows.
+    """
+    runtime = build_runtime(single_source_env)
+    sql = (
+        "SELECT DISTINCT customer_id, "
+        "SUM(price) OVER (PARTITION BY customer_id) AS s "
+        "FROM duckdb_primary.main.orders"
+    )
+    with pytest.raises(UnsupportedSQLError):
+        runtime.execute(sql)
 
 
 def test_window_function_pushes_to_single_source(single_source_env):

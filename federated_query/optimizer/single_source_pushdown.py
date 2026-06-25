@@ -30,7 +30,7 @@ from ..plan.logical import (
     Values,
 )
 from ..plan.expressions import ColumnRef, Expression, FunctionCall
-from ..plan.physical import PhysicalRemoteQuery
+from ..plan.physical import PhysicalRemoteQuery, render_grouping_sets
 from .decorrelation import (
     _split_conjuncts,
     _rebuild_expression,
@@ -912,7 +912,13 @@ class SingleSourcePushdown:
         return f"{item} NULLS {nulls[index]}"
 
     def _render_group_by(self, aggregate: Aggregate) -> Optional[str]:
-        """Render the GROUP BY clause, or None when the aggregate is global."""
+        """Render the GROUP BY clause, or None when the aggregate is global.
+
+        ROLLUP/CUBE/GROUPING SETS render as GROUPING SETS so the source produces
+        the super-aggregate rows; a flat group_by would drop them.
+        """
+        if aggregate.grouping_sets is not None:
+            return render_grouping_sets(aggregate.grouping_sets, lambda e: e.to_sql())
         if not aggregate.group_by:
             return None
         parts: List[str] = []

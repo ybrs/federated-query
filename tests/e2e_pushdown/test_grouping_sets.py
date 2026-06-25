@@ -69,6 +69,10 @@ GROUPING_CASES = [
     "SELECT region, SUM(price) AS s, GROUPING(region) AS g "
     "FROM {T} GROUP BY ROLLUP (region)",
     "SELECT region, status, SUM(price) AS s FROM {T} GROUP BY region, ROLLUP (status)",
+    # Regression: ORDER BY / WHERE pushdown must not drop the grouping sets
+    # (the optimizer's scan rebuilds previously lost them, dropping super-aggregate rows).
+    "SELECT region, SUM(price) AS s FROM {T} GROUP BY ROLLUP (region) ORDER BY region",
+    "SELECT region, SUM(price) AS s FROM {T} WHERE price > 30 GROUP BY ROLLUP (region)",
 ]
 
 
@@ -79,6 +83,31 @@ def test_single_source_grouping_sets(single_source_env, template):
     federated = _federated_rows(runtime, template.format(T=SINGLE))
     expected = _ground_truth_rows(
         single_source_env.datasources[0].connection, template.format(T="orders")
+    )
+    assert federated == expected
+
+
+def test_grouping_sets_over_same_source_join(single_source_env):
+    """ROLLUP over a same-source join pushes as one query without dropping sets.
+
+    Regression: this path (SingleSourcePushdown -> PhysicalRemoteQuery) rendered a
+    flat GROUP BY and lost the super-aggregate rows.
+    """
+    runtime = build_runtime(single_source_env)
+    federated_sql = (
+        "SELECT o.region, SUM(o.price) AS s "
+        "FROM duckdb_primary.main.orders o "
+        "JOIN duckdb_primary.main.customers c ON o.customer_id = c.customer_id "
+        "GROUP BY ROLLUP (o.region)"
+    )
+    reference_sql = (
+        "SELECT o.region, SUM(o.price) AS s "
+        "FROM orders o JOIN customers c ON o.customer_id = c.customer_id "
+        "GROUP BY ROLLUP (o.region)"
+    )
+    federated = _federated_rows(runtime, federated_sql)
+    expected = _ground_truth_rows(
+        single_source_env.datasources[0].connection, reference_sql
     )
     assert federated == expected
 

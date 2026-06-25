@@ -223,41 +223,9 @@ class PredicatePushdownRule(OptimizationRule):
             merged = BinaryOp(
                 op=BinaryOpType.AND, left=scan.filters, right=filter_node.predicate
             )
-            return Scan(
-                datasource=scan.datasource,
-                schema_name=scan.schema_name,
-                table_name=scan.table_name,
-                columns=scan.columns,
-                filters=merged,
-                alias=scan.alias,
-                group_by=scan.group_by,
-                aggregates=scan.aggregates,
-                output_names=scan.output_names,
-                limit=scan.limit,
-                offset=scan.offset,
-                order_by_keys=scan.order_by_keys,
-                order_by_ascending=scan.order_by_ascending,
-                order_by_nulls=scan.order_by_nulls,
-                distinct=scan.distinct,
-            )
+            return replace(scan, filters=merged)
 
-        return Scan(
-            datasource=scan.datasource,
-            schema_name=scan.schema_name,
-            table_name=scan.table_name,
-            columns=scan.columns,
-            filters=filter_node.predicate,
-            alias=scan.alias,
-            group_by=scan.group_by,
-            aggregates=scan.aggregates,
-            output_names=scan.output_names,
-            limit=scan.limit,
-            offset=scan.offset,
-            order_by_keys=scan.order_by_keys,
-            order_by_ascending=scan.order_by_ascending,
-            order_by_nulls=scan.order_by_nulls,
-            distinct=scan.distinct,
-        )
+        return replace(scan, filters=filter_node.predicate)
 
     def _predicate_matches_side(
         self, pred_cols: set, side_cols: set, other_cols: set
@@ -715,23 +683,7 @@ class ProjectionPushdownRule(OptimizationRule):
                 if col in needed:
                     pruned_cols.append(col)
 
-            return Scan(
-                datasource=scan.datasource,
-                schema_name=scan.schema_name,
-                table_name=scan.table_name,
-                columns=pruned_cols,
-                filters=scan.filters,
-                alias=scan.alias,
-                group_by=scan.group_by,
-                aggregates=scan.aggregates,
-                output_names=scan.output_names,
-                limit=scan.limit,
-                offset=scan.offset,
-                order_by_keys=scan.order_by_keys,
-                order_by_ascending=scan.order_by_ascending,
-                order_by_nulls=scan.order_by_nulls,
-                distinct=scan.distinct,
-            )
+            return replace(scan, columns=pruned_cols)
 
         return scan
 
@@ -815,12 +767,7 @@ class LimitPushdownRule(OptimizationRule):
         """Rewrite aggregate child."""
         new_input = self._rewrite_plan(aggregate.input)
         if new_input != aggregate.input:
-            return Aggregate(
-                input=new_input,
-                group_by=aggregate.group_by,
-                aggregates=aggregate.aggregates,
-                output_names=aggregate.output_names,
-            )
+            return replace(aggregate, input=new_input)
         return aggregate
 
     def _rewrite_join(self, join: Join) -> LogicalPlanNode:
@@ -892,16 +839,8 @@ class LimitPushdownRule(OptimizationRule):
         sorted_input = self._rewrite_plan(sort.input)
 
         if isinstance(sorted_input, Scan):
-            new_scan = Scan(
-                datasource=sorted_input.datasource,
-                schema_name=sorted_input.schema_name,
-                table_name=sorted_input.table_name,
-                columns=sorted_input.columns,
-                filters=sorted_input.filters,
-                alias=sorted_input.alias,
-                group_by=sorted_input.group_by,
-                aggregates=sorted_input.aggregates,
-                output_names=sorted_input.output_names,
+            new_scan = replace(
+                sorted_input,
                 order_by_keys=sort.sort_keys,
                 order_by_ascending=sort.ascending,
                 order_by_nulls=sort.nulls_order,
@@ -945,23 +884,7 @@ class LimitPushdownRule(OptimizationRule):
         elif scan.offset:
             effective_offset = scan.offset + offset_value
 
-        return Scan(
-            datasource=scan.datasource,
-            schema_name=scan.schema_name,
-            table_name=scan.table_name,
-            columns=scan.columns,
-            filters=scan.filters,
-            alias=scan.alias,
-            group_by=scan.group_by,
-            aggregates=scan.aggregates,
-            output_names=scan.output_names,
-            limit=effective_limit,
-            offset=effective_offset,
-            order_by_keys=scan.order_by_keys,
-            order_by_ascending=scan.order_by_ascending,
-            order_by_nulls=scan.order_by_nulls,
-            distinct=scan.distinct,
-        )
+        return replace(scan, limit=effective_limit, offset=effective_offset)
 
     def name(self) -> str:
         """Return this rule's identifier (used in logging and EXPLAIN)."""
@@ -1088,22 +1011,11 @@ class OrderByPushdownRule(OptimizationRule):
 
     def _push_to_scan(self, sort: Sort, scan: Scan) -> Scan:
         """Push ORDER BY into scan node."""
-        return Scan(
-            datasource=scan.datasource,
-            schema_name=scan.schema_name,
-            table_name=scan.table_name,
-            columns=scan.columns,
-            filters=scan.filters,
-            alias=scan.alias,
-            group_by=scan.group_by,
-            aggregates=scan.aggregates,
-            output_names=scan.output_names,
-            limit=scan.limit,
-            offset=scan.offset,
+        return replace(
+            scan,
             order_by_keys=sort.sort_keys,
             order_by_ascending=sort.ascending,
             order_by_nulls=sort.nulls_order,
-            distinct=scan.distinct,
         )
 
     def _push_through_projection(
@@ -1227,12 +1139,7 @@ class OrderByPushdownRule(OptimizationRule):
             return sort
 
         pushed_child = self._push_sort_into_child(sort, aggregate.input)
-        new_agg = Aggregate(
-            input=pushed_child,
-            group_by=aggregate.group_by,
-            aggregates=aggregate.aggregates,
-            output_names=aggregate.output_names,
-        )
+        new_agg = replace(aggregate, input=pushed_child)
         return Sort(
             input=new_agg,
             sort_keys=sort.sort_keys,
@@ -1439,23 +1346,7 @@ class OrderByPushdownRule(OptimizationRule):
         if isinstance(plan, Filter):
             if isinstance(new_input, Scan) and new_input.aggregates:
                 merged_filters = self._merge_filters(new_input.filters, plan.predicate)
-                return Scan(
-                    datasource=new_input.datasource,
-                    schema_name=new_input.schema_name,
-                    table_name=new_input.table_name,
-                    columns=new_input.columns,
-                    filters=merged_filters,
-                    alias=new_input.alias,
-                    group_by=new_input.group_by,
-                    aggregates=new_input.aggregates,
-                    output_names=new_input.output_names,
-                    limit=new_input.limit,
-                    offset=new_input.offset,
-                    order_by_keys=new_input.order_by_keys,
-                    order_by_ascending=new_input.order_by_ascending,
-                    order_by_nulls=new_input.order_by_nulls,
-                    distinct=new_input.distinct,
-                )
+                return replace(new_input, filters=merged_filters)
             return Filter(new_input, plan.predicate)
 
         if isinstance(plan, Limit):
