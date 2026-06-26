@@ -770,8 +770,19 @@ class Parser:
         if not where:
             return input_plan
 
+        self._reject_window_in_clause(where.this, "WHERE")
         predicate = self._convert_expression(where.this)
         return Filter(input=input_plan, predicate=predicate)
+
+    def _reject_window_in_clause(self, node: exp.Expression, clause: str) -> None:
+        """Reject a window function used in WHERE / GROUP BY / HAVING.
+
+        Window functions are only legal in SELECT and ORDER BY (they evaluate
+        after WHERE/GROUP BY/HAVING). Fail fast with a clear error rather than
+        push invalid SQL to a source or mis-evaluate it on the merge path.
+        """
+        if node is not None and node.find(exp.Window) is not None:
+            raise UnsupportedSQLError(f"window functions are not allowed in {clause}")
 
     def _build_group_by_clause(
         self, select: exp.Select, input_plan: LogicalPlanNode
@@ -789,6 +800,7 @@ class Parser:
         has_aggregates = self._has_aggregate_functions(select)
 
         if group:
+            self._reject_window_in_clause(group, "GROUP BY")
             return self._create_aggregate_node(select, input_plan, group)
 
         if has_aggregates:
@@ -1055,6 +1067,7 @@ class Parser:
         if not having:
             return input_plan
 
+        self._reject_window_in_clause(having.this, "HAVING")
         predicate = self._convert_expression(having.this)
 
         if isinstance(input_plan, Aggregate):

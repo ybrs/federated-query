@@ -770,12 +770,12 @@ of joins/aggregates/CTEs/set-ops, and a merge engine for all cross-source work.
 
 ## Phase 9: Window Functions + Remaining SQL Breadth
 
-**Status:** NOT STARTED — **the next phase** (we do SQL breadth before the
-cost/runtime work: an unsupported feature is a hard wall, slow-but-correct is a
-gradient, and the cost work in Phase 11 is better designed against a complete
-operator set). Window functions are cheap here — single-source pushes to the
-source; cross-source renders window SQL to the merge engine (DuckDB does windows
-natively), reusing the set-op/aggregate machinery.
+**Status:** COMPLETE (window functions shipped + tested; the last gap, a
+fail-fast on a window in WHERE/GROUP BY/HAVING, landed 2026-06-26). SQL breadth
+is done before the cost/runtime work: an unsupported feature is a hard wall,
+slow-but-correct is a gradient, and the cost work in Phase 11 is better designed
+against a complete operator set. Window functions push to the source single-source
+and render to the merge engine (DuckDB does windows natively) cross-source.
 
 **Goal**: Close the remaining SQL surface. Most of this phase's original scope
 (sorting, set ops, CTEs, date/time, FILTER, NATURAL/USING) shipped in Phase 8;
@@ -794,29 +794,28 @@ natively), reusing the set-op/aggregate machinery.
 - [x] Implemented via the merge engine (`PhysicalUnion` / `PhysicalSetOperation`)
 
 ### 9.3 Window Functions (the remaining gap)
-- [ ] Add a `WindowExpr` expression node (function + PARTITION BY + ORDER BY +
+- [x] Add a `WindowExpr` expression node (function + PARTITION BY + ORDER BY +
       frame) with a `to_sql()` that renders `f(...) OVER (...)`.
-- [ ] Parse `exp.Window` in `parser.py::_convert_expression` (it currently falls
-      through to the generic "Unsupported expression type" raise — that is the
-      only thing blocking windows today).
-- [ ] Bind window refs; fail-fast if a window appears in WHERE/GROUP BY/HAVING.
-- [ ] Teach projection pushdown's `_extract_column_refs` to walk a `WindowExpr`
+- [x] Parse `exp.Window` in `parser.py::_convert_expression` (`_convert_window`).
+- [x] Bind window refs (`binder.py::_bind_window_expr`); fail-fast if a window
+      appears in WHERE/GROUP BY/HAVING (`parser.py::_reject_window_in_clause`,
+      covered by `test_sql_safety_sweep.py`).
+- [x] Teach projection pushdown's `_extract_column_refs` to walk a `WindowExpr`
       so partition/order/arg columns are not pruned.
-- [ ] Single-source: a window-bearing projection pushes as one remote query (it is
+- [x] Single-source: a window-bearing projection pushes as one remote query (it is
       a computed projection; renders via `to_sql()`).
-- [ ] Cross-source: a dedicated `PhysicalWindow` runs `SELECT *, <window> FROM
+- [x] Cross-source: a dedicated `PhysicalWindow` runs `SELECT *, <window> FROM
       input` in the merge engine (same shape as the HashAggregate merge path).
 
 ### 9.4 Correlated-window decorrelation (Option A — capstone)
-- [ ] Decorrelate a window inside a correlated subquery by **lifting the
+- [x] Decorrelate a window inside a correlated subquery by **lifting the
       correlation columns into the window's `PARTITION BY`** (prepend, don't
       replace an existing partition), then route the scalar `LIMIT` through the
-      existing pick-one `GroupedLimit` + LEFT-join machinery. Reuses `WindowExpr`,
-      `PhysicalWindow`, and `GroupedLimit` from 9.3.
-- [ ] Update `test_windowed_subquery_not_supported`: once `WindowExpr` lands the
-      query parses, so it flips from a parse-error assertion to executing
-      correctly (vs Postgres ground truth).
-- [ ] Precise `DecorrelationError` for the shapes the partition-lift pattern can't
+      existing pick-one `GroupedLimit` + LEFT-join machinery
+      (`decorrelation.py::_partition_window_values`/`_partition_window_expr`).
+- [x] The windowed-subquery test flipped from a not-supported assertion to
+      executing correctly (`tests/e2e_decorrelation/test_window_subqueries.py`).
+- [x] Precise `DecorrelationError` for the shapes the partition-lift pattern can't
       handle (non-equi correlation, no-LIMIT multi-row) — those go to the general
       dependent join in Phase 10.
 
@@ -830,8 +829,10 @@ natively), reusing the set-op/aggregate machinery.
 ### 9.6 Testing
 - [x] Test ORDER BY with various expressions
 - [x] Test set operations
-- [ ] Test window functions (single-source pushed + cross-source merge-engine)
-- [ ] Test correlated-window decorrelation (partition-lift) vs Postgres
+- [x] Test window functions (single-source pushed + cross-source merge-engine)
+      (`test_window_functions.py`)
+- [x] Test correlated-window decorrelation (partition-lift)
+      (`test_window_subqueries.py`)
 - [x] Test CTEs (`test_ctes.py`, `test_cross_source_ctes.py`)
 
 **Deliverable**: Window-function support (incl. the common correlated-window case

@@ -22,6 +22,12 @@ REJECTED_SQL = [
     f"SELECT order_id FROM {TABLE} ORDER BY price FETCH FIRST 10 PERCENT ROWS ONLY",
     f"SELECT region FROM {TABLE} GROUP BY ROLLUP (region), CUBE (status)",
     f"SELECT * FROM {TABLE} UNPIVOT (val FOR col IN (price, quantity))",
+    # Window functions are only legal in SELECT / ORDER BY; in WHERE / GROUP BY /
+    # HAVING they are invalid SQL and must not be pushed to a source verbatim.
+    f"SELECT order_id FROM {TABLE} WHERE row_number() OVER () > 1",
+    f"SELECT order_id FROM {TABLE} GROUP BY row_number() OVER ()",
+    f"SELECT region, count(*) FROM {TABLE} GROUP BY region "
+    f"HAVING row_number() OVER () > 1",
 ]
 
 
