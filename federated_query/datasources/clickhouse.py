@@ -147,7 +147,12 @@ class ClickHouseDataSource(DataSource):
         ).result_rows
         columns = []
         for name, ch_type in rows:
-            sql_type = _CH_TO_SQL.get(_strip_ch_type(ch_type), "VARCHAR")
+            base_type = _strip_ch_type(ch_type)
+            if base_type not in _CH_TO_SQL:
+                raise ValueError(
+                    f"Unsupported ClickHouse type {ch_type!r} for column {name!r}"
+                )
+            sql_type = _CH_TO_SQL[base_type]
             columns.append(
                 ColumnMetadata(
                     name=name,

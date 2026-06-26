@@ -91,6 +91,75 @@ def test_bind_scan_with_invalid_column(catalog_with_test_data):
     assert "not found" in str(exc_info.value)
 
 
+def test_bind_invalid_column_in_compound_predicate_over_join(catalog_with_test_data):
+    """An invalid column inside IN/BETWEEN/etc. in a join's WHERE must raise.
+
+    These compound predicates over a join were previously returned unbound, so
+    a nonexistent column inside them slipped through unvalidated.
+    """
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = (
+        "SELECT u.id FROM testdb.public.users u "
+        "JOIN testdb.public.orders o ON u.id = o.order_id "
+        "WHERE u.nonexistent IN (1, 2)"
+    )
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
+
+    with pytest.raises(BindingError) as exc_info:
+        binder.bind(plan)
+    assert "not found" in str(exc_info.value)
+
+
+def test_bind_valid_compound_predicate_over_join(catalog_with_test_data):
+    """A valid IN/BETWEEN in a join's WHERE still binds without error."""
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = (
+        "SELECT u.id FROM testdb.public.users u "
+        "JOIN testdb.public.orders o ON u.id = o.order_id "
+        "WHERE u.name IN ('a', 'b') AND o.amount BETWEEN 1 AND 9"
+    )
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
+
+    assert binder.bind(plan) is not None
+
+
+def test_bind_unknown_table_qualifier_over_join_raises(catalog_with_test_data):
+    """A column with an unknown table qualifier must raise, not silently rebind.
+
+    `x` is not a table or alias in scope; previously the binder scanned the
+    other tables by column name and bound to the first match, accepting a typo.
+    """
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = (
+        "SELECT u.id FROM testdb.public.users u "
+        "JOIN testdb.public.orders o ON u.id = o.order_id "
+        "WHERE x.name = 'a'"
+    )
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
+
+    with pytest.raises(BindingError) as exc_info:
+        binder.bind(plan)
+    assert "not found" in str(exc_info.value)
+
+
+def test_bind_table_name_qualifier_when_aliased_raises(catalog_with_test_data):
+    """Once a table is aliased, its real name is no longer a valid qualifier."""
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = (
+        "SELECT u.id FROM testdb.public.users u "
+        "JOIN testdb.public.orders o ON u.id = o.order_id "
+        "WHERE users.name = 'a'"
+    )
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
+
+    with pytest.raises(BindingError):
+        binder.bind(plan)
+
+
 def test_bind_with_where_clause(catalog_with_test_data):
     """Test binding with WHERE clause."""
     parser = Parser()

@@ -551,7 +551,9 @@ class Binder:
                 expr, lambda value: self._bind_expression_multi_table(value, tables)
             )
 
-        return expr
+        raise BindingError(
+            f"Unsupported expression in multi-table context: {type(expr).__name__}"
+        )
 
     def _bind_limit(self, limit: Limit) -> Limit:
         """Bind a Limit node."""
@@ -1019,7 +1021,7 @@ class Binder:
                 plan.datasource, plan.schema_name, plan.table_name
             )
             if table:
-                tables[plan.table_name] = table
+                tables[plan.alias or plan.table_name] = table
 
         if isinstance(plan, SubqueryScan):
             tables[plan.alias] = self._synthetic_table(plan)
@@ -1063,7 +1065,10 @@ class Binder:
                 lambda value: self._bind_join_condition(value, tables),
             )
 
-        return condition
+        # IN / BETWEEN / CASE / FunctionCall / Cast / Extract / Tuple etc. are
+        # legal in a join's ON / WHERE; route them through the full multi-table
+        # binder so the columns inside are resolved, never returned unbound.
+        return self._bind_expression_multi_table(condition, tables)
 
     def _bind_column_ref_multi_table(
         self, col_ref: ColumnRef, tables: Dict[Optional[str], Table]
@@ -1075,14 +1080,9 @@ class Binder:
         if col_ref.table:
             table = tables.get(col_ref.table)
             if table is None:
-                for table_name, tbl in tables.items():
-                    column = tbl.get_column(col_ref.column)
-                    if column:
-                        return ColumnRef(
-                            table=col_ref.table,
-                            column=col_ref.column,
-                            data_type=column.data_type,
-                        )
+                # The qualifier matches no in-scope table or alias. Do not scan
+                # other tables by column name (that silently accepts a typo'd or
+                # wrong qualifier); let an enclosing scope resolve it or raise.
                 return self._unresolved_or_raise(col_ref)
             column = table.get_column(col_ref.column)
             if column is None:
@@ -1211,7 +1211,9 @@ class Binder:
                 expr, lambda value: self._bind_expression(value, table)
             )
 
-        return expr
+        raise BindingError(
+            f"Unsupported expression type: {type(expr).__name__}"
+        )
 
     def _bind_cast(
         self,

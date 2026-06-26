@@ -78,6 +78,46 @@ class Parser:
         }
     )
 
+    # A FROM-less SELECT (SELECT 1) has no input relation, so only a constant
+    # projection list is meaningful; with_ is consumed upstream by _convert_with.
+    # LIMIT/OFFSET/DISTINCT/WHERE/... have nothing to act on and must not be
+    # silently dropped.
+    SUPPORTED_VALUES_SELECT_ARGS = frozenset({"expressions", "with_"})
+
+    # Set-operation node args the converter actually consumes. BY NAME (by_name)
+    # and a WITH that binds the whole set operation (with_) are NOT handled, so
+    # they fail fast rather than silently dropping the clause.
+    SUPPORTED_SET_OP_ARGS = frozenset(
+        {"this", "expression", "distinct", "order", "limit", "offset"}
+    )
+
+    # Per-JOIN clause args the converter consumes (right side, side/kind keyword,
+    # ON condition, NATURAL method, USING columns).
+    SUPPORTED_JOIN_ARGS = frozenset(
+        {"this", "side", "kind", "on", "method", "using"}
+    )
+
+    # Aggregate args the converter consumes. big_int is sqlglot's COUNT-returns-
+    # bigint marker; separator is the STRING_AGG separator. Any other modifier
+    # (an inner ORDER BY / LIMIT carried as its own arg) fails fast.
+    SUPPORTED_AGG_ARGS = frozenset({"this", "distinct", "big_int", "separator"})
+
+    # CAST consumes only the value and the target type; safe (TRY_CAST) and
+    # FORMAT change semantics and are rejected.
+    SUPPORTED_CAST_ARGS = frozenset({"this", "to"})
+
+    # BETWEEN consumes the value and its two bounds; SYMMETRIC is rejected.
+    SUPPORTED_BETWEEN_ARGS = frozenset({"this", "low", "high"})
+
+    # IN consumes a value list (expressions) or a subquery (query).
+    SUPPORTED_IN_ARGS = frozenset({"this", "expressions", "query"})
+
+    # Window consumes PARTITION BY, ORDER BY and the frame spec; over is the
+    # OVER-keyword marker carried by sqlglot.
+    SUPPORTED_WINDOW_ARGS = frozenset(
+        {"this", "partition_by", "order", "spec", "over"}
+    )
+
     def __init__(self):
         """Initialize parser."""
         self.dialect = FedQPostgres  # Custom Postgres dialect with native EXPLAIN
@@ -148,6 +188,9 @@ class Parser:
         ORDER BY / LIMIT that sqlglot attaches to the set-operation node wraps
         the whole result, so it is layered on top after the branches combine.
         """
+        self._reject_unsupported_args(
+            set_op, self.SUPPORTED_SET_OP_ARGS, "set operation"
+        )
         kind = self._SET_OP_KINDS[type(set_op)]
         distinct = bool(set_op.args.get("distinct"))
         left = self._convert_set_branch(set_op.this)
@@ -217,11 +260,22 @@ class Parser:
         in the engine. Clauses we now support (DISTINCT ON, GROUP BY ROLLUP/CUBE/
         GROUPING SETS, FETCH FIRST) are handled by their own converters.
         """
-        for name, value in select.args.items():
+        self._reject_unsupported_args(select, self.SUPPORTED_SELECT_ARGS, "SELECT")
+
+    def _reject_unsupported_args(self, node, supported, context: str) -> None:
+        """Fail fast on any arg of `node` outside `supported` (silent-drop guard).
+
+        Shared by every builder that consumes only a subset of an AST node's
+        clauses. `context` names the construct so a dropped clause crashes loudly
+        with a readable message instead of being ignored and returning a wrong
+        answer.
+        """
+        for name, value in node.args.items():
             if not value:
                 continue
-            if name not in self.SUPPORTED_SELECT_ARGS:
-                raise UnsupportedSQLError(f"Unsupported SQL clause: {name}")
+            if name not in supported:
+                clause = name.upper().rstrip("_")
+                raise UnsupportedSQLError(f"{context} does not support {clause}")
 
     def _convert_plain_select(self, select: exp.Select) -> LogicalPlanNode:
         """Convert a SELECT body (without its WITH clause) to a logical plan."""
@@ -311,14 +365,13 @@ class Parser:
         """Build a single-row Values plan for a FROM-less SELECT.
 
         Supports constant projections such as ``SELECT 42`` or
-        ``SELECT 'completed'``; clauses that require an input relation are
-        rejected.
+        ``SELECT 'completed'``; clauses that require an input relation
+        (WHERE/GROUP/HAVING/ORDER/JOIN as well as LIMIT/OFFSET/DISTINCT) have
+        nothing to act on and are rejected so they are never silently dropped.
         """
-        for clause in ("where", "group", "having", "order", "joins"):
-            if select.args.get(clause):
-                raise ValueError(
-                    f"FROM-less SELECT does not support a {clause.upper()} clause"
-                )
+        self._reject_unsupported_args(
+            select, self.SUPPORTED_VALUES_SELECT_ARGS, "FROM-less SELECT"
+        )
         row = []
         names = []
         for select_expr in select.expressions:
@@ -519,6 +572,9 @@ class Parser:
         current_plan = left_plan
 
         for join_clause in joins:
+            self._reject_unsupported_args(
+                join_clause, self.SUPPORTED_JOIN_ARGS, "JOIN"
+            )
             if isinstance(join_clause.this, exp.Lateral):
                 current_plan = self._build_lateral_join(current_plan, join_clause)
                 continue
@@ -1075,14 +1131,27 @@ class Parser:
 
         return Filter(input=input_plan, predicate=predicate)
 
+    def _is_aggregate_plan(self, plan: LogicalPlanNode) -> bool:
+        """Whether the plan is an aggregate, optionally under a HAVING filter."""
+        if isinstance(plan, Aggregate):
+            return True
+        return isinstance(plan, Filter) and isinstance(plan.input, Aggregate)
+
     def _build_select_clause(
         self, select: exp.Select, input_plan: LogicalPlanNode
     ) -> LogicalPlanNode:
-        """Build projection node from SELECT clause."""
-        if isinstance(input_plan, Aggregate):
-            return input_plan
+        """Build projection node from SELECT clause.
 
-        if isinstance(input_plan, Filter) and isinstance(input_plan.input, Aggregate):
+        The aggregate (GROUP BY) result carries its own output shape, so the
+        projection is the aggregate itself. DISTINCT has no representation on
+        that path, so it fails fast instead of being silently dropped (which
+        would let duplicate grouped rows through).
+        """
+        if self._is_aggregate_plan(input_plan):
+            if select.args.get("distinct"):
+                raise UnsupportedSQLError(
+                    "SELECT DISTINCT over GROUP BY is not supported"
+                )
             return input_plan
 
         expressions = []
@@ -1290,7 +1359,13 @@ class Parser:
         raise ValueError(f"Unsupported expression type: {type(expr)}")
 
     def _convert_in_expression(self, expr: exp.In) -> Expression:
-        """Convert IN list to expression node."""
+        """Convert IN list (or IN subquery) to expression node.
+
+        Only a value list and a subquery are handled; other forms such as
+        ``IN UNNEST(...)`` (the ``field``/``unnest`` args) are rejected rather
+        than silently treated as an empty or partial list.
+        """
+        self._reject_unsupported_args(expr, self.SUPPORTED_IN_ARGS, "IN")
         value_expr = self._convert_expression(expr.this)
         query = expr.args.get("query")
         if query is not None:
@@ -1307,7 +1382,15 @@ class Parser:
         return InList(value=value_expr, options=options)
 
     def _convert_between_expression(self, expr: exp.Between) -> Expression:
-        """Convert BETWEEN to expression node."""
+        """Convert BETWEEN to expression node.
+
+        BETWEEN SYMMETRIC (bounds in either order) carries a ``symmetric`` flag
+        with different semantics; it is rejected so it is not silently planned
+        as a plain BETWEEN.
+        """
+        self._reject_unsupported_args(
+            expr, self.SUPPORTED_BETWEEN_ARGS, "BETWEEN"
+        )
         value_expr = self._convert_expression(expr.this)
         low_expr = self._convert_expression(expr.args["low"])
         high_expr = self._convert_expression(expr.args["high"])
@@ -1324,7 +1407,18 @@ class Parser:
         raise ValueError("IS comparison supports only NULL and NOT NULL")
 
     def _convert_case_expression(self, expr: exp.Case) -> Expression:
-        """Convert CASE expression."""
+        """Convert a searched CASE (CASE WHEN cond THEN ... END).
+
+        A simple CASE (CASE operand WHEN value ...) stores the operand under
+        ``this``; it is not supported and is rejected rather than silently
+        treating the bare value as the WHEN condition (which would match the
+        wrong branch).
+        """
+        if expr.args.get("this") is not None:
+            raise UnsupportedSQLError(
+                "simple CASE (CASE operand WHEN ...) is not supported; "
+                "use a searched CASE (CASE WHEN operand = value ...)"
+            )
         when_clauses = []
         for if_clause in expr.args.get("ifs") or []:
             condition = self._convert_expression(if_clause.this)
@@ -1482,7 +1576,13 @@ class Parser:
         return comparison
 
     def _convert_cast(self, cast: exp.Cast) -> Cast:
-        """Convert CAST(expr AS type), preserving the target type text."""
+        """Convert CAST(expr AS type), preserving the target type text.
+
+        A safe cast (TRY_CAST, ``safe`` flag) returns NULL instead of raising on
+        a bad value, and a FORMAT clause changes parsing; both are rejected so
+        the cast is not silently planned as a plain, error-raising CAST.
+        """
+        self._reject_unsupported_args(cast, self.SUPPORTED_CAST_ARGS, "CAST")
         inner = self._convert_expression(cast.this)
         target_type = cast.args["to"].sql(dialect=self.dialect)
         return Cast(expr=inner, target_type=target_type)
@@ -1634,6 +1734,7 @@ class Parser:
         Returns:
             FunctionCall expression
         """
+        self._reject_unsupported_args(func, self.SUPPORTED_AGG_ARGS, "aggregate")
         func_name = self._aggregate_sql_name(func)
         distinct = bool(func.args.get("distinct"))
         if isinstance(func.this, exp.Distinct):
@@ -1706,26 +1807,34 @@ class Parser:
         func: exp.AggFunc,
         distinct: bool,
     ) -> List[Expression]:
-        """Extract arguments from function.
+        """Extract an aggregate's arguments, including a STRING_AGG separator.
 
-        Args:
-            func: sqlglot AggFunc node
-            distinct: True if DISTINCT modifier is present
-
-        Returns:
-            List of argument expressions
+        The separator (``STRING_AGG(x, ',')``) is a real second argument; it was
+        previously dropped, which silently changed the rendered aggregate. It is
+        appended after the primary argument so the call round-trips faithfully.
         """
-        args = []
+        args = self._extract_primary_args(func)
+        separator = func.args.get("separator")
+        if separator is not None:
+            args.append(self._convert_expression(separator))
+        return args
+
+    def _extract_primary_args(self, func: exp.AggFunc) -> List[Expression]:
+        """Convert the main argument(s): a DISTINCT list, one value, or * for COUNT."""
         value = getattr(func, "this", None)
         if isinstance(value, exp.Distinct):
-            for child in value.expressions or []:
-                converted = self._convert_expression(child)
-                args.append(converted)
-        elif value is not None:
-            arg = self._convert_expression(value)
-            args.append(arg)
-        elif isinstance(func, exp.Count):
-            args.append(ColumnRef(table=None, column="*"))
+            return self._convert_distinct_args(value)
+        if value is not None:
+            return [self._convert_expression(value)]
+        if isinstance(func, exp.Count):
+            return [ColumnRef(table=None, column="*")]
+        return []
+
+    def _convert_distinct_args(self, value: exp.Distinct) -> List[Expression]:
+        """Convert the expressions inside a DISTINCT aggregate argument."""
+        args = []
+        for child in value.expressions or []:
+            args.append(self._convert_expression(child))
         return args
 
     def _convert_function_call(self, func: exp.Expression) -> FunctionCall:
@@ -1736,7 +1845,12 @@ class Parser:
         return FunctionCall(function_name=name, args=args, is_aggregate=False)
 
     def _convert_window(self, win: exp.Window) -> WindowExpr:
-        """Convert a sqlglot Window (``func OVER (...)``) into a WindowExpr."""
+        """Convert a sqlglot Window (``func OVER (...)``) into a WindowExpr.
+
+        Only PARTITION BY, ORDER BY and the frame spec are consumed; any other
+        window clause is rejected rather than silently dropped from the frame.
+        """
+        self._reject_unsupported_args(win, self.SUPPORTED_WINDOW_ARGS, "window")
         function = self._convert_expression(win.this)
         partition_by = self._convert_partition_by(win)
         order_keys, ascending, nulls = self._convert_window_order(win)

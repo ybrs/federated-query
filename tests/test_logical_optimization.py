@@ -449,6 +449,33 @@ class TestLimitPushdown:
         assert isinstance(result.input, Limit)
         assert result.input.offset == 0
 
+    def test_limit_not_pushed_below_distinct_over_join(self):
+        """A LIMIT must stay above DISTINCT over a (locally-run) join.
+
+        Pushing it below would cap rows before deduplication and return too
+        few distinct rows. Over a single Scan the push is safe (it renders as
+        one SELECT DISTINCT ... LIMIT to the source), so only the non-Scan
+        child blocks the pushdown.
+        """
+        left = Scan(
+            datasource="a", schema_name="s", table_name="t1", columns=["c"]
+        )
+        right = Scan(
+            datasource="b", schema_name="s", table_name="t2", columns=["d"]
+        )
+        join = Join(left=left, right=right, join_type=JoinType.INNER, condition=None)
+        project = Projection(
+            input=join,
+            expressions=[ColumnRef(table=None, column="c")],
+            aliases=["c"],
+            distinct=True,
+        )
+        result = LimitPushdownRule().apply(Limit(input=project, limit=5, offset=0))
+
+        assert isinstance(result, Limit)
+        assert isinstance(result.input, Projection)
+        assert result.input.distinct is True
+
     def test_limit_does_not_push_through_filter(self):
         """Test that limit does NOT push through filter.
 

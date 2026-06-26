@@ -2,7 +2,15 @@
 
 This document provides an overview of the codebase structure, key classes, compilation instructions, and coding standards for AI-assisted development.
 
-## TOP PRIORITY RULE: ASCII ONLY
+## TOP PRIORITY : no silent crashes
+
+# A crash never ships a lie.
+
+Never fail silently. Never fail silently. This is the most important thing we care in this project. Do whatever the fuck you can do to stop silent fails. 
+
+The code should be readable, self explained.Most of all the code should be defensive. We appreciate crashes more than silent fails.
+
+# No ascii
 
 Use ASCII characters only. No exceptions you invent. This applies EVERYWHERE:
 assistant replies, chat messages, docs, comments, commit messages, log output,

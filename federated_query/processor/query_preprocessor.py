@@ -680,9 +680,30 @@ class StarExpansionProcessor(QueryProcessor):
         context = executor.query_context
         if not context.columns:
             return result
-        if result.num_columns != len(context.columns):
-            return result
+        if result.num_columns == len(context.columns):
+            return result.rename_columns(self._positional_visible_names(context))
+        return result.rename_columns(self._mapped_visible_names(result, context))
+
+    def _positional_visible_names(self, context) -> List[str]:
+        """Visible name per output column, in projection order (counts match)."""
         names: List[str] = []
         for mapping in context.columns:
             names.append(mapping.visible_name)
-        return result.rename_columns(names)
+        return names
+
+    def _mapped_visible_names(self, result: pa.Table, context) -> List[str]:
+        """Best-effort rename when some projections recorded no mapping.
+
+        Reached when the result has more columns than recorded mappings - a
+        non-column projection mixed with a star (``SELECT *, 1 AS x``) or a
+        ``* REPLACE (...)`` column. Each expanded star column is renamed from
+        its internal name; a column with no mapping keeps its own name, so
+        internal names are never silently shipped to the user.
+        """
+        rename = {}
+        for mapping in context.columns:
+            rename[mapping.internal_name] = mapping.visible_name
+        names: List[str] = []
+        for current in result.column_names:
+            names.append(rename.get(current, current))
+        return names

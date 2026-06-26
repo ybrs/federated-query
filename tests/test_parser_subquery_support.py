@@ -3,6 +3,7 @@
 import pytest
 
 from federated_query.parser.parser import Parser
+from federated_query.parser.errors import UnsupportedSQLError
 from federated_query.plan.logical import (
     Values,
     SubqueryScan,
@@ -146,3 +147,60 @@ def test_fromless_select_with_where_rejected():
     """A FROM-less SELECT cannot carry a WHERE clause."""
     with pytest.raises(ValueError, match="WHERE"):
         parse("SELECT 1 WHERE 1 = 1")
+
+
+def test_fromless_select_with_limit_rejected():
+    """B2: a FROM-less SELECT must not silently drop LIMIT."""
+    with pytest.raises(UnsupportedSQLError, match="LIMIT"):
+        parse("SELECT 1 LIMIT 0")
+
+
+def test_fromless_select_with_distinct_rejected():
+    """B2: a FROM-less SELECT must not silently drop DISTINCT."""
+    with pytest.raises(UnsupportedSQLError, match="DISTINCT"):
+        parse("SELECT DISTINCT 1")
+
+
+def test_distinct_over_group_by_rejected():
+    """B1: SELECT DISTINCT over GROUP BY must fail, not return duplicates."""
+    with pytest.raises(UnsupportedSQLError, match="DISTINCT over GROUP BY"):
+        parse("SELECT DISTINCT count(*) FROM t GROUP BY a")
+
+
+def test_union_by_name_rejected():
+    """Sweep: UNION ... BY NAME is unhandled and must not be silently dropped."""
+    with pytest.raises(UnsupportedSQLError, match="BY_NAME"):
+        parse("SELECT a FROM t UNION ALL BY NAME SELECT b FROM u")
+
+
+def test_with_over_set_operation_rejected():
+    """Sweep: a WITH binding a top-level UNION drops the CTE today; fail fast."""
+    with pytest.raises(UnsupportedSQLError, match="WITH"):
+        parse("WITH x AS (SELECT 1 AS a) SELECT a FROM x UNION SELECT 2")
+
+
+def test_simple_case_rejected():
+    """A simple CASE (CASE operand WHEN ...) must not match the wrong branch."""
+    with pytest.raises(UnsupportedSQLError, match="simple CASE"):
+        parse("SELECT CASE x WHEN 1 THEN 'a' ELSE 'b' END FROM t")
+
+
+def test_try_cast_rejected():
+    """TRY_CAST must not be silently planned as an error-raising CAST."""
+    with pytest.raises(UnsupportedSQLError, match="SAFE"):
+        parse("SELECT TRY_CAST(x AS INT) FROM t")
+
+
+def test_between_symmetric_rejected():
+    """BETWEEN SYMMETRIC must not be silently planned as a plain BETWEEN."""
+    with pytest.raises(UnsupportedSQLError, match="SYMMETRIC"):
+        parse("SELECT a FROM t WHERE x BETWEEN SYMMETRIC 1 AND 9")
+
+
+def test_string_agg_separator_preserved():
+    """STRING_AGG separator is a real argument and must not be dropped."""
+    plan = parse("SELECT STRING_AGG(s, ',') AS c FROM t GROUP BY r")
+    aggregate = plan.aggregates[0]
+    assert len(aggregate.args) == 2
+    assert isinstance(aggregate.args[1], Literal)
+    assert aggregate.args[1].value == ","

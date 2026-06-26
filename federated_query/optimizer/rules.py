@@ -446,7 +446,7 @@ class PredicatePushdownRule(OptimizationRule):
         them made predicates that reference real columns look column-free and
         get pushed down vacuously.
         """
-        from ..plan.expressions import BinaryOp, UnaryOp, FunctionCall, Cast
+        from ..plan.expressions import BinaryOp, UnaryOp, FunctionCall, Cast, Extract
 
         if isinstance(expr, BinaryOp):
             return [expr.left, expr.right]
@@ -459,6 +459,8 @@ class PredicatePushdownRule(OptimizationRule):
             return children
         if isinstance(expr, Cast):
             return [expr.expr]
+        if isinstance(expr, Extract):
+            return [expr.source]
         return self._container_predicate_children(expr)
 
     def _container_predicate_children(self, expr: Expression) -> list:
@@ -586,12 +588,32 @@ class ProjectionPushdownRule(OptimizationRule):
             UnaryOp,
             FunctionCall,
             WindowExpr,
+            Cast,
+            Extract,
+            CaseExpr,
+            TupleExpression,
         )
 
         columns = set()
 
         if isinstance(expr, ColumnRef):
             columns.add(expr.column)
+            return columns
+
+        if isinstance(expr, Cast):
+            columns.update(self._extract_columns(expr.expr))
+            return columns
+
+        if isinstance(expr, Extract):
+            columns.update(self._extract_columns(expr.source))
+            return columns
+
+        if isinstance(expr, CaseExpr):
+            return self._case_columns(expr)
+
+        if isinstance(expr, TupleExpression):
+            for item in expr.items:
+                columns.update(self._extract_columns(item))
             return columns
 
         if isinstance(expr, WindowExpr):
@@ -627,6 +649,16 @@ class ProjectionPushdownRule(OptimizationRule):
             columns.update(self._extract_columns(expr.upper))
             return columns
 
+        return columns
+
+    def _case_columns(self, expr) -> set:
+        """Columns referenced in a CASE expression's branches and ELSE."""
+        columns = set()
+        for condition, result in expr.when_clauses:
+            columns.update(self._extract_columns(condition))
+            columns.update(self._extract_columns(result))
+        if expr.else_result is not None:
+            columns.update(self._extract_columns(expr.else_result))
         return columns
 
     def _window_children(self, expr) -> list:
@@ -825,6 +857,19 @@ class LimitPushdownRule(OptimizationRule):
 
         return limit.model_copy(update={"input": input_node})
 
+    def _distinct_blocks_pushdown(self, projection: Projection) -> bool:
+        """Whether a DISTINCT projection blocks pushing a LIMIT below it.
+
+        Pushing a LIMIT below DISTINCT over a Scan is safe: it renders as one
+        ``SELECT DISTINCT ... LIMIT`` pushed to the single source. Over any
+        other child (e.g. a cross-source Join) the DISTINCT runs locally, so a
+        LIMIT pushed beneath it would cap rows before deduplication and return
+        too few distinct rows - the LIMIT must stay above.
+        """
+        if not (projection.distinct or projection.distinct_on is not None):
+            return False
+        return not isinstance(projection.input, Scan)
+
     def _push_through_projection(
         self, limit: Limit, projection: Projection
     ) -> LogicalPlanNode:
@@ -834,6 +879,8 @@ class LimitPushdownRule(OptimizationRule):
         it is not, the outer Limit must retain the offset rather than zero a
         value that was never pushed down (which would corrupt pagination).
         """
+        if self._distinct_blocks_pushdown(projection):
+            return limit.model_copy(update={"input": projection})
         pushed_child = self._apply_limit_metadata(
             projection.input,
             limit.limit,

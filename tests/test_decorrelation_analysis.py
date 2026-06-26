@@ -11,6 +11,8 @@ from federated_query.plan.expressions import (
     BinaryOpType,
     Literal,
     DataType,
+    Cast,
+    Extract,
 )
 
 
@@ -46,6 +48,54 @@ def test_correlation_analyzer_detects_correlated_subquery():
     # analyzer tracks the relation by its alias only.
     assert "orders" not in result.inner_tables
     assert "o" in result.inner_tables
+
+
+def test_correlation_analyzer_detects_outer_ref_inside_cast():
+    """An outer reference wrapped in CAST/EXTRACT must still be seen.
+
+    The correlation walker previously did not descend into Cast/Extract/Window,
+    so such a subquery was treated as uncorrelated and executed once instead of
+    per outer row - a silent wrong result.
+    """
+    scan = Scan(
+        datasource="pg",
+        schema_name="public",
+        table_name="orders",
+        columns=["amount"],
+        alias="o",
+    )
+    predicate = BinaryOp(
+        op=BinaryOpType.GT,
+        left=ColumnRef(table="o", column="amount"),
+        right=Cast(
+            expr=ColumnRef(table="u", column="threshold"), target_type="DECIMAL"
+        ),
+    )
+    result = CorrelationAnalyzer().analyze(Filter(input=scan, predicate=predicate), {"u"})
+
+    assert result.is_correlated is True
+    assert result.outer_references[0].table == "u"
+    assert result.outer_references[0].column == "threshold"
+
+
+def test_correlation_analyzer_detects_outer_ref_inside_extract():
+    """An outer reference inside EXTRACT(... FROM outer.col) must be seen."""
+    scan = Scan(
+        datasource="pg",
+        schema_name="public",
+        table_name="orders",
+        columns=["y"],
+        alias="o",
+    )
+    predicate = BinaryOp(
+        op=BinaryOpType.EQ,
+        left=ColumnRef(table="o", column="y"),
+        right=Extract(field="YEAR", source=ColumnRef(table="u", column="created")),
+    )
+    result = CorrelationAnalyzer().analyze(Filter(input=scan, predicate=predicate), {"u"})
+
+    assert result.is_correlated is True
+    assert result.outer_references[0].column == "created"
 
 
 def test_correlation_analyzer_uncorrelated_subquery():

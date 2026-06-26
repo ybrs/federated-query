@@ -441,8 +441,9 @@ class PostgreSQLDataSource(DataSource):
 
         Postgres ``uuid`` arrives as opaque binary and ``numeric`` as an opaque
         string; the engine wants a canonical uuid string and a float64
-        respectively (matching psycopg2). Unknown opaque types fall back to
-        their string storage.
+        respectively (matching psycopg2). Any other opaque type raises rather
+        than passing its raw storage through, which would diverge from the
+        psycopg2 path and mistype the column silently.
         """
         type_name = getattr(column_type, "type_name", "")
         storage = column.combine_chunks().storage
@@ -450,7 +451,7 @@ class PostgreSQLDataSource(DataSource):
             return self._uuid_bytes_to_string(storage)
         if type_name == "numeric":
             return pc.cast(storage, pa.float64())
-        return storage
+        raise ValueError(f"Unsupported ADBC opaque type: {type_name!r}")
 
     def _uuid_bytes_to_string(self, storage) -> pa.Array:
         """Format a binary(16) uuid column to canonical strings, vectorized.
@@ -523,14 +524,24 @@ class PostgreSQLDataSource(DataSource):
         1082: pa.date32(),  # date
         1114: pa.timestamp("us"),  # timestamp
         1184: pa.timestamp("us", tz="UTC"),  # timestamptz
+        2950: pa.string(),  # uuid (rendered as text, matching the ADBC path)
     }
 
     def _build_arrow_fields(self, description) -> List[pa.Field]:
-        """Build typed Arrow fields from a cursor description."""
+        """Build typed Arrow fields from a cursor description.
+
+        An unmapped type OID raises instead of defaulting to string: a silent
+        string fallback would mistype the column (e.g. a uuid/json/time value)
+        and could diverge from the same column fetched via the ADBC path.
+        """
         fields = []
         for column in description:
-            arrow_type = self._OID_TO_ARROW.get(column[1], pa.string())
-            fields.append(pa.field(column[0], arrow_type))
+            if column[1] not in self._OID_TO_ARROW:
+                raise ValueError(
+                    f"Unsupported PostgreSQL type OID {column[1]} "
+                    f"for column {column[0]!r}"
+                )
+            fields.append(pa.field(column[0], self._OID_TO_ARROW[column[1]]))
         return fields
 
     def _build_column_arrays(self, rows: List, schema: pa.Schema) -> List[pa.Array]:

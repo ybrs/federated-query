@@ -70,6 +70,8 @@ from ..plan.expressions import (
     BetweenExpression,
     TupleExpression,
     WindowExpr,
+    Cast,
+    Extract,
 )
 
 
@@ -251,6 +253,12 @@ def _expression_children(expr: Expression) -> List[Expression]:
         return [expr.left, expr.right]
     if isinstance(expr, UnaryOp):
         return [expr.operand]
+    if isinstance(expr, Cast):
+        return [expr.expr]
+    if isinstance(expr, Extract):
+        return [expr.source]
+    if isinstance(expr, WindowExpr):
+        return [expr.function] + list(expr.partition_by) + list(expr.order_keys)
     if isinstance(
         expr, (FunctionCall, TupleExpression, InList, CaseExpr, BetweenExpression)
     ):
@@ -418,7 +426,30 @@ def _rebuild_container_expression(expr: Expression, rebuild_child) -> Expression
         for item in expr.items:
             rebuilt_items.append(rebuild_child(item))
         return TupleExpression(items=tuple(rebuilt_items))
+    if isinstance(expr, Cast):
+        return expr.model_copy(update={"expr": rebuild_child(expr.expr)})
+    if isinstance(expr, Extract):
+        return expr.model_copy(update={"source": rebuild_child(expr.source)})
+    if isinstance(expr, WindowExpr):
+        return _rebuild_window_expression(expr, rebuild_child)
     return expr
+
+
+def _rebuild_window_expression(expr: WindowExpr, rebuild_child) -> WindowExpr:
+    """Rebuild a window expression, applying rebuild_child to its sub-expressions."""
+    rebuilt_partition = []
+    for part in expr.partition_by:
+        rebuilt_partition.append(rebuild_child(part))
+    rebuilt_order = []
+    for key in expr.order_keys:
+        rebuilt_order.append(rebuild_child(key))
+    return expr.model_copy(
+        update={
+            "function": rebuild_child(expr.function),
+            "partition_by": rebuilt_partition,
+            "order_keys": rebuilt_order,
+        }
+    )
 
 
 def _rebuild_case_expression(expr: CaseExpr, rebuild_child) -> CaseExpr:

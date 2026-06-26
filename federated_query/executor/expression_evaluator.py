@@ -275,7 +275,9 @@ class ExpressionEvaluator:
             return pc.is_null(operand)
         if expr.op == UnaryOpType.IS_NOT_NULL:
             return pc.is_valid(operand)
-        return pc.negate(operand)
+        if expr.op == UnaryOpType.NEGATE:
+            return pc.negate(operand)
+        raise ExpressionEvaluationError(f"Unsupported unary operator: {expr.op.value}")
 
     def _eval_function(self, expr: FunctionCall):
         """Evaluate a scalar (non-aggregate) function call."""

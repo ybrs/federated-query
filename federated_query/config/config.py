@@ -110,6 +110,16 @@ def load_config(config_path: str) -> Config:
     with open(path, "r") as f:
         data = yaml.safe_load(f)
 
+    # Reject unknown top-level sections so a typo (e.g. "optimizr:") fails loud
+    # instead of being silently ignored and falling back to defaults. The nested
+    # models already forbid unknown keys; this covers the section names too.
+    known_sections = {"datasources", "optimizer", "executor", "cost"}
+    unknown_sections = set(data) - known_sections
+    if unknown_sections:
+        raise ValueError(
+            f"Unknown config section(s): {', '.join(sorted(unknown_sections))}"
+        )
+
     # Parse data sources
     datasources = {}
     for name, ds_config in data.get("datasources", {}).items():

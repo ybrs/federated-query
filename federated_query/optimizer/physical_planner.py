@@ -422,17 +422,18 @@ class PhysicalPlanner:
     def _plan_remote_join_aggregate(
         self, aggregate: Aggregate, remote_join: PhysicalRemoteJoin
     ) -> PhysicalRemoteJoin:
-        """Fold an aggregate onto a remote join so both push as one remote query."""
-        return PhysicalRemoteJoin(
-            left=remote_join.left,
-            right=remote_join.right,
-            join_type=remote_join.join_type,
-            condition=remote_join.condition,
-            datasource_connection=remote_join.datasource_connection,
-            group_by=aggregate.group_by,
-            grouping_sets=aggregate.grouping_sets,
-            aggregates=aggregate.aggregates,
-            output_names=aggregate.output_names,
+        """Fold an aggregate onto a remote join so both push as one remote query.
+
+        Uses model_copy so the join's own fields (distinct/order_by_*) survive;
+        re-listing fields would silently drop any omitted one.
+        """
+        return remote_join.model_copy(
+            update={
+                "group_by": aggregate.group_by,
+                "grouping_sets": aggregate.grouping_sets,
+                "aggregates": aggregate.aggregates,
+                "output_names": aggregate.output_names,
+            }
         )
 
     def _plan_explain(self, explain: Explain) -> PhysicalExplain:
@@ -907,25 +908,12 @@ class PhysicalPlanner:
     def _scan_with_columns(
         self, scan: PhysicalScan, columns: List[str]
     ) -> PhysicalScan:
-        """Clone a scan, replacing its projected column list."""
-        return PhysicalScan(
-            datasource=scan.datasource,
-            schema_name=scan.schema_name,
-            table_name=scan.table_name,
-            columns=columns,
-            filters=scan.filters,
-            datasource_connection=scan.datasource_connection,
-            group_by=scan.group_by,
-            aggregates=scan.aggregates,
-            output_names=scan.output_names,
-            alias=scan.alias,
-            limit=scan.limit,
-            offset=scan.offset,
-            order_by_keys=scan.order_by_keys,
-            order_by_ascending=scan.order_by_ascending,
-            order_by_nulls=scan.order_by_nulls,
-            distinct=scan.distinct,
-        )
+        """Clone a scan, replacing its projected column list.
+
+        Uses model_copy so every other field (including sample/grouping_sets)
+        is preserved; re-listing fields would silently drop any omitted one.
+        """
+        return scan.model_copy(update={"columns": columns})
 
     def _plan_local_set_op(
         self,

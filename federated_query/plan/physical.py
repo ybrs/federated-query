@@ -1060,6 +1060,11 @@ class PhysicalWindow(PhysicalPlanNode):
 
     def _window_select_list(self, aliases) -> str:
         """Alias each projection expression, resolving columns to physical names."""
+        if len(self.expressions) != len(self.output_names):
+            raise ValueError(
+                f"expressions ({len(self.expressions)}) and output_names "
+                f"({len(self.output_names)}) length mismatch"
+            )
         parts = []
         for expr, name in zip(self.expressions, self.output_names):
             resolved = _resolve_window_columns(expr, aliases)
@@ -1485,6 +1490,11 @@ class PhysicalHashJoin(PhysicalPlanNode):
 
     def _merge_on_clause(self) -> str:
         """Render the equi-join condition as l.key = r.key conjuncts."""
+        if len(self.left_keys) != len(self.right_keys):
+            raise ValueError(
+                f"join key count mismatch: {len(self.left_keys)} left vs "
+                f"{len(self.right_keys)} right"
+            )
         left_aliases = self.left.column_aliases()
         right_aliases = self.right.column_aliases()
         conjuncts = []
@@ -2456,6 +2466,11 @@ class PhysicalHashAggregate(PhysicalPlanNode):
 
     def _aggregate_select_list(self, aliases) -> str:
         """Alias each SELECT expression to its output name."""
+        if len(self.aggregates) != len(self.output_names):
+            raise ValueError(
+                f"aggregates ({len(self.aggregates)}) and output_names "
+                f"({len(self.output_names)}) length mismatch"
+            )
         parts = []
         for expr, name in zip(self.aggregates, self.output_names):
             parts.append(f'{self._render_agg_expr(expr, aliases)} AS "{name}"')
@@ -2580,10 +2595,14 @@ class PhysicalHashAggregate(PhysicalPlanNode):
 
         key_values = []
         for expr in self.group_by:
-            if isinstance(expr, ColumnRef):
-                col = batch.column(expr.column)
-                value = col[row_idx].as_py()
-                key_values.append(value)
+            if not isinstance(expr, ColumnRef):
+                raise NotImplementedError(
+                    "Local GROUP BY on a non-column key is not supported: "
+                    f"{type(expr).__name__}"
+                )
+            col = batch.column(expr.column)
+            value = col[row_idx].as_py()
+            key_values.append(value)
         return tuple(key_values)
 
     def _accumulate_row(self, batch: pa.RecordBatch, row_idx: int, accumulator: dict):
@@ -2724,11 +2743,13 @@ class PhysicalHashAggregate(PhysicalPlanNode):
             else:
                 # This is a group-by column - find which one
                 group_idx = self._find_group_by_index(expr)
-                if group_idx is not None:
-                    values.append(group_key[group_idx] if group_key else None)
-                else:
-                    # Fallback: might be a constant or expression
-                    values.append(None)
+                if group_idx is None:
+                    raise NotImplementedError(
+                        "Local aggregate output for a non-aggregate, "
+                        "non-group-by expression is not supported: "
+                        f"{type(expr).__name__}"
+                    )
+                values.append(group_key[group_idx] if group_key else None)
 
         return pa.array(values)
 
@@ -2812,22 +2833,47 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         self, table: pa.Table, group_key: tuple, row_indices: List[int]
     ) -> List:
         """Compute one output row for a single group."""
-        from .expressions import ColumnRef, FunctionCall
-
         row_data = []
         for agg_expr in self.aggregates:
-            if isinstance(agg_expr, ColumnRef):
-                idx = self._find_group_by_index(agg_expr)
-                if idx is not None and len(group_key) > 0:
-                    row_data.append(group_key[idx])
-                else:
-                    row_data.append(None)
-            elif isinstance(agg_expr, FunctionCall):
-                value = self._compute_aggregate(table, agg_expr, row_indices)
-                row_data.append(value)
-            else:
-                row_data.append(None)
+            row_data.append(
+                self._compute_group_cell(table, agg_expr, group_key, row_indices)
+            )
         return row_data
+
+    def _compute_group_cell(
+        self,
+        table: pa.Table,
+        agg_expr: Expression,
+        group_key: tuple,
+        row_indices: List[int],
+    ):
+        """Compute one output cell: a group-by key value or an aggregate result.
+
+        A SELECT expression that is neither a group-by column, a constant, nor
+        an aggregate call (e.g. ``SUM(x) * 2``) is unsupported on the local path
+        and raises, rather than silently emitting NULL.
+        """
+        from .expressions import ColumnRef, FunctionCall, Literal
+
+        if isinstance(agg_expr, ColumnRef):
+            return self._group_key_value(agg_expr, group_key)
+        if isinstance(agg_expr, Literal):
+            return agg_expr.value
+        if isinstance(agg_expr, FunctionCall):
+            return self._compute_aggregate(table, agg_expr, row_indices)
+        raise NotImplementedError(
+            "Local aggregate output for a non-aggregate, non-group-by expression "
+            f"is not supported: {type(agg_expr).__name__}"
+        )
+
+    def _group_key_value(self, column_ref, group_key: tuple):
+        """Return a group-by column's value for the current group, or raise."""
+        idx = self._find_group_by_index(column_ref)
+        if idx is None or len(group_key) == 0:
+            raise NotImplementedError(
+                f"GROUP BY column not found in grouping keys: {column_ref.column}"
+            )
+        return group_key[idx]
 
     def _compute_aggregate(
         self, table: pa.Table, func: "FunctionCall", row_indices: List[int]
