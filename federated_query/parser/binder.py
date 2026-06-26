@@ -215,8 +215,6 @@ class Binder:
         in this table are dropped here; references that resolve nowhere
         still fail loudly during expression binding.
         """
-        from ..plan.transform import replace
-
         table = self._resolve_table(scan)
         kept = []
         for name in scan.columns:

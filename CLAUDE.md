@@ -32,13 +32,15 @@ asserts on). Nothing else, anywhere.
 
 Never fail silently. If something breaks it should throw an error. We don't want silent fails. You can only catch exceptions when we show it to the user in the cli. Otherwise all exceptions should be thrown. 
 
-NO DATACLASSES; state types are Pydantic models. This project does not use Python dataclasses (`@dataclass`) anywhere - final, non-negotiable. Dataclasses silently drop fields on reconstruction (a forgotten field takes its default = a wrong answer with no error). Every state-carrying type (plan nodes, expression nodes, catalog/config/state objects) is a `pydantic.BaseModel`. Rules:
-- Never write `@dataclass` or `from dataclasses import ...`. A `@dataclass` is a bug to migrate, not preserve.
+NO DATACLASSES; state types are Pydantic models. Final, non-negotiable design decision: no Python dataclasses (`@dataclass`) anywhere. Dataclasses silently drop fields on reconstruction (a forgotten field takes its default = a wrong answer with no error). Every state-carrying type (plan nodes, expression nodes, catalog/config/state objects) is a `pydantic.BaseModel`. (Migration to this is in progress - status and remaining layers are tracked in tasks.md - but this rule is the target; do not weaken it.) Rules:
+- Never write a `@dataclass` or import `dataclasses`. A `@dataclass` is a bug to migrate, not preserve.
 - Fields are declared as Pydantic annotations; a field with no default is REQUIRED and Pydantic raises on omission. Construct with kwargs: `Scan(datasource=..., schema_name=..., ...)`.
 - To copy-with-change (any transformation), use `node.model_copy(update={"filters": ...})`, which copies EVERY field and overrides only what you name, so a field can never be dropped. NEVER reconstruct a node by re-listing its fields into a raw constructor.
 - Equality/copy/introspection come from Pydantic: structural `==` over all fields (this is the change-detection contract - do not hand-write field-by-field comparison), `model_copy`, `model_fields`. Hold non-Pydantic values (sqlglot, etc.) via `model_config = ConfigDict(arbitrary_types_allowed=True)` on a base.
 - Nodes keep their `children()`/`with_children()`/`accept()`/`schema()` methods; `with_children` is `self.model_copy(update={...})`.
-The test `tests/test_node_field_preservation.py` pins that a rebuild preserves every field.
+The test `tests/test_node_field_preservation.py` pins that `with_children` preserves every field for each node type.
+
+Mutable by default; do not reach for immutability. Use plain mutable classes. Do NOT make a type immutable - no `frozen=True`, no `__setattr__` guards, no read-only/value-object wrappers - unless there is a STRONG, concrete reason. Immutability is not a goal in itself and does not by itself guarantee correctness; never introduce it speculatively, and never change a design to be immutable without a real, stated reason. If a specific type genuinely needs to be immutable, the reason MUST be written down here as a listed exception (which type, and why). Immutability exceptions (currently none): _none_.
 
 No legacy / compatibility cruft. This is a system we are building from scratch - there is no legacy code, no old callers, no external API to stay compatible with. Never add "store for compatibility" fields, shim attributes, dead aliases, or back-compat branches. If something is no longer needed, delete it; if an abstraction doesn't fit (e.g. a base attribute that a subclass can't honor), fix the abstraction and its callers, don't paper over it. A comment like "kept for compatibility" is a red flag to remove, not preserve.
 

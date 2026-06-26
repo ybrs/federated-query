@@ -47,6 +47,27 @@ class ExplainFormat(Enum):
     JSON = "JSON"
 
 
+def _positional_to_kwargs(node_cls, args, kwargs) -> None:
+    """Place positional construction args into kwargs by declared field order.
+
+    Fails fast on too many args or a positional/keyword collision rather than
+    silently truncating or clobbering.
+    """
+    names = list(node_cls.model_fields)
+    if len(args) > len(names):
+        raise TypeError(
+            f"{node_cls.__name__} takes at most {len(names)} positional "
+            f"arguments but {len(args)} were given"
+        )
+    for index, value in enumerate(args):
+        name = names[index]
+        if name in kwargs:
+            raise TypeError(
+                f"{node_cls.__name__} got multiple values for argument '{name}'"
+            )
+        kwargs[name] = value
+
+
 class LogicalPlanNode(BaseModel):
     """Base class for logical plan nodes.
 
@@ -57,20 +78,18 @@ class LogicalPlanNode(BaseModel):
     other non-model values.
     """
 
+    # arbitrary_types_allowed: nodes hold non-model values (Expression, sqlglot).
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def __init__(self, *args, **kwargs):
         """Construct from kwargs, or positionally in declared field order.
 
-        Positional construction is explicit and complete (it supplies fields by
-        position), so it cannot drop a field; it is mapped to the field names so
-        the rest of the model machinery is unchanged. Copy-with-change must still
-        use ``model_copy``, never a re-listed constructor.
+        Positional args are mapped to field names so the rest of the model is
+        unchanged. Copy-with-change must still use ``model_copy``, never a
+        re-listed constructor.
         """
         if args:
-            names = list(type(self).model_fields)
-            for index, value in enumerate(args):
-                kwargs[names[index]] = value
+            _positional_to_kwargs(type(self), args, kwargs)
         super().__init__(**kwargs)
 
     def children(self) -> List["LogicalPlanNode"]:

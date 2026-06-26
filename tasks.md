@@ -1,5 +1,18 @@
 # Federated Query Engine - Implementation Tasks
 
+## In progress: migrate all state types off @dataclass to pydantic.BaseModel
+
+Final design decision (see CLAUDE.md / AGENTS.md): no dataclasses; state types are
+plain (mutable) Pydantic models; copy-with-change via `model_copy`. Status:
+- [x] Logical plan layer (`plan/logical.py`, 17 nodes) - done, suite green.
+- [ ] Expression layer (`plan/expressions.py`, 17 nodes).
+- [ ] Physical layer (`plan/physical.py`, ~24 nodes).
+- [ ] Value types: `config/config.py`, `datasources/base.py`, `catalog/schema.py`,
+      `optimizer/decorrelation.py` (3 local), processor contexts, `physical_planner.py`.
+- [ ] Remove the temporary `plan/transform.py::replace` bridge (move call sites to
+      `model_copy`) once every layer is migrated.
+- [ ] Add a lint test that fails on any `@dataclass` / `import dataclasses`.
+
 ## Overview
 
 This document breaks down the implementation into phases. Each phase builds on the previous one, aiming for a working end-to-end system early, then adding optimizations and advanced features.
@@ -880,12 +893,13 @@ progress:
       `tests/e2e_pushdown/test_distinct_on.py` (single-source correctness incl.
       row order + WHERE; cross-source fail-fast).
       ROOT-CAUSE FIX (silent field drops): the recurring "rebuild drops a new
-      field" bug (distinct_on, within_group_key) is eliminated by reconstructing
-      frozen-dataclass nodes with `dataclasses.replace(...)` instead of re-listing
-      fields. Converted 34 optimizer/decorrelation rebuilds + the binder/physical
-      expression rebuilds. New rule in CLAUDE.md/AGENTS.md, and a guard test
-      `tests/test_node_field_preservation.py` pins the `with_children` contract for
-      every node type with children (a dropped field fails the round-trip).
+      field" bug (distinct_on, within_group_key) was first addressed by routing
+      node reconstruction through a copy-that-preserves-all-fields (then
+      `dataclasses.replace`, now superseded by the move to Pydantic `model_copy`;
+      `plan/transform.py::replace` bridges the two during migration). The guard
+      test `tests/test_node_field_preservation.py` pins each node's `with_children`
+      (which copies all fields and changes only the children), so a `with_children`
+      that updates the wrong field or forgets a child fails the round-trip.
 - [x] GROUP BY ROLLUP / CUBE / GROUPING SETS + the GROUPING() function. ROLLUP/CUBE
       are expanded into explicit grouping sets at parse (supports leading normal
       keys + one construct; combining several constructs fails fast).
