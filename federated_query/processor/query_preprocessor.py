@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import pyarrow as pa
 import sqlglot
 from sqlglot import exp
+
+from ..model import StateModel
 
 from ..catalog import Catalog
 from ..catalog.schema import Table
@@ -23,8 +24,7 @@ class StarExpansionError(Exception):
     pass
 
 
-@dataclass
-class _SelectSource:
+class _SelectSource(StateModel):
     """Metadata for a table referenced in a SELECT."""
 
     datasource: str

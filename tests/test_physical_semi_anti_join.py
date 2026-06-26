@@ -1,17 +1,21 @@
 """Tests for SEMI and ANTI join execution in physical operators."""
 
+from typing import Any
+
 import pyarrow as pa
-from federated_query.plan.physical import PhysicalHashJoin, PhysicalNestedLoopJoin
+from federated_query.plan.physical import (
+    PhysicalHashJoin,
+    PhysicalNestedLoopJoin,
+    PhysicalPlanNode,
+)
 from federated_query.plan.logical import JoinType
 from federated_query.plan.expressions import ColumnRef, BinaryOp, BinaryOpType
 
 
-class FakeNode:
+class FakeNode(PhysicalPlanNode):
     """Simple plan node that yields fixed batches for testing."""
 
-    def __init__(self, batches):
-        """Store batches to return during execute."""
-        self._batches = batches
+    batches: Any
 
     def children(self):
         """Return no children for leaf node."""
@@ -19,14 +23,14 @@ class FakeNode:
 
     def execute(self):
         """Yield stored batches in order."""
-        for batch in self._batches:
+        for batch in self.batches:
             yield batch
 
     def schema(self):
         """Return schema of first batch or empty schema."""
-        if len(self._batches) == 0:
+        if len(self.batches) == 0:
             return pa.schema([])
-        return self._batches[0].schema
+        return self.batches[0].schema
 
     def estimated_cost(self):
         """Return zero cost for test node."""
@@ -69,8 +73,8 @@ def test_hash_join_semi_emits_only_matching_left_rows():
     """Input: hash SEMI join on id; Expect: only left rows with matching id, no right cols."""
     left = _make_batch([[1, 2], ["a", "b"]], ["id", "val"])
     right = _make_batch([[1], ["x"]], ["id", "rval"])
-    left_node = FakeNode([left])
-    right_node = FakeNode([right])
+    left_node = FakeNode(batches=[left])
+    right_node = FakeNode(batches=[right])
     join = PhysicalHashJoin(
         left=left_node,
         right=right_node,
@@ -92,8 +96,8 @@ def test_hash_join_anti_emits_only_non_matching_left_rows():
     """Input: hash ANTI join on id; Expect: left rows without match, no right cols."""
     left = _make_batch([[1, 2], ["a", "b"]], ["id", "val"])
     right = _make_batch([[1], ["x"]], ["id", "rval"])
-    left_node = FakeNode([left])
-    right_node = FakeNode([right])
+    left_node = FakeNode(batches=[left])
+    right_node = FakeNode(batches=[right])
     join = PhysicalHashJoin(
         left=left_node,
         right=right_node,
@@ -114,8 +118,8 @@ def test_nested_loop_semi_respects_condition():
     """Input: nested-loop SEMI join with condition; Expect: only left rows satisfying predicate."""
     left = _make_batch([[1, 2], ["a", "b"]], ["id", "val"])
     right = _make_batch([[2], ["x"]], ["rid", "rval"])
-    left_node = FakeNode([left])
-    right_node = FakeNode([right])
+    left_node = FakeNode(batches=[left])
+    right_node = FakeNode(batches=[right])
     condition = BinaryOp(
         op=BinaryOpType.EQ,
         left=ColumnRef(table=None, column="id"),

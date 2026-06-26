@@ -45,20 +45,54 @@ def _leaf(name="leaf"):
 # with_children that fails to carry one would revert it to its default and break
 # the round-trip equality below.
 NODES = [
-    Projection(_leaf(), [COL], ["c"], distinct=True, distinct_on=[COL]),
-    Filter(_leaf(), COL),
-    Sort(_leaf(), [COL], [False], ["LAST"]),
-    Limit(_leaf(), 5, 2),
-    Aggregate(_leaf(), [COL], [COL], ["c"], grouping_sets=[[COL], []]),
-    Join(_leaf("l"), _leaf("r"), JoinType.LEFT, COL, natural=True, using=["c"]),
-    LateralJoin(_leaf("l"), _leaf("r"), JoinType.LEFT),
-    SetOperation(_leaf("l"), _leaf("r"), SetOpKind.UNION, distinct=True),
-    Union([_leaf("l"), _leaf("r")], distinct=True),
-    CTE("w", _leaf("c"), _leaf("b"), recursive=True, column_names=["c"]),
-    SubqueryScan(_leaf(), "a"),
-    Explain(_leaf(), ExplainFormat.JSON),
-    GroupedLimit(_leaf(), [COL], 3, [COL], [False], ["LAST"]),
-    SingleRowGuard(_leaf(), [COL]),
+    Projection(
+        input=_leaf(),
+        expressions=[COL],
+        aliases=["c"],
+        distinct=True,
+        distinct_on=[COL],
+    ),
+    Filter(input=_leaf(), predicate=COL),
+    Sort(input=_leaf(), sort_keys=[COL], ascending=[False], nulls_order=["LAST"]),
+    Limit(input=_leaf(), limit=5, offset=2),
+    Aggregate(
+        input=_leaf(),
+        group_by=[COL],
+        aggregates=[COL],
+        output_names=["c"],
+        grouping_sets=[[COL], []],
+    ),
+    Join(
+        left=_leaf("l"),
+        right=_leaf("r"),
+        join_type=JoinType.LEFT,
+        condition=COL,
+        natural=True,
+        using=["c"],
+    ),
+    LateralJoin(left=_leaf("l"), right=_leaf("r"), join_type=JoinType.LEFT),
+    SetOperation(
+        left=_leaf("l"), right=_leaf("r"), kind=SetOpKind.UNION, distinct=True
+    ),
+    Union(inputs=[_leaf("l"), _leaf("r")], distinct=True),
+    CTE(
+        name="w",
+        cte_plan=_leaf("c"),
+        child=_leaf("b"),
+        recursive=True,
+        column_names=["c"],
+    ),
+    SubqueryScan(input=_leaf(), alias="a"),
+    Explain(input=_leaf(), format=ExplainFormat.JSON),
+    GroupedLimit(
+        input=_leaf(),
+        keys=[COL],
+        limit=3,
+        order_by_keys=[COL],
+        order_by_ascending=[False],
+        order_by_nulls=["LAST"],
+    ),
+    SingleRowGuard(input=_leaf(), keys=[COL]),
 ]
 
 

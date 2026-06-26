@@ -2,7 +2,6 @@
 
 import json
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
 from typing import (
     List,
     Optional,
@@ -19,6 +18,9 @@ from enum import Enum
 import pyarrow as pa
 from sqlglot import exp
 
+from pydantic import Field
+
+from ..model import StateModel
 from .expressions import Expression
 from .logical import JoinType, ExplainFormat, SetOpKind
 from ..utils.logging import get_logger
@@ -54,8 +56,12 @@ _GROUPED_LIMIT_INDEX_COL = "__gl_idx"
 _GROUPED_LIMIT_RN_COL = "__gl_rn"
 
 
-class PhysicalPlanNode(ABC):
+class PhysicalPlanNode(StateModel, ABC):
     """Base class for physical plan nodes."""
+
+    # The per-query DuckDB merge engine, attached imperatively after planning
+    # (a private attr, not a field: execution state, not plan structure).
+    _merge_engine: Any = None
 
     @abstractmethod
     def children(self) -> List["PhysicalPlanNode"]:
@@ -223,7 +229,6 @@ def _table_from_batches(batches: List[pa.RecordBatch], schema: pa.Schema) -> pa.
     return pa.Table.from_batches(batches)
 
 
-@dataclass
 class PhysicalCTE(PhysicalPlanNode):
     """Materializes a cross-source CTE body once, shared by every reference.
 
@@ -236,6 +241,8 @@ class PhysicalCTE(PhysicalPlanNode):
     name: str
     body: PhysicalPlanNode
     column_names: Optional[List[str]] = None
+    # Lazily-filled cache of the materialized body (private attr, not a field).
+    _cached: Optional[Any] = None
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.body]
@@ -276,7 +283,6 @@ class PhysicalCTE(PhysicalPlanNode):
         return f"PhysicalCTE({self.name})"
 
 
-@dataclass
 class PhysicalCTEScan(PhysicalPlanNode):
     """Reads a materialized CTE's rows; one per reference, shares the producer."""
 
@@ -300,7 +306,6 @@ class PhysicalCTEScan(PhysicalPlanNode):
         return f"PhysicalCTEScan({self.producer.name})"
 
 
-@dataclass
 class PhysicalCTEMergeQuery(PhysicalPlanNode):
     """Runs a whole (possibly recursive) WITH inside the merge engine.
 
@@ -430,29 +435,26 @@ def _resolved_column_ref(expr, aliases):
 def _resolve_function_columns(expr, aliases):
     """Rebuild a FunctionCall with each argument's columns resolved.
 
-    ``replace`` preserves every other field (including the ordered-set WITHIN
+    ``model_copy`` preserves every other field (including the ordered-set WITHIN
     GROUP key, which is also resolved), so no field is silently dropped.
     """
-    from .transform import replace
-
     new_args = []
     for arg in expr.args:
         new_args.append(_resolve_window_columns(arg, aliases))
     new_key = expr.within_group_key
     if new_key is not None:
         new_key = _resolve_window_columns(new_key, aliases)
-    return replace(expr, args=new_args, within_group_key=new_key)
+    return expr.model_copy(update={"args": new_args, "within_group_key": new_key})
 
 
 def _resolve_window_expr(expr, aliases):
     """Rebuild a WindowExpr with its function/partition/order columns resolved."""
-    from .transform import replace
-
-    return replace(
-        expr,
-        function=_resolve_window_columns(expr.function, aliases),
-        partition_by=_resolve_window_list(expr.partition_by, aliases),
-        order_keys=_resolve_window_list(expr.order_keys, aliases),
+    return expr.model_copy(
+        update={
+            "function": _resolve_window_columns(expr.function, aliases),
+            "partition_by": _resolve_window_list(expr.partition_by, aliases),
+            "order_keys": _resolve_window_list(expr.order_keys, aliases),
+        }
     )
 
 
@@ -541,7 +543,6 @@ def _join_output_aliases(
     return alias_map
 
 
-@dataclass
 class PhysicalScan(PhysicalPlanNode):
     """Scan a table from a data source.
 
@@ -859,7 +860,6 @@ class PhysicalScan(PhysicalPlanNode):
         return f"PhysicalScan({table_ref})"
 
 
-@dataclass
 class PhysicalProjection(PhysicalPlanNode):
     """Projection expressions."""
 
@@ -1026,7 +1026,6 @@ class PhysicalProjection(PhysicalPlanNode):
         return self.input.column_aliases()
 
 
-@dataclass
 class PhysicalWindow(PhysicalPlanNode):
     """Evaluate a window-bearing projection in the merge engine.
 
@@ -1088,7 +1087,6 @@ class PhysicalWindow(PhysicalPlanNode):
         return f"PhysicalWindow({len(self.expressions)} exprs)"
 
 
-@dataclass
 class PhysicalFilter(PhysicalPlanNode):
     """Filter rows."""
 
@@ -1128,7 +1126,6 @@ class PhysicalFilter(PhysicalPlanNode):
         return self.input.column_aliases()
 
 
-@dataclass
 class PhysicalHashJoin(PhysicalPlanNode):
     """Hash join implementation."""
 
@@ -1785,7 +1782,6 @@ class PhysicalHashJoin(PhysicalPlanNode):
         return f"PhysicalHashJoin({self.join_type.value}, build={self.build_side})"
 
 
-@dataclass
 class PhysicalRemoteJoin(PhysicalPlanNode):
     """Join executed directly on a single data source.
 
@@ -1817,9 +1813,7 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
     order_by_ascending: Optional[List[bool]] = None
     order_by_nulls: Optional[List[Optional[str]]] = None
     _schema: Optional[pa.Schema] = None
-    _column_alias_map: Dict[Tuple[Optional[str], str], str] = field(
-        default_factory=dict, init=False
-    )
+    _column_alias_map: Dict[Tuple[Optional[str], str], str] = {}
 
     def children(self) -> List[PhysicalPlanNode]:
         return []
@@ -2024,7 +2018,6 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
         return self._column_alias_map
 
 
-@dataclass
 class PhysicalNestedLoopJoin(PhysicalPlanNode):
     """Nested loop join implementation."""
 
@@ -2354,7 +2347,6 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
         return pa.RecordBatch.from_arrays(arrays, names=names)
 
 
-@dataclass
 class PhysicalHashAggregate(PhysicalPlanNode):
     """Hash-based aggregation."""
 
@@ -2961,7 +2953,6 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         return self.input.column_aliases()
 
 
-@dataclass
 class PhysicalSort(PhysicalPlanNode):
     """Sort rows."""
 
@@ -3088,7 +3079,6 @@ class PhysicalSort(PhysicalPlanNode):
         return self.input.column_aliases()
 
 
-@dataclass
 class PhysicalLimit(PhysicalPlanNode):
     """Limit rows. ``limit`` is None for an OFFSET with no row cap."""
 
@@ -3145,7 +3135,6 @@ class CardinalityViolationError(Exception):
     """Raised when a scalar subquery produces more than one row."""
 
 
-@dataclass
 class PhysicalValues(PhysicalPlanNode):
     """Emits in-memory rows built from constant expressions.
 
@@ -3195,7 +3184,6 @@ def _one_row_dummy_batch() -> pa.RecordBatch:
     return pa.RecordBatch.from_pydict({"__dummy": pa.array([0])})
 
 
-@dataclass
 class PhysicalRemoteQuery(PhysicalPlanNode):
     """A pushable single-source subtree rendered as one remote SQL query.
 
@@ -3209,7 +3197,7 @@ class PhysicalRemoteQuery(PhysicalPlanNode):
     datasource_connection: Any
     query_ast: Any
     output_names: List[str]
-    column_alias_map: Dict[Tuple[Optional[str], str], str] = field(default_factory=dict)
+    column_alias_map: Dict[Tuple[Optional[str], str], str] = Field(default_factory=dict)
     _schema: Optional[pa.Schema] = None
 
     def children(self) -> List[PhysicalPlanNode]:
@@ -3240,7 +3228,6 @@ class PhysicalRemoteQuery(PhysicalPlanNode):
         return f"PhysicalRemoteQuery({self.datasource})"
 
 
-@dataclass
 class PhysicalUnion(PhysicalPlanNode):
     """Concatenates input streams; optionally removes duplicate rows."""
 
@@ -3326,7 +3313,6 @@ _SET_OP_EXP = {
 }
 
 
-@dataclass
 class PhysicalRemoteSetOp(PhysicalPlanNode):
     """Set operation pushed to a single data source as one remote query.
 
@@ -3456,7 +3442,6 @@ class PhysicalRemoteSetOp(PhysicalPlanNode):
         return query
 
 
-@dataclass
 class PhysicalSetOperation(PhysicalPlanNode):
     """Locally evaluated INTERSECT / EXCEPT over two materialized inputs.
 
@@ -3583,7 +3568,6 @@ class PhysicalSetOperation(PhysicalPlanNode):
         return f"PhysicalSetOperation({self.kind.value}{suffix})"
 
 
-@dataclass
 class PhysicalSingleRowGuard(PhysicalPlanNode):
     """Enforces scalar-subquery cardinality at execution time.
 
@@ -3655,7 +3639,6 @@ class PhysicalSingleRowGuard(PhysicalPlanNode):
         return self.input.column_aliases()
 
 
-@dataclass
 class PhysicalGroupedLimit(PhysicalPlanNode):
     """Emits at most ``limit`` rows per distinct key tuple.
 
@@ -3855,7 +3838,6 @@ class PhysicalGroupedLimit(PhysicalPlanNode):
         return self.input.column_aliases()
 
 
-@dataclass
 class PhysicalLateralJoin(PhysicalPlanNode):
     """Cross-source dependent (LATERAL) join, run in the merge engine.
 
@@ -3904,8 +3886,6 @@ class PhysicalLateralJoin(PhysicalPlanNode):
         The filter may be loose (a superset) — the merge engine re-checks the
         exact correlation — so it only shrinks the rows the base source returns.
         """
-        from .transform import replace
-
         if not isinstance(self.base_scan, PhysicalScan):
             return self.base_scan
         term = _derive_domain_filter(self.correlations, left_table)
@@ -3914,7 +3894,7 @@ class PhysicalLateralJoin(PhysicalPlanNode):
         combined = term
         if self.base_scan.filters is not None:
             combined = _and_expr(self.base_scan.filters, term)
-        return replace(self.base_scan, filters=combined)
+        return self.base_scan.model_copy(update={"filters": combined})
 
     def schema(self) -> pa.Schema:
         """The (left + value) output schema, read without fetching rows.
@@ -4000,7 +3980,6 @@ def _literal(value) -> Expression:
     return Literal(value=value, data_type=DataType.VARCHAR)
 
 
-@dataclass
 class PhysicalExplain(PhysicalPlanNode):
     """Explain a physical plan without executing it."""
 
@@ -4091,8 +4070,7 @@ class PhysicalExplain(PhysicalPlanNode):
         return collector.collect(self.child)
 
 
-@dataclass
-class _DatasourceQuerySnapshot:
+class _DatasourceQuerySnapshot(StateModel):
     """Captured query metadata for a single datasource call."""
 
     datasource_name: str
@@ -4100,7 +4078,6 @@ class _DatasourceQuerySnapshot:
     query_ast: Any
 
 
-@dataclass
 class Gather(PhysicalPlanNode):
     """Gather data from a remote data source.
 
@@ -4366,7 +4343,9 @@ class _DatasourceQueryCollector:
         query_ast = datasource.parse_query(base_sql)
         native_sql = to_source_sql(datasource, base_sql)
         sql = self._annotate_dynamic_filter(scan, native_sql)
-        snapshot = _DatasourceQuerySnapshot(scan.datasource, sql, query_ast)
+        snapshot = _DatasourceQuerySnapshot(
+            datasource_name=scan.datasource, sql=sql, query_ast=query_ast
+        )
         snapshots.append(snapshot)
 
     def _annotate_dynamic_filter(self, scan: PhysicalScan, sql: str) -> str:
@@ -4418,7 +4397,9 @@ class _DatasourceQueryCollector:
         postgres_sql = join._build_query()
         query_ast = datasource.parse_query(postgres_sql)
         native_sql = to_source_sql(datasource, postgres_sql)
-        snapshot = _DatasourceQuerySnapshot(join.left.datasource, native_sql, query_ast)
+        snapshot = _DatasourceQuerySnapshot(
+            datasource_name=join.left.datasource, sql=native_sql, query_ast=query_ast
+        )
         snapshots.append(snapshot)
 
     def _record_remote_set_op(
@@ -4428,7 +4409,9 @@ class _DatasourceQueryCollector:
             return
         query_ast = set_op.build_remote_ast()
         sql = query_ast.sql(dialect=set_op.datasource_connection.render_dialect)
-        snapshot = _DatasourceQuerySnapshot(set_op.datasource, sql, query_ast)
+        snapshot = _DatasourceQuerySnapshot(
+            datasource_name=set_op.datasource, sql=sql, query_ast=query_ast
+        )
         snapshots.append(snapshot)
 
     def _record_remote_query(
@@ -4437,5 +4420,7 @@ class _DatasourceQueryCollector:
         if node.datasource_connection is None:
             return
         sql = node.query_ast.sql(dialect=node.datasource_connection.render_dialect)
-        snapshot = _DatasourceQuerySnapshot(node.datasource, sql, node.query_ast)
+        snapshot = _DatasourceQuerySnapshot(
+            datasource_name=node.datasource, sql=sql, query_ast=node.query_ast
+        )
         snapshots.append(snapshot)

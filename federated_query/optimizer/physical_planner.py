@@ -52,7 +52,7 @@ from ..plan.physical import (
 from ..plan.expressions import BinaryOp, BinaryOpType, ColumnRef, Literal, Expression
 from .single_source_pushdown import SingleSourcePushdown
 from typing import List, Tuple
-from dataclasses import dataclass
+from ..model import StateModel
 
 # Comparison operators a LATERAL correlation can use to derive a domain filter.
 _COMPARISONS = {
@@ -83,8 +83,7 @@ if TYPE_CHECKING:
     from ..processor.query_executor import QueryExecutor
 
 
-@dataclass(frozen=True)
-class _JoinSides:
+class _JoinSides(StateModel):
     """Relation qualifiers and bare column names exposed by each join side."""
 
     left_aliases: set

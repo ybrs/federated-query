@@ -27,8 +27,7 @@ Unsupported patterns raise DecorrelationError. Decorrelation never
 silently skips a subquery.
 """
 
-from dataclasses import dataclass
-from ..plan.transform import replace
+from ..model import StateModel
 from typing import Dict, List, Optional, Set, Tuple
 
 from ..plan.logical import (
@@ -74,8 +73,7 @@ from ..plan.expressions import (
 )
 
 
-@dataclass
-class CorrelationResult:
+class CorrelationResult(StateModel):
     """Correlation metadata for a subquery."""
 
     is_correlated: bool
@@ -394,7 +392,9 @@ def _rebuild_expression(expr: Expression, rebuild_child) -> Expression:
         rebuilt_key = None
         if expr.within_group_key is not None:
             rebuilt_key = rebuild_child(expr.within_group_key)
-        return replace(expr, args=rebuilt_args, within_group_key=rebuilt_key)
+        return expr.model_copy(
+            update={"args": rebuilt_args, "within_group_key": rebuilt_key}
+        )
     return _rebuild_container_expression(expr, rebuild_child)
 
 
@@ -437,8 +437,7 @@ def _is_null_check(expr: Expression) -> UnaryOp:
     return UnaryOp(op=UnaryOpType.IS_NULL, operand=expr)
 
 
-@dataclass
-class _PreparedSubquery:
+class _PreparedSubquery(StateModel):
     """A subquery transformed into a join-ready right side.
 
     plan exposes deterministically renamed output columns; condition holds
@@ -451,8 +450,7 @@ class _PreparedSubquery:
     values: List[str]
 
 
-@dataclass
-class _PreparedScalar:
+class _PreparedScalar(StateModel):
     """A scalar subquery's join side plus its replacement expression."""
 
     plan: LogicalPlanNode
@@ -702,7 +700,7 @@ class _SubqueryPreparer:
         of the value relation while the value columns are taken from below it.
         """
         inner_core, value_exprs = self._peel_values_top(plan.input, True)
-        return replace(plan, input=inner_core), value_exprs
+        return plan.model_copy(update={"input": inner_core}), value_exprs
 
     def _reject_star_values(self, expressions: List[Expression]) -> None:
         """A star projection has no determinate value columns."""
@@ -862,7 +860,7 @@ class _SubqueryPreparer:
         stripped_input = self._strip(plan.input)
         crossing = self.pulled[before:]
         if len(crossing) == 0:
-            return replace(plan, input=stripped_input)
+            return plan.model_copy(update={"input": stripped_input})
         return self._widen_aggregate(plan, stripped_input, crossing, before)
 
     def _widen_aggregate(
@@ -1004,7 +1002,9 @@ class _SubqueryPreparer:
         if not isinstance(expr, WindowExpr) or len(keys) == 0:
             return expr
         self._reject_non_equi_window()
-        return replace(expr, partition_by=list(keys) + list(expr.partition_by))
+        return expr.model_copy(
+            update={"partition_by": list(keys) + list(expr.partition_by)}
+        )
 
     def _reject_non_equi_window(self) -> None:
         """A correlated window only lifts to PARTITION BY under equi-correlation."""
@@ -1516,7 +1516,7 @@ class Decorrelator:
         for expr in node.expressions:
             rewritten, plan = self._rewrite_value_expr(expr, plan)
             expressions.append(rewritten)
-        return replace(node, input=plan, expressions=expressions)
+        return node.model_copy(update={"input": plan, "expressions": expressions})
 
     def _rewrite_sort(self, node: Sort) -> LogicalPlanNode:
         """Rewrite sort keys; prune helper columns added for subqueries."""
@@ -1740,9 +1740,9 @@ class Decorrelator:
     ) -> LogicalPlanNode:
         """Rename a single-column subquery body's output to ``value_name``."""
         if isinstance(node, Projection):
-            return replace(node, aliases=[value_name])
+            return node.model_copy(update={"aliases": [value_name]})
         if isinstance(node, Aggregate):
-            return replace(node, output_names=[value_name])
+            return node.model_copy(update={"output_names": [value_name]})
         if isinstance(node, (Limit, Sort, Filter)):
             inner = self._project_lateral_value(node.input, value_name)
             return node.with_children([inner])

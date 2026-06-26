@@ -3,15 +3,25 @@
 ## In progress: migrate all state types off @dataclass to pydantic.BaseModel
 
 Final design decision (see CLAUDE.md / AGENTS.md): no dataclasses; state types are
-plain (mutable) Pydantic models; copy-with-change via `model_copy`. Status:
-- [x] Logical plan layer (`plan/logical.py`, 17 nodes) - done, suite green.
-- [ ] Expression layer (`plan/expressions.py`, 17 nodes).
-- [ ] Physical layer (`plan/physical.py`, ~24 nodes).
-- [ ] Value types: `config/config.py`, `datasources/base.py`, `catalog/schema.py`,
-      `optimizer/decorrelation.py` (3 local), processor contexts, `physical_planner.py`.
-- [ ] Remove the temporary `plan/transform.py::replace` bridge (move call sites to
-      `model_copy`) once every layer is migrated.
-- [ ] Add a lint test that fails on any `@dataclass` / `import dataclasses`.
+plain (mutable) Pydantic models; copy-with-change via `model_copy`. COMPLETE.
+- [x] Shared base `federated_query/model.py::StateModel` (keyword-only Pydantic
+      base with `arbitrary_types_allowed`), reused by every layer.
+- [x] Logical plan layer (`plan/logical.py`, 17 nodes).
+- [x] Expression layer (`plan/expressions.py`, 17 nodes). Cross-layer `subquery`
+      fields are typed `Any` to avoid the logical<->expressions import cycle.
+- [x] Physical layer (`plan/physical.py`, 24 nodes). Runtime caches (`_schema`,
+      `_merge_engine`, `_cached`, `_column_alias_map`) are now Pydantic private
+      attrs; the executor test doubles were made real `PhysicalPlanNode`
+      subclasses so the child-field type contract holds.
+- [x] Value types: `config/config.py`, `datasources/base.py`, `catalog/schema.py`
+      (parent back-refs are private attrs exposed via read-only properties so the
+      object graph stays acyclic), `optimizer/decorrelation.py`,
+      `processor/query_context.py`, `processor/query_preprocessor.py`,
+      `optimizer/physical_planner.py`.
+- [x] Removed the temporary `replace` bridge; all 59 call sites now use
+      `model_copy(update=...)` directly.
+- [x] Lint test `tests/test_no_dataclasses.py` (AST-based) fails on any
+      `@dataclass` / `dataclasses` import anywhere in the package.
 
 ## Overview
 

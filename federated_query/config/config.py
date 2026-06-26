@@ -1,23 +1,24 @@
 """Configuration management for federated query engine."""
 
-from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional
 import yaml
 from pathlib import Path
 
+from pydantic import Field
 
-@dataclass
-class DataSourceConfig:
+from ..model import StateModel
+
+
+class DataSourceConfig(StateModel):
     """Configuration for a single data source."""
 
     name: str
     type: str  # "postgresql", "duckdb", etc.
     config: Dict[str, Any]
-    capabilities: List[str] = field(default_factory=list)
+    capabilities: List[str] = Field(default_factory=list)
 
 
-@dataclass
-class OptimizerConfig:
+class OptimizerConfig(StateModel):
     """Configuration for query optimizer."""
 
     enable_predicate_pushdown: bool = True
@@ -27,8 +28,7 @@ class OptimizerConfig:
     max_join_reorder_size: int = 10  # Use DP for <= this many tables
 
 
-@dataclass
-class ExecutorConfig:
+class ExecutorConfig(StateModel):
     """Configuration for query executor."""
 
     max_memory_mb: int = 1024
@@ -44,8 +44,7 @@ class ExecutorConfig:
     merge_engine_temp_directory: Optional[str] = None
 
 
-@dataclass
-class CostConfig:
+class CostConfig(StateModel):
     """Configuration for cost model."""
 
     cpu_tuple_cost: float = 0.01
@@ -54,14 +53,13 @@ class CostConfig:
     network_rtt_ms: float = 10.0
 
 
-@dataclass
-class Config:
+class Config(StateModel):
     """Main configuration class."""
 
-    datasources: Dict[str, DataSourceConfig] = field(default_factory=dict)
-    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
-    executor: ExecutorConfig = field(default_factory=ExecutorConfig)
-    cost: CostConfig = field(default_factory=CostConfig)
+    datasources: Dict[str, DataSourceConfig] = Field(default_factory=dict)
+    optimizer: OptimizerConfig = Field(default_factory=OptimizerConfig)
+    executor: ExecutorConfig = Field(default_factory=ExecutorConfig)
+    cost: CostConfig = Field(default_factory=CostConfig)
 
 
 def load_config(config_path: str) -> Config:

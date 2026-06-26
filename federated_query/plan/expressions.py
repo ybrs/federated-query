@@ -1,13 +1,11 @@
 """Expression nodes for query plans."""
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, List, Optional, Tuple
 from enum import Enum
 
-if TYPE_CHECKING:
-    from .logical import LogicalPlanNode
+from ..model import StateModel
 
 
 @lru_cache(maxsize=None)
@@ -58,8 +56,9 @@ class DataType(Enum):
     NULL = "NULL"
 
 
-class Expression(ABC):
-    """Base class for all expressions."""
+class Expression(StateModel, ABC):
+    """Base class for all expressions (a mutable Pydantic model, see
+    :class:`~federated_query.model.StateModel`)."""
 
     @abstractmethod
     def get_type(self) -> DataType:
@@ -77,7 +76,6 @@ class Expression(ABC):
         pass
 
 
-@dataclass(frozen=True)
 class ColumnRef(Expression):
     """Column reference expression."""
 
@@ -105,7 +103,6 @@ class ColumnRef(Expression):
         return f"ColumnRef({self.column})"
 
 
-@dataclass(frozen=True)
 class Literal(Expression):
     """Literal value expression."""
 
@@ -166,7 +163,6 @@ class BinaryOpType(Enum):
     REGEX_IMATCH = "~*"  # case-insensitive POSIX regex match
 
 
-@dataclass(frozen=True)
 class BinaryOp(Expression):
     """Binary operation expression."""
 
@@ -221,7 +217,6 @@ class UnaryOpType(Enum):
     IS_NOT_NULL = "IS NOT NULL"
 
 
-@dataclass(frozen=True)
 class UnaryOp(Expression):
     """Unary operation expression."""
 
@@ -245,7 +240,6 @@ class UnaryOp(Expression):
         return f"UnaryOp({self.op.value}, {self.operand})"
 
 
-@dataclass(frozen=True)
 class FunctionCall(Expression):
     """Function call expression."""
 
@@ -292,7 +286,6 @@ class FunctionCall(Expression):
         return f"FunctionCall({self.function_name}, {self.args})"
 
 
-@dataclass(frozen=True)
 class CaseExpr(Expression):
     """CASE expression."""
 
@@ -323,7 +316,6 @@ class CaseExpr(Expression):
         return f"CaseExpr(when_count={len(self.when_clauses)})"
 
 
-@dataclass(frozen=True)
 class InList(Expression):
     """IN list expression."""
 
@@ -347,7 +339,6 @@ class InList(Expression):
         return f"InList(options={len(self.options)})"
 
 
-@dataclass(frozen=True)
 class BetweenExpression(Expression):
     """BETWEEN expression."""
 
@@ -371,7 +362,6 @@ class BetweenExpression(Expression):
         return "BetweenExpression()"
 
 
-@dataclass(frozen=True)
 class Cast(Expression):
     """``CAST(expr AS target_type)`` type conversion.
 
@@ -400,7 +390,6 @@ class Cast(Expression):
         return f"Cast({self.expr} AS {self.target_type})"
 
 
-@dataclass(frozen=True)
 class WindowExpr(Expression):
     """A window function: ``function OVER (PARTITION BY ... ORDER BY ... <frame>)``.
 
@@ -469,7 +458,6 @@ class WindowExpr(Expression):
         return f"WindowExpr({self.function})"
 
 
-@dataclass(frozen=True)
 class Extract(Expression):
     """``EXTRACT(field FROM source)`` date/time field extraction.
 
@@ -496,7 +484,6 @@ class Extract(Expression):
         return f"Extract({self.field} FROM {self.source})"
 
 
-@dataclass(frozen=True)
 class Interval(Expression):
     """An ``INTERVAL 'value unit'`` literal such as ``INTERVAL '30 days'``.
 
@@ -602,11 +589,13 @@ class Quantifier(Enum):
     ALL = "ALL"
 
 
-@dataclass(frozen=True)
 class SubqueryExpression(Expression):
     """Scalar subquery expression."""
 
-    subquery: "LogicalPlanNode"
+    # LogicalPlanNode; typed Any because logical.py imports this module,
+    # so the real type would be a runtime import cycle (it was never
+    # validated as a dataclass field either).
+    subquery: Any
 
     def get_type(self) -> DataType:
         return DataType.NULL
@@ -621,11 +610,13 @@ class SubqueryExpression(Expression):
         return "SubqueryExpression()"
 
 
-@dataclass(frozen=True)
 class ExistsExpression(Expression):
     """EXISTS or NOT EXISTS predicate."""
 
-    subquery: "LogicalPlanNode"
+    # LogicalPlanNode; typed Any because logical.py imports this module,
+    # so the real type would be a runtime import cycle (it was never
+    # validated as a dataclass field either).
+    subquery: Any
     negated: bool = False
 
     def get_type(self) -> DataType:
@@ -643,12 +634,14 @@ class ExistsExpression(Expression):
         return f"{prefix}ExistsExpression()"
 
 
-@dataclass(frozen=True)
 class InSubquery(Expression):
     """IN or NOT IN predicate with subquery."""
 
     value: Expression
-    subquery: "LogicalPlanNode"
+    # LogicalPlanNode; typed Any because logical.py imports this module,
+    # so the real type would be a runtime import cycle (it was never
+    # validated as a dataclass field either).
+    subquery: Any
     negated: bool = False
 
     def get_type(self) -> DataType:
@@ -666,7 +659,6 @@ class InSubquery(Expression):
         return f"{prefix}InSubquery()"
 
 
-@dataclass(frozen=True)
 class TupleExpression(Expression):
     """Row value constructor such as ``(u.city, u.country)``.
 
@@ -694,14 +686,16 @@ class TupleExpression(Expression):
         return f"TupleExpression({len(self.items)} items)"
 
 
-@dataclass(frozen=True)
 class QuantifiedComparison(Expression):
     """Quantified comparison such as > ANY or = ALL."""
 
     operator: BinaryOpType
     quantifier: Quantifier
     left: Expression
-    subquery: "LogicalPlanNode"
+    # LogicalPlanNode; typed Any because logical.py imports this module,
+    # so the real type would be a runtime import cycle (it was never
+    # validated as a dataclass field either).
+    subquery: Any
 
     def get_type(self) -> DataType:
         return DataType.BOOLEAN

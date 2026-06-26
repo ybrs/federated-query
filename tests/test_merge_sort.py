@@ -10,19 +10,21 @@ import pytest
 
 from federated_query.executor.merge_engine import MergeEngine
 from federated_query.plan.expressions import ColumnRef
-from federated_query.plan.physical import PhysicalSort
+from federated_query.plan.physical import PhysicalPlanNode, PhysicalSort
 
 
-class _Node:
+class _Node(PhysicalPlanNode):
     """Minimal physical node replaying a fixed table."""
 
-    def __init__(self, table: pa.Table):
-        """Hold the table to replay."""
-        self._table = table
+    table: pa.Table
+
+    def children(self):
+        """A leaf node has no children."""
+        return []
 
     def schema(self) -> pa.Schema:
         """Return the table schema."""
-        return self._table.schema
+        return self.table.schema
 
     def column_aliases(self):
         """No qualified-name remapping."""
@@ -30,8 +32,12 @@ class _Node:
 
     def execute(self):
         """Yield the table's batches."""
-        for batch in self._table.to_batches():
+        for batch in self.table.to_batches():
             yield batch
+
+    def estimated_cost(self) -> float:
+        """Free; this is a test fixture."""
+        return 0.0
 
 
 @pytest.fixture
@@ -45,7 +51,7 @@ def engine():
 def _sorted_column(engine, table, keys, ascending, nulls_order, column):
     """Run the sort and return the values of one output column in result order."""
     op = PhysicalSort(
-        input=_Node(table),
+        input=_Node(table=table),
         sort_keys=keys,
         ascending=ascending,
         nulls_order=nulls_order,

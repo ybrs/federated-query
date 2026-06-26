@@ -4,8 +4,7 @@ from abc import ABC, abstractmethod
 from typing import List, Optional
 from enum import Enum
 
-from pydantic import BaseModel, ConfigDict
-
+from ..model import StateModel
 from .expressions import Expression
 
 
@@ -47,50 +46,9 @@ class ExplainFormat(Enum):
     JSON = "JSON"
 
 
-def _positional_to_kwargs(node_cls, args, kwargs) -> None:
-    """Place positional construction args into kwargs by declared field order.
-
-    Fails fast on too many args or a positional/keyword collision rather than
-    silently truncating or clobbering.
-    """
-    names = list(node_cls.model_fields)
-    if len(args) > len(names):
-        raise TypeError(
-            f"{node_cls.__name__} takes at most {len(names)} positional "
-            f"arguments but {len(args)} were given"
-        )
-    for index, value in enumerate(args):
-        name = names[index]
-        if name in kwargs:
-            raise TypeError(
-                f"{node_cls.__name__} got multiple values for argument '{name}'"
-            )
-        kwargs[name] = value
-
-
-class LogicalPlanNode(BaseModel):
-    """Base class for logical plan nodes.
-
-    A Pydantic model: fields are declared as annotations (no default = required,
-    enforced by Pydantic), copies use ``model_copy(update=...)`` so a field can
-    never be dropped, and equality is the structural comparison Pydantic derives
-    over every field. ``arbitrary_types_allowed`` lets a node hold Expression and
-    other non-model values.
-    """
-
-    # arbitrary_types_allowed: nodes hold non-model values (Expression, sqlglot).
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    def __init__(self, *args, **kwargs):
-        """Construct from kwargs, or positionally in declared field order.
-
-        Positional args are mapped to field names so the rest of the model is
-        unchanged. Copy-with-change must still use ``model_copy``, never a
-        re-listed constructor.
-        """
-        if args:
-            _positional_to_kwargs(type(self), args, kwargs)
-        super().__init__(**kwargs)
+class LogicalPlanNode(StateModel):
+    """Base class for logical plan nodes (a mutable Pydantic model, see
+    :class:`~federated_query.model.StateModel`)."""
 
     def children(self) -> List["LogicalPlanNode"]:
         """Return child nodes."""

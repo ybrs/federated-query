@@ -54,8 +54,10 @@ class TestFunctionCallColumnExtraction:
         )
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER),
+            left=ColumnRef(
+                table="orders", column="customer_id", data_type=DataType.INTEGER
+            ),
+            right=ColumnRef(table="customers", column="id", data_type=DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
@@ -67,14 +69,18 @@ class TestFunctionCallColumnExtraction:
         # Filter with FunctionCall: ABS(o.amount - c.credit_limit) > 100
         abs_arg = BinaryOp(
             op=BinaryOpType.SUBTRACT,
-            left=ColumnRef(None, "amount", DataType.DECIMAL),
-            right=ColumnRef(None, "credit_limit", DataType.DECIMAL),
+            left=ColumnRef(table=None, column="amount", data_type=DataType.DECIMAL),
+            right=ColumnRef(
+                table=None, column="credit_limit", data_type=DataType.DECIMAL
+            ),
         )
         abs_call = FunctionCall(function_name="ABS", args=[abs_arg])
         predicate = BinaryOp(
-            op=BinaryOpType.GT, left=abs_call, right=Literal(100, DataType.DECIMAL)
+            op=BinaryOpType.GT,
+            left=abs_call,
+            right=Literal(value=100, data_type=DataType.DECIMAL),
         )
-        filter_node = Filter(join, predicate)
+        filter_node = Filter(input=join, predicate=predicate)
 
         rule = PredicatePushdownRule()
         result = rule.apply(filter_node)
@@ -111,8 +117,10 @@ class TestFunctionCallColumnExtraction:
         )
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER),
+            left=ColumnRef(
+                table="orders", column="customer_id", data_type=DataType.INTEGER
+            ),
+            right=ColumnRef(table="customers", column="id", data_type=DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
@@ -125,16 +133,18 @@ class TestFunctionCallColumnExtraction:
         coalesce_call = FunctionCall(
             function_name="COALESCE",
             args=[
-                ColumnRef(None, "priority", DataType.VARCHAR),
-                ColumnRef(None, "default_priority", DataType.VARCHAR),
+                ColumnRef(table=None, column="priority", data_type=DataType.VARCHAR),
+                ColumnRef(
+                    table=None, column="default_priority", data_type=DataType.VARCHAR
+                ),
             ],
         )
         predicate = BinaryOp(
             op=BinaryOpType.EQ,
             left=coalesce_call,
-            right=Literal("high", DataType.VARCHAR),
+            right=Literal(value="high", data_type=DataType.VARCHAR),
         )
-        filter_node = Filter(join, predicate)
+        filter_node = Filter(input=join, predicate=predicate)
 
         rule = PredicatePushdownRule()
         result = rule.apply(filter_node)
@@ -166,8 +176,10 @@ class TestFunctionCallColumnExtraction:
         )
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER),
+            left=ColumnRef(
+                table="orders", column="customer_id", data_type=DataType.INTEGER
+            ),
+            right=ColumnRef(table="customers", column="id", data_type=DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
@@ -178,12 +190,15 @@ class TestFunctionCallColumnExtraction:
 
         # UPPER(c.name) = 'ACME'
         upper_call = FunctionCall(
-            function_name="UPPER", args=[ColumnRef(None, "name", DataType.VARCHAR)]
+            function_name="UPPER",
+            args=[ColumnRef(table=None, column="name", data_type=DataType.VARCHAR)],
         )
         predicate = BinaryOp(
-            op=BinaryOpType.EQ, left=upper_call, right=Literal("ACME", DataType.VARCHAR)
+            op=BinaryOpType.EQ,
+            left=upper_call,
+            right=Literal(value="ACME", data_type=DataType.VARCHAR),
         )
-        filter_node = Filter(join, predicate)
+        filter_node = Filter(input=join, predicate=predicate)
 
         rule = PredicatePushdownRule()
         result = rule.apply(filter_node)
@@ -218,15 +233,17 @@ class TestFilterThroughProjectionBug:
         )
         project = Projection(
             input=scan,
-            expressions=[ColumnRef(None, "id", DataType.INTEGER)],
+            expressions=[
+                ColumnRef(table=None, column="id", data_type=DataType.INTEGER)
+            ],
             aliases=["id"],
         )
         predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(None, "id", DataType.INTEGER),
-            right=Literal(10, DataType.INTEGER),
+            left=ColumnRef(table=None, column="id", data_type=DataType.INTEGER),
+            right=Literal(value=10, data_type=DataType.INTEGER),
         )
-        filter_node = Filter(project, predicate)
+        filter_node = Filter(input=project, predicate=predicate)
 
         rule = PredicatePushdownRule()
         result = rule.apply(filter_node)
@@ -263,15 +280,17 @@ class TestFilterThroughProjectionBug:
         )
         project = Projection(
             input=scan,
-            expressions=[ColumnRef(None, "id", DataType.INTEGER)],
+            expressions=[
+                ColumnRef(table=None, column="id", data_type=DataType.INTEGER)
+            ],
             aliases=["id"],
         )
         predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(None, "age", DataType.INTEGER),
-            right=Literal(18, DataType.INTEGER),
+            left=ColumnRef(table=None, column="age", data_type=DataType.INTEGER),
+            right=Literal(value=18, data_type=DataType.INTEGER),
         )
-        filter_node = Filter(project, predicate)
+        filter_node = Filter(input=project, predicate=predicate)
 
         rule = PredicatePushdownRule()
         result = rule.apply(filter_node)
@@ -311,10 +330,10 @@ class TestColumnDetectionForWrappedJoins:
         )
         left_predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(None, "amount", DataType.DECIMAL),
-            right=Literal(50, DataType.DECIMAL),
+            left=ColumnRef(table=None, column="amount", data_type=DataType.DECIMAL),
+            right=Literal(value=50, data_type=DataType.DECIMAL),
         )
-        left_filtered = Filter(left_scan, left_predicate)
+        left_filtered = Filter(input=left_scan, predicate=left_predicate)
 
         # Right side: bare Scan
         right_scan = Scan(
@@ -326,8 +345,10 @@ class TestColumnDetectionForWrappedJoins:
 
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER),
+            left=ColumnRef(
+                table="orders", column="customer_id", data_type=DataType.INTEGER
+            ),
+            right=ColumnRef(table="customers", column="id", data_type=DataType.INTEGER),
         )
         join = Join(
             left=left_filtered,  # Wrapped in Filter!
@@ -339,10 +360,10 @@ class TestColumnDetectionForWrappedJoins:
         # Filter on right side
         predicate = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("active", DataType.VARCHAR),
+            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            right=Literal(value="active", data_type=DataType.VARCHAR),
         )
-        filter_node = Filter(join, predicate)
+        filter_node = Filter(input=join, predicate=predicate)
 
         rule = PredicatePushdownRule()
         result = rule.apply(filter_node)
@@ -375,8 +396,8 @@ class TestColumnDetectionForWrappedJoins:
         left_project = Projection(
             input=left_scan,
             expressions=[
-                ColumnRef(None, "id", DataType.INTEGER),
-                ColumnRef(None, "customer_id", DataType.INTEGER),
+                ColumnRef(table=None, column="id", data_type=DataType.INTEGER),
+                ColumnRef(table=None, column="customer_id", data_type=DataType.INTEGER),
             ],
             aliases=["id", "customer_id"],
         )
@@ -391,16 +412,18 @@ class TestColumnDetectionForWrappedJoins:
         right_project = Projection(
             input=right_scan,
             expressions=[
-                ColumnRef(None, "id", DataType.INTEGER),
-                ColumnRef(None, "name", DataType.VARCHAR),
+                ColumnRef(table=None, column="id", data_type=DataType.INTEGER),
+                ColumnRef(table=None, column="name", data_type=DataType.VARCHAR),
             ],
             aliases=["id", "name"],
         )
 
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER),
+            left=ColumnRef(
+                table="orders", column="customer_id", data_type=DataType.INTEGER
+            ),
+            right=ColumnRef(table="customers", column="id", data_type=DataType.INTEGER),
         )
         join = Join(
             left=left_project,
@@ -412,10 +435,12 @@ class TestColumnDetectionForWrappedJoins:
         # Filter on left side column
         predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(None, "customer_id", DataType.INTEGER),
-            right=Literal(100, DataType.INTEGER),
+            left=ColumnRef(
+                table=None, column="customer_id", data_type=DataType.INTEGER
+            ),
+            right=Literal(value=100, data_type=DataType.INTEGER),
         )
-        filter_node = Filter(join, predicate)
+        filter_node = Filter(input=join, predicate=predicate)
 
         rule = PredicatePushdownRule()
         result = rule.apply(filter_node)
@@ -471,8 +496,10 @@ class TestTableQualifierBug:
         )
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER),
+            left=ColumnRef(
+                table="orders", column="customer_id", data_type=DataType.INTEGER
+            ),
+            right=ColumnRef(table="customers", column="id", data_type=DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
@@ -484,10 +511,10 @@ class TestTableQualifierBug:
         # Filter: customers.id > 100 (QUALIFIED reference to right side)
         predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef("customers", "id", DataType.INTEGER),
-            right=Literal(100, DataType.INTEGER),
+            left=ColumnRef(table="customers", column="id", data_type=DataType.INTEGER),
+            right=Literal(value=100, data_type=DataType.INTEGER),
         )
-        filter_node = Filter(join, predicate)
+        filter_node = Filter(input=join, predicate=predicate)
 
         rule = PredicatePushdownRule()
         result = rule.apply(filter_node)
@@ -529,8 +556,10 @@ class TestTableQualifierBug:
         )
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER),
+            left=ColumnRef(
+                table="orders", column="customer_id", data_type=DataType.INTEGER
+            ),
+            right=ColumnRef(table="customers", column="id", data_type=DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
@@ -542,10 +571,10 @@ class TestTableQualifierBug:
         # Filter: orders.id > 100 (QUALIFIED reference to left side)
         predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef("orders", "id", DataType.INTEGER),
-            right=Literal(100, DataType.INTEGER),
+            left=ColumnRef(table="orders", column="id", data_type=DataType.INTEGER),
+            right=Literal(value=100, data_type=DataType.INTEGER),
         )
-        filter_node = Filter(join, predicate)
+        filter_node = Filter(input=join, predicate=predicate)
 
         rule = PredicatePushdownRule()
         result = rule.apply(filter_node)
@@ -583,8 +612,10 @@ class TestTableQualifierBug:
         )
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER),
+            left=ColumnRef(
+                table="orders", column="customer_id", data_type=DataType.INTEGER
+            ),
+            right=ColumnRef(table="customers", column="id", data_type=DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
@@ -596,10 +627,12 @@ class TestTableQualifierBug:
         # Filter: id > 100 (UNQUALIFIED - ambiguous!)
         predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(None, "id", DataType.INTEGER),  # No table qualifier!
-            right=Literal(100, DataType.INTEGER),
+            left=ColumnRef(
+                table=None, column="id", data_type=DataType.INTEGER
+            ),  # No table qualifier!
+            right=Literal(value=100, data_type=DataType.INTEGER),
         )
-        filter_node = Filter(join, predicate)
+        filter_node = Filter(input=join, predicate=predicate)
 
         rule = PredicatePushdownRule()
         result = rule.apply(filter_node)
@@ -632,8 +665,10 @@ class TestTableQualifierBug:
         )
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER),
+            left=ColumnRef(
+                table="orders", column="customer_id", data_type=DataType.INTEGER
+            ),
+            right=ColumnRef(table="customers", column="id", data_type=DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
@@ -645,13 +680,17 @@ class TestTableQualifierBug:
         # orders.amount + customers.credit_limit > 1000
         sum_expr = BinaryOp(
             op=BinaryOpType.ADD,
-            left=ColumnRef("orders", "amount", DataType.DECIMAL),
-            right=ColumnRef("customers", "credit_limit", DataType.DECIMAL),
+            left=ColumnRef(table="orders", column="amount", data_type=DataType.DECIMAL),
+            right=ColumnRef(
+                table="customers", column="credit_limit", data_type=DataType.DECIMAL
+            ),
         )
         predicate = BinaryOp(
-            op=BinaryOpType.GT, left=sum_expr, right=Literal(1000, DataType.DECIMAL)
+            op=BinaryOpType.GT,
+            left=sum_expr,
+            right=Literal(value=1000, data_type=DataType.DECIMAL),
         )
-        filter_node = Filter(join, predicate)
+        filter_node = Filter(input=join, predicate=predicate)
 
         rule = PredicatePushdownRule()
         result = rule.apply(filter_node)
@@ -696,10 +735,10 @@ class TestTableAliasBug:
         # Filter: u.age > 18 (uses alias "u")
         predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef("u", "age", DataType.INTEGER),
-            right=Literal(18, DataType.INTEGER),
+            left=ColumnRef(table="u", column="age", data_type=DataType.INTEGER),
+            right=Literal(value=18, data_type=DataType.INTEGER),
         )
-        filter_node = Filter(scan, predicate)
+        filter_node = Filter(input=scan, predicate=predicate)
 
         rule = PredicatePushdownRule()
         result = rule.apply(filter_node)
@@ -736,8 +775,8 @@ class TestTableAliasBug:
         )
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("o", "customer_id", DataType.INTEGER),
-            right=ColumnRef("c", "id", DataType.INTEGER),
+            left=ColumnRef(table="o", column="customer_id", data_type=DataType.INTEGER),
+            right=ColumnRef(table="c", column="id", data_type=DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
@@ -749,10 +788,10 @@ class TestTableAliasBug:
         # Filter: o.amount > 100 (uses alias "o")
         predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef("o", "amount", DataType.DECIMAL),
-            right=Literal(100, DataType.DECIMAL),
+            left=ColumnRef(table="o", column="amount", data_type=DataType.DECIMAL),
+            right=Literal(value=100, data_type=DataType.DECIMAL),
         )
-        filter_node = Filter(join, predicate)
+        filter_node = Filter(input=join, predicate=predicate)
 
         rule = PredicatePushdownRule()
         result = rule.apply(filter_node)
@@ -790,8 +829,8 @@ class TestTableAliasBug:
         )
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("o", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER),
+            left=ColumnRef(table="o", column="customer_id", data_type=DataType.INTEGER),
+            right=ColumnRef(table="customers", column="id", data_type=DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
@@ -803,16 +842,18 @@ class TestTableAliasBug:
         # Filter: o.amount > 100 AND customers.status = 'active'
         left_pred = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef("o", "amount", DataType.DECIMAL),
-            right=Literal(100, DataType.DECIMAL),
+            left=ColumnRef(table="o", column="amount", data_type=DataType.DECIMAL),
+            right=Literal(value=100, data_type=DataType.DECIMAL),
         )
         right_pred = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("customers", "status", DataType.VARCHAR),
-            right=Literal("active", DataType.VARCHAR),
+            left=ColumnRef(
+                table="customers", column="status", data_type=DataType.VARCHAR
+            ),
+            right=Literal(value="active", data_type=DataType.VARCHAR),
         )
         predicate = BinaryOp(op=BinaryOpType.AND, left=left_pred, right=right_pred)
-        filter_node = Filter(join, predicate)
+        filter_node = Filter(input=join, predicate=predicate)
 
         rule = PredicatePushdownRule()
         result = rule.apply(filter_node)
@@ -866,8 +907,8 @@ class TestColumnPruningJoinKeyBug:
         # Join condition: u.id = o.user_id
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("u", "id", DataType.INTEGER),
-            right=ColumnRef("o", "user_id", DataType.INTEGER),
+            left=ColumnRef(table="u", column="id", data_type=DataType.INTEGER),
+            right=ColumnRef(table="o", column="user_id", data_type=DataType.INTEGER),
         )
 
         join = Join(
@@ -880,7 +921,9 @@ class TestColumnPruningJoinKeyBug:
         # Projection: SELECT u.name (only projects name, not id!)
         project = Projection(
             input=join,
-            expressions=[ColumnRef("u", "name", DataType.VARCHAR)],
+            expressions=[
+                ColumnRef(table="u", column="name", data_type=DataType.VARCHAR)
+            ],
             aliases=["name"],
         )
 
@@ -944,8 +987,8 @@ class TestColumnPruningJoinKeyBug:
         # Join condition: u.id = o.user_id
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("u", "id", DataType.INTEGER),
-            right=ColumnRef("o", "user_id", DataType.INTEGER),
+            left=ColumnRef(table="u", column="id", data_type=DataType.INTEGER),
+            right=ColumnRef(table="o", column="user_id", data_type=DataType.INTEGER),
         )
 
         join = Join(
@@ -958,15 +1001,17 @@ class TestColumnPruningJoinKeyBug:
         # Filter: o.amount > 100
         filter_pred = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef("o", "amount", DataType.DECIMAL),
-            right=Literal(100, DataType.DECIMAL),
+            left=ColumnRef(table="o", column="amount", data_type=DataType.DECIMAL),
+            right=Literal(value=100, data_type=DataType.DECIMAL),
         )
-        filter_node = Filter(join, filter_pred)
+        filter_node = Filter(input=join, predicate=filter_pred)
 
         # Projection: SELECT u.name
         project = Projection(
             input=filter_node,
-            expressions=[ColumnRef("u", "name", DataType.VARCHAR)],
+            expressions=[
+                ColumnRef(table="u", column="name", data_type=DataType.VARCHAR)
+            ],
             aliases=["name"],
         )
 
@@ -1040,8 +1085,8 @@ class TestColumnPruningJoinKeyBug:
         # Join condition: u.id = o.user_id
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("u", "id", DataType.INTEGER),
-            right=ColumnRef("o", "user_id", DataType.INTEGER),
+            left=ColumnRef(table="u", column="id", data_type=DataType.INTEGER),
+            right=ColumnRef(table="o", column="user_id", data_type=DataType.INTEGER),
         )
 
         join = Join(
@@ -1055,8 +1100,8 @@ class TestColumnPruningJoinKeyBug:
         inner_project = Projection(
             input=join,
             expressions=[
-                ColumnRef("u", "name", DataType.VARCHAR),
-                ColumnRef("u", "id", DataType.INTEGER),
+                ColumnRef(table="u", column="name", data_type=DataType.VARCHAR),
+                ColumnRef(table="u", column="id", data_type=DataType.INTEGER),
             ],
             aliases=["name", "id"],
         )
@@ -1064,7 +1109,9 @@ class TestColumnPruningJoinKeyBug:
         # Outer projection: SELECT name
         outer_project = Projection(
             input=inner_project,
-            expressions=[ColumnRef(None, "name", DataType.VARCHAR)],
+            expressions=[
+                ColumnRef(table=None, column="name", data_type=DataType.VARCHAR)
+            ],
             aliases=["name"],
         )
 
@@ -1134,8 +1181,10 @@ class TestAggregateColumnPruningBug:
         # Join condition: c.id = o.customer_id
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("c", "id", DataType.INTEGER),
-            right=ColumnRef("o", "customer_id", DataType.INTEGER),
+            left=ColumnRef(table="c", column="id", data_type=DataType.INTEGER),
+            right=ColumnRef(
+                table="o", column="customer_id", data_type=DataType.INTEGER
+            ),
         )
 
         join = Join(
@@ -1147,8 +1196,10 @@ class TestAggregateColumnPruningBug:
 
         # Aggregate: SELECT c.country, SUM(o.total) GROUP BY c.country
         # For testing purposes, just use column refs for aggregates
-        group_by_expr = ColumnRef("c", "country", DataType.VARCHAR)
-        sum_expr = ColumnRef("o", "total", DataType.DECIMAL)
+        group_by_expr = ColumnRef(
+            table="c", column="country", data_type=DataType.VARCHAR
+        )
+        sum_expr = ColumnRef(table="o", column="total", data_type=DataType.DECIMAL)
 
         aggregate = Aggregate(
             input=join,
@@ -1207,14 +1258,14 @@ class TestAggregateColumnPruningBug:
         # Filter: WHERE status = 'pending'
         filter_pred = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("pending", DataType.VARCHAR),
+            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            right=Literal(value="pending", data_type=DataType.VARCHAR),
         )
-        filter_node = Filter(scan, filter_pred)
+        filter_node = Filter(input=scan, predicate=filter_pred)
 
         # Aggregate: SELECT COUNT(*)
         # For testing purposes, use a simple literal for COUNT(*)
-        count_expr = Literal(1, DataType.INTEGER)
+        count_expr = Literal(value=1, data_type=DataType.INTEGER)
 
         aggregate = Aggregate(
             input=filter_node,
@@ -1278,8 +1329,10 @@ class TestAggregateColumnPruningBug:
         # Join condition: c.id = o.customer_id
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("c", "id", DataType.INTEGER),
-            right=ColumnRef("o", "customer_id", DataType.INTEGER),
+            left=ColumnRef(table="c", column="id", data_type=DataType.INTEGER),
+            right=ColumnRef(
+                table="o", column="customer_id", data_type=DataType.INTEGER
+            ),
         )
 
         join = Join(
@@ -1292,14 +1345,16 @@ class TestAggregateColumnPruningBug:
         # Filter: WHERE o.status = 'completed'
         filter_pred = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("o", "status", DataType.VARCHAR),
-            right=Literal("completed", DataType.VARCHAR),
+            left=ColumnRef(table="o", column="status", data_type=DataType.VARCHAR),
+            right=Literal(value="completed", data_type=DataType.VARCHAR),
         )
-        filter_node = Filter(join, filter_pred)
+        filter_node = Filter(input=join, predicate=filter_pred)
 
         # Aggregate: SELECT c.country, COUNT(*) GROUP BY c.country
-        group_by_expr = ColumnRef("c", "country", DataType.VARCHAR)
-        count_expr = Literal(1, DataType.INTEGER)  # COUNT(*)
+        group_by_expr = ColumnRef(
+            table="c", column="country", data_type=DataType.VARCHAR
+        )
+        count_expr = Literal(value=1, data_type=DataType.INTEGER)  # COUNT(*)
 
         aggregate = Aggregate(
             input=filter_node,
@@ -1376,10 +1431,10 @@ class TestParserAliasNotPopulatedBug:
         # Filter uses alias "u" (as parser would create)
         predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef("u", "age", DataType.INTEGER),
-            right=Literal(18, DataType.INTEGER),
+            left=ColumnRef(table="u", column="age", data_type=DataType.INTEGER),
+            right=Literal(value=18, data_type=DataType.INTEGER),
         )
-        filter_node = Filter(scan, predicate)
+        filter_node = Filter(input=scan, predicate=predicate)
 
         rule = PredicatePushdownRule()
         result = rule.apply(filter_node)
@@ -1423,8 +1478,8 @@ class TestParserAliasNotPopulatedBug:
         # Join condition uses aliases "o" and "c"
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("o", "customer_id", DataType.INTEGER),
-            right=ColumnRef("c", "id", DataType.INTEGER),
+            left=ColumnRef(table="o", column="customer_id", data_type=DataType.INTEGER),
+            right=ColumnRef(table="c", column="id", data_type=DataType.INTEGER),
         )
 
         join = Join(
@@ -1437,10 +1492,10 @@ class TestParserAliasNotPopulatedBug:
         # Filter uses alias "o"
         predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef("o", "amount", DataType.DECIMAL),
-            right=Literal(100, DataType.DECIMAL),
+            left=ColumnRef(table="o", column="amount", data_type=DataType.DECIMAL),
+            right=Literal(value=100, data_type=DataType.DECIMAL),
         )
-        filter_node = Filter(join, predicate)
+        filter_node = Filter(input=join, predicate=predicate)
 
         rule = PredicatePushdownRule()
         result = rule.apply(filter_node)
@@ -1484,8 +1539,10 @@ class TestParserAliasNotPopulatedBug:
         # Join condition uses aliases "c" and "o"
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("c", "id", DataType.INTEGER),
-            right=ColumnRef("o", "customer_id", DataType.INTEGER),
+            left=ColumnRef(table="c", column="id", data_type=DataType.INTEGER),
+            right=ColumnRef(
+                table="o", column="customer_id", data_type=DataType.INTEGER
+            ),
         )
 
         join = Join(
@@ -1496,8 +1553,10 @@ class TestParserAliasNotPopulatedBug:
         )
 
         # Aggregate uses aliases
-        group_by_expr = ColumnRef("c", "country", DataType.VARCHAR)
-        sum_expr = ColumnRef("o", "total", DataType.DECIMAL)
+        group_by_expr = ColumnRef(
+            table="c", column="country", data_type=DataType.VARCHAR
+        )
+        sum_expr = ColumnRef(table="o", column="total", data_type=DataType.DECIMAL)
 
         aggregate = Aggregate(
             input=join,
@@ -1556,9 +1615,9 @@ class TestLimitPushdownNotRecursing:
         project = Projection(
             input=scan,
             expressions=[
-                ColumnRef(None, "id", DataType.INTEGER),
-                ColumnRef(None, "name", DataType.VARCHAR),
-                ColumnRef(None, "age", DataType.INTEGER),
+                ColumnRef(table=None, column="id", data_type=DataType.INTEGER),
+                ColumnRef(table=None, column="name", data_type=DataType.VARCHAR),
+                ColumnRef(table=None, column="age", data_type=DataType.INTEGER),
             ],
             aliases=["id", "name", "age"],
         )
@@ -1569,8 +1628,8 @@ class TestLimitPushdownNotRecursing:
         # Filter: WHERE age > 18
         predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(None, "age", DataType.INTEGER),
-            right=Literal(18, DataType.INTEGER),
+            left=ColumnRef(table=None, column="age", data_type=DataType.INTEGER),
+            right=Literal(value=18, data_type=DataType.INTEGER),
         )
         filter_node = Filter(input=limit, predicate=predicate)
 
@@ -1608,8 +1667,8 @@ class TestLimitPushdownNotRecursing:
         left_project = Projection(
             input=left_scan,
             expressions=[
-                ColumnRef(None, "customer_id", DataType.INTEGER),
-                ColumnRef(None, "amount", DataType.DECIMAL),
+                ColumnRef(table=None, column="customer_id", data_type=DataType.INTEGER),
+                ColumnRef(table=None, column="amount", data_type=DataType.DECIMAL),
             ],
             aliases=["customer_id", "amount"],
         )
@@ -1627,8 +1686,10 @@ class TestLimitPushdownNotRecursing:
         # Join
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "customer_id", DataType.INTEGER),
-            right=ColumnRef(None, "id", DataType.INTEGER),
+            left=ColumnRef(
+                table=None, column="customer_id", data_type=DataType.INTEGER
+            ),
+            right=ColumnRef(table=None, column="id", data_type=DataType.INTEGER),
         )
 
         join = Join(
@@ -1672,8 +1733,8 @@ class TestLimitPushdownNotRecursing:
         inner_project = Projection(
             input=inner_scan,
             expressions=[
-                ColumnRef(None, "id", DataType.INTEGER),
-                ColumnRef(None, "price", DataType.DECIMAL),
+                ColumnRef(table=None, column="id", data_type=DataType.INTEGER),
+                ColumnRef(table=None, column="price", data_type=DataType.DECIMAL),
             ],
             aliases=["id", "price"],
         )
@@ -1682,8 +1743,8 @@ class TestLimitPushdownNotRecursing:
 
         inner_predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(None, "price", DataType.DECIMAL),
-            right=Literal(10.0, DataType.DECIMAL),
+            left=ColumnRef(table=None, column="price", data_type=DataType.DECIMAL),
+            right=Literal(value=10.0, data_type=DataType.DECIMAL),
         )
         inner_filter = Filter(input=inner_limit, predicate=inner_predicate)
 
@@ -1698,8 +1759,10 @@ class TestLimitPushdownNotRecursing:
         # Join
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "id", DataType.INTEGER),
-            right=ColumnRef(None, "product_id", DataType.INTEGER),
+            left=ColumnRef(table=None, column="id", data_type=DataType.INTEGER),
+            right=ColumnRef(
+                table=None, column="product_id", data_type=DataType.INTEGER
+            ),
         )
 
         join = Join(
@@ -1712,8 +1775,8 @@ class TestLimitPushdownNotRecursing:
         # Outer filter
         outer_predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(None, "quantity", DataType.INTEGER),
-            right=Literal(5, DataType.INTEGER),
+            left=ColumnRef(table=None, column="quantity", data_type=DataType.INTEGER),
+            right=Literal(value=5, data_type=DataType.INTEGER),
         )
         outer_filter = Filter(input=join, predicate=outer_predicate)
 

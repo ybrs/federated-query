@@ -1,11 +1,11 @@
 """Query context objects shared across middleware and execution."""
 
-from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from ..model import StateModel
 
-@dataclass
-class ColumnMapping:
+
+class ColumnMapping(StateModel):
     """Represents a single output column's naming data."""
 
     internal_name: str

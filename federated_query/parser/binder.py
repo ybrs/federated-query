@@ -1,6 +1,5 @@
 """Binder resolves references and validates types."""
 
-from ..plan.transform import replace
 from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 from ..catalog.catalog import Catalog
 from ..catalog.schema import Table, Column
@@ -56,14 +55,14 @@ class BindingError(Exception):
 def _rebuild_function_call(expr, bound_args, bind_one) -> FunctionCall:
     """Rebuild a bound FunctionCall, preserving every field except the args.
 
-    ``replace`` copies all other fields (is_aggregate, distinct, WITHIN GROUP
+    ``model_copy`` copies all other fields (is_aggregate, distinct, WITHIN GROUP
     info, and any field added later), so binding can never silently drop one.
     ``bind_one`` binds the WITHIN GROUP sort key of an ordered-set aggregate.
     """
     bound_key = None
     if expr.within_group_key is not None:
         bound_key = bind_one(expr.within_group_key)
-    return replace(expr, args=bound_args, within_group_key=bound_key)
+    return expr.model_copy(update={"args": bound_args, "within_group_key": bound_key})
 
 
 # Maps the leading keyword of a SQL CAST target type to the engine DataType.
@@ -224,7 +223,7 @@ class Binder:
             kept = ["*"]
         if kept == scan.columns:
             return scan
-        return replace(scan, columns=kept)
+        return scan.model_copy(update={"columns": kept})
 
     def _resolve_table(self, scan: Scan) -> Table:
         """Resolve table reference."""
@@ -631,12 +630,15 @@ class Binder:
             )
             bind_set = lambda s: self._bind_group_by_expressions(s, table)
 
-        return replace(
-            aggregate,
-            input=bound_input,
-            group_by=bound_group_by,
-            aggregates=bound_aggregates,
-            grouping_sets=self._bind_grouping_sets(aggregate.grouping_sets, bind_set),
+        return aggregate.model_copy(
+            update={
+                "input": bound_input,
+                "group_by": bound_group_by,
+                "aggregates": bound_aggregates,
+                "grouping_sets": self._bind_grouping_sets(
+                    aggregate.grouping_sets, bind_set
+                ),
+            }
         )
 
     def _bind_grouping_sets(self, grouping_sets, bind_set):
@@ -1387,11 +1389,12 @@ class Binder:
         bound_order = []
         for key in expr.order_keys:
             bound_order.append(bind(key))
-        return replace(
-            expr,
-            function=bind(expr.function),
-            partition_by=bound_partition,
-            order_keys=bound_order,
+        return expr.model_copy(
+            update={
+                "function": bind(expr.function),
+                "partition_by": bound_partition,
+                "order_keys": bound_order,
+            }
         )
 
     def __repr__(self) -> str:
@@ -1524,12 +1527,15 @@ class SubqueryPlanBinder:
                 bound_keys.append(self._bind_expr_for(expr, bound_input))
             return bound_keys
 
-        return replace(
-            aggregate,
-            input=bound_input,
-            group_by=bound_group_by,
-            aggregates=bound_aggregates,
-            grouping_sets=self._bind_grouping_sets(aggregate.grouping_sets, bind_set),
+        return aggregate.model_copy(
+            update={
+                "input": bound_input,
+                "group_by": bound_group_by,
+                "aggregates": bound_aggregates,
+                "grouping_sets": self._bind_grouping_sets(
+                    aggregate.grouping_sets, bind_set
+                ),
+            }
         )
 
     def _bind_grouping_sets(self, grouping_sets, bind_set):
@@ -1663,11 +1669,12 @@ class SubqueryPlanBinder:
         order = []
         for key in expr.order_keys:
             order.append(self._bind_expr(key, scopes))
-        return replace(
-            expr,
-            function=self._bind_expr(expr.function, scopes),
-            partition_by=partition,
-            order_keys=order,
+        return expr.model_copy(
+            update={
+                "function": self._bind_expr(expr.function, scopes),
+                "partition_by": partition,
+                "order_keys": order,
+            }
         )
 
     def _bind_special_expr(

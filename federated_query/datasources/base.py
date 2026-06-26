@@ -1,11 +1,12 @@
 """Base data source interface."""
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from typing import List, Dict, Any, Iterator, Optional
 from enum import Enum
 import pyarrow as pa
 import sqlglot
+
+from ..model import StateModel
 
 
 class DataSourceCapability(Enum):
@@ -21,8 +22,7 @@ class DataSourceCapability(Enum):
     ORDER_BY = "order_by"
 
 
-@dataclass
-class ColumnMetadata:
+class ColumnMetadata(StateModel):
     """Metadata about a column."""
 
     name: str
@@ -32,8 +32,7 @@ class ColumnMetadata:
     foreign_key: Optional[str] = None  # Referenced table.column
 
 
-@dataclass
-class TableMetadata:
+class TableMetadata(StateModel):
     """Metadata about a table."""
 
     schema_name: str
@@ -43,17 +42,7 @@ class TableMetadata:
     size_bytes: Optional[int] = None
 
 
-@dataclass
-class TableStatistics:
-    """Statistics about a table."""
-
-    row_count: int
-    total_size_bytes: int
-    column_stats: Dict[str, "ColumnStatistics"]
-
-
-@dataclass
-class ColumnStatistics:
+class ColumnStatistics(StateModel):
     """Statistics about a column."""
 
     num_distinct: int
@@ -61,6 +50,14 @@ class ColumnStatistics:
     avg_width: int  # Average size in bytes
     min_value: Optional[Any] = None
     max_value: Optional[Any] = None
+
+
+class TableStatistics(StateModel):
+    """Statistics about a table."""
+
+    row_count: int
+    total_size_bytes: int
+    column_stats: Dict[str, ColumnStatistics]
 
 
 class DataSource(ABC):

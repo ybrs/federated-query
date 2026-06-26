@@ -48,10 +48,10 @@ class TestPredicatePushdown:
         )
         predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(None, "age", DataType.INTEGER),
-            right=Literal(18, DataType.INTEGER),
+            left=ColumnRef(table=None, column="age", data_type=DataType.INTEGER),
+            right=Literal(value=18, data_type=DataType.INTEGER),
         )
-        filter_node = Filter(scan, predicate)
+        filter_node = Filter(input=scan, predicate=predicate)
 
         rule = PredicatePushdownRule()
         result = rule.apply(filter_node)
@@ -70,16 +70,16 @@ class TestPredicatePushdown:
         )
         predicate1 = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(None, "age", DataType.INTEGER),
-            right=Literal(18, DataType.INTEGER),
+            left=ColumnRef(table=None, column="age", data_type=DataType.INTEGER),
+            right=Literal(value=18, data_type=DataType.INTEGER),
         )
         predicate2 = BinaryOp(
             op=BinaryOpType.LT,
-            left=ColumnRef(None, "age", DataType.INTEGER),
-            right=Literal(65, DataType.INTEGER),
+            left=ColumnRef(table=None, column="age", data_type=DataType.INTEGER),
+            right=Literal(value=65, data_type=DataType.INTEGER),
         )
-        filter1 = Filter(scan, predicate1)
-        filter2 = Filter(filter1, predicate2)
+        filter1 = Filter(input=scan, predicate=predicate1)
+        filter2 = Filter(input=filter1, predicate=predicate2)
 
         rule = PredicatePushdownRule()
         result = rule.apply(filter2)
@@ -98,17 +98,17 @@ class TestPredicatePushdown:
         project = Projection(
             input=scan,
             expressions=[
-                ColumnRef(None, "id", DataType.INTEGER),
-                ColumnRef(None, "age", DataType.INTEGER),
+                ColumnRef(table=None, column="id", data_type=DataType.INTEGER),
+                ColumnRef(table=None, column="age", data_type=DataType.INTEGER),
             ],
             aliases=["id", "age"],
         )
         predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(None, "age", DataType.INTEGER),
-            right=Literal(18, DataType.INTEGER),
+            left=ColumnRef(table=None, column="age", data_type=DataType.INTEGER),
+            right=Literal(value=18, data_type=DataType.INTEGER),
         )
-        filter_node = Filter(project, predicate)
+        filter_node = Filter(input=project, predicate=predicate)
 
         rule = PredicatePushdownRule()
         result = rule.apply(filter_node)
@@ -145,8 +145,10 @@ class TestPredicatePushdown:
         )
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER),
+            left=ColumnRef(
+                table="orders", column="customer_id", data_type=DataType.INTEGER
+            ),
+            right=ColumnRef(table="customers", column="id", data_type=DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
@@ -157,10 +159,10 @@ class TestPredicatePushdown:
 
         predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(None, "amount", DataType.DECIMAL),
-            right=Literal(100, DataType.DECIMAL),
+            left=ColumnRef(table=None, column="amount", data_type=DataType.DECIMAL),
+            right=Literal(value=100, data_type=DataType.DECIMAL),
         )
-        filter_node = Filter(join, predicate)
+        filter_node = Filter(input=join, predicate=predicate)
 
         rule = PredicatePushdownRule()
         result = rule.apply(filter_node)
@@ -185,8 +187,10 @@ class TestPredicatePushdown:
         )
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER),
+            left=ColumnRef(
+                table="orders", column="customer_id", data_type=DataType.INTEGER
+            ),
+            right=ColumnRef(table="customers", column="id", data_type=DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
@@ -197,10 +201,10 @@ class TestPredicatePushdown:
 
         predicate = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("active", DataType.VARCHAR),
+            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            right=Literal(value="active", data_type=DataType.VARCHAR),
         )
-        filter_node = Filter(join, predicate)
+        filter_node = Filter(input=join, predicate=predicate)
 
         rule = PredicatePushdownRule()
         result = rule.apply(filter_node)
@@ -225,8 +229,10 @@ class TestPredicatePushdown:
         )
         join_condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER),
+            left=ColumnRef(
+                table="orders", column="customer_id", data_type=DataType.INTEGER
+            ),
+            right=ColumnRef(table="customers", column="id", data_type=DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
@@ -237,10 +243,12 @@ class TestPredicatePushdown:
 
         predicate = BinaryOp(
             op=BinaryOpType.LT,
-            left=ColumnRef(None, "amount", DataType.DECIMAL),
-            right=ColumnRef(None, "credit_limit", DataType.DECIMAL),
+            left=ColumnRef(table=None, column="amount", data_type=DataType.DECIMAL),
+            right=ColumnRef(
+                table=None, column="credit_limit", data_type=DataType.DECIMAL
+            ),
         )
-        filter_node = Filter(join, predicate)
+        filter_node = Filter(input=join, predicate=predicate)
 
         rule = PredicatePushdownRule()
         result = rule.apply(filter_node)
@@ -256,8 +264,8 @@ class TestProjectionPushdown:
         """Test collecting columns from scan with filter."""
         predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(None, "age", DataType.INTEGER),
-            right=Literal(18, DataType.INTEGER),
+            left=ColumnRef(table=None, column="age", data_type=DataType.INTEGER),
+            right=Literal(value=18, data_type=DataType.INTEGER),
         )
         scan = Scan(
             datasource="test_ds",
@@ -283,8 +291,8 @@ class TestProjectionPushdown:
         project = Projection(
             input=scan,
             expressions=[
-                ColumnRef(None, "id", DataType.INTEGER),
-                ColumnRef(None, "name", DataType.VARCHAR),
+                ColumnRef(table=None, column="id", data_type=DataType.INTEGER),
+                ColumnRef(table=None, column="name", data_type=DataType.VARCHAR),
             ],
             aliases=["id", "name"],
         )
@@ -306,13 +314,15 @@ class TestProjectionPushdown:
         )
         predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(None, "age", DataType.INTEGER),
-            right=Literal(18, DataType.INTEGER),
+            left=ColumnRef(table=None, column="age", data_type=DataType.INTEGER),
+            right=Literal(value=18, data_type=DataType.INTEGER),
         )
-        filter_node = Filter(scan, predicate)
+        filter_node = Filter(input=scan, predicate=predicate)
         project = Projection(
             input=filter_node,
-            expressions=[ColumnRef(None, "name", DataType.VARCHAR)],
+            expressions=[
+                ColumnRef(table=None, column="name", data_type=DataType.VARCHAR)
+            ],
             aliases=["name"],
         )
 
@@ -337,8 +347,8 @@ class TestProjectionPushdown:
         project = Projection(
             input=scan,
             expressions=[
-                ColumnRef(None, "id", DataType.INTEGER),
-                ColumnRef(None, "name", DataType.VARCHAR),
+                ColumnRef(table=None, column="id", data_type=DataType.INTEGER),
+                ColumnRef(table=None, column="name", data_type=DataType.VARCHAR),
             ],
             aliases=["id", "name"],
         )
@@ -353,8 +363,8 @@ class TestProjectionPushdown:
         """Test extracting columns from binary operation."""
         expr = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(None, "age", DataType.INTEGER),
-            right=Literal(18, DataType.INTEGER),
+            left=ColumnRef(table=None, column="age", data_type=DataType.INTEGER),
+            right=Literal(value=18, data_type=DataType.INTEGER),
         )
 
         rule = ProjectionPushdownRule()
@@ -369,13 +379,13 @@ class TestProjectionPushdown:
             op=BinaryOpType.AND,
             left=BinaryOp(
                 op=BinaryOpType.GT,
-                left=ColumnRef(None, "age", DataType.INTEGER),
-                right=Literal(18, DataType.INTEGER),
+                left=ColumnRef(table=None, column="age", data_type=DataType.INTEGER),
+                right=Literal(value=18, data_type=DataType.INTEGER),
             ),
             right=BinaryOp(
                 op=BinaryOpType.EQ,
-                left=ColumnRef(None, "status", DataType.VARCHAR),
-                right=Literal("active", DataType.VARCHAR),
+                left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+                right=Literal(value="active", data_type=DataType.VARCHAR),
             ),
         )
 
@@ -399,10 +409,12 @@ class TestLimitPushdown:
         )
         project = Projection(
             input=scan,
-            expressions=[ColumnRef(None, "id", DataType.INTEGER)],
+            expressions=[
+                ColumnRef(table=None, column="id", data_type=DataType.INTEGER)
+            ],
             aliases=["id"],
         )
-        limit = Limit(project, limit=10)
+        limit = Limit(input=project, limit=10)
 
         rule = LimitPushdownRule()
         result = rule.apply(limit)
@@ -422,11 +434,13 @@ class TestLimitPushdown:
         )
         project = Projection(
             input=scan,
-            expressions=[ColumnRef(None, "id", DataType.INTEGER)],
+            expressions=[
+                ColumnRef(table=None, column="id", data_type=DataType.INTEGER)
+            ],
             aliases=["id"],
             distinct=True,
         )
-        limit = Limit(project, limit=1, offset=1)
+        limit = Limit(input=project, limit=1, offset=1)
 
         rule = LimitPushdownRule()
         result = rule.apply(limit)
@@ -448,11 +462,11 @@ class TestLimitPushdown:
         )
         predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(None, "age", DataType.INTEGER),
-            right=Literal(18, DataType.INTEGER),
+            left=ColumnRef(table=None, column="age", data_type=DataType.INTEGER),
+            right=Literal(value=18, data_type=DataType.INTEGER),
         )
-        filter_node = Filter(scan, predicate)
-        limit = Limit(filter_node, limit=10)
+        filter_node = Filter(input=scan, predicate=predicate)
+        limit = Limit(input=filter_node, limit=10)
 
         rule = LimitPushdownRule()
         result = rule.apply(limit)
@@ -477,7 +491,7 @@ class TestLimitPushdown:
             table_name="users",
             columns=["id", "name"],
         )
-        limit = Limit(scan, limit=10, offset=5)
+        limit = Limit(input=scan, limit=10, offset=5)
 
         rule = LimitPushdownRule()
         result = rule.apply(limit)
@@ -503,12 +517,16 @@ class TestOrderByPushdown:
         )
         project = Projection(
             input=scan,
-            expressions=[ColumnRef(None, "order_id", DataType.INTEGER)],
+            expressions=[
+                ColumnRef(table=None, column="order_id", data_type=DataType.INTEGER)
+            ],
             aliases=["oid"],
         )
         sort = Sort(
             input=project,
-            sort_keys=[ColumnRef(None, "order_id", DataType.INTEGER)],
+            sort_keys=[
+                ColumnRef(table=None, column="order_id", data_type=DataType.INTEGER)
+            ],
             ascending=[True],
             nulls_order=[None],
         )
@@ -531,13 +549,13 @@ class TestOrderByPushdown:
         )
         expr = BinaryOp(
             op=BinaryOpType.ADD,
-            left=ColumnRef(None, "order_id", DataType.INTEGER),
-            right=Literal(100, DataType.INTEGER),
+            left=ColumnRef(table=None, column="order_id", data_type=DataType.INTEGER),
+            right=Literal(value=100, data_type=DataType.INTEGER),
         )
-        project = Projection(scan, [expr], ["oid"])
+        project = Projection(input=scan, expressions=[expr], aliases=["oid"])
         sort = Sort(
             input=project,
-            sort_keys=[ColumnRef(None, "oid", DataType.INTEGER)],
+            sort_keys=[ColumnRef(table=None, column="oid", data_type=DataType.INTEGER)],
             ascending=[True],
             nulls_order=[None],
         )
@@ -568,10 +586,12 @@ class TestOrderByPushdown:
             table_name="customers",
             columns=["id", "name"],
         )
-        join = Join(left, right, JoinType.INNER, None)
+        join = Join(left=left, right=right, join_type=JoinType.INNER, condition=None)
         sort = Sort(
             input=join,
-            sort_keys=[ColumnRef("orders", "id", DataType.INTEGER)],
+            sort_keys=[
+                ColumnRef(table="orders", column="id", data_type=DataType.INTEGER)
+            ],
             ascending=[True],
             nulls_order=[None],
         )
@@ -602,7 +622,9 @@ class TestOrderByPushdown:
                 table_name="orders",
                 columns=["id"],
             ),
-            expressions=[ColumnRef(None, "id", DataType.INTEGER)],
+            expressions=[
+                ColumnRef(table=None, column="id", data_type=DataType.INTEGER)
+            ],
             aliases=["id"],
         )
         right = Projection(
@@ -612,13 +634,17 @@ class TestOrderByPushdown:
                 table_name="customers",
                 columns=["id"],
             ),
-            expressions=[ColumnRef(None, "id", DataType.INTEGER)],
+            expressions=[
+                ColumnRef(table=None, column="id", data_type=DataType.INTEGER)
+            ],
             aliases=["id"],
         )
-        join = Join(left, right, JoinType.INNER, None)
+        join = Join(left=left, right=right, join_type=JoinType.INNER, condition=None)
         sort = Sort(
             input=join,
-            sort_keys=[ColumnRef("orders", "id", DataType.INTEGER)],
+            sort_keys=[
+                ColumnRef(table="orders", column="id", data_type=DataType.INTEGER)
+            ],
             ascending=[True],
             nulls_order=[None],
         )
@@ -648,8 +674,8 @@ class TestOrderByPushdown:
 
         expr = BinaryOp(
             op=BinaryOpType.ADD,
-            left=ColumnRef(None, "amount", DataType.INTEGER),
-            right=Literal(1, DataType.INTEGER),
+            left=ColumnRef(table=None, column="amount", data_type=DataType.INTEGER),
+            right=Literal(value=1, data_type=DataType.INTEGER),
         )
         sort = Sort(
             input=scan,
@@ -676,15 +702,15 @@ class TestOrderByPushdown:
         )
         agg = Aggregate(
             input=scan,
-            group_by=[ColumnRef(None, "cid", DataType.INTEGER)],
+            group_by=[ColumnRef(table=None, column="cid", data_type=DataType.INTEGER)],
             aggregates=[
-                ColumnRef(None, "cid", DataType.INTEGER),
+                ColumnRef(table=None, column="cid", data_type=DataType.INTEGER),
             ],
             output_names=["cid"],
         )
         sort = Sort(
             input=agg,
-            sort_keys=[ColumnRef(None, "cid", DataType.INTEGER)],
+            sort_keys=[ColumnRef(table=None, column="cid", data_type=DataType.INTEGER)],
             ascending=[True],
             nulls_order=[None],
         )
@@ -712,10 +738,10 @@ class TestOrderByPushdown:
             table_name="orders_backup",
             columns=["cid"],
         )
-        union = Union([left, right], distinct=True)
+        union = Union(inputs=[left, right], distinct=True)
         sort = Sort(
             input=union,
-            sort_keys=[ColumnRef(None, "cid", DataType.INTEGER)],
+            sort_keys=[ColumnRef(table=None, column="cid", data_type=DataType.INTEGER)],
             ascending=[True],
             nulls_order=[None],
         )
@@ -744,10 +770,10 @@ class TestRuleBasedOptimizer:
         )
         predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(None, "age", DataType.INTEGER),
-            right=Literal(18, DataType.INTEGER),
+            left=ColumnRef(table=None, column="age", data_type=DataType.INTEGER),
+            right=Literal(value=18, data_type=DataType.INTEGER),
         )
-        filter_node = Filter(scan, predicate)
+        filter_node = Filter(input=scan, predicate=predicate)
 
         optimizer = RuleBasedOptimizer(catalog)
         optimizer.add_rule(PredicatePushdownRule())
@@ -767,10 +793,12 @@ class TestRuleBasedOptimizer:
         )
         project = Projection(
             input=scan,
-            expressions=[ColumnRef(None, "id", DataType.INTEGER)],
+            expressions=[
+                ColumnRef(table=None, column="id", data_type=DataType.INTEGER)
+            ],
             aliases=["id"],
         )
-        limit = Limit(project, limit=10)
+        limit = Limit(input=project, limit=10)
 
         optimizer = RuleBasedOptimizer(catalog)
         optimizer.add_rule(LimitPushdownRule())
@@ -810,16 +838,18 @@ class TestComplexOptimizations:
         )
         predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(None, "age", DataType.INTEGER),
-            right=Literal(18, DataType.INTEGER),
+            left=ColumnRef(table=None, column="age", data_type=DataType.INTEGER),
+            right=Literal(value=18, data_type=DataType.INTEGER),
         )
-        filter_node = Filter(scan, predicate)
+        filter_node = Filter(input=scan, predicate=predicate)
         project = Projection(
             input=filter_node,
-            expressions=[ColumnRef(None, "id", DataType.INTEGER)],
+            expressions=[
+                ColumnRef(table=None, column="id", data_type=DataType.INTEGER)
+            ],
             aliases=["id"],
         )
-        limit = Limit(project, limit=10)
+        limit = Limit(input=project, limit=10)
 
         optimizer = RuleBasedOptimizer(catalog)
         optimizer.add_rule(PredicatePushdownRule())
@@ -839,23 +869,23 @@ class TestComplexOptimizations:
         )
         pred1 = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(None, "age", DataType.INTEGER),
-            right=Literal(18, DataType.INTEGER),
+            left=ColumnRef(table=None, column="age", data_type=DataType.INTEGER),
+            right=Literal(value=18, data_type=DataType.INTEGER),
         )
         pred2 = BinaryOp(
             op=BinaryOpType.LT,
-            left=ColumnRef(None, "age", DataType.INTEGER),
-            right=Literal(65, DataType.INTEGER),
+            left=ColumnRef(table=None, column="age", data_type=DataType.INTEGER),
+            right=Literal(value=65, data_type=DataType.INTEGER),
         )
         pred3 = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("active", DataType.VARCHAR),
+            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            right=Literal(value="active", data_type=DataType.VARCHAR),
         )
 
-        filter1 = Filter(scan, pred1)
-        filter2 = Filter(filter1, pred2)
-        filter3 = Filter(filter2, pred3)
+        filter1 = Filter(input=scan, predicate=pred1)
+        filter2 = Filter(input=filter1, predicate=pred2)
+        filter3 = Filter(input=filter2, predicate=pred3)
 
         optimizer = RuleBasedOptimizer(catalog)
         optimizer.add_rule(PredicatePushdownRule())

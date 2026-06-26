@@ -67,8 +67,8 @@ class TestSelectivityEstimation:
         """Test equality selectivity using statistics."""
         predicate = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("active", DataType.VARCHAR),
+            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            right=Literal(value="active", data_type=DataType.VARCHAR),
         )
         selectivity = cost_model.estimate_selectivity(predicate, table_stats)
         assert selectivity == pytest.approx(1.0 / 5, rel=0.01)
@@ -77,8 +77,10 @@ class TestSelectivityEstimation:
         """Test equality selectivity without statistics."""
         predicate = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "unknown_col", DataType.VARCHAR),
-            right=Literal("value", DataType.VARCHAR),
+            left=ColumnRef(
+                table=None, column="unknown_col", data_type=DataType.VARCHAR
+            ),
+            right=Literal(value="value", data_type=DataType.VARCHAR),
         )
         selectivity = cost_model.estimate_selectivity(predicate, None)
         assert selectivity == 0.1
@@ -87,8 +89,8 @@ class TestSelectivityEstimation:
         """Test inequality selectivity (LT, GT, etc)."""
         predicate = BinaryOp(
             op=BinaryOpType.LT,
-            left=ColumnRef(None, "id", DataType.INTEGER),
-            right=Literal(100, DataType.INTEGER),
+            left=ColumnRef(table=None, column="id", data_type=DataType.INTEGER),
+            right=Literal(value=100, data_type=DataType.INTEGER),
         )
         selectivity = cost_model.estimate_selectivity(predicate, table_stats)
         assert selectivity == 0.33
@@ -97,8 +99,8 @@ class TestSelectivityEstimation:
         """Test not-equal selectivity."""
         predicate = BinaryOp(
             op=BinaryOpType.NEQ,
-            left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("active", DataType.VARCHAR),
+            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            right=Literal(value="active", data_type=DataType.VARCHAR),
         )
         selectivity = cost_model.estimate_selectivity(predicate, table_stats)
         expected = 1.0 - (1.0 / 5)
@@ -108,13 +110,13 @@ class TestSelectivityEstimation:
         """Test AND selectivity (product of operands)."""
         left = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("active", DataType.VARCHAR),
+            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            right=Literal(value="active", data_type=DataType.VARCHAR),
         )
         right = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(None, "id", DataType.INTEGER),
-            right=Literal(100, DataType.INTEGER),
+            left=ColumnRef(table=None, column="id", data_type=DataType.INTEGER),
+            right=Literal(value=100, data_type=DataType.INTEGER),
         )
         predicate = BinaryOp(op=BinaryOpType.AND, left=left, right=right)
 
@@ -126,13 +128,13 @@ class TestSelectivityEstimation:
         """Test OR selectivity."""
         left = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("active", DataType.VARCHAR),
+            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            right=Literal(value="active", data_type=DataType.VARCHAR),
         )
         right = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("pending", DataType.VARCHAR),
+            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            right=Literal(value="pending", data_type=DataType.VARCHAR),
         )
         predicate = BinaryOp(op=BinaryOpType.OR, left=left, right=right)
 
@@ -146,8 +148,8 @@ class TestSelectivityEstimation:
         """Test NOT selectivity."""
         inner = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("active", DataType.VARCHAR),
+            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            right=Literal(value="active", data_type=DataType.VARCHAR),
         )
         predicate = UnaryOp(op=UnaryOpType.NOT, operand=inner)
 
@@ -158,7 +160,8 @@ class TestSelectivityEstimation:
     def test_is_null_selectivity(self, cost_model, table_stats):
         """Test IS NULL selectivity using null_fraction."""
         predicate = UnaryOp(
-            op=UnaryOpType.IS_NULL, operand=ColumnRef(None, "name", DataType.VARCHAR)
+            op=UnaryOpType.IS_NULL,
+            operand=ColumnRef(table=None, column="name", data_type=DataType.VARCHAR),
         )
         selectivity = cost_model.estimate_selectivity(predicate, table_stats)
         assert selectivity == 0.1
@@ -167,7 +170,7 @@ class TestSelectivityEstimation:
         """Test IS NOT NULL selectivity."""
         predicate = UnaryOp(
             op=UnaryOpType.IS_NOT_NULL,
-            operand=ColumnRef(None, "name", DataType.VARCHAR),
+            operand=ColumnRef(table=None, column="name", data_type=DataType.VARCHAR),
         )
         selectivity = cost_model.estimate_selectivity(predicate, table_stats)
         assert selectivity == 0.9
@@ -176,8 +179,8 @@ class TestSelectivityEstimation:
         """Test LIKE selectivity."""
         predicate = BinaryOp(
             op=BinaryOpType.LIKE,
-            left=ColumnRef(None, "name", DataType.VARCHAR),
-            right=Literal("%smith%", DataType.VARCHAR),
+            left=ColumnRef(table=None, column="name", data_type=DataType.VARCHAR),
+            right=Literal(value="%smith%", data_type=DataType.VARCHAR),
         )
         selectivity = cost_model.estimate_selectivity(predicate, table_stats)
         assert selectivity == 0.1
@@ -207,8 +210,8 @@ class TestCardinalityEstimation:
         )
         predicate = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("active", DataType.VARCHAR),
+            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            right=Literal(value="active", data_type=DataType.VARCHAR),
         )
         filter_node = Filter(input=scan, predicate=predicate)
 
@@ -226,7 +229,9 @@ class TestCardinalityEstimation:
         )
         project = Projection(
             input=scan,
-            expressions=[ColumnRef(None, "id", DataType.INTEGER)],
+            expressions=[
+                ColumnRef(table=None, column="id", data_type=DataType.INTEGER)
+            ],
             aliases=["id"],
         )
 
@@ -249,8 +254,10 @@ class TestCardinalityEstimation:
         )
         condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER),
+            left=ColumnRef(
+                table="orders", column="customer_id", data_type=DataType.INTEGER
+            ),
+            right=ColumnRef(table="customers", column="id", data_type=DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
@@ -300,8 +307,10 @@ class TestCardinalityEstimation:
         )
         condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER),
+            left=ColumnRef(
+                table="orders", column="customer_id", data_type=DataType.INTEGER
+            ),
+            right=ColumnRef(table="customers", column="id", data_type=DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
@@ -336,7 +345,9 @@ class TestCardinalityEstimation:
         )
         agg = Aggregate(
             input=scan,
-            group_by=[ColumnRef(None, "customer_id", DataType.INTEGER)],
+            group_by=[
+                ColumnRef(table=None, column="customer_id", data_type=DataType.INTEGER)
+            ],
             aggregates=[],
             output_names=["customer_id"],
         )
@@ -402,8 +413,8 @@ class TestCostModelWithStatistics:
         cost_model = CostModel(cost_config, stats_collector)
         predicate = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("active", DataType.VARCHAR),
+            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            right=Literal(value="active", data_type=DataType.VARCHAR),
         )
         scan = Scan(
             datasource="test_ds",
@@ -443,8 +454,8 @@ class TestOperatorCostEstimation:
         )
         predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(None, "id", DataType.INTEGER),
-            right=Literal(100, DataType.INTEGER),
+            left=ColumnRef(table=None, column="id", data_type=DataType.INTEGER),
+            right=Literal(value=100, data_type=DataType.INTEGER),
         )
         filter_node = Filter(input=scan, predicate=predicate)
 
@@ -463,8 +474,8 @@ class TestOperatorCostEstimation:
         project = Projection(
             input=scan,
             expressions=[
-                ColumnRef(None, "id", DataType.INTEGER),
-                ColumnRef(None, "name", DataType.VARCHAR),
+                ColumnRef(table=None, column="id", data_type=DataType.INTEGER),
+                ColumnRef(table=None, column="name", data_type=DataType.VARCHAR),
             ],
             aliases=["id", "name"],
         )
@@ -489,8 +500,10 @@ class TestOperatorCostEstimation:
         )
         condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER),
+            left=ColumnRef(
+                table="orders", column="customer_id", data_type=DataType.INTEGER
+            ),
+            right=ColumnRef(table="customers", column="id", data_type=DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
@@ -514,7 +527,9 @@ class TestOperatorCostEstimation:
         )
         agg = Aggregate(
             input=scan,
-            group_by=[ColumnRef(None, "customer_id", DataType.INTEGER)],
+            group_by=[
+                ColumnRef(table=None, column="customer_id", data_type=DataType.INTEGER)
+            ],
             aggregates=[],
             output_names=["customer_id"],
         )
@@ -547,13 +562,15 @@ class TestOperatorCostEstimation:
         )
         predicate = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("active", DataType.VARCHAR),
+            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            right=Literal(value="active", data_type=DataType.VARCHAR),
         )
         filter_node = Filter(input=scan, predicate=predicate)
         project = Projection(
             input=filter_node,
-            expressions=[ColumnRef(None, "id", DataType.INTEGER)],
+            expressions=[
+                ColumnRef(table=None, column="id", data_type=DataType.INTEGER)
+            ],
             aliases=["id"],
         )
         limit = Limit(input=project, limit=100)
