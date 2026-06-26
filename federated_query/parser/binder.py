@@ -1,6 +1,6 @@
 """Binder resolves references and validates types."""
 
-from dataclasses import replace
+from ..plan.transform import replace
 from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 from ..catalog.catalog import Catalog
 from ..catalog.schema import Table, Column
@@ -215,7 +215,7 @@ class Binder:
         in this table are dropped here; references that resolve nowhere
         still fail loudly during expression binding.
         """
-        from dataclasses import replace
+        from ..plan.transform import replace
 
         table = self._resolve_table(scan)
         kept = []

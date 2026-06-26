@@ -433,7 +433,7 @@ def _resolve_function_columns(expr, aliases):
     ``replace`` preserves every other field (including the ordered-set WITHIN
     GROUP key, which is also resolved), so no field is silently dropped.
     """
-    from dataclasses import replace
+    from .transform import replace
 
     new_args = []
     for arg in expr.args:
@@ -446,7 +446,7 @@ def _resolve_function_columns(expr, aliases):
 
 def _resolve_window_expr(expr, aliases):
     """Rebuild a WindowExpr with its function/partition/order columns resolved."""
-    from dataclasses import replace
+    from .transform import replace
 
     return replace(
         expr,
@@ -3904,7 +3904,7 @@ class PhysicalLateralJoin(PhysicalPlanNode):
         The filter may be loose (a superset) — the merge engine re-checks the
         exact correlation — so it only shrinks the rows the base source returns.
         """
-        from dataclasses import replace
+        from .transform import replace
 
         if not isinstance(self.base_scan, PhysicalScan):
             return self.base_scan

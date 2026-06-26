@@ -75,13 +75,18 @@ def test_with_children_preserves_all_fields(node):
     assert rebuilt == node
 
 
-def _field_default(field):
-    """Return a dataclass field's default value, or MISSING if it has none."""
-    if field.default is not dataclasses.MISSING:
-        return field.default
-    if field.default_factory is not dataclasses.MISSING:
-        return field.default_factory()
-    return dataclasses.MISSING
+_NO_DEFAULT = object()
+
+
+def _field_default(field_info):
+    """Return a Pydantic field's default value, or _NO_DEFAULT if it is required."""
+    from pydantic_core import PydanticUndefined
+
+    if field_info.default is not PydanticUndefined:
+        return field_info.default
+    if field_info.default_factory is not None:
+        return field_info.default_factory()
+    return _NO_DEFAULT
 
 
 @pytest.mark.parametrize("node", NODES, ids=lambda n: type(n).__name__)
@@ -91,16 +96,16 @@ def test_dropping_any_optional_field_is_detected(node):
     compare unequal, so the equality check in the guard above cannot pass when a
     field is silently dropped.
     """
-    for field in dataclasses.fields(node):
-        default = _field_default(field)
-        if default is dataclasses.MISSING:
+    for name, field_info in type(node).model_fields.items():
+        default = _field_default(field_info)
+        if default is _NO_DEFAULT:
             continue
-        if getattr(node, field.name) == default:
+        if getattr(node, name) == default:
             continue
-        dropped = dataclasses.replace(node, **{field.name: default})
+        dropped = node.model_copy(update={name: default})
         assert (
             dropped != node
-        ), f"a dropped {type(node).__name__}.{field.name} would NOT be detected"
+        ), f"a dropped {type(node).__name__}.{name} would NOT be detected"
 
 
 def test_distinct_on_drop_is_detected():
@@ -141,19 +146,19 @@ def test_every_childed_node_type_is_covered():
     This keeps the guard exhaustive: a newly added node type with a child field
     must be added to NODES, or this test points it out.
     """
-    import dataclasses
     from federated_query.plan import logical
+    from federated_query.plan.logical import LogicalPlanNode
 
     covered = {type(node) for node in NODES}
     child_fields = {"input", "left", "right", "inputs", "child", "cte_plan"}
     missing = []
     for name in dir(logical):
         obj = getattr(logical, name)
-        if not isinstance(obj, type) or not dataclasses.is_dataclass(obj):
+        if not isinstance(obj, type) or not issubclass(obj, LogicalPlanNode):
             continue
-        if not hasattr(obj, "with_children"):
+        if obj is LogicalPlanNode:
             continue
-        field_names = {f.name for f in dataclasses.fields(obj)}
+        field_names = set(obj.model_fields.keys())
         if child_fields & field_names and obj not in covered:
             missing.append(name)
     assert not missing, f"Node types with children not covered by NODES: {missing}"

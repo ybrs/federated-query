@@ -27,7 +27,8 @@ Unsupported patterns raise DecorrelationError. Decorrelation never
 silently skips a subquery.
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+from ..plan.transform import replace
 from typing import Dict, List, Optional, Set, Tuple
 
 from ..plan.logical import (

@@ -1,7 +1,7 @@
 """Optimization rules for logical plans."""
 
 from abc import ABC, abstractmethod
-from dataclasses import replace
+from ..plan.transform import replace
 from typing import List, Optional, TYPE_CHECKING
 from ..plan.logical import (
     LogicalPlanNode,
