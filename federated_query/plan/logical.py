@@ -58,6 +58,20 @@ class LogicalPlanNode(StateModel):
         """Return a copy of this node with different children."""
         raise NotImplementedError
 
+    def _require_child_count(
+        self, children: List["LogicalPlanNode"], expected: int
+    ) -> None:
+        """Raise when with_children is given the wrong arity.
+
+        Uses an explicit raise rather than assert so the check is not stripped
+        under ``python -O`` (which would let an invalid rebuild pass silently).
+        """
+        if len(children) != expected:
+            raise ValueError(
+                f"{type(self).__name__}.with_children expects {expected} "
+                f"child(ren), got {len(children)}"
+            )
+
     def accept(self, visitor):
         """Accept a visitor for the visitor pattern."""
         raise NotImplementedError
@@ -105,7 +119,7 @@ class Scan(LogicalPlanNode):
         return []
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Scan":
-        assert len(children) == 0
+        self._require_child_count(children, 0)
         return self
 
     def accept(self, visitor):
@@ -155,7 +169,7 @@ class Projection(LogicalPlanNode):
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Projection":
-        assert len(children) == 1
+        self._require_child_count(children, 1)
         return self.model_copy(update={"input": children[0]})
 
     def accept(self, visitor):
@@ -190,7 +204,7 @@ class Filter(LogicalPlanNode):
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Filter":
-        assert len(children) == 1
+        self._require_child_count(children, 1)
         return self.model_copy(update={"input": children[0]})
 
     def accept(self, visitor):
@@ -220,7 +234,7 @@ class Join(LogicalPlanNode):
         return [self.left, self.right]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Join":
-        assert len(children) == 2
+        self._require_child_count(children, 2)
         return self.model_copy(update={"left": children[0], "right": children[1]})
 
     def accept(self, visitor):
@@ -253,7 +267,7 @@ class Aggregate(LogicalPlanNode):
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Aggregate":
-        assert len(children) == 1
+        self._require_child_count(children, 1)
         return self.model_copy(update={"input": children[0]})
 
     def accept(self, visitor):
@@ -278,7 +292,7 @@ class Sort(LogicalPlanNode):
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Sort":
-        assert len(children) == 1
+        self._require_child_count(children, 1)
         return self.model_copy(update={"input": children[0]})
 
     def accept(self, visitor):
@@ -306,7 +320,7 @@ class Limit(LogicalPlanNode):
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Limit":
-        assert len(children) == 1
+        self._require_child_count(children, 1)
         return self.model_copy(update={"input": children[0]})
 
     def accept(self, visitor):
@@ -360,7 +374,7 @@ class SetOperation(LogicalPlanNode):
         return [self.left, self.right]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "SetOperation":
-        assert len(children) == 2
+        self._require_child_count(children, 2)
         return self.model_copy(update={"left": children[0], "right": children[1]})
 
     def accept(self, visitor):
@@ -385,7 +399,7 @@ class Explain(LogicalPlanNode):
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Explain":
-        assert len(children) == 1
+        self._require_child_count(children, 1)
         return self.model_copy(update={"input": children[0]})
 
     def accept(self, visitor):
@@ -416,7 +430,7 @@ class CTE(LogicalPlanNode):
         return [self.cte_plan, self.child]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "CTE":
-        assert len(children) == 2
+        self._require_child_count(children, 2)
         return self.model_copy(update={"cte_plan": children[0], "child": children[1]})
 
     def accept(self, visitor):
@@ -448,7 +462,7 @@ class CTERef(LogicalPlanNode):
         return []
 
     def with_children(self, children: List[LogicalPlanNode]) -> "CTERef":
-        assert len(children) == 0
+        self._require_child_count(children, 0)
         return self
 
     def accept(self, visitor):
@@ -475,7 +489,7 @@ class Values(LogicalPlanNode):
         return []
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Values":
-        assert len(children) == 0
+        self._require_child_count(children, 0)
         return self
 
     def accept(self, visitor):
@@ -502,7 +516,7 @@ class SubqueryScan(LogicalPlanNode):
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "SubqueryScan":
-        assert len(children) == 1
+        self._require_child_count(children, 1)
         return self.model_copy(update={"input": children[0]})
 
     def accept(self, visitor):
@@ -531,7 +545,7 @@ class SingleRowGuard(LogicalPlanNode):
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "SingleRowGuard":
-        assert len(children) == 1
+        self._require_child_count(children, 1)
         return self.model_copy(update={"input": children[0]})
 
     def accept(self, visitor):
@@ -565,7 +579,7 @@ class GroupedLimit(LogicalPlanNode):
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "GroupedLimit":
-        assert len(children) == 1
+        self._require_child_count(children, 1)
         return self.model_copy(update={"input": children[0]})
 
     def accept(self, visitor):
@@ -598,7 +612,7 @@ class LateralJoin(LogicalPlanNode):
         return [self.left, self.right]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "LateralJoin":
-        assert len(children) == 2
+        self._require_child_count(children, 2)
         return self.model_copy(update={"left": children[0], "right": children[1]})
 
     def accept(self, visitor):

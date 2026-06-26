@@ -509,6 +509,10 @@ class Parser:
             row = []
             for cell in row_expr.expressions:
                 row.append(self._convert_expression(cell))
+            if rows and len(row) != len(rows[0]):
+                raise UnsupportedSQLError(
+                    "VALUES rows must all have the same number of columns"
+                )
             rows.append(row)
         return rows
 
@@ -516,10 +520,14 @@ class Parser:
         self, values: exp.Values, rows: List[List[Expression]]
     ) -> List[str]:
         """Return VALUES column names from the alias, or column1..N by default."""
+        width = len(rows[0]) if rows else 0
         names = self._values_alias_columns(values)
         if names is not None:
+            if rows and len(names) != width:
+                raise UnsupportedSQLError(
+                    "VALUES column alias count does not match the row width"
+                )
             return names
-        width = len(rows[0]) if rows else 0
         return self._default_value_columns(width)
 
     def _values_alias_columns(self, values: exp.Values) -> Optional[List[str]]:
@@ -1796,7 +1804,15 @@ class Parser:
         return [self._convert_expression(aggregate.this)]
 
     def _within_group_order(self, order: exp.Order) -> Tuple[Expression, bool]:
-        """Return the (key, descending) of a single-column WITHIN GROUP order."""
+        """Return the (key, descending) of a single-column WITHIN GROUP order.
+
+        Only one ORDER BY key is supported; additional keys would be silently
+        dropped, so they fail fast instead.
+        """
+        if len(order.expressions) != 1:
+            raise UnsupportedSQLError(
+                "WITHIN GROUP supports a single ORDER BY key"
+            )
         ordered = order.expressions[0]
         key = self._convert_expression(ordered.this)
         descending = bool(ordered.args.get("desc"))

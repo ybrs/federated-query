@@ -96,6 +96,14 @@ Fixed (all verified to ship a wrong/incomplete result before the fix):
   count mismatch. Now best-effort rename by internal name; internal names never leak.
 - [x] Config: an unknown/typo'd top-level section was silently ignored. Now raises.
 
+Enforcement (lint): `tests/test_expression_walker_exhaustiveness.py` plants sentinel
+columns in every child slot of every compound Expression type and asserts each
+recursive collector (decorrelation `_expression_column_refs`, ProjectionPushdown
+`_extract_columns`, PredicatePushdown `_extract_column_refs`) surfaces them all. A
+new Expression subclass fails the test until classified leaf/subquery/compound. This
+lint caught a further gap the manual audits missed: TupleExpression/WindowExpr were
+dropped by PredicatePushdown column extraction (`(a,b) IN (...)` -> vacuous pushdown).
+
 Left as NOT lie-shipping (validated late but caught LOUDLY downstream, documented):
 - Binder HAVING compound predicate + column-ref-with-None-table: an invalid column
   is rejected by the source / expression evaluator at execution, not at bind.

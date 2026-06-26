@@ -29,6 +29,13 @@ from federated_query.plan.expressions import (
 )
 
 
+def _walk(node):
+    """Yield a plan node and all of its descendants."""
+    yield node
+    for child in node.children():
+        yield from _walk(child)
+
+
 @pytest.fixture
 def catalog():
     """Create test catalog."""
@@ -86,6 +93,43 @@ class TestPredicatePushdown:
 
         assert isinstance(result, Scan)
         assert result.filters is not None
+
+    def test_push_filter_below_join_preserves_using(self):
+        """Pushing a filter below a USING join must keep its USING columns.
+
+        The join was previously rebuilt with a raw Join(...) that dropped the
+        natural/using fields, silently turning a USING join into one with no
+        join condition.
+        """
+        left = Scan(
+            datasource="d",
+            schema_name="public",
+            table_name="users",
+            columns=["id", "age"],
+        )
+        right = Scan(
+            datasource="d",
+            schema_name="public",
+            table_name="orders",
+            columns=["id", "amount"],
+        )
+        join = Join(
+            left=left,
+            right=right,
+            join_type=JoinType.INNER,
+            condition=None,
+            using=["id"],
+        )
+        predicate = BinaryOp(
+            op=BinaryOpType.GT,
+            left=ColumnRef(table=None, column="age", data_type=DataType.INTEGER),
+            right=Literal(value=18, data_type=DataType.INTEGER),
+        )
+        result = PredicatePushdownRule().apply(Filter(input=join, predicate=predicate))
+
+        joins = [node for node in _walk(result) if isinstance(node, Join)]
+        assert len(joins) == 1
+        assert joins[0].using == ["id"]
 
     def test_push_filter_through_project(self):
         """Test pushing filter through projection."""

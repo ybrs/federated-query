@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import sqlglot
@@ -11,6 +10,7 @@ import pytest
 
 from federated_query.catalog import Catalog
 from federated_query.datasources.duckdb import DuckDBDataSource
+from federated_query.model import StateModel
 
 
 class ProxyingDuckDBDataSource(DuckDBDataSource):
@@ -31,8 +31,7 @@ class ProxyingDuckDBDataSource(DuckDBDataSource):
         return self._last_ast
 
 
-@dataclass
-class QueryEnvironment:
+class QueryEnvironment(StateModel):
     """Wrapper containing catalog + datasources for pushdown tests."""
 
     catalog: Catalog

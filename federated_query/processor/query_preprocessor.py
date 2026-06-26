@@ -186,6 +186,8 @@ class QueryPreprocessor:
         pivots = table.args.get("pivots")
         if not pivots:
             return None
+        if len(pivots) > 1:
+            raise UnsupportedSQLError("multiple PIVOT clauses are not supported")
         return pivots[0]
 
     def _reject_unsupported_pivot(self, select: exp.Select, pivot: exp.Pivot) -> None:
@@ -361,6 +363,7 @@ class QueryPreprocessor:
         targets = self._targets_for_wildcard(qualifier, sources)
         excluded = self._excluded_column_names(star)
         replacements = self._replacement_expressions(star)
+        self._reject_unknown_star_names(targets, excluded, replacements)
         columns: List[exp.Expression] = []
         metadata: List[ColumnMapping] = []
         for source in targets:
@@ -385,6 +388,23 @@ class QueryPreprocessor:
                 visible_name=column,
             )
         )
+
+    def _reject_unknown_star_names(self, targets, excluded, replacements) -> None:
+        """Fail fast when EXCLUDE/REPLACE names a column the star does not expand.
+
+        A typo'd name would otherwise match nothing and be silently ignored, so
+        the user's intended exclusion/replacement is dropped with no error.
+        """
+        available = set()
+        for source in targets:
+            for column in source.columns:
+                available.add(column.lower())
+        unknown = (set(excluded) | set(replacements)) - available
+        if unknown:
+            raise UnsupportedSQLError(
+                "SELECT * EXCLUDE/REPLACE names unknown column(s): "
+                f"{', '.join(sorted(unknown))}"
+            )
 
     def _excluded_column_names(self, star: exp.Star) -> set:
         """Return the lowercased column names listed in a star's EXCEPT/EXCLUDE."""

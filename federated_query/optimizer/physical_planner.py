@@ -348,11 +348,25 @@ class PhysicalPlanner:
         )
 
     def _projection_has_window(self, projection: Projection) -> bool:
-        """Whether any projection expression is a window function."""
-        from ..plan.expressions import WindowExpr
+        """Whether any projection expression contains a window function.
 
+        Recurses the expression tree so a window nested inside an expression
+        (e.g. ``row_number() OVER (...) + 1``) still selects PhysicalWindow.
+        """
         for expr in projection.expressions:
-            if isinstance(expr, WindowExpr):
+            if self._expression_has_window(expr):
+                return True
+        return False
+
+    def _expression_has_window(self, expr) -> bool:
+        """Whether an expression tree contains a WindowExpr at any depth."""
+        from ..plan.expressions import WindowExpr
+        from .decorrelation import _expression_children
+
+        if isinstance(expr, WindowExpr):
+            return True
+        for child in _expression_children(expr):
+            if self._expression_has_window(child):
                 return True
         return False
 

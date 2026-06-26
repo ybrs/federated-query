@@ -204,3 +204,23 @@ def test_string_agg_separator_preserved():
     assert len(aggregate.args) == 2
     assert isinstance(aggregate.args[1], Literal)
     assert aggregate.args[1].value == ","
+
+
+def test_within_group_multiple_keys_rejected():
+    """WITHIN GROUP with multiple ORDER BY keys must not silently drop the rest."""
+    with pytest.raises(UnsupportedSQLError, match="WITHIN GROUP"):
+        parse(
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a, b) FROM t"
+        )
+
+
+def test_values_ragged_rows_rejected():
+    """VALUES rows of differing widths must fail, not build a ragged relation."""
+    with pytest.raises(UnsupportedSQLError, match="same number of columns"):
+        parse("SELECT * FROM (VALUES (1, 2), (3)) AS v(a, b)")
+
+
+def test_values_alias_width_mismatch_rejected():
+    """A VALUES column-alias count that does not match the row width must fail."""
+    with pytest.raises(UnsupportedSQLError, match="alias count"):
+        parse("SELECT * FROM (VALUES (1, 2)) AS v(a, b, c)")

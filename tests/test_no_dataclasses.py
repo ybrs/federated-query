@@ -17,11 +17,20 @@ import pathlib
 import federated_query
 
 _PACKAGE_ROOT = pathlib.Path(federated_query.__file__).parent
+_REPO_ROOT = _PACKAGE_ROOT.parent
+_TESTS_ROOT = _REPO_ROOT / "tests"
 
 
 def _python_files():
-    """Every .py file shipped in the federated_query package."""
-    return sorted(_PACKAGE_ROOT.rglob("*.py"))
+    """Every .py file in the package and the test suite.
+
+    The tests are covered too: a ``@dataclass`` in a test fixture (e.g. a
+    conftest) is the same silent field-drop hazard and previously slipped through
+    a package-only scan.
+    """
+    files = list(_PACKAGE_ROOT.rglob("*.py"))
+    files.extend(_TESTS_ROOT.rglob("*.py"))
+    return sorted(files)
 
 
 def _offenders(tree: ast.AST):
@@ -52,13 +61,13 @@ def _decorator_name(decorator: ast.expr):
 
 
 def test_no_dataclasses_in_package():
-    """No module in the package imports dataclasses or uses @dataclass."""
+    """No module in the package or tests imports dataclasses or uses @dataclass."""
     failures = {}
     for path in _python_files():
         tree = ast.parse(path.read_text(), filename=str(path))
         reasons = list(_offenders(tree))
         if reasons:
-            failures[str(path.relative_to(_PACKAGE_ROOT))] = reasons
+            failures[str(path.relative_to(_REPO_ROOT))] = reasons
     assert not failures, "dataclasses found (use StateModel instead):\n" + "\n".join(
         f"  {f}: {', '.join(rs)}" for f, rs in failures.items()
     )

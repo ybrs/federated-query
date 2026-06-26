@@ -86,9 +86,17 @@ class Schema(StateModel):
 
     @model_validator(mode="after")
     def _link_tables(self) -> "Schema":
-        """Point each table back at this schema."""
-        for table in self.tables.values():
+        """Lowercase table keys and point each table back at this schema.
+
+        get_table/add_table key by lowercase name; normalizing here keeps a
+        directly-constructed ``tables`` dict consistent, so a mixed-case key is
+        not silently unreachable via get_table.
+        """
+        normalized = {}
+        for key, table in self.tables.items():
             table._schema = self
+            normalized[key.lower()] = table
+        self.tables = normalized
         return self
 
     def get_table(self, name: str) -> Optional[Table]:

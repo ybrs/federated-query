@@ -301,14 +301,15 @@ class PredicatePushdownRule(OptimizationRule):
         pred_left_only = self._predicate_matches_side(pred_cols, left_cols, right_cols)
         pred_right_only = self._predicate_matches_side(pred_cols, right_cols, left_cols)
 
-        # Only push for INNER joins
+        # Only push for INNER joins. model_copy preserves every other field
+        # (notably NATURAL / USING), which a raw Join(...) rebuild would drop.
         if join.join_type != JoinType.INNER:
             # For outer joins, keep filter above join
-            new_join = Join(
-                left=self._push_down(join.left),
-                right=self._push_down(join.right),
-                join_type=join.join_type,
-                condition=join.condition,
+            new_join = join.model_copy(
+                update={
+                    "left": self._push_down(join.left),
+                    "right": self._push_down(join.right),
+                }
             )
             return Filter(input=new_join, predicate=predicate)
 
@@ -316,24 +317,16 @@ class PredicatePushdownRule(OptimizationRule):
         if pred_left_only:
             new_left = Filter(input=join.left, predicate=predicate)
             new_left = self._push_down(new_left)
-            new_join = Join(
-                left=new_left,
-                right=self._push_down(join.right),
-                join_type=join.join_type,
-                condition=join.condition,
+            return join.model_copy(
+                update={"left": new_left, "right": self._push_down(join.right)}
             )
-            return new_join
 
         if pred_right_only:
             new_right = Filter(input=join.right, predicate=predicate)
             new_right = self._push_down(new_right)
-            new_join = Join(
-                left=self._push_down(join.left),
-                right=new_right,
-                join_type=join.join_type,
-                condition=join.condition,
+            return join.model_copy(
+                update={"left": self._push_down(join.left), "right": new_right}
             )
-            return new_join
 
         # Predicate spans both sides of an INNER join. A cross-side equality is
         # a join key: fold it into the ON condition so a comma/cross join
@@ -341,18 +334,19 @@ class PredicatePushdownRule(OptimizationRule):
         # filter on top. Non-equi cross-side predicates stay as a filter.
         if self._is_equi_predicate(predicate):
             merged_condition = self._merge_join_condition(join.condition, predicate)
-            return Join(
-                left=self._push_down(join.left),
-                right=self._push_down(join.right),
-                join_type=join.join_type,
-                condition=merged_condition,
+            return join.model_copy(
+                update={
+                    "left": self._push_down(join.left),
+                    "right": self._push_down(join.right),
+                    "condition": merged_condition,
+                }
             )
 
-        new_join = Join(
-            left=self._push_down(join.left),
-            right=self._push_down(join.right),
-            join_type=join.join_type,
-            condition=join.condition,
+        new_join = join.model_copy(
+            update={
+                "left": self._push_down(join.left),
+                "right": self._push_down(join.right),
+            }
         )
         return Filter(input=new_join, predicate=predicate)
 
@@ -464,8 +458,14 @@ class PredicatePushdownRule(OptimizationRule):
         return self._container_predicate_children(expr)
 
     def _container_predicate_children(self, expr: Expression) -> list:
-        """Sub-expressions of container predicate nodes (IN / BETWEEN / CASE)."""
-        from ..plan.expressions import InList, BetweenExpression, CaseExpr
+        """Sub-expressions of container predicate nodes (IN/BETWEEN/CASE/tuple/window)."""
+        from ..plan.expressions import (
+            InList,
+            BetweenExpression,
+            CaseExpr,
+            TupleExpression,
+            WindowExpr,
+        )
 
         if isinstance(expr, InList):
             return [expr.value] + list(expr.options)
@@ -473,6 +473,10 @@ class PredicatePushdownRule(OptimizationRule):
             return [expr.value, expr.lower, expr.upper]
         if isinstance(expr, CaseExpr):
             return self._case_predicate_children(expr)
+        if isinstance(expr, TupleExpression):
+            return list(expr.items)
+        if isinstance(expr, WindowExpr):
+            return [expr.function] + list(expr.partition_by) + list(expr.order_keys)
         return []
 
     def _case_predicate_children(self, expr) -> list:

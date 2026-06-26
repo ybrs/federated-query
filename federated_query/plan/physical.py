@@ -406,20 +406,75 @@ def _resolve_window_columns(expr, aliases):
 
 
 def _resolve_window_operands(expr, aliases):
-    """Resolve columns inside a binary/unary expression; pass anything else through."""
-    from .expressions import BinaryOp, UnaryOp
+    """Resolve columns inside a compound expression; pass leaf nodes through."""
+    from .expressions import BinaryOp, UnaryOp, Cast, Extract
 
     if isinstance(expr, BinaryOp):
-        return BinaryOp(
-            op=expr.op,
-            left=_resolve_window_columns(expr.left, aliases),
-            right=_resolve_window_columns(expr.right, aliases),
+        return expr.model_copy(
+            update={
+                "left": _resolve_window_columns(expr.left, aliases),
+                "right": _resolve_window_columns(expr.right, aliases),
+            }
         )
     if isinstance(expr, UnaryOp):
-        return UnaryOp(
-            op=expr.op, operand=_resolve_window_columns(expr.operand, aliases)
+        return expr.model_copy(
+            update={"operand": _resolve_window_columns(expr.operand, aliases)}
         )
+    if isinstance(expr, Cast):
+        return expr.model_copy(
+            update={"expr": _resolve_window_columns(expr.expr, aliases)}
+        )
+    if isinstance(expr, Extract):
+        return expr.model_copy(
+            update={"source": _resolve_window_columns(expr.source, aliases)}
+        )
+    return _resolve_window_containers(expr, aliases)
+
+
+def _resolve_window_containers(expr, aliases):
+    """Resolve columns inside CASE / BETWEEN / IN / tuple operands, else pass through."""
+    from .expressions import CaseExpr, BetweenExpression, InList, TupleExpression
+
+    if isinstance(expr, BetweenExpression):
+        return expr.model_copy(
+            update={
+                "value": _resolve_window_columns(expr.value, aliases),
+                "lower": _resolve_window_columns(expr.lower, aliases),
+                "upper": _resolve_window_columns(expr.upper, aliases),
+            }
+        )
+    if isinstance(expr, InList):
+        return expr.model_copy(
+            update={
+                "value": _resolve_window_columns(expr.value, aliases),
+                "options": _resolve_window_list(expr.options, aliases),
+            }
+        )
+    if isinstance(expr, TupleExpression):
+        return expr.model_copy(
+            update={"items": tuple(_resolve_window_list(expr.items, aliases))}
+        )
+    if isinstance(expr, CaseExpr):
+        return _resolve_window_case(expr, aliases)
     return expr
+
+
+def _resolve_window_case(expr, aliases):
+    """Resolve columns in a CASE expression's branch conditions, results and ELSE."""
+    new_when = []
+    for condition, result in expr.when_clauses:
+        new_when.append(
+            (
+                _resolve_window_columns(condition, aliases),
+                _resolve_window_columns(result, aliases),
+            )
+        )
+    new_else = expr.else_result
+    if new_else is not None:
+        new_else = _resolve_window_columns(new_else, aliases)
+    return expr.model_copy(
+        update={"when_clauses": new_when, "else_result": new_else}
+    )
 
 
 def _resolved_column_ref(expr, aliases):
@@ -1072,11 +1127,15 @@ class PhysicalWindow(PhysicalPlanNode):
         return ", ".join(parts)
 
     def schema(self) -> pa.Schema:
-        """Output schema, read from DuckDB so window result types are exact."""
+        """Output schema, read from DuckDB so window result types are exact.
+
+        Uses an empty table built from the input schema rather than executing
+        the input, so schema()/EXPLAIN never materializes the upstream query.
+        """
         engine = self.merge_engine()
-        materialized = pa.Table.from_batches(list(self.input.execute()))
+        empty_input = self.input.schema().empty_table()
         sql = self._window_sql(self.input.column_aliases())
-        return engine.schema(sql, {_MERGE_WINDOW_RELATION: materialized})
+        return engine.schema(sql, {_MERGE_WINDOW_RELATION: empty_input})
 
     def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
         """Each output column is exposed by its bare output name."""
@@ -2518,9 +2577,17 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         return f"{call} WITHIN GROUP (ORDER BY {order})"
 
     def _render_agg_inner(self, func: "FunctionCall", aliases) -> str:
-        """Render an aggregate's direct arguments (empty for MODE, '*' for COUNT)."""
+        """Render an aggregate's direct arguments (empty for MODE, '*' for COUNT).
+
+        Every direct argument is rendered in order, so a multi-argument
+        aggregate such as ``STRING_AGG(x, ',')`` keeps its separator instead of
+        silently dropping all but the first argument.
+        """
         if func.args:
-            return self._render_agg_expr(func.args[0], aliases)
+            parts = []
+            for arg in func.args:
+                parts.append(self._render_agg_expr(arg, aliases))
+            return ", ".join(parts)
         if func.within_group_key is not None:
             return ""
         return "*"

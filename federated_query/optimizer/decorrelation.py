@@ -1029,12 +1029,22 @@ class _SubqueryPreparer:
         return rewritten
 
     def _partition_window_expr(self, expr, keys):
-        """Prepend correlation keys to a WindowExpr's partition, else pass through."""
-        if not isinstance(expr, WindowExpr) or len(keys) == 0:
+        """Prepend correlation keys to every WindowExpr partition in the tree.
+
+        A window nested inside an expression (``rank() OVER (...) + 1``) must be
+        partitioned too, so the tree is rebuilt and every WindowExpr at any depth
+        is lifted, not just a top-level one.
+        """
+        if len(keys) == 0:
             return expr
+        rebuilt = _rebuild_expression(
+            expr, lambda child: self._partition_window_expr(child, keys)
+        )
+        if not isinstance(rebuilt, WindowExpr):
+            return rebuilt
         self._reject_non_equi_window()
-        return expr.model_copy(
-            update={"partition_by": list(keys) + list(expr.partition_by)}
+        return rebuilt.model_copy(
+            update={"partition_by": list(keys) + list(rebuilt.partition_by)}
         )
 
     def _reject_non_equi_window(self) -> None:
