@@ -258,7 +258,7 @@ class Binder:
             return self._bind_having_predicate(predicate, bound_input)
         if isinstance(bound_input, Join):
             tables = self._get_tables_from_join(bound_input.left, bound_input.right)
-            return self._bind_join_condition(predicate, tables)
+            return self._bind_expression_multi_table(predicate, tables)
         table = self._get_table_from_plan(bound_input)
         return self._bind_expression(predicate, table)
 
@@ -489,53 +489,11 @@ class Binder:
     def _bind_expression_multi_table(
         self, expr: Expression, tables: Dict[Optional[str], Table]
     ) -> Expression:
-        """Bind expression with multiple tables."""
-        if isinstance(expr, ColumnRef):
-            return self._bind_column_ref_multi_table(expr, tables)
-        if isinstance(expr, Literal):
-            return expr
-        if isinstance(expr, BinaryOp):
-            left = self._bind_expression_multi_table(expr.left, tables)
-            right = self._bind_expression_multi_table(expr.right, tables)
-            return BinaryOp(op=expr.op, left=left, right=right)
-        if isinstance(expr, UnaryOp):
-            operand = self._bind_expression_multi_table(expr.operand, tables)
-            return UnaryOp(op=expr.op, operand=operand)
-        if isinstance(expr, InList):
-            return self._bind_in_list_multi(expr, tables)
-        if isinstance(expr, BetweenExpression):
-            return self._bind_between_multi(expr, tables)
-        if isinstance(expr, CaseExpr):
-            return self._bind_case_expr_multi(expr, tables)
-        if isinstance(expr, Cast):
-            return self._bind_cast(
-                expr, lambda value: self._bind_expression_multi_table(value, tables)
-            )
-        if isinstance(expr, Extract):
-            return self._bind_extract(
-                expr, lambda value: self._bind_expression_multi_table(value, tables)
-            )
-        if isinstance(expr, Interval):
-            return expr
-        if isinstance(expr, FunctionCall):
-            return self._bind_function_args(
-                expr, lambda value: self._bind_expression_multi_table(value, tables)
-            )
-        if isinstance(expr, WindowExpr):
-            return self._bind_window_expr(
-                expr, lambda value: self._bind_expression_multi_table(value, tables)
-            )
-        if self._is_subquery_expression(expr):
-            return self._bind_subquery_expr(
-                expr, lambda value: self._bind_expression_multi_table(value, tables)
-            )
-        if isinstance(expr, TupleExpression):
-            return self._bind_tuple(
-                expr, lambda value: self._bind_expression_multi_table(value, tables)
-            )
-
-        raise BindingError(
-            f"Unsupported expression in multi-table context: {type(expr).__name__}"
+        """Bind an expression against the join tables, then enclosing scopes."""
+        return self._bind_expr_dispatch(
+            expr,
+            lambda value: self._bind_expression_multi_table(value, tables),
+            lambda col_ref: self._bind_column_ref_multi_table(col_ref, tables),
         )
 
     def _bind_limit(self, limit: Limit) -> Limit:
@@ -553,7 +511,9 @@ class Binder:
             self._push_scope_for(bound_left, bound_right)
             try:
                 tables = self._get_tables_from_join(bound_left, bound_right)
-                bound_condition = self._bind_join_condition(join.condition, tables)
+                bound_condition = self._bind_expression_multi_table(
+                    join.condition, tables
+                )
             finally:
                 self._pop_scope()
 
@@ -1021,32 +981,6 @@ class Binder:
 
         return tables
 
-    def _bind_join_condition(
-        self, condition: Expression, tables: Dict[Optional[str], Table]
-    ) -> Expression:
-        """Bind join condition with multiple tables."""
-        if isinstance(condition, ColumnRef):
-            return self._bind_column_ref_multi_table(condition, tables)
-        if isinstance(condition, Literal):
-            return condition
-        if isinstance(condition, BinaryOp):
-            left = self._bind_join_condition(condition.left, tables)
-            right = self._bind_join_condition(condition.right, tables)
-            return BinaryOp(op=condition.op, left=left, right=right)
-        if isinstance(condition, UnaryOp):
-            operand = self._bind_join_condition(condition.operand, tables)
-            return UnaryOp(op=condition.op, operand=operand)
-        if self._is_subquery_expression(condition):
-            return self._bind_subquery_expr(
-                condition,
-                lambda value: self._bind_join_condition(value, tables),
-            )
-
-        # IN / BETWEEN / CASE / FunctionCall / Cast / Extract / Tuple etc. are
-        # legal in a join's ON / WHERE; route them through the full multi-table
-        # binder so the columns inside are resolved, never returned unbound.
-        return self._bind_expression_multi_table(condition, tables)
-
     def _bind_column_ref_multi_table(
         self, col_ref: ColumnRef, tables: Dict[Optional[str], Table]
     ) -> ColumnRef:
@@ -1149,48 +1083,62 @@ class Binder:
         return bound
 
     def _bind_expression(self, expr: Expression, table: Optional[Table]) -> Expression:
-        """Bind an expression."""
-        if isinstance(expr, ColumnRef):
-            return self._bind_column_ref(expr, table)
-        if isinstance(expr, Literal):
-            return expr
-        if isinstance(expr, BinaryOp):
-            return self._bind_binary_op(expr, table)
-        if isinstance(expr, UnaryOp):
-            return self._bind_unary_op(expr, table)
-        if isinstance(expr, InList):
-            return self._bind_in_list(expr, table)
-        if isinstance(expr, BetweenExpression):
-            return self._bind_between(expr, table)
-        if isinstance(expr, CaseExpr):
-            return self._bind_case_expr(expr, table)
-        if isinstance(expr, Cast):
-            return self._bind_cast(
-                expr, lambda value: self._bind_expression(value, table)
-            )
-        if isinstance(expr, Extract):
-            return self._bind_extract(
-                expr, lambda value: self._bind_expression(value, table)
-            )
-        if isinstance(expr, Interval):
-            return expr
-        if isinstance(expr, FunctionCall):
-            return self._bind_function_args(
-                expr, lambda value: self._bind_expression(value, table)
-            )
-        if isinstance(expr, WindowExpr):
-            return self._bind_window_expr(
-                expr, lambda value: self._bind_expression(value, table)
-            )
-        if self._is_subquery_expression(expr):
-            return self._bind_subquery_expr(
-                expr, lambda value: self._bind_expression(value, table)
-            )
-        if isinstance(expr, TupleExpression):
-            return self._bind_tuple(
-                expr, lambda value: self._bind_expression(value, table)
-            )
+        """Bind an expression against a single known table (deferral leaf)."""
+        return self._bind_expr_dispatch(
+            expr,
+            lambda value: self._bind_expression(value, table),
+            lambda col_ref: self._bind_column_ref(col_ref, table),
+        )
 
+    def _bind_expr_dispatch(
+        self,
+        expr: Expression,
+        bind: Callable[[Expression], Expression],
+        resolve_column: Callable[[ColumnRef], Expression],
+        subquery_scopes: Optional[List[Dict[str, Table]]] = None,
+    ) -> Expression:
+        """Bind one expression: resolve a column leaf, rebuild a compound node.
+
+        The ONLY things that differ between the single-table, multi-table, and
+        subquery binders are ``resolve_column`` (the column leaf), ``bind`` (how
+        children recurse), and ``subquery_scopes`` (the scopes a nested subquery
+        sees, defaulting to the live scope stack); the dispatch is shared by all.
+        """
+        if isinstance(expr, ColumnRef):
+            return resolve_column(expr)
+        if isinstance(expr, (Literal, Interval)):
+            return expr
+        return self._bind_compound_expr(expr, bind, subquery_scopes)
+
+    def _bind_compound_expr(
+        self,
+        expr: Expression,
+        bind: Callable[[Expression], Expression],
+        subquery_scopes: Optional[List[Dict[str, Table]]] = None,
+    ) -> Expression:
+        """Rebuild a compound expression by binding its children with ``bind``."""
+        if isinstance(expr, BinaryOp):
+            return self._bind_binary_op(expr, bind)
+        if isinstance(expr, UnaryOp):
+            return self._bind_unary_op(expr, bind)
+        if isinstance(expr, InList):
+            return self._bind_in_list(expr, bind)
+        if isinstance(expr, BetweenExpression):
+            return self._bind_between(expr, bind)
+        if isinstance(expr, CaseExpr):
+            return self._bind_case_expr(expr, bind)
+        if isinstance(expr, Cast):
+            return self._bind_cast(expr, bind)
+        if isinstance(expr, Extract):
+            return self._bind_extract(expr, bind)
+        if isinstance(expr, FunctionCall):
+            return self._bind_function_args(expr, bind)
+        if isinstance(expr, WindowExpr):
+            return self._bind_window_expr(expr, bind)
+        if self._is_subquery_expression(expr):
+            return self._bind_subquery_expr(expr, bind, scopes=subquery_scopes)
+        if isinstance(expr, TupleExpression):
+            return self._bind_tuple(expr, bind)
         raise BindingError(f"Unsupported expression type: {type(expr).__name__}")
 
     def _bind_cast(
@@ -1277,87 +1225,47 @@ class Binder:
             table=col_ref.table, column=col_ref.column, data_type=column.data_type
         )
 
-    def _bind_binary_op(self, binary_op: BinaryOp, table: Optional[Table]) -> BinaryOp:
-        """Bind a binary operation."""
-        left = self._bind_expression(binary_op.left, table)
-        right = self._bind_expression(binary_op.right, table)
-        return BinaryOp(op=binary_op.op, left=left, right=right)
+    def _bind_binary_op(
+        self, binary_op: BinaryOp, bind: Callable[[Expression], Expression]
+    ) -> BinaryOp:
+        """Bind a binary operation's operands with the given child binder."""
+        return BinaryOp(
+            op=binary_op.op, left=bind(binary_op.left), right=bind(binary_op.right)
+        )
 
-    def _bind_unary_op(self, unary_op: UnaryOp, table: Optional[Table]) -> UnaryOp:
-        """Bind a unary operation."""
-        operand = self._bind_expression(unary_op.operand, table)
-        return UnaryOp(op=unary_op.op, operand=operand)
+    def _bind_unary_op(
+        self, unary_op: UnaryOp, bind: Callable[[Expression], Expression]
+    ) -> UnaryOp:
+        """Bind a unary operation's operand with the given child binder."""
+        return UnaryOp(op=unary_op.op, operand=bind(unary_op.operand))
 
-    def _bind_in_list(self, expr: InList, table: Optional[Table]) -> InList:
-        """Bind an IN-list's value and each option against a single table."""
-        bound_value = self._bind_expression(expr.value, table)
-        bound_options: List[Expression] = []
-        for option in expr.options:
-            bound_option = self._bind_expression(option, table)
-            bound_options.append(bound_option)
-        return InList(value=bound_value, options=bound_options)
-
-    def _bind_in_list_multi(
-        self, expr: InList, tables: Dict[Optional[str], Table]
+    def _bind_in_list(
+        self, expr: InList, bind: Callable[[Expression], Expression]
     ) -> InList:
-        """Bind an IN-list across multiple tables (multi-relation scope)."""
-        bound_value = self._bind_expression_multi_table(expr.value, tables)
+        """Bind an IN-list's value and each option with the given child binder."""
         bound_options: List[Expression] = []
         for option in expr.options:
-            bound_option = self._bind_expression_multi_table(option, tables)
-            bound_options.append(bound_option)
-        return InList(value=bound_value, options=bound_options)
+            bound_options.append(bind(option))
+        return InList(value=bind(expr.value), options=bound_options)
 
     def _bind_between(
-        self, expr: BetweenExpression, table: Optional[Table]
+        self, expr: BetweenExpression, bind: Callable[[Expression], Expression]
     ) -> BetweenExpression:
-        """Bind a BETWEEN's value/lower/upper operands against a single table."""
-        bound_value = self._bind_expression(expr.value, table)
-        bound_lower = self._bind_expression(expr.lower, table)
-        bound_upper = self._bind_expression(expr.upper, table)
+        """Bind a BETWEEN's value/lower/upper operands with the child binder."""
         return BetweenExpression(
-            value=bound_value,
-            lower=bound_lower,
-            upper=bound_upper,
+            value=bind(expr.value), lower=bind(expr.lower), upper=bind(expr.upper)
         )
 
-    def _bind_between_multi(
-        self, expr: BetweenExpression, tables: Dict[Optional[str], Table]
-    ) -> BetweenExpression:
-        """Bind a BETWEEN expression across multiple tables (multi-relation scope)."""
-        bound_value = self._bind_expression_multi_table(expr.value, tables)
-        bound_lower = self._bind_expression_multi_table(expr.lower, tables)
-        bound_upper = self._bind_expression_multi_table(expr.upper, tables)
-        return BetweenExpression(
-            value=bound_value,
-            lower=bound_lower,
-            upper=bound_upper,
-        )
-
-    def _bind_case_expr(self, expr: CaseExpr, table: Optional[Table]) -> CaseExpr:
-        """Bind a CASE expression's WHEN conditions/results and ELSE on one table."""
-        bound_when = []
-        for condition, result in expr.when_clauses:
-            bound_condition = self._bind_expression(condition, table)
-            bound_result = self._bind_expression(result, table)
-            bound_when.append((bound_condition, bound_result))
-        bound_else = None
-        if expr.else_result is not None:
-            bound_else = self._bind_expression(expr.else_result, table)
-        return CaseExpr(when_clauses=bound_when, else_result=bound_else)
-
-    def _bind_case_expr_multi(
-        self, expr: CaseExpr, tables: Dict[Optional[str], Table]
+    def _bind_case_expr(
+        self, expr: CaseExpr, bind: Callable[[Expression], Expression]
     ) -> CaseExpr:
-        """Bind a CASE expression across multiple tables (multi-relation scope)."""
+        """Bind a CASE expression's WHEN/THEN branches and ELSE with the child binder."""
         bound_when = []
         for condition, result in expr.when_clauses:
-            bound_condition = self._bind_expression_multi_table(condition, tables)
-            bound_result = self._bind_expression_multi_table(result, tables)
-            bound_when.append((bound_condition, bound_result))
+            bound_when.append((bind(condition), bind(result)))
         bound_else = None
         if expr.else_result is not None:
-            bound_else = self._bind_expression_multi_table(expr.else_result, tables)
+            bound_else = bind(expr.else_result)
         return CaseExpr(when_clauses=bound_when, else_result=bound_else)
 
     def _bind_window_expr(
@@ -1608,100 +1516,17 @@ class SubqueryPlanBinder:
     def _bind_expr(
         self, expr: Expression, scopes: List[Dict[str, Table]]
     ) -> Expression:
-        """Bind one expression with innermost-first scope resolution."""
-        if isinstance(expr, ColumnRef):
-            return self.host.resolve_in_scopes(scopes, expr)
-        if isinstance(expr, Literal):
-            return expr
-        return self._bind_compound_expr(expr, scopes)
+        """Bind one expression via the shared dispatch, resolving against scopes.
 
-    def _bind_compound_expr(
-        self, expr: Expression, scopes: List[Dict[str, Table]]
-    ) -> Expression:
-        """Bind binary/unary/function expressions."""
-        if isinstance(expr, BinaryOp):
-            left = self._bind_expr(expr.left, scopes)
-            right = self._bind_expr(expr.right, scopes)
-            return BinaryOp(op=expr.op, left=left, right=right)
-        if isinstance(expr, UnaryOp):
-            return UnaryOp(op=expr.op, operand=self._bind_expr(expr.operand, scopes))
-        if isinstance(expr, FunctionCall):
-            bound_args = []
-            for arg in expr.args:
-                bound_args.append(self._bind_expr(arg, scopes))
-            return _rebuild_function_call(
-                expr, bound_args, lambda e: self._bind_expr(e, scopes)
-            )
-        if isinstance(expr, WindowExpr):
-            return self._bind_window(expr, scopes)
-        return self._bind_special_expr(expr, scopes)
-
-    def _bind_window(
-        self, expr: WindowExpr, scopes: List[Dict[str, Table]]
-    ) -> WindowExpr:
-        """Bind a window's function, partition keys, and order keys in scope."""
-        partition = []
-        for part in expr.partition_by:
-            partition.append(self._bind_expr(part, scopes))
-        order = []
-        for key in expr.order_keys:
-            order.append(self._bind_expr(key, scopes))
-        return expr.model_copy(
-            update={
-                "function": self._bind_expr(expr.function, scopes),
-                "partition_by": partition,
-                "order_keys": order,
-            }
+        The compound dispatch is the host binder's; only the column leaf (the
+        scope chain) and the nested-subquery scopes differ here.
+        """
+        return self.host._bind_expr_dispatch(
+            expr,
+            lambda value: self._bind_expr(value, scopes),
+            lambda col_ref: self.host.resolve_in_scopes(scopes, col_ref),
+            subquery_scopes=list(scopes),
         )
-
-    def _bind_special_expr(
-        self, expr: Expression, scopes: List[Dict[str, Table]]
-    ) -> Expression:
-        """Bind CASE / IN-list / BETWEEN / tuple expressions."""
-        if isinstance(expr, CaseExpr):
-            return self._bind_case(expr, scopes)
-        if isinstance(expr, InList):
-            value = self._bind_expr(expr.value, scopes)
-            options = []
-            for option in expr.options:
-                options.append(self._bind_expr(option, scopes))
-            return InList(value=value, options=options)
-        if isinstance(expr, BetweenExpression):
-            return BetweenExpression(
-                value=self._bind_expr(expr.value, scopes),
-                lower=self._bind_expr(expr.lower, scopes),
-                upper=self._bind_expr(expr.upper, scopes),
-            )
-        return self._bind_subquery_or_tuple(expr, scopes)
-
-    def _bind_subquery_or_tuple(
-        self, expr: Expression, scopes: List[Dict[str, Table]]
-    ) -> Expression:
-        """Bind nested subquery expressions and tuples; reject unknowns."""
-        if isinstance(expr, TupleExpression):
-            bound_items = []
-            for item in expr.items:
-                bound_items.append(self._bind_expr(item, scopes))
-            return TupleExpression(items=tuple(bound_items))
-        if self.host._is_subquery_expression(expr):
-            return self.host._bind_subquery_expr(
-                expr,
-                lambda value: self._bind_expr(value, scopes),
-                scopes=list(scopes),
-            )
-        raise BindingError(f"Unsupported expression in subquery: {type(expr).__name__}")
-
-    def _bind_case(self, expr: CaseExpr, scopes: List[Dict[str, Table]]) -> CaseExpr:
-        """Bind all branches of a CASE expression."""
-        bound_when = []
-        for condition, result in expr.when_clauses:
-            bound_condition = self._bind_expr(condition, scopes)
-            bound_result = self._bind_expr(result, scopes)
-            bound_when.append((bound_condition, bound_result))
-        bound_else = None
-        if expr.else_result is not None:
-            bound_else = self._bind_expr(expr.else_result, scopes)
-        return CaseExpr(when_clauses=bound_when, else_result=bound_else)
 
     def __repr__(self) -> str:
         return f"SubqueryPlanBinder(scopes={len(self.outer_scopes)})"
