@@ -3,12 +3,9 @@
 from pathlib import Path
 from federated_query.config.config import load_config
 from federated_query.catalog.catalog import Catalog
+from federated_query.cli.fedq import FedQRuntime
 from federated_query.datasources.duckdb import DuckDBDataSource
 from federated_query.datasources.postgresql import PostgreSQLDataSource
-from federated_query.parser.parser import Parser
-from federated_query.parser.binder import Binder
-from federated_query.optimizer.physical_planner import PhysicalPlanner
-from federated_query.executor.executor import Executor
 from federated_query.config.config import ExecutorConfig
 
 
@@ -76,16 +73,9 @@ def run_query(catalog, sql, query_name):
     print(sql)
     print()
 
-    parser = Parser()
-    binder = Binder(catalog)
-    planner = PhysicalPlanner(catalog)
-    executor = Executor(ExecutorConfig())
+    runtime = FedQRuntime(catalog, ExecutorConfig())
 
-    logical_plan = parser.parse_to_logical_plan(sql, catalog)
-    bound_plan = binder.bind(logical_plan)
-    physical_plan = planner.plan(bound_plan)
-
-    result_table = executor.execute_to_table(physical_plan)
+    result_table = runtime.execute(sql)
 
     print(f"Result ({result_table.num_rows} rows):")
     print(result_table.to_pandas())
