@@ -1050,46 +1050,13 @@ class Binder:
     def _bind_column_ref_multi_table(
         self, col_ref: ColumnRef, tables: Dict[Optional[str], Table]
     ) -> ColumnRef:
-        """Bind column reference with multiple tables."""
-        if col_ref.column == "*":
-            return col_ref
+        """Bind a column reference against the join tables, then enclosing scopes.
 
-        if col_ref.table:
-            table = tables.get(col_ref.table)
-            if table is None:
-                # The qualifier matches no in-scope table or alias. Do not scan
-                # other tables by column name (that silently accepts a typo'd or
-                # wrong qualifier); let an enclosing scope resolve it or raise.
-                return self._unresolved_or_raise(col_ref)
-            column = table.get_column(col_ref.column)
-            if column is None:
-                return self._unresolved_or_raise(col_ref)
-            return ColumnRef(
-                table=col_ref.table,
-                column=col_ref.column,
-                data_type=column.data_type,
-            )
-
-        found_table = None
-        found_column = None
-        for table_name, table in tables.items():
-            column = table.get_column(col_ref.column)
-            if column:
-                if found_column:
-                    raise BindingError(
-                        f"Column '{col_ref.column}' is ambiguous (found in multiple tables)"
-                    )
-                found_table = table_name
-                found_column = column
-
-        if found_column is None:
-            return self._unresolved_or_raise(col_ref)
-
-        return ColumnRef(
-            table=found_table,
-            column=col_ref.column,
-            data_type=found_column.data_type,
-        )
+        The join relations are the innermost scope; the enclosing query blocks
+        (the scope stack below this one) follow, so a correlated reference into
+        an outer query still resolves through the one shared resolver.
+        """
+        return self.resolve_in_scopes(self._scope_stack[:-1] + [tables], col_ref)
 
     def resolve_in_scopes(
         self, scopes: List[Dict[str, Table]], col_ref: ColumnRef
@@ -1124,7 +1091,10 @@ class Binder:
             return ColumnRef(
                 table=col_ref.table, column=col_ref.column, data_type=column.data_type
             )
-        raise BindingError(f"Unknown table '{col_ref.table}' for column reference")
+        raise BindingError(
+            f"Table '{col_ref.table}' not found in scope for column "
+            f"'{col_ref.column}'"
+        )
 
     def _resolve_unqualified(
         self, scopes: List[Dict[str, Table]], col_ref: ColumnRef
@@ -1153,36 +1123,6 @@ class Binder:
                 table=alias, column=column_name, data_type=column.data_type
             )
         return found
-
-    def _unresolved_or_raise(self, col_ref: ColumnRef) -> ColumnRef:
-        """Keep a column unbound only if an enclosing scope defines it.
-
-        A reference that resolves in no in-scope or enclosing relation is a
-        typo and must raise at bind time, not slip through to a KeyError or a
-        remote UndefinedColumn at execution.
-        """
-        if self._resolves_in_scope_stack(col_ref):
-            return col_ref
-        raise BindingError(
-            f"Column '{col_ref.to_sql()}' not found in any table in scope"
-        )
-
-    def _resolves_in_scope_stack(self, col_ref: ColumnRef) -> bool:
-        """Whether a reference resolves against any enclosing query scope."""
-        for scope in self._scope_stack:
-            if self._scope_defines(scope, col_ref):
-                return True
-        return False
-
-    def _scope_defines(self, scope: Dict[str, Table], col_ref: ColumnRef) -> bool:
-        """Whether a relation scope defines the referenced column."""
-        if col_ref.table is not None:
-            table = scope.get(col_ref.table)
-            return table is not None and table.get_column(col_ref.column) is not None
-        for table in scope.values():
-            if table.get_column(col_ref.column) is not None:
-                return True
-        return False
 
     def _get_table_from_plan(self, plan: LogicalPlanNode) -> Optional[Table]:
         """Extract table metadata from a plan node."""
@@ -1317,23 +1257,24 @@ class Binder:
         return TupleExpression(items=tuple(bound_items))
 
     def _bind_column_ref(self, col_ref: ColumnRef, table: Optional[Table]) -> ColumnRef:
-        """Bind a column reference."""
+        """Bind a column reference against a single known table.
+
+        With no determinable single table (a multi-relation input), the
+        reference is left unbound here: join-collision renaming downstream
+        depends on the original qualifier surviving, so eager scope resolution
+        would mis-rename it.
+        """
         if col_ref.column == "*":
             return col_ref
-
         if table is None:
             return col_ref
-
         column = table.get_column(col_ref.column)
         if column is None:
             raise BindingError(
                 f"Column '{col_ref.column}' not found in table '{table.name}'"
             )
-
         return ColumnRef(
-            table=col_ref.table,
-            column=col_ref.column,
-            data_type=column.data_type,
+            table=col_ref.table, column=col_ref.column, data_type=column.data_type
         )
 
     def _bind_binary_op(self, binary_op: BinaryOp, table: Optional[Table]) -> BinaryOp:
