@@ -51,6 +51,15 @@ def _make_batch(values, names):
     return pa.RecordBatch.from_arrays(arrays, names=names)
 
 
+def _with_engine(node):
+    """Attach the DuckDB merge engine (and to children) for local execution."""
+    from federated_query.executor.executor import _attach_merge_engine
+    from federated_query.executor.merge_engine import MergeEngine
+
+    _attach_merge_engine(node, MergeEngine("256MB", None))
+    return node
+
+
 def _rows_from_batches(batches):
     """Convert batches to list of row dicts."""
     rows = []
@@ -84,7 +93,7 @@ def test_hash_join_semi_emits_only_matching_left_rows():
         build_side="right",
     )
 
-    rows = _rows_from_batches(list(join.execute()))
+    rows = _rows_from_batches(list(_with_engine(join).execute()))
 
     assert len(rows) == 1
     assert "rval" not in rows[0]
@@ -107,7 +116,7 @@ def test_hash_join_anti_emits_only_non_matching_left_rows():
         build_side="right",
     )
 
-    rows = _rows_from_batches(list(join.execute()))
+    rows = _rows_from_batches(list(_with_engine(join).execute()))
 
     assert len(rows) == 1
     assert rows[0]["id"] == 2
@@ -132,7 +141,7 @@ def test_nested_loop_semi_respects_condition():
         condition=condition,
     )
 
-    rows = _rows_from_batches(list(join.execute()))
+    rows = _rows_from_batches(list(_with_engine(join).execute()))
 
     assert len(rows) == 1
     assert rows[0]["id"] == 2

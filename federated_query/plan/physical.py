@@ -43,6 +43,7 @@ def _parse_table_sample(sample_text: str) -> exp.Expression:
     parsed = sqlglot.parse_one(f"SELECT * FROM _t {sample_text}", read="postgres")
     return parsed.find(exp.Table).args.get("sample")
 
+
 if TYPE_CHECKING:
     from .expressions import FunctionCall
 
@@ -462,6 +463,21 @@ def _prepend_batch(first: pa.RecordBatch, rest) -> Iterator[pa.RecordBatch]:
     yield from rest
 
 
+def _require_engine(node: "PhysicalPlanNode"):
+    """Return the node's attached DuckDB merge engine, or raise if none.
+
+    Local execution always runs through the merge engine (DuckDB is a hard
+    dependency the executor attaches to every plan); a missing engine is a bug,
+    so it fails loudly rather than silently taking a slow Python path.
+    """
+    engine = node.merge_engine()
+    if engine is None:
+        raise RuntimeError(
+            f"{type(node).__name__} requires the DuckDB merge engine; none attached"
+        )
+    return engine
+
+
 def _streaming_reader(node: "PhysicalPlanNode") -> pa.RecordBatchReader:
     """Expose a node's output as a lazy reader without materializing it.
 
@@ -627,7 +643,9 @@ class PhysicalScan(PhysicalPlanNode):
         where_pred, having_pred = self._split_where_having()
         if where_pred is not None:
             select.set("where", exp.Where(this=_source_ast(where_pred)))
-        group = clauses.group_by(self.group_by, self.grouping_sets, CANONICAL_SOURCE_RESOLVER)
+        group = clauses.group_by(
+            self.group_by, self.grouping_sets, CANONICAL_SOURCE_RESOLVER
+        )
         if group is not None:
             select.set("group", group)
         if having_pred is not None:
@@ -637,7 +655,10 @@ class PhysicalScan(PhysicalPlanNode):
     def _apply_order(self, select: exp.Select) -> exp.Select:
         """Attach ORDER BY when the scan carries sort keys."""
         order = clauses.order_by(
-            self.order_by_keys, self.order_by_ascending, self.order_by_nulls, CANONICAL_SOURCE_RESOLVER
+            self.order_by_keys,
+            self.order_by_ascending,
+            self.order_by_nulls,
+            CANONICAL_SOURCE_RESOLVER,
         )
         if order is not None:
             select.set("order", order)
@@ -684,7 +705,9 @@ class PhysicalScan(PhysicalPlanNode):
             db=exp.to_identifier(self.schema_name, quoted=True),
         )
         if self.alias:
-            table.set("alias", exp.TableAlias(this=exp.to_identifier(self.alias, quoted=True)))
+            table.set(
+                "alias", exp.TableAlias(this=exp.to_identifier(self.alias, quoted=True))
+            )
         if self.sample:
             table.set("sample", _parse_table_sample(self.sample))
         return table
@@ -898,9 +921,7 @@ class PhysicalWindow(PhysicalPlanNode):
 
     def execute(self) -> Iterator[pa.RecordBatch]:
         """Stream the input through DuckDB, which evaluates the window SQL."""
-        engine = self.merge_engine()
-        if engine is None:
-            raise ValueError("window functions require the merge engine")
+        engine = _require_engine(self)
         reader = _streaming_reader(self.input)
         sql = self._window_sql(self.input.column_aliases())
         yield from engine.run(sql, {_MERGE_WINDOW_RELATION: reader})
@@ -1001,120 +1022,8 @@ class PhysicalHashJoin(PhysicalPlanNode):
         return [self.left, self.right]
 
     def execute(self) -> Iterator[pa.RecordBatch]:
-        """Execute the hash join, via the merge engine when one is attached."""
-        engine = self.merge_engine()
-        if engine is not None:
-            yield from self._execute_merge(engine)
-            return
-        if self.join_type in (JoinType.SEMI, JoinType.ANTI):
-            yield from self._execute_semi_anti()
-            return
-        yield from self._execute_row_loop()
-
-    def _execute_row_loop(self) -> Iterator[pa.RecordBatch]:
-        """Row-at-a-time hash join (fallback when no merge engine is attached)."""
-        from collections import defaultdict
-
-        if self.build_side == "right":
-            build_node = self.right
-            probe_node = self.left
-            build_keys = self.right_keys
-            probe_keys = self.left_keys
-            probe_is_left = True
-        else:
-            build_node = self.left
-            probe_node = self.right
-            build_keys = self.left_keys
-            probe_keys = self.right_keys
-            probe_is_left = False
-
-        hash_table = defaultdict(list)
-        build_batches = []
-        matched_build_rows = set()
-
-        build_aliases = build_node.column_aliases()
-        probe_aliases = probe_node.column_aliases()
-        for batch in build_node.execute():
-            build_batches.append(batch)
-            key_values = self._extract_key_values(batch, build_keys, build_aliases)
-
-            for row_idx in range(batch.num_rows):
-                key = _row_key_tuple(key_values, row_idx)
-                # SQL equality never matches NULL keys, so rows with a NULL
-                # key component are not indexed for matching.
-                if None not in key:
-                    hash_table[key].append((len(build_batches) - 1, row_idx))
-
-        if len(build_batches) == 0:
-            need_probe_outer = (
-                (self.join_type == JoinType.LEFT and probe_is_left)
-                or (self.join_type == JoinType.RIGHT and not probe_is_left)
-                or (self.join_type == JoinType.FULL)
-            )
-            if need_probe_outer:
-                for batch in probe_node.execute():
-                    if probe_is_left:
-                        yield self._create_left_outer_batch(batch)
-                    else:
-                        yield self._create_right_outer_batch(batch)
-            return
-
-        self._maybe_reduce_probe(probe_node, probe_keys, hash_table)
-
-        for probe_batch in probe_node.execute():
-            probe_key_values = self._extract_key_values(
-                probe_batch, probe_keys, probe_aliases
-            )
-
-            for probe_row_idx in range(probe_batch.num_rows):
-                probe_key = _row_key_tuple(probe_key_values, probe_row_idx)
-
-                # A NULL key component can never satisfy SQL equality.
-                if None not in probe_key and probe_key in hash_table:
-                    build_rows = hash_table[probe_key]
-                    for build_batch_idx, build_row_idx in build_rows:
-                        build_batch = build_batches[build_batch_idx]
-                        matched_build_rows.add((build_batch_idx, build_row_idx))
-                        yield self._join_matched_rows(
-                            probe_batch,
-                            probe_row_idx,
-                            build_batch,
-                            build_row_idx,
-                            probe_is_left,
-                        )
-                else:
-                    need_probe_outer = (
-                        (self.join_type == JoinType.LEFT and probe_is_left)
-                        or (self.join_type == JoinType.RIGHT and not probe_is_left)
-                        or (self.join_type == JoinType.FULL)
-                    )
-                    if need_probe_outer:
-                        if probe_is_left:
-                            yield self._create_left_outer_row(
-                                probe_batch, probe_row_idx
-                            )
-                        else:
-                            yield self._create_right_outer_row(
-                                probe_batch, probe_row_idx
-                            )
-
-        need_build_outer = (
-            (self.join_type == JoinType.RIGHT and probe_is_left)
-            or (self.join_type == JoinType.LEFT and not probe_is_left)
-            or (self.join_type == JoinType.FULL)
-        )
-        if need_build_outer:
-            for build_batch_idx, build_batch in enumerate(build_batches):
-                for build_row_idx in range(build_batch.num_rows):
-                    if (build_batch_idx, build_row_idx) not in matched_build_rows:
-                        if probe_is_left:
-                            yield self._create_right_outer_row(
-                                build_batch, build_row_idx
-                            )
-                        else:
-                            yield self._create_left_outer_row_from_batch(
-                                build_batch, build_row_idx
-                            )
+        """Execute the hash join in the DuckDB merge engine."""
+        yield from self._execute_merge(_require_engine(self))
 
     def _execute_merge(self, engine) -> Iterator[pa.RecordBatch]:
         """Run the join through DuckDB; INNER keeps the G9 build-materialize path."""
@@ -1196,22 +1105,6 @@ class PhysicalHashJoin(PhysicalPlanNode):
         for batch in build_node.execute():
             batches.append(batch)
         return batches
-
-    def _maybe_reduce_probe(self, probe_node, probe_keys, hash_table) -> None:
-        """Push an already-built hash table's keys into the probe (row-loop path).
-
-        The row-at-a-time join has already materialized ``hash_table`` (its keys
-        are the distinct non-NULL build keys), so reading them back is free here
-        — no extra pass. INNER only; outer joins keep non-matching probe rows.
-        The vectorized merge path uses ``_distinct_build_keys`` instead.
-        """
-        if self.join_type != JoinType.INNER:
-            return
-        keys = list(hash_table.keys())
-        if not _within_dynamic_filter_cap(len(keys)):
-            return
-        if probe_node.apply_dynamic_filter(probe_keys, keys):
-            _LOGGER.debug("dynamic filter applied to probe: %d keys", len(keys))
 
     def _reduce_probe_from_build(self, build_batches: List[pa.RecordBatch]) -> None:
         """Push the build side's distinct keys into the probe as an IN filter.
@@ -1390,231 +1283,6 @@ class PhysicalHashJoin(PhysicalPlanNode):
             if resolved is not None:
                 return resolved
         return key.column
-
-    def _execute_semi_anti(self) -> Iterator[pa.RecordBatch]:
-        """Execute SEMI or ANTI hash join."""
-        from collections import defaultdict
-
-        right_aliases = self.right.column_aliases()
-        left_aliases = self.left.column_aliases()
-        hash_table = defaultdict(bool)
-        for batch in self.right.execute():
-            key_values = self._extract_key_values(batch, self.right_keys, right_aliases)
-            for row_idx in range(batch.num_rows):
-                key = _row_key_tuple(key_values, row_idx)
-                # SQL equality never matches NULL keys.
-                if None not in key:
-                    hash_table[key] = True
-
-        for left_batch in self.left.execute():
-            left_keys = self._extract_key_values(
-                left_batch, self.left_keys, left_aliases
-            )
-            for left_idx in range(left_batch.num_rows):
-                key = _row_key_tuple(left_keys, left_idx)
-                match = None not in key and key in hash_table
-                if self.join_type == JoinType.SEMI and match:
-                    yield self._left_row_batch(left_batch, left_idx)
-                if self.join_type == JoinType.ANTI and not match:
-                    yield self._left_row_batch(left_batch, left_idx)
-
-    def _join_matched_rows(
-        self,
-        probe_batch: pa.RecordBatch,
-        probe_row_idx: int,
-        build_batch: pa.RecordBatch,
-        build_row_idx: int,
-        probe_is_left: bool,
-    ) -> pa.RecordBatch:
-        """Join a matched probe/build row pair, always in left-then-right order.
-
-        The build side may be either input (chosen for performance), so order
-        the output by which input is logically the left one to keep the column
-        order independent of the build/probe choice.
-        """
-        if probe_is_left:
-            return self._join_rows(
-                probe_batch, probe_row_idx, build_batch, build_row_idx
-            )
-        return self._join_rows(build_batch, build_row_idx, probe_batch, probe_row_idx)
-
-    def _join_rows(
-        self,
-        left_batch: pa.RecordBatch,
-        left_row_idx: int,
-        right_batch: pa.RecordBatch,
-        right_row_idx: int,
-    ) -> pa.RecordBatch:
-        """Join two rows into a single batch."""
-        arrays = []
-        names = []
-
-        for i in range(left_batch.num_columns):
-            col = left_batch.column(i)
-            field = left_batch.schema.field(i)
-            scalar_val = col[left_row_idx]
-            arr = pa.array([scalar_val.as_py()], type=field.type)
-            arrays.append(arr)
-            names.append(field.name)
-
-        for i in range(right_batch.num_columns):
-            col = right_batch.column(i)
-            field = right_batch.schema.field(i)
-            name = field.name
-
-            if name in names:
-                name = f"right_{name}"
-
-            scalar_val = col[right_row_idx]
-            arr = pa.array([scalar_val.as_py()], type=field.type)
-            arrays.append(arr)
-            names.append(name)
-
-        return pa.RecordBatch.from_arrays(arrays, names=names)
-
-    def _create_left_outer_batch(self, left_batch: pa.RecordBatch) -> pa.RecordBatch:
-        """Create batch with NULLs for right side (for LEFT OUTER JOIN)."""
-        right_schema = self.right.schema()
-
-        arrays = []
-        names = []
-
-        for i in range(left_batch.num_columns):
-            arrays.append(left_batch.column(i))
-            field = left_batch.schema.field(i)
-            names.append(field.name)
-
-        for field in right_schema:
-            name = field.name
-            if name in names:
-                name = f"right_{name}"
-            null_array = pa.array([None] * left_batch.num_rows, type=field.type)
-            arrays.append(null_array)
-            names.append(name)
-
-        return pa.RecordBatch.from_arrays(arrays, names=names)
-
-    def _create_left_outer_row(
-        self, left_batch: pa.RecordBatch, left_row_idx: int
-    ) -> pa.RecordBatch:
-        """Create single row with NULLs for right side."""
-        right_schema = self.right.schema()
-
-        arrays = []
-        names = []
-
-        for i in range(left_batch.num_columns):
-            col = left_batch.column(i)
-            field = left_batch.schema.field(i)
-            scalar_val = col[left_row_idx]
-            arr = pa.array([scalar_val.as_py()], type=field.type)
-            arrays.append(arr)
-            names.append(field.name)
-
-        for field in right_schema:
-            name = field.name
-            if name in names:
-                name = f"right_{name}"
-            null_array = pa.array([None], type=field.type)
-            arrays.append(null_array)
-            names.append(name)
-
-        return pa.RecordBatch.from_arrays(arrays, names=names)
-
-    def _create_right_outer_row(
-        self, right_batch: pa.RecordBatch, right_row_idx: int
-    ) -> pa.RecordBatch:
-        """Create single row with NULLs for left side and data from right side."""
-        left_schema = self.left.schema()
-
-        arrays = []
-        names = []
-
-        for field in left_schema:
-            null_array = pa.array([None], type=field.type)
-            arrays.append(null_array)
-            names.append(field.name)
-
-        for i in range(right_batch.num_columns):
-            col = right_batch.column(i)
-            field = right_batch.schema.field(i)
-            name = field.name
-
-            if name in names:
-                name = f"right_{name}"
-
-            scalar_val = col[right_row_idx]
-            arr = pa.array([scalar_val.as_py()], type=field.type)
-            arrays.append(arr)
-            names.append(name)
-
-        return pa.RecordBatch.from_arrays(arrays, names=names)
-
-    def _create_right_outer_batch(self, right_batch: pa.RecordBatch) -> pa.RecordBatch:
-        """Create batch with NULLs for left side (for RIGHT OUTER JOIN)."""
-        left_schema = self.left.schema()
-
-        arrays = []
-        names = []
-
-        for field in left_schema:
-            null_array = pa.array([None] * right_batch.num_rows, type=field.type)
-            arrays.append(null_array)
-            names.append(field.name)
-
-        for i in range(right_batch.num_columns):
-            field = right_batch.schema.field(i)
-            name = field.name
-            if name in names:
-                name = f"right_{name}"
-            arrays.append(right_batch.column(i))
-            names.append(name)
-
-        return pa.RecordBatch.from_arrays(arrays, names=names)
-
-    def _create_left_outer_row_from_batch(
-        self, left_batch: pa.RecordBatch, left_row_idx: int
-    ) -> pa.RecordBatch:
-        """Create single row from left batch with NULLs for right side."""
-        right_schema = self.right.schema()
-
-        arrays = []
-        names = []
-
-        for i in range(left_batch.num_columns):
-            col = left_batch.column(i)
-            field = left_batch.schema.field(i)
-            scalar_val = col[left_row_idx]
-            arr = pa.array([scalar_val.as_py()], type=field.type)
-            arrays.append(arr)
-            names.append(field.name)
-
-        for field in right_schema:
-            name = field.name
-            if name in names:
-                name = f"right_{name}"
-            null_array = pa.array([None], type=field.type)
-            arrays.append(null_array)
-            names.append(name)
-
-        return pa.RecordBatch.from_arrays(arrays, names=names)
-
-    def _left_row_batch(
-        self,
-        batch: pa.RecordBatch,
-        row_idx: int,
-    ) -> pa.RecordBatch:
-        """Create single-row batch with only left columns."""
-        arrays = []
-        names = []
-        for i in range(batch.num_columns):
-            col = batch.column(i)
-            field = batch.schema.field(i)
-            scalar_val = col[row_idx]
-            arr = pa.array([scalar_val.as_py()], type=field.type)
-            arrays.append(arr)
-            names.append(field.name)
-        return pa.RecordBatch.from_arrays(arrays, names=names)
 
     def schema(self) -> pa.Schema:
         """Combine schemas from both sides."""
@@ -1905,11 +1573,7 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
         side is never re-scanned per outer row (which, cross-source, would be a
         remote query per row). The Python loop remains only as a no-engine path.
         """
-        engine = self.merge_engine()
-        if engine is not None:
-            yield from self._execute_merge(engine)
-            return
-        yield from self._execute_python()
+        yield from self._execute_merge(_require_engine(self))
 
     def _execute_merge(self, engine) -> Iterator[pa.RecordBatch]:
         """Materialize the right, stream the left, and join in DuckDB."""
@@ -1939,230 +1603,6 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
             f"{_MERGE_JOIN_KEYWORDS[self.join_type]} {_MERGE_RIGHT_RELATION} AS r "
             f"ON {on_clause}"
         )
-
-    def _execute_python(self) -> Iterator[pa.RecordBatch]:
-        """Row-at-a-time nested loop, used only when no merge engine is attached."""
-        import pyarrow.compute as pc
-
-        if self.join_type in (JoinType.SEMI, JoinType.ANTI):
-            for batch in self._execute_semi_anti():
-                yield batch
-            return
-
-        right_batches = []
-        for batch in self.right.execute():
-            right_batches.append(batch)
-
-        if len(right_batches) == 0:
-            if self.join_type in (JoinType.LEFT, JoinType.FULL):
-                for batch in self.left.execute():
-                    yield self._create_left_outer_batch(batch)
-            return
-
-        matched_right_rows = set()
-
-        for left_batch in self.left.execute():
-            for left_row_idx in range(left_batch.num_rows):
-                matched = False
-
-                for right_batch_idx, right_batch in enumerate(right_batches):
-                    for right_row_idx in range(right_batch.num_rows):
-                        if self.condition is None or self._evaluate_condition(
-                            left_batch, left_row_idx, right_batch, right_row_idx
-                        ):
-                            yield self._join_rows(
-                                left_batch, left_row_idx, right_batch, right_row_idx
-                            )
-                            matched = True
-                            matched_right_rows.add((right_batch_idx, right_row_idx))
-
-                if not matched and self.join_type in (JoinType.LEFT, JoinType.FULL):
-                    yield self._create_left_outer_row(left_batch, left_row_idx)
-
-        if self.join_type in (JoinType.RIGHT, JoinType.FULL):
-            for right_batch_idx, right_batch in enumerate(right_batches):
-                for right_row_idx in range(right_batch.num_rows):
-                    if (right_batch_idx, right_row_idx) not in matched_right_rows:
-                        yield self._create_right_outer_row(right_batch, right_row_idx)
-
-    def _execute_semi_anti(self) -> Iterator[pa.RecordBatch]:
-        """Execute SEMI or ANTI nested loop join."""
-        for left_batch in self.left.execute():
-            for left_row_idx in range(left_batch.num_rows):
-                matched = False
-                for right_batch in self.right.execute():
-                    for right_row_idx in range(right_batch.num_rows):
-                        if self.condition is None or self._evaluate_condition(
-                            left_batch,
-                            left_row_idx,
-                            right_batch,
-                            right_row_idx,
-                        ):
-                            matched = True
-                            break
-                    if matched:
-                        break
-                if self.join_type == JoinType.SEMI and matched:
-                    yield self._left_row_batch(left_batch, left_row_idx)
-                if self.join_type == JoinType.ANTI and not matched:
-                    yield self._left_row_batch(left_batch, left_row_idx)
-
-    def _evaluate_condition(
-        self,
-        left_batch: pa.RecordBatch,
-        left_row_idx: int,
-        right_batch: pa.RecordBatch,
-        right_row_idx: int,
-    ) -> bool:
-        """Evaluate join condition for two rows."""
-        from .expressions import BinaryOp, BinaryOpType, ColumnRef, Literal
-        import pyarrow.compute as pc
-
-        if self.condition is None:
-            return True
-
-        joined = self._join_rows(left_batch, left_row_idx, right_batch, right_row_idx)
-        result = self._evaluate_expression_on_batch(self.condition, joined)
-
-        return result[0].as_py() if len(result) > 0 else False
-
-    def _evaluate_expression_on_batch(
-        self, expr: Expression, batch: pa.RecordBatch
-    ) -> pa.Array:
-        """Evaluate expression on a batch."""
-        from ..executor.expression_evaluator import ExpressionEvaluator
-
-        evaluator = ExpressionEvaluator(batch)
-        return evaluator.evaluate(expr)
-
-    def _join_rows(
-        self,
-        left_batch: pa.RecordBatch,
-        left_row_idx: int,
-        right_batch: pa.RecordBatch,
-        right_row_idx: int,
-    ) -> pa.RecordBatch:
-        """Join two rows into a single batch."""
-        arrays = []
-        names = []
-
-        for i in range(left_batch.num_columns):
-            col = left_batch.column(i)
-            field = left_batch.schema.field(i)
-            scalar_val = col[left_row_idx]
-            arr = pa.array([scalar_val.as_py()], type=field.type)
-            arrays.append(arr)
-            names.append(field.name)
-
-        for i in range(right_batch.num_columns):
-            col = right_batch.column(i)
-            field = right_batch.schema.field(i)
-            name = field.name
-
-            if name in names:
-                name = f"right_{name}"
-
-            scalar_val = col[right_row_idx]
-            arr = pa.array([scalar_val.as_py()], type=field.type)
-            arrays.append(arr)
-            names.append(name)
-
-        return pa.RecordBatch.from_arrays(arrays, names=names)
-
-    def _create_left_outer_batch(self, left_batch: pa.RecordBatch) -> pa.RecordBatch:
-        """Create batch with NULLs for right side."""
-        right_schema = self.right.schema()
-
-        arrays = []
-        names = []
-
-        for i in range(left_batch.num_columns):
-            arrays.append(left_batch.column(i))
-            field = left_batch.schema.field(i)
-            names.append(field.name)
-
-        for field in right_schema:
-            name = field.name
-            if name in names:
-                name = f"right_{name}"
-            null_array = pa.array([None] * left_batch.num_rows, type=field.type)
-            arrays.append(null_array)
-            names.append(name)
-
-        return pa.RecordBatch.from_arrays(arrays, names=names)
-
-    def _create_left_outer_row(
-        self, left_batch: pa.RecordBatch, left_row_idx: int
-    ) -> pa.RecordBatch:
-        """Create single row with NULLs for right side."""
-        right_schema = self.right.schema()
-
-        arrays = []
-        names = []
-
-        for i in range(left_batch.num_columns):
-            col = left_batch.column(i)
-            field = left_batch.schema.field(i)
-            scalar_val = col[left_row_idx]
-            arr = pa.array([scalar_val.as_py()], type=field.type)
-            arrays.append(arr)
-            names.append(field.name)
-
-        for field in right_schema:
-            name = field.name
-            if name in names:
-                name = f"right_{name}"
-            null_array = pa.array([None], type=field.type)
-            arrays.append(null_array)
-            names.append(name)
-
-        return pa.RecordBatch.from_arrays(arrays, names=names)
-
-    def _create_right_outer_row(
-        self, right_batch: pa.RecordBatch, right_row_idx: int
-    ) -> pa.RecordBatch:
-        """Create single row with NULLs for left side and data from right side."""
-        left_schema = self.left.schema()
-
-        arrays = []
-        names = []
-
-        for field in left_schema:
-            null_array = pa.array([None], type=field.type)
-            arrays.append(null_array)
-            names.append(field.name)
-
-        for i in range(right_batch.num_columns):
-            col = right_batch.column(i)
-            field = right_batch.schema.field(i)
-            name = field.name
-
-            if name in names:
-                name = f"right_{name}"
-
-            scalar_val = col[right_row_idx]
-            arr = pa.array([scalar_val.as_py()], type=field.type)
-            arrays.append(arr)
-            names.append(name)
-
-        return pa.RecordBatch.from_arrays(arrays, names=names)
-
-    def _left_row_batch(
-        self,
-        batch: pa.RecordBatch,
-        row_idx: int,
-    ) -> pa.RecordBatch:
-        """Create single-row batch with only left columns."""
-        arrays = []
-        names = []
-        for i in range(batch.num_columns):
-            col = batch.column(i)
-            field = batch.schema.field(i)
-            scalar_val = col[row_idx]
-            arr = pa.array([scalar_val.as_py()], type=field.type)
-            arrays.append(arr)
-            names.append(field.name)
-        return pa.RecordBatch.from_arrays(arrays, names=names)
 
     def schema(self) -> pa.Schema:
         """Combine schemas from both sides."""
@@ -2195,23 +1635,6 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
     def __repr__(self) -> str:
         return f"PhysicalNestedLoopJoin({self.join_type.value})"
 
-    def _left_row_batch(
-        self,
-        batch: pa.RecordBatch,
-        row_idx: int,
-    ) -> pa.RecordBatch:
-        """Create single-row batch with only left columns."""
-        arrays = []
-        names = []
-        for i in range(batch.num_columns):
-            col = batch.column(i)
-            field = batch.schema.field(i)
-            scalar_val = col[row_idx]
-            arr = pa.array([scalar_val.as_py()], type=field.type)
-            arrays.append(arr)
-            names.append(field.name)
-        return pa.RecordBatch.from_arrays(arrays, names=names)
-
 
 class PhysicalHashAggregate(PhysicalPlanNode):
     """Hash-based aggregation."""
@@ -2227,9 +1650,8 @@ class PhysicalHashAggregate(PhysicalPlanNode):
 
     def execute(self) -> Iterator[pa.RecordBatch]:
         """Execute hash aggregation, via the merge engine when one is attached."""
-        engine = self.merge_engine()
-        if engine is not None and self._can_merge_aggregate():
-            yield from self._execute_merge_aggregate(engine)
+        if self._can_merge_aggregate():
+            yield from self._execute_merge_aggregate(_require_engine(self))
             return
 
         if self.grouping_sets is not None:
@@ -2876,9 +2298,8 @@ class PhysicalSort(PhysicalPlanNode):
 
     def execute(self) -> Iterator[pa.RecordBatch]:
         """Execute sort, via the merge engine when one is attached."""
-        engine = self.merge_engine()
-        if engine is not None and self._can_merge_sort():
-            yield from self._execute_merge_sort(engine)
+        if self._can_merge_sort():
+            yield from self._execute_merge_sort(_require_engine(self))
             return
         yield from self._execute_pyarrow_sort()
 
@@ -2907,7 +2328,10 @@ class PhysicalSort(PhysicalPlanNode):
         a DuckDB fragment for the merge query.
         """
         order = clauses.order_by(
-            self.sort_keys, self.ascending, self.nulls_order, MergeResolver(aliases),
+            self.sort_keys,
+            self.ascending,
+            self.nulls_order,
+            MergeResolver(aliases),
             fill_nulls_default=True,
         )
         parts = []
@@ -3144,11 +2568,7 @@ class PhysicalUnion(PhysicalPlanNode):
     def execute(self) -> Iterator[pa.RecordBatch]:
         """Yield all input batches, deduplicating rows when distinct."""
         if self.distinct:
-            engine = self.merge_engine()
-            if engine is not None:
-                yield from self._execute_merge_distinct(engine)
-            else:
-                yield from self._execute_distinct()
+            yield from self._execute_merge_distinct(_require_engine(self))
             return
         for input_node in self.inputs:
             yield from input_node.execute()
@@ -3168,29 +2588,6 @@ class PhysicalUnion(PhysicalPlanNode):
             selects.append(f"SELECT * FROM {name}")
         return engine.run(" UNION ".join(selects), inputs)
 
-    def _execute_distinct(self) -> Iterator[pa.RecordBatch]:
-        """Yield input batches with duplicate rows removed."""
-        seen_rows: Set[tuple] = set()
-        for input_node in self.inputs:
-            for batch in input_node.execute():
-                deduplicated = self._drop_seen_rows(batch, seen_rows)
-                if deduplicated.num_rows > 0:
-                    yield deduplicated
-
-    def _drop_seen_rows(
-        self, batch: pa.RecordBatch, seen_rows: Set[tuple]
-    ) -> pa.RecordBatch:
-        """Filter out rows whose full tuple was already emitted."""
-        keep_mask = []
-        for row_index in range(batch.num_rows):
-            row = _batch_row_tuple(batch, row_index)
-            if row in seen_rows:
-                keep_mask.append(False)
-            else:
-                seen_rows.add(row)
-                keep_mask.append(True)
-        return batch.filter(pa.array(keep_mask))
-
     def schema(self) -> pa.Schema:
         return self.inputs[0].schema()
 
@@ -3200,14 +2597,6 @@ class PhysicalUnion(PhysicalPlanNode):
     def __repr__(self) -> str:
         kind = "DISTINCT" if self.distinct else "ALL"
         return f"PhysicalUnion({kind}, {len(self.inputs)} inputs)"
-
-
-def _batch_row_tuple(batch: pa.RecordBatch, row_index: int) -> tuple:
-    """Extract one row of a batch as a hashable Python tuple."""
-    values = []
-    for column_index in range(batch.num_columns):
-        values.append(batch.column(column_index)[row_index].as_py())
-    return tuple(values)
 
 
 _SET_OP_EXP = {
@@ -3306,7 +2695,10 @@ class PhysicalRemoteSetOp(PhysicalPlanNode):
         subquery = exp.Subquery(this=set_op_ast, alias=alias)
         select = exp.Select(expressions=[exp.Star()]).from_(subquery)
         order = clauses.order_by(
-            self.order_by_keys, self.order_by_ascending, self.order_by_nulls, CANONICAL_SOURCE_RESOLVER
+            self.order_by_keys,
+            self.order_by_ascending,
+            self.order_by_nulls,
+            CANONICAL_SOURCE_RESOLVER,
         )
         if order is not None:
             select.set("order", order)
@@ -3331,11 +2723,7 @@ class PhysicalSetOperation(PhysicalPlanNode):
 
     def execute(self) -> Iterator[pa.RecordBatch]:
         """Yield the combined rows honoring INTERSECT/EXCEPT semantics."""
-        engine = self.merge_engine()
-        if engine is not None:
-            yield from self._execute_merge_setop(engine)
-            return
-        yield from self._execute_row_loop()
+        yield from self._execute_merge_setop(_require_engine(self))
 
     def _execute_merge_setop(self, engine) -> Iterator[pa.RecordBatch]:
         """Run INTERSECT/EXCEPT (distinct or ALL) through DuckDB.
@@ -3360,73 +2748,6 @@ class PhysicalSetOperation(PhysicalPlanNode):
         """DuckDB keyword for this set operation and multiset mode."""
         base = "INTERSECT" if self.kind == SetOpKind.INTERSECT else "EXCEPT"
         return base if self.distinct else f"{base} ALL"
-
-    def _execute_row_loop(self) -> Iterator[pa.RecordBatch]:
-        """Row-at-a-time INTERSECT/EXCEPT (fallback when no engine is attached)."""
-        right_counts = self._row_counts(self.right)
-        emitted: Set[tuple] = set()
-        for batch in self.left.execute():
-            kept = self._select_rows(batch, right_counts, emitted)
-            if kept.num_rows > 0:
-                yield kept
-
-    def _select_rows(
-        self,
-        batch: pa.RecordBatch,
-        right_counts: Dict[tuple, int],
-        emitted: Set[tuple],
-    ) -> pa.RecordBatch:
-        """Build the keep-mask for one left batch under the set-op rules."""
-        keep_mask = []
-        for row_index in range(batch.num_rows):
-            row = _batch_row_tuple(batch, row_index)
-            keep_mask.append(self._keep_row(row, right_counts, emitted))
-        return batch.filter(pa.array(keep_mask))
-
-    def _keep_row(
-        self, row: tuple, right_counts: Dict[tuple, int], emitted: Set[tuple]
-    ) -> bool:
-        """Decide whether one left row belongs in the result."""
-        if self.distinct:
-            return self._keep_distinct(row, right_counts, emitted)
-        return self._keep_all(row, right_counts)
-
-    def _keep_distinct(
-        self, row: tuple, right_counts: Dict[tuple, int], emitted: Set[tuple]
-    ) -> bool:
-        """Distinct INTERSECT/EXCEPT: emit each qualifying row once."""
-        if row in emitted:
-            return False
-        present_on_right = right_counts.get(row, 0) > 0
-        qualifies = present_on_right
-        if self.kind == SetOpKind.EXCEPT:
-            qualifies = not present_on_right
-        if not qualifies:
-            return False
-        emitted.add(row)
-        return True
-
-    def _keep_all(self, row: tuple, right_counts: Dict[tuple, int]) -> bool:
-        """ALL form: consume right multiplicity per matched row."""
-        available = right_counts.get(row, 0)
-        if self.kind == SetOpKind.INTERSECT:
-            if available > 0:
-                right_counts[row] = available - 1
-                return True
-            return False
-        if available > 0:
-            right_counts[row] = available - 1
-            return False
-        return True
-
-    def _row_counts(self, node: PhysicalPlanNode) -> Dict[tuple, int]:
-        """Materialize one input as a multiset of row tuples."""
-        counts: Dict[tuple, int] = {}
-        for batch in node.execute():
-            for row_index in range(batch.num_rows):
-                row = _batch_row_tuple(batch, row_index)
-                counts[row] = counts.get(row, 0) + 1
-        return counts
 
     def schema(self) -> pa.Schema:
         return self.left.schema()
@@ -3536,9 +2857,8 @@ class PhysicalGroupedLimit(PhysicalPlanNode):
         …)`` window when keys are plain columns; otherwise the Python streaming
         path applies the per-key limit in row order.
         """
-        engine = self.merge_engine()
-        if engine is not None and self._can_merge():
-            yield from self._execute_merge(engine)
+        if self._can_merge():
+            yield from self._execute_merge(_require_engine(self))
         else:
             yield from self._execute_python()
 
@@ -3628,7 +2948,9 @@ class PhysicalGroupedLimit(PhysicalPlanNode):
         parts = []
         if self.order_by_keys:
             order = clauses.order_by(
-                self.order_by_keys, self.order_by_ascending, self.order_by_nulls,
+                self.order_by_keys,
+                self.order_by_ascending,
+                self.order_by_nulls,
                 MergeResolver({}),
             )
             for item in order.expressions:

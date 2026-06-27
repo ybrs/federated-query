@@ -33,6 +33,7 @@ class StaticSource(PhysicalPlanNode):
     """Physical node that replays a fixed list of batches."""
 
     batches: Any
+    output_schema: Any = None  # Declared schema for an empty (no-batch) source
 
     def children(self):
         """No children: this is a leaf source."""
@@ -44,7 +45,10 @@ class StaticSource(PhysicalPlanNode):
             yield batch
 
     def schema(self):
-        """Schema of the first batch (or empty)."""
+        """Declared schema, else the first batch's (a real empty input still
+        has a schema, so an explicit one is required when there are no batches)."""
+        if self.output_schema is not None:
+            return self.output_schema
         if self.batches:
             return self.batches[0].schema
         return pa.schema([])
@@ -60,7 +64,14 @@ def batch_of(**columns):
 
 
 def rows_of(node):
-    """Execute a physical node and collect rows as dicts."""
+    """Execute a physical node (with the DuckDB merge engine) and collect rows.
+
+    Local execution always runs through the merge engine, so the engine is
+    attached to the node and its children before executing.
+    """
+    from federated_query.executor.executor import _attach_merge_engine
+
+    _attach_merge_engine(node, _merge_engine())
     rows = []
     for batch in node.execute():
         for row in batch.to_pylist():
@@ -100,7 +111,9 @@ def test_union_distinct_deduplicates():
     left = StaticSource(batches=[batch_of(id=[1, 2])])
     right = StaticSource(batches=[batch_of(id=[2, 3])])
     node = PhysicalUnion(inputs=[left, right], distinct=True)
-    assert rows_of(node) == [{"id": 1}, {"id": 2}, {"id": 3}]
+    # UNION DISTINCT is a set operation with no ordering guarantee.
+    result = sorted(rows_of(node), key=lambda row: row["id"])
+    assert result == [{"id": 1}, {"id": 2}, {"id": 3}]
 
 
 def test_single_row_guard_passes_one_row():
@@ -239,7 +252,7 @@ def test_left_hash_join_null_probe_key_emits_outer_row():
 
 def test_global_aggregate_over_empty_input_emits_one_row():
     """SQL: SELECT COUNT(*), MAX(v) over no rows is one row (0, NULL)."""
-    empty = StaticSource(batches=[])
+    empty = StaticSource(batches=[], output_schema=pa.schema([("v", pa.int64())]))
     count_star = FunctionCall(function_name="COUNT", args=[], is_aggregate=True)
     max_v = FunctionCall(function_name="MAX", args=[col("v")], is_aggregate=True)
     node = PhysicalHashAggregate(
@@ -253,7 +266,7 @@ def test_global_aggregate_over_empty_input_emits_one_row():
 
 def test_sum_over_empty_input_is_null():
     """SQL: SUM over no rows is NULL, not 0."""
-    empty = StaticSource(batches=[])
+    empty = StaticSource(batches=[], output_schema=pa.schema([("v", pa.int64())]))
     sum_v = FunctionCall(function_name="SUM", args=[col("v")], is_aggregate=True)
     node = PhysicalHashAggregate(
         input=empty, group_by=[], aggregates=[sum_v], output_names=["total"]
