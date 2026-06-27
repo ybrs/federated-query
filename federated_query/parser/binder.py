@@ -1091,6 +1091,69 @@ class Binder:
             data_type=found_column.data_type,
         )
 
+    def resolve_in_scopes(
+        self, scopes: List[Dict[str, Table]], col_ref: ColumnRef
+    ) -> ColumnRef:
+        """Resolve a column reference innermost-first across a scope chain.
+
+        This is the SINGLE column resolver for the whole binder (top-level and
+        subquery): a qualified reference resolves against the nearest scope that
+        defines its table, an unqualified one against the nearest scope that
+        defines the column (ambiguity within a scope is an error). A reference
+        that resolves in no scope raises, so a typo never slips through unbound.
+        """
+        if col_ref.column == "*":
+            return col_ref
+        if col_ref.table is not None:
+            return self._resolve_qualified(scopes, col_ref)
+        return self._resolve_unqualified(scopes, col_ref)
+
+    def _resolve_qualified(
+        self, scopes: List[Dict[str, Table]], col_ref: ColumnRef
+    ) -> ColumnRef:
+        """Resolve a table-qualified reference to the nearest scope with its table."""
+        for scope in reversed(scopes):
+            table = scope.get(col_ref.table)
+            if table is None:
+                continue
+            column = table.get_column(col_ref.column)
+            if column is None:
+                raise BindingError(
+                    f"Column '{col_ref.column}' not found in table '{col_ref.table}'"
+                )
+            return ColumnRef(
+                table=col_ref.table, column=col_ref.column, data_type=column.data_type
+            )
+        raise BindingError(f"Unknown table '{col_ref.table}' for column reference")
+
+    def _resolve_unqualified(
+        self, scopes: List[Dict[str, Table]], col_ref: ColumnRef
+    ) -> ColumnRef:
+        """Resolve a bare column name to the nearest scope that defines it."""
+        for scope in reversed(scopes):
+            match = self._match_in_scope(scope, col_ref.column)
+            if match is not None:
+                return match
+        raise BindingError(f"Column '{col_ref.column}' not found in any table in scope")
+
+    def _match_in_scope(
+        self, scope: Dict[str, Table], column_name: str
+    ) -> Optional[ColumnRef]:
+        """Find a column in one scope; ambiguity across its tables is an error."""
+        found = None
+        for alias, table in scope.items():
+            column = table.get_column(column_name)
+            if column is None:
+                continue
+            if found is not None:
+                raise BindingError(
+                    f"Column '{column_name}' is ambiguous (found in multiple tables)"
+                )
+            found = ColumnRef(
+                table=alias, column=column_name, data_type=column.data_type
+            )
+        return found
+
     def _unresolved_or_raise(self, col_ref: ColumnRef) -> ColumnRef:
         """Keep a column unbound only if an enclosing scope defines it.
 
@@ -1606,7 +1669,7 @@ class SubqueryPlanBinder:
     ) -> Expression:
         """Bind one expression with innermost-first scope resolution."""
         if isinstance(expr, ColumnRef):
-            return self._resolve_column(expr, scopes)
+            return self.host.resolve_in_scopes(scopes, expr)
         if isinstance(expr, Literal):
             return expr
         return self._bind_compound_expr(expr, scopes)
@@ -1698,64 +1761,6 @@ class SubqueryPlanBinder:
         if expr.else_result is not None:
             bound_else = self._bind_expr(expr.else_result, scopes)
         return CaseExpr(when_clauses=bound_when, else_result=bound_else)
-
-    def _resolve_column(
-        self, col_ref: ColumnRef, scopes: List[Dict[str, Table]]
-    ) -> ColumnRef:
-        """Resolve a column reference innermost-first across scopes."""
-        if col_ref.column == "*":
-            return col_ref
-        if col_ref.table is not None:
-            return self._resolve_qualified(col_ref, scopes)
-        return self._resolve_unqualified(col_ref, scopes)
-
-    def _resolve_qualified(
-        self, col_ref: ColumnRef, scopes: List[Dict[str, Table]]
-    ) -> ColumnRef:
-        """Resolve a table-qualified reference to its nearest scope."""
-        for scope in reversed(scopes):
-            table = scope.get(col_ref.table)
-            if table is None:
-                continue
-            column = table.get_column(col_ref.column)
-            if column is None:
-                raise BindingError(
-                    f"Column '{col_ref.column}' not found in table '{col_ref.table}'"
-                )
-            return ColumnRef(
-                table=col_ref.table,
-                column=col_ref.column,
-                data_type=column.data_type,
-            )
-        raise BindingError(f"Unknown table '{col_ref.table}' in subquery")
-
-    def _resolve_unqualified(
-        self, col_ref: ColumnRef, scopes: List[Dict[str, Table]]
-    ) -> ColumnRef:
-        """Resolve a bare column name to the nearest scope defining it."""
-        for scope in reversed(scopes):
-            match = self._match_in_scope(col_ref.column, scope)
-            if match is not None:
-                return match
-        raise BindingError(f"Column '{col_ref.column}' not found in any visible scope")
-
-    def _match_in_scope(
-        self, column_name: str, scope: Dict[str, Table]
-    ) -> Optional[ColumnRef]:
-        """Find a column in one scope; ambiguity is an error."""
-        found = None
-        for alias, table in scope.items():
-            column = table.get_column(column_name)
-            if column is None:
-                continue
-            if found is not None:
-                raise BindingError(
-                    f"Column '{column_name}' is ambiguous in subquery scope"
-                )
-            found = ColumnRef(
-                table=alias, column=column_name, data_type=column.data_type
-            )
-        return found
 
     def __repr__(self) -> str:
         return f"SubqueryPlanBinder(scopes={len(self.outer_scopes)})"
