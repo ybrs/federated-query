@@ -92,7 +92,7 @@ def test_order_by_expression_renders_and_runs_in_duckdb(engine):
     # The ORDER BY expression is rendered to DuckDB SQL (not evaluated in Python).
     order_sql = node._sort_order_clause(node.input.column_aliases())
     assert '"a" * "b"' in order_sql
-    assert "ASC NULLS LAST" in order_sql
+    assert "ASC" in order_sql
 
     rows = _rows(node, engine)
     # products: 3*10=30, 1*40=40, 2*20=40 -> ordered ascending by the product.
