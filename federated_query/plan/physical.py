@@ -3291,7 +3291,7 @@ class PhysicalRemoteSetOp(PhysicalPlanNode):
         """Build the AST for one branch (a scan or a nested set operation)."""
         if isinstance(branch, PhysicalRemoteSetOp):
             return branch.build_remote_ast()
-        return self.datasource_connection.parse_query(branch._build_query())
+        return branch._build_ast()
 
     def _combine(
         self, left_ast: exp.Expression, right_ast: exp.Expression
@@ -3301,54 +3301,16 @@ class PhysicalRemoteSetOp(PhysicalPlanNode):
         return node_cls(this=left_ast, expression=right_ast, distinct=self.distinct)
 
     def _wrap_order_limit(self, set_op_ast: exp.Expression) -> exp.Expression:
-        """Wrap the set operation in an outer SELECT carrying ORDER BY/LIMIT."""
-        inner_sql = set_op_ast.sql(dialect="postgres")
-        wrapped = f"SELECT * FROM ({inner_sql}) AS _setop"
-        wrapped = self._append_order_by(wrapped)
-        wrapped = self._append_limit_offset(wrapped)
-        return self.datasource_connection.parse_query(wrapped)
-
-    def _append_order_by(self, query: str) -> str:
-        """Append the ORDER BY clause built from the folded sort keys."""
-        if not self.order_by_keys:
-            return query
-        items = []
-        for index in range(len(self.order_by_keys)):
-            items.append(self._order_item(index))
-        return f"{query} ORDER BY {', '.join(items)}"
-
-    def _order_item(self, index: int) -> str:
-        """Render one ORDER BY item with direction and NULLS handling."""
-        item = self.order_by_keys[index].to_sql()
-        item = self._with_direction(item, index)
-        return self._with_nulls(item, index)
-
-    def _with_direction(self, item: str, index: int) -> str:
-        """Add DESC when the sort direction for this key is descending."""
-        if not self.order_by_ascending:
-            return item
-        if index < len(self.order_by_ascending) and not self.order_by_ascending[index]:
-            return f"{item} DESC"
-        return item
-
-    def _with_nulls(self, item: str, index: int) -> str:
-        """Append NULLS FIRST/LAST when specified for this key."""
-        if not self.order_by_nulls:
-            return item
-        if index >= len(self.order_by_nulls):
-            return item
-        spec = self.order_by_nulls[index]
-        if not spec:
-            return item
-        return f"{item} NULLS {spec}"
-
-    def _append_limit_offset(self, query: str) -> str:
-        """Append LIMIT and/or OFFSET clauses when present."""
-        if self.limit is not None:
-            query = f"{query} LIMIT {self.limit}"
-        if self.offset:
-            query = f"{query} OFFSET {self.offset}"
-        return query
+        """Wrap the set operation in an outer SELECT carrying ORDER BY/LIMIT/OFFSET."""
+        alias = exp.TableAlias(this=exp.to_identifier("_setop", quoted=True))
+        subquery = exp.Subquery(this=set_op_ast, alias=alias)
+        select = exp.Select(expressions=[exp.Star()]).from_(subquery)
+        order = clauses.order_by(
+            self.order_by_keys, self.order_by_ascending, self.order_by_nulls, CANONICAL_SOURCE_RESOLVER
+        )
+        if order is not None:
+            select.set("order", order)
+        return clauses.apply_limit_offset(select, self.limit, self.offset)
 
 
 class PhysicalSetOperation(PhysicalPlanNode):
