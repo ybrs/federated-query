@@ -194,22 +194,6 @@ def to_source_sql(connection, postgres_sql: str) -> str:
     return ast.sql(dialect=connection.render_dialect)
 
 
-def render_grouping_sets(grouping_sets, render_expr) -> str:
-    """Render ``GROUPING SETS ((a, b), (a), ())`` from explicit grouping sets.
-
-    ``render_expr`` turns one key expression into SQL (plain ``to_sql`` for
-    pushdown, alias-resolved for the merge engine), so both render paths share
-    one structure.
-    """
-    rendered_sets = []
-    for grouping_set in grouping_sets:
-        columns = []
-        for expr in grouping_set:
-            columns.append(render_expr(expr))
-        rendered_sets.append("(" + ", ".join(columns) + ")")
-    return "GROUPING SETS (" + ", ".join(rendered_sets) + ")"
-
-
 def _literal_for_value(value):
     """Wrap a Python join-key value as a typed Literal, or None if unsupported.
 
@@ -394,32 +378,6 @@ def _qualify_join_condition(condition, left_names, right_names):
             operand=_qualify_join_condition(condition.operand, left_names, right_names),
         )
     return condition
-
-
-def _resolve_window_columns(expr, aliases):
-    """Rebuild an expression with each ColumnRef resolved to its physical name.
-
-    After a merge-engine join the registered relation has flat physical column
-    names; ``aliases`` maps each logical ``(table, column)`` to that name.
-    Rewriting the tree and then calling ``to_sql()`` renders the expression
-    against the registered relation without qualifier ambiguity. Uses the shared
-    map_children so every compound node type is covered by one implementation.
-    """
-    from .expressions import ColumnRef, map_children
-
-    if isinstance(expr, ColumnRef):
-        return _resolved_column_ref(expr, aliases)
-    return map_children(expr, lambda child: _resolve_window_columns(child, aliases))
-
-
-def _resolved_column_ref(expr, aliases):
-    """Map a ColumnRef to a bare ColumnRef using the input's physical names."""
-    from .expressions import ColumnRef
-
-    if expr.column == "*":
-        return expr
-    resolved = aliases.get((expr.table, expr.column)) if aliases else None
-    return ColumnRef(table=None, column=resolved or expr.column)
 
 
 def _merge_join_select_list(join_type, left_schema, right_schema) -> str:
@@ -932,16 +890,23 @@ class PhysicalWindow(PhysicalPlanNode):
         return f"SELECT {select_list} FROM {_MERGE_WINDOW_RELATION}"
 
     def _window_select_list(self, aliases) -> str:
-        """Alias each projection expression, resolving columns to physical names."""
+        """Alias each projection expression via the shared clause builder.
+
+        Columns resolve to their physical merge-relation names (MergeResolver) and
+        the whole expression (window function included) lowers through the one
+        emitter to DuckDB SQL.
+        """
         if len(self.expressions) != len(self.output_names):
             raise ValueError(
                 f"expressions ({len(self.expressions)}) and output_names "
                 f"({len(self.output_names)}) length mismatch"
             )
+        items = clauses.select_expressions(
+            self.expressions, self.output_names, MergeResolver(aliases)
+        )
         parts = []
-        for expr, name in zip(self.expressions, self.output_names):
-            resolved = _resolve_window_columns(expr, aliases)
-            parts.append(f'{resolved.to_sql()} AS "{name}"')
+        for item in items:
+            parts.append(item.sql(dialect="duckdb"))
         return ", ".join(parts)
 
     def schema(self) -> pa.Schema:
@@ -1180,7 +1145,7 @@ class PhysicalHashJoin(PhysicalPlanNode):
 
     def _join_sql(self, left_schema: pa.Schema, right_schema: pa.Schema) -> str:
         """Render the join SELECT for this join type over the registered relations."""
-        select_list = self._merge_select_list_for_type(left_schema, right_schema)
+        select_list = _merge_join_select_list(self.join_type, left_schema, right_schema)
         return (
             f"SELECT {select_list} "
             f"FROM {_MERGE_LEFT_RELATION} AS l "
@@ -1199,43 +1164,6 @@ class PhysicalHashJoin(PhysicalPlanNode):
             JoinType.ANTI: "ANTI JOIN",
         }
         return keywords[self.join_type]
-
-    def _merge_select_list_for_type(
-        self, left_schema: pa.Schema, right_schema: pa.Schema
-    ) -> str:
-        """SEMI/ANTI emit only the left columns; other joins emit both sides."""
-        if self.join_type in (JoinType.SEMI, JoinType.ANTI):
-            return self._merge_left_select_list(left_schema)
-        return self._merge_select_list(left_schema, right_schema)
-
-    def _merge_left_select_list(self, left_schema: pa.Schema) -> str:
-        """Alias only the left columns, for SEMI/ANTI output."""
-        parts = []
-        for name in left_schema.names:
-            parts.append(f'l."{name}" AS "{name}"')
-        return ", ".join(parts)
-
-    def _merge_select_list(
-        self, left_schema: pa.Schema, right_schema: pa.Schema
-    ) -> str:
-        """Alias left then right columns to reproduce the join output schema.
-
-        The actual materialized input schemas are used (not ``schema()``) so the
-        output matches the row-at-a-time path, which reads real batch fields;
-        a right column whose name collides with a left one is renamed with the
-        ``right_`` prefix, exactly as ``_join_rows`` does.
-        """
-        left_names = left_schema.names
-        left_name_set = set(left_names)
-        parts = []
-        for name in left_names:
-            parts.append(f'l."{name}" AS "{name}"')
-        for field in right_schema:
-            output_name = field.name
-            if output_name in left_name_set:
-                output_name = f"right_{output_name}"
-            parts.append(f'r."{field.name}" AS "{output_name}"')
-        return ", ".join(parts)
 
     def _merge_on_clause(self) -> str:
         """Render the equi-join condition as l.key = r.key conjuncts."""
@@ -1653,15 +1581,10 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         return ", ".join(parts)
 
     def _aggregate_group_list(self, aliases) -> str:
-        """Render the GROUP BY keys (GROUPING SETS for ROLLUP/CUBE/GROUPING SETS)."""
-        if self.grouping_sets is not None:
-            return render_grouping_sets(
-                self.grouping_sets, lambda e: self._render_agg_expr(e, aliases)
-            )
-        parts = []
-        for expr in self.group_by:
-            parts.append(self._render_agg_expr(expr, aliases))
-        return ", ".join(parts)
+        """Render GROUP BY keys / GROUPING SETS via the shared clause builder."""
+        return clauses.group_by_fragment(
+            self.group_by, self.grouping_sets, MergeResolver(aliases), dialect="duckdb"
+        )
 
     def _render_agg_expr(self, expr: Expression, aliases) -> str:
         """Render a SELECT/group expression against the input's physical columns.
