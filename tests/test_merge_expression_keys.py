@@ -95,8 +95,10 @@ def test_order_by_expression_renders_and_runs_in_duckdb(engine):
     assert "ASC NULLS LAST" in order_sql
 
     rows = _rows(node, engine)
-    # products: 3*10=30, 1*40=40, 2*20=40 -> ascending keeps 30 first.
-    assert [(r["a"], r["b"]) for r in rows] == [(3, 10), (1, 40), (2, 20)]
+    # products: 3*10=30, 1*40=40, 2*20=40 -> ordered ascending by the product.
+    # The two equal products tie, so assert the product sequence, not row order.
+    products = [r["a"] * r["b"] for r in rows]
+    assert products == [30, 40, 40]
 
 
 def test_group_by_with_expression_aggregate_arg(engine):
