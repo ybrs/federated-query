@@ -1400,42 +1400,16 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
         return f"{query} GROUP BY {group_clause}"
 
     def _apply_order_by(self, query: str) -> str:
-        """Append ORDER BY clause when present."""
+        """Append the ORDER BY clause via the shared clause builder when present."""
         if not self.order_by_keys:
             return query
-        order_items = []
-        for index in range(len(self.order_by_keys)):
-            item = self._build_order_item(index)
-            order_items.append(item)
-        order_clause = ", ".join(order_items)
+        order_clause = clauses.order_by_fragment(
+            self.order_by_keys,
+            self.order_by_ascending,
+            self.order_by_nulls,
+            CANONICAL_SOURCE_RESOLVER,
+        )
         return f"{query} ORDER BY {order_clause}"
-
-    def _build_order_item(self, index: int) -> str:
-        """Build a single ORDER BY item with direction and NULLS handling."""
-        item = self.order_by_keys[index].to_sql()
-        item = self._apply_order_direction(item, index)
-        return self._apply_nulls_order(item, index)
-
-    def _apply_order_direction(self, item: str, index: int) -> str:
-        """Add DESC keyword when sorting direction is descending."""
-        if self.order_by_ascending is None:
-            return item
-        if index >= len(self.order_by_ascending):
-            return item
-        if self.order_by_ascending[index]:
-            return item
-        return f"{item} DESC"
-
-    def _apply_nulls_order(self, item: str, index: int) -> str:
-        """Append NULLS FIRST/LAST when specified."""
-        if self.order_by_nulls is None:
-            return item
-        if index >= len(self.order_by_nulls):
-            return item
-        nulls_spec = self.order_by_nulls[index]
-        if not nulls_spec:
-            return item
-        return f"{item} NULLS {nulls_spec}"
 
     def _build_select_clause(self) -> str:
         if self.aggregates:
@@ -1447,28 +1421,20 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
         return ", ".join(items)
 
     def _build_aggregate_select_clause(self) -> str:
-        items = []
-        names = self.output_names or []
-        expressions = self.aggregates or []
-        index = 0
-        while index < len(expressions):
-            expr_sql = expressions[index].to_sql()
-            alias = names[index] if index < len(names) else None
-            if alias:
-                items.append(f'{expr_sql} AS "{alias}"')
-            else:
-                items.append(expr_sql)
-            index += 1
-        return ", ".join(items)
+        """Render the aggregate SELECT list via the shared clause builder."""
+        items = clauses.select_expressions(
+            self.aggregates or [], self.output_names or [], CANONICAL_SOURCE_RESOLVER
+        )
+        parts = []
+        for item in items:
+            parts.append(item.sql(dialect="postgres"))
+        return ", ".join(parts)
 
     def _build_group_by_clause(self) -> str:
-        """Render the GROUP BY keys (GROUPING SETS for ROLLUP/CUBE/GROUPING SETS)."""
-        if self.grouping_sets is not None:
-            return render_grouping_sets(self.grouping_sets, lambda e: e.to_sql())
-        parts = []
-        for expr in self.group_by or []:
-            parts.append(expr.to_sql())
-        return ", ".join(parts)
+        """Render the GROUP BY keys via the shared clause builder."""
+        return clauses.group_by_fragment(
+            self.group_by, self.grouping_sets, CANONICAL_SOURCE_RESOLVER
+        )
 
     def _append_select_items(
         self, scan: PhysicalScan, items: List[str], seen: Set[str], is_right: bool
@@ -1836,17 +1802,14 @@ class PhysicalSort(PhysicalPlanNode):
         so the merge engine's ordering matches the source's; each key renders to
         a DuckDB fragment for the merge query.
         """
-        order = clauses.order_by(
+        return clauses.order_by_fragment(
             self.sort_keys,
             self.ascending,
             self.nulls_order,
             MergeResolver(aliases),
+            dialect="duckdb",
             fill_nulls_default=True,
         )
-        parts = []
-        for item in order.expressions:
-            parts.append(item.sql(dialect="duckdb"))
-        return ", ".join(parts)
 
     def schema(self) -> pa.Schema:
         return self.input.schema()
@@ -2376,14 +2339,15 @@ class PhysicalGroupedLimit(PhysicalPlanNode):
         """
         parts = []
         if self.order_by_keys:
-            order = clauses.order_by(
-                self.order_by_keys,
-                self.order_by_ascending,
-                self.order_by_nulls,
-                MergeResolver({}),
+            parts.append(
+                clauses.order_by_fragment(
+                    self.order_by_keys,
+                    self.order_by_ascending,
+                    self.order_by_nulls,
+                    MergeResolver({}),
+                    dialect="duckdb",
+                )
             )
-            for item in order.expressions:
-                parts.append(item.sql(dialect="duckdb"))
         parts.append(f'"{_GROUPED_LIMIT_INDEX_COL}" ASC')
         return ", ".join(parts)
 

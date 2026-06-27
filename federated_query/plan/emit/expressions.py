@@ -10,14 +10,15 @@ from sqlglot import exp
 
 from .. import expressions as E
 
-
 # Allowlist: engine binary operator -> sqlglot node builder. A missing entry
 # raises in visit_binary_op (never fall through to a default operator).
 _BINARY_BUILDERS = {
     E.BinaryOpType.ADD: lambda l, r: exp.Add(this=l, expression=r),
     E.BinaryOpType.SUBTRACT: lambda l, r: exp.Sub(this=l, expression=r),
     E.BinaryOpType.MULTIPLY: lambda l, r: exp.Mul(this=l, expression=r),
-    E.BinaryOpType.DIVIDE: lambda l, r: exp.Div(this=l, expression=r, typed=True, safe=False),
+    E.BinaryOpType.DIVIDE: lambda l, r: exp.Div(
+        this=l, expression=r, typed=True, safe=False
+    ),
     E.BinaryOpType.MODULO: lambda l, r: exp.Mod(this=l, expression=r),
     E.BinaryOpType.EQ: lambda l, r: exp.EQ(this=l, expression=r),
     E.BinaryOpType.NEQ: lambda l, r: exp.NEQ(this=l, expression=r),
@@ -41,7 +42,9 @@ _UNARY_BUILDERS = {
     E.UnaryOpType.NOT: lambda o: exp.Not(this=o),
     E.UnaryOpType.NEGATE: lambda o: exp.Neg(this=o),
     E.UnaryOpType.IS_NULL: lambda o: exp.Is(this=o, expression=exp.Null()),
-    E.UnaryOpType.IS_NOT_NULL: lambda o: exp.Not(this=exp.Is(this=o, expression=exp.Null())),
+    E.UnaryOpType.IS_NOT_NULL: lambda o: exp.Not(
+        this=exp.Is(this=o, expression=exp.Null())
+    ),
 }
 
 # Engine data types whose literal renders as a numeric token.
@@ -139,7 +142,9 @@ class SqlglotEmitter(E.ExpressionVisitor):
 
     def visit_function_call(self, expr):
         """Render a function/aggregate call, with DISTINCT and WITHIN GROUP."""
-        call = self._build_call(expr.function_name, self._emit_each(expr.args), expr.distinct)
+        call = self._build_call(
+            expr.function_name, self._emit_each(expr.args), expr.distinct
+        )
         if expr.within_group_key is None:
             return call
         return self._wrap_within_group(call, expr)
@@ -155,7 +160,9 @@ class SqlglotEmitter(E.ExpressionVisitor):
         different NULL semantics).
         """
         if distinct:
-            return exp.Anonymous(this=name, expressions=[exp.Distinct(expressions=args)])
+            return exp.Anonymous(
+                this=name, expressions=[exp.Distinct(expressions=args)]
+            )
         return exp.Anonymous(this=name, expressions=args)
 
     def _wrap_within_group(self, call: exp.Expression, expr) -> exp.Expression:
@@ -183,7 +190,9 @@ class SqlglotEmitter(E.ExpressionVisitor):
 
     def visit_in_list(self, expr):
         """Render ``(value IN (options...))``, parenthesized like a predicate."""
-        in_node = exp.In(this=self._emit(expr.value), expressions=self._emit_each(expr.options))
+        in_node = exp.In(
+            this=self._emit(expr.value), expressions=self._emit_each(expr.options)
+        )
         return exp.Paren(this=in_node)
 
     def visit_between(self, expr):
@@ -197,7 +206,9 @@ class SqlglotEmitter(E.ExpressionVisitor):
 
     def visit_cast(self, expr):
         """Render ``CAST(expr AS target_type)``, parsing the type text."""
-        return exp.Cast(this=self._emit(expr.expr), to=exp.DataType.build(expr.target_type))
+        return exp.Cast(
+            this=self._emit(expr.expr), to=exp.DataType.build(expr.target_type)
+        )
 
     def visit_extract(self, expr):
         """Render ``EXTRACT(field FROM source)``."""
@@ -227,7 +238,9 @@ class SqlglotEmitter(E.ExpressionVisitor):
         """Build the OVER clause ORDER BY, or None when there are no keys."""
         if not expr.order_keys:
             return None
-        ordered = self._ordered_keys(expr.order_keys, expr.order_ascending, expr.order_nulls)
+        ordered = self._ordered_keys(
+            expr.order_keys, expr.order_ascending, expr.order_nulls
+        )
         return exp.Order(expressions=ordered)
 
     def _ordered_keys(self, keys, ascending, nulls) -> list:
@@ -243,11 +256,15 @@ class SqlglotEmitter(E.ExpressionVisitor):
         nulls_spec = nulls[index]
         if nulls_spec is None:
             return exp.Ordered(this=self._emit(key), desc=desc)
-        return exp.Ordered(this=self._emit(key), desc=desc, nulls_first=(nulls_spec.upper() == "FIRST"))
+        return exp.Ordered(
+            this=self._emit(key), desc=desc, nulls_first=(nulls_spec.upper() == "FIRST")
+        )
 
     def visit_subquery(self, expr):
         """A scalar subquery must be decorrelated before SQL emission."""
-        raise ValueError("SubqueryExpression reached SQL emission; decorrelate it first")
+        raise ValueError(
+            "SubqueryExpression reached SQL emission; decorrelate it first"
+        )
 
     def visit_exists(self, expr):
         """An EXISTS predicate must be decorrelated before SQL emission."""
@@ -259,7 +276,9 @@ class SqlglotEmitter(E.ExpressionVisitor):
 
     def visit_quantified_comparison(self, expr):
         """A quantified comparison must be decorrelated before SQL emission."""
-        raise ValueError("QuantifiedComparison reached SQL emission; decorrelate it first")
+        raise ValueError(
+            "QuantifiedComparison reached SQL emission; decorrelate it first"
+        )
 
     def visit_tuple(self, expr):
         """Render a row-value tuple ``(a, b, ...)``."""

@@ -349,9 +349,7 @@ class Binder:
 
         table = self._get_table_from_plan(bound_input)
         bound_keys = self._bind_sort_keys(sort.sort_keys, table)
-        return sort.model_copy(
-            update={"input": bound_input, "sort_keys": bound_keys}
-        )
+        return sort.model_copy(update={"input": bound_input, "sort_keys": bound_keys})
 
     def _bind_sort_keys(
         self, sort_keys: List[Expression], table: Optional[Table]
@@ -651,9 +649,7 @@ class Binder:
         self._cte_tables[cte.name] = table
         bound_child = self.bind(cte.child)
         self._restore_cte(cte.name, saved)
-        return cte.model_copy(
-            update={"cte_plan": bound_plan, "child": bound_child}
-        )
+        return cte.model_copy(update={"cte_plan": bound_plan, "child": bound_child})
 
     def _bind_recursive_cte(self, cte: CTE) -> CTE:
         """Bind a recursive CTE; its name is in scope while its own body binds."""
@@ -1192,9 +1188,7 @@ class Binder:
                 expr, lambda value: self._bind_expression(value, table)
             )
 
-        raise BindingError(
-            f"Unsupported expression type: {type(expr).__name__}"
-        )
+        raise BindingError(f"Unsupported expression type: {type(expr).__name__}")
 
     def _bind_cast(
         self,
@@ -1481,9 +1475,7 @@ class SubqueryPlanBinder:
             update={
                 "input": bound_input,
                 "expressions": bound_expressions,
-                "distinct_on": self._bind_subquery_distinct_on(
-                    projection, bound_input
-                ),
+                "distinct_on": self._bind_subquery_distinct_on(projection, bound_input),
             }
         )
 
@@ -1538,9 +1530,7 @@ class SubqueryPlanBinder:
         bound_keys = []
         for key in sort.sort_keys:
             bound_keys.append(self._bind_expr_for(key, bound_input))
-        return sort.model_copy(
-            update={"input": bound_input, "sort_keys": bound_keys}
-        )
+        return sort.model_copy(update={"input": bound_input, "sort_keys": bound_keys})
 
     def _bind_join(self, join: Join) -> Join:
         """Bind a join inside a subquery."""

@@ -36,7 +36,9 @@ class SourceResolver(ColumnResolver):
     def _star(self, table: Optional[str]) -> exp.Expression:
         """Build ``*`` or ``"alias".*`` depending on whether a table is given."""
         if table:
-            return exp.Column(this=exp.Star(), table=exp.to_identifier(table, quoted=True))
+            return exp.Column(
+                this=exp.Star(), table=exp.to_identifier(table, quoted=True)
+            )
         return exp.Star()
 
 

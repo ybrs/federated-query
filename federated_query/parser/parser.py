@@ -93,9 +93,7 @@ class Parser:
 
     # Per-JOIN clause args the converter consumes (right side, side/kind keyword,
     # ON condition, NATURAL method, USING columns).
-    SUPPORTED_JOIN_ARGS = frozenset(
-        {"this", "side", "kind", "on", "method", "using"}
-    )
+    SUPPORTED_JOIN_ARGS = frozenset({"this", "side", "kind", "on", "method", "using"})
 
     # Aggregate args the converter consumes. big_int is sqlglot's COUNT-returns-
     # bigint marker; separator is the STRING_AGG separator. Any other modifier
@@ -114,9 +112,7 @@ class Parser:
 
     # Window consumes PARTITION BY, ORDER BY and the frame spec; over is the
     # OVER-keyword marker carried by sqlglot.
-    SUPPORTED_WINDOW_ARGS = frozenset(
-        {"this", "partition_by", "order", "spec", "over"}
-    )
+    SUPPORTED_WINDOW_ARGS = frozenset({"this", "partition_by", "order", "spec", "over"})
 
     def __init__(self):
         """Initialize parser."""
@@ -580,9 +576,7 @@ class Parser:
         current_plan = left_plan
 
         for join_clause in joins:
-            self._reject_unsupported_args(
-                join_clause, self.SUPPORTED_JOIN_ARGS, "JOIN"
-            )
+            self._reject_unsupported_args(join_clause, self.SUPPORTED_JOIN_ARGS, "JOIN")
             if isinstance(join_clause.this, exp.Lateral):
                 current_plan = self._build_lateral_join(current_plan, join_clause)
                 continue
@@ -1411,9 +1405,7 @@ class Parser:
         with different semantics; it is rejected so it is not silently planned
         as a plain BETWEEN.
         """
-        self._reject_unsupported_args(
-            expr, self.SUPPORTED_BETWEEN_ARGS, "BETWEEN"
-        )
+        self._reject_unsupported_args(expr, self.SUPPORTED_BETWEEN_ARGS, "BETWEEN")
         value_expr = self._convert_expression(expr.this)
         low_expr = self._convert_expression(expr.args["low"])
         high_expr = self._convert_expression(expr.args["high"])
@@ -1825,9 +1817,7 @@ class Parser:
         dropped, so they fail fast instead.
         """
         if len(order.expressions) != 1:
-            raise UnsupportedSQLError(
-                "WITHIN GROUP supports a single ORDER BY key"
-            )
+            raise UnsupportedSQLError("WITHIN GROUP supports a single ORDER BY key")
         ordered = order.expressions[0]
         key = self._convert_expression(ordered.this)
         descending = bool(ordered.args.get("desc"))

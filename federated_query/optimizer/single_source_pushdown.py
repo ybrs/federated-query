@@ -880,11 +880,9 @@ class SingleSourcePushdown:
         ``emit.clauses.order_by`` implementation, then each key is rendered to a
         canonical Postgres fragment for the assembled query.
         """
-        order = clauses.order_by(keys, ascending, nulls, CANONICAL_SOURCE_RESOLVER)
-        parts: List[str] = []
-        for item in order.expressions:
-            parts.append(item.sql(dialect="postgres"))
-        return ", ".join(parts)
+        return clauses.order_by_fragment(
+            keys, ascending, nulls, CANONICAL_SOURCE_RESOLVER
+        )
 
     def _render_group_by(self, aggregate: Aggregate) -> Optional[str]:
         """Render the GROUP BY clause via the shared clause builder, or None.
@@ -893,14 +891,9 @@ class SingleSourcePushdown:
         ``emit.clauses.group_by`` implementation) so the source produces the
         super-aggregate rows; a flat group_by would drop them.
         """
-        group = clauses.group_by(
+        return clauses.group_by_fragment(
             aggregate.group_by, aggregate.grouping_sets, CANONICAL_SOURCE_RESOLVER
         )
-        if group is None:
-            return None
-        text = group.sql(dialect="postgres")
-        prefix = "GROUP BY "
-        return text[len(prefix):] if text.startswith(prefix) else text
 
     def _distinct_keyword(self, context: _PushContext) -> str:
         """Render SELECT, SELECT DISTINCT, or SELECT DISTINCT ON (keys)."""

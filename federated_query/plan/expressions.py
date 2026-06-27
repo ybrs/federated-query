@@ -48,7 +48,9 @@ class Expression(StateModel, ABC):
         """
         from .emit import expression_to_ast, CANONICAL_SOURCE_RESOLVER
 
-        return expression_to_ast(self, CANONICAL_SOURCE_RESOLVER).sql(dialect="postgres")
+        return expression_to_ast(self, CANONICAL_SOURCE_RESOLVER).sql(
+            dialect="postgres"
+        )
 
 
 class ColumnRef(Expression):
@@ -823,4 +825,6 @@ def _substitute_aggregate_refs(expr: Expression, output_map) -> Expression:
     """Replace aggregate-output column refs with their aggregate expressions."""
     if isinstance(expr, ColumnRef):
         return output_map.get(expr.column, expr)
-    return map_children(expr, lambda child: _substitute_aggregate_refs(child, output_map))
+    return map_children(
+        expr, lambda child: _substitute_aggregate_refs(child, output_map)
+    )

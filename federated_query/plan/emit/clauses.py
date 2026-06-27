@@ -39,11 +39,15 @@ def order_by(keys, ascending, nulls, resolver, fill_nulls_default=False):
         return None
     ordered = []
     for index, key in enumerate(keys):
-        ordered.append(_ordered_key(index, key, ascending, nulls, resolver, fill_nulls_default))
+        ordered.append(
+            _ordered_key(index, key, ascending, nulls, resolver, fill_nulls_default)
+        )
     return exp.Order(expressions=ordered)
 
 
-def _ordered_key(index, key, ascending, nulls, resolver, fill_nulls_default) -> exp.Ordered:
+def _ordered_key(
+    index, key, ascending, nulls, resolver, fill_nulls_default
+) -> exp.Ordered:
     """Build one ordered key, honoring its ascending flag and NULLS placement."""
     desc = bool(ascending) and index < len(ascending) and not ascending[index]
     spec = nulls[index] if nulls and index < len(nulls) else None
@@ -53,6 +57,35 @@ def _ordered_key(index, key, ascending, nulls, resolver, fill_nulls_default) -> 
     if spec is None:
         return exp.Ordered(this=ast, desc=desc)
     return exp.Ordered(this=ast, desc=desc, nulls_first=(spec.upper() == "FIRST"))
+
+
+def order_by_fragment(
+    keys, ascending, nulls, resolver, dialect="postgres", fill_nulls_default=False
+):
+    """Render ORDER BY keys to a comma-separated SQL fragment (no ``ORDER BY``).
+
+    The single ``order_by`` builder produces the AST; each key is then rendered
+    to ``dialect``. Used by every node that assembles ORDER BY into a SQL string
+    (remote scans/joins/pushdown and the local merge operators).
+    """
+    order = order_by(keys, ascending, nulls, resolver, fill_nulls_default)
+    parts = []
+    for item in order.expressions:
+        parts.append(item.sql(dialect=dialect))
+    return ", ".join(parts)
+
+
+def group_by_fragment(group_keys, grouping_sets, resolver, dialect="postgres"):
+    """Render GROUP BY keys / GROUPING SETS to a SQL fragment (no ``GROUP BY``).
+
+    Returns None when there is nothing to group by.
+    """
+    group = group_by(group_keys, grouping_sets, resolver)
+    if group is None:
+        return None
+    text = group.sql(dialect=dialect)
+    prefix = "GROUP BY "
+    return text[len(prefix) :] if text.startswith(prefix) else text
 
 
 def group_by(group_keys, grouping_sets, resolver):

@@ -192,7 +192,9 @@ class ClickHouseDataSource(DataSource):
         for column in metadata.columns:
             distinct, nulls = row[index], row[index + 1]
             index += 2
-            stats[column.name] = self._build_column_statistics(distinct, nulls, row_count)
+            stats[column.name] = self._build_column_statistics(
+                distinct, nulls, row_count
+            )
         return stats
 
     def execute_query(self, query: str) -> Iterator[pa.RecordBatch]:
