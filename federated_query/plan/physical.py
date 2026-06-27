@@ -601,15 +601,16 @@ class PhysicalScan(PhysicalPlanNode):
             yield batch
 
     def _render_source_sql(self) -> str:
-        """Render this scan directly in the source dialect (no parse-back)."""
-        return self._build_ast().sql(dialect=self.datasource_connection.render_dialect)
+        """Render this scan in the source dialect via the transpile boundary.
+
+        The single emitter builds the canonical Postgres AST; to_source_sql
+        parses it once and renders the source dialect, which is where function
+        names and other dialect-divergent syntax are translated.
+        """
+        return to_source_sql(self.datasource_connection, self._build_query())
 
     def _build_query(self) -> str:
-        """Render this scan as canonical Postgres-form SQL.
-
-        Kept for the EXPLAIN snapshot and set-op branch builders that still
-        consume a string; the execute/schema paths use the AST directly.
-        """
+        """Render this scan as canonical Postgres-form SQL from its AST."""
         return self._build_ast().sql(dialect="postgres")
 
     def _build_ast(self) -> exp.Select:
@@ -3268,9 +3269,14 @@ class PhysicalRemoteSetOp(PhysicalPlanNode):
         return f"PhysicalRemoteSetOp({self.kind.value}{suffix})"
 
     def _build_query(self) -> str:
-        """Render the remote SQL string for this set operation in the source dialect."""
-        return self.build_remote_ast().sql(
-            dialect=self.datasource_connection.render_dialect
+        """Render the set operation in the source dialect via the transpile boundary.
+
+        The branch ASTs are built in the canonical Postgres form by the single
+        emitter; to_source_sql translates dialect-divergent syntax (function
+        names, etc.) when rendering the source dialect.
+        """
+        return to_source_sql(
+            self.datasource_connection, self.build_remote_ast().sql(dialect="postgres")
         )
 
     def build_remote_ast(self) -> exp.Expression:
@@ -4272,7 +4278,9 @@ class _DatasourceQueryCollector:
         if set_op.datasource_connection is None:
             return
         query_ast = set_op.build_remote_ast()
-        sql = query_ast.sql(dialect=set_op.datasource_connection.render_dialect)
+        sql = to_source_sql(
+            set_op.datasource_connection, query_ast.sql(dialect="postgres")
+        )
         snapshot = _DatasourceQuerySnapshot(
             datasource_name=set_op.datasource, sql=sql, query_ast=query_ast
         )

@@ -17,7 +17,7 @@ _BINARY_BUILDERS = {
     E.BinaryOpType.ADD: lambda l, r: exp.Add(this=l, expression=r),
     E.BinaryOpType.SUBTRACT: lambda l, r: exp.Sub(this=l, expression=r),
     E.BinaryOpType.MULTIPLY: lambda l, r: exp.Mul(this=l, expression=r),
-    E.BinaryOpType.DIVIDE: lambda l, r: exp.Div(this=l, expression=r),
+    E.BinaryOpType.DIVIDE: lambda l, r: exp.Div(this=l, expression=r, typed=True, safe=False),
     E.BinaryOpType.MODULO: lambda l, r: exp.Mod(this=l, expression=r),
     E.BinaryOpType.EQ: lambda l, r: exp.EQ(this=l, expression=r),
     E.BinaryOpType.NEQ: lambda l, r: exp.NEQ(this=l, expression=r),
@@ -145,14 +145,30 @@ class SqlglotEmitter(E.ExpressionVisitor):
         return self._wrap_within_group(call, expr)
 
     def _build_call(self, name: str, args: list, distinct: bool) -> exp.Expression:
-        """Build ``name(args)`` or ``name(DISTINCT args)`` as a generic call."""
+        """Build a verbatim ``name(args)`` / ``name(DISTINCT args)`` call.
+
+        The function name is kept as written (a generic call). Dialect-specific
+        function translation (e.g. PERCENTILE_CONT -> QUANTILE_CONT for DuckDB)
+        happens at the single transpile boundary (to_source_sql), which parses
+        this canonical Postgres form and renders the source dialect; a typed node
+        here would mis-handle names like CONCAT (rendered as ``||``, which has
+        different NULL semantics).
+        """
         if distinct:
             return exp.Anonymous(this=name, expressions=[exp.Distinct(expressions=args)])
         return exp.Anonymous(this=name, expressions=args)
 
     def _wrap_within_group(self, call: exp.Expression, expr) -> exp.Expression:
-        """Wrap an ordered-set aggregate call in ``WITHIN GROUP (ORDER BY key)``."""
-        ordered = exp.Ordered(this=self._emit(expr.within_group_key), desc=expr.within_group_desc)
+        """Wrap an ordered-set aggregate call in ``WITHIN GROUP (ORDER BY key)``.
+
+        Direction is emitted only for DESC; an explicit ASC keyword inside
+        WITHIN GROUP defeats sqlglot's ordered-set function transpilation.
+        """
+        key_ast = self._emit(expr.within_group_key)
+        if expr.within_group_desc:
+            ordered = exp.Ordered(this=key_ast, desc=True)
+        else:
+            ordered = exp.Ordered(this=key_ast)
         return exp.WithinGroup(this=call, expression=exp.Order(expressions=[ordered]))
 
     def visit_case_expr(self, expr):
