@@ -8,6 +8,7 @@ from federated_query.optimizer.rules import (
     LimitPushdownRule,
     RuleBasedOptimizer,
 )
+from federated_query.optimizer import pushdown
 from federated_query.catalog.catalog import Catalog
 from federated_query.plan.logical import (
     Scan,
@@ -411,8 +412,7 @@ class TestProjectionPushdown:
             right=Literal(value=18, data_type=DataType.INTEGER),
         )
 
-        rule = ProjectionPushdownRule()
-        columns = rule._extract_columns(expr)
+        columns = pushdown.bare_names(expr)
 
         assert "age" in columns
         assert len(columns) == 1
@@ -433,8 +433,7 @@ class TestProjectionPushdown:
             ),
         )
 
-        rule = ProjectionPushdownRule()
-        columns = rule._extract_columns(expr)
+        columns = pushdown.bare_names(expr)
 
         assert "age" in columns
         assert "status" in columns

@@ -15,6 +15,7 @@ from ..plan.logical import (
     SetOperation,
     Explain,
 )
+from . import pushdown
 from ..plan.expressions import (
     Expression,
     InList,
@@ -206,7 +207,7 @@ class PredicatePushdownRule(OptimizationRule):
         Push filter BELOW projection if the predicate can be evaluated
         using columns available in the projection's input.
         """
-        predicate_cols = self._extract_column_refs(filter_node.predicate)
+        predicate_cols = pushdown.qualified_or_bare_names(filter_node.predicate)
         input_cols = self._get_column_names(projection.input)
 
         # Can we evaluate predicate using columns from input?
@@ -235,54 +236,6 @@ class PredicatePushdownRule(OptimizationRule):
 
         return scan.model_copy(update={"filters": filter_node.predicate})
 
-    def _predicate_matches_side(
-        self, pred_cols: set, side_cols: set, other_cols: set
-    ) -> bool:
-        """Check if predicate columns match exactly one side of join.
-
-        Handles both qualified and unqualified column references.
-        Also handles alias vs physical name mismatches (e.g., "o.amount" vs "orders.amount").
-        For both qualified and unqualified refs, checks if column uniquely belongs to this side.
-        """
-        for pred_col in pred_cols:
-            # Exact match - pred_col is directly in side_cols
-            if pred_col in side_cols:
-                continue
-
-            # Extract bare column name (part after last ".")
-            if "." in pred_col:
-                # Qualified reference like "o.amount" or "orders.amount"
-                bare_col = pred_col.split(".")[-1]
-            else:
-                # Unqualified reference like "amount"
-                bare_col = pred_col
-
-            # Check if bare column name uniquely belongs to this side
-            # This handles:
-            # - Unqualified refs: "amount" matching "orders.amount"
-            # - Alias mismatches: "o.amount" matching "orders.amount"
-            side_has_col = False
-            other_has_col = False
-
-            for col in side_cols:
-                if col.endswith(f".{bare_col}") or col == bare_col:
-                    side_has_col = True
-                    break
-
-            for col in other_cols:
-                if col.endswith(f".{bare_col}") or col == bare_col:
-                    other_has_col = True
-                    break
-
-            # Column must be on this side only (not on other side)
-            if side_has_col and not other_has_col:
-                continue
-
-            # Column is not uniquely on this side
-            return False
-
-        return True
-
     def _push_filter_below_join(
         self, filter_node: Filter, join: Join
     ) -> LogicalPlanNode:
@@ -301,10 +254,14 @@ class PredicatePushdownRule(OptimizationRule):
         left_cols = self._get_column_names(join.left)
         right_cols = self._get_column_names(join.right)
 
-        pred_cols = self._extract_column_refs(predicate)
+        pred_cols = pushdown.qualified_or_bare_names(predicate)
 
-        pred_left_only = self._predicate_matches_side(pred_cols, left_cols, right_cols)
-        pred_right_only = self._predicate_matches_side(pred_cols, right_cols, left_cols)
+        pred_left_only = pushdown.columns_belong_to_side(
+            pred_cols, left_cols, right_cols
+        )
+        pred_right_only = pushdown.columns_belong_to_side(
+            pred_cols, right_cols, left_cols
+        )
 
         # Only push for INNER joins. model_copy preserves every other field
         # (notably NATURAL / USING), which a raw Join(...) rebuild would drop.
@@ -416,23 +373,6 @@ class PredicatePushdownRule(OptimizationRule):
 
         return set()
 
-    def _extract_column_refs(self, expr: Expression) -> set:
-        """Qualified column names in an expression (``table.col`` or bare ``col``).
-
-        Critical for join filter pushdown: when both join inputs expose a column
-        of the same name, the table qualifier decides which side a filter goes
-        to. Built on the shared column_refs walker so every node type is covered.
-        """
-        from ..plan.expressions import column_refs
-
-        columns = set()
-        for ref in column_refs(expr):
-            if ref.table:
-                columns.add(f"{ref.table}.{ref.column}")
-            else:
-                columns.add(ref.column)
-        return columns
-
     def name(self) -> str:
         """Return this rule's identifier (used in logging and EXPLAIN)."""
         return "PredicatePushdown"
@@ -484,13 +424,13 @@ class ProjectionPushdownRule(OptimizationRule):
 
         if isinstance(plan, Scan):
             if plan.filters:
-                columns.update(self._extract_columns(plan.filters))
+                columns.update(pushdown.bare_names(plan.filters))
             return columns
 
         if isinstance(plan, Projection):
             # Collect columns from projection expressions
             for expr in plan.expressions:
-                columns.update(self._extract_columns(expr))
+                columns.update(pushdown.bare_names(expr))
             # CRITICAL: Must recurse into input to collect columns needed by
             # downstream operators (e.g., join keys, filter columns)
             # Otherwise those columns will be pruned and break the query!
@@ -498,13 +438,13 @@ class ProjectionPushdownRule(OptimizationRule):
             return columns
 
         if isinstance(plan, Filter):
-            columns.update(self._extract_columns(plan.predicate))
+            columns.update(pushdown.bare_names(plan.predicate))
             columns.update(self._collect_required_columns(plan.input))
             return columns
 
         if isinstance(plan, Join):
             if plan.condition:
-                columns.update(self._extract_columns(plan.condition))
+                columns.update(pushdown.bare_names(plan.condition))
             columns.update(self._collect_required_columns(plan.left))
             columns.update(self._collect_required_columns(plan.right))
             return columns
@@ -512,10 +452,10 @@ class ProjectionPushdownRule(OptimizationRule):
         if isinstance(plan, Aggregate):
             # Collect columns from group by expressions
             for expr in plan.group_by:
-                columns.update(self._extract_columns(expr))
+                columns.update(pushdown.bare_names(expr))
             # Collect columns from aggregate expressions
             for expr in plan.aggregates:
-                columns.update(self._extract_columns(expr))
+                columns.update(pushdown.bare_names(expr))
             # CRITICAL: Must recurse into input to collect columns needed by
             # downstream operators (e.g., join keys, filter columns)
             # Otherwise those columns will be pruned and break the query!
@@ -526,19 +466,6 @@ class ProjectionPushdownRule(OptimizationRule):
             columns.update(self._collect_required_columns(plan.input))
             return columns
 
-        return columns
-
-    def _extract_columns(self, expr: Expression) -> set:
-        """Bare column names referenced in an expression.
-
-        Built on the shared column_refs walker so every node type is covered by
-        one implementation.
-        """
-        from ..plan.expressions import column_refs
-
-        columns = set()
-        for ref in column_refs(expr):
-            columns.add(ref.column)
         return columns
 
     def _prune_columns(self, plan: LogicalPlanNode, required: set) -> LogicalPlanNode:
@@ -553,7 +480,7 @@ class ProjectionPushdownRule(OptimizationRule):
             return plan
 
         if isinstance(plan, Filter):
-            filter_cols = self._extract_columns(plan.predicate)
+            filter_cols = pushdown.bare_names(plan.predicate)
             combined_required = required.union(filter_cols)
             new_input = self._prune_columns(plan.input, combined_required)
             if new_input != plan.input:
@@ -609,10 +536,10 @@ class ProjectionPushdownRule(OptimizationRule):
 
         if isinstance(plan, Scan):
             if plan.filters:
-                local_required.update(self._extract_columns(plan.filters))
+                local_required.update(pushdown.bare_names(plan.filters))
 
         if isinstance(plan, Filter):
-            local_required.update(self._extract_columns(plan.predicate))
+            local_required.update(pushdown.bare_names(plan.predicate))
 
         return local_required.union(parent_required)
 
@@ -979,12 +906,12 @@ class OrderByPushdownRule(OptimizationRule):
         if left_scan is not None and right_scan is not None:
             if left_scan.datasource != right_scan.datasource:
                 return sort
-        sort_cols = self._extract_sort_columns(sort)
+        sort_cols = pushdown.column_key_set(sort.sort_keys)
         left_cols = self._get_available_columns(join.left)
         right_cols = self._get_available_columns(join.right)
 
-        left_only = self._columns_match_side(sort_cols, left_cols, right_cols)
-        right_only = self._columns_match_side(sort_cols, right_cols, left_cols)
+        left_only = pushdown.columns_belong_to_side(sort_cols, left_cols, right_cols)
+        right_only = pushdown.columns_belong_to_side(sort_cols, right_cols, left_cols)
 
         new_left = (
             self._push_sort_into_child(sort, join.left) if left_only else join.left
@@ -1008,60 +935,22 @@ class OrderByPushdownRule(OptimizationRule):
             return pushed.input
         return pushed
 
-    def _columns_match_side(
-        self,
-        sort_cols: set,
-        side_cols: set,
-        other_cols: set,
-    ) -> bool:
-        """Check if sort columns belong exclusively to one join side."""
-        for col in sort_cols:
-            if col in side_cols:
-                continue
-
-            bare = col.split(".")[-1]
-            side_has = any(
-                entry.endswith(f".{bare}") or entry == bare for entry in side_cols
-            )
-            other_has = any(
-                entry.endswith(f".{bare}") or entry == bare for entry in other_cols
-            )
-
-            if side_has and not other_has:
-                continue
-
-            return False
-
-        return True
-
     def _push_through_aggregate(
         self, sort: Sort, aggregate: Aggregate
     ) -> LogicalPlanNode:
         """Push ORDER BY through aggregate when keys align with aggregate output."""
-        sort_cols = self._extract_sort_columns(sort)
+        sort_cols = pushdown.column_key_set(sort.sort_keys)
         output_cols = set(aggregate.output_names)
         if not sort_cols.issubset(output_cols):
             return sort
 
-        group_cols = self._extract_group_columns(aggregate.group_by)
+        group_cols = pushdown.column_key_set(aggregate.group_by)
         if not sort_cols.issubset(group_cols):
             return sort
 
         pushed_child = self._push_sort_into_child(sort, aggregate.input)
         new_agg = aggregate.model_copy(update={"input": pushed_child})
         return sort.model_copy(update={"input": new_agg})
-
-    def _extract_group_columns(self, group_by: List[Expression]) -> set:
-        """Extract column names from group by expressions."""
-        from ..plan.expressions import ColumnRef
-
-        columns = set()
-        for expr in group_by:
-            if isinstance(expr, ColumnRef):
-                if expr.table:
-                    columns.add(f"{expr.table}.{expr.column}")
-                columns.add(expr.column)
-        return columns
 
     def _push_through_union(self, sort: Sort, union: Union) -> LogicalPlanNode:
         """Propagate sort metadata into union inputs while keeping top sort."""
@@ -1111,19 +1000,6 @@ class OrderByPushdownRule(OptimizationRule):
             return self._get_available_columns(plan.input)
 
         return set()
-
-    def _extract_sort_columns(self, sort: Sort) -> set:
-        """Extract column names from sort keys."""
-        from ..plan.expressions import ColumnRef
-
-        columns = set()
-        for key in sort.sort_keys:
-            if isinstance(key, ColumnRef):
-                if key.table:
-                    columns.add(f"{key.table}.{key.column}")
-                columns.add(key.column)
-
-        return columns
 
     def _rewrite_sort_keys_for_projection(
         self,

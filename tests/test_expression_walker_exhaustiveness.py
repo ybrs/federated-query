@@ -44,10 +44,7 @@ from federated_query.plan.expressions import (
     QuantifiedComparison,
 )
 from federated_query.optimizer.decorrelation import _expression_column_refs
-from federated_query.optimizer.rules import (
-    ProjectionPushdownRule,
-    PredicatePushdownRule,
-)
+from federated_query.optimizer import pushdown
 
 
 # Leaf nodes carry no child expressions, so a walker correctly returns nothing
@@ -193,12 +190,12 @@ _WALKERS = [
         lambda expr: [ref.column for ref in _expression_column_refs(expr)],
     ),
     (
-        "ProjectionPushdownRule._extract_columns",
-        lambda expr: ProjectionPushdownRule()._extract_columns(expr),
+        "pushdown.bare_names",
+        lambda expr: pushdown.bare_names(expr),
     ),
     (
-        "PredicatePushdownRule._extract_column_refs",
-        lambda expr: PredicatePushdownRule()._extract_column_refs(expr),
+        "pushdown.qualified_or_bare_names",
+        lambda expr: pushdown.qualified_or_bare_names(expr),
     ),
 ]
 
