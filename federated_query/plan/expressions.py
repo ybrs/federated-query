@@ -1,42 +1,10 @@
 """Expression nodes for query plans."""
 
 from abc import ABC, abstractmethod
-from functools import lru_cache
 from typing import Any, List, Optional, Tuple
 from enum import Enum
 
 from ..model import StateModel
-
-
-@lru_cache(maxsize=None)
-def _identifier_needs_quoting(name: str) -> bool:
-    """Whether a bare identifier must be quoted to be valid SQL.
-
-    A reserved word (e.g. ``select``, ``order``) does not round-trip as a plain
-    column name, so it must be double-quoted. Checked once per name by
-    re-parsing ``SELECT <name>`` and caching the result.
-    """
-    import sqlglot
-    from sqlglot import exp
-    from sqlglot.errors import ParseError
-
-    try:
-        parsed = sqlglot.parse_one(f"SELECT {name}")
-    except ParseError:
-        return True
-    selected = parsed.expressions[0] if parsed.expressions else None
-    return not (
-        isinstance(selected, exp.Column) and selected.name.upper() == name.upper()
-    )
-
-
-def render_identifier(name: str) -> str:
-    """Render a column/identifier name, quoting it when SQL requires it."""
-    if name == "*":
-        return name
-    if _identifier_needs_quoting(name):
-        return f'"{name}"'
-    return name
 
 
 class DataType(Enum):
@@ -70,10 +38,17 @@ class Expression(StateModel, ABC):
         """Accept a visitor for the visitor pattern."""
         pass
 
-    @abstractmethod
     def to_sql(self) -> str:
-        """Convert expression to SQL string."""
-        pass
+        """Render this expression as canonical Postgres-form SQL text.
+
+        Delegates to the single sqlglot-AST emitter, so every diagnostic and
+        string-building caller shares one renderer. Subquery-bearing nodes
+        override this with a diagnostic form (they are decorrelated before any
+        real SQL emission).
+        """
+        from .emit import expression_to_ast, CANONICAL_SOURCE_RESOLVER
+
+        return expression_to_ast(self, CANONICAL_SOURCE_RESOLVER).sql(dialect="postgres")
 
 
 class ColumnRef(Expression):
@@ -90,12 +65,6 @@ class ColumnRef(Expression):
 
     def accept(self, visitor):
         return visitor.visit_column_ref(self)
-
-    def to_sql(self) -> str:
-        column = render_identifier(self.column)
-        if self.table:
-            return f"{self.table}.{column}"
-        return column
 
     def __repr__(self) -> str:
         if self.table:
@@ -114,16 +83,6 @@ class Literal(Expression):
 
     def accept(self, visitor):
         return visitor.visit_literal(self)
-
-    def to_sql(self) -> str:
-        if self.value is None:
-            return "NULL"
-        if self.data_type in (DataType.VARCHAR, DataType.TEXT):
-            # Escape embedded single quotes (O'Brien -> 'O''Brien') so the
-            # remote SQL stays valid and is not an injection vector.
-            escaped = str(self.value).replace("'", "''")
-            return f"'{escaped}'"
-        return str(self.value)
 
     def __repr__(self) -> str:
         return f"Literal({self.value})"
@@ -201,9 +160,6 @@ class BinaryOp(Expression):
     def accept(self, visitor):
         return visitor.visit_binary_op(self)
 
-    def to_sql(self) -> str:
-        return f"({self.left.to_sql()} {self.op.value} {self.right.to_sql()})"
-
     def __repr__(self) -> str:
         return f"BinaryOp({self.op.value}, {self.left}, {self.right})"
 
@@ -230,11 +186,6 @@ class UnaryOp(Expression):
 
     def accept(self, visitor):
         return visitor.visit_unary_op(self)
-
-    def to_sql(self) -> str:
-        if self.op in (UnaryOpType.IS_NULL, UnaryOpType.IS_NOT_NULL):
-            return f"({self.operand.to_sql()} {self.op.value})"
-        return f"({self.op.value} {self.operand.to_sql()})"
 
     def __repr__(self) -> str:
         return f"UnaryOp({self.op.value}, {self.operand})"
@@ -264,24 +215,6 @@ class FunctionCall(Expression):
     def accept(self, visitor):
         return visitor.visit_function_call(self)
 
-    def to_sql(self) -> str:
-        args_sql_parts = []
-        for arg in self.args:
-            args_sql_parts.append(arg.to_sql())
-        args_sql = ", ".join(args_sql_parts)
-        prefix = ""
-        if self.distinct:
-            prefix = "DISTINCT "
-        call = f"{self.function_name}({prefix}{args_sql})"
-        if self.within_group_key is None:
-            return call
-        return f"{call} WITHIN GROUP (ORDER BY {self._within_group_order_sql()})"
-
-    def _within_group_order_sql(self) -> str:
-        """Render the ORDER BY key of an ordered-set aggregate's WITHIN GROUP."""
-        direction = " DESC" if self.within_group_desc else ""
-        return f"{self.within_group_key.to_sql()}{direction}"
-
     def __repr__(self) -> str:
         return f"FunctionCall({self.function_name}, {self.args})"
 
@@ -303,15 +236,6 @@ class CaseExpr(Expression):
     def accept(self, visitor):
         return visitor.visit_case_expr(self)
 
-    def to_sql(self) -> str:
-        sql = "CASE"
-        for condition, result in self.when_clauses:
-            sql += f" WHEN {condition.to_sql()} THEN {result.to_sql()}"
-        if self.else_result:
-            sql += f" ELSE {self.else_result.to_sql()}"
-        sql += " END"
-        return sql
-
     def __repr__(self) -> str:
         return f"CaseExpr(when_count={len(self.when_clauses)})"
 
@@ -327,13 +251,6 @@ class InList(Expression):
 
     def accept(self, visitor):
         return visitor.visit_in_list(self)
-
-    def to_sql(self) -> str:
-        values = []
-        for option in self.options:
-            values.append(option.to_sql())
-        joined = ", ".join(values)
-        return f"({self.value.to_sql()} IN ({joined}))"
 
     def __repr__(self) -> str:
         return f"InList(options={len(self.options)})"
@@ -351,12 +268,6 @@ class BetweenExpression(Expression):
 
     def accept(self, visitor):
         return visitor.visit_between(self)
-
-    def to_sql(self) -> str:
-        value_sql = self.value.to_sql()
-        lower_sql = self.lower.to_sql()
-        upper_sql = self.upper.to_sql()
-        return f"({value_sql} BETWEEN {lower_sql} AND {upper_sql})"
 
     def __repr__(self) -> str:
         return "BetweenExpression()"
@@ -382,9 +293,6 @@ class Cast(Expression):
 
     def accept(self, visitor):
         return visitor.visit_cast(self)
-
-    def to_sql(self) -> str:
-        return f"CAST({self.expr.to_sql()} AS {self.target_type})"
 
     def __repr__(self) -> str:
         return f"Cast({self.expr} AS {self.target_type})"
@@ -415,45 +323,6 @@ class WindowExpr(Expression):
         """Dispatch to the visitor's window hook."""
         return visitor.visit_window_expr(self)
 
-    def to_sql(self) -> str:
-        """Render ``function OVER (PARTITION BY ... ORDER BY ... <frame>)``."""
-        return f"{self.function.to_sql()} OVER ({self._over_clause()})"
-
-    def _over_clause(self) -> str:
-        """Assemble the PARTITION BY / ORDER BY / frame body of the OVER clause."""
-        parts = []
-        if self.partition_by:
-            parts.append(f"PARTITION BY {self._partition_sql()}")
-        if self.order_keys:
-            parts.append(f"ORDER BY {self._order_sql()}")
-        if self.frame:
-            parts.append(self.frame)
-        return " ".join(parts)
-
-    def _partition_sql(self) -> str:
-        """Render the comma-separated PARTITION BY expressions."""
-        items = []
-        for expr in self.partition_by:
-            items.append(expr.to_sql())
-        return ", ".join(items)
-
-    def _order_sql(self) -> str:
-        """Render the comma-separated ORDER BY items with direction and NULLS."""
-        items = []
-        for index, key in enumerate(self.order_keys):
-            items.append(self._order_item_sql(index, key))
-        return ", ".join(items)
-
-    def _order_item_sql(self, index: int, key: Expression) -> str:
-        """Render one ORDER BY item: ``expr [DESC] [NULLS FIRST|LAST]``."""
-        text = key.to_sql()
-        if not self.order_ascending[index]:
-            text += " DESC"
-        nulls = self.order_nulls[index]
-        if nulls is not None:
-            text += f" NULLS {nulls}"
-        return text
-
     def __repr__(self) -> str:
         return f"WindowExpr({self.function})"
 
@@ -475,10 +344,6 @@ class Extract(Expression):
     def accept(self, visitor):
         """Dispatch to the visitor's extract hook."""
         return visitor.visit_extract(self)
-
-    def to_sql(self) -> str:
-        """Render the keyword-argument EXTRACT syntax."""
-        return f"EXTRACT({self.field} FROM {self.source.to_sql()})"
 
     def __repr__(self) -> str:
         return f"Extract({self.field} FROM {self.source})"
@@ -502,12 +367,6 @@ class Interval(Expression):
     def accept(self, visitor):
         """Dispatch to the visitor's interval hook."""
         return visitor.visit_interval(self)
-
-    def to_sql(self) -> str:
-        """Render the INTERVAL literal with its unit when present."""
-        if self.unit:
-            return f"INTERVAL '{self.value} {self.unit}'"
-        return f"INTERVAL '{self.value}'"
 
     def __repr__(self) -> str:
         return f"Interval({self.value} {self.unit})"
@@ -558,6 +417,10 @@ class ExpressionVisitor(ABC):
 
     @abstractmethod
     def visit_interval(self, expr: "Interval"):
+        pass
+
+    @abstractmethod
+    def visit_window_expr(self, expr: "WindowExpr"):
         pass
 
     @abstractmethod
@@ -674,13 +537,6 @@ class TupleExpression(Expression):
 
     def accept(self, visitor):
         return visitor.visit_tuple(self)
-
-    def to_sql(self) -> str:
-        parts = []
-        for item in self.items:
-            parts.append(item.to_sql())
-        joined = ", ".join(parts)
-        return f"({joined})"
 
     def __repr__(self) -> str:
         return f"TupleExpression({len(self.items)} items)"
