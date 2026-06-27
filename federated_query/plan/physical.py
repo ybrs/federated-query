@@ -459,12 +459,18 @@ def _join_output_aliases(
     """Build a (table, column) -> output-name map for a binary join.
 
     Left columns keep their names; right columns whose names collide with a
-    left column are renamed with a ``right_`` prefix, mirroring the renaming
-    in ``_join_rows`` so qualified references resolve to the correct side.
+    left column are renamed with a ``right_`` prefix, matching the execution
+    SELECT list. When both sides expose the SAME (table, column) key - e.g. a
+    subquery that scans the same table the outer query does - the LEFT side wins
+    the key (the outer reference is what the user wrote); the right's renamed
+    column is reachable by its physical name but never overwrites the left, so a
+    qualified outer reference can never silently resolve to the inner relation.
     """
     alias_map: Dict[Tuple[Optional[str], str], str] = dict(left.column_aliases())
     left_names = set(left.schema().names)
     for key, physical_name in right.column_aliases().items():
+        if key in alias_map:
+            continue
         if physical_name in left_names:
             alias_map[key] = f"right_{physical_name}"
         else:

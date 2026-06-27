@@ -160,6 +160,49 @@ def test_bind_table_name_qualifier_when_aliased_raises(catalog_with_test_data):
         binder.bind(plan)
 
 
+def test_bind_single_table_bogus_qualifier_in_projection_raises(catalog_with_test_data):
+    """A bogus qualifier on a single-table query MUST raise, not return rows.
+
+    `x` is not the table or its alias, so `x.id` references a relation the query
+    never names. Accepting it (binding `x.id` to `users.id` and returning rows)
+    is an EPIC FAIL: the engine would answer an invalid query as if it were
+    valid. There is one resolver path; it validates the qualifier and raises.
+    """
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = "SELECT x.id FROM testdb.public.users u"
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
+
+    with pytest.raises(BindingError) as exc_info:
+        binder.bind(plan)
+    assert "not found" in str(exc_info.value)
+
+
+def test_bind_single_table_bogus_qualifier_in_where_raises(catalog_with_test_data):
+    """A bogus qualifier in a single-table WHERE must raise, not silently rebind."""
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = "SELECT u.id FROM testdb.public.users u WHERE x.name = 'a'"
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
+
+    with pytest.raises(BindingError) as exc_info:
+        binder.bind(plan)
+    assert "not found" in str(exc_info.value)
+
+
+def test_bind_single_table_real_name_qualifier_when_aliased_raises(
+    catalog_with_test_data,
+):
+    """On a single aliased table, the real table name is not a valid qualifier."""
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = "SELECT users.id FROM testdb.public.users u"
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
+
+    with pytest.raises(BindingError):
+        binder.bind(plan)
+
+
 @pytest.mark.xfail(
     reason="D1: HAVING does not yet validate aggregate-function arguments",
     strict=True,

@@ -10,6 +10,36 @@ Never fail silently. Never fail silently. This is the most important thing we ca
 
 The code should be readable, self explained.Most of all the code should be defensive. We appreciate crashes more than silent fails.
 
+## TOP PRIORITY : an invalid query MUST raise. Answering one is an EPIC FAIL.
+
+An invalid query is one that references something it does not name: a table
+qualifier that is not a table or alias in scope (`SELECT x.id FROM users u`), a
+column that does not exist, an aggregate/HAVING reference to a non-output name,
+or any reference the query itself does not bring into scope. Such a query MUST
+raise a BindingError at bind time. It must NEVER bind, plan, execute, or return
+rows.
+
+Returning rows for an invalid query is an EPIC FAIL. It is WORSE than a silent
+fail: a silent fail hides a problem, but answering an invalid query manufactures
+a wrong answer and presents it as correct. A crash never ships a lie; answering
+an invalid query ships a lie. There is no "the result happened to be right" -
+the query was invalid, so any result is wrong. Never describe this as
+acceptable, normal, or a minor issue. It is the most severe failure mode in the
+engine.
+
+Rules:
+- One resolver path. A qualifier is validated against the scope chain and the
+  resolver RAISES when it is not found. No lenient/fallback path that scans other
+  relations by column name and binds to the first match - that is exactly how an
+  invalid query gets accepted. Allowlist + raise, never denylist.
+- Never add a branch that makes an invalid query bind in order to pass a test.
+  A test that expects an invalid query to succeed is itself wrong and must be
+  corrected or deleted.
+- Every invalid-query class has a test asserting it raises BindingError (bogus
+  qualifier single-table and over-joins, real table name when aliased, unknown
+  column, HAVING over non-output). These guard tests are load-bearing: do not
+  weaken or remove them.
+
 # No ascii
 
 Use ASCII characters only. No exceptions you invent. This applies EVERYWHERE:
