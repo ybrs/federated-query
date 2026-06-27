@@ -40,6 +40,26 @@ class SourceResolver(ColumnResolver):
         return exp.Star()
 
 
+class MergeResolver(ColumnResolver):
+    """Merge path: resolve a column to its physical name in the merge relation.
+
+    The DuckDB merge engine operates on fetched Arrow relations whose columns are
+    the nodes' physical output names; a ``(table, column)`` reference maps through
+    the node's alias map to that physical name (unqualified). ``*`` stays a star.
+    """
+
+    def __init__(self, aliases):
+        """Store the {(table, column): physical_name} map (may be empty/None)."""
+        self._aliases = aliases or {}
+
+    def resolve(self, table: Optional[str], column: str) -> exp.Expression:
+        """Map the reference to its physical column name via the alias map."""
+        if column == "*":
+            return exp.Star()
+        name = self._aliases.get((table, column), column)
+        return exp.column(name, quoted=True)
+
+
 # The canonical resolver for the engine's internal Postgres-form SQL. Used by
 # Expression.to_sql(), which is the one place every diagnostic/string caller
 # shares.

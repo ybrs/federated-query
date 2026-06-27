@@ -6,12 +6,18 @@ converter; the only thing that differs between the remote-pushdown path and the
 local DuckDB merge path is the :class:`ColumnResolver` and the dialect string.
 """
 
-from .resolver import ColumnResolver, SourceResolver, CANONICAL_SOURCE_RESOLVER
+from .resolver import (
+    ColumnResolver,
+    SourceResolver,
+    MergeResolver,
+    CANONICAL_SOURCE_RESOLVER,
+)
 from .expressions import SqlglotEmitter, expression_to_ast
 
 __all__ = [
     "ColumnResolver",
     "SourceResolver",
+    "MergeResolver",
     "CANONICAL_SOURCE_RESOLVER",
     "SqlglotEmitter",
     "expression_to_ast",

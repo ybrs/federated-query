@@ -22,7 +22,7 @@ from pydantic import Field
 
 from ..model import StateModel
 from .expressions import Expression, and_expressions
-from .emit import expression_to_ast, CANONICAL_SOURCE_RESOLVER, clauses
+from .emit import expression_to_ast, CANONICAL_SOURCE_RESOLVER, MergeResolver, clauses
 from .logical import JoinType, ExplainFormat, SetOpKind
 from ..utils.logging import get_logger
 
@@ -2899,34 +2899,21 @@ class PhysicalSort(PhysicalPlanNode):
         return engine.run(sql, {_MERGE_SORT_RELATION: reader})
 
     def _sort_order_clause(self, aliases) -> str:
-        """Render every ORDER BY key with its direction and NULLS placement."""
+        """Render every ORDER BY key via the shared clause builder.
+
+        The single ``emit.clauses.order_by`` resolves keys to their physical
+        merge-relation names (MergeResolver) and fills the Postgres NULLS default
+        so the merge engine's ordering matches the source's; each key renders to
+        a DuckDB fragment for the merge query.
+        """
+        order = clauses.order_by(
+            self.sort_keys, self.ascending, self.nulls_order, MergeResolver(aliases),
+            fill_nulls_default=True,
+        )
         parts = []
-        for index, key in enumerate(self.sort_keys):
-            parts.append(self._sort_key_sql(key, index, aliases))
+        for item in order.expressions:
+            parts.append(item.sql(dialect="duckdb"))
         return ", ".join(parts)
-
-    def _sort_key_sql(self, key, index: int, aliases) -> str:
-        """Render one sort key: ``"col" ASC|DESC NULLS FIRST|LAST``."""
-        name = self._resolve_sort_column(key, aliases)
-        direction = "ASC" if self.ascending[index] else "DESC"
-        return f'"{name}" {direction} NULLS {self._nulls_keyword(index)}'
-
-    def _nulls_keyword(self, index: int) -> str:
-        """NULLS placement: explicit if given, else Postgres default by direction."""
-        explicit = None
-        if self.nulls_order and index < len(self.nulls_order):
-            explicit = self.nulls_order[index]
-        if explicit in ("FIRST", "LAST"):
-            return explicit
-        return "LAST" if self.ascending[index] else "FIRST"
-
-    def _resolve_sort_column(self, key, aliases) -> str:
-        """Resolve a sort column to its physical name in the input relation."""
-        if aliases:
-            resolved = aliases.get((key.table, key.column))
-            if resolved is not None:
-                return resolved
-        return key.column
 
     def _execute_pyarrow_sort(self) -> Iterator[pa.RecordBatch]:
         """Materialize the input and sort it with pyarrow (fallback path)."""
@@ -3633,30 +3620,21 @@ class PhysicalGroupedLimit(PhysicalPlanNode):
     def _merge_order_clause(self) -> str:
         """Order each partition by the ordering keys, then the row index.
 
-        The trailing row-index keeps ties in input order, so the same rows
-        survive as the streaming Python path.
+        The ordering keys render through the shared ``emit.clauses.order_by``
+        (explicit direction, NULLS only when supplied); the trailing row-index
+        keeps ties in input order, so the same rows survive as the streaming
+        Python path.
         """
         parts = []
         if self.order_by_keys:
-            for index in range(len(self.order_by_keys)):
-                parts.append(self._merge_order_key(index))
+            order = clauses.order_by(
+                self.order_by_keys, self.order_by_ascending, self.order_by_nulls,
+                MergeResolver({}),
+            )
+            for item in order.expressions:
+                parts.append(item.sql(dialect="duckdb"))
         parts.append(f'"{_GROUPED_LIMIT_INDEX_COL}" ASC')
         return ", ".join(parts)
-
-    def _merge_order_key(self, index: int) -> str:
-        """Render one ordering key: ``"col" ASC|DESC [NULLS FIRST|LAST]``."""
-        ascending = self.order_by_ascending
-        descending = ascending is not None and not ascending[index]
-        direction = "DESC" if descending else "ASC"
-        name = self.order_by_keys[index].column
-        return f'"{name}" {direction}{self._merge_nulls_suffix(index)}'
-
-    def _merge_nulls_suffix(self, index: int) -> str:
-        """Render an explicit NULLS placement when the plan supplies one."""
-        nulls = self.order_by_nulls
-        if nulls is None or nulls[index] is None:
-            return ""
-        return f" NULLS {nulls[index].upper()}"
 
     def _execute_ordered(self) -> Iterator[pa.RecordBatch]:
         """Materialize, sort within each key, and emit each key's first rows."""

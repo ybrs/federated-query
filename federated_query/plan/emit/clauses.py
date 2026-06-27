@@ -27,21 +27,29 @@ def select_expressions(exprs, names, resolver) -> list:
     return items
 
 
-def order_by(keys, ascending, nulls, resolver):
-    """Build an ``exp.Order`` from parallel key/ascending/nulls lists, or None."""
+def order_by(keys, ascending, nulls, resolver, fill_nulls_default=False):
+    """Build an ``exp.Order`` from parallel key/ascending/nulls lists, or None.
+
+    When ``fill_nulls_default`` is set (the merge path), a key with no explicit
+    NULLS placement gets the Postgres default (LAST for ASC, FIRST for DESC) so
+    the merge engine's ordering matches the source's; the remote path leaves it
+    unset and lets the source apply its own default.
+    """
     if not keys:
         return None
     ordered = []
     for index, key in enumerate(keys):
-        ordered.append(_ordered_key(index, key, ascending, nulls, resolver))
+        ordered.append(_ordered_key(index, key, ascending, nulls, resolver, fill_nulls_default))
     return exp.Order(expressions=ordered)
 
 
-def _ordered_key(index, key, ascending, nulls, resolver) -> exp.Ordered:
+def _ordered_key(index, key, ascending, nulls, resolver, fill_nulls_default) -> exp.Ordered:
     """Build one ordered key, honoring its ascending flag and NULLS placement."""
     desc = bool(ascending) and index < len(ascending) and not ascending[index]
     spec = nulls[index] if nulls and index < len(nulls) else None
     ast = expression_to_ast(key, resolver)
+    if spec is None and fill_nulls_default:
+        spec = "FIRST" if desc else "LAST"
     if spec is None:
         return exp.Ordered(this=ast, desc=desc)
     return exp.Ordered(this=ast, desc=desc, nulls_first=(spec.upper() == "FIRST"))
