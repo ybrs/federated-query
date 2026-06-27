@@ -251,11 +251,16 @@ class SqlglotEmitter(E.ExpressionVisitor):
         return items
 
     def _ordered_key(self, index, key, ascending, nulls) -> "exp.Ordered":
-        """Build a single ordered key honoring its ascending flag and NULLS."""
+        """Build a single ordered key with explicit direction and NULLS.
+
+        NULLS placement is always explicit (the plan's, or the Postgres default
+        - LAST for ASC, FIRST for DESC); leaving it unset lets sqlglot emit
+        ``DESC NULLS LAST``, the opposite of Postgres's DESC default.
+        """
         desc = not ascending[index]
         nulls_spec = nulls[index]
         if nulls_spec is None:
-            return exp.Ordered(this=self._emit(key), desc=desc)
+            nulls_spec = "FIRST" if desc else "LAST"
         return exp.Ordered(
             this=self._emit(key), desc=desc, nulls_first=(nulls_spec.upper() == "FIRST")
         )

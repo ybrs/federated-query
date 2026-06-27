@@ -1213,23 +1213,26 @@ class PhysicalHashJoin(PhysicalPlanNode):
         return key.column
 
     def schema(self) -> pa.Schema:
-        """Combine schemas from both sides."""
+        """Combine schemas from both sides.
+
+        A right column whose name collides with a LEFT column is renamed
+        ``right_<name>`` - the same left-only rule the execution SELECT list
+        (_merge_join_select_list) and the parent-resolution map
+        (_join_output_aliases) use, so the declared schema, the actual output,
+        and qualified-reference resolution all agree.
+        """
         left_schema = self.left.schema()
         right_schema = self.right.schema()
+        left_names = set(left_schema.names)
 
         fields = []
-        names = []
-
         for field in left_schema:
             fields.append(field)
-            names.append(field.name)
-
         for field in right_schema:
             name = field.name
-            if name in names:
+            if name in left_names:
                 name = f"right_{name}"
             fields.append(pa.field(name, field.type, nullable=field.nullable))
-            names.append(name)
 
         return pa.schema(fields)
 
@@ -1386,7 +1389,7 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
         return scan.columns
 
     def _format_column(self, alias: str, column: str) -> str:
-        return f'{alias}."{column}"'
+        return f'"{alias}"."{column}"'
 
     def _select_output_name(self, column: str, seen: Set[str], is_right: bool) -> str:
         name = column
@@ -1420,9 +1423,14 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
         return self._aliased(derived, alias)
 
     def _aliased(self, source: str, alias: Optional[str]) -> str:
-        """Append an ``AS alias`` suffix when an alias is present."""
+        """Append a quoted ``AS "alias"`` suffix when an alias is present.
+
+        The alias is quoted to match the emitter's quoted column qualifiers
+        (``"alias"."col"``); an unquoted alias would case-fold and miss a
+        case-sensitive qualifier.
+        """
         if alias:
-            return f"{source} AS {alias}"
+            return f'{source} AS "{alias}"'
         return source
 
     def _register_column_alias(
@@ -1499,23 +1507,26 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
         )
 
     def schema(self) -> pa.Schema:
-        """Combine schemas from both sides."""
+        """Combine schemas from both sides.
+
+        A right column whose name collides with a LEFT column is renamed
+        ``right_<name>`` - the same left-only rule the execution SELECT list
+        (_merge_join_select_list) and the parent-resolution map
+        (_join_output_aliases) use, so the declared schema, the actual output,
+        and qualified-reference resolution all agree.
+        """
         left_schema = self.left.schema()
         right_schema = self.right.schema()
+        left_names = set(left_schema.names)
 
         fields = []
-        names = []
-
         for field in left_schema:
             fields.append(field)
-            names.append(field.name)
-
         for field in right_schema:
             name = field.name
-            if name in names:
+            if name in left_names:
                 name = f"right_{name}"
             fields.append(pa.field(name, field.type, nullable=field.nullable))
-            names.append(name)
 
         return pa.schema(fields)
 
@@ -1731,7 +1742,6 @@ class PhysicalSort(PhysicalPlanNode):
             self.nulls_order,
             MergeResolver(aliases),
             dialect="duckdb",
-            fill_nulls_default=True,
         )
 
     def schema(self) -> pa.Schema:

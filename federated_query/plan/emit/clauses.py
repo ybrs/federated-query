@@ -27,48 +27,46 @@ def select_expressions(exprs, names, resolver) -> list:
     return items
 
 
-def order_by(keys, ascending, nulls, resolver, fill_nulls_default=False):
+def order_by(keys, ascending, nulls, resolver):
     """Build an ``exp.Order`` from parallel key/ascending/nulls lists, or None.
 
-    When ``fill_nulls_default`` is set (the merge path), a key with no explicit
-    NULLS placement gets the Postgres default (LAST for ASC, FIRST for DESC) so
-    the merge engine's ordering matches the source's; the remote path leaves it
-    unset and lets the source apply its own default.
+    Every key gets an explicit NULLS placement (the plan's, or the canonical
+    Postgres default - LAST for ASC, FIRST for DESC), so NULL ordering is
+    consistent across sources and never left to a dialect's differing default.
     """
     if not keys:
         return None
     ordered = []
     for index, key in enumerate(keys):
-        ordered.append(
-            _ordered_key(index, key, ascending, nulls, resolver, fill_nulls_default)
-        )
+        ordered.append(_ordered_key(index, key, ascending, nulls, resolver))
     return exp.Order(expressions=ordered)
 
 
-def _ordered_key(
-    index, key, ascending, nulls, resolver, fill_nulls_default
-) -> exp.Ordered:
-    """Build one ordered key, honoring its ascending flag and NULLS placement."""
+def _ordered_key(index, key, ascending, nulls, resolver) -> exp.Ordered:
+    """Build one ordered key with explicit direction and NULLS placement.
+
+    NULLS placement is always made explicit using the engine's canonical
+    Postgres default (LAST for ASC, FIRST for DESC) when the plan did not specify
+    one. Leaving it unset is unsafe: sqlglot emits ``DESC NULLS LAST`` for
+    Postgres, the opposite of Postgres's own DESC default, which would silently
+    flip NULL ordering.
+    """
     desc = bool(ascending) and index < len(ascending) and not ascending[index]
     spec = nulls[index] if nulls and index < len(nulls) else None
-    ast = expression_to_ast(key, resolver)
-    if spec is None and fill_nulls_default:
-        spec = "FIRST" if desc else "LAST"
     if spec is None:
-        return exp.Ordered(this=ast, desc=desc)
+        spec = "FIRST" if desc else "LAST"
+    ast = expression_to_ast(key, resolver)
     return exp.Ordered(this=ast, desc=desc, nulls_first=(spec.upper() == "FIRST"))
 
 
-def order_by_fragment(
-    keys, ascending, nulls, resolver, dialect="postgres", fill_nulls_default=False
-):
+def order_by_fragment(keys, ascending, nulls, resolver, dialect="postgres"):
     """Render ORDER BY keys to a comma-separated SQL fragment (no ``ORDER BY``).
 
     The single ``order_by`` builder produces the AST; each key is then rendered
     to ``dialect``. Used by every node that assembles ORDER BY into a SQL string
     (remote scans/joins/pushdown and the local merge operators).
     """
-    order = order_by(keys, ascending, nulls, resolver, fill_nulls_default)
+    order = order_by(keys, ascending, nulls, resolver)
     parts = []
     for item in order.expressions:
         parts.append(item.sql(dialect=dialect))
