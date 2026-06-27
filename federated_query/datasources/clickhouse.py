@@ -172,11 +172,7 @@ class ClickHouseDataSource(DataSource):
         ).result_rows[0]
         row_count = row[0]
         column_stats = self._column_statistics(metadata, row, row_count)
-        return TableStatistics(
-            row_count=row_count,
-            total_size_bytes=row_count * 100,
-            column_stats=column_stats,
-        )
+        return self._build_table_statistics(row_count, column_stats)
 
     def _statistics_query(self, schema, table, metadata: TableMetadata) -> str:
         """Build one query: count() plus uniqExact/nulls for every column."""
@@ -196,10 +192,7 @@ class ClickHouseDataSource(DataSource):
         for column in metadata.columns:
             distinct, nulls = row[index], row[index + 1]
             index += 2
-            null_fraction = nulls / row_count if row_count > 0 else 0.0
-            stats[column.name] = ColumnStatistics(
-                num_distinct=distinct, null_fraction=null_fraction, avg_width=10
-            )
+            stats[column.name] = self._build_column_statistics(distinct, nulls, row_count)
         return stats
 
     def execute_query(self, query: str) -> Iterator[pa.RecordBatch]:

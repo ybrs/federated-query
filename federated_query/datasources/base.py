@@ -169,6 +169,32 @@ class DataSource(ABC):
         """
         pass
 
+    def _metadata_from_information_schema(self, schema, table, rows) -> TableMetadata:
+        """Build TableMetadata from information_schema (name, type, is_nullable) rows.
+
+        Shared by sources that read information_schema.columns verbatim; nullable
+        follows the SQL ``is_nullable = 'YES'`` convention.
+        """
+        columns = []
+        for name, data_type, is_nullable in rows:
+            columns.append(
+                ColumnMetadata(name=name, data_type=data_type, nullable=(is_nullable == "YES"))
+            )
+        return TableMetadata(schema_name=schema, table_name=table, columns=columns)
+
+    def _build_column_statistics(self, num_distinct, null_count, row_count) -> ColumnStatistics:
+        """Build ColumnStatistics, deriving the null fraction from a null count."""
+        null_fraction = null_count / row_count if row_count > 0 else 0.0
+        return ColumnStatistics(
+            num_distinct=num_distinct, null_fraction=null_fraction, avg_width=10
+        )
+
+    def _build_table_statistics(self, row_count, column_stats) -> TableStatistics:
+        """Wrap a row count and per-column stats into TableStatistics."""
+        return TableStatistics(
+            row_count=row_count, total_size_bytes=row_count * 100, column_stats=column_stats
+        )
+
     def parse_query(self, query: str):
         """Parse query text into a sqlglot AST with NATURAL joins marked."""
         from ..parser.dialect import FedQPostgres

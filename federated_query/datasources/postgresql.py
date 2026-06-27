@@ -15,7 +15,6 @@ from .base import (
     DataSource,
     DataSourceCapability,
     TableMetadata,
-    ColumnMetadata,
     TableStatistics,
     ColumnStatistics,
 )
@@ -196,19 +195,12 @@ class PostgreSQLDataSource(DataSource):
                     (schema, table),
                 )
 
-                columns = []
+                rows = []
                 for row in cursor.fetchall():
-                    columns.append(
-                        ColumnMetadata(
-                            name=row["column_name"],
-                            data_type=row["data_type"],
-                            nullable=row["is_nullable"] == "YES",
-                        )
+                    rows.append(
+                        (row["column_name"], row["data_type"], row["is_nullable"])
                     )
-
-                return TableMetadata(
-                    schema_name=schema, table_name=table, columns=columns
-                )
+                return self._metadata_from_information_schema(schema, table, rows)
         except psycopg2.Error as e:
             logger.error(f"Error getting metadata for {schema}.{table}: {e}")
             raise
@@ -259,11 +251,7 @@ class PostgreSQLDataSource(DataSource):
                         avg_width=10,  # Placeholder
                     )
 
-                return TableStatistics(
-                    row_count=row_count,
-                    total_size_bytes=row_count * 100,  # Rough estimate
-                    column_stats=column_stats,
-                )
+                return self._build_table_statistics(row_count, column_stats)
         finally:
             self._return_connection(conn)
 

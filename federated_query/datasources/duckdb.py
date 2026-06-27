@@ -9,7 +9,6 @@ from .base import (
     DataSource,
     DataSourceCapability,
     TableMetadata,
-    ColumnMetadata,
     TableStatistics,
     ColumnStatistics,
 )
@@ -103,17 +102,7 @@ class DuckDBDataSource(DataSource):
             [schema, table],
         ).fetchall()
 
-        columns = []
-        for row in result:
-            columns.append(
-                ColumnMetadata(
-                    name=row[0],
-                    data_type=row[1],
-                    nullable=row[2] == "YES",
-                )
-            )
-
-        return TableMetadata(schema_name=schema, table_name=table, columns=columns)
+        return self._metadata_from_information_schema(schema, table, result)
 
     def get_table_statistics(
         self, schema: str, table: str
@@ -129,11 +118,7 @@ class DuckDBDataSource(DataSource):
             schema, table, metadata, row_count
         )
 
-        return TableStatistics(
-            row_count=row_count,
-            total_size_bytes=row_count * 100,
-            column_stats=column_stats,
-        )
+        return self._build_table_statistics(row_count, column_stats)
 
     def _collect_column_statistics(
         self, schema: str, table: str, metadata: TableMetadata, row_count: int
@@ -156,13 +141,7 @@ class DuckDBDataSource(DataSource):
 
         n_distinct = result[0] if result else 0
         null_count = result[1] if result else 0
-        null_fraction = null_count / row_count if row_count > 0 else 0.0
-
-        return ColumnStatistics(
-            num_distinct=n_distinct,
-            null_fraction=null_fraction,
-            avg_width=10,
-        )
+        return self._build_column_statistics(n_distinct, null_count, row_count)
 
     def execute_query(self, query: str) -> Iterator[pa.RecordBatch]:
         """Execute query and yield Arrow record batches."""
