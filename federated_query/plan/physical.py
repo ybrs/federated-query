@@ -22,8 +22,26 @@ from pydantic import Field
 
 from ..model import StateModel
 from .expressions import Expression, and_expressions
+from .emit import expression_to_ast, CANONICAL_SOURCE_RESOLVER, clauses
 from .logical import JoinType, ExplainFormat, SetOpKind
 from ..utils.logging import get_logger
+
+
+def _source_ast(expr: Expression) -> exp.Expression:
+    """Lower an engine predicate to a sqlglot AST in the canonical source form."""
+    return expression_to_ast(expr, CANONICAL_SOURCE_RESOLVER)
+
+
+def _parse_table_sample(sample_text: str) -> exp.Expression:
+    """Parse a stored Postgres-form TABLESAMPLE fragment into a sqlglot node.
+
+    The clause is held as raw text; recover the structured node once here so
+    sqlglot renders the source dialect's own sampling syntax.
+    """
+    import sqlglot
+
+    parsed = sqlglot.parse_one(f"SELECT * FROM _t {sample_text}", read="postgres")
+    return parsed.find(exp.Table).args.get("sample")
 
 if TYPE_CHECKING:
     from .expressions import FunctionCall
@@ -574,7 +592,7 @@ class PhysicalScan(PhysicalPlanNode):
         if self.datasource_connection is None:
             raise RuntimeError("Data source connection not set")
 
-        query = to_source_sql(self.datasource_connection, self._build_query())
+        query = self._render_source_sql()
 
         self.datasource_connection.ensure_connected()
         batches = self.datasource_connection.execute_query(query)
@@ -582,30 +600,47 @@ class PhysicalScan(PhysicalPlanNode):
         for batch in batches:
             yield batch
 
+    def _render_source_sql(self) -> str:
+        """Render this scan directly in the source dialect (no parse-back)."""
+        return self._build_ast().sql(dialect=self.datasource_connection.render_dialect)
+
     def _build_query(self) -> str:
-        """Build SQL query for this scan."""
-        select_kw = "SELECT DISTINCT" if self.distinct else "SELECT"
-        query = f"{select_kw} {self._format_columns()} FROM {self._format_table_ref()}"
+        """Render this scan as canonical Postgres-form SQL.
+
+        Kept for the EXPLAIN snapshot and set-op branch builders that still
+        consume a string; the execute/schema paths use the AST directly.
+        """
+        return self._build_ast().sql(dialect="postgres")
+
+    def _build_ast(self) -> exp.Select:
+        """Build the sqlglot SELECT for this scan."""
+        select = exp.Select(expressions=self._select_items()).from_(self._table_ref())
+        select = self._apply_filter_clauses(select)
+        select = self._apply_order(select)
+        if self.distinct:
+            select.set("distinct", exp.Distinct())
+        return clauses.apply_limit_offset(select, self.limit, self.offset)
+
+    def _apply_filter_clauses(self, select: exp.Select) -> exp.Select:
+        """Attach WHERE, GROUP BY, and HAVING from the (folded) scan filter."""
         where_pred, having_pred = self._split_where_having()
         if where_pred is not None:
-            query = f"{query} WHERE {where_pred.to_sql()}"
-        if self.group_by or self.grouping_sets is not None:
-            query = f"{query} GROUP BY {self._format_group_by()}"
+            select.set("where", exp.Where(this=_source_ast(where_pred)))
+        group = clauses.group_by(self.group_by, self.grouping_sets, CANONICAL_SOURCE_RESOLVER)
+        if group is not None:
+            select.set("group", group)
         if having_pred is not None:
-            query = f"{query} HAVING {having_pred.to_sql()}"
-        return self._append_order_limit(query)
+            select.set("having", exp.Having(this=_source_ast(having_pred)))
+        return select
 
-    def _append_order_limit(self, query: str) -> str:
-        """Append ORDER BY / LIMIT / OFFSET clauses to a query."""
-        if self.order_by_keys:
-            query = f"{query} ORDER BY {self._format_order_by()}"
-        if self.limit is not None:
-            query = f"{query} LIMIT {self.limit}"
-        # OFFSET is independent of LIMIT: ``OFFSET n`` alone is valid SQL and
-        # must not be dropped just because there is no row cap.
-        if self.offset:
-            query = f"{query} OFFSET {self.offset}"
-        return query
+    def _apply_order(self, select: exp.Select) -> exp.Select:
+        """Attach ORDER BY when the scan carries sort keys."""
+        order = clauses.order_by(
+            self.order_by_keys, self.order_by_ascending, self.order_by_nulls, CANONICAL_SOURCE_RESOLVER
+        )
+        if order is not None:
+            select.set("order", order)
+        return select
 
     def _split_where_having(self):
         """Partition the scan filter into (WHERE, HAVING) via the shared splitter.
@@ -624,85 +659,34 @@ class PhysicalScan(PhysicalPlanNode):
         output_map = aggregate_output_map(self.output_names, self.aggregates)
         return split_where_having(self.filters, output_map)
 
-    def _format_columns(self) -> str:
-        """Format column list for SQL.
+    def _select_items(self) -> list:
+        """Build the SELECT projection: aggregates, a star, or plain columns.
 
-        If aggregates are present, use them directly.
-        The aggregates list contains ALL SELECT expressions in order:
-        - GROUP BY columns first
-        - Then aggregate functions (COUNT, SUM, etc.)
-
-        Otherwise format simple column list.
+        With aggregates present, the aggregates list is the full ordered SELECT
+        (GROUP BY keys first, then aggregate functions) aliased by output_names.
         """
         if self.aggregates:
-            select_items = []
-            index = 0
-            while index < len(self.aggregates):
-                expr = self.aggregates[index]
-                expr_sql = expr.to_sql()
-                alias_name = None
-                if self.output_names and index < len(self.output_names):
-                    alias_name = self.output_names[index]
-                if alias_name:
-                    select_items.append(f'{expr_sql} AS "{alias_name}"')
-                else:
-                    select_items.append(expr_sql)
-                index += 1
-            return ", ".join(select_items)
-
+            return clauses.select_expressions(
+                self.aggregates, self.output_names, CANONICAL_SOURCE_RESOLVER
+            )
         if "*" in self.columns:
-            return "*"
-
-        quoted_cols = []
-        for col in self.columns:
-            quoted_cols.append(f'"{col}"')
-
-        return ", ".join(quoted_cols)
-
-    def _format_table_ref(self) -> str:
-        """Format table reference for SQL, including any TABLESAMPLE clause."""
-        ref = f'"{self.schema_name}"."{self.table_name}"'
-        if self.alias:
-            ref = f"{ref} AS {self.alias}"
-        if self.sample:
-            ref = f"{ref} {self.sample}"
-        return ref
-
-    def _format_group_by(self) -> str:
-        """Format GROUP BY clause (GROUPING SETS for ROLLUP/CUBE/GROUPING SETS)."""
-        if self.grouping_sets is not None:
-            return render_grouping_sets(self.grouping_sets, lambda e: e.to_sql())
-        if not self.group_by:
-            return ""
-
-        group_items = []
-        for expr in self.group_by:
-            group_items.append(expr.to_sql())
-
-        return ", ".join(group_items)
-
-    def _format_order_by(self) -> str:
-        """Format ORDER BY clause for SQL."""
-        if not self.order_by_keys:
-            return ""
-
+            return [exp.Star()]
         items = []
-        for i in range(len(self.order_by_keys)):
-            expr = self.order_by_keys[i]
-            item = expr.to_sql()
+        for col in self.columns:
+            items.append(exp.column(col, quoted=True))
+        return items
 
-            if self.order_by_ascending and i < len(self.order_by_ascending):
-                if not self.order_by_ascending[i]:
-                    item = f"{item} DESC"
-
-            if self.order_by_nulls and i < len(self.order_by_nulls):
-                nulls_spec = self.order_by_nulls[i]
-                if nulls_spec:
-                    item = f"{item} NULLS {nulls_spec}"
-
-            items.append(item)
-
-        return ", ".join(items)
+    def _table_ref(self) -> exp.Table:
+        """Build the FROM table with optional alias and TABLESAMPLE."""
+        table = exp.Table(
+            this=exp.to_identifier(self.table_name, quoted=True),
+            db=exp.to_identifier(self.schema_name, quoted=True),
+        )
+        if self.alias:
+            table.set("alias", exp.TableAlias(this=exp.to_identifier(self.alias, quoted=True)))
+        if self.sample:
+            table.set("sample", _parse_table_sample(self.sample))
+        return table
 
     def schema(self) -> pa.Schema:
         """Get output schema."""
@@ -712,7 +696,7 @@ class PhysicalScan(PhysicalPlanNode):
         if self.datasource_connection is None:
             raise RuntimeError("Data source connection not set")
 
-        query = to_source_sql(self.datasource_connection, self._build_query())
+        query = self._render_source_sql()
         self._schema = self.datasource_connection.get_query_schema(query)
         return self._schema
 
