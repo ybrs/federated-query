@@ -224,3 +224,14 @@ def test_values_alias_width_mismatch_rejected():
     """A VALUES column-alias count that does not match the row width must fail."""
     with pytest.raises(UnsupportedSQLError, match="alias count"):
         parse("SELECT * FROM (VALUES (1, 2)) AS v(a, b, c)")
+
+
+def test_trim_position_keyword_rejected():
+    """TRIM LEADING/TRAILING/BOTH must not be silently dropped to a both-trim."""
+    with pytest.raises(UnsupportedSQLError, match="TRIM"):
+        parse("SELECT trim(LEADING 'x' FROM col) FROM s.t")
+
+
+def test_plain_trim_still_parses():
+    """TRIM without a position keyword is unaffected."""
+    assert parse("SELECT trim(col) FROM s.t") is not None

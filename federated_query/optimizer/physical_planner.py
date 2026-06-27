@@ -49,8 +49,16 @@ from ..plan.physical import (
     PhysicalCTEScan,
     PhysicalCTEMergeQuery,
 )
-from ..plan.expressions import BinaryOp, BinaryOpType, ColumnRef, Literal, Expression
+from ..plan.expressions import (
+    BinaryOp,
+    BinaryOpType,
+    ColumnRef,
+    Literal,
+    Expression,
+    split_conjuncts as _split_and,
+)
 from .single_source_pushdown import SingleSourcePushdown
+from ..parser.errors import UnsupportedSQLError
 from typing import List, Tuple
 from ..model import StateModel
 
@@ -70,13 +78,6 @@ _FLIP_OP = {
     BinaryOpType.GT: BinaryOpType.LT,
     BinaryOpType.GTE: BinaryOpType.LTE,
 }
-
-
-def _split_and(expr: Expression) -> List[Expression]:
-    """Flatten a predicate into its top-level AND conjuncts."""
-    if isinstance(expr, BinaryOp) and expr.op == BinaryOpType.AND:
-        return _split_and(expr.left) + _split_and(expr.right)
-    return [expr]
 
 
 if TYPE_CHECKING:
@@ -332,6 +333,9 @@ class PhysicalPlanner:
         """Plan a projection; window-bearing ones run in the merge engine."""
         input_plan = self._plan_node(projection.input)
         if self._projection_has_window(projection):
+            # DISTINCT (incl. DISTINCT ON) over a window is rejected at parse by
+            # _reject_distinct_window, so a window projection is never distinct
+            # here - no distinct handling needed on this path.
             return PhysicalWindow(
                 input=input_plan,
                 expressions=projection.expressions,
@@ -360,12 +364,11 @@ class PhysicalPlanner:
 
     def _expression_has_window(self, expr) -> bool:
         """Whether an expression tree contains a WindowExpr at any depth."""
-        from ..plan.expressions import WindowExpr
-        from .decorrelation import _expression_children
+        from ..plan.expressions import WindowExpr, expression_children
 
         if isinstance(expr, WindowExpr):
             return True
-        for child in _expression_children(expr):
+        for child in expression_children(expr):
             if self._expression_has_window(child):
                 return True
         return False
@@ -532,6 +535,15 @@ class PhysicalPlanner:
         remote = self._try_plan_remote_join(join, left_plan, right_plan)
         if remote:
             return remote
+        if join.condition is None and (join.natural or join.using):
+            # Same-source NATURAL/USING is rendered as-is by the remote path
+            # above. Reaching here means a cross-source NATURAL/USING join whose
+            # name-match equality the merge engine cannot resolve; building a
+            # conditionless nested loop would be a silent Cartesian product.
+            raise UnsupportedSQLError(
+                "cross-source NATURAL/USING join is not supported; "
+                "use an explicit ON condition"
+            )
         hash_join = self._plan_hash_join_or_none(join, left_plan, right_plan)
         if hash_join:
             return hash_join

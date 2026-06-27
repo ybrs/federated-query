@@ -160,6 +160,31 @@ def test_bind_table_name_qualifier_when_aliased_raises(catalog_with_test_data):
         binder.bind(plan)
 
 
+@pytest.mark.xfail(
+    reason="D1: HAVING does not yet validate aggregate-function arguments",
+    strict=True,
+)
+def test_bind_invalid_column_in_having_should_raise(catalog_with_test_data):
+    """Desired (tracked, not yet implemented): a column that exists only inside a
+    HAVING aggregate is rejected at bind time.
+
+    The HAVING binder currently leaves FunctionCall arguments unbound, so this
+    raises nothing and the test xfails. When D1 is fixed the binder will raise
+    BindingError and this XPASSes (strict) - the signal to remove the marker.
+    The companion e2e test asserts the query still crashes at execution today,
+    so the deferral never ships a wrong answer in the meantime.
+    """
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = (
+        "SELECT amount FROM testdb.public.orders "
+        "GROUP BY amount HAVING SUM(nonexistent_col) > 10"
+    )
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
+    with pytest.raises(BindingError):
+        binder.bind(plan)
+
+
 def test_bind_with_where_clause(catalog_with_test_data):
     """Test binding with WHERE clause."""
     parser = Parser()

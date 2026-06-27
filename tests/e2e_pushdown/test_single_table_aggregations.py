@@ -1,5 +1,6 @@
 """Single-table aggregation pushdown tests."""
 
+import pytest
 from sqlglot import exp
 
 from tests.e2e_pushdown.helpers import (
@@ -90,8 +91,13 @@ def test_group_by_multiple_columns(single_source_env):
     assert projection[1] == "status"
 
 
-def test_having_clause_translated_to_remote_filter(single_source_env):
-    """Verifies HAVING sum is converted into a remote filter predicate."""
+def test_having_clause_pushed_as_remote_having(single_source_env):
+    """HAVING is pushed as a remote HAVING clause (not a WHERE on an alias).
+
+    The binder rewrites ``SUM(quantity) > 10`` to the output alias; the emitter
+    routes it into HAVING and substitutes the alias back to the aggregate, so the
+    source sees ``HAVING SUM(quantity) > 10`` - valid SQL that executes.
+    """
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT region, SUM(quantity) AS total_qty "
@@ -101,11 +107,35 @@ def test_having_clause_translated_to_remote_filter(single_source_env):
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
     assert projection == ["region", "total_qty"]
-    where_clause = ast.args.get("where")
-    assert where_clause is not None
-    predicate = unwrap_parens(where_clause.this)
+    assert ast.args.get("where") is None
+    having_clause = ast.args.get("having")
+    assert having_clause is not None
+    predicate = unwrap_parens(having_clause.this)
     assert isinstance(predicate, exp.GT)
-    assert predicate.left.name.lower() == "total_qty"
+    assert "SUM" in predicate.left.sql().upper()
+
+
+def test_having_executes_and_matches_source(single_source_env):
+    """A pushed-down HAVING must EXECUTE and match the source's own result.
+
+    The existing test above only EXPLAINs the pushed AST, so it never catches
+    that the rendered WHERE-on-an-aggregate is invalid SQL. This executes it.
+    """
+    runtime = build_runtime(single_source_env)
+    engine_sql = (
+        "SELECT region, SUM(quantity) AS total "
+        "FROM duckdb_primary.main.orders GROUP BY region HAVING SUM(quantity) > 10"
+    )
+    reference_sql = (
+        "SELECT region, SUM(quantity) AS total "
+        "FROM orders GROUP BY region HAVING SUM(quantity) > 10"
+    )
+    rows = runtime.execute(engine_sql).to_pylist()
+    reference = single_source_env.datasources[0].connection.execute(
+        reference_sql
+    ).fetchall()
+    got = sorted((row["region"], row["total"]) for row in rows)
+    assert got == sorted(reference)
 
 
 def test_min_max_with_limit(single_source_env):
@@ -247,9 +277,10 @@ def test_having_with_multiple_conditions(single_source_env):
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
     assert set(projection) == {"region", "total_qty", "avg_price"}
-    where_clause = ast.args.get("where")
-    assert where_clause is not None
-    predicate = unwrap_parens(where_clause.this)
+    assert ast.args.get("where") is None
+    having_clause = ast.args.get("having")
+    assert having_clause is not None
+    predicate = unwrap_parens(having_clause.this)
     assert isinstance(predicate, exp.And)
 
 

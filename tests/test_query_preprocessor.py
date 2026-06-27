@@ -12,6 +12,7 @@ from federated_query.processor import (
     StarExpansionError,
     StarExpansionProcessor,
 )
+from federated_query.parser.errors import UnsupportedSQLError
 
 
 def _build_catalog() -> Catalog:
@@ -78,6 +79,40 @@ def test_preprocess_missing_table_raises() -> None:
     preprocessor = QueryPreprocessor(catalog)
     with pytest.raises(StarExpansionError):
         preprocessor.preprocess(context.original_sql, context)
+
+
+def test_chained_named_windows_rejected() -> None:
+    """B11: a window defined in terms of another (w2 AS (w1 ...)) must not
+    silently drop the base window's PARTITION BY - it fails fast."""
+    catalog = _build_catalog()
+    sql = (
+        "SELECT row_number() OVER w2 FROM testdb.main.orders "
+        "WINDOW w1 AS (PARTITION BY region), w2 AS (w1 ORDER BY order_id)"
+    )
+    with pytest.raises(UnsupportedSQLError, match="chained named windows"):
+        QueryPreprocessor(catalog).preprocess(sql, QueryContext(sql))
+
+
+def test_pivot_with_star_exclude_rejected() -> None:
+    """B12: SELECT * EXCLUDE/REPLACE alongside PIVOT must not be silently ignored."""
+    catalog = _build_catalog()
+    sql = (
+        "SELECT * EXCLUDE (quantity) FROM testdb.main.orders "
+        "PIVOT(SUM(quantity) FOR region IN ('us','eu'))"
+    )
+    with pytest.raises(UnsupportedSQLError, match="EXCLUDE/REPLACE with PIVOT"):
+        QueryPreprocessor(catalog).preprocess(sql, QueryContext(sql))
+
+
+def test_pivot_with_group_by_rejected() -> None:
+    """B13: a user GROUP BY alongside PIVOT must not be silently clobbered."""
+    catalog = _build_catalog()
+    sql = (
+        "SELECT * FROM testdb.main.orders "
+        "PIVOT(SUM(quantity) FOR region IN ('us','eu')) GROUP BY order_id"
+    )
+    with pytest.raises(UnsupportedSQLError, match="GROUP BY with PIVOT"):
+        QueryPreprocessor(catalog).preprocess(sql, QueryContext(sql))
 
 
 def test_preprocess_rejects_subquery_sources() -> None:

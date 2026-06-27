@@ -682,6 +682,27 @@ class TestRegressionPrevention:
         assert_plan_structure(decorrelated_plan, {})
         results = execute_and_fetch_all(executor, decorrelated_plan)
 
+    def test_having_invalid_column_crashes_not_lies(self, catalog, setup_test_data):
+        """A column that exists only in HAVING must crash, never return wrong rows.
+
+        The binder does not yet validate aggregate-function args in HAVING (D1).
+        This guarantees the deferral is safe: the engine fails loudly at
+        execution (the source rejects the unknown column) instead of shipping a
+        wrong answer. If a change ever made this query succeed, this test fails.
+        """
+        sql = (
+            "SELECT user_id, SUM(amount) AS total FROM pg.orders "
+            "GROUP BY user_id HAVING SUM(nonexistent_col) > 200"
+        )
+        parser = Parser()
+        binder = Binder(catalog)
+        decorrelator = Decorrelator()
+        executor = Executor(catalog)
+
+        with pytest.raises(Exception):
+            plan = decorrelator.decorrelate(binder.bind(parser.parse(sql)))
+            execute_and_fetch_all(executor, plan)
+
 
 class TestValidationPhase:
     """Test post-decorrelation validation."""

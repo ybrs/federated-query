@@ -15,7 +15,12 @@ from ..plan.logical import (
     SetOperation,
     Explain,
 )
-from ..plan.expressions import Expression, InList, BetweenExpression
+from ..plan.expressions import (
+    Expression,
+    InList,
+    BetweenExpression,
+    and_expressions,
+)
 from ..catalog.catalog import Catalog
 
 if TYPE_CHECKING:
@@ -412,82 +417,21 @@ class PredicatePushdownRule(OptimizationRule):
         return set()
 
     def _extract_column_refs(self, expr: Expression) -> set:
-        """Extract qualified column names from expression.
+        """Qualified column names in an expression (``table.col`` or bare ``col``).
 
-        Returns column names with table qualifier when available (e.g., "orders.id"),
-        or bare column names if no qualifier present (e.g., "id").
-
-        This is critical for join filter pushdown: when both join inputs have
-        columns with the same name, we must respect table qualifiers to avoid
-        pushing filters to the wrong side.
+        Critical for join filter pushdown: when both join inputs expose a column
+        of the same name, the table qualifier decides which side a filter goes
+        to. Built on the shared column_refs walker so every node type is covered.
         """
-        from ..plan.expressions import ColumnRef
-
-        if isinstance(expr, ColumnRef):
-            if expr.table:
-                return {f"{expr.table}.{expr.column}"}
-            return {expr.column}
+        from ..plan.expressions import column_refs
 
         columns = set()
-        for child in self._predicate_children(expr):
-            columns.update(self._extract_column_refs(child))
+        for ref in column_refs(expr):
+            if ref.table:
+                columns.add(f"{ref.table}.{ref.column}")
+            else:
+                columns.add(ref.column)
         return columns
-
-    def _predicate_children(self, expr: Expression) -> list:
-        """Direct sub-expressions of a predicate node (for column extraction).
-
-        CASE/IN/BETWEEN/CAST must be traversed too; returning no children for
-        them made predicates that reference real columns look column-free and
-        get pushed down vacuously.
-        """
-        from ..plan.expressions import BinaryOp, UnaryOp, FunctionCall, Cast, Extract
-
-        if isinstance(expr, BinaryOp):
-            return [expr.left, expr.right]
-        if isinstance(expr, UnaryOp):
-            return [expr.operand]
-        if isinstance(expr, FunctionCall):
-            children = list(expr.args)
-            if expr.within_group_key is not None:
-                children.append(expr.within_group_key)
-            return children
-        if isinstance(expr, Cast):
-            return [expr.expr]
-        if isinstance(expr, Extract):
-            return [expr.source]
-        return self._container_predicate_children(expr)
-
-    def _container_predicate_children(self, expr: Expression) -> list:
-        """Sub-expressions of container predicate nodes (IN/BETWEEN/CASE/tuple/window)."""
-        from ..plan.expressions import (
-            InList,
-            BetweenExpression,
-            CaseExpr,
-            TupleExpression,
-            WindowExpr,
-        )
-
-        if isinstance(expr, InList):
-            return [expr.value] + list(expr.options)
-        if isinstance(expr, BetweenExpression):
-            return [expr.value, expr.lower, expr.upper]
-        if isinstance(expr, CaseExpr):
-            return self._case_predicate_children(expr)
-        if isinstance(expr, TupleExpression):
-            return list(expr.items)
-        if isinstance(expr, WindowExpr):
-            return [expr.function] + list(expr.partition_by) + list(expr.order_keys)
-        return []
-
-    def _case_predicate_children(self, expr) -> list:
-        """Condition/result sub-expressions of a CASE node."""
-        children = []
-        for condition, result in expr.when_clauses:
-            children.append(condition)
-            children.append(result)
-        if expr.else_result is not None:
-            children.append(expr.else_result)
-        return children
 
     def name(self) -> str:
         """Return this rule's identifier (used in logging and EXPLAIN)."""
@@ -585,92 +529,17 @@ class ProjectionPushdownRule(OptimizationRule):
         return columns
 
     def _extract_columns(self, expr: Expression) -> set:
-        """Extract column names from expression."""
-        from ..plan.expressions import (
-            ColumnRef,
-            BinaryOp,
-            UnaryOp,
-            FunctionCall,
-            WindowExpr,
-            Cast,
-            Extract,
-            CaseExpr,
-            TupleExpression,
-        )
+        """Bare column names referenced in an expression.
+
+        Built on the shared column_refs walker so every node type is covered by
+        one implementation.
+        """
+        from ..plan.expressions import column_refs
 
         columns = set()
-
-        if isinstance(expr, ColumnRef):
-            columns.add(expr.column)
-            return columns
-
-        if isinstance(expr, Cast):
-            columns.update(self._extract_columns(expr.expr))
-            return columns
-
-        if isinstance(expr, Extract):
-            columns.update(self._extract_columns(expr.source))
-            return columns
-
-        if isinstance(expr, CaseExpr):
-            return self._case_columns(expr)
-
-        if isinstance(expr, TupleExpression):
-            for item in expr.items:
-                columns.update(self._extract_columns(item))
-            return columns
-
-        if isinstance(expr, WindowExpr):
-            for child in self._window_children(expr):
-                columns.update(self._extract_columns(child))
-            return columns
-
-        if isinstance(expr, BinaryOp):
-            columns.update(self._extract_columns(expr.left))
-            columns.update(self._extract_columns(expr.right))
-            return columns
-
-        if isinstance(expr, UnaryOp):
-            columns.update(self._extract_columns(expr.operand))
-            return columns
-
-        if isinstance(expr, FunctionCall):
-            for arg in expr.args:
-                columns.update(self._extract_columns(arg))
-            if expr.within_group_key is not None:
-                columns.update(self._extract_columns(expr.within_group_key))
-            return columns
-
-        if isinstance(expr, InList):
-            columns.update(self._extract_columns(expr.value))
-            for option in expr.options:
-                columns.update(self._extract_columns(option))
-            return columns
-
-        if isinstance(expr, BetweenExpression):
-            columns.update(self._extract_columns(expr.value))
-            columns.update(self._extract_columns(expr.lower))
-            columns.update(self._extract_columns(expr.upper))
-            return columns
-
+        for ref in column_refs(expr):
+            columns.add(ref.column)
         return columns
-
-    def _case_columns(self, expr) -> set:
-        """Columns referenced in a CASE expression's branches and ELSE."""
-        columns = set()
-        for condition, result in expr.when_clauses:
-            columns.update(self._extract_columns(condition))
-            columns.update(self._extract_columns(result))
-        if expr.else_result is not None:
-            columns.update(self._extract_columns(expr.else_result))
-        return columns
-
-    def _window_children(self, expr) -> list:
-        """A window's column-bearing sub-expressions: function, partition, order."""
-        children = [expr.function]
-        children.extend(expr.partition_by)
-        children.extend(expr.order_keys)
-        return children
 
     def _prune_columns(self, plan: LogicalPlanNode, required: set) -> LogicalPlanNode:
         """Prune unused columns from plan."""
@@ -833,14 +702,14 @@ class LimitPushdownRule(OptimizationRule):
             if rewritten != child:
                 changed = True
         if changed:
-            return Union(inputs=new_inputs, distinct=union.distinct)
+            return union.model_copy(update={"inputs": new_inputs})
         return union
 
     def _rewrite_explain(self, explain: Explain) -> LogicalPlanNode:
         """Rewrite explain child."""
         new_input = self._rewrite_plan(explain.input)
         if new_input != explain.input:
-            return Explain(input=new_input, format=explain.format)
+            return explain.model_copy(update={"input": new_input})
         return explain
 
     def _push_limit_node(self, limit: Limit) -> LogicalPlanNode:
@@ -857,7 +726,7 @@ class LimitPushdownRule(OptimizationRule):
             scan_with_limit = self._apply_limit_metadata(
                 input_node, limit.limit, limit.offset
             )
-            return Limit(input=scan_with_limit, limit=limit.limit, offset=0)
+            return limit.model_copy(update={"input": scan_with_limit, "offset": 0})
 
         return limit.model_copy(update={"input": input_node})
 
@@ -891,7 +760,9 @@ class LimitPushdownRule(OptimizationRule):
             limit.offset,
         )
         retained_offset = 0 if isinstance(projection.input, Scan) else limit.offset
-        limited = Limit(input=pushed_child, limit=limit.limit, offset=retained_offset)
+        limited = limit.model_copy(
+            update={"input": pushed_child, "offset": retained_offset}
+        )
         return projection.model_copy(update={"input": limited})
 
     def _push_limit_with_sort(self, limit: Limit, sort: Sort) -> LogicalPlanNode:
@@ -908,14 +779,9 @@ class LimitPushdownRule(OptimizationRule):
                     "offset": limit.offset,
                 }
             )
-            return Limit(input=new_scan, limit=limit.limit, offset=0)
+            return limit.model_copy(update={"input": new_scan, "offset": 0})
 
-        new_sort = Sort(
-            input=sorted_input,
-            sort_keys=sort.sort_keys,
-            ascending=sort.ascending,
-            nulls_order=sort.nulls_order,
-        )
+        new_sort = sort.model_copy(update={"input": sorted_input})
         return limit.model_copy(update={"input": new_sort})
 
     def _apply_limit_metadata(
@@ -996,12 +862,7 @@ class OrderByPushdownRule(OptimizationRule):
         """Try to push sort into its input."""
         if not self._sort_keys_are_columns(sort.sort_keys):
             pushed_child = self._attach_order_metadata(sort.input, sort)
-            return Sort(
-                input=pushed_child,
-                sort_keys=sort.sort_keys,
-                ascending=sort.ascending,
-                nulls_order=sort.nulls_order,
-            )
+            return sort.model_copy(update={"input": pushed_child})
 
         input_node = sort.input
 
@@ -1093,11 +954,8 @@ class OrderByPushdownRule(OptimizationRule):
         if rewritten_keys is None:
             return sort
 
-        rewritten_sort = Sort(
-            input=projection.input,
-            sort_keys=rewritten_keys,
-            ascending=sort.ascending,
-            nulls_order=sort.nulls_order,
+        rewritten_sort = sort.model_copy(
+            update={"input": projection.input, "sort_keys": rewritten_keys}
         )
         pushed_child = self._push_order_by(rewritten_sort)
 
@@ -1105,12 +963,7 @@ class OrderByPushdownRule(OptimizationRule):
             rebuilt_projection = projection.model_copy(
                 update={"input": pushed_child.input}
             )
-            return Sort(
-                input=rebuilt_projection,
-                sort_keys=sort.sort_keys,
-                ascending=sort.ascending,
-                nulls_order=sort.nulls_order,
-            )
+            return sort.model_copy(update={"input": rebuilt_projection})
 
         return projection.model_copy(update={"input": pushed_child})
 
@@ -1141,12 +994,7 @@ class OrderByPushdownRule(OptimizationRule):
         )
 
         rebuilt = join.model_copy(update={"left": new_left, "right": new_right})
-        return Sort(
-            input=rebuilt,
-            sort_keys=sort.sort_keys,
-            ascending=sort.ascending,
-            nulls_order=sort.nulls_order,
-        )
+        return sort.model_copy(update={"input": rebuilt})
 
     def _push_sort_into_child(
         self,
@@ -1154,12 +1002,7 @@ class OrderByPushdownRule(OptimizationRule):
         child: LogicalPlanNode,
     ) -> LogicalPlanNode:
         """Push sort keys into a specific child and return transformed child."""
-        injected = Sort(
-            input=child,
-            sort_keys=sort.sort_keys,
-            ascending=sort.ascending,
-            nulls_order=sort.nulls_order,
-        )
+        injected = sort.model_copy(update={"input": child})
         pushed = self._push_order_by(injected)
         if isinstance(pushed, Sort):
             return pushed.input
@@ -1206,12 +1049,7 @@ class OrderByPushdownRule(OptimizationRule):
 
         pushed_child = self._push_sort_into_child(sort, aggregate.input)
         new_agg = aggregate.model_copy(update={"input": pushed_child})
-        return Sort(
-            input=new_agg,
-            sort_keys=sort.sort_keys,
-            ascending=sort.ascending,
-            nulls_order=sort.nulls_order,
-        )
+        return sort.model_copy(update={"input": new_agg})
 
     def _extract_group_columns(self, group_by: List[Expression]) -> set:
         """Extract column names from group by expressions."""
@@ -1229,25 +1067,15 @@ class OrderByPushdownRule(OptimizationRule):
         """Propagate sort metadata into union inputs while keeping top sort."""
         new_inputs = []
         for child in union.inputs:
-            injected = Sort(
-                input=child,
-                sort_keys=sort.sort_keys,
-                ascending=sort.ascending,
-                nulls_order=sort.nulls_order,
-            )
+            injected = sort.model_copy(update={"input": child})
             pushed_child = self._push_order_by(injected)
             if isinstance(pushed_child, Sort):
                 new_inputs.append(pushed_child.input)
             else:
                 new_inputs.append(pushed_child)
 
-        new_union = Union(inputs=new_inputs, distinct=union.distinct)
-        return Sort(
-            input=new_union,
-            sort_keys=sort.sort_keys,
-            ascending=sort.ascending,
-            nulls_order=sort.nulls_order,
-        )
+        new_union = union.model_copy(update={"inputs": new_inputs})
+        return sort.model_copy(update={"input": new_union})
 
     def _get_available_columns(self, plan: LogicalPlanNode) -> set:
         """Get all column names available from a plan node."""
@@ -1413,7 +1241,7 @@ class OrderByPushdownRule(OptimizationRule):
             if isinstance(new_input, Scan) and new_input.aggregates:
                 merged_filters = self._merge_filters(new_input.filters, plan.predicate)
                 return new_input.model_copy(update={"filters": merged_filters})
-            return Filter(input=new_input, predicate=plan.predicate)
+            return plan.model_copy(update={"input": new_input})
 
         if isinstance(plan, Limit):
             return plan.model_copy(update={"input": new_input})
@@ -1427,6 +1255,13 @@ class OrderByPushdownRule(OptimizationRule):
             )
 
         return plan
+
+    def _merge_filters(
+        self, left: Optional[Expression], right: Optional[Expression]
+    ) -> Optional[Expression]:
+        """None-safe AND of two predicate expressions (HAVING folded onto an
+        aggregate-bearing scan after order-by pushdown)."""
+        return and_expressions(left, right)
 
     def _recurse_join(self, join: Join) -> LogicalPlanNode:
         """Recurse into join node."""
@@ -1505,16 +1340,8 @@ class AggregatePushdownRule(OptimizationRule):
     def _merge_filters(
         self, scan_filter: Optional[Expression], filter_filter: Optional[Expression]
     ) -> Optional[Expression]:
-        """Merge filters from scan and filter node."""
-        if scan_filter is None:
-            return filter_filter
-
-        if filter_filter is None:
-            return scan_filter
-
-        from ..plan.expressions import BinaryOp, BinaryOpType
-
-        return BinaryOp(op=BinaryOpType.AND, left=scan_filter, right=filter_filter)
+        """None-safe AND of a scan filter and a filter-node predicate."""
+        return and_expressions(scan_filter, filter_filter)
 
     def _recurse_node(self, plan: LogicalPlanNode) -> LogicalPlanNode:
         """Recurse into node children."""

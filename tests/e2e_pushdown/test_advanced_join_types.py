@@ -1,7 +1,9 @@
 """Advanced join type pushdown tests (FULL OUTER, self-join, NATURAL, USING)."""
 
+import pytest
 from sqlglot import exp
 
+from federated_query.parser.errors import UnsupportedSQLError
 from tests.e2e_pushdown.helpers import (
     build_runtime,
     explain_datasource_query,
@@ -193,6 +195,75 @@ def test_natural_join(single_source_env):
     join_node = _get_join_node(ast)
     natural = join_node.args.get("natural")
     assert natural is True or natural is not None
+
+
+def test_cross_source_natural_join_fails_fast(multi_source_env):
+    """C1: a cross-source NATURAL join must fail fast, not become a Cartesian.
+
+    The merge engine cannot resolve the name-match equality across sources, so
+    building a conditionless nested loop would silently cross-join. orders and
+    customers share customer_id, so this is a real NATURAL match.
+    """
+    runtime = build_runtime(multi_source_env)
+    sql = (
+        "SELECT count(*) FROM duckdb_orders.main.orders "
+        "NATURAL JOIN duckdb_customers.main.customers"
+    )
+    with pytest.raises(UnsupportedSQLError):
+        runtime.execute(sql)
+
+
+def test_cross_source_using_join_fails_fast(multi_source_env):
+    """C1: a cross-source USING join fails fast for the same reason."""
+    runtime = build_runtime(multi_source_env)
+    sql = (
+        "SELECT count(*) FROM duckdb_orders.main.orders o "
+        "JOIN duckdb_customers.main.customers c USING (customer_id)"
+    )
+    with pytest.raises(UnsupportedSQLError):
+        runtime.execute(sql)
+
+
+# --- Deferred feature backlog (C1): cross-source NATURAL/USING SHOULD eventually
+# join on the matched columns like the equivalent explicit ON. These xfail until
+# the merge engine can disambiguate the duplicate join-column names; when that
+# lands they XPASS (strict) and signal the markers - and the fail-fast guards and
+# their raises-tests above - should be removed.
+
+
+@pytest.mark.xfail(
+    strict=True, reason="C1: cross-source NATURAL join not yet supported"
+)
+def test_cross_source_natural_join_matches_explicit_on(multi_source_env):
+    """A cross-source NATURAL join should equal the explicit ON join on the
+    shared customer_id column."""
+    runtime = build_runtime(multi_source_env)
+    natural = runtime.execute(
+        "SELECT count(*) AS n FROM duckdb_orders.main.orders "
+        "NATURAL JOIN duckdb_customers.main.customers"
+    )
+    explicit = runtime.execute(
+        "SELECT count(*) AS n FROM duckdb_orders.main.orders o "
+        "JOIN duckdb_customers.main.customers c ON o.customer_id = c.customer_id"
+    )
+    assert natural.to_pylist() == explicit.to_pylist()
+
+
+@pytest.mark.xfail(
+    strict=True, reason="C1: cross-source USING join not yet supported"
+)
+def test_cross_source_using_join_matches_explicit_on(multi_source_env):
+    """A cross-source USING (customer_id) join should equal the explicit ON join."""
+    runtime = build_runtime(multi_source_env)
+    using = runtime.execute(
+        "SELECT count(*) AS n FROM duckdb_orders.main.orders o "
+        "JOIN duckdb_customers.main.customers c USING (customer_id)"
+    )
+    explicit = runtime.execute(
+        "SELECT count(*) AS n FROM duckdb_orders.main.orders o "
+        "JOIN duckdb_customers.main.customers c ON o.customer_id = c.customer_id"
+    )
+    assert using.to_pylist() == explicit.to_pylist()
 
 
 def test_join_with_using_single_column(single_source_env):

@@ -1361,10 +1361,25 @@ class Parser:
             return self._convert_grouping(expr)
         if self._is_aggregate_function(expr):
             return self._convert_aggregate_function(expr)
+        if isinstance(expr, exp.Trim):
+            return self._convert_trim(expr)
         if isinstance(expr, (exp.Anonymous, exp.Func, exp.Upper)):
             return self._convert_function_call(expr)
 
         raise ValueError(f"Unsupported expression type: {type(expr)}")
+
+    def _convert_trim(self, trim: exp.Trim) -> FunctionCall:
+        """Convert TRIM; an explicit LEADING/TRAILING/BOTH position is unsupported.
+
+        The position keyword is a bare string slot the generic function-arg
+        collector silently skips, which would turn TRIM(LEADING 'x' FROM col)
+        into a both-sides trim. Reject it rather than drop it.
+        """
+        if trim.args.get("position"):
+            raise UnsupportedSQLError(
+                "TRIM with LEADING/TRAILING/BOTH is not supported"
+            )
+        return self._convert_function_call(trim)
 
     def _convert_in_expression(self, expr: exp.In) -> Expression:
         """Convert IN list (or IN subquery) to expression node.

@@ -236,6 +236,7 @@ class QueryPreprocessor:
 
     def _apply_pivot_rewrite(self, select, table, pivot, columns) -> None:
         """Replace SELECT * ... PIVOT(...) with conditional-aggregation SQL."""
+        self._reject_incompatible_pivot_clauses(select)
         field = pivot.args["fields"][0]
         agg_func = self._pivot_agg_func(pivot.expressions[0])
         group_cols = self._pivot_group_columns(columns, field.this.name, agg_func)
@@ -246,6 +247,21 @@ class QueryPreprocessor:
         for column in group_cols:
             keys.append(exp.column(column, quoted=True))
         select.set("group", exp.Group(expressions=keys))
+
+    def _reject_incompatible_pivot_clauses(self, select: exp.Select) -> None:
+        """Reject PIVOT alongside clauses the rewrite would silently discard.
+
+        The rewrite sets its own GROUP BY and rebuilds the projection from
+        catalog columns, so a user GROUP BY would be clobbered and a star's
+        EXCLUDE/REPLACE would be ignored.
+        """
+        if select.args.get("group"):
+            raise UnsupportedSQLError("GROUP BY with PIVOT is not supported")
+        star = select.expressions[0]
+        if star.args.get("except_") or star.args.get("replace"):
+            raise UnsupportedSQLError(
+                "SELECT * EXCLUDE/REPLACE with PIVOT is not supported"
+            )
 
     def _pivot_group_columns(self, columns, pivot_col, agg_func) -> List[str]:
         """Columns that stay grouped: all table columns minus pivot/value columns."""
@@ -318,6 +334,12 @@ class QueryPreprocessor:
         definition = definitions.get(alias.name.lower())
         if definition is None:
             raise StarExpansionError(f"Unknown window name '{alias.name}'")
+        if definition.args.get("alias"):
+            # The definition itself references another named window; merging only
+            # this level would drop the base window's PARTITION BY / ORDER BY.
+            raise UnsupportedSQLError(
+                "chained named windows (WINDOW w2 AS (w1 ...)) are not supported"
+            )
         self._merge_window_definition(window, definition)
 
     def _merge_window_definition(

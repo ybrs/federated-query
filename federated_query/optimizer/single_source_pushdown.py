@@ -29,13 +29,9 @@ from ..plan.logical import (
     CTERef,
     Values,
 )
-from ..plan.expressions import ColumnRef, Expression, FunctionCall
+from ..plan.expressions import ColumnRef, Expression
 from ..plan.physical import PhysicalRemoteQuery, render_grouping_sets
-from .decorrelation import (
-    _split_conjuncts,
-    _rebuild_expression,
-    _expression_column_refs,
-)
+from ..plan.expressions import aggregate_output_map, split_where_having
 
 _JOIN_KEYWORDS = {
     JoinType.INNER: "INNER JOIN",
@@ -590,6 +586,8 @@ class SingleSourcePushdown:
         """
         self._adopt_scan_order(scan, context)
         self._adopt_scan_limit(scan, context)
+        self._adopt_scan_offset(scan, context)
+        self._adopt_scan_distinct(scan, context)
 
     def _adopt_scan_order(self, scan: Scan, context: _PushContext) -> None:
         """Adopt a scan's folded ORDER BY unless a Sort node already set one."""
@@ -600,6 +598,16 @@ class SingleSourcePushdown:
         """Adopt a scan's folded LIMIT unless a Limit node already set one."""
         if scan.limit is not None and context.limit is None:
             context.limit = scan.limit
+
+    def _adopt_scan_offset(self, scan: Scan, context: _PushContext) -> None:
+        """Adopt a scan's folded OFFSET unless a Limit node already set one."""
+        if scan.offset and context.offset == 0:
+            context.offset = scan.offset
+
+    def _adopt_scan_distinct(self, scan: Scan, context: _PushContext) -> None:
+        """Adopt a scan's folded DISTINCT unless already set above."""
+        if scan.distinct and not context.distinct:
+            context.distinct = True
 
     def _absorb_aggregate_scan(self, scan: Scan, context: _PushContext) -> bool:
         """Render a scan carrying folded aggregates/GROUP BY as the FROM source.
@@ -620,51 +628,19 @@ class SingleSourcePushdown:
         return True
 
     def _split_scan_filter(self, scan: Scan, context: _PushContext) -> None:
-        """Route a folded aggregate-scan filter into WHERE or HAVING.
+        """Route a folded aggregate-scan filter into WHERE / HAVING.
 
-        The optimizer folds both WHERE and HAVING into one scan filter.
-        A conjunct that references an aggregate output is a HAVING term; its
-        synthetic output references (e.g. ``__subq_0_h1``, which decorrelation
-        hoisted out of ``COUNT(*)``) are substituted back to the aggregate
-        expression so the source sees ``HAVING COUNT(*) > 10``.
+        Delegates to the shared split_where_having (the single source of truth);
+        the resulting predicates are stringified into the push context.
         """
         if scan.filters is None:
             return
-        aggregate_map = self._aggregate_expr_map(scan)
-        for conjunct in _split_conjuncts(scan.filters):
-            self._route_conjunct(conjunct, aggregate_map, context)
-
-    def _route_conjunct(self, conjunct, aggregate_map, context: _PushContext) -> None:
-        """Place one conjunct in HAVING (aggregate refs resolved) or in WHERE."""
-        if self._references_aggregate(conjunct, aggregate_map):
-            resolved = self._substitute_aggregate_refs(conjunct, aggregate_map)
-            context.having_terms.append(resolved.to_sql())
-        else:
-            context.where_terms.append(conjunct.to_sql())
-
-    def _aggregate_expr_map(self, scan: Scan) -> Dict[str, Expression]:
-        """Map each aggregate-function output name to its aggregate expression."""
-        mapping: Dict[str, Expression] = {}
-        for index in range(len(scan.output_names)):
-            expression = scan.aggregates[index]
-            if isinstance(expression, FunctionCall) and expression.is_aggregate:
-                mapping[scan.output_names[index]] = expression
-        return mapping
-
-    def _references_aggregate(self, expr: Expression, aggregate_map) -> bool:
-        """Whether an expression references any aggregate-output column."""
-        for ref in _expression_column_refs(expr):
-            if ref.column in aggregate_map:
-                return True
-        return False
-
-    def _substitute_aggregate_refs(self, expr: Expression, aggregate_map) -> Expression:
-        """Replace aggregate-output column refs with their aggregate expressions."""
-        if isinstance(expr, ColumnRef):
-            return aggregate_map.get(expr.column, expr)
-        return _rebuild_expression(
-            expr, lambda child: self._substitute_aggregate_refs(child, aggregate_map)
-        )
+        output_map = aggregate_output_map(scan.output_names, scan.aggregates)
+        where_pred, having_pred = split_where_having(scan.filters, output_map)
+        if where_pred is not None:
+            context.where_terms.append(where_pred.to_sql())
+        if having_pred is not None:
+            context.having_terms.append(having_pred.to_sql())
 
     def _absorb_join(self, join: Join, context: _PushContext) -> bool:
         """Add one join to a left-deep tree, rendering its right relation.
@@ -879,7 +855,10 @@ class SingleSourcePushdown:
             registered = context.scan_names.get(id(scan))
         reference = registered or f'"{scan.schema_name}"."{scan.table_name}"'
         alias = scan.alias if scan.alias else scan.table_name
-        return f"{reference} AS {alias}"
+        ref = f"{reference} AS {alias}"
+        if registered is None and scan.sample:
+            ref = f"{ref} {scan.sample}"
+        return ref
 
     def _render_order(self, sort: Sort) -> str:
         """Render a Sort node's ORDER BY items with direction and NULLS."""

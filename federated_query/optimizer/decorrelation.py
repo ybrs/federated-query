@@ -72,6 +72,17 @@ from ..plan.expressions import (
     WindowExpr,
     Cast,
     Extract,
+    # Canonical shared expression utilities (single implementation lives in
+    # plan/expressions.py); imported under the existing local names so call
+    # sites are unchanged and there is exactly one implementation of each.
+    expression_children as _expression_children,
+    map_children as _rebuild_expression,
+    column_refs as _expression_column_refs,
+    split_conjuncts as _split_conjuncts,
+    split_disjuncts as _split_disjuncts,
+    combine_and,
+    combine_or,
+    SUBQUERY_NODE_TYPES as _SUBQUERY_NODE_TYPES,
 )
 
 
@@ -169,14 +180,6 @@ class DecorrelationError(Exception):
     """Raised when decorrelation cannot be completed."""
 
 
-_SUBQUERY_NODE_TYPES = (
-    SubqueryExpression,
-    ExistsExpression,
-    InSubquery,
-    QuantifiedComparison,
-)
-
-
 # Logical negation of a comparison operator, used to push NOT through a
 # quantified comparison by De Morgan (NOT (x op ANY S) == x neg_op ALL S).
 _NEGATED_BINARY_OP = {
@@ -189,13 +192,6 @@ _NEGATED_BINARY_OP = {
 }
 
 
-def _split_conjuncts(expr: Expression) -> List[Expression]:
-    """Flatten a predicate into its top-level AND conjuncts."""
-    if isinstance(expr, BinaryOp) and expr.op == BinaryOpType.AND:
-        return _split_conjuncts(expr.left) + _split_conjuncts(expr.right)
-    return [expr]
-
-
 def _needs_lateral(error: "DecorrelationError") -> bool:
     """Whether a flattening failure should fall back to a LATERAL join.
 
@@ -205,20 +201,11 @@ def _needs_lateral(error: "DecorrelationError") -> bool:
     return "equality correlation predicates can cross" in str(error)
 
 
-def _split_disjuncts(expr: Expression) -> List[Expression]:
-    """Flatten a predicate into its top-level OR disjuncts."""
-    if isinstance(expr, BinaryOp) and expr.op == BinaryOpType.OR:
-        return _split_disjuncts(expr.left) + _split_disjuncts(expr.right)
-    return [expr]
-
-
 def _and_join(conjuncts: List[Expression]) -> Expression:
-    """Combine conjuncts back into a single AND expression."""
-    if len(conjuncts) == 0:
+    """Combine conjuncts into a single AND expression; raise if empty."""
+    result = combine_and(conjuncts)
+    if result is None:
         raise DecorrelationError("Cannot build a predicate from no conjuncts")
-    result = conjuncts[0]
-    for conjunct in conjuncts[1:]:
-        result = BinaryOp(op=BinaryOpType.AND, left=result, right=conjunct)
     return result
 
 
@@ -238,59 +225,11 @@ def _is_unconditional_global_aggregate(plan: LogicalPlanNode) -> bool:
 
 
 def _or_join(disjuncts: List[Expression]) -> Expression:
-    """Combine disjuncts back into a single OR expression."""
-    if len(disjuncts) == 0:
+    """Combine disjuncts into a single OR expression; raise if empty."""
+    result = combine_or(disjuncts)
+    if result is None:
         raise DecorrelationError("Cannot build a predicate from no disjuncts")
-    result = disjuncts[0]
-    for disjunct in disjuncts[1:]:
-        result = BinaryOp(op=BinaryOpType.OR, left=result, right=disjunct)
     return result
-
-
-def _expression_children(expr: Expression) -> List[Expression]:
-    """List the direct child expressions of an expression node."""
-    if isinstance(expr, BinaryOp):
-        return [expr.left, expr.right]
-    if isinstance(expr, UnaryOp):
-        return [expr.operand]
-    if isinstance(expr, Cast):
-        return [expr.expr]
-    if isinstance(expr, Extract):
-        return [expr.source]
-    if isinstance(expr, WindowExpr):
-        return [expr.function] + list(expr.partition_by) + list(expr.order_keys)
-    if isinstance(
-        expr, (FunctionCall, TupleExpression, InList, CaseExpr, BetweenExpression)
-    ):
-        return _container_expression_children(expr)
-    return []
-
-
-def _container_expression_children(expr: Expression) -> List[Expression]:
-    """Child expressions of container-style expression nodes."""
-    if isinstance(expr, FunctionCall):
-        children = list(expr.args)
-        if expr.within_group_key is not None:
-            children.append(expr.within_group_key)
-        return children
-    if isinstance(expr, TupleExpression):
-        return list(expr.items)
-    if isinstance(expr, InList):
-        return [expr.value] + list(expr.options)
-    if isinstance(expr, BetweenExpression):
-        return [expr.value, expr.lower, expr.upper]
-    return _case_expression_children(expr)
-
-
-def _case_expression_children(expr: CaseExpr) -> List[Expression]:
-    """Child expressions of a CASE expression."""
-    children: List[Expression] = []
-    for condition, result in expr.when_clauses:
-        children.append(condition)
-        children.append(result)
-    if expr.else_result is not None:
-        children.append(expr.else_result)
-    return children
 
 
 def _expression_has_subquery(expr: Expression) -> bool:
@@ -301,20 +240,6 @@ def _expression_has_subquery(expr: Expression) -> bool:
         if _expression_has_subquery(child):
             return True
     return False
-
-
-def _expression_column_refs(expr: Expression) -> List[ColumnRef]:
-    """Collect all column references in an expression tree.
-
-    Does not descend into subquery plans: a subquery node's own references
-    belong to its inner scopes.
-    """
-    refs: List[ColumnRef] = []
-    if isinstance(expr, ColumnRef):
-        refs.append(expr)
-    for child in _expression_children(expr):
-        refs.extend(_expression_column_refs(child))
-    return refs
 
 
 def _plan_expressions(plan: LogicalPlanNode) -> List[Expression]:
@@ -383,84 +308,6 @@ def _replace_column_refs(
         replacement = mapping.get((expr.table, expr.column))
         return replacement if replacement is not None else expr
     return _rebuild_expression(expr, lambda child: _replace_column_refs(child, mapping))
-
-
-def _rebuild_expression(expr: Expression, rebuild_child) -> Expression:
-    """Rebuild an expression node applying rebuild_child to children."""
-    if isinstance(expr, BinaryOp):
-        return BinaryOp(
-            op=expr.op, left=rebuild_child(expr.left), right=rebuild_child(expr.right)
-        )
-    if isinstance(expr, UnaryOp):
-        return UnaryOp(op=expr.op, operand=rebuild_child(expr.operand))
-    if isinstance(expr, FunctionCall):
-        rebuilt_args = []
-        for arg in expr.args:
-            rebuilt_args.append(rebuild_child(arg))
-        rebuilt_key = None
-        if expr.within_group_key is not None:
-            rebuilt_key = rebuild_child(expr.within_group_key)
-        return expr.model_copy(
-            update={"args": rebuilt_args, "within_group_key": rebuilt_key}
-        )
-    return _rebuild_container_expression(expr, rebuild_child)
-
-
-def _rebuild_container_expression(expr: Expression, rebuild_child) -> Expression:
-    """Rebuild CASE / IN-list / BETWEEN / tuple expressions."""
-    if isinstance(expr, CaseExpr):
-        return _rebuild_case_expression(expr, rebuild_child)
-    if isinstance(expr, InList):
-        rebuilt_options = []
-        for option in expr.options:
-            rebuilt_options.append(rebuild_child(option))
-        return InList(value=rebuild_child(expr.value), options=rebuilt_options)
-    if isinstance(expr, BetweenExpression):
-        return BetweenExpression(
-            value=rebuild_child(expr.value),
-            lower=rebuild_child(expr.lower),
-            upper=rebuild_child(expr.upper),
-        )
-    if isinstance(expr, TupleExpression):
-        rebuilt_items = []
-        for item in expr.items:
-            rebuilt_items.append(rebuild_child(item))
-        return TupleExpression(items=tuple(rebuilt_items))
-    if isinstance(expr, Cast):
-        return expr.model_copy(update={"expr": rebuild_child(expr.expr)})
-    if isinstance(expr, Extract):
-        return expr.model_copy(update={"source": rebuild_child(expr.source)})
-    if isinstance(expr, WindowExpr):
-        return _rebuild_window_expression(expr, rebuild_child)
-    return expr
-
-
-def _rebuild_window_expression(expr: WindowExpr, rebuild_child) -> WindowExpr:
-    """Rebuild a window expression, applying rebuild_child to its sub-expressions."""
-    rebuilt_partition = []
-    for part in expr.partition_by:
-        rebuilt_partition.append(rebuild_child(part))
-    rebuilt_order = []
-    for key in expr.order_keys:
-        rebuilt_order.append(rebuild_child(key))
-    return expr.model_copy(
-        update={
-            "function": rebuild_child(expr.function),
-            "partition_by": rebuilt_partition,
-            "order_keys": rebuilt_order,
-        }
-    )
-
-
-def _rebuild_case_expression(expr: CaseExpr, rebuild_child) -> CaseExpr:
-    """Rebuild a CASE expression applying rebuild_child to branches."""
-    rebuilt_when = []
-    for condition, result in expr.when_clauses:
-        rebuilt_when.append((rebuild_child(condition), rebuild_child(result)))
-    rebuilt_else = None
-    if expr.else_result is not None:
-        rebuilt_else = rebuild_child(expr.else_result)
-    return CaseExpr(when_clauses=rebuilt_when, else_result=rebuilt_else)
 
 
 def _is_null_check(expr: Expression) -> UnaryOp:
@@ -641,11 +488,12 @@ class _SubqueryPreparer:
         for call, name in hoisted:
             aggregates.append(call)
             names.append(name)
-        return Aggregate(
-            input=plan.input,
-            group_by=list(plan.group_by),
-            aggregates=aggregates,
-            output_names=names,
+        return plan.model_copy(
+            update={
+                "group_by": list(plan.group_by),
+                "aggregates": aggregates,
+                "output_names": names,
+            }
         )
 
     def _prepare_scalar_row(self, plan: LogicalPlanNode) -> _PreparedScalar:
@@ -836,11 +684,8 @@ class _SubqueryPreparer:
         names = list(aggregate.output_names)
         rewritten_kept = self._hoist_each(kept, aggregates, names)
         rewritten_pulled = self._hoist_each(pulled, aggregates, names)
-        widened = Aggregate(
-            input=aggregate.input,
-            group_by=aggregate.group_by,
-            aggregates=aggregates,
-            output_names=names,
+        widened = aggregate.model_copy(
+            update={"aggregates": aggregates, "output_names": names}
         )
         return widened, rewritten_kept, rewritten_pulled
 
@@ -915,11 +760,13 @@ class _SubqueryPreparer:
             self.pulled[start + offset] = BinaryOp(
                 op=BinaryOpType.EQ, left=outer_side, right=renamed
             )
-        return Aggregate(
-            input=stripped_input,
-            group_by=group_by,
-            aggregates=aggregates,
-            output_names=names,
+        return plan.model_copy(
+            update={
+                "input": stripped_input,
+                "group_by": group_by,
+                "aggregates": aggregates,
+                "output_names": names,
+            }
         )
 
     def _key_equality(self, predicate: Expression) -> Tuple[ColumnRef, Expression]:
@@ -1641,7 +1488,9 @@ class Decorrelator:
         for name in self._sort_helper_columns(keys, existing):
             expressions.append(ColumnRef(table=None, column=name))
             aliases.append(name)
-        return Projection(input=plan, expressions=expressions, aliases=aliases)
+        return projection.model_copy(
+            update={"input": plan, "expressions": expressions, "aliases": aliases}
+        )
 
     def _sort_helper_columns(
         self, keys: List[Expression], existing: Set[str]

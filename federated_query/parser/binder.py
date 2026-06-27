@@ -198,7 +198,7 @@ class Binder:
             for expr in row:
                 bound_row.append(self._bind_expression(expr, None))
             bound_rows.append(bound_row)
-        return Values(rows=bound_rows, output_names=values.output_names)
+        return values.model_copy(update={"rows": bound_rows})
 
     def _bind_subquery_scan(self, node: SubqueryScan) -> SubqueryScan:
         """Bind a derived table by binding its inner plan."""
@@ -277,12 +277,12 @@ class Binder:
         finally:
             self._pop_scope()
 
-        return Projection(
-            input=bound_input,
-            expressions=bound_expressions,
-            aliases=projection.aliases,
-            distinct=projection.distinct,
-            distinct_on=bound_distinct_on,
+        return projection.model_copy(
+            update={
+                "input": bound_input,
+                "expressions": bound_expressions,
+                "distinct_on": bound_distinct_on,
+            }
         )
 
     def _bind_distinct_on(self, keys, bound_input) -> Optional[List[Expression]]:
@@ -321,20 +321,14 @@ class Binder:
             bound_keys = self._bind_sort_keys_for_projection(
                 sort.sort_keys, bound_input
             )
-            return Sort(
-                input=bound_input,
-                sort_keys=bound_keys,
-                ascending=sort.ascending,
-                nulls_order=sort.nulls_order,
+            return sort.model_copy(
+                update={"input": bound_input, "sort_keys": bound_keys}
             )
 
         if isinstance(bound_input, Aggregate):
             bound_keys = self._bind_sort_keys_for_aggregate(sort.sort_keys, bound_input)
-            return Sort(
-                input=bound_input,
-                sort_keys=bound_keys,
-                ascending=sort.ascending,
-                nulls_order=sort.nulls_order,
+            return sort.model_copy(
+                update={"input": bound_input, "sort_keys": bound_keys}
             )
 
         if isinstance(bound_input, Filter) and isinstance(bound_input.input, Aggregate):
@@ -342,30 +336,21 @@ class Binder:
                 sort.sort_keys,
                 bound_input.input,
             )
-            return Sort(
-                input=bound_input,
-                sort_keys=bound_keys,
-                ascending=sort.ascending,
-                nulls_order=sort.nulls_order,
+            return sort.model_copy(
+                update={"input": bound_input, "sort_keys": bound_keys}
             )
 
         if self._contains_join(bound_input):
             tables = self._extract_tables_from_tree(bound_input)
             bound_keys = self._bind_sort_keys_multi(sort.sort_keys, tables)
-            return Sort(
-                input=bound_input,
-                sort_keys=bound_keys,
-                ascending=sort.ascending,
-                nulls_order=sort.nulls_order,
+            return sort.model_copy(
+                update={"input": bound_input, "sort_keys": bound_keys}
             )
 
         table = self._get_table_from_plan(bound_input)
         bound_keys = self._bind_sort_keys(sort.sort_keys, table)
-        return Sort(
-            input=bound_input,
-            sort_keys=bound_keys,
-            ascending=sort.ascending,
-            nulls_order=sort.nulls_order,
+        return sort.model_copy(
+            update={"input": bound_input, "sort_keys": bound_keys}
         )
 
     def _bind_sort_keys(
@@ -558,7 +543,7 @@ class Binder:
     def _bind_limit(self, limit: Limit) -> Limit:
         """Bind a Limit node."""
         bound_input = self.bind(limit.input)
-        return Limit(input=bound_input, limit=limit.limit, offset=limit.offset)
+        return limit.model_copy(update={"input": bound_input})
 
     def _bind_join(self, join: Join) -> Join:
         """Bind a Join node."""
@@ -574,13 +559,12 @@ class Binder:
             finally:
                 self._pop_scope()
 
-        return Join(
-            left=bound_left,
-            right=bound_right,
-            join_type=join.join_type,
-            condition=bound_condition,
-            natural=join.natural,
-            using=join.using,
+        return join.model_copy(
+            update={
+                "left": bound_left,
+                "right": bound_right,
+                "condition": bound_condition,
+            }
         )
 
     def _bind_lateral_join(self, join: LateralJoin) -> LateralJoin:
@@ -602,7 +586,7 @@ class Binder:
     def _bind_explain(self, explain: Explain) -> Explain:
         """Bind an Explain node."""
         bound_child = self.bind(explain.input)
-        return Explain(input=bound_child, format=explain.format)
+        return explain.model_copy(update={"input": bound_child})
 
     def _bind_aggregate(self, aggregate: Aggregate) -> Aggregate:
         """Bind an Aggregate node."""
@@ -667,11 +651,8 @@ class Binder:
         self._cte_tables[cte.name] = table
         bound_child = self.bind(cte.child)
         self._restore_cte(cte.name, saved)
-        return CTE(
-            name=cte.name,
-            cte_plan=bound_plan,
-            child=bound_child,
-            column_names=cte.column_names,
+        return cte.model_copy(
+            update={"cte_plan": bound_plan, "child": bound_child}
         )
 
     def _bind_recursive_cte(self, cte: CTE) -> CTE:
@@ -686,12 +667,12 @@ class Binder:
         bound_plan = self.bind(cte.cte_plan)
         bound_child = self.bind(cte.child)
         self._restore_cte(cte.name, saved)
-        return CTE(
-            name=cte.name,
-            cte_plan=bound_plan,
-            child=bound_child,
-            recursive=True,
-            column_names=cte.column_names,
+        return cte.model_copy(
+            update={
+                "cte_plan": bound_plan,
+                "child": bound_child,
+                "recursive": True,
+            }
         )
 
     def _bind_cte_ref(self, node: CTERef) -> CTERef:
@@ -1479,7 +1460,7 @@ class SubqueryPlanBinder:
             for expr in row:
                 bound_row.append(self._bind_expr(expr, self.outer_scopes))
             bound_rows.append(bound_row)
-        return Values(rows=bound_rows, output_names=values.output_names)
+        return values.model_copy(update={"rows": bound_rows})
 
     def _bind_filter(self, filter_node: Filter) -> Filter:
         """Bind a filter, treating Filter-over-Aggregate as HAVING."""
@@ -1496,12 +1477,14 @@ class SubqueryPlanBinder:
         bound_expressions = []
         for expr in projection.expressions:
             bound_expressions.append(self._bind_expr_for(expr, bound_input))
-        return Projection(
-            input=bound_input,
-            expressions=bound_expressions,
-            aliases=projection.aliases,
-            distinct=projection.distinct,
-            distinct_on=self._bind_subquery_distinct_on(projection, bound_input),
+        return projection.model_copy(
+            update={
+                "input": bound_input,
+                "expressions": bound_expressions,
+                "distinct_on": self._bind_subquery_distinct_on(
+                    projection, bound_input
+                ),
+            }
         )
 
     def _bind_subquery_distinct_on(self, projection, bound_input):
@@ -1555,11 +1538,8 @@ class SubqueryPlanBinder:
         bound_keys = []
         for key in sort.sort_keys:
             bound_keys.append(self._bind_expr_for(key, bound_input))
-        return Sort(
-            input=bound_input,
-            sort_keys=bound_keys,
-            ascending=sort.ascending,
-            nulls_order=sort.nulls_order,
+        return sort.model_copy(
+            update={"input": bound_input, "sort_keys": bound_keys}
         )
 
     def _bind_join(self, join: Join) -> Join:
@@ -1573,11 +1553,12 @@ class SubqueryPlanBinder:
             self.host._add_plan_to_scope(bound_right, local)
             scopes = self.outer_scopes + [local]
             bound_condition = self._bind_expr(join.condition, scopes)
-        return Join(
-            left=bound_left,
-            right=bound_right,
-            join_type=join.join_type,
-            condition=bound_condition,
+        return join.model_copy(
+            update={
+                "left": bound_left,
+                "right": bound_right,
+                "condition": bound_condition,
+            }
         )
 
     def _bind_having(self, predicate: Expression, aggregate: Aggregate) -> Expression:

@@ -21,7 +21,7 @@ from sqlglot import exp
 from pydantic import Field
 
 from ..model import StateModel
-from .expressions import Expression
+from .expressions import Expression, and_expressions
 from .logical import JoinType, ExplainFormat, SetOpKind
 from ..utils.logging import get_logger
 
@@ -161,15 +161,6 @@ def _zip_columns_to_tuples(columns: List[list], num_rows: int) -> List[tuple]:
             values.append(column[row_index])
         tuples.append(tuple(values))
     return tuples
-
-
-def _and_filters(existing: Optional[Expression], new_filter: Expression) -> Expression:
-    """Combine an existing scan filter with an additional predicate via AND."""
-    from .expressions import BinaryOp, BinaryOpType
-
-    if existing is None:
-        return new_filter
-    return BinaryOp(op=BinaryOpType.AND, left=existing, right=new_filter)
 
 
 def to_source_sql(connection, postgres_sql: str) -> str:
@@ -392,89 +383,14 @@ def _resolve_window_columns(expr, aliases):
     After a merge-engine join the registered relation has flat physical column
     names; ``aliases`` maps each logical ``(table, column)`` to that name.
     Rewriting the tree and then calling ``to_sql()`` renders the expression
-    against the registered relation without qualifier ambiguity.
+    against the registered relation without qualifier ambiguity. Uses the shared
+    map_children so every compound node type is covered by one implementation.
     """
-    from .expressions import ColumnRef, FunctionCall, WindowExpr
+    from .expressions import ColumnRef, map_children
 
     if isinstance(expr, ColumnRef):
         return _resolved_column_ref(expr, aliases)
-    if isinstance(expr, WindowExpr):
-        return _resolve_window_expr(expr, aliases)
-    if isinstance(expr, FunctionCall):
-        return _resolve_function_columns(expr, aliases)
-    return _resolve_window_operands(expr, aliases)
-
-
-def _resolve_window_operands(expr, aliases):
-    """Resolve columns inside a compound expression; pass leaf nodes through."""
-    from .expressions import BinaryOp, UnaryOp, Cast, Extract
-
-    if isinstance(expr, BinaryOp):
-        return expr.model_copy(
-            update={
-                "left": _resolve_window_columns(expr.left, aliases),
-                "right": _resolve_window_columns(expr.right, aliases),
-            }
-        )
-    if isinstance(expr, UnaryOp):
-        return expr.model_copy(
-            update={"operand": _resolve_window_columns(expr.operand, aliases)}
-        )
-    if isinstance(expr, Cast):
-        return expr.model_copy(
-            update={"expr": _resolve_window_columns(expr.expr, aliases)}
-        )
-    if isinstance(expr, Extract):
-        return expr.model_copy(
-            update={"source": _resolve_window_columns(expr.source, aliases)}
-        )
-    return _resolve_window_containers(expr, aliases)
-
-
-def _resolve_window_containers(expr, aliases):
-    """Resolve columns inside CASE / BETWEEN / IN / tuple operands, else pass through."""
-    from .expressions import CaseExpr, BetweenExpression, InList, TupleExpression
-
-    if isinstance(expr, BetweenExpression):
-        return expr.model_copy(
-            update={
-                "value": _resolve_window_columns(expr.value, aliases),
-                "lower": _resolve_window_columns(expr.lower, aliases),
-                "upper": _resolve_window_columns(expr.upper, aliases),
-            }
-        )
-    if isinstance(expr, InList):
-        return expr.model_copy(
-            update={
-                "value": _resolve_window_columns(expr.value, aliases),
-                "options": _resolve_window_list(expr.options, aliases),
-            }
-        )
-    if isinstance(expr, TupleExpression):
-        return expr.model_copy(
-            update={"items": tuple(_resolve_window_list(expr.items, aliases))}
-        )
-    if isinstance(expr, CaseExpr):
-        return _resolve_window_case(expr, aliases)
-    return expr
-
-
-def _resolve_window_case(expr, aliases):
-    """Resolve columns in a CASE expression's branch conditions, results and ELSE."""
-    new_when = []
-    for condition, result in expr.when_clauses:
-        new_when.append(
-            (
-                _resolve_window_columns(condition, aliases),
-                _resolve_window_columns(result, aliases),
-            )
-        )
-    new_else = expr.else_result
-    if new_else is not None:
-        new_else = _resolve_window_columns(new_else, aliases)
-    return expr.model_copy(
-        update={"when_clauses": new_when, "else_result": new_else}
-    )
+    return map_children(expr, lambda child: _resolve_window_columns(child, aliases))
 
 
 def _resolved_column_ref(expr, aliases):
@@ -485,40 +401,6 @@ def _resolved_column_ref(expr, aliases):
         return expr
     resolved = aliases.get((expr.table, expr.column)) if aliases else None
     return ColumnRef(table=None, column=resolved or expr.column)
-
-
-def _resolve_function_columns(expr, aliases):
-    """Rebuild a FunctionCall with each argument's columns resolved.
-
-    ``model_copy`` preserves every other field (including the ordered-set WITHIN
-    GROUP key, which is also resolved), so no field is silently dropped.
-    """
-    new_args = []
-    for arg in expr.args:
-        new_args.append(_resolve_window_columns(arg, aliases))
-    new_key = expr.within_group_key
-    if new_key is not None:
-        new_key = _resolve_window_columns(new_key, aliases)
-    return expr.model_copy(update={"args": new_args, "within_group_key": new_key})
-
-
-def _resolve_window_expr(expr, aliases):
-    """Rebuild a WindowExpr with its function/partition/order columns resolved."""
-    return expr.model_copy(
-        update={
-            "function": _resolve_window_columns(expr.function, aliases),
-            "partition_by": _resolve_window_list(expr.partition_by, aliases),
-            "order_keys": _resolve_window_list(expr.order_keys, aliases),
-        }
-    )
-
-
-def _resolve_window_list(items, aliases):
-    """Resolve columns across a list of expressions (partition or order keys)."""
-    resolved = []
-    for item in items:
-        resolved.append(_resolve_window_columns(item, aliases))
-    return resolved
 
 
 def _merge_join_select_list(join_type, left_schema, right_schema) -> str:
@@ -657,7 +539,7 @@ class PhysicalScan(PhysicalPlanNode):
         in_filter = self._build_in_filter(key_columns[0], value_tuples)
         if in_filter is None:
             return False
-        self.filters = _and_filters(self.filters, in_filter)
+        self.filters = and_expressions(self.filters, in_filter)
         return True
 
     def _build_in_filter(self, key_column: Expression, value_tuples: List[tuple]):
@@ -726,47 +608,21 @@ class PhysicalScan(PhysicalPlanNode):
         return query
 
     def _split_where_having(self):
-        """Partition the filter into pre-aggregate WHERE and HAVING predicates.
+        """Partition the scan filter into (WHERE, HAVING) via the shared splitter.
 
-        A predicate merged from WHERE and HAVING must be split by conjunct:
-        aggregate-bearing conjuncts belong in HAVING, the rest in WHERE.
-        Routing the whole conjunction to one clause produces invalid SQL.
+        A folded GROUP BY query carries its WHERE and HAVING conjuncts together;
+        the shared split_where_having routes aggregate-output references (the
+        binder rewrote ``SUM(x)`` to its alias) into HAVING and substitutes them
+        back to the aggregate, rather than leaving an aggregate/alias in WHERE.
         """
+        from .expressions import aggregate_output_map, split_where_having
+
         if not self.filters:
             return None, None
         if not (self.group_by or self.aggregates):
             return self.filters, None
-        return self._partition_conjuncts(self.filters)
-
-    def _partition_conjuncts(self, predicate: Expression):
-        """Split top-level conjuncts into (WHERE predicate, HAVING predicate)."""
-        where_terms = []
-        having_terms = []
-        for conjunct in self._split_and(predicate):
-            if self._predicate_uses_aggregates(conjunct):
-                having_terms.append(conjunct)
-            else:
-                where_terms.append(conjunct)
-        return self._join_and(where_terms), self._join_and(having_terms)
-
-    def _split_and(self, predicate: Expression):
-        """Flatten a predicate into its top-level AND conjuncts."""
-        from .expressions import BinaryOp, BinaryOpType
-
-        if isinstance(predicate, BinaryOp) and predicate.op == BinaryOpType.AND:
-            return self._split_and(predicate.left) + self._split_and(predicate.right)
-        return [predicate]
-
-    def _join_and(self, terms):
-        """Recombine conjuncts into one AND expression, or None when empty."""
-        from .expressions import BinaryOp, BinaryOpType
-
-        if not terms:
-            return None
-        result = terms[0]
-        for term in terms[1:]:
-            result = BinaryOp(op=BinaryOpType.AND, left=result, right=term)
-        return result
+        output_map = aggregate_output_map(self.output_names, self.aggregates)
+        return split_where_having(self.filters, output_map)
 
     def _format_columns(self) -> str:
         """Format column list for SQL.
@@ -847,50 +703,6 @@ class PhysicalScan(PhysicalPlanNode):
             items.append(item)
 
         return ", ".join(items)
-
-    def _predicate_uses_aggregates(self, expr: Expression) -> bool:
-        """Check if predicate references aggregate functions."""
-        from .expressions import (
-            FunctionCall,
-            BinaryOp,
-            UnaryOp,
-            InList,
-            BetweenExpression,
-            ColumnRef,
-        )
-
-        if isinstance(expr, FunctionCall):
-            if expr.is_aggregate:
-                return True
-            for arg in expr.args:
-                if self._predicate_uses_aggregates(arg):
-                    return True
-            return False
-
-        if isinstance(expr, BinaryOp):
-            return self._predicate_uses_aggregates(
-                expr.left
-            ) or self._predicate_uses_aggregates(expr.right)
-
-        if isinstance(expr, UnaryOp):
-            return self._predicate_uses_aggregates(expr.operand)
-
-        if isinstance(expr, InList):
-            if self._predicate_uses_aggregates(expr.value):
-                return True
-            for option in expr.options:
-                if self._predicate_uses_aggregates(option):
-                    return True
-            return False
-
-        if isinstance(expr, BetweenExpression):
-            return (
-                self._predicate_uses_aggregates(expr.value)
-                or self._predicate_uses_aggregates(expr.lower)
-                or self._predicate_uses_aggregates(expr.upper)
-            )
-
-        return False
 
     def schema(self) -> pa.Schema:
         """Get output schema."""
@@ -4006,7 +3818,7 @@ class PhysicalLateralJoin(PhysicalPlanNode):
             return self.base_scan
         combined = term
         if self.base_scan.filters is not None:
-            combined = _and_expr(self.base_scan.filters, term)
+            combined = and_expressions(self.base_scan.filters, term)
         return self.base_scan.model_copy(update={"filters": combined})
 
     def schema(self) -> pa.Schema:
@@ -4027,13 +3839,6 @@ class PhysicalLateralJoin(PhysicalPlanNode):
 
     def __repr__(self) -> str:
         return f"PhysicalLateralJoin({self.join_type.name}, base={self.base_name})"
-
-
-def _and_expr(left: Expression, right: Expression) -> Expression:
-    """Combine two predicates with AND."""
-    from .expressions import BinaryOp, BinaryOpType
-
-    return BinaryOp(op=BinaryOpType.AND, left=left, right=right)
 
 
 def _derive_domain_filter(correlations, left_table: pa.Table) -> Optional[Expression]:
@@ -4061,7 +3866,7 @@ def _derive_domain_filter(correlations, left_table: pa.Table) -> Optional[Expres
         return None
     combined = terms[0]
     for term in terms[1:]:
-        combined = _and_expr(combined, term)
+        combined = and_expressions(combined, term)
     return combined
 
 
