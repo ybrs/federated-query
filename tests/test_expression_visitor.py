@@ -20,6 +20,7 @@ from federated_query.plan.expressions import (
     Cast,
     Extract,
     Interval,
+    WindowExpr,
     CaseExpr,
     InList,
     BetweenExpression,
@@ -58,6 +59,16 @@ def _one_of_each_expression():
         (Cast(expr=col, target_type="VARCHAR"), "cast"),
         (Extract(field="YEAR", source=col), "extract"),
         (Interval(value="30", unit="DAYS"), "interval"),
+        (
+            WindowExpr(
+                function=FunctionCall(function_name="SUM", args=[col]),
+                partition_by=[col],
+                order_keys=[col],
+                order_ascending=[True],
+                order_nulls=[None],
+            ),
+            "window_expr",
+        ),
         (SubqueryExpression(subquery=plan), "subquery"),
         (ExistsExpression(subquery=plan), "exists"),
         (InSubquery(value=col, subquery=plan), "in_subquery"),
@@ -109,6 +120,9 @@ class _LabelVisitor(ExpressionVisitor):
 
     def visit_interval(self, expr):
         return "interval"
+
+    def visit_window_expr(self, expr):
+        return "window_expr"
 
     def visit_subquery(self, expr):
         return "subquery"
@@ -175,6 +189,13 @@ class _ColumnCollector(ExpressionVisitor):
 
     def visit_interval(self, expr):
         return None
+
+    def visit_window_expr(self, expr):
+        expr.function.accept(self)
+        for key in expr.partition_by:
+            key.accept(self)
+        for key in expr.order_keys:
+            key.accept(self)
 
     def visit_tuple(self, expr):
         for item in expr.items:

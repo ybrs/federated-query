@@ -113,7 +113,7 @@ class TestNestedExists:
         # Skip-level correlation (innermost subquery referencing the
         # outermost query) is documented future work; the engine must
         # refuse loudly rather than rewrite it incorrectly.
-        with pytest.raises(DecorrelationError, match="u.id"):
+        with pytest.raises(DecorrelationError, match=r'"u"\."id"'):
             decorrelator.decorrelate(bound_plan)
 
     def test_deeply_nested_exists(self, catalog, setup_test_data):

@@ -73,7 +73,7 @@ def test_explain_shows_dynamic_filter_with_real_values(multi_source_env):
     table = runtime.execute(sql)
     plan_text = "\n".join(row["plan"] for row in table.to_pylist())
     # the build (products) is filtered to id 101, so the probe IN shows it
-    assert "product_id IN (101)" in plan_text
+    assert '"product_id" IN (101)' in plan_text
 
 
 def test_build_side_chosen_by_filter_regardless_of_order(multi_source_env):
@@ -93,4 +93,4 @@ def test_build_side_chosen_by_filter_regardless_of_order(multi_source_env):
         row["plan"] for row in runtime.execute("EXPLAIN " + sql).to_pylist()
     )
     # orders (the big, unfiltered side) is the one carrying the IN filter
-    assert "product_id IN (101)" in plan
+    assert '"product_id" IN (101)' in plan
