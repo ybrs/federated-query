@@ -101,6 +101,32 @@ def test_order_by_expression_renders_and_runs_in_duckdb(engine):
     assert products == [30, 40, 40]
 
 
+def test_order_by_expression_desc_with_null_product(engine):
+    """``ORDER BY a * b DESC`` over a NULL product renders DESC NULLS FIRST to DuckDB.
+
+    The engine pins the Postgres default (DESC -> NULLS FIRST); DuckDB's own DESC
+    default is NULLS LAST, so sqlglot must emit the explicit keyword. This pins
+    that the NULL product sorts first and the rest descend.
+    """
+    table = pa.table({"a": pa.array([1, 2, 3]), "b": pa.array([10, None, 30])})
+    node = PhysicalSort(
+        input=_Node(table=table),
+        sort_keys=[_mul(_col("a"), _col("b"))],
+        ascending=[False],
+        nulls_order=[None],
+    )
+
+    order_sql = node._sort_order_clause(node.input.column_aliases())
+    assert '"a" * "b"' in order_sql
+    # DuckDB default for DESC is NULLS LAST, so the engine's NULLS FIRST is explicit.
+    assert "DESC NULLS FIRST" in order_sql
+
+    rows = _rows(node, engine)
+    products = [None if r["b"] is None else r["a"] * r["b"] for r in rows]
+    # NULL product first (NULLS FIRST), then 3*30=90, then 1*10=10.
+    assert products == [None, 90, 10]
+
+
 def test_group_by_with_expression_aggregate_arg(engine):
     """``GROUP BY g, SUM(a * b)`` renders the product into DuckDB SQL and sums it."""
     table = pa.table(
