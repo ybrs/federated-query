@@ -3128,8 +3128,15 @@ class PhysicalRemoteQuery(PhysicalPlanNode):
         return self._schema
 
     def _sql(self) -> str:
-        """Render the carried AST in the target source's dialect."""
-        return self.query_ast.sql(dialect=self.datasource_connection.render_dialect)
+        """Render the carried canonical AST in the target source's dialect.
+
+        The AST is built in the canonical Postgres form by the single emitter;
+        to_source_sql is the one transpile boundary that translates
+        dialect-divergent syntax for the source.
+        """
+        return to_source_sql(
+            self.datasource_connection, self.query_ast.sql(dialect="postgres")
+        )
 
     def estimated_cost(self) -> float:
         raise NotImplementedError("Cost estimation not yet implemented")

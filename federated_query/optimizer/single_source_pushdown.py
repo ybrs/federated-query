@@ -30,7 +30,8 @@ from ..plan.logical import (
     Values,
 )
 from ..plan.expressions import ColumnRef, Expression
-from ..plan.physical import PhysicalRemoteQuery, render_grouping_sets
+from ..plan.physical import PhysicalRemoteQuery
+from ..plan.emit import clauses, CANONICAL_SOURCE_RESOLVER
 from ..plan.expressions import aggregate_output_map, split_where_having
 
 _JOIN_KEYWORDS = {
@@ -186,7 +187,7 @@ class SingleSourcePushdown:
             unique = self._unique_name(name, seen)
             seen.add(unique)
             context.output_names.append(unique)
-            context.select_items.append(f'{alias}."{name}" AS "{unique}"')
+            context.select_items.append(f'"{alias}"."{name}" AS "{unique}"')
             context.column_aliases[(alias, name)] = unique
 
     def _should_push(self, context: _PushContext) -> bool:
@@ -458,7 +459,7 @@ class SingleSourcePushdown:
     def _cte_ref_sql(self, node: CTERef) -> str:
         """Render a CTE reference as its name, keeping a distinct alias."""
         if node.alias and node.alias != node.name:
-            return f"{node.name} AS {node.alias}"
+            return f'{node.name} AS "{node.alias}"'
         return node.name
 
     def _absorb_set_operation_base(
@@ -489,7 +490,7 @@ class SingleSourcePushdown:
             return None
         keyword = node.kind.name if node.distinct else f"{node.kind.name} ALL"
         alias = self._derived_alias(context)
-        return f"({left_sql} {keyword} {right_sql}) AS {alias}"
+        return f'({left_sql} {keyword} {right_sql}) AS "{alias}"'
 
     def _render_branch(
         self, node: LogicalPlanNode, context: _PushContext
@@ -534,7 +535,7 @@ class SingleSourcePushdown:
         for expr, name in zip(node.rows[0], node.output_names):
             sql = expr.to_sql()
             if name and name != sql:
-                sql = f"{sql} AS {name}"
+                sql = f'{sql} AS "{name}"'
             items.append(sql)
         return "SELECT " + ", ".join(items)
 
@@ -726,7 +727,7 @@ class SingleSourcePushdown:
             return None
         if context.datasource is None:
             context.datasource = inner.datasource
-        return f"({self._render(inner)}) AS {node.alias}"
+        return f'({self._render(inner)}) AS "{node.alias}"'
 
     def _render_derived(
         self, node: LogicalPlanNode, context: _PushContext
@@ -750,7 +751,7 @@ class SingleSourcePushdown:
         if context.datasource is None:
             context.datasource = inner.datasource
         alias = self._derived_alias(context)
-        return f"({self._render(inner)}) AS {alias}"
+        return f'({self._render(inner)}) AS "{alias}"'
 
     def _derived_alias(self, context: _PushContext) -> str:
         """Return a unique relation alias for the next derived table."""
@@ -763,8 +764,10 @@ class SingleSourcePushdown:
         if join.natural:
             return f"NATURAL {keyword} {right_ref}"
         if join.using is not None:
-            columns = ", ".join(join.using)
-            return f"{keyword} {right_ref} USING ({columns})"
+            quoted = []
+            for column in join.using:
+                quoted.append(f'"{column}"')
+            return f"{keyword} {right_ref} USING ({', '.join(quoted)})"
         return f"{keyword} {right_ref} ON {join.condition.to_sql()}"
 
     def _claim_scan(self, scan: Scan, context: _PushContext) -> bool:
@@ -855,7 +858,7 @@ class SingleSourcePushdown:
             registered = context.scan_names.get(id(scan))
         reference = registered or f'"{scan.schema_name}"."{scan.table_name}"'
         alias = scan.alias if scan.alias else scan.table_name
-        ref = f"{reference} AS {alias}"
+        ref = f'{reference} AS "{alias}"'
         if registered is None and scan.sample:
             ref = f"{ref} {scan.sample}"
         return ref
@@ -871,39 +874,33 @@ class SingleSourcePushdown:
         )
 
     def _render_order_keys(self, keys, ascending, nulls) -> str:
-        """Render ORDER BY items from key, direction, and NULLS-order lists."""
-        items: List[str] = []
-        for index in range(len(keys)):
-            items.append(self._order_key_item(keys, ascending, nulls, index))
-        return ", ".join(items)
+        """Render ORDER BY items via the shared clause builder, as a SQL fragment.
 
-    def _order_key_item(self, keys, ascending, nulls, index: int) -> str:
-        """Render one ORDER BY key with ASC/DESC and NULLS placement."""
-        item = keys[index].to_sql()
-        if ascending and not ascending[index]:
-            item = f"{item} DESC"
-        return self._order_key_nulls(item, nulls, index)
-
-    def _order_key_nulls(self, item: str, nulls, index: int) -> str:
-        """Append NULLS FIRST/LAST to an ORDER BY item when specified."""
-        if not nulls or index >= len(nulls) or not nulls[index]:
-            return item
-        return f"{item} NULLS {nulls[index]}"
+        Direction (DESC) and NULLS placement come from the single
+        ``emit.clauses.order_by`` implementation, then each key is rendered to a
+        canonical Postgres fragment for the assembled query.
+        """
+        order = clauses.order_by(keys, ascending, nulls, CANONICAL_SOURCE_RESOLVER)
+        parts: List[str] = []
+        for item in order.expressions:
+            parts.append(item.sql(dialect="postgres"))
+        return ", ".join(parts)
 
     def _render_group_by(self, aggregate: Aggregate) -> Optional[str]:
-        """Render the GROUP BY clause, or None when the aggregate is global.
+        """Render the GROUP BY clause via the shared clause builder, or None.
 
-        ROLLUP/CUBE/GROUPING SETS render as GROUPING SETS so the source produces
-        the super-aggregate rows; a flat group_by would drop them.
+        ROLLUP/CUBE/GROUPING SETS render as GROUPING SETS (from the one
+        ``emit.clauses.group_by`` implementation) so the source produces the
+        super-aggregate rows; a flat group_by would drop them.
         """
-        if aggregate.grouping_sets is not None:
-            return render_grouping_sets(aggregate.grouping_sets, lambda e: e.to_sql())
-        if not aggregate.group_by:
+        group = clauses.group_by(
+            aggregate.group_by, aggregate.grouping_sets, CANONICAL_SOURCE_RESOLVER
+        )
+        if group is None:
             return None
-        parts: List[str] = []
-        for expression in aggregate.group_by:
-            parts.append(expression.to_sql())
-        return ", ".join(parts)
+        text = group.sql(dialect="postgres")
+        prefix = "GROUP BY "
+        return text[len(prefix):] if text.startswith(prefix) else text
 
     def _distinct_keyword(self, context: _PushContext) -> str:
         """Render SELECT, SELECT DISTINCT, or SELECT DISTINCT ON (keys)."""
