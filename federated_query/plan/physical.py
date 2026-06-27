@@ -1649,81 +1649,13 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         return [self.input]
 
     def execute(self) -> Iterator[pa.RecordBatch]:
-        """Execute hash aggregation, via the merge engine when one is attached."""
-        if self._can_merge_aggregate():
-            yield from self._execute_merge_aggregate(_require_engine(self))
-            return
+        """Execute the hash aggregation in the DuckDB merge engine.
 
-        if self.grouping_sets is not None:
-            from ..parser.errors import UnsupportedSQLError
-
-            raise UnsupportedSQLError(
-                "GROUP BY ROLLUP/CUBE/GROUPING SETS is only supported when the "
-                "aggregate pushes to a source or runs in the merge engine"
-            )
-
-        if self._supports_streaming():
-            result_batch = self._execute_streaming()
-        else:
-            result_batch = self._execute_materialized()
-
-        if result_batch.num_rows > 0:
-            yield result_batch
-
-    def _can_merge_aggregate(self) -> bool:
-        """Whether group-bys and aggregates are simple enough to render to SQL."""
-        return self._group_by_renderable() and self._aggregates_renderable()
-
-    def _group_by_renderable(self) -> bool:
-        """True when every group-by key is a plain column reference."""
-        from .expressions import ColumnRef
-
-        for expr in self.group_by:
-            if not isinstance(expr, ColumnRef):
-                return False
-        return True
-
-    def _aggregates_renderable(self) -> bool:
-        """True when every SELECT expression is a column or a column aggregate."""
-        for expr in self.aggregates:
-            if not self._agg_expr_renderable(expr):
-                return False
-        return True
-
-    def _agg_expr_renderable(self, expr: Expression) -> bool:
-        """A group column, or an aggregate the merge engine can render to SQL."""
-        from .expressions import ColumnRef, FunctionCall
-
-        if isinstance(expr, ColumnRef):
-            return True
-        if not isinstance(expr, FunctionCall):
-            return False
-        return self._function_renderable(expr)
-
-    def _function_renderable(self, func: "FunctionCall") -> bool:
-        """An aggregate with renderable args and, if ordered-set, a column sort key."""
-        if not func.is_aggregate:
-            return False
-        if not self._args_are_renderable(func):
-            return False
-        return self._within_group_renderable(func)
-
-    def _args_are_renderable(self, func: "FunctionCall") -> bool:
-        """True when every aggregate argument is a plain column or a literal."""
-        from .expressions import ColumnRef, Literal
-
-        for arg in func.args:
-            if not isinstance(arg, (ColumnRef, Literal)):
-                return False
-        return True
-
-    def _within_group_renderable(self, func: "FunctionCall") -> bool:
-        """An ordered-set aggregate is renderable when its sort key is a column."""
-        from .expressions import ColumnRef
-
-        if func.within_group_key is None:
-            return True
-        return isinstance(func.within_group_key, ColumnRef)
+        Group keys and aggregate arguments (plain columns or any expression)
+        render to DuckDB SQL, so DuckDB computes the whole GROUP BY; there is no
+        separate Python aggregation.
+        """
+        yield from self._execute_merge_aggregate(_require_engine(self))
 
     def _execute_merge_aggregate(self, engine) -> Iterator[pa.RecordBatch]:
         """Run the GROUP BY through DuckDB, casting output to the declared schema."""
@@ -1766,24 +1698,18 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         return ", ".join(parts)
 
     def _render_agg_expr(self, expr: Expression, aliases) -> str:
-        """Render a column or aggregate against the input's physical column names."""
-        from .expressions import ColumnRef, Literal
+        """Render a SELECT/group expression against the input's physical columns.
 
-        if isinstance(expr, ColumnRef):
-            if expr.column == "*":
-                return "*"
-            return f'"{self._resolve_agg_column(expr, aliases)}"'
-        if isinstance(expr, Literal):
-            return expr.to_sql()
-        return self._render_agg_function(expr, aliases)
+        An aggregate call keeps its verbatim form (so an ordered-set aggregate's
+        WITHIN GROUP renders as DuckDB accepts it); every other expression - a
+        plain column, arithmetic, or a scalar function - lowers through the one
+        emitter with the physical-name MergeResolver.
+        """
+        from .expressions import is_aggregate_call
 
-    def _resolve_agg_column(self, expr, aliases) -> str:
-        """Resolve a column reference to its physical name in the input relation."""
-        if aliases:
-            resolved = aliases.get((expr.table, expr.column))
-            if resolved is not None:
-                return resolved
-        return expr.column
+        if is_aggregate_call(expr):
+            return self._render_agg_function(expr, aliases)
+        return expression_to_ast(expr, MergeResolver(aliases)).sql(dialect="duckdb")
 
     def _render_agg_function(self, func: "FunctionCall", aliases) -> str:
         """Render an aggregate call (DISTINCT, COUNT(*), and WITHIN GROUP)."""
@@ -1815,415 +1741,6 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         """Render the ORDER BY key of an ordered-set aggregate for the merge engine."""
         direction = " DESC" if func.within_group_desc else ""
         return f"{self._render_agg_expr(func.within_group_key, aliases)}{direction}"
-
-    def _supports_streaming(self) -> bool:
-        """Return True when streaming aggregation can evaluate all expressions."""
-        from .expressions import ColumnRef, FunctionCall
-
-        def is_supported(expr: Expression) -> bool:
-            if isinstance(expr, ColumnRef):
-                return True
-            if isinstance(expr, FunctionCall) and expr.is_aggregate:
-                if expr.within_group_key is not None:
-                    return False
-                return all(is_supported(arg) for arg in expr.args)
-            return False
-
-        return all(is_supported(expr) for expr in self.aggregates)
-
-    def _execute_streaming(self) -> pa.RecordBatch:
-        from collections import defaultdict
-
-        hash_table = defaultdict(lambda: self._create_accumulator())
-
-        for batch in self.input.execute():
-            self._accumulate_batch(batch, hash_table)
-
-        return self._finalize_aggregates(hash_table)
-
-    def _create_accumulator(self) -> dict:
-        """Create accumulator for aggregate functions."""
-        accumulator = {}
-        for i, expr in enumerate(self.aggregates):
-            accumulator[i] = self._create_single_accumulator(expr)
-        return accumulator
-
-    def _create_single_accumulator(self, expr: Expression) -> dict:
-        """Create accumulator for a single aggregate."""
-        from .expressions import FunctionCall
-
-        if isinstance(expr, FunctionCall) and expr.is_aggregate:
-            func_name = expr.function_name.upper()
-            return {
-                "type": func_name,
-                "count": 0,
-                "sum": 0,
-                "min": None,
-                "max": None,
-                "distinct": expr.distinct,
-                "seen": set(),
-            }
-
-        return {"type": "VALUE", "value": None}
-
-    def _accumulate_batch(self, batch: pa.RecordBatch, hash_table: dict):
-        """Accumulate values from a batch."""
-        for row_idx in range(batch.num_rows):
-            group_key = self._extract_group_key(batch, row_idx)
-            self._accumulate_row(batch, row_idx, hash_table[group_key])
-
-    def _extract_group_key(self, batch: pa.RecordBatch, row_idx: int) -> tuple:
-        """Extract grouping key from a row."""
-        from .expressions import ColumnRef
-
-        if len(self.group_by) == 0:
-            return ()
-
-        key_values = []
-        for expr in self.group_by:
-            if not isinstance(expr, ColumnRef):
-                raise NotImplementedError(
-                    "Local GROUP BY on a non-column key is not supported: "
-                    f"{type(expr).__name__}"
-                )
-            col = batch.column(expr.column)
-            value = col[row_idx].as_py()
-            key_values.append(value)
-        return tuple(key_values)
-
-    def _accumulate_row(self, batch: pa.RecordBatch, row_idx: int, accumulator: dict):
-        """Accumulate values from a single row."""
-        for i, expr in enumerate(self.aggregates):
-            value = self._extract_value_from_row(batch, row_idx, expr)
-            self._update_accumulator(accumulator[i], value)
-
-    def _extract_value_from_row(
-        self, batch: pa.RecordBatch, row_idx: int, expr: Expression
-    ):
-        """Extract value for an expression from a row."""
-        from .expressions import ColumnRef, FunctionCall
-
-        if isinstance(expr, ColumnRef):
-            if expr.column == "*":
-                return 1
-            col = batch.column(expr.column)
-            return col[row_idx].as_py()
-
-        if isinstance(expr, FunctionCall) and expr.is_aggregate:
-            if len(expr.args) == 0:
-                return 1
-            arg = expr.args[0]
-            return self._extract_value_from_row(batch, row_idx, arg)
-
-        return self._evaluate_scalar(batch, row_idx, expr)
-
-    def _evaluate_scalar(self, batch: pa.RecordBatch, row_idx: int, expr: Expression):
-        """Evaluate a non-trivial aggregate argument (e.g. ``price * qty``).
-
-        Computing it through the shared evaluator avoids silently dropping
-        the value to None, which would corrupt SUM/AVG over expressions.
-        """
-        from ..executor.expression_evaluator import ExpressionEvaluator
-
-        row = batch.slice(row_idx, 1)
-        result = ExpressionEvaluator(row).evaluate(expr)
-        return result[0].as_py()
-
-    def _update_accumulator(self, acc: dict, value):
-        """Update accumulator with a value."""
-        acc_type = acc["type"]
-
-        if acc_type == "VALUE":
-            acc["value"] = value
-            return
-
-        if not self._distinct_admits(acc, value):
-            return
-
-        if acc_type == "COUNT":
-            # SQL COUNT skips NULLs; COUNT(*) always accumulates a literal 1.
-            if value is not None:
-                acc["count"] += 1
-            return
-
-        if value is None:
-            return
-
-        self._update_numeric_accumulator(acc, value, acc_type)
-
-    def _distinct_admits(self, acc: dict, value) -> bool:
-        """For a DISTINCT aggregate, accept each non-NULL value only once.
-
-        NULLs are passed through here and dropped by the per-aggregate NULL
-        handling, matching SQL's exclusion of NULLs from DISTINCT aggregates.
-        """
-        if not acc.get("distinct"):
-            return True
-        if value is None:
-            return True
-        if value in acc["seen"]:
-            return False
-        acc["seen"].add(value)
-        return True
-
-    def _update_numeric_accumulator(self, acc: dict, value, acc_type: str):
-        """Update a SUM/AVG (numeric) or MIN/MAX (any comparable) accumulator.
-
-        MIN/MAX keep the value's native type so string columns (``MIN(status)``)
-        compare correctly; SUM keeps integer inputs integral rather than
-        forcing float64.
-        """
-        acc["count"] += 1
-        if acc_type in ("SUM", "AVG"):
-            acc["sum"] += value
-        if acc_type in ("MIN", "MAX"):
-            self._update_min_max(acc, value, acc_type)
-
-    def _update_min_max(self, acc: dict, value, acc_type: str):
-        """Update min/max accumulator over natively comparable values."""
-        if acc["min"] is None:
-            acc["min"] = value
-            acc["max"] = value
-        else:
-            if acc_type == "MIN":
-                acc["min"] = min(acc["min"], value)
-            if acc_type == "MAX":
-                acc["max"] = max(acc["max"], value)
-
-    def _finalize_aggregates(self, hash_table: dict) -> pa.RecordBatch:
-        """Convert hash table to record batch."""
-        if len(hash_table) == 0 and len(self.group_by) == 0:
-            # SQL: a global aggregate over empty input yields exactly one
-            # row (COUNT = 0, other aggregates NULL).
-            hash_table[()] = self._create_accumulator()
-        if len(hash_table) == 0:
-            return self._create_empty_batch()
-
-        columns = []
-        for i in range(len(self.output_names)):
-            col_values = self._extract_column_values(hash_table, i)
-            columns.append(col_values)
-
-        return pa.RecordBatch.from_arrays(columns, names=self.output_names)
-
-    def _extract_column_values(self, hash_table: dict, col_idx: int) -> pa.Array:
-        """Extract values for a column.
-
-        The aggregates list contains ALL expressions from SELECT clause:
-        - Non-aggregate columns (ColumnRef) - these match group_by expressions
-        - Aggregate functions (FunctionCall with is_aggregate=True)
-
-        Accumulators are indexed by position in aggregates (accumulator[i] for aggregates[i]).
-        """
-        from .expressions import FunctionCall
-
-        expr = self.aggregates[col_idx]
-
-        values = []
-        for group_key, accumulators in hash_table.items():
-            # Check if this is an aggregate function
-            if isinstance(expr, FunctionCall) and expr.is_aggregate:
-                # Accumulators are indexed by position in aggregates
-                value = self._finalize_accumulator(accumulators[col_idx])
-                values.append(value)
-            else:
-                # This is a group-by column - find which one
-                group_idx = self._find_group_by_index(expr)
-                if group_idx is None:
-                    raise NotImplementedError(
-                        "Local aggregate output for a non-aggregate, "
-                        "non-group-by expression is not supported: "
-                        f"{type(expr).__name__}"
-                    )
-                values.append(group_key[group_idx] if group_key else None)
-
-        return pa.array(values)
-
-    def _find_group_by_index(self, expr: Expression) -> int:
-        """Find which group_by expression this matches."""
-        from .expressions import ColumnRef
-
-        # For now, simple match by column name
-        if isinstance(expr, ColumnRef):
-            for i, group_expr in enumerate(self.group_by):
-                if (
-                    isinstance(group_expr, ColumnRef)
-                    and group_expr.column == expr.column
-                ):
-                    return i
-
-        return None
-
-    def _finalize_accumulator(self, acc: dict):
-        """Finalize accumulator to get final value."""
-        acc_type = acc["type"]
-
-        if acc_type == "VALUE":
-            return acc["value"]
-        if acc_type == "COUNT":
-            return acc["count"]
-        if acc_type == "SUM":
-            # SQL SUM over zero accumulated values is NULL, not 0.
-            return acc["sum"] if acc["count"] > 0 else None
-        if acc_type == "AVG":
-            return acc["sum"] / acc["count"] if acc["count"] > 0 else None
-        if acc_type == "MIN":
-            return acc["min"]
-        if acc_type == "MAX":
-            return acc["max"]
-
-        raise NotImplementedError(f"Local aggregate function not supported: {acc_type}")
-
-    def _create_empty_batch(self) -> pa.RecordBatch:
-        """Create empty batch with proper schema."""
-        arrays = []
-        for _ in self.output_names:
-            arrays.append(pa.array([]))
-        return pa.RecordBatch.from_arrays(arrays, names=self.output_names)
-
-    def _execute_materialized(self) -> pa.RecordBatch:
-        """Fallback aggregation that materializes input and uses pyarrow compute."""
-        input_table = self._materialize_input()
-        groups = self._build_groups(input_table)
-        return self._compute_result(input_table, groups)
-
-    def _materialize_input(self) -> pa.Table:
-        """Materialize all input batches into a pyarrow.Table."""
-        batches = [batch for batch in self.input.execute()]
-        if not batches:
-            return pa.Table.from_arrays([], names=[])
-        return pa.Table.from_batches(batches)
-
-    def _build_groups(self, table: pa.Table) -> dict:
-        """Build hash table of group keys to row indices."""
-        from collections import defaultdict
-
-        groups = defaultdict(list)
-        for row_idx in range(table.num_rows):
-            key = self._extract_group_key(table, row_idx)
-            groups[key].append(row_idx)
-        return groups
-
-    def _compute_result(self, table: pa.Table, groups: dict) -> pa.RecordBatch:
-        """Compute aggregate results for all groups."""
-        if len(groups) == 0 and len(self.group_by) == 0:
-            # SQL: a global aggregate over empty input yields one row.
-            groups = {(): []}
-        result_rows = []
-        for group_key, row_indices in groups.items():
-            row = self._compute_group_row(table, group_key, row_indices)
-            result_rows.append(row)
-        return self._arrays_to_batch(result_rows)
-
-    def _compute_group_row(
-        self, table: pa.Table, group_key: tuple, row_indices: List[int]
-    ) -> List:
-        """Compute one output row for a single group."""
-        row_data = []
-        for agg_expr in self.aggregates:
-            row_data.append(
-                self._compute_group_cell(table, agg_expr, group_key, row_indices)
-            )
-        return row_data
-
-    def _compute_group_cell(
-        self,
-        table: pa.Table,
-        agg_expr: Expression,
-        group_key: tuple,
-        row_indices: List[int],
-    ):
-        """Compute one output cell: a group-by key value or an aggregate result.
-
-        A SELECT expression that is neither a group-by column, a constant, nor
-        an aggregate call (e.g. ``SUM(x) * 2``) is unsupported on the local path
-        and raises, rather than silently emitting NULL.
-        """
-        from .expressions import ColumnRef, FunctionCall, Literal
-
-        if isinstance(agg_expr, ColumnRef):
-            return self._group_key_value(agg_expr, group_key)
-        if isinstance(agg_expr, Literal):
-            return agg_expr.value
-        if isinstance(agg_expr, FunctionCall):
-            return self._compute_aggregate(table, agg_expr, row_indices)
-        raise NotImplementedError(
-            "Local aggregate output for a non-aggregate, non-group-by expression "
-            f"is not supported: {type(agg_expr).__name__}"
-        )
-
-    def _group_key_value(self, column_ref, group_key: tuple):
-        """Return a group-by column's value for the current group, or raise."""
-        idx = self._find_group_by_index(column_ref)
-        if idx is None or len(group_key) == 0:
-            raise NotImplementedError(
-                f"GROUP BY column not found in grouping keys: {column_ref.column}"
-            )
-        return group_key[idx]
-
-    def _compute_aggregate(
-        self, table: pa.Table, func: "FunctionCall", row_indices: List[int]
-    ):
-        """Compute an aggregate function using pyarrow compute helpers."""
-        import pyarrow.compute as pc
-        from .expressions import ColumnRef
-
-        func_name = func.function_name.upper()
-
-        if func_name == "COUNT" and (
-            len(func.args) == 0 or getattr(func.args[0], "column", "*") == "*"
-        ):
-            return len(row_indices)
-
-        if len(func.args) == 0:
-            return len(row_indices)
-
-        if len(row_indices) == 0:
-            # No input rows: COUNT(col) is 0, every other aggregate is NULL.
-            return 0 if func_name == "COUNT" else None
-
-        column = self._aggregate_input_column(table, func.args[0])
-        subset = column.take(row_indices)
-
-        if func_name == "COUNT":
-            return len(subset) - subset.null_count
-        if func_name == "SUM":
-            return pc.sum(subset).as_py()
-        if func_name == "AVG":
-            return pc.mean(subset).as_py()
-        if func_name == "MIN":
-            return pc.min(subset).as_py()
-        if func_name == "MAX":
-            return pc.max(subset).as_py()
-
-        raise ValueError(f"Unsupported aggregate function: {func_name}")
-
-    def _aggregate_input_column(self, table: pa.Table, arg: Expression):
-        """Resolve an aggregate's argument to a column, evaluating expressions.
-
-        A non-column argument (``SUM(price * quantity)``) is computed through
-        the shared evaluator rather than silently dropped to None.
-        """
-        from .expressions import ColumnRef
-        from ..executor.expression_evaluator import ExpressionEvaluator
-
-        if isinstance(arg, ColumnRef):
-            return table.column(arg.column)
-        batch = table.combine_chunks().to_batches()[0]
-        return ExpressionEvaluator(batch).evaluate(arg)
-
-    def _arrays_to_batch(self, rows: List[List]) -> pa.RecordBatch:
-        """Convert list of row data to a RecordBatch with correct names."""
-        if len(rows) == 0:
-            return self._create_empty_batch()
-
-        num_cols = len(rows[0])
-        arrays = []
-        for col_idx in range(num_cols):
-            col_data = [row[col_idx] for row in rows]
-            arrays.append(pa.array(col_data))
-
-        return pa.RecordBatch.from_arrays(arrays, names=self.output_names)
 
     def schema(self) -> pa.Schema:
         """Get output schema."""
@@ -2297,20 +1814,12 @@ class PhysicalSort(PhysicalPlanNode):
         return [self.input]
 
     def execute(self) -> Iterator[pa.RecordBatch]:
-        """Execute sort, via the merge engine when one is attached."""
-        if self._can_merge_sort():
-            yield from self._execute_merge_sort(_require_engine(self))
-            return
-        yield from self._execute_pyarrow_sort()
+        """Execute the sort in the DuckDB merge engine.
 
-    def _can_merge_sort(self) -> bool:
-        """True when every sort key is a plain column reference."""
-        from .expressions import ColumnRef
-
-        for key in self.sort_keys:
-            if not isinstance(key, ColumnRef):
-                return False
-        return True
+        Every sort key (a plain column or any expression) renders to DuckDB SQL,
+        so DuckDB does all the ordering; there is no separate Python sort.
+        """
+        yield from self._execute_merge_sort(_require_engine(self))
 
     def _execute_merge_sort(self, engine) -> Iterator[pa.RecordBatch]:
         """Sort through DuckDB, with per-key NULLS FIRST/LAST placement."""
@@ -2338,54 +1847,6 @@ class PhysicalSort(PhysicalPlanNode):
         for item in order.expressions:
             parts.append(item.sql(dialect="duckdb"))
         return ", ".join(parts)
-
-    def _execute_pyarrow_sort(self) -> Iterator[pa.RecordBatch]:
-        """Materialize the input and sort it with pyarrow (fallback path)."""
-        batches = []
-        for batch in self.input.execute():
-            batches.append(batch)
-
-        if not batches:
-            return
-
-        table = pa.Table.from_batches(batches)
-
-        sort_keys = []
-        for i in range(len(self.sort_keys)):
-            col_name = self._extract_column_name(self.sort_keys[i])
-            order = "ascending" if self.ascending[i] else "descending"
-            sort_keys.append((col_name, order))
-
-        indices = pa.compute.sort_indices(
-            table, sort_keys=sort_keys, null_placement=self._null_placement()
-        )
-        sorted_table = table.take(indices)
-
-        for batch in sorted_table.to_batches():
-            yield batch
-
-    def _null_placement(self) -> str:
-        """NULL placement for the first key, defaulting to Postgres semantics.
-
-        Postgres orders NULLS LAST for ascending and NULLS FIRST for
-        descending unless an explicit ``NULLS FIRST/LAST`` is given.
-        """
-        nulls = self.nulls_order[0] if self.nulls_order else None
-        if nulls == "FIRST":
-            return "at_start"
-        if nulls == "LAST":
-            return "at_end"
-        return "at_end" if self.ascending[0] else "at_start"
-
-    def _extract_column_name(self, expr: Expression) -> str:
-        """Extract column name from expression."""
-        from .expressions import ColumnRef
-
-        if isinstance(expr, ColumnRef):
-            return expr.column
-        raise NotImplementedError(
-            f"ORDER BY on complex expressions not yet supported: {expr}"
-        )
 
     def schema(self) -> pa.Schema:
         return self.input.schema()
@@ -2851,46 +2312,12 @@ class PhysicalGroupedLimit(PhysicalPlanNode):
         return [self.input]
 
     def execute(self) -> Iterator[pa.RecordBatch]:
-        """Keep at most ``limit`` rows per key.
+        """Keep at most ``limit`` rows per key, via a DuckDB ROW_NUMBER window.
 
-        Pushed to the merge engine as a ``ROW_NUMBER() OVER (PARTITION BY keys
-        …)`` window when keys are plain columns; otherwise the Python streaming
-        path applies the per-key limit in row order.
+        Partition and ordering keys (plain columns or any expression) render to
+        DuckDB SQL, so DuckDB applies the per-key limit; there is no Python path.
         """
-        if self._can_merge():
-            yield from self._execute_merge(_require_engine(self))
-        else:
-            yield from self._execute_python()
-
-    def _execute_python(self) -> Iterator[pa.RecordBatch]:
-        """Apply the per-key limit in Python (no merge engine attached).
-
-        Without an ordering the input row order decides which rows survive; with
-        one the input is materialized and each key group is sorted first.
-        """
-        if self.order_by_keys:
-            yield from self._execute_ordered()
-            return
-        emitted_counts: Dict[tuple, int] = {}
-        for batch in self.input.execute():
-            filtered = self._limit_batch(batch, emitted_counts)
-            if filtered.num_rows > 0:
-                yield filtered
-
-    def _can_merge(self) -> bool:
-        """True when every partition and ordering key is a plain column."""
-        return self._all_columns(self.keys) and self._all_columns(
-            self.order_by_keys or []
-        )
-
-    def _all_columns(self, expressions: List[Expression]) -> bool:
-        """Whether every expression is a bare column reference."""
-        from .expressions import ColumnRef
-
-        for expression in expressions:
-            if not isinstance(expression, ColumnRef):
-                return False
-        return True
+        yield from self._execute_merge(_require_engine(self))
 
     def _execute_merge(self, engine) -> Iterator[pa.RecordBatch]:
         """Run the per-key limit as a windowed query in the merge engine."""
@@ -2931,10 +2358,12 @@ class PhysicalGroupedLimit(PhysicalPlanNode):
         return ", ".join(parts)
 
     def _partition_clause(self) -> str:
-        """Render the PARTITION BY list from the per-key columns."""
+        """Render the PARTITION BY list, lowering each key (column or expression)."""
         parts = []
         for key in self.keys:
-            parts.append(f'"{key.column}"')
+            parts.append(
+                expression_to_ast(key, MergeResolver({})).sql(dialect="duckdb")
+            )
         return ", ".join(parts)
 
     def _merge_order_clause(self) -> str:
@@ -2957,57 +2386,6 @@ class PhysicalGroupedLimit(PhysicalPlanNode):
                 parts.append(item.sql(dialect="duckdb"))
         parts.append(f'"{_GROUPED_LIMIT_INDEX_COL}" ASC')
         return ", ".join(parts)
-
-    def _execute_ordered(self) -> Iterator[pa.RecordBatch]:
-        """Materialize, sort within each key, and emit each key's first rows."""
-        table = self._sorted_input_table()
-        emitted_counts: Dict[tuple, int] = {}
-        for batch in table.to_batches():
-            filtered = self._limit_batch(batch, emitted_counts)
-            if filtered.num_rows > 0:
-                yield filtered
-
-    def _sorted_input_table(self) -> pa.Table:
-        """Collect the input and sort it by key then by the ordering keys."""
-        batches = list(self.input.execute())
-        table = pa.Table.from_batches(batches, schema=self.input.schema())
-        return table.sort_by(self._sort_directives())
-
-    def _sort_directives(self) -> List[Tuple[str, str]]:
-        """Sort by every key (to group rows) then by each ordering key."""
-        directives: List[Tuple[str, str]] = []
-        for key in self.keys:
-            directives.append((key.column, "ascending"))
-        for index in range(len(self.order_by_keys)):
-            directives.append(
-                (self.order_by_keys[index].column, self._direction(index))
-            )
-        return directives
-
-    def _direction(self, index: int) -> str:
-        """The pyarrow sort direction for one ordering key."""
-        ascending = self.order_by_ascending
-        if ascending is None or ascending[index]:
-            return "ascending"
-        return "descending"
-
-    def _limit_batch(
-        self, batch: pa.RecordBatch, emitted_counts: Dict[tuple, int]
-    ) -> pa.RecordBatch:
-        """Build the per-key limited slice of one batch."""
-        key_arrays = []
-        for key in self.keys:
-            key_arrays.append(batch.column(key.column))
-        keep_mask = []
-        for row_index in range(batch.num_rows):
-            key_values = []
-            for array in key_arrays:
-                key_values.append(array[row_index].as_py())
-            key = tuple(key_values)
-            count = emitted_counts.get(key, 0)
-            keep_mask.append(count < self.limit)
-            emitted_counts[key] = count + 1
-        return batch.filter(pa.array(keep_mask))
 
     def schema(self) -> pa.Schema:
         return self.input.schema()
