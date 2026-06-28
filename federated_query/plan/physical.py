@@ -535,6 +535,30 @@ def _join_output_aliases(
     return alias_map
 
 
+def _join_output_schema(
+    left: "PhysicalPlanNode", right: "PhysicalPlanNode"
+) -> pa.Schema:
+    """Build the output schema of a binary join.
+
+    Left columns keep their names; a right column whose name collides with a left
+    column is renamed ``right_<name>`` - the same left-wins rule used by the
+    execution SELECT list (_merge_join_select_list) and the parent-resolution map
+    (_join_output_aliases), so the declared schema, the actual output, and
+    qualified-reference resolution all agree.
+    """
+    left_schema = left.schema()
+    left_names = set(left_schema.names)
+    fields = []
+    for field in left_schema:
+        fields.append(field)
+    for field in right.schema():
+        name = field.name
+        if name in left_names:
+            name = f"right_{name}"
+        fields.append(pa.field(name, field.type, nullable=field.nullable))
+    return pa.schema(fields)
+
+
 class PhysicalScan(PhysicalPlanNode):
     """Scan a table from a data source.
 
@@ -1276,28 +1300,8 @@ class PhysicalHashJoin(PhysicalPlanNode):
         return key.column
 
     def schema(self) -> pa.Schema:
-        """Combine schemas from both sides.
-
-        A right column whose name collides with a LEFT column is renamed
-        ``right_<name>`` - the same left-only rule the execution SELECT list
-        (_merge_join_select_list) and the parent-resolution map
-        (_join_output_aliases) use, so the declared schema, the actual output,
-        and qualified-reference resolution all agree.
-        """
-        left_schema = self.left.schema()
-        right_schema = self.right.schema()
-        left_names = set(left_schema.names)
-
-        fields = []
-        for field in left_schema:
-            fields.append(field)
-        for field in right_schema:
-            name = field.name
-            if name in left_names:
-                name = f"right_{name}"
-            fields.append(pa.field(name, field.type, nullable=field.nullable))
-
-        return pa.schema(fields)
+        """Combine both sides' schemas (left-wins on name collision)."""
+        return _join_output_schema(self.left, self.right)
 
     def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
         """Map qualified columns to their (possibly renamed) output names."""
@@ -1570,28 +1574,8 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
         )
 
     def schema(self) -> pa.Schema:
-        """Combine schemas from both sides.
-
-        A right column whose name collides with a LEFT column is renamed
-        ``right_<name>`` - the same left-only rule the execution SELECT list
-        (_merge_join_select_list) and the parent-resolution map
-        (_join_output_aliases) use, so the declared schema, the actual output,
-        and qualified-reference resolution all agree.
-        """
-        left_schema = self.left.schema()
-        right_schema = self.right.schema()
-        left_names = set(left_schema.names)
-
-        fields = []
-        for field in left_schema:
-            fields.append(field)
-        for field in right_schema:
-            name = field.name
-            if name in left_names:
-                name = f"right_{name}"
-            fields.append(pa.field(name, field.type, nullable=field.nullable))
-
-        return pa.schema(fields)
+        """Combine both sides' schemas (left-wins on name collision)."""
+        return _join_output_schema(self.left, self.right)
 
     def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
         """Map qualified columns to their (possibly renamed) output names."""
