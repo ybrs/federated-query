@@ -43,6 +43,10 @@ from federated_query.plan.expressions import (
     SubqueryExpression,
     QuantifiedComparison,
 )
+from federated_query.plan.expressions import (
+    expression_children,
+    map_children,
+)
 from federated_query.optimizer.decorrelation import _expression_column_refs
 from federated_query.optimizer import pushdown
 
@@ -81,7 +85,9 @@ def _all_expression_subclasses() -> set:
     pending = list(Expression.__subclasses__())
     while pending:
         cls = pending.pop()
-        found.add(cls)
+        # Skip test-local stub subclasses; only production nodes are triaged.
+        if cls.__module__.startswith("federated_query"):
+            found.add(cls)
         pending.extend(cls.__subclasses__())
     return found
 
@@ -244,3 +250,82 @@ def test_walker_descends_into_every_compound_slot(
         f"{walker_name} does not surface {sorted(missing)} inside "
         f"{compound_type.__name__}: it skips that node or child slot"
     )
+
+
+class _UnknownExpression(Expression):
+    """A stand-in Expression type the walkers have no rule for."""
+
+    def get_type(self) -> DataType:
+        """Unused; present only to satisfy the abstract base."""
+        return DataType.NULL
+
+    def accept(self, visitor):
+        """Unused; present only to satisfy the abstract base."""
+        raise NotImplementedError
+
+
+def test_expression_children_raises_on_unknown_type():
+    """An unhandled Expression type raises instead of silently returning []."""
+    with pytest.raises(TypeError):
+        expression_children(_UnknownExpression())
+
+
+def test_map_children_raises_on_unknown_type():
+    """An unhandled Expression type raises instead of passing through unchanged."""
+    with pytest.raises(TypeError):
+        map_children(_UnknownExpression(), lambda child: child)
+
+
+@pytest.mark.parametrize(
+    "expr_type",
+    sorted(LEAF_EXPRESSIONS | SUBQUERY_EXPRESSIONS | COMPOUND_EXPRESSIONS,
+           key=lambda c: c.__name__),
+    ids=lambda c: c.__name__,
+)
+def test_walkers_handle_every_known_expression_type(expr_type):
+    """expression_children and map_children handle every real subclass loudly.
+
+    Leaf/subquery types return [] (pass through); compound types descend. No
+    real subclass hits the raise - only a brand-new, untriaged type would.
+    """
+    if expr_type in COMPOUND_EXPRESSIONS:
+        instance = _INSTANCES[expr_type][0]
+    elif expr_type in LEAF_EXPRESSIONS:
+        instance = _leaf_instance(expr_type)
+    else:
+        instance = _subquery_instance(expr_type)
+    # Neither call raises for a known type.
+    expression_children(instance)
+    map_children(instance, lambda child: child)
+
+
+def _leaf_instance(expr_type) -> Expression:
+    """Build one instance of a leaf expression type for the walker check."""
+    if expr_type is ColumnRef:
+        return _col("leaf")
+    if expr_type is Literal:
+        return _lit()
+    return Interval(value="1", unit="DAY")
+
+
+def _subquery_instance(expr_type) -> Expression:
+    """Build one instance of a subquery-boundary expression type."""
+    if expr_type is ExistsExpression:
+        return ExistsExpression(subquery=None)
+    if expr_type is InSubquery:
+        return InSubquery(value=_col("v"), subquery=None)
+    if expr_type is SubqueryExpression:
+        return SubqueryExpression(subquery=None)
+    return QuantifiedComparison(
+        left=_col("v"),
+        operator=BinaryOpType.EQ,
+        quantifier=_any_quantifier(),
+        subquery=None,
+    )
+
+
+def _any_quantifier():
+    """The ANY quantifier, imported lazily to keep the import block focused."""
+    from federated_query.plan.expressions import Quantifier
+
+    return Quantifier.ANY

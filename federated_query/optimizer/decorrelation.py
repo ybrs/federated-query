@@ -43,7 +43,6 @@ from ..plan.logical import (
     Union,
     Explain,
     CTE,
-    CTERef,
     Values,
     SubqueryScan,
     SingleRowGuard,
@@ -243,116 +242,16 @@ def _expression_has_subquery(expr: Expression) -> bool:
     return False
 
 
-# Plan node types that carry no directly-attached expressions. Their child
-# plans are visited separately through plan.children(), so returning [] here is
-# correct - but they are listed EXPLICITLY so a newly added node type is never
-# silently assumed expression-free: an unlisted type hits the raise below.
-_NO_DIRECT_EXPRESSION_NODES = (
-    CTE,
-    CTERef,
-    Explain,
-    LateralJoin,
-    Limit,
-    SetOperation,
-    SubqueryScan,
-    Union,
-)
-
-
 def _plan_expressions(plan: LogicalPlanNode) -> List[Expression]:
-    """Collect every expression attached directly to a plan node.
+    """Every expression attached directly to a plan node.
 
-    Allowlist, not denylist: each LogicalPlanNode type is handled explicitly -
-    expression-bearing nodes return all of their expressions, expression-free
-    nodes return []. An unhandled type RAISES rather than returning [], because
-    the correlation guards (_is_correlated, _validate_no_outer_left,
-    _raise_if_subquery_expression) walk this function; a silently skipped node
-    would let an outer reference or a surviving subquery pass unseen.
+    Delegates to the node's annotation-driven direct_expressions(), the single
+    source of truth: every node type is covered without a per-node list here,
+    and a field whose type cannot be classified raises rather than being
+    silently skipped. The correlation guards (_is_correlated,
+    _validate_no_outer_left, _raise_if_subquery_expression) walk this.
     """
-    if isinstance(plan, Filter):
-        return [plan.predicate]
-    if isinstance(plan, Projection):
-        return list(plan.expressions) + _optional_exprs(plan.distinct_on)
-    if isinstance(plan, Aggregate):
-        return _aggregate_expressions(plan)
-    return _scan_sort_join_expressions(plan)
-
-
-def _scan_sort_join_expressions(plan: LogicalPlanNode) -> List[Expression]:
-    """Expressions of scan/sort/join nodes; delegates the remaining types."""
-    if isinstance(plan, Scan):
-        return _scan_expressions(plan)
-    if isinstance(plan, Sort):
-        return list(plan.sort_keys)
-    if isinstance(plan, Join):
-        return _join_condition_expressions(plan)
-    return _values_grouped_leaf_expressions(plan)
-
-
-def _values_grouped_leaf_expressions(plan: LogicalPlanNode) -> List[Expression]:
-    """Expressions of values/grouped-limit/single-row-guard; else delegates."""
-    if isinstance(plan, Values):
-        return _values_expressions(plan)
-    if isinstance(plan, GroupedLimit):
-        return list(plan.keys) + _optional_exprs(plan.order_by_keys)
-    if isinstance(plan, SingleRowGuard):
-        return list(plan.keys)
-    return _no_direct_expressions(plan)
-
-
-def _no_direct_expressions(plan: LogicalPlanNode) -> List[Expression]:
-    """Return [] for the known expression-free nodes; raise on any other type."""
-    if isinstance(plan, _NO_DIRECT_EXPRESSION_NODES):
-        return []
-    raise DecorrelationError(
-        f"_plan_expressions has no rule for plan node {type(plan).__name__}; "
-        "add it to the allowlist so the correlation guards never skip it silently"
-    )
-
-
-def _aggregate_expressions(plan: Aggregate) -> List[Expression]:
-    """Group keys, aggregate calls, and any GROUPING SETS keys."""
-    collected = list(plan.group_by) + list(plan.aggregates)
-    collected.extend(_flatten_grouping_sets(plan.grouping_sets))
-    return collected
-
-
-def _scan_expressions(plan: Scan) -> List[Expression]:
-    """Every expression a Scan can carry from pushed-down clauses."""
-    collected: List[Expression] = []
-    if plan.filters is not None:
-        collected.append(plan.filters)
-    collected.extend(_optional_exprs(plan.group_by))
-    collected.extend(_optional_exprs(plan.aggregates))
-    collected.extend(_optional_exprs(plan.order_by_keys))
-    collected.extend(_flatten_grouping_sets(plan.grouping_sets))
-    return collected
-
-
-def _join_condition_expressions(plan: Join) -> List[Expression]:
-    """A join's ON condition, or [] when it has none."""
-    if plan.condition is None:
-        return []
-    return [plan.condition]
-
-
-def _optional_exprs(value: Optional[List[Expression]]) -> List[Expression]:
-    """Return a copy of an optional expression list, or [] when it is None."""
-    if value is None:
-        return []
-    return list(value)
-
-
-def _flatten_grouping_sets(
-    grouping_sets: Optional[List[List[Expression]]],
-) -> List[Expression]:
-    """Flatten optional GROUPING SETS (a list of key lists) into expressions."""
-    if grouping_sets is None:
-        return []
-    flattened: List[Expression] = []
-    for grouping_set in grouping_sets:
-        flattened.extend(grouping_set)
-    return flattened
+    return plan.direct_expressions()
 
 
 def _values_expressions(plan: Values) -> List[Expression]:

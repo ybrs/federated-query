@@ -595,11 +595,31 @@ def is_aggregate_call(expr: Expression) -> bool:
     return isinstance(expr, FunctionCall) and expr.is_aggregate
 
 
+# Expression node types that expose no child expressions to a generic tree
+# walk: the leaves (ColumnRef/Literal/Interval) genuinely have none, and the
+# subquery-bearing nodes deliberately hide their inner plan/values so a generic
+# walk never descends into a subquery. Listed explicitly so a NEW expression
+# type is never silently assumed childless - it raises in expression_children
+# and map_children instead.
+_NO_CHILD_EXPRESSIONS = (
+    ColumnRef,
+    Literal,
+    Interval,
+    SubqueryExpression,
+    ExistsExpression,
+    InSubquery,
+    QuantifiedComparison,
+)
+
+
 def expression_children(expr: Expression) -> List[Expression]:
     """Direct child expressions of a node.
 
-    Leaves (ColumnRef/Literal/Interval) and subquery nodes return []; a generic
-    walk never descends into a subquery's own plan.
+    Allowlist, not denylist: every concrete Expression type is handled here or
+    listed in _NO_CHILD_EXPRESSIONS (leaves and subquery boundaries, which a
+    generic walk must not descend into). An unhandled type RAISES rather than
+    returning [], so a new expression node cannot silently drop its children
+    from every tree walk (column_refs, correlation analysis) built on this.
     """
     if isinstance(expr, BinaryOp):
         return [expr.left, expr.right]
@@ -610,10 +630,20 @@ def expression_children(expr: Expression) -> List[Expression]:
     if isinstance(expr, Extract):
         return [expr.source]
     if isinstance(expr, FunctionCall):
-        children = list(expr.args)
-        if expr.within_group_key is not None:
-            children.append(expr.within_group_key)
-        return children
+        return _function_children(expr)
+    return _compound_expression_children(expr)
+
+
+def _function_children(expr: "FunctionCall") -> List[Expression]:
+    """A function call's arguments plus its WITHIN GROUP key, if any."""
+    children = list(expr.args)
+    if expr.within_group_key is not None:
+        children.append(expr.within_group_key)
+    return children
+
+
+def _compound_expression_children(expr: Expression) -> List[Expression]:
+    """Children of the remaining compound nodes; raise on an unknown type."""
     if isinstance(expr, CaseExpr):
         return _case_children(expr)
     if isinstance(expr, InList):
@@ -624,7 +654,17 @@ def expression_children(expr: Expression) -> List[Expression]:
         return list(expr.items)
     if isinstance(expr, WindowExpr):
         return [expr.function] + list(expr.partition_by) + list(expr.order_keys)
-    return []
+    return _no_child_expressions(expr)
+
+
+def _no_child_expressions(expr: Expression) -> List[Expression]:
+    """[] for leaf/subquery-boundary nodes; raise on any other expression type."""
+    if isinstance(expr, _NO_CHILD_EXPRESSIONS):
+        return []
+    raise TypeError(
+        f"expression_children has no rule for {type(expr).__name__}; add it so "
+        "tree walks never silently drop its children"
+    )
 
 
 def _case_children(expr: "CaseExpr") -> List[Expression]:
@@ -678,7 +718,22 @@ def map_children(expr: Expression, fn) -> Expression:
                 "order_keys": _map_list(expr.order_keys, fn),
             }
         )
-    return expr
+    return _map_leaf_expression(expr)
+
+
+def _map_leaf_expression(expr: Expression) -> Expression:
+    """Return leaf/subquery-boundary nodes unchanged; raise on an unknown type.
+
+    These nodes expose no child expressions to a generic rewrite (see
+    _NO_CHILD_EXPRESSIONS), so they pass through untouched. Any other type
+    raises rather than being silently returned unrewritten.
+    """
+    if isinstance(expr, _NO_CHILD_EXPRESSIONS):
+        return expr
+    raise TypeError(
+        f"map_children has no rule for {type(expr).__name__}; add it so a "
+        "rewrite never silently passes its children through unchanged"
+    )
 
 
 def _map_list(items, fn) -> List[Expression]:

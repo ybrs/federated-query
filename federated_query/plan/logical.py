@@ -6,6 +6,7 @@ from enum import Enum
 
 from ..model import StateModel
 from .expressions import Expression
+from .field_introspection import model_expression_values
 
 
 class JoinType(Enum):
@@ -53,6 +54,18 @@ class LogicalPlanNode(StateModel):
     def children(self) -> List["LogicalPlanNode"]:
         """Return child nodes."""
         raise NotImplementedError
+
+    def direct_expressions(self) -> List[Expression]:
+        """Every expression attached directly to this node (not its children).
+
+        Derived from the field type annotations (see
+        :mod:`federated_query.plan.field_introspection`), so every node type is
+        covered without a per-node list and a field whose type cannot be
+        classified raises rather than being silently skipped. Walkers that must
+        see all of a node's expressions (correlation analysis, validation) use
+        this single source of truth.
+        """
+        return model_expression_values(self)
 
     def with_children(self, children: List["LogicalPlanNode"]) -> "LogicalPlanNode":
         """Return a copy of this node with different children."""
