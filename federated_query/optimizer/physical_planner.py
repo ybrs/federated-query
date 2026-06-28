@@ -635,13 +635,6 @@ class PhysicalPlanner:
         """Whether an equality compares a column reference to a literal."""
         return {type(predicate.left), type(predicate.right)} == {ColumnRef, Literal}
 
-        return PhysicalNestedLoopJoin(
-            left=left_plan,
-            right=right_plan,
-            join_type=join.join_type,
-            condition=join.condition,
-        )
-
     def _mark_dynamic_filter(self, hash_join: PhysicalHashJoin) -> None:
         """Mark the probe-side scan that will receive a runtime IN filter.
 
@@ -726,12 +719,20 @@ class PhysicalPlanner:
     def _orient_by_name(
         self, first: ColumnRef, second: ColumnRef, sides: "_JoinSides"
     ) -> Tuple[ColumnRef, ColumnRef]:
-        """Orient using bare column names when qualifiers do not resolve."""
+        """Orient using bare column names when qualifiers do not resolve.
+
+        Raises when neither column resolves to a side: the planner cannot tell
+        which key belongs to which input, and keeping the original order would
+        key the hash join on mismatched columns (wrong or empty results).
+        """
         if first.column in sides.left_names and second.column in sides.right_names:
             return first, second
         if first.column in sides.right_names and second.column in sides.left_names:
             return second, first
-        return first, second
+        raise ValueError(
+            f"cannot orient join keys '{first.column}' / '{second.column}' to a "
+            "join side; neither resolves by qualifier or by column name"
+        )
 
     def _relation_aliases(self, plan) -> set:
         """Collect the relation aliases/names a plan subtree exposes."""

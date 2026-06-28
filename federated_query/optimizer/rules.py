@@ -427,6 +427,12 @@ class ProjectionPushdownRule(OptimizationRule):
             columns.update(self._collect_required_columns(plan.input))
             return columns
 
+        if isinstance(plan, Sort):
+            for key in plan.sort_keys:
+                columns.update(pushdown.bare_names(key))
+            columns.update(self._collect_required_columns(plan.input))
+            return columns
+
         return columns
 
     def _prune_columns(self, plan: LogicalPlanNode, required: set) -> LogicalPlanNode:
@@ -465,6 +471,15 @@ class ProjectionPushdownRule(OptimizationRule):
 
         if isinstance(plan, Limit):
             new_input = self._prune_columns(plan.input, required)
+            if new_input != plan.input:
+                return plan.model_copy(update={"input": new_input})
+            return plan
+
+        if isinstance(plan, Sort):
+            sort_cols = set()
+            for key in plan.sort_keys:
+                sort_cols.update(pushdown.bare_names(key))
+            new_input = self._prune_columns(plan.input, required.union(sort_cols))
             if new_input != plan.input:
                 return plan.model_copy(update={"input": new_input})
             return plan
