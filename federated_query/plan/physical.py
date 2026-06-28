@@ -453,6 +453,23 @@ def _merge_join_select_list(join_type, left_schema, right_schema) -> str:
     return ", ".join(parts)
 
 
+def _merge_join_sql(
+    join_type, on_clause: str, left_schema: pa.Schema, right_schema: pa.Schema
+) -> str:
+    """Render a merge-engine join SELECT over the two registered relations.
+
+    Shared by the hash join (equi-key ON clause) and the nested-loop join
+    (arbitrary ON clause); only the ON clause differs between them.
+    """
+    select_list = _merge_join_select_list(join_type, left_schema, right_schema)
+    return (
+        f"SELECT {select_list} "
+        f"FROM {_MERGE_LEFT_RELATION} AS l "
+        f"{_MERGE_JOIN_KEYWORDS[join_type]} {_MERGE_RIGHT_RELATION} AS r "
+        f"ON {on_clause}"
+    )
+
+
 def _cast_batch_to_schema(batch: pa.RecordBatch, target: pa.Schema) -> pa.RecordBatch:
     """Cast each column of a batch to the target schema's types.
 
@@ -1232,25 +1249,9 @@ class PhysicalHashJoin(PhysicalPlanNode):
 
     def _join_sql(self, left_schema: pa.Schema, right_schema: pa.Schema) -> str:
         """Render the join SELECT for this join type over the registered relations."""
-        select_list = _merge_join_select_list(self.join_type, left_schema, right_schema)
-        return (
-            f"SELECT {select_list} "
-            f"FROM {_MERGE_LEFT_RELATION} AS l "
-            f"{self._merge_join_keyword()} {_MERGE_RIGHT_RELATION} AS r "
-            f"ON {self._merge_on_clause()}"
+        return _merge_join_sql(
+            self.join_type, self._merge_on_clause(), left_schema, right_schema
         )
-
-    def _merge_join_keyword(self) -> str:
-        """Map the join type to its DuckDB SQL join keyword."""
-        keywords = {
-            JoinType.INNER: "INNER JOIN",
-            JoinType.LEFT: "LEFT JOIN",
-            JoinType.RIGHT: "RIGHT JOIN",
-            JoinType.FULL: "FULL JOIN",
-            JoinType.SEMI: "SEMI JOIN",
-            JoinType.ANTI: "ANTI JOIN",
-        }
-        return keywords[self.join_type]
 
     def _merge_on_clause(self) -> str:
         """Render the equi-join condition as l.key = r.key conjuncts."""
@@ -1559,19 +1560,13 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
 
     def _merge_sql(self, left_schema: pa.Schema, right_schema: pa.Schema) -> str:
         """Render the join SELECT over the two registered merge relations."""
-        select_list = _merge_join_select_list(self.join_type, left_schema, right_schema)
         on_clause = "TRUE"
         if self.condition is not None:
             qualified = _qualify_join_condition(
                 self.condition, set(left_schema.names), set(right_schema.names)
             )
             on_clause = qualified.to_sql()
-        return (
-            f"SELECT {select_list} "
-            f"FROM {_MERGE_LEFT_RELATION} AS l "
-            f"{_MERGE_JOIN_KEYWORDS[self.join_type]} {_MERGE_RIGHT_RELATION} AS r "
-            f"ON {on_clause}"
-        )
+        return _merge_join_sql(self.join_type, on_clause, left_schema, right_schema)
 
     def schema(self) -> pa.Schema:
         """Combine both sides' schemas (left-wins on name collision)."""
