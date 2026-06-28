@@ -44,6 +44,18 @@ _JOIN_KEYWORDS = {
 }
 
 
+def same_source(left: Optional[str], right: Optional[str]) -> bool:
+    """Whether two datasource names identify the same source.
+
+    A datasource name maps 1:1 to a connection in the catalog, so the name is the
+    authoritative identity for "can these run together as one source?". This is
+    the single definition of that decision: the pushdown builder and the physical
+    planner both use it instead of each re-deciding (one by name, one by
+    connection object). A ``None`` name (no source claimed yet) matches nothing.
+    """
+    return left is not None and left == right
+
+
 class _PushContext:
     """Mutable accumulator for the clauses of one remote query."""
 
@@ -522,7 +534,9 @@ class SingleSourcePushdown:
         """
         if inner.datasource is None:
             return True
-        if context.datasource is not None and inner.datasource != context.datasource:
+        if context.datasource is not None and not same_source(
+            inner.datasource, context.datasource
+        ):
             return False
         context.datasource = inner.datasource
         return True
@@ -805,7 +819,9 @@ class SingleSourcePushdown:
         """Whether a scan may join this push (always true when merge-rendering)."""
         if context.scan_names is not None:
             return True
-        return context.datasource is None or context.datasource == scan.datasource
+        return context.datasource is None or same_source(
+            context.datasource, scan.datasource
+        )
 
     def _set_select(self, expressions, names, context: _PushContext) -> None:
         """Render the SELECT list with unique output names per column.

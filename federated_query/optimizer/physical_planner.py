@@ -58,7 +58,7 @@ from ..plan.expressions import (
     Expression,
     split_conjuncts as _split_and,
 )
-from .single_source_pushdown import SingleSourcePushdown
+from .single_source_pushdown import SingleSourcePushdown, same_source
 from ..parser.errors import UnsupportedSQLError
 from typing import List, Tuple
 from ..model import StateModel
@@ -799,10 +799,10 @@ class PhysicalPlanner:
             return False
         if not isinstance(right_plan, PhysicalScan):
             return False
-        if left_plan.datasource != right_plan.datasource:
+        if not same_source(left_plan.datasource, right_plan.datasource):
             return False
         ds = left_plan.datasource_connection
-        if ds is None or ds != right_plan.datasource_connection:
+        if ds is None:
             return False
         if not ds.supports_capability(DataSourceCapability.JOINS):
             return False
@@ -866,10 +866,10 @@ class PhysicalPlanner:
         right_branch = self._as_pushable_set_branch(right)
         if left_branch is None or right_branch is None:
             return None
-        if left_branch.datasource != right_branch.datasource:
+        if not same_source(left_branch.datasource, right_branch.datasource):
             return None
         connection = left_branch.datasource_connection
-        if connection is None or connection != right_branch.datasource_connection:
+        if connection is None:
             return None
         return PhysicalRemoteSetOp(
             left=left_branch,
