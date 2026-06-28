@@ -27,6 +27,18 @@ def select_expressions(exprs, names, resolver) -> list:
     return items
 
 
+def select_expressions_fragment(exprs, names, resolver, dialect="postgres") -> str:
+    """Render aliased SELECT items to a comma-separated SQL fragment.
+
+    The same build-items-then-render-and-join the merge operators repeat; they
+    differ only in the resolver and dialect, like order_by_fragment.
+    """
+    parts = []
+    for item in select_expressions(exprs, names, resolver):
+        parts.append(item.sql(dialect=dialect))
+    return ", ".join(parts)
+
+
 def order_by(keys, ascending, nulls, resolver):
     """Build an ``exp.Order`` from parallel key/ascending/nulls lists, or None.
 

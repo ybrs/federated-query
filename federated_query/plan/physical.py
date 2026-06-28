@@ -1005,13 +1005,9 @@ class PhysicalWindow(PhysicalPlanNode):
                 f"expressions ({len(self.expressions)}) and output_names "
                 f"({len(self.output_names)}) length mismatch"
             )
-        items = clauses.select_expressions(
-            self.expressions, self.output_names, MergeResolver(aliases)
+        return clauses.select_expressions_fragment(
+            self.expressions, self.output_names, MergeResolver(aliases), dialect="duckdb"
         )
-        parts = []
-        for item in items:
-            parts.append(item.sql(dialect="duckdb"))
-        return ", ".join(parts)
 
     def schema(self) -> pa.Schema:
         """Output schema, read from DuckDB so window result types are exact.
@@ -1421,13 +1417,12 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
 
     def _build_aggregate_select_clause(self) -> str:
         """Render the aggregate SELECT list via the shared clause builder."""
-        items = clauses.select_expressions(
-            self.aggregates or [], self.output_names or [], CANONICAL_SOURCE_RESOLVER
+        return clauses.select_expressions_fragment(
+            self.aggregates or [],
+            self.output_names or [],
+            CANONICAL_SOURCE_RESOLVER,
+            dialect="postgres",
         )
-        parts = []
-        for item in items:
-            parts.append(item.sql(dialect="postgres"))
-        return ", ".join(parts)
 
     def _build_group_by_clause(self) -> str:
         """Render the GROUP BY keys via the shared clause builder."""
