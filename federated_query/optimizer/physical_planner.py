@@ -181,7 +181,7 @@ class PhysicalPlanner:
         the LATERAL runs in the in-memory DuckDB, with the base reduced to the
         left's correlation domain (a dynamic filter) before transfer.
         """
-        base_scans = self._lateral_base_scans(node.right)
+        base_scans = self._collect_base_scans(node.right)
         if len(base_scans) != 1:
             raise ValueError(
                 "Cross-source LATERAL with multiple base relations is not "
@@ -209,15 +209,6 @@ class PhysicalPlanner:
                 node.right, base_alias, outer_alias
             ),
         )
-
-    def _lateral_base_scans(self, node: LogicalPlanNode) -> List[Scan]:
-        """Collect the base scans of a LATERAL right side."""
-        if isinstance(node, Scan):
-            return [node]
-        scans: List[Scan] = []
-        for child in node.children():
-            scans.extend(self._lateral_base_scans(child))
-        return scans
 
     def _lateral_outer_alias(self, node: LateralJoin) -> str:
         """The left relation's alias, referenced by the right's correlation."""
