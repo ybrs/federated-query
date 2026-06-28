@@ -9,6 +9,15 @@ being re-implemented per rule.
 from typing import List, Set
 
 from ..plan.expressions import Expression, ColumnRef, column_refs
+from ..plan.logical import (
+    LogicalPlanNode,
+    Scan,
+    Join,
+    Projection,
+    Aggregate,
+    Filter,
+    Limit,
+)
 
 
 def _ref_key(ref: ColumnRef) -> str:
@@ -40,37 +49,45 @@ def bare_names(expr: Expression) -> Set[str]:
 
 
 def column_key_set(items: List[Expression]) -> Set[str]:
-    """Both qualified and bare names of the plain column keys in a list.
+    """One authoritative name per plain column key (``table.col`` or bare ``col``).
 
-    Non-column items (e.g. ``UPPER(x)``) are ignored: this matches GROUP BY /
-    ORDER BY keys, where only bare column keys participate in side matching.
+    Mirrors ``qualified_or_bare_names``: a qualified key contributes only its
+    qualified form, so side matching (columns_belong_to_side) judges it by that
+    one form and bare-name tolerance handles alias-vs-physical differences.
+    Non-column items (e.g. ``UPPER(x)``) are ignored, matching GROUP BY / ORDER BY
+    where only plain column keys participate in side matching.
     """
     names: Set[str] = set()
     for item in items:
         if isinstance(item, ColumnRef):
-            if item.table:
-                names.add(f"{item.table}.{item.column}")
-            names.add(item.column)
+            names.add(_ref_key(item))
     return names
 
 
 def columns_belong_to_side(
     cols: Set[str], side_cols: Set[str], other_cols: Set[str]
 ) -> bool:
-    """Whether every column in ``cols`` belongs uniquely to one join side.
-
-    A column matches a side if it is present there exactly (qualified) or by bare
-    name - handling unqualified references and alias-vs-physical-name mismatches
-    (``o.amount`` vs ``orders.amount``) - and is NOT present on the other side.
-    """
+    """Whether every column in ``cols`` belongs uniquely to one join side."""
     for col in cols:
-        if col in side_cols:
-            continue
-        bare = col.split(".")[-1]
-        if _side_has(side_cols, bare) and not _side_has(other_cols, bare):
-            continue
-        return False
+        if not _belongs_to_side(col, side_cols, other_cols):
+            return False
     return True
+
+
+def _belongs_to_side(col: str, side_cols: Set[str], other_cols: Set[str]) -> bool:
+    """Whether one column reference belongs uniquely to ``side_cols``.
+
+    It must be exposed by this side (matched by bare name, which tolerates
+    alias-vs-physical-name differences like ``o.amount`` vs ``orders.amount``)
+    AND not by the other side - unless it is explicitly qualified to this side,
+    which is unambiguous even when both sides share the bare name (a self-join).
+    """
+    bare = col.split(".")[-1]
+    if not _side_has(side_cols, bare):
+        return False
+    if not _side_has(other_cols, bare):
+        return True
+    return col in side_cols and col not in other_cols
 
 
 def _side_has(cols: Set[str], bare: str) -> bool:
@@ -79,3 +96,54 @@ def _side_has(cols: Set[str], bare: str) -> bool:
         if entry == bare or entry.endswith(f".{bare}"):
             return True
     return False
+
+
+def available_columns(plan: LogicalPlanNode) -> Set[str]:
+    """Column names a plan subtree exposes, as both bare and qualified forms.
+
+    The single answer to "which columns does this side of a join expose?", used
+    by both predicate and order-by pushdown to decide which side a predicate or
+    sort key belongs to. Both forms are returned so a reference resolves whether
+    written bare (``id``), aliased (``o.id``), or by physical name
+    (``orders.id``). A node type with no rule returns the empty set, which is
+    conservative: the caller then declines to push (correctness over the
+    optimization).
+    """
+    if isinstance(plan, Scan):
+        return _scan_columns(plan)
+    if isinstance(plan, Join):
+        return available_columns(plan.left) | available_columns(plan.right)
+    if isinstance(plan, Projection):
+        return _projection_columns(plan)
+    if isinstance(plan, Aggregate):
+        return set(plan.output_names)
+    if isinstance(plan, (Filter, Limit)):
+        return available_columns(plan.input)
+    return set()
+
+
+def _scan_columns(scan: Scan) -> Set[str]:
+    """A scan's columns as bare and alias-qualified (``alias.col``) names."""
+    table_ref = scan.alias if scan.alias else scan.table_name
+    names: Set[str] = set()
+    for col in scan.columns:
+        names.add(col)
+        names.add(f"{table_ref}.{col}")
+    return names
+
+
+def _projection_columns(projection: Projection) -> Set[str]:
+    """A projection's output aliases plus the columns its expressions reference.
+
+    Aliases are what a parent sees; the referenced columns let an ORDER BY over
+    an alias be matched back to the input. A bare ``*`` falls back to the input.
+    """
+    names = set(projection.aliases)
+    if "*" in names:
+        return available_columns(projection.input)
+    for expr in projection.expressions:
+        if isinstance(expr, ColumnRef):
+            if expr.table:
+                names.add(f"{expr.table}.{expr.column}")
+            names.add(expr.column)
+    return names

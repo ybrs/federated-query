@@ -209,7 +209,7 @@ class PredicatePushdownRule(OptimizationRule):
         using columns available in the projection's input.
         """
         predicate_cols = pushdown.qualified_or_bare_names(filter_node.predicate)
-        input_cols = self._get_column_names(projection.input)
+        input_cols = pushdown.available_columns(projection.input)
 
         # Can we evaluate predicate using columns from input?
         can_push = self._can_evaluate_predicate(predicate_cols, input_cols)
@@ -252,8 +252,8 @@ class PredicatePushdownRule(OptimizationRule):
         from ..plan.logical import JoinType
 
         predicate = filter_node.predicate
-        left_cols = self._get_column_names(join.left)
-        right_cols = self._get_column_names(join.right)
+        left_cols = pushdown.available_columns(join.left)
+        right_cols = pushdown.available_columns(join.right)
 
         pred_cols = pushdown.qualified_or_bare_names(predicate)
 
@@ -333,46 +333,6 @@ class PredicatePushdownRule(OptimizationRule):
         if existing is None:
             return predicate
         return BinaryOp(op=BinaryOpType.AND, left=existing, right=predicate)
-
-    def _get_column_names(self, plan: LogicalPlanNode) -> set:
-        """Get all column names available from a plan node.
-
-        Returns qualified column names (e.g., "orders.id") for Scan nodes to
-        enable correct filter pushdown when multiple tables have columns with
-        the same name.
-
-        Recursively handles wrapped nodes (Filter, Limit, etc).
-        """
-        if isinstance(plan, Scan):
-            # Return qualified column names: "table.column" or "alias.column"
-            # Use alias if present (e.g., "u" from "FROM users u")
-            # Otherwise use physical table name
-            # This prevents ambiguity when multiple tables have same column names
-            table_ref = plan.alias if plan.alias else plan.table_name
-            qualified = set()
-            for col in plan.columns:
-                qualified.add(f"{table_ref}.{col}")
-            return qualified
-
-        if isinstance(plan, Projection):
-            return set(plan.aliases)
-
-        if isinstance(plan, Join):
-            left_cols = self._get_column_names(plan.left)
-            right_cols = self._get_column_names(plan.right)
-            return left_cols.union(right_cols)
-
-        if isinstance(plan, Filter):
-            return self._get_column_names(plan.input)
-
-        if isinstance(plan, Limit):
-            return self._get_column_names(plan.input)
-
-        if isinstance(plan, Aggregate):
-            # Aggregate changes schema - return output columns
-            return set(plan.output_names)
-
-        return set()
 
     def name(self) -> str:
         """Return this rule's identifier (used in logging and EXPLAIN)."""
@@ -908,8 +868,8 @@ class OrderByPushdownRule(OptimizationRule):
             if left_scan.datasource != right_scan.datasource:
                 return sort
         sort_cols = pushdown.column_key_set(sort.sort_keys)
-        left_cols = self._get_available_columns(join.left)
-        right_cols = self._get_available_columns(join.right)
+        left_cols = pushdown.available_columns(join.left)
+        right_cols = pushdown.available_columns(join.right)
 
         left_only = pushdown.columns_belong_to_side(sort_cols, left_cols, right_cols)
         right_only = pushdown.columns_belong_to_side(sort_cols, right_cols, left_cols)
@@ -967,41 +927,6 @@ class OrderByPushdownRule(OptimizationRule):
         new_union = union.model_copy(update={"inputs": new_inputs})
         return sort.model_copy(update={"input": new_union})
 
-    def _get_available_columns(self, plan: LogicalPlanNode) -> set:
-        """Get all column names available from a plan node."""
-        if isinstance(plan, Scan):
-            columns = set()
-            table_ref = plan.alias if plan.alias else plan.table_name
-            for col in plan.columns:
-                columns.add(col)
-                columns.add(f"{table_ref}.{col}")
-            return columns
-
-        if isinstance(plan, Projection):
-            columns = set()
-            for alias in plan.aliases:
-                columns.add(alias)
-
-            if "*" in columns:
-                return self._get_available_columns(plan.input)
-
-            index = 0
-            for expr in plan.expressions:
-                from ..plan.expressions import ColumnRef
-
-                if isinstance(expr, ColumnRef):
-                    if expr.table:
-                        columns.add(f"{expr.table}.{expr.column}")
-                    columns.add(expr.column)
-                index += 1
-
-            return columns
-
-        if isinstance(plan, Filter):
-            return self._get_available_columns(plan.input)
-
-        return set()
-
     def _rewrite_sort_keys_for_projection(
         self,
         sort_keys: List[Expression],
@@ -1009,7 +934,7 @@ class OrderByPushdownRule(OptimizationRule):
     ) -> Optional[List[Expression]]:
         """Rewrite projection sort keys to input expressions when aliases are used."""
         alias_map = self._build_projection_alias_map(projection)
-        available = self._get_available_columns(projection.input)
+        available = pushdown.available_columns(projection.input)
         rewritten: List[Expression] = []
         from ..plan.expressions import ColumnRef
 
