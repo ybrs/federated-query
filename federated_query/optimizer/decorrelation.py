@@ -84,6 +84,7 @@ from ..plan.expressions import (
     combine_or,
     SUBQUERY_NODE_TYPES as _SUBQUERY_NODE_TYPES,
 )
+from .scope_validator import validate_scope
 
 
 class CorrelationResult(StateModel):
@@ -1058,6 +1059,7 @@ class Decorrelator:
         """
         rewritten = self._rewrite_plan(plan)
         self._raise_if_subquery_expression(rewritten)
+        validate_scope(rewritten, "after decorrelation")
         return rewritten
 
     def _next_prefix(self) -> str:

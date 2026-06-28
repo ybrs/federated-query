@@ -16,6 +16,7 @@ from ..plan.logical import (
     Explain,
 )
 from . import pushdown
+from .scope_validator import validate_scope
 from ..plan.expressions import (
     Expression,
     InList,
@@ -1326,6 +1327,7 @@ class RuleBasedOptimizer:
                 if result is not None and result != current_plan:
                     current_plan = result
                     changed = True
+                    validate_scope(current_plan, f"after {type(rule).__name__}")
 
             # If no rules made changes, we've reached fixed point
             if not changed:
