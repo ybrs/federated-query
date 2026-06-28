@@ -181,6 +181,12 @@ class DecorrelationError(Exception):
     """Raised when decorrelation cannot be completed."""
 
 
+class NonFlattenableCorrelation(DecorrelationError):
+    """A correlation cannot become a set-based join (non-equality across an
+    aggregate or LIMIT). The scalar-subquery path catches this specific type to
+    fall back to a LATERAL join; other DecorrelationErrors propagate."""
+
+
 # Logical negation of a comparison operator, used to push NOT through a
 # quantified comparison by De Morgan (NOT (x op ANY S) == x neg_op ALL S).
 _NEGATED_BINARY_OP = {
@@ -191,15 +197,6 @@ _NEGATED_BINARY_OP = {
     BinaryOpType.GT: BinaryOpType.LTE,
     BinaryOpType.GTE: BinaryOpType.LT,
 }
-
-
-def _needs_lateral(error: "DecorrelationError") -> bool:
-    """Whether a flattening failure should fall back to a LATERAL join.
-
-    A non-equality correlation crossing an aggregate or LIMIT cannot become a
-    set-based per-key join, but a LATERAL evaluates it correctly per outer row.
-    """
-    return "equality correlation predicates can cross" in str(error)
 
 
 def _and_join(conjuncts: List[Expression]) -> Expression:
@@ -763,7 +760,7 @@ class _SubqueryPreparer:
     def _key_equality(self, predicate: Expression) -> Tuple[ColumnRef, Expression]:
         """Decompose a predicate into (inner key column, outer side)."""
         if not isinstance(predicate, BinaryOp) or predicate.op != BinaryOpType.EQ:
-            raise DecorrelationError(
+            raise NonFlattenableCorrelation(
                 "Only equality correlation predicates can cross an "
                 f"aggregate or limit, got: {predicate.to_sql()}"
             )
@@ -1011,7 +1008,7 @@ class _SubqueryPreparer:
         """
         for predicate in self.pulled:
             if not isinstance(predicate, BinaryOp) or predicate.op != BinaryOpType.EQ:
-                raise DecorrelationError(
+                raise NonFlattenableCorrelation(
                     "Only equality correlation predicates can cross an "
                     f"aggregate or limit, got: {predicate.to_sql()}"
                 )
@@ -1587,9 +1584,7 @@ class Decorrelator:
         """
         try:
             prepared = self._preparer().prepare_scalar(expr.subquery)
-        except DecorrelationError as error:
-            if not _needs_lateral(error):
-                raise
+        except NonFlattenableCorrelation:
             return self._lateral_scalar(expr, plan)
         condition = prepared.condition
         if condition is None:

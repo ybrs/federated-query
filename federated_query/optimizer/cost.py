@@ -65,7 +65,9 @@ class CostModel:
         if isinstance(plan, Limit):
             return self._estimate_limit_cardinality(plan)
 
-        return 1000
+        raise ValueError(
+            f"estimate_cardinality has no rule for plan node {type(plan).__name__}"
+        )
 
     def _estimate_scan_cardinality(self, scan: Scan) -> int:
         """Estimate cardinality of a scan node."""
@@ -286,7 +288,9 @@ class CostModel:
         if isinstance(plan, Limit):
             return self._estimate_limit_cost(plan)
 
-        return 1000.0
+        raise ValueError(
+            f"estimate_logical_plan_cost has no rule for {type(plan).__name__}"
+        )
 
     def _estimate_scan_cost(self, scan: Scan) -> float:
         """Estimate cost of scanning a table."""
@@ -360,7 +364,9 @@ class CostModel:
         if "Limit" in plan_name:
             return self._estimate_physical_limit_cost(plan)
 
-        return 1000.0
+        raise ValueError(
+            f"estimate_physical_plan_cost has no rule for {plan_name}"
+        )
 
     def _estimate_physical_scan_cost(self, scan) -> float:
         """Estimate cost of physical scan."""
