@@ -50,6 +50,7 @@ from ..plan.expressions import (
     QuantifiedComparison,
     Quantifier,
     TupleExpression,
+    map_children,
 )
 
 if TYPE_CHECKING:
@@ -881,16 +882,22 @@ class Parser:
         return input_plan
 
     def _has_aggregate_functions(self, select: exp.Select) -> bool:
-        """Check if SELECT has aggregate functions.
+        """Whether the SELECT list, HAVING, or ORDER BY contains an aggregate.
 
-        Args:
-            select: sqlglot Select node
-
-        Returns:
-            True if SELECT contains aggregate functions
+        An aggregate may appear in HAVING or ORDER BY without being in the SELECT
+        list (``... HAVING COUNT(*) > 1``); missing those would skip building the
+        Aggregate node and mis-plan the aggregate over a raw scan.
         """
         for expr in select.expressions:
             if self._contains_aggregate_function(expr):
+                return True
+        return self._clause_has_aggregate(select, ("having", "order"))
+
+    def _clause_has_aggregate(self, select: exp.Select, keys) -> bool:
+        """Whether any of the named SELECT clauses carries an aggregate."""
+        for key in keys:
+            clause = select.args.get(key)
+            if clause is not None and self._contains_aggregate_function(clause):
                 return True
         return False
 
@@ -1951,14 +1958,28 @@ class Parser:
             self._append_function_arg(func.args.get(key), args)
 
     def _append_function_arg(self, value, args: List[Expression]) -> None:
-        """Convert one argument slot, which may be a node or a list of nodes."""
+        """Convert one argument slot (a node, a list of nodes, or an absent slot).
+
+        An absent slot (None) and a boolean modifier flag (e.g. CONCAT's ``safe``)
+        are not positional arguments and are skipped. Any other non-expression
+        slot - a string/keyword modifier such as TRIM's position - is NOT silently
+        dropped: it raises, because dropping it loses semantics the generic
+        FunctionCall cannot carry, so the function must be handled explicitly
+        (as _convert_trim does) instead.
+        """
+        if value is None or isinstance(value, bool):
+            return
         if isinstance(value, exp.Expression):
             args.append(self._convert_expression(value))
             return
         if isinstance(value, list):
             for item in value:
-                if isinstance(item, exp.Expression):
-                    args.append(self._convert_expression(item))
+                self._append_function_arg(item, args)
+            return
+        raise UnsupportedSQLError(
+            f"Unsupported function argument slot of type {type(value).__name__}: "
+            f"{value!r}"
+        )
 
     def _rewrite_having_predicate(
         self, predicate: Expression, aggregate: Aggregate
@@ -2028,21 +2049,24 @@ class Parser:
             Rewritten expression
         """
         if isinstance(expr, FunctionCall) and expr.is_aggregate:
-            expr_key = self._expr_to_key(expr)
-            if expr_key in agg_map:
-                col_name = agg_map[expr_key]
-                return ColumnRef(table=None, column=col_name, data_type=expr.get_type())
-            return expr
+            return self._rewrite_aggregate_ref(expr, agg_map)
+        return map_children(
+            expr, lambda child: self._rewrite_expression(child, agg_map)
+        )
 
-        if isinstance(expr, BinaryOp):
-            left = self._rewrite_expression(expr.left, agg_map)
-            right = self._rewrite_expression(expr.right, agg_map)
-            return BinaryOp(op=expr.op, left=left, right=right)
+    def _rewrite_aggregate_ref(
+        self, expr: FunctionCall, agg_map: Dict[str, str]
+    ) -> Expression:
+        """Replace an aggregate call with its output column reference, if mapped.
 
-        if isinstance(expr, UnaryOp):
-            operand = self._rewrite_expression(expr.operand, agg_map)
-            return UnaryOp(op=expr.op, operand=operand)
-
+        An aggregate not present in the mapping is returned unchanged (its
+        arguments reference input columns, not the aggregate's output).
+        """
+        expr_key = self._expr_to_key(expr)
+        if expr_key in agg_map:
+            return ColumnRef(
+                table=None, column=agg_map[expr_key], data_type=expr.get_type()
+            )
         return expr
 
     def parse_to_logical_plan(
