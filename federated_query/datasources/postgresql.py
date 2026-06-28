@@ -321,15 +321,14 @@ class PostgreSQLDataSource(DataSource):
             self._release_adbc(connection)
 
     def _bound_adbc_batch_size(self, cursor) -> None:
-        """Cap the streamed batch size; best-effort if the option is unsupported."""
-        import adbc_driver_manager
+        """Cap the streamed batch size via the ADBC statement option.
 
-        try:
-            cursor.adbc_statement.set_options(
-                **{"adbc.postgresql.batch_size_hint_bytes": str(_ADBC_BATCH_BYTES)}
-            )
-        except adbc_driver_manager.Error:
-            pass
+        Not wrapped in a best-effort catch: if the driver rejects this known
+        PostgreSQL option the engine must surface it, not silently run unhinted.
+        """
+        cursor.adbc_statement.set_options(
+            **{"adbc.postgresql.batch_size_hint_bytes": str(_ADBC_BATCH_BYTES)}
+        )
 
     def _adbc_record_batches(self, cursor) -> Iterator[pa.RecordBatch]:
         """Lazy ``RecordBatchReader`` for an executed cursor (no full drain)."""

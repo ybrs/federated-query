@@ -197,12 +197,16 @@ class Catalog:
         )
 
     def _map_textual_type(self, type_str: str) -> DataType:
-        """Map boolean and string types, defaulting unknowns to VARCHAR."""
+        """Map boolean and string types; raise on a type the engine does not model.
+
+        An unknown type is NOT silently coerced to VARCHAR: a mis-typed column is
+        a wrong answer with no error. An unmodeled type must be added explicitly.
+        """
         if "BOOL" in type_str:
             return DataType.BOOLEAN
         if "CHAR" in type_str or "TEXT" in type_str or "STRING" in type_str:
             return DataType.VARCHAR if "VAR" in type_str else DataType.TEXT
-        return DataType.VARCHAR
+        raise ValueError(f"Unsupported column type for catalog mapping: {type_str}")
 
     def __repr__(self) -> str:
         return (

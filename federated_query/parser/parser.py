@@ -56,6 +56,20 @@ if TYPE_CHECKING:
     from ..processor.query_executor import QueryExecutor
 
 
+# Parsed JOIN side / kind -> engine JoinType. SEMI/ANTI are produced by
+# decorrelation, never parsed from SQL syntax, so they are intentionally absent:
+# an unmapped side or kind raises instead of silently becoming INNER.
+_JOIN_SIDES = {
+    "LEFT": JoinType.LEFT,
+    "RIGHT": JoinType.RIGHT,
+    "FULL": JoinType.FULL,
+}
+_JOIN_KINDS = {
+    "INNER": JoinType.INNER,
+    "CROSS": JoinType.CROSS,
+}
+
+
 class Parser:
     """SQL parser that converts SQL to logical plan."""
 
@@ -711,31 +725,31 @@ class Parser:
         return ["*"]
 
     def _extract_join_type(self, join_clause: exp.Join) -> JoinType:
-        """Extract join type from JOIN clause.
+        """Map a parsed JOIN's side/kind to a JoinType, raising on anything else.
 
-        Args:
-            join_clause: sqlglot Join node
-
-        Returns:
-            JoinType enum value
+        A plain ``JOIN`` (no side, no kind) and an explicit ``INNER`` are INNER.
+        Any side or kind the engine does not model (e.g. a dialect's SEMI/ANTI)
+        raises rather than being silently downgraded to INNER.
         """
         kind = join_clause.args.get("kind")
         side = join_clause.args.get("side")
-
         if side:
-            side_upper = side.upper()
-            if side_upper == "LEFT":
-                return JoinType.LEFT
-            if side_upper == "RIGHT":
-                return JoinType.RIGHT
-            if side_upper == "FULL":
-                return JoinType.FULL
+            return self._sided_join_type(side, kind)
+        if not kind:
+            return JoinType.INNER
+        if kind.upper() in _JOIN_KINDS:
+            return _JOIN_KINDS[kind.upper()]
+        raise UnsupportedSQLError(f"Unsupported JOIN kind: {kind}")
 
-        if kind:
-            if kind.upper() == "CROSS":
-                return JoinType.CROSS
-
-        return JoinType.INNER
+    def _sided_join_type(self, side: str, kind) -> JoinType:
+        """An outer-join side (LEFT/RIGHT/FULL), optionally with an OUTER kind."""
+        if side.upper() not in _JOIN_SIDES:
+            raise UnsupportedSQLError(f"Unsupported JOIN side: {side}")
+        if kind and kind.upper() != "OUTER":
+            raise UnsupportedSQLError(
+                f"Unsupported JOIN kind '{kind}' with side '{side}'"
+            )
+        return _JOIN_SIDES[side.upper()]
 
     def _extract_table_parts(self, table_expr: exp.Table) -> Tuple[str, str, str]:
         """Extract datasource, schema, and table name.

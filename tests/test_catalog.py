@@ -205,8 +205,16 @@ def test_type_mapping(catalog):
     assert catalog._map_type("DATE") == DataType.DATE
     assert catalog._map_type("TIMESTAMP") == DataType.TIMESTAMP
 
-    # Unknown type defaults to VARCHAR
-    assert catalog._map_type("UNKNOWN_TYPE") == DataType.VARCHAR
+
+def test_unknown_type_raises(catalog):
+    """An unmodeled column type raises instead of silently coercing to VARCHAR.
+
+    A mis-typed column is a wrong answer with no error, so an unknown type must
+    be added to the mapping explicitly rather than defaulted.
+    """
+    with pytest.raises(ValueError) as exc_info:
+        catalog._map_type("UNKNOWN_TYPE")
+    assert "UNKNOWN_TYPE" in str(exc_info.value)
 
 
 def test_catalog_repr(catalog):
