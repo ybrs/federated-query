@@ -798,15 +798,6 @@ class OrderByPushdownRule(OptimizationRule):
                 return False
         return True
 
-    def _propagate_sort_metadata(self, node: LogicalPlanNode, sort: Sort) -> None:
-        """Attach sort metadata to the lowest scan without removing top sort."""
-        if isinstance(node, Scan):
-            self._push_to_scan(sort, node)
-            return
-        child = getattr(node, "input", None)
-        if isinstance(child, LogicalPlanNode):
-            self._propagate_sort_metadata(child, sort)
-
     def _attach_order_metadata(
         self, node: LogicalPlanNode, sort: Sort
     ) -> LogicalPlanNode:

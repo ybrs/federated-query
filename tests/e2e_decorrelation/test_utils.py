@@ -134,11 +134,11 @@ def plan_physical(executor, plan: LogicalPlanNode):
     """
     Convert a logical plan to a physical plan.
 
-    The decorrelation tests construct ``Executor(catalog)``, so the catalog
-    travels in the executor's config slot; it is required here to resolve
-    data sources during physical planning.
+    The decorrelation tests construct ``Executor(catalog)``, so the catalog is
+    held in the executor's catalog slot; it is required here to resolve data
+    sources during physical planning.
     """
-    catalog = executor.config
+    catalog = executor.catalog
     if not isinstance(catalog, Catalog):
         raise TypeError(
             "Decorrelation tests must construct the executor as "
