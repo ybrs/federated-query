@@ -489,6 +489,40 @@ def _cast_batch_to_schema(batch: pa.RecordBatch, target: pa.Schema) -> pa.Record
     return pa.RecordBatch.from_arrays(arrays, names=list(target.names))
 
 
+def _evaluate_expression_type(expr, input_schema, alias_map) -> pa.DataType:
+    """Infer an expression's Arrow type by evaluating it against an empty batch.
+
+    The authoritative way to type a computed expression: run the actual kernels
+    on a zero-row batch with the input schema and read the result type, instead
+    of guessing from the operator. Shared by projection output typing and
+    aggregate-argument typing so both agree.
+    """
+    from ..executor.expression_evaluator import ExpressionEvaluator
+
+    empty_batch = pa.RecordBatch.from_pylist([], schema=input_schema)
+    return ExpressionEvaluator(empty_batch, alias_map=alias_map).evaluate(expr).type
+
+
+def _sum_result_type(arg_type: pa.DataType) -> pa.DataType:
+    """The Arrow type a SUM produces: integers widen to a 64-bit accumulator,
+    floating and decimal arguments keep their own type."""
+    if pa.types.is_integer(arg_type):
+        return pa.int64()
+    return arg_type
+
+
+def _column_ref_type(col_ref, input_schema: pa.Schema, alias_map) -> pa.DataType:
+    """Input Arrow type of a column reference.
+
+    The qualifier is resolved through the alias map so a qualified key reads the
+    intended column rather than a bare-name match (which, with two same-named
+    columns, would pick the wrong one).
+    """
+    physical = alias_map.get((col_ref.table, col_ref.column), col_ref.column)
+    index = input_schema.get_field_index(physical)
+    return input_schema.field(index).type
+
+
 def _prepend_batch(first: pa.RecordBatch, rest) -> Iterator[pa.RecordBatch]:
     """Yield an already-pulled first batch, then the remaining batches."""
     yield first
@@ -903,13 +937,8 @@ class PhysicalProjection(PhysicalPlanNode):
     def _infer_expression_type(
         self, expr: Expression, input_schema: pa.Schema
     ) -> pa.DataType:
-        """Infer a computed expression's Arrow type by evaluating it
-        against an empty batch with the input schema."""
-        from ..executor.expression_evaluator import ExpressionEvaluator
-
-        empty_batch = pa.RecordBatch.from_pylist([], schema=input_schema)
-        evaluator = ExpressionEvaluator(empty_batch, alias_map=self.column_aliases())
-        return evaluator.evaluate(expr).type
+        """Infer a computed expression's Arrow type via the shared evaluator."""
+        return _evaluate_expression_type(expr, input_schema, self.column_aliases())
 
     def estimated_cost(self) -> float:
         # Cost is input cost + projection cost
@@ -1696,38 +1725,61 @@ class PhysicalHashAggregate(PhysicalPlanNode):
     def _infer_output_type(
         self, expr: Expression, input_schema: pa.Schema
     ) -> pa.DataType:
-        """Infer output type for an expression."""
-        from .expressions import ColumnRef, FunctionCall
+        """Output type of one aggregate-list item: a group key or an aggregate.
 
-        if isinstance(expr, ColumnRef):
-            field_index = input_schema.get_field_index(expr.column)
-            return input_schema.field(field_index).type
+        A column group key is typed from the input schema (resolving its
+        qualifier via the alias map); an aggregate uses the function's
+        result-type rule. Any other expression key (e.g. ``a % b``, evaluated by
+        the merge engine, not the local kernels) keeps the integer default.
+        """
+        from .expressions import FunctionCall, ColumnRef
 
         if isinstance(expr, FunctionCall) and expr.is_aggregate:
             return self._infer_aggregate_type(expr, input_schema)
-
+        if isinstance(expr, ColumnRef):
+            return _column_ref_type(expr, input_schema, self.column_aliases())
         return pa.int64()
 
     def _infer_aggregate_type(
         self, func: "FunctionCall", input_schema: pa.Schema
     ) -> pa.DataType:
-        """Infer output type for aggregate function."""
+        """Result type of an aggregate from the function and its argument type.
+
+        COUNT is always an integer; MIN/MAX preserve the argument type (so
+        MIN(name) is varchar, not float64 - the previous bug that made the
+        result cast corrupt non-numeric columns); AVG is double; SUM widens
+        integers but keeps float/decimal. Any other aggregate falls back to its
+        argument type, the safest declaration when the rule is unknown.
+        """
+        func_name = func.function_name.upper()
+        if func_name in ("COUNT", "COUNT_DISTINCT"):
+            return pa.int64()
+        arg_type = self._aggregate_arg_type(func, input_schema)
+        if func_name in ("MIN", "MAX"):
+            return arg_type
+        if func_name == "AVG":
+            return pa.float64()
+        if func_name == "SUM":
+            return _sum_result_type(arg_type)
+        return arg_type
+
+    def _aggregate_arg_type(
+        self, func: "FunctionCall", input_schema: pa.Schema
+    ) -> pa.DataType:
+        """Arrow type of an aggregate's first argument.
+
+        A column argument (the usual case, e.g. ``MIN(name)``) is typed from the
+        input schema; a computed argument (``SUM(a + b)``) by the shared
+        empty-batch evaluator.
+        """
         from .expressions import ColumnRef
 
-        func_name = func.function_name.upper()
-        arg_type = pa.float64()
-        if func.args and isinstance(func.args[0], ColumnRef):
-            field_index = input_schema.get_field_index(func.args[0].column)
-            arg_type = input_schema.field(field_index).type
-
-        if func_name == "COUNT":
+        if not func.args:
             return pa.int64()
-        if func_name in ("SUM", "AVG", "MIN", "MAX"):
-            # Numeric accumulators compute in float64; the declared type
-            # must match what execution actually produces.
-            return pa.float64()
-
-        return pa.float64()
+        arg = func.args[0]
+        if isinstance(arg, ColumnRef):
+            return _column_ref_type(arg, input_schema, self.column_aliases())
+        return _evaluate_expression_type(arg, input_schema, self.column_aliases())
 
     def estimated_cost(self) -> float:
         raise NotImplementedError("Cost estimation not yet implemented")
