@@ -108,48 +108,6 @@ class Catalog:
             return schema.get_table(table_name)
         return None
 
-    def resolve_table(self, table_ref: str) -> Optional[Tuple[str, str, str, Table]]:
-        """Resolve a table reference to its components.
-
-        Supports formats:
-        - datasource.schema.table
-        - schema.table (searches all data sources)
-        - table (searches all schemas)
-
-        Args:
-            table_ref: Table reference string
-
-        Returns:
-            Tuple of (datasource, schema, table_name, Table) if found, None otherwise
-        """
-        parts = table_ref.split(".")
-
-        if len(parts) == 3:
-            # Fully qualified: datasource.schema.table
-            ds, schema_name, table_name = parts
-            table = self.get_table(ds, schema_name, table_name)
-            if table:
-                return (ds, schema_name, table_name, table)
-
-        elif len(parts) == 2:
-            # schema.table - search all data sources
-            schema_name, table_name = parts
-            for (ds, sch_name), schema in self.schemas.items():
-                if sch_name.lower() == schema_name.lower():
-                    table = schema.get_table(table_name)
-                    if table:
-                        return (ds, sch_name, table_name, table)
-
-        elif len(parts) == 1:
-            # Just table name - search all schemas
-            table_name = parts[0]
-            for (ds, sch_name), schema in self.schemas.items():
-                table = schema.get_table(table_name)
-                if table:
-                    return (ds, sch_name, table_name, table)
-
-        return None
-
     def _map_type(self, type_str: str) -> DataType:
         """Map a database type string to a DataType, most specific first.
 

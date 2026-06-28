@@ -723,20 +723,6 @@ class LimitPushdownRule(OptimizationRule):
         return "LimitPushdown"
 
 
-class JoinReorderingRule(OptimizationRule):
-    """Reorder joins for better performance."""
-
-    def apply(self, plan: LogicalPlanNode) -> Optional[LogicalPlanNode]:
-        """Reorder joins by cost. Not yet implemented (cost-based optimization phase)."""
-        # TODO: Implement cost-based join reordering
-        # Requires integration with Phase 5 cost model
-        raise NotImplementedError()
-
-    def name(self) -> str:
-        """Return this rule's identifier (used in logging and EXPLAIN)."""
-        return "JoinReordering"
-
-
 class OrderByPushdownRule(OptimizationRule):
     """Push ORDER BY clauses to data sources when safe.
 
