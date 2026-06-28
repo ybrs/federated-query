@@ -251,19 +251,8 @@ class SqlglotEmitter(E.ExpressionVisitor):
         return items
 
     def _ordered_key(self, index, key, ascending, nulls) -> "exp.Ordered":
-        """Build a single ordered key with explicit direction and NULLS.
-
-        NULLS placement is always explicit (the plan's, or the Postgres default
-        - LAST for ASC, FIRST for DESC); leaving it unset lets sqlglot emit
-        ``DESC NULLS LAST``, the opposite of Postgres's DESC default.
-        """
-        desc = not ascending[index]
-        nulls_spec = nulls[index]
-        if nulls_spec is None:
-            nulls_spec = "FIRST" if desc else "LAST"
-        return exp.Ordered(
-            this=self._emit(key), desc=desc, nulls_first=(nulls_spec.upper() == "FIRST")
-        )
+        """Build a single window ordered key (shares the ORDER BY NULLS rule)."""
+        return ordered_key_from_ast(self._emit(key), index, ascending, nulls)
 
     def visit_subquery(self, expr):
         """A scalar subquery must be decorrelated before SQL emission."""
@@ -305,3 +294,20 @@ def _frame_spec(frame_text: str) -> exp.Expression:
 def expression_to_ast(expr: "E.Expression", resolver) -> exp.Expression:
     """Lower an engine expression tree to a sqlglot AST using ``resolver``."""
     return expr.accept(SqlglotEmitter(resolver))
+
+
+def ordered_key_from_ast(ast, index, ascending, nulls) -> exp.Ordered:
+    """Build one ``exp.Ordered`` from a pre-emitted key AST.
+
+    The single place the NULLS placement is decided: always made explicit using
+    the plan's value, or the engine's canonical Postgres default (LAST for ASC,
+    FIRST for DESC). Leaving it unset lets sqlglot emit ``DESC NULLS LAST`` for
+    Postgres - the opposite of Postgres's own DESC default - which would silently
+    flip NULL ordering. Both the ORDER BY clause builder and the window emitter
+    use this so the rule never drifts between them.
+    """
+    desc = bool(ascending) and index < len(ascending) and not ascending[index]
+    spec = nulls[index] if nulls and index < len(nulls) else None
+    if spec is None:
+        spec = "FIRST" if desc else "LAST"
+    return exp.Ordered(this=ast, desc=desc, nulls_first=(spec.upper() == "FIRST"))

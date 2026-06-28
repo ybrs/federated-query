@@ -8,7 +8,7 @@ so clause rendering exists in exactly one place.
 
 from sqlglot import exp
 
-from .expressions import expression_to_ast
+from .expressions import expression_to_ast, ordered_key_from_ast
 
 
 def aliased_item(ast: exp.Expression, name) -> exp.Expression:
@@ -43,20 +43,10 @@ def order_by(keys, ascending, nulls, resolver):
 
 
 def _ordered_key(index, key, ascending, nulls, resolver) -> exp.Ordered:
-    """Build one ordered key with explicit direction and NULLS placement.
-
-    NULLS placement is always made explicit using the engine's canonical
-    Postgres default (LAST for ASC, FIRST for DESC) when the plan did not specify
-    one. Leaving it unset is unsafe: sqlglot emits ``DESC NULLS LAST`` for
-    Postgres, the opposite of Postgres's own DESC default, which would silently
-    flip NULL ordering.
-    """
-    desc = bool(ascending) and index < len(ascending) and not ascending[index]
-    spec = nulls[index] if nulls and index < len(nulls) else None
-    if spec is None:
-        spec = "FIRST" if desc else "LAST"
-    ast = expression_to_ast(key, resolver)
-    return exp.Ordered(this=ast, desc=desc, nulls_first=(spec.upper() == "FIRST"))
+    """Build one ORDER BY key; shares the NULLS-default rule with the emitter."""
+    return ordered_key_from_ast(
+        expression_to_ast(key, resolver), index, ascending, nulls
+    )
 
 
 def order_by_fragment(keys, ascending, nulls, resolver, dialect="postgres"):
