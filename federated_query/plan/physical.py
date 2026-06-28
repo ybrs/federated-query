@@ -1343,18 +1343,12 @@ class PhysicalHashJoin(PhysicalPlanNode):
 class PhysicalRemoteJoin(PhysicalPlanNode):
     """Join executed directly on a single data source.
 
-    NOT dead code — intentionally retained for future selective pushdown.
-    The G1 single-source generator (``optimizer/single_source_pushdown.py``,
-    surfaced as ``PhysicalRemoteQuery``) currently pushes the *whole* maximal
-    same-source subtree, so the planner no longer constructs this node (verified
-    by instrumentation: 0 hits across the suite). It stays because that greedy
-    "push everything" policy breaks down once part of the data lives on the
-    coordinator — most importantly when we run as a query accelerator with a
-    large table cached locally and want to push only the remote portion of a
-    join (e.g. a 3-table join where one table is cached on our side). Reviving
-    selective/partial pushdown will reuse this node's per-side SQL building.
-    See ``selective-pushdown.md`` for the cases and the planned machinery.
-    Do not delete without sign-off.
+    The planner builds this only when both sides are plain same-source scans
+    (_try_plan_remote_join / _is_remote_join_candidate). Single-source pushdown
+    (PhysicalRemoteQuery) currently collapses the whole maximal same-source
+    subtree first, so the candidate check does not fire in practice today; the
+    node remains for selective/partial pushdown, where only the remote portion
+    of a join is pushed while part of the data is on the coordinator.
     """
 
     left: PhysicalScan
