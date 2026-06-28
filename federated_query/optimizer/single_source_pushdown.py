@@ -488,9 +488,13 @@ class SingleSourcePushdown:
         right_sql = self._render_branch(node.right, context)
         if left_sql is None or right_sql is None:
             return None
-        keyword = node.kind.name if node.distinct else f"{node.kind.name} ALL"
+        keyword = self._set_op_keyword(node)
         alias = self._derived_alias(context)
         return f'({left_sql} {keyword} {right_sql}) AS "{alias}"'
+
+    def _set_op_keyword(self, node: SetOperation) -> str:
+        """The SQL keyword for a set operation: DISTINCT by default, else ALL."""
+        return node.kind.name if node.distinct else f"{node.kind.name} ALL"
 
     def _render_branch(
         self, node: LogicalPlanNode, context: _PushContext
@@ -554,7 +558,7 @@ class SingleSourcePushdown:
         right_sql = self._render_branch(node.right, context)
         if left_sql is None or right_sql is None:
             return None
-        keyword = node.kind.name if node.distinct else f"{node.kind.name} ALL"
+        keyword = self._set_op_keyword(node)
         return f"{left_sql} {keyword} {right_sql}"
 
     def _absorb_subquery_scan_base(
