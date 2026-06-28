@@ -277,6 +277,24 @@ class PhysicalCTE(PhysicalPlanNode):
         return f"PhysicalCTE({self.name})"
 
 
+def _alias_column_map(
+    alias: Optional[str], names
+) -> Dict[Tuple[Optional[str], str], str]:
+    """Map every output column to itself under a relation alias.
+
+    A relation that introduces an alias (a scan, a derived table, a CTE
+    reference) exposes ``(alias, column) -> physical_name`` so a qualified
+    reference resolves to a specific physical column instead of a bare name that
+    could be shared across relations. Returns {} when there is no alias.
+    """
+    if alias is None:
+        return {}
+    mapping: Dict[Tuple[Optional[str], str], str] = {}
+    for name in names:
+        mapping[(alias, name)] = name
+    return mapping
+
+
 class PhysicalCTEScan(PhysicalPlanNode):
     """Reads a materialized CTE's rows; one per reference, shares the producer."""
 
@@ -293,11 +311,50 @@ class PhysicalCTEScan(PhysicalPlanNode):
     def schema(self) -> pa.Schema:
         return self.producer.schema()
 
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        """Expose the CTE's columns under the reference alias (or the CTE name)."""
+        return _alias_column_map(self.alias or self.producer.name, self.schema().names)
+
     def estimated_cost(self) -> float:
         raise NotImplementedError("Cost estimation not yet implemented")
 
     def __repr__(self) -> str:
         return f"PhysicalCTEScan({self.producer.name})"
+
+
+class PhysicalAliasedRelation(PhysicalPlanNode):
+    """Re-exposes a derived relation's columns under its subquery alias.
+
+    A SubqueryScan introduces an alias - ``(SELECT ...) AS u`` or
+    ``(VALUES ...) AS v(a, b)`` - and outer references bind as ``u.col``. This
+    wrapper carries that alias and maps each output column to itself under it, so
+    a qualified reference resolves to a specific physical column rather than
+    falling back to a bare name. Inner relation aliases are intentionally hidden
+    (SQL scoping): only ``alias.col`` is visible above the subquery.
+    """
+
+    input: PhysicalPlanNode
+    alias: str
+
+    def children(self) -> List[PhysicalPlanNode]:
+        return [self.input]
+
+    def execute(self) -> Iterator[pa.RecordBatch]:
+        """Pass the input's batches through unchanged."""
+        yield from self.input.execute()
+
+    def schema(self) -> pa.Schema:
+        return self.input.schema()
+
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        """Expose every output column under the subquery alias."""
+        return _alias_column_map(self.alias, self.schema().names)
+
+    def estimated_cost(self) -> float:
+        return self.input.estimated_cost()
+
+    def __repr__(self) -> str:
+        return f"PhysicalAliasedRelation(alias={self.alias})"
 
 
 class PhysicalCTEMergeQuery(PhysicalPlanNode):
@@ -1953,6 +2010,10 @@ class PhysicalUnion(PhysicalPlanNode):
 
     def schema(self) -> pa.Schema:
         return self.inputs[0].schema()
+
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        """Expose the first branch's aliases; a union's output is its columns."""
+        return self.inputs[0].column_aliases()
 
     def estimated_cost(self) -> float:
         raise NotImplementedError("Cost estimation not yet implemented")

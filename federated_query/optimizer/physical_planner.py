@@ -48,6 +48,7 @@ from ..plan.physical import (
     PhysicalCTE,
     PhysicalCTEScan,
     PhysicalCTEMergeQuery,
+    PhysicalAliasedRelation,
 )
 from ..plan.expressions import (
     BinaryOp,
@@ -164,7 +165,9 @@ class PhysicalPlanner:
         if isinstance(node, Values):
             return PhysicalValues(rows=node.rows, output_names=node.output_names)
         if isinstance(node, SubqueryScan):
-            return self._plan_node(node.input)
+            return PhysicalAliasedRelation(
+                input=self._plan_node(node.input), alias=node.alias
+            )
         if isinstance(node, LateralJoin):
             return self._plan_lateral_join(node)
         return self._plan_guard_node(node)

@@ -12,6 +12,15 @@ from typing import Optional
 from sqlglot import exp
 
 
+class ColumnResolutionError(Exception):
+    """A qualified column reference does not resolve in the relation's alias map.
+
+    A bound, qualified reference that the producing relation does not expose is
+    an internal planning error. It is raised rather than silently resolved by
+    bare name, which could bind to a same-named column of another relation.
+    """
+
+
 class ColumnResolver(ABC):
     """Turns an engine ``ColumnRef`` (table, column) into a sqlglot node."""
 
@@ -55,9 +64,21 @@ class MergeResolver(ColumnResolver):
         self._aliases = aliases or {}
 
     def resolve(self, table: Optional[str], column: str) -> exp.Expression:
-        """Map the reference to its physical column name via the alias map."""
+        """Map the reference to its physical column name via the alias map.
+
+        An unqualified reference (no table) is emitted as the bare name - that is
+        the physical name an aggregate output / exposed column carries. A
+        QUALIFIED reference must be present in the alias map; if it is not, the
+        plan produced a reference the relation does not expose, so it raises
+        rather than dropping the qualifier and guessing by bare name.
+        """
         if column == "*":
             return exp.Star()
+        if table is not None and (table, column) not in self._aliases:
+            raise ColumnResolutionError(
+                f"Unresolved column reference {table}.{column}; "
+                f"relation exposes {sorted(self._aliases.keys())}"
+            )
         name = self._aliases.get((table, column), column)
         return exp.column(name, quoted=True)
 

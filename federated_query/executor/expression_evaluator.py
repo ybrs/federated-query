@@ -124,11 +124,23 @@ class ExpressionEvaluator:
         return None
 
     def _eval_column(self, expr: ColumnRef):
-        """Resolve a column reference against the batch by name."""
+        """Resolve a column reference against the batch via the alias map.
+
+        An unqualified reference (no table) reads the batch column of that name -
+        the physical name an aggregate output / exposed column carries. A
+        QUALIFIED reference must resolve through the alias map; if it does not,
+        the plan produced a reference the relation does not expose, which raises
+        rather than guessing by bare name (which could pick a same-named column
+        from another relation).
+        """
         if expr.table is not None:
             mapped = self.alias_map.get((expr.table, expr.column))
-            if mapped is not None:
-                return self.batch.column(mapped)
+            if mapped is None:
+                raise ExpressionEvaluationError(
+                    f"Unresolved column reference {expr.table}.{expr.column}; "
+                    f"relation exposes {sorted(self.alias_map.keys())}"
+                )
+            return self.batch.column(mapped)
         return self.batch.column(expr.column)
 
     def _eval_literal(self, expr: Literal):
