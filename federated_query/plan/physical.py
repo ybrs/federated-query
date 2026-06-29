@@ -67,6 +67,8 @@ _MERGE_AGG_RELATION = "in_agg"
 _MERGE_SORT_RELATION = "in_sort"
 # Name under which a window operator registers its single input with the merge engine.
 _MERGE_WINDOW_RELATION = "in_window"
+# Name under which a DISTINCT projection registers its projected input.
+_MERGE_DISTINCT_RELATION = "in_distinct"
 # Name under which a grouped-limit registers its single input, plus the synthetic
 # columns it adds: a row-order index (stable tiebreak so the merge path keeps the
 # same rows as the Python streaming path) and the per-key row number.
@@ -855,21 +857,19 @@ class PhysicalProjection(PhysicalPlanNode):
         yield from self._execute_distinct()
 
     def _execute_distinct(self) -> Iterator[pa.RecordBatch]:
-        """Project all input, then emit only distinct rows.
+        """Project all input, then emit only distinct rows via the merge engine.
 
-        Local DISTINCT used to be a no-op (the flag was decorative), so a
-        query executed locally returned duplicates; grouping by every output
-        column collapses them while preserving each column's type.
+        Deduplication runs as ``SELECT DISTINCT * `` in DuckDB - the one local
+        set/dedup engine that PhysicalUnion, PhysicalSort, and the aggregate
+        operators also use - instead of a separate pyarrow group-by path.
         """
-        batches = []
+        engine = _require_engine(self)
+        projected = []
         for batch in self.input.execute():
-            batches.append(self._project_batch(batch))
-        if len(batches) == 0:
-            return
-        table = pa.Table.from_batches(batches)
-        deduped = table.group_by(table.column_names).aggregate([])
-        for batch in deduped.select(table.column_names).to_batches():
-            yield batch
+            projected.append(self._project_batch(batch))
+        table = _table_from_batches(projected, self.schema())
+        sql = f"SELECT DISTINCT * FROM {_MERGE_DISTINCT_RELATION}"
+        yield from engine.run(sql, {_MERGE_DISTINCT_RELATION: table})
 
     def _project_batch(self, batch: pa.RecordBatch) -> pa.RecordBatch:
         """Project a single batch."""
