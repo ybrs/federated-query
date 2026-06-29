@@ -2952,8 +2952,15 @@ class _DatasourceQueryCollector:
     ) -> None:
         if node.datasource_connection is None:
             return
+        # node.query_ast is the emitter's canonical form (function calls are
+        # exp.Anonymous). For the EXPLAIN snapshot, normalize it through the
+        # source's own dialect and parser - as _record_scan does - so the
+        # displayed AST is the dialect's typed form (and SEMI/ANTI joins, which a
+        # Postgres render would rewrite to EXISTS, are preserved). Execution
+        # still renders node.query_ast directly; this is display-only.
         sql = node.query_ast.sql(dialect=node.datasource_connection.render_dialect)
+        display_ast = node.datasource_connection.parse_query(sql)
         snapshot = _DatasourceQuerySnapshot(
-            datasource_name=node.datasource, sql=sql, query_ast=node.query_ast
+            datasource_name=node.datasource, sql=sql, query_ast=display_ast
         )
         snapshots.append(snapshot)

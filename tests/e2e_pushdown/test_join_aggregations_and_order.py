@@ -3,6 +3,7 @@
 from sqlglot import exp
 
 from tests.e2e_pushdown.helpers import (
+    is_func,
     build_runtime,
     explain_datasource_query,
     explain_document,
@@ -29,7 +30,7 @@ def test_join_aggregation_group_by_pushdown(single_source_env):
     assert "region" in names
     projection = select_column_names(ast)
     assert projection == ["region", "total_cost"]
-    aggregates = find_in_select(ast, lambda node: isinstance(node, exp.Sum))
+    aggregates = find_in_select(ast, lambda node: is_func(node, "SUM"))
     assert len(aggregates) == 1
 
 
@@ -49,7 +50,7 @@ def test_join_aggregation_with_having(single_source_env):
     assert group_clause is not None
     projection = select_column_names(ast)
     assert projection == ["region", "total_cost"]
-    aggregates = find_in_select(ast, lambda node: isinstance(node, exp.Sum))
+    aggregates = find_in_select(ast, lambda node: is_func(node, "SUM"))
     assert len(aggregates) == 1
 
 

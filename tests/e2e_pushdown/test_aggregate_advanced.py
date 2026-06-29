@@ -5,6 +5,7 @@ import pytest
 from sqlglot import exp
 
 from tests.e2e_pushdown.helpers import (
+    is_func,
     build_runtime,
     explain_datasource_query,
     find_alias_expression,
@@ -30,7 +31,7 @@ def test_filter_clause_basic(single_source_env):
 
     count_expr = find_alias_expression(ast, "expensive_count")
     assert count_expr is not None
-    assert isinstance(count_expr, exp.Count)
+    assert is_func(count_expr, "COUNT")
 
     filter_clause = count_expr.args.get("filter")
     if filter_clause:
@@ -92,7 +93,7 @@ def test_aggregate_distinct_with_expression(single_source_env):
 
     count_expr = find_alias_expression(ast, "unique_totals")
     assert count_expr is not None
-    assert isinstance(count_expr, exp.Count)
+    assert is_func(count_expr, "COUNT")
     # sqlglot models COUNT(DISTINCT x) as Count(this=Distinct(expressions=[x])).
     distinct = count_expr.this
     assert isinstance(distinct, exp.Distinct)
@@ -118,7 +119,7 @@ def test_conditional_aggregation_sum_case(single_source_env):
 
     sum_expr = find_alias_expression(ast, "expensive_total")
     assert sum_expr is not None
-    assert isinstance(sum_expr, exp.Sum)
+    assert is_func(sum_expr, "SUM")
 
     case_arg = unwrap_parens(sum_expr.this)
     assert isinstance(case_arg, exp.Case)
@@ -190,7 +191,7 @@ def test_nested_aggregate_via_subquery(single_source_env):
 
     avg_expr = find_alias_expression(ast, "avg_region_total")
     assert avg_expr is not None
-    assert isinstance(avg_expr, exp.Avg)
+    assert is_func(avg_expr, "AVG")
 
     from_clause = ast.find(exp.From)
     assert from_clause is not None

@@ -41,6 +41,22 @@ def unwrap_parens(expression):
     return current
 
 
+def is_func(node, name: str) -> bool:
+    """Whether a node is a function call of ``name`` (case-insensitive).
+
+    The single SQL emitter lowers function calls to ``exp.Anonymous`` (verbatim
+    names) - the engine's canonical Postgres form, shared by every pushed query;
+    the dialect transpile boundary (to_source_sql) normalizes them to typed nodes
+    on execution. Tests therefore match by NAME, not by a specific sqlglot class.
+    """
+    target = name.upper()
+    if isinstance(node, exp.Anonymous):
+        return str(node.this).upper() == target
+    if isinstance(node, exp.Func):
+        return node.sql_name().upper() == target
+    return False
+
+
 def find_in_select(
     select_ast: exp.Select, predicate: Callable[[exp.Expression], bool]
 ) -> List[exp.Expression]:

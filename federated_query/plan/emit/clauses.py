@@ -136,6 +136,7 @@ def apply_distinct(select: exp.Select, distinct, distinct_on) -> exp.Select:
 def assemble_select(
     from_clause: exp.Expression,
     select_items,
+    joins=None,
     where=None,
     group=None,
     having=None,
@@ -147,13 +148,16 @@ def assemble_select(
 ) -> exp.Select:
     """Compose a SELECT from already-built AST pieces - the one skeleton builder.
 
-    Every part is a sqlglot node (or None): ``from_clause`` a table / subquery /
-    join chain, ``select_items`` aliased projection items, ``where``/``having``
-    predicate ASTs, ``group``/``order`` exp.Group / exp.Order. Both the remote
-    single-table scan and the same-source N-table subtree build their pieces and
-    assemble here, so the N=1 and N>1 cases of one query share one structure.
+    Every part is a sqlglot node (or None): ``from_clause`` the base relation,
+    ``joins`` its join chain (exp.Join nodes), ``select_items`` aliased projection
+    items, ``where``/``having`` predicate ASTs, ``group``/``order`` exp.Group /
+    exp.Order. Both the remote single-table scan (no joins) and the same-source
+    N-table subtree build their pieces and assemble here, so the N=1 and N>1
+    cases of one query share one structure.
     """
     select = exp.Select(expressions=list(select_items)).from_(from_clause)
+    if joins:
+        select.set("joins", list(joins))
     if where is not None:
         select.set("where", exp.Where(this=where))
     if group is not None:

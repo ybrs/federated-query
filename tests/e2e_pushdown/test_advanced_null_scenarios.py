@@ -3,6 +3,7 @@
 from sqlglot import exp
 
 from tests.e2e_pushdown.helpers import (
+    is_func,
     build_runtime,
     explain_datasource_query,
     find_alias_expression,
@@ -27,7 +28,7 @@ def test_coalesce_multiple_nulls(single_source_env):
 
     coalesce_expr = find_alias_expression(ast, "location")
     assert coalesce_expr is not None
-    assert isinstance(coalesce_expr, exp.Coalesce)
+    assert is_func(coalesce_expr, "COALESCE")
 
     # sqlglot stores the first COALESCE operand in ``this`` and the rest in
     # ``expressions``, so all three operands are ``this`` plus ``expressions``.
@@ -114,7 +115,7 @@ def test_complex_null_propagation(single_source_env):
     assert isinstance(left, exp.Mul)
 
     left_coalesce = unwrap_parens(left.left)
-    assert isinstance(left_coalesce, exp.Coalesce)
+    assert is_func(left_coalesce, "COALESCE")
 
     right_coalesce = unwrap_parens(left.right)
-    assert isinstance(right_coalesce, exp.Coalesce)
+    assert is_func(right_coalesce, "COALESCE")

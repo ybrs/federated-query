@@ -5,6 +5,7 @@ from sqlglot import exp
 
 from federated_query.parser.errors import UnsupportedSQLError
 from tests.e2e_pushdown.helpers import (
+    is_func,
     build_runtime,
     explain_datasource_query,
 )
@@ -44,7 +45,7 @@ def test_window_function_pushes_to_single_source(single_source_env):
     assert len(windows) == 1
     window = windows[0]
 
-    assert isinstance(window.this, exp.RowNumber)
+    assert is_func(window.this, "ROW_NUMBER")
 
     partition = window.args.get("partition_by")
     assert [column.name.lower() for column in partition] == ["customer_id"]

@@ -25,22 +25,49 @@ from ..plan.logical import (
     LateralJoin,
     SubqueryScan,
     SetOperation,
+    SetOpKind,
     CTE,
     CTERef,
     Values,
 )
+from sqlglot import exp
+
 from ..plan.expressions import ColumnRef, Expression
 from ..plan.physical import PhysicalRemoteQuery
 from ..plan.emit import clauses, CANONICAL_SOURCE_RESOLVER
+from ..plan.emit.expressions import expression_to_ast
 from ..plan.expressions import aggregate_output_map, split_where_having
 
-_JOIN_KEYWORDS = {
-    JoinType.INNER: "INNER JOIN",
-    JoinType.LEFT: "LEFT JOIN",
-    JoinType.RIGHT: "RIGHT JOIN",
-    JoinType.FULL: "FULL OUTER JOIN",
-    JoinType.SEMI: "SEMI JOIN",
-    JoinType.ANTI: "ANTI JOIN",
+
+def _source_ast(expr: Expression) -> exp.Expression:
+    """Lower an engine expression to its canonical Postgres-form sqlglot AST."""
+    return expression_to_ast(expr, CANONICAL_SOURCE_RESOLVER)
+
+
+def _combine_and(terms) -> Optional[exp.Expression]:
+    """AND a list of predicate ASTs into one expression, or None when empty."""
+    if not terms:
+        return None
+    return exp.and_(*terms)
+
+# Engine join type -> sqlglot exp.Join (kind, side), mirroring how sqlglot's own
+# parser represents each keyword so the rendered SQL is identical to the prior
+# parse-back. SEMI/ANTI render to WHERE [NOT] EXISTS in Postgres form, exactly as
+# the parsed "SEMI/ANTI JOIN" string did.
+_JOIN_KIND_SIDE = {
+    JoinType.INNER: ("INNER", None),
+    JoinType.LEFT: (None, "LEFT"),
+    JoinType.RIGHT: (None, "RIGHT"),
+    JoinType.FULL: ("OUTER", "FULL"),
+    JoinType.SEMI: ("SEMI", None),
+    JoinType.ANTI: ("ANTI", None),
+}
+
+# Engine set-operation kind -> sqlglot node; distinct=False renders ``... ALL``.
+_SET_OP_EXP = {
+    SetOpKind.UNION: exp.Union,
+    SetOpKind.INTERSECT: exp.Intersect,
+    SetOpKind.EXCEPT: exp.Except,
 }
 
 
@@ -61,14 +88,18 @@ class _PushContext:
 
     def __init__(self) -> None:
         self.datasource: Optional[str] = None
-        self.select_items: List[str] = []
+        # SELECT items, FROM relation, join chain, WHERE/HAVING predicates, and
+        # GROUP BY / ORDER BY are sqlglot AST nodes (built via the one emitter),
+        # assembled once by clauses.assemble_select - the same skeleton builder a
+        # single-table scan uses. No SQL string is hand-crafted or parsed back.
+        self.select_items: List[exp.Expression] = []
         self.output_names: List[str] = []
-        self.from_sql: Optional[str] = None
-        self.joins: List[str] = []
-        self.where_terms: List[str] = []
-        self.having_terms: List[str] = []
-        self.group_sql: Optional[str] = None
-        self.order_sql: Optional[str] = None
+        self.from_node: Optional[exp.Expression] = None
+        self.joins: List[exp.Join] = []
+        self.where_terms: List[exp.Expression] = []
+        self.having_terms: List[exp.Expression] = []
+        self.group_node: Optional[exp.Group] = None
+        self.order_node: Optional[exp.Order] = None
         self.limit: Optional[int] = None
         self.offset: int = 0
         self.distinct: bool = False
@@ -102,8 +133,8 @@ class _PushContext:
         # (the query body) is left to the planner's set-operation path.
         self.in_derived: bool = False
         # CTE definitions to emit as a leading WITH clause, in declaration
-        # order: each is (name, column_names, body_sql).
-        self.ctes: List[Tuple[str, Optional[List[str]], str]] = []
+        # order: each is (name, column_names, body_ast).
+        self.ctes: List[Tuple[str, Optional[List[str]], exp.Select]] = []
         # CTE names defined by an enclosing WITH (so a body or derived sub-render
         # can reference an earlier sibling, or itself when recursive) without
         # re-emitting their definitions here.
@@ -151,7 +182,7 @@ class SingleSourcePushdown:
         context.scan_names = scan_names
         if not self._absorb(node, context):
             return None
-        return self._render(context)
+        return self._render(context).sql(dialect="postgres")
 
     def _expand_star_select(self, context: _PushContext) -> bool:
         """Build a unique-aliased SELECT list from each scan's needed columns.
@@ -199,7 +230,9 @@ class SingleSourcePushdown:
             unique = self._unique_name(name, seen)
             seen.add(unique)
             context.output_names.append(unique)
-            context.select_items.append(f'"{alias}"."{name}" AS "{unique}"')
+            context.select_items.append(
+                clauses.aliased_item(exp.column(name, table=alias, quoted=True), unique)
+            )
             context.column_aliases[(alias, name)] = unique
 
     def _should_push(self, context: _PushContext) -> bool:
@@ -224,12 +257,10 @@ class SingleSourcePushdown:
             return None
         if not connection.supports_capability(DataSourceCapability.JOINS):
             return None
-        sql = self._render(context)
-        ast = connection.parse_query(sql)
         return PhysicalRemoteQuery(
             datasource=context.datasource,
             datasource_connection=connection,
-            query_ast=ast,
+            query_ast=self._render(context),
             output_names=context.output_names,
             column_alias_map=context.column_aliases,
         )
@@ -300,8 +331,12 @@ class SingleSourcePushdown:
         right_ref = self._render_relation(node.right, context)
         if right_ref is None:
             return False
-        keyword = _JOIN_KEYWORDS[node.join_type]
-        context.joins.append(f"{keyword} LATERAL {right_ref} ON TRUE")
+        kind, side = _JOIN_KIND_SIDE[node.join_type]
+        context.joins.append(
+            exp.Join(
+                this=exp.Lateral(this=right_ref), kind=kind, side=side, on=exp.true()
+            )
+        )
         context.has_join = True
         context.has_derived_columns = True
         return True
@@ -314,7 +349,9 @@ class SingleSourcePushdown:
 
     def _absorb_sort(self, sort: Sort, context: _PushContext) -> bool:
         """Record the ORDER BY clause, then descend."""
-        context.order_sql = self._render_order(sort)
+        context.order_node = clauses.order_by(
+            sort.sort_keys, sort.ascending, sort.nulls_order, CANONICAL_SOURCE_RESOLVER
+        )
         return self._absorb(sort.input, context)
 
     def _absorb_projection(self, projection: Projection, context: _PushContext) -> bool:
@@ -407,7 +444,9 @@ class SingleSourcePushdown:
         context.has_aggregate = True
         if not context.select_items:
             self._set_select(aggregate.aggregates, aggregate.output_names, context)
-        context.group_sql = self._render_group_by(aggregate)
+        context.group_node = clauses.group_by(
+            aggregate.group_by, aggregate.grouping_sets, CANONICAL_SOURCE_RESOLVER
+        )
         return self._absorb(aggregate.input, context)
 
     def _absorb_filter(self, filter_node: Filter, context: _PushContext) -> bool:
@@ -422,7 +461,7 @@ class SingleSourcePushdown:
         """
         if isinstance(filter_node.input, Aggregate):
             return False
-        context.where_terms.append(filter_node.predicate.to_sql())
+        context.where_terms.append(_source_ast(filter_node.predicate))
         return self._absorb(filter_node.input, context)
 
     def _absorb_from(self, node: LogicalPlanNode, context: _PushContext) -> bool:
@@ -449,7 +488,7 @@ class SingleSourcePushdown:
         """
         if not self._cte_defined(node.name, context):
             return False
-        context.from_sql = self._cte_ref_sql(node)
+        context.from_node = self._cte_ref_sql(node)
         return True
 
     def _cte_defined(self, name: str, context: _PushContext) -> bool:
@@ -468,11 +507,14 @@ class SingleSourcePushdown:
             names.append(cte_name)
         return names
 
-    def _cte_ref_sql(self, node: CTERef) -> str:
-        """Render a CTE reference as its name, keeping a distinct alias."""
+    def _cte_ref_sql(self, node: CTERef) -> exp.Table:
+        """Build a CTE reference (its bare name), keeping a distinct alias."""
+        table = exp.Table(this=exp.to_identifier(node.name))
         if node.alias and node.alias != node.name:
-            return f'{node.name} AS "{node.alias}"'
-        return node.name
+            table.set(
+                "alias", exp.TableAlias(this=exp.to_identifier(node.alias, quoted=True))
+            )
+        return table
 
     def _absorb_set_operation_base(
         self, node: SetOperation, context: _PushContext
@@ -488,30 +530,33 @@ class SingleSourcePushdown:
         rendered = self._render_set_operation(node, context)
         if rendered is None:
             return False
-        context.from_sql = rendered
+        context.from_node = rendered
         context.has_subquery_relation = True
         return True
 
     def _render_set_operation(
         self, node: SetOperation, context: _PushContext
-    ) -> Optional[str]:
-        """Render a set operation as a derived relation combining its branches."""
-        left_sql = self._render_branch(node.left, context)
-        right_sql = self._render_branch(node.right, context)
-        if left_sql is None or right_sql is None:
+    ) -> Optional[exp.Subquery]:
+        """Build a set operation as an aliased derived relation of its branches."""
+        left = self._render_branch(node.left, context)
+        right = self._render_branch(node.right, context)
+        if left is None or right is None:
             return None
-        keyword = self._set_op_keyword(node)
         alias = self._derived_alias(context)
-        return f'({left_sql} {keyword} {right_sql}) AS "{alias}"'
+        return self._derived_table(self._set_op_ast(node, left, right), alias)
 
-    def _set_op_keyword(self, node: SetOperation) -> str:
-        """The SQL keyword for a set operation: DISTINCT by default, else ALL."""
-        return node.kind.name if node.distinct else f"{node.kind.name} ALL"
+    def _set_op_ast(
+        self, node: SetOperation, left: exp.Expression, right: exp.Expression
+    ) -> exp.Expression:
+        """Build a UNION/INTERSECT/EXCEPT AST; ``distinct`` False renders ALL."""
+        return _SET_OP_EXP[node.kind](
+            this=left, expression=right, distinct=node.distinct
+        )
 
     def _render_branch(
         self, node: LogicalPlanNode, context: _PushContext
-    ) -> Optional[str]:
-        """Render one set-operation branch as a standalone SELECT, same source."""
+    ) -> Optional[exp.Expression]:
+        """Build one set-operation branch as a standalone SELECT, same source."""
         if isinstance(node, Values):
             return self._render_values_branch(node)
         inner = _PushContext()
@@ -541,8 +586,8 @@ class SingleSourcePushdown:
         context.datasource = inner.datasource
         return True
 
-    def _render_values_branch(self, node: Values) -> Optional[str]:
-        """Render a single constant row as a FROM-less ``SELECT`` branch.
+    def _render_values_branch(self, node: Values) -> Optional[exp.Select]:
+        """Build a single constant row as a FROM-less ``SELECT`` branch.
 
         Used for the base case of a recursive CTE (``SELECT 1``); a trailing
         alias is added only when it differs from the rendered expression.
@@ -551,14 +596,16 @@ class SingleSourcePushdown:
             return None
         items = []
         for expr, name in zip(node.rows[0], node.output_names):
-            sql = expr.to_sql()
-            if name and name != sql:
-                sql = f'{sql} AS "{name}"'
-            items.append(sql)
-        return "SELECT " + ", ".join(items)
+            ast = _source_ast(expr)
+            if name and name != expr.to_sql():
+                ast = clauses.aliased_item(ast, name)
+            items.append(ast)
+        return exp.Select(expressions=items)
 
-    def _render_cte_body(self, node: CTE, context: _PushContext) -> Optional[str]:
-        """Render a CTE's body as the bare SQL inside ``name AS (<sql>)``."""
+    def _render_cte_body(
+        self, node: CTE, context: _PushContext
+    ) -> Optional[exp.Expression]:
+        """Build a CTE's body (the SELECT / set operation inside ``name AS (...)``)."""
         body = node.cte_plan
         if isinstance(body, SetOperation):
             return self._render_cte_set_body(body, context)
@@ -566,14 +613,13 @@ class SingleSourcePushdown:
 
     def _render_cte_set_body(
         self, node: SetOperation, context: _PushContext
-    ) -> Optional[str]:
-        """Render a set-operation CTE body unwrapped (no derived-table alias)."""
-        left_sql = self._render_branch(node.left, context)
-        right_sql = self._render_branch(node.right, context)
-        if left_sql is None or right_sql is None:
+    ) -> Optional[exp.Expression]:
+        """Build a set-operation CTE body (unwrapped, no derived-table alias)."""
+        left = self._render_branch(node.left, context)
+        right = self._render_branch(node.right, context)
+        if left is None or right is None:
             return None
-        keyword = self._set_op_keyword(node)
-        return f"{left_sql} {keyword} {right_sql}"
+        return self._set_op_ast(node, left, right)
 
     def _absorb_subquery_scan_base(
         self, node: SubqueryScan, context: _PushContext
@@ -582,7 +628,7 @@ class SingleSourcePushdown:
         rendered = self._render_subquery_scan(node, context)
         if rendered is None:
             return False
-        context.from_sql = rendered
+        context.from_node = rendered
         context.has_subquery_relation = True
         return True
 
@@ -592,7 +638,7 @@ class SingleSourcePushdown:
             return self._absorb_aggregate_scan(scan, context)
         if not self._claim_scan(scan, context):
             return False
-        context.from_sql = self._scan_ref(scan, context)
+        context.from_node = self._scan_ref(scan, context)
         self._absorb_scan_modifiers(scan, context)
         return True
 
@@ -610,8 +656,13 @@ class SingleSourcePushdown:
 
     def _adopt_scan_order(self, scan: Scan, context: _PushContext) -> None:
         """Adopt a scan's folded ORDER BY unless a Sort node already set one."""
-        if scan.order_by_keys and context.order_sql is None:
-            context.order_sql = self._scan_order_sql(scan)
+        if scan.order_by_keys and context.order_node is None:
+            context.order_node = clauses.order_by(
+                scan.order_by_keys,
+                scan.order_by_ascending,
+                scan.order_by_nulls,
+                CANONICAL_SOURCE_RESOLVER,
+            )
 
     def _adopt_scan_limit(self, scan: Scan, context: _PushContext) -> None:
         """Adopt a scan's folded LIMIT unless a Limit node already set one."""
@@ -641,8 +692,10 @@ class SingleSourcePushdown:
         if not context.select_items:
             self._set_select(scan.aggregates, scan.output_names, context)
         self._split_scan_filter(scan, context)
-        context.group_sql = self._render_group_by(scan)
-        context.from_sql = self._scan_ref(scan, context)
+        context.group_node = clauses.group_by(
+            scan.group_by, scan.grouping_sets, CANONICAL_SOURCE_RESOLVER
+        )
+        context.from_node = self._scan_ref(scan, context)
         context.has_aggregate = True
         return True
 
@@ -657,9 +710,9 @@ class SingleSourcePushdown:
         output_map = aggregate_output_map(scan.output_names, scan.aggregates)
         where_pred, having_pred = split_where_having(scan.filters, output_map)
         if where_pred is not None:
-            context.where_terms.append(where_pred.to_sql())
+            context.where_terms.append(_source_ast(where_pred))
         if having_pred is not None:
-            context.having_terms.append(having_pred.to_sql())
+            context.having_terms.append(_source_ast(having_pred))
 
     def _absorb_join(self, join: Join, context: _PushContext) -> bool:
         """Add one join to a left-deep tree, rendering its right relation.
@@ -670,8 +723,7 @@ class SingleSourcePushdown:
         reference, a projected sub-relation becomes a derived table. No subquery
         expression is ever re-created.
         """
-        keyword = _JOIN_KEYWORDS.get(join.join_type)
-        if keyword is None or not self._join_is_pushable(join):
+        if join.join_type not in _JOIN_KIND_SIDE or not self._join_is_pushable(join):
             return False
         if not self._absorb_from(join.left, context):
             return False
@@ -680,7 +732,7 @@ class SingleSourcePushdown:
             return False
         if self._contributes_columns(join):
             context.has_derived_columns = True
-        context.joins.append(self._render_join_clause(join, keyword, right_ref))
+        context.joins.append(self._render_join_clause(join, right_ref))
         context.has_join = True
         return True
 
@@ -707,12 +759,12 @@ class SingleSourcePushdown:
 
     def _render_relation(
         self, node: LogicalPlanNode, context: _PushContext
-    ) -> Optional[str]:
-        """Render a join's right side as a FROM/JOIN relation reference.
+    ) -> Optional[exp.Expression]:
+        """Build a join's right side as a FROM/JOIN relation AST.
 
-        A base scan renders as its table reference; anything projected (the
-        decorrelated key/value relation, or a user derived table) renders as a
-        parenthesized derived table with a fresh alias.
+        A base scan builds its table reference; anything projected (the
+        decorrelated key/value relation, or a user derived table) builds a
+        subquery (derived table) with a fresh alias.
         """
         if isinstance(node, SubqueryScan):
             return self._render_subquery_scan(node, context)
@@ -728,8 +780,8 @@ class SingleSourcePushdown:
 
     def _render_subquery_scan(
         self, node: SubqueryScan, context: _PushContext
-    ) -> Optional[str]:
-        """Render a derived table ``(SELECT ...) AS alias`` keeping its own alias.
+    ) -> Optional[exp.Subquery]:
+        """Build a derived table ``(SELECT ...) AS alias`` keeping its own alias.
 
         Unlike a synthetic decorrelation relation, a ``SubqueryScan`` carries a
         user-visible alias that outer columns reference (``o.amount``), so the
@@ -745,12 +797,12 @@ class SingleSourcePushdown:
             return None
         if context.datasource is None:
             context.datasource = inner.datasource
-        return f'({self._render(inner)}) AS "{node.alias}"'
+        return self._derived_table(self._render(inner), node.alias)
 
     def _render_derived(
         self, node: LogicalPlanNode, context: _PushContext
-    ) -> Optional[str]:
-        """Render a projected sub-relation as ``(SELECT ...) AS alias``.
+    ) -> Optional[exp.Subquery]:
+        """Build a projected sub-relation as ``(SELECT ...) AS alias``.
 
         The sub-relation is rendered by an independent push context, so it
         carries its own SELECT/WHERE/GROUP BY; it must resolve to the same data
@@ -768,8 +820,14 @@ class SingleSourcePushdown:
             return None
         if context.datasource is None:
             context.datasource = inner.datasource
-        alias = self._derived_alias(context)
-        return f'({self._render(inner)}) AS "{alias}"'
+        return self._derived_table(self._render(inner), self._derived_alias(context))
+
+    def _derived_table(self, body: exp.Select, alias: str) -> exp.Subquery:
+        """Wrap a sub-SELECT as an aliased derived table ``(<body>) AS alias``."""
+        return exp.Subquery(
+            this=body,
+            alias=exp.TableAlias(this=exp.to_identifier(alias, quoted=True)),
+        )
 
     def _derived_alias(self, context: _PushContext) -> str:
         """Return a unique relation alias for the next derived table."""
@@ -777,16 +835,21 @@ class SingleSourcePushdown:
         context.derived_count += 1
         return alias
 
-    def _render_join_clause(self, join: Join, keyword: str, right_ref: str) -> str:
-        """Render one join clause using ON, USING, or NATURAL syntax."""
+    def _render_join_clause(
+        self, join: Join, right_ref: exp.Expression
+    ) -> exp.Join:
+        """Build one join clause AST using ON, USING, or NATURAL."""
+        kind, side = _JOIN_KIND_SIDE[join.join_type]
         if join.natural:
-            return f"NATURAL {keyword} {right_ref}"
+            return exp.Join(this=right_ref, kind=kind, side=side, method="NATURAL")
         if join.using is not None:
-            quoted = []
+            using = []
             for column in join.using:
-                quoted.append(f'"{column}"')
-            return f"{keyword} {right_ref} USING ({', '.join(quoted)})"
-        return f"{keyword} {right_ref} ON {join.condition.to_sql()}"
+                using.append(exp.to_identifier(column, quoted=True))
+            return exp.Join(this=right_ref, kind=kind, side=side, using=using)
+        return exp.Join(
+            this=right_ref, kind=kind, side=side, on=_source_ast(join.condition)
+        )
 
     def _claim_scan(self, scan: Scan, context: _PushContext) -> bool:
         """Confirm a plain (non-aggregate) scan shares the data source."""
@@ -800,7 +863,7 @@ class SingleSourcePushdown:
     def _claim_scan_filters(self, scan: Scan, context: _PushContext) -> None:
         """Collect a plain scan's filters as WHERE terms."""
         if scan.filters is not None:
-            context.where_terms.append(scan.filters.to_sql())
+            context.where_terms.append(_source_ast(scan.filters))
 
     def _claim_source(self, scan: Scan, context: _PushContext) -> bool:
         """Bind the scan's data source; reject a cross-source scan when pushing.
@@ -833,7 +896,7 @@ class SingleSourcePushdown:
         (qualifier, column) -> unique name entry for qualified resolution.
         """
         seen: set = set()
-        items: List[str] = []
+        items: List[exp.Expression] = []
         output_names: List[str] = []
         for index in range(len(expressions)):
             expression = expressions[index]
@@ -841,7 +904,7 @@ class SingleSourcePushdown:
             unique = self._unique_name(base, seen)
             seen.add(unique)
             output_names.append(unique)
-            items.append(f'{expression.to_sql()} AS "{unique}"')
+            items.append(clauses.aliased_item(_source_ast(expression), unique))
             self._record_alias(expression, unique, context)
         context.select_items = items
         context.output_names = output_names
@@ -866,129 +929,82 @@ class SingleSourcePushdown:
         if isinstance(expression, ColumnRef):
             context.column_aliases[(expression.table, expression.column)] = unique
 
-    def _scan_ref(self, scan: Scan, context: _PushContext) -> str:
-        """Render a table reference with its alias for the FROM clause.
+    def _scan_ref(self, scan: Scan, context: _PushContext) -> exp.Table:
+        """Build the FROM table reference (with alias) for a base scan.
 
         When the context carries a scan-name map (cross-source LATERAL rendering
-        for the merge engine), a base scan renders as its registered relation
-        name instead of ``"schema"."table"``.
+        for the merge engine), a base scan references its registered Arrow
+        relation name instead of ``"schema"."table"``.
         """
+        from ..plan.physical import _parse_table_sample
+
         registered = None
         if context.scan_names is not None:
             registered = context.scan_names.get(id(scan))
-        reference = registered or f'"{scan.schema_name}"."{scan.table_name}"'
+        if registered is not None:
+            table = exp.Table(this=exp.to_identifier(registered, quoted=True))
+        else:
+            table = exp.Table(
+                this=exp.to_identifier(scan.table_name, quoted=True),
+                db=exp.to_identifier(scan.schema_name, quoted=True),
+            )
         alias = scan.alias if scan.alias else scan.table_name
-        ref = f'{reference} AS "{alias}"'
+        table.set("alias", exp.TableAlias(this=exp.to_identifier(alias, quoted=True)))
         if registered is None and scan.sample:
-            ref = f"{ref} {scan.sample}"
-        return ref
+            table.set("sample", _parse_table_sample(scan.sample))
+        return table
 
-    def _render_order(self, sort: Sort) -> str:
-        """Render a Sort node's ORDER BY items with direction and NULLS."""
-        return self._render_order_keys(sort.sort_keys, sort.ascending, sort.nulls_order)
+    def _render(self, context: _PushContext) -> exp.Select:
+        """Assemble the remote SELECT AST via the one shared skeleton builder.
 
-    def _scan_order_sql(self, scan: Scan) -> str:
-        """Render an ORDER BY the optimizer folded onto a scan."""
-        return self._render_order_keys(
-            scan.order_by_keys, scan.order_by_ascending, scan.order_by_nulls
-        )
-
-    def _render_order_keys(self, keys, ascending, nulls) -> str:
-        """Render ORDER BY items via the shared clause builder, as a SQL fragment.
-
-        Direction (DESC) and NULLS placement come from the single
-        ``emit.clauses.order_by`` implementation, then each key is rendered to a
-        canonical Postgres fragment for the assembled query.
+        The same ``clauses.assemble_select`` a single-table scan uses; this is
+        only the N>1 case (a join / derived / CTE / set-op subtree). Every piece
+        in the context is already a sqlglot node, so no SQL string is built or
+        parsed back.
         """
-        return clauses.order_by_fragment(
-            keys, ascending, nulls, CANONICAL_SOURCE_RESOLVER
+        select = clauses.assemble_select(
+            context.from_node,
+            context.select_items if context.select_items else [exp.Star()],
+            joins=context.joins,
+            where=_combine_and(context.where_terms),
+            group=context.group_node,
+            having=_combine_and(context.having_terms),
+            distinct=context.distinct,
+            distinct_on=self._distinct_on_asts(context),
+            order=context.order_node,
+            limit=context.limit,
+            offset=context.offset,
         )
+        return self._with_node(select, context)
 
-    def _render_group_by(self, aggregate: Aggregate) -> Optional[str]:
-        """Render the GROUP BY clause via the shared clause builder, or None.
+    def _distinct_on_asts(self, context: _PushContext):
+        """The DISTINCT ON key ASTs, or None when there is no DISTINCT ON."""
+        if context.distinct_on is None:
+            return None
+        keys = []
+        for key in context.distinct_on:
+            keys.append(_source_ast(key))
+        return keys
 
-        ROLLUP/CUBE/GROUPING SETS render as GROUPING SETS (from the one
-        ``emit.clauses.group_by`` implementation) so the source produces the
-        super-aggregate rows; a flat group_by would drop them.
-        """
-        return clauses.group_by_fragment(
-            aggregate.group_by, aggregate.grouping_sets, CANONICAL_SOURCE_RESOLVER
-        )
-
-    def _distinct_keyword(self, context: _PushContext) -> str:
-        """Render SELECT, SELECT DISTINCT, or SELECT DISTINCT ON (keys)."""
-        if context.distinct_on is not None:
-            keys = []
-            for key in context.distinct_on:
-                keys.append(key.to_sql())
-            return f"SELECT DISTINCT ON ({', '.join(keys)})"
-        if context.distinct:
-            return "SELECT DISTINCT"
-        return "SELECT"
-
-    def _render(self, context: _PushContext) -> str:
-        """Assemble the full remote SELECT statement from the context."""
-        select_kw = self._distinct_keyword(context)
-        select_list = ", ".join(context.select_items) if context.select_items else "*"
-        from_sql = self._from_clause(context)
-        query = f"{select_kw} {select_list} FROM {from_sql}"
-        query = self._append_where(query, context)
-        query = self._append_group_by(query, context)
-        query = self._append_having(query, context)
-        query = self._append_order_limit(query, context)
-        return self._prepend_with(query, context)
-
-    def _prepend_with(self, body: str, context: _PushContext) -> str:
-        """Prepend a leading WITH clause built from collected CTE definitions."""
+    def _with_node(self, select: exp.Select, context: _PushContext) -> exp.Select:
+        """Attach a leading WITH clause from the collected CTE definitions."""
         if not context.ctes:
-            return body
-        keyword = "WITH RECURSIVE" if context.has_recursive_cte else "WITH"
-        definitions = self._cte_definitions_sql(context.ctes)
-        return f"{keyword} {definitions} {body}"
+            return select
+        cte_nodes = []
+        for name, columns, body in context.ctes:
+            cte_nodes.append(self._cte_node(name, columns, body))
+        select.set(
+            "with_",
+            exp.With(expressions=cte_nodes, recursive=context.has_recursive_cte),
+        )
+        return select
 
-    def _cte_definitions_sql(self, ctes) -> str:
-        """Render the comma-separated ``name [(cols)] AS (<sql>)`` definitions."""
-        parts = []
-        for name, columns, body_sql in ctes:
-            header = name
-            if columns:
-                header = f"{name}({', '.join(columns)})"
-            parts.append(f"{header} AS ({body_sql})")
-        return ", ".join(parts)
-
-    def _from_clause(self, context: _PushContext) -> str:
-        """Join the base source and its join chain into a FROM clause."""
-        parts = [context.from_sql or ""]
-        for join_sql in context.joins:
-            parts.append(join_sql)
-        return " ".join(parts)
-
-    def _append_where(self, query: str, context: _PushContext) -> str:
-        """Append a combined top-level WHERE from collected scan filters."""
-        if not context.where_terms:
-            return query
-        predicate = " AND ".join(context.where_terms)
-        return f"{query} WHERE {predicate}"
-
-    def _append_group_by(self, query: str, context: _PushContext) -> str:
-        """Append the GROUP BY clause when present."""
-        if context.group_sql:
-            query = f"{query} GROUP BY {context.group_sql}"
-        return query
-
-    def _append_having(self, query: str, context: _PushContext) -> str:
-        """Append the HAVING clause from collected post-aggregate terms."""
-        if not context.having_terms:
-            return query
-        predicate = " AND ".join(context.having_terms)
-        return f"{query} HAVING {predicate}"
-
-    def _append_order_limit(self, query: str, context: _PushContext) -> str:
-        """Append ORDER BY, LIMIT, and OFFSET clauses when present."""
-        if context.order_sql:
-            query = f"{query} ORDER BY {context.order_sql}"
-        if context.limit is not None:
-            query = f"{query} LIMIT {context.limit}"
-        if context.offset:
-            query = f"{query} OFFSET {context.offset}"
-        return query
+    def _cte_node(self, name, columns, body: exp.Expression) -> exp.CTE:
+        """Build one ``name [(cols)] AS (<body>)`` CTE definition."""
+        alias = exp.TableAlias(this=exp.to_identifier(name))
+        if columns:
+            cols = []
+            for column in columns:
+                cols.append(exp.to_identifier(column))
+            alias.set("columns", cols)
+        return exp.CTE(this=body, alias=alias)

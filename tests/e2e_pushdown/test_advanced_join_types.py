@@ -5,6 +5,7 @@ from sqlglot import exp
 
 from federated_query.parser.errors import UnsupportedSQLError
 from tests.e2e_pushdown.helpers import (
+    is_func,
     build_runtime,
     explain_datasource_query,
     join_table_names,
@@ -367,8 +368,8 @@ def test_join_on_string_expressions(single_source_env):
 
     left_expr = unwrap_parens(condition.left)
     right_expr = unwrap_parens(condition.right)
-    assert isinstance(left_expr, exp.Upper)
-    assert isinstance(right_expr, exp.Upper)
+    assert is_func(left_expr, "UPPER")
+    assert is_func(right_expr, "UPPER")
 
 
 def test_three_way_join_with_full_outer(single_source_env):
@@ -408,7 +409,7 @@ def test_join_with_coalesce_in_condition(single_source_env):
     assert isinstance(condition, exp.EQ)
 
     left_expr = unwrap_parens(condition.left)
-    assert isinstance(left_expr, exp.Coalesce)
+    assert is_func(left_expr, "COALESCE")
 
 
 def test_join_with_case_in_condition(single_source_env):

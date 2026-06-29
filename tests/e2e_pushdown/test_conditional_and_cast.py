@@ -3,6 +3,7 @@
 from sqlglot import exp
 
 from tests.e2e_pushdown.helpers import (
+    is_func,
     build_runtime,
     explain_datasource_query,
     find_alias_expression,
@@ -97,7 +98,7 @@ def test_coalesce_in_where(single_source_env):
     assert isinstance(predicate, exp.EQ)
 
     left = unwrap_parens(predicate.left)
-    assert isinstance(left, exp.Coalesce)
+    assert is_func(left, "COALESCE")
     # sqlglot keeps the first COALESCE argument in `this` and the remaining
     # arguments in `expressions`, so a two-argument COALESCE has exactly one
     # trailing expression.
