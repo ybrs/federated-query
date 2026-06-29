@@ -430,13 +430,15 @@ renders it once with `ast.sql(dialect=...)` (`plan/emit/__init__.py`).
 - The SELECT skeleton (FROM / SELECT / WHERE / GROUP / HAVING / DISTINCT / ORDER
   / LIMIT) is composed in ONE place: `clauses.assemble_select` (`:136`). A remote
   query is one SELECT over N relations; a single-table scan is the N=1 case and a
-  same-source join/CTE/set-op subtree is the N>1 case, so both build their FROM
-  and clause pieces and assemble through the same function. `PhysicalScan._build_ast`
-  (`plan/physical.py:728`) already composes through it. (`SingleSourcePushdown`
-  still builds its larger N>1 skeleton as a string and parses it back in
-  `_finish`; converging it onto `assemble_select` so the whole remote path is
-  AST-first is in-progress cleanup, not two different designs - the expression
-  conversion and the transpile boundary are already shared.)
+  same-source join/CTE/set-op subtree is the N>1 case, so both build their FROM,
+  join, and clause pieces and assemble through the same function.
+  `PhysicalScan._build_ast` (`plan/physical.py:728`) composes through it, and so
+  does `SingleSourcePushdown` (`optimizer/single_source_pushdown.py:_render`):
+  the whole remote path is AST-first. `SingleSourcePushdown` builds its FROM as
+  an exp.Table / exp.Subquery, its joins as exp.Join (SEMI/ANTI/LATERAL/NATURAL),
+  set operations as exp.Union/Intersect/Except, and CTEs as exp.With - no SQL
+  string is hand-crafted and `_finish` stores the built AST directly (no
+  parse-back). Execution renders that AST through `to_source_sql`.
 - `FedQPostgres` (`parser/dialect.py:16`) is the canonical internal dialect: a
   Postgres dialect that parses EXPLAIN into a native `exp.Describe` so the inner
   statement is never re-scanned from text. All plans render to Postgres form
