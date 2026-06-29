@@ -1632,16 +1632,23 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         return sql
 
     def _aggregate_select_list(self, aliases) -> str:
-        """Alias each SELECT expression to its output name."""
+        """Alias each SELECT expression to its output name.
+
+        Uses the shared alias-and-join skeleton (clauses.aliased_select_fragment);
+        only the per-expression renderer differs - an aggregate call renders
+        verbatim (WITHIN GROUP / DISTINCT / COUNT(*)) where the generic emitter
+        would not.
+        """
         if len(self.aggregates) != len(self.output_names):
             raise ValueError(
                 f"aggregates ({len(self.aggregates)}) and output_names "
                 f"({len(self.output_names)}) length mismatch"
             )
-        parts = []
-        for expr, name in zip(self.aggregates, self.output_names):
-            parts.append(f'{self._render_agg_expr(expr, aliases)} AS "{name}"')
-        return ", ".join(parts)
+        return clauses.aliased_select_fragment(
+            self.aggregates,
+            self.output_names,
+            lambda expr: self._render_agg_expr(expr, aliases),
+        )
 
     def _aggregate_group_list(self, aliases) -> str:
         """Render GROUP BY keys / GROUPING SETS via the shared clause builder."""

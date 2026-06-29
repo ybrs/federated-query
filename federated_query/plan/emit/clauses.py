@@ -27,16 +27,34 @@ def select_expressions(exprs, names, resolver) -> list:
     return items
 
 
+def aliased_select_fragment(exprs, names, render_one) -> str:
+    """Render each expression to ``<sql> AS "name"`` and join with ', '.
+
+    The render-and-join skeleton every SELECT-list builder repeats, with the one
+    genuine difference - how a single expression renders to SQL - supplied by
+    ``render_one(expr) -> str``. An expression with no parallel name is emitted
+    without an alias.
+    """
+    parts = []
+    for index, expr in enumerate(exprs):
+        fragment = render_one(expr)
+        name = names[index] if names and index < len(names) else None
+        if name:
+            fragment = f'{fragment} AS "{name}"'
+        parts.append(fragment)
+    return ", ".join(parts)
+
+
 def select_expressions_fragment(exprs, names, resolver, dialect="postgres") -> str:
     """Render aliased SELECT items to a comma-separated SQL fragment.
 
-    The same build-items-then-render-and-join the merge operators repeat; they
-    differ only in the resolver and dialect, like order_by_fragment.
+    The expression renderer is the one emitter (expression_to_ast) for the given
+    resolver and dialect; the alias-and-join skeleton is aliased_select_fragment,
+    shared with the aggregate SELECT list.
     """
-    parts = []
-    for item in select_expressions(exprs, names, resolver):
-        parts.append(item.sql(dialect=dialect))
-    return ", ".join(parts)
+    return aliased_select_fragment(
+        exprs, names, lambda expr: expression_to_ast(expr, resolver).sql(dialect=dialect)
+    )
 
 
 def order_by(keys, ascending, nulls, resolver):
