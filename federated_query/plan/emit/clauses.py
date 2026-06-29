@@ -118,3 +118,49 @@ def apply_limit_offset(select: exp.Select, limit, offset) -> exp.Select:
     if offset:
         select = select.offset(offset)
     return select
+
+
+def apply_distinct(select: exp.Select, distinct, distinct_on) -> exp.Select:
+    """Attach DISTINCT or DISTINCT ON (keys) to a SELECT.
+
+    ``distinct_on`` is a list of already-built key ASTs; a bare ``distinct``
+    flag is a plain DISTINCT. DISTINCT ON wins when both are set.
+    """
+    if distinct_on:
+        select.set("distinct", exp.Distinct(on=exp.Tuple(expressions=list(distinct_on))))
+    elif distinct:
+        select.set("distinct", exp.Distinct())
+    return select
+
+
+def assemble_select(
+    from_clause: exp.Expression,
+    select_items,
+    where=None,
+    group=None,
+    having=None,
+    distinct=False,
+    distinct_on=None,
+    order=None,
+    limit=None,
+    offset=0,
+) -> exp.Select:
+    """Compose a SELECT from already-built AST pieces - the one skeleton builder.
+
+    Every part is a sqlglot node (or None): ``from_clause`` a table / subquery /
+    join chain, ``select_items`` aliased projection items, ``where``/``having``
+    predicate ASTs, ``group``/``order`` exp.Group / exp.Order. Both the remote
+    single-table scan and the same-source N-table subtree build their pieces and
+    assemble here, so the N=1 and N>1 cases of one query share one structure.
+    """
+    select = exp.Select(expressions=list(select_items)).from_(from_clause)
+    if where is not None:
+        select.set("where", exp.Where(this=where))
+    if group is not None:
+        select.set("group", group)
+    if having is not None:
+        select.set("having", exp.Having(this=having))
+    select = apply_distinct(select, distinct, distinct_on)
+    if order is not None:
+        select.set("order", order)
+    return apply_limit_offset(select, limit, offset)

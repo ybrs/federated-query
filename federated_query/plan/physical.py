@@ -726,39 +726,31 @@ class PhysicalScan(PhysicalPlanNode):
         return self._build_ast().sql(dialect="postgres")
 
     def _build_ast(self) -> exp.Select:
-        """Build the sqlglot SELECT for this scan."""
-        select = exp.Select(expressions=self._select_items()).from_(self._table_ref())
-        select = self._apply_filter_clauses(select)
-        select = self._apply_order(select)
-        if self.distinct:
-            select.set("distinct", exp.Distinct())
-        return clauses.apply_limit_offset(select, self.limit, self.offset)
+        """Build the sqlglot SELECT for this scan via the shared assembler.
 
-    def _apply_filter_clauses(self, select: exp.Select) -> exp.Select:
-        """Attach WHERE, GROUP BY, and HAVING from the (folded) scan filter."""
+        A scan is the N=1 case of a same-source query, so it composes the same
+        skeleton (clauses.assemble_select) that the N-table single-source
+        pushdown builder uses; only the FROM clause (one table) differs.
+        """
         where_pred, having_pred = self._split_where_having()
-        if where_pred is not None:
-            select.set("where", exp.Where(this=_source_ast(where_pred)))
-        group = clauses.group_by(
-            self.group_by, self.grouping_sets, CANONICAL_SOURCE_RESOLVER
+        return clauses.assemble_select(
+            self._table_ref(),
+            self._select_items(),
+            where=_source_ast(where_pred) if where_pred is not None else None,
+            group=clauses.group_by(
+                self.group_by, self.grouping_sets, CANONICAL_SOURCE_RESOLVER
+            ),
+            having=_source_ast(having_pred) if having_pred is not None else None,
+            distinct=self.distinct,
+            order=clauses.order_by(
+                self.order_by_keys,
+                self.order_by_ascending,
+                self.order_by_nulls,
+                CANONICAL_SOURCE_RESOLVER,
+            ),
+            limit=self.limit,
+            offset=self.offset,
         )
-        if group is not None:
-            select.set("group", group)
-        if having_pred is not None:
-            select.set("having", exp.Having(this=_source_ast(having_pred)))
-        return select
-
-    def _apply_order(self, select: exp.Select) -> exp.Select:
-        """Attach ORDER BY when the scan carries sort keys."""
-        order = clauses.order_by(
-            self.order_by_keys,
-            self.order_by_ascending,
-            self.order_by_nulls,
-            CANONICAL_SOURCE_RESOLVER,
-        )
-        if order is not None:
-            select.set("order", order)
-        return select
 
     def _split_where_having(self):
         """Partition the scan filter into (WHERE, HAVING) via the shared splitter.
