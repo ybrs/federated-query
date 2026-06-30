@@ -685,10 +685,10 @@ class TestRegressionPrevention:
     def test_having_invalid_column_crashes_not_lies(self, catalog, setup_test_data):
         """A column that exists only in HAVING must crash, never return wrong rows.
 
-        The binder does not yet validate aggregate-function args in HAVING (D1).
-        This guarantees the deferral is safe: the engine fails loudly at
-        execution (the source rejects the unknown column) instead of shipping a
-        wrong answer. If a change ever made this query succeed, this test fails.
+        The one HAVING binder walks the predicate through the shared dispatch, so
+        an unknown aggregate-function argument now raises BindingError at bind
+        time; either way the engine fails loudly instead of shipping a wrong
+        answer. If a change ever made this query succeed, this test fails.
         """
         sql = (
             "SELECT user_id, SUM(amount) AS total FROM pg.orders "

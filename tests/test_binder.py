@@ -203,19 +203,35 @@ def test_bind_single_table_real_name_qualifier_when_aliased_raises(
         binder.bind(plan)
 
 
-@pytest.mark.xfail(
-    reason="D1: HAVING does not yet validate aggregate-function arguments",
-    strict=True,
-)
-def test_bind_invalid_column_in_having_should_raise(catalog_with_test_data):
-    """Desired (tracked, not yet implemented): a column that exists only inside a
-    HAVING aggregate is rejected at bind time.
+def test_bind_having_function_argument_is_bound(catalog_with_test_data):
+    """A column inside a HAVING function is bound, not left unresolved.
 
-    The HAVING binder currently leaves FunctionCall arguments unbound, so this
-    raises nothing and the test xfails. When D1 is fixed the binder will raise
-    BindingError and this XPASSes (strict) - the signal to remove the marker.
-    The companion e2e test asserts the query still crashes at execution today,
-    so the deferral never ships a wrong answer in the meantime.
+    Regression guard: the HAVING binder once fell through to ``return expr`` for
+    a FunctionCall, leaving its ColumnRef argument unbound (no data_type) to
+    crash later at execution. Routing through the shared dispatch binds it.
+    """
+    from federated_query.plan.expressions import column_refs
+
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = (
+        "SELECT name, COUNT(*) AS n FROM testdb.public.users "
+        "GROUP BY name HAVING upper(name) = 'X'"
+    )
+    bound_plan = binder.bind(parser.parse_to_logical_plan(sql, catalog_with_test_data))
+    found = column_refs(bound_plan.predicate)
+    assert len(found) > 0
+    for ref in found:
+        assert ref.data_type is not None
+
+
+def test_bind_invalid_column_in_having_should_raise(catalog_with_test_data):
+    """A column that exists only inside a HAVING aggregate is rejected at bind.
+
+    The one HAVING binder walks the predicate through the shared expression
+    dispatch, so a FunctionCall argument like ``SUM(nonexistent_col)`` is bound
+    and an unknown column raises BindingError at bind time (it no longer leaves
+    the argument unbound to crash later at execution).
     """
     parser = Parser()
     binder = Binder(catalog_with_test_data)

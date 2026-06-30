@@ -350,11 +350,7 @@ class Binder:
         aggregate: Aggregate,
     ) -> List[Expression]:
         """Bind ORDER BY keys when input is an Aggregate (supports output aliases)."""
-        alias_map: Dict[str, Expression] = {}
-        for index in range(len(aggregate.output_names)):
-            alias = aggregate.output_names[index]
-            expr = aggregate.aggregates[index]
-            alias_map[alias] = expr
+        alias_map = self._aggregate_alias_map(aggregate)
 
         bound_keys: List[Expression] = []
         for key in sort_keys:
@@ -616,44 +612,85 @@ class Binder:
 
         return self._bind_expression(expr)
 
+    def _aggregate_alias_map(self, aggregate: Aggregate) -> Dict[str, Expression]:
+        """Map each aggregate output name to its source expression."""
+        alias_map: Dict[str, Expression] = {}
+        for index in range(len(aggregate.output_names)):
+            alias_map[aggregate.output_names[index]] = aggregate.aggregates[index]
+        return alias_map
+
     def _bind_having_predicate(
         self, predicate: Expression, aggregate: Aggregate
     ) -> Expression:
-        """Bind HAVING predicate against aggregate output schema."""
-        alias_map: Dict[str, Expression] = {}
-        for i in range(len(aggregate.output_names)):
-            alias_map[aggregate.output_names[i]] = aggregate.aggregates[i]
-        return self._bind_having_expression(predicate, alias_map)
+        """Bind a HAVING predicate against the aggregate output and relation scope.
 
-    def _bind_having_expression(
-        self, expr: Expression, alias_map: Dict[str, Expression]
+        The scope of the aggregate's input is already pushed (by _bind_filter),
+        so a grouping column resolves through it; resolve_in_scopes raises on a
+        reference the query does not name.
+        """
+        alias_map = self._aggregate_alias_map(aggregate)
+        return self._bind_having_with(
+            predicate,
+            alias_map,
+            lambda col_ref: self.resolve_in_scopes(self._scope_stack, col_ref),
+        )
+
+    def _bind_having_with(
+        self,
+        predicate: Expression,
+        alias_map: Dict[str, Expression],
+        base_resolve: Callable[[ColumnRef], Expression],
+        subquery_scopes: Optional[List[Dict[str, Table]]] = None,
     ) -> Expression:
-        """Bind expression against aggregate output columns."""
-        if isinstance(expr, ColumnRef):
-            if expr.column in alias_map:
-                source = alias_map[expr.column]
-                return ColumnRef(
-                    table=None,
-                    column=expr.column,
-                    data_type=source.get_type(),
-                )
-            raise BindingError(f"Column '{expr.column}' not found in aggregate output")
+        """Bind a HAVING predicate via the shared expression dispatch.
 
-        if isinstance(expr, BinaryOp):
-            left = self._bind_having_expression(expr.left, alias_map)
-            right = self._bind_having_expression(expr.right, alias_map)
-            return BinaryOp(op=expr.op, left=left, right=right)
+        One HAVING binder for the top-level and subquery contexts; only
+        base_resolve - the scope a non-output column resolves against - and the
+        nested-subquery scopes differ. An aggregate-output name binds to the
+        output; a grouping column or an outer-correlation column falls through to
+        base_resolve, instead of being rejected or left unbound.
+        """
+        return self._bind_having_dispatch(
+            predicate,
+            lambda col_ref: self._resolve_having_column(
+                col_ref, alias_map, base_resolve
+            ),
+            subquery_scopes,
+        )
 
-        if isinstance(expr, UnaryOp):
-            operand = self._bind_having_expression(expr.operand, alias_map)
-            return UnaryOp(op=expr.op, operand=operand)
+    def _bind_having_dispatch(
+        self,
+        expr: Expression,
+        resolve: Callable[[ColumnRef], Expression],
+        subquery_scopes: Optional[List[Dict[str, Table]]],
+    ) -> Expression:
+        """Walk a HAVING predicate through the shared dispatch with ``resolve``."""
+        return self._bind_expr_dispatch(
+            expr,
+            lambda value: self._bind_having_dispatch(value, resolve, subquery_scopes),
+            resolve,
+            subquery_scopes=subquery_scopes,
+        )
 
-        if self._is_subquery_expression(expr):
-            return self._bind_subquery_expr(
-                expr, lambda value: self._bind_having_expression(value, alias_map)
+    def _resolve_having_column(
+        self,
+        col_ref: ColumnRef,
+        alias_map: Dict[str, Expression],
+        base_resolve: Callable[[ColumnRef], Expression],
+    ) -> Expression:
+        """Resolve a HAVING column: an aggregate output name first, else the scope.
+
+        A bare column naming an aggregate output binds to that output; anything
+        else (a grouping column, an outer-correlation column, or an unknown
+        reference base_resolve will reject) resolves through base_resolve, so
+        HAVING binds the same way at top level and inside a subquery.
+        """
+        if col_ref.table is None and col_ref.column in alias_map:
+            source = alias_map[col_ref.column]
+            return ColumnRef(
+                table=None, column=col_ref.column, data_type=source.get_type()
             )
-
-        return expr
+        return base_resolve(col_ref)
 
     def _push_scope_for(self, *plans: LogicalPlanNode) -> None:
         """Push the relation scope visible inside the given subtree(s)."""
@@ -1237,46 +1274,22 @@ class SubqueryPlanBinder:
         )
 
     def _bind_having(self, predicate: Expression, aggregate: Aggregate) -> Expression:
-        """Bind a HAVING predicate over a subquery aggregate."""
-        alias_map: Dict[str, Expression] = {}
-        for index in range(len(aggregate.output_names)):
-            alias_map[aggregate.output_names[index]] = aggregate.aggregates[index]
+        """Bind a HAVING predicate over a subquery aggregate.
+
+        Delegates to the host's one HAVING binder; only the scope a non-output
+        column resolves against differs - here the outer scopes plus the
+        aggregate's input, so an outer-correlation column also binds.
+        """
+        alias_map = self.host._aggregate_alias_map(aggregate)
         local: Dict[str, Table] = {}
         self.host._add_plan_to_scope(aggregate.input, local)
         scopes = self.outer_scopes + [local]
-        return self._bind_having_expr(predicate, alias_map, scopes)
-
-    def _bind_having_expr(
-        self,
-        expr: Expression,
-        alias_map: Dict[str, Expression],
-        scopes: List[Dict[str, Table]],
-    ) -> Expression:
-        """Bind HAVING parts: aggregate output names first, then scopes."""
-        output_ref = self._having_output_ref(expr, alias_map)
-        if output_ref is not None:
-            return output_ref
-        if isinstance(expr, BinaryOp):
-            left = self._bind_having_expr(expr.left, alias_map, scopes)
-            right = self._bind_having_expr(expr.right, alias_map, scopes)
-            return BinaryOp(op=expr.op, left=left, right=right)
-        if isinstance(expr, UnaryOp):
-            operand = self._bind_having_expr(expr.operand, alias_map, scopes)
-            return UnaryOp(op=expr.op, operand=operand)
-        return self._bind_expr(expr, scopes)
-
-    def _having_output_ref(
-        self, expr: Expression, alias_map: Dict[str, Expression]
-    ) -> Optional[ColumnRef]:
-        """Resolve a bare column against the aggregate's output names."""
-        if not isinstance(expr, ColumnRef):
-            return None
-        if expr.table is not None:
-            return None
-        source = alias_map.get(expr.column)
-        if source is None:
-            return None
-        return ColumnRef(table=None, column=expr.column, data_type=source.get_type())
+        return self.host._bind_having_with(
+            predicate,
+            alias_map,
+            lambda col_ref: self.host.resolve_in_scopes(scopes, col_ref),
+            subquery_scopes=list(scopes),
+        )
 
     def _bind_expr_for(
         self, expr: Expression, bound_input: LogicalPlanNode
