@@ -176,8 +176,8 @@ class TestBug1PyArrowColumnAccess:
     def test_hash_join_key_extraction(self, setup_two_datasources):
         """Test that PhysicalHashJoin can extract join keys by column name.
 
-        Bug: batch.column(key.column) in PhysicalHashJoin._extract_key_values
-        calls with string name instead of integer index.
+        Bug: batch.column(key.column) in the build-key extractor
+        (_key_column_arrays) calls with string name instead of integer index.
         """
         catalog, ds_customers, ds_orders = setup_two_datasources
 

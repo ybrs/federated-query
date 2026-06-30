@@ -545,6 +545,28 @@ def _column_ref_type(col_ref, input_schema: pa.Schema, alias_map) -> pa.DataType
     return input_schema.field(index).type
 
 
+def _key_column_arrays(batch, keys, aliases) -> List[pa.Array]:
+    """Collect each key column's array from a batch, resolving qualified names.
+
+    The one build-key extractor for the hash join and the EXPLAIN dynamic-filter
+    collector. A non-ColumnRef key is unsupported and RAISES - never a silent
+    empty result, which would hide the unsupported key and render an empty
+    dynamic filter as if there were no values. ``aliases`` maps a key's (table,
+    column) to its physical output name; a key the map does not carry uses its
+    own name.
+    """
+    from .expressions import ColumnRef
+
+    arrays = []
+    for key in keys:
+        if not isinstance(key, ColumnRef):
+            raise NotImplementedError(
+                f"Key extraction not supported for {type(key).__name__}"
+            )
+        arrays.append(batch.column(_physical_column_name(key, aliases or {})))
+    return arrays
+
+
 def _prepend_batch(first: pa.RecordBatch, rest) -> Iterator[pa.RecordBatch]:
     """Yield an already-pulled first batch, then the remaining batches."""
     yield first
@@ -1234,7 +1256,7 @@ class PhysicalHashJoin(PhysicalPlanNode):
         names = _key_column_names(len(build_keys))
         key_tables = []
         for batch in build_batches:
-            arrays = self._extract_key_values(batch, build_keys, aliases)
+            arrays = _key_column_arrays(batch, build_keys, aliases)
             key_tables.append(pa.table(arrays, names=names))
         combined = pa.concat_tables(key_tables)
         return combined.drop_null().group_by(names).aggregate([])
@@ -1283,29 +1305,6 @@ class PhysicalHashJoin(PhysicalPlanNode):
             right_name = self._resolve_key_name(right_key, right_aliases)
             conjuncts.append(f'l."{left_name}" = r."{right_name}"')
         return " AND ".join(conjuncts)
-
-    def _extract_key_values(
-        self, batch: pa.RecordBatch, keys: List[Expression], aliases=None
-    ) -> List[pa.Array]:
-        """Extract key column values from a batch, resolving qualified names.
-
-        When the input is a pushed multi-table query, two source columns may
-        share a name; ``aliases`` maps a key's (table, column) to the unique
-        output column so the right one is selected instead of failing on an
-        ambiguous bare name.
-        """
-        from .expressions import ColumnRef
-
-        key_arrays = []
-        for key in keys:
-            if not isinstance(key, ColumnRef):
-                raise NotImplementedError(
-                    f"Key extraction not implemented for {type(key)}"
-                )
-            name = self._resolve_key_name(key, aliases)
-            key_arrays.append(batch.column(name))
-
-        return key_arrays
 
     def _resolve_key_name(self, key, aliases) -> str:
         """Map a key column reference to its physical output column name."""
@@ -2839,26 +2838,12 @@ class _DatasourceQueryCollector:
         distinct: List[tuple] = []
         seen: Set[tuple] = set()
         for batch in build_node.execute():
-            key_arrays = self._build_key_arrays(batch, build_keys, aliases)
+            key_arrays = _key_column_arrays(batch, build_keys, aliases)
             for row_index in range(batch.num_rows):
                 self._add_distinct_key(key_arrays, row_index, seen, distinct)
                 if len(distinct) > 5:
                     return distinct
         return distinct
-
-    def _build_key_arrays(self, batch, build_keys, aliases):
-        """Collect the build-key column arrays, resolving qualified names."""
-        from .expressions import ColumnRef
-
-        arrays = []
-        for key in build_keys:
-            if not isinstance(key, ColumnRef):
-                return []
-            name = key.column
-            if aliases:
-                name = aliases.get((key.table, key.column), key.column)
-            arrays.append(batch.column(name))
-        return arrays
 
     def _add_distinct_key(self, key_arrays, row_index, seen, distinct) -> None:
         """Append a row's key tuple to ``distinct`` if new and free of NULLs."""
