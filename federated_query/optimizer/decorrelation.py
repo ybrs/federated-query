@@ -1455,8 +1455,8 @@ class Decorrelator:
             if residual is not None:
                 kept.append(residual)
         condition = _and_join(kept) if len(kept) > 0 else None
-        return Join(
-            left=left, right=right, join_type=node.join_type, condition=condition
+        return node.model_copy(
+            update={"left": left, "right": right, "condition": condition}
         )
 
     def _rewrite_value_expr(

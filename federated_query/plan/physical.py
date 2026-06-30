@@ -440,9 +440,9 @@ def _qualify_join_condition(condition, left_names, right_names):
 
     if isinstance(condition, ColumnRef):
         if condition.column in left_names:
-            return ColumnRef(table="l", column=condition.column)
+            return condition.model_copy(update={"table": "l"})
         if condition.column in right_names:
-            return ColumnRef(table="r", column=condition.column)
+            return condition.model_copy(update={"table": "r"})
         return condition
     if isinstance(condition, BinaryOp):
         return BinaryOp(
