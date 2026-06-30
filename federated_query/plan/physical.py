@@ -1307,18 +1307,10 @@ class PhysicalHashJoin(PhysicalPlanNode):
         right_aliases = self.right.column_aliases()
         conjuncts = []
         for left_key, right_key in zip(self.left_keys, self.right_keys):
-            left_name = self._resolve_key_name(left_key, left_aliases)
-            right_name = self._resolve_key_name(right_key, right_aliases)
+            left_name = _physical_column_name(left_key, left_aliases or {})
+            right_name = _physical_column_name(right_key, right_aliases or {})
             conjuncts.append(f'l."{left_name}" = r."{right_name}"')
         return " AND ".join(conjuncts)
-
-    def _resolve_key_name(self, key, aliases) -> str:
-        """Map a key column reference to its physical output column name."""
-        if aliases:
-            resolved = aliases.get((key.table, key.column))
-            if resolved is not None:
-                return resolved
-        return key.column
 
     def schema(self) -> pa.Schema:
         """Combine both sides' schemas (left-wins on name collision)."""
@@ -2221,10 +2213,7 @@ class PhysicalSingleRowGuard(PhysicalPlanNode):
         NULL-keyed inner rows can never match an outer row and must not be
         treated as a cardinality violation.
         """
-        aliases = self.input.column_aliases()
-        key_arrays = []
-        for key in self.keys:
-            key_arrays.append(batch.column(_physical_column_name(key, aliases)))
+        key_arrays = _key_column_arrays(batch, self.keys, self.input.column_aliases())
         for row_index in range(batch.num_rows):
             self._check_row_key(key_arrays, row_index, seen_keys)
 

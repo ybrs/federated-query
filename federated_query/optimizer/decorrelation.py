@@ -49,6 +49,7 @@ from ..plan.logical import (
     GroupedLimit,
     LateralJoin,
     SetOperation,
+    transform_children,
 )
 from ..plan.expressions import (
     Expression,
@@ -1025,16 +1026,17 @@ class Decorrelator:
         )
 
     def _rewrite_rest(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Rewrite remaining node types by recursing into children."""
+        """Rewrite remaining node types by recursing into children.
+
+        These nodes carry no rewrite of their own; recurse so a subquery nested
+        deeper still gets decorrelated, then rebuild via the shared
+        transform_children. An Aggregate first rejects subqueries in grouping or
+        aggregate positions, which are unsupported.
+        """
         if isinstance(plan, Aggregate):
             self._reject_subqueries_in(plan.group_by, "GROUP BY")
             self._reject_subqueries_in(plan.aggregates, "aggregate expressions")
-        rewritten_children = []
-        for child in plan.children():
-            rewritten_children.append(self._rewrite_plan(child))
-        if len(rewritten_children) == 0:
-            return plan
-        return plan.with_children(rewritten_children)
+        return transform_children(plan, self._rewrite_plan)
 
     def _reject_subqueries_in(self, expressions: List[Expression], where: str) -> None:
         """Subqueries in grouping/aggregation positions are unsupported."""
