@@ -280,9 +280,8 @@ class PostgreSQLDataSource(DataSource):
 
                 schema = pa.schema(self._build_arrow_fields(cursor.description))
 
-                batch_size = 10000
                 while True:
-                    rows = cursor.fetchmany(batch_size)
+                    rows = cursor.fetchmany(self._fetch_batch_size)
                     if not rows:
                         break
 

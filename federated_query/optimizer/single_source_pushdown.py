@@ -25,7 +25,6 @@ from ..plan.logical import (
     LateralJoin,
     SubqueryScan,
     SetOperation,
-    SetOpKind,
     CTE,
     CTERef,
     Values,
@@ -62,14 +61,6 @@ _JOIN_KIND_SIDE = {
     JoinType.SEMI: ("SEMI", None),
     JoinType.ANTI: ("ANTI", None),
 }
-
-# Engine set-operation kind -> sqlglot node; distinct=False renders ``... ALL``.
-_SET_OP_EXP = {
-    SetOpKind.UNION: exp.Union,
-    SetOpKind.INTERSECT: exp.Intersect,
-    SetOpKind.EXCEPT: exp.Except,
-}
-
 
 def same_source(left: Optional[str], right: Optional[str]) -> bool:
     """Whether two datasource names identify the same source.
@@ -555,7 +546,7 @@ class SingleSourcePushdown:
         self, node: SetOperation, left: exp.Expression, right: exp.Expression
     ) -> exp.Expression:
         """Build a UNION/INTERSECT/EXCEPT AST; ``distinct`` False renders ALL."""
-        return _SET_OP_EXP[node.kind](
+        return clauses.SET_OP_EXP[node.kind](
             this=left, expression=right, distinct=node.distinct
         )
 

@@ -149,8 +149,7 @@ class DuckDBDataSource(DataSource):
         result = self.connection.execute(query)
         arrow_table = result.to_arrow_table()
 
-        batch_size = 10000
-        for batch in arrow_table.to_batches(max_chunksize=batch_size):
+        for batch in arrow_table.to_batches(max_chunksize=self._fetch_batch_size):
             yield batch
 
     def get_query_schema(self, query: str) -> pa.Schema:

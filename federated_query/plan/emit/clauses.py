@@ -9,6 +9,15 @@ so clause rendering exists in exactly one place.
 from sqlglot import exp
 
 from .expressions import expression_to_ast, ordered_key_from_ast
+from ..logical import SetOpKind
+
+# Engine set-operation kind -> sqlglot node; distinct=False renders ``... ALL``.
+# The one mapping shared by the remote set-op node and single-source pushdown.
+SET_OP_EXP = {
+    SetOpKind.UNION: exp.Union,
+    SetOpKind.INTERSECT: exp.Intersect,
+    SetOpKind.EXCEPT: exp.Except,
+}
 
 
 def aliased_item(ast: exp.Expression, name) -> exp.Expression:

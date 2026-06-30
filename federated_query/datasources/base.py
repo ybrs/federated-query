@@ -71,6 +71,11 @@ class DataSource(ABC):
     # Subclasses override this; the default suits Postgres-compatible sources.
     render_dialect = "postgres"
 
+    # Rows per Arrow record batch when streaming a query result. One default for
+    # every driver's fetch loop; a source with different memory characteristics
+    # overrides it.
+    _fetch_batch_size = 10000
+
     def __init__(self, name: str, config: Dict[str, Any]):
         """Initialize data source.
 

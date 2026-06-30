@@ -757,12 +757,7 @@ class PhysicalScan(PhysicalPlanNode):
         Lets a join above resolve qualified references (``o.id``) even when
         another relation in the join exposes a column of the same name.
         """
-        if self.alias is None:
-            return {}
-        mapping: Dict[Tuple[Optional[str], str], str] = {}
-        for name in self.schema().names:
-            mapping[(self.alias, name)] = name
-        return mapping
+        return _alias_column_map(self.alias, self.schema().names)
 
     def execute(self) -> Iterator[pa.RecordBatch]:
         """Execute scan on remote data source."""
@@ -1552,14 +1547,15 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
         return [self.left, self.right]
 
     def execute(self) -> Iterator[pa.RecordBatch]:
-        """Run the join in the merge engine (DuckDB), or a Python loop if absent.
+        """Run the join in the merge engine (DuckDB); raise if none is attached.
 
         The arbitrary ``condition`` (in practice the null-aware SEMI/ANTI/LEFT
         predicate decorrelation produces, ``x = v OR x IS NULL OR v IS NULL``) is
         rendered to DuckDB with each column resolved to the left or right input.
-        DuckDB materializes each side once and joins set-based — so the inner
-        side is never re-scanned per outer row (which, cross-source, would be a
-        remote query per row). The Python loop remains only as a no-engine path.
+        DuckDB materializes each side once and joins set-based, so the inner side
+        is never re-scanned per outer row (which, cross-source, would be a remote
+        query per row). There is no Python row-by-row fallback: a missing engine
+        is a bug, so _require_engine raises rather than silently running slow.
         """
         yield from self._execute_merge(_require_engine(self))
 
@@ -2034,13 +2030,6 @@ class PhysicalUnion(PhysicalPlanNode):
         return f"PhysicalUnion({kind}, {len(self.inputs)} inputs)"
 
 
-_SET_OP_EXP = {
-    SetOpKind.UNION: exp.Union,
-    SetOpKind.INTERSECT: exp.Intersect,
-    SetOpKind.EXCEPT: exp.Except,
-}
-
-
 class PhysicalRemoteSetOp(PhysicalPlanNode):
     """Set operation pushed to a single data source as one remote query.
 
@@ -2121,7 +2110,7 @@ class PhysicalRemoteSetOp(PhysicalPlanNode):
         self, left_ast: exp.Expression, right_ast: exp.Expression
     ) -> exp.Expression:
         """Wrap two branch ASTs in the matching set-operation node."""
-        node_cls = _SET_OP_EXP[self.kind]
+        node_cls = clauses.SET_OP_EXP[self.kind]
         return node_cls(this=left_ast, expression=right_ast, distinct=self.distinct)
 
     def _wrap_order_limit(self, set_op_ast: exp.Expression) -> exp.Expression:
