@@ -3,6 +3,7 @@
 from typing import Dict, Optional, List, Tuple
 from ..datasources.base import DataSource
 from .schema import Schema, Table, Column
+from ..plan.arrow_types import is_renderable
 
 
 class Catalog:
@@ -47,10 +48,13 @@ class Catalog:
 
                     # Convert to our Column format. The source maps its own
                     # native type, so the catalog and the execution path never
-                    # disagree on what a column is.
+                    # disagree on what a column is; the engine guarantees that
+                    # DataType renders to Arrow, so a source that ever produces a
+                    # non-renderable type fails loudly here, not mid-query.
                     columns = []
                     for col_meta in metadata.columns:
                         data_type = datasource.map_native_type(col_meta.data_type)
+                        self._require_renderable(col_meta.name, data_type)
                         columns.append(
                             Column(
                                 name=col_meta.name,
@@ -66,6 +70,19 @@ class Catalog:
                 self.schemas[(ds_name, schema_name)] = schema
 
         self._metadata_loaded = True
+
+    def _require_renderable(self, column_name: str, data_type) -> None:
+        """Raise if a column's mapped DataType has no Arrow rendering.
+
+        The connector type contract: map_native_type must yield a DataType the
+        engine can render to Arrow. A gap is a connector bug, surfaced here with
+        the offending column rather than as a later execution crash.
+        """
+        if not is_renderable(data_type):
+            raise ValueError(
+                f"Column {column_name!r} maps to DataType {data_type.value}, "
+                f"which has no Arrow rendering"
+            )
 
     def get_datasource(self, name: str) -> Optional[DataSource]:
         """Get data source by name.

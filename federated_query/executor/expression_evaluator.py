@@ -26,20 +26,7 @@ from ..plan.expressions import (
     InList,
     BetweenExpression,
 )
-
-# Maps engine DataTypes to the Arrow type a local CAST converts to.
-_ARROW_CAST_TYPES = {
-    DataType.INTEGER: pa.int64(),
-    DataType.BIGINT: pa.int64(),
-    DataType.FLOAT: pa.float32(),
-    DataType.DOUBLE: pa.float64(),
-    DataType.DECIMAL: pa.float64(),
-    DataType.VARCHAR: pa.string(),
-    DataType.TEXT: pa.string(),
-    DataType.BOOLEAN: pa.bool_(),
-    DataType.DATE: pa.date32(),
-    DataType.TIMESTAMP: pa.timestamp("us"),
-}
+from ..plan.arrow_types import arrow_type_for, is_renderable
 
 
 class ExpressionEvaluationError(Exception):
@@ -271,12 +258,12 @@ class ExpressionEvaluator:
     def _eval_cast(self, expr: Cast) -> pa.Array:
         """Evaluate CAST locally via an Arrow type conversion."""
         value = self._broadcast(self._eval(expr.expr))
-        target = _ARROW_CAST_TYPES.get(expr.get_type())
-        if target is None:
+        data_type = expr.get_type()
+        if not is_renderable(data_type):
             raise ExpressionEvaluationError(
                 f"Unsupported local CAST target: {expr.target_type}"
             )
-        return pc.cast(value, target)
+        return pc.cast(value, arrow_type_for(data_type))
 
     def _eval_unary(self, expr: UnaryOp):
         """Evaluate NOT / IS NULL / IS NOT NULL / negation."""
