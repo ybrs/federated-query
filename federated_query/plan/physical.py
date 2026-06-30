@@ -44,6 +44,25 @@ def _parse_table_sample(sample_text: str) -> exp.Expression:
     return parsed.find(exp.Table).args.get("sample")
 
 
+def build_table_ref(name, schema=None, alias=None, sample=None) -> exp.Table:
+    """Build a FROM table reference ``["schema".]"name"`` with optional parts.
+
+    The one scan-to-exp.Table builder, shared by the remote scan and the
+    single-source pushdown: a quoted name (and optional quoted schema), an
+    optional quoted alias, and an optional TABLESAMPLE recovered from its stored
+    text. Each caller supplies its own alias policy; the node construction is
+    here so it exists once.
+    """
+    table = exp.Table(this=exp.to_identifier(name, quoted=True))
+    if schema is not None:
+        table.set("db", exp.to_identifier(schema, quoted=True))
+    if alias:
+        table.set("alias", exp.TableAlias(this=exp.to_identifier(alias, quoted=True)))
+    if sample is not None:
+        table.set("sample", _parse_table_sample(sample))
+    return table
+
+
 if TYPE_CHECKING:
     from .expressions import FunctionCall
 
@@ -834,17 +853,9 @@ class PhysicalScan(PhysicalPlanNode):
 
     def _table_ref(self) -> exp.Table:
         """Build the FROM table with optional alias and TABLESAMPLE."""
-        table = exp.Table(
-            this=exp.to_identifier(self.table_name, quoted=True),
-            db=exp.to_identifier(self.schema_name, quoted=True),
+        return build_table_ref(
+            self.table_name, self.schema_name, self.alias, self.sample
         )
-        if self.alias:
-            table.set(
-                "alias", exp.TableAlias(this=exp.to_identifier(self.alias, quoted=True))
-            )
-        if self.sample:
-            table.set("sample", _parse_table_sample(self.sample))
-        return table
 
     def schema(self) -> pa.Schema:
         """Get output schema."""

@@ -206,5 +206,5 @@ class ClickHouseDataSource(DataSource):
 
     def get_query_schema(self, query: str) -> pa.Schema:
         """Real Arrow schema of a query, via a zero-row probe."""
-        table = self._client.query_arrow(f"SELECT * FROM ({query}) AS q LIMIT 0")
+        table = self._client.query_arrow(self._schema_probe_sql(query))
         return table.schema

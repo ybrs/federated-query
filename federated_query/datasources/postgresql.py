@@ -344,7 +344,7 @@ class PostgreSQLDataSource(DataSource):
 
     def get_query_schema(self, query: str) -> pa.Schema:
         """Get a query's Arrow schema without materializing rows."""
-        wrapped = f"SELECT * FROM ({query}) AS q LIMIT 0"
+        wrapped = self._schema_probe_sql(query)
         if self._use_adbc:
             return self._adbc_fetch(wrapped).schema
         conn = self._get_connection()

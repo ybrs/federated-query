@@ -161,6 +161,6 @@ class DuckDBDataSource(DataSource):
         string instead — the previous behavior — produced schemas that
         mismatched the executed data and crashed FULL OUTER joins.
         """
-        result = self.connection.execute(f"SELECT * FROM ({query}) AS q LIMIT 0")
+        result = self.connection.execute(self._schema_probe_sql(query))
         empty_table = result.to_arrow_table()
         return empty_table.schema

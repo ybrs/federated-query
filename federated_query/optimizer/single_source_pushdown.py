@@ -940,25 +940,19 @@ class SingleSourcePushdown:
 
         When the context carries a scan-name map (cross-source LATERAL rendering
         for the merge engine), a base scan references its registered Arrow
-        relation name instead of ``"schema"."table"``.
+        relation name (no schema, no sample) instead of ``"schema"."table"``.
+        Unlike a remote scan, a pushed scan is always aliased (defaulting to the
+        table name) so its columns are addressable in the assembled query.
         """
-        from ..plan.physical import _parse_table_sample
+        from ..plan.physical import build_table_ref
 
         registered = None
         if context.scan_names is not None:
             registered = context.scan_names.get(id(scan))
-        if registered is not None:
-            table = exp.Table(this=exp.to_identifier(registered, quoted=True))
-        else:
-            table = exp.Table(
-                this=exp.to_identifier(scan.table_name, quoted=True),
-                db=exp.to_identifier(scan.schema_name, quoted=True),
-            )
         alias = scan.alias if scan.alias else scan.table_name
-        table.set("alias", exp.TableAlias(this=exp.to_identifier(alias, quoted=True)))
-        if registered is None and scan.sample:
-            table.set("sample", _parse_table_sample(scan.sample))
-        return table
+        if registered is not None:
+            return build_table_ref(registered, alias=alias)
+        return build_table_ref(scan.table_name, scan.schema_name, alias, scan.sample)
 
     def _render(self, context: _PushContext) -> exp.Select:
         """Assemble the remote SELECT AST via the one shared skeleton builder.

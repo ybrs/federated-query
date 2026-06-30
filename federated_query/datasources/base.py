@@ -170,6 +170,15 @@ class DataSource(ABC):
         """
         pass
 
+    def _schema_probe_sql(self, query: str) -> str:
+        """Wrap a query so it returns its schema with no rows (a LIMIT 0 probe).
+
+        Every source reports a query's exact column types by running it under
+        ``LIMIT 0``; only how the empty result becomes an Arrow schema differs
+        per driver, so the wrapping SQL lives here once.
+        """
+        return f"SELECT * FROM ({query}) AS q LIMIT 0"
+
     def _metadata_from_information_schema(self, schema, table, rows) -> TableMetadata:
         """Build TableMetadata from information_schema (name, type, is_nullable) rows.
 

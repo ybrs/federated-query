@@ -184,6 +184,12 @@ def _collect_inner_aliases(plan: LogicalPlanNode) -> Set[str]:
     A distinct explicit alias hides the base table name (SQL scoping), so
     only the alias is added in that case; the base name is added only when
     the relation is unaliased.
+
+    This is the TRANSITIVE collector: it recurses into a SubqueryScan's body to
+    see every inner relation name (correlation analysis needs them). It is NOT
+    the same as physical_planner._collect_relation_aliases, which stops at a
+    SubqueryScan boundary because SQL scoping hides a subquery's internals from
+    the outside; do not merge the two.
     """
     names: Set[str] = set()
     if isinstance(plan, Scan):

@@ -741,7 +741,13 @@ class PhysicalPlanner:
         return aliases
 
     def _collect_relation_aliases(self, plan, aliases: set) -> None:
-        """Recursively gather Scan/SubqueryScan qualifiers from a subtree."""
+        """Recursively gather the relation qualifiers a subtree EXPOSES.
+
+        Stops at a SubqueryScan boundary - its alias is exposed, its internals
+        are not (SQL scoping). This is deliberately NOT decorrelation's
+        _collect_inner_aliases, which recurses into a subquery to find every
+        inner name for correlation analysis; the two answer different questions.
+        """
         if isinstance(plan, Scan):
             aliases.add(plan.alias if plan.alias else plan.table_name)
             return
