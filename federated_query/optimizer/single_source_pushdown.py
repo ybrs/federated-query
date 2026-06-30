@@ -391,7 +391,13 @@ class SingleSourcePushdown:
         return self._absorb(projection.input, context)
 
     def _resolve_against_aggregate(self, expressions, child):
-        """Map each projected column to its aggregate child's source expression."""
+        """Map each projected column to its aggregate child's source expression.
+
+        ``outputs`` are the aggregate's SQL result-column names, unique within
+        the one relation, so ``index`` resolves each projected name to exactly
+        one aggregate; a name that is not an output raises (caller guards with
+        _is_columns_over_aggregate, so a miss here is a planner bug).
+        """
         outputs = self._aggregate_outputs(child)
         aggregates = child.aggregates
         resolved = []

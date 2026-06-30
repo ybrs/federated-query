@@ -439,6 +439,19 @@ def _qualify_join_condition(condition, left_names, right_names):
     return condition
 
 
+def _right_output_name(physical_name: str, left_names) -> str:
+    """Right-side output name under the left-wins collision rule.
+
+    A right column whose name collides with a left column is renamed
+    ``right_<name>``; otherwise it keeps its name. The one rule shared by the
+    join SELECT list, the output schema, and the parent-resolution alias map, so
+    all three agree on the join's columns.
+    """
+    if physical_name in left_names:
+        return f"right_{physical_name}"
+    return physical_name
+
+
 def _merge_join_select_list(join_type, left_schema, right_schema) -> str:
     """SELECT list reproducing the join output: left only for SEMI/ANTI, else both."""
     parts = []
@@ -448,9 +461,7 @@ def _merge_join_select_list(join_type, left_schema, right_schema) -> str:
         return ", ".join(parts)
     left_name_set = set(left_schema.names)
     for field in right_schema:
-        output_name = field.name
-        if output_name in left_name_set:
-            output_name = f"right_{output_name}"
+        output_name = _right_output_name(field.name, left_name_set)
         parts.append(f'r."{field.name}" AS "{output_name}"')
     return ", ".join(parts)
 
@@ -513,14 +524,23 @@ def _sum_result_type(arg_type: pa.DataType) -> pa.DataType:
     return arg_type
 
 
-def _column_ref_type(col_ref, input_schema: pa.Schema, alias_map) -> pa.DataType:
-    """Input Arrow type of a column reference.
+def _physical_column_name(col_ref, alias_map) -> str:
+    """Physical output-column name for a column reference - the one resolver.
 
     The qualifier is resolved through the alias map so a qualified key reads the
     intended column rather than a bare-name match (which, with two same-named
-    columns, would pick the wrong one).
+    columns, would pick the wrong one). A reference the map does not carry - a
+    column of a flat scan, whose namespace is unambiguous - uses its own name.
+    Both the type path (_column_ref_type) and the array path (_resolve_column)
+    go through here, so a declared schema and the executed output resolve every
+    column identically.
     """
-    physical = alias_map.get((col_ref.table, col_ref.column), col_ref.column)
+    return alias_map.get((col_ref.table, col_ref.column), col_ref.column)
+
+
+def _column_ref_type(col_ref, input_schema: pa.Schema, alias_map) -> pa.DataType:
+    """Input Arrow type of a column reference, resolved through the alias map."""
+    physical = _physical_column_name(col_ref, alias_map)
     index = input_schema.get_field_index(physical)
     return input_schema.field(index).type
 
@@ -564,50 +584,52 @@ def _streaming_reader(node: "PhysicalPlanNode") -> pa.RecordBatchReader:
 
 
 def _join_output_aliases(
-    left: "PhysicalPlanNode", right: "PhysicalPlanNode"
+    join_type, left: "PhysicalPlanNode", right: "PhysicalPlanNode"
 ) -> Dict[Tuple[Optional[str], str], str]:
     """Build a (table, column) -> output-name map for a binary join.
 
-    Left columns keep their names; right columns whose names collide with a
-    left column are renamed with a ``right_`` prefix, matching the execution
-    SELECT list. When both sides expose the SAME (table, column) key - e.g. a
-    subquery that scans the same table the outer query does - the LEFT side wins
-    the key (the outer reference is what the user wrote); the right's renamed
-    column is reachable by its physical name but never overwrites the left, so a
-    qualified outer reference can never silently resolve to the inner relation.
+    A SEMI/ANTI join outputs left columns only (matching the execution SELECT
+    list), so no right column enters the map. For an INNER/OUTER join, left
+    columns keep their names and a colliding right column is renamed with a
+    ``right_`` prefix (the left-wins rule). When both sides expose the SAME
+    (table, column) key - e.g. a subquery that scans the same table the outer
+    query does - the LEFT side wins the key (the outer reference is what the user
+    wrote); the right's renamed column is reachable by its physical name but
+    never overwrites the left, so a qualified outer reference can never silently
+    resolve to the inner relation.
     """
     alias_map: Dict[Tuple[Optional[str], str], str] = dict(left.column_aliases())
+    if join_type in (JoinType.SEMI, JoinType.ANTI):
+        return alias_map
     left_names = set(left.schema().names)
     for key, physical_name in right.column_aliases().items():
         if key in alias_map:
             continue
-        if physical_name in left_names:
-            alias_map[key] = f"right_{physical_name}"
-        else:
-            alias_map[key] = physical_name
+        alias_map[key] = _right_output_name(physical_name, left_names)
     return alias_map
 
 
 def _join_output_schema(
-    left: "PhysicalPlanNode", right: "PhysicalPlanNode"
+    join_type, left: "PhysicalPlanNode", right: "PhysicalPlanNode"
 ) -> pa.Schema:
     """Build the output schema of a binary join.
 
-    Left columns keep their names; a right column whose name collides with a left
+    A SEMI/ANTI join outputs left columns only, so the right side adds nothing.
+    For an INNER/OUTER join, left columns keep their names and a colliding right
     column is renamed ``right_<name>`` - the same left-wins rule used by the
     execution SELECT list (_merge_join_select_list) and the parent-resolution map
     (_join_output_aliases), so the declared schema, the actual output, and
     qualified-reference resolution all agree.
     """
     left_schema = left.schema()
-    left_names = set(left_schema.names)
     fields = []
     for field in left_schema:
         fields.append(field)
+    if join_type in (JoinType.SEMI, JoinType.ANTI):
+        return pa.schema(fields)
+    left_names = set(left_schema.names)
     for field in right.schema():
-        name = field.name
-        if name in left_names:
-            name = f"right_{name}"
+        name = _right_output_name(field.name, left_names)
         fields.append(pa.field(name, field.type, nullable=field.nullable))
     return pa.schema(fields)
 
@@ -916,10 +938,10 @@ class PhysicalProjection(PhysicalPlanNode):
                     for field in input_schema:
                         fields.append(field)
                 else:
-                    field_index = input_schema.get_field_index(expr.column)
-                    field = input_schema.field(field_index)
-                    new_field = pa.field(self.output_names[i], field.type)
-                    fields.append(new_field)
+                    field_type = _column_ref_type(
+                        expr, input_schema, self.column_aliases()
+                    )
+                    fields.append(pa.field(self.output_names[i], field_type))
             else:
                 inferred = self._infer_expression_type(expr, input_schema)
                 fields.append(pa.field(self.output_names[i], inferred))
@@ -945,40 +967,16 @@ class PhysicalProjection(PhysicalPlanNode):
         batch: pa.RecordBatch,
         alias_map: Dict[Tuple[Optional[str], str], str],
     ) -> pa.Array:
-        """Resolve column, including alias fallbacks."""
+        """Resolve a column to its array via the shared physical-name rule.
+
+        Uses the same resolver as schema typing (_physical_column_name), so the
+        executed output and the declared schema read every column identically.
+        """
         from .expressions import ColumnRef
 
         if not isinstance(expr, ColumnRef):
             raise ValueError("Expected ColumnRef")
-
-        mapped = None
-        if expr.table is not None:
-            mapped = self._lookup_alias(expr, alias_map)
-            if mapped is not None:
-                return batch.column(mapped)
-
-        try:
-            return batch.column(expr.column)
-        except KeyError:
-            if mapped is None:
-                mapped = self._lookup_alias(expr, alias_map)
-            if mapped is None:
-                raise
-            return batch.column(mapped)
-
-    def _lookup_alias(
-        self, expr: Expression, alias_map: Dict[Tuple[Optional[str], str], str]
-    ) -> Optional[str]:
-        from .expressions import ColumnRef
-
-        if not isinstance(expr, ColumnRef):
-            return None
-
-        if expr.table is None:
-            return None
-
-        key = (expr.table, expr.column)
-        return alias_map.get(key)
+        return batch.column(_physical_column_name(expr, alias_map))
 
     def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
         return self.input.column_aliases()
@@ -1319,11 +1317,11 @@ class PhysicalHashJoin(PhysicalPlanNode):
 
     def schema(self) -> pa.Schema:
         """Combine both sides' schemas (left-wins on name collision)."""
-        return _join_output_schema(self.left, self.right)
+        return _join_output_schema(self.join_type, self.left, self.right)
 
     def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
         """Map qualified columns to their (possibly renamed) output names."""
-        return _join_output_aliases(self.left, self.right)
+        return _join_output_aliases(self.join_type, self.left, self.right)
 
     def estimated_cost(self) -> float:
         raise NotImplementedError("Cost estimation not yet implemented")
@@ -1580,11 +1578,11 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
 
     def schema(self) -> pa.Schema:
         """Combine both sides' schemas (left-wins on name collision)."""
-        return _join_output_schema(self.left, self.right)
+        return _join_output_schema(self.join_type, self.left, self.right)
 
     def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
         """Map qualified columns to their (possibly renamed) output names."""
-        return _join_output_aliases(self.left, self.right)
+        return _join_output_aliases(self.join_type, self.left, self.right)
 
     def estimated_cost(self) -> float:
         raise NotImplementedError("Cost estimation not yet implemented")
@@ -2240,9 +2238,10 @@ class PhysicalSingleRowGuard(PhysicalPlanNode):
         NULL-keyed inner rows can never match an outer row and must not be
         treated as a cardinality violation.
         """
+        aliases = self.input.column_aliases()
         key_arrays = []
         for key in self.keys:
-            key_arrays.append(batch.column(key.column))
+            key_arrays.append(batch.column(_physical_column_name(key, aliases)))
         for row_index in range(batch.num_rows):
             self._check_row_key(key_arrays, row_index, seen_keys)
 

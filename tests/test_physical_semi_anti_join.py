@@ -78,6 +78,43 @@ def _rows_from_batches(batches):
     return rows
 
 
+def _semi_join_over_colliding_columns(join_type):
+    """A SEMI/ANTI join whose right side has a colliding ``id`` and a unique col."""
+    left = _make_batch([[1, 2], ["a", "b"]], ["id", "val"])
+    right = _make_batch([[1], ["x"]], ["id", "rval"])
+    return PhysicalHashJoin(
+        left=FakeNode(batches=[left]),
+        right=FakeNode(batches=[right]),
+        join_type=join_type,
+        left_keys=[ColumnRef(table=None, column="id")],
+        right_keys=[ColumnRef(table=None, column="id")],
+        build_side="right",
+    )
+
+
+def test_semi_join_schema_is_left_only():
+    """SEMI join declares left columns only - no phantom right_* columns.
+
+    _merge_join_select_list emits left columns only for SEMI/ANTI; schema() must
+    match, or the empty-result path (which builds from schema()) and any parent
+    reading the column set positionally would see columns the join never yields.
+    """
+    join = _semi_join_over_colliding_columns(JoinType.SEMI)
+    assert join.schema().names == ["id", "val"]
+
+
+def test_anti_join_schema_is_left_only():
+    """ANTI join declares left columns only, matching its execution SELECT list."""
+    join = _semi_join_over_colliding_columns(JoinType.ANTI)
+    assert join.schema().names == ["id", "val"]
+
+
+def test_inner_join_schema_renames_colliding_right_column():
+    """INNER join keeps both sides; a colliding right column becomes right_<name>."""
+    join = _semi_join_over_colliding_columns(JoinType.INNER)
+    assert join.schema().names == ["id", "val", "right_id", "rval"]
+
+
 def test_hash_join_semi_emits_only_matching_left_rows():
     """Input: hash SEMI join on id; Expect: only left rows with matching id, no right cols."""
     left = _make_batch([[1, 2], ["a", "b"]], ["id", "val"])
