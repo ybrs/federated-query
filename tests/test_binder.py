@@ -225,6 +225,43 @@ def test_bind_having_function_argument_is_bound(catalog_with_test_data):
         assert ref.data_type is not None
 
 
+def test_bind_cast_resolves_data_type(catalog_with_test_data):
+    """A CAST binds its inner column AND resolves its target into a data_type.
+
+    Compound expressions bind through map_children, but a CAST keeps a binder
+    arm: map_children only maps child expressions, so without the special arm the
+    target type would stay unresolved.
+    """
+    from federated_query.plan.expressions import Cast, column_refs
+
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = "SELECT CAST(age AS BIGINT) FROM testdb.public.users"
+    bound = binder.bind(parser.parse_to_logical_plan(sql, catalog_with_test_data))
+    cast = bound.expressions[0]
+    assert isinstance(cast, Cast)
+    assert cast.data_type == DataType.BIGINT
+    for ref in column_refs(cast):
+        assert ref.data_type is not None
+
+
+def test_bind_compound_expression_binds_every_leaf(catalog_with_test_data):
+    """A CASE/BETWEEN compound binds every nested ColumnRef via map_children."""
+    from federated_query.plan.expressions import column_refs
+
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = (
+        "SELECT CASE WHEN age BETWEEN 18 AND 65 THEN name ELSE email END "
+        "FROM testdb.public.users"
+    )
+    bound = binder.bind(parser.parse_to_logical_plan(sql, catalog_with_test_data))
+    refs = column_refs(bound.expressions[0])
+    assert len(refs) >= 3
+    for ref in refs:
+        assert ref.data_type is not None
+
+
 def test_bind_invalid_column_in_having_should_raise(catalog_with_test_data):
     """A column that exists only inside a HAVING aggregate is rejected at bind.
 

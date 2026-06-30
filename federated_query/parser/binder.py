@@ -24,22 +24,15 @@ from ..plan.expressions import (
     Expression,
     ColumnRef,
     Literal,
-    BinaryOp,
-    UnaryOp,
     DataType,
     FunctionCall,
-    InList,
-    BetweenExpression,
     Cast,
-    Extract,
     Interval,
-    CaseExpr,
-    WindowExpr,
     SubqueryExpression,
     ExistsExpression,
     InSubquery,
     QuantifiedComparison,
-    TupleExpression,
+    map_children,
 )
 
 if TYPE_CHECKING:
@@ -947,30 +940,19 @@ class Binder:
         bind: Callable[[Expression], Expression],
         subquery_scopes: Optional[List[Dict[str, Table]]] = None,
     ) -> Expression:
-        """Rebuild a compound expression by binding its children with ``bind``."""
-        if isinstance(expr, BinaryOp):
-            return self._bind_binary_op(expr, bind)
-        if isinstance(expr, UnaryOp):
-            return self._bind_unary_op(expr, bind)
-        if isinstance(expr, InList):
-            return self._bind_in_list(expr, bind)
-        if isinstance(expr, BetweenExpression):
-            return self._bind_between(expr, bind)
-        if isinstance(expr, CaseExpr):
-            return self._bind_case_expr(expr, bind)
+        """Rebuild a compound expression by binding its children with ``bind``.
+
+        Two node types bind specially: a Cast also resolves its target type, and
+        a subquery node threads the binder's scopes into its plan. Every other
+        compound node is a pure structural recurse-and-rebuild, so it goes
+        through the one expression walker (map_children), which rebuilds via
+        model_copy (never dropping a field) and raises on an unmodeled type.
+        """
         if isinstance(expr, Cast):
             return self._bind_cast(expr, bind)
-        if isinstance(expr, Extract):
-            return self._bind_extract(expr, bind)
-        if isinstance(expr, FunctionCall):
-            return self._bind_function_args(expr, bind)
-        if isinstance(expr, WindowExpr):
-            return self._bind_window_expr(expr, bind)
         if self._is_subquery_expression(expr):
             return self._bind_subquery_expr(expr, bind, scopes=subquery_scopes)
-        if isinstance(expr, TupleExpression):
-            return self._bind_tuple(expr, bind)
-        raise BindingError(f"Unsupported expression type: {type(expr).__name__}")
+        return map_children(expr, bind)
 
     def _bind_cast(
         self,
@@ -986,15 +968,6 @@ class Binder:
             data_type=data_type,
         )
 
-    def _bind_extract(
-        self,
-        expr: Extract,
-        bind_value: Callable[[Expression], Expression],
-    ) -> Extract:
-        """Bind the source of an EXTRACT while preserving its field keyword."""
-        bound_source = bind_value(expr.source)
-        return Extract(field=expr.field, source=bound_source)
-
     def _resolve_cast_type(self, target_type: str) -> DataType:
         """Map a SQL type text such as ``DECIMAL(10, 2)`` to a DataType."""
         keyword = target_type.split("(")[0].strip().upper()
@@ -1002,17 +975,6 @@ class Binder:
         if leading not in _CAST_TYPE_KEYWORDS:
             raise BindingError(f"Unsupported CAST target type: {target_type}")
         return _CAST_TYPE_KEYWORDS[leading]
-
-    def _bind_function_args(
-        self,
-        expr: FunctionCall,
-        bind_value: Callable[[Expression], Expression],
-    ) -> FunctionCall:
-        """Bind the arguments of a function call."""
-        bound_args = []
-        for arg in expr.args:
-            bound_args.append(bind_value(arg))
-        return _rebuild_function_call(expr, bound_args, bind_value)
 
     def _is_subquery_expression(self, expr: Expression) -> bool:
         """Check whether an expression node carries a subquery plan."""
@@ -1023,78 +985,6 @@ class Binder:
             QuantifiedComparison,
         )
         return isinstance(expr, subquery_types)
-
-    def _bind_tuple(
-        self,
-        expr: TupleExpression,
-        bind_value: Callable[[Expression], Expression],
-    ) -> TupleExpression:
-        """Bind each item of a row value constructor."""
-        bound_items = []
-        for item in expr.items:
-            bound_items.append(bind_value(item))
-        return TupleExpression(items=tuple(bound_items))
-
-    def _bind_binary_op(
-        self, binary_op: BinaryOp, bind: Callable[[Expression], Expression]
-    ) -> BinaryOp:
-        """Bind a binary operation's operands with the given child binder."""
-        return BinaryOp(
-            op=binary_op.op, left=bind(binary_op.left), right=bind(binary_op.right)
-        )
-
-    def _bind_unary_op(
-        self, unary_op: UnaryOp, bind: Callable[[Expression], Expression]
-    ) -> UnaryOp:
-        """Bind a unary operation's operand with the given child binder."""
-        return UnaryOp(op=unary_op.op, operand=bind(unary_op.operand))
-
-    def _bind_in_list(
-        self, expr: InList, bind: Callable[[Expression], Expression]
-    ) -> InList:
-        """Bind an IN-list's value and each option with the given child binder."""
-        bound_options: List[Expression] = []
-        for option in expr.options:
-            bound_options.append(bind(option))
-        return InList(value=bind(expr.value), options=bound_options)
-
-    def _bind_between(
-        self, expr: BetweenExpression, bind: Callable[[Expression], Expression]
-    ) -> BetweenExpression:
-        """Bind a BETWEEN's value/lower/upper operands with the child binder."""
-        return BetweenExpression(
-            value=bind(expr.value), lower=bind(expr.lower), upper=bind(expr.upper)
-        )
-
-    def _bind_case_expr(
-        self, expr: CaseExpr, bind: Callable[[Expression], Expression]
-    ) -> CaseExpr:
-        """Bind a CASE expression's WHEN/THEN branches and ELSE with the child binder."""
-        bound_when = []
-        for condition, result in expr.when_clauses:
-            bound_when.append((bind(condition), bind(result)))
-        bound_else = None
-        if expr.else_result is not None:
-            bound_else = bind(expr.else_result)
-        return CaseExpr(when_clauses=bound_when, else_result=bound_else)
-
-    def _bind_window_expr(
-        self, expr: WindowExpr, bind: Callable[[Expression], Expression]
-    ) -> WindowExpr:
-        """Bind a window's inner function, partition keys, and order keys."""
-        bound_partition = []
-        for part in expr.partition_by:
-            bound_partition.append(bind(part))
-        bound_order = []
-        for key in expr.order_keys:
-            bound_order.append(bind(key))
-        return expr.model_copy(
-            update={
-                "function": bind(expr.function),
-                "partition_by": bound_partition,
-                "order_keys": bound_order,
-            }
-        )
 
     def __repr__(self) -> str:
         return "Binder()"
