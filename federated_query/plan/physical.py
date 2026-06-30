@@ -1632,9 +1632,8 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         """Alias each SELECT expression to its output name.
 
         Uses the shared alias-and-join skeleton (clauses.aliased_select_fragment);
-        only the per-expression renderer differs - an aggregate call renders
-        verbatim (WITHIN GROUP / DISTINCT / COUNT(*)) where the generic emitter
-        would not.
+        the per-expression renderer is the one emitter, except an ordered-set
+        aggregate's WITHIN GROUP form, which DuckDB needs literal.
         """
         if len(self.aggregates) != len(self.output_names):
             raise ValueError(
@@ -1656,47 +1655,32 @@ class PhysicalHashAggregate(PhysicalPlanNode):
     def _render_agg_expr(self, expr: Expression, aliases) -> str:
         """Render a SELECT/group expression against the input's physical columns.
 
-        An aggregate call keeps its verbatim form (so an ordered-set aggregate's
-        WITHIN GROUP renders as DuckDB accepts it); every other expression - a
-        plain column, arithmetic, or a scalar function - lowers through the one
-        emitter with the physical-name MergeResolver.
+        Everything lowers through the one emitter except an ordered-set
+        aggregate's WITHIN GROUP form: the emitter's typed node transpiles to an
+        inline ``f(arg ORDER BY key)`` that DuckDB rejects, so that one case is
+        wrapped here from emitter-rendered parts. COUNT(*), DISTINCT, and
+        multi-argument calls the emitter already renders identically.
         """
-        from .expressions import is_aggregate_call
+        from .expressions import FunctionCall
 
-        if is_aggregate_call(expr):
-            return self._render_agg_function(expr, aliases)
+        if isinstance(expr, FunctionCall) and expr.within_group_key is not None:
+            return self._render_ordered_set_aggregate(expr, aliases)
         return expression_to_ast(expr, MergeResolver(aliases)).sql(dialect="duckdb")
 
-    def _render_agg_function(self, func: "FunctionCall", aliases) -> str:
-        """Render an aggregate call (DISTINCT, COUNT(*), and WITHIN GROUP)."""
-        name = func.function_name.upper()
-        distinct = "DISTINCT " if func.distinct else ""
-        call = f"{name}({distinct}{self._render_agg_inner(func, aliases)})"
-        if func.within_group_key is None:
-            return call
-        order = self._render_within_group_order(func, aliases)
-        return f"{call} WITHIN GROUP (ORDER BY {order})"
+    def _render_ordered_set_aggregate(self, func: "FunctionCall", aliases) -> str:
+        """Render ``f(args) WITHIN GROUP (ORDER BY key [DESC])`` for DuckDB.
 
-    def _render_agg_inner(self, func: "FunctionCall", aliases) -> str:
-        """Render an aggregate's direct arguments (empty for MODE, '*' for COUNT).
-
-        Every direct argument is rendered in order, so a multi-argument
-        aggregate such as ``STRING_AGG(x, ',')`` keeps its separator instead of
-        silently dropping all but the first argument.
+        DuckDB accepts the standard WITHIN GROUP form but rejects the inline
+        ``f(args ORDER BY key)`` that sqlglot's DuckDB dialect transpiles an
+        ordered-set Anonymous call to; the call and the sort key are rendered by
+        the one emitter, and only the WITHIN GROUP wrapper is built here.
         """
-        if func.args:
-            parts = []
-            for arg in func.args:
-                parts.append(self._render_agg_expr(arg, aliases))
-            return ", ".join(parts)
-        if func.within_group_key is not None:
-            return ""
-        return "*"
-
-    def _render_within_group_order(self, func: "FunctionCall", aliases) -> str:
-        """Render the ORDER BY key of an ordered-set aggregate for the merge engine."""
+        resolver = MergeResolver(aliases)
+        call = func.model_copy(update={"within_group_key": None})
+        call_sql = expression_to_ast(call, resolver).sql(dialect="duckdb")
+        key_sql = expression_to_ast(func.within_group_key, resolver).sql(dialect="duckdb")
         direction = " DESC" if func.within_group_desc else ""
-        return f"{self._render_agg_expr(func.within_group_key, aliases)}{direction}"
+        return f"{call_sql} WITHIN GROUP (ORDER BY {key_sql}{direction})"
 
     def schema(self) -> pa.Schema:
         """Get output schema."""
