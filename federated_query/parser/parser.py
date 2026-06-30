@@ -1488,12 +1488,7 @@ class Parser:
         guarded_args: List[Expression] = []
         for arg in aggregate.args:
             guarded_args.append(self._guard_one_arg(arg, predicate))
-        return FunctionCall(
-            function_name=aggregate.function_name,
-            args=guarded_args,
-            is_aggregate=aggregate.is_aggregate,
-            distinct=aggregate.distinct,
-        )
+        return aggregate.model_copy(update={"args": guarded_args})
 
     def _guard_one_arg(self, arg: Expression, predicate: Expression) -> CaseExpr:
         """Build ``CASE WHEN predicate THEN arg END``, using 1 for COUNT(*)."""

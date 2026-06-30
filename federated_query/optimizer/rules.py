@@ -426,7 +426,7 @@ class ProjectionPushdownRule(OptimizationRule):
             combined_required = required.union(filter_cols)
             new_input = self._prune_columns(plan.input, combined_required)
             if new_input != plan.input:
-                return Filter(input=new_input, predicate=plan.predicate)
+                return plan.model_copy(update={"input": new_input})
             return plan
 
         if isinstance(plan, Join):

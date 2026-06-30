@@ -502,7 +502,7 @@ class PostgreSQLDataSource(DataSource):
         20: pa.int64(),  # int8
         21: pa.int64(),  # int2
         23: pa.int64(),  # int4
-        700: pa.float64(),  # float4
+        700: pa.float32(),  # float4 (32-bit; matches DataType.FLOAT and ADBC)
         701: pa.float64(),  # float8
         1700: pa.float64(),  # numeric
         25: pa.string(),  # text
