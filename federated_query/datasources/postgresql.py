@@ -18,6 +18,7 @@ from .base import (
     TableStatistics,
     ColumnStatistics,
 )
+from ..plan.expressions import DataType
 
 logger = logging.getLogger(__name__)
 
@@ -513,6 +514,25 @@ class PostgreSQLDataSource(DataSource):
         1184: pa.timestamp("us", tz="UTC"),  # timestamptz
         2950: pa.string(),  # uuid (rendered as text, matching the ADBC path)
     }
+
+    # Native Postgres type names the generic SQL mapper does not cover, mapped
+    # to the engine DataType the fetch path also yields (uuid OID 2950 above is
+    # fetched as text). Keeps catalog metadata and execution in agreement.
+    _NATIVE_TYPE_OVERRIDES = {
+        "UUID": DataType.VARCHAR,
+    }
+
+    def map_native_type(self, type_str: str) -> DataType:
+        """Map a Postgres type name, honoring types only Postgres exposes.
+
+        Without the uuid override the catalog would raise on a uuid column the
+        engine can actually query (the fetch path renders uuid as text), so the
+        two paths would disagree on the same column.
+        """
+        normalized = type_str.upper().split("(")[0].strip()
+        if normalized in self._NATIVE_TYPE_OVERRIDES:
+            return self._NATIVE_TYPE_OVERRIDES[normalized]
+        return super().map_native_type(type_str)
 
     def _build_arrow_fields(self, description) -> List[pa.Field]:
         """Build typed Arrow fields from a cursor description.

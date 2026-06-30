@@ -99,43 +99,64 @@ def test_get_nonexistent_table(catalog, sample_schema):
     assert catalog.get_table("nonexistent", "public", "customers") is None
 
 
-def test_type_mapping(catalog):
-    """Test database type mapping."""
+@pytest.fixture
+def datasource():
+    """A connector instance for testing its native-type mapping (no connect)."""
+    return DuckDBDataSource(name="test_db", config={"database": ":memory:"})
+
+
+def test_type_mapping(datasource):
+    """The source maps the common SQL type names to engine DataTypes."""
     # Integer types
-    assert catalog._map_type("INTEGER") == DataType.INTEGER
-    assert catalog._map_type("BIGINT") == DataType.BIGINT
-    assert catalog._map_type("SERIAL") == DataType.INTEGER
-    assert catalog._map_type("BIGSERIAL") == DataType.BIGINT
+    assert datasource.map_native_type("INTEGER") == DataType.INTEGER
+    assert datasource.map_native_type("BIGINT") == DataType.BIGINT
+    assert datasource.map_native_type("SERIAL") == DataType.INTEGER
+    assert datasource.map_native_type("BIGSERIAL") == DataType.BIGINT
 
     # Float types
-    assert catalog._map_type("FLOAT") == DataType.FLOAT
-    assert catalog._map_type("REAL") == DataType.FLOAT
-    assert catalog._map_type("DOUBLE") == DataType.DOUBLE
-    assert catalog._map_type("NUMERIC") == DataType.DOUBLE
-    assert catalog._map_type("DECIMAL") == DataType.DOUBLE
+    assert datasource.map_native_type("FLOAT") == DataType.FLOAT
+    assert datasource.map_native_type("REAL") == DataType.FLOAT
+    assert datasource.map_native_type("DOUBLE") == DataType.DOUBLE
+    assert datasource.map_native_type("NUMERIC") == DataType.DOUBLE
+    assert datasource.map_native_type("DECIMAL") == DataType.DOUBLE
 
     # String types
-    assert catalog._map_type("VARCHAR") == DataType.VARCHAR
-    assert catalog._map_type("CHAR") == DataType.TEXT
-    assert catalog._map_type("TEXT") == DataType.TEXT
+    assert datasource.map_native_type("VARCHAR") == DataType.VARCHAR
+    assert datasource.map_native_type("CHAR") == DataType.TEXT
+    assert datasource.map_native_type("TEXT") == DataType.TEXT
 
     # Boolean
-    assert catalog._map_type("BOOLEAN") == DataType.BOOLEAN
+    assert datasource.map_native_type("BOOLEAN") == DataType.BOOLEAN
 
     # Date/Time
-    assert catalog._map_type("DATE") == DataType.DATE
-    assert catalog._map_type("TIMESTAMP") == DataType.TIMESTAMP
+    assert datasource.map_native_type("DATE") == DataType.DATE
+    assert datasource.map_native_type("TIMESTAMP") == DataType.TIMESTAMP
 
 
-def test_unknown_type_raises(catalog):
+def test_unknown_type_raises(datasource):
     """An unmodeled column type raises instead of silently coercing to VARCHAR.
 
     A mis-typed column is a wrong answer with no error, so an unknown type must
     be added to the mapping explicitly rather than defaulted.
     """
     with pytest.raises(ValueError) as exc_info:
-        catalog._map_type("UNKNOWN_TYPE")
+        datasource.map_native_type("UNKNOWN_TYPE")
     assert "UNKNOWN_TYPE" in str(exc_info.value)
+
+
+def test_postgres_maps_uuid_consistently_with_execution():
+    """Postgres maps uuid to VARCHAR, the same type the fetch path yields.
+
+    Regression guard: the catalog's generic mapper raised on uuid while the
+    execution path (OID 2950 -> string) handled it, so load_metadata crashed on
+    a table the engine could query. The connector now owns the mapping.
+    """
+    from federated_query.datasources.postgresql import PostgreSQLDataSource
+
+    source = PostgreSQLDataSource(name="pg", config={"host": "localhost"})
+    assert source.map_native_type("uuid") == DataType.VARCHAR
+    # The generic names still resolve through the shared base mapper.
+    assert source.map_native_type("integer") == DataType.INTEGER
 
 
 def test_catalog_repr(catalog):
