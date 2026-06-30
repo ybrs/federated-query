@@ -97,6 +97,28 @@ class LogicalPlanNode(StateModel):
         return self.__class__.__name__
 
 
+def transform_children(node, transform) -> "LogicalPlanNode":
+    """Rebuild a plan node from its transformed children, or return it unchanged.
+
+    The mechanical recurse-and-rebuild that every pushdown rule's pass-through
+    arms share: each child is transformed, and the node is rebuilt via
+    with_children only when a child actually changed, so an unchanged subtree
+    keeps its identity (the rules' change-detection relies on that). The per-rule
+    decision of WHICH node types to recurse into stays in the rule; this only
+    removes the hand-written rebuild boilerplate.
+    """
+    new_children = []
+    changed = False
+    for child in node.children():
+        new_child = transform(child)
+        new_children.append(new_child)
+        if new_child != child:
+            changed = True
+    if changed:
+        return node.with_children(new_children)
+    return node
+
+
 class Scan(LogicalPlanNode):
     """Scan a table from a data source.
 

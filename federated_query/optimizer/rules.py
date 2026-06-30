@@ -14,6 +14,7 @@ from ..plan.logical import (
     Union,
     SetOperation,
     Explain,
+    transform_children,
 )
 from . import pushdown
 from .scope_validator import validate_scope
@@ -78,44 +79,18 @@ class PredicatePushdownRule(OptimizationRule):
         return self._push_down(plan)
 
     def _push_down(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Recursively push predicates down the plan tree."""
+        """Recursively push predicates down the plan tree.
+
+        Filter is where pushdown happens; every other node here just recurses
+        into its children and rebuilds if one changed (transform_children). A
+        SetOperation rewrites its two branches; an unhandled node bottoms out.
+        """
         if isinstance(plan, Filter):
             return self._push_filter(plan)
-
-        if isinstance(plan, Projection):
-            new_input = self._push_down(plan.input)
-            if new_input != plan.input:
-                return plan.model_copy(update={"input": new_input})
-            return plan
-
-        if isinstance(plan, Join):
-            new_left = self._push_down(plan.left)
-            new_right = self._push_down(plan.right)
-            if new_left != plan.left or new_right != plan.right:
-                return plan.model_copy(update={"left": new_left, "right": new_right})
-            return plan
-
-        if isinstance(plan, Aggregate):
-            new_input = self._push_down(plan.input)
-            if new_input != plan.input:
-                return plan.model_copy(update={"input": new_input})
-            return plan
-
-        if isinstance(plan, Limit):
-            new_input = self._push_down(plan.input)
-            if new_input != plan.input:
-                return plan.model_copy(update={"input": new_input})
-            return plan
-
-        if isinstance(plan, Sort):
-            new_input = self._push_down(plan.input)
-            if new_input != plan.input:
-                return plan.model_copy(update={"input": new_input})
-            return plan
-
         if isinstance(plan, SetOperation):
             return _rewrite_set_operation_branches(plan, self._push_down)
-
+        if isinstance(plan, (Projection, Join, Aggregate, Limit, Sort)):
+            return transform_children(plan, self._push_down)
         return plan
 
     def _push_filter(self, filter_node: Filter) -> LogicalPlanNode:
@@ -539,81 +514,17 @@ class LimitPushdownRule(OptimizationRule):
         return self._rewrite_plan(plan)
 
     def _rewrite_plan(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Recursively rewrite plan, pushing limits when safe."""
-        handler = self._get_rewrite_handler(plan)
-        if handler is None:
-            return plan
-        return handler(plan)
+        """Recursively rewrite plan, pushing limits when safe.
 
-    def _get_rewrite_handler(self, plan: LogicalPlanNode):
-        """Return rewrite handler for plan type."""
-        handlers = {
-            Limit: self._push_limit_node,
-            Projection: self._rewrite_projection,
-            Filter: self._rewrite_filter,
-            Sort: self._rewrite_sort,
-            Aggregate: self._rewrite_aggregate,
-            Join: self._rewrite_join,
-            Union: self._rewrite_union,
-            Explain: self._rewrite_explain,
-        }
-        return handlers.get(type(plan))
-
-    def _rewrite_projection(self, projection: Projection) -> LogicalPlanNode:
-        """Rewrite projection child."""
-        new_input = self._rewrite_plan(projection.input)
-        if new_input != projection.input:
-            return projection.model_copy(update={"input": new_input})
-        return projection
-
-    def _rewrite_filter(self, filter_node: Filter) -> LogicalPlanNode:
-        """Rewrite filter child."""
-        new_input = self._rewrite_plan(filter_node.input)
-        if new_input != filter_node.input:
-            return Filter(input=new_input, predicate=filter_node.predicate)
-        return filter_node
-
-    def _rewrite_sort(self, sort: Sort) -> LogicalPlanNode:
-        """Rewrite sort child."""
-        new_input = self._rewrite_plan(sort.input)
-        if new_input != sort.input:
-            return sort.model_copy(update={"input": new_input})
-        return sort
-
-    def _rewrite_aggregate(self, aggregate: Aggregate) -> LogicalPlanNode:
-        """Rewrite aggregate child."""
-        new_input = self._rewrite_plan(aggregate.input)
-        if new_input != aggregate.input:
-            return aggregate.model_copy(update={"input": new_input})
-        return aggregate
-
-    def _rewrite_join(self, join: Join) -> LogicalPlanNode:
-        """Rewrite join children."""
-        new_left = self._rewrite_plan(join.left)
-        new_right = self._rewrite_plan(join.right)
-        if new_left != join.left or new_right != join.right:
-            return join.model_copy(update={"left": new_left, "right": new_right})
-        return join
-
-    def _rewrite_union(self, union: Union) -> LogicalPlanNode:
-        """Rewrite union inputs."""
-        new_inputs = []
-        changed = False
-        for child in union.inputs:
-            rewritten = self._rewrite_plan(child)
-            new_inputs.append(rewritten)
-            if rewritten != child:
-                changed = True
-        if changed:
-            return union.model_copy(update={"inputs": new_inputs})
-        return union
-
-    def _rewrite_explain(self, explain: Explain) -> LogicalPlanNode:
-        """Rewrite explain child."""
-        new_input = self._rewrite_plan(explain.input)
-        if new_input != explain.input:
-            return explain.model_copy(update={"input": new_input})
-        return explain
+        A Limit is pushed downward (_push_limit_node); every other handled node
+        just recurses into its children (transform_children). An unhandled node
+        type bottoms out unchanged.
+        """
+        if isinstance(plan, Limit):
+            return self._push_limit_node(plan)
+        if isinstance(plan, (Projection, Filter, Sort, Aggregate, Join, Union, Explain)):
+            return transform_children(plan, self._rewrite_plan)
+        return plan
 
     def _push_limit_node(self, limit: Limit) -> LogicalPlanNode:
         """Push a single Limit node downward when safe."""
@@ -984,20 +895,34 @@ class OrderByPushdownRule(OptimizationRule):
         return None
 
     def _recurse_node(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Recurse into node children."""
-        if isinstance(plan, (Projection, Filter, Limit, Sort)):
-            return self._recurse_unary(plan)
+        """Recurse into node children.
 
-        if isinstance(plan, Join):
-            return self._recurse_join(plan)
-
-        if isinstance(plan, Aggregate):
-            return self._recurse_aggregate(plan)
-
+        Filter has a special arm (a HAVING predicate folds onto an aggregate
+        scan); every other handled node just recurses and rebuilds if a child
+        changed (transform_children). A SetOperation rewrites its two branches.
+        """
+        if isinstance(plan, Filter):
+            return self._recurse_filter(plan)
         if isinstance(plan, SetOperation):
             return _rewrite_set_operation_branches(plan, self._push_order_by)
-
+        if isinstance(plan, (Projection, Limit, Sort, Join, Aggregate)):
+            return transform_children(plan, self._push_order_by)
         return plan
+
+    def _recurse_filter(self, plan: Filter) -> LogicalPlanNode:
+        """Recurse into a Filter, folding HAVING onto an aggregate scan.
+
+        When order-by pushdown turns the input into an aggregate-bearing Scan,
+        the Filter is a HAVING clause and merges onto the scan's filters;
+        otherwise the Filter is rebuilt over its new input.
+        """
+        new_input = self._push_order_by(plan.input)
+        if new_input == plan.input:
+            return plan
+        if isinstance(new_input, Scan) and new_input.aggregates:
+            merged_filters = self._merge_filters(new_input.filters, plan.predicate)
+            return new_input.model_copy(update={"filters": merged_filters})
+        return plan.model_copy(update={"input": new_input})
 
     def _resolve_scan(self, node: LogicalPlanNode) -> Optional[Scan]:
         """Return the first Scan found under wrappers (Projection/Filter/Limit/Sort/Aggregate)."""
@@ -1022,58 +947,12 @@ class OrderByPushdownRule(OptimizationRule):
                 continue
             return None
 
-    def _recurse_unary(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Recurse into unary node."""
-        new_input = self._push_order_by(plan.input)
-        if new_input == plan.input:
-            return plan
-
-        if isinstance(plan, Projection):
-            return plan.model_copy(update={"input": new_input})
-
-        if isinstance(plan, Filter):
-            if isinstance(new_input, Scan) and new_input.aggregates:
-                merged_filters = self._merge_filters(new_input.filters, plan.predicate)
-                return new_input.model_copy(update={"filters": merged_filters})
-            return plan.model_copy(update={"input": new_input})
-
-        if isinstance(plan, Limit):
-            return plan.model_copy(update={"input": new_input})
-
-        if isinstance(plan, Sort):
-            return Sort(
-                input=new_input,
-                sort_keys=plan.sort_keys,
-                ascending=plan.ascending,
-                nulls_order=plan.nulls_order,
-            )
-
-        return plan
-
     def _merge_filters(
         self, left: Optional[Expression], right: Optional[Expression]
     ) -> Optional[Expression]:
         """None-safe AND of two predicate expressions (HAVING folded onto an
         aggregate-bearing scan after order-by pushdown)."""
         return and_expressions(left, right)
-
-    def _recurse_join(self, join: Join) -> LogicalPlanNode:
-        """Recurse into join node."""
-        new_left = self._push_order_by(join.left)
-        new_right = self._push_order_by(join.right)
-
-        if new_left == join.left and new_right == join.right:
-            return join
-
-        return join.model_copy(update={"left": new_left, "right": new_right})
-
-    def _recurse_aggregate(self, agg: Aggregate) -> LogicalPlanNode:
-        """Recurse into aggregate node."""
-        new_input = self._push_order_by(agg.input)
-        if new_input == agg.input:
-            return agg
-
-        return agg.model_copy(update={"input": new_input})
 
     def name(self) -> str:
         """Return this rule's identifier (used in logging and EXPLAIN)."""
@@ -1138,47 +1017,16 @@ class AggregatePushdownRule(OptimizationRule):
         return and_expressions(scan_filter, filter_filter)
 
     def _recurse_node(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Recurse into node children."""
-        if isinstance(plan, (Projection, Filter, Limit, Sort)):
-            return self._recurse_unary(plan)
+        """Recurse into node children, rebuilding if a child changed.
 
-        if isinstance(plan, Join):
-            return self._recurse_join(plan)
-
+        Every handled node just recurses (transform_children); a SetOperation
+        rewrites its two branches. An unhandled node bottoms out unchanged.
+        """
         if isinstance(plan, SetOperation):
             return _rewrite_set_operation_branches(plan, self._push_aggregate)
-
+        if isinstance(plan, (Projection, Filter, Limit, Sort, Join)):
+            return transform_children(plan, self._push_aggregate)
         return plan
-
-    def _recurse_unary(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Recurse into unary node."""
-        new_input = self._push_aggregate(plan.input)
-        if new_input == plan.input:
-            return plan
-
-        if isinstance(plan, Projection):
-            return plan.model_copy(update={"input": new_input})
-
-        if isinstance(plan, Filter):
-            return Filter(input=new_input, predicate=plan.predicate)
-
-        if isinstance(plan, Limit):
-            return plan.model_copy(update={"input": new_input})
-
-        if isinstance(plan, Sort):
-            return plan.model_copy(update={"input": new_input})
-
-        return plan
-
-    def _recurse_join(self, join: Join) -> LogicalPlanNode:
-        """Recurse into join node."""
-        new_left = self._push_aggregate(join.left)
-        new_right = self._push_aggregate(join.right)
-
-        if new_left == join.left and new_right == join.right:
-            return join
-
-        return join.model_copy(update={"left": new_left, "right": new_right})
 
     def name(self) -> str:
         """Return this rule's identifier (used in logging and EXPLAIN)."""
