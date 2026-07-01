@@ -642,8 +642,14 @@ class TestOrderByPushdown:
         assert isinstance(key.left, ColumnRef)
         assert key.left.column == "order_id"
 
-    def test_order_by_join_side_pushdown(self):
-        """Sort on one join side should annotate that side but keep top sort."""
+    def test_order_by_over_join_kept_above(self):
+        """A Sort over a join stays above it; a join does not preserve row order.
+
+        Pushing ORDER BY into a scan below a join would not survive the join
+        (hash/nested-loop joins reorder), so the explicit Sort is kept over the
+        join and neither side is annotated. When the whole subtree is
+        single-source, single-source pushdown renders the ORDER BY remotely.
+        """
         left = Scan(
             datasource="test_ds",
             schema_name="public",
@@ -671,9 +677,7 @@ class TestOrderByPushdown:
 
         assert isinstance(result, Sort)
         assert isinstance(result.input, Join)
-        assert isinstance(result.input.left, Scan)
-        assert result.input.left.order_by_keys is not None
-        assert result.input.left.order_by_keys[0].column == "id"
+        assert result.input.left.order_by_keys is None
         assert result.input.right.order_by_keys is None
 
     def test_order_by_join_cross_datasource_avoids_pushdown(self):

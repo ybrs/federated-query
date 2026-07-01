@@ -849,40 +849,33 @@ class OrderByPushdownRule(OptimizationRule):
         return filter_node.model_copy(update={"input": pushed_child})
 
     def _push_through_join(self, sort: Sort, join: Join) -> LogicalPlanNode:
-        """Push ORDER BY metadata into a single join side when safe."""
-        left_scan = self._resolve_scan(join.left)
-        right_scan = self._resolve_scan(join.right)
-        if left_scan is not None and right_scan is not None:
-            if left_scan.datasource != right_scan.datasource:
-                return sort
-        sort_cols = pushdown.column_key_set(sort.sort_keys)
-        left_cols = pushdown.available_columns(join.left)
-        right_cols = pushdown.available_columns(join.right)
+        """Keep the Sort above a join; a join does not preserve input row order.
 
-        left_only = pushdown.columns_belong_to_side(sort_cols, left_cols, right_cols)
-        right_only = pushdown.columns_belong_to_side(sort_cols, right_cols, left_cols)
-
-        new_left = (
-            self._push_sort_into_child(sort, join.left) if left_only else join.left
-        )
-        new_right = (
-            self._push_sort_into_child(sort, join.right) if right_only else join.right
-        )
-
-        rebuilt = join.model_copy(update={"left": new_left, "right": new_right})
-        return sort.model_copy(update={"input": rebuilt})
+        Hash and nested-loop joins reorder rows, so ORDER BY pushed into a join
+        input (as scan metadata) would not survive to the output - the final
+        result would come back unsorted. The explicit Sort therefore stays over
+        the join. When the whole Sort-over-join subtree is single-source,
+        single-source pushdown renders it as the remote query's ORDER BY (order
+        preserved by the source); otherwise the Sort executes locally over the
+        materialized join output.
+        """
+        return sort
 
     def _push_sort_into_child(
         self,
         sort: Sort,
         child: LogicalPlanNode,
     ) -> LogicalPlanNode:
-        """Push sort keys into a specific child and return transformed child."""
+        """Push a sort into a child and return the result of that pushdown.
+
+        The result is whatever ORDER BY pushdown made of ``Sort(child)``: the
+        child with the order dissolved into scan metadata (no explicit Sort
+        left), or an explicit Sort kept wherever it could not descend (e.g. above
+        a join, which does not preserve input order). It must NOT strip a kept
+        Sort - dropping it would silently lose the ordering.
+        """
         injected = sort.model_copy(update={"input": child})
-        pushed = self._push_order_by(injected)
-        if isinstance(pushed, Sort):
-            return pushed.input
-        return pushed
+        return self._push_order_by(injected)
 
     def _push_through_aggregate(
         self, sort: Sort, aggregate: Aggregate
