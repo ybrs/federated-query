@@ -29,43 +29,65 @@ _STATE_NAMES = None
 def _state_class_names():
     """Return (and cache) every StateModel subclass name in the engine.
 
-    Imports every federated_query submodule so the whole subclass tree exists,
-    then walks the subclasses transitively. These are the class names whose bare
-    construction FQ001 forbids and whose ``.create`` FQ002 guards.
+    Computed by a STATIC scan of the federated_query source: parse every module,
+    record each class and its base names, then take the transitive closure of
+    classes that reach ``StateModel``. This deliberately does NOT import the
+    package - the lint must run in any venv (including one where the package is
+    not installed or its heavy deps are missing), and a flake8 worker should not
+    pay to import the whole engine. These names are what FQ001 (bare init) and
+    FQ002 (.create) guard.
     """
     global _STATE_NAMES
     if _STATE_NAMES is not None:
         return _STATE_NAMES
-    import importlib
-    import pkgutil
     import pathlib
 
-    import federated_query
-    from federated_query.model import StateModel
+    package = pathlib.Path(__file__).resolve().parent.parent / "federated_query"
+    class_bases = {}
+    for path in package.rglob("*.py"):
+        try:
+            tree = ast.parse(path.read_text())
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                bases = set(filter(None, (_rightmost_name(base) for base in node.bases)))
+                class_bases.setdefault(node.name, set()).update(bases)
+    _STATE_NAMES = _closure_over_statemodel(class_bases)
+    return _STATE_NAMES
 
-    root = pathlib.Path(federated_query.__file__).parent
-    for module in pkgutil.walk_packages([str(root)], prefix="federated_query."):
-        importlib.import_module(module.name)
-    names = set()
-    pending = list(StateModel.__subclasses__())
-    while pending:
-        cls = pending.pop()
-        names.add(cls.__name__)
-        pending.extend(cls.__subclasses__())
-    _STATE_NAMES = names
-    return names
+
+def _closure_over_statemodel(class_bases):
+    """Return every class name that transitively subclasses StateModel.
+
+    ``class_bases`` maps a class name to the set of its base names. A class is a
+    state class if it lists StateModel as a base or lists any known state class;
+    iterate to a fixpoint so multi-level subclassing is covered.
+    """
+    state = set()
+    changed = True
+    while changed:
+        changed = False
+        for name, bases in class_bases.items():
+            if name not in state and ("StateModel" in bases or bases & state):
+                state.add(name)
+                changed = True
+    return state
 
 
 def _rightmost_name(expr):
-    """Return the trailing identifier of a Name or Attribute, else None.
+    """Return the trailing identifier of a Name / Attribute / Subscript, else None.
 
-    ``Scan`` -> ``Scan``; ``physical.Scan`` -> ``Scan``. Lets a bare and a
-    module-qualified reference to a class be treated the same.
+    ``Scan`` -> ``Scan``; ``physical.Scan`` -> ``Scan``; ``Generic[T]`` -> the
+    base of the subscript. Lets a bare, module-qualified, or subscripted
+    reference to a class be treated the same.
     """
     if isinstance(expr, ast.Name):
         return expr.id
     if isinstance(expr, ast.Attribute):
         return expr.attr
+    if isinstance(expr, ast.Subscript):
+        return _rightmost_name(expr.value)
     return None
 
 

@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/workspace/venv-fedq/bin/python /workspace/federated-query/.claude/hooks/posttooluse_lint.py"
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/posttooluse_lint.py\""
           }
         ]
       }
