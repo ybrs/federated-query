@@ -1,0 +1,5 @@
+[flake8:local-plugins]
+extension =
+    FQ = flake8_fedq:FedqConstructionChecker
+paths =
+    ./lint

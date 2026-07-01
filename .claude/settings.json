@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/workspace/venv-fedq/bin/python /workspace/federated-query/.claude/hooks/posttooluse_lint.py"
+          }
+        ]
+      }
+    ]
+  }
+}

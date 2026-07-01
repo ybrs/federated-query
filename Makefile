@@ -5,9 +5,11 @@
 # self-contained instance with no system install. See README-test-harness-setup.md.
 
 PYTHON ?= python3
-VENV   ?= ../venv-fedq
+# Python virtualenv. An activated venv (VIRTUAL_ENV) is used automatically;
+# otherwise falls back to the sibling ../venv-fedq. Override: make VENV=/path.
+VENV   ?= $(if $(VIRTUAL_ENV),$(VIRTUAL_ENV),../venv-fedq)
 
-.PHONY: download_postgres pg-start pg-stop test test-no-db install
+.PHONY: download_postgres pg-start pg-stop test test-no-db install lint lint-ascii lint-construction
 
 # Download the prebuilt PostgreSQL binaries into ./postgres-17 (one-time).
 download_postgres:
@@ -32,3 +34,16 @@ test:
 # Run only the tests that do not require PostgreSQL.
 test-no-db:
 	$(VENV)/bin/python -m pytest -q --ignore=tests/e2e_decorrelation
+
+# Run all linters (same checks the PostToolUse hook runs per edited file).
+lint: lint-ascii lint-construction
+
+# Codepoint rule: fail on any character above U+00FF anywhere in the repo.
+# --error makes semgrep exit non-zero when it finds a match.
+lint-ascii:
+	$(VENV)/bin/semgrep --config .semgrep.yml --error --quiet .
+
+# Construction rules: FQ001 (no unjustified bare init) and FQ002 (.create needs
+# >=2 comment lines) over the engine, via the flake8 plugin in lint/.
+lint-construction:
+	$(VENV)/bin/flake8 --select=FQ federated_query
