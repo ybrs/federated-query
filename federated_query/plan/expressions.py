@@ -60,6 +60,18 @@ class ColumnRef(Expression):
     column: str
     data_type: Optional[DataType] = None  # Set during binding
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        table: Optional[str],
+        column: str,
+        data_type: Optional[DataType] = None,
+    ) -> "ColumnRef":
+        """Build a ColumnRef naming a (possibly qualified) column.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(table=table, column=column, data_type=data_type)
+
     def get_type(self) -> DataType:
         if self.data_type is None:
             raise NotImplementedError("Type must be set during binding")
@@ -79,6 +91,12 @@ class Literal(Expression):
 
     value: Any
     data_type: DataType
+
+    @classmethod
+    def create(cls, *, value: Any, data_type: DataType) -> "Literal":
+        """Build a Literal value expression of a given data type.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(value=value, data_type=data_type)
 
     def get_type(self) -> DataType:
         return self.data_type
@@ -131,6 +149,14 @@ class BinaryOp(Expression):
     left: Expression
     right: Expression
 
+    @classmethod
+    def create(
+        cls, *, op: BinaryOpType, left: Expression, right: Expression
+    ) -> "BinaryOp":
+        """Build a binary operation over two operand expressions.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(op=op, left=left, right=right)
+
     def get_type(self) -> DataType:
         # Logical and comparison operators return boolean
         if self.op in (
@@ -181,6 +207,12 @@ class UnaryOp(Expression):
     op: UnaryOpType
     operand: Expression
 
+    @classmethod
+    def create(cls, *, op: UnaryOpType, operand: Expression) -> "UnaryOp":
+        """Build a unary operation over a single operand expression.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(op=op, operand=operand)
+
     def get_type(self) -> DataType:
         if self.op in (UnaryOpType.NOT, UnaryOpType.IS_NULL, UnaryOpType.IS_NOT_NULL):
             return DataType.BOOLEAN
@@ -205,6 +237,28 @@ class FunctionCall(Expression):
     within_group_key: Optional[Expression] = None
     within_group_desc: bool = False
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        function_name: str,
+        args: List[Expression],
+        is_aggregate: bool = False,
+        distinct: bool = False,
+        within_group_key: Optional[Expression] = None,
+        within_group_desc: bool = False,
+    ) -> "FunctionCall":
+        """Build a function-call expression (scalar or aggregate).
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(
+            function_name=function_name,
+            args=args,
+            is_aggregate=is_aggregate,
+            distinct=distinct,
+            within_group_key=within_group_key,
+            within_group_desc=within_group_desc,
+        )
+
     def get_type(self) -> DataType:
         # Type depends on function - needs catalog lookup
         # Simplified for now
@@ -227,6 +281,17 @@ class CaseExpr(Expression):
     when_clauses: List[Tuple[Expression, Expression]]  # (condition, result)
     else_result: Optional[Expression]
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        when_clauses: List[Tuple[Expression, Expression]],
+        else_result: Optional[Expression],
+    ) -> "CaseExpr":
+        """Build a CASE expression from WHEN clauses and an optional ELSE.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(when_clauses=when_clauses, else_result=else_result)
+
     def get_type(self) -> DataType:
         # Return type is the type of the first result expression
         if self.when_clauses:
@@ -248,6 +313,14 @@ class InList(Expression):
     value: Expression
     options: List[Expression]
 
+    @classmethod
+    def create(
+        cls, *, value: Expression, options: List[Expression]
+    ) -> "InList":
+        """Build an IN-list membership test over a value and options.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(value=value, options=options)
+
     def get_type(self) -> DataType:
         return DataType.BOOLEAN
 
@@ -264,6 +337,18 @@ class BetweenExpression(Expression):
     value: Expression
     lower: Expression
     upper: Expression
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        value: Expression,
+        lower: Expression,
+        upper: Expression,
+    ) -> "BetweenExpression":
+        """Build a BETWEEN range test over a value and its bounds.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(value=value, lower=lower, upper=upper)
 
     def get_type(self) -> DataType:
         return DataType.BOOLEAN
@@ -287,6 +372,18 @@ class Cast(Expression):
     expr: Expression
     target_type: str
     data_type: Optional[DataType] = None
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        expr: Expression,
+        target_type: str,
+        data_type: Optional[DataType] = None,
+    ) -> "Cast":
+        """Build a CAST of an expression to a target SQL type.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(expr=expr, target_type=target_type, data_type=data_type)
 
     def get_type(self) -> DataType:
         if self.data_type is None:
@@ -317,6 +414,28 @@ class WindowExpr(Expression):
     order_nulls: List[Optional[str]]
     frame: Optional[str] = None
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        function: Expression,
+        partition_by: List[Expression],
+        order_keys: List[Expression],
+        order_ascending: List[bool],
+        order_nulls: List[Optional[str]],
+        frame: Optional[str] = None,
+    ) -> "WindowExpr":
+        """Build a window function with its PARTITION BY / ORDER BY / frame.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(
+            function=function,
+            partition_by=partition_by,
+            order_keys=order_keys,
+            order_ascending=order_ascending,
+            order_nulls=order_nulls,
+            frame=frame,
+        )
+
     def get_type(self) -> DataType:
         """The window's type is the type of its underlying function."""
         return self.function.get_type()
@@ -338,6 +457,12 @@ class Extract(Expression):
 
     field: str
     source: Expression
+
+    @classmethod
+    def create(cls, *, field: str, source: Expression) -> "Extract":
+        """Build an EXTRACT of a date/time field from a source expression.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(field=field, source=source)
 
     def get_type(self) -> DataType:
         """EXTRACT yields a numeric component, modelled as a double."""
@@ -361,6 +486,12 @@ class Interval(Expression):
 
     value: str
     unit: Optional[str]
+
+    @classmethod
+    def create(cls, *, value: str, unit: Optional[str]) -> "Interval":
+        """Build an INTERVAL literal from its magnitude and optional unit.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(value=value, unit=unit)
 
     def get_type(self) -> DataType:
         """Interval literals carry the INTERVAL type."""
@@ -462,6 +593,12 @@ class SubqueryExpression(Expression):
     # validated as a dataclass field either).
     subquery: Any
 
+    @classmethod
+    def create(cls, *, subquery: Any) -> "SubqueryExpression":
+        """Build a scalar subquery expression wrapping a logical plan.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(subquery=subquery)
+
     def get_type(self) -> DataType:
         return DataType.NULL
 
@@ -483,6 +620,12 @@ class ExistsExpression(Expression):
     # validated as a dataclass field either).
     subquery: Any
     negated: bool = False
+
+    @classmethod
+    def create(cls, *, subquery: Any, negated: bool = False) -> "ExistsExpression":
+        """Build an EXISTS / NOT EXISTS predicate over a subquery plan.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(subquery=subquery, negated=negated)
 
     def get_type(self) -> DataType:
         return DataType.BOOLEAN
@@ -509,6 +652,14 @@ class InSubquery(Expression):
     subquery: Any
     negated: bool = False
 
+    @classmethod
+    def create(
+        cls, *, value: Expression, subquery: Any, negated: bool = False
+    ) -> "InSubquery":
+        """Build an IN / NOT IN predicate pairing a value with a subquery plan.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(value=value, subquery=subquery, negated=negated)
+
     def get_type(self) -> DataType:
         return DataType.BOOLEAN
 
@@ -534,6 +685,12 @@ class TupleExpression(Expression):
 
     items: Tuple[Expression, ...]
 
+    @classmethod
+    def create(cls, *, items: Tuple[Expression, ...]) -> "TupleExpression":
+        """Build a row-value tuple expression from its item expressions.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(items=items)
+
     def get_type(self) -> DataType:
         return DataType.NULL
 
@@ -554,6 +711,24 @@ class QuantifiedComparison(Expression):
     # so the real type would be a runtime import cycle (it was never
     # validated as a dataclass field either).
     subquery: Any
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        operator: BinaryOpType,
+        quantifier: Quantifier,
+        left: Expression,
+        subquery: Any,
+    ) -> "QuantifiedComparison":
+        """Build a quantified comparison (op ANY/SOME/ALL subquery).
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(
+            operator=operator,
+            quantifier=quantifier,
+            left=left,
+            subquery=subquery,
+        )
 
     def get_type(self) -> DataType:
         return DataType.BOOLEAN
@@ -805,7 +980,9 @@ def _combine(terms: List[Expression], op: "BinaryOpType") -> Optional[Expression
         return None
     result = terms[0]
     for term in terms[1:]:
-        result = BinaryOp(op=op, left=result, right=term)
+        # Fresh node: folding two independent predicates into a new combined
+        # BinaryOp; there is no existing BinaryOp to derive this from.
+        result = BinaryOp.create(op=op, left=result, right=term)
     return result
 
 
@@ -817,7 +994,9 @@ def and_expressions(
         return right
     if right is None:
         return left
-    return BinaryOp(op=BinaryOpType.AND, left=left, right=right)
+    # Conjunction joining two non-null predicates into one AND expression.
+    # Reached only when both sides are present, so a real AND is required.
+    return BinaryOp.create(op=BinaryOpType.AND, left=left, right=right)
 
 
 def contains_aggregate(expr: Expression) -> bool:

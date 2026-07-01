@@ -248,7 +248,10 @@ class SingleSourcePushdown:
             return None
         if not connection.supports_capability(DataSourceCapability.JOINS):
             return None
-        return PhysicalRemoteQuery(
+        # Send the rendered SQL to the single owning source and stream its rows
+        # back, mapping remote result columns to their engine-internal names.
+        # Lowered from the whole pushed subtree collapsed into one remote query.
+        return PhysicalRemoteQuery.create(
             datasource=context.datasource,
             datasource_connection=connection,
             query_ast=self._render(context),

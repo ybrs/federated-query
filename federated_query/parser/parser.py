@@ -206,7 +206,9 @@ class Parser:
         distinct = bool(set_op.args.get("distinct"))
         left = self._convert_set_branch(set_op.this)
         right = self._convert_set_branch(set_op.expression)
-        plan: LogicalPlanNode = SetOperation(
+        # The binary UNION/INTERSECT/EXCEPT of two query blocks maps to one
+        # SetOperation node, built from the two converted branches and the kind.
+        plan: LogicalPlanNode = SetOperation.create(
             left=left, right=right, kind=kind, distinct=distinct
         )
         plan = self._build_order_by_clause(set_op, plan)
@@ -339,7 +341,9 @@ class Parser:
         """Nest CTE definitions around the body, innermost binding last."""
         plan = child
         for name, columns, cte_plan in reversed(definitions):
-            plan = CTE(
+            # A WITH binding wraps the body in a CTE node naming the defined
+            # relation, built from this definition's plan around the inner plan.
+            plan = CTE.create(
                 name=name,
                 cte_plan=cte_plan,
                 child=plan,
@@ -370,7 +374,9 @@ class Parser:
         if table_expr.name not in self._cte_names:
             return None
         alias = self._extract_table_alias(table_expr)
-        return CTERef(name=table_expr.name, alias=alias, columns=columns)
+        # A bare table name matching an in-scope WITH name is a CTE reference,
+        # built from the sqlglot Table node's name, alias and needed columns.
+        return CTERef.create(name=table_expr.name, alias=alias, columns=columns)
 
     def _build_values_select(self, select: exp.Select) -> LogicalPlanNode:
         """Build a single-row Values plan for a FROM-less SELECT.
@@ -388,7 +394,9 @@ class Parser:
         for select_expr in select.expressions:
             row.append(self._convert_expression(select_expr))
             names.append(self._get_alias(select_expr))
-        return Values(rows=[row], output_names=names)
+        # A FROM-less SELECT (SELECT 1) is a single constant row, modelled as a
+        # Values relation built from the converted projection expressions.
+        return Values.create(rows=[row], output_names=names)
 
     def _convert_explain(self, describe: exp.Describe) -> LogicalPlanNode:
         """Convert a native ``exp.Describe`` (EXPLAIN) node to a logical plan.
@@ -402,7 +410,9 @@ class Parser:
             raise ValueError("EXPLAIN requires a statement to describe")
         child_plan = self.ast_to_logical_plan(inner_statement)
         explain_format = self._explain_format(describe)
-        return Explain(input=child_plan, format=explain_format)
+        # EXPLAIN wraps the described statement in an Explain node, built from
+        # the already-converted child plan plus the requested output format.
+        return Explain.create(input=child_plan, format=explain_format)
 
     def _explain_format(self, describe: exp.Describe) -> ExplainFormat:
         """Map the dialect's JSON flag to an ExplainFormat."""
@@ -447,7 +457,9 @@ class Parser:
         schema_name = table_parts[1]
         table_name = table_parts[2]
 
-        return Scan(
+        # A plain FROM table is a base-relation Scan, built from the sqlglot
+        # Table node's datasource/schema/name plus the columns the query needs.
+        return Scan.create(
             datasource=datasource,
             schema_name=schema_name,
             table_name=table_name,
@@ -482,7 +494,9 @@ class Parser:
         if cte_ref is not None:
             return cte_ref
         table_parts = self._extract_table_parts(table_expr)
-        return Scan(
+        # One join input that is a base table becomes a Scan, built from the
+        # sqlglot Table node with only the columns this side of the join uses.
+        return Scan.create(
             datasource=table_parts[0],
             schema_name=table_parts[1],
             table_name=table_parts[2],
@@ -497,7 +511,9 @@ class Parser:
         if not alias:
             raise ValueError("Derived tables require an alias")
         inner_plan = self.ast_to_logical_plan(subquery.this)
-        return SubqueryScan(input=inner_plan, alias=alias)
+        # A derived table (subquery in FROM) is a SubqueryScan wrapping the
+        # converted inner plan under the required table alias.
+        return SubqueryScan.create(input=inner_plan, alias=alias)
 
     def _values_relation(self, values: exp.Values) -> SubqueryScan:
         """Build a derived table from a VALUES list: ``(VALUES ...) AS v(a, b)``.
@@ -511,7 +527,11 @@ class Parser:
             raise ValueError("VALUES in FROM requires an alias")
         rows = self._convert_values_rows(values)
         names = self._values_column_names(values, rows)
-        return SubqueryScan(input=Values(rows=rows, output_names=names), alias=alias)
+        # A VALUES list in FROM is a constant Values relation wrapped as a
+        # SubqueryScan so its alias and column names name it like a derived table.
+        return SubqueryScan.create(
+            input=Values.create(rows=rows, output_names=names), alias=alias
+        )
 
     def _convert_values_rows(self, values: exp.Values) -> List[List[Expression]]:
         """Convert each VALUES row (a tuple of constants) into expressions."""
@@ -602,7 +622,9 @@ class Parser:
             if join_clause.args.get("on"):
                 join_condition = self._convert_expression(join_clause.args["on"])
 
-            current_plan = Join(
+            # Each JOIN clause folds the running plan and the right input into a
+            # binary Join node with the side/kind, ON condition and USING/NATURAL.
+            current_plan = Join.create(
                 left=current_plan,
                 right=right_plan,
                 join_type=join_type,
@@ -627,12 +649,16 @@ class Parser:
         alias = lateral.alias
         if not alias:
             raise ValueError("LATERAL derived tables require an alias")
-        right = SubqueryScan(
+        # The LATERAL right side is a derived table that may reference the left;
+        # built as a SubqueryScan over its converted inner plan under the alias.
+        right = SubqueryScan.create(
             input=self.ast_to_logical_plan(lateral.this.this), alias=alias
         )
         side = join_clause.args.get("side")
         join_type = JoinType.LEFT if side else JoinType.INNER
-        return LateralJoin(left=left_plan, right=right, join_type=join_type)
+        # A LATERAL join is a dependent join, built from the left plan and the
+        # lateral right; LEFT when a side keyword is present, else INNER.
+        return LateralJoin.create(left=left_plan, right=right, join_type=join_type)
 
     def _is_natural_join(self, join_clause: exp.Join) -> bool:
         """Whether the JOIN carries the NATURAL method keyword."""
@@ -845,7 +871,9 @@ class Parser:
 
         self._reject_window_in_clause(where.this, "WHERE")
         predicate = self._convert_expression(where.this)
-        return Filter(input=input_plan, predicate=predicate)
+        # A WHERE clause is a Filter over its input, built from the converted
+        # boolean predicate of the sqlglot Where node.
+        return Filter.create(input=input_plan, predicate=predicate)
 
     def _reject_window_in_clause(self, node: exp.Expression, clause: str) -> None:
         """Reject a window function used in WHERE / GROUP BY / HAVING.
@@ -945,7 +973,9 @@ class Parser:
         aggregates = self._extract_aggregates_from_select(select)
         output_names = self._extract_output_names(select)
 
-        return Aggregate(
+        # An aggregate SELECT with no GROUP BY collapses the input to one row;
+        # built with an empty group_by from the converted SELECT-list aggregates.
+        return Aggregate.create(
             input=input_plan,
             group_by=[],
             aggregates=aggregates,
@@ -970,7 +1000,9 @@ class Parser:
         aggregates = self._extract_aggregates_from_select(select)
         output_names = self._extract_output_names(select)
 
-        return Aggregate(
+        # A GROUP BY SELECT is an Aggregate, built from the converted grouping
+        # keys, SELECT-list aggregates and any expanded ROLLUP/CUBE grouping sets.
+        return Aggregate.create(
             input=input_plan,
             group_by=group_by_exprs,
             aggregates=aggregates,
@@ -1152,7 +1184,9 @@ class Parser:
         if isinstance(input_plan, Aggregate):
             predicate = self._rewrite_having_predicate(predicate, input_plan)
 
-        return Filter(input=input_plan, predicate=predicate)
+        # HAVING filters grouped rows, so it is a Filter above the Aggregate,
+        # built from the predicate rewritten to reference aggregate outputs.
+        return Filter.create(input=input_plan, predicate=predicate)
 
     def _is_aggregate_plan(self, plan: LogicalPlanNode) -> bool:
         """Whether the plan is an aggregate, optionally under a HAVING filter."""
@@ -1189,7 +1223,9 @@ class Parser:
 
         distinct_arg = select.args.get("distinct")
         has_distinct = bool(distinct_arg)
-        return Projection(
+        # The SELECT list is a Projection over its input, built from the
+        # converted output expressions, their aliases and any DISTINCT/DISTINCT ON.
+        return Projection.create(
             input=input_plan,
             expressions=expressions,
             aliases=aliases,
@@ -1259,7 +1295,9 @@ class Parser:
             else:
                 nulls_order.append(None)
 
-        return Sort(
+        # ORDER BY becomes a Sort over its input, built from the converted sort
+        # keys with their per-key ascending and NULLS FIRST/LAST directions.
+        return Sort.create(
             input=input_plan,
             sort_keys=sort_keys,
             ascending=ascending,
@@ -1287,7 +1325,9 @@ class Parser:
         offset_value = 0
         if offset_expr is not None:
             offset_value = int(offset_expr.expression.this)
-        return Limit(input=input_plan, limit=limit_value, offset=offset_value)
+        # LIMIT/OFFSET caps and skips rows, modelled as a Limit node built from
+        # the parsed row count and offset of the sqlglot Limit/Offset clauses.
+        return Limit.create(input=input_plan, limit=limit_value, offset=offset_value)
 
     def _limit_count(self, limit_expr) -> Optional[int]:
         """Return the row cap from a LIMIT or FETCH clause (None for OFFSET-only)."""
@@ -1335,9 +1375,13 @@ class Parser:
         if isinstance(expr, exp.Literal):
             return self._convert_literal(expr)
         if isinstance(expr, exp.Boolean):
-            return Literal(value=bool(expr.this), data_type=DataType.BOOLEAN)
+            # A TRUE/FALSE keyword maps to a boolean Literal, built directly
+            # from the sqlglot Boolean node's value.
+            return Literal.create(value=bool(expr.this), data_type=DataType.BOOLEAN)
         if isinstance(expr, exp.Null):
-            return Literal(value=None, data_type=DataType.NULL)
+            # A NULL keyword maps to a null-typed Literal carrying no value,
+            # built directly from the sqlglot Null node.
+            return Literal.create(value=None, data_type=DataType.NULL)
         if isinstance(expr, exp.Tuple):
             return self._convert_tuple_expression(expr)
         if isinstance(expr, exp.Exists):
@@ -1357,7 +1401,9 @@ class Parser:
         if isinstance(expr, exp.Alias):
             return self._convert_expression(expr.this)
         if isinstance(expr, exp.Star):
-            return ColumnRef(table=None, column="*")
+            # A bare * projection maps to a wildcard ColumnRef with no table
+            # qualifier, built from the sqlglot Star node.
+            return ColumnRef.create(table=None, column="*")
         if isinstance(expr, exp.Case):
             return self._convert_case_expression(expr)
         if isinstance(expr, exp.Extract):
@@ -1408,7 +1454,9 @@ class Parser:
         query = expr.args.get("query")
         if query is not None:
             subquery_plan = self._extract_subquery_plan(query)
-            return InSubquery(
+            # ``x IN (SELECT ...)`` is a non-negated InSubquery, built from the
+            # converted left value and the subquery's logical plan.
+            return InSubquery.create(
                 value=value_expr,
                 subquery=subquery_plan,
                 negated=False,
@@ -1417,7 +1465,9 @@ class Parser:
         for option in expr.expressions:
             converted = self._convert_expression(option)
             options.append(converted)
-        return InList(value=value_expr, options=options)
+        # ``x IN (a, b, ...)`` is an InList, built from the converted left value
+        # and the converted list of candidate value expressions.
+        return InList.create(value=value_expr, options=options)
 
     def _convert_between_expression(self, expr: exp.Between) -> Expression:
         """Convert BETWEEN to expression node.
@@ -1430,16 +1480,24 @@ class Parser:
         value_expr = self._convert_expression(expr.this)
         low_expr = self._convert_expression(expr.args["low"])
         high_expr = self._convert_expression(expr.args["high"])
-        return BetweenExpression(value=value_expr, lower=low_expr, upper=high_expr)
+        # BETWEEN maps to a BetweenExpression, built from the converted value
+        # and its converted low and high bound expressions.
+        return BetweenExpression.create(
+            value=value_expr, lower=low_expr, upper=high_expr
+        )
 
     def _convert_is_expression(self, expr: exp.Is) -> Expression:
         """Convert IS and IS NOT comparisons into unary operations."""
         operand = self._convert_expression(expr.this)
         comparison = expr.expression
         if isinstance(comparison, exp.Null):
-            return UnaryOp(op=UnaryOpType.IS_NULL, operand=operand)
+            # ``x IS NULL`` maps to an IS_NULL UnaryOp, built from the converted
+            # left operand of the sqlglot Is node.
+            return UnaryOp.create(op=UnaryOpType.IS_NULL, operand=operand)
         if isinstance(comparison, exp.Not) and isinstance(comparison.this, exp.Null):
-            return UnaryOp(op=UnaryOpType.IS_NOT_NULL, operand=operand)
+            # ``x IS NOT NULL`` maps to an IS_NOT_NULL UnaryOp, built from the
+            # converted left operand of the sqlglot Is node.
+            return UnaryOp.create(op=UnaryOpType.IS_NOT_NULL, operand=operand)
         raise ValueError("IS comparison supports only NULL and NOT NULL")
 
     def _convert_case_expression(self, expr: exp.Case) -> Expression:
@@ -1462,13 +1520,17 @@ class Parser:
             if result_expr is not None:
                 result = self._convert_expression(result_expr)
             else:
-                result = Literal(value=None, data_type=DataType.NULL)
+                # A WHEN with no THEN value yields SQL NULL, so build a
+                # null-typed Literal as this branch's result.
+                result = Literal.create(value=None, data_type=DataType.NULL)
             when_clauses.append((condition, result))
         else_expr = None
         default_expr = expr.args.get("default")
         if default_expr is not None:
             else_expr = self._convert_expression(default_expr)
-        return CaseExpr(when_clauses=when_clauses, else_result=else_expr)
+        # A searched CASE maps to a CaseExpr, built from the converted
+        # (condition, result) WHEN pairs and the optional ELSE result.
+        return CaseExpr.create(when_clauses=when_clauses, else_result=else_expr)
 
     def _convert_filter_aggregate(self, filter_expr: exp.Filter) -> FunctionCall:
         """Convert ``AGG(...) FILTER (WHERE p)`` into a CASE-guarded aggregate.
@@ -1494,8 +1556,12 @@ class Parser:
         """Build ``CASE WHEN predicate THEN arg END``, using 1 for COUNT(*)."""
         result = arg
         if isinstance(arg, ColumnRef) and arg.column == "*":
-            result = Literal(value=1, data_type=DataType.INTEGER)
-        return CaseExpr(when_clauses=[(predicate, result)], else_result=None)
+            # COUNT(*) has no column to guard, so substitute the integer literal
+            # 1 as the value counted inside the FILTER CASE guard.
+            result = Literal.create(value=1, data_type=DataType.INTEGER)
+        # ``agg(x) FILTER (WHERE p)`` becomes ``agg(CASE WHEN p THEN x END)``;
+        # build that CASE guard with no ELSE so non-matching rows drop out.
+        return CaseExpr.create(when_clauses=[(predicate, result)], else_result=None)
 
     def _convert_extract(self, extract: exp.Extract) -> Extract:
         """Convert EXTRACT(field FROM source), keeping the field keyword.
@@ -1505,7 +1571,9 @@ class Parser:
         """
         field = extract.this.name
         source = self._convert_expression(extract.expression)
-        return Extract(field=field, source=source)
+        # EXTRACT(field FROM source) maps to an Extract node, built from the
+        # field keyword and the converted source date/time expression.
+        return Extract.create(field=field, source=source)
 
     def _convert_date_trunc(self, trunc: exp.Func) -> FunctionCall:
         """Convert DATE_TRUNC into a portable two-argument function call.
@@ -1516,8 +1584,14 @@ class Parser:
         """
         unit = trunc.args["unit"].name
         source = self._convert_expression(trunc.this)
-        unit_literal = Literal(value=unit, data_type=DataType.VARCHAR)
-        return FunctionCall(function_name="DATE_TRUNC", args=[unit_literal, source])
+        # The truncation unit ('month', ...) becomes a string Literal argument,
+        # built from the unit keyword sqlglot stored on the trunc node.
+        unit_literal = Literal.create(value=unit, data_type=DataType.VARCHAR)
+        # Re-materialise the standard DATE_TRUNC(unit, source) call shape as a
+        # FunctionCall from the unit literal and the converted source.
+        return FunctionCall.create(
+            function_name="DATE_TRUNC", args=[unit_literal, source]
+        )
 
     def _convert_interval(self, interval: exp.Interval) -> Interval:
         """Convert an INTERVAL literal, preserving its magnitude and unit.
@@ -1528,12 +1602,16 @@ class Parser:
         value = interval.this.name
         unit_node = interval.args.get("unit")
         unit = unit_node.name if unit_node is not None else None
-        return Interval(value=value, unit=unit)
+        # An INTERVAL literal maps to an Interval node, built from the magnitude
+        # sqlglot kept in ``this`` and the optional unit keyword.
+        return Interval.create(value=value, unit=unit)
 
     def _convert_column(self, col: exp.Column) -> ColumnRef:
         """Convert sqlglot Column to ColumnRef."""
         table = col.table if col.table else None
-        return ColumnRef(table=table, column=col.name)
+        # A column reference maps to a ColumnRef, built fresh from the sqlglot
+        # Column node with the data type left unset for the binder to resolve.
+        return ColumnRef.create(table=table, column=col.name)
 
     def _convert_literal(self, lit: exp.Literal) -> Literal:
         """Convert sqlglot Literal to our Literal.
@@ -1544,10 +1622,14 @@ class Parser:
         """
         value_str = lit.this
         if lit.is_string:
-            return Literal(value=value_str, data_type=DataType.VARCHAR)
+            # A quoted literal is always text even when it looks numeric, so map
+            # it to a VARCHAR Literal built from the raw sqlglot literal string.
+            return Literal.create(value=value_str, data_type=DataType.VARCHAR)
         data_type = self._infer_literal_type(value_str)
         converted_value = self._convert_literal_value(value_str, data_type)
-        return Literal(value=converted_value, data_type=data_type)
+        # An unquoted literal maps to a typed Literal, built from the value
+        # coerced to the Python type of its inferred numeric/boolean data type.
+        return Literal.create(value=converted_value, data_type=data_type)
 
     def _infer_literal_type(self, value: str) -> DataType:
         """Infer data type from literal value."""
@@ -1574,7 +1656,9 @@ class Parser:
         items = []
         for item in tuple_expr.expressions:
             items.append(self._convert_expression(item))
-        return TupleExpression(items=tuple(items))
+        # A row value constructor ``(a, b)`` maps to a TupleExpression, built
+        # from the converted item expressions of the sqlglot Tuple node.
+        return TupleExpression.create(items=tuple(items))
 
     def _convert_like_predicate(self, like: exp.Like) -> Expression:
         """Convert LIKE, wrapping in NOT when sqlglot marks it negated.
@@ -1588,9 +1672,13 @@ class Parser:
             return quantified
         left = self._convert_expression(like.this)
         right = self._convert_expression(like.expression)
-        comparison = BinaryOp(op=BinaryOpType.LIKE, left=left, right=right)
+        # LIKE maps to a LIKE BinaryOp, built from the converted left value and
+        # the converted pattern expression.
+        comparison = BinaryOp.create(op=BinaryOpType.LIKE, left=left, right=right)
         if like.args.get("negate"):
-            return UnaryOp(op=UnaryOpType.NOT, operand=comparison)
+            # sqlglot folds NOT LIKE into a negate flag, so wrap the comparison
+            # in a NOT UnaryOp here to preserve the negation.
+            return UnaryOp.create(op=UnaryOpType.NOT, operand=comparison)
         return comparison
 
     def _convert_ilike_predicate(self, ilike: exp.ILike) -> Expression:
@@ -1601,9 +1689,13 @@ class Parser:
         """
         left = self._convert_expression(ilike.this)
         right = self._convert_expression(ilike.expression)
-        comparison = BinaryOp(op=BinaryOpType.ILIKE, left=left, right=right)
+        # ILIKE maps to a case-insensitive ILIKE BinaryOp, built from the
+        # converted left value and the converted pattern expression.
+        comparison = BinaryOp.create(op=BinaryOpType.ILIKE, left=left, right=right)
         if ilike.args.get("negate"):
-            return UnaryOp(op=UnaryOpType.NOT, operand=comparison)
+            # sqlglot folds NOT ILIKE into a negate flag, so wrap the comparison
+            # in a NOT UnaryOp here to preserve the negation.
+            return UnaryOp.create(op=UnaryOpType.NOT, operand=comparison)
         return comparison
 
     def _convert_cast(self, cast: exp.Cast) -> Cast:
@@ -1616,7 +1708,9 @@ class Parser:
         self._reject_unsupported_args(cast, self.SUPPORTED_CAST_ARGS, "CAST")
         inner = self._convert_expression(cast.this)
         target_type = cast.args["to"].sql(dialect=self.dialect)
-        return Cast(expr=inner, target_type=target_type)
+        # CAST(expr AS type) maps to a Cast node, built from the converted inner
+        # expression and the target type rendered as engine-dialect SQL text.
+        return Cast.create(expr=inner, target_type=target_type)
 
     def _convert_quantified_like(self, like: exp.Like) -> Optional[Expression]:
         """Convert ``LIKE ANY/ALL (subquery)`` to a quantified comparison."""
@@ -1628,7 +1722,9 @@ class Parser:
             if isinstance(like.expression, node_type):
                 left = self._convert_expression(like.this)
                 subquery_plan = self._extract_subquery_plan(like.expression.this)
-                return QuantifiedComparison(
+                # ``x LIKE ANY/ALL (subquery)`` maps to a QuantifiedComparison,
+                # built from the left value, quantifier and the subquery plan.
+                return QuantifiedComparison.create(
                     operator=BinaryOpType.LIKE,
                     quantifier=quantifier,
                     left=left,
@@ -1647,7 +1743,9 @@ class Parser:
         left = self._convert_expression(binary.left)
         right = self._convert_expression(binary.right)
         op = self._map_binary_op(binary)
-        return BinaryOp(op=op, left=left, right=right)
+        # A binary operator (arithmetic/comparison/logical) maps to a BinaryOp,
+        # built from the converted left and right operands and the mapped op.
+        return BinaryOp.create(op=op, left=left, right=right)
 
     def _map_binary_op(self, binary: exp.Binary) -> BinaryOpType:
         """Map sqlglot binary op to our BinaryOpType, failing on unknowns."""
@@ -1691,7 +1789,9 @@ class Parser:
                 if query is not None:
                     value_expr = self._convert_expression(unary.this.this)
                     subquery_plan = self._extract_subquery_plan(query)
-                    return InSubquery(
+                    # ``x NOT IN (SELECT ...)`` is a negated InSubquery, built
+                    # from the converted left value and the subquery's plan.
+                    return InSubquery.create(
                         value=value_expr,
                         subquery=subquery_plan,
                         negated=True,
@@ -1699,7 +1799,9 @@ class Parser:
 
         operand = self._convert_expression(unary.this)
         op = self._map_unary_op(unary)
-        return UnaryOp(op=op, operand=operand)
+        # A unary operator (NOT / negation) maps to a UnaryOp, built from the
+        # converted operand and the mapped unary op type.
+        return UnaryOp.create(op=op, operand=operand)
 
     def _map_unary_op(self, unary: exp.Unary) -> UnaryOpType:
         """Map sqlglot unary op to our UnaryOpType, failing on unknowns."""
@@ -1719,7 +1821,9 @@ class Parser:
     ) -> ExistsExpression:
         """Convert EXISTS/NOT EXISTS expression."""
         subquery_plan = self._extract_subquery_plan(exists_expr.this)
-        return ExistsExpression(subquery=subquery_plan, negated=negated)
+        # EXISTS / NOT EXISTS maps to an ExistsExpression, built from the
+        # subquery's logical plan and the negation flag.
+        return ExistsExpression.create(subquery=subquery_plan, negated=negated)
 
     def _convert_subquery_expression(
         self,
@@ -1727,7 +1831,9 @@ class Parser:
     ) -> SubqueryExpression:
         """Convert scalar subquery expression."""
         subquery_plan = self._extract_subquery_plan(subquery)
-        return SubqueryExpression(subquery=subquery_plan)
+        # A scalar subquery ``(SELECT ...)`` used as a value maps to a
+        # SubqueryExpression, built from the subquery's logical plan.
+        return SubqueryExpression.create(subquery=subquery_plan)
 
     def _build_quantified_comparison(
         self,
@@ -1738,7 +1844,9 @@ class Parser:
         left_expr = self._convert_expression(binary.left)
         subquery_plan = self._extract_subquery_plan(binary.right.this)
         operator = self._map_binary_op(binary)
-        return QuantifiedComparison(
+        # ``x op ANY/SOME/ALL (subquery)`` maps to a QuantifiedComparison, built
+        # from the left value, the mapped operator, quantifier and subquery plan.
+        return QuantifiedComparison.create(
             operator=operator,
             quantifier=quantifier,
             left=left_expr,
@@ -1771,7 +1879,9 @@ class Parser:
         if isinstance(func.this, exp.Distinct):
             distinct = True
         args = self._extract_function_args(func, distinct)
-        return FunctionCall(
+        # An aggregate call (SUM/COUNT/...) maps to a FunctionCall marked
+        # aggregate, built from its SQL name, converted args and DISTINCT flag.
+        return FunctionCall.create(
             function_name=func_name,
             args=args,
             is_aggregate=True,
@@ -1795,7 +1905,9 @@ class Parser:
         GROUPING reports whether each argument was rolled up in the current
         grouping set; it is only valid with GROUP BY, so it is marked aggregate.
         """
-        return FunctionCall(
+        # GROUPING(a, ...) maps to an aggregate-context FunctionCall, built from
+        # its converted argument expressions and marked as an aggregate.
+        return FunctionCall.create(
             function_name="GROUPING",
             args=self._convert_group_expressions(expr.expressions),
             is_aggregate=True,
@@ -1809,7 +1921,9 @@ class Parser:
         """
         aggregate = expr.this
         key, descending = self._within_group_order(expr.expression)
-        return FunctionCall(
+        # An ordered-set aggregate ``f(args) WITHIN GROUP (ORDER BY key)`` maps
+        # to a FunctionCall carrying the sort key from the WITHIN GROUP order.
+        return FunctionCall.create(
             function_name=self._aggregate_sql_name(aggregate),
             args=self._ordered_set_direct_args(aggregate),
             is_aggregate=True,
@@ -1864,7 +1978,9 @@ class Parser:
         if value is not None:
             return [self._convert_expression(value)]
         if isinstance(func, exp.Count):
-            return [ColumnRef(table=None, column="*")]
+            # COUNT(*) has no argument node, so represent its ``*`` as a
+            # wildcard ColumnRef with no table qualifier.
+            return [ColumnRef.create(table=None, column="*")]
         return []
 
     def _convert_distinct_args(self, value: exp.Distinct) -> List[Expression]:
@@ -1879,7 +1995,9 @@ class Parser:
         name = func.sql_name().upper()
         args: List[Expression] = []
         self._collect_function_args(func, args)
-        return FunctionCall(function_name=name, args=args, is_aggregate=False)
+        # A generic scalar function call maps to a non-aggregate FunctionCall,
+        # built from its SQL name and every collected argument expression.
+        return FunctionCall.create(function_name=name, args=args, is_aggregate=False)
 
     def _convert_window(self, win: exp.Window) -> WindowExpr:
         """Convert a sqlglot Window (``func OVER (...)``) into a WindowExpr.
@@ -1891,7 +2009,9 @@ class Parser:
         function = self._convert_expression(win.this)
         partition_by = self._convert_partition_by(win)
         order_keys, ascending, nulls = self._convert_window_order(win)
-        return WindowExpr(
+        # ``func OVER (...)`` maps to a WindowExpr, built from the converted
+        # function, PARTITION BY, ORDER BY keys/direction and frame spec.
+        return WindowExpr.create(
             function=function,
             partition_by=partition_by,
             order_keys=order_keys,
@@ -2059,7 +2179,9 @@ class Parser:
         """
         expr_key = self._expr_to_key(expr)
         if expr_key in agg_map:
-            return ColumnRef(
+            # A HAVING aggregate is replaced by a reference to the aggregate's
+            # output column, built as a ColumnRef carrying the aggregate's type.
+            return ColumnRef.create(
                 table=None, column=agg_map[expr_key], data_type=expr.get_type()
             )
         return expr

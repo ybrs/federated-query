@@ -19,6 +19,23 @@ class Column(StateModel):
     # serialization; it is navigational, not part of the column's identity.
     _table: Optional["Table"] = None
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        name: str,
+        data_type: DataType,
+        nullable: bool,
+    ) -> "Column":
+        """Sanctioned fresh-construction path for Column.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            name=name,
+            data_type=data_type,
+            nullable=nullable,
+        )
+
     @property
     def table(self) -> Optional["Table"]:
         """The owning table (a read-only view of the back-reference)."""
@@ -39,6 +56,13 @@ class Table(StateModel):
 
     name: str
     columns: List[Column] = Field(default_factory=list)
+
+    @classmethod
+    def create(cls, *, name: str, columns: List[Column]) -> "Table":
+        """Sanctioned fresh-construction path for Table.
+        columns is explicit (the default_factory cannot be a parameter default);
+        pass [] for an empty table."""
+        return cls(name=name, columns=columns)
     # Parent back-reference, set by the owning Schema (private; see Column._table).
     _schema: Optional["Schema"] = None
 
@@ -83,6 +107,13 @@ class Schema(StateModel):
     name: str
     datasource: str
     tables: Dict[str, Table] = Field(default_factory=dict)
+
+    @classmethod
+    def create(cls, *, name: str, datasource: str, tables: Dict[str, Table]) -> "Schema":
+        """Sanctioned fresh-construction path for Schema.
+        tables is explicit (the default_factory cannot be a parameter default);
+        pass {} for an empty schema and add tables via add_table."""
+        return cls(name=name, datasource=datasource, tables=tables)
 
     @model_validator(mode="after")
     def _link_tables(self) -> "Schema":

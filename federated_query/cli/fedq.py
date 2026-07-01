@@ -16,7 +16,14 @@ from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from sqlglot import errors as sqlglot_errors
 
 from ..catalog import Catalog
-from ..config import Config, DataSourceConfig, ExecutorConfig, load_config
+from ..config import (
+    Config,
+    DataSourceConfig,
+    OptimizerConfig,
+    ExecutorConfig,
+    CostConfig,
+    load_config,
+)
 from ..datasources.duckdb import DuckDBDataSource
 from ..datasources.postgresql import PostgreSQLDataSource
 from ..datasources.clickhouse import ClickHouseDataSource
@@ -467,8 +474,17 @@ def _load_config_bundle(config_path: Optional[str]) -> Tuple[Config, Optional[st
 
 def _build_default_config() -> Config:
     """Build a config with a single in-memory DuckDB data source for the demo."""
-    config = Config()
-    ds_config = DataSourceConfig(
+    # Empty root config for the demo; sub-configs use their defaults and the
+    # single datasource below is attached after construction.
+    config = Config.create(
+        datasources={},
+        optimizer=OptimizerConfig.create(),
+        executor=ExecutorConfig.create(),
+        cost=CostConfig.create(),
+    )
+    # The lone in-memory DuckDB source that backs the demo tables, declaring
+    # only the capabilities the demo exercises.
+    ds_config = DataSourceConfig.create(
         name="duckdb_mem",
         type="duckdb",
         config={"path": ":memory:", "read_only": False},

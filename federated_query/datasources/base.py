@@ -32,6 +32,27 @@ class ColumnMetadata(StateModel):
     primary_key: bool = False
     foreign_key: Optional[str] = None  # Referenced table.column
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        name: str,
+        data_type: str,
+        nullable: bool,
+        primary_key: bool = False,
+        foreign_key: Optional[str] = None,
+    ) -> "ColumnMetadata":
+        """Sanctioned fresh-construction path for ColumnMetadata.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            name=name,
+            data_type=data_type,
+            nullable=nullable,
+            primary_key=primary_key,
+            foreign_key=foreign_key,
+        )
+
 
 class TableMetadata(StateModel):
     """Metadata about a table."""
@@ -41,6 +62,27 @@ class TableMetadata(StateModel):
     columns: List[ColumnMetadata]
     row_count: Optional[int] = None
     size_bytes: Optional[int] = None
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        schema_name: str,
+        table_name: str,
+        columns: List[ColumnMetadata],
+        row_count: Optional[int] = None,
+        size_bytes: Optional[int] = None,
+    ) -> "TableMetadata":
+        """Sanctioned fresh-construction path for TableMetadata.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            schema_name=schema_name,
+            table_name=table_name,
+            columns=columns,
+            row_count=row_count,
+            size_bytes=size_bytes,
+        )
 
 
 class ColumnStatistics(StateModel):
@@ -52,6 +94,27 @@ class ColumnStatistics(StateModel):
     min_value: Optional[Any] = None
     max_value: Optional[Any] = None
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        num_distinct: int,
+        null_fraction: float,
+        avg_width: int,
+        min_value: Optional[Any] = None,
+        max_value: Optional[Any] = None,
+    ) -> "ColumnStatistics":
+        """Sanctioned fresh-construction path for ColumnStatistics.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            num_distinct=num_distinct,
+            null_fraction=null_fraction,
+            avg_width=avg_width,
+            min_value=min_value,
+            max_value=max_value,
+        )
+
 
 class TableStatistics(StateModel):
     """Statistics about a table."""
@@ -59,6 +122,23 @@ class TableStatistics(StateModel):
     row_count: int
     total_size_bytes: int
     column_stats: Dict[str, ColumnStatistics]
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        row_count: int,
+        total_size_bytes: int,
+        column_stats: Dict[str, ColumnStatistics],
+    ) -> "TableStatistics":
+        """Sanctioned fresh-construction path for TableStatistics.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            row_count=row_count,
+            total_size_bytes=total_size_bytes,
+            column_stats=column_stats,
+        )
 
 
 class DataSource(ABC):
@@ -192,25 +272,35 @@ class DataSource(ABC):
         """
         columns = []
         for name, data_type, is_nullable in rows:
+            # One column descriptor decoded from an information_schema row, with
+            # nullability read off the SQL 'YES'/'NO' is_nullable flag.
             columns.append(
-                ColumnMetadata(
+                ColumnMetadata.create(
                     name=name, data_type=data_type, nullable=(is_nullable == "YES")
                 )
             )
-        return TableMetadata(schema_name=schema, table_name=table, columns=columns)
+        # The table descriptor gathering the columns just decoded above under the
+        # requested schema and table names.
+        return TableMetadata.create(
+            schema_name=schema, table_name=table, columns=columns
+        )
 
     def _build_column_statistics(
         self, num_distinct, null_count, row_count
     ) -> ColumnStatistics:
         """Build ColumnStatistics, deriving the null fraction from a null count."""
         null_fraction = null_count / row_count if row_count > 0 else 0.0
-        return ColumnStatistics(
+        # Per-column stats for the optimizer, turning the raw null count into the
+        # null fraction it expects; avg_width is a fixed placeholder estimate.
+        return ColumnStatistics.create(
             num_distinct=num_distinct, null_fraction=null_fraction, avg_width=10
         )
 
     def _build_table_statistics(self, row_count, column_stats) -> TableStatistics:
         """Wrap a row count and per-column stats into TableStatistics."""
-        return TableStatistics(
+        # Table-level stats for cost estimation; byte size is approximated from
+        # the row count since sources here do not report an exact size.
+        return TableStatistics.create(
             row_count=row_count,
             total_size_bytes=row_count * 100,
             column_stats=column_stats,

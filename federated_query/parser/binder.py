@@ -164,12 +164,9 @@ class Binder:
         bound_left = self.bind(set_op.left)
         bound_right = self.bind(set_op.right)
         self._check_set_branch_arity(bound_left, bound_right)
-        return SetOperation(
-            left=bound_left,
-            right=bound_right,
-            kind=set_op.kind,
-            distinct=set_op.distinct,
-        )
+        # The bound UNION/INTERSECT/EXCEPT node: swap in the two bound branches
+        # while model_copy preserves the set-op kind and DISTINCT flag unchanged.
+        return set_op.model_copy(update={"left": bound_left, "right": bound_right})
 
     def _check_set_branch_arity(
         self, left: LogicalPlanNode, right: LogicalPlanNode
@@ -196,7 +193,9 @@ class Binder:
     def _bind_subquery_scan(self, node: SubqueryScan) -> SubqueryScan:
         """Bind a derived table by binding its inner plan."""
         bound_input = self.bind(node.input)
-        return SubqueryScan(input=bound_input, alias=node.alias)
+        # The derived table with its inner plan now bound; only the input changes,
+        # so model_copy keeps the derived-table alias untouched.
+        return node.model_copy(update={"input": bound_input})
 
     def _bind_scan(self, scan: Scan) -> Scan:
         """Bind a Scan node, keeping only columns of the scanned table.
@@ -241,7 +240,9 @@ class Binder:
         finally:
             self._pop_scope()
 
-        return Filter(input=bound_input, predicate=bound_predicate)
+        # The bound WHERE/HAVING filter: both its input subtree and its predicate
+        # are freshly bound, so construct the resolved Filter from those parts.
+        return Filter.create(input=bound_input, predicate=bound_predicate)
 
     def _bind_filter_predicate(
         self, predicate: Expression, bound_input: LogicalPlanNode
@@ -350,12 +351,10 @@ class Binder:
             if isinstance(key, ColumnRef) and key.table is None:
                 if key.column in alias_map:
                     expr = alias_map[key.column]
+                    # An ORDER BY key naming an aggregate output alias: keep the
+                    # bare (unqualified) key but stamp it with the alias's type.
                     bound_keys.append(
-                        ColumnRef(
-                            table=None,
-                            column=key.column,
-                            data_type=expr.get_type(),
-                        )
+                        key.model_copy(update={"data_type": expr.get_type()})
                     )
                     continue
             bound_keys.append(self._bind_expression(key))
@@ -392,12 +391,16 @@ class Binder:
         from ..plan.expressions import ColumnRef
 
         if isinstance(source_expr, ColumnRef):
-            return ColumnRef(
+            # The ORDER BY reference points at a SELECT alias whose expression is
+            # itself a column; resolve the key to that column's bound reference.
+            return ColumnRef.create(
                 table=source_expr.table,
                 column=source_expr.column,
                 data_type=source_expr.data_type,
             )
-        return ColumnRef(table=None, column=key.column, data_type=source_expr.get_type())
+        # The alias maps to a computed expression; keep the bare ORDER BY key and
+        # carry the alias expression's type onto it.
+        return key.model_copy(update={"data_type": source_expr.get_type()})
 
     def _build_alias_expression_map(
         self, projection: Projection
@@ -450,7 +453,9 @@ class Binder:
             bound_right = plan_binder.bind(join.right)
         finally:
             self._pop_scope()
-        return LateralJoin(left=bound_left, right=bound_right, join_type=join.join_type)
+        # The bound LATERAL join: its left and dependent right sides are now
+        # bound, while model_copy preserves the join type unchanged.
+        return join.model_copy(update={"left": bound_left, "right": bound_right})
 
     def _bind_explain(self, explain: Explain) -> Explain:
         """Bind an Explain node."""
@@ -515,7 +520,11 @@ class Binder:
             raise BindingError(
                 f"Recursive CTE '{cte.name}' requires an explicit column list"
             )
-        table = Table(name=cte.name, columns=self._named_columns(cte.column_names))
+        # A synthetic relation standing in for the recursive CTE so its own body
+        # can reference it while binding; columns come from the declared name list.
+        table = Table.create(
+            name=cte.name, columns=self._named_columns(cte.column_names)
+        )
         saved = self._cte_tables.get(cte.name)
         self._cte_tables[cte.name] = table
         bound_plan = self.bind(cte.cte_plan)
@@ -537,27 +546,28 @@ class Binder:
         names = []
         for column in table.columns:
             names.append(column.name)
-        return CTERef(
-            name=node.name,
-            alias=node.alias,
-            columns=node.columns,
-            output_names=names,
-        )
+        # The resolved CTE reference: only its output column names are filled in
+        # from the registered CTE, so model_copy keeps name/alias/columns intact.
+        return node.model_copy(update={"output_names": names})
 
     def _cte_table(self, cte: CTE, bound_plan: LogicalPlanNode) -> Table:
         """Build a Table describing a CTE's output columns."""
         columns = self._plan_output_columns(bound_plan)
         if cte.column_names:
             columns = self._rename_columns(cte.column_names, columns)
-        return Table(name=cte.name, columns=columns)
+        # A synthetic relation describing the CTE's output columns so a later
+        # CTERef resolves against it like an ordinary table.
+        return Table.create(name=cte.name, columns=columns)
 
     def _rename_columns(self, names: List[str], columns: List[Column]) -> List[Column]:
         """Re-label output columns with an explicit CTE column list."""
         renamed = []
         for index in range(len(names)):
             data_type = columns[index].data_type
+            # A re-labelled output column: the explicit CTE column list supplies
+            # the name while the underlying expression keeps its inferred type.
             renamed.append(
-                Column(name=names[index], data_type=data_type, nullable=True)
+                Column.create(name=names[index], data_type=data_type, nullable=True)
             )
         return renamed
 
@@ -565,7 +575,11 @@ class Binder:
         """Build placeholder columns for a name-only schema (recursive CTE)."""
         columns = []
         for name in names:
-            columns.append(Column(name=name, data_type=DataType.NULL, nullable=True))
+            # A placeholder output column for a recursive CTE's declared name; its
+            # type is unknown until the body binds, so it starts as NULL-typed.
+            columns.append(
+                Column.create(name=name, data_type=DataType.NULL, nullable=True)
+            )
         return columns
 
     def _restore_cte(self, name: str, saved: Optional[Table]) -> None:
@@ -680,9 +694,9 @@ class Binder:
         """
         if col_ref.table is None and col_ref.column in alias_map:
             source = alias_map[col_ref.column]
-            return ColumnRef(
-                table=None, column=col_ref.column, data_type=source.get_type()
-            )
+            # A HAVING reference to an aggregate output alias: keep the bare column
+            # reference but stamp it with the aggregate expression's type.
+            return col_ref.model_copy(update={"data_type": source.get_type()})
         return base_resolve(col_ref)
 
     def _push_scope_for(self, *plans: LogicalPlanNode) -> None:
@@ -735,7 +749,9 @@ class Binder:
     def _synthetic_table(self, node: SubqueryScan) -> Table:
         """Build a Table describing a derived table's output columns."""
         columns = self._plan_output_columns(node.input)
-        return Table(name=node.alias, columns=columns)
+        # A synthetic relation describing a derived table's output columns so its
+        # alias resolves in scope like a base table.
+        return Table.create(name=node.alias, columns=columns)
 
     def _plan_output_columns(self, plan: LogicalPlanNode) -> List[Column]:
         """Derive output Column metadata from a bound plan."""
@@ -794,8 +810,10 @@ class Binder:
         columns = []
         for index in range(len(names)):
             data_type = expressions[index].get_type()
+            # One output column pairing a projection/aggregate output name with
+            # its expression's inferred type for downstream schema resolution.
             columns.append(
-                Column(name=names[index], data_type=data_type, nullable=True)
+                Column.create(name=names[index], data_type=data_type, nullable=True)
             )
         return columns
 
@@ -816,22 +834,31 @@ class Binder:
             scopes = list(self._scope_stack)
         plan_binder = SubqueryPlanBinder(self, scopes)
         if isinstance(expr, SubqueryExpression):
-            return SubqueryExpression(subquery=plan_binder.bind(expr.subquery))
+            # A scalar subquery expression with its subquery plan bound against the
+            # enclosing scopes so correlated references resolve.
+            return SubqueryExpression.create(subquery=plan_binder.bind(expr.subquery))
         if isinstance(expr, ExistsExpression):
-            return ExistsExpression(
-                subquery=plan_binder.bind(expr.subquery), negated=expr.negated
+            # An EXISTS predicate: bind its subquery plan while model_copy keeps
+            # the NOT-EXISTS negation flag unchanged.
+            return expr.model_copy(
+                update={"subquery": plan_binder.bind(expr.subquery)}
             )
         if isinstance(expr, InSubquery):
-            return InSubquery(
-                value=bind_value(expr.value),
-                subquery=plan_binder.bind(expr.subquery),
-                negated=expr.negated,
+            # An IN (subquery) predicate: bind both the outer value and the
+            # subquery plan, while model_copy preserves the NOT-IN negation flag.
+            return expr.model_copy(
+                update={
+                    "value": bind_value(expr.value),
+                    "subquery": plan_binder.bind(expr.subquery),
+                }
             )
-        return QuantifiedComparison(
-            operator=expr.operator,
-            quantifier=expr.quantifier,
-            left=bind_value(expr.left),
-            subquery=plan_binder.bind(expr.subquery),
+        # A quantified comparison (op ANY/ALL subquery): bind its left operand and
+        # subquery plan; model_copy keeps the operator and quantifier unchanged.
+        return expr.model_copy(
+            update={
+                "left": bind_value(expr.left),
+                "subquery": plan_binder.bind(expr.subquery),
+            }
         )
 
     def resolve_in_scopes(
@@ -864,9 +891,9 @@ class Binder:
                 raise BindingError(
                     f"Column '{col_ref.column}' not found in table '{col_ref.table}'"
                 )
-            return ColumnRef(
-                table=col_ref.table, column=col_ref.column, data_type=column.data_type
-            )
+            # The resolved table-qualified reference: the qualifier and column name
+            # stay, and model_copy stamps the catalog column's data type onto it.
+            return col_ref.model_copy(update={"data_type": column.data_type})
         raise BindingError(
             f"Table '{col_ref.table}' not found in scope for column "
             f"'{col_ref.column}'"
@@ -895,7 +922,9 @@ class Binder:
                 raise BindingError(
                     f"Column '{column_name}' is ambiguous (found in multiple tables)"
                 )
-            found = ColumnRef(
+            # A resolved reference to a bare column found in this scope: qualify it
+            # with the owning relation's alias and the catalog column's data type.
+            found = ColumnRef.create(
                 table=alias, column=column_name, data_type=column.data_type
             )
         return found
@@ -962,10 +991,10 @@ class Binder:
         """Bind a CAST's inner expression and resolve its engine type."""
         bound_inner = bind_value(expr.expr)
         data_type = self._resolve_cast_type(expr.target_type)
-        return Cast(
-            expr=bound_inner,
-            target_type=expr.target_type,
-            data_type=data_type,
+        # The bound CAST: its inner expression is bound and the SQL target type is
+        # resolved to an engine type; model_copy keeps the original target text.
+        return expr.model_copy(
+            update={"expr": bound_inner, "data_type": data_type}
         )
 
     def _resolve_cast_type(self, target_type: str) -> DataType:
@@ -1012,7 +1041,9 @@ class SubqueryPlanBinder:
             return self._bind_values(plan)
         if isinstance(plan, SubqueryScan):
             inner = SubqueryPlanBinder(self.host, self.outer_scopes)
-            return SubqueryScan(input=inner.bind(plan.input), alias=plan.alias)
+            # A nested derived table bound with the same enclosing scopes; only its
+            # inner plan changes, so model_copy keeps the derived-table alias.
+            return plan.model_copy(update={"input": inner.bind(plan.input)})
         return self._bind_relational(plan)
 
     def _bind_relational(self, plan: LogicalPlanNode) -> LogicalPlanNode:
@@ -1031,7 +1062,9 @@ class SubqueryPlanBinder:
             return self._bind_sort(plan)
         if isinstance(plan, Limit):
             bound_input = self.bind(plan.input)
-            return Limit(input=bound_input, limit=plan.limit, offset=plan.offset)
+            # The bound LIMIT node inside a subquery: only its input is rebound,
+            # so model_copy preserves the row count and offset unchanged.
+            return plan.model_copy(update={"input": bound_input})
         if isinstance(plan, Join):
             return self._bind_join(plan)
         if isinstance(plan, SetOperation):
@@ -1047,12 +1080,9 @@ class SubqueryPlanBinder:
         bound_left = self.bind(set_op.left)
         bound_right = self.bind(set_op.right)
         self.host._check_set_branch_arity(bound_left, bound_right)
-        return SetOperation(
-            left=bound_left,
-            right=bound_right,
-            kind=set_op.kind,
-            distinct=set_op.distinct,
-        )
+        # The bound set-operation subquery body: swap in the two bound branches
+        # while model_copy preserves the set-op kind and DISTINCT flag.
+        return set_op.model_copy(update={"left": bound_left, "right": bound_right})
 
     def _bind_scan(self, scan: Scan) -> Scan:
         """Bind a subquery scan via the host's lenient column filtering."""
@@ -1075,7 +1105,9 @@ class SubqueryPlanBinder:
             predicate = self._bind_having(filter_node.predicate, bound_input)
         else:
             predicate = self._bind_expr_for(filter_node.predicate, bound_input)
-        return Filter(input=bound_input, predicate=predicate)
+        # The bound subquery filter (WHERE or HAVING): both its input and its
+        # predicate are freshly bound, so build the resolved Filter from them.
+        return Filter.create(input=bound_input, predicate=predicate)
 
     def _bind_projection(self, projection: Projection) -> Projection:
         """Bind projection expressions against the subquery's relations."""

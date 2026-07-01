@@ -104,11 +104,15 @@ class PredicatePushdownRule(OptimizationRule):
             isinstance(predicate, BinaryOp) and predicate.op == BinaryOpType.AND
         )
         if is_conjunction and self._can_absorb_split(input_plan):
+            # Split a conjunctive predicate: wrap the child in a Filter carrying
+            # only the left conjunct so each half can be pushed independently.
             left_result = self._push_filter(
-                Filter(input=input_plan, predicate=predicate.left)
+                Filter.create(input=input_plan, predicate=predicate.left)
             )
+            # Stack the right conjunct as its own Filter over the already-pushed
+            # left result, so the remaining half descends on top of it.
             return self._push_filter(
-                Filter(input=left_result, predicate=predicate.right)
+                Filter.create(input=left_result, predicate=predicate.right)
             )
 
         if isinstance(input_plan, Filter):
@@ -125,7 +129,9 @@ class PredicatePushdownRule(OptimizationRule):
 
         new_input = self._push_down(input_plan)
         if new_input != input_plan:
-            return Filter(input=new_input, predicate=predicate)
+            # The predicate could not descend further, but the child subtree was
+            # rewritten; re-home the same filter over its optimized input.
+            return filter_node.model_copy(update={"input": new_input})
 
         return filter_node
 
@@ -143,11 +149,15 @@ class PredicatePushdownRule(OptimizationRule):
         """Merge two adjacent filters."""
         from ..plan.expressions import BinaryOp, BinaryOpType
 
-        merged_predicate = BinaryOp(
+        # Two stacked filters collapse into one: AND their predicates so a single
+        # Filter can carry the combined condition of the outer and inner filters.
+        merged_predicate = BinaryOp.create(
             op=BinaryOpType.AND, left=outer.predicate, right=inner.predicate
         )
 
-        new_filter = Filter(input=inner.input, predicate=merged_predicate)
+        # A single Filter over the inner filter's input, carrying the merged
+        # predicate, then re-run pushdown on the collapsed node.
+        new_filter = Filter.create(input=inner.input, predicate=merged_predicate)
         return self._push_down(new_filter)
 
     def _can_evaluate_predicate(self, pred_cols: set, available_cols: set) -> bool:
@@ -190,22 +200,28 @@ class PredicatePushdownRule(OptimizationRule):
         can_push = self._can_evaluate_predicate(predicate_cols, input_cols)
 
         if can_push:
-            # Push filter BELOW projection: Projection(Filter(input, pred), ...)
-            new_filter = Filter(input=projection.input, predicate=filter_node.predicate)
+            # Push the filter BELOW the projection so it runs before column output.
+            # Re-home the original filter over the projection's input, keeping its
+            # predicate, since those input columns can evaluate the predicate.
+            new_filter = filter_node.model_copy(update={"input": projection.input})
             new_filter = self._push_down(new_filter)
             return projection.model_copy(update={"input": new_filter})
 
         # Filter references columns not available in input, keep above
         new_input = self._push_down(projection.input)
         new_project = projection.model_copy(update={"input": new_input})
-        return Filter(input=new_project, predicate=filter_node.predicate)
+        # The predicate needs columns the projection does not expose, so keep the
+        # filter above: re-home the original filter over the rebuilt projection.
+        return filter_node.model_copy(update={"input": new_project})
 
     def _push_filter_to_scan(self, filter_node: Filter, scan: Scan) -> LogicalPlanNode:
         """Push filter into scan node."""
         from ..plan.expressions import BinaryOp, BinaryOpType
 
         if scan.filters:
-            merged = BinaryOp(
+            # The scan already carries a pushed predicate; AND the new filter's
+            # predicate onto it so both conditions apply at the source.
+            merged = BinaryOp.create(
                 op=BinaryOpType.AND, left=scan.filters, right=filter_node.predicate
             )
             return scan.model_copy(update={"filters": merged})
@@ -249,18 +265,24 @@ class PredicatePushdownRule(OptimizationRule):
                     "right": self._push_down(join.right),
                 }
             )
-            return Filter(input=new_join, predicate=predicate)
+            # Outer-join semantics forbid pushing the predicate below the join, so
+            # keep the original filter on top of the recursed join.
+            return filter_node.model_copy(update={"input": new_join})
 
         # INNER JOIN: safe to push
         if pred_left_only:
-            new_left = Filter(input=join.left, predicate=predicate)
+            # The predicate touches only left-side columns; re-home the original
+            # filter onto the join's left input so it runs before the join.
+            new_left = filter_node.model_copy(update={"input": join.left})
             new_left = self._push_down(new_left)
             return join.model_copy(
                 update={"left": new_left, "right": self._push_down(join.right)}
             )
 
         if pred_right_only:
-            new_right = Filter(input=join.right, predicate=predicate)
+            # The predicate touches only right-side columns; re-home the original
+            # filter onto the join's right input so it runs before the join.
+            new_right = filter_node.model_copy(update={"input": join.right})
             new_right = self._push_down(new_right)
             return join.model_copy(
                 update={"left": self._push_down(join.left), "right": new_right}
@@ -286,7 +308,9 @@ class PredicatePushdownRule(OptimizationRule):
                 "right": self._push_down(join.right),
             }
         )
-        return Filter(input=new_join, predicate=predicate)
+        # A non-equi predicate spanning both sides cannot become a join key, so
+        # keep the original filter above the recursed join.
+        return filter_node.model_copy(update={"input": new_join})
 
     def _is_equi_predicate(self, predicate: Expression) -> bool:
         """Whether a predicate is a column-to-column equality (a join key)."""
@@ -307,7 +331,9 @@ class PredicatePushdownRule(OptimizationRule):
 
         if existing is None:
             return predicate
-        return BinaryOp(op=BinaryOpType.AND, left=existing, right=predicate)
+        # A join already has an ON condition; AND the inferred equi-predicate onto
+        # it so the folded join key extends the existing condition.
+        return BinaryOp.create(op=BinaryOpType.AND, left=existing, right=predicate)
 
     def name(self) -> str:
         """Return this rule's identifier (used in logging and EXPLAIN)."""
@@ -708,7 +734,9 @@ class OrderByPushdownRule(OptimizationRule):
 
         if isinstance(node, Filter):
             new_input = self._attach_order_metadata(node.input, sort)
-            return Filter(input=new_input, predicate=node.predicate)
+            # Order metadata was pushed into this filter's child; rebuild the
+            # filter over that new input while preserving its predicate.
+            return Filter.create(input=new_input, predicate=node.predicate)
 
         if isinstance(node, Limit):
             new_input = self._attach_order_metadata(node.input, sort)
@@ -761,7 +789,9 @@ class OrderByPushdownRule(OptimizationRule):
     def _push_through_filter(self, sort: Sort, filter_node: Filter) -> LogicalPlanNode:
         """Push ORDER BY through filter (always safe)."""
         pushed_child = self._push_sort_into_child(sort, filter_node.input)
-        return Filter(input=pushed_child, predicate=filter_node.predicate)
+        # Sort pushed into the filter's child; re-home the same filter over that
+        # reordered input, keeping its predicate unchanged.
+        return filter_node.model_copy(update={"input": pushed_child})
 
     def _push_through_join(self, sort: Sort, join: Join) -> LogicalPlanNode:
         """Push ORDER BY metadata into a single join side when safe."""
@@ -1077,7 +1107,9 @@ class RuleBasedOptimizer:
                 max_iterations,
                 query_executor=query_executor,
             )
-            return Explain(input=optimized_child, format=plan.format)
+            # Re-wrap the optimized child in an Explain, preserving the requested
+            # output format so EXPLAIN reports the plan of the optimized query.
+            return Explain.create(input=optimized_child, format=plan.format)
 
         current_plan = plan
         iteration = 0

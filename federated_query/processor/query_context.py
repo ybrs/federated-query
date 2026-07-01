@@ -12,6 +12,23 @@ class ColumnMapping(StateModel):
     visible_name: str
     alias: Optional[str] = None
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        internal_name: str,
+        visible_name: str,
+        alias: Optional[str] = None,
+    ) -> "ColumnMapping":
+        """Sanctioned fresh-construction path for ColumnMapping.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            internal_name=internal_name,
+            visible_name=visible_name,
+            alias=alias,
+        )
+
 
 class QueryContext:
     """Tracks metadata every processor can read or update.

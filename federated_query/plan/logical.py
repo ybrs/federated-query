@@ -150,6 +150,50 @@ class Scan(LogicalPlanNode):
     order_by_nulls: Optional[List[Optional[str]]] = None  # NULLS FIRST/LAST per key
     distinct: bool = False
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        datasource: str,
+        schema_name: str,
+        table_name: str,
+        columns: List[str],
+        filters: Optional[Expression] = None,
+        alias: Optional[str] = None,
+        sample: Optional[str] = None,
+        group_by: Optional[List[Expression]] = None,
+        grouping_sets: Optional[List[List[Expression]]] = None,
+        aggregates: Optional[List[Expression]] = None,
+        output_names: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        order_by_keys: Optional[List[Expression]] = None,
+        order_by_ascending: Optional[List[bool]] = None,
+        order_by_nulls: Optional[List[Optional[str]]] = None,
+        distinct: bool = False,
+    ) -> "Scan":
+        """Build a Scan leaf reading columns from a source table.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(
+            datasource=datasource,
+            schema_name=schema_name,
+            table_name=table_name,
+            columns=columns,
+            filters=filters,
+            alias=alias,
+            sample=sample,
+            group_by=group_by,
+            grouping_sets=grouping_sets,
+            aggregates=aggregates,
+            output_names=output_names,
+            limit=limit,
+            offset=offset,
+            order_by_keys=order_by_keys,
+            order_by_ascending=order_by_ascending,
+            order_by_nulls=order_by_nulls,
+            distinct=distinct,
+        )
+
     def children(self) -> List[LogicalPlanNode]:
         return []
 
@@ -200,6 +244,26 @@ class Projection(LogicalPlanNode):
     # None for a plain projection; an empty/non-empty list implies DISTINCT ON.
     distinct_on: Optional[List[Expression]] = None
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        input: LogicalPlanNode,
+        expressions: List[Expression],
+        aliases: List[str],
+        distinct: bool = False,
+        distinct_on: Optional[List[Expression]] = None,
+    ) -> "Projection":
+        """Build a Projection selecting the given expressions over an input.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(
+            input=input,
+            expressions=expressions,
+            aliases=aliases,
+            distinct=distinct,
+            distinct_on=distinct_on,
+        )
+
     def children(self) -> List[LogicalPlanNode]:
         return [self.input]
 
@@ -235,6 +299,14 @@ class Filter(LogicalPlanNode):
     input: LogicalPlanNode
     predicate: Expression
 
+    @classmethod
+    def create(
+        cls, *, input: LogicalPlanNode, predicate: Expression
+    ) -> "Filter":
+        """Build a Filter applying a predicate to its input rows.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(input=input, predicate=predicate)
+
     def children(self) -> List[LogicalPlanNode]:
         return [self.input]
 
@@ -264,6 +336,28 @@ class Join(LogicalPlanNode):
     # column names of a USING join.
     natural: bool = False
     using: Optional[List[str]] = None
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        left: LogicalPlanNode,
+        right: LogicalPlanNode,
+        join_type: JoinType,
+        condition: Optional[Expression],
+        natural: bool = False,
+        using: Optional[List[str]] = None,
+    ) -> "Join":
+        """Build a Join of two inputs with an optional ON condition.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(
+            left=left,
+            right=right,
+            join_type=join_type,
+            condition=condition,
+            natural=natural,
+            using=using,
+        )
 
     def children(self) -> List[LogicalPlanNode]:
         return [self.left, self.right]
@@ -298,6 +392,26 @@ class Aggregate(LogicalPlanNode):
     # an ordinary single-level GROUP BY.
     grouping_sets: Optional[List[List[Expression]]] = None
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        input: LogicalPlanNode,
+        group_by: List[Expression],
+        aggregates: List[Expression],
+        output_names: List[str],
+        grouping_sets: Optional[List[List[Expression]]] = None,
+    ) -> "Aggregate":
+        """Build an Aggregate grouping its input and computing aggregates.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(
+            input=input,
+            group_by=group_by,
+            aggregates=aggregates,
+            output_names=output_names,
+            grouping_sets=grouping_sets,
+        )
+
     def children(self) -> List[LogicalPlanNode]:
         return [self.input]
 
@@ -322,6 +436,24 @@ class Sort(LogicalPlanNode):
     sort_keys: List[Expression]
     ascending: List[bool]  # One per sort key
     nulls_order: Optional[List[Optional[str]]] = None  # NULLS FIRST/LAST per key
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        input: LogicalPlanNode,
+        sort_keys: List[Expression],
+        ascending: List[bool],
+        nulls_order: Optional[List[Optional[str]]] = None,
+    ) -> "Sort":
+        """Build a Sort ordering its input by the given keys.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(
+            input=input,
+            sort_keys=sort_keys,
+            ascending=ascending,
+            nulls_order=nulls_order,
+        )
 
     def children(self) -> List[LogicalPlanNode]:
         return [self.input]
@@ -351,6 +483,14 @@ class Limit(LogicalPlanNode):
     limit: Optional[int]
     offset: int = 0
 
+    @classmethod
+    def create(
+        cls, *, input: LogicalPlanNode, limit: Optional[int], offset: int = 0
+    ) -> "Limit":
+        """Build a Limit capping and/or offsetting its input rows.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(input=input, limit=limit, offset=offset)
+
     def children(self) -> List[LogicalPlanNode]:
         return [self.input]
 
@@ -373,6 +513,14 @@ class Union(LogicalPlanNode):
 
     inputs: List[LogicalPlanNode]
     distinct: bool  # True for UNION, False for UNION ALL
+
+    @classmethod
+    def create(
+        cls, *, inputs: List[LogicalPlanNode], distinct: bool
+    ) -> "Union":
+        """Build a Union combining several inputs sharing a schema.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(inputs=inputs, distinct=distinct)
 
     def children(self) -> List[LogicalPlanNode]:
         return self.inputs
@@ -405,6 +553,19 @@ class SetOperation(LogicalPlanNode):
     kind: SetOpKind
     distinct: bool
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        left: LogicalPlanNode,
+        right: LogicalPlanNode,
+        kind: SetOpKind,
+        distinct: bool,
+    ) -> "SetOperation":
+        """Build a binary SetOperation (UNION/INTERSECT/EXCEPT) over two inputs.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(left=left, right=right, kind=kind, distinct=distinct)
+
     def children(self) -> List[LogicalPlanNode]:
         return [self.left, self.right]
 
@@ -429,6 +590,17 @@ class Explain(LogicalPlanNode):
 
     input: LogicalPlanNode
     format: ExplainFormat = ExplainFormat.TEXT
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        input: LogicalPlanNode,
+        format: ExplainFormat = ExplainFormat.TEXT,
+    ) -> "Explain":
+        """Build an Explain wrapper rendering a plan in the given format.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(input=input, format=format)
 
     def children(self) -> List[LogicalPlanNode]:
         return [self.input]
@@ -460,6 +632,26 @@ class CTE(LogicalPlanNode):
     child: LogicalPlanNode
     recursive: bool = False
     column_names: Optional[List[str]] = None
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        name: str,
+        cte_plan: LogicalPlanNode,
+        child: LogicalPlanNode,
+        recursive: bool = False,
+        column_names: Optional[List[str]] = None,
+    ) -> "CTE":
+        """Build a CTE binding a named subplan for use by a child plan.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(
+            name=name,
+            cte_plan=cte_plan,
+            child=child,
+            recursive=recursive,
+            column_names=column_names,
+        )
 
     def children(self) -> List[LogicalPlanNode]:
         return [self.cte_plan, self.child]
@@ -493,6 +685,24 @@ class CTERef(LogicalPlanNode):
     columns: Optional[List[str]] = None
     output_names: Optional[List[str]] = None
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        name: str,
+        alias: Optional[str] = None,
+        columns: Optional[List[str]] = None,
+        output_names: Optional[List[str]] = None,
+    ) -> "CTERef":
+        """Build a CTERef leaf referencing a named CTE in a FROM/JOIN position.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(
+            name=name,
+            alias=alias,
+            columns=columns,
+            output_names=output_names,
+        )
+
     def children(self) -> List[LogicalPlanNode]:
         return []
 
@@ -520,6 +730,14 @@ class Values(LogicalPlanNode):
     rows: List[List[Expression]]
     output_names: List[str]
 
+    @classmethod
+    def create(
+        cls, *, rows: List[List[Expression]], output_names: List[str]
+    ) -> "Values":
+        """Build a Values leaf of constant rows evaluated without input columns.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(rows=rows, output_names=output_names)
+
     def children(self) -> List[LogicalPlanNode]:
         return []
 
@@ -546,6 +764,14 @@ class SubqueryScan(LogicalPlanNode):
 
     input: LogicalPlanNode
     alias: str
+
+    @classmethod
+    def create(
+        cls, *, input: LogicalPlanNode, alias: str
+    ) -> "SubqueryScan":
+        """Build a SubqueryScan exposing a subplan under a derived-table alias.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(input=input, alias=alias)
 
     def children(self) -> List[LogicalPlanNode]:
         return [self.input]
@@ -575,6 +801,14 @@ class SingleRowGuard(LogicalPlanNode):
 
     input: LogicalPlanNode
     keys: List[Expression]
+
+    @classmethod
+    def create(
+        cls, *, input: LogicalPlanNode, keys: List[Expression]
+    ) -> "SingleRowGuard":
+        """Build a SingleRowGuard enforcing at-most-one-row-per-key on its input.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(input=input, keys=keys)
 
     def children(self) -> List[LogicalPlanNode]:
         return [self.input]
@@ -610,6 +844,28 @@ class GroupedLimit(LogicalPlanNode):
     order_by_ascending: Optional[List[bool]] = None
     order_by_nulls: Optional[List[Optional[str]]] = None
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        input: LogicalPlanNode,
+        keys: List[Expression],
+        limit: int,
+        order_by_keys: Optional[List[Expression]] = None,
+        order_by_ascending: Optional[List[bool]] = None,
+        order_by_nulls: Optional[List[Optional[str]]] = None,
+    ) -> "GroupedLimit":
+        """Build a GroupedLimit keeping at most N rows per correlation key.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(
+            input=input,
+            keys=keys,
+            limit=limit,
+            order_by_keys=order_by_keys,
+            order_by_ascending=order_by_ascending,
+            order_by_nulls=order_by_nulls,
+        )
+
     def children(self) -> List[LogicalPlanNode]:
         return [self.input]
 
@@ -642,6 +898,18 @@ class LateralJoin(LogicalPlanNode):
     left: LogicalPlanNode
     right: LogicalPlanNode
     join_type: JoinType
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        left: LogicalPlanNode,
+        right: LogicalPlanNode,
+        join_type: JoinType,
+    ) -> "LateralJoin":
+        """Build a LateralJoin whose right side may reference left columns.
+        Sanctioned construction path; prefer model_copy when deriving from an existing node."""
+        return cls(left=left, right=right, join_type=join_type)
 
     def children(self) -> List[LogicalPlanNode]:
         return [self.left, self.right]

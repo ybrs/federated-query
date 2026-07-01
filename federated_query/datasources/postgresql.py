@@ -246,7 +246,9 @@ class PostgreSQLDataSource(DataSource):
                     else:
                         n_distinct = int(n_distinct)
 
-                    column_stats[col_name] = ColumnStatistics(
+                    # Per-column stats from pg_stats for this column; n_distinct
+                    # was already normalized above from Postgres' signed encoding.
+                    column_stats[col_name] = ColumnStatistics.create(
                         num_distinct=n_distinct,
                         null_fraction=row["null_frac"] or 0.0,
                         avg_width=10,  # Placeholder

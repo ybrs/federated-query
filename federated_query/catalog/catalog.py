@@ -39,7 +39,9 @@ class Catalog:
             # Load schemas
             schema_names = datasource.list_schemas()
             for schema_name in schema_names:
-                schema = Schema(name=schema_name, datasource=ds_name)
+                # Catalog entry for one schema of the current data source; its
+                # tables map starts empty and is populated by add_table below.
+                schema = Schema.create(name=schema_name, datasource=ds_name, tables={})
 
                 # Load tables
                 table_names = datasource.list_tables(schema_name)
@@ -55,15 +57,19 @@ class Catalog:
                     for col_meta in metadata.columns:
                         data_type = datasource.map_native_type(col_meta.data_type)
                         self._require_renderable(col_meta.name, data_type)
+                        # One catalog column translated from the source's native
+                        # metadata into the engine's mapped, Arrow-renderable type.
                         columns.append(
-                            Column(
+                            Column.create(
                                 name=col_meta.name,
                                 data_type=data_type,
                                 nullable=col_meta.nullable,
                             )
                         )
 
-                    table = Table(name=table_name, columns=columns)
+                    # The assembled catalog table holding the columns just mapped
+                    # above, ready to be registered into the schema.
+                    table = Table.create(name=table_name, columns=columns)
                     schema.add_table(table)
 
                 # Register schema

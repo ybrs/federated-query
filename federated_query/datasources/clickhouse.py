@@ -153,14 +153,20 @@ class ClickHouseDataSource(DataSource):
                     f"Unsupported ClickHouse type {ch_type!r} for column {name!r}"
                 )
             sql_type = _CH_TO_SQL[base_type]
+            # One column descriptor with the ClickHouse type mapped to a SQL type;
+            # nullability comes from the Nullable(...) wrapper on the native type.
             columns.append(
-                ColumnMetadata(
+                ColumnMetadata.create(
                     name=name,
                     data_type=sql_type,
                     nullable=ch_type.startswith("Nullable("),
                 )
             )
-        return TableMetadata(schema_name=schema, table_name=table, columns=columns)
+        # The table descriptor collecting the columns decoded above from the
+        # ClickHouse system.columns rows for this schema and table.
+        return TableMetadata.create(
+            schema_name=schema, table_name=table, columns=columns
+        )
 
     def get_table_statistics(
         self, schema: str, table: str
