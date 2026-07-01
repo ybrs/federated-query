@@ -1222,16 +1222,52 @@ class Decorrelator:
                 raise DecorrelationError(f"Subqueries in {where} are not supported")
 
     def _rewrite_filter(self, node: Filter) -> LogicalPlanNode:
-        """Rewrite a filter: joins for conjuncts, unions for disjunctions."""
+        """Rewrite a filter: joins for conjuncts, unions for disjunctions.
+
+        A filter does not change its input's schema, but decorrelating a scalar
+        subquery in the predicate adds the subquery's value column through a
+        join. A HAVING (a filter over an aggregate) has no SELECT projection
+        above it to drop that extra column, so its result is re-projected back to
+        the aggregate's columns. A WHERE filter is left alone: its SELECT
+        projection already trims, and re-projecting would block the correlation
+        pull-up when the filter sits inside another subquery.
+        """
         input_plan = self._rewrite_plan(node.input)
         if not _expression_has_subquery(node.predicate):
             # No subquery in the predicate, so the filter is preserved as-is over
             # the (possibly rewritten) input; only the child needed decorrelating.
             return Filter.create(input=input_plan, predicate=node.predicate)
-        disjuncts = _split_disjuncts(node.predicate)
+        original_schema = input_plan.schema()
+        rewritten = self._rewrite_filter_predicate(input_plan, node.predicate)
+        if isinstance(input_plan, Aggregate):
+            return self._restore_filter_schema(rewritten, original_schema)
+        return rewritten
+
+    def _rewrite_filter_predicate(
+        self, input_plan: LogicalPlanNode, predicate: Expression
+    ) -> LogicalPlanNode:
+        """Rewrite a subquery-bearing predicate into joins (AND) or unions (OR)."""
+        disjuncts = _split_disjuncts(predicate)
         if len(disjuncts) > 1:
             return self._expand_or(input_plan, disjuncts)
-        return self._rewrite_filter_conjuncts(input_plan, node.predicate)
+        return self._rewrite_filter_conjuncts(input_plan, predicate)
+
+    def _restore_filter_schema(
+        self, plan: LogicalPlanNode, names: List[str]
+    ) -> LogicalPlanNode:
+        """Re-project a subquery-joined filter back to its pre-join columns."""
+        if plan.schema() == names:
+            return plan
+        expressions: List[Expression] = []
+        for name in names:
+            # A reference to one original output column by its physical name; the
+            # projection drops the columns the scalar subquery's join added.
+            expressions.append(ColumnRef.create(table=None, column=name))
+        # Restore the filter's original output schema over the join-threaded plan,
+        # so a HAVING subquery's join does not leak its value column downstream.
+        return Projection.create(
+            input=plan, expressions=expressions, aliases=list(names)
+        )
 
     def _expand_or(
         self, input_plan: LogicalPlanNode, disjuncts: List[Expression]
