@@ -1,15 +1,18 @@
 """Compare two query result sets for TPC-H correctness checking.
 
-The engine result and the DuckDB oracle result are compared as multisets of
-normalized rows. Comparison is by column position (the two engines may name
-columns differently), numbers are rounded to a fixed number of decimals (TPC-H
-aggregates are monetary), and fixed-width CHAR padding is stripped. Row order is
-not compared: TPC-H ties are order-ambiguous, so a multiset match is the
-correctness signal we want.
+The engine result and the DuckDB oracle result are compared row by row, in
+order: row i of the engine output must equal row i of DuckDB's output. Numbers
+are rounded to a fixed number of decimals (TPC-H aggregates are monetary) and
+fixed-width CHAR padding is stripped, so only genuine value differences count.
+Comparison is by column position; the two engines may name columns differently.
+
+Row order is part of correctness here: a TPC-H query with an ORDER BY must
+return rows in that order. When the rows match as a set but not in order, the
+mismatch is reported as an ordering difference so it is not confused with a
+wrong value.
 """
 
 import datetime
-from collections import Counter
 from decimal import Decimal
 
 
@@ -37,39 +40,45 @@ def _normalize_row(row, decimals):
 
 
 def _normalize_rows(rows, decimals):
-    """Normalize a list of rows into a multiset (Counter) of row tuples."""
-    counter = Counter()
+    """Normalize a list of rows into a list of comparable row tuples, in order."""
+    normalized = []
     for row in rows:
-        counter[_normalize_row(row, decimals)] += 1
-    return counter
+        normalized.append(_normalize_row(row, decimals))
+    return normalized
 
 
-def _example_difference(engine_counter, oracle_counter):
-    """Return a short description of one row present in only one side."""
-    engine_only = engine_counter - oracle_counter
-    oracle_only = oracle_counter - engine_counter
-    if engine_only:
-        row = next(iter(engine_only.elements()))
-        return "engine produced unexpected row: {0}".format(row)
-    if oracle_only:
-        row = next(iter(oracle_only.elements()))
-        return "engine missing expected row: {0}".format(row)
-    return "row multiplicities differ"
+def _first_differing_index(engine_norm, oracle_norm):
+    """Return the index of the first row that differs, or -1 if all match."""
+    for index in range(len(engine_norm)):
+        if engine_norm[index] != oracle_norm[index]:
+            return index
+    return -1
+
+
+def _describe_difference(index, engine_norm, oracle_norm):
+    """Describe the first differing row, flagging an order-only difference."""
+    if sorted(engine_norm) == sorted(oracle_norm):
+        template = "rows match as a set but order differs at row {0}: engine={1} oracle={2}"
+    else:
+        template = "row {0} differs: engine={1} oracle={2}"
+    return template.format(index, engine_norm[index], oracle_norm[index])
 
 
 def compare_results(engine_rows, oracle_rows, decimals=2):
-    """Compare two result sets, returning (is_match, reason).
+    """Compare two result sets row by row, returning (is_match, reason).
 
     ``reason`` is an empty string on a match and otherwise names the first
-    discrepancy (row count, or an example row present on only one side).
+    discrepancy: a differing row count, or the first row position whose values
+    (or ordering) differ.
     """
     if len(engine_rows) != len(oracle_rows):
         reason = "row count differs: engine={0} oracle={1}".format(
             len(engine_rows), len(oracle_rows)
         )
         return False, reason
-    engine_counter = _normalize_rows(engine_rows, decimals)
-    oracle_counter = _normalize_rows(oracle_rows, decimals)
-    if engine_counter == oracle_counter:
+    engine_norm = _normalize_rows(engine_rows, decimals)
+    oracle_norm = _normalize_rows(oracle_rows, decimals)
+    index = _first_differing_index(engine_norm, oracle_norm)
+    if index == -1:
         return True, ""
-    return False, _example_difference(engine_counter, oracle_counter)
+    return False, _describe_difference(index, engine_norm, oracle_norm)

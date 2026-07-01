@@ -57,10 +57,13 @@ One line per query plus a summary:
 ## Correctness comparison
 
 Results are compared by column position (the engines may name columns
-differently), as a multiset of rows. Numbers are rounded to `--decimals`
-(default 2, matching TPC-H monetary values) and `CHAR` padding is stripped. Row
-order is not compared: TPC-H ties are order-ambiguous, so a multiset match is
-the correctness signal. Adjust rounding with `run.py --decimals N`.
+differently), row by row in order: row i of the engine output must equal row i
+of DuckDB's output. Numbers are rounded to `--decimals` (default 2, matching
+TPC-H monetary values) and `CHAR` padding is stripped, so only genuine value
+differences count. Row order is part of correctness (a TPC-H `ORDER BY` must be
+honored); when the rows match as a set but not in order, the report flags it as
+an ordering difference rather than a wrong value. Adjust rounding with
+`run.py --decimals N`.
 
 ## Files
 

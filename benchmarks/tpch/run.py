@@ -189,8 +189,8 @@ ERROR_CATEGORIES = [
     ("Timeout", "Timeout"),
     ("Killed", "Memory limit (killed)"),
     ("row count differs", "Wrong result: row count"),
-    ("unexpected row", "Wrong result: row values"),
-    ("missing expected row", "Wrong result: row values"),
+    ("order differs at row", "Wrong result: row order"),
+    ("differs: engine=", "Wrong result: row values"),
 ]
 
 

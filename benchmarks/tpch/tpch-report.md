@@ -15,10 +15,10 @@ Queries: q02, q03, q05, q10, q11, q17, q18
 
 - ValueError: cannot orient join keys 's_suppkey' / 'ps_suppkey' to a join side; neither resolves by qualifier or by column name
 
-### Out of memory (4)
-Queries: q07, q08, q09, q21
+### Out of memory (3)
+Queries: q07, q08, q09
 
-- OSError: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 33554432 bytes
+- InvalidInputException: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 16777216 bytes
 
 ### Binding: reference not in scope (2)
 Queries: q13, q15
@@ -29,6 +29,11 @@ Queries: q13, q15
 Queries: q20
 
 - DecorrelationError: Correlation key "lineitem"."l_suppkey" is not part of the subquery's GROUP BY
+
+### Other (1)
+Queries: q21
+
+- OSError: INTERRUPT Error: Interrupted!
 
 ### Timeout (1)
 Queries: q19
@@ -45,8 +50,8 @@ Queries: q19
 | q04 | PASS | 5 / 5 | rows and values match |
 | q05 | ERROR | - | ValueError: cannot orient join keys 'c_custkey' / 'o_custkey' to a join side; neither resolves by qualifier or by column name |
 | q06 | PASS | 1 / 1 | rows and values match |
-| q07 | ERROR | - | OSError: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 33554432 bytes |
-| q08 | ERROR | - | InvalidInputException: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 8388608 bytes |
+| q07 | ERROR | - | InvalidInputException: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 16777216 bytes |
+| q08 | ERROR | - | OSError: Out of Memory Error: ArrowBuffer: failed to allocate 67108864 bytes |
 | q09 | ERROR | - | OSError: Out of Memory Error: ArrowBuffer: failed to allocate 67108864 bytes |
 | q10 | ERROR | - | ValueError: cannot orient join keys 'c_custkey' / 'o_custkey' to a join side; neither resolves by qualifier or by column name |
 | q11 | ERROR | - | ValueError: cannot orient join keys 'ps_suppkey' / 's_suppkey' to a join side; neither resolves by qualifier or by column name |
@@ -59,5 +64,5 @@ Queries: q19
 | q18 | ERROR | - | ValueError: cannot orient join keys 'o_orderkey' / '__subq_0_v0' to a join side; neither resolves by qualifier or by column name |
 | q19 | ERROR | - | Timeout: exceeded 45.0s |
 | q20 | ERROR | - | DecorrelationError: Correlation key "lineitem"."l_suppkey" is not part of the subquery's GROUP BY |
-| q21 | ERROR | - | InvalidInputException: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 134217728 bytes |
+| q21 | ERROR | - | OSError: INTERRUPT Error: Interrupted! |
 | q22 | PASS | 7 / 7 | rows and values match |
