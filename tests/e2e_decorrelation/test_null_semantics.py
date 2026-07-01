@@ -77,7 +77,6 @@ class TestInWithNulls:
 
         Expected plan structure:
             - SEMI join with null-safe equality
-            - NULL = 'US' evaluates to UNKNOWN → row filtered
 
         Expected result:
             Users with country US or UK (NULL country filtered out)
@@ -147,7 +146,6 @@ class TestInWithNulls:
 
         Expected plan structure:
             - ANTI join with NULL guard
-            - If subquery has NULL and no match, result is UNKNOWN → filtered
             - Must detect NULL presence via aggregate flag
 
         Expected result:
@@ -186,8 +184,6 @@ class TestInWithNulls:
 
         Expected plan structure:
             - ANTI join with NULL guard
-            - Rows with match → FALSE (filtered)
-            - Rows without match but NULL in subquery → UNKNOWN (filtered)
 
         Expected result:
             All users filtered (those with matches and those without due to NULL)
@@ -301,7 +297,6 @@ class TestQuantifiedWithNulls:
             - Aggregate flag to detect NULL
 
         Expected result:
-            If subquery has NULL and row doesn't violate, UNKNOWN → filtered
             Complex three-valued logic
         """
         sql = """
@@ -758,7 +753,6 @@ class TestComplexNullScenarios:
 
         Expected plan structure:
             - Scalar subquery decorrelated
-            - COALESCE handles NULL → 0
 
         Expected result:
             Users with totals, 0 instead of NULL for users without orders

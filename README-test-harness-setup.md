@@ -12,7 +12,6 @@ There are two kinds of data source used by the tests:
 | DuckDB     | `tests/e2e_pushdown`, most `test_e2e_*`   | In-process, in-memory   |
 | PostgreSQL | `tests/e2e_decorrelation`, `test_datasources` | Local server (below) |
 
-DuckDB needs nothing — it runs in-memory inside the test process. PostgreSQL needs
 a running server, which the scripts in `scripts/` provide without any system
 install or Docker.
 
@@ -54,7 +53,6 @@ CI workflow, so a fresh `make pg-start` needs no configuration:
 | password | `postgres`  | `PGPASSWORD` / `POSTGRES_PASSWORD` |
 
 The cluster is initialized with `trust` local authentication, so the password is
-accepted but not enforced — convenient for a local-only test database.
 
 ## 2. Run the tests
 
@@ -74,7 +72,6 @@ Test fixtures build a `Catalog`, register one or more `DataSource` objects, and
 call `load_metadata()` so the binder can resolve columns. The pattern lives in the
 suite-level `conftest.py` files.
 
-### DuckDB (in-memory) — see `tests/e2e_pushdown/conftest.py`
 
 ```python
 ds = DuckDBDataSource(name="duckdb_primary", config={"database": ":memory:", "read_only": False})
@@ -89,7 +86,6 @@ catalog.load_metadata()
 Queries then address the table with the engine's three-part name
 `datasource.schema.table`, e.g. `duckdb_primary.main.orders`.
 
-### PostgreSQL — see `tests/e2e_decorrelation/conftest.py`
 
 The decorrelation tests reference tables with **two-part** names such as
 `pg.users`. The parser resolves a two-part name as `schema.table` inside the
@@ -131,8 +127,6 @@ catalog.load_metadata()
 ## 4. Adding a new test data source
 
 1. Pick the datasource **name** to match the names your test SQL will use:
-   - three-part SQL (`mydb.main.t`) → register the source as `mydb`;
-   - two-part SQL (`s.t`) → register the source as `default` and put the table in
      a schema named `s`.
 2. For PostgreSQL, create the schema/tables (the harness database is `test_db`);
    for DuckDB, create them on the in-memory connection.

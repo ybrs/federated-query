@@ -3,11 +3,9 @@
 A CTE whose body or references span data sources cannot push to one source as a
 single ``WITH``. Two strategies run in the merge engine:
 
-- **Non-recursive** — the body is materialized into Arrow *once* (a
   ``PhysicalCTE`` producer) and every reference reads that one table (a
   ``PhysicalCTEScan``); the child's CTE-vs-other-source joins run in the merge
   engine.
-- **Recursive** — the whole ``WITH RECURSIVE`` runs inside the in-memory DuckDB
   (``PhysicalCTEMergeQuery``): every base source relation is materialized and
   registered, and DuckDB computes the fixpoint locally.
 
@@ -268,7 +266,6 @@ def test_recursive_cross_source_hierarchy(hierarchy_env):
     """A recursive hierarchy traversal in one source, joined to a second.
 
     The management chain is walked recursively over ``ds_emp.employees`` and the
-    final result joins each employee's bonus from ``ds_bonus.bonuses`` — the
     whole WITH RECURSIVE runs in the merge engine over both materialized
     sources.
     """
@@ -320,7 +317,6 @@ def test_merge_query_schema_without_rows(hierarchy_env):
     """``PhysicalCTEMergeQuery.schema()`` reports columns without fetching rows.
 
     The schema comes from the Arrow reader, which exposes it before any batch,
-    so an empty result still yields the right columns — a ``LIMIT 0`` probe
     would produce zero batches and silently lose the schema.
     """
     plan = _attached_plan(hierarchy_env, _SCHEMA_SQL)
@@ -374,7 +370,6 @@ def test_constant_cte_in_multi_source_catalog(multi_source_env):
 
     With several sources, pushdown cannot default the pure-computation body to
     one of them, so it materializes through the producer path and the child
-    reads it — verified by the result and the presence of the producer.
     """
     plan = _attached_plan(multi_source_env, "WITH x AS (SELECT 1 AS n) SELECT n FROM x")
     producers = _collect(plan, PhysicalCTE)

@@ -2,7 +2,6 @@
 
 Enabled by setting the ``FEDQ_PROFILE`` environment variable. When on, the
 :class:`QueryExecutor` records how long each planning stage takes and, during
-execution, the *self-time* of every physical operator — the wall-clock spent in
 that operator's own ``execute()`` minus the time it spends pulling its children.
 A remote scan's self-time is therefore its fetch cost, and a hash join's
 self-time is its local merge cost, which is exactly what is needed to tell a

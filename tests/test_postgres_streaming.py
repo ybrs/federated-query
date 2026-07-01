@@ -1,4 +1,4 @@
-"""THE streaming contract for remote sources — the most important perf invariant.
+"""Streaming path tests for the PostgreSQL data source.
 
 When the engine joins a PostgreSQL table, those rows must reach the coordinator
 DuckDB. There are two ways to do it:
@@ -9,7 +9,7 @@ DuckDB. There are two ways to do it:
          for seconds before DuckDB does any work.
 
   RIGHT: hand DuckDB a LAZY ``pyarrow.RecordBatchReader`` and let DuckDB pull
-         batches itself — so it drives the fetch (and can spill, prune, or stop
+         batches as it needs them (the first rows arrive
          early) while we hold almost nothing.
 
 ``PostgreSQLDataSource.execute_query`` (ADBC path) MUST do the second. These
@@ -122,6 +122,5 @@ def test_first_batch_arrives_without_draining_everything(streaming_source):
     assert total_rows == PROBE_ROWS  # correctness: every row still arrives
 
     assert first_batch_ms < total_ms * 0.5, (
-        f"first batch took {first_batch_ms:.0f} ms of {total_ms:.0f} ms total — "
         "the whole result was drained before the first batch (not streaming)"
     )

@@ -410,12 +410,10 @@ class TestQuantifiedWithNulls:
 
         Expected plan structure:
             - ANTI join for violations
-            - NULL guard: if subquery has NULL and no violation, result is UNKNOWN → FALSE
             - Aggregate to detect NULL: has_null flag
 
         Expected result:
             If subquery has NULL, only rows that would violate return FALSE
-            Otherwise UNKNOWN → filtered out
         """
         # This demonstrates the three-valued logic complexity
         sql = """
@@ -447,7 +445,6 @@ class TestQuantifiedWithNulls:
             SELECT * FROM products WHERE price > ALL(SELECT amount FROM orders WHERE FALSE)
 
         Expected plan structure:
-            - Empty subquery → ALL evaluates to TRUE (vacuous truth)
             - All rows should pass
 
         Expected result:
@@ -480,7 +477,6 @@ class TestQuantifiedWithNulls:
             SELECT * FROM products WHERE price > ANY(SELECT amount FROM orders WHERE FALSE)
 
         Expected plan structure:
-            - Empty subquery → ANY evaluates to FALSE
             - No rows should pass
 
         Expected result:

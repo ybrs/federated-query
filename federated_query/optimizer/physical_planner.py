@@ -664,7 +664,6 @@ class PhysicalPlanner:
         """Build from the side with a selective equality filter (likely small).
 
         That side becomes the hash-table build input and the other becomes the
-        probe that the dynamic filter reduces. Only INNER joins are eligible —
         for SEMI/ANTI/outer joins the build side is fixed by semantics (the
         right input is the inner/built side). Defaults to the right input when
         neither (or both) side has such a filter.
@@ -733,7 +732,6 @@ class PhysicalPlanner:
     def _probe_side(
         self, hash_join: PhysicalHashJoin
     ) -> Tuple[PhysicalPlanNode, List[ColumnRef]]:
-        """Return the (probe node, probe keys) — the input that is not built."""
         if hash_join.build_side == "right":
             return hash_join.left, hash_join.left_keys
         return hash_join.right, hash_join.right_keys

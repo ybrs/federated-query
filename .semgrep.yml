@@ -1,0 +1,47 @@
+rules:
+  - id: no-bare-state-init
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Bare initializer of an engine state class is forbidden. Construct via
+      ClassName.create(...) for fresh construction / cross-type lowering, or
+      instance.model_copy(update={...}) for a rebuild deriving from an existing
+      node. The only allowed bare construction is cls(...) inside a .create body.
+    paths:
+      include:
+        - "federated_query"
+    patterns:
+      - pattern: $CLS(...)
+      - metavariable-regex:
+          metavariable: $CLS
+          regex: ^(Aggregate|BetweenExpression|BinaryOp|CTE|CTERef|CaseExpr|Cast|Column|ColumnMapping|ColumnMetadata|ColumnRef|ColumnStatistics|Config|CostConfig|DataSourceConfig|ExecutorConfig|ExistsExpression|Explain|Expression|Extract|Filter|FunctionCall|Gather|GroupedLimit|InList|InSubquery|Interval|Join|LateralJoin|Limit|Literal|LogicalPlanNode|OptimizerConfig|PhysicalAliasedRelation|PhysicalCTE|PhysicalCTEMergeQuery|PhysicalCTEScan|PhysicalExplain|PhysicalFilter|PhysicalGroupedLimit|PhysicalHashAggregate|PhysicalHashJoin|PhysicalLateralJoin|PhysicalLimit|PhysicalNestedLoopJoin|PhysicalPlanNode|PhysicalProjection|PhysicalRemoteJoin|PhysicalRemoteQuery|PhysicalRemoteSetOp|PhysicalScan|PhysicalSetOperation|PhysicalSingleRowGuard|PhysicalSort|PhysicalUnion|PhysicalValues|PhysicalWindow|Projection|QuantifiedComparison|Scan|Schema|SetOperation|SingleRowGuard|Sort|SubqueryExpression|SubqueryScan|Table|TableMetadata|TableStatistics|TupleExpression|UnaryOp|Union|Values|WindowExpr|_DatasourceQuerySnapshot|_JoinSides|_PreparedScalar|_PreparedSubquery|_SelectSource)$
+
+  - id: no-codepoint-above-ff
+    languages: [generic]
+    severity: ERROR
+    message: >-
+      Character above U+00FF found. Only the single-byte range (codepoints
+      0-255, i.e. ASCII plus Latin-1) is allowed anywhere in this project.
+      Anything above U+00FF (em dash, arrows, box-drawing, smart quotes, CJK,
+      emoji, ...) is banned; replace it with an ASCII/Latin-1 equivalent.
+    options:
+      generic_ellipsis_max_span: 0
+    paths:
+      include:
+        - "*.py"
+        - "*.md"
+        - "*.txt"
+        - "*.rst"
+        - "*.yml"
+        - "*.yaml"
+        - "*.toml"
+        - "*.cfg"
+        - "*.ini"
+        - "*.sh"
+        - "*.sql"
+      exclude:
+        - "*.duckdb"
+        - "*.db"
+        - "*.log"
+    patterns:
+      - pattern-regex: "[^\\x00-\\xff]"

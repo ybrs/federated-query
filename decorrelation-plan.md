@@ -3,7 +3,6 @@
 ## Goals
 - Provide a deterministic decorrelation engine that rewrites correlated and uncorrelated subqueries into join-based or CTE-based logical plans before cost-based optimization.
 - Preserve SQL semantics (NULL handling, duplicate handling, outer reference visibility) identical to DuckDB/PostgreSQL behaviour.
-- Keep every implementation function under 20 lines with cyclomatic complexity ≤4, per repository standards, while adding clear docstrings for every method.
 - Fail fast on unsupported patterns; never silently skip decorrelation.
 
 ## Scope
@@ -20,19 +19,10 @@
 - **Multiplicity**: EXISTS/Semi join ignore duplicates; scalar subqueries preserve scalar/NULL result; quantified comparisons must respect duplicates only where SQL semantics require (e.g., `ALL` evaluates over all rows, including duplicates).
 
 ## Desired Output Shape
-- After decorrelation, the logical plan contains only joins, projections, aggregates, and filters—no subquery expression nodes remain.
 - Subqueries that are uncorrelated are rewritten into CTEs (WITH) or cross joins executed once and reused.
 - Correlated predicates become joins with explicit join conditions on correlation keys; scalar subqueries become joins to aggregated subplans keyed by correlation keys.
 
 ## Rewrite Coverage Matrix
-- EXISTS / NOT EXISTS in predicates → SEMI / ANTI joins with correlation predicates.
-- IN (subquery) / NOT IN (subquery) → SEMI / ANTI joins using null-safe equality; anti join includes null-blocking logic.
-- Quantified comparisons (`op ANY`, `op SOME`) → SEMI joins with comparison predicate.
-- `op ALL` → Anti join plus guard to ensure no violating row; may require two subplans: one for violation detection (semi join) and one for NULL check.
-- Scalar subqueries in SELECT list → LEFT join against grouped subplan keyed by correlation columns with enforced single-row-per-key (or raise if multiple).
-- Scalar subqueries in predicates (e.g., `a = (SELECT ...)`) → LEFT join to grouped subplan + comparison against aggregated output.
-- Nested correlated subqueries → recursively decorrelate innermost first, then re-run on parent.
-- Derived table containing subqueries → decorrelate inside derived table first, then treat as normal input.
 
 ## Core Invariants
 - No remaining subquery expressions post-pass.
@@ -69,7 +59,6 @@
   - Handle NULL like IN; use null-safe predicate.
 - **Quantified comparison `lhs op ALL(subq)`**:
   - Build ANTI join that searches for violating rows: `lhs NOT op sub.col`; if any violation exists, predicate fails.
-  - Add NULL guard: if subquery produces NULL and no violation, result is UNKNOWN → filter should not pass; enforce via additional aggregate flag.
 - **Scalar subquery in SELECT list**:
   - Correlated: rewrite to LEFT join with subquery aggregated by correlation keys; aggregation enforces single row via `COUNT(*)` guard; raise if count >1.
   - Uncorrelated: compute once via CTE; cross join into outer plan.
@@ -142,7 +131,6 @@
   Rewrite:  
   1. Build violating subplan: `Filter(price > cap, limits(region=outer.region))`.  
   2. ANTI join to ensure no violations.  
-  3. Add NULL guard subplan to detect NULL in `cap`; if any NULL and no violation, result UNKNOWN → filter should fail. Implement via aggregate flags.
 
 - **Nested subqueries**  
   Input: `WHERE EXISTS (SELECT 1 FROM A WHERE A.x = outer.x AND A.id IN (SELECT B.id FROM B WHERE B.y = A.y))`  
@@ -189,7 +177,6 @@
 - Unit tests per rule: EXISTS, NOT EXISTS, IN/NOT IN, ANY/ALL, scalar subqueries (correlated and uncorrelated), nested correlation, derived table correlation.
 - Semantic tests for NULL handling: `value IN (SELECT NULL)`, `NOT IN` with NULL, scalar subquery returning NULL vs value.
 - Cardinality enforcement tests: scalar subquery returning multiple rows should raise.
-- Integration: end-to-end queries against DuckDB/PostgreSQL fixtures that mirror DuckDB’s expected plans and outputs.
 - Regression: ensure existing non-subquery queries remain unchanged after decorrelation pass.
 
 ## Implementation Steps
@@ -198,7 +185,6 @@
 3. Extend binder to tag ColumnRefs with scope information and populate `correlation_refs`.
 4. Implement correlation analysis pass (pure detection, no rewrites).
 5. Implement normalization utilities (predicate pushdown, null-safe comparison helper).
-6. Implement rewrite rules iteratively (EXISTS/NOT EXISTS → IN/NOT IN → ANY/ALL → scalar).
 7. Add CTE hoisting mechanism for uncorrelated subqueries.
 8. Wire Decorrelator into the optimization pipeline; ensure optimizer assumes subqueries already removed.
 9. Add comprehensive tests and update docs/examples.

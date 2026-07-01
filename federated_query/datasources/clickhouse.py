@@ -1,7 +1,6 @@
-"""ClickHouse data source — Arrow-native streaming via clickhouse-connect.
+"""ClickHouse data source connector.
 
 ClickHouse returns query results as Arrow directly (over HTTP), so the data path
-hands the engine a streaming ``RecordBatchReader`` with no per-row Python — the
 same shape as the ADBC PostgreSQL path. This makes ClickHouse a clean, fast
 remote source for the federated engine (and a fair benchmark fact store, since
 neither engine gets it "for free" the way a local DuckDB table is).

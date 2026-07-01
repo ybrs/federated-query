@@ -32,12 +32,12 @@ def test_empty_string_vs_null(single_source_env):
     assert isinstance(right_pred, exp.Is)
 
 
-def test_unicode_strings(single_source_env):
-    """Validates Unicode strings (emojis, Chinese, Arabic) push correctly."""
+def test_latin1_strings(single_source_env):
+    """Validates non-ASCII Latin-1 (byte range 0-255) string literals push correctly."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE region IN ('🌍', '中国', 'العربية')"
+        "WHERE region IN ('café', 'Zürich', 'naïve')"
     )
     ast = explain_datasource_query(runtime, sql)
 

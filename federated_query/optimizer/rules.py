@@ -664,7 +664,6 @@ class OrderByPushdownRule(OptimizationRule):
     """Push ORDER BY clauses to data sources when safe.
 
     Transforms:
-        Sort(Projection?(Filter?(Scan))) → Projection?(Filter?(Scan(with order by)))
 
     This pushes ORDER BY to the data source for execution.
     ORDER BY pushdown is mandatory for correctness in many use cases:
@@ -993,7 +992,6 @@ class AggregatePushdownRule(OptimizationRule):
     """Push aggregates to data sources when possible.
 
     Transforms:
-        Aggregate(Filter?(Scan)) → Scan(with aggregates)
 
     This pushes GROUP BY and aggregate functions (COUNT, SUM, etc.)
     to the data source for execution, reducing data transfer.

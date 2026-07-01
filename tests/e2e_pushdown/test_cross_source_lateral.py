@@ -77,7 +77,6 @@ def test_cross_source_user_left_join_lateral(multi_source_env):
 
 
 def test_cross_source_comma_lateral_is_inner(multi_source_env):
-    """A cross-source comma ``LATERAL`` is INNER — outer rows with no match drop."""
     engine_sql = (
         "SELECT o.order_id, t.name FROM duckdb_orders.main.orders o, "
         "LATERAL ("

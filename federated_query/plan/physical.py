@@ -251,7 +251,6 @@ class PhysicalCTE(PhysicalPlanNode):
 
     A CTE is a named relation: its body is executed a single time into an Arrow
     table that every reference reads, so the work is never repeated even when
-    the CTE is referenced many times. Single-source CTEs never reach here — they
     are pushed whole as a remote ``WITH``; this is the cross-source path.
     """
 
@@ -433,7 +432,6 @@ class PhysicalCTEMergeQuery(PhysicalPlanNode):
     Every base source relation in the CTE is materialized into Arrow and
     registered under a generated name; the rendered WITH references those names
     so the in-memory DuckDB runs the recursion (and any multi-reference)
-    locally. Used when a recursive CTE spans data sources — the fixpoint needs a
     single engine.
     """
 
@@ -847,8 +845,6 @@ class PhysicalScan(PhysicalPlanNode):
 
         Only single-column keys with renderable literal values are handled; a
         composite key or an untypable value declines (the join probes in full).
-        The filter mutates this scan in place — its SQL is rebuilt at execute
-        time — and does not change the output schema.
         """
         if len(key_columns) != 1:
             return False
@@ -1348,8 +1344,6 @@ class PhysicalHashJoin(PhysicalPlanNode):
         Outer joins (LEFT/RIGHT/FULL) and ANTI keep non-matching rows, so the
         probe reduction does not apply; a SEMI join keeps only matching left
         rows, so the right's keys are pushed into the left as a semi-join
-        reduction. The right side is drained into a table first — exactly as the
-        row-at-a-time path drains the build side — so its source connection is
         released before the left side streams; otherwise deeply nested joins
         hold a connection open at every level and exhaust the pool. The left
         side streams.
@@ -1372,7 +1366,6 @@ class PhysicalHashJoin(PhysicalPlanNode):
         A SEMI join keeps only left rows whose key matches a right key, so
         constraining the left to those keys drops no result row and avoids
         fetching unmatched rows from the left's (often remote) source. ANTI is
-        excluded — it keeps non-matching rows, which this filter would remove.
         """
         value_tuples = self._distinct_build_keys(
             right_batches, self.right, self.right_keys
@@ -1441,8 +1434,6 @@ class PhysicalHashJoin(PhysicalPlanNode):
         """Distinct non-NULL build-key tuples, or None if empty or above the cap.
 
         Distinct values are computed with pyarrow, so the cap is enforced on the
-        vectorized distinct count: an over-cap build — which the probe would
-        reject anyway — never pays the per-row Python boxing the row-at-a-time
         path would. Only the surviving (<= cap) keys are turned into tuples.
         """
         aliases = build_node.column_aliases()
@@ -1456,7 +1447,6 @@ class PhysicalHashJoin(PhysicalPlanNode):
 
         Each batch's key columns are collected as-is and concatenated, then
         DuckDB-style deduplicated via ``drop_null().group_by(...).aggregate([])``
-        — all in pyarrow's C++ kernels, no Python per row.
         """
         names = _key_column_names(len(build_keys))
         key_tables = []
@@ -1720,7 +1710,6 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
         A side filter may be written against the join alias (``p.category``).
         The alias must therefore be applied to the table INSIDE the derived
         table as well, since the outer alias is not in scope within the
-        subquery — otherwise the remote engine raises a binder error.
         """
         table_ref = f'"{scan.schema_name}"."{scan.table_name}"'
         alias = scan.alias if scan.alias else scan.table_name
@@ -2595,7 +2584,6 @@ class PhysicalSingleRowGuard(PhysicalPlanNode):
     """Enforces scalar-subquery cardinality at execution time.
 
     With no keys, more than one input row in total raises. With keys, a
-    repeated key value raises — this guards decorrelated correlated scalar
     subqueries, where each key admits at most one row.
     """
 
@@ -2881,8 +2869,6 @@ class PhysicalLateralJoin(PhysicalPlanNode):
     def _apply_domain_filter(self, left_table: pa.Table) -> PhysicalPlanNode:
         """Add a sound dynamic filter (domain restriction) to the base scan.
 
-        The filter may be loose (a superset) — the merge engine re-checks the
-        exact correlation — so it only shrinks the rows the base source returns.
         """
         if not isinstance(self.base_scan, PhysicalScan):
             return self.base_scan
@@ -2898,7 +2884,6 @@ class PhysicalLateralJoin(PhysicalPlanNode):
         """The (left + value) output schema, read without fetching rows.
 
         Taken from the LATERAL result's Arrow reader, which exposes the schema
-        before any batch — so an empty join still yields the right columns (a
         ``LIMIT 0`` probe produces zero batches and would lose the schema).
         """
         engine = self.merge_engine()
@@ -2919,7 +2904,6 @@ def _derive_domain_filter(correlations, left_table: pa.Table) -> Optional[Expres
 
     ``=`` becomes ``inner IN (domain)``; ``<``/``<=`` a ``< max(domain)`` bound;
     ``>``/``>=`` a ``> min(domain)`` bound. Any other shape contributes no term
-    (the base is fetched in full — still correct, just not reduced).
     """
     from .expressions import BinaryOp, BinaryOpType, InList, ColumnRef
 
@@ -3253,7 +3237,7 @@ class _PlanFormatter:
     def _remote_join_detail(self, node: PhysicalRemoteJoin) -> str:
         left = f"{node.left.schema_name}.{node.left.table_name}"
         right = f"{node.right.schema_name}.{node.right.table_name}"
-        return f"type={node.join_type.value} sources={left}⨝{right}"
+        return f"type={node.join_type.value} sources={left}|X|{right}"
 
     def _nested_loop_join_detail(self, node: PhysicalNestedLoopJoin) -> str:
         info = f"type={node.join_type.value}"

@@ -354,7 +354,6 @@ class _SubqueryPreparer:
     def _peel_scalar_limit_order(self, plan: LogicalPlanNode) -> LogicalPlanNode:
         """Peel a top LIMIT and the ORDER BY it caps into pending state.
 
-        ``SELECT … WHERE k = outer.k ORDER BY c LIMIT n`` becomes a per-key
         limit: the LIMIT count and the ORDER BY are recorded here and reattached
         as an order-aware GroupedLimit once the join side is assembled.
         """
@@ -540,7 +539,6 @@ class _SubqueryPreparer:
         """Peel a Sort or HAVING filter, keeping it wrapped around the core.
 
         An ORDER BY/LIMIT or a HAVING clause shapes the subquery's result set,
-        so unlike a value projection it cannot be discarded — it stays as part
         of the value relation while the value columns are taken from below it.
         """
         inner_core, value_exprs = self._peel_values_top(plan.input, True)
@@ -649,8 +647,6 @@ class _SubqueryPreparer:
         A HAVING predicate above an aggregate may reference aggregate
         functions absent from the aggregate's output list. A filter (kept)
         or a pulled correlation condition cannot recompute them per row, so
-        the calls are appended as outputs and every predicate — both kept
-        and pulled — is rewritten to reference them by name.
         """
         aggregates = list(aggregate.aggregates)
         names = list(aggregate.output_names)

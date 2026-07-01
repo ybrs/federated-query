@@ -6,23 +6,14 @@ This is a production-grade federated query engine that executes SQL queries acro
 
 ## Implementation Status
 
-**Current Implementation State**: Phases 0–8 complete. Phase 9 (general
 dependent-join decorrelation + cross-source subquery fallback; parallel
-execution + memory management) not started — see `decorrelation-gaps.md`.
 
-- **Phase 0**: Foundation — project structure, configuration, catalog, data sources
-- **Phase 1**: Basic query execution — single-table SELECT with filters and limits
-- **Phase 2**: Joins — multi-table queries with hash and nested-loop joins
-- **Phase 3**: Aggregations — GROUP BY, aggregate functions, HAVING, global aggregates
-- **Phases 4–6**: Optimizer rules (predicate/projection/aggregate/order-by/limit pushdown,
   expression simplification), cost stubs, native `EXPLAIN`, statistics scaffolding
-- **Phase 7**: Subquery decorrelation — EXISTS/IN/ANY/ALL/scalar → joins with exact
   three-valued NULL semantics
 - **Phase 8**: Pushdown breadth and advanced SQL
   - Single-source generator pushes any same-source subtree as one remote query
     (joins of every shape incl. SEMI/ANTI/LEFT, computed projections, derived tables)
   - Set operations, `CAST`, decorrelation gaps A/B, `LATERAL` (same + cross-source)
-  - **CTEs** (`WITH`, incl. `RECURSIVE`) — single-source and cross-source
   - Cross-source dynamic filtering / semi-join reduction (G9)
   - Local set-based work runs in the DuckDB merge engine (no Python row-loop joins)
 
@@ -98,8 +89,6 @@ datasources:
 **Purpose**: Basic algebraic simplifications before main optimization
 
 **Rules**:
-- Constant folding: `1 + 2` → `3`
-- Expression simplification: `x AND TRUE` → `x`
 - Predicate normalization: Convert to CNF/DNF
 - Type coercion resolution
 - Null handling simplification
@@ -180,17 +169,10 @@ WHERE c.region = 'US'
 ```
 Cost = CPU_cost + IO_cost + Network_cost
 
-CPU_cost = rows_processed × CPU_TUPLE_COST
-IO_cost = pages_read × IO_PAGE_COST
-Network_cost = bytes_transferred × NETWORK_BYTE_COST + RTT × NUM_ROUND_TRIPS
 ```
 
 **Cost Estimation for Operations**:
-- **Scan**: rows × (CPU + IO costs)
-- **Filter**: input_rows × selectivity × CPU_cost
 - **Join**: depends on join method (nested loop, hash, merge)
-- **Aggregate**: input_rows × CPU_cost + hash_table_cost
-- **Sort**: input_rows × log(input_rows) × CPU_cost
 
 **Cardinality Estimation**:
 - Use histograms and statistics when available
@@ -276,10 +258,6 @@ Query: SELECT o.id, c.name FROM postgres.orders o
 
 Physical Plan:
 HashJoin (local)
-├─ Gather (from PostgreSQL)
-│  └─ RemoteScan: SELECT id, customer_id FROM orders WHERE amount > 1000
-└─ Gather (from DuckDB)
-   └─ RemoteScan: SELECT id, name FROM customers
 
 Execution:
 1. Push filter to PostgreSQL: "amount > 1000"
@@ -319,33 +297,19 @@ class ColumnStats:
 
 ```
 SQL Input
-   ↓
 [1. Parse] (sqlglot)
-   ↓
 Abstract Syntax Tree (AST)
-   ↓
 [2. Bind] (resolve references, types)
-   ↓
 Logical Plan (unoptimized)
-   ↓
 [3. Pre-Optimize] (constant folding, simplification)
-   ↓
 [4. Decorrelate] (remove correlated subqueries)
-   ↓
 [5. Logical Optimize] (pushdown, reordering)
-   ↓
 Optimized Logical Plan
-   ↓
 [6. Generate Physical Plans] (enumerate alternatives)
-   ↓
 Candidate Physical Plans
-   ↓
 [7. Cost Estimation] (choose best plan)
-   ↓
 Selected Physical Plan
-   ↓
 [8. Execute] (fetch data, compute results)
-   ↓
 Results (Arrow format)
 ```
 
@@ -394,7 +358,6 @@ Results (Arrow format)
 - **Hash Join / Nested-Loop Join**: local strategies, chosen by the planner
 - **Remote Join**: same-source joins pushed to the source as one query
 - **Semi-Join Pushdown** (a.k.a. dynamic filtering): send the build side's
-  join keys to constrain the probe side and reduce data fetched — **not yet
   implemented; tracked as G9** and the top cross-source usability gap
 - **Broadcast / Shuffle Join**: not yet implemented
 

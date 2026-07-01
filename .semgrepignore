@@ -1,0 +1,14 @@
+# Paths semgrep must skip. Providing this file REPLACES semgrep's built-in
+# default ignore list. That default silently ignores "tests/", which hid all
+# non-ASCII in our test files (semgrep flagged 32 files where grep found 47).
+# We deliberately DO NOT ignore tests/ here so the no-non-ascii rule sees them.
+venv/
+.git/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+postgres-17/
+postgres-data/
+*.duckdb
+*.db
+*.log

@@ -49,15 +49,12 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
 
 ### Implemented Test Files:
 
-- **Section 0 – Foundation:** `tests/e2e_pushdown/test_foundation.py` (2 tests)
-- **Section 1 – Single-table predicates:** `tests/e2e_pushdown/test_single_table_predicates.py` (**26 tests**, not 12)
   - Covers: SELECT *, projections, all comparison operators (=, !=, <, >, <=, >=)
   - Covers: AND, OR, NOT, IN, NOT IN, BETWEEN, NOT BETWEEN, LIKE, NOT LIKE
   - Covers: IS NULL, IS NOT NULL
   - Covers: 3-way AND/OR, nested (a AND b) OR (c AND d), complex logic
   - Covers: LIMIT, OFFSET
 
-- **Section 2 – Single-table aggregations:** `tests/e2e_pushdown/test_single_table_aggregations.py` (**15 tests**, not 6)
   - Covers: COUNT(*), COUNT(col), COUNT(DISTINCT), SUM, SUM(DISTINCT), AVG, MIN, MAX
   - Covers: GROUP BY single/multiple columns
   - Covers: HAVING, HAVING with multiple conditions
@@ -65,7 +62,6 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
   - Covers: Aggregates on expressions (SUM(a * b))
   - Covers: MIN/MAX on strings
 
-- **Section 3 – NULL Handling:** `tests/e2e_pushdown/test_null_handling.py` (**13 tests** - MISSING FROM ORIGINAL DOC!)
   - Covers: IS NULL / IS NOT NULL
   - Covers: NULL in AND/OR logic (three-valued logic)
   - Covers: NULL in JOIN keys
@@ -76,36 +72,30 @@ VERY IMPORTANT: in this exercise you can't use "string in string" checks. That i
   - Covers: NULL equality comparison
   - Covers: Complex boolean logic with NULL
 
-- **Section 4 – Two-table joins:** `tests/e2e_pushdown/test_single_source_joins.py` (10 tests)
   - Covers: INNER, LEFT, RIGHT, CROSS joins
   - Covers: JOIN with filters, LIMIT
   - Covers: Comma syntax
   - Covers: Non-equi join fallback
 
-- **Section 5 – Join + aggregation/order:** `tests/e2e_pushdown/test_join_aggregations_and_order.py` (6 tests)
   - Covers: JOIN + GROUP BY, HAVING
   - Covers: JOIN + ORDER BY, LIMIT
   - Covers: Multiple group columns
 
-- **Section 6 – Three-table joins:** `tests/e2e_pushdown/test_multi_table_joins.py` (4 tests)
   - Covers: 3-table inner chains
   - Covers: Mixed INNER/LEFT
   - Covers: 3-table with predicates, LIMIT
 
-- **Section 7 – Combined pushdowns:** `tests/e2e_pushdown/test_combined_pushdowns.py` (5 tests)
   - Covers: Projection + predicate + aggregation + join + limit
   - Covers: Computed expressions + GROUP BY
   - Covers: ORDER BY after aggregation
   - Covers: DISTINCT with JOIN
   - Covers: CASE expressions in aggregates
 
-- **Section 8 – Multi-datasource guardrails:** `tests/e2e_pushdown/test_multi_datasource_guardrails.py` (5 tests)
   - Covers: Same-source join pushdown
   - Covers: Cross-source join fallback
   - Covers: 3-source joins
   - Covers: Cross-source filters, aggregates
 
-- **Section 9 – Edge cases & negatives:** `tests/e2e_pushdown/test_edge_cases_negatives.py` (3 tests)
   - Covers: Window functions (unsupported, errors)
   - Covers: Scalar subqueries (unsupported, errors)
   - Covers: OR in join condition (fallback)

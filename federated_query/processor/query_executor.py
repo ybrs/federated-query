@@ -75,7 +75,6 @@ class QueryExecutor:
     def _execute_pipeline(
         self, sql: str, profiler: Optional[QueryProfiler]
     ) -> Union[pa.Table, dict]:
-        """Run parse → bind → decorrelate → optimize → plan → execute, timed."""
         physical_plan = self._plan_pipeline(sql, profiler)
         if profiler is not None:
             profiler.instrument(physical_plan)

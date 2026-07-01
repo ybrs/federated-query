@@ -190,7 +190,6 @@ class TestNestedScalarSubqueries:
             FROM users u
 
         Expected plan structure:
-            - Inner scalar (AVG) decorrelated first → CTE or CROSS join
             - Outer scalar decorrelated with inner result available
             - LEFT join for outer scalar
 

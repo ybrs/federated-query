@@ -159,7 +159,6 @@ def test_four_table_with_having(single_source_env):
     assert group_clause is not None
 
     # HAVING over a join is applied locally (post-aggregation), so the remote
-    # query carries no WHERE — matching test_join_having_with_alias_adds_filter.
     assert ast.args.get("where") is None
 
 

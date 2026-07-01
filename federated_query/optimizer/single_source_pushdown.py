@@ -148,7 +148,6 @@ class SingleSourcePushdown:
         """Return a remote query for a pushable same-source subtree, or None.
 
         Fires for any subtree that contains a join (G1) or a computed,
-        non-aggregate projection (G2 — e.g. ``UPPER(x)``, ``a || b``); plain
         single-table scans keep using the existing scan-pushdown path.
         """
         context = _PushContext()
@@ -183,7 +182,6 @@ class SingleSourcePushdown:
         operator cannot resolve, so the columns are listed explicitly with
         unique aliases and recorded for qualified resolution. Each scan already
         carries the columns projection pushdown found necessary, so only those
-        are emitted (not the whole table) — a true ``*`` falls back to the
         catalog.
 
         Declines when a column-contributing join pulled in a derived relation:
@@ -317,7 +315,6 @@ class SingleSourcePushdown:
 
         The right side renders as a derived relation that keeps its outer
         column references; in LATERAL scope the source (or the DuckDB merge
-        engine) evaluates it per left row. Same-source only — a cross-source
         right side fails the data-source check and declines to push.
         """
         if not self._absorb_from(node.left, context):
@@ -717,8 +714,6 @@ class SingleSourcePushdown:
     def _absorb_join(self, join: Join, context: _PushContext) -> bool:
         """Add one join to a left-deep tree, rendering its right relation.
 
-        Every join type — including the SEMI/ANTI/LEFT joins that decorrelation
-        produces from EXISTS/IN/scalar subqueries — pushes as a real SQL join.
         The right side is rendered as a relation: a base scan stays a table
         reference, a projected sub-relation becomes a derived table. No subquery
         expression is ever re-created.
@@ -890,7 +885,6 @@ class SingleSourcePushdown:
         """Render the SELECT list with unique output names per column.
 
         Output names are made unique (``id``, ``id_1`` ...) so a result with
-        columns from several tables never has two fields of the same name —
         otherwise a parent operator could not address one of them and the
         connector could not decode them. Each column reference also records a
         (qualifier, column) -> unique name entry for qualified resolution.

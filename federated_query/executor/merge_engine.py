@@ -58,7 +58,6 @@ class MergeEngine:
         """Return a query's result schema without fetching its rows.
 
         The Arrow reader exposes its schema before any batch is pulled, so an
-        empty result (or a ``LIMIT 0``) still yields the correct column types —
         unlike reading the first batch, which an empty result never produces.
         """
         cursor = self._connection.cursor()

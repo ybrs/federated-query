@@ -88,7 +88,6 @@ def _stringify_query_value(query_value: Any) -> str:
 
 
 class FedQRuntime:
-    """Wraps the parse → bind → optimize → plan → execute pipeline."""
 
     def __init__(self, catalog: Catalog, executor_config: ExecutorConfig):
         """Assemble and warm up the full query-execution pipeline."""

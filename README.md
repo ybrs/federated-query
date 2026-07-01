@@ -25,49 +25,12 @@ The engine follows a classic database architecture with several optimization pha
 
 ```
 SQL Query
-   ↓
-[Parser] (sqlglot) → AST
-   ↓
-[Binder] → Resolved Logical Plan
-   ↓
-[Pre-Optimizer] → Simplified Plan
-   ↓
-[Decorrelator] → Decorrelated Plan
-   ↓
-[Logical Optimizer] → Optimized Logical Plan
-   ↓
-[Physical Planner] → Physical Plan (with cost estimation)
-   ↓
-[Executor] → Results (Arrow format)
 ```
 
 ## Project Structure
 
 ```
 federated-query/
-├── federated_query/          # Main package
-│   ├── catalog/              # Metadata catalog
-│   ├── config/               # Configuration management
-│   ├── datasources/          # Data source connectors
-│   │   ├── postgresql.py     # PostgreSQL connector
-│   │   └── duckdb.py         # DuckDB connector
-│   ├── executor/             # Query executor
-│   ├── optimizer/            # Query optimization
-│   │   ├── rules.py          # Optimization rules
-│   │   ├── cost.py           # Cost model
-│   │   ├── decorrelation.py  # Subquery decorrelation
-│   │   └── statistics.py     # Statistics collection
-│   ├── parser/               # SQL parser and binder
-│   ├── plan/                 # Plan representations
-│   │   ├── logical.py        # Logical plan nodes
-│   │   ├── physical.py       # Physical plan nodes
-│   │   └── expressions.py    # Expression nodes
-│   └── utils/                # Utilities
-├── config/                   # Configuration files
-│   └── example_config.yaml   # Example configuration
-├── tests/                    # Test suite
-├── plan.md                   # Architecture documentation
-└── tasks.md                  # Implementation roadmap
 ```
 
 ## Installation
@@ -146,7 +109,6 @@ sql = """
     WHERE o.amount > 1000
 """
 
-# Parse → Bind → Optimize → Execute
 logical_plan = parser.parse_to_logical_plan(sql, catalog)
 bound_plan = binder.bind(logical_plan)
 optimized_plan = optimizer.optimize(bound_plan)
@@ -164,7 +126,6 @@ Use `EXPLAIN` to inspect how a query will run without touching the underlying da
 EXPLAIN SELECT id, name FROM duckdb.main.users WHERE age > 30;
 ```
 
-The engine returns a single-column result where each row is a formatted physical operator (including stubbed cost values, row estimates, and key attributes) so you can understand join order, predicates, and data source usage before executing the statement. The `Queries:` section shows the exact SQL sent to each source. For a cross-source join with dynamic filtering, the probe-side query shows the runtime `key IN (...)` predicate with real build-side values — to print those, EXPLAIN reads a few rows from the build side (capped, so it never scans a large table just to render the plan).
 
 ### Interactive CLI (`fedq`)
 
@@ -245,10 +206,7 @@ HAVING SUM(o.amount) > 2000
 ```
 
 **Phase 7: Subquery Decorrelation** (done)
-- EXISTS / NOT EXISTS → SEMI / ANTI joins
-- IN / NOT IN → SEMI / ANTI joins with exact NULL semantics (incl. tuple IN)
 - ANY / SOME / ALL quantified comparisons (incl. LIKE ALL)
-- Scalar subqueries → LEFT joins with aggregation, COALESCE for COUNT,
   runtime cardinality guards, per-key limits for correlated LIMIT
 - Boolean subqueries in SELECT lists (flag columns via SEMI/ANTI unions)
 - OR-of-subqueries via union expansion; nested subqueries innermost-first
@@ -276,14 +234,12 @@ WHERE u.country IN (SELECT code FROM countries WHERE enabled)
 - Many pre-existing silent-fail / correctness fixes (DuckDB typed schemas,
   remote-join side filters, predicate-pushdown recursion, WHERE/HAVING split,
   NULLS FIRST/LAST, MIN/MAX type preservation)
-- **Set operations** (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`) — parse,
   bind, single-source pushdown, and local multiset execution
 - In progress (tracked in `TODO-phase7-review.md`, section G): broader
   same-source join pushdown (G1), computed-projection pushdown (G2), CTEs (G3),
   `CAST` target types (G5), date/time functions (G6), aggregate `FILTER` (G7)
 
 ### Known Limitations
-- **Cross-source joins fetch both sides in full** and join locally — there is
   no dynamic filtering / semi-join reduction yet, so the probe side ships its
   entire table over the network. This is the top usability gap, tracked as
   **G9** in `TODO-phase7-review.md`.
@@ -331,9 +287,6 @@ Implemented today:
 - **Join Strategy Selection**: Chooses between hash and nested-loop joins (remote join when both sides share a source)
 
 Not yet implemented (roadmap):
-- **Cross-Source Dynamic Filtering** (semi-join reduction) — see G9; today cross-source joins fetch both sides in full
-- **Parallel Execution** — sources are currently fetched sequentially
-- **Memory Management / spill-to-disk** — execution is in-memory
 
 ## Contributing
 

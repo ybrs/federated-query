@@ -1,4 +1,4 @@
-"""ClickHouse connector — Arrow-native fetch and metadata.
+"""ClickHouse connector integration tests.
 
 Skipped unless ``clickhouse-connect`` is installed and a ClickHouse server is
 reachable (host/port from ``CLICKHOUSE_HOST`` / ``CLICKHOUSE_PORT``, default

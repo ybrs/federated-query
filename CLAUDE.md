@@ -22,31 +22,7 @@ engine.
 
 # No ascii
 
-Use ASCII characters only. No exceptions you invent. This applies EVERYWHERE:
-assistant replies, chat messages, docs, comments, commit messages, log output,
-code, and file contents.
-
-Banned (this is not an exhaustive list, the rule is "if it is not ASCII it is
-banned"):
-- emoji and emoticons of any kind.
-- status glyphs: green check, cross mark, hourglass, colored dots
-  (red/yellow/green), warning triangle, construction sign, stars, fire, etc.
-- "smart" / typographic punctuation: em-dash, en-dash, curly quotes, the
-  ellipsis character, non-breaking space, bullet glyphs, box-drawing characters,
-  and arrow glyphs.
-
-Use the plain ASCII equivalent instead:
-- dashes: "-" or "--", never an em-dash or en-dash.
-- quotes: straight ' and ", never curly quotes.
-- ellipsis: "...", three ASCII periods.
-- arrows: "->", never an arrow glyph.
-- status: write the word. DONE, COMPLETE, NOT STARTED, PENDING, IN PROGRESS,
-  PASS, FAIL, WARNING, CRITICAL, yes/no.
-
-Markdown task checkboxes (`- [x]` / `- [ ]`) are fine; they are ASCII. The ONLY
-allowed non-ASCII is a character that is genuinely required content in a test
-fixture or real data (an accented name, a CJK/Arabic string the test actually
-asserts on). Nothing else, anywhere.
+Only ascii edits are allowed.
 
 Never fail silently. If something breaks it should throw an error. We don't want silent fails. You can only catch exceptions when we show it to the user in the cli. Otherwise all exceptions should be thrown. 
 

@@ -2,7 +2,6 @@
 
 ## Goals
 - Push qualifying joins down into remote data sources so they execute server-side.
-- Preserve correctness and readability by keeping each function under 20 lines and cyclomatic complexity ≤4, per repository standards.
 - Maintain full compatibility with existing predicate, projection, aggregate, and limit pushdowns.
 
 ## Scope

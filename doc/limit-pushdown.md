@@ -362,7 +362,6 @@ Sort(Projection(Scan(products)))
 ```sql
 SELECT name, price FROM products ORDER BY 2
 ```
-**Resolve**: ORDER BY 2 → ORDER BY price
 **Then push**: `Scan(products, order_by=[price])`
 
 #### 5.3 OFFSET Without LIMIT
@@ -805,7 +804,6 @@ SELECT * FROM products LIMIT -1  -- ERROR
 **Test Coverage Required**:
 
 1. **Unit Tests**: Test each pushdown rule in isolation
-2. **Integration Tests**: Test parser → optimizer → planner → execution
 3. **E2E Tests**: Already exist in `tests/e2e_pushdown/test_order_by_comprehensive.py`
 4. **Edge Cases**: Test all edge cases listed in Rule 5
 
@@ -827,8 +825,6 @@ SELECT * FROM products LIMIT -1  -- ERROR
    SELECT * FROM events ORDER BY timestamp
    -- Used by: cursor processing, streaming, chronological order
    ```
-   - Without pushdown: Database returns unsorted → client gets wrong order
-   - With pushdown: Database returns properly sorted → correct behavior
    - **Impact**: Correctness requirement, not optimization
 
 2. **ORDER BY + LIMIT for pagination** (OPTIMIZATION):

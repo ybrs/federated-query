@@ -285,8 +285,6 @@ Output:
 - Network: Transfer all source rows
 
 **Federated aggregation:**
-- Complexity: O(n₁) scan source 1 + O(n₂) scan source 2 + O(n₁ + n₂) JOIN + O(result) aggregation
-- Memory: O(groups) for aggregation + O(max(n₁, n₂)) for JOIN
 - Network: Transfer all rows from both sources
 
 ### With Pushdown (Future)

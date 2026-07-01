@@ -1,8 +1,6 @@
 """Tests for the public ExpressionVisitor extension point.
 
 The visitor lets callers walk an expression tree (to debug, monitor, or
-rewrite queries). These tests exercise the pattern end to end — which nothing
-else in the engine does — so the ``accept`` hooks and the ``ExpressionVisitor``
 interface cannot silently drift out of sync as new expression types are added.
 """
 
