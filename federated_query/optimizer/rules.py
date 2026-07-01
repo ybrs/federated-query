@@ -92,7 +92,7 @@ class PredicatePushdownRule(OptimizationRule):
             return self._push_filter(plan)
         if isinstance(plan, SetOperation):
             return _rewrite_set_operation_branches(plan, self._push_down)
-        if isinstance(plan, (Projection, Join, Aggregate, Limit, Sort)):
+        if isinstance(plan, (Projection, Join, Aggregate, Limit, Sort, SubqueryScan)):
             return transform_children(plan, self._push_down)
         return plan
 
@@ -241,10 +241,67 @@ class PredicatePushdownRule(OptimizationRule):
         from ..plan.logical import JoinType
 
         if join.join_type != JoinType.INNER:
-            return self._rehome_filter_over_join(filter_node, join)
+            return self._push_filter_below_outer_join(filter_node, join)
         conjuncts = split_conjuncts(filter_node.predicate)
         groups = self._group_join_conjuncts(conjuncts, join)
         return self._assemble_pushed_join(join, groups)
+
+    def _push_filter_below_outer_join(
+        self, filter_node: Filter, join: Join
+    ) -> LogicalPlanNode:
+        """Push only preserved-side conjuncts below an outer join; keep the rest above.
+
+        A LEFT join preserves its left rows, so a conjunct referencing only left
+        columns can descend into the left input (the filter above would remove
+        those rows anyway); RIGHT is the mirror. A conjunct touching the
+        null-extended side or both sides must stay above (pushing it would change
+        which rows are null-extended). FULL preserves neither side.
+        """
+        preserved = self._preserved_side(join.join_type)
+        if preserved is None:
+            return self._rehome_filter_over_join(filter_node, join)
+        conjuncts = split_conjuncts(filter_node.predicate)
+        down, keep = self._partition_preserved(conjuncts, join, preserved)
+        return self._assemble_outer_join(filter_node, join, down, keep, preserved)
+
+    def _preserved_side(self, join_type) -> Optional[str]:
+        """The join side whose rows always survive ('left'/'right'), None for FULL."""
+        from ..plan.logical import JoinType
+
+        if join_type == JoinType.LEFT:
+            return "left"
+        if join_type == JoinType.RIGHT:
+            return "right"
+        return None
+
+    def _partition_preserved(self, conjuncts, join, preserved):
+        """Split conjuncts into preserved-side-only (pushable) and the rest."""
+        other = "right" if preserved == "left" else "left"
+        side_cols = pushdown.available_columns(getattr(join, preserved))
+        other_cols = pushdown.available_columns(getattr(join, other))
+        down, keep = [], []
+        for conjunct in conjuncts:
+            cols = pushdown.qualified_or_bare_names(conjunct)
+            if pushdown.columns_belong_to_side(cols, side_cols, other_cols):
+                down.append(conjunct)
+            else:
+                keep.append(conjunct)
+        return down, keep
+
+    def _assemble_outer_join(self, filter_node, join, down, keep, preserved):
+        """Rebuild an outer join with preserved-side conjuncts pushed, rest kept above."""
+        other = "right" if preserved == "left" else "left"
+        new_join = join.model_copy(
+            update={
+                preserved: self._push_side(getattr(join, preserved), down),
+                other: self._push_down(getattr(join, other)),
+            }
+        )
+        if not keep:
+            return new_join
+        # Conjuncts touching the null-extended side or both sides cannot move below
+        # the outer join without changing its null rows, so keep them on top.
+        return Filter.create(input=new_join, predicate=combine_and(keep))
 
     def _rehome_filter_over_join(
         self, filter_node: Filter, join: Join

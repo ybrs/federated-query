@@ -198,24 +198,60 @@ class Binder:
         return node.model_copy(update={"input": bound_input})
 
     def _bind_scan(self, scan: Scan) -> Scan:
-        """Bind a Scan node, keeping only columns of the scanned table.
+        """Bind a Scan node to the real column names it reads from its table.
 
         The parser over-collects referenced names: a scan's column list may
-        include names that belong to other relations, to enclosing queries
-        (correlated references), or to nested subqueries. Names not present
-        in this table are dropped here; references that resolve nowhere
-        still fail loudly during expression binding.
+        include names of other relations, enclosing queries (correlated refs),
+        or nested subqueries. Names not present in this table are dropped; a
+        star read-set (the parser's "all columns" fallback for unqualified
+        references it cannot attribute) is expanded to the table's actual
+        columns. A bound scan MUST carry explicit columns, never a star.
         """
         table = self._resolve_table(scan)
-        kept = []
-        for name in scan.columns:
-            if name == "*" or table.get_column(name) is not None:
-                kept.append(name)
-        if len(kept) == 0:
-            kept = ["*"]
+        kept = self._scan_read_columns(scan, table)
+        self._guard_no_star_columns(scan, kept)
         if kept == scan.columns:
             return scan
         return scan.model_copy(update={"columns": kept})
+
+    def _scan_read_columns(self, scan: Scan, table: Table) -> List[str]:
+        """Resolve a scan's read-set to real column names, expanding any star.
+
+        A star (or a read-set that attributes nothing to this table) means "all
+        columns", so it expands to every column the catalog lists for the table.
+        """
+        if "*" in scan.columns:
+            return self._all_column_names(table)
+        kept = []
+        for name in scan.columns:
+            if table.get_column(name) is not None:
+                kept.append(name)
+        if len(kept) == 0:
+            return self._all_column_names(table)
+        return kept
+
+    def _all_column_names(self, table: Table) -> List[str]:
+        """Every column name the table exposes, in catalog order."""
+        names = []
+        for column in table.columns:
+            names.append(column.name)
+        if len(names) == 0:
+            raise BindingError(f"Table {table.name} exposes no columns")
+        return names
+
+    def _guard_no_star_columns(self, scan: Scan, columns: List[str]) -> None:
+        """Fail loudly if a star survived into a bound scan's read-set.
+
+        No shortcut column lists: a bound scan must name real columns so every
+        pass that reasons about columns (side-assignment, pruning, orientation)
+        sees the true schema. A surviving star is a bug, not a valid state.
+        """
+        for name in columns:
+            if name == "*":
+                raise BindingError(
+                    f"Scan of '{scan.table_name}' still has a '*' column after "
+                    "binding; scan read-sets must be explicit column names"
+                )
 
     def _resolve_table(self, scan: Scan) -> Table:
         """Resolve table reference."""
