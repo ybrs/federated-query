@@ -129,7 +129,12 @@ def test_in_uses_plain_equality(catalog):
     )
     join = the_join(plan, JoinType.SEMI)
     assert "IS NULL" not in condition_sql(join)
-    assert '= "__subq_0_v0"' in condition_sql(join).replace("(", "").replace(")", "")
+    # The subquery value column is qualified to its derived-relation alias
+    # (__subq_0), so the equality compares against "__subq_0"."__subq_0_v0".
+    assert (
+        '= "__subq_0"."__subq_0_v0"'
+        in condition_sql(join).replace("(", "").replace(")", "")
+    )
 
 
 def test_not_in_uses_null_aware_match(catalog):

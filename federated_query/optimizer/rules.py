@@ -13,6 +13,7 @@ from ..plan.logical import (
     Limit,
     Union,
     SetOperation,
+    SubqueryScan,
     Explain,
     transform_children,
 )
@@ -1050,7 +1051,7 @@ class AggregatePushdownRule(OptimizationRule):
         """
         if isinstance(plan, SetOperation):
             return _rewrite_set_operation_branches(plan, self._push_aggregate)
-        if isinstance(plan, (Projection, Filter, Limit, Sort, Join)):
+        if isinstance(plan, (Projection, Filter, Limit, Sort, Join, SubqueryScan)):
             return transform_children(plan, self._push_aggregate)
         return plan
 

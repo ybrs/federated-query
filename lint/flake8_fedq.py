@@ -13,6 +13,11 @@ checked only for source under ``federated_query/`` (never tests):
          directly above its statement (the comments that say what is built and
          why).
 
+  FQ003  String-matching a column/table name to resolve which relation a column
+         belongs to is forbidden (``ref.column.startswith(...)``,
+         ``ref.table.endswith(...)``). Relation membership is resolved by
+         qualifier / identity; matching name text is how bugs sneak in.
+
 This is an AST plugin, not a text scan, for two reasons a regex cannot handle:
 a nested call (``A.create(b=B.create(...))``) is attributed to the ONE enclosing
 statement, so the statement's comments defend the whole tree instead of each
@@ -22,6 +27,12 @@ access, not a bare init of the state class ``Table``, so it is not flagged.
 
 import ast
 import os
+
+# FQ003: methods that test one string against another, and the ColumnRef naming
+# fields whose value is a relational identifier. A name-test method called on a
+# .column / .table attribute is string-matching relation membership.
+_NAME_MATCH_METHODS = {"startswith", "endswith"}
+_RELATION_FIELDS = {"column", "table"}
 
 _STATE_NAMES = None
 
@@ -152,6 +163,24 @@ class FedqConstructionChecker:
             return "FQ002", _rightmost_name(func.value)
         return None
 
+    def _string_match_violation(self, node):
+        """Return "FQ003" if the call string-matches a column/table name.
+
+        A ``.startswith(...)`` / ``.endswith(...)`` whose receiver is a ``.column``
+        or ``.table`` attribute is deciding a column's relation membership by
+        matching its name text - the anti-pattern for a query engine. Membership
+        must be resolved by qualifier / identity, never by name string-matching.
+        """
+        func = node.func
+        if not isinstance(func, ast.Attribute):
+            return None
+        if func.attr not in _NAME_MATCH_METHODS:
+            return None
+        receiver = func.value
+        if isinstance(receiver, ast.Attribute) and receiver.attr in _RELATION_FIELDS:
+            return "FQ003"
+        return None
+
     def _message(self, code, name):
         """Render the human-facing message for a violation code."""
         if code == "FQ001":
@@ -160,10 +189,16 @@ class FedqConstructionChecker:
                 f"or .model_copy(update=...), or justify the bare init with >=2 "
                 f"comment lines directly above the statement"
             )
+        if code == "FQ003":
+            return (
+                "FQ003 string-matching a column/table name (.startswith/.endswith "
+                "on a .column or .table) to resolve relation membership is "
+                "forbidden; resolve columns by qualifier/identity, not by name text"
+            )
         return f"FQ002 {name}.create(...) needs >=2 comment lines directly above the statement"
 
     def run(self):
-        """Yield one flake8 finding per undefended construction statement."""
+        """Yield one flake8 finding per construction or string-match violation."""
         if not self._in_scope():
             return
         names = _state_class_names()
@@ -172,15 +207,22 @@ class FedqConstructionChecker:
         for node in ast.walk(self.tree):
             if not isinstance(node, ast.Call):
                 continue
-            classified = self._classify(node, names)
-            if classified is None:
-                continue
-            code, name = classified
-            statement = self._enclosing_statement(node, parents)
-            line = statement.lineno if statement is not None else node.lineno
-            if self._comments_above(line) >= 2:
-                continue
-            if (line, code) in reported:
-                continue
-            reported.add((line, code))
-            yield line, 0, self._message(code, name), type(self)
+            for line, code, name in self._call_violations(node, names, parents):
+                if (line, code) in reported:
+                    continue
+                reported.add((line, code))
+                yield line, 0, self._message(code, name), type(self)
+
+    def _call_violations(self, node, names, parents):
+        """Yield (line, code, name) for each violation a single call raises."""
+        match = self._string_match_violation(node)
+        if match is not None:
+            yield node.lineno, match, None
+        classified = self._classify(node, names)
+        if classified is None:
+            return
+        code, name = classified
+        statement = self._enclosing_statement(node, parents)
+        line = statement.lineno if statement is not None else node.lineno
+        if self._comments_above(line) < 2:
+            yield line, code, name

@@ -233,6 +233,7 @@ class _PreparedSubquery(StateModel):
     plan: LogicalPlanNode
     condition: Optional[Expression]
     values: List[str]
+    alias: str
 
     @classmethod
     def create(
@@ -241,14 +242,18 @@ class _PreparedSubquery(StateModel):
         plan: LogicalPlanNode,
         condition: Optional[Expression],
         values: List[str],
+        alias: str,
     ) -> "_PreparedSubquery":
         """Sanctioned fresh-construction path for _PreparedSubquery.
         Names every field so none is dropped; derive from an existing node
-        with model_copy(update=...) instead of re-listing fields here."""
+        with model_copy(update=...) instead of re-listing fields here.
+        alias is the subquery's derived-relation alias (its prefix), the
+        qualifier its output columns carry once wrapped in a SubqueryScan."""
         return cls(
             plan=plan,
             condition=condition,
             values=values,
+            alias=alias,
         )
 
 
@@ -297,6 +302,49 @@ class _SubqueryPreparer:
         # correlated "ORDER BY ... LIMIT n" keeps the first n rows per key.
         self.pending_order: Optional[Sort] = None
 
+    def _wrap_boundary(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Expose the prepared subquery under its prefix alias as a derived relation."""
+        # The assembled subquery plan exposed under its deterministic prefix
+        # alias, so outer references to its output columns qualify to that
+        # relation exactly like a FROM (SELECT ...) derived table's alias.
+        return SubqueryScan.create(input=plan, alias=self.prefix)
+
+    def _finalize(self, prepared: _PreparedSubquery) -> _PreparedSubquery:
+        """Wrap a prepared subquery at its alias boundary.
+
+        The single choke point where an IN/ANY/EXISTS subquery becomes a derived
+        relation: its plan is wrapped in the prefix-aliased SubqueryScan. Its
+        correlation condition already refers to the subquery's output columns
+        with the prefix qualifier (set where those refs are constructed), so no
+        unqualified subquery ref escapes into the outer plan.
+        """
+        return prepared.model_copy(
+            update={"plan": self._wrap_boundary(prepared.plan)}
+        )
+
+    def _finalize_scalar(
+        self,
+        guarded: LogicalPlanNode,
+        condition: Optional[Expression],
+        replacement: Expression,
+    ) -> "_PreparedScalar":
+        """Wrap a scalar subquery at its alias boundary as a derived relation.
+
+        The scalar value plan (already cardinality-guarded) becomes a derived
+        relation under the prefix alias. The correlation condition and the outer
+        replacement expression already carry the prefix qualifier on the
+        subquery's own output columns (set at construction), so nothing
+        unqualified escapes into the outer plan.
+        """
+        # The scalar subquery as a join-ready derived relation: its guarded value
+        # plan wrapped at the prefix-aliased boundary, plus the already-qualified
+        # correlation condition and outer replacement expression.
+        return _PreparedScalar.create(
+            plan=self._wrap_boundary(guarded),
+            condition=condition,
+            replacement=replacement,
+        )
+
     def prepare_exists(self, subquery: LogicalPlanNode) -> _PreparedSubquery:
         """Prepare an EXISTS subquery: only correlation columns matter."""
         plan = self.decorrelator._rewrite_plan(subquery)
@@ -305,14 +353,16 @@ class _SubqueryPreparer:
             # Uncorrelated EXISTS only asks whether any row exists, so the join
             # right side is the subplan capped at one row with no correlation
             # condition; LIMIT 1 keeps the SEMI join input minimal.
-            return _PreparedSubquery.create(
+            capped = _PreparedSubquery.create(
                 plan=Limit.create(input=plan, limit=1, offset=0),
                 condition=None,
                 values=[],
+                alias=self.prefix,
             )
+            return self._finalize(capped)
         core = self._peel_exists_top(plan)
         stripped = self._strip(core)
-        return self._assemble(stripped, [], [])
+        return self._finalize(self._assemble(stripped, [], []))
 
     def _peel_exists_top(self, plan: LogicalPlanNode) -> LogicalPlanNode:
         """Strip layers that do not affect existence (SELECT list, ORDER, LIMIT).
@@ -340,7 +390,7 @@ class _SubqueryPreparer:
         value_names = []
         for index in range(len(value_exprs)):
             value_names.append(f"{self.prefix}_v{index}")
-        return self._assemble(stripped, value_exprs, value_names)
+        return self._finalize(self._assemble(stripped, value_exprs, value_names))
 
     def prepare_scalar(self, subquery: LogicalPlanNode) -> _PreparedScalar:
         """Prepare a scalar subquery: single value plus cardinality rules."""
@@ -389,11 +439,12 @@ class _SubqueryPreparer:
         value_exprs, value_names = self._hoisted_value_refs(hoisted)
         prepared = self._assemble(stripped, value_exprs, value_names)
         guarded = self._guard_scalar(prepared, needs_guard=original_grouped)
-        # The prepared scalar-aggregate side: the guarded per-key aggregate plan,
-        # its correlation condition, and the replacement expression (hoisted
-        # aggregate refs) that stands in for the subquery in the outer row.
-        return _PreparedScalar.create(
-            plan=guarded, condition=prepared.condition, replacement=replacement
+        # The prepared scalar-aggregate side: the guarded per-key aggregate plan
+        # wrapped at its alias boundary, its qualified correlation condition, and
+        # the replacement expression (hoisted aggregate refs) that stands in for
+        # the subquery in the outer row, qualified to the subquery alias.
+        return self._finalize_scalar(
+            guarded, prepared.condition, replacement
         )
 
     def _hoisted_value_refs(
@@ -422,7 +473,9 @@ class _SubqueryPreparer:
             hoisted.append((expr, name))
             # A reference to the renamed aggregate output that replaces the call
             # in place, so the outer expression reads the post-join column value.
-            ref = ColumnRef.create(table=None, column=name)
+            # Qualified to the subquery alias: this ref lands in the outer
+            # expression, above the alias boundary the subquery is wrapped in.
+            ref = ColumnRef.create(table=self.prefix, column=name)
             if expr.function_name.upper() == "COUNT":
                 # A zero literal for the COALESCE default: after the LEFT join an
                 # absent group has no COUNT row, and SQL COUNT must read as zero.
@@ -462,13 +515,14 @@ class _SubqueryPreparer:
         value_name = f"{self.prefix}_v0"
         prepared = self._assemble(stripped, value_exprs, [value_name])
         guarded = self._guard_scalar(prepared, needs_guard=self.pending_limit != 1)
-        # The prepared plain-row scalar side: the cardinality-guarded value plan,
-        # its correlation condition, and a reference to the single projected value
-        # column that replaces the subquery in the outer expression.
-        return _PreparedScalar.create(
-            plan=guarded,
-            condition=prepared.condition,
-            replacement=ColumnRef.create(table=None, column=value_name),
+        # The prepared plain-row scalar side: the cardinality-guarded value plan
+        # wrapped at its alias boundary, its qualified correlation condition, and
+        # a reference to the single projected value column - qualified to the
+        # subquery alias - that replaces the subquery in the outer expression.
+        return self._finalize_scalar(
+            guarded,
+            prepared.condition,
+            ColumnRef.create(table=self.prefix, column=value_name),
         )
 
     def _reject_outer_refs_in_value(self, expr: Expression) -> None:
@@ -729,7 +783,9 @@ class _SubqueryPreparer:
             names.append(key_name)
             # A reference to the correlation key now emitted as a grouped output
             # of the widened aggregate, so the pulled predicate can join on it.
-            renamed = ColumnRef.create(table=None, column=key_name)
+            # Qualified to the subquery alias: this ref lives in the correlation
+            # condition, which is evaluated at the join above the alias boundary.
+            renamed = ColumnRef.create(table=self.prefix, column=key_name)
             # The rewritten correlation equality (outer side = renamed inner key),
             # relocated above the aggregate to become part of the join condition
             # now that the key is exposed per group.
@@ -842,9 +898,11 @@ class _SubqueryPreparer:
         plan = self._apply_pending_limit(plan, aliases, non_keys, order)
         # The assembled join-ready subquery: its renamed plan, the pulled-out
         # correlation condition (None when uncorrelated), and the value column
-        # names the caller compares against.
+        # names the caller compares against. plan/condition are still raw here;
+        # the caller's _finalize wraps the plan at the alias boundary and
+        # qualifies the condition (the scalar path guards the raw plan first).
         return _PreparedSubquery.create(
-            plan=plan, condition=condition, values=value_names
+            plan=plan, condition=condition, values=value_names, alias=self.prefix
         )
 
     def _partition_window_values(self, value_exprs, exposures):
@@ -951,7 +1009,12 @@ class _SubqueryPreparer:
             if key in exposure_names:
                 continue
             if self._is_renamed_ref(ref):
-                exposures.append((ref, ref.column))
+                # A key already widened into the aggregate below. Expose it by its
+                # inner physical name (read from the aggregate output under the
+                # boundary), aliased under that name; the condition keeps the
+                # qualified ref, which resolves against this exposed column.
+                inner = ColumnRef.create(table=None, column=ref.column)
+                exposures.append((inner, ref.column))
                 exposure_names[key] = ref
                 continue
             if not self._is_inner_column(ref):
@@ -960,12 +1023,19 @@ class _SubqueryPreparer:
             exposures.append((ref, name))
             # The renamed reference that the pulled predicate's inner column maps
             # to; the correlation condition is rebuilt against this deterministic
-            # name so it can be evaluated on the join's right side.
-            exposure_names[key] = ColumnRef.create(table=None, column=name)
+            # name so it can be evaluated on the join's right side. Qualified to
+            # the subquery alias, since the condition sits above the boundary.
+            exposure_names[key] = ColumnRef.create(table=self.prefix, column=name)
 
     def _is_renamed_ref(self, ref: ColumnRef) -> bool:
-        """Check for a column already renamed by aggregate widening."""
-        return ref.table is None and ref.column.startswith(self.prefix)
+        """Whether a ref is one this subquery already exposed as its own output.
+
+        Identified by its qualifier: a ref carrying this subquery's alias is one
+        we minted for the correlation condition (aggregate widening), not an
+        inner column still to be exposed. Matched by qualifier, never by
+        string-matching the column name.
+        """
+        return ref.table == self.prefix
 
     def _validate_no_outer_left(self, plan: LogicalPlanNode) -> None:
         """Fail if correlated references remain anywhere in the subplan."""
@@ -1355,7 +1425,10 @@ class Decorrelator:
         for index in range(len(items)):
             # A reference to one subquery value column that the matching outer
             # item is compared against; IN pairs each item with its value column.
-            value_ref = ColumnRef.create(table=None, column=prepared.values[index])
+            # Qualified to the subquery alias so it resolves against the boundary.
+            value_ref = ColumnRef.create(
+                table=prepared.alias, column=prepared.values[index]
+            )
             comparisons.append(
                 self._match_term(items[index], value_ref, null_aware=expr.negated)
             )
@@ -1426,7 +1499,8 @@ class Decorrelator:
             )
         # A reference to the single subquery value column that the quantified
         # comparison ranges over (one column is required for op ANY/ALL).
-        value_ref = ColumnRef.create(table=None, column=prepared.values[0])
+        # Qualified to the subquery alias so it resolves against the boundary.
+        value_ref = ColumnRef.create(table=prepared.alias, column=prepared.values[0])
         # The per-row comparison "left op value" applied against each subquery row;
         # ANY keeps rows where one holds, ALL keeps rows where none is violated.
         comparison = BinaryOp.create(op=expr.operator, left=expr.left, right=value_ref)
@@ -1685,15 +1759,22 @@ class Decorrelator:
         place for the LATERAL to evaluate per left row.
         """
         body = self._rewrite_plan(expr.subquery)
-        value_name = f"{self._next_prefix()}_v0"
-        right = self._project_lateral_value(body, value_name)
+        prefix = self._next_prefix()
+        value_name = f"{prefix}_v0"
+        # The lateral body exposed as a prefix-aliased derived relation so the
+        # outer replacement ref qualifies to it, matching how every other
+        # subquery relation carries an alias its output columns resolve through.
+        right = SubqueryScan.create(
+            input=self._project_lateral_value(body, value_name), alias=prefix
+        )
         # The LATERAL join fallback for a correlation that cannot flatten to a
         # set-based join; the still-correlated body is evaluated per left row and
         # the executing engine decorrelates it.
         joined = LateralJoin.create(left=plan, right=right, join_type=JoinType.LEFT)
         # A reference to the single projected value of the lateral body, which
-        # replaces the scalar subquery in the outer expression.
-        return ColumnRef.create(table=None, column=value_name), joined
+        # replaces the scalar subquery in the outer expression. Qualified to the
+        # lateral relation's alias so it resolves against that derived relation.
+        return ColumnRef.create(table=prefix, column=value_name), joined
 
     def _project_lateral_value(
         self, node: LogicalPlanNode, value_name: str

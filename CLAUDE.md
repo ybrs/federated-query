@@ -26,6 +26,10 @@ Only ascii edits are allowed.
 
 Never fail silently. If something breaks it should throw an error. We don't want silent fails. You can only catch exceptions when we show it to the user in the cli. Otherwise all exceptions should be thrown. 
 
+ALL COLUMNS MUST BE QUALIFIED AFTER THE BINDER. Non-negotiable rule: once binding is done, every column reference (`ColumnRef`) flowing through the logical and physical plan MUST carry its relation qualifier (`table` set to the owning relation/alias). An unqualified column ref (`table` is None or empty) must NEVER pass through the plan after binding. This is not only the binder's job: any pass that MANUFACTURES columns (decorrelation's synthetic subquery outputs, optimizer-introduced projections, etc.) must qualify them to a real relation, exposing that relation under an alias if one does not already exist. Enforce it with a loud guard that walks the plan after binding/decorrelation and raises on any unqualified ref. Rationale: side-assignment, join-key orientation, and scope resolution all rely on the qualifier; an unqualified column silently defeats them and manufactures wrong or empty results.
+
+NO SHORTCUT COLUMN LISTS. Relational operators must carry explicit, real column names - never a star placeholder standing in for "all columns". In particular `Scan.columns` MUST be a concrete list of the table's actual column names; it must never be `["*"]` or contain `"*"`. The binder expands any star read-set into the real column list from catalog metadata. Guard it: a `*` in a bound scan's columns must raise. A star is a shortcut that hides the real schema from every pass that reasons about columns.
+
 NO DATACLASSES; state types are Pydantic models. Final, non-negotiable design decision: no Python dataclasses (`@dataclass`) anywhere. Dataclasses silently drop fields on reconstruction (a forgotten field takes its default = a wrong answer with no error). Every state-carrying type (plan nodes, expression nodes, catalog/config/state objects) derives from `federated_query.model.StateModel` (a `pydantic.BaseModel` with `arbitrary_types_allowed`; construction is keyword-only). `StateModel` is built to keep mistakes LOUD: `extra="forbid"` (an unknown/renamed construction kwarg raises, never silently dropped) and a `model_copy` override that rejects unknown `update` keys (plain Pydantic `model_copy` would set a junk attribute silently). The migration is COMPLETE; `tests/test_no_dataclasses.py` enforces it; `tests/test_state_model.py` pins the loudness. Rules:
 - Never write a `@dataclass` or import `dataclasses`. A `@dataclass` is a bug to migrate, not preserve. New state types subclass `StateModel`.
 - Fields are declared as Pydantic annotations; a field with no default is REQUIRED and Pydantic raises on omission. Construct with kwargs: `Scan(datasource=..., schema_name=..., ...)`.
@@ -132,6 +136,10 @@ Seeing any pointless fuck in the code will result in immediate fail in task and 
 ## Repository Overview
 
 This is a production-grade federated query engine that executes SQL queries across multiple heterogeneous data sources (PostgreSQL, DuckDB) with intelligent optimization.
+
+## Archtiecture doc
+read this file first: README-architecture.md
+
 
 ## Project Structure
 

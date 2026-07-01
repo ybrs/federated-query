@@ -150,6 +150,13 @@ class SingleSourcePushdown:
         Fires for any subtree that contains a join (G1) or a computed,
         single-table scans keep using the existing scan-pushdown path.
         """
+        if isinstance(node, SubqueryScan):
+            # A top-level SubqueryScan is a derived relation's alias boundary.
+            # Absorbing it here as a bare derived-table FROM would drop the alias
+            # from column_aliases (nothing above supplies the SELECT list), so its
+            # output could not be resolved as alias.col. Decline: the planner
+            # pushes its INPUT and re-applies the alias via PhysicalAliasedRelation.
+            return None
         context = _PushContext()
         if not self._absorb(node, context):
             return None
