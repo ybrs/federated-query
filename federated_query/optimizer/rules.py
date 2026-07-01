@@ -23,6 +23,8 @@ from ..plan.expressions import (
     InList,
     BetweenExpression,
     and_expressions,
+    split_conjuncts,
+    combine_and,
 )
 from ..catalog.catalog import Catalog
 
@@ -94,56 +96,41 @@ class PredicatePushdownRule(OptimizationRule):
         return plan
 
     def _push_filter(self, filter_node: Filter) -> LogicalPlanNode:
-        """Push a filter node down."""
+        """Route a filter to the handler for its input node type.
+
+        A conjunctive predicate is NOT split here. Each handler that can absorb
+        part of a conjunction (join, projection) distributes the conjuncts
+        itself in a single pass. Splitting a conjunction here and re-merging
+        stacked filters in _merge_filters form an inverse pair that oscillates
+        forever on a predicate whose conjuncts cannot all descend, so there is
+        no split step.
+        """
         input_plan = filter_node.input
-        predicate = filter_node.predicate
-
-        from ..plan.expressions import BinaryOp, BinaryOpType
-
-        is_conjunction = (
-            isinstance(predicate, BinaryOp) and predicate.op == BinaryOpType.AND
-        )
-        if is_conjunction and self._can_absorb_split(input_plan):
-            # Split a conjunctive predicate: wrap the child in a Filter carrying
-            # only the left conjunct so each half can be pushed independently.
-            left_result = self._push_filter(
-                Filter.create(input=input_plan, predicate=predicate.left)
-            )
-            # Stack the right conjunct as its own Filter over the already-pushed
-            # left result, so the remaining half descends on top of it.
-            return self._push_filter(
-                Filter.create(input=left_result, predicate=predicate.right)
-            )
-
         if isinstance(input_plan, Filter):
             return self._merge_filters(filter_node, input_plan)
-
         if isinstance(input_plan, Projection):
             return self._push_filter_through_projection(filter_node, input_plan)
-
         if isinstance(input_plan, Join):
             return self._push_filter_below_join(filter_node, input_plan)
-
         if isinstance(input_plan, Scan):
             return self._push_filter_to_scan(filter_node, input_plan)
+        return self._rehome_filter_over_opaque(filter_node, input_plan)
 
+    def _rehome_filter_over_opaque(
+        self, filter_node: Filter, input_plan: LogicalPlanNode
+    ) -> LogicalPlanNode:
+        """Keep a filter above a node that cannot absorb it, optimizing the child.
+
+        Aggregate/Limit/Sort/SetOperation cannot take a predicate below them
+        (HAVING, row limits, ordering, branch semantics), so the filter stays
+        put; the child subtree is still pushed so lower filters descend.
+        """
         new_input = self._push_down(input_plan)
         if new_input != input_plan:
             # The predicate could not descend further, but the child subtree was
             # rewritten; re-home the same filter over its optimized input.
             return filter_node.model_copy(update={"input": new_input})
-
         return filter_node
-
-    def _can_absorb_split(self, input_plan: LogicalPlanNode) -> bool:
-        """Whether splitting a conjunction helps for this input.
-
-        Splitting distributes conjuncts into a join's sides or pushes them
-        into a scan/projection. Over any other input (e.g. an Aggregate
-        carrying HAVING) the parts cannot descend, and splitting then merging
-        them back would recurse forever.
-        """
-        return isinstance(input_plan, (Join, Scan, Projection))
 
     def _merge_filters(self, outer: Filter, inner: Filter) -> LogicalPlanNode:
         """Merge two adjacent filters."""
@@ -188,31 +175,41 @@ class PredicatePushdownRule(OptimizationRule):
     def _push_filter_through_projection(
         self, filter_node: Filter, projection: Projection
     ) -> LogicalPlanNode:
-        """Push filter through projection if possible.
+        """Push the conjuncts a projection's input can evaluate below it.
 
-        Push filter BELOW projection if the predicate can be evaluated
-        using columns available in the projection's input.
+        Each conjunct that references only columns available in the projection's
+        input descends below the projection; conjuncts needing a
+        projection-computed output stay above. Partitioning per conjunct (rather
+        than all-or-nothing) lets a filter partly cross a projection without any
+        caller-level split.
         """
-        predicate_cols = pushdown.qualified_or_bare_names(filter_node.predicate)
         input_cols = pushdown.available_columns(projection.input)
+        conjuncts = split_conjuncts(filter_node.predicate)
+        below, above = self._partition_by_evaluability(conjuncts, input_cols)
+        return self._assemble_projection(projection, below, above)
 
-        # Can we evaluate predicate using columns from input?
-        can_push = self._can_evaluate_predicate(predicate_cols, input_cols)
+    def _partition_by_evaluability(self, conjuncts, input_cols):
+        """Split conjuncts into those evaluable by input_cols and those not."""
+        below = []
+        above = []
+        for conjunct in conjuncts:
+            cols = pushdown.qualified_or_bare_names(conjunct)
+            if self._can_evaluate_predicate(cols, input_cols):
+                below.append(conjunct)
+            else:
+                above.append(conjunct)
+        return below, above
 
-        if can_push:
-            # Push the filter BELOW the projection so it runs before column output.
-            # Re-home the original filter over the projection's input, keeping its
-            # predicate, since those input columns can evaluate the predicate.
-            new_filter = filter_node.model_copy(update={"input": projection.input})
-            new_filter = self._push_down(new_filter)
-            return projection.model_copy(update={"input": new_filter})
-
-        # Filter references columns not available in input, keep above
-        new_input = self._push_down(projection.input)
+    def _assemble_projection(self, projection, below, above):
+        """Rebuild a projection with pushable conjuncts under it, the rest on top."""
+        new_input = self._push_side(projection.input, below)
         new_project = projection.model_copy(update={"input": new_input})
-        # The predicate needs columns the projection does not expose, so keep the
-        # filter above: re-home the original filter over the rebuilt projection.
-        return filter_node.model_copy(update={"input": new_project})
+        if not above:
+            return new_project
+        # These conjuncts reference columns the projection produces (aliases or
+        # computed expressions), so they must run after it; keep them as one
+        # residual filter above the rebuilt projection.
+        return Filter.create(input=new_project, predicate=combine_and(above))
 
     def _push_filter_to_scan(self, filter_node: Filter, scan: Scan) -> LogicalPlanNode:
         """Push filter into scan node."""
@@ -231,86 +228,99 @@ class PredicatePushdownRule(OptimizationRule):
     def _push_filter_below_join(
         self, filter_node: Filter, join: Join
     ) -> LogicalPlanNode:
-        """Push filter below join when safe.
+        """Route each conjunct of a filter to the join site that can evaluate it.
 
-        Only safe for INNER joins. For outer joins, pushing filters
-        below the join changes semantics:
-        - LEFT OUTER: Can't push right-side filters (changes NULL rows)
-        - RIGHT OUTER: Can't push left-side filters (changes NULL rows)
-        - FULL OUTER: Can't push any filters
+        The predicate is flattened into conjuncts and each is routed
+        independently in a SINGLE pass: a conjunct touching only one INNER-join
+        side descends into that side; a cross-side equality becomes a join key
+        folded into the ON condition; anything else stays as one residual filter
+        above the join. Outer joins keep the whole filter above (pushing would
+        change NULL-extended rows).
         """
-        from ..plan.expressions import BinaryOp, BinaryOpType, ColumnRef
         from ..plan.logical import JoinType
 
-        predicate = filter_node.predicate
-        left_cols = pushdown.available_columns(join.left)
-        right_cols = pushdown.available_columns(join.right)
-
-        pred_cols = pushdown.qualified_or_bare_names(predicate)
-
-        pred_left_only = pushdown.columns_belong_to_side(
-            pred_cols, left_cols, right_cols
-        )
-        pred_right_only = pushdown.columns_belong_to_side(
-            pred_cols, right_cols, left_cols
-        )
-
-        # Only push for INNER joins. model_copy preserves every other field
-        # (notably NATURAL / USING), which a raw Join(...) rebuild would drop.
         if join.join_type != JoinType.INNER:
-            # For outer joins, keep filter above join
-            new_join = join.model_copy(
-                update={
-                    "left": self._push_down(join.left),
-                    "right": self._push_down(join.right),
-                }
-            )
-            # Outer-join semantics forbid pushing the predicate below the join, so
-            # keep the original filter on top of the recursed join.
-            return filter_node.model_copy(update={"input": new_join})
+            return self._rehome_filter_over_join(filter_node, join)
+        conjuncts = split_conjuncts(filter_node.predicate)
+        groups = self._group_join_conjuncts(conjuncts, join)
+        return self._assemble_pushed_join(join, groups)
 
-        # INNER JOIN: safe to push
-        if pred_left_only:
-            # The predicate touches only left-side columns; re-home the original
-            # filter onto the join's left input so it runs before the join.
-            new_left = filter_node.model_copy(update={"input": join.left})
-            new_left = self._push_down(new_left)
-            return join.model_copy(
-                update={"left": new_left, "right": self._push_down(join.right)}
-            )
+    def _rehome_filter_over_join(
+        self, filter_node: Filter, join: Join
+    ) -> LogicalPlanNode:
+        """Keep the filter above an outer join while still pushing into both sides.
 
-        if pred_right_only:
-            # The predicate touches only right-side columns; re-home the original
-            # filter onto the join's right input so it runs before the join.
-            new_right = filter_node.model_copy(update={"input": join.right})
-            new_right = self._push_down(new_right)
-            return join.model_copy(
-                update={"left": self._push_down(join.left), "right": new_right}
-            )
-
-        # Predicate spans both sides of an INNER join. A cross-side equality is
-        # a join key: fold it into the ON condition so a comma/cross join
-        # becomes an equi-join (hash join) instead of a Cartesian product with a
-        # filter on top. Non-equi cross-side predicates stay as a filter.
-        if self._is_equi_predicate(predicate):
-            merged_condition = self._merge_join_condition(join.condition, predicate)
-            return join.model_copy(
-                update={
-                    "left": self._push_down(join.left),
-                    "right": self._push_down(join.right),
-                    "condition": merged_condition,
-                }
-            )
-
+        model_copy preserves every other field (notably NATURAL / USING), which
+        a raw Join(...) rebuild would drop.
+        """
         new_join = join.model_copy(
             update={
                 "left": self._push_down(join.left),
                 "right": self._push_down(join.right),
             }
         )
-        # A non-equi predicate spanning both sides cannot become a join key, so
-        # keep the original filter above the recursed join.
+        # Outer-join semantics forbid pushing the predicate below the join, so
+        # the original filter stays on top of the join whose children were pushed.
         return filter_node.model_copy(update={"input": new_join})
+
+    def _group_join_conjuncts(self, conjuncts, join):
+        """Bucket conjuncts by destination: left side, right side, equi-key, residual."""
+        left_cols = pushdown.available_columns(join.left)
+        right_cols = pushdown.available_columns(join.right)
+        groups = {"left": [], "right": [], "equi": [], "residual": []}
+        for conjunct in conjuncts:
+            bucket = self._classify_join_conjunct(conjunct, left_cols, right_cols)
+            groups[bucket].append(conjunct)
+        return groups
+
+    def _classify_join_conjunct(self, conjunct, left_cols, right_cols):
+        """Name the join bucket a single conjunct belongs to."""
+        cols = pushdown.qualified_or_bare_names(conjunct)
+        if pushdown.columns_belong_to_side(cols, left_cols, right_cols):
+            return "left"
+        if pushdown.columns_belong_to_side(cols, right_cols, left_cols):
+            return "right"
+        if self._is_equi_predicate(conjunct):
+            return "equi"
+        return "residual"
+
+    def _assemble_pushed_join(self, join, groups):
+        """Rebuild the join with side conjuncts pushed and equi keys folded in."""
+        condition = self._fold_equi_conjuncts(join.condition, groups["equi"])
+        new_join = join.model_copy(
+            update={
+                "left": self._push_side(join.left, groups["left"]),
+                "right": self._push_side(join.right, groups["right"]),
+                "condition": condition,
+            }
+        )
+        return self._wrap_residual(new_join, groups["residual"])
+
+    def _push_side(self, side, conjuncts):
+        """Push a group of one-sided conjuncts into a join input, then optimize it."""
+        if not conjuncts:
+            return self._push_down(side)
+        # Wrap the input in a Filter carrying the AND of the conjuncts that only
+        # reference this side, so predicate pushdown drives them to the leaves.
+        side_filter = Filter.create(input=side, predicate=combine_and(conjuncts))
+        return self._push_down(side_filter)
+
+    def _fold_equi_conjuncts(self, condition, equi_conjuncts):
+        """AND cross-side equality keys into the join's existing ON condition."""
+        combined = condition
+        for conjunct in equi_conjuncts:
+            combined = and_expressions(combined, conjunct)
+        return combined
+
+    def _wrap_residual(self, new_join, residual_conjuncts):
+        """Put leftover cross-side non-equi conjuncts back as one filter on top."""
+        if not residual_conjuncts:
+            return new_join
+        # These conjuncts span both sides and are not join keys, so they can only
+        # be evaluated after the join; keep them as one residual filter above it.
+        return Filter.create(
+            input=new_join, predicate=combine_and(residual_conjuncts)
+        )
 
     def _is_equi_predicate(self, predicate: Expression) -> bool:
         """Whether a predicate is a column-to-column equality (a join key)."""
@@ -322,18 +332,6 @@ class PredicatePushdownRule(OptimizationRule):
             and isinstance(predicate.left, ColumnRef)
             and isinstance(predicate.right, ColumnRef)
         )
-
-    def _merge_join_condition(
-        self, existing: Optional[Expression], predicate: Expression
-    ) -> Expression:
-        """AND a freshly inferred equi-condition into a join's ON clause."""
-        from ..plan.expressions import BinaryOp, BinaryOpType
-
-        if existing is None:
-            return predicate
-        # A join already has an ON condition; AND the inferred equi-predicate onto
-        # it so the folded join key extends the existing condition.
-        return BinaryOp.create(op=BinaryOpType.AND, left=existing, right=predicate)
 
     def name(self) -> str:
         """Return this rule's identifier (used in logging and EXPLAIN)."""

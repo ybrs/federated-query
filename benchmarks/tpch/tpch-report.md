@@ -6,19 +6,19 @@ Correctness is differential against DuckDB: each query runs through the engine a
 
 ## Summary
 
-Total 22 | PASS 4 | MISMATCH 0 | ERROR 18
+Total 22 | PASS 8 | MISMATCH 0 | ERROR 14
 
 ## Failure clusters
 
-### Recursion (11)
-Queries: q02, q03, q04, q05, q10, q12, q14, q16, q17, q18, q21
+### Join-key orientation (7)
+Queries: q02, q03, q05, q10, q11, q17, q18
 
-- RecursionError: maximum recursion depth exceeded
+- ValueError: cannot orient join keys 's_suppkey' / 'ps_suppkey' to a join side; neither resolves by qualifier or by column name
 
 ### Out of memory (3)
 Queries: q07, q08, q09
 
-- OSError: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 67108864 bytes
+- OSError: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 33554432 bytes
 
 ### Binding: reference not in scope (2)
 Queries: q13, q15
@@ -30,34 +30,34 @@ Queries: q20
 
 - DecorrelationError: Correlation key "lineitem"."l_suppkey" is not part of the subquery's GROUP BY
 
-### Join-key orientation (1)
-Queries: q11
+### Other (1)
+Queries: q21
 
-- ValueError: cannot orient join keys 'ps_suppkey' / 's_suppkey' to a join side; neither resolves by qualifier or by column name
+- OSError: INTERRUPT Error: Interrupted!
 
 ## Per-query matrix
 
 | Query | Status | Rows engine/oracle | Detail |
 | --- | --- | --- | --- |
 | q01 | PASS | 4 / 4 | rows and values match |
-| q02 | ERROR | - | RecursionError: maximum recursion depth exceeded |
-| q03 | ERROR | - | RecursionError: maximum recursion depth exceeded |
-| q04 | ERROR | - | RecursionError: maximum recursion depth exceeded |
-| q05 | ERROR | - | RecursionError: maximum recursion depth exceeded |
+| q02 | ERROR | - | ValueError: cannot orient join keys 's_suppkey' / 'ps_suppkey' to a join side; neither resolves by qualifier or by column name |
+| q03 | ERROR | - | ValueError: cannot orient join keys 'c_custkey' / 'o_custkey' to a join side; neither resolves by qualifier or by column name |
+| q04 | PASS | 5 / 5 | rows and values match |
+| q05 | ERROR | - | ValueError: cannot orient join keys 'c_custkey' / 'o_custkey' to a join side; neither resolves by qualifier or by column name |
 | q06 | PASS | 1 / 1 | rows and values match |
-| q07 | ERROR | - | OSError: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 67108864 bytes |
-| q08 | ERROR | - | OSError: Out of Memory Error: ArrowBuffer: failed to allocate 67108864 bytes |
-| q09 | ERROR | - | OSError: Out of Memory Error: ArrowBuffer: failed to allocate 134217728 bytes |
-| q10 | ERROR | - | RecursionError: maximum recursion depth exceeded |
+| q07 | ERROR | - | OSError: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 33554432 bytes |
+| q08 | ERROR | - | InvalidInputException: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 16777216 bytes |
+| q09 | ERROR | - | InvalidInputException: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 16777216 bytes |
+| q10 | ERROR | - | ValueError: cannot orient join keys 'c_custkey' / 'o_custkey' to a join side; neither resolves by qualifier or by column name |
 | q11 | ERROR | - | ValueError: cannot orient join keys 'ps_suppkey' / 's_suppkey' to a join side; neither resolves by qualifier or by column name |
-| q12 | ERROR | - | RecursionError: maximum recursion depth exceeded |
+| q12 | PASS | 2 / 2 | rows and values match |
 | q13 | ERROR | - | BindingError: Column 'c_count' not found in any table in scope |
-| q14 | ERROR | - | RecursionError: maximum recursion depth exceeded |
+| q14 | PASS | 1 / 1 | rows and values match |
 | q15 | ERROR | - | BindingError: Column 'supplier_no' not found in any table in scope |
-| q16 | ERROR | - | RecursionError: maximum recursion depth exceeded |
-| q17 | ERROR | - | RecursionError: maximum recursion depth exceeded |
-| q18 | ERROR | - | RecursionError: maximum recursion depth exceeded |
+| q16 | PASS | 296 / 296 | rows and values match |
+| q17 | ERROR | - | ValueError: cannot orient join keys 'p_partkey' / '__subq_0_g0' to a join side; neither resolves by qualifier or by column name |
+| q18 | ERROR | - | ValueError: cannot orient join keys 'o_orderkey' / '__subq_0_v0' to a join side; neither resolves by qualifier or by column name |
 | q19 | PASS | 1 / 1 | rows and values match |
 | q20 | ERROR | - | DecorrelationError: Correlation key "lineitem"."l_suppkey" is not part of the subquery's GROUP BY |
-| q21 | ERROR | - | RecursionError: maximum recursion depth exceeded |
+| q21 | ERROR | - | OSError: INTERRUPT Error: Interrupted! |
 | q22 | PASS | 7 / 7 | rows and values match |
