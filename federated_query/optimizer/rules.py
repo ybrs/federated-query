@@ -265,10 +265,15 @@ class PredicatePushdownRule(OptimizationRule):
         return self._assemble_outer_join(filter_node, join, down, keep, preserved)
 
     def _preserved_side(self, join_type) -> Optional[str]:
-        """The join side whose rows always survive ('left'/'right'), None for FULL."""
+        """The join side whose rows always survive ('left'/'right'), None for FULL.
+
+        A SEMI/ANTI join keeps (or drops) whole left rows by match existence and
+        exposes only left columns, so - like a LEFT join - a left-only conjunct
+        can descend into its left input.
+        """
         from ..plan.logical import JoinType
 
-        if join_type == JoinType.LEFT:
+        if join_type in (JoinType.LEFT, JoinType.SEMI, JoinType.ANTI):
             return "left"
         if join_type == JoinType.RIGHT:
             return "right"
