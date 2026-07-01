@@ -28,13 +28,10 @@ needs confirming. Severity: HIGH / MED / LOW.
   joins, so `SELECT 1 LIMIT 0` returns a row, `SELECT DISTINCT 1` ignores DISTINCT.
   Fix: add limit/offset/distinct to the rejected-clause list (fail-fast) or handle.
 
-- [ ] B3 (HIGH, verified) `OrderByPushdownRule._merge_filters` is an AttributeError.
-  `rules.py:1363` calls `self._merge_filters(...)`, but `OrderByPushdownRule`
-  (920-1402) has no such method (`hasattr` = False; it lives on PredicatePushdown
-  @160 and AggregatePushdown @1454). Path: HAVING filter over an aggregate-bearing
-  scan after order-by pushdown. Fix: merge the two predicate expressions directly
-  with `BinaryOp(op=AND, ...)` (None-safe), not the Filter-typed method. Add a
-  regression test (ORDER BY + HAVING over a pushed aggregate scan).
+- [x] B3 (DONE 2026-06-27) `OrderByPushdownRule._merge_filters` AttributeError.
+  Added a None-safe expression `_merge_filters` to `OrderByPushdownRule` so the
+  HAVING-over-aggregate-scan-after-order-by-pushdown path no longer crashes with
+  AttributeError. NOTE: fixing the crash surfaced a deeper, separate bug - see B7.
 
 - [ ] B4 (MED, verified) Three aggregate-pushdown tests are inverted / false-green.
   `tests/test_functional_pushdown.py:365+` `test_count_aggregate`,
@@ -60,6 +57,39 @@ needs confirming. Severity: HIGH / MED / LOW.
   because ',' equals DuckDB's default) - now IMPLEMENTED as a real second arg.
   Already-loud (not silent) and left as-is: array_agg(ORDER BY) and LIKE ESCAPE.
   Implement-candidates now loud: simple CASE, TRY_CAST, BETWEEN SYMMETRIC.
+
+- [x] B7 (FIXED 2026-06-27) Single-source GROUP BY HAVING crashed at execution
+  (rendered HAVING as a WHERE on the aggregate alias). Root cause was two
+  divergent WHERE/HAVING splitters; consolidated to ONE shared
+  `split_where_having` (output-name-aware, substitutes the alias back to the
+  aggregate) in plan/expressions.py, used by both PhysicalScan and
+  single_source_pushdown. Verified: pushes `... GROUP BY region HAVING
+  (SUM(quantity) > 10)` and executes. xfail flipped to a real passing test;
+  two EXPLAIN-only false-greens corrected to assert HAVING. Original report:
+  Single-source GROUP BY HAVING crashed at execution in the full pipeline.
+  `single_source_pushdown` pushes a HAVING as a remote WHERE on the aggregate
+  alias (e.g. `... GROUP BY region WHERE (total > 10) GROUP BY region`), which the
+  source rejects ("WHERE clause cannot contain aggregates"). Verified end-to-end:
+  `SELECT region, SUM(quantity) AS total FROM <duckdb> GROUP BY region HAVING
+  SUM(quantity) > 10` raises BinderException via FedQRuntime.
+  Why it was never caught: the executing HAVING tests (test_e2e_aggregations
+  `test_having_with_sum`) call PhysicalPlanner DIRECTLY, bypassing the
+  RuleBasedOptimizer that does the fold; the optimized test
+  (`test_having_clause_translated_to_remote_filter`) only EXPLAINs and ASSERTS
+  the wrong WHERE rendering (false-green). No test executed a single-source
+  HAVING through the full runtime.
+  Root-cause area: a HAVING folds into a single PhysicalScan's `filters`, and the
+  conjunct is rendered into WHERE rather than HAVING - `_split_scan_filter` /
+  `_references_aggregate` did not route the alias `total` to HAVING (and
+  `_absorb_filter` only recognizes HAVING when the input is an `Aggregate` node,
+  not a folded aggregate-scan). Needs careful tracing across RuleBasedOptimizer,
+  physical planner folding, and single_source_pushdown rendering.
+  Fix options: render it as a remote HAVING (substitute the alias back to the
+  aggregate expression, like `_split_scan_filter` already does for the folded
+  case) OR apply it as a local filter above the pushed aggregate.
+  TRACKED by xfail `tests/e2e_pushdown/test_single_table_aggregations.py::
+  test_having_executes_and_matches_source` (executes + compares to the source;
+  XPASSes when fixed). Also fix the false-green EXPLAIN-only test then.
 
 ---
 
@@ -129,11 +159,10 @@ Left as NOT lie-shipping (validated late but caught LOUDLY downstream, documente
   Keep genuine non-ASCII test FIXTURE content (e.g.
   `tests/e2e_pushdown/test_string_edge_cases.py:40`) - that is the allowed exception.
 
-- [ ] R3 (HIGH, verified) `no_dataclasses` lint does not cover `tests/`, and a
-  live `@dataclass` slipped through. `tests/test_no_dataclasses.py` globs only the
-  package root; `tests/e2e_pushdown/conftest.py:5,34` has `from dataclasses import
-  dataclass` + `@dataclass class QueryEnvironment`. Fix: convert `QueryEnvironment`
-  to `StateModel`; extend the lint to also walk `tests/`.
+- [x] R3 (DONE 2026-06-27) `no_dataclasses` lint did not cover `tests/`, and a
+  live `@dataclass` slipped through. Fixed: `QueryEnvironment` converted to
+  `StateModel`; `test_no_dataclasses.py` now walks `tests/` too (scans package +
+  tests, keys failures off the repo root).
 
 - [ ] R4 (MED, verified) `PhysicalRemoteJoin` docstring lies about reachability.
   `physical.py:1785-1800` claims "the planner no longer constructs this node
@@ -199,9 +228,9 @@ Left as NOT lie-shipping (validated late but caught LOUDLY downstream, documente
   `expressions.py:597,618,643,697` - the four `subquery: Any` comments say "...never
   validated as a dataclass field either"; drop the dataclass clause.
 
-- [ ] M10 (LOW, reported) `_extract_tables` keys a Scan by table name, ignoring
-  alias. `binder.py:1017-1022` vs the alias-aware `_add_scan_to_scope` (binder.py
-  :890). Reconcile to the alias-aware key.
+- [x] M10 (DONE 2026-06-27) `_extract_tables` keyed a Scan by table name, ignoring
+  alias. Fixed as part of the binder D3 silent-fail fix: now keys by
+  `alias or table_name`, consistent with `_add_scan_to_scope`.
 
 - [ ] M11 (LOW, reported) `datetime.utcnow()` deprecation. `utils/logging.py:23`
   (only relevant if the structured formatter survives D5). Use

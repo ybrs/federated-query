@@ -1,5 +1,19 @@
 # Silent-drop audit (full pipeline) - 2026-06-26
 
+STATUS: COMPLETE (2026-06-27). All silent-drop (lie-shipping) items below are
+fixed; D1 is the one remaining item, deliberately deferred as NOT lie-shipping
+(it crashes loudly, never returns a wrong answer) and tracked by tests. Each fix
+is locked by a regression test; the recurrence classes are held shut by two
+lints:
+- `tests/test_no_raw_node_rebuild.py` - Class A (no raw same-type rebuild; use model_copy)
+- `tests/test_expression_walker_exhaustiveness.py` - incomplete expression walkers
+Valid-SQL features resolved by fail-fast are tracked as an executable backlog of
+strict xfails (see the "Deferred-feature backlog" section). Suite: 961 passed,
+3 skipped, 22 xfailed. This file is kept as the historical record; the tests are
+now the source of truth.
+
+---
+
 Question asked: with the Pydantic/no-dataclass migration done, how do silent drops
 STILL happen? Answer: the migration killed exactly ONE silent-drop mechanism
 (reconstructing a node by re-listing fields, where the rebuild now goes through
@@ -103,32 +117,52 @@ systematically under-propagated and is the single most dangerous column here
 
 ---
 
+## Deferred-feature backlog (intentionally fail-fast for now)
+
+Many fixes above resolve a silent fail by failing FAST on a valid-SQL feature we
+do not support yet (cross-source NATURAL/USING, TRY_CAST, simple CASE, UNION BY
+NAME, BETWEEN SYMMETRIC, IN UNNEST, TRIM LEADING/TRAILING, FETCH FIRST WITH
+TIES/PERCENT, DISTINCT-over-window, DISTINCT-over-GROUP-BY, combined ROLLUP/CUBE,
+WITHIN GROUP multi-key, GROUP BY WITH TOTALS, UNPIVOT, multiple/multi-aggregate
+PIVOT, PIVOT+GROUP BY, PIVOT+EXCLUDE, chained named windows). Each has BOTH:
+- a passing raises-test (the current contract: loud, never a silent wrong answer), and
+- an `xfail(strict=True)` documenting the desired behavior, in
+  `tests/test_deferred_features.py` (parser + preprocessor levels) and
+  `tests/e2e_pushdown/test_advanced_join_types.py` (cross-source NATURAL/USING).
+
+The xfails are the executable backlog: when a feature is implemented its xfail
+turns into a loud XPASS, signalling to finish wiring it and remove the guard +
+raises-test. "When" each ships is a scheduling decision, tracked here and in the
+suite, not inside this silent-fail cleanup.
+
+---
+
 ## CLASS A - raw-constructor rebuild drops a field (fix: model_copy)
 
-- [ ] A1 [verified] HIGH/CRITICAL - `PredicatePushdownRule._push_filter_below_join`
+- [x] A1 [verified] HIGH/CRITICAL - `PredicatePushdownRule._push_filter_below_join`
   rebuilds `Join` at `rules.py:307,319,330,344,351` listing only
   `left,right,join_type,condition` - drops `natural` and `using`. A NATURAL/USING
   join with a WHERE above it becomes `natural=False, condition=None` = a Cartesian
   product (verified: `natural=True` in, `natural=False, condition=None` out).
   Fix: `join.model_copy(update={"left": ..., "right": ...})` in all five sites.
 
-- [ ] A2 [verified] HIGH - `SubqueryPlanBinder._bind_join` at `binder.py:1574`
+- [x] A2 [verified] HIGH - `SubqueryPlanBinder._bind_join` at `binder.py:1574`
   rebuilds `Join` listing `left,right,join_type,condition` - drops `natural`,
   `using`. Any NATURAL/USING join inside a correlated EXISTS/IN/scalar/LATERAL
   subquery loses its equi-match; downstream `_join_is_pushable` then sees no
   predicate and the join degenerates to a cross product. Fix: `model_copy`.
 
-- [ ] A3 HIGH - `decorrelation.py:1603` `_widen_projection_for_keys` rebuilds the
+- [x] A3 HIGH - `decorrelation.py:1603` `_widen_projection_for_keys` rebuilds the
   user's `Projection` as `Projection(input, expressions, aliases)` - drops
   `distinct` and `distinct_on`. `SELECT DISTINCT ... ORDER BY (<correlated
   subquery>)` loses DISTINCT (duplicate rows). Fix: `projection.model_copy(...)`.
 
-- [ ] A4 MED - `decorrelation.py:613,808,887` rebuild `Aggregate` listing
+- [x] A4 MED - `decorrelation.py:613,808,887` rebuild `Aggregate` listing
   `input,group_by,aggregates,output_names` - drop `grouping_sets`. A correlated
   subquery with GROUP BY ROLLUP/CUBE/GROUPING SETS that is HAVING-hoisted or
   key-widened collapses to a single-level GROUP BY. Fix: `model_copy`.
 
-- [ ] A5 MED - `physical_planner.py:911` `_scan_with_columns` rebuilds
+- [x] A5 MED - `physical_planner.py:911` `_scan_with_columns` rebuilds
   `PhysicalScan` to fold a bare projection into the scan, omitting `sample`
   (verified by the agent: `TABLESAMPLE` becomes None). A sampled scan whose
   projection collapses scans the FULL table. Fix: `scan.model_copy(update=
@@ -140,36 +174,38 @@ systematically under-propagated and is the single most dangerous column here
 
 ### B.statement / clause (parser.py)
 
-- [ ] B1 [verified] HIGH - DISTINCT / DISTINCT ON over an aggregate dropped.
+- [x] B1 [verified] HIGH - DISTINCT / DISTINCT ON over an aggregate dropped.
   `_build_select_clause` (`parser.py:1082-1086`) returns the Aggregate (or
   Filter-over-Aggregate) BEFORE the `distinct`/`distinct_on` read at 1098-1106.
   `SELECT DISTINCT count(*) FROM t GROUP BY a` loses DISTINCT.
   Fix: honor distinct over the aggregate result, or fail-fast.
 
-- [ ] B2 [verified] HIGH - FROM-less SELECT drops LIMIT / OFFSET / DISTINCT.
+- [x] B2 [verified] HIGH - FROM-less SELECT drops LIMIT / OFFSET / DISTINCT.
   `_build_values_select` (`parser.py:310-327`) rejects only
   where/group/having/order/joins, never reads limit/offset/distinct.
   `SELECT 1 LIMIT 0` returns 1 row; `SELECT 1 OFFSET 5` returns 1 row. Fix:
   consume limit/offset (and reject distinct on) or fail-fast.
 
-- [ ] B3 [verified] HIGH - WITH dropped on a top-level set operation.
+- [x] B3 [verified] HIGH - WITH dropped on a top-level set operation.
   `_convert_set_operation` (`parser.py:144-160`) never reads the `with_` arg
   sqlglot attaches to a leading-WITH union. `WITH c AS (...) SELECT ... FROM c
   UNION SELECT ... FROM c` silently treats `c` as a catalog table (verified:
   produces `Scan table=c`, not `CTERef`); masked crash if no such table, wrong
   table if one exists. Fix: establish CTE scope on the set-op path, or fail-fast.
 
-- [ ] B4 HIGH - `UNION [ALL] BY NAME` degraded to positional UNION.
+- [x] B4 HIGH - `UNION [ALL] BY NAME` degraded to positional UNION.
   `_convert_set_operation` never reads `by_name`. Branches with different column
   orders get unioned by position. Fix: fail-fast on `by_name` (or implement
   name alignment).
 
-- [ ] B-systemic - the set-op path has NO consume-or-reject guard at all (unlike
-  the plain-Select path's `_reject_unknown_select_args`). B3/B4 are instances.
+- [x] B-systemic - DONE: the set-op path now has a consume-or-reject guard
+  (`_convert_set_operation` calls `_reject_unsupported_args(set_op,
+  SUPPORTED_SET_OP_ARGS, ...)`), the same discipline as the plain-Select path.
+  B3/B4 (with_/by_name) fail fast through it.
 
 ### B.expression (parser.py)
 
-- [ ] B5 [verified] CRITICAL - multi-argument aggregates drop every arg after the
+- [x] B5 [verified] CRITICAL - multi-argument aggregates drop every arg after the
   first. `_extract_function_args` (`parser.py:1704-1729`) reads only `func.this`,
   never iterates `arg_types`. `covar_pop(a,b)` becomes `COVAR_POP(a)`;
   `regr_slope(y,x)` becomes `REGR_SLOPE(y)`; `approx_quantile(x,0.5)` becomes
@@ -177,29 +213,29 @@ systematically under-propagated and is the single most dangerous column here
   Fix: gather args by iterating `arg_types` like the scalar `_collect_function_args`
   already does, or fail-fast on extra populated slots.
 
-- [ ] B6 [verified] CRITICAL - `string_agg`/`group_concat` separator dropped
+- [x] B6 [verified] CRITICAL - `string_agg`/`group_concat` separator dropped
   (special case of B5). `string_agg(x, ';')` becomes `STRING_AGG(x)` (verified) -
   invalid in Postgres (mandatory delimiter). Fix: same as B5.
 
-- [ ] B7 [verified] HIGH - `TRIM(LEADING/TRAILING/BOTH ... FROM ...)` position
+- [x] B7 [verified] HIGH - `TRIM(LEADING/TRAILING/BOTH ... FROM ...)` position
   keyword dropped. `_append_function_arg` (`parser.py:1804-1812`) silently skips
   the `position` slot (a bare string, not an Expression). `trim(LEADING 'x' FROM
   col)` becomes `TRIM(col, 'x')` = both-sides trim (verified). COLLATE is dropped
   the same way. Fix: handle `exp.Trim` explicitly; fail-fast on a non-Expression,
   non-list arg slot rather than skipping.
 
-- [ ] B8 [verified] HIGH - `TRY_CAST`/`SAFE_CAST` silently becomes strict `CAST`.
+- [x] B8 [verified] HIGH - `TRY_CAST`/`SAFE_CAST` silently becomes strict `CAST`.
   `_convert_cast` (`parser.py:1484-1488`) reads `this`+`to`, never the `safe` flag.
   `TRY_CAST(x AS INT)` becomes `CAST(x AS INT)` (verified) - NULL-on-failure turns
   into error-on-failure. Fix: read `safe`, render TRY_CAST per dialect, or fail-fast.
 
-- [ ] B9 [verified] HIGH - `x IN UNNEST(array)` becomes empty `IN ()`.
+- [x] B9 [verified] HIGH - `x IN UNNEST(array)` becomes empty `IN ()`.
   `_convert_in_expression` (`parser.py:1292-1307`) reads only this/query/expressions;
   with `unnest` populated and `expressions` empty it builds `InList(options=[])`.
   `x IN UNNEST(arr)` becomes `(x IN ())` (verified) = always false/NULL. The
   `field` form drops the same way. Fix: handle unnest/field, or fail-fast.
 
-- [ ] B10 [verified] MED - `BETWEEN SYMMETRIC` drops the SYMMETRIC flag.
+- [x] B10 [verified] MED - `BETWEEN SYMMETRIC` drops the SYMMETRIC flag.
   `_convert_between_expression` (`parser.py:1309-1314`) reads this/low/high only.
   `col BETWEEN SYMMETRIC 5 AND 1` becomes `(col BETWEEN 5 AND 1)` (verified) =
   always false, when SYMMETRIC means swap-the-bounds. Fix: honor or fail-fast.
@@ -210,32 +246,32 @@ literals - all raise. `count(DISTINCT a,b)` honored.)
 
 ### B.preprocessor (query_preprocessor.py)
 
-- [ ] B11 HIGH - chained named windows drop the inherited PARTITION BY.
+- [x] B11 HIGH - chained named windows drop the inherited PARTITION BY.
   `_inline_named_windows` (`query_preprocessor.py:290-302`) resolves each window
   reference independently in document order and merges only one level, so
   `WINDOW w1 AS (PARTITION BY active), w2 AS (w1 ORDER BY id)` referenced via
   `OVER w2` loses `PARTITION BY active` (wrong row numbers). Fix: resolve the
   base-window chain to a fixed point, or fail-fast when a window's base ref is set.
 
-- [ ] B12 HIGH - `SELECT * EXCLUDE/REPLACE` ignored on the PIVOT path.
+- [x] B12 HIGH - `SELECT * EXCLUDE/REPLACE` ignored on the PIVOT path.
   `_is_star_select` (`query_preprocessor.py:224-227`) treats any Star as bare and
   does not inspect `except_`/`replace`; `_apply_pivot_rewrite` rebuilds the
   projection from catalog columns. `SELECT * EXCLUDE (amount) ... PIVOT(...)`
   keeps `amount`. Fix: reject a star carrying except_/replace on the pivot path,
   or thread them through.
 
-- [ ] B13 MED - user GROUP BY overwritten by the PIVOT rewrite.
+- [x] B13 MED - user GROUP BY overwritten by the PIVOT rewrite.
   `_apply_pivot_rewrite` (`query_preprocessor.py:242-246`) unconditionally
   `select.set("group", ...)`, clobbering an existing GROUP BY. Fix: fail-fast when
   a GROUP BY already exists alongside PIVOT.
 
-- [ ] B14 MED (masked error) - `EXCLUDE (nonexistent)` silently no-ops.
+- [x] B14 MED (masked error) - `EXCLUDE (nonexistent)` silently no-ops.
   `_excluded_column_names`/`_expand_wildcard` (`query_preprocessor.py:389-394,
   366-369`) only `continue` on a match; a name matching nothing is never
   validated. A typo silently keeps the column. Fix: assert every excluded name
   exists; raise `StarExpansionError`.
 
-- [ ] B15 MED (masked error) - `REPLACE (expr AS nonexistent)` silently discarded.
+- [x] B15 MED (masked error) - `REPLACE (expr AS nonexistent)` silently discarded.
   `_replacement_expressions`/`_append_wildcard_column` key by column name; a
   REPLACE aliased to a non-existent column is never looked up or emitted. Fix:
   validate REPLACE keys against target columns; raise on a miss.
@@ -248,46 +284,60 @@ joined table - all honored or rejected.)
 
 ## CLASS C - cross-representation lowering misses fields
 
-- [ ] C1 HIGH - physical planner never honors NATURAL/USING for cross-source
+- [x] C1 HIGH - physical planner never honors NATURAL/USING for cross-source
   joins. `physical_planner.py:512-555,771-791` lowers a join purely from
   `condition`; with `condition is None` it builds `PhysicalNestedLoopJoin(
   condition=None)` = an unconditional Cartesian product. The name-match semantics
   is lost. Fix: expand NATURAL/USING into an explicit ON equality before physical
   planning (and ideally before the optimizer, which also ignores them - see A1).
 
-- [ ] C2 HIGH - single-source pushdown drops a folded scan's `sample`, `offset`,
+- [x] C2 HIGH - single-source pushdown drops a folded scan's `sample`, `offset`,
   `distinct`. `_scan_ref` (`single_source_pushdown.py:870-882`) never renders
   `sample`; `_absorb_scan_modifiers` (`584-602`) adopts limit but not offset, and
   distinct is never read off the scan. A sampled join side loses TABLESAMPLE; a
   paginated scan loses OFFSET. Fix: render sample in `_scan_ref`; adopt offset
   (and handle distinct) alongside limit.
 
-- [ ] C3 MED - the PhysicalWindow path drops projection `distinct`/`distinct_on`.
-  `_plan_projection` (`physical_planner.py:331-348`) returns `PhysicalWindow`
-  early, before applying distinct. `SELECT DISTINCT rank() OVER (...) ...` over a
-  cross-source input loses DISTINCT. Fix: carry distinct onto PhysicalWindow and
-  render `SELECT DISTINCT`, or wrap in a distinct operator.
+- [x] C3 MED - NOT REACHABLE (already prevented at parse). The concern was the
+  PhysicalWindow path dropping a projection's `distinct`. But `SELECT DISTINCT`
+  (incl. DISTINCT ON) over a projection containing a window is rejected at parse
+  by `_reject_distinct_window` (`parser.py`), so a window projection can never
+  arrive at `_plan_projection` with distinct set. No physical change is needed
+  (an earlier attempt to carry distinct onto PhysicalWindow was reverted as dead
+  code). Covered by `tests/e2e_pushdown/test_window_functions.py` ("SELECT
+  DISTINCT over a window must not silently drop the DISTINCT").
 
 ---
 
 ## CLASS D - incomplete binder dispatch (returns unbound, skips validation)
 
-- [ ] D1 HIGH - HAVING does not bind/validate aggregate (function) arguments.
-  `_bind_having_expression` (`binder.py:816-844`) recurses only into
+- [ ] D1 HIGH - DEFERRED (not lie-shipping). HAVING does not bind/validate
+  aggregate (function) arguments. `_bind_having_expression` recurses only into
   ColumnRef/BinaryOp/UnaryOp/subquery and `return expr` for everything else, so a
   `FunctionCall` in HAVING keeps `data_type=None` and its column refs are never
-  existence-checked. `HAVING SUM(nonexistent_col) > 10` is accepted by the binder
-  (only the source might later reject it; a pushed subtree can run). Fix: delegate
-  non-ColumnRef leaves to the full `_bind_expression` dispatch.
+  existence-checked. `HAVING SUM(nonexistent_col) > 10` is accepted by the binder.
+  Assessment: this is delayed validation, not a wrong answer - an invalid column
+  is rejected loudly by the source (pushed) or the expression evaluator (local
+  HAVING over a cross-source aggregate), so it crashes rather than shipping a
+  lie. Left open because a proper fix needs the aggregate's INPUT scope (not the
+  output alias_map the HAVING binder has), which is a larger change; tracked but
+  not a silent-fail per the "crash > lie" bar.
+  TRACKED BY TWO TESTS (not just this checkbox):
+  - `tests/test_binder.py::test_bind_invalid_column_in_having_should_raise` -
+    xfail(strict): documents the desired bind-time rejection; XPASSes (fails)
+    when D1 is fixed, signalling the marker should be removed.
+  - `tests/e2e_decorrelation/test_error_cases.py::...::
+    test_having_invalid_column_crashes_not_lies` - guarantees the deferral stays
+    safe: the query must crash at execution, never return wrong rows.
 
-- [ ] D2 HIGH - JOIN ON does not recurse into Cast/FunctionCall/CaseExpr/Extract/
+- [x] D2 HIGH - JOIN ON does not recurse into Cast/FunctionCall/CaseExpr/Extract/
   Between/InList/Window. `_bind_join_condition` (`binder.py:1045-1066`) handles
   ColumnRef/Literal/BinaryOp/UnaryOp/subquery and `return condition` for the rest,
   leaving nested columns unbound and unchecked. `ON a.x = LENGTH(b.does_not_exist)`
   passes silently. Fix: route non-trivial operands through
   `_bind_expression_multi_table`.
 
-- [ ] D3 HIGH - alias-qualified column binds to the WRONG relation in a multi-table
+- [x] D3 HIGH - alias-qualified column binds to the WRONG relation in a multi-table
   join. `_extract_tables` (`binder.py:1013-1022`) keys a scan by `table_name`
   while `_add_scan_to_scope` (`881`) keys by `alias or table_name`. In
   `_bind_column_ref_multi_table` (`1068`) an alias-qualified lookup misses and the
@@ -336,9 +386,15 @@ joined table - all honored or rejected.)
 
 ---
 
-## Verification status
+## Verification status (final)
 
-Personally reproduced (ran the engine, observed the drop): A1, A2(structural),
-B1, B2, B3, B5, B6, B7, B8, B9, B10. The remaining items (A3, A4, A5, B4,
-B11-B15, C1-C3, D1-D3) are agent-found with stated repros and should be confirmed
-when each is fixed (the fix's regression test is the confirmation).
+Every item is now confirmed by an executable test, not a one-off repro:
+- Fixed items each have a regression test (raises-test for fail-fast resolutions,
+  behavioural test for the implemented ones).
+- Recurrence classes A and the expression-walker class are held by the two lints
+  named in the STATUS banner.
+- D1 (only deferred item): not lie-shipping (crashes loudly) - guarded by
+  `test_having_invalid_column_crashes_not_lies` and tracked for a proper fix by
+  the xfail `test_bind_invalid_column_in_having_should_raise`.
+- Fail-fast-for-now valid-SQL features: tracked as strict xfails in
+  `tests/test_deferred_features.py` and `test_advanced_join_types.py`.
