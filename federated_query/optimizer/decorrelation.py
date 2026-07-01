@@ -776,11 +776,12 @@ class _SubqueryPreparer:
     ) -> Aggregate:
         """Add correlation keys to an aggregate and rename predicates."""
         group_by = list(plan.group_by)
+        had_group_by = len(plan.group_by) > 0
         aggregates = list(plan.aggregates)
         names = list(plan.output_names)
         for offset in range(len(crossing)):
             inner_ref, outer_side = self._key_equality(crossing[offset])
-            self._add_group_key(group_by, inner_ref)
+            self._add_group_key(group_by, inner_ref, had_group_by)
             key_name = f"{self.prefix}_g{start + offset}"
             aggregates.append(inner_ref)
             names.append(key_name)
@@ -846,12 +847,21 @@ class _SubqueryPreparer:
                 return True
         return False
 
-    def _add_group_key(self, group_by: List[Expression], key: ColumnRef) -> None:
-        """Add a correlation key to the grouping, validating legality."""
+    def _add_group_key(
+        self, group_by: List[Expression], key: ColumnRef, had_group_by: bool
+    ) -> None:
+        """Add a correlation key to the grouping, validating legality.
+
+        A scalar-aggregate subquery (no original GROUP BY) may correlate on
+        several keys; each is added as a grouping key. But when the subquery
+        already had its own GROUP BY, a correlation key not among those keys
+        cannot be added - it would change the aggregation granularity - so it
+        raises. ``had_group_by`` is the ORIGINAL state, not the growing list.
+        """
         for existing in group_by:
             if isinstance(existing, ColumnRef) and existing.column == key.column:
                 return
-        if len(group_by) > 0:
+        if had_group_by:
             raise DecorrelationError(
                 f"Correlation key {key.to_sql()} is not part of the "
                 "subquery's GROUP BY"
