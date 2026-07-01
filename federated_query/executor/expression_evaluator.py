@@ -23,10 +23,28 @@ from ..plan.expressions import (
     FunctionCall,
     Cast,
     CaseExpr,
+    Extract,
     InList,
     BetweenExpression,
 )
 from ..plan.arrow_types import arrow_type_for, is_renderable
+
+
+# EXTRACT(field FROM source) maps each field keyword to the Arrow temporal
+# kernel that reads it. Every kernel takes one temporal array and returns an
+# integer array, matching SQL EXTRACT's numeric result.
+_EXTRACT_KERNELS = {
+    "YEAR": pc.year,
+    "MONTH": pc.month,
+    "DAY": pc.day,
+    "HOUR": pc.hour,
+    "MINUTE": pc.minute,
+    "SECOND": pc.second,
+    "QUARTER": pc.quarter,
+    "WEEK": pc.iso_week,
+    "DOW": pc.day_of_week,
+    "DOY": pc.day_of_year,
+}
 
 
 class ExpressionEvaluationError(Exception):
@@ -102,6 +120,7 @@ class ExpressionEvaluator:
             (FunctionCall, self._eval_function),
             (Cast, self._eval_cast),
             (CaseExpr, self._eval_case),
+            (Extract, self._eval_extract),
             (InList, self._eval_in_list),
             (BetweenExpression, self._eval_between),
         ]
@@ -142,7 +161,39 @@ class ExpressionEvaluator:
         kernel = self._binary_kernel(expr.op)
         left = self._eval(expr.left)
         right = self._eval(expr.right)
+        return self._apply_binary_kernel(expr.op, kernel, left, right)
+
+    def _apply_binary_kernel(self, op, kernel, left, right):
+        """Apply a binary kernel, widening decimals to decimal256 when they overflow.
+
+        Arrow rejects a decimal128 arithmetic result whose precision exceeds 38;
+        SQL engines fall back to a wider numeric. When two decimal operands would
+        overflow, both are cast to decimal256 (precision up to 76) so the value
+        is still computed EXACTLY - float would lose the last cent.
+        """
+        if op in _ARITHMETIC_KERNELS and self._decimal_would_overflow(left, right):
+            wide = kernel(self._to_decimal256(left), self._to_decimal256(right))
+            return self._narrow_decimal(wide)
         return kernel(left, right)
+
+    def _to_decimal256(self, value):
+        """Cast a decimal operand to decimal256, keeping its precision and scale."""
+        return pc.cast(value, pa.decimal256(value.type.precision, value.type.scale))
+
+    def _narrow_decimal(self, value):
+        """Cap a wide decimal result back to decimal128(38, scale).
+
+        The exact value was computed in decimal256; downstream consumers (the
+        DuckDB merge engine) accept only decimal128 (precision <= 38), so the
+        result is capped at 38 like DuckDB caps its own decimal arithmetic.
+        """
+        return pc.cast(value, pa.decimal128(38, value.type.scale))
+
+    def _decimal_would_overflow(self, left, right) -> bool:
+        """Whether a decimal op on both operands would exceed Arrow's 38 precision."""
+        if not pa.types.is_decimal(left.type) or not pa.types.is_decimal(right.type):
+            return False
+        return left.type.precision + right.type.precision + 1 > 38
 
     def _special_binary_handler(self, op: BinaryOpType):
         """Return a handler for operators that are not plain kernels."""
@@ -264,6 +315,16 @@ class ExpressionEvaluator:
                 f"Unsupported local CAST target: {expr.target_type}"
             )
         return pc.cast(value, arrow_type_for(data_type))
+
+    def _eval_extract(self, expr: Extract) -> pa.Array:
+        """Evaluate EXTRACT(field FROM source) via the Arrow temporal kernel."""
+        source = self._broadcast(self._eval(expr.source))
+        kernel = _EXTRACT_KERNELS.get(expr.field.upper())
+        if kernel is None:
+            raise ExpressionEvaluationError(
+                f"Unsupported EXTRACT field: {expr.field}"
+            )
+        return kernel(source)
 
     def _eval_unary(self, expr: UnaryOp):
         """Evaluate NOT / IS NULL / IS NOT NULL / negation."""
