@@ -2,6 +2,13 @@
 
 This document provides an overview of the codebase structure, key classes, compilation instructions, and coding standards for AI-assisted development.
 
+NEW HERE? Read `README-agents-onboarding.md` first - it documents the operational
+setup you should not have to rediscover: the Python virtualenv
+(`/workspace/venv-fedq`), the background services (bundled PostgreSQL on
+localhost:5432, ClickHouse on localhost:8123), how to run the test suite, and the
+map of the codebase. For how the engine works internally, read
+`README-architecture.md`.
+
 ## TOP PRIORITY : no silent crashes
 
 # A crash never ships a lie.
