@@ -29,7 +29,12 @@ cd benchmarks/tpch
 ./run.sh 1                   # standard TPC-H scale factor 1 (~6M lineitem rows)
 ./run.sh 0.01 --only 1,6     # run a subset of queries
 ./run.sh 0.01 --timeout 120  # raise the per-query wall-clock limit
+./run.sh 0.01 --report tpch-report.md  # also write a clustered markdown report
 ```
+
+`--report <path>` writes a markdown report with the summary, failures grouped
+into clusters (by reason), and the full per-query matrix including engine/oracle
+row counts. See `tpch-report.md` for a generated example.
 
 `run.sh` defaults to the `venv-fedq` interpreter; override with
 `PYTHON=/path/to/python ./run.sh`.

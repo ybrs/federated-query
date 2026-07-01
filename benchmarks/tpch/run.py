@@ -132,10 +132,12 @@ def evaluate_query(oracle, path, db_path, options):
     engine_sql = qualify_query(original_sql, options.source, options.schema, ENGINE_DIALECT)
     engine_rows, error = run_engine_isolated(engine_sql, db_path, options)
     if error is not None:
-        return {"name": name, "status": "ERROR", "reason": error}
+        return {"name": name, "status": "ERROR", "reason": error,
+                "engine_rows": None, "oracle_rows": None}
     oracle_rows = oracle.execute(original_sql).fetchall()
     match, reason = compare_results(engine_rows, oracle_rows, options.decimals)
-    return {"name": name, "status": "PASS" if match else "MISMATCH", "reason": reason}
+    return {"name": name, "status": "PASS" if match else "MISMATCH", "reason": reason,
+            "engine_rows": len(engine_rows), "oracle_rows": len(oracle_rows)}
 
 
 def _select_query_files(queries_dir, only):
@@ -174,6 +176,140 @@ def _print_summary(results):
     )
 
 
+# Ordered failure signatures: the first substring found in a reason names the
+# cluster. An unmatched failure falls into "Other" so it is never hidden.
+ERROR_CATEGORIES = [
+    ("orient join keys", "Join-key orientation"),
+    ("Out of Memory", "Out of memory"),
+    ("ArrowBuffer", "Out of memory"),
+    ("arrow_scan", "Out of memory"),
+    ("RecursionError", "Recursion"),
+    ("DecorrelationError", "Decorrelation limitation"),
+    ("BindingError", "Binding: reference not in scope"),
+    ("Timeout", "Timeout"),
+    ("Killed", "Memory limit (killed)"),
+    ("row count differs", "Wrong result: row count"),
+    ("unexpected row", "Wrong result: row values"),
+    ("missing expected row", "Wrong result: row values"),
+]
+
+
+def _categorize(reason):
+    """Map a failure reason to a cluster label; unknown reasons are 'Other'."""
+    for needle, label in ERROR_CATEGORIES:
+        if needle in reason:
+            return label
+    return "Other"
+
+
+def _cluster_failures(results):
+    """Group non-PASS results by failure cluster, preserving encounter order."""
+    clusters = {}
+    for result in results:
+        if result["status"] == "PASS":
+            continue
+        label = _categorize(result["reason"])
+        clusters.setdefault(label, []).append(result)
+    return clusters
+
+
+def _escape(text):
+    """Escape markdown table cell separators in a reason string."""
+    return text.replace("|", "\\|")
+
+
+def _rows_cell(result):
+    """Render the engine/oracle row-count cell, or '-' when the query errored."""
+    if result["engine_rows"] is None:
+        return "-"
+    return "{0} / {1}".format(result["engine_rows"], result["oracle_rows"])
+
+
+def _matrix_lines(results):
+    """Build the per-query markdown table (status, row counts, detail)."""
+    lines = ["| Query | Status | Rows engine/oracle | Detail |",
+             "| --- | --- | --- | --- |"]
+    for result in results:
+        detail = result["reason"] if result["reason"] else "rows and values match"
+        lines.append("| {0} | {1} | {2} | {3} |".format(
+            result["name"], result["status"], _rows_cell(result), _escape(detail)))
+    return lines
+
+
+def _member_names(members):
+    """Join the query names of a cluster into a comma-separated string."""
+    names = []
+    for member in members:
+        names.append(member["name"])
+    return ", ".join(names)
+
+
+def _cluster_lines(clusters):
+    """Build the failure-cluster section, largest cluster first."""
+    ordered = sorted(clusters.items(), key=_cluster_sort_key)
+    lines = []
+    for label, members in ordered:
+        names = _member_names(members)
+        lines.append("### {0} ({1})".format(label, len(members)))
+        lines.append("Queries: {0}".format(names))
+        lines.append("")
+        lines.append("- " + members[0]["reason"])
+        lines.append("")
+    return lines
+
+
+def _cluster_sort_key(item):
+    """Sort clusters by descending size, then by label for stable output."""
+    label, members = item
+    return (-len(members), label)
+
+
+def _summary_line(results):
+    """Return the one-line PASS/MISMATCH/ERROR tally as text."""
+    tally = {"PASS": 0, "MISMATCH": 0, "ERROR": 0}
+    for result in results:
+        tally[result["status"]] += 1
+    return "Total {0} | PASS {1} | MISMATCH {2} | ERROR {3}".format(
+        len(results), tally["PASS"], tally["MISMATCH"], tally["ERROR"])
+
+
+def _report_header(results, options):
+    """Build the report preamble: parameters, methodology, and summary."""
+    return [
+        "# TPC-H benchmark report",
+        "",
+        "Scale factor {0}, single DuckDB source, per-query timeout {1}s, "
+        "memory cap {2} MB.".format(options.scale_factor, options.timeout,
+                                    options.memory_limit),
+        "",
+        "Correctness is differential against DuckDB: each query runs through the "
+        "engine and directly in DuckDB, and the two result sets are compared as "
+        "a multiset of rows with every column value normalized (numbers rounded "
+        "to {0} decimals, CHAR padding stripped). PASS means every row and every "
+        "value matches; row order is not compared.".format(options.decimals),
+        "",
+        "## Summary",
+        "",
+        _summary_line(results),
+    ]
+
+
+def write_report(results, options, path):
+    """Write the markdown report: summary, failure clusters, per-query matrix."""
+    lines = _report_header(results, options)
+    lines.append("")
+    lines.append("## Failure clusters")
+    lines.append("")
+    lines.extend(_cluster_lines(_cluster_failures(results)))
+    lines.append("## Per-query matrix")
+    lines.append("")
+    lines.extend(_matrix_lines(results))
+    lines.append("")
+    with open(path, "w") as handle:
+        handle.write("\n".join(lines))
+    print("Wrote report: {0}".format(path))
+
+
 def run(options):
     """Run every selected query and print the support matrix and summary."""
     paths = _select_query_files(options.queries_dir, options.only)
@@ -186,6 +322,8 @@ def run(options):
         results.append(result)
         _print_result(result)
     _print_summary(results)
+    if options.report:
+        write_report(results, options, options.report)
     return results
 
 
@@ -201,6 +339,7 @@ def _parse_args():
     parser.add_argument("--decimals", type=int, default=2)
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--memory-limit", type=int, default=12288)
+    parser.add_argument("--report", default=None)
     return parser.parse_args()
 
 
