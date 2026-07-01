@@ -1,4 +1,5 @@
 """Utility functions for decorrelation e2e tests."""
+
 from typing import List, Set, Any
 
 from federated_query.catalog import Catalog
@@ -106,8 +107,9 @@ def verify_no_subquery_expressions(plan: LogicalPlanNode):
     Raises:
         AssertionError if subquery expressions found
     """
-    assert not has_subquery_expressions(plan), \
-        "Decorrelated plan should not contain subquery expression nodes"
+    assert not has_subquery_expressions(
+        plan
+    ), "Decorrelated plan should not contain subquery expression nodes"
 
 
 def get_join_conditions(plan: LogicalPlanNode) -> List[Expression]:
@@ -132,11 +134,11 @@ def plan_physical(executor, plan: LogicalPlanNode):
     """
     Convert a logical plan to a physical plan.
 
-    The decorrelation tests construct ``Executor(catalog)``, so the catalog
-    travels in the executor's config slot; it is required here to resolve
-    data sources during physical planning.
+    The decorrelation tests construct ``Executor(catalog)``, so the catalog is
+    held in the executor's catalog slot; it is required here to resolve data
+    sources during physical planning.
     """
-    catalog = executor.config
+    catalog = executor.catalog
     if not isinstance(catalog, Catalog):
         raise TypeError(
             "Decorrelation tests must construct the executor as "
@@ -185,8 +187,9 @@ def assert_result_count(executor, plan: LogicalPlanNode, expected_count: int):
         AssertionError if count doesn't match
     """
     results = execute_and_fetch_all(executor, plan)
-    assert len(results) == expected_count, \
-        f"Expected {expected_count} rows, got {len(results)}"
+    assert (
+        len(results) == expected_count
+    ), f"Expected {expected_count} rows, got {len(results)}"
 
 
 def assert_result_contains_ids(executor, plan: LogicalPlanNode, expected_ids: Set[int]):
@@ -204,17 +207,17 @@ def assert_result_contains_ids(executor, plan: LogicalPlanNode, expected_ids: Se
     results = execute_and_fetch_all(executor, plan)
     actual_ids = set()
     for row in results:
-        if 'id' in row:
-            actual_ids.add(row['id'])
-        elif 'user_id' in row:
-            actual_ids.add(row['user_id'])
+        if "id" in row:
+            actual_ids.add(row["id"])
+        elif "user_id" in row:
+            actual_ids.add(row["user_id"])
 
-    assert actual_ids == expected_ids, \
-        f"Expected IDs {expected_ids}, got {actual_ids}"
+    assert actual_ids == expected_ids, f"Expected IDs {expected_ids}, got {actual_ids}"
 
 
-def assert_column_values(executor, plan: LogicalPlanNode,
-                         column_name: str, expected_values: List[Any]):
+def assert_column_values(
+    executor, plan: LogicalPlanNode, column_name: str, expected_values: List[Any]
+):
     """
     Assert that a column contains expected values.
 
@@ -235,12 +238,14 @@ def assert_column_values(executor, plan: LogicalPlanNode,
     actual_set = set(actual_values)
     expected_set = set(expected_values)
 
-    assert actual_set == expected_set, \
-        f"Expected {expected_set} for {column_name}, got {actual_set}"
+    assert (
+        actual_set == expected_set
+    ), f"Expected {expected_set} for {column_name}, got {actual_set}"
 
 
-def assert_all_rows_satisfy(executor, plan: LogicalPlanNode,
-                            predicate: callable) -> bool:
+def assert_all_rows_satisfy(
+    executor, plan: LogicalPlanNode, predicate: callable
+) -> bool:
     """
     Assert that all result rows satisfy a predicate.
 
@@ -274,41 +279,35 @@ def assert_plan_structure(plan: LogicalPlanNode, expected_structure: dict):
     Raises:
         AssertionError if structure doesn't match
     """
-    if 'has_semi_join' in expected_structure:
-        expected = expected_structure['has_semi_join']
-        actual = has_join_type(plan, 'SEMI')
-        assert actual == expected, \
-            f"Expected has_semi_join={expected}, got {actual}"
+    if "has_semi_join" in expected_structure:
+        expected = expected_structure["has_semi_join"]
+        actual = has_join_type(plan, "SEMI")
+        assert actual == expected, f"Expected has_semi_join={expected}, got {actual}"
 
-    if 'has_anti_join' in expected_structure:
-        expected = expected_structure['has_anti_join']
-        actual = has_join_type(plan, 'ANTI')
-        assert actual == expected, \
-            f"Expected has_anti_join={expected}, got {actual}"
+    if "has_anti_join" in expected_structure:
+        expected = expected_structure["has_anti_join"]
+        actual = has_join_type(plan, "ANTI")
+        assert actual == expected, f"Expected has_anti_join={expected}, got {actual}"
 
-    if 'has_left_join' in expected_structure:
-        expected = expected_structure['has_left_join']
-        actual = has_join_type(plan, 'LEFT')
-        assert actual == expected, \
-            f"Expected has_left_join={expected}, got {actual}"
+    if "has_left_join" in expected_structure:
+        expected = expected_structure["has_left_join"]
+        actual = has_join_type(plan, "LEFT")
+        assert actual == expected, f"Expected has_left_join={expected}, got {actual}"
 
-    if 'semi_join_count' in expected_structure:
-        expected = expected_structure['semi_join_count']
-        actual = count_joins_of_type(plan, 'SEMI')
-        assert actual == expected, \
-            f"Expected {expected} SEMI joins, got {actual}"
+    if "semi_join_count" in expected_structure:
+        expected = expected_structure["semi_join_count"]
+        actual = count_joins_of_type(plan, "SEMI")
+        assert actual == expected, f"Expected {expected} SEMI joins, got {actual}"
 
-    if 'anti_join_count' in expected_structure:
-        expected = expected_structure['anti_join_count']
-        actual = count_joins_of_type(plan, 'ANTI')
-        assert actual == expected, \
-            f"Expected {expected} ANTI joins, got {actual}"
+    if "anti_join_count" in expected_structure:
+        expected = expected_structure["anti_join_count"]
+        actual = count_joins_of_type(plan, "ANTI")
+        assert actual == expected, f"Expected {expected} ANTI joins, got {actual}"
 
-    if 'has_aggregation' in expected_structure:
-        expected = expected_structure['has_aggregation']
+    if "has_aggregation" in expected_structure:
+        expected = expected_structure["has_aggregation"]
         aggs = find_nodes_of_type(plan, Aggregate)
         actual = len(aggs) > 0
-        assert actual == expected, \
-            f"Expected has_aggregation={expected}, got {actual}"
+        assert actual == expected, f"Expected has_aggregation={expected}, got {actual}"
 
     verify_no_subquery_expressions(plan)

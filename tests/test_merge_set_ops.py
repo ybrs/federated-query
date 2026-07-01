@@ -10,19 +10,25 @@ import pytest
 
 from federated_query.executor.merge_engine import MergeEngine
 from federated_query.plan.logical import SetOpKind
-from federated_query.plan.physical import PhysicalSetOperation, PhysicalUnion
+from federated_query.plan.physical import (
+    PhysicalPlanNode,
+    PhysicalSetOperation,
+    PhysicalUnion,
+)
 
 
-class _Node:
+class _Node(PhysicalPlanNode):
     """Minimal physical node yielding a fixed table's batches."""
 
-    def __init__(self, table: pa.Table):
-        """Hold the table to replay."""
-        self._table = table
+    table: pa.Table
+
+    def children(self):
+        """A leaf node has no children."""
+        return []
 
     def schema(self) -> pa.Schema:
         """Return the table schema."""
-        return self._table.schema
+        return self.table.schema
 
     def column_aliases(self):
         """No qualified-name remapping for this fake node."""
@@ -30,8 +36,12 @@ class _Node:
 
     def execute(self):
         """Yield the table's batches."""
-        for batch in self._table.to_batches():
+        for batch in self.table.to_batches():
             yield batch
+
+    def estimated_cost(self) -> float:
+        """Free; this is a test fixture."""
+        return 0.0
 
 
 @pytest.fixture
@@ -46,14 +56,18 @@ def engine():
 def left():
     """Left input with a duplicate (1, x) row."""
     return _Node(
-        pa.table({"a": pa.array([1, 1, 2, 3]), "b": pa.array(["x", "x", "y", "z"])})
+        table=pa.table(
+            {"a": pa.array([1, 1, 2, 3]), "b": pa.array(["x", "x", "y", "z"])}
+        )
     )
 
 
 @pytest.fixture
 def right():
     """Right input with two (2, y) rows."""
-    return _Node(pa.table({"a": pa.array([1, 2, 2]), "b": pa.array(["x", "y", "y"])}))
+    return _Node(
+        table=pa.table({"a": pa.array([1, 2, 2]), "b": pa.array(["x", "y", "y"])})
+    )
 
 
 def _run(op, engine) -> list:

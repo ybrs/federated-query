@@ -93,7 +93,7 @@ def test_correlated_exists_becomes_semi_join(catalog):
         "WHERE EXISTS (SELECT 1 FROM pg.orders o WHERE o.user_id = u.id)",
     )
     join = the_join(plan, JoinType.SEMI)
-    assert "u.id" in condition_sql(join)
+    assert '"u"."id"' in condition_sql(join)
     assert "__subq_0_k0" in condition_sql(join)
 
 
@@ -129,7 +129,7 @@ def test_in_uses_plain_equality(catalog):
     )
     join = the_join(plan, JoinType.SEMI)
     assert "IS NULL" not in condition_sql(join)
-    assert "= __subq_0_v0" in condition_sql(join).replace("(", "").replace(")", "")
+    assert '= "__subq_0_v0"' in condition_sql(join).replace("(", "").replace(")", "")
 
 
 def test_not_in_uses_null_aware_match(catalog):

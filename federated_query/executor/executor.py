@@ -20,15 +20,19 @@ def _attach_merge_engine(node: PhysicalPlanNode, engine: MergeEngine) -> None:
 class Executor:
     """Query executor that runs physical plans."""
 
-    def __init__(self, config: Optional[ExecutorConfig] = None):
+    def __init__(self, catalog=None, config: Optional[ExecutorConfig] = None):
         """Initialize executor.
 
         Args:
-            config: Executor configuration (uses defaults if not provided)
+            catalog: Optional catalog, used by callers that plan-then-execute
+                through this executor (the decorrelation test harness). Production
+                plans through QueryExecutor's own planner and leaves this None.
+            config: Executor configuration (uses defaults if not provided).
         """
         if config is None:
             config = ExecutorConfig()
         self.config = config
+        self.catalog = catalog
         # The merge engine is created once on first use and reused across every
         # query this executor runs: opening a fresh in-memory DuckDB costs ~10ms,
         # so a per-query connection would dwarf the local join it accelerates.
@@ -52,16 +56,12 @@ class Executor:
         yield from plan.execute()
 
     def _get_merge_engine(self) -> MergeEngine:
-        """Return the reused merge engine, creating it once on first use.
-
-        ``self.config`` is an ``ExecutorConfig`` in the real runtime but a
-        ``Catalog`` in the decorrelation test harness, so the merge-engine
-        settings are read defensively with sensible defaults.
-        """
+        """Return the reused merge engine, creating it once on first use."""
         if self._merge_engine is None:
-            memory_limit = getattr(self.config, "merge_engine_memory_limit", "1GB")
-            temp_directory = getattr(self.config, "merge_engine_temp_directory", None)
-            self._merge_engine = MergeEngine(memory_limit, temp_directory)
+            self._merge_engine = MergeEngine(
+                self.config.merge_engine_memory_limit,
+                self.config.merge_engine_temp_directory,
+            )
         return self._merge_engine
 
     def warmup(self) -> None:

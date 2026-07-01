@@ -3,11 +3,8 @@
 from pathlib import Path
 from federated_query.config.config import load_config, Config, DataSourceConfig, ExecutorConfig
 from federated_query.catalog.catalog import Catalog
+from federated_query.cli.fedq import FedQRuntime
 from federated_query.datasources.duckdb import DuckDBDataSource
-from federated_query.parser.parser import Parser
-from federated_query.parser.binder import Binder
-from federated_query.optimizer.physical_planner import PhysicalPlanner
-from federated_query.executor.executor import Executor
 
 
 def main():
@@ -60,10 +57,7 @@ def main():
 
     print(f"4. Catalog has {len(catalog.datasources)} datasources")
 
-    parser = Parser()
-    binder = Binder(catalog)
-    planner = PhysicalPlanner(catalog)
-    executor = Executor(ExecutorConfig())
+    runtime = FedQRuntime(catalog, ExecutorConfig())
 
     print("\n" + "="*60)
     print("TEST 1: Decimal precision fix")
@@ -76,10 +70,7 @@ def main():
     print(sql1)
 
     try:
-        logical_plan = parser.parse_to_logical_plan(sql1, catalog)
-        bound_plan = binder.bind(logical_plan)
-        physical_plan = planner.plan(bound_plan)
-        result = executor.execute_to_table(physical_plan)
+        result = runtime.execute(sql1)
 
         print(f"\nResult ({result.num_rows} rows, {result.num_columns} columns):")
         print(f"Schema: {result.schema}")
@@ -99,10 +90,7 @@ def main():
     print(sql2)
 
     try:
-        logical_plan = parser.parse_to_logical_plan(sql2, catalog)
-        bound_plan = binder.bind(logical_plan)
-        physical_plan = planner.plan(bound_plan)
-        result = executor.execute_to_table(physical_plan)
+        result = runtime.execute(sql2)
 
         print(f"\nResult ({result.num_rows} rows, {result.num_columns} columns):")
         print(f"Schema: {result.schema}")
@@ -122,10 +110,7 @@ def main():
     print(sql3)
 
     try:
-        logical_plan = parser.parse_to_logical_plan(sql3, catalog)
-        bound_plan = binder.bind(logical_plan)
-        physical_plan = planner.plan(bound_plan)
-        result = executor.execute_to_table(physical_plan)
+        result = runtime.execute(sql3)
 
         print(f"\nResult ({result.num_rows} rows, {result.num_columns} columns):")
         print(f"Schema: {result.schema}")

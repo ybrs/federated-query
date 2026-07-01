@@ -101,8 +101,8 @@ def test_case_expression_null_condition_falls_through():
     """A NULL WHEN condition must fall through, not poison the result."""
     is_big = BinaryOp(op=BinaryOpType.GT, left=col("amount"), right=lit(60))
     expr = CaseExpr(
-        when_clauses=[(is_big, Literal("big", DataType.VARCHAR))],
-        else_result=Literal("small", DataType.VARCHAR),
+        when_clauses=[(is_big, Literal(value="big", data_type=DataType.VARCHAR))],
+        else_result=Literal(value="small", data_type=DataType.VARCHAR),
     )
     assert evaluate(expr) == ["big", "small", "big", "small"]
 
@@ -111,7 +111,7 @@ def test_coalesce_function():
     """COALESCE replaces NULLs with the fallback."""
     expr = FunctionCall(
         function_name="COALESCE",
-        args=[col("amount"), Literal(0.0, DataType.DOUBLE)],
+        args=[col("amount"), Literal(value=0.0, data_type=DataType.DOUBLE)],
     )
     assert evaluate(expr) == [100.0, 0.0, 300.0, 50.0]
 

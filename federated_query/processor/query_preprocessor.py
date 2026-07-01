@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import pyarrow as pa
 import sqlglot
 from sqlglot import exp
 
+from ..model import StateModel
+
 from ..catalog import Catalog
 from ..catalog.schema import Table
 from ..parser.dialect import FedQPostgres
+from ..parser.errors import UnsupportedSQLError
 from .query_context import ColumnMapping, QueryContext
 from .query_executor import QueryExecutor, QueryProcessor
 
@@ -22,8 +24,7 @@ class StarExpansionError(Exception):
     pass
 
 
-@dataclass
-class _SelectSource:
+class _SelectSource(StateModel):
     """Metadata for a table referenced in a SELECT."""
 
     datasource: str
@@ -78,6 +79,8 @@ class QueryPreprocessor:
     ) -> None:
         """Traverse AST and rewrite every SELECT."""
         if isinstance(node, exp.Select):
+            self._rewrite_pivot(node)
+            self._inline_named_windows(node)
             self._rewrite_select(node, context, is_root)
         for key, value in node.args.items():
             child_is_root = self._child_is_root(node, key, is_root)
@@ -149,33 +152,295 @@ class QueryPreprocessor:
     ) -> Tuple[List[exp.Expression], List[ColumnMapping]]:
         """Rewrite an individual SELECT expression."""
         if isinstance(expression, exp.Star):
-            return self._expand_wildcard(None, sources)
+            return self._expand_wildcard(None, sources, expression)
         if isinstance(expression, exp.Column) and isinstance(expression.this, exp.Star):
             qualifier = self._identifier_to_str(expression.table)
-            return self._expand_wildcard(qualifier, sources)
+            return self._expand_wildcard(qualifier, sources, expression.this)
         replacements: List[exp.Expression] = [expression]
         metadata = self._column_mappings_for_expression(expression, sources)
         return replacements, metadata
+
+    def _rewrite_pivot(self, select: exp.Select) -> None:
+        """Expand a single-aggregate static PIVOT into conditional aggregation.
+
+        PIVOT is not expressible in the engine's Postgres internal SQL, so it is
+        rewritten to portable ``agg(CASE WHEN k = value THEN x END)`` that every
+        source supports. Shapes the rewrite cannot handle fail fast.
+        """
+        pivot = self._single_pivot(select)
+        if pivot is None:
+            return
+        self._reject_unsupported_pivot(select, pivot)
+        table = select.args["from_"].this
+        columns = self._build_source(table).columns
+        self._apply_pivot_rewrite(select, table, pivot, columns)
+
+    def _single_pivot(self, select: exp.Select):
+        """Return the FROM table's pivot node, or None when there is none."""
+        from_clause = select.args.get("from_")
+        if from_clause is None:
+            return None
+        table = from_clause.this
+        if not isinstance(table, exp.Table):
+            return None
+        pivots = table.args.get("pivots")
+        if not pivots:
+            return None
+        if len(pivots) > 1:
+            raise UnsupportedSQLError("multiple PIVOT clauses are not supported")
+        return pivots[0]
+
+    def _reject_unsupported_pivot(self, select: exp.Select, pivot: exp.Pivot) -> None:
+        """Fail fast on pivot shapes the conditional-aggregation rewrite cannot do."""
+        if pivot.args.get("unpivot"):
+            raise UnsupportedSQLError("UNPIVOT is not supported")
+        if len(pivot.expressions) != 1:
+            raise UnsupportedSQLError("PIVOT with multiple aggregates is not supported")
+        self._reject_non_star_pivot(select)
+        self._reject_unsupported_pivot_field(pivot)
+
+    def _reject_non_star_pivot(self, select: exp.Select) -> None:
+        """PIVOT requires SELECT * over a single table (no joins)."""
+        if select.args.get("joins") or not self._is_star_select(select):
+            raise UnsupportedSQLError("PIVOT requires SELECT * over a single table")
+
+    def _reject_unsupported_pivot_field(self, pivot: exp.Pivot) -> None:
+        """Require a static IN list of literals and a column aggregate argument."""
+        self._reject_non_static_in(pivot.args["fields"][0])
+        agg_input = self._pivot_agg_func(pivot.expressions[0]).this
+        if not isinstance(agg_input, exp.Column):
+            raise UnsupportedSQLError("PIVOT aggregate must be over a single column")
+
+    def _reject_non_static_in(self, field: exp.Expression) -> None:
+        """The pivot's FOR ... IN must be a static list of literal values."""
+        if not isinstance(field, exp.In) or not field.expressions:
+            raise UnsupportedSQLError("PIVOT requires a static IN value list")
+        self._reject_non_literal_values(field.expressions)
+
+    def _reject_non_literal_values(self, values) -> None:
+        """Require every pivot IN value to be a literal (no subquery/expression)."""
+        for value in values:
+            if not isinstance(value, exp.Literal):
+                raise UnsupportedSQLError("PIVOT IN values must be literals")
+
+    def _is_star_select(self, select: exp.Select) -> bool:
+        """True when the projection is a single bare ``*``."""
+        expressions = select.expressions
+        return len(expressions) == 1 and isinstance(expressions[0], exp.Star)
+
+    def _pivot_agg_func(self, aggregate: exp.Expression) -> exp.Expression:
+        """Return the aggregate function node, unwrapping an output alias."""
+        if isinstance(aggregate, exp.Alias):
+            return aggregate.this
+        return aggregate
+
+    def _apply_pivot_rewrite(self, select, table, pivot, columns) -> None:
+        """Replace SELECT * ... PIVOT(...) with conditional-aggregation SQL."""
+        self._reject_incompatible_pivot_clauses(select)
+        field = pivot.args["fields"][0]
+        agg_func = self._pivot_agg_func(pivot.expressions[0])
+        group_cols = self._pivot_group_columns(columns, field.this.name, agg_func)
+        projections = self._pivot_projections(group_cols, pivot, field, agg_func)
+        table.set("pivots", None)
+        select.set("expressions", projections)
+        keys = []
+        for column in group_cols:
+            keys.append(exp.column(column, quoted=True))
+        select.set("group", exp.Group(expressions=keys))
+
+    def _reject_incompatible_pivot_clauses(self, select: exp.Select) -> None:
+        """Reject PIVOT alongside clauses the rewrite would silently discard.
+
+        The rewrite sets its own GROUP BY and rebuilds the projection from
+        catalog columns, so a user GROUP BY would be clobbered and a star's
+        EXCLUDE/REPLACE would be ignored.
+        """
+        if select.args.get("group"):
+            raise UnsupportedSQLError("GROUP BY with PIVOT is not supported")
+        star = select.expressions[0]
+        if star.args.get("except_") or star.args.get("replace"):
+            raise UnsupportedSQLError(
+                "SELECT * EXCLUDE/REPLACE with PIVOT is not supported"
+            )
+
+    def _pivot_group_columns(self, columns, pivot_col, agg_func) -> List[str]:
+        """Columns that stay grouped: all table columns minus pivot/value columns."""
+        consumed = {pivot_col.lower()}
+        for column in agg_func.find_all(exp.Column):
+            consumed.add(column.name.lower())
+        group_cols = []
+        for column in columns:
+            if column.lower() not in consumed:
+                group_cols.append(column)
+        return group_cols
+
+    def _pivot_projections(self, group_cols, pivot, field, agg_func):
+        """Group columns plus one conditional aggregate per IN value."""
+        projections = []
+        for column in group_cols:
+            projections.append(exp.column(column, quoted=True))
+        names = self._pivot_output_names(pivot, field)
+        for value, out_name in zip(field.expressions, names):
+            projections.append(
+                self._pivot_case_aggregate(field.this, value, agg_func, out_name)
+            )
+        return projections
+
+    def _pivot_output_names(self, pivot: exp.Pivot, field: exp.In) -> List[str]:
+        """Output column names sqlglot computed, or the IN value text as fallback."""
+        names = []
+        for column in pivot.args.get("columns") or []:
+            names.append(column.name)
+        if len(names) == len(field.expressions):
+            return names
+        names = []
+        for value in field.expressions:
+            names.append(value.name)
+        return names
+
+    def _pivot_case_aggregate(self, pivot_col, value, agg_func, out_name):
+        """Build ``agg(CASE WHEN pivot_col = value THEN <arg> END) AS out_name``."""
+        condition = exp.EQ(this=pivot_col.copy(), expression=value.copy())
+        case = exp.Case(ifs=[exp.If(this=condition, true=agg_func.this.copy())])
+        new_agg = agg_func.__class__(this=case)
+        return exp.alias_(new_agg, out_name)
+
+    def _inline_named_windows(self, select: exp.Select) -> None:
+        """Inline named windows (WINDOW w AS (...)) into their OVER w references.
+
+        After inlining, every window reference carries its own spec and the
+        WINDOW clause is removed, so the parser sees only explicit OVER (...).
+        """
+        named = select.args.get("windows")
+        if not named:
+            return
+        definitions = self._named_window_map(named)
+        for window in select.find_all(exp.Window):
+            self._resolve_window_reference(window, definitions)
+        select.set("windows", None)
+
+    def _named_window_map(self, named: List[exp.Window]) -> dict:
+        """Map each WINDOW name to its definition node."""
+        definitions = {}
+        for definition in named:
+            definitions[definition.this.name.lower()] = definition
+        return definitions
+
+    def _resolve_window_reference(self, window: exp.Window, definitions: dict) -> None:
+        """Merge a named window's spec into an ``OVER name`` reference."""
+        alias = window.args.get("alias")
+        if alias is None:
+            return
+        definition = definitions.get(alias.name.lower())
+        if definition is None:
+            raise StarExpansionError(f"Unknown window name '{alias.name}'")
+        if definition.args.get("alias"):
+            # The definition itself references another named window; merging only
+            # this level would drop the base window's PARTITION BY / ORDER BY.
+            raise UnsupportedSQLError(
+                "chained named windows (WINDOW w2 AS (w1 ...)) are not supported"
+            )
+        self._merge_window_definition(window, definition)
+
+    def _merge_window_definition(
+        self, window: exp.Window, definition: exp.Window
+    ) -> None:
+        """Adopt the definition's partition/order/frame, keeping reference extras."""
+        window.set("alias", None)
+        self._inherit_window_arg(window, definition, "partition_by")
+        self._inherit_window_arg(window, definition, "order")
+        self._inherit_window_arg(window, definition, "spec")
+
+    def _inherit_window_arg(
+        self, window: exp.Window, definition: exp.Window, key: str
+    ) -> None:
+        """Copy one window-spec arg from the definition if the reference lacks it."""
+        if window.args.get(key):
+            return
+        source = definition.args.get(key)
+        if source is None:
+            return
+        window.set(key, self._copy_window_arg(source))
+
+    def _copy_window_arg(self, source):
+        """Copy a window-spec arg, which may be a node or a list of nodes."""
+        if isinstance(source, list):
+            copied = []
+            for item in source:
+                copied.append(item.copy())
+            return copied
+        return source.copy()
 
     def _expand_wildcard(
         self,
         qualifier: Optional[str],
         sources: List[_SelectSource],
+        star: exp.Star,
     ) -> Tuple[List[exp.Expression], List[ColumnMapping]]:
-        """Expand '*' or alias.* into explicit columns."""
+        """Expand '*' or alias.* into explicit columns, honoring EXCLUDE/REPLACE.
+
+        EXCLUDE/EXCEPT drops the listed columns; REPLACE substitutes a column's
+        output with the given ``expr AS name`` expression, keeping its position.
+        """
         targets = self._targets_for_wildcard(qualifier, sources)
-        replacements: List[exp.Expression] = []
+        excluded = self._excluded_column_names(star)
+        replacements = self._replacement_expressions(star)
+        self._reject_unknown_star_names(targets, excluded, replacements)
+        columns: List[exp.Expression] = []
         metadata: List[ColumnMapping] = []
         for source in targets:
             for column in source.columns:
-                column_expr = self._build_column_expression(source, column)
-                replacements.append(column_expr)
-                mapping = ColumnMapping(
-                    internal_name=self._build_internal_name(source, column),
-                    visible_name=column,
+                if column.lower() in excluded:
+                    continue
+                self._append_wildcard_column(
+                    source, column, replacements, columns, metadata
                 )
-                metadata.append(mapping)
-        return replacements, metadata
+        return columns, metadata
+
+    def _append_wildcard_column(self, source, column, replacements, columns, metadata):
+        """Append one expanded column, or its REPLACE expression, plus metadata."""
+        replacement = replacements.get(column.lower())
+        if replacement is not None:
+            columns.append(replacement.copy())
+            return
+        columns.append(self._build_column_expression(source, column))
+        metadata.append(
+            ColumnMapping(
+                internal_name=self._build_internal_name(source, column),
+                visible_name=column,
+            )
+        )
+
+    def _reject_unknown_star_names(self, targets, excluded, replacements) -> None:
+        """Fail fast when EXCLUDE/REPLACE names a column the star does not expand.
+
+        A typo'd name would otherwise match nothing and be silently ignored, so
+        the user's intended exclusion/replacement is dropped with no error.
+        """
+        available = set()
+        for source in targets:
+            for column in source.columns:
+                available.add(column.lower())
+        unknown = (set(excluded) | set(replacements)) - available
+        if unknown:
+            raise UnsupportedSQLError(
+                "SELECT * EXCLUDE/REPLACE names unknown column(s): "
+                f"{', '.join(sorted(unknown))}"
+            )
+
+    def _excluded_column_names(self, star: exp.Star) -> set:
+        """Return the lowercased column names listed in a star's EXCEPT/EXCLUDE."""
+        names = set()
+        for column in star.args.get("except_") or []:
+            names.add(column.name.lower())
+        return names
+
+    def _replacement_expressions(self, star: exp.Star) -> dict:
+        """Map a lowercased column name to its REPLACE ``expr AS name`` node."""
+        mapping = {}
+        for alias in star.args.get("replace") or []:
+            mapping[alias.alias.lower()] = alias
+        return mapping
 
     def _targets_for_wildcard(
         self,
@@ -457,9 +722,30 @@ class StarExpansionProcessor(QueryProcessor):
         context = executor.query_context
         if not context.columns:
             return result
-        if result.num_columns != len(context.columns):
-            return result
+        if result.num_columns == len(context.columns):
+            return result.rename_columns(self._positional_visible_names(context))
+        return result.rename_columns(self._mapped_visible_names(result, context))
+
+    def _positional_visible_names(self, context) -> List[str]:
+        """Visible name per output column, in projection order (counts match)."""
         names: List[str] = []
         for mapping in context.columns:
             names.append(mapping.visible_name)
-        return result.rename_columns(names)
+        return names
+
+    def _mapped_visible_names(self, result: pa.Table, context) -> List[str]:
+        """Best-effort rename when some projections recorded no mapping.
+
+        Reached when the result has more columns than recorded mappings - a
+        non-column projection mixed with a star (``SELECT *, 1 AS x``) or a
+        ``* REPLACE (...)`` column. Each expanded star column is renamed from
+        its internal name; a column with no mapping keeps its own name, so
+        internal names are never silently shipped to the user.
+        """
+        rename = {}
+        for mapping in context.columns:
+            rename[mapping.internal_name] = mapping.visible_name
+        names: List[str] = []
+        for current in result.column_names:
+            names.append(rename.get(current, current))
+        return names

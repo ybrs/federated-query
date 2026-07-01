@@ -1,11 +1,13 @@
 """Base data source interface."""
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from typing import List, Dict, Any, Iterator, Optional
 from enum import Enum
 import pyarrow as pa
 import sqlglot
+
+from ..model import StateModel
+from ..plan.expressions import DataType
 
 
 class DataSourceCapability(Enum):
@@ -21,8 +23,7 @@ class DataSourceCapability(Enum):
     ORDER_BY = "order_by"
 
 
-@dataclass
-class ColumnMetadata:
+class ColumnMetadata(StateModel):
     """Metadata about a column."""
 
     name: str
@@ -32,8 +33,7 @@ class ColumnMetadata:
     foreign_key: Optional[str] = None  # Referenced table.column
 
 
-@dataclass
-class TableMetadata:
+class TableMetadata(StateModel):
     """Metadata about a table."""
 
     schema_name: str
@@ -43,17 +43,7 @@ class TableMetadata:
     size_bytes: Optional[int] = None
 
 
-@dataclass
-class TableStatistics:
-    """Statistics about a table."""
-
-    row_count: int
-    total_size_bytes: int
-    column_stats: Dict[str, "ColumnStatistics"]
-
-
-@dataclass
-class ColumnStatistics:
+class ColumnStatistics(StateModel):
     """Statistics about a column."""
 
     num_distinct: int
@@ -63,8 +53,28 @@ class ColumnStatistics:
     max_value: Optional[Any] = None
 
 
+class TableStatistics(StateModel):
+    """Statistics about a table."""
+
+    row_count: int
+    total_size_bytes: int
+    column_stats: Dict[str, ColumnStatistics]
+
+
 class DataSource(ABC):
     """Abstract base class for data sources."""
+
+    # sqlglot dialect a pushed query is rendered in for this source. The engine
+    # generates Postgres-flavored SQL internally; rendering it through the
+    # source's own dialect transpiles dialect-divergent syntax (function names,
+    # TABLESAMPLE, ordered-set aggregates) to what the source actually accepts.
+    # Subclasses override this; the default suits Postgres-compatible sources.
+    render_dialect = "postgres"
+
+    # Rows per Arrow record batch when streaming a query result. One default for
+    # every driver's fetch loop; a source with different memory characteristics
+    # overrides it.
+    _fetch_batch_size = 10000
 
     def __init__(self, name: str, config: Dict[str, Any]):
         """Initialize data source.
@@ -164,6 +174,108 @@ class DataSource(ABC):
             Arrow schema
         """
         pass
+
+    def _schema_probe_sql(self, query: str) -> str:
+        """Wrap a query so it returns its schema with no rows (a LIMIT 0 probe).
+
+        Every source reports a query's exact column types by running it under
+        ``LIMIT 0``; only how the empty result becomes an Arrow schema differs
+        per driver, so the wrapping SQL lives here once.
+        """
+        return f"SELECT * FROM ({query}) AS q LIMIT 0"
+
+    def _metadata_from_information_schema(self, schema, table, rows) -> TableMetadata:
+        """Build TableMetadata from information_schema (name, type, is_nullable) rows.
+
+        Shared by sources that read information_schema.columns verbatim; nullable
+        follows the SQL ``is_nullable = 'YES'`` convention.
+        """
+        columns = []
+        for name, data_type, is_nullable in rows:
+            columns.append(
+                ColumnMetadata(
+                    name=name, data_type=data_type, nullable=(is_nullable == "YES")
+                )
+            )
+        return TableMetadata(schema_name=schema, table_name=table, columns=columns)
+
+    def _build_column_statistics(
+        self, num_distinct, null_count, row_count
+    ) -> ColumnStatistics:
+        """Build ColumnStatistics, deriving the null fraction from a null count."""
+        null_fraction = null_count / row_count if row_count > 0 else 0.0
+        return ColumnStatistics(
+            num_distinct=num_distinct, null_fraction=null_fraction, avg_width=10
+        )
+
+    def _build_table_statistics(self, row_count, column_stats) -> TableStatistics:
+        """Wrap a row count and per-column stats into TableStatistics."""
+        return TableStatistics(
+            row_count=row_count,
+            total_size_bytes=row_count * 100,
+            column_stats=column_stats,
+        )
+
+    def map_native_type(self, type_str: str) -> DataType:
+        """Map this source's native column-type name to an engine DataType.
+
+        The connector is the authority on its own types, so the catalog and the
+        execution path agree on what a column is. The default handles the common
+        SQL type names; a source with extra native types (e.g. Postgres uuid)
+        overrides this and falls back here. Most specific first: TIMESTAMP /
+        DATETIME before DATE, and word-aware integer matching so POINT (which
+        contains INT) is not read as an integer.
+        """
+        normalized = type_str.upper().split("(")[0].strip()
+        temporal = self._map_temporal_type(normalized)
+        if temporal is not None:
+            return temporal
+        numeric = self._map_numeric_type(normalized)
+        if numeric is not None:
+            return numeric
+        return self._map_textual_type(normalized)
+
+    def _map_temporal_type(self, type_str: str) -> Optional[DataType]:
+        """Map date/time types, checking TIMESTAMP/DATETIME before DATE."""
+        if "TIMESTAMP" in type_str or "DATETIME" in type_str:
+            return DataType.TIMESTAMP
+        if "DATE" in type_str:
+            return DataType.DATE
+        if "TIME" in type_str:
+            return DataType.TIMESTAMP
+        return None
+
+    def _map_numeric_type(self, type_str: str) -> Optional[DataType]:
+        """Map numeric types; integer match avoids the POINT/INT trap."""
+        if "DOUBLE" in type_str or "NUMERIC" in type_str or "DECIMAL" in type_str:
+            return DataType.DOUBLE
+        if "FLOAT" in type_str or "REAL" in type_str:
+            return DataType.FLOAT
+        if "BIGINT" in type_str or "INT8" in type_str or "BIGSERIAL" in type_str:
+            return DataType.BIGINT
+        if self._is_integer_type(type_str):
+            return DataType.INTEGER
+        return None
+
+    def _is_integer_type(self, type_str: str) -> bool:
+        """Whether a type name denotes an integer (word-aware, not POINT)."""
+        return type_str.startswith("INT") or type_str in (
+            "SMALLINT",
+            "SERIAL",
+            "INTEGER",
+        )
+
+    def _map_textual_type(self, type_str: str) -> DataType:
+        """Map boolean and string types; raise on a type the engine does not model.
+
+        An unknown type is NOT silently coerced to VARCHAR: a mis-typed column is
+        a wrong answer with no error. An unmodeled type must be added explicitly.
+        """
+        if "BOOL" in type_str:
+            return DataType.BOOLEAN
+        if "CHAR" in type_str or "TEXT" in type_str or "STRING" in type_str:
+            return DataType.VARCHAR if "VAR" in type_str else DataType.TEXT
+        raise ValueError(f"Unsupported column type for catalog mapping: {type_str}")
 
     def parse_query(self, query: str):
         """Parse query text into a sqlglot AST with NATURAL joins marked."""

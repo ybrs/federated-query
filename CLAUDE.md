@@ -2,13 +2,65 @@
 
 This document provides an overview of the codebase structure, key classes, compilation instructions, and coding standards for AI-assisted development.
 
-## Coding Rules
+## TOP PRIORITY : no silent crashes
 
-No emoji, emoticons, or status glyphs anywhere — not in docs, comments, commit messages, log output, or code. Never use symbols like a green check, an hourglass, colored circles (red/yellow/green dots), a construction sign, a warning triangle, stars, or any pictographic character to convey status or decoration. Write the plain word instead: "DONE", "COMPLETE", "NOT STARTED", "PENDING", "IN PROGRESS", "PASS", "FAIL", "WARNING", "CRITICAL", "yes"/"no". Markdown task checkboxes (`- [x]` / `- [ ]`) are fine because they are plain text. The only acceptable non-ASCII characters are ones that are genuinely part of readable text or required test data (e.g. accented names, CJK/Arabic strings in a test fixture). Status must be readable as words.
+# A crash never ships a lie.
+
+Never fail silently. Never fail silently. This is the most important thing we care in this project. Do whatever the fuck you can do to stop silent fails. 
+
+The code should be readable, self explained.Most of all the code should be defensive. We appreciate crashes more than silent fails.
+
+## TOP PRIORITY : an invalid query MUST raise. Answering one is an EPIC FAIL.
+
+Returning rows for an invalid query is an EPIC FAIL. It is WORSE than a silent
+fail: a silent fail hides a problem, but answering an invalid query manufactures
+a wrong answer and presents it as correct. A crash never ships a lie; answering
+an invalid query ships a lie. There is no "the result happened to be right" -
+the query was invalid, so any result is wrong. Never describe this as
+acceptable, normal, or a minor issue. It is the most severe failure mode in the
+engine.
+
+# No ascii
+
+Use ASCII characters only. No exceptions you invent. This applies EVERYWHERE:
+assistant replies, chat messages, docs, comments, commit messages, log output,
+code, and file contents.
+
+Banned (this is not an exhaustive list, the rule is "if it is not ASCII it is
+banned"):
+- emoji and emoticons of any kind.
+- status glyphs: green check, cross mark, hourglass, colored dots
+  (red/yellow/green), warning triangle, construction sign, stars, fire, etc.
+- "smart" / typographic punctuation: em-dash, en-dash, curly quotes, the
+  ellipsis character, non-breaking space, bullet glyphs, box-drawing characters,
+  and arrow glyphs.
+
+Use the plain ASCII equivalent instead:
+- dashes: "-" or "--", never an em-dash or en-dash.
+- quotes: straight ' and ", never curly quotes.
+- ellipsis: "...", three ASCII periods.
+- arrows: "->", never an arrow glyph.
+- status: write the word. DONE, COMPLETE, NOT STARTED, PENDING, IN PROGRESS,
+  PASS, FAIL, WARNING, CRITICAL, yes/no.
+
+Markdown task checkboxes (`- [x]` / `- [ ]`) are fine; they are ASCII. The ONLY
+allowed non-ASCII is a character that is genuinely required content in a test
+fixture or real data (an accented name, a CJK/Arabic string the test actually
+asserts on). Nothing else, anywhere.
 
 Never fail silently. If something breaks it should throw an error. We don't want silent fails. You can only catch exceptions when we show it to the user in the cli. Otherwise all exceptions should be thrown. 
 
-No legacy / compatibility cruft. This is a system we are building from scratch — there is no legacy code, no old callers, no external API to stay compatible with. Never add "store for compatibility" fields, shim attributes, dead aliases, or back-compat branches. If something is no longer needed, delete it; if an abstraction doesn't fit (e.g. a base attribute that a subclass can't honor), fix the abstraction and its callers, don't paper over it. A comment like "kept for compatibility" is a red flag to remove, not preserve.
+NO DATACLASSES; state types are Pydantic models. Final, non-negotiable design decision: no Python dataclasses (`@dataclass`) anywhere. Dataclasses silently drop fields on reconstruction (a forgotten field takes its default = a wrong answer with no error). Every state-carrying type (plan nodes, expression nodes, catalog/config/state objects) derives from `federated_query.model.StateModel` (a `pydantic.BaseModel` with `arbitrary_types_allowed`; construction is keyword-only). `StateModel` is built to keep mistakes LOUD: `extra="forbid"` (an unknown/renamed construction kwarg raises, never silently dropped) and a `model_copy` override that rejects unknown `update` keys (plain Pydantic `model_copy` would set a junk attribute silently). The migration is COMPLETE; `tests/test_no_dataclasses.py` enforces it; `tests/test_state_model.py` pins the loudness. Rules:
+- Never write a `@dataclass` or import `dataclasses`. A `@dataclass` is a bug to migrate, not preserve. New state types subclass `StateModel`.
+- Fields are declared as Pydantic annotations; a field with no default is REQUIRED and Pydantic raises on omission. Construct with kwargs: `Scan(datasource=..., schema_name=..., ...)`.
+- To copy-with-change (any transformation), use `node.model_copy(update={"filters": ...})`, which copies EVERY field and overrides only what you name, so a field can never be dropped. NEVER reconstruct a node by re-listing its fields into a raw constructor.
+- Equality/copy/introspection come from Pydantic: structural `==` over all fields (this is the change-detection contract - do not hand-write field-by-field comparison), `model_copy`, `model_fields`. Hold non-Pydantic values (sqlglot, etc.) via `model_config = ConfigDict(arbitrary_types_allowed=True)` on a base.
+- Nodes keep their `children()`/`with_children()`/`accept()`/`schema()` methods; `with_children` is `self.model_copy(update={...})`.
+The test `tests/test_node_field_preservation.py` pins that `with_children` preserves every field for each node type.
+
+Mutable by default; do not reach for immutability. Use plain mutable classes. Do NOT make a type immutable - no `frozen=True`, no `__setattr__` guards, no read-only/value-object wrappers - unless there is a STRONG, concrete reason. Immutability is not a goal in itself and does not by itself guarantee correctness; never introduce it speculatively, and never change a design to be immutable without a real, stated reason. If a specific type genuinely needs to be immutable, the reason MUST be written down here as a listed exception (which type, and why). Immutability exceptions (currently none): _none_.
+
+No legacy / compatibility cruft. This is a system we are building from scratch - there is no legacy code, no old callers, no external API to stay compatible with. Never add "store for compatibility" fields, shim attributes, dead aliases, or back-compat branches. If something is no longer needed, delete it; if an abstraction doesn't fit (e.g. a base attribute that a subclass can't honor), fix the abstraction and its callers, don't paper over it. A comment like "kept for compatibility" is a red flag to remove, not preserve.
 
 Follow Python PEP8
 
@@ -109,43 +161,43 @@ This is a production-grade federated query engine that executes SQL queries acro
 
 ```
 federated-query/
-├── federated_query/          # Main package
-│   ├── catalog/              # Metadata catalog
-│   │   ├── catalog.py        # Catalog class - manages metadata across data sources
-│   │   └── schema.py         # Schema, Table, Column classes
-│   ├── config/               # Configuration management
-│   │   └── config.py         # Config classes and YAML loader
-│   ├── datasources/          # Data source connectors
-│   │   ├── base.py           # DataSource abstract base class
-│   │   ├── postgresql.py     # PostgreSQLDataSource implementation
-│   │   └── duckdb.py         # DuckDBDataSource implementation
-│   ├── executor/             # Query execution engine
-│   │   ├── executor.py       # Executor class - executes physical plans
-│   │   └── operators.py      # Physical operators (joins, aggregations, etc.)
-│   ├── optimizer/            # Query optimization
-│   │   ├── rules.py          # RuleBasedOptimizer and optimization rules
-│   │   ├── cost.py           # CostModel for query cost estimation
-│   │   ├── decorrelation.py  # Subquery decorrelation transformer
-│   │   └── statistics.py     # Statistics collection and estimation
-│   ├── parser/               # SQL parsing and binding
-│   │   ├── parser.py         # Parser class - SQL to logical plan
-│   │   └── binder.py         # Binder class - resolves references
-│   ├── plan/                 # Plan representations
-│   │   ├── logical.py        # Logical plan nodes (LogicalScan, LogicalJoin, etc.)
-│   │   ├── physical.py       # Physical plan nodes (PhysicalScan, PhysicalHashJoin, etc.)
-│   │   └── expressions.py    # Expression nodes (Column, Literal, BinaryOp, etc.)
-│   └── utils/                # Utilities
-│       └── logging.py        # Logging configuration
-├── config/                   # Configuration files
-│   └── example_config.yaml   # Example configuration
-├── tests/                    # Test suite
-│   ├── test_parser.py        # Parser tests
-│   ├── test_catalog.py       # Catalog tests
-│   ├── test_config.py        # Configuration tests
-│   └── test_datasources.py   # Data source tests
-├── scripts/                  # Utility scripts
-│   └── init_duckdb.py        # Initialize test DuckDB database
-└── docker/                   # Docker configuration for test databases
+  federated_query/          # Main package
+    catalog/                # Metadata catalog
+      catalog.py            # Catalog class - manages metadata across data sources
+      schema.py             # Schema, Table, Column classes
+    config/                 # Configuration management
+      config.py             # Config classes and YAML loader
+    datasources/            # Data source connectors
+      base.py               # DataSource abstract base class
+      postgresql.py         # PostgreSQLDataSource implementation
+      duckdb.py             # DuckDBDataSource implementation
+    executor/               # Query execution engine
+      executor.py           # Executor class - executes physical plans
+      operators.py          # Physical operators (joins, aggregations, etc.)
+    optimizer/              # Query optimization
+      rules.py              # RuleBasedOptimizer and optimization rules
+      cost.py               # CostModel for query cost estimation
+      decorrelation.py      # Subquery decorrelation transformer
+      statistics.py         # Statistics collection and estimation
+    parser/                 # SQL parsing and binding
+      parser.py             # Parser class - SQL to logical plan
+      binder.py             # Binder class - resolves references
+    plan/                   # Plan representations
+      logical.py            # Logical plan nodes (LogicalScan, LogicalJoin, etc.)
+      physical.py           # Physical plan nodes (PhysicalScan, PhysicalHashJoin, etc.)
+      expressions.py        # Expression nodes (Column, Literal, BinaryOp, etc.)
+    utils/                  # Utilities
+      logging.py            # Logging configuration
+  config/                   # Configuration files
+    example_config.yaml     # Example configuration
+  tests/                    # Test suite
+    test_parser.py          # Parser tests
+    test_catalog.py         # Catalog tests
+    test_config.py          # Configuration tests
+    test_datasources.py     # Data source tests
+  scripts/                  # Utility scripts
+    init_duckdb.py          # Initialize test DuckDB database
+  docker/                   # Docker configuration for test databases
 ```
 
 ## Key Classes and Their Locations
@@ -231,18 +283,24 @@ mypy federated_query
 
 ```
 SQL Query String
-   ↓
-Parser.parse() → sqlglot AST
-   ↓
-Parser.ast_to_logical_plan() → LogicalPlanNode
-   ↓
-Binder.bind() → Bound LogicalPlanNode (resolved references)
-   ↓
-RuleBasedOptimizer.optimize() → Optimized LogicalPlanNode
-   ↓
-PhysicalPlanner.plan() → PhysicalPlanNode (with cost estimation)
-   ↓
-Executor.execute() → Iterator[pa.RecordBatch] (Arrow format)
+   |
+   v
+Parser.parse() -> sqlglot AST
+   |
+   v
+Parser.ast_to_logical_plan() -> LogicalPlanNode
+   |
+   v
+Binder.bind() -> Bound LogicalPlanNode (resolved references)
+   |
+   v
+RuleBasedOptimizer.optimize() -> Optimized LogicalPlanNode
+   |
+   v
+PhysicalPlanner.plan() -> PhysicalPlanNode (with cost estimation)
+   |
+   v
+Executor.execute() -> Iterator[pa.RecordBatch] (Arrow format)
 ```
 
 ## Coding Standards and Rules

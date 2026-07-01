@@ -6,6 +6,7 @@ import sqlglot
 from sqlglot import exp
 
 from .dialect import FedQPostgres
+from .errors import UnsupportedSQLError
 from ..plan.logical import (
     LogicalPlanNode,
     Scan,
@@ -42,20 +43,91 @@ from ..plan.expressions import (
     Extract,
     Interval,
     CaseExpr,
+    WindowExpr,
     SubqueryExpression,
     ExistsExpression,
     InSubquery,
     QuantifiedComparison,
     Quantifier,
     TupleExpression,
+    map_children,
 )
 
 if TYPE_CHECKING:
     from ..processor.query_executor import QueryExecutor
 
 
+# Parsed JOIN side / kind -> engine JoinType. SEMI/ANTI are produced by
+# decorrelation, never parsed from SQL syntax, so they are intentionally absent:
+# an unmapped side or kind raises instead of silently becoming INNER.
+_JOIN_SIDES = {
+    "LEFT": JoinType.LEFT,
+    "RIGHT": JoinType.RIGHT,
+    "FULL": JoinType.FULL,
+}
+_JOIN_KINDS = {
+    "INNER": JoinType.INNER,
+    "CROSS": JoinType.CROSS,
+}
+
+
 class Parser:
     """SQL parser that converts SQL to logical plan."""
+
+    # SELECT clauses the converter actually consumes. Any other clause that
+    # sqlglot attaches to a Select (windows, qualify, pivots, locks, into,
+    # connect, sample, ...) is rejected so it can never be silently dropped.
+    SUPPORTED_SELECT_ARGS = frozenset(
+        {
+            "expressions",
+            "from_",
+            "where",
+            "group",
+            "having",
+            "joins",
+            "order",
+            "limit",
+            "offset",
+            "distinct",
+            "with_",
+        }
+    )
+
+    # A FROM-less SELECT (SELECT 1) has no input relation, so only a constant
+    # projection list is meaningful; with_ is consumed upstream by _convert_with.
+    # LIMIT/OFFSET/DISTINCT/WHERE/... have nothing to act on and must not be
+    # silently dropped.
+    SUPPORTED_VALUES_SELECT_ARGS = frozenset({"expressions", "with_"})
+
+    # Set-operation node args the converter actually consumes. BY NAME (by_name)
+    # and a WITH that binds the whole set operation (with_) are NOT handled, so
+    # they fail fast rather than silently dropping the clause.
+    SUPPORTED_SET_OP_ARGS = frozenset(
+        {"this", "expression", "distinct", "order", "limit", "offset"}
+    )
+
+    # Per-JOIN clause args the converter consumes (right side, side/kind keyword,
+    # ON condition, NATURAL method, USING columns).
+    SUPPORTED_JOIN_ARGS = frozenset({"this", "side", "kind", "on", "method", "using"})
+
+    # Aggregate args the converter consumes. big_int is sqlglot's COUNT-returns-
+    # bigint marker; separator is the STRING_AGG separator. Any other modifier
+    # (an inner ORDER BY / LIMIT carried as its own arg) fails fast.
+    SUPPORTED_AGG_ARGS = frozenset({"this", "distinct", "big_int", "separator"})
+
+    # CAST consumes only the value and the target type; safe (TRY_CAST) and
+    # FORMAT change semantics and are rejected.
+    SUPPORTED_CAST_ARGS = frozenset({"this", "to"})
+
+    # BETWEEN consumes the value and its two bounds; SYMMETRIC is rejected.
+    SUPPORTED_BETWEEN_ARGS = frozenset({"this", "low", "high"})
+
+    # IN consumes a value list (expressions) or a subquery (query).
+    SUPPORTED_IN_ARGS = frozenset({"this", "expressions", "query"})
+
+    # Window consumes PARTITION BY, ORDER BY and the frame spec; over is the
+    # OVER-keyword marker carried by sqlglot.
+    SUPPORTED_WINDOW_ARGS = frozenset({"this", "partition_by", "order", "spec", "over"})
 
     def __init__(self):
         """Initialize parser."""
@@ -127,6 +199,9 @@ class Parser:
         ORDER BY / LIMIT that sqlglot attaches to the set-operation node wraps
         the whole result, so it is layered on top after the branches combine.
         """
+        self._reject_unsupported_args(
+            set_op, self.SUPPORTED_SET_OP_ARGS, "set operation"
+        )
         kind = self._SET_OP_KINDS[type(set_op)]
         distinct = bool(set_op.args.get("distinct"))
         left = self._convert_set_branch(set_op.this)
@@ -173,8 +248,50 @@ class Parser:
             return self._convert_with(select, with_clause)
         return self._convert_plain_select(select)
 
+    def _reject_distinct_window(self, select: exp.Select) -> None:
+        """Reject SELECT DISTINCT over a window function (silent-drop guard).
+
+        A windowed aggregate routes through the aggregate path, which ignores
+        DISTINCT, so DISTINCT would be silently dropped and return duplicate
+        rows. Checked on the raw AST so every downstream path is covered.
+        """
+        if not select.args.get("distinct"):
+            return
+        for projection in select.expressions:
+            if projection.find(exp.Window) is not None:
+                raise UnsupportedSQLError(
+                    "SELECT DISTINCT with window functions is not supported"
+                )
+
+    def _reject_unknown_select_args(self, select: exp.Select) -> None:
+        """Fail fast on any SELECT clause the converter does not consume.
+
+        Without this the parser would silently ignore clauses such as named
+        WINDOW, pivots, locks, or sample and return a wrong answer or crash deep
+        in the engine. Clauses we now support (DISTINCT ON, GROUP BY ROLLUP/CUBE/
+        GROUPING SETS, FETCH FIRST) are handled by their own converters.
+        """
+        self._reject_unsupported_args(select, self.SUPPORTED_SELECT_ARGS, "SELECT")
+
+    def _reject_unsupported_args(self, node, supported, context: str) -> None:
+        """Fail fast on any arg of `node` outside `supported` (silent-drop guard).
+
+        Shared by every builder that consumes only a subset of an AST node's
+        clauses. `context` names the construct so a dropped clause crashes loudly
+        with a readable message instead of being ignored and returning a wrong
+        answer.
+        """
+        for name, value in node.args.items():
+            if not value:
+                continue
+            if name not in supported:
+                clause = name.upper().rstrip("_")
+                raise UnsupportedSQLError(f"{context} does not support {clause}")
+
     def _convert_plain_select(self, select: exp.Select) -> LogicalPlanNode:
         """Convert a SELECT body (without its WITH clause) to a logical plan."""
+        self._reject_unknown_select_args(select)
+        self._reject_distinct_window(select)
         if select.args.get("from_") is None:
             return self._build_values_select(select)
         plan = self._build_from_clause(select)
@@ -259,14 +376,13 @@ class Parser:
         """Build a single-row Values plan for a FROM-less SELECT.
 
         Supports constant projections such as ``SELECT 42`` or
-        ``SELECT 'completed'``; clauses that require an input relation are
-        rejected.
+        ``SELECT 'completed'``; clauses that require an input relation
+        (WHERE/GROUP/HAVING/ORDER/JOIN as well as LIMIT/OFFSET/DISTINCT) have
+        nothing to act on and are rejected so they are never silently dropped.
         """
-        for clause in ("where", "group", "having", "order", "joins"):
-            if select.args.get(clause):
-                raise ValueError(
-                    f"FROM-less SELECT does not support a {clause.upper()} clause"
-                )
+        self._reject_unsupported_args(
+            select, self.SUPPORTED_VALUES_SELECT_ARGS, "FROM-less SELECT"
+        )
         row = []
         names = []
         for select_expr in select.expressions:
@@ -315,6 +431,8 @@ class Parser:
 
         if isinstance(table_expr, exp.Subquery):
             return self._build_derived_table(table_expr)
+        if isinstance(table_expr, exp.Values):
+            return self._values_relation(table_expr)
         self._reject_unsupported_relation(table_expr)
 
         all_columns = self._collect_needed_columns(select)
@@ -335,7 +453,19 @@ class Parser:
             table_name=table_name,
             columns=all_columns,
             alias=table_alias,
+            sample=self._table_sample_sql(table_expr),
         )
+
+    def _table_sample_sql(self, table_expr: exp.Expression) -> Optional[str]:
+        """Render a table's TABLESAMPLE clause as Postgres-form SQL, or None.
+
+        The source dialect transpile at render time turns this into the form the
+        target accepts (e.g. DuckDB's ``BERNOULLI (10 PERCENT)``).
+        """
+        sample = table_expr.args.get("sample")
+        if sample is None:
+            return None
+        return sample.sql(dialect=self.dialect)
 
     def _build_join_input(
         self, table_expr: exp.Expression, column_usage: Dict[str, List[str]]
@@ -343,6 +473,8 @@ class Parser:
         """Build the plan for one input relation of a join."""
         if isinstance(table_expr, exp.Subquery):
             return self._build_derived_table(table_expr)
+        if isinstance(table_expr, exp.Values):
+            return self._values_relation(table_expr)
         self._reject_unsupported_relation(table_expr)
         table_alias = self._extract_table_alias(table_expr)
         columns = self._columns_for_join_table(column_usage, table_alias)
@@ -356,6 +488,7 @@ class Parser:
             table_name=table_parts[2],
             columns=columns,
             alias=table_alias,
+            sample=self._table_sample_sql(table_expr),
         )
 
     def _build_derived_table(self, subquery: exp.Subquery) -> SubqueryScan:
@@ -366,6 +499,68 @@ class Parser:
         inner_plan = self.ast_to_logical_plan(subquery.this)
         return SubqueryScan(input=inner_plan, alias=alias)
 
+    def _values_relation(self, values: exp.Values) -> SubqueryScan:
+        """Build a derived table from a VALUES list: ``(VALUES ...) AS v(a, b)``.
+
+        The constant rows become a Values relation; the table alias and column
+        aliases name it, so the rest of the engine treats it like any other
+        derived table.
+        """
+        alias = values.alias
+        if not alias:
+            raise ValueError("VALUES in FROM requires an alias")
+        rows = self._convert_values_rows(values)
+        names = self._values_column_names(values, rows)
+        return SubqueryScan(input=Values(rows=rows, output_names=names), alias=alias)
+
+    def _convert_values_rows(self, values: exp.Values) -> List[List[Expression]]:
+        """Convert each VALUES row (a tuple of constants) into expressions."""
+        rows = []
+        for row_expr in values.expressions:
+            row = []
+            for cell in row_expr.expressions:
+                row.append(self._convert_expression(cell))
+            if rows and len(row) != len(rows[0]):
+                raise UnsupportedSQLError(
+                    "VALUES rows must all have the same number of columns"
+                )
+            rows.append(row)
+        return rows
+
+    def _values_column_names(
+        self, values: exp.Values, rows: List[List[Expression]]
+    ) -> List[str]:
+        """Return VALUES column names from the alias, or column1..N by default."""
+        width = len(rows[0]) if rows else 0
+        names = self._values_alias_columns(values)
+        if names is not None:
+            if rows and len(names) != width:
+                raise UnsupportedSQLError(
+                    "VALUES column alias count does not match the row width"
+                )
+            return names
+        return self._default_value_columns(width)
+
+    def _values_alias_columns(self, values: exp.Values) -> Optional[List[str]]:
+        """Column names from the table alias's column list, or None if absent."""
+        alias_node = values.args.get("alias")
+        if alias_node is None:
+            return None
+        columns = alias_node.args.get("columns")
+        if not columns:
+            return None
+        names = []
+        for column in columns:
+            names.append(column.name)
+        return names
+
+    def _default_value_columns(self, width: int) -> List[str]:
+        """Default column1..columnN names when VALUES has no column aliases."""
+        names = []
+        for index in range(width):
+            names.append(f"column{index + 1}")
+        return names
+
     def _reject_unsupported_relation(self, table_expr: exp.Expression) -> None:
         """Fail fast on FROM items the engine cannot plan.
 
@@ -373,6 +568,8 @@ class Parser:
         """
         if not isinstance(table_expr, exp.Table):
             raise ValueError(f"Unsupported FROM item: {type(table_expr).__name__}")
+        if table_expr.args.get("pivots"):
+            raise UnsupportedSQLError("PIVOT/UNPIVOT is not supported")
 
     def _build_join_plan(
         self, select: exp.Select, left_table: exp.Table, joins: List[exp.Join]
@@ -394,6 +591,7 @@ class Parser:
         current_plan = left_plan
 
         for join_clause in joins:
+            self._reject_unsupported_args(join_clause, self.SUPPORTED_JOIN_ARGS, "JOIN")
             if isinstance(join_clause.this, exp.Lateral):
                 current_plan = self._build_lateral_join(current_plan, join_clause)
                 continue
@@ -528,31 +726,31 @@ class Parser:
         return ["*"]
 
     def _extract_join_type(self, join_clause: exp.Join) -> JoinType:
-        """Extract join type from JOIN clause.
+        """Map a parsed JOIN's side/kind to a JoinType, raising on anything else.
 
-        Args:
-            join_clause: sqlglot Join node
-
-        Returns:
-            JoinType enum value
+        A plain ``JOIN`` (no side, no kind) and an explicit ``INNER`` are INNER.
+        Any side or kind the engine does not model (e.g. a dialect's SEMI/ANTI)
+        raises rather than being silently downgraded to INNER.
         """
         kind = join_clause.args.get("kind")
         side = join_clause.args.get("side")
-
         if side:
-            side_upper = side.upper()
-            if side_upper == "LEFT":
-                return JoinType.LEFT
-            if side_upper == "RIGHT":
-                return JoinType.RIGHT
-            if side_upper == "FULL":
-                return JoinType.FULL
+            return self._sided_join_type(side, kind)
+        if not kind:
+            return JoinType.INNER
+        if kind.upper() in _JOIN_KINDS:
+            return _JOIN_KINDS[kind.upper()]
+        raise UnsupportedSQLError(f"Unsupported JOIN kind: {kind}")
 
-        if kind:
-            if kind.upper() == "CROSS":
-                return JoinType.CROSS
-
-        return JoinType.INNER
+    def _sided_join_type(self, side: str, kind) -> JoinType:
+        """An outer-join side (LEFT/RIGHT/FULL), optionally with an OUTER kind."""
+        if side.upper() not in _JOIN_SIDES:
+            raise UnsupportedSQLError(f"Unsupported JOIN side: {side}")
+        if kind and kind.upper() != "OUTER":
+            raise UnsupportedSQLError(
+                f"Unsupported JOIN kind '{kind}' with side '{side}'"
+            )
+        return _JOIN_SIDES[side.upper()]
 
     def _extract_table_parts(self, table_expr: exp.Table) -> Tuple[str, str, str]:
         """Extract datasource, schema, and table name.
@@ -645,8 +843,19 @@ class Parser:
         if not where:
             return input_plan
 
+        self._reject_window_in_clause(where.this, "WHERE")
         predicate = self._convert_expression(where.this)
         return Filter(input=input_plan, predicate=predicate)
+
+    def _reject_window_in_clause(self, node: exp.Expression, clause: str) -> None:
+        """Reject a window function used in WHERE / GROUP BY / HAVING.
+
+        Window functions are only legal in SELECT and ORDER BY (they evaluate
+        after WHERE/GROUP BY/HAVING). Fail fast with a clear error rather than
+        push invalid SQL to a source or mis-evaluate it on the merge path.
+        """
+        if node is not None and node.find(exp.Window) is not None:
+            raise UnsupportedSQLError(f"window functions are not allowed in {clause}")
 
     def _build_group_by_clause(
         self, select: exp.Select, input_plan: LogicalPlanNode
@@ -664,6 +873,7 @@ class Parser:
         has_aggregates = self._has_aggregate_functions(select)
 
         if group:
+            self._reject_window_in_clause(group, "GROUP BY")
             return self._create_aggregate_node(select, input_plan, group)
 
         if has_aggregates:
@@ -672,16 +882,22 @@ class Parser:
         return input_plan
 
     def _has_aggregate_functions(self, select: exp.Select) -> bool:
-        """Check if SELECT has aggregate functions.
+        """Whether the SELECT list, HAVING, or ORDER BY contains an aggregate.
 
-        Args:
-            select: sqlglot Select node
-
-        Returns:
-            True if SELECT contains aggregate functions
+        An aggregate may appear in HAVING or ORDER BY without being in the SELECT
+        list (``... HAVING COUNT(*) > 1``); missing those would skip building the
+        Aggregate node and mis-plan the aggregate over a raw scan.
         """
         for expr in select.expressions:
             if self._contains_aggregate_function(expr):
+                return True
+        return self._clause_has_aggregate(select, ("having", "order"))
+
+    def _clause_has_aggregate(self, select: exp.Select, keys) -> bool:
+        """Whether any of the named SELECT clauses carries an aggregate."""
+        for key in keys:
+            clause = select.args.get(key)
+            if clause is not None and self._contains_aggregate_function(clause):
                 return True
         return False
 
@@ -749,7 +965,8 @@ class Parser:
         Returns:
             Aggregate node
         """
-        group_by_exprs = self._extract_group_by_exprs(group)
+        grouping_sets = self._extract_grouping_sets(group)
+        group_by_exprs = self._extract_group_by_exprs(group, grouping_sets)
         aggregates = self._extract_aggregates_from_select(select)
         output_names = self._extract_output_names(select)
 
@@ -758,22 +975,130 @@ class Parser:
             group_by=group_by_exprs,
             aggregates=aggregates,
             output_names=output_names,
+            grouping_sets=grouping_sets,
         )
 
-    def _extract_group_by_exprs(self, group: exp.Group) -> List[Expression]:
-        """Extract grouping expressions.
+    def _extract_group_by_exprs(
+        self, group: exp.Group, grouping_sets: Optional[List[List[Expression]]] = None
+    ) -> List[Expression]:
+        """Extract the flat grouping expressions used for column resolution.
 
-        Args:
-            group: sqlglot Group node
-
-        Returns:
-            List of grouping expressions
+        For ROLLUP/CUBE/GROUPING SETS this is the distinct union of the keys
+        across all grouping sets; for an ordinary GROUP BY it is the key list.
         """
-        expressions = []
-        for expr in group.expressions:
-            converted = self._convert_expression(expr)
-            expressions.append(converted)
-        return expressions
+        if grouping_sets is not None:
+            return self._union_grouping_keys(grouping_sets)
+        return self._convert_group_expressions(group.expressions)
+
+    def _convert_group_expressions(
+        self, expressions: List[exp.Expression]
+    ) -> List[Expression]:
+        """Convert a list of grouping key expressions."""
+        converted = []
+        for expr in expressions:
+            converted.append(self._convert_expression(expr))
+        return converted
+
+    def _union_grouping_keys(
+        self, grouping_sets: List[List[Expression]]
+    ) -> List[Expression]:
+        """Distinct grouping keys across every grouping set, preserving order."""
+        seen = []
+        keys = []
+        for grouping_set in grouping_sets:
+            for expr in grouping_set:
+                token = expr.to_sql()
+                if token not in seen:
+                    seen.append(token)
+                    keys.append(expr)
+        return keys
+
+    def _extract_grouping_sets(
+        self, group: exp.Group
+    ) -> Optional[List[List[Expression]]]:
+        """Expand GROUP BY ROLLUP/CUBE/GROUPING SETS into explicit grouping sets.
+
+        Returns None for an ordinary single-level GROUP BY. Supports leading
+        normal keys plus exactly one ROLLUP/CUBE/GROUPING SETS construct; richer
+        combinations fail fast rather than risk a wrong expansion.
+        """
+        construct = self._single_grouping_construct(group)
+        if construct is None:
+            return None
+        normal_keys = self._convert_group_expressions(group.expressions)
+        sets = []
+        for construct_set in self._expand_grouping_construct(construct):
+            sets.append(normal_keys + construct_set)
+        return sets
+
+    def _single_grouping_construct(self, group: exp.Group):
+        """Return the one ROLLUP/CUBE/GROUPING SETS node, or None; reject mixes."""
+        if group.args.get("totals"):
+            raise UnsupportedSQLError("GROUP BY ... WITH TOTALS is not supported")
+        present = self._grouping_constructs(group)
+        if not present:
+            return None
+        if len(present) > 1:
+            raise UnsupportedSQLError(
+                "Combining multiple ROLLUP/CUBE/GROUPING SETS is not supported"
+            )
+        return present[0]
+
+    def _grouping_constructs(self, group: exp.Group) -> List[exp.Expression]:
+        """Collect the ROLLUP/CUBE/GROUPING SETS nodes attached to a GROUP BY."""
+        present = []
+        for kind in ("rollup", "cube", "grouping_sets"):
+            present.extend(group.args.get(kind) or [])
+        return present
+
+    def _expand_grouping_construct(self, construct) -> List[List[Expression]]:
+        """Expand one ROLLUP/CUBE/GROUPING SETS node into a list of grouping sets."""
+        if isinstance(construct, exp.Rollup):
+            return self._rollup_sets(
+                self._convert_group_expressions(construct.expressions)
+            )
+        if isinstance(construct, exp.Cube):
+            return self._cube_sets(
+                self._convert_group_expressions(construct.expressions)
+            )
+        return self._explicit_grouping_sets(construct)
+
+    def _rollup_sets(self, keys: List[Expression]) -> List[List[Expression]]:
+        """ROLLUP(k1..kn): the n+1 prefixes [k1..kn], ..., [k1], []."""
+        sets = []
+        for size in range(len(keys), -1, -1):
+            sets.append(list(keys[:size]))
+        return sets
+
+    def _cube_sets(self, keys: List[Expression]) -> List[List[Expression]]:
+        """CUBE(k1..kn): every subset of the keys."""
+        sets = []
+        for mask in range(2 ** len(keys)):
+            sets.append(self._subset_for_mask(keys, mask))
+        return sets
+
+    def _subset_for_mask(self, keys: List[Expression], mask: int) -> List[Expression]:
+        """Pick the keys whose bit is set in the bitmask."""
+        subset = []
+        for index, key in enumerate(keys):
+            if mask & (1 << index):
+                subset.append(key)
+        return subset
+
+    def _explicit_grouping_sets(self, grouping_sets) -> List[List[Expression]]:
+        """Convert an explicit GROUPING SETS node into lists of expressions."""
+        sets = []
+        for element in grouping_sets.expressions:
+            sets.append(self._grouping_set_columns(element))
+        return sets
+
+    def _grouping_set_columns(self, element: exp.Expression) -> List[Expression]:
+        """Return one grouping-set element's columns (handles (), (a), (a, b))."""
+        if isinstance(element, exp.Tuple):
+            return self._convert_group_expressions(element.expressions)
+        if isinstance(element, exp.Paren):
+            return [self._convert_expression(element.this)]
+        return [self._convert_expression(element)]
 
     def _extract_aggregates_from_select(self, select: exp.Select) -> List[Expression]:
         """Extract all expressions from SELECT for aggregation.
@@ -821,6 +1146,7 @@ class Parser:
         if not having:
             return input_plan
 
+        self._reject_window_in_clause(having.this, "HAVING")
         predicate = self._convert_expression(having.this)
 
         if isinstance(input_plan, Aggregate):
@@ -828,14 +1154,27 @@ class Parser:
 
         return Filter(input=input_plan, predicate=predicate)
 
+    def _is_aggregate_plan(self, plan: LogicalPlanNode) -> bool:
+        """Whether the plan is an aggregate, optionally under a HAVING filter."""
+        if isinstance(plan, Aggregate):
+            return True
+        return isinstance(plan, Filter) and isinstance(plan.input, Aggregate)
+
     def _build_select_clause(
         self, select: exp.Select, input_plan: LogicalPlanNode
     ) -> LogicalPlanNode:
-        """Build projection node from SELECT clause."""
-        if isinstance(input_plan, Aggregate):
-            return input_plan
+        """Build projection node from SELECT clause.
 
-        if isinstance(input_plan, Filter) and isinstance(input_plan.input, Aggregate):
+        The aggregate (GROUP BY) result carries its own output shape, so the
+        projection is the aggregate itself. DISTINCT has no representation on
+        that path, so it fails fast instead of being silently dropped (which
+        would let duplicate grouped rows through).
+        """
+        if self._is_aggregate_plan(input_plan):
+            if select.args.get("distinct"):
+                raise UnsupportedSQLError(
+                    "SELECT DISTINCT over GROUP BY is not supported"
+                )
             return input_plan
 
         expressions = []
@@ -855,7 +1194,20 @@ class Parser:
             expressions=expressions,
             aliases=aliases,
             distinct=has_distinct,
+            distinct_on=self._distinct_on_keys(distinct_arg),
         )
+
+    def _distinct_on_keys(self, distinct_arg) -> Optional[List[Expression]]:
+        """Convert the key expressions of a DISTINCT ON, or None for plain DISTINCT."""
+        if distinct_arg is None:
+            return None
+        on = distinct_arg.args.get("on")
+        if on is None:
+            return None
+        keys = []
+        for key_expr in on.expressions:
+            keys.append(self._convert_expression(key_expr))
+        return keys
 
     def _get_alias(self, expr: exp.Expression) -> str:
         """Get alias for expression.
@@ -931,11 +1283,37 @@ class Parser:
         if not limit_expr and offset_expr is None:
             return input_plan
 
-        limit_value = int(limit_expr.expression.this) if limit_expr else None
+        limit_value = self._limit_count(limit_expr)
         offset_value = 0
         if offset_expr is not None:
             offset_value = int(offset_expr.expression.this)
         return Limit(input=input_plan, limit=limit_value, offset=offset_value)
+
+    def _limit_count(self, limit_expr) -> Optional[int]:
+        """Return the row cap from a LIMIT or FETCH clause (None for OFFSET-only)."""
+        if limit_expr is None:
+            return None
+        if isinstance(limit_expr, exp.Fetch):
+            return self._fetch_count(limit_expr)
+        return int(limit_expr.expression.this)
+
+    def _fetch_count(self, fetch: exp.Fetch) -> int:
+        """Return the row count of FETCH FIRST n ROWS ONLY.
+
+        WITH TIES and PERCENT change the meaning of the count and are not
+        supported, so they fail fast rather than be read as a plain row cap.
+        """
+        self._reject_fetch_options(fetch.args.get("limit_options"))
+        return int(fetch.args["count"].this)
+
+    def _reject_fetch_options(self, options) -> None:
+        """Reject FETCH FIRST modifiers the engine does not implement."""
+        if options is None:
+            return
+        if options.args.get("with_ties"):
+            raise UnsupportedSQLError("FETCH FIRST ... WITH TIES is not supported")
+        if options.args.get("percent"):
+            raise UnsupportedSQLError("FETCH FIRST ... PERCENT is not supported")
 
     def _convert_expression(self, expr: exp.Expression) -> Expression:
         """Convert sqlglot expression to our Expression.
@@ -990,15 +1368,42 @@ class Parser:
             return self._convert_interval(expr)
         if isinstance(expr, exp.Filter):
             return self._convert_filter_aggregate(expr)
+        if isinstance(expr, exp.Window):
+            return self._convert_window(expr)
+        if isinstance(expr, exp.WithinGroup):
+            return self._convert_within_group(expr)
+        if isinstance(expr, exp.Grouping):
+            return self._convert_grouping(expr)
         if self._is_aggregate_function(expr):
             return self._convert_aggregate_function(expr)
+        if isinstance(expr, exp.Trim):
+            return self._convert_trim(expr)
         if isinstance(expr, (exp.Anonymous, exp.Func, exp.Upper)):
             return self._convert_function_call(expr)
 
         raise ValueError(f"Unsupported expression type: {type(expr)}")
 
+    def _convert_trim(self, trim: exp.Trim) -> FunctionCall:
+        """Convert TRIM; an explicit LEADING/TRAILING/BOTH position is unsupported.
+
+        The position keyword is a bare string slot the generic function-arg
+        collector silently skips, which would turn TRIM(LEADING 'x' FROM col)
+        into a both-sides trim. Reject it rather than drop it.
+        """
+        if trim.args.get("position"):
+            raise UnsupportedSQLError(
+                "TRIM with LEADING/TRAILING/BOTH is not supported"
+            )
+        return self._convert_function_call(trim)
+
     def _convert_in_expression(self, expr: exp.In) -> Expression:
-        """Convert IN list to expression node."""
+        """Convert IN list (or IN subquery) to expression node.
+
+        Only a value list and a subquery are handled; other forms such as
+        ``IN UNNEST(...)`` (the ``field``/``unnest`` args) are rejected rather
+        than silently treated as an empty or partial list.
+        """
+        self._reject_unsupported_args(expr, self.SUPPORTED_IN_ARGS, "IN")
         value_expr = self._convert_expression(expr.this)
         query = expr.args.get("query")
         if query is not None:
@@ -1015,7 +1420,13 @@ class Parser:
         return InList(value=value_expr, options=options)
 
     def _convert_between_expression(self, expr: exp.Between) -> Expression:
-        """Convert BETWEEN to expression node."""
+        """Convert BETWEEN to expression node.
+
+        BETWEEN SYMMETRIC (bounds in either order) carries a ``symmetric`` flag
+        with different semantics; it is rejected so it is not silently planned
+        as a plain BETWEEN.
+        """
+        self._reject_unsupported_args(expr, self.SUPPORTED_BETWEEN_ARGS, "BETWEEN")
         value_expr = self._convert_expression(expr.this)
         low_expr = self._convert_expression(expr.args["low"])
         high_expr = self._convert_expression(expr.args["high"])
@@ -1032,7 +1443,18 @@ class Parser:
         raise ValueError("IS comparison supports only NULL and NOT NULL")
 
     def _convert_case_expression(self, expr: exp.Case) -> Expression:
-        """Convert CASE expression."""
+        """Convert a searched CASE (CASE WHEN cond THEN ... END).
+
+        A simple CASE (CASE operand WHEN value ...) stores the operand under
+        ``this``; it is not supported and is rejected rather than silently
+        treating the bare value as the WHEN condition (which would match the
+        wrong branch).
+        """
+        if expr.args.get("this") is not None:
+            raise UnsupportedSQLError(
+                "simple CASE (CASE operand WHEN ...) is not supported; "
+                "use a searched CASE (CASE WHEN operand = value ...)"
+            )
         when_clauses = []
         for if_clause in expr.args.get("ifs") or []:
             condition = self._convert_expression(if_clause.this)
@@ -1066,12 +1488,7 @@ class Parser:
         guarded_args: List[Expression] = []
         for arg in aggregate.args:
             guarded_args.append(self._guard_one_arg(arg, predicate))
-        return FunctionCall(
-            function_name=aggregate.function_name,
-            args=guarded_args,
-            is_aggregate=aggregate.is_aggregate,
-            distinct=aggregate.distinct,
-        )
+        return aggregate.model_copy(update={"args": guarded_args})
 
     def _guard_one_arg(self, arg: Expression, predicate: Expression) -> CaseExpr:
         """Build ``CASE WHEN predicate THEN arg END``, using 1 for COUNT(*)."""
@@ -1190,7 +1607,13 @@ class Parser:
         return comparison
 
     def _convert_cast(self, cast: exp.Cast) -> Cast:
-        """Convert CAST(expr AS type), preserving the target type text."""
+        """Convert CAST(expr AS type), preserving the target type text.
+
+        A safe cast (TRY_CAST, ``safe`` flag) returns NULL instead of raising on
+        a bad value, and a FORMAT clause changes parsing; both are rejected so
+        the cast is not silently planned as a plain, error-raising CAST.
+        """
+        self._reject_unsupported_args(cast, self.SUPPORTED_CAST_ARGS, "CAST")
         inner = self._convert_expression(cast.this)
         target_type = cast.args["to"].sql(dialect=self.dialect)
         return Cast(expr=inner, target_type=target_type)
@@ -1342,7 +1765,8 @@ class Parser:
         Returns:
             FunctionCall expression
         """
-        func_name = type(func).__name__.upper()
+        self._reject_unsupported_args(func, self.SUPPORTED_AGG_ARGS, "aggregate")
+        func_name = self._aggregate_sql_name(func)
         distinct = bool(func.args.get("distinct"))
         if isinstance(func.this, exp.Distinct):
             distinct = True
@@ -1354,31 +1778,100 @@ class Parser:
             distinct=distinct,
         )
 
+    def _aggregate_sql_name(self, func: exp.AggFunc) -> str:
+        """Return an aggregate's real SQL name in the engine dialect.
+
+        ``type(func).__name__`` is a sqlglot class name (e.g. VariancePop),
+        which is not a valid SQL function in any source. Rendering the node in
+        the engine dialect yields the correct token (e.g. VAR_POP); the function
+        head is everything before the first argument parenthesis.
+        """
+        rendered = func.sql(dialect=self.dialect)
+        return rendered.split("(", 1)[0].strip().upper()
+
+    def _convert_grouping(self, expr: exp.Grouping) -> FunctionCall:
+        """Convert GROUPING(a, ...) into an aggregate-context FunctionCall.
+
+        GROUPING reports whether each argument was rolled up in the current
+        grouping set; it is only valid with GROUP BY, so it is marked aggregate.
+        """
+        return FunctionCall(
+            function_name="GROUPING",
+            args=self._convert_group_expressions(expr.expressions),
+            is_aggregate=True,
+        )
+
+    def _convert_within_group(self, expr: exp.WithinGroup) -> FunctionCall:
+        """Convert an ordered-set aggregate: f(args) WITHIN GROUP (ORDER BY key).
+
+        Covers PERCENTILE_CONT/PERCENTILE_DISC/MODE (and MEDIAN, which the
+        preprocessor re-renders to PERCENTILE_CONT(0.5) WITHIN GROUP).
+        """
+        aggregate = expr.this
+        key, descending = self._within_group_order(expr.expression)
+        return FunctionCall(
+            function_name=self._aggregate_sql_name(aggregate),
+            args=self._ordered_set_direct_args(aggregate),
+            is_aggregate=True,
+            within_group_key=key,
+            within_group_desc=descending,
+        )
+
+    def _ordered_set_direct_args(self, aggregate: exp.AggFunc) -> List[Expression]:
+        """Convert the direct arguments of an ordered-set aggregate.
+
+        PERCENTILE_CONT/DISC carry a fraction in ``this``; MODE carries nothing.
+        """
+        if aggregate.this is None:
+            return []
+        return [self._convert_expression(aggregate.this)]
+
+    def _within_group_order(self, order: exp.Order) -> Tuple[Expression, bool]:
+        """Return the (key, descending) of a single-column WITHIN GROUP order.
+
+        Only one ORDER BY key is supported; additional keys would be silently
+        dropped, so they fail fast instead.
+        """
+        if len(order.expressions) != 1:
+            raise UnsupportedSQLError("WITHIN GROUP supports a single ORDER BY key")
+        ordered = order.expressions[0]
+        key = self._convert_expression(ordered.this)
+        descending = bool(ordered.args.get("desc"))
+        return key, descending
+
     def _extract_function_args(
         self,
         func: exp.AggFunc,
         distinct: bool,
     ) -> List[Expression]:
-        """Extract arguments from function.
+        """Extract an aggregate's arguments, including a STRING_AGG separator.
 
-        Args:
-            func: sqlglot AggFunc node
-            distinct: True if DISTINCT modifier is present
-
-        Returns:
-            List of argument expressions
+        The separator (``STRING_AGG(x, ',')``) is a real second argument; it was
+        previously dropped, which silently changed the rendered aggregate. It is
+        appended after the primary argument so the call round-trips faithfully.
         """
-        args = []
+        args = self._extract_primary_args(func)
+        separator = func.args.get("separator")
+        if separator is not None:
+            args.append(self._convert_expression(separator))
+        return args
+
+    def _extract_primary_args(self, func: exp.AggFunc) -> List[Expression]:
+        """Convert the main argument(s): a DISTINCT list, one value, or * for COUNT."""
         value = getattr(func, "this", None)
         if isinstance(value, exp.Distinct):
-            for child in value.expressions or []:
-                converted = self._convert_expression(child)
-                args.append(converted)
-        elif value is not None:
-            arg = self._convert_expression(value)
-            args.append(arg)
-        elif isinstance(func, exp.Count):
-            args.append(ColumnRef(table=None, column="*"))
+            return self._convert_distinct_args(value)
+        if value is not None:
+            return [self._convert_expression(value)]
+        if isinstance(func, exp.Count):
+            return [ColumnRef(table=None, column="*")]
+        return []
+
+    def _convert_distinct_args(self, value: exp.Distinct) -> List[Expression]:
+        """Convert the expressions inside a DISTINCT aggregate argument."""
+        args = []
+        for child in value.expressions or []:
+            args.append(self._convert_expression(child))
         return args
 
     def _convert_function_call(self, func: exp.Expression) -> FunctionCall:
@@ -1387,6 +1880,60 @@ class Parser:
         args: List[Expression] = []
         self._collect_function_args(func, args)
         return FunctionCall(function_name=name, args=args, is_aggregate=False)
+
+    def _convert_window(self, win: exp.Window) -> WindowExpr:
+        """Convert a sqlglot Window (``func OVER (...)``) into a WindowExpr.
+
+        Only PARTITION BY, ORDER BY and the frame spec are consumed; any other
+        window clause is rejected rather than silently dropped from the frame.
+        """
+        self._reject_unsupported_args(win, self.SUPPORTED_WINDOW_ARGS, "window")
+        function = self._convert_expression(win.this)
+        partition_by = self._convert_partition_by(win)
+        order_keys, ascending, nulls = self._convert_window_order(win)
+        return WindowExpr(
+            function=function,
+            partition_by=partition_by,
+            order_keys=order_keys,
+            order_ascending=ascending,
+            order_nulls=nulls,
+            frame=self._render_window_frame(win),
+        )
+
+    def _convert_partition_by(self, win: exp.Window) -> List[Expression]:
+        """Convert a window's PARTITION BY expressions."""
+        result: List[Expression] = []
+        for part in win.args.get("partition_by") or []:
+            result.append(self._convert_expression(part))
+        return result
+
+    def _convert_window_order(self, win: exp.Window):
+        """Convert a window's ORDER BY into (keys, ascending, nulls) lists."""
+        keys: List[Expression] = []
+        ascending: List[bool] = []
+        nulls: List[Optional[str]] = []
+        order = win.args.get("order")
+        if order is None:
+            return keys, ascending, nulls
+        for ordered in order.expressions:
+            keys.append(self._convert_expression(ordered.this))
+            ascending.append(not ordered.args.get("desc", False))
+            nulls.append(self._window_nulls(ordered))
+        return keys, ascending, nulls
+
+    def _window_nulls(self, ordered: exp.Ordered) -> Optional[str]:
+        """Map an Ordered node's NULLS placement to 'FIRST'/'LAST'/None."""
+        nulls = ordered.args.get("nulls_first")
+        if nulls is None:
+            return None
+        return "FIRST" if nulls else "LAST"
+
+    def _render_window_frame(self, win: exp.Window) -> Optional[str]:
+        """Render the frame spec (``ROWS/RANGE ...``) verbatim, or None."""
+        spec = win.args.get("spec")
+        if spec is None:
+            return None
+        return spec.sql(dialect=self.dialect)
 
     def _collect_function_args(
         self, func: exp.Expression, args: List[Expression]
@@ -1406,14 +1953,28 @@ class Parser:
             self._append_function_arg(func.args.get(key), args)
 
     def _append_function_arg(self, value, args: List[Expression]) -> None:
-        """Convert one argument slot, which may be a node or a list of nodes."""
+        """Convert one argument slot (a node, a list of nodes, or an absent slot).
+
+        An absent slot (None) and a boolean modifier flag (e.g. CONCAT's ``safe``)
+        are not positional arguments and are skipped. Any other non-expression
+        slot - a string/keyword modifier such as TRIM's position - is NOT silently
+        dropped: it raises, because dropping it loses semantics the generic
+        FunctionCall cannot carry, so the function must be handled explicitly
+        (as _convert_trim does) instead.
+        """
+        if value is None or isinstance(value, bool):
+            return
         if isinstance(value, exp.Expression):
             args.append(self._convert_expression(value))
             return
         if isinstance(value, list):
             for item in value:
-                if isinstance(item, exp.Expression):
-                    args.append(self._convert_expression(item))
+                self._append_function_arg(item, args)
+            return
+        raise UnsupportedSQLError(
+            f"Unsupported function argument slot of type {type(value).__name__}: "
+            f"{value!r}"
+        )
 
     def _rewrite_having_predicate(
         self, predicate: Expression, aggregate: Aggregate
@@ -1483,21 +2044,24 @@ class Parser:
             Rewritten expression
         """
         if isinstance(expr, FunctionCall) and expr.is_aggregate:
-            expr_key = self._expr_to_key(expr)
-            if expr_key in agg_map:
-                col_name = agg_map[expr_key]
-                return ColumnRef(table=None, column=col_name, data_type=expr.get_type())
-            return expr
+            return self._rewrite_aggregate_ref(expr, agg_map)
+        return map_children(
+            expr, lambda child: self._rewrite_expression(child, agg_map)
+        )
 
-        if isinstance(expr, BinaryOp):
-            left = self._rewrite_expression(expr.left, agg_map)
-            right = self._rewrite_expression(expr.right, agg_map)
-            return BinaryOp(op=expr.op, left=left, right=right)
+    def _rewrite_aggregate_ref(
+        self, expr: FunctionCall, agg_map: Dict[str, str]
+    ) -> Expression:
+        """Replace an aggregate call with its output column reference, if mapped.
 
-        if isinstance(expr, UnaryOp):
-            operand = self._rewrite_expression(expr.operand, agg_map)
-            return UnaryOp(op=expr.op, operand=operand)
-
+        An aggregate not present in the mapping is returned unchanged (its
+        arguments reference input columns, not the aggregate's output).
+        """
+        expr_key = self._expr_to_key(expr)
+        if expr_key in agg_map:
+            return ColumnRef(
+                table=None, column=agg_map[expr_key], data_type=expr.get_type()
+            )
         return expr
 
     def parse_to_logical_plan(

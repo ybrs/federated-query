@@ -7,6 +7,7 @@ These tests define expected behavior for date/time pushdown.
 from sqlglot import exp
 
 from tests.e2e_pushdown.helpers import (
+    is_func,
     build_runtime,
     explain_datasource_query,
     find_alias_expression,
@@ -115,16 +116,13 @@ def test_age_function_interval_comparison(single_source_env):
     assert isinstance(predicate, exp.GT)
 
     left = unwrap_parens(predicate.left)
-    assert isinstance(left, exp.Anonymous) or hasattr(left, 'name')
+    assert isinstance(left, exp.Anonymous) or hasattr(left, "name")
 
 
 def test_current_date_in_select(single_source_env):
     """Validates CURRENT_DATE function pushes in SELECT projection."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id, CURRENT_DATE AS today "
-        "FROM duckdb_primary.main.orders"
-    )
+    sql = "SELECT order_id, CURRENT_DATE AS today " "FROM duckdb_primary.main.orders"
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
     assert "order_id" in projection
@@ -132,7 +130,7 @@ def test_current_date_in_select(single_source_env):
 
     today_expr = find_alias_expression(ast, "today")
     assert today_expr is not None
-    assert isinstance(today_expr, (exp.CurrentDate, exp.CurrentTimestamp))
+    assert is_func(today_expr, "CURRENT_DATE") or is_func(today_expr, "CURRENT_TIMESTAMP")
 
 
 def test_extract_in_group_by(single_source_env):

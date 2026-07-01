@@ -1,11 +1,12 @@
-"""Logical plan nodes."""
+"""Logical plan nodes (Pydantic models)."""
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 from enum import Enum
 
+from ..model import StateModel
 from .expressions import Expression
+from .field_introspection import model_expression_values
 
 
 class JoinType(Enum):
@@ -46,34 +47,78 @@ class ExplainFormat(Enum):
     JSON = "JSON"
 
 
-class LogicalPlanNode(ABC):
-    """Base class for logical plan nodes."""
+class LogicalPlanNode(StateModel):
+    """Base class for logical plan nodes (a mutable Pydantic model, see
+    :class:`~federated_query.model.StateModel`)."""
 
-    @abstractmethod
     def children(self) -> List["LogicalPlanNode"]:
         """Return child nodes."""
-        pass
+        raise NotImplementedError
 
-    @abstractmethod
+    def direct_expressions(self) -> List[Expression]:
+        """Every expression attached directly to this node (not its children).
+
+        Derived from the field type annotations (see
+        :mod:`federated_query.plan.field_introspection`), so every node type is
+        covered without a per-node list and a field whose type cannot be
+        classified raises rather than being silently skipped. Walkers that must
+        see all of a node's expressions (correlation analysis, validation) use
+        this single source of truth.
+        """
+        return model_expression_values(self)
+
     def with_children(self, children: List["LogicalPlanNode"]) -> "LogicalPlanNode":
-        """Create a new node with different children (immutable)."""
-        pass
+        """Return a copy of this node with different children."""
+        raise NotImplementedError
 
-    @abstractmethod
+    def _require_child_count(
+        self, children: List["LogicalPlanNode"], expected: int
+    ) -> None:
+        """Raise when with_children is given the wrong arity.
+
+        Uses an explicit raise rather than assert so the check is not stripped
+        under ``python -O`` (which would let an invalid rebuild pass silently).
+        """
+        if len(children) != expected:
+            raise ValueError(
+                f"{type(self).__name__}.with_children expects {expected} "
+                f"child(ren), got {len(children)}"
+            )
+
     def accept(self, visitor):
         """Accept a visitor for the visitor pattern."""
-        pass
+        raise NotImplementedError
 
-    @abstractmethod
     def schema(self) -> List[str]:
         """Return output column names."""
-        pass
+        raise NotImplementedError
 
     def __repr__(self) -> str:
         return self.__class__.__name__
 
 
-@dataclass(frozen=True)
+def transform_children(node, transform) -> "LogicalPlanNode":
+    """Rebuild a plan node from its transformed children, or return it unchanged.
+
+    The mechanical recurse-and-rebuild that every pushdown rule's pass-through
+    arms share: each child is transformed, and the node is rebuilt via
+    with_children only when a child actually changed, so an unchanged subtree
+    keeps its identity (the rules' change-detection relies on that). The per-rule
+    decision of WHICH node types to recurse into stays in the rule; this only
+    removes the hand-written rebuild boilerplate.
+    """
+    new_children = []
+    changed = False
+    for child in node.children():
+        new_child = transform(child)
+        new_children.append(new_child)
+        if new_child != child:
+            changed = True
+    if changed:
+        return node.with_children(new_children)
+    return node
+
+
 class Scan(LogicalPlanNode):
     """Scan a table from a data source.
 
@@ -90,25 +135,26 @@ class Scan(LogicalPlanNode):
     columns: List[str]  # Columns to read
     filters: Optional[Expression] = None  # Optional pushed-down filters
     alias: Optional[str] = None  # Table alias (e.g., "u" in "FROM users u")
+    # TABLESAMPLE clause as Postgres-form SQL (e.g. "TABLESAMPLE BERNOULLI (10)");
+    # transpiled to the source dialect when the scan is rendered.
+    sample: Optional[str] = None
     group_by: Optional[List[Expression]] = None  # Optional GROUP BY expressions
+    # GROUP BY ROLLUP/CUBE/GROUPING SETS folded onto the scan, as explicit sets.
+    grouping_sets: Optional[List[List[Expression]]] = None
     aggregates: Optional[List[Expression]] = None  # Optional aggregate expressions
-    output_names: Optional[List[str]] = (
-        None  # Output column names when using aggregates
-    )
+    output_names: Optional[List[str]] = None  # Output names when using aggregates
     limit: Optional[int] = None
     offset: int = 0
     order_by_keys: Optional[List[Expression]] = None  # ORDER BY expressions
     order_by_ascending: Optional[List[bool]] = None  # ASC/DESC for each key
-    order_by_nulls: Optional[List[Optional[str]]] = (
-        None  # NULLS FIRST/LAST for each key
-    )
+    order_by_nulls: Optional[List[Optional[str]]] = None  # NULLS FIRST/LAST per key
     distinct: bool = False
 
     def children(self) -> List[LogicalPlanNode]:
         return []
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Scan":
-        assert len(children) == 0
+        self._require_child_count(children, 0)
         return self
 
     def accept(self, visitor):
@@ -143,7 +189,6 @@ class Scan(LogicalPlanNode):
         )
 
 
-@dataclass(frozen=True)
 class Projection(LogicalPlanNode):
     """Projection (select) specific expressions."""
 
@@ -151,13 +196,16 @@ class Projection(LogicalPlanNode):
     expressions: List[Expression]
     aliases: List[str]  # Output column names
     distinct: bool = False
+    # DISTINCT ON (keys): keep one row per key combination (chosen by ORDER BY).
+    # None for a plain projection; an empty/non-empty list implies DISTINCT ON.
+    distinct_on: Optional[List[Expression]] = None
 
     def children(self) -> List[LogicalPlanNode]:
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Projection":
-        assert len(children) == 1
-        return Projection(children[0], self.expressions, self.aliases, self.distinct)
+        self._require_child_count(children, 1)
+        return self.model_copy(update={"input": children[0]})
 
     def accept(self, visitor):
         return visitor.visit_projection(self)
@@ -181,7 +229,6 @@ class Projection(LogicalPlanNode):
         return f"{prefix}Projection({len(self.expressions)} expressions)"
 
 
-@dataclass(frozen=True)
 class Filter(LogicalPlanNode):
     """Filter rows based on a predicate."""
 
@@ -192,8 +239,8 @@ class Filter(LogicalPlanNode):
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Filter":
-        assert len(children) == 1
-        return Filter(children[0], self.predicate)
+        self._require_child_count(children, 1)
+        return self.model_copy(update={"input": children[0]})
 
     def accept(self, visitor):
         return visitor.visit_filter(self)
@@ -205,7 +252,6 @@ class Filter(LogicalPlanNode):
         return f"Filter({self.predicate})"
 
 
-@dataclass(frozen=True)
 class Join(LogicalPlanNode):
     """Join two inputs."""
 
@@ -223,15 +269,8 @@ class Join(LogicalPlanNode):
         return [self.left, self.right]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Join":
-        assert len(children) == 2
-        return Join(
-            children[0],
-            children[1],
-            self.join_type,
-            self.condition,
-            self.natural,
-            self.using,
-        )
+        self._require_child_count(children, 2)
+        return self.model_copy(update={"left": children[0], "right": children[1]})
 
     def accept(self, visitor):
         return visitor.visit_join(self)
@@ -247,21 +286,24 @@ class Join(LogicalPlanNode):
         return f"Join({self.join_type.value}, {self.condition})"
 
 
-@dataclass(frozen=True)
 class Aggregate(LogicalPlanNode):
     """Aggregate with grouping."""
 
     input: LogicalPlanNode
-    group_by: List[Expression]  # Grouping expressions
+    group_by: List[Expression]  # Grouping expressions (union of all grouping sets)
     aggregates: List[Expression]  # Aggregate expressions
     output_names: List[str]  # Output column names
+    # GROUP BY ROLLUP/CUBE/GROUPING SETS, expanded to explicit grouping sets.
+    # Each inner list is one set's expressions ([] is the grand total). None for
+    # an ordinary single-level GROUP BY.
+    grouping_sets: Optional[List[List[Expression]]] = None
 
     def children(self) -> List[LogicalPlanNode]:
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Aggregate":
-        assert len(children) == 1
-        return Aggregate(children[0], self.group_by, self.aggregates, self.output_names)
+        self._require_child_count(children, 1)
+        return self.model_copy(update={"input": children[0]})
 
     def accept(self, visitor):
         return visitor.visit_aggregate(self)
@@ -273,21 +315,20 @@ class Aggregate(LogicalPlanNode):
         return f"Aggregate(groups={len(self.group_by)}, aggs={len(self.aggregates)})"
 
 
-@dataclass(frozen=True)
 class Sort(LogicalPlanNode):
     """Sort rows."""
 
     input: LogicalPlanNode
     sort_keys: List[Expression]
     ascending: List[bool]  # One per sort key
-    nulls_order: Optional[List[Optional[str]]] = None  # NULLS FIRST/LAST for each key
+    nulls_order: Optional[List[Optional[str]]] = None  # NULLS FIRST/LAST per key
 
     def children(self) -> List[LogicalPlanNode]:
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Sort":
-        assert len(children) == 1
-        return Sort(children[0], self.sort_keys, self.ascending, self.nulls_order)
+        self._require_child_count(children, 1)
+        return self.model_copy(update={"input": children[0]})
 
     def accept(self, visitor):
         return visitor.visit_sort(self)
@@ -299,7 +340,6 @@ class Sort(LogicalPlanNode):
         return f"Sort({len(self.sort_keys)} keys)"
 
 
-@dataclass(frozen=True)
 class Limit(LogicalPlanNode):
     """Limit number of rows.
 
@@ -315,8 +355,8 @@ class Limit(LogicalPlanNode):
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Limit":
-        assert len(children) == 1
-        return Limit(children[0], self.limit, self.offset)
+        self._require_child_count(children, 1)
+        return self.model_copy(update={"input": children[0]})
 
     def accept(self, visitor):
         return visitor.visit_limit(self)
@@ -328,7 +368,6 @@ class Limit(LogicalPlanNode):
         return f"Limit({self.limit}, offset={self.offset})"
 
 
-@dataclass(frozen=True)
 class Union(LogicalPlanNode):
     """Union of multiple inputs."""
 
@@ -339,7 +378,7 @@ class Union(LogicalPlanNode):
         return self.inputs
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Union":
-        return Union(children, self.distinct)
+        return self.model_copy(update={"inputs": children})
 
     def accept(self, visitor):
         return visitor.visit_union(self)
@@ -353,7 +392,6 @@ class Union(LogicalPlanNode):
         return f"{union_type}({len(self.inputs)} inputs)"
 
 
-@dataclass(frozen=True)
 class SetOperation(LogicalPlanNode):
     """Binary SQL set operation (UNION / INTERSECT / EXCEPT).
 
@@ -371,8 +409,8 @@ class SetOperation(LogicalPlanNode):
         return [self.left, self.right]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "SetOperation":
-        assert len(children) == 2
-        return SetOperation(children[0], children[1], self.kind, self.distinct)
+        self._require_child_count(children, 2)
+        return self.model_copy(update={"left": children[0], "right": children[1]})
 
     def accept(self, visitor):
         return visitor.visit_set_operation(self)
@@ -386,7 +424,6 @@ class SetOperation(LogicalPlanNode):
         return f"{self.kind.value}{suffix}(left, right)"
 
 
-@dataclass(frozen=True)
 class Explain(LogicalPlanNode):
     """Explain wrapper around another plan."""
 
@@ -397,8 +434,8 @@ class Explain(LogicalPlanNode):
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Explain":
-        assert len(children) == 1
-        return Explain(children[0], self.format)
+        self._require_child_count(children, 1)
+        return self.model_copy(update={"input": children[0]})
 
     def accept(self, visitor):
         return visitor.visit_explain(self)
@@ -410,7 +447,6 @@ class Explain(LogicalPlanNode):
         return f"Explain(format={self.format.value})"
 
 
-@dataclass(frozen=True)
 class CTE(LogicalPlanNode):
     """Common table expression wrapper.
 
@@ -429,14 +465,8 @@ class CTE(LogicalPlanNode):
         return [self.cte_plan, self.child]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "CTE":
-        assert len(children) == 2
-        return CTE(
-            name=self.name,
-            cte_plan=children[0],
-            child=children[1],
-            recursive=self.recursive,
-            column_names=self.column_names,
-        )
+        self._require_child_count(children, 2)
+        return self.model_copy(update={"cte_plan": children[0], "child": children[1]})
 
     def accept(self, visitor):
         return visitor.visit_cte(self)
@@ -448,7 +478,6 @@ class CTE(LogicalPlanNode):
         return f"CTE({self.name})"
 
 
-@dataclass(frozen=True)
 class CTERef(LogicalPlanNode):
     """A reference to a CTE by name, used in a FROM/JOIN position.
 
@@ -468,7 +497,7 @@ class CTERef(LogicalPlanNode):
         return []
 
     def with_children(self, children: List[LogicalPlanNode]) -> "CTERef":
-        assert len(children) == 0
+        self._require_child_count(children, 0)
         return self
 
     def accept(self, visitor):
@@ -481,7 +510,6 @@ class CTERef(LogicalPlanNode):
         return f"CTERef({self.name})"
 
 
-@dataclass(frozen=True)
 class Values(LogicalPlanNode):
     """In-memory rows built from constant expressions.
 
@@ -496,7 +524,7 @@ class Values(LogicalPlanNode):
         return []
 
     def with_children(self, children: List[LogicalPlanNode]) -> "Values":
-        assert len(children) == 0
+        self._require_child_count(children, 0)
         return self
 
     def accept(self, visitor):
@@ -509,7 +537,6 @@ class Values(LogicalPlanNode):
         return f"Values({len(self.rows)} rows)"
 
 
-@dataclass(frozen=True)
 class SubqueryScan(LogicalPlanNode):
     """A derived table: a subplan exposed under an alias.
 
@@ -524,8 +551,8 @@ class SubqueryScan(LogicalPlanNode):
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "SubqueryScan":
-        assert len(children) == 1
-        return SubqueryScan(input=children[0], alias=self.alias)
+        self._require_child_count(children, 1)
+        return self.model_copy(update={"input": children[0]})
 
     def accept(self, visitor):
         return visitor.visit_subquery_scan(self)
@@ -537,7 +564,6 @@ class SubqueryScan(LogicalPlanNode):
         return f"SubqueryScan({self.alias})"
 
 
-@dataclass(frozen=True)
 class SingleRowGuard(LogicalPlanNode):
     """Runtime cardinality guard for decorrelated scalar subqueries.
 
@@ -554,8 +580,8 @@ class SingleRowGuard(LogicalPlanNode):
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "SingleRowGuard":
-        assert len(children) == 1
-        return SingleRowGuard(input=children[0], keys=self.keys)
+        self._require_child_count(children, 1)
+        return self.model_copy(update={"input": children[0]})
 
     def accept(self, visitor):
         return visitor.visit_single_row_guard(self)
@@ -567,7 +593,6 @@ class SingleRowGuard(LogicalPlanNode):
         return f"SingleRowGuard(keys={len(self.keys)})"
 
 
-@dataclass(frozen=True)
 class GroupedLimit(LogicalPlanNode):
     """Per-key LIMIT produced by decorrelating a correlated LIMIT.
 
@@ -589,15 +614,8 @@ class GroupedLimit(LogicalPlanNode):
         return [self.input]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "GroupedLimit":
-        assert len(children) == 1
-        return GroupedLimit(
-            input=children[0],
-            keys=self.keys,
-            limit=self.limit,
-            order_by_keys=self.order_by_keys,
-            order_by_ascending=self.order_by_ascending,
-            order_by_nulls=self.order_by_nulls,
-        )
+        self._require_child_count(children, 1)
+        return self.model_copy(update={"input": children[0]})
 
     def accept(self, visitor):
         return visitor.visit_grouped_limit(self)
@@ -609,16 +627,15 @@ class GroupedLimit(LogicalPlanNode):
         return f"GroupedLimit(limit={self.limit}, keys={len(self.keys)})"
 
 
-@dataclass(frozen=True)
 class LateralJoin(LogicalPlanNode):
     """A dependent (lateral) join: the right side may reference left columns.
 
     This is the decorrelation fallback for a correlated subquery that cannot be
-    flattened into a set-based join — a non-equality correlation crossing an
+    flattened into a set-based join - a non-equality correlation crossing an
     aggregate or LIMIT, or a skip-level correlation. The right side is a
     correlated subquery subtree (with the outer references kept) that is
-    evaluated per left row; the executing engine — a pushed-to source, or the
-    in-memory DuckDB merge engine — decorrelates and runs it. ``join_type`` is
+    evaluated per left row; the executing engine - a pushed-to source, or the
+    in-memory DuckDB merge engine - decorrelates and runs it. ``join_type`` is
     LEFT so an outer row with no subquery match still survives (value NULL).
     """
 
@@ -630,8 +647,8 @@ class LateralJoin(LogicalPlanNode):
         return [self.left, self.right]
 
     def with_children(self, children: List[LogicalPlanNode]) -> "LateralJoin":
-        assert len(children) == 2
-        return LateralJoin(children[0], children[1], self.join_type)
+        self._require_child_count(children, 2)
+        return self.model_copy(update={"left": children[0], "right": children[1]})
 
     def accept(self, visitor):
         return visitor.visit_lateral_join(self)

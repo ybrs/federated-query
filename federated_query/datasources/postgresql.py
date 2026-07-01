@@ -15,10 +15,10 @@ from .base import (
     DataSource,
     DataSourceCapability,
     TableMetadata,
-    ColumnMetadata,
     TableStatistics,
     ColumnStatistics,
 )
+from ..plan.expressions import DataType
 
 logger = logging.getLogger(__name__)
 
@@ -196,19 +196,12 @@ class PostgreSQLDataSource(DataSource):
                     (schema, table),
                 )
 
-                columns = []
+                rows = []
                 for row in cursor.fetchall():
-                    columns.append(
-                        ColumnMetadata(
-                            name=row["column_name"],
-                            data_type=row["data_type"],
-                            nullable=row["is_nullable"] == "YES",
-                        )
+                    rows.append(
+                        (row["column_name"], row["data_type"], row["is_nullable"])
                     )
-
-                return TableMetadata(
-                    schema_name=schema, table_name=table, columns=columns
-                )
+                return self._metadata_from_information_schema(schema, table, rows)
         except psycopg2.Error as e:
             logger.error(f"Error getting metadata for {schema}.{table}: {e}")
             raise
@@ -259,11 +252,7 @@ class PostgreSQLDataSource(DataSource):
                         avg_width=10,  # Placeholder
                     )
 
-                return TableStatistics(
-                    row_count=row_count,
-                    total_size_bytes=row_count * 100,  # Rough estimate
-                    column_stats=column_stats,
-                )
+                return self._build_table_statistics(row_count, column_stats)
         finally:
             self._return_connection(conn)
 
@@ -291,9 +280,8 @@ class PostgreSQLDataSource(DataSource):
 
                 schema = pa.schema(self._build_arrow_fields(cursor.description))
 
-                batch_size = 10000
                 while True:
-                    rows = cursor.fetchmany(batch_size)
+                    rows = cursor.fetchmany(self._fetch_batch_size)
                     if not rows:
                         break
 
@@ -333,15 +321,14 @@ class PostgreSQLDataSource(DataSource):
             self._release_adbc(connection)
 
     def _bound_adbc_batch_size(self, cursor) -> None:
-        """Cap the streamed batch size; best-effort if the option is unsupported."""
-        import adbc_driver_manager
+        """Cap the streamed batch size via the ADBC statement option.
 
-        try:
-            cursor.adbc_statement.set_options(
-                **{"adbc.postgresql.batch_size_hint_bytes": str(_ADBC_BATCH_BYTES)}
-            )
-        except adbc_driver_manager.Error:
-            pass
+        Not wrapped in a best-effort catch: if the driver rejects this known
+        PostgreSQL option the engine must surface it, not silently run unhinted.
+        """
+        cursor.adbc_statement.set_options(
+            **{"adbc.postgresql.batch_size_hint_bytes": str(_ADBC_BATCH_BYTES)}
+        )
 
     def _adbc_record_batches(self, cursor) -> Iterator[pa.RecordBatch]:
         """Lazy ``RecordBatchReader`` for an executed cursor (no full drain)."""
@@ -356,7 +343,7 @@ class PostgreSQLDataSource(DataSource):
 
     def get_query_schema(self, query: str) -> pa.Schema:
         """Get a query's Arrow schema without materializing rows."""
-        wrapped = f"SELECT * FROM ({query}) AS q LIMIT 0"
+        wrapped = self._schema_probe_sql(query)
         if self._use_adbc:
             return self._adbc_fetch(wrapped).schema
         conn = self._get_connection()
@@ -441,8 +428,9 @@ class PostgreSQLDataSource(DataSource):
 
         Postgres ``uuid`` arrives as opaque binary and ``numeric`` as an opaque
         string; the engine wants a canonical uuid string and a float64
-        respectively (matching psycopg2). Unknown opaque types fall back to
-        their string storage.
+        respectively (matching psycopg2). Any other opaque type raises rather
+        than passing its raw storage through, which would diverge from the
+        psycopg2 path and mistype the column silently.
         """
         type_name = getattr(column_type, "type_name", "")
         storage = column.combine_chunks().storage
@@ -450,7 +438,7 @@ class PostgreSQLDataSource(DataSource):
             return self._uuid_bytes_to_string(storage)
         if type_name == "numeric":
             return pc.cast(storage, pa.float64())
-        return storage
+        raise ValueError(f"Unsupported ADBC opaque type: {type_name!r}")
 
     def _uuid_bytes_to_string(self, storage) -> pa.Array:
         """Format a binary(16) uuid column to canonical strings, vectorized.
@@ -514,7 +502,7 @@ class PostgreSQLDataSource(DataSource):
         20: pa.int64(),  # int8
         21: pa.int64(),  # int2
         23: pa.int64(),  # int4
-        700: pa.float64(),  # float4
+        700: pa.float32(),  # float4 (32-bit; matches DataType.FLOAT and ADBC)
         701: pa.float64(),  # float8
         1700: pa.float64(),  # numeric
         25: pa.string(),  # text
@@ -523,14 +511,43 @@ class PostgreSQLDataSource(DataSource):
         1082: pa.date32(),  # date
         1114: pa.timestamp("us"),  # timestamp
         1184: pa.timestamp("us", tz="UTC"),  # timestamptz
+        2950: pa.string(),  # uuid (rendered as text, matching the ADBC path)
     }
 
+    # Native Postgres type names the generic SQL mapper does not cover, mapped
+    # to the engine DataType the fetch path also yields (uuid OID 2950 above is
+    # fetched as text). Keeps catalog metadata and execution in agreement.
+    _NATIVE_TYPE_OVERRIDES = {
+        "UUID": DataType.VARCHAR,
+    }
+
+    def map_native_type(self, type_str: str) -> DataType:
+        """Map a Postgres type name, honoring types only Postgres exposes.
+
+        Without the uuid override the catalog would raise on a uuid column the
+        engine can actually query (the fetch path renders uuid as text), so the
+        two paths would disagree on the same column.
+        """
+        normalized = type_str.upper().split("(")[0].strip()
+        if normalized in self._NATIVE_TYPE_OVERRIDES:
+            return self._NATIVE_TYPE_OVERRIDES[normalized]
+        return super().map_native_type(type_str)
+
     def _build_arrow_fields(self, description) -> List[pa.Field]:
-        """Build typed Arrow fields from a cursor description."""
+        """Build typed Arrow fields from a cursor description.
+
+        An unmapped type OID raises instead of defaulting to string: a silent
+        string fallback would mistype the column (e.g. a uuid/json/time value)
+        and could diverge from the same column fetched via the ADBC path.
+        """
         fields = []
         for column in description:
-            arrow_type = self._OID_TO_ARROW.get(column[1], pa.string())
-            fields.append(pa.field(column[0], arrow_type))
+            if column[1] not in self._OID_TO_ARROW:
+                raise ValueError(
+                    f"Unsupported PostgreSQL type OID {column[1]} "
+                    f"for column {column[0]!r}"
+                )
+            fields.append(pa.field(column[0], self._OID_TO_ARROW[column[1]]))
         return fields
 
     def _build_column_arrays(self, rows: List, schema: pa.Schema) -> List[pa.Array]:

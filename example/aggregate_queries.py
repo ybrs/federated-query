@@ -3,12 +3,10 @@
 from pathlib import Path
 
 from federated_query.catalog.catalog import Catalog
+from federated_query.cli.fedq import FedQRuntime
 from federated_query.config.config import ExecutorConfig, load_config
 from federated_query.datasources.duckdb import DuckDBDataSource
 from federated_query.datasources.postgresql import PostgreSQLDataSource
-from federated_query.executor.executor import Executor
-from federated_query.optimizer.physical_planner import PhysicalPlanner
-from federated_query.parser import Binder, Parser
 
 
 def create_datasource(name, ds_config):
@@ -150,17 +148,10 @@ def execute_query(catalog, sql, description):
     print(f"{'='*80}")
     print(f"SQL:\n{sql}\n")
 
-    parser = Parser()
-    binder = Binder(catalog)
-    planner = PhysicalPlanner(catalog)
-    executor = Executor(ExecutorConfig())
+    runtime = FedQRuntime(catalog, ExecutorConfig())
 
     try:
-        logical_plan = parser.parse_to_logical_plan(sql, catalog)
-        bound_plan = binder.bind(logical_plan)
-        physical_plan = planner.plan(bound_plan)
-
-        result_table = executor.execute_to_table(physical_plan)
+        result_table = runtime.execute(sql)
 
         print(f"Results ({result_table.num_rows} rows):")
         print(result_table)

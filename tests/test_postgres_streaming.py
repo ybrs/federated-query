@@ -16,6 +16,7 @@ DuckDB. There are two ways to do it:
 tests pin that: the data path must use the streaming reader, and the first batch
 must come back without draining the entire result.
 """
+
 import os
 import time
 
@@ -49,8 +50,11 @@ def streaming_source():
     pytest.importorskip("adbc_driver_postgresql")
     config = _pg_config()
     conn = psycopg2.connect(
-        host=config["host"], port=config["port"], dbname=config["database"],
-        user=config["user"], password=config["password"],
+        host=config["host"],
+        port=config["port"],
+        dbname=config["database"],
+        user=config["user"],
+        password=config["password"],
     )
     conn.autocommit = True
     with conn.cursor() as cursor:
@@ -91,12 +95,12 @@ def test_execute_query_uses_streaming_reader_not_fetch_arrow_table(
 
     list(streaming_source.execute_query("SELECT id FROM stream_probe LIMIT 5000"))
 
-    assert calls["fetch_record_batch"] >= 1, (
-        "execute_query must stream via fetch_record_batch (lazy reader)"
-    )
-    assert calls["fetch_arrow_table"] == 0, (
-        "execute_query must NOT drain the result with fetch_arrow_table"
-    )
+    assert (
+        calls["fetch_record_batch"] >= 1
+    ), "execute_query must stream via fetch_record_batch (lazy reader)"
+    assert (
+        calls["fetch_arrow_table"] == 0
+    ), "execute_query must NOT drain the result with fetch_arrow_table"
 
 
 def test_first_batch_arrives_without_draining_everything(streaming_source):

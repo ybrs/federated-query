@@ -18,21 +18,17 @@ def test_runtime_executes_simple_select():
         },
     )
     datasource.connect()
-    datasource.connection.execute(
-        """
+    datasource.connection.execute("""
         CREATE TABLE items (
             id INTEGER,
             name VARCHAR
         )
-        """
-    )
-    datasource.connection.execute(
-        """
+        """)
+    datasource.connection.execute("""
         INSERT INTO items VALUES
         (1, 'alpha'),
         (2, 'beta')
-        """
-    )
+        """)
 
     catalog = Catalog()
     catalog.register_datasource(datasource)

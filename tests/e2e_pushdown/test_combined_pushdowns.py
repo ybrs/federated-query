@@ -3,6 +3,7 @@
 from sqlglot import exp
 
 from tests.e2e_pushdown.helpers import (
+    is_func,
     build_runtime,
     explain_document,
     find_alias_expression,
@@ -31,7 +32,7 @@ def test_projection_predicate_aggregation_join_limit(single_source_env):
     query_ast = queries[0]["query"]
     projection = select_column_names(query_ast)
     assert projection == ["region", "total_cost"]
-    aggregates = find_in_select(query_ast, lambda node: isinstance(node, exp.Sum))
+    aggregates = find_in_select(query_ast, lambda node: is_func(node, "SUM"))
     assert len(aggregates) == 1
     child = aggregates[0].this
     assert isinstance(child, exp.Column)
@@ -56,7 +57,7 @@ def test_join_with_computed_expression_group_by(single_source_env):
     query_ast = document["queries"][0]["query"]
     projection = select_column_names(query_ast)
     assert projection == ["region", "revenue"]
-    aggregates = find_in_select(query_ast, lambda node: isinstance(node, exp.Sum))
+    aggregates = find_in_select(query_ast, lambda node: is_func(node, "SUM"))
     assert len(aggregates) == 1
     expression = unwrap_parens(aggregates[0].this)
     assert isinstance(expression, exp.Mul)
@@ -79,7 +80,7 @@ def test_join_with_order_by_after_aggregation(single_source_env):
     query_ast = document["queries"][0]["query"]
     projection = select_column_names(query_ast)
     assert projection == ["region", "total_cost"]
-    aggregates = find_in_select(query_ast, lambda node: isinstance(node, exp.Sum))
+    aggregates = find_in_select(query_ast, lambda node: is_func(node, "SUM"))
     assert len(aggregates) == 1
     join_nodes = query_ast.args.get("joins") or []
     assert join_nodes, "join should remain remote"
@@ -120,5 +121,5 @@ def test_join_with_case_expression_and_limit(single_source_env):
     assert projection == ["region", "clothing_spend"]
     target = find_alias_expression(query_ast, "clothing_spend")
     assert target is not None
-    assert isinstance(target, exp.Sum)
+    assert is_func(target, "SUM")
     assert isinstance(target.this, exp.Case)

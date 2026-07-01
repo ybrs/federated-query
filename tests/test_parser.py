@@ -2,7 +2,67 @@
 
 import pytest
 from federated_query.parser import Parser
-from federated_query.plan.logical import Projection, Scan, Join, Explain, ExplainFormat
+from federated_query.plan.logical import (
+    Projection,
+    Scan,
+    Join,
+    Explain,
+    ExplainFormat,
+    Aggregate,
+    Filter,
+)
+from federated_query.plan.expressions import FunctionCall, expression_children
+
+
+def _find_nodes(plan, node_type):
+    """Collect every node of a type in a logical plan tree."""
+    found = []
+    stack = [plan]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, node_type):
+            found.append(node)
+        stack.extend(node.children())
+    return found
+
+
+def _expr_has_aggregate(expr):
+    """Whether an expression tree still contains an aggregate function call."""
+    if isinstance(expr, FunctionCall) and expr.is_aggregate:
+        return True
+    for child in expression_children(expr):
+        if _expr_has_aggregate(child):
+            return True
+    return False
+
+
+def test_having_only_aggregate_builds_aggregate_node():
+    """An aggregate that appears only in HAVING still builds an Aggregate node.
+
+    Without scanning HAVING for aggregates the plan would aggregate nothing and
+    evaluate COUNT(*) over a raw scan.
+    """
+    parser = Parser()
+    plan = parser.parse("SELECT 1 AS one FROM products HAVING COUNT(*) > 0")
+    assert _find_nodes(plan, Aggregate), "HAVING-only aggregate built no Aggregate"
+
+
+def test_having_aggregate_inside_case_is_remapped():
+    """An aggregate nested in a CASE in HAVING is remapped to its output column.
+
+    The HAVING rewrite must recurse through every compound node, not just
+    BinaryOp/UnaryOp, or the nested SUM stays an aggregate call referencing
+    pre-aggregation input that the post-aggregate schema does not expose.
+    """
+    parser = Parser()
+    plan = parser.parse(
+        "SELECT category, SUM(price) AS total FROM products GROUP BY category "
+        "HAVING CASE WHEN SUM(price) > 100 THEN 1 ELSE 0 END = 1"
+    )
+    for filter_node in _find_nodes(plan, Filter):
+        assert not _expr_has_aggregate(
+            filter_node.predicate
+        ), "aggregate inside HAVING CASE was not remapped to an output column"
 
 
 def test_parser_initialization():

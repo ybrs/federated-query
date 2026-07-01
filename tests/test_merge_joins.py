@@ -14,32 +14,37 @@ import pytest
 from federated_query.executor.merge_engine import MergeEngine
 from federated_query.plan.expressions import ColumnRef
 from federated_query.plan.logical import JoinType
-from federated_query.plan.physical import PhysicalHashJoin
+from federated_query.plan.physical import PhysicalHashJoin, PhysicalPlanNode
 
 
-class _Node:
-    """Minimal physical node replaying a fixed table."""
+class _Node(PhysicalPlanNode):
+    """Minimal physical node replaying a fixed table.
 
-    def __init__(self, table: pa.Table):
-        """Hold the table to replay."""
-        self._table = table
+    Inherits ``apply_dynamic_filter`` (declines the G9 filter) from the base.
+    """
+
+    table: pa.Table
+
+    def children(self):
+        """A leaf node has no children."""
+        return []
 
     def schema(self) -> pa.Schema:
         """Return the table schema."""
-        return self._table.schema
+        return self.table.schema
 
     def column_aliases(self):
         """No qualified-name remapping."""
         return {}
 
-    def apply_dynamic_filter(self, key_columns, value_tuples) -> bool:
-        """Fake probe declines the G9 dynamic filter."""
-        return False
-
     def execute(self):
         """Yield the table's batches."""
-        for batch in self._table.to_batches():
+        for batch in self.table.to_batches():
             yield batch
+
+    def estimated_cost(self) -> float:
+        """Free; this is a test fixture."""
+        return 0.0
 
 
 @pytest.fixture
@@ -54,7 +59,9 @@ def engine():
 def left():
     """Left input with a non-matching key (1) and a NULL key."""
     return _Node(
-        pa.table({"k": pa.array([1, 2, 3, None]), "v": pa.array(["a", "b", "c", "d"])})
+        table=pa.table(
+            {"k": pa.array([1, 2, 3, None]), "v": pa.array(["a", "b", "c", "d"])}
+        )
     )
 
 
@@ -62,7 +69,9 @@ def left():
 def right():
     """Right input with a duplicate key (3) and a NULL key."""
     return _Node(
-        pa.table({"k": pa.array([2, 3, 3, None]), "w": pa.array(["x", "y", "z", "q"])})
+        table=pa.table(
+            {"k": pa.array([2, 3, 3, None]), "w": pa.array(["x", "y", "z", "q"])}
+        )
     )
 
 

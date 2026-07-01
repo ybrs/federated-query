@@ -178,38 +178,9 @@ class TestAmbiguousReferences:
 class TestUnsupportedPatterns:
     """Test unsupported decorrelation patterns (future work)."""
 
-    def test_windowed_subquery_not_supported(self, catalog, setup_test_data):
-        """
-        Test: Window functions in subqueries (marked as future work).
-
-        Input SQL:
-            SELECT u.id,
-                   (SELECT ROW_NUMBER() OVER (ORDER BY amount)
-                    FROM orders WHERE user_id = u.id LIMIT 1) AS rank
-            FROM users u
-
-        Expected behavior:
-            - Decorrelator detects unsupported window function
-            - Raises DecorrelationError with clear message
-            - Or passes through to engine if not decorrelating windows
-
-        Expected result:
-            Error or pass-through (depending on implementation choice)
-        """
-        sql = """
-            SELECT u.id,
-                   (SELECT ROW_NUMBER() OVER (ORDER BY amount)
-                    FROM pg.orders WHERE user_id = u.id LIMIT 1) AS rank
-            FROM pg.users u
-        """
-
-        parser = Parser()
-        binder = Binder(catalog)
-        decorrelator = Decorrelator()
-        executor = Executor(catalog)
-
-        with pytest.raises(ValueError, match="Window"):
-            parser.parse(sql)
+    # NOTE: window functions inside a correlated scalar subquery are now
+    # SUPPORTED (Phase 9 section 9.4, partition-lift decorrelation). Positive +
+    # fail-fast coverage moved to test_window_subqueries.py.
 
     def test_recursive_cte_without_column_list_fails_fast(
         self, catalog, setup_test_data
@@ -710,6 +681,27 @@ class TestRegressionPrevention:
         # Verify plan structure
         assert_plan_structure(decorrelated_plan, {})
         results = execute_and_fetch_all(executor, decorrelated_plan)
+
+    def test_having_invalid_column_crashes_not_lies(self, catalog, setup_test_data):
+        """A column that exists only in HAVING must crash, never return wrong rows.
+
+        The one HAVING binder walks the predicate through the shared dispatch, so
+        an unknown aggregate-function argument now raises BindingError at bind
+        time; either way the engine fails loudly instead of shipping a wrong
+        answer. If a change ever made this query succeed, this test fails.
+        """
+        sql = (
+            "SELECT user_id, SUM(amount) AS total FROM pg.orders "
+            "GROUP BY user_id HAVING SUM(nonexistent_col) > 200"
+        )
+        parser = Parser()
+        binder = Binder(catalog)
+        decorrelator = Decorrelator()
+        executor = Executor(catalog)
+
+        with pytest.raises(Exception):
+            plan = decorrelator.decorrelate(binder.bind(parser.parse(sql)))
+            execute_and_fetch_all(executor, plan)
 
 
 class TestValidationPhase:

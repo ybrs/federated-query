@@ -4,6 +4,7 @@ E2E tests for scalar subquery decorrelation.
 Tests scalar subqueries in SELECT lists, WHERE clauses, HAVING clauses,
 and join conditions. Focuses on cardinality enforcement and NULL handling.
 """
+
 import pytest
 from federated_query.parser.parser import Parser
 from federated_query.parser.binder import Binder
@@ -14,7 +15,7 @@ from .test_utils import (
     assert_plan_structure,
     assert_result_count,
     assert_result_contains_ids,
-    execute_and_fetch_all
+    execute_and_fetch_all,
 )
 
 
@@ -252,7 +253,9 @@ class TestCorrelatedScalarInSelect:
         results = execute_and_fetch_all(executor, decorrelated_plan)
         assert len(results) >= 0, "Query should execute successfully"
 
-    def test_correlated_scalar_multiple_correlation_keys(self, catalog, setup_test_data):
+    def test_correlated_scalar_multiple_correlation_keys(
+        self, catalog, setup_test_data
+    ):
         """
         Test: Correlated scalar with multiple correlation predicates.
 
@@ -291,7 +294,9 @@ class TestCorrelatedScalarInSelect:
         results = execute_and_fetch_all(executor, decorrelated_plan)
         assert len(results) >= 0, "Query should execute successfully"
 
-    def test_correlated_scalar_with_outer_reference_in_projection(self, catalog, setup_test_data):
+    def test_correlated_scalar_with_outer_reference_in_projection(
+        self, catalog, setup_test_data
+    ):
         """
         Test: Correlated scalar that references outer column in projection.
 

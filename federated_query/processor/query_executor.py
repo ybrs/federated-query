@@ -132,9 +132,20 @@ class QueryExecutor:
     def _run_physical_plan(self, plan: PhysicalPlanNode) -> Union[pa.Table, dict]:
         """Execute the physical plan or build EXPLAIN output."""
         if isinstance(plan, PhysicalExplain):
-            if plan.format == ExplainFormat.JSON:
-                return plan.build_document(stringify_queries=False)
+            return self._run_explain(plan)
         return self.physical_executor.execute_to_table(plan, query_executor=self)
+
+    def _run_explain(self, plan: PhysicalExplain) -> Union[pa.Table, dict]:
+        """JSON explain returns a structured document; TEXT explain executes to rows.
+
+        Every ExplainFormat is handled explicitly; an unhandled one raises rather
+        than silently being executed as if it were a normal query.
+        """
+        if plan.format == ExplainFormat.JSON:
+            return plan.build_document(stringify_queries=False)
+        if plan.format == ExplainFormat.TEXT:
+            return self.physical_executor.execute_to_table(plan, query_executor=self)
+        raise ValueError(f"Unsupported EXPLAIN format: {plan.format}")
 
     def _run_after_processors(
         self, result: Union[pa.Table, dict]

@@ -155,10 +155,9 @@ class TestPredicatePushdownReal:
         for batch in results:
             data = batch.to_pydict()
             for i in range(batch.num_rows):
-                all_rows.append({
-                    "order_id": data["order_id"][i],
-                    "price": data["price"][i]
-                })
+                all_rows.append(
+                    {"order_id": data["order_id"][i], "price": data["price"][i]}
+                )
 
         # Should have orders 2-10 (all except order_id=1)
         order_ids = [r["order_id"] for r in all_rows]
@@ -182,11 +181,13 @@ class TestPredicatePushdownReal:
         for batch in results:
             data = batch.to_pydict()
             for i in range(batch.num_rows):
-                all_rows.append({
-                    "order_id": data["order_id"][i],
-                    "status": data["status"][i],
-                    "price": data["price"][i]
-                })
+                all_rows.append(
+                    {
+                        "order_id": data["order_id"][i],
+                        "status": data["status"][i],
+                        "price": data["price"][i],
+                    }
+                )
 
         # Only order_id 3 (150.0, completed) and 9 (300.0, completed) match
         assert len(all_rows) == 2, f"Expected 2 rows, got {len(all_rows)}: {all_rows}"
@@ -207,7 +208,9 @@ class TestProjectionPushdownReal:
 
         # Query should select specific columns
         assert "SELECT" in query, f"No SELECT: {query}"
-        assert '"order_id"' in query or "order_id" in query, f"order_id not selected: {query}"
+        assert (
+            '"order_id"' in query or "order_id" in query
+        ), f"order_id not selected: {query}"
         assert '"price"' in query or "price" in query, f"price not selected: {query}"
         assert "SELECT *" not in query, f"Should not SELECT *: {query}"
 
@@ -225,7 +228,9 @@ class TestProjectionPushdownReal:
         query, results = execute_and_capture(sql, catalog, ds)
 
         # Should fetch order_id (for output) and price (for filter)
-        assert '"order_id"' in query or "order_id" in query, f"order_id not in query: {query}"
+        assert (
+            '"order_id"' in query or "order_id" in query
+        ), f"order_id not in query: {query}"
         assert '"price"' in query or "price" in query, f"price not in query: {query}"
         assert "WHERE" in query, f"WHERE missing: {query}"
 
@@ -284,7 +289,9 @@ class TestAggregatePushdownReal:
         """Test GROUP BY IS pushed down to data source."""
         catalog, ds = setup_capturing_db
 
-        sql = "SELECT customer_id, COUNT(*) FROM testdb.main.orders GROUP BY customer_id"
+        sql = (
+            "SELECT customer_id, COUNT(*) FROM testdb.main.orders GROUP BY customer_id"
+        )
         query, results = execute_and_capture(sql, catalog, ds)
 
         # GROUP BY MUST be in the query
@@ -309,15 +316,10 @@ class TestAggregatePushdownReal:
                 count = data[count_col][i]
                 customer_counts[cust_id] = count
 
-        expected = {
-            100: 3,
-            101: 2,
-            102: 2,
-            103: 1,
-            104: 1,
-            105: 1
-        }
-        assert customer_counts == expected, f"Expected {expected}, got {customer_counts}"
+        expected = {100: 3, 101: 2, 102: 2, 103: 1, 104: 1, 105: 1}
+        assert (
+            customer_counts == expected
+        ), f"Expected {expected}, got {customer_counts}"
 
     def test_sum_aggregate_pushed(self, setup_capturing_db):
         """Test SUM(column) IS pushed down to data source."""
@@ -345,7 +347,9 @@ class TestCombinedPushdownReal:
         """Test WHERE + column selection."""
         catalog, ds = setup_capturing_db
 
-        sql = "SELECT order_id, price FROM testdb.main.orders WHERE status = 'completed'"
+        sql = (
+            "SELECT order_id, price FROM testdb.main.orders WHERE status = 'completed'"
+        )
         query, results = execute_and_capture(sql, catalog, ds)
 
         # Filter should push
@@ -353,7 +357,9 @@ class TestCombinedPushdownReal:
         assert "status" in query, f"status not in WHERE: {query}"
 
         # Projection should include needed columns
-        assert '"order_id"' in query or "order_id" in query, f"order_id not selected: {query}"
+        assert (
+            '"order_id"' in query or "order_id" in query
+        ), f"order_id not selected: {query}"
         assert '"price"' in query or "price" in query, f"price not selected: {query}"
 
         # Verify results
@@ -361,10 +367,9 @@ class TestCombinedPushdownReal:
         for batch in results:
             data = batch.to_pydict()
             for i in range(batch.num_rows):
-                all_rows.append({
-                    "order_id": data["order_id"][i],
-                    "price": data["price"][i]
-                })
+                all_rows.append(
+                    {"order_id": data["order_id"][i], "price": data["price"][i]}
+                )
 
         # Completed orders: 1, 3, 4, 6, 8, 9, 10
         expected_ids = {1, 3, 4, 6, 8, 9, 10}
@@ -397,7 +402,9 @@ class TestBuggyAggregates:
         # Each order_id appears exactly once, so each group should have COUNT=1
         # NOT the order_id value itself!
         for count in count_values:
-            assert count == 1, f"Each group should have count=1, got {count}. Values: {count_values}"
+            assert (
+                count == 1
+            ), f"Each group should have count=1, got {count}. Values: {count_values}"
 
         # Should have 9 groups (order_id 2-10)
         assert len(count_values) == 9, f"Expected 9 groups, got {len(count_values)}"
@@ -436,7 +443,7 @@ class TestBuggyAggregates:
             102: 200.0,
             103: 200.0,
             104: 150.0,
-            105: 300.0
+            105: 300.0,
         }
 
         assert customer_sums == expected, f"Expected {expected}, got {customer_sums}"
@@ -460,13 +467,17 @@ class TestBuggyAggregates:
         assert "COUNT" in query.upper(), f"COUNT was NOT pushed down! Query: {query}"
 
         # CRITICAL: GROUP BY must be in the query sent to data source
-        assert "GROUP BY" in query.upper(), f"GROUP BY was NOT pushed down! Query: {query}"
+        assert (
+            "GROUP BY" in query.upper()
+        ), f"GROUP BY was NOT pushed down! Query: {query}"
 
         # Verify WHERE is also pushed
         assert "WHERE" in query.upper(), f"WHERE was NOT pushed down! Query: {query}"
         assert "order_id" in query, f"order_id not in query: {query}"
 
-        print(f"SUCCESS: Query correctly pushed COUNT, GROUP BY, and WHERE to data source")
+        print(
+            f"SUCCESS: Query correctly pushed COUNT, GROUP BY, and WHERE to data source"
+        )
 
     def test_exact_user_query_WITHOUT_aggregate_pushdown_rule(self, setup_capturing_db):
         """Test what happens WITHOUT AggregatePushdownRule.
@@ -508,8 +519,12 @@ class TestBuggyAggregates:
         print(f"\nDEBUG: SQL WITHOUT AggregatePushdownRule: {query}")
 
         # Verify the broken behavior: COUNT and GROUP BY are NOT pushed
-        assert "COUNT" not in query.upper(), f"COUNT should NOT be pushed without rule! Query: {query}"
-        assert "GROUP BY" not in query.upper(), f"GROUP BY should NOT be pushed without rule! Query: {query}"
+        assert (
+            "COUNT" not in query.upper()
+        ), f"COUNT should NOT be pushed without rule! Query: {query}"
+        assert (
+            "GROUP BY" not in query.upper()
+        ), f"GROUP BY should NOT be pushed without rule! Query: {query}"
 
         # Only WHERE should be pushed
         assert "WHERE" in query.upper(), f"WHERE should still be pushed: {query}"
@@ -528,7 +543,9 @@ class TestJoinPushdownReal:
         """
         query, results = execute_and_capture(sql, catalog, ds)
         assert len(ds.captured_queries) == 1, "Join should run as single query"
-        assert "INNER JOIN" in query.upper(), f"Expected INNER JOIN in pushed SQL: {query}"
+        assert (
+            "INNER JOIN" in query.upper()
+        ), f"Expected INNER JOIN in pushed SQL: {query}"
         rows = []
         for batch in results:
             data = batch.to_pydict()
@@ -537,7 +554,9 @@ class TestJoinPushdownReal:
                 rows.append(row)
         assert len(rows) == 8, f"Expected 8 joined rows, got {len(rows)}"
         for customer_id, _ in rows:
-            assert customer_id != 104, "Unmatched customers should not appear in INNER JOIN results"
+            assert (
+                customer_id != 104
+            ), "Unmatched customers should not appear in INNER JOIN results"
 
     def test_left_join_pushdown_preserves_unmatched_rows(self, setup_capturing_db):
         """LEFT JOIN should be pushed down and keep unmatched customers."""
@@ -554,16 +573,20 @@ class TestJoinPushdownReal:
         for batch in results:
             data = batch.to_pydict()
             for idx in range(batch.num_rows):
-                left_rows.append({
-                    "customer_id": data["customer_id"][idx],
-                    "order_id": data["order_id"][idx],
-                })
+                left_rows.append(
+                    {
+                        "customer_id": data["customer_id"][idx],
+                        "order_id": data["order_id"][idx],
+                    }
+                )
         has_unmatched = False
         for row in left_rows:
             if row["customer_id"] == 106 and row["order_id"] is None:
                 has_unmatched = True
         assert has_unmatched, "Expected unmatched customer 106 with NULL orders"
-        assert len(left_rows) == 9, f"Expected 9 rows (including unmatched), got {len(left_rows)}"
+        assert (
+            len(left_rows) == 9
+        ), f"Expected 9 rows (including unmatched), got {len(left_rows)}"
 
     def test_right_join_pushdown_preserves_unmatched_rows(self, setup_capturing_db):
         """RIGHT JOIN should be pushed down and keep unmatched orders."""
@@ -580,15 +603,19 @@ class TestJoinPushdownReal:
         for batch in results:
             data = batch.to_pydict()
             for idx in range(batch.num_rows):
-                rows.append({
-                    "customer_id": data["customer_id"][idx],
-                    "name": data["name"][idx],
-                })
+                rows.append(
+                    {
+                        "customer_id": data["customer_id"][idx],
+                        "name": data["name"][idx],
+                    }
+                )
         saw_unmatched = False
         for row in rows:
             if row["customer_id"] in (104, 105) and row["name"] is None:
                 saw_unmatched = True
-        assert saw_unmatched, "Expected unmatched orders 104/105 with NULL customer names"
+        assert (
+            saw_unmatched
+        ), "Expected unmatched orders 104/105 with NULL customer names"
         assert len(rows) == 10, f"Expected 10 rows (all orders), got {len(rows)}"
 
     def test_full_join_pushed_down(self, setup_capturing_db):

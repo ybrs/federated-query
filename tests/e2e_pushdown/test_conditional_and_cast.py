@@ -3,13 +3,13 @@
 from sqlglot import exp
 
 from tests.e2e_pushdown.helpers import (
+    is_func,
     build_runtime,
     explain_datasource_query,
     find_alias_expression,
     select_column_names,
     unwrap_parens,
 )
-
 
 # Conditional Expressions
 
@@ -98,7 +98,7 @@ def test_coalesce_in_where(single_source_env):
     assert isinstance(predicate, exp.EQ)
 
     left = unwrap_parens(predicate.left)
-    assert isinstance(left, exp.Coalesce)
+    assert is_func(left, "COALESCE")
     # sqlglot keeps the first COALESCE argument in `this` and the remaining
     # arguments in `expressions`, so a two-argument COALESCE has exactly one
     # trailing expression.
@@ -161,10 +161,7 @@ def test_cast_in_where_clause(single_source_env):
 def test_postgres_cast_syntax(single_source_env):
     """Validates PostgreSQL :: cast syntax pushes correctly."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE price::INTEGER > 50"
-    )
+    sql = "SELECT order_id FROM duckdb_primary.main.orders " "WHERE price::INTEGER > 50"
     ast = explain_datasource_query(runtime, sql)
     where_clause = ast.args.get("where")
     assert where_clause is not None

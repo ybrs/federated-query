@@ -176,8 +176,8 @@ class TestBug1PyArrowColumnAccess:
     def test_hash_join_key_extraction(self, setup_two_datasources):
         """Test that PhysicalHashJoin can extract join keys by column name.
 
-        Bug: batch.column(key.column) in PhysicalHashJoin._extract_key_values
-        calls with string name instead of integer index.
+        Bug: batch.column(key.column) in the build-key extractor
+        (_key_column_arrays) calls with string name instead of integer index.
         """
         catalog, ds_customers, ds_orders = setup_two_datasources
 
@@ -202,10 +202,9 @@ class TestBug1PyArrowColumnAccess:
         for batch in results:
             result_dict = batch.to_pydict()
             for i in range(batch.num_rows):
-                rows.append({
-                    "name": result_dict["name"][i],
-                    "amount": result_dict["amount"][i]
-                })
+                rows.append(
+                    {"name": result_dict["name"][i], "amount": result_dict["amount"][i]}
+                )
 
         assert len(rows) == 4
 
@@ -274,10 +273,9 @@ class TestBug1PyArrowColumnAccess:
         for batch in results:
             result_dict = batch.to_pydict()
             for i in range(batch.num_rows):
-                rows.append({
-                    "name": result_dict["name"][i],
-                    "amount": result_dict["amount"][i]
-                })
+                rows.append(
+                    {"name": result_dict["name"][i], "amount": result_dict["amount"][i]}
+                )
 
         assert len(rows) == 2
         amounts = sorted([r["amount"] for r in rows])
@@ -313,14 +311,18 @@ class TestBug2StarProjectionDropsExpressions:
         first_batch = batches[0]
 
         schema_names = first_batch.schema.names
-        assert "id_copy" in schema_names, \
-            f"Expected 'id_copy' column but got schema: {schema_names}"
+        assert (
+            "id_copy" in schema_names
+        ), f"Expected 'id_copy' column but got schema: {schema_names}"
 
-        assert first_batch.num_columns == 5, \
-            f"Expected 5 columns (4 original + id_copy) but got {first_batch.num_columns}"
+        assert (
+            first_batch.num_columns == 5
+        ), f"Expected 5 columns (4 original + id_copy) but got {first_batch.num_columns}"
 
         pydict = first_batch.to_pydict()
-        assert pydict["id"] == pydict["id_copy"], "id and id_copy should have same values"
+        assert (
+            pydict["id"] == pydict["id_copy"]
+        ), "id and id_copy should have same values"
 
     def test_star_with_multiple_additional_columns(self, setup_single_datasource):
         """Test SELECT *, id AS id_copy, name AS name_copy.
@@ -384,8 +386,9 @@ class TestBug2StarProjectionDropsExpressions:
         first_batch = batches[0]
 
         schema_names = first_batch.schema.names
-        assert "product_name" in schema_names, \
-            f"Expected 'product_name' column but got schema: {schema_names}"
+        assert (
+            "product_name" in schema_names
+        ), f"Expected 'product_name' column but got schema: {schema_names}"
 
         assert first_batch.num_columns == 5
         pydict = first_batch.to_pydict()
@@ -424,19 +427,33 @@ class TestBug3LeftFullJoinNotImplemented:
         for batch in results:
             result_dict = batch.to_pydict()
             for i in range(batch.num_rows):
-                rows.append({
-                    "customer_id": result_dict["id"][i],
-                    "name": result_dict["name"][i],
-                    "order_id": result_dict["order_id"][i] if "order_id" in result_dict else None,
-                    "amount": result_dict["amount"][i] if "amount" in result_dict else None
-                })
+                rows.append(
+                    {
+                        "customer_id": result_dict["id"][i],
+                        "name": result_dict["name"][i],
+                        "order_id": (
+                            result_dict["order_id"][i]
+                            if "order_id" in result_dict
+                            else None
+                        ),
+                        "amount": (
+                            result_dict["amount"][i]
+                            if "amount" in result_dict
+                            else None
+                        ),
+                    }
+                )
 
         assert len(rows) >= 4, "Should have at least 4 customers"
 
         charlie_rows = [r for r in rows if r["name"] == "Charlie"]
         assert len(charlie_rows) == 1, "Charlie should appear once"
-        assert charlie_rows[0]["order_id"] is None, "Charlie has no orders, should be NULL"
-        assert charlie_rows[0]["amount"] is None, "Charlie has no orders, should be NULL"
+        assert (
+            charlie_rows[0]["order_id"] is None
+        ), "Charlie has no orders, should be NULL"
+        assert (
+            charlie_rows[0]["amount"] is None
+        ), "Charlie has no orders, should be NULL"
 
         diana_rows = [r for r in rows if r["name"] == "Diana"]
         assert len(diana_rows) == 1, "Diana should appear once"
@@ -471,10 +488,16 @@ class TestBug3LeftFullJoinNotImplemented:
         for batch in results:
             result_dict = batch.to_pydict()
             for i in range(batch.num_rows):
-                rows.append({
-                    "name": result_dict["name"][i],
-                    "amount": result_dict["amount"][i] if "amount" in result_dict else None
-                })
+                rows.append(
+                    {
+                        "name": result_dict["name"][i],
+                        "amount": (
+                            result_dict["amount"][i]
+                            if "amount" in result_dict
+                            else None
+                        ),
+                    }
+                )
 
         assert len(rows) == 1
         assert rows[0]["name"] == "Charlie"
@@ -508,10 +531,16 @@ class TestBug3LeftFullJoinNotImplemented:
         for batch in results:
             result_dict = batch.to_pydict()
             for i in range(batch.num_rows):
-                rows.append({
-                    "name": result_dict["name"][i],
-                    "amount": result_dict["amount"][i] if "amount" in result_dict else None
-                })
+                rows.append(
+                    {
+                        "name": result_dict["name"][i],
+                        "amount": (
+                            result_dict["amount"][i]
+                            if "amount" in result_dict
+                            else None
+                        ),
+                    }
+                )
 
         assert len(rows) == 4
 
@@ -559,18 +588,27 @@ class TestBug4FullJoinMissingRightRows:
         for batch in results:
             result_dict = batch.to_pydict()
             for i in range(batch.num_rows):
-                rows.append({
-                    "cust_id": result_dict.get("cust_id", [None] * batch.num_rows)[i],
-                    "name": result_dict.get("name", [None] * batch.num_rows)[i],
-                    "order_id": result_dict.get("order_id", [None] * batch.num_rows)[i],
-                    "amount": result_dict.get("amount", [None] * batch.num_rows)[i]
-                })
+                rows.append(
+                    {
+                        "cust_id": result_dict.get("cust_id", [None] * batch.num_rows)[
+                            i
+                        ],
+                        "name": result_dict.get("name", [None] * batch.num_rows)[i],
+                        "order_id": result_dict.get(
+                            "order_id", [None] * batch.num_rows
+                        )[i],
+                        "amount": result_dict.get("amount", [None] * batch.num_rows)[i],
+                    }
+                )
 
-        assert len(rows) == 6, f"Expected 6 rows (4 matched + 2 unmatched customers), got {len(rows)}"
+        assert (
+            len(rows) == 6
+        ), f"Expected 6 rows (4 matched + 2 unmatched customers), got {len(rows)}"
 
         unmatched_customers = [r for r in rows if r["order_id"] is None]
-        assert len(unmatched_customers) == 2, \
-            f"Expected 2 customers with no orders, got {len(unmatched_customers)}"
+        assert (
+            len(unmatched_customers) == 2
+        ), f"Expected 2 customers with no orders, got {len(unmatched_customers)}"
 
         customer_names = {r["name"] for r in unmatched_customers}
         assert "Charlie" in customer_names
@@ -658,18 +696,27 @@ class TestBug4FullJoinMissingRightRows:
         for batch in results:
             result_dict = batch.to_pydict()
             for i in range(batch.num_rows):
-                rows.append({
-                    "cust_id": result_dict.get("cust_id", [None] * batch.num_rows)[i],
-                    "name": result_dict.get("name", [None] * batch.num_rows)[i],
-                    "order_id": result_dict.get("order_id", [None] * batch.num_rows)[i],
-                    "order_cust_id": result_dict.get("order_cust_id", [None] * batch.num_rows)[i]
-                })
+                rows.append(
+                    {
+                        "cust_id": result_dict.get("cust_id", [None] * batch.num_rows)[
+                            i
+                        ],
+                        "name": result_dict.get("name", [None] * batch.num_rows)[i],
+                        "order_id": result_dict.get(
+                            "order_id", [None] * batch.num_rows
+                        )[i],
+                        "order_cust_id": result_dict.get(
+                            "order_cust_id", [None] * batch.num_rows
+                        )[i],
+                    }
+                )
 
         ds_customers.disconnect()
         ds_orders.disconnect()
 
-        assert len(rows) == 4, \
-            f"Expected 4 rows (1 unmatched left, 2 matched, 1 unmatched right), got {len(rows)}"
+        assert (
+            len(rows) == 4
+        ), f"Expected 4 rows (1 unmatched left, 2 matched, 1 unmatched right), got {len(rows)}"
 
         alice_row = [r for r in rows if r.get("name") == "Alice"]
         assert len(alice_row) == 1, "Alice (customer 1) should appear once"
@@ -684,12 +731,20 @@ class TestBug4FullJoinMissingRightRows:
         assert charlie_row[0]["order_id"] == 102
 
         orphan_order = [r for r in rows if r["order_id"] == 103]
-        assert len(orphan_order) == 1, "Order 103 (for non-existent customer 4) should appear"
-        assert orphan_order[0]["cust_id"] is None, "Orphan order should have NULL customer id"
-        assert orphan_order[0]["name"] is None, "Orphan order should have NULL customer name"
+        assert (
+            len(orphan_order) == 1
+        ), "Order 103 (for non-existent customer 4) should appear"
+        assert (
+            orphan_order[0]["cust_id"] is None
+        ), "Orphan order should have NULL customer id"
+        assert (
+            orphan_order[0]["name"] is None
+        ), "Orphan order should have NULL customer name"
         assert orphan_order[0]["order_cust_id"] == 4
 
-    def test_nested_loop_full_join_with_unmatched_right_rows(self, setup_two_datasources):
+    def test_nested_loop_full_join_with_unmatched_right_rows(
+        self, setup_two_datasources
+    ):
         """Test nested loop FULL OUTER JOIN with unmatched right rows.
 
         Bug: PhysicalNestedLoopJoin only emits unmatched left rows but never
@@ -718,23 +773,34 @@ class TestBug4FullJoinMissingRightRows:
         for batch in results:
             result_dict = batch.to_pydict()
             for i in range(batch.num_rows):
-                rows.append({
-                    "name": result_dict.get("name", [None] * batch.num_rows)[i],
-                    "order_id": result_dict.get("order_id", [None] * batch.num_rows)[i]
-                })
+                rows.append(
+                    {
+                        "name": result_dict.get("name", [None] * batch.num_rows)[i],
+                        "order_id": result_dict.get(
+                            "order_id", [None] * batch.num_rows
+                        )[i],
+                    }
+                )
 
         assert len(rows) >= 4, f"Should have at least 4 customers, got {len(rows)}"
 
-        unmatched_customers = [r for r in rows if r["order_id"] is None and r["name"] is not None]
-        assert len(unmatched_customers) >= 2, "Should have unmatched customers (Charlie, Diana, maybe others)"
+        unmatched_customers = [
+            r for r in rows if r["order_id"] is None and r["name"] is not None
+        ]
+        assert (
+            len(unmatched_customers) >= 2
+        ), "Should have unmatched customers (Charlie, Diana, maybe others)"
 
         customer_names = {r["name"] for r in unmatched_customers}
         assert "Charlie" in customer_names
         assert "Diana" in customer_names
 
-        unmatched_orders = [r for r in rows if r["name"] is None and r["order_id"] is not None]
-        assert len(unmatched_orders) > 0, \
-            "Should have unmatched orders (those that don't meet amount > 75 or other criteria)"
+        unmatched_orders = [
+            r for r in rows if r["name"] is None and r["order_id"] is not None
+        ]
+        assert (
+            len(unmatched_orders) > 0
+        ), "Should have unmatched orders (those that don't meet amount > 75 or other criteria)"
 
 
 class TestBug5RightJoinMissingUnmatchedRows:
@@ -773,16 +839,25 @@ class TestBug5RightJoinMissingUnmatchedRows:
         for batch in results:
             result_dict = batch.to_pydict()
             for i in range(batch.num_rows):
-                rows.append({
-                    "name": result_dict.get("name", [None] * batch.num_rows)[i],
-                    "order_id": result_dict.get("order_id", [None] * batch.num_rows)[i],
-                    "amount": result_dict.get("amount", [None] * batch.num_rows)[i]
-                })
+                rows.append(
+                    {
+                        "name": result_dict.get("name", [None] * batch.num_rows)[i],
+                        "order_id": result_dict.get(
+                            "order_id", [None] * batch.num_rows
+                        )[i],
+                        "amount": result_dict.get("amount", [None] * batch.num_rows)[i],
+                    }
+                )
 
         assert len(rows) == 4, f"Expected 4 orders (all orders), got {len(rows)}"
 
         order_ids = sorted([r["order_id"] for r in rows])
-        assert order_ids == [101, 102, 103, 104], f"Should have all 4 orders, got {order_ids}"
+        assert order_ids == [
+            101,
+            102,
+            103,
+            104,
+        ], f"Should have all 4 orders, got {order_ids}"
 
         matched_rows = [r for r in rows if r["name"] is not None]
         assert len(matched_rows) == 4, "All orders belong to existing customers"
@@ -866,18 +941,27 @@ class TestBug5RightJoinMissingUnmatchedRows:
         for batch in results:
             result_dict = batch.to_pydict()
             for i in range(batch.num_rows):
-                rows.append({
-                    "cust_id": result_dict.get("cust_id", [None] * batch.num_rows)[i],
-                    "name": result_dict.get("name", [None] * batch.num_rows)[i],
-                    "order_id": result_dict.get("order_id", [None] * batch.num_rows)[i],
-                    "order_cust_id": result_dict.get("order_cust_id", [None] * batch.num_rows)[i]
-                })
+                rows.append(
+                    {
+                        "cust_id": result_dict.get("cust_id", [None] * batch.num_rows)[
+                            i
+                        ],
+                        "name": result_dict.get("name", [None] * batch.num_rows)[i],
+                        "order_id": result_dict.get(
+                            "order_id", [None] * batch.num_rows
+                        )[i],
+                        "order_cust_id": result_dict.get(
+                            "order_cust_id", [None] * batch.num_rows
+                        )[i],
+                    }
+                )
 
         ds_customers.disconnect()
         ds_orders.disconnect()
 
-        assert len(rows) == 3, \
-            f"Expected 3 rows (all orders: 2 matched, 1 unmatched right), got {len(rows)}"
+        assert (
+            len(rows) == 3
+        ), f"Expected 3 rows (all orders: 2 matched, 1 unmatched right), got {len(rows)}"
 
         bob_row = [r for r in rows if r.get("name") == "Bob"]
         assert len(bob_row) == 1, "Bob should appear once"
@@ -888,15 +972,25 @@ class TestBug5RightJoinMissingUnmatchedRows:
         assert charlie_row[0]["order_id"] == 102
 
         orphan_order = [r for r in rows if r["order_id"] == 103]
-        assert len(orphan_order) == 1, "Order 103 (for non-existent customer 4) should appear"
-        assert orphan_order[0]["cust_id"] is None, "Orphan order should have NULL customer id"
-        assert orphan_order[0]["name"] is None, "Orphan order should have NULL customer name"
+        assert (
+            len(orphan_order) == 1
+        ), "Order 103 (for non-existent customer 4) should appear"
+        assert (
+            orphan_order[0]["cust_id"] is None
+        ), "Orphan order should have NULL customer id"
+        assert (
+            orphan_order[0]["name"] is None
+        ), "Orphan order should have NULL customer name"
         assert orphan_order[0]["order_cust_id"] == 4
 
         alice_rows = [r for r in rows if r.get("name") == "Alice"]
-        assert len(alice_rows) == 0, "Alice (customer 1) has no orders, should not appear in RIGHT JOIN"
+        assert (
+            len(alice_rows) == 0
+        ), "Alice (customer 1) has no orders, should not appear in RIGHT JOIN"
 
-    def test_nested_loop_right_join_with_unmatched_right_rows(self, setup_two_datasources):
+    def test_nested_loop_right_join_with_unmatched_right_rows(
+        self, setup_two_datasources
+    ):
         """Test nested loop RIGHT OUTER JOIN with unmatched right rows.
 
         Bug: PhysicalNestedLoopJoin only handles LEFT and FULL joins but not RIGHT joins.
@@ -924,11 +1018,15 @@ class TestBug5RightJoinMissingUnmatchedRows:
         for batch in results:
             result_dict = batch.to_pydict()
             for i in range(batch.num_rows):
-                rows.append({
-                    "name": result_dict.get("name", [None] * batch.num_rows)[i],
-                    "order_id": result_dict.get("order_id", [None] * batch.num_rows)[i],
-                    "amount": result_dict.get("amount", [None] * batch.num_rows)[i]
-                })
+                rows.append(
+                    {
+                        "name": result_dict.get("name", [None] * batch.num_rows)[i],
+                        "order_id": result_dict.get(
+                            "order_id", [None] * batch.num_rows
+                        )[i],
+                        "amount": result_dict.get("amount", [None] * batch.num_rows)[i],
+                    }
+                )
 
         assert len(rows) == 4, f"Should have all 4 orders, got {len(rows)}"
 
@@ -936,10 +1034,13 @@ class TestBug5RightJoinMissingUnmatchedRows:
         assert order_ids == [101, 102, 103, 104], f"Should have all 4 orders"
 
         matched_with_customers = [r for r in rows if r["name"] is not None]
-        assert len(matched_with_customers) == 3, \
-            "3 orders meet amount > 75 AND have matching customers"
+        assert (
+            len(matched_with_customers) == 3
+        ), "3 orders meet amount > 75 AND have matching customers"
 
-        unmatched_orders = [r for r in rows if r["name"] is None and r["order_id"] is not None]
-        assert len(unmatched_orders) == 1, \
-            "1 order doesn't meet amount > 75 criteria, should have NULL customer"
-
+        unmatched_orders = [
+            r for r in rows if r["name"] is None and r["order_id"] is not None
+        ]
+        assert (
+            len(unmatched_orders) == 1
+        ), "1 order doesn't meet amount > 75 criteria, should have NULL customer"

@@ -14,8 +14,16 @@ from ..plan.logical import (
     Union,
     SetOperation,
     Explain,
+    transform_children,
 )
-from ..plan.expressions import Expression, InList, BetweenExpression
+from . import pushdown
+from .scope_validator import validate_scope
+from ..plan.expressions import (
+    Expression,
+    InList,
+    BetweenExpression,
+    and_expressions,
+)
 from ..catalog.catalog import Catalog
 
 if TYPE_CHECKING:
@@ -32,7 +40,7 @@ def _rewrite_set_operation_branches(set_op: SetOperation, rewrite) -> SetOperati
     """
     new_left = rewrite(set_op.left)
     new_right = rewrite(set_op.right)
-    return SetOperation(new_left, new_right, set_op.kind, set_op.distinct)
+    return set_op.model_copy(update={"left": new_left, "right": new_right})
 
 
 class OptimizationRule(ABC):
@@ -71,51 +79,18 @@ class PredicatePushdownRule(OptimizationRule):
         return self._push_down(plan)
 
     def _push_down(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Recursively push predicates down the plan tree."""
+        """Recursively push predicates down the plan tree.
+
+        Filter is where pushdown happens; every other node here just recurses
+        into its children and rebuilds if one changed (transform_children). A
+        SetOperation rewrites its two branches; an unhandled node bottoms out.
+        """
         if isinstance(plan, Filter):
             return self._push_filter(plan)
-
-        if isinstance(plan, Projection):
-            new_input = self._push_down(plan.input)
-            if new_input != plan.input:
-                return Projection(
-                    new_input,
-                    plan.expressions,
-                    plan.aliases,
-                    plan.distinct,
-                )
-            return plan
-
-        if isinstance(plan, Join):
-            new_left = self._push_down(plan.left)
-            new_right = self._push_down(plan.right)
-            if new_left != plan.left or new_right != plan.right:
-                return Join(new_left, new_right, plan.join_type, plan.condition)
-            return plan
-
-        if isinstance(plan, Aggregate):
-            new_input = self._push_down(plan.input)
-            if new_input != plan.input:
-                return Aggregate(
-                    new_input, plan.group_by, plan.aggregates, plan.output_names
-                )
-            return plan
-
-        if isinstance(plan, Limit):
-            new_input = self._push_down(plan.input)
-            if new_input != plan.input:
-                return Limit(new_input, plan.limit, plan.offset)
-            return plan
-
-        if isinstance(plan, Sort):
-            new_input = self._push_down(plan.input)
-            if new_input != plan.input:
-                return Sort(new_input, plan.sort_keys, plan.ascending, plan.nulls_order)
-            return plan
-
         if isinstance(plan, SetOperation):
             return _rewrite_set_operation_branches(plan, self._push_down)
-
+        if isinstance(plan, (Projection, Join, Aggregate, Limit, Sort)):
+            return transform_children(plan, self._push_down)
         return plan
 
     def _push_filter(self, filter_node: Filter) -> LogicalPlanNode:
@@ -129,8 +104,12 @@ class PredicatePushdownRule(OptimizationRule):
             isinstance(predicate, BinaryOp) and predicate.op == BinaryOpType.AND
         )
         if is_conjunction and self._can_absorb_split(input_plan):
-            left_result = self._push_filter(Filter(input_plan, predicate.left))
-            return self._push_filter(Filter(left_result, predicate.right))
+            left_result = self._push_filter(
+                Filter(input=input_plan, predicate=predicate.left)
+            )
+            return self._push_filter(
+                Filter(input=left_result, predicate=predicate.right)
+            )
 
         if isinstance(input_plan, Filter):
             return self._merge_filters(filter_node, input_plan)
@@ -146,7 +125,7 @@ class PredicatePushdownRule(OptimizationRule):
 
         new_input = self._push_down(input_plan)
         if new_input != input_plan:
-            return Filter(new_input, predicate)
+            return Filter(input=new_input, predicate=predicate)
 
         return filter_node
 
@@ -168,7 +147,7 @@ class PredicatePushdownRule(OptimizationRule):
             op=BinaryOpType.AND, left=outer.predicate, right=inner.predicate
         )
 
-        new_filter = Filter(inner.input, merged_predicate)
+        new_filter = Filter(input=inner.input, predicate=merged_predicate)
         return self._push_down(new_filter)
 
     def _can_evaluate_predicate(self, pred_cols: set, available_cols: set) -> bool:
@@ -204,32 +183,22 @@ class PredicatePushdownRule(OptimizationRule):
         Push filter BELOW projection if the predicate can be evaluated
         using columns available in the projection's input.
         """
-        predicate_cols = self._extract_column_refs(filter_node.predicate)
-        input_cols = self._get_column_names(projection.input)
+        predicate_cols = pushdown.qualified_or_bare_names(filter_node.predicate)
+        input_cols = pushdown.available_columns(projection.input)
 
         # Can we evaluate predicate using columns from input?
         can_push = self._can_evaluate_predicate(predicate_cols, input_cols)
 
         if can_push:
             # Push filter BELOW projection: Projection(Filter(input, pred), ...)
-            new_filter = Filter(projection.input, filter_node.predicate)
+            new_filter = Filter(input=projection.input, predicate=filter_node.predicate)
             new_filter = self._push_down(new_filter)
-            return Projection(
-                new_filter,
-                projection.expressions,
-                projection.aliases,
-                projection.distinct,
-            )
+            return projection.model_copy(update={"input": new_filter})
 
         # Filter references columns not available in input, keep above
         new_input = self._push_down(projection.input)
-        new_project = Projection(
-            new_input,
-            projection.expressions,
-            projection.aliases,
-            projection.distinct,
-        )
-        return Filter(new_project, filter_node.predicate)
+        new_project = projection.model_copy(update={"input": new_input})
+        return Filter(input=new_project, predicate=filter_node.predicate)
 
     def _push_filter_to_scan(self, filter_node: Filter, scan: Scan) -> LogicalPlanNode:
         """Push filter into scan node."""
@@ -239,89 +208,9 @@ class PredicatePushdownRule(OptimizationRule):
             merged = BinaryOp(
                 op=BinaryOpType.AND, left=scan.filters, right=filter_node.predicate
             )
-            return Scan(
-                datasource=scan.datasource,
-                schema_name=scan.schema_name,
-                table_name=scan.table_name,
-                columns=scan.columns,
-                filters=merged,
-                alias=scan.alias,
-                group_by=scan.group_by,
-                aggregates=scan.aggregates,
-                output_names=scan.output_names,
-                limit=scan.limit,
-                offset=scan.offset,
-                order_by_keys=scan.order_by_keys,
-                order_by_ascending=scan.order_by_ascending,
-                order_by_nulls=scan.order_by_nulls,
-                distinct=scan.distinct,
-            )
+            return scan.model_copy(update={"filters": merged})
 
-        return Scan(
-            datasource=scan.datasource,
-            schema_name=scan.schema_name,
-            table_name=scan.table_name,
-            columns=scan.columns,
-            filters=filter_node.predicate,
-            alias=scan.alias,
-            group_by=scan.group_by,
-            aggregates=scan.aggregates,
-            output_names=scan.output_names,
-            limit=scan.limit,
-            offset=scan.offset,
-            order_by_keys=scan.order_by_keys,
-            order_by_ascending=scan.order_by_ascending,
-            order_by_nulls=scan.order_by_nulls,
-            distinct=scan.distinct,
-        )
-
-    def _predicate_matches_side(
-        self, pred_cols: set, side_cols: set, other_cols: set
-    ) -> bool:
-        """Check if predicate columns match exactly one side of join.
-
-        Handles both qualified and unqualified column references.
-        Also handles alias vs physical name mismatches (e.g., "o.amount" vs "orders.amount").
-        For both qualified and unqualified refs, checks if column uniquely belongs to this side.
-        """
-        for pred_col in pred_cols:
-            # Exact match - pred_col is directly in side_cols
-            if pred_col in side_cols:
-                continue
-
-            # Extract bare column name (part after last ".")
-            if "." in pred_col:
-                # Qualified reference like "o.amount" or "orders.amount"
-                bare_col = pred_col.split(".")[-1]
-            else:
-                # Unqualified reference like "amount"
-                bare_col = pred_col
-
-            # Check if bare column name uniquely belongs to this side
-            # This handles:
-            # - Unqualified refs: "amount" matching "orders.amount"
-            # - Alias mismatches: "o.amount" matching "orders.amount"
-            side_has_col = False
-            other_has_col = False
-
-            for col in side_cols:
-                if col.endswith(f".{bare_col}") or col == bare_col:
-                    side_has_col = True
-                    break
-
-            for col in other_cols:
-                if col.endswith(f".{bare_col}") or col == bare_col:
-                    other_has_col = True
-                    break
-
-            # Column must be on this side only (not on other side)
-            if side_has_col and not other_has_col:
-                continue
-
-            # Column is not uniquely on this side
-            return False
-
-        return True
+        return scan.model_copy(update={"filters": filter_node.predicate})
 
     def _push_filter_below_join(
         self, filter_node: Filter, join: Join
@@ -338,41 +227,44 @@ class PredicatePushdownRule(OptimizationRule):
         from ..plan.logical import JoinType
 
         predicate = filter_node.predicate
-        left_cols = self._get_column_names(join.left)
-        right_cols = self._get_column_names(join.right)
+        left_cols = pushdown.available_columns(join.left)
+        right_cols = pushdown.available_columns(join.right)
 
-        pred_cols = self._extract_column_refs(predicate)
+        pred_cols = pushdown.qualified_or_bare_names(predicate)
 
-        pred_left_only = self._predicate_matches_side(pred_cols, left_cols, right_cols)
-        pred_right_only = self._predicate_matches_side(pred_cols, right_cols, left_cols)
+        pred_left_only = pushdown.columns_belong_to_side(
+            pred_cols, left_cols, right_cols
+        )
+        pred_right_only = pushdown.columns_belong_to_side(
+            pred_cols, right_cols, left_cols
+        )
 
-        # Only push for INNER joins
+        # Only push for INNER joins. model_copy preserves every other field
+        # (notably NATURAL / USING), which a raw Join(...) rebuild would drop.
         if join.join_type != JoinType.INNER:
             # For outer joins, keep filter above join
-            new_join = Join(
-                self._push_down(join.left),
-                self._push_down(join.right),
-                join.join_type,
-                join.condition,
+            new_join = join.model_copy(
+                update={
+                    "left": self._push_down(join.left),
+                    "right": self._push_down(join.right),
+                }
             )
-            return Filter(new_join, predicate)
+            return Filter(input=new_join, predicate=predicate)
 
         # INNER JOIN: safe to push
         if pred_left_only:
-            new_left = Filter(join.left, predicate)
+            new_left = Filter(input=join.left, predicate=predicate)
             new_left = self._push_down(new_left)
-            new_join = Join(
-                new_left, self._push_down(join.right), join.join_type, join.condition
+            return join.model_copy(
+                update={"left": new_left, "right": self._push_down(join.right)}
             )
-            return new_join
 
         if pred_right_only:
-            new_right = Filter(join.right, predicate)
+            new_right = Filter(input=join.right, predicate=predicate)
             new_right = self._push_down(new_right)
-            new_join = Join(
-                self._push_down(join.left), new_right, join.join_type, join.condition
+            return join.model_copy(
+                update={"left": self._push_down(join.left), "right": new_right}
             )
-            return new_join
 
         # Predicate spans both sides of an INNER join. A cross-side equality is
         # a join key: fold it into the ON condition so a comma/cross join
@@ -380,20 +272,21 @@ class PredicatePushdownRule(OptimizationRule):
         # filter on top. Non-equi cross-side predicates stay as a filter.
         if self._is_equi_predicate(predicate):
             merged_condition = self._merge_join_condition(join.condition, predicate)
-            return Join(
-                self._push_down(join.left),
-                self._push_down(join.right),
-                join.join_type,
-                merged_condition,
+            return join.model_copy(
+                update={
+                    "left": self._push_down(join.left),
+                    "right": self._push_down(join.right),
+                    "condition": merged_condition,
+                }
             )
 
-        new_join = Join(
-            self._push_down(join.left),
-            self._push_down(join.right),
-            join.join_type,
-            join.condition,
+        new_join = join.model_copy(
+            update={
+                "left": self._push_down(join.left),
+                "right": self._push_down(join.right),
+            }
         )
-        return Filter(new_join, predicate)
+        return Filter(input=new_join, predicate=predicate)
 
     def _is_equi_predicate(self, predicate: Expression) -> bool:
         """Whether a predicate is a column-to-column equality (a join key)."""
@@ -415,109 +308,6 @@ class PredicatePushdownRule(OptimizationRule):
         if existing is None:
             return predicate
         return BinaryOp(op=BinaryOpType.AND, left=existing, right=predicate)
-
-    def _get_column_names(self, plan: LogicalPlanNode) -> set:
-        """Get all column names available from a plan node.
-
-        Returns qualified column names (e.g., "orders.id") for Scan nodes to
-        enable correct filter pushdown when multiple tables have columns with
-        the same name.
-
-        Recursively handles wrapped nodes (Filter, Limit, etc).
-        """
-        if isinstance(plan, Scan):
-            # Return qualified column names: "table.column" or "alias.column"
-            # Use alias if present (e.g., "u" from "FROM users u")
-            # Otherwise use physical table name
-            # This prevents ambiguity when multiple tables have same column names
-            table_ref = plan.alias if plan.alias else plan.table_name
-            qualified = set()
-            for col in plan.columns:
-                qualified.add(f"{table_ref}.{col}")
-            return qualified
-
-        if isinstance(plan, Projection):
-            return set(plan.aliases)
-
-        if isinstance(plan, Join):
-            left_cols = self._get_column_names(plan.left)
-            right_cols = self._get_column_names(plan.right)
-            return left_cols.union(right_cols)
-
-        if isinstance(plan, Filter):
-            return self._get_column_names(plan.input)
-
-        if isinstance(plan, Limit):
-            return self._get_column_names(plan.input)
-
-        if isinstance(plan, Aggregate):
-            # Aggregate changes schema - return output columns
-            return set(plan.output_names)
-
-        return set()
-
-    def _extract_column_refs(self, expr: Expression) -> set:
-        """Extract qualified column names from expression.
-
-        Returns column names with table qualifier when available (e.g., "orders.id"),
-        or bare column names if no qualifier present (e.g., "id").
-
-        This is critical for join filter pushdown: when both join inputs have
-        columns with the same name, we must respect table qualifiers to avoid
-        pushing filters to the wrong side.
-        """
-        from ..plan.expressions import ColumnRef
-
-        if isinstance(expr, ColumnRef):
-            if expr.table:
-                return {f"{expr.table}.{expr.column}"}
-            return {expr.column}
-
-        columns = set()
-        for child in self._predicate_children(expr):
-            columns.update(self._extract_column_refs(child))
-        return columns
-
-    def _predicate_children(self, expr: Expression) -> list:
-        """Direct sub-expressions of a predicate node (for column extraction).
-
-        CASE/IN/BETWEEN/CAST must be traversed too; returning no children for
-        them made predicates that reference real columns look column-free and
-        get pushed down vacuously.
-        """
-        from ..plan.expressions import BinaryOp, UnaryOp, FunctionCall, Cast
-
-        if isinstance(expr, BinaryOp):
-            return [expr.left, expr.right]
-        if isinstance(expr, UnaryOp):
-            return [expr.operand]
-        if isinstance(expr, FunctionCall):
-            return list(expr.args)
-        if isinstance(expr, Cast):
-            return [expr.expr]
-        return self._container_predicate_children(expr)
-
-    def _container_predicate_children(self, expr: Expression) -> list:
-        """Sub-expressions of container predicate nodes (IN / BETWEEN / CASE)."""
-        from ..plan.expressions import InList, BetweenExpression, CaseExpr
-
-        if isinstance(expr, InList):
-            return [expr.value] + list(expr.options)
-        if isinstance(expr, BetweenExpression):
-            return [expr.value, expr.lower, expr.upper]
-        if isinstance(expr, CaseExpr):
-            return self._case_predicate_children(expr)
-        return []
-
-    def _case_predicate_children(self, expr) -> list:
-        """Condition/result sub-expressions of a CASE node."""
-        children = []
-        for condition, result in expr.when_clauses:
-            children.append(condition)
-            children.append(result)
-        if expr.else_result is not None:
-            children.append(expr.else_result)
-        return children
 
     def name(self) -> str:
         """Return this rule's identifier (used in logging and EXPLAIN)."""
@@ -570,13 +360,13 @@ class ProjectionPushdownRule(OptimizationRule):
 
         if isinstance(plan, Scan):
             if plan.filters:
-                columns.update(self._extract_columns(plan.filters))
+                columns.update(pushdown.bare_names(plan.filters))
             return columns
 
         if isinstance(plan, Projection):
             # Collect columns from projection expressions
             for expr in plan.expressions:
-                columns.update(self._extract_columns(expr))
+                columns.update(pushdown.bare_names(expr))
             # CRITICAL: Must recurse into input to collect columns needed by
             # downstream operators (e.g., join keys, filter columns)
             # Otherwise those columns will be pruned and break the query!
@@ -584,13 +374,13 @@ class ProjectionPushdownRule(OptimizationRule):
             return columns
 
         if isinstance(plan, Filter):
-            columns.update(self._extract_columns(plan.predicate))
+            columns.update(pushdown.bare_names(plan.predicate))
             columns.update(self._collect_required_columns(plan.input))
             return columns
 
         if isinstance(plan, Join):
             if plan.condition:
-                columns.update(self._extract_columns(plan.condition))
+                columns.update(pushdown.bare_names(plan.condition))
             columns.update(self._collect_required_columns(plan.left))
             columns.update(self._collect_required_columns(plan.right))
             return columns
@@ -598,10 +388,10 @@ class ProjectionPushdownRule(OptimizationRule):
         if isinstance(plan, Aggregate):
             # Collect columns from group by expressions
             for expr in plan.group_by:
-                columns.update(self._extract_columns(expr))
+                columns.update(pushdown.bare_names(expr))
             # Collect columns from aggregate expressions
             for expr in plan.aggregates:
-                columns.update(self._extract_columns(expr))
+                columns.update(pushdown.bare_names(expr))
             # CRITICAL: Must recurse into input to collect columns needed by
             # downstream operators (e.g., join keys, filter columns)
             # Otherwise those columns will be pruned and break the query!
@@ -612,42 +402,10 @@ class ProjectionPushdownRule(OptimizationRule):
             columns.update(self._collect_required_columns(plan.input))
             return columns
 
-        return columns
-
-    def _extract_columns(self, expr: Expression) -> set:
-        """Extract column names from expression."""
-        from ..plan.expressions import ColumnRef, BinaryOp, UnaryOp, FunctionCall
-
-        columns = set()
-
-        if isinstance(expr, ColumnRef):
-            columns.add(expr.column)
-            return columns
-
-        if isinstance(expr, BinaryOp):
-            columns.update(self._extract_columns(expr.left))
-            columns.update(self._extract_columns(expr.right))
-            return columns
-
-        if isinstance(expr, UnaryOp):
-            columns.update(self._extract_columns(expr.operand))
-            return columns
-
-        if isinstance(expr, FunctionCall):
-            for arg in expr.args:
-                columns.update(self._extract_columns(arg))
-            return columns
-
-        if isinstance(expr, InList):
-            columns.update(self._extract_columns(expr.value))
-            for option in expr.options:
-                columns.update(self._extract_columns(option))
-            return columns
-
-        if isinstance(expr, BetweenExpression):
-            columns.update(self._extract_columns(expr.value))
-            columns.update(self._extract_columns(expr.lower))
-            columns.update(self._extract_columns(expr.upper))
+        if isinstance(plan, Sort):
+            for key in plan.sort_keys:
+                columns.update(pushdown.bare_names(key))
+            columns.update(self._collect_required_columns(plan.input))
             return columns
 
         return columns
@@ -660,20 +418,15 @@ class ProjectionPushdownRule(OptimizationRule):
         if isinstance(plan, Projection):
             new_input = self._prune_columns(plan.input, required)
             if new_input != plan.input:
-                return Projection(
-                    new_input,
-                    plan.expressions,
-                    plan.aliases,
-                    plan.distinct,
-                )
+                return plan.model_copy(update={"input": new_input})
             return plan
 
         if isinstance(plan, Filter):
-            filter_cols = self._extract_columns(plan.predicate)
+            filter_cols = pushdown.bare_names(plan.predicate)
             combined_required = required.union(filter_cols)
             new_input = self._prune_columns(plan.input, combined_required)
             if new_input != plan.input:
-                return Filter(new_input, plan.predicate)
+                return plan.model_copy(update={"input": new_input})
             return plan
 
         if isinstance(plan, Join):
@@ -682,21 +435,28 @@ class ProjectionPushdownRule(OptimizationRule):
             new_left = self._prune_columns(plan.left, left_req)
             new_right = self._prune_columns(plan.right, right_req)
             if new_left != plan.left or new_right != plan.right:
-                return Join(new_left, new_right, plan.join_type, plan.condition)
+                return plan.model_copy(update={"left": new_left, "right": new_right})
             return plan
 
         if isinstance(plan, Aggregate):
             new_input = self._prune_columns(plan.input, required)
             if new_input != plan.input:
-                return Aggregate(
-                    new_input, plan.group_by, plan.aggregates, plan.output_names
-                )
+                return plan.model_copy(update={"input": new_input})
             return plan
 
         if isinstance(plan, Limit):
             new_input = self._prune_columns(plan.input, required)
             if new_input != plan.input:
-                return Limit(new_input, plan.limit, plan.offset)
+                return plan.model_copy(update={"input": new_input})
+            return plan
+
+        if isinstance(plan, Sort):
+            sort_cols = set()
+            for key in plan.sort_keys:
+                sort_cols.update(pushdown.bare_names(key))
+            new_input = self._prune_columns(plan.input, required.union(sort_cols))
+            if new_input != plan.input:
+                return plan.model_copy(update={"input": new_input})
             return plan
 
         return plan
@@ -715,23 +475,7 @@ class ProjectionPushdownRule(OptimizationRule):
                 if col in needed:
                     pruned_cols.append(col)
 
-            return Scan(
-                datasource=scan.datasource,
-                schema_name=scan.schema_name,
-                table_name=scan.table_name,
-                columns=pruned_cols,
-                filters=scan.filters,
-                alias=scan.alias,
-                group_by=scan.group_by,
-                aggregates=scan.aggregates,
-                output_names=scan.output_names,
-                limit=scan.limit,
-                offset=scan.offset,
-                order_by_keys=scan.order_by_keys,
-                order_by_ascending=scan.order_by_ascending,
-                order_by_nulls=scan.order_by_nulls,
-                distinct=scan.distinct,
-            )
+            return scan.model_copy(update={"columns": pruned_cols})
 
         return scan
 
@@ -743,10 +487,10 @@ class ProjectionPushdownRule(OptimizationRule):
 
         if isinstance(plan, Scan):
             if plan.filters:
-                local_required.update(self._extract_columns(plan.filters))
+                local_required.update(pushdown.bare_names(plan.filters))
 
         if isinstance(plan, Filter):
-            local_required.update(self._extract_columns(plan.predicate))
+            local_required.update(pushdown.bare_names(plan.predicate))
 
         return local_required.union(parent_required)
 
@@ -770,91 +514,17 @@ class LimitPushdownRule(OptimizationRule):
         return self._rewrite_plan(plan)
 
     def _rewrite_plan(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Recursively rewrite plan, pushing limits when safe."""
-        handler = self._get_rewrite_handler(plan)
-        if handler is None:
-            return plan
-        return handler(plan)
+        """Recursively rewrite plan, pushing limits when safe.
 
-    def _get_rewrite_handler(self, plan: LogicalPlanNode):
-        """Return rewrite handler for plan type."""
-        handlers = {
-            Limit: self._push_limit_node,
-            Projection: self._rewrite_projection,
-            Filter: self._rewrite_filter,
-            Sort: self._rewrite_sort,
-            Aggregate: self._rewrite_aggregate,
-            Join: self._rewrite_join,
-            Union: self._rewrite_union,
-            Explain: self._rewrite_explain,
-        }
-        return handlers.get(type(plan))
-
-    def _rewrite_projection(self, projection: Projection) -> LogicalPlanNode:
-        """Rewrite projection child."""
-        new_input = self._rewrite_plan(projection.input)
-        if new_input != projection.input:
-            return Projection(
-                new_input,
-                projection.expressions,
-                projection.aliases,
-                projection.distinct,
-            )
-        return projection
-
-    def _rewrite_filter(self, filter_node: Filter) -> LogicalPlanNode:
-        """Rewrite filter child."""
-        new_input = self._rewrite_plan(filter_node.input)
-        if new_input != filter_node.input:
-            return Filter(new_input, filter_node.predicate)
-        return filter_node
-
-    def _rewrite_sort(self, sort: Sort) -> LogicalPlanNode:
-        """Rewrite sort child."""
-        new_input = self._rewrite_plan(sort.input)
-        if new_input != sort.input:
-            return Sort(new_input, sort.sort_keys, sort.ascending, sort.nulls_order)
-        return sort
-
-    def _rewrite_aggregate(self, aggregate: Aggregate) -> LogicalPlanNode:
-        """Rewrite aggregate child."""
-        new_input = self._rewrite_plan(aggregate.input)
-        if new_input != aggregate.input:
-            return Aggregate(
-                input=new_input,
-                group_by=aggregate.group_by,
-                aggregates=aggregate.aggregates,
-                output_names=aggregate.output_names,
-            )
-        return aggregate
-
-    def _rewrite_join(self, join: Join) -> LogicalPlanNode:
-        """Rewrite join children."""
-        new_left = self._rewrite_plan(join.left)
-        new_right = self._rewrite_plan(join.right)
-        if new_left != join.left or new_right != join.right:
-            return Join(new_left, new_right, join.join_type, join.condition)
-        return join
-
-    def _rewrite_union(self, union: Union) -> LogicalPlanNode:
-        """Rewrite union inputs."""
-        new_inputs = []
-        changed = False
-        for child in union.inputs:
-            rewritten = self._rewrite_plan(child)
-            new_inputs.append(rewritten)
-            if rewritten != child:
-                changed = True
-        if changed:
-            return Union(new_inputs, union.distinct)
-        return union
-
-    def _rewrite_explain(self, explain: Explain) -> LogicalPlanNode:
-        """Rewrite explain child."""
-        new_input = self._rewrite_plan(explain.input)
-        if new_input != explain.input:
-            return Explain(new_input, explain.format)
-        return explain
+        A Limit is pushed downward (_push_limit_node); every other handled node
+        just recurses into its children (transform_children). An unhandled node
+        type bottoms out unchanged.
+        """
+        if isinstance(plan, Limit):
+            return self._push_limit_node(plan)
+        if isinstance(plan, (Projection, Filter, Sort, Aggregate, Join, Union, Explain)):
+            return transform_children(plan, self._rewrite_plan)
+        return plan
 
     def _push_limit_node(self, limit: Limit) -> LogicalPlanNode:
         """Push a single Limit node downward when safe."""
@@ -870,9 +540,22 @@ class LimitPushdownRule(OptimizationRule):
             scan_with_limit = self._apply_limit_metadata(
                 input_node, limit.limit, limit.offset
             )
-            return Limit(scan_with_limit, limit.limit, 0)
+            return limit.model_copy(update={"input": scan_with_limit, "offset": 0})
 
-        return Limit(input_node, limit.limit, limit.offset)
+        return limit.model_copy(update={"input": input_node})
+
+    def _distinct_blocks_pushdown(self, projection: Projection) -> bool:
+        """Whether a DISTINCT projection blocks pushing a LIMIT below it.
+
+        Pushing a LIMIT below DISTINCT over a Scan is safe: it renders as one
+        ``SELECT DISTINCT ... LIMIT`` pushed to the single source. Over any
+        other child (e.g. a cross-source Join) the DISTINCT runs locally, so a
+        LIMIT pushed beneath it would cap rows before deduplication and return
+        too few distinct rows - the LIMIT must stay above.
+        """
+        if not (projection.distinct or projection.distinct_on is not None):
+            return False
+        return not isinstance(projection.input, Scan)
 
     def _push_through_projection(
         self, limit: Limit, projection: Projection
@@ -883,50 +566,37 @@ class LimitPushdownRule(OptimizationRule):
         it is not, the outer Limit must retain the offset rather than zero a
         value that was never pushed down (which would corrupt pagination).
         """
+        if self._distinct_blocks_pushdown(projection):
+            return limit.model_copy(update={"input": projection})
         pushed_child = self._apply_limit_metadata(
             projection.input,
             limit.limit,
             limit.offset,
         )
         retained_offset = 0 if isinstance(projection.input, Scan) else limit.offset
-        limited = Limit(pushed_child, limit.limit, retained_offset)
-        return Projection(
-            limited,
-            projection.expressions,
-            projection.aliases,
-            projection.distinct,
+        limited = limit.model_copy(
+            update={"input": pushed_child, "offset": retained_offset}
         )
+        return projection.model_copy(update={"input": limited})
 
     def _push_limit_with_sort(self, limit: Limit, sort: Sort) -> LogicalPlanNode:
         """Move limit below sort and attach metadata to scan when possible."""
         sorted_input = self._rewrite_plan(sort.input)
 
         if isinstance(sorted_input, Scan):
-            new_scan = Scan(
-                datasource=sorted_input.datasource,
-                schema_name=sorted_input.schema_name,
-                table_name=sorted_input.table_name,
-                columns=sorted_input.columns,
-                filters=sorted_input.filters,
-                alias=sorted_input.alias,
-                group_by=sorted_input.group_by,
-                aggregates=sorted_input.aggregates,
-                output_names=sorted_input.output_names,
-                order_by_keys=sort.sort_keys,
-                order_by_ascending=sort.ascending,
-                order_by_nulls=sort.nulls_order,
-                limit=limit.limit,
-                offset=limit.offset,
+            new_scan = sorted_input.model_copy(
+                update={
+                    "order_by_keys": sort.sort_keys,
+                    "order_by_ascending": sort.ascending,
+                    "order_by_nulls": sort.nulls_order,
+                    "limit": limit.limit,
+                    "offset": limit.offset,
+                }
             )
-            return Limit(new_scan, limit.limit, 0)
+            return limit.model_copy(update={"input": new_scan, "offset": 0})
 
-        new_sort = Sort(
-            input=sorted_input,
-            sort_keys=sort.sort_keys,
-            ascending=sort.ascending,
-            nulls_order=sort.nulls_order,
-        )
-        return Limit(new_sort, limit.limit, limit.offset)
+        new_sort = sort.model_copy(update={"input": sorted_input})
+        return limit.model_copy(update={"input": new_sort})
 
     def _apply_limit_metadata(
         self, node: LogicalPlanNode, limit_value: int, offset_value: int
@@ -955,41 +625,13 @@ class LimitPushdownRule(OptimizationRule):
         elif scan.offset:
             effective_offset = scan.offset + offset_value
 
-        return Scan(
-            datasource=scan.datasource,
-            schema_name=scan.schema_name,
-            table_name=scan.table_name,
-            columns=scan.columns,
-            filters=scan.filters,
-            alias=scan.alias,
-            group_by=scan.group_by,
-            aggregates=scan.aggregates,
-            output_names=scan.output_names,
-            limit=effective_limit,
-            offset=effective_offset,
-            order_by_keys=scan.order_by_keys,
-            order_by_ascending=scan.order_by_ascending,
-            order_by_nulls=scan.order_by_nulls,
-            distinct=scan.distinct,
+        return scan.model_copy(
+            update={"limit": effective_limit, "offset": effective_offset}
         )
 
     def name(self) -> str:
         """Return this rule's identifier (used in logging and EXPLAIN)."""
         return "LimitPushdown"
-
-
-class JoinReorderingRule(OptimizationRule):
-    """Reorder joins for better performance."""
-
-    def apply(self, plan: LogicalPlanNode) -> Optional[LogicalPlanNode]:
-        """Reorder joins by cost. Not yet implemented (deferred to Phase 10)."""
-        # TODO: Implement cost-based join reordering
-        # Requires integration with Phase 5 cost model
-        raise NotImplementedError()
-
-    def name(self) -> str:
-        """Return this rule's identifier (used in logging and EXPLAIN)."""
-        return "JoinReordering"
 
 
 class OrderByPushdownRule(OptimizationRule):
@@ -1020,12 +662,7 @@ class OrderByPushdownRule(OptimizationRule):
         """Try to push sort into its input."""
         if not self._sort_keys_are_columns(sort.sort_keys):
             pushed_child = self._attach_order_metadata(sort.input, sort)
-            return Sort(
-                input=pushed_child,
-                sort_keys=sort.sort_keys,
-                ascending=sort.ascending,
-                nulls_order=sort.nulls_order,
-            )
+            return sort.model_copy(update={"input": pushed_child})
 
         input_node = sort.input
 
@@ -1058,15 +695,6 @@ class OrderByPushdownRule(OptimizationRule):
                 return False
         return True
 
-    def _propagate_sort_metadata(self, node: LogicalPlanNode, sort: Sort) -> None:
-        """Attach sort metadata to the lowest scan without removing top sort."""
-        if isinstance(node, Scan):
-            self._push_to_scan(sort, node)
-            return
-        child = getattr(node, "input", None)
-        if isinstance(child, LogicalPlanNode):
-            self._propagate_sort_metadata(child, sort)
-
     def _attach_order_metadata(
         self, node: LogicalPlanNode, sort: Sort
     ) -> LogicalPlanNode:
@@ -1076,46 +704,34 @@ class OrderByPushdownRule(OptimizationRule):
 
         if isinstance(node, Projection):
             new_input = self._attach_order_metadata(node.input, sort)
-            return Projection(new_input, node.expressions, node.aliases, node.distinct)
+            return node.model_copy(update={"input": new_input})
 
         if isinstance(node, Filter):
             new_input = self._attach_order_metadata(node.input, sort)
-            return Filter(new_input, node.predicate)
+            return Filter(input=new_input, predicate=node.predicate)
 
         if isinstance(node, Limit):
             new_input = self._attach_order_metadata(node.input, sort)
-            return Limit(new_input, node.limit, node.offset)
+            return node.model_copy(update={"input": new_input})
 
         if isinstance(node, Aggregate):
             new_input = self._attach_order_metadata(node.input, sort)
-            return Aggregate(
-                new_input, node.group_by, node.aggregates, node.output_names
-            )
+            return node.model_copy(update={"input": new_input})
 
         if isinstance(node, Sort):
             new_input = self._attach_order_metadata(node.input, sort)
-            return Sort(new_input, node.sort_keys, node.ascending, node.nulls_order)
+            return node.model_copy(update={"input": new_input})
 
         return node
 
     def _push_to_scan(self, sort: Sort, scan: Scan) -> Scan:
         """Push ORDER BY into scan node."""
-        return Scan(
-            datasource=scan.datasource,
-            schema_name=scan.schema_name,
-            table_name=scan.table_name,
-            columns=scan.columns,
-            filters=scan.filters,
-            alias=scan.alias,
-            group_by=scan.group_by,
-            aggregates=scan.aggregates,
-            output_names=scan.output_names,
-            limit=scan.limit,
-            offset=scan.offset,
-            order_by_keys=sort.sort_keys,
-            order_by_ascending=sort.ascending,
-            order_by_nulls=sort.nulls_order,
-            distinct=scan.distinct,
+        return scan.model_copy(
+            update={
+                "order_by_keys": sort.sort_keys,
+                "order_by_ascending": sort.ascending,
+                "order_by_nulls": sort.nulls_order,
+            }
         )
 
     def _push_through_projection(
@@ -1129,39 +745,23 @@ class OrderByPushdownRule(OptimizationRule):
         if rewritten_keys is None:
             return sort
 
-        rewritten_sort = Sort(
-            input=projection.input,
-            sort_keys=rewritten_keys,
-            ascending=sort.ascending,
-            nulls_order=sort.nulls_order,
+        rewritten_sort = sort.model_copy(
+            update={"input": projection.input, "sort_keys": rewritten_keys}
         )
         pushed_child = self._push_order_by(rewritten_sort)
 
         if isinstance(pushed_child, Sort):
-            rebuilt_projection = Projection(
-                pushed_child.input,
-                projection.expressions,
-                projection.aliases,
-                projection.distinct,
+            rebuilt_projection = projection.model_copy(
+                update={"input": pushed_child.input}
             )
-            return Sort(
-                input=rebuilt_projection,
-                sort_keys=sort.sort_keys,
-                ascending=sort.ascending,
-                nulls_order=sort.nulls_order,
-            )
+            return sort.model_copy(update={"input": rebuilt_projection})
 
-        return Projection(
-            pushed_child,
-            projection.expressions,
-            projection.aliases,
-            projection.distinct,
-        )
+        return projection.model_copy(update={"input": pushed_child})
 
     def _push_through_filter(self, sort: Sort, filter_node: Filter) -> LogicalPlanNode:
         """Push ORDER BY through filter (always safe)."""
         pushed_child = self._push_sort_into_child(sort, filter_node.input)
-        return Filter(pushed_child, filter_node.predicate)
+        return Filter(input=pushed_child, predicate=filter_node.predicate)
 
     def _push_through_join(self, sort: Sort, join: Join) -> LogicalPlanNode:
         """Push ORDER BY metadata into a single join side when safe."""
@@ -1170,12 +770,12 @@ class OrderByPushdownRule(OptimizationRule):
         if left_scan is not None and right_scan is not None:
             if left_scan.datasource != right_scan.datasource:
                 return sort
-        sort_cols = self._extract_sort_columns(sort)
-        left_cols = self._get_available_columns(join.left)
-        right_cols = self._get_available_columns(join.right)
+        sort_cols = pushdown.column_key_set(sort.sort_keys)
+        left_cols = pushdown.available_columns(join.left)
+        right_cols = pushdown.available_columns(join.right)
 
-        left_only = self._columns_match_side(sort_cols, left_cols, right_cols)
-        right_only = self._columns_match_side(sort_cols, right_cols, left_cols)
+        left_only = pushdown.columns_belong_to_side(sort_cols, left_cols, right_cols)
+        right_only = pushdown.columns_belong_to_side(sort_cols, right_cols, left_cols)
 
         new_left = (
             self._push_sort_into_child(sort, join.left) if left_only else join.left
@@ -1184,13 +784,8 @@ class OrderByPushdownRule(OptimizationRule):
             self._push_sort_into_child(sort, join.right) if right_only else join.right
         )
 
-        rebuilt = Join(new_left, new_right, join.join_type, join.condition)
-        return Sort(
-            input=rebuilt,
-            sort_keys=sort.sort_keys,
-            ascending=sort.ascending,
-            nulls_order=sort.nulls_order,
-        )
+        rebuilt = join.model_copy(update={"left": new_left, "right": new_right})
+        return sort.model_copy(update={"input": rebuilt})
 
     def _push_sort_into_child(
         self,
@@ -1198,153 +793,42 @@ class OrderByPushdownRule(OptimizationRule):
         child: LogicalPlanNode,
     ) -> LogicalPlanNode:
         """Push sort keys into a specific child and return transformed child."""
-        injected = Sort(
-            input=child,
-            sort_keys=sort.sort_keys,
-            ascending=sort.ascending,
-            nulls_order=sort.nulls_order,
-        )
+        injected = sort.model_copy(update={"input": child})
         pushed = self._push_order_by(injected)
         if isinstance(pushed, Sort):
             return pushed.input
         return pushed
 
-    def _columns_match_side(
-        self,
-        sort_cols: set,
-        side_cols: set,
-        other_cols: set,
-    ) -> bool:
-        """Check if sort columns belong exclusively to one join side."""
-        for col in sort_cols:
-            if col in side_cols:
-                continue
-
-            bare = col.split(".")[-1]
-            side_has = any(
-                entry.endswith(f".{bare}") or entry == bare for entry in side_cols
-            )
-            other_has = any(
-                entry.endswith(f".{bare}") or entry == bare for entry in other_cols
-            )
-
-            if side_has and not other_has:
-                continue
-
-            return False
-
-        return True
-
     def _push_through_aggregate(
         self, sort: Sort, aggregate: Aggregate
     ) -> LogicalPlanNode:
         """Push ORDER BY through aggregate when keys align with aggregate output."""
-        sort_cols = self._extract_sort_columns(sort)
+        sort_cols = pushdown.column_key_set(sort.sort_keys)
         output_cols = set(aggregate.output_names)
         if not sort_cols.issubset(output_cols):
             return sort
 
-        group_cols = self._extract_group_columns(aggregate.group_by)
+        group_cols = pushdown.column_key_set(aggregate.group_by)
         if not sort_cols.issubset(group_cols):
             return sort
 
         pushed_child = self._push_sort_into_child(sort, aggregate.input)
-        new_agg = Aggregate(
-            input=pushed_child,
-            group_by=aggregate.group_by,
-            aggregates=aggregate.aggregates,
-            output_names=aggregate.output_names,
-        )
-        return Sort(
-            input=new_agg,
-            sort_keys=sort.sort_keys,
-            ascending=sort.ascending,
-            nulls_order=sort.nulls_order,
-        )
-
-    def _extract_group_columns(self, group_by: List[Expression]) -> set:
-        """Extract column names from group by expressions."""
-        from ..plan.expressions import ColumnRef
-
-        columns = set()
-        for expr in group_by:
-            if isinstance(expr, ColumnRef):
-                if expr.table:
-                    columns.add(f"{expr.table}.{expr.column}")
-                columns.add(expr.column)
-        return columns
+        new_agg = aggregate.model_copy(update={"input": pushed_child})
+        return sort.model_copy(update={"input": new_agg})
 
     def _push_through_union(self, sort: Sort, union: Union) -> LogicalPlanNode:
         """Propagate sort metadata into union inputs while keeping top sort."""
         new_inputs = []
         for child in union.inputs:
-            injected = Sort(
-                input=child,
-                sort_keys=sort.sort_keys,
-                ascending=sort.ascending,
-                nulls_order=sort.nulls_order,
-            )
+            injected = sort.model_copy(update={"input": child})
             pushed_child = self._push_order_by(injected)
             if isinstance(pushed_child, Sort):
                 new_inputs.append(pushed_child.input)
             else:
                 new_inputs.append(pushed_child)
 
-        new_union = Union(new_inputs, union.distinct)
-        return Sort(
-            input=new_union,
-            sort_keys=sort.sort_keys,
-            ascending=sort.ascending,
-            nulls_order=sort.nulls_order,
-        )
-
-    def _get_available_columns(self, plan: LogicalPlanNode) -> set:
-        """Get all column names available from a plan node."""
-        if isinstance(plan, Scan):
-            columns = set()
-            table_ref = plan.alias if plan.alias else plan.table_name
-            for col in plan.columns:
-                columns.add(col)
-                columns.add(f"{table_ref}.{col}")
-            return columns
-
-        if isinstance(plan, Projection):
-            columns = set()
-            for alias in plan.aliases:
-                columns.add(alias)
-
-            if "*" in columns:
-                return self._get_available_columns(plan.input)
-
-            index = 0
-            for expr in plan.expressions:
-                from ..plan.expressions import ColumnRef
-
-                if isinstance(expr, ColumnRef):
-                    if expr.table:
-                        columns.add(f"{expr.table}.{expr.column}")
-                    columns.add(expr.column)
-                index += 1
-
-            return columns
-
-        if isinstance(plan, Filter):
-            return self._get_available_columns(plan.input)
-
-        return set()
-
-    def _extract_sort_columns(self, sort: Sort) -> set:
-        """Extract column names from sort keys."""
-        from ..plan.expressions import ColumnRef
-
-        columns = set()
-        for key in sort.sort_keys:
-            if isinstance(key, ColumnRef):
-                if key.table:
-                    columns.add(f"{key.table}.{key.column}")
-                columns.add(key.column)
-
-        return columns
+        new_union = union.model_copy(update={"inputs": new_inputs})
+        return sort.model_copy(update={"input": new_union})
 
     def _rewrite_sort_keys_for_projection(
         self,
@@ -1353,7 +837,7 @@ class OrderByPushdownRule(OptimizationRule):
     ) -> Optional[List[Expression]]:
         """Rewrite projection sort keys to input expressions when aliases are used."""
         alias_map = self._build_projection_alias_map(projection)
-        available = self._get_available_columns(projection.input)
+        available = pushdown.available_columns(projection.input)
         rewritten: List[Expression] = []
         from ..plan.expressions import ColumnRef
 
@@ -1411,20 +895,34 @@ class OrderByPushdownRule(OptimizationRule):
         return None
 
     def _recurse_node(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Recurse into node children."""
-        if isinstance(plan, (Projection, Filter, Limit, Sort)):
-            return self._recurse_unary(plan)
+        """Recurse into node children.
 
-        if isinstance(plan, Join):
-            return self._recurse_join(plan)
-
-        if isinstance(plan, Aggregate):
-            return self._recurse_aggregate(plan)
-
+        Filter has a special arm (a HAVING predicate folds onto an aggregate
+        scan); every other handled node just recurses and rebuilds if a child
+        changed (transform_children). A SetOperation rewrites its two branches.
+        """
+        if isinstance(plan, Filter):
+            return self._recurse_filter(plan)
         if isinstance(plan, SetOperation):
             return _rewrite_set_operation_branches(plan, self._push_order_by)
-
+        if isinstance(plan, (Projection, Limit, Sort, Join, Aggregate)):
+            return transform_children(plan, self._push_order_by)
         return plan
+
+    def _recurse_filter(self, plan: Filter) -> LogicalPlanNode:
+        """Recurse into a Filter, folding HAVING onto an aggregate scan.
+
+        When order-by pushdown turns the input into an aggregate-bearing Scan,
+        the Filter is a HAVING clause and merges onto the scan's filters;
+        otherwise the Filter is rebuilt over its new input.
+        """
+        new_input = self._push_order_by(plan.input)
+        if new_input == plan.input:
+            return plan
+        if isinstance(new_input, Scan) and new_input.aggregates:
+            merged_filters = self._merge_filters(new_input.filters, plan.predicate)
+            return new_input.model_copy(update={"filters": merged_filters})
+        return plan.model_copy(update={"input": new_input})
 
     def _resolve_scan(self, node: LogicalPlanNode) -> Optional[Scan]:
         """Return the first Scan found under wrappers (Projection/Filter/Limit/Sort/Aggregate)."""
@@ -1449,72 +947,12 @@ class OrderByPushdownRule(OptimizationRule):
                 continue
             return None
 
-    def _recurse_unary(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Recurse into unary node."""
-        new_input = self._push_order_by(plan.input)
-        if new_input == plan.input:
-            return plan
-
-        if isinstance(plan, Projection):
-            return Projection(
-                new_input,
-                plan.expressions,
-                plan.aliases,
-                plan.distinct,
-            )
-
-        if isinstance(plan, Filter):
-            if isinstance(new_input, Scan) and new_input.aggregates:
-                merged_filters = self._merge_filters(new_input.filters, plan.predicate)
-                return Scan(
-                    datasource=new_input.datasource,
-                    schema_name=new_input.schema_name,
-                    table_name=new_input.table_name,
-                    columns=new_input.columns,
-                    filters=merged_filters,
-                    alias=new_input.alias,
-                    group_by=new_input.group_by,
-                    aggregates=new_input.aggregates,
-                    output_names=new_input.output_names,
-                    limit=new_input.limit,
-                    offset=new_input.offset,
-                    order_by_keys=new_input.order_by_keys,
-                    order_by_ascending=new_input.order_by_ascending,
-                    order_by_nulls=new_input.order_by_nulls,
-                    distinct=new_input.distinct,
-                )
-            return Filter(new_input, plan.predicate)
-
-        if isinstance(plan, Limit):
-            return Limit(new_input, plan.limit, plan.offset)
-
-        if isinstance(plan, Sort):
-            return Sort(
-                input=new_input,
-                sort_keys=plan.sort_keys,
-                ascending=plan.ascending,
-                nulls_order=plan.nulls_order,
-            )
-
-        return plan
-
-    def _recurse_join(self, join: Join) -> LogicalPlanNode:
-        """Recurse into join node."""
-        new_left = self._push_order_by(join.left)
-        new_right = self._push_order_by(join.right)
-
-        if new_left == join.left and new_right == join.right:
-            return join
-
-        return Join(new_left, new_right, join.join_type, join.condition)
-
-    def _recurse_aggregate(self, agg: Aggregate) -> LogicalPlanNode:
-        """Recurse into aggregate node."""
-        new_input = self._push_order_by(agg.input)
-        if new_input == agg.input:
-            return agg
-
-        return Aggregate(new_input, agg.group_by, agg.aggregates, agg.output_names)
+    def _merge_filters(
+        self, left: Optional[Expression], right: Optional[Expression]
+    ) -> Optional[Expression]:
+        """None-safe AND of two predicate expressions (HAVING folded onto an
+        aggregate-bearing scan after order-by pushdown)."""
+        return and_expressions(left, right)
 
     def name(self) -> str:
         """Return this rule's identifier (used in logging and EXPLAIN)."""
@@ -1562,85 +1000,33 @@ class AggregatePushdownRule(OptimizationRule):
         """Push aggregate into scan node."""
         merged_filters = self._merge_filters(scan.filters, filter_expr)
 
-        return Scan(
-            datasource=scan.datasource,
-            schema_name=scan.schema_name,
-            table_name=scan.table_name,
-            columns=scan.columns,
-            filters=merged_filters,
-            alias=scan.alias,
-            group_by=agg.group_by,
-            aggregates=agg.aggregates,
-            output_names=agg.output_names,
-            limit=scan.limit,
-            offset=scan.offset,
-            order_by_keys=scan.order_by_keys,
-            order_by_ascending=scan.order_by_ascending,
-            order_by_nulls=scan.order_by_nulls,
-            distinct=scan.distinct,
+        return scan.model_copy(
+            update={
+                "filters": merged_filters,
+                "group_by": agg.group_by,
+                "grouping_sets": agg.grouping_sets,
+                "aggregates": agg.aggregates,
+                "output_names": agg.output_names,
+            }
         )
 
     def _merge_filters(
         self, scan_filter: Optional[Expression], filter_filter: Optional[Expression]
     ) -> Optional[Expression]:
-        """Merge filters from scan and filter node."""
-        if scan_filter is None:
-            return filter_filter
-
-        if filter_filter is None:
-            return scan_filter
-
-        from ..plan.expressions import BinaryOp, BinaryOpType
-
-        return BinaryOp(op=BinaryOpType.AND, left=scan_filter, right=filter_filter)
+        """None-safe AND of a scan filter and a filter-node predicate."""
+        return and_expressions(scan_filter, filter_filter)
 
     def _recurse_node(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Recurse into node children."""
-        if isinstance(plan, (Projection, Filter, Limit, Sort)):
-            return self._recurse_unary(plan)
+        """Recurse into node children, rebuilding if a child changed.
 
-        if isinstance(plan, Join):
-            return self._recurse_join(plan)
-
+        Every handled node just recurses (transform_children); a SetOperation
+        rewrites its two branches. An unhandled node bottoms out unchanged.
+        """
         if isinstance(plan, SetOperation):
             return _rewrite_set_operation_branches(plan, self._push_aggregate)
-
+        if isinstance(plan, (Projection, Filter, Limit, Sort, Join)):
+            return transform_children(plan, self._push_aggregate)
         return plan
-
-    def _recurse_unary(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Recurse into unary node."""
-        new_input = self._push_aggregate(plan.input)
-        if new_input == plan.input:
-            return plan
-
-        if isinstance(plan, Projection):
-            return Projection(
-                new_input,
-                plan.expressions,
-                plan.aliases,
-                plan.distinct,
-            )
-
-        if isinstance(plan, Filter):
-            return Filter(new_input, plan.predicate)
-
-        if isinstance(plan, Limit):
-            return Limit(new_input, plan.limit, plan.offset)
-
-        if isinstance(plan, Sort):
-            return Sort(new_input, plan.sort_keys, plan.ascending, plan.nulls_order)
-
-        return plan
-
-    def _recurse_join(self, join: Join) -> LogicalPlanNode:
-        """Recurse into join node."""
-        new_left = self._push_aggregate(join.left)
-        new_right = self._push_aggregate(join.right)
-
-        if new_left == join.left and new_right == join.right:
-            return join
-
-        return Join(new_left, new_right, join.join_type, join.condition)
 
     def name(self) -> str:
         """Return this rule's identifier (used in logging and EXPLAIN)."""
@@ -1691,7 +1077,7 @@ class RuleBasedOptimizer:
                 max_iterations,
                 query_executor=query_executor,
             )
-            return Explain(optimized_child, plan.format)
+            return Explain(input=optimized_child, format=plan.format)
 
         current_plan = plan
         iteration = 0
@@ -1706,6 +1092,7 @@ class RuleBasedOptimizer:
                 if result is not None and result != current_plan:
                     current_plan = result
                     changed = True
+                    validate_scope(current_plan, f"after {type(rule).__name__}")
 
             # If no rules made changes, we've reached fixed point
             if not changed:

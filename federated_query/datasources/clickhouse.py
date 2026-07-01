@@ -27,13 +27,28 @@ logger = logging.getLogger(__name__)
 # consistent with the duckdb/postgres connectors. Wrappers (Nullable, etc.) and
 # parameters (DateTime64(3), FixedString(16)) are stripped before lookup.
 _CH_TO_SQL = {
-    "Int8": "SMALLINT", "Int16": "SMALLINT", "Int32": "INTEGER", "Int64": "BIGINT",
-    "Int128": "BIGINT", "Int256": "BIGINT",
-    "UInt8": "SMALLINT", "UInt16": "INTEGER", "UInt32": "BIGINT", "UInt64": "BIGINT",
-    "Float32": "REAL", "Float64": "DOUBLE", "Decimal": "DOUBLE",
-    "String": "VARCHAR", "FixedString": "VARCHAR", "UUID": "VARCHAR", "Enum8": "VARCHAR",
+    "Int8": "SMALLINT",
+    "Int16": "SMALLINT",
+    "Int32": "INTEGER",
+    "Int64": "BIGINT",
+    "Int128": "BIGINT",
+    "Int256": "BIGINT",
+    "UInt8": "SMALLINT",
+    "UInt16": "INTEGER",
+    "UInt32": "BIGINT",
+    "UInt64": "BIGINT",
+    "Float32": "REAL",
+    "Float64": "DOUBLE",
+    "Decimal": "DOUBLE",
+    "String": "VARCHAR",
+    "FixedString": "VARCHAR",
+    "UUID": "VARCHAR",
+    "Enum8": "VARCHAR",
     "Enum16": "VARCHAR",
-    "Date": "DATE", "Date32": "DATE", "DateTime": "TIMESTAMP", "DateTime64": "TIMESTAMP",
+    "Date": "DATE",
+    "Date32": "DATE",
+    "DateTime": "TIMESTAMP",
+    "DateTime64": "TIMESTAMP",
     "Bool": "BOOLEAN",
 }
 
@@ -43,7 +58,7 @@ def _strip_ch_type(ch_type: str) -> str:
     base = ch_type
     for wrapper in ("Nullable(", "LowCardinality("):
         if base.startswith(wrapper):
-            base = base[len(wrapper):-1]
+            base = base[len(wrapper) : -1]
     paren = base.find("(")
     if paren != -1:
         base = base[:paren]
@@ -52,6 +67,8 @@ def _strip_ch_type(ch_type: str) -> str:
 
 class ClickHouseDataSource(DataSource):
     """ClickHouse connector that fetches results as streamed Arrow batches."""
+
+    render_dialect = "clickhouse"
 
     def __init__(self, name: str, config: Dict[str, Any]):
         """Config: host, port (HTTP, default 8123), user, password, database."""
@@ -73,8 +90,11 @@ class ClickHouseDataSource(DataSource):
         # shared ClickHouse session serializes them and raises SESSION_IS_LOCKED.
         # Without a session each HTTP query is independent over the client's pool.
         self._client = clickhouse_connect.get_client(
-            host=self.host, port=self.port, username=self.username,
-            password=self.password, database=self.database,
+            host=self.host,
+            port=self.port,
+            username=self.username,
+            password=self.password,
+            database=self.database,
             autogenerate_session_id=False,
         )
         self._connected = True
@@ -127,10 +147,18 @@ class ClickHouseDataSource(DataSource):
         ).result_rows
         columns = []
         for name, ch_type in rows:
-            sql_type = _CH_TO_SQL.get(_strip_ch_type(ch_type), "VARCHAR")
+            base_type = _strip_ch_type(ch_type)
+            if base_type not in _CH_TO_SQL:
+                raise ValueError(
+                    f"Unsupported ClickHouse type {ch_type!r} for column {name!r}"
+                )
+            sql_type = _CH_TO_SQL[base_type]
             columns.append(
-                ColumnMetadata(name=name, data_type=sql_type,
-                               nullable=ch_type.startswith("Nullable("))
+                ColumnMetadata(
+                    name=name,
+                    data_type=sql_type,
+                    nullable=ch_type.startswith("Nullable("),
+                )
             )
         return TableMetadata(schema_name=schema, table_name=table, columns=columns)
 
@@ -144,11 +172,7 @@ class ClickHouseDataSource(DataSource):
         ).result_rows[0]
         row_count = row[0]
         column_stats = self._column_statistics(metadata, row, row_count)
-        return TableStatistics(
-            row_count=row_count,
-            total_size_bytes=row_count * 100,
-            column_stats=column_stats,
-        )
+        return self._build_table_statistics(row_count, column_stats)
 
     def _statistics_query(self, schema, table, metadata: TableMetadata) -> str:
         """Build one query: count() plus uniqExact/nulls for every column."""
@@ -168,9 +192,8 @@ class ClickHouseDataSource(DataSource):
         for column in metadata.columns:
             distinct, nulls = row[index], row[index + 1]
             index += 2
-            null_fraction = nulls / row_count if row_count > 0 else 0.0
-            stats[column.name] = ColumnStatistics(
-                num_distinct=distinct, null_fraction=null_fraction, avg_width=10
+            stats[column.name] = self._build_column_statistics(
+                distinct, nulls, row_count
             )
         return stats
 
@@ -183,5 +206,5 @@ class ClickHouseDataSource(DataSource):
 
     def get_query_schema(self, query: str) -> pa.Schema:
         """Real Arrow schema of a query, via a zero-row probe."""
-        table = self._client.query_arrow(f"SELECT * FROM ({query}) AS q LIMIT 0")
+        table = self._client.query_arrow(self._schema_probe_sql(query))
         return table.schema

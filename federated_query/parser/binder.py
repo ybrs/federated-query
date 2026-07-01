@@ -24,21 +24,15 @@ from ..plan.expressions import (
     Expression,
     ColumnRef,
     Literal,
-    BinaryOp,
-    UnaryOp,
     DataType,
     FunctionCall,
-    InList,
-    BetweenExpression,
     Cast,
-    Extract,
     Interval,
-    CaseExpr,
     SubqueryExpression,
     ExistsExpression,
     InSubquery,
     QuantifiedComparison,
-    TupleExpression,
+    map_children,
 )
 
 if TYPE_CHECKING:
@@ -49,6 +43,19 @@ class BindingError(Exception):
     """Exception raised during binding."""
 
     pass
+
+
+def _rebuild_function_call(expr, bound_args, bind_one) -> FunctionCall:
+    """Rebuild a bound FunctionCall, preserving every field except the args.
+
+    ``model_copy`` copies all other fields (is_aggregate, distinct, WITHIN GROUP
+    info, and any field added later), so binding can never silently drop one.
+    ``bind_one`` binds the WITHIN GROUP sort key of an ordered-set aggregate.
+    """
+    bound_key = None
+    if expr.within_group_key is not None:
+        bound_key = bind_one(expr.within_group_key)
+    return expr.model_copy(update={"args": bound_args, "within_group_key": bound_key})
 
 
 # Maps the leading keyword of a SQL CAST target type to the engine DataType.
@@ -182,9 +189,9 @@ class Binder:
         for row in values.rows:
             bound_row = []
             for expr in row:
-                bound_row.append(self._bind_expression(expr, None))
+                bound_row.append(self._bind_expression(expr))
             bound_rows.append(bound_row)
-        return Values(rows=bound_rows, output_names=values.output_names)
+        return values.model_copy(update={"rows": bound_rows})
 
     def _bind_subquery_scan(self, node: SubqueryScan) -> SubqueryScan:
         """Bind a derived table by binding its inner plan."""
@@ -200,8 +207,6 @@ class Binder:
         in this table are dropped here; references that resolve nowhere
         still fail loudly during expression binding.
         """
-        from dataclasses import replace
-
         table = self._resolve_table(scan)
         kept = []
         for name in scan.columns:
@@ -211,7 +216,7 @@ class Binder:
             kept = ["*"]
         if kept == scan.columns:
             return scan
-        return replace(scan, columns=kept)
+        return scan.model_copy(update={"columns": kept})
 
     def _resolve_table(self, scan: Scan) -> Table:
         """Resolve table reference."""
@@ -241,14 +246,14 @@ class Binder:
     def _bind_filter_predicate(
         self, predicate: Expression, bound_input: LogicalPlanNode
     ) -> Expression:
-        """Bind a filter predicate against its bound input plan."""
+        """Bind a filter predicate against its bound input plan.
+
+        A filter over an Aggregate is a HAVING clause (aggregate-output names
+        in scope); everything else binds against the input's relation scope.
+        """
         if isinstance(bound_input, Aggregate):
             return self._bind_having_predicate(predicate, bound_input)
-        if isinstance(bound_input, Join):
-            tables = self._get_tables_from_join(bound_input.left, bound_input.right)
-            return self._bind_join_condition(predicate, tables)
-        table = self._get_table_from_plan(bound_input)
-        return self._bind_expression(predicate, table)
+        return self._bind_expression(predicate)
 
     def _bind_projection(self, projection: Projection) -> Projection:
         """Bind a Projection node."""
@@ -259,30 +264,34 @@ class Binder:
             bound_expressions = self._bind_projection_expressions(
                 projection.expressions, bound_input
             )
+            bound_distinct_on = self._bind_distinct_on(
+                projection.distinct_on, bound_input
+            )
         finally:
             self._pop_scope()
 
-        return Projection(
-            input=bound_input,
-            expressions=bound_expressions,
-            aliases=projection.aliases,
-            distinct=projection.distinct,
+        return projection.model_copy(
+            update={
+                "input": bound_input,
+                "expressions": bound_expressions,
+                "distinct_on": bound_distinct_on,
+            }
         )
+
+    def _bind_distinct_on(self, keys, bound_input) -> Optional[List[Expression]]:
+        """Bind the DISTINCT ON key expressions, or None for a plain projection."""
+        if keys is None:
+            return None
+        return self._bind_projection_expressions(keys, bound_input)
 
     def _bind_projection_expressions(
         self, expressions: List[Expression], bound_input: LogicalPlanNode
     ) -> List[Expression]:
-        """Bind projection expressions against the bound input plan."""
-        if self._contains_join(bound_input):
-            tables = self._extract_tables_from_tree(bound_input)
-            bound_expressions = []
-            for expr in expressions:
-                bound_expressions.append(
-                    self._bind_expression_multi_table(expr, tables)
-                )
-            return bound_expressions
-        table = self._get_table_from_plan(bound_input)
-        return self._bind_expressions(expressions, table)
+        """Bind projection expressions against the bound input's relation scope."""
+        bound_expressions = []
+        for expr in expressions:
+            bound_expressions.append(self._bind_expression(expr))
+        return bound_expressions
 
     def _bind_sort(self, sort: Sort) -> Sort:
         """Bind a Sort node."""
@@ -299,20 +308,14 @@ class Binder:
             bound_keys = self._bind_sort_keys_for_projection(
                 sort.sort_keys, bound_input
             )
-            return Sort(
-                input=bound_input,
-                sort_keys=bound_keys,
-                ascending=sort.ascending,
-                nulls_order=sort.nulls_order,
+            return sort.model_copy(
+                update={"input": bound_input, "sort_keys": bound_keys}
             )
 
         if isinstance(bound_input, Aggregate):
             bound_keys = self._bind_sort_keys_for_aggregate(sort.sort_keys, bound_input)
-            return Sort(
-                input=bound_input,
-                sort_keys=bound_keys,
-                ascending=sort.ascending,
-                nulls_order=sort.nulls_order,
+            return sort.model_copy(
+                update={"input": bound_input, "sort_keys": bound_keys}
             )
 
         if isinstance(bound_input, Filter) and isinstance(bound_input.input, Aggregate):
@@ -320,40 +323,18 @@ class Binder:
                 sort.sort_keys,
                 bound_input.input,
             )
-            return Sort(
-                input=bound_input,
-                sort_keys=bound_keys,
-                ascending=sort.ascending,
-                nulls_order=sort.nulls_order,
+            return sort.model_copy(
+                update={"input": bound_input, "sort_keys": bound_keys}
             )
 
-        if self._contains_join(bound_input):
-            tables = self._extract_tables_from_tree(bound_input)
-            bound_keys = self._bind_sort_keys_multi(sort.sort_keys, tables)
-            return Sort(
-                input=bound_input,
-                sort_keys=bound_keys,
-                ascending=sort.ascending,
-                nulls_order=sort.nulls_order,
-            )
+        bound_keys = self._bind_sort_keys(sort.sort_keys)
+        return sort.model_copy(update={"input": bound_input, "sort_keys": bound_keys})
 
-        table = self._get_table_from_plan(bound_input)
-        bound_keys = self._bind_sort_keys(sort.sort_keys, table)
-        return Sort(
-            input=bound_input,
-            sort_keys=bound_keys,
-            ascending=sort.ascending,
-            nulls_order=sort.nulls_order,
-        )
-
-    def _bind_sort_keys(
-        self, sort_keys: List[Expression], table: Optional[Table]
-    ) -> List[Expression]:
-        """Bind ORDER BY expressions for a single table."""
+    def _bind_sort_keys(self, sort_keys: List[Expression]) -> List[Expression]:
+        """Bind ORDER BY expressions against the relation scope."""
         bound_keys: List[Expression] = []
         for key in sort_keys:
-            bound_key = self._bind_expression(key, table)
-            bound_keys.append(bound_key)
+            bound_keys.append(self._bind_expression(key))
         return bound_keys
 
     def _bind_sort_keys_for_aggregate(
@@ -362,14 +343,9 @@ class Binder:
         aggregate: Aggregate,
     ) -> List[Expression]:
         """Bind ORDER BY keys when input is an Aggregate (supports output aliases)."""
-        alias_map: Dict[str, Expression] = {}
-        for index in range(len(aggregate.output_names)):
-            alias = aggregate.output_names[index]
-            expr = aggregate.aggregates[index]
-            alias_map[alias] = expr
+        alias_map = self._aggregate_alias_map(aggregate)
 
         bound_keys: List[Expression] = []
-        table = self._get_table_from_plan(aggregate.input)
         for key in sort_keys:
             if isinstance(key, ColumnRef) and key.table is None:
                 if key.column in alias_map:
@@ -382,19 +358,7 @@ class Binder:
                         )
                     )
                     continue
-            bound_keys.append(self._bind_expression(key, table))
-        return bound_keys
-
-    def _bind_sort_keys_multi(
-        self,
-        sort_keys: List[Expression],
-        tables: Dict[Optional[str], Table],
-    ) -> List[Expression]:
-        """Bind ORDER BY expressions referencing multiple tables."""
-        bound_keys: List[Expression] = []
-        for key in sort_keys:
-            bound_key = self._bind_expression_multi_table(key, tables)
-            bound_keys.append(bound_key)
+            bound_keys.append(self._bind_expression(key))
         return bound_keys
 
     def _bind_sort_keys_for_projection(
@@ -404,53 +368,36 @@ class Binder:
     ) -> List[Expression]:
         """Bind ORDER BY keys when input is a Projection (supports aliases)."""
         alias_map = self._build_alias_expression_map(projection)
-        tables = None
-        if self._contains_join(projection.input):
-            tables = self._extract_tables_from_tree(projection.input)
-        table = self._get_table_from_plan(projection.input)
-
         bound_keys: List[Expression] = []
         for key in sort_keys:
-            bound_key = self._bind_projection_sort_key(
-                key=key,
-                alias_map=alias_map,
-                table=table,
-                tables=tables,
-            )
-            bound_keys.append(bound_key)
+            bound_keys.append(self._bind_projection_sort_key(key, alias_map))
         return bound_keys
 
     def _bind_projection_sort_key(
         self,
         key: Expression,
         alias_map: Dict[str, Expression],
-        table: Optional[Table],
-        tables: Optional[Dict[Optional[str], Table]],
     ) -> Expression:
         """Bind a single ORDER BY expression that may reference a select alias."""
         from ..plan.expressions import ColumnRef
 
-        if isinstance(key, ColumnRef) and key.table is None:
-            if key.column in alias_map:
-                source_expr = alias_map[key.column]
-                from ..plan.expressions import ColumnRef as BoundColumnRef
+        if isinstance(key, ColumnRef) and key.table is None and key.column in alias_map:
+            return self._sort_key_from_alias(key, alias_map[key.column])
+        return self._bind_expression(key)
 
-                if isinstance(source_expr, BoundColumnRef):
-                    return ColumnRef(
-                        table=source_expr.table,
-                        column=source_expr.column,
-                        data_type=source_expr.data_type,
-                    )
-                return ColumnRef(
-                    table=None,
-                    column=key.column,
-                    data_type=source_expr.get_type(),
-                )
+    def _sort_key_from_alias(
+        self, key: Expression, source_expr: Expression
+    ) -> Expression:
+        """Resolve an ORDER BY reference to a SELECT alias's bound expression."""
+        from ..plan.expressions import ColumnRef
 
-        if tables is not None:
-            return self._bind_expression_multi_table(key, tables)
-
-        return self._bind_expression(key, table)
+        if isinstance(source_expr, ColumnRef):
+            return ColumnRef(
+                table=source_expr.table,
+                column=source_expr.column,
+                data_type=source_expr.data_type,
+            )
+        return ColumnRef(table=None, column=key.column, data_type=source_expr.get_type())
 
     def _build_alias_expression_map(
         self, projection: Projection
@@ -463,74 +410,10 @@ class Binder:
             alias_map[alias] = expression
         return alias_map
 
-    def _contains_join(self, plan: LogicalPlanNode) -> bool:
-        """Check if plan tree contains a Join node."""
-        if isinstance(plan, Join):
-            return True
-        if hasattr(plan, "input"):
-            return self._contains_join(plan.input)
-        return False
-
-    def _extract_tables_from_tree(
-        self, plan: LogicalPlanNode
-    ) -> Dict[Optional[str], Table]:
-        """Extract all tables from plan tree."""
-        if isinstance(plan, Join):
-            return self._get_tables_from_join(plan.left, plan.right)
-        if hasattr(plan, "input"):
-            return self._extract_tables_from_tree(plan.input)
-        return {}
-
-    def _bind_expression_multi_table(
-        self, expr: Expression, tables: Dict[Optional[str], Table]
-    ) -> Expression:
-        """Bind expression with multiple tables."""
-        if isinstance(expr, ColumnRef):
-            return self._bind_column_ref_multi_table(expr, tables)
-        if isinstance(expr, Literal):
-            return expr
-        if isinstance(expr, BinaryOp):
-            left = self._bind_expression_multi_table(expr.left, tables)
-            right = self._bind_expression_multi_table(expr.right, tables)
-            return BinaryOp(op=expr.op, left=left, right=right)
-        if isinstance(expr, UnaryOp):
-            operand = self._bind_expression_multi_table(expr.operand, tables)
-            return UnaryOp(op=expr.op, operand=operand)
-        if isinstance(expr, InList):
-            return self._bind_in_list_multi(expr, tables)
-        if isinstance(expr, BetweenExpression):
-            return self._bind_between_multi(expr, tables)
-        if isinstance(expr, CaseExpr):
-            return self._bind_case_expr_multi(expr, tables)
-        if isinstance(expr, Cast):
-            return self._bind_cast(
-                expr, lambda value: self._bind_expression_multi_table(value, tables)
-            )
-        if isinstance(expr, Extract):
-            return self._bind_extract(
-                expr, lambda value: self._bind_expression_multi_table(value, tables)
-            )
-        if isinstance(expr, Interval):
-            return expr
-        if isinstance(expr, FunctionCall):
-            return self._bind_function_args(
-                expr, lambda value: self._bind_expression_multi_table(value, tables)
-            )
-        if self._is_subquery_expression(expr):
-            return self._bind_subquery_expr(
-                expr, lambda value: self._bind_expression_multi_table(value, tables)
-            )
-        if isinstance(expr, TupleExpression):
-            return self._bind_tuple(
-                expr, lambda value: self._bind_expression_multi_table(value, tables)
-            )
-
-        return expr
-
     def _bind_limit(self, limit: Limit) -> Limit:
         """Bind a Limit node."""
         bound_input = self.bind(limit.input)
-        return Limit(input=bound_input, limit=limit.limit, offset=limit.offset)
+        return limit.model_copy(update={"input": bound_input})
 
     def _bind_join(self, join: Join) -> Join:
         """Bind a Join node."""
@@ -541,18 +424,16 @@ class Binder:
         if join.condition:
             self._push_scope_for(bound_left, bound_right)
             try:
-                tables = self._get_tables_from_join(bound_left, bound_right)
-                bound_condition = self._bind_join_condition(join.condition, tables)
+                bound_condition = self._bind_expression(join.condition)
             finally:
                 self._pop_scope()
 
-        return Join(
-            left=bound_left,
-            right=bound_right,
-            join_type=join.join_type,
-            condition=bound_condition,
-            natural=join.natural,
-            using=join.using,
+        return join.model_copy(
+            update={
+                "left": bound_left,
+                "right": bound_right,
+                "condition": bound_condition,
+            }
         )
 
     def _bind_lateral_join(self, join: LateralJoin) -> LateralJoin:
@@ -574,7 +455,7 @@ class Binder:
     def _bind_explain(self, explain: Explain) -> Explain:
         """Bind an Explain node."""
         bound_child = self.bind(explain.input)
-        return Explain(input=bound_child, format=explain.format)
+        return explain.model_copy(update={"input": bound_child})
 
     def _bind_aggregate(self, aggregate: Aggregate) -> Aggregate:
         """Bind an Aggregate node."""
@@ -589,25 +470,27 @@ class Binder:
         self, aggregate: Aggregate, bound_input: LogicalPlanNode
     ) -> Aggregate:
         """Bind aggregate expressions against the bound input plan."""
-        if self._contains_join(bound_input):
-            tables = self._extract_tables_from_tree(bound_input)
-            bound_group_by = self._bind_group_by_multi_table(aggregate.group_by, tables)
-            bound_aggregates = self._bind_aggregate_expressions_multi_table(
-                aggregate.aggregates, tables
-            )
-        else:
-            table = self._get_table_from_plan(bound_input)
-            bound_group_by = self._bind_group_by_expressions(aggregate.group_by, table)
-            bound_aggregates = self._bind_aggregate_expressions(
-                aggregate.aggregates, table
-            )
-
-        return Aggregate(
-            input=bound_input,
-            group_by=bound_group_by,
-            aggregates=bound_aggregates,
-            output_names=aggregate.output_names,
+        bound_group_by = self._bind_group_by_expressions(aggregate.group_by)
+        bound_aggregates = self._bind_aggregate_expressions(aggregate.aggregates)
+        return aggregate.model_copy(
+            update={
+                "input": bound_input,
+                "group_by": bound_group_by,
+                "aggregates": bound_aggregates,
+                "grouping_sets": self._bind_grouping_sets(
+                    aggregate.grouping_sets, self._bind_group_by_expressions
+                ),
+            }
         )
+
+    def _bind_grouping_sets(self, grouping_sets, bind_set):
+        """Bind each grouping set's key expressions, or None for a flat GROUP BY."""
+        if grouping_sets is None:
+            return None
+        bound = []
+        for grouping_set in grouping_sets:
+            bound.append(bind_set(grouping_set))
+        return bound
 
     def _bind_cte(self, cte: CTE) -> CTE:
         """Bind a CTE: register its name as a relation, then bind body and child.
@@ -624,12 +507,7 @@ class Binder:
         self._cte_tables[cte.name] = table
         bound_child = self.bind(cte.child)
         self._restore_cte(cte.name, saved)
-        return CTE(
-            name=cte.name,
-            cte_plan=bound_plan,
-            child=bound_child,
-            column_names=cte.column_names,
-        )
+        return cte.model_copy(update={"cte_plan": bound_plan, "child": bound_child})
 
     def _bind_recursive_cte(self, cte: CTE) -> CTE:
         """Bind a recursive CTE; its name is in scope while its own body binds."""
@@ -643,12 +521,12 @@ class Binder:
         bound_plan = self.bind(cte.cte_plan)
         bound_child = self.bind(cte.child)
         self._restore_cte(cte.name, saved)
-        return CTE(
-            name=cte.name,
-            cte_plan=bound_plan,
-            child=bound_child,
-            recursive=True,
-            column_names=cte.column_names,
+        return cte.model_copy(
+            update={
+                "cte_plan": bound_plan,
+                "child": bound_child,
+                "recursive": True,
+            }
         )
 
     def _bind_cte_ref(self, node: CTERef) -> CTERef:
@@ -698,115 +576,114 @@ class Binder:
             self._cte_tables[name] = saved
 
     def _bind_group_by_expressions(
-        self, expressions: List[Expression], table: Optional[Table]
+        self, expressions: List[Expression]
     ) -> List[Expression]:
-        """Bind GROUP BY expressions."""
+        """Bind GROUP BY expressions against the relation scope."""
         bound = []
         for expr in expressions:
-            bound_expr = self._bind_expression(expr, table)
-            bound.append(bound_expr)
+            bound.append(self._bind_expression(expr))
         return bound
 
     def _bind_aggregate_expressions(
-        self, expressions: List[Expression], table: Optional[Table]
+        self, expressions: List[Expression]
     ) -> List[Expression]:
-        """Bind aggregate expressions."""
+        """Bind aggregate expressions against the relation scope."""
         bound = []
         for expr in expressions:
-            bound_expr = self._bind_aggregate_expression(expr, table)
-            bound.append(bound_expr)
+            bound.append(self._bind_aggregate_expression(expr))
         return bound
 
-    def _bind_group_by_multi_table(
-        self, expressions: List[Expression], tables: Dict[Optional[str], Table]
-    ) -> List[Expression]:
-        """Bind GROUP BY expressions referencing multiple tables."""
-        bound: List[Expression] = []
-        for expr in expressions:
-            bound_expr = self._bind_expression_multi_table(expr, tables)
-            bound.append(bound_expr)
-        return bound
-
-    def _bind_aggregate_expressions_multi_table(
-        self, expressions: List[Expression], tables: Dict[Optional[str], Table]
-    ) -> List[Expression]:
-        """Bind aggregate expressions when multiple tables are available."""
-        bound = []
-        for expr in expressions:
-            bound.append(self._bind_aggregate_expression_multi_table(expr, tables))
-        return bound
-
-    def _bind_aggregate_expression(
-        self, expr: Expression, table: Optional[Table]
-    ) -> Expression:
-        """Bind an aggregate expression."""
-        if isinstance(expr, FunctionCall):
-            bound_args = self._bind_expressions(expr.args, table)
-            return FunctionCall(
-                function_name=expr.function_name,
-                args=bound_args,
-                is_aggregate=expr.is_aggregate,
-                distinct=expr.distinct,
-            )
-
-        return self._bind_expression(expr, table)
-
-    def _bind_aggregate_expression_multi_table(
-        self, expr: Expression, tables: Dict[Optional[str], Table]
-    ) -> Expression:
-        """Bind aggregate expression referencing multiple tables."""
+    def _bind_aggregate_expression(self, expr: Expression) -> Expression:
+        """Bind an aggregate expression's arguments against the relation scope."""
         if isinstance(expr, FunctionCall):
             bound_args = []
             for arg in expr.args:
-                bound_arg = self._bind_expression_multi_table(arg, tables)
-                bound_args.append(bound_arg)
-            return FunctionCall(
-                function_name=expr.function_name,
-                args=bound_args,
-                is_aggregate=expr.is_aggregate,
-                distinct=expr.distinct,
+                bound_args.append(self._bind_expression(arg))
+            return _rebuild_function_call(
+                expr, bound_args, lambda e: self._bind_expression(e)
             )
 
-        return self._bind_expression_multi_table(expr, tables)
+        return self._bind_expression(expr)
+
+    def _aggregate_alias_map(self, aggregate: Aggregate) -> Dict[str, Expression]:
+        """Map each aggregate output name to its source expression."""
+        alias_map: Dict[str, Expression] = {}
+        for index in range(len(aggregate.output_names)):
+            alias_map[aggregate.output_names[index]] = aggregate.aggregates[index]
+        return alias_map
 
     def _bind_having_predicate(
         self, predicate: Expression, aggregate: Aggregate
     ) -> Expression:
-        """Bind HAVING predicate against aggregate output schema."""
-        alias_map: Dict[str, Expression] = {}
-        for i in range(len(aggregate.output_names)):
-            alias_map[aggregate.output_names[i]] = aggregate.aggregates[i]
-        return self._bind_having_expression(predicate, alias_map)
+        """Bind a HAVING predicate against the aggregate output and relation scope.
 
-    def _bind_having_expression(
-        self, expr: Expression, alias_map: Dict[str, Expression]
+        The scope of the aggregate's input is already pushed (by _bind_filter),
+        so a grouping column resolves through it; resolve_in_scopes raises on a
+        reference the query does not name.
+        """
+        alias_map = self._aggregate_alias_map(aggregate)
+        return self._bind_having_with(
+            predicate,
+            alias_map,
+            lambda col_ref: self.resolve_in_scopes(self._scope_stack, col_ref),
+        )
+
+    def _bind_having_with(
+        self,
+        predicate: Expression,
+        alias_map: Dict[str, Expression],
+        base_resolve: Callable[[ColumnRef], Expression],
+        subquery_scopes: Optional[List[Dict[str, Table]]] = None,
     ) -> Expression:
-        """Bind expression against aggregate output columns."""
-        if isinstance(expr, ColumnRef):
-            if expr.column in alias_map:
-                source = alias_map[expr.column]
-                return ColumnRef(
-                    table=None,
-                    column=expr.column,
-                    data_type=source.get_type(),
-                )
-            raise BindingError(f"Column '{expr.column}' not found in aggregate output")
+        """Bind a HAVING predicate via the shared expression dispatch.
 
-        if isinstance(expr, BinaryOp):
-            left = self._bind_having_expression(expr.left, alias_map)
-            right = self._bind_having_expression(expr.right, alias_map)
-            return BinaryOp(op=expr.op, left=left, right=right)
+        One HAVING binder for the top-level and subquery contexts; only
+        base_resolve - the scope a non-output column resolves against - and the
+        nested-subquery scopes differ. An aggregate-output name binds to the
+        output; a grouping column or an outer-correlation column falls through to
+        base_resolve, instead of being rejected or left unbound.
+        """
+        return self._bind_having_dispatch(
+            predicate,
+            lambda col_ref: self._resolve_having_column(
+                col_ref, alias_map, base_resolve
+            ),
+            subquery_scopes,
+        )
 
-        if isinstance(expr, UnaryOp):
-            operand = self._bind_having_expression(expr.operand, alias_map)
-            return UnaryOp(op=expr.op, operand=operand)
+    def _bind_having_dispatch(
+        self,
+        expr: Expression,
+        resolve: Callable[[ColumnRef], Expression],
+        subquery_scopes: Optional[List[Dict[str, Table]]],
+    ) -> Expression:
+        """Walk a HAVING predicate through the shared dispatch with ``resolve``."""
+        return self._bind_expr_dispatch(
+            expr,
+            lambda value: self._bind_having_dispatch(value, resolve, subquery_scopes),
+            resolve,
+            subquery_scopes=subquery_scopes,
+        )
 
-        if self._is_subquery_expression(expr):
-            return self._bind_subquery_expr(
-                expr, lambda value: self._bind_having_expression(value, alias_map)
+    def _resolve_having_column(
+        self,
+        col_ref: ColumnRef,
+        alias_map: Dict[str, Expression],
+        base_resolve: Callable[[ColumnRef], Expression],
+    ) -> Expression:
+        """Resolve a HAVING column: an aggregate output name first, else the scope.
+
+        A bare column naming an aggregate output binds to that output; anything
+        else (a grouping column, an outer-correlation column, or an unknown
+        reference base_resolve will reject) resolves through base_resolve, so
+        HAVING binds the same way at top level and inside a subquery.
+        """
+        if col_ref.table is None and col_ref.column in alias_map:
+            source = alias_map[col_ref.column]
+            return ColumnRef(
+                table=None, column=col_ref.column, data_type=source.get_type()
             )
-
-        return expr
+        return base_resolve(col_ref)
 
     def _push_scope_for(self, *plans: LogicalPlanNode) -> None:
         """Push the relation scope visible inside the given subtree(s)."""
@@ -957,222 +834,125 @@ class Binder:
             subquery=plan_binder.bind(expr.subquery),
         )
 
-    def _get_tables_from_join(
-        self, left: LogicalPlanNode, right: LogicalPlanNode
-    ) -> Dict[Optional[str], Table]:
-        """Get tables from both sides of join.
-
-        Returns:
-            Dictionary mapping table names/aliases to Table objects
-        """
-        tables = {}
-
-        left_tables = self._extract_tables(left)
-        right_tables = self._extract_tables(right)
-
-        tables.update(left_tables)
-        tables.update(right_tables)
-
-        return tables
-
-    def _extract_tables(self, plan: LogicalPlanNode) -> Dict[Optional[str], Table]:
-        """Extract all tables from a plan node."""
-        tables = {}
-
-        if isinstance(plan, Scan):
-            table = self.catalog.get_table(
-                plan.datasource, plan.schema_name, plan.table_name
-            )
-            if table:
-                tables[plan.table_name] = table
-
-        if isinstance(plan, SubqueryScan):
-            tables[plan.alias] = self._synthetic_table(plan)
-            return tables
-
-        if isinstance(plan, CTERef):
-            table = self._cte_tables.get(plan.name)
-            if table is not None:
-                tables[plan.alias if plan.alias else plan.name] = table
-            return tables
-
-        if isinstance(plan, Join):
-            left_tables = self._extract_tables(plan.left)
-            right_tables = self._extract_tables(plan.right)
-            tables.update(left_tables)
-            tables.update(right_tables)
-
-        if hasattr(plan, "input"):
-            return self._extract_tables(plan.input)
-
-        return tables
-
-    def _bind_join_condition(
-        self, condition: Expression, tables: Dict[Optional[str], Table]
-    ) -> Expression:
-        """Bind join condition with multiple tables."""
-        if isinstance(condition, ColumnRef):
-            return self._bind_column_ref_multi_table(condition, tables)
-        if isinstance(condition, Literal):
-            return condition
-        if isinstance(condition, BinaryOp):
-            left = self._bind_join_condition(condition.left, tables)
-            right = self._bind_join_condition(condition.right, tables)
-            return BinaryOp(op=condition.op, left=left, right=right)
-        if isinstance(condition, UnaryOp):
-            operand = self._bind_join_condition(condition.operand, tables)
-            return UnaryOp(op=condition.op, operand=operand)
-        if self._is_subquery_expression(condition):
-            return self._bind_subquery_expr(
-                condition,
-                lambda value: self._bind_join_condition(value, tables),
-            )
-
-        return condition
-
-    def _bind_column_ref_multi_table(
-        self, col_ref: ColumnRef, tables: Dict[Optional[str], Table]
+    def resolve_in_scopes(
+        self, scopes: List[Dict[str, Table]], col_ref: ColumnRef
     ) -> ColumnRef:
-        """Bind column reference with multiple tables."""
+        """Resolve a column reference innermost-first across a scope chain.
+
+        This is the SINGLE column resolver for the whole binder (top-level and
+        subquery): a qualified reference resolves against the nearest scope that
+        defines its table, an unqualified one against the nearest scope that
+        defines the column (ambiguity within a scope is an error). A reference
+        that resolves in no scope raises, so a typo never slips through unbound.
+        """
         if col_ref.column == "*":
             return col_ref
+        if col_ref.table is not None:
+            return self._resolve_qualified(scopes, col_ref)
+        return self._resolve_unqualified(scopes, col_ref)
 
-        if col_ref.table:
-            table = tables.get(col_ref.table)
+    def _resolve_qualified(
+        self, scopes: List[Dict[str, Table]], col_ref: ColumnRef
+    ) -> ColumnRef:
+        """Resolve a table-qualified reference to the nearest scope with its table."""
+        for scope in reversed(scopes):
+            table = scope.get(col_ref.table)
             if table is None:
-                for table_name, tbl in tables.items():
-                    column = tbl.get_column(col_ref.column)
-                    if column:
-                        return ColumnRef(
-                            table=col_ref.table,
-                            column=col_ref.column,
-                            data_type=column.data_type,
-                        )
-                return self._unresolved_or_raise(col_ref)
+                continue
             column = table.get_column(col_ref.column)
             if column is None:
-                return self._unresolved_or_raise(col_ref)
+                raise BindingError(
+                    f"Column '{col_ref.column}' not found in table '{col_ref.table}'"
+                )
             return ColumnRef(
-                table=col_ref.table,
-                column=col_ref.column,
-                data_type=column.data_type,
+                table=col_ref.table, column=col_ref.column, data_type=column.data_type
             )
-
-        found_table = None
-        found_column = None
-        for table_name, table in tables.items():
-            column = table.get_column(col_ref.column)
-            if column:
-                if found_column:
-                    raise BindingError(
-                        f"Column '{col_ref.column}' is ambiguous (found in multiple tables)"
-                    )
-                found_table = table_name
-                found_column = column
-
-        if found_column is None:
-            return self._unresolved_or_raise(col_ref)
-
-        return ColumnRef(
-            table=found_table,
-            column=col_ref.column,
-            data_type=found_column.data_type,
-        )
-
-    def _unresolved_or_raise(self, col_ref: ColumnRef) -> ColumnRef:
-        """Keep a column unbound only if an enclosing scope defines it.
-
-        A reference that resolves in no in-scope or enclosing relation is a
-        typo and must raise at bind time, not slip through to a KeyError or a
-        remote UndefinedColumn at execution.
-        """
-        if self._resolves_in_scope_stack(col_ref):
-            return col_ref
         raise BindingError(
-            f"Column '{col_ref.to_sql()}' not found in any table in scope"
+            f"Table '{col_ref.table}' not found in scope for column "
+            f"'{col_ref.column}'"
         )
 
-    def _resolves_in_scope_stack(self, col_ref: ColumnRef) -> bool:
-        """Whether a reference resolves against any enclosing query scope."""
-        for scope in self._scope_stack:
-            if self._scope_defines(scope, col_ref):
-                return True
-        return False
+    def _resolve_unqualified(
+        self, scopes: List[Dict[str, Table]], col_ref: ColumnRef
+    ) -> ColumnRef:
+        """Resolve a bare column name to the nearest scope that defines it."""
+        for scope in reversed(scopes):
+            match = self._match_in_scope(scope, col_ref.column)
+            if match is not None:
+                return match
+        raise BindingError(f"Column '{col_ref.column}' not found in any table in scope")
 
-    def _scope_defines(self, scope: Dict[str, Table], col_ref: ColumnRef) -> bool:
-        """Whether a relation scope defines the referenced column."""
-        if col_ref.table is not None:
-            table = scope.get(col_ref.table)
-            return table is not None and table.get_column(col_ref.column) is not None
-        for table in scope.values():
-            if table.get_column(col_ref.column) is not None:
-                return True
-        return False
-
-    def _get_table_from_plan(self, plan: LogicalPlanNode) -> Optional[Table]:
-        """Extract table metadata from a plan node."""
-        if isinstance(plan, Scan):
-            return self.catalog.get_table(
-                plan.datasource, plan.schema_name, plan.table_name
+    def _match_in_scope(
+        self, scope: Dict[str, Table], column_name: str
+    ) -> Optional[ColumnRef]:
+        """Find a column in one scope; ambiguity across its tables is an error."""
+        found = None
+        for alias, table in scope.items():
+            column = table.get_column(column_name)
+            if column is None:
+                continue
+            if found is not None:
+                raise BindingError(
+                    f"Column '{column_name}' is ambiguous (found in multiple tables)"
+                )
+            found = ColumnRef(
+                table=alias, column=column_name, data_type=column.data_type
             )
-        if isinstance(plan, SubqueryScan):
-            return self._synthetic_table(plan)
-        if isinstance(plan, CTERef):
-            return self._cte_tables.get(plan.name)
-        if hasattr(plan, "input"):
-            return self._get_table_from_plan(plan.input)
-        return None
+        return found
 
-    def _bind_expressions(
-        self, expressions: List[Expression], table: Optional[Table]
-    ) -> List[Expression]:
-        """Bind a list of expressions."""
-        bound = []
-        for expr in expressions:
-            bound_expr = self._bind_expression(expr, table)
-            bound.append(bound_expr)
-        return bound
+    def _bind_expression(self, expr: Expression) -> Expression:
+        """Bind an expression, resolving every column against the scope chain.
 
-    def _bind_expression(self, expr: Expression, table: Optional[Table]) -> Expression:
-        """Bind an expression."""
+        One expression binder serves top-level, join, and subquery contexts:
+        columns resolve through resolve_in_scopes (the live scope stack), which
+        validates the qualifier and raises on an unknown table - so an invalid
+        reference can never bind to a relation the query does not name.
+        """
+        return self._bind_expr_dispatch(
+            expr,
+            lambda value: self._bind_expression(value),
+            lambda col_ref: self.resolve_in_scopes(self._scope_stack, col_ref),
+        )
+
+    def _bind_expr_dispatch(
+        self,
+        expr: Expression,
+        bind: Callable[[Expression], Expression],
+        resolve_column: Callable[[ColumnRef], Expression],
+        subquery_scopes: Optional[List[Dict[str, Table]]] = None,
+    ) -> Expression:
+        """Bind one expression: resolve a column leaf, rebuild a compound node.
+
+        The ONLY things that differ between the single-table, multi-table, and
+        subquery binders are ``resolve_column`` (the column leaf), ``bind`` (how
+        children recurse), and ``subquery_scopes`` (the scopes a nested subquery
+        sees, defaulting to the live scope stack); the dispatch is shared by all.
+        """
         if isinstance(expr, ColumnRef):
-            return self._bind_column_ref(expr, table)
-        if isinstance(expr, Literal):
+            return resolve_column(expr)
+        if isinstance(expr, (Literal, Interval)):
             return expr
-        if isinstance(expr, BinaryOp):
-            return self._bind_binary_op(expr, table)
-        if isinstance(expr, UnaryOp):
-            return self._bind_unary_op(expr, table)
-        if isinstance(expr, InList):
-            return self._bind_in_list(expr, table)
-        if isinstance(expr, BetweenExpression):
-            return self._bind_between(expr, table)
-        if isinstance(expr, CaseExpr):
-            return self._bind_case_expr(expr, table)
-        if isinstance(expr, Cast):
-            return self._bind_cast(
-                expr, lambda value: self._bind_expression(value, table)
-            )
-        if isinstance(expr, Extract):
-            return self._bind_extract(
-                expr, lambda value: self._bind_expression(value, table)
-            )
-        if isinstance(expr, Interval):
-            return expr
-        if isinstance(expr, FunctionCall):
-            return self._bind_function_args(
-                expr, lambda value: self._bind_expression(value, table)
-            )
-        if self._is_subquery_expression(expr):
-            return self._bind_subquery_expr(
-                expr, lambda value: self._bind_expression(value, table)
-            )
-        if isinstance(expr, TupleExpression):
-            return self._bind_tuple(
-                expr, lambda value: self._bind_expression(value, table)
-            )
+        return self._bind_compound_expr(expr, bind, subquery_scopes)
 
-        return expr
+    def _bind_compound_expr(
+        self,
+        expr: Expression,
+        bind: Callable[[Expression], Expression],
+        subquery_scopes: Optional[List[Dict[str, Table]]] = None,
+    ) -> Expression:
+        """Rebuild a compound expression by binding its children with ``bind``.
+
+        Two node types bind specially: a Cast also resolves its target type, and
+        a subquery node threads the binder's scopes into its plan. Every other
+        compound node is a pure structural recurse-and-rebuild, so it goes
+        through the one expression walker (map_children), which rebuilds via
+        model_copy (never dropping a field) and raises on an unmodeled type.
+        """
+        if isinstance(expr, Cast):
+            return self._bind_cast(expr, bind)
+        if self._is_subquery_expression(expr):
+            return self._bind_subquery_expr(expr, bind, scopes=subquery_scopes)
+        return map_children(expr, bind)
 
     def _bind_cast(
         self,
@@ -1188,15 +968,6 @@ class Binder:
             data_type=data_type,
         )
 
-    def _bind_extract(
-        self,
-        expr: Extract,
-        bind_value: Callable[[Expression], Expression],
-    ) -> Extract:
-        """Bind the source of an EXTRACT while preserving its field keyword."""
-        bound_source = bind_value(expr.source)
-        return Extract(field=expr.field, source=bound_source)
-
     def _resolve_cast_type(self, target_type: str) -> DataType:
         """Map a SQL type text such as ``DECIMAL(10, 2)`` to a DataType."""
         keyword = target_type.split("(")[0].strip().upper()
@@ -1204,22 +975,6 @@ class Binder:
         if leading not in _CAST_TYPE_KEYWORDS:
             raise BindingError(f"Unsupported CAST target type: {target_type}")
         return _CAST_TYPE_KEYWORDS[leading]
-
-    def _bind_function_args(
-        self,
-        expr: FunctionCall,
-        bind_value: Callable[[Expression], Expression],
-    ) -> FunctionCall:
-        """Bind the arguments of a function call."""
-        bound_args = []
-        for arg in expr.args:
-            bound_args.append(bind_value(arg))
-        return FunctionCall(
-            function_name=expr.function_name,
-            args=bound_args,
-            is_aggregate=expr.is_aggregate,
-            distinct=expr.distinct,
-        )
 
     def _is_subquery_expression(self, expr: Expression) -> bool:
         """Check whether an expression node carries a subquery plan."""
@@ -1230,120 +985,6 @@ class Binder:
             QuantifiedComparison,
         )
         return isinstance(expr, subquery_types)
-
-    def _bind_tuple(
-        self,
-        expr: TupleExpression,
-        bind_value: Callable[[Expression], Expression],
-    ) -> TupleExpression:
-        """Bind each item of a row value constructor."""
-        bound_items = []
-        for item in expr.items:
-            bound_items.append(bind_value(item))
-        return TupleExpression(items=tuple(bound_items))
-
-    def _bind_column_ref(self, col_ref: ColumnRef, table: Optional[Table]) -> ColumnRef:
-        """Bind a column reference."""
-        if col_ref.column == "*":
-            return col_ref
-
-        if table is None:
-            return col_ref
-
-        column = table.get_column(col_ref.column)
-        if column is None:
-            raise BindingError(
-                f"Column '{col_ref.column}' not found in table '{table.name}'"
-            )
-
-        return ColumnRef(
-            table=col_ref.table,
-            column=col_ref.column,
-            data_type=column.data_type,
-        )
-
-    def _bind_binary_op(self, binary_op: BinaryOp, table: Optional[Table]) -> BinaryOp:
-        """Bind a binary operation."""
-        left = self._bind_expression(binary_op.left, table)
-        right = self._bind_expression(binary_op.right, table)
-        return BinaryOp(op=binary_op.op, left=left, right=right)
-
-    def _bind_unary_op(self, unary_op: UnaryOp, table: Optional[Table]) -> UnaryOp:
-        """Bind a unary operation."""
-        operand = self._bind_expression(unary_op.operand, table)
-        return UnaryOp(op=unary_op.op, operand=operand)
-
-    def _bind_in_list(self, expr: InList, table: Optional[Table]) -> InList:
-        """Bind an IN-list's value and each option against a single table."""
-        bound_value = self._bind_expression(expr.value, table)
-        bound_options: List[Expression] = []
-        for option in expr.options:
-            bound_option = self._bind_expression(option, table)
-            bound_options.append(bound_option)
-        return InList(value=bound_value, options=bound_options)
-
-    def _bind_in_list_multi(
-        self, expr: InList, tables: Dict[Optional[str], Table]
-    ) -> InList:
-        """Bind an IN-list across multiple tables (multi-relation scope)."""
-        bound_value = self._bind_expression_multi_table(expr.value, tables)
-        bound_options: List[Expression] = []
-        for option in expr.options:
-            bound_option = self._bind_expression_multi_table(option, tables)
-            bound_options.append(bound_option)
-        return InList(value=bound_value, options=bound_options)
-
-    def _bind_between(
-        self, expr: BetweenExpression, table: Optional[Table]
-    ) -> BetweenExpression:
-        """Bind a BETWEEN's value/lower/upper operands against a single table."""
-        bound_value = self._bind_expression(expr.value, table)
-        bound_lower = self._bind_expression(expr.lower, table)
-        bound_upper = self._bind_expression(expr.upper, table)
-        return BetweenExpression(
-            value=bound_value,
-            lower=bound_lower,
-            upper=bound_upper,
-        )
-
-    def _bind_between_multi(
-        self, expr: BetweenExpression, tables: Dict[Optional[str], Table]
-    ) -> BetweenExpression:
-        """Bind a BETWEEN expression across multiple tables (multi-relation scope)."""
-        bound_value = self._bind_expression_multi_table(expr.value, tables)
-        bound_lower = self._bind_expression_multi_table(expr.lower, tables)
-        bound_upper = self._bind_expression_multi_table(expr.upper, tables)
-        return BetweenExpression(
-            value=bound_value,
-            lower=bound_lower,
-            upper=bound_upper,
-        )
-
-    def _bind_case_expr(self, expr: CaseExpr, table: Optional[Table]) -> CaseExpr:
-        """Bind a CASE expression's WHEN conditions/results and ELSE on one table."""
-        bound_when = []
-        for condition, result in expr.when_clauses:
-            bound_condition = self._bind_expression(condition, table)
-            bound_result = self._bind_expression(result, table)
-            bound_when.append((bound_condition, bound_result))
-        bound_else = None
-        if expr.else_result is not None:
-            bound_else = self._bind_expression(expr.else_result, table)
-        return CaseExpr(when_clauses=bound_when, else_result=bound_else)
-
-    def _bind_case_expr_multi(
-        self, expr: CaseExpr, tables: Dict[Optional[str], Table]
-    ) -> CaseExpr:
-        """Bind a CASE expression across multiple tables (multi-relation scope)."""
-        bound_when = []
-        for condition, result in expr.when_clauses:
-            bound_condition = self._bind_expression_multi_table(condition, tables)
-            bound_result = self._bind_expression_multi_table(result, tables)
-            bound_when.append((bound_condition, bound_result))
-        bound_else = None
-        if expr.else_result is not None:
-            bound_else = self._bind_expression_multi_table(expr.else_result, tables)
-        return CaseExpr(when_clauses=bound_when, else_result=bound_else)
 
     def __repr__(self) -> str:
         return "Binder()"
@@ -1425,7 +1066,7 @@ class SubqueryPlanBinder:
             for expr in row:
                 bound_row.append(self._bind_expr(expr, self.outer_scopes))
             bound_rows.append(bound_row)
-        return Values(rows=bound_rows, output_names=values.output_names)
+        return values.model_copy(update={"rows": bound_rows})
 
     def _bind_filter(self, filter_node: Filter) -> Filter:
         """Bind a filter, treating Filter-over-Aggregate as HAVING."""
@@ -1442,12 +1083,22 @@ class SubqueryPlanBinder:
         bound_expressions = []
         for expr in projection.expressions:
             bound_expressions.append(self._bind_expr_for(expr, bound_input))
-        return Projection(
-            input=bound_input,
-            expressions=bound_expressions,
-            aliases=projection.aliases,
-            distinct=projection.distinct,
+        return projection.model_copy(
+            update={
+                "input": bound_input,
+                "expressions": bound_expressions,
+                "distinct_on": self._bind_subquery_distinct_on(projection, bound_input),
+            }
         )
+
+    def _bind_subquery_distinct_on(self, projection, bound_input):
+        """Bind a subquery projection's DISTINCT ON keys, or None if absent."""
+        if projection.distinct_on is None:
+            return None
+        bound = []
+        for key in projection.distinct_on:
+            bound.append(self._bind_expr_for(key, bound_input))
+        return bound
 
     def _bind_aggregate(self, aggregate: Aggregate) -> Aggregate:
         """Bind group-by and aggregate expressions."""
@@ -1458,12 +1109,32 @@ class SubqueryPlanBinder:
         bound_aggregates = []
         for expr in aggregate.aggregates:
             bound_aggregates.append(self._bind_expr_for(expr, bound_input))
-        return Aggregate(
-            input=bound_input,
-            group_by=bound_group_by,
-            aggregates=bound_aggregates,
-            output_names=aggregate.output_names,
+
+        def bind_set(grouping_set):
+            bound_keys = []
+            for expr in grouping_set:
+                bound_keys.append(self._bind_expr_for(expr, bound_input))
+            return bound_keys
+
+        return aggregate.model_copy(
+            update={
+                "input": bound_input,
+                "group_by": bound_group_by,
+                "aggregates": bound_aggregates,
+                "grouping_sets": self._bind_grouping_sets(
+                    aggregate.grouping_sets, bind_set
+                ),
+            }
         )
+
+    def _bind_grouping_sets(self, grouping_sets, bind_set):
+        """Bind each grouping set's keys, or None for a flat GROUP BY."""
+        if grouping_sets is None:
+            return None
+        bound = []
+        for grouping_set in grouping_sets:
+            bound.append(bind_set(grouping_set))
+        return bound
 
     def _bind_sort(self, sort: Sort) -> Sort:
         """Bind sort keys against the subquery's relations."""
@@ -1471,12 +1142,7 @@ class SubqueryPlanBinder:
         bound_keys = []
         for key in sort.sort_keys:
             bound_keys.append(self._bind_expr_for(key, bound_input))
-        return Sort(
-            input=bound_input,
-            sort_keys=bound_keys,
-            ascending=sort.ascending,
-            nulls_order=sort.nulls_order,
-        )
+        return sort.model_copy(update={"input": bound_input, "sort_keys": bound_keys})
 
     def _bind_join(self, join: Join) -> Join:
         """Bind a join inside a subquery."""
@@ -1489,54 +1155,31 @@ class SubqueryPlanBinder:
             self.host._add_plan_to_scope(bound_right, local)
             scopes = self.outer_scopes + [local]
             bound_condition = self._bind_expr(join.condition, scopes)
-        return Join(
-            left=bound_left,
-            right=bound_right,
-            join_type=join.join_type,
-            condition=bound_condition,
+        return join.model_copy(
+            update={
+                "left": bound_left,
+                "right": bound_right,
+                "condition": bound_condition,
+            }
         )
 
     def _bind_having(self, predicate: Expression, aggregate: Aggregate) -> Expression:
-        """Bind a HAVING predicate over a subquery aggregate."""
-        alias_map: Dict[str, Expression] = {}
-        for index in range(len(aggregate.output_names)):
-            alias_map[aggregate.output_names[index]] = aggregate.aggregates[index]
+        """Bind a HAVING predicate over a subquery aggregate.
+
+        Delegates to the host's one HAVING binder; only the scope a non-output
+        column resolves against differs - here the outer scopes plus the
+        aggregate's input, so an outer-correlation column also binds.
+        """
+        alias_map = self.host._aggregate_alias_map(aggregate)
         local: Dict[str, Table] = {}
         self.host._add_plan_to_scope(aggregate.input, local)
         scopes = self.outer_scopes + [local]
-        return self._bind_having_expr(predicate, alias_map, scopes)
-
-    def _bind_having_expr(
-        self,
-        expr: Expression,
-        alias_map: Dict[str, Expression],
-        scopes: List[Dict[str, Table]],
-    ) -> Expression:
-        """Bind HAVING parts: aggregate output names first, then scopes."""
-        output_ref = self._having_output_ref(expr, alias_map)
-        if output_ref is not None:
-            return output_ref
-        if isinstance(expr, BinaryOp):
-            left = self._bind_having_expr(expr.left, alias_map, scopes)
-            right = self._bind_having_expr(expr.right, alias_map, scopes)
-            return BinaryOp(op=expr.op, left=left, right=right)
-        if isinstance(expr, UnaryOp):
-            operand = self._bind_having_expr(expr.operand, alias_map, scopes)
-            return UnaryOp(op=expr.op, operand=operand)
-        return self._bind_expr(expr, scopes)
-
-    def _having_output_ref(
-        self, expr: Expression, alias_map: Dict[str, Expression]
-    ) -> Optional[ColumnRef]:
-        """Resolve a bare column against the aggregate's output names."""
-        if not isinstance(expr, ColumnRef):
-            return None
-        if expr.table is not None:
-            return None
-        source = alias_map.get(expr.column)
-        if source is None:
-            return None
-        return ColumnRef(table=None, column=expr.column, data_type=source.get_type())
+        return self.host._bind_having_with(
+            predicate,
+            alias_map,
+            lambda col_ref: self.host.resolve_in_scopes(scopes, col_ref),
+            subquery_scopes=list(scopes),
+        )
 
     def _bind_expr_for(
         self, expr: Expression, bound_input: LogicalPlanNode
@@ -1549,141 +1192,17 @@ class SubqueryPlanBinder:
     def _bind_expr(
         self, expr: Expression, scopes: List[Dict[str, Table]]
     ) -> Expression:
-        """Bind one expression with innermost-first scope resolution."""
-        if isinstance(expr, ColumnRef):
-            return self._resolve_column(expr, scopes)
-        if isinstance(expr, Literal):
-            return expr
-        return self._bind_compound_expr(expr, scopes)
+        """Bind one expression via the shared dispatch, resolving against scopes.
 
-    def _bind_compound_expr(
-        self, expr: Expression, scopes: List[Dict[str, Table]]
-    ) -> Expression:
-        """Bind binary/unary/function expressions."""
-        if isinstance(expr, BinaryOp):
-            left = self._bind_expr(expr.left, scopes)
-            right = self._bind_expr(expr.right, scopes)
-            return BinaryOp(op=expr.op, left=left, right=right)
-        if isinstance(expr, UnaryOp):
-            return UnaryOp(op=expr.op, operand=self._bind_expr(expr.operand, scopes))
-        if isinstance(expr, FunctionCall):
-            bound_args = []
-            for arg in expr.args:
-                bound_args.append(self._bind_expr(arg, scopes))
-            return FunctionCall(
-                function_name=expr.function_name,
-                args=bound_args,
-                is_aggregate=expr.is_aggregate,
-                distinct=expr.distinct,
-            )
-        return self._bind_special_expr(expr, scopes)
-
-    def _bind_special_expr(
-        self, expr: Expression, scopes: List[Dict[str, Table]]
-    ) -> Expression:
-        """Bind CASE / IN-list / BETWEEN / tuple expressions."""
-        if isinstance(expr, CaseExpr):
-            return self._bind_case(expr, scopes)
-        if isinstance(expr, InList):
-            value = self._bind_expr(expr.value, scopes)
-            options = []
-            for option in expr.options:
-                options.append(self._bind_expr(option, scopes))
-            return InList(value=value, options=options)
-        if isinstance(expr, BetweenExpression):
-            return BetweenExpression(
-                value=self._bind_expr(expr.value, scopes),
-                lower=self._bind_expr(expr.lower, scopes),
-                upper=self._bind_expr(expr.upper, scopes),
-            )
-        return self._bind_subquery_or_tuple(expr, scopes)
-
-    def _bind_subquery_or_tuple(
-        self, expr: Expression, scopes: List[Dict[str, Table]]
-    ) -> Expression:
-        """Bind nested subquery expressions and tuples; reject unknowns."""
-        if isinstance(expr, TupleExpression):
-            bound_items = []
-            for item in expr.items:
-                bound_items.append(self._bind_expr(item, scopes))
-            return TupleExpression(items=tuple(bound_items))
-        if self.host._is_subquery_expression(expr):
-            return self.host._bind_subquery_expr(
-                expr,
-                lambda value: self._bind_expr(value, scopes),
-                scopes=list(scopes),
-            )
-        raise BindingError(f"Unsupported expression in subquery: {type(expr).__name__}")
-
-    def _bind_case(self, expr: CaseExpr, scopes: List[Dict[str, Table]]) -> CaseExpr:
-        """Bind all branches of a CASE expression."""
-        bound_when = []
-        for condition, result in expr.when_clauses:
-            bound_condition = self._bind_expr(condition, scopes)
-            bound_result = self._bind_expr(result, scopes)
-            bound_when.append((bound_condition, bound_result))
-        bound_else = None
-        if expr.else_result is not None:
-            bound_else = self._bind_expr(expr.else_result, scopes)
-        return CaseExpr(when_clauses=bound_when, else_result=bound_else)
-
-    def _resolve_column(
-        self, col_ref: ColumnRef, scopes: List[Dict[str, Table]]
-    ) -> ColumnRef:
-        """Resolve a column reference innermost-first across scopes."""
-        if col_ref.column == "*":
-            return col_ref
-        if col_ref.table is not None:
-            return self._resolve_qualified(col_ref, scopes)
-        return self._resolve_unqualified(col_ref, scopes)
-
-    def _resolve_qualified(
-        self, col_ref: ColumnRef, scopes: List[Dict[str, Table]]
-    ) -> ColumnRef:
-        """Resolve a table-qualified reference to its nearest scope."""
-        for scope in reversed(scopes):
-            table = scope.get(col_ref.table)
-            if table is None:
-                continue
-            column = table.get_column(col_ref.column)
-            if column is None:
-                raise BindingError(
-                    f"Column '{col_ref.column}' not found in table '{col_ref.table}'"
-                )
-            return ColumnRef(
-                table=col_ref.table,
-                column=col_ref.column,
-                data_type=column.data_type,
-            )
-        raise BindingError(f"Unknown table '{col_ref.table}' in subquery")
-
-    def _resolve_unqualified(
-        self, col_ref: ColumnRef, scopes: List[Dict[str, Table]]
-    ) -> ColumnRef:
-        """Resolve a bare column name to the nearest scope defining it."""
-        for scope in reversed(scopes):
-            match = self._match_in_scope(col_ref.column, scope)
-            if match is not None:
-                return match
-        raise BindingError(f"Column '{col_ref.column}' not found in any visible scope")
-
-    def _match_in_scope(
-        self, column_name: str, scope: Dict[str, Table]
-    ) -> Optional[ColumnRef]:
-        """Find a column in one scope; ambiguity is an error."""
-        found = None
-        for alias, table in scope.items():
-            column = table.get_column(column_name)
-            if column is None:
-                continue
-            if found is not None:
-                raise BindingError(
-                    f"Column '{column_name}' is ambiguous in subquery scope"
-                )
-            found = ColumnRef(
-                table=alias, column=column_name, data_type=column.data_type
-            )
-        return found
+        The compound dispatch is the host binder's; only the column leaf (the
+        scope chain) and the nested-subquery scopes differ here.
+        """
+        return self.host._bind_expr_dispatch(
+            expr,
+            lambda value: self._bind_expr(value, scopes),
+            lambda col_ref: self.host.resolve_in_scopes(scopes, col_ref),
+            subquery_scopes=list(scopes),
+        )
 
     def __repr__(self) -> str:
         return f"SubqueryPlanBinder(scopes={len(self.outer_scopes)})"

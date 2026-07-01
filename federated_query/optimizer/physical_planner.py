@@ -29,6 +29,7 @@ from ..plan.physical import (
     PhysicalPlanNode,
     PhysicalScan,
     PhysicalProjection,
+    PhysicalWindow,
     PhysicalFilter,
     PhysicalLimit,
     PhysicalHashJoin,
@@ -47,11 +48,20 @@ from ..plan.physical import (
     PhysicalCTE,
     PhysicalCTEScan,
     PhysicalCTEMergeQuery,
+    PhysicalAliasedRelation,
 )
-from ..plan.expressions import BinaryOp, BinaryOpType, ColumnRef, Literal, Expression
-from .single_source_pushdown import SingleSourcePushdown
+from ..plan.expressions import (
+    BinaryOp,
+    BinaryOpType,
+    ColumnRef,
+    Literal,
+    Expression,
+    split_conjuncts as _split_and,
+)
+from .single_source_pushdown import SingleSourcePushdown, same_source
+from ..parser.errors import UnsupportedSQLError
 from typing import List, Tuple
-from dataclasses import dataclass
+from ..model import StateModel
 
 # Comparison operators a LATERAL correlation can use to derive a domain filter.
 _COMPARISONS = {
@@ -71,19 +81,11 @@ _FLIP_OP = {
 }
 
 
-def _split_and(expr: Expression) -> List[Expression]:
-    """Flatten a predicate into its top-level AND conjuncts."""
-    if isinstance(expr, BinaryOp) and expr.op == BinaryOpType.AND:
-        return _split_and(expr.left) + _split_and(expr.right)
-    return [expr]
-
-
 if TYPE_CHECKING:
     from ..processor.query_executor import QueryExecutor
 
 
-@dataclass(frozen=True)
-class _JoinSides:
+class _JoinSides(StateModel):
     """Relation qualifiers and bare column names exposed by each join side."""
 
     left_aliases: set
@@ -163,7 +165,9 @@ class PhysicalPlanner:
         if isinstance(node, Values):
             return PhysicalValues(rows=node.rows, output_names=node.output_names)
         if isinstance(node, SubqueryScan):
-            return self._plan_node(node.input)
+            return PhysicalAliasedRelation(
+                input=self._plan_node(node.input), alias=node.alias
+            )
         if isinstance(node, LateralJoin):
             return self._plan_lateral_join(node)
         return self._plan_guard_node(node)
@@ -177,7 +181,7 @@ class PhysicalPlanner:
         the LATERAL runs in the in-memory DuckDB, with the base reduced to the
         left's correlation domain (a dynamic filter) before transfer.
         """
-        base_scans = self._lateral_base_scans(node.right)
+        base_scans = self._collect_base_scans(node.right)
         if len(base_scans) != 1:
             raise ValueError(
                 "Cross-source LATERAL with multiple base relations is not "
@@ -205,15 +209,6 @@ class PhysicalPlanner:
                 node.right, base_alias, outer_alias
             ),
         )
-
-    def _lateral_base_scans(self, node: LogicalPlanNode) -> List[Scan]:
-        """Collect the base scans of a LATERAL right side."""
-        if isinstance(node, Scan):
-            return [node]
-        scans: List[Scan] = []
-        for child in node.children():
-            scans.extend(self._lateral_base_scans(child))
-        return scans
 
     def _lateral_outer_alias(self, node: LateralJoin) -> str:
         """The left relation's alias, referenced by the right's correlation."""
@@ -310,9 +305,11 @@ class PhysicalPlanner:
             filters=scan.filters,
             datasource_connection=datasource,
             group_by=scan.group_by,
+            grouping_sets=scan.grouping_sets,
             aggregates=scan.aggregates,
             output_names=scan.output_names,
             alias=scan.alias,
+            sample=scan.sample,
             limit=scan.limit,
             offset=scan.offset,
             order_by_keys=scan.order_by_keys,
@@ -326,9 +323,18 @@ class PhysicalPlanner:
         input_plan = self._plan_node(filter_node.input)
         return PhysicalFilter(input=input_plan, predicate=filter_node.predicate)
 
-    def _plan_projection(self, projection: Projection) -> PhysicalProjection:
-        """Plan a projection node."""
+    def _plan_projection(self, projection: Projection) -> PhysicalPlanNode:
+        """Plan a projection; window-bearing ones run in the merge engine."""
         input_plan = self._plan_node(projection.input)
+        if self._projection_has_window(projection):
+            # DISTINCT (incl. DISTINCT ON) over a window is rejected at parse by
+            # _reject_distinct_window, so a window projection is never distinct
+            # here - no distinct handling needed on this path.
+            return PhysicalWindow(
+                input=input_plan,
+                expressions=projection.expressions,
+                output_names=projection.aliases,
+            )
         if projection.distinct:
             self._propagate_distinct(input_plan)
         return PhysicalProjection(
@@ -336,7 +342,30 @@ class PhysicalPlanner:
             expressions=projection.expressions,
             output_names=projection.aliases,
             distinct=projection.distinct,
+            distinct_on=projection.distinct_on,
         )
+
+    def _projection_has_window(self, projection: Projection) -> bool:
+        """Whether any projection expression contains a window function.
+
+        Recurses the expression tree so a window nested inside an expression
+        (e.g. ``row_number() OVER (...) + 1``) still selects PhysicalWindow.
+        """
+        for expr in projection.expressions:
+            if self._expression_has_window(expr):
+                return True
+        return False
+
+    def _expression_has_window(self, expr) -> bool:
+        """Whether an expression tree contains a WindowExpr at any depth."""
+        from ..plan.expressions import WindowExpr, expression_children
+
+        if isinstance(expr, WindowExpr):
+            return True
+        for child in expression_children(expr):
+            if self._expression_has_window(child):
+                return True
+        return False
 
     def _propagate_distinct(self, node: PhysicalPlanNode) -> None:
         """Mark the lowest scan-like node to emit DISTINCT."""
@@ -398,21 +427,24 @@ class PhysicalPlanner:
             group_by=aggregate.group_by,
             aggregates=aggregate.aggregates,
             output_names=aggregate.output_names,
+            grouping_sets=aggregate.grouping_sets,
         )
 
     def _plan_remote_join_aggregate(
         self, aggregate: Aggregate, remote_join: PhysicalRemoteJoin
     ) -> PhysicalRemoteJoin:
-        """Fold an aggregate onto a remote join so both push as one remote query."""
-        return PhysicalRemoteJoin(
-            left=remote_join.left,
-            right=remote_join.right,
-            join_type=remote_join.join_type,
-            condition=remote_join.condition,
-            datasource_connection=remote_join.datasource_connection,
-            group_by=aggregate.group_by,
-            aggregates=aggregate.aggregates,
-            output_names=aggregate.output_names,
+        """Fold an aggregate onto a remote join so both push as one remote query.
+
+        Uses model_copy so the join's own fields (distinct/order_by_*) survive;
+        re-listing fields would silently drop any omitted one.
+        """
+        return remote_join.model_copy(
+            update={
+                "group_by": aggregate.group_by,
+                "grouping_sets": aggregate.grouping_sets,
+                "aggregates": aggregate.aggregates,
+                "output_names": aggregate.output_names,
+            }
         )
 
     def _plan_explain(self, explain: Explain) -> PhysicalExplain:
@@ -497,6 +529,15 @@ class PhysicalPlanner:
         remote = self._try_plan_remote_join(join, left_plan, right_plan)
         if remote:
             return remote
+        if join.condition is None and (join.natural or join.using):
+            # Same-source NATURAL/USING is rendered as-is by the remote path
+            # above. Reaching here means a cross-source NATURAL/USING join whose
+            # name-match equality the merge engine cannot resolve; building a
+            # conditionless nested loop would be a silent Cartesian product.
+            raise UnsupportedSQLError(
+                "cross-source NATURAL/USING join is not supported; "
+                "use an explicit ON condition"
+            )
         hash_join = self._plan_hash_join_or_none(join, left_plan, right_plan)
         if hash_join:
             return hash_join
@@ -594,13 +635,6 @@ class PhysicalPlanner:
         """Whether an equality compares a column reference to a literal."""
         return {type(predicate.left), type(predicate.right)} == {ColumnRef, Literal}
 
-        return PhysicalNestedLoopJoin(
-            left=left_plan,
-            right=right_plan,
-            join_type=join.join_type,
-            condition=join.condition,
-        )
-
     def _mark_dynamic_filter(self, hash_join: PhysicalHashJoin) -> None:
         """Mark the probe-side scan that will receive a runtime IN filter.
 
@@ -685,12 +719,20 @@ class PhysicalPlanner:
     def _orient_by_name(
         self, first: ColumnRef, second: ColumnRef, sides: "_JoinSides"
     ) -> Tuple[ColumnRef, ColumnRef]:
-        """Orient using bare column names when qualifiers do not resolve."""
+        """Orient using bare column names when qualifiers do not resolve.
+
+        Raises when neither column resolves to a side: the planner cannot tell
+        which key belongs to which input, and keeping the original order would
+        key the hash join on mismatched columns (wrong or empty results).
+        """
         if first.column in sides.left_names and second.column in sides.right_names:
             return first, second
         if first.column in sides.right_names and second.column in sides.left_names:
             return second, first
-        return first, second
+        raise ValueError(
+            f"cannot orient join keys '{first.column}' / '{second.column}' to a "
+            "join side; neither resolves by qualifier or by column name"
+        )
 
     def _relation_aliases(self, plan) -> set:
         """Collect the relation aliases/names a plan subtree exposes."""
@@ -699,7 +741,13 @@ class PhysicalPlanner:
         return aliases
 
     def _collect_relation_aliases(self, plan, aliases: set) -> None:
-        """Recursively gather Scan/SubqueryScan qualifiers from a subtree."""
+        """Recursively gather the relation qualifiers a subtree EXPOSES.
+
+        Stops at a SubqueryScan boundary - its alias is exposed, its internals
+        are not (SQL scoping). This is deliberately NOT decorrelation's
+        _collect_inner_aliases, which recurses into a subquery to find every
+        inner name for correlation analysis; the two answer different questions.
+        """
         if isinstance(plan, Scan):
             aliases.add(plan.alias if plan.alias else plan.table_name)
             return
@@ -757,10 +805,10 @@ class PhysicalPlanner:
             return False
         if not isinstance(right_plan, PhysicalScan):
             return False
-        if left_plan.datasource != right_plan.datasource:
+        if not same_source(left_plan.datasource, right_plan.datasource):
             return False
         ds = left_plan.datasource_connection
-        if ds is None or ds != right_plan.datasource_connection:
+        if ds is None:
             return False
         if not ds.supports_capability(DataSourceCapability.JOINS):
             return False
@@ -824,10 +872,10 @@ class PhysicalPlanner:
         right_branch = self._as_pushable_set_branch(right)
         if left_branch is None or right_branch is None:
             return None
-        if left_branch.datasource != right_branch.datasource:
+        if not same_source(left_branch.datasource, right_branch.datasource):
             return None
         connection = left_branch.datasource_connection
-        if connection is None or connection != right_branch.datasource_connection:
+        if connection is None:
             return None
         return PhysicalRemoteSetOp(
             left=left_branch,
@@ -887,25 +935,12 @@ class PhysicalPlanner:
     def _scan_with_columns(
         self, scan: PhysicalScan, columns: List[str]
     ) -> PhysicalScan:
-        """Clone a scan, replacing its projected column list."""
-        return PhysicalScan(
-            datasource=scan.datasource,
-            schema_name=scan.schema_name,
-            table_name=scan.table_name,
-            columns=columns,
-            filters=scan.filters,
-            datasource_connection=scan.datasource_connection,
-            group_by=scan.group_by,
-            aggregates=scan.aggregates,
-            output_names=scan.output_names,
-            alias=scan.alias,
-            limit=scan.limit,
-            offset=scan.offset,
-            order_by_keys=scan.order_by_keys,
-            order_by_ascending=scan.order_by_ascending,
-            order_by_nulls=scan.order_by_nulls,
-            distinct=scan.distinct,
-        )
+        """Clone a scan, replacing its projected column list.
+
+        Uses model_copy so every other field (including sample/grouping_sets)
+        is preserved; re-listing fields would silently drop any omitted one.
+        """
+        return scan.model_copy(update={"columns": columns})
 
     def _plan_local_set_op(
         self,

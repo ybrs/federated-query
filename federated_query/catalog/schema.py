@@ -1,43 +1,64 @@
 """Schema metadata classes."""
 
-from dataclasses import dataclass
 from typing import List, Optional, Dict
+
+from pydantic import Field, model_validator
+
+from ..model import StateModel
 from ..plan.expressions import DataType
 
 
-@dataclass
-class Column:
+class Column(StateModel):
     """Column metadata."""
 
     name: str
     data_type: DataType
     nullable: bool
-    table: Optional["Table"] = None
+    # Parent back-reference, set by the owning Table. A private attr (not a
+    # field) so the column/table/schema graph stays acyclic for equality and
+    # serialization; it is navigational, not part of the column's identity.
+    _table: Optional["Table"] = None
+
+    @property
+    def table(self) -> Optional["Table"]:
+        """The owning table (a read-only view of the back-reference)."""
+        return self._table
 
     def fully_qualified_name(self) -> str:
         """Get fully qualified column name."""
-        if self.table:
-            return f"{self.table.fully_qualified_name()}.{self.name}"
+        if self._table:
+            return f"{self._table.fully_qualified_name()}.{self.name}"
         return self.name
 
     def __repr__(self) -> str:
         return f"Column({self.name}, {self.data_type.value})"
 
 
-@dataclass
-class Table:
+class Table(StateModel):
     """Table metadata."""
 
     name: str
-    schema: Optional["Schema"] = None
-    columns: List[Column] = None
+    columns: List[Column] = Field(default_factory=list)
+    # Parent back-reference, set by the owning Schema (private; see Column._table).
+    _schema: Optional["Schema"] = None
 
-    def __post_init__(self):
-        if self.columns is None:
-            self.columns = []
-        # Set back-reference to table
+    @property
+    def schema(self) -> Optional["Schema"]:
+        """The owning schema (a read-only view of the back-reference)."""
+        return self._schema
+
+    @model_validator(mode="after")
+    def _link_columns(self) -> "Table":
+        """Point each column back at this table.
+
+        Runs on construction only; ``model_copy`` does not re-run validators, so
+        a copied Table's columns would keep the original's back-ref. Catalog
+        objects are built once and never copied, so this is fine - revisit if
+        that changes.
+        """
         for col in self.columns:
-            col.table = self
+            col._table = self
+        return self
 
     def get_column(self, name: str) -> Optional[Column]:
         """Get column by name."""
@@ -48,28 +69,35 @@ class Table:
 
     def fully_qualified_name(self) -> str:
         """Get fully qualified table name."""
-        if self.schema:
-            return f"{self.schema.datasource}.{self.schema.name}.{self.name}"
+        if self._schema:
+            return f"{self._schema.datasource}.{self._schema.name}.{self.name}"
         return self.name
 
     def __repr__(self) -> str:
         return f"Table({self.name}, cols={len(self.columns)})"
 
 
-@dataclass
-class Schema:
+class Schema(StateModel):
     """Schema metadata."""
 
     name: str
     datasource: str
-    tables: Dict[str, Table] = None
+    tables: Dict[str, Table] = Field(default_factory=dict)
 
-    def __post_init__(self):
-        if self.tables is None:
-            self.tables = {}
-        # Set back-reference to schema
-        for table in self.tables.values():
-            table.schema = self
+    @model_validator(mode="after")
+    def _link_tables(self) -> "Schema":
+        """Lowercase table keys and point each table back at this schema.
+
+        get_table/add_table key by lowercase name; normalizing here keeps a
+        directly-constructed ``tables`` dict consistent, so a mixed-case key is
+        not silently unreachable via get_table.
+        """
+        normalized = {}
+        for key, table in self.tables.items():
+            table._schema = self
+            normalized[key.lower()] = table
+        self.tables = normalized
+        return self
 
     def get_table(self, name: str) -> Optional[Table]:
         """Get table by name."""
@@ -77,7 +105,7 @@ class Schema:
 
     def add_table(self, table: Table) -> None:
         """Add a table to this schema."""
-        table.schema = self
+        table._schema = self
         self.tables[table.name.lower()] = table
 
     def __repr__(self) -> str:

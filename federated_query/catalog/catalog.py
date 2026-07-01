@@ -3,7 +3,7 @@
 from typing import Dict, Optional, List, Tuple
 from ..datasources.base import DataSource
 from .schema import Schema, Table, Column
-from ..plan.expressions import DataType
+from ..plan.arrow_types import is_renderable
 
 
 class Catalog:
@@ -46,11 +46,15 @@ class Catalog:
                 for table_name in table_names:
                     metadata = datasource.get_table_metadata(schema_name, table_name)
 
-                    # Convert to our Column format
+                    # Convert to our Column format. The source maps its own
+                    # native type, so the catalog and the execution path never
+                    # disagree on what a column is; the engine guarantees that
+                    # DataType renders to Arrow, so a source that ever produces a
+                    # non-renderable type fails loudly here, not mid-query.
                     columns = []
                     for col_meta in metadata.columns:
-                        # TODO: Proper type mapping
-                        data_type = self._map_type(col_meta.data_type)
+                        data_type = datasource.map_native_type(col_meta.data_type)
+                        self._require_renderable(col_meta.name, data_type)
                         columns.append(
                             Column(
                                 name=col_meta.name,
@@ -66,6 +70,19 @@ class Catalog:
                 self.schemas[(ds_name, schema_name)] = schema
 
         self._metadata_loaded = True
+
+    def _require_renderable(self, column_name: str, data_type) -> None:
+        """Raise if a column's mapped DataType has no Arrow rendering.
+
+        The connector type contract: map_native_type must yield a DataType the
+        engine can render to Arrow. A gap is a connector bug, surfaced here with
+        the offending column rather than as a later execution crash.
+        """
+        if not is_renderable(data_type):
+            raise ValueError(
+                f"Column {column_name!r} maps to DataType {data_type.value}, "
+                f"which has no Arrow rendering"
+            )
 
     def get_datasource(self, name: str) -> Optional[DataSource]:
         """Get data source by name.
@@ -107,102 +124,6 @@ class Catalog:
         if schema:
             return schema.get_table(table_name)
         return None
-
-    def resolve_table(self, table_ref: str) -> Optional[Tuple[str, str, str, Table]]:
-        """Resolve a table reference to its components.
-
-        Supports formats:
-        - datasource.schema.table
-        - schema.table (searches all data sources)
-        - table (searches all schemas)
-
-        Args:
-            table_ref: Table reference string
-
-        Returns:
-            Tuple of (datasource, schema, table_name, Table) if found, None otherwise
-        """
-        parts = table_ref.split(".")
-
-        if len(parts) == 3:
-            # Fully qualified: datasource.schema.table
-            ds, schema_name, table_name = parts
-            table = self.get_table(ds, schema_name, table_name)
-            if table:
-                return (ds, schema_name, table_name, table)
-
-        elif len(parts) == 2:
-            # schema.table - search all data sources
-            schema_name, table_name = parts
-            for (ds, sch_name), schema in self.schemas.items():
-                if sch_name.lower() == schema_name.lower():
-                    table = schema.get_table(table_name)
-                    if table:
-                        return (ds, sch_name, table_name, table)
-
-        elif len(parts) == 1:
-            # Just table name - search all schemas
-            table_name = parts[0]
-            for (ds, sch_name), schema in self.schemas.items():
-                table = schema.get_table(table_name)
-                if table:
-                    return (ds, sch_name, table_name, table)
-
-        return None
-
-    def _map_type(self, type_str: str) -> DataType:
-        """Map a database type string to a DataType, most specific first.
-
-        Ordering matters: TIMESTAMP/DATETIME must be matched before DATE (else
-        ``DATETIME`` mis-maps to DATE), and integer matching must be word-aware
-        so ``POINT`` (which contains ``INT``) is not read as an integer.
-        """
-        normalized = type_str.upper().split("(")[0].strip()
-        temporal = self._map_temporal_type(normalized)
-        if temporal is not None:
-            return temporal
-        numeric = self._map_numeric_type(normalized)
-        if numeric is not None:
-            return numeric
-        return self._map_textual_type(normalized)
-
-    def _map_temporal_type(self, type_str: str) -> Optional[DataType]:
-        """Map date/time types, checking TIMESTAMP/DATETIME before DATE."""
-        if "TIMESTAMP" in type_str or "DATETIME" in type_str:
-            return DataType.TIMESTAMP
-        if "DATE" in type_str:
-            return DataType.DATE
-        if "TIME" in type_str:
-            return DataType.TIMESTAMP
-        return None
-
-    def _map_numeric_type(self, type_str: str) -> Optional[DataType]:
-        """Map numeric types; integer match avoids the POINT/INT trap."""
-        if "DOUBLE" in type_str or "NUMERIC" in type_str or "DECIMAL" in type_str:
-            return DataType.DOUBLE
-        if "FLOAT" in type_str or "REAL" in type_str:
-            return DataType.FLOAT
-        if "BIGINT" in type_str or "INT8" in type_str or "BIGSERIAL" in type_str:
-            return DataType.BIGINT
-        if self._is_integer_type(type_str):
-            return DataType.INTEGER
-        return None
-
-    def _is_integer_type(self, type_str: str) -> bool:
-        """Whether a type name denotes an integer (word-aware, not POINT)."""
-        return type_str.startswith("INT") or type_str in (
-            "SMALLINT",
-            "SERIAL",
-            "INTEGER",
-        )
-
-    def _map_textual_type(self, type_str: str) -> DataType:
-        """Map boolean and string types, defaulting unknowns to VARCHAR."""
-        if "BOOL" in type_str:
-            return DataType.BOOLEAN
-        if "CHAR" in type_str or "TEXT" in type_str or "STRING" in type_str:
-            return DataType.VARCHAR if "VAR" in type_str else DataType.TEXT
-        return DataType.VARCHAR
 
     def __repr__(self) -> str:
         return (

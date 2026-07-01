@@ -91,6 +91,196 @@ def test_bind_scan_with_invalid_column(catalog_with_test_data):
     assert "not found" in str(exc_info.value)
 
 
+def test_bind_invalid_column_in_compound_predicate_over_join(catalog_with_test_data):
+    """An invalid column inside IN/BETWEEN/etc. in a join's WHERE must raise.
+
+    These compound predicates over a join were previously returned unbound, so
+    a nonexistent column inside them slipped through unvalidated.
+    """
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = (
+        "SELECT u.id FROM testdb.public.users u "
+        "JOIN testdb.public.orders o ON u.id = o.order_id "
+        "WHERE u.nonexistent IN (1, 2)"
+    )
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
+
+    with pytest.raises(BindingError) as exc_info:
+        binder.bind(plan)
+    assert "not found" in str(exc_info.value)
+
+
+def test_bind_valid_compound_predicate_over_join(catalog_with_test_data):
+    """A valid IN/BETWEEN in a join's WHERE still binds without error."""
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = (
+        "SELECT u.id FROM testdb.public.users u "
+        "JOIN testdb.public.orders o ON u.id = o.order_id "
+        "WHERE u.name IN ('a', 'b') AND o.amount BETWEEN 1 AND 9"
+    )
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
+
+    assert binder.bind(plan) is not None
+
+
+def test_bind_unknown_table_qualifier_over_join_raises(catalog_with_test_data):
+    """A column with an unknown table qualifier must raise, not silently rebind.
+
+    `x` is not a table or alias in scope; previously the binder scanned the
+    other tables by column name and bound to the first match, accepting a typo.
+    """
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = (
+        "SELECT u.id FROM testdb.public.users u "
+        "JOIN testdb.public.orders o ON u.id = o.order_id "
+        "WHERE x.name = 'a'"
+    )
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
+
+    with pytest.raises(BindingError) as exc_info:
+        binder.bind(plan)
+    assert "not found" in str(exc_info.value)
+
+
+def test_bind_table_name_qualifier_when_aliased_raises(catalog_with_test_data):
+    """Once a table is aliased, its real name is no longer a valid qualifier."""
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = (
+        "SELECT u.id FROM testdb.public.users u "
+        "JOIN testdb.public.orders o ON u.id = o.order_id "
+        "WHERE users.name = 'a'"
+    )
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
+
+    with pytest.raises(BindingError):
+        binder.bind(plan)
+
+
+def test_bind_single_table_bogus_qualifier_in_projection_raises(catalog_with_test_data):
+    """A bogus qualifier on a single-table query MUST raise, not return rows.
+
+    `x` is not the table or its alias, so `x.id` references a relation the query
+    never names. Accepting it (binding `x.id` to `users.id` and returning rows)
+    is an EPIC FAIL: the engine would answer an invalid query as if it were
+    valid. There is one resolver path; it validates the qualifier and raises.
+    """
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = "SELECT x.id FROM testdb.public.users u"
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
+
+    with pytest.raises(BindingError) as exc_info:
+        binder.bind(plan)
+    assert "not found" in str(exc_info.value)
+
+
+def test_bind_single_table_bogus_qualifier_in_where_raises(catalog_with_test_data):
+    """A bogus qualifier in a single-table WHERE must raise, not silently rebind."""
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = "SELECT u.id FROM testdb.public.users u WHERE x.name = 'a'"
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
+
+    with pytest.raises(BindingError) as exc_info:
+        binder.bind(plan)
+    assert "not found" in str(exc_info.value)
+
+
+def test_bind_single_table_real_name_qualifier_when_aliased_raises(
+    catalog_with_test_data,
+):
+    """On a single aliased table, the real table name is not a valid qualifier."""
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = "SELECT users.id FROM testdb.public.users u"
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
+
+    with pytest.raises(BindingError):
+        binder.bind(plan)
+
+
+def test_bind_having_function_argument_is_bound(catalog_with_test_data):
+    """A column inside a HAVING function is bound, not left unresolved.
+
+    Regression guard: the HAVING binder once fell through to ``return expr`` for
+    a FunctionCall, leaving its ColumnRef argument unbound (no data_type) to
+    crash later at execution. Routing through the shared dispatch binds it.
+    """
+    from federated_query.plan.expressions import column_refs
+
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = (
+        "SELECT name, COUNT(*) AS n FROM testdb.public.users "
+        "GROUP BY name HAVING upper(name) = 'X'"
+    )
+    bound_plan = binder.bind(parser.parse_to_logical_plan(sql, catalog_with_test_data))
+    found = column_refs(bound_plan.predicate)
+    assert len(found) > 0
+    for ref in found:
+        assert ref.data_type is not None
+
+
+def test_bind_cast_resolves_data_type(catalog_with_test_data):
+    """A CAST binds its inner column AND resolves its target into a data_type.
+
+    Compound expressions bind through map_children, but a CAST keeps a binder
+    arm: map_children only maps child expressions, so without the special arm the
+    target type would stay unresolved.
+    """
+    from federated_query.plan.expressions import Cast, column_refs
+
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = "SELECT CAST(age AS BIGINT) FROM testdb.public.users"
+    bound = binder.bind(parser.parse_to_logical_plan(sql, catalog_with_test_data))
+    cast = bound.expressions[0]
+    assert isinstance(cast, Cast)
+    assert cast.data_type == DataType.BIGINT
+    for ref in column_refs(cast):
+        assert ref.data_type is not None
+
+
+def test_bind_compound_expression_binds_every_leaf(catalog_with_test_data):
+    """A CASE/BETWEEN compound binds every nested ColumnRef via map_children."""
+    from federated_query.plan.expressions import column_refs
+
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = (
+        "SELECT CASE WHEN age BETWEEN 18 AND 65 THEN name ELSE email END "
+        "FROM testdb.public.users"
+    )
+    bound = binder.bind(parser.parse_to_logical_plan(sql, catalog_with_test_data))
+    refs = column_refs(bound.expressions[0])
+    assert len(refs) >= 3
+    for ref in refs:
+        assert ref.data_type is not None
+
+
+def test_bind_invalid_column_in_having_should_raise(catalog_with_test_data):
+    """A column that exists only inside a HAVING aggregate is rejected at bind.
+
+    The one HAVING binder walks the predicate through the shared expression
+    dispatch, so a FunctionCall argument like ``SUM(nonexistent_col)`` is bound
+    and an unknown column raises BindingError at bind time (it no longer leaves
+    the argument unbound to crash later at execution).
+    """
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = (
+        "SELECT amount FROM testdb.public.orders "
+        "GROUP BY amount HAVING SUM(nonexistent_col) > 10"
+    )
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
+    with pytest.raises(BindingError):
+        binder.bind(plan)
+
+
 def test_bind_with_where_clause(catalog_with_test_data):
     """Test binding with WHERE clause."""
     parser = Parser()
@@ -130,6 +320,7 @@ def test_bind_resolves_column_types(catalog_with_test_data):
         # Check that expressions have types
         for expr in current.expressions:
             from federated_query.plan.expressions import ColumnRef
+
             if isinstance(expr, ColumnRef):
                 # Should have type set
                 assert expr.data_type is not None

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import sqlglot
@@ -11,6 +10,7 @@ import pytest
 
 from federated_query.catalog import Catalog
 from federated_query.datasources.duckdb import DuckDBDataSource
+from federated_query.model import StateModel
 
 
 class ProxyingDuckDBDataSource(DuckDBDataSource):
@@ -31,8 +31,7 @@ class ProxyingDuckDBDataSource(DuckDBDataSource):
         return self._last_ast
 
 
-@dataclass
-class QueryEnvironment:
+class QueryEnvironment(StateModel):
     """Wrapper containing catalog + datasources for pushdown tests."""
 
     catalog: Catalog
@@ -52,8 +51,7 @@ class QueryEnvironment:
 
 
 def _seed_orders(cursor) -> None:
-    cursor.execute(
-        """
+    cursor.execute("""
         CREATE TABLE orders (
             order_id INTEGER,
             product_id INTEGER,
@@ -65,10 +63,8 @@ def _seed_orders(cursor) -> None:
             created_at TIMESTAMP,
             "select" INTEGER
         )
-        """
-    )
-    cursor.execute(
-        """
+        """)
+    cursor.execute("""
         INSERT INTO orders VALUES
         (1, 101, 1, 3, 25.0, 'processing', 'NA', TIMESTAMP '2024-01-05 09:00:00', 0),
         (2, 102, 2, 5, 50.0, 'shipped', 'EU', TIMESTAMP '2024-02-10 12:30:00', 1),
@@ -80,13 +76,11 @@ def _seed_orders(cursor) -> None:
         (8, 104, 3, 6, 15.0, 'shipped', 'EU', TIMESTAMP '2024-05-09 16:40:00', 1),
         (9, 105, 4, 9, 10.0, 'processing', 'NA', TIMESTAMP '2024-05-22 07:55:00', 0),
         (10, 106, 5, 8, 200.0, 'processing', 'EU', TIMESTAMP '2024-06-01 13:10:00', 1)
-        """
-    )
+        """)
 
 
 def _seed_products(cursor) -> None:
-    cursor.execute(
-        """
+    cursor.execute("""
         CREATE TABLE products (
             id INTEGER,
             category VARCHAR,
@@ -96,10 +90,8 @@ def _seed_products(cursor) -> None:
             active BOOLEAN,
             status VARCHAR
         )
-        """
-    )
-    cursor.execute(
-        """
+        """)
+    cursor.execute("""
         INSERT INTO products VALUES
         (101, 'clothing', 'jacket', 20.0, 20.0, TRUE, 'active'),
         (102, 'clothing', 'shirt', 30.0, 30.0, TRUE, 'active'),
@@ -109,30 +101,25 @@ def _seed_products(cursor) -> None:
         (106, 'home', 'desk', 220.0, 220.0, TRUE, 'active'),
         (107, 'home', 'chair', 90.0, 90.0, TRUE, 'active'),
         (108, 'food', 'coffee', 12.0, 12.0, TRUE, 'discontinued')
-        """
-    )
+        """)
 
 
 def _seed_customers(cursor) -> None:
-    cursor.execute(
-        """
+    cursor.execute("""
         CREATE TABLE customers (
             customer_id INTEGER,
             segment VARCHAR,
             loyalty VARCHAR
         )
-        """
-    )
-    cursor.execute(
-        """
+        """)
+    cursor.execute("""
         INSERT INTO customers VALUES
         (1, 'enterprise', 'gold'),
         (2, 'enterprise', 'silver'),
         (3, 'smb', 'silver'),
         (4, 'consumer', 'bronze'),
         (5, 'consumer', 'gold')
-        """
-    )
+        """)
 
 
 def _build_datasource(name: str) -> QueryCapturingDataSource:

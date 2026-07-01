@@ -27,7 +27,7 @@ Unsupported patterns raise DecorrelationError. Decorrelation never
 silently skips a subquery.
 """
 
-from dataclasses import dataclass, replace
+from ..model import StateModel
 from typing import Dict, List, Optional, Set, Tuple
 
 from ..plan.logical import (
@@ -49,6 +49,7 @@ from ..plan.logical import (
     GroupedLimit,
     LateralJoin,
     SetOperation,
+    transform_children,
 )
 from ..plan.expressions import (
     Expression,
@@ -69,110 +70,32 @@ from ..plan.expressions import (
     InList,
     BetweenExpression,
     TupleExpression,
+    WindowExpr,
+    Cast,
+    Extract,
+    # Canonical shared expression utilities (single implementation lives in
+    # plan/expressions.py); imported under the existing local names so call
+    # sites are unchanged and there is exactly one implementation of each.
+    expression_children as _expression_children,
+    map_children as _rebuild_expression,
+    column_refs as _expression_column_refs,
+    split_conjuncts as _split_conjuncts,
+    split_disjuncts as _split_disjuncts,
+    combine_and,
+    combine_or,
+    SUBQUERY_NODE_TYPES as _SUBQUERY_NODE_TYPES,
 )
-
-
-@dataclass
-class CorrelationResult:
-    """Correlation metadata for a subquery."""
-
-    is_correlated: bool
-    outer_references: List[ColumnRef]
-    inner_tables: Set[str]
-
-
-class CorrelationAnalyzer:
-    """Detects outer references in subqueries."""
-
-    def analyze(
-        self,
-        subquery: LogicalPlanNode,
-        outer_scope: Set[str],
-    ) -> CorrelationResult:
-        """Classify a subquery as correlated or uncorrelated."""
-        inner_tables = self._collect_tables(subquery)
-        refs = self._collect_outer_refs(subquery, inner_tables, outer_scope)
-        is_correlated = len(refs) > 0
-        return CorrelationResult(
-            is_correlated=is_correlated,
-            outer_references=refs,
-            inner_tables=inner_tables,
-        )
-
-    def _collect_tables(self, plan: LogicalPlanNode) -> Set[str]:
-        """Collect table names and aliases defined inside a plan.
-
-        An explicit alias (``FROM emp e2``) hides the base table name in
-        SQL, so the original name must NOT be added when a distinct alias is
-        present; otherwise an outer reference to the base name is misread as
-        an inner reference.
-        """
-        names: Set[str] = set()
-        if hasattr(plan, "table_name") and hasattr(plan, "schema_name"):
-            alias = getattr(plan, "alias", None)
-            if alias and alias != plan.table_name:
-                names.add(alias)
-            else:
-                names.add(plan.table_name)
-        for child in plan.children():
-            child_names = self._collect_tables(child)
-            for name in child_names:
-                names.add(name)
-        return names
-
-    def _collect_outer_refs(
-        self,
-        plan: LogicalPlanNode,
-        inner: Set[str],
-        outer: Set[str],
-    ) -> List[ColumnRef]:
-        """Collect column references that resolve outside the subquery."""
-        refs: List[ColumnRef] = []
-        expressions = _plan_expressions(plan)
-        for expr in expressions:
-            self._collect_expr_refs(expr, inner, outer, refs)
-        for child in plan.children():
-            child_refs = self._collect_outer_refs(child, inner, outer)
-            for ref in child_refs:
-                refs.append(ref)
-        return refs
-
-    def _collect_expr_refs(
-        self,
-        expr: Expression,
-        inner: Set[str],
-        outer: Set[str],
-        refs: List[ColumnRef],
-    ) -> None:
-        """Collect outer references from one expression tree."""
-        for ref in _expression_column_refs(expr):
-            if self._is_outer_ref(ref, inner, outer):
-                refs.append(ref)
-
-    def _is_outer_ref(
-        self,
-        col_ref: ColumnRef,
-        inner: Set[str],
-        outer: Set[str],
-    ) -> bool:
-        """A qualified reference to a table not defined inside is outer."""
-        if col_ref.table is None:
-            return False
-        if col_ref.table in inner:
-            return False
-        return True
+from .scope_validator import validate_scope
 
 
 class DecorrelationError(Exception):
     """Raised when decorrelation cannot be completed."""
 
 
-_SUBQUERY_NODE_TYPES = (
-    SubqueryExpression,
-    ExistsExpression,
-    InSubquery,
-    QuantifiedComparison,
-)
+class NonFlattenableCorrelation(DecorrelationError):
+    """A correlation cannot become a set-based join (non-equality across an
+    aggregate or LIMIT). The scalar-subquery path catches this specific type to
+    fall back to a LATERAL join; other DecorrelationErrors propagate."""
 
 
 # Logical negation of a comparison operator, used to push NOT through a
@@ -187,36 +110,11 @@ _NEGATED_BINARY_OP = {
 }
 
 
-def _split_conjuncts(expr: Expression) -> List[Expression]:
-    """Flatten a predicate into its top-level AND conjuncts."""
-    if isinstance(expr, BinaryOp) and expr.op == BinaryOpType.AND:
-        return _split_conjuncts(expr.left) + _split_conjuncts(expr.right)
-    return [expr]
-
-
-def _needs_lateral(error: "DecorrelationError") -> bool:
-    """Whether a flattening failure should fall back to a LATERAL join.
-
-    A non-equality correlation crossing an aggregate or LIMIT cannot become a
-    set-based per-key join, but a LATERAL evaluates it correctly per outer row.
-    """
-    return "equality correlation predicates can cross" in str(error)
-
-
-def _split_disjuncts(expr: Expression) -> List[Expression]:
-    """Flatten a predicate into its top-level OR disjuncts."""
-    if isinstance(expr, BinaryOp) and expr.op == BinaryOpType.OR:
-        return _split_disjuncts(expr.left) + _split_disjuncts(expr.right)
-    return [expr]
-
-
 def _and_join(conjuncts: List[Expression]) -> Expression:
-    """Combine conjuncts back into a single AND expression."""
-    if len(conjuncts) == 0:
+    """Combine conjuncts into a single AND expression; raise if empty."""
+    result = combine_and(conjuncts)
+    if result is None:
         raise DecorrelationError("Cannot build a predicate from no conjuncts")
-    result = conjuncts[0]
-    for conjunct in conjuncts[1:]:
-        result = BinaryOp(op=BinaryOpType.AND, left=result, right=conjunct)
     return result
 
 
@@ -236,50 +134,11 @@ def _is_unconditional_global_aggregate(plan: LogicalPlanNode) -> bool:
 
 
 def _or_join(disjuncts: List[Expression]) -> Expression:
-    """Combine disjuncts back into a single OR expression."""
-    if len(disjuncts) == 0:
+    """Combine disjuncts into a single OR expression; raise if empty."""
+    result = combine_or(disjuncts)
+    if result is None:
         raise DecorrelationError("Cannot build a predicate from no disjuncts")
-    result = disjuncts[0]
-    for disjunct in disjuncts[1:]:
-        result = BinaryOp(op=BinaryOpType.OR, left=result, right=disjunct)
     return result
-
-
-def _expression_children(expr: Expression) -> List[Expression]:
-    """List the direct child expressions of an expression node."""
-    if isinstance(expr, BinaryOp):
-        return [expr.left, expr.right]
-    if isinstance(expr, UnaryOp):
-        return [expr.operand]
-    if isinstance(
-        expr, (FunctionCall, TupleExpression, InList, CaseExpr, BetweenExpression)
-    ):
-        return _container_expression_children(expr)
-    return []
-
-
-def _container_expression_children(expr: Expression) -> List[Expression]:
-    """Child expressions of container-style expression nodes."""
-    if isinstance(expr, FunctionCall):
-        return list(expr.args)
-    if isinstance(expr, TupleExpression):
-        return list(expr.items)
-    if isinstance(expr, InList):
-        return [expr.value] + list(expr.options)
-    if isinstance(expr, BetweenExpression):
-        return [expr.value, expr.lower, expr.upper]
-    return _case_expression_children(expr)
-
-
-def _case_expression_children(expr: CaseExpr) -> List[Expression]:
-    """Child expressions of a CASE expression."""
-    children: List[Expression] = []
-    for condition, result in expr.when_clauses:
-        children.append(condition)
-        children.append(result)
-    if expr.else_result is not None:
-        children.append(expr.else_result)
-    return children
 
 
 def _expression_has_subquery(expr: Expression) -> bool:
@@ -292,40 +151,16 @@ def _expression_has_subquery(expr: Expression) -> bool:
     return False
 
 
-def _expression_column_refs(expr: Expression) -> List[ColumnRef]:
-    """Collect all column references in an expression tree.
-
-    Does not descend into subquery plans: a subquery node's own references
-    belong to its inner scopes.
-    """
-    refs: List[ColumnRef] = []
-    if isinstance(expr, ColumnRef):
-        refs.append(expr)
-    for child in _expression_children(expr):
-        refs.extend(_expression_column_refs(child))
-    return refs
-
-
 def _plan_expressions(plan: LogicalPlanNode) -> List[Expression]:
-    """Collect the expressions attached directly to a plan node."""
-    if isinstance(plan, Filter):
-        return [plan.predicate]
-    if isinstance(plan, Projection):
-        return list(plan.expressions)
-    if isinstance(plan, Aggregate):
-        return list(plan.group_by) + list(plan.aggregates)
-    return _other_plan_expressions(plan)
+    """Every expression attached directly to a plan node.
 
-
-def _other_plan_expressions(plan: LogicalPlanNode) -> List[Expression]:
-    """Expressions of sort/join/values nodes."""
-    if isinstance(plan, Sort):
-        return list(plan.sort_keys)
-    if isinstance(plan, Join) and plan.condition is not None:
-        return [plan.condition]
-    if isinstance(plan, Values):
-        return _values_expressions(plan)
-    return []
+    Delegates to the node's annotation-driven direct_expressions(), the single
+    source of truth: every node type is covered without a per-node list here,
+    and a field whose type cannot be classified raises rather than being
+    silently skipped. The correlation guards (_is_correlated,
+    _validate_no_outer_left, _raise_if_subquery_expression) walk this.
+    """
+    return plan.direct_expressions()
 
 
 def _values_expressions(plan: Values) -> List[Expression]:
@@ -350,6 +185,12 @@ def _collect_inner_aliases(plan: LogicalPlanNode) -> Set[str]:
     A distinct explicit alias hides the base table name (SQL scoping), so
     only the alias is added in that case; the base name is added only when
     the relation is unaliased.
+
+    This is the TRANSITIVE collector: it recurses into a SubqueryScan's body to
+    see every inner relation name (correlation analysis needs them). It is NOT
+    the same as physical_planner._collect_relation_aliases, which stops at a
+    SubqueryScan boundary because SQL scoping hides a subquery's internals from
+    the outside; do not merge the two.
     """
     names: Set[str] = set()
     if isinstance(plan, Scan):
@@ -374,68 +215,12 @@ def _replace_column_refs(
     return _rebuild_expression(expr, lambda child: _replace_column_refs(child, mapping))
 
 
-def _rebuild_expression(expr: Expression, rebuild_child) -> Expression:
-    """Rebuild an expression node applying rebuild_child to children."""
-    if isinstance(expr, BinaryOp):
-        return BinaryOp(
-            op=expr.op, left=rebuild_child(expr.left), right=rebuild_child(expr.right)
-        )
-    if isinstance(expr, UnaryOp):
-        return UnaryOp(op=expr.op, operand=rebuild_child(expr.operand))
-    if isinstance(expr, FunctionCall):
-        rebuilt_args = []
-        for arg in expr.args:
-            rebuilt_args.append(rebuild_child(arg))
-        return FunctionCall(
-            function_name=expr.function_name,
-            args=rebuilt_args,
-            is_aggregate=expr.is_aggregate,
-            distinct=expr.distinct,
-        )
-    return _rebuild_container_expression(expr, rebuild_child)
-
-
-def _rebuild_container_expression(expr: Expression, rebuild_child) -> Expression:
-    """Rebuild CASE / IN-list / BETWEEN / tuple expressions."""
-    if isinstance(expr, CaseExpr):
-        return _rebuild_case_expression(expr, rebuild_child)
-    if isinstance(expr, InList):
-        rebuilt_options = []
-        for option in expr.options:
-            rebuilt_options.append(rebuild_child(option))
-        return InList(value=rebuild_child(expr.value), options=rebuilt_options)
-    if isinstance(expr, BetweenExpression):
-        return BetweenExpression(
-            value=rebuild_child(expr.value),
-            lower=rebuild_child(expr.lower),
-            upper=rebuild_child(expr.upper),
-        )
-    if isinstance(expr, TupleExpression):
-        rebuilt_items = []
-        for item in expr.items:
-            rebuilt_items.append(rebuild_child(item))
-        return TupleExpression(items=tuple(rebuilt_items))
-    return expr
-
-
-def _rebuild_case_expression(expr: CaseExpr, rebuild_child) -> CaseExpr:
-    """Rebuild a CASE expression applying rebuild_child to branches."""
-    rebuilt_when = []
-    for condition, result in expr.when_clauses:
-        rebuilt_when.append((rebuild_child(condition), rebuild_child(result)))
-    rebuilt_else = None
-    if expr.else_result is not None:
-        rebuilt_else = rebuild_child(expr.else_result)
-    return CaseExpr(when_clauses=rebuilt_when, else_result=rebuilt_else)
-
-
 def _is_null_check(expr: Expression) -> UnaryOp:
     """Build an IS NULL check for an expression."""
     return UnaryOp(op=UnaryOpType.IS_NULL, operand=expr)
 
 
-@dataclass
-class _PreparedSubquery:
+class _PreparedSubquery(StateModel):
     """A subquery transformed into a join-ready right side.
 
     plan exposes deterministically renamed output columns; condition holds
@@ -448,8 +233,7 @@ class _PreparedSubquery:
     values: List[str]
 
 
-@dataclass
-class _PreparedScalar:
+class _PreparedScalar(StateModel):
     """A scalar subquery's join side plus its replacement expression."""
 
     plan: LogicalPlanNode
@@ -609,11 +393,12 @@ class _SubqueryPreparer:
         for call, name in hoisted:
             aggregates.append(call)
             names.append(name)
-        return Aggregate(
-            input=plan.input,
-            group_by=list(plan.group_by),
-            aggregates=aggregates,
-            output_names=names,
+        return plan.model_copy(
+            update={
+                "group_by": list(plan.group_by),
+                "aggregates": aggregates,
+                "output_names": names,
+            }
         )
 
     def _prepare_scalar_row(self, plan: LogicalPlanNode) -> _PreparedScalar:
@@ -699,7 +484,7 @@ class _SubqueryPreparer:
         of the value relation while the value columns are taken from below it.
         """
         inner_core, value_exprs = self._peel_values_top(plan.input, True)
-        return replace(plan, input=inner_core), value_exprs
+        return plan.model_copy(update={"input": inner_core}), value_exprs
 
     def _reject_star_values(self, expressions: List[Expression]) -> None:
         """A star projection has no determinate value columns."""
@@ -804,11 +589,8 @@ class _SubqueryPreparer:
         names = list(aggregate.output_names)
         rewritten_kept = self._hoist_each(kept, aggregates, names)
         rewritten_pulled = self._hoist_each(pulled, aggregates, names)
-        widened = Aggregate(
-            input=aggregate.input,
-            group_by=aggregate.group_by,
-            aggregates=aggregates,
-            output_names=names,
+        widened = aggregate.model_copy(
+            update={"aggregates": aggregates, "output_names": names}
         )
         return widened, rewritten_kept, rewritten_pulled
 
@@ -859,7 +641,7 @@ class _SubqueryPreparer:
         stripped_input = self._strip(plan.input)
         crossing = self.pulled[before:]
         if len(crossing) == 0:
-            return replace(plan, input=stripped_input)
+            return plan.model_copy(update={"input": stripped_input})
         return self._widen_aggregate(plan, stripped_input, crossing, before)
 
     def _widen_aggregate(
@@ -883,17 +665,19 @@ class _SubqueryPreparer:
             self.pulled[start + offset] = BinaryOp(
                 op=BinaryOpType.EQ, left=outer_side, right=renamed
             )
-        return Aggregate(
-            input=stripped_input,
-            group_by=group_by,
-            aggregates=aggregates,
-            output_names=names,
+        return plan.model_copy(
+            update={
+                "input": stripped_input,
+                "group_by": group_by,
+                "aggregates": aggregates,
+                "output_names": names,
+            }
         )
 
     def _key_equality(self, predicate: Expression) -> Tuple[ColumnRef, Expression]:
         """Decompose a predicate into (inner key column, outer side)."""
         if not isinstance(predicate, BinaryOp) or predicate.op != BinaryOpType.EQ:
-            raise DecorrelationError(
+            raise NonFlattenableCorrelation(
                 "Only equality correlation predicates can cross an "
                 f"aggregate or limit, got: {predicate.to_sql()}"
             )
@@ -962,6 +746,7 @@ class _SubqueryPreparer:
         """Build the renamed right side and the join condition."""
         exposures, condition = self._expose_correlation_columns()
         self._validate_no_outer_left(core)
+        value_exprs = self._partition_window_values(value_exprs, exposures)
         expressions: List[Expression] = []
         aliases: List[str] = []
         for expr, alias in exposures:
@@ -978,6 +763,50 @@ class _SubqueryPreparer:
         )
         plan = self._apply_pending_limit(plan, aliases, non_keys, order)
         return _PreparedSubquery(plan=plan, condition=condition, values=value_names)
+
+    def _partition_window_values(self, value_exprs, exposures):
+        """Partition any window value by the correlation key columns.
+
+        A window inside a correlated subquery is implicitly partitioned by the
+        correlation: once the equality filter is pulled out, the window must
+        ``PARTITION BY`` those key columns so each outer row still sees only its
+        own group. Without this the window would range over the whole scan.
+        """
+        keys = []
+        for expr, _ in exposures:
+            keys.append(expr)
+        rewritten = []
+        for expr in value_exprs:
+            rewritten.append(self._partition_window_expr(expr, keys))
+        return rewritten
+
+    def _partition_window_expr(self, expr, keys):
+        """Prepend correlation keys to every WindowExpr partition in the tree.
+
+        A window nested inside an expression (``rank() OVER (...) + 1``) must be
+        partitioned too, so the tree is rebuilt and every WindowExpr at any depth
+        is lifted, not just a top-level one.
+        """
+        if len(keys) == 0:
+            return expr
+        rebuilt = _rebuild_expression(
+            expr, lambda child: self._partition_window_expr(child, keys)
+        )
+        if not isinstance(rebuilt, WindowExpr):
+            return rebuilt
+        self._reject_non_equi_window()
+        return rebuilt.model_copy(
+            update={"partition_by": list(keys) + list(rebuilt.partition_by)}
+        )
+
+    def _reject_non_equi_window(self) -> None:
+        """A correlated window only lifts to PARTITION BY under equi-correlation."""
+        for predicate in self.pulled:
+            if not isinstance(predicate, BinaryOp) or predicate.op != BinaryOpType.EQ:
+                raise DecorrelationError(
+                    "Only equality correlation can partition a window; "
+                    f"got: {predicate.to_sql()}"
+                )
 
     def _build_order(self, expressions, aliases, non_keys):
         """Map a pending ORDER BY onto projected aliases, projecting any missing.
@@ -1096,7 +925,7 @@ class _SubqueryPreparer:
         """
         for predicate in self.pulled:
             if not isinstance(predicate, BinaryOp) or predicate.op != BinaryOpType.EQ:
-                raise DecorrelationError(
+                raise NonFlattenableCorrelation(
                     "Only equality correlation predicates can cross an "
                     f"aggregate or limit, got: {predicate.to_sql()}"
                 )
@@ -1144,6 +973,7 @@ class Decorrelator:
         """
         rewritten = self._rewrite_plan(plan)
         self._raise_if_subquery_expression(rewritten)
+        validate_scope(rewritten, "after decorrelation")
         return rewritten
 
     def _next_prefix(self) -> str:
@@ -1196,16 +1026,17 @@ class Decorrelator:
         )
 
     def _rewrite_rest(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Rewrite remaining node types by recursing into children."""
+        """Rewrite remaining node types by recursing into children.
+
+        These nodes carry no rewrite of their own; recurse so a subquery nested
+        deeper still gets decorrelated, then rebuild via the shared
+        transform_children. An Aggregate first rejects subqueries in grouping or
+        aggregate positions, which are unsupported.
+        """
         if isinstance(plan, Aggregate):
             self._reject_subqueries_in(plan.group_by, "GROUP BY")
             self._reject_subqueries_in(plan.aggregates, "aggregate expressions")
-        rewritten_children = []
-        for child in plan.children():
-            rewritten_children.append(self._rewrite_plan(child))
-        if len(rewritten_children) == 0:
-            return plan
-        return plan.with_children(rewritten_children)
+        return transform_children(plan, self._rewrite_plan)
 
     def _reject_subqueries_in(self, expressions: List[Expression], where: str) -> None:
         """Subqueries in grouping/aggregation positions are unsupported."""
@@ -1480,12 +1311,7 @@ class Decorrelator:
         for expr in node.expressions:
             rewritten, plan = self._rewrite_value_expr(expr, plan)
             expressions.append(rewritten)
-        return Projection(
-            input=plan,
-            expressions=expressions,
-            aliases=node.aliases,
-            distinct=node.distinct,
-        )
+        return node.model_copy(update={"input": plan, "expressions": expressions})
 
     def _rewrite_sort(self, node: Sort) -> LogicalPlanNode:
         """Rewrite sort keys; prune helper columns added for subqueries."""
@@ -1569,7 +1395,9 @@ class Decorrelator:
         for name in self._sort_helper_columns(keys, existing):
             expressions.append(ColumnRef(table=None, column=name))
             aliases.append(name)
-        return Projection(input=plan, expressions=expressions, aliases=aliases)
+        return projection.model_copy(
+            update={"input": plan, "expressions": expressions, "aliases": aliases}
+        )
 
     def _sort_helper_columns(
         self, keys: List[Expression], existing: Set[str]
@@ -1627,8 +1455,8 @@ class Decorrelator:
             if residual is not None:
                 kept.append(residual)
         condition = _and_join(kept) if len(kept) > 0 else None
-        return Join(
-            left=left, right=right, join_type=node.join_type, condition=condition
+        return node.model_copy(
+            update={"left": left, "right": right, "condition": condition}
         )
 
     def _rewrite_value_expr(
@@ -1674,9 +1502,7 @@ class Decorrelator:
         """
         try:
             prepared = self._preparer().prepare_scalar(expr.subquery)
-        except DecorrelationError as error:
-            if not _needs_lateral(error):
-                raise
+        except NonFlattenableCorrelation:
             return self._lateral_scalar(expr, plan)
         condition = prepared.condition
         if condition is None:
@@ -1709,9 +1535,9 @@ class Decorrelator:
     ) -> LogicalPlanNode:
         """Rename a single-column subquery body's output to ``value_name``."""
         if isinstance(node, Projection):
-            return replace(node, aliases=[value_name])
+            return node.model_copy(update={"aliases": [value_name]})
         if isinstance(node, Aggregate):
-            return replace(node, output_names=[value_name])
+            return node.model_copy(update={"output_names": [value_name]})
         if isinstance(node, (Limit, Sort, Filter)):
             inner = self._project_lateral_value(node.input, value_name)
             return node.with_children([inner])

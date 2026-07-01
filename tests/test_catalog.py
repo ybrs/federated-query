@@ -99,114 +99,64 @@ def test_get_nonexistent_table(catalog, sample_schema):
     assert catalog.get_table("nonexistent", "public", "customers") is None
 
 
-def test_resolve_fully_qualified_table(catalog, sample_schema):
-    """Test resolving a fully qualified table reference."""
-    catalog.schemas[("test_db", "public")] = sample_schema
-
-    result = catalog.resolve_table("test_db.public.customers")
-    assert result is not None
-    ds, schema, table_name, table = result
-    assert ds == "test_db"
-    assert schema == "public"
-    assert table_name == "customers"
-    assert table.name == "customers"
+@pytest.fixture
+def datasource():
+    """A connector instance for testing its native-type mapping (no connect)."""
+    return DuckDBDataSource(name="test_db", config={"database": ":memory:"})
 
 
-def test_resolve_schema_qualified_table(catalog, sample_schema):
-    """Test resolving a schema-qualified table reference."""
-    catalog.schemas[("test_db", "public")] = sample_schema
-
-    result = catalog.resolve_table("public.customers")
-    assert result is not None
-    ds, schema, table_name, table = result
-    assert ds == "test_db"
-    assert schema == "public"
-    assert table_name == "customers"
-
-
-def test_resolve_unqualified_table(catalog, sample_schema):
-    """Test resolving an unqualified table reference."""
-    catalog.schemas[("test_db", "public")] = sample_schema
-
-    result = catalog.resolve_table("customers")
-    assert result is not None
-    ds, schema, table_name, table = result
-    assert ds == "test_db"
-    assert schema == "public"
-    assert table_name == "customers"
-
-
-def test_resolve_nonexistent_table(catalog, sample_schema):
-    """Test resolving a non-existent table."""
-    catalog.schemas[("test_db", "public")] = sample_schema
-
-    assert catalog.resolve_table("nonexistent") is None
-    assert catalog.resolve_table("test_db.public.nonexistent") is None
-
-
-def test_resolve_ambiguous_table(catalog):
-    """Test resolving a table that exists in multiple schemas."""
-    # Create two schemas with the same table name
-    schema1 = Schema(name="schema1", datasource="db1")
-    schema1.add_table(
-        Table(
-            name="users",
-            columns=[Column(name="id", data_type=DataType.INTEGER, nullable=False)],
-        )
-    )
-
-    schema2 = Schema(name="schema2", datasource="db2")
-    schema2.add_table(
-        Table(
-            name="users",
-            columns=[Column(name="id", data_type=DataType.INTEGER, nullable=False)],
-        )
-    )
-
-    catalog.schemas[("db1", "schema1")] = schema1
-    catalog.schemas[("db2", "schema2")] = schema2
-
-    # Unqualified reference should return the first match
-    result = catalog.resolve_table("users")
-    assert result is not None
-
-    # Qualified references should be unambiguous
-    result1 = catalog.resolve_table("db1.schema1.users")
-    result2 = catalog.resolve_table("db2.schema2.users")
-
-    assert result1[0] == "db1"
-    assert result2[0] == "db2"
-
-
-def test_type_mapping(catalog):
-    """Test database type mapping."""
+def test_type_mapping(datasource):
+    """The source maps the common SQL type names to engine DataTypes."""
     # Integer types
-    assert catalog._map_type("INTEGER") == DataType.INTEGER
-    assert catalog._map_type("BIGINT") == DataType.BIGINT
-    assert catalog._map_type("SERIAL") == DataType.INTEGER
-    assert catalog._map_type("BIGSERIAL") == DataType.BIGINT
+    assert datasource.map_native_type("INTEGER") == DataType.INTEGER
+    assert datasource.map_native_type("BIGINT") == DataType.BIGINT
+    assert datasource.map_native_type("SERIAL") == DataType.INTEGER
+    assert datasource.map_native_type("BIGSERIAL") == DataType.BIGINT
 
     # Float types
-    assert catalog._map_type("FLOAT") == DataType.FLOAT
-    assert catalog._map_type("REAL") == DataType.FLOAT
-    assert catalog._map_type("DOUBLE") == DataType.DOUBLE
-    assert catalog._map_type("NUMERIC") == DataType.DOUBLE
-    assert catalog._map_type("DECIMAL") == DataType.DOUBLE
+    assert datasource.map_native_type("FLOAT") == DataType.FLOAT
+    assert datasource.map_native_type("REAL") == DataType.FLOAT
+    assert datasource.map_native_type("DOUBLE") == DataType.DOUBLE
+    assert datasource.map_native_type("NUMERIC") == DataType.DOUBLE
+    assert datasource.map_native_type("DECIMAL") == DataType.DOUBLE
 
     # String types
-    assert catalog._map_type("VARCHAR") == DataType.VARCHAR
-    assert catalog._map_type("CHAR") == DataType.TEXT
-    assert catalog._map_type("TEXT") == DataType.TEXT
+    assert datasource.map_native_type("VARCHAR") == DataType.VARCHAR
+    assert datasource.map_native_type("CHAR") == DataType.TEXT
+    assert datasource.map_native_type("TEXT") == DataType.TEXT
 
     # Boolean
-    assert catalog._map_type("BOOLEAN") == DataType.BOOLEAN
+    assert datasource.map_native_type("BOOLEAN") == DataType.BOOLEAN
 
     # Date/Time
-    assert catalog._map_type("DATE") == DataType.DATE
-    assert catalog._map_type("TIMESTAMP") == DataType.TIMESTAMP
+    assert datasource.map_native_type("DATE") == DataType.DATE
+    assert datasource.map_native_type("TIMESTAMP") == DataType.TIMESTAMP
 
-    # Unknown type defaults to VARCHAR
-    assert catalog._map_type("UNKNOWN_TYPE") == DataType.VARCHAR
+
+def test_unknown_type_raises(datasource):
+    """An unmodeled column type raises instead of silently coercing to VARCHAR.
+
+    A mis-typed column is a wrong answer with no error, so an unknown type must
+    be added to the mapping explicitly rather than defaulted.
+    """
+    with pytest.raises(ValueError) as exc_info:
+        datasource.map_native_type("UNKNOWN_TYPE")
+    assert "UNKNOWN_TYPE" in str(exc_info.value)
+
+
+def test_postgres_maps_uuid_consistently_with_execution():
+    """Postgres maps uuid to VARCHAR, the same type the fetch path yields.
+
+    Regression guard: the catalog's generic mapper raised on uuid while the
+    execution path (OID 2950 -> string) handled it, so load_metadata crashed on
+    a table the engine could query. The connector now owns the mapping.
+    """
+    from federated_query.datasources.postgresql import PostgreSQLDataSource
+
+    source = PostgreSQLDataSource(name="pg", config={"host": "localhost"})
+    assert source.map_native_type("uuid") == DataType.VARCHAR
+    # The generic names still resolve through the shared base mapper.
+    assert source.map_native_type("integer") == DataType.INTEGER
 
 
 def test_catalog_repr(catalog):

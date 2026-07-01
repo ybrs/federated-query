@@ -4,6 +4,7 @@ E2E tests for nested subquery decorrelation.
 Tests nested correlated subqueries, derived tables with subqueries,
 and complex multi-level correlation patterns.
 """
+
 import pytest
 from federated_query.parser.parser import Parser
 from federated_query.parser.binder import Binder
@@ -13,7 +14,7 @@ from .test_utils import (
     assert_plan_structure,
     assert_result_count,
     assert_result_contains_ids,
-    execute_and_fetch_all
+    execute_and_fetch_all,
 )
 
 
@@ -112,7 +113,7 @@ class TestNestedExists:
         # Skip-level correlation (innermost subquery referencing the
         # outermost query) is documented future work; the engine must
         # refuse loudly rather than rewrite it incorrectly.
-        with pytest.raises(DecorrelationError, match="u.id"):
+        with pytest.raises(DecorrelationError, match=r'"u"\."id"'):
             decorrelator.decorrelate(bound_plan)
 
     def test_deeply_nested_exists(self, catalog, setup_test_data):
@@ -351,7 +352,9 @@ class TestDerivedTablesWithSubqueries:
         results = execute_and_fetch_all(executor, decorrelated_plan)
         assert len(results) >= 0, "Query should execute successfully"
 
-    def test_correlated_subquery_referencing_derived_table(self, catalog, setup_test_data):
+    def test_correlated_subquery_referencing_derived_table(
+        self, catalog, setup_test_data
+    ):
         """
         Test: Outer query subquery that references derived table.
 

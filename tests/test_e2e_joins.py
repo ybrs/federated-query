@@ -18,45 +18,37 @@ def setup_test_db():
     """Set up in-memory DuckDB with test data for joins."""
     conn = duckdb.connect(":memory:")
 
-    conn.execute(
-        """
+    conn.execute("""
         CREATE TABLE customers (
             id INTEGER,
             name VARCHAR,
             city VARCHAR
         )
-    """
-    )
+    """)
 
-    conn.execute(
-        """
+    conn.execute("""
         INSERT INTO customers VALUES
             (1, 'Alice', 'NYC'),
             (2, 'Bob', 'LA'),
             (3, 'Charlie', 'SF')
-    """
-    )
+    """)
 
-    conn.execute(
-        """
+    conn.execute("""
         CREATE TABLE orders (
             order_id INTEGER,
             customer_id INTEGER,
             amount DOUBLE,
             product VARCHAR
         )
-    """
-    )
+    """)
 
-    conn.execute(
-        """
+    conn.execute("""
         INSERT INTO orders VALUES
             (101, 1, 100.0, 'Widget'),
             (102, 1, 150.0, 'Gadget'),
             (103, 2, 200.0, 'Widget'),
             (104, 3, 75.0, 'Gadget')
-    """
-    )
+    """)
 
     return conn
 

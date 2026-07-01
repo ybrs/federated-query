@@ -5,6 +5,8 @@ PhysicalGroupedLimit, NULL-key behaviour of the hash join, and SQL
 semantics of global aggregates over empty input.
 """
 
+from typing import Any
+
 import pyarrow as pa
 import pytest
 
@@ -30,8 +32,8 @@ from federated_query.plan.expressions import (
 class StaticSource(PhysicalPlanNode):
     """Physical node that replays a fixed list of batches."""
 
-    def __init__(self, batches):
-        self.batches = batches
+    batches: Any
+    output_schema: Any = None  # Declared schema for an empty (no-batch) source
 
     def children(self):
         """No children: this is a leaf source."""
@@ -43,7 +45,10 @@ class StaticSource(PhysicalPlanNode):
             yield batch
 
     def schema(self):
-        """Schema of the first batch (or empty)."""
+        """Declared schema, else the first batch's (a real empty input still
+        has a schema, so an explicit one is required when there are no batches)."""
+        if self.output_schema is not None:
+            return self.output_schema
         if self.batches:
             return self.batches[0].schema
         return pa.schema([])
@@ -59,7 +64,14 @@ def batch_of(**columns):
 
 
 def rows_of(node):
-    """Execute a physical node and collect rows as dicts."""
+    """Execute a physical node (with the DuckDB merge engine) and collect rows.
+
+    Local execution always runs through the merge engine, so the engine is
+    attached to the node and its children before executing.
+    """
+    from federated_query.executor.executor import _attach_merge_engine
+
+    _attach_merge_engine(node, _merge_engine())
     rows = []
     for batch in node.execute():
         for row in batch.to_pylist():
@@ -75,7 +87,12 @@ def col(name):
 def test_values_emits_literal_row():
     """PhysicalValues evaluates literal expressions into one batch."""
     node = PhysicalValues(
-        rows=[[Literal(42, DataType.INTEGER), Literal("x", DataType.VARCHAR)]],
+        rows=[
+            [
+                Literal(value=42, data_type=DataType.INTEGER),
+                Literal(value="x", data_type=DataType.VARCHAR),
+            ]
+        ],
         output_names=["answer", "tag"],
     )
     assert rows_of(node) == [{"answer": 42, "tag": "x"}]
@@ -83,29 +100,35 @@ def test_values_emits_literal_row():
 
 def test_union_all_concatenates():
     """UNION ALL keeps duplicates from both branches."""
-    left = StaticSource([batch_of(id=[1, 2])])
-    right = StaticSource([batch_of(id=[2, 3])])
+    left = StaticSource(batches=[batch_of(id=[1, 2])])
+    right = StaticSource(batches=[batch_of(id=[2, 3])])
     node = PhysicalUnion(inputs=[left, right], distinct=False)
     assert rows_of(node) == [{"id": 1}, {"id": 2}, {"id": 2}, {"id": 3}]
 
 
 def test_union_distinct_deduplicates():
     """UNION DISTINCT removes rows already emitted."""
-    left = StaticSource([batch_of(id=[1, 2])])
-    right = StaticSource([batch_of(id=[2, 3])])
+    left = StaticSource(batches=[batch_of(id=[1, 2])])
+    right = StaticSource(batches=[batch_of(id=[2, 3])])
     node = PhysicalUnion(inputs=[left, right], distinct=True)
-    assert rows_of(node) == [{"id": 1}, {"id": 2}, {"id": 3}]
+    # UNION DISTINCT is a set operation with no ordering guarantee.
+    result = sorted(rows_of(node), key=lambda row: row["id"])
+    assert result == [{"id": 1}, {"id": 2}, {"id": 3}]
 
 
 def test_single_row_guard_passes_one_row():
     """A single global row flows through the guard untouched."""
-    node = PhysicalSingleRowGuard(input=StaticSource([batch_of(v=[10])]), keys=[])
+    node = PhysicalSingleRowGuard(
+        input=StaticSource(batches=[batch_of(v=[10])]), keys=[]
+    )
     assert rows_of(node) == [{"v": 10}]
 
 
 def test_single_row_guard_raises_on_second_row():
     """Two global rows must raise a cardinality error."""
-    node = PhysicalSingleRowGuard(input=StaticSource([batch_of(v=[10, 20])]), keys=[])
+    node = PhysicalSingleRowGuard(
+        input=StaticSource(batches=[batch_of(v=[10, 20])]), keys=[]
+    )
     with pytest.raises(CardinalityViolationError):
         rows_of(node)
 
@@ -113,7 +136,7 @@ def test_single_row_guard_raises_on_second_row():
 def test_single_row_guard_raises_on_duplicate_key():
     """A repeated correlation key must raise a cardinality error."""
     node = PhysicalSingleRowGuard(
-        input=StaticSource([batch_of(k=[1, 2, 1], v=[10, 20, 30])]),
+        input=StaticSource(batches=[batch_of(k=[1, 2, 1], v=[10, 20, 30])]),
         keys=[col("k")],
     )
     with pytest.raises(CardinalityViolationError):
@@ -123,7 +146,9 @@ def test_single_row_guard_raises_on_duplicate_key():
 def test_grouped_limit_keeps_first_row_per_key():
     """GroupedLimit(1) keeps only the first row of each key."""
     node = PhysicalGroupedLimit(
-        input=StaticSource([batch_of(k=[1, 1, 2, 2, 3], v=[10, 11, 20, 21, 30])]),
+        input=StaticSource(
+            batches=[batch_of(k=[1, 1, 2, 2, 3], v=[10, 11, 20, 21, 30])]
+        ),
         keys=[col("k")],
         limit=1,
     )
@@ -145,10 +170,10 @@ def test_grouped_limit_merge_path_matches_python():
     """The merge-engine ROW_NUMBER push keeps the same rows and order as Python."""
     rows = batch_of(k=[1, 1, 1, 2, 2, 3], v=[10, 11, 12, 20, 21, 30])
     python_node = PhysicalGroupedLimit(
-        input=StaticSource([rows]), keys=[col("k")], limit=2
+        input=StaticSource(batches=[rows]), keys=[col("k")], limit=2
     )
     merge_node = PhysicalGroupedLimit(
-        input=StaticSource([rows]), keys=[col("k")], limit=2
+        input=StaticSource(batches=[rows]), keys=[col("k")], limit=2
     )
     merge_node.set_merge_engine(_merge_engine())
     assert rows_of(merge_node) == rows_of(python_node)
@@ -170,8 +195,8 @@ def test_grouped_limit_merge_path_ordered_latest_per_key():
         order_by_keys=[col("v")],
         order_by_ascending=[False],
     )
-    python_node = PhysicalGroupedLimit(input=StaticSource([rows]), **fields)
-    merge_node = PhysicalGroupedLimit(input=StaticSource([rows]), **fields)
+    python_node = PhysicalGroupedLimit(input=StaticSource(batches=[rows]), **fields)
+    merge_node = PhysicalGroupedLimit(input=StaticSource(batches=[rows]), **fields)
     merge_node.set_merge_engine(_merge_engine())
     assert rows_of(merge_node) == rows_of(python_node)
     assert rows_of(merge_node) == [{"k": 1, "v": 12}, {"k": 2, "v": 21}]
@@ -179,8 +204,8 @@ def test_grouped_limit_merge_path_ordered_latest_per_key():
 
 def test_hash_semi_join_null_keys_never_match():
     """A NULL key must not match a NULL build key (SQL equality)."""
-    left = StaticSource([batch_of(id=[1, None, 3])])
-    right = StaticSource([batch_of(ref=[1, None])])
+    left = StaticSource(batches=[batch_of(id=[1, None, 3])])
+    right = StaticSource(batches=[batch_of(ref=[1, None])])
     node = PhysicalHashJoin(
         left=left,
         right=right,
@@ -194,8 +219,8 @@ def test_hash_semi_join_null_keys_never_match():
 
 def test_hash_anti_join_null_keys_kept():
     """ANTI join keeps NULL-key rows: NULL never equals anything."""
-    left = StaticSource([batch_of(id=[1, None, 3])])
-    right = StaticSource([batch_of(ref=[1, None])])
+    left = StaticSource(batches=[batch_of(id=[1, None, 3])])
+    right = StaticSource(batches=[batch_of(ref=[1, None])])
     node = PhysicalHashJoin(
         left=left,
         right=right,
@@ -209,8 +234,8 @@ def test_hash_anti_join_null_keys_kept():
 
 def test_left_hash_join_null_probe_key_emits_outer_row():
     """LEFT join with a NULL probe key produces the NULL-padded row."""
-    left = StaticSource([batch_of(id=[1, None])])
-    right = StaticSource([batch_of(ref=[1], payload=["a"])])
+    left = StaticSource(batches=[batch_of(id=[1, None])])
+    right = StaticSource(batches=[batch_of(ref=[1], payload=["a"])])
     node = PhysicalHashJoin(
         left=left,
         right=right,
@@ -227,7 +252,7 @@ def test_left_hash_join_null_probe_key_emits_outer_row():
 
 def test_global_aggregate_over_empty_input_emits_one_row():
     """SQL: SELECT COUNT(*), MAX(v) over no rows is one row (0, NULL)."""
-    empty = StaticSource([])
+    empty = StaticSource(batches=[], output_schema=pa.schema([("v", pa.int64())]))
     count_star = FunctionCall(function_name="COUNT", args=[], is_aggregate=True)
     max_v = FunctionCall(function_name="MAX", args=[col("v")], is_aggregate=True)
     node = PhysicalHashAggregate(
@@ -241,7 +266,7 @@ def test_global_aggregate_over_empty_input_emits_one_row():
 
 def test_sum_over_empty_input_is_null():
     """SQL: SUM over no rows is NULL, not 0."""
-    empty = StaticSource([])
+    empty = StaticSource(batches=[], output_schema=pa.schema([("v", pa.int64())]))
     sum_v = FunctionCall(function_name="SUM", args=[col("v")], is_aggregate=True)
     node = PhysicalHashAggregate(
         input=empty, group_by=[], aggregates=[sum_v], output_names=["total"]
@@ -251,7 +276,7 @@ def test_sum_over_empty_input_is_null():
 
 def test_count_column_skips_nulls():
     """SQL: COUNT(col) counts only non-NULL values."""
-    source = StaticSource([batch_of(v=[1, None, 3])])
+    source = StaticSource(batches=[batch_of(v=[1, None, 3])])
     count_v = FunctionCall(function_name="COUNT", args=[col("v")], is_aggregate=True)
     node = PhysicalHashAggregate(
         input=source, group_by=[], aggregates=[count_v], output_names=["cnt"]

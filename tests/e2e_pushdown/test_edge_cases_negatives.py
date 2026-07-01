@@ -6,6 +6,7 @@ from sqlglot import exp
 
 from tests.e2e_pushdown.helpers import (
     build_runtime,
+    explain_datasource_query,
     explain_document,
 )
 
@@ -17,14 +18,19 @@ def _expect_explain_failure(runtime, sql: str, message: str) -> None:
         runtime.execute(statement)
 
 
-def test_window_function_not_supported(single_source_env):
-    """Ensures window functions surface a parser error instead of silent pushdown."""
+def test_window_function_pushes_down(single_source_env):
+    """A standalone window function now pushes to the source (Phase 9, section 9.3).
+
+    Previously this surfaced a parser error; windows are now a supported
+    expression and ship as one remote query.
+    """
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id, ROW_NUMBER() OVER (PARTITION BY region ORDER BY order_id) AS rn "
         "FROM duckdb_primary.main.orders"
     )
-    _expect_explain_failure(runtime, sql, "Window")
+    ast = explain_datasource_query(runtime, sql)
+    assert len(list(ast.find_all(exp.Window))) == 1
 
 
 def test_scalar_subquery_in_projection_supported(single_source_env):

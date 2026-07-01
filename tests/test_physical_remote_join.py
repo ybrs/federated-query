@@ -68,6 +68,6 @@ def test_remote_join_keeps_side_filters_before_join():
     # The table is aliased inside the derived table so a qualified side
     # filter would resolve; the alias is applied unconditionally.
     assert (
-        '(SELECT * FROM "public"."right_table" AS r WHERE (active = True)) AS r'
+        '(SELECT * FROM "public"."right_table" AS "r" WHERE ("active" = TRUE)) AS "r"'
         in query
     )

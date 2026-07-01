@@ -8,7 +8,6 @@ from .rules import (
     AggregatePushdownRule,
     OrderByPushdownRule,
     LimitPushdownRule,
-    JoinReorderingRule,
 )
 from .cost import CostModel
 from .statistics import StatisticsCollector
@@ -23,7 +22,6 @@ __all__ = [
     "AggregatePushdownRule",
     "OrderByPushdownRule",
     "LimitPushdownRule",
-    "JoinReorderingRule",
     "CostModel",
     "StatisticsCollector",
     "PhysicalPlanner",

@@ -59,7 +59,7 @@ datasources:
     user: test
     password: test
 """
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
         f.write(minimal_yaml)
         config_path = f.name
 
@@ -84,6 +84,34 @@ def test_missing_config_file():
         load_config("nonexistent_config.yaml")
 
 
+def test_unknown_top_level_section_raises():
+    """A misspelled top-level section must raise, not be silently ignored.
+
+    Without this, `optimizr:` (typo) would be dropped and the optimizer would
+    fall back to all defaults, silently discarding the user's settings.
+    """
+    config_yaml = """
+datasources:
+  test_pg:
+    type: postgresql
+    host: localhost
+    database: test
+    user: test
+    password: test
+optimizr:
+  enable_predicate_pushdown: false
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        f.write(config_yaml)
+        config_path = f.name
+
+    try:
+        with pytest.raises(ValueError, match="optimizr"):
+            load_config(config_path)
+    finally:
+        Path(config_path).unlink()
+
+
 def test_config_with_capabilities():
     """Test configuration with data source capabilities."""
     config_yaml = """
@@ -99,7 +127,7 @@ datasources:
       - joins
       - window_functions
 """
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
         f.write(config_yaml)
         config_path = f.name
 
@@ -136,7 +164,7 @@ datasources:
     type: duckdb
     path: /path/to/db.duckdb
 """
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
         f.write(config_yaml)
         config_path = f.name
 
@@ -171,7 +199,7 @@ optimizer:
   enable_join_reordering: false
   max_join_reorder_size: 20
 """
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
         f.write(config_yaml)
         config_path = f.name
 
@@ -201,7 +229,7 @@ executor:
   batch_size: 50000
   max_threads: 16
 """
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
         f.write(config_yaml)
         config_path = f.name
 

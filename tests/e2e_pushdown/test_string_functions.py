@@ -3,6 +3,7 @@
 from sqlglot import exp
 
 from tests.e2e_pushdown.helpers import (
+    is_func,
     build_runtime,
     explain_datasource_query,
     find_alias_expression,
@@ -26,7 +27,7 @@ def test_upper_function_in_where(single_source_env):
     assert isinstance(predicate, exp.EQ)
 
     left = unwrap_parens(predicate.left)
-    assert isinstance(left, exp.Upper)
+    assert is_func(left, "UPPER")
     col = unwrap_parens(left.this)
     assert isinstance(col, exp.Column)
     assert col.name.lower() == "status"
@@ -51,7 +52,7 @@ def test_lower_function_with_like(single_source_env):
     assert isinstance(predicate, exp.Like)
 
     left = unwrap_parens(predicate.this)
-    assert isinstance(left, exp.Lower)
+    assert is_func(left, "LOWER")
     col = unwrap_parens(left.this)
     assert isinstance(col, exp.Column)
     assert col.name.lower() == "region"
@@ -64,10 +65,7 @@ def test_lower_function_with_like(single_source_env):
 def test_length_function_comparison(single_source_env):
     """Ensures LENGTH() function pushes down for string length checks."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT name FROM duckdb_primary.main.products "
-        "WHERE LENGTH(name) > 10"
-    )
+    sql = "SELECT name FROM duckdb_primary.main.products " "WHERE LENGTH(name) > 10"
     ast = explain_datasource_query(runtime, sql)
 
     where_clause = ast.args.get("where")
@@ -76,7 +74,7 @@ def test_length_function_comparison(single_source_env):
     assert isinstance(predicate, exp.GT)
 
     left = unwrap_parens(predicate.left)
-    assert isinstance(left, exp.Length)
+    assert is_func(left, "LENGTH")
     col = unwrap_parens(left.this)
     assert isinstance(col, exp.Column)
     assert col.name.lower() == "name"
@@ -101,7 +99,7 @@ def test_substring_function_in_where(single_source_env):
     assert isinstance(predicate, exp.EQ)
 
     left = unwrap_parens(predicate.left)
-    assert isinstance(left, exp.Substring)
+    assert is_func(left, "SUBSTRING")
     col = unwrap_parens(left.this)
     assert isinstance(col, exp.Column)
     assert col.name.lower() == "name"
@@ -110,10 +108,7 @@ def test_substring_function_in_where(single_source_env):
 def test_trim_function_in_where(single_source_env):
     """Checks TRIM() function pushes for whitespace removal."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id FROM duckdb_primary.main.orders "
-        "WHERE TRIM(region) = 'EU'"
-    )
+    sql = "SELECT order_id FROM duckdb_primary.main.orders " "WHERE TRIM(region) = 'EU'"
     ast = explain_datasource_query(runtime, sql)
 
     where_clause = ast.args.get("where")
@@ -122,7 +117,7 @@ def test_trim_function_in_where(single_source_env):
     assert isinstance(predicate, exp.EQ)
 
     left = unwrap_parens(predicate.left)
-    assert isinstance(left, exp.Trim)
+    assert is_func(left, "TRIM")
     col = unwrap_parens(left.this)
     assert isinstance(col, exp.Column)
     assert col.name.lower() == "region"
@@ -145,7 +140,7 @@ def test_string_concatenation_operator(single_source_env):
 
     concat_expr = find_alias_expression(ast, "labeled_name")
     assert concat_expr is not None
-    assert isinstance(concat_expr, (exp.Concat, exp.DPipe))
+    assert is_func(concat_expr, "CONCAT") or isinstance(concat_expr, exp.DPipe)
 
 
 def test_concat_function_multiple_columns(single_source_env):
@@ -161,7 +156,7 @@ def test_concat_function_multiple_columns(single_source_env):
 
     concat_expr = find_alias_expression(ast, "full_label")
     assert concat_expr is not None
-    assert isinstance(concat_expr, exp.Concat)
+    assert is_func(concat_expr, "CONCAT")
 
 
 def test_string_functions_in_select_projection(single_source_env):
@@ -178,14 +173,14 @@ def test_string_functions_in_select_projection(single_source_env):
 
     upper_expr = find_alias_expression(ast, "status_upper")
     assert upper_expr is not None
-    assert isinstance(upper_expr, exp.Upper)
+    assert is_func(upper_expr, "UPPER")
     upper_col = unwrap_parens(upper_expr.this)
     assert isinstance(upper_col, exp.Column)
     assert upper_col.name.lower() == "status"
 
     lower_expr = find_alias_expression(ast, "region_lower")
     assert lower_expr is not None
-    assert isinstance(lower_expr, exp.Lower)
+    assert is_func(lower_expr, "LOWER")
     lower_col = unwrap_parens(lower_expr.this)
     assert isinstance(lower_col, exp.Column)
     assert lower_col.name.lower() == "region"
@@ -209,7 +204,7 @@ def test_string_function_in_group_by(single_source_env):
     assert len(expressions) == 1
 
     group_expr = unwrap_parens(expressions[0])
-    assert isinstance(group_expr, exp.Upper)
+    assert is_func(group_expr, "UPPER")
     col = unwrap_parens(group_expr.this)
     assert isinstance(col, exp.Column)
     assert col.name.lower() == "status"
@@ -218,10 +213,7 @@ def test_string_function_in_group_by(single_source_env):
 def test_string_function_in_order_by(single_source_env):
     """Ensures string functions push down in ORDER BY clause."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT name FROM duckdb_primary.main.products "
-        "ORDER BY LOWER(name)"
-    )
+    sql = "SELECT name FROM duckdb_primary.main.products " "ORDER BY LOWER(name)"
     ast = explain_datasource_query(runtime, sql)
 
     order_clause = ast.args.get("order")
@@ -231,7 +223,7 @@ def test_string_function_in_order_by(single_source_env):
 
     first_order = expressions[0]
     order_expr = unwrap_parens(first_order.this)
-    assert isinstance(order_expr, exp.Lower)
+    assert is_func(order_expr, "LOWER")
     col = unwrap_parens(order_expr.this)
     assert isinstance(col, exp.Column)
     assert col.name.lower() == "name"

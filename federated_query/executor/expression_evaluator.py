@@ -26,20 +26,7 @@ from ..plan.expressions import (
     InList,
     BetweenExpression,
 )
-
-# Maps engine DataTypes to the Arrow type a local CAST converts to.
-_ARROW_CAST_TYPES = {
-    DataType.INTEGER: pa.int64(),
-    DataType.BIGINT: pa.int64(),
-    DataType.FLOAT: pa.float32(),
-    DataType.DOUBLE: pa.float64(),
-    DataType.DECIMAL: pa.float64(),
-    DataType.VARCHAR: pa.string(),
-    DataType.TEXT: pa.string(),
-    DataType.BOOLEAN: pa.bool_(),
-    DataType.DATE: pa.date32(),
-    DataType.TIMESTAMP: pa.timestamp("us"),
-}
+from ..plan.arrow_types import arrow_type_for, is_renderable
 
 
 class ExpressionEvaluationError(Exception):
@@ -124,11 +111,23 @@ class ExpressionEvaluator:
         return None
 
     def _eval_column(self, expr: ColumnRef):
-        """Resolve a column reference against the batch by name."""
+        """Resolve a column reference against the batch via the alias map.
+
+        An unqualified reference (no table) reads the batch column of that name -
+        the physical name an aggregate output / exposed column carries. A
+        QUALIFIED reference must resolve through the alias map; if it does not,
+        the plan produced a reference the relation does not expose, which raises
+        rather than guessing by bare name (which could pick a same-named column
+        from another relation).
+        """
         if expr.table is not None:
             mapped = self.alias_map.get((expr.table, expr.column))
-            if mapped is not None:
-                return self.batch.column(mapped)
+            if mapped is None:
+                raise ExpressionEvaluationError(
+                    f"Unresolved column reference {expr.table}.{expr.column}; "
+                    f"relation exposes {sorted(self.alias_map.keys())}"
+                )
+            return self.batch.column(mapped)
         return self.batch.column(expr.column)
 
     def _eval_literal(self, expr: Literal):
@@ -259,12 +258,12 @@ class ExpressionEvaluator:
     def _eval_cast(self, expr: Cast) -> pa.Array:
         """Evaluate CAST locally via an Arrow type conversion."""
         value = self._broadcast(self._eval(expr.expr))
-        target = _ARROW_CAST_TYPES.get(expr.get_type())
-        if target is None:
+        data_type = expr.get_type()
+        if not is_renderable(data_type):
             raise ExpressionEvaluationError(
                 f"Unsupported local CAST target: {expr.target_type}"
             )
-        return pc.cast(value, target)
+        return pc.cast(value, arrow_type_for(data_type))
 
     def _eval_unary(self, expr: UnaryOp):
         """Evaluate NOT / IS NULL / IS NOT NULL / negation."""
@@ -275,7 +274,9 @@ class ExpressionEvaluator:
             return pc.is_null(operand)
         if expr.op == UnaryOpType.IS_NOT_NULL:
             return pc.is_valid(operand)
-        return pc.negate(operand)
+        if expr.op == UnaryOpType.NEGATE:
+            return pc.negate(operand)
+        raise ExpressionEvaluationError(f"Unsupported unary operator: {expr.op.value}")
 
     def _eval_function(self, expr: FunctionCall):
         """Evaluate a scalar (non-aggregate) function call."""

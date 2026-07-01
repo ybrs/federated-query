@@ -4,6 +4,7 @@ E2E tests for EXISTS and NOT EXISTS decorrelation.
 Tests both correlated and uncorrelated EXISTS/NOT EXISTS patterns
 and verifies they are rewritten to SEMI/ANTI joins.
 """
+
 import pytest
 from federated_query.parser.parser import Parser
 from federated_query.parser.binder import Binder
@@ -13,7 +14,7 @@ from .test_utils import (
     assert_plan_structure,
     assert_result_count,
     assert_result_contains_ids,
-    execute_and_fetch_all
+    execute_and_fetch_all,
 )
 
 
@@ -126,15 +127,16 @@ class TestCorrelatedExists:
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
         # Verify plan has SEMI join
-        assert_plan_structure(decorrelated_plan, {
-            'has_semi_join': True,
-            'semi_join_count': 1
-        })
+        assert_plan_structure(
+            decorrelated_plan, {"has_semi_join": True, "semi_join_count": 1}
+        )
 
         # Execute and verify results: 4 users (Postgres-verified)
         assert_result_contains_ids(executor, decorrelated_plan, {1, 2, 3, 5})
 
-    def test_correlated_exists_multiple_correlation_keys(self, catalog, setup_test_data):
+    def test_correlated_exists_multiple_correlation_keys(
+        self, catalog, setup_test_data
+    ):
         """
         Test: Correlated EXISTS with multiple correlation predicates.
 
@@ -171,9 +173,7 @@ class TestCorrelatedExists:
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
         # Verify plan has SEMI join
-        assert_plan_structure(decorrelated_plan, {
-            'has_semi_join': True
-        })
+        assert_plan_structure(decorrelated_plan, {"has_semi_join": True})
 
         # Execute and verify results
         results = execute_and_fetch_all(executor, decorrelated_plan)
@@ -284,9 +284,7 @@ class TestCorrelatedNotExists:
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
         # Verify plan has ANTI join
-        assert_plan_structure(decorrelated_plan, {
-            'has_anti_join': True
-        })
+        assert_plan_structure(decorrelated_plan, {"has_anti_join": True})
 
         # Execute and verify results: 4 users (all except Charlie)
         assert_result_contains_ids(executor, decorrelated_plan, {1, 2, 4, 5})
@@ -328,9 +326,7 @@ class TestCorrelatedNotExists:
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
         # Verify plan has ANTI join
-        assert_plan_structure(decorrelated_plan, {
-            'has_anti_join': True
-        })
+        assert_plan_structure(decorrelated_plan, {"has_anti_join": True})
 
         # Execute and verify results: All 5 users
         assert_result_count(executor, decorrelated_plan, 5)
@@ -375,7 +371,7 @@ class TestExistsInComplexQueries:
         # Execute and verify results: 5 rows with has_orders column
         results = execute_and_fetch_all(executor, decorrelated_plan)
         assert len(results) == 5, "Should have all 5 users"
-        assert 'has_orders' in results[0], "Should have has_orders column"
+        assert "has_orders" in results[0], "Should have has_orders column"
 
     def test_multiple_exists_same_query(self, catalog, setup_test_data):
         """
@@ -410,9 +406,7 @@ class TestExistsInComplexQueries:
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
         # Verify plan has multiple SEMI joins
-        assert_plan_structure(decorrelated_plan, {
-            'has_semi_join': True
-        })
+        assert_plan_structure(decorrelated_plan, {"has_semi_join": True})
 
         # Execute and verify results: Users satisfying both conditions
         results = execute_and_fetch_all(executor, decorrelated_plan)
@@ -459,10 +453,9 @@ class TestExistsInComplexQueries:
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
         # Verify plan has SEMI join and aggregation
-        assert_plan_structure(decorrelated_plan, {
-            'has_semi_join': True,
-            'has_aggregation': True
-        })
+        assert_plan_structure(
+            decorrelated_plan, {"has_semi_join": True, "has_aggregation": True}
+        )
 
         # Execute and verify results: 3 users
         assert_result_contains_ids(executor, decorrelated_plan, {1, 3, 5})
@@ -508,12 +501,10 @@ class TestExistsInComplexQueries:
         bound_plan = binder.bind(logical_plan)
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
-        assert_plan_structure(decorrelated_plan, {
-            'has_semi_join': True
-        })
+        assert_plan_structure(decorrelated_plan, {"has_semi_join": True})
 
         results = execute_and_fetch_all(executor, decorrelated_plan)
         ids = set()
         for row in results:
-            ids.add(row['id'])
+            ids.add(row["id"])
         assert ids == {3, 4, 5}, f"Unexpected ids {ids}"

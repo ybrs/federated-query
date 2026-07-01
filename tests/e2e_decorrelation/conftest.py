@@ -11,6 +11,7 @@ Connection parameters default to the local test harness (see
 README-test-harness-setup.md) and may be overridden via the standard
 ``POSTGRES_*`` environment variables.
 """
+
 import os
 
 import pytest
@@ -18,7 +19,6 @@ import pytest
 from federated_query.catalog import Catalog
 from federated_query.datasources.postgresql import PostgreSQLDataSource
 from federated_query.datasources.duckdb import DuckDBDataSource
-
 
 PG_SCHEMA = "pg"
 
@@ -65,42 +65,35 @@ def catalog(pg_datasource, duckdb_datasource):
 
 def _create_users(cursor) -> None:
     """Create and populate the users table."""
-    cursor.execute(
-        """
+    cursor.execute("""
         CREATE TABLE users (
             id INTEGER PRIMARY KEY,
             name VARCHAR(100),
             country VARCHAR(50),
             city VARCHAR(50)
         )
-        """
-    )
-    cursor.execute(
-        """
+        """)
+    cursor.execute("""
         INSERT INTO users (id, name, country, city) VALUES
         (1, 'Alice', 'US', 'New York'),
         (2, 'Bob', 'UK', 'London'),
         (3, 'Charlie', 'US', 'Boston'),
         (4, 'David', 'FR', 'Paris'),
         (5, 'Eve', 'UK', 'Manchester')
-        """
-    )
+        """)
 
 
 def _create_orders(cursor) -> None:
     """Create and populate the orders table."""
-    cursor.execute(
-        """
+    cursor.execute("""
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             user_id INTEGER,
             amount DECIMAL(10,2),
             status VARCHAR(20)
         )
-        """
-    )
-    cursor.execute(
-        """
+        """)
+    cursor.execute("""
         INSERT INTO orders (id, user_id, amount, status) VALUES
         (1, 1, 100.00, 'completed'),
         (2, 1, 200.00, 'completed'),
@@ -108,24 +101,20 @@ def _create_orders(cursor) -> None:
         (4, 3, 300.00, 'completed'),
         (5, 3, 50.00, 'cancelled'),
         (6, 5, 500.00, 'completed')
-        """
-    )
+        """)
 
 
 def _create_cities(cursor) -> None:
     """Create and populate the cities table."""
-    cursor.execute(
-        """
+    cursor.execute("""
         CREATE TABLE cities (
             id INTEGER PRIMARY KEY,
             name VARCHAR(50),
             country VARCHAR(50),
             population INTEGER
         )
-        """
-    )
-    cursor.execute(
-        """
+        """)
+    cursor.execute("""
         INSERT INTO cities (id, name, country, population) VALUES
         (1, 'New York', 'US', 8000000),
         (2, 'London', 'UK', 9000000),
@@ -133,37 +122,31 @@ def _create_cities(cursor) -> None:
         (4, 'Paris', 'FR', 2000000),
         (5, 'Manchester', 'UK', 500000),
         (6, 'Chicago', 'US', 2700000)
-        """
-    )
+        """)
 
 
 def _create_products(cursor) -> None:
     """Create and populate the products table."""
-    cursor.execute(
-        """
+    cursor.execute("""
         CREATE TABLE products (
             id INTEGER PRIMARY KEY,
             name VARCHAR(100),
             price DECIMAL(10,2),
             category VARCHAR(50)
         )
-        """
-    )
-    cursor.execute(
-        """
+        """)
+    cursor.execute("""
         INSERT INTO products (id, name, price, category) VALUES
         (1, 'Laptop', 1000.00, 'Electronics'),
         (2, 'Mouse', 20.00, 'Electronics'),
         (3, 'Desk', 300.00, 'Furniture'),
         (4, 'Chair', 150.00, 'Furniture')
-        """
-    )
+        """)
 
 
 def _create_sales(cursor) -> None:
     """Create and populate the sales table."""
-    cursor.execute(
-        """
+    cursor.execute("""
         CREATE TABLE sales (
             id INTEGER PRIMARY KEY,
             product_id INTEGER,
@@ -171,82 +154,67 @@ def _create_sales(cursor) -> None:
             price DECIMAL(10,2),
             region VARCHAR(50)
         )
-        """
-    )
-    cursor.execute(
-        """
+        """)
+    cursor.execute("""
         INSERT INTO sales (id, product_id, seller, price, region) VALUES
         (1, 1, 'SellerA', 950.00, 'East'),
         (2, 2, 'SellerA', 18.00, 'East'),
         (3, 3, 'SellerB', 280.00, 'West'),
         (4, 4, 'SellerB', 140.00, 'West')
-        """
-    )
+        """)
 
 
 def _create_offers(cursor) -> None:
     """Create and populate the offers table."""
-    cursor.execute(
-        """
+    cursor.execute("""
         CREATE TABLE offers (
             id INTEGER PRIMARY KEY,
             product_id INTEGER,
             seller VARCHAR(50),
             amount DECIMAL(10,2)
         )
-        """
-    )
-    cursor.execute(
-        """
+        """)
+    cursor.execute("""
         INSERT INTO offers (id, product_id, seller, amount) VALUES
         (1, 1, 'SellerA', 900.00),
         (2, 1, 'SellerA', 920.00),
         (3, 2, 'SellerA', 15.00),
         (4, 3, 'SellerB', 250.00)
-        """
-    )
+        """)
 
 
 def _create_limits(cursor) -> None:
     """Create and populate the limits table."""
-    cursor.execute(
-        """
+    cursor.execute("""
         CREATE TABLE limits (
             id INTEGER PRIMARY KEY,
             region VARCHAR(50),
             cap DECIMAL(10,2)
         )
-        """
-    )
-    cursor.execute(
-        """
+        """)
+    cursor.execute("""
         INSERT INTO limits (id, region, cap) VALUES
         (1, 'East', 1000.00),
         (2, 'West', 300.00)
-        """
-    )
+        """)
 
 
 def _create_countries(cursor) -> None:
     """Create and populate the countries table."""
-    cursor.execute(
-        """
+    cursor.execute("""
         CREATE TABLE countries (
             code VARCHAR(10) PRIMARY KEY,
             name VARCHAR(100),
             enabled BOOLEAN
         )
-        """
-    )
-    cursor.execute(
-        """
+        """)
+    cursor.execute("""
         INSERT INTO countries (code, name, enabled) VALUES
         ('US', 'United States', true),
         ('UK', 'United Kingdom', true),
         ('FR', 'France', true),
         ('DE', 'Germany', false)
-        """
-    )
+        """)
 
 
 def _build_schema(cursor) -> None:

@@ -4,6 +4,7 @@ E2E tests for IN and NOT IN decorrelation.
 Tests both correlated and uncorrelated IN/NOT IN patterns with focus on
 null-safe equality semantics and proper NULL handling.
 """
+
 import pytest
 from federated_query.parser.parser import Parser
 from federated_query.parser.binder import Binder
@@ -13,7 +14,7 @@ from .test_utils import (
     assert_plan_structure,
     assert_result_count,
     assert_result_contains_ids,
-    execute_and_fetch_all
+    execute_and_fetch_all,
 )
 
 
@@ -49,9 +50,7 @@ class TestUncorrelatedIn:
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
         # Verify plan has SEMI join
-        assert_plan_structure(decorrelated_plan, {
-            'has_semi_join': True
-        })
+        assert_plan_structure(decorrelated_plan, {"has_semi_join": True})
 
         # Execute and verify: All 5 users
         assert_result_count(executor, decorrelated_plan, 5)
@@ -84,9 +83,7 @@ class TestUncorrelatedIn:
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
         # Verify plan has SEMI join
-        assert_plan_structure(decorrelated_plan, {
-            'has_semi_join': True
-        })
+        assert_plan_structure(decorrelated_plan, {"has_semi_join": True})
 
         # Execute and verify: 0 rows
         assert_result_count(executor, decorrelated_plan, 0)
@@ -119,9 +116,7 @@ class TestUncorrelatedIn:
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
         # Verify plan has SEMI join
-        assert_plan_structure(decorrelated_plan, {
-            'has_semi_join': True
-        })
+        assert_plan_structure(decorrelated_plan, {"has_semi_join": True})
 
         # Execute and verify: All users
         assert_result_count(executor, decorrelated_plan, 5)
@@ -164,9 +159,7 @@ class TestCorrelatedIn:
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
         # Verify plan has SEMI join
-        assert_plan_structure(decorrelated_plan, {
-            'has_semi_join': True
-        })
+        assert_plan_structure(decorrelated_plan, {"has_semi_join": True})
 
         # Execute and verify results
         results = execute_and_fetch_all(executor, decorrelated_plan)
@@ -205,9 +198,7 @@ class TestCorrelatedIn:
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
         # Verify plan has SEMI join
-        assert_plan_structure(decorrelated_plan, {
-            'has_semi_join': True
-        })
+        assert_plan_structure(decorrelated_plan, {"has_semi_join": True})
 
         # Execute and verify results
         results = execute_and_fetch_all(executor, decorrelated_plan)
@@ -245,9 +236,7 @@ class TestUncorrelatedNotIn:
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
         # Verify plan has ANTI join
-        assert_plan_structure(decorrelated_plan, {
-            'has_anti_join': True
-        })
+        assert_plan_structure(decorrelated_plan, {"has_anti_join": True})
 
         # Execute and verify: All 5 users
         assert_result_count(executor, decorrelated_plan, 5)
@@ -280,9 +269,7 @@ class TestUncorrelatedNotIn:
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
         # Verify plan has ANTI join
-        assert_plan_structure(decorrelated_plan, {
-            'has_anti_join': True
-        })
+        assert_plan_structure(decorrelated_plan, {"has_anti_join": True})
 
         # Execute and verify: 0 rows
         assert_result_count(executor, decorrelated_plan, 0)
@@ -327,9 +314,7 @@ class TestCorrelatedNotIn:
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
         # Verify plan has ANTI join
-        assert_plan_structure(decorrelated_plan, {
-            'has_anti_join': True
-        })
+        assert_plan_structure(decorrelated_plan, {"has_anti_join": True})
 
         # Execute and verify results
         results = execute_and_fetch_all(executor, decorrelated_plan)
@@ -367,9 +352,7 @@ class TestInWithNullSemantics:
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
         # Verify plan has SEMI join
-        assert_plan_structure(decorrelated_plan, {
-            'has_semi_join': True
-        })
+        assert_plan_structure(decorrelated_plan, {"has_semi_join": True})
 
         # Execute and verify results
         results = execute_and_fetch_all(executor, decorrelated_plan)
@@ -410,9 +393,7 @@ class TestInWithNullSemantics:
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
         # Verify plan has ANTI join
-        assert_plan_structure(decorrelated_plan, {
-            'has_anti_join': True
-        })
+        assert_plan_structure(decorrelated_plan, {"has_anti_join": True})
 
         # Execute and verify results
         results = execute_and_fetch_all(executor, decorrelated_plan)
@@ -450,7 +431,7 @@ class TestInWithNullSemantics:
 
         # Execute and verify: Users with country US or UK
         results = execute_and_fetch_all(executor, decorrelated_plan)
-        result_ids = {r['id'] for r in results}
+        result_ids = {r["id"] for r in results}
         assert 1 in result_ids, "Should include Alice (US)"
         assert 2 in result_ids, "Should include Bob (UK)"
 
@@ -491,9 +472,7 @@ class TestInComplexQueries:
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
         # Verify plan has SEMI join
-        assert_plan_structure(decorrelated_plan, {
-            'has_semi_join': True
-        })
+        assert_plan_structure(decorrelated_plan, {"has_semi_join": True})
 
         # Execute and verify results
         results = execute_and_fetch_all(executor, decorrelated_plan)
@@ -535,7 +514,7 @@ class TestInComplexQueries:
         # Execute and verify: 5 rows with boolean flag
         results = execute_and_fetch_all(executor, decorrelated_plan)
         assert len(results) == 5, "Should have all 5 users"
-        assert 'in_enabled_country' in results[0], "Should have boolean column"
+        assert "in_enabled_country" in results[0], "Should have boolean column"
 
     def test_multiple_in_predicates(self, catalog, setup_test_data):
         """
@@ -568,9 +547,7 @@ class TestInComplexQueries:
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
         # Verify plan has multiple SEMI joins
-        assert_plan_structure(decorrelated_plan, {
-            'has_semi_join': True
-        })
+        assert_plan_structure(decorrelated_plan, {"has_semi_join": True})
 
         # Execute and verify results
         results = execute_and_fetch_all(executor, decorrelated_plan)

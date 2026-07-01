@@ -36,7 +36,7 @@ def cost_config():
         cpu_tuple_cost=0.01,
         io_page_cost=1.0,
         network_byte_cost=0.0001,
-        network_rtt_ms=10.0
+        network_rtt_ms=10.0,
     )
 
 
@@ -47,22 +47,10 @@ def table_stats():
         row_count=1000,
         total_size_bytes=100000,
         column_stats={
-            "id": ColumnStatistics(
-                num_distinct=1000,
-                null_fraction=0.0,
-                avg_width=8
-            ),
-            "name": ColumnStatistics(
-                num_distinct=500,
-                null_fraction=0.1,
-                avg_width=20
-            ),
-            "status": ColumnStatistics(
-                num_distinct=5,
-                null_fraction=0.0,
-                avg_width=10
-            ),
-        }
+            "id": ColumnStatistics(num_distinct=1000, null_fraction=0.0, avg_width=8),
+            "name": ColumnStatistics(num_distinct=500, null_fraction=0.1, avg_width=20),
+            "status": ColumnStatistics(num_distinct=5, null_fraction=0.0, avg_width=10),
+        },
     )
 
 
@@ -79,8 +67,8 @@ class TestSelectivityEstimation:
         """Test equality selectivity using statistics."""
         predicate = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("active", DataType.VARCHAR)
+            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            right=Literal(value="active", data_type=DataType.VARCHAR),
         )
         selectivity = cost_model.estimate_selectivity(predicate, table_stats)
         assert selectivity == pytest.approx(1.0 / 5, rel=0.01)
@@ -89,8 +77,10 @@ class TestSelectivityEstimation:
         """Test equality selectivity without statistics."""
         predicate = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "unknown_col", DataType.VARCHAR),
-            right=Literal("value", DataType.VARCHAR)
+            left=ColumnRef(
+                table=None, column="unknown_col", data_type=DataType.VARCHAR
+            ),
+            right=Literal(value="value", data_type=DataType.VARCHAR),
         )
         selectivity = cost_model.estimate_selectivity(predicate, None)
         assert selectivity == 0.1
@@ -99,8 +89,8 @@ class TestSelectivityEstimation:
         """Test inequality selectivity (LT, GT, etc)."""
         predicate = BinaryOp(
             op=BinaryOpType.LT,
-            left=ColumnRef(None, "id", DataType.INTEGER),
-            right=Literal(100, DataType.INTEGER)
+            left=ColumnRef(table=None, column="id", data_type=DataType.INTEGER),
+            right=Literal(value=100, data_type=DataType.INTEGER),
         )
         selectivity = cost_model.estimate_selectivity(predicate, table_stats)
         assert selectivity == 0.33
@@ -109,8 +99,8 @@ class TestSelectivityEstimation:
         """Test not-equal selectivity."""
         predicate = BinaryOp(
             op=BinaryOpType.NEQ,
-            left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("active", DataType.VARCHAR)
+            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            right=Literal(value="active", data_type=DataType.VARCHAR),
         )
         selectivity = cost_model.estimate_selectivity(predicate, table_stats)
         expected = 1.0 - (1.0 / 5)
@@ -120,13 +110,13 @@ class TestSelectivityEstimation:
         """Test AND selectivity (product of operands)."""
         left = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("active", DataType.VARCHAR)
+            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            right=Literal(value="active", data_type=DataType.VARCHAR),
         )
         right = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(None, "id", DataType.INTEGER),
-            right=Literal(100, DataType.INTEGER)
+            left=ColumnRef(table=None, column="id", data_type=DataType.INTEGER),
+            right=Literal(value=100, data_type=DataType.INTEGER),
         )
         predicate = BinaryOp(op=BinaryOpType.AND, left=left, right=right)
 
@@ -138,13 +128,13 @@ class TestSelectivityEstimation:
         """Test OR selectivity."""
         left = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("active", DataType.VARCHAR)
+            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            right=Literal(value="active", data_type=DataType.VARCHAR),
         )
         right = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("pending", DataType.VARCHAR)
+            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            right=Literal(value="pending", data_type=DataType.VARCHAR),
         )
         predicate = BinaryOp(op=BinaryOpType.OR, left=left, right=right)
 
@@ -158,8 +148,8 @@ class TestSelectivityEstimation:
         """Test NOT selectivity."""
         inner = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("active", DataType.VARCHAR)
+            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            right=Literal(value="active", data_type=DataType.VARCHAR),
         )
         predicate = UnaryOp(op=UnaryOpType.NOT, operand=inner)
 
@@ -171,7 +161,7 @@ class TestSelectivityEstimation:
         """Test IS NULL selectivity using null_fraction."""
         predicate = UnaryOp(
             op=UnaryOpType.IS_NULL,
-            operand=ColumnRef(None, "name", DataType.VARCHAR)
+            operand=ColumnRef(table=None, column="name", data_type=DataType.VARCHAR),
         )
         selectivity = cost_model.estimate_selectivity(predicate, table_stats)
         assert selectivity == 0.1
@@ -180,7 +170,7 @@ class TestSelectivityEstimation:
         """Test IS NOT NULL selectivity."""
         predicate = UnaryOp(
             op=UnaryOpType.IS_NOT_NULL,
-            operand=ColumnRef(None, "name", DataType.VARCHAR)
+            operand=ColumnRef(table=None, column="name", data_type=DataType.VARCHAR),
         )
         selectivity = cost_model.estimate_selectivity(predicate, table_stats)
         assert selectivity == 0.9
@@ -189,8 +179,8 @@ class TestSelectivityEstimation:
         """Test LIKE selectivity."""
         predicate = BinaryOp(
             op=BinaryOpType.LIKE,
-            left=ColumnRef(None, "name", DataType.VARCHAR),
-            right=Literal("%smith%", DataType.VARCHAR)
+            left=ColumnRef(table=None, column="name", data_type=DataType.VARCHAR),
+            right=Literal(value="%smith%", data_type=DataType.VARCHAR),
         )
         selectivity = cost_model.estimate_selectivity(predicate, table_stats)
         assert selectivity == 0.1
@@ -205,7 +195,7 @@ class TestCardinalityEstimation:
             datasource="test_ds",
             schema_name="public",
             table_name="users",
-            columns=["id", "name"]
+            columns=["id", "name"],
         )
         cardinality = cost_model.estimate_cardinality(scan)
         assert cardinality == 1000
@@ -216,12 +206,12 @@ class TestCardinalityEstimation:
             datasource="test_ds",
             schema_name="public",
             table_name="users",
-            columns=["id", "name", "status"]
+            columns=["id", "name", "status"],
         )
         predicate = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("active", DataType.VARCHAR)
+            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            right=Literal(value="active", data_type=DataType.VARCHAR),
         )
         filter_node = Filter(input=scan, predicate=predicate)
 
@@ -235,12 +225,14 @@ class TestCardinalityEstimation:
             datasource="test_ds",
             schema_name="public",
             table_name="users",
-            columns=["id", "name"]
+            columns=["id", "name"],
         )
         project = Projection(
             input=scan,
-            expressions=[ColumnRef(None, "id", DataType.INTEGER)],
-            aliases=["id"]
+            expressions=[
+                ColumnRef(table=None, column="id", data_type=DataType.INTEGER)
+            ],
+            aliases=["id"],
         )
 
         cardinality = cost_model.estimate_cardinality(project)
@@ -252,24 +244,26 @@ class TestCardinalityEstimation:
             datasource="test_ds",
             schema_name="public",
             table_name="orders",
-            columns=["id", "customer_id"]
+            columns=["id", "customer_id"],
         )
         right_scan = Scan(
             datasource="test_ds",
             schema_name="public",
             table_name="customers",
-            columns=["id", "name"]
+            columns=["id", "name"],
         )
         condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER)
+            left=ColumnRef(
+                table="orders", column="customer_id", data_type=DataType.INTEGER
+            ),
+            right=ColumnRef(table="customers", column="id", data_type=DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
             right=right_scan,
             join_type=JoinType.INNER,
-            condition=condition
+            condition=condition,
         )
 
         cardinality = cost_model.estimate_cardinality(join)
@@ -282,19 +276,16 @@ class TestCardinalityEstimation:
             datasource="test_ds",
             schema_name="public",
             table_name="orders",
-            columns=["id"]
+            columns=["id"],
         )
         right_scan = Scan(
             datasource="test_ds",
             schema_name="public",
             table_name="customers",
-            columns=["id"]
+            columns=["id"],
         )
         join = Join(
-            left=left_scan,
-            right=right_scan,
-            join_type=JoinType.CROSS,
-            condition=None
+            left=left_scan, right=right_scan, join_type=JoinType.CROSS, condition=None
         )
 
         cardinality = cost_model.estimate_cardinality(join)
@@ -306,24 +297,26 @@ class TestCardinalityEstimation:
             datasource="test_ds",
             schema_name="public",
             table_name="orders",
-            columns=["id", "customer_id"]
+            columns=["id", "customer_id"],
         )
         right_scan = Scan(
             datasource="test_ds",
             schema_name="public",
             table_name="customers",
-            columns=["id"]
+            columns=["id"],
         )
         condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER)
+            left=ColumnRef(
+                table="orders", column="customer_id", data_type=DataType.INTEGER
+            ),
+            right=ColumnRef(table="customers", column="id", data_type=DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
             right=right_scan,
             join_type=JoinType.LEFT,
-            condition=condition
+            condition=condition,
         )
 
         cardinality = cost_model.estimate_cardinality(join)
@@ -335,14 +328,9 @@ class TestCardinalityEstimation:
             datasource="test_ds",
             schema_name="public",
             table_name="orders",
-            columns=["id", "amount"]
+            columns=["id", "amount"],
         )
-        agg = Aggregate(
-            input=scan,
-            group_by=[],
-            aggregates=[],
-            output_names=[]
-        )
+        agg = Aggregate(input=scan, group_by=[], aggregates=[], output_names=[])
 
         cardinality = cost_model.estimate_cardinality(agg)
         assert cardinality == 1
@@ -353,13 +341,15 @@ class TestCardinalityEstimation:
             datasource="test_ds",
             schema_name="public",
             table_name="orders",
-            columns=["customer_id", "amount"]
+            columns=["customer_id", "amount"],
         )
         agg = Aggregate(
             input=scan,
-            group_by=[ColumnRef(None, "customer_id", DataType.INTEGER)],
+            group_by=[
+                ColumnRef(table=None, column="customer_id", data_type=DataType.INTEGER)
+            ],
             aggregates=[],
-            output_names=["customer_id"]
+            output_names=["customer_id"],
         )
 
         cardinality = cost_model.estimate_cardinality(agg)
@@ -371,7 +361,7 @@ class TestCardinalityEstimation:
             datasource="test_ds",
             schema_name="public",
             table_name="users",
-            columns=["id", "name"]
+            columns=["id", "name"],
         )
         limit = Limit(input=scan, limit=10)
 
@@ -384,7 +374,7 @@ class TestCardinalityEstimation:
             datasource="test_ds",
             schema_name="public",
             table_name="users",
-            columns=["id", "name"]
+            columns=["id", "name"],
         )
         limit = Limit(input=scan, limit=10, offset=5)
 
@@ -407,7 +397,7 @@ class TestCostModelWithStatistics:
             datasource="test_ds",
             schema_name="public",
             table_name="users",
-            columns=["id", "name"]
+            columns=["id", "name"],
         )
 
         cardinality = cost_model.estimate_cardinality(scan)
@@ -423,15 +413,15 @@ class TestCostModelWithStatistics:
         cost_model = CostModel(cost_config, stats_collector)
         predicate = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("active", DataType.VARCHAR)
+            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            right=Literal(value="active", data_type=DataType.VARCHAR),
         )
         scan = Scan(
             datasource="test_ds",
             schema_name="public",
             table_name="users",
             columns=["id", "name", "status"],
-            filters=predicate
+            filters=predicate,
         )
 
         cardinality = cost_model.estimate_cardinality(scan)
@@ -448,7 +438,7 @@ class TestOperatorCostEstimation:
             datasource="test_ds",
             schema_name="public",
             table_name="users",
-            columns=["id", "name"]
+            columns=["id", "name"],
         )
         cost = cost_model.estimate_logical_plan_cost(scan)
         assert cost > 0
@@ -460,12 +450,12 @@ class TestOperatorCostEstimation:
             datasource="test_ds",
             schema_name="public",
             table_name="users",
-            columns=["id", "name"]
+            columns=["id", "name"],
         )
         predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(None, "id", DataType.INTEGER),
-            right=Literal(100, DataType.INTEGER)
+            left=ColumnRef(table=None, column="id", data_type=DataType.INTEGER),
+            right=Literal(value=100, data_type=DataType.INTEGER),
         )
         filter_node = Filter(input=scan, predicate=predicate)
 
@@ -479,15 +469,15 @@ class TestOperatorCostEstimation:
             datasource="test_ds",
             schema_name="public",
             table_name="users",
-            columns=["id", "name", "email"]
+            columns=["id", "name", "email"],
         )
         project = Projection(
             input=scan,
             expressions=[
-                ColumnRef(None, "id", DataType.INTEGER),
-                ColumnRef(None, "name", DataType.VARCHAR)
+                ColumnRef(table=None, column="id", data_type=DataType.INTEGER),
+                ColumnRef(table=None, column="name", data_type=DataType.VARCHAR),
             ],
-            aliases=["id", "name"]
+            aliases=["id", "name"],
         )
 
         scan_cost = cost_model.estimate_logical_plan_cost(scan)
@@ -500,24 +490,26 @@ class TestOperatorCostEstimation:
             datasource="test_ds",
             schema_name="public",
             table_name="orders",
-            columns=["id", "customer_id"]
+            columns=["id", "customer_id"],
         )
         right_scan = Scan(
             datasource="test_ds",
             schema_name="public",
             table_name="customers",
-            columns=["id", "name"]
+            columns=["id", "name"],
         )
         condition = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef("orders", "customer_id", DataType.INTEGER),
-            right=ColumnRef("customers", "id", DataType.INTEGER)
+            left=ColumnRef(
+                table="orders", column="customer_id", data_type=DataType.INTEGER
+            ),
+            right=ColumnRef(table="customers", column="id", data_type=DataType.INTEGER),
         )
         join = Join(
             left=left_scan,
             right=right_scan,
             join_type=JoinType.INNER,
-            condition=condition
+            condition=condition,
         )
 
         left_cost = cost_model.estimate_logical_plan_cost(left_scan)
@@ -531,13 +523,15 @@ class TestOperatorCostEstimation:
             datasource="test_ds",
             schema_name="public",
             table_name="orders",
-            columns=["customer_id", "amount"]
+            columns=["customer_id", "amount"],
         )
         agg = Aggregate(
             input=scan,
-            group_by=[ColumnRef(None, "customer_id", DataType.INTEGER)],
+            group_by=[
+                ColumnRef(table=None, column="customer_id", data_type=DataType.INTEGER)
+            ],
             aggregates=[],
-            output_names=["customer_id"]
+            output_names=["customer_id"],
         )
 
         scan_cost = cost_model.estimate_logical_plan_cost(scan)
@@ -550,7 +544,7 @@ class TestOperatorCostEstimation:
             datasource="test_ds",
             schema_name="public",
             table_name="users",
-            columns=["id", "name"]
+            columns=["id", "name"],
         )
         limit = Limit(input=scan, limit=10)
 
@@ -564,18 +558,20 @@ class TestOperatorCostEstimation:
             datasource="test_ds",
             schema_name="public",
             table_name="users",
-            columns=["id", "name", "status"]
+            columns=["id", "name", "status"],
         )
         predicate = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(None, "status", DataType.VARCHAR),
-            right=Literal("active", DataType.VARCHAR)
+            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            right=Literal(value="active", data_type=DataType.VARCHAR),
         )
         filter_node = Filter(input=scan, predicate=predicate)
         project = Projection(
             input=filter_node,
-            expressions=[ColumnRef(None, "id", DataType.INTEGER)],
-            aliases=["id"]
+            expressions=[
+                ColumnRef(table=None, column="id", data_type=DataType.INTEGER)
+            ],
+            aliases=["id"],
         )
         limit = Limit(input=project, limit=100)
 
@@ -588,14 +584,12 @@ class TestOperatorCostEstimation:
         stats_collector = StatisticsCollector(catalog)
 
         small_stats = TableStatistics(
-            row_count=100,
-            total_size_bytes=10000,
-            column_stats=table_stats.column_stats
+            row_count=100, total_size_bytes=10000, column_stats=table_stats.column_stats
         )
         large_stats = TableStatistics(
             row_count=10000,
             total_size_bytes=1000000,
-            column_stats=table_stats.column_stats
+            column_stats=table_stats.column_stats,
         )
 
         stats_collector.cache[("test_ds", "public", "small")] = small_stats
@@ -607,13 +601,13 @@ class TestOperatorCostEstimation:
             datasource="test_ds",
             schema_name="public",
             table_name="small",
-            columns=["id"]
+            columns=["id"],
         )
         large_scan = Scan(
             datasource="test_ds",
             schema_name="public",
             table_name="large",
-            columns=["id"]
+            columns=["id"],
         )
 
         small_cost = cost_model.estimate_logical_plan_cost(small_scan)

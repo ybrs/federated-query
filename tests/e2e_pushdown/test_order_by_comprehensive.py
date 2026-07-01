@@ -14,10 +14,7 @@ from tests.e2e_pushdown.helpers import (
 def test_order_by_asc_explicit(single_source_env):
     """Verifies explicit ASC ordering pushes down correctly."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT order_id, price FROM duckdb_primary.main.orders "
-        "ORDER BY price ASC"
-    )
+    sql = "SELECT order_id, price FROM duckdb_primary.main.orders " "ORDER BY price ASC"
     ast = explain_datasource_query(runtime, sql)
     order_clause = ast.args.get("order")
     assert order_clause is not None
@@ -35,8 +32,7 @@ def test_order_by_desc(single_source_env):
     """Validates DESC ordering pushes to datasource."""
     runtime = build_runtime(single_source_env)
     sql = (
-        "SELECT order_id, price FROM duckdb_primary.main.orders "
-        "ORDER BY price DESC"
+        "SELECT order_id, price FROM duckdb_primary.main.orders " "ORDER BY price DESC"
     )
     ast = explain_datasource_query(runtime, sql)
     order_clause = ast.args.get("order")
@@ -166,8 +162,7 @@ def test_order_by_column_not_in_select(single_source_env):
     """Checks ORDER BY column that's not in SELECT projection."""
     runtime = build_runtime(single_source_env)
     sql = (
-        "SELECT order_id, region FROM duckdb_primary.main.orders "
-        "ORDER BY price DESC"
+        "SELECT order_id, region FROM duckdb_primary.main.orders " "ORDER BY price DESC"
     )
     ast = explain_datasource_query(runtime, sql)
     order_clause = ast.args.get("order")
@@ -185,10 +180,7 @@ def test_order_by_column_not_in_select(single_source_env):
 def test_order_by_with_distinct(single_source_env):
     """Ensures ORDER BY works with DISTINCT."""
     runtime = build_runtime(single_source_env)
-    sql = (
-        "SELECT DISTINCT region FROM duckdb_primary.main.orders "
-        "ORDER BY region"
-    )
+    sql = "SELECT DISTINCT region FROM duckdb_primary.main.orders " "ORDER BY region"
     ast = explain_datasource_query(runtime, sql)
     order_clause = ast.args.get("order")
     assert order_clause is not None
