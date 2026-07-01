@@ -511,9 +511,25 @@ class Parser:
         if not alias:
             raise ValueError("Derived tables require an alias")
         inner_plan = self.ast_to_logical_plan(subquery.this)
+        column_names = self._derived_column_names(subquery)
         # A derived table (subquery in FROM) is a SubqueryScan wrapping the
-        # converted inner plan under the required table alias.
-        return SubqueryScan.create(input=inner_plan, alias=alias)
+        # converted inner plan under the required table alias, carrying any
+        # ``AS alias(col, ...)`` column-rename list.
+        return SubqueryScan.create(
+            input=inner_plan, alias=alias, column_names=column_names
+        )
+
+    def _derived_column_names(
+        self, subquery: exp.Subquery
+    ) -> Optional[List[str]]:
+        """Extract a derived table's column-alias list, or None if it has none."""
+        table_alias = subquery.args.get("alias")
+        if table_alias is None or not table_alias.columns:
+            return None
+        names = []
+        for identifier in table_alias.columns:
+            names.append(identifier.name)
+        return names
 
     def _values_relation(self, values: exp.Values) -> SubqueryScan:
         """Build a derived table from a VALUES list: ``(VALUES ...) AS v(a, b)``.

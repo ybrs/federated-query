@@ -191,11 +191,48 @@ class Binder:
         return values.model_copy(update={"rows": bound_rows})
 
     def _bind_subquery_scan(self, node: SubqueryScan) -> SubqueryScan:
-        """Bind a derived table by binding its inner plan."""
+        """Bind a derived table by binding its inner plan, applying any rename."""
         bound_input = self.bind(node.input)
+        if node.column_names is not None:
+            bound_input = self._rename_derived_columns(bound_input, node.column_names)
         # The derived table with its inner plan now bound; only the input changes,
         # so model_copy keeps the derived-table alias untouched.
         return node.model_copy(update={"input": bound_input})
+
+    def _rename_derived_columns(
+        self, plan: LogicalPlanNode, names: List[str]
+    ) -> LogicalPlanNode:
+        """Apply a derived table's column-alias list (``AS d(a, b)``).
+
+        A projection over the bound subquery renames its outputs positionally,
+        without disturbing references already bound inside the subquery. Each
+        output column is read by its physical name and re-aliased.
+        """
+        columns = self._plan_output_columns(plan)
+        if len(columns) != len(names):
+            raise BindingError(
+                f"Derived table column-alias list has {len(names)} names but the "
+                f"subquery returns {len(columns)} columns"
+            )
+        expressions = self._output_column_refs(columns)
+        # A rename projection selecting each subquery output column by its
+        # physical name and exposing it under the derived table's alias-list name.
+        return Projection.create(
+            input=plan, expressions=expressions, aliases=list(names)
+        )
+
+    def _output_column_refs(self, columns: List[Column]) -> List[Expression]:
+        """A ColumnRef reading each output column by its physical name."""
+        refs: List[Expression] = []
+        for column in columns:
+            # A reference to one subquery output column, read by its physical name
+            # (the derived table's own scope); the rename projection re-aliases it.
+            refs.append(
+                ColumnRef.create(
+                    table=None, column=column.name, data_type=column.data_type
+                )
+            )
+        return refs
 
     def _bind_scan(self, scan: Scan) -> Scan:
         """Bind a Scan node to the real column names it reads from its table.
@@ -511,7 +548,10 @@ class Binder:
         self, aggregate: Aggregate, bound_input: LogicalPlanNode
     ) -> Aggregate:
         """Bind aggregate expressions against the bound input plan."""
-        bound_group_by = self._bind_group_by_expressions(aggregate.group_by)
+        alias_map = self._aggregate_alias_map(aggregate)
+        bound_group_by = self._bind_group_by_expressions(
+            aggregate.group_by, alias_map
+        )
         bound_aggregates = self._bind_aggregate_expressions(aggregate.aggregates)
         return aggregate.model_copy(
             update={
@@ -626,13 +666,44 @@ class Binder:
             self._cte_tables[name] = saved
 
     def _bind_group_by_expressions(
-        self, expressions: List[Expression]
+        self,
+        expressions: List[Expression],
+        alias_map: Optional[Dict[str, Expression]] = None,
     ) -> List[Expression]:
-        """Bind GROUP BY expressions against the relation scope."""
+        """Bind GROUP BY expressions against the relation scope.
+
+        A bare key that names a SELECT-list output alias (not an input column)
+        groups by the expression that alias stands for, as PostgreSQL allows.
+        """
         bound = []
         for expr in expressions:
-            bound.append(self._bind_expression(expr))
+            bound.append(self._bind_group_key(expr, alias_map))
         return bound
+
+    def _bind_group_key(
+        self, expr: Expression, alias_map: Optional[Dict[str, Expression]]
+    ) -> Expression:
+        """Bind one GROUP BY key, resolving a SELECT-output alias to its source."""
+        if self._is_group_by_alias(expr, alias_map):
+            return self._bind_expression(alias_map[expr.column])
+        return self._bind_expression(expr)
+
+    def _is_group_by_alias(
+        self, expr: Expression, alias_map: Optional[Dict[str, Expression]]
+    ) -> bool:
+        """Whether a key is a bare output-alias name that is not an input column."""
+        if alias_map is None or not isinstance(expr, ColumnRef):
+            return False
+        if expr.table is not None or expr.column not in alias_map:
+            return False
+        return not self._resolves_in_scope(expr)
+
+    def _resolves_in_scope(self, col_ref: ColumnRef) -> bool:
+        """Whether a bare column resolves in the current scope chain (non-raising)."""
+        for scope in reversed(self._scope_stack):
+            if self._match_in_scope(scope, col_ref.column) is not None:
+                return True
+        return False
 
     def _bind_aggregate_expressions(
         self, expressions: List[Expression]
@@ -1073,6 +1144,11 @@ class SubqueryPlanBinder:
         """Bind one subquery plan node, dispatching by type."""
         if isinstance(plan, Scan):
             return self._bind_scan(plan)
+        if isinstance(plan, CTERef):
+            # A reference to a CTE defined in an enclosing block; it is a leaf, so
+            # there is nothing to rebind. The CTE's columns enter the subquery's
+            # scope through the host's scope builder (_add_cte_ref_to_scope).
+            return plan
         if isinstance(plan, Values):
             return self._bind_values(plan)
         if isinstance(plan, SubqueryScan):

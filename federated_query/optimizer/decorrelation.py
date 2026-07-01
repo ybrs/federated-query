@@ -45,6 +45,7 @@ from ..plan.logical import (
     CTE,
     Values,
     SubqueryScan,
+    CTERef,
     SingleRowGuard,
     GroupedLimit,
     LateralJoin,
@@ -200,6 +201,8 @@ def _collect_inner_aliases(plan: LogicalPlanNode) -> Set[str]:
             names.add(plan.table_name)
     if isinstance(plan, SubqueryScan):
         names.add(plan.alias)
+    if isinstance(plan, CTERef):
+        names.add(plan.alias if plan.alias else plan.name)
     for child in plan.children():
         names.update(_collect_inner_aliases(child))
     return names

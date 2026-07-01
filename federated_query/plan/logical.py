@@ -759,19 +759,24 @@ class SubqueryScan(LogicalPlanNode):
     """A derived table: a subplan exposed under an alias.
 
     ``FROM (SELECT ...) dt`` becomes SubqueryScan(input=subplan, alias="dt");
-    the output columns are the subplan's output columns.
+    the output columns are the subplan's output columns. A column-alias list
+    (``... AS dt(a, b)``) is carried in column_names and renames those outputs
+    positionally; None means keep the subplan's own output names.
     """
 
     input: LogicalPlanNode
     alias: str
+    column_names: Optional[List[str]] = None
 
     @classmethod
     def create(
-        cls, *, input: LogicalPlanNode, alias: str
+        cls, *, input: LogicalPlanNode, alias: str,
+        column_names: Optional[List[str]] = None,
     ) -> "SubqueryScan":
         """Build a SubqueryScan exposing a subplan under a derived-table alias.
+        column_names carries a ``AS alias(col, ...)`` rename list, or None.
         Sanctioned construction path; prefer model_copy when deriving from an existing node."""
-        return cls(input=input, alias=alias)
+        return cls(input=input, alias=alias, column_names=column_names)
 
     def children(self) -> List[LogicalPlanNode]:
         return [self.input]
