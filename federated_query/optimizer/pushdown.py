@@ -17,7 +17,94 @@ from ..plan.logical import (
     Aggregate,
     Filter,
     Limit,
+    SubqueryScan,
 )
+
+
+class SidePlacementError(Exception):
+    """A qualified column does not resolve to exactly one join side.
+
+    Raised instead of falling back to a name guess: after binding every base
+    column carries its resolving relation, so a column that resolves to neither
+    side (or to both) means the plan mis-placed the predicate - a loud bug, not
+    something to paper over.
+    """
+
+
+def relation_identities(plan: LogicalPlanNode) -> Set[str]:
+    """The relation identities a plan subtree EXPOSES (scan alias and table
+    name, derived-table alias).
+
+    This is the authoritative basis for deciding which join side owns a column:
+    a bound ColumnRef carries its resolving relation in ``.table``, so the side
+    that owns it is the side whose relation identities contain that qualifier -
+    no column-name matching against a scan's read-set (which may be ``['*']``).
+    """
+    identities: Set[str] = set()
+    _collect_relation_identities(plan, identities)
+    return identities
+
+
+def _collect_relation_identities(plan: LogicalPlanNode, identities: Set[str]) -> None:
+    """Gather relation identities a subtree exposes, stopping at a derived-table
+    boundary (a SubqueryScan exposes its alias, not its internals)."""
+    if isinstance(plan, Scan):
+        # A scan's effective identity is its alias when set, else its table
+        # name. The binder qualifies every ColumnRef with this same value, so a
+        # self-join / self-correlation stays distinguishable (an aliased outer
+        # 'orders O' is {O}, the inner 'orders' is {orders}).
+        identities.add(plan.alias if plan.alias else plan.table_name)
+        return
+    if isinstance(plan, SubqueryScan):
+        identities.add(plan.alias)
+        return
+    for child in plan.children():
+        _collect_relation_identities(child, identities)
+
+
+def _column_side(ref: ColumnRef, left_ids: Set[str], right_ids: Set[str]) -> str:
+    """Which join side owns a single column, by its resolved qualifier.
+
+    Raises SidePlacementError when the column is unqualified or its qualifier
+    resolves to neither side or (ambiguously) to both.
+    """
+    if ref.table is None:
+        raise SidePlacementError(
+            f"unqualified column '{ref.column}' reached a join-side decision"
+        )
+    in_left = ref.table in left_ids
+    in_right = ref.table in right_ids
+    if in_left == in_right:
+        raise SidePlacementError(
+            f"column '{ref.table}.{ref.column}' does not resolve to exactly one join side"
+        )
+    if in_left:
+        return "left"
+    return "right"
+
+
+def predicate_join_side(
+    predicate: Expression, left_ids: Set[str], right_ids: Set[str]
+) -> str:
+    """Classify a predicate as belonging to the 'left', 'right', or 'both' join
+    sides, purely by its columns' resolved qualifiers.
+
+    A predicate with no columns (a constant) is treated as 'left' so it still
+    pushes to a single side, matching the prior behavior. Any column whose
+    qualifier resolves to neither side raises SidePlacementError.
+    """
+    saw_left = False
+    saw_right = False
+    for ref in column_refs(predicate):
+        if _column_side(ref, left_ids, right_ids) == "left":
+            saw_left = True
+        else:
+            saw_right = True
+    if saw_left and saw_right:
+        return "both"
+    if saw_right:
+        return "right"
+    return "left"
 
 
 def _ref_key(ref: ColumnRef) -> str:

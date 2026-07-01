@@ -215,6 +215,30 @@ def _replace_column_refs(
     return _rebuild_expression(expr, lambda child: _replace_column_refs(child, mapping))
 
 
+def _qualify_output_refs(
+    expr: Expression, output_columns: Set[str], alias: str
+) -> Expression:
+    """Qualify references to a relation's own output columns with its alias.
+
+    ``output_columns`` is the EXACT set of columns the relation exposes (its
+    ``schema()``), so attribution is by an authoritative set, not by a name
+    shape. Once the assembled subquery is exposed under
+    ``SubqueryScan(alias=alias)``, a reference to one of its outputs from
+    OUTSIDE the relation (a join condition, a scalar replacement, a value
+    comparison) must carry that alias so join-side resolution places it by
+    qualifier. Only unqualified references are stamped: an outer column already
+    carries its own relation. Uses the shared structural walker, which copies
+    every field via model_copy, so no field is dropped.
+    """
+    if isinstance(expr, ColumnRef):
+        if expr.table is None and expr.column in output_columns:
+            return expr.model_copy(update={"table": alias})
+        return expr
+    return _rebuild_expression(
+        expr, lambda child: _qualify_output_refs(child, output_columns, alias)
+    )
+
+
 def _is_null_check(expr: Expression) -> UnaryOp:
     """Build an IS NULL check for an expression."""
     return UnaryOp(op=UnaryOpType.IS_NULL, operand=expr)
@@ -231,6 +255,10 @@ class _PreparedSubquery(StateModel):
     plan: LogicalPlanNode
     condition: Optional[Expression]
     values: List[str]
+    # The alias the join-ready plan is exposed under (a SubqueryScan boundary),
+    # so consumers qualify references to its value columns. None while raw,
+    # before the preparer finalizes it.
+    alias: Optional[str] = None
 
 
 class _PreparedScalar(StateModel):
@@ -239,6 +267,8 @@ class _PreparedScalar(StateModel):
     plan: LogicalPlanNode
     condition: Optional[Expression]
     replacement: Expression
+    # The alias the join-ready plan is exposed under (a SubqueryScan boundary).
+    alias: Optional[str] = None
 
 
 class _SubqueryPreparer:
@@ -261,17 +291,58 @@ class _SubqueryPreparer:
         # correlated "ORDER BY ... LIMIT n" keeps the first n rows per key.
         self.pending_order: Optional[Sort] = None
 
+    def _expose(self, plan: LogicalPlanNode) -> Tuple[SubqueryScan, Set[str]]:
+        """Expose an assembled relation as a derived table under this subquery's
+        alias, returning the wrapped node and its exact set of output columns.
+
+        The alias gives the relation a first-class identity, so a join places
+        its columns by qualifier (never by column name); the output-column set
+        is the authoritative basis for qualifying references to those columns.
+        """
+        output_columns = set(plan.schema())
+        return SubqueryScan(input=plan, alias=self.prefix), output_columns
+
+    def _qualify(self, expr, output_columns: Set[str]):
+        """Qualify references to this subquery's own outputs with its alias."""
+        if expr is None:
+            return None
+        return _qualify_output_refs(expr, output_columns, self.prefix)
+
+    def _finalize_subquery(self, prepared: _PreparedSubquery) -> _PreparedSubquery:
+        """Expose a prepared subquery under its alias and qualify its condition."""
+        wrapped, output_columns = self._expose(prepared.plan)
+        return prepared.model_copy(
+            update={
+                "plan": wrapped,
+                "condition": self._qualify(prepared.condition, output_columns),
+                "alias": self.prefix,
+            }
+        )
+
+    def _finalize_scalar(
+        self, plan: LogicalPlanNode, condition, replacement
+    ) -> _PreparedScalar:
+        """Expose a scalar side under its alias and qualify its boundary refs."""
+        wrapped, output_columns = self._expose(plan)
+        return _PreparedScalar(
+            plan=wrapped,
+            condition=self._qualify(condition, output_columns),
+            replacement=self._qualify(replacement, output_columns),
+            alias=self.prefix,
+        )
+
     def prepare_exists(self, subquery: LogicalPlanNode) -> _PreparedSubquery:
         """Prepare an EXISTS subquery: only correlation columns matter."""
         plan = self.decorrelator._rewrite_plan(subquery)
         self.inner_aliases = _collect_inner_aliases(plan)
         if not self._is_correlated(plan):
-            return _PreparedSubquery(
+            uncorrelated = _PreparedSubquery(
                 plan=Limit(input=plan, limit=1, offset=0), condition=None, values=[]
             )
+            return self._finalize_subquery(uncorrelated)
         core = self._peel_exists_top(plan)
         stripped = self._strip(core)
-        return self._assemble(stripped, [], [])
+        return self._finalize_subquery(self._assemble(stripped, [], []))
 
     def _peel_exists_top(self, plan: LogicalPlanNode) -> LogicalPlanNode:
         """Strip layers that do not affect existence (SELECT list, ORDER, LIMIT).
@@ -299,7 +370,9 @@ class _SubqueryPreparer:
         value_names = []
         for index in range(len(value_exprs)):
             value_names.append(f"{self.prefix}_v{index}")
-        return self._assemble(stripped, value_exprs, value_names)
+        return self._finalize_subquery(
+            self._assemble(stripped, value_exprs, value_names)
+        )
 
     def prepare_scalar(self, subquery: LogicalPlanNode) -> _PreparedScalar:
         """Prepare a scalar subquery: single value plus cardinality rules."""
@@ -349,9 +422,7 @@ class _SubqueryPreparer:
         value_exprs, value_names = self._hoisted_value_refs(hoisted)
         prepared = self._assemble(stripped, value_exprs, value_names)
         guarded = self._guard_scalar(prepared, needs_guard=original_grouped)
-        return _PreparedScalar(
-            plan=guarded, condition=prepared.condition, replacement=replacement
-        )
+        return self._finalize_scalar(guarded, prepared.condition, replacement)
 
     def _hoisted_value_refs(
         self, hoisted: List[Tuple[FunctionCall, str]]
@@ -411,10 +482,10 @@ class _SubqueryPreparer:
         value_name = f"{self.prefix}_v0"
         prepared = self._assemble(stripped, value_exprs, [value_name])
         guarded = self._guard_scalar(prepared, needs_guard=self.pending_limit != 1)
-        return _PreparedScalar(
-            plan=guarded,
-            condition=prepared.condition,
-            replacement=ColumnRef(table=None, column=value_name),
+        return self._finalize_scalar(
+            guarded,
+            prepared.condition,
+            ColumnRef(table=None, column=value_name),
         )
 
     def _reject_outer_refs_in_value(self, expr: Expression) -> None:
@@ -1223,7 +1294,7 @@ class Decorrelator:
         items = self._in_value_items(expr, prepared)
         comparisons: List[Expression] = []
         for index in range(len(items)):
-            value_ref = ColumnRef(table=None, column=prepared.values[index])
+            value_ref = ColumnRef(table=prepared.alias, column=prepared.values[index])
             comparisons.append(
                 self._match_term(items[index], value_ref, null_aware=expr.negated)
             )

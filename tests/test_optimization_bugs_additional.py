@@ -5,6 +5,7 @@ from federated_query.optimizer.rules import (
     PredicatePushdownRule,
     LimitPushdownRule,
 )
+from federated_query.optimizer.pushdown import SidePlacementError
 from federated_query.plan.logical import (
     Scan,
     Filter,
@@ -69,9 +70,9 @@ class TestFunctionCallColumnExtraction:
         # Filter with FunctionCall: ABS(o.amount - c.credit_limit) > 100
         abs_arg = BinaryOp(
             op=BinaryOpType.SUBTRACT,
-            left=ColumnRef(table=None, column="amount", data_type=DataType.DECIMAL),
+            left=ColumnRef(table="orders", column="amount", data_type=DataType.DECIMAL),
             right=ColumnRef(
-                table=None, column="credit_limit", data_type=DataType.DECIMAL
+                table="customers", column="credit_limit", data_type=DataType.DECIMAL
             ),
         )
         abs_call = FunctionCall(function_name="ABS", args=[abs_arg])
@@ -133,9 +134,9 @@ class TestFunctionCallColumnExtraction:
         coalesce_call = FunctionCall(
             function_name="COALESCE",
             args=[
-                ColumnRef(table=None, column="priority", data_type=DataType.VARCHAR),
+                ColumnRef(table="orders", column="priority", data_type=DataType.VARCHAR),
                 ColumnRef(
-                    table=None, column="default_priority", data_type=DataType.VARCHAR
+                    table="customers", column="default_priority", data_type=DataType.VARCHAR
                 ),
             ],
         )
@@ -191,7 +192,7 @@ class TestFunctionCallColumnExtraction:
         # UPPER(c.name) = 'ACME'
         upper_call = FunctionCall(
             function_name="UPPER",
-            args=[ColumnRef(table=None, column="name", data_type=DataType.VARCHAR)],
+            args=[ColumnRef(table="customers", column="name", data_type=DataType.VARCHAR)],
         )
         predicate = BinaryOp(
             op=BinaryOpType.EQ,
@@ -360,7 +361,7 @@ class TestColumnDetectionForWrappedJoins:
         # Filter on right side
         predicate = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            left=ColumnRef(table="customers", column="status", data_type=DataType.VARCHAR),
             right=Literal(value="active", data_type=DataType.VARCHAR),
         )
         filter_node = Filter(input=join, predicate=predicate)
@@ -436,7 +437,7 @@ class TestColumnDetectionForWrappedJoins:
         predicate = BinaryOp(
             op=BinaryOpType.GT,
             left=ColumnRef(
-                table=None, column="customer_id", data_type=DataType.INTEGER
+                table="orders", column="customer_id", data_type=DataType.INTEGER
             ),
             right=Literal(value=100, data_type=DataType.INTEGER),
         )
@@ -588,15 +589,17 @@ class TestTableQualifierBug:
             result.left.filters is not None
         ), "Filter should push to LEFT side (orders)"
 
-    def test_unqualified_column_with_collision_stays_above_join(self):
-        """Test unqualified column reference with name collision stays above join.
+    def test_unqualified_column_reaching_join_decision_raises(self):
+        """An unqualified column at a join-side decision raises, never guesses.
 
         SELECT * FROM orders o
         JOIN customers c ON o.customer_id = c.id
         WHERE id > 100  -- Ambiguous! Could be orders.id or customers.id
 
-        When column name is ambiguous and not qualified, safest behavior is to
-        keep filter ABOVE join to avoid incorrect results.
+        After binding every base column is qualified (the binder rejects an
+        ambiguous bare column outright). If an unqualified column nonetheless
+        reaches predicate pushdown's join-side decision, the optimizer raises
+        rather than falling back to a bare-name guess against scan read-sets.
         """
         left_scan = Scan(
             datasource="test_ds",
@@ -635,11 +638,8 @@ class TestTableQualifierBug:
         filter_node = Filter(input=join, predicate=predicate)
 
         rule = PredicatePushdownRule()
-        result = rule.apply(filter_node)
-
-        # Filter should stay ABOVE join (ambiguous column reference)
-        assert isinstance(result, Filter), "Ambiguous filter should stay above join"
-        assert isinstance(result.input, Join)
+        with pytest.raises(SidePlacementError):
+            rule.apply(filter_node)
 
     def test_qualified_column_in_complex_expression(self):
         """Test qualified columns in complex expression push correctly.
@@ -1447,17 +1447,18 @@ class TestParserAliasNotPopulatedBug:
             result.filters is not None
         ), "Filter should push to scan even with alias in ColumnRef"
 
-    def test_join_with_aliases_in_columnref_but_not_in_scan(self):
-        """Test join filter pushdown when aliases are in ColumnRef but not Scan.
+    def test_columnref_alias_not_matching_any_scan_raises(self):
+        """A column qualifier that matches no relation identity raises.
 
         SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id
         WHERE o.amount > 100
 
-        Parser would create:
-        - Scan(table_name="orders", alias=None)
-        - Scan(table_name="customers", alias=None)
-        - ColumnRef("o", "amount")
-        - Join condition with ColumnRef("o", ...) and ColumnRef("c", ...)
+        This hand-builds the malformed state the OLD name-based fallback
+        tolerated: Scans with alias=None but ColumnRefs qualified with aliases
+        "o"/"c". The binder never produces this (it always populates Scan.alias
+        to the user alias or the table name), so if a qualifier resolves to no
+        relation on either side, the optimizer raises rather than guessing by
+        bare column name against a scan read-set.
         """
         # Scans WITHOUT alias populated
         left_scan = Scan(
@@ -1498,14 +1499,8 @@ class TestParserAliasNotPopulatedBug:
         filter_node = Filter(input=join, predicate=predicate)
 
         rule = PredicatePushdownRule()
-        result = rule.apply(filter_node)
-
-        # Filter should push to left side despite alias mismatch
-        assert isinstance(result, Join), f"Expected Join, got {type(result).__name__}"
-        assert isinstance(result.left, Scan)
-        assert (
-            result.left.filters is not None
-        ), "Filter should push to left side even with alias in ColumnRef"
+        with pytest.raises(SidePlacementError):
+            rule.apply(filter_node)
 
     def test_aggregate_with_aliases_in_columnref_but_not_in_scan(self):
         """Test column pruning for aggregate when aliases in ColumnRef but not Scan.

@@ -246,17 +246,16 @@ class PredicatePushdownRule(OptimizationRule):
         from ..plan.logical import JoinType
 
         predicate = filter_node.predicate
-        left_cols = pushdown.available_columns(join.left)
-        right_cols = pushdown.available_columns(join.right)
+        # Decide the predicate's join side by each column's resolved qualifier
+        # against the relation identities each side exposes - never by matching
+        # column names against a scan's read-set (which may be ['*']). A column
+        # that resolves to neither side raises rather than being mis-placed.
+        left_ids = pushdown.relation_identities(join.left)
+        right_ids = pushdown.relation_identities(join.right)
+        predicate_side = pushdown.predicate_join_side(predicate, left_ids, right_ids)
 
-        pred_cols = pushdown.qualified_or_bare_names(predicate)
-
-        pred_left_only = pushdown.columns_belong_to_side(
-            pred_cols, left_cols, right_cols
-        )
-        pred_right_only = pushdown.columns_belong_to_side(
-            pred_cols, right_cols, left_cols
-        )
+        pred_left_only = predicate_side == "left"
+        pred_right_only = predicate_side == "right"
 
         # Only push for INNER joins. model_copy preserves every other field
         # (notably NATURAL / USING), which a raw Join(...) rebuild would drop.

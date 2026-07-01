@@ -123,7 +123,7 @@ class TestPredicatePushdown:
         )
         predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(table=None, column="age", data_type=DataType.INTEGER),
+            left=ColumnRef(table="users", column="age", data_type=DataType.INTEGER),
             right=Literal(value=18, data_type=DataType.INTEGER),
         )
         result = PredicatePushdownRule().apply(Filter(input=join, predicate=predicate))
@@ -204,7 +204,7 @@ class TestPredicatePushdown:
 
         predicate = BinaryOp(
             op=BinaryOpType.GT,
-            left=ColumnRef(table=None, column="amount", data_type=DataType.DECIMAL),
+            left=ColumnRef(table="orders", column="amount", data_type=DataType.DECIMAL),
             right=Literal(value=100, data_type=DataType.DECIMAL),
         )
         filter_node = Filter(input=join, predicate=predicate)
@@ -246,7 +246,7 @@ class TestPredicatePushdown:
 
         predicate = BinaryOp(
             op=BinaryOpType.EQ,
-            left=ColumnRef(table=None, column="status", data_type=DataType.VARCHAR),
+            left=ColumnRef(table="customers", column="status", data_type=DataType.VARCHAR),
             right=Literal(value="active", data_type=DataType.VARCHAR),
         )
         filter_node = Filter(input=join, predicate=predicate)
@@ -288,9 +288,9 @@ class TestPredicatePushdown:
 
         predicate = BinaryOp(
             op=BinaryOpType.LT,
-            left=ColumnRef(table=None, column="amount", data_type=DataType.DECIMAL),
+            left=ColumnRef(table="orders", column="amount", data_type=DataType.DECIMAL),
             right=ColumnRef(
-                table=None, column="credit_limit", data_type=DataType.DECIMAL
+                table="customers", column="credit_limit", data_type=DataType.DECIMAL
             ),
         )
         filter_node = Filter(input=join, predicate=predicate)

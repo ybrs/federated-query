@@ -58,7 +58,22 @@ class ColumnRef(Expression):
 
     table: Optional[str]  # Can be None for unqualified references
     column: str
-    data_type: Optional[DataType] = None  # Set during binding
+    # Required: a column reference carries its type. There is NO default, so
+    # omitting it raises at construction (StateModel loudness) instead of
+    # silently making an untyped ref. The ONLY sanctioned way to build a ref
+    # whose type is not yet known is ColumnRef.create() below - which is greppable.
+    data_type: Optional[DataType]
+
+    @classmethod
+    def create(cls, *, table: Optional[str], column: str) -> "ColumnRef":
+        """Build a column reference whose type is not yet known (data_type=None).
+
+        This is the one explicit, auditable escape hatch for an untyped ref
+        (e.g. before binding resolves types). Normal construction requires
+        data_type, so a forgotten type crashes; reach for this only when the
+        type genuinely cannot be supplied at the call site.
+        """
+        return cls(table=table, column=column, data_type=None)
 
     def get_type(self) -> DataType:
         if self.data_type is None:

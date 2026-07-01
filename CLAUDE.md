@@ -20,6 +20,44 @@ the query was invalid, so any result is wrong. Never describe this as
 acceptable, normal, or a minor issue. It is the most severe failure mode in the
 engine.
 
+## TOP PRIORITY : NO name-matching heuristics. Anywhere. Ever.
+
+Deciding what a thing IS, or WHICH relation/side/output it belongs to, by
+matching or massaging its NAME string is BANNED everywhere in this codebase. A
+name is a label, not an identity. Matching by name is a guess dressed up as
+logic; it silently does the wrong thing the moment two columns share a name, an
+alias differs from a physical name, or a rename happens - exactly the class of
+bug this engine exists to never ship.
+
+Concretely BANNED (non-exhaustive - the rule is "no deciding by name"):
+- `column.startswith(prefix)` / `endswith(f".{name}")` / `name.split(".")[-1]`
+  to identify or attribute a column.
+- bare-name membership tests like `col.column in some_name_set` /
+  `if name in scan.columns` to decide a column's side, owner, or evaluability.
+- "try the qualifier, else fall back to the bare name" resolution, e.g.
+  `alias_map.get((table, column), column)` - a qualified miss MUST raise, never
+  silently return a same-named column.
+- building a set of column-name strings and asking "does this side expose this
+  name?" to place a predicate or a join key.
+
+What to do INSTEAD:
+- Decide by TYPE and by the authoritative (relation, column) qualifier. Every
+  base column leaves the binder qualified (its resolving relation alias is on
+  `ColumnRef.table`); use it. Attribute a column to a join side by matching
+  `ColumnRef.table` against the RELATION IDENTITIES a subtree exposes (scan
+  alias/table_name, derived-table alias), never by column name.
+- For a derived relation (subquery / CTE), give it a real alias
+  (`SubqueryScan(alias=...)`) and qualify its columns with that alias so it has
+  a first-class identity - do NOT recognize its columns by a name prefix.
+- Match against an EXACT known set (e.g. a relation's `schema()` output
+  columns), not a name-shaped guess, and only when the set is authoritative.
+- When a qualifier is absent or resolves to neither/both sides, RAISE. Do not
+  guess.
+
+If you do not know how to check something authoritatively (by type or by
+qualifier) WITHOUT matching a name, STOP and ASK - do not invent a name-based
+shortcut. Introducing a name-matching heuristic is a task failure.
+
 # No ascii
 
 Use ASCII characters only. No exceptions you invent. This applies EVERYWHERE:
