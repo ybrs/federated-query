@@ -107,9 +107,7 @@ class PredicatePushdownRule(OptimizationRule):
             left_result = self._push_filter(
                 Filter(input=input_plan, predicate=predicate.left)
             )
-            return self._push_filter(
-                Filter(input=left_result, predicate=predicate.right)
-            )
+            return self._combine_second_conjunct(left_result, predicate.right)
 
         if isinstance(input_plan, Filter):
             return self._merge_filters(filter_node, input_plan)
@@ -128,6 +126,27 @@ class PredicatePushdownRule(OptimizationRule):
             return Filter(input=new_input, predicate=predicate)
 
         return filter_node
+
+    def _combine_second_conjunct(
+        self, left_result: LogicalPlanNode, right_predicate: Expression
+    ) -> LogicalPlanNode:
+        """Push the second conjunct after the first, without re-merging them.
+
+        If pushing the first conjunct left a residual filter (it could not
+        descend below the node), push the second conjunct into the node BELOW
+        that residual and keep the residual on top. Reconstructing an AND over
+        the node instead would let the same conjunction split then merge back
+        forever (the residual filter re-enters _merge_filters, which rebuilds
+        the AND and re-splits it).
+        """
+        if isinstance(left_result, Filter):
+            pushed = self._push_filter(
+                Filter(input=left_result.input, predicate=right_predicate)
+            )
+            return Filter(input=pushed, predicate=left_result.predicate)
+        return self._push_filter(
+            Filter(input=left_result, predicate=right_predicate)
+        )
 
     def _can_absorb_split(self, input_plan: LogicalPlanNode) -> bool:
         """Whether splitting a conjunction helps for this input.

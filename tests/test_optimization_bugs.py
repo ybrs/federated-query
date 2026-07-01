@@ -312,3 +312,68 @@ class TestOuterJoinFilterPushdown:
         assert isinstance(result, Filter)
         assert isinstance(result.input, Join)
         assert result.input.join_type == JoinType.RIGHT
+
+
+class TestConjunctivePushdownTermination:
+    """Predicate pushdown must terminate on unpushable conjunctions.
+
+    A conjunction of cross-side, non-equi predicates over a join cannot descend
+    to either side. Splitting the conjunction and then merging an unpushable
+    part back into an AND used to re-split the same conjunction over the same
+    join forever (RecursionError). Both conjuncts must survive as residual
+    filters and the rule must return.
+    """
+
+    def _cross_side_join(self):
+        """Build an inner cross join exposing a left and a right column."""
+        left_scan = Scan(
+            datasource="ds",
+            schema_name="public",
+            table_name="nation",
+            columns=["n_regionkey", "n_nationkey"],
+        )
+        right_scan = Scan(
+            datasource="ds",
+            schema_name="public",
+            table_name="region",
+            columns=["r_regionkey"],
+        )
+        return Join(
+            left=left_scan,
+            right=right_scan,
+            join_type=JoinType.INNER,
+            condition=None,
+        )
+
+    def _collect_predicates(self, plan):
+        """Return every Filter predicate found anywhere in a plan subtree."""
+        predicates = []
+        if isinstance(plan, Filter):
+            predicates.append(plan.predicate)
+        for child in plan.children():
+            predicates.extend(self._collect_predicates(child))
+        return predicates
+
+    def test_conjunction_of_cross_side_predicates_terminates(self):
+        """AND of two cross-side non-equi predicates must not recurse forever."""
+        join = self._cross_side_join()
+        left_pred = BinaryOp(
+            op=BinaryOpType.GT,
+            left=ColumnRef(table=None, column="n_regionkey", data_type=DataType.INTEGER),
+            right=ColumnRef(table=None, column="r_regionkey", data_type=DataType.INTEGER),
+        )
+        right_pred = BinaryOp(
+            op=BinaryOpType.LT,
+            left=ColumnRef(table=None, column="n_nationkey", data_type=DataType.INTEGER),
+            right=ColumnRef(table=None, column="r_regionkey", data_type=DataType.INTEGER),
+        )
+        predicate = BinaryOp(op=BinaryOpType.AND, left=left_pred, right=right_pred)
+        filter_node = Filter(input=join, predicate=predicate)
+
+        rule = PredicatePushdownRule()
+        result = rule.apply(filter_node)
+
+        # Both conjuncts survive as residual filters; neither is lost.
+        residual = self._collect_predicates(result)
+        assert left_pred in residual
+        assert right_pred in residual
