@@ -25,7 +25,9 @@ from ..plan.expressions import (
     BetweenExpression,
     and_expressions,
     split_conjuncts,
+    split_disjuncts,
     combine_and,
+    combine_or,
 )
 from ..catalog.catalog import Catalog
 
@@ -106,6 +108,7 @@ class PredicatePushdownRule(OptimizationRule):
         forever on a predicate whose conjuncts cannot all descend, so there is
         no split step.
         """
+        filter_node = self._factor_filter_predicate(filter_node)
         input_plan = filter_node.input
         if isinstance(input_plan, Filter):
             return self._merge_filters(filter_node, input_plan)
@@ -116,6 +119,75 @@ class PredicatePushdownRule(OptimizationRule):
         if isinstance(input_plan, Scan):
             return self._push_filter_to_scan(filter_node, input_plan)
         return self._rehome_filter_over_opaque(filter_node, input_plan)
+
+    def _factor_filter_predicate(self, filter_node: Filter) -> Filter:
+        """Lift conjuncts common to every OR branch out of a filter predicate."""
+        factored = self._factor_common_conjuncts(filter_node.predicate)
+        if factored is filter_node.predicate:
+            return filter_node
+        return filter_node.model_copy(update={"predicate": factored})
+
+    def _factor_common_conjuncts(self, predicate: Expression) -> Expression:
+        """Rewrite ``(A and c) or (B and c)`` as ``c and (A or B)``.
+
+        A conjunct present in EVERY branch of a top-level OR is lifted out of the
+        disjunction. This exposes a join key trapped inside an OR (TPC-H q19) so
+        predicate pushdown can fold it into the join instead of leaving a cross
+        product. Valid under three-valued logic (distribution of AND over OR).
+        """
+        branches = split_disjuncts(predicate)
+        if len(branches) < 2:
+            return predicate
+        branch_conjuncts = []
+        for branch in branches:
+            branch_conjuncts.append(split_conjuncts(branch))
+        common = self._common_conjuncts(branch_conjuncts)
+        if len(common) == 0:
+            return predicate
+        return self._rebuild_factored(common, branch_conjuncts)
+
+    def _common_conjuncts(self, branch_conjuncts):
+        """Conjuncts that appear (structurally) in every OR branch."""
+        common = []
+        for conjunct in branch_conjuncts[0]:
+            if self._in_all_branches(conjunct, branch_conjuncts):
+                common.append(conjunct)
+        return common
+
+    def _in_all_branches(self, conjunct, branch_conjuncts) -> bool:
+        """Whether a conjunct is present in every branch's conjunct list."""
+        for branch in branch_conjuncts:
+            if not self._contains_expr(branch, conjunct):
+                return False
+        return True
+
+    def _contains_expr(self, exprs, target) -> bool:
+        """Whether a list holds an expression structurally equal to target."""
+        for expr in exprs:
+            if expr == target:
+                return True
+        return False
+
+    def _rebuild_factored(self, common, branch_conjuncts) -> Expression:
+        """Build ``common and (remainder_1 or ... or remainder_n)``."""
+        factored = combine_and(common)
+        remainders = []
+        for branch in branch_conjuncts:
+            rest = self._drop_common(branch, common)
+            if len(rest) == 0:
+                # A branch reduced to nothing is TRUE, so the whole OR is TRUE
+                # and only the common conjuncts remain.
+                return factored
+            remainders.append(combine_and(rest))
+        return and_expressions(factored, combine_or(remainders))
+
+    def _drop_common(self, branch, common):
+        """A branch's conjuncts with the common ones removed."""
+        rest = []
+        for conjunct in branch:
+            if not self._contains_expr(common, conjunct):
+                rest.append(conjunct)
+        return rest
 
     def _rehome_filter_over_opaque(
         self, filter_node: Filter, input_plan: LogicalPlanNode
