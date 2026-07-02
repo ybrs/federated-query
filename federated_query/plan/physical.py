@@ -1976,6 +1976,20 @@ class PhysicalHashAggregate(PhysicalPlanNode):
             return self._infer_aggregate_type(expr, input_schema)
         if isinstance(expr, ColumnRef):
             return _column_ref_type(expr, input_schema, self.column_aliases())
+        from .expressions import contains_aggregate
+        from .arrow_types import arrow_type_for
+
+        if contains_aggregate(expr):
+            # A scalar over aggregates (100.0 * SUM(x) / SUM(y)): its output type
+            # is not an aggregate's and is not int by default. Type it
+            # structurally from the engine DataType (its aggregate leaves are
+            # typed at binding), so a decimal/double result is not mis-cast to
+            # int64 (TPC-H q14).
+            return arrow_type_for(expr.get_type())
+        # A plain expression group key (a % b): DuckDB computes it and returns an
+        # integer for the integer keys these are in practice; keep the integer
+        # default rather than the value's structural type, which would need
+        # every operator's local kernel just to infer a type.
         return pa.int64()
 
     def _infer_aggregate_type(

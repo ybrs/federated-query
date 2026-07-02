@@ -345,10 +345,30 @@ class ExpressionEvaluator:
             raise ExpressionEvaluationError(
                 f"Aggregate {expr.function_name} cannot be evaluated per-row"
             )
+        name = expr.function_name.upper()
+        if name in ("SUBSTRING", "SUBSTR"):
+            return self._eval_substring(expr)
         args = []
         for arg in expr.args:
             args.append(self._broadcast(self._eval(arg)))
-        return self._apply_function(expr.function_name.upper(), args)
+        return self._apply_function(name, args)
+
+    def _eval_substring(self, expr: FunctionCall) -> pa.Array:
+        """Evaluate SUBSTRING(s FROM start FOR length).
+
+        SQL positions are 1-based and inclusive; Arrow's utf8_slice_codeunits
+        takes a 0-based [start, stop) range. start/length must be constant.
+        """
+        text = self._broadcast(self._eval(expr.args[0]))
+        start = self._scalar_int(expr.args[1])
+        if len(expr.args) >= 3:
+            length = self._scalar_int(expr.args[2])
+            return pc.utf8_slice_codeunits(text, start - 1, start - 1 + length)
+        return pc.utf8_slice_codeunits(text, start - 1)
+
+    def _scalar_int(self, expr: Expression) -> int:
+        """Evaluate a SUBSTRING position/length argument to a Python int."""
+        return self._eval(expr).as_py()
 
     def _apply_function(self, name: str, args):
         """Apply a supported scalar function to evaluated arguments."""

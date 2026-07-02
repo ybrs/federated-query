@@ -142,6 +142,39 @@ class BinaryOpType(Enum):
     REGEX_IMATCH = "~*"  # case-insensitive POSIX regex match
 
 
+# Numeric widening order for arithmetic result-type inference. A wider type
+# absorbs a narrower one (INTEGER + DOUBLE -> DOUBLE), matching how the engines
+# that execute the arithmetic (DuckDB / PostgreSQL) promote operands.
+_NUMERIC_RANK = {
+    DataType.BOOLEAN: 0,
+    DataType.INTEGER: 1,
+    DataType.BIGINT: 2,
+    DataType.DECIMAL: 3,
+    DataType.FLOAT: 4,
+    DataType.DOUBLE: 5,
+}
+
+
+def _wider_numeric(left: DataType, right: DataType) -> DataType:
+    """The wider of two numeric operand types for arithmetic.
+
+    Falls back to the left type when a non-numeric operand is involved (date or
+    interval arithmetic), which the specialized paths handle elsewhere.
+    """
+    left_rank = _NUMERIC_RANK.get(left)
+    right_rank = _NUMERIC_RANK.get(right)
+    if left_rank is None or right_rank is None:
+        return left
+    return left if left_rank >= right_rank else right
+
+
+def _sum_result_type(arg_type: DataType) -> DataType:
+    """Result type of SUM: integers widen to BIGINT; decimals/floats keep type."""
+    if arg_type in (DataType.BOOLEAN, DataType.INTEGER, DataType.BIGINT):
+        return DataType.BIGINT
+    return arg_type
+
+
 class BinaryOp(Expression):
     """Binary operation expression."""
 
@@ -181,9 +214,10 @@ class BinaryOp(Expression):
         if self.op == BinaryOpType.CONCAT:
             return DataType.VARCHAR
 
-        # Arithmetic operators inherit type from operands
-        # (simplified - real implementation needs type coercion)
-        return self.left.get_type()
+        # Arithmetic operators promote to the wider of the two operand types
+        # (INTEGER * DOUBLE -> DOUBLE), so the inferred type matches what the
+        # executing engine actually computes.
+        return _wider_numeric(self.left.get_type(), self.right.get_type())
 
     def accept(self, visitor):
         return visitor.visit_binary_op(self)
@@ -465,8 +499,12 @@ class Extract(Expression):
         return cls(field=field, source=source)
 
     def get_type(self) -> DataType:
-        """EXTRACT yields a numeric component, modelled as a double."""
-        return DataType.DOUBLE
+        """EXTRACT yields a whole date/time component (year, month, ...).
+
+        The Arrow temporal kernels and both source engines return an integer,
+        so the result is BIGINT, not a floating type.
+        """
+        return DataType.BIGINT
 
     def accept(self, visitor):
         """Dispatch to the visitor's extract hook."""
