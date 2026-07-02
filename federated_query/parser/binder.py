@@ -32,6 +32,7 @@ from ..plan.expressions import (
     ExistsExpression,
     InSubquery,
     QuantifiedComparison,
+    contains_aggregate,
     map_children,
 )
 
@@ -214,12 +215,29 @@ class Binder:
                 f"Derived table column-alias list has {len(names)} names but the "
                 f"subquery returns {len(columns)} columns"
             )
+        self._guard_unique_output_names(columns)
         expressions = self._output_column_refs(columns)
         # A rename projection selecting each subquery output column by its
         # physical name and exposing it under the derived table's alias-list name.
         return Projection.create(
             input=plan, expressions=expressions, aliases=list(names)
         )
+
+    def _guard_unique_output_names(self, columns: List[Column]) -> None:
+        """Reject a column-alias rename when the subquery has duplicate output names.
+
+        The rename reads each output by its physical name; two outputs sharing a
+        name (``SELECT t.a, s.a``) would both resolve to the first, silently
+        giving one alias the wrong column. Fail loudly instead of lying.
+        """
+        seen = set()
+        for column in columns:
+            if column.name in seen:
+                raise BindingError(
+                    "Derived table with a column-alias list has duplicate output "
+                    f"column name '{column.name}'; qualify or alias the columns"
+                )
+            seen.add(column.name)
 
     def _output_column_refs(self, columns: List[Column]) -> List[Expression]:
         """A ColumnRef reading each output column by its physical name."""
@@ -683,9 +701,19 @@ class Binder:
     def _bind_group_key(
         self, expr: Expression, alias_map: Optional[Dict[str, Expression]]
     ) -> Expression:
-        """Bind one GROUP BY key, resolving a SELECT-output alias to its source."""
+        """Bind one GROUP BY key, resolving a SELECT-output alias to its source.
+
+        Grouping by an alias whose expression is an aggregate is invalid SQL
+        (``GROUP BY count(*)``), so it raises rather than silently grouping by an
+        aggregate call.
+        """
         if self._is_group_by_alias(expr, alias_map):
-            return self._bind_expression(alias_map[expr.column])
+            source = alias_map[expr.column]
+            if contains_aggregate(source):
+                raise BindingError(
+                    f"aggregate output '{expr.column}' is not allowed in GROUP BY"
+                )
+            return self._bind_expression(source)
         return self._bind_expression(expr)
 
     def _is_group_by_alias(

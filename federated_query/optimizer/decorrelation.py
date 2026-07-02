@@ -859,7 +859,11 @@ class _SubqueryPreparer:
         raises. ``had_group_by`` is the ORIGINAL state, not the growing list.
         """
         for existing in group_by:
-            if isinstance(existing, ColumnRef) and existing.column == key.column:
+            if (
+                isinstance(existing, ColumnRef)
+                and existing.table == key.table
+                and existing.column == key.column
+            ):
                 return
         if had_group_by:
             raise DecorrelationError(
