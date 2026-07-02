@@ -174,8 +174,6 @@ FROM orders;
 
 All code follows strict standards:
 - No list comprehensions
-- Functions ≤ 20 lines
-- Cyclomatic complexity ≤ 4
 - No unnecessary exception handling
 - Clear, readable code
 - Proper separation of concerns

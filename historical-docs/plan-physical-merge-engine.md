@@ -21,7 +21,6 @@ Replace the row-at-a-time local operators with a **vectorized local engine**:
 an in-memory **DuckDB** "merge engine" that the local operators hand their Arrow
 streams to. DuckDB is a world-class vectorized, multi-threaded, out-of-core
 engine with correct SQL semantics for joins (all types), aggregates, sorts, set
-operations, and NULL handling — and we already depend on it. It consumes Arrow
 streams lazily and returns Arrow streams.
 
 Name: the local engine that *merges* the Arrow streams coming back from the
@@ -31,10 +30,8 @@ remote sources.
 
 Nothing upstream of execution:
 - parser, binder, **decorrelation**, logical optimizer, physical planner,
-  pushdown (G1–G9), remote-query generation.
 - The logical and physical **plan trees stay exactly as they are.**
 
-We change only the **`execute()` of the local physical operators** — how a node
 turns its child Arrow streams into its output Arrow stream. The decorrelation
 already produced the join/semi/anti nodes and their conditions; we just *render
 those existing conditions to SQL* and let DuckDB run them. No re-homing of
@@ -42,10 +39,8 @@ anything.
 
 ## Key facts (verified)
 
-- DuckDB **streams** an Arrow `RecordBatchReader` lazily — a `LIMIT 5` over a
   1000-batch reader pulled only 7 batches. So we pass streams, we do **not**
   materialize inputs into `pa.Table`.
-- The **only** unavoidable buffering is a hash join's **build side** — inherent
   to the algorithm (you must read all build rows to build the table); DuckDB
   buffers it internally on the smaller side and streams the probe. This is the
   floor for *any* hash join.
@@ -56,9 +51,6 @@ anything.
 ## Architecture
 
 ```
-remote source ──Arrow stream──┐
-remote source ──Arrow stream──┤→ [coordinator in-memory DuckDB] → Arrow stream → up the plan
-local/cached  ──Arrow stream──┘     (register readers, run SQL, fetch_record_batch)
 ```
 
 - A **coordinator DuckDB** connection (in-memory), separate from the DuckDB
@@ -78,38 +70,28 @@ local/cached  ──Arrow stream──┘     (register readers, run SQL, fetch_
 
 Start by swapping individual operators' `execute()`. The plan tree is unchanged;
 each node independently runs its piece in DuckDB. This is incremental and
-low-risk — migrate and verify one operator at a time.
 
 (A later, optional optimization is *subtree fusion*: translate a maximal local
 subtree into one DuckDB query to cut round-trips and intermediate copies. Bigger
-and not needed first — defer.)
 
 ## The genuinely fiddly bits (all execution-local, not plan changes)
 
-1. **Output column naming.** DuckDB's join output is left-cols ⧺ right-cols.
    We control the `SELECT`, so alias columns explicitly to match what the parent
-   expects — preserving the existing `right_<dup>` convention and the
-   `column_aliases` (qualifier→name) resolution already used for cross-source
    joins with duplicate names.
 2. **Rendering conditions to SQL.** Join keys/conditions, group-by/aggregate
-   expressions, sort keys (with NULLS FIRST/LAST), filters — render from the
    existing node fields via the same `Expression.to_sql()` path used for
    pushdown. The one careful case: an ANTI join whose condition carries the
-   null-aware `x=v OR x IS NULL OR v IS NULL` that decorrelation produced — we
    render *that exact condition*; DuckDB evaluates it correctly. No decorrelation
    change.
 3. **The dynamic-filter / semi-join-reduction hook (G9).** Today
    `PhysicalHashJoin._maybe_reduce_probe` reads the build keys and injects
    `WHERE key IN (...)` into the probe-side *remote* scan *before* probing. That
    is a *remote pushdown* optimization (reduce what the source sends), separate
-   from the *local* join — keep it. Design question: it needs the build keys in
    Python, which means reading the build side once; then DuckDB reads build again
    for the join. Options: (a) accept the double-read of the (small) build side;
    (b) materialize the build once and feed the same Arrow to both the key
    extraction and DuckDB; (c) push v2.1 so the remote returns few rows and the
    local join is trivial regardless. Decide during the spike.
-4. **Type fidelity.** DuckDB over Arrow preserves Arrow types — this *helps*
-   P3 (FIX COLUMN TYPES): once we stop coercing (uuid→string etc.), the join
    keys keep native types and compare correctly. Until P3 lands, both sides must
    already agree on types (today they do, via the lossy-but-consistent coercion).
 5. **Empty results / schema.** DuckDB must emit the right output schema even for
@@ -127,7 +109,6 @@ and not needed first — defer.)
 
 ## Sequencing
 
-1. **Spike — `PhysicalHashJoin` via DuckDB**, INNER equi first: register the two
    child streams, run `SELECT <aliased cols> FROM in0 <type> JOIN in1 ON <cond>`,
    stream the result. Wire `temp_directory`/`memory_limit`. Validate correctness
    and speed against the suite.
@@ -137,20 +118,13 @@ and not needed first — defer.)
    NULLS placement), `PhysicalUnion`/`PhysicalSetOperation`, distinct,
    `PhysicalGroupedLimit`.
 4. Leave trivial vectorized ops as-is or use native Arrow (`Table.slice` for
-   limit/offset, `pc` for projection — already vectorized via G2).
 5. Decide whether `PhysicalNestedLoopJoin` (non-equi / cross) also goes to
-   DuckDB (it will — DuckDB does non-equi joins vectorized).
 
 ## Risks / open questions
 
-- **Two DuckDBs** (datasource vs coordinator) — keep separate; watch memory.
-- **Spill location/limit** — set sane `temp_directory` + `memory_limit` defaults
   in `ExecutorConfig`; document.
 - **Correctness guard:** the 116 decorrelation e2e tests encode exact SQL NULL
-  semantics against PostgreSQL ground truth — run them after each operator
   migration; they are the safety net.
-- **Per-operator vs subtree fusion** — start per-operator; revisit fusion later.
-- **The G9 hook interaction** (bit #3) — settle during the spike.
 - **pyarrow.compute as an alternative kernel** for some operators (join/agg/sort
   all exist there too, ~0.4 ms for the join). DuckDB is preferred for full SQL
   semantics (esp. null-aware anti and set ops) and out-of-core; pyarrow is an

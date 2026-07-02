@@ -132,6 +132,40 @@ class TestPredicatePushdown:
         assert len(joins) == 1
         assert joins[0].using == ["id"]
 
+    def test_cross_side_equality_not_folded_into_using_join(self):
+        """A WHERE cross-side equality over a USING join stays a residual filter.
+
+        Folding it into join.condition would be dropped when the join renders as
+        USING (no ON clause), silently losing the predicate and returning rows a
+        real engine would filter out.
+        """
+        left = Scan(
+            datasource="d", schema_name="public", table_name="users",
+            columns=["id", "v"],
+        )
+        right = Scan(
+            datasource="d", schema_name="public", table_name="orders",
+            columns=["id", "w"],
+        )
+        join = Join(
+            left=left, right=right, join_type=JoinType.INNER,
+            condition=None, using=["id"],
+        )
+        predicate = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef(table="users", column="v", data_type=DataType.INTEGER),
+            right=ColumnRef(table="orders", column="w", data_type=DataType.INTEGER),
+        )
+        result = PredicatePushdownRule().apply(Filter(input=join, predicate=predicate))
+
+        joins = [node for node in _walk(result) if isinstance(node, Join)]
+        filters = [node for node in _walk(result) if isinstance(node, Filter)]
+        assert len(joins) == 1
+        assert joins[0].using == ["id"]
+        assert joins[0].condition is None
+        assert len(filters) == 1
+        assert filters[0].predicate == predicate
+
     def test_push_filter_through_project(self):
         """Test pushing filter through projection."""
         scan = Scan(
@@ -642,8 +676,14 @@ class TestOrderByPushdown:
         assert isinstance(key.left, ColumnRef)
         assert key.left.column == "order_id"
 
-    def test_order_by_join_side_pushdown(self):
-        """Sort on one join side should annotate that side but keep top sort."""
+    def test_order_by_over_join_kept_above(self):
+        """A Sort over a join stays above it; a join does not preserve row order.
+
+        Pushing ORDER BY into a scan below a join would not survive the join
+        (hash/nested-loop joins reorder), so the explicit Sort is kept over the
+        join and neither side is annotated. When the whole subtree is
+        single-source, single-source pushdown renders the ORDER BY remotely.
+        """
         left = Scan(
             datasource="test_ds",
             schema_name="public",
@@ -671,9 +711,7 @@ class TestOrderByPushdown:
 
         assert isinstance(result, Sort)
         assert isinstance(result.input, Join)
-        assert isinstance(result.input.left, Scan)
-        assert result.input.left.order_by_keys is not None
-        assert result.input.left.order_by_keys[0].column == "id"
+        assert result.input.left.order_by_keys is None
         assert result.input.right.order_by_keys is None
 
     def test_order_by_join_cross_datasource_avoids_pushdown(self):

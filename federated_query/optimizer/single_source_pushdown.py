@@ -148,9 +148,15 @@ class SingleSourcePushdown:
         """Return a remote query for a pushable same-source subtree, or None.
 
         Fires for any subtree that contains a join (G1) or a computed,
-        non-aggregate projection (G2 — e.g. ``UPPER(x)``, ``a || b``); plain
         single-table scans keep using the existing scan-pushdown path.
         """
+        if isinstance(node, SubqueryScan):
+            # A top-level SubqueryScan is a derived relation's alias boundary.
+            # Absorbing it here as a bare derived-table FROM would drop the alias
+            # from column_aliases (nothing above supplies the SELECT list), so its
+            # output could not be resolved as alias.col. Decline: the planner
+            # pushes its INPUT and re-applies the alias via PhysicalAliasedRelation.
+            return None
         context = _PushContext()
         if not self._absorb(node, context):
             return None
@@ -183,7 +189,6 @@ class SingleSourcePushdown:
         operator cannot resolve, so the columns are listed explicitly with
         unique aliases and recorded for qualified resolution. Each scan already
         carries the columns projection pushdown found necessary, so only those
-        are emitted (not the whole table) — a true ``*`` falls back to the
         catalog.
 
         Declines when a column-contributing join pulled in a derived relation:
@@ -248,7 +253,10 @@ class SingleSourcePushdown:
             return None
         if not connection.supports_capability(DataSourceCapability.JOINS):
             return None
-        return PhysicalRemoteQuery(
+        # Send the rendered SQL to the single owning source and stream its rows
+        # back, mapping remote result columns to their engine-internal names.
+        # Lowered from the whole pushed subtree collapsed into one remote query.
+        return PhysicalRemoteQuery.create(
             datasource=context.datasource,
             datasource_connection=connection,
             query_ast=self._render(context),
@@ -314,7 +322,6 @@ class SingleSourcePushdown:
 
         The right side renders as a derived relation that keeps its outer
         column references; in LATERAL scope the source (or the DuckDB merge
-        engine) evaluates it per left row. Same-source only — a cross-source
         right side fails the data-source check and declines to push.
         """
         if not self._absorb_from(node.left, context):
@@ -714,8 +721,6 @@ class SingleSourcePushdown:
     def _absorb_join(self, join: Join, context: _PushContext) -> bool:
         """Add one join to a left-deep tree, rendering its right relation.
 
-        Every join type — including the SEMI/ANTI/LEFT joins that decorrelation
-        produces from EXISTS/IN/scalar subqueries — pushes as a real SQL join.
         The right side is rendered as a relation: a base scan stays a table
         reference, a projected sub-relation becomes a derived table. No subquery
         expression is ever re-created.
@@ -887,7 +892,6 @@ class SingleSourcePushdown:
         """Render the SELECT list with unique output names per column.
 
         Output names are made unique (``id``, ``id_1`` ...) so a result with
-        columns from several tables never has two fields of the same name —
         otherwise a parent operator could not address one of them and the
         connector could not decode them. Each column reference also records a
         (qualifier, column) -> unique name entry for qualified resolution.

@@ -45,6 +45,7 @@ from ..plan.logical import (
     CTE,
     Values,
     SubqueryScan,
+    CTERef,
     SingleRowGuard,
     GroupedLimit,
     LateralJoin,
@@ -200,6 +201,8 @@ def _collect_inner_aliases(plan: LogicalPlanNode) -> Set[str]:
             names.add(plan.table_name)
     if isinstance(plan, SubqueryScan):
         names.add(plan.alias)
+    if isinstance(plan, CTERef):
+        names.add(plan.alias if plan.alias else plan.name)
     for child in plan.children():
         names.update(_collect_inner_aliases(child))
     return names
@@ -217,7 +220,9 @@ def _replace_column_refs(
 
 def _is_null_check(expr: Expression) -> UnaryOp:
     """Build an IS NULL check for an expression."""
-    return UnaryOp(op=UnaryOpType.IS_NULL, operand=expr)
+    # The IS NULL predicate wrapping the operand, used to make NOT IN and ALL
+    # anti-join conditions NULL-aware so an UNKNOWN comparison drops the row.
+    return UnaryOp.create(op=UnaryOpType.IS_NULL, operand=expr)
 
 
 class _PreparedSubquery(StateModel):
@@ -231,6 +236,28 @@ class _PreparedSubquery(StateModel):
     plan: LogicalPlanNode
     condition: Optional[Expression]
     values: List[str]
+    alias: str
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        plan: LogicalPlanNode,
+        condition: Optional[Expression],
+        values: List[str],
+        alias: str,
+    ) -> "_PreparedSubquery":
+        """Sanctioned fresh-construction path for _PreparedSubquery.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here.
+        alias is the subquery's derived-relation alias (its prefix), the
+        qualifier its output columns carry once wrapped in a SubqueryScan."""
+        return cls(
+            plan=plan,
+            condition=condition,
+            values=values,
+            alias=alias,
+        )
 
 
 class _PreparedScalar(StateModel):
@@ -239,6 +266,23 @@ class _PreparedScalar(StateModel):
     plan: LogicalPlanNode
     condition: Optional[Expression]
     replacement: Expression
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        plan: LogicalPlanNode,
+        condition: Optional[Expression],
+        replacement: Expression,
+    ) -> "_PreparedScalar":
+        """Sanctioned fresh-construction path for _PreparedScalar.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            plan=plan,
+            condition=condition,
+            replacement=replacement,
+        )
 
 
 class _SubqueryPreparer:
@@ -261,17 +305,67 @@ class _SubqueryPreparer:
         # correlated "ORDER BY ... LIMIT n" keeps the first n rows per key.
         self.pending_order: Optional[Sort] = None
 
+    def _wrap_boundary(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Expose the prepared subquery under its prefix alias as a derived relation."""
+        # The assembled subquery plan exposed under its deterministic prefix
+        # alias, so outer references to its output columns qualify to that
+        # relation exactly like a FROM (SELECT ...) derived table's alias.
+        return SubqueryScan.create(input=plan, alias=self.prefix)
+
+    def _finalize(self, prepared: _PreparedSubquery) -> _PreparedSubquery:
+        """Wrap a prepared subquery at its alias boundary.
+
+        The single choke point where an IN/ANY/EXISTS subquery becomes a derived
+        relation: its plan is wrapped in the prefix-aliased SubqueryScan. Its
+        correlation condition already refers to the subquery's output columns
+        with the prefix qualifier (set where those refs are constructed), so no
+        unqualified subquery ref escapes into the outer plan.
+        """
+        return prepared.model_copy(
+            update={"plan": self._wrap_boundary(prepared.plan)}
+        )
+
+    def _finalize_scalar(
+        self,
+        guarded: LogicalPlanNode,
+        condition: Optional[Expression],
+        replacement: Expression,
+    ) -> "_PreparedScalar":
+        """Wrap a scalar subquery at its alias boundary as a derived relation.
+
+        The scalar value plan (already cardinality-guarded) becomes a derived
+        relation under the prefix alias. The correlation condition and the outer
+        replacement expression already carry the prefix qualifier on the
+        subquery's own output columns (set at construction), so nothing
+        unqualified escapes into the outer plan.
+        """
+        # The scalar subquery as a join-ready derived relation: its guarded value
+        # plan wrapped at the prefix-aliased boundary, plus the already-qualified
+        # correlation condition and outer replacement expression.
+        return _PreparedScalar.create(
+            plan=self._wrap_boundary(guarded),
+            condition=condition,
+            replacement=replacement,
+        )
+
     def prepare_exists(self, subquery: LogicalPlanNode) -> _PreparedSubquery:
         """Prepare an EXISTS subquery: only correlation columns matter."""
         plan = self.decorrelator._rewrite_plan(subquery)
         self.inner_aliases = _collect_inner_aliases(plan)
         if not self._is_correlated(plan):
-            return _PreparedSubquery(
-                plan=Limit(input=plan, limit=1, offset=0), condition=None, values=[]
+            # Uncorrelated EXISTS only asks whether any row exists, so the join
+            # right side is the subplan capped at one row with no correlation
+            # condition; LIMIT 1 keeps the SEMI join input minimal.
+            capped = _PreparedSubquery.create(
+                plan=Limit.create(input=plan, limit=1, offset=0),
+                condition=None,
+                values=[],
+                alias=self.prefix,
             )
+            return self._finalize(capped)
         core = self._peel_exists_top(plan)
         stripped = self._strip(core)
-        return self._assemble(stripped, [], [])
+        return self._finalize(self._assemble(stripped, [], []))
 
     def _peel_exists_top(self, plan: LogicalPlanNode) -> LogicalPlanNode:
         """Strip layers that do not affect existence (SELECT list, ORDER, LIMIT).
@@ -299,7 +393,7 @@ class _SubqueryPreparer:
         value_names = []
         for index in range(len(value_exprs)):
             value_names.append(f"{self.prefix}_v{index}")
-        return self._assemble(stripped, value_exprs, value_names)
+        return self._finalize(self._assemble(stripped, value_exprs, value_names))
 
     def prepare_scalar(self, subquery: LogicalPlanNode) -> _PreparedScalar:
         """Prepare a scalar subquery: single value plus cardinality rules."""
@@ -313,7 +407,6 @@ class _SubqueryPreparer:
     def _peel_scalar_limit_order(self, plan: LogicalPlanNode) -> LogicalPlanNode:
         """Peel a top LIMIT and the ORDER BY it caps into pending state.
 
-        ``SELECT … WHERE k = outer.k ORDER BY c LIMIT n`` becomes a per-key
         limit: the LIMIT count and the ORDER BY are recorded here and reattached
         as an order-aware GroupedLimit once the join side is assembled.
         """
@@ -349,8 +442,12 @@ class _SubqueryPreparer:
         value_exprs, value_names = self._hoisted_value_refs(hoisted)
         prepared = self._assemble(stripped, value_exprs, value_names)
         guarded = self._guard_scalar(prepared, needs_guard=original_grouped)
-        return _PreparedScalar(
-            plan=guarded, condition=prepared.condition, replacement=replacement
+        # The prepared scalar-aggregate side: the guarded per-key aggregate plan
+        # wrapped at its alias boundary, its qualified correlation condition, and
+        # the replacement expression (hoisted aggregate refs) that stands in for
+        # the subquery in the outer row, qualified to the subquery alias.
+        return self._finalize_scalar(
+            guarded, prepared.condition, replacement
         )
 
     def _hoisted_value_refs(
@@ -360,7 +457,9 @@ class _SubqueryPreparer:
         value_exprs: List[Expression] = []
         value_names: List[str] = []
         for _, name in hoisted:
-            value_exprs.append(ColumnRef(table=None, column=name))
+            # A reference to one hoisted aggregate's renamed output column, so the
+            # projection above the join can select the aggregate value by name.
+            value_exprs.append(ColumnRef.create(table=None, column=name))
             value_names.append(name)
         return value_exprs, value_names
 
@@ -375,10 +474,18 @@ class _SubqueryPreparer:
         if isinstance(expr, FunctionCall) and expr.is_aggregate:
             name = f"{self.prefix}_v{len(hoisted)}"
             hoisted.append((expr, name))
-            ref = ColumnRef(table=None, column=name)
+            # A reference to the renamed aggregate output that replaces the call
+            # in place, so the outer expression reads the post-join column value.
+            # Qualified to the subquery alias: this ref lands in the outer
+            # expression, above the alias boundary the subquery is wrapped in.
+            ref = ColumnRef.create(table=self.prefix, column=name)
             if expr.function_name.upper() == "COUNT":
-                zero = Literal(value=0, data_type=DataType.INTEGER)
-                return FunctionCall(function_name="COALESCE", args=[ref, zero])
+                # A zero literal for the COALESCE default: after the LEFT join an
+                # absent group has no COUNT row, and SQL COUNT must read as zero.
+                zero = Literal.create(value=0, data_type=DataType.INTEGER)
+                # COALESCE(count_ref, 0) so a missing (non-matching) group yields
+                # zero rather than NULL, matching SQL COUNT semantics exactly.
+                return FunctionCall.create(function_name="COALESCE", args=[ref, zero])
             return ref
         return _rebuild_expression(
             expr, lambda child: self._hoist_aggregate_calls(child, hoisted)
@@ -411,10 +518,14 @@ class _SubqueryPreparer:
         value_name = f"{self.prefix}_v0"
         prepared = self._assemble(stripped, value_exprs, [value_name])
         guarded = self._guard_scalar(prepared, needs_guard=self.pending_limit != 1)
-        return _PreparedScalar(
-            plan=guarded,
-            condition=prepared.condition,
-            replacement=ColumnRef(table=None, column=value_name),
+        # The prepared plain-row scalar side: the cardinality-guarded value plan
+        # wrapped at its alias boundary, its qualified correlation condition, and
+        # a reference to the single projected value column - qualified to the
+        # subquery alias - that replaces the subquery in the outer expression.
+        return self._finalize_scalar(
+            guarded,
+            prepared.condition,
+            ColumnRef.create(table=self.prefix, column=value_name),
         )
 
     def _reject_outer_refs_in_value(self, expr: Expression) -> None:
@@ -434,8 +545,13 @@ class _SubqueryPreparer:
             return prepared.plan
         keys: List[Expression] = []
         for name in self._key_names_of(prepared):
-            keys.append(ColumnRef(table=None, column=name))
-        return SingleRowGuard(input=prepared.plan, keys=keys)
+            # A reference to one correlation-key column that groups the guard, so
+            # the runtime cardinality check is applied per outer-row key group.
+            keys.append(ColumnRef.create(table=None, column=name))
+        # The runtime cardinality guard: raises CardinalityViolationError if any
+        # key group has more than one row, since a scalar subquery must be single
+        # valued and this side could not be proven so statically.
+        return SingleRowGuard.create(input=prepared.plan, keys=keys)
 
     def _key_names_of(self, prepared: _PreparedSubquery) -> List[str]:
         """The renamed correlation key columns exposed by the plan."""
@@ -480,7 +596,6 @@ class _SubqueryPreparer:
         """Peel a Sort or HAVING filter, keeping it wrapped around the core.
 
         An ORDER BY/LIMIT or a HAVING clause shapes the subquery's result set,
-        so unlike a value projection it cannot be discarded — it stays as part
         of the value relation while the value columns are taken from below it.
         """
         inner_core, value_exprs = self._peel_values_top(plan.input, True)
@@ -502,21 +617,27 @@ class _SubqueryPreparer:
             raise DecorrelationError("Multi-row VALUES subqueries not supported")
         refs: List[Expression] = []
         for name in plan.output_names:
-            refs.append(ColumnRef(table=None, column=name))
+            # A reference to one Values output column, exposing the constant row's
+            # value under its own name so it can be matched by the enclosing IN.
+            refs.append(ColumnRef.create(table=None, column=name))
         return plan, refs
 
     def _aggregate_value_refs(self, plan: Aggregate) -> List[Expression]:
         """References to an aggregate subquery's output columns."""
         refs: List[Expression] = []
         for name in plan.output_names:
-            refs.append(ColumnRef(table=None, column=name))
+            # A reference to one aggregate output column, so the aggregate result
+            # can serve as the comparison value of the enclosing IN/ANY/ALL.
+            refs.append(ColumnRef.create(table=None, column=name))
         return refs
 
     def _relation_value_refs(self, plan: LogicalPlanNode) -> List[Expression]:
         """References to a relation's output columns (e.g. a set-operation body)."""
         refs: List[Expression] = []
         for name in plan.schema():
-            refs.append(ColumnRef(table=None, column=name))
+            # A reference to one output column of the relation (e.g. a set
+            # operation), exposing its schema columns as comparison values.
+            refs.append(ColumnRef.create(table=None, column=name))
         return refs
 
     def _is_correlated(self, plan: LogicalPlanNode) -> bool:
@@ -543,12 +664,10 @@ class _SubqueryPreparer:
         """Pass through sort nodes; stop at scans, joins, and projections."""
         if isinstance(plan, Sort):
             stripped = self._strip(plan.input)
-            return Sort(
-                input=stripped,
-                sort_keys=plan.sort_keys,
-                ascending=plan.ascending,
-                nulls_order=plan.nulls_order,
-            )
+            # The same ORDER BY re-seated on the correlation-stripped input; this
+            # rebuilds an existing Sort, so model_copy preserves its keys and
+            # direction and only swaps the input, never dropping a field.
+            return plan.model_copy(update={"input": stripped})
         return plan
 
     def _strip_filter(self, plan: Filter) -> LogicalPlanNode:
@@ -569,7 +688,10 @@ class _SubqueryPreparer:
             self.pulled.append(conjunct)
         if len(kept) == 0:
             return stripped_input
-        return Filter(input=stripped_input, predicate=_and_join(kept))
+        # The residual filter holding only the non-correlated conjuncts; the
+        # correlated ones were pulled out to become the join condition, so what
+        # remains is the local predicate the subquery still enforces internally.
+        return Filter.create(input=stripped_input, predicate=_and_join(kept))
 
     def _hoist_having(
         self,
@@ -582,8 +704,6 @@ class _SubqueryPreparer:
         A HAVING predicate above an aggregate may reference aggregate
         functions absent from the aggregate's output list. A filter (kept)
         or a pulled correlation condition cannot recompute them per row, so
-        the calls are appended as outputs and every predicate — both kept
-        and pulled — is rewritten to reference them by name.
         """
         aggregates = list(aggregate.aggregates)
         names = list(aggregate.output_names)
@@ -617,7 +737,10 @@ class _SubqueryPreparer:
             name = f"{self.prefix}_h{len(names)}"
             aggregates.append(expr)
             names.append(name)
-            return ColumnRef(table=None, column=name)
+            # A reference to the HAVING aggregate now materialized as an aggregate
+            # output; the predicate reads it by name instead of recomputing the
+            # aggregate call, which a post-aggregate filter cannot do per row.
+            return ColumnRef.create(table=None, column=name)
         return _rebuild_expression(
             expr, lambda child: self._hoist_having_expr(child, aggregates, names)
         )
@@ -653,16 +776,24 @@ class _SubqueryPreparer:
     ) -> Aggregate:
         """Add correlation keys to an aggregate and rename predicates."""
         group_by = list(plan.group_by)
+        had_group_by = len(plan.group_by) > 0
         aggregates = list(plan.aggregates)
         names = list(plan.output_names)
         for offset in range(len(crossing)):
             inner_ref, outer_side = self._key_equality(crossing[offset])
-            self._add_group_key(group_by, inner_ref)
+            self._add_group_key(group_by, inner_ref, had_group_by)
             key_name = f"{self.prefix}_g{start + offset}"
             aggregates.append(inner_ref)
             names.append(key_name)
-            renamed = ColumnRef(table=None, column=key_name)
-            self.pulled[start + offset] = BinaryOp(
+            # A reference to the correlation key now emitted as a grouped output
+            # of the widened aggregate, so the pulled predicate can join on it.
+            # Qualified to the subquery alias: this ref lives in the correlation
+            # condition, which is evaluated at the join above the alias boundary.
+            renamed = ColumnRef.create(table=self.prefix, column=key_name)
+            # The rewritten correlation equality (outer side = renamed inner key),
+            # relocated above the aggregate to become part of the join condition
+            # now that the key is exposed per group.
+            self.pulled[start + offset] = BinaryOp.create(
                 op=BinaryOpType.EQ, left=outer_side, right=renamed
             )
         return plan.model_copy(
@@ -716,12 +847,25 @@ class _SubqueryPreparer:
                 return True
         return False
 
-    def _add_group_key(self, group_by: List[Expression], key: ColumnRef) -> None:
-        """Add a correlation key to the grouping, validating legality."""
+    def _add_group_key(
+        self, group_by: List[Expression], key: ColumnRef, had_group_by: bool
+    ) -> None:
+        """Add a correlation key to the grouping, validating legality.
+
+        A scalar-aggregate subquery (no original GROUP BY) may correlate on
+        several keys; each is added as a grouping key. But when the subquery
+        already had its own GROUP BY, a correlation key not among those keys
+        cannot be added - it would change the aggregation granularity - so it
+        raises. ``had_group_by`` is the ORIGINAL state, not the growing list.
+        """
         for existing in group_by:
-            if isinstance(existing, ColumnRef) and existing.column == key.column:
+            if (
+                isinstance(existing, ColumnRef)
+                and existing.table == key.table
+                and existing.column == key.column
+            ):
                 return
-        if len(group_by) > 0:
+        if had_group_by:
             raise DecorrelationError(
                 f"Correlation key {key.to_sql()} is not part of the "
                 "subquery's GROUP BY"
@@ -733,7 +877,11 @@ class _SubqueryPreparer:
         before = len(self.pulled)
         stripped_input = self._strip(plan.input)
         if len(self.pulled) == before:
-            return Limit(input=stripped_input, limit=plan.limit, offset=plan.offset)
+            # No correlation crossed this LIMIT, so it stays a plain row-limit on
+            # the stripped input; nothing needs per-key handling here.
+            return Limit.create(
+                input=stripped_input, limit=plan.limit, offset=plan.offset
+            )
         self._record_limit(plan)
         return stripped_input
 
@@ -758,11 +906,21 @@ class _SubqueryPreparer:
             raise DecorrelationError("Subquery rewrite produced no output columns")
         non_keys = list(value_names)
         order = self._build_order(expressions, aliases, non_keys)
-        plan: LogicalPlanNode = Projection(
+        # The renamed right side of the join: a projection exposing the exposed
+        # correlation-key columns and the subquery value columns under their
+        # deterministic aliases, so the outer join can reference them by name.
+        plan: LogicalPlanNode = Projection.create(
             input=core, expressions=expressions, aliases=aliases
         )
         plan = self._apply_pending_limit(plan, aliases, non_keys, order)
-        return _PreparedSubquery(plan=plan, condition=condition, values=value_names)
+        # The assembled join-ready subquery: its renamed plan, the pulled-out
+        # correlation condition (None when uncorrelated), and the value column
+        # names the caller compares against. plan/condition are still raw here;
+        # the caller's _finalize wraps the plan at the alias boundary and
+        # qualifies the condition (the scalar path guards the raw plan first).
+        return _PreparedSubquery.create(
+            plan=plan, condition=condition, values=value_names, alias=self.prefix
+        )
 
     def _partition_window_values(self, value_exprs, exposures):
         """Partition any window value by the correlation key columns.
@@ -820,7 +978,10 @@ class _SubqueryPreparer:
         order_keys: List[Expression] = []
         for sort_key in self.pending_order.sort_keys:
             alias = self._order_alias(sort_key, expressions, aliases, non_keys)
-            order_keys.append(ColumnRef(table=None, column=alias))
+            # A reference to the projected alias of one ORDER BY key, remapping the
+            # pending sort onto the renamed outputs so the per-key limit can order
+            # rows by columns that now live in the assembled projection.
+            order_keys.append(ColumnRef.create(table=None, column=alias))
         return (
             order_keys,
             self.pending_order.ascending,
@@ -865,18 +1026,33 @@ class _SubqueryPreparer:
             if key in exposure_names:
                 continue
             if self._is_renamed_ref(ref):
-                exposures.append((ref, ref.column))
+                # A key already widened into the aggregate below. Expose it by its
+                # inner physical name (read from the aggregate output under the
+                # boundary), aliased under that name; the condition keeps the
+                # qualified ref, which resolves against this exposed column.
+                inner = ColumnRef.create(table=None, column=ref.column)
+                exposures.append((inner, ref.column))
                 exposure_names[key] = ref
                 continue
             if not self._is_inner_column(ref):
                 continue
             name = f"{self.prefix}_k{len(exposures)}"
             exposures.append((ref, name))
-            exposure_names[key] = ColumnRef(table=None, column=name)
+            # The renamed reference that the pulled predicate's inner column maps
+            # to; the correlation condition is rebuilt against this deterministic
+            # name so it can be evaluated on the join's right side. Qualified to
+            # the subquery alias, since the condition sits above the boundary.
+            exposure_names[key] = ColumnRef.create(table=self.prefix, column=name)
 
     def _is_renamed_ref(self, ref: ColumnRef) -> bool:
-        """Check for a column already renamed by aggregate widening."""
-        return ref.table is None and ref.column.startswith(self.prefix)
+        """Whether a ref is one this subquery already exposed as its own output.
+
+        Identified by its qualifier: a ref carrying this subquery's alias is one
+        we minted for the correlation condition (aggregate widening), not an
+        inner column still to be exposed. Matched by qualifier, never by
+        string-matching the column name.
+        """
+        return ref.table == self.prefix
 
     def _validate_no_outer_left(self, plan: LogicalPlanNode) -> None:
         """Fail if correlated references remain anywhere in the subplan."""
@@ -909,7 +1085,9 @@ class _SubqueryPreparer:
         keys: List[Expression] = []
         for alias in aliases:
             if alias not in non_keys:
-                keys.append(ColumnRef(table=None, column=alias))
+                # A reference to one correlation-key column that partitions the
+                # per-key limit, so each outer row's group is limited on its own.
+                keys.append(ColumnRef.create(table=None, column=alias))
         if len(keys) == 0:
             return self._unkeyed_limit(plan, order)
         self._require_equi_correlation_for_limit()
@@ -933,16 +1111,25 @@ class _SubqueryPreparer:
     def _unkeyed_limit(self, plan: LogicalPlanNode, order) -> LogicalPlanNode:
         """A plain LIMIT, ordered when the subquery had ORDER BY ... LIMIT."""
         if order is not None:
-            plan = Sort(
+            # The ORDER BY that the recorded LIMIT caps, applied before the row
+            # limit so "ORDER BY ... LIMIT n" keeps the intended first n rows.
+            plan = Sort.create(
                 input=plan, sort_keys=order[0], ascending=order[1], nulls_order=order[2]
             )
-        return Limit(input=plan, limit=self.pending_limit, offset=0)
+        # The whole-result row limit for an uncorrelated subquery, where there is
+        # no correlation key to partition on, so a plain LIMIT is correct.
+        return Limit.create(input=plan, limit=self.pending_limit, offset=0)
 
     def _keyed_limit(self, plan: LogicalPlanNode, keys, order) -> LogicalPlanNode:
         """A per-key (grouped) LIMIT, ordered within each key when requested."""
         if order is None:
-            return GroupedLimit(input=plan, keys=keys, limit=self.pending_limit)
-        return GroupedLimit(
+            # A per-key row limit with no ordering: each correlation-key group is
+            # capped at the subquery's LIMIT independently of the others.
+            return GroupedLimit.create(input=plan, keys=keys, limit=self.pending_limit)
+        # A per-key ordered limit: within each correlation-key group the rows are
+        # ordered as the subquery's ORDER BY asked, then capped, so each outer row
+        # keeps its own first n rows.
+        return GroupedLimit.create(
             input=plan,
             keys=keys,
             limit=self.pending_limit,
@@ -1012,16 +1199,20 @@ class Decorrelator:
             )
         # Thread joins onto a clean one-row placeholder, not the original
         # Values: the original still carries the subquery expressions and
-        # would re-introduce them as a join input.
-        plan: LogicalPlanNode = Values(
-            rows=[[Literal(value=1, data_type=DataType.INTEGER)]],
+        # would re-introduce them as a join input. The single constant row is
+        # the outer row that each SELECT-list subquery join hangs off of.
+        plan: LogicalPlanNode = Values.create(
+            rows=[[Literal.create(value=1, data_type=DataType.INTEGER)]],
             output_names=["__exists_base"],
         )
         expressions: List[Expression] = []
         for expr in node.rows[0]:
             rewritten, plan = self._rewrite_value_expr(expr, plan)
             expressions.append(rewritten)
-        return Projection(
+        # Re-project the rewritten SELECT-list expressions under the original
+        # output names, over the plan that now carries the subquery joins, so the
+        # FROM-less SELECT presents exactly the columns the user asked for.
+        return Projection.create(
             input=plan, expressions=expressions, aliases=list(node.output_names)
         )
 
@@ -1045,14 +1236,52 @@ class Decorrelator:
                 raise DecorrelationError(f"Subqueries in {where} are not supported")
 
     def _rewrite_filter(self, node: Filter) -> LogicalPlanNode:
-        """Rewrite a filter: joins for conjuncts, unions for disjunctions."""
+        """Rewrite a filter: joins for conjuncts, unions for disjunctions.
+
+        A filter does not change its input's schema, but decorrelating a scalar
+        subquery in the predicate adds the subquery's value column through a
+        join. A HAVING (a filter over an aggregate) has no SELECT projection
+        above it to drop that extra column, so its result is re-projected back to
+        the aggregate's columns. A WHERE filter is left alone: its SELECT
+        projection already trims, and re-projecting would block the correlation
+        pull-up when the filter sits inside another subquery.
+        """
         input_plan = self._rewrite_plan(node.input)
         if not _expression_has_subquery(node.predicate):
-            return Filter(input=input_plan, predicate=node.predicate)
-        disjuncts = _split_disjuncts(node.predicate)
+            # No subquery in the predicate, so the filter is preserved as-is over
+            # the (possibly rewritten) input; only the child needed decorrelating.
+            return Filter.create(input=input_plan, predicate=node.predicate)
+        original_schema = input_plan.schema()
+        rewritten = self._rewrite_filter_predicate(input_plan, node.predicate)
+        if isinstance(input_plan, Aggregate):
+            return self._restore_filter_schema(rewritten, original_schema)
+        return rewritten
+
+    def _rewrite_filter_predicate(
+        self, input_plan: LogicalPlanNode, predicate: Expression
+    ) -> LogicalPlanNode:
+        """Rewrite a subquery-bearing predicate into joins (AND) or unions (OR)."""
+        disjuncts = _split_disjuncts(predicate)
         if len(disjuncts) > 1:
             return self._expand_or(input_plan, disjuncts)
-        return self._rewrite_filter_conjuncts(input_plan, node.predicate)
+        return self._rewrite_filter_conjuncts(input_plan, predicate)
+
+    def _restore_filter_schema(
+        self, plan: LogicalPlanNode, names: List[str]
+    ) -> LogicalPlanNode:
+        """Re-project a subquery-joined filter back to its pre-join columns."""
+        if plan.schema() == names:
+            return plan
+        expressions: List[Expression] = []
+        for name in names:
+            # A reference to one original output column by its physical name; the
+            # projection drops the columns the scalar subquery's join added.
+            expressions.append(ColumnRef.create(table=None, column=name))
+        # Restore the filter's original output schema over the join-threaded plan,
+        # so a HAVING subquery's join does not leak its value column downstream.
+        return Projection.create(
+            input=plan, expressions=expressions, aliases=list(names)
+        )
 
     def _expand_or(
         self, input_plan: LogicalPlanNode, disjuncts: List[Expression]
@@ -1073,7 +1302,10 @@ class Decorrelator:
         for disjunct in disjuncts:
             term, plan = self._disjunct_term(disjunct, plan)
             terms.append(term)
-        return Filter(input=plan, predicate=_or_join(terms))
+        # One filter over the OR of every per-disjunct term, on the plan grown
+        # with each disjunct's SEMI/ANTI flag join; this keeps every input row
+        # exactly once instead of a distinct union that would lose duplicates.
+        return Filter.create(input=plan, predicate=_or_join(terms))
 
     def _disjunct_term(
         self, disjunct: Expression, plan: LogicalPlanNode
@@ -1081,7 +1313,9 @@ class Decorrelator:
         """Turn one OR disjunct into a boolean term over the grown plan."""
         constant = self._constant_exists_value(disjunct)
         if constant is not None:
-            return Literal(value=constant, data_type=DataType.BOOLEAN), plan
+            # A constant boolean term for an EXISTS over a global aggregate that is
+            # always TRUE/FALSE; no join is needed, so the plan passes through.
+            return Literal.create(value=constant, data_type=DataType.BOOLEAN), plan
         if isinstance(disjunct, _SUBQUERY_NODE_TYPES):
             return self._join_flag(disjunct, plan)
         if not _expression_has_subquery(disjunct):
@@ -1100,7 +1334,10 @@ class Decorrelator:
                 kept.append(residual)
         if len(kept) == 0:
             return plan
-        return Filter(input=plan, predicate=_and_join(kept))
+        # The residual filter for conjuncts that did not become joins; subquery
+        # conjuncts were consumed as SEMI/ANTI joins, and only the remaining plain
+        # predicates stay as a filter over the join-threaded plan.
+        return Filter.create(input=plan, predicate=_and_join(kept))
 
     def _apply_conjunct(
         self, plan: LogicalPlanNode, conjunct: Expression
@@ -1108,15 +1345,22 @@ class Decorrelator:
         """Turn one conjunct into a join (consumed) or keep it filtered."""
         constant = self._constant_exists_value(conjunct)
         if constant is not None:
-            return plan, Literal(value=constant, data_type=DataType.BOOLEAN)
+            # A constant boolean residual for an always-true/false EXISTS over a
+            # global aggregate; it stays as a filter predicate, no join required.
+            return plan, Literal.create(value=constant, data_type=DataType.BOOLEAN)
         negated = self._negated_subquery_conjunct(conjunct)
         if negated is not None:
             return self._apply_conjunct(plan, negated)
         if isinstance(conjunct, _SUBQUERY_NODE_TYPES):
             right, condition, positive = self._semi_anti_parts(conjunct)
             join_type = JoinType.SEMI if positive else JoinType.ANTI
+            # The SEMI/ANTI join that enforces a boolean subquery conjunct: SEMI
+            # keeps outer rows that have a match, ANTI keeps those that do not, so
+            # the conjunct is fully consumed and leaves no residual predicate.
             return (
-                Join(left=plan, right=right, join_type=join_type, condition=condition),
+                Join.create(
+                    left=plan, right=right, join_type=join_type, condition=condition
+                ),
                 None,
             )
         if not _expression_has_subquery(conjunct):
@@ -1142,9 +1386,15 @@ class Decorrelator:
     def _negate_subquery_predicate(self, node: Expression) -> Expression:
         """Return the logical negation of a boolean subquery predicate."""
         if isinstance(node, ExistsExpression):
-            return ExistsExpression(subquery=node.subquery, negated=not node.negated)
+            # The negation of an EXISTS is the same subquery with its negated flag
+            # flipped, turning EXISTS into NOT EXISTS (and back) exactly.
+            return ExistsExpression.create(
+                subquery=node.subquery, negated=not node.negated
+            )
         if isinstance(node, InSubquery):
-            return InSubquery(
+            # The negation of an IN predicate is the same value/subquery with the
+            # negated flag flipped, giving NOT IN with its NULL-aware anti-join.
+            return InSubquery.create(
                 value=node.value, subquery=node.subquery, negated=not node.negated
             )
         if isinstance(node, QuantifiedComparison):
@@ -1164,7 +1414,10 @@ class Decorrelator:
             quantifier = Quantifier.ALL
         else:
             quantifier = Quantifier.ANY
-        return QuantifiedComparison(
+        # The De Morgan dual of the quantified comparison: NOT (x op ANY S) becomes
+        # x neg_op ALL S (and vice versa), so both the operator and the quantifier
+        # are flipped while the left value and subquery are unchanged.
+        return QuantifiedComparison.create(
             operator=operator,
             quantifier=quantifier,
             left=node.left,
@@ -1223,7 +1476,12 @@ class Decorrelator:
         items = self._in_value_items(expr, prepared)
         comparisons: List[Expression] = []
         for index in range(len(items)):
-            value_ref = ColumnRef(table=None, column=prepared.values[index])
+            # A reference to one subquery value column that the matching outer
+            # item is compared against; IN pairs each item with its value column.
+            # Qualified to the subquery alias so it resolves against the boundary.
+            value_ref = ColumnRef.create(
+                table=prepared.alias, column=prepared.values[index]
+            )
             comparisons.append(
                 self._match_term(items[index], value_ref, null_aware=expr.negated)
             )
@@ -1249,13 +1507,22 @@ class Decorrelator:
         self, outer_value: Expression, inner_ref: ColumnRef, null_aware: bool
     ) -> Expression:
         """Equality term; NULL-aware variants also match on NULL sides."""
-        equality = BinaryOp(op=BinaryOpType.EQ, left=outer_value, right=inner_ref)
+        # The plain equality between the outer value and the subquery value column;
+        # for IN this is the match, and NULL sides simply fail to match.
+        equality = BinaryOp.create(
+            op=BinaryOpType.EQ, left=outer_value, right=inner_ref
+        )
         if not null_aware:
             return equality
-        with_outer_null = BinaryOp(
+        # For NOT IN the anti-join must also treat a NULL outer value as a match,
+        # so the equality is OR'd with an IS NULL test on the outer side, making an
+        # UNKNOWN comparison drop the outer row as SQL requires.
+        with_outer_null = BinaryOp.create(
             op=BinaryOpType.OR, left=equality, right=_is_null_check(outer_value)
         )
-        return BinaryOp(
+        # Likewise a NULL on the subquery value side counts as a match, so the term
+        # is OR'd with an IS NULL test on the inner ref to complete NULL-awareness.
+        return BinaryOp.create(
             op=BinaryOpType.OR, left=with_outer_null, right=_is_null_check(inner_ref)
         )
 
@@ -1283,8 +1550,13 @@ class Decorrelator:
             raise DecorrelationError(
                 "Quantified comparison subquery must return one column"
             )
-        value_ref = ColumnRef(table=None, column=prepared.values[0])
-        comparison = BinaryOp(op=expr.operator, left=expr.left, right=value_ref)
+        # A reference to the single subquery value column that the quantified
+        # comparison ranges over (one column is required for op ANY/ALL).
+        # Qualified to the subquery alias so it resolves against the boundary.
+        value_ref = ColumnRef.create(table=prepared.alias, column=prepared.values[0])
+        # The per-row comparison "left op value" applied against each subquery row;
+        # ANY keeps rows where one holds, ALL keeps rows where none is violated.
+        comparison = BinaryOp.create(op=expr.operator, left=expr.left, right=value_ref)
         if expr.quantifier in (Quantifier.ANY, Quantifier.SOME):
             condition = self._combine_condition([comparison], prepared.condition)
             return prepared.plan, condition, True
@@ -1296,11 +1568,17 @@ class Decorrelator:
         self, comparison: BinaryOp, left: Expression, value_ref: ColumnRef
     ) -> Expression:
         """A row violating ALL: comparison fails or is UNKNOWN."""
-        negated = UnaryOp(op=UnaryOpType.NOT, operand=comparison)
-        with_left_null = BinaryOp(
+        # The base violation of ALL: the comparison failing (NOT comparison), which
+        # is the case where a subquery row disqualifies the outer row.
+        negated = UnaryOp.create(op=UnaryOpType.NOT, operand=comparison)
+        # A NULL left side makes the comparison UNKNOWN, which also blocks ALL from
+        # being TRUE, so a NULL left counts as a violation and is OR'd in.
+        with_left_null = BinaryOp.create(
             op=BinaryOpType.OR, left=negated, right=_is_null_check(left)
         )
-        return BinaryOp(
+        # A NULL subquery value likewise yields UNKNOWN and counts as a violation,
+        # so the final term also OR's in an IS NULL test on the value column.
+        return BinaryOp.create(
             op=BinaryOpType.OR, left=with_left_null, right=_is_null_check(value_ref)
         )
 
@@ -1317,12 +1595,10 @@ class Decorrelator:
         """Rewrite sort keys; prune helper columns added for subqueries."""
         input_plan = self._rewrite_plan(node.input)
         if not self._any_has_subquery(node.sort_keys):
-            return Sort(
-                input=input_plan,
-                sort_keys=node.sort_keys,
-                ascending=node.ascending,
-                nulls_order=node.nulls_order,
-            )
+            # No subquery in the sort keys, so the same ORDER BY is re-seated over
+            # the rewritten input; this rebuilds an existing Sort, so model_copy
+            # preserves its keys and direction and only swaps the input.
+            return node.model_copy(update={"input": input_plan})
         return self._rewrite_sort_with_subqueries(node, input_plan)
 
     def _any_has_subquery(self, expressions: List[Expression]) -> bool:
@@ -1359,12 +1635,11 @@ class Decorrelator:
         for key in node.sort_keys:
             rewritten, plan = self._rewrite_value_expr(key, plan)
             keys.append(rewritten)
-        sorted_plan = Sort(
-            input=plan,
-            sort_keys=keys,
-            ascending=node.ascending,
-            nulls_order=node.nulls_order,
-        )
+        # The same ORDER BY re-seated over the join-threaded input with its keys
+        # rewritten to reference the joined subquery values; this transforms an
+        # existing Sort, so model_copy keeps its direction and only swaps input
+        # and sort keys.
+        sorted_plan = node.model_copy(update={"input": plan, "sort_keys": keys})
         return self._prune_to_names(sorted_plan, original_names)
 
     def _sort_subqueries_below_projection(
@@ -1377,12 +1652,11 @@ class Decorrelator:
             rewritten, plan = self._rewrite_value_expr(key, plan)
             keys.append(rewritten)
         widened = self._widen_projection_for_keys(projection, plan, keys)
-        sorted_plan = Sort(
-            input=widened,
-            sort_keys=keys,
-            ascending=node.ascending,
-            nulls_order=node.nulls_order,
-        )
+        # The same ORDER BY re-seated above the widened projection (which now
+        # carries the sort-key helper columns), with keys rewritten to the joined
+        # values; model_copy rebuilds the existing Sort, keeping direction and
+        # only swapping input and sort keys.
+        sorted_plan = node.model_copy(update={"input": widened, "sort_keys": keys})
         return self._prune_to_names(sorted_plan, original_names)
 
     def _widen_projection_for_keys(
@@ -1393,7 +1667,10 @@ class Decorrelator:
         aliases = list(projection.aliases)
         existing = set(aliases)
         for name in self._sort_helper_columns(keys, existing):
-            expressions.append(ColumnRef(table=None, column=name))
+            # A pass-through reference to a sort-key column the projection did not
+            # already output, so the ORDER BY above the projection can still see
+            # the value before it is pruned back to the original columns.
+            expressions.append(ColumnRef.create(table=None, column=name))
             aliases.append(name)
         return projection.model_copy(
             update={"input": plan, "expressions": expressions, "aliases": aliases}
@@ -1415,22 +1692,25 @@ class Decorrelator:
         """Project a plan back down to the given output columns."""
         expressions: List[Expression] = []
         for name in names:
-            expressions.append(ColumnRef(table=None, column=name))
-        return Projection(input=plan, expressions=expressions, aliases=list(names))
+            # A reference to one of the original output columns, so the pruning
+            # projection selects exactly the pre-rewrite columns by name.
+            expressions.append(ColumnRef.create(table=None, column=name))
+        # The pruning projection that drops the helper columns added for subquery
+        # sort keys, restoring the query's original output column set.
+        return Projection.create(
+            input=plan, expressions=expressions, aliases=list(names)
+        )
 
     def _rewrite_join(self, node: Join) -> LogicalPlanNode:
         """Rewrite a join whose condition may contain subqueries."""
         left = self._rewrite_plan(node.left)
         right = self._rewrite_plan(node.right)
         if node.condition is None or not _expression_has_subquery(node.condition):
-            return Join(
-                left=left,
-                right=right,
-                join_type=node.join_type,
-                condition=node.condition,
-                natural=node.natural,
-                using=node.using,
-            )
+            # No subquery in the join condition, so the same join is kept with its
+            # inputs replaced by their decorrelated forms; this rebuilds an
+            # existing Join, so model_copy preserves type, condition, natural, and
+            # using while only swapping the two child plans.
+            return node.model_copy(update={"left": left, "right": right})
         if node.join_type != JoinType.INNER:
             raise DecorrelationError(
                 "Subqueries in non-INNER join conditions are not supported"
@@ -1470,7 +1750,9 @@ class Decorrelator:
         """
         constant = self._constant_exists_value(expr)
         if constant is not None:
-            return Literal(value=constant, data_type=DataType.BOOLEAN), plan
+            # A constant boolean for an EXISTS over a global aggregate that is
+            # always TRUE/FALSE; it replaces the subquery with no join added.
+            return Literal.create(value=constant, data_type=DataType.BOOLEAN), plan
         if isinstance(expr, SubqueryExpression):
             return self._join_scalar(expr, plan)
         if isinstance(expr, _SUBQUERY_NODE_TYPES):
@@ -1506,8 +1788,13 @@ class Decorrelator:
             return self._lateral_scalar(expr, plan)
         condition = prepared.condition
         if condition is None:
-            condition = Literal(value=True, data_type=DataType.BOOLEAN)
-        joined = Join(
+            # An uncorrelated scalar subquery has no correlation predicate, so the
+            # LEFT join matches unconditionally; a TRUE literal is that condition.
+            condition = Literal.create(value=True, data_type=DataType.BOOLEAN)
+        # The LEFT join that attaches the scalar subquery's single value to every
+        # outer row (NULL where no match), so the replacement expression can read
+        # that value column in place of the subquery.
+        joined = Join.create(
             left=plan,
             right=prepared.plan,
             join_type=JoinType.LEFT,
@@ -1525,10 +1812,22 @@ class Decorrelator:
         place for the LATERAL to evaluate per left row.
         """
         body = self._rewrite_plan(expr.subquery)
-        value_name = f"{self._next_prefix()}_v0"
-        right = self._project_lateral_value(body, value_name)
-        joined = LateralJoin(left=plan, right=right, join_type=JoinType.LEFT)
-        return ColumnRef(table=None, column=value_name), joined
+        prefix = self._next_prefix()
+        value_name = f"{prefix}_v0"
+        # The lateral body exposed as a prefix-aliased derived relation so the
+        # outer replacement ref qualifies to it, matching how every other
+        # subquery relation carries an alias its output columns resolve through.
+        right = SubqueryScan.create(
+            input=self._project_lateral_value(body, value_name), alias=prefix
+        )
+        # The LATERAL join fallback for a correlation that cannot flatten to a
+        # set-based join; the still-correlated body is evaluated per left row and
+        # the executing engine decorrelates it.
+        joined = LateralJoin.create(left=plan, right=right, join_type=JoinType.LEFT)
+        # A reference to the single projected value of the lateral body, which
+        # replaces the scalar subquery in the outer expression. Qualified to the
+        # lateral relation's alias so it resolves against that derived relation.
+        return ColumnRef.create(table=prefix, column=value_name), joined
 
     def _project_lateral_value(
         self, node: LogicalPlanNode, value_name: str
@@ -1560,8 +1859,13 @@ class Decorrelator:
         miss_branch = self._flag_branch(
             plan, right, condition, JoinType.ANTI, not positive, flag_name
         )
-        union = Union(inputs=[match_branch, miss_branch], distinct=False)
-        return ColumnRef(table=None, column=flag_name), union
+        # The non-distinct union of the SEMI branch (matching rows tagged TRUE) and
+        # the ANTI branch (non-matching rows tagged FALSE); together they restore
+        # the full input row set exactly once, each carrying its boolean flag.
+        union = Union.create(inputs=[match_branch, miss_branch], distinct=False)
+        # A reference to that flag column, which stands in for the boolean subquery
+        # in the outer expression.
+        return ColumnRef.create(table=None, column=flag_name), union
 
     def _flag_branch(
         self,
@@ -1573,10 +1877,20 @@ class Decorrelator:
         flag_name: str,
     ) -> Projection:
         """One half of a flag pair: join, then append the literal flag."""
-        joined = Join(left=plan, right=right, join_type=join_type, condition=condition)
-        star = ColumnRef(table=None, column="*")
-        flag = Literal(value=flag_value, data_type=DataType.BOOLEAN)
-        return Projection(
+        # One half of the flag pair: a SEMI or ANTI join selecting either the
+        # matching or the non-matching outer rows for this branch.
+        joined = Join.create(
+            left=plan, right=right, join_type=join_type, condition=condition
+        )
+        # A star reference so the branch carries through every original column
+        # alongside the flag it is about to append.
+        star = ColumnRef.create(table=None, column="*")
+        # The constant boolean flag tagging this branch's rows (TRUE for the match
+        # branch, FALSE for the miss branch) that the outer expression reads.
+        flag = Literal.create(value=flag_value, data_type=DataType.BOOLEAN)
+        # The projection that appends the flag to the branch's passed-through rows,
+        # so the union of the two branches yields each row once with its flag.
+        return Projection.create(
             input=joined, expressions=[star, flag], aliases=["*", flag_name]
         )
 

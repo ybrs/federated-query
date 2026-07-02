@@ -78,7 +78,7 @@ def test_explain_shows_dynamic_filter_with_real_values(multi_source_env):
 
 def test_build_side_chosen_by_filter_regardless_of_order(multi_source_env):
     """The filtered table is built from even when it is the left input, so the
-    big side is still the one reduced — and column order is preserved."""
+    dynamic IN filter still targets the other (big, unfiltered) side."""
     runtime = build_runtime(multi_source_env)
     # filtered table (products) written FIRST (left input)
     sql = (

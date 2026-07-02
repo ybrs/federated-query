@@ -142,7 +142,10 @@ class TestPredicatePushdownReal:
         """Test WHERE order_id > 1 actually pushes."""
         catalog, ds = setup_capturing_db
 
-        sql = "SELECT * FROM testdb.main.orders WHERE order_id > 1"
+        sql = (
+            "SELECT order_id, price, status FROM testdb.main.orders "
+            "WHERE order_id > 1"
+        )
         query, results = execute_and_capture(sql, catalog, ds)
 
         # Verify query has WHERE clause
@@ -168,7 +171,10 @@ class TestPredicatePushdownReal:
         """Test WHERE status = 'completed' AND price > 100."""
         catalog, ds = setup_capturing_db
 
-        sql = "SELECT * FROM testdb.main.orders WHERE status = 'completed' AND price > 100"
+        sql = (
+            "SELECT order_id, price, status FROM testdb.main.orders "
+            "WHERE status = 'completed' AND price > 100"
+        )
         query, results = execute_and_capture(sql, catalog, ds)
 
         assert "WHERE" in query, f"No WHERE: {query}"

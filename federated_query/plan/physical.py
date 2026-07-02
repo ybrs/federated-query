@@ -234,7 +234,9 @@ def _literal_for_value(value):
     data_type = type_map.get(type(value))
     if data_type is None:
         return None
-    return Literal(value=value, data_type=data_type)
+    # Typed constant standing in for a raw Python scalar in a predicate.
+    # Built from the runtime value once its Python type maps to a DataType.
+    return Literal.create(value=value, data_type=data_type)
 
 
 def _table_from_batches(batches: List[pa.RecordBatch], schema: pa.Schema) -> pa.Table:
@@ -249,7 +251,6 @@ class PhysicalCTE(PhysicalPlanNode):
 
     A CTE is a named relation: its body is executed a single time into an Arrow
     table that every reference reads, so the work is never repeated even when
-    the CTE is referenced many times. Single-source CTEs never reach here — they
     are pushed whole as a remote ``WITH``; this is the cross-source path.
     """
 
@@ -258,6 +259,23 @@ class PhysicalCTE(PhysicalPlanNode):
     column_names: Optional[List[str]] = None
     # Lazily-filled cache of the materialized body (private attr, not a field).
     _cached: Optional[Any] = None
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        name: str,
+        body: PhysicalPlanNode,
+        column_names: Optional[List[str]] = None,
+    ) -> "PhysicalCTE":
+        """Sanctioned fresh-construction path for PhysicalCTE.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            name=name,
+            body=body,
+            column_names=column_names,
+        )
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.body]
@@ -322,6 +340,21 @@ class PhysicalCTEScan(PhysicalPlanNode):
     producer: PhysicalCTE
     alias: Optional[str] = None
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        producer: PhysicalCTE,
+        alias: Optional[str] = None,
+    ) -> "PhysicalCTEScan":
+        """Sanctioned fresh-construction path for PhysicalCTEScan.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            producer=producer,
+            alias=alias,
+        )
+
     def children(self) -> List[PhysicalPlanNode]:
         return [self.producer]
 
@@ -357,6 +390,21 @@ class PhysicalAliasedRelation(PhysicalPlanNode):
     input: PhysicalPlanNode
     alias: str
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        input: PhysicalPlanNode,
+        alias: str,
+    ) -> "PhysicalAliasedRelation":
+        """Sanctioned fresh-construction path for PhysicalAliasedRelation.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            input=input,
+            alias=alias,
+        )
+
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
 
@@ -384,13 +432,29 @@ class PhysicalCTEMergeQuery(PhysicalPlanNode):
     Every base source relation in the CTE is materialized into Arrow and
     registered under a generated name; the rendered WITH references those names
     so the in-memory DuckDB runs the recursion (and any multi-reference)
-    locally. Used when a recursive CTE spans data sources — the fixpoint needs a
     single engine.
     """
 
     sql: str
     inputs: Dict[str, PhysicalPlanNode]
     output_names: List[str]
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        sql: str,
+        inputs: Dict[str, PhysicalPlanNode],
+        output_names: List[str],
+    ) -> "PhysicalCTEMergeQuery":
+        """Sanctioned fresh-construction path for PhysicalCTEMergeQuery.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            sql=sql,
+            inputs=inputs,
+            output_names=output_names,
+        )
 
     def children(self) -> List[PhysicalPlanNode]:
         return list(self.inputs.values())
@@ -445,13 +509,17 @@ def _qualify_join_condition(condition, left_names, right_names):
             return condition.model_copy(update={"table": "r"})
         return condition
     if isinstance(condition, BinaryOp):
-        return BinaryOp(
+        # Same operator with both operands recursively side-qualified.
+        # A new node is needed because each child gets an l./r. rewrite.
+        return BinaryOp.create(
             op=condition.op,
             left=_qualify_join_condition(condition.left, left_names, right_names),
             right=_qualify_join_condition(condition.right, left_names, right_names),
         )
     if isinstance(condition, UnaryOp):
-        return UnaryOp(
+        # Same unary operator wrapping its side-qualified operand.
+        # Rebuilt so the negated/inner column carries the l./r. prefix.
+        return UnaryOp.create(
             op=condition.op,
             operand=_qualify_join_condition(condition.operand, left_names, right_names),
         )
@@ -716,6 +784,57 @@ class PhysicalScan(PhysicalPlanNode):
     # filter renders with real values; None outside EXPLAIN.
     dynamic_filter_values: Optional[List[tuple]] = None
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        datasource: str,
+        schema_name: str,
+        table_name: str,
+        columns: List[str],
+        filters: Optional[Expression] = None,
+        datasource_connection: Any = None,
+        sample: Optional[str] = None,
+        group_by: Optional[List[Expression]] = None,
+        grouping_sets: Optional[List[List[Expression]]] = None,
+        aggregates: Optional[List[Expression]] = None,
+        output_names: Optional[List[str]] = None,
+        alias: Optional[str] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        order_by_keys: Optional[List[Expression]] = None,
+        order_by_ascending: Optional[List[bool]] = None,
+        order_by_nulls: Optional[List[Optional[str]]] = None,
+        distinct: bool = False,
+        dynamic_filter_keys: Optional[List[Expression]] = None,
+        dynamic_filter_values: Optional[List[tuple]] = None,
+    ) -> "PhysicalScan":
+        """Sanctioned fresh-construction path for PhysicalScan.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            datasource=datasource,
+            schema_name=schema_name,
+            table_name=table_name,
+            columns=columns,
+            filters=filters,
+            datasource_connection=datasource_connection,
+            sample=sample,
+            group_by=group_by,
+            grouping_sets=grouping_sets,
+            aggregates=aggregates,
+            output_names=output_names,
+            alias=alias,
+            limit=limit,
+            offset=offset,
+            order_by_keys=order_by_keys,
+            order_by_ascending=order_by_ascending,
+            order_by_nulls=order_by_nulls,
+            distinct=distinct,
+            dynamic_filter_keys=dynamic_filter_keys,
+            dynamic_filter_values=dynamic_filter_values,
+        )
+
     def children(self) -> List[PhysicalPlanNode]:
         return []
 
@@ -726,8 +845,6 @@ class PhysicalScan(PhysicalPlanNode):
 
         Only single-column keys with renderable literal values are handled; a
         composite key or an untypable value declines (the join probes in full).
-        The filter mutates this scan in place — its SQL is rebuilt at execute
-        time — and does not change the output schema.
         """
         if len(key_columns) != 1:
             return False
@@ -749,7 +866,9 @@ class PhysicalScan(PhysicalPlanNode):
             options.append(literal)
         if not options:
             return None
-        return InList(value=key_column, options=options)
+        # Runtime membership test restricting the scan to the join's build keys.
+        # Assembled from the collected key literals for dynamic filter pushdown.
+        return InList.create(value=key_column, options=options)
 
     def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
         """Expose this scan's columns under its table alias.
@@ -883,6 +1002,27 @@ class PhysicalProjection(PhysicalPlanNode):
     output_names: List[str]
     distinct: bool = False
     distinct_on: Optional[List[Expression]] = None
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        input: PhysicalPlanNode,
+        expressions: List[Expression],
+        output_names: List[str],
+        distinct: bool = False,
+        distinct_on: Optional[List[Expression]] = None,
+    ) -> "PhysicalProjection":
+        """Sanctioned fresh-construction path for PhysicalProjection.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            input=input,
+            expressions=expressions,
+            output_names=output_names,
+            distinct=distinct,
+            distinct_on=distinct_on,
+        )
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
@@ -1025,6 +1165,23 @@ class PhysicalWindow(PhysicalPlanNode):
     expressions: List[Expression]
     output_names: List[str]
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        input: PhysicalPlanNode,
+        expressions: List[Expression],
+        output_names: List[str],
+    ) -> "PhysicalWindow":
+        """Sanctioned fresh-construction path for PhysicalWindow.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            input=input,
+            expressions=expressions,
+            output_names=output_names,
+        )
+
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
 
@@ -1087,6 +1244,21 @@ class PhysicalFilter(PhysicalPlanNode):
     input: PhysicalPlanNode
     predicate: Expression
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        input: PhysicalPlanNode,
+        predicate: Expression,
+    ) -> "PhysicalFilter":
+        """Sanctioned fresh-construction path for PhysicalFilter.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            input=input,
+            predicate=predicate,
+        )
+
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
 
@@ -1130,6 +1302,29 @@ class PhysicalHashJoin(PhysicalPlanNode):
     right_keys: List[Expression]
     build_side: str  # "left" or "right"
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        left: PhysicalPlanNode,
+        right: PhysicalPlanNode,
+        join_type: JoinType,
+        left_keys: List[Expression],
+        right_keys: List[Expression],
+        build_side: str,
+    ) -> "PhysicalHashJoin":
+        """Sanctioned fresh-construction path for PhysicalHashJoin.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            left=left,
+            right=right,
+            join_type=join_type,
+            left_keys=left_keys,
+            right_keys=right_keys,
+            build_side=build_side,
+        )
+
     def children(self) -> List[PhysicalPlanNode]:
         return [self.left, self.right]
 
@@ -1149,8 +1344,6 @@ class PhysicalHashJoin(PhysicalPlanNode):
         Outer joins (LEFT/RIGHT/FULL) and ANTI keep non-matching rows, so the
         probe reduction does not apply; a SEMI join keeps only matching left
         rows, so the right's keys are pushed into the left as a semi-join
-        reduction. The right side is drained into a table first — exactly as the
-        row-at-a-time path drains the build side — so its source connection is
         released before the left side streams; otherwise deeply nested joins
         hold a connection open at every level and exhaust the pool. The left
         side streams.
@@ -1173,7 +1366,6 @@ class PhysicalHashJoin(PhysicalPlanNode):
         A SEMI join keeps only left rows whose key matches a right key, so
         constraining the left to those keys drops no result row and avoids
         fetching unmatched rows from the left's (often remote) source. ANTI is
-        excluded — it keeps non-matching rows, which this filter would remove.
         """
         value_tuples = self._distinct_build_keys(
             right_batches, self.right, self.right_keys
@@ -1188,21 +1380,90 @@ class PhysicalHashJoin(PhysicalPlanNode):
     def _execute_inner_merge(self, engine) -> Iterator[pa.RecordBatch]:
         """Run an INNER equi-join through the DuckDB merge engine.
 
-        The build side is materialized once (its keys feed the G9 dynamic probe
-        filter, and a hash join must read all build rows anyway). The output is
-        rendered from the actual materialized input schemas, so its column names
-        and types match the row-at-a-time path the engine relies on. The result
-        streams back from DuckDB.
+        The build side is streamed into a DuckDB temp table (DuckDB-owned and
+        spillable) rather than drained into a Python Arrow table. DuckDB then
+        computes the build's DISTINCT keys, which are pushed into the probe as a
+        dynamic filter (semi-join reduction); the probe streams and DuckDB joins
+        it against the buffered build, and the result streams back.
         """
-        build_batches = self._materialize_build()
-        if not build_batches:
-            return iter(())
-        self._reduce_probe_from_build(build_batches)
-        inputs = self._merge_inputs(build_batches)
-        left_schema = inputs[_MERGE_LEFT_RELATION].schema
-        right_schema = inputs[_MERGE_RIGHT_RELATION].schema
-        sql = self._join_sql(left_schema, right_schema)
-        return engine.run(sql, inputs)
+        build_node, probe_node, build_keys, probe_keys = self._build_probe_sides()
+        build_rel, probe_rel = self._merge_relation_names()
+        with engine.join_session() as session:
+            build_reader = _streaming_reader(build_node)
+            build_schema = build_reader.schema
+            session.materialize(build_rel, build_reader)
+            self._reduce_probe_via_distinct(
+                session, build_rel, build_node, build_keys, probe_node, probe_keys
+            )
+            probe_reader = _streaming_reader(probe_node)
+            sql = self._inner_join_sql(build_schema, probe_reader.schema)
+            yield from session.stream(sql, {probe_rel: probe_reader})
+
+    def _merge_relation_names(self):
+        """(build_relation, probe_relation) names, keeping self.left as in_left."""
+        if self.build_side == "right":
+            return _MERGE_RIGHT_RELATION, _MERGE_LEFT_RELATION
+        return _MERGE_LEFT_RELATION, _MERGE_RIGHT_RELATION
+
+    def _inner_join_sql(self, build_schema, probe_schema) -> str:
+        """Render the join SELECT with left/right schemas in self.left/right order."""
+        if self.build_side == "right":
+            return self._join_sql(probe_schema, build_schema)
+        return self._join_sql(build_schema, probe_schema)
+
+    def _reduce_probe_via_distinct(
+        self, session, build_rel, build_node, build_keys, probe_node, probe_keys
+    ) -> None:
+        """Push the build's DuckDB-computed DISTINCT keys into the probe (reduction).
+
+        An INNER join only emits probe rows whose key matches a build key, so
+        constraining the probe to those keys drops no result row and avoids
+        fetching unmatched rows from the probe's (often remote) source.
+        """
+        keys = self._distinct_keys_via_engine(session, build_rel, build_node, build_keys)
+        if keys is None:
+            return
+        if probe_node.apply_dynamic_filter(probe_keys, keys):
+            _LOGGER.debug("dynamic filter applied to probe: %d keys", len(keys))
+
+    def _distinct_keys_via_engine(
+        self, session, build_rel, build_node, build_keys
+    ) -> Optional[List[tuple]]:
+        """Distinct non-NULL build-key tuples from the buffered build, or None.
+
+        DuckDB computes the DISTINCT over the (spillable) build temp table; only
+        the key set - capped, and pulled to Python solely to build the probe's IN
+        filter - crosses back. None when empty or above the cap.
+        """
+        columns = self._build_key_columns(build_node, build_keys)
+        rows = session.fetch(self._distinct_keys_sql(build_rel, columns))
+        if not _within_dynamic_filter_cap(len(rows)):
+            return None
+        return rows
+
+    def _build_key_columns(self, build_node, build_keys) -> List[str]:
+        """Physical column names of the build's join keys in its temp table."""
+        aliases = build_node.column_aliases()
+        columns = []
+        for key in build_keys:
+            columns.append(_physical_column_name(key, aliases or {}))
+        return columns
+
+    def _distinct_keys_sql(self, build_rel: str, columns: List[str]) -> str:
+        """SELECT DISTINCT of the key columns, non-NULL, capped one past the limit."""
+        quoted = []
+        for column in columns:
+            # Quote via the sqlglot emitter so a name containing an embedded quote
+            # is escaped, not injected raw into the SQL text.
+            quoted.append(exp.to_identifier(column, quoted=True).sql(dialect="duckdb"))
+        not_null = []
+        for name in quoted:
+            not_null.append(f"{name} IS NOT NULL")
+        limit = _DYNAMIC_FILTER_MAX_KEYS + 1
+        return (
+            f"SELECT DISTINCT {', '.join(quoted)} FROM {build_rel} "
+            f"WHERE {' AND '.join(not_null)} LIMIT {limit}"
+        )
 
     def _build_probe_sides(self):
         """Return (build_node, probe_node, build_keys, probe_keys) per build_side."""
@@ -1210,40 +1471,12 @@ class PhysicalHashJoin(PhysicalPlanNode):
             return self.right, self.left, self.right_keys, self.left_keys
         return self.left, self.right, self.left_keys, self.right_keys
 
-    def _materialize_build(self) -> List[pa.RecordBatch]:
-        """Read the build side fully into a list of batches."""
-        build_node = self._build_probe_sides()[0]
-        batches = []
-        for batch in build_node.execute():
-            batches.append(batch)
-        return batches
-
-    def _reduce_probe_from_build(self, build_batches: List[pa.RecordBatch]) -> None:
-        """Push the build side's distinct keys into the probe as an IN filter.
-
-        Semi-join reduction: an INNER join only emits probe rows whose key
-        matches a build key, so constraining the probe to those keys is safe and
-        avoids fetching unmatched rows (the win for a remote probe). Limited to
-        INNER joins; the distinct-key set is computed vectorized and skipped when
-        empty or above the cap, so an over-cap build pays no per-row Python cost.
-        """
-        if self.join_type != JoinType.INNER:
-            return
-        build_node, probe_node, build_keys, probe_keys = self._build_probe_sides()
-        value_tuples = self._distinct_build_keys(build_batches, build_node, build_keys)
-        if value_tuples is None:
-            return
-        if probe_node.apply_dynamic_filter(probe_keys, value_tuples):
-            _LOGGER.debug("dynamic filter applied to probe: %d keys", len(value_tuples))
-
     def _distinct_build_keys(
         self, build_batches: List[pa.RecordBatch], build_node, build_keys
     ) -> Optional[List[tuple]]:
         """Distinct non-NULL build-key tuples, or None if empty or above the cap.
 
         Distinct values are computed with pyarrow, so the cap is enforced on the
-        vectorized distinct count: an over-cap build — which the probe would
-        reject anyway — never pays the per-row Python boxing the row-at-a-time
         path would. Only the surviving (<= cap) keys are turned into tuples.
         """
         aliases = build_node.column_aliases()
@@ -1257,7 +1490,6 @@ class PhysicalHashJoin(PhysicalPlanNode):
 
         Each batch's key columns are collected as-is and concatenated, then
         DuckDB-style deduplicated via ``drop_null().group_by(...).aggregate([])``
-        — all in pyarrow's C++ kernels, no Python per row.
         """
         names = _key_column_names(len(build_keys))
         key_tables = []
@@ -1266,29 +1498,6 @@ class PhysicalHashJoin(PhysicalPlanNode):
             key_tables.append(pa.table(arrays, names=names))
         combined = pa.concat_tables(key_tables)
         return combined.drop_null().group_by(names).aggregate([])
-
-    def _merge_inputs(self, build_batches: List[pa.RecordBatch]) -> Dict[str, object]:
-        """Map self.left/self.right to the DuckDB relations under stable names.
-
-        ``self.left`` always registers as the left relation and ``self.right``
-        as the right, regardless of which side is built, so the output column
-        order does not depend on the build/probe choice. The build side is
-        already materialized (a hash join must read all build rows, and its keys
-        feed the G9 probe filter); the probe side is handed to DuckDB as a lazy
-        streaming reader and is never drained into a table by us.
-        """
-        build_node, probe_node, _, _ = self._build_probe_sides()
-        build_table = _table_from_batches(build_batches, build_node.schema())
-        probe_reader = _streaming_reader(probe_node)
-        if self.build_side == "right":
-            return {
-                _MERGE_LEFT_RELATION: probe_reader,
-                _MERGE_RIGHT_RELATION: build_table,
-            }
-        return {
-            _MERGE_LEFT_RELATION: build_table,
-            _MERGE_RIGHT_RELATION: probe_reader,
-        }
 
     def _join_sql(self, left_schema: pa.Schema, right_schema: pa.Schema) -> str:
         """Render the join SELECT for this join type over the registered relations."""
@@ -1353,6 +1562,43 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
     order_by_nulls: Optional[List[Optional[str]]] = None
     _schema: Optional[pa.Schema] = None
     _column_alias_map: Dict[Tuple[Optional[str], str], str] = {}
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        left: PhysicalScan,
+        right: PhysicalScan,
+        join_type: JoinType,
+        condition: Expression,
+        datasource_connection: Any,
+        group_by: Optional[List[Expression]] = None,
+        grouping_sets: Optional[List[List[Expression]]] = None,
+        aggregates: Optional[List[Expression]] = None,
+        output_names: Optional[List[str]] = None,
+        distinct: bool = False,
+        order_by_keys: Optional[List[Expression]] = None,
+        order_by_ascending: Optional[List[bool]] = None,
+        order_by_nulls: Optional[List[Optional[str]]] = None,
+    ) -> "PhysicalRemoteJoin":
+        """Sanctioned fresh-construction path for PhysicalRemoteJoin.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            left=left,
+            right=right,
+            join_type=join_type,
+            condition=condition,
+            datasource_connection=datasource_connection,
+            group_by=group_by,
+            grouping_sets=grouping_sets,
+            aggregates=aggregates,
+            output_names=output_names,
+            distinct=distinct,
+            order_by_keys=order_by_keys,
+            order_by_ascending=order_by_ascending,
+            order_by_nulls=order_by_nulls,
+        )
 
     def children(self) -> List[PhysicalPlanNode]:
         return []
@@ -1484,7 +1730,6 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
         A side filter may be written against the join alias (``p.category``).
         The alias must therefore be applied to the table INSIDE the derived
         table as well, since the outer alias is not in scope within the
-        subquery — otherwise the remote engine raises a binder error.
         """
         table_ref = f'"{scan.schema_name}"."{scan.table_name}"'
         alias = scan.alias if scan.alias else scan.table_name
@@ -1534,6 +1779,25 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
     right: PhysicalPlanNode
     join_type: JoinType
     condition: Optional[Expression]
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        left: PhysicalPlanNode,
+        right: PhysicalPlanNode,
+        join_type: JoinType,
+        condition: Optional[Expression],
+    ) -> "PhysicalNestedLoopJoin":
+        """Sanctioned fresh-construction path for PhysicalNestedLoopJoin.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            left=left,
+            right=right,
+            join_type=join_type,
+            condition=condition,
+        )
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.left, self.right]
@@ -1597,6 +1861,27 @@ class PhysicalHashAggregate(PhysicalPlanNode):
     aggregates: List[Expression]
     output_names: List[str]
     grouping_sets: Optional[List[List[Expression]]] = None
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        input: PhysicalPlanNode,
+        group_by: List[Expression],
+        aggregates: List[Expression],
+        output_names: List[str],
+        grouping_sets: Optional[List[List[Expression]]] = None,
+    ) -> "PhysicalHashAggregate":
+        """Sanctioned fresh-construction path for PhysicalHashAggregate.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            input=input,
+            group_by=group_by,
+            aggregates=aggregates,
+            output_names=output_names,
+            grouping_sets=grouping_sets,
+        )
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
@@ -1711,6 +1996,20 @@ class PhysicalHashAggregate(PhysicalPlanNode):
             return self._infer_aggregate_type(expr, input_schema)
         if isinstance(expr, ColumnRef):
             return _column_ref_type(expr, input_schema, self.column_aliases())
+        from .expressions import contains_aggregate
+        from .arrow_types import arrow_type_for
+
+        if contains_aggregate(expr):
+            # A scalar over aggregates (100.0 * SUM(x) / SUM(y)): its output type
+            # is not an aggregate's and is not int by default. Type it
+            # structurally from the engine DataType (its aggregate leaves are
+            # typed at binding), so a decimal/double result is not mis-cast to
+            # int64 (TPC-H q14).
+            return arrow_type_for(expr.get_type())
+        # A plain expression group key (a % b): DuckDB computes it and returns an
+        # integer for the integer keys these are in practice; keep the integer
+        # default rather than the value's structural type, which would need
+        # every operator's local kernel just to infer a type.
         return pa.int64()
 
     def _infer_aggregate_type(
@@ -1772,6 +2071,25 @@ class PhysicalSort(PhysicalPlanNode):
     ascending: List[bool]
     nulls_order: Optional[List[Optional[str]]] = None
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        input: PhysicalPlanNode,
+        sort_keys: List[Expression],
+        ascending: List[bool],
+        nulls_order: Optional[List[Optional[str]]] = None,
+    ) -> "PhysicalSort":
+        """Sanctioned fresh-construction path for PhysicalSort.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            input=input,
+            sort_keys=sort_keys,
+            ascending=ascending,
+            nulls_order=nulls_order,
+        )
+
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
 
@@ -1825,6 +2143,23 @@ class PhysicalLimit(PhysicalPlanNode):
     input: PhysicalPlanNode
     limit: Optional[int]
     offset: int = 0
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        input: PhysicalPlanNode,
+        limit: Optional[int],
+        offset: int = 0,
+    ) -> "PhysicalLimit":
+        """Sanctioned fresh-construction path for PhysicalLimit.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            input=input,
+            limit=limit,
+            offset=offset,
+        )
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
@@ -1885,6 +2220,21 @@ class PhysicalValues(PhysicalPlanNode):
     rows: List[List[Expression]]
     output_names: List[str]
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        rows: List[List[Expression]],
+        output_names: List[str],
+    ) -> "PhysicalValues":
+        """Sanctioned fresh-construction path for PhysicalValues.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            rows=rows,
+            output_names=output_names,
+        )
+
     def children(self) -> List[PhysicalPlanNode]:
         return []
 
@@ -1938,6 +2288,27 @@ class PhysicalRemoteQuery(PhysicalPlanNode):
     query_ast: Any
     output_names: List[str]
     column_alias_map: Dict[Tuple[Optional[str], str], str] = Field(default_factory=dict)
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        datasource: str,
+        datasource_connection: Any,
+        query_ast: Any,
+        output_names: List[str],
+        column_alias_map: Dict[Tuple[Optional[str], str], str],
+    ) -> "PhysicalRemoteQuery":
+        """Sanctioned fresh-construction path for PhysicalRemoteQuery.
+        column_alias_map is explicit (the default_factory cannot be a parameter
+        default); pass {} when no alias remapping is needed."""
+        return cls(
+            datasource=datasource,
+            datasource_connection=datasource_connection,
+            query_ast=query_ast,
+            output_names=output_names,
+            column_alias_map=column_alias_map,
+        )
     _schema: Optional[pa.Schema] = None
 
     def children(self) -> List[PhysicalPlanNode]:
@@ -1980,6 +2351,21 @@ class PhysicalUnion(PhysicalPlanNode):
 
     inputs: List[PhysicalPlanNode]
     distinct: bool
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        inputs: List[PhysicalPlanNode],
+        distinct: bool,
+    ) -> "PhysicalUnion":
+        """Sanctioned fresh-construction path for PhysicalUnion.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            inputs=inputs,
+            distinct=distinct,
+        )
 
     def children(self) -> List[PhysicalPlanNode]:
         return self.inputs
@@ -2043,6 +2429,39 @@ class PhysicalRemoteSetOp(PhysicalPlanNode):
     limit: Optional[int] = None
     offset: int = 0
     _schema: Optional[pa.Schema] = None
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        left: PhysicalPlanNode,
+        right: PhysicalPlanNode,
+        kind: SetOpKind,
+        distinct: bool,
+        datasource: str,
+        datasource_connection: Any,
+        order_by_keys: Optional[List[Expression]] = None,
+        order_by_ascending: Optional[List[bool]] = None,
+        order_by_nulls: Optional[List[Optional[str]]] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> "PhysicalRemoteSetOp":
+        """Sanctioned fresh-construction path for PhysicalRemoteSetOp.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            left=left,
+            right=right,
+            kind=kind,
+            distinct=distinct,
+            datasource=datasource,
+            datasource_connection=datasource_connection,
+            order_by_keys=order_by_keys,
+            order_by_ascending=order_by_ascending,
+            order_by_nulls=order_by_nulls,
+            limit=limit,
+            offset=offset,
+        )
 
     def children(self) -> List[PhysicalPlanNode]:
         return []
@@ -2134,6 +2553,25 @@ class PhysicalSetOperation(PhysicalPlanNode):
     kind: SetOpKind
     distinct: bool
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        left: PhysicalPlanNode,
+        right: PhysicalPlanNode,
+        kind: SetOpKind,
+        distinct: bool,
+    ) -> "PhysicalSetOperation":
+        """Sanctioned fresh-construction path for PhysicalSetOperation.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            left=left,
+            right=right,
+            kind=kind,
+            distinct=distinct,
+        )
+
     def children(self) -> List[PhysicalPlanNode]:
         return [self.left, self.right]
 
@@ -2180,12 +2618,26 @@ class PhysicalSingleRowGuard(PhysicalPlanNode):
     """Enforces scalar-subquery cardinality at execution time.
 
     With no keys, more than one input row in total raises. With keys, a
-    repeated key value raises — this guards decorrelated correlated scalar
     subqueries, where each key admits at most one row.
     """
 
     input: PhysicalPlanNode
     keys: List[Expression]
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        input: PhysicalPlanNode,
+        keys: List[Expression],
+    ) -> "PhysicalSingleRowGuard":
+        """Sanctioned fresh-construction path for PhysicalSingleRowGuard.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            input=input,
+            keys=keys,
+        )
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
@@ -2260,6 +2712,29 @@ class PhysicalGroupedLimit(PhysicalPlanNode):
     order_by_keys: Optional[List[Expression]] = None
     order_by_ascending: Optional[List[bool]] = None
     order_by_nulls: Optional[List[Optional[str]]] = None
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        input: PhysicalPlanNode,
+        keys: List[Expression],
+        limit: int,
+        order_by_keys: Optional[List[Expression]] = None,
+        order_by_ascending: Optional[List[bool]] = None,
+        order_by_nulls: Optional[List[Optional[str]]] = None,
+    ) -> "PhysicalGroupedLimit":
+        """Sanctioned fresh-construction path for PhysicalGroupedLimit.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            input=input,
+            keys=keys,
+            limit=limit,
+            order_by_keys=order_by_keys,
+            order_by_ascending=order_by_ascending,
+            order_by_nulls=order_by_nulls,
+        )
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
@@ -2377,6 +2852,35 @@ class PhysicalLateralJoin(PhysicalPlanNode):
     # derive the dynamic filter pushed into the base relation.
     correlations: List[Tuple[str, Any, str]]
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        left: PhysicalPlanNode,
+        left_name: str,
+        left_alias: str,
+        base_scan: PhysicalPlanNode,
+        base_name: str,
+        lateral_sql: str,
+        output_names: List[str],
+        join_type: JoinType,
+        correlations: List[Tuple[str, Any, str]],
+    ) -> "PhysicalLateralJoin":
+        """Sanctioned fresh-construction path for PhysicalLateralJoin.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            left=left,
+            left_name=left_name,
+            left_alias=left_alias,
+            base_scan=base_scan,
+            base_name=base_name,
+            lateral_sql=lateral_sql,
+            output_names=output_names,
+            join_type=join_type,
+            correlations=correlations,
+        )
+
     def children(self) -> List[PhysicalPlanNode]:
         return [self.left, self.base_scan]
 
@@ -2399,8 +2903,6 @@ class PhysicalLateralJoin(PhysicalPlanNode):
     def _apply_domain_filter(self, left_table: pa.Table) -> PhysicalPlanNode:
         """Add a sound dynamic filter (domain restriction) to the base scan.
 
-        The filter may be loose (a superset) — the merge engine re-checks the
-        exact correlation — so it only shrinks the rows the base source returns.
         """
         if not isinstance(self.base_scan, PhysicalScan):
             return self.base_scan
@@ -2416,7 +2918,6 @@ class PhysicalLateralJoin(PhysicalPlanNode):
         """The (left + value) output schema, read without fetching rows.
 
         Taken from the LATERAL result's Arrow reader, which exposes the schema
-        before any batch — so an empty join still yields the right columns (a
         ``LIMIT 0`` probe produces zero batches and would lose the schema).
         """
         engine = self.merge_engine()
@@ -2437,7 +2938,6 @@ def _derive_domain_filter(correlations, left_table: pa.Table) -> Optional[Expres
 
     ``=`` becomes ``inner IN (domain)``; ``<``/``<=`` a ``< max(domain)`` bound;
     ``>``/``>=`` a ``> min(domain)`` bound. Any other shape contributes no term
-    (the base is fetched in full — still correct, just not reduced).
     """
     from .expressions import BinaryOp, BinaryOpType, InList, ColumnRef
 
@@ -2449,7 +2949,9 @@ def _derive_domain_filter(correlations, left_table: pa.Table) -> Optional[Expres
         values = domain.to_pylist()
         if not values:
             continue
-        column = ColumnRef(table=None, column=inner_col)
+        # Unqualified reference to the base relation's correlated inner column.
+        # Names the column the derived domain term will constrain.
+        column = ColumnRef.create(table=None, column=inner_col)
         term = _domain_term(column, op, values)
         if term is not None:
             terms.append(term)
@@ -2468,11 +2970,17 @@ def _domain_term(column, op, values) -> Optional[Expression]:
     if op == BinaryOpType.EQ:
         if not _within_dynamic_filter_cap(len(values)):
             return None
-        return InList(value=column, options=[_literal(v) for v in values])
+        # Membership term reducing the base to the equality domain's values.
+        # An equality correlation maps to IN over the full distinct domain.
+        return InList.create(value=column, options=[_literal(v) for v in values])
     if op in (BinaryOpType.LT, BinaryOpType.LTE):
-        return BinaryOp(op=op, left=column, right=_literal(max(values)))
+        # Upper-bound term keeping only rows below the domain's maximum.
+        # A less-than correlation is soundly reduced to a single max bound.
+        return BinaryOp.create(op=op, left=column, right=_literal(max(values)))
     if op in (BinaryOpType.GT, BinaryOpType.GTE):
-        return BinaryOp(op=op, left=column, right=_literal(min(values)))
+        # Lower-bound term keeping only rows above the domain's minimum.
+        # A greater-than correlation is soundly reduced to a single min bound.
+        return BinaryOp.create(op=op, left=column, right=_literal(min(values)))
     return None
 
 
@@ -2481,12 +2989,20 @@ def _literal(value) -> Expression:
     from .expressions import Literal, DataType
 
     if isinstance(value, bool):
-        return Literal(value=value, data_type=DataType.BOOLEAN)
+        # Boolean constant carrying a domain value into the filter tree.
+        # Chosen because the Python value is a bool.
+        return Literal.create(value=value, data_type=DataType.BOOLEAN)
     if isinstance(value, int):
-        return Literal(value=value, data_type=DataType.BIGINT)
+        # Integer constant carrying a domain value into the filter tree.
+        # Widened to BIGINT since the Python value is an int.
+        return Literal.create(value=value, data_type=DataType.BIGINT)
     if isinstance(value, float):
-        return Literal(value=value, data_type=DataType.DOUBLE)
-    return Literal(value=value, data_type=DataType.VARCHAR)
+        # Floating-point constant carrying a domain value into the filter tree.
+        # Chosen because the Python value is a float.
+        return Literal.create(value=value, data_type=DataType.DOUBLE)
+    # String constant carrying any remaining domain value into the filter tree.
+    # The fallback for values that are not bool, int, or float.
+    return Literal.create(value=value, data_type=DataType.VARCHAR)
 
 
 class PhysicalExplain(PhysicalPlanNode):
@@ -2494,6 +3010,21 @@ class PhysicalExplain(PhysicalPlanNode):
 
     child: PhysicalPlanNode
     format: ExplainFormat = ExplainFormat.TEXT
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        child: PhysicalPlanNode,
+        format: ExplainFormat = ExplainFormat.TEXT,
+    ) -> "PhysicalExplain":
+        """Sanctioned fresh-construction path for PhysicalExplain.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            child=child,
+            format=format,
+        )
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.child]
@@ -2586,6 +3117,23 @@ class _DatasourceQuerySnapshot(StateModel):
     sql: str
     query_ast: Any
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        datasource_name: str,
+        sql: str,
+        query_ast: Any,
+    ) -> "_DatasourceQuerySnapshot":
+        """Sanctioned fresh-construction path for _DatasourceQuerySnapshot.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            datasource_name=datasource_name,
+            sql=sql,
+            query_ast=query_ast,
+        )
+
 
 class Gather(PhysicalPlanNode):
     """Gather data from a remote data source.
@@ -2597,6 +3145,23 @@ class Gather(PhysicalPlanNode):
     datasource: str
     query: str  # SQL query to execute on remote source
     datasource_connection: Any = None
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        datasource: str,
+        query: str,
+        datasource_connection: Any = None,
+    ) -> "Gather":
+        """Sanctioned fresh-construction path for Gather.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            datasource=datasource,
+            query=query,
+            datasource_connection=datasource_connection,
+        )
 
     def children(self) -> List[PhysicalPlanNode]:
         return []
@@ -2706,7 +3271,7 @@ class _PlanFormatter:
     def _remote_join_detail(self, node: PhysicalRemoteJoin) -> str:
         left = f"{node.left.schema_name}.{node.left.table_name}"
         right = f"{node.right.schema_name}.{node.right.table_name}"
-        return f"type={node.join_type.value} sources={left}⨝{right}"
+        return f"type={node.join_type.value} sources={left}|X|{right}"
 
     def _nested_loop_join_detail(self, node: PhysicalNestedLoopJoin) -> str:
         info = f"type={node.join_type.value}"
@@ -2838,7 +3403,9 @@ class _DatasourceQueryCollector:
         query_ast = datasource.parse_query(base_sql)
         native_sql = to_source_sql(datasource, base_sql)
         sql = self._annotate_dynamic_filter(scan, native_sql)
-        snapshot = _DatasourceQuerySnapshot(
+        # EXPLAIN record of the per-source query this scan will issue.
+        # Captured from the scan's rendered native SQL and parsed AST.
+        snapshot = _DatasourceQuerySnapshot.create(
             datasource_name=scan.datasource, sql=sql, query_ast=query_ast
         )
         snapshots.append(snapshot)
@@ -2892,7 +3459,9 @@ class _DatasourceQueryCollector:
         postgres_sql = join._build_query()
         query_ast = datasource.parse_query(postgres_sql)
         native_sql = to_source_sql(datasource, postgres_sql)
-        snapshot = _DatasourceQuerySnapshot(
+        # EXPLAIN record of the pushed-down remote join query.
+        # Attributed to the left input's datasource that runs the join.
+        snapshot = _DatasourceQuerySnapshot.create(
             datasource_name=join.left.datasource, sql=native_sql, query_ast=query_ast
         )
         snapshots.append(snapshot)
@@ -2906,7 +3475,9 @@ class _DatasourceQueryCollector:
         sql = to_source_sql(
             set_op.datasource_connection, query_ast.sql(dialect="postgres")
         )
-        snapshot = _DatasourceQuerySnapshot(
+        # EXPLAIN record of the pushed-down remote set operation query.
+        # Taken from the set op's remote AST rendered to the source dialect.
+        snapshot = _DatasourceQuerySnapshot.create(
             datasource_name=set_op.datasource, sql=sql, query_ast=query_ast
         )
         snapshots.append(snapshot)
@@ -2924,7 +3495,9 @@ class _DatasourceQueryCollector:
         # still renders node.query_ast directly; this is display-only.
         sql = node.query_ast.sql(dialect=node.datasource_connection.render_dialect)
         display_ast = node.datasource_connection.parse_query(sql)
-        snapshot = _DatasourceQuerySnapshot(
+        # EXPLAIN record of the remote query, normalized for display only.
+        # Uses the dialect-reparsed AST so the shown form matches the source.
+        snapshot = _DatasourceQuerySnapshot.create(
             datasource_name=node.datasource, sql=sql, query_ast=display_ast
         )
         snapshots.append(snapshot)

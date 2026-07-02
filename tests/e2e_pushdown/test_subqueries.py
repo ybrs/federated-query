@@ -45,8 +45,6 @@ def _assert_no_subquery_expressions(ast):
     """Assert no predicate/projection-position subquery survived decorrelation.
 
     A subquery in FROM/JOIN position is a derived-table *relation* and is
-    allowed; anything else — ``EXISTS``, ``IN (SELECT ...)``, ``ANY``/``ALL``,
-    or a scalar ``(SELECT ...)`` in WHERE/SELECT/HAVING — is forbidden, because
     decorrelation must leave the physical plan free of subquery expressions.
     """
     assert not list(ast.find_all(exp.Exists)), "EXISTS survived decorrelation"
@@ -302,7 +300,7 @@ def test_correlated_count_scalar_pushed_result_matches_source(single_source_env)
 
 
 def test_correlated_scalar_order_limit_matches_source(single_source_env):
-    """A correlated scalar ``ORDER BY … LIMIT 1`` (pick-one) matches the source.
+    """A correlated scalar subquery with ORDER BY/LIMIT matches the raw source.
 
     Decorrelates to a LEFT JOIN with an order-aware per-key limit; verified by
     comparing engine output to the same SQL on the raw source.
@@ -360,7 +358,6 @@ def test_non_equi_scalar_aggregate_in_select_matches_source(single_source_env):
 
 
 def test_non_equi_scalar_order_limit_matches_source(single_source_env):
-    """A non-equi correlated ``ORDER BY … LIMIT 1`` scalar matches the source."""
     sql = (
         "SELECT o.order_id, "
         "  (SELECT p.name FROM duckdb_primary.main.products p "

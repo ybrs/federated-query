@@ -30,7 +30,9 @@ class Executor:
             config: Executor configuration (uses defaults if not provided).
         """
         if config is None:
-            config = ExecutorConfig()
+            # Default executor tuning when the caller supplies none, so every
+            # downstream operator sees a concrete config rather than None.
+            config = ExecutorConfig.create()
         self.config = config
         self.catalog = catalog
         # The merge engine is created once on first use and reused across every

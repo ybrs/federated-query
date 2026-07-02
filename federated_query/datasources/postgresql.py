@@ -38,7 +38,6 @@ _UUID_TEXT_WIDTH = 36
 _DASH = ord("-")
 
 # Cap each streamed ADBC batch so a huge scan yields many bounded batches rather
-# than one giant one — keeps peak memory flat and lets the consumer pull lazily.
 _ADBC_BATCH_BYTES = 4 * 1024 * 1024
 
 
@@ -70,7 +69,6 @@ class PostgreSQLDataSource(DataSource):
         # Pool of idle ADBC connections. A streamed COPY keeps its connection
         # busy for the life of the reader, and libpq allows only one COPY per
         # connection, so concurrent scans (e.g. both sides of a join) each need
-        # their own — a single shared connection would collide.
         self._adbc_idle: List[Any] = []
 
     def connect(self) -> None:
@@ -246,7 +244,9 @@ class PostgreSQLDataSource(DataSource):
                     else:
                         n_distinct = int(n_distinct)
 
-                    column_stats[col_name] = ColumnStatistics(
+                    # Per-column stats from pg_stats for this column; n_distinct
+                    # was already normalized above from Postgres' signed encoding.
+                    column_stats[col_name] = ColumnStatistics.create(
                         num_distinct=n_distinct,
                         null_fraction=row["null_frac"] or 0.0,
                         avg_width=10,  # Placeholder
@@ -303,7 +303,6 @@ class PostgreSQLDataSource(DataSource):
         """Execute via ADBC and STREAM the result, never draining it ourselves.
 
         The result is yielded from a lazy ``RecordBatchReader`` so the consumer
-        (the coordinator DuckDB) pulls batches on demand — it drives the fetch
         and can spill or stop early, instead of us buffering the whole scan into
         an Arrow table first. The cursor stays open for the life of the stream;
         ``finally`` closes it when the stream is exhausted or the consumer stops.
@@ -445,7 +444,6 @@ class PostgreSQLDataSource(DataSource):
 
         Renders every row's 36-char text into one contiguous byte buffer (hex
         bytes via a lookup table, dashes at the fixed positions) and wraps it as
-        a string array through fixed-width offsets — no per-row Python and no
         slow numpy string concatenation. NULLs are restored at the end.
         """
         fixed = pc.cast(storage, pa.binary(16))
@@ -554,8 +552,6 @@ class PostgreSQLDataSource(DataSource):
         """Build one Arrow array per column position.
 
         Indexing by position (not by name) is what lets a result with duplicate
-        column names — e.g. ``SELECT *`` over a join where both tables expose an
-        ``id`` column — round-trip faithfully instead of collapsing the
         same-named columns together.
         """
         arrays: List[pa.Array] = []

@@ -35,6 +35,31 @@ class _SelectSource(StateModel):
     internal_prefix: str
     columns: List[str]
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        datasource: str,
+        schema_name: str,
+        table_name: str,
+        alias: Optional[str],
+        sql_qualifier: str,
+        internal_prefix: str,
+        columns: List[str],
+    ) -> "_SelectSource":
+        """Sanctioned fresh-construction path for _SelectSource.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            datasource=datasource,
+            schema_name=schema_name,
+            table_name=table_name,
+            alias=alias,
+            sql_qualifier=sql_qualifier,
+            internal_prefix=internal_prefix,
+            columns=columns,
+        )
+
     def has_column(self, column: str) -> bool:
         """Check if this table defines a column."""
         for existing in self.columns:
@@ -404,8 +429,10 @@ class QueryPreprocessor:
             columns.append(replacement.copy())
             return
         columns.append(self._build_column_expression(source, column))
+        # Naming record for one star-expanded column: its qualified internal name
+        # for the engine, and the plain column name the user sees.
         metadata.append(
-            ColumnMapping(
+            ColumnMapping.create(
                 internal_name=self._build_internal_name(source, column),
                 visible_name=column,
             )
@@ -504,7 +531,9 @@ class QueryPreprocessor:
         if alias_name:
             visible = alias_name
         internal = self._build_internal_name(source, column_name)
-        return ColumnMapping(
+        # Naming record for one explicit column reference: engine-facing internal
+        # name plus the visible name, which is the user alias when one was given.
+        return ColumnMapping.create(
             internal_name=internal,
             visible_name=visible,
             alias=alias_name,
@@ -558,7 +587,9 @@ class QueryPreprocessor:
             datasource, schema_name, table_name, alias
         )
         columns = self._column_names(table)
-        return _SelectSource(
+        # Resolved per-table metadata for star expansion, bundling the catalog
+        # identity with the SQL qualifier, internal prefix, and column names.
+        return _SelectSource.create(
             datasource=datasource,
             schema_name=schema_name,
             table_name=table_name,

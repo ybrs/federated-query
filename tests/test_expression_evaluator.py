@@ -18,8 +18,10 @@ from federated_query.plan.expressions import (
     CaseExpr,
     InList,
     BetweenExpression,
+    Extract,
     DataType,
 )
+import datetime
 
 
 def make_batch():
@@ -145,3 +147,59 @@ def test_unknown_function_rejected():
     func = FunctionCall(function_name="FROBNICATE", args=[col("id")])
     with pytest.raises(ExpressionEvaluationError):
         evaluate(func)
+
+
+def _substring(text, start, length=None):
+    """Build a SUBSTRING(text FROM start [FOR length]) call over constant bounds."""
+    args = [lit(text, DataType.VARCHAR), lit(start, DataType.INTEGER)]
+    if length is not None:
+        args.append(lit(length, DataType.INTEGER))
+    return FunctionCall(function_name="SUBSTRING", args=args)
+
+
+def test_substring_is_one_based():
+    """SUBSTRING positions are 1-based and inclusive."""
+    # The literal broadcasts across the standard batch, so every row is equal.
+    assert set(evaluate(_substring("abcdef", 1, 2))) == {"ab"}
+    assert set(evaluate(_substring("abcdef", 3, 2))) == {"cd"}
+
+
+def test_substring_start_at_or_below_one_clamps_to_string_start():
+    """A start <= 0 clamps to the string start, never a from-the-end Arrow slice."""
+    # SUBSTRING('abcdef' FROM 0) -> whole string (not the last char).
+    assert set(evaluate(_substring("abcdef", 0))) == {"abcdef"}
+    # A window reaching before position 1 keeps only the in-range chars.
+    assert set(evaluate(_substring("abcdef", -2, 5))) == {"ab"}
+    assert set(evaluate(_substring("abcdef", 0, 3))) == {"ab"}
+
+
+def test_substring_non_constant_bounds_raise():
+    """A per-row (column) position/length is unsupported and raises loudly."""
+    expr = FunctionCall(
+        function_name="SUBSTRING",
+        args=[lit("abc", DataType.VARCHAR), col("id")],
+    )
+    with pytest.raises(ExpressionEvaluationError):
+        evaluate(expr)
+
+
+def test_extract_dow_is_sunday_zero():
+    """EXTRACT(DOW) is Sunday=0..Saturday=6, matching SQL - not Arrow's Monday=0."""
+    batch = pa.RecordBatch.from_pydict(
+        {"d": pa.array([datetime.date(2026, 7, 5), datetime.date(2026, 7, 6)])}
+    )  # Sunday, Monday
+    expr = Extract(field="DOW", source=col("d"))
+    assert ExpressionEvaluator(batch).evaluate(expr).to_pylist() == [0, 1]
+
+
+def test_decimal_times_integer_overflow_widens_not_crashes():
+    """decimal(38) * int overflows precision 38; it widens to decimal256, no crash."""
+    batch = pa.RecordBatch.from_pydict(
+        {
+            "d": pa.array([2], pa.decimal128(38, 0)),
+            "i": pa.array([3], pa.int64()),
+        }
+    )
+    expr = BinaryOp(op=BinaryOpType.MULTIPLY, left=col("d"), right=col("i"))
+    result = ExpressionEvaluator(batch).evaluate(expr).to_pylist()
+    assert [int(v) for v in result] == [6]

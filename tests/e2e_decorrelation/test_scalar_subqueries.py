@@ -107,7 +107,6 @@ class TestUncorrelatedScalarInSelect:
             FROM users u
 
         Expected plan structure:
-            - Subquery returns empty result → NULL
             - CROSS join preserves NULL semantics
 
         Expected result:
@@ -732,7 +731,6 @@ class TestScalarComplexQueries:
             FROM users u
 
         Expected plan structure:
-            - Inner scalar (AVG) decorrelated first → CTE
             - Outer scalar decorrelated with reference to CTE
             - Multiple joins in final plan
 

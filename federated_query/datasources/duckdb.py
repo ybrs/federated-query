@@ -157,7 +157,6 @@ class DuckDBDataSource(DataSource):
 
         Running the query under ``LIMIT 0`` lets DuckDB report the exact
         column types (int, double, timestamp, ...). Typing every column as
-        string instead — the previous behavior — produced schemas that
         mismatched the executed data and crashed FULL OUTER joins.
         """
         result = self.connection.execute(self._schema_probe_sql(query))

@@ -388,3 +388,74 @@ def test_bind_order_by_alias(catalog_with_test_data):
     project = bound_plan.input
     assert isinstance(sort_node.sort_keys[0], type(project.expressions[0]))
     assert sort_node.sort_keys[0].column == "order_id"
+
+
+def test_group_by_alias_of_aggregate_is_rejected(catalog_with_test_data):
+    """GROUP BY naming an output alias that is an aggregate is invalid and raises."""
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = "SELECT count(*) AS c FROM testdb.public.users GROUP BY c"
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
+    with pytest.raises(BindingError):
+        binder.bind(plan)
+
+
+def test_group_by_output_alias_of_plain_column_is_allowed(catalog_with_test_data):
+    """GROUP BY may name a SELECT alias of a plain (non-aggregate) column."""
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = "SELECT age AS a, count(*) FROM testdb.public.users GROUP BY a"
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
+    assert binder.bind(plan) is not None
+
+
+def test_derived_column_alias_rejects_duplicate_output_names(catalog_with_test_data):
+    """A column-alias list over a subquery with duplicate output names must raise.
+
+    ``SELECT id, id`` yields two outputs both named ``id``; a positional rename
+    read by name would silently give one alias the wrong column, so it raises.
+    """
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = "SELECT y FROM (SELECT id, id FROM testdb.public.users) d(x, y)"
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
+    with pytest.raises(BindingError):
+        binder.bind(plan)
+
+
+def test_derived_column_alias_renames_distinct_outputs(catalog_with_test_data):
+    """A column-alias list renames a subquery's distinct outputs positionally."""
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = "SELECT c FROM (SELECT id, name FROM testdb.public.users) d(k, c)"
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
+    assert binder.bind(plan) is not None
+
+
+def test_cte_column_list_arity_mismatch_raises(catalog_with_test_data):
+    """A CTE column list must match the query's output arity, or it raises.
+
+    Too few names would silently drop trailing columns; too many would index
+    past the end - both are rejected with a clear BindingError.
+    """
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    too_few = "WITH t(a) AS (SELECT id, name FROM testdb.public.users) SELECT a FROM t"
+    plan = parser.parse_to_logical_plan(too_few, catalog_with_test_data)
+    with pytest.raises(BindingError):
+        binder.bind(plan)
+    too_many = (
+        "WITH t(a, b, c) AS (SELECT id, name FROM testdb.public.users) SELECT a FROM t"
+    )
+    plan = parser.parse_to_logical_plan(too_many, catalog_with_test_data)
+    with pytest.raises(BindingError):
+        binder.bind(plan)
+
+
+def test_cte_column_list_matching_arity_is_allowed(catalog_with_test_data):
+    """A CTE column list that matches the output arity renames and binds."""
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = "WITH t(a, b) AS (SELECT id, name FROM testdb.public.users) SELECT a, b FROM t"
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
+    assert binder.bind(plan) is not None

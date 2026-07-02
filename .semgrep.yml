@@ -1,0 +1,36 @@
+# Bare-init (FQ001) and create-needs-comment (FQ002) live in the flake8 plugin
+# lint/flake8_fedq.py, not here: both require counting the comment lines above a
+# construction and attributing a nested call to its enclosing statement, which
+# semgrep (comments are dropped in python mode, and generic mode cannot tell a
+# nested call from a top-level one) cannot express. This file keeps only the
+# codepoint rule, which semgrep generic mode does well across every file type.
+rules:
+  - id: no-codepoint-above-ff
+    languages: [generic]
+    severity: ERROR
+    message: >-
+      Character above U+00FF found. Only the single-byte range (codepoints
+      0-255, i.e. ASCII plus Latin-1) is allowed anywhere in this project.
+      Anything above U+00FF (em dash, arrows, box-drawing, smart quotes, CJK,
+      emoji, ...) is banned; replace it with an ASCII/Latin-1 equivalent.
+    options:
+      generic_ellipsis_max_span: 0
+    paths:
+      include:
+        - "*.py"
+        - "*.md"
+        - "*.txt"
+        - "*.rst"
+        - "*.yml"
+        - "*.yaml"
+        - "*.toml"
+        - "*.cfg"
+        - "*.ini"
+        - "*.sh"
+        - "*.sql"
+      exclude:
+        - "*.duckdb"
+        - "*.db"
+        - "*.log"
+    patterns:
+      - pattern-regex: "[^\\x00-\\xff]"

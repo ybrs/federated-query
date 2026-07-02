@@ -12,6 +12,7 @@ Every local operator in a plan runs its own small SQL statement over its
 registered Arrow inputs on an isolated cursor, so reuse stays safe.
 """
 
+from contextlib import contextmanager
 from typing import Dict, Iterator, Optional
 
 import duckdb
@@ -58,7 +59,6 @@ class MergeEngine:
         """Return a query's result schema without fetching its rows.
 
         The Arrow reader exposes its schema before any batch is pulled, so an
-        empty result (or a ``LIMIT 0``) still yields the correct column types —
         unlike reading the first batch, which an empty result never produces.
         """
         cursor = self._connection.cursor()
@@ -68,6 +68,26 @@ class MergeEngine:
             return cursor.execute(sql).to_arrow_reader().schema
         finally:
             cursor.close()
+
+    @contextmanager
+    def join_session(self):
+        """A single-cursor session for a join that buffers one side in DuckDB.
+
+        A hash join must read all of one side (the build) up front, and cross-
+        source dynamic filtering needs that side's DISTINCT keys before the other
+        side is fetched. Rather than draining the build into a Python Arrow table
+        (unbounded, unspillable), the session streams it into a DuckDB temp table
+        - which DuckDB owns and can spill - then computes DISTINCT and runs the
+        join over it. Temp tables are connection-local, so the build table, its
+        DISTINCT scan, and the join all run on this one cursor, which stays open
+        while the result reader is consumed and drops its temps on exit.
+        """
+        cursor = self._connection.cursor()
+        session = _MergeSession(cursor)
+        try:
+            yield session
+        finally:
+            session.close()
 
     def warmup(self) -> None:
         """Run a trivial join so the first real query pays no DuckDB setup cost.
@@ -87,3 +107,56 @@ class MergeEngine:
     def close(self) -> None:
         """Close the coordinator connection and release its resources."""
         self._connection.close()
+
+
+class _MergeSession:
+    """One cursor's worth of join state: buffered build tables plus streaming.
+
+    Created by MergeEngine.join_session. Everything runs on the single cursor so
+    a connection-local temp table is visible to the DISTINCT scan and the join.
+    """
+
+    def __init__(self, cursor):
+        """Capture the cursor and track temp tables to drop on close."""
+        self._cursor = cursor
+        self._temps = []
+
+    def materialize(self, name: str, reader: pa.RecordBatchReader) -> None:
+        """Stream an Arrow reader into a DuckDB temp table (DuckDB-owned, spillable).
+
+        DuckDB pulls the reader through the C data interface (no per-batch Python
+        loop) and holds the rows in its buffer manager, which spills under the
+        memory limit - unlike a Python-side Arrow table.
+        """
+        source = f"{name}_src"
+        self._cursor.register(source, reader)
+        self._cursor.execute(f"CREATE TEMP TABLE {name} AS SELECT * FROM {source}")
+        self._cursor.unregister(source)
+        self._temps.append(name)
+
+    def fetch(self, sql: str):
+        """Run a query on this cursor and return all rows (small result sets)."""
+        return self._cursor.execute(sql).fetchall()
+
+    def stream(
+        self, sql: str, inputs: Dict[str, object]
+    ) -> Iterator[pa.RecordBatch]:
+        """Register streaming inputs and yield the query's result batches lazily."""
+        for name, arrow_input in inputs.items():
+            self._cursor.register(name, arrow_input)
+        reader = self._cursor.execute(sql).to_arrow_reader()
+        for batch in reader:
+            yield batch
+
+    def close(self) -> None:
+        """Drop the session's temp tables and close its cursor.
+
+        The cursor is closed even if a DROP fails, so a failed cleanup cannot
+        leak a cursor (and its DuckDB worker threads); the DROP error still
+        propagates.
+        """
+        try:
+            for name in self._temps:
+                self._cursor.execute(f"DROP TABLE IF EXISTS {name}")
+        finally:
+            self._cursor.close()

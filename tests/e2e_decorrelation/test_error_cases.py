@@ -221,7 +221,6 @@ class TestUnsupportedPatterns:
 
     def test_lateral_subquery_handling(self, catalog, setup_test_data):
         """A user-written LATERAL parses, binds, and decorrelates to a
-        LateralJoin (dependent join) — the explicit correlation is kept and
         evaluated per outer row by the executing engine.
         """
         sql = """
@@ -829,7 +828,6 @@ class TestUnsupportedSubqueryShapes:
     ):
         """A non-equi correlated ``ORDER BY ... LIMIT`` scalar cannot become a
         per-key limit (a ``<``/``>`` correlation matches many groups), so it
-        falls back to a LATERAL join evaluated per outer row — never a wrong
         per-key answer.
         """
         sql = (

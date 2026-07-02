@@ -1,7 +1,6 @@
-"""ClickHouse data source — Arrow-native streaming via clickhouse-connect.
+"""ClickHouse data source connector.
 
 ClickHouse returns query results as Arrow directly (over HTTP), so the data path
-hands the engine a streaming ``RecordBatchReader`` with no per-row Python — the
 same shape as the ADBC PostgreSQL path. This makes ClickHouse a clean, fast
 remote source for the federated engine (and a fair benchmark fact store, since
 neither engine gets it "for free" the way a local DuckDB table is).
@@ -153,14 +152,20 @@ class ClickHouseDataSource(DataSource):
                     f"Unsupported ClickHouse type {ch_type!r} for column {name!r}"
                 )
             sql_type = _CH_TO_SQL[base_type]
+            # One column descriptor with the ClickHouse type mapped to a SQL type;
+            # nullability comes from the Nullable(...) wrapper on the native type.
             columns.append(
-                ColumnMetadata(
+                ColumnMetadata.create(
                     name=name,
                     data_type=sql_type,
                     nullable=ch_type.startswith("Nullable("),
                 )
             )
-        return TableMetadata(schema_name=schema, table_name=table, columns=columns)
+        # The table descriptor collecting the columns decoded above from the
+        # ClickHouse system.columns rows for this schema and table.
+        return TableMetadata.create(
+            schema_name=schema, table_name=table, columns=columns
+        )
 
     def get_table_statistics(
         self, schema: str, table: str

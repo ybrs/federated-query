@@ -23,10 +23,41 @@ from ..plan.expressions import (
     FunctionCall,
     Cast,
     CaseExpr,
+    Extract,
     InList,
     BetweenExpression,
 )
 from ..plan.arrow_types import arrow_type_for, is_renderable
+
+
+# EXTRACT(field FROM source) maps each field keyword to the Arrow temporal
+# kernel that reads it. Every kernel takes one temporal array and returns an
+# integer array, matching SQL EXTRACT's numeric result.
+# A 64-bit integer needs at most 19 decimal digits; used to size the decimal256
+# an integer operand is widened to for exact decimal x integer arithmetic.
+_INTEGER_DECIMAL_DIGITS = 19
+
+
+def _extract_dow(array: pa.Array) -> pa.Array:
+    """EXTRACT(DOW): Sunday=0 .. Saturday=6, matching SQL / DuckDB / PostgreSQL.
+
+    Arrow's day_of_week defaults to Monday=0; week_start=7 makes Sunday the 0.
+    """
+    return pc.day_of_week(array, count_from_zero=True, week_start=7)
+
+
+_EXTRACT_KERNELS = {
+    "YEAR": pc.year,
+    "MONTH": pc.month,
+    "DAY": pc.day,
+    "HOUR": pc.hour,
+    "MINUTE": pc.minute,
+    "SECOND": pc.second,
+    "QUARTER": pc.quarter,
+    "WEEK": pc.iso_week,
+    "DOW": _extract_dow,
+    "DOY": pc.day_of_year,
+}
 
 
 class ExpressionEvaluationError(Exception):
@@ -102,6 +133,7 @@ class ExpressionEvaluator:
             (FunctionCall, self._eval_function),
             (Cast, self._eval_cast),
             (CaseExpr, self._eval_case),
+            (Extract, self._eval_extract),
             (InList, self._eval_in_list),
             (BetweenExpression, self._eval_between),
         ]
@@ -142,7 +174,67 @@ class ExpressionEvaluator:
         kernel = self._binary_kernel(expr.op)
         left = self._eval(expr.left)
         right = self._eval(expr.right)
+        return self._apply_binary_kernel(expr.op, kernel, left, right)
+
+    def _apply_binary_kernel(self, op, kernel, left, right):
+        """Apply a binary kernel, widening decimals to decimal256 when they overflow.
+
+        Arrow rejects a decimal128 arithmetic result whose precision exceeds 38;
+        SQL engines fall back to a wider numeric. When two decimal operands would
+        overflow, both are cast to decimal256 (precision up to 76) so the value
+        is still computed EXACTLY - float would lose the last cent.
+        """
+        if op in _ARITHMETIC_KERNELS and self._decimal_would_overflow(left, right):
+            wide = kernel(self._to_decimal256(left), self._to_decimal256(right))
+            return self._narrow_decimal(wide)
         return kernel(left, right)
+
+    def _to_decimal256(self, value):
+        """Cast a decimal-or-integer operand to decimal256 for exact wide arithmetic.
+
+        A decimal keeps its precision and scale; an integer becomes a scale-0
+        decimal wide enough to hold it, so ``decimal * int`` also computes wide.
+        """
+        if pa.types.is_decimal(value.type):
+            return pc.cast(value, pa.decimal256(value.type.precision, value.type.scale))
+        return pc.cast(value, pa.decimal256(_INTEGER_DECIMAL_DIGITS, 0))
+
+    def _narrow_decimal(self, value):
+        """Cap a wide decimal result back to decimal128(38, scale).
+
+        The exact value was computed in decimal256; downstream consumers (the
+        DuckDB merge engine) accept only decimal128 (precision <= 38), so the
+        result is capped at 38 like DuckDB caps its own decimal arithmetic. A
+        value that genuinely needs > 38 digits raises rather than truncating.
+        """
+        return pc.cast(value, pa.decimal128(38, value.type.scale))
+
+    def _decimal_would_overflow(self, left, right) -> bool:
+        """Whether a decimal arithmetic op would exceed Arrow's decimal128 cap of 38.
+
+        Fires for decimal x decimal and decimal x integer (both computed exactly
+        in decimal256); a float operand is left alone, since Arrow promotes to
+        double there rather than overflowing a decimal.
+        """
+        if not self._is_decimal_or_int(left.type) or not self._is_decimal_or_int(
+            right.type
+        ):
+            return False
+        if not pa.types.is_decimal(left.type) and not pa.types.is_decimal(right.type):
+            return False
+        left_digits = self._decimal_digits(left.type)
+        right_digits = self._decimal_digits(right.type)
+        return left_digits + right_digits + 1 > 38
+
+    def _is_decimal_or_int(self, arrow_type) -> bool:
+        """Whether a type participates in exact decimal widening (decimal or int)."""
+        return pa.types.is_decimal(arrow_type) or pa.types.is_integer(arrow_type)
+
+    def _decimal_digits(self, arrow_type) -> int:
+        """Precision of a decimal type, or the digit budget of an integer type."""
+        if pa.types.is_decimal(arrow_type):
+            return arrow_type.precision
+        return _INTEGER_DECIMAL_DIGITS
 
     def _special_binary_handler(self, op: BinaryOpType):
         """Return a handler for operators that are not plain kernels."""
@@ -265,6 +357,16 @@ class ExpressionEvaluator:
             )
         return pc.cast(value, arrow_type_for(data_type))
 
+    def _eval_extract(self, expr: Extract) -> pa.Array:
+        """Evaluate EXTRACT(field FROM source) via the Arrow temporal kernel."""
+        source = self._broadcast(self._eval(expr.source))
+        kernel = _EXTRACT_KERNELS.get(expr.field.upper())
+        if kernel is None:
+            raise ExpressionEvaluationError(
+                f"Unsupported EXTRACT field: {expr.field}"
+            )
+        return kernel(source)
+
     def _eval_unary(self, expr: UnaryOp):
         """Evaluate NOT / IS NULL / IS NOT NULL / negation."""
         operand = self._broadcast(self._eval(expr.operand))
@@ -284,10 +386,44 @@ class ExpressionEvaluator:
             raise ExpressionEvaluationError(
                 f"Aggregate {expr.function_name} cannot be evaluated per-row"
             )
+        name = expr.function_name.upper()
+        if name in ("SUBSTRING", "SUBSTR"):
+            return self._eval_substring(expr)
         args = []
         for arg in expr.args:
             args.append(self._broadcast(self._eval(arg)))
-        return self._apply_function(expr.function_name.upper(), args)
+        return self._apply_function(name, args)
+
+    def _eval_substring(self, expr: FunctionCall) -> pa.Array:
+        """Evaluate SUBSTRING(s FROM start FOR length).
+
+        SQL positions are 1-based; Arrow's utf8_slice_codeunits takes a 0-based
+        [begin, stop) range. A start <= 0 (or a window reaching before position
+        1) is clamped to the string start, matching SQL - and never handed to
+        Arrow negative, which would count from the END and silently corrupt the
+        result. start/length must be constant.
+        """
+        text = self._broadcast(self._eval(expr.args[0]))
+        start = self._scalar_int(expr.args[1])
+        begin = max(start - 1, 0)
+        if len(expr.args) >= 3:
+            stop = max(start - 1 + self._scalar_int(expr.args[2]), 0)
+            return pc.utf8_slice_codeunits(text, begin, stop)
+        return pc.utf8_slice_codeunits(text, begin)
+
+    def _scalar_int(self, expr: Expression) -> int:
+        """A SUBSTRING position/length argument as a constant int.
+
+        Only constant bounds are supported; a per-row position/length (a column
+        or computed expression) raises loudly rather than crashing on a missing
+        scalar method or silently mis-slicing.
+        """
+        value = self._eval(expr)
+        if not isinstance(value, pa.Scalar):
+            raise ExpressionEvaluationError(
+                "SUBSTRING position and length must be constant integers"
+            )
+        return value.as_py()
 
     def _apply_function(self, name: str, args):
         """Apply a supported scalar function to evaluated arguments."""

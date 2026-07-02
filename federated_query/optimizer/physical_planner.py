@@ -93,6 +93,25 @@ class _JoinSides(StateModel):
     left_names: set
     right_names: set
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        left_aliases: set,
+        right_aliases: set,
+        left_names: set,
+        right_names: set,
+    ) -> "_JoinSides":
+        """Sanctioned fresh-construction path for _JoinSides.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            left_aliases=left_aliases,
+            right_aliases=right_aliases,
+            left_names=left_names,
+            right_names=right_names,
+        )
+
 
 class PhysicalPlanner:
     """Converts logical plans to physical plans."""
@@ -161,11 +180,20 @@ class PhysicalPlanner:
             inputs = []
             for child in node.inputs:
                 inputs.append(self._plan_node(child))
-            return PhysicalUnion(inputs=inputs, distinct=node.distinct)
+            # Concatenate the planned branch streams at execution, deduplicating
+            # rows when the operation requested DISTINCT.
+            # Lowered from a decorrelation-produced logical Union over its inputs.
+            return PhysicalUnion.create(inputs=inputs, distinct=node.distinct)
         if isinstance(node, Values):
-            return PhysicalValues(rows=node.rows, output_names=node.output_names)
+            # Emit the literal row tuples directly as an in-memory relation with
+            # the given output column names.
+            # Lowered from a logical Values row set produced by decorrelation.
+            return PhysicalValues.create(rows=node.rows, output_names=node.output_names)
         if isinstance(node, SubqueryScan):
-            return PhysicalAliasedRelation(
+            # Re-expose the input relation under a new correlation name so parent
+            # references resolve against the aliased scope at execution.
+            # Lowered from a logical SubqueryScan wrapping its input plan.
+            return PhysicalAliasedRelation.create(
                 input=self._plan_node(node.input), alias=node.alias
             )
         if isinstance(node, LateralJoin):
@@ -196,7 +224,10 @@ class PhysicalPlanner:
             raise ValueError("Cross-source LATERAL right side is not renderable")
         outer_alias = self._lateral_outer_alias(node)
         base_alias = base.alias if base.alias else base.table_name
-        return PhysicalLateralJoin(
+        # For each left row, run the rendered LATERAL query over the base
+        # relation reduced to the correlation domain, then join the results.
+        # Lowered from a cross-source logical LateralJoin (left plus right base).
+        return PhysicalLateralJoin.create(
             left=self._plan_node(node.left),
             left_name="lat_left",
             left_alias=outer_alias,
@@ -277,11 +308,17 @@ class PhysicalPlanner:
     def _plan_guard_node(self, node: LogicalPlanNode) -> PhysicalPlanNode:
         """Plan cardinality guard and per-key limit nodes."""
         if isinstance(node, SingleRowGuard):
-            return PhysicalSingleRowGuard(
+            # Enforce at most one input row per key group at execution, raising
+            # when a scalar-subquery source returns more than one.
+            # Lowered from a logical SingleRowGuard over its input.
+            return PhysicalSingleRowGuard.create(
                 input=self._plan_node(node.input), keys=node.keys
             )
         if isinstance(node, GroupedLimit):
-            return PhysicalGroupedLimit(
+            # Keep only the first rows within each key group at execution,
+            # ordered by the per-group sort keys.
+            # Lowered from a logical GroupedLimit over its input.
+            return PhysicalGroupedLimit.create(
                 input=self._plan_node(node.input),
                 keys=node.keys,
                 limit=node.limit,
@@ -297,7 +334,10 @@ class PhysicalPlanner:
         if datasource is None:
             raise ValueError(f"Data source not found: {scan.datasource}")
 
-        return PhysicalScan(
+        # Push the projected columns, filters and any aggregation down to the
+        # owning source and stream the matching rows back as Arrow batches.
+        # Lowered from a logical Scan bound to a resolved datasource connection.
+        return PhysicalScan.create(
             datasource=scan.datasource,
             schema_name=scan.schema_name,
             table_name=scan.table_name,
@@ -321,7 +361,10 @@ class PhysicalPlanner:
     def _plan_filter(self, filter_node: Filter) -> PhysicalFilter:
         """Plan a filter node."""
         input_plan = self._plan_node(filter_node.input)
-        return PhysicalFilter(input=input_plan, predicate=filter_node.predicate)
+        # Evaluate the predicate against each input row at execution and drop
+        # the rows that do not satisfy it.
+        # Lowered from a logical Filter over its planned input.
+        return PhysicalFilter.create(input=input_plan, predicate=filter_node.predicate)
 
     def _plan_projection(self, projection: Projection) -> PhysicalPlanNode:
         """Plan a projection; window-bearing ones run in the merge engine."""
@@ -330,14 +373,20 @@ class PhysicalPlanner:
             # DISTINCT (incl. DISTINCT ON) over a window is rejected at parse by
             # _reject_distinct_window, so a window projection is never distinct
             # here - no distinct handling needed on this path.
-            return PhysicalWindow(
+            # Evaluate the window functions over their partitions and frames in
+            # the merge engine, appending the computed columns to each row.
+            # Lowered from a logical Projection that carries window expressions.
+            return PhysicalWindow.create(
                 input=input_plan,
                 expressions=projection.expressions,
                 output_names=projection.aliases,
             )
         if projection.distinct:
             self._propagate_distinct(input_plan)
-        return PhysicalProjection(
+        # Evaluate the projection expressions per input row at execution,
+        # optionally deduplicating on the DISTINCT (ON) keys.
+        # Lowered from a logical Projection over its planned input.
+        return PhysicalProjection.create(
             input=input_plan,
             expressions=projection.expressions,
             output_names=projection.aliases,
@@ -386,7 +435,12 @@ class PhysicalPlanner:
             input_plan.limit = limit.limit
             input_plan.offset = limit.offset
             return input_plan
-        return PhysicalLimit(input=input_plan, limit=limit.limit, offset=limit.offset)
+        # Stop pulling from the input once offset rows are skipped and limit
+        # rows have been emitted at execution.
+        # Lowered from a logical Limit that could not fold into a pushed set op.
+        return PhysicalLimit.create(
+            input=input_plan, limit=limit.limit, offset=limit.offset
+        )
 
     def _plan_sort(self, sort: Sort) -> PhysicalPlanNode:
         """Plan a sort node."""
@@ -410,7 +464,10 @@ class PhysicalPlanner:
             input_plan.order_by_nulls = sort.nulls_order
             return input_plan
 
-        return PhysicalSort(
+        # Materialize the input and order it by the sort keys at execution,
+        # honoring each key's direction and null placement.
+        # Lowered from a logical Sort whose input is not a pushdown target.
+        return PhysicalSort.create(
             input=input_plan,
             sort_keys=sort.sort_keys,
             ascending=sort.ascending,
@@ -422,7 +479,10 @@ class PhysicalPlanner:
         input_plan = self._plan_node(aggregate.input)
         if isinstance(input_plan, PhysicalRemoteJoin):
             return self._plan_remote_join_aggregate(aggregate, input_plan)
-        return PhysicalHashAggregate(
+        # Build a hash table keyed by the grouping columns and accumulate the
+        # aggregate states per group at execution.
+        # Lowered from a logical Aggregate whose input is not a remote join.
+        return PhysicalHashAggregate.create(
             input=input_plan,
             group_by=aggregate.group_by,
             aggregates=aggregate.aggregates,
@@ -450,7 +510,10 @@ class PhysicalPlanner:
     def _plan_explain(self, explain: Explain) -> PhysicalExplain:
         """Plan an explain node."""
         child_plan = self._plan_node(explain.input)
-        return PhysicalExplain(child=child_plan, format=explain.format)
+        # Render the planned child tree as EXPLAIN output in the requested
+        # format at execution instead of running it.
+        # Lowered from a logical Explain wrapping its input plan.
+        return PhysicalExplain.create(child=child_plan, format=explain.format)
 
     def _plan_cte(self, cte: CTE) -> PhysicalPlanNode:
         """Plan a CTE that single-source pushdown declined (it spans sources).
@@ -466,7 +529,10 @@ class PhysicalPlanner:
 
     def _plan_cross_source_cte(self, cte: CTE) -> PhysicalPlanNode:
         """Materialize the body once; plan the child with the name in scope."""
-        producer = PhysicalCTE(
+        # Materialize the CTE body once at execution and expose it under its
+        # name so every reference reads the same buffered result.
+        # Lowered from a non-recursive cross-source logical CTE's body plan.
+        producer = PhysicalCTE.create(
             name=cte.name,
             body=self._plan_node(cte.cte_plan),
             column_names=cte.column_names,
@@ -489,7 +555,10 @@ class PhysicalPlanner:
         producer = self._cte_producers.get(node.name)
         if producer is None:
             raise ValueError(f"CTE '{node.name}' is not in scope")
-        return PhysicalCTEScan(producer=producer, alias=node.alias)
+        # Read the already-materialized CTE producer's buffered rows under the
+        # reference's alias at execution.
+        # Lowered from a logical CTERef resolved to its in-scope producer.
+        return PhysicalCTEScan.create(producer=producer, alias=node.alias)
 
     def _plan_recursive_cte_merge(self, cte: CTE) -> PhysicalPlanNode:
         """Run a cross-source recursive CTE wholly in the merge engine.
@@ -510,7 +579,12 @@ class PhysicalPlanner:
             raise ValueError(
                 f"Recursive CTE '{cte.name}' is not renderable for the merge engine"
             )
-        return PhysicalCTEMergeQuery(sql=sql, inputs=inputs, output_names=cte.schema())
+        # Run the rendered WITH RECURSIVE over the materialized base relations
+        # in the in-memory merge engine so the fixpoint iterates in one engine.
+        # Lowered from a recursive cross-source logical CTE.
+        return PhysicalCTEMergeQuery.create(
+            sql=sql, inputs=inputs, output_names=cte.schema()
+        )
 
     def _collect_base_scans(self, node: LogicalPlanNode) -> List[Scan]:
         """Collect every base ``Scan`` in a subtree (CTE references excluded)."""
@@ -553,7 +627,10 @@ class PhysicalPlanner:
         if not join_keys:
             return None
         left_keys, right_keys = self._orient_join_keys(join_keys, join)
-        hash_join = PhysicalHashJoin(
+        # Build a hash table on one side's equi-keys and probe it with the
+        # other side at execution, emitting matched (and outer) rows.
+        # Lowered from a logical Join whose condition yields equi-join keys.
+        hash_join = PhysicalHashJoin.create(
             left=left_plan,
             right=right_plan,
             join_type=join.join_type,
@@ -568,7 +645,10 @@ class PhysicalPlanner:
         self, join: Join, left_plan: PhysicalPlanNode, right_plan: PhysicalPlanNode
     ) -> PhysicalNestedLoopJoin:
         """Fall back to a nested-loop join (no equi-keys, or no join condition)."""
-        return PhysicalNestedLoopJoin(
+        # Evaluate the join condition for every left/right row pair at
+        # execution, the general fallback when no equi-keys exist.
+        # Lowered from a logical Join with no usable equi-join keys.
+        return PhysicalNestedLoopJoin.create(
             left=left_plan,
             right=right_plan,
             join_type=join.join_type,
@@ -584,7 +664,6 @@ class PhysicalPlanner:
         """Build from the side with a selective equality filter (likely small).
 
         That side becomes the hash-table build input and the other becomes the
-        probe that the dynamic filter reduces. Only INNER joins are eligible —
         for SEMI/ANTI/outer joins the build side is fixed by semantics (the
         right input is the inner/built side). Defaults to the right input when
         neither (or both) side has such a filter.
@@ -653,7 +732,6 @@ class PhysicalPlanner:
     def _probe_side(
         self, hash_join: PhysicalHashJoin
     ) -> Tuple[PhysicalPlanNode, List[ColumnRef]]:
-        """Return the (probe node, probe keys) — the input that is not built."""
         if hash_join.build_side == "right":
             return hash_join.left, hash_join.left_keys
         return hash_join.right, hash_join.right_keys
@@ -672,7 +750,10 @@ class PhysicalPlanner:
         swapped when needed; pairs that cannot be placed by name keep
         their original orientation.
         """
-        sides = _JoinSides(
+        # Bundle each input's relation aliases and output column names so every
+        # equality's columns can be assigned to the correct join side.
+        # Built from the logical Join's left and right relation metadata.
+        sides = _JoinSides.create(
             left_aliases=self._relation_aliases(join.left),
             right_aliases=self._relation_aliases(join.right),
             left_names=set(join.left.schema()),
@@ -782,7 +863,10 @@ class PhysicalPlanner:
             order_keys = right_plan.order_by_keys
             order_asc = right_plan.order_by_ascending
             order_nulls = right_plan.order_by_nulls
-        return PhysicalRemoteJoin(
+        # Render both scans and their ON condition as one SQL join sent to the
+        # shared source, streaming only the joined result back.
+        # Lowered from a same-source logical Join over two plain scans.
+        return PhysicalRemoteJoin.create(
             left=left_plan,
             right=right_plan,
             join_type=join.join_type,
@@ -877,7 +961,10 @@ class PhysicalPlanner:
         connection = left_branch.datasource_connection
         if connection is None:
             return None
-        return PhysicalRemoteSetOp(
+        # Send both branches to the shared source as one UNION/INTERSECT/EXCEPT
+        # query at execution and stream the combined result back.
+        # Lowered from a logical SetOperation whose branches share one source.
+        return PhysicalRemoteSetOp.create(
             left=left_branch,
             right=right_branch,
             kind=set_op.kind,
@@ -950,8 +1037,14 @@ class PhysicalPlanner:
     ) -> PhysicalPlanNode:
         """Evaluate a set operation locally when it cannot be pushed down."""
         if set_op.kind == SetOpKind.UNION:
-            return PhysicalUnion(inputs=[left, right], distinct=set_op.distinct)
-        return PhysicalSetOperation(
+            # Concatenate both branch streams locally at execution, applying
+            # DISTINCT deduplication for UNION (not UNION ALL).
+            # Lowered from a logical UNION SetOperation that cannot be pushed down.
+            return PhysicalUnion.create(inputs=[left, right], distinct=set_op.distinct)
+        # Compute the INTERSECT/EXCEPT of the two branch streams locally at
+        # execution, deduplicating per the operation's DISTINCT flag.
+        # Lowered from a logical SetOperation that cannot be pushed down.
+        return PhysicalSetOperation.create(
             left=left, right=right, kind=set_op.kind, distinct=set_op.distinct
         )
 
