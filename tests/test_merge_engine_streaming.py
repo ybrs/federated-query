@@ -13,6 +13,7 @@ from federated_query.plan.physical import (
     PhysicalPlanNode,
     _MERGE_LEFT_RELATION,
     _MERGE_RIGHT_RELATION,
+    _streaming_reader,
 )
 from federated_query.plan.logical import JoinType
 
@@ -62,31 +63,30 @@ def _make_join(build_node, probe_node) -> PhysicalHashJoin:
 
 
 def test_probe_input_is_a_streaming_reader_not_a_table():
-    """The probe must be registered as a streaming reader, not a pa.Table."""
+    """The probe side is exposed as a streaming reader, not a materialized table."""
     schema = pa.schema([("file_id", pa.int64())])
-    build = _CountingNode(out_schema=schema, batch_count=1)
     probe = _CountingNode(out_schema=schema, batch_count=5)
-    join = _make_join(build, probe)
 
-    inputs = join._merge_inputs(list(build.execute()))
-    probe_input = inputs[_MERGE_RIGHT_RELATION]
+    reader = _streaming_reader(probe)
 
-    assert isinstance(probe_input, pa.RecordBatchReader)
-    assert not isinstance(probe_input, pa.Table)
+    assert isinstance(reader, pa.RecordBatchReader)
+    assert not isinstance(reader, pa.Table)
 
 
-def test_building_inputs_does_not_drain_the_probe():
-    """Constructing the merge inputs must not fully consume the probe stream."""
+def test_streaming_the_probe_does_not_drain_it_upfront():
+    """Exposing the probe as a reader must not fully consume its stream.
+
+    The join hands this reader to DuckDB, which pulls it lazily; building the
+    reader only peeks one batch to learn the schema.
+    """
     schema = pa.schema([("file_id", pa.int64())])
-    build = _CountingNode(out_schema=schema, batch_count=1)
     probe = _CountingNode(out_schema=schema, batch_count=5)
-    join = _make_join(build, probe)
 
-    inputs = join._merge_inputs(list(build.execute()))
+    reader = _streaming_reader(probe)
 
-    # The probe has 5 batches; building inputs must not have pulled them all.
+    # The probe has 5 batches; exposing the reader must not have pulled them all.
     assert probe.pulled < 5
     # And the reader still yields every batch when DuckDB actually pulls it.
-    drained = list(inputs[_MERGE_RIGHT_RELATION])
+    drained = list(reader)
     assert len(drained) == 5
     assert probe.pulled == 5

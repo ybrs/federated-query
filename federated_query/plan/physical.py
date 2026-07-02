@@ -1380,53 +1380,94 @@ class PhysicalHashJoin(PhysicalPlanNode):
     def _execute_inner_merge(self, engine) -> Iterator[pa.RecordBatch]:
         """Run an INNER equi-join through the DuckDB merge engine.
 
-        The build side is materialized once (its keys feed the G9 dynamic probe
-        filter, and a hash join must read all build rows anyway). The output is
-        rendered from the actual materialized input schemas, so its column names
-        and types match the row-at-a-time path the engine relies on. The result
-        streams back from DuckDB.
+        The build side is streamed into a DuckDB temp table (DuckDB-owned and
+        spillable) rather than drained into a Python Arrow table. DuckDB then
+        computes the build's DISTINCT keys, which are pushed into the probe as a
+        dynamic filter (semi-join reduction); the probe streams and DuckDB joins
+        it against the buffered build, and the result streams back.
         """
-        build_batches = self._materialize_build()
-        if not build_batches:
-            return iter(())
-        self._reduce_probe_from_build(build_batches)
-        inputs = self._merge_inputs(build_batches)
-        left_schema = inputs[_MERGE_LEFT_RELATION].schema
-        right_schema = inputs[_MERGE_RIGHT_RELATION].schema
-        sql = self._join_sql(left_schema, right_schema)
-        return engine.run(sql, inputs)
+        build_node, probe_node, build_keys, probe_keys = self._build_probe_sides()
+        build_rel, probe_rel = self._merge_relation_names()
+        with engine.join_session() as session:
+            build_reader = _streaming_reader(build_node)
+            build_schema = build_reader.schema
+            session.materialize(build_rel, build_reader)
+            self._reduce_probe_via_distinct(
+                session, build_rel, build_node, build_keys, probe_node, probe_keys
+            )
+            probe_reader = _streaming_reader(probe_node)
+            sql = self._inner_join_sql(build_schema, probe_reader.schema)
+            yield from session.stream(sql, {probe_rel: probe_reader})
+
+    def _merge_relation_names(self):
+        """(build_relation, probe_relation) names, keeping self.left as in_left."""
+        if self.build_side == "right":
+            return _MERGE_RIGHT_RELATION, _MERGE_LEFT_RELATION
+        return _MERGE_LEFT_RELATION, _MERGE_RIGHT_RELATION
+
+    def _inner_join_sql(self, build_schema, probe_schema) -> str:
+        """Render the join SELECT with left/right schemas in self.left/right order."""
+        if self.build_side == "right":
+            return self._join_sql(probe_schema, build_schema)
+        return self._join_sql(build_schema, probe_schema)
+
+    def _reduce_probe_via_distinct(
+        self, session, build_rel, build_node, build_keys, probe_node, probe_keys
+    ) -> None:
+        """Push the build's DuckDB-computed DISTINCT keys into the probe (reduction).
+
+        An INNER join only emits probe rows whose key matches a build key, so
+        constraining the probe to those keys drops no result row and avoids
+        fetching unmatched rows from the probe's (often remote) source.
+        """
+        keys = self._distinct_keys_via_engine(session, build_rel, build_node, build_keys)
+        if keys is None:
+            return
+        if probe_node.apply_dynamic_filter(probe_keys, keys):
+            _LOGGER.debug("dynamic filter applied to probe: %d keys", len(keys))
+
+    def _distinct_keys_via_engine(
+        self, session, build_rel, build_node, build_keys
+    ) -> Optional[List[tuple]]:
+        """Distinct non-NULL build-key tuples from the buffered build, or None.
+
+        DuckDB computes the DISTINCT over the (spillable) build temp table; only
+        the key set - capped, and pulled to Python solely to build the probe's IN
+        filter - crosses back. None when empty or above the cap.
+        """
+        columns = self._build_key_columns(build_node, build_keys)
+        rows = session.fetch(self._distinct_keys_sql(build_rel, columns))
+        if not _within_dynamic_filter_cap(len(rows)):
+            return None
+        return rows
+
+    def _build_key_columns(self, build_node, build_keys) -> List[str]:
+        """Physical column names of the build's join keys in its temp table."""
+        aliases = build_node.column_aliases()
+        columns = []
+        for key in build_keys:
+            columns.append(_physical_column_name(key, aliases or {}))
+        return columns
+
+    def _distinct_keys_sql(self, build_rel: str, columns: List[str]) -> str:
+        """SELECT DISTINCT of the key columns, non-NULL, capped one past the limit."""
+        quoted = []
+        for column in columns:
+            quoted.append(f'"{column}"')
+        not_null = []
+        for name in quoted:
+            not_null.append(f"{name} IS NOT NULL")
+        limit = _DYNAMIC_FILTER_MAX_KEYS + 1
+        return (
+            f"SELECT DISTINCT {', '.join(quoted)} FROM {build_rel} "
+            f"WHERE {' AND '.join(not_null)} LIMIT {limit}"
+        )
 
     def _build_probe_sides(self):
         """Return (build_node, probe_node, build_keys, probe_keys) per build_side."""
         if self.build_side == "right":
             return self.right, self.left, self.right_keys, self.left_keys
         return self.left, self.right, self.left_keys, self.right_keys
-
-    def _materialize_build(self) -> List[pa.RecordBatch]:
-        """Read the build side fully into a list of batches."""
-        build_node = self._build_probe_sides()[0]
-        batches = []
-        for batch in build_node.execute():
-            batches.append(batch)
-        return batches
-
-    def _reduce_probe_from_build(self, build_batches: List[pa.RecordBatch]) -> None:
-        """Push the build side's distinct keys into the probe as an IN filter.
-
-        Semi-join reduction: an INNER join only emits probe rows whose key
-        matches a build key, so constraining the probe to those keys is safe and
-        avoids fetching unmatched rows (the win for a remote probe). Limited to
-        INNER joins; the distinct-key set is computed vectorized and skipped when
-        empty or above the cap, so an over-cap build pays no per-row Python cost.
-        """
-        if self.join_type != JoinType.INNER:
-            return
-        build_node, probe_node, build_keys, probe_keys = self._build_probe_sides()
-        value_tuples = self._distinct_build_keys(build_batches, build_node, build_keys)
-        if value_tuples is None:
-            return
-        if probe_node.apply_dynamic_filter(probe_keys, value_tuples):
-            _LOGGER.debug("dynamic filter applied to probe: %d keys", len(value_tuples))
 
     def _distinct_build_keys(
         self, build_batches: List[pa.RecordBatch], build_node, build_keys
@@ -1455,29 +1496,6 @@ class PhysicalHashJoin(PhysicalPlanNode):
             key_tables.append(pa.table(arrays, names=names))
         combined = pa.concat_tables(key_tables)
         return combined.drop_null().group_by(names).aggregate([])
-
-    def _merge_inputs(self, build_batches: List[pa.RecordBatch]) -> Dict[str, object]:
-        """Map self.left/self.right to the DuckDB relations under stable names.
-
-        ``self.left`` always registers as the left relation and ``self.right``
-        as the right, regardless of which side is built, so the output column
-        order does not depend on the build/probe choice. The build side is
-        already materialized (a hash join must read all build rows, and its keys
-        feed the G9 probe filter); the probe side is handed to DuckDB as a lazy
-        streaming reader and is never drained into a table by us.
-        """
-        build_node, probe_node, _, _ = self._build_probe_sides()
-        build_table = _table_from_batches(build_batches, build_node.schema())
-        probe_reader = _streaming_reader(probe_node)
-        if self.build_side == "right":
-            return {
-                _MERGE_LEFT_RELATION: probe_reader,
-                _MERGE_RIGHT_RELATION: build_table,
-            }
-        return {
-            _MERGE_LEFT_RELATION: build_table,
-            _MERGE_RIGHT_RELATION: probe_reader,
-        }
 
     def _join_sql(self, left_schema: pa.Schema, right_schema: pa.Schema) -> str:
         """Render the join SELECT for this join type over the registered relations."""
