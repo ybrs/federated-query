@@ -302,3 +302,24 @@ def test_correlated_non_equality_through_aggregate_uses_lateral(catalog):
         "WHERE o.user_id > u.id) AS total FROM pg.users u",
     )
     assert len(find_all(plan, LateralJoin)) == 1
+
+
+def test_scalar_correlated_on_same_named_keys_groups_by_both(catalog):
+    """Two correlation keys sharing a bare name (from different inner tables) must
+    each become a grouping key, not be deduped by bare name into one."""
+    plan = decorrelate(
+        catalog,
+        "SELECT o.amount, "
+        "(SELECT count(*) FROM pg.users u, pg.orders o2 "
+        " WHERE u.id = o.user_id AND o2.id = o.id) AS n "
+        "FROM pg.orders o",
+    )
+    aggregates = find_all(plan, Aggregate)
+    assert len(aggregates) == 1
+    keyed = set()
+    for key in aggregates[0].group_by:
+        if isinstance(key, ColumnRef):
+            keyed.add((key.table, key.column))
+    # Both u.id and o2.id are grouping keys, distinguished by qualifier.
+    assert ("u", "id") in keyed
+    assert ("o2", "id") in keyed
