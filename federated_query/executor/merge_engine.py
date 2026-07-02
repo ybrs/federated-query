@@ -149,7 +149,14 @@ class _MergeSession:
             yield batch
 
     def close(self) -> None:
-        """Drop the session's temp tables and close its cursor."""
-        for name in self._temps:
-            self._cursor.execute(f"DROP TABLE IF EXISTS {name}")
-        self._cursor.close()
+        """Drop the session's temp tables and close its cursor.
+
+        The cursor is closed even if a DROP fails, so a failed cleanup cannot
+        leak a cursor (and its DuckDB worker threads); the DROP error still
+        propagates.
+        """
+        try:
+            for name in self._temps:
+                self._cursor.execute(f"DROP TABLE IF EXISTS {name}")
+        finally:
+            self._cursor.close()

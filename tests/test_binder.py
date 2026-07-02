@@ -430,3 +430,32 @@ def test_derived_column_alias_renames_distinct_outputs(catalog_with_test_data):
     sql = "SELECT c FROM (SELECT id, name FROM testdb.public.users) d(k, c)"
     plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
     assert binder.bind(plan) is not None
+
+
+def test_cte_column_list_arity_mismatch_raises(catalog_with_test_data):
+    """A CTE column list must match the query's output arity, or it raises.
+
+    Too few names would silently drop trailing columns; too many would index
+    past the end - both are rejected with a clear BindingError.
+    """
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    too_few = "WITH t(a) AS (SELECT id, name FROM testdb.public.users) SELECT a FROM t"
+    plan = parser.parse_to_logical_plan(too_few, catalog_with_test_data)
+    with pytest.raises(BindingError):
+        binder.bind(plan)
+    too_many = (
+        "WITH t(a, b, c) AS (SELECT id, name FROM testdb.public.users) SELECT a FROM t"
+    )
+    plan = parser.parse_to_logical_plan(too_many, catalog_with_test_data)
+    with pytest.raises(BindingError):
+        binder.bind(plan)
+
+
+def test_cte_column_list_matching_arity_is_allowed(catalog_with_test_data):
+    """A CTE column list that matches the output arity renames and binds."""
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = "WITH t(a, b) AS (SELECT id, name FROM testdb.public.users) SELECT a, b FROM t"
+    plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
+    assert binder.bind(plan) is not None

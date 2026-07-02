@@ -1453,7 +1453,9 @@ class PhysicalHashJoin(PhysicalPlanNode):
         """SELECT DISTINCT of the key columns, non-NULL, capped one past the limit."""
         quoted = []
         for column in columns:
-            quoted.append(f'"{column}"')
+            # Quote via the sqlglot emitter so a name containing an embedded quote
+            # is escaped, not injected raw into the SQL text.
+            quoted.append(exp.to_identifier(column, quoted=True).sql(dialect="duckdb"))
         not_null = []
         for name in quoted:
             not_null.append(f"{name} IS NOT NULL")

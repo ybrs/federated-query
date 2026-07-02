@@ -654,7 +654,16 @@ class Binder:
         return Table.create(name=cte.name, columns=columns)
 
     def _rename_columns(self, names: List[str], columns: List[Column]) -> List[Column]:
-        """Re-label output columns with an explicit CTE column list."""
+        """Re-label output columns with an explicit CTE column list.
+
+        The list must match the query's output arity; a mismatch would otherwise
+        silently drop trailing columns or index past the end, so it raises.
+        """
+        if len(names) != len(columns):
+            raise BindingError(
+                f"CTE column list has {len(names)} names but the query returns "
+                f"{len(columns)} columns"
+            )
         renamed = []
         for index in range(len(names)):
             data_type = columns[index].data_type

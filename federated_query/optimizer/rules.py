@@ -421,15 +421,22 @@ class PredicatePushdownRule(OptimizationRule):
 
     def _assemble_pushed_join(self, join, groups):
         """Rebuild the join with side conjuncts pushed and equi keys folded in."""
-        condition = self._fold_equi_conjuncts(join.condition, groups["equi"])
+        equi = groups["equi"]
+        residual = groups["residual"]
+        if join.natural or join.using is not None:
+            # A NATURAL/USING join renders with no ON condition, so an equi folded
+            # into join.condition would be silently dropped. Keep those equalities
+            # as a residual filter above the join instead.
+            residual = residual + equi
+            equi = []
         new_join = join.model_copy(
             update={
                 "left": self._push_side(join.left, groups["left"]),
                 "right": self._push_side(join.right, groups["right"]),
-                "condition": condition,
+                "condition": self._fold_equi_conjuncts(join.condition, equi),
             }
         )
-        return self._wrap_residual(new_join, groups["residual"])
+        return self._wrap_residual(new_join, residual)
 
     def _push_side(self, side, conjuncts):
         """Push a group of one-sided conjuncts into a join input, then optimize it."""

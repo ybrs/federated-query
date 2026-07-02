@@ -132,6 +132,40 @@ class TestPredicatePushdown:
         assert len(joins) == 1
         assert joins[0].using == ["id"]
 
+    def test_cross_side_equality_not_folded_into_using_join(self):
+        """A WHERE cross-side equality over a USING join stays a residual filter.
+
+        Folding it into join.condition would be dropped when the join renders as
+        USING (no ON clause), silently losing the predicate and returning rows a
+        real engine would filter out.
+        """
+        left = Scan(
+            datasource="d", schema_name="public", table_name="users",
+            columns=["id", "v"],
+        )
+        right = Scan(
+            datasource="d", schema_name="public", table_name="orders",
+            columns=["id", "w"],
+        )
+        join = Join(
+            left=left, right=right, join_type=JoinType.INNER,
+            condition=None, using=["id"],
+        )
+        predicate = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef(table="users", column="v", data_type=DataType.INTEGER),
+            right=ColumnRef(table="orders", column="w", data_type=DataType.INTEGER),
+        )
+        result = PredicatePushdownRule().apply(Filter(input=join, predicate=predicate))
+
+        joins = [node for node in _walk(result) if isinstance(node, Join)]
+        filters = [node for node in _walk(result) if isinstance(node, Filter)]
+        assert len(joins) == 1
+        assert joins[0].using == ["id"]
+        assert joins[0].condition is None
+        assert len(filters) == 1
+        assert filters[0].predicate == predicate
+
     def test_push_filter_through_project(self):
         """Test pushing filter through projection."""
         scan = Scan(
