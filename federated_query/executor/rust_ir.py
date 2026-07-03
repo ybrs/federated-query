@@ -34,6 +34,7 @@ from ..plan.physical import (
     PhysicalHashJoin,
     PhysicalProjection,
     PhysicalRemoteQuery,
+    PhysicalRemoteSetOp,
     PhysicalScan,
     PhysicalSort,
     PhysicalValues,
@@ -140,7 +141,7 @@ def raw_scan_spec(node):
     """
     if isinstance(node, PhysicalScan):
         return {"raw_sql": node._render_source_sql()}
-    renderer = getattr(node, "_sql", None)
+    renderer = getattr(node, "_sql", None) or getattr(node, "_build_query", None)
     if renderer is None:
         raise UnsupportedIR(f"{type(node).__name__} does not render source SQL")
     return {"raw_sql": renderer()}
@@ -648,6 +649,7 @@ def _side_column(relation, name, alias):
 _NODE_EMITTERS = {
     PhysicalRemoteQuery: _emit_source,
     PhysicalScan: _emit_source,
+    PhysicalRemoteSetOp: _emit_source,
     PhysicalHashJoin: _emit_join,
     PhysicalProjection: _emit_projection,
     PhysicalHashAggregate: _emit_aggregate,
