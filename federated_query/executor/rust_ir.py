@@ -305,16 +305,36 @@ def _projection_items(expressions, names, input_name, aliases):
 
 
 def _emit_aggregate(node, ctx):
-    """A GROUP BY over its single input, as an `aggregate` fragment."""
-    if node.grouping_sets:
-        raise UnsupportedIR("GROUPING SETS/ROLLUP/CUBE not yet supported")
+    """A GROUP BY (or GROUPING SETS) over its single input, as an `aggregate`
+    fragment."""
     child = _emit(node.input, ctx)
     aliases = node.input.column_aliases()
-    group_by = _serialize_group_by(node.group_by, aliases)
-    select = _aggregate_select(node.aggregates, node.output_names, aliases)
     fragment = ctx.names.fragment()
-    ctx.fragments[fragment] = {"kind": "aggregate", "select": select, "group_by": group_by}
+    ctx.fragments[fragment] = _aggregate_fragment(node, aliases)
     return _merge_step(ctx, fragment, {"in_0": child})
+
+
+def _aggregate_fragment(node, aliases):
+    """Build the aggregate fragment: select list, group-by, optional grouping sets."""
+    fragment = {
+        "kind": "aggregate",
+        "select": _aggregate_select(node.aggregates, node.output_names, aliases),
+        "group_by": _serialize_group_by(node.group_by, aliases),
+    }
+    if node.grouping_sets:
+        fragment["grouping_sets"] = _serialize_grouping_sets(node.grouping_sets, aliases)
+    return fragment
+
+
+def _serialize_grouping_sets(grouping_sets, aliases):
+    """Serialize each grouping set's expressions over the single input."""
+    result = []
+    for group_set in grouping_sets:
+        exprs = []
+        for expr in group_set:
+            exprs.append(_expr_over(expr, "in_0", aliases))
+        result.append(exprs)
+    return result
 
 
 def _serialize_group_by(group_by, aliases):
