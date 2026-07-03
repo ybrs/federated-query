@@ -25,6 +25,7 @@ from federated_query.optimizer import (
     LimitPushdownRule,
 )
 from federated_query.executor import Executor
+from tests.duckdb_tmp import duckdb_path
 
 
 class QueryCapturingDataSource(DuckDBDataSource):
@@ -53,7 +54,7 @@ class QueryCapturingDataSource(DuckDBDataSource):
 @pytest.fixture
 def setup_capturing_db():
     """Set up DuckDB with query capturing."""
-    config = {"database": ":memory:", "read_only": False}
+    config = {"path": duckdb_path(), "read_only": False}
     ds = QueryCapturingDataSource(name="testdb", config=config)
     ds.connect()
 

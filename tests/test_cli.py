@@ -6,6 +6,7 @@ from federated_query.cli.fedq import FedQRuntime, build_json_explain_table
 from federated_query.catalog import Catalog
 from federated_query.datasources.duckdb import DuckDBDataSource
 from federated_query.config import ExecutorConfig
+from tests.duckdb_tmp import duckdb_path
 
 
 def test_runtime_executes_simple_select():
@@ -13,7 +14,7 @@ def test_runtime_executes_simple_select():
     datasource = DuckDBDataSource(
         name="mem",
         config={
-            "path": ":memory:",
+            "path": duckdb_path(),
             "read_only": False,
         },
     )

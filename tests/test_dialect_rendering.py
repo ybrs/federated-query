@@ -9,6 +9,7 @@ from federated_query.datasources.clickhouse import ClickHouseDataSource
 from federated_query.datasources.duckdb import DuckDBDataSource
 from federated_query.datasources.postgresql import PostgreSQLDataSource
 from federated_query.plan.physical import to_source_sql
+from tests.duckdb_tmp import duckdb_path
 
 
 def test_each_source_declares_its_render_dialect():
@@ -20,7 +21,7 @@ def test_each_source_declares_its_render_dialect():
 
 def test_to_source_sql_transpiles_functions_for_duckdb():
     """Postgres-form aggregate names transpile to DuckDB's spelling."""
-    duck = DuckDBDataSource(name="d", config={"database": ":memory:"})
+    duck = DuckDBDataSource(name="d", config={"path": duckdb_path()})
     postgres_sql = 'SELECT STRING_AGG(s, \',\') AS a FROM "main"."t"'
     native = to_source_sql(duck, postgres_sql)
     assert "LISTAGG" in native
@@ -29,7 +30,7 @@ def test_to_source_sql_transpiles_functions_for_duckdb():
 
 def test_to_source_sql_transpiles_tablesample_for_duckdb():
     """Postgres TABLESAMPLE (a bare count) becomes DuckDB's PERCENT form."""
-    duck = DuckDBDataSource(name="d", config={"database": ":memory:"})
+    duck = DuckDBDataSource(name="d", config={"path": duckdb_path()})
     postgres_sql = 'SELECT a FROM "main"."t" TABLESAMPLE BERNOULLI (10)'
     native = to_source_sql(duck, postgres_sql)
     assert "PERCENT" in native

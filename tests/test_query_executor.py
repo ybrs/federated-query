@@ -11,6 +11,7 @@ from federated_query.optimizer import PhysicalPlanner, RuleBasedOptimizer
 from federated_query.parser import Binder, Parser
 from federated_query.processor import QueryExecutor as PipelineExecutor
 from federated_query.processor import StarExpansionProcessor
+from tests.duckdb_tmp import duckdb_path
 
 _CREATE_USERS_SQL = """
 CREATE TABLE users (
@@ -30,7 +31,7 @@ def _create_duckdb_catalog() -> Tuple[Catalog, DuckDBDataSource]:
     """Create a catalog with an in-memory DuckDB datasource."""
     datasource = DuckDBDataSource(
         name="testdb",
-        config={"path": ":memory:", "read_only": False},
+        config={"path": duckdb_path(), "read_only": False},
     )
     datasource.connect()
     datasource.connection.execute(_CREATE_USERS_SQL)

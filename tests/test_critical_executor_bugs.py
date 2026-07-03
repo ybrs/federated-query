@@ -13,13 +13,14 @@ from federated_query.catalog import Catalog
 from federated_query.datasources.duckdb import DuckDBDataSource
 from federated_query.optimizer import PhysicalPlanner
 from federated_query.executor import Executor
+from tests.duckdb_tmp import duckdb_path
 
 
 @pytest.fixture
 def setup_two_datasources():
     """Set up two DuckDB datasources for testing joins."""
     config_customers = {
-        "database": ":memory:",
+        "path": duckdb_path(),
         "read_only": False,
     }
     ds_customers = DuckDBDataSource(name="db1", config=config_customers)
@@ -42,7 +43,7 @@ def setup_two_datasources():
     """)
 
     config_orders = {
-        "database": ":memory:",
+        "path": duckdb_path(),
         "read_only": False,
     }
     ds_orders = DuckDBDataSource(name="db2", config=config_orders)
@@ -80,7 +81,7 @@ def setup_two_datasources():
 def setup_single_datasource():
     """Set up a single DuckDB datasource for basic query tests."""
     config = {
-        "database": ":memory:",
+        "path": duckdb_path(),
         "read_only": False,
     }
     datasource = DuckDBDataSource(name="testdb", config=config)
@@ -627,7 +628,7 @@ class TestBug4FullJoinMissingRightRows:
                   and orphan order for customer 4 with NULL customer info.
         """
         config_customers = {
-            "database": ":memory:",
+            "path": duckdb_path(),
             "read_only": False,
         }
         ds_customers = DuckDBDataSource(name="db1", config=config_customers)
@@ -649,7 +650,7 @@ class TestBug4FullJoinMissingRightRows:
         """)
 
         config_orders = {
-            "database": ":memory:",
+            "path": duckdb_path(),
             "read_only": False,
         }
         ds_orders = DuckDBDataSource(name="db2", config=config_orders)
@@ -872,7 +873,7 @@ class TestBug5RightJoinMissingUnmatchedRows:
         (Orders for customers 2&3 with names, order for customer 4 with NULL name)
         """
         config_customers = {
-            "database": ":memory:",
+            "path": duckdb_path(),
             "read_only": False,
         }
         ds_customers = DuckDBDataSource(name="db1", config=config_customers)
@@ -894,7 +895,7 @@ class TestBug5RightJoinMissingUnmatchedRows:
         """)
 
         config_orders = {
-            "database": ":memory:",
+            "path": duckdb_path(),
             "read_only": False,
         }
         ds_orders = DuckDBDataSource(name="db2", config=config_orders)

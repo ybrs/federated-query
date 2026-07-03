@@ -11,6 +11,7 @@ import pytest
 from federated_query.catalog import Catalog
 from federated_query.datasources.duckdb import DuckDBDataSource
 from federated_query.model import StateModel
+from tests.duckdb_tmp import duckdb_path
 
 
 class ProxyingDuckDBDataSource(DuckDBDataSource):
@@ -123,7 +124,7 @@ def _seed_customers(cursor) -> None:
 
 
 def _build_datasource(name: str) -> QueryCapturingDataSource:
-    config = {"database": ":memory:", "read_only": False}
+    config = {"path": duckdb_path(), "read_only": False}
     ds = ProxyingDuckDBDataSource(name=name, config=config)
     ds.connect()
     return ds

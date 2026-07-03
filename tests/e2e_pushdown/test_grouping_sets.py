@@ -15,6 +15,7 @@ from federated_query.parser.errors import UnsupportedSQLError
 
 from tests.e2e_pushdown.conftest import _seed_customers, _seed_orders
 from tests.e2e_pushdown.helpers import build_runtime
+from tests.duckdb_tmp import duckdb_path
 
 SINGLE = "duckdb_primary.main.orders"
 
@@ -126,7 +127,7 @@ def test_cross_source_grouping_sets(multi_source_env):
         "FROM orders o JOIN customers c ON o.customer_id = c.customer_id "
         "GROUP BY ROLLUP (o.region)"
     )
-    reference = duckdb.connect(":memory:")
+    reference = duckdb.connect(duckdb_path())
     _seed_orders(reference)
     _seed_customers(reference)
 

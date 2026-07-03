@@ -14,6 +14,7 @@ import pytest
 
 from federated_query.processor.query_preprocessor import StarExpansionError
 from tests.e2e_pushdown.helpers import build_runtime
+from tests.duckdb_tmp import duckdb_path
 
 TABLE = "duckdb_primary.main.orders"
 
@@ -50,7 +51,7 @@ def _reference():
     """A DuckDB holding the same orders data as the single-source fixture."""
     from tests.e2e_pushdown.conftest import _seed_orders
 
-    connection = duckdb.connect(":memory:")
+    connection = duckdb.connect(duckdb_path())
     _seed_orders(connection)
     return connection
 
@@ -71,7 +72,7 @@ VALUES_CASES = [
 def test_values_source_standalone(single_source_env, federated_sql, reference_sql):
     """A standalone VALUES relation matches DuckDB."""
     runtime = build_runtime(single_source_env)
-    reference = duckdb.connect(":memory:")
+    reference = duckdb.connect(duckdb_path())
     assert _federated_rows(runtime, federated_sql) == _ground_truth_rows(
         reference, reference_sql
     )

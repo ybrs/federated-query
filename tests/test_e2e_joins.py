@@ -1,6 +1,5 @@
 """End-to-end tests for join queries."""
 
-import duckdb
 import pyarrow as pa
 from federated_query.catalog import Catalog
 from federated_query.catalog.schema import Schema, Table, Column, DataType
@@ -12,11 +11,16 @@ from federated_query.config.config import ExecutorConfig
 from federated_query.optimizer import RuleBasedOptimizer
 from federated_query.processor import QueryExecutor as PipelineExecutor
 from federated_query.processor import StarExpansionProcessor
+from tests.duckdb_tmp import duckdb_path
 
 
 def setup_test_db():
-    """Set up in-memory DuckDB with test data for joins."""
-    conn = duckdb.connect(":memory:")
+    """Create a file-backed DuckDB source populated with join test data."""
+    datasource = DuckDBDataSource(
+        name="testdb", config={"path": duckdb_path(), "read_only": False}
+    )
+    datasource.connect()
+    conn = datasource.connection
 
     conn.execute("""
         CREATE TABLE customers (
@@ -50,24 +54,14 @@ def setup_test_db():
             (104, 3, 75.0, 'Gadget')
     """)
 
-    return conn
+    return datasource
 
 
-def setup_catalog(conn):
-    """Set up catalog with test data source."""
+def setup_catalog(datasource):
+    """Set up catalog with the given data source."""
     catalog = Catalog()
-
-    config = {
-        "database": ":memory:",
-        "read_only": False,
-    }
-    datasource = DuckDBDataSource(name="testdb", config=config)
-    datasource.connection = conn
-    datasource._connected = True
-
     catalog.register_datasource(datasource)
     catalog.load_metadata()
-
     return catalog
 
 
@@ -92,8 +86,8 @@ def build_query_executor(catalog: Catalog) -> PipelineExecutor:
 
 def test_simple_inner_join():
     """Test simple INNER JOIN query."""
-    conn = setup_test_db()
-    catalog = setup_catalog(conn)
+    datasource = setup_test_db()
+    catalog = setup_catalog(datasource)
 
     sql = """
         SELECT c.name, o.order_id, o.amount
@@ -112,13 +106,13 @@ def test_simple_inner_join():
     assert "Bob" in names
     assert "Charlie" in names
 
-    conn.close()
+    datasource.disconnect()
 
 
 def test_join_with_where():
     """Test JOIN with WHERE clause."""
-    conn = setup_test_db()
-    catalog = setup_catalog(conn)
+    datasource = setup_test_db()
+    catalog = setup_catalog(datasource)
 
     sql = """
         SELECT c.name, o.amount
@@ -136,13 +130,13 @@ def test_join_with_where():
     amounts = [row.as_py() for row in result.column("amount")]
     assert all(amt > 100 for amt in amounts)
 
-    conn.close()
+    datasource.disconnect()
 
 
 def test_join_specific_columns():
     """Test JOIN selecting specific columns."""
-    conn = setup_test_db()
-    catalog = setup_catalog(conn)
+    datasource = setup_test_db()
+    catalog = setup_catalog(datasource)
 
     sql = """
         SELECT c.id, c.name, o.order_id
@@ -159,13 +153,13 @@ def test_join_specific_columns():
 
     assert result.schema.names == ["id", "name", "order_id"]
 
-    conn.close()
+    datasource.disconnect()
 
 
 def test_join_all_columns():
     """Test JOIN with SELECT *."""
-    conn = setup_test_db()
-    catalog = setup_catalog(conn)
+    datasource = setup_test_db()
+    catalog = setup_catalog(datasource)
 
     sql = """
         SELECT *
@@ -180,13 +174,13 @@ def test_join_all_columns():
     assert result.num_rows == 4
     assert result.num_columns == 7
 
-    conn.close()
+    datasource.disconnect()
 
 
 def test_parser_creates_join_plan():
     """Test that parser creates Join logical plan node."""
-    conn = setup_test_db()
-    catalog = setup_catalog(conn)
+    datasource = setup_test_db()
+    catalog = setup_catalog(datasource)
 
     sql = """
         SELECT c.name, o.amount
@@ -205,4 +199,4 @@ def test_parser_creates_join_plan():
     join_node = logical_plan.input
     assert join_node.condition is not None
 
-    conn.close()
+    datasource.disconnect()

@@ -19,6 +19,7 @@ import pytest
 from federated_query.catalog import Catalog
 from federated_query.datasources.postgresql import PostgreSQLDataSource
 from federated_query.datasources.duckdb import DuckDBDataSource
+from tests.duckdb_tmp import duckdb_path
 
 PG_SCHEMA = "pg"
 
@@ -47,7 +48,7 @@ def pg_datasource():
 @pytest.fixture(scope="module")
 def duckdb_datasource():
     """Connected in-memory DuckDB data source."""
-    config = {"database": ":memory:", "read_only": False}
+    config = {"path": duckdb_path(), "read_only": False}
     datasource = DuckDBDataSource(name="duckdb", config=config)
     datasource.connect()
     yield datasource

@@ -30,6 +30,7 @@ from tests.e2e_pushdown.conftest import (
     _seed_customers,
 )
 from tests.e2e_pushdown.helpers import build_runtime
+from tests.duckdb_tmp import duckdb_path
 
 _EMPLOYEE_ROWS = (
     "INSERT INTO employees VALUES "
@@ -55,7 +56,7 @@ def _seed_bonuses(cursor) -> None:
 def _hierarchy_source(name: str, seed) -> ProxyingDuckDBDataSource:
     """Build a connected DuckDB source seeded by the given function."""
     ds = ProxyingDuckDBDataSource(
-        name=name, config={"database": ":memory:", "read_only": False}
+        name=name, config={"path": duckdb_path(), "read_only": False}
     )
     ds.connect()
     seed(ds.connection)

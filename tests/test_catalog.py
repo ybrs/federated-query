@@ -5,6 +5,7 @@ from federated_query.catalog import Catalog
 from federated_query.catalog.schema import Schema, Table, Column
 from federated_query.plan.expressions import DataType
 from federated_query.datasources.duckdb import DuckDBDataSource
+from tests.duckdb_tmp import duckdb_path
 
 
 @pytest.fixture
@@ -54,7 +55,7 @@ def test_catalog_initialization(catalog):
 
 def test_register_datasource(catalog):
     """Test registering a data source."""
-    ds = DuckDBDataSource("test_duck", {"path": ":memory:"})
+    ds = DuckDBDataSource("test_duck", {"path": duckdb_path()})
     catalog.register_datasource(ds)
 
     assert "test_duck" in catalog.datasources
@@ -102,7 +103,7 @@ def test_get_nonexistent_table(catalog, sample_schema):
 @pytest.fixture
 def datasource():
     """A connector instance for testing its native-type mapping (no connect)."""
-    return DuckDBDataSource(name="test_db", config={"database": ":memory:"})
+    return DuckDBDataSource(name="test_db", config={"path": duckdb_path()})
 
 
 def test_type_mapping(datasource):

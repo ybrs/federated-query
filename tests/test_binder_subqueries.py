@@ -17,13 +17,14 @@ from federated_query.plan.expressions import (
     SubqueryExpression,
     BinaryOp,
 )
+from tests.duckdb_tmp import duckdb_path
 
 
 @pytest.fixture(scope="module")
 def catalog():
     """Catalog with users/orders tables in an in-memory DuckDB."""
     ds = DuckDBDataSource(
-        name="default", config={"database": ":memory:", "read_only": False}
+        name="default", config={"path": duckdb_path(), "read_only": False}
     )
     ds.connect()
     ds.connection.execute(

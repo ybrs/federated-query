@@ -11,6 +11,7 @@ import pytest
 
 from federated_query.parser.errors import UnsupportedSQLError
 from tests.e2e_pushdown.helpers import build_runtime
+from tests.duckdb_tmp import duckdb_path
 
 TABLE = "duckdb_primary.main.orders"
 
@@ -46,7 +47,7 @@ def _ground_truth_rows(connection, sql):
 def _reference():
     from tests.e2e_pushdown.conftest import _seed_orders
 
-    connection = duckdb.connect(":memory:")
+    connection = duckdb.connect(duckdb_path())
     _seed_orders(connection)
     return connection
 

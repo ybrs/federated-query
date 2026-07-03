@@ -14,6 +14,7 @@ from federated_query.optimizer import (
     LimitPushdownRule,
 )
 from federated_query.executor import Executor
+from tests.duckdb_tmp import duckdb_path
 
 
 def create_optimizer(catalog: Catalog) -> RuleBasedOptimizer:
@@ -31,7 +32,7 @@ def setup_duckdb():
     """Set up DuckDB with test data."""
     # Create in-memory DuckDB
     config = {
-        "database": ":memory:",
+        "path": duckdb_path(),
         "read_only": False,
     }
     datasource = DuckDBDataSource(name="testdb", config=config)

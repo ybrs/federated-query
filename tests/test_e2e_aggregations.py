@@ -10,13 +10,14 @@ from federated_query.parser import Parser, Binder
 from federated_query.optimizer.physical_planner import PhysicalPlanner
 from federated_query.executor.executor import Executor
 from federated_query.config.config import ExecutorConfig
+from tests.duckdb_tmp import duckdb_path
 
 
 @pytest.fixture
 def setup_test_db():
     """Create in-memory DuckDB with test data."""
     config = {
-        "database": ":memory:",
+        "path": duckdb_path(),
         "read_only": False,
     }
     datasource = DuckDBDataSource(name="test_db", config=config)

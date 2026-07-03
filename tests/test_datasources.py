@@ -4,12 +4,13 @@ import pytest
 import duckdb
 from federated_query.datasources.duckdb import DuckDBDataSource
 from federated_query.datasources.base import DataSourceCapability
+from tests.duckdb_tmp import duckdb_path
 
 
 @pytest.fixture
 def duckdb_datasource():
     """Create an in-memory DuckDB datasource for testing."""
-    ds = DuckDBDataSource("test_duck", {"path": ":memory:", "read_only": False})
+    ds = DuckDBDataSource("test_duck", {"path": duckdb_path(), "read_only": False})
     ds.connect()
 
     # Create test schema and tables
@@ -151,7 +152,7 @@ def test_duckdb_get_table_statistics(duckdb_datasource):
 
 def test_duckdb_context_manager():
     """Test using data source as context manager."""
-    ds = DuckDBDataSource("test", {"path": ":memory:", "read_only": False})
+    ds = DuckDBDataSource("test", {"path": duckdb_path(), "read_only": False})
 
     assert not ds.is_connected()
 
@@ -166,7 +167,7 @@ def test_duckdb_context_manager():
 
 def test_duckdb_disconnect():
     """Test disconnecting from DuckDB."""
-    ds = DuckDBDataSource("test", {"path": ":memory:", "read_only": False})
+    ds = DuckDBDataSource("test", {"path": duckdb_path(), "read_only": False})
     ds.connect()
 
     assert ds.is_connected()
@@ -179,7 +180,7 @@ def test_duckdb_disconnect():
 
 def test_duckdb_reconnect():
     """Test reconnecting to DuckDB."""
-    ds = DuckDBDataSource("test", {"path": ":memory:", "read_only": False})
+    ds = DuckDBDataSource("test", {"path": duckdb_path(), "read_only": False})
 
     ds.connect()
     assert ds.is_connected()
@@ -195,7 +196,7 @@ def test_duckdb_reconnect():
 
 def test_duckdb_ensure_connected():
     """Test ensure_connected method."""
-    ds = DuckDBDataSource("test", {"path": ":memory:", "read_only": False})
+    ds = DuckDBDataSource("test", {"path": duckdb_path(), "read_only": False})
 
     assert not ds.is_connected()
 
@@ -227,7 +228,7 @@ def test_duckdb_multiple_queries(duckdb_datasource):
 
 def test_duckdb_repr():
     """Test string representation of DuckDB datasource."""
-    ds = DuckDBDataSource("my_duckdb", {"path": ":memory:"})
+    ds = DuckDBDataSource("my_duckdb", {"path": duckdb_path()})
     repr_str = repr(ds)
 
     assert "DuckDBDataSource" in repr_str
@@ -236,7 +237,7 @@ def test_duckdb_repr():
 
 def test_duckdb_error_handling():
     """Test error handling for invalid queries."""
-    ds = DuckDBDataSource("test", {"path": ":memory:", "read_only": False})
+    ds = DuckDBDataSource("test", {"path": duckdb_path(), "read_only": False})
     ds.connect()
 
     # Invalid SQL should raise an exception
@@ -248,7 +249,7 @@ def test_duckdb_error_handling():
 
 def test_duckdb_empty_result():
     """Test querying with no results."""
-    ds = DuckDBDataSource("test", {"path": ":memory:", "read_only": False})
+    ds = DuckDBDataSource("test", {"path": duckdb_path(), "read_only": False})
     ds.connect()
 
     ds.connection.execute("CREATE TABLE empty_table (id INTEGER)")
@@ -263,7 +264,7 @@ def test_duckdb_empty_result():
 
 def test_duckdb_types():
     """Test various data types."""
-    ds = DuckDBDataSource("test", {"path": ":memory:", "read_only": False})
+    ds = DuckDBDataSource("test", {"path": duckdb_path(), "read_only": False})
     ds.connect()
 
     ds.connection.execute("""
