@@ -12,6 +12,7 @@ Every local operator in a plan runs its own small SQL statement over its
 registered Arrow inputs on an isolated cursor, so reuse stays safe.
 """
 
+import os
 from contextlib import contextmanager
 from typing import Dict, Iterator, Optional
 
@@ -23,10 +24,16 @@ class MergeEngine:
     """Vectorized local execution engine backed by an in-memory DuckDB."""
 
     def __init__(self, memory_limit: str, temp_directory: Optional[str]):
-        """Open the in-memory coordinator and apply its spill/memory settings."""
+        """Open the in-memory coordinator and apply its spill/memory settings.
+
+        When a temp directory is configured, it is created if missing and handed
+        to DuckDB so an intermediate that exceeds ``memory_limit`` spills to disk
+        instead of OOM-ing. A None temp directory disables spilling.
+        """
         self._connection = duckdb.connect(":memory:")
         self._connection.execute(f"SET memory_limit='{memory_limit}'")
         if temp_directory is not None:
+            os.makedirs(temp_directory, exist_ok=True)
             self._connection.execute(f"SET temp_directory='{temp_directory}'")
 
     def run(self, sql: str, inputs: Dict[str, object]) -> Iterator[pa.RecordBatch]:
@@ -138,9 +145,7 @@ class _MergeSession:
         """Run a query on this cursor and return all rows (small result sets)."""
         return self._cursor.execute(sql).fetchall()
 
-    def stream(
-        self, sql: str, inputs: Dict[str, object]
-    ) -> Iterator[pa.RecordBatch]:
+    def stream(self, sql: str, inputs: Dict[str, object]) -> Iterator[pa.RecordBatch]:
         """Register streaming inputs and yield the query's result batches lazily."""
         for name, arrow_input in inputs.items():
             self._cursor.register(name, arrow_input)

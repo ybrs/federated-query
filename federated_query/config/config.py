@@ -1,5 +1,7 @@
 """Configuration management for federated query engine."""
 
+import os
+import tempfile
 from typing import Dict, Any, List, Optional
 import yaml
 from pathlib import Path
@@ -7,6 +9,13 @@ from pathlib import Path
 from pydantic import Field
 
 from ..model import StateModel
+
+# Default spill location for the local merge engine's in-memory DuckDB. Spilling
+# to disk is on by default so a large intermediate degrades to disk I/O instead
+# of OOM-ing the process; DuckDB writes its own temp files under this directory.
+_DEFAULT_MERGE_SPILL_DIRECTORY = os.path.join(
+    tempfile.gettempdir(), "federated_query_merge_spill"
+)
 
 
 class DataSourceConfig(StateModel):
@@ -73,10 +82,11 @@ class ExecutorConfig(StateModel):
     # Local "merge engine" (in-memory DuckDB coordinator) settings. The engine
     # merges the Arrow streams returned by remote sources; it buffers only what
     # the algorithm requires and spills to ``merge_engine_temp_directory`` once
-    # it exceeds ``merge_engine_memory_limit``. The temp directory is left to
-    # DuckDB's default when None.
-    merge_engine_memory_limit: str = "1GB"
-    merge_engine_temp_directory: Optional[str] = None
+    # it exceeds ``merge_engine_memory_limit``. Spilling is on by default (a real
+    # temp directory), so a large intermediate degrades to disk I/O rather than
+    # OOM-ing the process. Set the temp directory to None to disable spilling.
+    merge_engine_memory_limit: str = "16GB"
+    merge_engine_temp_directory: Optional[str] = _DEFAULT_MERGE_SPILL_DIRECTORY
 
     @classmethod
     def create(
@@ -86,8 +96,8 @@ class ExecutorConfig(StateModel):
         batch_size: int = 10000,
         max_threads: int = 4,
         enable_parallel_fetch: bool = True,
-        merge_engine_memory_limit: str = "1GB",
-        merge_engine_temp_directory: Optional[str] = None,
+        merge_engine_memory_limit: str = "16GB",
+        merge_engine_temp_directory: Optional[str] = _DEFAULT_MERGE_SPILL_DIRECTORY,
     ) -> "ExecutorConfig":
         """Sanctioned fresh-construction path for ExecutorConfig.
         Names every field so none is dropped; derive from an existing node

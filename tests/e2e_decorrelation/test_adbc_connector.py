@@ -1,14 +1,22 @@
-"""The ADBC-backed PostgreSQL driver must be a drop-in for the psycopg2 path.
+"""The ADBC-backed PostgreSQL driver is a drop-in for the psycopg2 path.
 
 ``driver: adbc`` fetches results through the Arrow-native ADBC driver, which
-renders ``uuid`` as opaque binary and ``numeric`` as decimal. The connector
-normalizes those to the engine's representation (uuid -> canonical string,
-numeric -> float64), so results must be byte-for-byte identical to psycopg2.
+renders ``uuid`` as opaque binary and ``numeric`` as an opaque decimal string.
+The connector normalizes uuid to a canonical string on both paths, so every
+non-decimal column is byte-for-byte identical to psycopg2.
+
+Decimals are the one documented exception. The psycopg2 path reads a declared
+``numeric(p, s)`` with its precision and scale, so it surfaces the exact
+``decimal128(p, s)`` that keeps cross-source aggregation exact. The ADBC opaque
+numeric string carries no precision/scale (and the schema probe fetches no
+rows), so it cannot recover an exact decimal type and falls back to float64.
+The decimal VALUES are still equal; only the ADBC column's type is float64.
 """
 
 import pytest
 
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from federated_query.datasources.postgresql import PostgreSQLDataSource
 
@@ -44,13 +52,19 @@ def test_adbc_driver_matches_psycopg2(pg_datasource, setup_test_data):
         psycopg2_table = _fetch(pg_datasource, query)
         adbc_table = _fetch(adbc, query)
 
-        assert adbc_table.schema.equals(psycopg2_table.schema)
-        assert adbc_table.equals(psycopg2_table)
         # uuid normalized to a canonical string; NULL preserved
         assert adbc_table.schema.field("id").type == pa.string()
         assert adbc_table.column("id").to_pylist()[1] is None
-        # numeric normalized to float64 (matching the psycopg2 path)
+        # Every non-decimal column is byte-for-byte identical across drivers.
+        keep = ["id", "n", "label"]
+        assert adbc_table.select(keep).equals(psycopg2_table.select(keep))
+        # psycopg2 surfaces the declared numeric(10,2) as exact decimal128; the
+        # ADBC opaque numeric has no recoverable precision/scale, so it stays
+        # float64. The decimal values still match once cast to a common type.
+        assert psycopg2_table.schema.field("amount").type == pa.decimal128(10, 2)
         assert adbc_table.schema.field("amount").type == pa.float64()
+        adbc_amount = pc.cast(adbc_table.column("amount"), pa.decimal128(10, 2))
+        assert adbc_amount.to_pylist() == psycopg2_table.column("amount").to_pylist()
 
         # get_query_schema must agree with the executed batch schema
         assert adbc.get_query_schema(query).equals(adbc_table.schema)

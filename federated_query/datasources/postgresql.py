@@ -37,6 +37,12 @@ _HEX256 = _hex_byte_table()
 _UUID_TEXT_WIDTH = 36
 _DASH = ord("-")
 
+# Postgres OID for NUMERIC/DECIMAL. A declared numeric(p,s) is surfaced as an
+# exact Arrow decimal128 (see _numeric_arrow_type); the largest exact decimal128
+# Arrow supports is 38 digits.
+_NUMERIC_OID = 1700
+_MAX_DECIMAL128_PRECISION = 38
+
 # Cap each streamed ADBC batch so a huge scan yields many bounded batches rather
 _ADBC_BATCH_BYTES = 4 * 1024 * 1024
 
@@ -401,8 +407,9 @@ class PostgreSQLDataSource(DataSource):
 
     def _normalize_table(self, table: pa.Table) -> pa.Table:
         """Align ADBC's Arrow types with the psycopg2 path's, so the driver is
-        a drop-in: uuid->string, numeric->float64, every integer width->int64,
-        and real(float32)->float64. Anything already matching is left untouched.
+        a drop-in: uuid->string, numeric decimal preserved as decimal128, every
+        integer width->int64, and real(float32)->float64. Anything already
+        matching is left untouched.
         """
         columns = []
         for index in range(table.num_columns):
@@ -415,7 +422,7 @@ class PostgreSQLDataSource(DataSource):
         if getattr(column_type, "extension_name", None) == "arrow.opaque":
             return self._normalize_opaque(column, column_type)
         if pa.types.is_decimal(column_type):
-            return pc.cast(column, pa.float64())
+            return column
         if pa.types.is_integer(column_type) and not pa.types.is_int64(column_type):
             return pc.cast(column, pa.int64())
         if pa.types.is_floating(column_type) and not pa.types.is_float64(column_type):
@@ -425,11 +432,13 @@ class PostgreSQLDataSource(DataSource):
     def _normalize_opaque(self, column, column_type):
         """Convert an ADBC opaque extension column to the engine's type.
 
-        Postgres ``uuid`` arrives as opaque binary and ``numeric`` as an opaque
-        string; the engine wants a canonical uuid string and a float64
-        respectively (matching psycopg2). Any other opaque type raises rather
-        than passing its raw storage through, which would diverge from the
-        psycopg2 path and mistype the column silently.
+        Postgres ``uuid`` arrives as opaque binary and becomes a canonical uuid
+        string. A ``numeric`` here is an opaque string with no recoverable
+        precision/scale, so it falls back to float64 (the same fallback the
+        psycopg2 path uses for an unconstrained numeric); a declared numeric
+        instead arrives as a native decimal and is preserved as decimal128 by
+        _normalize_column. Any other opaque type raises rather than passing its
+        raw storage through, which would mistype the column silently.
         """
         type_name = getattr(column_type, "type_name", "")
         storage = column.combine_chunks().storage
@@ -493,8 +502,9 @@ class PostgreSQLDataSource(DataSource):
             columns.append(desc[0])
         return columns
 
-    # PostgreSQL type OIDs -> Arrow types. NUMERIC maps to float64: the
-    # engine computes over floats, so sources surface decimals as doubles.
+    # PostgreSQL type OIDs -> Arrow types. NUMERIC (1700) is handled per-column
+    # by _numeric_arrow_type (declared precision/scale -> exact decimal128); the
+    # entry here is only the fallback for an unconstrained/oversized numeric.
     _OID_TO_ARROW = {
         16: pa.bool_(),  # bool
         20: pa.int64(),  # int8
@@ -540,13 +550,46 @@ class PostgreSQLDataSource(DataSource):
         """
         fields = []
         for column in description:
-            if column[1] not in self._OID_TO_ARROW:
-                raise ValueError(
-                    f"Unsupported PostgreSQL type OID {column[1]} "
-                    f"for column {column[0]!r}"
-                )
-            fields.append(pa.field(column[0], self._OID_TO_ARROW[column[1]]))
+            fields.append(self._arrow_field_for(column))
         return fields
+
+    def _arrow_field_for(self, column) -> pa.Field:
+        """Build one Arrow field, surfacing a declared NUMERIC as decimal128.
+
+        A NUMERIC column with a declared precision and scale becomes an exact
+        Arrow decimal128 so cross-source arithmetic and aggregation over
+        Postgres decimals stay exact (matching how DuckDB surfaces DECIMAL),
+        instead of drifting through float64. Every other type uses the static
+        OID map; an unmapped OID raises rather than silently defaulting.
+        """
+        name, oid = column[0], column[1]
+        if oid == _NUMERIC_OID:
+            return pa.field(name, self._numeric_arrow_type(column[4], column[5]))
+        if oid not in self._OID_TO_ARROW:
+            raise ValueError(
+                f"Unsupported PostgreSQL type OID {oid} for column {name!r}"
+            )
+        return pa.field(name, self._OID_TO_ARROW[oid])
+
+    def _numeric_arrow_type(self, precision, scale) -> pa.DataType:
+        """Arrow type for a NUMERIC column: exact decimal128, else float64.
+
+        An unconstrained NUMERIC (no declared precision, which Postgres reports
+        as a 65535 sentinel) or one beyond Arrow's 38-digit decimal128 limit
+        cannot be represented exactly, so it falls back to float64 (the engine's
+        prior behavior for every numeric).
+        """
+        if self._is_exact_decimal(precision, scale):
+            return pa.decimal128(precision, scale)
+        return pa.float64()
+
+    def _is_exact_decimal(self, precision, scale) -> bool:
+        """Whether a declared (precision, scale) fits an exact Arrow decimal128."""
+        if precision is None or scale is None:
+            return False
+        if not 1 <= precision <= _MAX_DECIMAL128_PRECISION:
+            return False
+        return 0 <= scale <= precision
 
     def _build_column_arrays(self, rows: List, schema: pa.Schema) -> List[pa.Array]:
         """Build one Arrow array per column position.
@@ -565,7 +608,9 @@ class PostgreSQLDataSource(DataSource):
         """Collect one column's values, coercing Decimal to float for float64.
 
         Arrow refuses to place ``decimal.Decimal`` values into float64 arrays,
-        and NUMERIC columns surface as float64 in this engine.
+        so an unconstrained NUMERIC (the float64 fallback) is coerced. A
+        declared NUMERIC now surfaces as decimal128, so its Decimal values pass
+        straight through into the decimal128 array unchanged.
         """
         coerce = pa.types.is_float64(field.type)
         values = []
