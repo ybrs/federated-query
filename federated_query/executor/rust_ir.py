@@ -41,6 +41,7 @@ from ..plan.physical import (
     PhysicalScan,
     PhysicalSort,
     PhysicalValues,
+    PhysicalWindow,
     _DYNAMIC_FILTER_MAX_KEYS,
     _physical_column_name,
 )
@@ -405,6 +406,18 @@ def _relabel_columns(binding, body, names, ctx):
     return result
 
 
+def _emit_window(node, ctx):
+    """A window-bearing projection: register the input as `in_window` and run the
+    rendered `SELECT <exprs> OVER (...) FROM in_window` as a raw_sql fragment."""
+    child = _emit(node.input, ctx)
+    sql = node._window_sql(node.input.column_aliases())
+    fragment = ctx.names.fragment()
+    ctx.fragments[fragment] = {"kind": "raw_sql", "sql": sql}
+    result = ctx.names.binding()
+    ctx.steps.append({"op": "merge", "fragment": fragment, "inputs": {"in_window": child}, "binding": result})
+    return result
+
+
 def _emit_cte_merge(node, ctx):
     """A whole WITH/CTE rendered as SQL over named inputs: emit each input to a
     binding, register it under its name, and run the SQL as a `raw_sql` fragment."""
@@ -734,6 +747,7 @@ _NODE_EMITTERS = {
     PhysicalCTEMergeQuery: _emit_cte_merge,
     PhysicalCTEScan: _emit_cte_scan,
     PhysicalAliasedRelation: _emit_passthrough,
+    PhysicalWindow: _emit_window,
 }
 
 
