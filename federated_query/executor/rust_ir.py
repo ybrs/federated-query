@@ -23,6 +23,8 @@ from ..plan.expressions import (
 )
 from ..plan.logical import JoinType
 from ..plan.physical import (
+    PhysicalAliasedRelation,
+    PhysicalFilter,
     PhysicalHashAggregate,
     PhysicalHashJoin,
     PhysicalProjection,
@@ -336,6 +338,21 @@ def _agg_args(args, aliases, star):
     return items
 
 
+def _emit_passthrough(node, ctx):
+    """A node that only re-qualifies its input's columns (e.g. a subquery alias):
+    the data is unchanged, so emit the child and let column resolution handle it."""
+    return _emit(node.input, ctx)
+
+
+def _emit_filter(node, ctx):
+    """A boolean filter over its single input, as a `filter` fragment."""
+    child = _emit(node.input, ctx)
+    predicate = _expr_over(node.predicate, "in_0", node.input.column_aliases())
+    fragment = ctx.names.fragment()
+    ctx.fragments[fragment] = {"kind": "filter", "predicate": predicate}
+    return _merge_step(ctx, fragment, {"in_0": child})
+
+
 def _emit_sort(node, ctx):
     """An ORDER BY over its single input, as a `sort` fragment."""
     child = _emit(node.input, ctx)
@@ -375,35 +392,63 @@ def _nulls_first(nulls_order, index, ascending):
     return str(setting).upper() == "FIRST"
 
 
-def _emit_join(join, ctx):
-    """Emit build/collect/inject/merge for an INNER hash join.
+# JoinType enum -> IR join_kind string. Any type absent here is refused.
+_JOIN_KINDS = {
+    JoinType.INNER: "inner",
+    JoinType.LEFT: "left",
+    JoinType.RIGHT: "right",
+    JoinType.FULL: "full",
+    JoinType.SEMI: "semi",
+    JoinType.ANTI: "anti",
+}
 
-    Semi-join reduction: read the build side, collect its distinct join key,
-    inject those values into the probe's SQL as `probe_key IN (...)` (all in
-    Rust), then join and emit the join's canonical output columns.
+
+def _emit_join(join, ctx):
+    """Emit a hash join, reducing the probe by the build keys when possible.
+
+    Semi-join reduction (read build, collect its distinct key, inject it into
+    the probe's SQL) applies only to an INNER single-key join between two plain
+    scans; otherwise both children are emitted in full (recursively, so they may
+    be any subtree) and joined. The join's canonical output columns are emitted
+    so a parent can reference them.
     """
-    _check_join_supported(join)
+    kind = _join_kind(join)
+    if _can_reduce(join):
+        left_binding, right_binding = _emit_reduced_join(join, ctx)
+    else:
+        left_binding = _emit(join.left, ctx)
+        right_binding = _emit(join.right, ctx)
+    fragment = ctx.names.fragment()
+    ctx.fragments[fragment] = _join_fragment(join, kind)
+    return _merge_step(ctx, fragment, {"in_left": left_binding, "in_right": right_binding})
+
+
+def _join_kind(join):
+    """The IR join_kind for a physical join, or raise if the type is unmapped."""
+    kind = _JOIN_KINDS.get(join.join_type)
+    if kind is None:
+        raise UnsupportedIR(f"join type {join.join_type} not yet supported")
+    return kind
+
+
+def _can_reduce(join):
+    """True when the semi-join reduction applies: INNER, single key, both plain
+    scans (so the build renders source SQL and the probe accepts an IN filter)."""
+    if join.join_type != JoinType.INNER:
+        return False
+    if len(join.left_keys) != 1 or len(join.right_keys) != 1:
+        return False
+    return isinstance(join.left, PhysicalScan) and isinstance(join.right, PhysicalScan)
+
+
+def _emit_reduced_join(join, ctx):
+    """The build/collect/inject reduction path; returns (left, right) bindings."""
     build_child, probe_child, build_key_expr, probe_key_expr = _orient_join(join)
     build_binding, probe_binding = _emit_reduced_inputs(
         ctx, build_child, probe_child, build_key_expr, probe_key_expr)
-    return _emit_join_merge(join, ctx, build_child, build_binding, probe_binding)
-
-
-def _check_join_supported(join):
-    """Refuse join shapes the serializer does not yet cover."""
-    if join.join_type != JoinType.INNER:
-        raise UnsupportedIR(f"join type {join.join_type} not yet supported")
-    if len(join.left_keys) != 1 or len(join.right_keys) != 1:
-        raise UnsupportedIR("multi-key join not yet supported")
-    _check_scan_children(join)
-
-
-def _check_scan_children(join):
-    """Refuse a join whose children are not plain scans (for now)."""
-    if not isinstance(join.left, PhysicalScan):
-        raise UnsupportedIR("join children must be plain scans for now")
-    if not isinstance(join.right, PhysicalScan):
-        raise UnsupportedIR("join children must be plain scans for now")
+    left_binding = build_binding if build_child is join.left else probe_binding
+    right_binding = build_binding if build_child is join.right else probe_binding
+    return left_binding, right_binding
 
 
 def _orient_join(join):
@@ -451,24 +496,25 @@ def _emit_injected_scan(ctx, probe_child, inject_col, keys_binding, binding):
     })
 
 
-def _emit_join_merge(join, ctx, build_child, build_binding, probe_binding):
-    """Wire the join inputs to their semantic sides and emit the join fragment."""
-    left_binding = build_binding if build_child is join.left else probe_binding
-    right_binding = build_binding if build_child is join.right else probe_binding
-    fragment = ctx.names.fragment()
-    ctx.fragments[fragment] = _join_fragment(join)
-    return _merge_step(ctx, fragment, {"in_left": left_binding, "in_right": right_binding})
-
-
-def _join_fragment(join):
-    """Build the hash-join fragment: keys plus the canonical output projection."""
-    left_key = _physical_column_name(join.left_keys[0], join.left.column_aliases())
-    right_key = _physical_column_name(join.right_keys[0], join.right.column_aliases())
+def _join_fragment(join, kind):
+    """Build the hash-join fragment: keys (possibly several) plus the canonical
+    output projection."""
     return {
-        "kind": "hash_join", "join_type": "inner",
-        "left_keys": [left_key], "right_keys": [right_key],
+        "kind": "hash_join",
+        "join_type": kind,
+        "left_keys": _key_names(join.left_keys, join.left),
+        "right_keys": _key_names(join.right_keys, join.right),
         "project": _join_output_projection(join),
     }
+
+
+def _key_names(keys, child):
+    """Physical column names of the join keys against a child's aliases."""
+    aliases = child.column_aliases()
+    names = []
+    for key in keys:
+        names.append(_physical_column_name(key, aliases))
+    return names
 
 
 def _join_output_projection(join):
@@ -512,6 +558,8 @@ _NODE_EMITTERS = {
     PhysicalProjection: _emit_projection,
     PhysicalHashAggregate: _emit_aggregate,
     PhysicalSort: _emit_sort,
+    PhysicalFilter: _emit_filter,
+    PhysicalAliasedRelation: _emit_passthrough,
 }
 
 

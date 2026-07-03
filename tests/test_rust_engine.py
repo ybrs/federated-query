@@ -254,12 +254,13 @@ def test_cross_source_order_by(engine):
 
 
 def test_unsupported_shape_raises(engine):
-    """A shape the serializer does not yet cover (here a non-INNER cross-source
-    join) must raise, never silently emit a plan that could produce wrong rows."""
+    """A shape the serializer does not yet cover (here a window over a
+    cross-source join) must raise, never silently emit a plan that could
+    produce wrong rows."""
     qe, _ = engine
     sql = (
-        "SELECT n.n_name, r.r_name "
-        f"FROM srcA.{SCHEMA}.nation n LEFT JOIN srcB.{SCHEMA}.region r "
+        "SELECT n.n_name, row_number() OVER (ORDER BY n.n_name) AS rn "
+        f"FROM srcA.{SCHEMA}.nation n JOIN srcB.{SCHEMA}.region r "
         "ON n.n_regionkey = r.r_regionkey"
     )
     plan = qe._plan_pipeline(sql, profiler=None)
