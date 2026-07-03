@@ -106,16 +106,29 @@ def _register_for_rust(datasource):
 
 
 def _duckdb_file(datasource):
-    """A DuckDB file path Rust can open, snapshotting an in-memory DB once."""
-    key = id(datasource)
-    if key in _DUCK_FILES:
-        return _DUCK_FILES[key]
+    """A DuckDB file path Rust can open. A real file is used as-is; an in-memory
+    DB is snapshotted to a temp file, re-snapshotting whenever its table set has
+    changed since last time (module-scoped fixtures add tables mid-run)."""
     path = getattr(datasource, "db_path", None)
     if path and path != ":memory:" and os.path.exists(path):
-        _DUCK_FILES[key] = path
-    else:
-        _DUCK_FILES[key] = _snapshot_memory_db(datasource.connection)
-    return _DUCK_FILES[key]
+        return path
+    connection = datasource.connection
+    signature = _table_signature(connection)
+    cached = _DUCK_FILES.get(id(datasource))
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    fresh = _snapshot_memory_db(connection)
+    _DUCK_FILES[id(datasource)] = (signature, fresh)
+    return fresh
+
+
+def _table_signature(connection):
+    """The current set of (schema, table) pairs, so a change forces a re-snapshot."""
+    rows = connection.execute(
+        "SELECT table_schema, table_name FROM information_schema.tables "
+        "WHERE table_schema NOT IN ('information_schema', 'pg_catalog')"
+    ).fetchall()
+    return tuple(sorted(rows))
 
 
 def _snapshot_memory_db(connection):
