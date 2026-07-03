@@ -561,7 +561,25 @@ def _join_output_projection(join):
         item = _join_projection_item(
             table, column, out_name, left_tables, left_aliases, right_aliases)
         project.append(item)
+    _uniquify_aliases(project)
     return project
+
+
+def _uniquify_aliases(project):
+    """Suffix any repeated output alias so the join result has unique column
+    names. A self-join (both sides the same relation) can name two columns
+    identically (`right_customer_id` twice); DataFusion rejects a duplicate
+    qualified name when that result is registered as a downstream input. Only a
+    repeat is renamed, so a column a parent actually references keeps its name.
+    """
+    seen = {}
+    for item in project:
+        name = item["alias"]
+        if name not in seen:
+            seen[name] = 0
+            continue
+        seen[name] += 1
+        item["alias"] = f"{name}_{seen[name]}"
 
 
 def _relation_names(aliases):
