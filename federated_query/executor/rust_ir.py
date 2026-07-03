@@ -361,12 +361,17 @@ def _aggregate_item(expr, name, aliases):
 
 
 def _agg_call(fn, aliases):
-    """Serialize an aggregate FunctionCall; `count(*)` is the star form."""
-    if fn.within_group_key is not None:
-        raise UnsupportedIR("ordered-set aggregates (WITHIN GROUP) not yet supported")
+    """Serialize an aggregate FunctionCall; `count(*)` is the star form, and an
+    ordered-set aggregate carries its `WITHIN GROUP (ORDER BY ...)`."""
     star = _is_star_arg(fn.args)
     args = _agg_args(fn.args, aliases, star)
-    return {"func": fn.function_name, "distinct": fn.distinct, "star": star, "args": args}
+    call = {"func": fn.function_name, "distinct": fn.distinct, "star": star, "args": args}
+    if fn.within_group_key is not None:
+        call["within_group"] = {
+            "key": _expr_over(fn.within_group_key, "in_0", aliases),
+            "desc": fn.within_group_desc,
+        }
+    return call
 
 
 def _is_star_arg(args):
