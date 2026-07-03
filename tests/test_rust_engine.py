@@ -91,6 +91,16 @@ def engine():
             "(6,'FRANCE',3,100.01),(7,'GERMANY',3,2.20),(8,'INDIA',2,4.40),"
             "(9,'INDONESIA',2,8.80)"
         )
+        # High-cardinality pair (> the 2000-key IN cap) so the engine exercises
+        # the temp-table / parallel dynamic-filter strategies. hc_build has 3000
+        # distinct keys; hc_probe spreads over 10000, so the filter selects ~30%
+        # (the selective temp-table band).
+        cur.execute(f"CREATE TABLE {SCHEMA}.hc_build (k INT)")
+        cur.execute(f"INSERT INTO {SCHEMA}.hc_build SELECT g FROM generate_series(1,3000) g")
+        cur.execute(f"CREATE TABLE {SCHEMA}.hc_probe (k INT, v INT)")
+        cur.execute(f"INSERT INTO {SCHEMA}.hc_probe SELECT g, g*2 FROM generate_series(1,10000) g")
+        cur.execute(f"ANALYZE {SCHEMA}.hc_build")
+        cur.execute(f"ANALYZE {SCHEMA}.hc_probe")
 
     ds_a = PostgreSQLDataSource(name="srcA", config=dict(cfg))
     ds_b = PostgreSQLDataSource(name="srcB", config=dict(cfg))
@@ -210,6 +220,17 @@ def test_cross_source_decimal_aggregate(engine):
     assert rust.keys() == ref.keys()
     for k in ref:
         assert abs(float(rust[k]) - float(ref[k])) < 1e-6
+
+
+def test_high_cardinality_dynamic_filter(engine):
+    """> 2000 distinct build keys, so the engine leaves the IN-list path and
+    uses a temp-table / parallel strategy in Rust. Result must still match."""
+    qe, datasources = engine
+    sql = (
+        "SELECT count(*) AS n, sum(p.v) AS s "
+        f"FROM srcA.{SCHEMA}.hc_probe p JOIN srcB.{SCHEMA}.hc_build b ON p.k = b.k"
+    )
+    _assert_parity(qe, datasources, sql)
 
 
 def _ordered(table):
