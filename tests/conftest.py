@@ -16,6 +16,7 @@ grouped by reason. Without ``FEDQRS`` set this file does nothing.
 
 import collections
 import os
+import tempfile
 
 _ROUTING = {
     "rust": 0,
@@ -23,6 +24,11 @@ _ROUTING = {
     "error": 0,
     "reasons": collections.Counter(),
 }
+
+# id(datasource) -> a DuckDB file path Rust can open. In-memory test databases
+# are snapshotted to a temp file once, since a separate Rust connection cannot
+# see another connection's in-memory database.
+_DUCK_FILES = {}
 
 
 def _reason(exc) -> str:
@@ -55,10 +61,17 @@ def pytest_configure(config):
 
 def _run_via_rust(plan, datasources):
     """Try the Rust engine; return its table, or None to fall back."""
-    from federated_query.executor.rust_ir import execute_via_rust, UnsupportedIR
+    import json
+
+    import fedqrs
+    import pyarrow as pa
+    from federated_query.executor.rust_ir import build_ir, UnsupportedIR
 
     try:
-        table = execute_via_rust(plan, datasources)
+        for datasource in datasources:
+            _register_for_rust(datasource)
+        ir = build_ir(plan)
+        table = pa.RecordBatchReader.from_stream(fedqrs.execute_ir(json.dumps(ir))).read_all()
         _ROUTING["rust"] += 1
         return table
     except UnsupportedIR as exc:
@@ -69,6 +82,52 @@ def _run_via_rust(plan, datasources):
         _ROUTING["error"] += 1
         _ROUTING["reasons"]["err: " + _reason(exc)] += 1
         return None
+
+
+def _register_for_rust(datasource):
+    """Register one datasource with the Rust engine; snapshot in-memory DuckDB."""
+    import fedqrs
+    from federated_query.datasources.duckdb import DuckDBDataSource
+    from federated_query.datasources.postgresql import PostgreSQLDataSource
+    from federated_query.executor.rust_ir import _pg_adbc_driver_path
+
+    if isinstance(datasource, PostgreSQLDataSource):
+        params = {"uri": datasource._adbc_uri(), "adbc_driver": _pg_adbc_driver_path()}
+        fedqrs.register_datasource(datasource.name, "postgres", params)
+        return
+    if isinstance(datasource, DuckDBDataSource):
+        fedqrs.register_datasource(datasource.name, "duckdb", {"path": _duckdb_file(datasource)})
+        return
+    raise RuntimeError(f"no Rust connector for {type(datasource).__name__}")
+
+
+def _duckdb_file(datasource):
+    """A DuckDB file path Rust can open, snapshotting an in-memory DB once."""
+    key = id(datasource)
+    if key in _DUCK_FILES:
+        return _DUCK_FILES[key]
+    path = getattr(datasource, "db_path", None)
+    if path and path != ":memory:" and os.path.exists(path):
+        _DUCK_FILES[key] = path
+    else:
+        _DUCK_FILES[key] = _snapshot_memory_db(datasource.connection)
+    return _DUCK_FILES[key]
+
+
+def _snapshot_memory_db(connection):
+    """Copy every table of an in-memory DuckDB to a fresh file, return its path."""
+    path = tempfile.mktemp(suffix=".duckdb")
+    connection.execute(f"ATTACH '{path}' AS __rust")
+    rows = connection.execute(
+        "SELECT table_schema, table_name FROM information_schema.tables "
+        "WHERE table_schema NOT IN ('information_schema', 'pg_catalog')"
+    ).fetchall()
+    for schema, table in rows:
+        connection.execute(
+            f'CREATE TABLE __rust."{table}" AS SELECT * FROM "{schema}"."{table}"'
+        )
+    connection.execute("DETACH __rust")
+    return path
 
 
 def pytest_sessionfinish(session, exitstatus):
