@@ -43,11 +43,15 @@ def pytest_configure(config):
         return
 
     from federated_query.executor.executor import Executor
-    from federated_query.executor.rust_ir import execute_via_rust, UnsupportedIR
+    from federated_query.plan import PhysicalExplain
 
     original = Executor.execute_to_table
 
     def routed(self, plan, query_executor=None):
+        # EXPLAIN is plan introspection, not data execution: it runs no query
+        # through any engine, so it is not a routing candidate. Run it normally.
+        if isinstance(plan, PhysicalExplain):
+            return original(self, plan, query_executor=query_executor)
         catalog = getattr(query_executor, "catalog", None)
         datasources = getattr(catalog, "datasources", None)
         if datasources:
