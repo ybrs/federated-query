@@ -24,6 +24,8 @@ from ..plan.expressions import (
 from ..plan.logical import JoinType
 from ..plan.physical import (
     PhysicalAliasedRelation,
+    PhysicalCTEMergeQuery,
+    PhysicalCTEScan,
     PhysicalFilter,
     PhysicalHashAggregate,
     PhysicalLimit,
@@ -354,6 +356,29 @@ def _emit_filter(node, ctx):
     return _merge_step(ctx, fragment, {"in_0": child})
 
 
+def _emit_cte_scan(node, ctx):
+    """A CTE reference: emit the producer's body. A CTE referenced N times
+    re-emits the body per reference (correct for deterministic bodies; sharing
+    a single materialization is a perf follow-up). Explicit CTE column names are
+    not yet handled."""
+    if node.producer.column_names:
+        raise UnsupportedIR("CTE with explicit column names not yet supported")
+    return _emit(node.producer.body, ctx)
+
+
+def _emit_cte_merge(node, ctx):
+    """A whole WITH/CTE rendered as SQL over named inputs: emit each input to a
+    binding, register it under its name, and run the SQL as a `raw_sql` fragment."""
+    inputs = {}
+    for name, subtree in node.inputs.items():
+        inputs[name] = _emit(subtree, ctx)
+    fragment = ctx.names.fragment()
+    ctx.fragments[fragment] = {"kind": "raw_sql", "sql": node.sql}
+    result = ctx.names.binding()
+    ctx.steps.append({"op": "merge", "fragment": fragment, "inputs": inputs, "binding": result})
+    return result
+
+
 def _emit_limit(node, ctx):
     """A LIMIT/OFFSET over its single input, as a `limit` fragment."""
     child = _emit(node.input, ctx)
@@ -569,6 +594,8 @@ _NODE_EMITTERS = {
     PhysicalSort: _emit_sort,
     PhysicalFilter: _emit_filter,
     PhysicalLimit: _emit_limit,
+    PhysicalCTEMergeQuery: _emit_cte_merge,
+    PhysicalCTEScan: _emit_cte_scan,
     PhysicalAliasedRelation: _emit_passthrough,
 }
 
