@@ -74,6 +74,39 @@ def same_source(left: Optional[str], right: Optional[str]) -> bool:
     return left is not None and left == right
 
 
+def _alias_anchor_columns(body: exp.Expression, columns) -> None:
+    """Alias the anchor SELECT's columns to a CTE's declared names in place.
+
+    A CTE column list (``seq(n)``) renames the body's output columns. DuckDB
+    applies that list, but DataFusion ignores it and keeps the anchor's own
+    names (``SELECT 1`` -> ``Int64(1)``), so a recursive self-reference to
+    ``seq.n`` then fails. Writing the names onto the anchor as explicit aliases
+    (``SELECT 1 AS n``) makes both engines resolve the columns.
+    """
+    anchor = _anchor_select(body)
+    if anchor is None:
+        return
+    aliased = []
+    for expr, name in zip(anchor.expressions, columns):
+        aliased.append(_alias_to(expr, name))
+    anchor.set("expressions", aliased)
+
+
+def _anchor_select(body: exp.Expression) -> Optional[exp.Select]:
+    """The leftmost SELECT of a (possibly nested) set-operation CTE body."""
+    while isinstance(body, exp.SetOperation):
+        body = body.this
+    if isinstance(body, exp.Select):
+        return body
+    return None
+
+
+def _alias_to(expr: exp.Expression, name: str) -> exp.Expression:
+    """Alias an expression to ``name``, replacing any existing alias."""
+    inner = expr.this if isinstance(expr, exp.Alias) else expr
+    return exp.alias_(inner.copy(), name)
+
+
 class _PushContext:
     """Mutable accumulator for the clauses of one remote query."""
 
@@ -996,6 +1029,8 @@ class SingleSourcePushdown:
 
     def _cte_node(self, name, columns, body: exp.Expression) -> exp.CTE:
         """Build one ``name [(cols)] AS (<body>)`` CTE definition."""
+        if columns:
+            _alias_anchor_columns(body, columns)
         alias = exp.TableAlias(this=exp.to_identifier(name))
         if columns:
             cols = []
