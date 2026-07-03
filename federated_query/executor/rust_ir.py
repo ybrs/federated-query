@@ -22,6 +22,8 @@ from ..plan.expressions import (
     ColumnRef,
     FunctionCall,
     Literal,
+    UnaryOp,
+    UnaryOpType,
 )
 from ..plan.logical import JoinType
 from ..plan.physical import (
@@ -32,6 +34,7 @@ from ..plan.physical import (
     PhysicalHashAggregate,
     PhysicalLimit,
     PhysicalHashJoin,
+    PhysicalNestedLoopJoin,
     PhysicalProjection,
     PhysicalRemoteQuery,
     PhysicalRemoteSetOp,
@@ -68,6 +71,10 @@ _BINARY_OP_TOKENS = {
 # subclass of `int`, so exact-type lookup keeps them distinct.
 _LITERAL_KINDS = {bool: "bool", int: "int", float: "float", str: "str"}
 
+# Unary ops the engine represents as an IR `unary` node, and as an `is_null` node.
+_UNARY_OPS = {UnaryOpType.NOT: "not", UnaryOpType.NEGATE: "neg"}
+_NULL_TESTS = {UnaryOpType.IS_NULL: False, UnaryOpType.IS_NOT_NULL: True}
+
 
 # --- expression serialization -------------------------------------------------
 
@@ -92,7 +99,21 @@ def _serialize_expr(expr, column_fn):
         return {"node": "literal", "value": _literal_value(expr.value)}
     if isinstance(expr, BinaryOp):
         return _serialize_binary(expr, column_fn)
+    if isinstance(expr, UnaryOp):
+        return _serialize_unary(expr, column_fn)
     raise UnsupportedIR(f"expression {type(expr).__name__} not supported in IR")
+
+
+def _serialize_unary(expr, column_fn):
+    """Serialize a unary op: NOT / negate as `unary`, IS [NOT] NULL as `is_null`."""
+    operand = _serialize_expr(expr.operand, column_fn)
+    unary = _UNARY_OPS.get(expr.op)
+    if unary is not None:
+        return {"node": "unary", "op": unary, "operand": operand}
+    negated = _NULL_TESTS.get(expr.op)
+    if negated is None:
+        raise UnsupportedIR(f"unary operator {expr.op} not supported in IR")
+    return {"node": "is_null", "expr": operand, "negated": negated}
 
 
 def _serialize_binary(expr, column_fn):
@@ -608,6 +629,44 @@ def _key_names(keys, child):
     return names
 
 
+def _emit_nested_loop_join(node, ctx):
+    """A non-equi (nested-loop) join: emit both sides, join on the condition
+    (or a cross join when there is none), then the canonical output columns."""
+    kind = _join_kind(node)
+    left_binding = _emit(node.left, ctx)
+    right_binding = _emit(node.right, ctx)
+    fragment = ctx.names.fragment()
+    ctx.fragments[fragment] = _nested_loop_fragment(node, kind)
+    return _merge_step(ctx, fragment, {"in_left": left_binding, "in_right": right_binding})
+
+
+def _nested_loop_fragment(node, kind):
+    """Build the nested-loop-join fragment: condition + canonical projection."""
+    fragment = {
+        "kind": "nested_loop_join",
+        "join_type": kind,
+        "project": _join_output_projection(node),
+    }
+    if node.condition is not None:
+        fragment["condition"] = _serialize_expr(node.condition, _two_sided_column_fn(node))
+    return fragment
+
+
+def _two_sided_column_fn(join):
+    """A column renderer resolving each ref to in_left/in_right by owning side."""
+    left_aliases = join.left.column_aliases()
+    right_aliases = join.right.column_aliases()
+    left_tables = _relation_names(left_aliases)
+
+    def column(col_ref):
+        key = (col_ref.table, col_ref.column)
+        if col_ref.table in left_tables:
+            return {"node": "column", "relation": "in_left", "name": left_aliases[key]}
+        return {"node": "column", "relation": "in_right", "name": right_aliases[key]}
+
+    return column
+
+
 def _join_output_projection(join):
     """Every join output column, from whichever side owns it, canonically named."""
     left_aliases = join.left.column_aliases()
@@ -665,6 +724,7 @@ _NODE_EMITTERS = {
     PhysicalScan: _emit_source,
     PhysicalRemoteSetOp: _emit_source,
     PhysicalHashJoin: _emit_join,
+    PhysicalNestedLoopJoin: _emit_nested_loop_join,
     PhysicalProjection: _emit_projection,
     PhysicalHashAggregate: _emit_aggregate,
     PhysicalSort: _emit_sort,
