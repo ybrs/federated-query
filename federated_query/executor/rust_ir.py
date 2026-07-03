@@ -363,11 +363,25 @@ def _emit_filter(node, ctx):
 def _emit_cte_scan(node, ctx):
     """A CTE reference: emit the producer's body. A CTE referenced N times
     re-emits the body per reference (correct for deterministic bodies; sharing
-    a single materialization is a perf follow-up). Explicit CTE column names are
-    not yet handled."""
-    if node.producer.column_names:
-        raise UnsupportedIR("CTE with explicit column names not yet supported")
-    return _emit(node.producer.body, ctx)
+    a single materialization is a perf follow-up). An explicit CTE column list
+    relabels the body's output columns to the declared names."""
+    binding = _emit(node.producer.body, ctx)
+    if not node.producer.column_names:
+        return binding
+    return _relabel_columns(binding, node.producer.body, node.producer.column_names, ctx)
+
+
+def _relabel_columns(binding, body, names, ctx):
+    """Project a binding's columns to new output names (a CTE column list),
+    positionally: the i-th body column becomes the i-th declared name."""
+    project = []
+    for source, target in zip(body.schema().names, names):
+        project.append(_side_column("in_0", source, target))
+    fragment = ctx.names.fragment()
+    ctx.fragments[fragment] = {"kind": "project", "project": project}
+    result = ctx.names.binding()
+    ctx.steps.append({"op": "merge", "fragment": fragment, "inputs": {"in_0": binding}, "binding": result})
+    return result
 
 
 def _emit_cte_merge(node, ctx):
