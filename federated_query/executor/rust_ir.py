@@ -31,6 +31,7 @@ from ..plan.physical import (
     PhysicalCTEMergeQuery,
     PhysicalCTEScan,
     PhysicalFilter,
+    PhysicalGroupedLimit,
     PhysicalHashAggregate,
     PhysicalLimit,
     PhysicalHashJoin,
@@ -43,6 +44,8 @@ from ..plan.physical import (
     PhysicalValues,
     PhysicalWindow,
     _DYNAMIC_FILTER_MAX_KEYS,
+    _GROUPED_LIMIT_INDEX_COL,
+    _MERGE_GROUPED_LIMIT_RELATION,
     _physical_column_name,
 )
 
@@ -431,6 +434,26 @@ def _relabel_columns(binding, body, names, ctx):
     return result
 
 
+def _emit_grouped_limit(node, ctx):
+    """Keep at most `limit` rows per group. The node's SQL expects a synthetic
+    row-index column (added by the merge engine to preserve input order for the
+    final ORDER BY); our binding lacks it, so wrap the input in a CTE named for
+    the merge relation that adds it, then run the node's rendered SQL."""
+    child = _emit(node.input, ctx)
+    node_sql = node._grouped_limit_sql(node.input.schema().names)
+    sql = (
+        f"WITH {_MERGE_GROUPED_LIMIT_RELATION} AS "
+        f'(SELECT *, ROW_NUMBER() OVER () AS "{_GROUPED_LIMIT_INDEX_COL}" '
+        "FROM __gl_input) "
+        + node_sql
+    )
+    fragment = ctx.names.fragment()
+    ctx.fragments[fragment] = {"kind": "raw_sql", "sql": sql}
+    result = ctx.names.binding()
+    ctx.steps.append({"op": "merge", "fragment": fragment, "inputs": {"__gl_input": child}, "binding": result})
+    return result
+
+
 def _emit_window(node, ctx):
     """A window-bearing projection: register the input as `in_window` and run the
     rendered `SELECT <exprs> OVER (...) FROM in_window` as a raw_sql fragment."""
@@ -773,6 +796,7 @@ _NODE_EMITTERS = {
     PhysicalCTEScan: _emit_cte_scan,
     PhysicalAliasedRelation: _emit_passthrough,
     PhysicalWindow: _emit_window,
+    PhysicalGroupedLimit: _emit_grouped_limit,
 }
 
 
