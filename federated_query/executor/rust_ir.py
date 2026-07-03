@@ -18,7 +18,6 @@ from ..plan.expressions import (
     BinaryOp,
     BinaryOpType,
     ColumnRef,
-    Expression,
     FunctionCall,
     Literal,
 )
@@ -40,8 +39,6 @@ class UnsupportedIR(Exception):
 
 
 # Binary operators the Rust engine understands, keyed by the engine's enum.
-# The Rust side accepts arithmetic/comparison symbols verbatim plus lowercase
-# ``and``/``or``; anything absent here is refused loudly.
 _BINARY_OP_TOKENS = {
     BinaryOpType.ADD: "+",
     BinaryOpType.SUBTRACT: "-",
@@ -58,109 +55,143 @@ _BINARY_OP_TOKENS = {
     BinaryOpType.OR: "or",
 }
 
+# Typed-literal tags keyed by the value's exact Python type. `bool` is a
+# subclass of `int`, so exact-type lookup keeps them distinct.
+_LITERAL_KINDS = {bool: "bool", int: "int", float: "float", str: "str"}
 
-def expr_to_ir(expr: Expression) -> dict:
-    """Serialize one engine expression into an IR expression node.
 
-    Supports the shapes a simple scan filter needs (column / literal / binary).
-    Unsupported node types raise, never degrade.
-    """
+# --- expression serialization -------------------------------------------------
+
+def expr_to_ir(expr):
+    """Serialize a source-side expression; columns keep their own qualifier."""
+    return _serialize_expr(expr, _plain_column)
+
+
+def _plain_column(col_ref):
+    """A column node carrying the reference's own relation qualifier."""
+    node = {"node": "column", "name": col_ref.column}
+    if col_ref.table is not None:
+        node["relation"] = col_ref.table
+    return node
+
+
+def _serialize_expr(expr, column_fn):
+    """Serialize one expression; `column_fn` renders each ColumnRef."""
     if isinstance(expr, ColumnRef):
-        node = {"node": "column", "name": expr.column}
-        if expr.table is not None:
-            node["relation"] = expr.table
-        return node
-
+        return column_fn(expr)
     if isinstance(expr, Literal):
         return {"node": "literal", "value": _literal_value(expr.value)}
-
     if isinstance(expr, BinaryOp):
-        token = _BINARY_OP_TOKENS.get(expr.op)
-        if token is None:
-            raise UnsupportedIR(f"binary operator {expr.op} not supported in IR")
-        return {
-            "node": "binary",
-            "op": token,
-            "left": expr_to_ir(expr.left),
-            "right": expr_to_ir(expr.right),
-        }
-
+        return _serialize_binary(expr, column_fn)
     raise UnsupportedIR(f"expression {type(expr).__name__} not supported in IR")
 
 
-def _literal_value(value) -> dict:
-    """Map a Python literal value to the IR's typed-literal form.
+def _serialize_binary(expr, column_fn):
+    """Serialize a binary operation, refusing operators the engine lacks."""
+    token = _BINARY_OP_TOKENS.get(expr.op)
+    if token is None:
+        raise UnsupportedIR(f"binary operator {expr.op} not supported in IR")
+    left = _serialize_expr(expr.left, column_fn)
+    right = _serialize_expr(expr.right, column_fn)
+    return {"node": "binary", "op": token, "left": left, "right": right}
 
-    ``bool`` is checked before ``int`` because ``bool`` is an ``int`` subclass.
-    """
+
+def _literal_value(value):
+    """Map a Python literal to the IR's typed-literal form."""
     if value is None:
         return {"lit": "null"}
-    if isinstance(value, bool):
-        return {"lit": "bool", "value": value}
-    if isinstance(value, int):
-        return {"lit": "int", "value": value}
-    if isinstance(value, float):
-        return {"lit": "float", "value": value}
-    if isinstance(value, str):
-        return {"lit": "str", "value": value}
-    raise UnsupportedIR(f"literal value of type {type(value).__name__} not supported")
+    kind = _LITERAL_KINDS.get(type(value))
+    if kind is None:
+        raise UnsupportedIR(f"literal of type {type(value).__name__} not supported")
+    return {"lit": kind, "value": value}
 
 
-def raw_scan_spec(node) -> dict:
-    """A scan spec that carries pre-rendered source SQL.
+def _expr_over(expr, input_name, child_aliases):
+    """Serialize an expression whose columns come from one input relation.
 
-    Used for a single-source subtree (or any scan we don't need to inject a
-    dynamic filter into): Python's emitter already renders dialect-correct SQL,
-    and Rust runs it natively. ``node`` must expose the engine's source-SQL
-    renderer (``PhysicalScan`` / ``PhysicalRemoteQuery``).
+    Each ColumnRef resolves through `child_aliases` to the physical column name
+    in that input's binding, tagged with `input_name` (e.g. `in_0`).
+    """
+    def column(col_ref):
+        return {
+            "node": "column",
+            "relation": input_name,
+            "name": _physical_column_name(col_ref, child_aliases),
+        }
+
+    return _serialize_expr(expr, column)
+
+
+# --- scan specs ---------------------------------------------------------------
+
+def raw_scan_spec(node):
+    """A scan spec carrying pre-rendered source SQL (Python's emitter).
+
+    Used for a single-source subtree or any scan we do not inject a dynamic
+    filter into; Rust runs the SQL natively.
     """
     if isinstance(node, PhysicalScan):
         return {"raw_sql": node._render_source_sql()}
-    # PhysicalRemoteQuery and any other single-source leaf render through _sql().
     renderer = getattr(node, "_sql", None)
     if renderer is None:
-        raise UnsupportedIR(
-            f"{type(node).__name__} does not render source SQL for a raw scan"
-        )
+        raise UnsupportedIR(f"{type(node).__name__} does not render source SQL")
     return {"raw_sql": renderer()}
 
 
-def structured_scan_spec(scan: PhysicalScan) -> dict:
+def structured_scan_spec(scan):
     """A structured scan spec for a plain single-table scan.
 
     Required when Rust must inject a dynamic ``col IN (...)`` filter: the scan
-    must be a bare table read (no pushed aggregate / grouping / order-by), so
-    the injected predicate composes correctly. Raises otherwise.
+    must be a bare table read so the injected predicate composes correctly.
     """
-    if scan.aggregates or scan.group_by or scan.grouping_sets:
+    _reject_nonplain_scan(scan)
+    spec = {"table": scan.table_name, "columns": list(scan.columns)}
+    _add_scan_qualifiers(scan, spec)
+    _add_scan_predicates(scan, spec)
+    return spec
+
+
+def _reject_nonplain_scan(scan):
+    """Refuse a scan that already folds aggregation/ordering/limits."""
+    if any((scan.aggregates, scan.group_by, scan.grouping_sets)):
         raise UnsupportedIR("cannot inject a dynamic filter into an aggregate scan")
-    if scan.order_by_keys or scan.limit is not None or scan.offset:
+    if any((scan.order_by_keys, scan.limit is not None, scan.offset)):
         raise UnsupportedIR("cannot inject a dynamic filter into an ordered/limited scan")
 
-    spec: dict = {"table": scan.table_name, "columns": list(scan.columns)}
+
+def _add_scan_qualifiers(scan, spec):
+    """Copy the optional schema and alias onto the scan spec."""
     if scan.schema_name:
         spec["schema"] = scan.schema_name
     if scan.alias:
         spec["alias"] = scan.alias
+
+
+def _add_scan_predicates(scan, spec):
+    """Copy the optional filter and DISTINCT flag onto the scan spec."""
     if scan.filters is not None:
         spec["filter"] = expr_to_ir(scan.filters)
     if scan.distinct:
         spec["distinct"] = True
-    return spec
 
+
+# --- plan walker --------------------------------------------------------------
 
 class _Names:
     """Hands out unique binding and fragment names within one IR."""
 
     def __init__(self):
+        """Start the binding and fragment counters at zero."""
         self._b = 0
         self._f = 0
 
-    def binding(self) -> str:
+    def binding(self):
+        """Return the next unique binding name."""
         self._b += 1
         return f"b{self._b}"
 
-    def fragment(self) -> str:
+    def fragment(self):
+        """Return the next unique fragment name."""
         self._f += 1
         return f"f{self._f}"
 
@@ -169,241 +200,324 @@ class _Ctx:
     """Accumulates IR steps and fragments while walking a plan bottom-up."""
 
     def __init__(self):
-        self.steps: list = []
-        self.fragments: dict = {}
+        """Start with empty steps/fragments and fresh name counters."""
+        self.steps = []
+        self.fragments = {}
         self.names = _Names()
 
 
-def build_ir(plan) -> dict:
+def build_ir(plan):
     """Serialize a physical plan root into the execution IR.
 
     Walks the tree bottom-up: each node emits its steps and yields a binding
     whose Arrow columns are named by that node's output schema, so a parent
-    resolves its expressions against ``child.column_aliases()`` (the same
-    contract the engine's own operators use). Unsupported shapes raise so we
-    never emit a plan that could produce wrong rows.
+    resolves its expressions against ``child.column_aliases()``. Unsupported
+    shapes raise so we never emit a plan that could produce wrong rows.
     """
     ctx = _Ctx()
     binding = _emit(plan, ctx)
     ctx.steps.append({"op": "return", "input": binding})
-    outputs = list(getattr(plan, "output_names", None) or plan.schema().names)
-    return {"outputs": outputs, "steps": ctx.steps, "fragments": ctx.fragments}
+    return {"outputs": _plan_outputs(plan), "steps": ctx.steps, "fragments": ctx.fragments}
 
 
-def _emit(node, ctx: _Ctx) -> str:
+def _plan_outputs(plan):
+    """The result column names, from output_names or the node schema."""
+    names = getattr(plan, "output_names", None)
+    if names:
+        return list(names)
+    return list(plan.schema().names)
+
+
+def _emit(node, ctx):
     """Emit steps for `node`, returning the binding that holds its output."""
-    if isinstance(node, (PhysicalRemoteQuery, PhysicalScan)):
-        binding = ctx.names.binding()
-        ctx.steps.append({
-            "op": "source_scan",
-            "datasource": node.datasource,
-            "scan": raw_scan_spec(node),
-            "binding": binding,
-        })
-        return binding
-    if isinstance(node, PhysicalHashJoin):
-        return _emit_join(node, ctx)
-    if isinstance(node, PhysicalProjection):
-        return _emit_projection(node, ctx)
-    if isinstance(node, PhysicalHashAggregate):
-        return _emit_aggregate(node, ctx)
-    if isinstance(node, PhysicalSort):
-        return _emit_sort(node, ctx)
-    raise UnsupportedIR(f"physical node {type(node).__name__} not supported yet")
+    emitter = _NODE_EMITTERS.get(type(node))
+    if emitter is None:
+        raise UnsupportedIR(f"physical node {type(node).__name__} not supported yet")
+    return emitter(node, ctx)
 
 
-def _emit_sort(node, ctx: _Ctx) -> str:
-    """An ORDER BY over its single input, as a `sort` fragment."""
-    child = _emit(node.input, ctx)
-    child_aliases = node.input.column_aliases()
-    keys = []
-    for i, (expr, asc) in enumerate(zip(node.sort_keys, node.ascending)):
-        nulls = node.nulls_order[i] if node.nulls_order else None
-        # SQL default NULL placement: DESC -> NULLS FIRST, ASC -> NULLS LAST.
-        nulls_first = (str(nulls).upper() == "FIRST") if nulls is not None else (not asc)
-        keys.append({
-            "expr": _expr_over(expr, "in_0", child_aliases),
-            "ascending": asc,
-            "nulls_first": nulls_first,
-        })
-    frag = ctx.names.fragment()
-    ctx.fragments[frag] = {"kind": "sort", "keys": keys}
+def _emit_source(node, ctx):
+    """A source scan run natively, as pre-rendered SQL."""
+    binding = ctx.names.binding()
+    ctx.steps.append({
+        "op": "source_scan", "datasource": node.datasource,
+        "scan": raw_scan_spec(node), "binding": binding,
+    })
+    return binding
+
+
+def _merge_step(ctx, fragment, inputs):
+    """Append a merge step running `fragment` over `inputs`; return its binding."""
     result = ctx.names.binding()
     ctx.steps.append({
-        "op": "merge", "fragment": frag,
-        "inputs": {"in_0": child}, "binding": result,
+        "op": "merge", "fragment": fragment, "inputs": inputs, "binding": result,
     })
     return result
 
 
-def _emit_aggregate(node, ctx: _Ctx) -> str:
-    """A GROUP BY over its single input, as an `aggregate` fragment.
+def _emit_projection(node, ctx):
+    """A projection over its single input, as a `project` fragment."""
+    child = _emit(node.input, ctx)
+    aliases = node.input.column_aliases()
+    project = _projection_items(node.expressions, node.output_names, "in_0", aliases)
+    fragment = ctx.names.fragment()
+    ctx.fragments[fragment] = {"kind": "project", "project": project}
+    return _merge_step(ctx, fragment, {"in_0": child})
 
-    The node's `aggregates` list is the output SELECT list: each item is either
-    an aggregate FunctionCall or a plain grouping expression, aliased by
-    `output_names`. Columns resolve against the child's aliases (relation `in_0`).
-    """
+
+def _projection_items(expressions, names, input_name, aliases):
+    """Serialize each output expression aliased to its output name."""
+    items = []
+    for expr, name in zip(expressions, names):
+        items.append({"expr": _expr_over(expr, input_name, aliases), "alias": name})
+    return items
+
+
+def _emit_aggregate(node, ctx):
+    """A GROUP BY over its single input, as an `aggregate` fragment."""
     if node.grouping_sets:
         raise UnsupportedIR("GROUPING SETS/ROLLUP/CUBE not yet supported")
     child = _emit(node.input, ctx)
-    child_aliases = node.input.column_aliases()
-
-    group_by = [_expr_over(g, "in_0", child_aliases) for g in node.group_by]
-    select = []
-    for expr, name in zip(node.aggregates, node.output_names):
-        if isinstance(expr, FunctionCall) and expr.is_aggregate:
-            select.append({"agg": _agg_call(expr, child_aliases), "alias": name})
-        else:
-            select.append({"expr": _expr_over(expr, "in_0", child_aliases), "alias": name})
-
-    frag = ctx.names.fragment()
-    ctx.fragments[frag] = {"kind": "aggregate", "select": select, "group_by": group_by}
-    result = ctx.names.binding()
-    ctx.steps.append({
-        "op": "merge", "fragment": frag,
-        "inputs": {"in_0": child}, "binding": result,
-    })
-    return result
+    aliases = node.input.column_aliases()
+    group_by = _serialize_group_by(node.group_by, aliases)
+    select = _aggregate_select(node.aggregates, node.output_names, aliases)
+    fragment = ctx.names.fragment()
+    ctx.fragments[fragment] = {"kind": "aggregate", "select": select, "group_by": group_by}
+    return _merge_step(ctx, fragment, {"in_0": child})
 
 
-def _agg_call(fn: FunctionCall, child_aliases: dict) -> dict:
-    """Serialize an aggregate FunctionCall. `count(*)` is the star form."""
+def _serialize_group_by(group_by, aliases):
+    """Serialize each grouping key over the `in_0` input."""
+    items = []
+    for key in group_by:
+        items.append(_expr_over(key, "in_0", aliases))
+    return items
+
+
+def _aggregate_select(aggregates, names, aliases):
+    """Serialize the aggregate SELECT list (agg calls and grouping columns)."""
+    items = []
+    for expr, name in zip(aggregates, names):
+        items.append(_aggregate_item(expr, name, aliases))
+    return items
+
+
+def _aggregate_item(expr, name, aliases):
+    """One aggregate output: an aggregate call or a plain grouping expression."""
+    if isinstance(expr, FunctionCall) and expr.is_aggregate:
+        return {"agg": _agg_call(expr, aliases), "alias": name}
+    return {"expr": _expr_over(expr, "in_0", aliases), "alias": name}
+
+
+def _agg_call(fn, aliases):
+    """Serialize an aggregate FunctionCall; `count(*)` is the star form."""
     if fn.within_group_key is not None:
         raise UnsupportedIR("ordered-set aggregates (WITHIN GROUP) not yet supported")
-    star = (
-        len(fn.args) == 1
-        and isinstance(fn.args[0], ColumnRef)
-        and fn.args[0].column == "*"
-    )
-    args = [] if star else [_expr_over(a, "in_0", child_aliases) for a in fn.args]
+    star = _is_star_arg(fn.args)
+    args = _agg_args(fn.args, aliases, star)
     return {"func": fn.function_name, "distinct": fn.distinct, "star": star, "args": args}
 
 
-def _emit_projection(node, ctx: _Ctx) -> str:
-    """A projection over its single input, as a `project` fragment."""
+def _is_star_arg(args):
+    """True when the single argument is the `*` wildcard column."""
+    if len(args) != 1:
+        return False
+    first = args[0]
+    return isinstance(first, ColumnRef) and first.column == "*"
+
+
+def _agg_args(args, aliases, star):
+    """Serialize aggregate arguments; the star form takes none."""
+    if star:
+        return []
+    items = []
+    for arg in args:
+        items.append(_expr_over(arg, "in_0", aliases))
+    return items
+
+
+def _emit_sort(node, ctx):
+    """An ORDER BY over its single input, as a `sort` fragment."""
     child = _emit(node.input, ctx)
-    child_aliases = node.input.column_aliases()
-    project = [
-        {"expr": _expr_over(expr, "in_0", child_aliases), "alias": name}
-        for expr, name in zip(node.expressions, node.output_names)
-    ]
-    frag = ctx.names.fragment()
-    ctx.fragments[frag] = {"kind": "project", "project": project}
-    result = ctx.names.binding()
-    ctx.steps.append({
-        "op": "merge", "fragment": frag,
-        "inputs": {"in_0": child}, "binding": result,
-    })
-    return result
+    aliases = node.input.column_aliases()
+    keys = _sort_keys(node, aliases)
+    fragment = ctx.names.fragment()
+    ctx.fragments[fragment] = {"kind": "sort", "keys": keys}
+    return _merge_step(ctx, fragment, {"in_0": child})
 
 
-def _emit_join(join, ctx: _Ctx) -> str:
-    """Emit build/collect/inject/merge for an INNER hash join, producing the
-    join's canonical output columns (so a parent can reference them).
+def _sort_keys(node, aliases):
+    """Serialize each ORDER BY key with direction and NULL placement."""
+    keys = []
+    for index, expr in enumerate(node.sort_keys):
+        keys.append(_sort_key(node, index, expr, aliases))
+    return keys
+
+
+def _sort_key(node, index, expr, aliases):
+    """One sort key: expression, direction, and NULL placement."""
+    ascending = node.ascending[index]
+    nulls_first = _nulls_first(node.nulls_order, index, ascending)
+    return {
+        "expr": _expr_over(expr, "in_0", aliases),
+        "ascending": ascending,
+        "nulls_first": nulls_first,
+    }
+
+
+def _nulls_first(nulls_order, index, ascending):
+    """NULL placement: explicit if given, else SQL default (DESC first)."""
+    if not nulls_order:
+        return not ascending
+    setting = nulls_order[index]
+    if setting is None:
+        return not ascending
+    return str(setting).upper() == "FIRST"
+
+
+def _emit_join(join, ctx):
+    """Emit build/collect/inject/merge for an INNER hash join.
 
     Semi-join reduction: read the build side, collect its distinct join key,
     inject those values into the probe's SQL as `probe_key IN (...)` (all in
-    Rust), then join.
+    Rust), then join and emit the join's canonical output columns.
     """
+    _check_join_supported(join)
+    build_child, probe_child, build_key_expr, probe_key_expr = _orient_join(join)
+    build_binding, probe_binding = _emit_reduced_inputs(
+        ctx, build_child, probe_child, build_key_expr, probe_key_expr)
+    return _emit_join_merge(join, ctx, build_child, build_binding, probe_binding)
+
+
+def _check_join_supported(join):
+    """Refuse join shapes the serializer does not yet cover."""
     if join.join_type != JoinType.INNER:
         raise UnsupportedIR(f"join type {join.join_type} not yet supported")
     if len(join.left_keys) != 1 or len(join.right_keys) != 1:
         raise UnsupportedIR("multi-key join not yet supported")
-    left, right = join.left, join.right
-    if not isinstance(left, PhysicalScan) or not isinstance(right, PhysicalScan):
+    _check_scan_children(join)
+
+
+def _check_scan_children(join):
+    """Refuse a join whose children are not plain scans (for now)."""
+    if not isinstance(join.left, PhysicalScan):
+        raise UnsupportedIR("join children must be plain scans for now")
+    if not isinstance(join.right, PhysicalScan):
         raise UnsupportedIR("join children must be plain scans for now")
 
-    if join.build_side == "left":
-        build_child, probe_child = left, right
-        build_key_expr, probe_key_expr = join.left_keys[0], join.right_keys[0]
-    else:
-        build_child, probe_child = right, left
-        build_key_expr, probe_key_expr = join.right_keys[0], join.left_keys[0]
 
+def _orient_join(join):
+    """Pick build/probe sides and their join keys from the build_side choice."""
+    if join.build_side == "left":
+        return join.left, join.right, join.left_keys[0], join.right_keys[0]
+    return join.right, join.left, join.right_keys[0], join.left_keys[0]
+
+
+def _emit_reduced_inputs(ctx, build_child, probe_child, build_key_expr, probe_key_expr):
+    """Emit the build scan, its distinct keys, and the injected probe scan."""
     build_key = _physical_column_name(build_key_expr, build_child.column_aliases())
     inject_col = _physical_column_name(probe_key_expr, probe_child.column_aliases())
-
     build_binding = ctx.names.binding()
     keys_binding = ctx.names.binding()
     probe_binding = ctx.names.binding()
+    _emit_build_scan(ctx, build_child, build_binding)
+    _emit_collect_distinct(ctx, build_binding, build_key, keys_binding)
+    _emit_injected_scan(ctx, probe_child, inject_col, keys_binding, probe_binding)
+    return build_binding, probe_binding
 
+
+def _emit_build_scan(ctx, build_child, binding):
+    """A fully materialized build-side scan (it is also distinct-scanned)."""
     ctx.steps.append({
         "op": "source_scan", "datasource": build_child.datasource,
-        "scan": raw_scan_spec(build_child), "binding": build_binding,
-        "materialize": True,
+        "scan": raw_scan_spec(build_child), "binding": binding, "materialize": True,
     })
+
+
+def _emit_collect_distinct(ctx, input_binding, key, binding):
+    """Collect the build side's distinct join-key values, capped."""
     ctx.steps.append({
-        "op": "collect_distinct", "input": build_binding, "key": build_key,
-        "cap": _DYNAMIC_FILTER_MAX_KEYS, "binding": keys_binding,
+        "op": "collect_distinct", "input": input_binding, "key": key,
+        "cap": _DYNAMIC_FILTER_MAX_KEYS, "binding": binding,
     })
+
+
+def _emit_injected_scan(ctx, probe_child, inject_col, keys_binding, binding):
+    """A probe scan with the build's keys pushed in as `col IN (...)`."""
     ctx.steps.append({
         "op": "injected_scan", "datasource": probe_child.datasource,
         "scan": structured_scan_spec(probe_child), "inject_column": inject_col,
-        "keys_from": keys_binding, "binding": probe_binding,
+        "keys_from": keys_binding, "binding": binding,
     })
 
-    left_binding = build_binding if build_child is left else probe_binding
-    right_binding = build_binding if build_child is right else probe_binding
-    left_key = _physical_column_name(join.left_keys[0], left.column_aliases())
-    right_key = _physical_column_name(join.right_keys[0], right.column_aliases())
 
-    # Canonical output: every join output column, from whichever side owns it.
-    left_aliases = left.column_aliases()
-    right_aliases = right.column_aliases()
-    left_tables = {tbl for (tbl, _c) in left_aliases}
-    project = []
-    for (tbl, col), out_name in join.column_aliases().items():
-        side = "in_left" if tbl in left_tables else "in_right"
-        aliases = left_aliases if tbl in left_tables else right_aliases
-        phys = aliases[(tbl, col)]
-        project.append({
-            "expr": {"node": "column", "relation": side, "name": phys},
-            "alias": out_name,
-        })
+def _emit_join_merge(join, ctx, build_child, build_binding, probe_binding):
+    """Wire the join inputs to their semantic sides and emit the join fragment."""
+    left_binding = build_binding if build_child is join.left else probe_binding
+    right_binding = build_binding if build_child is join.right else probe_binding
+    fragment = ctx.names.fragment()
+    ctx.fragments[fragment] = _join_fragment(join)
+    return _merge_step(ctx, fragment, {"in_left": left_binding, "in_right": right_binding})
 
-    frag = ctx.names.fragment()
-    ctx.fragments[frag] = {
+
+def _join_fragment(join):
+    """Build the hash-join fragment: keys plus the canonical output projection."""
+    left_key = _physical_column_name(join.left_keys[0], join.left.column_aliases())
+    right_key = _physical_column_name(join.right_keys[0], join.right.column_aliases())
+    return {
         "kind": "hash_join", "join_type": "inner",
-        "left_keys": [left_key], "right_keys": [right_key], "project": project,
+        "left_keys": [left_key], "right_keys": [right_key],
+        "project": _join_output_projection(join),
     }
-    result = ctx.names.binding()
-    ctx.steps.append({
-        "op": "merge", "fragment": frag,
-        "inputs": {"in_left": left_binding, "in_right": right_binding},
-        "binding": result,
-    })
-    return result
 
 
-def _expr_over(expr: Expression, input_name: str, child_aliases: dict) -> dict:
-    """Serialize an expression whose columns come from one input relation.
+def _join_output_projection(join):
+    """Every join output column, from whichever side owns it, canonically named."""
+    left_aliases = join.left.column_aliases()
+    right_aliases = join.right.column_aliases()
+    left_tables = _relation_names(left_aliases)
+    project = []
+    for (table, column), out_name in join.column_aliases().items():
+        item = _join_projection_item(
+            table, column, out_name, left_tables, left_aliases, right_aliases)
+        project.append(item)
+    return project
 
-    Each ColumnRef resolves through `child_aliases` to the physical column name
-    in that input's binding, tagged with `input_name` (e.g. `in_0`)."""
-    if isinstance(expr, ColumnRef):
-        return {
-            "node": "column",
-            "relation": input_name,
-            "name": _physical_column_name(expr, child_aliases),
-        }
-    if isinstance(expr, Literal):
-        return {"node": "literal", "value": _literal_value(expr.value)}
-    if isinstance(expr, BinaryOp):
-        token = _BINARY_OP_TOKENS.get(expr.op)
-        if token is None:
-            raise UnsupportedIR(f"binary operator {expr.op} not supported in IR")
-        return {
-            "node": "binary",
-            "op": token,
-            "left": _expr_over(expr.left, input_name, child_aliases),
-            "right": _expr_over(expr.right, input_name, child_aliases),
-        }
-    raise UnsupportedIR(f"expression {type(expr).__name__} not supported")
+
+def _relation_names(aliases):
+    """The set of relation aliases present in a column-alias map."""
+    names = set()
+    for (table, _column) in aliases:
+        names.add(table)
+    return names
+
+
+def _join_projection_item(table, column, out_name, left_tables, left_aliases, right_aliases):
+    """One join output column, resolved to its input side and physical name."""
+    if table in left_tables:
+        return _side_column("in_left", left_aliases[(table, column)], out_name)
+    return _side_column("in_right", right_aliases[(table, column)], out_name)
+
+
+def _side_column(relation, name, alias):
+    """A projection item selecting `relation`.`name` aliased to `alias`."""
+    return {"expr": {"node": "column", "relation": relation, "name": name}, "alias": alias}
+
+
+# Physical node type -> its emitter. Defined after the emitters it references.
+_NODE_EMITTERS = {
+    PhysicalRemoteQuery: _emit_source,
+    PhysicalScan: _emit_source,
+    PhysicalHashJoin: _emit_join,
+    PhysicalProjection: _emit_projection,
+    PhysicalHashAggregate: _emit_aggregate,
+    PhysicalSort: _emit_sort,
+}
 
 
 # --- datasource registration bridge -------------------------------------------
 
-def _pg_adbc_driver_path() -> str:
+def _pg_adbc_driver_path():
     """Locate the ADBC Postgres driver shared library shipped with the venv."""
     import adbc_driver_postgresql
 
@@ -413,26 +527,29 @@ def _pg_adbc_driver_path() -> str:
     )
 
 
-def register_datasources(datasources) -> None:
+def register_datasources(datasources):
     """Register each Python datasource with the Rust engine (by name)."""
     import fedqrs
 
-    from ..datasources.postgresql import PostgreSQLDataSource
     from ..datasources.duckdb import DuckDBDataSource
+    from ..datasources.postgresql import PostgreSQLDataSource
 
-    for ds in datasources:
-        if isinstance(ds, PostgreSQLDataSource):
-            fedqrs.register_datasource(
-                ds.name,
-                "postgres",
-                {"uri": ds._adbc_uri(), "adbc_driver": _pg_adbc_driver_path()},
-            )
-        elif isinstance(ds, DuckDBDataSource):
-            fedqrs.register_datasource(ds.name, "duckdb", {"path": ds.db_path})
-        else:
-            raise UnsupportedIR(
-                f"datasource {type(ds).__name__} has no native Rust connector yet"
-            )
+    for datasource in datasources:
+        _register_one(fedqrs, datasource, PostgreSQLDataSource, DuckDBDataSource)
+
+
+def _register_one(fedqrs, datasource, postgres_cls, duckdb_cls):
+    """Register a single datasource, dispatching on its connector type."""
+    if isinstance(datasource, postgres_cls):
+        params = {"uri": datasource._adbc_uri(), "adbc_driver": _pg_adbc_driver_path()}
+        fedqrs.register_datasource(datasource.name, "postgres", params)
+        return
+    if isinstance(datasource, duckdb_cls):
+        fedqrs.register_datasource(datasource.name, "duckdb", {"path": datasource.db_path})
+        return
+    raise UnsupportedIR(
+        f"datasource {type(datasource).__name__} has no native Rust connector yet"
+    )
 
 
 def execute_via_rust(plan, datasources):

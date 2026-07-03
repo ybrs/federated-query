@@ -123,9 +123,20 @@ def engine():
     setup.close()
 
 
+def _table_rows(table):
+    """Materialize a pyarrow table as a list of Python-value row tuples."""
+    rows = []
+    for index in range(table.num_rows):
+        row = []
+        for column in table.columns:
+            row.append(column[index].as_py())
+        rows.append(tuple(row))
+    return rows
+
+
 def _rows(table):
-    return sorted(tuple(col[i].as_py() for col in table.columns)
-                  for i in range(table.num_rows))
+    """Row tuples, sorted, for order-insensitive comparison."""
+    return sorted(_table_rows(table))
 
 
 def _assert_parity(qe, datasources, sql):
@@ -202,7 +213,8 @@ def test_cross_source_decimal_aggregate(engine):
 
 
 def _ordered(table):
-    return [tuple(col[i].as_py() for col in table.columns) for i in range(table.num_rows)]
+    """Row tuples in table order, for order-sensitive comparison."""
+    return _table_rows(table)
 
 
 def test_cross_source_order_by(engine):
