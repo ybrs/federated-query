@@ -26,6 +26,7 @@ from ..plan.physical import (
     PhysicalAliasedRelation,
     PhysicalFilter,
     PhysicalHashAggregate,
+    PhysicalLimit,
     PhysicalHashJoin,
     PhysicalProjection,
     PhysicalRemoteQuery,
@@ -353,6 +354,14 @@ def _emit_filter(node, ctx):
     return _merge_step(ctx, fragment, {"in_0": child})
 
 
+def _emit_limit(node, ctx):
+    """A LIMIT/OFFSET over its single input, as a `limit` fragment."""
+    child = _emit(node.input, ctx)
+    fragment = ctx.names.fragment()
+    ctx.fragments[fragment] = {"kind": "limit", "limit": node.limit, "offset": node.offset}
+    return _merge_step(ctx, fragment, {"in_0": child})
+
+
 def _emit_sort(node, ctx):
     """An ORDER BY over its single input, as a `sort` fragment."""
     child = _emit(node.input, ctx)
@@ -559,6 +568,7 @@ _NODE_EMITTERS = {
     PhysicalHashAggregate: _emit_aggregate,
     PhysicalSort: _emit_sort,
     PhysicalFilter: _emit_filter,
+    PhysicalLimit: _emit_limit,
     PhysicalAliasedRelation: _emit_passthrough,
 }
 
