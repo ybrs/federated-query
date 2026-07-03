@@ -14,6 +14,8 @@ a plan that would silently produce wrong rows.
 
 import os
 
+from sqlglot import exp
+
 from ..plan.expressions import (
     BinaryOp,
     BinaryOpType,
@@ -34,6 +36,7 @@ from ..plan.physical import (
     PhysicalRemoteQuery,
     PhysicalScan,
     PhysicalSort,
+    PhysicalValues,
     _DYNAMIC_FILTER_MAX_KEYS,
     _physical_column_name,
 )
@@ -387,6 +390,45 @@ def _emit_limit(node, ctx):
     return _merge_step(ctx, fragment, {"in_0": child})
 
 
+def _emit_values(node, ctx):
+    """A VALUES relation of constant rows: render it as `SELECT * FROM (VALUES
+    ...) AS v(names)` and run it as a `raw_sql` fragment (no inputs)."""
+    sql = _render_values_sql(node.rows, node.output_names)
+    fragment = ctx.names.fragment()
+    ctx.fragments[fragment] = {"kind": "raw_sql", "sql": sql}
+    result = ctx.names.binding()
+    ctx.steps.append({"op": "merge", "fragment": fragment, "inputs": {}, "binding": result})
+    return result
+
+
+def _render_values_sql(rows, names):
+    """Render a constant VALUES relation to DataFusion-compatible SQL."""
+    tuples = []
+    for row in rows:
+        tuples.append(exp.Tuple(expressions=_values_row(row)))
+    columns = []
+    for name in names:
+        columns.append(exp.to_identifier(name))
+    alias = exp.TableAlias(this=exp.to_identifier("v"), columns=columns)
+    values = exp.Values(expressions=tuples, alias=alias)
+    return exp.select("*").from_(values).sql()
+
+
+def _values_row(row):
+    """Convert one row of constant cells to sqlglot literal expressions."""
+    cells = []
+    for cell in row:
+        cells.append(_values_cell(cell))
+    return cells
+
+
+def _values_cell(cell):
+    """A single VALUES cell; only constant literals are supported."""
+    if not isinstance(cell, Literal):
+        raise UnsupportedIR(f"non-literal VALUES cell {type(cell).__name__}")
+    return exp.convert(cell.value)
+
+
 def _emit_sort(node, ctx):
     """An ORDER BY over its single input, as a `sort` fragment."""
     child = _emit(node.input, ctx)
@@ -612,6 +654,7 @@ _NODE_EMITTERS = {
     PhysicalSort: _emit_sort,
     PhysicalFilter: _emit_filter,
     PhysicalLimit: _emit_limit,
+    PhysicalValues: _emit_values,
     PhysicalCTEMergeQuery: _emit_cte_merge,
     PhysicalCTEScan: _emit_cte_scan,
     PhysicalAliasedRelation: _emit_passthrough,
