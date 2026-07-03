@@ -82,13 +82,14 @@ def engine():
         )
         cur.execute(
             f"CREATE TABLE {SCHEMA}.nation "
-            "(n_nationkey INT, n_name TEXT, n_regionkey INT)"
+            "(n_nationkey INT, n_name TEXT, n_regionkey INT, n_amount NUMERIC(10,2))"
         )
         cur.execute(
             f"INSERT INTO {SCHEMA}.nation VALUES "
-            "(0,'ALGERIA',0),(1,'ARGENTINA',1),(2,'BRAZIL',1),(3,'CANADA',1),"
-            "(4,'EGYPT',4),(5,'ETHIOPIA',0),(6,'FRANCE',3),(7,'GERMANY',3),"
-            "(8,'INDIA',2),(9,'INDONESIA',2)"
+            "(0,'ALGERIA',0,10.50),(1,'ARGENTINA',1,20.25),(2,'BRAZIL',1,5.10),"
+            "(3,'CANADA',1,7.75),(4,'EGYPT',4,3.30),(5,'ETHIOPIA',0,9.90),"
+            "(6,'FRANCE',3,100.01),(7,'GERMANY',3,2.20),(8,'INDIA',2,4.40),"
+            "(9,'INDONESIA',2,8.80)"
         )
 
     ds_a = PostgreSQLDataSource(name="srcA", config=dict(cfg))
@@ -177,6 +178,27 @@ def test_cross_source_aggregate(engine):
         "ON n.n_regionkey = r.r_regionkey GROUP BY r.r_name"
     )
     _assert_parity(qe, datasources, sql)
+
+
+def test_cross_source_decimal_aggregate(engine):
+    """Postgres NUMERIC arrives over ADBC as opaque strings; the engine casts
+    them to a real number on read, so decimal arithmetic/SUM works. Compared to
+    the DuckDB path within float precision."""
+    qe, datasources = engine
+    sql = (
+        "SELECT r.r_name, sum(n.n_amount * 2) AS total "
+        f"FROM srcA.{SCHEMA}.nation n JOIN srcB.{SCHEMA}.region r "
+        "ON n.n_regionkey = r.r_regionkey GROUP BY r.r_name"
+    )
+    plan = qe._plan_pipeline(sql, profiler=None)
+    rust_tbl = execute_via_rust(plan, datasources)
+    rust = dict(zip(rust_tbl.column("r_name").to_pylist(), rust_tbl.column("total").to_pylist()))
+    ref_tbl = qe.execute(sql)
+    ref = {r: t for r, t in zip(
+        ref_tbl.column("r_name").to_pylist(), ref_tbl.column("total").to_pylist())}
+    assert rust.keys() == ref.keys()
+    for k in ref:
+        assert abs(float(rust[k]) - float(ref[k])) < 1e-6
 
 
 def _ordered(table):
