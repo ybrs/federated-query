@@ -123,10 +123,9 @@ Corpus (`tests/test_nk_decorrelation.py`):
 - **M2 (done)** — top-k per outer via ROW_NUMBER() window (chosen over the
   bare-key GroupedLimit so column pruning keeps the domain column).
 - **M3 (done)** — outer references inside the aggregate value folded into domain.
-- **M4 (done)** — user-written `LATERAL` (top-k body), multi-column. Unnests
-  uniformly; a same-source lateral still pushes as ONE remote query (verified),
-  a cross-source one runs on Rust. The top-k builder was generalized to emit a
-  multi-column relation.
+- **M4 (done)** — user-written `LATERAL` (top-k body), multi-column, unnested
+  through the SAME single path as a correlated top-k. The top-k builder was
+  generalized to emit a multi-column relation.
 - **M5 (done)** — user `LATERAL` with an aggregate body (dependent-aggregate
   builder generalized to a relation output).
 - **M6 (done)** — user `LATERAL` with a plain multi-row (set) body: the domain
@@ -150,15 +149,14 @@ we decorrelate), so it is *correctly* left as a `LateralJoin` today:
   natively (Postgres/DuckDB do LATERAL). Keep this — it is the cheapest path.
 - **Cross-source**: cannot push; currently fails fast.
 
-Decision (RESOLVED, M4-M6): a user LATERAL is the *same* dependent join the N-K
-machinery unnests, so it now routes through the same domain -> join ->
-(aggregate | top-k window | set) -> join-back unnesting. It unnests **uniformly**
-(same and cross source) because the decorrelator runs before source assignment;
-this is fine because a same-source unnested lateral still collapses to ONE remote
-query (verified: a single PhysicalRemoteQuery, just regular-join SQL instead of
-LATERAL), so the "cheap push" is preserved, while a cross-source one now runs on
-Rust with no merge fallback. Only a genuinely non-unnestable dependent join
-(e.g. a lateral over a set-returning function) would remain, and it fails loud.
+Decision (RESOLVED, M4-M6): a user LATERAL is the same dependent join the N-K
+machinery unnests, so it goes through the SAME SINGLE PATH as a correlated
+subquery - domain -> join -> (aggregate | top-k window | set) -> join-back - with
+NO single-source vs cross-source distinction. The decorrelator runs before source
+assignment and unnests every lateral identically; the physical planner then does
+whatever it does with the result regardless of where the relations live. Only a
+genuinely non-unnestable dependent join (e.g. a lateral over a set-returning
+function) remains, and it fails loud.
 
 ## Non-goals (for now)
 
