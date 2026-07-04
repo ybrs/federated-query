@@ -333,8 +333,9 @@ def _assert_two_col_matches_source(single_source_env, sql):
 # Non-equi correlated scalars -> LATERAL join (dependent join), same source
 
 
-def test_non_equi_scalar_aggregate_in_where_lateral(single_source_env):
-    """A non-equi correlated scalar aggregate in WHERE pushes as a LATERAL join."""
+def test_non_equi_scalar_aggregate_in_where_unnests(single_source_env):
+    """A non-equi correlated scalar aggregate in WHERE unnests to regular joins
+    (Neumann-Kemper), never a LATERAL - no correlated subquery is pushed."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id FROM duckdb_primary.main.orders o "
@@ -342,7 +343,7 @@ def test_non_equi_scalar_aggregate_in_where_lateral(single_source_env):
         "               WHERE p.price < o.price)"
     )
     ast = explain_datasource_query(runtime, sql)
-    assert ast.find(exp.Lateral) is not None
+    assert ast.find(exp.Lateral) is None
     _assert_no_subquery_expressions(ast)
 
 

@@ -1139,6 +1139,11 @@ class _SubqueryPreparer:
         )
 
 
+# Output name of the aggregate value produced by Neumann-Kemper unnesting; it is
+# always qualified by a fresh per-subquery relation alias, so the bare name is safe.
+_UNNEST_VALUE = "nk_value"
+
+
 class Decorrelator:
     """Decorrelates subqueries in bound logical plans."""
 
@@ -1785,7 +1790,7 @@ class Decorrelator:
         try:
             prepared = self._preparer().prepare_scalar(expr.subquery)
         except NonFlattenableCorrelation:
-            return self._lateral_scalar(expr, plan)
+            return self._unnest_dependent_scalar(expr, plan)
         condition = prepared.condition
         if condition is None:
             # An uncorrelated scalar subquery has no correlation predicate, so the
@@ -1841,6 +1846,178 @@ class Decorrelator:
             inner = self._project_lateral_value(node.input, value_name)
             return node.with_children([inner])
         raise DecorrelationError("Unsupported scalar subquery body for LATERAL")
+
+    def _unnest_dependent_scalar(
+        self, expr: SubqueryExpression, plan: LogicalPlanNode
+    ) -> Tuple[Expression, LogicalPlanNode]:
+        """Neumann-Kemper unnesting of a correlated scalar-aggregate subquery.
+
+        Build the distinct domain of the outer correlation values, join it to the
+        subquery's inner relation on the (possibly non-equi) correlation predicate,
+        aggregate once per domain value, and LEFT-join the result back onto the
+        outer - ordinary relational algebra with no residual correlation. Falls
+        back to a LATERAL for a subquery shape not yet covered here.
+        """
+        body = self._rewrite_plan(expr.subquery)
+        shape = self._dependent_shape(body)
+        if shape is None:
+            return self._lateral_scalar(expr, plan)
+        return self._assemble_unnested(plan, body, shape)
+
+    def _dependent_shape(self, body: LogicalPlanNode):
+        """Recognize Aggregate([one agg], no GROUP BY, Filter(correlated, inner)).
+
+        Returns (correlated_conjuncts, local_conjuncts, inner, free_vars), or None
+        when the shape is outside this rewrite (the LATERAL fallback handles it).
+        """
+        if not self._is_scalar_aggregate_over_filter(body):
+            return None
+        inner_aliases = _collect_inner_aliases(body)
+        correlated, local = self._split_by_outer(body.input.predicate, inner_aliases)
+        free_vars = self._distinct_outer_refs(correlated, inner_aliases)
+        if not correlated or not free_vars:
+            return None
+        return (correlated, local, body.input.input, free_vars)
+
+    def _is_scalar_aggregate_over_filter(self, body: LogicalPlanNode) -> bool:
+        """One aggregate, no GROUP BY, directly over a Filter carrying the correlation."""
+        if not isinstance(body, Aggregate) or body.group_by:
+            return False
+        return len(body.aggregates) == 1 and isinstance(body.input, Filter)
+
+    def _split_by_outer(self, predicate: Expression, inner_aliases):
+        """Split a conjunctive predicate into (references-outer, inner-only) parts."""
+        correlated: List[Expression] = []
+        local: List[Expression] = []
+        for conjunct in self._conjuncts(predicate):
+            if self._refs_outside(conjunct, inner_aliases):
+                correlated.append(conjunct)
+            else:
+                local.append(conjunct)
+        return correlated, local
+
+    def _conjuncts(self, predicate: Expression) -> List[Expression]:
+        """Flatten a predicate's top-level AND tree into a list of conjuncts."""
+        if isinstance(predicate, BinaryOp) and predicate.op == BinaryOpType.AND:
+            return self._conjuncts(predicate.left) + self._conjuncts(predicate.right)
+        return [predicate]
+
+    def _refs_outside(self, expr: Expression, inner_aliases) -> bool:
+        """Whether an expression references any relation not inside the subquery."""
+        for ref in _expression_column_refs(expr):
+            if ref.table not in inner_aliases:
+                return True
+        return False
+
+    def _distinct_outer_refs(self, predicates: List[Expression], inner_aliases):
+        """The distinct outer column references (free vars) across the predicates."""
+        seen: Set[Tuple[Optional[str], str]] = set()
+        free_vars: List[ColumnRef] = []
+        for predicate in predicates:
+            self._collect_outer_refs(predicate, inner_aliases, seen, free_vars)
+        return free_vars
+
+    def _collect_outer_refs(self, predicate, inner_aliases, seen, free_vars) -> None:
+        """Append each not-yet-seen outer column ref in a predicate to free_vars."""
+        for ref in _expression_column_refs(predicate):
+            key = (ref.table, ref.column)
+            if ref.table not in inner_aliases and key not in seen:
+                seen.add(key)
+                free_vars.append(ref)
+
+    def _assemble_unnested(self, plan, body, shape) -> Tuple[Expression, LogicalPlanNode]:
+        """Build the domain -> dependent aggregate -> join-back rewrite for a shape."""
+        correlated, local, inner, free_vars = shape
+        dom_prefix = self._next_prefix()
+        dep_prefix = self._next_prefix()
+        domain, dom_map = self._build_domain(plan, free_vars, dom_prefix)
+        dependent = self._build_dependent_relation(
+            body, domain, inner, correlated, local, dom_map, dep_prefix
+        )
+        joined = Join.create(
+            left=plan, right=dependent, join_type=JoinType.LEFT,
+            condition=self._join_back_condition(free_vars, dom_map, dep_prefix),
+        )
+        return self._scalar_value_ref(body, dep_prefix), joined
+
+    def _build_domain(self, plan, free_vars, prefix):
+        """Distinct outer correlation values, aliased so their columns are qualified.
+
+        Returns the aliased domain relation and a map from each free var's
+        (table, column) to its domain column reference (qualified to the alias).
+        """
+        names: List[str] = []
+        dom_map: Dict[Tuple[Optional[str], str], ColumnRef] = {}
+        for index, free_var in enumerate(free_vars):
+            name = f"d{index}"
+            names.append(name)
+            dom_map[(free_var.table, free_var.column)] = ColumnRef.create(
+                table=prefix, column=name
+            )
+        distinct = Projection.create(
+            input=plan, expressions=list(free_vars), aliases=names, distinct=True
+        )
+        return SubqueryScan.create(input=distinct, alias=prefix), dom_map
+
+    def _build_dependent_relation(
+        self, body, domain, inner, correlated, local, dom_map, prefix
+    ):
+        """Aggregate once per domain value over (domain JOIN inner ON correlation)."""
+        condition = self._dependent_join_condition(correlated, local, dom_map)
+        dependent_input = Join.create(
+            left=domain, right=inner, join_type=JoinType.INNER, condition=condition
+        )
+        group_cols: List[Expression] = []
+        select_list: List[Expression] = []
+        names: List[str] = []
+        for domain_ref in dom_map.values():
+            group_cols.append(domain_ref)
+            # aggregates IS the output SELECT list here, so the group key is
+            # repeated as a passthrough output, not just a grouping key.
+            select_list.append(domain_ref)
+            names.append(domain_ref.column)
+        select_list.extend(body.aggregates)
+        names.append(_UNNEST_VALUE)
+        aggregate = Aggregate.create(
+            input=dependent_input, group_by=group_cols,
+            aggregates=select_list, output_names=names,
+        )
+        return SubqueryScan.create(input=aggregate, alias=prefix)
+
+    def _dependent_join_condition(self, correlated, local, dom_map) -> Expression:
+        """The correlation (outer refs rewritten to domain columns) AND any locals."""
+        rewritten: List[Expression] = []
+        for conjunct in correlated:
+            rewritten.append(_replace_column_refs(conjunct, dom_map))
+        return _and_join(rewritten + local)
+
+    def _join_back_condition(self, free_vars, dom_map, dep_prefix) -> Expression:
+        """Equate each outer free var to the dependent relation's domain column."""
+        equalities: List[Expression] = []
+        for free_var in free_vars:
+            domain_ref = dom_map[(free_var.table, free_var.column)]
+            dependent_ref = ColumnRef.create(table=dep_prefix, column=domain_ref.column)
+            equalities.append(
+                BinaryOp.create(op=BinaryOpType.EQ, left=free_var, right=dependent_ref)
+            )
+        return _and_join(equalities)
+
+    def _scalar_value_ref(self, body, dep_prefix) -> Expression:
+        """The dependent aggregate value, with COUNT's empty-group 0 (the count bug)."""
+        value_ref = ColumnRef.create(table=dep_prefix, column=_UNNEST_VALUE)
+        if not self._is_count_aggregate(body.aggregates[0]):
+            return value_ref
+        zero = Literal.create(value=0, data_type=DataType.INTEGER)
+        return FunctionCall.create(
+            function_name="COALESCE", args=[value_ref, zero], is_aggregate=False
+        )
+
+    def _is_count_aggregate(self, aggregate: Expression) -> bool:
+        """Whether the aggregate is a COUNT (0 over an empty group, not NULL)."""
+        return (
+            isinstance(aggregate, FunctionCall)
+            and aggregate.function_name.upper() == "COUNT"
+        )
 
     def _join_flag(
         self, expr: Expression, plan: LogicalPlanNode

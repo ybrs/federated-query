@@ -293,16 +293,18 @@ def test_plan_without_subqueries_unchanged_in_shape(catalog):
     assert repr(rewritten.input) == repr(bound.input)
 
 
-def test_correlated_non_equality_through_aggregate_uses_lateral(catalog):
-    """Non-equality correlation across an aggregate can't flatten to a set-based
-    join, so it falls back to a LATERAL join (the engine evaluates it per row).
+def test_correlated_non_equality_through_aggregate_unnests(catalog):
+    """A non-equality correlation across an aggregate no longer needs a LATERAL:
+    Neumann-Kemper unnesting lowers it to a distinct domain of the outer key
+    joined to the inner relation and aggregated per domain value - ordinary
+    relational algebra, no residual correlation.
     """
     plan = decorrelate(
         catalog,
         "SELECT u.id, (SELECT SUM(o.amount) FROM pg.orders o "
         "WHERE o.user_id > u.id) AS total FROM pg.users u",
     )
-    assert len(find_all(plan, LateralJoin)) == 1
+    assert len(find_all(plan, LateralJoin)) == 0
 
 
 def test_scalar_correlated_on_same_named_keys_groups_by_both(catalog):
