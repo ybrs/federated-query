@@ -17,12 +17,14 @@ import os
 from sqlglot import exp
 
 from ..plan.expressions import (
+    BetweenExpression,
     BinaryOp,
     BinaryOpType,
     CaseExpr,
     Cast,
     ColumnRef,
     DataType,
+    Extract,
     FunctionCall,
     InList,
     Literal,
@@ -155,6 +157,33 @@ def _serialize_case(expr, column_fn):
     return case
 
 
+def _serialize_extract(expr, column_fn):
+    """EXTRACT(field FROM source) lowers to date_part('field', source)."""
+    field = {"node": "literal", "value": {"lit": "str", "value": expr.field.lower()}}
+    source = _serialize_expr(expr.source, column_fn)
+    return {"node": "function", "name": "date_part", "args": [field, source]}
+
+
+def _serialize_function(expr, column_fn):
+    """A scalar function call resolved by name in the engine's function registry."""
+    if expr.is_aggregate:
+        raise UnsupportedIR(f"aggregate {expr.function_name} not valid as an expression")
+    args = []
+    for arg in expr.args:
+        args.append(_serialize_expr(arg, column_fn))
+    return {"node": "function", "name": expr.function_name.lower(), "args": args}
+
+
+def _serialize_between(expr, column_fn):
+    """BETWEEN as (value >= lower) AND (value <= upper)."""
+    value = _serialize_expr(expr.value, column_fn)
+    lower = _serialize_expr(expr.lower, column_fn)
+    upper = _serialize_expr(expr.upper, column_fn)
+    ge = {"node": "binary", "op": ">=", "left": value, "right": lower}
+    le = {"node": "binary", "op": "<=", "left": value, "right": upper}
+    return {"node": "binary", "op": "and", "left": ge, "right": le}
+
+
 def _serialize_unary(expr, column_fn):
     """Serialize a unary op: NOT / negate as `unary`, IS [NOT] NULL as `is_null`."""
     operand = _serialize_expr(expr.operand, column_fn)
@@ -227,6 +256,9 @@ _EXPR_SERIALIZERS = {
     Cast: _serialize_cast,
     InList: _serialize_in_list,
     CaseExpr: _serialize_case,
+    Extract: _serialize_extract,
+    FunctionCall: _serialize_function,
+    BetweenExpression: _serialize_between,
 }
 
 
