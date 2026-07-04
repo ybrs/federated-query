@@ -218,3 +218,15 @@ def test_top_k_row_subquery_asc(env):
         "WHERE p.base_price > o.price ORDER BY p.base_price ASC LIMIT 1) AS pid "
         "FROM orders o"
     ))
+
+
+def test_outer_ref_in_aggregate_value(env):
+    """An outer column referenced inside the aggregate expression (not only the
+    filter) is added to the domain and rewritten, so nothing dangles."""
+    _assert_nk(env, (
+        "SELECT o.order_id, (SELECT MAX(p.base_price + o.price) FROM src_p.main.products p "
+        "WHERE p.base_price < o.price) AS m FROM src_o.main.orders o"
+    ), (
+        "SELECT o.order_id, (SELECT MAX(p.base_price + o.price) FROM products p "
+        "WHERE p.base_price < o.price) AS m FROM orders o"
+    ))

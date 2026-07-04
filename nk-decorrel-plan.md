@@ -127,6 +127,24 @@ Corpus (`tests/test_nk_decorrelation.py`):
   full baseline + TPC-H green; the `e2e_pushdown/test_cross_source_lateral.py`
   tests now run on the Rust engine (no DuckDB fallback).
 
+## User-written LATERAL (`LEFT JOIN LATERAL (...)`) — revisit
+
+A user-written `LEFT JOIN LATERAL` is an explicit dependent join (not a subquery
+we decorrelate), so it is *correctly* left as a `LateralJoin` today:
+
+- **Same-source**: pushes to the owning source as one query and evaluates
+  natively (Postgres/DuckDB do LATERAL). Keep this — it is the cheapest path.
+- **Cross-source**: cannot push; currently fails fast.
+
+Decision (to revisit after M3): a user LATERAL is structurally the *same*
+dependent join the N-K machinery already unnests. So a **cross-source** user
+LATERAL should route through the same domain -> join -> (aggregate | top-k window)
+-> join-back unnesting and run on Rust, instead of failing. Same-source keeps the
+cheap push. This unifies user laterals and subquery decorrelation under one
+dependent-join-unnesting path. (Only genuinely non-unnestable dependent joins —
+e.g. a lateral calling a set-returning function — would then remain, and those
+fail loud.)
+
 ## Non-goals (for now)
 
 - Uniform rewrite of the whole decorrelator (keep the working pattern paths).

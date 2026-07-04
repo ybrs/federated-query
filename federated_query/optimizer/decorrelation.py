@@ -1878,7 +1878,11 @@ class Decorrelator:
             return None
         inner_aliases = _collect_inner_aliases(body)
         correlated, local = self._split_by_outer(body.input.predicate, inner_aliases)
-        free_vars = self._distinct_outer_refs(correlated, inner_aliases)
+        # Free vars come from the correlation predicate AND the aggregate value
+        # itself (e.g. MAX(x + o.f)); both are rewritten to the domain column.
+        free_vars = self._distinct_outer_refs(
+            correlated + list(body.aggregates), inner_aliases
+        )
         if not correlated or not free_vars:
             return None
         return (correlated, local, body.input.input, free_vars)
@@ -1909,9 +1913,17 @@ class Decorrelator:
     def _refs_outside(self, expr: Expression, inner_aliases) -> bool:
         """Whether an expression references any relation not inside the subquery."""
         for ref in _expression_column_refs(expr):
-            if ref.table not in inner_aliases:
+            if self._is_outer_ref(ref, inner_aliases):
                 return True
         return False
+
+    def _is_outer_ref(self, ref: ColumnRef, inner_aliases) -> bool:
+        """A qualified column belonging to an outer relation, not the subquery.
+
+        The qualifier check excludes an unqualified ``*`` (from ``COUNT(*)``),
+        which is not a correlation to any outer relation.
+        """
+        return ref.table is not None and ref.table not in inner_aliases
 
     def _distinct_outer_refs(self, predicates: List[Expression], inner_aliases):
         """The distinct outer column references (free vars) across the predicates."""
@@ -1925,7 +1937,7 @@ class Decorrelator:
         """Append each not-yet-seen outer column ref in a predicate to free_vars."""
         for ref in _expression_column_refs(predicate):
             key = (ref.table, ref.column)
-            if ref.table not in inner_aliases and key not in seen:
+            if self._is_outer_ref(ref, inner_aliases) and key not in seen:
                 seen.add(key)
                 free_vars.append(ref)
 
@@ -1980,7 +1992,10 @@ class Decorrelator:
             # repeated as a passthrough output, not just a grouping key.
             select_list.append(domain_ref)
             names.append(domain_ref.column)
-        select_list.extend(body.aggregates)
+        # Rewrite any outer reference inside the aggregate value to its domain
+        # column, so the aggregate no longer references the outer relation.
+        for aggregate in body.aggregates:
+            select_list.append(_replace_column_refs(aggregate, dom_map))
         names.append(_UNNEST_VALUE)
         aggregate = Aggregate.create(
             input=dependent_input, group_by=group_cols,
