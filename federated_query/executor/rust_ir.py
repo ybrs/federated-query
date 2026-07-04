@@ -19,8 +19,12 @@ from sqlglot import exp
 from ..plan.expressions import (
     BinaryOp,
     BinaryOpType,
+    CaseExpr,
+    Cast,
     ColumnRef,
+    DataType,
     FunctionCall,
+    InList,
     Literal,
     UnaryOp,
     UnaryOpType,
@@ -69,6 +73,8 @@ _BINARY_OP_TOKENS = {
     BinaryOpType.GTE: ">=",
     BinaryOpType.AND: "and",
     BinaryOpType.OR: "or",
+    BinaryOpType.LIKE: "like",
+    BinaryOpType.ILIKE: "ilike",
 }
 
 # Typed-literal tags keyed by the value's exact Python type. `bool` is a
@@ -96,16 +102,57 @@ def _plain_column(col_ref):
 
 
 def _serialize_expr(expr, column_fn):
-    """Serialize one expression; `column_fn` renders each ColumnRef."""
-    if isinstance(expr, ColumnRef):
-        return column_fn(expr)
-    if isinstance(expr, Literal):
-        return {"node": "literal", "value": _literal_value(expr.value)}
-    if isinstance(expr, BinaryOp):
-        return _serialize_binary(expr, column_fn)
-    if isinstance(expr, UnaryOp):
-        return _serialize_unary(expr, column_fn)
-    raise UnsupportedIR(f"expression {type(expr).__name__} not supported in IR")
+    """Serialize one expression via a type-dispatched serializer; `column_fn`
+    renders each ColumnRef."""
+    serializer = _EXPR_SERIALIZERS.get(type(expr))
+    if serializer is None:
+        raise UnsupportedIR(f"expression {type(expr).__name__} not supported in IR")
+    return serializer(expr, column_fn)
+
+
+def _serialize_column(expr, column_fn):
+    """A column reference, rendered by the caller's column function."""
+    return column_fn(expr)
+
+
+def _serialize_literal(expr, column_fn):
+    """A typed literal value."""
+    return {"node": "literal", "value": _literal_value(expr.value)}
+
+
+def _serialize_cast(expr, column_fn):
+    """A CAST to the engine's Arrow type name (decimals become float64)."""
+    arrow_type = _CAST_TYPES.get(expr.data_type)
+    if arrow_type is None:
+        raise UnsupportedIR(f"cast to {expr.target_type} not supported in IR")
+    return {"node": "cast", "expr": _serialize_expr(expr.expr, column_fn), "to": arrow_type}
+
+
+def _serialize_in_list(expr, column_fn):
+    """An IN-list membership test (NOT IN arrives wrapped in a NOT unary op)."""
+    options = []
+    for option in expr.options:
+        options.append(_serialize_expr(option, column_fn))
+    return {
+        "node": "in_list",
+        "expr": _serialize_expr(expr.value, column_fn),
+        "list": options,
+        "negated": False,
+    }
+
+
+def _serialize_case(expr, column_fn):
+    """A searched CASE: a list of WHEN/THEN plus an optional ELSE."""
+    whens = []
+    for condition, result in expr.when_clauses:
+        whens.append({
+            "when": _serialize_expr(condition, column_fn),
+            "then": _serialize_expr(result, column_fn),
+        })
+    case = {"node": "case", "whens": whens}
+    if expr.else_result is not None:
+        case["else"] = _serialize_expr(expr.else_result, column_fn)
+    return case
 
 
 def _serialize_unary(expr, column_fn):
@@ -154,6 +201,33 @@ def _expr_over(expr, input_name, child_aliases):
         }
 
     return _serialize_expr(expr, column)
+
+
+# Engine DataType -> Arrow type name for a CAST target. The engine treats
+# decimals as float64 (PG numeric already arrives as float), matching the
+# DuckDB path within float precision.
+_CAST_TYPES = {
+    DataType.INTEGER: "int32",
+    DataType.BIGINT: "int64",
+    DataType.FLOAT: "float32",
+    DataType.DOUBLE: "float64",
+    DataType.DECIMAL: "float64",
+    DataType.VARCHAR: "utf8",
+    DataType.TEXT: "utf8",
+    DataType.BOOLEAN: "boolean",
+    DataType.DATE: "date32",
+}
+
+# Expression type -> its serializer. Defined after the serializers it names.
+_EXPR_SERIALIZERS = {
+    ColumnRef: _serialize_column,
+    Literal: _serialize_literal,
+    BinaryOp: _serialize_binary,
+    UnaryOp: _serialize_unary,
+    Cast: _serialize_cast,
+    InList: _serialize_in_list,
+    CaseExpr: _serialize_case,
+}
 
 
 # --- scan specs ---------------------------------------------------------------
