@@ -165,9 +165,9 @@ def _serialize_extract(expr, column_fn):
 
 
 def _serialize_function(expr, column_fn):
-    """A scalar function call resolved by name in the engine's function registry."""
-    if expr.is_aggregate:
-        raise UnsupportedIR(f"aggregate {expr.function_name} not valid as an expression")
+    """A function call resolved by name in the engine's registry. Aggregate calls
+    are allowed so an aggregate can sit inside a larger expression (e.g.
+    `100 * sum(x) / sum(y)` in an aggregate select)."""
     args = []
     for arg in expr.args:
         args.append(_serialize_expr(arg, column_fn))
