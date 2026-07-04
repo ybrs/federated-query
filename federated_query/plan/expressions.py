@@ -294,13 +294,18 @@ class FunctionCall(Expression):
         )
 
     def get_type(self) -> DataType:
-        # Type depends on function - needs catalog lookup
-        # Simplified for now
-        if self.function_name.upper() in ("COUNT", "SUM"):
+        """Result DataType of the call, grouped by function family.
+
+        COUNT/SUM and the integer ranking window functions (ROW_NUMBER, RANK,
+        DENSE_RANK, NTILE) yield BIGINT; AVG yields DOUBLE. Any other function
+        is not yet typed here and defaults to VARCHAR.
+        """
+        name = self.function_name.upper()
+        if name in ("COUNT", "SUM", "ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE"):
             return DataType.BIGINT
-        if self.function_name.upper() in ("AVG"):
+        if name == "AVG":
             return DataType.DOUBLE
-        return DataType.VARCHAR  # Default
+        return DataType.VARCHAR
 
     def accept(self, visitor):
         return visitor.visit_function_call(self)

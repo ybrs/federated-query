@@ -1151,14 +1151,16 @@ class PhysicalProjection(PhysicalPlanNode):
 
 
 class PhysicalWindow(PhysicalPlanNode):
-    """Evaluate a window-bearing projection in the merge engine.
+    """Evaluate a window-bearing projection as one ``SELECT ... OVER (...)``.
 
-    Runs ``SELECT <projection exprs> FROM input`` in DuckDB, which computes the
-    window functions natively. Used on the cross-source path, when a projection
+    Renders ``SELECT <projection exprs> FROM input`` and runs it where the plan
+    executes: the Rust engine emits it as a SQL fragment, and the DuckDB merge
+    path runs it directly. Used on the cross-source path, when a projection
     containing a window sits over a non-pushable input; the single-source path
     renders the window straight into the remote query instead, so this operator
     is never built there. Window functions cannot be evaluated row-at-a-time, so
-    a merge engine is required.
+    execution needs a SQL engine, but the output schema is derived directly from
+    the input schema and expression types with no engine call.
     """
 
     input: PhysicalPlanNode
@@ -1204,25 +1206,57 @@ class PhysicalWindow(PhysicalPlanNode):
         the whole expression (window function included) lowers through the one
         emitter to DuckDB SQL.
         """
-        if len(self.expressions) != len(self.output_names):
-            raise ValueError(
-                f"expressions ({len(self.expressions)}) and output_names "
-                f"({len(self.output_names)}) length mismatch"
-            )
+        self._check_output_arity()
         return clauses.select_expressions_fragment(
             self.expressions, self.output_names, MergeResolver(aliases), dialect="duckdb"
         )
 
     def schema(self) -> pa.Schema:
-        """Output schema, read from DuckDB so window result types are exact.
+        """Output schema computed directly from the input schema and expression
+        types, with no merge-engine round trip.
 
-        Uses an empty table built from the input schema rather than executing
-        the input, so schema()/EXPLAIN never materializes the upstream query.
+        One output column per projection expression: a plain column reference
+        keeps its input Arrow type, a window function takes the Arrow type of its
+        underlying function, and any other scalar expression is typed by the
+        shared evaluator against the input schema.
         """
-        engine = self.merge_engine()
-        empty_input = self.input.schema().empty_table()
-        sql = self._window_sql(self.input.column_aliases())
-        return engine.schema(sql, {_MERGE_WINDOW_RELATION: empty_input})
+        self._check_output_arity()
+        input_schema = self.input.schema()
+        fields = []
+        for index, expr in enumerate(self.expressions):
+            field_type = self._output_type(expr, input_schema)
+            fields.append(pa.field(self.output_names[index], field_type))
+        return pa.schema(fields)
+
+    def _output_type(self, expr: Expression, input_schema: pa.Schema) -> pa.DataType:
+        """Arrow type of one output expression, routed by its kind."""
+        from .expressions import ColumnRef, WindowExpr
+
+        if isinstance(expr, ColumnRef):
+            return _column_ref_type(expr, input_schema, self.column_aliases())
+        if isinstance(expr, WindowExpr):
+            return self._window_type(expr)
+        return _evaluate_expression_type(expr, input_schema, self.column_aliases())
+
+    def _window_type(self, expr: Expression) -> pa.DataType:
+        """Arrow type of a window function, from its underlying function's type.
+
+        A ranking window (ROW_NUMBER, RANK, ...) yields an integer; a value or
+        aggregate window keeps its function's declared type. A window nested
+        inside a larger scalar expression is not routed here - the shared
+        evaluator has no window kernel, so such a case fails loudly there.
+        """
+        from .arrow_types import arrow_type_for
+
+        return arrow_type_for(expr.get_type())
+
+    def _check_output_arity(self) -> None:
+        """Raise when expressions and output_names disagree in length."""
+        if len(self.expressions) != len(self.output_names):
+            raise ValueError(
+                f"expressions ({len(self.expressions)}) and output_names "
+                f"({len(self.output_names)}) length mismatch"
+            )
 
     def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
         """Each output column is exposed by its bare output name."""

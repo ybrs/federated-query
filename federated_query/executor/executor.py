@@ -126,10 +126,6 @@ class Executor:
             return None
         from .rust_ir import execute_via_rust, UnsupportedIR
 
-        # Some nodes (window) infer their exact output types by running SQL on the
-        # merge engine at plan time; attach it so serialization can read schemas.
-        # Execution still happens entirely in Rust.
-        _attach_merge_engine(plan, self._get_merge_engine())
         try:
             return execute_via_rust(plan, datasources)
         except UnsupportedIR:
