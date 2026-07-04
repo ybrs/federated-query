@@ -1995,7 +1995,7 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         if isinstance(expr, FunctionCall) and expr.is_aggregate:
             return self._infer_aggregate_type(expr, input_schema)
         if isinstance(expr, ColumnRef):
-            return _column_ref_type(expr, input_schema, self.column_aliases())
+            return _column_ref_type(expr, input_schema, self.input.column_aliases())
         from .expressions import contains_aggregate
         from .arrow_types import arrow_type_for
 
@@ -2050,8 +2050,8 @@ class PhysicalHashAggregate(PhysicalPlanNode):
             return pa.int64()
         arg = func.args[0]
         if isinstance(arg, ColumnRef):
-            return _column_ref_type(arg, input_schema, self.column_aliases())
-        return _evaluate_expression_type(arg, input_schema, self.column_aliases())
+            return _column_ref_type(arg, input_schema, self.input.column_aliases())
+        return _evaluate_expression_type(arg, input_schema, self.input.column_aliases())
 
     def estimated_cost(self) -> float:
         raise NotImplementedError("Cost estimation not yet implemented")
@@ -2060,7 +2060,20 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         return f"PhysicalHashAggregate(groups={len(self.group_by)}, aggs={len(self.aggregates)})"
 
     def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
-        return self.input.column_aliases()
+        """This aggregate's OUTPUT columns, keyed by qualifier -> output name, so
+        a parent resolves against what the aggregate produces. A group key that
+        is a plain column keeps its source qualifier; every output is also
+        exposed unqualified by its output name (a computed result has no source
+        column). The aggregate's own type inference uses input.column_aliases()
+        directly, so this no longer needs to pass the input columns through."""
+        from .expressions import ColumnRef
+
+        aliases: Dict[Tuple[Optional[str], str], str] = {}
+        for expr, name in zip(self.aggregates, self.output_names):
+            aliases[(None, name)] = name
+            if isinstance(expr, ColumnRef):
+                aliases[(expr.table, expr.column)] = name
+        return aliases
 
 
 class PhysicalSort(PhysicalPlanNode):
