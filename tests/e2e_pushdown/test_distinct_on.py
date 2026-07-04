@@ -66,7 +66,7 @@ def test_plain_distinct_unaffected(single_source_env):
     assert table.num_rows == 3
 
 
-def test_cross_source_distinct_on_fails_fast(multi_source_env):
+def test_cross_source_distinct_on_fails_fast(multi_source_env, duckdb_engine):
     """A cross-source DISTINCT ON fails fast instead of returning a wrong answer."""
     runtime = build_runtime(multi_source_env)
     sql = (

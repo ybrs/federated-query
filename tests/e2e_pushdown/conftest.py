@@ -177,3 +177,11 @@ def multi_source_env() -> QueryEnvironment:
     ds_orders.disconnect()
     ds_products.disconnect()
     ds_customers.disconnect()
+
+
+@pytest.fixture
+def duckdb_engine(monkeypatch):
+    """Force the DuckDB merge engine for tests that assert on the SQL a proxy
+    datasource receives - the Rust engine sends SQL through its native connector,
+    so the Python proxy would see nothing. These verify Python-side pushdown."""
+    monkeypatch.setenv("FEDQ_ENGINE", "duckdb")

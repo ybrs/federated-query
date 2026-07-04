@@ -16,7 +16,7 @@ def _find_in(ast) -> bool:
     return ast is not None and ast.find(exp.In) is not None
 
 
-def test_cross_source_join_pushes_dynamic_filter(multi_source_env):
+def test_cross_source_join_pushes_dynamic_filter(multi_source_env, duckdb_engine):
     """The probe-side remote query carries an IN filter from the build keys."""
     runtime = build_runtime(multi_source_env)
     multi_source_env.reset_datasources()
@@ -33,7 +33,7 @@ def test_cross_source_join_pushes_dynamic_filter(multi_source_env):
     assert _find_in(asts.get("duckdb_orders")), asts.get("duckdb_orders")
 
 
-def test_cross_source_comma_join_pushes_dynamic_filter(multi_source_env):
+def test_cross_source_comma_join_pushes_dynamic_filter(multi_source_env, duckdb_engine):
     """The comma-join form (promoted to an equi-join) also reduces the probe."""
     runtime = build_runtime(multi_source_env)
     multi_source_env.reset_datasources()

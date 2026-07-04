@@ -592,7 +592,7 @@ def test_cross_datasource_subquery_fallback(multi_source_env):
     assert engine_rows == expected
 
 
-def test_cross_source_semi_join_reduction(multi_source_env):
+def test_cross_source_semi_join_reduction(multi_source_env, duckdb_engine):
     """A cross-source ``IN`` (SEMI join) pushes the subquery's distinct keys into
     the outer scan as a dynamic ``IN`` filter, so the outer source returns only
     rows whose key can match (semi-join reduction)."""
