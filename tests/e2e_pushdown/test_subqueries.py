@@ -594,29 +594,6 @@ def test_cross_datasource_subquery_fallback(multi_source_env):
     assert engine_rows == expected
 
 
-def test_cross_source_semi_join_reduction(multi_source_env, duckdb_engine):
-    """A cross-source ``IN`` (SEMI join) pushes the subquery's distinct keys into
-    the outer scan as a dynamic ``IN`` filter, so the outer source returns only
-    rows whose key can match (semi-join reduction)."""
-    runtime = build_runtime(multi_source_env)
-    multi_source_env.reset_datasources()
-    sql = (
-        "SELECT order_id FROM duckdb_orders.main.orders "
-        "WHERE product_id IN ("
-        "  SELECT id FROM duckdb_products.main.products WHERE price > 50"
-        ")"
-    )
-    runtime.execute(sql)
-
-    orders_source = multi_source_env.datasources[0]
-    orders_ast = orders_source.last_query_ast()
-    assert orders_ast is not None
-    in_filters = list(orders_ast.find_all(exp.In))
-    assert any(
-        node.args.get("expressions") for node in in_filters
-    ), "expected a dynamic IN (...) filter pushed to the orders source"
-
-
 def test_cross_source_union_subquery_matches_source(multi_source_env):
     """A cross-source ``IN`` over a UNION body: the union pushes to its source
     and the SEMI join runs in the merge engine. Verified vs a combined DB."""

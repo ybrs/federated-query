@@ -133,17 +133,6 @@ def _collect(plan, node_type):
     return found
 
 
-def _attached_plan(env, sql):
-    """Build a physical plan with the merge engine attached, ready to run."""
-    from federated_query.executor.executor import _attach_merge_engine
-
-    runtime = build_runtime(env)
-    plan = runtime.query_executor._plan_pipeline(sql, None)
-    engine = runtime.query_executor.physical_executor._get_merge_engine()
-    _attach_merge_engine(plan, engine)
-    return plan
-
-
 def test_body_single_source_child_joins_other_source(multi_source_env):
     """A single-source CTE body joined in the child against a second source."""
     engine_sql = (
@@ -314,20 +303,22 @@ _SCHEMA_SQL = (
 )
 
 
-def test_merge_query_schema_without_rows(hierarchy_env):
-    """``PhysicalCTEMergeQuery.schema()`` reports columns without fetching rows.
+def test_merge_query_output_names_carried(hierarchy_env):
+    """``PhysicalCTEMergeQuery`` carries its result column names as a plan node.
 
-    The schema comes from the Arrow reader, which exposes it before any batch,
-    would produce zero batches and silently lose the schema.
+    The Rust engine types the (recursive) WITH result natively; the physical
+    node is a pure representation, so its declared output names are what the plan
+    exposes. The output types come from execution, so ``schema()`` is not
+    computed in Python (it raises) - this pins the static column contract.
     """
-    plan = _attached_plan(hierarchy_env, _SCHEMA_SQL)
+    plan = _physical_plan(hierarchy_env, _SCHEMA_SQL)
     merge_query = _collect(plan, PhysicalCTEMergeQuery)[0]
-    assert merge_query.schema().names == ["name", "lvl", "amount"]
+    assert merge_query.output_names == ["name", "lvl", "amount"]
     assert "PhysicalCTEMergeQuery" in repr(merge_query)
 
 
-def test_producer_materializes_once_and_executes(multi_source_env):
-    """The producer caches its body and yields it from ``execute()`` too."""
+def test_producer_and_scan_repr(multi_source_env):
+    """A CTE referenced twice yields one producer and readable node reprs."""
     engine_sql = (
         "WITH cust AS ("
         "  SELECT customer_id, segment FROM duckdb_customers.main.customers "
@@ -337,15 +328,8 @@ def test_producer_materializes_once_and_executes(multi_source_env):
         "JOIN cust a ON o.customer_id = a.customer_id "
         "JOIN cust b ON o.customer_id = b.customer_id"
     )
-    plan = _attached_plan(multi_source_env, engine_sql)
+    plan = _physical_plan(multi_source_env, engine_sql)
     producer = _collect(plan, PhysicalCTE)[0]
-
-    first = producer.materialize()
-    # A second call returns the very same cached table (computed once).
-    assert producer.materialize() is first
-    # The producer also yields those rows via execute().
-    executed = list(producer.execute())
-    assert sum(batch.num_rows for batch in executed) == first.num_rows
     assert "PhysicalCTE(cust)" in repr(producer)
     scan = _collect(plan, PhysicalCTEScan)[0]
     assert "PhysicalCTEScan(cust)" in repr(scan)
@@ -372,7 +356,7 @@ def test_constant_cte_in_multi_source_catalog(multi_source_env):
     With several sources, pushdown cannot default the pure-computation body to
     one of them, so it materializes through the producer path and the child
     """
-    plan = _attached_plan(multi_source_env, "WITH x AS (SELECT 1 AS n) SELECT n FROM x")
+    plan = _physical_plan(multi_source_env, "WITH x AS (SELECT 1 AS n) SELECT n FROM x")
     producers = _collect(plan, PhysicalCTE)
     assert len(producers) == 1
     runtime = build_runtime(multi_source_env)

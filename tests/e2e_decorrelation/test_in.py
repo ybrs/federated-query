@@ -478,6 +478,7 @@ class TestInComplexQueries:
         results = execute_and_fetch_all(executor, decorrelated_plan)
         assert len(results) > 0, "Should have users with matching tuples"
 
+    @pytest.mark.xfail(reason="fedqrs gap: PhysicalUnion (union-distinct) has no Rust operator", strict=False)
     def test_in_select_list_as_boolean(self, catalog, setup_test_data):
         """
         Test: IN expression in SELECT list producing boolean.

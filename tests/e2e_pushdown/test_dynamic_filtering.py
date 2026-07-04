@@ -6,46 +6,55 @@ remote query as a ``key IN (...)`` filter, so the probe does not ship rows that
 cannot match.
 """
 
-from sqlglot import exp
+from federated_query.executor.rust_ir import build_ir
 
 from tests.e2e_pushdown.helpers import build_runtime
 
 
-def _find_in(ast) -> bool:
-    """Whether a captured query AST contains an IN predicate."""
-    return ast is not None and ast.find(exp.In) is not None
+def _injected_scan(multi_source_env, sql):
+    """Return the Rust IR ``injected_scan`` step for the probe, if any.
 
-
-def test_cross_source_join_pushes_dynamic_filter(multi_source_env, duckdb_engine):
-    """The probe-side remote query carries an IN filter from the build keys."""
+    The Rust engine runs the whole cross-source join and injects the build's
+    distinct keys into the probe's native query itself, so the Python proxy no
+    longer sees the runtime SQL. The plan's serialized IR is where the semi-join
+    reduction is now observable: an ``injected_scan`` step names the probe
+    datasource and the column the ``key IN (...)`` filter constrains.
+    """
     runtime = build_runtime(multi_source_env)
-    multi_source_env.reset_datasources()
+    plan = runtime.query_executor._plan_pipeline(sql, None)
+    ir = build_ir(plan)
+    for step in ir["steps"]:
+        if step.get("op") == "injected_scan":
+            return step
+    return None
+
+
+def test_cross_source_join_pushes_dynamic_filter(multi_source_env):
+    """The probe scan carries an injected dynamic filter from the build keys."""
     sql = (
         "SELECT O.order_id "
         "FROM duckdb_orders.main.orders O "
         "JOIN duckdb_products.main.products P ON O.product_id = P.id"
     )
-    runtime.execute(sql)
+    step = _injected_scan(multi_source_env, sql)
+    # build side is products; the probe (orders) is constrained to product ids
+    # that exist in the build, injected on its product_id column.
+    assert step is not None
+    assert step["datasource"] == "duckdb_orders"
+    assert step["inject_column"] == "product_id"
 
-    asts = multi_source_env.snapshot_asts()
-    # build side is the right input (products); probe side is orders, which
-    # should be constrained to product ids that exist in the build.
-    assert _find_in(asts.get("duckdb_orders")), asts.get("duckdb_orders")
 
-
-def test_cross_source_comma_join_pushes_dynamic_filter(multi_source_env, duckdb_engine):
+def test_cross_source_comma_join_pushes_dynamic_filter(multi_source_env):
     """The comma-join form (promoted to an equi-join) also reduces the probe."""
-    runtime = build_runtime(multi_source_env)
-    multi_source_env.reset_datasources()
     sql = (
         "SELECT O.order_id "
         "FROM duckdb_orders.main.orders O, duckdb_products.main.products P "
         "WHERE O.product_id = P.id"
     )
-    runtime.execute(sql)
-
-    asts = multi_source_env.snapshot_asts()
-    assert _find_in(asts.get("duckdb_orders")), asts.get("duckdb_orders")
+    step = _injected_scan(multi_source_env, sql)
+    assert step is not None
+    assert step["datasource"] == "duckdb_orders"
+    assert step["inject_column"] == "product_id"
 
 
 def test_cross_source_join_results_correct(multi_source_env):

@@ -9,7 +9,7 @@ ORDER BY semantics, so it fails fast.
 
 import pytest
 
-from federated_query.parser.errors import UnsupportedSQLError
+from federated_query.executor.rust_ir import UnsupportedIR
 
 from tests.e2e_pushdown.helpers import build_runtime
 
@@ -66,8 +66,13 @@ def test_plain_distinct_unaffected(single_source_env):
     assert table.num_rows == 3
 
 
-def test_cross_source_distinct_on_fails_fast(multi_source_env, duckdb_engine):
-    """A cross-source DISTINCT ON fails fast instead of returning a wrong answer."""
+def test_cross_source_distinct_on_fails_fast(multi_source_env):
+    """A cross-source DISTINCT ON fails loud instead of returning a wrong answer.
+
+    Single-source DISTINCT ON pushes to its source; a cross-source one becomes a
+    PhysicalProjection the Rust engine's project fragment cannot dedup, so IR
+    build raises UnsupportedIR rather than silently dropping the DISTINCT ON.
+    """
     runtime = build_runtime(multi_source_env)
     sql = (
         "SELECT DISTINCT ON (o.region) o.region, o.order_id, c.segment "
@@ -75,5 +80,5 @@ def test_cross_source_distinct_on_fails_fast(multi_source_env, duckdb_engine):
         "JOIN duckdb_customers.main.customers c ON o.customer_id = c.customer_id "
         "ORDER BY o.region, o.order_id"
     )
-    with pytest.raises(UnsupportedSQLError):
+    with pytest.raises(UnsupportedIR):
         runtime.execute(sql)

@@ -25,7 +25,58 @@ from federated_query.optimizer import (
     LimitPushdownRule,
 )
 from federated_query.executor import Executor
+from federated_query.plan.physical import (
+    PhysicalScan,
+    PhysicalRemoteQuery,
+    PhysicalRemoteJoin,
+    to_source_sql,
+)
 from tests.duckdb_tmp import duckdb_path
+
+
+def _count_source_nodes(node):
+    """Count the source-reading nodes in a physical plan.
+
+    A same-source subtree collapses to exactly one such node, so ``== 1`` proves
+    the whole query (join included) is pushed as a single remote query - the
+    property the old runtime query-count assertion checked.
+    """
+    if isinstance(node, (PhysicalScan, PhysicalRemoteQuery, PhysicalRemoteJoin)):
+        return 1
+    total = 0
+    for child in node.children():
+        total += _count_source_nodes(child)
+    return total
+
+
+def _single_pushed_sql(catalog, sql):
+    """Plan `sql` and return (source-node count, rendered pushed SQL)."""
+    parser = Parser()
+    bound = Binder(catalog).bind(parser.parse_to_logical_plan(sql, catalog))
+    physical_plan = PhysicalPlanner(catalog).plan(_optimize(catalog, bound))
+    return _count_source_nodes(physical_plan), _render_pushed_sql(physical_plan)
+
+
+def _render_pushed_sql(node):
+    """Render the source SQL a plan pushes down, found in the physical plan.
+
+    The Rust engine runs the whole plan and sends SQL through its native
+    connector, so the Python datasource proxy no longer sees the query. The
+    pushed-down SQL is instead read statically from the plan's source node (a
+    single-source subtree collapses to one remote query / scan), which is exactly
+    what the source will receive.
+    """
+    if isinstance(node, PhysicalScan):
+        return node._render_source_sql()
+    if isinstance(node, PhysicalRemoteQuery):
+        return node._sql()
+    if isinstance(node, PhysicalRemoteJoin):
+        return to_source_sql(node.datasource_connection, node._build_query())
+    for child in node.children():
+        rendered = _render_pushed_sql(child)
+        if rendered is not None:
+            return rendered
+    return None
 
 
 class QueryCapturingDataSource(DuckDBDataSource):
@@ -110,30 +161,31 @@ def setup_capturing_db():
 
 
 def execute_and_capture(sql: str, catalog: Catalog, ds: QueryCapturingDataSource):
-    """Execute SQL and return captured query + results."""
-    ds.clear_queries()
-
+    """Return the pushed-down source SQL (from the plan) plus the Rust results."""
     parser = Parser()
     logical_plan = parser.parse_to_logical_plan(sql, catalog)
 
     binder = Binder(catalog)
     bound_plan = binder.bind(logical_plan)
 
+    optimized_plan = _optimize(catalog, bound_plan)
+    physical_plan = PhysicalPlanner(catalog).plan(optimized_plan)
+
+    executor = Executor(catalog)
+    results = list(executor.execute(physical_plan))
+
+    return _render_pushed_sql(physical_plan), results
+
+
+def _optimize(catalog, bound_plan):
+    """Apply the standard pushdown rule set to a bound plan."""
     optimizer = RuleBasedOptimizer(catalog)
     optimizer.add_rule(PredicatePushdownRule())
     optimizer.add_rule(ProjectionPushdownRule())
     optimizer.add_rule(AggregatePushdownRule())
     optimizer.add_rule(OrderByPushdownRule())
     optimizer.add_rule(LimitPushdownRule())
-    optimized_plan = optimizer.optimize(bound_plan)
-
-    planner = PhysicalPlanner(catalog)
-    physical_plan = planner.plan(optimized_plan)
-
-    executor = Executor()
-    results = list(executor.execute(physical_plan))
-
-    return ds.get_last_query(), results
+    return optimizer.optimize(bound_plan)
 
 
 class TestPredicatePushdownReal:
@@ -518,10 +570,10 @@ class TestBuggyAggregates:
         planner = PhysicalPlanner(catalog)
         physical_plan = planner.plan(optimized_plan)
 
-        executor = Executor()
-        results = list(executor.execute(physical_plan))
+        executor = Executor(catalog)
+        list(executor.execute(physical_plan))
 
-        query = ds.get_last_query()
+        query = _render_pushed_sql(physical_plan)
 
         print(f"\nDEBUG: SQL WITHOUT AggregatePushdownRule: {query}")
 
@@ -548,8 +600,9 @@ class TestJoinPushdownReal:
             FROM testdb.main.customers c
             JOIN testdb.main.orders o ON c.customer_id = o.customer_id
         """
-        query, results = execute_and_capture(sql, catalog, ds)
-        assert len(ds.captured_queries) == 1, "Join should run as single query"
+        source_count, query = _single_pushed_sql(catalog, sql)
+        _, results = execute_and_capture(sql, catalog, ds)
+        assert source_count == 1, "Join should push as a single remote query"
         assert (
             "INNER JOIN" in query.upper()
         ), f"Expected INNER JOIN in pushed SQL: {query}"
@@ -573,8 +626,9 @@ class TestJoinPushdownReal:
             FROM testdb.main.customers c
             LEFT JOIN testdb.main.orders o ON c.customer_id = o.customer_id
         """
-        query, results = execute_and_capture(sql, catalog, ds)
-        assert len(ds.captured_queries) == 1, "LEFT JOIN should run remotely"
+        source_count, query = _single_pushed_sql(catalog, sql)
+        _, results = execute_and_capture(sql, catalog, ds)
+        assert source_count == 1, "LEFT JOIN should push as a single remote query"
         assert "LEFT JOIN" in query.upper(), f"Expected LEFT JOIN in SQL: {query}"
         left_rows = []
         for batch in results:
@@ -603,8 +657,9 @@ class TestJoinPushdownReal:
             FROM testdb.main.customers c
             RIGHT JOIN testdb.main.orders o ON c.customer_id = o.customer_id
         """
-        query, results = execute_and_capture(sql, catalog, ds)
-        assert len(ds.captured_queries) == 1, "RIGHT JOIN should run remotely"
+        source_count, query = _single_pushed_sql(catalog, sql)
+        _, results = execute_and_capture(sql, catalog, ds)
+        assert source_count == 1, "RIGHT JOIN should push as a single remote query"
         assert "RIGHT JOIN" in query.upper(), f"Expected RIGHT JOIN in SQL: {query}"
         rows = []
         for batch in results:
@@ -633,9 +688,10 @@ class TestJoinPushdownReal:
             FROM testdb.main.customers c
             FULL JOIN testdb.main.orders o ON c.customer_id = o.customer_id
         """
+        source_count, query = _single_pushed_sql(catalog, sql)
         _, results = execute_and_capture(sql, catalog, ds)
-        assert len(ds.captured_queries) == 1, "FULL JOIN should push as one query"
-        assert "JOIN" in ds.captured_queries[0].upper()
+        assert source_count == 1, "FULL JOIN should push as one remote query"
+        assert "JOIN" in query.upper()
         total_rows = 0
         for batch in results:
             total_rows += batch.num_rows

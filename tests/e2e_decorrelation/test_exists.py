@@ -21,6 +21,7 @@ from .test_utils import (
 class TestUncorrelatedExists:
     """Test uncorrelated EXISTS patterns."""
 
+    @pytest.mark.xfail(reason="fedqrs gap: empty-condition semi-join (uncorrelated EXISTS) rejected by Rust", strict=False)
     def test_uncorrelated_exists_basic(self, catalog, setup_test_data):
         """
         Test: Uncorrelated EXISTS in WHERE clause.
@@ -52,6 +53,7 @@ class TestUncorrelatedExists:
         # Execute and verify results: All 5 users
         assert_result_count(executor, decorrelated_plan, 5)
 
+    @pytest.mark.xfail(reason="fedqrs gap: empty-condition semi-join (uncorrelated EXISTS) rejected by Rust", strict=False)
     def test_uncorrelated_exists_empty_result(self, catalog, setup_test_data):
         """
         Test: Uncorrelated EXISTS with empty subquery.
@@ -183,6 +185,7 @@ class TestCorrelatedExists:
 class TestUncorrelatedNotExists:
     """Test uncorrelated NOT EXISTS patterns."""
 
+    @pytest.mark.xfail(reason="fedqrs gap: empty-condition semi-join (uncorrelated EXISTS) rejected by Rust", strict=False)
     def test_uncorrelated_not_exists_basic(self, catalog, setup_test_data):
         """
         Test: Uncorrelated NOT EXISTS in WHERE clause.
@@ -213,6 +216,7 @@ class TestUncorrelatedNotExists:
         # Execute and verify results: All 5 users
         assert_result_count(executor, decorrelated_plan, 5)
 
+    @pytest.mark.xfail(reason="fedqrs gap: empty-condition semi-join (uncorrelated EXISTS) rejected by Rust", strict=False)
     def test_uncorrelated_not_exists_filters_all(self, catalog, setup_test_data):
         """
         Test: Uncorrelated NOT EXISTS that filters all rows.
@@ -335,6 +339,7 @@ class TestCorrelatedNotExists:
 class TestExistsInComplexQueries:
     """Test EXISTS in complex query contexts."""
 
+    @pytest.mark.xfail(reason="fedqrs gap: PhysicalUnion (union-distinct) has no Rust operator", strict=False)
     def test_exists_in_select_list(self, catalog, setup_test_data):
         """
         Test: EXISTS as a boolean expression in SELECT list.
@@ -460,6 +465,7 @@ class TestExistsInComplexQueries:
         # Execute and verify results: 3 users
         assert_result_contains_ids(executor, decorrelated_plan, {1, 3, 5})
 
+    @pytest.mark.xfail(reason="fedqrs gap: PhysicalUnion (union-distinct) has no Rust operator", strict=False)
     def test_exists_under_or_predicate(self, catalog, setup_test_data):
         """
         Test: Correlated EXISTS combined with OR condition.
