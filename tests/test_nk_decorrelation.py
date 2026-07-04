@@ -150,3 +150,43 @@ def test_non_equi_correlated_count_bug(env):
         "  (SELECT COUNT(*) FROM products p WHERE p.base_price < o.price) AS c "
         "FROM orders o"
     ))
+
+
+@pytest.mark.parametrize("agg,op", [
+    ("MAX", "<"), ("MIN", ">"), ("SUM", "<"), ("AVG", "<="), ("COUNT", ">"),
+])
+def test_non_equi_scalar_aggregate_variants(env, agg, op):
+    """Every (aggregate, non-equi operator) pair unnests and matches DuckDB,
+    including empty-match groups (MAX/SUM/AVG -> NULL, COUNT -> 0)."""
+    inner = "*" if agg == "COUNT" else "p.base_price"
+    _assert_nk(env, (
+        f"SELECT o.order_id, (SELECT {agg}({inner}) FROM src_p.main.products p "
+        f"WHERE p.base_price {op} o.price) AS v FROM src_o.main.orders o"
+    ), (
+        f"SELECT o.order_id, (SELECT {agg}({inner}) FROM products p "
+        f"WHERE p.base_price {op} o.price) AS v FROM orders o"
+    ))
+
+
+def test_two_free_vars(env):
+    """A correlation on two outer columns builds a two-column domain."""
+    _assert_nk(env, (
+        "SELECT o.order_id, (SELECT COUNT(*) FROM src_p.main.products p "
+        "WHERE p.base_price < o.price AND p.id > o.order_id) AS c "
+        "FROM src_o.main.orders o"
+    ), (
+        "SELECT o.order_id, (SELECT COUNT(*) FROM products p "
+        "WHERE p.base_price < o.price AND p.id > o.order_id) AS c "
+        "FROM orders o"
+    ))
+
+
+def test_non_equi_aggregate_in_where(env):
+    """A non-equi correlated scalar aggregate used in a WHERE comparison."""
+    _assert_nk(env, (
+        "SELECT o.order_id FROM src_o.main.orders o WHERE o.price > "
+        "(SELECT MIN(p.base_price) FROM src_p.main.products p WHERE p.base_price < o.price)"
+    ), (
+        "SELECT o.order_id FROM orders o WHERE o.price > "
+        "(SELECT MIN(p.base_price) FROM products p WHERE p.base_price < o.price)"
+    ))
