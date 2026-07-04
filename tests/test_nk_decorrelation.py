@@ -258,3 +258,17 @@ def test_user_lateral_aggregate_unnests(env):
         "(SELECT MAX(p.base_price) AS m FROM products p "
         " WHERE p.base_price < o.price) t ON true"
     ))
+
+
+def test_user_lateral_set_unnests(env):
+    """A cross-source user LATERAL with a plain multi-row body (no LIMIT/aggregate)
+    unnests to a domain join keeping every matching row, and matches DuckDB."""
+    _assert_nk(env, (
+        "SELECT o.order_id, t.bp FROM src_o.main.orders o LEFT JOIN LATERAL "
+        "(SELECT p.base_price AS bp FROM src_p.main.products p "
+        " WHERE p.base_price < o.price) t ON true"
+    ), (
+        "SELECT o.order_id, t.bp FROM orders o LEFT JOIN LATERAL "
+        "(SELECT p.base_price AS bp FROM products p "
+        " WHERE p.base_price < o.price) t ON true"
+    ))

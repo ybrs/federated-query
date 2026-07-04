@@ -2123,6 +2123,11 @@ class Decorrelator:
         joined = Join.create(
             left=domain, right=inner, join_type=JoinType.INNER, condition=condition
         )
+        if limit is None:
+            # No LIMIT: a multi-row (set) LATERAL keeps every matching row, so no
+            # ranking - just project (domain columns, values) over the join.
+            projected = self._project_join_values(joined, value_exprs, value_names, dom_map)
+            return SubqueryScan.create(input=projected, alias=prefix)
         win_prefix = self._next_prefix()
         ranked = self._rank_by_row_number(
             joined, value_exprs, value_names, order, dom_map, win_prefix
@@ -2132,6 +2137,19 @@ class Decorrelator:
         )
         projected = self._project_domain_values(capped, value_names, dom_map, win_prefix)
         return SubqueryScan.create(input=projected, alias=prefix)
+
+    def _project_join_values(self, joined, value_exprs, value_names, dom_map):
+        """Project (domain columns, output values) directly over the domain join,
+        rewriting any outer reference in a value to its domain column."""
+        names: List[str] = []
+        for domain_ref in dom_map.values():
+            names.append(domain_ref.column)
+        names.extend(value_names)
+        values: List[Expression] = []
+        for value in value_exprs:
+            values.append(_replace_column_refs(value, dom_map))
+        expressions = list(dom_map.values()) + values
+        return Projection.create(input=joined, expressions=expressions, aliases=names)
 
     def _rank_by_row_number(self, joined, value_exprs, value_names, order, dom_map, win_prefix):
         """Project (domain cols, output values, ROW_NUMBER() per domain), aliased.
@@ -2217,11 +2235,36 @@ class Decorrelator:
         )
 
     def _lateral_relation(self, outer, alias, body):
-        """Unnest a LATERAL body to a relation - top-k or aggregate - or None."""
+        """Unnest a LATERAL body to a relation - top-k, aggregate, or set - or None."""
         top_k = self._lateral_top_k_relation(outer, alias, body)
         if top_k is not None:
             return top_k
-        return self._lateral_aggregate_relation(outer, alias, body)
+        aggregate = self._lateral_aggregate_relation(outer, alias, body)
+        if aggregate is not None:
+            return aggregate
+        return self._lateral_set_relation(outer, alias, body)
+
+    def _lateral_set_relation(self, outer, alias, body):
+        """Build the relation for a plain multi-row LATERAL body: Projection[Filter].
+
+        A dependent join with no aggregate or LIMIT keeps every matching inner row
+        per outer, so it unnests to the domain join projected to the body columns.
+        """
+        if not isinstance(body, Projection) or not isinstance(body.input, Filter):
+            return None
+        inner_aliases = _collect_inner_aliases(body)
+        correlated, local = self._split_by_outer(body.input.predicate, inner_aliases)
+        free_vars = self._distinct_outer_refs(
+            correlated + list(body.expressions), inner_aliases
+        )
+        if not correlated or not free_vars:
+            return None
+        domain, dom_map = self._build_domain(outer, free_vars, self._next_prefix())
+        relation = self._build_top_k_relation(
+            list(body.expressions), list(body.aliases), None, None, domain,
+            body.input.input, correlated, local, dom_map, alias,
+        )
+        return (relation, free_vars, dom_map)
 
     def _lateral_top_k_relation(self, outer, alias, body):
         """Build the top-k relation for a Limit[...] LATERAL body, or None."""
