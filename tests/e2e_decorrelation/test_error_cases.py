@@ -823,12 +823,12 @@ class TestUnsupportedSubqueryShapes:
         assert grouped.limit == 1
         assert grouped.order_by_keys
 
-    def test_non_equi_correlated_limit_subquery_uses_lateral(
+    def test_non_equi_correlated_limit_subquery_unnests(
         self, catalog, setup_test_data
     ):
-        """A non-equi correlated ``ORDER BY ... LIMIT`` scalar cannot become a
-        per-key limit (a ``<``/``>`` correlation matches many groups), so it
-        per-key answer.
+        """A non-equi correlated ``ORDER BY ... LIMIT`` scalar unnests via
+        Neumann-Kemper (a per-domain ROW_NUMBER() top-k over the distinct outer
+        values), so it lowers to regular algebra rather than a LATERAL.
         """
         sql = (
             "SELECT u.id, (SELECT o.user_id FROM pg.orders o "
@@ -836,7 +836,7 @@ class TestUnsupportedSubqueryShapes:
             "FROM pg.users u"
         )
         plan = self._decorrelate(catalog, sql)
-        assert self._find_lateral_join(plan) is not None
+        assert self._find_lateral_join(plan) is None
 
     def _find_lateral_join(self, node):
         """Return the first LateralJoin in a plan, or None."""

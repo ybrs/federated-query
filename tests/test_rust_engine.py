@@ -255,14 +255,13 @@ def test_cross_source_order_by(engine):
 
 def test_unsupported_shape_raises(engine):
     """A shape the serializer does not yet cover (here a cross-source correlated
-    scalar subquery with ORDER BY + LIMIT - top-k per outer, an M2 target - which
-    still decorrelates to a LATERAL) must raise, never silently emit a plan that
-    could produce wrong rows."""
+    aggregate subquery with its own GROUP BY, which still decorrelates to a
+    LATERAL) must raise, never silently emit a plan that could produce wrong rows."""
     qe, _ = engine
     sql = (
         "SELECT n.n_name, "
-        f"  (SELECT r.r_name FROM srcB.{SCHEMA}.region r "
-        "   WHERE r.r_regionkey < n.n_regionkey ORDER BY r.r_name LIMIT 1) AS m "
+        f"  (SELECT MAX(r.r_regionkey) FROM srcB.{SCHEMA}.region r "
+        "   WHERE r.r_regionkey < n.n_regionkey GROUP BY r.r_name) AS m "
         f"FROM srcA.{SCHEMA}.nation n"
     )
     plan = qe._plan_pipeline(sql, profiler=None)

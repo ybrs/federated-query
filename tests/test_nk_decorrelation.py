@@ -190,3 +190,31 @@ def test_non_equi_aggregate_in_where(env):
         "SELECT o.order_id FROM orders o WHERE o.price > "
         "(SELECT MIN(p.base_price) FROM products p WHERE p.base_price < o.price)"
     ))
+
+
+def test_top_k_row_subquery_desc(env):
+    """A correlated row subquery ORDER BY DESC LIMIT 1 (largest base_price below
+    o.price) unnests via a per-domain top-k, no LATERAL, and matches DuckDB."""
+    _assert_nk(env, (
+        "SELECT o.order_id, (SELECT p.base_price FROM src_p.main.products p "
+        "WHERE p.base_price < o.price ORDER BY p.base_price DESC LIMIT 1) AS m "
+        "FROM src_o.main.orders o"
+    ), (
+        "SELECT o.order_id, (SELECT p.base_price FROM products p "
+        "WHERE p.base_price < o.price ORDER BY p.base_price DESC LIMIT 1) AS m "
+        "FROM orders o"
+    ))
+
+
+def test_top_k_row_subquery_asc(env):
+    """A correlated row subquery ORDER BY ASC LIMIT 1 (smallest base_price above
+    o.price), including empty-match outer rows (NULL)."""
+    _assert_nk(env, (
+        "SELECT o.order_id, (SELECT p.id FROM src_p.main.products p "
+        "WHERE p.base_price > o.price ORDER BY p.base_price ASC LIMIT 1) AS pid "
+        "FROM src_o.main.orders o"
+    ), (
+        "SELECT o.order_id, (SELECT p.id FROM products p "
+        "WHERE p.base_price > o.price ORDER BY p.base_price ASC LIMIT 1) AS pid "
+        "FROM orders o"
+    ))

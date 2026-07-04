@@ -1139,9 +1139,10 @@ class _SubqueryPreparer:
         )
 
 
-# Output name of the aggregate value produced by Neumann-Kemper unnesting; it is
-# always qualified by a fresh per-subquery relation alias, so the bare name is safe.
+# Output names produced by Neumann-Kemper unnesting; always qualified by a fresh
+# per-subquery relation alias, so the bare names are safe.
 _UNNEST_VALUE = "nk_value"
+_UNNEST_RANK = "nk_rank"
 
 
 class Decorrelator:
@@ -1859,10 +1860,13 @@ class Decorrelator:
         back to a LATERAL for a subquery shape not yet covered here.
         """
         body = self._rewrite_plan(expr.subquery)
-        shape = self._dependent_shape(body)
-        if shape is None:
-            return self._lateral_scalar(expr, plan)
-        return self._assemble_unnested(plan, body, shape)
+        aggregate = self._dependent_shape(body)
+        if aggregate is not None:
+            return self._assemble_unnested(plan, body, aggregate)
+        top_k = self._dependent_limit_shape(body)
+        if top_k is not None:
+            return self._assemble_unnested_limit(plan, top_k)
+        return self._lateral_scalar(expr, plan)
 
     def _dependent_shape(self, body: LogicalPlanNode):
         """Recognize Aggregate([one agg], no GROUP BY, Filter(correlated, inner)).
@@ -2018,6 +2022,137 @@ class Decorrelator:
             isinstance(aggregate, FunctionCall)
             and aggregate.function_name.upper() == "COUNT"
         )
+
+    def _dependent_limit_shape(self, body: LogicalPlanNode):
+        """Recognize Limit[Sort?[Projection[Filter(correlated, inner)]]] - a
+        top-k-per-outer row subquery.
+
+        Returns (value, order, limit, correlated, local, inner, free_vars), or
+        None when the shape is outside this rewrite (the LATERAL fallback covers it).
+        """
+        peeled = self._peel_limit_body(body)
+        if peeled is None:
+            return None
+        value, order, limit, filter_node = peeled
+        inner_aliases = _collect_inner_aliases(body)
+        correlated, local = self._split_by_outer(filter_node.predicate, inner_aliases)
+        free_vars = self._distinct_outer_refs(correlated, inner_aliases)
+        if not correlated or not free_vars:
+            return None
+        return (value, order, limit, correlated, local, filter_node.input, free_vars)
+
+    def _peel_limit_body(self, body: LogicalPlanNode):
+        """Peel Limit / (optional Sort) / single-column Projection to its Filter.
+
+        Returns (value_expr, order_or_None, limit, filter_node) or None.
+        """
+        if not isinstance(body, Limit):
+            return None
+        order, below_sort = self._peel_sort(body.input)
+        return self._peel_value_filter(below_sort, order, body.limit)
+
+    def _peel_sort(self, node: LogicalPlanNode):
+        """Split a leading Sort into its (keys, ascending, nulls) order and input."""
+        if isinstance(node, Sort):
+            return (node.sort_keys, node.ascending, node.nulls_order), node.input
+        return None, node
+
+    def _peel_value_filter(self, node, order, limit):
+        """A single-column Projection directly over a Filter carries the value."""
+        if not self._is_value_projection(node):
+            return None
+        return (node.expressions[0], order, limit, node.input)
+
+    def _is_value_projection(self, node: LogicalPlanNode) -> bool:
+        """A single-column Projection directly over a Filter."""
+        if not isinstance(node, Projection) or len(node.expressions) != 1:
+            return False
+        return isinstance(node.input, Filter)
+
+    def _assemble_unnested_limit(self, plan, shape) -> Tuple[Expression, LogicalPlanNode]:
+        """Build the domain -> top-k-per-domain -> join-back rewrite for a row subquery."""
+        value, order, limit, correlated, local, inner, free_vars = shape
+        dom_prefix = self._next_prefix()
+        dep_prefix = self._next_prefix()
+        domain, dom_map = self._build_domain(plan, free_vars, dom_prefix)
+        top_k = self._build_top_k_relation(
+            value, order, limit, domain, inner, correlated, local, dom_map, dep_prefix
+        )
+        joined = Join.create(
+            left=plan, right=top_k, join_type=JoinType.LEFT,
+            condition=self._join_back_condition(free_vars, dom_map, dep_prefix),
+        )
+        return ColumnRef.create(table=dep_prefix, column=_UNNEST_VALUE), joined
+
+    def _build_top_k_relation(
+        self, value, order, limit, domain, inner, correlated, local, dom_map, prefix
+    ):
+        """domain JOIN inner, ranked by ROW_NUMBER() per domain value, filtered to
+        the top-k rows, projected to (domain columns, subquery value).
+
+        Uses a window (qualified columns, a real resolver) rather than a bare-key
+        GroupedLimit, so column pruning keeps the domain column through the join.
+        """
+        condition = self._dependent_join_condition(correlated, local, dom_map)
+        joined = Join.create(
+            left=domain, right=inner, join_type=JoinType.INNER, condition=condition
+        )
+        win_prefix = self._next_prefix()
+        ranked = self._rank_by_row_number(joined, value, order, dom_map, win_prefix)
+        capped = Filter.create(
+            input=ranked, predicate=self._row_number_cap(win_prefix, limit)
+        )
+        projected = self._project_domain_value(capped, dom_map, win_prefix)
+        return SubqueryScan.create(input=projected, alias=prefix)
+
+    def _rank_by_row_number(self, joined, value, order, dom_map, win_prefix):
+        """Project (domain cols, value, ROW_NUMBER() per domain) and alias it."""
+        window = self._row_number_window(list(dom_map.values()), order)
+        names: List[str] = []
+        for domain_ref in dom_map.values():
+            names.append(domain_ref.column)
+        names.append(_UNNEST_VALUE)
+        names.append(_UNNEST_RANK)
+        projection = Projection.create(
+            input=joined,
+            expressions=list(dom_map.values()) + [value, window],
+            aliases=names,
+        )
+        return SubqueryScan.create(input=projection, alias=win_prefix)
+
+    def _row_number_window(self, partition_keys, order):
+        """A ROW_NUMBER() window partitioned by the domain, ordered as asked."""
+        row_number = FunctionCall.create(
+            function_name="ROW_NUMBER", args=[], is_aggregate=False
+        )
+        keys, ascending, nulls = self._order_parts(order)
+        return WindowExpr.create(
+            function=row_number, partition_by=partition_keys,
+            order_keys=keys, order_ascending=ascending, order_nulls=nulls,
+        )
+
+    def _order_parts(self, order):
+        """Split an optional (keys, ascending, nulls) order tuple, empty when None."""
+        if order is None:
+            return [], [], []
+        return order[0], order[1], order[2]
+
+    def _row_number_cap(self, win_prefix, limit) -> Expression:
+        """The rn <= limit predicate keeping the top-k rows per domain value."""
+        rank = ColumnRef.create(table=win_prefix, column=_UNNEST_RANK)
+        bound = Literal.create(value=limit, data_type=DataType.INTEGER)
+        return BinaryOp.create(op=BinaryOpType.LTE, left=rank, right=bound)
+
+    def _project_domain_value(self, capped, dom_map, win_prefix):
+        """Project the ranked, capped relation down to (domain columns, value)."""
+        expressions: List[Expression] = []
+        names: List[str] = []
+        for domain_ref in dom_map.values():
+            expressions.append(ColumnRef.create(table=win_prefix, column=domain_ref.column))
+            names.append(domain_ref.column)
+        expressions.append(ColumnRef.create(table=win_prefix, column=_UNNEST_VALUE))
+        names.append(_UNNEST_VALUE)
+        return Projection.create(input=capped, expressions=expressions, aliases=names)
 
     def _join_flag(
         self, expr: Expression, plan: LogicalPlanNode
