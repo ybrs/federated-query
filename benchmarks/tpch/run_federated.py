@@ -16,6 +16,7 @@ loaded every table into both sources), so a mismatch is a real engine bug.
 import argparse
 import glob
 import os
+import time
 
 import duckdb
 import sqlglot
@@ -127,27 +128,41 @@ def _query_sources(sql, placement):
     return sources
 
 
+def _median_ms(thunk):
+    """Median wall time in ms over 3 runs after a warm-up, plus the last result."""
+    thunk()
+    times = []
+    for _ in range(3):
+        start = time.time()
+        result = thunk()
+        times.append((time.time() - start) * 1000)
+    times.sort()
+    return times[1], result
+
+
 def evaluate_query(runtime, oracle, path, placement, decimals):
-    """Run one query through the engine and the connector oracle; classify it."""
+    """Run one query through the engine and the connector oracle; time + classify."""
     name = os.path.splitext(os.path.basename(path))[0]
     raw = _read_query(path)
     cross = "cross" if len(_query_sources(raw, placement)) > 1 else "single"
+    engine_sql = _qualify(raw, placement, FEDQ_SOURCES, ENGINE_DIALECT)
     try:
-        engine_sql = _qualify(raw, placement, FEDQ_SOURCES, ENGINE_DIALECT)
-        engine_rows = arrow_to_rows(runtime.execute(engine_sql))
+        ours_ms, engine_rows = _median_ms(lambda: arrow_to_rows(runtime.execute(engine_sql)))
     except Exception as error:
-        return _result(name, "ERROR", _error_text(error), cross, None, None)
+        return _result(name, "ERROR", _error_text(error), cross, None, None, 0.0, 0.0)
     oracle_sql = _qualify(raw, placement, ORACLE_SOURCES, "duckdb")
-    oracle_rows = oracle.execute(oracle_sql).fetchall()
+    duck_ms, oracle_rows = _median_ms(lambda: oracle.execute(oracle_sql).fetchall())
     match, reason = compare_results(engine_rows, oracle_rows, decimals)
     status = "PASS" if match else "MISMATCH"
-    return _result(name, status, reason, cross, len(engine_rows), len(oracle_rows))
+    return _result(name, status, reason, cross, len(engine_rows), len(oracle_rows),
+                   ours_ms, duck_ms)
 
 
-def _result(name, status, reason, cross, engine_rows, oracle_rows):
+def _result(name, status, reason, cross, engine_rows, oracle_rows, ours_ms, duck_ms):
     """Assemble one query's outcome record."""
     return {"name": name, "status": status, "reason": reason, "span": cross,
-            "engine_rows": engine_rows, "oracle_rows": oracle_rows}
+            "engine_rows": engine_rows, "oracle_rows": oracle_rows,
+            "ours_ms": ours_ms, "duck_ms": duck_ms}
 
 
 def _error_text(error):
@@ -158,29 +173,34 @@ def _error_text(error):
 
 
 def _print_result(result):
-    """Print one query's outcome row."""
+    """Print one query's outcome row with timing and slowness (ours / duckdb)."""
     reason = result["reason"]
-    if len(reason) > 80:
-        reason = reason[:80] + "..."
-    print("{0:5} {1:8} {2:7} {3}".format(
-        result["name"], result["status"], result["span"], reason), flush=True)
+    if len(reason) > 46:
+        reason = reason[:46] + "..."
+    slower = result["ours_ms"] / result["duck_ms"] if result["duck_ms"] else 0.0
+    print("{0:5} {1:8} {2:6} {3:9.1f}m {4:8.1f}m {5:6.2f}x  {6}".format(
+        result["name"], result["status"], result["span"],
+        result["ours_ms"], result["duck_ms"], slower, reason), flush=True)
 
 
 def _print_summary(placement_name, results):
-    """Print the pass/mismatch/error tally and cross-source count."""
+    """Print the tally, cross-source count, and the total timing ratio."""
     tally = {"PASS": 0, "MISMATCH": 0, "ERROR": 0}
     cross = 0
+    ours_total = duck_total = 0.0
     for result in results:
         tally[result["status"]] += 1
-        if result["span"] == "cross":
-            cross += 1
-    print("-" * 60)
-    print(
-        "[{0}] Total {1} | PASS {2} | MISMATCH {3} | ERROR {4} | cross-source {5}".format(
-            placement_name, len(results), tally["PASS"], tally["MISMATCH"],
-            tally["ERROR"], cross,
-        )
-    )
+        cross += 1 if result["span"] == "cross" else 0
+        ours_total += result["ours_ms"]
+        duck_total += result["duck_ms"]
+    ratio = ours_total / duck_total if duck_total else float("nan")
+    print("-" * 72)
+    print("[{0}] Total {1} | PASS {2} | MISMATCH {3} | ERROR {4} | cross-source {5}".format(
+        placement_name, len(results), tally["PASS"], tally["MISMATCH"],
+        tally["ERROR"], cross))
+    print("[{0}] ours {1:.0f}m  duckdb {2:.0f}m  ->  {3:.2f}x slower  "
+          "(both federated over the same PG+DuckDB split)".format(
+              placement_name, ours_total, duck_total, ratio))
 
 
 def _select_query_files(queries_dir, only):
@@ -201,7 +221,10 @@ def _select_query_files(queries_dir, only):
 def run_placement(placement_name, paths, runtime, oracle, decimals):
     """Run every selected query under one placement and print the matrix."""
     placement = PLACEMENTS[placement_name]
-    print("\n==== placement: {0} ====".format(placement_name))
+    print("\n==== placement: {0} (ours=fedq, duckdb=via postgres connector) ====".format(
+        placement_name))
+    print("{0:5} {1:8} {2:6} {3:>10} {4:>9} {5:>7}".format(
+        "query", "status", "span", "ours", "duckdb", "slower"))
     results = []
     for path in paths:
         result = evaluate_query(runtime, oracle, path, placement, decimals)
