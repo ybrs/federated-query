@@ -289,6 +289,7 @@ class SingleSourcePushdown:
         # Send the rendered SQL to the single owning source and stream its rows
         # back, mapping remote result columns to their engine-internal names.
         # Lowered from the whole pushed subtree collapsed into one remote query.
+        self._expose_computed_outputs(context)
         return PhysicalRemoteQuery.create(
             datasource=context.datasource,
             datasource_connection=connection,
@@ -296,6 +297,15 @@ class SingleSourcePushdown:
             output_names=context.output_names,
             column_alias_map=context.column_aliases,
         )
+
+    def _expose_computed_outputs(self, context: "_PushContext") -> None:
+        """Map any output column with no source qualifier (a computed result
+        like an aggregate's ``value``) under ``(None, name)``, so a parent that
+        reads this remote query - e.g. a join over it - can resolve it."""
+        mapped = set(context.column_aliases.values())
+        for name in context.output_names:
+            if name not in mapped:
+                context.column_aliases[(None, name)] = name
 
     def _resolve_datasource(self, context: _PushContext) -> Optional[str]:
         """Pick the target source, defaulting a pure-computation CTE.
