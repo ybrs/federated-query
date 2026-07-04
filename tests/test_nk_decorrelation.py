@@ -230,3 +230,17 @@ def test_outer_ref_in_aggregate_value(env):
         "SELECT o.order_id, (SELECT MAX(p.base_price + o.price) FROM products p "
         "WHERE p.base_price < o.price) AS m FROM orders o"
     ))
+
+
+def test_user_lateral_top_k_unnests(env):
+    """A cross-source user LEFT JOIN LATERAL (top-k) unnests to regular joins,
+    runs on Rust, and matches DuckDB - no dependent join, no merge fallback."""
+    _assert_nk(env, (
+        "SELECT o.order_id, t.bp FROM src_o.main.orders o LEFT JOIN LATERAL "
+        "(SELECT p.base_price AS bp FROM src_p.main.products p "
+        " WHERE p.base_price < o.price ORDER BY p.base_price DESC LIMIT 1) t ON true"
+    ), (
+        "SELECT o.order_id, t.bp FROM orders o LEFT JOIN LATERAL "
+        "(SELECT p.base_price AS bp FROM products p "
+        " WHERE p.base_price < o.price ORDER BY p.base_price DESC LIMIT 1) t ON true"
+    ))

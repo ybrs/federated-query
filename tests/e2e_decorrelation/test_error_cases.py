@@ -220,8 +220,8 @@ class TestUnsupportedPatterns:
             binder.bind(plan)
 
     def test_lateral_subquery_handling(self, catalog, setup_test_data):
-        """A user-written LATERAL parses, binds, and decorrelates to a
-        evaluated per outer row by the executing engine.
+        """A user-written LATERAL parses, binds, and unnests to regular algebra
+        (Neumann-Kemper), so no dependent join survives for the engine to run.
         """
         sql = """
             SELECT u.id, o.amount
@@ -236,7 +236,7 @@ class TestUnsupportedPatterns:
                 return True
             return any(has_lateral(child) for child in node.children())
 
-        assert has_lateral(plan)
+        assert not has_lateral(plan)
 
 
 class TestUnsupportedOperators:

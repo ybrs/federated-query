@@ -371,8 +371,9 @@ def test_non_equi_scalar_order_limit_matches_source(single_source_env):
 # User-written LATERAL (dependent join), same source
 
 
-def test_user_left_join_lateral_matches_source(single_source_env):
-    """A user ``LEFT JOIN LATERAL`` pushes as one query and matches the source."""
+def test_user_left_join_lateral_unnests_and_matches_source(single_source_env):
+    """A user ``LEFT JOIN LATERAL`` unnests to regular joins (no LATERAL) and
+    still pushes as one query to its single source, matching it exactly."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT o.order_id, t.name FROM duckdb_primary.main.orders o "
@@ -382,7 +383,7 @@ def test_user_left_join_lateral_matches_source(single_source_env):
         ") t ON true"
     )
     ast = explain_datasource_query(runtime, sql)
-    assert ast.find(exp.Lateral) is not None
+    assert ast.find(exp.Lateral) is None
     _assert_two_col_matches_source(single_source_env, sql)
 
 

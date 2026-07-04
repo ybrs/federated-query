@@ -1183,6 +1183,8 @@ class Decorrelator:
             return self._rewrite_projection(plan)
         if isinstance(plan, Sort):
             return self._rewrite_sort(plan)
+        if isinstance(plan, LateralJoin):
+            return self._rewrite_lateral_join(plan)
         if isinstance(plan, Join):
             return self._rewrite_join(plan)
         if isinstance(plan, Values):
@@ -2091,7 +2093,8 @@ class Decorrelator:
         dep_prefix = self._next_prefix()
         domain, dom_map = self._build_domain(plan, free_vars, dom_prefix)
         top_k = self._build_top_k_relation(
-            value, order, limit, domain, inner, correlated, local, dom_map, dep_prefix
+            [value], [_UNNEST_VALUE], order, limit, domain, inner,
+            correlated, local, dom_map, dep_prefix,
         )
         joined = Join.create(
             left=plan, right=top_k, join_type=JoinType.LEFT,
@@ -2100,39 +2103,48 @@ class Decorrelator:
         return ColumnRef.create(table=dep_prefix, column=_UNNEST_VALUE), joined
 
     def _build_top_k_relation(
-        self, value, order, limit, domain, inner, correlated, local, dom_map, prefix
+        self, value_exprs, value_names, order, limit, domain, inner,
+        correlated, local, dom_map, prefix,
     ):
         """domain JOIN inner, ranked by ROW_NUMBER() per domain value, filtered to
-        the top-k rows, projected to (domain columns, subquery value).
+        the top-k rows, projected to (domain columns, output columns).
 
-        Uses a window (qualified columns, a real resolver) rather than a bare-key
-        GroupedLimit, so column pruning keeps the domain column through the join.
+        Output columns are a list so this serves both a scalar subquery (one
+        value) and a user LATERAL (the body's whole projection). Uses a window
+        (qualified columns, a real resolver) rather than a bare-key GroupedLimit,
+        so column pruning keeps the domain column through the join.
         """
         condition = self._dependent_join_condition(correlated, local, dom_map)
         joined = Join.create(
             left=domain, right=inner, join_type=JoinType.INNER, condition=condition
         )
         win_prefix = self._next_prefix()
-        ranked = self._rank_by_row_number(joined, value, order, dom_map, win_prefix)
+        ranked = self._rank_by_row_number(
+            joined, value_exprs, value_names, order, dom_map, win_prefix
+        )
         capped = Filter.create(
             input=ranked, predicate=self._row_number_cap(win_prefix, limit)
         )
-        projected = self._project_domain_value(capped, dom_map, win_prefix)
+        projected = self._project_domain_values(capped, value_names, dom_map, win_prefix)
         return SubqueryScan.create(input=projected, alias=prefix)
 
-    def _rank_by_row_number(self, joined, value, order, dom_map, win_prefix):
-        """Project (domain cols, value, ROW_NUMBER() per domain) and alias it."""
+    def _rank_by_row_number(self, joined, value_exprs, value_names, order, dom_map, win_prefix):
+        """Project (domain cols, output values, ROW_NUMBER() per domain), aliased.
+
+        Any outer reference inside an output value is rewritten to its domain
+        column, so the projection over the join references no outer relation.
+        """
         window = self._row_number_window(list(dom_map.values()), order)
         names: List[str] = []
         for domain_ref in dom_map.values():
             names.append(domain_ref.column)
-        names.append(_UNNEST_VALUE)
+        names.extend(value_names)
         names.append(_UNNEST_RANK)
-        projection = Projection.create(
-            input=joined,
-            expressions=list(dom_map.values()) + [value, window],
-            aliases=names,
-        )
+        values: List[Expression] = []
+        for value in value_exprs:
+            values.append(_replace_column_refs(value, dom_map))
+        expressions = list(dom_map.values()) + values + [window]
+        projection = Projection.create(input=joined, expressions=expressions, aliases=names)
         return SubqueryScan.create(input=projection, alias=win_prefix)
 
     def _row_number_window(self, partition_keys, order):
@@ -2158,16 +2170,85 @@ class Decorrelator:
         bound = Literal.create(value=limit, data_type=DataType.INTEGER)
         return BinaryOp.create(op=BinaryOpType.LTE, left=rank, right=bound)
 
-    def _project_domain_value(self, capped, dom_map, win_prefix):
-        """Project the ranked, capped relation down to (domain columns, value)."""
+    def _project_domain_values(self, capped, value_names, dom_map, win_prefix):
+        """Project the ranked, capped relation down to (domain columns, values)."""
         expressions: List[Expression] = []
         names: List[str] = []
         for domain_ref in dom_map.values():
             expressions.append(ColumnRef.create(table=win_prefix, column=domain_ref.column))
             names.append(domain_ref.column)
-        expressions.append(ColumnRef.create(table=win_prefix, column=_UNNEST_VALUE))
-        names.append(_UNNEST_VALUE)
+        for value_name in value_names:
+            expressions.append(ColumnRef.create(table=win_prefix, column=value_name))
+            names.append(value_name)
         return Projection.create(input=capped, expressions=expressions, aliases=names)
+
+    def _rewrite_lateral_join(self, node: LateralJoin) -> LogicalPlanNode:
+        """Unnest a top-k user LATERAL to regular algebra, else recurse in place.
+
+        A same-source LATERAL still pushes to its source unchanged; this only
+        rewrites one we would otherwise run as a dependent join (cross-source).
+        """
+        outer = self._rewrite_plan(node.left)
+        unnested = self._unnest_lateral(outer, node)
+        if unnested is not None:
+            return unnested
+        return node.model_copy(
+            update={"left": outer, "right": self._rewrite_plan(node.right)}
+        )
+
+    def _unnest_lateral(self, outer, node):
+        """Domain -> ranked top-k over the LATERAL body -> join back onto outer."""
+        body = self._lateral_top_k_body(node.right)
+        if body is None:
+            return None
+        alias, value_exprs, value_names, shape = body
+        correlated, local, inner, free_vars, order, limit = shape
+        domain, dom_map = self._build_domain(outer, free_vars, self._next_prefix())
+        relation = self._build_top_k_relation(
+            value_exprs, value_names, order, limit, domain, inner,
+            correlated, local, dom_map, alias,
+        )
+        return Join.create(
+            left=outer, right=relation, join_type=node.join_type,
+            condition=self._join_back_condition(free_vars, dom_map, alias),
+        )
+
+    def _lateral_top_k_body(self, right: LogicalPlanNode):
+        """Recognize SubqueryScan(alias, Limit[Sort?[Projection[Filter(correlated)]]]).
+
+        Returns (alias, value_exprs, value_names, shape) or None; shape is
+        (correlated, local, inner, free_vars, order, limit).
+        """
+        if not isinstance(right, SubqueryScan):
+            return None
+        parts = self._peel_lateral_limit(self._rewrite_plan(right.input))
+        if parts is None:
+            return None
+        return self._lateral_body_shape(right.alias, parts)
+
+    def _lateral_body_shape(self, alias, parts):
+        """Extract the correlation and free vars for a peeled LATERAL body."""
+        projection, order, limit, filter_node, inner_aliases = parts
+        correlated, local = self._split_by_outer(filter_node.predicate, inner_aliases)
+        free_vars = self._distinct_outer_refs(
+            correlated + list(projection.expressions), inner_aliases
+        )
+        if not correlated or not free_vars:
+            return None
+        shape = (correlated, local, filter_node.input, free_vars, order, limit)
+        return (alias, list(projection.expressions), list(projection.aliases), shape)
+
+    def _peel_lateral_limit(self, body):
+        """Peel Limit / (Sort?) / Projection to its Filter for a LATERAL body.
+
+        Returns (projection, order, limit, filter_node, inner_aliases) or None.
+        """
+        if not isinstance(body, Limit):
+            return None
+        order, below = self._peel_sort(body.input)
+        if not isinstance(below, Projection) or not isinstance(below.input, Filter):
+            return None
+        return (below, order, body.limit, below.input, _collect_inner_aliases(body))
 
     def _join_flag(
         self, expr: Expression, plan: LogicalPlanNode
