@@ -117,15 +117,29 @@ Corpus (`tests/test_nk_decorrelation.py`):
 - **cross-source** variants of each (the actual point): correlation spanning two
   sources must lower to regular joins the Rust engine runs.
 
-## Milestones
+## Milestones (M1-M6 DONE)
 
-- **M1** — extraction + domain infra + Case A (non-equi aggregate) + count-bug +
-  differential tests. Deliverable: cross-source non-equi correlated aggregate
-  runs on Rust and matches DuckDB.
-- **M2** — Case B (top-k per outer) + window handling + tests.
-- **M3** — retire the `LateralJoin` fallback; assert no plan produces a lateral;
-  full baseline + TPC-H green; the `e2e_pushdown/test_cross_source_lateral.py`
-  tests now run on the Rust engine (no DuckDB fallback).
+- **M1 (done)** — non-equi correlated scalar aggregate + count-bug.
+- **M2 (done)** — top-k per outer via ROW_NUMBER() window (chosen over the
+  bare-key GroupedLimit so column pruning keeps the domain column).
+- **M3 (done)** — outer references inside the aggregate value folded into domain.
+- **M4 (done)** — user-written `LATERAL` (top-k body), multi-column. Unnests
+  uniformly; a same-source lateral still pushes as ONE remote query (verified),
+  a cross-source one runs on Rust. The top-k builder was generalized to emit a
+  multi-column relation.
+- **M5 (done)** — user `LATERAL` with an aggregate body (dependent-aggregate
+  builder generalized to a relation output).
+- **M6 (done)** — user `LATERAL` with a plain multi-row (set) body: the domain
+  join with no ranking (limit=None), correct multiplicity + LEFT semantics.
+
+Result: every common correlated shape - subquery aggregate / top-k, and user
+LATERAL top-k / aggregate / set / comma - unnests to regular algebra and runs
+cross-source on Rust. 15 differential-vs-DuckDB tests; both engines 1090.
+
+Still fail loud at planning (never used the merge): correlation in a JOIN `ON`
+clause, nested-subquery correlation ("unsupported position"), and a GROUP-BY
+scalar subquery (an invalid scalar). These are the only remaining non-unnested
+correlated shapes and they raise rather than produce wrong rows.
 
 ## User-written LATERAL (`LEFT JOIN LATERAL (...)`) — revisit
 
@@ -136,14 +150,15 @@ we decorrelate), so it is *correctly* left as a `LateralJoin` today:
   natively (Postgres/DuckDB do LATERAL). Keep this — it is the cheapest path.
 - **Cross-source**: cannot push; currently fails fast.
 
-Decision (to revisit after M3): a user LATERAL is structurally the *same*
-dependent join the N-K machinery already unnests. So a **cross-source** user
-LATERAL should route through the same domain -> join -> (aggregate | top-k window)
--> join-back unnesting and run on Rust, instead of failing. Same-source keeps the
-cheap push. This unifies user laterals and subquery decorrelation under one
-dependent-join-unnesting path. (Only genuinely non-unnestable dependent joins —
-e.g. a lateral calling a set-returning function — would then remain, and those
-fail loud.)
+Decision (RESOLVED, M4-M6): a user LATERAL is the *same* dependent join the N-K
+machinery unnests, so it now routes through the same domain -> join ->
+(aggregate | top-k window | set) -> join-back unnesting. It unnests **uniformly**
+(same and cross source) because the decorrelator runs before source assignment;
+this is fine because a same-source unnested lateral still collapses to ONE remote
+query (verified: a single PhysicalRemoteQuery, just regular-join SQL instead of
+LATERAL), so the "cheap push" is preserved, while a cross-source one now runs on
+Rust with no merge fallback. Only a genuinely non-unnestable dependent join
+(e.g. a lateral over a set-returning function) would remain, and it fails loud.
 
 ## Non-goals (for now)
 
