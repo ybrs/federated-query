@@ -174,7 +174,7 @@ def _run_query(qe, sources, duck, source_of, name):
 
 def _report(qe, sources, duck, source_of):
     """Run all 22 queries, print the per-query table, return totals + correct count."""
-    print(f"{'query':6} {'ours(rust)':>11} {'duckdb':>9} {'ratio':>7}  match")
+    print(f"{'query':6} {'ours(rust)':>11} {'duckdb':>9} {'slower':>8}  match")
     ours_total = duck_total = 0.0
     correct = 0
     for i in range(1, 23):
@@ -188,8 +188,9 @@ def _report(qe, sources, duck, source_of):
         duck_total += duck_ms
         matched = ours == ref
         correct += 1 if matched else 0
+        # "slower" = how many times slower ours is than DuckDB (ours / duckdb).
         print(f"{name:6} {ours_ms:9.1f}m {duck_ms:8.1f}m "
-              f"{duck_ms / ours_ms:6.2f}x  {'OK' if matched else 'DIFF'}")
+              f"{ours_ms / duck_ms:6.2f}x  {'OK' if matched else 'DIFF'}")
     return ours_total, duck_total, correct
 
 
@@ -209,7 +210,7 @@ def main():
         print(f"mode={args.mode}  sources={list(groups)}  data={args.data}\n")
         ours_total, duck_total, correct = _report(qe, sources, duck, source_of)
         print(f"\n{'TOTAL':6} {ours_total:9.1f}m {duck_total:8.1f}m "
-              f"{duck_total / ours_total:6.2f}x")
+              f"{ours_total / duck_total:6.2f}x")
         print(f"correct: {correct}/22 (exact match vs DuckDB)")
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
