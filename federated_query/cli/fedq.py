@@ -99,9 +99,6 @@ class FedQRuntime:
         self.planner = PhysicalPlanner(catalog)
         self.decorrelator = Decorrelator()
         physical_executor = Executor(config=executor_config)
-        # Warm the local merge engine now so the first query in the session does
-        # not absorb DuckDB's one-time thread-pool / operator setup cost.
-        physical_executor.warmup()
         processors = [StarExpansionProcessor(catalog, dialect=self.parser.dialect)]
         self.query_executor = QueryExecutor(
             catalog=catalog,

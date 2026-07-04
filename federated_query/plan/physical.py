@@ -21,10 +21,9 @@ from sqlglot import exp
 from pydantic import Field
 
 from ..model import StateModel
-from .expressions import Expression, and_expressions
+from .expressions import Expression
 from .emit import expression_to_ast, CANONICAL_SOURCE_RESOLVER, MergeResolver, clauses
 from .logical import JoinType, ExplainFormat, SetOpKind
-from ..utils.logging import get_logger
 
 
 def _source_ast(expr: Expression) -> exp.Expression:
@@ -67,50 +66,35 @@ if TYPE_CHECKING:
     from .expressions import FunctionCall
 
 
-_LOGGER = get_logger(__name__)
-
 # Cap on distinct build-side keys for which a hash join pushes a dynamic IN
 # filter into the probe side. Above this the IN list is not worth the round
-# trip, so the probe is fetched in full (logged, never silently dropped). A
-# cost-based choice would replace this constant later.
+# trip, so the Rust engine fetches the probe in full. A cost-based choice would
+# replace this constant later.
 _DYNAMIC_FILTER_MAX_KEYS = 2000
 
-# Names under which a hash join registers its two inputs with the merge engine.
-# Each join runs on its own DuckDB cursor, so these fixed names never collide
-# across nested joins.
-_MERGE_LEFT_RELATION = "in_left"
-_MERGE_RIGHT_RELATION = "in_right"
-# Name under which an aggregate registers its single input with the merge engine.
-_MERGE_AGG_RELATION = "in_agg"
-# Name under which a sort registers its single input with the merge engine.
-_MERGE_SORT_RELATION = "in_sort"
-# Name under which a window operator registers its single input with the merge engine.
+# Name under which a window operator's input is registered when its rendered SQL
+# runs as a Rust ``raw_sql`` fragment.
 _MERGE_WINDOW_RELATION = "in_window"
-# Name under which a DISTINCT projection registers its projected input.
-_MERGE_DISTINCT_RELATION = "in_distinct"
 # Name under which a grouped-limit registers its single input, plus the synthetic
-# columns it adds: a row-order index (stable tiebreak so the merge path keeps the
-# same rows as the Python streaming path) and the per-key row number.
+# columns its rendered SQL adds: a row-order index (stable tiebreak) and the
+# per-key row number.
 _MERGE_GROUPED_LIMIT_RELATION = "in_grouped_limit"
 _GROUPED_LIMIT_INDEX_COL = "__gl_idx"
 _GROUPED_LIMIT_RN_COL = "__gl_rn"
 
 
 class PhysicalPlanNode(StateModel, ABC):
-    """Base class for physical plan nodes."""
+    """Base class for physical plan nodes.
 
-    # The per-query DuckDB merge engine, attached imperatively after planning
-    # (a private attr, not a field: execution state, not plan structure).
-    _merge_engine: Any = None
+    Physical nodes are a pure plan representation: they carry schema,
+    column-alias, and SQL-rendering information that ``rust_ir`` serializes into
+    the Rust engine's IR. They are never executed in Python; the Rust engine is
+    the one execution path.
+    """
 
     @abstractmethod
     def children(self) -> List["PhysicalPlanNode"]:
         """Return child nodes."""
-        pass
-
-    @abstractmethod
-    def execute(self) -> Iterator[pa.RecordBatch]:
-        """Execute this operator and yield record batches."""
         pass
 
     @abstractmethod
@@ -130,26 +114,6 @@ class PhysicalPlanNode(StateModel, ABC):
         """Optional mapping from (table, column) to physical column name."""
         return {}
 
-    def set_merge_engine(self, engine: Any) -> None:
-        """Attach the per-query DuckDB merge engine used for local execution."""
-        self._merge_engine = engine
-
-    def merge_engine(self) -> Any:
-        """Return the attached merge engine, or None when none was attached."""
-        return getattr(self, "_merge_engine", None)
-
-    def apply_dynamic_filter(
-        self, key_columns: List[Expression], value_tuples: List[tuple]
-    ) -> bool:
-        """Constrain this input to rows whose join keys appear in ``value_tuples``.
-
-        Used by a hash join to push the build side's distinct key values into
-        the probe side as a runtime ``IN`` filter (semi-join reduction). Most
-        nodes cannot accept such a filter; they return False and the join probes
-        in full. ``PhysicalScan`` overrides this.
-        """
-        return False
-
 
 def _row_key_tuple(key_values, row_index: int) -> tuple:
     """Build a hashable key tuple from per-column arrays at one row index."""
@@ -157,50 +121,6 @@ def _row_key_tuple(key_values, row_index: int) -> tuple:
     for array in key_values:
         values.append(array[row_index].as_py())
     return tuple(values)
-
-
-def _key_column_names(num_keys: int) -> List[str]:
-    """Stable column names k0..k(n-1) for a join's key columns."""
-    names = []
-    for index in range(num_keys):
-        names.append(f"k{index}")
-    return names
-
-
-def _within_dynamic_filter_cap(num_keys: int) -> bool:
-    """Whether a build-key count is non-empty and within the IN-list cap.
-
-    Logs at INFO when an over-cap set is skipped so the decision is observable.
-    """
-    if num_keys == 0:
-        return False
-    if num_keys > _DYNAMIC_FILTER_MAX_KEYS:
-        _LOGGER.info(
-            "dynamic filter skipped: %d build keys exceed cap %d",
-            num_keys,
-            _DYNAMIC_FILTER_MAX_KEYS,
-        )
-        return False
-    return True
-
-
-def _key_tuples_from_table(table: "pa.Table") -> List[tuple]:
-    """Convert a distinct-key table (already within the cap) to value tuples."""
-    columns = []
-    for name in table.column_names:
-        columns.append(table.column(name).to_pylist())
-    return _zip_columns_to_tuples(columns, table.num_rows)
-
-
-def _zip_columns_to_tuples(columns: List[list], num_rows: int) -> List[tuple]:
-    """Row-wise zip of per-column value lists into hashable key tuples."""
-    tuples = []
-    for row_index in range(num_rows):
-        values = []
-        for column in columns:
-            values.append(column[row_index])
-        tuples.append(tuple(values))
-    return tuples
 
 
 def to_source_sql(connection, postgres_sql: str) -> str:
@@ -239,13 +159,6 @@ def _literal_for_value(value):
     return Literal.create(value=value, data_type=data_type)
 
 
-def _table_from_batches(batches: List[pa.RecordBatch], schema: pa.Schema) -> pa.Table:
-    """Build an Arrow table from batches, falling back to an empty typed table."""
-    if not batches:
-        return schema.empty_table()
-    return pa.Table.from_batches(batches)
-
-
 class PhysicalCTE(PhysicalPlanNode):
     """Materializes a cross-source CTE body once, shared by every reference.
 
@@ -257,8 +170,6 @@ class PhysicalCTE(PhysicalPlanNode):
     name: str
     body: PhysicalPlanNode
     column_names: Optional[List[str]] = None
-    # Lazily-filled cache of the materialized body (private attr, not a field).
-    _cached: Optional[Any] = None
 
     @classmethod
     def create(
@@ -279,25 +190,6 @@ class PhysicalCTE(PhysicalPlanNode):
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.body]
-
-    def materialize(self) -> pa.Table:
-        """Execute the body once and cache its rows as an Arrow table."""
-        cached = getattr(self, "_cached", None)
-        if cached is not None:
-            return cached
-        table = _table_from_batches(list(self.body.execute()), self.body.schema())
-        self._cached = self._relabel(table)
-        return self._cached
-
-    def _relabel(self, table: pa.Table) -> pa.Table:
-        """Apply an explicit CTE column list to the output column names."""
-        if not self.column_names or list(table.column_names) == self.column_names:
-            return table
-        return table.rename_columns(self.column_names)
-
-    def execute(self) -> Iterator[pa.RecordBatch]:
-        """Yield the materialized rows (computed once)."""
-        yield from self.materialize().to_batches()
 
     def schema(self) -> pa.Schema:
         """Output schema, taken from the body and relabeled if a list is set."""
@@ -358,10 +250,6 @@ class PhysicalCTEScan(PhysicalPlanNode):
     def children(self) -> List[PhysicalPlanNode]:
         return [self.producer]
 
-    def execute(self) -> Iterator[pa.RecordBatch]:
-        """Yield the producer's materialized rows."""
-        yield from self.producer.materialize().to_batches()
-
     def schema(self) -> pa.Schema:
         return self.producer.schema()
 
@@ -407,10 +295,6 @@ class PhysicalAliasedRelation(PhysicalPlanNode):
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
-
-    def execute(self) -> Iterator[pa.RecordBatch]:
-        """Pass the input's batches through unchanged."""
-        yield from self.input.execute()
 
     def schema(self) -> pa.Schema:
         return self.input.schema()
@@ -459,71 +343,24 @@ class PhysicalCTEMergeQuery(PhysicalPlanNode):
     def children(self) -> List[PhysicalPlanNode]:
         return list(self.inputs.values())
 
-    def execute(self) -> Iterator[pa.RecordBatch]:
-        """Materialize the registered sources, then run the WITH in DuckDB."""
-        engine = self.merge_engine()
-        yield from engine.run(self.sql, self._materialized_inputs())
-
-    def _materialized_inputs(self) -> Dict[str, pa.Table]:
-        """Execute each base-source subtree into a registered Arrow table."""
-        tables = {}
-        for name, node in self.inputs.items():
-            tables[name] = _table_from_batches(list(node.execute()), node.schema())
-        return tables
-
     def schema(self) -> pa.Schema:
-        """Output schema of the WITH, read from the result without fetching rows."""
-        engine = self.merge_engine()
-        return engine.schema(self.sql, self._materialized_inputs())
+        """The WITH's output schema is computed natively by the Rust engine.
+
+        The result types of a (possibly recursive) WITH depend on running the
+        SQL, which only the execution engine does; this node is a pure plan
+        representation whose columns the Rust engine types. A caller that reaches
+        here wants a type the plan cannot supply, so it fails loudly rather than
+        return a guessed schema.
+        """
+        raise NotImplementedError(
+            "PhysicalCTEMergeQuery output schema is computed by the Rust engine"
+        )
 
     def estimated_cost(self) -> float:
         raise NotImplementedError("Cost estimation not yet implemented")
 
     def __repr__(self) -> str:
         return f"PhysicalCTEMergeQuery({len(self.inputs)} sources)"
-
-
-_MERGE_JOIN_KEYWORDS = {
-    JoinType.INNER: "INNER JOIN",
-    JoinType.LEFT: "LEFT JOIN",
-    JoinType.RIGHT: "RIGHT JOIN",
-    JoinType.FULL: "FULL JOIN",
-    JoinType.SEMI: "SEMI JOIN",
-    JoinType.ANTI: "ANTI JOIN",
-}
-
-
-def _qualify_join_condition(condition, left_names, right_names):
-    """Rebuild a join condition qualifying each column ref by its side.
-
-    A column whose name belongs to the left input is qualified ``l.``, one on
-    the right ``r.``; this lets an arbitrary (non-equi, NULL-aware) predicate be
-    rendered against the two registered merge-engine relations without ambiguity.
-    """
-    from .expressions import ColumnRef, BinaryOp, UnaryOp
-
-    if isinstance(condition, ColumnRef):
-        if condition.column in left_names:
-            return condition.model_copy(update={"table": "l"})
-        if condition.column in right_names:
-            return condition.model_copy(update={"table": "r"})
-        return condition
-    if isinstance(condition, BinaryOp):
-        # Same operator with both operands recursively side-qualified.
-        # A new node is needed because each child gets an l./r. rewrite.
-        return BinaryOp.create(
-            op=condition.op,
-            left=_qualify_join_condition(condition.left, left_names, right_names),
-            right=_qualify_join_condition(condition.right, left_names, right_names),
-        )
-    if isinstance(condition, UnaryOp):
-        # Same unary operator wrapping its side-qualified operand.
-        # Rebuilt so the negated/inner column carries the l./r. prefix.
-        return UnaryOp.create(
-            op=condition.op,
-            operand=_qualify_join_condition(condition.operand, left_names, right_names),
-        )
-    return condition
 
 
 def _right_output_name(physical_name: str, left_names) -> str:
@@ -537,56 +374,6 @@ def _right_output_name(physical_name: str, left_names) -> str:
     if physical_name in left_names:
         return f"right_{physical_name}"
     return physical_name
-
-
-def _merge_join_select_list(join_type, left_schema, right_schema) -> str:
-    """SELECT list reproducing the join output: left only for SEMI/ANTI, else both."""
-    parts = []
-    for name in left_schema.names:
-        parts.append(f'l."{name}" AS "{name}"')
-    if join_type in (JoinType.SEMI, JoinType.ANTI):
-        return ", ".join(parts)
-    left_name_set = set(left_schema.names)
-    for field in right_schema:
-        output_name = _right_output_name(field.name, left_name_set)
-        parts.append(f'r."{field.name}" AS "{output_name}"')
-    return ", ".join(parts)
-
-
-def _merge_join_sql(
-    join_type, on_clause: str, left_schema: pa.Schema, right_schema: pa.Schema
-) -> str:
-    """Render a merge-engine join SELECT over the two registered relations.
-
-    Shared by the hash join (equi-key ON clause) and the nested-loop join
-    (arbitrary ON clause); only the ON clause differs between them.
-    """
-    select_list = _merge_join_select_list(join_type, left_schema, right_schema)
-    return (
-        f"SELECT {select_list} "
-        f"FROM {_MERGE_LEFT_RELATION} AS l "
-        f"{_MERGE_JOIN_KEYWORDS[join_type]} {_MERGE_RIGHT_RELATION} AS r "
-        f"ON {on_clause}"
-    )
-
-
-def _cast_batch_to_schema(batch: pa.RecordBatch, target: pa.Schema) -> pa.RecordBatch:
-    """Cast each column of a batch to the target schema's types.
-
-    DuckDB may return a different-but-compatible type for an aggregate (e.g.
-    a wide SUM); aligning to the operator's declared schema keeps the output
-    contract stable for parent operators.
-    """
-    import pyarrow.compute as pc
-
-    arrays = []
-    for index, field in enumerate(target):
-        column = batch.column(index)
-        if column.type == field.type:
-            arrays.append(column)
-        else:
-            arrays.append(pc.cast(column, field.type))
-    return pa.RecordBatch.from_arrays(arrays, names=list(target.names))
 
 
 def _evaluate_expression_type(expr, input_schema, alias_map) -> pa.DataType:
@@ -652,44 +439,6 @@ def _key_column_arrays(batch, keys, aliases) -> List[pa.Array]:
             )
         arrays.append(batch.column(_physical_column_name(key, aliases or {})))
     return arrays
-
-
-def _prepend_batch(first: pa.RecordBatch, rest) -> Iterator[pa.RecordBatch]:
-    """Yield an already-pulled first batch, then the remaining batches."""
-    yield first
-    yield from rest
-
-
-def _require_engine(node: "PhysicalPlanNode"):
-    """Return the node's attached DuckDB merge engine, or raise if none.
-
-    Local execution always runs through the merge engine (DuckDB is a hard
-    dependency the executor attaches to every plan); a missing engine is a bug,
-    so it fails loudly rather than silently taking a slow Python path.
-    """
-    engine = node.merge_engine()
-    if engine is None:
-        raise RuntimeError(
-            f"{type(node).__name__} requires the DuckDB merge engine; none attached"
-        )
-    return engine
-
-
-def _streaming_reader(node: "PhysicalPlanNode") -> pa.RecordBatchReader:
-    """Expose a node's output as a lazy reader without materializing it.
-
-    DuckDB pulls batches from this reader on demand, so the (often large) probe
-    side is streamed, never drained into a table by us. A single batch is peeked
-    to learn the real output schema (a node's declared ``schema()`` can drift
-    from what it actually yields); the rest stay lazy.
-    """
-    batches = node.execute()
-    first = next(batches, None)
-    if first is None:
-        return pa.RecordBatchReader.from_batches(node.schema(), iter(()))
-    return pa.RecordBatchReader.from_batches(
-        first.schema, _prepend_batch(first, batches)
-    )
 
 
 def _join_output_aliases(
@@ -838,38 +587,6 @@ class PhysicalScan(PhysicalPlanNode):
     def children(self) -> List[PhysicalPlanNode]:
         return []
 
-    def apply_dynamic_filter(
-        self, key_columns: List[Expression], value_tuples: List[tuple]
-    ) -> bool:
-        """Add a runtime ``key IN (...)`` filter from a join's build-side keys.
-
-        Only single-column keys with renderable literal values are handled; a
-        composite key or an untypable value declines (the join probes in full).
-        """
-        if len(key_columns) != 1:
-            return False
-        in_filter = self._build_in_filter(key_columns[0], value_tuples)
-        if in_filter is None:
-            return False
-        self.filters = and_expressions(self.filters, in_filter)
-        return True
-
-    def _build_in_filter(self, key_column: Expression, value_tuples: List[tuple]):
-        """Build ``key_column IN (<distinct values>)`` or None if any is untypable."""
-        from .expressions import InList
-
-        options = []
-        for value_tuple in value_tuples:
-            literal = _literal_for_value(value_tuple[0])
-            if literal is None:
-                return None
-            options.append(literal)
-        if not options:
-            return None
-        # Runtime membership test restricting the scan to the join's build keys.
-        # Assembled from the collected key literals for dynamic filter pushdown.
-        return InList.create(value=key_column, options=options)
-
     def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
         """Expose this scan's columns under its table alias.
 
@@ -879,7 +596,12 @@ class PhysicalScan(PhysicalPlanNode):
         return _alias_column_map(self.alias, self.schema().names)
 
     def execute(self) -> Iterator[pa.RecordBatch]:
-        """Execute scan on remote data source."""
+        """Read this scan's rows from its data source.
+
+        The Rust engine runs whole plans; this direct read is used only by
+        EXPLAIN, which samples a scan's build-side keys to show the dynamic
+        ``IN`` filter with real values.
+        """
         if self.datasource_connection is None:
             raise RuntimeError("Data source connection not set")
 
@@ -1027,72 +749,6 @@ class PhysicalProjection(PhysicalPlanNode):
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
 
-    def execute(self) -> Iterator[pa.RecordBatch]:
-        """Execute projection, de-duplicating rows when SELECT DISTINCT.
-
-        DISTINCT ON is only correct when pushed to a source (or the merge
-        engine), where ORDER BY chooses the surviving row; the local pyarrow
-        path cannot honor that, so it fails fast rather than guess.
-        """
-        if self.distinct_on is not None:
-            from ..parser.errors import UnsupportedSQLError
-
-            raise UnsupportedSQLError(
-                "DISTINCT ON is only supported when the query pushes to a single source"
-            )
-        if not self.distinct:
-            for batch in self.input.execute():
-                yield self._project_batch(batch)
-            return
-        yield from self._execute_distinct()
-
-    def _execute_distinct(self) -> Iterator[pa.RecordBatch]:
-        """Project all input, then emit only distinct rows via the merge engine.
-
-        Deduplication runs as ``SELECT DISTINCT * `` in DuckDB - the one local
-        set/dedup engine that PhysicalUnion, PhysicalSort, and the aggregate
-        operators also use - instead of a separate pyarrow group-by path.
-        """
-        engine = _require_engine(self)
-        projected = []
-        for batch in self.input.execute():
-            projected.append(self._project_batch(batch))
-        table = _table_from_batches(projected, self.schema())
-        sql = f"SELECT DISTINCT * FROM {_MERGE_DISTINCT_RELATION}"
-        yield from engine.run(sql, {_MERGE_DISTINCT_RELATION: table})
-
-    def _project_batch(self, batch: pa.RecordBatch) -> pa.RecordBatch:
-        """Project a single batch."""
-        from .expressions import ColumnRef
-
-        columns = []
-        output_names = []
-        alias_map = self.column_aliases()
-
-        for i, expr in enumerate(self.expressions):
-            if isinstance(expr, ColumnRef):
-                if expr.column == "*":
-                    for col_idx in range(batch.num_columns):
-                        columns.append(batch.column(col_idx))
-                        output_names.append(batch.schema.field(col_idx).name)
-                else:
-                    column_data = self._resolve_column(expr, batch, alias_map)
-                    columns.append(column_data)
-                    output_names.append(self.output_names[i])
-            else:
-                evaluated = self._evaluate_expression(expr, batch)
-                columns.append(evaluated)
-                output_names.append(self.output_names[i])
-
-        return pa.RecordBatch.from_arrays(columns, names=output_names)
-
-    def _evaluate_expression(self, expr: Expression, batch: pa.RecordBatch) -> pa.Array:
-        """Evaluate expression on batch."""
-        from ..executor.expression_evaluator import ExpressionEvaluator
-
-        evaluator = ExpressionEvaluator(batch, alias_map=self.column_aliases())
-        return evaluator.evaluate(expr)
-
     def schema(self) -> pa.Schema:
         """Get output schema."""
         from .expressions import ColumnRef
@@ -1128,23 +784,6 @@ class PhysicalProjection(PhysicalPlanNode):
 
     def __repr__(self) -> str:
         return f"PhysicalProjection({len(self.expressions)} exprs)"
-
-    def _resolve_column(
-        self,
-        expr: Expression,
-        batch: pa.RecordBatch,
-        alias_map: Dict[Tuple[Optional[str], str], str],
-    ) -> pa.Array:
-        """Resolve a column to its array via the shared physical-name rule.
-
-        Uses the same resolver as schema typing (_physical_column_name), so the
-        executed output and the declared schema read every column identically.
-        """
-        from .expressions import ColumnRef
-
-        if not isinstance(expr, ColumnRef):
-            raise ValueError("Expected ColumnRef")
-        return batch.column(_physical_column_name(expr, alias_map))
 
     def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
         return self.input.column_aliases()
@@ -1186,13 +825,6 @@ class PhysicalWindow(PhysicalPlanNode):
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
-
-    def execute(self) -> Iterator[pa.RecordBatch]:
-        """Stream the input through DuckDB, which evaluates the window SQL."""
-        engine = _require_engine(self)
-        reader = _streaming_reader(self.input)
-        sql = self._window_sql(self.input.column_aliases())
-        yield from engine.run(sql, {_MERGE_WINDOW_RELATION: reader})
 
     def _window_sql(self, aliases) -> str:
         """Render ``SELECT <exprs> AS <names> FROM in_window``."""
@@ -1296,23 +928,6 @@ class PhysicalFilter(PhysicalPlanNode):
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
 
-    def execute(self) -> Iterator[pa.RecordBatch]:
-        """Execute filter."""
-        import pyarrow.compute as pc
-
-        for batch in self.input.execute():
-            mask = self._evaluate_predicate(batch)
-            filtered = batch.filter(mask)
-            if filtered.num_rows > 0:
-                yield filtered
-
-    def _evaluate_predicate(self, batch: pa.RecordBatch) -> pa.Array:
-        """Evaluate predicate on batch and return boolean mask."""
-        from ..executor.expression_evaluator import ExpressionEvaluator
-
-        evaluator = ExpressionEvaluator(batch, alias_map=self.column_aliases())
-        return evaluator.evaluate(self.predicate)
-
     def schema(self) -> pa.Schema:
         return self.input.schema()
 
@@ -1361,199 +976,6 @@ class PhysicalHashJoin(PhysicalPlanNode):
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.left, self.right]
-
-    def execute(self) -> Iterator[pa.RecordBatch]:
-        """Execute the hash join in the DuckDB merge engine."""
-        yield from self._execute_merge(_require_engine(self))
-
-    def _execute_merge(self, engine) -> Iterator[pa.RecordBatch]:
-        """Run the join through DuckDB; INNER keeps the G9 build-materialize path."""
-        if self.join_type == JoinType.INNER:
-            return self._execute_inner_merge(engine)
-        return self._execute_streamed_merge(engine)
-
-    def _execute_streamed_merge(self, engine) -> Iterator[pa.RecordBatch]:
-        """Run a non-INNER join (LEFT/RIGHT/FULL/SEMI/ANTI) through DuckDB.
-
-        Outer joins (LEFT/RIGHT/FULL) and ANTI keep non-matching rows, so the
-        probe reduction does not apply; a SEMI join keeps only matching left
-        rows, so the right's keys are pushed into the left as a semi-join
-        released before the left side streams; otherwise deeply nested joins
-        hold a connection open at every level and exhaust the pool. The left
-        side streams.
-        """
-        right_batches = list(self.right.execute())
-        if self.join_type == JoinType.SEMI:
-            self._reduce_left_for_semi(right_batches)
-        right_table = _table_from_batches(right_batches, self.right.schema())
-        left_reader = _streaming_reader(self.left)
-        inputs = {
-            _MERGE_LEFT_RELATION: left_reader,
-            _MERGE_RIGHT_RELATION: right_table,
-        }
-        sql = self._join_sql(left_reader.schema, right_table.schema)
-        return engine.run(sql, inputs)
-
-    def _reduce_left_for_semi(self, right_batches: List[pa.RecordBatch]) -> None:
-        """Push the right's distinct keys into the left scan (semi-join reduction).
-
-        A SEMI join keeps only left rows whose key matches a right key, so
-        constraining the left to those keys drops no result row and avoids
-        fetching unmatched rows from the left's (often remote) source. ANTI is
-        """
-        value_tuples = self._distinct_build_keys(
-            right_batches, self.right, self.right_keys
-        )
-        if value_tuples is None:
-            return
-        if self.left.apply_dynamic_filter(self.left_keys, value_tuples):
-            _LOGGER.debug(
-                "semi-join reduction: %d keys pushed to left", len(value_tuples)
-            )
-
-    def _execute_inner_merge(self, engine) -> Iterator[pa.RecordBatch]:
-        """Run an INNER equi-join through the DuckDB merge engine.
-
-        The build side is streamed into a DuckDB temp table (DuckDB-owned and
-        spillable) rather than drained into a Python Arrow table. DuckDB then
-        computes the build's DISTINCT keys, which are pushed into the probe as a
-        dynamic filter (semi-join reduction); the probe streams and DuckDB joins
-        it against the buffered build, and the result streams back.
-        """
-        build_node, probe_node, build_keys, probe_keys = self._build_probe_sides()
-        build_rel, probe_rel = self._merge_relation_names()
-        with engine.join_session() as session:
-            build_reader = _streaming_reader(build_node)
-            build_schema = build_reader.schema
-            session.materialize(build_rel, build_reader)
-            self._reduce_probe_via_distinct(
-                session, build_rel, build_node, build_keys, probe_node, probe_keys
-            )
-            probe_reader = _streaming_reader(probe_node)
-            sql = self._inner_join_sql(build_schema, probe_reader.schema)
-            yield from session.stream(sql, {probe_rel: probe_reader})
-
-    def _merge_relation_names(self):
-        """(build_relation, probe_relation) names, keeping self.left as in_left."""
-        if self.build_side == "right":
-            return _MERGE_RIGHT_RELATION, _MERGE_LEFT_RELATION
-        return _MERGE_LEFT_RELATION, _MERGE_RIGHT_RELATION
-
-    def _inner_join_sql(self, build_schema, probe_schema) -> str:
-        """Render the join SELECT with left/right schemas in self.left/right order."""
-        if self.build_side == "right":
-            return self._join_sql(probe_schema, build_schema)
-        return self._join_sql(build_schema, probe_schema)
-
-    def _reduce_probe_via_distinct(
-        self, session, build_rel, build_node, build_keys, probe_node, probe_keys
-    ) -> None:
-        """Push the build's DuckDB-computed DISTINCT keys into the probe (reduction).
-
-        An INNER join only emits probe rows whose key matches a build key, so
-        constraining the probe to those keys drops no result row and avoids
-        fetching unmatched rows from the probe's (often remote) source.
-        """
-        keys = self._distinct_keys_via_engine(session, build_rel, build_node, build_keys)
-        if keys is None:
-            return
-        if probe_node.apply_dynamic_filter(probe_keys, keys):
-            _LOGGER.debug("dynamic filter applied to probe: %d keys", len(keys))
-
-    def _distinct_keys_via_engine(
-        self, session, build_rel, build_node, build_keys
-    ) -> Optional[List[tuple]]:
-        """Distinct non-NULL build-key tuples from the buffered build, or None.
-
-        DuckDB computes the DISTINCT over the (spillable) build temp table; only
-        the key set - capped, and pulled to Python solely to build the probe's IN
-        filter - crosses back. None when empty or above the cap.
-        """
-        columns = self._build_key_columns(build_node, build_keys)
-        rows = session.fetch(self._distinct_keys_sql(build_rel, columns))
-        if not _within_dynamic_filter_cap(len(rows)):
-            return None
-        return rows
-
-    def _build_key_columns(self, build_node, build_keys) -> List[str]:
-        """Physical column names of the build's join keys in its temp table."""
-        aliases = build_node.column_aliases()
-        columns = []
-        for key in build_keys:
-            columns.append(_physical_column_name(key, aliases or {}))
-        return columns
-
-    def _distinct_keys_sql(self, build_rel: str, columns: List[str]) -> str:
-        """SELECT DISTINCT of the key columns, non-NULL, capped one past the limit."""
-        quoted = []
-        for column in columns:
-            # Quote via the sqlglot emitter so a name containing an embedded quote
-            # is escaped, not injected raw into the SQL text.
-            quoted.append(exp.to_identifier(column, quoted=True).sql(dialect="duckdb"))
-        not_null = []
-        for name in quoted:
-            not_null.append(f"{name} IS NOT NULL")
-        limit = _DYNAMIC_FILTER_MAX_KEYS + 1
-        return (
-            f"SELECT DISTINCT {', '.join(quoted)} FROM {build_rel} "
-            f"WHERE {' AND '.join(not_null)} LIMIT {limit}"
-        )
-
-    def _build_probe_sides(self):
-        """Return (build_node, probe_node, build_keys, probe_keys) per build_side."""
-        if self.build_side == "right":
-            return self.right, self.left, self.right_keys, self.left_keys
-        return self.left, self.right, self.left_keys, self.right_keys
-
-    def _distinct_build_keys(
-        self, build_batches: List[pa.RecordBatch], build_node, build_keys
-    ) -> Optional[List[tuple]]:
-        """Distinct non-NULL build-key tuples, or None if empty or above the cap.
-
-        Distinct values are computed with pyarrow, so the cap is enforced on the
-        path would. Only the surviving (<= cap) keys are turned into tuples.
-        """
-        aliases = build_node.column_aliases()
-        table = self._build_key_table(build_batches, build_keys, aliases)
-        if not _within_dynamic_filter_cap(table.num_rows):
-            return None
-        return _key_tuples_from_table(table)
-
-    def _build_key_table(self, build_batches, build_keys, aliases) -> "pa.Table":
-        """Distinct non-NULL build-key combinations as a table (vectorized).
-
-        Each batch's key columns are collected as-is and concatenated, then
-        DuckDB-style deduplicated via ``drop_null().group_by(...).aggregate([])``
-        """
-        names = _key_column_names(len(build_keys))
-        key_tables = []
-        for batch in build_batches:
-            arrays = _key_column_arrays(batch, build_keys, aliases)
-            key_tables.append(pa.table(arrays, names=names))
-        combined = pa.concat_tables(key_tables)
-        return combined.drop_null().group_by(names).aggregate([])
-
-    def _join_sql(self, left_schema: pa.Schema, right_schema: pa.Schema) -> str:
-        """Render the join SELECT for this join type over the registered relations."""
-        return _merge_join_sql(
-            self.join_type, self._merge_on_clause(), left_schema, right_schema
-        )
-
-    def _merge_on_clause(self) -> str:
-        """Render the equi-join condition as l.key = r.key conjuncts."""
-        if len(self.left_keys) != len(self.right_keys):
-            raise ValueError(
-                f"join key count mismatch: {len(self.left_keys)} left vs "
-                f"{len(self.right_keys)} right"
-            )
-        left_aliases = self.left.column_aliases()
-        right_aliases = self.right.column_aliases()
-        conjuncts = []
-        for left_key, right_key in zip(self.left_keys, self.right_keys):
-            left_name = _physical_column_name(left_key, left_aliases or {})
-            right_name = _physical_column_name(right_key, right_aliases or {})
-            conjuncts.append(f'l."{left_name}" = r."{right_name}"')
-        return " AND ".join(conjuncts)
 
     def schema(self) -> pa.Schema:
         """Combine both sides' schemas (left-wins on name collision)."""
@@ -1636,13 +1058,6 @@ class PhysicalRemoteJoin(PhysicalPlanNode):
 
     def children(self) -> List[PhysicalPlanNode]:
         return []
-
-    def execute(self) -> Iterator[pa.RecordBatch]:
-        query = to_source_sql(self.datasource_connection, self._build_query())
-        self.datasource_connection.ensure_connected()
-        batches = self.datasource_connection.execute_query(query)
-        for batch in batches:
-            yield batch
 
     def schema(self) -> pa.Schema:
         if self._schema is None:
@@ -1836,42 +1251,6 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
     def children(self) -> List[PhysicalPlanNode]:
         return [self.left, self.right]
 
-    def execute(self) -> Iterator[pa.RecordBatch]:
-        """Run the join in the merge engine (DuckDB); raise if none is attached.
-
-        The arbitrary ``condition`` (in practice the null-aware SEMI/ANTI/LEFT
-        predicate decorrelation produces, ``x = v OR x IS NULL OR v IS NULL``) is
-        rendered to DuckDB with each column resolved to the left or right input.
-        DuckDB materializes each side once and joins set-based, so the inner side
-        is never re-scanned per outer row (which, cross-source, would be a remote
-        query per row). There is no Python row-by-row fallback: a missing engine
-        is a bug, so _require_engine raises rather than silently running slow.
-        """
-        yield from self._execute_merge(_require_engine(self))
-
-    def _execute_merge(self, engine) -> Iterator[pa.RecordBatch]:
-        """Materialize the right, stream the left, and join in DuckDB."""
-        right_table = _table_from_batches(
-            list(self.right.execute()), self.right.schema()
-        )
-        left_reader = _streaming_reader(self.left)
-        inputs = {
-            _MERGE_LEFT_RELATION: left_reader,
-            _MERGE_RIGHT_RELATION: right_table,
-        }
-        sql = self._merge_sql(left_reader.schema, right_table.schema)
-        return engine.run(sql, inputs)
-
-    def _merge_sql(self, left_schema: pa.Schema, right_schema: pa.Schema) -> str:
-        """Render the join SELECT over the two registered merge relations."""
-        on_clause = "TRUE"
-        if self.condition is not None:
-            qualified = _qualify_join_condition(
-                self.condition, set(left_schema.names), set(right_schema.names)
-            )
-            on_clause = qualified.to_sql()
-        return _merge_join_sql(self.join_type, on_clause, left_schema, right_schema)
-
     def schema(self) -> pa.Schema:
         """Combine both sides' schemas (left-wins on name collision)."""
         return _join_output_schema(self.join_type, self.left, self.right)
@@ -1919,86 +1298,6 @@ class PhysicalHashAggregate(PhysicalPlanNode):
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
-
-    def execute(self) -> Iterator[pa.RecordBatch]:
-        """Execute the hash aggregation in the DuckDB merge engine.
-
-        Group keys and aggregate arguments (plain columns or any expression)
-        render to DuckDB SQL, so DuckDB computes the whole GROUP BY; there is no
-        separate Python aggregation.
-        """
-        yield from self._execute_merge_aggregate(_require_engine(self))
-
-    def _execute_merge_aggregate(self, engine) -> Iterator[pa.RecordBatch]:
-        """Run the GROUP BY through DuckDB, casting output to the declared schema."""
-        reader = _streaming_reader(self.input)
-        sql = self._aggregate_sql(self.input.column_aliases())
-        target = self.schema()
-        for batch in engine.run(sql, {_MERGE_AGG_RELATION: reader}):
-            yield _cast_batch_to_schema(batch, target)
-
-    def _aggregate_sql(self, aliases) -> str:
-        """Render ``SELECT <aggs> FROM in_agg [GROUP BY <keys>]``."""
-        select_list = self._aggregate_select_list(aliases)
-        sql = f"SELECT {select_list} FROM {_MERGE_AGG_RELATION}"
-        group_list = self._aggregate_group_list(aliases)
-        if group_list:
-            sql += f" GROUP BY {group_list}"
-        return sql
-
-    def _aggregate_select_list(self, aliases) -> str:
-        """Alias each SELECT expression to its output name.
-
-        Uses the shared alias-and-join skeleton (clauses.aliased_select_fragment);
-        the per-expression renderer is the one emitter, except an ordered-set
-        aggregate's WITHIN GROUP form, which DuckDB needs literal.
-        """
-        if len(self.aggregates) != len(self.output_names):
-            raise ValueError(
-                f"aggregates ({len(self.aggregates)}) and output_names "
-                f"({len(self.output_names)}) length mismatch"
-            )
-        return clauses.aliased_select_fragment(
-            self.aggregates,
-            self.output_names,
-            lambda expr: self._render_agg_expr(expr, aliases),
-        )
-
-    def _aggregate_group_list(self, aliases) -> str:
-        """Render GROUP BY keys / GROUPING SETS via the shared clause builder."""
-        return clauses.group_by_fragment(
-            self.group_by, self.grouping_sets, MergeResolver(aliases), dialect="duckdb"
-        )
-
-    def _render_agg_expr(self, expr: Expression, aliases) -> str:
-        """Render a SELECT/group expression against the input's physical columns.
-
-        Everything lowers through the one emitter except an ordered-set
-        aggregate's WITHIN GROUP form: the emitter's typed node transpiles to an
-        inline ``f(arg ORDER BY key)`` that DuckDB rejects, so that one case is
-        wrapped here from emitter-rendered parts. COUNT(*), DISTINCT, and
-        multi-argument calls the emitter already renders identically.
-        """
-        from .expressions import FunctionCall
-
-        if isinstance(expr, FunctionCall) and expr.within_group_key is not None:
-            return self._render_ordered_set_aggregate(expr, aliases)
-        return expression_to_ast(expr, MergeResolver(aliases)).sql(dialect="duckdb")
-
-    def _render_ordered_set_aggregate(self, func: "FunctionCall", aliases) -> str:
-        """Render ``f(args) WITHIN GROUP (ORDER BY key [DESC])`` for DuckDB.
-
-        DuckDB accepts the standard WITHIN GROUP form but rejects the inline
-        ``f(args ORDER BY key)`` that sqlglot's DuckDB dialect transpiles an
-        ordered-set Anonymous call to; the call and the sort key are rendered by
-        the one emitter, and only the WITHIN GROUP wrapper is built here.
-        """
-        resolver = MergeResolver(aliases)
-        call = func.model_copy(update={"within_group_key": None})
-        call_sql = expression_to_ast(call, resolver).sql(dialect="duckdb")
-        key_sql = expression_to_ast(func.within_group_key, resolver).sql(dialect="duckdb")
-        direction = " DESC" if func.within_group_desc else ""
-        return f"{call_sql} WITHIN GROUP (ORDER BY {key_sql}{direction})"
 
     def schema(self) -> pa.Schema:
         """Get output schema."""
@@ -2140,37 +1439,6 @@ class PhysicalSort(PhysicalPlanNode):
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
 
-    def execute(self) -> Iterator[pa.RecordBatch]:
-        """Execute the sort in the DuckDB merge engine.
-
-        Every sort key (a plain column or any expression) renders to DuckDB SQL,
-        so DuckDB does all the ordering; there is no separate Python sort.
-        """
-        yield from self._execute_merge_sort(_require_engine(self))
-
-    def _execute_merge_sort(self, engine) -> Iterator[pa.RecordBatch]:
-        """Sort through DuckDB, with per-key NULLS FIRST/LAST placement."""
-        reader = _streaming_reader(self.input)
-        order = self._sort_order_clause(self.input.column_aliases())
-        sql = f"SELECT * FROM {_MERGE_SORT_RELATION} ORDER BY {order}"
-        return engine.run(sql, {_MERGE_SORT_RELATION: reader})
-
-    def _sort_order_clause(self, aliases) -> str:
-        """Render every ORDER BY key via the shared clause builder.
-
-        The single ``emit.clauses.order_by`` resolves keys to their physical
-        merge-relation names (MergeResolver) and fills the Postgres NULLS default
-        so the merge engine's ordering matches the source's; each key renders to
-        a DuckDB fragment for the merge query.
-        """
-        return clauses.order_by_fragment(
-            self.sort_keys,
-            self.ascending,
-            self.nulls_order,
-            MergeResolver(aliases),
-            dialect="duckdb",
-        )
-
     def schema(self) -> pa.Schema:
         return self.input.schema()
 
@@ -2210,38 +1478,6 @@ class PhysicalLimit(PhysicalPlanNode):
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
-
-    def execute(self) -> Iterator[pa.RecordBatch]:
-        """Execute limit, skipping the offset then capping at the limit."""
-        rows_emitted = 0
-        rows_skipped = 0
-        for batch in self.input.execute():
-            batch, rows_skipped = self._skip_offset(batch, rows_skipped)
-            if batch.num_rows == 0 or self._limit_reached(rows_emitted):
-                continue
-            out = self._take(batch, rows_emitted)
-            rows_emitted += out.num_rows
-            yield out
-
-    def _skip_offset(self, batch: pa.RecordBatch, rows_skipped: int):
-        """Drop leading rows until the offset has been consumed."""
-        if rows_skipped >= self.offset:
-            return batch, rows_skipped
-        skip = min(self.offset - rows_skipped, batch.num_rows)
-        return batch.slice(skip), rows_skipped + skip
-
-    def _limit_reached(self, rows_emitted: int) -> bool:
-        """True once the row cap (if any) has been met."""
-        return self.limit is not None and rows_emitted >= self.limit
-
-    def _take(self, batch: pa.RecordBatch, rows_emitted: int) -> pa.RecordBatch:
-        """Slice a batch down to the remaining row allowance."""
-        if self.limit is None:
-            return batch
-        remaining = self.limit - rows_emitted
-        if batch.num_rows <= remaining:
-            return batch
-        return batch.slice(0, remaining)
 
     def schema(self) -> pa.Schema:
         return self.input.schema()
@@ -2284,19 +1520,6 @@ class PhysicalValues(PhysicalPlanNode):
 
     def children(self) -> List[PhysicalPlanNode]:
         return []
-
-    def execute(self) -> Iterator[pa.RecordBatch]:
-        """Evaluate the constant rows into a single batch."""
-        from ..executor.expression_evaluator import ExpressionEvaluator
-
-        columns = []
-        for column_index in range(len(self.output_names)):
-            values = []
-            for row in self.rows:
-                evaluator = ExpressionEvaluator(_one_row_dummy_batch())
-                values.append(evaluator.evaluate(row[column_index])[0].as_py())
-            columns.append(pa.array(values))
-        yield pa.RecordBatch.from_arrays(columns, names=self.output_names)
 
     def schema(self) -> pa.Schema:
         """Infer schema by evaluating the first row."""
@@ -2417,29 +1640,6 @@ class PhysicalUnion(PhysicalPlanNode):
     def children(self) -> List[PhysicalPlanNode]:
         return self.inputs
 
-    def execute(self) -> Iterator[pa.RecordBatch]:
-        """Yield all input batches, deduplicating rows when distinct."""
-        if self.distinct:
-            yield from self._execute_merge_distinct(_require_engine(self))
-            return
-        for input_node in self.inputs:
-            yield from input_node.execute()
-
-    def _execute_merge_distinct(self, engine) -> Iterator[pa.RecordBatch]:
-        """Deduplicate the unioned inputs via DuckDB UNION (vectorized, type-aware).
-
-        Each branch is drained into a table first so its source connection is
-        released before the next branch is read (UNION DISTINCT must see every
-        row anyway, so DuckDB would buffer them regardless).
-        """
-        inputs = {}
-        selects = []
-        for index, node in enumerate(self.inputs):
-            name = f"in_union_{index}"
-            inputs[name] = _table_from_batches(list(node.execute()), node.schema())
-            selects.append(f"SELECT * FROM {name}")
-        return engine.run(" UNION ".join(selects), inputs)
-
     def schema(self) -> pa.Schema:
         return self.inputs[0].schema()
 
@@ -2512,12 +1712,6 @@ class PhysicalRemoteSetOp(PhysicalPlanNode):
 
     def children(self) -> List[PhysicalPlanNode]:
         return []
-
-    def execute(self) -> Iterator[pa.RecordBatch]:
-        query = self._build_query()
-        self.datasource_connection.ensure_connected()
-        for batch in self.datasource_connection.execute_query(query):
-            yield batch
 
     def schema(self) -> pa.Schema:
         if self._schema is None:
@@ -2622,34 +1816,6 @@ class PhysicalSetOperation(PhysicalPlanNode):
     def children(self) -> List[PhysicalPlanNode]:
         return [self.left, self.right]
 
-    def execute(self) -> Iterator[pa.RecordBatch]:
-        """Yield the combined rows honoring INTERSECT/EXCEPT semantics."""
-        yield from self._execute_merge_setop(_require_engine(self))
-
-    def _execute_merge_setop(self, engine) -> Iterator[pa.RecordBatch]:
-        """Run INTERSECT/EXCEPT (distinct or ALL) through DuckDB.
-
-        Both inputs are drained into tables first (releasing their source
-        connections); DuckDB applies the multiset semantics natively.
-        """
-        left_table = _table_from_batches(list(self.left.execute()), self.left.schema())
-        right_table = _table_from_batches(
-            list(self.right.execute()), self.right.schema()
-        )
-        sql = (
-            f"SELECT * FROM {_MERGE_LEFT_RELATION} {self._setop_keyword()} "
-            f"SELECT * FROM {_MERGE_RIGHT_RELATION}"
-        )
-        return engine.run(
-            sql,
-            {_MERGE_LEFT_RELATION: left_table, _MERGE_RIGHT_RELATION: right_table},
-        )
-
-    def _setop_keyword(self) -> str:
-        """DuckDB keyword for this set operation and multiset mode."""
-        base = "INTERSECT" if self.kind == SetOpKind.INTERSECT else "EXCEPT"
-        return base if self.distinct else f"{base} ALL"
-
     def schema(self) -> pa.Schema:
         return self.left.schema()
 
@@ -2688,48 +1854,6 @@ class PhysicalSingleRowGuard(PhysicalPlanNode):
 
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
-
-    def execute(self) -> Iterator[pa.RecordBatch]:
-        """Stream input batches, raising on any cardinality violation."""
-        seen_keys: Set[tuple] = set()
-        total_rows = 0
-        for batch in self.input.execute():
-            total_rows += batch.num_rows
-            if len(self.keys) == 0 and total_rows > 1:
-                raise CardinalityViolationError(
-                    "Scalar subquery returned more than one row"
-                )
-            if len(self.keys) > 0:
-                self._check_key_uniqueness(batch, seen_keys)
-            yield batch
-
-    def _check_key_uniqueness(
-        self, batch: pa.RecordBatch, seen_keys: Set[tuple]
-    ) -> None:
-        """Raise when a non-NULL guard key value appears more than once.
-
-        A key containing NULL can never satisfy SQL equality, so duplicate
-        NULL-keyed inner rows can never match an outer row and must not be
-        treated as a cardinality violation.
-        """
-        key_arrays = _key_column_arrays(batch, self.keys, self.input.column_aliases())
-        for row_index in range(batch.num_rows):
-            self._check_row_key(key_arrays, row_index, seen_keys)
-
-    def _check_row_key(self, key_arrays, row_index: int, seen_keys: Set[tuple]) -> None:
-        """Record one row's key and raise on a repeated non-NULL key."""
-        key_values = []
-        for array in key_arrays:
-            key_values.append(array[row_index].as_py())
-        key = tuple(key_values)
-        if None in key:
-            return
-        if key in seen_keys:
-            raise CardinalityViolationError(
-                "Scalar subquery returned more than one row for a "
-                f"correlation key {key}"
-            )
-        seen_keys.add(key)
 
     def schema(self) -> pa.Schema:
         return self.input.schema()
@@ -2786,30 +1910,12 @@ class PhysicalGroupedLimit(PhysicalPlanNode):
     def children(self) -> List[PhysicalPlanNode]:
         return [self.input]
 
-    def execute(self) -> Iterator[pa.RecordBatch]:
-        """Keep at most ``limit`` rows per key, via a DuckDB ROW_NUMBER window.
-
-        Partition and ordering keys (plain columns or any expression) render to
-        DuckDB SQL, so DuckDB applies the per-key limit; there is no Python path.
-        """
-        yield from self._execute_merge(_require_engine(self))
-
-    def _execute_merge(self, engine) -> Iterator[pa.RecordBatch]:
-        """Run the per-key limit as a windowed query in the merge engine."""
-        table = self._indexed_input_table()
-        sql = self._grouped_limit_sql(self.input.schema().names)
-        return engine.run(sql, {_MERGE_GROUPED_LIMIT_RELATION: table})
-
-    def _indexed_input_table(self) -> pa.Table:
-        """Materialize the input and append a stable row-order index column."""
-        table = pa.Table.from_batches(
-            list(self.input.execute()), schema=self.input.schema()
-        )
-        index = pa.array(range(table.num_rows), type=pa.int64())
-        return table.append_column(_GROUPED_LIMIT_INDEX_COL, index)
-
     def _grouped_limit_sql(self, names: List[str]) -> str:
-        """Render the ``ROW_NUMBER`` window and keep each key's first rows."""
+        """Render the ``ROW_NUMBER`` window and keep each key's first rows.
+
+        Rendered by the Rust engine's grouped-limit fragment, which wraps this
+        input in a CTE adding the row-order index column this SQL orders by.
+        """
         window = (
             f"ROW_NUMBER() OVER (PARTITION BY {self._partition_clause()} "
             f"ORDER BY {self._merge_order_clause()})"
@@ -2931,44 +2037,18 @@ class PhysicalLateralJoin(PhysicalPlanNode):
     def children(self) -> List[PhysicalPlanNode]:
         return [self.left, self.base_scan]
 
-    def execute(self) -> Iterator[pa.RecordBatch]:
-        """Materialize both sides, register them, run the LATERAL in DuckDB."""
-        engine = self.merge_engine()
-        yield from engine.run(self.lateral_sql, self._inputs())
-
-    def _inputs(self) -> Dict[str, pa.Table]:
-        """Build the registered Arrow inputs: the left and the reduced base."""
-        left_table = _table_from_batches(list(self.left.execute()), self.left.schema())
-        base_table = self._reduced_base(left_table)
-        return {self.left_name: left_table, self.base_name: base_table}
-
-    def _reduced_base(self, left_table: pa.Table) -> pa.Table:
-        """Execute the base relation, restricted to the left's correlation domain."""
-        scan = self._apply_domain_filter(left_table)
-        return _table_from_batches(list(scan.execute()), scan.schema())
-
-    def _apply_domain_filter(self, left_table: pa.Table) -> PhysicalPlanNode:
-        """Add a sound dynamic filter (domain restriction) to the base scan.
-
-        """
-        if not isinstance(self.base_scan, PhysicalScan):
-            return self.base_scan
-        term = _derive_domain_filter(self.correlations, left_table)
-        if term is None:
-            return self.base_scan
-        combined = term
-        if self.base_scan.filters is not None:
-            combined = and_expressions(self.base_scan.filters, term)
-        return self.base_scan.model_copy(update={"filters": combined})
-
     def schema(self) -> pa.Schema:
-        """The (left + value) output schema, read without fetching rows.
+        """A cross-source LATERAL is not representable in the Rust engine IR.
 
-        Taken from the LATERAL result's Arrow reader, which exposes the schema
-        ``LIMIT 0`` probe produces zero batches and would lose the schema).
+        The output types of the dependent join depend on running the LATERAL
+        query, which the removed local coordinator did. The Rust engine has no
+        native connector for this shape yet, so a plan containing this node fails
+        loudly at IR build (UnsupportedIR) rather than producing a wrong answer;
+        its schema is likewise not computable here.
         """
-        engine = self.merge_engine()
-        return engine.schema(self.lateral_sql, self._inputs())
+        raise NotImplementedError(
+            "cross-source LATERAL is not supported by the Rust engine"
+        )
 
     def estimated_cost(self) -> float:
         raise NotImplementedError("Cost estimation not yet implemented")
@@ -2978,78 +2058,6 @@ class PhysicalLateralJoin(PhysicalPlanNode):
 
     def __repr__(self) -> str:
         return f"PhysicalLateralJoin({self.join_type.name}, base={self.base_name})"
-
-
-def _derive_domain_filter(correlations, left_table: pa.Table) -> Optional[Expression]:
-    """Derive a sound base-relation filter from the left's correlation domain.
-
-    ``=`` becomes ``inner IN (domain)``; ``<``/``<=`` a ``< max(domain)`` bound;
-    ``>``/``>=`` a ``> min(domain)`` bound. Any other shape contributes no term
-    """
-    from .expressions import BinaryOp, BinaryOpType, InList, ColumnRef
-
-    terms: List[Expression] = []
-    for inner_col, op, outer_col in correlations:
-        if outer_col not in left_table.schema.names:
-            continue
-        domain = left_table.column(outer_col).combine_chunks().unique().drop_null()
-        values = domain.to_pylist()
-        if not values:
-            continue
-        # Unqualified reference to the base relation's correlated inner column.
-        # Names the column the derived domain term will constrain.
-        column = ColumnRef.create(table=None, column=inner_col)
-        term = _domain_term(column, op, values)
-        if term is not None:
-            terms.append(term)
-    if not terms:
-        return None
-    combined = terms[0]
-    for term in terms[1:]:
-        combined = and_expressions(combined, term)
-    return combined
-
-
-def _domain_term(column, op, values) -> Optional[Expression]:
-    """Build one sound dynamic-filter term for a correlation operator."""
-    from .expressions import BinaryOp, BinaryOpType, InList
-
-    if op == BinaryOpType.EQ:
-        if not _within_dynamic_filter_cap(len(values)):
-            return None
-        # Membership term reducing the base to the equality domain's values.
-        # An equality correlation maps to IN over the full distinct domain.
-        return InList.create(value=column, options=[_literal(v) for v in values])
-    if op in (BinaryOpType.LT, BinaryOpType.LTE):
-        # Upper-bound term keeping only rows below the domain's maximum.
-        # A less-than correlation is soundly reduced to a single max bound.
-        return BinaryOp.create(op=op, left=column, right=_literal(max(values)))
-    if op in (BinaryOpType.GT, BinaryOpType.GTE):
-        # Lower-bound term keeping only rows above the domain's minimum.
-        # A greater-than correlation is soundly reduced to a single min bound.
-        return BinaryOp.create(op=op, left=column, right=_literal(min(values)))
-    return None
-
-
-def _literal(value) -> Expression:
-    """Wrap a Python domain value as a typed literal."""
-    from .expressions import Literal, DataType
-
-    if isinstance(value, bool):
-        # Boolean constant carrying a domain value into the filter tree.
-        # Chosen because the Python value is a bool.
-        return Literal.create(value=value, data_type=DataType.BOOLEAN)
-    if isinstance(value, int):
-        # Integer constant carrying a domain value into the filter tree.
-        # Widened to BIGINT since the Python value is an int.
-        return Literal.create(value=value, data_type=DataType.BIGINT)
-    if isinstance(value, float):
-        # Floating-point constant carrying a domain value into the filter tree.
-        # Chosen because the Python value is a float.
-        return Literal.create(value=value, data_type=DataType.DOUBLE)
-    # String constant carrying any remaining domain value into the filter tree.
-    # The fallback for values that are not bool, int, or float.
-    return Literal.create(value=value, data_type=DataType.VARCHAR)
 
 
 class PhysicalExplain(PhysicalPlanNode):
@@ -3076,14 +2084,16 @@ class PhysicalExplain(PhysicalPlanNode):
     def children(self) -> List[PhysicalPlanNode]:
         return [self.child]
 
-    def execute(self) -> Iterator[pa.RecordBatch]:
-        """Return representation of the plan."""
+    def build_explain_batch(self) -> pa.RecordBatch:
+        """Render the plan as a single-column Arrow batch (no data execution).
+
+        EXPLAIN is plan introspection: the executor renders it directly instead
+        of running it through the Rust engine, so it never needs an execution
+        engine of its own.
+        """
         if self.format == ExplainFormat.JSON:
-            batch = self._build_json_batch()
-            yield batch
-            return
-        batch = self._build_text_batch()
-        yield batch
+            return self._build_json_batch()
+        return self._build_text_batch()
 
     def build_document(self, stringify_queries: bool = False) -> Dict[str, Any]:
         """Build structured plan + query metadata."""
@@ -3212,10 +2222,6 @@ class Gather(PhysicalPlanNode):
 
     def children(self) -> List[PhysicalPlanNode]:
         return []
-
-    def execute(self) -> Iterator[pa.RecordBatch]:
-        """Execute query on remote source and stream results."""
-        raise NotImplementedError("Execute not yet implemented")
 
     def schema(self) -> pa.Schema:
         raise NotImplementedError("Schema resolution not yet implemented")

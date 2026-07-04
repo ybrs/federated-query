@@ -396,21 +396,50 @@ def _merge_step(ctx, fragment, inputs):
 
 
 def _emit_projection(node, ctx):
-    """A projection over its single input, as a `project` fragment."""
+    """A projection over its single input, as a `project` fragment.
+
+    DISTINCT ON needs the source's ORDER BY semantics to pick the surviving row.
+    A single-source DISTINCT ON is pushed whole to its source; one reaching here
+    is cross-source, which the project fragment cannot honor, so it fails loudly
+    rather than silently dropping the DISTINCT ON and returning wrong rows.
+    """
+    if node.distinct_on is not None:
+        raise UnsupportedIR(
+            "DISTINCT ON is only supported when the query pushes to a single source"
+        )
     child = _emit(node.input, ctx)
     aliases = node.input.column_aliases()
-    project = _projection_items(node.expressions, node.output_names, "in_0", aliases)
+    project = _projection_items(node.expressions, node.output_names, "in_0", aliases, node.input)
     fragment = ctx.names.fragment()
     ctx.fragments[fragment] = {"kind": "project", "project": project}
     return _merge_step(ctx, fragment, {"in_0": child})
 
 
-def _projection_items(expressions, names, input_name, aliases):
-    """Serialize each output expression aliased to its output name."""
+def _projection_items(expressions, names, input_name, aliases, input_node):
+    """Serialize each output expression aliased to its output name.
+
+    A ``*`` column reference expands to one item per input column (keeping each
+    column's own name), the same expansion the node's ``schema()`` performs, so
+    an unexpanded ``SELECT *`` projection resolves against real columns.
+    """
     items = []
     for expr, name in zip(expressions, names):
-        items.append({"expr": _expr_over(expr, input_name, aliases), "alias": name})
+        if _is_star_column(expr):
+            _append_star_items(items, input_node, input_name)
+        else:
+            items.append({"expr": _expr_over(expr, input_name, aliases), "alias": name})
     return items
+
+
+def _is_star_column(expr):
+    """True when the expression is the ``*`` wildcard column reference."""
+    return isinstance(expr, ColumnRef) and expr.column == "*"
+
+
+def _append_star_items(items, input_node, input_name):
+    """Append one projection item per input column, keeping its own name."""
+    for name in input_node.schema().names:
+        items.append(_side_column(input_name, name, name))
 
 
 def _emit_aggregate(node, ctx):
