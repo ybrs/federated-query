@@ -244,3 +244,17 @@ def test_user_lateral_top_k_unnests(env):
         "(SELECT p.base_price AS bp FROM products p "
         " WHERE p.base_price < o.price ORDER BY p.base_price DESC LIMIT 1) t ON true"
     ))
+
+
+def test_user_lateral_aggregate_unnests(env):
+    """A cross-source user LATERAL with an aggregate body unnests to regular
+    algebra (domain + per-domain aggregate), runs on Rust, and matches DuckDB."""
+    _assert_nk(env, (
+        "SELECT o.order_id, t.m FROM src_o.main.orders o LEFT JOIN LATERAL "
+        "(SELECT MAX(p.base_price) AS m FROM src_p.main.products p "
+        " WHERE p.base_price < o.price) t ON true"
+    ), (
+        "SELECT o.order_id, t.m FROM orders o LEFT JOIN LATERAL "
+        "(SELECT MAX(p.base_price) AS m FROM products p "
+        " WHERE p.base_price < o.price) t ON true"
+    ))

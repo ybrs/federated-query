@@ -1950,7 +1950,8 @@ class Decorrelator:
         dep_prefix = self._next_prefix()
         domain, dom_map = self._build_domain(plan, free_vars, dom_prefix)
         dependent = self._build_dependent_relation(
-            body, domain, inner, correlated, local, dom_map, dep_prefix
+            body.aggregates, [_UNNEST_VALUE], domain, inner,
+            correlated, local, dom_map, dep_prefix,
         )
         joined = Join.create(
             left=plan, right=dependent, join_type=JoinType.LEFT,
@@ -1978,9 +1979,13 @@ class Decorrelator:
         return SubqueryScan.create(input=distinct, alias=prefix), dom_map
 
     def _build_dependent_relation(
-        self, body, domain, inner, correlated, local, dom_map, prefix
+        self, aggregates, agg_names, domain, inner, correlated, local, dom_map, prefix
     ):
-        """Aggregate once per domain value over (domain JOIN inner ON correlation)."""
+        """Aggregate once per domain value over (domain JOIN inner ON correlation).
+
+        aggregates / agg_names are lists so this serves both a scalar subquery
+        (one value) and a user LATERAL (the body's whole aggregate projection).
+        """
         condition = self._dependent_join_condition(correlated, local, dom_map)
         dependent_input = Join.create(
             left=domain, right=inner, join_type=JoinType.INNER, condition=condition
@@ -1994,11 +1999,11 @@ class Decorrelator:
             # repeated as a passthrough output, not just a grouping key.
             select_list.append(domain_ref)
             names.append(domain_ref.column)
-        # Rewrite any outer reference inside the aggregate value to its domain
+        # Rewrite any outer reference inside an aggregate value to its domain
         # column, so the aggregate no longer references the outer relation.
-        for aggregate in body.aggregates:
+        for aggregate in aggregates:
             select_list.append(_replace_column_refs(aggregate, dom_map))
-        names.append(_UNNEST_VALUE)
+        names.extend(agg_names)
         aggregate = Aggregate.create(
             input=dependent_input, group_by=group_cols,
             aggregates=select_list, output_names=names,
@@ -2197,37 +2202,48 @@ class Decorrelator:
         )
 
     def _unnest_lateral(self, outer, node):
-        """Domain -> ranked top-k over the LATERAL body -> join back onto outer."""
-        body = self._lateral_top_k_body(node.right)
-        if body is None:
+        """Domain -> unnested LATERAL body (top-k or aggregate) -> join back."""
+        if not isinstance(node.right, SubqueryScan):
             return None
-        alias, value_exprs, value_names, shape = body
-        correlated, local, inner, free_vars, order, limit = shape
-        domain, dom_map = self._build_domain(outer, free_vars, self._next_prefix())
-        relation = self._build_top_k_relation(
-            value_exprs, value_names, order, limit, domain, inner,
-            correlated, local, dom_map, alias,
-        )
+        alias = node.right.alias
+        body = self._rewrite_plan(node.right.input)
+        built = self._lateral_relation(outer, alias, body)
+        if built is None:
+            return None
+        relation, free_vars, dom_map = built
         return Join.create(
             left=outer, right=relation, join_type=node.join_type,
             condition=self._join_back_condition(free_vars, dom_map, alias),
         )
 
-    def _lateral_top_k_body(self, right: LogicalPlanNode):
-        """Recognize SubqueryScan(alias, Limit[Sort?[Projection[Filter(correlated)]]]).
+    def _lateral_relation(self, outer, alias, body):
+        """Unnest a LATERAL body to a relation - top-k or aggregate - or None."""
+        top_k = self._lateral_top_k_relation(outer, alias, body)
+        if top_k is not None:
+            return top_k
+        return self._lateral_aggregate_relation(outer, alias, body)
 
-        Returns (alias, value_exprs, value_names, shape) or None; shape is
-        (correlated, local, inner, free_vars, order, limit).
-        """
-        if not isinstance(right, SubqueryScan):
-            return None
-        parts = self._peel_lateral_limit(self._rewrite_plan(right.input))
+    def _lateral_top_k_relation(self, outer, alias, body):
+        """Build the top-k relation for a Limit[...] LATERAL body, or None."""
+        parts = self._peel_lateral_limit(body)
         if parts is None:
             return None
-        return self._lateral_body_shape(right.alias, parts)
+        shape = self._lateral_limit_shape(parts)
+        if shape is None:
+            return None
+        return self._top_k_from_shape(outer, alias, shape)
 
-    def _lateral_body_shape(self, alias, parts):
-        """Extract the correlation and free vars for a peeled LATERAL body."""
+    def _top_k_from_shape(self, outer, alias, shape):
+        """Build (relation, free_vars, dom_map) for a recognized top-k body."""
+        exprs, names, order, limit, correlated, local, inner, free_vars = shape
+        domain, dom_map = self._build_domain(outer, free_vars, self._next_prefix())
+        relation = self._build_top_k_relation(
+            exprs, names, order, limit, domain, inner, correlated, local, dom_map, alias
+        )
+        return (relation, free_vars, dom_map)
+
+    def _lateral_limit_shape(self, parts):
+        """Correlation, free vars, and output for a peeled top-k LATERAL body."""
         projection, order, limit, filter_node, inner_aliases = parts
         correlated, local = self._split_by_outer(filter_node.predicate, inner_aliases)
         free_vars = self._distinct_outer_refs(
@@ -2235,8 +2251,31 @@ class Decorrelator:
         )
         if not correlated or not free_vars:
             return None
-        shape = (correlated, local, filter_node.input, free_vars, order, limit)
-        return (alias, list(projection.expressions), list(projection.aliases), shape)
+        return (list(projection.expressions), list(projection.aliases), order, limit,
+                correlated, local, filter_node.input, free_vars)
+
+    def _lateral_aggregate_relation(self, outer, alias, body):
+        """Build the aggregate relation for an Aggregate[Filter] LATERAL body, or None."""
+        if not self._is_aggregate_over_filter(body):
+            return None
+        inner_aliases = _collect_inner_aliases(body)
+        correlated, local = self._split_by_outer(body.input.predicate, inner_aliases)
+        free_vars = self._distinct_outer_refs(
+            correlated + list(body.aggregates), inner_aliases
+        )
+        if not correlated or not free_vars:
+            return None
+        domain, dom_map = self._build_domain(outer, free_vars, self._next_prefix())
+        relation = self._build_dependent_relation(
+            body.aggregates, body.output_names, domain, body.input.input,
+            correlated, local, dom_map, alias,
+        )
+        return (relation, free_vars, dom_map)
+
+    def _is_aggregate_over_filter(self, body: LogicalPlanNode) -> bool:
+        """An Aggregate with no GROUP BY directly over a Filter (the correlation)."""
+        return (isinstance(body, Aggregate) and not body.group_by
+                and isinstance(body.input, Filter))
 
     def _peel_lateral_limit(self, body):
         """Peel Limit / (Sort?) / Projection to its Filter for a LATERAL body.
