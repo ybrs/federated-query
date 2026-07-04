@@ -931,6 +931,11 @@ def register_datasources(datasources):
 
 def _register_one(fedqrs, datasource, postgres_cls, duckdb_cls):
     """Register a single datasource, dispatching on its connector type."""
+    from ..datasources.parquet import ParquetDataSource
+
+    if isinstance(datasource, ParquetDataSource):
+        fedqrs.register_datasource(datasource.name, "parquet", {"dir": datasource.parquet_dir})
+        return
     if isinstance(datasource, postgres_cls):
         params = {"uri": datasource._adbc_uri(), "adbc_driver": _pg_adbc_driver_path()}
         fedqrs.register_datasource(datasource.name, "postgres", params)
