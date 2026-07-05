@@ -104,7 +104,8 @@ class PredicatePushdownRule(OptimizationRule):
             return self._push_filter(plan)
         if isinstance(plan, SetOperation):
             return _rewrite_set_operation_branches(plan, self._push_down)
-        if isinstance(plan, (Projection, Join, Aggregate, Limit, Sort, SubqueryScan)):
+        if isinstance(plan, (Projection, Join, Aggregate, Limit, Sort, SubqueryScan,
+                             CTE)):
             return transform_children(plan, self._push_down)
         return plan
 
@@ -727,7 +728,8 @@ class LimitPushdownRule(OptimizationRule):
         """
         if isinstance(plan, Limit):
             return self._push_limit_node(plan)
-        if isinstance(plan, (Projection, Filter, Sort, Aggregate, Join, Union, Explain)):
+        if isinstance(plan, (Projection, Filter, Sort, Aggregate, Join, Union, Explain,
+                             SubqueryScan, CTE)):
             return transform_children(plan, self._rewrite_plan)
         return plan
 
@@ -1106,7 +1108,8 @@ class OrderByPushdownRule(OptimizationRule):
             return self._recurse_filter(plan)
         if isinstance(plan, SetOperation):
             return _rewrite_set_operation_branches(plan, self._push_order_by)
-        if isinstance(plan, (Projection, Limit, Sort, Join, Aggregate)):
+        if isinstance(plan, (Projection, Limit, Sort, Join, Aggregate, SubqueryScan,
+                             CTE)):
             return transform_children(plan, self._push_order_by)
         return plan
 
@@ -1224,7 +1227,8 @@ class AggregatePushdownRule(OptimizationRule):
         """
         if isinstance(plan, SetOperation):
             return _rewrite_set_operation_branches(plan, self._push_aggregate)
-        if isinstance(plan, (Projection, Filter, Limit, Sort, Join, SubqueryScan)):
+        if isinstance(plan, (Projection, Filter, Limit, Sort, Join, SubqueryScan,
+                             CTE)):
             return transform_children(plan, self._push_aggregate)
         return plan
 

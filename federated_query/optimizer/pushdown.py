@@ -16,6 +16,7 @@ from ..plan.expressions import (
     column_refs,
 )
 from ..plan.logical import (
+    CTERef,
     LogicalPlanNode,
     Scan,
     Join,
@@ -23,6 +24,8 @@ from ..plan.logical import (
     Aggregate,
     Filter,
     Limit,
+    Sort,
+    SubqueryScan,
 )
 
 
@@ -136,9 +139,23 @@ def available_columns(plan: LogicalPlanNode) -> Set[str]:
         return _projection_columns(plan)
     if isinstance(plan, Aggregate):
         return set(plan.output_names)
-    if isinstance(plan, (Filter, Limit)):
+    if isinstance(plan, (Filter, Limit, Sort)):
         return available_columns(plan.input)
+    if isinstance(plan, CTERef):
+        return _aliased_names(plan.schema(), plan.alias if plan.alias else plan.name)
+    if isinstance(plan, SubqueryScan):
+        return _aliased_names(plan.schema(), plan.alias)
     return set()
+
+
+def _aliased_names(columns, alias: str) -> Set[str]:
+    """Output columns of an aliased relation (CTE reference, derived table)
+    as bare and alias-qualified names - what a predicate above it may use."""
+    names: Set[str] = set()
+    for column in columns:
+        names.add(column)
+        names.add(f"{alias}.{column}")
+    return names
 
 
 def _scan_columns(scan: Scan) -> Set[str]:

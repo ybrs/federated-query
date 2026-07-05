@@ -34,6 +34,7 @@ from ..plan.physical import (
     PhysicalLimit,
     PhysicalHashJoin,
     PhysicalRemoteJoin,
+    PhysicalRemoteQuery,
     PhysicalNestedLoopJoin,
     PhysicalHashAggregate,
     PhysicalExplain,
@@ -723,15 +724,27 @@ class PhysicalPlanner:
 
         The probe is the side that is not the build side. Marking lets EXPLAIN
         show the dynamic filter even though its values are only known at
-        execution time. Only INNER joins with a single-column key qualify.
+        execution time. Only INNER joins with a single-column key qualify, and
+        only when the BUILD side can produce its key values standalone (a
+        plain scan or a collapsed remote query): a coordinator-computed build
+        input (e.g. a CTE body) has no source to read the keys from.
         """
         if hash_join.join_type != JoinType.INNER:
             return
         probe, probe_keys = self._probe_side(hash_join)
         if len(probe_keys) != 1:
             return
+        if not isinstance(self._build_side_node(hash_join),
+                          (PhysicalScan, PhysicalRemoteQuery)):
+            return
         if isinstance(probe, PhysicalScan):
             probe.dynamic_filter_keys = list(probe_keys)
+
+    def _build_side_node(self, hash_join: PhysicalHashJoin) -> PhysicalPlanNode:
+        """The input the hash table is built from."""
+        if hash_join.build_side == "right":
+            return hash_join.right
+        return hash_join.left
 
     def _probe_side(
         self, hash_join: PhysicalHashJoin
