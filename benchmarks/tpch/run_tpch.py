@@ -192,24 +192,41 @@ def _reference(parquet_dir):
     return connection
 
 
-def _run_one(args):
-    """Run a single query under the RSS cap; print `RESULT ours_ms duck_ms match`."""
+def _measure_record(name, ours_ms, duck_ms, ours, ref):
+    """Assemble one query's measurement dict from already-normalized rows."""
+    return {"name": name, "ours_ms": ours_ms, "duck_ms": duck_ms,
+            "correct": ours == ref, "ours_rows": len(ours), "duck_rows": len(ref)}
+
+
+def measure_one(mode, data, name):
+    """Run one query on Parquet through Rust + DuckDB; return a measurement dict.
+
+    Reused by the report orchestrator (bench.py) so a single query is measured
+    identically whether run standalone here or as one cell of the full matrix.
+    """
     from federated_query.executor.rust_ir import execute_via_rust
 
-    _start_memory_watchdog(int(args.memlimit_gb * 1024 ** 3))
-    groups, source_of = _source_layout(args.mode)
+    groups, source_of = _source_layout(mode)
     work = tempfile.mkdtemp(prefix="tpch_one_")
     try:
-        sources = _build_sources(args.data, work, groups)
+        sources = _build_sources(data, work, groups)
         qe = _build_runtime(sources)
-        duck = _reference(args.data)
-        raw = open(os.path.join(QUERY_DIR, f"{args.one}.sql")).read().strip().rstrip(";")
+        duck = _reference(data)
+        raw = open(os.path.join(QUERY_DIR, f"{name}.sql")).read().strip().rstrip(";")
         plan = qe._plan_pipeline(_qualify(raw, source_of), profiler=None)
         ours_ms, ours = _median3(lambda: _arrow_rows(execute_via_rust(plan, sources)))
         duck_ms, ref = _median3(lambda: _norm(duck.execute(raw).fetchall()))
-        print(f"RESULT {ours_ms:.1f} {duck_ms:.1f} {'OK' if ours == ref else 'DIFF'}")
+        return _measure_record(name, ours_ms, duck_ms, ours, ref)
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def _run_one(args):
+    """Run a single query under the RSS cap; print `RESULT ours_ms duck_ms match`."""
+    _start_memory_watchdog(int(args.memlimit_gb * 1024 ** 3))
+    record = measure_one(args.mode, args.data, args.one)
+    match = "OK" if record["correct"] else "DIFF"
+    print(f"RESULT {record['ours_ms']:.1f} {record['duck_ms']:.1f} {match}")
 
 
 # ----------------------------- parent: all 22 ------------------------------
