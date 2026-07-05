@@ -866,3 +866,82 @@ def test_pushed_aggregate_scan_ignores_having_columns_for_stats(cost_config):
     # Would raise a KeyError inside the fake source if __subq_0_h1 were
     # requested; the group-count estimate returns cleanly instead.
     assert model.estimate(scan).rows > 0
+
+
+class TestSemiAntiMatchedRows:
+    """The SEMI/ANTI distinct-match estimate (occupancy formula).
+
+    The bug: matched left rows were min(left, inner), which saturates to
+    left for a many-to-many inner (inner >= left) and forces ANTI to 0 - a
+    self-referential NOT-EXISTS fact atom then looked free to lead the join
+    order (TPC-H q21). The occupancy estimate matched = left * (1 - e^-fanout)
+    (fanout = inner/left) never saturates, so an ANTI is never spuriously
+    empty, while a selective semi (inner << left) is unchanged.
+    """
+
+    def _model(self):
+        """A cost model without statistics (the helper is stats-free)."""
+        return CostModel(CostConfig(
+            cpu_tuple_cost=0.01, io_page_cost=1.0,
+            network_byte_cost=0.0001, network_rtt_ms=10.0,
+        ))
+
+    def test_fanout_one_keeps_a_real_anti_fraction(self):
+        """inner == left (fanout 1): matched ~ 0.63*left, so ANTI ~ 0.37*left,
+        never 0 - this is the q21 regime that used to collapse."""
+        matched = self._model()._semi_matched_rows(1000, 1000)
+        assert 600 <= matched <= 640
+        assert 1000 - matched > 300
+
+    def test_selective_inner_matches_the_inner_size(self):
+        """inner << left: matched ~ inner (unchanged from the old min(left,
+        inner) for a selective semi)."""
+        matched = self._model()._semi_matched_rows(10, 1000)
+        assert 9 <= matched <= 10
+
+    def test_dense_fanout_saturates_to_left(self):
+        """A genuinely dense many-to-many (every left key matched, huge fanout)
+        still matches ~all of left, so ANTI is ~empty - the occupancy formula
+        agrees with reality here, it only fixes the fanout~1 case."""
+        matched = self._model()._semi_matched_rows(100_000, 1000)
+        assert matched == 1000
+
+    def test_bounds_never_exceed_left_or_go_negative(self):
+        """matched is always within [0, left_rows]."""
+        model = self._model()
+        assert model._semi_matched_rows(0, 1000) == 0
+        assert 0 <= model._semi_matched_rows(500, 1000) <= 1000
+        assert model._semi_matched_rows(5, 0) == 0
+
+
+def test_anti_join_estimate_is_not_zero_for_a_one_to_one_inner():
+    """Integration: an ANTI join whose inner equals its left side (fanout 1)
+    must estimate a real fraction of the left rows, not 0. Regression for the
+    q21 fact atom that estimated 0 and mis-led the join order."""
+    tables = {("public", "l1"): TableStatistics(
+        row_count=1000, total_size_bytes=0,
+        column_stats={"k": ColumnStatistics(
+            num_distinct=1000, null_fraction=0.0, avg_width=8)},
+    ), ("public", "l2"): TableStatistics(
+        row_count=1000, total_size_bytes=0,
+        column_stats={"k": ColumnStatistics(
+            num_distinct=1000, null_fraction=0.0, avg_width=8)},
+    )}
+    model = CostModel(cost_config_fixture(), _seeded_collector("ds", tables))
+    left = Scan(datasource="ds", schema_name="public", table_name="l1",
+                columns=["k"], alias="l1")
+    right = Scan(datasource="ds", schema_name="public", table_name="l2",
+                 columns=["k"], alias="l2")
+    condition = BinaryOp(
+        op=BinaryOpType.EQ,
+        left=ColumnRef(table="l1", column="k", data_type=DataType.INTEGER),
+        right=ColumnRef(table="l2", column="k", data_type=DataType.INTEGER),
+    )
+    anti = Join(left=left, right=right, join_type=JoinType.ANTI, condition=condition)
+    assert model.estimate(anti).rows > 200
+
+
+def cost_config_fixture():
+    """A plain cost config for direct construction in module-level tests."""
+    return CostConfig(cpu_tuple_cost=0.01, io_page_cost=1.0,
+                      network_byte_cost=0.0001, network_rtt_ms=10.0)

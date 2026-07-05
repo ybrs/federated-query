@@ -1,4 +1,4 @@
-# Status: nine phases live; fair federated gap 38.6x -> 3.61x
+# Status: ten phases live; fair federated gap 38.6x -> 3.26x
 
 State of the work. Facts only: what exists, what passes, what is measured,
 what is not done. Previous phase (Rust cutover, N-K decorrelation, merge-engine
@@ -13,7 +13,7 @@ merge-engine-datafusion
             `- feature/cost-based-optimizer   <-- HEAD (this document)
 ```
 
-Test suite: **1149 passed, 3 skipped, 39 xfailed, 0 failed**
+Test suite: **1154 passed, 3 skipped, 39 xfailed, 0 failed**
 (`POSTGRES_DB=duckpoc python -m pytest -q`). `make lint` green.
 
 ## What was built on this branch
@@ -232,17 +232,37 @@ Gate (report-result-1b5c9da.md): fedpgduck SF1 4147 -> 3820ms (3.61x), all
 Nine-phase run: 38.55x -> 3.61x; single-source SF1 2.15x. 18/22 fair queries
 under 5x, 8/22 under 3x.
 
+## SEMI/ANTI cardinality estimate (q21, commit f1e4921)
+
+Diagnosis pivoted after instrumenting the real DP: q21 was slow NOT because the
+transfer model is blind to reduction, but because the SEMI/ANTI fact atom
+(l1 with EXISTS/NOT-EXISTS lineitem self-joins) estimated to 0 rows, so the DP
+led with it (free) and applied the selective nation filter last, shipping
+98,833 rows. Root cause (cost.py _clamp_other_join_rows): matched =
+min(left, inner) counts match MULTIPLICITY off the many-to-many inner-join size
+and saturates to left_rows, forcing ANTI = 0. Fix: the occupancy estimate
+matched = left * (1 - e^-(inner/left)) - never saturates, so an ANTI is never
+spuriously empty; unchanged (~inner) for a selective semi. The DP then leads
+with the pg dims on its own; NO transfer/enumerator change was needed (the
+originally-planned reduction-aware ordering was abandoned - it would not have
+fixed a 0-estimate).
+
+Gate (report-result-f1e4921.md): fedpgduck SF1 3820 -> 3432ms (3.26x), all 132
+cells correct. q21 everywhere: fedpgduck SF1 591 -> 172ms (4.9x -> 1.4x),
+single SF1 390 -> 152ms, fedparquet SF1 305 -> 142ms. The ONLY other >40ms
+delta (q16 single 160 -> 214) is subprocess noise - its plan is byte-identical
+old vs new clamp. Ten-phase run: 38.55x -> 3.26x; single-source SF1 1.99x.
+
 ## Known gaps / next work (in priority order from the data)
 
-1. **Small-scale fixed overhead**: fedpgduck SF0.1 is 4.60x on 20-90ms
-   queries - per-query planning/stat-fetch/ingest constants, not plans. The
-   biggest remaining RATIO lever, but only if low-latency matters.
-2. **q07 (283ms/6.0x)**: OR-derivation helped but the two-nation shape still
-   leaves a mid-size intermediate; diminishing returns.
-3. **q09/q21/q10/q13 (3-5x, 280-590ms)**: residual multi-fact transfer +
-   genuine coordinator join work; the long flat tail.
-4. **Duck guard precision** (planner NDV as an IR hint), **TRANSFER_WEIGHT
-   calibration** (1.0), **CTE materialize-once**.
+1. **Small-scale fixed overhead**: fedpgduck SF0.1 is 4.47x on 20-90ms queries
+   - per-query planning/stat-fetch/ingest constants, not plans. The biggest
+   remaining RATIO lever if low-latency matters.
+2. **q07 (283ms/6.0x fedpgduck SF1)**: OR-across-nations shape; diminishing.
+3. **q09/q10/q13 (3-4x, 280-440ms)**: residual multi-fact transfer + genuine
+   coordinator join work; the flat tail.
+4. **TRANSFER_WEIGHT calibration** (1.0), **CTE materialize-once**, duck guard
+   NDV hint.
 5. **fedqrs missing operators** (18 xfails); `enable_decorrelation` unwired.
 
 ## How to run
