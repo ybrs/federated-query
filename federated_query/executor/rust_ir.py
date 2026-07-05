@@ -740,13 +740,27 @@ def _join_kind(join):
 
 
 def _can_reduce(join):
-    """True when the semi-join reduction applies: INNER, single key, both plain
-    scans (so the build renders source SQL and the probe accepts an IN filter)."""
+    """True when the semi-join reduction applies: INNER, single key, and at
+    least one side is a plain scan the keys can be injected into. The OTHER
+    side (the build) may be ANY subtree - it is materialized for the join
+    anyway, so collecting its distinct keys costs nothing extra and the
+    adaptive strategy in the engine (IN list / temp table / full-scan guard)
+    decides how the keys reach the probe's source."""
     if join.join_type != JoinType.INNER:
         return False
     if len(join.left_keys) != 1 or len(join.right_keys) != 1:
         return False
-    return isinstance(join.left, PhysicalScan) and isinstance(join.right, PhysicalScan)
+    return _injectable_scan(join.left) or _injectable_scan(join.right)
+
+
+def _injectable_scan(node):
+    """A plain single-table scan the engine can inject ``col IN (...)`` into
+    (mirrors _reject_nonplain_scan, so an emitted spec can never raise)."""
+    if not isinstance(node, PhysicalScan):
+        return False
+    if any((node.aggregates, node.group_by, node.grouping_sets)):
+        return False
+    return not any((node.order_by_keys, node.limit is not None, node.offset))
 
 
 def _emit_reduced_join(join, ctx):
@@ -760,23 +774,42 @@ def _emit_reduced_join(join, ctx):
 
 
 def _orient_join(join):
-    """Pick build/probe sides and their join keys from the build_side choice."""
-    if join.build_side == "left":
+    """Pick build/probe sides and their join keys.
+
+    When both sides are plain scans the planner's build_side choice stands.
+    Otherwise the injectable scan is the PROBE (the reduction exists to cut
+    the big base-table read) and the computed side donates the keys."""
+    if _injectable_scan(join.left) and _injectable_scan(join.right):
+        if join.build_side == "left":
+            return join.left, join.right, join.left_keys[0], join.right_keys[0]
+        return join.right, join.left, join.right_keys[0], join.left_keys[0]
+    if _injectable_scan(join.right):
         return join.left, join.right, join.left_keys[0], join.right_keys[0]
     return join.right, join.left, join.right_keys[0], join.left_keys[0]
 
 
 def _emit_reduced_inputs(ctx, build_child, probe_child, build_key_expr, probe_key_expr):
-    """Emit the build scan, its distinct keys, and the injected probe scan."""
+    """Emit the build side, its distinct keys, and the injected probe scan."""
     build_key = _physical_column_name(build_key_expr, build_child.column_aliases())
     inject_col = _physical_column_name(probe_key_expr, probe_child.column_aliases())
-    build_binding = ctx.names.binding()
+    build_binding = _emit_build_side(ctx, build_child)
     keys_binding = ctx.names.binding()
     probe_binding = ctx.names.binding()
-    _emit_build_scan(ctx, build_child, build_binding)
     _emit_collect_distinct(ctx, build_binding, build_key, keys_binding)
     _emit_injected_scan(ctx, probe_child, inject_col, keys_binding, probe_binding)
     return build_binding, probe_binding
+
+
+def _emit_build_side(ctx, build_child):
+    """The build input's binding: the dedicated materialized read for a plain
+    scan, the subtree's own emission for anything else (every step output is
+    a materialized binding in the engine, so the key collection and the join
+    can both read it)."""
+    if isinstance(build_child, PhysicalScan):
+        binding = ctx.names.binding()
+        _emit_build_scan(ctx, build_child, binding)
+        return binding
+    return _emit(build_child, ctx)
 
 
 def _emit_build_scan(ctx, build_child, binding):

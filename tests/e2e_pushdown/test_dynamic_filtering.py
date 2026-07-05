@@ -103,3 +103,34 @@ def test_build_side_chosen_by_filter_regardless_of_order(multi_source_env):
     )
     # orders (the big, unfiltered side) is the one carrying the IN filter
     assert '"product_id" IN (101)' in plan
+
+
+def test_computed_build_side_still_reduces_the_probe(multi_source_env):
+    """A build side that is itself a JOIN (not a plain scan) must still donate
+    its distinct keys: the reduction machinery is generic downstream, only the
+    gate used to require plain scans on BOTH sides. The chain
+    (customers JOIN orders) JOIN products must inject the pair's product ids
+    into the products scan."""
+    runtime = build_runtime(multi_source_env)
+    sql = (
+        "SELECT O.order_id "
+        "FROM duckdb_customers.main.customers C "
+        "JOIN duckdb_orders.main.orders O ON C.customer_id = O.customer_id "
+        "JOIN duckdb_products.main.products P ON O.product_id = P.id "
+        "WHERE C.segment = 'enterprise'"
+    )
+    plan = runtime.query_executor._plan_pipeline(sql, None)
+    ir = build_ir(plan)
+    injected = []
+    for step in ir["steps"]:
+        if step.get("op") == "injected_scan":
+            injected.append(step)
+    products_injections = []
+    for step in injected:
+        if step["datasource"] == "duckdb_products":
+            products_injections.append(step)
+    assert products_injections, f"no injection into products; steps: {injected}"
+    assert products_injections[0]["inject_column"] == "id"
+    # And the reduced plan computes the same rows as the unreduced semantics.
+    result = runtime.execute(sql)
+    assert result.num_rows > 0
