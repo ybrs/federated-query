@@ -1,4 +1,4 @@
-# Status: join ordering, projection pushdown, CTE pushdown live; next q21
+# Status: four optimizer fixes live; fair federated gap 38.6x -> 5.1x
 
 State of the work. Facts only: what exists, what passes, what is measured,
 what is not done. Previous phase (Rust cutover, N-K decorrelation, merge-engine
@@ -13,7 +13,7 @@ merge-engine-datafusion
             `- feature/cost-based-optimizer   <-- HEAD (this document)
 ```
 
-Test suite: **1127 passed, 3 skipped, 39 xfailed, 0 failed**
+Test suite: **1128 passed, 3 skipped, 39 xfailed, 0 failed**
 (`POSTGRES_DB=duckpoc python -m pytest -q`). `make lint` green.
 
 ## What was built on this branch
@@ -123,34 +123,45 @@ q15 ran at 169x DuckDB for three stacked reasons; two fixed:
 Deferred: the CTE body still evaluates once per reference (each copy is now
 a cheap remote aggregate; materialize-once is an engine feature).
 
-## Measured across all phases (report-result-a044026.md)
+## COUNT(*) pruning fix: the q21 outlier (commit 6dcc2ca)
 
-| Cell       | SF  | Pre-opt | Join order | +Projection | +CTE fix |
-| ---------- | --- | ------- | ---------- | ----------- | -------- |
-| single     | 0.1 | 4.31x   | 2.47x      | 1.90x       | **1.87x** |
-| single     | 1   | 13.8x*  | 5.62x      | 3.97x       | **2.13x** |
-| fedparquet | 0.1 | 6.47x   | 5.06x      | 2.71x       | **2.62x** |
-| fedparquet | 1   | 18.6x*  | 9.93x      | 5.43x       | **3.49x** |
-| fedpgduck  | 0.1 | 12.01x  | 11.29x     | 6.31x       | **5.84x** |
-| fedpgduck  | 1   | 38.55x  | 23.24x     | 11.36x      | **8.60x** |
+count(*) contributes a ColumnRef('*') to the required-column set, and the
+star guard then kept EVERY scan in the query at full width - q21's two
+EXISTS bodies each shipped all 16 lineitem columns x 6M rows. COUNT(*)
+counts rows and needs no columns: the collector skips count-star calls (a
+genuine star PROJECTION still blocks pruning). The suspected nested-loop
+SEMI/ANTI joins were a non-issue (the engine rewrites them to hash joins
+with filters). q21 3297 -> 365ms; every count(*) query benefits (q13 774
+-> 296ms, q22 431 -> 120ms).
 
-(* = q09 OOM-KILLED in those runs.) All 132 cells correct in every phase
-since the optimizer landed. q15 fedpgduck SF1: 2824 -> 78ms (169x -> 4.4x).
+## Measured across all phases (report-result-6dcc2ca.md)
+
+| Cell       | SF  | Pre-opt | Join order | +Projection | +CTE  | +count(*) |
+| ---------- | --- | ------- | ---------- | ----------- | ----- | --------- |
+| single     | 0.1 | 4.31x   | 2.47x      | 1.90x       | 1.87x | **1.83x** |
+| single     | 1   | 13.8x*  | 5.62x      | 3.97x       | 2.13x | **2.11x** |
+| fedparquet | 0.1 | 6.47x   | 5.06x      | 2.71x       | 2.62x | **2.39x** |
+| fedparquet | 1   | 18.6x*  | 9.93x      | 5.43x       | 3.49x | **2.82x** |
+| fedpgduck  | 0.1 | 12.01x  | 11.29x     | 6.31x       | 5.84x | **4.74x** |
+| fedpgduck  | 1   | 38.55x  | 23.24x     | 11.36x      | 8.60x | **5.10x** |
+
+(* = q09 OOM-KILLED in those runs.) All 132 cells correct in every phase.
+No query in the fair federated cell is above ~11x anymore; the worst are
+q07 479ms/11.1x, q09 950ms/10.2x, q18 783ms/8.6x.
 
 ## Known gaps / next work (in priority order from the data)
 
-1. **q21 (26.5x fedpgduck SF1, 3.2s)** - lineitem multi-self-join with
-   EXISTS/NOT EXISTS; untouched by all three phases. The dominant remaining
-   outlier (next: q09 956ms, q13 774ms, q18 769ms, all under 10x).
-2. **q17 (15x fedpgduck SF1, 0.4s)** - correlated aggregate subquery shape.
-3. **Locality cost term** at the `join_tree_cost` seam: transfer cost =
-   rows x width per source boundary (see git log 063aada for the measured
-   motivation).
-4. **CTE materialize-once** in the engine (per-reference evaluation is now
+1. **q07/q09/q18 (8-11x fedpgduck SF1, 0.5-1s each)**: residual data
+   movement on multi-fact joins - the natural target for the LOCALITY cost
+   term at the `join_tree_cost` seam (transfer = rows x width per source
+   boundary; see git log 063aada for the measured motivation), possibly
+   plus semi-join reduction for non-scan build sides.
+2. **q17 (15x fedpgduck SF1, ~0.4s)** - correlated aggregate subquery shape.
+3. **CTE materialize-once** in the engine (per-reference evaluation is now
    cheap but still duplicated).
-5. **fedqrs missing operators** (unchanged): `PhysicalSingleRowGuard`,
+4. **fedqrs missing operators** (unchanged): `PhysicalSingleRowGuard`,
    `PhysicalUnion`, empty-condition semi-join - 18 xfails.
-6. `enable_decorrelation` config flag is still unwired.
+5. `enable_decorrelation` config flag is still unwired.
 
 ## How to run
 
