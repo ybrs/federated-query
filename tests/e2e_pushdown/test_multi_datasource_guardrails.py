@@ -154,3 +154,30 @@ def test_cross_source_order_by_stays_local(multi_source_env):
     _assert_single_source_scan(products_query, "products")
     assert orders_query.args.get("order") is None
     assert products_query.args.get("order") is None
+    # ORDER BY at the root used to no-op projection pushdown entirely
+    # (the gate lacked a Sort arm): pin that both scans stay NARROW - the
+    # 9-column orders table ships exactly the referenced columns.
+    assert set(select_column_names(orders_query)) == {"order_id", "product_id"}
+    assert set(select_column_names(products_query)) == {"id", "name"}
+
+
+def test_cross_source_derived_table_prunes_inside(multi_source_env):
+    """A cross-source join under a derived table + ORDER BY prunes the scans
+    INSIDE the subquery body (the q07/q09 shape)."""
+    runtime = build_runtime(multi_source_env)
+    sql = (
+        "SELECT big.name, big.order_id FROM ("
+        "SELECT o.order_id AS order_id, p.name AS name, o.quantity AS quantity "
+        "FROM duckdb_orders.main.orders o "
+        "JOIN duckdb_products.main.products p ON o.product_id = p.id"
+        ") AS big WHERE big.quantity > 1 ORDER BY big.name"
+    )
+    document = explain_document(runtime, sql)
+    queries = datasource_query_map(document)
+    assert set(queries) == {"duckdb_orders", "duckdb_products"}
+    # The subquery body references 3 orders columns and 2 products columns;
+    # the 9-column orders scan and 7-column products scan must narrow to them.
+    assert set(select_column_names(queries["duckdb_orders"])) == {
+        "order_id", "product_id", "quantity",
+    }
+    assert set(select_column_names(queries["duckdb_products"])) == {"id", "name"}
