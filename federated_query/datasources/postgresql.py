@@ -213,54 +213,104 @@ class PostgreSQLDataSource(DataSource):
             self._return_connection(conn)
 
     def get_table_statistics(
-        self, schema: str, table: str
+        self, schema: str, table: str, columns: List[str]
     ) -> Optional[TableStatistics]:
-        """Get table statistics from pg_stats."""
+        """Catalog statistics: reltuples for the row count, pg_stats for the
+        requested columns. Pure catalog reads - never a scan of the table."""
         conn = self._get_connection()
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                # Get row count
-                cursor.execute(
-                    f"SELECT reltuples::bigint as row_count FROM pg_class WHERE relname = %s",
-                    (table,),
+                row_count = self._catalog_row_count(cursor, schema, table)
+                column_stats = self._pg_stats_columns(
+                    cursor, schema, table, columns, row_count
                 )
-                row = cursor.fetchone()
-                row_count = row["row_count"] if row else 0
-
-                # Get column statistics
-                cursor.execute(
-                    """
-                    SELECT
-                        attname as column_name,
-                        n_distinct,
-                        null_frac
-                    FROM pg_stats
-                    WHERE schemaname = %s AND tablename = %s
-                    """,
-                    (schema, table),
-                )
-
-                column_stats = {}
-                for row in cursor.fetchall():
-                    col_name = row["column_name"]
-                    # n_distinct is negative for fraction of total rows, positive for absolute count
-                    n_distinct = row["n_distinct"]
-                    if n_distinct < 0:
-                        n_distinct = int(abs(n_distinct) * row_count)
-                    else:
-                        n_distinct = int(n_distinct)
-
-                    # Per-column stats from pg_stats for this column; n_distinct
-                    # was already normalized above from Postgres' signed encoding.
-                    column_stats[col_name] = ColumnStatistics.create(
-                        num_distinct=n_distinct,
-                        null_fraction=row["null_frac"] or 0.0,
-                        avg_width=10,  # Placeholder
-                    )
-
                 return self._build_table_statistics(row_count, column_stats)
         finally:
             self._return_connection(conn)
+
+    def _catalog_row_count(self, cursor, schema: str, table: str) -> Optional[int]:
+        """reltuples of the schema-qualified table, or None when unknown.
+
+        The pg_namespace join is required: reltuples by relname alone would
+        return an arbitrary same-named table from another schema. reltuples is
+        -1 (never vacuumed/analyzed, PG14+) or a missing relation is None -
+        an unknown count is reported honestly, never coerced to 0.
+        """
+        cursor.execute(
+            "SELECT c.reltuples::bigint AS row_count"
+            " FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace"
+            " WHERE n.nspname = %s AND c.relname = %s",
+            (schema, table),
+        )
+        row = cursor.fetchone()
+        if row is None or row["row_count"] < 0:
+            return None
+        return row["row_count"]
+
+    def _pg_stats_columns(
+        self, cursor, schema, table, columns: List[str], row_count: Optional[int]
+    ) -> Dict[str, ColumnStatistics]:
+        """pg_stats rows for exactly the requested columns.
+
+        A column ANALYZE has never seen is simply absent from pg_stats and
+        therefore absent from the result - the estimator substitutes a named
+        default with provenance; the source never fabricates.
+        """
+        if not columns:
+            return {}
+        cursor.execute(
+            "SELECT attname, n_distinct, null_frac, avg_width,"
+            " histogram_bounds::text::text[] AS bounds"
+            " FROM pg_stats"
+            " WHERE schemaname = %s AND tablename = %s AND attname = ANY(%s)",
+            (schema, table, list(columns)),
+        )
+        column_stats: Dict[str, ColumnStatistics] = {}
+        for row in cursor.fetchall():
+            column_stats[row["attname"]] = self._decode_pg_stats_row(row, row_count)
+        return column_stats
+
+    def _decode_pg_stats_row(self, row, row_count: Optional[int]) -> ColumnStatistics:
+        """One pg_stats row decoded into engine column statistics."""
+        min_value, max_value = self._histogram_ends(row["bounds"])
+        # n_distinct decoded from Postgres' signed encoding; min/max are the
+        # histogram's real end points when the column carries a histogram.
+        return ColumnStatistics.create(
+            num_distinct=self._decode_n_distinct(row["n_distinct"], row_count),
+            null_fraction=row["null_frac"] or 0.0,
+            avg_width=row["avg_width"],
+            min_value=min_value,
+            max_value=max_value,
+        )
+
+    def _decode_n_distinct(self, n_distinct, row_count: Optional[int]) -> Optional[int]:
+        """Decode pg_stats.n_distinct: negative = fraction of rows, positive =
+        absolute count. A fraction without a known row count is unknown (None) -
+        multiplying a fraction by a guessed count would fabricate a statistic."""
+        if n_distinct >= 0:
+            return int(n_distinct)
+        if row_count is None:
+            return None
+        return int(abs(n_distinct) * row_count)
+
+    def _histogram_ends(self, bounds):
+        """The first and last histogram bound as Python numbers when the array
+        holds numerics; non-numeric bounds are reported as None (a string
+        min/max is not usable for range-selectivity interpolation)."""
+        if not bounds:
+            return None, None
+        return self._parse_bound(bounds[0]), self._parse_bound(bounds[-1])
+
+    def _parse_bound(self, text: str):
+        """One histogram bound parsed as int, then float; None when neither."""
+        try:
+            return int(text)
+        except ValueError:
+            pass
+        try:
+            return float(text)
+        except ValueError:
+            return None
 
     def execute_query(self, query: str) -> Iterator[pa.RecordBatch]:
         """Execute a query and yield Arrow record batches."""

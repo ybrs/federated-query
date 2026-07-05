@@ -60,6 +60,24 @@ def cost_model(cost_config):
     return CostModel(cost_config)
 
 
+class _StatsSource:
+    """A fake datasource serving canned TableStatistics by (schema, table)."""
+
+    def __init__(self, stats_by_table):
+        self.stats_by_table = stats_by_table
+
+    def get_table_statistics(self, schema, table, columns):
+        """Serve the canned statistics regardless of the requested columns."""
+        return self.stats_by_table[(schema, table)]
+
+
+def _seeded_collector(datasource, stats_by_table):
+    """A StatisticsCollector whose catalog holds one fake stats-serving source."""
+    catalog = Catalog()
+    catalog.datasources[datasource] = _StatsSource(stats_by_table)
+    return StatisticsCollector(catalog)
+
+
 class TestSelectivityEstimation:
     """Test selectivity estimation for various predicates."""
 
@@ -387,10 +405,9 @@ class TestCostModelWithStatistics:
 
     def test_scan_with_statistics(self, cost_config, table_stats):
         """Test scan cardinality with statistics."""
-        catalog = Catalog()
-        stats_collector = StatisticsCollector(catalog)
-        key = ("test_ds", "public", "users")
-        stats_collector.cache[key] = table_stats
+        stats_collector = _seeded_collector(
+            "test_ds", {("public", "users"): table_stats}
+        )
 
         cost_model = CostModel(cost_config, stats_collector)
         scan = Scan(
@@ -405,10 +422,9 @@ class TestCostModelWithStatistics:
 
     def test_scan_with_filter_pushdown(self, cost_config, table_stats):
         """Test scan with pushed-down filter."""
-        catalog = Catalog()
-        stats_collector = StatisticsCollector(catalog)
-        key = ("test_ds", "public", "users")
-        stats_collector.cache[key] = table_stats
+        stats_collector = _seeded_collector(
+            "test_ds", {("public", "users"): table_stats}
+        )
 
         cost_model = CostModel(cost_config, stats_collector)
         predicate = BinaryOp(
@@ -580,9 +596,6 @@ class TestOperatorCostEstimation:
 
     def test_cost_increases_with_cardinality(self, cost_config, table_stats):
         """Test that cost increases with larger tables."""
-        catalog = Catalog()
-        stats_collector = StatisticsCollector(catalog)
-
         small_stats = TableStatistics(
             row_count=100, total_size_bytes=10000, column_stats=table_stats.column_stats
         )
@@ -592,8 +605,10 @@ class TestOperatorCostEstimation:
             column_stats=table_stats.column_stats,
         )
 
-        stats_collector.cache[("test_ds", "public", "small")] = small_stats
-        stats_collector.cache[("test_ds", "public", "large")] = large_stats
+        stats_collector = _seeded_collector(
+            "test_ds",
+            {("public", "small"): small_stats, ("public", "large"): large_stats},
+        )
 
         cost_model = CostModel(cost_config, stats_collector)
 

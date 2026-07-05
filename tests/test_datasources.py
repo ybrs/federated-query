@@ -137,8 +137,8 @@ def test_duckdb_execute_filtered_query(duckdb_datasource):
 
 
 def test_duckdb_get_table_statistics(duckdb_datasource):
-    """Test getting table statistics."""
-    stats = duckdb_datasource.get_table_statistics("main", "test_table")
+    """Test getting table statistics for a requested column."""
+    stats = duckdb_datasource.get_table_statistics("main", "test_table", ["id"])
 
     assert stats is not None
     assert stats.row_count == 3

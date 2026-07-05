@@ -37,6 +37,26 @@ def _load_table(connection, table, schema):
     return rows
 
 
+def _analyze(options):
+    """Run ANALYZE so pg_class.reltuples and pg_stats are populated.
+
+    The engine's cost-based optimizer reads its statistics from PostgreSQL's
+    catalogs; a freshly CTAS'd table reports reltuples = -1 and has no pg_stats
+    rows until ANALYZE runs, which would leave the optimizer on defaults.
+    """
+    import psycopg2
+
+    connection = psycopg2.connect(
+        host=options.pg_host, port=options.pg_port, dbname=options.pg_database,
+        user=options.pg_user, password=options.pg_password,
+    )
+    connection.autocommit = True
+    with connection.cursor() as cursor:
+        cursor.execute("ANALYZE")
+    connection.close()
+    print("analyzed: pg_class.reltuples and pg_stats are populated")
+
+
 def load(options):
     """Attach the DuckDB dataset (read-only) and PostgreSQL, load every table.
 
@@ -55,6 +75,7 @@ def load(options):
         rows = _load_table(connection, table, options.pg_schema)
         print("loaded {0:10} {1:>10} rows".format(table, rows))
     connection.close()
+    _analyze(options)
 
 
 def _parse_args():

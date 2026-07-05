@@ -229,16 +229,23 @@ class DataSource(ABC):
 
     @abstractmethod
     def get_table_statistics(
-        self, schema: str, table: str
+        self, schema: str, table: str, columns: List[str]
     ) -> Optional[TableStatistics]:
-        """Get statistics for a table.
+        """Get catalog statistics for a table, lazily per column.
+
+        ``columns`` names exactly the columns the optimizer needs statistics
+        for (join keys and filtered columns); an empty list requests the row
+        count only. A source returns only what its catalog can provide
+        cheaply and honestly: unknown values are None / omitted columns,
+        never fabricated.
 
         Args:
             schema: Schema name
             table: Table name
+            columns: Column names to fetch column-level statistics for
 
         Returns:
-            Table statistics if available, None otherwise
+            Table statistics if the source supports them, None otherwise
         """
         pass
 
@@ -309,11 +316,13 @@ class DataSource(ABC):
 
     def _build_table_statistics(self, row_count, column_stats) -> TableStatistics:
         """Wrap a row count and per-column stats into TableStatistics."""
+        size_bytes = row_count * 100 if row_count is not None else 0
         # Table-level stats for cost estimation; byte size is approximated from
-        # the row count since sources here do not report an exact size.
+        # the row count (0 when the row count itself is unknown) since sources
+        # here do not report an exact size.
         return TableStatistics.create(
             row_count=row_count,
-            total_size_bytes=row_count * 100,
+            total_size_bytes=size_bytes,
             column_stats=column_stats,
         )
 

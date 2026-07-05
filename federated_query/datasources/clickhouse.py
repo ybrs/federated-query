@@ -168,36 +168,36 @@ class ClickHouseDataSource(DataSource):
         )
 
     def get_table_statistics(
-        self, schema: str, table: str
+        self, schema: str, table: str, columns: List[str]
     ) -> Optional[TableStatistics]:
-        """Row count + per-column distinct/null fraction (one scan in ClickHouse)."""
-        metadata = self.get_table_metadata(schema, table)
+        """Row count + distinct/null fraction for the REQUESTED columns only,
+        gathered in one scan (ClickHouse has no cheap per-column catalog NDV)."""
         row = self._client.query(
-            self._statistics_query(schema, table, metadata)
+            self._statistics_query(schema, table, columns)
         ).result_rows[0]
         row_count = row[0]
-        column_stats = self._column_statistics(metadata, row, row_count)
+        column_stats = self._column_statistics(columns, row, row_count)
         return self._build_table_statistics(row_count, column_stats)
 
-    def _statistics_query(self, schema, table, metadata: TableMetadata) -> str:
-        """Build one query: count() plus uniqExact/nulls for every column."""
+    def _statistics_query(self, schema, table, columns: List[str]) -> str:
+        """Build one query: count() plus uniqExact/nulls per requested column."""
         parts = ["count()"]
-        for column in metadata.columns:
-            quoted = f'"{column.name}"'
+        for column in columns:
+            quoted = f'"{column}"'
             parts.append(f"uniqExact({quoted})")
             parts.append(f"countIf({quoted} IS NULL)")
         return f'SELECT {", ".join(parts)} FROM "{schema}"."{table}"'
 
     def _column_statistics(
-        self, metadata: TableMetadata, row, row_count: int
+        self, columns: List[str], row, row_count: int
     ) -> Dict[str, ColumnStatistics]:
         """Unpack the stats row (count, then distinct/null pairs per column)."""
         stats: Dict[str, ColumnStatistics] = {}
         index = 1
-        for column in metadata.columns:
+        for column in columns:
             distinct, nulls = row[index], row[index + 1]
             index += 2
-            stats[column.name] = self._build_column_statistics(
+            stats[column] = self._build_column_statistics(
                 distinct, nulls, row_count
             )
         return stats

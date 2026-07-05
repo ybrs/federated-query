@@ -24,6 +24,7 @@ from ..plan.expressions import (
     UnaryOpType,
 )
 from ..config.config import CostConfig
+from ..optimizer.pushdown import bare_names
 from ..optimizer.statistics import StatisticsCollector
 from ..datasources.base import TableStatistics
 
@@ -75,9 +76,10 @@ class CostModel:
             return 1000
 
         stats = self.stats_collector.get_table_statistics(
-            scan.datasource, scan.schema_name, scan.table_name
+            scan.datasource, scan.schema_name, scan.table_name,
+            self._scan_stat_columns(scan),
         )
-        if not stats:
+        if not stats or stats.row_count is None:
             return 1000
 
         base_card = stats.row_count
@@ -86,6 +88,13 @@ class CostModel:
             return max(1, int(base_card * selectivity))
 
         return base_card
+
+    def _scan_stat_columns(self, scan: Scan) -> list:
+        """The columns a scan's estimate needs statistics for: the ones its
+        pushed-down filters reference (selectivity is computed from them)."""
+        if not scan.filters:
+            return []
+        return sorted(bare_names(scan.filters))
 
     def _estimate_filter_cardinality(self, filter_node: Filter) -> int:
         """Estimate cardinality after filtering."""

@@ -105,43 +105,71 @@ class DuckDBDataSource(DataSource):
         return self._metadata_from_information_schema(schema, table, result)
 
     def get_table_statistics(
-        self, schema: str, table: str
+        self, schema: str, table: str, columns: List[str]
     ) -> Optional[TableStatistics]:
-        """Get table statistics."""
-        result = self.connection.execute(
-            f"SELECT COUNT(*) FROM {schema}.{table}"
-        ).fetchone()
-        row_count = result[0] if result else 0
-
-        metadata = self.get_table_metadata(schema, table)
-        column_stats = self._collect_column_statistics(
-            schema, table, metadata, row_count
+        """Catalog row count plus one approximate stats scan for the requested
+        columns only - never a full COUNT(DISTINCT) pass over every column."""
+        row_count = self._catalog_row_count(schema, table)
+        column_stats = self._approx_column_statistics(
+            schema, table, columns, row_count
         )
-
         return self._build_table_statistics(row_count, column_stats)
 
-    def _collect_column_statistics(
-        self, schema: str, table: str, metadata: TableMetadata, row_count: int
-    ) -> Dict[str, ColumnStatistics]:
-        """Collect statistics for each column."""
-        column_stats = {}
-        for col in metadata.columns:
-            stats = self._get_single_column_stats(schema, table, col.name, row_count)
-            if stats:
-                column_stats[col.name] = stats
-        return column_stats
-
-    def _get_single_column_stats(
-        self, schema: str, table: str, col_name: str, row_count: int
-    ) -> Optional[ColumnStatistics]:
-        """Get statistics for a single column."""
+    def _catalog_row_count(self, schema: str, table: str) -> int:
+        """The table's row count from duckdb_tables() - a catalog read, not a
+        scan (exact for native tables). Raises for a table DuckDB does not know:
+        answering with a guess would silently mis-cost every plan over it."""
         result = self.connection.execute(
-            f"SELECT COUNT(DISTINCT {col_name}), COUNT(*) - COUNT({col_name}) FROM {schema}.{table}"
+            "SELECT estimated_size FROM duckdb_tables()"
+            " WHERE schema_name = ? AND table_name = ?",
+            [schema, table],
         ).fetchone()
+        if result is None:
+            raise ValueError(
+                f"duckdb_tables() knows no table {schema}.{table} on {self.name}"
+            )
+        return result[0]
 
-        n_distinct = result[0] if result else 0
-        null_count = result[1] if result else 0
-        return self._build_column_statistics(n_distinct, null_count, row_count)
+    def _approx_column_statistics(
+        self, schema: str, table: str, columns: List[str], row_count: int
+    ) -> Dict[str, ColumnStatistics]:
+        """Approximate NDV / nulls / min / max for the requested columns, all
+        gathered in ONE vectorized aggregate scan over the table."""
+        if not columns:
+            return {}
+        row = self.connection.execute(
+            self._column_stats_query(schema, table, columns)
+        ).fetchone()
+        return self._unpack_column_stats(columns, row, row_count)
+
+    def _column_stats_query(self, schema: str, table: str, columns: List[str]) -> str:
+        """Build the single aggregate scan: 4 measures per requested column."""
+        parts = []
+        for column in columns:
+            quoted = f'"{column}"'
+            parts.append(f"approx_count_distinct({quoted})")
+            parts.append(f"count({quoted})")
+            parts.append(f"min({quoted})")
+            parts.append(f"max({quoted})")
+        return f'SELECT {", ".join(parts)} FROM "{schema}"."{table}"'
+
+    def _unpack_column_stats(
+        self, columns: List[str], row, row_count: int
+    ) -> Dict[str, ColumnStatistics]:
+        """Unpack the stats row (ndv, non-null count, min, max per column)."""
+        stats: Dict[str, ColumnStatistics] = {}
+        for index, column in enumerate(columns):
+            ndv, non_null, min_value, max_value = row[index * 4:index * 4 + 4]
+            null_fraction = (
+                (row_count - non_null) / row_count if row_count > 0 else 0.0
+            )
+            # Per-column catalog statistics from the single approximate scan;
+            # avg_width stays a placeholder (DuckDB exposes no cheap width).
+            stats[column] = ColumnStatistics.create(
+                num_distinct=ndv, null_fraction=null_fraction, avg_width=10,
+                min_value=min_value, max_value=max_value,
+            )
+        return stats
 
     def execute_query(self, query: str) -> Iterator[pa.RecordBatch]:
         """Execute query and yield Arrow record batches."""
