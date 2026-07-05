@@ -1,4 +1,4 @@
-# Status: four optimizer fixes live; fair federated gap 38.6x -> 5.1x
+# Status: five optimizer phases live; locality term landed, key injection next
 
 State of the work. Facts only: what exists, what passes, what is measured,
 what is not done. Previous phase (Rust cutover, N-K decorrelation, merge-engine
@@ -13,7 +13,7 @@ merge-engine-datafusion
             `- feature/cost-based-optimizer   <-- HEAD (this document)
 ```
 
-Test suite: **1128 passed, 3 skipped, 39 xfailed, 0 failed**
+Test suite: **1133 passed, 3 skipped, 39 xfailed, 0 failed**
 (`POSTGRES_DB=duckpoc python -m pytest -q`). `make lint` green.
 
 ## What was built on this branch
@@ -148,6 +148,21 @@ with filters). q21 3297 -> 365ms; every count(*) query benefits (q13 774
 (* = q09 OOM-KILLED in those runs.) All 132 cells correct in every phase.
 No query in the fair federated cell is above ~11x anymore; the worst are
 q07 479ms/11.1x, q09 950ms/10.2x, q18 783ms/8.6x.
+
+## Locality term: LANDED (phase A, commits 1efefc7 + 39a1c8f)
+
+The DP charges rows crossing a source boundary (TRANSFER_WEIGHT x transfer)
+on top of C_out; only the leading same-source run of a left-deep component
+collapses into one remote query, and candidates track their island state
+(subset-determined, so the DP key stays the plain subset - proof in the
+_Candidate docstring). Gate (report-result-39a1c8f.md): fedpgduck SF1
+5594 -> 5209ms (5.01x), all 132 cells correct. q05 439 -> 195ms (its duck
+island lineitem JOIN orders now ships 912k rows instead of 6.2M), q03 -123ms,
+q10 -108ms, q07 -63ms. KNOWN trade-off, deliberate: q08 +134ms (both
+federated cells) and q09 fedparquet +299ms - the ultra-selective part filter
+used to cut intermediates before the fact join; the island defers it. Phase B
+(generalized key injection) targets exactly that shape; if q08 is still
+regressed after B, recalibrate TRANSFER_WEIGHT.
 
 ## Known gaps / next work (in priority order from the data)
 
