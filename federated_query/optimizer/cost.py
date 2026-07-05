@@ -1,5 +1,6 @@
 """Cost model for query optimization."""
 
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..plan.logical import (
@@ -801,12 +802,25 @@ class CostModel:
         """FULL preserves both sides; SEMI/ANTI partition the left side."""
         if join_type == JoinType.FULL:
             return max(left_rows + right_rows - inner, left_rows, right_rows)
-        matched = min(left_rows, inner)
+        matched = self._semi_matched_rows(inner, left_rows)
         if join_type == JoinType.SEMI:
-            return matched
+            return max(1, matched)
         if join_type == JoinType.ANTI:
-            return max(0, left_rows - matched)
+            return max(1, left_rows - matched)
         raise ValueError(f"no join-cardinality clamp for join type {join_type}")
+
+    def _semi_matched_rows(self, inner: int, left_rows: int) -> int:
+        """Expected DISTINCT left rows with at least one match, for a semi/anti
+        join. min(left, inner) would count match MULTIPLICITY and saturate to
+        left_rows for a many-to-many inner (inner >= left), spuriously emptying
+        an ANTI join. The occupancy estimate left * (1 - e^-fanout), with
+        fanout = inner/left the average matches per left row, never saturates:
+        it stays ~inner when inner << left and approaches (not equals) left as
+        the fanout grows."""
+        if left_rows <= 0:
+            return 0
+        fanout = inner / left_rows
+        return int(left_rows * (1.0 - math.exp(-fanout)))
 
     def _tracked_selectivity(
         self, predicate: Expression, stats: Optional[TableStatistics], target: str
