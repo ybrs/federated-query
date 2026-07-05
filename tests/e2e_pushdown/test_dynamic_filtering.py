@@ -178,3 +178,72 @@ def test_large_key_set_against_duckdb_probe_is_correct():
         "SELECT sum(p.v) FROM keys_side d JOIN probe p ON d.k = p.k"
     ).fetchone()[0]
     assert result.column("s").to_pylist() == [expected]
+
+
+def test_pushed_island_probe_receives_key_injection():
+    """The composition of locality + reduction: the facts island collapses
+    into ONE remote query, and the dim side's keys inject into THAT query
+    (its raw SQL wrapped as a derived table). This is the q05 endgame: the
+    island ships only rows matching the dim keys."""
+    import duckdb as duckdb_module
+    from federated_query.catalog import Catalog
+    from federated_query.cli.fedq import FedQRuntime
+    from federated_query.config import Config
+    from federated_query.datasources.duckdb import DuckDBDataSource
+    from tests.duckdb_tmp import duckdb_path
+
+    dims = DuckDBDataSource("dims", {"path": duckdb_path(), "read_only": False})
+    dims.connect()
+    dims.connection.execute(
+        "CREATE TABLE supplier (s_id INTEGER, s_flag VARCHAR);"
+        "INSERT INTO supplier SELECT g, 'F' || (g % 3) FROM range(0, 100) t(g);"
+    )
+    facts = DuckDBDataSource("facts", {"path": duckdb_path(), "read_only": False})
+    facts.connect()
+    facts.connection.execute(
+        "CREATE TABLE orders (o_id INTEGER, o_flag INTEGER);"
+        "INSERT INTO orders SELECT g, g % 10 FROM range(0, 2000) t(g);"
+        "CREATE TABLE lineitem (l_o INTEGER, l_s INTEGER, l_v INTEGER);"
+        "INSERT INTO lineitem SELECT g % 2000, g % 100, g FROM range(0, 10000) t(g);"
+    )
+    catalog = Catalog()
+    catalog.register_datasource(dims)
+    catalog.register_datasource(facts)
+    catalog.load_metadata()
+    runtime = FedQRuntime(catalog, Config())
+    sql = (
+        "SELECT sum(l.l_v) AS s "
+        "FROM dims.main.supplier s, facts.main.orders o, facts.main.lineitem l "
+        "WHERE s.s_id = l.l_s AND o.o_id = l.l_o "
+        "AND o.o_flag = 3 AND s.s_flag = 'F1'"
+    )
+    plan = runtime.query_executor._plan_pipeline(sql, None)
+    ir = build_ir(plan)
+    raw_injections = []
+    for step in ir["steps"]:
+        if step.get("op") == "injected_scan" and "raw_sql" in step["scan"]:
+            raw_injections.append(step)
+    assert raw_injections, f"no raw-sql injection; steps: {ir['steps']}"
+    assert step_targets_facts_island(raw_injections[0])
+    result = runtime.execute(sql)
+    oracle = duckdb_module.connect()
+    oracle.execute(
+        "CREATE TABLE supplier AS SELECT g AS s_id, 'F' || (g % 3) AS s_flag"
+        " FROM range(0, 100) t(g);"
+        "CREATE TABLE orders AS SELECT g AS o_id, g % 10 AS o_flag"
+        " FROM range(0, 2000) t(g);"
+        "CREATE TABLE lineitem AS SELECT g % 2000 AS l_o, g % 100 AS l_s, g AS l_v"
+        " FROM range(0, 10000) t(g);"
+    )
+    expected = oracle.execute(
+        "SELECT sum(l.l_v) FROM supplier s, orders o, lineitem l "
+        "WHERE s.s_id = l.l_s AND o.o_id = l.l_o "
+        "AND o.o_flag = 3 AND s.s_flag = 'F1'"
+    ).fetchone()[0]
+    assert result.column("s").to_pylist() == [expected]
+
+
+def step_targets_facts_island(step):
+    """The injected raw query must be the facts island (joins both tables)."""
+    raw = step["scan"]["raw_sql"].upper()
+    return "ORDERS" in raw and "LINEITEM" in raw and step["datasource"] == "facts"

@@ -750,7 +750,7 @@ def _can_reduce(join):
         return False
     if len(join.left_keys) != 1 or len(join.right_keys) != 1:
         return False
-    return _injectable_scan(join.left) or _injectable_scan(join.right)
+    return _probe_preference(join.left) > 0 or _probe_preference(join.right) > 0
 
 
 def _injectable_scan(node):
@@ -761,6 +761,18 @@ def _injectable_scan(node):
     if any((node.aggregates, node.group_by, node.grouping_sets)):
         return False
     return not any((node.order_by_keys, node.limit is not None, node.offset))
+
+
+def _probe_preference(node) -> int:
+    """Rank a node as the injection target: a pushed remote query first (it
+    is usually the collapsed fact island - the big side the reduction exists
+    to cut; the engine wraps its SQL as a derived table and filters its
+    output columns), then a plain scan, then nothing."""
+    if isinstance(node, PhysicalRemoteQuery):
+        return 2
+    if _injectable_scan(node):
+        return 1
+    return 0
 
 
 def _emit_reduced_join(join, ctx):
@@ -777,13 +789,13 @@ def _orient_join(join):
     """Pick build/probe sides and their join keys.
 
     When both sides are plain scans the planner's build_side choice stands.
-    Otherwise the injectable scan is the PROBE (the reduction exists to cut
-    the big base-table read) and the computed side donates the keys."""
+    Otherwise the side ranking higher as an injection target is the PROBE
+    (the reduction exists to cut the big read) and the other donates keys."""
     if _injectable_scan(join.left) and _injectable_scan(join.right):
         if join.build_side == "left":
             return join.left, join.right, join.left_keys[0], join.right_keys[0]
         return join.right, join.left, join.right_keys[0], join.left_keys[0]
-    if _injectable_scan(join.right):
+    if _probe_preference(join.right) >= _probe_preference(join.left):
         return join.left, join.right, join.left_keys[0], join.right_keys[0]
     return join.right, join.left, join.right_keys[0], join.left_keys[0]
 
@@ -832,9 +844,18 @@ def _emit_injected_scan(ctx, probe_child, inject_col, keys_binding, binding):
     """A probe scan with the build's keys pushed in as `col IN (...)`."""
     ctx.steps.append({
         "op": "injected_scan", "datasource": probe_child.datasource,
-        "scan": structured_scan_spec(probe_child), "inject_column": inject_col,
+        "scan": _injected_probe_spec(probe_child), "inject_column": inject_col,
         "keys_from": keys_binding, "binding": binding,
     })
+
+
+def _injected_probe_spec(probe_child):
+    """A structured spec for a plain scan; the pre-rendered SQL for a pushed
+    remote query (the engine wraps it as a derived table and applies the
+    key filter to its OUTPUT columns)."""
+    if isinstance(probe_child, PhysicalRemoteQuery):
+        return raw_scan_spec(probe_child)
+    return structured_scan_spec(probe_child)
 
 
 def _join_fragment(join, kind):
