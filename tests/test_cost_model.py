@@ -628,3 +628,211 @@ class TestOperatorCostEstimation:
         small_cost = cost_model.estimate_logical_plan_cost(small_scan)
         large_cost = cost_model.estimate_logical_plan_cost(large_scan)
         assert large_cost > small_cost
+
+
+def _tpch_like_stats():
+    """SF1-shaped statistics: orders (1.5M, unique o_custkey domain 150k)
+    joined to customer (150k, unique c_custkey), with a 5-value flag column."""
+    orders = TableStatistics(
+        row_count=1_500_000,
+        total_size_bytes=0,
+        column_stats={
+            "o_custkey": ColumnStatistics(
+                num_distinct=150_000, null_fraction=0.0, avg_width=8
+            ),
+            "o_flag": ColumnStatistics(
+                num_distinct=5, null_fraction=0.0, avg_width=1
+            ),
+        },
+    )
+    customer = TableStatistics(
+        row_count=150_000,
+        total_size_bytes=0,
+        column_stats={
+            "c_custkey": ColumnStatistics(
+                num_distinct=150_000, null_fraction=0.0, avg_width=8
+            ),
+            "c_age": ColumnStatistics(
+                num_distinct=100, null_fraction=0.0, avg_width=4,
+                min_value=0, max_value=100,
+            ),
+        },
+    )
+    return {("public", "orders"): orders, ("public", "customer"): customer}
+
+
+def _provenance_model(cost_config):
+    """A CostModel over the TPC-H-like seeded statistics."""
+    collector = _seeded_collector("test_ds", _tpch_like_stats())
+    return CostModel(cost_config, collector)
+
+
+def _scan(table, columns, alias=None, filters=None):
+    """A qualified scan of a seeded test table."""
+    return Scan(
+        datasource="test_ds", schema_name="public", table_name=table,
+        columns=columns, alias=alias, filters=filters,
+    )
+
+
+def _custkey_join(join_type=JoinType.INNER, left_filters=None):
+    """orders JOIN customer ON o.o_custkey = c.c_custkey (qualified refs)."""
+    condition = BinaryOp(
+        op=BinaryOpType.EQ,
+        left=ColumnRef(table="o", column="o_custkey", data_type=DataType.INTEGER),
+        right=ColumnRef(table="c", column="c_custkey", data_type=DataType.INTEGER),
+    )
+    return Join(
+        left=_scan("orders", ["o_custkey", "o_flag"], alias="o",
+                   filters=left_filters),
+        right=_scan("customer", ["c_custkey", "c_age"], alias="c"),
+        join_type=join_type,
+        condition=condition,
+    )
+
+
+class TestProvenanceEstimate:
+    """The provenance-carrying estimate() with the NDV join formula."""
+
+    def test_inner_join_uses_ndv_formula(self, cost_config):
+        """1.5M orders x 150k customer on custkey is ~1.5M rows - the NDV
+        formula, not the old 0.1-of-cross-product guess (225 billion * 0.1)."""
+        model = _provenance_model(cost_config)
+        estimate = model.estimate(_custkey_join())
+        assert estimate.rows == 1_500_000
+        assert estimate.defaults_used == []
+
+    def test_join_ndv_clamped_by_filtered_side(self, cost_config):
+        """A filtered probe side cannot have more distinct keys than rows:
+        orders filtered to 1/5 -> 300k rows; ndv(o_custkey) clamps 150k -> ...
+        rows = 300k * 150k / max(150k, 150k) = 300k."""
+        model = _provenance_model(cost_config)
+        flag_filter = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef(table="o", column="o_flag", data_type=DataType.VARCHAR),
+            right=Literal(value="F", data_type=DataType.VARCHAR),
+        )
+        estimate = model.estimate(_custkey_join(left_filters=flag_filter))
+        assert estimate.rows == 300_000
+
+    def test_semi_join_bounded_by_left(self, cost_config):
+        """SEMI keeps at most the left side's rows."""
+        model = _provenance_model(cost_config)
+        estimate = model.estimate(_custkey_join(join_type=JoinType.SEMI))
+        assert estimate.rows <= 1_500_000
+
+    def test_left_join_keeps_left_rows(self, cost_config):
+        """LEFT output is at least the left side's rows."""
+        model = _provenance_model(cost_config)
+        estimate = model.estimate(_custkey_join(join_type=JoinType.LEFT))
+        assert estimate.rows >= 1_500_000
+
+    def test_cross_join_is_product(self, cost_config):
+        """CROSS (no condition) is the plain product of the sides."""
+        model = _provenance_model(cost_config)
+        join = Join(
+            left=_scan("orders", ["o_custkey"], alias="o"),
+            right=_scan("customer", ["c_custkey"], alias="c"),
+            join_type=JoinType.CROSS,
+            condition=None,
+        )
+        estimate = model.estimate(join)
+        assert estimate.rows == 1_500_000 * 150_000
+
+    def test_missing_row_count_default_recorded(self, cost_config):
+        """A table whose source honestly reports row_count=None (never
+        analyzed) estimates from DEFAULT_ROW_COUNT and says so."""
+        stats = _tpch_like_stats()
+        stats[("public", "unknown_t")] = TableStatistics(
+            row_count=None, total_size_bytes=0, column_stats={}
+        )
+        collector = _seeded_collector("test_ds", stats)
+        model = CostModel(cost_config, collector)
+        scan = Scan(
+            datasource="test_ds", schema_name="public", table_name="unknown_t",
+            columns=["x"],
+        )
+        estimate = model.estimate(scan)
+        assert estimate.rows == 1000
+        assert any("unknown_t" in entry for entry in estimate.defaults_used)
+
+    def test_unknown_ndv_defaults_with_provenance(self, cost_config):
+        """A join key without NDV statistics estimates from the NDV default
+        and records exactly which column was defaulted."""
+        stats = _tpch_like_stats()
+        no_ndv = TableStatistics(
+            row_count=150_000,
+            total_size_bytes=0,
+            column_stats={
+                "c_custkey": ColumnStatistics(
+                    num_distinct=None, null_fraction=0.0, avg_width=8
+                ),
+            },
+        )
+        stats[("public", "customer")] = no_ndv
+        collector = _seeded_collector("test_ds", stats)
+        model = CostModel(cost_config, collector)
+        estimate = model.estimate(_custkey_join())
+        joined = " ".join(estimate.defaults_used)
+        assert "c_custkey" in joined
+        assert estimate.rows > 0
+
+    def test_range_interpolation_from_min_max(self, cost_config):
+        """c_age <= 50 over min 0 / max 100 halves the scan, instead of the
+        flat range default."""
+        model = _provenance_model(cost_config)
+        predicate = BinaryOp(
+            op=BinaryOpType.LTE,
+            left=ColumnRef(table="c", column="c_age", data_type=DataType.INTEGER),
+            right=Literal(value=50, data_type=DataType.INTEGER),
+        )
+        scan = _scan("customer", ["c_custkey", "c_age"], alias="c",
+                     filters=predicate)
+        estimate = model.estimate(scan)
+        assert estimate.rows == 75_000
+
+    def test_pushed_aggregate_scan_estimates_groups(self, cost_config):
+        """A scan with a pushed-down GROUP BY is costed as its group count
+        (ndv of the key), not as the raw table."""
+        model = _provenance_model(cost_config)
+        scan = Scan(
+            datasource="test_ds", schema_name="public", table_name="orders",
+            columns=["o_flag"], alias="o",
+            group_by=[ColumnRef(table="o", column="o_flag",
+                                data_type=DataType.VARCHAR)],
+            aggregates=[ColumnRef(table="o", column="o_flag",
+                                  data_type=DataType.VARCHAR)],
+        )
+        estimate = model.estimate(scan)
+        assert estimate.rows == 5
+
+    def test_aggregate_groups_from_key_ndv(self, cost_config):
+        """An Aggregate's output is the product of its group-key NDVs,
+        clamped by its input size."""
+        model = _provenance_model(cost_config)
+        aggregate = Aggregate(
+            input=_scan("orders", ["o_custkey", "o_flag"], alias="o"),
+            group_by=[ColumnRef(table="o", column="o_flag",
+                                data_type=DataType.VARCHAR)],
+            aggregates=[],
+            output_names=["o_flag"],
+        )
+        estimate = model.estimate(aggregate)
+        assert estimate.rows == 5
+
+    def test_estimate_raises_on_unknown_node(self, cost_config):
+        """estimate() must raise for a plan node it has no rule for."""
+        model = _provenance_model(cost_config)
+
+        class _Strange:
+            pass
+
+        with pytest.raises(ValueError):
+            model.estimate(_Strange())
+
+    def test_join_tree_cost_sums_join_outputs(self, cost_config):
+        """The C_out cost of a tree is the sum of its join output estimates."""
+        model = _provenance_model(cost_config)
+        join = _custkey_join()
+        cost = model.join_tree_cost(join)
+        assert cost == 1_500_000

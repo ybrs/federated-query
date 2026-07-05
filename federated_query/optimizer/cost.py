@@ -1,6 +1,7 @@
 """Cost model for query optimization."""
 
-from typing import Dict, Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
 from ..plan.logical import (
     LogicalPlanNode,
     Scan,
@@ -10,6 +11,7 @@ from ..plan.logical import (
     Aggregate,
     Limit,
     Sort,
+    SubqueryScan,
     Union,
     JoinType,
 )
@@ -22,8 +24,19 @@ from ..plan.expressions import (
     Literal,
     BinaryOpType,
     UnaryOpType,
+    split_conjuncts,
 )
 from ..config.config import CostConfig
+from ..optimizer.estimate_defaults import (
+    DEFAULT_EQ_SELECTIVITY,
+    DEFAULT_LIKE_SELECTIVITY,
+    DEFAULT_NDV_FRACTION,
+    DEFAULT_NULL_FRACTION,
+    DEFAULT_RANGE_SELECTIVITY,
+    DEFAULT_ROW_COUNT,
+    CardinalityEstimate,
+    combine_defaults,
+)
 from ..optimizer.pushdown import bare_names
 from ..optimizer.statistics import StatisticsCollector
 from ..datasources.base import TableStatistics
@@ -349,6 +362,455 @@ class CostModel:
         output_card = self._estimate_limit_cardinality(limit)
         cpu_cost = output_card * self.config.cpu_tuple_cost
         return cpu_cost
+
+    # ---- provenance-carrying estimation (cost-based join ordering) ----
+
+    def estimate(self, plan: LogicalPlanNode) -> CardinalityEstimate:
+        """Cardinality estimate of a subtree, carrying the provenance of every
+        default that fed it. Unknown node types raise: a silently-guessed
+        cardinality for an unmodeled operator would corrupt join ordering."""
+        if isinstance(plan, Scan):
+            return self._estimate_scan_tracked(plan)
+        if isinstance(plan, Filter):
+            return self._estimate_filter_tracked(plan)
+        if isinstance(plan, (Projection, Sort, SubqueryScan)):
+            return self.estimate(plan.input)
+        if isinstance(plan, Join):
+            return self._estimate_join_tracked(plan)
+        if isinstance(plan, Aggregate):
+            return self._estimate_aggregate_tracked(plan)
+        if isinstance(plan, Limit):
+            return self._estimate_limit_tracked(plan)
+        raise ValueError(f"estimate has no rule for plan node {type(plan).__name__}")
+
+    def join_tree_cost(self, plan: LogicalPlanNode) -> float:
+        """C_out: the sum of every join's estimated output rows in a subtree.
+
+        THE SEAM for richer costing: a locality/network term (penalizing
+        cross-source joins, rewarding same-source adjacency that pushes down
+        as one remote query) is added here, without touching the enumerator.
+        """
+        total = 0.0
+        if isinstance(plan, Join):
+            total += self.estimate(plan).rows
+        for child in plan.children():
+            total += self.join_tree_cost(child)
+        return total
+
+    def _estimate_scan_tracked(self, scan: Scan) -> CardinalityEstimate:
+        """Scan estimate: stats row count x filter selectivity, then pushed-
+        down grouping when the scan carries a remote aggregate."""
+        stats = self._scan_stats(scan)
+        rows, defaults = self._tracked_base_rows(scan, stats)
+        if scan.filters is not None:
+            selectivity, filter_defaults = self._tracked_selectivity(
+                scan.filters, stats, self._scan_target(scan)
+            )
+            rows = max(1, int(rows * selectivity))
+            defaults = defaults + filter_defaults
+        if scan.group_by:
+            return self._tracked_scan_groups(scan, stats, rows, defaults)
+        # A leaf estimate straight from source statistics (or the recorded
+        # defaults); every non-leaf estimate above is derived from these.
+        return CardinalityEstimate.create(rows=rows, defaults_used=defaults)
+
+    def _scan_stats(self, scan: Scan) -> Optional[TableStatistics]:
+        """The scan's table statistics covering its filter and group columns."""
+        if not self.stats_collector:
+            return None
+        return self.stats_collector.get_table_statistics(
+            scan.datasource, scan.schema_name, scan.table_name,
+            self._scan_needed_columns(scan),
+        )
+
+    def _scan_needed_columns(self, scan: Scan) -> List[str]:
+        """The columns a scan's estimate reads stats for: filter + group keys."""
+        needed = set()
+        if scan.filters is not None:
+            needed.update(bare_names(scan.filters))
+        for key in scan.group_by or []:
+            needed.update(bare_names(key))
+        return sorted(needed)
+
+    def _scan_target(self, scan: Scan) -> str:
+        """The scan's identity used in provenance entries."""
+        return f"{scan.datasource}.{scan.schema_name}.{scan.table_name}"
+
+    def _tracked_base_rows(self, scan, stats) -> Tuple[int, List[str]]:
+        """The raw table row count, defaulting with provenance when unknown."""
+        if stats is not None and stats.row_count is not None:
+            return stats.row_count, []
+        return DEFAULT_ROW_COUNT, [f"row_count({self._scan_target(scan)})"]
+
+    def _tracked_scan_groups(self, scan, stats, rows, defaults) -> CardinalityEstimate:
+        """A scan with a pushed-down GROUP BY outputs its group count."""
+        groups = 1
+        for key in scan.group_by:
+            ndv, key_defaults = self._scan_key_ndv(key, stats, rows, scan)
+            groups *= ndv
+            defaults = defaults + key_defaults
+        # The pushed aggregate's output cardinality: the product of its group
+        # keys' NDVs, never more than the (filtered) input rows.
+        return CardinalityEstimate.create(
+            rows=min(rows, groups), defaults_used=defaults
+        )
+
+    def _scan_key_ndv(self, key, stats, rows, scan) -> Tuple[int, List[str]]:
+        """One pushed group key's NDV from the scan's own statistics."""
+        col_stats = None
+        if isinstance(key, ColumnRef) and stats is not None:
+            col_stats = stats.column_stats.get(key.column)
+        if col_stats is None or col_stats.num_distinct is None:
+            fallback = max(1, int(rows * DEFAULT_NDV_FRACTION))
+            return fallback, [f"group_ndv({self._scan_target(scan)}.{self._key_name(key)})"]
+        return max(1, min(col_stats.num_distinct, rows)), []
+
+    def _key_name(self, key: Expression) -> str:
+        """A group key's display name for provenance entries."""
+        if isinstance(key, ColumnRef):
+            return key.column
+        return type(key).__name__
+
+    def _estimate_filter_tracked(self, node: Filter) -> CardinalityEstimate:
+        """A standalone Filter: input estimate x tracked selectivity."""
+        input_estimate = self.estimate(node.input)
+        selectivity, defaults = self._tracked_selectivity(
+            node.predicate, None, "filter"
+        )
+        rows = max(1, int(input_estimate.rows * selectivity))
+        # The filtered estimate inherits the input's provenance plus whatever
+        # defaults the selectivity of this predicate needed.
+        return CardinalityEstimate.create(
+            rows=rows, defaults_used=combine_defaults([input_estimate], defaults)
+        )
+
+    def _estimate_limit_tracked(self, node: Limit) -> CardinalityEstimate:
+        """LIMIT caps the input estimate at offset + limit."""
+        input_estimate = self.estimate(node.input)
+        rows = min(input_estimate.rows, node.offset + node.limit)
+        # Same provenance as the input; the cap itself never needs a default
+        # (offset and limit are literal values, not estimated quantities).
+        return CardinalityEstimate.create(
+            rows=rows, defaults_used=input_estimate.defaults_used
+        )
+
+    def _estimate_aggregate_tracked(self, agg: Aggregate) -> CardinalityEstimate:
+        """Group count = product of the group keys' NDVs, clamped by input."""
+        input_estimate = self.estimate(agg.input)
+        if not agg.group_by:
+            # A global aggregate always produces exactly one row; only the
+            # input's provenance carries through (rows=1 needs no default).
+            return CardinalityEstimate.create(
+                rows=1, defaults_used=input_estimate.defaults_used
+            )
+        groups, defaults = self._tracked_group_count(
+            agg.group_by, agg.input, input_estimate.rows
+        )
+        # More groups than input rows is impossible; the clamp keeps a wild
+        # NDV product from inflating the estimate past its input.
+        return CardinalityEstimate.create(
+            rows=min(input_estimate.rows, groups),
+            defaults_used=combine_defaults([input_estimate], defaults),
+        )
+
+    def _tracked_group_count(self, keys, input_node, input_rows) -> Tuple[int, List[str]]:
+        """The product of the group keys' NDVs over the input subtree."""
+        groups = 1
+        defaults: List[str] = []
+        for key in keys:
+            ndv, key_defaults = self._group_key_ndv(key, input_node, input_rows)
+            groups *= ndv
+            defaults.extend(key_defaults)
+        return groups, defaults
+
+    def _group_key_ndv(self, key, input_node, input_rows) -> Tuple[int, List[str]]:
+        """One group key's NDV; a non-column or stat-less key uses the default."""
+        if isinstance(key, ColumnRef) and key.table is not None:
+            owner = self._find_relation(input_node, key.table)
+            ndv = self._owner_column_ndv(owner, key.column)
+            if ndv is not None:
+                return max(1, min(ndv, input_rows)), []
+        fallback = max(1, int(input_rows * DEFAULT_NDV_FRACTION))
+        return fallback, [f"group_ndv({self._key_name(key)})"]
+
+    def _estimate_join_tracked(self, join: Join) -> CardinalityEstimate:
+        """Join estimate: the NDV formula over equi keys, clamped by type."""
+        left = self.estimate(join.left)
+        right = self.estimate(join.right)
+        if join.condition is None or join.join_type == JoinType.CROSS:
+            # No condition constrains anything: the honest estimate is the
+            # full cross product (this is what join ordering must avoid).
+            return CardinalityEstimate.create(
+                rows=left.rows * right.rows,
+                defaults_used=combine_defaults([left, right], []),
+            )
+        inner, defaults = self._tracked_inner_rows(join, left, right)
+        rows = self._clamp_join_rows(join.join_type, inner, left.rows, right.rows)
+        # The type-clamped estimate inherits both sides' provenance plus the
+        # defaults its own condition's selectivities needed.
+        return CardinalityEstimate.create(
+            rows=rows, defaults_used=combine_defaults([left, right], defaults)
+        )
+
+    def _tracked_inner_rows(self, join, left, right) -> Tuple[int, List[str]]:
+        """Inner-join rows: cross product x each conjunct's selectivity."""
+        rows = float(left.rows) * float(right.rows)
+        defaults: List[str] = []
+        for conjunct in split_conjuncts(join.condition):
+            factor, conjunct_defaults = self._conjunct_factor(
+                join, conjunct, left, right
+            )
+            rows *= factor
+            defaults.extend(conjunct_defaults)
+        return max(1, int(rows)), defaults
+
+    def _conjunct_factor(self, join, conjunct, left, right) -> Tuple[float, List[str]]:
+        """One conjunct's selectivity: 1/max(ndv, ndv) for a cross-side equi
+        key pair, the generic tracked selectivity for anything else."""
+        pair = self._equi_key_pair(join, conjunct)
+        if pair is None:
+            return self._tracked_selectivity(conjunct, None, "join")
+        left_ndv, left_defaults = self._side_key_ndv(join.left, pair[0], left.rows)
+        right_ndv, right_defaults = self._side_key_ndv(join.right, pair[1], right.rows)
+        return 1.0 / max(left_ndv, right_ndv), left_defaults + right_defaults
+
+    def _equi_key_pair(self, join, conjunct):
+        """(left_ref, right_ref) for a column=column equality across the two
+        sides of the join; None for anything else."""
+        if not (isinstance(conjunct, BinaryOp) and conjunct.op == BinaryOpType.EQ):
+            return None
+        if not isinstance(conjunct.left, ColumnRef):
+            return None
+        if not isinstance(conjunct.right, ColumnRef):
+            return None
+        return self._orient_pair(join, conjunct.left, conjunct.right)
+
+    def _orient_pair(self, join, first, second):
+        """Assign two column refs to the join's sides by their qualifiers."""
+        self._require_qualified(first)
+        self._require_qualified(second)
+        if self._resolves_in(join.left, first) and self._resolves_in(join.right, second):
+            return first, second
+        if self._resolves_in(join.left, second) and self._resolves_in(join.right, first):
+            return second, first
+        return None
+
+    def _require_qualified(self, ref: ColumnRef) -> None:
+        """An unqualified column in a join condition is an upstream bug: every
+        post-binder reference must carry its relation qualifier."""
+        if not ref.table:
+            raise ValueError(
+                f"unqualified column {ref.column!r} in a join condition; "
+                "every post-binder reference must be qualified"
+            )
+
+    def _resolves_in(self, node, ref: ColumnRef) -> bool:
+        """Whether the ref's qualifier names a relation inside this subtree."""
+        return self._find_relation(node, ref.table) is not None
+
+    def _find_relation(self, node, qualifier):
+        """The relation node owning a qualifier in a subtree, or None.
+
+        Raises on a duplicate qualifier: resolving a join key against an
+        ambiguous alias would silently pick a side and mis-estimate.
+        """
+        matches: List[LogicalPlanNode] = []
+        self._collect_relations(node, qualifier, matches)
+        if len(matches) > 1:
+            raise ValueError(
+                f"qualifier {qualifier!r} is ambiguous in the join subtree"
+            )
+        return matches[0] if matches else None
+
+    def _collect_relations(self, node, qualifier, matches) -> None:
+        """Append every relation in the subtree whose name is the qualifier."""
+        if isinstance(node, Scan):
+            name = node.alias if node.alias else node.table_name
+            if name == qualifier:
+                matches.append(node)
+            return
+        if isinstance(node, SubqueryScan):
+            if node.alias == qualifier:
+                matches.append(node)
+            return
+        for child in node.children():
+            self._collect_relations(child, qualifier, matches)
+
+    def _side_key_ndv(self, side, ref, side_rows) -> Tuple[int, List[str]]:
+        """A join key's NDV on its side, clamped to the side's row estimate
+        (a filtered side cannot hold more distinct keys than rows)."""
+        owner = self._find_relation(side, ref.table)
+        if owner is None:
+            raise ValueError(
+                f"join key {ref.table}.{ref.column} resolves to no relation"
+            )
+        ndv = self._owner_column_ndv(owner, ref.column)
+        if ndv is None:
+            fallback = max(1, int(side_rows * DEFAULT_NDV_FRACTION))
+            return fallback, [f"ndv({self._owner_target(owner, ref)})"]
+        return max(1, min(ndv, side_rows)), []
+
+    def _owner_column_ndv(self, owner, column: str) -> Optional[int]:
+        """The base NDV of a scan column from source statistics, else None."""
+        if not isinstance(owner, Scan) or not self.stats_collector:
+            return None
+        stats = self.stats_collector.get_table_statistics(
+            owner.datasource, owner.schema_name, owner.table_name, [column]
+        )
+        if stats is None:
+            return None
+        col_stats = stats.column_stats.get(column)
+        if col_stats is None:
+            return None
+        return col_stats.num_distinct
+
+    def _owner_target(self, owner, ref: ColumnRef) -> str:
+        """The provenance name of a join key's owning relation and column."""
+        if isinstance(owner, Scan):
+            return f"{self._scan_target(owner)}.{ref.column}"
+        return f"{ref.table}.{ref.column}"
+
+    def _clamp_join_rows(self, join_type, inner, left_rows, right_rows) -> int:
+        """Join-type bounds over the inner-join estimate."""
+        if join_type == JoinType.INNER:
+            return inner
+        if join_type == JoinType.LEFT:
+            return max(left_rows, inner)
+        if join_type == JoinType.RIGHT:
+            return max(right_rows, inner)
+        return self._clamp_other_join_rows(join_type, inner, left_rows, right_rows)
+
+    def _clamp_other_join_rows(self, join_type, inner, left_rows, right_rows) -> int:
+        """FULL preserves both sides; SEMI/ANTI partition the left side."""
+        if join_type == JoinType.FULL:
+            return max(left_rows + right_rows - inner, left_rows, right_rows)
+        matched = min(left_rows, inner)
+        if join_type == JoinType.SEMI:
+            return matched
+        if join_type == JoinType.ANTI:
+            return max(0, left_rows - matched)
+        raise ValueError(f"no join-cardinality clamp for join type {join_type}")
+
+    def _tracked_selectivity(
+        self, predicate: Expression, stats: Optional[TableStatistics], target: str
+    ) -> Tuple[float, List[str]]:
+        """Selectivity plus the provenance of every default it used."""
+        if isinstance(predicate, BinaryOp):
+            return self._tracked_binary_selectivity(predicate, stats, target)
+        if isinstance(predicate, UnaryOp):
+            return self._tracked_unary_selectivity(predicate, stats, target)
+        return DEFAULT_EQ_SELECTIVITY, [
+            f"selectivity({target}:{type(predicate).__name__})"
+        ]
+
+    def _tracked_binary_selectivity(self, binop, stats, target) -> Tuple[float, List[str]]:
+        """Dispatch a binary predicate to its tracked selectivity rule."""
+        if binop.op in (BinaryOpType.AND, BinaryOpType.OR):
+            return self._tracked_boolean_selectivity(binop, stats, target)
+        if binop.op in (BinaryOpType.EQ, BinaryOpType.NEQ):
+            return self._tracked_equality_selectivity(binop, stats, target)
+        range_ops = (BinaryOpType.LT, BinaryOpType.LTE, BinaryOpType.GT, BinaryOpType.GTE)
+        if binop.op in range_ops:
+            return self._tracked_range_selectivity(binop, stats, target)
+        if binop.op == BinaryOpType.LIKE:
+            return DEFAULT_LIKE_SELECTIVITY, [f"like_selectivity({target})"]
+        return DEFAULT_EQ_SELECTIVITY, [f"selectivity({target}:{binop.op.value})"]
+
+    def _tracked_boolean_selectivity(self, binop, stats, target) -> Tuple[float, List[str]]:
+        """AND is the product; OR the inclusion-exclusion complement."""
+        left_sel, left_defaults = self._tracked_selectivity(binop.left, stats, target)
+        right_sel, right_defaults = self._tracked_selectivity(binop.right, stats, target)
+        defaults = left_defaults + right_defaults
+        if binop.op == BinaryOpType.AND:
+            return left_sel * right_sel, defaults
+        return 1.0 - ((1.0 - left_sel) * (1.0 - right_sel)), defaults
+
+    def _tracked_equality_selectivity(self, binop, stats, target) -> Tuple[float, List[str]]:
+        """EQ is 1/ndv when the column's NDV is known; NEQ its complement."""
+        selectivity, defaults = self._tracked_eq_base(binop, stats, target)
+        if binop.op == BinaryOpType.NEQ:
+            return 1.0 - selectivity, defaults
+        return selectivity, defaults
+
+    def _tracked_eq_base(self, binop, stats, target) -> Tuple[float, List[str]]:
+        """The equality selectivity: 1/ndv or the recorded default."""
+        col_ref = self._extract_column_ref(binop)
+        col_stats = self._column_stats_or_none(stats, col_ref)
+        if col_stats is None or col_stats.num_distinct is None:
+            name = col_ref.column if col_ref else type(binop).__name__
+            return DEFAULT_EQ_SELECTIVITY, [f"eq_selectivity({target}.{name})"]
+        if col_stats.num_distinct == 0:
+            return 0.0, []
+        return min(1.0, 1.0 / col_stats.num_distinct), []
+
+    def _column_stats_or_none(self, stats, col_ref):
+        """The column's statistics when both the ref and the stats exist."""
+        if stats is None or col_ref is None:
+            return None
+        return stats.column_stats.get(col_ref.column)
+
+    def _tracked_range_selectivity(self, binop, stats, target) -> Tuple[float, List[str]]:
+        """min/max interpolation when possible, else the range default."""
+        fraction = self._range_fraction(binop, stats)
+        if fraction is None:
+            return DEFAULT_RANGE_SELECTIVITY, [f"range_selectivity({target})"]
+        return fraction, []
+
+    def _range_fraction(self, binop, stats) -> Optional[float]:
+        """(literal - min) / (max - min) oriented by the comparison direction;
+        None when the column, bounds, or literal are not all usable numbers."""
+        col_ref, value, below = self._range_parts(binop)
+        col_stats = self._column_stats_or_none(stats, col_ref)
+        if col_stats is None or not self._numeric_bounds(col_stats, value):
+            return None
+        span = col_stats.max_value - col_stats.min_value
+        if span <= 0:
+            return None
+        base = min(1.0, max(0.0, (value - col_stats.min_value) / span))
+        return base if below else 1.0 - base
+
+    def _range_parts(self, binop):
+        """Normalize a range comparison to (column, literal, below) where
+        below means the predicate keeps column values BELOW the literal."""
+        below_ops = (BinaryOpType.LT, BinaryOpType.LTE)
+        if isinstance(binop.left, ColumnRef) and isinstance(binop.right, Literal):
+            return binop.left, binop.right.value, binop.op in below_ops
+        if isinstance(binop.left, Literal) and isinstance(binop.right, ColumnRef):
+            # literal < column reads as column > literal: direction flips.
+            return binop.right, binop.left.value, binop.op not in below_ops
+        return None, None, False
+
+    def _numeric_bounds(self, col_stats, value) -> bool:
+        """True when min, max and the literal are all plain numbers."""
+        for item in (col_stats.min_value, col_stats.max_value, value):
+            if not isinstance(item, (int, float)) or isinstance(item, bool):
+                return False
+        return True
+
+    def _tracked_unary_selectivity(self, unop, stats, target) -> Tuple[float, List[str]]:
+        """NOT complements; IS NULL reads the null fraction when known."""
+        if unop.op == UnaryOpType.NOT:
+            inner, defaults = self._tracked_selectivity(unop.operand, stats, target)
+            return 1.0 - inner, defaults
+        if unop.op in (UnaryOpType.IS_NULL, UnaryOpType.IS_NOT_NULL):
+            return self._tracked_null_selectivity(unop, stats, target)
+        return DEFAULT_EQ_SELECTIVITY, [f"selectivity({target}:{unop.op.value})"]
+
+    def _tracked_null_selectivity(self, unop, stats, target) -> Tuple[float, List[str]]:
+        """IS NULL from the column's null fraction; IS NOT NULL complements."""
+        fraction, defaults = self._tracked_null_fraction(unop, stats, target)
+        if unop.op == UnaryOpType.IS_NOT_NULL:
+            return 1.0 - fraction, defaults
+        return fraction, defaults
+
+    def _tracked_null_fraction(self, unop, stats, target) -> Tuple[float, List[str]]:
+        """The operand column's null fraction, or the recorded default."""
+        col_ref = unop.operand if isinstance(unop.operand, ColumnRef) else None
+        col_stats = self._column_stats_or_none(stats, col_ref)
+        if col_stats is None:
+            name = col_ref.column if col_ref else type(unop.operand).__name__
+            return DEFAULT_NULL_FRACTION, [f"null_fraction({target}.{name})"]
+        return col_stats.null_fraction, []
 
     def estimate_physical_plan_cost(self, plan: PhysicalPlanNode) -> float:
         """Estimate cost of a physical plan.
