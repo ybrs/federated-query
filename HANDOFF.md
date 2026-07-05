@@ -1,4 +1,4 @@
-# Status: seven phases live; fair federated gap 38.6x -> 4.43x
+# Status: eight phases live; fair federated gap 38.6x -> 4.02x
 
 State of the work. Facts only: what exists, what passes, what is measured,
 what is not done. Previous phase (Rust cutover, N-K decorrelation, merge-engine
@@ -13,7 +13,7 @@ merge-engine-datafusion
             `- feature/cost-based-optimizer   <-- HEAD (this document)
 ```
 
-Test suite: **1136 passed, 3 skipped, 39 xfailed, 0 failed**
+Test suite: **1140 passed, 3 skipped, 39 xfailed, 0 failed**
 (`POSTGRES_DB=duckpoc python -m pytest -q`). `make lint` green.
 
 ## What was built on this branch
@@ -194,21 +194,38 @@ pre-opt 38.55x -> join order 23.24x -> +projection 11.36x -> +CTE 8.60x ->
 +count(*) 5.10x -> +locality 5.01x -> +key injection **4.43x**.
 Single-source (pure engine) SF1: 2.06x. All 132 cells correct in every phase.
 
+## Shape fixes: q18 + q07 (commits 12f59d2, 37c413d)
+
+- **q18 (IN group-by-having subquery)**: AggregatePushdown stopped at an
+  aggregate it could not fold and never visited its input - the HAVING
+  subquery aggregated 6M rows on the coordinator (the FIFTH instance of the
+  walker-descent disease). Fixed with a transform_children arm; the subquery
+  now collapses to a remote GROUP BY..HAVING (~60 rows). SEMI joins also
+  joined the key reduction (the injected IN IS the semi condition; the
+  coordinator semi stays; ANTI never injects). q18 840 -> 653ms.
+- **q07 (OR spanning two relations)**: the rule derives the IMPLIED
+  single-relation predicates from a multi-relation disjunction
+  ((n1=F or n1=G), (n2=G or n2=F)) and pushes them to the scans; the OR
+  stays for exactness. Companion fix: _push_filter_to_scan merges conjuncts
+  UNIQUELY (re-derivation would otherwise grow scan filters every fixpoint
+  pass). q07 416 -> 280ms; q19 held.
+
+Gate (report-result-37c413d.md): fedpgduck SF1 4786 -> 4147ms (4.02x), all
+132 cells correct. Full run: 38.55x -> 23.24 -> 11.36 -> 8.60 -> 5.10 ->
+5.01 -> 4.43 -> **4.02x**. Single-source SF1: 2.05x.
+
 ## Known gaps / next work (in priority order from the data)
 
-1. **q07 (416ms/9.7x fedpgduck SF1)** - the FRANCE/GERMANY OR shape yields
-   no injectable key set; the nations constraint reaches the facts only
-   after the join. Would need OR-derived key sets (union of two nation key
-   lists) or better residual selectivity.
-2. **q18 (840ms/9.3x)** - ~50ms is pre-cap key collection; the rest is the
-   IN-subquery (group-by-having over lineitem) shape.
-3. **Small-scale overhead**: fedpgduck SF0.1 is 4.85x with 20-90ms queries -
-   fixed per-query planning/stat-fetch/ingest costs dominate, not plans.
-4. **Duck guard precision**: replace the keys/rows estimate with the
-   planner's cached NDV as an IR hint if more shapes hit the cap.
-5. **TRANSFER_WEIGHT calibration** (1.0) as more shapes accumulate.
-6. **CTE materialize-once**; **fedqrs missing operators** (18 xfails);
-   `enable_decorrelation` flag unwired.
+1. **Small-scale fixed overhead**: fedpgduck SF0.1 is 5.03x on 20-90ms
+   queries - per-query planning/stat-fetch/ingest constants dominate, not
+   plans. The biggest remaining ratio lever if low-latency matters.
+2. **q18 (653ms/7.2x)** and **q07 (280ms/6.5x)** residuals: legitimate
+   in-source aggregation work + remaining transfers; diminishing returns at
+   the rule layer.
+3. **Duck guard precision** (planner NDV as an IR hint), **TRANSFER_WEIGHT
+   calibration** (1.0), **CTE materialize-once**.
+4. **fedqrs missing operators** (18 xfails); `enable_decorrelation` flag
+   unwired.
 
 ## How to run
 
