@@ -255,12 +255,21 @@ old vs new clamp. Ten-phase run: 38.55x -> 3.26x; single-source SF1 1.99x.
 
 ## Known gaps / next work (in priority order from the data)
 
-1. **Small-scale fixed overhead**: fedpgduck SF0.1 is 4.47x on 20-90ms queries
-   - per-query planning/stat-fetch/ingest constants, not plans. The biggest
-   remaining RATIO lever if low-latency matters.
-2. **q07 (283ms/6.0x fedpgduck SF1)**: OR-across-nations shape; diminishing.
-3. **q09/q10/q13 (3-4x, 280-440ms)**: residual multi-fact transfer + genuine
-   coordinator join work; the flat tail.
+Fair-federated ranking (report-result-3006554.md), all 22/22 correct:
+- SF1 total 3417ms vs 1058ms = 3.23x; SF0.1 total 1339ms vs 298ms = 4.49x.
+- SF1 slowest by absolute cost: q09 438ms(4.8x), q07 294ms(5.9x),
+  q13 294ms(3.0x), q10 260ms(3.9x), q18 206ms(2.4x), q05 193ms, q17 171ms(6.6x).
+- SF1 worst RATIO: q11 6.9x, q17 6.6x, q07 5.9x (plan/transfer, grows with data).
+- SF0.1 worst ratio: q15 10.5x, q06 9.6x, q02 7.4x - FIXED per-query overhead on
+  25-90ms queries (NOT plans; would need planning/connection/ingest latency cuts).
+
+1. **q09 (438ms, biggest absolute at both scales)**: multi-fact
+   part/partsupp/lineitem/orders/supplier - the most rows crossing. Under
+   investigation (where-do-we-lose-time next).
+2. **q07 (294ms/5.9x), q13 (294ms/3.0x), q10 (260ms/3.9x), q17 (171ms/6.6x)**:
+   the real big-dataset offenders - plan/transfer, worth digging.
+3. **Small-scale fixed overhead**: SF0.1 4.49x is per-query constants, not plans;
+   only worth chasing if low-latency matters (q06/q15 are 25-90ms).
 4. **TRANSFER_WEIGHT calibration** (1.0), **CTE materialize-once**, duck guard
    NDV hint.
 5. **fedqrs missing operators** (18 xfails); `enable_decorrelation` unwired.
