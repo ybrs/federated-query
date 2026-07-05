@@ -1,4 +1,4 @@
-# Status: join ordering + projection pushdown live; next is q15/q21
+# Status: join ordering, projection pushdown, CTE pushdown live; next q21
 
 State of the work. Facts only: what exists, what passes, what is measured,
 what is not done. Previous phase (Rust cutover, N-K decorrelation, merge-engine
@@ -13,7 +13,7 @@ merge-engine-datafusion
             `- feature/cost-based-optimizer   <-- HEAD (this document)
 ```
 
-Test suite: **1120 passed, 3 skipped, 39 xfailed, 0 failed**
+Test suite: **1127 passed, 3 skipped, 39 xfailed, 0 failed**
 (`POSTGRES_DB=duckpoc python -m pytest -q`). `make lint` green.
 
 ## What was built on this branch
@@ -105,38 +105,52 @@ Measured widths (fedpgduck q03): customer 8 -> 2, orders 9 -> 4, lineitem
 history (equi-only connectivity fix and its data-movement trade-off) is in
 the git log at 063aada.
 
-## Measured after both phases (report-result-307cec1.md)
+## CTE pushdown: FIXED (the q15 outlier, commit a044026)
 
-| Cell       | SF  | Pre-optimizer | Join ordering | + Projection pushdown |
-| ---------- | --- | ------------- | ------------- | --------------------- |
-| single     | 0.1 | 4.31x         | 2.47x         | **1.90x**             |
-| single     | 1   | 13.8x, q09 OOM | 5.62x        | **3.97x**             |
-| fedparquet | 0.1 | 6.47x         | 5.06x         | **2.71x**             |
-| fedparquet | 1   | 18.6x, q09 OOM | 9.93x        | **5.43x**             |
-| fedpgduck  | 0.1 | 12.01x        | 11.29x        | **6.31x**             |
-| fedpgduck  | 1   | 38.55x        | 23.24x        | **11.36x**            |
+q15 ran at 169x DuckDB for three stacked reasons; two fixed:
+- All four pushdown rules (Predicate/Aggregate/OrderBy/Limit) were CTE-blind:
+  the WITH body's filter and GROUP BY never reached the lineitem scan, so
+  the entire 6M-row table crossed the wire TWICE, unfiltered. All four
+  walkers now descend CTE (cte_plan + child); the body collapses to a
+  remote GROUP BY returning ~10k rows.
+- available_columns had no CTERef/SubqueryScan/Sort arms (unknown = empty =
+  decline to push): the s_suppkey = supplier_no equality could not be
+  classified past the decorrelated LEFT join, leaving supplier x revenue a
+  conditionless nested-loop CROSS. CTE references now expose their outputs.
+- Consequence fix: the dynamic-filter mark requires an executable build side
+  (PhysicalScan/PhysicalRemoteQuery) - a CTE build side crashed EXPLAIN's
+  value prefetch.
+Deferred: the CTE body still evaluates once per reference (each copy is now
+a cheap remote aggregate; materialize-once is an engine feature).
 
-All 132 cells correct everywhere. fedpgduck SF1 big movers vs the
-join-ordering report: q03 1407 -> 250ms, q05 2573 -> 427ms, q07 2689 ->
-476ms, q09 4622 -> 962ms, q18 3772 -> 771ms.
+## Measured across all phases (report-result-a044026.md)
+
+| Cell       | SF  | Pre-opt | Join order | +Projection | +CTE fix |
+| ---------- | --- | ------- | ---------- | ----------- | -------- |
+| single     | 0.1 | 4.31x   | 2.47x      | 1.90x       | **1.87x** |
+| single     | 1   | 13.8x*  | 5.62x      | 3.97x       | **2.13x** |
+| fedparquet | 0.1 | 6.47x   | 5.06x      | 2.71x       | **2.62x** |
+| fedparquet | 1   | 18.6x*  | 9.93x      | 5.43x       | **3.49x** |
+| fedpgduck  | 0.1 | 12.01x  | 11.29x     | 6.31x       | **5.84x** |
+| fedpgduck  | 1   | 38.55x  | 23.24x     | 11.36x      | **8.60x** |
+
+(* = q09 OOM-KILLED in those runs.) All 132 cells correct in every phase
+since the optimizer landed. q15 fedpgduck SF1: 2824 -> 78ms (169x -> 4.4x).
 
 ## Known gaps / next work (in priority order from the data)
 
-1. **q15 (168x fedpgduck, ~105x single at SF1, 2.8s).** View + window shape;
-   untouched by both optimizer phases. The single biggest outlier left.
-2. **q21 (26.6x fedpgduck SF1, 3.2s).** lineitem multi-self-join with
-   EXISTS/NOT EXISTS; barely moved by either phase - decorrelation shape +
-   data movement.
-3. **q17 (14.9x fedpgduck SF1)** - correlated aggregate subquery shape.
-4. **Locality cost term** at the `join_tree_cost` seam: transfer cost =
-   rows x width per source boundary; pruning made width meaningful, and the
-   q07 pair-first episode (git log 063aada) showed order choice can trade
-   local work against movement.
+1. **q21 (26.5x fedpgduck SF1, 3.2s)** - lineitem multi-self-join with
+   EXISTS/NOT EXISTS; untouched by all three phases. The dominant remaining
+   outlier (next: q09 956ms, q13 774ms, q18 769ms, all under 10x).
+2. **q17 (15x fedpgduck SF1, 0.4s)** - correlated aggregate subquery shape.
+3. **Locality cost term** at the `join_tree_cost` seam: transfer cost =
+   rows x width per source boundary (see git log 063aada for the measured
+   motivation).
+4. **CTE materialize-once** in the engine (per-reference evaluation is now
+   cheap but still duplicated).
 5. **fedqrs missing operators** (unchanged): `PhysicalSingleRowGuard`,
-   `PhysicalUnion`, empty-condition semi-join - 18 xfails in
-   `tests/e2e_decorrelation/`.
-6. `enable_decorrelation` config flag is still unwired (the Decorrelator is
-   not an optimizer rule).
+   `PhysicalUnion`, empty-condition semi-join - 18 xfails.
+6. `enable_decorrelation` config flag is still unwired.
 
 ## How to run
 
