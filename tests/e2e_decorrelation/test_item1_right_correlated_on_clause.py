@@ -18,7 +18,7 @@ better than wrong rows or a downstream crash.
 import pytest
 
 from federated_query.cli.fedq import FedQRuntime
-from federated_query.config import ExecutorConfig
+from federated_query.config import Config
 from federated_query.optimizer.scope_validator import ScopeError
 
 
@@ -43,7 +43,7 @@ def test_item1_right_correlated_name_collision_raises_scope_error(
     instead of letting the merge engine crash or silently rebind to people.country.
     """
     _make_people(duckdb_datasource, catalog, "people")
-    runtime = FedQRuntime(catalog, ExecutorConfig())
+    runtime = FedQRuntime(catalog, Config())
     sql = (
         "SELECT people.id AS uid "
         "FROM duckdb.main.people people "
@@ -66,7 +66,7 @@ def test_item1_right_correlated_unique_name_raises_scope_error(
     rather than deferring to a DuckDB BinderException during execution.
     """
     _make_people(duckdb_datasource, catalog, "people2")
-    runtime = FedQRuntime(catalog, ExecutorConfig())
+    runtime = FedQRuntime(catalog, Config())
     sql = (
         "SELECT people.id AS uid "
         "FROM duckdb.main.people2 people "

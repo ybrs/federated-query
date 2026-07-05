@@ -7,13 +7,13 @@ collapsing (which previously raised "Arrays were not all the same length").
 """
 
 from federated_query.cli.fedq import FedQRuntime
-from federated_query.config import ExecutorConfig
+from federated_query.config import Config
 
 
 def test_select_star_join_with_duplicate_column_names(catalog, setup_test_data):
     """SELECT * over a join keeps duplicate column names (both id columns),
     matching PostgreSQL, and returns the expected row/column counts."""
-    runtime = FedQRuntime(catalog, ExecutorConfig())
+    runtime = FedQRuntime(catalog, Config())
     sql = (
         "SELECT * FROM default.pg.users U, default.pg.orders O "
         "WHERE O.user_id = U.id LIMIT 1"
@@ -37,7 +37,7 @@ def test_cross_source_join_over_pushed_duplicate_columns(
     connection.execute("INSERT INTO file_access VALUES (1, 'a'), (2, 'b')")
     catalog.load_metadata()
 
-    runtime = FedQRuntime(catalog, ExecutorConfig())
+    runtime = FedQRuntime(catalog, Config())
     sql = (
         "SELECT count(*) "
         "FROM default.pg.users U, default.pg.orders O, duckdb.main.file_access A "
@@ -57,7 +57,7 @@ def test_pushed_subquery_only_fetches_needed_columns(
     connection.execute("INSERT INTO file_access2 VALUES (1, 'a')")
     catalog.load_metadata()
 
-    runtime = FedQRuntime(catalog, ExecutorConfig())
+    runtime = FedQRuntime(catalog, Config())
     sql = (
         "SELECT count(*) "
         "FROM default.pg.users U, default.pg.orders O, duckdb.main.file_access2 A "

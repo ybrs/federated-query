@@ -24,7 +24,7 @@ from sqlglot import exp
 
 from federated_query.catalog.catalog import Catalog
 from federated_query.cli.fedq import FedQRuntime
-from federated_query.config.config import ExecutorConfig
+from federated_query.config.config import Config
 from federated_query.datasources.duckdb import DuckDBDataSource
 from federated_query.datasources.postgresql import PostgreSQLDataSource
 
@@ -92,7 +92,7 @@ def build_fedq(db_path, options):
     catalog.register_datasource(duck)
     catalog.register_datasource(postgres)
     catalog.load_metadata()
-    return FedQRuntime(catalog, ExecutorConfig())
+    return FedQRuntime(catalog, Config())
 
 
 def build_oracle(db_path, options):

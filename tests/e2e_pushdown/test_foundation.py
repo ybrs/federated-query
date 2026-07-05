@@ -3,12 +3,12 @@
 from sqlglot import exp
 
 from federated_query.cli.fedq import FedQRuntime
-from federated_query.config import ExecutorConfig
+from federated_query.config import Config
 
 
 def _build_runtime(env):
     """Instantiate a FedQ runtime for the provided catalog fixture."""
-    runtime = FedQRuntime(env.catalog, ExecutorConfig())
+    runtime = FedQRuntime(env.catalog, Config())
     return runtime
 
 

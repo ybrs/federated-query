@@ -5,12 +5,12 @@ from typing import Callable, Dict, List, Optional
 from sqlglot import exp
 
 from federated_query.cli.fedq import FedQRuntime
-from federated_query.config import ExecutorConfig
+from federated_query.config import Config
 
 
 def build_runtime(env) -> FedQRuntime:
     """Create a FedQ runtime for the provided environment."""
-    runtime = FedQRuntime(env.catalog, ExecutorConfig())
+    runtime = FedQRuntime(env.catalog, Config())
     return runtime
 
 

@@ -950,6 +950,11 @@ class PhysicalHashJoin(PhysicalPlanNode):
     left_keys: List[Expression]
     right_keys: List[Expression]
     build_side: str  # "left" or "right"
+    # Carried over from the logical Join when the cost-based join-ordering
+    # rule ran: the estimated output rows and the provenance of any DEFAULTED
+    # statistics behind them. EXPLAIN prints both.
+    estimated_rows: Optional[int] = None
+    estimate_defaults: Optional[List[str]] = None
 
     @classmethod
     def create(
@@ -961,6 +966,8 @@ class PhysicalHashJoin(PhysicalPlanNode):
         left_keys: List[Expression],
         right_keys: List[Expression],
         build_side: str,
+        estimated_rows: Optional[int] = None,
+        estimate_defaults: Optional[List[str]] = None,
     ) -> "PhysicalHashJoin":
         """Sanctioned fresh-construction path for PhysicalHashJoin.
         Names every field so none is dropped; derive from an existing node
@@ -972,6 +979,8 @@ class PhysicalHashJoin(PhysicalPlanNode):
             left_keys=left_keys,
             right_keys=right_keys,
             build_side=build_side,
+            estimated_rows=estimated_rows,
+            estimate_defaults=estimate_defaults,
         )
 
     def children(self) -> List[PhysicalPlanNode]:
@@ -1228,6 +1237,11 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
     right: PhysicalPlanNode
     join_type: JoinType
     condition: Optional[Expression]
+    # Carried over from the logical Join when the cost-based join-ordering
+    # rule ran: the estimated output rows and the provenance of any DEFAULTED
+    # statistics behind them. EXPLAIN prints both.
+    estimated_rows: Optional[int] = None
+    estimate_defaults: Optional[List[str]] = None
 
     @classmethod
     def create(
@@ -1237,6 +1251,8 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
         right: PhysicalPlanNode,
         join_type: JoinType,
         condition: Optional[Expression],
+        estimated_rows: Optional[int] = None,
+        estimate_defaults: Optional[List[str]] = None,
     ) -> "PhysicalNestedLoopJoin":
         """Sanctioned fresh-construction path for PhysicalNestedLoopJoin.
         Names every field so none is dropped; derive from an existing node
@@ -1246,6 +1262,8 @@ class PhysicalNestedLoopJoin(PhysicalPlanNode):
             right=right,
             join_type=join_type,
             condition=condition,
+            estimated_rows=estimated_rows,
+            estimate_defaults=estimate_defaults,
         )
 
     def children(self) -> List[PhysicalPlanNode]:
@@ -2272,10 +2290,28 @@ class _PlanFormatter:
     def _build_header(self, node: PhysicalPlanNode) -> str:
         name = node.__class__.__name__
         cost = self._safe_cost(node)
+        rows = self._estimated_rows(node)
         detail = self._detail_for(node)
+        header = f"{name} cost={cost} rows={rows}"
         if detail:
-            return f"{name} cost={cost} rows=-1 details={detail}"
-        return f"{name} cost={cost} rows=-1"
+            header = f"{header} details={detail}"
+        return header + self._defaulted_note(node)
+
+    def _estimated_rows(self, node: PhysicalPlanNode) -> int:
+        """The join-ordering estimate when the node carries one; -1 means the
+        node was never cost-estimated."""
+        value = getattr(node, "estimated_rows", None)
+        if value is None:
+            return -1
+        return value
+
+    def _defaulted_note(self, node: PhysicalPlanNode) -> str:
+        """The defaulted-statistics marker: which estimates came from named
+        defaults rather than real source statistics. Never silent."""
+        defaults = getattr(node, "estimate_defaults", None)
+        if not defaults:
+            return ""
+        return f" stats=defaulted[{', '.join(defaults)}]"
 
     def _detail_for(self, node: PhysicalPlanNode) -> str:
         builder = self._detail_builders.get(type(node))

@@ -105,12 +105,9 @@ def _build_sources(parquet_dir, work_dir, groups):
 def _build_runtime(sources):
     """A QueryExecutor over the given sources with the standard rule set."""
     from federated_query.catalog import Catalog
-    from federated_query.config.config import ExecutorConfig
+    from federated_query.config.config import Config
     from federated_query.executor.executor import Executor
-    from federated_query.optimizer import (
-        AggregatePushdownRule, LimitPushdownRule, OrderByPushdownRule,
-        PredicatePushdownRule, ProjectionPushdownRule, RuleBasedOptimizer,
-    )
+    from federated_query.optimizer import build_optimizer
     from federated_query.optimizer.decorrelation import Decorrelator
     from federated_query.optimizer.physical_planner import PhysicalPlanner
     from federated_query.parser import Binder, Parser
@@ -121,13 +118,11 @@ def _build_runtime(sources):
         catalog.register_datasource(datasource)
     catalog.load_metadata()
     parser = Parser()
-    optimizer = RuleBasedOptimizer(catalog)
-    for rule in (PredicatePushdownRule(), ProjectionPushdownRule(),
-                 AggregatePushdownRule(), OrderByPushdownRule(), LimitPushdownRule()):
-        optimizer.add_rule(rule)
+    config = Config()
+    optimizer = build_optimizer(catalog, config.optimizer, config.cost)
     return QueryExecutor(
         catalog=catalog, parser=parser, binder=Binder(catalog), optimizer=optimizer,
-        planner=PhysicalPlanner(catalog), physical_executor=Executor(ExecutorConfig()),
+        planner=PhysicalPlanner(catalog), physical_executor=Executor(config.executor),
         processors=[StarExpansionProcessor(catalog, dialect=parser.dialect)],
         decorrelator=Decorrelator(),
     )

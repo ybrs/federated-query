@@ -5,7 +5,7 @@ import sqlglot
 from federated_query.cli.fedq import FedQRuntime, build_json_explain_table
 from federated_query.catalog import Catalog
 from federated_query.datasources.duckdb import DuckDBDataSource
-from federated_query.config import ExecutorConfig
+from federated_query.config import Config
 from tests.duckdb_tmp import duckdb_path
 
 
@@ -35,7 +35,7 @@ def test_runtime_executes_simple_select():
     catalog.register_datasource(datasource)
     catalog.load_metadata()
 
-    runtime = FedQRuntime(catalog, ExecutorConfig())
+    runtime = FedQRuntime(catalog, Config())
     table = runtime.execute("SELECT id FROM mem.main.items ORDER BY id")
 
     assert table.num_rows == 2

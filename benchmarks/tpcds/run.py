@@ -29,7 +29,7 @@ import duckdb
 
 from federated_query.catalog.catalog import Catalog
 from federated_query.cli.fedq import FedQRuntime
-from federated_query.config.config import ExecutorConfig
+from federated_query.config.config import Config
 from federated_query.datasources.duckdb import DuckDBDataSource
 
 from compare import compare_results
@@ -58,7 +58,7 @@ def build_runtime(db_path, source_name):
     catalog = Catalog()
     catalog.register_datasource(datasource)
     catalog.load_metadata()
-    return FedQRuntime(catalog, ExecutorConfig())
+    return FedQRuntime(catalog, Config())
 
 
 def _read_query(path):

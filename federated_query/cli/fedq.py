@@ -29,15 +29,7 @@ from ..datasources.postgresql import PostgreSQLDataSource
 from ..datasources.clickhouse import ClickHouseDataSource
 from ..executor import Executor
 from ..parser import Binder, Parser, BindingError
-from ..optimizer import (
-    PhysicalPlanner,
-    RuleBasedOptimizer,
-    PredicatePushdownRule,
-    ProjectionPushdownRule,
-    AggregatePushdownRule,
-    OrderByPushdownRule,
-    LimitPushdownRule,
-)
+from ..optimizer import PhysicalPlanner, build_optimizer
 from ..optimizer.decorrelation import Decorrelator
 from ..processor import QueryExecutor, StarExpansionError, StarExpansionProcessor
 
@@ -89,16 +81,21 @@ def _stringify_query_value(query_value: Any) -> str:
 
 class FedQRuntime:
 
-    def __init__(self, catalog: Catalog, executor_config: ExecutorConfig):
-        """Assemble and warm up the full query-execution pipeline."""
+    def __init__(self, catalog: Catalog, config: Config):
+        """Assemble and warm up the full query-execution pipeline.
+
+        Takes the whole Config: the optimizer stack is built from its
+        optimizer and cost sections (via the shared factory, so every
+        OptimizerConfig flag is honored) and the executor from its executor
+        section.
+        """
         self.catalog = catalog
         self.parser = Parser()
         self.binder = Binder(catalog)
-        self.optimizer = RuleBasedOptimizer(catalog)
-        self._register_optimization_rules()
+        self.optimizer = build_optimizer(catalog, config.optimizer, config.cost)
         self.planner = PhysicalPlanner(catalog)
         self.decorrelator = Decorrelator()
-        physical_executor = Executor(config=executor_config)
+        physical_executor = Executor(config=config.executor)
         processors = [StarExpansionProcessor(catalog, dialect=self.parser.dialect)]
         self.query_executor = QueryExecutor(
             catalog=catalog,
@@ -110,14 +107,6 @@ class FedQRuntime:
             processors=processors,
             decorrelator=self.decorrelator,
         )
-
-    def _register_optimization_rules(self) -> None:
-        """Register optimization rules in the correct order."""
-        self.optimizer.add_rule(PredicatePushdownRule())
-        self.optimizer.add_rule(ProjectionPushdownRule())
-        self.optimizer.add_rule(AggregatePushdownRule())
-        self.optimizer.add_rule(OrderByPushdownRule())
-        self.optimizer.add_rule(LimitPushdownRule())
 
     def execute(self, sql: str) -> Union[pa.Table, Dict[str, Any]]:
         """Run a SQL statement and return results."""
@@ -451,7 +440,7 @@ def _prepare_runtime(
     """Load config, build the catalog and runtime, and return them with any note."""
     config, message = _load_config_bundle(config_path)
     catalog = _build_catalog(config, message is not None)
-    runtime = FedQRuntime(catalog, config.executor)
+    runtime = FedQRuntime(catalog, config)
     note = ""
     if message:
         note = message

@@ -729,7 +729,10 @@ class CostModel:
         return matches[0] if matches else None
 
     def _collect_relations(self, node, qualifier, matches) -> None:
-        """Append every relation in the subtree whose name is the qualifier."""
+        """Append every relation in the subtree whose name is the qualifier.
+
+        Mirrors the join-graph qualifier collection: scans by alias or table
+        name, derived tables and CTE references by their exposed alias."""
         if isinstance(node, Scan):
             name = node.alias if node.alias else node.table_name
             if name == qualifier:
@@ -737,6 +740,11 @@ class CostModel:
             return
         if isinstance(node, SubqueryScan):
             if node.alias == qualifier:
+                matches.append(node)
+            return
+        if isinstance(node, CTERef):
+            name = node.alias if node.alias else node.name
+            if name == qualifier:
                 matches.append(node)
             return
         for child in node.children():

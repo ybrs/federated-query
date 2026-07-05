@@ -637,6 +637,8 @@ class PhysicalPlanner:
             left_keys=left_keys,
             right_keys=right_keys,
             build_side=self._choose_build_side(join.join_type, left_plan, right_plan),
+            estimated_rows=join.estimated_rows,
+            estimate_defaults=join.estimate_defaults,
         )
         self._mark_dynamic_filter(hash_join)
         return hash_join
@@ -653,6 +655,8 @@ class PhysicalPlanner:
             right=right_plan,
             join_type=join.join_type,
             condition=join.condition,
+            estimated_rows=join.estimated_rows,
+            estimate_defaults=join.estimate_defaults,
         )
 
     def _choose_build_side(
