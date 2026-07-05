@@ -25,8 +25,12 @@ from .scope_validator import validate_scope
 from ..plan.expressions import (
     Expression,
     InList,
+    InSubquery,
     BetweenExpression,
+    QuantifiedComparison,
+    SUBQUERY_NODE_TYPES,
     and_expressions,
+    expression_children,
     split_conjuncts,
     split_disjuncts,
     combine_and,
@@ -522,70 +526,44 @@ class ProjectionPushdownRule(OptimizationRule):
         return True
 
     def _collect_required_columns(self, plan: LogicalPlanNode) -> set:
-        """Collect all required column names from plan."""
+        """Every column the plan references anywhere, as QUALIFIED
+        ``table.col`` names (bare only for unqualified refs).
+
+        Annotation-driven and total: ``direct_expressions()`` derives each
+        node's expression fields from its type annotations (an unclassifiable
+        field raises), so a new node type or expression field can never be
+        silently skipped - this is what keeps Scan.filters, Scan.order_by_keys
+        (OrderByPushdown dissolves Sort into scan metadata), join conditions
+        and every future expression field covered without per-node arms.
+        Collection deliberately crosses naming-scope boundaries (subqueries,
+        CTEs, set-op branches): global over-collection can only over-KEEP a
+        column, never lose one.
+        """
         columns = set()
-
-        if isinstance(plan, Scan):
-            if plan.filters:
-                columns.update(pushdown.bare_names(plan.filters))
-            return columns
-
-        if isinstance(plan, Projection):
-            # Collect columns from projection expressions
-            for expr in plan.expressions:
-                columns.update(pushdown.bare_names(expr))
-            # CRITICAL: Must recurse into input to collect columns needed by
-            # downstream operators (e.g., join keys, filter columns)
-            # Otherwise those columns will be pruned and break the query!
-            columns.update(self._collect_required_columns(plan.input))
-            return columns
-
-        if isinstance(plan, Filter):
-            columns.update(pushdown.bare_names(plan.predicate))
-            columns.update(self._collect_required_columns(plan.input))
-            return columns
-
-        if isinstance(plan, Join):
-            if plan.condition:
-                columns.update(pushdown.bare_names(plan.condition))
-            columns.update(self._collect_required_columns(plan.left))
-            columns.update(self._collect_required_columns(plan.right))
-            return columns
-
-        if isinstance(plan, Aggregate):
-            # Collect columns from group by expressions
-            for expr in plan.group_by:
-                columns.update(pushdown.bare_names(expr))
-            # Collect columns from aggregate expressions
-            for expr in plan.aggregates:
-                columns.update(pushdown.bare_names(expr))
-            # CRITICAL: Must recurse into input to collect columns needed by
-            # downstream operators (e.g., join keys, filter columns)
-            # Otherwise those columns will be pruned and break the query!
-            columns.update(self._collect_required_columns(plan.input))
-            return columns
-
-        if isinstance(plan, Limit):
-            columns.update(self._collect_required_columns(plan.input))
-            return columns
-
-        if isinstance(plan, Sort):
-            for key in plan.sort_keys:
-                columns.update(pushdown.bare_names(key))
-            columns.update(self._collect_required_columns(plan.input))
-            return columns
-
-        if isinstance(plan, CTE):
-            columns.update(self._collect_required_columns(plan.child))
-            columns.update(self._collect_required_columns(plan.cte_plan))
-            return columns
-
-        if isinstance(plan, (SetOperation, Union)):
-            for child in plan.children():
-                columns.update(self._collect_required_columns(child))
-            return columns
-
+        for expression in plan.direct_expressions():
+            self._collect_expression(expression, columns)
+        for child in plan.children():
+            columns.update(self._collect_required_columns(child))
         return columns
+
+    def _collect_expression(self, expression: Expression, columns: set) -> None:
+        """Names from one expression, including the parts a generic walk
+        cannot see: subquery-bearing expressions hide their probe value and
+        inner plan (pre-decorrelation shapes reach this rule in tests)."""
+        columns.update(pushdown.qualified_or_bare_names(expression))
+        self._collect_subquery_parts(expression, columns)
+
+    def _collect_subquery_parts(self, expression: Expression, columns: set) -> None:
+        """Descend into subquery expressions' hidden fields and subplans."""
+        if isinstance(expression, InSubquery):
+            self._collect_expression(expression.value, columns)
+        if isinstance(expression, QuantifiedComparison):
+            self._collect_expression(expression.left, columns)
+        if isinstance(expression, SUBQUERY_NODE_TYPES):
+            columns.update(self._collect_required_columns(expression.subquery))
+            return
+        for child in expression_children(expression):
+            self._collect_subquery_parts(child, columns)
 
     def _prune_columns(self, plan: LogicalPlanNode, required: set) -> LogicalPlanNode:
         """Prune unused columns from plan."""
@@ -607,10 +585,10 @@ class ProjectionPushdownRule(OptimizationRule):
             return plan
 
         if isinstance(plan, Join):
-            left_req = self._get_required_for_subtree(plan.left, required)
-            right_req = self._get_required_for_subtree(plan.right, required)
-            new_left = self._prune_columns(plan.left, left_req)
-            new_right = self._prune_columns(plan.right, right_req)
+            # Qualified names self-select per scan, so both sides receive the
+            # ONE global required set - no per-side splitting needed.
+            new_left = self._prune_columns(plan.left, required)
+            new_right = self._prune_columns(plan.right, required)
             if new_left != plan.left or new_right != plan.right:
                 return plan.model_copy(update={"left": new_left, "right": new_right})
             return plan
@@ -676,37 +654,56 @@ class ProjectionPushdownRule(OptimizationRule):
         return plan
 
     def _prune_scan_columns(self, scan: Scan, required: set) -> Scan:
-        """Prune columns from scan node."""
-        available = set(scan.columns)
-        needed = available.intersection(required)
+        """Prune a scan to its referenced columns, under the safety guards."""
+        if self._scan_prune_blocked(scan, required):
+            return scan
+        needed = []
+        for column in scan.columns:
+            if self._scan_keeps_column(scan, column, required):
+                needed.append(column)
+        if not needed or len(needed) == len(scan.columns):
+            # Empty means no reference names this relation at all (an
+            # EXISTS-only or hand-built shape): keep everything - a
+            # zero-column scan is not representable as SQL.
+            return scan
+        return scan.model_copy(update={"columns": needed})
 
-        if not needed:
-            needed = available
+    def _scan_prune_blocked(self, scan: Scan, required: set) -> bool:
+        """Guards: a pushed-aggregate scan's columns are its OUTPUT shape and
+        a DISTINCT scan's columns are its deduplication set - both semantic,
+        never a read set to shrink. A star reference means keep-all."""
+        if scan.aggregates or scan.group_by or scan.output_names:
+            return True
+        if scan.distinct:
+            return True
+        return self._star_required(scan, required)
 
-        if needed != available:
-            pruned_cols = []
-            for col in scan.columns:
-                if col in needed:
-                    pruned_cols.append(col)
+    def _star_required(self, scan: Scan, required: set) -> bool:
+        """Whether a bare ``*`` or this relation's ``t.*`` is required."""
+        if "*" in required:
+            return True
+        for name in self._scan_qualifiers(scan):
+            if f"{name}.*" in required:
+                return True
+        return False
 
-            return scan.model_copy(update={"columns": pruned_cols})
+    def _scan_keeps_column(self, scan: Scan, column: str, required: set) -> bool:
+        """A column stays when referenced bare or through any of the scan's
+        relation names (alias and physical table name are both tolerated,
+        mirroring pushdown's side-classification)."""
+        if column in required:
+            return True
+        for name in self._scan_qualifiers(scan):
+            if f"{name}.{column}" in required:
+                return True
+        return False
 
-        return scan
-
-    def _get_required_for_subtree(
-        self, plan: LogicalPlanNode, parent_required: set
-    ) -> set:
-        """Get required columns for a subtree."""
-        local_required = set()
-
-        if isinstance(plan, Scan):
-            if plan.filters:
-                local_required.update(pushdown.bare_names(plan.filters))
-
-        if isinstance(plan, Filter):
-            local_required.update(pushdown.bare_names(plan.predicate))
-
-        return local_required.union(parent_required)
+    def _scan_qualifiers(self, scan: Scan) -> list:
+        """The relation names a reference may use for this scan."""
+        names = [scan.table_name]
+        if scan.alias and scan.alias != scan.table_name:
+            names.append(scan.alias)
+        return names
 
     def name(self) -> str:
         """Return this rule's identifier (used in logging and EXPLAIN)."""
