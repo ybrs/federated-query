@@ -134,3 +134,47 @@ def test_computed_build_side_still_reduces_the_probe(multi_source_env):
     # And the reduced plan computes the same rows as the unreduced semantics.
     result = runtime.execute(sql)
     assert result.num_rows > 0
+
+
+def test_large_key_set_against_duckdb_probe_is_correct():
+    """Above the IN cap (2000 keys) a DuckDB probe used to fall back to a
+    full fetch; it now takes the temp-table semi-join arm. Either way the
+    results must be exact - this pins correctness of the new arm end to end
+    with 3000 distinct build keys."""
+    import duckdb as duckdb_module
+    from federated_query.catalog import Catalog
+    from federated_query.cli.fedq import FedQRuntime
+    from federated_query.config import Config
+    from federated_query.datasources.duckdb import DuckDBDataSource
+    from tests.duckdb_tmp import duckdb_path
+
+    dims = DuckDBDataSource("dims", {"path": duckdb_path(), "read_only": False})
+    dims.connect()
+    dims.connection.execute(
+        "CREATE TABLE keys_side (k BIGINT);"
+        "INSERT INTO keys_side SELECT g * 2 FROM range(0, 3000) t(g);"
+    )
+    facts = DuckDBDataSource("facts", {"path": duckdb_path(), "read_only": False})
+    facts.connect()
+    facts.connection.execute(
+        "CREATE TABLE probe (k BIGINT, v BIGINT);"
+        "INSERT INTO probe SELECT g, g * 10 FROM range(0, 20000) t(g);"
+    )
+    catalog = Catalog()
+    catalog.register_datasource(dims)
+    catalog.register_datasource(facts)
+    catalog.load_metadata()
+    runtime = FedQRuntime(catalog, Config())
+    result = runtime.execute(
+        "SELECT sum(p.v) AS s FROM dims.main.keys_side d "
+        "JOIN facts.main.probe p ON d.k = p.k"
+    )
+    oracle = duckdb_module.connect()
+    oracle.execute(
+        "CREATE TABLE keys_side AS SELECT g * 2 AS k FROM range(0, 3000) t(g);"
+        "CREATE TABLE probe AS SELECT g AS k, g * 10 AS v FROM range(0, 20000) t(g);"
+    )
+    expected = oracle.execute(
+        "SELECT sum(p.v) FROM keys_side d JOIN probe p ON d.k = p.k"
+    ).fetchone()[0]
+    assert result.column("s").to_pylist() == [expected]
