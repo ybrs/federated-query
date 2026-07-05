@@ -7,8 +7,8 @@ what is measured, what is not done.
 
 ```
 merge-engine-datafusion            base
-  └─ nk-decorrelation              (12 commits) Decimal128, q11, Rust cutover, N-K M1-M6, window schema
-       └─ remove-duckdb-merge      (6 commits)  merge-engine removal + committed benchmarks   <-- HEAD
+  `- nk-decorrelation              (12 commits) Decimal128, q11, Rust cutover, N-K M1-M6, window schema
+       `- remove-duckdb-merge      (6 commits)  merge-engine removal + committed benchmarks   <-- HEAD
 ```
 
 Current branch: **remove-duckdb-merge**. Test suite: **1019 passed, 3 skipped, 39 xfailed, 0 failed**
