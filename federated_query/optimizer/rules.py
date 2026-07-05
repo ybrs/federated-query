@@ -3,12 +3,15 @@
 from abc import ABC, abstractmethod
 from typing import List, Optional, TYPE_CHECKING
 from ..plan.logical import (
+    CTE,
     LogicalPlanNode,
     Scan,
     Projection,
     Filter,
+    GroupedLimit,
     Join,
     Aggregate,
+    SingleRowGuard,
     Sort,
     Limit,
     Union,
@@ -492,22 +495,31 @@ class ProjectionPushdownRule(OptimizationRule):
         return self._prune_columns(plan, required_columns)
 
     def _has_explicit_projection(self, plan: LogicalPlanNode) -> bool:
-        """Check if plan has explicit projection (not SELECT *)."""
-        if isinstance(plan, Projection):
+        """Whether the plan pins an explicit output schema at its root chain.
+
+        Pruning is only safe below an explicit Projection/Aggregate (their
+        expression lists define what the query outputs). A plan with no
+        projection anywhere (programmatic Filter(Scan) plans) means SELECT
+        everything: never prune it. Every pass-through node must be seen
+        through here - the missing Sort arm used to no-op the whole rule on
+        every ORDER BY query.
+        """
+        if isinstance(plan, (Projection, Aggregate)):
             return True
-
-        if isinstance(plan, Aggregate):
-            # Aggregates have explicit output schema (group_by + aggregates)
-            # so column pruning should be applied
-            return True
-
-        if isinstance(plan, Filter):
+        if isinstance(plan, (Filter, Limit, Sort, GroupedLimit, SingleRowGuard)):
             return self._has_explicit_projection(plan.input)
-
-        if isinstance(plan, Limit):
-            return self._has_explicit_projection(plan.input)
-
+        if isinstance(plan, CTE):
+            return self._has_explicit_projection(plan.child)
+        if isinstance(plan, (SetOperation, Union)):
+            return self._branches_explicit(plan)
         return False
+
+    def _branches_explicit(self, plan: LogicalPlanNode) -> bool:
+        """A root set operation gates true only when EVERY branch does."""
+        for child in plan.children():
+            if not self._has_explicit_projection(child):
+                return False
+        return True
 
     def _collect_required_columns(self, plan: LogicalPlanNode) -> set:
         """Collect all required column names from plan."""
@@ -563,6 +575,16 @@ class ProjectionPushdownRule(OptimizationRule):
             columns.update(self._collect_required_columns(plan.input))
             return columns
 
+        if isinstance(plan, CTE):
+            columns.update(self._collect_required_columns(plan.child))
+            columns.update(self._collect_required_columns(plan.cte_plan))
+            return columns
+
+        if isinstance(plan, (SetOperation, Union)):
+            for child in plan.children():
+                columns.update(self._collect_required_columns(child))
+            return columns
+
         return columns
 
     def _prune_columns(self, plan: LogicalPlanNode, required: set) -> LogicalPlanNode:
@@ -614,6 +636,43 @@ class ProjectionPushdownRule(OptimizationRule):
                 return plan.model_copy(update={"input": new_input})
             return plan
 
+        if isinstance(plan, CTE):
+            return self._prune_cte(plan, required)
+
+        if isinstance(plan, (SetOperation, Union)):
+            return self._prune_branches(plan, required)
+
+        return plan
+
+    def _prune_cte(self, cte: CTE, required: set) -> LogicalPlanNode:
+        """Prune the WITH query's main child always; the named subplan only
+        when its own root pins an explicit output schema (a bare-plan CTE's
+        scan columns ARE its schema and must not change)."""
+        new_child = self._prune_columns(cte.child, required)
+        new_cte_plan = cte.cte_plan
+        if self._has_explicit_projection(cte.cte_plan):
+            new_cte_plan = self._prune_columns(cte.cte_plan, required)
+        if new_child != cte.child or new_cte_plan != cte.cte_plan:
+            return cte.model_copy(
+                update={"child": new_child, "cte_plan": new_cte_plan}
+            )
+        return cte
+
+    def _prune_branches(self, plan: LogicalPlanNode, required: set) -> LogicalPlanNode:
+        """Prune inside each explicitly-projected branch of a set operation:
+        its root Projection pins the branch's output list, so pruning below it
+        can never disturb the positional alignment across branches."""
+        children = []
+        changed = False
+        for child in plan.children():
+            pruned = child
+            if self._has_explicit_projection(child):
+                pruned = self._prune_columns(child, required)
+            children.append(pruned)
+            if pruned != child:
+                changed = True
+        if changed:
+            return plan.with_children(children)
         return plan
 
     def _prune_scan_columns(self, scan: Scan, required: set) -> Scan:
