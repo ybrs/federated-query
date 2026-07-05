@@ -122,6 +122,7 @@ class PredicatePushdownRule(OptimizationRule):
         no split step.
         """
         filter_node = self._factor_filter_predicate(filter_node)
+        filter_node = self._derive_disjunction_predicates(filter_node)
         input_plan = filter_node.input
         if isinstance(input_plan, Filter):
             return self._merge_filters(filter_node, input_plan)
@@ -201,6 +202,88 @@ class PredicatePushdownRule(OptimizationRule):
             if not self._contains_expr(common, conjunct):
                 rest.append(conjunct)
         return rest
+
+    # An OR with more branches than this derives nothing (the derived
+    # predicate would be as long as the original and rarely selective).
+    _MAX_DERIVE_BRANCHES = 8
+
+    def _derive_disjunction_predicates(self, filter_node: Filter) -> Filter:
+        """Add per-relation predicates IMPLIED by multi-relation ORs.
+
+        From ``(A1 and B1) or (A2 and B2)`` where the A's constrain only
+        relation RA and the B's only RB, every satisfying row also satisfies
+        ``(A1 or A2)`` and ``(B1 or B2)`` - single-relation predicates that
+        CAN push into their scans even though the OR itself cannot (TPC-H
+        q07's FRANCE/GERMANY pair kept both nation scans unfiltered). The
+        original OR stays for exactness; the derived conjuncts are redundant
+        but pushable. Already-present conjuncts are never re-added, and the
+        scan merge is unique, so the optimizer fixpoint stays stable.
+        """
+        conjuncts = split_conjuncts(filter_node.predicate)
+        derived = self._derived_from_disjunctions(conjuncts)
+        if not derived:
+            return filter_node
+        return filter_node.model_copy(
+            update={"predicate": combine_and(conjuncts + derived)}
+        )
+
+    def _derived_from_disjunctions(self, conjuncts) -> List[Expression]:
+        """The implied single-relation ORs not already among the conjuncts."""
+        derived: List[Expression] = []
+        for conjunct in conjuncts:
+            for candidate in self._implied_single_relation_ors(conjunct):
+                if not self._contains_expr(conjuncts + derived, candidate):
+                    derived.append(candidate)
+        return derived
+
+    def _implied_single_relation_ors(self, conjunct) -> List[Expression]:
+        """The per-relation predicates implied by one OR conjunct."""
+        branches = split_disjuncts(conjunct)
+        if len(branches) < 2 or len(branches) > self._MAX_DERIVE_BRANCHES:
+            return []
+        per_branch = []
+        for branch in branches:
+            per_branch.append(self._single_relation_groups(split_conjuncts(branch)))
+        implied = []
+        for relation in self._relations_in_every_branch(per_branch):
+            implied.append(self._relation_or(per_branch, relation))
+        return implied
+
+    def _relations_in_every_branch(self, per_branch) -> List[str]:
+        """Relations that EVERY branch constrains (else the implied predicate
+        would be TRUE and useless), in deterministic order."""
+        relations = set(per_branch[0])
+        for groups in per_branch[1:]:
+            relations = relations & set(groups)
+        return sorted(relations)
+
+    def _relation_or(self, per_branch, relation: str) -> Expression:
+        """OR together each branch's conjuncts on one relation."""
+        parts = []
+        for groups in per_branch:
+            parts.append(combine_and(groups[relation]))
+        return combine_or(parts)
+
+    def _single_relation_groups(self, branch_conjuncts):
+        """A branch's conjuncts grouped by the ONE relation they reference."""
+        groups: dict = {}
+        for conjunct in branch_conjuncts:
+            relation = self._sole_relation(conjunct)
+            if relation is not None:
+                groups.setdefault(relation, []).append(conjunct)
+        return groups
+
+    def _sole_relation(self, expression: Expression) -> Optional[str]:
+        """The single qualifier every column of an expression carries, or
+        None (unqualified refs, multiple relations, or no columns at all)."""
+        qualifiers = set()
+        for ref in pushdown.column_refs(expression):
+            if not ref.table:
+                return None
+            qualifiers.add(ref.table)
+        if len(qualifiers) == 1:
+            return next(iter(qualifiers))
+        return None
 
     def _rehome_filter_over_opaque(
         self, filter_node: Filter, input_plan: LogicalPlanNode
@@ -298,18 +381,21 @@ class PredicatePushdownRule(OptimizationRule):
         return Filter.create(input=new_project, predicate=combine_and(above))
 
     def _push_filter_to_scan(self, filter_node: Filter, scan: Scan) -> LogicalPlanNode:
-        """Push filter into scan node."""
-        from ..plan.expressions import BinaryOp, BinaryOpType
+        """Push filter into scan node, merging conjuncts UNIQUELY.
 
-        if scan.filters:
-            # The scan already carries a pushed predicate; AND the new filter's
-            # predicate onto it so both conditions apply at the source.
-            merged = BinaryOp.create(
-                op=BinaryOpType.AND, left=scan.filters, right=filter_node.predicate
-            )
-            return scan.model_copy(update={"filters": merged})
-
-        return scan.model_copy(update={"filters": filter_node.predicate})
+        A conjunct the scan already carries is not re-ANDed: derived
+        predicates (see _derive_disjunction_predicates) are re-derived from
+        the surviving OR on every optimizer pass, and a blind AND would grow
+        the scan filter each iteration and never reach the fixpoint.
+        """
+        existing = split_conjuncts(scan.filters) if scan.filters else []
+        merged = list(existing)
+        for conjunct in split_conjuncts(filter_node.predicate):
+            if not self._contains_expr(merged, conjunct):
+                merged.append(conjunct)
+        if merged == existing:
+            return scan
+        return scan.model_copy(update={"filters": combine_and(merged)})
 
     def _push_filter_below_join(
         self, filter_node: Filter, join: Join

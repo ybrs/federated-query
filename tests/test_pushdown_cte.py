@@ -321,3 +321,66 @@ def test_aggregate_pushdown_descends_below_an_unfoldable_aggregate():
     assert result is not None
     folded = _scan_of(result.input.right)
     assert folded.group_by, "the inner aggregate never folded onto its scan"
+
+
+def _or_pair_filter(join):
+    """The q07 shape: (n1=F AND n2=G) OR (n1=G AND n2=F) above a join."""
+    def name_eq(alias, value):
+        return BinaryOp(
+            op=BinaryOpType.EQ,
+            left=_col(alias, "n_name"),
+            right=Literal(value=value, data_type=DataType.VARCHAR),
+        )
+    disjunction = BinaryOp(
+        op=BinaryOpType.OR,
+        left=BinaryOp(op=BinaryOpType.AND, left=name_eq("n1", "FRANCE"),
+                      right=name_eq("n2", "GERMANY")),
+        right=BinaryOp(op=BinaryOpType.AND, left=name_eq("n1", "GERMANY"),
+                       right=name_eq("n2", "FRANCE")),
+    )
+    return Filter(input=join, predicate=disjunction)
+
+
+def test_disjunction_derives_pushable_single_relation_predicates():
+    """From (n1=F AND n2=G) OR (n1=G AND n2=F) the rule derives the implied
+    single-relation predicates (n1=F OR n1=G) and (n2=G OR n2=F) and pushes
+    them into the nation scans - the OR itself stays above for exactness.
+    Without this, q07 scanned ALL nations and filtered at the very top."""
+    n1 = _scan("nation", "n1", ("n_name", "n_nationkey"))
+    n2 = _scan("nation", "n2", ("n_name", "n_nationkey"))
+    join = Join(
+        left=n1, right=n2, join_type=JoinType.INNER,
+        condition=BinaryOp(op=BinaryOpType.EQ, left=_col("n1", "n_nationkey"),
+                           right=_col("n2", "n_nationkey")),
+    )
+    result = PredicatePushdownRule().apply(_or_pair_filter(join))
+    assert result is not None
+    scans = {}
+    _collect_scans_by_alias(result, scans)
+    assert scans["n1"].filters is not None, "n1 scan received no derived filter"
+    assert scans["n2"].filters is not None, "n2 scan received no derived filter"
+
+
+def test_derivation_is_fixpoint_stable():
+    """Re-deriving on the next optimizer pass must not duplicate the pushed
+    predicate on the scan (unique-conjunct merge)."""
+    n1 = _scan("nation", "n1", ("n_name", "n_nationkey"))
+    n2 = _scan("nation", "n2", ("n_name", "n_nationkey"))
+    join = Join(
+        left=n1, right=n2, join_type=JoinType.INNER,
+        condition=BinaryOp(op=BinaryOpType.EQ, left=_col("n1", "n_nationkey"),
+                           right=_col("n2", "n_nationkey")),
+    )
+    rule = PredicatePushdownRule()
+    once = rule.apply(_or_pair_filter(join))
+    twice = rule.apply(once)
+    settled = twice if twice is not None else once
+    assert settled == once, "second application changed the plan"
+
+
+def _collect_scans_by_alias(plan, found):
+    """Walk the tree collecting scans by alias."""
+    if isinstance(plan, Scan):
+        found[plan.alias] = plan
+    for child in plan.children():
+        _collect_scans_by_alias(child, found)
