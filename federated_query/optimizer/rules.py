@@ -26,7 +26,9 @@ from ..plan.logical import (
 from . import pushdown
 from .scope_validator import validate_scope
 from ..plan.expressions import (
+    ColumnRef,
     Expression,
+    FunctionCall,
     InList,
     InSubquery,
     BetweenExpression,
@@ -551,23 +553,40 @@ class ProjectionPushdownRule(OptimizationRule):
         return columns
 
     def _collect_expression(self, expression: Expression, columns: set) -> None:
-        """Names from one expression, including the parts a generic walk
-        cannot see: subquery-bearing expressions hide their probe value and
-        inner plan (pre-decorrelation shapes reach this rule in tests)."""
-        columns.update(pushdown.qualified_or_bare_names(expression))
-        self._collect_subquery_parts(expression, columns)
+        """Names from one expression tree, including the parts a generic walk
+        cannot see (subquery-bearing expressions hide their probe value and
+        inner plan) and EXCLUDING count-star calls: COUNT(*) counts rows and
+        needs no columns, so its star argument must not poison the required
+        set and disable pruning for the whole query. A genuine star
+        projection still blocks pruning via the scan-level star guard."""
+        if self._is_count_star(expression):
+            return
+        if isinstance(expression, ColumnRef):
+            columns.update(pushdown.qualified_or_bare_names(expression))
+            return
+        self._collect_subquery_fields(expression, columns)
+        for child in expression_children(expression):
+            self._collect_expression(child, columns)
 
-    def _collect_subquery_parts(self, expression: Expression, columns: set) -> None:
-        """Descend into subquery expressions' hidden fields and subplans."""
+    def _is_count_star(self, expression: Expression) -> bool:
+        """A COUNT over a single star argument - the row-count aggregate."""
+        if not isinstance(expression, FunctionCall):
+            return False
+        if expression.function_name.upper() != "COUNT":
+            return False
+        if len(expression.args) != 1:
+            return False
+        argument = expression.args[0]
+        return isinstance(argument, ColumnRef) and argument.column == "*"
+
+    def _collect_subquery_fields(self, expression: Expression, columns: set) -> None:
+        """Collect the fields subquery expressions hide from a generic walk."""
         if isinstance(expression, InSubquery):
             self._collect_expression(expression.value, columns)
         if isinstance(expression, QuantifiedComparison):
             self._collect_expression(expression.left, columns)
         if isinstance(expression, SUBQUERY_NODE_TYPES):
             columns.update(self._collect_required_columns(expression.subquery))
-            return
-        for child in expression_children(expression):
-            self._collect_subquery_parts(child, columns)
 
     def _prune_columns(self, plan: LogicalPlanNode, required: set) -> LogicalPlanNode:
         """Prune every scan in the plan to the required qualified names.

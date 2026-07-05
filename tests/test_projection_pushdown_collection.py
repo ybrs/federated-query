@@ -168,7 +168,7 @@ def test_distinct_scan_untouched():
 
 
 def test_star_reference_keeps_all_columns():
-    """A star reference (COUNT(*) carries ColumnRef('*')) means keep all."""
+    """A genuine star PROJECTION (not COUNT(*)) means keep all columns."""
     star = ColumnRef(table=None, column="*", data_type=DataType.INTEGER)
     tree = Projection(input=_scan(), expressions=[star], aliases=["star"])
     result = ProjectionPushdownRule().apply(tree)
@@ -189,3 +189,26 @@ def test_never_referenced_scan_keeps_all_columns():
     scans = _scans_by_alias(result)
     assert scans["t"].columns == ["a"]
     assert scans["u"].columns == ["x", "y"]
+
+
+def test_count_star_does_not_block_pruning():
+    """COUNT(*) counts rows and needs no columns: its star argument must not
+    poison the required set and disable pruning for the whole query (q21
+    kept every scan full-width because of the count(*) in its SELECT list)."""
+    from federated_query.plan.expressions import FunctionCall
+    from federated_query.plan.logical import Aggregate
+
+    count_star = FunctionCall(
+        function_name="COUNT",
+        args=[ColumnRef(table=None, column="*", data_type=DataType.INTEGER)],
+        is_aggregate=True,
+    )
+    tree = Aggregate(
+        input=_scan(),
+        group_by=[_col("t", "a")],
+        aggregates=[_col("t", "a"), count_star],
+        output_names=["a", "n"],
+    )
+    result = ProjectionPushdownRule().apply(tree)
+    assert result is not None
+    assert _scans_by_alias(result)["t"].columns == ["a"]
