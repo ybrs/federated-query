@@ -247,3 +247,61 @@ def step_targets_facts_island(step):
     """The injected raw query must be the facts island (joins both tables)."""
     raw = step["scan"]["raw_sql"].upper()
     return "ORDERS" in raw and "LINEITEM" in raw and step["datasource"] == "facts"
+
+
+def test_semi_join_reduces_the_preserved_side():
+    """An IN-subquery decorrelates to a SEMI join; the subquery side's keys
+    must inject into the preserved side's scan (the injected IN filter IS
+    the semi condition; the coordinator semi join stays for exactness)."""
+    import duckdb as duckdb_module
+    from federated_query.catalog import Catalog
+    from federated_query.cli.fedq import FedQRuntime
+    from federated_query.config import Config
+    from federated_query.datasources.duckdb import DuckDBDataSource
+    from tests.duckdb_tmp import duckdb_path
+
+    facts = DuckDBDataSource("facts", {"path": duckdb_path(), "read_only": False})
+    facts.connect()
+    facts.connection.execute(
+        "CREATE TABLE orders (o_id INTEGER, o_v INTEGER);"
+        "INSERT INTO orders SELECT g, g % 50 FROM range(0, 500) t(g);"
+    )
+    dims = DuckDBDataSource("dims", {"path": duckdb_path(), "read_only": False})
+    dims.connect()
+    dims.connection.execute(
+        "CREATE TABLE lineitem (l_o INTEGER, l_q INTEGER);"
+        "INSERT INTO lineitem SELECT g % 500, g % 9 FROM range(0, 5000) t(g);"
+    )
+    catalog = Catalog()
+    catalog.register_datasource(facts)
+    catalog.register_datasource(dims)
+    catalog.load_metadata()
+    runtime = FedQRuntime(catalog, Config())
+    sql = (
+        "SELECT o.o_id FROM facts.main.orders o WHERE o.o_id IN ("
+        "SELECT l.l_o FROM dims.main.lineitem l GROUP BY l.l_o"
+        " HAVING sum(l.l_q) > 42)"
+    )
+    plan = runtime.query_executor._plan_pipeline(sql, None)
+    ir = build_ir(plan)
+    injected = []
+    for step in ir["steps"]:
+        if step.get("op") == "injected_scan" and step["datasource"] == "facts":
+            injected.append(step)
+    assert injected, f"orders never reduced; steps: {ir['steps']}"
+    assert injected[0]["inject_column"] == "o_id"
+    result = runtime.execute(sql)
+    oracle = duckdb_module.connect()
+    oracle.execute(
+        "CREATE TABLE orders AS SELECT g AS o_id, g % 50 AS o_v"
+        " FROM range(0, 500) t(g);"
+        "CREATE TABLE lineitem AS SELECT g % 500 AS l_o, g % 9 AS l_q"
+        " FROM range(0, 5000) t(g);"
+    )
+    expected = set()
+    for row in oracle.execute(
+        "SELECT o_id FROM orders WHERE o_id IN (SELECT l_o FROM lineitem"
+        " GROUP BY l_o HAVING sum(l_q) > 42)"
+    ).fetchall():
+        expected.add(row[0])
+    assert set(result.column("o_id").to_pylist()) == expected

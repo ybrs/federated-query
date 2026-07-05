@@ -1214,7 +1214,10 @@ class AggregatePushdownRule(OptimizationRule):
             if isinstance(filter_input, Scan):
                 return self._push_to_scan(agg, filter_input, input_node.predicate)
 
-        return agg
+        # This aggregate cannot fold, but its INPUT may still hold foldable
+        # aggregates (a HAVING subquery under the main query's aggregate);
+        # stopping here left q18's subquery aggregating on the coordinator.
+        return transform_children(agg, self._push_aggregate)
 
     def _push_to_scan(
         self, agg: Aggregate, scan: Scan, filter_expr: Optional[Expression]

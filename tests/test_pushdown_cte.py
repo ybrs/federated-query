@@ -279,3 +279,45 @@ def test_q15_shape_explains_and_pushes_body_remote():
             row.append(column[index].as_py())
         got.append(tuple(row))
     assert got == expected
+
+
+def test_aggregate_pushdown_descends_below_an_unfoldable_aggregate():
+    """A HAVING subquery under the main query's aggregate: the OUTER
+    aggregate cannot fold (its input is a join), but the INNER aggregate
+    over a scan must still fold - the walker used to stop dead at the outer
+    one, leaving q18's subquery to aggregate 6M rows on the coordinator."""
+    inner_agg = Aggregate(
+        input=_scan("lineitem", "l2", ("l_o", "l_q")),
+        group_by=[_col("l2", "l_o")],
+        aggregates=[
+            _col("l2", "l_o"),
+            FunctionCall(function_name="SUM", args=[_col("l2", "l_q")],
+                         is_aggregate=True),
+        ],
+        output_names=["l_o", "total"],
+    )
+    subquery = SubqueryScan(
+        input=Projection(
+            input=Filter(input=inner_agg, predicate=_gt(_col("l2", "total"), 300)),
+            expressions=[_col("l2", "l_o")],
+            aliases=["k"],
+        ),
+        alias="__subq_0",
+    )
+    join = Join(
+        left=_scan("orders", "o", ("o_id", "o_v")),
+        right=subquery,
+        join_type=JoinType.SEMI,
+        condition=BinaryOp(op=BinaryOpType.EQ, left=_col("o", "o_id"),
+                           right=_col("__subq_0", "k")),
+    )
+    outer = Aggregate(
+        input=join,
+        group_by=[_col("o", "o_v")],
+        aggregates=[_col("o", "o_v")],
+        output_names=["o_v"],
+    )
+    result = AggregatePushdownRule().apply(outer)
+    assert result is not None
+    folded = _scan_of(result.input.right)
+    assert folded.group_by, "the inner aggregate never folded onto its scan"

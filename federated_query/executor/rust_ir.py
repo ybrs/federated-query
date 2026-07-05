@@ -746,9 +746,15 @@ def _can_reduce(join):
     anyway, so collecting its distinct keys costs nothing extra and the
     adaptive strategy in the engine (IN list / temp table / full-scan guard)
     decides how the keys reach the probe's source."""
-    if join.join_type != JoinType.INNER:
-        return False
     if len(join.left_keys) != 1 or len(join.right_keys) != 1:
+        return False
+    if join.join_type == JoinType.SEMI:
+        # For a SEMI join the injected IN filter IS the join condition: keys
+        # always come from the existential right side and pre-filter the
+        # preserved left probe; the coordinator semi join stays for
+        # exactness. ANTI must never inject (it would keep the wrong rows).
+        return _probe_preference(join.left) > 0
+    if join.join_type != JoinType.INNER:
         return False
     return _probe_preference(join.left) > 0 or _probe_preference(join.right) > 0
 
@@ -788,9 +794,13 @@ def _emit_reduced_join(join, ctx):
 def _orient_join(join):
     """Pick build/probe sides and their join keys.
 
-    When both sides are plain scans the planner's build_side choice stands.
-    Otherwise the side ranking higher as an injection target is the PROBE
-    (the reduction exists to cut the big read) and the other donates keys."""
+    A SEMI join's sides have fixed roles: the existential right side donates
+    keys and the preserved left side is the probe. For INNER joins: when both
+    sides are plain scans the planner's build_side choice stands; otherwise
+    the side ranking higher as an injection target is the PROBE (the
+    reduction exists to cut the big read) and the other donates keys."""
+    if join.join_type == JoinType.SEMI:
+        return join.right, join.left, join.right_keys[0], join.left_keys[0]
     if _injectable_scan(join.left) and _injectable_scan(join.right):
         if join.build_side == "left":
             return join.left, join.right, join.left_keys[0], join.right_keys[0]
