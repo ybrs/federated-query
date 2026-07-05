@@ -1,4 +1,4 @@
-# Status: eight phases live; fair federated gap 38.6x -> 4.02x
+# Status: nine phases live; fair federated gap 38.6x -> 3.61x
 
 State of the work. Facts only: what exists, what passes, what is measured,
 what is not done. Previous phase (Rust cutover, N-K decorrelation, merge-engine
@@ -13,7 +13,7 @@ merge-engine-datafusion
             `- feature/cost-based-optimizer   <-- HEAD (this document)
 ```
 
-Test suite: **1140 passed, 3 skipped, 39 xfailed, 0 failed**
+Test suite: **1149 passed, 3 skipped, 39 xfailed, 0 failed**
 (`POSTGRES_DB=duckpoc python -m pytest -q`). `make lint` green.
 
 ## What was built on this branch
@@ -214,18 +214,36 @@ Gate (report-result-37c413d.md): fedpgduck SF1 4786 -> 4147ms (4.02x), all
 132 cells correct. Full run: 38.55x -> 23.24 -> 11.36 -> 8.60 -> 5.10 ->
 5.01 -> 4.43 -> **4.02x**. Single-source SF1: 2.05x.
 
+## Semi-join pushdown (q18, commit 1b5c9da)
+
+SemiJoinPushdownRule commutes SEMI/ANTI joins below the INNER join they sit
+on when the semi condition references only ONE inner side
+(SEMI(A JOIN B, p) == SEMI(A, p) JOIN B for p over A) - so a selective
+existential (q18: an orders-only HAVING subquery keeping 57 of 1.5M orders)
+runs BEFORE the fact join, and the reduced orders feed the existing
+dynamic-filter reduction of lineitem. Fires only for the provable shape
+(plain INNER host, one-sided condition; every gate unit-tested). Surfaced +
+fixed a latent cost-model bug: _scan_needed_columns requested source stats
+for a pushed-aggregate scan's HAVING columns (aggregate output aliases, not
+stored columns) - now restricted to real base columns.
+
+Gate (report-result-1b5c9da.md): fedpgduck SF1 4147 -> 3820ms (3.61x), all
+132 cells correct. q18 653 -> 199ms (7.3x -> 2.3x); nothing else moved.
+Nine-phase run: 38.55x -> 3.61x; single-source SF1 2.15x. 18/22 fair queries
+under 5x, 8/22 under 3x.
+
 ## Known gaps / next work (in priority order from the data)
 
-1. **Small-scale fixed overhead**: fedpgduck SF0.1 is 5.03x on 20-90ms
-   queries - per-query planning/stat-fetch/ingest constants dominate, not
-   plans. The biggest remaining ratio lever if low-latency matters.
-2. **q18 (653ms/7.2x)** and **q07 (280ms/6.5x)** residuals: legitimate
-   in-source aggregation work + remaining transfers; diminishing returns at
-   the rule layer.
-3. **Duck guard precision** (planner NDV as an IR hint), **TRANSFER_WEIGHT
+1. **Small-scale fixed overhead**: fedpgduck SF0.1 is 4.60x on 20-90ms
+   queries - per-query planning/stat-fetch/ingest constants, not plans. The
+   biggest remaining RATIO lever, but only if low-latency matters.
+2. **q07 (283ms/6.0x)**: OR-derivation helped but the two-nation shape still
+   leaves a mid-size intermediate; diminishing returns.
+3. **q09/q21/q10/q13 (3-5x, 280-590ms)**: residual multi-fact transfer +
+   genuine coordinator join work; the long flat tail.
+4. **Duck guard precision** (planner NDV as an IR hint), **TRANSFER_WEIGHT
    calibration** (1.0), **CTE materialize-once**.
-4. **fedqrs missing operators** (18 xfails); `enable_decorrelation` flag
-   unwired.
+5. **fedqrs missing operators** (18 xfails); `enable_decorrelation` unwired.
 
 ## How to run
 
