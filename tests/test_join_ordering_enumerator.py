@@ -66,6 +66,15 @@ class _StubEstimator(RegionEstimator):
             rows=max(1, int(rows)), defaults_used=[]
         )
 
+    def cross_estimate(self, region, left, right, conjuncts):
+        """left x right x the spanning conjuncts' selectivities."""
+        rows = float(left.rows) * float(right.rows)
+        for conjunct in conjuncts:
+            rows *= self.selectivity_by_edge[conjunct.atom_indexes]
+        return CardinalityEstimate.create(
+            rows=max(1, int(rows)), defaults_used=[]
+        )
+
 
 def _region(names, edges):
     """A region of named atoms plus (i, j) equi edges."""
@@ -176,10 +185,10 @@ def test_disconnected_components_cross_at_top_smallest_first():
     region = _region(names, edges)
     order = choose_order(region, _StubEstimator(rows, selectivity), max_dp_size=10)
     assert len(order.components) == 2
-    assert len(order.cross_estimates) == 1
+    assert len(order.cross_steps) == 1
     # c-d yields 10 rows, a-b yields 1000: the smaller component leads.
     assert order.components[0].first_atom in (2, 3)
-    assert order.cross_estimates[0].rows == 10 * 1000
+    assert order.cross_steps[0].estimate.rows == 10 * 1000
 
 
 def test_greedy_used_above_dp_limit():
@@ -238,3 +247,96 @@ def test_every_multi_atom_conjunct_placed_exactly_once():
         if len(conjunct.atom_indexes) >= 2:
             expected.append(position)
     assert sorted(placed) == sorted(expected)
+
+
+def _q07_shape():
+    """The q07 join graph: n1 and n2 are connected to each other ONLY by a
+    non-equi conjunct (the FRANCE/GERMANY OR), while every other connection
+    is an equi key. Measured: starting with the n1 x n2 pair executes as a
+    nested-loop/cross and runs 7x slower than joining n2 last through its
+    equi key, despite the pair's tiny estimated output."""
+    names = ["n1", "n2", "supplier", "lineitem", "orders", "customer"]
+    edges = [
+        (0, 2),  # n1-supplier (equi)
+        (2, 3),  # supplier-lineitem (equi)
+        (3, 4),  # lineitem-orders (equi)
+        (4, 5),  # orders-customer (equi)
+        (1, 5),  # n2-customer (equi)
+    ]
+    region = _region(names, edges)
+    # The OR conjunct: non-equi, spanning n1 and n2 only.
+    or_conjunct = JoinConjunct(
+        expression=BinaryOp(
+            op=BinaryOpType.OR,
+            left=ColumnRef(table="n1", column="n_name", data_type=DataType.VARCHAR),
+            right=ColumnRef(table="n2", column="n_name", data_type=DataType.VARCHAR),
+        ),
+        atom_indexes=frozenset({0, 1}),
+        is_equi=False,
+    )
+    conjuncts = list(region.conjuncts)
+    conjuncts.append(or_conjunct)
+    region = JoinRegion(atoms=region.atoms, conjuncts=conjuncts)
+    rows = {0: 25, 1: 25, 2: 10_000, 3: 6_000_000, 4: 1_500_000, 5: 150_000}
+    selectivity = {
+        frozenset({0, 2}): 1.0 / 25,
+        frozenset({2, 3}): 1.0 / 10_000,
+        frozenset({3, 4}): 1.0 / 1_500_000,
+        frozenset({4, 5}): 1.0 / 150_000,
+        frozenset({1, 5}): 1.0 / 25,
+        frozenset({0, 1}): 0.0032,  # the OR's true selectivity - very small
+    }
+    return region, _StubEstimator(rows, selectivity)
+
+
+def test_q07_shape_never_pairs_on_a_non_equi_edge():
+    """Even though the n1 x n2 pair has the smallest estimated output, every
+    join step must place at least one EQUI conjunct: a non-equi-only
+    connection is a nested-loop in the engine, not a hash join."""
+    region, estimator = _q07_shape()
+    order = choose_order(region, estimator, max_dp_size=10)
+    assert len(order.components) == 1
+    for step in order.components[0].steps:
+        placed_equi = False
+        for position in step.conjunct_positions:
+            if region.conjuncts[position].is_equi:
+                placed_equi = True
+        assert placed_equi, "a step joined without any equi key"
+
+
+def test_q07_shape_or_conjunct_still_placed_once():
+    """The non-equi OR conjunct is still placed exactly once (on the step
+    that completes its atom set), so predicate conservation holds."""
+    region, estimator = _q07_shape()
+    order = choose_order(region, estimator, max_dp_size=10)
+    or_position = len(region.conjuncts) - 1
+    placements = 0
+    for component in order.components:
+        for step in component.steps:
+            if or_position in step.conjunct_positions:
+                placements += 1
+    for cross in order.cross_steps:
+        if or_position in cross.conjunct_positions:
+            placements += 1
+    assert placements == 1
+
+
+def test_non_equi_only_connection_splits_components():
+    """Two atoms linked ONLY by a non-equi conjunct are separate components:
+    the conjunct rides on the CROSS step between them, never lost."""
+    region = _region(["a", "b"], [])
+    non_equi = JoinConjunct(
+        expression=BinaryOp(
+            op=BinaryOpType.GT,
+            left=ColumnRef(table="a", column="k", data_type=DataType.INTEGER),
+            right=ColumnRef(table="b", column="k", data_type=DataType.INTEGER),
+        ),
+        atom_indexes=frozenset({0, 1}),
+        is_equi=False,
+    )
+    region = JoinRegion(atoms=region.atoms, conjuncts=[non_equi])
+    estimator = _StubEstimator({0: 10, 1: 20}, {frozenset({0, 1}): 0.5})
+    order = choose_order(region, estimator, max_dp_size=10)
+    assert len(order.components) == 2
+    assert len(order.cross_steps) == 1
+    assert order.cross_steps[0].conjunct_positions == [0]

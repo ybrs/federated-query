@@ -87,13 +87,19 @@ Test suite: **1096 passed, 3 skipped, 39 xfailed, 0 failed**
 
 ## Known gaps / next work (in priority order from the data)
 
-1. **q07 regression (single SF1: 193 -> 740ms, 12.4x).** The
-   FRANCE/GERMANY OR predicate spans the two nation atoms; it is a
-   cross-side residual conjunct estimated with `stats=None`, so its
-   equalities get `DEFAULT_EQ_SELECTIVITY` instead of 1/ndv(n_name) - the
-   misestimate steers the DP into a worse order than FROM order. Fix:
-   resolve column stats for residual-conjunct selectivity (the resolver
-   already exists for join keys). THE CURRENT TASK.
+1. **q07 regression: FIXED (single SF1: 740 -> 101ms, now 1.8x vs DuckDB
+   and 2x faster than the original FROM order).** Root cause was NOT the OR
+   selectivity: the DP joined the n1 x n2 nation pair first (tiny estimated
+   output) but a non-equi-only connection executes as a nested-loop/cross
+   in the engine - measured 7x slower than routing n2 through its equi key.
+   Fix: join-graph CONNECTIVITY is equi edges only; non-equi conjuncts
+   never make atoms adjacent, they place as residual filters on the step
+   (or the CROSS between components) that first covers their atoms.
+   Noted trade-off: cross-source (fedpgduck SF1) q07 settles at ~2.7s while
+   the pair-first plan ran 1.25s there - the pair plan minimized DATA
+   MOVEMENT. Evidence for the locality term at the `join_tree_cost` seam
+   (gap 3); with the fix nothing anywhere is worse than the pre-optimizer
+   baseline.
 2. **q15 (105x single, 175x fedpgduck at SF1).** View + window shape;
    unchanged by join ordering (never was a join-order problem). Next big
    single-query win.

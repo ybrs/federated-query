@@ -71,6 +71,14 @@ class RegionEstimator(ABC):
         """The estimated rows of joining the accumulated left side with one
         atom under the conjuncts newly placed at this step."""
 
+    @abstractmethod
+    def cross_estimate(
+        self, region: JoinRegion, left: CardinalityEstimate,
+        right: CardinalityEstimate, conjuncts: List[JoinConjunct],
+    ) -> CardinalityEstimate:
+        """The estimated rows of CROSSing two component subtrees, reduced by
+        any non-equi conjuncts that span them."""
+
 
 class JoinStep(StateModel):
     """One left-deep join step: the atom joined, the estimate, and which
@@ -123,26 +131,49 @@ class ComponentOrder(StateModel):
         )
 
 
+class CrossStep(StateModel):
+    """One CROSS between successive component subtrees: its estimate and the
+    (non-equi) region conjuncts that span the two sides and ride on it."""
+
+    estimate: CardinalityEstimate
+    conjunct_positions: List[int]
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        estimate: CardinalityEstimate,
+        conjunct_positions: List[int],
+    ) -> "CrossStep":
+        """Sanctioned fresh-construction path for CrossStep.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            estimate=estimate,
+            conjunct_positions=conjunct_positions,
+        )
+
+
 class RegionOrder(StateModel):
     """The whole region's order: component subtrees combined by CROSS joins,
-    with one estimate per CROSS between successive components."""
+    with one step per CROSS between successive components."""
 
     components: List[ComponentOrder]
-    cross_estimates: List[CardinalityEstimate]
+    cross_steps: List[CrossStep]
 
     @classmethod
     def create(
         cls,
         *,
         components: List[ComponentOrder],
-        cross_estimates: List[CardinalityEstimate],
+        cross_steps: List[CrossStep],
     ) -> "RegionOrder":
         """Sanctioned fresh-construction path for RegionOrder.
         Names every field so none is dropped; derive from an existing node
         with model_copy(update=...) instead of re-listing fields here."""
         return cls(
             components=components,
-            cross_estimates=cross_estimates,
+            cross_steps=cross_steps,
         )
 
 
@@ -171,7 +202,7 @@ def choose_order(
             _order_component(region, estimator, atom_estimates, component, max_dp_size)
         )
     ordered.sort(key=_component_sort_key)
-    return _combine(ordered)
+    return _combine(region, estimator, ordered)
 
 
 def _atom_estimates(region, estimator) -> List[CardinalityEstimate]:
@@ -193,11 +224,20 @@ def _local_conjuncts(region, atom_index: int) -> List[JoinConjunct]:
 
 
 def _adjacency(region) -> Dict[int, Set[int]]:
-    """Atom adjacency: every pair inside a multi-atom conjunct is connected."""
+    """Atom adjacency over EQUI conjuncts only.
+
+    Only a column-to-column equality is a hash-joinable edge; a non-equi
+    conjunct executes as a nested-loop/cross in the engine, which is far more
+    expensive than its estimated output suggests (measured on TPC-H q07: the
+    non-equi nation pair ran 7x slower than joining through the equi path).
+    Non-equi conjuncts still place - on the step or CROSS that covers them -
+    they just never make two atoms adjacent."""
     adjacency: Dict[int, Set[int]] = {}
     for atom in region.atoms:
         adjacency[atom.index] = set()
     for conjunct in region.conjuncts:
+        if not conjunct.is_equi:
+            continue
         for first in conjunct.atom_indexes:
             for second in conjunct.atom_indexes:
                 if first != second:
@@ -318,10 +358,11 @@ def _extend_subset(
 def _try_extend(
     region, estimator, atom_estimates, candidate, subset, atom_index: int
 ) -> Optional[_Candidate]:
-    """The candidate extended by one atom, or None when no conjunct connects
-    the atom to the subset (a cross product - never generated here)."""
+    """The candidate extended by one atom, or None when no EQUI conjunct
+    connects the atom to the subset (a cross product or nested-loop join -
+    never generated inside a component)."""
     positions = _newly_covered(region, subset, atom_index)
-    if not positions:
+    if not _any_equi(region, positions):
         return None
     estimate = estimator.join_estimate(
         region, candidate.estimate, atom_index, atom_estimates[atom_index],
@@ -343,13 +384,27 @@ def _newly_covered(region, subset, atom_index: int) -> List[int]:
     when this atom joins the subset (each conjunct is placed exactly once)."""
     grown = set(subset)
     grown.add(atom_index)
+    return _newly_covered_set(region, set(subset), grown)
+
+
+def _newly_covered_set(region, old_atoms: Set[int], new_atoms: Set[int]) -> List[int]:
+    """Positions of the multi-atom conjuncts covered by new_atoms but not by
+    old_atoms - the ones a step growing old to new must place."""
     positions = []
     for position, conjunct in enumerate(region.conjuncts):
         if len(conjunct.atom_indexes) < 2:
             continue
-        if conjunct.atom_indexes <= grown and not conjunct.atom_indexes <= subset:
+        if conjunct.atom_indexes <= new_atoms and not conjunct.atom_indexes <= old_atoms:
             positions.append(position)
     return positions
+
+
+def _any_equi(region, positions: List[int]) -> bool:
+    """Whether any of the conjuncts at these positions is an equi edge."""
+    for position in positions:
+        if region.conjuncts[position].is_equi:
+            return True
+    return False
 
 
 def _conjuncts_at(region, positions: List[int]) -> List[JoinConjunct]:
@@ -441,22 +496,55 @@ def _component_sort_key(order: ComponentOrder) -> tuple:
     return (order.total.rows, sequence)
 
 
-def _combine(ordered: List[ComponentOrder]) -> RegionOrder:
-    """Combine component orders with CROSS joins, smallest output first."""
-    cross_estimates: List[CardinalityEstimate] = []
+def _combine(region, estimator, ordered: List[ComponentOrder]) -> RegionOrder:
+    """Combine component orders with CROSS joins, smallest output first.
+
+    A conjunct spanning two components (necessarily non-equi: equi edges
+    define the components) is placed on the CROSS step that first covers all
+    its atoms, so predicate conservation holds and the estimate reflects it.
+    """
+    cross_steps: List[CrossStep] = []
     running = ordered[0].total
+    covered = _component_atoms(ordered[0])
     for component in ordered[1:]:
-        # The CROSS between two disconnected components: nothing constrains
-        # it, so the estimate is the plain product of the two sides' totals.
-        crossed = CardinalityEstimate.create(
-            rows=running.rows * component.total.rows,
-            defaults_used=combine_defaults([running, component.total], []),
+        incoming = _component_atoms(component)
+        positions = _spanning_positions(region, covered, incoming)
+        estimate = estimator.cross_estimate(
+            region, running, component.total, _conjuncts_at(region, positions)
         )
-        cross_estimates.append(crossed)
-        running = crossed
+        # One CROSS between component subtrees, carrying every conjunct that
+        # spans them (rendered as its residual filter at emission).
+        cross_steps.append(
+            CrossStep.create(estimate=estimate, conjunct_positions=positions)
+        )
+        running = estimate
+        covered = covered | incoming
     # The region's final order: each component its own left-deep subtree,
     # CROSSed together in ascending-cardinality order.
-    return RegionOrder.create(components=ordered, cross_estimates=cross_estimates)
+    return RegionOrder.create(components=ordered, cross_steps=cross_steps)
+
+
+def _spanning_positions(region, covered: Set[int], incoming: Set[int]) -> List[int]:
+    """Positions of the conjuncts that SPAN the covered set and the incoming
+    component: fully covered by their union but by neither side alone (a
+    conjunct inside one side was already placed by that side's steps)."""
+    grown = covered | incoming
+    positions = []
+    for position, conjunct in enumerate(region.conjuncts):
+        if len(conjunct.atom_indexes) < 2 or not conjunct.atom_indexes <= grown:
+            continue
+        if conjunct.atom_indexes <= covered or conjunct.atom_indexes <= incoming:
+            continue
+        positions.append(position)
+    return positions
+
+
+def _component_atoms(order: ComponentOrder) -> Set[int]:
+    """The atom indexes a component order covers."""
+    atoms = {order.first_atom}
+    for step in order.steps:
+        atoms.add(step.atom_index)
+    return atoms
 
 
 # ---------------- CostModel-backed estimator + the rule ----------------
@@ -557,6 +645,30 @@ class CostModelRegionEstimator(RegionEstimator):
             return fallback, [f"ndv({ref.table}.{ref.column})"]
         return max(1, min(ndv, side_rows)), []
 
+    def cross_estimate(self, region, left, right, conjuncts):
+        """left x right, reduced by the selectivity of any spanning non-equi
+        conjuncts (an equi conjunct here is an enumerator bug: equi edges
+        define the components, so they can never span two of them)."""
+        rows = float(left.rows) * float(right.rows)
+        defaults: List[str] = []
+        for conjunct in conjuncts:
+            if conjunct.is_equi:
+                raise JoinOrderError(
+                    "an equi conjunct spans two components; the component "
+                    "partition is broken"
+                )
+            factor, conjunct_defaults = self.cost_model.conjunct_selectivity(
+                conjunct.expression, "cross"
+            )
+            rows *= factor
+            defaults.extend(conjunct_defaults)
+        # The CROSS estimate with any spanning conjuncts' selectivity applied
+        # and both sides' provenance carried through.
+        return CardinalityEstimate.create(
+            rows=max(1, int(rows)),
+            defaults_used=combine_defaults([left, right], defaults),
+        )
+
 
 class JoinOrderingRule(OptimizationRule):
     """Cost-based join ordering over inner-join regions.
@@ -645,15 +757,32 @@ class JoinOrderingRule(OptimizationRule):
         current = self._emit_component(region, order.components[0], placed)
         for position, component in enumerate(order.components[1:]):
             right = self._emit_component(region, component, placed)
-            estimate = order.cross_estimates[position]
-            # The CROSS between disconnected components - the only cross
-            # product that legitimately survives reordering.
-            current = Join.create(
-                left=current, right=right, join_type=JoinType.CROSS,
-                condition=None, estimated_rows=estimate.rows,
-                estimate_defaults=estimate.defaults_used,
+            current = self._emit_cross(
+                region, current, right, order.cross_steps[position], placed
             )
         return self._wrap_constant_conjuncts(region, current, placed)
+
+    def _emit_cross(self, region, left_tree, right_tree, cross: "CrossStep",
+                    placed: List[int]):
+        """One CROSS between component subtrees - the only cross product that
+        survives reordering - with any spanning (non-equi) conjuncts as its
+        residual filter."""
+        placed.extend(cross.conjunct_positions)
+        # The CROSS join of the two component subtrees, annotated with the
+        # enumerator's estimate (spanning-conjunct selectivity included).
+        join = Join.create(
+            left=left_tree, right=right_tree, join_type=JoinType.CROSS,
+            condition=None, estimated_rows=cross.estimate.rows,
+            estimate_defaults=cross.estimate.defaults_used,
+        )
+        expressions = []
+        for conjunct in _conjuncts_at(region, cross.conjunct_positions):
+            expressions.append(conjunct.expression)
+        if not expressions:
+            return join
+        # The spanning conjuncts evaluate only once both components are
+        # present: one residual filter directly above the CROSS.
+        return Filter.create(input=join, predicate=combine_and(expressions))
 
     def _wrap_constant_conjuncts(self, region, tree, placed: List[int]):
         """Conjuncts referencing no column (e.g. WHERE 1 = 0) evaluate above
