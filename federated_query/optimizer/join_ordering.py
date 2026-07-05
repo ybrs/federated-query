@@ -24,15 +24,18 @@ from typing import Dict, FrozenSet, List, Optional, Set
 from ..model import StateModel
 from ..plan.expressions import and_expressions, combine_and
 from ..plan.logical import (
+    CTERef,
     Filter,
     Join,
     JoinType,
     LogicalPlanNode,
     Scan,
+    Values,
     transform_children,
 )
 from .estimate_defaults import (
     DEFAULT_NDV_FRACTION,
+    TRANSFER_WEIGHT,
     CardinalityEstimate,
     combine_defaults,
 )
@@ -178,14 +181,73 @@ class RegionOrder(StateModel):
 
 
 class _Candidate:
-    """One left-deep prefix during enumeration (mutable, internal only)."""
+    """One left-deep prefix during enumeration (mutable, internal only).
 
-    def __init__(self, cost, sequence, steps, estimate):
-        """A prefix with its accumulated C_out cost and current estimate."""
+    ``island_source``/``transfer`` implement the LOCALITY model: only the
+    leading same-source run of a left-deep component collapses into one
+    remote query (single-source pushdown collapses subtrees, and left-deep
+    subtrees are prefixes), so a candidate tracks whether its prefix is
+    still pure and how many rows have crossed the wire so far. Island state
+    is SUBSET-DETERMINED (the prefix of a full candidate is the whole
+    subset, so it is pure iff every atom in the subset shares one source) -
+    which is why the DP can stay keyed on the plain subset and two
+    candidates for the same subset never disagree on the island.
+    """
+
+    def __init__(self, cost, sequence, steps, estimate, transfer, island_source):
+        """A prefix with its C_out cost, estimate, and locality state."""
         self.cost = cost
         self.sequence = sequence
         self.steps = steps
         self.estimate = estimate
+        self.transfer = transfer
+        self.island_source = island_source
+
+
+def _atom_source(plan: LogicalPlanNode) -> Optional[str]:
+    """The single datasource every scan in an atom's subtree reads from, or
+    None when the atom is coordinator-resident: mixed sources, CTE
+    references, VALUES - exactly the shapes single-source pushdown declines
+    to collapse, so no transfer is saved by keeping them in an island."""
+    sources: Set[str] = set()
+    if not _collect_atom_sources(plan, sources):
+        return None
+    if len(sources) == 1:
+        return next(iter(sources))
+    return None
+
+
+def _collect_atom_sources(plan: LogicalPlanNode, sources: Set[str]) -> bool:
+    """Gather the subtree's scan datasources; False on a non-collapsible leaf."""
+    if isinstance(plan, Scan):
+        sources.add(plan.datasource)
+        return True
+    if isinstance(plan, (CTERef, Values)):
+        return False
+    collapsible = True
+    for child in plan.children():
+        if not _collect_atom_sources(child, sources):
+            collapsible = False
+    return collapsible
+
+
+def _extended_transfer(candidate: _Candidate, atom_source, atom_rows: int):
+    """The (transfer, island) state after joining one more atom.
+
+    Same source as the still-pure island: the join runs inside the source,
+    nothing crosses. On the first source switch the island's CURRENT result
+    crosses the wire, plus the new atom's own rows (unless it is
+    coordinator-resident and fetches nothing). Once mixed, each further
+    sourced atom ships its own rows.
+    """
+    if candidate.island_source is not None and atom_source == candidate.island_source:
+        return candidate.transfer, candidate.island_source
+    crossed = candidate.transfer
+    if candidate.island_source is not None:
+        crossed += candidate.estimate.rows
+    if atom_source is not None:
+        crossed += atom_rows
+    return crossed, None
 
 
 def choose_order(
@@ -196,10 +258,12 @@ def choose_order(
     if not region.atoms:
         raise JoinOrderError("choose_order over a region with no atoms")
     atom_estimates = _atom_estimates(region, estimator)
+    atom_sources = _atom_source_list(region)
     ordered: List[ComponentOrder] = []
     for component in _connected_components(region):
         ordered.append(
-            _order_component(region, estimator, atom_estimates, component, max_dp_size)
+            _order_component(region, estimator, atom_estimates, atom_sources,
+                             component, max_dp_size)
         )
     ordered.sort(key=_component_sort_key)
     return _combine(region, estimator, ordered)
@@ -212,6 +276,14 @@ def _atom_estimates(region, estimator) -> List[CardinalityEstimate]:
         local = _local_conjuncts(region, atom.index)
         estimates.append(estimator.atom_estimate(region, atom.index, local))
     return estimates
+
+
+def _atom_source_list(region) -> List[Optional[str]]:
+    """Every atom's source identity, by index (parallel to atom estimates)."""
+    sources = []
+    for atom in region.atoms:
+        sources.append(_atom_source(atom.plan))
+    return sources
 
 
 def _local_conjuncts(region, atom_index: int) -> List[JoinConjunct]:
@@ -272,7 +344,8 @@ def _flood(adjacency, start: int, seen: Set[int]) -> List[int]:
 
 
 def _order_component(
-    region, estimator, atom_estimates, component: List[int], max_dp_size: int
+    region, estimator, atom_estimates, atom_sources, component: List[int],
+    max_dp_size: int
 ) -> ComponentOrder:
     """One component's order: trivial, DP, or greedy by its size."""
     if len(component) == 1:
@@ -282,9 +355,9 @@ def _order_component(
             first_atom=component[0], steps=[], total=atom_estimates[component[0]]
         )
     if len(component) <= max_dp_size:
-        candidate = _dp_best(region, estimator, atom_estimates, component)
+        candidate = _dp_best(region, estimator, atom_estimates, atom_sources, component)
     else:
-        candidate = _greedy(region, estimator, atom_estimates, component)
+        candidate = _greedy(region, estimator, atom_estimates, atom_sources, component)
     return _to_component_order(candidate)
 
 
@@ -299,29 +372,34 @@ def _to_component_order(candidate: _Candidate) -> ComponentOrder:
     )
 
 
-def _dp_best(region, estimator, atom_estimates, component: List[int]) -> _Candidate:
+def _dp_best(
+    region, estimator, atom_estimates, atom_sources, component: List[int]
+) -> _Candidate:
     """Selinger-style DP over connected subsets, left-deep, deterministic."""
     best: Dict[FrozenSet[int], _Candidate] = {}
     for index in component:
         best[frozenset({index})] = _Candidate(
-            0.0, [index], [], atom_estimates[index]
+            0.0, [index], [], atom_estimates[index], 0.0, atom_sources[index]
         )
     for size in range(2, len(component) + 1):
-        _dp_layer(region, estimator, atom_estimates, component, best, size)
+        _dp_layer(region, estimator, atom_estimates, atom_sources, component,
+                  best, size)
     full = best.get(frozenset(component))
     if full is None:
         raise JoinOrderError("DP never covered a connected component fully")
     return full
 
 
-def _dp_layer(region, estimator, atom_estimates, component, best, size: int) -> None:
+def _dp_layer(
+    region, estimator, atom_estimates, atom_sources, component, best, size: int
+) -> None:
     """Extend every (size-1)-subset by each connected atom, keeping the best
     candidate per resulting subset."""
     additions: Dict[FrozenSet[int], _Candidate] = {}
     for subset in _subsets_of_size(best, size - 1):
         _extend_subset(
-            region, estimator, atom_estimates, component, best[subset], subset,
-            additions,
+            region, estimator, atom_estimates, atom_sources, component,
+            best[subset], subset, additions,
         )
     best.update(additions)
 
@@ -342,21 +420,24 @@ def _subset_key(subset: FrozenSet[int]) -> tuple:
 
 
 def _extend_subset(
-    region, estimator, atom_estimates, component, candidate, subset, additions
+    region, estimator, atom_estimates, atom_sources, component, candidate,
+    subset, additions
 ) -> None:
     """Try every connected single-atom extension of one candidate."""
     for atom_index in component:
         if atom_index in subset:
             continue
         extended = _try_extend(
-            region, estimator, atom_estimates, candidate, subset, atom_index
+            region, estimator, atom_estimates, atom_sources, candidate, subset,
+            atom_index,
         )
         if extended is not None:
             _keep_better(additions, subset | {atom_index}, extended)
 
 
 def _try_extend(
-    region, estimator, atom_estimates, candidate, subset, atom_index: int
+    region, estimator, atom_estimates, atom_sources, candidate, subset,
+    atom_index: int
 ) -> Optional[_Candidate]:
     """The candidate extended by one atom, or None when no EQUI conjunct
     connects the atom to the subset (a cross product or nested-loop join -
@@ -368,6 +449,9 @@ def _try_extend(
         region, candidate.estimate, atom_index, atom_estimates[atom_index],
         _conjuncts_at(region, positions),
     )
+    transfer, island = _extended_transfer(
+        candidate, atom_sources[atom_index], atom_estimates[atom_index].rows
+    )
     # One more left-deep step: this atom joined under the newly covered
     # conjuncts, its estimate appended for EXPLAIN and the C_out cost.
     step = JoinStep.create(
@@ -375,7 +459,7 @@ def _try_extend(
     )
     return _Candidate(
         candidate.cost + estimate.rows, candidate.sequence + [atom_index],
-        candidate.steps + [step], estimate,
+        candidate.steps + [step], estimate, transfer, island,
     )
 
 
@@ -423,47 +507,62 @@ def _keep_better(additions, key, candidate: _Candidate) -> None:
 
 
 def _candidate_key(candidate: _Candidate) -> tuple:
-    """Candidate ordering: C_out cost first, atom sequence as the tie-break."""
-    return (candidate.cost, candidate.sequence)
+    """Candidate ordering: C_out plus the weighted transfer cost, with the
+    atom sequence as the deterministic tie-break. cost stays pure C_out;
+    the locality term is combined only here."""
+    return (candidate.cost + TRANSFER_WEIGHT * candidate.transfer,
+            candidate.sequence)
 
 
-def _greedy(region, estimator, atom_estimates, component: List[int]) -> _Candidate:
-    """GOO-style left-deep greedy for components beyond the DP limit."""
-    candidate = _best_pair(region, estimator, atom_estimates, component)
+def _greedy(
+    region, estimator, atom_estimates, atom_sources, component: List[int]
+) -> _Candidate:
+    """GOO-style left-deep greedy for components beyond the DP limit.
+
+    Its cross-subset comparisons carry a mild stay-pure bias (a pure
+    candidate's pending island crossing is invisible until it breaks) -
+    directionally correct, since deferring the crossing lets joins shrink it.
+    """
+    candidate = _best_pair(region, estimator, atom_estimates, atom_sources, component)
     while len(candidate.sequence) < len(component):
         candidate = _best_extension(
-            region, estimator, atom_estimates, component, candidate
+            region, estimator, atom_estimates, atom_sources, component, candidate
         )
     return candidate
 
 
-def _best_pair(region, estimator, atom_estimates, component) -> _Candidate:
+def _best_pair(region, estimator, atom_estimates, atom_sources, component) -> _Candidate:
     """The cheapest connected starting pair of the component."""
     best = None
     for first in component:
         best = _better(
-            best, _pair_from(region, estimator, atom_estimates, component, first)
+            best,
+            _pair_from(region, estimator, atom_estimates, atom_sources,
+                       component, first),
         )
     if best is None:
         raise JoinOrderError("no connected starting pair in a multi-atom component")
     return best
 
 
-def _pair_from(region, estimator, atom_estimates, component, first: int):
+def _pair_from(region, estimator, atom_estimates, atom_sources, component, first: int):
     """The cheapest connected pair starting from one given atom."""
-    start = _Candidate(0.0, [first], [], atom_estimates[first])
+    start = _Candidate(0.0, [first], [], atom_estimates[first], 0.0,
+                       atom_sources[first])
     best = None
     for second in component:
         if second != first:
             best = _better(
                 best,
-                _try_extend(region, estimator, atom_estimates, start,
-                            frozenset({first}), second),
+                _try_extend(region, estimator, atom_estimates, atom_sources,
+                            start, frozenset({first}), second),
             )
     return best
 
 
-def _best_extension(region, estimator, atom_estimates, component, candidate) -> _Candidate:
+def _best_extension(
+    region, estimator, atom_estimates, atom_sources, component, candidate
+) -> _Candidate:
     """The cheapest connected one-atom extension of the greedy prefix."""
     subset = frozenset(candidate.sequence)
     best = None
@@ -471,8 +570,8 @@ def _best_extension(region, estimator, atom_estimates, component, candidate) -> 
         if atom_index not in subset:
             best = _better(
                 best,
-                _try_extend(region, estimator, atom_estimates, candidate,
-                            subset, atom_index),
+                _try_extend(region, estimator, atom_estimates, atom_sources,
+                            candidate, subset, atom_index),
             )
     if best is None:
         raise JoinOrderError("greedy walk stranded: no connected extension left")

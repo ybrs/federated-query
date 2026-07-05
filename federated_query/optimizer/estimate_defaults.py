@@ -44,6 +44,14 @@ DEFAULT_LIKE_SELECTIVITY = 0.1
 # unknown.
 DEFAULT_NULL_FRACTION = 0.05
 
+# Relative cost of one row CROSSING A SOURCE BOUNDARY versus one row of
+# coordinator join output (C_out). The join-order enumerator adds
+# TRANSFER_WEIGHT x (rows shipped from sources to the coordinator) to a
+# candidate's cost, which is what makes same-source islands stay adjacent
+# (they collapse into one remote query and only their RESULT crosses).
+# Calibrated against the federated TPC-H benchmark gate.
+TRANSFER_WEIGHT = 1.0
+
 
 class CardinalityEstimate(StateModel):
     """A row-count estimate plus the provenance of every default that fed it.

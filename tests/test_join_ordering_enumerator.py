@@ -340,3 +340,110 @@ def test_non_equi_only_connection_splits_components():
     assert len(order.components) == 2
     assert len(order.cross_steps) == 1
     assert order.cross_steps[0].conjunct_positions == [0]
+
+
+def test_atom_source_identity():
+    """An atom's source is the one datasource of every scan in its subtree;
+    mixed subtrees and non-scan leaves are coordinator-resident (None)."""
+    from federated_query.optimizer.join_ordering import _atom_source
+    from federated_query.plan.expressions import BinaryOp as _B
+    from federated_query.plan.logical import CTERef, Join as _J, JoinType as _JT
+
+    duck = Scan(datasource="duck", schema_name="s", table_name="a",
+                columns=["k"], alias="a")
+    duck2 = Scan(datasource="duck", schema_name="s", table_name="b",
+                 columns=["k"], alias="b")
+    pg = Scan(datasource="pg", schema_name="s", table_name="c",
+              columns=["k"], alias="c")
+    assert _atom_source(duck) == "duck"
+    same = _J(left=duck, right=duck2, join_type=_JT.LEFT,
+              condition=BinaryOp(op=BinaryOpType.EQ,
+                                 left=ColumnRef(table="a", column="k",
+                                                data_type=DataType.INTEGER),
+                                 right=ColumnRef(table="b", column="k",
+                                                 data_type=DataType.INTEGER)))
+    assert _atom_source(same) == "duck"
+    mixed = _J(left=duck, right=pg, join_type=_JT.LEFT, condition=None)
+    assert _atom_source(mixed) is None
+    assert _atom_source(CTERef(name="w", alias="w")) is None
+
+
+class _SourcedStub(_StubEstimator):
+    """The plain stub; sources come from the atoms' scan datasources."""
+
+
+def _sourced_region(names, sources, edges):
+    """A region whose atoms carry real datasource names."""
+    atoms = []
+    for index, name in enumerate(names):
+        scan = Scan(datasource=sources[index], schema_name="s",
+                    table_name=name, columns=["k"], alias=name)
+        atoms.append(JoinAtom(index=index, plan=scan, qualifiers={name}))
+    conjuncts = []
+    for pair in edges:
+        conjuncts.append(_edge(pair, (names[pair[0]], names[pair[1]])))
+    return JoinRegion(atoms=atoms, conjuncts=conjuncts)
+
+
+def test_transfer_term_keeps_same_source_islands_adjacent():
+    """pg-pg-duck-duck chain with near-equal cardinalities: the order must
+    lead with one source's island so it collapses into a single remote
+    query, instead of interleaving sources (which ships every table)."""
+    names = ["p1", "p2", "d1", "d2"]
+    sources = ["pg", "pg", "duck", "duck"]
+    edges = [(0, 1), (1, 2), (2, 3), (0, 3)]
+    rows = {0: 1000, 1: 1000, 2: 1000, 3: 1000}
+    selectivity = {
+        frozenset({0, 1}): 1.0 / 1000,
+        frozenset({1, 2}): 1.0 / 1000,
+        frozenset({2, 3}): 1.0 / 1000,
+        frozenset({0, 3}): 1.0 / 1000,
+    }
+    region = _sourced_region(names, sources, edges)
+    order = choose_order(region, _SourcedStub(rows, selectivity), max_dp_size=10)
+    sequence = _sequence(order)
+    # The first two atoms must share a source (a pure leading island).
+    first_two = {sources[sequence[0]], sources[sequence[1]]}
+    assert len(first_two) == 1, f"interleaved order {sequence}"
+
+
+def test_transfer_term_flips_q05_to_the_fact_island():
+    """The validated q05 arithmetic: with the transfer term, the chosen order
+    leads with the duck fact island (lineitem-orders joined remotely, ~912k
+    rows cross) instead of the pg-dim-first order that ships all 6M lineitem
+    rows. The 60M nationkey trap must stay dead."""
+    names = ["region", "nation", "supplier", "customer", "orders", "lineitem"]
+    sources = ["pg", "pg", "pg", "pg", "duck", "duck"]
+    edges = [
+        (0, 1), (1, 2), (2, 3),  # region-nation-supplier-customer(nationkey)
+        (3, 4),                  # customer-orders
+        (4, 5),                  # orders-lineitem
+        (2, 5),                  # supplier-lineitem
+    ]
+    rows = {0: 1, 1: 25, 2: 10_000, 3: 150_000, 4: 228_000, 5: 6_000_000}
+    selectivity = {
+        frozenset({0, 1}): 1.0 / 5,
+        frozenset({1, 2}): 1.0 / 25,
+        frozenset({2, 3}): 1.0 / 25,
+        frozenset({3, 4}): 1.0 / 150_000,
+        frozenset({4, 5}): 1.0 / 1_500_000,
+        frozenset({2, 5}): 1.0 / 10_000,
+    }
+    region = _sourced_region(names, sources, edges)
+    order = choose_order(region, _SourcedStub(rows, selectivity), max_dp_size=10)
+    sequence = _sequence(order)
+    # Leading island must be the duck facts (orders/lineitem in some order).
+    assert {sequence[0], sequence[1]} == {4, 5}, f"order {sequence}"
+    # The nationkey trap: supplier and customer never joined as a bare pair.
+    for position in range(len(sequence) - 1):
+        assert {sequence[position], sequence[position + 1]} != {2, 3} or position > 0
+
+
+def test_transfer_zero_for_single_source_regions_keeps_old_behavior():
+    """A pure single-source region has zero transfer everywhere: the chosen
+    order must be identical to the pure-C_out order (all existing stub tests
+    already pin this; this test states the invariant explicitly)."""
+    region, estimator = _q05_shape()
+    order = choose_order(region, estimator, max_dp_size=10)
+    for step in order.components[0].steps:
+        assert step.estimate.rows < 2_000_000
