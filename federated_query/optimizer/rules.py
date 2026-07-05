@@ -415,7 +415,7 @@ class PredicatePushdownRule(OptimizationRule):
             return "left"
         if pushdown.columns_belong_to_side(cols, right_cols, left_cols):
             return "right"
-        if self._is_equi_predicate(conjunct):
+        if pushdown.is_equi_predicate(conjunct):
             return "equi"
         return "residual"
 
@@ -462,17 +462,6 @@ class PredicatePushdownRule(OptimizationRule):
         # be evaluated after the join; keep them as one residual filter above it.
         return Filter.create(
             input=new_join, predicate=combine_and(residual_conjuncts)
-        )
-
-    def _is_equi_predicate(self, predicate: Expression) -> bool:
-        """Whether a predicate is a column-to-column equality (a join key)."""
-        from ..plan.expressions import BinaryOp, BinaryOpType, ColumnRef
-
-        return (
-            isinstance(predicate, BinaryOp)
-            and predicate.op == BinaryOpType.EQ
-            and isinstance(predicate.left, ColumnRef)
-            and isinstance(predicate.right, ColumnRef)
         )
 
     def name(self) -> str:

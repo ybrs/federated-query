@@ -8,7 +8,13 @@ being re-implemented per rule.
 
 from typing import List, Set
 
-from ..plan.expressions import Expression, ColumnRef, column_refs
+from ..plan.expressions import (
+    BinaryOp,
+    BinaryOpType,
+    ColumnRef,
+    Expression,
+    column_refs,
+)
 from ..plan.logical import (
     LogicalPlanNode,
     Scan,
@@ -25,6 +31,19 @@ def _ref_key(ref: ColumnRef) -> str:
     if ref.table:
         return f"{ref.table}.{ref.column}"
     return ref.column
+
+
+def is_equi_predicate(predicate: Expression) -> bool:
+    """Whether a predicate is a column-to-column equality (a join key).
+
+    Shared by predicate pushdown (folds these into Join.condition) and the
+    join-graph extraction (these are the edges join ordering walks)."""
+    return (
+        isinstance(predicate, BinaryOp)
+        and predicate.op == BinaryOpType.EQ
+        and isinstance(predicate.left, ColumnRef)
+        and isinstance(predicate.right, ColumnRef)
+    )
 
 
 def qualified_or_bare_names(expr: Expression) -> Set[str]:
