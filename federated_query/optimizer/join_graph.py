@@ -136,11 +136,11 @@ def _is_region_root(node: LogicalPlanNode) -> bool:
     """Whether a region starts here: a reorderable join, possibly under a
     Filter whose conjuncts then join the region's predicate pool."""
     if isinstance(node, Filter):
-        return _is_region_join(node.input)
-    return _is_region_join(node)
+        return is_region_join(node.input)
+    return is_region_join(node)
 
 
-def _is_region_join(node: LogicalPlanNode) -> bool:
+def is_region_join(node: LogicalPlanNode) -> bool:
     """A join the enumerator may reorder: INNER/CROSS with an explicit (or no)
     condition. NATURAL/USING joins carry an implicit condition that reordering
     would silently drop, so they are atoms."""
@@ -157,7 +157,7 @@ def _descend(node, atoms: List[JoinAtom], expressions: List[Expression]) -> None
         expressions.extend(split_conjuncts(node.predicate))
         _descend(node.input, atoms, expressions)
         return
-    if _is_region_join(node):
+    if is_region_join(node):
         if node.condition is not None:
             expressions.extend(split_conjuncts(node.condition))
         _descend(node.left, atoms, expressions)

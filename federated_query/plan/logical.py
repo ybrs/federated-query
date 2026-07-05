@@ -336,6 +336,12 @@ class Join(LogicalPlanNode):
     # column names of a USING join.
     natural: bool = False
     using: Optional[List[str]] = None
+    # Set by the cost-based join-ordering rule: the estimated output rows of
+    # this join and the provenance of every DEFAULTED statistic behind that
+    # estimate (empty/None = fully statistics-backed). EXPLAIN prints both, so
+    # a plan costed from guesses is visibly different from a costed one.
+    estimated_rows: Optional[int] = None
+    estimate_defaults: Optional[List[str]] = None
 
     @classmethod
     def create(
@@ -347,6 +353,8 @@ class Join(LogicalPlanNode):
         condition: Optional[Expression],
         natural: bool = False,
         using: Optional[List[str]] = None,
+        estimated_rows: Optional[int] = None,
+        estimate_defaults: Optional[List[str]] = None,
     ) -> "Join":
         """Build a Join of two inputs with an optional ON condition.
         Sanctioned construction path; prefer model_copy when deriving from an existing node."""
@@ -357,6 +365,8 @@ class Join(LogicalPlanNode):
             condition=condition,
             natural=natural,
             using=using,
+            estimated_rows=estimated_rows,
+            estimate_defaults=estimate_defaults,
         )
 
     def children(self) -> List[LogicalPlanNode]:

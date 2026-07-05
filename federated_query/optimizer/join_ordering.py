@@ -22,8 +22,27 @@ from abc import ABC, abstractmethod
 from typing import Dict, FrozenSet, List, Optional, Set
 
 from ..model import StateModel
-from .estimate_defaults import CardinalityEstimate, combine_defaults
-from .join_graph import JoinConjunct, JoinRegion
+from ..plan.expressions import and_expressions, combine_and
+from ..plan.logical import (
+    Filter,
+    Join,
+    JoinType,
+    LogicalPlanNode,
+    Scan,
+    transform_children,
+)
+from .estimate_defaults import (
+    DEFAULT_NDV_FRACTION,
+    CardinalityEstimate,
+    combine_defaults,
+)
+from .join_graph import (
+    JoinConjunct,
+    JoinRegion,
+    extract_region,
+    is_region_join,
+)
+from .rules import OptimizationRule
 
 
 class JoinOrderError(Exception):
@@ -438,3 +457,267 @@ def _combine(ordered: List[ComponentOrder]) -> RegionOrder:
     # The region's final order: each component its own left-deep subtree,
     # CROSSed together in ascending-cardinality order.
     return RegionOrder.create(components=ordered, cross_estimates=cross_estimates)
+
+
+# ---------------- CostModel-backed estimator + the rule ----------------
+
+
+def _with_local_filters(plan, conjuncts: List[JoinConjunct]):
+    """Fold single-atom conjuncts back onto their atom: straight into a
+    scan's pushed-down filters (PredicatePushdown's end state, keeping the
+    joint fixpoint stable), a Filter above anything else."""
+    if not conjuncts:
+        return plan
+    expressions = []
+    for conjunct in conjuncts:
+        expressions.append(conjunct.expression)
+    predicate = combine_and(expressions)
+    if isinstance(plan, Scan):
+        return plan.model_copy(
+            update={"filters": and_expressions(plan.filters, predicate)}
+        )
+    # A non-scan atom cannot absorb the predicate itself; a Filter above it
+    # lets predicate pushdown drive it further down on the next pass.
+    return Filter.create(input=plan, predicate=predicate)
+
+
+def _atom_owning(region: JoinRegion, ref) -> "JoinAtom":
+    """The region atom whose qualifiers own a column reference."""
+    for atom in region.atoms:
+        if ref.table in atom.qualifiers:
+            return atom
+    raise JoinOrderError(
+        f"reference {ref.table}.{ref.column} owns no atom in its region"
+    )
+
+
+def _orient_refs(region: JoinRegion, conjunct: JoinConjunct, atom_index: int):
+    """(atom-side ref, other-side ref) of a two-atom equi conjunct being
+    placed on the step that joins atom_index."""
+    left_ref = conjunct.expression.left
+    right_ref = conjunct.expression.right
+    qualifiers = region.atoms[atom_index].qualifiers
+    if left_ref.table in qualifiers:
+        return left_ref, right_ref
+    if right_ref.table in qualifiers:
+        return right_ref, left_ref
+    raise JoinOrderError(
+        "an equi conjunct was placed on a join step that touches neither "
+        "of its columns - the enumerator's placement is broken"
+    )
+
+
+class CostModelRegionEstimator(RegionEstimator):
+    """RegionEstimator answering from the CostModel and source statistics."""
+
+    def __init__(self, cost_model):
+        """Wire the estimator to the shared cost model."""
+        self.cost_model = cost_model
+
+    def atom_estimate(self, region, atom_index, local_conjuncts):
+        """The atom with its local filters folded in, estimated exactly as
+        the plan will look after pushdown, so iterations stay stable."""
+        plan = _with_local_filters(region.atoms[atom_index].plan, local_conjuncts)
+        return self.cost_model.estimate(plan)
+
+    def join_estimate(self, region, left, atom_index, atom, conjuncts):
+        """left x atom, reduced by every placed conjunct: the NDV formula for
+        equi keys, tracked selectivity for everything else."""
+        rows = float(left.rows) * float(atom.rows)
+        defaults: List[str] = []
+        for conjunct in conjuncts:
+            factor, conjunct_defaults = self._factor(
+                region, conjunct, left, atom, atom_index
+            )
+            rows *= factor
+            defaults.extend(conjunct_defaults)
+        # The step's estimate: the sides' provenance plus whatever defaults
+        # the conjuncts' selectivities needed.
+        return CardinalityEstimate.create(
+            rows=max(1, int(rows)),
+            defaults_used=combine_defaults([left, atom], defaults),
+        )
+
+    def _factor(self, region, conjunct, left, atom, atom_index):
+        """One conjunct's multiplicative selectivity at this join step."""
+        if not conjunct.is_equi or len(conjunct.atom_indexes) != 2:
+            return self.cost_model.conjunct_selectivity(conjunct.expression, "join")
+        atom_ref, other_ref = _orient_refs(region, conjunct, atom_index)
+        atom_ndv, atom_defaults = self._ref_ndv(region, atom_ref, atom.rows)
+        other_ndv, other_defaults = self._ref_ndv(region, other_ref, left.rows)
+        return 1.0 / max(atom_ndv, other_ndv), atom_defaults + other_defaults
+
+    def _ref_ndv(self, region, ref, side_rows: int):
+        """A key's NDV clamped by its side's current rows; the fallback is the
+        named NDV default, recorded with the key it applied to."""
+        atom = _atom_owning(region, ref)
+        ndv = self.cost_model.column_ndv(atom.plan, ref)
+        if ndv is None:
+            fallback = max(1, int(side_rows * DEFAULT_NDV_FRACTION))
+            return fallback, [f"ndv({ref.table}.{ref.column})"]
+        return max(1, min(ndv, side_rows)), []
+
+
+class JoinOrderingRule(OptimizationRule):
+    """Cost-based join ordering over inner-join regions.
+
+    Runs after predicate pushdown (it reads folded equi conditions and
+    embedded scan filters), chooses a cardinality-driven order per region and
+    re-emits the region in pushdown's normal form. Every region conjunct must
+    be placed exactly once - a mismatch raises instead of silently dropping
+    a predicate.
+    """
+
+    def __init__(self, cost_model, max_join_reorder_size: int):
+        """The rule over a cost model and the DP size limit."""
+        self.cost_model = cost_model
+        self.max_join_reorder_size = max_join_reorder_size
+        self.estimator = CostModelRegionEstimator(cost_model)
+
+    def name(self) -> str:
+        """Return this rule's identifier (used in logging and EXPLAIN)."""
+        return "JoinOrdering"
+
+    def apply(self, plan: LogicalPlanNode) -> Optional[LogicalPlanNode]:
+        """Reorder every region in the plan; None when nothing changed."""
+        rewritten = self._rewrite(plan)
+        if rewritten is plan:
+            return None
+        return rewritten
+
+    def _rewrite(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Reorder the region rooted here, or recurse into the children."""
+        region = extract_region(plan)
+        if region is None:
+            return transform_children(plan, self._rewrite)
+        return self._reorder_region(plan, region)
+
+    def _reorder_region(self, root, region: JoinRegion) -> LogicalPlanNode:
+        """Order one region and re-emit it, preserving identity on no-change
+        so the optimizer's fixpoint terminates."""
+        if not self._worth_reordering(region, root):
+            return transform_children(root, self._rewrite)
+        order = choose_order(region, self.estimator, self.max_join_reorder_size)
+        placed: List[int] = []
+        rebuilt = self._emit(region, order, placed)
+        self._verify_placement(len(region.conjuncts), placed)
+        if rebuilt == root:
+            return root
+        return rebuilt
+
+    def _worth_reordering(self, region: JoinRegion, root) -> bool:
+        """3+ atoms always; 2 atoms only when a condition-less join would gain
+        a connecting equality (turning a cross product into an inner join)."""
+        if len(region.atoms) >= 3:
+            return True
+        return self._has_edge(region) and self._has_conditionless_join(root)
+
+    def _has_edge(self, region: JoinRegion) -> bool:
+        """Whether the pool holds any multi-atom equi conjunct."""
+        for conjunct in region.conjuncts:
+            if conjunct.is_equi and len(conjunct.atom_indexes) >= 2:
+                return True
+        return False
+
+    def _has_conditionless_join(self, node) -> bool:
+        """Whether the region contains a reorderable join with no condition."""
+        if isinstance(node, Filter):
+            return self._has_conditionless_join(node.input)
+        if not is_region_join(node):
+            return False
+        if node.condition is None:
+            return True
+        return (self._has_conditionless_join(node.left)
+                or self._has_conditionless_join(node.right))
+
+    def _verify_placement(self, total: int, placed: List[int]) -> None:
+        """Every region conjunct must be placed exactly once; a dropped or
+        duplicated predicate manufactures wrong results - crash instead."""
+        if sorted(placed) != list(range(total)):
+            raise JoinOrderError(
+                f"join reordering placed conjuncts {sorted(placed)} of "
+                f"{total}; every conjunct must be placed exactly once"
+            )
+
+    def _emit(self, region, order: RegionOrder, placed: List[int]):
+        """The re-emitted region: component subtrees CROSSed smallest-first,
+        zero-atom (constant) conjuncts as one filter above everything."""
+        current = self._emit_component(region, order.components[0], placed)
+        for position, component in enumerate(order.components[1:]):
+            right = self._emit_component(region, component, placed)
+            estimate = order.cross_estimates[position]
+            # The CROSS between disconnected components - the only cross
+            # product that legitimately survives reordering.
+            current = Join.create(
+                left=current, right=right, join_type=JoinType.CROSS,
+                condition=None, estimated_rows=estimate.rows,
+                estimate_defaults=estimate.defaults_used,
+            )
+        return self._wrap_constant_conjuncts(region, current, placed)
+
+    def _wrap_constant_conjuncts(self, region, tree, placed: List[int]):
+        """Conjuncts referencing no column (e.g. WHERE 1 = 0) evaluate above
+        the whole region as one filter; they constrain no particular atom."""
+        expressions = []
+        for position, conjunct in enumerate(region.conjuncts):
+            if not conjunct.atom_indexes:
+                placed.append(position)
+                expressions.append(conjunct.expression)
+        if not expressions:
+            return tree
+        # The constant conjuncts as one region-topping filter, conserved
+        # verbatim so the placement guard accounts for them.
+        return Filter.create(input=tree, predicate=combine_and(expressions))
+
+    def _emit_component(self, region, component: ComponentOrder, placed):
+        """One component as its left-deep join subtree."""
+        current = self._emit_atom(region, component.first_atom, placed)
+        for step in component.steps:
+            current = self._emit_step(region, current, step, placed)
+        return current
+
+    def _emit_atom(self, region, atom_index: int, placed: List[int]):
+        """One atom: nested regions inside it rewritten, its local conjuncts
+        folded back onto it."""
+        plan = self._rewrite(region.atoms[atom_index].plan)
+        local_positions = self._local_positions(region, atom_index)
+        placed.extend(local_positions)
+        return _with_local_filters(plan, _conjuncts_at(region, local_positions))
+
+    def _local_positions(self, region, atom_index: int) -> List[int]:
+        """Positions of the conjuncts referencing exactly this one atom."""
+        positions = []
+        for position, conjunct in enumerate(region.conjuncts):
+            if conjunct.atom_indexes == frozenset({atom_index}):
+                positions.append(position)
+        return positions
+
+    def _emit_step(self, region, left_tree, step: JoinStep, placed: List[int]):
+        """One left-deep join step in PredicatePushdown's normal form: equi
+        keys in the condition, non-equi cross-side conjuncts as one filter."""
+        atom_tree = self._emit_atom(region, step.atom_index, placed)
+        placed.extend(step.conjunct_positions)
+        equi, residual = self._split_step_conjuncts(region, step.conjunct_positions)
+        # The reordered join, annotated with the enumerator's estimate and
+        # its statistics provenance for EXPLAIN.
+        join = Join.create(
+            left=left_tree, right=atom_tree, join_type=JoinType.INNER,
+            condition=combine_and(equi), estimated_rows=step.estimate.rows,
+            estimate_defaults=step.estimate.defaults_used,
+        )
+        if not residual:
+            return join
+        # Cross-side non-equi conjuncts evaluate only after the join: one
+        # residual filter above it, exactly as predicate pushdown leaves them.
+        return Filter.create(input=join, predicate=combine_and(residual))
+
+    def _split_step_conjuncts(self, region, positions: List[int]):
+        """A step's placed conjuncts split into (equi keys, residuals)."""
+        equi = []
+        residual = []
+        for conjunct in _conjuncts_at(region, positions):
+            if conjunct.is_equi:
+                equi.append(conjunct.expression)
+            else:
+                residual.append(conjunct.expression)
+        return equi, residual

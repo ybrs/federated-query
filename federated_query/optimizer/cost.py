@@ -3,16 +3,24 @@
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..plan.logical import (
+    CTE,
+    CTERef,
     LogicalPlanNode,
     Scan,
     Projection,
     Filter,
+    GroupedLimit,
     Join,
     Aggregate,
+    LateralJoin,
     Limit,
+    SetOperation,
+    SetOpKind,
+    SingleRowGuard,
     Sort,
     SubqueryScan,
     Union,
+    Values,
     JoinType,
 )
 from ..plan.physical import PhysicalPlanNode
@@ -28,6 +36,7 @@ from ..plan.expressions import (
 )
 from ..config.config import CostConfig
 from ..optimizer.estimate_defaults import (
+    DEFAULT_ATOM_ROWS,
     DEFAULT_EQ_SELECTIVITY,
     DEFAULT_LIKE_SELECTIVITY,
     DEFAULT_NDV_FRACTION,
@@ -367,8 +376,9 @@ class CostModel:
 
     def estimate(self, plan: LogicalPlanNode) -> CardinalityEstimate:
         """Cardinality estimate of a subtree, carrying the provenance of every
-        default that fed it. Unknown node types raise: a silently-guessed
-        cardinality for an unmodeled operator would corrupt join ordering."""
+        default that fed it. Covers every logical node type explicitly; a
+        genuinely unknown type raises - a silently-guessed cardinality for an
+        unmodeled operator would corrupt join ordering."""
         if isinstance(plan, Scan):
             return self._estimate_scan_tracked(plan)
         if isinstance(plan, Filter):
@@ -381,7 +391,81 @@ class CostModel:
             return self._estimate_aggregate_tracked(plan)
         if isinstance(plan, Limit):
             return self._estimate_limit_tracked(plan)
+        return self._estimate_rare_tracked(plan)
+
+    def _estimate_rare_tracked(self, plan: LogicalPlanNode) -> CardinalityEstimate:
+        """The remaining node types, each modeled explicitly (never a silent
+        catch-all): set operations, CTEs, VALUES, decorrelation wrappers."""
+        if isinstance(plan, Union):
+            return self._estimate_union_tracked(plan)
+        if isinstance(plan, SetOperation):
+            return self._estimate_setop_tracked(plan)
+        if isinstance(plan, CTE):
+            return self.estimate(plan.child)
+        if isinstance(plan, CTERef):
+            # A CTE reference has no catalog identity to fetch statistics
+            # for; it estimates from the named atom default, recorded.
+            return CardinalityEstimate.create(
+                rows=DEFAULT_ATOM_ROWS, defaults_used=[f"atom_rows(cte {plan.name})"]
+            )
+        if isinstance(plan, Values):
+            # A VALUES relation's cardinality is literally its row count;
+            # nothing is estimated, so the provenance stays empty.
+            return CardinalityEstimate.create(
+                rows=len(plan.rows), defaults_used=[]
+            )
+        return self._estimate_guard_tracked(plan)
+
+    def _estimate_guard_tracked(self, plan: LogicalPlanNode) -> CardinalityEstimate:
+        """Decorrelation wrappers: guards and per-key limits bound their
+        input's cardinality, laterals multiply the outer side."""
+        if isinstance(plan, (SingleRowGuard, GroupedLimit)):
+            return self.estimate(plan.input)
+        if isinstance(plan, LateralJoin):
+            left = self.estimate(plan.left)
+            # The lateral body's per-outer-row multiplicity is unknowable
+            # from catalog statistics; the outer side's rows stand in.
+            return CardinalityEstimate.create(
+                rows=left.rows,
+                defaults_used=combine_defaults([left], ["lateral_multiplicity"]),
+            )
         raise ValueError(f"estimate has no rule for plan node {type(plan).__name__}")
+
+    def _estimate_union_tracked(self, union: Union) -> CardinalityEstimate:
+        """A UNION's upper bound: the sum of its inputs."""
+        total = 0
+        parents: List[CardinalityEstimate] = []
+        for child in union.inputs:
+            child_estimate = self.estimate(child)
+            parents.append(child_estimate)
+            total += child_estimate.rows
+        # Upper bound: DISTINCT can only shrink the concatenation, so the sum
+        # of the inputs is the honest (bounding) estimate either way.
+        return CardinalityEstimate.create(
+            rows=total, defaults_used=combine_defaults(parents, [])
+        )
+
+    def _estimate_setop_tracked(self, setop: SetOperation) -> CardinalityEstimate:
+        """Set-operation bounds: UNION sums, INTERSECT takes the smaller side,
+        EXCEPT keeps at most the left side."""
+        left = self.estimate(setop.left)
+        right = self.estimate(setop.right)
+        rows = self._setop_rows(setop.kind, left.rows, right.rows)
+        # Structural bounds only - no statistics are involved, so the merged
+        # provenance is exactly the two sides' provenance.
+        return CardinalityEstimate.create(
+            rows=rows, defaults_used=combine_defaults([left, right], [])
+        )
+
+    def _setop_rows(self, kind, left_rows: int, right_rows: int) -> int:
+        """The bounding row count of one set-operation kind."""
+        if kind == SetOpKind.UNION:
+            return left_rows + right_rows
+        if kind == SetOpKind.INTERSECT:
+            return min(left_rows, right_rows)
+        if kind == SetOpKind.EXCEPT:
+            return left_rows
+        raise ValueError(f"no cardinality bound for set operation {kind}")
 
     def join_tree_cost(self, plan: LogicalPlanNode) -> float:
         """C_out: the sum of every join's estimated output rows in a subtree.
@@ -396,6 +480,28 @@ class CostModel:
         for child in plan.children():
             total += self.join_tree_cost(child)
         return total
+
+    def column_ndv(self, subtree: LogicalPlanNode, ref: ColumnRef) -> Optional[int]:
+        """The base NDV of a qualified column resolved inside a subtree, from
+        source statistics; None when the owner is opaque or has no NDV.
+
+        Public entry for the join-ordering estimator, which resolves join-key
+        NDVs against individual region atoms."""
+        owner = self._find_relation(subtree, ref.table)
+        if owner is None:
+            raise ValueError(
+                f"column {ref.table}.{ref.column} resolves to no relation"
+            )
+        return self._owner_column_ndv(owner, ref.column)
+
+    def conjunct_selectivity(
+        self, predicate: Expression, target: str
+    ) -> Tuple[float, List[str]]:
+        """Tracked selectivity of one predicate with no table statistics in
+        scope (cross-relation residual conjuncts) - defaults are recorded.
+
+        Public entry for the join-ordering estimator."""
+        return self._tracked_selectivity(predicate, None, target)
 
     def _estimate_scan_tracked(self, scan: Scan) -> CardinalityEstimate:
         """Scan estimate: stats row count x filter selectivity, then pushed-
