@@ -1,4 +1,4 @@
-# Status: five optimizer phases live; locality term landed, key injection next
+# Status: seven phases live; fair federated gap 38.6x -> 4.43x
 
 State of the work. Facts only: what exists, what passes, what is measured,
 what is not done. Previous phase (Rust cutover, N-K decorrelation, merge-engine
@@ -13,7 +13,7 @@ merge-engine-datafusion
             `- feature/cost-based-optimizer   <-- HEAD (this document)
 ```
 
-Test suite: **1133 passed, 3 skipped, 39 xfailed, 0 failed**
+Test suite: **1136 passed, 3 skipped, 39 xfailed, 0 failed**
 (`POSTGRES_DB=duckpoc python -m pytest -q`). `make lint` green.
 
 ## What was built on this branch
@@ -164,19 +164,51 @@ used to cut intermediates before the fact join; the island defers it. Phase B
 (generalized key injection) targets exactly that shape; if q08 is still
 regressed after B, recalibrate TRANSFER_WEIGHT.
 
+## Generalized key injection: LANDED (phase B, commits 0d397c8..62bba5f
+## + fedqrs db514e4/5313c18/d839050)
+
+The EXISTING adaptive strategy (IN list < 2000 keys; temp-table semi-join;
+selectivity guard) now actually fires on federated shapes - nothing about it
+was rewritten:
+- B1: the gate accepts a COMPUTED build side (it is materialized for the
+  join anyway; every step output is a re-readable binding).
+- B2: the missing DuckDB ingestion arm - Arrow keys appended into a
+  connection-scoped temp table, same temp_join_sql, same 40% guard fed by a
+  duckdb_tables() catalog estimate, plus DUCK_TEMP_CAP=50k (the keys/rows
+  estimate underestimates selectivity for near-superset key sets - a
+  measured q18 regression, the classic no-index backfire; PG keeps its
+  pg_stats guard uncapped).
+- B3: pushed remote queries are injection targets - the island's SQL wraps
+  as a derived table and the key filter applies to its output columns
+  (SELECT * FROM (<island>) AS fedq_probe WHERE col IN ...). This is the
+  locality + reduction composition.
+
+Gate (report-result-62bba5f.md): fedpgduck SF1 5209 -> 4786ms (4.43x), all
+132 cells correct. q09 1031 -> 479ms (the 10.6k %green% part keys semi-join
+inside DuckDB), q08 294 -> 167ms (phase A's deferred-filter regression
+erased), q05/q18 held.
+
+## Measured across all phases (fedpgduck SF1, ours/DuckDB)
+
+pre-opt 38.55x -> join order 23.24x -> +projection 11.36x -> +CTE 8.60x ->
++count(*) 5.10x -> +locality 5.01x -> +key injection **4.43x**.
+Single-source (pure engine) SF1: 2.06x. All 132 cells correct in every phase.
+
 ## Known gaps / next work (in priority order from the data)
 
-1. **q07/q09/q18 (8-11x fedpgduck SF1, 0.5-1s each)**: residual data
-   movement on multi-fact joins - the natural target for the LOCALITY cost
-   term at the `join_tree_cost` seam (transfer = rows x width per source
-   boundary; see git log 063aada for the measured motivation), possibly
-   plus semi-join reduction for non-scan build sides.
-2. **q17 (15x fedpgduck SF1, ~0.4s)** - correlated aggregate subquery shape.
-3. **CTE materialize-once** in the engine (per-reference evaluation is now
-   cheap but still duplicated).
-4. **fedqrs missing operators** (unchanged): `PhysicalSingleRowGuard`,
-   `PhysicalUnion`, empty-condition semi-join - 18 xfails.
-5. `enable_decorrelation` config flag is still unwired.
+1. **q07 (416ms/9.7x fedpgduck SF1)** - the FRANCE/GERMANY OR shape yields
+   no injectable key set; the nations constraint reaches the facts only
+   after the join. Would need OR-derived key sets (union of two nation key
+   lists) or better residual selectivity.
+2. **q18 (840ms/9.3x)** - ~50ms is pre-cap key collection; the rest is the
+   IN-subquery (group-by-having over lineitem) shape.
+3. **Small-scale overhead**: fedpgduck SF0.1 is 4.85x with 20-90ms queries -
+   fixed per-query planning/stat-fetch/ingest costs dominate, not plans.
+4. **Duck guard precision**: replace the keys/rows estimate with the
+   planner's cached NDV as an IR hint if more shapes hit the cap.
+5. **TRANSFER_WEIGHT calibration** (1.0) as more shapes accumulate.
+6. **CTE materialize-once**; **fedqrs missing operators** (18 xfails);
+   `enable_decorrelation` flag unwired.
 
 ## How to run
 
