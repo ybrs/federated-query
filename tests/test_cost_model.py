@@ -836,3 +836,33 @@ class TestProvenanceEstimate:
         join = _custkey_join()
         cost = model.join_tree_cost(join)
         assert cost == 1_500_000
+
+
+def test_pushed_aggregate_scan_ignores_having_columns_for_stats(cost_config):
+    """A scan carrying a pushed GROUP BY + HAVING must not request source
+    stats for the HAVING's aggregate-output column (not a stored column) -
+    only its real base columns. Regression for the q18 semi-atom estimate."""
+    tables = {("public", "lineitem"): TableStatistics(
+        row_count=6_000_000, total_size_bytes=0,
+        column_stats={"l_orderkey": ColumnStatistics(
+            num_distinct=1_500_000, null_fraction=0.0, avg_width=8)},
+    )}
+    model = CostModel(cost_config, _seeded_collector("ds", tables))
+    having = BinaryOp(
+        op=BinaryOpType.GT,
+        left=ColumnRef(table="l", column="__subq_0_h1", data_type=DataType.INTEGER),
+        right=Literal(value=300, data_type=DataType.INTEGER),
+    )
+    scan = Scan(
+        datasource="ds", schema_name="public", table_name="lineitem",
+        columns=["l_orderkey"], alias="l",
+        group_by=[ColumnRef(table="l", column="l_orderkey",
+                            data_type=DataType.INTEGER)],
+        aggregates=[ColumnRef(table="l", column="l_orderkey",
+                              data_type=DataType.INTEGER)],
+        output_names=["l_orderkey"],
+        filters=having,
+    )
+    # Would raise a KeyError inside the fake source if __subq_0_h1 were
+    # requested; the group-count estimate returns cleanly instead.
+    assert model.estimate(scan).rows > 0

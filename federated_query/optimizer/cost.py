@@ -530,13 +530,16 @@ class CostModel:
         )
 
     def _scan_needed_columns(self, scan: Scan) -> List[str]:
-        """The columns a scan's estimate reads stats for: filter + group keys."""
+        """The columns a scan's estimate reads stats for: filter + group keys,
+        restricted to REAL base columns. A pushed-aggregate scan's filter is a
+        HAVING over aggregate outputs (e.g. sum-alias > 300) whose names are
+        not stored columns; fetching their stats from the source would fail."""
         needed = set()
         if scan.filters is not None:
             needed.update(bare_names(scan.filters))
         for key in scan.group_by or []:
             needed.update(bare_names(key))
-        return sorted(needed)
+        return sorted(needed & set(scan.columns))
 
     def _scan_target(self, scan: Scan) -> str:
         """The scan's identity used in provenance entries."""

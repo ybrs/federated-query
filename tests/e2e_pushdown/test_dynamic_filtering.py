@@ -305,3 +305,74 @@ def test_semi_join_reduces_the_preserved_side():
     ).fetchall():
         expected.add(row[0])
     assert set(result.column("o_id").to_pylist()) == expected
+
+
+def test_selective_semi_join_reduces_the_fact_scan():
+    """The q18 shape end to end: a selective IN-subquery (few surviving
+    orderkeys) must push below the fact join so the fact scan is reduced to
+    the surviving keys - not scanned whole and filtered at the top. Verifies
+    the fact injected_scan appears AND the result matches the oracle."""
+    import duckdb as duckdb_module
+    from federated_query.catalog import Catalog
+    from federated_query.cli.fedq import FedQRuntime
+    from federated_query.config import Config
+    from federated_query.datasources.duckdb import DuckDBDataSource
+    from tests.duckdb_tmp import duckdb_path
+
+    dims = DuckDBDataSource("dims", {"path": duckdb_path(), "read_only": False})
+    dims.connect()
+    dims.connection.execute(
+        "CREATE TABLE customer (c_id INTEGER, c_name VARCHAR);"
+        "INSERT INTO customer SELECT g, 'C' || g FROM range(0, 300) t(g);"
+    )
+    facts = DuckDBDataSource("facts", {"path": duckdb_path(), "read_only": False})
+    facts.connect()
+    facts.connection.execute(
+        "CREATE TABLE orders (o_id INTEGER, o_c INTEGER);"
+        "INSERT INTO orders SELECT g, g % 300 FROM range(0, 3000) t(g);"
+        "CREATE TABLE lineitem (l_o INTEGER, l_q INTEGER);"
+        "INSERT INTO lineitem SELECT g % 3000, g % 13 FROM range(0, 30000) t(g);"
+    )
+    catalog = Catalog()
+    catalog.register_datasource(dims)
+    catalog.register_datasource(facts)
+    catalog.load_metadata()
+    runtime = FedQRuntime(catalog, Config())
+    sql = (
+        "SELECT c.c_name, sum(l.l_q) AS q "
+        "FROM dims.main.customer c, facts.main.orders o, facts.main.lineitem l "
+        "WHERE c.c_id = o.o_c AND l.l_o = o.o_id "
+        "AND o.o_id IN (SELECT l2.l_o FROM facts.main.lineitem l2 "
+        "GROUP BY l2.l_o HAVING sum(l2.l_q) > 80) "
+        "GROUP BY c.c_name"
+    )
+    plan = runtime.query_executor._plan_pipeline(sql, None)
+    ir = build_ir(plan)
+    fact_injections = []
+    for step in ir["steps"]:
+        if step.get("op") == "injected_scan" and step["datasource"] == "facts":
+            fact_injections.append(step)
+    assert fact_injections, f"no fact reduction; steps: {ir['steps']}"
+    result = runtime.execute(sql)
+    oracle = duckdb_module.connect()
+    oracle.execute(
+        "CREATE TABLE customer AS SELECT g AS c_id, 'C' || g AS c_name"
+        " FROM range(0, 300) t(g);"
+        "CREATE TABLE orders AS SELECT g AS o_id, g % 300 AS o_c"
+        " FROM range(0, 3000) t(g);"
+        "CREATE TABLE lineitem AS SELECT g % 3000 AS l_o, g % 13 AS l_q"
+        " FROM range(0, 30000) t(g);"
+    )
+    expected = set()
+    for row in oracle.execute(
+        "SELECT c.c_name, sum(l.l_q) FROM customer c, orders o, lineitem l "
+        "WHERE c.c_id = o.o_c AND l.l_o = o.o_id "
+        "AND o.o_id IN (SELECT l2.l_o FROM lineitem l2 GROUP BY l2.l_o"
+        " HAVING sum(l2.l_q) > 80) GROUP BY c.c_name"
+    ).fetchall():
+        expected.add(tuple(row))
+    got = set()
+    for index in range(result.num_rows):
+        got.add((result.column("c_name")[index].as_py(),
+                 result.column("q")[index].as_py()))
+    assert got == expected

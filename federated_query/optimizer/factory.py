@@ -16,6 +16,7 @@ from .rules import (
     PredicatePushdownRule,
     ProjectionPushdownRule,
     RuleBasedOptimizer,
+    SemiJoinPushdownRule,
 )
 from .statistics import StatisticsCollector
 
@@ -32,6 +33,10 @@ def build_optimizer(
     optimizer = RuleBasedOptimizer(catalog)
     if optimizer_config.enable_predicate_pushdown:
         optimizer.add_rule(PredicatePushdownRule())
+    # Before join ordering: pushing a selective SEMI/ANTI join down to the
+    # relation it filters changes the region the reorderer then sees (a
+    # reduced input instead of a top-level existential filter).
+    optimizer.add_rule(SemiJoinPushdownRule())
     if optimizer_config.enable_join_reordering:
         optimizer.add_rule(_join_ordering_rule(catalog, optimizer_config, cost_config))
     if optimizer_config.enable_projection_pushdown:

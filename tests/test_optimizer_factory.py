@@ -33,11 +33,14 @@ def _rule_names(optimizer):
 
 
 def test_factory_registers_join_ordering_after_pushdown():
-    """The default config includes JoinOrdering directly after
-    PredicatePushdown (it consumes pushdown's normal form)."""
+    """PredicatePushdown, then SemiJoinPushdown (reduces the region join
+    ordering will see), then JoinOrdering - in that order and before
+    projection pruning."""
     optimizer = build_optimizer(Catalog(), OptimizerConfig(), CostConfig())
     names = _rule_names(optimizer)
-    assert names.index("JoinOrdering") == names.index("PredicatePushdown") + 1
+    assert names.index("PredicatePushdown") < names.index("SemiJoinPushdown")
+    assert names.index("SemiJoinPushdown") < names.index("JoinOrdering")
+    assert names.index("JoinOrdering") < names.index("ProjectionPushdown")
 
 
 def test_factory_flag_disables_join_ordering():

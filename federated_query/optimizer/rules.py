@@ -12,6 +12,7 @@ from ..plan.logical import (
     Filter,
     GroupedLimit,
     Join,
+    JoinType,
     Aggregate,
     SingleRowGuard,
     Sort,
@@ -944,6 +945,119 @@ class LimitPushdownRule(OptimizationRule):
     def name(self) -> str:
         """Return this rule's identifier (used in logging and EXPLAIN)."""
         return "LimitPushdown"
+
+
+class SemiJoinPushdownRule(OptimizationRule):
+    """Push a SEMI/ANTI join below the INNER join it sits on.
+
+    A SEMI/ANTI join is an existential FILTER on its left input. When that
+    left input is an INNER join and the semi condition references only ONE
+    side of it, the semi commutes below the inner join and filters just that
+    side - so a highly selective existential (TPC-H q18: an orders-only
+    HAVING subquery that keeps 57 of 1.5M orders) runs BEFORE the expensive
+    fact join instead of on top of its full output. The pushed-down orders
+    then feed the existing dynamic-filter reduction of the fact scan.
+
+    Correctness: SEMI(A JOIN B, p) == SEMI(A, p) JOIN B and
+    ANTI(A JOIN B, p) == ANTI(A, p) JOIN B whenever p references only A -
+    both sides are exactly the rows of A JOIN B whose A-part satisfies p, and
+    the inner join preserves B-multiplicity identically either way. The rule
+    fires only for that provable shape (plain INNER host, one-sided
+    condition); everything else is left untouched.
+    """
+
+    def apply(self, plan: LogicalPlanNode) -> Optional[LogicalPlanNode]:
+        """Push every eligible semi/anti join down; None-free (returns the
+        rewritten plan, identical when nothing moved)."""
+        return self._rewrite(plan)
+
+    def _rewrite(self, plan: LogicalPlanNode) -> LogicalPlanNode:
+        """Try to push a semi/anti join here, then recurse (so a pushed join
+        keeps descending toward the relation its condition references)."""
+        pushed = plan
+        if isinstance(plan, Join):
+            pushed = self._try_push(plan)
+        return transform_children(pushed, self._rewrite)
+
+    def _try_push(self, join: Join) -> LogicalPlanNode:
+        """Rewrite SEMI/ANTI(INNER(X, Y), subq) to push the semi onto the one
+        inner side its condition references, or return the join unchanged."""
+        if join.join_type not in (JoinType.SEMI, JoinType.ANTI):
+            return join
+        inner = join.left
+        if not self._is_plain_inner(inner):
+            return join
+        side = self._condition_side(join.condition, inner, join.right)
+        if side is None:
+            return join
+        return self._push_to_side(join, inner, side)
+
+    def _is_plain_inner(self, node: LogicalPlanNode) -> bool:
+        """A host we may commute a semi through: a plain INNER join, never a
+        NATURAL/USING one (its condition is implicit and must not be split)."""
+        if not isinstance(node, Join) or node.join_type != JoinType.INNER:
+            return False
+        return not (node.natural or node.using is not None)
+
+    def _condition_side(self, condition, inner: Join, subq) -> Optional[str]:
+        """Which single inner side the semi condition references: 'left',
+        'right', or None (both, neither, or an unresolvable column - unsafe)."""
+        if condition is None:
+            return None
+        left_cols = pushdown.available_columns(inner.left)
+        right_cols = pushdown.available_columns(inner.right)
+        subq_cols = pushdown.available_columns(subq)
+        return self._classify_condition(condition, left_cols, right_cols, subq_cols)
+
+    def _classify_condition(self, condition, left_cols, right_cols, subq_cols):
+        """Reduce the condition's column refs to the single inner side they
+        all belong to (subquery refs are ignored); None when not exactly one."""
+        hits = set()
+        for ref in pushdown.column_refs(condition):
+            placement = self._classify_ref(ref, left_cols, right_cols, subq_cols)
+            if placement is None:
+                return None
+            if placement in ("left", "right"):
+                hits.add(placement)
+        if len(hits) == 1:
+            return next(iter(hits))
+        return None
+
+    def _classify_ref(self, ref, left_cols, right_cols, subq_cols) -> Optional[str]:
+        """Place one column ref in exactly one region, else None (ambiguous or
+        unresolvable references make the push unsafe)."""
+        keys = {ref.column}
+        if ref.table:
+            keys.add(f"{ref.table}.{ref.column}")
+        regions = []
+        for name, columns in (("left", left_cols), ("right", right_cols),
+                              ("subq", subq_cols)):
+            if keys & columns:
+                regions.append(name)
+        if len(regions) != 1:
+            return None
+        return regions[0]
+
+    def _push_to_side(self, semi: Join, inner: Join, side: str) -> Join:
+        """Rebuild INNER(X, Y) with the semi wrapped around the named side."""
+        if side == "left":
+            # The semi becomes an existential filter on the inner's left
+            # input; the inner join and its condition are otherwise untouched.
+            wrapped = self._wrap_semi(semi, inner.left)
+            return inner.model_copy(update={"left": wrapped})
+        # Symmetric case: the condition references the inner's right input.
+        wrapped = self._wrap_semi(semi, inner.right)
+        return inner.model_copy(update={"right": wrapped})
+
+    def _wrap_semi(self, semi: Join, target: LogicalPlanNode) -> Join:
+        """A copy of the semi/anti join re-parented onto one inner side."""
+        # Same join type, condition and subquery as the original semi; only
+        # its left input changes to the inner side its condition references.
+        return semi.model_copy(update={"left": target})
+
+    def name(self) -> str:
+        """Return this rule's identifier (used in logging and EXPLAIN)."""
+        return "SemiJoinPushdown"
 
 
 class OrderByPushdownRule(OptimizationRule):
