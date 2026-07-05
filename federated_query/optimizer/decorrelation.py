@@ -1953,6 +1953,8 @@ class Decorrelator:
             body.aggregates, [_UNNEST_VALUE], domain, inner,
             correlated, local, dom_map, dep_prefix,
         )
+        # Join the aggregated per-domain values back to the outer plan on the
+        # free variables; LEFT so outer rows with no matching group survive.
         joined = Join.create(
             left=plan, right=dependent, join_type=JoinType.LEFT,
             condition=self._join_back_condition(free_vars, dom_map, dep_prefix),
@@ -1970,12 +1972,18 @@ class Decorrelator:
         for index, free_var in enumerate(free_vars):
             name = f"d{index}"
             names.append(name)
+            # Each free variable resolves to its domain column d<i>, qualified
+            # to the domain subquery's alias so every later ref is qualified.
             dom_map[(free_var.table, free_var.column)] = ColumnRef.create(
                 table=prefix, column=name
             )
+        # DISTINCT projection of the outer correlation values - the N-K domain
+        # relation the dependent subquery is evaluated once per value of.
         distinct = Projection.create(
             input=plan, expressions=list(free_vars), aliases=names, distinct=True
         )
+        # Wrap the domain under its own alias so its columns are addressable
+        # (and qualified) from the dependent join and the join-back condition.
         return SubqueryScan.create(input=distinct, alias=prefix), dom_map
 
     def _build_dependent_relation(
@@ -1987,6 +1995,8 @@ class Decorrelator:
         (one value) and a user LATERAL (the body's whole aggregate projection).
         """
         condition = self._dependent_join_condition(correlated, local, dom_map)
+        # The dependent join: inner body joined to the domain on the rewritten
+        # correlation predicate - a plain INNER join, no correlation left.
         dependent_input = Join.create(
             left=domain, right=inner, join_type=JoinType.INNER, condition=condition
         )
@@ -2004,10 +2014,14 @@ class Decorrelator:
         for aggregate in aggregates:
             select_list.append(_replace_column_refs(aggregate, dom_map))
         names.extend(agg_names)
+        # One aggregate row per domain value: group by the domain columns and
+        # evaluate the (rewritten) aggregate values over the dependent join.
         aggregate = Aggregate.create(
             input=dependent_input, group_by=group_cols,
             aggregates=select_list, output_names=names,
         )
+        # Alias the aggregated relation so the join-back can address its domain
+        # columns and aggregate outputs with qualified references.
         return SubqueryScan.create(input=aggregate, alias=prefix)
 
     def _dependent_join_condition(self, correlated, local, dom_map) -> Expression:
@@ -2022,7 +2036,11 @@ class Decorrelator:
         equalities: List[Expression] = []
         for free_var in free_vars:
             domain_ref = dom_map[(free_var.table, free_var.column)]
+            # The dependent relation re-exposes each domain column under its
+            # own alias; the outer free var equates against that column.
             dependent_ref = ColumnRef.create(table=dep_prefix, column=domain_ref.column)
+            # free_var = dependent.d<i>: one equality per free variable, ANDed
+            # into the join-back condition by the caller below.
             equalities.append(
                 BinaryOp.create(op=BinaryOpType.EQ, left=free_var, right=dependent_ref)
             )
@@ -2030,10 +2048,16 @@ class Decorrelator:
 
     def _scalar_value_ref(self, body, dep_prefix) -> Expression:
         """The dependent aggregate value, with COUNT's empty-group 0 (the count bug)."""
+        # The aggregate's output value as exposed by the dependent relation's
+        # alias (qualified, like every post-binder column reference).
         value_ref = ColumnRef.create(table=dep_prefix, column=_UNNEST_VALUE)
         if not self._is_count_aggregate(body.aggregates[0]):
             return value_ref
+        # COUNT over an empty group must be 0, not NULL (the classic count
+        # bug); 0 is the substitute for the LEFT join's NULL below.
         zero = Literal.create(value=0, data_type=DataType.INTEGER)
+        # COALESCE substitutes 0 for the NULL the LEFT join-back produces when
+        # the dependent aggregate had no row for this outer value.
         return FunctionCall.create(
             function_name="COALESCE", args=[value_ref, zero], is_aggregate=False
         )
@@ -2101,10 +2125,14 @@ class Decorrelator:
             [value], [_UNNEST_VALUE], order, limit, domain, inner,
             correlated, local, dom_map, dep_prefix,
         )
+        # Join the per-domain top-k rows back to the outer plan on the free
+        # variables; LEFT so outer rows with no qualifying row survive.
         joined = Join.create(
             left=plan, right=top_k, join_type=JoinType.LEFT,
             condition=self._join_back_condition(free_vars, dom_map, dep_prefix),
         )
+        # The subquery's value is the top-k relation's output column, qualified
+        # to the dependent alias (row subquery: NULL when no row matched).
         return ColumnRef.create(table=dep_prefix, column=_UNNEST_VALUE), joined
 
     def _build_top_k_relation(
@@ -2120,22 +2148,28 @@ class Decorrelator:
         so column pruning keeps the domain column through the join.
         """
         condition = self._dependent_join_condition(correlated, local, dom_map)
+        # The dependent join: inner body joined to the domain on the rewritten
+        # correlation predicate - a plain INNER join, no correlation left.
         joined = Join.create(
             left=domain, right=inner, join_type=JoinType.INNER, condition=condition
         )
         if limit is None:
-            # No LIMIT: a multi-row (set) LATERAL keeps every matching row, so no
-            # ranking - just project (domain columns, values) over the join.
             projected = self._project_join_values(joined, value_exprs, value_names, dom_map)
+            # No LIMIT: a multi-row (set) LATERAL keeps every matching row, so
+            # no ranking - alias the projected join for the join-back.
             return SubqueryScan.create(input=projected, alias=prefix)
         win_prefix = self._next_prefix()
         ranked = self._rank_by_row_number(
             joined, value_exprs, value_names, order, dom_map, win_prefix
         )
+        # Keep only rows ranked within the top-k for their domain value: the
+        # rn <= limit cap over the ROW_NUMBER projection.
         capped = Filter.create(
             input=ranked, predicate=self._row_number_cap(win_prefix, limit)
         )
         projected = self._project_domain_values(capped, value_names, dom_map, win_prefix)
+        # Alias the top-k relation so the join-back addresses its domain and
+        # value columns with qualified references.
         return SubqueryScan.create(input=projected, alias=prefix)
 
     def _project_join_values(self, joined, value_exprs, value_names, dom_map):
@@ -2149,6 +2183,8 @@ class Decorrelator:
         for value in value_exprs:
             values.append(_replace_column_refs(value, dom_map))
         expressions = list(dom_map.values()) + values
+        # Project (domain columns, rewritten values) over the dependent join;
+        # the aliases give each output its stable, addressable name.
         return Projection.create(input=joined, expressions=expressions, aliases=names)
 
     def _rank_by_row_number(self, joined, value_exprs, value_names, order, dom_map, win_prefix):
@@ -2167,15 +2203,23 @@ class Decorrelator:
         for value in value_exprs:
             values.append(_replace_column_refs(value, dom_map))
         expressions = list(dom_map.values()) + values + [window]
+        # Project (domain cols, rewritten values, ROW_NUMBER) in one list; the
+        # rank's alias is what the rn <= limit cap filters on.
         projection = Projection.create(input=joined, expressions=expressions, aliases=names)
+        # Alias the ranked projection so the cap and the final projection can
+        # reference the rank and the values with qualified names.
         return SubqueryScan.create(input=projection, alias=win_prefix)
 
     def _row_number_window(self, partition_keys, order):
         """A ROW_NUMBER() window partitioned by the domain, ordered as asked."""
+        # ROW_NUMBER() itself takes no arguments; the ranking comes entirely
+        # from the window's partition and order clauses below.
         row_number = FunctionCall.create(
             function_name="ROW_NUMBER", args=[], is_aggregate=False
         )
         keys, ascending, nulls = self._order_parts(order)
+        # Partition by the domain columns (one ranking per outer value) and
+        # order by the subquery's ORDER BY, preserving its nulls handling.
         return WindowExpr.create(
             function=row_number, partition_by=partition_keys,
             order_keys=keys, order_ascending=ascending, order_nulls=nulls,
@@ -2189,8 +2233,14 @@ class Decorrelator:
 
     def _row_number_cap(self, win_prefix, limit) -> Expression:
         """The rn <= limit predicate keeping the top-k rows per domain value."""
+        # The rank column as exposed by the ranked subquery's alias; qualified
+        # like every post-binder column reference.
         rank = ColumnRef.create(table=win_prefix, column=_UNNEST_RANK)
+        # The subquery's LIMIT k becomes the inclusive bound on the rank
+        # (ROW_NUMBER is 1-based, so rn <= k keeps exactly k rows per value).
         bound = Literal.create(value=limit, data_type=DataType.INTEGER)
+        # rn <= k: the per-domain top-k predicate the caller applies above the
+        # ranked projection.
         return BinaryOp.create(op=BinaryOpType.LTE, left=rank, right=bound)
 
     def _project_domain_values(self, capped, value_names, dom_map, win_prefix):
@@ -2198,11 +2248,17 @@ class Decorrelator:
         expressions: List[Expression] = []
         names: List[str] = []
         for domain_ref in dom_map.values():
+            # Re-expose each domain column from the ranked relation under the
+            # window alias so the join-back can equate against it.
             expressions.append(ColumnRef.create(table=win_prefix, column=domain_ref.column))
             names.append(domain_ref.column)
         for value_name in value_names:
+            # Re-expose each output value column from the ranked relation; the
+            # rank column is deliberately not carried forward.
             expressions.append(ColumnRef.create(table=win_prefix, column=value_name))
             names.append(value_name)
+        # The final top-k relation: (domain columns, values) only - the rank
+        # was consumed by the cap and is projected away here.
         return Projection.create(input=capped, expressions=expressions, aliases=names)
 
     def _rewrite_lateral_join(self, node: LateralJoin) -> LogicalPlanNode:
@@ -2229,6 +2285,8 @@ class Decorrelator:
         if built is None:
             return None
         relation, free_vars, dom_map = built
+        # Join the unnested LATERAL relation back to the outer plan on the free
+        # variables, preserving the user's join type for the lateral.
         return Join.create(
             left=outer, right=relation, join_type=node.join_type,
             condition=self._join_back_condition(free_vars, dom_map, alias),
