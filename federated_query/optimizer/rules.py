@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 from typing import List, Optional, TYPE_CHECKING
 from ..plan.logical import (
     CTE,
+    CTERef,
+    LateralJoin,
     LogicalPlanNode,
     Scan,
     Projection,
@@ -18,6 +20,7 @@ from ..plan.logical import (
     SetOperation,
     SubqueryScan,
     Explain,
+    Values,
     transform_children,
 )
 from . import pushdown
@@ -566,61 +569,52 @@ class ProjectionPushdownRule(OptimizationRule):
             self._collect_subquery_parts(child, columns)
 
     def _prune_columns(self, plan: LogicalPlanNode, required: set) -> LogicalPlanNode:
-        """Prune unused columns from plan."""
+        """Prune every scan in the plan to the required qualified names.
+
+        The required set is GLOBAL (collection is qualified and crosses
+        scopes), so pass-through nodes just recurse with the same set and
+        each scan self-selects its own columns. Scope roots (derived tables,
+        CTE subplans, set-op branches) prune inside only when their root pins
+        an explicit output schema. An unknown node type raises - silently
+        skipping one could leave scans with stale semantics.
+        """
         if isinstance(plan, Scan):
             return self._prune_scan_columns(plan, required)
-
-        if isinstance(plan, Projection):
-            new_input = self._prune_columns(plan.input, required)
-            if new_input != plan.input:
-                return plan.model_copy(update={"input": new_input})
-            return plan
-
-        if isinstance(plan, Filter):
-            filter_cols = pushdown.bare_names(plan.predicate)
-            combined_required = required.union(filter_cols)
-            new_input = self._prune_columns(plan.input, combined_required)
-            if new_input != plan.input:
-                return plan.model_copy(update={"input": new_input})
-            return plan
-
-        if isinstance(plan, Join):
-            # Qualified names self-select per scan, so both sides receive the
-            # ONE global required set - no per-side splitting needed.
-            new_left = self._prune_columns(plan.left, required)
-            new_right = self._prune_columns(plan.right, required)
-            if new_left != plan.left or new_right != plan.right:
-                return plan.model_copy(update={"left": new_left, "right": new_right})
-            return plan
-
-        if isinstance(plan, Aggregate):
-            new_input = self._prune_columns(plan.input, required)
-            if new_input != plan.input:
-                return plan.model_copy(update={"input": new_input})
-            return plan
-
-        if isinstance(plan, Limit):
-            new_input = self._prune_columns(plan.input, required)
-            if new_input != plan.input:
-                return plan.model_copy(update={"input": new_input})
-            return plan
-
-        if isinstance(plan, Sort):
-            sort_cols = set()
-            for key in plan.sort_keys:
-                sort_cols.update(pushdown.bare_names(key))
-            new_input = self._prune_columns(plan.input, required.union(sort_cols))
-            if new_input != plan.input:
-                return plan.model_copy(update={"input": new_input})
-            return plan
-
+        if isinstance(plan, SubqueryScan):
+            return self._prune_subquery_scan(plan, required)
         if isinstance(plan, CTE):
             return self._prune_cte(plan, required)
-
         if isinstance(plan, (SetOperation, Union)):
             return self._prune_branches(plan, required)
+        if isinstance(plan, (Values, CTERef)):
+            return plan
+        return self._prune_through(plan, required)
 
-        return plan
+    def _prune_through(self, plan: LogicalPlanNode, required: set) -> LogicalPlanNode:
+        """Pass-through nodes: prune each child with the same global set."""
+        passthrough = (Projection, Filter, Join, Aggregate, Limit, Sort,
+                       GroupedLimit, SingleRowGuard, LateralJoin, Explain)
+        if not isinstance(plan, passthrough):
+            raise ValueError(
+                f"_prune_columns has no rule for plan node {type(plan).__name__}"
+            )
+
+        def prune_child(child: LogicalPlanNode) -> LogicalPlanNode:
+            """One child pruned with the enclosing required set."""
+            return self._prune_columns(child, required)
+
+        return transform_children(plan, prune_child)
+
+    def _prune_subquery_scan(self, node: SubqueryScan, required: set) -> LogicalPlanNode:
+        """A derived table prunes inside only when its body pins an explicit
+        output schema; a bare-plan body's scan columns ARE the derived
+        table's schema and must not change."""
+        if not self._has_explicit_projection(node.input):
+            return node
+        pruned = self._prune_columns(node.input, required)
+        if pruned != node.input:
+            return node.model_copy(update={"input": pruned})
+        return node
 
     def _prune_cte(self, cte: CTE, required: set) -> LogicalPlanNode:
         """Prune the WITH query's main child always; the named subplan only
