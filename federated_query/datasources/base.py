@@ -86,9 +86,14 @@ class TableMetadata(StateModel):
 
 
 class ColumnStatistics(StateModel):
-    """Statistics about a column."""
+    """Statistics about a column.
 
-    num_distinct: int
+    ``num_distinct`` is None when the source cannot provide a distinct count;
+    a source never fabricates a statistic it does not know - the estimator
+    substitutes a NAMED default and records the substitution as provenance.
+    """
+
+    num_distinct: Optional[int]
     null_fraction: float
     avg_width: int  # Average size in bytes
     min_value: Optional[Any] = None
@@ -98,7 +103,7 @@ class ColumnStatistics(StateModel):
     def create(
         cls,
         *,
-        num_distinct: int,
+        num_distinct: Optional[int],
         null_fraction: float,
         avg_width: int,
         min_value: Optional[Any] = None,
@@ -117,9 +122,15 @@ class ColumnStatistics(StateModel):
 
 
 class TableStatistics(StateModel):
-    """Statistics about a table."""
+    """Statistics about a table.
 
-    row_count: int
+    ``row_count`` is None when the source honestly does not know its row count
+    (e.g. PostgreSQL reltuples = -1 before the first ANALYZE); a source never
+    fabricates a count - the estimator substitutes a NAMED default and records
+    the substitution as provenance.
+    """
+
+    row_count: Optional[int]
     total_size_bytes: int
     column_stats: Dict[str, ColumnStatistics]
 
@@ -127,7 +138,7 @@ class TableStatistics(StateModel):
     def create(
         cls,
         *,
-        row_count: int,
+        row_count: Optional[int],
         total_size_bytes: int,
         column_stats: Dict[str, ColumnStatistics],
     ) -> "TableStatistics":
