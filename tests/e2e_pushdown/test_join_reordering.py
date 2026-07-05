@@ -158,3 +158,34 @@ def _collect_dynamic_filters(node, found):
         found.append(node)
     for child in node.children():
         _collect_dynamic_filters(child, found)
+
+
+def test_same_source_island_collapses_to_one_remote_query():
+    """The q05 pattern: a filter on one facts table makes the facts join
+    output far smaller than the raw tables, so the locality term keeps
+    orders and lineitem adjacent and the single-source collapse sends ONE
+    remote query joining them - instead of fetching each table whole.
+    (Without such a filter the island saves nothing and the model rightly
+    does not force it - that is the cost TERM, not a group-by-source rule.)"""
+    runtime = _runtime(Config())
+    sql = _qualify(
+        "SELECT count(*) AS n FROM region , nation , supplier , orders , lineitem "
+        "WHERE n_r = r_id AND s_n = n_id AND l_s = s_id AND l_o = o_id "
+        "AND r_name = 'R1' AND o_id < 50"
+    )
+    document = runtime.explain(sql)
+    facts_queries = []
+    for entry in document["queries"]:
+        if entry["datasource_name"] == "facts":
+            facts_queries.append(str(entry["query"]))
+    assert len(facts_queries) == 1, f"facts queries: {facts_queries}"
+    joined = facts_queries[0].upper()
+    assert "ORDERS" in joined and "LINEITEM" in joined and "JOIN" in joined
+    # And the reordered, collapsed plan still computes the right answer.
+    result = runtime.execute(sql)
+    expected = _oracle().execute(
+        "SELECT count(*) FROM region, nation, supplier, orders, lineitem "
+        "WHERE n_r = r_id AND s_n = n_id AND l_s = s_id AND l_o = o_id "
+        "AND r_name = 'R1' AND o_id < 50"
+    ).fetchone()[0]
+    assert result.column("n").to_pylist() == [expected]
