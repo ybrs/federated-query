@@ -1091,13 +1091,62 @@ def _injected_probe_spec(base, inject_col, build_key):
             spec["injected_sql"] = injected_sql
         return spec
     if any((base.aggregates, base.group_by, base.grouping_sets)):
-        return raw_scan_spec(base)
+        spec = raw_scan_spec(base)
+        injected_sql = _aggregate_injected_sql(base, inject_col, build_key)
+        if injected_sql is not None:
+            spec["injected_sql"] = injected_sql
+        return spec
     return structured_scan_spec(base)
 
 
 # The connection-scoped temp table the engine fills with the build side's
 # distinct keys (must match fedqrs's DYN_KEYS_TEMP_TABLE).
 _DYN_KEYS_TEMP_TABLE = "fedq_dyn_keys"
+
+
+def _aggregate_injected_sql(base, inject_col, build_key):
+    """An aggregate-subquery base (the decorrelated `AVG(x) GROUP BY key`
+    probe) with `group_key IN (SELECT key FROM fedq_dyn_keys)` placed in the
+    scan's WHERE - BEFORE the grouping - instead of wrapping its output.
+
+    The inject column is a GROUP KEY (the reduction joins on it), so filtering
+    the input by it is identical to filtering the groups, and sources do not
+    push a semi-join through the aggregate wrapper (measured q17 SF10: 1508ms
+    wrapped vs 93ms pushed inside). None when the inject column is not a plain
+    group-key base column, or the scan carries GROUPING SETS (a filtered input
+    changes which sets a row contributes to)."""
+    if base.grouping_sets:
+        return None
+    owner = _aggregate_key_owner(base, inject_col)
+    if owner is None:
+        return None
+    from ..plan.physical import to_source_sql
+
+    keys_query = exp.select(exp.column(build_key, quoted=True)).from_(
+        _DYN_KEYS_TEMP_TABLE
+    )
+    key_column = exp.column(owner.column, table=owner.table, quoted=True)
+    injected = base._build_ast().where(key_column.isin(query=keys_query), copy=True)
+    return to_source_sql(base.datasource_connection, injected.sql(dialect="postgres"))
+
+
+def _aggregate_key_owner(base, inject_col):
+    """The base ColumnRef of the group key whose output name is the inject
+    column; None when that output is a computed aggregate (not a plain group
+    key) or is ambiguous - filtering a non-group-key would change the result."""
+    group_cols = set()
+    for key in base.group_by or []:
+        if isinstance(key, ColumnRef):
+            group_cols.add((key.table, key.column))
+    owners = []
+    for expr, name in zip(base.aggregates or [], base.output_names or []):
+        if name != inject_col or not isinstance(expr, ColumnRef):
+            continue
+        if (expr.table, expr.column) in group_cols:
+            owners.append(expr)
+    if len(owners) == 1:
+        return owners[0]
+    return None
 
 
 def _island_injected_sql(base, inject_col, build_key):

@@ -342,6 +342,25 @@ CAPABILITY, precisely characterized, not un-costed decisions):
    same-source run; the left-deep enumerator cannot express that shape.
    Cost side is ready (run output vs per-atom transfers, both estimable);
    the emission restructure is the work.
+SF10 (60M lineitem) validation and what it exposed. Fair-federated at 10x:
+all 22 correct, overall 2.71x (up from SF1's 1.98x - the remaining gap is
+ALGORITHMIC, not overhead, confirmed because it grows with data). Half the
+queries hold at/under 1.5x (q06/q12/q19 BEAT DuckDB); the blow-ups pinpointed
+the real levers:
+- q17 (was 7.97x): FIXED. The decorrelated `AVG(l_quantity) GROUP BY
+  l_partkey` subquery had its 2044-partkey reduction applied to the
+  aggregate's OUTPUT (a wrapper DuckDB does not push through the GROUP BY),
+  so it aggregated all 60M rows / 200k groups then kept 2044. Extended
+  CBO-4's in-island injection to aggregate bases (_aggregate_injected_sql):
+  the key filter now sits in the scan's WHERE before GROUP BY, on the base
+  group-key column. Isolated 1508 -> 93ms; q17 SF10 1743 -> 298ms (1.34x),
+  SF1 unchanged (the 6M aggregate was already cheap). Guard-tested (declines
+  a non-group-key inject column and GROUPING SETS).
+- q09 (6.22x, 7.1s): the island break, now the single biggest lever - 60M
+  lineitem + 15M orders + 8M partsupp (all DuckDB) pulled to the coordinator
+  because only the leading same-source run collapses. Needs bushy
+  same-source emission (item 2).
+
 3. Monolithic-pushdown order sensitivity (found by the closing matrix):
    q21 in BOTH parquet cells regressed 147 -> ~390ms across this round.
    A fully-collapsed single-source query is executed by the SOURCE'S own

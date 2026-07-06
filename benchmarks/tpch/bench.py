@@ -49,7 +49,7 @@ REPORT_DIR = os.path.join(HERE, "reports")
 # feed the single/fedparquet cells; the PostgreSQL database feeds fedpgduck
 # (facts read from the DuckDB file, dims from this database).
 PARQUET_DIRS = {"0.1": "/workspace/tpch_parquet", "1": "/workspace/tpch_parquet_sf1"}
-PG_DATABASES = {"0.1": "duckpoc", "1": "duckpoc_sf1"}
+PG_DATABASES = {"0.1": "duckpoc", "1": "duckpoc_sf1", "10": "duckpoc_sf10"}
 LINEITEM_ROWS = {"0.1": "600K", "1": "6M"}
 
 CELLS = ("single", "fedparquet", "fedpgduck")

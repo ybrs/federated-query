@@ -352,3 +352,51 @@ def test_island_injection_declines_unsafe_shapes():
         {("orders", "o_custkey"): "o_custkey"},
     )
     assert _island_injected_sql(windowed, "o_custkey", "k") is None
+
+
+def _agg_scan(table, alias, group_col, agg_out, group_out):
+    """An aggregate PhysicalScan: AVG over `agg_out` GROUP BY `group_col`,
+    the decorrelated correlated-average subquery shape (q17)."""
+    from federated_query.plan.expressions import FunctionCall
+    from federated_query.datasources.duckdb import DuckDBDataSource
+    group_ref = _col(alias, group_col)
+    agg = FunctionCall(function_name="AVG", args=[_col(alias, agg_out)], is_aggregate=True)
+    scan = PhysicalScan(
+        datasource="duck", schema_name="main", table_name=table,
+        columns=[group_col, agg_out], alias=alias,
+        group_by=[group_ref], aggregates=[agg, group_ref],
+        output_names=["v0", group_out],
+        datasource_connection=DuckDBDataSource("duck", {"path": ":memory:"}),
+    )
+    fields = [("v0", pa.float64()), (group_out, pa.int32())]
+    object.__setattr__(scan, "_schema", pa.schema(fields))
+    return scan
+
+
+def test_aggregate_base_key_filter_goes_inside_the_group_by():
+    """q17: the key filter lands in the aggregate scan's WHERE (before GROUP
+    BY, on the base group column), not around its output - so the source
+    scans only the reduced input (measured SF10: 1508ms wrapped vs 93ms)."""
+    from federated_query.executor.rust_ir import _aggregate_injected_sql
+    agg = _agg_scan("lineitem", "l", "l_partkey", "l_quantity", "__subq_0_g0")
+    sql = _aggregate_injected_sql(agg, "__subq_0_g0", "p_partkey")
+    assert sql is not None
+    normalized = " ".join(sql.split())
+    assert 'WHERE "l"."l_partkey" IN (SELECT "p_partkey" FROM fedq_dyn_keys)' in normalized
+    assert normalized.index("WHERE") < normalized.index("GROUP BY")
+
+
+def test_aggregate_injection_declines_a_non_group_key_output():
+    """The inject column must be a plain GROUP KEY; an aggregate output (the
+    AVG) is not one, and filtering it would change the result - decline."""
+    from federated_query.executor.rust_ir import _aggregate_injected_sql
+    agg = _agg_scan("lineitem", "l", "l_partkey", "l_quantity", "__subq_0_g0")
+    assert _aggregate_injected_sql(agg, "v0", "p_partkey") is None
+
+
+def test_aggregate_injection_declines_grouping_sets():
+    """GROUPING SETS: a filtered input changes which sets a row feeds - decline."""
+    from federated_query.executor.rust_ir import _aggregate_injected_sql
+    agg = _agg_scan("lineitem", "l", "l_partkey", "l_quantity", "__subq_0_g0")
+    agg = agg.model_copy(update={"grouping_sets": [[_col("l", "l_partkey")], []]})
+    assert _aggregate_injected_sql(agg, "__subq_0_g0", "p_partkey") is None
