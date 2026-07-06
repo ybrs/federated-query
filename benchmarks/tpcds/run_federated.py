@@ -15,15 +15,18 @@ loaded every table into both sources), so a mismatch is a real engine bug.
 Each engine run happens in an isolated child process bounded by a wall-clock
 timeout and a memory cap, so a cross-source query that never terminates or blows
 up intermediate results becomes a clean ERROR row (Timeout / Killed) instead of
-hanging or OOM-ing the whole run. The DuckDB oracle runs in the parent.
+hanging or OOM-ing the whole run. The DuckDB oracle (Postgres attached) runs in
+that same child, so its timing is the "DuckDB over federated Postgres" baseline.
 """
 
 import argparse
 import glob
+import math
 import multiprocessing
 import os
 import queue as queue_module
 import resource
+import time
 
 import duckdb
 import sqlglot
@@ -148,31 +151,55 @@ def _apply_memory_limit(memory_limit_mb):
     resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
 
 
+def _run_engine(runtime, engine_sql):
+    """Warm the engine, then time one execution; return (elapsed_ms, rows).
+
+    Each query runs in a fresh child, so the FIRST execution pays cold Rust
+    connection-pool and plan setup. A discarded warm-up run makes the timed run
+    steady-state - a fair comparison against the equally-warmed oracle."""
+    runtime.execute(engine_sql)
+    start = time.perf_counter()
+    result = runtime.execute(engine_sql)
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+    return elapsed_ms, arrow_to_rows(result)
+
+
+def _run_oracle(oracle, oracle_sql):
+    """Warm the DuckDB-over-Postgres oracle, then time one execution."""
+    oracle.execute(oracle_sql).fetchall()
+    start = time.perf_counter()
+    rows = oracle.execute(oracle_sql).fetchall()
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+    return elapsed_ms, rows
+
+
 def _evaluate_worker(engine_sql, oracle_sql, db_path, options, decimals, result_queue):
     """Child-process entry: run the query through the engine AND the oracle in
-    ONE process, compare, and return the verdict.
+    ONE process, compare, time both, and return the verdict.
 
     Engine and oracle share the process (as in the TPC-H harness) so the
     engine's read-write DuckDB open never collides with the oracle's read-only
     lock across processes - the failure mode when the oracle was held open in
-    the parent."""
+    the parent. The oracle (DuckDB with Postgres attached) IS the "DuckDB over
+    federated Postgres" baseline the engine timing is measured against."""
     _apply_memory_limit(options.memory_limit)
     try:
         runtime = build_fedq(db_path, options)
-        engine_rows = arrow_to_rows(runtime.execute(engine_sql))
+        engine_ms, engine_rows = _run_engine(runtime, engine_sql)
     except Exception as error:
         result_queue.put(("error", _error_text(error)))
         return
     try:
         oracle = build_oracle(db_path, options)
-        oracle_rows = oracle.execute(oracle_sql).fetchall()
+        oracle_ms, oracle_rows = _run_oracle(oracle, oracle_sql)
     except Exception as error:
         result_queue.put(("error", "oracle: " + _error_text(error)))
         return
     match, reason = compare_results(engine_rows, oracle_rows, decimals)
     result_queue.put((
         "done",
-        ("PASS" if match else "MISMATCH", reason, len(engine_rows), len(oracle_rows)),
+        ("PASS" if match else "MISMATCH", reason, len(engine_rows),
+         len(oracle_rows), engine_ms, oracle_ms),
     ))
 
 
@@ -244,14 +271,17 @@ def evaluate_query(path, placement, db_path, options):
     outcome, error = _run_isolated(engine_sql, oracle_sql, db_path, options)
     if error is not None:
         return _result(name, "ERROR", error, cross, None, None)
-    status, reason, engine_rows, oracle_rows = outcome
-    return _result(name, status, reason, cross, engine_rows, oracle_rows)
+    status, reason, engine_rows, oracle_rows, engine_ms, oracle_ms = outcome
+    return _result(name, status, reason, cross, engine_rows, oracle_rows,
+                   engine_ms, oracle_ms)
 
 
-def _result(name, status, reason, cross, engine_rows, oracle_rows):
-    """Assemble one query's outcome record."""
+def _result(name, status, reason, cross, engine_rows, oracle_rows,
+            engine_ms=None, oracle_ms=None):
+    """Assemble one query's outcome record (timings are None for ERROR rows)."""
     return {"name": name, "status": status, "reason": reason, "span": cross,
-            "engine_rows": engine_rows, "oracle_rows": oracle_rows}
+            "engine_rows": engine_rows, "oracle_rows": oracle_rows,
+            "engine_ms": engine_ms, "oracle_ms": oracle_ms}
 
 
 def _print_result(result):
@@ -290,6 +320,58 @@ def _print_summary(placement_name, results):
     """Print the pass/mismatch/error tally and cross-source count."""
     print("-" * 60)
     print(_summary_line(placement_name, results))
+
+
+def _timing_rows(results):
+    """PASS queries that have both timings, as (name, engine_ms, duck_ms, ratio).
+
+    duck_ms is the DuckDB-over-Postgres oracle; ratio = engine_ms / duck_ms, so
+    >1 means the engine is slower than DuckDB federating the same split.
+    """
+    rows = []
+    for result in results:
+        if result["status"] != "PASS" or result["engine_ms"] is None:
+            continue
+        engine_ms = result["engine_ms"]
+        duck_ms = result["oracle_ms"]
+        ratio = engine_ms / duck_ms if duck_ms > 0 else float("inf")
+        rows.append((result["name"], engine_ms, duck_ms, ratio))
+    return rows
+
+
+def _geomean(values):
+    """Geometric mean of positive values (0.0 if empty)."""
+    if not values:
+        return 0.0
+    log_sum = 0.0
+    for value in values:
+        log_sum += math.log(value)
+    return math.exp(log_sum / len(values))
+
+
+def _timing_table_lines(placement_name, results):
+    """Markdown lines: engine vs DuckDB-over-Postgres timing for PASS queries."""
+    rows = _timing_rows(results)
+    if not rows:
+        return []
+    lines = ["", "### Timings (PASS only): engine vs DuckDB-over-Postgres [{0}]".format(
+        placement_name), "", "| query | engine ms | duck ms | ratio |",
+        "|---|---|---|---|"]
+    ratios = []
+    for name, engine_ms, duck_ms, ratio in rows:
+        ratios.append(ratio)
+        lines.append("| {0} | {1:.1f} | {2:.1f} | {3:.2f}x |".format(
+            name, engine_ms, duck_ms, ratio))
+    lines.append("")
+    lines.append("Geomean ratio (engine/duck): {0:.2f}x over {1} queries.".format(
+        _geomean(ratios), len(rows)))
+    return lines
+
+
+def _print_timing_summary(placement_name, results):
+    """Print the engine-vs-DuckDB-over-Postgres timing table to stdout."""
+    for line in _timing_table_lines(placement_name, results):
+        print(line)
 
 
 # Ordered failure signatures for the federated run: the first substring found in
@@ -402,8 +484,9 @@ def _report_header(options):
         "# TPC-DS federated benchmark report",
         "",
         "Scale factor {0}, PostgreSQL + DuckDB split, per-query timeout {1}s, "
-        "memory cap {2} MB. Each engine run is an isolated child process; the "
-        "DuckDB oracle (with PostgreSQL attached) runs in the parent.".format(
+        "memory cap {2} MB. Each query's engine and DuckDB oracle (with "
+        "PostgreSQL attached) run together in one isolated child process; "
+        "timings are steady-state (one warm-up run discarded).".format(
             options.scale_factor, options.timeout, options.memory_limit),
         "",
         "Correctness is differential: fedq reads each table from its placed "
@@ -420,6 +503,7 @@ def write_report(sections, options, path):
     lines = _report_header(options)
     for placement_name, results in sections:
         lines.extend(_placement_section(placement_name, results))
+        lines.extend(_timing_table_lines(placement_name, results))
     with open(path, "w") as handle:
         handle.write("\n".join(lines))
     print("Wrote report: {0}".format(path))
@@ -450,6 +534,7 @@ def run_placement(placement_name, paths, db_path, options):
         results.append(result)
         _print_result(result)
     _print_summary(placement_name, results)
+    _print_timing_summary(placement_name, results)
     return results
 
 
