@@ -1702,8 +1702,20 @@ class PhysicalUnion(PhysicalPlanNode):
         return self.inputs[0].schema()
 
     def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
-        """Expose the first branch's aliases; a union's output is its columns."""
-        return self.inputs[0].column_aliases()
+        """A union's output is exactly its columns: one alias per output column,
+        keyed by its output name.
+
+        NOT the first branch's aliases - those also expose that branch's SOURCE
+        column names (e.g. `('customer', 'c_customer_id')` alongside the
+        `(None, 'customer_id')` output), two keys mapping to one physical column.
+        Self-joining the union then renamed that column twice (right_customer_id
+        and right_customer_id_1), so a parent's right_customer_id reference did
+        not resolve (q04).
+        """
+        aliases: Dict[Tuple[Optional[str], str], str] = {}
+        for name in self.schema().names:
+            aliases[(None, name)] = name
+        return aliases
 
     def estimated_cost(self) -> float:
         raise NotImplementedError("Cost estimation not yet implemented")
