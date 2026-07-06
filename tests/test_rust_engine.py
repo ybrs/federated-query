@@ -169,6 +169,37 @@ def test_cross_source_inner_join(engine):
     assert result.num_rows == 10
 
 
+def test_cross_source_union_all(engine):
+    """UNION ALL over two sources concatenates both branches (PhysicalUnion,
+    emitted as a raw_sql union over the branch inputs)."""
+    qe, datasources = engine
+    sql = (
+        f"SELECT n_name AS name FROM srcA.{SCHEMA}.nation "
+        f"UNION ALL SELECT r_name AS name FROM srcB.{SCHEMA}.region"
+    )
+    _assert_parity(qe, datasources, sql)
+
+
+def test_cross_source_union_distinct(engine):
+    """UNION (distinct) over two sources dedups across both branches."""
+    qe, datasources = engine
+    sql = (
+        f"SELECT n_regionkey AS k FROM srcA.{SCHEMA}.nation "
+        f"UNION SELECT r_regionkey AS k FROM srcB.{SCHEMA}.region"
+    )
+    _assert_parity(qe, datasources, sql)
+
+
+def test_cross_source_intersect(engine):
+    """INTERSECT over two sources (PhysicalSetOperation)."""
+    qe, datasources = engine
+    sql = (
+        f"SELECT n_regionkey AS k FROM srcA.{SCHEMA}.nation "
+        f"INTERSECT SELECT r_regionkey AS k FROM srcB.{SCHEMA}.region"
+    )
+    _assert_parity(qe, datasources, sql)
+
+
 def test_cross_source_join_with_pushed_filter(engine):
     qe, datasources = engine
     sql = (

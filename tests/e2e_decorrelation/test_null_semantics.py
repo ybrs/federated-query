@@ -584,7 +584,6 @@ class TestExistsWithNulls:
         results = execute_and_fetch_all(executor, decorrelated_plan)
         assert len(results) >= 0, "Query should execute successfully"
 
-    @pytest.mark.xfail(reason="fedqrs gap: PhysicalUnion (union-distinct) has no Rust operator", strict=False)
     def test_exists_always_true_or_false(self, catalog, setup_null_test_data):
         """
         Test: EXISTS never returns NULL (always TRUE or FALSE).

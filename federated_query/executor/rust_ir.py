@@ -49,7 +49,9 @@ from ..plan.physical import (
     PhysicalRemoteQuery,
     PhysicalRemoteSetOp,
     PhysicalScan,
+    PhysicalSetOperation,
     PhysicalSort,
+    PhysicalUnion,
     PhysicalValues,
     PhysicalWindow,
     _DYNAMIC_FILTER_MAX_KEYS,
@@ -671,17 +673,58 @@ def _emit_window(node, ctx):
     return result
 
 
+def _raw_sql_step(ctx, sql, inputs):
+    """Append a `raw_sql` fragment running `sql` over the registered `inputs`
+    (each merge input is registered under its name in a fresh DataFusion
+    context, which parses and executes the SQL); return its binding."""
+    fragment = ctx.names.fragment()
+    ctx.fragments[fragment] = {"kind": "raw_sql", "sql": sql}
+    result = ctx.names.binding()
+    ctx.steps.append({
+        "op": "merge", "fragment": fragment, "inputs": inputs, "binding": result,
+    })
+    return result
+
+
 def _emit_cte_merge(node, ctx):
     """A whole WITH/CTE rendered as SQL over named inputs: emit each input to a
-    binding, register it under its name, and run the SQL as a `raw_sql` fragment."""
+    binding registered under its name, and run the SQL as a `raw_sql` fragment."""
     inputs = {}
     for name, subtree in node.inputs.items():
         inputs[name] = _emit(subtree, ctx)
-    fragment = ctx.names.fragment()
-    ctx.fragments[fragment] = {"kind": "raw_sql", "sql": node.sql}
-    result = ctx.names.binding()
-    ctx.steps.append({"op": "merge", "fragment": fragment, "inputs": inputs, "binding": result})
-    return result
+    return _raw_sql_step(ctx, node.sql, inputs)
+
+
+def _branch_inputs(ctx, branches):
+    """Emit each set-operation branch to an `in_<i>` binding; return the inputs
+    map and the per-branch `SELECT * FROM in_<i>` statements."""
+    inputs = {}
+    selects = []
+    for index, child in enumerate(branches):
+        name = "in_{0}".format(index)
+        inputs[name] = _emit(child, ctx)
+        selects.append("SELECT * FROM {0}".format(name))
+    return inputs, selects
+
+
+def _emit_union(node, ctx):
+    """A cross-source UNION [ALL] run as a raw_sql fragment over its branches.
+
+    Each branch is registered as in_0..in_N; DataFusion's UNION aligns by
+    position and takes the FIRST branch's column names - exactly the node's
+    output (its schema is inputs[0]). `distinct` picks UNION vs UNION ALL.
+    """
+    inputs, selects = _branch_inputs(ctx, node.inputs)
+    keyword = "UNION" if node.distinct else "UNION ALL"
+    return _raw_sql_step(ctx, (" " + keyword + " ").join(selects), inputs)
+
+
+def _emit_set_operation(node, ctx):
+    """A cross-source INTERSECT / EXCEPT [ALL] run as a raw_sql fragment over its
+    two branches (in_0, in_1); `distinct` picks the plain vs the ALL form."""
+    inputs, selects = _branch_inputs(ctx, [node.left, node.right])
+    keyword = node.kind.value if node.distinct else node.kind.value + " ALL"
+    return _raw_sql_step(ctx, (" " + keyword + " ").join(selects), inputs)
 
 
 def _emit_limit(node, ctx):
@@ -1344,6 +1387,8 @@ _NODE_EMITTERS = {
     PhysicalAliasedRelation: _emit_passthrough,
     PhysicalWindow: _emit_window,
     PhysicalGroupedLimit: _emit_grouped_limit,
+    PhysicalUnion: _emit_union,
+    PhysicalSetOperation: _emit_set_operation,
 }
 
 

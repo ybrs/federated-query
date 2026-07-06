@@ -456,7 +456,6 @@ class TestEdgeCases:
         results = execute_and_fetch_all(executor, decorrelated_plan)
         assert len(results) >= 0, "Query should execute successfully"
 
-    @pytest.mark.xfail(reason="fedqrs gap: PhysicalUnion (union-distinct) has no Rust operator", strict=False)
     def test_all_subquery_types_in_one_query(self, catalog, setup_test_data):
         """
         Test: Query using all subquery types simultaneously.

@@ -339,7 +339,6 @@ class TestCorrelatedNotExists:
 class TestExistsInComplexQueries:
     """Test EXISTS in complex query contexts."""
 
-    @pytest.mark.xfail(reason="fedqrs gap: PhysicalUnion (union-distinct) has no Rust operator", strict=False)
     def test_exists_in_select_list(self, catalog, setup_test_data):
         """
         Test: EXISTS as a boolean expression in SELECT list.
@@ -465,7 +464,6 @@ class TestExistsInComplexQueries:
         # Execute and verify results: 3 users
         assert_result_contains_ids(executor, decorrelated_plan, {1, 3, 5})
 
-    @pytest.mark.xfail(reason="fedqrs gap: PhysicalUnion (union-distinct) has no Rust operator", strict=False)
     def test_exists_under_or_predicate(self, catalog, setup_test_data):
         """
         Test: Correlated EXISTS combined with OR condition.
