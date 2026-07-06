@@ -1,4 +1,4 @@
-# Status: thirteen phases + DuckDB connection reuse; fair federated gap 38.6x -> 2.26x
+# Status: CBO complete at the decision layer; fair federated gap 38.6x -> 1.98x
 
 State of the work. Facts only: what exists, what passes, what is measured,
 what is not done. Previous phase (Rust cutover, N-K decorrelation, merge-engine
@@ -356,17 +356,64 @@ single / fedparquet cells are Parquet-based (cached ctx) and unaffected. The
 full pytest suite is green with the fix (1169 passed). Change is UNCOMMITTED in
 the fedqrs working tree; the regenerated report is report-result-e10d67b.md.
 
+## The CBO completion round (commits 618e58d..75d1e87 + fedqrs main)
+
+Every size-sensitive DECISION now consumes cost-model numbers; the full
+decision inventory with statuses, all measurements, one negative result, and
+one caught correctness regression live in perf-explore.md. The steps, each
+gated on the suite + fedpgduck both scales, closing matrix all 132 correct:
+- CBO-1: temporal range interpolation on a day scale, per-column INTERVAL
+  pairing in conjunctions (F(upper)-F(lower), not marginal products),
+  BETWEEN included. TPC-H estimates snapped to reality (q07 lineitem within
+  5% of actual).
+- CBO-2: PhysicalRemoteQuery carries output_estimated_rows (the island
+  root's real estimate) separate from the max-base orientation floor;
+  orientation, hash-build choice, and the usefulness gate consume it (q10
+  runs the REVERSE reduction). fedqrs: pg full-scan fraction 0.15 (its
+  fallback is the 8-way parallel read; measured break-even).
+- CBO-3: single-sided condition conjuncts of LEFT/SEMI/ANTI joins move into
+  the non-preserved input (q13's NOT LIKE runs in duck; pure-equi hash join).
+- CBO-4: island key filters prerender INSIDE the island SQL on the owning
+  relation (sources do not push semi-joins through the wrapper; q03 3x).
+- CBO-5: ONE shared cost model session-wide; the planner annotates
+  LEFT/SEMI/ANTI join scans regions never visit; usefulness = expected_keys
+  / max(build NDV, probe NDV); injected_scan carries probe NDV so the
+  runtime delivery guard prices keys/NDV (q14 -35ms).
+- Parallel pg source scans (round 2): big plain pg reads go through the
+  ctid-parallel path (customer wide read 136 -> 37.5ms).
+- CORRECTNESS CATCH: the closing matrix (not the suite) caught q13 wrong
+  rows in the single-parquet cell - the collapsed SQL hoisted the nullable
+  side's filter into WHERE, dropping null-extended rows. Fixed (75d1e87):
+  the filter rides the JOIN ON; FULL/NATURAL/USING decline; pinned by
+  differential test. RULE: plan-shape changes gate on the FULL matrix.
+- NEGATIVE RESULT: pricing the runtime reduction inside the DP transfer
+  term made totals worse (q03 74 -> 180ms) - coordinator join-INPUT work
+  has no cost term, so cheap transfer mis-prices island breaking. Reverted,
+  documented at the call site; needs a paired input term + TRANSFER_WEIGHT
+  recalibration as its own gated experiment.
+
+Gate (report-result-75d1e87.md): fedpgduck SF1 38.55x -> **1.98x**
+(2133/1079ms), SF0.1 3.16x; all 132 cells correct.
+
 ## Known gaps / next work (in priority order from the data)
 
-Fair-federated SF1 2.26x, SF0.1 3.27x; single-source SF1 1.70x; all correct.
-1. **Per-fetch engine overhead: the DuckDB instance-creation part is DONE** (see
-   the connection-reuse section). The residual per-fetch cost is now ~0.2-0.5ms
-   (DataFusion per-fragment `SessionContext` ~0.40ms; tokio `Runtime::new()`
-   0.18ms/query) - marginal; reusing one `SessionContext` per query or the tokio
-   runtime across queries would save fractions of a ms and is NOT worth it. What
-   remains in the fedpgduck cell is real data work (materialization: 1M lineitem
-   rows ~= 305ms) plus the reduction's collect+inject, whose duck cursors are now
-   ~0.2ms each - also no longer a lever.
+Fair-federated SF1 1.98x, SF0.1 3.16x; all correct.
+1. **q21/q08 in the PARQUET cells regressed** across the CBO round (q21 147
+   -> ~390ms both parquet cells; fedpgduck q21 unaffected): a fully-collapsed
+   single-source query is executed by DataFusion's own optimizer, which our
+   rendered join order still steers - an execution model the transfer-based
+   cost does not price. Reordering OFF is worse (472ms), so it is order
+   choice, not reordering. See perf-explore.md item 3.
+2. **Coordinator-input cost term + TRANSFER_WEIGHT recalibration** (unlocks
+   reduction-aware ordering; see the negative result).
+3. **Bushy same-source runs**: q02's mid-chain supplier x nation x region (3
+   pg trips -> 1) and q09's orders+partsupp need an emitter that can build a
+   bushy right subtree; cost side is ready.
+4. **Scan SELECT lists include filter-only columns** (q13 ships o_comment
+   although its filter runs in duck) - projection-pushdown gap, ~30-40ms.
+5. **Per-fetch engine overhead is DONE** (duck instance reuse; residuals
+   0.2-0.5ms/step are not a lever). fedqrs missing operators (xfails);
+   `enable_decorrelation` unwired.
 2. **q07 (6.4x), q13 (1.5M-order LEFT-count, inherent), q10**: the plan tail.
 3. **Composite-key correlation is only PARTIALLY modelled**: the cap fixes the
    worst 2-column-FK case; a full multi-column correlation NDV (or a lazy

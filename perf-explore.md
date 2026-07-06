@@ -247,25 +247,23 @@ is the full list - when the non-cost-based rows below are gone, there is no
 | # | decision | where | status |
 | - | -------- | ----- | ------ |
 | 1 | join ORDER within a region | JoinOrderingRule (Selinger DP, C_out + transfer) | COST-BASED |
-| 2 | hash-join build side | _choose_build_side via larger_estimated_side | COST-BASED (phase 12) |
+| 2 | hash-join build side | _choose_build_side via larger_estimated_side | COST-BASED (real output estimates since CBO-2) |
 | 3 | predicate/projection/aggregate/orderby/limit pushdown | rules.py | rule-based, always-profitable rewrites - needs no cost |
 | 4 | SEMI/ANTI commute below INNER | SemiJoinPushdownRule | structural gate (provable shape); cost-free by design |
-| 5 | reduction USEFULNESS (do the keys filter at all?) | rust_ir _reduction_filters | COST-BASED as of this round (NDVs threaded from the cost model; abstains for composite builds) |
-| 6 | parallel vs single-stream source read | rust_ir _parallel_scan_eligible | COST-BASED as of this round (estimated_rows threshold) |
-| 7 | reduction ORIENTATION vs a fact island | rust_ir _orient_join | BLUNTED: max-base over-estimate by design; needs a real remote OUTPUT estimate carried separately |
-| 8 | island formation (leading-run-only; break-for-reduction) | join ordering locality term | NOT modeled: the DP never sees reduction effects; mid-chain same-source runs never collapse |
-| 9 | key delivery strategy (IN / temp table / full scan) | engine.rs IN_CAP, DUCK_TEMP_CAP, FULL_SCAN_FRACTION | CONSTANTS; duck guard uses keys/rows instead of keys/NDV |
-| 10 | selectivity of DATE range filters | cost.py range interpolation | DEFAULTED (0.33) for non-numeric columns - q10's island est 2,000,405 = 1.5M x 0.33 x 4 vs actual 114k; TPC-H is full of date ranges, so this poisons many estimates |
-| 11 | NDV/estimate coverage on physical nodes | only region atoms + remotes carry them | PARTIAL: LEFT/SEMI joins outside INNER regions carry no NDVs, so gates abstain there |
-| 12 | nullable-side single-sided join conjunct pushdown (q13) | missing rewrite rule | needs no cost - it is semantics-preserving; just unimplemented |
+| 5 | reduction USEFULNESS | rust_ir _reduction_filters | COST-BASED (true semi-join selectivity; composite builds judged by output estimate; CBO-2/5) |
+| 6 | parallel vs single-stream source read | rust_ir _parallel_scan_eligible | COST-BASED (round 2) |
+| 7 | reduction ORIENTATION vs a fact island | rust_ir _orient_join | COST-BASED (output_estimated_rows preferred; max-base is the no-estimate floor; CBO-2) |
+| 8 | island formation (leading-run-only) | join ordering locality term | leading-run islands are costed; PRICING reduction inside the DP measured worse without a coordinator-input term (see the negative result); mid-chain runs need bushy emission |
+| 9 | key delivery strategy (IN / temp / full) | engine.rs | COST-BASED inputs: keys/NDV fraction from the planner's stats (CBO-5); source-aware thresholds measured (pg 0.15 vs duck 0.40, CBO-2) |
+| 10 | selectivity of DATE range filters | cost.py | FIXED (CBO-1): ordinal interpolation + interval pairing + BETWEEN |
+| 11 | NDV/estimate coverage on physical nodes | planner + regions + remotes | UNIFORM (CBO-5): one shared cost model; LEFT/SEMI/ANTI sides annotated by the planner |
+| 12 | nullable-side single-sided join conjunct pushdown | PredicatePushdownRule | IMPLEMENTED (CBO-3), guard-tested |
 
-So the honest answer to "how many steps": after this round, TWO estimate-
-quality items (7+10+11 are one workstream: real per-node output estimates,
-date interpolation, uniform threading) and ONE enumeration item (8, reduction
-+transfer modeled in the DP, which subsumes mid-chain islands and makes 9's
-thresholds costed choices). Plus the cost-free rewrite (12). That is the
-whole remaining list; nothing else in the pipeline makes a size-sensitive
-choice.
+Decision-layer status: EVERY size-sensitive decision now reads cost-model
+numbers, and every constant left standing (IN_CAP, DUCK_TEMP_CAP, the two
+full-scan fractions, PARALLEL_SCAN_MIN_ROWS, USELESS_KEYS_NDV_FRACTION) has
+a measurement behind it in this file or the commit log. What remains is not
+an un-costed decision but two capability extensions (next section).
 
 Why it kept coming back: the system has ONE cost number per node serving
 THREE different questions - (a) ordering wants order-independent, never-
@@ -276,6 +274,84 @@ number for (a), and (b)/(c) kept inheriting a number that deliberately means
 something else. The fix is not another patch to the shared number; it is
 carrying the answers separately (output estimate + key NDVs per node), which
 this round started.
+
+## Round 3: the CBO completion round (commits 618e58d..)
+
+Every decision in the inventory below now consumes cost-model numbers.
+The steps, each gated on the full suite + fedpgduck both scales:
+
+- CBO-1 (618e58d): temporal range interpolation + interval pairing.
+  Date-window predicates (all over TPC-H) stopped defaulting to 0.33 or
+  0.33^2 and price F(upper)-F(lower) on a day scale; BETWEEN included.
+  q07's lineitem estimate landed within 5% of actual. SF1 2.12 -> 2.03x.
+- CBO-2 (aef5e6d + fedqrs): remotes carry output_estimated_rows separate
+  from the max-base orientation floor; orientation, hash-build choice, and
+  the usefulness gate consume it. q10 flipped to the REVERSE reduction
+  (island keys into pg customer). The pg delivery guard threshold dropped
+  to 0.15 (its full-scan alternative is now the 8-way parallel read;
+  measured break-even). q09 (max-base's reason to exist) held.
+- CBO-3 (8954e7a): single-sided condition conjuncts of LEFT/RIGHT/SEMI/
+  ANTI joins move into the non-preserved input. q13's NOT LIKE runs in
+  duck, the join becomes pure-equi hash. 236 -> 204ms.
+- CBO-4 (e3af6a7 + fedqrs): the island key filter is prerendered INSIDE
+  the island SQL on its owning relation (fedq_dyn_keys temp join); the
+  wrapper that duckdb cannot push through is the fallback only.
+  q03 112 -> 71ms.
+- CBO-5 (fcaab59 + fedqrs): ONE shared cost model for the whole session;
+  the planner annotates LEFT/SEMI/ANTI join scans that regions never
+  visit; the usefulness predicate became true semi-join selectivity
+  (expected_keys / max(build NDV, probe NDV) - the old probe-only form
+  wrongly refused filtered dimensions); injected_scan carries probe NDV so
+  the runtime delivery guard prices keys/NDV, not keys/rows. q14 83 ->
+  54ms, q13 204 -> 176ms. SF1 1.93x - first time under 2x.
+
+## The correctness catch (why the gates are non-negotiable)
+
+The first post-CBO-3 FULL-matrix run showed q13 MISMATCH in the single-
+parquet cell (fedpgduck was correct - the join is cross-source there and
+never renders as one SQL). Root cause: the single-source renderer hoists a
+plain scan's filter into the global WHERE, which is wrong for the nullable
+side of a LEFT join (null-extended rows evaluate the filter to NULL and
+vanish) - a shape that only exists since the condition-pushdown rule.
+Fixed in 75d1e87: the filter rides the JOIN ON (the exact inverse of the
+logical rewrite); FULL/NATURAL/USING decline; RIGHT dropped from the rule.
+Pinned by test_outer_join_condition_render (ON placement + zero-match
+differential). The unit suite alone did NOT catch this; the 132-cell
+differential did. Any rule that changes plan shape must gate on the full
+matrix, not the suite.
+
+## The negative result that closes CBO-6a (measured, reverted)
+
+Charging the DP's transfer term the REDUCED expectation (rows x the same
+semi-join selectivity the gate prices) made totals WORSE: 2163 -> 2312ms;
+q03 74 -> 180, q10 +59, q05 +36 (q07 -37 was real but outweighed).
+Mechanism: cheaper transfer makes island-breaking look free because the
+coordinator pays JOIN-INPUT work (materialize + hash 300k-row inputs) that
+no cost term prices - C_out prices outputs only. Pricing reduction in the
+DP therefore requires a paired coordinator-input term and a TRANSFER_WEIGHT
+recalibration, run as its own gated experiment. The conservative
+full-rows charge stays (documented at the call site).
+
+What remains beyond the decision layer (both are new cost-model/enumerator
+CAPABILITY, precisely characterized, not un-costed decisions):
+1. Coordinator-input cost term + recalibration (above), which unlocks
+   reduction-aware ordering.
+2. Bushy same-source runs: mid-chain pg dims (q02's supplier x nation x
+   region, 3 round trips) and q09's orders+partsupp can only collapse if
+   the emitter can build a bushy right subtree for a consecutive
+   same-source run; the left-deep enumerator cannot express that shape.
+   Cost side is ready (run output vs per-atom transfers, both estimable);
+   the emission restructure is the work.
+3. Monolithic-pushdown order sensitivity (found by the closing matrix):
+   q21 in BOTH parquet cells regressed 147 -> ~390ms across this round.
+   A fully-collapsed single-source query is executed by the SOURCE'S own
+   optimizer (DataFusion re-plans our rendered SQL), yet the join order we
+   render still steers it; our transfer-based cost model does not price
+   that execution model. Measured: reordering OFF is WORSE (472ms), so
+   this is order-choice-under-new-estimates, not reordering itself. The
+   fair fedpgduck cell is unaffected (q21 136-158ms there). Candidate
+   fixes: order-render heuristics for fully-collapsed plans, or trust the
+   source and emit canonical order when a single query holds everything.
 
 ## Round 2 results (parallel scans + usefulness gate, commit pending)
 
