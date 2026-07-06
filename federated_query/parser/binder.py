@@ -429,16 +429,39 @@ class Binder:
             bound_keys.append(self._bind_expression(key))
         return bound_keys
 
+    def _positional_index(self, key: Expression, count: int) -> Optional[int]:
+        """The 0-based output index a positional ORDER BY key names, or None.
+
+        `ORDER BY <n>` (a plain integer literal 1..count) is a SQL ordinal - it
+        orders by the n-th SELECT output, NOT by the constant n. Left unresolved
+        it survives as a literal that a single-source push masks (the source
+        honors the ordinal) but the coordinator sort treats as a constant, so
+        the ORDER BY silently vanishes cross-source (q62)."""
+        if isinstance(key, Literal) and type(key.value) is int and 1 <= key.value <= count:
+            return key.value - 1
+        return None
+
     def _bind_sort_keys_for_aggregate(
         self,
         sort_keys: List[Expression],
         aggregate: Aggregate,
     ) -> List[Expression]:
-        """Bind ORDER BY keys when input is an Aggregate (supports output aliases)."""
+        """Bind ORDER BY keys when input is an Aggregate (supports output aliases
+        and positional ordinals)."""
         alias_map = self._aggregate_alias_map(aggregate)
+        outputs = aggregate.output_names or []
 
         bound_keys: List[Expression] = []
         for key in sort_keys:
+            index = self._positional_index(key, len(outputs))
+            if index is not None:
+                # ORDER BY <ordinal> over an aggregate: the n-th output, referenced
+                # bare by its output name (the same shape as ORDER BY <alias>).
+                bound_keys.append(ColumnRef.create(
+                    table=None, column=outputs[index],
+                    data_type=aggregate.aggregates[index].get_type(),
+                ))
+                continue
             if isinstance(key, ColumnRef) and key.table is None:
                 if key.column in alias_map:
                     expr = alias_map[key.column]
@@ -460,17 +483,28 @@ class Binder:
         alias_map = self._build_alias_expression_map(projection)
         bound_keys: List[Expression] = []
         for key in sort_keys:
-            bound_keys.append(self._bind_projection_sort_key(key, alias_map))
+            bound_keys.append(self._bind_projection_sort_key(key, alias_map, projection))
         return bound_keys
 
     def _bind_projection_sort_key(
         self,
         key: Expression,
         alias_map: Dict[str, Expression],
+        projection: Projection,
     ) -> Expression:
-        """Bind a single ORDER BY expression that may reference a select alias."""
+        """Bind a single ORDER BY expression that may reference a select alias
+        or be a positional ordinal."""
         from ..plan.expressions import ColumnRef
 
+        index = self._positional_index(key, len(projection.expressions))
+        if index is not None:
+            # ORDER BY <ordinal>: the n-th SELECT output, resolved to that output's
+            # column (the same treatment as ORDER BY <its alias>).
+            output_key = ColumnRef.create(
+                table=None, column=projection.aliases[index],
+                data_type=projection.expressions[index].get_type(),
+            )
+            return self._sort_key_from_alias(output_key, projection.expressions[index])
         if isinstance(key, ColumnRef) and key.table is None and key.column in alias_map:
             return self._sort_key_from_alias(key, alias_map[key.column])
         return self._bind_expression(key)
