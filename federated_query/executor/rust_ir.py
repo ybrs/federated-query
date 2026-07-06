@@ -792,7 +792,7 @@ def _emit_join(join, ctx):
     so a parent can reference them.
     """
     kind = _join_kind(join)
-    if _can_reduce(join) and _reduction_filters(join):
+    if _can_reduce(join) and _probe_base_resolvable(join) and _reduction_filters(join):
         left_binding, right_binding = _emit_reduced_join(join, ctx)
     else:
         left_binding = _emit(join.left, ctx)
@@ -844,6 +844,21 @@ def _left_reducible(join) -> bool:
         return False
     inject_col = _physical_column_name(join.right_keys[0], join.right.column_aliases())
     return _reducible_probe_base(join.right, inject_col) is not None
+
+
+def _probe_base_resolvable(join) -> bool:
+    """True when the oriented probe descends to a single injectable base for the
+    inject column - which the reduced-join emission requires.
+
+    _can_reduce accepts an INNER join on probe-preference alone, but the cost-
+    oriented probe can be the LARGER side, and that side may itself be a join
+    (a fact already joined to another dim, as in q96) with no single base. The
+    emission would then find no base and crash on None.datasource; gate on this
+    so the join instead emits as a normal (unreduced) join.
+    """
+    _, probe, _, probe_key = _orient_join(join)
+    inject_col = _physical_column_name(probe_key, probe.column_aliases())
+    return _reducible_probe_base(probe, inject_col) is not None
 
 
 def _reduction_filters(join) -> bool:

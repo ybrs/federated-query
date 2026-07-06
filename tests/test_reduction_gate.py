@@ -13,6 +13,7 @@ import pyarrow as pa
 from federated_query.executor.rust_ir import (
     _can_reduce,
     _orient_join,
+    _probe_base_resolvable,
     _reducible_probe_base,
 )
 from federated_query.plan.expressions import ColumnRef, DataType
@@ -400,3 +401,35 @@ def test_aggregate_injection_declines_grouping_sets():
     agg = _agg_scan("lineitem", "l", "l_partkey", "l_quantity", "__subq_0_g0")
     agg = agg.model_copy(update={"grouping_sets": [[_col("l", "l_partkey")], []]})
     assert _aggregate_injected_sql(agg, "__subq_0_g0", "p_partkey") is None
+
+
+def test_join_subtree_is_not_an_injectable_base():
+    """A join subtree has no single scan/remote base, so _reducible_probe_base
+    returns None - there is nowhere to inject a dynamic filter (q96: a fact
+    already joined to a dim)."""
+    fact = _scan("store_sales", "ss", ["ss_hdemo_sk", "ss_store_sk"])
+    dim = _scan("household_demographics", "hd", ["hd_demo_sk"])
+    joined = _inner(fact, dim, _col("ss", "ss_hdemo_sk"), _col("hd", "hd_demo_sk"))
+    assert _reducible_probe_base(joined, "ss_store_sk") is None
+
+
+def test_probe_base_resolvable_refuses_a_join_probe():
+    """When the oriented probe resolves to no injectable base, the gate refuses
+    the reduction so the emitter never dereferences a None base (the q96 crash).
+    A LEFT join fixes the nullable right as the probe, so a right join subtree
+    reliably orients the probe to a baseless node."""
+    left = _scan("store", "s", ["s_store_sk"])
+    r1 = _scan("store_sales", "ss", ["ss_store_sk", "ss_hdemo_sk"])
+    r2 = _scan("household_demographics", "hd", ["hd_demo_sk"])
+    right_join = _inner(r1, r2, _col("ss", "ss_hdemo_sk"), _col("hd", "hd_demo_sk"))
+    top = _left_join(left, right_join, _col("s", "s_store_sk"), _col("ss", "ss_store_sk"))
+    assert _probe_base_resolvable(top) is False
+
+
+def test_probe_base_resolvable_allows_a_plain_scan_probe():
+    """Two plain scans: the oriented probe is a scan whose key is at its base,
+    so the gate allows the reduction."""
+    dim = _scan("household_demographics", "hd", ["hd_demo_sk"])
+    fact = _scan("store_sales", "ss", ["ss_hdemo_sk", "ss_store_sk"])
+    join = _inner(fact, dim, _col("ss", "ss_hdemo_sk"), _col("hd", "hd_demo_sk"))
+    assert _probe_base_resolvable(join) is True

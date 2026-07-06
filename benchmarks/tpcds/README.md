@@ -95,6 +95,23 @@ a wrong value. Note that many TPC-DS queries end in `ORDER BY ... LIMIT n` over
 columns with ties, so a differing tie-break is a legitimate ordering difference
 rather than a wrong result.
 
+### DuckDB postgres-scanner filter pushdown (disabled in the oracle)
+
+The federated oracle sets `pg_experimental_filter_pushdown=false`. DuckDB's
+postgres extension can push a WHERE filter down to Postgres incorrectly and the
+scan then returns zero rows - on q59 the oracle returned 0 rows where both pure
+DuckDB and this engine return 100 (verified: the two data copies are identical;
+`EXPLAIN ANALYZE` shows a scan collapsing to 0; turning the pushdown off returns
+the correct 100). Since the oracle is the correctness reference, we disable the
+buggy (and, per its name, experimental) pushdown so the oracle is correct. The
+feature is new, so DuckDB will likely fix it; revisit then.
+
+One side effect: without pushdown the oracle reads unfiltered dimension rows and
+filters locally, so it is a bit slower than DuckDB's real fast path. That makes
+the engine-vs-DuckDB timing ratio somewhat favorable to us for now. Acceptable
+for outlier-hunting; treat the timing headline as "vs correct DuckDB", not "vs
+DuckDB at its fastest".
+
 ## Files
 
 - `generate.py` - build the DuckDB database and query files.
