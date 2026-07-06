@@ -390,6 +390,52 @@ def test_bind_order_by_alias(catalog_with_test_data):
     assert sort_node.sort_keys[0].column == "order_id"
 
 
+def test_order_by_positional_ordinal_over_projection(catalog_with_test_data):
+    """ORDER BY <n> resolves to the n-th SELECT output, not the integer literal.
+
+    Left as a literal, a single-source push honors the ordinal but the
+    coordinator sort treats <n> as a constant and the ORDER BY silently vanishes
+    (q62).
+    """
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+
+    sql = "SELECT name, age FROM testdb.public.users ORDER BY 2, 1"
+    bound_plan = binder.bind(parser.parse_to_logical_plan(sql, catalog_with_test_data))
+
+    from federated_query.plan.logical import Sort
+    from federated_query.plan.expressions import ColumnRef
+
+    assert isinstance(bound_plan, Sort)
+    # ORDER BY 2, 1 -> the 2nd output (age) then the 1st (name), as columns.
+    assert isinstance(bound_plan.sort_keys[0], ColumnRef)
+    assert bound_plan.sort_keys[0].column == "age"
+    assert isinstance(bound_plan.sort_keys[1], ColumnRef)
+    assert bound_plan.sort_keys[1].column == "name"
+
+
+def test_order_by_positional_ordinal_over_aggregate(catalog_with_test_data):
+    """ORDER BY <n> over an aggregate resolves to the n-th output column."""
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+
+    sql = (
+        "SELECT age, count(*) AS c FROM testdb.public.users "
+        "GROUP BY age ORDER BY 1"
+    )
+    bound_plan = binder.bind(parser.parse_to_logical_plan(sql, catalog_with_test_data))
+
+    from federated_query.plan.logical import Sort
+    from federated_query.plan.expressions import ColumnRef, Literal
+
+    assert isinstance(bound_plan, Sort)
+    key = bound_plan.sort_keys[0]
+    # Resolved to the grouping output 'age', not left as the integer literal 1.
+    assert not isinstance(key, Literal)
+    assert isinstance(key, ColumnRef)
+    assert key.column == "age"
+
+
 def test_group_by_alias_of_aggregate_is_rejected(catalog_with_test_data):
     """GROUP BY naming an output alias that is an aggregate is invalid and raises."""
     parser = Parser()

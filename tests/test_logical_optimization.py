@@ -676,6 +676,49 @@ class TestOrderByPushdown:
         assert isinstance(key.left, ColumnRef)
         assert key.left.column == "order_id"
 
+    def test_order_by_over_filter_kept_above(self):
+        """A Sort over a Filter stays ABOVE the filter, not pushed below it.
+
+        Pushing Sort(Filter) -> Filter(Sort) separates the sort from a LIMIT above
+        it; a filter between the sort and the limit does not preserve row order in
+        the cross-source engine, so the LIMIT keeps a non-deterministic top-N (the
+        q59 bug). The Sort therefore stays over the filter, and no order metadata
+        leaks into the scan beneath the filter.
+        """
+        scan = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="orders",
+            columns=["order_id", "amount"],
+        )
+        filtered = Filter(
+            input=scan,
+            predicate=BinaryOp(
+                op=BinaryOpType.GT,
+                left=ColumnRef(
+                    table="orders", column="amount", data_type=DataType.INTEGER
+                ),
+                right=Literal(value=5, data_type=DataType.INTEGER),
+            ),
+        )
+        sort = Sort(
+            input=filtered,
+            sort_keys=[
+                ColumnRef(table="orders", column="order_id", data_type=DataType.INTEGER)
+            ],
+            ascending=[True],
+            nulls_order=[None],
+        )
+
+        rule = OrderByPushdownRule()
+        result = rule.apply(sort)
+
+        assert isinstance(result, Sort)
+        assert isinstance(result.input, Filter)
+        assert isinstance(result.input.input, Scan)
+        # The sort did not descend through the filter into the scan.
+        assert result.input.input.order_by_keys is None
+
     def test_order_by_over_join_kept_above(self):
         """A Sort over a join stays above it; a join does not preserve row order.
 
