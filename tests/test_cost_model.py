@@ -945,3 +945,84 @@ def cost_config_fixture():
     """A plain cost config for direct construction in module-level tests."""
     return CostConfig(cpu_tuple_cost=0.01, io_page_cost=1.0,
                       network_byte_cost=0.0001, network_rtt_ms=10.0)
+
+
+def _two_col_scan(cols_ndv, rows):
+    """A scan whose columns each carry a distinct-count stat."""
+    stats = {}
+    for col, ndv in cols_ndv.items():
+        stats[col] = ColumnStatistics(num_distinct=ndv, null_fraction=0.0, avg_width=8)
+    return TableStatistics(row_count=rows, total_size_bytes=0, column_stats=stats)
+
+
+def test_composite_key_join_is_not_underestimated():
+    """A join on TWO columns together (a composite FK: lineitem<->partsupp on
+    partkey AND suppkey) must NOT be estimated by the PRODUCT of per-column
+    NDVs (which assumes independence: 200k*10k = 2e9, collapsing 6M rows to
+    ~2400). The distinct key COMBINATIONS cannot exceed the smaller side's
+    rows, so the estimate must be at least ~max(rows) = 6M."""
+    tables = {
+        ("public", "lineitem"): _two_col_scan(
+            {"l_partkey": 200_000, "l_suppkey": 10_000}, 6_000_000),
+        ("public", "partsupp"): _two_col_scan(
+            {"ps_partkey": 200_000, "ps_suppkey": 10_000}, 800_000),
+    }
+    model = CostModel(cost_config_fixture(), _seeded_collector("ds", tables))
+    left = Scan(datasource="ds", schema_name="public", table_name="lineitem",
+                columns=["l_partkey", "l_suppkey"], alias="l")
+    right = Scan(datasource="ds", schema_name="public", table_name="partsupp",
+                 columns=["ps_partkey", "ps_suppkey"], alias="ps")
+    condition = BinaryOp(
+        op=BinaryOpType.AND,
+        left=BinaryOp(op=BinaryOpType.EQ, left=ColumnRef(table="l", column="l_partkey", data_type=DataType.INTEGER),
+                      right=ColumnRef(table="ps", column="ps_partkey", data_type=DataType.INTEGER)),
+        right=BinaryOp(op=BinaryOpType.EQ, left=ColumnRef(table="l", column="l_suppkey", data_type=DataType.INTEGER),
+                       right=ColumnRef(table="ps", column="ps_suppkey", data_type=DataType.INTEGER)),
+    )
+    join = Join(left=left, right=right, join_type=JoinType.INNER, condition=condition)
+    rows = model.estimate(join).rows
+    assert rows >= 5_000_000, f"composite-key join under-estimated to {rows}"
+
+
+def test_single_key_join_estimate_unchanged():
+    """The cap only bites when the NDV product exceeds min(rows); a normal
+    single-key FK join keeps its NDV-formula estimate."""
+    tables = {
+        ("public", "orders"): _two_col_scan({"o_custkey": 100_000}, 1_500_000),
+        ("public", "customer"): _two_col_scan({"c_custkey": 150_000}, 150_000),
+    }
+    model = CostModel(cost_config_fixture(), _seeded_collector("ds", tables))
+    left = Scan(datasource="ds", schema_name="public", table_name="orders",
+                columns=["o_custkey"], alias="o")
+    right = Scan(datasource="ds", schema_name="public", table_name="customer",
+                 columns=["c_custkey"], alias="c")
+    condition = BinaryOp(op=BinaryOpType.EQ,
+        left=ColumnRef(table="o", column="o_custkey", data_type=DataType.INTEGER),
+        right=ColumnRef(table="c", column="c_custkey", data_type=DataType.INTEGER))
+    join = Join(left=left, right=right, join_type=JoinType.INNER, condition=condition)
+    # 1.5M * 150k / max(100k, 150k) = 1.5M (unchanged by the cap: denom
+    # 150k <= min(rows) 150k).
+    assert model.estimate(join).rows == 1_500_000
+
+
+def test_single_key_join_denominator_not_capped():
+    """Regression: a SINGLE-key join whose bigger side has a unique key
+    (ndv = its rows > the smaller side's rows) must NOT have its denominator
+    capped at min(rows). Capping it would turn a 50-row FK join into a
+    1000-row over-estimate (the composite cap must apply only to multi-column
+    keys)."""
+    tables = {
+        ("public", "big"): _two_col_scan({"k": 1000}, 1000),
+        ("public", "small"): _two_col_scan({"k": 50}, 50),
+    }
+    model = CostModel(cost_config_fixture(), _seeded_collector("ds", tables))
+    left = Scan(datasource="ds", schema_name="public", table_name="big",
+                columns=["k"], alias="b")
+    right = Scan(datasource="ds", schema_name="public", table_name="small",
+                 columns=["k"], alias="s")
+    condition = BinaryOp(op=BinaryOpType.EQ,
+        left=ColumnRef(table="b", column="k", data_type=DataType.INTEGER),
+        right=ColumnRef(table="s", column="k", data_type=DataType.INTEGER))
+    join = Join(left=left, right=right, join_type=JoinType.INNER, condition=condition)
+    # 1000 * 50 / max(1000, 50) = 50  (NOT 1000*50/min(rows)=1000)
+    assert model.estimate(join).rows == 50
