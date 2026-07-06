@@ -107,7 +107,11 @@ class PredicatePushdownRule(OptimizationRule):
             return self._push_filter(plan)
         if isinstance(plan, SetOperation):
             return _rewrite_set_operation_branches(plan, self._push_down)
-        if isinstance(plan, (Projection, Join, Aggregate, Limit, Sort, SubqueryScan,
+        if isinstance(plan, Join):
+            return transform_children(
+                self._push_join_condition(plan), self._push_down
+            )
+        if isinstance(plan, (Projection, Aggregate, Limit, Sort, SubqueryScan,
                              CTE)):
             return transform_children(plan, self._push_down)
         return plan
@@ -417,6 +421,64 @@ class PredicatePushdownRule(OptimizationRule):
         conjuncts = split_conjuncts(filter_node.predicate)
         groups = self._group_join_conjuncts(conjuncts, join)
         return self._assemble_pushed_join(join, groups)
+
+    # Join types whose single-sided condition conjuncts may move into the
+    # NON-PRESERVED input: matching is unchanged for every preserved row, and
+    # a non-matching inner row never appears on its own. FULL preserves both
+    # sides (a filtered inner row would lose its own null-extended output);
+    # INNER conditions are normalized by join ordering; CROSS has none.
+    _CONDITION_PUSH_SIDE = {
+        JoinType.LEFT: "right",
+        JoinType.RIGHT: "left",
+        JoinType.SEMI: "right",
+        JoinType.ANTI: "right",
+    }
+
+    def _push_join_condition(self, join: Join) -> Join:
+        """Move condition conjuncts that reference only the non-preserved side
+        into that input as a filter (q13: the LEFT join's o_comment NOT LIKE
+        conjunct then reaches the orders scan, so the wide comment column is
+        filtered at the source and the join condition becomes pure equi).
+        At least one conjunct must remain as the join condition."""
+        side = self._CONDITION_PUSH_SIDE.get(join.join_type)
+        if side is None or join.condition is None:
+            return join
+        if join.natural or join.using is not None:
+            return join
+        movable, kept = self._split_single_sided(join, side)
+        if not movable or not kept:
+            return join
+        # The moved conjuncts as one filter under the non-preserved input;
+        # ordinary filter pushdown then carries them into the side's scan.
+        filtered = Filter.create(
+            input=getattr(join, side), predicate=combine_and(movable)
+        )
+        return join.model_copy(
+            update={side: filtered, "condition": combine_and(kept)}
+        )
+
+    def _split_single_sided(self, join: Join, side: str):
+        """(movable, kept) condition conjuncts: movable ones reference at
+        least one column and only the given side's columns."""
+        side_cols = pushdown.available_columns(getattr(join, side))
+        other = "left" if side == "right" else "right"
+        other_cols = pushdown.available_columns(getattr(join, other))
+        movable = []
+        kept = []
+        for conjunct in split_conjuncts(join.condition):
+            if self._movable_conjunct(conjunct, side_cols, other_cols):
+                movable.append(conjunct)
+            else:
+                kept.append(conjunct)
+        return movable, kept
+
+    def _movable_conjunct(self, conjunct, side_cols, other_cols) -> bool:
+        """Whether one conjunct references only the pushable side (a constant
+        conjunct stays: moving it would be valid but pointless)."""
+        cols = pushdown.qualified_or_bare_names(conjunct)
+        if not cols:
+            return False
+        return pushdown.columns_belong_to_side(cols, side_cols, other_cols)
 
     def _push_filter_below_outer_join(
         self, filter_node: Filter, join: Join
