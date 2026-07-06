@@ -25,7 +25,7 @@ import math
 import multiprocessing
 import os
 import queue as queue_module
-import resource
+import threading
 import time
 
 import duckdb
@@ -143,12 +143,36 @@ def _error_text(error):
     return "{0}: {1}".format(type(error).__name__, detail)
 
 
-def _apply_memory_limit(memory_limit_mb):
-    """Cap the child process address space so a runaway query fails loudly."""
+def _current_rss():
+    """This process's resident memory in bytes (Linux /proc)."""
+    with open("/proc/self/status") as status:
+        for line in status:
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) * 1024
+    return 0
+
+
+def _start_memory_watchdog(memory_limit_mb):
+    """Kill this child (exit 137) the moment its REAL resident memory crosses
+    the cap, checked on a background thread.
+
+    RSS, not RLIMIT_AS: the Rust engine reserves a large VIRTUAL address space
+    (DataFusion/tokio/DuckDB arenas) at low RSS, so an address-space cap fires
+    on queries whose real memory is well within budget - e.g. q72's oracle uses
+    6 GB RSS but enough virtual, alongside the engine, to trip a 12 GB AS cap.
+    """
     if memory_limit_mb <= 0:
         return
     limit_bytes = memory_limit_mb * 1024 * 1024
-    resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+
+    def watch():
+        while True:
+            if _current_rss() > limit_bytes:
+                os.write(2, b"MEMORY LIMIT EXCEEDED - killing query\n")
+                os._exit(137)
+            time.sleep(0.2)
+
+    threading.Thread(target=watch, daemon=True).start()
 
 
 def _run_engine(runtime, engine_sql):
@@ -182,7 +206,7 @@ def _evaluate_worker(engine_sql, oracle_sql, db_path, options, decimals, result_
     lock across processes - the failure mode when the oracle was held open in
     the parent. The oracle (DuckDB with Postgres attached) IS the "DuckDB over
     federated Postgres" baseline the engine timing is measured against."""
-    _apply_memory_limit(options.memory_limit)
+    _start_memory_watchdog(options.memory_limit)
     try:
         runtime = build_fedq(db_path, options)
         engine_ms, engine_rows = _run_engine(runtime, engine_sql)
@@ -226,10 +250,32 @@ def _run_isolated(engine_sql, oracle_sql, db_path, options):
         args=(engine_sql, oracle_sql, db_path, options, options.decimals, result_queue),
     )
     process.start()
+    return _await_result(process, result_queue, options.timeout)
+
+
+def _await_result(process, result_queue, timeout_s):
+    """Wait for the worker's result, detecting a memory-watchdog kill promptly.
+
+    The watchdog exits the child (137) without queuing anything, so a plain
+    blocking get would wait the whole timeout; poll liveness between short gets
+    and report the kill as soon as the child is gone."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        outcome = _poll_worker(process, result_queue, timeout_s)
+        if outcome is not None:
+            return outcome
+    return _finish_stalled_worker(process, timeout_s)
+
+
+def _poll_worker(process, result_queue, timeout_s):
+    """One short poll: the classified outcome, a stall verdict if the child
+    died, or None to keep waiting."""
     try:
-        status, payload = result_queue.get(timeout=options.timeout)
+        status, payload = result_queue.get(timeout=0.25)
     except queue_module.Empty:
-        return _finish_stalled_worker(process, options.timeout)
+        if process.is_alive():
+            return None
+        return _finish_stalled_worker(process, timeout_s)
     process.join()
     if status == "done":
         return payload, None
