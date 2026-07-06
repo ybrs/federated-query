@@ -25,14 +25,23 @@ is "push down as much as possible, merge the rest locally":
 
 - MULTI-SOURCE query: tables span datasources, so no single source can answer
   the whole query. The engine scans each source with its own pushed-down SQL
-  (a `PhysicalScan` per source, `plan/physical.py`), pulls those results as
-  Arrow, and runs the cross-source operators (joins, aggregates, set ops,
-  windows, sorts) locally in an in-memory DuckDB instance called the merge
-  engine (`MergeEngine`, `executor/merge_engine.py`).
+  (a `PhysicalScan` per source, `plan/physical.py`) and runs the cross-source
+  operators (joins, aggregates, set ops, windows, sorts) in the embedded Rust
+  engine `fedqrs` - a DataFusion-based executor loaded as a Python extension
+  module (its sources live in `/workspace/fedqrs`). The physical plan is
+  serialized to that engine's JSON IR (`executor/rust_ir.py`) and the whole plan
+  - the source reads included - runs natively in Rust; only the final Arrow
+  result crosses back to Python.
 
-Both paths share the same logical plan, the same expression nodes, and the same
-SQL emitter; they differ only in whether a subtree collapses into one remote
-query or is split into per-source scans plus local merge operators.
+Every query, single- or multi-source, executes through `fedqrs`: a single-source
+plan is one `source_scan` IR step the engine returns directly (one round trip to
+the source), while a cross-source plan interleaves `source_scan` steps with
+`merge` steps whose join / aggregate / sort fragments run on DataFusion. DuckDB
+still appears - but only as a SOURCE connector (a native `duckdb` crate reading
+`.duckdb` files), never as the local execution engine; the old in-memory-DuckDB
+merge engine is gone. Both paths share the same logical plan, the same expression
+nodes, and the same SQL emitter; they differ only in whether a subtree collapses
+into one remote query or is split into per-source scans plus merge fragments.
 
 Two correctness rules dominate the design and are referenced throughout (see
 section 9): never fail silently, and an invalid query MUST raise rather than
@@ -71,7 +80,7 @@ SQL string
 [plan] PhysicalPlanner.plan LogicalPlanNode -> PhysicalPlanNode
   | (single-source subtrees collapse to PhysicalRemoteQuery)
   v
-[execute] Executor.execute_to_table remote SQL per source + DuckDB merge -> pa.Table
+[execute] Executor.execute_to_table serialize plan to fedqrs IR -> run natively in Rust -> pa.Table
   |
   v
 [after processors] StarExpansionProcessor.after_execution rename internal -> visible names
@@ -160,43 +169,56 @@ because their inner plans belong to a nested scope.
 ### 3.4 Physical plan nodes (`plan/physical.py`)
 
 Base class `PhysicalPlanNode` (`plan/physical.py`). Each node implements
-`children`, `execute -> Iterator[pa.RecordBatch]`, `schema -> pa.Schema`,
-and `estimated_cost`. It also carries a per-query merge engine handle
-(`set_merge_engine` / `merge_engine`) and `apply_dynamic_filter(...)` for
-semi-join reduction (default returns False; only `PhysicalScan` overrides it).
+`children`, `schema -> pa.Schema`, and `column_aliases()` - the map from an
+engine `(table, column)` to the physical Arrow column name that node's output
+carries, which is the key to IR column resolution. Physical nodes are NOT
+executed in Python: the tree is serialized to the fedqrs IR
+(`executor/rust_ir.py`) and run in Rust. A residual
+`execute -> Iterator[pa.RecordBatch]` survives only on `PhysicalScan` and
+`PhysicalRemoteQuery`, used by EXPLAIN to sample a scan's build-side keys so it
+can print the dynamic `IN` filter with real values; it is not the execution
+path.
 
 Single-source / remote-pushdown nodes:
 
 - `PhysicalScan` - reads one table from one datasource, with filters,
-  grouping, aggregates, ordering, limit folded in. Overrides
-  `apply_dynamic_filter` to AND an IN-list of join keys into its filters.
+  grouping, aggregates, ordering, limit folded in. When it is the probe of a
+  semi-join reduction it is emitted as an `injected_scan` IR step and the Rust
+  engine ANDs an `IN`-list of the build side's join keys into the scan.
 - `PhysicalRemoteQuery` - an entire same-source subtree rendered as
   one sqlglot AST and executed in a single round trip. This is the output of
   single-source pushdown.
 - `PhysicalRemoteJoin` and `PhysicalRemoteSetOp` - a join or
   set operation kept entirely on one source.
 
-Local merge-engine operators (used on the cross-source path):
+Cross-source operators (each emitted as one fedqrs merge fragment):
 
 - `PhysicalProjection`, `PhysicalFilter`, `PhysicalWindow`, `PhysicalHashJoin`, `PhysicalNestedLoopJoin`,
   `PhysicalHashAggregate`, `PhysicalSort`, `PhysicalLimit`, `PhysicalValues`, `PhysicalUnion`,
   `PhysicalSetOperation`, `PhysicalSingleRowGuard`,
-  `PhysicalGroupedLimit`, `PhysicalLateralJoin`.
+  `PhysicalGroupedLimit`, `PhysicalLateralJoin`, and `PhysicalAliasedRelation`
+  (a column-passthrough wrapper whose IR emit just re-qualifies its input).
 - CTE materialization: `PhysicalCTE`, `PhysicalCTEScan`,
   `PhysicalCTEMergeQuery`.
+
+Which of these actually have an IR emitter is decided by `_NODE_EMITTERS` in
+`executor/rust_ir.py` - the source of truth. Some nodes (e.g. `PhysicalUnion`,
+`PhysicalSetOperation`, `PhysicalSingleRowGuard`, `PhysicalLateralJoin`,
+`PhysicalCTE`) still exist in the physical layer but have no emitter yet, so a
+plan that reaches Rust with one raises `UnsupportedIR` rather than running
+wrong; this is the "missing operators" gap the engine roadmap tracks.
 
 Utility: `PhysicalExplain` (builds the EXPLAIN document without
 executing) and `Gather` (an unimplemented placeholder).
 
 Module-level helpers worth knowing: `to_source_sql` (the one transpile
-boundary - re-parses Postgres-form SQL and renders it in the source's dialect),
-`_MERGE_LEFT_RELATION` / `_MERGE_RIGHT_RELATION` (the names under which merge
-inputs are registered in DuckDB), `_require_engine`, `_streaming_reader`, and
-`_table_from_batches`. Column resolution at execution goes through one rule,
-`_physical_column_name(col_ref, alias_map)`, which honors a column's qualifier
-through the alias map; both the type path (`_column_ref_type`) and the array path
-(`_resolve_column`) use it, so a declared schema and the executed output resolve
-every column identically. A binary join's output is built by one set of helpers
+boundary - re-parses Postgres-form SQL and renders it in the source's dialect).
+Column resolution goes through one rule, `_physical_column_name(col_ref,
+alias_map)`, which honors a column's qualifier through the alias map; both the
+schema-typing path (`_column_ref_type`) and the alias-map path
+(`_resolve_column`) use it, and so does the IR serializer in
+`executor/rust_ir.py`, so the declared schema and the Rust-side column names
+resolve every column identically. A binary join's output is built by one set of helpers
 (`_join_output_schema` / `_join_output_aliases` / `_merge_join_select_list`), all
 taking the join type and returning LEFT columns only for SEMI/ANTI (the
 `right_<name>` collision rule lives once in `_right_output_name`), so the schema,
@@ -231,15 +253,16 @@ A `DataSourceConfig` holds the source `type` ("postgresql" / "duckdb" /
 
 The CLI (`cli/fedq.py`) builds everything. `cli` calls
 `_prepare_runtime`, which loads config, builds the catalog via
-`_build_catalog`, and constructs `FedQRuntime`. The runtime
-constructor instantiates `Parser`, `Binder(catalog)`,
-`RuleBasedOptimizer(catalog)` (rules registered by `_register_optimization_rules`
-at ), `PhysicalPlanner(catalog)`, `Decorrelator`, and
-`Executor(executor_config)` (warmed up immediately), then wraps them in a
-`QueryExecutor` with one processor: `StarExpansionProcessor`. `_build_catalog`
-uses the factory `_create_datasource` to map a config type to a
-connector class, calls `connect`, registers it, and finally calls
-`catalog.load_metadata`.
+`_build_catalog`, and constructs `FedQRuntime`. The runtime constructor
+(`cli/fedq.py:82`) takes the whole `Config` and instantiates `Parser`,
+`Binder(catalog)`, the optimizer via `build_optimizer(catalog,
+config.optimizer, config.cost)` (the ONE assembly point, `optimizer/factory.py`,
+so every `OptimizerConfig` flag and the `CostConfig` are honored everywhere),
+`PhysicalPlanner(catalog)`, `Decorrelator`, and `Executor(config.executor)`,
+then wraps them in a `QueryExecutor` with one processor:
+`StarExpansionProcessor`. `_build_catalog` uses the factory `_create_datasource`
+to map a config type to a connector class, calls `connect`, registers it, and
+finally calls `catalog.load_metadata`.
 
 `FedQRuntime.execute` simply delegates to `QueryExecutor.execute`.
 
@@ -344,18 +367,27 @@ guarantee that the rest of the pipeline never sees one.
 
 Entry point: `RuleBasedOptimizer.optimize` (`optimizer/rules.py`), called
 from `QueryExecutor._optimize_plan` (`query_executor.py`). It applies its
-registered rules iteratively to a fixed point (max 10 iterations). The rules,
-registered in `_register_optimization_rules` (`cli/fedq.py`) in this order:
+registered rules iteratively to a fixed point (max 10 iterations). The stack is
+assembled in ONE place, `build_optimizer` (`optimizer/factory.py`), which honors
+the `OptimizerConfig` flags. In order:
 
 1. `PredicatePushdownRule` (`rules.py`) - pushes filters through projections,
   below joins (split by side, outer-join-safe), and into scans.
-2. `ProjectionPushdownRule` - column pruning: collects required columns
-  and trims scans and intermediate projections.
-3. `AggregatePushdownRule` - folds GROUP BY and aggregates into a
-  single-source scan.
-4. `OrderByPushdownRule` - pushes ORDER BY toward sources, rewriting
-  keys through projections and joins.
-5. `LimitPushdownRule` - pushes LIMIT/OFFSET toward sources when safe.
+2. `SemiJoinPushdownRule` - commutes a selective SEMI/ANTI join below the INNER
+  join it sits on when the semi condition references only one inner side, so the
+  existential runs BEFORE the fact join. Runs before join ordering because it
+  changes the region the reorderer then sees.
+3. `JoinOrderingRule` (`optimizer/join_ordering.py`, gated by
+  `enable_join_reordering`) - the cost-based reorderer (see below). Registered
+  right after predicate pushdown so it reads the folded equi conditions and
+  embedded scan filters, and before projection pushdown prunes columns.
+4. `ProjectionPushdownRule` - column pruning: collects required columns and
+  trims scans and intermediate projections.
+5. `AggregatePushdownRule` - folds GROUP BY and aggregates into a single-source
+  scan.
+6. `OrderByPushdownRule` - pushes ORDER BY toward sources, rewriting keys
+  through projections and joins.
+7. `LimitPushdownRule` - pushes LIMIT/OFFSET toward sources when safe.
 
 Every rule returns a new plan via `model_copy` and never mutates in place. Each
 rule's pass-through arms (recurse into a node's children and rebuild only if one
@@ -364,11 +396,33 @@ changed) go through the single `transform_children(node, fn)` in
 recurse-and-rebuild mechanic is not hand-rolled per rule; only each rule's
 genuinely special arm (e.g. predicate-into-scan folding) is written out.
 
-`JoinReorderingRule` is a reserved placeholder (cost-based reordering is future
-work). Build-side choice during physical planning is a selective-filter
-heuristic (`_choose_build_side`), NOT cost-driven. `CostModel`
-(`optimizer/cost.py`) is currently unused by the pipeline (kept for a future
-cost-based phase).
+Cost-based join ordering (the current optimizer's core). `CostModel`
+(`optimizer/cost.py`) is LIVE - it is what `JoinOrderingRule` costs plans with -
+not the dormant placeholder it once was. The pieces:
+
+- `StatisticsCollector` (`optimizer/statistics.py`) fetches statistics from each
+  source's CATALOG at optimize time, lazily per column (join keys and filter
+  columns only) and session-cached, with a column's absence itself cached. A
+  source that has no statistics returns None; nothing is ever fabricated.
+- `CostModel.estimate` (`optimizer/cost.py`, with named fallbacks in
+  `estimate_defaults.py`) produces a `CardinalityEstimate` for every logical node
+  type. Joins use `card(L) * card(R) / prod max(ndv(l_key), ndv(r_key))`, the
+  composite-key denominator capped at the smaller side's rows. Every missing
+  statistic falls back to a NAMED default recorded in `defaults_used` provenance,
+  which EXPLAIN surfaces as `stats=defaulted[...]`.
+- `JoinOrderingRule` extracts join regions (`optimizer/join_graph.py`) - maximal
+  INNER/CROSS-join-plus-filter subtrees, with outer / semi / anti / lateral joins
+  as boundaries - and runs a left-deep Selinger DP per connected component
+  (bounded by `max_join_reorder_size`, GOO greedy above the bound), considering
+  only connected extensions so intra-component cross products are structurally
+  impossible. It re-emits in predicate-pushdown's normal form and a
+  predicate-conservation guard RAISES if any conjunct is not placed exactly once.
+- A LOCALITY term charges rows crossing a source boundary
+  (`TRANSFER_WEIGHT * transfer`) on top of `C_out`, so the DP prefers orders that
+  keep same-source runs collapsible into one remote query and reduce cross-source
+  transfer. The cost estimate also threads onto physical nodes (`estimated_rows`)
+  so the semi-join reduction can orient itself by real cardinality (reduce the
+  larger side) rather than a structural guess.
 
 Output: an optimized but still logical `LogicalPlanNode` tree.
 
@@ -383,12 +437,18 @@ one datasource and is renderable, `try_build` returns a `PhysicalRemoteQuery`
 and planning of that subtree is done. This is the SINGLE-SOURCE path.
 
 If the subtree spans sources (or cannot be rendered as one query), `_plan_node`
-falls through to per-node dispatch, producing local merge operators. Join
+falls through to per-node dispatch, producing cross-source operators. Join
 algorithm selection is in `_plan_join`: try a same-source
 `PhysicalRemoteJoin` (`_try_plan_remote_join`); else extract equi-keys
-(`_extract_join_keys`), orient them to sides (`_orient_join_keys`), choose a build side (`_choose_build_side`), mark a dynamic
-filter on the probe-side scan, and build a `PhysicalHashJoin`; else fall back to
-`PhysicalNestedLoopJoin`. Set operations route through `_plan_set_operation`; cross-source CTEs materialize through `_plan_cte`; a
+(`_extract_join_keys`), orient them to sides (`_orient_join_keys`), choose a
+build side (`_choose_build_side`, which reduces the LARGER estimated side via
+`larger_estimated_side`), mark a dynamic filter on the probe-side scan
+(`_mark_dynamic_filter` sets `dynamic_filter_keys`), and build a
+`PhysicalHashJoin`; else fall back to `PhysicalNestedLoopJoin`. The semi-join
+reduction itself (read the build, collect its distinct keys, inject them into
+the probe) is not run here - it is emitted as `collect_distinct` +
+`injected_scan` IR steps and executed in fedqrs. Set operations route through
+`_plan_set_operation`; cross-source CTEs materialize through `_plan_cte`; a
 projection with window functions becomes `PhysicalWindow` (`_plan_projection`).
 
 Output: a `PhysicalPlanNode` tree.
@@ -396,16 +456,23 @@ Output: a `PhysicalPlanNode` tree.
 ### 4.8 Execute (`executor/executor.py`)
 
 Entry point: `Executor.execute_to_table` (`executor/executor.py`), called
-from `QueryExecutor._run_physical_plan` (`query_executor.py`). It calls
-`execute`, which attaches the reused `MergeEngine` to every node via
-`_attach_merge_engine` and then pulls `plan.execute`, collecting the
-Arrow batches into a `pa.Table` (falling back to an empty typed table when there
-are no rows). Execution is pull-based and streaming: each operator's `execute`
-yields `pa.RecordBatch`es.
+from `QueryExecutor._run_physical_plan` (`query_executor.py`). It resolves the
+plan's datasources and calls `execute_via_rust(plan, datasources)`
+(`executor/rust_ir.py`), which (1) registers each datasource with the engine by
+name (`register_datasources` -> the native Postgres / DuckDB / Parquet Rust
+connectors), (2) serializes the physical plan into the JSON IR (`build_ir` walks
+the tree bottom-up into `source_scan` / `injected_scan` / `collect_distinct` /
+`merge` / `return` steps plus named `fragments`), (3) makes ONE
+`fedqrs.execute_ir(...)` call that runs the whole plan natively, and (4) reads
+the result back as a zero-copy Arrow C-stream
+(`pa.RecordBatchReader.from_stream(...).read_all()`). A physical node or
+expression the IR cannot represent raises `UnsupportedIR`, which propagates -
+there is no fallback and no silent wrong answer.
 
-If the physical plan root is a `PhysicalExplain` with JSON format,
-`_run_physical_plan` short-circuits and returns the plan document dict from
-`build_document` instead of executing.
+EXPLAIN is plan introspection, not data, so it never reaches Rust:
+`_run_physical_plan` short-circuits a `PhysicalExplain` through `_run_explain`,
+returning the plan document dict from `build_document` for `FORMAT JSON` and a
+rendered single-column table for `FORMAT TEXT`.
 
 ### 4.9 After-processors
 
@@ -464,9 +531,16 @@ renders it once with `ast.sql(dialect=...)` (`plan/emit/__init__.py`).
   execute time, the one place dialect divergence is resolved.
 
 So: the remote path builds a Postgres-form AST with a `SourceResolver` and
-transpiles to the source dialect; the merge path builds DuckDB SQL with a
-`MergeResolver` keyed to the physical column names of the Arrow relations
-registered in the merge engine. The expression conversion is identical.
+transpiles to the source dialect. The merge path no longer runs SQL through a
+local engine; instead `executor/rust_ir.py` serializes each cross-source
+operator into the fedqrs IR, resolving every column to its physical Arrow name
+via `_physical_column_name` (the same rule the remote path's schema uses). Most
+merge fragments are STRUCTURED IR (`project` / `filter` / `aggregate` / `sort` /
+`hash_join` / `limit`); the few easier to express as SQL - window, grouped-limit,
+CTE-merge, VALUES - are rendered as DuckDB-dialect `raw_sql` fragments with a
+`MergeResolver` and parsed by DataFusion's SQL front end in Rust. The
+expression-to-IR conversion (`expr_to_ir`, `rust_ir.py`) mirrors the
+expression-to-SQL emitter node for node.
 
 ---
 
@@ -518,9 +592,10 @@ LIMIT 10;
   `datasource_connection` is the `pg` `PostgreSQLDataSource`, `query_ast` is the
   built AST, and `output_names` is `["city", "n"]`.
 
-7. Execute. `Executor.execute_to_table` pulls `PhysicalRemoteQuery.execute`. That calls `_sql`, which renders the AST to Postgres
-  text and runs it through `to_source_sql` (here a Postgres -> Postgres pass).
-  The SQL sent to the source is one statement, equivalent to:
+7. Execute. `execute_via_rust` serializes the plan to a single `source_scan` IR
+  step carrying the rendered source-dialect SQL, and `fedqrs.execute_ir` runs it.
+  The SQL the engine sends to Postgres over its native ADBC connector is one
+  statement, equivalent to:
 
   ```sql
   SELECT "city" AS "city", COUNT(*) AS "n"
@@ -531,9 +606,9 @@ LIMIT 10;
   LIMIT 10
   ```
 
-  `PostgreSQLDataSource.execute_query` (`datasources/postgresql.py`)
-  executes it (psycopg2 batches, or ADBC for Arrow-native streaming) and yields
-  `pa.RecordBatch`es. The engine does no local joining, grouping, or sorting.
+  The Rust engine's Postgres connector executes it (ADBC, Arrow-native) on a
+  pooled connection and streams `pa.RecordBatch`es straight back to Python. The
+  engine does no local joining, grouping, or sorting.
 
 8. Return. The batches are assembled into a `pa.Table`; after-processors are a
   no-op (no star rename); the table is returned to the caller. The CLI prints it
@@ -585,36 +660,38 @@ single source can answer the query.
   in its own source dialect: the Postgres scan as Postgres SQL, the DuckDB scan
   as DuckDB SQL (via `render_dialect` and `to_source_sql`).
 
-5. Execute. `Executor.execute` attaches the shared `MergeEngine` to every node,
-  then pulls the root. The `PhysicalHashJoin` executes through the merge engine
-  (`_execute_inner_merge`, `plan/physical.py`):
-  - It materializes the build side fully (`_materialize_build`). Say the build
-  side is the smaller `pg.users` scan; that scan sends
-  `SELECT "id","name","age" FROM "public"."users" WHERE "age" > 30` to
-  Postgres and returns Arrow batches.
-  - It performs semi-join reduction: `_reduce_probe_from_build`
-  collects the build side's distinct join keys and calls
-  `probe_node.apply_dynamic_filter(...)`. The probe `PhysicalScan` ANDs an
-  `id IN (...)` filter into its own SQL, so DuckDB only returns matching
-  `orders` rows. This is the dynamic-filter pushdown the engine relies on to
-  keep the cross-source join cheap.
-  - It registers the two Arrow inputs in DuckDB under `_MERGE_LEFT_RELATION`
-  ("in_left") and `_MERGE_RIGHT_RELATION` ("in_right"), builds the equi-join
-  SQL with a `MergeResolver`, and calls `MergeEngine.run(sql, inputs)`
-  (`executor/merge_engine.py`). DuckDB registers each Arrow table on a
-  fresh cursor (`_stream`), runs the join vectorized, and streams the
-  result back as `pa.RecordBatch`es.
-  - `PhysicalProjection` evaluates `u.name, o.total` over those batches.
+5. Execute. `execute_via_rust` (`executor/rust_ir.py`) registers `pg` and `duck`
+  with the engine, serializes the plan to IR, and hands it to
+  `fedqrs.execute_ir`. Because the join is a single-key INNER join between two
+  plain scans, the serializer emits the semi-join REDUCTION as explicit steps.
+  Say the cost estimate makes `duck.orders` the larger side, so it is the probe
+  and `pg.users` donates keys:
+  - a `source_scan` step reads the build side `pg.users` with its pushed filter
+  (`SELECT "id","name","age" FROM "public"."users" WHERE "age" > 30`) over the
+  pooled Postgres connection, materialized into an Arrow binding.
+  - a `collect_distinct` step collects that build side's distinct `id` values
+  (capped at `_DYNAMIC_FILTER_MAX_KEYS`), in a DataFusion context.
+  - an `injected_scan` step reads the probe `duck.orders` with the collected keys
+  pushed in as `user_id IN (...)`, so DuckDB returns only matching `orders` rows.
+  This is the dynamic-filter reduction that keeps the cross-source join cheap;
+  the engine chooses the delivery (an inline `IN` list under the cap, else a
+  temp-table semi-join).
+  - a `merge` step runs the `hash_join` fragment: the two Arrow bindings are
+  registered as in-memory tables (`in_left` / `in_right`) in a DataFusion
+  `SessionContext` and joined on `id = user_id`, projecting the join's canonical
+  output columns.
+  - a second `merge` step runs the `project` fragment for `u.name, o.total`.
+  The engine returns only the final result, as an Arrow C-stream.
 
-6. Return. The streamed batches are collected into a `pa.Table` and returned.
+6. Return. Python wraps that stream (`pa.RecordBatchReader.from_stream`) and
+  materializes it into a `pa.Table`. Every source read, the reduction, the join,
+  and the projection ran inside Rust; only the final rows crossed back.
 
 So the multi-source path scans each source with its own pushed-down SQL (filters
-and dynamic join-key filters included), then runs the join locally in DuckDB.
-Other cross-source operators behave the same way: `PhysicalHashAggregate`,
-`PhysicalSort`, `PhysicalUnion`, `PhysicalSetOperation`, and `PhysicalWindow`
-each materialize or stream their inputs into the merge engine, register them
-under stable relation names, and run a DuckDB SQL statement built by the shared
-clause builders.
+and dynamic join-key filters included) and runs the cross-source join, aggregate,
+sort, window, and set operations on DataFusion inside fedqrs - all driven by the
+single IR the physical plan serializes to. There is no local DuckDB merge engine
+and no per-operator Python execution.
 
 ---
 
@@ -642,6 +719,18 @@ duplication: `_metadata_from_information_schema`, `_build_column_statistics`,
 `_schema_probe_sql` (the one `LIMIT 0` schema probe), and the `_fetch_batch_size`
 streaming chunk size.
 
+Two-tier connectors. Since the Rust cutover there are two connector layers. The
+Python `DataSource` classes below are the CATALOG and STATISTICS authority - they
+introspect schemas, map native types, fetch `get_table_statistics` for the cost
+model, and back EXPLAIN's dynamic-filter sampling. The DATA-PLANE reads happen in
+Rust: `register_datasources` (`executor/rust_ir.py`) hands each source to the
+engine by name with its connection params, and fedqrs reads it over a NATIVE Rust
+connector - Postgres via ADBC (thread-local pooled connection), DuckDB via the
+native `duckdb` crate (a file reopened per fetch, cheap), Parquet via a cached
+DataFusion `SessionContext` per directory. A source type with no native Rust
+connector (currently ClickHouse) raises `UnsupportedIR` at execute time rather
+than running a plan it cannot read.
+
 Connectors:
 
 - `PostgreSQLDataSource` (`datasources/postgresql.py`) - uses a psycopg2
@@ -653,14 +742,17 @@ Connectors:
 - `DuckDBDataSource` (`datasources/duckdb.py`) - a single in-memory or
   file-backed connection; `execute_query` runs the query and yields
   Arrow batches from the materialized result. `render_dialect = "duckdb"`.
+- `ParquetDataSource` (`datasources/parquet.py`) - a directory of Parquet files
+  exposed as tables; the Rust engine reads them through a cached DataFusion
+  context. `render_dialect = "duckdb"`.
 - `ClickHouseDataSource` (`datasources/clickhouse.py`) - HTTP via
   clickhouse-connect; `execute_query` streams Arrow batches from
-  `query_arrow_stream`. `render_dialect = "clickhouse"`. (Note: it is importable
-  from its module and usable via config, but not re-exported in
-  `datasources/__init__.py`.)
+  `query_arrow_stream`. `render_dialect = "clickhouse"`. It is importable and
+  usable for catalog/metadata, but has NO native Rust connector yet, so a plan
+  that reads it raises `UnsupportedIR` at execute (see the two-tier note above).
 
-All connectors return Arrow `RecordBatch`es, which is the common currency that
-lets the merge engine combine results from heterogeneous sources.
+All connectors return Arrow `RecordBatch`es, the common currency that lets fedqrs
+combine results from heterogeneous sources.
 
 ---
 
@@ -682,7 +774,10 @@ emitter dispatches via allowlist tables and raises on an unknown operator. The
 binder's dispatch (`bind`, `binder.py`) ends in
 `raise BindingError(...)` for an unknown node type, and the decorrelator asserts
 no subquery node survives (`_raise_if_subquery_expression`,
-`decorrelation.py`).
+`decorrelation.py`). The IR serializer is the same kind of guard at the last
+stage: `executor/rust_ir.py` raises `UnsupportedIR` on any physical node or
+expression it does not know how to emit, rather than shipping the engine a plan
+that could return wrong rows.
 
 An invalid query MUST raise. This is the most severe failure mode: returning
 rows for an invalid query manufactures a wrong answer. The single column
@@ -697,7 +792,8 @@ it fails at bind time, before any source is queried. Set-operation arity
 mismatches likewise raise at bind (`_check_set_branch_arity`).
 
 Exceptions are caught in exactly one place: the CLI REPL (`FedQRepl`,
-`cli/fedq.py`), which catches and displays `BindingError`,
-`UnsupportedSQLError`, `StarExpansionError`, parse errors, and DuckDB errors so
-the user sees them. Everywhere else, exceptions propagate. A crash never ships a
-lie.
+`cli/fedq.py`), which displays `BindingError`, `StarExpansionError`, sqlglot
+parse errors, `ValueError` / `RuntimeError`, and `duckdb.Error` as `error: ...`,
+with a broad fallback that surfaces anything else (an `UnsupportedIR`, a Rust
+engine error) as `unexpected error: ...`. Everywhere else, exceptions propagate.
+A crash never ships a lie.

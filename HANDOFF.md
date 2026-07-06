@@ -1,4 +1,4 @@
-# Status: thirteen phases live; fair federated gap 38.6x -> 2.98x
+# Status: thirteen phases + DuckDB connection reuse; fair federated gap 38.6x -> 2.26x
 
 State of the work. Facts only: what exists, what passes, what is measured,
 what is not done. Previous phase (Rust cutover, N-K decorrelation, merge-engine
@@ -321,17 +321,52 @@ NOTE: the reduction's max-base remote sizing (commit 64b7feb) is KEPT - the cap
 fixes the composite-key under-count specifically, max-base still guards any
 other remote-output under-count (multi-join selectivity compounding).
 
+## DuckDB connection reuse: the per-fetch floor eliminated (fedqrs, working tree)
+
+The "per-fetch overhead" was PROFILED, not assumed, and the earlier attribution
+was wrong on every count. Measured (SF1 duck file, min of 60 runs):
+- tokio `Runtime::new()`: **0.18ms**, once per query (standalone Rust bench).
+  Not milliseconds; the "tokio runtime per execute" headline was noise.
+- whole DataFusion coordinator path (Runtime + SessionContext + trivial plan +
+  collect): **0.6ms**. The "~6ms coordinator setup" number was wrong.
+- per merge fragment (its own `SessionContext`): **0.40ms**. Marginal.
+- DuckDB `Connection::open`: **7-10ms PER FETCH**, and INDEPENDENT of file size
+  (7.2ms on the 27MB SF0.1 file, 7.7ms on the 264MB SF1 file). It is DuckDB
+  database-INSTANCE creation (built-in function/type registration), not I/O, WAL,
+  or a catalog snapshot: open `:memory:` costs the same ~8ms. This was ~99% of
+  the overhead, paid once per `source_scan`/`injected_scan` because
+  `open_duckdb` ran per fetch.
+
+Fix (`fedqrs/src/connectors.rs`, `duck_cursor`): a process-global cache of one
+open DuckDB instance per file path, handing out cheap per-fetch cursors via
+`Connection::try_clone` (a `duckdb_connect` on the already-open Arc-shared
+`DatabaseHandle`, microseconds). Mirrors the PG thread-local pool and the Parquet
+`SessionContext` cache. Each fetch gets its own cursor so the temp-join arm's
+connection-scoped temp tables stay isolated (dropped with the cursor). Same
+read-write open mode as before, so it shares configuration with any other DuckDB
+handle on the file in-process.
+
+Effect: duck fetch 7.7 -> 0.44ms; per-duck-fetch slope 7.25 -> 0.21ms/fetch.
+Same-machine A/B (git-stash the one-file change, rebuild, same bench), 22/22
+correct on each side, DuckDB oracle stable across both (~1090ms SF1, ~290ms
+SF0.1) so the gain is ours-side:
+  fedpgduck SF1    2.97x -> **2.26x**  (ours 3245 -> 2478ms, -24%)
+  fedpgduck SF0.1  4.41x -> **3.27x**  (ours 1271 ->  944ms, -25%)
+single / fedparquet cells are Parquet-based (cached ctx) and unaffected. The
+full pytest suite is green with the fix (1169 passed). Change is UNCOMMITTED in
+the fedqrs working tree; the regenerated report is report-result-e10d67b.md.
+
 ## Known gaps / next work (in priority order from the data)
 
-Fair-federated SF1 2.98x, SF0.1 4.24x; single-source SF1 1.70x; all correct.
-1. **Per-fetch engine overhead (the biggest remaining lever)**: measured a
-   ~9ms fixed floor per DuckDB fetch + ~6ms DataFusion coordinator setup, in
-   the Rust engine (tokio runtime created per execute, SessionContext, Arrow/
-   pyo3 marshalling). NOT connections (PG pooled, duck-open free) and NOT
-   un-batched same-source (already collapsed). Scales with fetch count; the
-   reduction's collect+inject adds duck round-trips. Dominates SF0.1 ratios.
-   Levers: reuse the tokio runtime + DataFusion context across a query; fold
-   the reduction's two duck trips into one. (User deferred; revisit next.)
+Fair-federated SF1 2.26x, SF0.1 3.27x; single-source SF1 1.70x; all correct.
+1. **Per-fetch engine overhead: the DuckDB instance-creation part is DONE** (see
+   the connection-reuse section). The residual per-fetch cost is now ~0.2-0.5ms
+   (DataFusion per-fragment `SessionContext` ~0.40ms; tokio `Runtime::new()`
+   0.18ms/query) - marginal; reusing one `SessionContext` per query or the tokio
+   runtime across queries would save fractions of a ms and is NOT worth it. What
+   remains in the fedpgduck cell is real data work (materialization: 1M lineitem
+   rows ~= 305ms) plus the reduction's collect+inject, whose duck cursors are now
+   ~0.2ms each - also no longer a lever.
 2. **q07 (6.4x), q13 (1.5M-order LEFT-count, inherent), q10**: the plan tail.
 3. **Composite-key correlation is only PARTIALLY modelled**: the cap fixes the
    worst 2-column-FK case; a full multi-column correlation NDV (or a lazy
