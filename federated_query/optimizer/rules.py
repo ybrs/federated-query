@@ -1256,11 +1256,13 @@ class OrderByPushdownRule(OptimizationRule):
         LIMIT that sits above: the ORDER BY sort must reach the LIMIT to be a
         top-N, but a filter between them does not preserve the sort order in the
         cross-source (DataFusion) execution, so the LIMIT keeps a
-        non-deterministic set (q59). It also pessimizes - sorting the wider pre-
-        filter input. Nothing is lost: when the whole Sort-over-Filter subtree is
-        single-source, single-source pushdown renders it as the remote query's
-        WHERE + ORDER BY (order preserved by the source); otherwise the Sort
-        executes locally, directly under the LIMIT.
+        non-deterministic set. It also pessimizes - sorting the wider pre-filter
+        input. (Observed on a cross-source ``... WHERE <residual> ORDER BY <keys>
+        LIMIT n`` query - TPC-DS q59 - which returned a different top-n each run.)
+        Nothing is lost: when the whole Sort-over-Filter subtree is single-source,
+        single-source pushdown renders it as the remote query's WHERE + ORDER BY
+        (order preserved by the source); otherwise the Sort executes locally,
+        directly under the LIMIT.
         """
         return sort
 

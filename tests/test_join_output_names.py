@@ -1,12 +1,14 @@
 """Right-side join output naming stays collision-free in chained self-joins.
 
-A left-deep self-join of a CTE referenced N times (q31: ss1..ss3, ws1..ws3)
-exposes the same column name from several relations. `_right_output_name`
-renames a right column that collides with a left name to `right_<name>`; the
-bug was that it never checked whether `right_<name>` was ITSELF already
-produced by an earlier join in the chain, so two relations' columns collapsed
-onto one physical name and column resolution picked the wrong one (q31 dropped
-every row). These pin that each colliding column gets a distinct output name.
+A left-deep join that references the same relation three or more times exposes
+the same column name from several relations. `_right_output_name` renames a
+right column that collides with a left name to `right_<name>`; the bug was that
+it never checked whether `right_<name>` was ITSELF already produced by an
+earlier join in the chain, so two relations' columns collapsed onto one physical
+name and column resolution picked the wrong one - the query then dropped every
+row. (Concretely, TPC-DS q31 self-joins one aggregate CTE as ss1/ss2/ss3, so its
+`store_sales` column arrives from three relations.) These pin that each colliding
+column gets a distinct output name.
 """
 
 from federated_query.plan.physical import _right_output_name
@@ -25,8 +27,9 @@ def test_single_collision_prefixes_right():
 def test_chained_collision_suffixes_until_unique():
     """When right_<name> was already produced by an earlier join, suffix it.
 
-    This is the q31 case: the ws1-vs-ws2 join already emitted right_web_sales,
-    so ws3's web_sales must become right_web_sales_1, not reuse right_web_sales.
+    In a three-way self-join, the first collision (e.g. the ws1-vs-ws2 join)
+    already emitted right_web_sales, so the third relation's web_sales must
+    become right_web_sales_1, not reuse right_web_sales.
     """
     left = {"web_sales", "right_web_sales"}
     assert _right_output_name("web_sales", left) == "right_web_sales_1"

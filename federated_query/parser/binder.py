@@ -434,9 +434,11 @@ class Binder:
 
         `ORDER BY <n>` (a plain integer literal 1..count) is a SQL ordinal - it
         orders by the n-th SELECT output, NOT by the constant n. Left unresolved
-        it survives as a literal that a single-source push masks (the source
-        honors the ordinal) but the coordinator sort treats as a constant, so
-        the ORDER BY silently vanishes cross-source (q62)."""
+        it survives as a literal: a single-source push masks that (the source
+        honors the ordinal), but when the sort runs at the coordinator it sorts
+        by the constant n, so every row ties and the ORDER BY silently vanishes.
+        (Observed on TPC-DS q62, whose ORDER BY is positional, run cross-source.)
+        """
         if isinstance(key, Literal) and type(key.value) is int and 1 <= key.value <= count:
             return key.value - 1
         return None

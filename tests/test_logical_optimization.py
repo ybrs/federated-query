@@ -681,9 +681,10 @@ class TestOrderByPushdown:
 
         Pushing Sort(Filter) -> Filter(Sort) separates the sort from a LIMIT above
         it; a filter between the sort and the limit does not preserve row order in
-        the cross-source engine, so the LIMIT keeps a non-deterministic top-N (the
-        q59 bug). The Sort therefore stays over the filter, and no order metadata
-        leaks into the scan beneath the filter.
+        the cross-source engine, so the LIMIT keeps a non-deterministic top-N.
+        (This was observed on a cross-source ORDER BY ... LIMIT query, TPC-DS q59,
+        which returned a different top-n on each run.) The Sort therefore stays
+        over the filter, and no order metadata leaks into the scan beneath it.
         """
         scan = Scan(
             datasource="test_ds",

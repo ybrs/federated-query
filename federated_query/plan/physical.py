@@ -367,12 +367,15 @@ def _right_output_name(physical_name: str, left_names) -> str:
     """Right-side output name under the left-wins collision rule.
 
     A right column whose name collides with a left column is renamed
-    ``right_<name>``; if THAT also collides (a chained self-join where an
-    earlier join already produced ``right_<name>`` - e.g. q31's ss1..ss3 /
-    ws1..ws3), it is suffixed ``right_<name>_1``, ``_2`` ... until unique. Two
-    distinct right columns never map to the same output (their bases differ),
-    so this depends only on ``left_names`` and stays the ONE rule the join
-    SELECT list, the output schema, and the parent alias map all share.
+    ``right_<name>``; if THAT also collides - which happens in a left-deep
+    self-join that references the same relation three or more times, because an
+    earlier join in the chain already produced ``right_<name>`` - it is suffixed
+    ``right_<name>_1``, ``_2`` ... until unique. (Concretely, the TPC-DS q31
+    benchmark self-joins one aggregate CTE as ss1/ss2/ss3, so its ``store_sales``
+    column appears from three relations.) Two distinct right columns never map to
+    the same output (their bases differ), so this depends only on ``left_names``
+    and stays the ONE rule the join SELECT list, the output schema, and the
+    parent alias map all share.
     """
     if physical_name not in left_names:
         return physical_name

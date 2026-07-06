@@ -394,8 +394,8 @@ def test_order_by_positional_ordinal_over_projection(catalog_with_test_data):
     """ORDER BY <n> resolves to the n-th SELECT output, not the integer literal.
 
     Left as a literal, a single-source push honors the ordinal but the
-    coordinator sort treats <n> as a constant and the ORDER BY silently vanishes
-    (q62).
+    coordinator sort treats <n> as a constant and the ORDER BY silently vanishes.
+    (Observed on TPC-DS q62, whose ORDER BY is positional, run cross-source.)
     """
     parser = Parser()
     binder = Binder(catalog_with_test_data)
@@ -419,10 +419,7 @@ def test_order_by_positional_ordinal_over_aggregate(catalog_with_test_data):
     parser = Parser()
     binder = Binder(catalog_with_test_data)
 
-    sql = (
-        "SELECT age, count(*) AS c FROM testdb.public.users "
-        "GROUP BY age ORDER BY 1"
-    )
+    sql = "SELECT age, count(*) AS c FROM testdb.public.users GROUP BY age ORDER BY 1"
     bound_plan = binder.bind(parser.parse_to_logical_plan(sql, catalog_with_test_data))
 
     from federated_query.plan.logical import Sort
