@@ -168,3 +168,27 @@ def test_semi_and_left_orientation_unchanged():
     )
     build, probe, _, _ = _orient_join(semi)
     assert probe is big and build is small  # SEMI: preserved left is the probe
+
+
+def test_remote_orientation_size_is_max_base_not_join_output():
+    """A collapsed remote's orientation size must be its LARGEST base scan,
+    not the join OUTPUT estimate - a multi-join output under-counts via
+    composite-key correlation, which would make a fact island look tiny and
+    wrongly lose the reduction to a dim (the q09 regression). Here a fact
+    island (6M scan JOIN 800k scan, output annotated a bogus-small 3000) must
+    orient-size as 6,000,000."""
+    from federated_query.optimizer.single_source_pushdown import SingleSourcePushdown
+    from federated_query.catalog.catalog import Catalog
+    from federated_query.plan.logical import Join as LJoin, Scan as LScan, JoinType as LJT
+    from federated_query.plan.expressions import BinaryOp as LBinOp, BinaryOpType as LBOp
+    big = LScan.create(datasource="d", schema_name="m", table_name="lineitem",
+                       columns=["l_k"], alias="l", estimated_rows=6_000_000)
+    mid = LScan.create(datasource="d", schema_name="m", table_name="partsupp",
+                       columns=["ps_k"], alias="ps", estimated_rows=800_000)
+    join = LJoin.create(
+        left=big, right=mid, join_type=LJT.INNER,
+        condition=LBinOp(op=LBOp.EQ, left=_col("l", "l_k"), right=_col("ps", "ps_k")),
+        estimated_rows=3000,  # the under-counted join OUTPUT - must NOT be used
+    )
+    sizer = SingleSourcePushdown(Catalog())
+    assert sizer._root_estimate(join) == 6_000_000

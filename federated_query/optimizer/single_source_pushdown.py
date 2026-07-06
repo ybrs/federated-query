@@ -200,19 +200,27 @@ class SingleSourcePushdown:
         return self._finish(context, self._root_estimate(node))
 
     def _root_estimate(self, node: LogicalPlanNode) -> Optional[int]:
-        """The collapsed subtree's row estimate for reduction orientation.
+        """The reduction-orientation size of a collapsed subtree: the LARGEST
+        base scan it reads (reliable catalog sizes under local filters), NOT the
+        join OUTPUT estimate. A multi-join output UNDER-counts via composite-key
+        correlation (dividing by ndv(k1)*ndv(k2) as if independent), so a fact
+        island would look tiny and wrongly lose the reduction to a dim (TPC-H
+        q09). Max base can never make a fact-containing remote look small; it is
+        a safe over-estimate (a heavily filtered fact just reduces cheaply)."""
+        sizes: List[int] = []
+        self._collect_scan_sizes(node, sizes)
+        if not sizes:
+            return None
+        return max(sizes)
 
-        Only a Join or Scan root carries a trustworthy estimate; pure
-        pass-throughs (Projection/Sort/SubqueryScan) inherit their input's.
-        A cardinality-CHANGING root (Aggregate/Filter/Limit/set-op/CTE)
-        returns None so the reduction falls back rather than mis-size."""
-        if isinstance(node, Join):
-            return node.estimated_rows
+    def _collect_scan_sizes(self, node: LogicalPlanNode, sizes: List[int]) -> None:
+        """Gather every base scan's cost estimate in the subtree."""
         if isinstance(node, Scan):
-            return node.estimated_rows
-        if isinstance(node, (Projection, Sort, SubqueryScan)):
-            return self._root_estimate(node.input)
-        return None
+            if node.estimated_rows is not None:
+                sizes.append(node.estimated_rows)
+            return
+        for child in node.children():
+            self._collect_scan_sizes(child, sizes)
 
     def render_correlated_sql(self, node: LogicalPlanNode, scan_names) -> Optional[str]:
         """Render a single-source subtree to SQL with base scans named for the
