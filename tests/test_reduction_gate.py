@@ -97,3 +97,16 @@ def test_reducible_base_refuses_a_renamed_key():
         output_names=["renamed_key", "v0"],
     )
     assert _reducible_probe_base(proj, "renamed_key") is None
+
+
+def test_scan_estimated_rows_survives_model_copy():
+    """The cost estimate annotation must survive the model_copy derivations
+    that later optimizer rules use (a rebuild via Scan.create would drop it -
+    this pins that deriving with model_copy keeps it)."""
+    from federated_query.plan.logical import Scan as LogicalScan
+    scan = LogicalScan.create(
+        datasource="duck", schema_name="main", table_name="partsupp",
+        columns=["ps_partkey", "ps_suppkey"], alias="ps", estimated_rows=800000,
+    )
+    derived = scan.model_copy(update={"columns": ["ps_partkey"]})
+    assert derived.estimated_rows == 800000

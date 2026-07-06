@@ -532,6 +532,9 @@ class PhysicalScan(PhysicalPlanNode):
     # Distinct build-side key values fetched during EXPLAIN so the dynamic
     # filter renders with real values; None outside EXPLAIN.
     dynamic_filter_values: Optional[List[tuple]] = None
+    # The cost model's row estimate (threaded from the logical Scan), so the
+    # execution-IR reduction can orient by size; None when not cost-estimated.
+    estimated_rows: Optional[int] = None
 
     @classmethod
     def create(
@@ -557,6 +560,7 @@ class PhysicalScan(PhysicalPlanNode):
         distinct: bool = False,
         dynamic_filter_keys: Optional[List[Expression]] = None,
         dynamic_filter_values: Optional[List[tuple]] = None,
+        estimated_rows: Optional[int] = None,
     ) -> "PhysicalScan":
         """Sanctioned fresh-construction path for PhysicalScan.
         Names every field so none is dropped; derive from an existing node
@@ -582,6 +586,7 @@ class PhysicalScan(PhysicalPlanNode):
             distinct=distinct,
             dynamic_filter_keys=dynamic_filter_keys,
             dynamic_filter_values=dynamic_filter_values,
+            estimated_rows=estimated_rows,
         )
 
     def children(self) -> List[PhysicalPlanNode]:
@@ -1576,6 +1581,9 @@ class PhysicalRemoteQuery(PhysicalPlanNode):
     query_ast: Any
     output_names: List[str]
     column_alias_map: Dict[Tuple[Optional[str], str], str] = Field(default_factory=dict)
+    # The cost model's row estimate for the collapsed subtree's root, so the
+    # reduction can orient by size; None when the root is not a Join/Scan.
+    estimated_rows: Optional[int] = None
 
     @classmethod
     def create(
@@ -1586,6 +1594,7 @@ class PhysicalRemoteQuery(PhysicalPlanNode):
         query_ast: Any,
         output_names: List[str],
         column_alias_map: Dict[Tuple[Optional[str], str], str],
+        estimated_rows: Optional[int] = None,
     ) -> "PhysicalRemoteQuery":
         """Sanctioned fresh-construction path for PhysicalRemoteQuery.
         column_alias_map is explicit (the default_factory cannot be a parameter
@@ -1596,6 +1605,7 @@ class PhysicalRemoteQuery(PhysicalPlanNode):
             query_ast=query_ast,
             output_names=output_names,
             column_alias_map=column_alias_map,
+            estimated_rows=estimated_rows,
         )
     _schema: Optional[pa.Schema] = None
 

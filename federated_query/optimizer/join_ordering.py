@@ -906,11 +906,24 @@ class JoinOrderingRule(OptimizationRule):
 
     def _emit_atom(self, region, atom_index: int, placed: List[int]):
         """One atom: nested regions inside it rewritten, its local conjuncts
-        folded back onto it."""
+        folded back onto it, and its cost estimate recorded on a Scan leaf."""
         plan = self._rewrite(region.atoms[atom_index].plan)
         local_positions = self._local_positions(region, atom_index)
         placed.extend(local_positions)
-        return _with_local_filters(plan, _conjuncts_at(region, local_positions))
+        local = _conjuncts_at(region, local_positions)
+        return self._record_atom_estimate(
+            region, atom_index, local, _with_local_filters(plan, local)
+        )
+
+    def _record_atom_estimate(self, region, atom_index, local, emitted):
+        """Annotate a Scan atom with its cost estimate so the downstream
+        reduction can orient by size. Only a bare Scan is annotated (a
+        Filter-wrapped atom keeps None and falls back); a composite atom
+        already carries its estimate on its root Join."""
+        if not isinstance(emitted, Scan):
+            return emitted
+        estimate = self.estimator.atom_estimate(region, atom_index, local)
+        return emitted.model_copy(update={"estimated_rows": estimate.rows})
 
     def _local_positions(self, region, atom_index: int) -> List[int]:
         """Positions of the conjuncts referencing exactly this one atom."""

@@ -197,7 +197,22 @@ class SingleSourcePushdown:
             return None
         if not context.select_items and not self._expand_star_select(context):
             return None
-        return self._finish(context)
+        return self._finish(context, self._root_estimate(node))
+
+    def _root_estimate(self, node: LogicalPlanNode) -> Optional[int]:
+        """The collapsed subtree's row estimate for reduction orientation.
+
+        Only a Join or Scan root carries a trustworthy estimate; pure
+        pass-throughs (Projection/Sort/SubqueryScan) inherit their input's.
+        A cardinality-CHANGING root (Aggregate/Filter/Limit/set-op/CTE)
+        returns None so the reduction falls back rather than mis-size."""
+        if isinstance(node, Join):
+            return node.estimated_rows
+        if isinstance(node, Scan):
+            return node.estimated_rows
+        if isinstance(node, (Projection, Sort, SubqueryScan)):
+            return self._root_estimate(node.input)
+        return None
 
     def render_correlated_sql(self, node: LogicalPlanNode, scan_names) -> Optional[str]:
         """Render a single-source subtree to SQL with base scans named for the
@@ -276,7 +291,9 @@ class SingleSourcePushdown:
             return True
         return context.has_computed and not context.has_aggregate
 
-    def _finish(self, context: _PushContext) -> Optional[PhysicalRemoteQuery]:
+    def _finish(
+        self, context: _PushContext, estimated_rows: Optional[int]
+    ) -> Optional[PhysicalRemoteQuery]:
         """Resolve the connection, render SQL, and build the physical node."""
         datasource = self._resolve_datasource(context)
         if datasource is None:
@@ -296,6 +313,7 @@ class SingleSourcePushdown:
             query_ast=self._render(context),
             output_names=context.output_names,
             column_alias_map=context.column_aliases,
+            estimated_rows=estimated_rows,
         )
 
     def _expose_computed_outputs(self, context: "_PushContext") -> None:
