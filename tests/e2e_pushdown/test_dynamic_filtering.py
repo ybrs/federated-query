@@ -376,3 +376,61 @@ def test_selective_semi_join_reduces_the_fact_scan():
         got.add((result.column("c_name")[index].as_py(),
                  result.column("q")[index].as_py()))
     assert got == expected
+
+
+def test_left_join_aggregate_subquery_probe_is_reduced():
+    """The q17 shape: a scalar-avg subquery correlated to a filtered outer
+    decorrelates to a LEFT join onto an aggregate subquery. The outer's keys
+    must inject into that subquery's aggregate base (its raw SQL wrapped and
+    filtered on the group key) so it computes averages for only the matching
+    parts - not every part. Differential-checked against the oracle."""
+    import duckdb as duckdb_module
+    from federated_query.catalog import Catalog
+    from federated_query.cli.fedq import FedQRuntime
+    from federated_query.config import Config
+    from federated_query.datasources.duckdb import DuckDBDataSource
+    from tests.duckdb_tmp import duckdb_path
+
+    dims = DuckDBDataSource("dims", {"path": duckdb_path(), "read_only": False})
+    dims.connect()
+    dims.connection.execute(
+        "CREATE TABLE part (p_id INTEGER, p_flag VARCHAR);"
+        "INSERT INTO part SELECT g, 'F' || (g % 50) FROM range(0, 500) t(g);"
+    )
+    facts = DuckDBDataSource("facts", {"path": duckdb_path(), "read_only": False})
+    facts.connect()
+    facts.connection.execute(
+        "CREATE TABLE li (l_p INTEGER, l_q INTEGER);"
+        "INSERT INTO li SELECT g % 500, g % 11 FROM range(0, 20000) t(g);"
+    )
+    catalog = Catalog()
+    catalog.register_datasource(dims)
+    catalog.register_datasource(facts)
+    catalog.load_metadata()
+    runtime = FedQRuntime(catalog, Config())
+    sql = (
+        "SELECT sum(l.l_q) AS s "
+        "FROM dims.main.part p, facts.main.li l "
+        "WHERE p.p_id = l.l_p AND p.p_flag = 'F7' "
+        "AND l.l_q > (SELECT avg(l2.l_q) FROM facts.main.li l2 WHERE l2.l_p = p.p_id)"
+    )
+    plan = runtime.query_executor._plan_pipeline(sql, None)
+    ir = build_ir(plan)
+    raw_injections = []
+    for step in ir["steps"]:
+        if step.get("op") == "injected_scan" and "raw_sql" in step["scan"]:
+            raw_injections.append(step)
+    assert raw_injections, f"aggregate subquery not injected; steps: {ir['steps']}"
+    result = runtime.execute(sql)
+    oracle = duckdb_module.connect()
+    oracle.execute(
+        "CREATE TABLE part AS SELECT g AS p_id, 'F' || (g % 50) AS p_flag"
+        " FROM range(0, 500) t(g);"
+        "CREATE TABLE li AS SELECT g % 500 AS l_p, g % 11 AS l_q"
+        " FROM range(0, 20000) t(g);"
+    )
+    expected = oracle.execute(
+        "SELECT sum(l.l_q) FROM part p, li l WHERE p.p_id = l.l_p AND p.p_flag = 'F7'"
+        " AND l.l_q > (SELECT avg(l2.l_q) FROM li l2 WHERE l2.l_p = p.p_id)"
+    ).fetchone()[0]
+    assert result.column("s").to_pylist() == [expected]

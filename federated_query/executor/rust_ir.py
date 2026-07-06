@@ -344,6 +344,12 @@ class _Ctx:
         self.steps = []
         self.fragments = {}
         self.names = _Names()
+        # Bindings of base scans already emitted with an injected dynamic
+        # filter, keyed by node id: when the probe of a reduction is a
+        # composite (wrapper layers over a single-source base), the base is
+        # injected first and its binding cached, then the wrappers emit
+        # normally and reach the base through this cache instead of re-reading.
+        self.injected = {}
 
 
 def build_ir(plan):
@@ -370,6 +376,11 @@ def _plan_outputs(plan):
 
 def _emit(node, ctx):
     """Emit steps for `node`, returning the binding that holds its output."""
+    cached = ctx.injected.get(id(node))
+    if cached is not None:
+        # This base scan was already emitted with an injected dynamic filter;
+        # the wrappers above it read that reduced binding.
+        return cached
     emitter = _NODE_EMITTERS.get(type(node))
     if emitter is None:
         raise UnsupportedIR(f"physical node {type(node).__name__} not supported yet")
@@ -754,9 +765,61 @@ def _can_reduce(join):
         # preserved left probe; the coordinator semi join stays for
         # exactness. ANTI must never inject (it would keep the wrong rows).
         return _probe_preference(join.left) > 0
+    if join.join_type == JoinType.LEFT:
+        # A LEFT join preserves every left row, so only the NULLABLE right side
+        # may be reduced - by the preserved left's keys. Every left row keeps
+        # all its matches (its key is in the injected set) and unmatched left
+        # rows still get NULL, so the result is identical. The right may be a
+        # composite (an aggregate subquery) whose injectable base survives.
+        return _left_reducible(join)
     if join.join_type != JoinType.INNER:
         return False
     return _probe_preference(join.left) > 0 or _probe_preference(join.right) > 0
+
+
+def _left_reducible(join) -> bool:
+    """True when a LEFT join's nullable right side can be key-reduced: a single
+    equi key and a right probe whose injectable base preserves the key."""
+    if len(join.left_keys) != 1 or len(join.right_keys) != 1:
+        return False
+    inject_col = _physical_column_name(join.right_keys[0], join.right.column_aliases())
+    return _reducible_probe_base(join.right, inject_col) is not None
+
+
+def _reducible_probe_base(probe, inject_col):
+    """The single-source base scan/remote a probe reduces to - descending
+    through pure single-input wrappers - IF the inject column survives
+    unchanged to that base; else None (the reduction would mis-target)."""
+    node = probe
+    while not _is_probe_base(node):
+        node = _single_wrapper_input(node)
+        if node is None:
+            return None
+    if inject_col in _base_output_names(node):
+        return node
+    return None
+
+
+def _is_probe_base(node) -> bool:
+    """A node the engine can inject a dynamic filter into directly: a plain or
+    aggregate scan (wrapped as a derived table) or a pushed remote query."""
+    return isinstance(node, (PhysicalScan, PhysicalRemoteQuery))
+
+
+def _single_wrapper_input(node):
+    """The sole input of a column-passthrough wrapper (alias/projection), or
+    None for anything that reshapes or combines rows."""
+    if isinstance(node, (PhysicalAliasedRelation, PhysicalProjection)):
+        return node.input
+    return None
+
+
+def _base_output_names(node):
+    """The output column names of a probe base."""
+    names = set()
+    for name in node.column_aliases().values():
+        names.add(name)
+    return names
 
 
 def _injectable_scan(node):
@@ -801,6 +864,10 @@ def _orient_join(join):
     reduction exists to cut the big read) and the other donates keys."""
     if join.join_type == JoinType.SEMI:
         return join.right, join.left, join.right_keys[0], join.left_keys[0]
+    if join.join_type == JoinType.LEFT:
+        # Fixed roles: the preserved left donates keys, the nullable right is
+        # the reduced probe (reducing the left would drop preserved rows).
+        return join.left, join.right, join.left_keys[0], join.right_keys[0]
     if _injectable_scan(join.left) and _injectable_scan(join.right):
         if join.build_side == "left":
             return join.left, join.right, join.left_keys[0], join.right_keys[0]
@@ -816,10 +883,25 @@ def _emit_reduced_inputs(ctx, build_child, probe_child, build_key_expr, probe_ke
     inject_col = _physical_column_name(probe_key_expr, probe_child.column_aliases())
     build_binding = _emit_build_side(ctx, build_child)
     keys_binding = ctx.names.binding()
-    probe_binding = ctx.names.binding()
     _emit_collect_distinct(ctx, build_binding, build_key, keys_binding)
-    _emit_injected_scan(ctx, probe_child, inject_col, keys_binding, probe_binding)
+    probe_binding = _emit_probe(ctx, probe_child, inject_col, keys_binding)
     return build_binding, probe_binding
+
+
+def _emit_probe(ctx, probe_child, inject_col, keys_binding):
+    """Emit the probe with the build keys injected into its base scan.
+
+    A plain scan / remote probe is injected directly. A composite probe (an
+    aggregate subquery under alias/projection wrappers) has the keys injected
+    into its base, whose binding is cached so the wrappers - emitted normally
+    as coordinator fragments - read the reduced base."""
+    base = _reducible_probe_base(probe_child, inject_col)
+    base_binding = ctx.names.binding()
+    _emit_injected_scan(ctx, base, inject_col, keys_binding, base_binding)
+    if base is probe_child:
+        return base_binding
+    ctx.injected[id(base)] = base_binding
+    return _emit(probe_child, ctx)
 
 
 def _emit_build_side(ctx, build_child):
@@ -850,22 +932,25 @@ def _emit_collect_distinct(ctx, input_binding, key, binding):
     })
 
 
-def _emit_injected_scan(ctx, probe_child, inject_col, keys_binding, binding):
-    """A probe scan with the build's keys pushed in as `col IN (...)`."""
+def _emit_injected_scan(ctx, base, inject_col, keys_binding, binding):
+    """A probe base with the build's keys pushed in as `col IN (...)`."""
     ctx.steps.append({
-        "op": "injected_scan", "datasource": probe_child.datasource,
-        "scan": _injected_probe_spec(probe_child), "inject_column": inject_col,
+        "op": "injected_scan", "datasource": base.datasource,
+        "scan": _injected_probe_spec(base), "inject_column": inject_col,
         "keys_from": keys_binding, "binding": binding,
     })
 
 
-def _injected_probe_spec(probe_child):
-    """A structured spec for a plain scan; the pre-rendered SQL for a pushed
-    remote query (the engine wraps it as a derived table and applies the
-    key filter to its OUTPUT columns)."""
-    if isinstance(probe_child, PhysicalRemoteQuery):
-        return raw_scan_spec(probe_child)
-    return structured_scan_spec(probe_child)
+def _injected_probe_spec(base):
+    """A structured spec for a plain scan; pre-rendered SQL for a pushed remote
+    query OR an aggregate scan (both wrapped as a derived table so the key
+    filter applies to their OUTPUT columns - a plain scan takes the filter in
+    its own WHERE)."""
+    if isinstance(base, PhysicalRemoteQuery):
+        return raw_scan_spec(base)
+    if any((base.aggregates, base.group_by, base.grouping_sets)):
+        return raw_scan_spec(base)
+    return structured_scan_spec(base)
 
 
 def _join_fragment(join, kind):
