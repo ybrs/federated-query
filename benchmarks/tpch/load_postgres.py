@@ -25,6 +25,36 @@ def _attach_dsn(options):
     )
 
 
+# Join-key columns indexed on every PostgreSQL table. A real federated
+# deployment indexes its join keys; the DuckDB oracle reads the same indexed
+# tables through its postgres scanner, so the comparison stays fair. Without an
+# index Postgres evaluates a key semi-join as a full sequential scan, so the
+# engine only pushes a dynamic filter into an INDEXED Postgres probe (it reads
+# the table whole otherwise) - see fedqrs source_reduces_cheaply.
+INDEX_COLUMNS = {
+    "part": ["p_partkey"],
+    "supplier": ["s_suppkey", "s_nationkey"],
+    "partsupp": ["ps_partkey", "ps_suppkey"],
+    "customer": ["c_custkey", "c_nationkey"],
+    "orders": ["o_orderkey", "o_custkey"],
+    "lineitem": ["l_orderkey", "l_partkey", "l_suppkey"],
+    "nation": ["n_nationkey", "n_regionkey"],
+    "region": ["r_regionkey"],
+}
+
+
+def _create_indexes(connection, schema):
+    """Create a btree index on each join-key column (idempotent)."""
+    for table, columns in sorted(INDEX_COLUMNS.items()):
+        for column in columns:
+            name = f"idx_{table}_{column}"
+            connection.execute(
+                f'CREATE INDEX IF NOT EXISTS {name} '
+                f'ON pg.{schema}."{table}" ("{column}")'
+            )
+            print("indexed {0}.{1}".format(table, column))
+
+
 def _load_table(connection, table, schema):
     """Copy one base table from the DuckDB file into PostgreSQL, replacing it."""
     target = f'pg.{schema}."{table}"'
@@ -74,6 +104,7 @@ def load(options):
     for table in sorted(TPCH_TABLES):
         rows = _load_table(connection, table, options.pg_schema)
         print("loaded {0:10} {1:>10} rows".format(table, rows))
+    _create_indexes(connection, options.pg_schema)
     connection.close()
     _analyze(options)
 
