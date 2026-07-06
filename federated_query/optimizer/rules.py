@@ -427,9 +427,11 @@ class PredicatePushdownRule(OptimizationRule):
     # a non-matching inner row never appears on its own. FULL preserves both
     # sides (a filtered inner row would lose its own null-extended output);
     # INNER conditions are normalized by join ordering; CROSS has none.
+    # RIGHT is excluded: its non-preserved side is the whole LEFT subtree,
+    # which single-source rendering cannot carry on the ON clause the way it
+    # carries a filtered right scan (see _nullable_right_filter).
     _CONDITION_PUSH_SIDE = {
         JoinType.LEFT: "right",
-        JoinType.RIGHT: "left",
         JoinType.SEMI: "right",
         JoinType.ANTI: "right",
     }

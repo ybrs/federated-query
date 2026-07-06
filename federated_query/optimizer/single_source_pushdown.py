@@ -835,14 +835,35 @@ class SingleSourcePushdown:
             return False
         if not self._absorb_from(join.left, context):
             return False
-        right_ref = self._render_relation(join.right, context)
+        right, on_extra = self._nullable_right_filter(join)
+        if right is None:
+            return False
+        right_ref = self._render_relation(right, context)
         if right_ref is None:
             return False
         if self._contributes_columns(join):
             context.has_derived_columns = True
-        context.joins.append(self._render_join_clause(join, right_ref))
+        context.joins.append(self._render_join_clause(join, right_ref, on_extra))
         context.has_join = True
         return True
+
+    def _nullable_right_filter(self, join: Join):
+        """(right node to render, extra ON conjunct) for a join whose right
+        side is non-preserved. A plain right scan's embedded filter must ride
+        the JOIN CONDITION: hoisted into the global WHERE it would drop the
+        preserved side's null-extended rows (caught by the q13 differential -
+        NOT LIKE under the LEFT join's orders scan zeroed the zero-order
+        customers). LEFT JOIN (filtered B) ON c == LEFT JOIN B ON (c AND f).
+        FULL declines instead: the ON form would resurrect filtered-out
+        right-only rows. NATURAL/USING have no ON to carry the conjunct."""
+        right = join.right
+        if join.join_type not in (JoinType.LEFT, JoinType.FULL):
+            return right, None
+        if not isinstance(right, Scan) or right.filters is None:
+            return right, None
+        if join.join_type == JoinType.FULL or join.natural or join.using is not None:
+            return None, None
+        return right.model_copy(update={"filters": None}), _source_ast(right.filters)
 
     def _join_is_pushable(self, join: Join) -> bool:
         """A join pushes when it has an ON condition, or is NATURAL/USING."""
@@ -944,9 +965,11 @@ class SingleSourcePushdown:
         return alias
 
     def _render_join_clause(
-        self, join: Join, right_ref: exp.Expression
+        self, join: Join, right_ref: exp.Expression, on_extra=None
     ) -> exp.Join:
-        """Build one join clause AST using ON, USING, or NATURAL."""
+        """Build one join clause AST using ON, USING, or NATURAL. ``on_extra``
+        is a nullable-side filter conjunct that must evaluate as part of the
+        match condition (see _nullable_right_filter)."""
         kind, side = _JOIN_KIND_SIDE[join.join_type]
         if join.natural:
             return exp.Join(this=right_ref, kind=kind, side=side, method="NATURAL")
@@ -955,9 +978,10 @@ class SingleSourcePushdown:
             for column in join.using:
                 using.append(exp.to_identifier(column, quoted=True))
             return exp.Join(this=right_ref, kind=kind, side=side, using=using)
-        return exp.Join(
-            this=right_ref, kind=kind, side=side, on=_source_ast(join.condition)
-        )
+        on_ast = _source_ast(join.condition)
+        if on_extra is not None:
+            on_ast = exp.and_(on_ast, on_extra)
+        return exp.Join(this=right_ref, kind=kind, side=side, on=on_ast)
 
     def _claim_scan(self, scan: Scan, context: _PushContext) -> bool:
         """Confirm a plain (non-aggregate) scan shares the data source."""
