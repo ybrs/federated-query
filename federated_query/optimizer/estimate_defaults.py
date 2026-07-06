@@ -77,13 +77,24 @@ def cap_composite_denom(denom, equi_count, left_rows, right_rows):
     return min(denom, max(1.0, float(min(left_rows, right_rows))))
 
 
+def orientation_rows(node):
+    """A node's size for orientation decisions: a remote query's real OUTPUT
+    estimate when the optimizer computed one (its estimated_rows is only the
+    deliberate max-base floor for remotes whose root carries no estimate),
+    any other node's threaded estimate."""
+    output_rows = getattr(node, "output_estimated_rows", None)
+    if output_rows is not None:
+        return output_rows
+    return getattr(node, "estimated_rows", None)
+
+
 def larger_estimated_side(left, right):
     """The side with the greater cost-estimated row count, or None when either
     estimate is missing or the two tie. Shared by the reduction orientation
     (reduce the larger side) and the hash-build choice (build the smaller), so
     the two decisions can never disagree about which side is bigger."""
-    left_rows = getattr(left, "estimated_rows", None)
-    right_rows = getattr(right, "estimated_rows", None)
+    left_rows = orientation_rows(left)
+    right_rows = orientation_rows(right)
     if left_rows is None or right_rows is None or left_rows == right_rows:
         return None
     return right if right_rows > left_rows else left

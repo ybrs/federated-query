@@ -254,3 +254,41 @@ def test_gate_abstains_for_a_composite_build_side():
     join = _inner(partsupp, island,
                   _col("ps", "ps_suppkey"), _col("supplier", "s_suppkey"))
     assert _reduction_filters(join) is True
+
+
+def _island(output_est, est=10000):
+    """A pg supplier island with base-domain NDV and an optional real output
+    estimate (estimated_rows stays the max-base floor)."""
+    from federated_query.plan.physical import PhysicalRemoteQuery
+    return PhysicalRemoteQuery(
+        datasource="pg", datasource_connection=None, query_ast=None,
+        output_names=["s_suppkey"],
+        column_alias_map={("supplier", "s_suppkey"): "s_suppkey"},
+        estimated_rows=est, output_estimated_rows=output_est,
+        column_ndv={"s_suppkey": 10000},
+    )
+
+
+def test_gate_judges_a_remote_build_by_its_output_estimate():
+    """q11's shape resolved: a filtered island whose real output estimate is
+    400 donates ~400 keys - useful against a 10k-NDV probe column. The same
+    island estimated to return the whole domain is refused."""
+    from federated_query.executor.rust_ir import _reduction_filters
+    partsupp = _est_scan("partsupp", "ps", ["ps_suppkey", "ps_partkey"], 800000,
+                         column_ndv={"ps_suppkey": 10000})
+    def join_with(island):
+        return _inner(partsupp, island,
+                      _col("ps", "ps_suppkey"), _col("supplier", "s_suppkey"))
+    assert _reduction_filters(join_with(_island(output_est=400))) is True
+    assert _reduction_filters(join_with(_island(output_est=10000))) is False
+
+
+def test_orientation_prefers_the_remote_output_estimate():
+    """larger_estimated_side sizes a remote by its real output estimate when
+    present; the max-base estimated_rows is only the fallback floor."""
+    from federated_query.optimizer.estimate_defaults import larger_estimated_side
+    scan = _est_scan("customer", "c", ["c_custkey"], 150000)
+    small_island = _island(output_est=400, est=6000000)
+    assert larger_estimated_side(scan, small_island) is scan
+    unestimated_island = _island(output_est=None, est=6000000)
+    assert larger_estimated_side(scan, unestimated_island) is unestimated_island

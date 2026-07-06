@@ -1587,9 +1587,13 @@ class PhysicalRemoteQuery(PhysicalPlanNode):
     query_ast: Any
     output_names: List[str]
     column_alias_map: Dict[Tuple[Optional[str], str], str] = Field(default_factory=dict)
-    # The cost model's row estimate for the collapsed subtree's root, so the
-    # reduction can orient by size; None when the root is not a Join/Scan.
+    # The deliberate max-base OVER-estimate (largest interior base scan): the
+    # orientation FLOOR used when no real output estimate exists, so a
+    # fact-carrying remote can never look small on a missing estimate.
     estimated_rows: Optional[int] = None
+    # The subtree root's own cost estimate - the rows this query actually
+    # returns. Orientation and the reduction-usefulness gate prefer it.
+    output_estimated_rows: Optional[int] = None
     # Source-catalog NDV per OUTPUT column that passes through unchanged from
     # an interior base scan (join keys do). The reduction uses it to refuse a
     # dynamic filter whose keys cover the probe column's whole value domain.
@@ -1605,6 +1609,7 @@ class PhysicalRemoteQuery(PhysicalPlanNode):
         output_names: List[str],
         column_alias_map: Dict[Tuple[Optional[str], str], str],
         estimated_rows: Optional[int] = None,
+        output_estimated_rows: Optional[int] = None,
         column_ndv: Optional[Dict[str, int]] = None,
     ) -> "PhysicalRemoteQuery":
         """Sanctioned fresh-construction path for PhysicalRemoteQuery.
@@ -1617,6 +1622,7 @@ class PhysicalRemoteQuery(PhysicalPlanNode):
             output_names=output_names,
             column_alias_map=column_alias_map,
             estimated_rows=estimated_rows,
+            output_estimated_rows=output_estimated_rows,
             column_ndv=column_ndv,
         )
     _schema: Optional[pa.Schema] = None

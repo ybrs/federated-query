@@ -854,17 +854,26 @@ def _reduction_filters(join) -> bool:
     Decided from the cost model's NDVs threaded onto the plan; when either
     side's statistic is missing this keeps today's reduce-by-default."""
     build, probe, build_key, probe_key = _orient_join(join)
-    if not isinstance(build, PhysicalScan):
-        # Only a plain scan's estimate reflects its own filters. A collapsed
-        # remote's estimated_rows is the deliberate max-base OVER-estimate and
-        # its column_ndv the unfiltered base domain, so judging its keys here
-        # would kill useful reductions (q11: a 400-row filtered island reads
-        # as 10k keys). Abstain until remotes carry a real output estimate.
-        return True
     inject_col = _physical_column_name(probe_key, probe.column_aliases())
     probe_ndv = _node_column_ndv(_reducible_probe_base(probe, inject_col), inject_col)
     keys_ndv = _node_column_ndv(build, _build_key_name(build, build_key))
-    return not useless_key_reduction(keys_ndv, build.estimated_rows, probe_ndv)
+    build_rows = _output_rows(build)
+    if isinstance(build, PhysicalRemoteQuery) and build_rows is None:
+        # A remote's column_ndv is the unfiltered base domain; without its
+        # real output estimate there is no evidence about its actual key set.
+        return True
+    return not useless_key_reduction(keys_ndv, build_rows, probe_ndv)
+
+
+def _output_rows(node):
+    """The rows a node actually produces: a remote query's real output
+    estimate (its estimated_rows is the deliberate max-base orientation
+    floor, and its column_ndv the unfiltered base domain - judging keys by
+    those killed q11's useful 400-key island reduction), any other node's
+    threaded estimate. None abstains."""
+    if isinstance(node, PhysicalRemoteQuery):
+        return node.output_estimated_rows
+    return getattr(node, "estimated_rows", None)
 
 
 def _build_key_name(build, build_key_expr) -> str:

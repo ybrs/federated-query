@@ -197,7 +197,9 @@ class SingleSourcePushdown:
             return None
         if not context.select_items and not self._expand_star_select(context):
             return None
-        return self._finish(context, self._root_estimate(node))
+        return self._finish(
+            context, self._root_estimate(node), self._output_estimate(node)
+        )
 
     def _root_estimate(self, node: LogicalPlanNode) -> Optional[int]:
         """The reduction-orientation size of a collapsed subtree: the LARGEST
@@ -299,8 +301,22 @@ class SingleSourcePushdown:
             return True
         return context.has_computed and not context.has_aggregate
 
+    def _output_estimate(self, node: LogicalPlanNode) -> Optional[int]:
+        """The subtree ROOT's own cost estimate - the rows this remote query
+        actually returns - distinct from _root_estimate's deliberate max-base
+        over-estimate. Descends row-count-preserving wrappers (Projection,
+        Sort) to the estimated Join/Scan; None when the root reshapes
+        cardinality without carrying its own estimate."""
+        current = node
+        while isinstance(current, (Projection, Sort)):
+            current = current.children()[0]
+        return getattr(current, "estimated_rows", None)
+
     def _finish(
-        self, context: _PushContext, estimated_rows: Optional[int]
+        self,
+        context: _PushContext,
+        estimated_rows: Optional[int],
+        output_estimated_rows: Optional[int] = None,
     ) -> Optional[PhysicalRemoteQuery]:
         """Resolve the connection, render SQL, and build the physical node."""
         datasource = self._resolve_datasource(context)
@@ -322,6 +338,7 @@ class SingleSourcePushdown:
             output_names=context.output_names,
             column_alias_map=context.column_aliases,
             estimated_rows=estimated_rows,
+            output_estimated_rows=output_estimated_rows,
             column_ndv=self._remote_column_ndv(context),
         )
 
