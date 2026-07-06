@@ -21,15 +21,30 @@ from .rules import (
 from .statistics import StatisticsCollector
 
 
+def build_cost_model(catalog: Catalog, cost_config: CostConfig) -> CostModel:
+    """The session's ONE cost model over a session-cached statistics
+    collector: statistics are fetched from the sources' catalogs lazily per
+    column and cached for the life of the session. Shared by the join-ordering
+    rule and the physical planner so every size-sensitive decision reads the
+    same numbers."""
+    return CostModel(cost_config, StatisticsCollector(catalog))
+
+
 def build_optimizer(
-    catalog: Catalog, optimizer_config: OptimizerConfig, cost_config: CostConfig
+    catalog: Catalog,
+    optimizer_config: OptimizerConfig,
+    cost_config: CostConfig,
+    cost_model: CostModel = None,
 ) -> RuleBasedOptimizer:
     """The standard rule stack, honoring the optimizer configuration.
 
     JoinOrdering registers immediately after PredicatePushdown: it reads the
     folded equi conditions and embedded scan filters pushdown produces, and
-    must run before projection pushdown prunes columns.
+    must run before projection pushdown prunes columns. Callers that also
+    build a PhysicalPlanner pass the shared cost model here.
     """
+    if cost_model is None:
+        cost_model = build_cost_model(catalog, cost_config)
     optimizer = RuleBasedOptimizer(catalog)
     if optimizer_config.enable_predicate_pushdown:
         optimizer.add_rule(PredicatePushdownRule())
@@ -38,20 +53,12 @@ def build_optimizer(
     # reduced input instead of a top-level existential filter).
     optimizer.add_rule(SemiJoinPushdownRule())
     if optimizer_config.enable_join_reordering:
-        optimizer.add_rule(_join_ordering_rule(catalog, optimizer_config, cost_config))
+        optimizer.add_rule(
+            JoinOrderingRule(cost_model, optimizer_config.max_join_reorder_size)
+        )
     if optimizer_config.enable_projection_pushdown:
         optimizer.add_rule(ProjectionPushdownRule())
     optimizer.add_rule(AggregatePushdownRule())
     optimizer.add_rule(OrderByPushdownRule())
     optimizer.add_rule(LimitPushdownRule())
     return optimizer
-
-
-def _join_ordering_rule(
-    catalog: Catalog, optimizer_config: OptimizerConfig, cost_config: CostConfig
-) -> JoinOrderingRule:
-    """The cost-based join-ordering rule over a session-cached statistics
-    collector: statistics are fetched from the sources' catalogs lazily per
-    column and cached for the life of this optimizer."""
-    cost_model = CostModel(cost_config, StatisticsCollector(catalog))
-    return JoinOrderingRule(cost_model, optimizer_config.max_join_reorder_size)

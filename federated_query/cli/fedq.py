@@ -30,6 +30,7 @@ from ..datasources.clickhouse import ClickHouseDataSource
 from ..executor import Executor
 from ..parser import Binder, Parser, BindingError
 from ..optimizer import PhysicalPlanner, build_optimizer
+from ..optimizer.factory import build_cost_model
 from ..optimizer.decorrelation import Decorrelator
 from ..processor import QueryExecutor, StarExpansionError, StarExpansionProcessor
 
@@ -92,8 +93,13 @@ class FedQRuntime:
         self.catalog = catalog
         self.parser = Parser()
         self.binder = Binder(catalog)
-        self.optimizer = build_optimizer(catalog, config.optimizer, config.cost)
-        self.planner = PhysicalPlanner(catalog)
+        # ONE cost model (and statistics cache) for the session: join ordering
+        # and the physical planner's scan annotation read the same numbers.
+        cost_model = build_cost_model(catalog, config.cost)
+        self.optimizer = build_optimizer(
+            catalog, config.optimizer, config.cost, cost_model=cost_model
+        )
+        self.planner = PhysicalPlanner(catalog, cost_model=cost_model)
         self.decorrelator = Decorrelator()
         physical_executor = Executor(config=config.executor)
         processors = [StarExpansionProcessor(catalog, dialect=self.parser.dialect)]

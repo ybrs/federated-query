@@ -1062,13 +1062,19 @@ def _emit_collect_distinct(ctx, input_binding, key, binding):
 
 
 def _emit_injected_scan(ctx, base, inject_col, keys_binding, binding, build_key):
-    """A probe base with the build's keys pushed in as `col IN (...)`."""
-    ctx.steps.append({
+    """A probe base with the build's keys pushed in as `col IN (...)`. The
+    probe column's NDV rides along so the engine's delivery-strategy guard
+    prices the fetched fraction as keys/NDV instead of keys/row-count."""
+    step = {
         "op": "injected_scan", "datasource": base.datasource,
         "scan": _injected_probe_spec(base, inject_col, build_key),
         "inject_column": inject_col,
         "keys_from": keys_binding, "binding": binding,
-    })
+    }
+    ndv = _node_column_ndv(base, inject_col)
+    if ndv is not None:
+        step["inject_column_ndv"] = ndv
+    ctx.steps.append(step)
 
 
 def _injected_probe_spec(base, inject_col, build_key):

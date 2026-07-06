@@ -100,28 +100,34 @@ def larger_estimated_side(left, right):
     return right if right_rows > left_rows else left
 
 
-# A dynamic filter is refused when the build side's distinct keys are expected
-# to cover at least this fraction of the probe column's value domain: such a
-# filter keeps (nearly) every probe row, so collecting, shipping, and applying
-# it is pure overhead. Measured: TPC-H q07 injects ALL 10k supplier keys into
-# lineitem (l_suppkey NDV = 10k) - the filter passes 100% of rows and the
-# temp-table semi-join alone costs +75ms on the 6M-row scan.
+# A dynamic filter is refused when its expected semi-join selectivity is at
+# least this fraction: such a filter keeps (nearly) every probe row, so
+# collecting, shipping, and applying it is pure overhead. Measured: TPC-H q07
+# injects ALL 10k supplier keys into lineitem (l_suppkey NDV = 10k) - the
+# filter passes 100% of rows and the temp-table semi-join alone costs +75ms
+# on the 6M-row scan.
 USELESS_KEYS_NDV_FRACTION = 0.8
 
 
 def useless_key_reduction(build_keys_ndv, build_rows, probe_column_ndv):
-    """True when a planned key reduction provably filters (almost) nothing:
-    the build side's expected distinct keys cover >= USELESS_KEYS_NDV_FRACTION
-    of the probe column's value domain. Deciding needs BOTH the build key's
-    base NDV and the probe column's base NDV from source statistics; when
-    either is unknown this returns False (keep today's reduce-by-default)."""
-    if build_keys_ndv is None or probe_column_ndv is None:
+    """True when a planned key reduction provably filters (almost) nothing.
+
+    The expected fraction of probe rows the injected keys keep is
+    expected_keys / max(build key NDV, probe column NDV) - the same
+    max-NDV denominator the join estimate uses: keys drawn uniformly from
+    the build domain hit that share of either side's value domain, whichever
+    is wider. expected_keys is the build key's base NDV clamped by the
+    build's estimated rows (a filtered build donates fewer distinct keys).
+    An unknown build NDV abstains (False, reduce-by-default); an unknown
+    probe NDV falls back to the build domain alone (FK containment)."""
+    if build_keys_ndv is None:
         return False
     expected_keys = build_keys_ndv
     if build_rows is not None:
         # A filtered build cannot donate more distinct keys than it has rows.
         expected_keys = min(expected_keys, build_rows)
-    return expected_keys >= probe_column_ndv * USELESS_KEYS_NDV_FRACTION
+    domain = max(build_keys_ndv, probe_column_ndv or 0)
+    return expected_keys >= domain * USELESS_KEYS_NDV_FRACTION
 
 
 class CardinalityEstimate(StateModel):

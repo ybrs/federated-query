@@ -30,15 +30,20 @@ def _injected_scan(multi_source_env, sql):
 
 
 def test_cross_source_join_pushes_dynamic_filter(multi_source_env):
-    """The probe scan carries an injected dynamic filter from the build keys."""
+    """The probe scan carries an injected dynamic filter from the build keys.
+
+    The build carries a selective filter: an UNFILTERED dimension's keys are
+    the probe's whole FK domain and the cost-based usefulness gate correctly
+    refuses that reduction (it would filter nothing)."""
     sql = (
         "SELECT O.order_id "
         "FROM duckdb_orders.main.orders O "
-        "JOIN duckdb_products.main.products P ON O.product_id = P.id"
+        "JOIN duckdb_products.main.products P ON O.product_id = P.id "
+        "WHERE P.id > 102"
     )
     step = _injected_scan(multi_source_env, sql)
-    # build side is products; the probe (orders) is constrained to product ids
-    # that exist in the build, injected on its product_id column.
+    # build side is the filtered products; the probe (orders) is constrained
+    # to the surviving product ids, injected on its product_id column.
     assert step is not None
     assert step["datasource"] == "duckdb_orders"
     assert step["inject_column"] == "product_id"
@@ -49,12 +54,24 @@ def test_cross_source_comma_join_pushes_dynamic_filter(multi_source_env):
     sql = (
         "SELECT O.order_id "
         "FROM duckdb_orders.main.orders O, duckdb_products.main.products P "
-        "WHERE O.product_id = P.id"
+        "WHERE O.product_id = P.id AND P.id > 102"
     )
     step = _injected_scan(multi_source_env, sql)
     assert step is not None
     assert step["datasource"] == "duckdb_orders"
     assert step["inject_column"] == "product_id"
+
+
+def test_unfiltered_dimension_keys_are_not_injected(multi_source_env):
+    """An unfiltered build side's keys cover the probe column's whole value
+    domain (every order's product_id exists in products), so the reduction is
+    provably a no-op and the gate must skip it."""
+    sql = (
+        "SELECT O.order_id "
+        "FROM duckdb_orders.main.orders O "
+        "JOIN duckdb_products.main.products P ON O.product_id = P.id"
+    )
+    assert _injected_scan(multi_source_env, sql) is None
 
 
 def test_cross_source_join_results_correct(multi_source_env):

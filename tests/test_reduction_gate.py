@@ -195,14 +195,21 @@ def test_remote_orientation_size_is_max_base_not_join_output():
 
 
 def test_useless_key_reduction_predicate():
-    """The pure predicate: keys covering >= 80% of the probe column's domain
-    are useless; a filtered build (few rows) or missing statistics are not."""
+    """The pure predicate: expected keys covering >= 80% of the wider value
+    domain are useless; a filtered build (few expected keys), a build domain
+    much narrower than the probe's (dangling FKs), or an unknown build NDV
+    are not. An unknown probe NDV falls back to build-domain coverage."""
     from federated_query.optimizer.estimate_defaults import useless_key_reduction
     assert useless_key_reduction(10000, 10000, 10000) is True
     assert useless_key_reduction(10000, 300, 10000) is False
     assert useless_key_reduction(None, 10000, 10000) is False
     assert useless_key_reduction(10000, None, 10000) is True
-    assert useless_key_reduction(10000, 10000, None) is False
+    assert useless_key_reduction(10000, 10000, None) is True
+    # A full build domain that is much NARROWER than the probe domain still
+    # filters (probe values outside it drop): not useless.
+    assert useless_key_reduction(100, 100, 1000) is False
+    # A filtered build donating 7 of its 10 domain values keeps ~70%: useful.
+    assert useless_key_reduction(10, 7, 4) is False
 
 
 def test_gate_skips_unfiltered_dimension_keys():

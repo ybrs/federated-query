@@ -59,6 +59,7 @@ from ..plan.expressions import (
     Expression,
     split_conjuncts as _split_and,
 )
+from . import pushdown
 from .estimate_defaults import larger_estimated_side
 from .single_source_pushdown import SingleSourcePushdown, same_source
 from ..parser.errors import UnsupportedSQLError
@@ -118,13 +119,19 @@ class _JoinSides(StateModel):
 class PhysicalPlanner:
     """Converts logical plans to physical plans."""
 
-    def __init__(self, catalog: Catalog):
+    def __init__(self, catalog: Catalog, cost_model=None):
         """Initialize physical planner.
 
         Args:
             catalog: Catalog for looking up data sources
+            cost_model: Optional shared CostModel (the optimizer's, with its
+                session statistics cache). When present, bare-Scan join sides
+                that join ordering never visited (LEFT/SEMI/ANTI joins live
+                outside INNER regions) get their estimate and join-key NDVs
+                filled here, so the reduction gates work uniformly.
         """
         self.catalog = catalog
+        self.cost_model = cost_model
         self.single_source = SingleSourcePushdown(catalog)
         # CTE name -> its materializing producer, registered while a cross-source
         # CTE's child is planned so each CTERef resolves to a shared scan.
@@ -601,6 +608,7 @@ class PhysicalPlanner:
 
     def _plan_join(self, join: Join) -> PhysicalPlanNode:
         """Plan a join: try remote pushdown, then a hash join, else nested loop."""
+        join = self._annotate_join_scans(join)
         left_plan = self._plan_node(join.left)
         right_plan = self._plan_node(join.right)
 
@@ -620,6 +628,50 @@ class PhysicalPlanner:
         if hash_join:
             return hash_join
         return self._plan_nested_loop(join, left_plan, right_plan)
+
+    def _annotate_join_scans(self, join: Join) -> Join:
+        """Fill estimate + join-key NDVs on bare-Scan join sides that carry
+        none (join ordering only annotates INNER regions; a LEFT/SEMI/ANTI
+        join's scans reach here bare). Uses the shared cost model's session
+        statistics cache; without one, or for non-Scan sides, nothing changes
+        and the downstream gates abstain as before."""
+        if self.cost_model is None or join.condition is None:
+            return join
+        updates = {}
+        for side in ("left", "right"):
+            annotated = self._annotated_scan(getattr(join, side), join.condition)
+            if annotated is not None:
+                updates[side] = annotated
+        if not updates:
+            return join
+        return join.model_copy(update=updates)
+
+    def _annotated_scan(self, node, condition) -> Optional[Scan]:
+        """The side as an estimate+NDV-annotated Scan, or None to keep it."""
+        if not isinstance(node, Scan) or node.estimated_rows is not None:
+            return None
+        ndv_map = {}
+        for ref in self._side_key_refs(node, condition):
+            ndv = self.cost_model.column_ndv(node, ref)
+            if ndv is not None:
+                ndv_map[ref.column] = ndv
+        return node.model_copy(update={
+            "estimated_rows": self.cost_model.estimate(node).rows,
+            "column_ndv": ndv_map or None,
+        })
+
+    def _side_key_refs(self, scan: Scan, condition) -> List[ColumnRef]:
+        """The condition's equi-key column refs that this scan owns (matched
+        by its alias or table name)."""
+        names = {scan.alias, scan.table_name}
+        refs = []
+        for conjunct in _split_and(condition):
+            if not pushdown.is_equi_predicate(conjunct):
+                continue
+            for ref in (conjunct.left, conjunct.right):
+                if isinstance(ref, ColumnRef) and ref.table in names:
+                    refs.append(ref)
+        return refs
 
     def _plan_hash_join_or_none(
         self, join: Join, left_plan: PhysicalPlanNode, right_plan: PhysicalPlanNode
