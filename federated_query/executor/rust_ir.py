@@ -32,6 +32,7 @@ from ..plan.expressions import (
     UnaryOpType,
 )
 from ..plan.logical import JoinType
+from ..optimizer.estimate_defaults import larger_estimated_side
 from ..plan.physical import (
     PhysicalAliasedRelation,
     PhysicalCTEMergeQuery,
@@ -868,6 +869,14 @@ def _orient_join(join):
         # Fixed roles: the preserved left donates keys, the nullable right is
         # the reduced probe (reducing the left would drop preserved rows).
         return join.left, join.right, join.left_keys[0], join.right_keys[0]
+    # Cost-based: reduce the LARGER side (the cost model's estimate reaches
+    # here via estimated_rows), instead of the structural remote>scan guess
+    # that mis-sizes a small dim collapsed into a remote query.
+    probe = _cardinality_probe(join)
+    if probe is join.right:
+        return join.left, join.right, join.left_keys[0], join.right_keys[0]
+    if probe is join.left:
+        return join.right, join.left, join.right_keys[0], join.left_keys[0]
     if _injectable_scan(join.left) and _injectable_scan(join.right):
         if join.build_side == "left":
             return join.left, join.right, join.left_keys[0], join.right_keys[0]
@@ -875,6 +884,20 @@ def _orient_join(join):
     if _probe_preference(join.right) >= _probe_preference(join.left):
         return join.left, join.right, join.left_keys[0], join.right_keys[0]
     return join.right, join.left, join.right_keys[0], join.left_keys[0]
+
+
+def _cardinality_probe(join):
+    """The larger injectable side to reduce, or None to fall back.
+
+    Uses the cost estimate threaded onto both children (via the shared
+    larger_estimated_side helper). Declines (None) when either estimate is
+    missing, they tie (both likely defaulted), or the larger side is not an
+    injectable probe - guaranteeing the same reduction set as the structural
+    heuristic, just better-oriented when sizes differ."""
+    larger = larger_estimated_side(join.left, join.right)
+    if larger is not None and _probe_preference(larger) > 0:
+        return larger
+    return None
 
 
 def _emit_reduced_inputs(ctx, build_child, probe_child, build_key_expr, probe_key_expr):

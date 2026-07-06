@@ -53,6 +53,18 @@ DEFAULT_NULL_FRACTION = 0.05
 TRANSFER_WEIGHT = 1.0
 
 
+def larger_estimated_side(left, right):
+    """The side with the greater cost-estimated row count, or None when either
+    estimate is missing or the two tie. Shared by the reduction orientation
+    (reduce the larger side) and the hash-build choice (build the smaller), so
+    the two decisions can never disagree about which side is bigger."""
+    left_rows = getattr(left, "estimated_rows", None)
+    right_rows = getattr(right, "estimated_rows", None)
+    if left_rows is None or right_rows is None or left_rows == right_rows:
+        return None
+    return right if right_rows > left_rows else left
+
+
 class CardinalityEstimate(StateModel):
     """A row-count estimate plus the provenance of every default that fed it.
 

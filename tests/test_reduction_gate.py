@@ -110,3 +110,61 @@ def test_scan_estimated_rows_survives_model_copy():
     )
     derived = scan.model_copy(update={"columns": ["ps_partkey"]})
     assert derived.estimated_rows == 800000
+
+
+def _est_scan(table, alias, columns, rows, **kw):
+    """A plain injectable scan carrying a cost estimate."""
+    return _scan(table, alias, columns, estimated_rows=rows, **kw)
+
+
+def _inner(left, right, left_key, right_key, build="right"):
+    """An INNER hash join on a single equi key."""
+    return PhysicalHashJoin(
+        left=left, right=right, join_type=JoinType.INNER,
+        left_keys=[left_key], right_keys=[right_key], build_side=build,
+    )
+
+
+def test_inner_reduces_the_larger_estimated_side():
+    """The q11 fix: the bigger injectable side (partsupp 800k) becomes the
+    probe (reduced), the smaller (supplier 400) donates keys - regardless of
+    the structural _probe_preference that used to pick the small remote."""
+    from federated_query.executor.rust_ir import _cardinality_probe
+    big = _est_scan("partsupp", "ps", ["ps_partkey", "ps_suppkey"], 800000)
+    small = _est_scan("supplier", "s", ["s_suppkey"], 400)
+    # small on the left, big on the right (the shape _probe_preference got wrong)
+    join = _inner(small, big, _col("s", "s_suppkey"), _col("ps", "ps_suppkey"))
+    assert _cardinality_probe(join) is big
+    build, probe, _, _ = _orient_join(join)
+    assert probe is big and build is small
+
+
+def test_inner_tie_falls_back_to_structural_choice():
+    """Equal estimates (both defaulted) must NOT pick a side by cardinality -
+    the cardinality path returns None so the existing heuristic runs."""
+    from federated_query.executor.rust_ir import _cardinality_probe
+    a = _est_scan("a", "a", ["k"], 1000)
+    b = _est_scan("b", "b", ["k"], 1000)
+    join = _inner(a, b, _col("a", "k"), _col("b", "k"))
+    assert _cardinality_probe(join) is None
+
+
+def test_inner_missing_estimate_falls_back():
+    """When one side has no estimate the cardinality path declines."""
+    from federated_query.executor.rust_ir import _cardinality_probe
+    a = _est_scan("a", "a", ["k"], 1000)
+    b = _scan("b", "b", ["k"])  # no estimated_rows
+    join = _inner(a, b, _col("a", "k"), _col("b", "k"))
+    assert _cardinality_probe(join) is None
+
+
+def test_semi_and_left_orientation_unchanged():
+    """The cardinality branch is INNER-only; SEMI/LEFT keep fixed roles."""
+    big = _est_scan("li", "l", ["l_p", "l_q"], 6000000)
+    small = _est_scan("part", "p", ["p_id"], 200)
+    semi = PhysicalHashJoin(
+        left=big, right=small, join_type=JoinType.SEMI,
+        left_keys=[_col("l", "l_p")], right_keys=[_col("p", "p_id")], build_side="right",
+    )
+    build, probe, _, _ = _orient_join(semi)
+    assert probe is big and build is small  # SEMI: preserved left is the probe
