@@ -1011,11 +1011,11 @@ def _emit_reduced_inputs(ctx, build_child, probe_child, build_key_expr, probe_ke
     build_binding = _emit_build_side(ctx, build_child)
     keys_binding = ctx.names.binding()
     _emit_collect_distinct(ctx, build_binding, build_key, keys_binding)
-    probe_binding = _emit_probe(ctx, probe_child, inject_col, keys_binding)
+    probe_binding = _emit_probe(ctx, probe_child, inject_col, keys_binding, build_key)
     return build_binding, probe_binding
 
 
-def _emit_probe(ctx, probe_child, inject_col, keys_binding):
+def _emit_probe(ctx, probe_child, inject_col, keys_binding, build_key):
     """Emit the probe with the build keys injected into its base scan.
 
     A plain scan / remote probe is injected directly. A composite probe (an
@@ -1024,7 +1024,7 @@ def _emit_probe(ctx, probe_child, inject_col, keys_binding):
     as coordinator fragments - read the reduced base."""
     base = _reducible_probe_base(probe_child, inject_col)
     base_binding = ctx.names.binding()
-    _emit_injected_scan(ctx, base, inject_col, keys_binding, base_binding)
+    _emit_injected_scan(ctx, base, inject_col, keys_binding, base_binding, build_key)
     if base is probe_child:
         return base_binding
     ctx.injected[id(base)] = base_binding
@@ -1061,25 +1061,89 @@ def _emit_collect_distinct(ctx, input_binding, key, binding):
     })
 
 
-def _emit_injected_scan(ctx, base, inject_col, keys_binding, binding):
+def _emit_injected_scan(ctx, base, inject_col, keys_binding, binding, build_key):
     """A probe base with the build's keys pushed in as `col IN (...)`."""
     ctx.steps.append({
         "op": "injected_scan", "datasource": base.datasource,
-        "scan": _injected_probe_spec(base), "inject_column": inject_col,
+        "scan": _injected_probe_spec(base, inject_col, build_key),
+        "inject_column": inject_col,
         "keys_from": keys_binding, "binding": binding,
     })
 
 
-def _injected_probe_spec(base):
+def _injected_probe_spec(base, inject_col, build_key):
     """A structured spec for a plain scan; pre-rendered SQL for a pushed remote
-    query OR an aggregate scan (both wrapped as a derived table so the key
-    filter applies to their OUTPUT columns - a plain scan takes the filter in
-    its own WHERE)."""
+    query OR an aggregate scan (wrapped as a derived table so the key filter
+    applies to their OUTPUT columns - a plain scan takes the filter in its own
+    WHERE). A remote island additionally carries injected_sql: the same query
+    with the key filter placed on its owning base relation INSIDE, because
+    sources do not push a semi-join through the derived-table wrapper."""
     if isinstance(base, PhysicalRemoteQuery):
-        return raw_scan_spec(base)
+        spec = raw_scan_spec(base)
+        injected_sql = _island_injected_sql(base, inject_col, build_key)
+        if injected_sql is not None:
+            spec["injected_sql"] = injected_sql
+        return spec
     if any((base.aggregates, base.group_by, base.grouping_sets)):
         return raw_scan_spec(base)
     return structured_scan_spec(base)
+
+
+# The connection-scoped temp table the engine fills with the build side's
+# distinct keys (must match fedqrs's DYN_KEYS_TEMP_TABLE).
+_DYN_KEYS_TEMP_TABLE = "fedq_dyn_keys"
+
+
+def _island_injected_sql(base, inject_col, build_key):
+    """The island's SQL with `owner.col IN (SELECT key FROM fedq_dyn_keys)`
+    placed on the owning base relation inside the query (q03 measured the
+    wrapper at 65ms vs 21ms with the filter inside). None when the owner is
+    ambiguous or the island's shape would change meaning under an added WHERE
+    conjunct - the engine then falls back to the output wrapper."""
+    owner = _inject_owner(base, inject_col)
+    if owner is None or not _injectable_island_ast(base.query_ast):
+        return None
+    qualifier, column = owner
+    keys_query = exp.select(exp.column(build_key, quoted=True)).from_(
+        _DYN_KEYS_TEMP_TABLE
+    )
+    conjunct = exp.column(column, table=qualifier, quoted=True).isin(query=keys_query)
+    injected = base.query_ast.copy().where(conjunct, copy=False)
+    from ..plan.physical import to_source_sql
+
+    return to_source_sql(base.datasource_connection, injected.sql(dialect="postgres"))
+
+
+def _inject_owner(base, inject_col):
+    """The unique (relation alias, base column) whose output name is the
+    inject column; None when the column is computed (no qualifier) or when
+    more than one relation claims it (never inject on a guess)."""
+    owners = []
+    for (qualifier, column), output in base.column_alias_map.items():
+        if output == inject_col and qualifier is not None:
+            owners.append((qualifier, column))
+    if len(owners) == 1:
+        return owners[0]
+    return None
+
+
+def _injectable_island_ast(ast) -> bool:
+    """Whether adding a WHERE conjunct preserves the island's meaning: a plain
+    SELECT (no set-operation root, no WITH whose scopes the conjunct cannot
+    see), no LIMIT/OFFSET (the filter would change which rows the limit
+    keeps), and no window functions (frames would change). GROUP BY is fine:
+    the inject column maps to a selected base column, which under grouping is
+    a group key, and filtering by a group key before or after aggregation is
+    identical."""
+    if not isinstance(ast, exp.Select):
+        return False
+    if ast.args.get("with") is not None:
+        return False
+    if ast.args.get("limit") is not None or ast.args.get("offset") is not None:
+        return False
+    for _window in ast.find_all(exp.Window):
+        return False
+    return True
 
 
 def _join_fragment(join, kind):

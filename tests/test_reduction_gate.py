@@ -292,3 +292,56 @@ def test_orientation_prefers_the_remote_output_estimate():
     assert larger_estimated_side(scan, small_island) is scan
     unestimated_island = _island(output_est=None, est=6000000)
     assert larger_estimated_side(scan, unestimated_island) is unestimated_island
+
+
+def _remote_with_ast(sql, alias_map):
+    """A remote island carrying a parsed AST and its column alias map."""
+    import sqlglot
+    from federated_query.plan.physical import PhysicalRemoteQuery
+    from federated_query.datasources.duckdb import DuckDBDataSource
+    return PhysicalRemoteQuery(
+        datasource="duck",
+        datasource_connection=DuckDBDataSource("duck", {"path": ":memory:"}),
+        query_ast=sqlglot.parse_one(sql, dialect="postgres"),
+        output_names=["o_custkey"], column_alias_map=alias_map,
+    )
+
+
+def test_island_injected_sql_lands_on_the_owning_relation():
+    """The key filter goes INSIDE the island, qualified by the owning alias,
+    reading the build key from the temp table (the wrapper form is not pushed
+    down by sources - q03 measured 65ms wrapped vs 21ms inside)."""
+    from federated_query.executor.rust_ir import _island_injected_sql
+    island = _remote_with_ast(
+        'SELECT "orders"."o_custkey" AS "o_custkey" FROM "main"."orders" AS "orders" '
+        'JOIN "main"."lineitem" AS "lineitem" ON "lineitem"."l_orderkey" = "orders"."o_orderkey" '
+        "WHERE \"orders\".\"o_orderdate\" < CAST('1995-03-15' AS DATE)",
+        {("orders", "o_custkey"): "o_custkey"},
+    )
+    sql = _island_injected_sql(island, "o_custkey", "c_custkey")
+    assert sql is not None
+    assert '"orders"."o_custkey" IN (SELECT "c_custkey" FROM fedq_dyn_keys)' in sql
+    assert "o_orderdate" in sql
+
+
+def test_island_injection_declines_unsafe_shapes():
+    """No owner / ambiguous owner / LIMIT / window: fall back to the wrapper
+    rather than change what the island returns."""
+    from federated_query.executor.rust_ir import _island_injected_sql
+    computed = _remote_with_ast(
+        'SELECT "o_custkey" FROM "main"."orders" AS "orders"',
+        {(None, "o_custkey"): "o_custkey"},
+    )
+    assert _island_injected_sql(computed, "o_custkey", "k") is None
+    limited = _remote_with_ast(
+        'SELECT "orders"."o_custkey" AS "o_custkey" FROM "main"."orders" AS "orders" LIMIT 5',
+        {("orders", "o_custkey"): "o_custkey"},
+    )
+    assert _island_injected_sql(limited, "o_custkey", "k") is None
+    windowed = _remote_with_ast(
+        'SELECT "orders"."o_custkey" AS "o_custkey", '
+        'ROW_NUMBER() OVER (ORDER BY "orders"."o_custkey") AS "rn" '
+        'FROM "main"."orders" AS "orders"',
+        {("orders", "o_custkey"): "o_custkey"},
+    )
+    assert _island_injected_sql(windowed, "o_custkey", "k") is None
