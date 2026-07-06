@@ -1250,11 +1250,19 @@ class OrderByPushdownRule(OptimizationRule):
         return projection.model_copy(update={"input": pushed_child})
 
     def _push_through_filter(self, sort: Sort, filter_node: Filter) -> LogicalPlanNode:
-        """Push ORDER BY through filter (always safe)."""
-        pushed_child = self._push_sort_into_child(sort, filter_node.input)
-        # Sort pushed into the filter's child; re-home the same filter over that
-        # reordered input, keeping its predicate unchanged.
-        return filter_node.model_copy(update={"input": pushed_child})
+        """Keep the Sort ABOVE the filter.
+
+        Pushing the Sort below the filter (Sort(Filter) -> Filter(Sort)) breaks a
+        LIMIT that sits above: the ORDER BY sort must reach the LIMIT to be a
+        top-N, but a filter between them does not preserve the sort order in the
+        cross-source (DataFusion) execution, so the LIMIT keeps a
+        non-deterministic set (q59). It also pessimizes - sorting the wider pre-
+        filter input. Nothing is lost: when the whole Sort-over-Filter subtree is
+        single-source, single-source pushdown renders it as the remote query's
+        WHERE + ORDER BY (order preserved by the source); otherwise the Sort
+        executes locally, directly under the LIMIT.
+        """
+        return sort
 
     def _push_through_join(self, sort: Sort, join: Join) -> LogicalPlanNode:
         """Keep the Sort above a join; a join does not preserve input row order.
