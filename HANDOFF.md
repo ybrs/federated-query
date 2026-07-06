@@ -1,4 +1,4 @@
-# Status: ten phases live; fair federated gap 38.6x -> 3.26x
+# Status: eleven phases live; fair federated gap 38.6x -> 3.16x
 
 State of the work. Facts only: what exists, what passes, what is measured,
 what is not done. Previous phase (Rust cutover, N-K decorrelation, merge-engine
@@ -13,7 +13,7 @@ merge-engine-datafusion
             `- feature/cost-based-optimizer   <-- HEAD (this document)
 ```
 
-Test suite: **1154 passed, 3 skipped, 39 xfailed, 0 failed**
+Test suite: **1159 passed, 3 skipped, 39 xfailed, 0 failed**
 (`POSTGRES_DB=duckpoc python -m pytest -q`). `make lint` green.
 
 ## What was built on this branch
@@ -253,23 +253,34 @@ single SF1 390 -> 152ms, fedparquet SF1 305 -> 142ms. The ONLY other >40ms
 delta (q16 single 160 -> 214) is subprocess noise - its plan is byte-identical
 old vs new clamp. Ten-phase run: 38.55x -> 3.26x; single-source SF1 1.99x.
 
+## LEFT-join aggregate-subquery reduction (q17, commit c0e8d43)
+
+A scalar-aggregate subquery (l_quantity < (SELECT avg ... WHERE l_partkey =
+p_partkey)) decorrelates to a LEFT join onto a GROUP-BY subquery. Reduction
+used to skip it (INNER/SEMI only) so the subquery averaged ALL 200k partkeys
+and shipped them, when only the 204 filtered parts were needed. Two additions:
+- LEFT-join reduction: reduce only the NULLABLE right by the PRESERVED left's
+  keys (identical result; fixed orientation, never reduce the preserved side).
+- Composite probe: descend through pure alias/projection wrappers to the
+  injectable base IF the inject column survives unchanged (else refuse); the
+  aggregate base wraps as a derived table filtered on its group key, its
+  binding cached in _Ctx.injected so the wrappers emit as normal coordinator
+  fragments reading the reduced base. No per-emitter refactor.
+
+Gate (report-result-c0e8d43.md): fedpgduck SF1 3432 -> 3392ms (3.16x), all 132
+correct. q17 174 -> 73ms (6.6x -> 2.8x); fedparquet q17 272 -> 81ms; NO >40ms
+regression anywhere (INNER/SEMI paths untouched). Eleven-phase run 38.55x ->
+3.16x; single-source SF1 1.97x.
+
 ## Known gaps / next work (in priority order from the data)
 
-Fair-federated ranking (report-result-3006554.md), all 22/22 correct:
-- SF1 total 3417ms vs 1058ms = 3.23x; SF0.1 total 1339ms vs 298ms = 4.49x.
-- SF1 slowest by absolute cost: q09 438ms(4.8x), q07 294ms(5.9x),
-  q13 294ms(3.0x), q10 260ms(3.9x), q18 206ms(2.4x), q05 193ms, q17 171ms(6.6x).
-- SF1 worst RATIO: q11 6.9x, q17 6.6x, q07 5.9x (plan/transfer, grows with data).
-- SF0.1 worst ratio: q15 10.5x, q06 9.6x, q02 7.4x - FIXED per-query overhead on
-  25-90ms queries (NOT plans; would need planning/connection/ingest latency cuts).
-
-1. **q09 (438ms, biggest absolute at both scales)**: multi-fact
-   part/partsupp/lineitem/orders/supplier - the most rows crossing. Under
-   investigation (where-do-we-lose-time next).
-2. **q07 (294ms/5.9x), q13 (294ms/3.0x), q10 (260ms/3.9x), q17 (171ms/6.6x)**:
-   the real big-dataset offenders - plan/transfer, worth digging.
-3. **Small-scale fixed overhead**: SF0.1 4.49x is per-query constants, not plans;
-   only worth chasing if low-latency matters (q06/q15 are 25-90ms).
+Fair-federated SF1 3.16x, SF0.1 4.41x, all correct.
+1. **q09 (438ms, biggest absolute)**: even reduced-by-%green%-parts lineitem is
+   ~320k rows via a temp-table semi-join (199ms) + a 6-way coordinator join.
+   Mostly genuine distributed work; limited headroom.
+2. **q07 (294ms/5.9x), q13 (294ms/3.0x, 1.5M orders LEFT-count inherent),
+   q10 (260ms/3.9x)**: plan/transfer tail.
+3. **Small-scale fixed overhead**: SF0.1 4.41x is per-query constants, not plans.
 4. **TRANSFER_WEIGHT calibration** (1.0), **CTE materialize-once**, duck guard
    NDV hint.
 5. **fedqrs missing operators** (18 xfails); `enable_decorrelation` unwired.
