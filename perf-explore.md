@@ -389,6 +389,39 @@ the real levers:
   noise; ALL cells correct; suite 1179 passed. q07's remaining 1.8M-row
   island transfer is item 8.
 
+## Source-divergent reduction delivery (commits 77c10da/993762b + e40f499)
+
+The dynamic-filter reduction assumed every source evaluates a `col IN (keys)`
+semi-join cheaply. It does not - the cost depends on the source ENGINE:
+- DuckDB: columnar, its scanner ignores secondary indexes, so a semi-join is a
+  full vectorized scan regardless. Reduce whenever the keys are SELECTIVE
+  (keys/NDV) and fit the ingest ceiling. The old 50k count cap was a stale
+  selectivity proxy (pre-CBO-5); raised to 2M (ingest ceiling only). q09 SF10:
+  the 108k green-part keys (5.4%) now reduce lineitem 60M -> 3.26M
+  (injected_scan 3474 -> 283ms; q09 7126 -> 2742ms).
+- Postgres: row-store; a semi-join is index-accelerated ONLY when the probe
+  column is indexed. Without an index it degrades to a full sequential scan
+  even at low cardinality (the reported "60M-row scan at low cardinality"
+  disaster). An unindexed PG probe now reads whole (parallel ctid scan; the
+  coordinator join reduces); an indexed one uses the semi-join. column_has_index
+  reads pg_index once per column, cached.
+- Parquet: read in-process by DataFusion; nothing to ship.
+The benchmark now indexes the PG join columns (load_postgres.py) - a real
+deployment does, and the DuckDB oracle reads the same indexed PG, so it stays
+fair. Two bugs surfaced and fixed in the process: reordering the delivery
+choice ahead of the inline-IN path routed a small aliased+filtered scan (q07's
+nation) to the parallel scan and crashed on the unrendered alias (MISMATCH ->
+ERROR caught by the SF10 differential); the fix renders the alias in the
+parallel scan and keeps inline-IN first.
+
+## SF10 (60M lineitem) fair-federated, after this round
+
+All 22 correct. Overall 2.71x (initial SF10) -> 1.93x after the q17
+aggregate-injection fix, the DuckDB ingest cap, and the source-divergent
+delivery. Worst remaining: q05/q07 (~3-4x, coordinator multi-join fan-out) and
+q09 (2.4x, the residual island break - orders+partsupp still cross). Half the
+suite is at/under 1.5x, several beating DuckDB. SF1 fedpgduck ~1.90x.
+
 ## Repro
 
   # per-query decomposition + engine step traces
