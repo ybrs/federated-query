@@ -40,18 +40,21 @@ coordinator. Deferred by request.
 
 ## Current status (pg-dims, SF0.1)
 
-`PASS 40 | MISMATCH 1 (q18, above) | ERROR 58` of 99. No OTHER wrong results:
+`PASS 54 | MISMATCH 1 (q18, above) | ERROR 44` of 99. No OTHER wrong results:
 correctness is compared against pure DuckDB, so a MISMATCH is a real engine diff.
 
 Remaining ERROR clusters (by cause):
-- **Set operations - 25**: `PhysicalUnion` (23, UNION/UNION ALL) +
-  `PhysicalSetOperation` (2, INTERSECT/EXCEPT). Not emitted by `rust_ir` yet;
-  DataFusion supports them. BIGGEST lever - NEXT.
-- WindowExpr at the coordinator - 11.
-- `JoinType.CROSS` - 5.
-- `PhysicalSingleRowGuard` - 3 (scalar-subquery guard).
-- BindingError `reference not in scope` - a few remaining (distinct from the
-  customer collision, now fixed).
+- **UnsupportedIR - 27**: WindowExpr at the coordinator (~11), `JoinType.CROSS`
+  (~5), `PhysicalSingleRowGuard` (scalar-subquery guard, ~3), and other physical
+  nodes. Window functions at the coordinator are the biggest sub-group.
+- **RuntimeError - 15**: "No field named" naming issues (incl. `right_customer_id`
+  when a UNION result is SELF-JOINED - the union-adjacent next thread), the
+  "Mismatch between schema and batches" class, and `type_coercion`.
+- UnsupportedSQLError - 2 (simple CASE, window in WHERE).
+
+Set operations (UNION/INTERSECT/EXCEPT) are DONE - emitted via the raw_sql
+escape hatch in `rust_ir` (`_emit_union` / `_emit_set_operation`); 14 of 24
+set-op queries pass, no Rust change.
 
 ## Benchmark setup (important)
 
