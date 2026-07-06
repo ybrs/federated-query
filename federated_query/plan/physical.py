@@ -367,13 +367,22 @@ def _right_output_name(physical_name: str, left_names) -> str:
     """Right-side output name under the left-wins collision rule.
 
     A right column whose name collides with a left column is renamed
-    ``right_<name>``; otherwise it keeps its name. The one rule shared by the
-    join SELECT list, the output schema, and the parent-resolution alias map, so
-    all three agree on the join's columns.
+    ``right_<name>``; if THAT also collides (a chained self-join where an
+    earlier join already produced ``right_<name>`` - e.g. q31's ss1..ss3 /
+    ws1..ws3), it is suffixed ``right_<name>_1``, ``_2`` ... until unique. Two
+    distinct right columns never map to the same output (their bases differ),
+    so this depends only on ``left_names`` and stays the ONE rule the join
+    SELECT list, the output schema, and the parent alias map all share.
     """
-    if physical_name in left_names:
-        return f"right_{physical_name}"
-    return physical_name
+    if physical_name not in left_names:
+        return physical_name
+    candidate = f"right_{physical_name}"
+    unique = candidate
+    suffix = 1
+    while unique in left_names:
+        unique = f"{candidate}_{suffix}"
+        suffix += 1
+    return unique
 
 
 def _evaluate_expression_type(expr, input_schema, alias_map) -> pa.DataType:
