@@ -566,3 +566,27 @@ def test_qualified_reference_case_insensitive_to_derived_alias(catalog_with_test
         "WHERE catalog.id > 0"
     )
     assert binder.bind(parser.parse_to_logical_plan(sql, catalog_with_test_data)) is not None
+
+
+def test_order_by_aggregate_expression_binds_to_output(catalog_with_test_data):
+    """ORDER BY sum(x) where the SELECT computes sum(x) refers to that computed
+    output column, not a re-applied aggregate over the aggregate's own output
+    (which holds the sum, not raw x - the q42 cross-source failure).
+    """
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = (
+        "SELECT age, sum(id) FROM testdb.public.users "
+        "GROUP BY age ORDER BY sum(id) DESC"
+    )
+    bound = binder.bind(parser.parse_to_logical_plan(sql, catalog_with_test_data))
+
+    from federated_query.plan.logical import Sort
+    from federated_query.plan.expressions import ColumnRef, FunctionCall
+
+    assert isinstance(bound, Sort)
+    key = bound.sort_keys[0]
+    # Resolved to the aggregate OUTPUT column, not left as a FunctionCall to
+    # recompute over the aggregate's output.
+    assert isinstance(key, ColumnRef)
+    assert not isinstance(key, FunctionCall)

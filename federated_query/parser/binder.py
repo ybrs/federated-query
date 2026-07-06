@@ -473,8 +473,29 @@ class Binder:
                         key.model_copy(update={"data_type": expr.get_type()})
                     )
                     continue
-            bound_keys.append(self._bind_expression(key))
+            bound = self._bind_expression(key)
+            match = self._match_aggregate_output(bound, aggregate)
+            bound_keys.append(bound if match is None else match)
         return bound_keys
+
+    def _match_aggregate_output(
+        self, bound_key: Expression, aggregate: Aggregate
+    ) -> Optional[Expression]:
+        """The aggregate output a bound ORDER BY key equals, or None.
+
+        `ORDER BY sum(x)` where the SELECT already computes `sum(x)` refers to
+        that computed output - it must NOT be re-applied over the aggregate's own
+        output (which holds the sum, not the raw x, so `sum(in_0.x)` fails to
+        resolve; q42). When the bound key equals an output expression, reference
+        that output column by its name instead.
+        """
+        outputs = aggregate.output_names or []
+        for index, expr in enumerate(aggregate.aggregates):
+            if index < len(outputs) and expr == bound_key:
+                return ColumnRef.create(
+                    table=None, column=outputs[index], data_type=expr.get_type()
+                )
+        return None
 
     def _bind_sort_keys_for_projection(
         self,
