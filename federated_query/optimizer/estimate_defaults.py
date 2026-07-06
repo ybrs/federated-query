@@ -53,6 +53,30 @@ DEFAULT_NULL_FRACTION = 0.05
 TRANSFER_WEIGHT = 1.0
 
 
+def apply_conjunct_term(is_equi, value, denom, selectivity, equi_count):
+    """Fold one join conjunct into the running estimate terms: an equi key
+    multiplies the NDV denominator and counts toward the composite cap; a
+    non-equi conjunct multiplies the selectivity."""
+    if is_equi:
+        return denom * value, selectivity, equi_count + 1
+    return denom, selectivity * value, equi_count
+
+
+def cap_composite_denom(denom, equi_count, left_rows, right_rows):
+    """Cap a COMPOSITE key's NDV denominator at the smaller side's rows.
+
+    The denominator is the product of per-column NDVs, which assumes the
+    columns are independent. For a single key that product is just the key's
+    NDV and is left alone (it can legitimately exceed min(rows) - a small
+    table referencing a big unique key). For a MULTI-column key the product
+    over-counts the distinct combinations, which can never exceed the smaller
+    side's rows, so it is capped there (else a composite FK join is grossly
+    under-estimated - TPC-H q09's fact island)."""
+    if equi_count < 2:
+        return denom
+    return min(denom, max(1.0, float(min(left_rows, right_rows))))
+
+
 def larger_estimated_side(left, right):
     """The side with the greater cost-estimated row count, or None when either
     estimate is missing or the two tie. Shared by the reduction orientation

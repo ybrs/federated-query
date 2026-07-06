@@ -45,6 +45,8 @@ from ..optimizer.estimate_defaults import (
     DEFAULT_RANGE_SELECTIVITY,
     DEFAULT_ROW_COUNT,
     CardinalityEstimate,
+    apply_conjunct_term,
+    cap_composite_denom,
     combine_defaults,
 )
 from ..optimizer.pushdown import bare_names
@@ -663,26 +665,46 @@ class CostModel:
         )
 
     def _tracked_inner_rows(self, join, left, right) -> Tuple[int, List[str]]:
-        """Inner-join rows: cross product x each conjunct's selectivity."""
-        rows = float(left.rows) * float(right.rows)
-        defaults: List[str] = []
-        for conjunct in split_conjuncts(join.condition):
-            factor, conjunct_defaults = self._conjunct_factor(
-                join, conjunct, left, right
-            )
-            rows *= factor
-            defaults.extend(conjunct_defaults)
+        """Inner-join rows: cross product / capped key NDV x non-equi
+        selectivity. The equi-key denominator is the product of per-column
+        NDVs; that product assumes the columns are INDEPENDENT and wildly
+        over-counts a composite (multi-column FK) key, so it is capped at the
+        smaller side's rows - the distinct key COMBINATIONS can never exceed
+        that - or a foreign-key join is grossly under-estimated."""
+        denom, selectivity, equi_count, defaults = self._conjunct_terms(
+            join, left, right)
+        denom = cap_composite_denom(denom, equi_count, left.rows, right.rows)
+        rows = float(left.rows) * float(right.rows) * selectivity / denom
         return max(1, int(rows)), defaults
 
-    def _conjunct_factor(self, join, conjunct, left, right) -> Tuple[float, List[str]]:
-        """One conjunct's selectivity: 1/max(ndv, ndv) for a cross-side equi
-        key pair, the generic tracked selectivity for anything else."""
+    def _conjunct_terms(self, join, left, right):
+        """Accumulate the equi-key NDV denominator (product), the non-equi
+        selectivity, and the equi-conjunct COUNT across the join's conjuncts
+        (the count decides whether the composite cap applies)."""
+        denom = 1.0
+        selectivity = 1.0
+        equi_count = 0
+        defaults: List[str] = []
+        for conjunct in split_conjuncts(join.condition):
+            is_equi, value, conjunct_defaults = self._conjunct_term(
+                join, conjunct, left, right
+            )
+            denom, selectivity, equi_count = apply_conjunct_term(
+                is_equi, value, denom, selectivity, equi_count)
+            defaults.extend(conjunct_defaults)
+        return denom, selectivity, equi_count, defaults
+
+    def _conjunct_term(self, join, conjunct, left, right):
+        """(is_equi, value, defaults): for a cross-side equi key the value is
+        its NDV (a denominator term); for anything else it is the tracked
+        selectivity (a multiplier)."""
         pair = self._equi_key_pair(join, conjunct)
         if pair is None:
-            return self._tracked_selectivity(conjunct, None, "join")
+            factor, defaults = self._tracked_selectivity(conjunct, None, "join")
+            return False, factor, defaults
         left_ndv, left_defaults = self._side_key_ndv(join.left, pair[0], left.rows)
         right_ndv, right_defaults = self._side_key_ndv(join.right, pair[1], right.rows)
-        return 1.0 / max(left_ndv, right_ndv), left_defaults + right_defaults
+        return True, max(left_ndv, right_ndv), left_defaults + right_defaults
 
     def _equi_key_pair(self, join, conjunct):
         """(left_ref, right_ref) for a column=column equality across the two

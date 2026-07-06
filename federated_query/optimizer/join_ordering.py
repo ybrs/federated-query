@@ -37,6 +37,8 @@ from .estimate_defaults import (
     DEFAULT_NDV_FRACTION,
     TRANSFER_WEIGHT,
     CardinalityEstimate,
+    apply_conjunct_term,
+    cap_composite_denom,
     combine_defaults,
 )
 from .join_graph import (
@@ -708,31 +710,48 @@ class CostModelRegionEstimator(RegionEstimator):
         return self.cost_model.estimate(plan)
 
     def join_estimate(self, region, left, atom_index, atom, conjuncts):
-        """left x atom, reduced by every placed conjunct: the NDV formula for
-        equi keys, tracked selectivity for everything else."""
-        rows = float(left.rows) * float(atom.rows)
-        defaults: List[str] = []
-        for conjunct in conjuncts:
-            factor, conjunct_defaults = self._factor(
-                region, conjunct, left, atom, atom_index
-            )
-            rows *= factor
-            defaults.extend(conjunct_defaults)
-        # The step's estimate: the sides' provenance plus whatever defaults
-        # the conjuncts' selectivities needed.
+        """left x atom / capped key NDV x non-equi selectivity. The equi-key
+        denominator (product of per-column NDVs) assumes the columns are
+        independent and over-counts a composite key, so it is capped at the
+        smaller side's rows - distinct key COMBINATIONS cannot exceed that -
+        or a foreign-key join is grossly under-estimated (q09's fact island)."""
+        denom, selectivity, equi_count, defaults = self._step_terms(
+            region, left, atom, atom_index, conjuncts)
+        denom = cap_composite_denom(denom, equi_count, left.rows, atom.rows)
+        rows = float(left.rows) * float(atom.rows) * selectivity / denom
+        # The step's estimate carries both sides' provenance plus whatever
+        # NDV/selectivity defaults the conjuncts needed, for EXPLAIN.
         return CardinalityEstimate.create(
             rows=max(1, int(rows)),
             defaults_used=combine_defaults([left, atom], defaults),
         )
 
-    def _factor(self, region, conjunct, left, atom, atom_index):
-        """One conjunct's multiplicative selectivity at this join step."""
+    def _step_terms(self, region, left, atom, atom_index, conjuncts):
+        """The equi-key NDV denominator, non-equi selectivity and equi count
+        for one join step (the count decides the composite cap)."""
+        denom = 1.0
+        selectivity = 1.0
+        equi_count = 0
+        defaults: List[str] = []
+        for conjunct in conjuncts:
+            is_equi, value, conjunct_defaults = self._term(
+                region, conjunct, left, atom, atom_index)
+            denom, selectivity, equi_count = apply_conjunct_term(
+                is_equi, value, denom, selectivity, equi_count)
+            defaults.extend(conjunct_defaults)
+        return denom, selectivity, equi_count, defaults
+
+    def _term(self, region, conjunct, left, atom, atom_index):
+        """(is_equi, value, defaults) for one conjunct: an equi key's value is
+        its NDV; anything else's is the tracked selectivity."""
         if not conjunct.is_equi or len(conjunct.atom_indexes) != 2:
-            return self.cost_model.conjunct_selectivity(conjunct.expression, "join")
+            factor, defaults = self.cost_model.conjunct_selectivity(
+                conjunct.expression, "join")
+            return False, factor, defaults
         atom_ref, other_ref = _orient_refs(region, conjunct, atom_index)
         atom_ndv, atom_defaults = self._ref_ndv(region, atom_ref, atom.rows)
         other_ndv, other_defaults = self._ref_ndv(region, other_ref, left.rows)
-        return 1.0 / max(atom_ndv, other_ndv), atom_defaults + other_defaults
+        return True, max(atom_ndv, other_ndv), atom_defaults + other_defaults
 
     def _ref_ndv(self, region, ref, side_rows: int):
         """A key's NDV clamped by its side's current rows; the fallback is the
