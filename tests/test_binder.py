@@ -502,3 +502,46 @@ def test_cte_column_list_matching_arity_is_allowed(catalog_with_test_data):
     sql = "WITH t(a, b) AS (SELECT id, name FROM testdb.public.users) SELECT a, b FROM t"
     plan = parser.parse_to_logical_plan(sql, catalog_with_test_data)
     assert binder.bind(plan) is not None
+
+
+def test_columns_for_join_table_over_collects_all_referenced():
+    """A join input's read-set over-collects every referenced column, whatever
+    table each was written against; the binder drops the ones a table lacks.
+
+    The parser does not attribute columns to tables (that is the binder's job
+    once references are qualified), so it over-collects - otherwise an
+    unqualified aggregate measure was lost from the fact scan (q03).
+    """
+    parser = Parser()
+    usage = {"orders": ["order_id"], None: ["amount"], "users": ["id"]}
+    assert set(parser._columns_for_join_table(usage)) == {"order_id", "amount", "id"}
+
+
+def test_unqualified_aggregate_measure_reaches_its_table_scan(catalog_with_test_data):
+    """An unqualified aggregate measure over a join reaches the read-set of the
+    table that owns it (and no other), so a cross-source aggregate can fetch it.
+
+    The parser over-collects the measure onto every input; the binder keeps it
+    only where the catalog confirms the column exists.
+    """
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = (
+        "SELECT sum(amount) FROM testdb.public.orders, testdb.public.users "
+        "WHERE orders.order_id = users.id"
+    )
+    bound = binder.bind(parser.parse_to_logical_plan(sql, catalog_with_test_data))
+
+    from federated_query.plan.logical import Scan
+
+    scans = {}
+
+    def walk(node):
+        if isinstance(node, Scan):
+            scans[node.table_name] = node.columns
+        for child in node.children():
+            walk(child)
+
+    walk(bound)
+    assert "amount" in scans["orders"]
+    assert "amount" not in scans["users"]

@@ -489,7 +489,7 @@ class Parser:
             return self._values_relation(table_expr)
         self._reject_unsupported_relation(table_expr)
         table_alias = self._extract_table_alias(table_expr)
-        columns = self._columns_for_join_table(column_usage, table_alias)
+        columns = self._columns_for_join_table(column_usage)
         cte_ref = self._maybe_cte_ref(table_expr, columns)
         if cte_ref is not None:
             return cte_ref
@@ -752,20 +752,32 @@ class Parser:
         return usage
 
     def _columns_for_join_table(
-        self,
-        usage: Dict[Optional[str], List[str]],
-        table_alias: Optional[str],
+        self, usage: Dict[Optional[str], List[str]]
     ) -> List[str]:
-        """Return column list for a specific table in a join."""
-        key = table_alias
-        if key in usage:
-            columns = usage[key]
-            if "*" in columns:
-                return ["*"]
-            return list(columns)
-        if None in usage and usage[None]:
+        """The over-collected read-set for one join input: every column the
+        query references, whatever table each was written against.
+
+        The parser does not attribute a column to a table - resolving and
+        qualifying every reference is the binder's job - so it over-collects and
+        lets ``_bind_scan`` drop the names this table does not have (its
+        docstring: "may include names of other relations ... names not present
+        in this table are dropped"). Over-collecting is why an unqualified
+        aggregate measure (q03's ``sum(ss_ext_sales_price)``) is not lost: it
+        rides every input's read-set and survives on the one table that has it.
+        A star anywhere means read everything.
+        """
+        columns: List[str] = []
+        for names in usage.values():
+            self._merge_referenced_names(names, columns)
+        if "*" in columns:
             return ["*"]
-        return ["*"]
+        return columns
+
+    def _merge_referenced_names(self, names: List[str], columns: List[str]) -> None:
+        """Append the not-yet-seen names to the accumulator, preserving order."""
+        for name in names:
+            if name not in columns:
+                columns.append(name)
 
     def _extract_join_type(self, join_clause: exp.Join) -> JoinType:
         """Map a parsed JOIN's side/kind to a JoinType, raising on anything else.
