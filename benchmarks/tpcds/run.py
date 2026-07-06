@@ -82,15 +82,32 @@ def _apply_memory_limit(memory_limit_mb):
     resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
 
 
-def _engine_worker(engine_sql, db_path, source_name, memory_limit_mb, result_queue):
-    """Child-process entry: build a fresh runtime, run one query, send it back."""
+def _evaluate_worker(engine_sql, original_sql, db_path, source_name,
+                     memory_limit_mb, decimals, result_queue):
+    """Child-process entry: run the query through the engine AND the DuckDB
+    oracle in ONE process, compare, and return the verdict.
+
+    Engine and oracle share the process so the engine's read-write DuckDB open
+    never collides with the oracle's read-only lock across processes (the
+    failure mode when the oracle was held open in the parent)."""
     _apply_memory_limit(memory_limit_mb)
     try:
         runtime = build_runtime(db_path, source_name)
-        result = runtime.execute(engine_sql)
-        result_queue.put(("ok", arrow_to_rows(result)))
+        engine_rows = arrow_to_rows(runtime.execute(engine_sql))
     except Exception as error:
         result_queue.put(("error", _error_text(error)))
+        return
+    try:
+        oracle = duckdb.connect(db_path, read_only=True)
+        oracle_rows = oracle.execute(original_sql).fetchall()
+    except Exception as error:
+        result_queue.put(("error", "oracle: " + _error_text(error)))
+        return
+    match, reason = compare_results(engine_rows, oracle_rows, decimals)
+    result_queue.put((
+        "done",
+        ("PASS" if match else "MISMATCH", reason, len(engine_rows), len(oracle_rows)),
+    ))
 
 
 def _finish_stalled_worker(process, timeout_s):
@@ -106,13 +123,15 @@ def _finish_stalled_worker(process, timeout_s):
     return None, reason
 
 
-def run_engine_isolated(engine_sql, db_path, options):
-    """Run one query in a child process bounded by timeout and memory cap."""
+def _run_isolated(engine_sql, original_sql, db_path, options):
+    """Run one query's engine+oracle evaluation in a child bounded by timeout
+    and memory. Returns (outcome_tuple, None) or (None, error_text)."""
     context = multiprocessing.get_context("fork")
     result_queue = context.Queue()
     process = context.Process(
-        target=_engine_worker,
-        args=(engine_sql, db_path, options.source, options.memory_limit, result_queue),
+        target=_evaluate_worker,
+        args=(engine_sql, original_sql, db_path, options.source,
+              options.memory_limit, options.decimals, result_queue),
     )
     process.start()
     try:
@@ -120,24 +139,23 @@ def run_engine_isolated(engine_sql, db_path, options):
     except queue_module.Empty:
         return _finish_stalled_worker(process, options.timeout)
     process.join()
-    if status == "ok":
+    if status == "done":
         return payload, None
     return None, payload
 
 
-def evaluate_query(oracle, path, db_path, options):
-    """Run one query through engine and oracle and classify the outcome."""
+def evaluate_query(path, db_path, options):
+    """Run one query through the isolated engine+oracle worker; classify it."""
     name = os.path.splitext(os.path.basename(path))[0]
     original_sql = _read_query(path)
     engine_sql = qualify_query(original_sql, options.source, options.schema, ENGINE_DIALECT)
-    engine_rows, error = run_engine_isolated(engine_sql, db_path, options)
+    outcome, error = _run_isolated(engine_sql, original_sql, db_path, options)
     if error is not None:
         return {"name": name, "status": "ERROR", "reason": error,
                 "engine_rows": None, "oracle_rows": None}
-    oracle_rows = oracle.execute(original_sql).fetchall()
-    match, reason = compare_results(engine_rows, oracle_rows, options.decimals)
-    return {"name": name, "status": "PASS" if match else "MISMATCH", "reason": reason,
-            "engine_rows": len(engine_rows), "oracle_rows": len(oracle_rows)}
+    status, reason, engine_rows, oracle_rows = outcome
+    return {"name": name, "status": status, "reason": reason,
+            "engine_rows": engine_rows, "oracle_rows": oracle_rows}
 
 
 def _select_query_files(queries_dir, only):
@@ -317,10 +335,9 @@ def run(options):
     paths = _select_query_files(options.queries_dir, options.only)
     if not paths:
         raise SystemExit("No query files found in {0}".format(options.queries_dir))
-    oracle = duckdb.connect(options.db, read_only=True)
     results = []
     for path in paths:
-        result = evaluate_query(oracle, path, options.db, options)
+        result = evaluate_query(path, options.db, options)
         results.append(result)
         _print_result(result)
     _print_summary(results)
