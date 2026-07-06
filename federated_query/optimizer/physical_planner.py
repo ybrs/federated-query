@@ -59,6 +59,7 @@ from ..plan.expressions import (
     Expression,
     split_conjuncts as _split_and,
 )
+from .estimate_defaults import larger_estimated_side
 from .single_source_pushdown import SingleSourcePushdown, same_source
 from ..parser.errors import UnsupportedSQLError
 from typing import List, Tuple
@@ -357,6 +358,7 @@ class PhysicalPlanner:
             order_by_ascending=scan.order_by_ascending,
             order_by_nulls=scan.order_by_nulls,
             distinct=scan.distinct,
+            estimated_rows=scan.estimated_rows,
         )
 
     def _plan_filter(self, filter_node: Filter) -> PhysicalFilter:
@@ -675,6 +677,12 @@ class PhysicalPlanner:
         """
         if join_type != JoinType.INNER:
             return "right"
+        # Build the SMALLER estimated side when the cost model sized both (also
+        # what the reduction reduces the other side against - one shared helper
+        # keeps EXPLAIN's dynamic filter on the side that really gets reduced).
+        larger = larger_estimated_side(left_plan, right_plan)
+        if larger is not None:
+            return "left" if larger is right_plan else "right"
         if self._has_selective_filter(left_plan) and not self._has_selective_filter(
             right_plan
         ):

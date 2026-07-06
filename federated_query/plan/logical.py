@@ -149,6 +149,10 @@ class Scan(LogicalPlanNode):
     order_by_ascending: Optional[List[bool]] = None  # ASC/DESC for each key
     order_by_nulls: Optional[List[Optional[str]]] = None  # NULLS FIRST/LAST per key
     distinct: bool = False
+    # The cost model's row estimate for this scan under its local filters,
+    # recorded by join ordering so the downstream reduction can orient by size
+    # (reduce the big side); None when the scan was not cost-estimated.
+    estimated_rows: Optional[int] = None
 
     @classmethod
     def create(
@@ -171,6 +175,7 @@ class Scan(LogicalPlanNode):
         order_by_ascending: Optional[List[bool]] = None,
         order_by_nulls: Optional[List[Optional[str]]] = None,
         distinct: bool = False,
+        estimated_rows: Optional[int] = None,
     ) -> "Scan":
         """Build a Scan leaf reading columns from a source table.
         Sanctioned construction path; prefer model_copy when deriving from an existing node."""
@@ -192,6 +197,7 @@ class Scan(LogicalPlanNode):
             order_by_ascending=order_by_ascending,
             order_by_nulls=order_by_nulls,
             distinct=distinct,
+            estimated_rows=estimated_rows,
         )
 
     def children(self) -> List[LogicalPlanNode]:

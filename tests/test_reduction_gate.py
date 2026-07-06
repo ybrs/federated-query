@@ -97,3 +97,98 @@ def test_reducible_base_refuses_a_renamed_key():
         output_names=["renamed_key", "v0"],
     )
     assert _reducible_probe_base(proj, "renamed_key") is None
+
+
+def test_scan_estimated_rows_survives_model_copy():
+    """The cost estimate annotation must survive the model_copy derivations
+    that later optimizer rules use (a rebuild via Scan.create would drop it -
+    this pins that deriving with model_copy keeps it)."""
+    from federated_query.plan.logical import Scan as LogicalScan
+    scan = LogicalScan.create(
+        datasource="duck", schema_name="main", table_name="partsupp",
+        columns=["ps_partkey", "ps_suppkey"], alias="ps", estimated_rows=800000,
+    )
+    derived = scan.model_copy(update={"columns": ["ps_partkey"]})
+    assert derived.estimated_rows == 800000
+
+
+def _est_scan(table, alias, columns, rows, **kw):
+    """A plain injectable scan carrying a cost estimate."""
+    return _scan(table, alias, columns, estimated_rows=rows, **kw)
+
+
+def _inner(left, right, left_key, right_key, build="right"):
+    """An INNER hash join on a single equi key."""
+    return PhysicalHashJoin(
+        left=left, right=right, join_type=JoinType.INNER,
+        left_keys=[left_key], right_keys=[right_key], build_side=build,
+    )
+
+
+def test_inner_reduces_the_larger_estimated_side():
+    """The q11 fix: the bigger injectable side (partsupp 800k) becomes the
+    probe (reduced), the smaller (supplier 400) donates keys - regardless of
+    the structural _probe_preference that used to pick the small remote."""
+    from federated_query.executor.rust_ir import _cardinality_probe
+    big = _est_scan("partsupp", "ps", ["ps_partkey", "ps_suppkey"], 800000)
+    small = _est_scan("supplier", "s", ["s_suppkey"], 400)
+    # small on the left, big on the right (the shape _probe_preference got wrong)
+    join = _inner(small, big, _col("s", "s_suppkey"), _col("ps", "ps_suppkey"))
+    assert _cardinality_probe(join) is big
+    build, probe, _, _ = _orient_join(join)
+    assert probe is big and build is small
+
+
+def test_inner_tie_falls_back_to_structural_choice():
+    """Equal estimates (both defaulted) must NOT pick a side by cardinality -
+    the cardinality path returns None so the existing heuristic runs."""
+    from federated_query.executor.rust_ir import _cardinality_probe
+    a = _est_scan("a", "a", ["k"], 1000)
+    b = _est_scan("b", "b", ["k"], 1000)
+    join = _inner(a, b, _col("a", "k"), _col("b", "k"))
+    assert _cardinality_probe(join) is None
+
+
+def test_inner_missing_estimate_falls_back():
+    """When one side has no estimate the cardinality path declines."""
+    from federated_query.executor.rust_ir import _cardinality_probe
+    a = _est_scan("a", "a", ["k"], 1000)
+    b = _scan("b", "b", ["k"])  # no estimated_rows
+    join = _inner(a, b, _col("a", "k"), _col("b", "k"))
+    assert _cardinality_probe(join) is None
+
+
+def test_semi_and_left_orientation_unchanged():
+    """The cardinality branch is INNER-only; SEMI/LEFT keep fixed roles."""
+    big = _est_scan("li", "l", ["l_p", "l_q"], 6000000)
+    small = _est_scan("part", "p", ["p_id"], 200)
+    semi = PhysicalHashJoin(
+        left=big, right=small, join_type=JoinType.SEMI,
+        left_keys=[_col("l", "l_p")], right_keys=[_col("p", "p_id")], build_side="right",
+    )
+    build, probe, _, _ = _orient_join(semi)
+    assert probe is big and build is small  # SEMI: preserved left is the probe
+
+
+def test_remote_orientation_size_is_max_base_not_join_output():
+    """A collapsed remote's orientation size must be its LARGEST base scan,
+    not the join OUTPUT estimate - a multi-join output under-counts via
+    composite-key correlation, which would make a fact island look tiny and
+    wrongly lose the reduction to a dim (the q09 regression). Here a fact
+    island (6M scan JOIN 800k scan, output annotated a bogus-small 3000) must
+    orient-size as 6,000,000."""
+    from federated_query.optimizer.single_source_pushdown import SingleSourcePushdown
+    from federated_query.catalog.catalog import Catalog
+    from federated_query.plan.logical import Join as LJoin, Scan as LScan, JoinType as LJT
+    from federated_query.plan.expressions import BinaryOp as LBinOp, BinaryOpType as LBOp
+    big = LScan.create(datasource="d", schema_name="m", table_name="lineitem",
+                       columns=["l_k"], alias="l", estimated_rows=6_000_000)
+    mid = LScan.create(datasource="d", schema_name="m", table_name="partsupp",
+                       columns=["ps_k"], alias="ps", estimated_rows=800_000)
+    join = LJoin.create(
+        left=big, right=mid, join_type=LJT.INNER,
+        condition=LBinOp(op=LBOp.EQ, left=_col("l", "l_k"), right=_col("ps", "ps_k")),
+        estimated_rows=3000,  # the under-counted join OUTPUT - must NOT be used
+    )
+    sizer = SingleSourcePushdown(Catalog())
+    assert sizer._root_estimate(join) == 6_000_000

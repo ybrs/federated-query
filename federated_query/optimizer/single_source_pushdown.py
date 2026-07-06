@@ -197,7 +197,30 @@ class SingleSourcePushdown:
             return None
         if not context.select_items and not self._expand_star_select(context):
             return None
-        return self._finish(context)
+        return self._finish(context, self._root_estimate(node))
+
+    def _root_estimate(self, node: LogicalPlanNode) -> Optional[int]:
+        """The reduction-orientation size of a collapsed subtree: the LARGEST
+        base scan it reads (reliable catalog sizes under local filters), NOT the
+        join OUTPUT estimate. A multi-join output UNDER-counts via composite-key
+        correlation (dividing by ndv(k1)*ndv(k2) as if independent), so a fact
+        island would look tiny and wrongly lose the reduction to a dim (TPC-H
+        q09). Max base can never make a fact-containing remote look small; it is
+        a safe over-estimate (a heavily filtered fact just reduces cheaply)."""
+        sizes: List[int] = []
+        self._collect_scan_sizes(node, sizes)
+        if not sizes:
+            return None
+        return max(sizes)
+
+    def _collect_scan_sizes(self, node: LogicalPlanNode, sizes: List[int]) -> None:
+        """Gather every base scan's cost estimate in the subtree."""
+        if isinstance(node, Scan):
+            if node.estimated_rows is not None:
+                sizes.append(node.estimated_rows)
+            return
+        for child in node.children():
+            self._collect_scan_sizes(child, sizes)
 
     def render_correlated_sql(self, node: LogicalPlanNode, scan_names) -> Optional[str]:
         """Render a single-source subtree to SQL with base scans named for the
@@ -276,7 +299,9 @@ class SingleSourcePushdown:
             return True
         return context.has_computed and not context.has_aggregate
 
-    def _finish(self, context: _PushContext) -> Optional[PhysicalRemoteQuery]:
+    def _finish(
+        self, context: _PushContext, estimated_rows: Optional[int]
+    ) -> Optional[PhysicalRemoteQuery]:
         """Resolve the connection, render SQL, and build the physical node."""
         datasource = self._resolve_datasource(context)
         if datasource is None:
@@ -296,6 +321,7 @@ class SingleSourcePushdown:
             query_ast=self._render(context),
             output_names=context.output_names,
             column_alias_map=context.column_aliases,
+            estimated_rows=estimated_rows,
         )
 
     def _expose_computed_outputs(self, context: "_PushContext") -> None:

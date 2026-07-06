@@ -1,4 +1,4 @@
-# Status: eleven phases live; fair federated gap 38.6x -> 3.16x
+# Status: twelve phases live; fair federated gap 38.6x -> 3.08x
 
 State of the work. Facts only: what exists, what passes, what is measured,
 what is not done. Previous phase (Rust cutover, N-K decorrelation, merge-engine
@@ -13,7 +13,7 @@ merge-engine-datafusion
             `- feature/cost-based-optimizer   <-- HEAD (this document)
 ```
 
-Test suite: **1159 passed, 3 skipped, 39 xfailed, 0 failed**
+Test suite: **1166 passed, 3 skipped, 39 xfailed, 0 failed**
 (`POSTGRES_DB=duckpoc python -m pytest -q`). `make lint` green.
 
 ## What was built on this branch
@@ -272,17 +272,43 @@ correct. q17 174 -> 73ms (6.6x -> 2.8x); fedparquet q17 272 -> 81ms; NO >40ms
 regression anywhere (INNER/SEMI paths untouched). Eleven-phase run 38.55x ->
 3.16x; single-source SF1 1.97x.
 
+## Reduction orientation by cost cardinality (q11, commit 64b7feb)
+
+The cost model was used ONLY for join ordering; the dynamic-filter reduction
+re-decided build/probe at IR-build with a STRUCTURAL heuristic
+(_probe_preference: remote>scan), which mis-sized a small dim collapsed into a
+remote query - q11 shipped the 800k partsupp WHOLE and injected into the
+400-row German-supplier dim (9.2x, worst ratio). Fix: carry the estimate the
+optimizer already computed to the orientation.
+- estimated_rows on logical Scan / PhysicalScan / PhysicalRemoteQuery, threaded
+  from join ordering's atom estimate (_emit_atom annotates a Scan leaf) and the
+  physical planner / single_source_pushdown.
+- _orient_join (INNER) reduces the LARGER estimated side; _cardinality_probe
+  declines (falls back to the old heuristic) on missing/tied estimate or a
+  non-injectable larger side, so the reduction SET is unchanged. Shared
+  larger_estimated_side helper also drives _choose_build_side (build smaller) so
+  EXPLAIN marks the truly-reduced side. SEMI/LEFT untouched. Orientation is
+  performance-only (bindings map by identity, the coordinator re-checks the key).
+- A remote's orientation size is its LARGEST BASE SCAN, not the join OUTPUT: a
+  multi-join output under-counts via composite-key correlation (fact island
+  lineitem+partsupp+orders estimated 3522), which had flipped q09 to 1207ms -
+  max base keeps a fact-containing remote from ever looking small.
+
+Gate (report-result-64b7feb.md): fedpgduck SF1 3392 -> 3280ms (3.08x), all 132
+correct. q11 142 -> 75ms (9.2x -> 4.0x), q09 467 -> 424ms, q02 down; NO >40ms
+regression anywhere. Twelve-phase run 38.55x -> 3.08x; single-source SF1 1.96x.
+
 ## Known gaps / next work (in priority order from the data)
 
-Fair-federated SF1 3.16x, SF0.1 4.41x, all correct.
-1. **q09 (438ms, biggest absolute)**: even reduced-by-%green%-parts lineitem is
-   ~320k rows via a temp-table semi-join (199ms) + a 6-way coordinator join.
-   Mostly genuine distributed work; limited headroom.
-2. **q07 (294ms/5.9x), q13 (294ms/3.0x, 1.5M orders LEFT-count inherent),
-   q10 (260ms/3.9x)**: plan/transfer tail.
-3. **Small-scale fixed overhead**: SF0.1 4.41x is per-query constants, not plans.
-4. **TRANSFER_WEIGHT calibration** (1.0), **CTE materialize-once**, duck guard
-   NDV hint.
+Fair-federated SF1 3.08x, SF0.1 4.33x, all correct.
+1. **q09 (424ms, biggest absolute), q07 (5.9x), q13 (1.5M-order LEFT-count,
+   inherent), q10 (customer 150k preserved-side)**: the plan/transfer tail.
+2. **Cost-model composite-key correlation under-count**: a multi-key fact join
+   (lineitem<->partsupp on partkey+suppkey) estimates ~1000x low. Worked around
+   in the reduction (max-base), but the join-ORDERING estimate is still off -
+   the deeper fix is a correlation-aware NDV for composite FKs.
+3. **Small-scale fixed overhead**: SF0.1 4.33x is per-query constants, not plans.
+4. **TRANSFER_WEIGHT calibration** (1.0), **CTE materialize-once**.
 5. **fedqrs missing operators** (18 xfails); `enable_decorrelation` unwired.
 
 ## How to run

@@ -434,3 +434,60 @@ def test_left_join_aggregate_subquery_probe_is_reduced():
         " AND l.l_q > (SELECT avg(l2.l_q) FROM li l2 WHERE l2.l_p = p.p_id)"
     ).fetchone()[0]
     assert result.column("s").to_pylist() == [expected]
+
+
+def test_reduction_reduces_the_larger_side_by_cardinality():
+    """The q11 shape: a big fact scan INNER-joined to a tiny selective dim
+    that collapsed into a remote query. The reduction must inject into the
+    BIG fact (reduce it), not the tiny dim - driven by the cost estimate, not
+    the structural remote>scan heuristic. Differential-checked."""
+    import duckdb as duckdb_module
+    from federated_query.catalog import Catalog
+    from federated_query.cli.fedq import FedQRuntime
+    from federated_query.config import Config
+    from federated_query.datasources.duckdb import DuckDBDataSource
+    from tests.duckdb_tmp import duckdb_path
+
+    dims = DuckDBDataSource("dims", {"path": duckdb_path(), "read_only": False})
+    dims.connect()
+    dims.connection.execute(
+        "CREATE TABLE supplier (s_id INTEGER, s_nat VARCHAR);"
+        "INSERT INTO supplier SELECT g, 'N' || (g % 25) FROM range(0, 1000) t(g);"
+    )
+    facts = DuckDBDataSource("facts", {"path": duckdb_path(), "read_only": False})
+    facts.connect()
+    facts.connection.execute(
+        "CREATE TABLE partsupp (ps_p INTEGER, ps_s INTEGER, ps_cost INTEGER);"
+        "INSERT INTO partsupp SELECT g % 8000, g % 1000, g % 100"
+        " FROM range(0, 80000) t(g);"
+    )
+    catalog = Catalog()
+    catalog.register_datasource(dims)
+    catalog.register_datasource(facts)
+    catalog.load_metadata()
+    runtime = FedQRuntime(catalog, Config())
+    sql = (
+        "SELECT sum(p.ps_cost) AS s "
+        "FROM facts.main.partsupp p, dims.main.supplier s "
+        "WHERE p.ps_s = s.s_id AND s.s_nat = 'N3'"
+    )
+    plan = runtime.query_executor._plan_pipeline(sql, None)
+    ir = build_ir(plan)
+    fact_injections = []
+    for step in ir["steps"]:
+        if step.get("op") == "injected_scan" and step["datasource"] == "facts":
+            fact_injections.append(step)
+    assert fact_injections, f"partsupp (the big side) not reduced; steps: {ir['steps']}"
+    result = runtime.execute(sql)
+    oracle = duckdb_module.connect()
+    oracle.execute(
+        "CREATE TABLE supplier AS SELECT g AS s_id, 'N' || (g % 25) AS s_nat"
+        " FROM range(0, 1000) t(g);"
+        "CREATE TABLE partsupp AS SELECT g % 8000 AS ps_p, g % 1000 AS ps_s,"
+        " g % 100 AS ps_cost FROM range(0, 80000) t(g);"
+    )
+    expected = oracle.execute(
+        "SELECT sum(p.ps_cost) FROM partsupp p, supplier s"
+        " WHERE p.ps_s = s.s_id AND s.s_nat = 'N3'"
+    ).fetchone()[0]
+    assert result.column("s").to_pylist() == [expected]
