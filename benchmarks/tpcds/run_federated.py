@@ -129,10 +129,19 @@ def build_fedq(db_path, options):
 
 
 def build_oracle(db_path, options):
-    """Open DuckDB over the dataset with PostgreSQL attached via the connector."""
+    """Open DuckDB over the dataset with PostgreSQL attached via the connector.
+
+    Disable the postgres extension's filter pushdown: it is buggy (and flagged
+    'experimental') - on q59 it mis-pushes a filter to Postgres and the scan
+    returns 0 rows, so the oracle produced a wrong 0-row answer (verified: pure
+    DuckDB and our engine both return 100). The oracle is the correctness
+    reference, so it must be right even at the cost of reading unfiltered dim
+    rows and filtering locally.
+    """
     connection = duckdb.connect(db_path, read_only=True)
     connection.execute("LOAD postgres")
     connection.execute(f"ATTACH '{_pg_dsn(options)}' AS pgdb (TYPE postgres, READ_ONLY)")
+    connection.execute("SET pg_experimental_filter_pushdown=false")
     return connection
 
 
