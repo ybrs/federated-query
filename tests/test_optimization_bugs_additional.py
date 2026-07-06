@@ -1586,7 +1586,7 @@ class TestParserAliasNotPopulatedBug:
 
 
 class TestLimitPushdownNotRecursing:
-    """Test Bug #12: LimitPushdownRule doesn't recurse into non-Limit/Projection nodes.
+    """LimitPushdownRule must recurse into non-Limit/Projection nodes.
 
     The rule only descends into Limit and Projection nodes. If the root plan is a Filter,
     Join, or other operator, _push_limit returns without visiting children. This means

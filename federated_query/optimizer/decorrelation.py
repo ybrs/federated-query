@@ -2047,7 +2047,12 @@ class Decorrelator:
         return _and_join(equalities)
 
     def _scalar_value_ref(self, body, dep_prefix) -> Expression:
-        """The dependent aggregate value, with COUNT's empty-group 0 (the count bug)."""
+        """The dependent aggregate value; COUNT of an empty group is 0, not NULL.
+
+        This is the classic COUNT decorrelation bug (Kim 1982): a decorrelated
+        COUNT joined back must yield 0 for outer rows with no match, whereas a
+        plain join would drop them or produce NULL.
+        """
         # The aggregate's output value as exposed by the dependent relation's
         # alias (qualified, like every post-binder column reference).
         value_ref = ColumnRef.create(table=dep_prefix, column=_UNNEST_VALUE)

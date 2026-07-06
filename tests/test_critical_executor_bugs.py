@@ -1,9 +1,9 @@
-"""Tests for critical executor bugs found in code review.
+"""Regression tests for executor bugs found in code review.
 
-This test suite verifies three critical issues:
-1. PyArrow column access uses string keys instead of integer indices
-2. Star projections drop subsequent expressions
-3. Left/full outer joins raise NotImplementedError
+Each covers a distinct defect:
+- PyArrow column access uses string keys instead of integer indices
+- Star projections drop subsequent expressions
+- Left/full/right outer joins raise NotImplementedError or drop unmatched rows
 """
 
 import pytest
@@ -115,7 +115,7 @@ def setup_single_datasource():
 
 
 class TestBug1PyArrowColumnAccess:
-    """Test Bug #1: PyArrow column access uses string keys causing TypeError."""
+    """PyArrow column access uses string keys causing TypeError."""
 
     def test_filter_with_column_reference(self, setup_single_datasource):
         """Test that PhysicalFilter can access columns by name.
@@ -284,7 +284,7 @@ class TestBug1PyArrowColumnAccess:
 
 
 class TestBug2StarProjectionDropsExpressions:
-    """Test Bug #2: Star projections return early and drop subsequent expressions."""
+    """Star projections return early and drop subsequent expressions."""
 
     def test_star_with_additional_column(self, setup_single_datasource):
         """Test SELECT *, id AS id_copy.
@@ -397,7 +397,7 @@ class TestBug2StarProjectionDropsExpressions:
 
 
 class TestBug3LeftFullJoinNotImplemented:
-    """Test Bug #3: Left/full outer joins raise NotImplementedError."""
+    """Left/full outer joins raise NotImplementedError."""
 
     def test_left_join_with_unmatched_rows(self, setup_two_datasources):
         """Test LEFT JOIN where some left rows have no matching right rows.
@@ -554,7 +554,7 @@ class TestBug3LeftFullJoinNotImplemented:
 
 
 class TestBug4FullJoinMissingRightRows:
-    """Test Bug #4: FULL OUTER JOIN doesn't emit unmatched right rows."""
+    """FULL OUTER JOIN doesn't emit unmatched right rows."""
 
     def test_hash_full_join_with_unmatched_right_rows(self, setup_two_datasources):
         """Test FULL OUTER JOIN where right table has unmatched rows.
@@ -805,7 +805,7 @@ class TestBug4FullJoinMissingRightRows:
 
 
 class TestBug5RightJoinMissingUnmatchedRows:
-    """Test Bug #5: RIGHT OUTER JOIN doesn't emit unmatched right rows."""
+    """RIGHT OUTER JOIN doesn't emit unmatched right rows."""
 
     def test_hash_right_join_with_unmatched_right_rows(self, setup_two_datasources):
         """Test RIGHT OUTER JOIN where right table has unmatched rows.

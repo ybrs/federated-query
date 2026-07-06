@@ -140,7 +140,11 @@ def test_non_equi_scalar_aggregate_max(env):
 
 
 def test_non_equi_correlated_count_bug(env):
-    """COUNT over an empty non-equi correlation must be 0 (the count bug), not NULL."""
+    """COUNT over an empty non-equi correlation must be 0, not NULL.
+
+    The classic COUNT decorrelation bug (Kim 1982): the decorrelated COUNT must
+    yield 0 for outer rows with no matching inner row.
+    """
     _assert_nk(env, (
         "SELECT o.order_id, "
         "  (SELECT COUNT(*) FROM src_p.main.products p WHERE p.base_price < o.price) AS c "
