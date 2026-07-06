@@ -115,13 +115,22 @@ def test_pivot_with_group_by_rejected() -> None:
         QueryPreprocessor(catalog).preprocess(sql, QueryContext(sql))
 
 
-def test_preprocess_rejects_subquery_sources() -> None:
-    """Reject subqueries because we cannot enumerate columns."""
+def test_preprocess_expands_subquery_source() -> None:
+    """A derived table's * expands from its inner projection (bottom-up).
+
+    Subquery/CTE sources used to be rejected; they now expand by resolving the
+    star against the relation's own output columns. See test_star_expansion_cte
+    for the full coverage.
+    """
     catalog = _build_catalog()
     context = QueryContext("SELECT * FROM (SELECT * FROM testdb.main.users) t")
     preprocessor = QueryPreprocessor(catalog)
-    with pytest.raises(StarExpansionError):
-        preprocessor.preprocess(context.original_sql, context)
+    rewritten = preprocessor.preprocess(context.original_sql, context)
+
+    # Inner star -> users columns; outer star -> t-qualified columns.
+    assert "t.id" in rewritten
+    assert "t.name" in rewritten
+    assert "*" not in rewritten
 
 
 class _StubExecutor:

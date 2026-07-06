@@ -102,14 +102,19 @@ class QueryPreprocessor:
         context: QueryContext,
         is_root: bool,
     ) -> None:
-        """Traverse AST and rewrite every SELECT."""
+        """Traverse AST and rewrite every SELECT.
+
+        Children are rewritten BEFORE the enclosing SELECT (bottom-up), so a
+        subquery or CTE has already had its own stars expanded - and therefore
+        exposes a concrete column list - by the time an outer ``*`` over it is
+        resolved."""
+        for key, value in node.args.items():
+            child_is_root = self._child_is_root(node, key, is_root)
+            self._visit_child(key, value, context, child_is_root)
         if isinstance(node, exp.Select):
             self._rewrite_pivot(node)
             self._inline_named_windows(node)
             self._rewrite_select(node, context, is_root)
-        for key, value in node.args.items():
-            child_is_root = self._child_is_root(node, key, is_root)
-            self._visit_child(key, value, context, child_is_root)
 
     def _visit_child(
         self,
@@ -573,9 +578,29 @@ class QueryPreprocessor:
         return sources
 
     def _build_source(self, table_expr: exp.Expression) -> _SelectSource:
-        """Build metadata for a FROM/JOIN table."""
-        if not isinstance(table_expr, exp.Table):
-            raise StarExpansionError("Star expansion only supports base tables")
+        """Build star-expansion metadata for one FROM/JOIN source.
+
+        A source is a base table (catalog columns), a derived table
+        ``(SELECT ...) alias`` (columns from its own projection), or a reference
+        to a CTE defined in an enclosing WITH (columns from the CTE body)."""
+        if isinstance(table_expr, exp.Subquery):
+            return self._derived_source(table_expr)
+        if isinstance(table_expr, exp.Table):
+            return self._table_or_cte_source(table_expr)
+        raise StarExpansionError(
+            "Star expansion source must be a table, CTE, or derived subquery"
+        )
+
+    def _table_or_cte_source(self, table_expr: exp.Table) -> _SelectSource:
+        """A bare table name is a CTE reference if a WITH in scope defines it,
+        otherwise a base table resolved from the catalog."""
+        cte = self._find_cte(table_expr)
+        if cte is not None:
+            return self._cte_source(table_expr, cte)
+        return self._base_table_source(table_expr)
+
+    def _base_table_source(self, table_expr: exp.Table) -> _SelectSource:
+        """Build metadata for a catalog base table."""
         datasource, schema_name, table_name = self._extract_table_parts(table_expr)
         table = self.catalog.get_table(datasource, schema_name, table_name)
         if table is None:
@@ -599,8 +624,138 @@ class QueryPreprocessor:
             columns=columns,
         )
 
-    def _parse_alias(self, table_expr: exp.Table) -> Optional[str]:
-        """Parse table alias if present."""
+    def _derived_source(self, subquery: exp.Subquery) -> _SelectSource:
+        """Build metadata for a derived table ``(SELECT ...) alias``.
+
+        Standard SQL requires a derived table to be aliased; without one it
+        cannot be referenced, so a missing alias is a hard error.
+        """
+        alias = self._parse_alias(subquery)
+        if alias is None:
+            raise StarExpansionError("Derived table in FROM must have an alias")
+        columns = self._output_columns(subquery.this)
+        return self._derived_select_source(alias, columns)
+
+    def _cte_source(self, table_expr: exp.Table, cte: exp.CTE) -> _SelectSource:
+        """Build metadata for a reference to a CTE.
+
+        The reference is qualified by its own alias if present, else the CTE
+        name. Columns come from the CTE's explicit column list ``WITH c(a, b)``
+        when given, otherwise from the CTE body's projection.
+        """
+        alias = self._parse_alias(table_expr) or table_expr.name
+        columns = self._cte_columns(cte)
+        return self._derived_select_source(alias, columns)
+
+    def _derived_select_source(
+        self, alias: str, columns: List[str]
+    ) -> _SelectSource:
+        """Assemble a _SelectSource for a derived relation (subquery or CTE)."""
+        if not columns:
+            raise StarExpansionError(f"Derived relation '{alias}' exposes no columns")
+        # A derived relation has no catalog identity: it is qualified only by its
+        # alias, so both the SQL qualifier and the internal-name prefix are the
+        # alias (alias.column), and the catalog fields are left empty.
+        return _SelectSource.create(
+            datasource="",
+            schema_name="",
+            table_name=alias,
+            alias=alias,
+            sql_qualifier=alias,
+            internal_prefix=alias,
+            columns=columns,
+        )
+
+    def _find_cte(self, table_expr: exp.Table) -> Optional[exp.CTE]:
+        """Find the CTE a bare table name refers to in an enclosing WITH, or None.
+
+        Only an unqualified name can be a CTE reference; a name carrying a
+        catalog/schema is a base table. Walking parents finds the nearest
+        enclosing WITH, so an inner scope's CTE shadows an outer one.
+        """
+        if table_expr.catalog or table_expr.db:
+            return None
+        name = table_expr.name
+        node = table_expr.parent
+        while node is not None:
+            cte = self._cte_in_scope(node, name)
+            if cte is not None:
+                return cte
+            node = node.parent
+        return None
+
+    def _cte_in_scope(self, node: exp.Expression, name: str) -> Optional[exp.CTE]:
+        """Return the CTE named `name` defined by a WITH on `node`, or None.
+
+        This dialect stores the WITH clause under the ``with_`` arg key (like
+        ``from_``), not ``with``.
+        """
+        with_clause = node.args.get("with_")
+        if with_clause is None:
+            return None
+        for cte in with_clause.expressions:
+            if cte.alias == name:
+                return cte
+        return None
+
+    def _cte_columns(self, cte: exp.CTE) -> List[str]:
+        """Columns a CTE exposes: its explicit ``(a, b)`` list, else its body."""
+        explicit = self._cte_explicit_columns(cte)
+        if explicit:
+            return explicit
+        return self._output_columns(cte.this)
+
+    def _cte_explicit_columns(self, cte: exp.CTE) -> List[str]:
+        """The names in a CTE's explicit column list ``WITH c(a, b)``, or []."""
+        table_alias = cte.args.get("alias")
+        names: List[str] = []
+        if table_alias is None:
+            return names
+        for column in table_alias.columns:
+            names.append(column.name)
+        return names
+
+    def _output_columns(self, query: exp.Expression) -> List[str]:
+        """The output column names of a subquery/CTE body (SELECT or set op)."""
+        select = self._leftmost_select(query)
+        names: List[str] = []
+        for expression in select.expressions:
+            names.append(self._projection_output_name(expression))
+        return names
+
+    def _leftmost_select(self, query: exp.Expression) -> exp.Select:
+        """Descend a set operation to its leftmost SELECT - a UNION takes its
+        column names from the first branch - unwrapping any parentheses."""
+        node = query
+        wrappers = (exp.Union, exp.Except, exp.Intersect, exp.Subquery, exp.Paren)
+        while isinstance(node, wrappers):
+            node = node.this
+        if not isinstance(node, exp.Select):
+            raise StarExpansionError(
+                "Cannot enumerate columns of a non-SELECT subquery/CTE body"
+            )
+        return node
+
+    def _projection_output_name(self, expression: exp.Expression) -> str:
+        """The name a subquery/CTE projection item exposes (alias or column).
+
+        A star here means an inner source could not be expanded; an unnamed
+        expression has no stable name to reference - both are hard errors rather
+        than a silently guessed name.
+        """
+        if self._is_projection_star(expression):
+            raise StarExpansionError(
+                "Subquery/CTE has an unexpanded '*' that cannot be enumerated"
+            )
+        name = expression.output_name
+        if not name:
+            raise StarExpansionError(
+                "Unnamed expression in a starred subquery/CTE; add an AS alias"
+            )
+        return name
+
+    def _parse_alias(self, table_expr: exp.Expression) -> Optional[str]:
+        """Parse table/subquery alias if present."""
         alias = table_expr.alias
         if alias:
             return str(alias)
