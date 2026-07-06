@@ -437,10 +437,23 @@ class ExpressionEvaluator:
             return pc.coalesce(*args)
         if name == "CONCAT":
             return self._concat_arrays(args, null_handling="skip")
+        if name == "NULLIF":
+            return self._eval_nullif(args)
         kernel = kernels.get(name)
         if kernel is None:
             raise ExpressionEvaluationError(f"Unsupported function: {name}")
         return kernel(args[0])
+
+    def _eval_nullif(self, args):
+        """NULLIF(a, b): NULL where a = b, else a (a's type).
+
+        The first argument is already an evaluated array, so it is used once -
+        no re-evaluation of the underlying expression (which a CASE rewrite
+        would double-evaluate, wrong for a volatile argument).
+        """
+        left = args[0]
+        equals = pc.equal(left, args[1])
+        return pc.if_else(equals, pa.scalar(None, type=left.type), left)
 
     def _eval_case(self, expr: CaseExpr):
         """Evaluate CASE, computing each branch only on its matching rows.

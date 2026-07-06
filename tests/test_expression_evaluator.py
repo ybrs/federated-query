@@ -118,6 +118,17 @@ def test_coalesce_function():
     assert evaluate(expr) == [100.0, 0.0, 300.0, 50.0]
 
 
+def test_nullif_function():
+    """NULLIF(a, b) yields NULL where a = b, else a; the type is a's type."""
+    expr = FunctionCall(
+        function_name="NULLIF",
+        args=[col("amount"), Literal(value=300.0, data_type=DataType.DOUBLE)],
+    )
+    # amount = [100, NULL, 300, 50]: the 300 becomes NULL; a NULL input (a = b is
+    # NULL, not true) stays a's value, which is itself NULL here.
+    assert evaluate(expr) == [100.0, None, None, 50.0]
+
+
 def test_in_list_null_value_yields_null():
     """NULL IN (...) must be NULL (unknown), not FALSE."""
     expr = InList(value=col("amount"), options=[lit(100), lit(300)])
