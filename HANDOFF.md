@@ -1,4 +1,4 @@
-# Status: twelve phases live; fair federated gap 38.6x -> 3.08x
+# Status: thirteen phases live; fair federated gap 38.6x -> 2.98x
 
 State of the work. Facts only: what exists, what passes, what is measured,
 what is not done. Previous phase (Rust cutover, N-K decorrelation, merge-engine
@@ -13,7 +13,7 @@ merge-engine-datafusion
             `- feature/cost-based-optimizer   <-- HEAD (this document)
 ```
 
-Test suite: **1166 passed, 3 skipped, 39 xfailed, 0 failed**
+Test suite: **1168 passed, 3 skipped, 39 xfailed, 0 failed**
 (`POSTGRES_DB=duckpoc python -m pytest -q`). `make lint` green.
 
 ## What was built on this branch
@@ -298,17 +298,45 @@ Gate (report-result-64b7feb.md): fedpgduck SF1 3392 -> 3280ms (3.08x), all 132
 correct. q11 142 -> 75ms (9.2x -> 4.0x), q09 467 -> 424ms, q02 down; NO >40ms
 regression anywhere. Twelve-phase run 38.55x -> 3.08x; single-source SF1 1.96x.
 
+## Composite-key NDV cap (q09, commit 05d085a)
+
+A join's equi-key denominator is the PRODUCT of per-column NDVs, which assumes
+the columns are INDEPENDENT. For a multi-column FK key the product wildly
+over-counts distinct combinations: lineitem<->partsupp on (partkey, suppkey)
+got 200k*10k = 2e9, collapsing a 6M-row join estimate to ~3522 (~1700x low).
+Distinct key COMBINATIONS can never exceed the smaller side's rows, so the
+product is capped there - ONLY for composite keys (>=2 equi conjuncts); a
+single key's max(ndv) can legitimately exceed min(rows) (small table -> big
+unique key) and is left alone (capping it over-estimated a 50-row FK join to
+1000 - pinned by test). Shared apply_conjunct_term / cap_composite_denom in
+estimate_defaults, used by both cost.py and the join-order estimator.
+
+Gate (report-result-05d085a.md): all 132 correct, NO regression. q09 improved
+in EVERY cell (a wrong estimate was costing better join orders everywhere):
+single SF1 442->152ms, fedparquet SF1 1006->361ms, fedpgduck SF1 424->309ms;
+q05 single 149->100ms. Totals: single SF1 1.70x, fedparquet SF1 1.99x,
+fedpgduck SF1 2.98x. Thirteen-phase run 38.55x -> 2.98x fair.
+
+NOTE: the reduction's max-base remote sizing (commit 64b7feb) is KEPT - the cap
+fixes the composite-key under-count specifically, max-base still guards any
+other remote-output under-count (multi-join selectivity compounding).
+
 ## Known gaps / next work (in priority order from the data)
 
-Fair-federated SF1 3.08x, SF0.1 4.33x, all correct.
-1. **q09 (424ms, biggest absolute), q07 (5.9x), q13 (1.5M-order LEFT-count,
-   inherent), q10 (customer 150k preserved-side)**: the plan/transfer tail.
-2. **Cost-model composite-key correlation under-count**: a multi-key fact join
-   (lineitem<->partsupp on partkey+suppkey) estimates ~1000x low. Worked around
-   in the reduction (max-base), but the join-ORDERING estimate is still off -
-   the deeper fix is a correlation-aware NDV for composite FKs.
-3. **Small-scale fixed overhead**: SF0.1 4.33x is per-query constants, not plans.
-4. **TRANSFER_WEIGHT calibration** (1.0), **CTE materialize-once**.
+Fair-federated SF1 2.98x, SF0.1 4.24x; single-source SF1 1.70x; all correct.
+1. **Per-fetch engine overhead (the biggest remaining lever)**: measured a
+   ~9ms fixed floor per DuckDB fetch + ~6ms DataFusion coordinator setup, in
+   the Rust engine (tokio runtime created per execute, SessionContext, Arrow/
+   pyo3 marshalling). NOT connections (PG pooled, duck-open free) and NOT
+   un-batched same-source (already collapsed). Scales with fetch count; the
+   reduction's collect+inject adds duck round-trips. Dominates SF0.1 ratios.
+   Levers: reuse the tokio runtime + DataFusion context across a query; fold
+   the reduction's two duck trips into one. (User deferred; revisit next.)
+2. **q07 (6.4x), q13 (1.5M-order LEFT-count, inherent), q10**: the plan tail.
+3. **Composite-key correlation is only PARTIALLY modelled**: the cap fixes the
+   worst 2-column-FK case; a full multi-column correlation NDV (or a lazy
+   composite approx_count_distinct) would be the complete fix.
+4. **TRANSFER_WEIGHT calibration**, **CTE materialize-once**.
 5. **fedqrs missing operators** (18 xfails); `enable_decorrelation` unwired.
 
 ## How to run
