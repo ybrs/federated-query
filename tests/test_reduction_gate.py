@@ -192,3 +192,65 @@ def test_remote_orientation_size_is_max_base_not_join_output():
     )
     sizer = SingleSourcePushdown(Catalog())
     assert sizer._root_estimate(join) == 6_000_000
+
+
+def test_useless_key_reduction_predicate():
+    """The pure predicate: keys covering >= 80% of the probe column's domain
+    are useless; a filtered build (few rows) or missing statistics are not."""
+    from federated_query.optimizer.estimate_defaults import useless_key_reduction
+    assert useless_key_reduction(10000, 10000, 10000) is True
+    assert useless_key_reduction(10000, 300, 10000) is False
+    assert useless_key_reduction(None, 10000, 10000) is False
+    assert useless_key_reduction(10000, None, 10000) is True
+    assert useless_key_reduction(10000, 10000, None) is False
+
+
+def test_gate_skips_unfiltered_dimension_keys():
+    """q07's shape: an unfiltered dimension's keys are the probe column's whole
+    FK domain, so the reduction filters nothing and must be refused."""
+    from federated_query.executor.rust_ir import _reduction_filters
+    supplier = _est_scan("supplier", "s", ["s_suppkey"], 10000,
+                         column_ndv={"s_suppkey": 10000})
+    lineitem = _est_scan("lineitem", "l", ["l_suppkey", "l_qty"], 6000000,
+                         column_ndv={"l_suppkey": 10000})
+    join = _inner(lineitem, supplier, _col("l", "l_suppkey"), _col("s", "s_suppkey"))
+    assert _reduction_filters(join) is False
+
+
+def test_gate_keeps_a_filtered_build_side():
+    """q03's shape: a filtered dimension donates far fewer keys than the probe
+    column's domain, so the reduction is useful and must be kept."""
+    from federated_query.executor.rust_ir import _reduction_filters
+    customer = _est_scan("customer", "c", ["c_custkey"], 30142,
+                         column_ndv={"c_custkey": 150000})
+    orders = _est_scan("orders", "o", ["o_custkey", "o_key"], 1500000,
+                       column_ndv={"o_custkey": 100000})
+    join = _inner(orders, customer, _col("o", "o_custkey"), _col("c", "c_custkey"))
+    assert _reduction_filters(join) is True
+
+
+def test_gate_abstains_without_statistics():
+    """No threaded NDVs on either side: keep today's reduce-by-default."""
+    from federated_query.executor.rust_ir import _reduction_filters
+    left = _est_scan("part", "p", ["p_id"], 200000)
+    right = _est_scan("li", "l", ["l_p", "l_q"], 6000000)
+    join = _inner(right, left, _col("l", "l_p"), _col("p", "p_id"))
+    assert _reduction_filters(join) is True
+
+
+def test_gate_abstains_for_a_composite_build_side():
+    """q11's shape: a filtered ISLAND build (max-base over-estimate, base-domain
+    NDVs) must not be judged - its useful reduction stays."""
+    from federated_query.executor.rust_ir import _reduction_filters
+    from federated_query.plan.physical import PhysicalRemoteQuery
+    island = PhysicalRemoteQuery(
+        datasource="pg", datasource_connection=None, query_ast=None,
+        output_names=["s_suppkey"],
+        column_alias_map={("supplier", "s_suppkey"): "s_suppkey"},
+        estimated_rows=10000, column_ndv={"s_suppkey": 10000},
+    )
+    partsupp = _est_scan("partsupp", "ps", ["ps_suppkey", "ps_partkey"], 800000,
+                         column_ndv={"ps_suppkey": 10000})
+    join = _inner(partsupp, island,
+                  _col("ps", "ps_suppkey"), _col("supplier", "s_suppkey"))
+    assert _reduction_filters(join) is True

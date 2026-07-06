@@ -322,7 +322,27 @@ class SingleSourcePushdown:
             output_names=context.output_names,
             column_alias_map=context.column_aliases,
             estimated_rows=estimated_rows,
+            column_ndv=self._remote_column_ndv(context),
         )
+
+    def _remote_column_ndv(self, context: "_PushContext") -> Optional[Dict[str, int]]:
+        """Base NDVs of interior scans' join-key columns, keyed by the remote
+        OUTPUT name that carries each column (via the alias map, so only a
+        column passing through unchanged is mapped). The reduction reads this
+        to refuse a dynamic filter that cannot filter. None when no interior
+        scan carries cost-model NDVs."""
+        ndv_map: Dict[str, int] = {}
+        for scan in context.scans:
+            self._scan_output_ndv(scan, context, ndv_map)
+        return ndv_map or None
+
+    def _scan_output_ndv(self, scan, context, ndv_map: Dict[str, int]) -> None:
+        """Map one scan's key NDVs onto the remote output names carrying them."""
+        alias = scan.alias if scan.alias else scan.table_name
+        for column, ndv in (scan.column_ndv or {}).items():
+            output = context.column_aliases.get((alias, column))
+            if output is not None:
+                ndv_map[output] = ndv
 
     def _expose_computed_outputs(self, context: "_PushContext") -> None:
         """Map any output column with no source qualifier (a computed result

@@ -1,7 +1,7 @@
 """Logical plan nodes (Pydantic models)."""
 
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import Dict, List, Optional
 from enum import Enum
 
 from ..model import StateModel
@@ -153,6 +153,11 @@ class Scan(LogicalPlanNode):
     # recorded by join ordering so the downstream reduction can orient by size
     # (reduce the big side); None when the scan was not cost-estimated.
     estimated_rows: Optional[int] = None
+    # Source-catalog NDV per join-key column (BASE table values, unfiltered),
+    # recorded by join ordering alongside estimated_rows. The reduction uses it
+    # to refuse a dynamic filter whose keys cover the probe column's whole
+    # value domain (such a filter keeps every row). None = not cost-estimated.
+    column_ndv: Optional[Dict[str, int]] = None
 
     @classmethod
     def create(
@@ -176,6 +181,7 @@ class Scan(LogicalPlanNode):
         order_by_nulls: Optional[List[Optional[str]]] = None,
         distinct: bool = False,
         estimated_rows: Optional[int] = None,
+        column_ndv: Optional[Dict[str, int]] = None,
     ) -> "Scan":
         """Build a Scan leaf reading columns from a source table.
         Sanctioned construction path; prefer model_copy when deriving from an existing node."""
@@ -198,6 +204,7 @@ class Scan(LogicalPlanNode):
             order_by_nulls=order_by_nulls,
             distinct=distinct,
             estimated_rows=estimated_rows,
+            column_ndv=column_ndv,
         )
 
     def children(self) -> List[LogicalPlanNode]:

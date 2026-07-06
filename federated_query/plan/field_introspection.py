@@ -28,6 +28,12 @@ def innermost_type(annotation: Any) -> Any:
     origin = get_origin(annotation)
     if origin is None:
         return annotation
+    if origin is dict:
+        # A dict's expression content can only live in its VALUES: an
+        # Expression (an unhashable pydantic model) can never be a dict key,
+        # so classification follows the value type.
+        _key_type, value_type = get_args(annotation)
+        return innermost_type(value_type)
     inner_args = []
     for arg in get_args(annotation):
         if arg is type(None) or arg is Ellipsis:
@@ -65,11 +71,14 @@ def field_holds_expressions(annotation: Any) -> bool:
 
 
 def flatten_expression_values(value: Any) -> List[Expression]:
-    """Collect every Expression held in a field value (through lists/None)."""
+    """Collect every Expression held in a field value (lists/dicts/None)."""
     if value is None:
         return []
     if isinstance(value, Expression):
         return [value]
+    if isinstance(value, dict):
+        # Mirrors classification: a dict's expressions live in its values.
+        return flatten_expression_values(list(value.values()))
     if isinstance(value, (list, tuple)):
         collected: List[Expression] = []
         for item in value:

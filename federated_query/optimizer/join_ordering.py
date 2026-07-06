@@ -680,6 +680,19 @@ def _atom_owning(region: JoinRegion, ref) -> "JoinAtom":
     )
 
 
+def _atom_equi_refs(region: JoinRegion, atom_index: int):
+    """The atom-side column refs of every two-atom equi conjunct touching one
+    atom - the join keys a downstream reduction may inject on."""
+    refs = []
+    for conjunct in region.conjuncts:
+        if not conjunct.is_equi or len(conjunct.atom_indexes) != 2:
+            continue
+        if atom_index in conjunct.atom_indexes:
+            atom_ref, _other = _orient_refs(region, conjunct, atom_index)
+            refs.append(atom_ref)
+    return refs
+
+
 def _orient_refs(region: JoinRegion, conjunct: JoinConjunct, atom_index: int):
     """(atom-side ref, other-side ref) of a two-atom equi conjunct being
     placed on the step that joins atom_index."""
@@ -935,14 +948,30 @@ class JoinOrderingRule(OptimizationRule):
         )
 
     def _record_atom_estimate(self, region, atom_index, local, emitted):
-        """Annotate a Scan atom with its cost estimate so the downstream
-        reduction can orient by size. Only a bare Scan is annotated (a
-        Filter-wrapped atom keeps None and falls back); a composite atom
-        already carries its estimate on its root Join."""
+        """Annotate a Scan atom with its cost estimate and its join-key NDVs
+        so the downstream reduction can orient by size and refuse a dynamic
+        filter whose keys cover the probe column's whole value domain. Only a
+        bare Scan is annotated (a Filter-wrapped atom keeps None and falls
+        back); a composite atom already carries its estimate on its Join."""
         if not isinstance(emitted, Scan):
             return emitted
         estimate = self.estimator.atom_estimate(region, atom_index, local)
-        return emitted.model_copy(update={"estimated_rows": estimate.rows})
+        return emitted.model_copy(update={
+            "estimated_rows": estimate.rows,
+            "column_ndv": self._atom_key_ndv(region, atom_index),
+        })
+
+    def _atom_key_ndv(self, region, atom_index: int):
+        """Base NDV per equi-join-key column of one atom, from the same source
+        statistics the estimates used; keys the source has no NDV for are
+        omitted. None when the atom joins on no equi key."""
+        ndv_map = {}
+        for ref in _atom_equi_refs(region, atom_index):
+            ndv = self.estimator.cost_model.column_ndv(
+                region.atoms[atom_index].plan, ref)
+            if ndv is not None:
+                ndv_map[ref.column] = ndv
+        return ndv_map or None
 
     def _local_positions(self, region, atom_index: int) -> List[int]:
         """Positions of the conjuncts referencing exactly this one atom."""

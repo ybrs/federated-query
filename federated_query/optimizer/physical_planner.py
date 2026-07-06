@@ -359,6 +359,7 @@ class PhysicalPlanner:
             order_by_nulls=scan.order_by_nulls,
             distinct=scan.distinct,
             estimated_rows=scan.estimated_rows,
+            column_ndv=scan.column_ndv,
         )
 
     def _plan_filter(self, filter_node: Filter) -> PhysicalFilter:

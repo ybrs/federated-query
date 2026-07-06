@@ -535,6 +535,10 @@ class PhysicalScan(PhysicalPlanNode):
     # The cost model's row estimate (threaded from the logical Scan), so the
     # execution-IR reduction can orient by size; None when not cost-estimated.
     estimated_rows: Optional[int] = None
+    # Source-catalog NDV per join-key column (threaded from the logical Scan),
+    # so the reduction can refuse a dynamic filter whose keys cover the probe
+    # column's whole value domain; None when not cost-estimated.
+    column_ndv: Optional[Dict[str, int]] = None
 
     @classmethod
     def create(
@@ -561,6 +565,7 @@ class PhysicalScan(PhysicalPlanNode):
         dynamic_filter_keys: Optional[List[Expression]] = None,
         dynamic_filter_values: Optional[List[tuple]] = None,
         estimated_rows: Optional[int] = None,
+        column_ndv: Optional[Dict[str, int]] = None,
     ) -> "PhysicalScan":
         """Sanctioned fresh-construction path for PhysicalScan.
         Names every field so none is dropped; derive from an existing node
@@ -587,6 +592,7 @@ class PhysicalScan(PhysicalPlanNode):
             dynamic_filter_keys=dynamic_filter_keys,
             dynamic_filter_values=dynamic_filter_values,
             estimated_rows=estimated_rows,
+            column_ndv=column_ndv,
         )
 
     def children(self) -> List[PhysicalPlanNode]:
@@ -1584,6 +1590,10 @@ class PhysicalRemoteQuery(PhysicalPlanNode):
     # The cost model's row estimate for the collapsed subtree's root, so the
     # reduction can orient by size; None when the root is not a Join/Scan.
     estimated_rows: Optional[int] = None
+    # Source-catalog NDV per OUTPUT column that passes through unchanged from
+    # an interior base scan (join keys do). The reduction uses it to refuse a
+    # dynamic filter whose keys cover the probe column's whole value domain.
+    column_ndv: Optional[Dict[str, int]] = None
 
     @classmethod
     def create(
@@ -1595,6 +1605,7 @@ class PhysicalRemoteQuery(PhysicalPlanNode):
         output_names: List[str],
         column_alias_map: Dict[Tuple[Optional[str], str], str],
         estimated_rows: Optional[int] = None,
+        column_ndv: Optional[Dict[str, int]] = None,
     ) -> "PhysicalRemoteQuery":
         """Sanctioned fresh-construction path for PhysicalRemoteQuery.
         column_alias_map is explicit (the default_factory cannot be a parameter
@@ -1606,6 +1617,7 @@ class PhysicalRemoteQuery(PhysicalPlanNode):
             output_names=output_names,
             column_alias_map=column_alias_map,
             estimated_rows=estimated_rows,
+            column_ndv=column_ndv,
         )
     _schema: Optional[pa.Schema] = None
 

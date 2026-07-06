@@ -16,6 +16,8 @@ import os
 
 from sqlglot import exp
 
+from ..optimizer.estimate_defaults import useless_key_reduction
+
 from ..plan.expressions import (
     BetweenExpression,
     BinaryOp,
@@ -388,14 +390,70 @@ def _emit(node, ctx):
     return emitter(node, ctx)
 
 
+# A plain PostgreSQL scan at least this many estimated rows reads through the
+# engine's ctid-partitioned parallel path: one connection is bottlenecked on a
+# single PG backend's scan plus the ADBC driver's sequential decode (measured:
+# customer SF1 wide read 136ms single stream vs 37.5ms at 8 partitions; the
+# oracle's postgres_scanner does the same read in 76ms). Below this size the
+# per-partition round trips cost more than they save.
+PARALLEL_SCAN_MIN_ROWS = 50_000
+
+
 def _emit_source(node, ctx):
-    """A source scan run natively, as pre-rendered SQL."""
+    """A source scan run natively (structured+parallel when it qualifies)."""
     binding = ctx.names.binding()
     ctx.steps.append({
         "op": "source_scan", "datasource": node.datasource,
-        "scan": raw_scan_spec(node), "binding": binding,
+        "scan": _source_scan_spec(node), "binding": binding,
     })
     return binding
+
+
+def _source_scan_spec(node):
+    """The scan spec for a plain source read: a structured spec marked
+    ``parallel`` for a big plain PostgreSQL scan (the engine reads it with
+    ctid-partitioned parallel connections), pre-rendered SQL otherwise."""
+    if not _parallel_scan_eligible(node):
+        return raw_scan_spec(node)
+    try:
+        spec = structured_scan_spec(node)
+    except UnsupportedIR:
+        # A capability probe, not error hiding: a filter the expression IR
+        # cannot represent reads over the raw-SQL single-stream path, which
+        # is equally correct - only the parallel speedup is forfeited.
+        return raw_scan_spec(node)
+    spec["parallel"] = True
+    return spec
+
+
+def _parallel_scan_eligible(node) -> bool:
+    """Whether a scan is a big, plain, partition-safe PostgreSQL table read."""
+    if not _is_big_postgres_scan(node):
+        return False
+    return _partition_safe_scan(node)
+
+
+def _is_big_postgres_scan(node) -> bool:
+    """A PhysicalScan on a PostgreSQL source whose cost estimate clears the
+    parallel threshold; an unestimated scan stays on the single-stream path."""
+    from ..datasources.postgresql import PostgreSQLDataSource
+
+    if not isinstance(node, PhysicalScan):
+        return False
+    if not isinstance(node.datasource_connection, PostgreSQLDataSource):
+        return False
+    rows = node.estimated_rows
+    return rows is not None and rows >= PARALLEL_SCAN_MIN_ROWS
+
+
+def _partition_safe_scan(node) -> bool:
+    """Whether ctid-partitioned reads return exactly this scan's rows.
+    DISTINCT and TABLESAMPLE are not partition-safe (per-partition DISTINCT
+    keeps duplicates across partitions; sampling composes wrongly); aggregates,
+    ordering, and limits are excluded by the plain-scan check."""
+    if node.distinct or node.sample is not None:
+        return False
+    return _injectable_scan(node)
 
 
 def _merge_step(ctx, fragment, inputs):
@@ -728,12 +786,13 @@ def _emit_join(join, ctx):
 
     Semi-join reduction (read build, collect its distinct key, inject it into
     the probe's SQL) applies only to an INNER single-key join between two plain
-    scans; otherwise both children are emitted in full (recursively, so they may
+    scans, and only when the cost model does not prove the filter useless;
+    otherwise both children are emitted in full (recursively, so they may
     be any subtree) and joined. The join's canonical output columns are emitted
     so a parent can reference them.
     """
     kind = _join_kind(join)
-    if _can_reduce(join):
+    if _can_reduce(join) and _reduction_filters(join):
         left_binding, right_binding = _emit_reduced_join(join, ctx)
     else:
         left_binding = _emit(join.left, ctx)
@@ -785,6 +844,42 @@ def _left_reducible(join) -> bool:
         return False
     inject_col = _physical_column_name(join.right_keys[0], join.right.column_aliases())
     return _reducible_probe_base(join.right, inject_col) is not None
+
+
+def _reduction_filters(join) -> bool:
+    """The cost-based usefulness gate: False when the planned reduction
+    provably filters nothing - the build side's distinct keys cover the probe
+    column's whole value domain (an unfiltered dimension's keys are the FK
+    domain, so the injected IN keeps every probe row and costs pure overhead).
+    Decided from the cost model's NDVs threaded onto the plan; when either
+    side's statistic is missing this keeps today's reduce-by-default."""
+    build, probe, build_key, probe_key = _orient_join(join)
+    if not isinstance(build, PhysicalScan):
+        # Only a plain scan's estimate reflects its own filters. A collapsed
+        # remote's estimated_rows is the deliberate max-base OVER-estimate and
+        # its column_ndv the unfiltered base domain, so judging its keys here
+        # would kill useful reductions (q11: a 400-row filtered island reads
+        # as 10k keys). Abstain until remotes carry a real output estimate.
+        return True
+    inject_col = _physical_column_name(probe_key, probe.column_aliases())
+    probe_ndv = _node_column_ndv(_reducible_probe_base(probe, inject_col), inject_col)
+    keys_ndv = _node_column_ndv(build, _build_key_name(build, build_key))
+    return not useless_key_reduction(keys_ndv, build.estimated_rows, probe_ndv)
+
+
+def _build_key_name(build, build_key_expr) -> str:
+    """The physical output name of the build side's join-key column."""
+    return _physical_column_name(build_key_expr, build.column_aliases())
+
+
+def _node_column_ndv(node, column):
+    """A node's cost-model NDV for one of its output columns, or None when the
+    node carries no threaded statistics (a computed subtree, an unestimated
+    scan) - the gate then abstains rather than guessing."""
+    ndv_map = getattr(node, "column_ndv", None)
+    if not ndv_map:
+        return None
+    return ndv_map.get(column)
 
 
 def _reducible_probe_base(probe, inject_col):
@@ -940,10 +1035,12 @@ def _emit_build_side(ctx, build_child):
 
 
 def _emit_build_scan(ctx, build_child, binding):
-    """A fully materialized build-side scan (it is also distinct-scanned)."""
+    """A fully materialized build-side scan (it is also distinct-scanned).
+    Uses the same spec choice as a plain source scan, so a big PostgreSQL
+    build side also gets the ctid-parallel read."""
     ctx.steps.append({
         "op": "source_scan", "datasource": build_child.datasource,
-        "scan": raw_scan_spec(build_child), "binding": binding, "materialize": True,
+        "scan": _source_scan_spec(build_child), "binding": binding, "materialize": True,
     })
 
 
