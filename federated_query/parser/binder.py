@@ -1061,23 +1061,42 @@ class Binder:
     def _resolve_qualified(
         self, scopes: List[Dict[str, Table]], col_ref: ColumnRef
     ) -> ColumnRef:
-        """Resolve a table-qualified reference to the nearest scope with its table."""
+        """Resolve a table-qualified reference to the nearest scope with its table.
+
+        SQL identifiers are case-insensitive (Postgres, the canonical dialect,
+        folds unquoted names to lower case), so a `catalog` reference resolves
+        against a `CATALOG` alias (q49). The qualifier is normalized to the
+        alias's actual case so every later pass matches the relation's alias.
+        """
         for scope in reversed(scopes):
-            table = scope.get(col_ref.table)
-            if table is None:
+            entry = self._scope_entry(scope, col_ref.table)
+            if entry is None:
                 continue
+            alias, table = entry
             column = table.get_column(col_ref.column)
             if column is None:
                 raise BindingError(
                     f"Column '{col_ref.column}' not found in table '{col_ref.table}'"
                 )
-            # The resolved table-qualified reference: the qualifier and column name
-            # stay, and model_copy stamps the catalog column's data type onto it.
-            return col_ref.model_copy(update={"data_type": column.data_type})
+            return col_ref.model_copy(
+                update={"table": alias, "data_type": column.data_type}
+            )
         raise BindingError(
             f"Table '{col_ref.table}' not found in scope for column "
             f"'{col_ref.column}'"
         )
+
+    def _scope_entry(self, scope: Dict[str, Table], qualifier: str):
+        """The (alias, table) in `scope` whose alias matches `qualifier`,
+        case-insensitively (an exact match is preferred); None if absent."""
+        table = scope.get(qualifier)
+        if table is not None:
+            return qualifier, table
+        lowered = qualifier.lower()
+        for alias, candidate in scope.items():
+            if alias.lower() == lowered:
+                return alias, candidate
+        return None
 
     def _resolve_unqualified(
         self, scopes: List[Dict[str, Table]], col_ref: ColumnRef

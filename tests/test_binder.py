@@ -545,3 +545,24 @@ def test_unqualified_aggregate_measure_reaches_its_table_scan(catalog_with_test_
     walk(bound)
     assert "amount" in scans["orders"]
     assert "amount" not in scans["users"]
+
+
+def test_qualified_reference_case_insensitive_to_base_alias(catalog_with_test_data):
+    """SQL identifiers are case-insensitive: a lowercase reference resolves
+    against an uppercase alias, and vice versa (q49's CATALOG/catalog)."""
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = "SELECT u.id, U.name FROM testdb.public.users U WHERE u.age > 0"
+    assert binder.bind(parser.parse_to_logical_plan(sql, catalog_with_test_data)) is not None
+
+
+def test_qualified_reference_case_insensitive_to_derived_alias(catalog_with_test_data):
+    """A lowercase reference resolves against an uppercase derived-table alias -
+    the exact q49 shape (a CATALOG-aliased subquery referenced as catalog)."""
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = (
+        "SELECT catalog.id FROM (SELECT id FROM testdb.public.users) CATALOG "
+        "WHERE catalog.id > 0"
+    )
+    assert binder.bind(parser.parse_to_logical_plan(sql, catalog_with_test_data)) is not None
