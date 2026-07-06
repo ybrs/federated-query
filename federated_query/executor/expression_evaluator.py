@@ -389,6 +389,8 @@ class ExpressionEvaluator:
         name = expr.function_name.upper()
         if name in ("SUBSTRING", "SUBSTR"):
             return self._eval_substring(expr)
+        if name == "ROUND":
+            return self._eval_round(expr)
         args = []
         for arg in expr.args:
             args.append(self._broadcast(self._eval(arg)))
@@ -410,6 +412,17 @@ class ExpressionEvaluator:
             stop = max(start - 1 + self._scalar_int(expr.args[2]), 0)
             return pc.utf8_slice_codeunits(text, begin, stop)
         return pc.utf8_slice_codeunits(text, begin)
+
+    def _eval_round(self, expr: FunctionCall) -> pa.Array:
+        """Evaluate ROUND(x) or ROUND(x, n); a second argument (n) is a constant.
+
+        This path serves type inference and constant folding; the cross-source
+        execution runs in DataFusion, which evaluates the same round.
+        """
+        value = self._broadcast(self._eval(expr.args[0]))
+        if len(expr.args) >= 2:
+            return pc.round(value, ndigits=self._scalar_int(expr.args[1]))
+        return pc.round(value)
 
     def _scalar_int(self, expr: Expression) -> int:
         """A SUBSTRING position/length argument as a constant int.

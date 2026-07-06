@@ -129,6 +129,20 @@ def test_nullif_function():
     assert evaluate(expr) == [100.0, None, None, 50.0]
 
 
+def test_round_function():
+    """ROUND(x) rounds to an integer; ROUND(x, n) rounds to n decimals."""
+    whole = FunctionCall(function_name="ROUND", args=[col("amount")])
+    assert evaluate(whole) == [100.0, None, 300.0, 50.0]
+
+    fractional = BinaryOp(op=BinaryOpType.DIVIDE, left=col("amount"), right=lit(3.0))
+    rounded = FunctionCall(function_name="ROUND", args=[fractional, lit(2)])
+    result = evaluate(rounded)
+    assert result[1] is None
+    assert result[0] == pytest.approx(33.33)
+    assert result[2] == pytest.approx(100.0)
+    assert result[3] == pytest.approx(16.67)
+
+
 def test_in_list_null_value_yields_null():
     """NULL IN (...) must be NULL (unknown), not FALSE."""
     expr = InList(value=col("amount"), options=[lit(100), lit(300)])
