@@ -12,14 +12,20 @@ import argparse
 
 import duckdb
 
-from generate import _db_path, DEFAULT_DATA_DIR
+from generate import _db_path, pg_database_name, DEFAULT_DATA_DIR
 from qualify import TPCDS_TABLES
+
+
+def _database(options):
+    """The target PostgreSQL database: an explicit --pg-database, otherwise the
+    scale's dedicated TPC-DS database (kept separate from the TPC-H benchmark)."""
+    return options.pg_database or pg_database_name(options.scale_factor)
 
 
 def _attach_dsn(options):
     """Build the libpq DSN DuckDB's postgres extension attaches through."""
     return (
-        f"dbname={options.pg_database} user={options.pg_user} "
+        f"dbname={_database(options)} user={options.pg_user} "
         f"password={options.pg_password} host={options.pg_host} "
         f"port={options.pg_port}"
     )
@@ -63,7 +69,7 @@ def _parse_args():
     parser.add_argument("--scale-factor", default="1")
     parser.add_argument("--pg-host", default="localhost")
     parser.add_argument("--pg-port", default="5432")
-    parser.add_argument("--pg-database", default="duckpoc")
+    parser.add_argument("--pg-database", default=None)
     parser.add_argument("--pg-user", default="postgres")
     parser.add_argument("--pg-password", default="postgres")
     parser.add_argument("--pg-schema", default="public")

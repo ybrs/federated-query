@@ -39,7 +39,12 @@ from federated_query.datasources.duckdb import DuckDBDataSource
 from federated_query.datasources.postgresql import PostgreSQLDataSource
 
 from compare import compare_results
-from generate import _db_path, DEFAULT_DATA_DIR, DEFAULT_QUERIES_DIR
+from generate import (
+    _db_path,
+    pg_database_name,
+    DEFAULT_DATA_DIR,
+    DEFAULT_QUERIES_DIR,
+)
 from qualify import TPCDS_TABLES
 from run import arrow_to_rows, _read_query
 
@@ -94,12 +99,18 @@ FEDQ_SOURCES = {"pg": ("pg", "public"), "duck": ("duck", "main")}
 ORACLE_SOURCES = {"pg": ("pgdb", "public"), "duck": (None, "main")}
 
 
+def _database(options):
+    """The PostgreSQL database to read: an explicit --pg-database, otherwise the
+    scale's dedicated TPC-DS database (kept separate from the TPC-H benchmark)."""
+    return options.pg_database or pg_database_name(options.scale_factor)
+
+
 def _pg_config(options):
     """PostgreSQL connection config for the engine's connector."""
     return {
         "host": options.pg_host,
         "port": int(options.pg_port),
-        "database": options.pg_database,
+        "database": _database(options),
         "user": options.pg_user,
         "password": options.pg_password,
         "schemas": ["public"],
@@ -109,7 +120,7 @@ def _pg_config(options):
 def _pg_dsn(options):
     """The libpq DSN DuckDB's postgres extension attaches through."""
     return (
-        f"dbname={options.pg_database} user={options.pg_user} "
+        f"dbname={_database(options)} user={options.pg_user} "
         f"password={options.pg_password} host={options.pg_host} "
         f"port={options.pg_port}"
     )
@@ -624,7 +635,7 @@ def _parse_args():
     parser.add_argument("--report", default=None)
     parser.add_argument("--pg-host", default="localhost")
     parser.add_argument("--pg-port", default="5432")
-    parser.add_argument("--pg-database", default="duckpoc")
+    parser.add_argument("--pg-database", default=None)
     parser.add_argument("--pg-user", default="postgres")
     parser.add_argument("--pg-password", default="postgres")
     return parser.parse_args()

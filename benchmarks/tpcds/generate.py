@@ -23,6 +23,18 @@ def _db_path(data_dir, scale_factor):
     return os.path.join(data_dir, "tpcds_sf{0}.duckdb".format(scale_factor))
 
 
+def pg_database_name(scale_factor):
+    """The dedicated PostgreSQL database for a TPC-DS scale factor.
+
+    TPC-DS gets its OWN database per scale so it never collides with the TPC-H
+    benchmark on the same PostgreSQL server: both define a `customer` table, and
+    a shared database let TPC-H's 8-column customer shadow TPC-DS's 18-column
+    one (its c_customer_sk then unresolvable). The dot is dropped so the name
+    needs no quoting: scale 0.1 -> tpcds_sf01, 1 -> tpcds_sf1, 10 -> tpcds_sf10.
+    """
+    return "tpcds_sf{0}".format(str(scale_factor).replace(".", ""))
+
+
 def _generate_database(db_path, scale_factor):
     """Create the DuckDB file and populate it with dsdgen at the scale factor."""
     if os.path.exists(db_path):
