@@ -12,11 +12,16 @@ via the connector and the duck-placed tables natively, so it computes the exact
 federated answer fedq should produce. Both read identical data (load_postgres.py
 loaded every table into both sources), so a mismatch is a real engine bug.
 
+Correctness compares the engine's federated result against PURE DuckDB over the
+same file (the canonical single-source answer); the federated DuckDB oracle
+(Postgres attached) is used only for the timing baseline, since its postgres
+scanner has its own quirks (dropped rows, avg-of-decimal drift) that are not our
+bugs.
+
 Each engine run happens in an isolated child process bounded by a wall-clock
 timeout and a memory cap, so a cross-source query that never terminates or blows
 up intermediate results becomes a clean ERROR row (Timeout / Killed) instead of
-hanging or OOM-ing the whole run. The DuckDB oracle (Postgres attached) runs in
-that same child, so its timing is the "DuckDB over federated Postgres" baseline.
+hanging or OOM-ing the whole run.
 """
 
 import argparse
@@ -217,15 +222,20 @@ def _run_oracle(oracle, oracle_sql):
     return elapsed_ms, rows
 
 
-def _evaluate_worker(engine_sql, oracle_sql, db_path, options, decimals, result_queue):
-    """Child-process entry: run the query through the engine AND the oracle in
-    ONE process, compare, time both, and return the verdict.
+def _evaluate_worker(engine_sql, oracle_sql, truth_sql, db_path, options,
+                     decimals, result_queue):
+    """Child-process entry: run the query, verify it, and time the DuckDB
+    baseline - all in ONE process (so the engine's read-write DuckDB open never
+    collides with a read-only lock across processes).
 
-    Engine and oracle share the process (as in the TPC-H harness) so the
-    engine's read-write DuckDB open never collides with the oracle's read-only
-    lock across processes - the failure mode when the oracle was held open in
-    the parent. The oracle (DuckDB with Postgres attached) IS the "DuckDB over
-    federated Postgres" baseline the engine timing is measured against."""
+    CORRECTNESS compares the engine's federated result against PURE DuckDB over
+    the same file (truth_sql): pure DuckDB reads every table locally, so it
+    cannot hit the postgres-scanner quirks the federated oracle does (q59's
+    dropped rows, q18's avg-of-decimal drift). TIMING uses the federated oracle
+    (DuckDB with Postgres attached) as the "DuckDB over federated Postgres"
+    baseline; its rows are NOT trusted for correctness and a failure there only
+    drops the timing number, never the correctness verdict.
+    """
     _start_memory_watchdog(options.memory_limit)
     try:
         runtime = build_fedq(db_path, options)
@@ -234,17 +244,32 @@ def _evaluate_worker(engine_sql, oracle_sql, db_path, options, decimals, result_
         result_queue.put(("error", _error_text(error)))
         return
     try:
-        oracle = build_oracle(db_path, options)
-        oracle_ms, oracle_rows = _run_oracle(oracle, oracle_sql)
+        truth_rows = duckdb.connect(db_path, read_only=True).execute(truth_sql).fetchall()
     except Exception as error:
-        result_queue.put(("error", "oracle: " + _error_text(error)))
+        result_queue.put(("error", "ground-truth: " + _error_text(error)))
         return
-    match, reason = compare_results(engine_rows, oracle_rows, decimals)
+    oracle_ms = _time_federated_oracle(db_path, options, oracle_sql)
+    match, reason = compare_results(engine_rows, truth_rows, decimals)
     result_queue.put((
         "done",
         ("PASS" if match else "MISMATCH", reason, len(engine_rows),
-         len(oracle_rows), engine_ms, oracle_ms),
+         len(truth_rows), engine_ms, oracle_ms),
     ))
+
+
+def _time_federated_oracle(db_path, options, oracle_sql):
+    """Time DuckDB-over-Postgres for the baseline, or None if it cannot run.
+
+    The federated oracle is only a timing reference (its result is not trusted
+    for correctness), so any failure - an OOM, a scanner error, an unsupported
+    shape - must not fail an otherwise-correct query; it just yields no timing.
+    """
+    try:
+        oracle = build_oracle(db_path, options)
+        oracle_ms, _ = _run_oracle(oracle, oracle_sql)
+        return oracle_ms
+    except Exception:
+        return None
 
 
 def _finish_stalled_worker(process, timeout_s):
@@ -260,14 +285,16 @@ def _finish_stalled_worker(process, timeout_s):
     return None, reason
 
 
-def _run_isolated(engine_sql, oracle_sql, db_path, options):
-    """Run one query's engine+oracle evaluation in a child process bounded by
-    timeout and memory. Returns (outcome_tuple, None) or (None, error_text)."""
+def _run_isolated(engine_sql, oracle_sql, truth_sql, db_path, options):
+    """Run one query's engine evaluation (verified against pure DuckDB, timed
+    against the federated oracle) in a child process bounded by timeout and
+    memory. Returns (outcome_tuple, None) or (None, error_text)."""
     context = multiprocessing.get_context("fork")
     result_queue = context.Queue()
     process = context.Process(
         target=_evaluate_worker,
-        args=(engine_sql, oracle_sql, db_path, options, options.decimals, result_queue),
+        args=(engine_sql, oracle_sql, truth_sql, db_path, options,
+              options.decimals, result_queue),
     )
     process.start()
     return _await_result(process, result_queue, options.timeout)
@@ -328,13 +355,19 @@ def _query_sources(sql, placement):
 
 
 def evaluate_query(path, placement, db_path, options):
-    """Run one query through the isolated engine+oracle worker; classify it."""
+    """Run one query, verify the engine's federated result against pure DuckDB,
+    time it against the federated oracle, and classify it.
+
+    truth_sql is the raw query run against pure DuckDB (unqualified names resolve
+    to the file's main schema) - the correctness reference. engine_sql / oracle_sql
+    are qualified to the federated split for the engine and the timing oracle.
+    """
     name = os.path.splitext(os.path.basename(path))[0]
     raw = _read_query(path)
     cross = "cross" if len(_query_sources(raw, placement)) > 1 else "single"
     engine_sql = _qualify(raw, placement, FEDQ_SOURCES, ENGINE_DIALECT)
     oracle_sql = _qualify(raw, placement, ORACLE_SOURCES, "duckdb")
-    outcome, error = _run_isolated(engine_sql, oracle_sql, db_path, options)
+    outcome, error = _run_isolated(engine_sql, oracle_sql, raw, db_path, options)
     if error is not None:
         return _result(name, "ERROR", error, cross, None, None)
     status, reason, engine_rows, oracle_rows, engine_ms, oracle_ms = outcome
@@ -555,11 +588,13 @@ def _report_header(options):
         "timings are steady-state (one warm-up run discarded).".format(
             options.scale_factor, options.timeout, options.memory_limit),
         "",
-        "Correctness is differential: fedq reads each table from its placed "
-        "source while DuckDB reads the SAME split through its postgres "
-        "connector, so both compute the exact federated answer and a MISMATCH "
-        "is a real cross-source engine bug. Rows are compared in order, values "
-        "rounded to {0} decimals.".format(options.decimals),
+        "Correctness compares fedq's federated result against PURE DuckDB over "
+        "the same file (every table read locally), the canonical answer - so a "
+        "MISMATCH is a real engine bug, not a federation quirk of the DuckDB "
+        "postgres scanner (which dropped rows on q59 and drifts on avg-of-decimal "
+        "on q18). The federated DuckDB oracle is used only for the timing "
+        "baseline. Rows are compared in order, values rounded to {0} "
+        "decimals.".format(options.decimals),
         "",
     ]
 
