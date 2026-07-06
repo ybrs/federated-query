@@ -1026,3 +1026,56 @@ def test_single_key_join_denominator_not_capped():
     join = Join(left=left, right=right, join_type=JoinType.INNER, condition=condition)
     # 1000 * 50 / max(1000, 50) = 50  (NOT 1000*50/min(rows)=1000)
     assert model.estimate(join).rows == 50
+
+
+def test_date_range_interpolation_uses_ordinal_scale():
+    """Date bounds and DATE-cast literals interpolate on the day scale instead
+    of falling to the range default (which poisoned every date estimate)."""
+    import datetime
+    from federated_query.optimizer.cost import _range_ordinal, _interpolate_fraction
+    low = _range_ordinal(datetime.date(1992, 1, 1))
+    high = _range_ordinal(datetime.date(1998, 8, 2))
+    point = _range_ordinal(datetime.date(1993, 10, 1))
+    fraction = _interpolate_fraction(low, high, point, True)
+    assert 0.24 < fraction < 0.29
+
+
+def test_pg_text_bounds_parse_to_dates():
+    """PostgreSQL histogram bounds arrive as text; ISO dates must parse."""
+    from federated_query.optimizer.cost import _range_ordinal
+    import datetime
+    assert _range_ordinal("1992-01-01") == float(datetime.date(1992, 1, 1).toordinal())
+    assert _range_ordinal("not a date") is None
+    assert _range_ordinal(True) is None
+
+
+def test_interval_pair_prices_the_window_not_the_marginal_product():
+    """A both-bounded range on one column must price F(upper) - F(lower):
+    a 3-month window in a 6.6-year column is ~3.7%, while the product of the
+    two one-sided fractions would claim ~21%."""
+    import datetime
+    from federated_query.datasources.base import ColumnStatistics, TableStatistics
+    from federated_query.optimizer.cost import CostModel
+    from federated_query.config.config import CostConfig
+    from federated_query.plan.expressions import (
+        BinaryOp, BinaryOpType, Cast, ColumnRef, DataType, Literal, combine_and,
+    )
+    col = ColumnRef(table="o", column="o_orderdate", data_type=DataType.DATE)
+    def bound(op, day):
+        return BinaryOp(op=op, left=col, right=Cast(
+            expr=Literal(value=day, data_type=DataType.VARCHAR),
+            target_type="DATE", data_type=DataType.DATE))
+    predicate = combine_and([
+        bound(BinaryOpType.GTE, "1993-10-01"), bound(BinaryOpType.LT, "1994-01-01"),
+    ])
+    stats = TableStatistics.create(
+        row_count=1500000, total_size_bytes=0,
+        column_stats={"o_orderdate": ColumnStatistics.create(
+            num_distinct=2406, null_fraction=0.0, avg_width=4,
+            min_value=datetime.date(1992, 1, 1), max_value=datetime.date(1998, 8, 2),
+        )},
+    )
+    model = CostModel(CostConfig.create(), None)
+    selectivity, defaults = model._tracked_selectivity(predicate, stats, "scan")
+    assert defaults == []
+    assert 0.03 < selectivity < 0.05

@@ -1,5 +1,6 @@
 """Cost model for query optimization."""
 
+import datetime
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -27,12 +28,16 @@ from ..plan.logical import (
 from ..plan.physical import PhysicalPlanNode
 from ..plan.expressions import (
     Expression,
+    BetweenExpression,
     BinaryOp,
+    Cast,
     UnaryOp,
     ColumnRef,
+    DataType,
     Literal,
     BinaryOpType,
     UnaryOpType,
+    combine_and,
     split_conjuncts,
 )
 from ..config.config import CostConfig
@@ -52,6 +57,125 @@ from ..optimizer.estimate_defaults import (
 from ..optimizer.pushdown import bare_names
 from ..optimizer.statistics import StatisticsCollector
 from ..datasources.base import TableStatistics
+
+
+# Sentinel distinguishing "operand is not a literal" from a literal None.
+_NOT_A_LITERAL = object()
+
+# CAST target types whose string literals carry calendar values the range
+# interpolation can place on the day scale (DATE '1993-10-01' parses as a
+# Cast around a string Literal).
+_TEMPORAL_TYPES = (DataType.DATE, DataType.TIMESTAMP)
+
+
+def _comparable_literal(node):
+    """The comparable value of a range operand: a plain Literal's value, a
+    temporal CAST of one (DATE 'x') parsed to its date, or _NOT_A_LITERAL."""
+    if isinstance(node, Literal):
+        return node.value
+    if isinstance(node, Cast) and isinstance(node.expr, Literal):
+        if node.data_type in _TEMPORAL_TYPES:
+            return _parse_temporal(node.expr.value)
+        return node.expr.value
+    return _NOT_A_LITERAL
+
+
+def _parse_temporal(value):
+    """A date/timestamp literal payload as a datetime.date/.datetime; the
+    payload unchanged when it is not an ISO string (already parsed, or a
+    shape interpolation will reject downstream)."""
+    if not isinstance(value, str):
+        return value
+    try:
+        return datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return value
+
+
+def _range_ordinal(value) -> Optional[float]:
+    """A range bound's position on one shared ordinal scale: numbers as-is,
+    dates and timestamps as (fractional) days since day zero, ISO date or
+    timestamp strings parsed first (PostgreSQL histogram bounds arrive as
+    text). None for anything else - the caller then falls back to the named
+    range default instead of guessing."""
+    if isinstance(value, str):
+        value = _parse_temporal(value)
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return _temporal_days(value)
+
+
+def _temporal_days(value) -> Optional[float]:
+    """Days since day zero for a date or datetime (fractional for the time of
+    day), so date bounds and timestamp literals share one scale."""
+    if isinstance(value, datetime.datetime):
+        seconds = value.hour * 3600 + value.minute * 60 + value.second
+        return float(value.toordinal()) + seconds / 86400.0
+    if isinstance(value, datetime.date):
+        return float(value.toordinal())
+    return None
+
+
+def _interpolate_fraction(low, high, point, below) -> Optional[float]:
+    """Linear position of `point` in [low, high] oriented by direction; None
+    when any bound is missing or the span is degenerate."""
+    if low is None or high is None or point is None:
+        return None
+    span = high - low
+    if span <= 0:
+        return None
+    base = min(1.0, max(0.0, (point - low) / span))
+    return base if below else 1.0 - base
+
+
+# The four one-sided range comparison operators.
+_RANGE_OPS = (BinaryOpType.LT, BinaryOpType.LTE, BinaryOpType.GT, BinaryOpType.GTE)
+
+
+def _ordinal_stats(col_stats) -> bool:
+    """Whether the column's min/max sit on a usable ordinal scale."""
+    low = _range_ordinal(col_stats.min_value)
+    high = _range_ordinal(col_stats.max_value)
+    return low is not None and high is not None
+
+
+def _paired_interval_fraction(bounds):
+    """One combined fraction over every column with BOTH a lower and an upper
+    bound; single-direction bounds are handed back for per-conjunct pricing."""
+    fraction = 1.0
+    unpaired = []
+    for entry in bounds.values():
+        if entry["below"] and entry["above"]:
+            fraction *= _interval_fraction(entry)
+        else:
+            for _point, conjunct in entry["below"] + entry["above"]:
+                unpaired.append(conjunct)
+    return fraction, unpaired
+
+
+def _interval_fraction(entry) -> float:
+    """F(tightest upper) - F(tightest lower) on the column's ordinal scale,
+    clamped to [0, 1] (inverted bounds select nothing)."""
+    low = _range_ordinal(entry["stats"].min_value)
+    high = _range_ordinal(entry["stats"].max_value)
+    span = high - low
+    if span <= 0:
+        return 1.0
+    upper = _tightest(entry["below"], min)
+    lower = _tightest(entry["above"], max)
+    upper_fraction = min(1.0, max(0.0, (upper - low) / span))
+    lower_fraction = min(1.0, max(0.0, (lower - low) / span))
+    return max(0.0, upper_fraction - lower_fraction)
+
+
+def _tightest(items, chooser):
+    """The tightest bound point among (point, conjunct) pairs."""
+    points = []
+    for point, _conjunct in items:
+        points.append(point)
+    return chooser(points)
 
 
 class CostModel:
@@ -852,31 +976,91 @@ class CostModel:
             return self._tracked_binary_selectivity(predicate, stats, target)
         if isinstance(predicate, UnaryOp):
             return self._tracked_unary_selectivity(predicate, stats, target)
+        if isinstance(predicate, BetweenExpression):
+            return self._tracked_between_selectivity(predicate, stats, target)
         return DEFAULT_EQ_SELECTIVITY, [
             f"selectivity({target}:{type(predicate).__name__})"
         ]
 
+    def _tracked_between_selectivity(self, between, stats, target):
+        """BETWEEN as the equivalent both-bounded conjunction, so the interval
+        pairing (not the product of two marginals) prices it."""
+        # The lower bound of the interval, value >= lower, built for
+        # estimation only (never emitted into a plan).
+        lower = BinaryOp.create(
+            op=BinaryOpType.GTE, left=between.value, right=between.lower
+        )
+        # The matching upper bound, value <= upper, completing the pair the
+        # interval pricing combines into F(upper) - F(lower).
+        upper = BinaryOp.create(
+            op=BinaryOpType.LTE, left=between.value, right=between.upper
+        )
+        return self._tracked_conjunction(combine_and([lower, upper]), stats, target)
+
     def _tracked_binary_selectivity(self, binop, stats, target) -> Tuple[float, List[str]]:
         """Dispatch a binary predicate to its tracked selectivity rule."""
-        if binop.op in (BinaryOpType.AND, BinaryOpType.OR):
-            return self._tracked_boolean_selectivity(binop, stats, target)
+        if binop.op == BinaryOpType.AND:
+            return self._tracked_conjunction(binop, stats, target)
+        if binop.op == BinaryOpType.OR:
+            return self._tracked_or_selectivity(binop, stats, target)
         if binop.op in (BinaryOpType.EQ, BinaryOpType.NEQ):
             return self._tracked_equality_selectivity(binop, stats, target)
-        range_ops = (BinaryOpType.LT, BinaryOpType.LTE, BinaryOpType.GT, BinaryOpType.GTE)
-        if binop.op in range_ops:
+        if binop.op in _RANGE_OPS:
             return self._tracked_range_selectivity(binop, stats, target)
         if binop.op == BinaryOpType.LIKE:
             return DEFAULT_LIKE_SELECTIVITY, [f"like_selectivity({target})"]
         return DEFAULT_EQ_SELECTIVITY, [f"selectivity({target}:{binop.op.value})"]
 
-    def _tracked_boolean_selectivity(self, binop, stats, target) -> Tuple[float, List[str]]:
-        """AND is the product; OR the inclusion-exclusion complement."""
+    def _tracked_or_selectivity(self, binop, stats, target) -> Tuple[float, List[str]]:
+        """OR as the inclusion-exclusion complement of its two sides."""
         left_sel, left_defaults = self._tracked_selectivity(binop.left, stats, target)
         right_sel, right_defaults = self._tracked_selectivity(binop.right, stats, target)
-        defaults = left_defaults + right_defaults
-        if binop.op == BinaryOpType.AND:
-            return left_sel * right_sel, defaults
-        return 1.0 - ((1.0 - left_sel) * (1.0 - right_sel)), defaults
+        combined = 1.0 - ((1.0 - left_sel) * (1.0 - right_sel))
+        return combined, left_defaults + right_defaults
+
+    def _tracked_conjunction(self, predicate, stats, target) -> Tuple[float, List[str]]:
+        """An AND tree: both-bounded range pairs on one column combine into a
+        single interval fraction FIRST (the product of the two one-sided
+        marginals badly over-estimates a narrow interval: a 3-month
+        o_orderdate window is 3.7% of the column, the product says ~21%);
+        every other conjunct multiplies in independently."""
+        remaining, fraction = self._interval_terms(split_conjuncts(predicate), stats)
+        selectivity = fraction
+        defaults: List[str] = []
+        for conjunct in remaining:
+            one, one_defaults = self._tracked_selectivity(conjunct, stats, target)
+            selectivity *= one
+            defaults.extend(one_defaults)
+        return selectivity, defaults
+
+    def _interval_terms(self, conjuncts, stats):
+        """Partition conjuncts into per-column both-bounded range pairs
+        (returned as one combined fraction) and everything else."""
+        bounds: Dict[str, Dict[str, Any]] = {}
+        remaining = []
+        for conjunct in conjuncts:
+            if not self._bucket_range_bound(conjunct, stats, bounds):
+                remaining.append(conjunct)
+        fraction, unpaired = _paired_interval_fraction(bounds)
+        remaining.extend(unpaired)
+        return remaining, fraction
+
+    def _bucket_range_bound(self, conjunct, stats, bounds) -> bool:
+        """File one range conjunct under its column when the column's bounds
+        and the literal all sit on one ordinal scale; False to leave the
+        conjunct for the ordinary per-conjunct path."""
+        if not isinstance(conjunct, BinaryOp) or conjunct.op not in _RANGE_OPS:
+            return False
+        col_ref, value, below = self._range_parts(conjunct)
+        col_stats = self._column_stats_or_none(stats, col_ref)
+        point = _range_ordinal(value) if col_stats is not None else None
+        if point is None or not _ordinal_stats(col_stats):
+            return False
+        entry = bounds.setdefault(
+            col_ref.column, {"below": [], "above": [], "stats": col_stats}
+        )
+        entry["below" if below else "above"].append((point, conjunct))
+        return True
 
     def _tracked_equality_selectivity(self, binop, stats, target) -> Tuple[float, List[str]]:
         """EQ is 1/ndv when the column's NDV is known; NEQ its complement."""
@@ -911,34 +1095,28 @@ class CostModel:
 
     def _range_fraction(self, binop, stats) -> Optional[float]:
         """(literal - min) / (max - min) oriented by the comparison direction;
-        None when the column, bounds, or literal are not all usable numbers."""
+        None when the column, bounds, or literal share no ordinal scale."""
         col_ref, value, below = self._range_parts(binop)
         col_stats = self._column_stats_or_none(stats, col_ref)
-        if col_stats is None or not self._numeric_bounds(col_stats, value):
+        if col_stats is None:
             return None
-        span = col_stats.max_value - col_stats.min_value
-        if span <= 0:
-            return None
-        base = min(1.0, max(0.0, (value - col_stats.min_value) / span))
-        return base if below else 1.0 - base
+        low = _range_ordinal(col_stats.min_value)
+        high = _range_ordinal(col_stats.max_value)
+        point = _range_ordinal(value)
+        return _interpolate_fraction(low, high, point, below)
 
     def _range_parts(self, binop):
         """Normalize a range comparison to (column, literal, below) where
         below means the predicate keeps column values BELOW the literal."""
         below_ops = (BinaryOpType.LT, BinaryOpType.LTE)
-        if isinstance(binop.left, ColumnRef) and isinstance(binop.right, Literal):
-            return binop.left, binop.right.value, binop.op in below_ops
-        if isinstance(binop.left, Literal) and isinstance(binop.right, ColumnRef):
+        left_value = _comparable_literal(binop.left)
+        right_value = _comparable_literal(binop.right)
+        if isinstance(binop.left, ColumnRef) and right_value is not _NOT_A_LITERAL:
+            return binop.left, right_value, binop.op in below_ops
+        if left_value is not _NOT_A_LITERAL and isinstance(binop.right, ColumnRef):
             # literal < column reads as column > literal: direction flips.
-            return binop.right, binop.left.value, binop.op not in below_ops
+            return binop.right, left_value, binop.op not in below_ops
         return None, None, False
-
-    def _numeric_bounds(self, col_stats, value) -> bool:
-        """True when min, max and the literal are all plain numbers."""
-        for item in (col_stats.min_value, col_stats.max_value, value):
-            if not isinstance(item, (int, float)) or isinstance(item, bool):
-                return False
-        return True
 
     def _tracked_unary_selectivity(self, unop, stats, target) -> Tuple[float, List[str]]:
         """NOT complements; IS NULL reads the null fraction when known."""

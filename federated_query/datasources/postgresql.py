@@ -1,5 +1,6 @@
 """PostgreSQL data source implementation."""
 
+import datetime
 from contextlib import contextmanager
 from typing import List, Dict, Any, Iterator, Optional
 import numpy as np
@@ -294,21 +295,26 @@ class PostgreSQLDataSource(DataSource):
         return int(abs(n_distinct) * row_count)
 
     def _histogram_ends(self, bounds):
-        """The first and last histogram bound as Python numbers when the array
-        holds numerics; non-numeric bounds are reported as None (a string
-        min/max is not usable for range-selectivity interpolation)."""
+        """The first and last histogram bound parsed to a comparable Python
+        value (number, date, or timestamp); a bound of any other shape is
+        reported as None (unusable for range-selectivity interpolation)."""
         if not bounds:
             return None, None
         return self._parse_bound(bounds[0]), self._parse_bound(bounds[-1])
 
     def _parse_bound(self, text: str):
-        """One histogram bound parsed as int, then float; None when neither."""
+        """One histogram bound parsed as int, float, then ISO date/timestamp
+        (pg_stats renders every bound as text); None when none of them fit."""
         try:
             return int(text)
         except ValueError:
             pass
         try:
             return float(text)
+        except ValueError:
+            pass
+        try:
+            return datetime.datetime.fromisoformat(text)
         except ValueError:
             return None
 
