@@ -27,7 +27,7 @@ more and still fail (pinned by tests/test_tpcds_compare.py).
 ## Current status (pg-dims, SF0.1) - VERIFIED full 99-query tally 2026-07-07
 
 `PASS 99 | MISMATCH 0 | ERROR 0` - EVERY TPC-DS query passes federated.
-Geomean 2.80x, totals 13.9s vs 4.2s. Suite: 1272 passed, 3 skipped,
+Geomean 2.48x, totals 11.0s vs 4.2s. Suite: 1273 passed, 3 skipped,
 25 xfailed. Reports are commit-named under `benchmarks/tpcds/reports/`.
 
 TPC-H regression check 2026-07-07 (report-result-9a28f39.md): fedpgduck SF1
@@ -46,15 +46,20 @@ Outlier diagnosis found TWO structural costs; the first is fixed:
   structural fields never mutate after construction. Effect: geomean 3.44x
   -> 2.80x, totals 27.1s -> 13.9s; q59 3989 -> 158ms, q02 2552 -> 135ms,
   q64 3384 -> 398ms, q66 1057 -> 224ms.
-- **CTE re-emission (NEXT)**: a multi-referenced CTE re-emits and re-executes
-  its whole body per reference (rust_ir _emit_cte_scan documents it). q04
-  emits year_total 18 TIMES (customer scanned 18x, 82 merge fragments) - now
-  the top outlier at 1210ms/18.2x; also q74/q11/q75/q14/q31/q47/q57. Fix:
-  emit each CTE body once into a binding (emitter cache by producer
-  identity) + make Rust binding reads non-consuming (batches are Arc-cheap
-  to clone; take_materialized currently REMOVES the binding).
-- Remaining after that: q09 (108ms/13x, 15 scalar subqueries), q44
-  (67ms/13x), q10/q35 (disjunctive plan phases 2/3).
+- **CTE re-emission (FIXED, commit 2b0d639 + fedqrs 4526e0d)**: a
+  multi-referenced CTE re-emitted and re-executed its whole body per
+  reference. _emit_cte_scan now caches the body binding by producer identity
+  (the planner already shared ONE PhysicalCTE across references); the engine
+  pre-counts each binding's reads and CLONES a shared binding Arc-shallow
+  until its LAST consumer takes it (memory released where single-use
+  released it). Effect: geomean 2.80x -> 2.48x, totals 13.9s -> 11.0s;
+  q04 1210 -> 289ms (body ran 18x, now once), q14 711 -> 372ms, q11 532 ->
+  171ms, q75 302 -> 157ms, q74 366 -> 123ms, q47 198 -> 106ms.
+- Remaining outliers, all small-to-mid absolute: q44 70ms/14.7x and q09
+  100ms/9.9x and q28 80ms/8.6x (many scalar subqueries over one table -
+  island-breaking family), q35 594ms/7.5x and q10 (disjunctive plan phases
+  2/3 - the union split still replicates the input), q33/q56/q60 ~6x
+  (repeated same-fact union branches).
 
 ## Disjunctive decorrelation - Phase 1 DONE 2026-07-07 (commit 1767f60)
 
