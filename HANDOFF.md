@@ -27,8 +27,16 @@ more and still fail (pinned by tests/test_tpcds_compare.py).
 ## Current status (pg-dims, SF0.1) - VERIFIED full 99-query tally 2026-07-07
 
 `PASS 99 | MISMATCH 0 | ERROR 0` - EVERY TPC-DS query passes federated.
-Geomean 2.48x, totals 11.0s vs 4.2s. Suite: 1273 passed, 3 skipped,
+Geomean 2.39x, totals 10.5s vs 4.4s. Suite: 1276 passed, 3 skipped,
 25 xfailed. Reports are commit-named under `benchmarks/tpcds/reports/`.
+
+Disjunctive decorrelation is COMPLETE (disjunctive-decorrelation-plan.md):
+phase 2 (commit e68149e) rewrites a same-key OR of positive existentials as
+ONE SEMI join over a UNION ALL of the subquery key domains - q10 522 ->
+143ms (1.49x), q35 567 -> 136ms (1.72x); taken from both the top-level-OR
+and OR-conjunct entries; mixed/negative/multi-key shapes keep the flag
+path. Phase 3 (LeftMark) declined by its decision gate (q45 ~120ms/3.1x on
+the flag path).
 
 TPC-H regression check 2026-07-07 (report-result-9a28f39.md): fedpgduck SF1
 22/22 correct, 2145ms vs 1125ms = 1.91x - no regression vs the previous
@@ -55,11 +63,9 @@ Outlier diagnosis found TWO structural costs; the first is fixed:
   released it). Effect: geomean 2.80x -> 2.48x, totals 13.9s -> 11.0s;
   q04 1210 -> 289ms (body ran 18x, now once), q14 711 -> 372ms, q11 532 ->
   171ms, q75 302 -> 157ms, q74 366 -> 123ms, q47 198 -> 106ms.
-- Remaining outliers, all small-to-mid absolute: q44 70ms/14.7x and q09
-  100ms/9.9x and q28 80ms/8.6x (many scalar subqueries over one table -
-  island-breaking family), q35 594ms/7.5x and q10 (disjunctive plan phases
-  2/3 - the union split still replicates the input), q33/q56/q60 ~6x
-  (repeated same-fact union branches).
+- Remaining outliers, all small absolute: q44 82ms/15.5x, q09 122ms/14.1x,
+  q28 84ms/8.5x (many scalar subqueries over one table - the island-breaking
+  family, the next candidate), then q93/q41/q78 at 4.6-6.2x under 200ms.
 
 ## Disjunctive decorrelation - Phase 1 DONE 2026-07-07 (commit 1767f60)
 
