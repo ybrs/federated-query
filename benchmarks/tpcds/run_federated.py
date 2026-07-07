@@ -25,11 +25,13 @@ hanging or OOM-ing the whole run.
 """
 
 import argparse
+import datetime
 import glob
 import math
 import multiprocessing
 import os
 import queue as queue_module
+import subprocess
 import threading
 import time
 
@@ -53,6 +55,10 @@ from generate import (
 from qualify import TPCDS_TABLES
 from run import arrow_to_rows, _read_query
 
+
+HERE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Reports are commit-named under reports/, like the TPC-H benchmark's.
+REPORTS_DIR = os.path.join(HERE_DIR, "reports")
 
 # The seven TPC-DS fact tables; everything else is a dimension.
 FACT_TABLES = frozenset(
@@ -449,22 +455,28 @@ def _geomean(values):
 
 
 def _timing_table_lines(placement_name, results):
-    """Markdown lines: engine vs DuckDB-over-Postgres timing for PASS queries."""
+    """Markdown lines: the timing totals for PASS queries with both timings.
+
+    Per-query timings live in the per-query matrix; this is the tpch-style
+    summary row - totals, ratio, geomean, and how many queries were measured.
+    """
     rows = _timing_rows(results)
     if not rows:
         return []
-    lines = ["", "### Timings (PASS only): engine vs DuckDB-over-Postgres [{0}]".format(
-        placement_name), "", "| query | engine ms | duck ms | ratio |",
-        "|---|---|---|---|"]
+    ours_total = 0.0
+    duck_total = 0.0
     ratios = []
     for name, engine_ms, duck_ms, ratio in rows:
+        ours_total += engine_ms
+        duck_total += duck_ms
         ratios.append(ratio)
-        lines.append("| {0} | {1:.1f} | {2:.1f} | {3:.2f}x |".format(
-            name, engine_ms, duck_ms, ratio))
-    lines.append("")
-    lines.append("Geomean ratio (engine/duck): {0:.2f}x over {1} queries.".format(
-        _geomean(ratios), len(rows)))
-    return lines
+    return ["", "### Timing summary (PASS only): engine vs "
+            "DuckDB-over-Postgres [{0}]".format(placement_name), "",
+            "| Ours (ms) | DuckDB (ms) | Ratio | Geomean | Measured |",
+            "| --- | --- | --- | --- | --- |",
+            "| {0:.1f} | {1:.1f} | {2:.2f}x | {3:.2f}x | {4} |".format(
+                ours_total, duck_total, ours_total / duck_total,
+                _geomean(ratios), len(rows)), ""]
 
 
 def _print_timing_summary(placement_name, results):
@@ -553,15 +565,32 @@ def _rows_cell(result):
     return "{0} / {1}".format(result["engine_rows"], result["oracle_rows"])
 
 
+def _ms_cell(value):
+    """A milliseconds cell, or '-' when the query produced no timing."""
+    if value is None:
+        return "-"
+    return "{0:.1f}".format(value)
+
+
+def _ratio_cell(result):
+    """The ours/DuckDB ratio cell, or '-' without both timings."""
+    if result["engine_ms"] is None or not result["oracle_ms"]:
+        return "-"
+    return "{0:.2f}x".format(result["engine_ms"] / result["oracle_ms"])
+
+
 def _matrix_lines(results):
-    """Build the per-query markdown table (status, span, row counts, detail)."""
-    lines = ["| Query | Status | Span | Rows engine/oracle | Detail |",
-             "| --- | --- | --- | --- | --- |"]
+    """Build the per-query markdown table (timings, status, rows, detail)."""
+    lines = ["| Query | Ours (ms) | DuckDB (ms) | Ratio | Status | Span "
+             "| Rows engine/oracle | Detail |",
+             "| --- | --- | --- | --- | --- | --- | --- | --- |"]
     for result in results:
         detail = result["reason"] if result["reason"] else "rows and values match"
-        lines.append("| {0} | {1} | {2} | {3} | {4} |".format(
-            result["name"], result["status"], result["span"],
-            _rows_cell(result), _escape(detail)))
+        lines.append("| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} |".format(
+            result["name"], _ms_cell(result["engine_ms"]),
+            _ms_cell(result["oracle_ms"]), _ratio_cell(result),
+            result["status"], result["span"], _rows_cell(result),
+            _escape(detail)))
     return lines
 
 
@@ -577,10 +606,48 @@ def _placement_section(placement_name, results):
     return lines
 
 
+def _git(*args):
+    """Run a git command in this repo and return its stripped stdout."""
+    done = subprocess.run(
+        ("git",) + args, cwd=HERE_DIR, capture_output=True, text=True
+    )
+    return done.stdout.strip()
+
+
+def _commit_info():
+    """Return (short-hash, subject, dirty) for the current git checkout."""
+    short = _git("rev-parse", "--short", "HEAD")
+    subject = _git("log", "-1", "--format=%s")
+    dirty = _git("status", "--porcelain") != ""
+    return short, subject, dirty
+
+
+def _host_line():
+    """A one-line description of the CPU the benchmark ran on."""
+    model = "unknown CPU"
+    with open("/proc/cpuinfo") as handle:
+        for line in handle:
+            if line.startswith("model name"):
+                model = line.split(":", 1)[1].strip()
+                break
+    return "{0} ({1} cores)".format(model, os.cpu_count())
+
+
 def _report_header(options):
-    """Build the report preamble: parameters and methodology."""
+    """Build the report preamble: commit, host, engines, parameters."""
+    short, subject, dirty = _commit_info()
+    dirty_note = ""
+    if dirty:
+        dirty_note = "  (working tree DIRTY - results not from a clean commit)"
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     return [
         "# TPC-DS federated benchmark report",
+        "",
+        "Commit: `{0}` - {1}{2}".format(short, subject, dirty_note),
+        "Generated: {0}".format(stamp),
+        "Host: {0}".format(_host_line()),
+        "Engine: fedqrs (Rust / DataFusion) - the only execution path.",
+        "Oracle: DuckDB {0}.".format(duckdb.__version__),
         "",
         "Scale factor {0}, PostgreSQL + DuckDB split, per-query timeout {1}s, "
         "memory cap {2} MB. Each query's engine and DuckDB oracle (with "
@@ -653,8 +720,14 @@ def run(options):
     for placement_name in options.placements.split(","):
         results = run_placement(placement_name.strip(), paths, db_path, options)
         sections.append((placement_name.strip(), results))
-    if options.report:
-        write_report(sections, options, options.report)
+    write_report(sections, options, options.report or _default_report_path())
+
+
+def _default_report_path():
+    """reports/report-result-<commit>.md, like the TPC-H benchmark."""
+    short, _, _ = _commit_info()
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    return os.path.join(REPORTS_DIR, "report-result-{0}.md".format(short))
 
 
 def _parse_args():
