@@ -379,6 +379,18 @@ class _Ctx:
         # relation that ORIGINATES the key column instead of forcing a lazy
         # join region into memory (see _collect_anchor).
         self.scan_bindings = {}
+        # Per traced-base-id, the reduction candidate donating the FEWEST
+        # keys (built by _injection_winners before emission): when several
+        # joins trace to one base, first-emitted must not beat most
+        # selective (q33 injected 90k address keys and left January's 31
+        # date keys unused).
+        self.injection_winners = {}
+        # A winner's emitted keys, keyed by id(build node), so a winner
+        # feeding several bases collects once.
+        self.winner_keys = {}
+        # Build-side bindings keyed by id(build node), so a winner's early
+        # emission and its own join's emission share one read.
+        self.build_bindings = {}
 
 
 def build_ir(plan):
@@ -390,6 +402,7 @@ def build_ir(plan):
     shapes raise so we never emit a plan that could produce wrong rows.
     """
     ctx = _Ctx()
+    ctx.injection_winners = _injection_winners(plan)
     binding = _emit(plan, ctx)
     ctx.steps.append({"op": "return", "input": binding})
     return {
@@ -1448,6 +1461,21 @@ def _emit_reduced_inputs(ctx, build_child, probe_child, build_key_expr, probe_ke
     itself, forcing it.
     """
     build_binding = _emit_build_side(ctx, build_child)
+    keys_binding, anchor_key = _emit_keys_for(
+        ctx, build_child, build_binding, build_key_expr
+    )
+    reduction = {
+        "build": build_child,
+        "keys_binding": keys_binding,
+        "build_key": anchor_key,
+    }
+    probe_binding = _emit_probe(ctx, probe_child, probe_key_expr, reduction)
+    return build_binding, probe_binding
+
+
+def _emit_keys_for(ctx, build_child, build_binding, build_key_expr):
+    """(keys binding, key name) of a build side's distinct join keys,
+    anchored to the originating base scan when traceable."""
     anchor = _collect_anchor(ctx, build_child, build_key_expr)
     if anchor is None:
         anchor_binding = build_binding
@@ -1456,10 +1484,7 @@ def _emit_reduced_inputs(ctx, build_child, probe_child, build_key_expr, probe_ke
         anchor_binding, anchor_key = anchor
     keys_binding = ctx.names.binding()
     _emit_collect_distinct(ctx, anchor_binding, anchor_key, keys_binding)
-    probe_binding = _emit_probe(
-        ctx, probe_child, probe_key_expr, keys_binding, anchor_key
-    )
-    return build_binding, probe_binding
+    return keys_binding, anchor_key
 
 
 def _collect_anchor(ctx, build_child, build_key_expr):
@@ -1492,14 +1517,15 @@ def _originating_relation(node, key_expr):
     return None
 
 
-def _emit_probe(ctx, probe_child, probe_key_expr, keys_binding, build_key):
+def _emit_probe(ctx, probe_child, probe_key_expr, reduction):
     """Emit the probe with the build keys injected into its base scan(s).
 
     A plain scan / remote probe is injected directly. A composite probe (a
     join cascade, an aggregate subquery, decorrelation wrappers) has the
     keys injected into every base scan the key traces to; each base binding
     is cached so the wrappers - emitted normally as coordinator fragments -
-    read the reduced bases."""
+    read the reduced bases. Per base, the PLANNED WINNER's keys (fewest
+    donated) inject rather than this join's own when they differ."""
     bases = _probe_injection_bases(probe_child, probe_key_expr)
     if bases is None:
         # _probe_base_resolvable gated on this before choosing the reduced
@@ -1508,33 +1534,136 @@ def _emit_probe(ctx, probe_child, probe_key_expr, keys_binding, build_key):
     for base, inject_col in bases:
         cached = ctx.injected.get(id(base))
         if cached is not None:
-            # An earlier join already injected this base; reading the fact a
-            # SECOND time for a weaker filter costs more than it saves (q39
-            # shipped inventory twice). The join above still enforces its
-            # keys exactly - injection is only a reduction.
+            # This base is already injected; reading the fact a SECOND time
+            # for another filter costs more than it saves (q39 shipped
+            # inventory twice). The join above still enforces its keys
+            # exactly - injection is only a reduction.
             if base is probe_child:
                 return cached
             continue
-        base_binding = ctx.names.binding()
-        _emit_injected_scan(
-            ctx, base, inject_col, keys_binding, base_binding, build_key
-        )
+        base_binding = _emit_base_injection(ctx, base, inject_col, reduction)
         ctx.injected[id(base)] = base_binding
         if base is probe_child:
             return base_binding
     return _emit(probe_child, ctx)
 
 
+def _emit_base_injection(ctx, base, inject_col, reduction):
+    """One injected read of a base, using the planned winner's keys when a
+    more selective candidate targets the same base."""
+    winner = ctx.injection_winners.get(id(base))
+    keys_binding, build_key = reduction["keys_binding"], reduction["build_key"]
+    column = inject_col
+    if winner is not None and winner["build"] is not reduction["build"]:
+        keys_binding, build_key = _winner_keys(ctx, winner)
+        column = winner["columns"][id(base)]
+    base_binding = ctx.names.binding()
+    _emit_injected_scan(ctx, base, column, keys_binding, base_binding, build_key)
+    return base_binding
+
+
+def _winner_keys(ctx, winner):
+    """The winning candidate's distinct-keys binding, emitted once."""
+    cached = ctx.winner_keys.get(id(winner["build"]))
+    if cached is not None:
+        return cached
+    build_binding = _emit_build_side(ctx, winner["build"])
+    keys = _emit_keys_for(ctx, winner["build"], build_binding, winner["build_key"])
+    ctx.winner_keys[id(winner["build"])] = keys
+    return keys
+
+
+def _injection_winners(plan):
+    """Per traced-base-id, the reduction candidate donating the fewest keys.
+
+    Emission is bottom-up, so without this plan-level pass the INNERMOST
+    join's injection claims a shared base first regardless of selectivity
+    (q33: 90k address keys won over January's 31 date keys and the fact
+    shipped whole). Candidates whose build subtree CONTAINS the base are
+    skipped - their keys cannot exist before the base is read."""
+    winners = {}
+    for node in _walk_plan_nodes(plan):
+        if not isinstance(node, PhysicalHashJoin):
+            continue
+        if not _reduction_applies(node):
+            continue
+        _note_candidate(winners, node)
+    return winners
+
+
+def _walk_plan_nodes(node):
+    """Yield every node of a physical plan tree."""
+    yield node
+    for child in node.children():
+        yield from _walk_plan_nodes(child)
+
+
+def _reduction_applies(join) -> bool:
+    """Whether the emitter will take the reduced path for this join."""
+    if not _can_reduce(join) or not _probe_base_resolvable(join):
+        return False
+    return _reduction_filters(join)
+
+
+def _note_candidate(winners, join):
+    """Record this join's reduction against every base it traces to,
+    keeping the candidate with the smaller build output (fewer keys)."""
+    build, probe, build_key, probe_key = _orient_join(join)
+    bases = _probe_injection_bases(probe, probe_key)
+    if bases is None:
+        return
+    columns = {}
+    for base, inject_col in bases:
+        columns[id(base)] = inject_col
+    score = _candidate_score(build)
+    for base, _ in bases:
+        if _subtree_contains(build, base):
+            continue
+        current = winners.get(id(base))
+        if current is None or score < current["score"]:
+            winners[id(base)] = {
+                "build": build,
+                "build_key": build_key,
+                "columns": columns,
+                "score": score,
+            }
+
+
+def _candidate_score(build):
+    """A candidate's key-count proxy: the build's output estimate, or
+    effectively infinite when unknown (an unjudgeable candidate must not
+    beat a judged selective one)."""
+    rows = _output_rows(build)
+    if rows is None:
+        rows = getattr(build, "estimated_rows", None)
+    return (1 << 62) if rows is None else rows
+
+
+def _subtree_contains(node, target) -> bool:
+    """Whether `target` (by identity) appears in `node`'s subtree."""
+    for candidate in _walk_plan_nodes(node):
+        if candidate is target:
+            return True
+    return False
+
+
 def _emit_build_side(ctx, build_child):
     """The build input's binding: the dedicated materialized read for a plain
     scan, the subtree's own emission for anything else (every step output is
     a materialized binding in the engine, so the key collection and the join
-    can both read it)."""
+    can both read it). Cached by node identity, so a winner's early keys
+    emission and the join's own emission share one read."""
+    cached = ctx.build_bindings.get(id(build_child))
+    if cached is not None:
+        return cached
     if isinstance(build_child, PhysicalScan):
         binding = ctx.names.binding()
         _emit_build_scan(ctx, build_child, binding)
+        ctx.build_bindings[id(build_child)] = binding
         return binding
-    return _emit(build_child, ctx)
+    binding = _emit(build_child, ctx)
+    ctx.build_bindings[id(build_child)] = binding
+    return binding
 
 
 def _emit_build_scan(ctx, build_child, binding):

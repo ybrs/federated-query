@@ -575,3 +575,47 @@ def test_probe_base_resolvable_allows_a_plain_scan_probe():
     fact = _scan("store_sales", "ss", ["ss_hdemo_sk", "ss_store_sk"])
     join = _inner(fact, dim, _col("ss", "ss_hdemo_sk"), _col("hd", "hd_demo_sk"))
     assert _probe_base_resolvable(join) is True
+
+
+def test_traced_bases_descend_into_every_union_branch():
+    """A UNION probe (q05's channel unions) traces to EVERY branch's base
+    scan, so one keys binding can inject into all of them."""
+    from federated_query.executor.rust_ir import _traced_injection_bases
+    from federated_query.plan.physical import PhysicalUnion
+
+    sales = _scan("store_sales", "ss", ["date_sk", "price"])
+    returns = _scan("store_returns", "sr", ["date_sk", "price"])
+    union = PhysicalUnion(inputs=[sales, returns], distinct=False)
+    bases = _traced_injection_bases(union, (None, "date_sk"))
+    assert bases is not None and len(bases) == 2
+    found = []
+    for base, column in bases:
+        assert column == "date_sk"
+        found.append(base)
+    assert sales in found and returns in found
+
+
+def test_injection_winner_is_the_smallest_build_not_the_innermost():
+    """Two reducible joins trace to the SAME fact base: the candidate whose
+    build donates FEWER keys must win, regardless of join nesting (q33
+    injected 90k address keys and left the 31 date keys unused)."""
+    from federated_query.executor.rust_ir import _injection_winners
+
+    fact = _est_scan(
+        "store_sales", "ss", ["ss_addr_sk", "ss_date_sk", "price"], 28000000
+    )
+    # Both dimensions carry a pushed filter (unfiltered builds are refused
+    # structurally) and an output estimate the score can rank.
+    addr = _est_scan(
+        "customer_address",
+        "ca",
+        ["ca_address_sk"],
+        90000,
+        filters=_col("ca", "ca_address_sk"),
+    )
+    date = _est_scan("date_dim", "d", ["d_date_sk"], 31, filters=_col("d", "d_date_sk"))
+    inner = _inner(fact, addr, _col("ss", "ss_addr_sk"), _col("ca", "ca_address_sk"))
+    outer = _inner(inner, date, _col("ss", "ss_date_sk"), _col("d", "d_date_sk"))
+    winners = _injection_winners(outer)
+    assert id(fact) in winners
+    assert winners[id(fact)]["build"] is date, "the 31-key date build must win"
