@@ -63,23 +63,32 @@ class RegionEstimator(ABC):
 
     @abstractmethod
     def atom_estimate(
-        self, region: JoinRegion, atom_index: int,
+        self,
+        region: JoinRegion,
+        atom_index: int,
         local_conjuncts: List[JoinConjunct],
     ) -> CardinalityEstimate:
         """The estimated rows of one atom under its single-atom conjuncts."""
 
     @abstractmethod
     def join_estimate(
-        self, region: JoinRegion, left: CardinalityEstimate, atom_index: int,
-        atom: CardinalityEstimate, conjuncts: List[JoinConjunct],
+        self,
+        region: JoinRegion,
+        left: CardinalityEstimate,
+        atom_index: int,
+        atom: CardinalityEstimate,
+        conjuncts: List[JoinConjunct],
     ) -> CardinalityEstimate:
         """The estimated rows of joining the accumulated left side with one
         atom under the conjuncts newly placed at this step."""
 
     @abstractmethod
     def cross_estimate(
-        self, region: JoinRegion, left: CardinalityEstimate,
-        right: CardinalityEstimate, conjuncts: List[JoinConjunct],
+        self,
+        region: JoinRegion,
+        left: CardinalityEstimate,
+        right: CardinalityEstimate,
+        conjuncts: List[JoinConjunct],
     ) -> CardinalityEstimate:
         """The estimated rows of CROSSing two component subtrees, reduced by
         any non-equi conjuncts that span them."""
@@ -264,8 +273,9 @@ def choose_order(
     ordered: List[ComponentOrder] = []
     for component in _connected_components(region):
         ordered.append(
-            _order_component(region, estimator, atom_estimates, atom_sources,
-                             component, max_dp_size)
+            _order_component(
+                region, estimator, atom_estimates, atom_sources, component, max_dp_size
+            )
         )
     ordered.sort(key=_component_sort_key)
     return _combine(region, estimator, ordered)
@@ -346,8 +356,12 @@ def _flood(adjacency, start: int, seen: Set[int]) -> List[int]:
 
 
 def _order_component(
-    region, estimator, atom_estimates, atom_sources, component: List[int],
-    max_dp_size: int
+    region,
+    estimator,
+    atom_estimates,
+    atom_sources,
+    component: List[int],
+    max_dp_size: int,
 ) -> ComponentOrder:
     """One component's order: trivial, DP, or greedy by its size."""
     if len(component) == 1:
@@ -384,8 +398,9 @@ def _dp_best(
             0.0, [index], [], atom_estimates[index], 0.0, atom_sources[index]
         )
     for size in range(2, len(component) + 1):
-        _dp_layer(region, estimator, atom_estimates, atom_sources, component,
-                  best, size)
+        _dp_layer(
+            region, estimator, atom_estimates, atom_sources, component, best, size
+        )
     full = best.get(frozenset(component))
     if full is None:
         raise JoinOrderError("DP never covered a connected component fully")
@@ -400,8 +415,14 @@ def _dp_layer(
     additions: Dict[FrozenSet[int], _Candidate] = {}
     for subset in _subsets_of_size(best, size - 1):
         _extend_subset(
-            region, estimator, atom_estimates, atom_sources, component,
-            best[subset], subset, additions,
+            region,
+            estimator,
+            atom_estimates,
+            atom_sources,
+            component,
+            best[subset],
+            subset,
+            additions,
         )
     best.update(additions)
 
@@ -422,15 +443,26 @@ def _subset_key(subset: FrozenSet[int]) -> tuple:
 
 
 def _extend_subset(
-    region, estimator, atom_estimates, atom_sources, component, candidate,
-    subset, additions
+    region,
+    estimator,
+    atom_estimates,
+    atom_sources,
+    component,
+    candidate,
+    subset,
+    additions,
 ) -> None:
     """Try every connected single-atom extension of one candidate."""
     for atom_index in component:
         if atom_index in subset:
             continue
         extended = _try_extend(
-            region, estimator, atom_estimates, atom_sources, candidate, subset,
+            region,
+            estimator,
+            atom_estimates,
+            atom_sources,
+            candidate,
+            subset,
             atom_index,
         )
         if extended is not None:
@@ -438,8 +470,7 @@ def _extend_subset(
 
 
 def _try_extend(
-    region, estimator, atom_estimates, atom_sources, candidate, subset,
-    atom_index: int
+    region, estimator, atom_estimates, atom_sources, candidate, subset, atom_index: int
 ) -> Optional[_Candidate]:
     """The candidate extended by one atom, or None when no EQUI conjunct
     connects the atom to the subset (a cross product or nested-loop join -
@@ -448,9 +479,19 @@ def _try_extend(
     if not _any_equi(region, positions):
         return None
     estimate = estimator.join_estimate(
-        region, candidate.estimate, atom_index, atom_estimates[atom_index],
+        region,
+        candidate.estimate,
+        atom_index,
+        atom_estimates[atom_index],
         _conjuncts_at(region, positions),
     )
+    # The transfer charge is the atom's FULL rows, deliberately ignoring the
+    # runtime key reduction: charging the reduced expectation was measured
+    # to mis-price island breaking (q03 74 -> 180ms), because the
+    # coordinator-side join INPUT work the broken island then pays has no
+    # cost term of its own (C_out prices outputs only). Pricing reduction
+    # here needs a matching coordinator-input term and a TRANSFER_WEIGHT
+    # recalibration - a gated experiment of its own (see perf-explore.md).
     transfer, island = _extended_transfer(
         candidate, atom_sources[atom_index], atom_estimates[atom_index].rows
     )
@@ -460,8 +501,12 @@ def _try_extend(
         atom_index=atom_index, estimate=estimate, conjunct_positions=positions
     )
     return _Candidate(
-        candidate.cost + estimate.rows, candidate.sequence + [atom_index],
-        candidate.steps + [step], estimate, transfer, island,
+        candidate.cost + estimate.rows,
+        candidate.sequence + [atom_index],
+        candidate.steps + [step],
+        estimate,
+        transfer,
+        island,
     )
 
 
@@ -480,7 +525,10 @@ def _newly_covered_set(region, old_atoms: Set[int], new_atoms: Set[int]) -> List
     for position, conjunct in enumerate(region.conjuncts):
         if len(conjunct.atom_indexes) < 2:
             continue
-        if conjunct.atom_indexes <= new_atoms and not conjunct.atom_indexes <= old_atoms:
+        if (
+            conjunct.atom_indexes <= new_atoms
+            and not conjunct.atom_indexes <= old_atoms
+        ):
             positions.append(position)
     return positions
 
@@ -512,8 +560,7 @@ def _candidate_key(candidate: _Candidate) -> tuple:
     """Candidate ordering: C_out plus the weighted transfer cost, with the
     atom sequence as the deterministic tie-break. cost stays pure C_out;
     the locality term is combined only here."""
-    return (candidate.cost + TRANSFER_WEIGHT * candidate.transfer,
-            candidate.sequence)
+    return (candidate.cost + TRANSFER_WEIGHT * candidate.transfer, candidate.sequence)
 
 
 def _greedy(
@@ -533,14 +580,17 @@ def _greedy(
     return candidate
 
 
-def _best_pair(region, estimator, atom_estimates, atom_sources, component) -> _Candidate:
+def _best_pair(
+    region, estimator, atom_estimates, atom_sources, component
+) -> _Candidate:
     """The cheapest connected starting pair of the component."""
     best = None
     for first in component:
         best = _better(
             best,
-            _pair_from(region, estimator, atom_estimates, atom_sources,
-                       component, first),
+            _pair_from(
+                region, estimator, atom_estimates, atom_sources, component, first
+            ),
         )
     if best is None:
         raise JoinOrderError("no connected starting pair in a multi-atom component")
@@ -549,15 +599,23 @@ def _best_pair(region, estimator, atom_estimates, atom_sources, component) -> _C
 
 def _pair_from(region, estimator, atom_estimates, atom_sources, component, first: int):
     """The cheapest connected pair starting from one given atom."""
-    start = _Candidate(0.0, [first], [], atom_estimates[first], 0.0,
-                       atom_sources[first])
+    start = _Candidate(
+        0.0, [first], [], atom_estimates[first], 0.0, atom_sources[first]
+    )
     best = None
     for second in component:
         if second != first:
             best = _better(
                 best,
-                _try_extend(region, estimator, atom_estimates, atom_sources,
-                            start, frozenset({first}), second),
+                _try_extend(
+                    region,
+                    estimator,
+                    atom_estimates,
+                    atom_sources,
+                    start,
+                    frozenset({first}),
+                    second,
+                ),
             )
     return best
 
@@ -572,8 +630,15 @@ def _best_extension(
         if atom_index not in subset:
             best = _better(
                 best,
-                _try_extend(region, estimator, atom_estimates, atom_sources,
-                            candidate, subset, atom_index),
+                _try_extend(
+                    region,
+                    estimator,
+                    atom_estimates,
+                    atom_sources,
+                    candidate,
+                    subset,
+                    atom_index,
+                ),
             )
     if best is None:
         raise JoinOrderError("greedy walk stranded: no connected extension left")
@@ -729,7 +794,8 @@ class CostModelRegionEstimator(RegionEstimator):
         smaller side's rows - distinct key COMBINATIONS cannot exceed that -
         or a foreign-key join is grossly under-estimated (q09's fact island)."""
         denom, selectivity, equi_count, defaults = self._step_terms(
-            region, left, atom, atom_index, conjuncts)
+            region, left, atom, atom_index, conjuncts
+        )
         denom = cap_composite_denom(denom, equi_count, left.rows, atom.rows)
         rows = float(left.rows) * float(atom.rows) * selectivity / denom
         # The step's estimate carries both sides' provenance plus whatever
@@ -748,9 +814,11 @@ class CostModelRegionEstimator(RegionEstimator):
         defaults: List[str] = []
         for conjunct in conjuncts:
             is_equi, value, conjunct_defaults = self._term(
-                region, conjunct, left, atom, atom_index)
+                region, conjunct, left, atom, atom_index
+            )
             denom, selectivity, equi_count = apply_conjunct_term(
-                is_equi, value, denom, selectivity, equi_count)
+                is_equi, value, denom, selectivity, equi_count
+            )
             defaults.extend(conjunct_defaults)
         return denom, selectivity, equi_count, defaults
 
@@ -759,7 +827,8 @@ class CostModelRegionEstimator(RegionEstimator):
         its NDV; anything else's is the tracked selectivity."""
         if not conjunct.is_equi or len(conjunct.atom_indexes) != 2:
             factor, defaults = self.cost_model.conjunct_selectivity(
-                conjunct.expression, "join")
+                conjunct.expression, "join"
+            )
             return False, factor, defaults
         atom_ref, other_ref = _orient_refs(region, conjunct, atom_index)
         atom_ndv, atom_defaults = self._ref_ndv(region, atom_ref, atom.rows)
@@ -870,8 +939,9 @@ class JoinOrderingRule(OptimizationRule):
             return False
         if node.condition is None:
             return True
-        return (self._has_conditionless_join(node.left)
-                or self._has_conditionless_join(node.right))
+        return self._has_conditionless_join(node.left) or self._has_conditionless_join(
+            node.right
+        )
 
     def _verify_placement(self, total: int, placed: List[int]) -> None:
         """Every region conjunct must be placed exactly once; a dropped or
@@ -893,8 +963,9 @@ class JoinOrderingRule(OptimizationRule):
             )
         return self._wrap_constant_conjuncts(region, current, placed)
 
-    def _emit_cross(self, region, left_tree, right_tree, cross: "CrossStep",
-                    placed: List[int]):
+    def _emit_cross(
+        self, region, left_tree, right_tree, cross: "CrossStep", placed: List[int]
+    ):
         """One CROSS between component subtrees - the only cross product that
         survives reordering - with any spanning (non-equi) conjuncts as its
         residual filter."""
@@ -902,8 +973,11 @@ class JoinOrderingRule(OptimizationRule):
         # The CROSS join of the two component subtrees, annotated with the
         # enumerator's estimate (spanning-conjunct selectivity included).
         join = Join.create(
-            left=left_tree, right=right_tree, join_type=JoinType.CROSS,
-            condition=None, estimated_rows=cross.estimate.rows,
+            left=left_tree,
+            right=right_tree,
+            join_type=JoinType.CROSS,
+            condition=None,
+            estimated_rows=cross.estimate.rows,
             estimate_defaults=cross.estimate.defaults_used,
         )
         expressions = []
@@ -956,10 +1030,12 @@ class JoinOrderingRule(OptimizationRule):
         if not isinstance(emitted, Scan):
             return emitted
         estimate = self.estimator.atom_estimate(region, atom_index, local)
-        return emitted.model_copy(update={
-            "estimated_rows": estimate.rows,
-            "column_ndv": self._atom_key_ndv(region, atom_index),
-        })
+        return emitted.model_copy(
+            update={
+                "estimated_rows": estimate.rows,
+                "column_ndv": self._atom_key_ndv(region, atom_index),
+            }
+        )
 
     def _atom_key_ndv(self, region, atom_index: int):
         """Base NDV per equi-join-key column of one atom, from the same source
@@ -968,7 +1044,8 @@ class JoinOrderingRule(OptimizationRule):
         ndv_map = {}
         for ref in _atom_equi_refs(region, atom_index):
             ndv = self.estimator.cost_model.column_ndv(
-                region.atoms[atom_index].plan, ref)
+                region.atoms[atom_index].plan, ref
+            )
             if ndv is not None:
                 ndv_map[ref.column] = ndv
         return ndv_map or None
@@ -990,8 +1067,11 @@ class JoinOrderingRule(OptimizationRule):
         # The reordered join, annotated with the enumerator's estimate and
         # its statistics provenance for EXPLAIN.
         join = Join.create(
-            left=left_tree, right=atom_tree, join_type=JoinType.INNER,
-            condition=combine_and(equi), estimated_rows=step.estimate.rows,
+            left=left_tree,
+            right=atom_tree,
+            join_type=JoinType.INNER,
+            condition=combine_and(equi),
+            estimated_rows=step.estimate.rows,
             estimate_defaults=step.estimate.defaults_used,
         )
         if not residual:

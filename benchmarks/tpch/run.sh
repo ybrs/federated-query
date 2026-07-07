@@ -11,7 +11,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON="${PYTHON:-/workspace/venv-fedq/bin/python}"
+PYTHON="${PYTHON:-python}"
 SCALE_FACTOR="${1:-0.01}"
 DB="$HERE/data/tpch_sf${SCALE_FACTOR}.duckdb"
 
