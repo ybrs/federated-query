@@ -40,15 +40,28 @@ coordinator. Deferred by request.
 
 ## Current status (pg-dims, SF0.1)
 
-`PASS 54 | MISMATCH 1 (q18, above) | ERROR 44` of 99. No OTHER wrong results:
+`PASS 81 | MISMATCH 1 (q18, above) | ERROR 17` of 99. No OTHER wrong results:
 correctness is compared against pure DuckDB, so a MISMATCH is a real engine diff.
 
-Remaining ERROR clusters (by cause) - the RuntimeError cluster is GONE:
-- **UnsupportedIR - 27**: WindowExpr at the coordinator (~11), `JoinType.CROSS`
-  (~5), `PhysicalSingleRowGuard` (scalar-subquery guard, ~3), and other physical
-  nodes. Window functions at the coordinator are the biggest sub-group - the
-  highest-yield remaining target.
-- UnsupportedSQLError - 2 (simple CASE, window in WHERE).
+Remaining ERROR clusters (by cause) - RuntimeError and window clusters GONE:
+- **UnsupportedIR - 14**: `JoinType.CROSS` (~5), `PhysicalSingleRowGuard`
+  (scalar-subquery guard, ~3), and other physical nodes. CROSS join is now the
+  biggest remaining sub-group.
+- UnsupportedSQLError - 2 (simple CASE, window in WHERE - q70).
+- RuntimeError - 1 (q86: window combined with GROUPING()/ROLLUP, a DataFusion
+  physical-planner limitation).
+
+## Window functions - DONE (this round, +12)
+
+The TPC-DS window family (sum(sum(x)) OVER (...) with GROUP BY) lands the
+WindowExpr INSIDE PhysicalHashAggregate.aggregates - the SELECT list is fused
+onto the aggregate, so the structured aggregate fragment could not express the
+window ("expression WindowExpr not supported in IR"). Fix: a window over grouped
+aggregates is valid SQL, so PhysicalHashAggregate.has_window_output() +
+_aggregate_sql() render SELECT <outputs> FROM in_0 [GROUP BY <keys>] (columns
+lowered via MergeResolver, like PhysicalWindow), and rust_ir emits it as a
+raw_sql fragment. DataFusion evaluates it. Fixed q12/q20/q36/q47/q49/q51/q53/
+q57/q63/q67/q89/q98. q86 remains (window + GROUPING()).
 
 Set operations (UNION/INTERSECT/EXCEPT) are DONE - emitted via the raw_sql
 escape hatch in `rust_ir` (`_emit_union` / `_emit_set_operation`); no Rust change.
