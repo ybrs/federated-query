@@ -55,7 +55,6 @@ from generate import (
 from qualify import TPCDS_TABLES
 from run import arrow_to_rows, _read_query
 
-
 HERE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Reports are commit-named under reports/, like the TPC-H benchmark's.
 REPORTS_DIR = os.path.join(HERE_DIR, "reports")
@@ -63,8 +62,13 @@ REPORTS_DIR = os.path.join(HERE_DIR, "reports")
 # The seven TPC-DS fact tables; everything else is a dimension.
 FACT_TABLES = frozenset(
     {
-        "store_sales", "store_returns", "catalog_sales", "catalog_returns",
-        "web_sales", "web_returns", "inventory",
+        "store_sales",
+        "store_returns",
+        "catalog_sales",
+        "catalog_returns",
+        "web_sales",
+        "web_returns",
+        "inventory",
     }
 )
 
@@ -88,16 +92,30 @@ PLACEMENTS = {
     # Split sales facts from their matching returns and alternate the dimensions
     # so fact-fact and fact-dimension joins are forced across sources.
     "adversarial": {
-        "store_sales": "duck", "store_returns": "pg",
-        "catalog_sales": "pg", "catalog_returns": "duck",
-        "web_sales": "duck", "web_returns": "pg",
+        "store_sales": "duck",
+        "store_returns": "pg",
+        "catalog_sales": "pg",
+        "catalog_returns": "duck",
+        "web_sales": "duck",
+        "web_returns": "pg",
         "inventory": "pg",
-        "call_center": "pg", "catalog_page": "duck", "customer": "pg",
-        "customer_address": "duck", "customer_demographics": "pg",
-        "date_dim": "pg", "household_demographics": "duck", "income_band": "pg",
-        "item": "duck", "promotion": "pg", "reason": "duck", "ship_mode": "pg",
-        "store": "duck", "time_dim": "pg", "warehouse": "duck",
-        "web_page": "pg", "web_site": "duck",
+        "call_center": "pg",
+        "catalog_page": "duck",
+        "customer": "pg",
+        "customer_address": "duck",
+        "customer_demographics": "pg",
+        "date_dim": "pg",
+        "household_demographics": "duck",
+        "income_band": "pg",
+        "item": "duck",
+        "promotion": "pg",
+        "reason": "duck",
+        "ship_mode": "pg",
+        "store": "duck",
+        "time_dim": "pg",
+        "warehouse": "duck",
+        "web_page": "pg",
+        "web_site": "duck",
     },
 }
 
@@ -162,7 +180,9 @@ def build_oracle(db_path, options):
     """
     connection = _reference_connection(db_path, options)
     connection.execute("LOAD postgres")
-    connection.execute(f"ATTACH '{_pg_dsn(options)}' AS pgdb (TYPE postgres, READ_ONLY)")
+    connection.execute(
+        f"ATTACH '{_pg_dsn(options)}' AS pgdb (TYPE postgres, READ_ONLY)"
+    )
     connection.execute("SET pg_experimental_filter_pushdown=false")
     return connection
 
@@ -244,8 +264,9 @@ def _run_oracle(oracle, oracle_sql):
     return elapsed_ms, rows
 
 
-def _evaluate_worker(engine_sql, oracle_sql, truth_sql, db_path, options,
-                     decimals, result_queue):
+def _evaluate_worker(
+    engine_sql, oracle_sql, truth_sql, db_path, options, decimals, result_queue
+):
     """Child-process entry: run the query, verify it, and time the DuckDB
     baseline - all in ONE process (so the engine's read-write DuckDB open never
     collides with a read-only lock across processes).
@@ -274,11 +295,19 @@ def _evaluate_worker(engine_sql, oracle_sql, truth_sql, db_path, options,
         return
     oracle_ms = _time_federated_oracle(db_path, options, oracle_sql)
     match, reason = compare_results(engine_rows, truth_rows, decimals)
-    result_queue.put((
-        "done",
-        ("PASS" if match else "MISMATCH", reason, len(engine_rows),
-         len(truth_rows), engine_ms, oracle_ms),
-    ))
+    result_queue.put(
+        (
+            "done",
+            (
+                "PASS" if match else "MISMATCH",
+                reason,
+                len(engine_rows),
+                len(truth_rows),
+                engine_ms,
+                oracle_ms,
+            ),
+        )
+    )
 
 
 def _time_federated_oracle(db_path, options, oracle_sql):
@@ -317,8 +346,15 @@ def _run_isolated(engine_sql, oracle_sql, truth_sql, db_path, options):
     result_queue = context.Queue()
     process = context.Process(
         target=_evaluate_worker,
-        args=(engine_sql, oracle_sql, truth_sql, db_path, options,
-              options.decimals, result_queue),
+        args=(
+            engine_sql,
+            oracle_sql,
+            truth_sql,
+            db_path,
+            options,
+            options.decimals,
+            result_queue,
+        ),
     )
     process.start()
     return _await_result(process, result_queue, options.timeout)
@@ -395,16 +431,32 @@ def evaluate_query(path, placement, db_path, options):
     if error is not None:
         return _result(name, "ERROR", error, cross, None, None)
     status, reason, engine_rows, oracle_rows, engine_ms, oracle_ms = outcome
-    return _result(name, status, reason, cross, engine_rows, oracle_rows,
-                   engine_ms, oracle_ms)
+    return _result(
+        name, status, reason, cross, engine_rows, oracle_rows, engine_ms, oracle_ms
+    )
 
 
-def _result(name, status, reason, cross, engine_rows, oracle_rows,
-            engine_ms=None, oracle_ms=None):
+def _result(
+    name,
+    status,
+    reason,
+    cross,
+    engine_rows,
+    oracle_rows,
+    engine_ms=None,
+    oracle_ms=None,
+):
     """Assemble one query's outcome record (timings are None for ERROR rows)."""
-    return {"name": name, "status": status, "reason": reason, "span": cross,
-            "engine_rows": engine_rows, "oracle_rows": oracle_rows,
-            "engine_ms": engine_ms, "oracle_ms": oracle_ms}
+    return {
+        "name": name,
+        "status": status,
+        "reason": reason,
+        "span": cross,
+        "engine_rows": engine_rows,
+        "oracle_rows": oracle_rows,
+        "engine_ms": engine_ms,
+        "oracle_ms": oracle_ms,
+    }
 
 
 def _print_result(result):
@@ -412,8 +464,12 @@ def _print_result(result):
     reason = result["reason"]
     if len(reason) > 80:
         reason = reason[:80] + "..."
-    print("{0:5} {1:8} {2:7} {3}".format(
-        result["name"], result["status"], result["span"], reason), flush=True)
+    print(
+        "{0:5} {1:8} {2:7} {3}".format(
+            result["name"], result["status"], result["span"], reason
+        ),
+        flush=True,
+    )
 
 
 def _tally(results):
@@ -433,8 +489,12 @@ def _summary_line(placement_name, results):
     return (
         "[{0}] Total {1} | PASS {2} | MISMATCH {3} | ERROR {4} | "
         "cross-source {5}".format(
-            placement_name, len(results), tally["PASS"], tally["MISMATCH"],
-            tally["ERROR"], cross,
+            placement_name,
+            len(results),
+            tally["PASS"],
+            tally["MISMATCH"],
+            tally["ERROR"],
+            cross,
         )
     )
 
@@ -492,13 +552,18 @@ def _timing_table_lines(placement_name, results):
         ours_total += engine_ms
         duck_total += duck_ms
         ratios.append(ratio)
-    return ["", "### Timing summary (PASS only): engine vs "
-            "DuckDB-over-Postgres [{0}]".format(placement_name), "",
-            "| Ours (ms) | DuckDB (ms) | Ratio | Geomean | Measured |",
-            "| --- | --- | --- | --- | --- |",
-            "| {0:.1f} | {1:.1f} | {2:.2f}x | {3:.2f}x | {4} |".format(
-                ours_total, duck_total, ours_total / duck_total,
-                _geomean(ratios), len(rows)), ""]
+    return [
+        "",
+        "### Timing summary (PASS only): engine vs "
+        "DuckDB-over-Postgres [{0}]".format(placement_name),
+        "",
+        "| Ours (ms) | DuckDB (ms) | Ratio | Geomean | Measured |",
+        "| --- | --- | --- | --- | --- |",
+        "| {0:.1f} | {1:.1f} | {2:.2f}x | {3:.2f}x | {4} |".format(
+            ours_total, duck_total, ours_total / duck_total, _geomean(ratios), len(rows)
+        ),
+        "",
+    ]
 
 
 def _print_timing_summary(placement_name, results):
@@ -603,23 +668,38 @@ def _ratio_cell(result):
 
 def _matrix_lines(results):
     """Build the per-query markdown table (timings, status, rows, detail)."""
-    lines = ["| Query | Ours (ms) | DuckDB (ms) | Ratio | Status | Span "
-             "| Rows engine/oracle | Detail |",
-             "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+    lines = [
+        "| Query | Ours (ms) | DuckDB (ms) | Ratio | Status | Span "
+        "| Rows engine/oracle | Detail |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
     for result in results:
         detail = result["reason"] if result["reason"] else "rows and values match"
-        lines.append("| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} |".format(
-            result["name"], _ms_cell(result["engine_ms"]),
-            _ms_cell(result["oracle_ms"]), _ratio_cell(result),
-            result["status"], result["span"], _rows_cell(result),
-            _escape(detail)))
+        lines.append(
+            "| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} |".format(
+                result["name"],
+                _ms_cell(result["engine_ms"]),
+                _ms_cell(result["oracle_ms"]),
+                _ratio_cell(result),
+                result["status"],
+                result["span"],
+                _rows_cell(result),
+                _escape(detail),
+            )
+        )
     return lines
 
 
 def _placement_section(placement_name, results):
     """Build the report section for one placement: summary, clusters, matrix."""
-    lines = ["## Placement: {0}".format(placement_name), "", _summary_line(
-        placement_name, results), "", "### Failure clusters", ""]
+    lines = [
+        "## Placement: {0}".format(placement_name),
+        "",
+        _summary_line(placement_name, results),
+        "",
+        "### Failure clusters",
+        "",
+    ]
     lines.extend(_cluster_lines(_cluster_failures(results)))
     lines.append("### Per-query matrix")
     lines.append("")
@@ -630,9 +710,7 @@ def _placement_section(placement_name, results):
 
 def _git(*args):
     """Run a git command in this repo and return its stripped stdout."""
-    done = subprocess.run(
-        ("git",) + args, cwd=HERE_DIR, capture_output=True, text=True
-    )
+    done = subprocess.run(("git",) + args, cwd=HERE_DIR, capture_output=True, text=True)
     return done.stdout.strip()
 
 
@@ -675,7 +753,8 @@ def _report_header(options):
         "memory cap {2} MB. Each query's engine and DuckDB oracle (with "
         "PostgreSQL attached) run together in one isolated child process; "
         "timings are steady-state (one warm-up run discarded).".format(
-            options.scale_factor, options.timeout, options.memory_limit),
+            options.scale_factor, options.timeout, options.memory_limit
+        ),
         "",
         "Correctness compares fedq's federated result against PURE DuckDB over "
         "the same file (every table read locally), the canonical answer - so a "
@@ -733,7 +812,13 @@ def run(options):
 
     Each query's engine and oracle run together in one isolated child process
     (see _evaluate_worker), so nothing holds the DuckDB file open in the parent.
+    ``--mode`` picks the staged variants: save-refs / engine / compare (see the
+    staged-runs section at the bottom of this module); ``full`` is this
+    all-in-one behavior.
     """
+    if options.mode != "full":
+        run_staged(options)
+        return
     db_path = _db_path(DEFAULT_DATA_DIR, options.scale_factor)
     paths = _select_query_files(options.queries_dir, options.only)
     if not paths:
@@ -743,6 +828,19 @@ def run(options):
         results = run_placement(placement_name.strip(), paths, db_path, options)
         sections.append((placement_name.strip(), results))
     write_report(sections, options, options.report or _default_report_path())
+
+
+def run_staged(options):
+    """Dispatch one staged step for a single placement."""
+    placement_name = options.placements.split(",")[0].strip()
+    if options.mode == "save-refs":
+        run_save_references(options, placement_name)
+    elif options.mode == "engine":
+        run_engine_only(options, placement_name)
+    elif options.mode == "compare":
+        run_compare(options, placement_name)
+    else:
+        raise SystemExit("unknown --mode {0}".format(options.mode))
 
 
 def _default_report_path():
@@ -763,6 +861,11 @@ def _parse_args():
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--memory-limit", type=int, default=12288)
     parser.add_argument("--report", default=None)
+    parser.add_argument(
+        "--mode",
+        default="full",
+        choices=["full", "save-refs", "engine", "compare"],
+    )
     parser.add_argument("--pg-host", default="localhost")
     parser.add_argument("--pg-port", default="5432")
     parser.add_argument("--pg-database", default=None)
@@ -774,6 +877,245 @@ def _parse_args():
 def main():
     """Entry point: run the federated TPC-DS benchmark."""
     run(_parse_args())
+
+
+# --- staged runs: cached references, engine-only, timed compare ---------------
+#
+# The truth and oracle results are pure functions of the DATA, not of the
+# engine under test - so a full three-engine run per tally wastes most of its
+# wall clock re-deriving them. `--mode save-refs` runs them ONCE per dataset
+# into a references DuckDB file; `--mode engine` runs only our engine and
+# saves each result to CSV; `--mode compare` checks the CSVs against the
+# cached truth (and reports how long comparing took). `--mode full` is the
+# original all-in-one behavior.
+
+
+def _refs_path(options):
+    """The per-scale references database file."""
+    return os.path.join(
+        DEFAULT_DATA_DIR, "references_sf{0}.duckdb".format(options.scale_factor)
+    )
+
+
+def _engine_dir(options):
+    """The per-scale directory of engine result CSVs."""
+    return os.path.join(
+        DEFAULT_DATA_DIR, "engine_results_sf{0}".format(options.scale_factor)
+    )
+
+
+def _staged_queries(options, placement):
+    """(name, engine_sql, oracle_sql, truth_sql) for every selected query."""
+    prepared = []
+    for path in _select_query_files(options.queries_dir, options.only):
+        name = os.path.splitext(os.path.basename(path))[0]
+        raw = _read_query(path)
+        prepared.append(
+            (
+                name,
+                _qualify(raw, placement, FEDQ_SOURCES, ENGINE_DIALECT),
+                _qualify(raw, placement, ORACLE_SOURCES, "duckdb"),
+                raw,
+            )
+        )
+    return prepared
+
+
+def run_save_references(options, placement_name):
+    """Step 1: persist truth rows and oracle timings for every query."""
+    placement = PLACEMENTS[placement_name]
+    db_path = _db_path(DEFAULT_DATA_DIR, options.scale_factor)
+    refs = duckdb.connect(_refs_path(options))
+    refs.execute(
+        "CREATE OR REPLACE TABLE oracle_timings (query VARCHAR, oracle_ms DOUBLE)"
+    )
+    for name, _, oracle_sql, truth_sql in _staged_queries(options, placement):
+        started = time.perf_counter()
+        truth = _reference_connection(db_path, options).execute(truth_sql).arrow()
+        refs.register("truth_tmp", truth)
+        # __ord pins the truth's row order through table storage, so the
+        # in-order comparison still sees the ORDER BY output order.
+        refs.execute(
+            'CREATE OR REPLACE TABLE "{0}" AS '
+            "SELECT row_number() OVER () AS __ord, * FROM truth_tmp".format(name)
+        )
+        refs.unregister("truth_tmp")
+        truth_ms = (time.perf_counter() - started) * 1000.0
+        oracle_ms = _time_federated_oracle(db_path, options, oracle_sql)
+        refs.execute("INSERT INTO oracle_timings VALUES (?, ?)", [name, oracle_ms])
+        oracle_text = "-" if oracle_ms is None else "{0:.0f}ms".format(oracle_ms)
+        print(
+            "{0:5} truth {1:7.0f}ms  oracle {2}".format(name, truth_ms, oracle_text),
+            flush=True,
+        )
+    print("references written: {0}".format(_refs_path(options)))
+
+
+def _engine_worker(engine_sql, db_path, options, csv_path, result_queue):
+    """Child: run the engine (warm + timed) and save the result to CSV."""
+    _start_memory_watchdog(options.memory_limit)
+    try:
+        runtime = build_fedq(db_path, options)
+        runtime.execute(engine_sql)
+        started = time.perf_counter()
+        result = runtime.execute(engine_sql)
+        engine_ms = (time.perf_counter() - started) * 1000.0
+        _write_engine_csv(result, csv_path)
+    except Exception as error:
+        result_queue.put(("error", _error_text(error)))
+        return
+    result_queue.put(("done", (engine_ms, result.num_rows)))
+
+
+def _write_engine_csv(table, csv_path):
+    """Write an Arrow result to CSV; NULL is the explicit sentinel ``\\N``."""
+    import csv as csv_module
+
+    with open(csv_path, "w", newline="") as handle:
+        writer = csv_module.writer(handle)
+        writer.writerow(table.column_names)
+        for row in table.to_pylist():
+            cells = []
+            for column in table.column_names:
+                value = row[column]
+                cells.append("\\N" if value is None else str(value))
+            writer.writerow(cells)
+
+
+def run_engine_only(options, placement_name):
+    """Step 2: run ONLY the engine per query, saving results and timings."""
+    placement = PLACEMENTS[placement_name]
+    db_path = _db_path(DEFAULT_DATA_DIR, options.scale_factor)
+    out_dir = _engine_dir(options)
+    os.makedirs(out_dir, exist_ok=True)
+    timings = []
+    for name, engine_sql, _, _ in _staged_queries(options, placement):
+        csv_path = os.path.join(out_dir, name + ".csv")
+        context = multiprocessing.get_context("fork")
+        result_queue = context.Queue()
+        process = context.Process(
+            target=_engine_worker,
+            args=(engine_sql, db_path, options, csv_path, result_queue),
+        )
+        process.start()
+        outcome, error = _await_result(process, result_queue, options.timeout)
+        if error is not None:
+            print("{0:5} ERROR {1}".format(name, error[:90]), flush=True)
+            timings.append((name, None))
+            continue
+        engine_ms, rows = outcome
+        timings.append((name, engine_ms))
+        print("{0:5} {1:8.0f}ms  rows={2}".format(name, engine_ms, rows), flush=True)
+    _write_engine_timings(out_dir, timings)
+    print("engine results written: {0}".format(out_dir))
+
+
+def _write_engine_timings(out_dir, timings):
+    """Persist per-query engine timings next to the result CSVs."""
+    import csv as csv_module
+
+    with open(os.path.join(out_dir, "engine_timings.csv"), "w", newline="") as handle:
+        writer = csv_module.writer(handle)
+        writer.writerow(["query", "engine_ms"])
+        for name, engine_ms in timings:
+            writer.writerow([name, "" if engine_ms is None else engine_ms])
+
+
+def _typed_cell(value, dtype):
+    """Convert one CSV cell back to the truth column's comparable type."""
+    if value == "\\N":
+        return None
+    upper = dtype.upper()
+    if upper.startswith(("DECIMAL", "DOUBLE", "FLOAT", "REAL")):
+        return float(value)
+    if upper.startswith(("BIGINT", "INTEGER", "SMALLINT", "TINYINT", "HUGEINT")):
+        return int(value)
+    return value
+
+
+def _read_engine_csv(csv_path, column_types):
+    """Load an engine result CSV as typed rows (truth types drive parsing)."""
+    import csv as csv_module
+
+    rows = []
+    with open(csv_path, newline="") as handle:
+        reader = csv_module.reader(handle)
+        next(reader)
+        for record in reader:
+            cells = []
+            for value, dtype in zip(record, column_types):
+                cells.append(_typed_cell(value, dtype))
+            rows.append(tuple(cells))
+    return rows
+
+
+def run_compare(options, placement_name):
+    """Step 3: compare engine CSVs against cached truth; time the comparing."""
+    placement = PLACEMENTS[placement_name]
+    refs = duckdb.connect(_refs_path(options), read_only=True)
+    out_dir = _engine_dir(options)
+    engine_ms_by_name = _load_engine_timings(out_dir)
+    results = []
+    compare_started = time.perf_counter()
+    for name, _, _, _ in _staged_queries(options, placement):
+        results.append(_compare_one(refs, out_dir, name, engine_ms_by_name, options))
+    compare_ms = (time.perf_counter() - compare_started) * 1000.0
+    for result in results:
+        _print_result(result)
+    _print_summary(placement_name, results)
+    _print_timing_summary(placement_name, results)
+    print("compare took {0:.0f}ms for {1} queries".format(compare_ms, len(results)))
+
+
+def _compare_one(refs, out_dir, name, engine_ms_by_name, options):
+    """Compare one query's engine CSV against its cached truth table."""
+    csv_path = os.path.join(out_dir, name + ".csv")
+    engine_ms = engine_ms_by_name.get(name)
+    if engine_ms is None or not os.path.exists(csv_path):
+        return _result(name, "ERROR", "no engine result saved", "cross", None, None)
+    described = refs.execute('DESCRIBE "{0}"'.format(name)).fetchall()
+    column_types = []
+    for column in described[1:]:
+        column_types.append(column[1])
+    truth_rows = refs.execute(
+        'SELECT * EXCLUDE (__ord) FROM "{0}" ORDER BY __ord'.format(name)
+    ).fetchall()
+    engine_rows = _read_engine_csv(csv_path, column_types)
+    oracle_ms = _oracle_ms(refs, name)
+    match, reason = compare_results(engine_rows, truth_rows, options.decimals)
+    status = "PASS" if match else "MISMATCH"
+    return _result(
+        name,
+        status,
+        reason,
+        "cross",
+        len(engine_rows),
+        len(truth_rows),
+        engine_ms,
+        oracle_ms,
+    )
+
+
+def _oracle_ms(refs, name):
+    """The cached federated-oracle timing for a query, or None."""
+    row = refs.execute(
+        "SELECT oracle_ms FROM oracle_timings WHERE query = ?", [name]
+    ).fetchone()
+    return None if row is None else row[0]
+
+
+def _load_engine_timings(out_dir):
+    """query -> engine_ms from the engine step's timing file."""
+    import csv as csv_module
+
+    timings = {}
+    path = os.path.join(out_dir, "engine_timings.csv")
+    with open(path, newline="") as handle:
+        reader = csv_module.reader(handle)
+        next(reader)
+        for name, engine_ms in reader:
+            timings[name] = float(engine_ms) if engine_ms else None
+    return timings
 
 
 if __name__ == "__main__":
