@@ -8,6 +8,7 @@ and a rule can never be silently forgotten at one construction site.
 from ..catalog.catalog import Catalog
 from ..config.config import CostConfig, OptimizerConfig
 from .cost import CostModel
+from .cte_union_filter import CTEUnionFilterPushdownRule
 from .join_ordering import JoinOrderingRule
 from .rules import (
     AggregatePushdownRule,
@@ -47,6 +48,10 @@ def build_optimizer(
         cost_model = build_cost_model(catalog, cost_config)
     optimizer = RuleBasedOptimizer(catalog)
     if optimizer_config.enable_predicate_pushdown:
+        # Before the ordinary pushdown: this rule consumes the per-consumer
+        # filters pushdown places above the CTE refs, and inserts the union
+        # filter the same pushdown then sinks to the body's base scans.
+        optimizer.add_rule(CTEUnionFilterPushdownRule())
         optimizer.add_rule(PredicatePushdownRule())
     # Before join ordering: pushing a selective SEMI/ANTI join down to the
     # relation it filters changes the region the reorderer then sees (a
