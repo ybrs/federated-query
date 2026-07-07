@@ -1,8 +1,15 @@
 # Disjunctive decorrelation - plan
 
-Goal: make the three remaining TPC-DS ERROR queries pass (q10, q35, q45 -
-today they die cleanly in the 32GB DataFusion pool), and make OR-of-subqueries
-plans efficient in general. ASCII only. Status: PLANNED, not yet implemented.
+Goal: make the three remaining TPC-DS ERROR queries pass (q10, q35, q45),
+and make OR-of-subqueries plans efficient in general. ASCII only.
+
+Status: COMPLETE 2026-07-07. Phase 1 DONE (commit 1767f60): all three pass,
+ERROR column closed. Phase 2 DONE (commit e68149e): q10 522 -> 143ms (1.49x),
+q35 567 -> 136ms (1.72x). Phase 3 NOT TAKEN by its own decision gate: after
+phases 1+2 the mixed-disjunction flag path (q45) sits at ~120ms / 3.1x,
+below the next outlier family - a LeftMark join buys too little to justify
+the Rust surface. Revisit only if a workload makes flag-path disjunctions
+hot at scale.
 
 ## 1. The three queries and their shapes
 
