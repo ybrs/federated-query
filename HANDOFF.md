@@ -43,35 +43,46 @@ coordinator. Deferred by request.
 `PASS 54 | MISMATCH 1 (q18, above) | ERROR 44` of 99. No OTHER wrong results:
 correctness is compared against pure DuckDB, so a MISMATCH is a real engine diff.
 
-Remaining ERROR clusters (by cause):
+Remaining ERROR clusters (by cause) - the RuntimeError cluster is GONE:
 - **UnsupportedIR - 27**: WindowExpr at the coordinator (~11), `JoinType.CROSS`
   (~5), `PhysicalSingleRowGuard` (scalar-subquery guard, ~3), and other physical
   nodes. Window functions at the coordinator are the biggest sub-group - the
   highest-yield remaining target.
-- **RuntimeError**: was 15; the aggregate-output-naming group (ORDER BY sum(x))
-  and the self-join-of-union naming group are FIXED (below). Remaining: the
-  "Mismatch between schema and batches" class (q16/q94/q95), `type_coercion`
-  that is really a substring-output name (q79/q91), and a couple of others.
 - UnsupportedSQLError - 2 (simple CASE, window in WHERE).
 
 Set operations (UNION/INTERSECT/EXCEPT) are DONE - emitted via the raw_sql
 escape hatch in `rust_ir` (`_emit_union` / `_emit_set_operation`); no Rust change.
 
-## RuntimeError naming bugs fixed (this round)
+## RuntimeError cluster - fully fixed (was 15, now 0)
 
+All were column-naming / schema-consistency bugs:
 - **ORDER BY sum(x) re-applied over the aggregate** (`binder.py`
-  `_match_aggregate_output`): a bound sort key that equals an aggregate output
+  `_match_aggregate_output`): a bound sort key equal to an aggregate output
   expression now references that output column, not a FunctionCall recomputing
   sum over the aggregate's own output (which lacks raw x). Fixed q42/q85/q92/q96.
+- **ORDER BY substring(x) re-applied over the projection** (`binder.py`
+  `_match_projection_output`): same idea for a computed projection output; a
+  plain-column key is left qualified so single-source ORDER BY still pushes
+  down. Fixed q79.
 - **PhysicalProjection.column_aliases() leaked the input's columns**
   (`physical.py`): it returned `self.input.column_aliases()` even when the
   projection drops/renames columns, so a sort ABOVE a projection resolved a
   passthrough self-join-renamed column (right_customer_id) to a name the
   4-column projection had dropped. Now it returns the projection's OUTPUT
-  contract (one entry per output, resolvable by output name or a passthrough's
-  source column); the projection's own expressions are typed against
-  self.input.column_aliases() directly. Fixed q04/q11/q74/q84. Debugged with a
-  temporary FEDQRS_SCHEMA per-fragment schema trace in the Rust engine (removed).
+  contract; its own expressions are typed against self.input.column_aliases()
+  directly. Fixed q04/q11/q74/q84.
+- **Binding schema must match its executed batches** (`fedqrs engine.rs`
+  `collect_batches`): run_aggregate/raw_sql/sort/filter/limit set the binding
+  schema from the LOGICAL df.schema(), but the batches from execution disagree -
+  SUM widens decimal precision (Decimal(17,2)->Decimal(27,2); q16/q94/q95), and
+  a UNION's branches disagree on column nullability so the batches disagree with
+  EACH OTHER (q77). collect_batches now takes executed types from the first
+  batch, widens every field to nullable, and re-schemas every batch to that one
+  schema. Fixed q16/q94/q95/q77.
+
+Debugged with a temporary FEDQRS_SCHEMA per-fragment schema trace in the Rust
+engine (added then removed): it proved joins produced the right columns and
+localized each bug to alias resolution or schema declaration, not execution.
 
 ## Benchmark setup (important)
 
