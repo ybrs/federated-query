@@ -6,7 +6,7 @@ set belong to one side of a join?" - so the answers live here once instead of
 being re-implemented per rule.
 """
 
-from typing import List, Set
+from typing import List, Optional, Set
 
 from ..plan.expressions import (
     BinaryOp,
@@ -25,7 +25,9 @@ from ..plan.logical import (
     Filter,
     Limit,
     Sort,
+    SetOperation,
     SubqueryScan,
+    Union,
 )
 
 
@@ -145,7 +147,26 @@ def available_columns(plan: LogicalPlanNode) -> Set[str]:
         return _aliased_names(plan.schema(), plan.alias if plan.alias else plan.name)
     if isinstance(plan, SubqueryScan):
         return _aliased_names(plan.schema(), plan.alias)
+    if isinstance(plan, (Union, SetOperation)):
+        return _set_operation_columns(plan)
     return set()
+
+
+def _set_operation_columns(plan) -> Set[str]:
+    """Columns usable above a set operation: those available in EVERY branch.
+
+    A predicate pushed through a set operation lands in each branch, so a
+    reference must resolve in all of them; the intersection is exactly that
+    set. (Without this arm a union exposed NO columns, so every predicate
+    above one - e.g. the join equalities of a decorrelated OR-of-EXISTS -
+    stranded there and its branches planned as cartesian products.)
+    """
+    branches = plan.inputs if isinstance(plan, Union) else [plan.left, plan.right]
+    common: Optional[Set[str]] = None
+    for branch in branches:
+        cols = available_columns(branch)
+        common = cols if common is None else common & cols
+    return common if common is not None else set()
 
 
 def _aliased_names(columns, alias: str) -> Set[str]:

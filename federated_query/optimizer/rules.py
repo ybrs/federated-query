@@ -61,6 +61,22 @@ def _rewrite_set_operation_branches(set_op: SetOperation, rewrite) -> SetOperati
     return set_op.model_copy(update={"left": new_left, "right": new_right})
 
 
+def _set_operation_branches(node: LogicalPlanNode) -> List[LogicalPlanNode]:
+    """The branch plans of a binary SetOperation or an n-ary Union."""
+    if isinstance(node, Union):
+        return list(node.inputs)
+    return [node.left, node.right]
+
+
+def _with_set_operation_branches(
+    node: LogicalPlanNode, branches: List[LogicalPlanNode]
+) -> LogicalPlanNode:
+    """Rebuild a set operation with new branch plans (kind/flags preserved)."""
+    if isinstance(node, Union):
+        return node.model_copy(update={"inputs": branches})
+    return node.model_copy(update={"left": branches[0], "right": branches[1]})
+
+
 class OptimizationRule(ABC):
     """Base class for optimization rules."""
 
@@ -108,11 +124,10 @@ class PredicatePushdownRule(OptimizationRule):
         if isinstance(plan, SetOperation):
             return _rewrite_set_operation_branches(plan, self._push_down)
         if isinstance(plan, Join):
-            return transform_children(
-                self._push_join_condition(plan), self._push_down
-            )
-        if isinstance(plan, (Projection, Aggregate, Limit, Sort, SubqueryScan,
-                             CTE)):
+            return transform_children(self._push_join_condition(plan), self._push_down)
+        if isinstance(
+            plan, (Projection, Aggregate, Limit, Sort, SubqueryScan, CTE, Union)
+        ):
             return transform_children(plan, self._push_down)
         return plan
 
@@ -137,6 +152,8 @@ class PredicatePushdownRule(OptimizationRule):
             return self._push_filter_below_join(filter_node, input_plan)
         if isinstance(input_plan, Scan):
             return self._push_filter_to_scan(filter_node, input_plan)
+        if isinstance(input_plan, (Union, SetOperation)):
+            return self._push_filter_into_set_operation(filter_node, input_plan)
         return self._rehome_filter_over_opaque(filter_node, input_plan)
 
     def _factor_filter_predicate(self, filter_node: Filter) -> Filter:
@@ -405,6 +422,58 @@ class PredicatePushdownRule(OptimizationRule):
         # residual filter above the rebuilt projection.
         return Filter.create(input=new_project, predicate=combine_and(above))
 
+    def _push_filter_into_set_operation(
+        self, filter_node: Filter, set_op: LogicalPlanNode
+    ) -> LogicalPlanNode:
+        """Distribute pushable conjuncts into every set-operation branch.
+
+        A deterministic predicate commutes with UNION [ALL] / INTERSECT /
+        EXCEPT when applied to EVERY branch: identical row values yield the
+        same verdict on either side of the operation, so membership and dedup
+        semantics are unchanged (the engine has no volatile predicate
+        expressions). A conjunct descends only when every branch can evaluate
+        it; the rest - e.g. a flag column the disjunctive-subquery rewrite's
+        branch projections synthesize - stays above. Without this the join
+        equalities of an OR-of-subqueries query strand above the union and
+        its branches plan as cartesian products (TPC-DS q10/q35/q45).
+        """
+        branches = _set_operation_branches(set_op)
+        conjuncts = split_conjuncts(filter_node.predicate)
+        below, above = self._partition_for_branches(conjuncts, branches)
+        if not below:
+            return self._rehome_filter_over_opaque(filter_node, set_op)
+        pushed = []
+        for branch in branches:
+            pushed.append(self._push_side(branch, below))
+        rebuilt = _with_set_operation_branches(set_op, pushed)
+        if not above:
+            return rebuilt
+        # The conjuncts some branch cannot evaluate stay as one residual
+        # filter above the rebuilt set operation.
+        return Filter.create(input=rebuilt, predicate=combine_and(above))
+
+    def _partition_for_branches(self, conjuncts, branches):
+        """Split conjuncts into those EVERY branch can evaluate and the rest."""
+        availables = []
+        for branch in branches:
+            availables.append(pushdown.available_columns(branch))
+        below = []
+        above = []
+        for conjunct in conjuncts:
+            cols = pushdown.qualified_or_bare_names(conjunct)
+            if self._evaluable_in_all(cols, availables):
+                below.append(conjunct)
+            else:
+                above.append(conjunct)
+        return below, above
+
+    def _evaluable_in_all(self, cols, availables) -> bool:
+        """Whether a conjunct's columns are available in every branch."""
+        for available in availables:
+            if not self._can_evaluate_predicate(cols, available):
+                return False
+        return True
+
     def _push_filter_to_scan(self, filter_node: Filter, scan: Scan) -> LogicalPlanNode:
         """Push filter into scan node, merging conjuncts UNIQUELY.
 
@@ -475,9 +544,7 @@ class PredicatePushdownRule(OptimizationRule):
         filtered = Filter.create(
             input=getattr(join, side), predicate=combine_and(movable)
         )
-        return join.model_copy(
-            update={side: filtered, "condition": combine_and(kept)}
-        )
+        return join.model_copy(update={side: filtered, "condition": combine_and(kept)})
 
     def _split_single_sided(self, join: Join, side: str):
         """(movable, kept) condition conjuncts: movable ones reference at
@@ -644,9 +711,7 @@ class PredicatePushdownRule(OptimizationRule):
             return new_join
         # These conjuncts span both sides and are not join keys, so they can only
         # be evaluated after the join; keep them as one residual filter above it.
-        return Filter.create(
-            input=new_join, predicate=combine_and(residual_conjuncts)
-        )
+        return Filter.create(input=new_join, predicate=combine_and(residual_conjuncts))
 
     def name(self) -> str:
         """Return this rule's identifier (used in logging and EXPLAIN)."""
@@ -783,8 +848,18 @@ class ProjectionPushdownRule(OptimizationRule):
 
     def _prune_through(self, plan: LogicalPlanNode, required: set) -> LogicalPlanNode:
         """Pass-through nodes: prune each child with the same global set."""
-        passthrough = (Projection, Filter, Join, Aggregate, Limit, Sort,
-                       GroupedLimit, SingleRowGuard, LateralJoin, Explain)
+        passthrough = (
+            Projection,
+            Filter,
+            Join,
+            Aggregate,
+            Limit,
+            Sort,
+            GroupedLimit,
+            SingleRowGuard,
+            LateralJoin,
+            Explain,
+        )
         if not isinstance(plan, passthrough):
             raise ValueError(
                 f"_prune_columns has no rule for plan node {type(plan).__name__}"
@@ -796,7 +871,9 @@ class ProjectionPushdownRule(OptimizationRule):
 
         return transform_children(plan, prune_child)
 
-    def _prune_subquery_scan(self, node: SubqueryScan, required: set) -> LogicalPlanNode:
+    def _prune_subquery_scan(
+        self, node: SubqueryScan, required: set
+    ) -> LogicalPlanNode:
         """A derived table prunes inside only when its body pins an explicit
         output schema; a bare-plan body's scan columns ARE the derived
         table's schema and must not change."""
@@ -816,9 +893,7 @@ class ProjectionPushdownRule(OptimizationRule):
         if self._has_explicit_projection(cte.cte_plan):
             new_cte_plan = self._prune_columns(cte.cte_plan, required)
         if new_child != cte.child or new_cte_plan != cte.cte_plan:
-            return cte.model_copy(
-                update={"child": new_child, "cte_plan": new_cte_plan}
-            )
+            return cte.model_copy(update={"child": new_child, "cte_plan": new_cte_plan})
         return cte
 
     def _prune_branches(self, plan: LogicalPlanNode, required: set) -> LogicalPlanNode:
@@ -918,8 +993,20 @@ class LimitPushdownRule(OptimizationRule):
         """
         if isinstance(plan, Limit):
             return self._push_limit_node(plan)
-        if isinstance(plan, (Projection, Filter, Sort, Aggregate, Join, Union, Explain,
-                             SubqueryScan, CTE)):
+        if isinstance(
+            plan,
+            (
+                Projection,
+                Filter,
+                Sort,
+                Aggregate,
+                Join,
+                Union,
+                Explain,
+                SubqueryScan,
+                CTE,
+            ),
+        ):
             return transform_children(plan, self._rewrite_plan)
         return plan
 
@@ -1114,8 +1201,11 @@ class SemiJoinPushdownRule(OptimizationRule):
         if ref.table:
             keys.add(f"{ref.table}.{ref.column}")
         regions = []
-        for name, columns in (("left", left_cols), ("right", right_cols),
-                              ("subq", subq_cols)):
+        for name, columns in (
+            ("left", left_cols),
+            ("right", right_cols),
+            ("subq", subq_cols),
+        ):
             if keys & columns:
                 regions.append(name)
         if len(regions) != 1:
@@ -1421,8 +1511,9 @@ class OrderByPushdownRule(OptimizationRule):
             return self._recurse_filter(plan)
         if isinstance(plan, SetOperation):
             return _rewrite_set_operation_branches(plan, self._push_order_by)
-        if isinstance(plan, (Projection, Limit, Sort, Join, Aggregate, SubqueryScan,
-                             CTE)):
+        if isinstance(
+            plan, (Projection, Limit, Sort, Join, Aggregate, SubqueryScan, CTE)
+        ):
             return transform_children(plan, self._push_order_by)
         return plan
 
@@ -1543,8 +1634,7 @@ class AggregatePushdownRule(OptimizationRule):
         """
         if isinstance(plan, SetOperation):
             return _rewrite_set_operation_branches(plan, self._push_aggregate)
-        if isinstance(plan, (Projection, Filter, Limit, Sort, Join, SubqueryScan,
-                             CTE)):
+        if isinstance(plan, (Projection, Filter, Limit, Sort, Join, SubqueryScan, CTE)):
             return transform_children(plan, self._push_aggregate)
         return plan
 

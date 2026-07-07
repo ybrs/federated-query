@@ -140,16 +140,23 @@ class TestPredicatePushdown:
         real engine would filter out.
         """
         left = Scan(
-            datasource="d", schema_name="public", table_name="users",
+            datasource="d",
+            schema_name="public",
+            table_name="users",
             columns=["id", "v"],
         )
         right = Scan(
-            datasource="d", schema_name="public", table_name="orders",
+            datasource="d",
+            schema_name="public",
+            table_name="orders",
             columns=["id", "w"],
         )
         join = Join(
-            left=left, right=right, join_type=JoinType.INNER,
-            condition=None, using=["id"],
+            left=left,
+            right=right,
+            join_type=JoinType.INNER,
+            condition=None,
+            using=["id"],
         )
         predicate = BinaryOp(
             op=BinaryOpType.EQ,
@@ -534,12 +541,8 @@ class TestLimitPushdown:
         one SELECT DISTINCT ... LIMIT to the source), so only the non-Scan
         child blocks the pushdown.
         """
-        left = Scan(
-            datasource="a", schema_name="s", table_name="t1", columns=["c"]
-        )
-        right = Scan(
-            datasource="b", schema_name="s", table_name="t2", columns=["d"]
-        )
+        left = Scan(datasource="a", schema_name="s", table_name="t1", columns=["c"])
+        right = Scan(datasource="b", schema_name="s", table_name="t2", columns=["d"])
         join = Join(left=left, right=right, join_type=JoinType.INNER, condition=None)
         project = Projection(
             input=join,
@@ -1061,20 +1064,26 @@ def test_factor_common_equi_join_out_of_conjunct_disjunction():
 
     def branch(val):
         cond = BinaryOp(
-            op=BinaryOpType.EQ, left=a_x,
+            op=BinaryOpType.EQ,
+            left=a_x,
             right=Literal(value=val, data_type=DataType.INTEGER),
         )
         return BinaryOp(op=BinaryOpType.AND, left=equi, right=cond)
 
     disjunction = BinaryOp(op=BinaryOpType.OR, left=branch(1), right=branch(2))
     keep = BinaryOp(
-        op=BinaryOpType.GT, left=a_x,
+        op=BinaryOpType.GT,
+        left=a_x,
         right=Literal(value=0, data_type=DataType.INTEGER),
     )
     predicate = BinaryOp(op=BinaryOpType.AND, left=keep, right=disjunction)
-    left = Scan(datasource="d", schema_name="public", table_name="a", columns=["id", "x"])
+    left = Scan(
+        datasource="d", schema_name="public", table_name="a", columns=["id", "x"]
+    )
     right = Scan(datasource="d", schema_name="public", table_name="b", columns=["id"])
-    join = Join(left=left, right=right, join_type=JoinType.INNER, condition=None, using=[])
+    join = Join(
+        left=left, right=right, join_type=JoinType.INNER, condition=None, using=[]
+    )
 
     factored = PredicatePushdownRule()._factor_filter_predicate(
         Filter(input=join, predicate=predicate)
@@ -1082,3 +1091,96 @@ def test_factor_common_equi_join_out_of_conjunct_disjunction():
     top_conjuncts = split_conjuncts(factored.predicate)
     # The equi-join, trapped inside the OR before, is now a top-level conjunct.
     assert equi in top_conjuncts
+
+
+class TestSetOperationPredicatePushdown:
+    """Filter pushdown through UNION / set-operation branches."""
+
+    def _scan(self, table):
+        """A three-column scan of the given table."""
+        return Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name=table,
+            columns=["id", "age", "city"],
+        )
+
+    def _age_predicate(self):
+        """The pushable ``age > 18`` conjunct."""
+        return BinaryOp(
+            op=BinaryOpType.GT,
+            left=ColumnRef(table=None, column="age", data_type=DataType.INTEGER),
+            right=Literal(value=18, data_type=DataType.INTEGER),
+        )
+
+    def test_filter_pushes_into_union_branches(self):
+        """A conjunct every branch can evaluate lands in EVERY branch's scan."""
+        union = Union(inputs=[self._scan("users"), self._scan("staff")], distinct=False)
+        filter_node = Filter(input=union, predicate=self._age_predicate())
+
+        result = PredicatePushdownRule().apply(filter_node)
+
+        assert isinstance(result, Union)
+        for branch in result.inputs:
+            assert isinstance(branch, Scan)
+            assert branch.filters == self._age_predicate()
+
+    def test_filter_pushes_into_intersect_branches(self):
+        """A deterministic filter distributes into both set-operation branches."""
+        from federated_query.plan.logical import SetOperation, SetOpKind
+
+        set_op = SetOperation(
+            left=self._scan("users"),
+            right=self._scan("staff"),
+            kind=SetOpKind.INTERSECT,
+            distinct=True,
+        )
+        filter_node = Filter(input=set_op, predicate=self._age_predicate())
+
+        result = PredicatePushdownRule().apply(filter_node)
+
+        assert isinstance(result, SetOperation)
+        assert result.kind == SetOpKind.INTERSECT
+        assert result.left.filters == self._age_predicate()
+        assert result.right.filters == self._age_predicate()
+
+    def test_unresolvable_conjunct_stays_above_union(self):
+        """A conjunct some branch cannot evaluate stays above; the rest descend.
+
+        The flag column a disjunctive-subquery rewrite synthesizes exists only
+        in the branch projections' output, never below the union - its conjunct
+        must not be pushed while the plain age conjunct still is.
+        """
+        flag_conjunct = BinaryOp(
+            op=BinaryOpType.EQ,
+            left=ColumnRef(table=None, column="flag", data_type=DataType.BOOLEAN),
+            right=Literal(value=True, data_type=DataType.BOOLEAN),
+        )
+        predicate = BinaryOp(
+            op=BinaryOpType.AND, left=self._age_predicate(), right=flag_conjunct
+        )
+        union = Union(inputs=[self._scan("users"), self._scan("staff")], distinct=False)
+        filter_node = Filter(input=union, predicate=predicate)
+
+        result = PredicatePushdownRule().apply(filter_node)
+
+        assert isinstance(result, Filter)
+        assert result.predicate == flag_conjunct
+        assert isinstance(result.input, Union)
+        for branch in result.input.inputs:
+            assert branch.filters == self._age_predicate()
+
+    def test_available_columns_of_union_is_branch_intersection(self):
+        """A union exposes exactly the columns available in EVERY branch."""
+        narrow = Scan(
+            datasource="test_ds",
+            schema_name="public",
+            table_name="staff",
+            columns=["id", "age"],
+        )
+        union = Union(inputs=[self._scan("users"), narrow], distinct=False)
+
+        columns = pushdown.available_columns(union)
+
+        assert "age" in columns
+        assert "city" not in columns
