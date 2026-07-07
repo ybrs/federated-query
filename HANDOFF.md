@@ -4,7 +4,7 @@ State of the work, facts only. Earlier phases (Rust cutover, N-K decorrelation,
 cost-based optimizer, TPC-H fair benchmark) are in git history and in the
 auto-memory; this document is the CURRENT TPC-DS federated push.
 
-Test suite: **1221 passed, 3 skipped, 39 xfailed** (`POSTGRES_DB=duckpoc
+Test suite: **1240 passed, 3 skipped, 32 xfailed** (`POSTGRES_DB=duckpoc
 /workspace/venv-fedq/bin/python -m pytest -q`).
 
 ---
@@ -40,16 +40,68 @@ coordinator. Deferred by request.
 
 ## Current status (pg-dims, SF0.1)
 
-`PASS 81 | MISMATCH 1 (q18, above) | ERROR 17` of 99. No OTHER wrong results:
-correctness is compared against pure DuckDB, so a MISMATCH is a real engine diff.
+~`PASS 85 | MISMATCH 1 (q18) | ERROR ~14`. Last CLEAN full tally was PASS 81;
+the CROSS-join round then added q08/q13/q28/q88 (verified per-query). A full
+99-query tally was NOT re-run afterward ON PURPOSE - the remaining CROSS-join
+queries materialize huge cartesian products and OOMed the box on repeated full
+runs (see MEMORY section - the engine has no memory cap yet). Re-run only small
+`--only` subsets until the DataFusion memory pool below is wired.
 
 Remaining ERROR clusters (by cause) - RuntimeError and window clusters GONE:
-- **UnsupportedIR - 14**: `JoinType.CROSS` (~5), `PhysicalSingleRowGuard`
-  (scalar-subquery guard, ~3), and other physical nodes. CROSS join is now the
-  biggest remaining sub-group.
+- **CROSS-join OOM/timeout - ~4**: q45/q48/q10/q35 build a large cartesian
+  product. Their join condition is a DISJUNCTION with NO common conjunct
+  (q45: `(ca_zip IN ...) OR (i_item_id IN subquery)`), so factoring cannot lift
+  a hash key out; needs the memory pool (to fail cleanly) and/or disjunctive-
+  subquery decorrelation. q23 is a separate type_coercion.
+- **UnsupportedIR**: `PhysicalSingleRowGuard` (scalar-subquery guard, ~3) and a
+  few other physical nodes.
 - UnsupportedSQLError - 2 (simple CASE, window in WHERE - q70).
 - RuntimeError - 1 (q86: window combined with GROUPING()/ROLLUP, a DataFusion
   physical-planner limitation).
+
+## MEMORY - cap every run; DataFusion has NO limit today (DO THIS FIRST)
+
+The engine creates `SessionContext::new()` per fragment with NO runtime config,
+so DataFusion has NO memory limit. A CROSS-join query (q45/q48/q10/q35) that
+materializes a huge cartesian product allocates faster than the harness RSS
+watchdog polls, so it can OOM the whole server. DO NOT run the full 99-query
+tally until this is fixed; use `--only <subset>`.
+
+Environment facts (checked 2026-07-07):
+- No cgroup cap possible without root: cgroup v2 is mounted but /sys/fs/cgroup
+  is root-owned and READ-ONLY, we are in the root cgroup `0::/` with no
+  delegation (mkdir child cgroup = "Read-only file system"). `cgexec` and
+  `systemd-run` are both MISSING. `prlimit`/`ulimit -v` exist but cap VIRTUAL
+  address space per-process (RLIMIT_AS), which the Rust engine over-reserves -
+  the reason the harness uses an RSS watchdog, not RLIMIT_AS.
+
+Proper fix (in-engine, no root): configure a DataFusion `RuntimeEnv`:
+- `RuntimeEnvBuilder::new().with_memory_pool(Arc::new(FairSpillPool::new(LIMIT)))`
+  + default `DiskManager`, then `SessionContext::new_with_config_rt(cfg, rt)` for
+  EVERY context (engine.rs run_fragment ~417/439). Make LIMIT an env var
+  (e.g. FEDQRS_MEMORY_LIMIT, default ~a safe fraction of RAM).
+- Effect: memory-aware operators reserve from the pool and fail with
+  ResourcesExhausted instead of OOMing. DataFusion SPILLS sort + grouped
+  aggregate to disk (may let some big queries succeed); it does NOT spill hash
+  or nested-loop/CROSS joins (they error) - a real gap vs DuckDB, which spills
+  everything. So cross-join queries fail cleanly (still ERROR, but no OOM).
+- Caveat: the pool is COOPERATIVE accounting (tracks operator working memory,
+  not accumulated bindings), so it is not a hard kernel cap - but it covers the
+  join blowups that bit us.
+
+## CROSS join + disjunction factoring (this round)
+
+- **CROSS join emit** (`rust_ir` `_nested_loop_kind`): a CROSS join is a
+  PhysicalNestedLoopJoin with join_type CROSS, no keys, no condition; the engine
+  expresses a cartesian product as an INNER nested-loop join with an absent
+  condition (run_nested_loop_join reads None as join_on with no predicates), so
+  CROSS maps to inner. No Rust change. Fixed q08/q28/q88.
+- **Factor common conjuncts out of EACH conjunct's OR** (`optimizer/rules.py`
+  `_factor_filter_predicate`): it factored the WHOLE predicate, but a WHERE is a
+  top-level AND (split_disjuncts saw one branch, did nothing). A disjunction is a
+  CONJUNCT, so factor each conjunct. Lifts an equi-join repeated in every OR
+  branch (q13) to a top-level conjunct -> hash key instead of a cartesian
+  product. Fixed q13. Does NOT help q45/q48 (their OR has no common conjunct).
 
 ## Window functions - DONE (this round, +12)
 
