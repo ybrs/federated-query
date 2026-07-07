@@ -370,6 +370,10 @@ class _Ctx:
         # injected first and its binding cached, then the wrappers emit
         # normally and reach the base through this cache instead of re-reading.
         self.injected = {}
+        # CTE body bindings keyed by id(producer): a multi-referenced CTE is
+        # emitted (and executed) ONCE; every later reference reuses the same
+        # binding (the engine clones a shared binding until its last consumer).
+        self.cte_bindings = {}
 
 
 def build_ir(plan):
@@ -686,16 +690,23 @@ def _emit_single_row_guard(node, ctx):
 
 
 def _emit_cte_scan(node, ctx):
-    """A CTE reference: emit the producer's body. A CTE referenced N times
-    re-emits the body per reference (correct for deterministic bodies; sharing
-    a single materialization is a perf follow-up). An explicit CTE column list
-    relabels the body's output columns to the declared names."""
-    binding = _emit(node.producer.body, ctx)
-    if not node.producer.column_names:
+    """A CTE reference: the producer's body is emitted - and executed - ONCE.
+
+    Every reference to the same producer reuses the first reference's binding
+    (the engine clones a shared binding Arc-shallow until its last consumer,
+    so nothing re-runs; TPC-DS q04 executed its 6-times-referenced 3-branch
+    year_total body 18 times before this). An explicit CTE column list
+    relabels the body's output columns to the declared names, once as well.
+    """
+    producer = node.producer
+    binding = ctx.cte_bindings.get(id(producer))
+    if binding is not None:
         return binding
-    return _relabel_columns(
-        binding, node.producer.body, node.producer.column_names, ctx
-    )
+    binding = _emit(producer.body, ctx)
+    if producer.column_names:
+        binding = _relabel_columns(binding, producer.body, producer.column_names, ctx)
+    ctx.cte_bindings[id(producer)] = binding
+    return binding
 
 
 def _relabel_columns(binding, body, names, ctx):

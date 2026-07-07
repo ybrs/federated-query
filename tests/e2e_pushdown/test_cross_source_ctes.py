@@ -380,3 +380,42 @@ def test_recursive_cross_source_unrenderable_fails_fast(monkeypatch, hierarchy_e
     runtime = build_runtime(hierarchy_env)
     with pytest.raises(ValueError, match="not renderable"):
         runtime.query_executor._plan_pipeline(_SCHEMA_SQL, None)
+
+
+def test_multiple_references_emit_body_once(multi_source_env):
+    """The IR executes a twice-referenced CTE body exactly ONCE.
+
+    The shared producer used to be re-emitted per reference, re-running the
+    whole body (TPC-DS q04 executed its 6-times-referenced year_total body
+    18 times). The body's scan must appear once in the IR, and its binding
+    must feed BOTH references (the engine clones a shared binding until its
+    last consumer takes it).
+    """
+    from collections import Counter
+
+    from federated_query.executor.rust_ir import build_ir
+
+    engine_sql = (
+        "WITH cust AS ("
+        "  SELECT customer_id, segment FROM duckdb_customers.main.customers "
+        "  WHERE segment = 'enterprise'"
+        ") "
+        "SELECT o.order_id FROM duckdb_orders.main.orders o "
+        "JOIN cust a ON o.customer_id = a.customer_id "
+        "JOIN cust b ON o.customer_id = b.customer_id"
+    )
+    plan = _physical_plan(multi_source_env, engine_sql)
+    ir = build_ir(plan)
+
+    body_scans = 0
+    for step in ir["steps"]:
+        if step["op"] == "source_scan" and "customers" in str(step.get("scan")):
+            body_scans += 1
+    assert body_scans == 1
+
+    consumed = Counter()
+    for step in ir["steps"]:
+        if step["op"] == "merge":
+            for binding in step["inputs"].values():
+                consumed[binding] += 1
+    assert max(consumed.values()) >= 2
