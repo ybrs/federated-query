@@ -530,7 +530,33 @@ class Binder:
             return self._sort_key_from_alias(output_key, projection.expressions[index])
         if isinstance(key, ColumnRef) and key.table is None and key.column in alias_map:
             return self._sort_key_from_alias(key, alias_map[key.column])
-        return self._bind_expression(key)
+        bound = self._bind_expression(key)
+        match = self._match_projection_output(bound, projection)
+        return bound if match is None else match
+
+    def _match_projection_output(
+        self, bound_key: Expression, projection: Projection
+    ) -> Optional[Expression]:
+        """The projection output a COMPUTED ORDER BY key equals, or None.
+
+        ORDER BY substring(s_city,1,30) where the SELECT projects that exact
+        expression refers to the computed output column; recomputing it over the
+        projection's output fails, since the projection kept the substring but
+        dropped raw s_city (q79). A plain column key is left alone: it resolves
+        through the projection's output aliases and must stay qualified so a
+        single-source ORDER BY still pushes down.
+        """
+        from ..plan.expressions import ColumnRef
+
+        if isinstance(bound_key, ColumnRef):
+            return None
+        for index, expr in enumerate(projection.expressions):
+            if expr == bound_key:
+                return ColumnRef.create(
+                    table=None, column=projection.aliases[index],
+                    data_type=expr.get_type(),
+                )
+        return None
 
     def _sort_key_from_alias(
         self, key: Expression, source_expr: Expression

@@ -590,3 +590,26 @@ def test_order_by_aggregate_expression_binds_to_output(catalog_with_test_data):
     # recompute over the aggregate's output.
     assert isinstance(key, ColumnRef)
     assert not isinstance(key, FunctionCall)
+
+
+def test_order_by_computed_projection_expression_binds_to_output(catalog_with_test_data):
+    """ORDER BY substr(x,...) where the SELECT projects that exact expression
+    refers to the computed output column, not a recompute over the projection's
+    own output (which dropped raw x) - the q79 cross-source failure.
+    """
+    parser = Parser()
+    binder = Binder(catalog_with_test_data)
+    sql = (
+        "SELECT substr(name, 1, 3) FROM testdb.public.users "
+        "ORDER BY substr(name, 1, 3)"
+    )
+    bound = binder.bind(parser.parse_to_logical_plan(sql, catalog_with_test_data))
+
+    from federated_query.plan.logical import Sort
+    from federated_query.plan.expressions import ColumnRef, FunctionCall
+
+    assert isinstance(bound, Sort)
+    key = bound.sort_keys[0]
+    # Resolved to the computed OUTPUT column, not left as a recomputed substr.
+    assert isinstance(key, ColumnRef)
+    assert not isinstance(key, FunctionCall)
