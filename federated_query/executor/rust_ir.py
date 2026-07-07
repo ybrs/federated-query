@@ -50,6 +50,7 @@ from ..plan.physical import (
     PhysicalRemoteSetOp,
     PhysicalScan,
     PhysicalSetOperation,
+    PhysicalSingleRowGuard,
     PhysicalSort,
     PhysicalUnion,
     PhysicalValues,
@@ -82,6 +83,8 @@ _BINARY_OP_TOKENS = {
     BinaryOpType.OR: "or",
     BinaryOpType.LIKE: "like",
     BinaryOpType.ILIKE: "ilike",
+    BinaryOpType.NULL_SAFE_EQ: "is_not_distinct_from",
+    BinaryOpType.NULL_SAFE_NEQ: "is_distinct_from",
 }
 
 # Typed-literal tags keyed by the value's exact Python type. `bool` is a
@@ -94,6 +97,7 @@ _NULL_TESTS = {UnaryOpType.IS_NULL: False, UnaryOpType.IS_NOT_NULL: True}
 
 
 # --- expression serialization -------------------------------------------------
+
 
 def expr_to_ir(expr):
     """Serialize a source-side expression; columns keep their own qualifier."""
@@ -132,7 +136,11 @@ def _serialize_cast(expr, column_fn):
     arrow_type = _CAST_TYPES.get(expr.data_type)
     if arrow_type is None:
         raise UnsupportedIR(f"cast to {expr.target_type} not supported in IR")
-    return {"node": "cast", "expr": _serialize_expr(expr.expr, column_fn), "to": arrow_type}
+    return {
+        "node": "cast",
+        "expr": _serialize_expr(expr.expr, column_fn),
+        "to": arrow_type,
+    }
 
 
 def _serialize_in_list(expr, column_fn):
@@ -152,10 +160,12 @@ def _serialize_case(expr, column_fn):
     """A searched CASE: a list of WHEN/THEN plus an optional ELSE."""
     whens = []
     for condition, result in expr.when_clauses:
-        whens.append({
-            "when": _serialize_expr(condition, column_fn),
-            "then": _serialize_expr(result, column_fn),
-        })
+        whens.append(
+            {
+                "when": _serialize_expr(condition, column_fn),
+                "then": _serialize_expr(result, column_fn),
+            }
+        )
     case = {"node": "case", "whens": whens}
     if expr.else_result is not None:
         case["else"] = _serialize_expr(expr.else_result, column_fn)
@@ -227,6 +237,7 @@ def _expr_over(expr, input_name, child_aliases):
     Each ColumnRef resolves through `child_aliases` to the physical column name
     in that input's binding, tagged with `input_name` (e.g. `in_0`).
     """
+
     def column(col_ref):
         return {
             "node": "column",
@@ -269,6 +280,7 @@ _EXPR_SERIALIZERS = {
 
 # --- scan specs ---------------------------------------------------------------
 
+
 def raw_scan_spec(node):
     """A scan spec carrying pre-rendered source SQL (Python's emitter).
 
@@ -301,7 +313,9 @@ def _reject_nonplain_scan(scan):
     if any((scan.aggregates, scan.group_by, scan.grouping_sets)):
         raise UnsupportedIR("cannot inject a dynamic filter into an aggregate scan")
     if any((scan.order_by_keys, scan.limit is not None, scan.offset)):
-        raise UnsupportedIR("cannot inject a dynamic filter into an ordered/limited scan")
+        raise UnsupportedIR(
+            "cannot inject a dynamic filter into an ordered/limited scan"
+        )
 
 
 def _add_scan_qualifiers(scan, spec):
@@ -321,6 +335,7 @@ def _add_scan_predicates(scan, spec):
 
 
 # --- plan walker --------------------------------------------------------------
+
 
 class _Names:
     """Hands out unique binding and fragment names within one IR."""
@@ -368,7 +383,11 @@ def build_ir(plan):
     ctx = _Ctx()
     binding = _emit(plan, ctx)
     ctx.steps.append({"op": "return", "input": binding})
-    return {"outputs": _plan_outputs(plan), "steps": ctx.steps, "fragments": ctx.fragments}
+    return {
+        "outputs": _plan_outputs(plan),
+        "steps": ctx.steps,
+        "fragments": ctx.fragments,
+    }
 
 
 def _plan_outputs(plan):
@@ -404,10 +423,14 @@ PARALLEL_SCAN_MIN_ROWS = 50_000
 def _emit_source(node, ctx):
     """A source scan run natively (structured+parallel when it qualifies)."""
     binding = ctx.names.binding()
-    ctx.steps.append({
-        "op": "source_scan", "datasource": node.datasource,
-        "scan": _source_scan_spec(node), "binding": binding,
-    })
+    ctx.steps.append(
+        {
+            "op": "source_scan",
+            "datasource": node.datasource,
+            "scan": _source_scan_spec(node),
+            "binding": binding,
+        }
+    )
     return binding
 
 
@@ -461,9 +484,14 @@ def _partition_safe_scan(node) -> bool:
 def _merge_step(ctx, fragment, inputs):
     """Append a merge step running `fragment` over `inputs`; return its binding."""
     result = ctx.names.binding()
-    ctx.steps.append({
-        "op": "merge", "fragment": fragment, "inputs": inputs, "binding": result,
-    })
+    ctx.steps.append(
+        {
+            "op": "merge",
+            "fragment": fragment,
+            "inputs": inputs,
+            "binding": result,
+        }
+    )
     return result
 
 
@@ -481,9 +509,17 @@ def _emit_projection(node, ctx):
         )
     child = _emit(node.input, ctx)
     aliases = node.input.column_aliases()
-    project = _projection_items(node.expressions, node.output_names, "in_0", aliases, node.input)
+    project = _projection_items(
+        node.expressions, node.output_names, "in_0", aliases, node.input
+    )
     fragment = ctx.names.fragment()
-    ctx.fragments[fragment] = {"kind": "project", "project": project}
+    # `distinct` MUST reach the engine: a plain project fragment for a
+    # DISTINCT projection would silently return duplicate rows.
+    ctx.fragments[fragment] = {
+        "kind": "project",
+        "project": project,
+        "distinct": node.distinct,
+    }
     return _merge_step(ctx, fragment, {"in_0": child})
 
 
@@ -535,7 +571,9 @@ def _aggregate_fragment(node, aliases):
         "group_by": _serialize_group_by(node.group_by, aliases),
     }
     if node.grouping_sets:
-        fragment["grouping_sets"] = _serialize_grouping_sets(node.grouping_sets, aliases)
+        fragment["grouping_sets"] = _serialize_grouping_sets(
+            node.grouping_sets, aliases
+        )
     return fragment
 
 
@@ -578,7 +616,12 @@ def _agg_call(fn, aliases):
     ordered-set aggregate carries its `WITHIN GROUP (ORDER BY ...)`."""
     star = _is_star_arg(fn.args)
     args = _agg_args(fn.args, aliases, star)
-    call = {"func": fn.function_name, "distinct": fn.distinct, "star": star, "args": args}
+    call = {
+        "func": fn.function_name,
+        "distinct": fn.distinct,
+        "star": star,
+        "args": args,
+    }
     if fn.within_group_key is not None:
         call["within_group"] = {
             "key": _expr_over(fn.within_group_key, "in_0", aliases),
@@ -620,6 +663,21 @@ def _emit_filter(node, ctx):
     return _merge_step(ctx, fragment, {"in_0": child})
 
 
+def _emit_single_row_guard(node, ctx):
+    """The scalar-subquery cardinality guard over its single input, as a
+    `single_row_guard` fragment. The engine errors when the input holds more
+    than one row (per distinct key tuple when keys are given), else passes the
+    input through unchanged - dropping the guard would let the join above
+    silently duplicate outer rows."""
+    child = _emit(node.input, ctx)
+    keys = []
+    for key in node.keys:
+        keys.append(_expr_over(key, "in_0", node.input.column_aliases()))
+    fragment = ctx.names.fragment()
+    ctx.fragments[fragment] = {"kind": "single_row_guard", "keys": keys}
+    return _merge_step(ctx, fragment, {"in_0": child})
+
+
 def _emit_cte_scan(node, ctx):
     """A CTE reference: emit the producer's body. A CTE referenced N times
     re-emits the body per reference (correct for deterministic bodies; sharing
@@ -628,7 +686,9 @@ def _emit_cte_scan(node, ctx):
     binding = _emit(node.producer.body, ctx)
     if not node.producer.column_names:
         return binding
-    return _relabel_columns(binding, node.producer.body, node.producer.column_names, ctx)
+    return _relabel_columns(
+        binding, node.producer.body, node.producer.column_names, ctx
+    )
 
 
 def _relabel_columns(binding, body, names, ctx):
@@ -640,7 +700,14 @@ def _relabel_columns(binding, body, names, ctx):
     fragment = ctx.names.fragment()
     ctx.fragments[fragment] = {"kind": "project", "project": project}
     result = ctx.names.binding()
-    ctx.steps.append({"op": "merge", "fragment": fragment, "inputs": {"in_0": binding}, "binding": result})
+    ctx.steps.append(
+        {
+            "op": "merge",
+            "fragment": fragment,
+            "inputs": {"in_0": binding},
+            "binding": result,
+        }
+    )
     return result
 
 
@@ -654,13 +721,19 @@ def _emit_grouped_limit(node, ctx):
     sql = (
         f"WITH {_MERGE_GROUPED_LIMIT_RELATION} AS "
         f'(SELECT *, ROW_NUMBER() OVER () AS "{_GROUPED_LIMIT_INDEX_COL}" '
-        "FROM __gl_input) "
-        + node_sql
+        "FROM __gl_input) " + node_sql
     )
     fragment = ctx.names.fragment()
     ctx.fragments[fragment] = {"kind": "raw_sql", "sql": sql}
     result = ctx.names.binding()
-    ctx.steps.append({"op": "merge", "fragment": fragment, "inputs": {"__gl_input": child}, "binding": result})
+    ctx.steps.append(
+        {
+            "op": "merge",
+            "fragment": fragment,
+            "inputs": {"__gl_input": child},
+            "binding": result,
+        }
+    )
     return result
 
 
@@ -672,7 +745,14 @@ def _emit_window(node, ctx):
     fragment = ctx.names.fragment()
     ctx.fragments[fragment] = {"kind": "raw_sql", "sql": sql}
     result = ctx.names.binding()
-    ctx.steps.append({"op": "merge", "fragment": fragment, "inputs": {"in_window": child}, "binding": result})
+    ctx.steps.append(
+        {
+            "op": "merge",
+            "fragment": fragment,
+            "inputs": {"in_window": child},
+            "binding": result,
+        }
+    )
     return result
 
 
@@ -683,9 +763,14 @@ def _raw_sql_step(ctx, sql, inputs):
     fragment = ctx.names.fragment()
     ctx.fragments[fragment] = {"kind": "raw_sql", "sql": sql}
     result = ctx.names.binding()
-    ctx.steps.append({
-        "op": "merge", "fragment": fragment, "inputs": inputs, "binding": result,
-    })
+    ctx.steps.append(
+        {
+            "op": "merge",
+            "fragment": fragment,
+            "inputs": inputs,
+            "binding": result,
+        }
+    )
     return result
 
 
@@ -734,7 +819,11 @@ def _emit_limit(node, ctx):
     """A LIMIT/OFFSET over its single input, as a `limit` fragment."""
     child = _emit(node.input, ctx)
     fragment = ctx.names.fragment()
-    ctx.fragments[fragment] = {"kind": "limit", "limit": node.limit, "offset": node.offset}
+    ctx.fragments[fragment] = {
+        "kind": "limit",
+        "limit": node.limit,
+        "offset": node.offset,
+    }
     return _merge_step(ctx, fragment, {"in_0": child})
 
 
@@ -745,7 +834,9 @@ def _emit_values(node, ctx):
     fragment = ctx.names.fragment()
     ctx.fragments[fragment] = {"kind": "raw_sql", "sql": sql}
     result = ctx.names.binding()
-    ctx.steps.append({"op": "merge", "fragment": fragment, "inputs": {}, "binding": result})
+    ctx.steps.append(
+        {"op": "merge", "fragment": fragment, "inputs": {}, "binding": result}
+    )
     return result
 
 
@@ -845,7 +936,9 @@ def _emit_join(join, ctx):
         right_binding = _emit(join.right, ctx)
     fragment = ctx.names.fragment()
     ctx.fragments[fragment] = _join_fragment(join, kind)
-    return _merge_step(ctx, fragment, {"in_left": left_binding, "in_right": right_binding})
+    return _merge_step(
+        ctx, fragment, {"in_left": left_binding, "in_right": right_binding}
+    )
 
 
 def _join_kind(join):
@@ -1014,7 +1107,8 @@ def _emit_reduced_join(join, ctx):
     """The build/collect/inject reduction path; returns (left, right) bindings."""
     build_child, probe_child, build_key_expr, probe_key_expr = _orient_join(join)
     build_binding, probe_binding = _emit_reduced_inputs(
-        ctx, build_child, probe_child, build_key_expr, probe_key_expr)
+        ctx, build_child, probe_child, build_key_expr, probe_key_expr
+    )
     left_binding = build_binding if build_child is join.left else probe_binding
     right_binding = build_binding if build_child is join.right else probe_binding
     return left_binding, right_binding
@@ -1108,18 +1202,28 @@ def _emit_build_scan(ctx, build_child, binding):
     """A fully materialized build-side scan (it is also distinct-scanned).
     Uses the same spec choice as a plain source scan, so a big PostgreSQL
     build side also gets the ctid-parallel read."""
-    ctx.steps.append({
-        "op": "source_scan", "datasource": build_child.datasource,
-        "scan": _source_scan_spec(build_child), "binding": binding, "materialize": True,
-    })
+    ctx.steps.append(
+        {
+            "op": "source_scan",
+            "datasource": build_child.datasource,
+            "scan": _source_scan_spec(build_child),
+            "binding": binding,
+            "materialize": True,
+        }
+    )
 
 
 def _emit_collect_distinct(ctx, input_binding, key, binding):
     """Collect the build side's distinct join-key values, capped."""
-    ctx.steps.append({
-        "op": "collect_distinct", "input": input_binding, "key": key,
-        "cap": _DYNAMIC_FILTER_MAX_KEYS, "binding": binding,
-    })
+    ctx.steps.append(
+        {
+            "op": "collect_distinct",
+            "input": input_binding,
+            "key": key,
+            "cap": _DYNAMIC_FILTER_MAX_KEYS,
+            "binding": binding,
+        }
+    )
 
 
 def _emit_injected_scan(ctx, base, inject_col, keys_binding, binding, build_key):
@@ -1127,10 +1231,12 @@ def _emit_injected_scan(ctx, base, inject_col, keys_binding, binding, build_key)
     probe column's NDV rides along so the engine's delivery-strategy guard
     prices the fetched fraction as keys/NDV instead of keys/row-count."""
     step = {
-        "op": "injected_scan", "datasource": base.datasource,
+        "op": "injected_scan",
+        "datasource": base.datasource,
         "scan": _injected_probe_spec(base, inject_col, build_key),
         "inject_column": inject_col,
-        "keys_from": keys_binding, "binding": binding,
+        "keys_from": keys_binding,
+        "binding": binding,
     }
     ndv = _node_column_ndv(base, inject_col)
     if ndv is not None:
@@ -1301,7 +1407,9 @@ def _emit_nested_loop_join(node, ctx):
     right_binding = _emit(node.right, ctx)
     fragment = ctx.names.fragment()
     ctx.fragments[fragment] = _nested_loop_fragment(node, kind)
-    return _merge_step(ctx, fragment, {"in_left": left_binding, "in_right": right_binding})
+    return _merge_step(
+        ctx, fragment, {"in_left": left_binding, "in_right": right_binding}
+    )
 
 
 def _nested_loop_fragment(node, kind):
@@ -1312,7 +1420,9 @@ def _nested_loop_fragment(node, kind):
         "project": _join_output_projection(node),
     }
     if node.condition is not None:
-        fragment["condition"] = _serialize_expr(node.condition, _two_sided_column_fn(node))
+        fragment["condition"] = _serialize_expr(
+            node.condition, _two_sided_column_fn(node)
+        )
     return fragment
 
 
@@ -1339,7 +1449,8 @@ def _join_output_projection(join):
     project = []
     for (table, column), out_name in join.column_aliases().items():
         item = _join_projection_item(
-            table, column, out_name, left_tables, left_aliases, right_aliases)
+            table, column, out_name, left_tables, left_aliases, right_aliases
+        )
         project.append(item)
     _uniquify_aliases(project)
     return project
@@ -1365,12 +1476,14 @@ def _uniquify_aliases(project):
 def _relation_names(aliases):
     """The set of relation aliases present in a column-alias map."""
     names = set()
-    for (table, _column) in aliases:
+    for table, _column in aliases:
         names.add(table)
     return names
 
 
-def _join_projection_item(table, column, out_name, left_tables, left_aliases, right_aliases):
+def _join_projection_item(
+    table, column, out_name, left_tables, left_aliases, right_aliases
+):
     """One join output column, resolved to its input side and physical name."""
     if table in left_tables:
         return _side_column("in_left", left_aliases[(table, column)], out_name)
@@ -1379,7 +1492,10 @@ def _join_projection_item(table, column, out_name, left_tables, left_aliases, ri
 
 def _side_column(relation, name, alias):
     """A projection item selecting `relation`.`name` aliased to `alias`."""
-    return {"expr": {"node": "column", "relation": relation, "name": name}, "alias": alias}
+    return {
+        "expr": {"node": "column", "relation": relation, "name": name},
+        "alias": alias,
+    }
 
 
 # Physical node type -> its emitter. Defined after the emitters it references.
@@ -1400,12 +1516,14 @@ _NODE_EMITTERS = {
     PhysicalAliasedRelation: _emit_passthrough,
     PhysicalWindow: _emit_window,
     PhysicalGroupedLimit: _emit_grouped_limit,
+    PhysicalSingleRowGuard: _emit_single_row_guard,
     PhysicalUnion: _emit_union,
     PhysicalSetOperation: _emit_set_operation,
 }
 
 
 # --- datasource registration bridge -------------------------------------------
+
 
 def _pg_adbc_driver_path():
     """Locate the ADBC Postgres driver shared library shipped with the venv."""
@@ -1433,14 +1551,18 @@ def _register_one(fedqrs, datasource, postgres_cls, duckdb_cls):
     from ..datasources.parquet import ParquetDataSource
 
     if isinstance(datasource, ParquetDataSource):
-        fedqrs.register_datasource(datasource.name, "parquet", {"dir": datasource.parquet_dir})
+        fedqrs.register_datasource(
+            datasource.name, "parquet", {"dir": datasource.parquet_dir}
+        )
         return
     if isinstance(datasource, postgres_cls):
         params = {"uri": datasource._adbc_uri(), "adbc_driver": _pg_adbc_driver_path()}
         fedqrs.register_datasource(datasource.name, "postgres", params)
         return
     if isinstance(datasource, duckdb_cls):
-        fedqrs.register_datasource(datasource.name, "duckdb", {"path": datasource.db_path})
+        fedqrs.register_datasource(
+            datasource.name, "duckdb", {"path": datasource.db_path}
+        )
         return
     raise UnsupportedIR(
         f"datasource {type(datasource).__name__} has no native Rust connector yet"

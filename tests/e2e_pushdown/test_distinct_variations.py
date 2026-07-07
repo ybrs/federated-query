@@ -183,3 +183,22 @@ def test_distinct_star(single_source_env):
     assert len(expressions) == 9
     for column_expr in expressions:
         assert isinstance(column_expr, exp.Column)
+
+
+def test_distinct_over_cross_source_join(multi_source_env):
+    """A DISTINCT over a cross-source join deduplicates in the merge engine.
+
+    No single source can run the whole query, so the DISTINCT projection is a
+    merge fragment; the engine must honor its distinct flag. All 10 orders
+    join a customer, so a dropped DISTINCT would return one region per order
+    instead of the 3 distinct regions - a silent wrong answer.
+    """
+    runtime = build_runtime(multi_source_env)
+    sql = (
+        "SELECT DISTINCT o.region "
+        "FROM duckdb_orders.main.orders o "
+        "JOIN duckdb_customers.main.customers c ON o.customer_id = c.customer_id"
+    )
+    table = runtime.execute(sql)
+    regions = table.column("region").to_pylist()
+    assert sorted(regions) == ["APAC", "EU", "NA"]

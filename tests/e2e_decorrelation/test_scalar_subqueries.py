@@ -8,9 +8,8 @@ and join conditions. Focuses on cardinality enforcement and NULL handling.
 import pytest
 from federated_query.parser.parser import Parser
 from federated_query.parser.binder import Binder
-from federated_query.optimizer.decorrelation import Decorrelator
+from federated_query.optimizer.decorrelation import Decorrelator, DecorrelationError
 from federated_query.executor.executor import Executor
-from federated_query.executor.rust_ir import UnsupportedIR
 from .test_utils import (
     assert_plan_structure,
     assert_result_count,
@@ -60,7 +59,6 @@ class TestUncorrelatedScalarInSelect:
         results = execute_and_fetch_all(executor, decorrelated_plan)
         assert len(results) >= 0, "Query should execute successfully"
 
-    @pytest.mark.xfail(reason="fedqrs gap: PhysicalSingleRowGuard has no Rust operator", strict=False)
     def test_uncorrelated_scalar_single_row(self, catalog, setup_test_data):
         """
         Test: Uncorrelated scalar subquery returning single row without aggregation.
@@ -98,7 +96,6 @@ class TestUncorrelatedScalarInSelect:
         results = execute_and_fetch_all(executor, decorrelated_plan)
         assert len(results) >= 0, "Query should execute successfully"
 
-    @pytest.mark.xfail(reason="fedqrs gap: PhysicalSingleRowGuard has no Rust operator", strict=False)
     def test_uncorrelated_scalar_returns_null(self, catalog, setup_test_data):
         """
         Test: Uncorrelated scalar subquery returning NULL.
@@ -414,7 +411,6 @@ class TestScalarInPredicates:
         results = execute_and_fetch_all(executor, decorrelated_plan)
         assert len(results) >= 0, "Query should execute successfully"
 
-    @pytest.mark.xfail(reason="fedqrs gap: PhysicalSingleRowGuard has no Rust operator", strict=False)
     def test_scalar_comparison_null_safe(self, catalog, setup_test_data):
         """
         Test: Scalar subquery comparison with NULL handling.
@@ -526,11 +522,95 @@ class TestScalarCardinalityEnforcement:
         decorrelated_plan = decorrelator.decorrelate(bound_plan)
 
         assert_plan_structure(decorrelated_plan, {})
-        # The scalar-subquery cardinality guard (PhysicalSingleRowGuard) has no
-        # Rust operator yet, so the plan fails loud at IR build (UnsupportedIR)
-        # rather than returning wrong rows - a crash, never a lie.
-        with pytest.raises(UnsupportedIR, match="PhysicalSingleRowGuard"):
+        # The runtime cardinality guard (the engine's single_row_guard
+        # fragment) must fire: users 1 and 3 have multiple orders, so the
+        # scalar side holds more than one row per correlation key.
+        with pytest.raises(RuntimeError, match="more than one row"):
             execute_and_fetch_all(executor, decorrelated_plan)
+
+    def test_uncorrelated_scalar_multiple_rows_error(self, catalog, setup_test_data):
+        """An uncorrelated multi-row scalar fires the KEYLESS guard.
+
+        (SELECT amount FROM orders WHERE status = 'completed') holds 4 rows,
+        so the at-most-one-row-total check must raise at execution.
+        """
+        sql = """
+            SELECT u.id,
+                   (SELECT amount FROM pg.orders WHERE status = 'completed') AS amount
+            FROM pg.users u
+        """
+        parser = Parser()
+        binder = Binder(catalog)
+        decorrelator = Decorrelator()
+        executor = Executor(catalog)
+        decorrelated_plan = decorrelator.decorrelate(binder.bind(parser.parse(sql)))
+        with pytest.raises(RuntimeError, match="more than one row"):
+            execute_and_fetch_all(executor, decorrelated_plan)
+
+    def test_uncorrelated_distinct_scalar_passes_guard(self, catalog, setup_test_data):
+        """A DISTINCT scalar collapsing many rows to one value must pass.
+
+        (SELECT DISTINCT status FROM orders WHERE status = 'completed') reads
+        4 rows but is single-valued; the DISTINCT must survive decorrelation
+        (peeling it would multiply rows and falsely fire the guard).
+        """
+        sql = """
+            SELECT u.id,
+                   (SELECT DISTINCT status FROM pg.orders
+                    WHERE status = 'completed') AS st
+            FROM pg.users u
+            ORDER BY u.id
+        """
+        parser = Parser()
+        binder = Binder(catalog)
+        decorrelator = Decorrelator()
+        executor = Executor(catalog)
+        decorrelated_plan = decorrelator.decorrelate(binder.bind(parser.parse(sql)))
+        results = execute_and_fetch_all(executor, decorrelated_plan)
+        assert len(results) == 5
+        for row in results:
+            assert row["st"] == "completed"
+
+    def test_uncorrelated_distinct_expression_scalar(self, catalog, setup_test_data):
+        """A DISTINCT over an EXPRESSION keeps the rename onto the value column.
+
+        (SELECT DISTINCT user_id * 0 ...) exposes its output under a generated
+        name ("user_id * 0"); the rename projection to the synthetic value
+        column must survive single-source pushdown's projection collapse.
+        """
+        sql = """
+            SELECT u.id, (SELECT DISTINCT user_id * 0 FROM pg.orders) AS zero
+            FROM pg.users u
+            ORDER BY u.id
+        """
+        parser = Parser()
+        binder = Binder(catalog)
+        decorrelator = Decorrelator()
+        executor = Executor(catalog)
+        decorrelated_plan = decorrelator.decorrelate(binder.bind(parser.parse(sql)))
+        results = execute_and_fetch_all(executor, decorrelated_plan)
+        assert len(results) == 5
+        for row in results:
+            assert row["zero"] == 0
+
+    def test_correlated_distinct_scalar_fails_fast(self, catalog, setup_test_data):
+        """A correlated DISTINCT value subquery must fail fast at decorrelation.
+
+        Flattening it would need the correlation keys folded into the DISTINCT
+        column set; until that rewrite exists, answering would risk a wrong
+        row set - so it must raise, never silently drop the DISTINCT.
+        """
+        sql = """
+            SELECT u.id,
+                   (SELECT DISTINCT o.status FROM pg.orders o
+                    WHERE o.user_id = u.id) AS st
+            FROM pg.users u
+        """
+        parser = Parser()
+        binder = Binder(catalog)
+        decorrelator = Decorrelator()
+        with pytest.raises(DecorrelationError, match="DISTINCT in a correlated"):
+            decorrelator.decorrelate(binder.bind(parser.parse(sql)))
 
     def test_scalar_with_limit_one(self, catalog, setup_test_data):
         """

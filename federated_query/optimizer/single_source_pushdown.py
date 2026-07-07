@@ -49,6 +49,7 @@ def _combine_and(terms) -> Optional[exp.Expression]:
         return None
     return exp.and_(*terms)
 
+
 # Engine join type -> sqlglot exp.Join (kind, side), mirroring how sqlglot's own
 # parser represents each keyword so the rendered SQL is identical to the prior
 # parse-back. SEMI/ANTI render to WHERE [NOT] EXISTS in Postgres form, exactly as
@@ -61,6 +62,7 @@ _JOIN_KIND_SIDE = {
     JoinType.SEMI: ("SEMI", None),
     JoinType.ANTI: ("ANTI", None),
 }
+
 
 def same_source(left: Optional[str], right: Optional[str]) -> bool:
     """Whether two datasource names identify the same source.
@@ -465,6 +467,16 @@ class SingleSourcePushdown:
         expands stars before planning, so one surviving here cannot be rendered
         faithfully (``* AS "*"`` is invalid SQL) and is left to local execution.
         """
+        if context.select_items:
+            # A second SELECT list would OVERWRITE the one already absorbed,
+            # silently renaming columns or changing the row set. Only the
+            # explicit stacked-projection collapse below may combine two
+            # projections; anything else declines to the merge engine.
+            return False
+        if isinstance(projection.input, Projection):
+            return self._absorb_stacked_projection(
+                projection, projection.input, context
+            )
         context.distinct = projection.distinct
         context.distinct_on = projection.distinct_on
         if self._has_star(projection.expressions):
@@ -475,6 +487,58 @@ class SingleSourcePushdown:
             context.has_computed = True
         self._set_select(projection.expressions, projection.aliases, context)
         return self._absorb(projection.input, context)
+
+    def _absorb_stacked_projection(
+        self, outer: Projection, inner: Projection, context: _PushContext
+    ) -> bool:
+        """Collapse projection-over-projection into ONE SELECT list.
+
+        Decorrelation stacks a rename projection over a DISTINCT value
+        projection; absorbing both normally would let the inner SELECT list
+        overwrite the outer's, losing the rename. Only a pure column rename
+        covering every inner output exactly once collapses (the inner
+        expressions render under the OUTER aliases, the inner DISTINCT is
+        kept - a bijective rename never changes the distinct row set). Any
+        other stack is declined so the merge engine runs the outer projection
+        faithfully.
+        """
+        if outer.distinct_on is not None:
+            return False
+        substituted = self._substitute_bijective_rename(outer, inner)
+        if substituted is None:
+            return False
+        context.distinct = outer.distinct or inner.distinct
+        context.distinct_on = inner.distinct_on
+        self._set_select(substituted, outer.aliases, context)
+        return self._absorb(inner.input, context)
+
+    def _substitute_bijective_rename(
+        self, outer: Projection, inner: Projection
+    ) -> Optional[List[Expression]]:
+        """The inner expressions in outer order, when the outer projection is a
+        pure column rename covering every inner output exactly once; else None."""
+        if len(outer.expressions) != len(inner.aliases):
+            return None
+        used: set = set()
+        substituted: List[Expression] = []
+        for expression in outer.expressions:
+            source = self._rename_source(expression, inner, used)
+            if source is None:
+                return None
+            used.add(expression.column)
+            substituted.append(source)
+        return substituted
+
+    def _rename_source(
+        self, expression: Expression, inner: Projection, used: set
+    ) -> Optional[Expression]:
+        """The inner expression an outer rename item maps to, or None when the
+        item is not a fresh plain reference to one inner output column."""
+        if not isinstance(expression, ColumnRef):
+            return None
+        if expression.column in used or expression.column not in inner.aliases:
+            return None
+        return inner.expressions[inner.aliases.index(expression.column)]
 
     def _absorb_aggregate_projection(
         self, projection: Projection, context: _PushContext
