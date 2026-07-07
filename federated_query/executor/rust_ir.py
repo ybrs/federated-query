@@ -1283,10 +1283,20 @@ def _key_names(keys, child):
     return names
 
 
+def _nested_loop_kind(node):
+    """The IR join_kind for a nested-loop join. A CROSS join is a conditionless
+    cartesian product; the engine expresses it as an INNER nested-loop join with
+    NO condition (run_nested_loop_join reads an absent condition as the cross
+    product), so CROSS maps to inner here rather than being refused."""
+    if node.join_type == JoinType.CROSS:
+        return "inner"
+    return _join_kind(node)
+
+
 def _emit_nested_loop_join(node, ctx):
     """A non-equi (nested-loop) join: emit both sides, join on the condition
     (or a cross join when there is none), then the canonical output columns."""
-    kind = _join_kind(node)
+    kind = _nested_loop_kind(node)
     left_binding = _emit(node.left, ctx)
     right_binding = _emit(node.right, ctx)
     fragment = ctx.names.fragment()

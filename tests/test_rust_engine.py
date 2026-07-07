@@ -234,6 +234,19 @@ def test_cross_source_window_over_aggregate(engine):
     _assert_parity(qe, datasources, sql)
 
 
+def test_cross_source_cross_join(engine):
+    """A CROSS JOIN (cartesian product) across two sources. It has no keys and no
+    condition, so it lowers to an INNER nested-loop join with an absent condition
+    (the engine reads that as the cross product); q08/q28/q88.
+    """
+    qe, datasources = engine
+    sql = (
+        f"SELECT n.n_name, r.r_name "
+        f"FROM srcA.{SCHEMA}.nation n CROSS JOIN srcB.{SCHEMA}.region r"
+    )
+    _assert_parity(qe, datasources, sql)
+
+
 def test_sort_over_projection_of_renamed_self_join(engine):
     """ORDER BY a self-join-renamed column that a dropping projection passes
     through must sort by the OUTPUT column, not the vanished physical source.
