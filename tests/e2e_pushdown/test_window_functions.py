@@ -113,3 +113,70 @@ def test_window_over_cross_source_join(multi_source_env):
     # consumer (customers 4,5): orders 10,4,5,9 by price desc 200,125,60,10.
     assert ranks[10] == 1
     assert ranks[9] == 4
+
+
+def test_window_in_derived_table_filtered_by_outer_in(multi_source_env):
+    """A window inside a derived table referenced from WHERE is legal SQL.
+
+    The WHERE-clause window rejection must prune at subquery boundaries: the
+    rank() belongs to the derived table's own SELECT list (TPC-DS q70), only a
+    window used DIRECTLY in this clause is invalid. Regions ranked by total
+    price: EU 325, NA 195, APAC 165 - the top-2 filter keeps EU and NA rows.
+    """
+    runtime = build_runtime(multi_source_env)
+    sql = (
+        "SELECT o.order_id FROM duckdb_orders.main.orders o "
+        "JOIN duckdb_customers.main.customers c ON o.customer_id = c.customer_id "
+        "WHERE o.region IN ("
+        "  SELECT region FROM ("
+        "    SELECT region, rank() OVER (ORDER BY sum(price) DESC) AS ranking "
+        "    FROM duckdb_orders.main.orders GROUP BY region) tmp "
+        "  WHERE ranking <= 2)"
+    )
+    table = runtime.execute(sql)
+    assert table.num_rows == 8
+
+
+def test_grouping_inside_window_over_rollup_cross_source(multi_source_env):
+    """rank() partitioned by GROUPING() over a ROLLUP runs cross-source.
+
+    DataFusion cannot plan GROUPING() inside a window expression, so the
+    aggregate materializes the window operands and the window runs over the
+    materialized columns (the two-stage split; TPC-DS q70/q86). Detail rows
+    (g=0) rank EU 1, NA 2, APAC 3 by total; the rollup row (g=1) ranks 1 in
+    its own partition.
+    """
+    runtime = build_runtime(multi_source_env)
+    sql = (
+        "SELECT o.region, grouping(o.region) AS g, sum(o.price) AS total, "
+        "rank() OVER (PARTITION BY grouping(o.region) "
+        "             ORDER BY sum(o.price) DESC) AS r "
+        "FROM duckdb_orders.main.orders o "
+        "JOIN duckdb_customers.main.customers c ON o.customer_id = c.customer_id "
+        "GROUP BY rollup(o.region) "
+        "ORDER BY g, r"
+    )
+    table = runtime.execute(sql)
+    rows = table.to_pylist()
+    assert [row["region"] for row in rows] == ["EU", "NA", "APAC", None]
+    assert [row["r"] for row in rows] == [1, 2, 3, 1]
+    assert [row["g"] for row in rows] == [0, 0, 0, 1]
+
+
+def test_order_by_aggregate_not_in_select_cross_source(multi_source_env):
+    """ORDER BY an aggregate call absent from the SELECT list, cross-source.
+
+    max(o.price) appears only in ORDER BY, so the binder materializes it as a
+    hidden aggregate output the sort reads by name and the restore projection
+    drops. Region maxima: EU 200, NA 125, APAC 90.
+    """
+    runtime = build_runtime(multi_source_env)
+    sql = (
+        "SELECT o.region, count(*) AS n "
+        "FROM duckdb_orders.main.orders o "
+        "JOIN duckdb_customers.main.customers c ON o.customer_id = c.customer_id "
+        "GROUP BY o.region ORDER BY max(o.price) DESC"
+    )
+    table = runtime.execute(sql)
+    assert table.column_names == ["region", "n"]
+    assert table.column("region").to_pylist() == ["EU", "NA", "APAC"]

@@ -557,6 +557,13 @@ def _emit_aggregate(node, ctx):
     child = _emit(node.input, ctx)
     aliases = node.input.column_aliases()
     if node.has_window_output():
+        if node.window_split_needed():
+            # GROUPING() inside a window cannot run fused (DataFusion planner
+            # gap): stage 1 materializes the window operands as aggregate
+            # outputs, stage 2 runs the window over those columns.
+            stage1_sql, stage2_sql = node.split_window_aggregate_sqls(aliases)
+            grouped = _raw_sql_step(ctx, stage1_sql, {"in_0": child})
+            return _raw_sql_step(ctx, stage2_sql, {"in_0": grouped})
         return _raw_sql_step(ctx, node._aggregate_sql(aliases), {"in_0": child})
     fragment = ctx.names.fragment()
     ctx.fragments[fragment] = _aggregate_fragment(node, aliases)

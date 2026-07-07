@@ -519,9 +519,7 @@ class Parser:
             input=inner_plan, alias=alias, column_names=column_names
         )
 
-    def _derived_column_names(
-        self, subquery: exp.Subquery
-    ) -> Optional[List[str]]:
+    def _derived_column_names(self, subquery: exp.Subquery) -> Optional[List[str]]:
         """Extract a derived table's column-alias list, or None if it has none."""
         table_alias = subquery.args.get("alias")
         if table_alias is None or not table_alias.columns:
@@ -904,14 +902,22 @@ class Parser:
         return Filter.create(input=input_plan, predicate=predicate)
 
     def _reject_window_in_clause(self, node: exp.Expression, clause: str) -> None:
-        """Reject a window function used in WHERE / GROUP BY / HAVING.
+        """Reject a window function used directly in WHERE / GROUP BY / HAVING.
 
         Window functions are only legal in SELECT and ORDER BY (they evaluate
         after WHERE/GROUP BY/HAVING). Fail fast with a clear error rather than
         push invalid SQL to a source or mis-evaluate it on the merge path.
+        Only THIS clause's own scope is checked: the walk prunes at any nested
+        SELECT, whose windows belong to that subquery's own SELECT list (a
+        ranked derived table filtered by an outer IN is legal - TPC-DS q70).
         """
-        if node is not None and node.find(exp.Window) is not None:
-            raise UnsupportedSQLError(f"window functions are not allowed in {clause}")
+        if node is None:
+            return
+        for found in node.walk(prune=lambda n: isinstance(n, exp.Select)):
+            if isinstance(found, exp.Window):
+                raise UnsupportedSQLError(
+                    f"window functions are not allowed in {clause}"
+                )
 
     def _build_group_by_clause(
         self, select: exp.Select, input_plan: LogicalPlanNode
@@ -1529,36 +1535,71 @@ class Parser:
         raise ValueError("IS comparison supports only NULL and NOT NULL")
 
     def _convert_case_expression(self, expr: exp.Case) -> Expression:
-        """Convert a searched CASE (CASE WHEN cond THEN ... END).
+        """Convert a CASE expression to a searched CaseExpr.
 
-        A simple CASE (CASE operand WHEN value ...) stores the operand under
-        ``this``; it is not supported and is rejected rather than silently
-        treating the bare value as the WHEN condition (which would match the
-        wrong branch).
+        A simple CASE (CASE operand WHEN value ...) stores its operand under
+        ``this`` and compares it to each WHEN value; it lowers to the exactly
+        equivalent searched CASE with an ``operand = value`` condition per
+        branch (plain equality, so a NULL operand matches no branch in both
+        forms). A searched CASE converts its WHEN conditions as written.
         """
-        if expr.args.get("this") is not None:
-            raise UnsupportedSQLError(
-                "simple CASE (CASE operand WHEN ...) is not supported; "
-                "use a searched CASE (CASE WHEN operand = value ...)"
-            )
+        operand = self._convert_case_operand(expr)
         when_clauses = []
         for if_clause in expr.args.get("ifs") or []:
-            condition = self._convert_expression(if_clause.this)
-            result_expr = if_clause.args.get("true")
-            if result_expr is not None:
-                result = self._convert_expression(result_expr)
-            else:
-                # A WHEN with no THEN value yields SQL NULL, so build a
-                # null-typed Literal as this branch's result.
-                result = Literal.create(value=None, data_type=DataType.NULL)
-            when_clauses.append((condition, result))
+            when_clauses.append(self._convert_when_clause(if_clause, operand))
         else_expr = None
         default_expr = expr.args.get("default")
         if default_expr is not None:
             else_expr = self._convert_expression(default_expr)
-        # A searched CASE maps to a CaseExpr, built from the converted
-        # (condition, result) WHEN pairs and the optional ELSE result.
+        # The searched CaseExpr, built from the converted (condition, result)
+        # WHEN pairs and the optional ELSE result.
         return CaseExpr.create(when_clauses=when_clauses, else_result=else_expr)
+
+    def _convert_case_operand(self, expr: exp.Case) -> Optional[Expression]:
+        """The converted simple-CASE operand, or None for a searched CASE."""
+        operand = expr.args.get("this")
+        if operand is None:
+            return None
+        converted = self._convert_expression(operand)
+        self._reject_case_operand_functions(converted)
+        return converted
+
+    def _reject_case_operand_functions(self, operand: Expression) -> None:
+        """Reject a simple-CASE operand containing a function call.
+
+        The lowering duplicates the operand into every WHEN condition; a
+        volatile function (e.g. random()) would then re-evaluate per branch
+        and could match the wrong arm. The engine carries no volatility
+        metadata, so any function-bearing operand fails fast; columns,
+        literals, and operator expressions are deterministic by construction.
+        """
+        from ..plan.expressions import FunctionCall, expression_children
+
+        if isinstance(operand, FunctionCall):
+            raise UnsupportedSQLError(
+                "simple CASE with a function-call operand is not supported "
+                "(the operand is duplicated into every WHEN condition)"
+            )
+        for child in expression_children(operand):
+            self._reject_case_operand_functions(child)
+
+    def _convert_when_clause(self, if_clause, operand: Optional[Expression]):
+        """One (condition, result) WHEN pair of a CASE expression."""
+        condition = self._convert_expression(if_clause.this)
+        if operand is not None:
+            # The searched-CASE equivalent of a simple-CASE branch: compare the
+            # operand to this WHEN value with plain equality.
+            condition = BinaryOp.create(
+                op=BinaryOpType.EQ, left=operand, right=condition
+            )
+        result_expr = if_clause.args.get("true")
+        if result_expr is not None:
+            result = self._convert_expression(result_expr)
+        else:
+            # A WHEN with no THEN value yields SQL NULL, so build a
+            # null-typed Literal as this branch's result.
+            result = Literal.create(value=None, data_type=DataType.NULL)
+        return (condition, result)
 
     def _convert_filter_aggregate(self, filter_expr: exp.Filter) -> FunctionCall:
         """Convert ``AGG(...) FILTER (WHERE p)`` into a CASE-guarded aggregate.

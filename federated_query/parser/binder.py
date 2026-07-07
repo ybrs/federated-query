@@ -319,7 +319,7 @@ class Binder:
             )
         return table
 
-    def _bind_filter(self, filter_node: Filter) -> Filter:
+    def _bind_filter(self, filter_node: Filter) -> LogicalPlanNode:
         """Bind a Filter node."""
         bound_input = self.bind(filter_node.input)
 
@@ -331,9 +331,107 @@ class Binder:
         finally:
             self._pop_scope()
 
-        # The bound WHERE/HAVING filter: both its input subtree and its predicate
-        # are freshly bound, so construct the resolved Filter from those parts.
-        return Filter.create(input=bound_input, predicate=bound_predicate)
+        return self._finish_bound_filter(bound_input, bound_predicate)
+
+    def _finish_bound_filter(
+        self, bound_input: LogicalPlanNode, bound_predicate: Expression
+    ) -> LogicalPlanNode:
+        """Assemble a bound filter, materializing HAVING aggregate calls.
+
+        A HAVING may apply an aggregate call absent from the SELECT list
+        (``HAVING max(y) > 5``); a post-aggregate filter cannot compute an
+        aggregate per row, so each call is replaced by a reference to an
+        aggregate output - a hidden one appended to the aggregate when no
+        existing output computes it - and a projection above restores the
+        declared schema. (The parser already rewrote the calls that match a
+        SELECT-list aggregate textually; this covers the rest structurally.)
+        """
+        if not isinstance(bound_input, Aggregate):
+            # The bound WHERE filter: input and predicate are freshly bound, so
+            # construct the resolved Filter from those parts.
+            return Filter.create(input=bound_input, predicate=bound_predicate)
+        aggregates = list(bound_input.aggregates)
+        names = list(bound_input.output_names)
+        rewritten = self._hoist_aggregate_calls(bound_predicate, aggregates, names)
+        if len(names) == len(bound_input.output_names):
+            # No call was hoisted: the HAVING filter sits directly over the
+            # aggregate with its (possibly call-to-output rewritten) predicate.
+            return Filter.create(input=bound_input, predicate=rewritten)
+        widened = bound_input.model_copy(
+            update={"aggregates": aggregates, "output_names": names}
+        )
+        # The HAVING filter over the aggregate widened with the hidden outputs
+        # its predicate now references by name.
+        filtered = Filter.create(input=widened, predicate=rewritten)
+        return self._restore_aggregate_schema(bound_input, filtered)
+
+    def _hoist_aggregate_calls(
+        self,
+        expr: Expression,
+        aggregates: List[Expression],
+        names: List[str],
+    ) -> Expression:
+        """Replace each aggregate-scoped call with an aggregate-output ref.
+
+        Covers aggregate function calls and GROUPING(): both evaluate only
+        inside the aggregate, so a HAVING or ORDER BY above it must read them
+        as output columns rather than recompute them over aggregated rows.
+        """
+        if isinstance(expr, FunctionCall) and (
+            expr.is_aggregate or expr.function_name.lower() == "grouping"
+        ):
+            return self._aggregate_call_ref(expr, aggregates, names)
+        return map_children(
+            expr, lambda child: self._hoist_aggregate_calls(child, aggregates, names)
+        )
+
+    def _aggregate_call_ref(
+        self,
+        call: FunctionCall,
+        aggregates: List[Expression],
+        names: List[str],
+    ) -> ColumnRef:
+        """The output column reference for one HAVING aggregate call.
+
+        A call structurally equal to an existing aggregate output references
+        that output; otherwise the call is appended as a hidden output the
+        filter can read (the restore projection above drops it again).
+        """
+        for index, expr in enumerate(aggregates):
+            if index < len(names) and expr == call:
+                # A bare reference to the aggregate output that already computes
+                # this call, stamped with the call's result type.
+                return ColumnRef.create(
+                    table=None, column=names[index], data_type=call.get_type()
+                )
+        name = f"__agg_{len(names)}"
+        aggregates.append(call)
+        names.append(name)
+        # A bare reference to the hidden output just appended for this call,
+        # stamped with the call's result type.
+        return ColumnRef.create(table=None, column=name, data_type=call.get_type())
+
+    def _restore_aggregate_schema(
+        self, aggregate: Aggregate, plan: LogicalPlanNode
+    ) -> Projection:
+        """Re-project a hoisted HAVING filter or ORDER BY back to the
+        aggregate's declared columns, dropping the hidden hoisted outputs."""
+        restore: List[Expression] = []
+        for index, name in enumerate(aggregate.output_names):
+            # A bare reference to one ORIGINAL aggregate output; the projection
+            # drops the hidden HAVING columns the hoist appended.
+            restore.append(
+                ColumnRef.create(
+                    table=None,
+                    column=name,
+                    data_type=aggregate.aggregates[index].get_type(),
+                )
+            )
+        # Restore the aggregate's declared schema above the hoisted subtree so
+        # the hidden outputs never widen the query's (or a CTE's) result.
+        return Projection.create(
+            input=plan, expressions=restore, aliases=list(aggregate.output_names)
+        )
 
     def _bind_filter_predicate(
         self, predicate: Expression, bound_input: LogicalPlanNode
@@ -385,7 +483,7 @@ class Binder:
             bound_expressions.append(self._bind_expression(expr))
         return bound_expressions
 
-    def _bind_sort(self, sort: Sort) -> Sort:
+    def _bind_sort(self, sort: Sort) -> LogicalPlanNode:
         """Bind a Sort node."""
         bound_input = self.bind(sort.input)
         self._push_scope_for(bound_input)
@@ -394,7 +492,9 @@ class Binder:
         finally:
             self._pop_scope()
 
-    def _bind_sort_with_input(self, sort: Sort, bound_input: LogicalPlanNode) -> Sort:
+    def _bind_sort_with_input(
+        self, sort: Sort, bound_input: LogicalPlanNode
+    ) -> LogicalPlanNode:
         """Bind sort keys against the already-bound input plan."""
         if isinstance(bound_input, Projection):
             bound_keys = self._bind_sort_keys_for_projection(
@@ -405,22 +505,50 @@ class Binder:
             )
 
         if isinstance(bound_input, Aggregate):
-            bound_keys = self._bind_sort_keys_for_aggregate(sort.sort_keys, bound_input)
-            return sort.model_copy(
-                update={"input": bound_input, "sort_keys": bound_keys}
-            )
+            return self._bind_sort_over_aggregate(sort, bound_input, None)
 
         if isinstance(bound_input, Filter) and isinstance(bound_input.input, Aggregate):
-            bound_keys = self._bind_sort_keys_for_aggregate(
-                sort.sort_keys,
-                bound_input.input,
-            )
-            return sort.model_copy(
-                update={"input": bound_input, "sort_keys": bound_keys}
-            )
+            return self._bind_sort_over_aggregate(sort, bound_input.input, bound_input)
 
         bound_keys = self._bind_sort_keys(sort.sort_keys)
         return sort.model_copy(update={"input": bound_input, "sort_keys": bound_keys})
+
+    def _bind_sort_over_aggregate(
+        self,
+        sort: Sort,
+        aggregate: Aggregate,
+        filter_node: Optional[Filter],
+    ) -> LogicalPlanNode:
+        """Bind ORDER BY over an aggregate (optionally under its HAVING filter),
+        materializing aggregate-scoped key calls as hidden outputs.
+
+        A key expression containing an aggregate or GROUPING() call cannot be
+        recomputed above the aggregate (the raw inputs are gone); each call
+        becomes a reference to a (hidden) aggregate output the sort reads by
+        name, and a projection above restores the declared schema - the same
+        hoist HAVING uses. Widening only APPENDS outputs, so a HAVING filter in
+        between keeps resolving its own references unchanged.
+        """
+        aggregates = list(aggregate.aggregates)
+        names = list(aggregate.output_names)
+        bound_keys = self._bind_sort_keys_for_aggregate(
+            sort.sort_keys, aggregate, aggregates, names
+        )
+        if len(names) == len(aggregate.output_names):
+            input_plan = aggregate if filter_node is None else filter_node
+            return sort.model_copy(
+                update={"input": input_plan, "sort_keys": bound_keys}
+            )
+        widened = aggregate.model_copy(
+            update={"aggregates": aggregates, "output_names": names}
+        )
+        input_plan = widened
+        if filter_node is not None:
+            input_plan = filter_node.model_copy(update={"input": widened})
+        sorted_plan = sort.model_copy(
+            update={"input": input_plan, "sort_keys": bound_keys}
+        )
+        return self._restore_aggregate_schema(aggregate, sorted_plan)
 
     def _bind_sort_keys(self, sort_keys: List[Expression]) -> List[Expression]:
         """Bind ORDER BY expressions against the relation scope."""
@@ -439,7 +567,11 @@ class Binder:
         by the constant n, so every row ties and the ORDER BY silently vanishes.
         (Observed on TPC-DS q62, whose ORDER BY is positional, run cross-source.)
         """
-        if isinstance(key, Literal) and type(key.value) is int and 1 <= key.value <= count:
+        if (
+            isinstance(key, Literal)
+            and type(key.value) is int
+            and 1 <= key.value <= count
+        ):
             return key.value - 1
         return None
 
@@ -447,9 +579,13 @@ class Binder:
         self,
         sort_keys: List[Expression],
         aggregate: Aggregate,
+        widened_aggregates: List[Expression],
+        widened_names: List[str],
     ) -> List[Expression]:
         """Bind ORDER BY keys when input is an Aggregate (supports output aliases
-        and positional ordinals)."""
+        and positional ordinals). Aggregate-scoped calls inside a key that match
+        no existing output are appended to the widening lists as hidden outputs
+        the key references by name (see _bind_sort_over_aggregate)."""
         alias_map = self._aggregate_alias_map(aggregate)
         outputs = aggregate.output_names or []
 
@@ -459,10 +595,13 @@ class Binder:
             if index is not None:
                 # ORDER BY <ordinal> over an aggregate: the n-th output, referenced
                 # bare by its output name (the same shape as ORDER BY <alias>).
-                bound_keys.append(ColumnRef.create(
-                    table=None, column=outputs[index],
-                    data_type=aggregate.aggregates[index].get_type(),
-                ))
+                bound_keys.append(
+                    ColumnRef.create(
+                        table=None,
+                        column=outputs[index],
+                        data_type=aggregate.aggregates[index].get_type(),
+                    )
+                )
                 continue
             if isinstance(key, ColumnRef) and key.table is None:
                 if key.column in alias_map:
@@ -475,7 +614,12 @@ class Binder:
                     continue
             bound = self._bind_expression(key)
             match = self._match_aggregate_output(bound, aggregate)
-            bound_keys.append(bound if match is None else match)
+            if match is not None:
+                bound_keys.append(match)
+                continue
+            bound_keys.append(
+                self._hoist_aggregate_calls(bound, widened_aggregates, widened_names)
+            )
         return bound_keys
 
     def _match_aggregate_output(
@@ -506,7 +650,9 @@ class Binder:
         alias_map = self._build_alias_expression_map(projection)
         bound_keys: List[Expression] = []
         for key in sort_keys:
-            bound_keys.append(self._bind_projection_sort_key(key, alias_map, projection))
+            bound_keys.append(
+                self._bind_projection_sort_key(key, alias_map, projection)
+            )
         return bound_keys
 
     def _bind_projection_sort_key(
@@ -524,7 +670,8 @@ class Binder:
             # ORDER BY <ordinal>: the n-th SELECT output, resolved to that output's
             # column (the same treatment as ORDER BY <its alias>).
             output_key = ColumnRef.create(
-                table=None, column=projection.aliases[index],
+                table=None,
+                column=projection.aliases[index],
                 data_type=projection.expressions[index].get_type(),
             )
             return self._sort_key_from_alias(output_key, projection.expressions[index])
@@ -553,7 +700,8 @@ class Binder:
         for index, expr in enumerate(projection.expressions):
             if expr == bound_key:
                 return ColumnRef.create(
-                    table=None, column=projection.aliases[index],
+                    table=None,
+                    column=projection.aliases[index],
                     data_type=expr.get_type(),
                 )
         return None
@@ -650,9 +798,7 @@ class Binder:
     ) -> Aggregate:
         """Bind aggregate expressions against the bound input plan."""
         alias_map = self._aggregate_alias_map(aggregate)
-        bound_group_by = self._bind_group_by_expressions(
-            aggregate.group_by, alias_map
-        )
+        bound_group_by = self._bind_group_by_expressions(aggregate.group_by, alias_map)
         bound_aggregates = self._bind_aggregate_expressions(aggregate.aggregates)
         return aggregate.model_copy(
             update={
@@ -1067,9 +1213,7 @@ class Binder:
         if isinstance(expr, ExistsExpression):
             # An EXISTS predicate: bind its subquery plan while model_copy keeps
             # the NOT-EXISTS negation flag unchanged.
-            return expr.model_copy(
-                update={"subquery": plan_binder.bind(expr.subquery)}
-            )
+            return expr.model_copy(update={"subquery": plan_binder.bind(expr.subquery)})
         if isinstance(expr, InSubquery):
             # An IN (subquery) predicate: bind both the outer value and the
             # subquery plan, while model_copy preserves the NOT-IN negation flag.
@@ -1239,9 +1383,7 @@ class Binder:
         data_type = self._resolve_cast_type(expr.target_type)
         # The bound CAST: its inner expression is bound and the SQL target type is
         # resolved to an engine type; model_copy keeps the original target text.
-        return expr.model_copy(
-            update={"expr": bound_inner, "data_type": data_type}
-        )
+        return expr.model_copy(update={"expr": bound_inner, "data_type": data_type})
 
     def _resolve_cast_type(self, target_type: str) -> DataType:
         """Map a SQL type text such as ``DECIMAL(10, 2)`` to a DataType."""
@@ -1349,16 +1491,16 @@ class SubqueryPlanBinder:
             bound_rows.append(bound_row)
         return values.model_copy(update={"rows": bound_rows})
 
-    def _bind_filter(self, filter_node: Filter) -> Filter:
+    def _bind_filter(self, filter_node: Filter) -> LogicalPlanNode:
         """Bind a filter, treating Filter-over-Aggregate as HAVING."""
         bound_input = self.bind(filter_node.input)
         if isinstance(bound_input, Aggregate):
             predicate = self._bind_having(filter_node.predicate, bound_input)
         else:
             predicate = self._bind_expr_for(filter_node.predicate, bound_input)
-        # The bound subquery filter (WHERE or HAVING): both its input and its
-        # predicate are freshly bound, so build the resolved Filter from them.
-        return Filter.create(input=bound_input, predicate=predicate)
+        # Assemble through the host's shared path so HAVING aggregate calls are
+        # materialized as (hidden) aggregate outputs inside subqueries too.
+        return self.host._finish_bound_filter(bound_input, predicate)
 
     def _bind_projection(self, projection: Projection) -> Projection:
         """Bind projection expressions against the subquery's relations."""

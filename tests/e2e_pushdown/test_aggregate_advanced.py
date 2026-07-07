@@ -202,3 +202,25 @@ def test_nested_aggregate_via_subquery(single_source_env):
     assert isinstance(subquery, exp.Select)
     subquery_group = subquery.args.get("group")
     assert subquery_group is not None
+
+
+def test_having_aggregate_not_in_select_cross_source(multi_source_env):
+    """A HAVING aggregate call absent from the SELECT list runs cross-source.
+
+    MAX(o.price) appears only in HAVING, so the binder must materialize it as
+    a hidden aggregate output the merge filter can read (a filter fragment
+    cannot compute an aggregate per row) and drop it from the final schema.
+    Region maxima: NA 125, EU 200, APAC 90 - only NA and EU survive.
+    """
+    runtime = build_runtime(multi_source_env)
+    sql = (
+        "SELECT o.region, COUNT(*) AS n "
+        "FROM duckdb_orders.main.orders o "
+        "JOIN duckdb_customers.main.customers c ON o.customer_id = c.customer_id "
+        "GROUP BY o.region "
+        "HAVING MAX(o.price) > 100"
+    )
+    table = runtime.execute(sql)
+    assert table.column_names == ["region", "n"]
+    rows = dict(zip(table.column("region").to_pylist(), table.column("n").to_pylist()))
+    assert rows == {"NA": 4, "EU": 4}

@@ -91,6 +91,20 @@ def _expression_contains_window(expr) -> bool:
         if _expression_contains_window(child):
             return True
     return False
+
+
+def _expression_contains_grouping(expr) -> bool:
+    """Whether an expression tree contains a GROUPING() call at any depth."""
+    from .expressions import FunctionCall, expression_children
+
+    if isinstance(expr, FunctionCall) and expr.function_name.lower() == "grouping":
+        return True
+    for child in expression_children(expr):
+        if _expression_contains_grouping(child):
+            return True
+    return False
+
+
 # Name under which a grouped-limit registers its single input, plus the synthetic
 # columns its rendered SQL adds: a row-order index (stable tiebreak) and the
 # per-key row number.
@@ -900,7 +914,10 @@ class PhysicalWindow(PhysicalPlanNode):
         """
         self._check_output_arity()
         return clauses.select_expressions_fragment(
-            self.expressions, self.output_names, MergeResolver(aliases), dialect="duckdb"
+            self.expressions,
+            self.output_names,
+            MergeResolver(aliases),
+            dialect="duckdb",
         )
 
     def schema(self) -> pa.Schema:
@@ -1490,9 +1507,13 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         columns resolve to their physical merge-relation names via MergeResolver,
         the same lowering PhysicalWindow uses.
         """
+        return self._render_aggregate_sql(self.aggregates, self.output_names, aliases)
+
+    def _render_aggregate_sql(self, exprs, names, aliases) -> str:
+        """Render one grouped SELECT over the merge input for the given outputs."""
         resolver = MergeResolver(aliases)
         select_list = clauses.select_expressions_fragment(
-            self.aggregates, self.output_names, resolver, dialect="duckdb"
+            exprs, names, resolver, dialect="duckdb"
         )
         sql = f"SELECT {select_list} FROM {_MERGE_AGGREGATE_RELATION}"
         group = clauses.group_by_fragment(
@@ -1501,6 +1522,137 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         if group is not None:
             sql = f"{sql} GROUP BY {group}"
         return sql
+
+    def window_split_needed(self) -> bool:
+        """Whether the fused window-aggregate SQL must split into two stages.
+
+        DataFusion cannot plan GROUPING() referenced inside a window expression
+        (TPC-DS q70/q86: ``rank() OVER (PARTITION BY grouping(a)+grouping(b)``),
+        but evaluates it fine as a plain aggregate output - so the aggregate
+        materializes every window operand and the window runs over columns.
+        """
+        for expr in self.aggregates:
+            if _expression_contains_grouping(expr):
+                return True
+        return False
+
+    def split_window_aggregate_sqls(self, aliases) -> Tuple[str, str]:
+        """The two-stage SQL for a window over a GROUPING() aggregate.
+
+        Stage 1 is the GROUP BY, its outputs the non-window outputs plus every
+        window operand (grouping()/aggregate calls and key columns) materialized
+        under a hidden name. Stage 2 is the window SELECT over stage 1's result,
+        every operand replaced by its stage-1 output column, presenting exactly
+        the declared output names (hidden columns dropped).
+        """
+        stage1_exprs: List[Expression] = []
+        stage1_names: List[str] = []
+        for expr, name in zip(self.aggregates, self.output_names):
+            if not _expression_contains_window(expr):
+                stage1_exprs.append(expr)
+                stage1_names.append(name)
+        stage2_items: List[Expression] = []
+        for expr, name in zip(self.aggregates, self.output_names):
+            stage2_items.append(
+                self._stage2_item(expr, name, stage1_exprs, stage1_names)
+            )
+        return (
+            self._render_aggregate_sql(stage1_exprs, stage1_names, aliases),
+            self._stage2_sql(stage2_items, stage1_names),
+        )
+
+    def _stage2_item(self, expr, name, stage1_exprs, stage1_names) -> Expression:
+        """One stage-2 SELECT item: a pass-through of an already-aggregated
+        output by name, or the window expression over materialized operands."""
+        from .expressions import ColumnRef
+
+        if not _expression_contains_window(expr):
+            # The stage-1 output passes through stage 2 unchanged, by name.
+            return ColumnRef.create(table=None, column=name)
+        return self._materialize_window_operands(expr, stage1_exprs, stage1_names)
+
+    def _materialize_window_operands(self, expr, exprs, names) -> Expression:
+        """Rewrite a window-bearing expression to read stage-1 output columns.
+
+        Every grouping()/aggregate call and plain column reference becomes a
+        reference to the stage-1 output computing it (appended as a hidden
+        output when none does yet); the window structure itself is preserved.
+        """
+        from .expressions import WindowExpr, map_children
+
+        if isinstance(expr, WindowExpr):
+            return self._rebuild_window(expr, exprs, names)
+        if self._is_stage1_operand(expr):
+            return self._stage1_output_ref(expr, exprs, names)
+        return map_children(
+            expr,
+            lambda child: self._materialize_window_operands(child, exprs, names),
+        )
+
+    def _rebuild_window(self, window, exprs, names):
+        """Rebuild a WindowExpr with materialized operands: the function's
+        arguments, PARTITION BY items, and ORDER BY keys all read stage-1
+        columns; direction lists and the frame are preserved by model_copy."""
+        from .expressions import map_children
+
+        def rewrite(e):
+            """Materialize one window operand against the stage-1 outputs."""
+            return self._materialize_window_operands(e, exprs, names)
+
+        partition = []
+        for item in window.partition_by:
+            partition.append(rewrite(item))
+        order = []
+        for key in window.order_keys:
+            order.append(rewrite(key))
+        return window.model_copy(
+            update={
+                "function": map_children(window.function, rewrite),
+                "partition_by": partition,
+                "order_keys": order,
+            }
+        )
+
+    def _is_stage1_operand(self, expr) -> bool:
+        """A leaf stage 1 must compute: a column, an aggregate call, or
+        GROUPING() (an aggregate-scoped function the window stage cannot run)."""
+        from .expressions import ColumnRef, FunctionCall
+
+        if isinstance(expr, ColumnRef):
+            return True
+        return isinstance(expr, FunctionCall) and (
+            expr.is_aggregate or expr.function_name.lower() == "grouping"
+        )
+
+    def _stage1_output_ref(self, expr, exprs, names):
+        """The stage-1 output column computing ``expr``, appending a hidden
+        output (``__w<n>``) when no existing output matches structurally."""
+        from .expressions import ColumnRef
+
+        for index, existing in enumerate(exprs):
+            if existing == expr:
+                # A bare reference to the stage-1 output that already computes
+                # this operand, typed as the operand itself.
+                return ColumnRef.create(
+                    table=None, column=names[index], data_type=expr.get_type()
+                )
+        name = f"__w{len(names)}"
+        exprs.append(expr)
+        names.append(name)
+        # A bare reference to the hidden stage-1 output just appended for this
+        # operand, typed as the operand itself.
+        return ColumnRef.create(table=None, column=name, data_type=expr.get_type())
+
+    def _stage2_sql(self, items, stage1_names) -> str:
+        """Render the stage-2 window SELECT over the stage-1 relation."""
+        stage2_aliases: Dict[Tuple[Optional[str], str], str] = {}
+        for name in stage1_names:
+            stage2_aliases[(None, name)] = name
+        resolver = MergeResolver(stage2_aliases)
+        select_list = clauses.select_expressions_fragment(
+            items, self.output_names, resolver, dialect="duckdb"
+        )
+        return f"SELECT {select_list} FROM {_MERGE_AGGREGATE_RELATION}"
 
     def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
         """This aggregate's OUTPUT columns, keyed by qualifier -> output name, so
@@ -1706,6 +1858,7 @@ class PhysicalRemoteQuery(PhysicalPlanNode):
             output_estimated_rows=output_estimated_rows,
             column_ndv=column_ndv,
         )
+
     _schema: Optional[pa.Schema] = None
 
     def children(self) -> List[PhysicalPlanNode]:

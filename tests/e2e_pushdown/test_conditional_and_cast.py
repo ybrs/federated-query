@@ -253,3 +253,34 @@ def test_cast_in_order_by(single_source_env):
     assert cast_expr.name.lower() == "quantity"
 
     assert first_order.args.get("desc") is True
+
+
+def test_simple_case_cross_source(multi_source_env):
+    """A simple CASE runs cross-source via the searched-equality lowering.
+
+    CASE o.region WHEN 'NA' THEN ... compares the operand per branch; NULL
+    semantics match the searched form exactly (a NULL operand takes ELSE).
+    """
+    runtime = build_runtime(multi_source_env)
+    sql = (
+        "SELECT o.order_id, "
+        "CASE o.region WHEN 'NA' THEN 'domestic' WHEN 'EU' THEN 'europe' "
+        "ELSE 'other' END AS market "
+        "FROM duckdb_orders.main.orders o "
+        "JOIN duckdb_customers.main.customers c ON o.customer_id = c.customer_id "
+        "ORDER BY o.order_id"
+    )
+    table = runtime.execute(sql)
+    markets = table.column("market").to_pylist()
+    assert markets == [
+        "domestic",
+        "europe",
+        "other",
+        "domestic",
+        "europe",
+        "domestic",
+        "other",
+        "europe",
+        "domestic",
+        "europe",
+    ]

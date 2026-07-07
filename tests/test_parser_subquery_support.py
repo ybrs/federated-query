@@ -179,10 +179,24 @@ def test_with_over_set_operation_rejected():
         parse("WITH x AS (SELECT 1 AS a) SELECT a FROM x UNION SELECT 2")
 
 
-def test_simple_case_rejected():
-    """A simple CASE (CASE operand WHEN ...) must not match the wrong branch."""
-    with pytest.raises(UnsupportedSQLError, match="simple CASE"):
-        parse("SELECT CASE x WHEN 1 THEN 'a' ELSE 'b' END FROM t")
+def test_simple_case_lowers_to_searched_equality():
+    """A simple CASE lowers to a searched CASE comparing the operand per WHEN."""
+    from federated_query.plan.expressions import BinaryOp, BinaryOpType, CaseExpr
+
+    plan = parse("SELECT CASE x WHEN 1 THEN 'a' ELSE 'b' END AS c FROM t")
+    case = plan.expressions[0]
+    assert isinstance(case, CaseExpr)
+    condition, _ = case.when_clauses[0]
+    assert isinstance(condition, BinaryOp) and condition.op == BinaryOpType.EQ
+    assert condition.left.column == "x"
+    assert condition.right.value == 1
+
+
+def test_simple_case_function_operand_rejected():
+    """A function-call operand is duplicated per WHEN branch; fail fast (a
+    volatile call would re-evaluate per branch and could match the wrong arm)."""
+    with pytest.raises(UnsupportedSQLError, match="function-call operand"):
+        parse("SELECT CASE random() WHEN 1 THEN 'a' ELSE 'b' END FROM t")
 
 
 def test_try_cast_rejected():
@@ -209,9 +223,7 @@ def test_string_agg_separator_preserved():
 def test_within_group_multiple_keys_rejected():
     """WITHIN GROUP with multiple ORDER BY keys must not silently drop the rest."""
     with pytest.raises(UnsupportedSQLError, match="WITHIN GROUP"):
-        parse(
-            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a, b) FROM t"
-        )
+        parse("SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a, b) FROM t")
 
 
 def test_values_ragged_rows_rejected():

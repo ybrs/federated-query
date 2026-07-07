@@ -36,14 +36,7 @@ def _deferred(id_, sql, reason):
 # signal; full support (binding/planning/execution) is finished when the item is
 # removed from this list.
 _PARSER_DEFERRED = [
-    _deferred(
-        "simple_case",
-        "SELECT CASE x WHEN 1 THEN 'a' ELSE 'b' END FROM s.t",
-        "simple CASE (CASE operand WHEN ...)",
-    ),
-    _deferred(
-        "try_cast", "SELECT TRY_CAST(x AS INT) FROM s.t", "TRY_CAST / SAFE_CAST"
-    ),
+    _deferred("try_cast", "SELECT TRY_CAST(x AS INT) FROM s.t", "TRY_CAST / SAFE_CAST"),
     _deferred(
         "between_symmetric",
         "SELECT a FROM s.t WHERE x BETWEEN SYMMETRIC 1 AND 9",
