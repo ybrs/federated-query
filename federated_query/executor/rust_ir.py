@@ -1195,7 +1195,44 @@ def _traced_injection_bases(node, key_pair):
         return _traced_injection_bases(node.input, key_pair)
     if isinstance(node, PhysicalHashJoin):
         return _join_injection_bases(node, key_pair)
+    if isinstance(node, PhysicalUnion):
+        return _union_injection_bases(node, key_pair)
     return None
+
+
+def _union_injection_bases(union, key_pair):
+    """Descend into every union branch that traces (q05's probe is a UNION
+    ALL of sales and returns scans per channel). Branches that do not trace
+    stay unfiltered - correct either way, because the reduction join above
+    still drops keyless union rows exactly; None only when NO branch traces
+    (nothing would be reduced). Filtering a branch by a key superset
+    commutes with UNION's dedup too: the key is part of every row, so the
+    removed rows are whole dedup groups the join above drops anyway."""
+    if key_pair not in union.column_aliases():
+        return None
+    position = union.schema().names.index(key_pair[1])
+    bases = []
+    for branch in union.inputs:
+        pair = _branch_key_pair(branch, position)
+        if pair is None:
+            continue
+        traced = _traced_injection_bases(branch, pair)
+        if traced:
+            bases.extend(traced)
+    return bases or None
+
+
+def _branch_key_pair(branch, position):
+    """The (qualifier, column) pair naming a branch's output column at a
+    union position, or None when hidden or ambiguous."""
+    physical = branch.schema().names[position]
+    matches = []
+    for pair, name in branch.column_aliases().items():
+        if name == physical:
+            matches.append(pair)
+    if len(matches) != 1:
+        return None
+    return matches[0]
 
 
 def _traced_base_entry(base, key_pair):
@@ -1323,7 +1360,8 @@ def _orient_join(join):
         # KNOWN estimate - the reduction exists to cut the big read, and an
         # unknown side cannot be known big (q58: fact-x-item est 28.8M vs
         # date_dim-x-subquery est None flipped to the useless direction).
-        if _probe_urgency(join.left) > _probe_urgency(join.right):
+        left_urgency = _side_urgency(join.left, join.left_keys[0])
+        if left_urgency > _side_urgency(join.right, join.right_keys[0]):
             return join.right, join.left, join.right_keys[0], join.left_keys[0]
         return join.left, join.right, join.left_keys[0], join.right_keys[0]
     if right_rank > left_rank:
@@ -1359,6 +1397,26 @@ def _probe_urgency(node) -> int:
     if rows < 0 and isinstance(node, PhysicalRemoteQuery):
         return 1 << 62
     return rows
+
+
+def _side_urgency(node, key_expr) -> int:
+    """A join side's probe urgency, derived from the node itself or - when
+    the node is an unjudgeable composite - from the base relations its key
+    traces to: a union of statless fact islands must out-rank a filtered
+    dimension scan (q05's channel unions), and a composite over a known-big
+    fact scan carries that fact's size (q58)."""
+    urgency = _probe_urgency(node)
+    if urgency >= 0:
+        return urgency
+    bases = _probe_injection_bases(node, key_expr)
+    if not bases:
+        return urgency
+    best = urgency
+    for base, _ in bases:
+        candidate = _probe_urgency(base)
+        if candidate > best:
+            best = candidate
+    return best
 
 
 def _cardinality_probe(join):
