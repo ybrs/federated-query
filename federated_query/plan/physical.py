@@ -1,5 +1,6 @@
 """Physical plan nodes."""
 
+import functools
 import json
 from abc import ABC, abstractmethod
 from typing import (
@@ -18,7 +19,7 @@ from enum import Enum
 import pyarrow as pa
 from sqlglot import exp
 
-from pydantic import Field
+from pydantic import Field, PrivateAttr
 
 from ..model import StateModel
 from .expressions import Expression
@@ -113,6 +114,28 @@ _GROUPED_LIMIT_INDEX_COL = "__gl_idx"
 _GROUPED_LIMIT_RN_COL = "__gl_rn"
 
 
+def _derived_once(method):
+    """Cache a node's derived value (schema / column aliases) per instance.
+
+    Both derivations recurse the whole subtree, and every PARENT re-derives
+    its children's results, which is exponential in tree depth: TPC-DS q59
+    spent 4.6s of a 4.6s run re-deriving schemas during IR build against
+    ~0.3s of engine execution. The first call computes; every later call
+    returns the cached value. See PhysicalPlanNode for the invariant that
+    makes this safe.
+    """
+    name = method.__name__
+
+    @functools.wraps(method)
+    def wrapper(self):
+        cache = self._derived_cache
+        if name not in cache:
+            cache[name] = method(self)
+        return cache[name]
+
+    return wrapper
+
+
 class PhysicalPlanNode(StateModel, ABC):
     """Base class for physical plan nodes.
 
@@ -120,7 +143,45 @@ class PhysicalPlanNode(StateModel, ABC):
     column-alias, and SQL-rendering information that ``rust_ir`` serializes into
     the Rust engine's IR. They are never executed in Python; the Rust engine is
     the one execution path.
+
+    ``schema()`` and ``column_aliases()`` are computed ONCE per node: every
+    subclass's implementation is wrapped by ``_derived_once`` (see
+    ``__init_subclass__``). The cache relies on one invariant: the fields
+    those methods derive from (inputs, expressions, output names) are never
+    mutated after construction - plan rewrites replace nodes via
+    ``model_copy`` (which starts the copy with an EMPTY cache), never by
+    assigning structural fields in place. The in-place mutations that do
+    exist (a scan's ``distinct``, a remote set-op's ``limit``/``offset``,
+    ``estimated_rows`` threading) do not affect schema or aliases.
     """
+
+    # Per-instance cache for the wrapped derivations; private so pydantic
+    # keeps it out of fields, equality, and construction.
+    _derived_cache: Dict[str, Any] = PrivateAttr(default_factory=dict)
+
+    def __init_subclass__(cls, **kwargs) -> None:
+        """Wrap the subclass's own schema()/column_aliases() in the cache.
+
+        Wrapping happens HERE, once per subclass, so no node class can forget
+        the cache and silently reintroduce the exponential recomputation.
+        Only methods defined by the subclass itself are wrapped (inherited
+        ones are already wrapped on the class that defined them).
+        """
+        super().__init_subclass__(**kwargs)
+        for name in ("schema", "column_aliases"):
+            method = cls.__dict__.get(name)
+            if method is not None and not getattr(
+                method, "__isabstractmethod__", False
+            ):
+                setattr(cls, name, _derived_once(method))
+
+    def model_copy(
+        self, *, update: Optional[Dict[str, Any]] = None, deep: bool = False
+    ) -> "PhysicalPlanNode":
+        """Copy with an EMPTY derived cache: the copy's fields may differ."""
+        copied = super().model_copy(update=update, deep=deep)
+        copied._derived_cache = {}
+        return copied
 
     @abstractmethod
     def children(self) -> List["PhysicalPlanNode"]:
