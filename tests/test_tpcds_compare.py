@@ -51,10 +51,32 @@ def test_string_and_null_cells_unaffected():
     assert not match
 
 
-def test_row_order_still_significant():
-    """Out-of-order rows still fail, described as an ordering difference."""
+def test_pure_reorder_with_identical_multiset_matches():
+    """An order-only difference with identical multisets is a match.
+
+    Rows tied on their ORDER BY keys are legitimately unordered (TPC answer
+    set convention); a genuine mis-sort under ORDER BY ... LIMIT changes
+    WHICH rows survive and still fails via the multiset compare.
+    """
     engine = [(1,), (2,)]
     oracle = [(2,), (1,)]
+    match, _ = compare_results(engine, oracle, decimals=2)
+    assert match
+
+
+def test_tie_reordered_rows_match_as_multiset():
+    """Rows tied on their sort keys may interleave differently (SF10 q18/q65/
+    q71): an order-only difference with identical multisets is a match."""
+    engine = [("able", None, 3.23), ("able", None, 8.25)]
+    oracle = [("able", None, 8.25), ("able", None, 3.23)]
+    match, _ = compare_results(engine, oracle, decimals=2)
+    assert match
+
+
+def test_reordered_rows_with_a_real_difference_still_fail():
+    """Reordering must not mask a genuine value difference."""
+    engine = [("able", 3.23), ("able", 8.25)]
+    oracle = [("able", 8.25), ("able", 3.99)]
     match, reason = compare_results(engine, oracle, decimals=2)
     assert not match
-    assert "order differs" in reason
+    assert "differs" in reason

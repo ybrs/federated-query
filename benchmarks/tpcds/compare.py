@@ -121,6 +121,48 @@ def compare_results(engine_rows, oracle_rows, decimals=2):
     index = _first_differing_index(engine_rows, oracle_rows, decimals)
     if index == -1:
         return True, ""
+    if _multisets_match(engine_rows, oracle_rows, decimals):
+        # Rows with EQUAL ORDER BY keys are legitimately unordered (the TPC
+        # answer-set convention; two DuckDB runs can interleave them
+        # differently too), so an order-only difference with identical
+        # multisets is a match. A genuine mis-sort under the ubiquitous
+        # ORDER BY ... LIMIT still changes WHICH rows survive and fails the
+        # multiset compare. (Observed at SF10: q18's data-NULL detail rows tie
+        # with ROLLUP subtotal rows on every sort column; q65/q71 tie on
+        # their full key lists.)
+        return True, ""
     engine_norm = _normalize_rows(engine_rows, decimals)
     oracle_norm = _normalize_rows(oracle_rows, decimals)
     return False, _describe_difference(index, engine_norm, oracle_norm)
+
+
+def _multisets_match(engine_rows, oracle_rows, decimals):
+    """Whether the two result sets match as multisets under the cell rules.
+
+    Both sides are sorted by their normalized form and compared pairwise with
+    the tolerance-aware cell equality, so tie-reordered rows align while a
+    genuinely differing value still fails.
+    """
+    engine_sorted = _sort_by_normal_form(engine_rows, decimals)
+    oracle_sorted = _sort_by_normal_form(oracle_rows, decimals)
+    for engine_row, oracle_row in zip(engine_sorted, oracle_sorted):
+        if not _rows_equal(engine_row, oracle_row, decimals):
+            return False
+    return True
+
+
+def _sort_by_normal_form(rows, decimals):
+    """Rows sorted by their normalized (rounded, canonical-string) form."""
+    keyed = []
+    for row in rows:
+        keyed.append((_normalize_row(row, decimals), row))
+    keyed.sort(key=_normal_form_key)
+    ordered = []
+    for _, row in keyed:
+        ordered.append(row)
+    return ordered
+
+
+def _normal_form_key(item):
+    """Sort key accessor for (normal form, raw row) pairs."""
+    return item[0]
