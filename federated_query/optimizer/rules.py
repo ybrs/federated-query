@@ -126,7 +126,22 @@ class PredicatePushdownRule(OptimizationRule):
         if isinstance(plan, Join):
             return transform_children(self._push_join_condition(plan), self._push_down)
         if isinstance(
-            plan, (Projection, Aggregate, Limit, Sort, SubqueryScan, CTE, Union)
+            plan,
+            (
+                Projection,
+                Aggregate,
+                Limit,
+                Sort,
+                SubqueryScan,
+                CTE,
+                Union,
+                # The scalar-subquery cardinality guard passes rows through
+                # untouched; stopping the descent here stranded the
+                # subquery's own filter above its scan and the whole fact
+                # shipped (q44: 28.8M rows twice for a 99.99 percent
+                # selective filter).
+                SingleRowGuard,
+            ),
         ):
             return transform_children(plan, self._push_down)
         return plan
