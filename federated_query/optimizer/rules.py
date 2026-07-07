@@ -140,11 +140,31 @@ class PredicatePushdownRule(OptimizationRule):
         return self._rehome_filter_over_opaque(filter_node, input_plan)
 
     def _factor_filter_predicate(self, filter_node: Filter) -> Filter:
-        """Lift conjuncts common to every OR branch out of a filter predicate."""
-        factored = self._factor_common_conjuncts(filter_node.predicate)
-        if factored is filter_node.predicate:
+        """Lift conjuncts common to every OR branch out of a filter predicate.
+
+        A WHERE is an AND of conjuncts and a disjunction is ONE of them, so
+        factor each conjunct's OR rather than the whole predicate (whose top-level
+        operator is AND - split_disjuncts sees one branch and does nothing). This
+        exposes an equi-join repeated inside every OR branch (q13/q45/q48:
+        (ss_hdemo_sk=hd_demo_sk AND ...) OR (ss_hdemo_sk=hd_demo_sk AND ...)) as a
+        top-level conjunct, so it becomes a hash key instead of a cross product.
+        """
+        conjuncts = split_conjuncts(filter_node.predicate)
+        factored = self._factor_each_conjunct(conjuncts)
+        if factored is None:
             return filter_node
-        return filter_node.model_copy(update={"predicate": factored})
+        return filter_node.model_copy(update={"predicate": combine_and(factored)})
+
+    def _factor_each_conjunct(self, conjuncts):
+        """Factor common conjuncts out of each conjunct's OR; None if unchanged."""
+        result = []
+        changed = False
+        for conjunct in conjuncts:
+            rewritten = self._factor_common_conjuncts(conjunct)
+            if rewritten is not conjunct:
+                changed = True
+            result.append(rewritten)
+        return result if changed else None
 
     def _factor_common_conjuncts(self, predicate: Expression) -> Expression:
         """Rewrite ``(A and c) or (B and c)`` as ``c and (A or B)``.

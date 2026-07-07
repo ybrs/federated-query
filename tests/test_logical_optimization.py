@@ -1046,3 +1046,39 @@ class TestComplexOptimizations:
 
         assert isinstance(result, Scan)
         assert result.filters is not None
+
+
+def test_factor_common_equi_join_out_of_conjunct_disjunction():
+    """An equi-join repeated in every branch of an OR that is itself a conjunct
+    of the WHERE is lifted to a top-level conjunct, so it becomes a hash join key
+    instead of a cross product (the q13/q45/q48 disjunction pattern)."""
+    from federated_query.plan.expressions import split_conjuncts
+
+    a_id = ColumnRef(table="a", column="id", data_type=DataType.INTEGER)
+    b_id = ColumnRef(table="b", column="id", data_type=DataType.INTEGER)
+    a_x = ColumnRef(table="a", column="x", data_type=DataType.INTEGER)
+    equi = BinaryOp(op=BinaryOpType.EQ, left=a_id, right=b_id)
+
+    def branch(val):
+        cond = BinaryOp(
+            op=BinaryOpType.EQ, left=a_x,
+            right=Literal(value=val, data_type=DataType.INTEGER),
+        )
+        return BinaryOp(op=BinaryOpType.AND, left=equi, right=cond)
+
+    disjunction = BinaryOp(op=BinaryOpType.OR, left=branch(1), right=branch(2))
+    keep = BinaryOp(
+        op=BinaryOpType.GT, left=a_x,
+        right=Literal(value=0, data_type=DataType.INTEGER),
+    )
+    predicate = BinaryOp(op=BinaryOpType.AND, left=keep, right=disjunction)
+    left = Scan(datasource="d", schema_name="public", table_name="a", columns=["id", "x"])
+    right = Scan(datasource="d", schema_name="public", table_name="b", columns=["id"])
+    join = Join(left=left, right=right, join_type=JoinType.INNER, condition=None, using=[])
+
+    factored = PredicatePushdownRule()._factor_filter_predicate(
+        Filter(input=join, predicate=predicate)
+    )
+    top_conjuncts = split_conjuncts(factored.predicate)
+    # The equi-join, trapped inside the OR before, is now a top-level conjunct.
+    assert equi in top_conjuncts
