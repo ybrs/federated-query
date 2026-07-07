@@ -61,6 +61,39 @@ q39 2.7x -> 11.3x (776ms), q05 4.5x -> 9.3x (424ms), q78 4.6x -> 7.9x
 (1082ms), q04 4.2x -> 6.7x (1451ms), q79 2.3x -> 5.9x, q06 2.6x -> 5.3x,
 q11 2.8x -> 5.3x (785ms). Diagnose these at SF1 before optimizing anything.
 
+## TPC-DS at SF10 (100x) - 2026-07-07: PASS 95 | MISMATCH 0 | ERROR 4
+
+Infra: tpcds_sf10 pg db loaded (store_sales 28.8M), tpcds_sf10.duckdb
+(3.2GB) generated. Run with `--timeout 300 --memory-limit 40000` (the
+default 12GB child cap would kill legitimate SF10 queries). Report:
+report-result-1c4f848.md. Geomean 2.28x over the 95 measured; totals 118s
+vs 55s (2.14x) - NO global blowup (q72 runs at 0.39x, 2.5x FASTER than
+DuckDB). Suite: 1278 passed.
+
+THE TWO REAL SF10 FINDINGS:
+1. **Memory wall - 4 ERRORs**: q23/q67/q78 exhaust the 32GB pool in
+   fedq_collect; q64 hits the 40GB RSS watchdog. The engine fully
+   MATERIALIZES every fragment result and every source read as an Arrow
+   binding; DuckDB streams and spills. Fixing means spillable/streamed
+   bindings or aggressive pre-reduction - an architecture item, not a tweak.
+2. **A super-linear family** whose ratio grows at every scale step
+   (SF0.1 -> SF1 -> SF10): q05 4.5->9.3->24.3x, q39 2.7->11.3->19.2x,
+   q06 2.6->5.3->19.8x, q31 3.3->3.8->19.5x, q58 ->16.9x, q79 ->15.3x,
+   q44 ->13.2x, q70 ->12.2x. 67/95 queries got relatively worse SF1->SF10.
+   Suspects (UNDIAGNOSED - profile at SF10 first): cross-source fact
+   transfer volume, injections degrading to full reads, per-fragment
+   materialization latency. This family is the top perf backlog; the
+   SF0.1-era "island family" analysis is superseded.
+
+Comparator hardening from SF10 (commit 1c4f848): order-only differences
+with identical multisets are a MATCH - q18's data-NULL detail rows tie with
+ROLLUP subtotal rows on every sort column (full-precision sets verified
+IDENTICAL), q65/q71 tie on their whole key lists. Ties are legitimately
+unordered; a mis-sort under ORDER BY..LIMIT still changes the surviving
+set and fails.
+
+Three MISMATCH-free scales now: SF0.1 99/0/0, SF1 99/0/0, SF10 95/0/4.
+
 SF1 also exposed a REAL bug, fixed (fedqrs 83ca5cb): two pg read paths
 could return a binding whose declared schema disagreed with its executed
 batches ("Mismatch between schema and batches") - ADBC drops the NUMERIC
