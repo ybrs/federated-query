@@ -1,79 +1,19 @@
 # TPC-DS federated benchmark report
 
-Scale factor 0.1, PostgreSQL + DuckDB split, per-query timeout 60.0s, memory cap 12288 MB. Each engine run is an isolated child process; the DuckDB oracle (with PostgreSQL attached) runs in the parent.
+Scale factor 0.1, PostgreSQL + DuckDB split, per-query timeout 30.0s, memory cap 12288 MB. Each query's engine and DuckDB oracle (with PostgreSQL attached) run together in one isolated child process; timings are steady-state (one warm-up run discarded).
 
-Correctness is differential: fedq reads each table from its placed source while DuckDB reads the SAME split through its postgres connector, so both compute the exact federated answer and a MISMATCH is a real cross-source engine bug. Rows are compared in order, values rounded to 2 decimals.
+Correctness compares fedq's federated result against PURE DuckDB over the same file (every table read locally), the canonical answer - so a MISMATCH is a real engine bug, not a federation quirk of the DuckDB postgres scanner (which dropped rows on q59 and drifts on avg-of-decimal on q18). The federated DuckDB oracle is used only for the timing baseline. Rows are compared in order, values rounded to 2 decimals.
 
 ## Placement: pg-dims
 
-[pg-dims] Total 99 | PASS 15 | MISMATCH 0 | ERROR 84 | cross-source 97
+[pg-dims] Total 99 | PASS 91 | MISMATCH 1 | ERROR 7 | cross-source 97
 
 ### Failure clusters
 
-### Binding: reference not in scope (25)
-Queries: q11, q15, q18, q19, q23, q24, q30, q34, q35, q38, q45, q46, q49, q54, q61, q64, q68, q69, q73, q74, q79, q81, q84, q87, q91
+### Other (5)
+Queries: q10, q23, q35, q45, q86
 
-- BindingError: Column 'c_customer_sk' not found in any table in scope
-
-### Star over subquery/CTE (14)
-Queries: q21, q28, q33, q44, q47, q51, q53, q56, q57, q60, q63, q67, q88, q89
-
-- StarExpansionError: Star expansion only supports base tables
-
-### Out of memory (7)
-Queries: q05, q27, q31, q36, q77, q80, q83
-
-- InvalidInputException: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 8388608 bytes
-
-### Timeout (7)
-Queries: q01, q02, q10, q14, q59, q95, q97
-
-- Timeout: exceeded 60.0s
-
-### Other (6)
-Queries: q17, q25, q29, q58, q66, q72
-
-- Error: ArrowInvalid: Multiple matches for FieldRef.Name(right_d_quarter_name) in ss_sold_date_sk: int64
-
-### Cross-source column resolution (5)
-Queries: q03, q16, q42, q52, q94
-
-- ColumnResolutionError: Unresolved column reference store_sales.ss_ext_sales_price; relation exposes [('dt', 'd_date_sk'), ('dt', 'd_moy'), ('dt', 'd_year'), ('item', 'i_brand'), ('item', 'i_brand_id'), ('item', 'i_item_sk'), ('item', 'i_manufact_id'), ('store_sales', 'ss_item_sk'), ('store_sales', 'ss_sold_date_sk')]
-
-### DuckDB binder (oracle side) (4)
-Queries: q55, q85, q92, q96
-
-- BinderException: Binder Error: Referenced column "i_brand_id" not found in FROM clause!
-
-### Decimal precision (3)
-Queries: q43, q76, q86
-
-- ArrowInvalid: Decimal value does not fit in precision 7
-
-### Internal exception (3)
-Queries: q12, q20, q98
-
-- InternalException: INTERNAL Error: Failed to bind column reference "" [18.1] (bindings: {#[21.0], #[21.1], #[21.2], #[21.3], #[21.4], #[21.5], #[19.0], #[18.0]})
-
-### Join-key orientation (3)
-Queries: q62, q71, q99
-
-- ValueError: cannot orient join keys 'ws_warehouse_sk' / 'w_warehouse_sk' to a join side; neither resolves by qualifier or by column name
-
-### Unsupported function NULLIF (3)
-Queries: q75, q78, q90
-
-- ExpressionEvaluationError: Unsupported function: NULLIF
-
-### Postgres text decode (UnicodeDecodeError) (1)
-Queries: q04
-
-- UnicodeDecodeError: 'ascii' codec can't decode byte 0xc3 in position 1: ordinal not in range(128)
-
-### Scalar subquery > 1 row (1)
-Queries: q06
-
-- CardinalityViolationError: Scalar subquery returned more than one row
+- RuntimeError: Resources exhausted: Failed to allocate additional 279.6 KB for fedq_collect with 32.0 GB already allocated for this reservation - 200.7 KB remain available for the total memory pool: fair(pool_size: 32.0 GB)
 
 ### Simple CASE unsupported (1)
 Queries: q39
@@ -85,281 +25,210 @@ Queries: q70
 
 - UnsupportedSQLError: window functions are not allowed in WHERE
 
+### Wrong result: row values (1)
+Queries: q18
+
+- row 7 differs: engine=('AAAAAAAAAGEAAAAA', 'NULL', 'NULL', 'NULL', '91.00', '206.98', '836.96', '78.89', '-1022.42', '1945.50', '4.00') oracle=('AAAAAAAAAGEAAAAA', 'NULL', 'NULL', 'NULL', '91.00', '206.99', '836.96', '78.89', '-1022.41', '1945.50', '4.00')
+
 ### Per-query matrix
 
 | Query | Status | Span | Rows engine/oracle | Detail |
 | --- | --- | --- | --- | --- |
-| q01 | ERROR | cross | - | Timeout: exceeded 60.0s |
-| q02 | ERROR | cross | - | Timeout: exceeded 60.0s |
-| q03 | ERROR | cross | - | ColumnResolutionError: Unresolved column reference store_sales.ss_ext_sales_price; relation exposes [('dt', 'd_date_sk'), ('dt', 'd_moy'), ('dt', 'd_year'), ('item', 'i_brand'), ('item', 'i_brand_id'), ('item', 'i_item_sk'), ('item', 'i_manufact_id'), ('store_sales', 'ss_item_sk'), ('store_sales', 'ss_sold_date_sk')] |
-| q04 | ERROR | cross | - | UnicodeDecodeError: 'ascii' codec can't decode byte 0xc3 in position 1: ordinal not in range(128) |
-| q05 | ERROR | cross | - | InvalidInputException: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 8388608 bytes |
-| q06 | ERROR | cross | - | CardinalityViolationError: Scalar subquery returned more than one row |
+| q01 | PASS | cross | 100 / 100 | rows and values match |
+| q02 | PASS | cross | 2513 / 2513 | rows and values match |
+| q03 | PASS | cross | 15 / 15 | rows and values match |
+| q04 | PASS | cross | 0 / 0 | rows and values match |
+| q05 | PASS | cross | 100 / 100 | rows and values match |
+| q06 | PASS | cross | 10 / 10 | rows and values match |
 | q07 | PASS | cross | 100 / 100 | rows and values match |
 | q08 | PASS | cross | 0 / 0 | rows and values match |
 | q09 | PASS | cross | 1 / 1 | rows and values match |
-| q10 | ERROR | cross | - | Timeout: exceeded 60.0s |
-| q11 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q12 | ERROR | cross | - | InternalException: INTERNAL Error: Failed to bind column reference "" [18.1] (bindings: {#[21.0], #[21.1], #[21.2], #[21.3], #[21.4], #[21.5], #[19.0], #[18.0]}) |
+| q10 | ERROR | cross | - | RuntimeError: Resources exhausted: Failed to allocate additional 279.6 KB for fedq_collect with 32.0 GB already allocated for this reservation - 200.7 KB remain available for the total memory pool: fair(pool_size: 32.0 GB) |
+| q11 | PASS | cross | 4 / 4 | rows and values match |
+| q12 | PASS | cross | 100 / 100 | rows and values match |
 | q13 | PASS | cross | 1 / 1 | rows and values match |
-| q14 | ERROR | cross | - | Timeout: exceeded 60.0s |
-| q15 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q16 | ERROR | cross | - | ColumnResolutionError: Unresolved column reference cs1.cs_ext_ship_cost; relation exposes [('call_center', 'cc_call_center_id'), ('call_center', 'cc_call_center_sk'), ('call_center', 'cc_city'), ('call_center', 'cc_class'), ('call_center', 'cc_closed_date_sk'), ('call_center', 'cc_company'), ('call_center', 'cc_company_name'), ('call_center', 'cc_country'), ('call_center', 'cc_county'), ('call_center', 'cc_division'), ('call_center', 'cc_division_name'), ('call_center', 'cc_employees'), ('call_center', 'cc_gmt_offset'), ('call_center', 'cc_hours'), ('call_center', 'cc_manager'), ('call_center', 'cc_market_manager'), ('call_center', 'cc_mkt_class'), ('call_center', 'cc_mkt_desc'), ('call_center', 'cc_mkt_id'), ('call_center', 'cc_name'), ('call_center', 'cc_open_date_sk'), ('call_center', 'cc_rec_end_date'), ('call_center', 'cc_rec_start_date'), ('call_center', 'cc_sq_ft'), ('call_center', 'cc_state'), ('call_center', 'cc_street_name'), ('call_center', 'cc_street_number'), ('call_center', 'cc_street_type'), ('call_center', 'cc_suite_number'), ('call_center', 'cc_tax_percentage'), ('call_center', 'cc_zip'), ('cs1', 'cs_call_center_sk'), ('cs1', 'cs_order_number'), ('cs1', 'cs_ship_addr_sk'), ('cs1', 'cs_ship_date_sk'), ('cs1', 'cs_warehouse_sk'), ('customer_address', 'ca_address_id'), ('customer_address', 'ca_address_sk'), ('customer_address', 'ca_city'), ('customer_address', 'ca_country'), ('customer_address', 'ca_county'), ('customer_address', 'ca_gmt_offset'), ('customer_address', 'ca_location_type'), ('customer_address', 'ca_state'), ('customer_address', 'ca_street_name'), ('customer_address', 'ca_street_number'), ('customer_address', 'ca_street_type'), ('customer_address', 'ca_suite_number'), ('customer_address', 'ca_zip'), ('date_dim', 'd_current_day'), ('date_dim', 'd_current_month'), ('date_dim', 'd_current_quarter'), ('date_dim', 'd_current_week'), ('date_dim', 'd_current_year'), ('date_dim', 'd_date'), ('date_dim', 'd_date_id'), ('date_dim', 'd_date_sk'), ('date_dim', 'd_day_name'), ('date_dim', 'd_dom'), ('date_dim', 'd_dow'), ('date_dim', 'd_first_dom'), ('date_dim', 'd_following_holiday'), ('date_dim', 'd_fy_quarter_seq'), ('date_dim', 'd_fy_week_seq'), ('date_dim', 'd_fy_year'), ('date_dim', 'd_holiday'), ('date_dim', 'd_last_dom'), ('date_dim', 'd_month_seq'), ('date_dim', 'd_moy'), ('date_dim', 'd_qoy'), ('date_dim', 'd_quarter_name'), ('date_dim', 'd_quarter_seq'), ('date_dim', 'd_same_day_lq'), ('date_dim', 'd_same_day_ly'), ('date_dim', 'd_week_seq'), ('date_dim', 'd_weekend'), ('date_dim', 'd_year')] |
-| q17 | ERROR | cross | - | Error: ArrowInvalid: Multiple matches for FieldRef.Name(right_d_quarter_name) in ss_sold_date_sk: int64 |
-| q18 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q19 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q20 | ERROR | cross | - | InternalException: INTERNAL Error: Failed to bind column reference "" [18.1] (bindings: {#[21.0], #[21.1], #[21.2], #[21.3], #[21.4], #[21.5], #[19.0], #[18.0]}) |
-| q21 | ERROR | cross | - | StarExpansionError: Star expansion only supports base tables |
+| q14 | PASS | cross | 100 / 100 | rows and values match |
+| q15 | PASS | cross | 33 / 33 | rows and values match |
+| q16 | PASS | cross | 1 / 1 | rows and values match |
+| q17 | PASS | cross | 1 / 1 | rows and values match |
+| q18 | MISMATCH | cross | 100 / 100 | row 7 differs: engine=('AAAAAAAAAGEAAAAA', 'NULL', 'NULL', 'NULL', '91.00', '206.98', '836.96', '78.89', '-1022.42', '1945.50', '4.00') oracle=('AAAAAAAAAGEAAAAA', 'NULL', 'NULL', 'NULL', '91.00', '206.99', '836.96', '78.89', '-1022.41', '1945.50', '4.00') |
+| q19 | PASS | cross | 10 / 10 | rows and values match |
+| q20 | PASS | cross | 100 / 100 | rows and values match |
+| q21 | PASS | cross | 32 / 32 | rows and values match |
 | q22 | PASS | cross | 100 / 100 | rows and values match |
-| q23 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q24 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q25 | ERROR | cross | - | Error: ArrowInvalid: Multiple matches for FieldRef.Name(right_d_year) in ss_sold_date_sk: int64 |
+| q23 | ERROR | cross | - | RuntimeError: type_coercion |
+| q24 | PASS | cross | 0 / 0 | rows and values match |
+| q25 | PASS | cross | 0 / 0 | rows and values match |
 | q26 | PASS | cross | 100 / 100 | rows and values match |
-| q27 | ERROR | cross | - | InvalidInputException: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 16777216 bytes |
-| q28 | ERROR | single | - | StarExpansionError: Star expansion only supports base tables |
-| q29 | ERROR | cross | - | Error: ArrowInvalid: Multiple matches for FieldRef.Name(right_d_year) in ss_sold_date_sk: int64 |
-| q30 | ERROR | cross | - | BindingError: Column 'c_current_addr_sk' not found in any table in scope |
-| q31 | ERROR | cross | - | OSError: Out of Memory Error: ArrowBuffer: failed to allocate 16777216 bytes |
+| q27 | PASS | cross | 100 / 100 | rows and values match |
+| q28 | PASS | single | 1 / 1 | rows and values match |
+| q29 | PASS | cross | 0 / 0 | rows and values match |
+| q30 | PASS | cross | 21 / 21 | rows and values match |
+| q31 | PASS | cross | 1 / 1 | rows and values match |
 | q32 | PASS | cross | 1 / 1 | rows and values match |
-| q33 | ERROR | cross | - | StarExpansionError: Missing catalog metadata for default.public.ss |
-| q34 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q35 | ERROR | cross | - | BindingError: Column 'c_current_addr_sk' not found in table 'c' |
-| q36 | ERROR | cross | - | InvalidInputException: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 16777216 bytes |
+| q33 | PASS | cross | 100 / 100 | rows and values match |
+| q34 | PASS | cross | 53 / 53 | rows and values match |
+| q35 | ERROR | cross | - | RuntimeError: Resources exhausted: Failed to allocate additional 311.9 KB for fedq_collect with 32.0 GB already allocated for this reservation - 196.2 KB remain available for the total memory pool: fair(pool_size: 32.0 GB) |
+| q36 | PASS | cross | 100 / 100 | rows and values match |
 | q37 | PASS | cross | 0 / 0 | rows and values match |
-| q38 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in table 'customer' |
+| q38 | PASS | cross | 1 / 1 | rows and values match |
 | q39 | ERROR | cross | - | UnsupportedSQLError: simple CASE (CASE operand WHEN ...) is not supported; use a searched CASE (CASE WHEN operand = value ...) |
 | q40 | PASS | cross | 44 / 44 | rows and values match |
 | q41 | PASS | single | 0 / 0 | rows and values match |
-| q42 | ERROR | cross | - | ColumnResolutionError: Unresolved column reference store_sales.ss_ext_sales_price; relation exposes [('dt', 'd_date_sk'), ('dt', 'd_moy'), ('dt', 'd_year'), ('item', 'i_category'), ('item', 'i_category_id'), ('item', 'i_item_sk'), ('item', 'i_manager_id'), ('store_sales', 'ss_item_sk'), ('store_sales', 'ss_sold_date_sk')] |
-| q43 | ERROR | cross | - | ArrowInvalid: Decimal value does not fit in precision 7 |
-| q44 | ERROR | cross | - | StarExpansionError: Star expansion only supports base tables |
-| q45 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q46 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q47 | ERROR | cross | - | StarExpansionError: Missing catalog metadata for default.public.v2 |
+| q42 | PASS | cross | 4 / 4 | rows and values match |
+| q43 | PASS | cross | 1 / 1 | rows and values match |
+| q44 | PASS | cross | 0 / 0 | rows and values match |
+| q45 | ERROR | cross | - | RuntimeError: Resources exhausted: Failed to allocate additional 361.1 KB for fedq_collect with 32.0 GB already allocated for this reservation - 180.7 KB remain available for the total memory pool: fair(pool_size: 32.0 GB) |
+| q46 | PASS | cross | 100 / 100 | rows and values match |
+| q47 | PASS | cross | 100 / 100 | rows and values match |
 | q48 | PASS | cross | 1 / 1 | rows and values match |
-| q49 | ERROR | cross | - | BindingError: Table 'catalog' not found in scope for column 'return_rank' |
+| q49 | PASS | cross | 2 / 2 | rows and values match |
 | q50 | PASS | cross | 1 / 1 | rows and values match |
-| q51 | ERROR | cross | - | StarExpansionError: Star expansion only supports base tables |
-| q52 | ERROR | cross | - | ColumnResolutionError: Unresolved column reference store_sales.ss_ext_sales_price; relation exposes [('dt', 'd_date_sk'), ('dt', 'd_moy'), ('dt', 'd_year'), ('item', 'i_brand'), ('item', 'i_brand_id'), ('item', 'i_item_sk'), ('item', 'i_manager_id'), ('store_sales', 'ss_item_sk'), ('store_sales', 'ss_sold_date_sk')] |
-| q53 | ERROR | cross | - | StarExpansionError: Star expansion only supports base tables |
-| q54 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q55 | ERROR | cross | - | BinderException: Binder Error: Referenced column "i_brand_id" not found in FROM clause! |
-| q56 | ERROR | cross | - | StarExpansionError: Missing catalog metadata for default.public.ss |
-| q57 | ERROR | cross | - | StarExpansionError: Missing catalog metadata for default.public.v2 |
-| q58 | ERROR | cross | - | ArrowNotImplementedError: Function 'equal' has no kernel matching input types (date32[day], string) |
-| q59 | ERROR | cross | - | Timeout: exceeded 60.0s |
-| q60 | ERROR | cross | - | StarExpansionError: Missing catalog metadata for default.public.ss |
-| q61 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q62 | ERROR | cross | - | ValueError: cannot orient join keys 'ws_warehouse_sk' / 'w_warehouse_sk' to a join side; neither resolves by qualifier or by column name |
-| q63 | ERROR | cross | - | StarExpansionError: Star expansion only supports base tables |
-| q64 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
+| q51 | PASS | cross | 100 / 100 | rows and values match |
+| q52 | PASS | cross | 11 / 11 | rows and values match |
+| q53 | PASS | cross | 100 / 100 | rows and values match |
+| q54 | PASS | cross | 0 / 0 | rows and values match |
+| q55 | PASS | cross | 20 / 20 | rows and values match |
+| q56 | PASS | cross | 38 / 38 | rows and values match |
+| q57 | PASS | cross | 100 / 100 | rows and values match |
+| q58 | PASS | cross | 0 / 0 | rows and values match |
+| q59 | PASS | cross | 100 / 100 | rows and values match |
+| q60 | PASS | cross | 100 / 100 | rows and values match |
+| q61 | PASS | cross | 1 / 1 | rows and values match |
+| q62 | PASS | cross | 6 / 6 | rows and values match |
+| q63 | PASS | cross | 100 / 100 | rows and values match |
+| q64 | PASS | cross | 0 / 0 | rows and values match |
 | q65 | PASS | cross | 0 / 0 | rows and values match |
-| q66 | ERROR | cross | - | ArrowInvalid: Failed to parse string: 'DHL,BARIAN' as a scalar of type int64 |
-| q67 | ERROR | cross | - | StarExpansionError: Star expansion only supports base tables |
-| q68 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q69 | ERROR | cross | - | BindingError: Column 'c_current_addr_sk' not found in table 'c' |
+| q66 | PASS | cross | 1 / 1 | rows and values match |
+| q67 | PASS | cross | 100 / 100 | rows and values match |
+| q68 | PASS | cross | 100 / 100 | rows and values match |
+| q69 | PASS | cross | 71 / 71 | rows and values match |
 | q70 | ERROR | cross | - | UnsupportedSQLError: window functions are not allowed in WHERE |
-| q71 | ERROR | cross | - | ValueError: cannot orient join keys 'sold_item_sk' / 'i_item_sk' to a join side; neither resolves by qualifier or by column name |
-| q72 | ERROR | cross | - | ArrowNotImplementedError: Function 'add' has no kernel matching input types (timestamp[s], int64) |
-| q73 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q74 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q75 | ERROR | cross | - | ExpressionEvaluationError: Unsupported function: NULLIF |
-| q76 | ERROR | cross | - | ArrowInvalid: Decimal value does not fit in precision 7 |
-| q77 | ERROR | cross | - | OSError: Out of Memory Error: ArrowBuffer: failed to allocate 16777216 bytes |
-| q78 | ERROR | cross | - | ExpressionEvaluationError: Unsupported function: NULLIF |
-| q79 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q80 | ERROR | cross | - | OSError: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 16777216 bytes |
-| q81 | ERROR | cross | - | BindingError: Column 'c_current_addr_sk' not found in any table in scope |
+| q71 | PASS | cross | 56 / 56 | rows and values match |
+| q72 | PASS | cross | 50 / 50 | rows and values match |
+| q73 | PASS | cross | 0 / 0 | rows and values match |
+| q74 | PASS | cross | 3 / 3 | rows and values match |
+| q75 | PASS | cross | 25 / 25 | rows and values match |
+| q76 | PASS | cross | 100 / 100 | rows and values match |
+| q77 | PASS | cross | 10 / 10 | rows and values match |
+| q78 | PASS | cross | 100 / 100 | rows and values match |
+| q79 | PASS | cross | 100 / 100 | rows and values match |
+| q80 | PASS | cross | 100 / 100 | rows and values match |
+| q81 | PASS | cross | 34 / 34 | rows and values match |
 | q82 | PASS | cross | 0 / 0 | rows and values match |
-| q83 | ERROR | cross | - | OSError: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 8388608 bytes |
-| q84 | ERROR | cross | - | BindingError: Column 'c_current_addr_sk' not found in any table in scope |
-| q85 | ERROR | cross | - | BinderException: Binder Error: Referenced column "r_reason_desc" not found in FROM clause! |
-| q86 | ERROR | cross | - | ArrowInvalid: Decimal value does not fit in precision 7 |
-| q87 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in table 'customer' |
-| q88 | ERROR | cross | - | StarExpansionError: Star expansion only supports base tables |
-| q89 | ERROR | cross | - | StarExpansionError: Star expansion only supports base tables |
-| q90 | ERROR | cross | - | ExpressionEvaluationError: Unsupported function: NULLIF |
-| q91 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q92 | ERROR | cross | - | BinderException: Binder Error: Referenced column "ws_ext_discount_amt" not found in FROM clause! |
+| q83 | PASS | cross | 0 / 0 | rows and values match |
+| q84 | PASS | cross | 6 / 6 | rows and values match |
+| q85 | PASS | cross | 0 / 0 | rows and values match |
+| q86 | ERROR | cross | - | RuntimeError: This feature is not implemented: Physical plan does not support logical expression AggregateFunction(AggregateFunction { func: AggregateUDF { inner: Grouping { signature: Signature { type_signature: VariadicAny, volatility: Immutable, parameter_names: None } } }, params: AggregateFunctionParams { args: [Column(Column { relation: Some(Bare { table: "in_0" }), name: "i_category" })], distinct: false, filter: None, order_by: [], null_treatment: None } }) |
+| q87 | PASS | cross | 1 / 1 | rows and values match |
+| q88 | PASS | cross | 1 / 1 | rows and values match |
+| q89 | PASS | cross | 100 / 100 | rows and values match |
+| q90 | PASS | cross | 1 / 1 | rows and values match |
+| q91 | PASS | cross | 0 / 0 | rows and values match |
+| q92 | PASS | cross | 1 / 1 | rows and values match |
 | q93 | PASS | cross | 0 / 0 | rows and values match |
-| q94 | ERROR | cross | - | ColumnResolutionError: Unresolved column reference ws1.ws_ext_ship_cost; relation exposes [('customer_address', 'ca_address_id'), ('customer_address', 'ca_address_sk'), ('customer_address', 'ca_city'), ('customer_address', 'ca_country'), ('customer_address', 'ca_county'), ('customer_address', 'ca_gmt_offset'), ('customer_address', 'ca_location_type'), ('customer_address', 'ca_state'), ('customer_address', 'ca_street_name'), ('customer_address', 'ca_street_number'), ('customer_address', 'ca_street_type'), ('customer_address', 'ca_suite_number'), ('customer_address', 'ca_zip'), ('date_dim', 'd_current_day'), ('date_dim', 'd_current_month'), ('date_dim', 'd_current_quarter'), ('date_dim', 'd_current_week'), ('date_dim', 'd_current_year'), ('date_dim', 'd_date'), ('date_dim', 'd_date_id'), ('date_dim', 'd_date_sk'), ('date_dim', 'd_day_name'), ('date_dim', 'd_dom'), ('date_dim', 'd_dow'), ('date_dim', 'd_first_dom'), ('date_dim', 'd_following_holiday'), ('date_dim', 'd_fy_quarter_seq'), ('date_dim', 'd_fy_week_seq'), ('date_dim', 'd_fy_year'), ('date_dim', 'd_holiday'), ('date_dim', 'd_last_dom'), ('date_dim', 'd_month_seq'), ('date_dim', 'd_moy'), ('date_dim', 'd_qoy'), ('date_dim', 'd_quarter_name'), ('date_dim', 'd_quarter_seq'), ('date_dim', 'd_same_day_lq'), ('date_dim', 'd_same_day_ly'), ('date_dim', 'd_week_seq'), ('date_dim', 'd_weekend'), ('date_dim', 'd_year'), ('web_site', 'web_city'), ('web_site', 'web_class'), ('web_site', 'web_close_date_sk'), ('web_site', 'web_company_id'), ('web_site', 'web_company_name'), ('web_site', 'web_country'), ('web_site', 'web_county'), ('web_site', 'web_gmt_offset'), ('web_site', 'web_manager'), ('web_site', 'web_market_manager'), ('web_site', 'web_mkt_class'), ('web_site', 'web_mkt_desc'), ('web_site', 'web_mkt_id'), ('web_site', 'web_name'), ('web_site', 'web_open_date_sk'), ('web_site', 'web_rec_end_date'), ('web_site', 'web_rec_start_date'), ('web_site', 'web_site_id'), ('web_site', 'web_site_sk'), ('web_site', 'web_state'), ('web_site', 'web_street_name'), ('web_site', 'web_street_number'), ('web_site', 'web_street_type'), ('web_site', 'web_suite_number'), ('web_site', 'web_tax_percentage'), ('web_site', 'web_zip'), ('ws1', 'ws_order_number'), ('ws1', 'ws_ship_addr_sk'), ('ws1', 'ws_ship_date_sk'), ('ws1', 'ws_warehouse_sk'), ('ws1', 'ws_web_site_sk')] |
-| q95 | ERROR | cross | - | Timeout: exceeded 60.0s |
-| q96 | ERROR | cross | - | BinderException: Binder Error: Referenced column "s_store_sk" not found in FROM clause! |
-| q97 | ERROR | cross | - | Timeout: exceeded 60.0s |
-| q98 | ERROR | cross | - | InternalException: INTERNAL Error: Failed to bind column reference "" [18.1] (bindings: {#[21.0], #[21.1], #[21.2], #[21.3], #[21.4], #[21.5], #[19.0], #[18.0]}) |
-| q99 | ERROR | cross | - | ValueError: cannot orient join keys 'cs_warehouse_sk' / 'w_warehouse_sk' to a join side; neither resolves by qualifier or by column name |
+| q94 | PASS | cross | 1 / 1 | rows and values match |
+| q95 | PASS | cross | 1 / 1 | rows and values match |
+| q96 | PASS | cross | 1 / 1 | rows and values match |
+| q97 | PASS | cross | 1 / 1 | rows and values match |
+| q98 | PASS | cross | 250 / 250 | rows and values match |
+| q99 | PASS | cross | 6 / 6 | rows and values match |
 
-## Placement: adversarial
 
-[adversarial] Total 99 | PASS 14 | MISMATCH 0 | ERROR 85 | cross-source 95
+### Timings (PASS only): engine vs DuckDB-over-Postgres [pg-dims]
 
-### Failure clusters
+| query | engine ms | duck ms | ratio |
+|---|---|---|---|
+| q01 | 62.6 | 20.7 | 3.03x |
+| q02 | 2540.7 | 45.3 | 56.11x |
+| q03 | 34.8 | 25.6 | 1.36x |
+| q04 | 1522.9 | 68.7 | 22.17x |
+| q05 | 167.1 | 35.7 | 4.68x |
+| q06 | 147.4 | 44.0 | 3.35x |
+| q07 | 70.0 | 66.7 | 1.05x |
+| q08 | 81.1 | 30.4 | 2.67x |
+| q09 | 122.1 | 8.4 | 14.51x |
+| q11 | 537.4 | 54.1 | 9.94x |
+| q12 | 34.1 | 19.1 | 1.78x |
+| q13 | 99.4 | 52.7 | 1.89x |
+| q14 | 725.5 | 96.7 | 7.50x |
+| q15 | 40.9 | 21.7 | 1.88x |
+| q16 | 62.4 | 18.9 | 3.29x |
+| q17 | 125.3 | 35.1 | 3.57x |
+| q19 | 56.3 | 36.5 | 1.54x |
+| q20 | 35.2 | 20.7 | 1.70x |
+| q21 | 57.0 | 16.0 | 3.56x |
+| q22 | 47.1 | 28.7 | 1.64x |
+| q24 | 140.4 | 15.7 | 8.95x |
+| q25 | 88.1 | 33.7 | 2.61x |
+| q26 | 61.0 | 68.3 | 0.89x |
+| q27 | 236.3 | 67.0 | 3.53x |
+| q28 | 74.3 | 9.7 | 7.65x |
+| q29 | 127.3 | 49.1 | 2.59x |
+| q30 | 135.7 | 34.7 | 3.91x |
+| q31 | 303.0 | 39.7 | 7.63x |
+| q32 | 37.7 | 21.4 | 1.76x |
+| q33 | 211.0 | 38.5 | 5.49x |
+| q34 | 67.9 | 28.2 | 2.41x |
+| q36 | 140.4 | 31.5 | 4.46x |
+| q37 | 26.0 | 14.1 | 1.84x |
+| q38 | 92.2 | 41.9 | 2.20x |
+| q40 | 60.1 | 17.4 | 3.45x |
+| q41 | 37.7 | 6.3 | 5.97x |
+| q42 | 33.4 | 17.1 | 1.95x |
+| q43 | 45.5 | 28.0 | 1.63x |
+| q44 | 107.4 | 5.2 | 20.73x |
+| q46 | 117.7 | 30.5 | 3.86x |
+| q47 | 572.3 | 38.1 | 15.00x |
+| q48 | 101.7 | 66.8 | 1.52x |
+| q49 | 144.0 | 33.6 | 4.28x |
+| q50 | 68.3 | 31.6 | 2.16x |
+| q51 | 140.2 | 49.1 | 2.85x |
+| q52 | 36.7 | 18.9 | 1.94x |
+| q53 | 59.8 | 36.0 | 1.66x |
+| q54 | 185.3 | 51.0 | 3.63x |
+| q55 | 33.2 | 20.7 | 1.61x |
+| q56 | 209.5 | 39.5 | 5.31x |
+| q57 | 444.3 | 41.1 | 10.82x |
+| q58 | 237.1 | 62.9 | 3.77x |
+| q59 | 4091.5 | 53.3 | 76.80x |
+| q60 | 145.9 | 38.8 | 3.76x |
+| q61 | 126.1 | 35.0 | 3.60x |
+| q62 | 67.4 | 25.9 | 2.60x |
+| q63 | 60.2 | 23.7 | 2.54x |
+| q64 | 3309.3 | 97.0 | 34.11x |
+| q65 | 81.7 | 28.1 | 2.91x |
+| q66 | 1032.0 | 72.1 | 14.30x |
+| q67 | 229.6 | 72.7 | 3.16x |
+| q68 | 100.6 | 34.9 | 2.88x |
+| q69 | 126.3 | 80.7 | 1.57x |
+| q71 | 87.3 | 57.3 | 1.52x |
+| q72 | 180.3 | 65.5 | 2.75x |
+| q73 | 72.4 | 36.9 | 1.96x |
+| q74 | 365.6 | 41.3 | 8.86x |
+| q75 | 669.3 | 38.7 | 17.28x |
+| q76 | 89.6 | 32.5 | 2.76x |
+| q77 | 155.5 | 36.9 | 4.21x |
+| q78 | 186.5 | 39.5 | 4.72x |
+| q79 | 93.8 | 34.4 | 2.73x |
+| q80 | 222.9 | 45.2 | 4.93x |
+| q81 | 92.8 | 33.4 | 2.78x |
+| q82 | 26.0 | 19.6 | 1.32x |
+| q83 | 172.4 | 61.8 | 2.79x |
+| q84 | 40.6 | 41.5 | 0.98x |
+| q85 | 144.9 | 91.3 | 1.59x |
+| q87 | 89.9 | 43.5 | 2.07x |
+| q88 | 369.3 | 210.5 | 1.75x |
+| q89 | 63.8 | 30.6 | 2.08x |
+| q90 | 70.0 | 39.2 | 1.78x |
+| q91 | 64.1 | 51.4 | 1.25x |
+| q92 | 42.5 | 21.2 | 2.01x |
+| q93 | 24.6 | 3.9 | 6.25x |
+| q94 | 56.1 | 16.3 | 3.46x |
+| q95 | 56.2 | 35.5 | 1.59x |
+| q96 | 37.0 | 26.2 | 1.41x |
+| q97 | 51.6 | 24.0 | 2.15x |
+| q98 | 35.6 | 20.7 | 1.72x |
+| q99 | 72.8 | 20.5 | 3.55x |
 
-### Binding: reference not in scope (30)
-Queries: q01, q04, q06, q08, q10, q11, q15, q18, q19, q23, q24, q30, q34, q35, q38, q45, q46, q49, q54, q61, q64, q68, q69, q73, q74, q79, q81, q84, q87, q91
-
-- BindingError: Column 'c_customer_sk' not found in any table in scope
-
-### Star over subquery/CTE (14)
-Queries: q21, q28, q33, q44, q47, q51, q53, q56, q57, q60, q63, q67, q88, q89
-
-- StarExpansionError: Star expansion only supports base tables
-
-### Out of memory (7)
-Queries: q05, q27, q31, q36, q77, q80, q83
-
-- InvalidInputException: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 4194304 bytes
-
-### Other (6)
-Queries: q17, q25, q29, q58, q66, q72
-
-- Error: ArrowInvalid: Multiple matches for FieldRef.Name(right_d_quarter_name) in ss_sold_date_sk: int64
-
-### Cross-source column resolution (5)
-Queries: q03, q16, q42, q52, q94
-
-- ColumnResolutionError: Unresolved column reference store_sales.ss_ext_sales_price; relation exposes [('dt', 'd_date_sk'), ('dt', 'd_moy'), ('dt', 'd_year'), ('item', 'i_brand'), ('item', 'i_brand_id'), ('item', 'i_item_sk'), ('item', 'i_manufact_id'), ('store_sales', 'ss_item_sk'), ('store_sales', 'ss_sold_date_sk')]
-
-### Timeout (5)
-Queries: q02, q14, q59, q95, q97
-
-- Timeout: exceeded 60.0s
-
-### DuckDB binder (oracle side) (4)
-Queries: q55, q85, q92, q96
-
-- BinderException: Binder Error: Referenced column "i_brand_id" not found in FROM clause!
-
-### Decimal precision (3)
-Queries: q43, q76, q86
-
-- ArrowInvalid: Decimal value does not fit in precision 7
-
-### Internal exception (3)
-Queries: q12, q20, q98
-
-- InternalException: INTERNAL Error: Failed to bind column reference "" [18.1] (bindings: {#[21.0], #[21.1], #[21.2], #[21.3], #[21.4], #[21.5], #[19.0], #[18.0]})
-
-### Join-key orientation (3)
-Queries: q62, q71, q99
-
-- ValueError: cannot orient join keys 'ws_warehouse_sk' / 'w_warehouse_sk' to a join side; neither resolves by qualifier or by column name
-
-### Unsupported function NULLIF (3)
-Queries: q75, q78, q90
-
-- ExpressionEvaluationError: Unsupported function: NULLIF
-
-### Simple CASE unsupported (1)
-Queries: q39
-
-- UnsupportedSQLError: simple CASE (CASE operand WHEN ...) is not supported; use a searched CASE (CASE WHEN operand = value ...)
-
-### Window in WHERE (1)
-Queries: q70
-
-- UnsupportedSQLError: window functions are not allowed in WHERE
-
-### Per-query matrix
-
-| Query | Status | Span | Rows engine/oracle | Detail |
-| --- | --- | --- | --- | --- |
-| q01 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q02 | ERROR | cross | - | Timeout: exceeded 60.0s |
-| q03 | ERROR | cross | - | ColumnResolutionError: Unresolved column reference store_sales.ss_ext_sales_price; relation exposes [('dt', 'd_date_sk'), ('dt', 'd_moy'), ('dt', 'd_year'), ('item', 'i_brand'), ('item', 'i_brand_id'), ('item', 'i_item_sk'), ('item', 'i_manufact_id'), ('store_sales', 'ss_item_sk'), ('store_sales', 'ss_sold_date_sk')] |
-| q04 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q05 | ERROR | cross | - | InvalidInputException: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 4194304 bytes |
-| q06 | ERROR | cross | - | BindingError: Column 'c_current_addr_sk' not found in table 'c' |
-| q07 | PASS | cross | 100 / 100 | rows and values match |
-| q08 | ERROR | cross | - | BindingError: Column 'c_current_addr_sk' not found in any table in scope |
-| q09 | PASS | single | 1 / 1 | rows and values match |
-| q10 | ERROR | cross | - | BindingError: Column 'c_current_addr_sk' not found in table 'c' |
-| q11 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q12 | ERROR | cross | - | InternalException: INTERNAL Error: Failed to bind column reference "" [18.1] (bindings: {#[21.0], #[21.1], #[21.2], #[21.3], #[21.4], #[21.5], #[19.0], #[18.0]}) |
-| q13 | PASS | cross | 1 / 1 | rows and values match |
-| q14 | ERROR | cross | - | Timeout: exceeded 60.0s |
-| q15 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q16 | ERROR | cross | - | ColumnResolutionError: Unresolved column reference cs1.cs_ext_ship_cost; relation exposes [('call_center', 'cc_call_center_id'), ('call_center', 'cc_call_center_sk'), ('call_center', 'cc_city'), ('call_center', 'cc_class'), ('call_center', 'cc_closed_date_sk'), ('call_center', 'cc_company'), ('call_center', 'cc_company_name'), ('call_center', 'cc_country'), ('call_center', 'cc_county'), ('call_center', 'cc_division'), ('call_center', 'cc_division_name'), ('call_center', 'cc_employees'), ('call_center', 'cc_gmt_offset'), ('call_center', 'cc_hours'), ('call_center', 'cc_manager'), ('call_center', 'cc_market_manager'), ('call_center', 'cc_mkt_class'), ('call_center', 'cc_mkt_desc'), ('call_center', 'cc_mkt_id'), ('call_center', 'cc_name'), ('call_center', 'cc_open_date_sk'), ('call_center', 'cc_rec_end_date'), ('call_center', 'cc_rec_start_date'), ('call_center', 'cc_sq_ft'), ('call_center', 'cc_state'), ('call_center', 'cc_street_name'), ('call_center', 'cc_street_number'), ('call_center', 'cc_street_type'), ('call_center', 'cc_suite_number'), ('call_center', 'cc_tax_percentage'), ('call_center', 'cc_zip'), ('cs1', 'cs_call_center_sk'), ('cs1', 'cs_order_number'), ('cs1', 'cs_ship_addr_sk'), ('cs1', 'cs_ship_date_sk'), ('cs1', 'cs_warehouse_sk'), ('customer_address', 'ca_address_id'), ('customer_address', 'ca_address_sk'), ('customer_address', 'ca_city'), ('customer_address', 'ca_country'), ('customer_address', 'ca_county'), ('customer_address', 'ca_gmt_offset'), ('customer_address', 'ca_location_type'), ('customer_address', 'ca_state'), ('customer_address', 'ca_street_name'), ('customer_address', 'ca_street_number'), ('customer_address', 'ca_street_type'), ('customer_address', 'ca_suite_number'), ('customer_address', 'ca_zip'), ('date_dim', 'd_current_day'), ('date_dim', 'd_current_month'), ('date_dim', 'd_current_quarter'), ('date_dim', 'd_current_week'), ('date_dim', 'd_current_year'), ('date_dim', 'd_date'), ('date_dim', 'd_date_id'), ('date_dim', 'd_date_sk'), ('date_dim', 'd_day_name'), ('date_dim', 'd_dom'), ('date_dim', 'd_dow'), ('date_dim', 'd_first_dom'), ('date_dim', 'd_following_holiday'), ('date_dim', 'd_fy_quarter_seq'), ('date_dim', 'd_fy_week_seq'), ('date_dim', 'd_fy_year'), ('date_dim', 'd_holiday'), ('date_dim', 'd_last_dom'), ('date_dim', 'd_month_seq'), ('date_dim', 'd_moy'), ('date_dim', 'd_qoy'), ('date_dim', 'd_quarter_name'), ('date_dim', 'd_quarter_seq'), ('date_dim', 'd_same_day_lq'), ('date_dim', 'd_same_day_ly'), ('date_dim', 'd_week_seq'), ('date_dim', 'd_weekend'), ('date_dim', 'd_year')] |
-| q17 | ERROR | cross | - | Error: ArrowInvalid: Multiple matches for FieldRef.Name(right_d_quarter_name) in ss_sold_date_sk: int64 |
-| q18 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q19 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q20 | ERROR | cross | - | InternalException: INTERNAL Error: Failed to bind column reference "" [18.1] (bindings: {#[21.0], #[21.1], #[21.2], #[21.3], #[21.4], #[21.5], #[19.0], #[18.0]}) |
-| q21 | ERROR | cross | - | StarExpansionError: Star expansion only supports base tables |
-| q22 | PASS | cross | 100 / 100 | rows and values match |
-| q23 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q24 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q25 | ERROR | cross | - | Error: ArrowInvalid: Multiple matches for FieldRef.Name(right_d_year) in ss_sold_date_sk: int64 |
-| q26 | PASS | cross | 100 / 100 | rows and values match |
-| q27 | ERROR | cross | - | InvalidInputException: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 16777216 bytes |
-| q28 | ERROR | single | - | StarExpansionError: Star expansion only supports base tables |
-| q29 | ERROR | cross | - | Error: ArrowInvalid: Multiple matches for FieldRef.Name(right_d_year) in ss_sold_date_sk: int64 |
-| q30 | ERROR | cross | - | BindingError: Column 'c_current_addr_sk' not found in any table in scope |
-| q31 | ERROR | cross | - | OSError: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 16777216 bytes |
-| q32 | PASS | cross | 1 / 1 | rows and values match |
-| q33 | ERROR | cross | - | StarExpansionError: Missing catalog metadata for default.public.ss |
-| q34 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q35 | ERROR | cross | - | BindingError: Column 'c_current_addr_sk' not found in table 'c' |
-| q36 | ERROR | cross | - | InvalidInputException: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 16777216 bytes |
-| q37 | PASS | cross | 0 / 0 | rows and values match |
-| q38 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in table 'customer' |
-| q39 | ERROR | cross | - | UnsupportedSQLError: simple CASE (CASE operand WHEN ...) is not supported; use a searched CASE (CASE WHEN operand = value ...) |
-| q40 | PASS | cross | 44 / 44 | rows and values match |
-| q41 | PASS | single | 0 / 0 | rows and values match |
-| q42 | ERROR | cross | - | ColumnResolutionError: Unresolved column reference store_sales.ss_ext_sales_price; relation exposes [('dt', 'd_date_sk'), ('dt', 'd_moy'), ('dt', 'd_year'), ('item', 'i_category'), ('item', 'i_category_id'), ('item', 'i_item_sk'), ('item', 'i_manager_id'), ('store_sales', 'ss_item_sk'), ('store_sales', 'ss_sold_date_sk')] |
-| q43 | ERROR | cross | - | ArrowInvalid: Decimal value does not fit in precision 7 |
-| q44 | ERROR | single | - | StarExpansionError: Star expansion only supports base tables |
-| q45 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q46 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q47 | ERROR | cross | - | StarExpansionError: Missing catalog metadata for default.public.v2 |
-| q48 | PASS | cross | 1 / 1 | rows and values match |
-| q49 | ERROR | cross | - | BindingError: Table 'catalog' not found in scope for column 'return_rank' |
-| q50 | PASS | cross | 1 / 1 | rows and values match |
-| q51 | ERROR | cross | - | StarExpansionError: Star expansion only supports base tables |
-| q52 | ERROR | cross | - | ColumnResolutionError: Unresolved column reference store_sales.ss_ext_sales_price; relation exposes [('dt', 'd_date_sk'), ('dt', 'd_moy'), ('dt', 'd_year'), ('item', 'i_brand'), ('item', 'i_brand_id'), ('item', 'i_item_sk'), ('item', 'i_manager_id'), ('store_sales', 'ss_item_sk'), ('store_sales', 'ss_sold_date_sk')] |
-| q53 | ERROR | cross | - | StarExpansionError: Star expansion only supports base tables |
-| q54 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q55 | ERROR | cross | - | BinderException: Binder Error: Referenced column "i_brand_id" not found in FROM clause! |
-| q56 | ERROR | cross | - | StarExpansionError: Missing catalog metadata for default.public.ss |
-| q57 | ERROR | cross | - | StarExpansionError: Missing catalog metadata for default.public.v2 |
-| q58 | ERROR | cross | - | ArrowNotImplementedError: Function 'equal' has no kernel matching input types (date32[day], string) |
-| q59 | ERROR | cross | - | Timeout: exceeded 60.0s |
-| q60 | ERROR | cross | - | StarExpansionError: Missing catalog metadata for default.public.ss |
-| q61 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q62 | ERROR | cross | - | ValueError: cannot orient join keys 'ws_warehouse_sk' / 'w_warehouse_sk' to a join side; neither resolves by qualifier or by column name |
-| q63 | ERROR | cross | - | StarExpansionError: Star expansion only supports base tables |
-| q64 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q65 | PASS | cross | 0 / 0 | rows and values match |
-| q66 | ERROR | cross | - | ArrowInvalid: Failed to parse string: 'DHL,BARIAN' as a scalar of type int64 |
-| q67 | ERROR | cross | - | StarExpansionError: Star expansion only supports base tables |
-| q68 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q69 | ERROR | cross | - | BindingError: Column 'c_current_addr_sk' not found in table 'c' |
-| q70 | ERROR | cross | - | UnsupportedSQLError: window functions are not allowed in WHERE |
-| q71 | ERROR | cross | - | ValueError: cannot orient join keys 'sold_item_sk' / 'i_item_sk' to a join side; neither resolves by qualifier or by column name |
-| q72 | ERROR | cross | - | ArrowNotImplementedError: Function 'add' has no kernel matching input types (timestamp[s], int64) |
-| q73 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q74 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q75 | ERROR | cross | - | ExpressionEvaluationError: Unsupported function: NULLIF |
-| q76 | ERROR | cross | - | ArrowInvalid: Decimal value does not fit in precision 7 |
-| q77 | ERROR | cross | - | OSError: Out of Memory Error: ArrowBuffer: failed to allocate 2097152 bytes |
-| q78 | ERROR | cross | - | ExpressionEvaluationError: Unsupported function: NULLIF |
-| q79 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q80 | ERROR | cross | - | InvalidInputException: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 16777216 bytes |
-| q81 | ERROR | cross | - | BindingError: Column 'c_current_addr_sk' not found in any table in scope |
-| q82 | PASS | cross | 0 / 0 | rows and values match |
-| q83 | ERROR | cross | - | OSError: Invalid Input Error: arrow_scan: get_next failed(): IOError: IOError: Out of Memory Error: ArrowBuffer: failed to allocate 134217728 bytes |
-| q84 | ERROR | cross | - | BindingError: Column 'c_current_addr_sk' not found in any table in scope |
-| q85 | ERROR | cross | - | BinderException: Binder Error: Referenced column "r_reason_desc" not found in FROM clause! |
-| q86 | ERROR | cross | - | ArrowInvalid: Decimal value does not fit in precision 7 |
-| q87 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in table 'customer' |
-| q88 | ERROR | cross | - | StarExpansionError: Star expansion only supports base tables |
-| q89 | ERROR | cross | - | StarExpansionError: Star expansion only supports base tables |
-| q90 | ERROR | cross | - | ExpressionEvaluationError: Unsupported function: NULLIF |
-| q91 | ERROR | cross | - | BindingError: Column 'c_customer_sk' not found in any table in scope |
-| q92 | ERROR | cross | - | BinderException: Binder Error: Referenced column "ws_ext_discount_amt" not found in FROM clause! |
-| q93 | PASS | cross | 0 / 0 | rows and values match |
-| q94 | ERROR | cross | - | ColumnResolutionError: Unresolved column reference ws1.ws_ext_ship_cost; relation exposes [('customer_address', 'ca_address_id'), ('customer_address', 'ca_address_sk'), ('customer_address', 'ca_city'), ('customer_address', 'ca_country'), ('customer_address', 'ca_county'), ('customer_address', 'ca_gmt_offset'), ('customer_address', 'ca_location_type'), ('customer_address', 'ca_state'), ('customer_address', 'ca_street_name'), ('customer_address', 'ca_street_number'), ('customer_address', 'ca_street_type'), ('customer_address', 'ca_suite_number'), ('customer_address', 'ca_zip'), ('date_dim', 'd_current_day'), ('date_dim', 'd_current_month'), ('date_dim', 'd_current_quarter'), ('date_dim', 'd_current_week'), ('date_dim', 'd_current_year'), ('date_dim', 'd_date'), ('date_dim', 'd_date_id'), ('date_dim', 'd_date_sk'), ('date_dim', 'd_day_name'), ('date_dim', 'd_dom'), ('date_dim', 'd_dow'), ('date_dim', 'd_first_dom'), ('date_dim', 'd_following_holiday'), ('date_dim', 'd_fy_quarter_seq'), ('date_dim', 'd_fy_week_seq'), ('date_dim', 'd_fy_year'), ('date_dim', 'd_holiday'), ('date_dim', 'd_last_dom'), ('date_dim', 'd_month_seq'), ('date_dim', 'd_moy'), ('date_dim', 'd_qoy'), ('date_dim', 'd_quarter_name'), ('date_dim', 'd_quarter_seq'), ('date_dim', 'd_same_day_lq'), ('date_dim', 'd_same_day_ly'), ('date_dim', 'd_week_seq'), ('date_dim', 'd_weekend'), ('date_dim', 'd_year'), ('web_site', 'web_city'), ('web_site', 'web_class'), ('web_site', 'web_close_date_sk'), ('web_site', 'web_company_id'), ('web_site', 'web_company_name'), ('web_site', 'web_country'), ('web_site', 'web_county'), ('web_site', 'web_gmt_offset'), ('web_site', 'web_manager'), ('web_site', 'web_market_manager'), ('web_site', 'web_mkt_class'), ('web_site', 'web_mkt_desc'), ('web_site', 'web_mkt_id'), ('web_site', 'web_name'), ('web_site', 'web_open_date_sk'), ('web_site', 'web_rec_end_date'), ('web_site', 'web_rec_start_date'), ('web_site', 'web_site_id'), ('web_site', 'web_site_sk'), ('web_site', 'web_state'), ('web_site', 'web_street_name'), ('web_site', 'web_street_number'), ('web_site', 'web_street_type'), ('web_site', 'web_suite_number'), ('web_site', 'web_tax_percentage'), ('web_site', 'web_zip'), ('ws1', 'ws_order_number'), ('ws1', 'ws_ship_addr_sk'), ('ws1', 'ws_ship_date_sk'), ('ws1', 'ws_warehouse_sk'), ('ws1', 'ws_web_site_sk')] |
-| q95 | ERROR | cross | - | Timeout: exceeded 60.0s |
-| q96 | ERROR | cross | - | BinderException: Binder Error: Referenced column "s_store_sk" not found in FROM clause! |
-| q97 | ERROR | cross | - | Timeout: exceeded 60.0s |
-| q98 | ERROR | cross | - | InternalException: INTERNAL Error: Failed to bind column reference "" [18.1] (bindings: {#[21.0], #[21.1], #[21.2], #[21.3], #[21.4], #[21.5], #[19.0], #[18.0]}) |
-| q99 | ERROR | cross | - | ValueError: cannot orient join keys 'cs_warehouse_sk' / 'w_warehouse_sk' to a join side; neither resolves by qualifier or by column name |
+Geomean ratio (engine/duck): 3.41x over 91 queries.
