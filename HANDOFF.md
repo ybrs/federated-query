@@ -107,8 +107,12 @@ past 2GiB spill to Arrow IPC via the DiskManager and stream back
 (Binding::Spilled, fedqrs de79b69); the q64 kill turned out to be the
 UNCAPPED DuckDB truth blowing the shared child's watchdog - references now
 run under DuckDB's own memory_limit (a79dd95). A region whose hash-join
-build exhausts the pool retries once with sort-merge joins (ee32346);
-upfront cost-based SMJ selection is the open refinement.
+build exhausts the pool retries once with sort-merge joins (ee32346), and
+- since planner estimates are ABSENT on aggregate intermediates - a region
+whose MEASURED input volume exceeds 8GiB picks spillable sort-merge joins
+upfront (LazyRegion.input_bytes, bb731d1): q78 13.7 -> 11.0s with no doomed
+first attempt, and only q78's region crosses the threshold so nothing
+regresses onto the slower path.
 
 STAGED TALLIES (52d9428): truth+oracle results are pure functions of the
 data, so `--mode save-refs` caches them once per scale
