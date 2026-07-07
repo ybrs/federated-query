@@ -374,6 +374,11 @@ class _Ctx:
         # emitted (and executed) ONCE; every later reference reuses the same
         # binding (the engine clones a shared binding until its last consumer).
         self.cte_bindings = {}
+        # Base relation bindings keyed by id(scan node), recorded as scans
+        # emit: a later reduction can collect its build keys from the base
+        # relation that ORIGINATES the key column instead of forcing a lazy
+        # join region into memory (see _collect_anchor).
+        self.scan_bindings = {}
 
 
 def build_ir(plan):
@@ -435,6 +440,7 @@ def _emit_source(node, ctx):
             "binding": binding,
         }
     )
+    ctx.scan_bindings[id(node)] = binding
     return binding
 
 
@@ -1178,14 +1184,58 @@ def _cardinality_probe(join):
 
 
 def _emit_reduced_inputs(ctx, build_child, probe_child, build_key_expr, probe_key_expr):
-    """Emit the build side, its distinct keys, and the injected probe scan."""
-    build_key = _physical_column_name(build_key_expr, build_child.column_aliases())
+    """Emit the build side, its distinct keys, and the injected probe scan.
+
+    The keys are collected from the base relation that ORIGINATES the build
+    key column when possible (a superset of the joined build side's keys -
+    the injection is only a reduction, so a superset is always correct); the
+    build subtree's own binding then stays LAZY and its region keeps
+    streaming. Only when the key column is not traceable to an emitted base
+    (renamed through projections) does the collection read the build binding
+    itself, forcing it.
+    """
     inject_col = _physical_column_name(probe_key_expr, probe_child.column_aliases())
     build_binding = _emit_build_side(ctx, build_child)
+    anchor = _collect_anchor(ctx, build_child, build_key_expr)
+    if anchor is None:
+        anchor_binding = build_binding
+        anchor_key = _physical_column_name(build_key_expr, build_child.column_aliases())
+    else:
+        anchor_binding, anchor_key = anchor
     keys_binding = ctx.names.binding()
-    _emit_collect_distinct(ctx, build_binding, build_key, keys_binding)
-    probe_binding = _emit_probe(ctx, probe_child, inject_col, keys_binding, build_key)
+    _emit_collect_distinct(ctx, anchor_binding, anchor_key, keys_binding)
+    probe_binding = _emit_probe(ctx, probe_child, inject_col, keys_binding, anchor_key)
     return build_binding, probe_binding
+
+
+def _collect_anchor(ctx, build_child, build_key_expr):
+    """(binding, physical column) of the base relation originating the build
+    key, or None when the build side IS a base relation already (its binding
+    serves directly) or the key is not traceable to an emitted base."""
+    if isinstance(build_child, (PhysicalScan, PhysicalRemoteQuery)):
+        return None
+    scan = _originating_relation(build_child, build_key_expr)
+    if scan is None:
+        return None
+    binding = ctx.scan_bindings.get(id(scan))
+    if binding is None:
+        return None
+    return binding, _physical_column_name(build_key_expr, scan.column_aliases())
+
+
+def _originating_relation(node, key_expr):
+    """The base scan / remote relation exposing the key column under the
+    key's own qualifier, or None when renames hide it. A relation alias is
+    unique within a query, so the first match is the only match."""
+    if isinstance(node, (PhysicalScan, PhysicalRemoteQuery)):
+        if (key_expr.table, key_expr.column) in node.column_aliases():
+            return node
+        return None
+    for child in node.children():
+        found = _originating_relation(child, key_expr)
+        if found is not None:
+            return found
+    return None
 
 
 def _emit_probe(ctx, probe_child, inject_col, keys_binding, build_key):
@@ -1229,6 +1279,7 @@ def _emit_build_scan(ctx, build_child, binding):
             "materialize": True,
         }
     )
+    ctx.scan_bindings[id(build_child)] = binding
 
 
 def _emit_collect_distinct(ctx, input_binding, key, binding):
