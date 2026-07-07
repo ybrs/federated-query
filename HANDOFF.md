@@ -209,8 +209,12 @@ OOMs:
    `FairSpillPool(32GB)` + default `DiskManager` behind EVERY SessionContext -
    `engine.rs` `runtime_env()` / `memory_capped_context()` (collect_distinct,
    run_fragment) and `connectors.rs` parquet_ctx. Tracked allocations fail
-   with ResourcesExhausted; sort + grouped aggregate spill to disk; joins do
-   not spill (DataFusion gap vs DuckDB, which spills everything).
+   with ResourcesExhausted. Spill support VERIFIED in the DF54 sources:
+   sort, grouped aggregate, NESTED-LOOP join (block-spill fallback), and
+   sort-merge join (buffered side) all spill via the default OsTmpDirectory
+   DiskManager; HASH JOIN builds and CROSS joins do NOT (they error). The
+   engine's own binding accumulation (fedq_collect) is accounted but has NO
+   spill path - that is where the SF10 memory wall lives.
 2. **Pool-tracked accumulation**: the pool alone did NOT catch q45 - operators
    only account their WORKING memory, and the exploding cross-join OUTPUT
    accumulated untracked. `collect_batches`/`collect_distinct` now stream via
