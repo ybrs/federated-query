@@ -38,56 +38,54 @@ coordinator. Deferred by request.
 
 ---
 
-## Current status (pg-dims, SF0.1)
+## Current status (pg-dims, SF0.1) - VERIFIED full 99-query tally 2026-07-07
 
-~`PASS 85 | MISMATCH 1 (q18) | ERROR ~14`. Last CLEAN full tally was PASS 81;
-the CROSS-join round then added q08/q13/q28/q88 (verified per-query). A full
-99-query tally was NOT re-run afterward ON PURPOSE - the remaining CROSS-join
-queries materialize huge cartesian products and OOMed the box on repeated full
-runs (see MEMORY section - the engine has no memory cap yet). Re-run only small
-`--only` subsets until the DataFusion memory pool below is wired.
+`PASS 86 | MISMATCH 1 (q18) | ERROR 12`, geomean 3.24x vs the federated
+DuckDB timing oracle over the 86 passing queries. Full runs are SAFE now (see
+the MEMORY section below); the tally above is from a complete 99-query run,
+not a per-query extrapolation. q48 left the OOM cluster and PASSES.
 
-Remaining ERROR clusters (by cause) - RuntimeError and window clusters GONE:
-- **CROSS-join OOM/timeout - ~4**: q45/q48/q10/q35 build a large cartesian
-  product. Their join condition is a DISJUNCTION with NO common conjunct
-  (q45: `(ca_zip IN ...) OR (i_item_id IN subquery)`), so factoring cannot lift
-  a hash key out; needs the memory pool (to fail cleanly) and/or disjunctive-
-  subquery decorrelation. q23 is a separate type_coercion.
-- **UnsupportedIR**: `PhysicalSingleRowGuard` (scalar-subquery guard, ~3) and a
-  few other physical nodes.
-- UnsupportedSQLError - 2 (simple CASE, window in WHERE - q70).
-- RuntimeError - 1 (q86: window combined with GROUPING()/ROLLUP, a DataFusion
-  physical-planner limitation).
+Remaining ERROR clusters (by cause):
+- **Memory-killed - 3**: q10/q35/q45 build a large cartesian product and are
+  killed cleanly by the harness 12GB watchdog (exit 137). Their join condition
+  is a DISJUNCTION with NO common conjunct (q45: `(ca_zip IN ...) OR
+  (i_item_id IN subquery)`), so factoring cannot lift a hash key out; passing
+  them needs disjunctive-subquery decorrelation.
+- **UnsupportedIR - 5**: `PhysicalSingleRowGuard` (scalar-subquery cardinality
+  guard) has no IR emitter - q06/q14/q44/q54/q58.
+- UnsupportedSQLError - 2 (q39 simple CASE, q70 window in WHERE).
+- RuntimeError - 2 (q23 type_coercion; q86 window combined with
+  GROUPING()/ROLLUP, a DataFusion physical-planner limitation).
 
-## MEMORY - cap every run; DataFusion has NO limit today (DO THIS FIRST)
+## MEMORY - DONE 2026-07-07 (fedqrs commit 5f62deb); full runs are safe
 
-The engine creates `SessionContext::new()` per fragment with NO runtime config,
-so DataFusion has NO memory limit. A CROSS-join query (q45/q48/q10/q35) that
-materializes a huge cartesian product allocates faster than the harness RSS
-watchdog polls, so it can OOM the whole server. DO NOT run the full 99-query
-tally until this is fixed; use `--only <subset>`.
+It took THREE pieces, and the third was the actual root cause of the server
+OOMs:
 
-Environment facts (checked 2026-07-07):
-- No cgroup cap possible without root: cgroup v2 is mounted but /sys/fs/cgroup
-  is root-owned and READ-ONLY, we are in the root cgroup `0::/` with no
-  delegation (mkdir child cgroup = "Read-only file system"). `cgexec` and
-  `systemd-run` are both MISSING. `prlimit`/`ulimit -v` exist but cap VIRTUAL
-  address space per-process (RLIMIT_AS), which the Rust engine over-reserves -
-  the reason the harness uses an RSS watchdog, not RLIMIT_AS.
+1. **Shared 32GB pool** (hardcoded by request): one `RuntimeEnv` with
+   `FairSpillPool(32GB)` + default `DiskManager` behind EVERY SessionContext -
+   `engine.rs` `runtime_env()` / `memory_capped_context()` (collect_distinct,
+   run_fragment) and `connectors.rs` parquet_ctx. Tracked allocations fail
+   with ResourcesExhausted; sort + grouped aggregate spill to disk; joins do
+   not spill (DataFusion gap vs DuckDB, which spills everything).
+2. **Pool-tracked accumulation**: the pool alone did NOT catch q45 - operators
+   only account their WORKING memory, and the exploding cross-join OUTPUT
+   accumulated untracked. `collect_batches`/`collect_distinct` now stream via
+   `collect_tracked()` (engine.rs), charging every accumulated batch to the
+   pool via `MemoryConsumer.try_grow`.
+3. **GIL release in `execute_ir`** (lib.rs): the old entry held the GIL for
+   the entire native run, so the harness RSS-watchdog THREAD was frozen during
+   every Rust blowup and could never fire in flight - THIS is how full runs
+   OOMed the box despite the watchdog. `engine::execute` now returns
+   `(SchemaRef, Vec<RecordBatch>)` and runs under `py.allow_threads`; the
+   Arrow FFI export (raw pointers, not Send) is built back under the GIL.
+   Verified: q45 dies at the 12GB watchdog with a clean exit-137 ERROR.
 
-Proper fix (in-engine, no root): configure a DataFusion `RuntimeEnv`:
-- `RuntimeEnvBuilder::new().with_memory_pool(Arc::new(FairSpillPool::new(LIMIT)))`
-  + default `DiskManager`, then `SessionContext::new_with_config_rt(cfg, rt)` for
-  EVERY context (engine.rs run_fragment ~417/439). Make LIMIT an env var
-  (e.g. FEDQRS_MEMORY_LIMIT, default ~a safe fraction of RAM).
-- Effect: memory-aware operators reserve from the pool and fail with
-  ResourcesExhausted instead of OOMing. DataFusion SPILLS sort + grouped
-  aggregate to disk (may let some big queries succeed); it does NOT spill hash
-  or nested-loop/CROSS joins (they error) - a real gap vs DuckDB, which spills
-  everything. So cross-join queries fail cleanly (still ERROR, but no OOM).
-- Caveat: the pool is COOPERATIVE accounting (tracks operator working memory,
-  not accumulated bindings), so it is not a hard kernel cap - but it covers the
-  join blowups that bit us.
+Environment facts (still true, for reference): no cgroup cap without root
+(cgroup v2 mounted read-only, root cgroup `0::/`, no delegation; `cgexec` and
+`systemd-run` missing). `prlimit`/`ulimit -v` cap VIRTUAL address space
+(RLIMIT_AS), which the Rust engine over-reserves - the reason the harness uses
+an RSS watchdog, not RLIMIT_AS.
 
 ## CROSS join + disjunction factoring (this round)
 
