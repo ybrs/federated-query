@@ -9,44 +9,31 @@ Test suite: **1240 passed, 3 skipped, 32 xfailed** (`POSTGRES_DB=duckpoc
 
 ---
 
-## OPEN ISSUES (investigate next)
+## OPEN ISSUES
 
-### q18: avg(decimal) differs by 0.01 cross-source - SUSPECTED TYPE CONVERSION
-
-The one remaining MISMATCH. `q18` computes `avg(cast(<col> AS decimal(12,2)))`
-under `GROUP BY ROLLUP(...)`; a ROLLUP subtotal row differs from pure DuckDB by
-0.01 in the last decimal (e.g. agg2 `206.98` vs `206.99`, agg5 `-1022.42` vs
-`-1022.41`).
-
-NOT floating-point summation order: for float64 that effect is ~1e-10 on these
-magnitudes, far below 0.01. The size points to a **precision/type-conversion
-bug** - a decimal likely narrowed to float32 (or a scale truncated) somewhere in
-the CROSS-SOURCE aggregation path. Evidence gathered:
-- Single-source the engine matches DuckDB bit-for-bit: `avg(cast(cs_list_price
-  AS decimal(12,2)))` over `catalog_sales` = `100.99702512344902` on both.
-- The 0.01 gap appears only cross-source (fact on DuckDB, dims on Postgres,
-  avg computed at the coordinator / DataFusion).
-- Engine avg output type is `double`; DuckDB's `avg(cast(... as decimal))` is
-  also `DOUBLE`. Result is deterministic run-to-run.
-- Reproduce: `run_federated.py --scale-factor 0.1 --placements pg-dims --only 18`
-  (correctness is vs pure DuckDB, so this is a real engine-vs-DuckDB diff).
-
-Where to look: the type carried for the fetched decimal columns across the
-Postgres/ADBC boundary and into the DataFusion aggregate (float32 vs float64 vs
-decimal); the `cast(... AS decimal(12,2))` rendering in the pushed SQL vs at the
-coordinator. Deferred by request.
+None. q18 is RESOLVED 2026-07-07 (commit 05b1dcd) and was never an engine
+bug: the raw values are engine `206.98499999999999` vs oracle `206.985` -
+diff 1.4e-14, pure float64 summation ORDER (a distributed plan and a single
+engine sum in different orders) sitting exactly on a cent rounding boundary.
+The comparator's fixed-decimal rounding AMPLIFIED the last-bit difference
+into a visible cent (the earlier "not summation order, that effect is
+~1e-10, far below 0.01" analysis missed that the COMPARISON does the
+amplifying). Fix: compare.py matches cells whose rounded forms agree OR that
+sit within a TIGHT relative tolerance (1e-9); real value bugs differ by far
+more and still fail (pinned by tests/test_tpcds_compare.py).
 
 ---
 
 ## Current status (pg-dims, SF0.1) - VERIFIED full 99-query tally 2026-07-07
 
-`PASS 98 | MISMATCH 1 (q18) | ERROR 0` - the ERROR column is CLOSED. Geomean
-3.47x vs the federated DuckDB timing oracle over the 98 passing queries.
-Suite: 1264 passed, 3 skipped, 25 xfailed. Reports are commit-named under
+`PASS 99 | MISMATCH 0 | ERROR 0` - EVERY TPC-DS query passes federated.
+Geomean 3.44x vs the federated DuckDB timing oracle. Suite: 1269 passed,
+3 skipped, 25 xfailed. Reports are commit-named under
 `benchmarks/tpcds/reports/` (like tpch).
 
-The only remaining failure of any kind is the q18 MISMATCH (0.01
-avg-of-decimal on ROLLUP subtotals) - open, deferred; see OPEN ISSUES.
+TPC-H regression check 2026-07-07 (report-result-9a28f39.md): fedpgduck SF1
+22/22 correct, 2145ms vs 1125ms = 1.91x - no regression vs the previous
+report's 1.97x (5f123d0); the TPC-DS rounds did not open a gap.
 
 ## Disjunctive decorrelation - Phase 1 DONE 2026-07-07 (commit 1767f60)
 
