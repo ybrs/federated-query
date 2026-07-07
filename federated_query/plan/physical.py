@@ -786,7 +786,7 @@ class PhysicalProjection(PhysicalPlanNode):
                         fields.append(field)
                 else:
                     field_type = _column_ref_type(
-                        expr, input_schema, self.column_aliases()
+                        expr, input_schema, self.input.column_aliases()
                     )
                     fields.append(pa.field(self.output_names[i], field_type))
             else:
@@ -799,7 +799,9 @@ class PhysicalProjection(PhysicalPlanNode):
         self, expr: Expression, input_schema: pa.Schema
     ) -> pa.DataType:
         """Infer a computed expression's Arrow type via the shared evaluator."""
-        return _evaluate_expression_type(expr, input_schema, self.column_aliases())
+        return _evaluate_expression_type(
+            expr, input_schema, self.input.column_aliases()
+        )
 
     def estimated_cost(self) -> float:
         # Cost is input cost + projection cost
@@ -809,7 +811,26 @@ class PhysicalProjection(PhysicalPlanNode):
         return f"PhysicalProjection({len(self.expressions)} exprs)"
 
     def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
-        return self.input.column_aliases()
+        """This projection's OUTPUT columns: a reference resolves to an output by
+        its name, or by the source column of a passthrough expression.
+
+        NOT the input's aliases: a projection that DROPS columns must not expose
+        them, and a passthrough of a renamed column - a self-join collision
+        column physically named right_customer_id, projected under the clean
+        output name customer_id - must resolve to the OUTPUT name. A sort above
+        the projection otherwise named the vanished input column and failed
+        (q04). The projection's OWN expressions are typed against
+        self.input.column_aliases(), since they reference input columns.
+        """
+        from .expressions import ColumnRef
+
+        aliases: Dict[Tuple[Optional[str], str], str] = {}
+        for index, expr in enumerate(self.expressions):
+            name = self.output_names[index]
+            aliases[(None, name)] = name
+            if isinstance(expr, ColumnRef) and expr.column != "*":
+                aliases[(expr.table, expr.column)] = name
+        return aliases
 
 
 class PhysicalWindow(PhysicalPlanNode):

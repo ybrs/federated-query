@@ -200,6 +200,27 @@ def test_cross_source_intersect(engine):
     _assert_parity(qe, datasources, sql)
 
 
+def test_sort_over_projection_of_renamed_self_join(engine):
+    """ORDER BY a self-join-renamed column that a dropping projection passes
+    through must sort by the OUTPUT column, not the vanished physical source.
+
+    The union self-join renames b's columns to right_*; the SELECT drops every
+    column but b.nm (output nm) and orders by it. The projection's column_aliases
+    must expose (b, nm) -> nm, not leak the input's right_nm (the q04 failure:
+    the sort named right_nm, gone after the projection).
+    """
+    qe, datasources = engine
+    union = (
+        f"SELECT n_regionkey AS k, n_name AS nm FROM srcA.{SCHEMA}.nation "
+        f"UNION ALL SELECT r_regionkey, r_name FROM srcB.{SCHEMA}.region"
+    )
+    sql = (
+        f"WITH u AS ({union}) "
+        f"SELECT b.nm AS nm FROM u a JOIN u b ON a.k = b.k ORDER BY b.nm"
+    )
+    _assert_parity(qe, datasources, sql)
+
+
 def test_cross_source_join_with_pushed_filter(engine):
     qe, datasources = engine
     sql = (
