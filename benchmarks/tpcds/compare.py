@@ -49,10 +49,50 @@ def _normalize_rows(rows, decimals):
     return normalized
 
 
-def _first_differing_index(engine_norm, oracle_norm):
+def _numeric_close(left, right):
+    """Whether two numeric cells differ only by float summation noise.
+
+    A float64 aggregate's last bits depend on summation ORDER (a distributed
+    plan and a single-engine plan sum in different orders), and the
+    fixed-decimal rounding AMPLIFIES a last-bit difference sitting exactly on
+    a rounding boundary into a visible cent: q18's ROLLUP subtotal is engine
+    206.98499999999999 vs oracle 206.985 (diff 1.4e-14), rounded to 206.98 vs
+    206.99. Values within this TIGHT relative tolerance are the same number
+    for correctness purposes; a real value bug (wrong rows, dropped rounding,
+    a wrong scale) differs by far more than 1e-9 relative.
+    """
+    if not isinstance(left, (int, float, Decimal)) or isinstance(left, bool):
+        return False
+    if not isinstance(right, (int, float, Decimal)) or isinstance(right, bool):
+        return False
+    left_float = float(left)
+    right_float = float(right)
+    return abs(left_float - right_float) <= 1e-9 * max(
+        1.0, abs(left_float), abs(right_float)
+    )
+
+
+def _cells_equal(engine_value, oracle_value, decimals):
+    """Whether two cells match: by rounded form, or within numeric tolerance."""
+    engine_norm = _normalize_value(engine_value, decimals)
+    oracle_norm = _normalize_value(oracle_value, decimals)
+    if engine_norm == oracle_norm:
+        return True
+    return _numeric_close(engine_value, oracle_value)
+
+
+def _rows_equal(engine_row, oracle_row, decimals):
+    """Whether two rows match cell-for-cell."""
+    for engine_value, oracle_value in zip(engine_row, oracle_row):
+        if not _cells_equal(engine_value, oracle_value, decimals):
+            return False
+    return True
+
+
+def _first_differing_index(engine_rows, oracle_rows, decimals):
     """Return the index of the first row that differs, or -1 if all match."""
-    for index in range(len(engine_norm)):
-        if engine_norm[index] != oracle_norm[index]:
+    for index in range(len(engine_rows)):
+        if not _rows_equal(engine_rows[index], oracle_rows[index], decimals):
             return index
     return -1
 
@@ -78,9 +118,9 @@ def compare_results(engine_rows, oracle_rows, decimals=2):
             len(engine_rows), len(oracle_rows)
         )
         return False, reason
-    engine_norm = _normalize_rows(engine_rows, decimals)
-    oracle_norm = _normalize_rows(oracle_rows, decimals)
-    index = _first_differing_index(engine_norm, oracle_norm)
+    index = _first_differing_index(engine_rows, oracle_rows, decimals)
     if index == -1:
         return True, ""
+    engine_norm = _normalize_rows(engine_rows, decimals)
+    oracle_norm = _normalize_rows(oracle_rows, decimals)
     return False, _describe_difference(index, engine_norm, oracle_norm)
