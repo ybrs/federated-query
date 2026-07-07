@@ -129,11 +129,26 @@ by probe urgency (known size, statless remote = infinite, composites derive
 from traced bases). q05 15.4s (pre-round) -> 0.6s, q58 -> 0.3s, q79 ->
 0.4s, q39 -> 2.4s, q70 -> 1.4s.
 
-CURRENT BOARD 2026-07-07 evening: SF10 totals 111.0s vs 71.4s (1.56x),
-geomean 2.11x, PASS 99|0|0; SF0.1 99|0|0 (2.37x geo), SF1 99|0|0 (1.92x
-geo); TPC-H fedpgduck 22/22 at 1.72x - best yet. Remaining SF10 ratio
-outliers: q31 19x, q44 17x, q33/q56/q60 (item-list channel unions) 10-15x,
-q03 13x, q06 11x, q78 10.9x absolute 13.5s (SMJ path).
+CTE UNION-FILTER PUSHDOWN (b000bfc, optimizer/cte_union_filter.py +
+tests/test_cte_union_filter.py): the OR of every consumer's filter enters
+the shared body, translated onto the top aggregate's GROUPING columns
+(constant tags substitute their literal per union branch; untranslatable
+conjuncts drop from their arm; bare consumers / recursive / DISTINCT ON /
+grouping sets decline; idempotent by predicate-already-embedded check).
+q31 3.6s -> 0.9s, q04 12.9 -> 4.6s, q11 7.2 -> 2.8s, q78 13.0 -> 8.2s.
+
+BEST-CANDIDATE INJECTION (095ce62): a plan-level pre-pass scores reduction
+candidates per traced base (build output estimate = donated keys); the
+winner's keys inject instead of the first-emitted join's (q33 had injected
+90k address keys and left January's 31 date keys unused). q33 2.6 -> 1.2s,
+q56 2.3 -> 1.3s, q60 1.8 -> 1.3s.
+
+CURRENT BOARD 2026-07-08: SF10 totals 84.9s vs 71.4s (1.19x!), geomean
+1.87x, PASS 99|0|0; SF1 99|0|0 totals 1.59x geo 1.76x; SF0.1 99|0|0 geo
+2.32x; TPC-H fedpgduck 22/22 at 1.73x. 17 queries beat DuckDB at SF10
+(q72 0.22x). Remaining ratio outliers: q44 17x (rank islands - window
+machinery, no dim filter exists), q06 11x, q70 7.2x, q46/q68 ~6.6x, q39
+5.8x, q78 5.7x absolute 7.1s (largest absolute; SMJ region).
 
 STAGED TALLIES (52d9428): truth+oracle results are pure functions of the
 data, so `--mode save-refs` caches them once per scale
