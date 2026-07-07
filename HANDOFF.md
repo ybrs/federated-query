@@ -100,7 +100,22 @@ IDENTICAL), q65/q71 tie on their whole key lists. Ties are legitimately
 unordered; a mis-sort under ORDER BY..LIMIT still changes the surviving
 set and fails.
 
-Three MISMATCH-free scales now: SF0.1 99/0/0, SF1 99/0/0, SF10 95/0/4.
+CLEAN SWEEP AT ALL THREE SCALES 2026-07-07 (post fragment fusion +
+spilled bindings + reference caps): SF0.1 99|0|0, SF1 99|0|0, SF10 99|0|0
+(report-result-99bd6a4.md; SF10 geomean 2.28x). Phase C details: bindings
+past 2GiB spill to Arrow IPC via the DiskManager and stream back
+(Binding::Spilled, fedqrs de79b69); the q64 kill turned out to be the
+UNCAPPED DuckDB truth blowing the shared child's watchdog - references now
+run under DuckDB's own memory_limit (a79dd95). A region whose hash-join
+build exhausts the pool retries once with sort-merge joins (ee32346);
+upfront cost-based SMJ selection is the open refinement.
+
+STAGED TALLIES (52d9428): truth+oracle results are pure functions of the
+data, so `--mode save-refs` caches them once per scale
+(data/references_sf<sf>.duckdb), `--mode engine` runs only the engine
+(results to data/engine_results_sf<sf>/*.csv), `--mode compare` verifies in
+~1s for all 99 queries. Iterating on the engine no longer pays the
+hour-long three-engine tally.
 
 SF1 also exposed a REAL bug, fixed (fedqrs 83ca5cb): two pg read paths
 could return a binding whose declared schema disagreed with its executed
