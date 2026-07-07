@@ -200,6 +200,23 @@ def test_cross_source_intersect(engine):
     _assert_parity(qe, datasources, sql)
 
 
+def test_cross_source_sum_of_decimal(engine):
+    """A cross-source SUM over a decimal column materializes correctly.
+
+    DataFusion widens SUM's decimal precision (Decimal(17,2) -> Decimal(27,2)),
+    so its logical df.schema() disagrees with the executed batch schema; the
+    aggregate binding must carry the batch's actual schema or registering it as a
+    MemTable is rejected ('Mismatch between schema and batches'; q16/q94/q95).
+    """
+    qe, datasources = engine
+    sql = (
+        f"SELECT r.r_name, sum(n.n_amount) AS total "
+        f"FROM srcA.{SCHEMA}.nation n JOIN srcB.{SCHEMA}.region r "
+        f"ON n.n_regionkey = r.r_regionkey GROUP BY r.r_name"
+    )
+    _assert_parity(qe, datasources, sql)
+
+
 def test_sort_over_projection_of_renamed_self_join(engine):
     """ORDER BY a self-join-renamed column that a dropping projection passes
     through must sort by the OUTPUT column, not the vanished physical source.

@@ -620,7 +620,6 @@ class TestQuantifiedComplexQueries:
         results = execute_and_fetch_all(executor, decorrelated_plan)
         assert len(results) >= 0, "Query should execute successfully"
 
-    @pytest.mark.xfail(reason="fedqrs gap: Mismatch between schema and batches", strict=False)
     def test_all_in_select_list_boolean(self, catalog, setup_test_data):
         """
         Test: ALL comparison used as boolean in SELECT list.
