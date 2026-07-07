@@ -10,7 +10,15 @@ q05 ships 28.8M+14.4M+7.2M rows then filters to 14 days; q39 ships 133M
 inventory rows then filters to 52 dates; q58 ships three full facts for a
 one-week domain.
 
-ASCII only. Status: IN PROGRESS.
+ASCII only. Status: DONE (phases A+2 + orientation urgency). Results:
+- SF10: totals 127.5 -> 111.0s (1.56x vs duck), geomean 2.17 -> 2.11x,
+  PASS 99|0|0. q05 15.4s (pre-round) -> 0.6s, q58 2.8s -> 0.3s, q79 2.9s
+  -> 0.4s, q39 7.2 -> 2.4s, q70 3.7 -> 1.4s.
+- TPC-H fedpgduck SF1: 22/22 at 1.72x - best yet (regression q21 fixed by
+  statless-island urgency; see bb08eef).
+- SF0.1 / SF1: 99|0|0 at 2.37x / 1.92x geomean.
+Remaining SF10 ratio outliers: q31 19x, q44 17x, q33/q56/q60 (item-list
+channel unions) 10-15x, q03 13x, q06 11x, q78 10.9x absolute 13.5s.
 
 ## Diagnosis (profiles + join shapes, SF10)
 
