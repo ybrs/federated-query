@@ -40,22 +40,47 @@ coordinator. Deferred by request.
 
 ## Current status (pg-dims, SF0.1) - VERIFIED full 99-query tally 2026-07-07
 
-`PASS 86 | MISMATCH 1 (q18) | ERROR 12`, geomean 3.24x vs the federated
-DuckDB timing oracle over the 86 passing queries. Full runs are SAFE now (see
-the MEMORY section below); the tally above is from a complete 99-query run,
-not a per-query extrapolation. q48 left the OOM cluster and PASSES.
+`PASS 91 | MISMATCH 1 (q18) | ERROR 7`, geomean 3.41x vs the federated
+DuckDB timing oracle over the 91 passing queries. Full runs are SAFE (see the
+MEMORY section below); the tally is from a complete 99-query run. Suite:
+1251 passed, 3 skipped, 26 xfailed.
 
 Remaining ERROR clusters (by cause):
-- **Memory-killed - 3**: q10/q35/q45 build a large cartesian product and are
-  killed cleanly by the harness 12GB watchdog (exit 137). Their join condition
-  is a DISJUNCTION with NO common conjunct (q45: `(ca_zip IN ...) OR
-  (i_item_id IN subquery)`), so factoring cannot lift a hash key out; passing
-  them needs disjunctive-subquery decorrelation.
-- **UnsupportedIR - 5**: `PhysicalSingleRowGuard` (scalar-subquery cardinality
-  guard) has no IR emitter - q06/q14/q44/q54/q58.
+- **ResourcesExhausted - 3**: q10/q35/q45 build a large cartesian product and
+  now fail CLEANLY from the DataFusion 32GB pool itself ("Failed to allocate
+  ... fedq_collect ... fair(pool_size: 32.0 GB)") - no watchdog kill needed.
+  Their join condition is a DISJUNCTION with NO common conjunct (q45:
+  `(ca_zip IN ...) OR (i_item_id IN subquery)`), so factoring cannot lift a
+  hash key out; passing them needs disjunctive-subquery decorrelation.
 - UnsupportedSQLError - 2 (q39 simple CASE, q70 window in WHERE).
 - RuntimeError - 2 (q23 type_coercion; q86 window combined with
   GROUPING()/ROLLUP, a DataFusion physical-planner limitation).
+
+## Scalar-subquery cardinality guard - DONE 2026-07-07 (q06/q14/q44/q54/q58)
+
+fedqrs commit c33e9c8 + federated-query commit 8fdf1ff. The former
+`PhysicalSingleRowGuard UnsupportedIR` cluster is gone. It took the guard
+PLUS two upstream correctness bugs its runtime check exposed:
+
+- **`single_row_guard` fragment** (fedqrs ir.rs/engine.rs; emitter in
+  rust_ir.py): keyless = at most one row in TOTAL, keyed = at most one row
+  per distinct key tuple. Violation = "Scalar subquery produced more than one
+  row" (probe: `SELECT 1 FROM in_0 [GROUP BY keys] HAVING count(*) > 1`);
+  otherwise the input passes through unchanged.
+- **Subquery DISTINCT was silently dropped** (decorrelation.py
+  `_peel_values_top`): peeling `SELECT DISTINCT v` into bare value
+  expressions lost the flag, so q06's single-valued subquery fed 31 rows to
+  the guard. An uncorrelated DISTINCT projection now stays whole as the value
+  relation (`_peel_distinct_projection`); a correlated one fails fast.
+- **Stacked-projection SELECT overwrite** (single_source_pushdown.py
+  `_absorb_projection`): the inner projection's `_set_select` clobbered the
+  outer rename (q54: `SELECT DISTINCT d_month_seq+1` lost its rename to
+  `__subq_0_v0`). A stack now collapses only as a bijective pure-column
+  rename (inner exprs under OUTER aliases, DISTINCT kept); anything else
+  declines to the merge engine; a second SELECT list is refused outright.
+- Also fixed alongside: cross-source `SELECT DISTINCT` silently returned
+  duplicates (project fragment now carries `distinct`), and
+  `IS [NOT] DISTINCT FROM` is in the IR operator vocabulary.
 
 ## MEMORY - DONE 2026-07-07 (fedqrs commit 5f62deb); full runs are safe
 
@@ -72,7 +97,11 @@ OOMs:
    only account their WORKING memory, and the exploding cross-join OUTPUT
    accumulated untracked. `collect_batches`/`collect_distinct` now stream via
    `collect_tracked()` (engine.rs), charging every accumulated batch to the
-   pool via `MemoryConsumer.try_grow`.
+   pool via `MemoryConsumer.try_grow`. NOTE: `project_dataframe` (the collect
+   path of project/hash-join/nested-loop fragments) initially kept a plain
+   `collect()` and still evaded the pool; it now goes through
+   `collect_tracked` too (commit c33e9c8), which is why q10/q35/q45 die from
+   the pool rather than the watchdog.
 3. **GIL release in `execute_ir`** (lib.rs): the old entry held the GIL for
    the entire native run, so the harness RSS-watchdog THREAD was frozen during
    every Rust blowup and could never fire in flight - THIS is how full runs
