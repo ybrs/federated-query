@@ -112,7 +112,15 @@ build exhausts the pool retries once with sort-merge joins (ee32346), and
 whose MEASURED input volume exceeds 8GiB picks spillable sort-merge joins
 upfront (LazyRegion.input_bytes, bb731d1): q78 13.7 -> 11.0s with no doomed
 first attempt, and only q78's region crosses the threshold so nothing
-regresses onto the slower path.
+regresses onto the slower path. The per-binding 2GiB spill threshold then
+turned out to TAX big-fact queries with disk I/O the box never needed (q05
+3.8 -> 15.4s re-reading a spilled store_sales) - replaced by a 16GiB budget
+on the SUM of resident bindings with largest-first eviction (81bd44c): q05
+back to 3.7s, q39 7.2s (better than pre-fusion), q64 halved to 7.2s.
+CURRENT SF10 BOARD: totals 127.5s vs duck 71.4s (1.79x), geomean 2.17x, 18
+queries faster than DuckDB, PASS 99|0|0. Remaining ratio outliers (q05 24x,
+q70 20x, q39/q58/q31/q06/q44 ~17x, q78 10.5x absolute 13s) are genuine
+plan-quality gaps, not memory artifacts.
 
 STAGED TALLIES (52d9428): truth+oracle results are pure functions of the
 data, so `--mode save-refs` caches them once per scale
