@@ -71,11 +71,19 @@ vs 55s (2.14x) - NO global blowup (q72 runs at 0.39x, 2.5x FASTER than
 DuckDB). Suite: 1278 passed.
 
 THE TWO REAL SF10 FINDINGS:
-1. **Memory wall - 4 ERRORs**: q23/q67/q78 exhaust the 32GB pool in
-   fedq_collect; q64 hits the 40GB RSS watchdog. The engine fully
-   MATERIALIZES every fragment result and every source read as an Arrow
-   binding; DuckDB streams and spills. Fixing means spillable/streamed
-   bindings or aggressive pre-reduction - an architecture item, not a tweak.
+1. **Memory wall - RESOLVED 3 of 4 by fragment fusion, MERGED 2026-07-07**
+   (fragment-fusion-plan.md; fedqrs d8b5fff/ee32346, rust_ir beae016):
+   Binding::Lazy(LogicalPlan) composes merge fragments into ONE streaming
+   DataFusion execution per pipeline region (forced only at key collection,
+   multi-consumers, the guard, and the return); reductions collect keys from
+   the ORIGINATING base scan when traceable; and a region whose hash-join
+   build exhausts the pool (the one non-spilling operator) retries ONCE with
+   sort-merge joins, which spill (match the error chain ROOT - exhaustion
+   arrives wrapped). SF10 95|0|4 -> 98|0|1: q23 6.1s/2.05x, q67 3.8s/0.63x
+   (FASTER than DuckDB), q78 13.7s via the retry. SF0.1 geomean 2.39 ->
+   2.34x, TPC-H 1.91 -> 1.82x. q64 remains: RSS from MemTable-resident
+   SOURCE bindings the pool never sees - Phase C (streaming/spillable source
+   bindings) is the open item.
 2. **A super-linear family** whose ratio grows at every scale step
    (SF0.1 -> SF1 -> SF10): q05 4.5->9.3->24.3x, q39 2.7->11.3->19.2x,
    q06 2.6->5.3->19.8x, q31 3.3->3.8->19.5x, q58 ->16.9x, q79 ->15.3x,
