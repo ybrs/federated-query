@@ -1323,7 +1323,7 @@ def _orient_join(join):
         # KNOWN estimate - the reduction exists to cut the big read, and an
         # unknown side cannot be known big (q58: fact-x-item est 28.8M vs
         # date_dim-x-subquery est None flipped to the useless direction).
-        if _known_rows(join.left) > _known_rows(join.right):
+        if _probe_urgency(join.left) > _probe_urgency(join.right):
             return join.right, join.left, join.right_keys[0], join.left_keys[0]
         return join.left, join.right, join.left_keys[0], join.right_keys[0]
     if right_rank > left_rank:
@@ -1333,9 +1333,32 @@ def _orient_join(join):
 
 def _known_rows(node) -> int:
     """estimated_rows when threaded, else -1: an unknown side cannot be
-    known big, so a known-big side wins the probe role."""
+    known big, so a known-big side wins the probe role.
+
+    A remote query with no threaded output estimate still exposes its base
+    domains: the widest column NDV is its size floor (an island exposing a
+    1.5M-NDV order key cannot be small - TPC-H q21's lineitem self-join
+    island lost its estimate and a 10k-supplier island out-sized it,
+    flipping the reduction backwards)."""
     rows = getattr(node, "estimated_rows", None)
+    if rows is None and isinstance(node, PhysicalRemoteQuery):
+        ndv_map = getattr(node, "column_ndv", None)
+        if ndv_map:
+            rows = max(ndv_map.values())
     return -1 if rows is None else rows
+
+
+def _probe_urgency(node) -> int:
+    """How much a side needs to be the reduced probe: its known size floor,
+    or effectively infinite for a remote island carrying NO statistics at
+    all - the cost model could not see through it, and an unjudgeable
+    island read whole is exactly the risk the reduction exists to remove
+    (TPC-H q21's lineitem self-join island has no stats; the judgeable
+    10k-supplier island must not out-rank it)."""
+    rows = _known_rows(node)
+    if rows < 0 and isinstance(node, PhysicalRemoteQuery):
+        return 1 << 62
+    return rows
 
 
 def _cardinality_probe(join):
