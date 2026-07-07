@@ -516,9 +516,12 @@ def _append_star_items(items, input_node, input_name):
 
 def _emit_aggregate(node, ctx):
     """A GROUP BY (or GROUPING SETS) over its single input, as an `aggregate`
-    fragment."""
+    fragment - or, when an output carries a window function (which the structured
+    fragment cannot express), as a rendered `SELECT ... GROUP BY` raw_sql."""
     child = _emit(node.input, ctx)
     aliases = node.input.column_aliases()
+    if node.has_window_output():
+        return _raw_sql_step(ctx, node._aggregate_sql(aliases), {"in_0": child})
     fragment = ctx.names.fragment()
     ctx.fragments[fragment] = _aggregate_fragment(node, aliases)
     return _merge_step(ctx, fragment, {"in_0": child})

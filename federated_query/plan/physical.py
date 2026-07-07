@@ -75,6 +75,22 @@ _DYNAMIC_FILTER_MAX_KEYS = 2000
 # Name under which a window operator's input is registered when its rendered SQL
 # runs as a Rust ``raw_sql`` fragment.
 _MERGE_WINDOW_RELATION = "in_window"
+# Name under which a window-bearing aggregate registers its single input; its
+# rendered SELECT ... GROUP BY runs as a Rust ``raw_sql`` fragment. Matches the
+# input key rust_ir registers for the aggregate.
+_MERGE_AGGREGATE_RELATION = "in_0"
+
+
+def _expression_contains_window(expr) -> bool:
+    """Whether an expression tree contains a WindowExpr at any depth."""
+    from .expressions import WindowExpr, expression_children
+
+    if isinstance(expr, WindowExpr):
+        return True
+    for child in expression_children(expr):
+        if _expression_contains_window(child):
+            return True
+    return False
 # Name under which a grouped-limit registers its single input, plus the synthetic
 # columns its rendered SQL adds: a row-order index (stable tiebreak) and the
 # per-key row number.
@@ -1453,6 +1469,38 @@ class PhysicalHashAggregate(PhysicalPlanNode):
 
     def __repr__(self) -> str:
         return f"PhysicalHashAggregate(groups={len(self.group_by)}, aggs={len(self.aggregates)})"
+
+    def has_window_output(self) -> bool:
+        """Whether an output expression carries a window function.
+
+        A window over grouped aggregates (sum(sum(x)) OVER (...) ... GROUP BY ...)
+        is valid SQL but the structured aggregate fragment cannot express it, so
+        such an aggregate is emitted through _aggregate_sql instead.
+        """
+        for expr in self.aggregates:
+            if _expression_contains_window(expr):
+                return True
+        return False
+
+    def _aggregate_sql(self, aliases) -> str:
+        """Render ``SELECT <outputs> FROM in_0 [GROUP BY <keys>]`` for the merge
+        engine, used when an output carries a window (see has_window_output).
+
+        DataFusion evaluates the window over the grouped aggregates directly;
+        columns resolve to their physical merge-relation names via MergeResolver,
+        the same lowering PhysicalWindow uses.
+        """
+        resolver = MergeResolver(aliases)
+        select_list = clauses.select_expressions_fragment(
+            self.aggregates, self.output_names, resolver, dialect="duckdb"
+        )
+        sql = f"SELECT {select_list} FROM {_MERGE_AGGREGATE_RELATION}"
+        group = clauses.group_by_fragment(
+            self.group_by, self.grouping_sets, resolver, dialect="duckdb"
+        )
+        if group is not None:
+            sql = f"{sql} GROUP BY {group}"
+        return sql
 
     def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
         """This aggregate's OUTPUT columns, keyed by qualifier -> output name, so

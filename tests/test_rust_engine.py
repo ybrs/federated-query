@@ -218,6 +218,22 @@ def test_cross_source_sum_of_decimal(engine):
     _assert_parity(qe, datasources, sql)
 
 
+def test_cross_source_window_over_aggregate(engine):
+    """A window over grouped aggregates - sum(sum(x)) OVER (PARTITION BY ...) with
+    GROUP BY - lands as a WindowExpr in the aggregate's output. The structured
+    aggregate fragment cannot express it, so it is rendered as a SELECT ...
+    GROUP BY raw_sql that DataFusion evaluates (the q12/q49/q63 family).
+    """
+    qe, datasources = engine
+    sql = (
+        f"SELECT r.r_name, sum(n.n_amount) AS s, "
+        f"sum(sum(n.n_amount)) OVER (PARTITION BY r.r_regionkey) AS w "
+        f"FROM srcA.{SCHEMA}.nation n JOIN srcB.{SCHEMA}.region r "
+        f"ON n.n_regionkey = r.r_regionkey GROUP BY r.r_name, r.r_regionkey"
+    )
+    _assert_parity(qe, datasources, sql)
+
+
 def test_sort_over_projection_of_renamed_self_join(engine):
     """ORDER BY a self-join-renamed column that a dropping projection passes
     through must sort by the OUTPUT column, not the vanished physical source.
