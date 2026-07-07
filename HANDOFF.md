@@ -117,10 +117,23 @@ turned out to TAX big-fact queries with disk I/O the box never needed (q05
 3.8 -> 15.4s re-reading a spilled store_sales) - replaced by a 16GiB budget
 on the SUM of resident bindings with largest-first eviction (81bd44c): q05
 back to 3.7s, q39 7.2s (better than pre-fusion), q64 halved to 7.2s.
-CURRENT SF10 BOARD: totals 127.5s vs duck 71.4s (1.79x), geomean 2.17x, 18
-queries faster than DuckDB, PASS 99|0|0. Remaining ratio outliers (q05 24x,
-q70 20x, q39/q58/q31/q06/q44 ~17x, q78 10.5x absolute 13s) are genuine
-plan-quality gaps, not memory artifacts.
+FACT-INJECTION ROUND DONE (fact-injection-plan.md; b5240d1 traced
+composite-probe injection + bb08eef statless-island urgency + 7c0a420
+union-branch injection): the outlier cluster was ONE defect - semi-join
+reduction only accepted plain-scan probes, so facts under join cascades /
+decorrelated wrappers / unions shipped WHOLE. The probe key now traces to
+its originating base scan(s) through safe join sides (never null-extended),
+renames and union branches; per-base injection dedup; a structural gate
+refuses unfiltered plain builds (whole-domain keys); orientation ties break
+by probe urgency (known size, statless remote = infinite, composites derive
+from traced bases). q05 15.4s (pre-round) -> 0.6s, q58 -> 0.3s, q79 ->
+0.4s, q39 -> 2.4s, q70 -> 1.4s.
+
+CURRENT BOARD 2026-07-07 evening: SF10 totals 111.0s vs 71.4s (1.56x),
+geomean 2.11x, PASS 99|0|0; SF0.1 99|0|0 (2.37x geo), SF1 99|0|0 (1.92x
+geo); TPC-H fedpgduck 22/22 at 1.72x - best yet. Remaining SF10 ratio
+outliers: q31 19x, q44 17x, q33/q56/q60 (item-list channel unions) 10-15x,
+q03 13x, q06 11x, q78 10.9x absolute 13.5s (SMJ path).
 
 STAGED TALLIES (52d9428): truth+oracle results are pure functions of the
 data, so `--mode save-refs` caches them once per scale
