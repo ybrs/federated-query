@@ -160,10 +160,26 @@ def build_oracle(db_path, options):
     reference, so it must be right even at the cost of reading unfiltered dim
     rows and filtering locally.
     """
-    connection = duckdb.connect(db_path, read_only=True)
+    connection = _reference_connection(db_path, options)
     connection.execute("LOAD postgres")
     connection.execute(f"ATTACH '{_pg_dsn(options)}' AS pgdb (TYPE postgres, READ_ONLY)")
     connection.execute("SET pg_experimental_filter_pushdown=false")
+    return connection
+
+
+def _reference_connection(db_path, options):
+    """A DuckDB reference connection CAPPED below the child's RSS watchdog.
+
+    The engine and both references share one watchdog-limited child; an
+    uncapped reference computing a heavy SF10 truth (q64 joins three facts)
+    can blow the child's RSS limit and be misattributed as an ENGINE error.
+    DuckDB degrades gracefully under its own memory_limit (it spills), so the
+    references get ~60 percent of the watchdog budget.
+    """
+    connection = duckdb.connect(db_path, read_only=True)
+    if options.memory_limit > 0:
+        cap_mb = max(2048, int(options.memory_limit * 0.6))
+        connection.execute(f"SET memory_limit='{cap_mb}MB'")
     return connection
 
 
@@ -250,7 +266,9 @@ def _evaluate_worker(engine_sql, oracle_sql, truth_sql, db_path, options,
         result_queue.put(("error", _error_text(error)))
         return
     try:
-        truth_rows = duckdb.connect(db_path, read_only=True).execute(truth_sql).fetchall()
+        truth_rows = (
+            _reference_connection(db_path, options).execute(truth_sql).fetchall()
+        )
     except Exception as error:
         result_queue.put(("error", "ground-truth: " + _error_text(error)))
         return
