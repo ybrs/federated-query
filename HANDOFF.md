@@ -27,13 +27,34 @@ more and still fail (pinned by tests/test_tpcds_compare.py).
 ## Current status (pg-dims, SF0.1) - VERIFIED full 99-query tally 2026-07-07
 
 `PASS 99 | MISMATCH 0 | ERROR 0` - EVERY TPC-DS query passes federated.
-Geomean 3.44x vs the federated DuckDB timing oracle. Suite: 1269 passed,
-3 skipped, 25 xfailed. Reports are commit-named under
-`benchmarks/tpcds/reports/` (like tpch).
+Geomean 2.80x, totals 13.9s vs 4.2s. Suite: 1272 passed, 3 skipped,
+25 xfailed. Reports are commit-named under `benchmarks/tpcds/reports/`.
 
 TPC-H regression check 2026-07-07 (report-result-9a28f39.md): fedpgduck SF1
 22/22 correct, 2145ms vs 1125ms = 1.91x - no regression vs the previous
 report's 1.97x (5f123d0); the TPC-DS rounds did not open a gap.
+
+## Perf round 1 - schema memoization DONE 2026-07-07 (commit 534b246)
+
+Outlier diagnosis found TWO structural costs; the first is fixed:
+- **build_ir schema recomputation (FIXED)**: schema()/column_aliases()
+  recursed per parent with no caching - exponential in tree depth. q59 spent
+  4572ms of a 4580ms run re-deriving schemas (engine execution: ~300ms).
+  Fix: PhysicalPlanNode.__init_subclass__ wraps every subclass's
+  schema()/column_aliases() in a per-instance once-cache; model_copy starts
+  the copy with an empty cache. Invariant documented on the base class:
+  structural fields never mutate after construction. Effect: geomean 3.44x
+  -> 2.80x, totals 27.1s -> 13.9s; q59 3989 -> 158ms, q02 2552 -> 135ms,
+  q64 3384 -> 398ms, q66 1057 -> 224ms.
+- **CTE re-emission (NEXT)**: a multi-referenced CTE re-emits and re-executes
+  its whole body per reference (rust_ir _emit_cte_scan documents it). q04
+  emits year_total 18 TIMES (customer scanned 18x, 82 merge fragments) - now
+  the top outlier at 1210ms/18.2x; also q74/q11/q75/q14/q31/q47/q57. Fix:
+  emit each CTE body once into a binding (emitter cache by producer
+  identity) + make Rust binding reads non-consuming (batches are Arc-cheap
+  to clone; take_materialized currently REMOVES the binding).
+- Remaining after that: q09 (108ms/13x, 15 scalar subqueries), q44
+  (67ms/13x), q10/q35 (disjunctive plan phases 2/3).
 
 ## Disjunctive decorrelation - Phase 1 DONE 2026-07-07 (commit 1767f60)
 
