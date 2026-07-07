@@ -201,12 +201,13 @@ def test_cross_source_intersect(engine):
 
 
 def test_cross_source_sum_of_decimal(engine):
-    """A cross-source SUM over a decimal column materializes correctly.
+    """A cross-source SUM over a decimal column matches pure DuckDB.
 
-    DataFusion widens SUM's decimal precision (Decimal(17,2) -> Decimal(27,2)),
-    so its logical df.schema() disagrees with the executed batch schema; the
-    aggregate binding must carry the batch's actual schema or registering it as a
-    MemTable is rejected ('Mismatch between schema and batches'; q16/q94/q95).
+    General parity coverage for the aggregate path. The specific schema-widening
+    regression it relates to (DataFusion widening SUM's decimal precision so its
+    logical df.schema() disagrees with the executed batches) only reproduces on
+    the deeper TPC-DS shapes q16/q94/q95, which are the regression queries for
+    the engine's collect_batches fix.
     """
     qe, datasources = engine
     sql = (
