@@ -146,9 +146,14 @@ q56 2.3 -> 1.3s, q60 1.8 -> 1.3s.
 CURRENT BOARD 2026-07-08: SF10 totals 84.9s vs 71.4s (1.19x!), geomean
 1.87x, PASS 99|0|0; SF1 99|0|0 totals 1.59x geo 1.76x; SF0.1 99|0|0 geo
 2.32x; TPC-H fedpgduck 22/22 at 1.73x. 17 queries beat DuckDB at SF10
-(q72 0.22x). Remaining ratio outliers: q44 17x (rank islands - window
-machinery, no dim filter exists), q06 11x, q70 7.2x, q46/q68 ~6.6x, q39
-5.8x, q78 5.7x absolute 7.1s (largest absolute; SMJ region).
+(q72 0.22x). q44 was NOT window machinery: the
+SingleRowGuard node was missing from predicate pushdown's recursion
+allowlist, so its HAVING subquery's 99.99-percent filter stayed at the
+coordinator and the whole fact shipped twice - one walker arm (522267b)
+took it 2037 -> 225ms (the walker-descent lesson AGAIN). BOARD after:
+SF10 totals 81.7s vs 71.4s (1.14x), geomean 1.81x, 99|0|0; tpch 22/22
+1.76x. Remaining ratio outliers: q06 11x (scalar-avg chain), q70 7.2x,
+q46/q68 ~6.6x, q39 5.8x, q78 5.7x absolute 7.1s (largest; SMJ region).
 
 STAGED TALLIES (52d9428): truth+oracle results are pure functions of the
 data, so `--mode save-refs` caches them once per scale
