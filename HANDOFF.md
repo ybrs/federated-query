@@ -40,19 +40,34 @@ coordinator. Deferred by request.
 
 ## Current status (pg-dims, SF0.1) - VERIFIED full 99-query tally 2026-07-07
 
-`PASS 95 | MISMATCH 1 (q18) | ERROR 3`, geomean 3.32x vs the federated
-DuckDB timing oracle over the 95 passing queries. Full runs are SAFE (see the
-MEMORY section below). Suite: 1257 passed, 3 skipped, 25 xfailed. Reports are
-commit-named under `benchmarks/tpcds/reports/` (like tpch).
+`PASS 98 | MISMATCH 1 (q18) | ERROR 0` - the ERROR column is CLOSED. Geomean
+3.47x vs the federated DuckDB timing oracle over the 98 passing queries.
+Suite: 1264 passed, 3 skipped, 25 xfailed. Reports are commit-named under
+`benchmarks/tpcds/reports/` (like tpch).
 
-Remaining failures:
-- **ResourcesExhausted - 3**: q10/q35/q45 build a large cartesian product and
-  fail CLEANLY from the DataFusion 32GB pool ("Failed to allocate ...
-  fedq_collect ... fair(pool_size: 32.0 GB)"). Their join condition is a
-  DISJUNCTION with NO common conjunct (q45: `(ca_zip IN ...) OR (i_item_id IN
-  subquery)`), so factoring cannot lift a hash key out; passing them needs
-  disjunctive-subquery decorrelation. This is the ONLY remaining ERROR cause.
-- q18 MISMATCH (0.01 avg-of-decimal on ROLLUP subtotals) - open, deferred.
+The only remaining failure of any kind is the q18 MISMATCH (0.01
+avg-of-decimal on ROLLUP subtotals) - open, deferred; see OPEN ISSUES.
+
+## Disjunctive decorrelation - Phase 1 DONE 2026-07-07 (commit 1767f60)
+
+Plan: `disjunctive-decorrelation-plan.md`. Diagnosis: the OR-of-subqueries
+rewrite (SEMI/ANTI union split) was already correct; predicate pushdown
+treated Union/SetOperation as OPAQUE, stranding the comma-join equalities
+above the union, so each branch planned as a conditionless cross join
+(q10/q35/q45's memory blowups).
+
+- `rules.py _push_filter_into_set_operation`: distributes the conjuncts
+  every branch can evaluate into EVERY branch (a deterministic predicate
+  commutes with any set operation applied per branch); conjuncts a branch
+  cannot evaluate (the rewrite's flag columns) stay above. Union also joined
+  the `_push_down` recursion arm (was missing - a walker-descent stop).
+- `pushdown.py available_columns`: Union/SetOperation arm = the INTERSECTION
+  of branch columns. Without it a union exposed no columns, which also
+  blocked the SEMI-join left-side descent above q10/q35's nested unions.
+- q10 517ms / q35 572ms / q45 124ms at SF0.1. The union split still
+  replicates the input per SEMI/ANTI pair; plan phases 2 (common-key OR of
+  existentials -> one SEMI over a domain union) and 3 (DataFusion LeftMark
+  joins) are now PERF refinements, to be judged against these numbers.
 
 ## Error round 2026-07-07 (commit b484808): q23/q39/q70/q86 fixed
 
