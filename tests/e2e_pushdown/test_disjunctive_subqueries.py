@@ -72,3 +72,85 @@ def test_or_of_exists_preserves_outer_multiplicity(multi_source_env):
     # Customers with an EU or APAC order: 2 (EU+APAC), 3 (APAC+EU), 5 (EU).
     # Their orders, each exactly once: 2,3,5,7,8,10.
     assert table.column("order_id").to_pylist() == [2, 3, 5, 7, 8, 10]
+
+
+def _physical_plan(multi_source_env, sql):
+    """Build the physical plan for a query without executing it."""
+    runtime = build_runtime(multi_source_env)
+    return runtime.query_executor._plan_pipeline(sql, None)
+
+
+def _collect(plan, node_type):
+    """Collect every node of a given type in a physical plan tree."""
+    found = []
+    if isinstance(plan, node_type):
+        found.append(plan)
+    for child in plan.children():
+        found.extend(_collect(child, node_type))
+    return found
+
+
+def test_same_key_or_of_exists_plans_as_domain_semi(multi_source_env):
+    """A same-key OR of positive EXISTS plans as ONE SEMI over a domain union.
+
+    Phase 2 of the disjunctive plan (q10/q35): no flag split - the input is
+    not replicated into SEMI/ANTI union branches; instead one SEMI hash join
+    probes the UNION of the two subqueries' key domains.
+    """
+    from federated_query.plan.logical import JoinType
+    from federated_query.plan.physical import PhysicalHashJoin, PhysicalUnion
+
+    sql = (
+        "SELECT c.customer_id FROM duckdb_customers.main.customers c "
+        "WHERE EXISTS (SELECT 1 FROM duckdb_orders.main.orders o "
+        "              WHERE o.customer_id = c.customer_id AND o.region = 'NA') "
+        "   OR EXISTS (SELECT 1 FROM duckdb_orders.main.orders o "
+        "              WHERE o.customer_id = c.customer_id AND o.region = 'APAC')"
+    )
+    plan = _physical_plan(multi_source_env, sql)
+    semis = []
+    for join in _collect(plan, PhysicalHashJoin):
+        if join.join_type == JoinType.SEMI:
+            semis.append(join)
+    assert len(semis) == 1
+    # Exactly the domain union under the SEMI's build side - a flag split
+    # would instead put a Union of replicated input branches ABOVE the joins.
+    assert len(_collect(plan, PhysicalUnion)) == 1
+
+
+def test_mixed_plain_or_exists_falls_back_to_flags(multi_source_env):
+    """A plain predicate OR'd with an EXISTS keeps the flag path, correctly.
+
+    NA-order customers (1, 4) plus the 'smb'-segment customer (3), each
+    exactly once.
+    """
+    runtime = build_runtime(multi_source_env)
+    sql = (
+        "SELECT c.customer_id FROM duckdb_customers.main.customers c "
+        "WHERE EXISTS (SELECT 1 FROM duckdb_orders.main.orders o "
+        "              WHERE o.customer_id = c.customer_id AND o.region = 'NA') "
+        "   OR c.segment = 'smb' "
+        "ORDER BY c.customer_id"
+    )
+    table = runtime.execute(sql)
+    assert table.column("customer_id").to_pylist() == [1, 3, 4]
+
+
+def test_not_exists_in_or_keeps_flag_path(multi_source_env):
+    """NOT EXISTS inside an OR must not take the domain union.
+
+    Its null-aware ANTI semantics do not distribute over a key-domain union,
+    so the flag path handles it. Customers with no EU order (1, 4) plus
+    customers with an APAC order (2, 3); customer 5 has only EU orders.
+    """
+    runtime = build_runtime(multi_source_env)
+    sql = (
+        "SELECT c.customer_id FROM duckdb_customers.main.customers c "
+        "WHERE NOT EXISTS (SELECT 1 FROM duckdb_orders.main.orders o "
+        "                  WHERE o.customer_id = c.customer_id AND o.region = 'EU') "
+        "   OR EXISTS (SELECT 1 FROM duckdb_orders.main.orders o "
+        "              WHERE o.customer_id = c.customer_id AND o.region = 'APAC') "
+        "ORDER BY c.customer_id"
+    )
+    table = runtime.execute(sql)
+    assert table.column("customer_id").to_pylist() == [1, 2, 3, 4]

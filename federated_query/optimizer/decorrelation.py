@@ -1318,7 +1318,14 @@ class Decorrelator:
         context, collapsing a subquery flag's UNKNOWN to FALSE is safe: an
         OR term that is UNKNOWN and one that is FALSE both leave the row to
         be dropped unless another term is TRUE.
+
+        The common-key special case is taken FIRST: an OR of positive
+        existentials on one shared outer key becomes a single SEMI join over
+        the union of their key domains (no flag joins, no input replication).
         """
+        domain_semi = self._try_domain_union_semi(input_plan, disjuncts)
+        if domain_semi is not None:
+            return domain_semi
         plan = input_plan
         terms: List[Expression] = []
         for disjunct in disjuncts:
@@ -1328,6 +1335,129 @@ class Decorrelator:
         # with each disjunct's SEMI/ANTI flag join; this keeps every input row
         # exactly once instead of a distinct union that would lose duplicates.
         return Filter.create(input=plan, predicate=_or_join(terms))
+
+    def _try_domain_union_semi(
+        self, input_plan: LogicalPlanNode, disjuncts: List[Expression]
+    ) -> Optional[LogicalPlanNode]:
+        """OR of positive same-key existentials as ONE SEMI over a domain union.
+
+        ``EXISTS(S1: k = outer.k) OR EXISTS(S2: k = outer.k)`` keeps an outer
+        row iff outer.k appears in EITHER subquery's key domain - a SEMI join
+        against the UNION of the domains (TPC-DS q10/q35). One hash join, no
+        input replication, and the unioned build side feeds the dynamic-filter
+        injection; the flag path below instead duplicates the whole input per
+        disjunct. Applies only when EVERY disjunct is a positive existential
+        whose correlation is a single equality on the SAME outer expression;
+        anything else returns None and takes the flag path. WHERE semantics
+        are exact: a SEMI join keeps each qualifying row exactly once, and an
+        UNKNOWN membership drops the row just as the OR filter would.
+        """
+        parts = []
+        for disjunct in disjuncts:
+            part = self._domain_union_part(disjunct)
+            if part is None:
+                return None
+            parts.append(part)
+        outer_expr = parts[0][0]
+        for other_outer, _, _ in parts[1:]:
+            if other_outer != outer_expr:
+                return None
+        return self._build_domain_semi(input_plan, outer_expr, parts)
+
+    def _domain_union_part(
+        self, disjunct: Expression
+    ) -> Optional[Tuple[Expression, LogicalPlanNode, ColumnRef]]:
+        """(outer key expr, subquery relation, its key column) for a disjunct.
+
+        None when the disjunct is not a positive EXISTS / IN whose prepared
+        correlation is a single plain equality - those shapes keep the flag
+        path (NOT EXISTS / NOT IN carry null-aware conditions a domain union
+        cannot express; multi-key correlation is out of scope here).
+        """
+        if not isinstance(disjunct, (ExistsExpression, InSubquery)):
+            return None
+        if self._constant_exists_value(disjunct) is not None:
+            return None
+        right, condition, positive = self._semi_anti_parts(disjunct)
+        if not positive or condition is None:
+            return None
+        if not isinstance(right, SubqueryScan):
+            return None
+        return self._single_equality_parts(right, condition)
+
+    def _single_equality_parts(
+        self, right: SubqueryScan, condition: Expression
+    ) -> Optional[Tuple[Expression, LogicalPlanNode, ColumnRef]]:
+        """Split a one-conjunct plain equality into (outer expr, right, key)."""
+        conjuncts = _split_conjuncts(condition)
+        if len(conjuncts) != 1:
+            return None
+        equality = conjuncts[0]
+        if not isinstance(equality, BinaryOp) or equality.op != BinaryOpType.EQ:
+            return None
+        return self._orient_domain_equality(right, equality)
+
+    def _orient_domain_equality(
+        self, right: SubqueryScan, equality: BinaryOp
+    ) -> Optional[Tuple[Expression, LogicalPlanNode, ColumnRef]]:
+        """Orient one equality to (outer side, right, subquery key column)."""
+        left_is_key = self._is_relation_column(equality.left, right.alias)
+        right_is_key = self._is_relation_column(equality.right, right.alias)
+        if left_is_key == right_is_key:
+            return None
+        outer = equality.right if left_is_key else equality.left
+        key = equality.left if left_is_key else equality.right
+        for ref in _expression_column_refs(outer):
+            if ref.table == right.alias:
+                return None
+        return (outer, right, key)
+
+    def _is_relation_column(self, expr: Expression, alias: Optional[str]) -> bool:
+        """Whether an expression is a plain column of the given relation."""
+        return isinstance(expr, ColumnRef) and expr.table == alias
+
+    def _build_domain_semi(
+        self,
+        input_plan: LogicalPlanNode,
+        outer_expr: Expression,
+        parts: List[Tuple[Expression, LogicalPlanNode, ColumnRef]],
+    ) -> LogicalPlanNode:
+        """Assemble the SEMI join over the unioned per-disjunct key domains."""
+        prefix = self._next_prefix()
+        key_name = f"{prefix}_k0"
+        branches: List[LogicalPlanNode] = []
+        for _, right, key in parts:
+            # Each existential's relation projected to its correlation-key
+            # column under ONE canonical name, so the branches union
+            # positionally into a single key domain.
+            branches.append(
+                Projection.create(input=right, expressions=[key], aliases=[key_name])
+            )
+        # UNION ALL of the key domains: the SEMI join tests membership, so
+        # duplicate keys across (or within) branches change nothing, and
+        # skipping the dedup keeps the build side one cheap append.
+        union = Union.create(inputs=branches, distinct=False)
+        # The unioned domain exposed under a fresh subquery alias, so the join
+        # condition's key reference resolves against a named relation.
+        domain = SubqueryScan.create(input=union, alias=prefix)
+        # The domain key has the OUTER key's type: the equality's two sides
+        # share it, and the outer side is bound while the prepared subquery
+        # key column carries no type (matching the flag path's conditions).
+        key_type = outer_expr.get_type()
+        # The one equality the SEMI join probes: outer key = domain key.
+        condition = BinaryOp.create(
+            op=BinaryOpType.EQ,
+            left=outer_expr,
+            right=ColumnRef.create(table=prefix, column=key_name, data_type=key_type),
+        )
+        # The SEMI join that implements the whole OR: it keeps each outer row
+        # exactly once when its key appears in EITHER existential's domain.
+        return Join.create(
+            left=input_plan,
+            right=domain,
+            join_type=JoinType.SEMI,
+            condition=condition,
+        )
 
     def _disjunct_term(
         self, disjunct: Expression, plan: LogicalPlanNode
@@ -1387,8 +1517,25 @@ class Decorrelator:
             )
         if not _expression_has_subquery(conjunct):
             return plan, conjunct
+        domain_semi = self._or_conjunct_domain_semi(plan, conjunct)
+        if domain_semi is not None:
+            # The whole OR-of-existentials conjunct is consumed by the domain
+            # SEMI join; there is no residual predicate to keep.
+            return domain_semi, None
         rewritten, plan = self._rewrite_value_expr(conjunct, plan)
         return plan, rewritten
+
+    def _or_conjunct_domain_semi(
+        self, plan: LogicalPlanNode, conjunct: Expression
+    ) -> Optional[LogicalPlanNode]:
+        """A conjunct that is an OR of positive same-key existentials becomes
+        the domain-union SEMI join directly (q10/q35's ``... AND (EXISTS(ws)
+        OR EXISTS(cs))``); any other shape returns None and takes the flag
+        path through _rewrite_value_expr."""
+        disjuncts = _split_disjuncts(conjunct)
+        if len(disjuncts) < 2:
+            return None
+        return self._try_domain_union_semi(plan, disjuncts)
 
     def _negated_subquery_conjunct(self, conjunct: Expression) -> Optional[Expression]:
         """Push a ``NOT`` around a subquery predicate into the node itself.
