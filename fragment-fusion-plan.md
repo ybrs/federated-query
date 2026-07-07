@@ -13,7 +13,17 @@ fedq_collect, q64 hits the 40GB RSS watchdog) and the super-linear family
 `feature/fragment-fusion` in BOTH repos (experimental; the previous branches
 are the rollback).
 
-ASCII only. Status: IN PROGRESS.
+ASCII only. Status: Phases A+B DONE + sort-merge retry; branch results
+below. Phase C (streaming/spillable source bindings, the q64 residency) is
+the remaining item.
+
+RESULTS on this branch (all suites 1278 green):
+- SF0.1: PASS 99|0|0 (geomean improved 2.39x -> 2.34x)
+- SF1:   PASS 99|0|0
+- SF10:  PASS 98|0|1 (was 95|0|4): q23 6.1s/2.05x, q67 3.8s/0.63x - FASTER
+  than DuckDB - and q78 13.7s via the sort-merge retry; q64 remains (RSS
+  from MemTable-resident source bindings - Phase C).
+- TPC-H fedpgduck SF1: 22/22 at 1.82x (was 1.91x - fusion sped it up too).
 
 ## Diagnosis recap (verified on q67's IR at SF10)
 
