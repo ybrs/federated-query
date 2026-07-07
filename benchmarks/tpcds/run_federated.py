@@ -1011,13 +1011,22 @@ def run_engine_only(options, placement_name):
 
 
 def _write_engine_timings(out_dir, timings):
-    """Persist per-query engine timings next to the result CSVs."""
+    """Persist per-query engine timings next to the result CSVs.
+
+    MERGED with any existing file, so an ``--only`` engine run refreshes just
+    its queries instead of clobbering the full run's timings.
+    """
     import csv as csv_module
 
-    with open(os.path.join(out_dir, "engine_timings.csv"), "w", newline="") as handle:
+    path = os.path.join(out_dir, "engine_timings.csv")
+    merged = _load_engine_timings(out_dir) if os.path.exists(path) else {}
+    for name, engine_ms in timings:
+        merged[name] = engine_ms
+    with open(path, "w", newline="") as handle:
         writer = csv_module.writer(handle)
         writer.writerow(["query", "engine_ms"])
-        for name, engine_ms in timings:
+        for name in sorted(merged):
+            engine_ms = merged[name]
             writer.writerow([name, "" if engine_ms is None else engine_ms])
 
 
