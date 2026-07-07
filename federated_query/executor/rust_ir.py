@@ -997,7 +997,20 @@ def _can_reduce(join):
         return _left_reducible(join)
     if join.join_type != JoinType.INNER:
         return False
-    return _probe_preference(join.left) > 0 or _probe_preference(join.right) > 0
+    return _injection_rank(join.left, join.left_keys[0]) > 0 or (
+        _injection_rank(join.right, join.right_keys[0]) > 0
+    )
+
+
+def _injection_rank(node, key_expr) -> int:
+    """_probe_preference extended to composite probes: a subtree whose join
+    key traces to injectable base scans ranks like a plain scan."""
+    rank = _probe_preference(node)
+    if rank > 0:
+        return rank
+    if _probe_injection_bases(node, key_expr) is not None:
+        return 1
+    return 0
 
 
 def _left_reducible(join) -> bool:
@@ -1020,8 +1033,7 @@ def _probe_base_resolvable(join) -> bool:
     so the join instead emits as a normal (unreduced) join.
     """
     _, probe, _, probe_key = _orient_join(join)
-    inject_col = _physical_column_name(probe_key, probe.column_aliases())
-    return _reducible_probe_base(probe, inject_col) is not None
+    return _probe_injection_bases(probe, probe_key) is not None
 
 
 def _reduction_filters(join) -> bool:
@@ -1032,8 +1044,15 @@ def _reduction_filters(join) -> bool:
     Decided from the cost model's NDVs threaded onto the plan; when either
     side's statistic is missing this keeps today's reduce-by-default."""
     build, probe, build_key, probe_key = _orient_join(join)
-    inject_col = _physical_column_name(probe_key, probe.column_aliases())
-    probe_ndv = _node_column_ndv(_reducible_probe_base(probe, inject_col), inject_col)
+    if _build_donates_whole_domain(build):
+        return False
+    bases = _probe_injection_bases(probe, probe_key)
+    probe_ndv = None
+    if bases:
+        # The fetched-fraction price is keyed to the base actually injected;
+        # multi-base probes price by their first base (same key domain).
+        base, inject_col = bases[0]
+        probe_ndv = _node_column_ndv(base, inject_col)
     keys_ndv = _node_column_ndv(build, _build_key_name(build, build_key))
     build_rows = _output_rows(build)
     if isinstance(build, PhysicalRemoteQuery) and build_rows is None:
@@ -1041,6 +1060,19 @@ def _reduction_filters(join) -> bool:
         # real output estimate there is no evidence about its actual key set.
         return True
     return not useless_key_reduction(keys_ndv, build_rows, probe_ndv)
+
+
+def _build_donates_whole_domain(build) -> bool:
+    """An UNFILTERED plain base scan donates its entire key domain, so under
+    FK containment the injection keeps every probe row and costs pure
+    overhead (q39's whole-warehouse and q06's every-item injections). This
+    structural check needs no statistics; filtered scans and composite
+    builds fall through to the NDV pricing."""
+    if not isinstance(build, PhysicalScan):
+        return False
+    if build.filters is not None or build.sample is not None:
+        return False
+    return not any((build.aggregates, build.group_by, build.grouping_sets))
 
 
 def _output_rows(node):
@@ -1127,6 +1159,126 @@ def _probe_preference(node) -> int:
     return 0
 
 
+def _probe_injection_bases(probe, key_expr):
+    """[(base, inject column)] for a probe: the legacy single-base resolution
+    (which also covers aggregate bases) first, else the traced descent
+    through join cascades and decorrelation wrappers. None = untraceable.
+
+    The traced path is why the SF10 outlier cluster existed: only plain-scan
+    probes were injectable, so a fact under a join cascade (q39: (inventory
+    x item) x date_dim), a decorrelated wrapper (q58, q06) or a union (q05)
+    shipped WHOLE across the wire while the filtered dimension received a
+    useless injection."""
+    inject_col = _physical_column_name(key_expr, probe.column_aliases())
+    base = _reducible_probe_base(probe, inject_col)
+    if base is not None:
+        return [(base, inject_col)]
+    return _traced_injection_bases(probe, (key_expr.table, key_expr.column))
+
+
+def _traced_injection_bases(node, key_pair):
+    """The base scan(s) that ORIGINATE the probe key column, descending only
+    where removing base rows lacking the keys cannot change what the
+    reduction join above sees. `key_pair` is (qualifier, column) AT THIS
+    NODE'S OUTPUT and is translated through renames on the way down."""
+    if isinstance(node, (PhysicalScan, PhysicalRemoteQuery)):
+        return _traced_base_entry(node, key_pair)
+    if isinstance(node, PhysicalAliasedRelation):
+        inner = _alias_inner_pair(node, key_pair)
+        return None if inner is None else _traced_injection_bases(node.input, inner)
+    if isinstance(node, PhysicalProjection):
+        inner = _projection_inner_pair(node, key_pair)
+        return None if inner is None else _traced_injection_bases(node.input, inner)
+    if isinstance(node, PhysicalFilter):
+        # A filter passes columns through untouched; filtering its input by a
+        # key superset commutes with it.
+        return _traced_injection_bases(node.input, key_pair)
+    if isinstance(node, PhysicalHashJoin):
+        return _join_injection_bases(node, key_pair)
+    return None
+
+
+def _traced_base_entry(base, key_pair):
+    """[(base, physical column)] when a PLAIN injectable base exposes the
+    key; aggregate/limited scans only reduce via the legacy vetted shape."""
+    if isinstance(base, PhysicalScan) and not _injectable_scan(base):
+        return None
+    physical = base.column_aliases().get(key_pair)
+    if physical is None:
+        return None
+    return [(base, physical)]
+
+
+def _alias_inner_pair(node, key_pair):
+    """Translate the key through an alias wrapper: the single input column
+    the aliased output re-exposes, or None when hidden or ambiguous."""
+    physical = node.column_aliases().get(key_pair)
+    if physical is None:
+        return None
+    matches = []
+    for pair, name in node.input.column_aliases().items():
+        if name == physical:
+            matches.append(pair)
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _projection_inner_pair(node, key_pair):
+    """Translate the key through a projection: the input column the key
+    output re-exposes, or None (computed expression, ambiguous name, or
+    DISTINCT ON - which picks a survivor per group, so removing input rows
+    can change which row a kept group keeps)."""
+    if node.distinct_on:
+        return None
+    if key_pair not in node.column_aliases():
+        return None
+    matches = []
+    for i, name in enumerate(node.output_names):
+        if name == key_pair[1]:
+            matches.append(node.expressions[i])
+    if len(matches) != 1:
+        return None
+    expr = matches[0]
+    if not isinstance(expr, ColumnRef) or expr.column == "*":
+        return None
+    return (expr.table, expr.column)
+
+
+def _join_injection_bases(join, key_pair):
+    """Descend into the join side that carries the key, when that side is not
+    null-extended by this join: a removed keyless row then only removes
+    output rows whose key the reduction join above drops anyway. A
+    null-extended side is unsafe - removing its rows turns matches into
+    NULL extensions, changing kept rows' contents."""
+    sides = []
+    if key_pair in join.left.column_aliases():
+        sides.append("left")
+    if key_pair in join.right.column_aliases():
+        sides.append("right")
+    if len(sides) != 1:
+        return None
+    side = sides[0]
+    if not _injection_side_safe(join.join_type, side):
+        return None
+    child = join.left if side == "left" else join.right
+    return _traced_injection_bases(child, key_pair)
+
+
+def _injection_side_safe(join_type, side) -> bool:
+    """Whether a join side is preserved (not null-extended) so its base may
+    be pre-filtered by a key superset. FULL extends both sides: never."""
+    if join_type == JoinType.INNER:
+        return True
+    if join_type == JoinType.LEFT:
+        return side == "left"
+    if join_type == JoinType.RIGHT:
+        return side == "right"
+    if join_type in (JoinType.SEMI, JoinType.ANTI):
+        return side == "left"
+    return False
+
+
 def _emit_reduced_join(join, ctx):
     """The build/collect/inject reduction path; returns (left, right) bindings."""
     build_child, probe_child, build_key_expr, probe_key_expr = _orient_join(join)
@@ -1164,9 +1316,26 @@ def _orient_join(join):
         if join.build_side == "left":
             return join.left, join.right, join.left_keys[0], join.right_keys[0]
         return join.right, join.left, join.right_keys[0], join.left_keys[0]
-    if _probe_preference(join.right) >= _probe_preference(join.left):
+    left_rank = _injection_rank(join.left, join.left_keys[0])
+    right_rank = _injection_rank(join.right, join.right_keys[0])
+    if left_rank == right_rank:
+        # Rank tie (e.g. both sides trace): probe the side with the larger
+        # KNOWN estimate - the reduction exists to cut the big read, and an
+        # unknown side cannot be known big (q58: fact-x-item est 28.8M vs
+        # date_dim-x-subquery est None flipped to the useless direction).
+        if _known_rows(join.left) > _known_rows(join.right):
+            return join.right, join.left, join.right_keys[0], join.left_keys[0]
+        return join.left, join.right, join.left_keys[0], join.right_keys[0]
+    if right_rank > left_rank:
         return join.left, join.right, join.left_keys[0], join.right_keys[0]
     return join.right, join.left, join.right_keys[0], join.left_keys[0]
+
+
+def _known_rows(node) -> int:
+    """estimated_rows when threaded, else -1: an unknown side cannot be
+    known big, so a known-big side wins the probe role."""
+    rows = getattr(node, "estimated_rows", None)
+    return -1 if rows is None else rows
 
 
 def _cardinality_probe(join):
@@ -1178,7 +1347,10 @@ def _cardinality_probe(join):
     injectable probe - guaranteeing the same reduction set as the structural
     heuristic, just better-oriented when sizes differ."""
     larger = larger_estimated_side(join.left, join.right)
-    if larger is not None and _probe_preference(larger) > 0:
+    if larger is None:
+        return None
+    key_expr = join.left_keys[0] if larger is join.left else join.right_keys[0]
+    if _injection_rank(larger, key_expr) > 0:
         return larger
     return None
 
@@ -1194,7 +1366,6 @@ def _emit_reduced_inputs(ctx, build_child, probe_child, build_key_expr, probe_ke
     (renamed through projections) does the collection read the build binding
     itself, forcing it.
     """
-    inject_col = _physical_column_name(probe_key_expr, probe_child.column_aliases())
     build_binding = _emit_build_side(ctx, build_child)
     anchor = _collect_anchor(ctx, build_child, build_key_expr)
     if anchor is None:
@@ -1204,7 +1375,9 @@ def _emit_reduced_inputs(ctx, build_child, probe_child, build_key_expr, probe_ke
         anchor_binding, anchor_key = anchor
     keys_binding = ctx.names.binding()
     _emit_collect_distinct(ctx, anchor_binding, anchor_key, keys_binding)
-    probe_binding = _emit_probe(ctx, probe_child, inject_col, keys_binding, anchor_key)
+    probe_binding = _emit_probe(
+        ctx, probe_child, probe_key_expr, keys_binding, anchor_key
+    )
     return build_binding, probe_binding
 
 
@@ -1238,19 +1411,36 @@ def _originating_relation(node, key_expr):
     return None
 
 
-def _emit_probe(ctx, probe_child, inject_col, keys_binding, build_key):
-    """Emit the probe with the build keys injected into its base scan.
+def _emit_probe(ctx, probe_child, probe_key_expr, keys_binding, build_key):
+    """Emit the probe with the build keys injected into its base scan(s).
 
-    A plain scan / remote probe is injected directly. A composite probe (an
-    aggregate subquery under alias/projection wrappers) has the keys injected
-    into its base, whose binding is cached so the wrappers - emitted normally
-    as coordinator fragments - read the reduced base."""
-    base = _reducible_probe_base(probe_child, inject_col)
-    base_binding = ctx.names.binding()
-    _emit_injected_scan(ctx, base, inject_col, keys_binding, base_binding, build_key)
-    if base is probe_child:
-        return base_binding
-    ctx.injected[id(base)] = base_binding
+    A plain scan / remote probe is injected directly. A composite probe (a
+    join cascade, an aggregate subquery, decorrelation wrappers) has the
+    keys injected into every base scan the key traces to; each base binding
+    is cached so the wrappers - emitted normally as coordinator fragments -
+    read the reduced bases."""
+    bases = _probe_injection_bases(probe_child, probe_key_expr)
+    if bases is None:
+        # _probe_base_resolvable gated on this before choosing the reduced
+        # path; reaching here means the gate and the emission disagree.
+        raise UnsupportedIR("reduced join probe lost its injection base")
+    for base, inject_col in bases:
+        cached = ctx.injected.get(id(base))
+        if cached is not None:
+            # An earlier join already injected this base; reading the fact a
+            # SECOND time for a weaker filter costs more than it saves (q39
+            # shipped inventory twice). The join above still enforces its
+            # keys exactly - injection is only a reduction.
+            if base is probe_child:
+                return cached
+            continue
+        base_binding = ctx.names.binding()
+        _emit_injected_scan(
+            ctx, base, inject_col, keys_binding, base_binding, build_key
+        )
+        ctx.injected[id(base)] = base_binding
+        if base is probe_child:
+            return base_binding
     return _emit(probe_child, ctx)
 
 
