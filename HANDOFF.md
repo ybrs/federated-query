@@ -40,21 +40,41 @@ coordinator. Deferred by request.
 
 ## Current status (pg-dims, SF0.1) - VERIFIED full 99-query tally 2026-07-07
 
-`PASS 91 | MISMATCH 1 (q18) | ERROR 7`, geomean 3.41x vs the federated
-DuckDB timing oracle over the 91 passing queries. Full runs are SAFE (see the
-MEMORY section below); the tally is from a complete 99-query run. Suite:
-1251 passed, 3 skipped, 26 xfailed.
+`PASS 95 | MISMATCH 1 (q18) | ERROR 3`, geomean 3.32x vs the federated
+DuckDB timing oracle over the 95 passing queries. Full runs are SAFE (see the
+MEMORY section below). Suite: 1257 passed, 3 skipped, 25 xfailed. Reports are
+commit-named under `benchmarks/tpcds/reports/` (like tpch).
 
-Remaining ERROR clusters (by cause):
+Remaining failures:
 - **ResourcesExhausted - 3**: q10/q35/q45 build a large cartesian product and
-  now fail CLEANLY from the DataFusion 32GB pool itself ("Failed to allocate
-  ... fedq_collect ... fair(pool_size: 32.0 GB)") - no watchdog kill needed.
-  Their join condition is a DISJUNCTION with NO common conjunct (q45:
-  `(ca_zip IN ...) OR (i_item_id IN subquery)`), so factoring cannot lift a
-  hash key out; passing them needs disjunctive-subquery decorrelation.
-- UnsupportedSQLError - 2 (q39 simple CASE, q70 window in WHERE).
-- RuntimeError - 2 (q23 type_coercion; q86 window combined with
-  GROUPING()/ROLLUP, a DataFusion physical-planner limitation).
+  fail CLEANLY from the DataFusion 32GB pool ("Failed to allocate ...
+  fedq_collect ... fair(pool_size: 32.0 GB)"). Their join condition is a
+  DISJUNCTION with NO common conjunct (q45: `(ca_zip IN ...) OR (i_item_id IN
+  subquery)`), so factoring cannot lift a hash key out; passing them needs
+  disjunctive-subquery decorrelation. This is the ONLY remaining ERROR cause.
+- q18 MISMATCH (0.01 avg-of-decimal on ROLLUP subtotals) - open, deferred.
+
+## Error round 2026-07-07 (commit b484808): q23/q39/q70/q86 fixed
+
+- **HAVING / ORDER BY aggregate hoist** (binder `_hoist_aggregate_calls`): an
+  aggregate or GROUPING() call in HAVING or ORDER BY matching no SELECT
+  output cannot be recomputed above the aggregate; it becomes a hidden
+  aggregate output (`__agg_N`) read by name, with a restore projection above
+  (q23's `HAVING ... max(tpcds_cmax)`, q86's ORDER BY grouping-CASE).
+  Single-source is unaffected (split_where_having substitutes back).
+- **Two-stage grouping-window split** (physical.py
+  `split_window_aggregate_sqls` + rust_ir): DataFusion cannot plan GROUPING()
+  inside a window expression; the GROUP BY stage materializes every window
+  operand as an output and the window stage runs over those columns
+  (q70/q86 `rank() OVER (PARTITION BY grouping(a)+grouping(b), ...)`).
+- **Window-rejection scoping** (parser `_reject_window_in_clause`): prunes at
+  nested SELECT boundaries, so a ranked derived table inside a WHERE
+  IN-subquery is legal (q70); a window used directly in the clause still
+  fails fast (pinned by the safety sweep).
+- **Simple CASE** (parser `_convert_case_expression`): lowers to the searched
+  form with `operand = value` per branch (identical NULL semantics); a
+  function-bearing operand fails fast (duplication would re-evaluate a
+  volatile call per branch). q39.
 
 ## Scalar-subquery cardinality guard - DONE 2026-07-07 (q06/q14/q44/q54/q58)
 
