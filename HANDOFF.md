@@ -42,6 +42,37 @@ TPC-H regression check 2026-07-07 (report-result-9a28f39.md): fedpgduck SF1
 22/22 correct, 2145ms vs 1125ms = 1.91x - no regression vs the previous
 report's 1.97x (5f123d0); the TPC-DS rounds did not open a gap.
 
+## TPC-DS at SF1 (10x data) - 2026-07-07, PASS 99 | 0 | 0 holds
+
+Infra: `tpcds_sf1` Postgres database created + loaded (store_sales 2.88M);
+`benchmarks/tpcds/data/tpcds_sf1.duckdb` already existed. Full tally at SF1
+(report-result-7983eee.md): `PASS 99 | MISMATCH 0 | ERROR 0`, geomean
+1.86x, totals 23.4s vs 12.2s (1.91x) - matching TPC-H's fair-cell ratio.
+
+THE SCALING ANSWER: the gaps do NOT grow with data - they COMPRESS.
+Geomean 2.39x (SF0.1) -> 1.86x (SF1); 70/99 queries have a BETTER relative
+ratio at SF1 (fixed per-query Python/orchestration overhead amortizes; the
+data path scales). The SF0.1 "scalar-subquery island family" mostly
+DISSOLVED at scale (q09 14.1x -> 3.7x, q28 8.5x -> 2.4x, q44 15.5x -> 6.4x)
+- their small-scale ratios were fixed-overhead artifacts.
+
+Queries that genuinely scale WORSE (the real perf backlog now):
+q39 2.7x -> 11.3x (776ms), q05 4.5x -> 9.3x (424ms), q78 4.6x -> 7.9x
+(1082ms), q04 4.2x -> 6.7x (1451ms), q79 2.3x -> 5.9x, q06 2.6x -> 5.3x,
+q11 2.8x -> 5.3x (785ms). Diagnose these at SF1 before optimizing anything.
+
+SF1 also exposed a REAL bug, fixed (fedqrs 83ca5cb): two pg read paths
+could return a binding whose declared schema disagreed with its executed
+batches ("Mismatch between schema and batches") - ADBC drops the NUMERIC
+typmod on temp-join results, and fetch_parallel took the FIRST ctid
+partition's schema while each partition normalizes NUMERIC scales from its
+own rows (q64: an empty first partition said Decimal128(38,0), row-bearing
+ones shipped (38,2); the temp-table path only engages above the 2000-key
+inline-IN cap, so SF0.1 never hit it). reconcile_executed now re-derives
+disagreeing decimal columns across ALL batches at both assemblies and fails
+loudly on any non-decimal disagreement; MemTable registration failures now
+name the binding and the exact field diff.
+
 ## Perf round 1 - schema memoization DONE 2026-07-07 (commit 534b246)
 
 Outlier diagnosis found TWO structural costs; the first is fixed:
