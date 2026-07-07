@@ -4,7 +4,7 @@ State of the work, facts only. Earlier phases (Rust cutover, N-K decorrelation,
 cost-based optimizer, TPC-H fair benchmark) are in git history and in the
 auto-memory; this document is the CURRENT TPC-DS federated push.
 
-Test suite: **1240 passed, 3 skipped, 32 xfailed** (`POSTGRES_DB=duckpoc
+Test suite: **1276 passed, 3 skipped, 25 xfailed** (`POSTGRES_DB=duckpoc
 /workspace/venv-fedq/bin/python -m pytest -q`).
 
 ---
