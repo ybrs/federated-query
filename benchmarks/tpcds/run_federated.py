@@ -455,10 +455,14 @@ def _timing_rows(results):
     for result in results:
         if result["status"] != "PASS" or result["engine_ms"] is None:
             continue
-        engine_ms = result["engine_ms"]
         duck_ms = result["oracle_ms"]
-        ratio = engine_ms / duck_ms if duck_ms > 0 else float("inf")
-        rows.append((result["name"], engine_ms, duck_ms, ratio))
+        if duck_ms is None or duck_ms <= 0:
+            # A PASS whose TIMING oracle failed (e.g. it exceeded its own
+            # memory cap): correctness stands, there is just no baseline to
+            # compare against, so the row is excluded from the timing table.
+            continue
+        engine_ms = result["engine_ms"]
+        rows.append((result["name"], engine_ms, duck_ms, engine_ms / duck_ms))
     return rows
 
 
