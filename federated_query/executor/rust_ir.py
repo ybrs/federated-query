@@ -12,6 +12,7 @@ model. Anything not yet supported raises ``UnsupportedIR`` rather than emitting
 a plan that would silently produce wrong rows.
 """
 
+import json
 import os
 
 from sqlglot import exp
@@ -32,8 +33,10 @@ from ..plan.expressions import (
     Literal,
     UnaryOp,
     UnaryOpType,
+    expression_children,
 )
 from ..plan.logical import JoinType
+from ..optimizer.decorrelation import _replace_column_refs
 from ..optimizer.estimate_defaults import larger_estimated_side
 from ..plan.physical import (
     PhysicalAliasedRelation,
@@ -364,6 +367,12 @@ class _Ctx:
         self.steps = []
         self.fragments = {}
         self.names = _Names()
+        # One binding per DISTINCT step content (source scans, key
+        # collections, injected scans keyed by everything but the output
+        # name): two plan branches reading the same data share one read
+        # (q70 fetched the same reduced fact twice for its main rollup and
+        # its ranked-states subquery).
+        self.step_cache = {}
         # Bindings of base scans already emitted with an injected dynamic
         # filter, keyed by node id: when the probe of a reduction is a
         # composite (wrapper layers over a single-source base), the base is
@@ -444,17 +453,111 @@ PARALLEL_SCAN_MIN_ROWS = 50_000
 
 def _emit_source(node, ctx):
     """A source scan run natively (structured+parallel when it qualifies)."""
-    binding = ctx.names.binding()
-    ctx.steps.append(
-        {
-            "op": "source_scan",
-            "datasource": node.datasource,
-            "scan": _source_scan_spec(node),
-            "binding": binding,
-        }
-    )
+    step = {
+        "op": "source_scan",
+        "datasource": node.datasource,
+        "scan": _source_scan_spec(node),
+        "binding": ctx.names.binding(),
+    }
+    binding = _emit_step_once(ctx, step, key=_scan_share_key(node, step))
     ctx.scan_bindings[id(node)] = binding
     return binding
+
+
+def _scan_share_key(node, step):
+    """A scan step's sharing identity, alias-neutral when possible.
+
+    Two identical reads under different aliases render different SQL (the
+    alias qualifies the WHERE columns), so the key renders a CLONE under a
+    fixed alias - the alias inside a self-contained scan is invisible to
+    consumers. q70's two date_dim reads differed only this way, which kept
+    their key collections and injected fact reads apart. Falls back to the
+    literal step identity when the shape does not canonicalize."""
+    if not isinstance(node, PhysicalScan) or not _injectable_scan(node):
+        return _step_cache_key(step)
+    fields = {
+        "op": step["op"],
+        "datasource": node.datasource,
+        "schema": node.schema_name,
+        "table": node.table_name,
+        "materialize": step.get("materialize", False),
+        "sql": _canonical_scan_sql(node),
+    }
+    return json.dumps(fields, sort_keys=True)
+
+
+def _canonical_scan_sql(node):
+    """The scan rendered under a fixed alias, with its filter references
+    requalified to match; used only as a sharing key."""
+    filters = node.filters
+    if filters is not None:
+        mapping = {}
+        for ref in _expression_refs(filters):
+            mapping[(ref.table, ref.column)] = ref.model_copy(
+                update={"table": "__cse__"}
+            )
+        filters = _replace_column_refs(filters, mapping)
+    clone = node.model_copy(update={"alias": "__cse__", "filters": filters})
+    return clone._render_source_sql()
+
+
+def _expression_refs(expr):
+    """Every ColumnRef in an expression tree."""
+    refs = []
+    if isinstance(expr, ColumnRef):
+        refs.append(expr)
+        return refs
+    for child in expression_children(expr):
+        refs.extend(_expression_refs(child))
+    return refs
+
+
+def _emit_step_once(ctx, step, key=None):
+    """Append a producing step unless an identical one (same op and inputs,
+    ignoring the output name) already ran; return the binding that holds
+    the data either way. The engine's use counting handles the sharing.
+
+    For structured scans the COLUMN LIST is excluded from the identity and
+    widened to the union on a hit: two branches reading different columns
+    of the same rows share one read (q70's rollup and its ranked-states
+    subquery scan the same reduced fact), and consumers resolve their
+    columns by name, so extra columns are invisible to them."""
+    if key is None:
+        key = _step_cache_key(step)
+    cached = ctx.step_cache.get(key)
+    if cached is not None:
+        _widen_cached_columns(cached, step)
+        return cached["binding"]
+    ctx.steps.append(step)
+    ctx.step_cache[key] = step
+    return step["binding"]
+
+
+def _step_cache_key(step) -> str:
+    """A step's identity: every field except its output name and, for a
+    structured scan spec, its mergeable column list."""
+    key_fields = {}
+    for field, value in step.items():
+        if field == "binding":
+            continue
+        if field == "scan" and isinstance(value, dict) and "columns" in value:
+            narrowed = dict(value)
+            narrowed.pop("columns")
+            key_fields[field] = narrowed
+            continue
+        key_fields[field] = value
+    return json.dumps(key_fields, sort_keys=True)
+
+
+def _widen_cached_columns(cached, step) -> None:
+    """Widen an already-emitted scan's columns to cover a new consumer's."""
+    cached_scan = cached.get("scan")
+    new_scan = step.get("scan")
+    if not isinstance(cached_scan, dict) or "columns" not in cached_scan:
+        return
+    for column in new_scan["columns"]:
+        if column not in cached_scan["columns"]:
+            cached_scan["columns"].append(column)
 
 
 def _source_scan_spec(node):
@@ -1482,8 +1585,9 @@ def _emit_keys_for(ctx, build_child, build_binding, build_key_expr):
         anchor_key = _physical_column_name(build_key_expr, build_child.column_aliases())
     else:
         anchor_binding, anchor_key = anchor
-    keys_binding = ctx.names.binding()
-    _emit_collect_distinct(ctx, anchor_binding, anchor_key, keys_binding)
+    keys_binding = _emit_collect_distinct(
+        ctx, anchor_binding, anchor_key, ctx.names.binding()
+    )
     return keys_binding, anchor_key
 
 
@@ -1557,9 +1661,9 @@ def _emit_base_injection(ctx, base, inject_col, reduction):
     if winner is not None and winner["build"] is not reduction["build"]:
         keys_binding, build_key = _winner_keys(ctx, winner)
         column = winner["columns"][id(base)]
-    base_binding = ctx.names.binding()
-    _emit_injected_scan(ctx, base, column, keys_binding, base_binding, build_key)
-    return base_binding
+    return _emit_injected_scan(
+        ctx, base, column, keys_binding, ctx.names.binding(), build_key
+    )
 
 
 def _winner_keys(ctx, winner):
@@ -1657,8 +1761,7 @@ def _emit_build_side(ctx, build_child):
     if cached is not None:
         return cached
     if isinstance(build_child, PhysicalScan):
-        binding = ctx.names.binding()
-        _emit_build_scan(ctx, build_child, binding)
+        binding = _emit_build_scan(ctx, build_child, ctx.names.binding())
         ctx.build_bindings[id(build_child)] = binding
         return binding
     binding = _emit(build_child, ctx)
@@ -1669,36 +1772,40 @@ def _emit_build_side(ctx, build_child):
 def _emit_build_scan(ctx, build_child, binding):
     """A fully materialized build-side scan (it is also distinct-scanned).
     Uses the same spec choice as a plain source scan, so a big PostgreSQL
-    build side also gets the ctid-parallel read."""
-    ctx.steps.append(
-        {
-            "op": "source_scan",
-            "datasource": build_child.datasource,
-            "scan": _source_scan_spec(build_child),
-            "binding": binding,
-            "materialize": True,
-        }
-    )
-    ctx.scan_bindings[id(build_child)] = binding
+    build side also gets the ctid-parallel read. Returns the binding that
+    holds the data (a shared one when an identical scan already ran)."""
+    step = {
+        "op": "source_scan",
+        "datasource": build_child.datasource,
+        "scan": _source_scan_spec(build_child),
+        "binding": binding,
+        "materialize": True,
+    }
+    shared = _emit_step_once(ctx, step, key=_scan_share_key(build_child, step))
+    ctx.scan_bindings[id(build_child)] = shared
+    return shared
 
 
 def _emit_collect_distinct(ctx, input_binding, key, binding):
-    """Collect the build side's distinct join-key values, capped."""
-    ctx.steps.append(
+    """Collect the build side's distinct join-key values, capped. Returns
+    the binding holding the keys (shared when identical)."""
+    return _emit_step_once(
+        ctx,
         {
             "op": "collect_distinct",
             "input": input_binding,
             "key": key,
             "cap": _DYNAMIC_FILTER_MAX_KEYS,
             "binding": binding,
-        }
+        },
     )
 
 
 def _emit_injected_scan(ctx, base, inject_col, keys_binding, binding, build_key):
     """A probe base with the build's keys pushed in as `col IN (...)`. The
     probe column's NDV rides along so the engine's delivery-strategy guard
-    prices the fetched fraction as keys/NDV instead of keys/row-count."""
+    prices the fetched fraction as keys/NDV instead of keys/row-count.
+    Returns the binding holding the rows (shared when identical)."""
     step = {
         "op": "injected_scan",
         "datasource": base.datasource,
@@ -1710,7 +1817,7 @@ def _emit_injected_scan(ctx, base, inject_col, keys_binding, binding, build_key)
     ndv = _node_column_ndv(base, inject_col)
     if ndv is not None:
         step["inject_column_ndv"] = ndv
-    ctx.steps.append(step)
+    return _emit_step_once(ctx, step)
 
 
 def _injected_probe_spec(base, inject_col, build_key):
