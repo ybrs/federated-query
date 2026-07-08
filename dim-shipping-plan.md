@@ -10,7 +10,20 @@ returns. This generalizes: any fact-heavy subtree blocked from collapsing
 by one or two small foreign dims (q39, parts of q70/q75, the remaining
 q23/q14 costs).
 
-ASCII only. Status: IN PROGRESS.
+ASCII only. Status: Phase A DONE (fedqrs 082e4c7 - Ship step, pinned
+duck connections, drop guard; inert until the planner emits it). Phase B
+OPEN QUESTION before implementation: the island containing the shipped
+table gets its schema probed (LIMIT 0) on the PYTHON-side connection,
+where the temp table never exists - either PhysicalRemoteQuery must build
+its schema from the bound select items' data_types instead of probing, or
+the synthetic scan must carry a seeded schema end to end. Decide there
+first; the rest of Phase B is mechanical (Shipment wrapper node mirroring
+CTE, DimShippingRule after join ordering, synthetic Scan with
+schema_name='temp' - verified duck resolves 2-part temp."x").
+
+CONTEXT SHIFT: with CSE + multi-injection landed, SF10 totals reached
+1.00x vs DuckDB - parity. Dim shipping's remaining value is q39 (2.4s,
+5.8x) and the long tail, not the totals.
 
 ## Mechanism
 
