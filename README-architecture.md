@@ -200,6 +200,9 @@ Cross-source operators (each emitted as one fedqrs merge fragment):
   (a column-passthrough wrapper whose IR emit just re-qualifies its input).
 - CTE materialization: `PhysicalCTE`, `PhysicalCTEScan`,
   `PhysicalCTEMergeQuery`.
+- `PhysicalShipment` - materializes a small dimension into the fact's source as
+  a temp table so a cross-source fact-dimension subtree collapses into one
+  island (dim shipping, section 4.7.1).
 
 Which of these actually have an IR emitter is decided by `_NODE_EMITTERS` in
 `executor/rust_ir.py` - the source of truth. Some nodes (e.g. `PhysicalUnion`,
@@ -452,6 +455,43 @@ the probe) is not run here - it is emitted as `collect_distinct` +
 projection with window functions becomes `PhysicalWindow` (`_plan_projection`).
 
 Output: a `PhysicalPlanNode` tree.
+
+### 4.7.1 Dim shipping (`optimizer/dim_shipping.py`)
+
+Before the per-node cross-source dispatch, `_plan_node` tries ONE more
+same-source collapse: `DimShipping.try_ship(node)`. When a large fact on one
+source joins small dimensions on another and the query GROUPS BY dimension
+columns, the fact cannot collapse into its own source and every fact row must
+cross to the coordinator. Dim shipping instead SHIPS the small dimensions INTO
+the fact's source as temp tables, so the whole join+aggregate runs as one island
+there and only the aggregate OUTPUT crosses. It rewrites each foreign `Scan`
+into a temp-table `Scan` on the fact's source, collapses the rewritten subtree
+with `SingleSourcePushdown.try_build` into one island, and wraps it in a
+`PhysicalShipment` per shipped dimension (`plan/physical.py`). The engine
+materializes each shipment (`fedqrs` `connectors::ship_table`: a DuckDB pinned
+TEMP TABLE, or a Postgres `pg_temp` table via ADBC binary-COPY, ANALYZEd after
+ingest and dropped at query end) before the island reads it. The island carries
+a SEEDED schema from the pure cross-source plan, because a temp table that does
+not yet exist cannot be probed python-side.
+
+Correctness rests on shipping only across deterministic, row-preserving-or-
+reducing nodes and INNER equi joins (a foreign relation is evaluated and joined
+identically to how the coordinator join would), so a shipped plan returns
+exactly the rows the pure plan would. The GATE is a HEURISTIC, not a cost
+decision - the cost model cannot estimate whether an aggregate COLLAPSES (the
+NDV-independence product over-counts a correlated multi-column group; see the
+`dim-shipping-*` docs). It ships only when: the root is a plain (non-rollup)
+aggregate; the fact is genuinely large and each shipped dimension is small and
+known (declining on any defaulted size); the island's outputs match the pure
+plan's; and - the collapse guard - the aggregate's GROUP BY does NOT span two or
+more independent high-cardinality SOURCE DIMENSIONS (`_dimension_explosion`,
+`HIGH_CARD_NDV`). That last guard counts distinct high-card OWNER relations, not
+high-card keys, so correlated keys from one dimension (an id and its description)
+count once and still ship, while a genuinely explosive group (item x date) is
+declined and keeps the pipelined no-ship plan. A hard runtime row cap in
+`ship_table` (`SHIP_MAX_ROWS`) is the safety backstop against a stale-stats
+mis-ship - it raises loudly rather than ingest a giant relation. Kill switch:
+`FEDQ_DIM_SHIPPING=0`.
 
 ### 4.8 Execute (`executor/executor.py`)
 

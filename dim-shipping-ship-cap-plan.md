@@ -7,6 +7,17 @@ it a bomb?"). This plan takes the two hardening items that section lists as
 estimator work (sections 1-3), which the doc marks as large and not required
 for safety.
 
+STATUS: LANDED 2026-07-09 (fedqrs `connectors.rs`). Both items implemented:
+(1) a hard row cap `SHIP_MAX_ROWS = 50_000_000` in `ship_table` that raises
+loudly before ingesting an over-cap relation; (2) `ANALYZE` on the shipped
+Postgres temp table after ingest. The cap value differs from the 2M this plan
+first proposed: a safety valve has no query-derived "right" number, so it is set
+to a deliberately large fixed constant (per the user's call) and will move to
+user-overridable settings later; the planner's own SHIP_ROW_BUDGET (~200k
+estimated) is what keeps legitimate ships small, so the cap only ever fires on a
+stale-stats blowup. Verified: TPC-DS SF10 adversarial (ships into pg) stays
+green with ANALYZE in the path; no TPC-DS ship approaches the cap.
+
 Scope note: section 5 (the psycopg2 client_encoding=UTF8 latent bug) is ALREADY
 FIXED on `feature/cost-based-optimizer` (commit ca13e1a) - nothing to do here.
 

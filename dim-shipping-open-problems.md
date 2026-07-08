@@ -99,6 +99,16 @@ to ~20 and `i_item_sk` (q23) resolves to ~100k. That is a cost-model project
 
 ## 4. Tail risk / "is it a bomb?" - mostly bounded, one real edge
 
+RESOLVED 2026-07-09 (fedqrs `connectors.rs`; see
+`dim-shipping-ship-cap-plan.md`). The proposed hardening below is now
+implemented: a hard row cap `SHIP_MAX_ROWS = 50_000_000` in `ship_table` raises
+loudly BEFORE ingesting an over-cap relation (converting a stale-stats runaway
+into an immediate honest crash), and the shipped Postgres temp table is ANALYZEd
+after ingest so the island join is planned over real stats. The cap is a fixed
+constant for now (a safety valve has no query-derived right value; the planner's
+SHIP_ROW_BUDGET keeps legitimate ships small) and will move to user-overridable
+settings later.
+
 Concern: on a very large table, could a wrong ship decision be catastrophic
 (saturate the network, hammer Postgres, run for hours)?
 
