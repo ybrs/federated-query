@@ -27,12 +27,15 @@ from ..plan.logical import (
 from . import pushdown
 from .scope_validator import validate_scope
 from ..plan.expressions import (
+    BinaryOp,
+    BinaryOpType,
     ColumnRef,
     Expression,
     FunctionCall,
     InList,
     InSubquery,
     BetweenExpression,
+    Literal,
     QuantifiedComparison,
     SUBQUERY_NODE_TYPES,
     and_expressions,
@@ -523,8 +526,64 @@ class PredicatePushdownRule(OptimizationRule):
         if join.join_type != JoinType.INNER:
             return self._push_filter_below_outer_join(filter_node, join)
         conjuncts = split_conjuncts(filter_node.predicate)
+        conjuncts = conjuncts + self._transitive_constants(conjuncts, join)
         groups = self._group_join_conjuncts(conjuncts, join)
         return self._assemble_pushed_join(join, groups)
+
+    def _transitive_constants(self, conjuncts, join) -> list:
+        """Constants implied through the join's equality condition.
+
+        A filter conjunct ``a = lit`` plus a condition conjunct ``a = b``
+        implies ``b = lit`` - which DuckDB derives and we did not, so q78's
+        year restriction never reached two of its three channel CTEs (their
+        refs sit under the JOIN, restricted only transitively) and 90
+        percent of catalog_sales shipped. Exact for the preserved-filter
+        case: rows failing the derived constant could only ever match rows
+        the original filter drops."""
+        literals = {}
+        for conjunct in conjuncts:
+            self._note_literal_equality(conjunct, literals)
+        if not literals or join.condition is None:
+            return []
+        return self._derive_from_condition(join, literals, conjuncts)
+
+    def _note_literal_equality(self, conjunct, literals) -> None:
+        """Record a ``column = literal`` conjunct (either orientation)."""
+        if not isinstance(conjunct, BinaryOp) or conjunct.op != BinaryOpType.EQ:
+            return
+        if isinstance(conjunct.left, ColumnRef) and isinstance(conjunct.right, Literal):
+            literals[(conjunct.left.table, conjunct.left.column)] = conjunct.right
+        if isinstance(conjunct.right, ColumnRef) and isinstance(conjunct.left, Literal):
+            literals[(conjunct.right.table, conjunct.right.column)] = conjunct.left
+
+    def _derive_from_condition(self, join, literals, conjuncts) -> list:
+        """The derived ``other = lit`` conjuncts, deduplicated against what
+        is already present (the rule runs to a fixed point)."""
+        derived = []
+        present = list(conjuncts) + split_conjuncts(join.condition)
+        for equi in split_conjuncts(join.condition):
+            candidate = self._transit_one(equi, literals)
+            if candidate is None:
+                continue
+            if candidate not in present and candidate not in derived:
+                derived.append(candidate)
+        return derived
+
+    def _transit_one(self, equi, literals):
+        """``other = lit`` for one condition equality, or None."""
+        if not isinstance(equi, BinaryOp) or equi.op != BinaryOpType.EQ:
+            return None
+        if not isinstance(equi.left, ColumnRef) or not isinstance(
+            equi.right, ColumnRef
+        ):
+            return None
+        for source, target in ((equi.left, equi.right), (equi.right, equi.left)):
+            literal = literals.get((source.table, source.column))
+            if literal is not None:
+                # The derived constant: target equals the same literal the
+                # source column is pinned to through the join equality.
+                return BinaryOp.create(op=BinaryOpType.EQ, left=target, right=literal)
+        return None
 
     # Join types whose single-sided condition conjuncts may move into the
     # NON-PRESERVED input: matching is unchanged for every preserved row, and
@@ -599,8 +658,36 @@ class PredicatePushdownRule(OptimizationRule):
         if preserved is None:
             return self._rehome_filter_over_join(filter_node, join)
         conjuncts = split_conjuncts(filter_node.predicate)
+        join = self._widen_condition_transitively(join, conjuncts, preserved)
+        # A join under a residual filter is never visited BARE by the walker,
+        # so its single-sided condition conjuncts (including the transitive
+        # constants just derived) must migrate here or never (q78's cs body).
+        join = self._push_join_condition(join)
         down, keep = self._partition_preserved(conjuncts, join, preserved)
         return self._assemble_outer_join(filter_node, join, down, keep, preserved)
+
+    def _widen_condition_transitively(self, join, conjuncts, preserved) -> Join:
+        """AND constants derived from PRESERVED-side filter conjuncts into the
+        outer join's condition (q78: ``ss_sold_year = 2000`` above plus
+        ``ws_sold_year = ss_sold_year`` in the ON implies ``ws_sold_year =
+        2000``). Exact: rows failing the derived constant could only match
+        preserved rows the filter above drops, and adding a condition
+        conjunct never changes which preserved rows survive. The existing
+        condition-push then sinks it into the nullable input."""
+        preserved_input = join.left if preserved == "left" else join.right
+        nullable_input = join.right if preserved == "left" else join.left
+        preserved_cols = pushdown.available_columns(preserved_input)
+        nullable_cols = pushdown.available_columns(nullable_input)
+        anchored = []
+        for conjunct in conjuncts:
+            names = pushdown.qualified_or_bare_names(conjunct)
+            if pushdown.columns_belong_to_side(names, preserved_cols, nullable_cols):
+                anchored.append(conjunct)
+        derived = self._transitive_constants(anchored, join)
+        if not derived:
+            return join
+        widened = combine_and(split_conjuncts(join.condition) + derived)
+        return join.model_copy(update={"condition": widened})
 
     def _preserved_side(self, join_type) -> Optional[str]:
         """The join side whose rows always survive ('left'/'right'), None for FULL.
