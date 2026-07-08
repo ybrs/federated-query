@@ -39,50 +39,57 @@ extras yet - primary reduction still applies, join keeps exactness).
 Effect: q46 1431->471ms, q68 1491->350ms. Test:
 `tests/test_reduction_gate.py::test_injection_candidates_rank_smallest_build_first`.
 
-### 3. Dim shipping - PHASE A DONE (fedqrs 082e4c7), PHASE B OPEN
-Plan: `dim-shipping-plan.md`. Idea: ship a SMALL filtered foreign dim INTO
-the fact's DuckDB source as a temp table, so the whole join+aggregate
-collapses to one duck island and only the aggregate OUTPUT returns (q39's
-26.5M inventory rows never move; target ~411ms like DuckDB's own).
+### 3. Dim shipping - PHASE A + PHASE B DONE 2026-07-08
+Plan: `dim-shipping-plan.md` (Phase B section). Open problems + safety:
+`dim-shipping-open-problems.md`. Commits: fedqrs `feature/dim-shipping-pg`
+(fad52a3, pg ship target - NOT merged to main); federated-query
+`feature/cost-based-optimizer` (7f7c220 Phase B + d0f2ccd .create comments).
 
-PHASE A landed inert (no planner emits it yet):
-- IR `Step::Ship {datasource, input, table}` (core/src/ir.rs).
-- engine arm forces the input, calls `connectors::ship_table` (engine.rs).
-- `connectors::ship_table` CREATEs a duck TEMP TABLE on a connection PINNED
-  in `PINNED_DUCK` (temp objects are per-connection; `duck_cursor` clones
-  cannot see them). `fetch_duckdb` routes through the pinned connection when
-  one exists for that db path. `ShipmentGuard` (Drop) + `clear_shipments()`
-  at execute() entry drop pins (and temp tables) on every exit path.
-- use-count scan bumps the shipped input; profiler prints a `ship` line.
+Ship a small foreign dim INTO the fact's source (DuckDB via pinned-connection
+TEMP TABLE, or Postgres via ADBC-COPY into a pg_temp table dropped at query
+end) so the whole join+aggregate collapses to ONE island there and only the
+aggregate OUTPUT crosses. The optimizer chooses the target by cost among
+sources with the new SHIP_TARGET capability (DuckDB + Postgres; not Parquet).
 
-PHASE B - the ONE blocker to solve FIRST, then the rest is mechanical:
-- BLOCKER: the island that reads the shipped table gets its output schema
-  probed with a `LIMIT 0` query on the PYTHON-side datasource connection,
-  where the temp table does NOT exist (it lives only on the engine's pinned
-  Rust-side duck connection). Fix options: (a) make PhysicalRemoteQuery
-  derive its schema from the bound select items' `data_type`s instead of
-  probing, or (b) carry a seeded schema on the synthetic scan end to end.
-  Prefer (a) - it removes a network round-trip for every island anyway.
-- THEN mechanical: a `Shipment` wrapper plan node (mirror `CTE`: holds the
-  foreign subtree + a name, child references it); a `DimShippingRule` after
-  join ordering that, for a cross-source INNER equi join whose FOREIGN side
-  output-estimate < SHIP_ROW_BUDGET (~100k) and whose LOCAL side is
-  otherwise single-source, replaces the foreign subtree with a synthetic
-  `Scan(datasource=<local>, schema_name='temp', table=__fedq_ship_N,
-  columns=<foreign outputs>)` and records the shipment; emitter emits the
-  foreign subtree then a `ship` step before the island scan. Duck resolves
-  a 2-part `temp."__fedq_ship_N"` reference (VERIFIED). Cost gate: ship only
-  when local-est / foreign-est > ~50x AND foreign-est known; unknown =
-  DECLINE (a mis-shipped big dim floods the source).
-- GATES: pytest; staged SF10 engine+compare on {39,75,23,14}+full 99;
-  SF0.1/SF1; TPC-H fedpgduck (dims are pg-side there - watch orientation).
+The Phase-B blocker (island schema probed python-side where the temp table
+does not exist) was solved by SEEDING the island schema, not probing: the IR
+ships no types to Rust (Rust reconciles from executed batches), python needs
+only names, and the exact schema is free from the pure cross-source plan
+(plan_without_shipping). seeded_schema field on PhysicalScan/RemoteQuery.
+
+Correct 99|0|0 at SF0.1/SF1/SF10 (pg-dims) + 99|0|0 adversarial (ships into
+pg) + TPC-H 22/22; net perf-positive at SF10 (70.6s vs 73.1s no-ship). q39
+SF10 2.5s->1.6s, SF1 776ms->177ms. Kill switch FEDQ_DIM_SHIPPING=0.
+
+GATE is a HEURISTIC, not a cost decision (the cost model cannot estimate
+aggregate collapse - see open-problems doc). Ship only a plain (non-rollup)
+aggregate root, INNER joins, writable target, fact-large/foreign-small/ratio,
+no window in the fallback, island outputs == pure-plan outputs.
 
 ---
 
 ## OPEN ISSUES
 
-None blocking correctness. The only open perf item is dim-shipping Phase B
-(see the resumable section above). q18 is RESOLVED 2026-07-07 (commit
+None blocking correctness (99|0|0 everywhere). Dim shipping is DONE but has
+OPEN PROBLEMS to revisit - full detail in `dim-shipping-open-problems.md`:
+- Residual perf: q23 (a PLAIN aggregate that does NOT collapse - 28.8M->13.8M)
+  slips past the structural gate and regresses ~13%/~0.8s. Cannot be gated
+  without multi-column-distinct estimation (the cost model reports "no
+  collapse" for the WINNER q39 too - NDV independence + defaulting). Option 2
+  (group-width guard) investigated and reverted: it also declines q39.
+- TAIL-RISK HARDENING (do first, highest priority): a HARD RUNTIME CAP on the
+  shipped relation size in `connectors::ship_table` (raise loudly above ~2M
+  rows) so a stale-stats mis-ship fails fast instead of hammering pg with a
+  giant COPY. Transfer/compute worst case is otherwise a bounded constant
+  factor, but the ingest is the one unbounded edge. Plus ANALYZE the pg temp
+  table after ingest.
+- LATENT BUG (independent, found via the option-2 probe): `PostgreSQLDataSource
+  .connect()` builds the psycopg2 pool WITHOUT client_encoding='UTF8', so
+  collecting pg_stats for a non-ASCII TEXT column crashes fetchall() with
+  UnicodeDecodeError (0xc3). One-line fix. Any plan needing stats for a
+  non-ASCII text column hits it.
+
+q18 is RESOLVED 2026-07-07 (commit
 05b1dcd) and was never an engine
 bug: the raw values are engine `206.98499999999999` vs oracle `206.985` -
 diff 1.4e-14, pure float64 summation ORDER (a distributed plan and a single
