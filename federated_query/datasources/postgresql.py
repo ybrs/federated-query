@@ -100,6 +100,11 @@ class PostgreSQLDataSource(DataSource):
             database=self.config["database"],
             user=self.config["user"],
             password=self.config["password"],
+            # Force UTF-8 client decoding: pg_stats histogram bounds (and any
+            # other text read through psycopg2) can hold non-ASCII values, and
+            # without this psycopg2 decodes as ASCII and fetchall() raises
+            # UnicodeDecodeError on the first accented name/country/email.
+            client_encoding="UTF8",
         )
         self._connected = True
         logger.info(f"Successfully connected to PostgreSQL: {self.name}")
