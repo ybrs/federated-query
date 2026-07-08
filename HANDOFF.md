@@ -152,8 +152,18 @@ allowlist, so its HAVING subquery's 99.99-percent filter stayed at the
 coordinator and the whole fact shipped twice - one walker arm (522267b)
 took it 2037 -> 225ms (the walker-descent lesson AGAIN). BOARD after:
 SF10 totals 81.7s vs 71.4s (1.14x), geomean 1.81x, 99|0|0; tpch 22/22
-1.76x. Remaining ratio outliers: q06 11x (scalar-avg chain), q70 7.2x,
-q46/q68 ~6.6x, q39 5.8x, q78 5.7x absolute 7.1s (largest; SMJ region).
+1.76x. q06 was ALSO not what it looked like: 'd_month_seq = (scalar
+subquery)' decorrelated to LEFT-ON-TRUE + residual filter = a cross join
+the reduction machinery cannot see; when the residual is a plain equality
+with one column per side, the LEFT join now tightens to an INNER equi
+join (70087b6; exact because the guarded single row makes the shapes
+identical) - q06 2330 -> 273ms. BOARD 2026-07-08 end of day: SF10 totals
+79.8s vs 71.4s (1.12x), geomean 1.78x, 99|0|0 at all three scales; tpch
+22/22 1.77x. Remaining: q70 7.2x/1.4s (two REAL fact reads - ranked-states
+subquery; needs CSE), q46/q68 ~6.5x/1.6s (853ms collect forced on a join
+region; injected-binding anchor attempt made it WORSE - reverted, needs
+region-level thought), q39 5.8x, q78 5.7x/7.1s (SMJ region, largest
+absolute), q16/q03 sub-second fixed-overhead.
 
 STAGED TALLIES (52d9428): truth+oracle results are pure functions of the
 data, so `--mode save-refs` caches them once per scale
