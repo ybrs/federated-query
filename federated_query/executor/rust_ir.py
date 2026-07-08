@@ -1653,17 +1653,44 @@ def _emit_probe(ctx, probe_child, probe_key_expr, reduction):
 
 
 def _emit_base_injection(ctx, base, inject_col, reduction):
-    """One injected read of a base, using the planned winner's keys when a
-    more selective candidate targets the same base."""
-    winner = ctx.injection_winners.get(id(base))
+    """One injected read of a base: the most selective planned candidate is
+    the PRIMARY injection (full delivery-strategy machinery), and every
+    further candidate's keys ride along as bounded extra IN lists on the
+    same read (q46's store AND date keys now both apply)."""
+    candidates = ctx.injection_winners.get(id(base), [])
     keys_binding, build_key = reduction["keys_binding"], reduction["build_key"]
     column = inject_col
-    if winner is not None and winner["build"] is not reduction["build"]:
-        keys_binding, build_key = _winner_keys(ctx, winner)
-        column = winner["columns"][id(base)]
+    if candidates and candidates[0]["build"] is not reduction["build"]:
+        keys_binding, build_key = _winner_keys(ctx, candidates[0])
+        column = candidates[0]["columns"][id(base)]
+    extras = _extra_injections(ctx, base, column, candidates)
     return _emit_injected_scan(
-        ctx, base, column, keys_binding, ctx.names.binding(), build_key
+        ctx,
+        base,
+        column,
+        keys_binding,
+        ctx.names.binding(),
+        build_key,
+        extras=extras,
     )
+
+
+def _extra_injections(ctx, base, primary_column, candidates):
+    """The runner-up candidates as extra (column, keys) injections, capped
+    at two - each is a bonus filter, and past the best few the selectivity
+    gains vanish while the IN lists lengthen the SQL."""
+    extras = []
+    for candidate in candidates[1:]:
+        if len(extras) == 2:
+            break
+        column = candidate["columns"][id(base)]
+        if column == primary_column:
+            # A second key set on the SAME column adds nothing: the primary
+            # already restricts it, and the join enforces exactness.
+            continue
+        keys_binding, _ = _winner_keys(ctx, candidate)
+        extras.append({"column": column, "keys_from": keys_binding})
+    return extras
 
 
 def _winner_keys(ctx, winner):
@@ -1710,8 +1737,10 @@ def _reduction_applies(join) -> bool:
 
 
 def _note_candidate(winners, join):
-    """Record this join's reduction against every base it traces to,
-    keeping the candidate with the smaller build output (fewer keys)."""
+    """Record this join's reduction against every base it traces to. All
+    candidates are kept, ordered by build output (fewest donated keys
+    first): the best one becomes the PRIMARY injection, the rest ride
+    along as bounded extra IN lists on the same read."""
     build, probe, build_key, probe_key = _orient_join(join)
     bases = _probe_injection_bases(probe, probe_key)
     if bases is None:
@@ -1723,14 +1752,24 @@ def _note_candidate(winners, join):
     for base, _ in bases:
         if _subtree_contains(build, base):
             continue
-        current = winners.get(id(base))
-        if current is None or score < current["score"]:
-            winners[id(base)] = {
-                "build": build,
-                "build_key": build_key,
-                "columns": columns,
-                "score": score,
-            }
+        candidate = {
+            "build": build,
+            "build_key": build_key,
+            "columns": columns,
+            "score": score,
+        }
+        entries = winners.setdefault(id(base), [])
+        if not _candidate_known(entries, candidate):
+            entries.append(candidate)
+            entries.sort(key=lambda entry: entry["score"])
+
+
+def _candidate_known(entries, candidate) -> bool:
+    """Whether an equivalent candidate (same build node) is already listed."""
+    for entry in entries:
+        if entry["build"] is candidate["build"]:
+            return True
+    return False
 
 
 def _candidate_score(build):
@@ -1801,7 +1840,9 @@ def _emit_collect_distinct(ctx, input_binding, key, binding):
     )
 
 
-def _emit_injected_scan(ctx, base, inject_col, keys_binding, binding, build_key):
+def _emit_injected_scan(
+    ctx, base, inject_col, keys_binding, binding, build_key, extras=None
+):
     """A probe base with the build's keys pushed in as `col IN (...)`. The
     probe column's NDV rides along so the engine's delivery-strategy guard
     prices the fetched fraction as keys/NDV instead of keys/row-count.
@@ -1817,6 +1858,8 @@ def _emit_injected_scan(ctx, base, inject_col, keys_binding, binding, build_key)
     ndv = _node_column_ndv(base, inject_col)
     if ndv is not None:
         step["inject_column_ndv"] = ndv
+    if extras:
+        step["extra_injections"] = extras
     return _emit_step_once(ctx, step)
 
 

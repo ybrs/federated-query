@@ -595,10 +595,12 @@ def test_traced_bases_descend_into_every_union_branch():
     assert sales in found and returns in found
 
 
-def test_injection_winner_is_the_smallest_build_not_the_innermost():
-    """Two reducible joins trace to the SAME fact base: the candidate whose
-    build donates FEWER keys must win, regardless of join nesting (q33
-    injected 90k address keys and left the 31 date keys unused)."""
+def test_injection_candidates_rank_smallest_build_first():
+    """Two reducible joins trace to the SAME fact base: every candidate is
+    kept, ordered by donated keys - the smallest becomes the PRIMARY
+    injection and the runner-up rides along as an extra IN list (q33
+    injected 90k address keys and left the 31 date keys unused; q46 now
+    applies store AND date keys on one read)."""
     from federated_query.executor.rust_ir import _injection_winners
 
     fact = _est_scan(
@@ -618,4 +620,7 @@ def test_injection_winner_is_the_smallest_build_not_the_innermost():
     outer = _inner(inner, date, _col("ss", "ss_date_sk"), _col("d", "d_date_sk"))
     winners = _injection_winners(outer)
     assert id(fact) in winners
-    assert winners[id(fact)]["build"] is date, "the 31-key date build must win"
+    candidates = winners[id(fact)]
+    assert len(candidates) == 2, "both dimensions must be listed"
+    assert candidates[0]["build"] is date, "the 31-key date build ranks first"
+    assert candidates[1]["build"] is addr, "the address build rides as extra"
