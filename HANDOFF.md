@@ -169,8 +169,22 @@ SMJ regime. BOARD: SF10 totals 76.4s vs 71.4s (1.07x!), geomean 1.77x,
 99|0|0 all scales, tpch 22/22 1.76x. Remaining: q70 7.2x/1.4s (two real
 fact reads, needs CSE), q46/q68 ~6.5x/1.5s (multi-injection would AND
 store+date keys), q39 5.8x (transfer floor - dim shipping), q78 2.7x/3.3s,
-q16/q54/q03 sub-second overhead. Next features by leverage: true
-multi-injection per base; identical-scan CSE; dim-shipping temp tables.
+q16/q54/q03 sub-second overhead. CSE + MULTI-INJECTION LANDED
+(4bd23d3 identical-step CSE with alias-neutral scan identity and
+column-union widening; 77ac78e/843feac multi-injection - runner-up
+candidates ride as extra IN lists on one read): q46 1431 -> 471ms, q68
+1491 -> 350ms, q31 -> 450ms, q44 -> 163ms.
+
+PARITY BOARD 2026-07-08: SF10 totals 71.30s vs DuckDB 71.36s = 1.00x,
+geomean 1.61x, 99|0|0; SF1 totals 1.48x geo 1.64x; SF0.1 geo 2.34x; TPC-H
+22/22 at 1.75x. THE FEDERATED ENGINE TIES SINGLE-NODE DUCKDB ON TPC-DS
+SF10 TOTALS WITH FULL CORRECTNESS AT EVERY SCALE.
+
+Dim shipping: Phase A (engine Ship step, pinned duck connections) landed
+inert (fedqrs 082e4c7); Phase B blocked on one design question (see
+dim-shipping-plan.md - island schema probing on the python-side
+connection). Remaining tail is geomean now: q39 5.8x/2.4s (dim shipping's
+target), q70 ~7x/1.2s (subplan CSE), sub-second overhead family.
 
 STAGED TALLIES (52d9428): truth+oracle results are pure functions of the
 data, so `--mode save-refs` caches them once per scale
