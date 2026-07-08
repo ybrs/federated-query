@@ -154,7 +154,10 @@ def test_where_not_in_subquery(single_source_env):
 
 
 def test_scalar_subquery_max(single_source_env):
-    """A scalar ``= (SELECT MAX(...))`` pushes as a LEFT JOIN, no subquery expr."""
+    """A scalar ``= (SELECT MAX(...))`` pushes as an INNER equi join, no
+    subquery expr: the guarded single row makes LEFT-ON-TRUE plus the
+    equality filter identical to the equi join, and the equi join is what
+    the semi-join reduction machinery can see (the q06 fix)."""
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id, price FROM duckdb_primary.main.orders "
@@ -163,7 +166,7 @@ def test_scalar_subquery_max(single_source_env):
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
-    assert "LEFT" in _join_kinds(ast)
+    assert "INNER" in _join_kinds(ast)
     _assert_no_subquery_expressions(ast)
 
 

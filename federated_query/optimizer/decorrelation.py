@@ -1523,7 +1523,55 @@ class Decorrelator:
             # SEMI join; there is no residual predicate to keep.
             return domain_semi, None
         rewritten, plan = self._rewrite_value_expr(conjunct, plan)
+        tightened = self._tighten_scalar_equality(rewritten, plan)
+        if tightened is not None:
+            return tightened, None
         return plan, rewritten
+
+    def _tighten_scalar_equality(
+        self, rewritten: Expression, plan: LogicalPlanNode
+    ) -> Optional[LogicalPlanNode]:
+        """An equality residual against the just-attached scalar's value
+        column turns its LEFT-ON-TRUE join into an INNER equi join.
+
+        The filter would drop NULL extensions and non-matching rows anyway
+        (`col = NULL` is UNKNOWN), so the multiset is identical - and an
+        equi join is visible to the semi-join reduction machinery, where a
+        cross join plus filter is not: q06 shipped the whole fact because
+        `d_month_seq = (subquery)` hid the date filter this way."""
+        if not isinstance(plan, Join) or plan.join_type != JoinType.LEFT:
+            return None
+        if not self._is_true_literal(plan.condition):
+            return None
+        if not self._equality_splits_join_sides(rewritten, plan):
+            return None
+        return plan.model_copy(
+            update={"join_type": JoinType.INNER, "condition": rewritten}
+        )
+
+    def _is_true_literal(self, expr: Optional[Expression]) -> bool:
+        """Whether a join condition is the unconditional TRUE literal."""
+        return isinstance(expr, Literal) and expr.value is True
+
+    def _equality_splits_join_sides(self, rewritten: Expression, plan: Join) -> bool:
+        """Whether the residual is a plain equality with one plain column per
+        join side (the shape an equi hash join consumes exactly)."""
+        if not isinstance(rewritten, BinaryOp) or rewritten.op != BinaryOpType.EQ:
+            return False
+        if not isinstance(rewritten.left, ColumnRef):
+            return False
+        if not isinstance(rewritten.right, ColumnRef):
+            return False
+        return self._sides_split(rewritten.left, rewritten.right, plan)
+
+    def _sides_split(self, first: ColumnRef, second: ColumnRef, plan: Join) -> bool:
+        """Whether exactly one of the two refs names the scalar side's output
+        (decorrelation's __subq names are unique, so name membership is
+        unambiguous)."""
+        right_names = set(plan.right.schema())
+        first_right = first.column in right_names
+        second_right = second.column in right_names
+        return first_right != second_right
 
     def _or_conjunct_domain_semi(
         self, plan: LogicalPlanNode, conjunct: Expression
