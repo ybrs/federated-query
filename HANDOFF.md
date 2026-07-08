@@ -159,11 +159,18 @@ with one column per side, the LEFT join now tightens to an INNER equi
 join (70087b6; exact because the guarded single row makes the shapes
 identical) - q06 2330 -> 273ms. BOARD 2026-07-08 end of day: SF10 totals
 79.8s vs 71.4s (1.12x), geomean 1.78x, 99|0|0 at all three scales; tpch
-22/22 1.77x. Remaining: q70 7.2x/1.4s (two REAL fact reads - ranked-states
-subquery; needs CSE), q46/q68 ~6.5x/1.6s (853ms collect forced on a join
-region; injected-binding anchor attempt made it WORSE - reverted, needs
-region-level thought), q39 5.8x, q78 5.7x/7.1s (SMJ region, largest
-absolute), q16/q03 sub-second fixed-overhead.
+22/22 1.77x. TRANSITIVE CONSTANTS (3f0efc4): 'a = lit' filter + 'a = b' join
+equality now derives 'b = lit' (INNER routed; LEFT/SEMI/ANTI from the
+preserved side into the condition), AND the filtered-join path applies
+_push_join_condition itself - a join under a residual filter is never
+visited bare, so derived constants were stuck in the ON clause (q78's cs
+body). q78 7.2 -> 3.3s, all three channel facts date-reduced, out of the
+SMJ regime. BOARD: SF10 totals 76.4s vs 71.4s (1.07x!), geomean 1.77x,
+99|0|0 all scales, tpch 22/22 1.76x. Remaining: q70 7.2x/1.4s (two real
+fact reads, needs CSE), q46/q68 ~6.5x/1.5s (multi-injection would AND
+store+date keys), q39 5.8x (transfer floor - dim shipping), q78 2.7x/3.3s,
+q16/q54/q03 sub-second overhead. Next features by leverage: true
+multi-injection per base; identical-scan CSE; dim-shipping temp tables.
 
 STAGED TALLIES (52d9428): truth+oracle results are pure functions of the
 data, so `--mode save-refs` caches them once per scale
