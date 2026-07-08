@@ -8,6 +8,21 @@ there is one real tail-risk edge to harden.
 
 See `dim-shipping-plan.md` for the design and the gates as implemented.
 
+RESOLVED 2026-07-08 (sections 1-3, the q23 gating problem): a
+dimension-width gate now declines a plain aggregate whose GROUP BY spans two or
+more INDEPENDENT high-cardinality dimensions. Full design, measured evidence,
+and the correction to this doc's "intractable" framing are in
+`dim-shipping-collapse-gate-plan.md`. Key facts: the distinguishing signal is
+the number of distinct high-card SOURCE DIMENSIONS (owner relations), NOT the
+number of high-card keys - correlated keys from one dimension (i_item_id +
+i_item_desc) still collapse. Option 2 (group-width) looked broken only because
+`warehouse` and five other small tables had NO pg stats (nondeterministic
+autoanalyze), now fixed by ANALYZE-after-load; the psycopg2 crash it also hit is
+already fixed (ca13e1a). Measured at SF10: q23 ship declined (6.06s -> 5.22s,
+99|0|0), every shipping winner preserved (q39/q17/q25/q29/q37/q66/q82 still
+ship), SF10 pg-dims totals 71.4s -> 65.0s (0.91x vs DuckDB), geomean 1.61 ->
+1.38x. The tail-risk hardening (section 4, ship-size cap) is still OPEN.
+
 ## 1. The core problem: we cannot tell "will this aggregate collapse?"
 
 Dim shipping trades one execution shape for another:

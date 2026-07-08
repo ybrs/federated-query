@@ -60,6 +60,16 @@ SHIP_LOCAL_FLOOR = 100_000
 SHIP_ROW_BUDGET = 200_000
 # The local side must exceed the shipped foreign side by at least this factor.
 SHIP_MIN_RATIO = 20
+# A group key whose dimension has at least this many distinct values is
+# high-cardinality. Shipping wins only when the aggregate COLLAPSES; a GROUP BY
+# collapses unless it spans two or more INDEPENDENT high-cardinality dimensions
+# (item x date, item x customer), whose combinations the fact does not reduce.
+# 10k sits with wide margin between every TPC-DS dimension that ships: the low
+# side tops out near 3.7k (price bands, stores, brands, months, states,
+# warehouses), the high side starts near 45k (item ids, item descriptions,
+# dates, customers). Correlated keys from ONE dimension (i_item_id + i_item_desc)
+# share an owner and count once, so this is not fooled the way a raw key count is.
+HIGH_CARD_NDV = 10_000
 
 
 class DimShipping:
@@ -88,6 +98,8 @@ class DimShipping:
         if not self._is_shippable_shape(node):
             return None
         if not self._collapses_via_aggregate(node):
+            return None
+        if self._dimension_explosion(node):
             return None
         scans = self._planner._collect_base_scans(node)
         rows = self._scan_rows_map(scans)
@@ -141,10 +153,57 @@ class DimShipping:
         no gain (q22 below its rollup, q38/q87's DISTINCT branches), and a
         ROLLUP/CUBE aggregate collapses poorly evaluated in one island
         (q14/q22/q67). Only a plain aggregate reliably shrinks the transfer."""
+        root = self._ship_aggregate(node)
+        return isinstance(root, Aggregate) and not root.grouping_sets
+
+    def _dimension_explosion(self, node) -> bool:
+        """The ship-target aggregate's GROUP BY spans two or more independent
+        high-cardinality dimensions, so it does not collapse and shipping would
+        move a large materialized result instead of pipelining the reduced fact
+        (q23: store_sales grouped by item x date, 28.8M -> 13.8M). Declining is
+        always safe: it keeps the proven no-ship plan, which never changes a
+        result. Runs only after _collapses_via_aggregate confirmed the root."""
+        aggregate = self._ship_aggregate(node)
+        return self._count_high_dimensions(aggregate) >= 2
+
+    def _ship_aggregate(self, node):
+        """The node under the row-preserving wrappers (Projection/Filter/Sort/
+        Limit/SubqueryScan). _collapses_via_aggregate checks it is a plain
+        Aggregate; the explosion gate reads that aggregate's group keys."""
         current = node
         while isinstance(current, (Projection, Filter, Sort, Limit, SubqueryScan)):
             current = current.children()[0]
-        return isinstance(current, Aggregate) and not current.grouping_sets
+        return current
+
+    def _count_high_dimensions(self, aggregate) -> int:
+        """The number of distinct source dimensions contributing a high-card
+        group key. Correlated keys from one relation share an owner and count
+        once; an ownerless high-card key (a bare expression) counts as its own
+        dimension, since we cannot prove it shares one with another key."""
+        owners = set()
+        ownerless = 0
+        for key in aggregate.group_by:
+            contributes, owner = self._high_card_owner(aggregate, key)
+            if not contributes:
+                continue
+            if owner is None:
+                ownerless += 1
+            else:
+                owners.add(owner)
+        return len(owners) + ownerless
+
+    def _high_card_owner(self, aggregate, key):
+        """(is_high_card, owner_identity) for one group key. A resolved NDV below
+        the threshold is low-card and does not contribute; an unknown NDV is
+        treated as high-card (conservative - prefer declining when we cannot
+        prove a dimension is small). The owner identity is the relation's id, so
+        two keys from the same relation collapse to one dimension."""
+        owner, ndv = self._planner.cost_model.group_key_dimension(
+            aggregate.input, key
+        )
+        if ndv is not None and ndv < HIGH_CARD_NDV:
+            return False, None
+        return True, (id(owner) if owner is not None else None)
 
     def _local_source(self, scans, rows):
         """The datasource holding the largest scan (the fact side), or None when

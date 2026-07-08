@@ -60,7 +60,17 @@ def load(options):
     for table in sorted(TPCDS_TABLES):
         rows = _load_table(connection, table, options.pg_schema)
         print("loaded {0:24} {1:>12} rows".format(table, rows))
+    _analyze(connection)
     connection.close()
+
+
+def _analyze(connection):
+    """ANALYZE every loaded table so the cost model has row counts and column
+    NDVs for all of them. Without this the small dimensions (warehouse and
+    friends) carry no statistics until autoanalyze happens to fire, and the
+    dim-shipping gate's dimension classification would depend on that timing."""
+    connection.execute("CALL postgres_execute('pg', 'ANALYZE')")
+    print("analyzed all tables")
 
 
 def _parse_args():

@@ -630,6 +630,26 @@ class CostModel:
         Public entry for the join-ordering estimator."""
         return self._tracked_selectivity(predicate, None, target)
 
+    def group_key_dimension(
+        self, input_node: LogicalPlanNode, key: Expression
+    ) -> Tuple[Optional[LogicalPlanNode], Optional[int]]:
+        """The (owner relation, NDV) a GROUP BY key resolves to over its input.
+
+        Public entry for the dim-shipping gate, which counts how many
+        independent high-cardinality dimensions a GROUP BY spans. The owner is
+        None when the key is not a qualified column (an expression or a key that
+        resolves to no relation); the NDV is None when the owner has no
+        resolvable distinct count. The NDV here is bounded by the owner's row
+        count when a column histogram is absent (a small dimension classifies
+        low-card even without per-column stats), a widening confined to this
+        gate so the join-ordering NDV path is unchanged."""
+        if not (isinstance(key, ColumnRef) and key.table is not None):
+            return None, None
+        owner = self._find_relation(input_node, key.table)
+        if owner is None:
+            return None, None
+        return owner, self._bounded_owner_ndv(owner, key.column)
+
     def _estimate_scan_tracked(self, scan: Scan) -> CardinalityEstimate:
         """Scan estimate: stats row count x filter selectivity, then pushed-
         down grouping when the scan carries a remote aggregate."""
@@ -927,6 +947,26 @@ class CostModel:
         if col_stats is None:
             return None
         return col_stats.num_distinct
+
+    def _bounded_owner_ndv(self, owner, column: str) -> Optional[int]:
+        """A column's NDV, falling back to the owner's table row count as an
+        upper bound when the column has no histogram (a column cannot hold more
+        distinct values than the table has rows). Gate-facing only."""
+        ndv = self._owner_column_ndv(owner, column)
+        if ndv is not None:
+            return ndv
+        return self._owner_row_count(owner)
+
+    def _owner_row_count(self, owner) -> Optional[int]:
+        """The owning scan's table row count from source statistics, or None."""
+        if not isinstance(owner, Scan) or not self.stats_collector:
+            return None
+        stats = self.stats_collector.get_table_statistics(
+            owner.datasource, owner.schema_name, owner.table_name, []
+        )
+        if stats is None:
+            return None
+        return stats.row_count
 
     def _owner_target(self, owner, ref: ColumnRef) -> str:
         """The provenance name of a join key's owning relation and column."""

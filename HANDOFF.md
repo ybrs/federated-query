@@ -72,11 +72,24 @@ no window in the fallback, island outputs == pure-plan outputs.
 
 None blocking correctness (99|0|0 everywhere). Dim shipping is DONE but has
 OPEN PROBLEMS to revisit - full detail in `dim-shipping-open-problems.md`:
-- Residual perf: q23 (a PLAIN aggregate that does NOT collapse - 28.8M->13.8M)
-  slips past the structural gate and regresses ~13%/~0.8s. Cannot be gated
-  without multi-column-distinct estimation (the cost model reports "no
-  collapse" for the WINNER q39 too - NDV independence + defaulting). Option 2
-  (group-width guard) investigated and reverted: it also declines q39.
+- q23 REGRESSION - RESOLVED 2026-07-09 (dimension-width gate;
+  `dim-shipping-collapse-gate-plan.md`). q23 shipped a PLAIN aggregate that does
+  NOT collapse (store_sales by item x date, 28.8M->13.8M) and regressed ~13%.
+  FIX: decline shipping when the ship-target aggregate's GROUP BY spans >= 2
+  distinct high-cardinality SOURCE DIMENSIONS (owner relations, NDV>=10k or
+  unknown). The distinguishing signal is distinct high-card DIMENSIONS, not
+  high-card KEY count - correlated keys from one dimension (i_item_id +
+  i_item_desc) share an owner and count once, so the q17/q25/q29/q37/q66 WINS
+  are kept while only q23 declines. Option 2 (the naive key-count group-width
+  guard) looked broken only because `warehouse` + 5 small tables had NO pg
+  stats (nondeterministic autoanalyze) so q39 defaulted to high-card; fixed by
+  ANALYZE-after-load (`benchmarks/tpcds/load_postgres.py`) plus a row-count NDV
+  bound in `optimizer/cost.py` (a column cannot exceed its table's rows). The
+  psycopg2 crash Option 2 also hit is already fixed (ca13e1a). Measured SF10:
+  q23 6058->5223ms (99|0|0), winners preserved, pg-dims totals 71.4s->65.0s
+  (0.91x vs DuckDB, was 1.00x), geomean 1.61->1.38x. Gate in
+  `optimizer/dim_shipping.py` (`_dimension_explosion`, HIGH_CARD_NDV=10_000);
+  tests `tests/test_dim_shipping_gate.py`.
 - TAIL-RISK HARDENING (do first, highest priority): a HARD RUNTIME CAP on the
   shipped relation size in `connectors::ship_table` (raise loudly above ~2M
   rows) so a stale-stats mis-ship fails fast instead of hammering pg with a
