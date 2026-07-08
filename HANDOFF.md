@@ -4,14 +4,86 @@ State of the work, facts only. Earlier phases (Rust cutover, N-K decorrelation,
 cost-based optimizer, TPC-H fair benchmark) are in git history and in the
 auto-memory; this document is the CURRENT TPC-DS federated push.
 
-Test suite: **1276 passed, 3 skipped, 25 xfailed** (`POSTGRES_DB=duckpoc
+Test suite: **1287 passed, 3 skipped, 25 xfailed** (`POSTGRES_DB=duckpoc
 /workspace/venv-fedq/bin/python -m pytest -q`).
+
+---
+
+## PERFORMANCE FEATURE STATUS (2026-07-08) - resumable
+
+Three features were the last perf round. First two DONE + committed; the
+third is half-landed with a precise open question. All commits on
+`feature/cost-based-optimizer` (federated-query) and `main` (fedqrs).
+
+### 1. Identical-step CSE - DONE (federated-query 4bd23d3)
+`rust_ir.py` dedups producing steps (source_scan / collect_distinct /
+injected_scan) by content (all fields except the output binding name).
+Structured scans exclude the COLUMN LIST from identity and widen the kept
+scan to the union of columns on a hit (consumers resolve by name).
+Scan identity is ALIAS-NEUTRAL: `_scan_share_key` renders a clone under a
+fixed alias `__cse__` with filter refs requalified, and pins
+datasource+schema+table explicitly so no textual coincidence merges two
+relations. Effect: q31 906->450ms, q44->163ms, q70 date reads shared.
+Tests: covered by the full suite (no dedicated file; the tallies pin it).
+
+### 2. Multi-injection - DONE (federated-query 77ac78e + fedqrs 843feac)
+`_injection_winners` keeps EVERY reduction candidate per traced base,
+sorted by donated keys. `_emit_base_injection` injects the smallest
+(PRIMARY, full delivery-strategy machinery) and up to two runners-up ride
+along as `extra_injections` (bounded IN lists ANDed onto the same read;
+same-column or over-cap extras skipped). IR: `ExtraInjection {column,
+keys_from}` on `InjectedScan`; engine `run_injected_scan` takes
+`extras: &[(&str,&Batches)]`, `extras_in_filter` ANDs them in the inline-IN
+/ parquet / full-read paths (temp-table + parallel paths do NOT thread
+extras yet - primary reduction still applies, join keeps exactness).
+Effect: q46 1431->471ms, q68 1491->350ms. Test:
+`tests/test_reduction_gate.py::test_injection_candidates_rank_smallest_build_first`.
+
+### 3. Dim shipping - PHASE A DONE (fedqrs 082e4c7), PHASE B OPEN
+Plan: `dim-shipping-plan.md`. Idea: ship a SMALL filtered foreign dim INTO
+the fact's DuckDB source as a temp table, so the whole join+aggregate
+collapses to one duck island and only the aggregate OUTPUT returns (q39's
+26.5M inventory rows never move; target ~411ms like DuckDB's own).
+
+PHASE A landed inert (no planner emits it yet):
+- IR `Step::Ship {datasource, input, table}` (core/src/ir.rs).
+- engine arm forces the input, calls `connectors::ship_table` (engine.rs).
+- `connectors::ship_table` CREATEs a duck TEMP TABLE on a connection PINNED
+  in `PINNED_DUCK` (temp objects are per-connection; `duck_cursor` clones
+  cannot see them). `fetch_duckdb` routes through the pinned connection when
+  one exists for that db path. `ShipmentGuard` (Drop) + `clear_shipments()`
+  at execute() entry drop pins (and temp tables) on every exit path.
+- use-count scan bumps the shipped input; profiler prints a `ship` line.
+
+PHASE B - the ONE blocker to solve FIRST, then the rest is mechanical:
+- BLOCKER: the island that reads the shipped table gets its output schema
+  probed with a `LIMIT 0` query on the PYTHON-side datasource connection,
+  where the temp table does NOT exist (it lives only on the engine's pinned
+  Rust-side duck connection). Fix options: (a) make PhysicalRemoteQuery
+  derive its schema from the bound select items' `data_type`s instead of
+  probing, or (b) carry a seeded schema on the synthetic scan end to end.
+  Prefer (a) - it removes a network round-trip for every island anyway.
+- THEN mechanical: a `Shipment` wrapper plan node (mirror `CTE`: holds the
+  foreign subtree + a name, child references it); a `DimShippingRule` after
+  join ordering that, for a cross-source INNER equi join whose FOREIGN side
+  output-estimate < SHIP_ROW_BUDGET (~100k) and whose LOCAL side is
+  otherwise single-source, replaces the foreign subtree with a synthetic
+  `Scan(datasource=<local>, schema_name='temp', table=__fedq_ship_N,
+  columns=<foreign outputs>)` and records the shipment; emitter emits the
+  foreign subtree then a `ship` step before the island scan. Duck resolves
+  a 2-part `temp."__fedq_ship_N"` reference (VERIFIED). Cost gate: ship only
+  when local-est / foreign-est > ~50x AND foreign-est known; unknown =
+  DECLINE (a mis-shipped big dim floods the source).
+- GATES: pytest; staged SF10 engine+compare on {39,75,23,14}+full 99;
+  SF0.1/SF1; TPC-H fedpgduck (dims are pg-side there - watch orientation).
 
 ---
 
 ## OPEN ISSUES
 
-None. q18 is RESOLVED 2026-07-07 (commit 05b1dcd) and was never an engine
+None blocking correctness. The only open perf item is dim-shipping Phase B
+(see the resumable section above). q18 is RESOLVED 2026-07-07 (commit
+05b1dcd) and was never an engine
 bug: the raw values are engine `206.98499999999999` vs oracle `206.985` -
 diff 1.4e-14, pure float64 summation ORDER (a distributed plan and a single
 engine sum in different orders) sitting exactly on a cent rounding boundary.
