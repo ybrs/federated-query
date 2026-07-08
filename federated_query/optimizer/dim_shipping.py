@@ -277,8 +277,11 @@ class DimShipping:
         """A local temp-table scan replacing a foreign scan, under the SAME alias
         and columns so every reference above resolves unchanged. The local
         filters moved into the shipped body, so this scan carries none."""
-        # A synthetic scan of the shipped temp table on the local fact source;
-        # same alias/columns as the foreign scan so parent references still bind.
+        # create, NOT foreign_scan.model_copy: this is a fresh BARE read of the
+        # shipped table, and model_copy would carry over the foreign scan's
+        # filters/aggregates/ordering (which moved into the shipped body and must
+        # be ABSENT here). Every field the temp scan needs is named below; all
+        # others correctly default to none/empty, giving exactly a plain read.
         return Scan.create(
             datasource=local,
             schema_name=schema,
@@ -306,8 +309,10 @@ class DimShipping:
         child = island
         for name, foreign_scan in reversed(shipments):
             body = self._planner.plan_without_shipping(foreign_scan)
-            # One shipment node per foreign scan: it materializes the body into
-            # the local source as temp table `name`, then the child reads it.
+            # create: a genuinely fresh node - there is no existing
+            # PhysicalShipment to derive from - and all four of its fields are
+            # named here. It materializes the body into the local source as temp
+            # table `name`, then the child reads it.
             child = PhysicalShipment.create(
                 table=name, datasource=local, body=body, child=child
             )
