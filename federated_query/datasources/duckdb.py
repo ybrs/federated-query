@@ -59,6 +59,7 @@ class DuckDBDataSource(DataSource):
             DataSourceCapability.DISTINCT,
             DataSourceCapability.LIMIT,
             DataSourceCapability.ORDER_BY,
+            DataSourceCapability.SHIP_TARGET,
         ]
 
     def list_schemas(self) -> List[str]:
@@ -110,9 +111,7 @@ class DuckDBDataSource(DataSource):
         """Catalog row count plus one approximate stats scan for the requested
         columns only - never a full COUNT(DISTINCT) pass over every column."""
         row_count = self._catalog_row_count(schema, table)
-        column_stats = self._approx_column_statistics(
-            schema, table, columns, row_count
-        )
+        column_stats = self._approx_column_statistics(schema, table, columns, row_count)
         return self._build_table_statistics(row_count, column_stats)
 
     def _catalog_row_count(self, schema: str, table: str) -> int:
@@ -159,15 +158,16 @@ class DuckDBDataSource(DataSource):
         """Unpack the stats row (ndv, non-null count, min, max per column)."""
         stats: Dict[str, ColumnStatistics] = {}
         for index, column in enumerate(columns):
-            ndv, non_null, min_value, max_value = row[index * 4:index * 4 + 4]
-            null_fraction = (
-                (row_count - non_null) / row_count if row_count > 0 else 0.0
-            )
+            ndv, non_null, min_value, max_value = row[index * 4 : index * 4 + 4]
+            null_fraction = (row_count - non_null) / row_count if row_count > 0 else 0.0
             # Per-column catalog statistics from the single approximate scan;
             # avg_width stays a placeholder (DuckDB exposes no cheap width).
             stats[column] = ColumnStatistics.create(
-                num_distinct=ndv, null_fraction=null_fraction, avg_width=10,
-                min_value=min_value, max_value=max_value,
+                num_distinct=ndv,
+                null_fraction=null_fraction,
+                avg_width=10,
+                min_value=min_value,
+                max_value=max_value,
             )
         return stats
 

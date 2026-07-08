@@ -53,6 +53,7 @@ from ..plan.physical import (
     PhysicalRemoteSetOp,
     PhysicalScan,
     PhysicalSetOperation,
+    PhysicalShipment,
     PhysicalSingleRowGuard,
     PhysicalSort,
     PhysicalUnion,
@@ -829,6 +830,28 @@ def _emit_cte_scan(node, ctx):
         binding = _relabel_columns(binding, producer.body, producer.column_names, ctx)
     ctx.cte_bindings[id(producer)] = binding
     return binding
+
+
+def _emit_shipment(node, ctx):
+    """Ship a foreign relation into a target source, then run the island.
+
+    Emits the body binding, then a `ship` step that materializes it as a temp
+    table on `node.datasource`, then the child island (whose source_scan reads
+    that temp table). The ORDER is load-bearing: the ship step must precede the
+    island's scan so the table exists when the engine reads it. The engine
+    routes every later read of that source through the pinned connection the
+    ship created, and drops the temp table at query end.
+    """
+    body_binding = _emit(node.body, ctx)
+    ctx.steps.append(
+        {
+            "op": "ship",
+            "datasource": node.datasource,
+            "input": body_binding,
+            "table": node.table,
+        }
+    )
+    return _emit(node.child, ctx)
 
 
 def _relabel_columns(binding, body, names, ctx):
@@ -2132,6 +2155,7 @@ _NODE_EMITTERS = {
     PhysicalValues: _emit_values,
     PhysicalCTEMergeQuery: _emit_cte_merge,
     PhysicalCTEScan: _emit_cte_scan,
+    PhysicalShipment: _emit_shipment,
     PhysicalAliasedRelation: _emit_passthrough,
     PhysicalWindow: _emit_window,
     PhysicalGroupedLimit: _emit_grouped_limit,

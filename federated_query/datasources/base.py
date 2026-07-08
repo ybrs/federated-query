@@ -21,6 +21,10 @@ class DataSourceCapability(Enum):
     DISTINCT = "distinct"
     LIMIT = "limit"
     ORDER_BY = "order_by"
+    # The source can receive a shipped relation as a session TEMP TABLE (dim
+    # shipping materializes a small foreign dimension into the fact's source).
+    # Writable sources (DuckDB, PostgreSQL) support it; read-only ones do not.
+    SHIP_TARGET = "ship_target"
 
 
 class ColumnMetadata(StateModel):

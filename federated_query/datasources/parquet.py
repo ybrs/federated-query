@@ -9,8 +9,9 @@ DataFusion also parses.
 
 import glob
 import os
-from typing import Any, Dict
+from typing import Any, Dict, List
 
+from .base import DataSourceCapability
 from .duckdb import DuckDBDataSource
 
 
@@ -37,3 +38,12 @@ class ParquetDataSource(DuckDBDataSource):
             self.connection.execute(
                 f"CREATE TABLE {table} AS SELECT * FROM read_parquet('{path}')"
             )
+
+    def get_capabilities(self) -> List[DataSourceCapability]:
+        """A read-only Parquet directory plans like DuckDB but cannot receive a
+        shipped temp table; drop SHIP_TARGET from the inherited capabilities."""
+        capabilities = []
+        for capability in super().get_capabilities():
+            if capability != DataSourceCapability.SHIP_TARGET:
+                capabilities.append(capability)
+        return capabilities

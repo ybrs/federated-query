@@ -62,6 +62,7 @@ from ..plan.expressions import (
 from . import pushdown
 from .estimate_defaults import larger_estimated_side
 from .single_source_pushdown import SingleSourcePushdown, same_source
+from .dim_shipping import DimShipping
 from ..parser.errors import UnsupportedSQLError
 from typing import List, Tuple
 from ..model import StateModel
@@ -133,6 +134,13 @@ class PhysicalPlanner:
         self.catalog = catalog
         self.cost_model = cost_model
         self.single_source = SingleSourcePushdown(catalog)
+        self.dim_shipping = DimShipping(self)
+        # Ship attempts are suppressed while planning a shipping fallback (the
+        # pure cross-source plan used only for the island's seed schema), so a
+        # subtree never ships itself recursively.
+        self._shipping_enabled = True
+        # Per-query counter giving each shipped temp table a unique name.
+        self._ship_counter = 0
         # CTE name -> its materializing producer, registered while a cross-source
         # CTE's child is planned so each CTERef resolves to a shared scan.
         self._cte_producers: Dict[str, PhysicalCTE] = {}
@@ -151,13 +159,34 @@ class PhysicalPlanner:
         Returns:
             Physical plan ready for execution
         """
+        self._ship_counter = 0
         return self._plan_node(logical_plan)
+
+    def next_ship_name(self) -> str:
+        """A unique temp-table name for a shipped dimension within this query."""
+        name = f"__fedq_ship_{self._ship_counter}"
+        self._ship_counter += 1
+        return name
+
+    def plan_without_shipping(self, node: LogicalPlanNode) -> PhysicalPlanNode:
+        """Plan a subtree with dim shipping suppressed, for the pure cross-source
+        plan used to seed a shipped island's schema (and as the decline path)."""
+        saved = self._shipping_enabled
+        self._shipping_enabled = False
+        try:
+            return self._plan_node(node)
+        finally:
+            self._shipping_enabled = saved
 
     def _plan_node(self, node: LogicalPlanNode) -> PhysicalPlanNode:
         """Plan a single node."""
         remote = self.single_source.try_build(node)
         if remote is not None:
             return remote
+        if self._shipping_enabled:
+            shipped = self.dim_shipping.try_ship(node)
+            if shipped is not None:
+                return shipped
         if isinstance(node, Scan):
             return self._plan_scan(node)
         if isinstance(node, Filter):

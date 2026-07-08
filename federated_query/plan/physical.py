@@ -355,6 +355,64 @@ class PhysicalCTEScan(PhysicalPlanNode):
         return f"PhysicalCTEScan({self.producer.name})"
 
 
+class PhysicalShipment(PhysicalPlanNode):
+    """Ships a foreign relation INTO a target source, then runs the child there.
+
+    Dim shipping: a small foreign dimension (``body``) is materialized once and
+    written to ``datasource`` as a TEMP TABLE named ``table``; ``child`` - an
+    island on ``datasource`` whose SQL references that temp table - then runs
+    with the whole fact join+aggregate collapsed into one source, so only the
+    aggregate OUTPUT crosses the boundary instead of the fact rows.
+
+    Mirrors PhysicalCTE (materialize a body once, consume it above), but the
+    materialization lands on ANOTHER source. The emitter emits the body binding,
+    then a ``ship`` step, then the child - so the temp table exists before the
+    island reads it. The child island carries a seeded schema (the temp table
+    cannot be probed from the python-side connection).
+    """
+
+    table: str
+    datasource: str
+    body: PhysicalPlanNode
+    child: PhysicalPlanNode
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        table: str,
+        datasource: str,
+        body: PhysicalPlanNode,
+        child: PhysicalPlanNode,
+    ) -> "PhysicalShipment":
+        """Sanctioned fresh-construction path for PhysicalShipment.
+        Names every field so none is dropped; derive from an existing node
+        with model_copy(update=...) instead of re-listing fields here."""
+        return cls(
+            table=table,
+            datasource=datasource,
+            body=body,
+            child=child,
+        )
+
+    def children(self) -> List[PhysicalPlanNode]:
+        return [self.body, self.child]
+
+    def schema(self) -> pa.Schema:
+        """The output is the island's output; the shipped body is a side effect."""
+        return self.child.schema()
+
+    def column_aliases(self) -> Dict[Tuple[Optional[str], str], str]:
+        """Resolve references against the island that produces the output."""
+        return self.child.column_aliases()
+
+    def estimated_cost(self) -> float:
+        raise NotImplementedError("Cost estimation not yet implemented")
+
+    def __repr__(self) -> str:
+        return f"PhysicalShipment(table={self.table}, ds={self.datasource})"
+
+
 class PhysicalAliasedRelation(PhysicalPlanNode):
     """Re-exposes a derived relation's columns under its subquery alias.
 
@@ -642,6 +700,11 @@ class PhysicalScan(PhysicalPlanNode):
     # so the reduction can refuse a dynamic filter whose keys cover the probe
     # column's whole value domain; None when not cost-estimated.
     column_ndv: Optional[Dict[str, int]] = None
+    # A known output schema seeded at construction, used INSTEAD of probing the
+    # source. Set only for the synthetic scan of a shipped dimension: that temp
+    # table lives on the engine's pinned connection, so the python-side probe
+    # cannot see it. None everywhere else, so every real table still probes.
+    seeded_schema: Optional[pa.Schema] = None
 
     @classmethod
     def create(
@@ -669,6 +732,7 @@ class PhysicalScan(PhysicalPlanNode):
         dynamic_filter_values: Optional[List[tuple]] = None,
         estimated_rows: Optional[int] = None,
         column_ndv: Optional[Dict[str, int]] = None,
+        seeded_schema: Optional[pa.Schema] = None,
     ) -> "PhysicalScan":
         """Sanctioned fresh-construction path for PhysicalScan.
         Names every field so none is dropped; derive from an existing node
@@ -696,6 +760,7 @@ class PhysicalScan(PhysicalPlanNode):
             dynamic_filter_values=dynamic_filter_values,
             estimated_rows=estimated_rows,
             column_ndv=column_ndv,
+            seeded_schema=seeded_schema,
         )
 
     def children(self) -> List[PhysicalPlanNode]:
@@ -808,8 +873,17 @@ class PhysicalScan(PhysicalPlanNode):
         )
 
     def schema(self) -> pa.Schema:
-        """Get output schema."""
+        """Get output schema.
+
+        A seeded schema (a shipped-dimension temp table) is returned directly:
+        that table exists only on the engine's pinned connection, so the
+        python-side probe cannot see it. Every real table still probes.
+        """
         if self._schema is not None:
+            return self._schema
+
+        if self.seeded_schema is not None:
+            self._schema = self.seeded_schema
             return self._schema
 
         if self.datasource_connection is None:
@@ -1892,6 +1966,11 @@ class PhysicalRemoteQuery(PhysicalPlanNode):
     # an interior base scan (join keys do). The reduction uses it to refuse a
     # dynamic filter whose keys cover the probe column's whole value domain.
     column_ndv: Optional[Dict[str, int]] = None
+    # A known output schema seeded at construction, used INSTEAD of probing the
+    # source. Set only for the island that reads a shipped dimension: it
+    # references a temp table that lives on the engine's pinned connection, so
+    # the python-side probe cannot see it. None everywhere else.
+    seeded_schema: Optional[pa.Schema] = None
 
     @classmethod
     def create(
@@ -1905,6 +1984,7 @@ class PhysicalRemoteQuery(PhysicalPlanNode):
         estimated_rows: Optional[int] = None,
         output_estimated_rows: Optional[int] = None,
         column_ndv: Optional[Dict[str, int]] = None,
+        seeded_schema: Optional[pa.Schema] = None,
     ) -> "PhysicalRemoteQuery":
         """Sanctioned fresh-construction path for PhysicalRemoteQuery.
         column_alias_map is explicit (the default_factory cannot be a parameter
@@ -1918,6 +1998,7 @@ class PhysicalRemoteQuery(PhysicalPlanNode):
             estimated_rows=estimated_rows,
             output_estimated_rows=output_estimated_rows,
             column_ndv=column_ndv,
+            seeded_schema=seeded_schema,
         )
 
     _schema: Optional[pa.Schema] = None
@@ -1935,8 +2016,17 @@ class PhysicalRemoteQuery(PhysicalPlanNode):
             yield batch
 
     def schema(self) -> pa.Schema:
+        """Output schema, seeded when this island reads a shipped dimension.
+
+        A shipped-dimension temp table lives only on the engine's pinned
+        connection, so the python-side probe cannot see it; the shipping rule
+        seeds the known schema here. Every other island still probes.
+        """
         if self._schema is None:
-            self._schema = self.datasource_connection.get_query_schema(self._sql())
+            if self.seeded_schema is not None:
+                self._schema = self.seeded_schema
+            else:
+                self._schema = self.datasource_connection.get_query_schema(self._sql())
         return self._schema
 
     def _sql(self) -> str:

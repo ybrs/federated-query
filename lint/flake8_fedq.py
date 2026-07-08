@@ -9,9 +9,17 @@ checked only for source under ``federated_query/`` (never tests):
          the two source lines directly above the statement are comments that
          justify it.
 
-  FQ002  Every ``Node.create(...)`` call needs at least two comment lines
-         directly above its statement (the comments that say what is built and
-         why).
+  FQ002  ``Node.create(...)`` is DISCOURAGED. Prefer deriving from an existing
+         node with ``instance.model_copy(update=...)``: it copies EVERY field
+         and overrides only what you name, so a field can never be silently
+         dropped. ``.create`` re-lists fields by hand, which is exactly how a
+         forgotten field (= a wrong answer with no error) sneaks in. So a
+         ``.create`` call must be JUSTIFIED by at least two comment lines
+         directly above it that state WHY create is used instead of model_copy
+         (typically: this is a genuinely fresh node with no source to copy from)
+         and confirm the field list is complete. The rule is not about having
+         comments for their own sake - it forces the author to show that using
+         create here is correct.
 
   FQ003  String-matching a column/table name to resolve which relation a column
          belongs to is forbidden (``ref.column.startswith(...)``,
@@ -195,7 +203,14 @@ class FedqConstructionChecker:
                 "on a .column or .table) to resolve relation membership is "
                 "forbidden; resolve columns by qualifier/identity, not by name text"
             )
-        return f"FQ002 {name}.create(...) needs >=2 comment lines directly above the statement"
+        return (
+            f"FQ002 {name}.create(...) is discouraged - prefer "
+            f".model_copy(update=...) which copies every field so none is "
+            f"dropped; if create is genuinely needed (a fresh node with nothing "
+            f"to copy from), justify it with >=2 comment lines directly above "
+            f"stating WHY create over model_copy and confirming the field list "
+            f"is complete"
+        )
 
     def run(self):
         """Yield one flake8 finding per construction or string-match violation."""

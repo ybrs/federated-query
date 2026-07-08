@@ -150,6 +150,7 @@ class PostgreSQLDataSource(DataSource):
             DataSourceCapability.DISTINCT,
             DataSourceCapability.LIMIT,
             DataSourceCapability.ORDER_BY,
+            DataSourceCapability.SHIP_TARGET,
         ]
 
     def list_schemas(self) -> List[str]:
