@@ -2377,18 +2377,49 @@ def _register_one(fedqrs, datasource, postgres_cls, duckdb_cls):
     )
 
 
-def execute_via_rust(plan, datasources):
+def execute_via_rust(plan, datasources, stats_catalog=None):
     """Register datasources, serialize `plan` to IR, run it in Rust, return a
-    pyarrow Table. The whole query executes in Rust; only the result crosses."""
+    pyarrow Table. The whole query executes in Rust; only the result crosses.
+
+    When `stats_catalog` is given, the engine's per-step measurements are
+    persisted to it (learned-stats write path), off the critical path.
+    """
     import json
 
     import fedqrs
     import pyarrow as pa
 
     register_datasources(datasources)
-    ir = build_ir(plan)
-    # The engine returns per-step (binding, measured rows) observations for the
-    # learned-stats catalog; the write path (join with build_ir provenance,
-    # persist) is wired by the caller. Discarded here until then.
-    stream, _observations = fedqrs.execute_ir(json.dumps(ir))
-    return pa.RecordBatchReader.from_stream(stream).read_all()
+    ir, provenance = build_ir_with_observations(plan)
+    stream, measurements = fedqrs.execute_ir(json.dumps(ir))
+    table = pa.RecordBatchReader.from_stream(stream).read_all()
+    if stats_catalog is not None:
+        _persist_observations(stats_catalog, provenance, measurements)
+    return table
+
+
+def _persist_observations(stats_catalog, provenance, measurements):
+    """Write each measured (binding, rows) whose binding carries provenance into
+    the learned-stats catalog. Runs AFTER the result table is materialized, so it
+    is off the query's critical path; a binding with no provenance (a merge
+    fragment, an unmapped step) is skipped."""
+    for binding, rows in measurements:
+        prov = provenance.get(binding)
+        if prov is not None:
+            _persist_one(stats_catalog, prov, rows)
+
+
+def _persist_one(stats_catalog, prov, rows):
+    """Dispatch one observation to its catalog table by target kind."""
+    target = prov["target"]
+    if target == "table_rows":
+        stats_catalog.record_table_rows(
+            prov["datasource"], prov["schema"], prov["table"], rows
+        )
+        return
+    if target == "column_ndv":
+        stats_catalog.record_column_ndv(
+            prov["datasource"], prov["schema"], prov["table"], prov["column"], rows
+        )
+        return
+    raise ValueError(f"unknown observation target {target!r}")

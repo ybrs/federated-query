@@ -123,6 +123,37 @@ def test_persists_across_reopen(catalog_path):
     reopened.close()
 
 
+def test_persist_observations_writes_by_target(catalog_path):
+    """The write path joins engine measurements with build_ir provenance and
+    dispatches each to its catalog table; a measurement with no provenance (a
+    merge fragment) is skipped."""
+    from federated_query.executor.rust_ir import _persist_observations
+
+    catalog = _catalog(catalog_path)
+    provenance = {
+        "b1": {"target": "table_rows", "datasource": "duck",
+               "schema": "main", "table": "store_sales"},
+        "b2": {"target": "column_ndv", "datasource": "pg", "schema": "public",
+               "table": "warehouse", "column": "w_warehouse_sk"},
+    }
+    measurements = [("b1", 28800991), ("b2", 10), ("b3", 999)]
+    _persist_observations(catalog, provenance, measurements)
+    assert catalog.table_rows("duck", "main", "store_sales") == 28800991
+    assert catalog.column_ndv("pg", "public", "warehouse", "w_warehouse_sk") == 10
+    catalog.close()
+
+
+def test_persist_unknown_target_raises(catalog_path):
+    """An observation naming an unknown catalog target raises rather than being
+    silently dropped (defensive: a new provenance kind must be handled)."""
+    from federated_query.executor.rust_ir import _persist_observations
+
+    catalog = _catalog(catalog_path)
+    with pytest.raises(ValueError):
+        _persist_observations(catalog, {"b1": {"target": "bogus"}}, [("b1", 5)])
+    catalog.close()
+
+
 def test_unknown_field_raises(catalog_path):
     """The internal upsert refuses a field outside its allow-list (defensive:
     no dynamic SQL over an unvetted column name)."""

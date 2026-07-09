@@ -18,7 +18,10 @@ class Executor:
     silent wrong answer). EXPLAIN is plan introspection and renders directly.
     """
 
-    def __init__(self, catalog=None, config: Optional[ExecutorConfig] = None):
+    def __init__(
+        self, catalog=None, config: Optional[ExecutorConfig] = None,
+        stats_catalog=None,
+    ):
         """Initialize executor.
 
         Args:
@@ -26,6 +29,9 @@ class Executor:
                 when a plan is executed through this executor directly (the
                 decorrelation/e2e test harnesses build ``Executor(catalog)``).
             config: Executor configuration (uses defaults if not provided).
+            stats_catalog: Optional learned-stats catalog to persist the engine's
+                per-step cardinality measurements into (None disables the write
+                path, the default - no behavior change).
         """
         if config is None:
             # Default executor tuning when the caller supplies none, so every
@@ -33,6 +39,7 @@ class Executor:
             config = ExecutorConfig.create()
         self.config = config
         self.catalog = catalog
+        self.stats_catalog = stats_catalog
 
     def execute(
         self,
@@ -71,7 +78,7 @@ class Executor:
             raise RuntimeError("no datasources available to execute the plan")
         from .rust_ir import execute_via_rust
 
-        return execute_via_rust(plan, datasources)
+        return execute_via_rust(plan, datasources, stats_catalog=self.stats_catalog)
 
     def _resolve_datasources(
         self, plan: PhysicalPlanNode, query_executor: Optional["QueryExecutor"]
