@@ -2437,12 +2437,9 @@ def execute_via_rust(plan, datasources, stats_catalog=None):
 
     register_datasources(datasources)
     ir, provenance = build_ir_with_observations(plan)
-    # Observe (harvest aggregate metrics) only when a catalog will consume the
-    # measurements - the harvest keeps the plan and walks it, so the default
-    # non-learning run must not pay it.
-    stream, measurements = fedqrs.execute_ir(
-        json.dumps(ir), stats_catalog is not None
-    )
+    # The engine always returns per-step observations (the metric harvest is
+    # free); python persists them only when a catalog is present.
+    stream, measurements = fedqrs.execute_ir(json.dumps(ir))
     table = pa.RecordBatchReader.from_stream(stream).read_all()
     if stats_catalog is not None:
         _persist_observations(stats_catalog, provenance, measurements)

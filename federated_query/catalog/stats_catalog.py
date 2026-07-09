@@ -136,12 +136,13 @@ class StatsCatalog:
         self._ensure_schema()
 
     def _tune(self) -> None:
-        """WAL + synchronous=NORMAL: the write path runs during the timed query,
-        so a per-commit fsync would tax every execution (measured +~50ms/query
-        at SF10). WAL with NORMAL syncs far less while staying crash-safe enough
-        for a stats cache whose values only steer plan choice."""
+        """WAL + synchronous=OFF: the write path runs during the timed query, so
+        NO fsync at all - the catalog only steers plan choice, never correctness,
+        so losing the last few observations to an OS crash costs at most a cold
+        estimate next run. This is what lets stat collection be ALWAYS ON with no
+        measurable write cost (a per-commit fsync was +~50ms/query)."""
         self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA synchronous=OFF")
 
     def _ensure_schema(self) -> None:
         """Create every catalog table if absent (idempotent on every open)."""
