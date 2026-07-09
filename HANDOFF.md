@@ -126,23 +126,34 @@ equi-join graph + filter shapes), so a measured cardinality can be keyed by the
 subplan that produced it and found again at plan time. Constant-neutral matches
 the exploratory workload; correctness-neutral.
 
-REMAINING to make group_stats BITE on the real targets (two independent pieces,
-both needed together):
-1. KEYING via signatures - stamp signature(agg.input) + base group columns on
-   the physical aggregate node so the write path records group_stats by
-   signature and the cost model looks it up. Straightforward for single-source
-   aggregates (SingleSourcePushdown stamps the RemoteQuery), but those are RARE
-   in pg-dims.
-2. MEASUREMENT of CROSS-SOURCE aggregates - the dim-shipping fact-x-dim GROUP BY
-   is a coordinator MERGE fragment (lazy-fused), so its group count is NOT the
-   v1 materialized-row-count; it needs the DataFusion output-row METRIC HARVEST
-   (restructure collect_tracked to keep the physical plan, read AggregateExec
-   output_rows, attribute to the logical aggregate). This is the "path b" the
-   v1.5 commit deferred.
-Signatures (1) give the KEY; metric harvest (2) gives the NUMBER. Only both
-together cover the cross-source joined aggregates that motivated group_stats.
-Then optionally change the dim-shipping gate to consult the measured collapse
-(group_count / input_rows) instead of the dimension-width heuristic.
+CROSS-SOURCE group_stats - DONE 2026-07-09 (fedqrs 50e0498 metric harvest +
+federated-query 40a7ef8 signature wiring). Both halves landed and validated end
+to end:
+1. MEASUREMENT - collect_tracked (when observing) keeps the physical plan and
+   walks it for every FINAL AggregateExec's output_rows metric; execute()
+   matches each aggregate merge fragment to its harvest by group columns and
+   emits a (binding, group count) observation. Gated behind an `observe` flag
+   (on only when a catalog is wired) so the default collection path is unchanged
+   - the ungated version cost +5s at SF10; gated, per-query timings match
+   baseline.
+2. KEYING - physical_planner stamps group_observation {subplan signature of the
+   input, group columns} on each coordinator PhysicalHashAggregate; build_ir
+   records it as "group" provenance; CostModel reads the measured count keyed by
+   the same subject (table name for a single unfiltered scan, else the subplan
+   signature). subplan_signature is alias/constant-neutral.
+Validated (SF10, no-ship): store_sales x date_dim GROUP BY d_year -> catalog
+records 6 -> the cost model estimates 6 (measured, not the NDV product). 99|0|0.
+
+REMAINING (smaller, optional):
+- Dim-SHIPPED aggregates become a RemoteQuery ISLAND (not a PhysicalHashAggregate),
+  so their group count is the island's materialized row count. Stamp the ORIGINAL
+  aggregate's signature (pre-ship, so it matches the cost model's key) on the
+  island RemoteQuery + read it in build_ir's _emit_source. This covers the case
+  where a fact-x-dim aggregate SHIPS.
+- Consume group_stats in the dim-shipping GATE: replace/augment the
+  dimension-width heuristic with the measured collapse (group_count vs input
+  rows) - self-correcting after a bad ship. The gate currently uses width and is
+  already correct on TPC-DS, so this is a robustness upgrade, not a fix.
 
 ## OPEN ISSUES
 
