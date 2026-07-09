@@ -158,12 +158,27 @@ then named defaults - provenance recorded so EXPLAIN can surface
 
 ## Phases
 
-- A - RECORD (get the schema right). Build the SQLite catalog + the observations
-  payload from `fedqrs` + the Python persist path + read/write plumbing. NO
-  behavior change. Populate by running the benchmark suite; VALIDATE the schema:
-  do near-identical queries hit the same keys, does the signature collapse
-  alias/constant variants, are the four tables populated with sane values. This
-  phase locks the schema before anything depends on it.
+- A - RECORD (get the schema right). DONE 2026-07-09 (branch
+  feature/adaptive-catalog). SQLite catalog (`catalog/stats_catalog.py`, stdlib
+  sqlite3, self-heal + TTL, 10 tests); engine returns (stream, observations)
+  = (binding, rows) per materialized step (fedqrs `engine::execute` /
+  `execute_ir`); `build_ir_with_observations` records the binding->provenance
+  map; `execute_via_rust`/`Executor` persist off the critical path
+  (`_persist_observations`), None by default = no behavior change (1310 pass).
+  Validated end to end at SF10: q54/q39/q70/q03/q07 populate correct base row
+  counts - item=102000, store=102, and warehouse=10 (the exact stat pg lacked
+  that broke the dim-shipping gate), with observation_count self-healing.
+
+  COVERAGE FINDING (drives v1.5 priority): v1 source-side observations are
+  SPARSE. `table_rows` fires only for an UNFILTERED base scan (mostly small
+  dims); `column_ndv` rarely fires because a collect_distinct almost always runs
+  over a REDUCED (injected) or FILTERED scan, whose distinct count is NOT the
+  base column's domain and is correctly refused (q54 was briefly mis-recording
+  store_sales.ss_sold_date_sk=48 vs the real 1823 - fixed). So v1 mainly learns
+  DIMENSION base row counts. The real coverage - and the estimator wins - live
+  in v1.5: `predicate_stats` for filtered scans (very common) and merge-side
+  `group_stats` / `subplan_stats`. Prioritize v1.5 (DataFusion output-row metric
+  harvest) right after Phase B, or interleave it.
 - B - CONSULT (warm planning). `CostModel` + gates READ observations; cold ->
   warm within a session, then across sessions (persistence). Measure estimate-
   quality lift across the suite and the dim-shipping gate improvement (q23-shape
