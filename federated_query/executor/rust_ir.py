@@ -1744,9 +1744,10 @@ def _emit_keys_for(ctx, build_child, build_binding, build_key_expr):
 
 def _record_ndv_observation(ctx, build_child, key_expr, keys_binding):
     """Record that a collect_distinct's measured row count is a base COLUMN's
-    NDV - only when the collected key IS a base column (so the distinct count is
-    that column's real distinct-value count, not a joined-result cardinality)."""
-    base = _ndv_base_scan(build_child, key_expr)
+    NDV - only when the collected key IS a column of an UNREDUCED base scan, so
+    the distinct count is that column's real domain, not a joined-or-reduced
+    cardinality."""
+    base = _ndv_base_scan(ctx, build_child, key_expr)
     if base is None:
         return
     ctx.observations[keys_binding] = {
@@ -1758,10 +1759,11 @@ def _record_ndv_observation(ctx, build_child, key_expr, keys_binding):
     }
 
 
-def _ndv_base_scan(build_child, key_expr):
+def _ndv_base_scan(ctx, build_child, key_expr):
     """The base PhysicalScan whose real column the collected key IS, or None. A
-    scan carrying a filter/aggregate is excluded: its distinct count is over the
-    reduced rows, not the base column's domain."""
+    scan carrying a filter/aggregate, or one REDUCED by an injected dynamic
+    filter (its collected distinct count is over the reduced rows, not the base
+    column's domain), is excluded."""
     if isinstance(build_child, PhysicalScan):
         scan = build_child
     else:
@@ -1769,6 +1771,8 @@ def _ndv_base_scan(build_child, key_expr):
     if not isinstance(scan, PhysicalScan):
         return None
     if scan.filters is not None or scan.group_by or scan.aggregates:
+        return None
+    if scan.dynamic_filter_keys or id(scan) in ctx.injected:
         return None
     if (key_expr.table, key_expr.column) not in scan.column_aliases():
         return None
@@ -2383,5 +2387,8 @@ def execute_via_rust(plan, datasources):
 
     register_datasources(datasources)
     ir = build_ir(plan)
-    stream = fedqrs.execute_ir(json.dumps(ir))
+    # The engine returns per-step (binding, measured rows) observations for the
+    # learned-stats catalog; the write path (join with build_ir provenance,
+    # persist) is wired by the caller. Discarded here until then.
+    stream, _observations = fedqrs.execute_ir(json.dumps(ir))
     return pa.RecordBatchReader.from_stream(stream).read_all()

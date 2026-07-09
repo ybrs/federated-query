@@ -109,7 +109,9 @@ def _build_ir_or_none(plan):
 
 def _time_rust(ir):
     """Execution-only time of the Rust engine for a prepared IR."""
-    return best(lambda: pa.RecordBatchReader.from_stream(fedqrs.execute_ir(ir)).read_all())
+    return best(
+        lambda: pa.RecordBatchReader.from_stream(fedqrs.execute_ir(ir)[0]).read_all()
+    )
 
 
 def run(qe, duck, label, fed_sql, duck_pg_sql):
