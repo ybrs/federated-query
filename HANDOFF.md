@@ -68,6 +68,29 @@ no window in the fallback, island outputs == pure-plan outputs.
 
 ---
 
+## REDUCTION ORIENTATION THROUGH WRAPPERS - DONE 2026-07-09 (8d3bb02)
+
+The semi-join reduction oriented backwards on a fact wrapped in a derived
+table / union: q54 read catalog_sales(14.4M)+web_sales(7.2M) WHOLE and reduced
+the tiny filtered dims instead. Three walker-descent gaps, all fixed:
+(1) only a join's immediate Scan children got estimated_rows, so a wrapped fact
+carried no size - physical_planner now annotates EVERY scan (_scan_estimated_rows);
+(2) _cardinality_probe read estimated_rows off the wrapper (None) - it now
+DERIVES a side's size descending through size-preserving wrappers and summing a
+union's branches (_derived_side_rows), abstaining on aggregate/DISTINCT;
+(3) the injection tracer skipped binary PhysicalSetOperation (q54's UNION ALL)
+and _branch_key_pair bailed on a renaming projection exposing both (None,out) and
+(base,col) - added _setop_injection_bases (UNION only) + _branch_identity_pair.
+Correctness-neutral (reductions are supersets the coordinator re-checks): 99|0|0
+SF0.1/SF1/SF10 pg-dims + adversarial, TPC-H 22/22, pytest 1300. q54 1048->298ms
+(5.53x->1.48x); q22/q72/q23 also improved; no real regressions.
+
+REMAINING perf backlog (SF10 pg-dims): q70 7.2x (store_sales scanned 4x - a CSE
+miss across the main query and its decorrelated IN-subquery); q04 3.3x (eager
+aggregation validated but entangled with the reduction machinery - the reduction
+must descend through the pushed partial aggregate; deferred); sub-second overhead
+family (q16/q54-now-fine/q94).
+
 ## OPEN ISSUES
 
 None blocking correctness (99|0|0 everywhere). Dim shipping is DONE but has
