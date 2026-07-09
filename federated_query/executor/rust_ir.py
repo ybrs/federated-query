@@ -401,6 +401,11 @@ class _Ctx:
         # Build-side bindings keyed by id(build node), so a winner's early
         # emission and its own join's emission share one read.
         self.build_bindings = {}
+        # binding name -> catalog provenance for the learned-stats write path:
+        # what this binding's measured output-row count MEANS (a base table's
+        # row count, a column's NDV). The engine reports one number per binding;
+        # this map assigns it meaning. See adaptive-catalog-plan.md.
+        self.observations = {}
 
 
 def build_ir(plan):
@@ -411,15 +416,28 @@ def build_ir(plan):
     resolves its expressions against ``child.column_aliases()``. Unsupported
     shapes raise so we never emit a plan that could produce wrong rows.
     """
+    ir, _ = build_ir_with_observations(plan)
+    return ir
+
+
+def build_ir_with_observations(plan):
+    """Serialize a plan and ALSO return the observation provenance map (binding
+    name -> what its measured row count means for the learned-stats catalog).
+
+    Kept separate from build_ir so the provenance never enters the JSON sent to
+    the engine (it is a python-side write-path concern), and so build_ir's many
+    callers keep their single-value return.
+    """
     ctx = _Ctx()
     ctx.injection_winners = _injection_winners(plan)
     binding = _emit(plan, ctx)
     ctx.steps.append({"op": "return", "input": binding})
-    return {
+    ir = {
         "outputs": _plan_outputs(plan),
         "steps": ctx.steps,
         "fragments": ctx.fragments,
     }
+    return ir, ctx.observations
 
 
 def _plan_outputs(plan):
@@ -462,7 +480,25 @@ def _emit_source(node, ctx):
     }
     binding = _emit_step_once(ctx, step, key=_scan_share_key(node, step))
     ctx.scan_bindings[id(node)] = binding
+    _record_scan_observation(ctx, node, binding)
     return binding
+
+
+def _record_scan_observation(ctx, node, binding):
+    """Record that this scan's measured output rows are a table's BASE row count.
+    Only an unfiltered, un-aggregated base scan qualifies: a filter makes the
+    count a predicate selectivity and a pushed aggregate makes it a group count,
+    both of which are v1.5 (they come from lazy merge fragments)."""
+    if not isinstance(node, PhysicalScan):
+        return
+    if node.filters is not None or node.group_by or node.aggregates or node.grouping_sets:
+        return
+    ctx.observations[binding] = {
+        "target": "table_rows",
+        "datasource": node.datasource,
+        "schema": node.schema_name,
+        "table": node.table_name,
+    }
 
 
 def _scan_share_key(node, step):
@@ -1702,7 +1738,41 @@ def _emit_keys_for(ctx, build_child, build_binding, build_key_expr):
     keys_binding = _emit_collect_distinct(
         ctx, anchor_binding, anchor_key, ctx.names.binding()
     )
+    _record_ndv_observation(ctx, build_child, build_key_expr, keys_binding)
     return keys_binding, anchor_key
+
+
+def _record_ndv_observation(ctx, build_child, key_expr, keys_binding):
+    """Record that a collect_distinct's measured row count is a base COLUMN's
+    NDV - only when the collected key IS a base column (so the distinct count is
+    that column's real distinct-value count, not a joined-result cardinality)."""
+    base = _ndv_base_scan(build_child, key_expr)
+    if base is None:
+        return
+    ctx.observations[keys_binding] = {
+        "target": "column_ndv",
+        "datasource": base.datasource,
+        "schema": base.schema_name,
+        "table": base.table_name,
+        "column": key_expr.column,
+    }
+
+
+def _ndv_base_scan(build_child, key_expr):
+    """The base PhysicalScan whose real column the collected key IS, or None. A
+    scan carrying a filter/aggregate is excluded: its distinct count is over the
+    reduced rows, not the base column's domain."""
+    if isinstance(build_child, PhysicalScan):
+        scan = build_child
+    else:
+        scan = _originating_relation(build_child, key_expr)
+    if not isinstance(scan, PhysicalScan):
+        return None
+    if scan.filters is not None or scan.group_by or scan.aggregates:
+        return None
+    if (key_expr.table, key_expr.column) not in scan.column_aliases():
+        return None
+    return scan
 
 
 def _collect_anchor(ctx, build_child, build_key_expr):
