@@ -759,6 +759,15 @@ class CostModel:
             return CardinalityEstimate.create(
                 rows=1, defaults_used=input_estimate.defaults_used
             )
+        learned = self._learned_group_count(agg)
+        if learned is not None:
+            # A MEASURED group count (exact, from a pushed single-table GROUP BY
+            # the engine ran) replaces the NDV-independence product, which
+            # over-counts a correlated key set. No default: it is not estimated.
+            return CardinalityEstimate.create(
+                rows=min(input_estimate.rows, learned),
+                defaults_used=input_estimate.defaults_used,
+            )
         groups, defaults = self._tracked_group_count(
             agg.group_by, agg.input, input_estimate.rows
         )
@@ -768,6 +777,38 @@ class CostModel:
             rows=min(input_estimate.rows, groups),
             defaults_used=combine_defaults([input_estimate], defaults),
         )
+
+    def _learned_group_count(self, agg: Aggregate) -> Optional[int]:
+        """The catalog's MEASURED group count for a plain GROUP BY over ONE
+        unfiltered base table, or None. Only this shape matches what the write
+        path records (a pushed single-table aggregate), so the key is identical
+        on both sides."""
+        catalog = getattr(self.stats_collector, "stats_catalog", None)
+        if catalog is None:
+            return None
+        scan = self._single_unfiltered_scan(agg.input)
+        columns = self._plain_group_columns(agg.group_by)
+        if scan is None or columns is None:
+            return None
+        subject = f"{scan.datasource}.{scan.schema_name}.{scan.table_name}"
+        ttl = self.stats_collector.learned_ttl_seconds
+        return catalog.group_count(subject, columns, ttl)
+
+    def _single_unfiltered_scan(self, input_node):
+        """The one base Scan an aggregate groups directly, with no filter, or
+        None (a filtered or multi-relation input is not this shape)."""
+        if isinstance(input_node, Scan) and input_node.filters is None:
+            return input_node
+        return None
+
+    def _plain_group_columns(self, group_by):
+        """The group keys' column names when all are plain columns, else None."""
+        columns = []
+        for key in group_by:
+            if not isinstance(key, ColumnRef) or not key.table:
+                return None
+            columns.append(key.column)
+        return columns
 
     def _tracked_group_count(self, keys, input_node, input_rows) -> Tuple[int, List[str]]:
         """The product of the group keys' NDVs over the input subtree."""

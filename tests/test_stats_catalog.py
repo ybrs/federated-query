@@ -123,6 +123,18 @@ def test_persists_across_reopen(catalog_path):
     reopened.close()
 
 
+def test_group_count_roundtrip_order_independent(catalog_path):
+    """A recorded group count reads back, and the key is column-order
+    independent (write [item, date], read [date, item] -> same key)."""
+    catalog = _catalog(catalog_path)
+    catalog.record_group("duck.main.store_sales", ["i_item_sk", "d_date"], 13800000)
+    assert catalog.group_count(
+        "duck.main.store_sales", ["d_date", "i_item_sk"]
+    ) == 13800000
+    assert catalog.group_count("duck.main.store_sales", ["i_item_sk"]) is None
+    catalog.close()
+
+
 def test_persist_observations_writes_by_target(catalog_path):
     """The write path joins engine measurements with build_ir provenance and
     dispatches each to its catalog table; a measurement with no provenance (a

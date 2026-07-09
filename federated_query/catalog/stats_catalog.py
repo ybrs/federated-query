@@ -17,9 +17,10 @@ TTL (older-than-TTL falls through to source stats); nothing here can produce an
 incorrect result. See adaptive-catalog-plan.md.
 """
 
+import json
 import sqlite3
 from datetime import datetime, timezone
-from typing import Optional
+from typing import List, Optional
 
 # The table-level row count has no column, but SQLite treats NULL as distinct in
 # a UNIQUE/PRIMARY KEY (NULLs never compare equal), which would defeat the
@@ -105,6 +106,14 @@ _SCHEMA = (
 def _utc_now() -> str:
     """The current UTC time as an ISO-8601 string (the observed_at stamp)."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def group_key(columns: List[str]) -> str:
+    """The canonical group_key_set string for a list of GROUP BY column names.
+    Sorted + JSON so the write side (a pushed aggregate scan) and the read side
+    (the cost model's aggregate estimate) produce the IDENTICAL key regardless
+    of column order."""
+    return json.dumps(sorted(columns))
 
 
 class StatsCatalog:
@@ -212,7 +221,39 @@ class StatsCatalog:
             return None
         return output_rows / input_rows
 
+    def record_group(
+        self, subject: str, group_columns: List[str], group_count: int,
+        input_rows: Optional[int] = None,
+    ) -> None:
+        """Record a GROUP BY's MEASURED output-row count (the number of groups)
+        for a subject (a table, or a subplan signature) and its group-key set.
+        This is the collapse signal the cost model cannot estimate - the
+        NDV-independence product over-counts - but the engine measures exactly."""
+        self._conn.execute(
+            "INSERT INTO group_stats (subject, group_key_set, measured_group_count, "
+            "measured_input_rows, observed_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(subject, group_key_set) DO UPDATE SET "
+            "measured_group_count=excluded.measured_group_count, "
+            "measured_input_rows=excluded.measured_input_rows, "
+            "observed_at=excluded.observed_at, "
+            "observation_count=group_stats.observation_count+1",
+            (subject, group_key(group_columns), group_count, input_rows, self._clock()),
+        )
+
     # --- read path (warm the planner; TTL falls through to source stats) -------
+
+    def group_count(
+        self, subject: str, group_columns: List[str], max_age_seconds=None
+    ) -> Optional[int]:
+        """The learned number of groups for a subject's GROUP BY key set, or None
+        (absent/stale). The measured collapse the cost model uses in place of its
+        NDV-independence product."""
+        row = self._conn.execute(
+            "SELECT measured_group_count, observed_at FROM group_stats WHERE "
+            "subject=? AND group_key_set=?",
+            (subject, group_key(group_columns)),
+        ).fetchone()
+        return self._fresh_value(row, max_age_seconds)
 
     def table_rows(
         self, datasource: str, schema: str, table: str, max_age_seconds=None

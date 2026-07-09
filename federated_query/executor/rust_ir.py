@@ -485,13 +485,17 @@ def _emit_source(node, ctx):
 
 
 def _record_scan_observation(ctx, node, binding):
-    """Record that this scan's measured output rows are a table's BASE row count.
-    Only an unfiltered, un-aggregated base scan qualifies: a filter makes the
-    count a predicate selectivity and a pushed aggregate makes it a group count,
-    both of which are v1.5 (they come from lazy merge fragments)."""
-    if not isinstance(node, PhysicalScan):
+    """Record what a base scan's measured output rows mean for the catalog. An
+    unfiltered plain GROUP BY on one table: the rows are the GROUP COUNT (the
+    collapse signal). An unfiltered, un-grouped scan: the table's BASE row
+    count. Filtered scans are predicate-conditioned (their counts belong to
+    predicate_stats, later)."""
+    if not isinstance(node, PhysicalScan) or node.filters is not None:
         return
-    if node.filters is not None or node.group_by or node.aggregates or node.grouping_sets:
+    if node.group_by and not node.grouping_sets:
+        _record_group_observation(ctx, node, binding)
+        return
+    if node.group_by or node.aggregates or node.grouping_sets:
         return
     ctx.observations[binding] = {
         "target": "table_rows",
@@ -499,6 +503,31 @@ def _record_scan_observation(ctx, node, binding):
         "schema": node.schema_name,
         "table": node.table_name,
     }
+
+
+def _record_group_observation(ctx, node, binding):
+    """A pushed single-table GROUP BY: the scan's output rows are the group count
+    for (table, group columns). Only plain-column group keys, so the cost
+    model's aggregate estimate - which keys by the same column names - finds it."""
+    columns = _plain_group_columns(node.group_by)
+    if columns is None:
+        return
+    ctx.observations[binding] = {
+        "target": "group",
+        "subject": f"{node.datasource}.{node.schema_name}.{node.table_name}",
+        "columns": columns,
+    }
+
+
+def _plain_group_columns(group_by):
+    """The column names of a GROUP BY when every key is a plain column, else
+    None (an expression key has no stable name to match on)."""
+    columns = []
+    for key in group_by:
+        if not isinstance(key, ColumnRef) or key.column == "*":
+            return None
+        columns.append(key.column)
+    return columns
 
 
 def _scan_share_key(node, step):
@@ -2424,5 +2453,8 @@ def _persist_one(stats_catalog, prov, rows):
         stats_catalog.record_column_ndv(
             prov["datasource"], prov["schema"], prov["table"], prov["column"], rows
         )
+        return
+    if target == "group":
+        stats_catalog.record_group(prov["subject"], prov["columns"], rows)
         return
     raise ValueError(f"unknown observation target {target!r}")
