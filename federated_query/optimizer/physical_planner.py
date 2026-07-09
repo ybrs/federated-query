@@ -371,6 +371,7 @@ class PhysicalPlanner:
         datasource = self.catalog.get_datasource(scan.datasource)
         if datasource is None:
             raise ValueError(f"Data source not found: {scan.datasource}")
+        estimated_rows = self._scan_estimated_rows(scan)
 
         # Push the projected columns, filters and any aggregation down to the
         # owning source and stream the matching rows back as Arrow batches.
@@ -394,9 +395,24 @@ class PhysicalPlanner:
             order_by_ascending=scan.order_by_ascending,
             order_by_nulls=scan.order_by_nulls,
             distinct=scan.distinct,
-            estimated_rows=scan.estimated_rows,
+            estimated_rows=estimated_rows,
             column_ndv=scan.column_ndv,
         )
+
+    def _scan_estimated_rows(self, scan: Scan) -> Optional[int]:
+        """A scan's row estimate for reduction orientation: its own annotation
+        (from join reordering), else a non-defaulted cost estimate, else None.
+        Annotating EVERY scan - not only a join's immediate children - lets the
+        reduction orient a join whose big side is wrapped in a derived table or
+        union (its leaf scans still carry a size the orientation can descend to).
+        A defaulted estimate stays None: an untrusted guess must not masquerade
+        as a known size and flip a good orientation."""
+        if scan.estimated_rows is not None:
+            return scan.estimated_rows
+        if self.cost_model is None:
+            return None
+        estimate = self.cost_model.estimate(scan)
+        return None if estimate.defaults_used else estimate.rows
 
     def _plan_filter(self, filter_node: Filter) -> PhysicalFilter:
         """Plan a filter node."""

@@ -35,9 +35,9 @@ from ..plan.expressions import (
     UnaryOpType,
     expression_children,
 )
-from ..plan.logical import JoinType
+from ..plan.logical import JoinType, SetOpKind
 from ..optimizer.decorrelation import _replace_column_refs
-from ..optimizer.estimate_defaults import larger_estimated_side
+from ..optimizer.estimate_defaults import larger_estimated_side, orientation_rows
 from ..plan.physical import (
     PhysicalAliasedRelation,
     PhysicalCTEMergeQuery,
@@ -1336,7 +1336,31 @@ def _traced_injection_bases(node, key_pair):
         return _join_injection_bases(node, key_pair)
     if isinstance(node, PhysicalUnion):
         return _union_injection_bases(node, key_pair)
+    if isinstance(node, PhysicalSetOperation):
+        return _setop_injection_bases(node, key_pair)
     return None
+
+
+def _setop_injection_bases(setop, key_pair):
+    """Descend into both branches of a binary UNION, exactly as the n-ary union
+    case does (q54's catalog UNION ALL web sits in a SetOperation, not a
+    PhysicalUnion). INTERSECT/EXCEPT are not traced: filtering an EXCEPT's right
+    branch could ADD result rows, and an intersect only reduces via its smaller
+    side, so neither reduces safely by a key superset here. A branch that does
+    not trace stays unfiltered - the reduction join above still drops keyless
+    rows exactly; None only when NEITHER branch traces."""
+    if setop.kind != SetOpKind.UNION or key_pair not in setop.column_aliases():
+        return None
+    position = setop.schema().names.index(key_pair[1])
+    bases = []
+    for branch in (setop.left, setop.right):
+        pair = _branch_key_pair(branch, position)
+        if pair is None:
+            continue
+        traced = _traced_injection_bases(branch, pair)
+        if traced:
+            bases.extend(traced)
+    return bases or None
 
 
 def _union_injection_bases(union, key_pair):
@@ -1369,9 +1393,22 @@ def _branch_key_pair(branch, position):
     for pair, name in branch.column_aliases().items():
         if name == physical:
             matches.append(pair)
-    if len(matches) != 1:
-        return None
-    return matches[0]
+    if len(matches) == 1:
+        return matches[0]
+    return _branch_identity_pair(matches, physical)
+
+
+def _branch_identity_pair(matches, physical):
+    """Resolve an ambiguous branch column. A renaming projection exposes BOTH
+    its output-alias identity ``(None, out)`` and the base passthrough
+    ``(base, col)`` under the same physical name; prefer the output-alias pair
+    (its column IS the physical name), which the downstream projection tracer
+    resolves through its output names. None when that is not unique either."""
+    identity = []
+    for pair in matches:
+        if pair[1] == physical:
+            identity.append(pair)
+    return identity[0] if len(identity) == 1 else None
 
 
 def _traced_base_entry(base, key_pair):
@@ -1558,15 +1595,69 @@ def _side_urgency(node, key_expr) -> int:
     return best
 
 
+def _passthrough_input(node):
+    """The single input a SIZE-PRESERVING wrapper exposes unchanged (a derived
+    table, a filter, or a non-DISTINCT projection), or None. A DISTINCT
+    projection collapses rows, so it is not size-preserving."""
+    if isinstance(node, (PhysicalAliasedRelation, PhysicalFilter)):
+        return node.input
+    if isinstance(node, PhysicalProjection) and not node.distinct and not node.distinct_on:
+        return node.input
+    return None
+
+
+def _derived_side_rows(node):
+    """A join side's size for orientation when its own estimate is absent:
+    descend through size-preserving wrappers and sum a union's branches down to
+    the leaf scans (every scan now carries an estimate). Abstains (None) on a
+    collapsing node - an aggregate or DISTINCT - whose output size the input
+    rows do not predict, so orientation keeps its rank-based fallback there
+    rather than trust an over-estimate."""
+    direct = orientation_rows(node)
+    if direct is not None:
+        return direct
+    passthrough = _passthrough_input(node)
+    if passthrough is not None:
+        return _derived_side_rows(passthrough)
+    if isinstance(node, (PhysicalUnion, PhysicalSetOperation)):
+        return _summed_side_rows(node)
+    return None
+
+
+def _summed_side_rows(node):
+    """The summed derived size of a union's branches, or None if any branch is
+    unjudgeable (a partial sum would understate the side and mis-orient)."""
+    total = 0
+    for child in node.children():
+        rows = _derived_side_rows(child)
+        if rows is None:
+            return None
+        total += rows
+    return total
+
+
+def _larger_derived_side(left, right):
+    """The bigger of two join sides by derived size, or None when either is
+    unjudgeable or they tie - the same abstention contract as
+    larger_estimated_side, but seeing through derived-table / union wrappers."""
+    left_rows = _derived_side_rows(left)
+    right_rows = _derived_side_rows(right)
+    if left_rows is None or right_rows is None or left_rows == right_rows:
+        return None
+    return right if right_rows > left_rows else left
+
+
 def _cardinality_probe(join):
     """The larger injectable side to reduce, or None to fall back.
 
-    Uses the cost estimate threaded onto both children (via the shared
-    larger_estimated_side helper). Declines (None) when either estimate is
-    missing, they tie (both likely defaulted), or the larger side is not an
-    injectable probe - guaranteeing the same reduction set as the structural
-    heuristic, just better-oriented when sizes differ."""
-    larger = larger_estimated_side(join.left, join.right)
+    Uses the cost estimate threaded onto both children, seen THROUGH derived-
+    table and union wrappers (a big fact wrapped in a derived table still
+    out-sizes a small dimension - q54's 21.6M sales union vs a 30-row date
+    filter). Declines (None) when either estimate is missing, they tie (both
+    likely defaulted), or the larger side is not an injectable probe -
+    guaranteeing the same reduction set as the structural heuristic, just
+    better-oriented when sizes differ."""
+    larger = _larger_derived_side(join.left, join.right)
     if larger is None:
         return None
     key_expr = join.left_keys[0] if larger is join.left else join.right_keys[0]
