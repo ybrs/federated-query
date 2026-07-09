@@ -1,6 +1,6 @@
 """Configuration management for federated query engine."""
 
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import yaml
 from pathlib import Path
 
@@ -126,6 +126,10 @@ class Config(StateModel):
     optimizer: OptimizerConfig = Field(default_factory=OptimizerConfig)
     executor: ExecutorConfig = Field(default_factory=ExecutorConfig)
     cost: CostConfig = Field(default_factory=CostConfig)
+    # The YAML file this config was loaded from, when any. The learned-stats
+    # catalog defaults next to it (one catalog per configuration). None for a
+    # programmatically-built config.
+    source_path: Optional[str] = None
 
     @classmethod
     def create(
@@ -235,7 +239,8 @@ def load_config(config_path: str) -> Config:
     cost = CostConfig.create(**cost_data)
 
     # The fully assembled engine config, wiring the parsed data sources together
-    # with the optimizer, executor, and cost sub-configs built above.
+    # with the optimizer, executor, and cost sub-configs built above. The source
+    # path is recorded so the learned-stats catalog can default next to it.
     return Config.create(
         datasources=datasources, optimizer=optimizer, executor=executor, cost=cost
-    )
+    ).model_copy(update={"source_path": str(path)})

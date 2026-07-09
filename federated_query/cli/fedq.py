@@ -6,6 +6,17 @@ import json
 import os
 import time
 from pathlib import Path
+
+
+def _config_catalog_path(config):
+    """The learned-stats catalog file next to the config it was loaded from
+    (``<config>.stats.sqlite``), or None for a config with no source file."""
+    source = getattr(config, "source_path", None)
+    if not source:
+        return None
+    source_path = Path(source)
+    return str(source_path.parent / (source_path.stem + ".stats.sqlite"))
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import click
@@ -96,8 +107,9 @@ class FedQRuntime:
         self.binder = Binder(catalog)
         # ONE learned-stats catalog for the session, shared by the read path
         # (cost model overlays measured values) and the write path (executor
-        # persists measurements). None disables learning.
-        self.stats_catalog = self._open_stats_catalog()
+        # persists measurements). Defaults next to the config; None only for a
+        # programmatic config with no file and no override.
+        self.stats_catalog = self._open_stats_catalog(config)
         # ONE cost model (and statistics cache) for the session: join ordering
         # and the physical planner's scan annotation read the same numbers.
         cost_model = build_cost_model(
@@ -123,11 +135,12 @@ class FedQRuntime:
             decorrelator=self.decorrelator,
         )
 
-    def _open_stats_catalog(self):
-        """Open the learned-stats catalog when FEDQ_STATS_CATALOG names a path,
-        else None (learning off). One catalog per configuration, shared by the
-        read and write paths."""
-        path = os.environ.get("FEDQ_STATS_CATALOG")
+    def _open_stats_catalog(self, config):
+        """Open the learned-stats catalog: the FEDQ_STATS_CATALOG path when set
+        (an override), else a file NEXT TO the loaded config (one catalog per
+        configuration, always on - collection is free). None only when there is
+        neither: a programmatic config with no file and no override."""
+        path = os.environ.get("FEDQ_STATS_CATALOG") or _config_catalog_path(config)
         if not path:
             return None
         from ..catalog.stats_catalog import StatsCatalog
