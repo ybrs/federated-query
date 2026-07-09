@@ -22,13 +22,17 @@ from .rules import (
 from .statistics import StatisticsCollector
 
 
-def build_cost_model(catalog: Catalog, cost_config: CostConfig) -> CostModel:
+def build_cost_model(
+    catalog: Catalog, cost_config: CostConfig, stats_catalog=None
+) -> CostModel:
     """The session's ONE cost model over a session-cached statistics
     collector: statistics are fetched from the sources' catalogs lazily per
     column and cached for the life of the session. Shared by the join-ordering
     rule and the physical planner so every size-sensitive decision reads the
-    same numbers."""
-    return CostModel(cost_config, StatisticsCollector(catalog))
+    same numbers. A learned-stats catalog, when given, overlays measured row
+    counts / NDVs over the sources' estimates."""
+    collector = StatisticsCollector(catalog, stats_catalog=stats_catalog)
+    return CostModel(cost_config, collector)
 
 
 def build_optimizer(

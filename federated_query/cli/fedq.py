@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -93,15 +94,23 @@ class FedQRuntime:
         self.catalog = catalog
         self.parser = Parser()
         self.binder = Binder(catalog)
+        # ONE learned-stats catalog for the session, shared by the read path
+        # (cost model overlays measured values) and the write path (executor
+        # persists measurements). None disables learning.
+        self.stats_catalog = self._open_stats_catalog()
         # ONE cost model (and statistics cache) for the session: join ordering
         # and the physical planner's scan annotation read the same numbers.
-        cost_model = build_cost_model(catalog, config.cost)
+        cost_model = build_cost_model(
+            catalog, config.cost, stats_catalog=self.stats_catalog
+        )
         self.optimizer = build_optimizer(
             catalog, config.optimizer, config.cost, cost_model=cost_model
         )
         self.planner = PhysicalPlanner(catalog, cost_model=cost_model)
         self.decorrelator = Decorrelator()
-        physical_executor = Executor(config=config.executor)
+        physical_executor = Executor(
+            config=config.executor, stats_catalog=self.stats_catalog
+        )
         processors = [StarExpansionProcessor(catalog, dialect=self.parser.dialect)]
         self.query_executor = QueryExecutor(
             catalog=catalog,
@@ -113,6 +122,17 @@ class FedQRuntime:
             processors=processors,
             decorrelator=self.decorrelator,
         )
+
+    def _open_stats_catalog(self):
+        """Open the learned-stats catalog when FEDQ_STATS_CATALOG names a path,
+        else None (learning off). One catalog per configuration, shared by the
+        read and write paths."""
+        path = os.environ.get("FEDQ_STATS_CATALOG")
+        if not path:
+            return None
+        from ..catalog.stats_catalog import StatsCatalog
+
+        return StatsCatalog(path)
 
     def execute(self, sql: str) -> Union[pa.Table, Dict[str, Any]]:
         """Run a SQL statement and return results."""

@@ -154,6 +154,86 @@ def test_persist_unknown_target_raises(catalog_path):
     catalog.close()
 
 
+class _FakeSource:
+    """A datasource returning canned TableStatistics regardless of columns."""
+
+    def __init__(self, stats):
+        """Hold the canned statistics this fake source serves."""
+        self.stats = stats
+
+    def get_table_statistics(self, schema, table, columns):
+        """Serve the canned statistics."""
+        return self.stats
+
+
+class _FakeCatalog:
+    """A metadata catalog resolving every datasource name to one fake source."""
+
+    def __init__(self, source):
+        """Hold the single source every lookup resolves to."""
+        self.source = source
+
+    def get_datasource(self, name):
+        """Resolve any datasource name to the fake source."""
+        return self.source
+
+
+def _collector(source_stats, stats_catalog):
+    """A StatisticsCollector over a fake source, with the learned catalog wired."""
+    from federated_query.optimizer.statistics import StatisticsCollector
+
+    return StatisticsCollector(
+        _FakeCatalog(_FakeSource(source_stats)), stats_catalog=stats_catalog
+    )
+
+
+def test_overlay_fills_missing_source_row_count(catalog_path):
+    """A learned row count fills the source's None (the warehouse case: pg has
+    no stats, the catalog measured 10)."""
+    from federated_query.datasources.base import TableStatistics
+
+    catalog = _catalog(catalog_path)
+    catalog.record_table_rows("pg", "public", "warehouse", 10)
+    source_stats = TableStatistics.create(
+        row_count=None, total_size_bytes=0, column_stats={}
+    )
+    collector = _collector(source_stats, catalog)
+    stats = collector.get_table_statistics("pg", "public", "warehouse", [])
+    assert stats.row_count == 10
+    catalog.close()
+
+
+def test_overlay_fills_missing_column_ndv(catalog_path):
+    """A learned column NDV fills a source that lacks that column's stats."""
+    from federated_query.datasources.base import TableStatistics
+
+    catalog = _catalog(catalog_path)
+    catalog.record_column_ndv("pg", "public", "warehouse", "w_warehouse_sk", 10)
+    source_stats = TableStatistics.create(
+        row_count=10, total_size_bytes=0, column_stats={}
+    )
+    collector = _collector(source_stats, catalog)
+    stats = collector.get_table_statistics(
+        "pg", "public", "warehouse", ["w_warehouse_sk"]
+    )
+    assert stats.column_stats["w_warehouse_sk"].num_distinct == 10
+    catalog.close()
+
+
+def test_overlay_absent_leaves_source_unchanged(catalog_path):
+    """With nothing learned for a table, the source's stats pass through."""
+    from federated_query.datasources.base import TableStatistics
+
+    catalog = _catalog(catalog_path)
+    source_stats = TableStatistics.create(
+        row_count=500, total_size_bytes=0, column_stats={}
+    )
+    collector = _collector(source_stats, catalog)
+    stats = collector.get_table_statistics("pg", "public", "other", [])
+    assert stats.row_count == 500
+    catalog.close()
+
+
 def test_unknown_field_raises(catalog_path):
     """The internal upsert refuses a field outside its allow-list (defensive:
     no dynamic SQL over an unvetted column name)."""
