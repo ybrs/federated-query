@@ -119,10 +119,30 @@ Verified: suite 1315+ pass; 18 catalog tests; 99|0|0 at SF10 with learning on
 (perf-neutral after the fill-only + batched-write fixes); warm sessions read
 back warehouse=10 / item=102000 / a measured group count.
 
-NEXT: SUBPLAN SIGNATURES - a canonical key for a joined/filtered aggregate (and
-later a reduction subtree) so group_stats/subplan_stats engage on real queries,
-turning the catalog from "fills missing stats" into "learns the hard
-cardinalities". This is what makes the learning change decisions on TPC-DS.
+SUBPLAN SIGNATURES - foundation DONE 2026-07-09 (5cfa456,
+optimizer/subplan_signature.py + 7 tests): subplan_signature(node) hashes a
+logical subplan MODULO alias names + constant values (sorted base tables + the
+equi-join graph + filter shapes), so a measured cardinality can be keyed by the
+subplan that produced it and found again at plan time. Constant-neutral matches
+the exploratory workload; correctness-neutral.
+
+REMAINING to make group_stats BITE on the real targets (two independent pieces,
+both needed together):
+1. KEYING via signatures - stamp signature(agg.input) + base group columns on
+   the physical aggregate node so the write path records group_stats by
+   signature and the cost model looks it up. Straightforward for single-source
+   aggregates (SingleSourcePushdown stamps the RemoteQuery), but those are RARE
+   in pg-dims.
+2. MEASUREMENT of CROSS-SOURCE aggregates - the dim-shipping fact-x-dim GROUP BY
+   is a coordinator MERGE fragment (lazy-fused), so its group count is NOT the
+   v1 materialized-row-count; it needs the DataFusion output-row METRIC HARVEST
+   (restructure collect_tracked to keep the physical plan, read AggregateExec
+   output_rows, attribute to the logical aggregate). This is the "path b" the
+   v1.5 commit deferred.
+Signatures (1) give the KEY; metric harvest (2) gives the NUMBER. Only both
+together cover the cross-source joined aggregates that motivated group_stats.
+Then optionally change the dim-shipping gate to consult the measured collapse
+(group_count / input_rows) instead of the dimension-width heuristic.
 
 ## OPEN ISSUES
 
