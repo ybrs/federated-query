@@ -189,11 +189,59 @@ signature-stability check. Phase B: an estimate-quality metric (predicted vs
 measured rows, logged), the q23-family gate check, and 99|0|0. Phase C:
 per-decision correctness + the perf tally.
 
+## Observations payload (write-path interface) - DESIGNED
+
+Core principle: the engine reports ONE number per step - its output row count -
+and Python decides what each number MEANS. The engine stays dumb (no knowledge
+of catalog keys, tables, or templates); all semantics live in a Python-side
+provenance map. This keeps the Rust<->Python surface tiny and stable.
+
+Interface:
+
+```
+fedqrs.execute_ir(ir_json)  ->  (arrow_stream, observations)
+# observations: [(binding_name, output_rows), ...]   -- dozens of entries, small
+```
+
+Always on (counting already-materialized batches is negligible), no flag;
+`execute_via_rust` is the only caller, so it unpacks a tuple.
+
+Correlation - `build_ir` records `binding -> provenance` as it emits each
+observable step; provenance is the catalog target for that binding's row count:
+
+```
+source_scan(base, no filter)        -> table_stats(ds, schema, table).measured_rows
+source_scan/injected(base + filter) -> predicate_stats(..., predicate_template)
+collect_distinct(key -> base col C)  -> table_stats(...C).measured_ndv  # rows == NDV
+```
+
+The key `collect_distinct` traces to its base column via the SAME injection-base
+tracing the reduction already uses (`_probe_injection_bases`). After execute, a
+`CatalogWriter` joins `observations` with the provenance map and upserts - OFF
+the critical path (after the result is returned), so it adds no latency.
+
+THE LAZY-FUSION WRINKLE (phasing): merge fragments report rows=0 today (fusion
+streams rows past the fragment boundary without counting). So:
+- v1: source-side only - `source_scan` / `injected_scan` rows and
+  `collect_distinct` NDVs. These are explicitly materialized and counted, and
+  they are exactly what hurt us: EXACT NDVs replace the missing/wrong pg_stats
+  NDVs that broke the dim-shipping gate, and base row counts fix the orientation
+  family. No engine execution change needed.
+- v1.5: merge-side (`group_stats`, `subplan_stats`) by harvesting DataFusion's
+  built-in per-operator `output_rows` metric (`MetricsSet`) after a region runs
+  and mapping operators back to logical fragments. Real but contained Rust work.
+
+FORWARD-COMPAT (Phase C): when Rust must READ the catalog at execution time to
+make runtime decisions, promote the provenance into the IR - each observable
+step carries an `"observe": {...}` tag the engine echoes back - so Rust keys the
+catalog inline. v1 keeps provenance Python-side; design the provenance struct now
+to be IR-serializable (plain fields: target_kind, datasource, schema, table,
+column, predicate_template) so there is no interface churn later.
+
 ## Open items to close before Phase A
 
-- Q2 scope: confirm "one catalog per config, keyed by datasource name, with a
-  `source_fingerprint` slot" (proposed).
 - `source_fingerprint` definition per connector (connection-target hash).
-- The observations payload format (how `execute_ir` returns per-step measurements
-  alongside the Arrow stream).
-- Catalog path default location.
+- Catalog path default location (a state dir derived from the config).
+- v1.5 metric-harvest mechanism: confirm DataFusion `MetricsSet` exposes
+  per-fragment `output_rows` under fusion, or add lightweight CountExec wrappers
+  at logical fragment boundaries.
