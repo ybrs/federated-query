@@ -2407,6 +2407,9 @@ def _persist_observations(stats_catalog, provenance, measurements):
         prov = provenance.get(binding)
         if prov is not None:
             _persist_one(stats_catalog, prov, rows)
+    # One commit for the whole query's batch: per-upsert fsyncs taxed every
+    # execution (measured +~50ms/query at SF10).
+    stats_catalog.commit()
 
 
 def _persist_one(stats_catalog, prov, rows):

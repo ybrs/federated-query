@@ -220,6 +220,23 @@ def test_overlay_fills_missing_column_ndv(catalog_path):
     catalog.close()
 
 
+def test_overlay_fills_not_overrides_row_count(catalog_path):
+    """A present source row count is KEPT even when the catalog learned a
+    different one - fill gaps, do not override (overriding destabilizes
+    orientation decisions tuned against source estimates)."""
+    from federated_query.datasources.base import TableStatistics
+
+    catalog = _catalog(catalog_path)
+    catalog.record_table_rows("pg", "public", "customer", 999)
+    source_stats = TableStatistics.create(
+        row_count=500000, total_size_bytes=0, column_stats={}
+    )
+    collector = _collector(source_stats, catalog)
+    stats = collector.get_table_statistics("pg", "public", "customer", [])
+    assert stats.row_count == 500000
+    catalog.close()
+
+
 def test_overlay_absent_leaves_source_unchanged(catalog_path):
     """With nothing learned for a table, the source's stats pass through."""
     from federated_query.datasources.base import TableStatistics

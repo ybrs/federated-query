@@ -123,7 +123,16 @@ class StatsCatalog:
         """
         self._conn = sqlite3.connect(path)
         self._clock = clock
+        self._tune()
         self._ensure_schema()
+
+    def _tune(self) -> None:
+        """WAL + synchronous=NORMAL: the write path runs during the timed query,
+        so a per-commit fsync would tax every execution (measured +~50ms/query
+        at SF10). WAL with NORMAL syncs far less while staying crash-safe enough
+        for a stats cache whose values only steer plan choice."""
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
 
     def _ensure_schema(self) -> None:
         """Create every catalog table if absent (idempotent on every open)."""
@@ -131,8 +140,15 @@ class StatsCatalog:
             self._conn.execute(statement)
         self._conn.commit()
 
+    def commit(self) -> None:
+        """Flush pending upserts. The write methods do NOT commit each - the
+        query's whole batch of observations commits ONCE (per-upsert fsyncs were
+        the +50ms/query tax)."""
+        self._conn.commit()
+
     def close(self) -> None:
-        """Close the underlying SQLite connection."""
+        """Commit any pending writes and close the connection."""
+        self._conn.commit()
         self._conn.close()
 
     # --- write path (from execution measurements) -----------------------------
@@ -168,7 +184,6 @@ class StatsCatalog:
         self._conn.execute(
             sql, (datasource, schema, table, column, value, self._clock())
         )
-        self._conn.commit()
 
     def record_predicate(
         self, datasource: str, schema: str, table: str, template: str,
@@ -189,7 +204,6 @@ class StatsCatalog:
             (datasource, schema, table, template, param_bucket, input_rows,
              output_rows, selectivity, self._clock()),
         )
-        self._conn.commit()
 
     def _selectivity(self, input_rows: int, output_rows: int) -> Optional[float]:
         """output/input as a fraction, or None when the input row count is zero

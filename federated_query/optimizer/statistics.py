@@ -80,11 +80,14 @@ class StatisticsCollector:
         return entry.merged_view()
 
     def _overlay_learned(self, datasource, schema, table, columns, source_stats):
-        """Prefer LEARNED (measured, exact) values over the source's estimates,
-        filling the row count and per-column NDV where the catalog has a fresh
-        observation. Safe: these values only steer plan choice, never the
-        answer; the TTL bounds staleness. Returns the source stats unchanged when
-        nothing was learned for this table."""
+        """FILL a table's missing statistics from the catalog - the row count or
+        a column NDV the source does not provide (the warehouse case: pg has no
+        stats, the catalog measured 10). This does NOT override values the source
+        already has: replacing source estimates wholesale destabilizes the
+        reduction/orientation decisions tuned against them (measured +5s at SF10),
+        while filling only the gaps keeps the win without the churn. Safe either
+        way - these values only steer plan choice; the TTL bounds staleness.
+        Returns the source stats unchanged when nothing was learned."""
         rows = self.stats_catalog.table_rows(
             datasource, schema, table, self.learned_ttl_seconds
         )
@@ -105,12 +108,15 @@ class StatisticsCollector:
         return ndvs
 
     def _merge_learned(self, source_stats, rows, ndvs):
-        """A TableStatistics with learned row count / column NDVs overlaid over
-        whatever the source provided (which may be None)."""
-        row_count = rows if rows is not None else self._source_rows(source_stats)
+        """A TableStatistics with learned values FILLING the gaps the source left
+        (a None row count, a column with no distinct count); present source
+        values are kept."""
+        row_count = self._source_rows(source_stats)
+        if row_count is None:
+            row_count = rows
         column_stats = dict(source_stats.column_stats) if source_stats else {}
         for column, ndv in ndvs.items():
-            column_stats[column] = self._column_with_ndv(column_stats.get(column), ndv)
+            column_stats[column] = self._filled_column(column_stats.get(column), ndv)
         total = source_stats.total_size_bytes if source_stats else 0
         # create, not model_copy: this MERGES two origins (learned row count /
         # NDVs over the source's), so there is no single node to copy from -
@@ -123,9 +129,12 @@ class StatisticsCollector:
         """The source's row count, or None when it provided no statistics."""
         return source_stats.row_count if source_stats else None
 
-    def _column_with_ndv(self, existing, ndv):
-        """A ColumnStatistics carrying the learned NDV: the source's column with
-        its distinct count replaced, or a fresh one when the source lacked it."""
+    def _filled_column(self, existing, ndv):
+        """The column's stats with the learned NDV FILLED IN only where the
+        source lacks one: a present source distinct count is kept (fill, not
+        override)."""
+        if existing is not None and existing.num_distinct is not None:
+            return existing
         if existing is not None:
             return existing.model_copy(update={"num_distinct": ndv})
         # create, not model_copy: the source had NO stats for this column, so
