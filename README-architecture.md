@@ -837,3 +837,51 @@ parse errors, `ValueError` / `RuntimeError`, and `duckdb.Error` as `error: ...`,
 with a broad fallback that surfaces anything else (an `UnsupportedIR`, a Rust
 engine error) as `unexpected error: ...`. Everywhere else, exceptions propagate.
 A crash never ships a lie.
+
+---
+
+## 10. Learned statistics catalog (optional)
+
+The optimizer's cardinality decisions - reduction orientation, the dim-shipping
+gate, join order, build-side choice - rest on estimates from source statistics,
+with the NDV-independence and defaulting this engine has repeatedly been bitten
+by. A federated engine can instead MEASURE: it materializes every cross-source
+intermediate anyway, so the exact size and distinct-key counts are free at
+runtime. The learned catalog (`catalog/stats_catalog.py`, `StatsCatalog`)
+persists those measurements to a local SQLite file and serves them back to warm
+future planning - the system learns its workload. It is OPTIONAL: enabled only
+when `FEDQ_STATS_CATALOG` names a path, off by default with no behavior change.
+Design and phases: `adaptive-catalog-plan.md`.
+
+Correctness-neutral by construction. A learned value only changes WHICH plan the
+optimizer picks - never the answer - because every decision it feeds is itself
+correctness-neutral (the join / aggregate is always computed correctly). A stale
+or wrong value costs a slow query, never a wrong one, so the catalog can learn
+aggressively and invalidate lazily.
+
+WRITE path (execution time). `fedqrs.execute_ir` returns, alongside the Arrow
+result, a per-step `(binding, measured rows)` list - the engine reports one
+number per materialized step (`source_scan` / `injected_scan` /
+`collect_distinct`) and stays ignorant of catalog semantics. `build_ir_with_
+observations` (`executor/rust_ir.py`) records a `binding -> provenance` map that
+says what each number MEANS: an unfiltered base scan is a table's row count, a
+collect_distinct over a base column is that column's NDV, an unfiltered pushed
+single-table `GROUP BY` is a group count. `execute_via_rust` joins the two and
+persists them (`Executor.stats_catalog`) after the result table is built, off
+the critical path; writes batch into one commit per query (WAL + normal sync).
+
+READ path (optimize time). `StatisticsCollector._overlay_learned`
+(`optimizer/statistics.py`) FILLS a table's missing statistics from the catalog -
+a row count or column NDV the source does not provide (the warehouse case: pg
+has no stats, the catalog measured 10) - without OVERRIDING values the source
+already has (overriding destabilizes decisions tuned against source estimates).
+`CostModel._estimate_aggregate_tracked` (`optimizer/cost.py`) uses a MEASURED
+group count in place of its NDV-independence product when the aggregate is a
+plain `GROUP BY` over one unfiltered base table. Both consult the catalog first,
+then source stats, then named defaults; a TTL bounds staleness.
+
+The catalog is scoped one-per-configuration (keyed by the config's datasource
+names, with a `source_fingerprint` slot for repoint detection). It also holds
+`predicate_stats`, `subplan_stats`, and a `materialized_fragments` registry -
+schema that later phases (predicate-conditioned selectivities, subplan-signature
+cardinalities, and the query accelerator) populate.

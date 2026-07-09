@@ -91,6 +91,39 @@ aggregation validated but entangled with the reduction machinery - the reduction
 must descend through the pushed partial aggregate; deferred); sub-second overhead
 family (q16/q54-now-fine/q94).
 
+## ADAPTIVE STATISTICS CATALOG - Phase A + B + v1.5 DONE 2026-07-09
+
+Branch feature/adaptive-catalog (federated-query + fedqrs). The optimizer
+GUESSES cardinalities (NDV-independence, defaulting); a federated engine can
+MEASURE (it materializes every cross-source intermediate anyway) and REMEMBER.
+A local SQLite catalog (`catalog/stats_catalog.py`) persists runtime measurements
+and warms future planning - the system learns its workload. OPTIONAL: on only
+when FEDQ_STATS_CATALOG names a path (off by default, no behavior change).
+Correctness-neutral by construction: a learned value only steers plan choice,
+never the answer. Full design: `adaptive-catalog-plan.md`; architecture doc
+section 10.
+
+- Phase A (write): `execute_ir` returns (arrow_stream, [(binding, rows)]);
+  `build_ir_with_observations` maps each binding to catalog provenance;
+  `execute_via_rust`/`Executor` persist off the critical path, batched (one
+  commit/query, WAL). Captures base row counts + exact column NDVs.
+- Phase B (read): `StatisticsCollector._overlay_learned` FILLS missing source
+  stats (the warehouse=10 case) but does NOT override present ones (overriding
+  destabilized orientation, +5s at SF10). Shared one catalog across read+write.
+- v1.5 (group_stats): measured GROUP COUNT for an unfiltered single-table GROUP
+  BY replaces the cost model's NDV product. Coverage is narrow (single-table
+  unfiltered); FILTERED and MULTI-TABLE (joined) aggregates need
+  predicate-conditioning / SUBPLAN SIGNATURES - the current follow-up.
+
+Verified: suite 1315+ pass; 18 catalog tests; 99|0|0 at SF10 with learning on
+(perf-neutral after the fill-only + batched-write fixes); warm sessions read
+back warehouse=10 / item=102000 / a measured group count.
+
+NEXT: SUBPLAN SIGNATURES - a canonical key for a joined/filtered aggregate (and
+later a reduction subtree) so group_stats/subplan_stats engage on real queries,
+turning the catalog from "fills missing stats" into "learns the hard
+cardinalities". This is what makes the learning change decisions on TPC-DS.
+
 ## OPEN ISSUES
 
 None blocking correctness (99|0|0 everywhere). Dim shipping is DONE but has

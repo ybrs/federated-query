@@ -155,6 +155,65 @@ def test_persist_observations_writes_by_target(catalog_path):
     catalog.close()
 
 
+def test_persist_group_observation(catalog_path):
+    """A 'group' observation dispatches to record_group (the group count)."""
+    from federated_query.executor.rust_ir import _persist_observations
+
+    catalog = _catalog(catalog_path)
+    provenance = {
+        "b1": {"target": "group", "subject": "duck.main.store_sales",
+               "columns": ["ss_item_sk", "d_date"]},
+    }
+    _persist_observations(catalog, provenance, [("b1", 13800000)])
+    assert catalog.group_count(
+        "duck.main.store_sales", ["ss_item_sk", "d_date"]
+    ) == 13800000
+    catalog.close()
+
+
+def test_plain_group_columns():
+    """The group-column extractor returns names for plain columns, None when any
+    key is not a plain column (no stable name to key group_stats on)."""
+    from federated_query.executor.rust_ir import _plain_group_columns
+    from federated_query.plan.expressions import ColumnRef, Literal, DataType
+
+    cols = [
+        ColumnRef(table="t", column="a", data_type=DataType.INTEGER),
+        ColumnRef(table="t", column="b", data_type=DataType.INTEGER),
+    ]
+    assert _plain_group_columns(cols) == ["a", "b"]
+    assert _plain_group_columns([Literal(value=1, data_type=DataType.INTEGER)]) is None
+
+
+def test_cost_model_uses_learned_group_count(catalog_path):
+    """The cost model replaces its NDV-product group estimate with the MEASURED
+    group count for a plain GROUP BY over one unfiltered base table."""
+    from federated_query.optimizer.cost import CostModel
+    from federated_query.optimizer.statistics import StatisticsCollector
+    from federated_query.config.config import CostConfig
+    from federated_query.plan.logical import Aggregate, Scan
+    from federated_query.plan.expressions import ColumnRef, DataType
+
+    catalog = _catalog(catalog_path)
+    catalog.record_group("ds.public.t", ["k"], 42)
+    collector = StatisticsCollector(
+        _FakeCatalog(_FakeSource(None)), stats_catalog=catalog
+    )
+    cost = CostModel(
+        CostConfig(cpu_tuple_cost=0.01, io_page_cost=1.0,
+                   network_byte_cost=0.0001, network_rtt_ms=10.0),
+        collector,
+    )
+    scan = Scan(datasource="ds", schema_name="public", table_name="t", columns=["k"])
+    agg = Aggregate(
+        input=scan,
+        group_by=[ColumnRef(table="t", column="k", data_type=DataType.INTEGER)],
+        aggregates=[], output_names=["k"],
+    )
+    assert cost.estimate(agg).rows == 42
+    catalog.close()
+
+
 def test_persist_unknown_target_raises(catalog_path):
     """An observation naming an unknown catalog target raises rather than being
     silently dropped (defensive: a new provenance kind must be handled)."""
