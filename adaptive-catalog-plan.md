@@ -179,11 +179,19 @@ then named defaults - provenance recorded so EXPLAIN can surface
   in v1.5: `predicate_stats` for filtered scans (very common) and merge-side
   `group_stats` / `subplan_stats`. Prioritize v1.5 (DataFusion output-row metric
   harvest) right after Phase B, or interleave it.
-- B - CONSULT (warm planning). `CostModel` + gates READ observations; cold ->
-  warm within a session, then across sessions (persistence). Measure estimate-
-  quality lift across the suite and the dim-shipping gate improvement (q23-shape
-  now answered by measured `group_stats`). Verify 99|0|0 - trivially safe
-  (perf-only).
+- B - CONSULT (warm planning). DONE 2026-07-09. `StatisticsCollector` overlays
+  learned row counts / NDVs (`_overlay_learned`); `FedQRuntime` opens ONE
+  `StatsCatalog` when `FEDQ_STATS_CATALOG` names a path and shares it across the
+  read path (cost model) and write path (executor), None = off. Validated: a
+  cold session populates, a warm session reads back warehouse=10 / item=102000.
+  99|0|0 at SF10 with learning on. TWO findings from measuring the read path on:
+  (1) FILL-ONLY, not prefer-learned - overriding present source estimates
+  destabilizes the reduction/orientation decisions tuned against them (+5s at
+  SF10); fill only the gaps the source left. (2) BATCH the writes - a per-upsert
+  commit fsynced on the timed execute path (+50ms/query); one commit per query +
+  WAL/synchronous=NORMAL cut it to ~+4ms/query. The dim-shipping-gate improvement
+  from measured group_stats waits on v1.5 (this phase reads only v1's table_rows
+  / NDVs).
 - C - ADAPT (runtime decision points). Move reduction orientation / usefulness /
   build-side to decisions made AT execution time from observed cardinalities of
   already-executed inputs - the real adaptive layer, and the first slice of
