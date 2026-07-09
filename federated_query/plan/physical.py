@@ -1504,6 +1504,11 @@ class PhysicalHashAggregate(PhysicalPlanNode):
     aggregates: List[Expression]
     output_names: List[str]
     grouping_sets: Optional[List[List[Expression]]] = None
+    # Learned-stats group provenance, stamped at planning from the logical
+    # aggregate: {"subject": subplan signature, "columns": group column names}.
+    # The engine measures this aggregate's group count (the collapse); the write
+    # path keys it in the catalog by this subject. None = not observable.
+    group_observation: Optional[Dict[str, object]] = None
 
     @classmethod
     def create(
@@ -1514,6 +1519,7 @@ class PhysicalHashAggregate(PhysicalPlanNode):
         aggregates: List[Expression],
         output_names: List[str],
         grouping_sets: Optional[List[List[Expression]]] = None,
+        group_observation: Optional[Dict[str, object]] = None,
     ) -> "PhysicalHashAggregate":
         """Sanctioned fresh-construction path for PhysicalHashAggregate.
         Names every field so none is dropped; derive from an existing node
@@ -1524,6 +1530,7 @@ class PhysicalHashAggregate(PhysicalPlanNode):
             aggregates=aggregates,
             output_names=output_names,
             grouping_sets=grouping_sets,
+            group_observation=group_observation,
         )
 
     def children(self) -> List[PhysicalPlanNode]:

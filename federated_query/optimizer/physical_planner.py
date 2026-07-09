@@ -61,6 +61,7 @@ from ..plan.expressions import (
 )
 from . import pushdown
 from .estimate_defaults import larger_estimated_side
+from .subplan_signature import subplan_signature, group_column_names
 from .single_source_pushdown import SingleSourcePushdown, same_source
 from .dim_shipping import DimShipping
 from ..parser.errors import UnsupportedSQLError
@@ -544,7 +545,20 @@ class PhysicalPlanner:
             aggregates=aggregate.aggregates,
             output_names=aggregate.output_names,
             grouping_sets=aggregate.grouping_sets,
+            group_observation=self._group_observation(aggregate),
         )
+
+    def _group_observation(self, aggregate: Aggregate):
+        """The learned-stats group provenance for a coordinator aggregate: the
+        input's subplan SIGNATURE (so a cross-source fact-x-dim GROUP BY is keyed
+        by its shape) plus the group column names. None for a rollup or a
+        non-plain-column group key (nothing stable to key on)."""
+        if aggregate.grouping_sets or not aggregate.group_by:
+            return None
+        columns = group_column_names(aggregate.group_by)
+        if columns is None:
+            return None
+        return {"subject": subplan_signature(aggregate.input), "columns": columns}
 
     def _plan_remote_join_aggregate(
         self, aggregate: Aggregate, remote_join: PhysicalRemoteJoin

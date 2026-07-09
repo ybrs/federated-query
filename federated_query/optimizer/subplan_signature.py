@@ -40,6 +40,18 @@ def subplan_signature(node: LogicalPlanNode) -> str:
     return hashlib.sha1(canonical.encode("utf-8")).hexdigest()
 
 
+def group_column_names(group_by) -> Optional[List[str]]:
+    """The group-by column names when every key is a plain qualified column,
+    else None (an expression key has no stable name to key group_stats on).
+    Shared by the write provenance, the cost-model read, and the stamp."""
+    names = []
+    for key in group_by:
+        if not isinstance(key, ColumnRef) or not key.table:
+            return None
+        names.append(key.column)
+    return names
+
+
 def _base_tables(node: LogicalPlanNode) -> List[str]:
     """Every base table the subplan reads, as sorted ``ds.schema.table`` names
     (multiplicity kept, so a self-join reads as two entries)."""

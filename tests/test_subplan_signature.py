@@ -84,3 +84,47 @@ def test_stable_across_calls():
     """The signature is deterministic - the same subplan hashes the same twice."""
     plan = _build()
     assert subplan_signature(plan) == subplan_signature(plan)
+
+
+def test_group_column_names():
+    """group_column_names returns plain-column names, None on an expression key."""
+    from federated_query.optimizer.subplan_signature import group_column_names
+
+    keys = [_col("d", "d_year"), _col("i", "i_item_id")]
+    assert group_column_names(keys) == ["d_year", "i_item_id"]
+    assert group_column_names([Literal(value=1, data_type=DataType.INTEGER)]) is None
+
+
+def test_cost_model_uses_signature_group_count(tmp_path):
+    """The cost model reads a MEASURED group count keyed by the input's subplan
+    SIGNATURE for a cross-source joined aggregate (the metric-harvest target)."""
+    from federated_query.catalog.stats_catalog import StatsCatalog
+    from federated_query.optimizer.cost import CostModel
+    from federated_query.optimizer.statistics import StatisticsCollector
+    from federated_query.config.config import CostConfig
+    from federated_query.plan.logical import Aggregate
+
+    join = _build()
+    agg = Aggregate(
+        input=join, group_by=[_col("d", "d_year")], aggregates=[],
+        output_names=["d_year"],
+    )
+    catalog = StatsCatalog(str(tmp_path / "c.sqlite"))
+    catalog.record_group(subplan_signature(join), ["d_year"], 6)
+
+    class _Src:
+        def get_table_statistics(self, schema, table, columns):
+            return None
+
+    class _Cat:
+        def get_datasource(self, name):
+            return _Src()
+
+    collector = StatisticsCollector(_Cat(), stats_catalog=catalog)
+    cost = CostModel(
+        CostConfig(cpu_tuple_cost=0.01, io_page_cost=1.0,
+                   network_byte_cost=0.0001, network_rtt_ms=10.0),
+        collector,
+    )
+    assert cost.estimate(agg).rows == 6
+    catalog.close()

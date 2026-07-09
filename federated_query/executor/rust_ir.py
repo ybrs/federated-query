@@ -759,7 +759,24 @@ def _emit_aggregate(node, ctx):
         return _raw_sql_step(ctx, node._aggregate_sql(aliases), {"in_0": child})
     fragment = ctx.names.fragment()
     ctx.fragments[fragment] = _aggregate_fragment(node, aliases)
-    return _merge_step(ctx, fragment, {"in_0": child})
+    binding = _merge_step(ctx, fragment, {"in_0": child})
+    _record_group_signature(ctx, node, binding)
+    return binding
+
+
+def _record_group_signature(ctx, node, binding):
+    """Record the group provenance stamped on a coordinator aggregate at planning
+    (subplan signature + group columns). The engine measures this binding's group
+    count (via AggregateExec metrics); python keys it in the catalog by the
+    signature, so a cross-source fact-x-dim GROUP BY's collapse is learned."""
+    observation = node.group_observation
+    if observation is None:
+        return
+    ctx.observations[binding] = {
+        "target": "group",
+        "subject": observation["subject"],
+        "columns": observation["columns"],
+    }
 
 
 def _aggregate_fragment(node, aliases):
@@ -2420,7 +2437,12 @@ def execute_via_rust(plan, datasources, stats_catalog=None):
 
     register_datasources(datasources)
     ir, provenance = build_ir_with_observations(plan)
-    stream, measurements = fedqrs.execute_ir(json.dumps(ir))
+    # Observe (harvest aggregate metrics) only when a catalog will consume the
+    # measurements - the harvest keeps the plan and walks it, so the default
+    # non-learning run must not pay it.
+    stream, measurements = fedqrs.execute_ir(
+        json.dumps(ir), stats_catalog is not None
+    )
     table = pa.RecordBatchReader.from_stream(stream).read_all()
     if stats_catalog is not None:
         _persist_observations(stats_catalog, provenance, measurements)

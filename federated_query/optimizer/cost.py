@@ -54,6 +54,7 @@ from ..optimizer.estimate_defaults import (
     cap_composite_denom,
     combine_defaults,
 )
+from .subplan_signature import subplan_signature, group_column_names
 from ..optimizer.pushdown import bare_names
 from ..optimizer.statistics import StatisticsCollector
 from ..datasources.base import TableStatistics
@@ -779,36 +780,25 @@ class CostModel:
         )
 
     def _learned_group_count(self, agg: Aggregate) -> Optional[int]:
-        """The catalog's MEASURED group count for a plain GROUP BY over ONE
-        unfiltered base table, or None. Only this shape matches what the write
-        path records (a pushed single-table aggregate), so the key is identical
-        on both sides."""
+        """The catalog's MEASURED group count for a plain GROUP BY, or None. The
+        subject matches the write side: a single UNFILTERED base table is keyed
+        by its name (the folded pushed-aggregate write); anything else - a
+        joined/filtered, cross-source aggregate - is keyed by its input's SUBPLAN
+        SIGNATURE (the coordinator-aggregate write)."""
         catalog = getattr(self.stats_collector, "stats_catalog", None)
-        if catalog is None:
+        columns = group_column_names(agg.group_by)
+        if catalog is None or columns is None:
             return None
-        scan = self._single_unfiltered_scan(agg.input)
-        columns = self._plain_group_columns(agg.group_by)
-        if scan is None or columns is None:
-            return None
-        subject = f"{scan.datasource}.{scan.schema_name}.{scan.table_name}"
+        subject = self._group_subject(agg.input)
         ttl = self.stats_collector.learned_ttl_seconds
         return catalog.group_count(subject, columns, ttl)
 
-    def _single_unfiltered_scan(self, input_node):
-        """The one base Scan an aggregate groups directly, with no filter, or
-        None (a filtered or multi-relation input is not this shape)."""
+    def _group_subject(self, input_node) -> str:
+        """The catalog subject for an aggregate's input: a single unfiltered base
+        table's name, else the input's subplan signature."""
         if isinstance(input_node, Scan) and input_node.filters is None:
-            return input_node
-        return None
-
-    def _plain_group_columns(self, group_by):
-        """The group keys' column names when all are plain columns, else None."""
-        columns = []
-        for key in group_by:
-            if not isinstance(key, ColumnRef) or not key.table:
-                return None
-            columns.append(key.column)
-        return columns
+            return f"{input_node.datasource}.{input_node.schema_name}.{input_node.table_name}"
+        return subplan_signature(input_node)
 
     def _tracked_group_count(self, keys, input_node, input_rows) -> Tuple[int, List[str]]:
         """The product of the group keys' NDVs over the input subtree."""
