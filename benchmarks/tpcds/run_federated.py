@@ -310,6 +310,13 @@ def _evaluate_worker(
     )
 
 
+# The federated oracle's share of the child timeout: past it the oracle is
+# INTERRUPTED (duckdb Connection.interrupt is thread-safe) and the query keeps
+# its correctness verdict with no oracle timing - the summary already renders
+# a PASS with no timing.
+ORACLE_TIMEOUT_FRACTION = 0.5
+
+
 def _time_federated_oracle(db_path, options, oracle_sql):
     """Time DuckDB-over-Postgres for the baseline, or None if it cannot run.
 
@@ -319,7 +326,18 @@ def _time_federated_oracle(db_path, options, oracle_sql):
     """
     try:
         oracle = build_oracle(db_path, options)
-        oracle_ms, _ = _run_oracle(oracle, oracle_sql)
+        # The oracle gets its OWN time budget: a reference that neither errors
+        # nor finishes (duck's postgres scanner grinding through a mis-ordered
+        # spilling join - q85 adversarial) must yield "no timing", not burn the
+        # whole child timeout and misreport the ENGINE as an ERROR.
+        timer = threading.Timer(
+            options.timeout * ORACLE_TIMEOUT_FRACTION, oracle.interrupt
+        )
+        timer.start()
+        try:
+            oracle_ms, _ = _run_oracle(oracle, oracle_sql)
+        finally:
+            timer.cancel()
         return oracle_ms
     except Exception:
         return None
