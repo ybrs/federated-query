@@ -253,6 +253,19 @@ class DataSource(ABC):
         """
         pass
 
+    def estimate_scan_rows(self, schema: str, table: str, sql: str):
+        """The SOURCE PLANNER's row estimate for a rendered single-table scan
+        (its EXPLAIN output), or None when this source offers none.
+
+        Consulted when the engine's estimator cannot fully price a scan's
+        predicate (LIKE patterns, column-vs-column ranges): the source's own
+        planner prices it from ITS statistics - an informed estimate with real
+        provenance, where the engine would otherwise only have the
+        no-reduction bound. None is an honest abstention (the base class has
+        no planner to ask; a connector overrides), never an error path.
+        """
+        return None
+
     @abstractmethod
     def execute_query(self, query: str) -> Iterator[pa.RecordBatch]:
         """Execute a SQL query and return results as Arrow record batches.

@@ -1,5 +1,6 @@
 """DuckDB data source implementation."""
 
+import re
 from typing import List, Dict, Any, Iterator, Optional
 import pyarrow as pa
 import duckdb
@@ -14,6 +15,11 @@ from .base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The row-estimate line inside a DuckDB EXPLAIN physical-plan box, e.g.
+# "~1,200,243 rows" (singular "~1 row" for a one-row estimate). The FIRST
+# occurrence belongs to the plan's root operator - the query's output estimate.
+_EXPLAIN_ROWS = re.compile(r"~([0-9,]+) rows?", re.IGNORECASE)
 
 
 class DuckDBDataSource(DataSource):
@@ -170,6 +176,26 @@ class DuckDBDataSource(DataSource):
                 max_value=max_value,
             )
         return stats
+
+    def estimate_scan_rows(self, schema: str, table: str, sql: str):
+        """DuckDB's planner estimate for a rendered scan, parsed from EXPLAIN's
+        physical plan (its root operator's "~N rows" line) - never executes
+        the scan. DuckDB keeps statistics on every native table, so unlike
+        PostgreSQL there is no statless case to refuse."""
+        try:
+            rows = self.connection.execute(f"EXPLAIN {sql}").fetchall()
+        except duckdb.Error:
+            # A capability probe, not error hiding: a predicate shape this
+            # rendering cannot express for DuckDB (an engine-evaluated
+            # function like age()) fails EXPLAIN here while the query itself
+            # still executes via its normal path - the estimate is then
+            # honestly absent, never fabricated.
+            return None
+        for _kind, text in rows:
+            match = _EXPLAIN_ROWS.search(text)
+            if match:
+                return int(match.group(1).replace(",", ""))
+        return None
 
     def execute_query(self, query: str) -> Iterator[pa.RecordBatch]:
         """Execute query and yield Arrow record batches."""

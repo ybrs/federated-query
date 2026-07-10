@@ -9,10 +9,19 @@ A column the source has no statistics for is attempted once and never
 re-fetched - its absence is itself cached.
 """
 
+import os
 from typing import Dict, List, Optional, Set, Tuple
 
 from ..catalog.catalog import Catalog
-from ..datasources.base import ColumnStatistics, TableStatistics
+from ..datasources.base import ColumnStatistics, DataSource, TableStatistics
+from ..plan.physical import PhysicalScan
+
+
+def _ask_source_enabled() -> bool:
+    """Whether source-planner scan estimates are on. Shares the probe family's
+    kill switch (FEDQ_STATS_PROBE=0): both are 'measure at the source what the
+    engine cannot know'; anything else, including unset, is on."""
+    return os.environ.get("FEDQ_STATS_PROBE", "1") != "0"
 
 
 class _TableStatsEntry:
@@ -49,6 +58,10 @@ class StatisticsCollector:
         self.cache: Dict[Tuple[str, str, str], _TableStatsEntry] = {}
         self.stats_catalog = stats_catalog
         self.learned_ttl_seconds = learned_ttl_seconds
+        # Source-planner (EXPLAIN) row estimates for rendered filtered scans,
+        # keyed by (datasource, rendered SQL) - one round trip per distinct
+        # scan per session, however often the join enumerator re-estimates.
+        self.planner_estimates: Dict[Tuple[str, str], Optional[int]] = {}
 
     def get_table_statistics(
         self, datasource: str, schema: str, table: str, columns: List[str]
@@ -172,6 +185,50 @@ class StatisticsCollector:
             entry.attempted_columns.add(column)
         entry.column_stats.update(fetched.column_stats)
         return entry
+
+    def scan_planner_estimate(self, scan) -> Optional[int]:
+        """The SOURCE PLANNER's row estimate for a filtered logical scan, or
+        None (source offers none / kill switch off). Consulted by the cost
+        model when its own predicate pricing left gaps: the source prices the
+        predicate from ITS statistics - an informed estimate with provenance,
+        where the engine would otherwise only hold the no-reduction bound."""
+        if not _ask_source_enabled():
+            return None
+        source = self.catalog.get_datasource(scan.datasource)
+        if source is None:
+            raise ValueError(
+                f"StatisticsCollector: catalog knows no datasource {scan.datasource!r}"
+            )
+        if not isinstance(source, DataSource):
+            # Only a real connector carries a source planner to ask; a bare
+            # stats-serving stand-in (tests) honestly has no estimate.
+            return None
+        sql = self._render_probe_scan(scan, source)
+        key = (scan.datasource, sql)
+        if key not in self.planner_estimates:
+            self.planner_estimates[key] = source.estimate_scan_rows(
+                scan.schema_name, scan.table_name, sql
+            )
+        return self.planner_estimates[key]
+
+    def _render_probe_scan(self, scan, source) -> str:
+        """The scan rendered in the source dialect exactly as execution would
+        render it - same emitter, same transpile boundary - minus any grouping:
+        the estimate prices the FILTERED INPUT rows, which is what the group
+        clamp consumes."""
+        # create, not model_copy: a throwaway PHYSICAL scan built from a
+        # LOGICAL one purely to reuse the canonical SQL renderer; only the
+        # rendering-relevant fields exist on both, the rest keep defaults.
+        probe = PhysicalScan.create(
+            datasource=scan.datasource,
+            schema_name=scan.schema_name,
+            table_name=scan.table_name,
+            columns=list(scan.columns),
+            filters=scan.filters,
+            alias=scan.alias,
+            datasource_connection=source,
+        )
+        return probe._render_source_sql()
 
     def clear_cache(self) -> None:
         """Drop every cached statistic (a fresh session's view)."""
