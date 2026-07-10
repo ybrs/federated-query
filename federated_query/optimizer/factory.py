@@ -9,6 +9,7 @@ from ..catalog.catalog import Catalog
 from ..config.config import CostConfig, OptimizerConfig
 from .cost import CostModel
 from .cte_union_filter import CTEUnionFilterPushdownRule
+from .eager_aggregation import EagerAggregationRule
 from .join_ordering import JoinOrderingRule
 from .rules import (
     AggregatePushdownRule,
@@ -61,6 +62,11 @@ def build_optimizer(
     # relation it filters changes the region the reorderer then sees (a
     # reduced input instead of a top-level existential filter).
     optimizer.add_rule(SemiJoinPushdownRule())
+    # Before join ordering: the partial aggregate replaces the fact atom in
+    # the region the reorderer sees (and dim shipping later collapses the
+    # partial at the fact's source). Declines are free; the collapse gate
+    # prices the rewrite from the shared cost model.
+    optimizer.add_rule(EagerAggregationRule(cost_model))
     if optimizer_config.enable_join_reordering:
         optimizer.add_rule(
             JoinOrderingRule(cost_model, optimizer_config.max_join_reorder_size)

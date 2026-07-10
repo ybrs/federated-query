@@ -203,6 +203,43 @@ def _mul_groups(groups, ndv) -> Optional[int]:
     return groups * ndv
 
 
+def _owner_filter_value_cap(owner, column: str) -> Optional[int]:
+    """The value cap a SCAN owner's pushed filter puts on one column, or
+    None when the owner is not a filtered scan."""
+    if not isinstance(owner, Scan) or owner.filters is None:
+        return None
+    return _filter_value_cap(owner.filters, column)
+
+
+def _filter_value_cap(filters, column: str) -> Optional[int]:
+    """How many distinct values a filter allows one column, or None (no
+    exact bound). column = literal allows ONE; column IN (v1..vn) allows at
+    most n. Derived from the predicate itself - a logical fact, never a
+    statistic - so it carries no provenance gap."""
+    if filters is None:
+        return None
+    cap = None
+    for conjunct in split_conjuncts(filters):
+        cap = _min_rows(cap, _conjunct_value_cap(conjunct, column))
+    return cap
+
+
+def _conjunct_value_cap(conjunct, column: str) -> Optional[int]:
+    """One conjunct's exact value bound for a column, or None."""
+    if isinstance(conjunct, BinaryOp) and conjunct.op == BinaryOpType.EQ:
+        if isinstance(conjunct.left, ColumnRef) and conjunct.left.column == column:
+            if isinstance(conjunct.right, Literal):
+                return 1
+        if isinstance(conjunct.right, ColumnRef) and conjunct.right.column == column:
+            if isinstance(conjunct.left, Literal):
+                return 1
+        return None
+    if isinstance(conjunct, InList) and isinstance(conjunct.value, ColumnRef):
+        if conjunct.value.column == column:
+            return len(conjunct.options)
+    return None
+
+
 
 
 class CostModel:
@@ -540,14 +577,18 @@ class CostModel:
     def _scan_key_ndv(self, key, stats, rows, scan) -> Tuple[Optional[int], List[str]]:
         """One pushed group key's NDV from the scan's own statistics, or
         UNKNOWN with its gap recorded - never a fabricated fraction of the
-        row count."""
+        row count. The scan's own filter caps the NDV exactly (EQ -> one
+        value, IN -> the list's length)."""
         col_stats = None
         if isinstance(key, ColumnRef) and stats is not None:
             col_stats = stats.column_stats.get(key.column)
         if col_stats is None or col_stats.num_distinct is None:
             gap = f"group_ndv({self._scan_target(scan)}.{self._key_name(key)})"
             return None, [gap]
-        return max(1, _min_rows(col_stats.num_distinct, rows)), []
+        capped = _min_rows(
+            col_stats.num_distinct, _filter_value_cap(scan.filters, key.column)
+        )
+        return max(1, _min_rows(capped, rows)), []
 
     def _key_name(self, key: Expression) -> str:
         """A group key's display name for provenance entries."""
@@ -648,10 +689,14 @@ class CostModel:
 
     def _group_key_ndv(self, key, input_node, input_rows):
         """One group key's NDV, or UNKNOWN with its gap recorded - never a
-        fabricated fraction of the input rows."""
+        fabricated fraction of the input rows. The owner's own FILTER caps
+        the NDV exactly: after d_year IN (2001, 2002) the column holds at
+        most TWO values, however many the unfiltered table has - the cap that
+        keeps the NDV-independence product honest for filtered dims."""
         if isinstance(key, ColumnRef) and key.table is not None:
             owner = self._find_relation(input_node, key.table)
             ndv = self._owner_column_ndv(owner, key.column)
+            ndv = _min_rows(ndv, _owner_filter_value_cap(owner, key.column))
             if ndv is not None:
                 return max(1, _min_rows(ndv, input_rows)), []
         return None, [f"group_ndv({self._key_name(key)})"]
@@ -1022,7 +1067,11 @@ class CostModel:
         return None
 
     def _tracked_eq_base(self, binop, stats, target):
-        """The equality selectivity: 1/ndv, or UNKNOWN with the gap recorded."""
+        """The equality selectivity: 1/ndv, or UNKNOWN with the gap recorded.
+        A literal-vs-literal equality (q04's 's' = 's' union-arm tags) is
+        EXACTLY computable - no statistics involved, no gap."""
+        if isinstance(binop.left, Literal) and isinstance(binop.right, Literal):
+            return (1.0 if binop.left.value == binop.right.value else 0.0), []
         col_ref = self._extract_column_ref(binop)
         col_stats = self._column_stats_or_none(stats, col_ref)
         if col_stats is None or col_stats.num_distinct is None:
