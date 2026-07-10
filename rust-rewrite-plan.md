@@ -83,10 +83,34 @@ Effort: R1-R4 is a multi-month single-stream program (est. 35-45k lines of
 Rust plus targeted test ports; the 1329-test Python suite remains the
 reference oracle until each stage's differential gate holds).
 
-## Recommendation
+## Recommendation (resequenced 2026-07-10 after review)
 
 YES, strategically - the GIL argument alone decides it once multi-query
-lands - but sequenced: accelerator first (product velocity stays in Python
-where iteration is cheap), then R1 immediately after (it is self-contained,
-kills two boundaries, and the dialect risk is already retired by the spike).
-Re-evaluate polyglot vs direct emission at R1 with its own fidelity gate.
+lands. SEQUENCING: R1 FIRST, THEN the accelerator, then R2-R4.
+
+The original draft put the accelerator before R1; the review caught why
+that is wrong: the accelerator's machinery CONCENTRATES at exactly the
+layer R1 moves. Fragments are WRITTEN by the engine (Rust holds every
+materialized binding), READ as local scans (the engine already reads
+parquet), and USED at plan time by matching subplan signatures and
+REWRITING the physical plan to scan the fragment - physical-planning/IR
+logic. Built in Python first, that logic is built twice (R1 re-ports it
+immediately) and in between the language boundary grows a new bidirectional
+protocol (Python decides -> Rust writes -> Python re-evaluates -> Rust
+reads) that R1 then has to cut through.
+
+The refinement that keeps this from meaning "everything in Rust first": the
+accelerator never touches the parser, the decorrelator, or the logical
+optimizer rules (R2-R4) - porting those first buys it nothing. Fragment
+substitution sits at the physical/IR level; its plan-quality input
+(measured cardinalities per subplan signature) is already in the learned
+catalog, which Rust reads directly at that point (rusqlite - the
+adaptive-catalog plan's original Phase C note). Python keeps the logical
+half, where iteration is cheap and fragments never reach.
+
+Order of work: R1 (physical planner + single-source SQL emission + dim
+shipping + IR construction, ~8-9k of the densest lines; dialect risk
+retired by the spike; gated by the logical-plan-JSON differential + the
+tallies) -> accelerator, Rust-native at that layer -> R2-R4 as the
+optimizer/decorrelator stabilize. Re-evaluate polyglot vs direct emission
+at R1 entry with its own fidelity gate.
