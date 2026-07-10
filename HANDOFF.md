@@ -368,6 +368,18 @@ DONE:
   deferred: the optimizer manufactures/copies literals, so positional
   constant substitution is unsound.
 
+ROUND BOARD 2026-07-10 (feature/plan-cache-eager-agg, post battery):
+SF10 totals 53.3s vs duck 71.4s = 0.75x, geomean 1.11x; SF1 1.07x/1.07x;
+SF0.1 1.32x/1.36x; tpch 22/22 at 1.29x; 99|0|0 all scales + adversarial;
+cold convergence intact. MEASUREMENT NOTE: the harness warms each query, so
+timed runs now HIT the plan cache - the small-scale boards measure
+warm-plan latency (the exploration workload's reality); single-shot
+cold-plan latency still pays the ~11-26ms planning floor.
+SHIP-DOMINANCE GATE (cf1853c): eager fired on q21 whose dims are all
+shippable and broke its full collapse (80->214ms); the rule now requires a
+peeled dim OVER the ship budget - eager RESCUES what full shipping cannot
+collapse, never pre-empts it. q21 back to 60ms.
+
 EAGER AGGREGATION - LANDED 2026-07-10 (5716b64): q04 4184->1214ms (3.4x),
 q11 2264->754ms, q74 1418->512ms at SF10; partials SHIP. Cost gate prices
 against the LARGEST BASE SCAN (join estimates under-count, see plan doc);
