@@ -46,23 +46,22 @@ probes 850k partial rows, not 11M.
    aggregates, grouping sets, and window-bearing aggregates decline.
 2. Aggregate INPUT expressions reference ONLY cols(S) - an expression mixing
    fact and decorating-dim columns cannot pre-aggregate.
-3. Every decorating join D_i is INNER and equi, and its key is UNIQUE on the
-   D_i side, proven from DECLARED CONSTRAINTS ONLY (PRIMARY KEY / UNIQUE
-   from the source's information schema - truths the source ENFORCES).
-   NEVER from statistics: a wrong uniqueness call multiply-counts the merged
-   SUM, i.e. changes the ANSWER, and the standing invariant is that
-   statistics only ever steer speed. Even an exact-looking measured NDV is a
-   snapshot, not a guarantee (a row inserted after measurement breaks it);
-   pg's n_distinct is itself sampled. Without a declared constraint the rule
-   DECLINES. PREREQUISITES this creates:
-   - connectors fetch constraint metadata (pg information_schema
-     key_column_usage/table_constraints; duckdb_constraints()) into the
-     existing ColumnMetadata.primary_key (present, currently never
-     populated) plus a unique flag;
-   - the TPC-DS loader declares dimension PKs (the spec defines them; the
-     loaded databases currently declare NONE, so q04 would decline today) -
-     idempotent ALTER TABLE ADD PRIMARY KEY on the dims, in
-     load_postgres.py and as a one-time migration for existing databases.
+3. Every decorating join D_i is INNER and equi on PLAIN COLUMNS, with the
+   fact-side key column(s) added to the partial's group keys. NO uniqueness
+   requirement - and none is needed (Yan & Larson 1995): the join
+   multiplicity M is a function of the join key alone, every raw row inside
+   one partial shares that key, so the final re-aggregation counts each
+   partial M times exactly as the original counted each raw row M times.
+   Duplication COMMUTES with the final SUM/COUNT merge and never affects
+   MIN/MAX; INNER drops and NULL keys behave identically in both forms.
+   (This is also why SQL Server's GbAggBeforeJoin, Trino's
+   PushPartialAggregationThroughJoin and Spark's partial aggregation carry
+   no constraint requirement. Declared-uniqueness machinery - RELY-style
+   informational constraints in source configs - is a SEPARATE future
+   feature for join elimination, not a prerequisite here; the earlier
+   version of this gate required it out of an over-conservative reading,
+   and the connector constraint-fetch + benchmark PK prerequisites it
+   created are DROPPED from this plan's critical path.)
 4. INNER-join drop semantics are preserved by construction: a partial row
    whose key misses D_i drops exactly as its raw rows would have.
 5. Two customers sharing identical GROUP BY attribute tuples still merge
