@@ -407,12 +407,31 @@ not the dormant placeholder it once was. The pieces:
   source's CATALOG at optimize time, lazily per column (join keys and filter
   columns only) and session-cached, with a column's absence itself cached. A
   source that has no statistics returns None; nothing is ever fabricated.
-- `CostModel.estimate` (`optimizer/cost.py`, with named fallbacks in
+- `CostModel.estimate` (`optimizer/cost.py`, combination helpers in
   `estimate_defaults.py`) produces a `CardinalityEstimate` for every logical node
   type. Joins use `card(L) * card(R) / prod max(ndv(l_key), ndv(r_key))`, the
-  composite-key denominator capped at the smaller side's rows. Every missing
-  statistic falls back to a NAMED default recorded in `defaults_used` provenance,
-  which EXPLAIN surfaces as `stats=defaulted[...]`.
+  composite-key denominator capped at the smaller side's rows.
+- HONEST UNKNOWNS, never fabricated constants: a statistic feeding an estimate
+  is a MEASUREMENT with provenance or it is None. `CardinalityEstimate.rows`
+  is None (unknown - propagates to every derived estimate), a point estimate
+  (gap-free), or an UPPER BOUND by construction (a gap: an unknown selectivity
+  ceilings at 1.0, an unknown NDV floors the join denominator at 1, an unknown
+  group NDV clamps to input rows). Each gap is recorded in `defaults_used`
+  provenance, which EXPLAIN surfaces. Decision points define their unknown
+  policy: the join-order DP DECLINES a region containing an unknown atom
+  (keeps the written order), gates decline, orientation may USE bounds (a
+  side whose upper bound is under the other side's measured size is provably
+  smaller). CTERef atoms estimate their registered BODY (the rule registers
+  CTE bodies during descent, reset per plan walk); recursive CTEs stay
+  unknown.
+- Where the engine cannot price a PLAIN scan's predicate (LIKE patterns,
+  column-vs-column ranges), it fills the gap from measurements, in order:
+  the learned catalog's measured output for the same filter template
+  (section 10), then the SOURCE PLANNER's estimate for the rendered scan
+  (`DataSource.estimate_scan_rows` - pg `EXPLAIN (FORMAT JSON)`, ANALYZEd
+  tables only so pg's internal default priors never leak in; DuckDB EXPLAIN
+  text parse; capability-probe semantics, cached per rendered SQL per
+  session), else the no-reduction bound with the gap recorded.
 - `JoinOrderingRule` extracts join regions (`optimizer/join_graph.py`) - maximal
   INNER/CROSS-join-plus-filter subtrees, with outer / semi / anti / lateral joins
   as boundaries - and runs a left-deep Selinger DP per connected component
@@ -840,48 +859,108 @@ A crash never ships a lie.
 
 ---
 
-## 10. Learned statistics catalog (optional)
+## 10. Statistics: measure, learn, never fabricate
 
 The optimizer's cardinality decisions - reduction orientation, the dim-shipping
-gate, join order, build-side choice - rest on estimates from source statistics,
-with the NDV-independence and defaulting this engine has repeatedly been bitten
-by. A federated engine can instead MEASURE: it materializes every cross-source
-intermediate anyway, so the exact size and distinct-key counts are free at
-runtime. The learned catalog (`catalog/stats_catalog.py`, `StatsCatalog`)
-persists those measurements to a local SQLite file and serves them back to warm
-future planning - the system learns its workload. It is OPTIONAL: enabled only
-when `FEDQ_STATS_CATALOG` names a path, off by default with no behavior change.
-Design and phases: `adaptive-catalog-plan.md`.
+gate, join order, build-side choice - consume exactly three DATA properties:
+base row counts, column NDVs, and predicate selectivities. The governing
+principle across every layer: each one is a MEASUREMENT with provenance
+(source catalog, probe, learned) or it is honestly UNKNOWN - never a fabricated
+constant. A fabricated row count next to a measured one inverts every
+larger-side decision (the verified q39 cold-source regression); a real row
+count paired with a fabricated NDV skews exactly the ratios that pick join
+order (q23). Full history and decisions: `adaptive-catalog-plan.md`
+("COURSE CORRECTION" section).
 
-Correctness-neutral by construction. A learned value only changes WHICH plan the
-optimizer picks - never the answer - because every decision it feeds is itself
-correctness-neutral (the join / aggregate is always computed correctly). A stale
-or wrong value costs a slow query, never a wrong one, so the catalog can learn
-aggressively and invalidate lazily.
+Measurements arrive through four channels:
 
-WRITE path (execution time). `fedqrs.execute_ir` returns, alongside the Arrow
-result, a per-step `(binding, measured rows)` list - the engine reports one
-number per materialized step (`source_scan` / `injected_scan` /
-`collect_distinct`) and stays ignorant of catalog semantics. `build_ir_with_
-observations` (`executor/rust_ir.py`) records a `binding -> provenance` map that
-says what each number MEANS: an unfiltered base scan is a table's row count, a
-collect_distinct over a base column is that column's NDV, an unfiltered pushed
-single-table `GROUP BY` is a group count. `execute_via_rust` joins the two and
-persists them (`Executor.stats_catalog`) after the result table is built, off
-the critical path; writes batch into one commit per query (WAL + normal sync).
+1. SOURCE CATALOG (optimize time). reltuples / pg_stats on PostgreSQL,
+   duckdb_tables() + one approx aggregate scan on DuckDB - what ANALYZE
+   derived (section 4.6).
+2. PROBE (first touch of a statless table). A never-ANALYZEd pg table
+   (reltuples = -1) is MEASURED by the connector instead of reported unknown:
+   at or below `PROBE_EXACT_BYTES` (256MB - every SF10 TPC-DS dimension fits)
+   one exact aggregate scan returns the row count plus per-requested-column
+   NDV / null fraction / min / max; above it a `TABLESAMPLE SYSTEM` block
+   sample scales a row-count estimate only (a sampled NDV is biased low and
+   would fabricate). Reads the real file size, so it works with relpages = 0.
+   Session-cached by the collector; kill switch `FEDQ_STATS_PROBE=0`.
+3. ASK-THE-SOURCE (optimize time, plain filtered scans the engine cannot
+   price). The source planner's own EXPLAIN estimate, with the guards listed
+   in section 4.6. Shares the probe's kill switch.
+4. LEARNED CATALOG (execution time, persisted). `fedqrs.execute_ir` returns a
+   per-step `(binding, measured rows)` list; `build_ir_with_observations`
+   (`executor/rust_ir.py`) maps each binding to catalog provenance and
+   `execute_via_rust` persists after the result is built, off the critical
+   path, one commit per query (WAL, synchronous=OFF). ALWAYS ON: the catalog
+   opens next to the loaded config (`<config>.stats.sqlite`), or the
+   `FEDQ_STATS_CATALOG` env path. What each measured number MEANS:
+   - an unfiltered plain base scan: the table's ROW COUNT;
+   - a collect_distinct over an unfiltered base column: that column's NDV;
+   - a FILTERED unreduced plain scan: the predicate's measured OUTPUT, keyed
+     by its constant-neutral template (`scan_predicate_template`: sorted
+     conjunct shapes, alias-neutral, constants dropped) - query N's
+     measurement warms query N+1 whatever the literal values. An
+     injection-reduced scan is excluded: its output is below what the
+     predicate alone keeps, recording it would learn a lie;
+   - a coordinator `PhysicalHashAggregate` (via the engine's AggregateExec
+     metric harvest) or a SHIPPED ISLAND stamped with `group_observation`:
+     the aggregate's measured GROUP COUNT, keyed by the input's subplan
+     signature (`optimizer/subplan_signature.py` - alias- and
+     constant-neutral). The island stamp applies only under
+     row-count-preserving wrappers (Projection/Sort/SubqueryScan).
 
-READ path (optimize time). `StatisticsCollector._overlay_learned`
-(`optimizer/statistics.py`) FILLS a table's missing statistics from the catalog -
-a row count or column NDV the source does not provide (the warehouse case: pg
-has no stats, the catalog measured 10) - without OVERRIDING values the source
-already has (overriding destabilizes decisions tuned against source estimates).
-`CostModel._estimate_aggregate_tracked` (`optimizer/cost.py`) uses a MEASURED
-group count in place of its NDV-independence product when the aggregate is a
-plain `GROUP BY` over one unfiltered base table. Both consult the catalog first,
-then source stats, then named defaults; a TTL bounds staleness.
+READ paths, all fill-not-override (a present source statistic is never
+replaced; overriding destabilized decisions tuned against source estimates):
+`StatisticsCollector._overlay_learned` fills missing row counts / NDVs;
+`CostModel._scan_filter_rows` fills an unpriceable predicate from the learned
+template measurement BEFORE asking the source planner; `CostModel.
+_estimate_aggregate_tracked` uses a measured group count in place of the
+NDV-independence product; the dim-shipping explosion gate PREFERS a measured
+collapse (`SHIP_COLLAPSE_MAX_FRACTION` of estimated input rows) over its
+dimension-width heuristic - self-correcting in both directions, since a
+declined ship still measures its coordinator group count and a taken ship
+measures its island output. A TTL bounds staleness; every write self-heals on
+the next execution of the shape.
+
+Correctness-neutral by construction. A learned or probed value only changes
+WHICH plan the optimizer picks - never the answer - because every decision it
+feeds is itself correctness-neutral. A stale or wrong value costs a slow
+query, never a wrong one, so the system learns aggressively and invalidates
+lazily.
 
 The catalog is scoped one-per-configuration (keyed by the config's datasource
-names, with a `source_fingerprint` slot for repoint detection). It also holds
-`predicate_stats`, `subplan_stats`, and a `materialized_fragments` registry -
-schema that later phases (predicate-conditioned selectivities, subplan-signature
-cardinalities, and the query accelerator) populate.
+names, with a `source_fingerprint` slot for repoint detection). Tables:
+`table_stats`, `predicate_stats`, `group_stats`, `subplan_stats`, and a
+`materialized_fragments` registry reserved for the query accelerator.
+
+### 10.1 The cold-source test harness
+
+`benchmarks/tpcds/cold_sources.py` is the scoreboard for the statless-source
+regime, and its SUCCESS CRITERION is CONVERGENCE: a never-ANALYZEd source's
+time should approach the ANALYZED path's (the plan real statistics buy), not
+merely beat learning-off. It runs the stat-sensitive subset three ways -
+ANALYZED (real pg stats, the reference column), cold learning-OFF, cold
+learning-ON warmed - and reports W-OFF and W-ANLZ deltas plus row-count
+correctness across all three.
+
+Simulating "never ANALYZEd" honestly requires that pg stats stay absent for
+the WHOLE cold window, not just at its start:
+- going cold DELETEs the tables' `pg_statistic` rows and sets
+  `reltuples = -1, relpages = 0` - exactly a fresh load's state;
+- it also `ALTER TABLE .. SET (autovacuum_enabled = false)` per table:
+  autoanalyze triggers on WRITE counters (`n_mod_since_analyze`), which a
+  read-only benchmark never advances, but the experiment must not depend on
+  that;
+- before restoring anything, `_verify_still_cold` asserts every table still
+  has zero `pg_statistic` rows and `reltuples < 0`, and RAISES if statistics
+  crept back - a benchmark that silently measured the analyzed path would
+  report a lie;
+- restore re-enables autovacuum and ANALYZEs, leaving the database as found.
+
+The probe deliberately still works under this simulation (pg_relation_size
+and TABLESAMPLE read the actual file, not relpages), while ask-the-source
+deliberately refuses (pg's planner would only relay its own internal default
+selectivities - the fabricated priors this engine removed).
+`benchmarks/tpcds/diag_profile.py` applies the same guard for single-query
+mechanism probes (`DIAG_SCALE` selects the scale).
