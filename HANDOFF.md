@@ -347,6 +347,36 @@ q85 adversarial's oracle ground past the child timeout (pre-existing,
 NOT the parallel change; verified with the kill switch and pre-round
 python) and misreported the correct-in-263ms engine as ERROR.
 
+## PERF ROUND: EXPLORATION FLOOR + q04 FAMILY - IN PROGRESS 2026-07-10
+
+Branch feature/plan-cache-eager-agg (both repos, off feature/parallel-reads).
+Measured small-query floor at SF0.1 (the workload is exploratory): 27-61ms
+total, of which 11-26ms is python planning - the floor is the target.
+
+DONE:
+- q70 duplicate fact read (66894e0): extra injections no longer block
+  injected-scan CSE (excluded from identity, narrowed to the intersection on
+  a hit - the exactness contract already allows it). q70 652 -> 571ms, one
+  5.5M-row read instead of two. tests/test_injected_scan_cse.py.
+- PLAN CACHE (3be0ea0): cross-query LRU+TTL keyed by EXACT rewritten SQL
+  (executor/plan_cache.py, wired in _plan_pipeline). Hits skip
+  parse-through-physical: q96 42->17ms, q91 67->35ms. Stores PLANS never
+  data (hit re-executes; pinned by test); EXPLAIN never caches (its
+  execution mutates dynamic_filter_values); before-processors still run
+  every execution (star expansion's after-hook needs their per-query state).
+  FEDQ_PLAN_CACHE=0 / _TTL / _SIZE. Template-keyed caching deliberately
+  deferred: the optimizer manufactures/copies literals, so positional
+  constant substitution is unsound.
+
+NEXT - EAGER AGGREGATION (eager-agg-plan.md, committed): rewrite
+Aggregate-over-join into Final over Join(dims, Partial) so dim shipping
+collapses the PARTIAL at the fact's source (compose, don't extend
+dim_shipping). q04 reads 11M raw fact rows that become ~850k partials;
+q04/q11/q74 ~8s of the SF10 board. All gates resolved in the plan doc -
+decomposable aggs only, uniqueness of decorating-join keys PROVEN from
+exact statistics (approx NDV abstains), synthetic partial outputs qualified
+via __eager alias, collapse-or-decline cost gate on learned group counts.
+
 ## OPEN ISSUES
 
 None blocking correctness (99|0|0 everywhere). Dim shipping is DONE but has
