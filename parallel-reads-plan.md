@@ -128,7 +128,46 @@ A READY-SET SCHEDULER in `engine.rs::execute`, replacing the plain loop:
   binding lifecycle stays single-threaded.
 - C. Parallel Ship uploads + exact ship-visibility edges in the IR (each
   island scan lists the ship tables it reads), releasing the conservative
-  rule. Smallest win; do last.
+  rule. ASSESSED 2026-07-10, DEFERRED to the multi-server phase - quantified:
+  ship uploads cost 3.8-27.3ms in queries of 178-1582ms at SF10 (q17 24ms/5
+  ships, q25 27ms/5, q39 3.8ms/3, q66 5.9ms/8), so parallel uploads save at
+  most ~20ms per shipping query locally; the island read that DOMINATES
+  those queries (q39: 1551 of 1582ms) depends on ALL ships and can never
+  overlap them; and the conservative duck-scan exclusion costs nothing
+  because duck reads only overlap profitably when I/O-bound, which shipping
+  queries' remaining reads are not. The value appears only with real
+  network RTTs to the ship target (5 serialized COPYs at 10ms RTT = ~40ms
+  recoverable) - exactly what the planned multi-server rig measures. Do it
+  then, if the RTT term shows up.
+
+## Outlier sweep (SF10, full 99-query tally, par vs FEDQRS_PARALLEL_STEPS=0)
+
+One back-to-back full-tally diff after Phase B: the ONLY per-query delta
+beyond +-150ms in EITHER direction is q23 at -930ms (the win). Totals 64.3s
+parallel vs 66.0s sequential. The two 50-150ms positives the diff flagged
+(q67 +81, q51 +77) dissolved under repeated dedicated A/B (q67's sequential
+runs alone spanned 3821-4420ms). On a single box competing for one disk,
+parallel fetch is net -1.7s with no reproducible per-query backfire.
+
+## Multi-source parallelism (verified in code)
+
+The pool is SOURCE-AGNOSTIC by construction: a job carries (datasource name,
+work), workers resolve the connector per job through connectors::fetch, and
+per-worker connection caches are per-NAME maps - scans from any number of
+DISTINCT sources round-robin onto the same workers and overlap freely (the
+q23 win IS cross-source: a duck whole-fact read overlapping pg reads and a
+duck injected scan). Two caveats:
+- The Rust engine supports exactly THREE source kinds today (DsKind:
+  Postgres, DuckDb, Parquet). ClickHouse exists only as a python connector -
+  register_datasources RAISES UnsupportedIR for it, so a clickhouse source
+  cannot run through the engine at all yet; mysql does not exist anywhere.
+  When a new kind gets its connectors::fetch arm, the parallel path inherits
+  it with zero extra work.
+- Per-KIND concurrency policy is the knob to revisit as sources multiply:
+  an in-process/embedded kind wants the duck-style injection exclusion
+  (already saturates local cores), a networked kind wants full overlap;
+  there is no per-source in-flight cap yet (6 workers could all hit one
+  source - fine for pg today, worth a cap when sources are many or small).
 
 ## Non-goals
 
