@@ -58,7 +58,9 @@ def _rule(extra_sources=None):
         ("main", "fact"): _stats(1_000_000, {"f_cust": 50_000, "f_date": 400}),
     })
     catalog.datasources["pg"] = _StatsSource({
-        ("public", "cust"): _stats(50_000, {"c_sk": 50_000, "c_name": 40_000}),
+        # cust exceeds SHIP_ROW_BUDGET: eager only fires where FULL
+        # dim-shipping collapse cannot (an unshippable decorating dim).
+        ("public", "cust"): _stats(500_000, {"c_sk": 500_000, "c_name": 400_000}),
         ("public", "dates"): _stats(400, {"d_sk": 400, "d_year": 3}),
     })
     collector = StatisticsCollector(catalog)
