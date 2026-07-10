@@ -129,15 +129,20 @@ def _query_sources(sql, placement):
 
 
 def _median_ms(thunk):
-    """Median wall time in ms over 3 runs after a warm-up, plus the last result."""
+    """(cold ms, warm median ms, last result): the FIRST run on the fresh
+    runtime is COLD (stats fetches, planning, connections) and times
+    separately; the warm median covers 3 subsequent runs (plan-cache hits).
+    Reporting both keeps cold-path regressions visible."""
+    start = time.time()
     thunk()
+    cold_ms = (time.time() - start) * 1000
     times = []
     for _ in range(3):
         start = time.time()
         result = thunk()
         times.append((time.time() - start) * 1000)
     times.sort()
-    return times[1], result
+    return cold_ms, times[1], result
 
 
 def evaluate_query(runtime, oracle, path, placement, decimals):
@@ -147,22 +152,28 @@ def evaluate_query(runtime, oracle, path, placement, decimals):
     cross = "cross" if len(_query_sources(raw, placement)) > 1 else "single"
     engine_sql = _qualify(raw, placement, FEDQ_SOURCES, ENGINE_DIALECT)
     try:
-        ours_ms, engine_rows = _median_ms(lambda: arrow_to_rows(runtime.execute(engine_sql)))
+        ours_cold_ms, ours_ms, engine_rows = _median_ms(
+            lambda: arrow_to_rows(runtime.execute(engine_sql))
+        )
     except Exception as error:
         return _result(name, "ERROR", _error_text(error), cross, None, None, 0.0, 0.0)
     oracle_sql = _qualify(raw, placement, ORACLE_SOURCES, "duckdb")
-    duck_ms, oracle_rows = _median_ms(lambda: oracle.execute(oracle_sql).fetchall())
+    _duck_cold, duck_ms, oracle_rows = _median_ms(
+        lambda: oracle.execute(oracle_sql).fetchall()
+    )
     match, reason = compare_results(engine_rows, oracle_rows, decimals)
     status = "PASS" if match else "MISMATCH"
     return _result(name, status, reason, cross, len(engine_rows), len(oracle_rows),
-                   ours_ms, duck_ms)
+                   ours_ms, duck_ms, ours_cold_ms)
 
 
-def _result(name, status, reason, cross, engine_rows, oracle_rows, ours_ms, duck_ms):
-    """Assemble one query's outcome record."""
+def _result(name, status, reason, cross, engine_rows, oracle_rows, ours_ms, duck_ms,
+            ours_cold_ms=None):
+    """Assemble one query's outcome record. ours_ms is the WARM median;
+    ours_cold_ms the fresh runtime's first execution."""
     return {"name": name, "status": status, "reason": reason, "span": cross,
             "engine_rows": engine_rows, "oracle_rows": oracle_rows,
-            "ours_ms": ours_ms, "duck_ms": duck_ms}
+            "ours_ms": ours_ms, "duck_ms": duck_ms, "ours_cold_ms": ours_cold_ms}
 
 
 def _error_text(error):

@@ -243,16 +243,22 @@ def _start_memory_watchdog(memory_limit_mb):
 
 
 def _run_engine(runtime, engine_sql):
-    """Warm the engine, then time one execution; return (elapsed_ms, rows).
+    """Time the COLD and the WARM execution; return (cold_ms, warm_ms, rows).
 
-    Each query runs in a fresh child, so the FIRST execution pays cold Rust
-    connection-pool and plan setup. A discarded warm-up run makes the timed run
-    steady-state - a fair comparison against the equally-warmed oracle."""
+    Each query runs in a fresh child, so the FIRST execution is genuinely
+    COLD: source connections, statistics fetches (and the statless-table
+    probe), the full planning pipeline, and the Rust engine's setup all pay
+    here. The SECOND execution is WARM: connections pooled, stats
+    session-cached, the plan cache HIT. Reporting BOTH keeps cold-path
+    regressions visible - a feature that only helps warm runs must not
+    silently tax first-sight queries."""
+    start = time.perf_counter()
     runtime.execute(engine_sql)
+    cold_ms = (time.perf_counter() - start) * 1000.0
     start = time.perf_counter()
     result = runtime.execute(engine_sql)
-    elapsed_ms = (time.perf_counter() - start) * 1000.0
-    return elapsed_ms, arrow_to_rows(result)
+    warm_ms = (time.perf_counter() - start) * 1000.0
+    return cold_ms, warm_ms, arrow_to_rows(result)
 
 
 def _run_oracle(oracle, oracle_sql):
@@ -282,7 +288,7 @@ def _evaluate_worker(
     _start_memory_watchdog(options.memory_limit)
     try:
         runtime = build_fedq(db_path, options)
-        engine_ms, engine_rows = _run_engine(runtime, engine_sql)
+        engine_cold_ms, engine_ms, engine_rows = _run_engine(runtime, engine_sql)
     except Exception as error:
         result_queue.put(("error", _error_text(error)))
         return
@@ -305,6 +311,7 @@ def _evaluate_worker(
                 len(truth_rows),
                 engine_ms,
                 oracle_ms,
+                engine_cold_ms,
             ),
         )
     )
@@ -448,9 +455,11 @@ def evaluate_query(path, placement, db_path, options):
     outcome, error = _run_isolated(engine_sql, oracle_sql, raw, db_path, options)
     if error is not None:
         return _result(name, "ERROR", error, cross, None, None)
-    status, reason, engine_rows, oracle_rows, engine_ms, oracle_ms = outcome
+    (status, reason, engine_rows, oracle_rows,
+     engine_ms, oracle_ms, engine_cold_ms) = outcome
     return _result(
-        name, status, reason, cross, engine_rows, oracle_rows, engine_ms, oracle_ms
+        name, status, reason, cross, engine_rows, oracle_rows,
+        engine_ms, oracle_ms, engine_cold_ms,
     )
 
 
@@ -463,8 +472,12 @@ def _result(
     oracle_rows,
     engine_ms=None,
     oracle_ms=None,
+    engine_cold_ms=None,
 ):
-    """Assemble one query's outcome record (timings are None for ERROR rows)."""
+    """Assemble one query's outcome record (timings are None for ERROR rows).
+    engine_ms is the WARM run (plan cache hit, pooled connections, cached
+    stats); engine_cold_ms is the fresh child's FIRST execution - the
+    cold-path number a warm-only report would let regress silently."""
     return {
         "name": name,
         "status": status,
@@ -474,6 +487,7 @@ def _result(
         "oracle_rows": oracle_rows,
         "engine_ms": engine_ms,
         "oracle_ms": oracle_ms,
+        "engine_cold_ms": engine_cold_ms,
     }
 
 
@@ -570,18 +584,37 @@ def _timing_table_lines(placement_name, results):
         ours_total += engine_ms
         duck_total += duck_ms
         ratios.append(ratio)
+    cold_total = _cold_total(results)
+    cold_cell = "-" if cold_total is None else "{0:.1f}".format(cold_total)
     return [
         "",
         "### Timing summary (PASS only): engine vs "
         "DuckDB-over-Postgres [{0}]".format(placement_name),
         "",
-        "| Ours (ms) | DuckDB (ms) | Ratio | Geomean | Measured |",
-        "| --- | --- | --- | --- | --- |",
-        "| {0:.1f} | {1:.1f} | {2:.2f}x | {3:.2f}x | {4} |".format(
-            ours_total, duck_total, ours_total / duck_total, _geomean(ratios), len(rows)
+        "| Warm (ms) | Cold (ms) | DuckDB (ms) | Ratio | Geomean | Measured |",
+        "| --- | --- | --- | --- | --- | --- |",
+        "| {0:.1f} | {1} | {2:.1f} | {3:.2f}x | {4:.2f}x | {5} |".format(
+            ours_total, cold_cell, duck_total, ours_total / duck_total,
+            _geomean(ratios), len(rows)
         ),
         "",
     ]
+
+
+def _cold_total(results):
+    """The summed COLD engine time over PASS queries, or None when no result
+    carries one (older records). Reported next to the warm total so a change
+    helping only warm runs cannot silently tax first-sight queries."""
+    total = 0.0
+    seen = False
+    for result in results:
+        if result["status"] != "PASS":
+            continue
+        cold_ms = result.get("engine_cold_ms")
+        if cold_ms is not None:
+            total += cold_ms
+            seen = True
+    return total if seen else None
 
 
 def _print_timing_summary(placement_name, results):
@@ -970,11 +1003,15 @@ def run_save_references(options, placement_name):
 
 
 def _engine_worker(engine_sql, db_path, options, csv_path, result_queue):
-    """Child: run the engine (warm + timed) and save the result to CSV."""
+    """Child: time the COLD then the WARM execution, saving the result CSV.
+    Cold = the fresh child's first run (connections, stats fetches, probe,
+    full planning); warm = the second (plan-cache hit, cached stats)."""
     _start_memory_watchdog(options.memory_limit)
     try:
         runtime = build_fedq(db_path, options)
+        started = time.perf_counter()
         runtime.execute(engine_sql)
+        cold_ms = (time.perf_counter() - started) * 1000.0
         started = time.perf_counter()
         result = runtime.execute(engine_sql)
         engine_ms = (time.perf_counter() - started) * 1000.0
@@ -982,7 +1019,7 @@ def _engine_worker(engine_sql, db_path, options, csv_path, result_queue):
     except Exception as error:
         result_queue.put(("error", _error_text(error)))
         return
-    result_queue.put(("done", (engine_ms, result.num_rows)))
+    result_queue.put(("done", (engine_ms, result.num_rows, cold_ms)))
 
 
 def _write_engine_csv(table, csv_path):
@@ -1019,11 +1056,12 @@ def run_engine_only(options, placement_name):
         outcome, error = _await_result(process, result_queue, options.timeout)
         if error is not None:
             print("{0:5} ERROR {1}".format(name, error[:90]), flush=True)
-            timings.append((name, None))
+            timings.append((name, None, None))
             continue
-        engine_ms, rows = outcome
-        timings.append((name, engine_ms))
-        print("{0:5} {1:8.0f}ms  rows={2}".format(name, engine_ms, rows), flush=True)
+        engine_ms, rows, cold_ms = outcome
+        timings.append((name, engine_ms, cold_ms))
+        print("{0:5} warm={1:7.0f}ms cold={2:7.0f}ms  rows={3}".format(
+            name, engine_ms, cold_ms, rows), flush=True)
     _write_engine_timings(out_dir, timings)
     print("engine results written: {0}".format(out_dir))
 
@@ -1037,15 +1075,19 @@ def _write_engine_timings(out_dir, timings):
     import csv as csv_module
 
     path = os.path.join(out_dir, "engine_timings.csv")
-    merged = _load_engine_timings(out_dir) if os.path.exists(path) else {}
-    for name, engine_ms in timings:
-        merged[name] = engine_ms
+    merged = _load_all_engine_timings(out_dir) if os.path.exists(path) else {}
+    for name, engine_ms, cold_ms in timings:
+        merged[name] = (engine_ms, cold_ms)
     with open(path, "w", newline="") as handle:
         writer = csv_module.writer(handle)
-        writer.writerow(["query", "engine_ms"])
+        writer.writerow(["query", "engine_ms", "engine_cold_ms"])
         for name in sorted(merged):
-            engine_ms = merged[name]
-            writer.writerow([name, "" if engine_ms is None else engine_ms])
+            engine_ms, cold_ms = merged[name]
+            writer.writerow([
+                name,
+                "" if engine_ms is None else engine_ms,
+                "" if cold_ms is None else cold_ms,
+            ])
 
 
 def _typed_cell(value, dtype):
@@ -1081,7 +1123,7 @@ def run_compare(options, placement_name):
     placement = PLACEMENTS[placement_name]
     refs = duckdb.connect(_refs_path(options), read_only=True)
     out_dir = _engine_dir(options)
-    engine_ms_by_name = _load_engine_timings(out_dir)
+    engine_ms_by_name = _load_all_engine_timings(out_dir)
     results = []
     compare_started = time.perf_counter()
     for name, _, _, _ in _staged_queries(options, placement):
@@ -1097,7 +1139,7 @@ def run_compare(options, placement_name):
 def _compare_one(refs, out_dir, name, engine_ms_by_name, options):
     """Compare one query's engine CSV against its cached truth table."""
     csv_path = os.path.join(out_dir, name + ".csv")
-    engine_ms = engine_ms_by_name.get(name)
+    engine_ms, engine_cold_ms = engine_ms_by_name.get(name, (None, None))
     if engine_ms is None or not os.path.exists(csv_path):
         return _result(name, "ERROR", "no engine result saved", "cross", None, None)
     described = refs.execute('DESCRIBE "{0}"'.format(name)).fetchall()
@@ -1120,6 +1162,7 @@ def _compare_one(refs, out_dir, name, engine_ms_by_name, options):
         len(truth_rows),
         engine_ms,
         oracle_ms,
+        engine_cold_ms,
     )
 
 
@@ -1132,7 +1175,16 @@ def _oracle_ms(refs, name):
 
 
 def _load_engine_timings(out_dir):
-    """query -> engine_ms from the engine step's timing file."""
+    """query -> WARM engine_ms from the engine step's timing file."""
+    warm = {}
+    for name, (engine_ms, _cold_ms) in _load_all_engine_timings(out_dir).items():
+        warm[name] = engine_ms
+    return warm
+
+
+def _load_all_engine_timings(out_dir):
+    """query -> (warm engine_ms, cold engine_ms) from the timing file. A file
+    from before the cold column reads back with cold = None."""
     import csv as csv_module
 
     timings = {}
@@ -1140,8 +1192,11 @@ def _load_engine_timings(out_dir):
     with open(path, newline="") as handle:
         reader = csv_module.reader(handle)
         next(reader)
-        for name, engine_ms in reader:
-            timings[name] = float(engine_ms) if engine_ms else None
+        for row in reader:
+            name = row[0]
+            engine_ms = float(row[1]) if row[1] else None
+            cold_ms = float(row[2]) if len(row) > 2 and row[2] else None
+            timings[name] = (engine_ms, cold_ms)
     return timings
 
 

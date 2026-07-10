@@ -87,6 +87,7 @@ def _fed_to_record(outcome):
     correct = outcome["status"] == "PASS"
     status = "OK" if correct else outcome["status"]
     return {"name": outcome["name"], "ours_ms": outcome["ours_ms"],
+            "ours_cold_ms": outcome.get("ours_cold_ms"),
             "duck_ms": outcome["duck_ms"], "correct": correct,
             "ours_rows": outcome["engine_rows"], "duck_rows": outcome["oracle_rows"],
             "status": status, "reason": "" if correct else outcome["reason"]}
@@ -232,24 +233,31 @@ def _correct_cell(record):
 
 
 def _cell_totals(records):
-    """Sum ours/duck ms over measured queries; count correct and measured."""
-    ours = duck = 0.0
-    correct = measured = 0
+    """Sum ours (warm + cold) / duck ms over measured queries; count correct
+    and measured. Cold is None when no record carries it (parquet cells or
+    older records)."""
+    ours = duck = cold = 0.0
+    correct = measured = cold_seen = 0
     for record in records:
         correct += 1 if record["correct"] else 0
         if record["ours_ms"] is not None and record["duck_ms"] is not None:
             ours += record["ours_ms"]
             duck += record["duck_ms"]
             measured += 1
-    return ours, duck, correct, measured
+            cold_ms = record.get("ours_cold_ms")
+            if cold_ms is not None:
+                cold += cold_ms
+                cold_seen += 1
+    return ours, duck, correct, measured, (cold if cold_seen else None)
 
 
 def _summary_row(cell, scale, records):
     """One row of the top-level summary matrix for a (cell, scale)."""
-    ours, duck, correct, measured = _cell_totals(records)
+    ours, duck, correct, measured, cold = _cell_totals(records)
     ratio = ours / duck if duck else math.nan
-    return "| {0} | {1} | {2}/22 | {3:.1f} | {4:.1f} | {5:.2f}x | {6} |".format(
-        cell, scale, correct, ours, duck, ratio, measured)
+    cold_cell = "-" if cold is None else "{0:.1f}".format(cold)
+    return "| {0} | {1} | {2}/22 | {3:.1f} | {4} | {5:.1f} | {6:.2f}x | {7} |".format(
+        cell, scale, correct, ours, cold_cell, duck, ratio, measured)
 
 
 def _summary_section(results, scales):
@@ -259,8 +267,9 @@ def _summary_section(results, scales):
              "KILLED / ERROR queries are excluded from the ms totals but counted "
              "as not-correct. `measured` is how many of the 22 timed cleanly.",
              "",
-             "| Cell | SF | Correct | Ours (ms) | DuckDB (ms) | Ratio | Measured |",
-             "| --- | --- | --- | --- | --- | --- | --- |"]
+             "| Cell | SF | Correct | Warm (ms) | Cold (ms) | DuckDB (ms) "
+             "| Ratio | Measured |",
+             "| --- | --- | --- | --- | --- | --- | --- | --- |"]
     for cell in results:
         for scale in scales:
             if scale in results[cell]:
