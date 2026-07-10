@@ -48,7 +48,11 @@ from ..optimizer.estimate_defaults import (
     combine_defaults,
     max_known_ndv,
 )
-from .subplan_signature import subplan_signature, group_column_names
+from .subplan_signature import (
+    group_column_names,
+    scan_predicate_template,
+    subplan_signature,
+)
 from ..optimizer.pushdown import bare_names
 from ..optimizer.statistics import StatisticsCollector
 from ..datasources.base import TableStatistics
@@ -436,11 +440,33 @@ class CostModel:
         )
         if not gaps:
             return self._filtered_rows(rows, selectivity), []
+        learned = self._learned_predicate_rows(scan)
+        if learned is not None:
+            # A MEASURED output for this filter's template (a previous run of
+            # the same filter SHAPE) beats any estimate of it; base-clamped.
+            return max(1, min(learned, rows)), []
         planner_rows = self._source_scan_estimate(scan)
         if planner_rows is not None:
             # A filtered scan cannot outgrow its base table; clamp defensively.
             return max(1, min(planner_rows, rows)), []
         return self._filtered_rows(rows, selectivity), gaps
+
+    def _learned_predicate_rows(self, scan) -> Optional[int]:
+        """The catalog's MEASURED output rows for this scan's filter template
+        (recorded by a previous execution of the same filter shape), or None.
+        Consulted only when the engine's own pricing left gaps - fill, never
+        override - and BEFORE the source planner's estimate: a measurement of
+        this very predicate beats the source's guess about it."""
+        catalog = getattr(self.stats_collector, "stats_catalog", None)
+        if catalog is None:
+            return None
+        template = scan_predicate_template(scan)
+        if template is None:
+            return None
+        ttl = self.stats_collector.learned_ttl_seconds
+        return catalog.predicate_output_rows(
+            scan.datasource, scan.schema_name, scan.table_name, template, "", ttl
+        )
 
     def _source_scan_estimate(self, scan) -> Optional[int]:
         """The source planner's row estimate for this filtered scan via the

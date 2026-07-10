@@ -40,6 +40,22 @@ def subplan_signature(node: LogicalPlanNode) -> str:
     return hashlib.sha1(canonical.encode("utf-8")).hexdigest()
 
 
+def scan_predicate_template(scan: Scan) -> Optional[str]:
+    """The constant-neutral TEMPLATE of a scan's pushed filter: its conjunct
+    shapes (operator + alias-neutral base columns, constants dropped), sorted
+    and joined. The predicate_stats key: query N's measured filter output
+    warms query N+1's estimate for the same filter shape, whatever the
+    literal values. None when the scan carries no filter."""
+    if scan.filters is None:
+        return None
+    alias_map = {scan_qualifier(scan): _table_name(scan)}
+    shapes = []
+    for conjunct in split_conjuncts(scan.filters):
+        shapes.append(_conjunct_shape(conjunct, alias_map))
+    shapes.sort()
+    return "&".join(shapes)
+
+
 def group_column_names(group_by) -> Optional[List[str]]:
     """The group-by column names when every key is a plain qualified column,
     else None (an expression key has no stable name to key group_stats on).

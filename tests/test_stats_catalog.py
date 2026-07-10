@@ -225,6 +225,94 @@ def test_persist_unknown_target_raises(catalog_path):
     catalog.close()
 
 
+def test_predicate_output_rows_roundtrip(catalog_path):
+    """A recorded predicate reads back its MEASURED output rows directly (the
+    self-healing measurement), independent of the selectivity ratio."""
+    catalog = _catalog(catalog_path)
+    catalog.record_predicate(
+        "pg", "public", "part", "LIKE(pg.public.part.p_name)",
+        input_rows=None, output_rows=10664,
+    )
+    rows = catalog.predicate_output_rows(
+        "pg", "public", "part", "LIKE(pg.public.part.p_name)"
+    )
+    assert rows == 10664
+    # The selectivity ratio is honestly absent when the base was unknown.
+    assert catalog.predicate_selectivity(
+        "pg", "public", "part", "LIKE(pg.public.part.p_name)"
+    ) is None
+    catalog.close()
+
+
+def test_persist_predicate_observation(catalog_path):
+    """A 'predicate' observation records the template's measured output, with
+    the input rows joined from the catalog's own base count so the stored
+    selectivity is measurement-over-measurement."""
+    from federated_query.executor.rust_ir import _persist_observations
+
+    catalog = _catalog(catalog_path)
+    catalog.record_table_rows("pg", "public", "part", 200000)
+    provenance = {
+        "b1": {"target": "predicate", "datasource": "pg", "schema": "public",
+               "table": "part", "template": "LIKE(pg.public.part.p_name)"},
+    }
+    _persist_observations(catalog, provenance, [("b1", 10664)])
+    assert catalog.predicate_output_rows(
+        "pg", "public", "part", "LIKE(pg.public.part.p_name)"
+    ) == 10664
+    assert catalog.predicate_selectivity(
+        "pg", "public", "part", "LIKE(pg.public.part.p_name)"
+    ) == pytest.approx(10664 / 200000)
+    catalog.close()
+
+
+def test_cost_model_uses_learned_predicate_rows(catalog_path):
+    """A scan whose filter the estimator cannot price (LIKE) estimates from
+    the catalog's MEASURED output for the same filter template - recorded by a
+    previous run - instead of standing on its no-reduction bound."""
+    from federated_query.optimizer.cost import CostModel
+    from federated_query.optimizer.statistics import StatisticsCollector
+    from federated_query.optimizer.subplan_signature import (
+        scan_predicate_template,
+    )
+    from federated_query.config.config import CostConfig
+    from federated_query.plan.logical import Scan
+    from federated_query.plan.expressions import (
+        BinaryOp, BinaryOpType, ColumnRef, DataType, Literal,
+    )
+    from federated_query.datasources.base import TableStatistics
+
+    predicate = BinaryOp(
+        op=BinaryOpType.LIKE,
+        left=ColumnRef(table="part", column="p_name", data_type=DataType.VARCHAR),
+        right=Literal(value="%green%", data_type=DataType.VARCHAR),
+    )
+    scan = Scan(
+        datasource="pg", schema_name="public", table_name="part",
+        columns=["p_name"], filters=predicate,
+    )
+    catalog = _catalog(catalog_path)
+    catalog.record_predicate(
+        "pg", "public", "part", scan_predicate_template(scan),
+        input_rows=200000, output_rows=10664,
+    )
+    source_stats = TableStatistics.create(
+        row_count=200000, total_size_bytes=0, column_stats={}
+    )
+    collector = StatisticsCollector(
+        _FakeCatalog(_FakeSource(source_stats)), stats_catalog=catalog
+    )
+    cost = CostModel(
+        CostConfig(cpu_tuple_cost=0.01, io_page_cost=1.0,
+                   network_byte_cost=0.0001, network_rtt_ms=10.0),
+        collector,
+    )
+    estimate = cost.estimate(scan)
+    assert estimate.rows == 10664
+    assert estimate.defaults_used == []
+    catalog.close()
+
+
 class _FakeSource:
     """A datasource returning canned TableStatistics regardless of columns."""
 

@@ -292,6 +292,21 @@ class StatsCatalog:
         ).fetchone()
         return self._fresh_value(row, max_age_seconds)
 
+    def predicate_output_rows(
+        self, datasource: str, schema: str, table: str, template: str,
+        param_bucket: str = "", max_age_seconds=None,
+    ) -> Optional[int]:
+        """The learned MEASURED output row count of a filter template, or None
+        (absent/stale). The direct measurement - self-healing on every run of
+        the shape - read in preference to the stored selectivity ratio."""
+        row = self._conn.execute(
+            "SELECT measured_output_rows, observed_at FROM predicate_stats WHERE "
+            "datasource=? AND schema_name=? AND table_name=? AND "
+            "predicate_template=? AND param_bucket=?",
+            (datasource, schema, table, template, param_bucket),
+        ).fetchone()
+        return self._fresh_value(row, max_age_seconds)
+
     def _fresh_value(self, row, max_age_seconds):
         """The stored value from a (value, observed_at) row, or None when the row
         is absent, its value is NULL, or it is older than the TTL."""

@@ -38,6 +38,7 @@ from ..plan.expressions import (
 from ..plan.logical import JoinType, SetOpKind
 from ..optimizer.decorrelation import _replace_column_refs
 from ..optimizer.estimate_defaults import larger_estimated_side, orientation_rows
+from ..optimizer.subplan_signature import scan_predicate_template
 from ..plan.physical import (
     PhysicalAliasedRelation,
     PhysicalCTEMergeQuery,
@@ -488,9 +489,17 @@ def _record_scan_observation(ctx, node, binding):
     """Record what a base scan's measured output rows mean for the catalog. An
     unfiltered plain GROUP BY on one table: the rows are the GROUP COUNT (the
     collapse signal). An unfiltered, un-grouped scan: the table's BASE row
-    count. Filtered scans are predicate-conditioned (their counts belong to
-    predicate_stats, later)."""
-    if not isinstance(node, PhysicalScan) or node.filters is not None:
+    count. A FILTERED plain scan: the predicate's measured OUTPUT, keyed by
+    its constant-neutral template (the selectivity leg of learning). A shipped
+    ISLAND stamped with group provenance: its materialized row count IS the
+    pre-ship aggregate's group count."""
+    if isinstance(node, PhysicalRemoteQuery):
+        _record_island_group(ctx, node, binding)
+        return
+    if not isinstance(node, PhysicalScan):
+        return
+    if node.filters is not None:
+        _record_predicate_observation(ctx, node, binding)
         return
     if node.group_by and not node.grouping_sets:
         _record_group_observation(ctx, node, binding)
@@ -502,6 +511,43 @@ def _record_scan_observation(ctx, node, binding):
         "datasource": node.datasource,
         "schema": node.schema_name,
         "table": node.table_name,
+    }
+
+
+def _record_island_group(ctx, node, binding):
+    """A shipped island's group provenance (stamped by dim shipping from the
+    PRE-SHIP aggregate) records the island's materialized rows as the measured
+    group count - covering the aggregates that SHIP and therefore never pass
+    through a coordinator PhysicalHashAggregate."""
+    observation = node.group_observation
+    if observation is None:
+        return
+    ctx.observations[binding] = {
+        "target": "group",
+        "subject": observation["subject"],
+        "columns": observation["columns"],
+    }
+
+
+def _record_predicate_observation(ctx, node, binding):
+    """A filtered plain scan's measured output rows, keyed by the filter's
+    constant-neutral template. Excluded: a grouped/aggregated scan (its output
+    is a group count, not the predicate's) and a REDUCED scan (an injected IN
+    list shrinks the output below what the predicate alone keeps - recording
+    it would learn a lie)."""
+    if node.group_by or node.aggregates or node.grouping_sets:
+        return
+    if node.dynamic_filter_keys or id(node) in ctx.injected:
+        return
+    template = scan_predicate_template(node)
+    if template is None:
+        return
+    ctx.observations[binding] = {
+        "target": "predicate",
+        "datasource": node.datasource,
+        "schema": node.schema_name,
+        "table": node.table_name,
+        "template": template,
     }
 
 
@@ -2476,4 +2522,21 @@ def _persist_one(stats_catalog, prov, rows):
     if target == "group":
         stats_catalog.record_group(prov["subject"], prov["columns"], rows)
         return
+    if target == "predicate":
+        _persist_predicate(stats_catalog, prov, rows)
+        return
     raise ValueError(f"unknown observation target {target!r}")
+
+
+def _persist_predicate(stats_catalog, prov, rows):
+    """Record a filter template's measured output, with the input rows taken
+    from the catalog's freshest base count (learned or probed earlier) so the
+    stored selectivity ratio is measurement-over-measurement; an unknown base
+    stores the output alone (selectivity None, output still usable)."""
+    input_rows = stats_catalog.table_rows(
+        prov["datasource"], prov["schema"], prov["table"]
+    )
+    stats_catalog.record_predicate(
+        prov["datasource"], prov["schema"], prov["table"], prov["template"],
+        input_rows, rows,
+    )
