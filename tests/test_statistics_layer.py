@@ -155,10 +155,81 @@ def test_pg_row_count_is_schema_qualified(pg_source):
     assert stats_b.row_count == 1
 
 
-def test_pg_never_analyzed_row_count_is_none(pg_source):
-    """reltuples of a never-analyzed table (-1) must surface as None, not 0."""
+def test_pg_never_analyzed_table_is_probed(pg_source):
+    """A never-analyzed table (reltuples=-1) is PROBED: the connector measures
+    the row count with a bounded scan instead of reporting unknown - and never
+    fabricates (the probe is a measurement, reltuples=-1 stays untouched)."""
+    stats = pg_source.get_table_statistics("stats_a", "never_analyzed", [])
+    assert stats.row_count == 2
+
+
+def test_pg_probe_disabled_reports_unknown(pg_source, monkeypatch):
+    """With the FEDQ_STATS_PROBE=0 kill switch, a never-analyzed table's row
+    count surfaces as None (honest unknown), never 0 and never a guess."""
+    monkeypatch.setenv("FEDQ_STATS_PROBE", "0")
     stats = pg_source.get_table_statistics("stats_a", "never_analyzed", [])
     assert stats.row_count is None
+
+
+def test_pg_probe_measures_exact_column_statistics(pg_source):
+    """The exact probe measures per-column NDV, null fraction and min/max in
+    one scan - analyzed-grade inputs for a table ANALYZE never saw."""
+    stats = pg_source.get_table_statistics("stats_a", "never_analyzed", ["k"])
+    column = stats.column_stats["k"]
+    assert column.num_distinct == 2
+    assert column.null_fraction == 0.0
+    assert column.min_value == 1
+    assert column.max_value == 2
+
+
+def test_pg_probe_large_table_samples_row_count_only(pg_source, monkeypatch):
+    """Above the exact budget the probe TABLESAMPLEs a row-count estimate and
+    reports NO column statistics (a block-sampled NDV is biased low; reporting
+    it would fabricate). A 100-percent sample here makes the count exact."""
+    from federated_query.datasources import postgresql as pg_module
+    monkeypatch.setattr(pg_module, "PROBE_EXACT_BYTES", 0)
+    stats = pg_source.get_table_statistics("stats_a", "never_analyzed", ["k"])
+    assert stats.row_count == 2
+    assert stats.column_stats == {}
+
+
+def test_pg_planner_estimate_for_analyzed_scan(pg_source):
+    """The source planner prices a rendered scan via EXPLAIN: an ANALYZEd
+    table answers with its estimate; a never-ANALYZEd one refuses (pg would
+    only relay its own default selectivities - the fabricated priors this
+    engine removed)."""
+    estimate = pg_source.estimate_scan_rows(
+        "stats_a", "t", "SELECT k FROM stats_a.t WHERE v LIKE '%x%'"
+    )
+    assert estimate is not None and estimate > 0
+    refused = pg_source.estimate_scan_rows(
+        "stats_a", "never_analyzed", "SELECT k FROM stats_a.never_analyzed"
+    )
+    assert refused is None
+
+
+def test_pg_planner_estimate_bad_sql_abstains_and_pool_survives(pg_source):
+    """An EXPLAIN the source cannot parse abstains (capability probe) and the
+    rollback leaves the pooled connection usable for the next statistics
+    read."""
+    estimate = pg_source.estimate_scan_rows(
+        "stats_a", "t", "SELECT nonsense_column FROM stats_a.t"
+    )
+    assert estimate is None
+    stats = pg_source.get_table_statistics("stats_a", "t", [])
+    assert stats.row_count == 200
+
+
+def test_duckdb_planner_estimate(duck_source):
+    """DuckDB's EXPLAIN row estimate parses from the plan's root operator; an
+    unparseable probe abstains instead of crashing estimation."""
+    estimate = duck_source.estimate_scan_rows(
+        "main", "stats_t", "SELECT id FROM main.stats_t WHERE grp LIKE '%a%'"
+    )
+    assert estimate is not None and estimate > 0
+    assert duck_source.estimate_scan_rows(
+        "main", "stats_t", "SELECT no_such_col FROM main.stats_t"
+    ) is None
 
 
 def test_pg_negative_n_distinct_decodes_against_row_count(pg_source):

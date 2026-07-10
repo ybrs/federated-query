@@ -1,6 +1,8 @@
 """PostgreSQL data source implementation."""
 
 import datetime
+import decimal
+import os
 from contextlib import contextmanager
 from typing import List, Dict, Any, Iterator, Optional
 import numpy as np
@@ -43,6 +45,32 @@ _DASH = ord("-")
 # Arrow supports is 38 digits.
 _NUMERIC_OID = 1700
 _MAX_DECIMAL128_PRECISION = 38
+
+# A never-ANALYZEd table at or below this size probes with one EXACT aggregate
+# scan (row count + per-column NDV/nulls/min/max). This is a probe BUDGET (how
+# much one-time measuring work the connector may spend), not a statistic; at
+# SF10 every TPC-DS dimension (largest: customer_demographics, 180MB) fits and
+# every fact (GB-scale) goes to the sampled path.
+PROBE_EXACT_BYTES = 256 * 1024 * 1024
+
+# Block-sample size targeted by the large-table row-count probe; TABLESAMPLE
+# SYSTEM percent is derived from it and clamped to [0.01, 100].
+PROBE_SAMPLE_TARGET_BYTES = 32 * 1024 * 1024
+
+
+def _probe_enabled() -> bool:
+    """Whether statless-table probing is on. FEDQ_STATS_PROBE=0 is the kill
+    switch (mirrors FEDQ_DIM_SHIPPING); anything else, including unset, is on."""
+    return os.environ.get("FEDQ_STATS_PROBE", "1") != "0"
+
+
+def _probe_bound(value):
+    """A probed min/max as a value the range interpolation can order: Decimal
+    becomes float (the estimator's ordinal scale handles int/float/date/
+    datetime); every other type passes through unchanged."""
+    if isinstance(value, decimal.Decimal):
+        return float(value)
+    return value
 
 # Cap each streamed ADBC batch so a huge scan yields many bounded batches rather
 _ADBC_BATCH_BYTES = 4 * 1024 * 1024
@@ -223,17 +251,154 @@ class PostgreSQLDataSource(DataSource):
         self, schema: str, table: str, columns: List[str]
     ) -> Optional[TableStatistics]:
         """Catalog statistics: reltuples for the row count, pg_stats for the
-        requested columns. Pure catalog reads - never a scan of the table."""
+        requested columns - pure catalog reads when ANALYZE has run. A
+        never-ANALYZEd table is PROBED instead (a bounded measuring scan, the
+        same shape the DuckDB connector's approx pass always runs): the source
+        MEASURES what the catalog lacks, it never fabricates - and unknown
+        statistics starve every optimizer decision over the table."""
         conn = self._get_connection()
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 row_count = self._catalog_row_count(cursor, schema, table)
+                if row_count is None and _probe_enabled():
+                    return self._probe_statistics(cursor, schema, table, columns)
                 column_stats = self._pg_stats_columns(
                     cursor, schema, table, columns, row_count
                 )
                 return self._build_table_statistics(row_count, column_stats)
         finally:
             self._return_connection(conn)
+
+    def estimate_scan_rows(self, schema: str, table: str, sql: str):
+        """PostgreSQL's planner estimate for a rendered scan, via EXPLAIN
+        (FORMAT JSON) - never executes the scan. Answers ONLY for an ANALYZEd
+        table: on a statless table pg's planner falls back to ITS OWN default
+        selectivities, which are exactly the fabricated priors this engine
+        removed - relaying them would smuggle the fabrication back in. The
+        statless case stays on the probe + honest bounds."""
+        conn = self._get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                if self._catalog_row_count(cursor, schema, table) is None:
+                    return None
+                return self._explain_rows(conn, cursor, sql)
+        finally:
+            self._return_connection(conn)
+
+    def _explain_rows(self, conn, cursor, sql) -> Optional[int]:
+        """One EXPLAIN (FORMAT JSON) round trip's root row estimate."""
+        try:
+            cursor.execute(f"EXPLAIN (FORMAT JSON) {sql}")
+        except psycopg2.Error:
+            # A capability probe, not error hiding: a predicate shape this
+            # rendering cannot express for PostgreSQL fails EXPLAIN here while
+            # the query itself still executes via its normal path - the
+            # estimate is then honestly absent. The rollback unpoisons the
+            # pooled connection the failed statement left in an aborted
+            # transaction.
+            conn.rollback()
+            return None
+        return self._explain_plan_rows(cursor.fetchone())
+
+    def _explain_plan_rows(self, plan_row) -> Optional[int]:
+        """The root plan node's row estimate from one EXPLAIN (FORMAT JSON)
+        result row. psycopg2 decodes the json column to a Python list."""
+        payload = plan_row["QUERY PLAN"]
+        return int(payload[0]["Plan"]["Plan Rows"])
+
+    def _probe_statistics(self, cursor, schema, table, columns):
+        """Measured statistics for a never-ANALYZEd table. At or below
+        PROBE_EXACT_BYTES: one EXACT aggregate scan (row count plus per-column
+        NDV / nulls / min / max) - at SF10 every TPC-DS dimension fits. Above:
+        a TABLESAMPLE row-count estimate only, because a block-sampled distinct
+        count is biased low and reporting it would fabricate a statistic."""
+        size = self._relation_size(cursor, schema, table)
+        if size is None:
+            # The relation does not exist here; report honest unknowns, the
+            # binder is the layer that rejects a truly missing table.
+            return self._build_table_statistics(None, {})
+        if size <= PROBE_EXACT_BYTES:
+            return self._probe_exact(cursor, schema, table, columns, size)
+        return self._probe_sampled(cursor, schema, table, size)
+
+    def _relation_size(self, cursor, schema, table) -> Optional[int]:
+        """The relation's main-fork size in bytes (real file size, valid even
+        when relpages is 0), or None for a missing relation."""
+        cursor.execute(
+            "SELECT pg_relation_size(c.oid) AS size"
+            " FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace"
+            " WHERE n.nspname = %s AND c.relname = %s",
+            (schema, table),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return row["size"]
+
+    def _probe_exact(self, cursor, schema, table, columns, size):
+        """One exact aggregate scan over a small statless table: the row count
+        and, per requested column, distinct / non-null counts and min / max."""
+        cursor.execute(self._probe_exact_sql(schema, table, columns))
+        row = cursor.fetchone()
+        rows = row["probe_rows"]
+        stats = self._unpack_probe_columns(columns, row, rows)
+        # create, not model_copy: fresh statistics assembled from this probe's
+        # measurements; there is no prior node. All three fields are named.
+        return TableStatistics.create(
+            row_count=rows, total_size_bytes=size, column_stats=stats
+        )
+
+    def _probe_exact_sql(self, schema, table, columns) -> str:
+        """The single-scan probe query: count(*) plus four measures per
+        requested column, aliased by position for the unpack."""
+        parts = ["count(*) AS probe_rows"]
+        for index, column in enumerate(columns):
+            quoted = '"' + column.replace('"', '""') + '"'
+            parts.append(f"count(DISTINCT {quoted}) AS ndv_{index}")
+            parts.append(f"count({quoted}) AS nonnull_{index}")
+            parts.append(f"min({quoted}) AS min_{index}")
+            parts.append(f"max({quoted}) AS max_{index}")
+        joined = ", ".join(parts)
+        return f'SELECT {joined} FROM "{schema}"."{table}"'
+
+    def _unpack_probe_columns(self, columns, row, rows):
+        """Per-column ColumnStatistics from the probe row (exact NDV and null
+        fraction; min/max for range interpolation)."""
+        stats: Dict[str, ColumnStatistics] = {}
+        for index, column in enumerate(columns):
+            null_fraction = 0.0
+            if rows > 0:
+                null_fraction = (rows - row[f"nonnull_{index}"]) / rows
+            # Fresh per-column statistics from this probe's measurements (no
+            # prior node to copy); avg_width stays the shared placeholder.
+            stats[column] = ColumnStatistics.create(
+                num_distinct=row[f"ndv_{index}"],
+                null_fraction=null_fraction,
+                avg_width=10,
+                min_value=_probe_bound(row[f"min_{index}"]),
+                max_value=_probe_bound(row[f"max_{index}"]),
+            )
+        return stats
+
+    def _probe_sampled(self, cursor, schema, table, size):
+        """A TABLESAMPLE SYSTEM row-count estimate for a large statless table,
+        scaled from a PROBE_SAMPLE_TARGET_BYTES block sample. Column stats stay
+        unknown (sampled NDVs fabricate); an empty sample stays unknown too."""
+        percent = max(0.01, min(100.0, PROBE_SAMPLE_TARGET_BYTES / size * 100.0))
+        cursor.execute(
+            f'SELECT count(*) AS probe_rows FROM "{schema}"."{table}"'
+            f" TABLESAMPLE SYSTEM ({percent})"
+        )
+        sampled = cursor.fetchone()["probe_rows"]
+        if sampled == 0:
+            return self._build_table_statistics(None, {})
+        # create, not model_copy: fresh statistics from this probe's sample;
+        # there is no prior node. All three fields are named.
+        return TableStatistics.create(
+            row_count=int(sampled * 100.0 / percent),
+            total_size_bytes=size,
+            column_stats={},
+        )
 
     def _catalog_row_count(self, cursor, schema: str, table: str) -> Optional[int]:
         """reltuples of the schema-qualified table, or None when unknown.
