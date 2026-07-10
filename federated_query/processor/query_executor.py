@@ -8,6 +8,7 @@ import pyarrow as pa
 
 from ..catalog import Catalog
 from ..executor import Executor
+from ..executor.plan_cache import PlanCache, plan_cache_from_env
 from ..executor.profiling import QueryProfiler, profiling_enabled, stage_timer
 from ..optimizer import PhysicalPlanner, RuleBasedOptimizer
 from ..optimizer.decorrelation import Decorrelator
@@ -45,6 +46,7 @@ class QueryExecutor:
         physical_executor: Executor,
         processors: Optional[List[QueryProcessor]] = None,
         decorrelator: Optional[Decorrelator] = None,
+        plan_cache: Optional[PlanCache] = None,
     ):
         """Initialize dependencies."""
         self.catalog = catalog
@@ -59,6 +61,11 @@ class QueryExecutor:
         if decorrelator is None:
             decorrelator = Decorrelator()
         self.decorrelator = decorrelator
+        # Cross-query plan cache (None = disabled): repeated statements skip
+        # parse-through-physical and go straight to execution.
+        if plan_cache is None:
+            plan_cache = plan_cache_from_env()
+        self.plan_cache = plan_cache
         self.input_query = ""
         self.query_context = QueryContext("")
         self.last_profile_report: Optional[str] = None
@@ -85,9 +92,17 @@ class QueryExecutor:
     def _plan_pipeline(
         self, sql: str, profiler: Optional[QueryProfiler]
     ) -> PhysicalPlanNode:
-        """Run and time the planning stages, returning the physical plan."""
+        """Run and time the planning stages, returning the physical plan.
+
+        Before-processors run on EVERY execution, cache hit or not: the star
+        expansion's after-hook renames result columns from state its
+        before-hook builds per query. The cache keys on the REWRITTEN SQL and
+        skips parse-through-physical."""
         with stage_timer(profiler, "before"):
             rewritten_sql = self._run_before_processors(sql)
+        cached = self._cached_plan(rewritten_sql)
+        if cached is not None:
+            return cached
         with stage_timer(profiler, "parse"):
             logical_plan = self._parse_query(rewritten_sql)
         with stage_timer(profiler, "bind"):
@@ -97,7 +112,24 @@ class QueryExecutor:
         with stage_timer(profiler, "optimize"):
             optimized_plan = self._optimize_plan(decorrelated_plan)
         with stage_timer(profiler, "plan"):
-            return self._build_physical_plan(optimized_plan)
+            physical_plan = self._build_physical_plan(optimized_plan)
+        self._store_plan(rewritten_sql, physical_plan)
+        return physical_plan
+
+    def _cached_plan(self, rewritten_sql: str) -> Optional[PhysicalPlanNode]:
+        """The cached physical plan for this rewritten SQL, or None (miss,
+        expired, or the cache is disabled)."""
+        if self.plan_cache is None:
+            return None
+        return self.plan_cache.get(rewritten_sql)
+
+    def _store_plan(self, rewritten_sql: str, plan: PhysicalPlanNode) -> None:
+        """Cache a freshly built plan. An EXPLAIN plan never caches: its
+        execution mutates scan nodes (dynamic_filter_values) and it must
+        present the CURRENT planning decisions, not last minute's."""
+        if self.plan_cache is None or isinstance(plan, PhysicalExplain):
+            return
+        self.plan_cache.put(rewritten_sql, plan)
 
     def _run_before_processors(self, sql: str) -> str:
         """Execute processor hooks before planning."""
