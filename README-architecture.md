@@ -964,3 +964,63 @@ deliberately refuses (pg's planner would only relay its own internal default
 selectivities - the fabricated priors this engine removed).
 `benchmarks/tpcds/diag_profile.py` applies the same guard for single-query
 mechanism probes (`DIAG_SCALE` selects the scale).
+
+## 11. Runtime performance layers (2026-07-10)
+
+### 11.1 Plan cache
+
+`executor/plan_cache.py`, wired into `QueryExecutor._plan_pipeline`. A
+cross-query LRU+TTL map from the EXACT rewritten SQL to its physical plan: a
+hit skips parse/bind/decorrelate/optimize/physical (11-26ms of a small
+query) and goes straight to execution. It stores PLANS, never data - a hit
+re-executes against the sources, so results always reflect current data;
+the only staleness is plan QUALITY lagging newer learned statistics,
+bounded by the TTL. Before-processors still run on every execution (star
+expansion's after-hook renames columns from per-query state its before-hook
+builds); EXPLAIN plans never cache (their execution mutates scan nodes and
+must show current decisions). Keys are deliberately NOT constant-neutral
+templates: the optimizer manufactures and copies literals (transitive
+constants, CTE union-filter pushdown), so positional constant substitution
+into a cached plan is unsound. `FEDQ_PLAN_CACHE=0` disables;
+`FEDQ_PLAN_CACHE_TTL` / `_SIZE` override defaults.
+
+### 11.2 Eager aggregation
+
+`optimizer/eager_aggregation.py` (design: `eager-agg-plan.md`). Rewrites
+`Aggregate(G, sums)` over a join tree into a FINAL aggregate over
+`Join(decorating dims, SubqueryScan(PARTIAL aggregate over the fact side))`
+so dim shipping collapses the partial - fact, its small dims, and the
+pre-aggregation - into ONE island; only partial rows cross. No uniqueness
+requirement on the decorating keys (Yan & Larson 1995: join multiplicity is
+a function of the key alone, so the final merge counts each partial exactly
+as the original counted each raw row). Gates, each declining safely: plain
+single-level GROUP BY; SUM / constant / passthrough outputs; pure INNER
+plain-equi join tree; MULTI-source only; at least one peeled dim OVER the
+ship budget (eager RESCUES what full dim-shipping cannot collapse, never
+pre-empts a full collapse that already wins - measured on q21); collapse
+priced as partial groups vs the LARGEST base scan (join estimates
+under-count through containment asymmetries). Kill switch FEDQ_EAGER_AGG=0.
+Measured at SF10: q04 3.4x, q11 3.0x, q74 2.8x.
+
+### 11.3 Cross-step parallel reads (engine)
+
+`fedqrs engine.rs` (design + measurements: `parallel-reads-plan.md`). The
+step loop prefetches every PLAIN source scan (non-ctid-parallel, not on a
+ship-target datasource) onto a persistent worker pool before the loop, and
+dispatches each InjectedScan the moment its key bindings land
+(POSTGRES-only: a DuckDB injected scan is in-process and already saturates
+every core, so concurrency there is pure contention). Results are consumed
+at their step index - bindings, use counts, the memory budget and the spill
+machinery stay single-threaded. Workers fetch through the same
+`connectors::fetch` as the sequential path (per-THREAD pg connection
+caches, mutex-guarded DuckDB clone base). Kill switch
+FEDQRS_PARALLEL_STEPS=0. NOTE: on the loopback bench rig the overlap value
+is mostly hidden (zero network latency); it scales with real source RTT.
+
+### 11.4 Cold vs warm benchmarking
+
+Every benchmark child times its FIRST execution (COLD: source connections,
+statistics fetches and the statless probe, full planning) separately from
+the warm run (plan-cache hit, cached stats); both TPC-DS and TPC-H reports
+carry Warm and Cold columns, and `engine_timings.csv` both values. A change
+that helps only warm runs can no longer silently tax first-sight queries.

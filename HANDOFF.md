@@ -4,8 +4,22 @@ State of the work, facts only. Earlier phases (Rust cutover, N-K decorrelation,
 cost-based optimizer, TPC-H fair benchmark) are in git history and in the
 auto-memory; this document is the CURRENT TPC-DS federated push.
 
-Test suite: **1287 passed, 3 skipped, 25 xfailed** (`POSTGRES_DB=duckpoc
+Test suite: **1329 passed, 3 skipped, 25 xfailed** (`POSTGRES_DB=duckpoc
 /workspace/venv-fedq/bin/python -m pytest -q`).
+
+## CURRENT BOARD (2026-07-10, merged to main)
+
+SF10 totals 53.3s vs single-node DuckDB 71.4s = **0.75x**, geomean 1.11x;
+SF1 1.07x/1.07x; SF0.1 1.32x/1.36x; TPC-H fedpgduck 22/22 at 1.29x;
+99|0|0 at all three scales AND the adversarial placement; cold-source
+convergence intact (a never-ANALYZEd pg source plans like an analyzed one).
+Boards measure WARM runs (plan-cache hits); the harness reports COLD
+separately. Landed since the 2026-07-08 parity board, in order: adaptive
+statistics (honest unknowns, probe, ask-the-source, predicate learning,
+measured ship gate), parallel reads (Phases A+B), q70 extras-CSE, the plan
+cache, eager aggregation, and the cold/warm benchmark split. NEXT: the full
+python-to-rust conversion (branch rewrite-python-to-rust,
+rewrite-python-to-rust-plan.md).
 
 ---
 
