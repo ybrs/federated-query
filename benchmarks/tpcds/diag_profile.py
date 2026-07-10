@@ -25,15 +25,19 @@ def _opts():
 
 
 def _set_stats(conn, cold):
+    """Clear/restore pg statistics; autovacuum is disabled per table while
+    cold so a background autoanalyze cannot re-derive stats mid-probe."""
     conn.autocommit = True
     cur = conn.cursor()
     for t in sorted(TPCDS_TABLES):
         if cold:
+            cur.execute(f'ALTER TABLE "{t}" SET (autovacuum_enabled = false)')
             cur.execute("DELETE FROM pg_statistic WHERE starelid=to_regclass(%s)",
                         (f"public.{t}",))
             cur.execute("UPDATE pg_class SET reltuples=-1,relpages=0 "
                         "WHERE oid=to_regclass(%s)", (f"public.{t}",))
         else:
+            cur.execute(f'ALTER TABLE "{t}" RESET (autovacuum_enabled)')
             cur.execute(f'ANALYZE "{t}"')
 
 

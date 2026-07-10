@@ -54,11 +54,17 @@ def _pg(scale):
 def _set_stats(conn, cold):
     """Clear (cold=True) or restore (cold=False) the TPC-DS tables' statistics.
     Cold = no pg_statistic rows and reltuples=-1: exactly a never-ANALYZEd load.
-    Restore = ANALYZE, re-deriving real stats so the DB is left as found."""
+    Going cold also DISABLES per-table autovacuum so a background autoanalyze
+    cannot silently re-derive statistics mid-benchmark (reads never trigger it,
+    but the experiment must not depend on that). Restore = re-enable autovacuum
+    and ANALYZE, re-deriving real stats so the DB is left as found."""
     conn.autocommit = True
     cursor = conn.cursor()
     for table in sorted(TPCDS_TABLES):
         if cold:
+            cursor.execute(
+                f'ALTER TABLE "{table}" SET (autovacuum_enabled = false)'
+            )
             cursor.execute(
                 "DELETE FROM pg_statistic WHERE starelid = to_regclass(%s)",
                 (f"public.{table}",),
@@ -69,7 +75,27 @@ def _set_stats(conn, cold):
                 (f"public.{table}",),
             )
         else:
+            cursor.execute(f'ALTER TABLE "{table}" RESET (autovacuum_enabled)')
             cursor.execute(f'ANALYZE "{table}"')
+
+
+def _verify_still_cold(conn):
+    """Assert no TPC-DS table regained statistics during the cold phases; a
+    benchmark that silently measured the ANALYZED path would report a lie."""
+    cursor = conn.cursor()
+    for table in sorted(TPCDS_TABLES):
+        cursor.execute(
+            "SELECT count(*), (SELECT reltuples FROM pg_class"
+            " WHERE oid = to_regclass(%s))"
+            " FROM pg_statistic WHERE starelid = to_regclass(%s)",
+            (f"public.{table}", f"public.{table}"),
+        )
+        stat_rows, reltuples = cursor.fetchone()
+        if stat_rows != 0 or reltuples >= 0:
+            raise RuntimeError(
+                f"cold benchmark invalidated: {table} regained pg statistics "
+                f"mid-run (pg_statistic rows={stat_rows}, reltuples={reltuples})"
+            )
 
 
 def _sqls(scale):
@@ -125,6 +151,9 @@ def main():
         print(f"=== COLD sources (no pg stats), scale {scale} ===")
         off = _run(scale, sqls, catalog_path=None)
         warm = _run(scale, sqls, catalog_path="/tmp/cold_learn.sqlite")
+        # The measurements above are only meaningful if the source stayed
+        # statless the whole time - verify before restoring anything.
+        _verify_still_cold(conn)
     finally:
         _set_stats(conn, cold=False)  # always restore
         conn.close()
