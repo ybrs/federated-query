@@ -97,11 +97,14 @@ Branch feature/adaptive-catalog (federated-query + fedqrs). The optimizer
 GUESSES cardinalities (NDV-independence, defaulting); a federated engine can
 MEASURE (it materializes every cross-source intermediate anyway) and REMEMBER.
 A local SQLite catalog (`catalog/stats_catalog.py`) persists runtime measurements
-and warms future planning - the system learns its workload. OPTIONAL: on only
-when FEDQ_STATS_CATALOG names a path (off by default, no behavior change).
+and warms future planning - the system learns its workload. ALWAYS ON (2026-07-09,
+no flag): the catalog opens NEXT TO the loaded config (`<config>.stats.sqlite`),
+or the FEDQ_STATS_CATALOG env path when set as an override; collection is free
+(no observe flag, SQLite WAL + synchronous=OFF, batched one commit/query).
 Correctness-neutral by construction: a learned value only steers plan choice,
 never the answer. Full design: `adaptive-catalog-plan.md`; architecture doc
-section 10.
+section 10. NOTE: always-on collection is correct and cheap, but the READ path
+regresses cold sources today - see STATS PATH DIAGNOSIS below.
 
 - Phase A (write): `execute_ir` returns (arrow_stream, [(binding, rows)]);
   `build_ir_with_observations` maps each binding to catalog provenance;
@@ -132,10 +135,10 @@ to end:
 1. MEASUREMENT - collect_tracked (when observing) keeps the physical plan and
    walks it for every FINAL AggregateExec's output_rows metric; execute()
    matches each aggregate merge fragment to its harvest by group columns and
-   emits a (binding, group count) observation. Gated behind an `observe` flag
-   (on only when a catalog is wired) so the default collection path is unchanged
-   - the ungated version cost +5s at SF10; gated, per-query timings match
-   baseline.
+   emits a (binding, group count) observation. The observe flag was REMOVED
+   2026-07-09 - the harvest restructure is byte-identical to df.execute_stream
+   and the walk touches only AggregateExec, so it is free; the earlier "+5s at
+   SF10" was box variance in child-process full-suite runs, not the harvest.
 2. KEYING - physical_planner stamps group_observation {subplan signature of the
    input, group columns} on each coordinator PhysicalHashAggregate; build_ir
    records it as "group" provenance; CostModel reads the measured count keyed by
@@ -154,6 +157,156 @@ REMAINING (smaller, optional):
   dimension-width heuristic with the measured collapse (group_count vs input
   rows) - self-correcting after a bad ship. The gate currently uses width and is
   already correct on TPC-DS, so this is a robustness upgrade, not a fix.
+
+## STATS PATH DIAGNOSIS 2026-07-09 - warm REGRESSES vs cold (the core problem)
+
+Branch feature/adaptive-catalog. This is the honest current state of learning,
+after diagnosing why the catalog does not pay off. Read this before doing more
+stats work - the earlier "broken CSE" hypothesis was WRONG (see below).
+
+THE THREE REGIMES (and the alarming finding):
+- HAPPY PATH (remote sources ANALYZEd): we fetch real pg stats, plan well. This
+  is our strong regime - faster than Trino single-node, ~1.0x DuckDB single-node.
+- COLD (remote UNANALYZEd, no stats): best-effort ordering. Ok-ish.
+- WARM (cold source + learned catalog, run 2+): SHOULD beat cold. It is WORSE.
+  A database must get better with use; ours regresses. That is the bug.
+
+ANALYZE on a large pg table can take hours, so the un-analyzed source is a REAL,
+important use case, not an edge case. The whole point of learning is to converge
+a cold source toward the happy path over a few runs. Today it diverges.
+
+THE CORRECTED DIAGNOSIS (q39 at SF10, cold-sources benchmark):
+- The "learning broke CSE, fact read 3x" claim was a MEASUREMENT ARTIFACT. Under
+  FEDQRS_PROFILE with a SINGLE isolated timed run, inventory reads EXACTLY ONCE
+  in both cold-off and cold-warm. The "3x" was 3 separate executions (2 warmups
+  + 1 timed) each reading once = 3 profile lines, misread as 3 reads in one run.
+  IR-level CSE already merges the reads into one step in both regimes. Not a bug.
+- The REAL regression: q39 has one fact (inventory, 26.5M reduced rows) joined to
+  small dims (warehouse 10, item 102000, date_dim 365), aggregated, self-joined.
+  The whole fused join+aggregate pipeline is the cost; the fact reads once. The
+  ONLY variable is JOIN ORDER, and partial learned stats push the cost-based
+  reorderer onto a worse DataFusion join order (it re-shuffles the 26.5M stream
+  differently). Measured fused-body time: cold-off 1925ms; warm q39-only 2499ms;
+  warm FULL-subset 7438ms - it gets WORSE as more (accurate) stats accumulate.
+- The WIN path is DIM-SHIPPING, which learning does NOT enable when cold. With
+  analyzed stats q39 SHIPS the 3 dims into DuckDB as temp tables, the star-join
+  collapses to one island, and DuckDB's optimizer handles order: 1569ms. Cold we
+  decline the ship (the gate needs dim NDVs, which learning is not capturing) and
+  fall back to our own DataFusion join order, which the reorderer picks badly.
+
+  q39 SF10 scorecard: SHIP(analyzed) 1569ms | cold-off 2543ms | cold-warm 8005ms.
+
+ROOT CAUSE - we learn ONE leg of a three-legged stool:
+A cost-based planner consumes exactly three DATA PROPERTIES (intrinsic to the
+data, transferable to ANY plan): (1) base ROW COUNTS, (2) column NDVs, (3)
+predicate SELECTIVITIES. ANALYZE produces these; our happy path consumes them.
+Learning's only job is to reconstruct the SAME three by measurement so a warm
+cold source LOOKS ANALYZED to the planner. Instead:
+- We learn ROW COUNTS broadly, but NDVs almost never, and selectivities barely.
+- Join cardinality = rows_l * rows_r / max(ndv_l, ndv_r). Row count and NDV are a
+  PAIR - the formula is only right if BOTH are real or BOTH are defaults. We feed
+  REAL rows + DEFAULT NDV: a mismatched pair. That is WORSE than all-defaults,
+  which is at least internally consistent. The mismatch skews exactly the ratios
+  that pick join order. That is why warm > cold.
+- Do NOT confuse this with PLAN cardinalities (output of THIS join / group-by /
+  subplan). Those are plan-specific and do not transfer when the next run picks a
+  different shape. Only the three data properties transfer.
+
+VERIFIED 2026-07-09 (probe at SF1: warm phase of the cold_sources subset with
+the catalog KEPT and dumped): after 2 full warmups the catalog holds 6 row
+counts, 0 column NDVs, 0 predicate selectivities - and `inventory` (the
+q39/q21/q22 fact) never learns its row count AT ALL. Structural, not
+incidental: `_record_scan_observation` and `_ndv_base_scan` only fire on
+UNFILTERED, UNREDUCED scans, and a good plan never reads a fact unfiltered, so
+a fact can NEVER be learned passively. Warm q39 planning therefore believes
+inventory = DEFAULT_ROW_COUNT = 1000 next to MEASURED dims (date_dim 73049,
+item 18000) - the relative size order INVERTS and every larger-side decision
+flips. Cold-off fabricates 1000 uniformly, preserving the (unknown) order,
+which is why it plans better. q23 is the second flavor: real learned
+store_sales rows paired with a fabricated NDV (rows*0.1) in max(ndv_l,ndv_r).
+One disease, two flavors: a fabricated constant meeting a measurement in the
+same arithmetic.
+
+DECISIONS CORRECTED 2026-07-09 (user review; supersedes the earlier
+"WHAT IS MISSING" list here):
+1. OVERTURNED "systematic passive NDV capture is nearly free": held batches
+   are post-filter/post-reduction, their distinct counts are NOT base-domain
+   NDVs (the code already correctly refuses them). Pure passive learning
+   structurally cannot converge a cold source - THAT branch is the actual
+   rabbit hole.
+2. OVERTURNED the atomic-triple consistency guard: a fact's triple can never
+   complete passively, so the guard = learning permanently inert for fact
+   queries. Symptom patch, not the fix.
+3. OVERTURNED fabricated stat defaults entirely (DEFAULT_ROW_COUNT /
+   DEFAULT_ATOM_ROWS / DEFAULT_NDV_FRACTION / the selectivity priors): a
+   statistic is a MEASUREMENT with provenance (source/learned/probed) or it is
+   NULL. Unknown propagates; every decision point gets an explicit
+   conservative unknown policy (precedents already in-tree:
+   larger_estimated_side abstains, useless_key_reduction abstains, statless
+   remote = infinite urgency).
+
+THE PLAN (authoritative version in adaptive-catalog-plan.md, section
+"COURSE CORRECTION 2026-07-09") - BOTH CORE PHASES LANDED 2026-07-10:
+- Phase HONEST-UNKNOWNS - DONE. All seven fabricated constants deleted;
+  CardinalityEstimate.rows Optional (None = unknown; gap-free = point
+  estimate; gap-carrying = UPPER BOUND by construction - unknown selectivity
+  ceilings at 1.0, unknown NDV floors the denominator at 1); null-propagation
+  through the estimator; DP join order declines a region containing an
+  UNKNOWN atom (keeps written order); CTE atoms estimate their BODY via a
+  registry the JoinOrderingRule fills during descent (reset per plan walk);
+  InList gets a real len(options)/ndv selectivity. Orientation and the
+  every-scan annotation USE bounds (a side whose upper bound is under the
+  other side's measured size is provably smaller) - refusing them regressed
+  q65/q14/q51 on the analyzed path (q65's BETWEEN with an expression bound
+  gapped date_dim, orientation abstained, the fact shipped whole). The
+  dim-shipping gate keeps its stricter no-gap policy.
+- Phase PROBE - DONE (connector-level, not catalog-level). A never-ANALYZEd
+  pg table is PROBED by PostgreSQLDataSource.get_table_statistics: one EXACT
+  aggregate scan (count + per-column NDV/nulls/min/max) up to PROBE_EXACT_BYTES
+  (256MB - every SF10 dim fits), TABLESAMPLE row estimate above (no sampled
+  NDVs - biased, would fabricate). Mirrors the DuckDB connector's existing
+  approx-stats scan; session-cached by the collector; kill switch
+  FEDQ_STATS_PROBE=0. Deferred: PK/unique-metadata NDVs, catalog persistence
+  of probed values ('provenance' column).
+- ASK-THE-SOURCE - DONE (same probe family, same kill switch). A PLAIN
+  filtered scan whose predicate the engine cannot fully price (LIKE,
+  column-vs-column range) asks the SOURCE PLANNER for the rendered scan's
+  row estimate (DataSource.estimate_scan_rows: pg EXPLAIN FORMAT JSON -
+  ANALYZEd tables only, or it would relay pg's own default priors; duck
+  EXPLAIN text parse). Capability-probe semantics: unrenderable shapes
+  abstain (pg rolls back the pooled connection). Cached per rendered SQL per
+  session. THE reason it exists: the deleted LIKE/range priors were
+  load-bearing on TPC-H - q09 regressed 136->896ms (part at its 200k bound
+  stopped the dim-ship island collapse) and q21 144->539ms (DP order broke
+  the nation+supplier pg island) until the source's estimates restored both
+  to baseline (136ms / 152ms). Full detail in adaptive-catalog-plan.md.
+- Phase REFINE - remaining: predicate_stats systematic feed, dim-shipped
+  island group counts, gate consumption of group_stats.
+
+SUCCESS CRITERION MET at SF10 (cold_sources.py, now with an ANALYZED column):
+q39 ANALYZED 1570 | OFF 1563 | WARM 1563 (was OFF 4586 / WARM 8005 pre-fix);
+q21 converges exactly (90/88/91); all six subset queries within noise of the
+analyzed path, rows correct. A never-ANALYZEd source now plans like an
+analyzed one from its first session.
+
+HOW TO RUN THE COLD BENCHMARK (the scoreboard):
+```
+cd benchmarks/tpcds
+PGUSER=postgres /workspace/venv-fedq/bin/python cold_sources.py 10   # scale 10
+```
+`cold_sources.py` CLEARS pg_statistic + reltuples for the TPC-DS tables (a
+never-ANALYZEd source), runs SUBSET=[q07,q21,q22,q23,q39,q54] learning-OFF then
+learning-ON-warmed (2 warmups, best-of-4), and RESTORES stats via ANALYZE in a
+finally (leaves the DB as found). Needs a superuser pg connection (postgres) to
+touch pg_statistic. Output columns: OFF(ms) WARM(ms) delta rows(off/warm).
+Latest run (net NEGATIVE, the problem): q21 -100 (win), q07 -2, q54 -26, q22
++67, q23 +1009, q39 +5463. Correctness OK on all (rows match).
+
+Per-query mechanism probe: `benchmarks/tpcds/diag_profile.py off|warm [full]`
+runs q39 under FEDQRS_PROFILE with `=== TIMED ===` markers isolating ONE timed
+execution (so profile lines are not miscounted across warmups); `full` warms the
+whole subset to reproduce the benchmark's accumulated-catalog context. This is
+how the 1925/2499/7438ms fused-body numbers above were measured.
 
 ## OPEN ISSUES
 

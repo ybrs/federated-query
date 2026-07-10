@@ -14,6 +14,210 @@ queries. The two phases are NOT independent - the cheap exploration touches the
 same tables/columns/filters/join-shapes the heavy queries will, so it TRAINS the
 optimizer for free. Exploration warms the engine for exploitation.
 
+---
+
+# COURSE CORRECTION 2026-07-09 - measurements or null, never fabricated
+
+This section is the AUTHORITATIVE plan forward. It supersedes the handoff's
+"WHAT IS MISSING" list (systematic passive NDV capture; the atomic-triple
+consistency guard) after the warm-regression diagnosis was verified in code and
+by probe. Phases A/B/v1.5 below remain accurate as the record of what landed.
+
+## The verified failure, restated precisely
+
+A probe at SF1 (2 full warmups of the cold_sources subset, catalog kept and
+dumped) measured what learning actually captures: 6 row counts, 0 column NDVs,
+0 predicate selectivities. Structural, not incidental: `_record_scan_observation`
+and `_ndv_base_scan` only fire on UNFILTERED, UNREDUCED scans, and a good plan
+never reads a fact unfiltered - so a fact can NEVER be learned passively.
+`inventory` therefore stays at the fabricated DEFAULT_ROW_COUNT=1000 while its
+dims carry measured real counts (date_dim 73049, item 18000). The planner
+compares the fabricated 1000 against the measured 73049 as if both were facts
+and every larger-side decision (reduction orientation, build side, join order,
+the dim-shipping fact-large gate) INVERTS. Cold-off fabricates 1000 uniformly,
+which at least preserves the (unknown) relative order. That is the whole
+warm-worse-than-cold mystery.
+
+Second flavor (q23): store_sales DOES learn real rows and pairs them with a
+fabricated NDV (rows * DEFAULT_NDV_FRACTION) inside max(ndv_l, ndv_r).
+
+Both flavors are ONE disease: a fabricated constant meeting a measurement in
+the same arithmetic as an equal citizen.
+
+## The principle (this project's own rule, applied to statistics)
+
+A statistic is either a MEASUREMENT with provenance - source catalog (ANALYZE),
+learned (exact runtime observation), probed (sampled, see Phase PROBE) - or it
+is NULL. Never an arbitrary constant dressed up as a number. A fabricated
+default is the stats-level equivalent of a silent `except: pass`: it hides
+"I do not know" behind a confident wrong answer. Unknown PROPAGATES through
+estimate arithmetic (any formula over an unknown input is unknown), and every
+DECISION POINT declares an explicit, documented policy for unknown inputs -
+conservative, meaning "decline the optimization / keep the safe orientation",
+which is exactly the cold-off behavior measured as acceptable. Model
+assumptions on how to COMBINE measurements (NDV independence, containment)
+remain - those are documented estimator formulas, not fabricated inputs.
+
+Precedents already in the codebase (this is not a new invention here):
+- `larger_estimated_side` returns None when either side's estimate is missing;
+  callers keep their default orientation.
+- `useless_key_reduction` abstains (reduce-by-default) on an unknown build NDV.
+- The fact-injection round's orientation urgency treats a statless remote as
+  INFINITE size - unknown = assume large - and that heuristic measurably won.
+
+## Phase HONEST-UNKNOWNS (first; fixes the regression by construction)
+
+Remove every fabricated stat constant. `estimate_defaults.py` keeps ONLY
+TRANSFER_WEIGHT (a cost-model weight, not a statistic) and the estimator
+combination helpers. Deleted, with their substitution sites:
+- DEFAULT_ROW_COUNT (cost.py `_tracked_base_rows`)
+- DEFAULT_ATOM_ROWS (cost.py `_estimate_rare_tracked`, CTE atoms) - a CTE atom
+  is not unknowable: estimate its BODY through the estimator (the plan is right
+  there), and fill from measured `subplan_stats` when the signature matches;
+  only a genuinely unknown body propagates unknown.
+- DEFAULT_NDV_FRACTION (cost.py x3, join_ordering.py x1)
+- DEFAULT_EQ_SELECTIVITY / DEFAULT_RANGE_SELECTIVITY / DEFAULT_LIKE_SELECTIVITY
+  / DEFAULT_NULL_FRACTION - selectivity is 1/NDV or min-max interpolation over
+  MEASURED stats, else unknown.
+
+`CardinalityEstimate.rows` becomes Optional[int] (None = unknown); the
+`defaults_used` provenance list stays for EXPLAIN but now records which objects
+made an estimate UNKNOWN rather than which default was substituted. Estimator
+arithmetic null-propagates.
+
+Decision-point unknown policies (each documented at the decision site):
+- Reduction orientation: an unknown side is treated as INFINITE (reduce it,
+  never reduce INTO a measured side using an unknown side's keys blindly) -
+  the existing urgency precedent, now uniform.
+- Hash build side: build on the known-smaller side; both unknown = keep the
+  planner's syntactic choice.
+- Join-order DP (`choose_order`): a region containing ANY unknown atom is NOT
+  enumerated - keep syntactic order with island adjacency (the cold-off
+  behavior). Rationale: a DP over mixed known/fabricated costs is confidently
+  wrong (q39); a DP over all-unknown is noise. Phase PROBE makes this branch
+  rare rather than making the DP unknown-tolerant.
+- Dim-shipping gate: any stat the gate needs unknown = decline the ship
+  (already mostly true; make it total).
+- useless_key_reduction: unchanged (already abstains correctly).
+
+Gates: full pytest; 99|0|0 at SF0.1/SF1/SF10 pg-dims + TPC-H 22/22 with NO
+tally regression (the analyzed path never sees an unknown, so nothing may
+move); cold_sources.py shows WARM >= COLD on every subset query (the
+inversions are gone by construction because a fabricated number no longer
+exists to invert against).
+
+STATUS 2026-07-10: IMPLEMENTED (all seven constants deleted; rows Optional;
+per-decision policies as above; CTE bodies estimated via a registry the
+JoinOrderingRule fills during descent, reset per plan walk). Suite 1334 pass.
+TWO MEASURED FINDINGS from the SF10 cold benchmark run between this phase and
+PROBE:
+1. The inversion class is dead: q21 warm converged EXACTLY to analyzed
+   (89ms vs 88ms), q23 warm beat cold by 635ms.
+2. Honest unknowns ALONE are not sufficient: q39 warm still lost to cold
+   (+3231ms) because learned ROW COUNTS with no NDVs/selectivities let the
+   DP enumerate on very loose bounds (date_dim priced 73049 when the true
+   filtered size is 365 - its d_year selectivity was unknown), and the
+   bound-ranked order lost to the written order in DataFusion. A stricter
+   "decline enumeration on ANY gap" gate was probed and REJECTED: on the
+   ANALYZED path 218 of 372 regions carry at least one gapped atom (CTE-body
+   and expression-shape gaps), so the gate would de-enumerate 59 percent of
+   the healthy path. The correct fix is better INPUTS, not a blunter gate -
+   which is exactly Phase PROBE.
+
+BOUNDS SEMANTICS (third measured finding, 2026-07-10): with the fabricated
+constants gone, a gap-fed estimate is an UPPER BOUND BY CONSTRUCTION (an
+unknown selectivity ceilings at 1.0, an unknown NDV floors the join
+denominator at 1, an unknown group NDV clamps to input rows) - so
+CardinalityEstimate.rows now means: None = unknown; gap-free value = point
+estimate; gap-carrying value = upper bound. Decision points may USE bounds
+for two-way comparisons: a side whose upper bound is under the other side's
+measured size is PROVABLY smaller. The first implementation refused gap-fed
+sizes at _scan_estimated_rows and _annotated_scan, and that regressed
+q65 945->2047ms, q14 2479->3356, q51 2052->2628 on the ANALYZED path:
+q65's date_dim filter (d_month_seq BETWEEN 1176 AND 1176+11, an expression
+bound the interval pricer cannot place) made the estimate gap-carrying, the
+orientation abstained, and the un-reduced fact shipped whole (28.8M rows vs
+5.4M date-key-reduced). Fixed by stamping bounds: only truly UNKNOWN (None)
+abstains. Caveat recorded: a bound passing through a COMPLEMENT (ANTI join's
+left - matched) can undershoot - bounds are approximate there, matching the
+epistemic status the old priors had, minus fabrication. The dim-shipping
+gate KEEPS its stricter no-gap policy (pre-existing, tuned; shipping is a
+bigger commitment than orientation).
+
+## Phase PROBE (second; the only way unknown becomes a number)
+
+IMPLEMENTED 2026-07-10 in the pg CONNECTOR, not the catalog layer:
+`PostgreSQLDataSource.get_table_statistics` probes a never-ANALYZEd table
+(reltuples=-1) instead of reporting unknown. This mirrors what the DuckDB
+connector has ALWAYS done (its stats path runs one approx aggregate scan);
+pg merely reaches parity. The StatisticsCollector's session cache bounds the
+cost to one probe per table per session.
+
+Shape as landed:
+- Small table (pg_relation_size <= PROBE_EXACT_BYTES, 256MB - every SF10
+  TPC-DS dimension fits, every fact exceeds it): ONE exact aggregate scan
+  measuring count(*) plus per-requested-column count(DISTINCT), null count,
+  min, max. Analyzed-grade inputs: exact NDVs and range bounds.
+- Large table: `TABLESAMPLE SYSTEM (p)` with p sized to a
+  PROBE_SAMPLE_TARGET_BYTES (32MB) block sample; the scaled count(*) is the
+  row estimate. NO column stats from a sample - a block-sampled distinct
+  count is biased low, and reporting it would fabricate a statistic.
+- Reads the actual file size, so it works even when relpages=0 (the
+  cold_sources simulation included). Kill switch: FEDQ_STATS_PROBE=0.
+- Tests: tests/test_statistics_layer.py (probe measures, kill switch reports
+  honest unknown, exact column stats, sampled path drops column stats).
+
+ASK-THE-SOURCE (second probe mechanism, landed 2026-07-10): when the engine's
+own predicate pricing leaves gaps on a PLAIN filtered scan (LIKE patterns,
+column-vs-column ranges, expression bounds), the cost model asks the SOURCE
+PLANNER for the rendered scan's row estimate - `DataSource.estimate_scan_rows`
+via `EXPLAIN (FORMAT JSON)` on pg / EXPLAIN plan-text parse on DuckDB. The
+source prices the predicate from ITS statistics: informed, with provenance,
+never our fabricated prior. Guards, each measured-in:
+- pg answers ONLY for an ANALYZEd table - a statless table would relay pg's
+  own default selectivities, i.e. smuggle the fabricated priors back in; the
+  cold path stays on probe + honest bounds (validated converged).
+- Only PLAIN scans ask: a pushed-aggregate scan's filter is a HAVING over
+  aggregate OUTPUT names - invalid as a WHERE at the source.
+- The EXPLAIN is a CAPABILITY PROBE: a predicate shape the rendering cannot
+  express for that source (engine-evaluated functions like age()) abstains
+  (pg rolls back to unpoison the pooled connection) - the query itself still
+  executes via its normal path.
+- Cached per (datasource, rendered SQL) on the StatisticsCollector - one
+  round trip per distinct scan per session, however often the DP re-estimates.
+WHY IT EXISTS: removing the priors regressed TPC-H q09 136->896ms (the LIKE
+prior 0.1 was load-bearing: part priced at its 200k bound stopped the
+dim-ship, breaking the one-island collapse) and q21 144->539ms (the
+column-vs-column range prior shaped the DP order that kept nation+supplier
+one pg island). With the source's estimate both restored to baseline
+(q09 136ms, q21 152ms). Tests: test_statistics_layer.py (pg analyzed answers
+/ statless refuses / bad SQL abstains + pool survives; duck parse incl.
+singular "~1 row").
+
+DEFERRED from the original sketch (add only if measurement demands):
+- UNIQUE/PK-metadata NDVs (dims are small enough for the exact path; the
+  unique-column shortcut only matters for facts, whose keys are not unique).
+- Catalog persistence of probed values under a 'provenance' column (the
+  session cache already amortizes; cross-session persistence is a latency
+  refinement, and learned exact observations land in the catalog anyway).
+
+Gates: cold_sources.py gained the ANALYZED(ms) reference column; the
+scoreboard criterion is WARM (and now OFF too - the probe needs no catalog)
+CONVERGING to ANALYZED per query, not merely beating COLD. Plus the standing
+correctness harness.
+
+## Phase REFINE (third; existing passive machinery, now on honest ground)
+
+Unchanged in intent from the earlier list, now REFINING probed estimates with
+exact measurements instead of papering over fabricated ones:
+- Feed `predicate_stats` systematically from filtered UNREDUCED scans (input
+  rows = measured/probed base rows, output rows = the scan's measured output).
+- Dim-shipped island group counts: stamp the pre-ship aggregate's signature on
+  the island RemoteQuery (the handoff's open item).
+- Consume group_stats in the dim-shipping gate (robustness upgrade).
+
+---
+
 ## The safety property (why this whole layer is low-risk)
 
 A learned observation can only change WHICH PLAN the optimizer picks - never the
