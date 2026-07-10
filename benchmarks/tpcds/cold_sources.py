@@ -117,6 +117,10 @@ def main():
     sqls = _sqls(scale)
     conn = _pg(scale)
     try:
+        # ANALYZED runs FIRST, with the source's real statistics intact: it is
+        # the convergence target - perfect learning reproduces this time.
+        print(f"=== ANALYZED sources (real pg stats), scale {scale} ===")
+        analyzed = _run(scale, sqls, catalog_path=None)
         _set_stats(conn, cold=True)
         print(f"=== COLD sources (no pg stats), scale {scale} ===")
         off = _run(scale, sqls, catalog_path=None)
@@ -126,18 +130,23 @@ def main():
         conn.close()
         if os.path.exists("/tmp/cold_learn.sqlite"):
             os.remove("/tmp/cold_learn.sqlite")
-    _report(off, warm)
+    _report(analyzed, off, warm)
 
 
-def _report(off, warm):
-    """Print the cold learning-off vs learning-on comparison."""
-    print(f"\n{'query':7} {'OFF(ms)':>9} {'WARM(ms)':>9} {'delta':>9}  rows(off/warm)")
+def _report(analyzed, off, warm):
+    """Print the scoreboard: the criterion is WARM CONVERGING to ANALYZED
+    (the plan real statistics buy), not merely beating OFF."""
+    header = (f"\n{'query':7} {'ANALYZED':>9} {'OFF(ms)':>9} {'WARM(ms)':>9} "
+              f"{'W-OFF':>8} {'W-ANLZ':>8}  rows(anlz/off/warm)")
+    print(header)
     for name in SUBSET:
+        anlz_ms, anlz_rows = analyzed[name]
         off_ms, off_rows = off[name]
         warm_ms, warm_rows = warm[name]
-        match = "OK" if off_rows == warm_rows else "ROWS DIFFER"
-        print(f"{name:7} {off_ms:9.0f} {warm_ms:9.0f} {warm_ms-off_ms:+9.0f}  "
-              f"{off_rows}/{warm_rows} {match}")
+        match = "OK" if off_rows == warm_rows == anlz_rows else "ROWS DIFFER"
+        print(f"{name:7} {anlz_ms:9.0f} {off_ms:9.0f} {warm_ms:9.0f} "
+              f"{warm_ms-off_ms:+8.0f} {warm_ms-anlz_ms:+8.0f}  "
+              f"{anlz_rows}/{off_rows}/{warm_rows} {match}")
 
 
 if __name__ == "__main__":
