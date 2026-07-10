@@ -146,18 +146,16 @@ class EagerAggregationRule(OptimizationRule):
 
     def _sum_only_outputs(self, agg: Aggregate) -> bool:
         """Every output is a passthrough group column, a CONSTANT (a literal
-        tag column like q04's sale_type), or a plain SUM call. An input
-        reference from a previous eager alias also declines: the idempotence
-        guard against re-splitting an already-split aggregate."""
+        tag column like q04's sale_type), or a plain SUM call. An aggregate
+        whose input already contains an eager partial (a SubqueryScan this
+        rule aliased) also declines: the idempotence guard against
+        re-splitting an already-split aggregate."""
         for entry in agg.aggregates:
             if isinstance(entry, (ColumnRef, Literal)):
                 continue
             if not _plain_sum(entry):
                 return False
-            for ref in column_refs(entry):
-                if ref.table and ref.table.startswith(_EAGER_PREFIX):
-                    return False
-        return True
+        return not _contains_eager_partial(agg.input)
 
     def _plain_column_keys(self, keys: List[Expression]) -> bool:
         """Whether every group key is a qualified plain column reference."""
@@ -446,20 +444,33 @@ class EagerAggregationRule(OptimizationRule):
             if isinstance(entry, ColumnRef):
                 select_list.append(_replace_column_refs(entry, mapping))
                 continue
+            # create, not model_copy: a FRESH reference to a column this
+            # rule just synthesized on the partial - no prior node to copy.
             partial_ref = ColumnRef.create(
                 table=built["alias"], column=next(sum_iter),
                 data_type=entry.get_type(),
             )
-            # SUM of partial sums: the merge that makes duplication commute.
-            select_list.append(FunctionCall.create(
-                function_name=entry.function_name, args=[partial_ref],
-                is_aggregate=True,
-            ))
+            # The merge SUM keeps the original call's identity via model_copy
+            # (distinct/within-group flags survive - they are gate-guaranteed
+            # empty, and copying keeps that invariant visible), swapping only
+            # the argument for the partial's synthetic column.
+            select_list.append(entry.model_copy(update={"args": [partial_ref]}))
         # The final aggregate keeps the ORIGINAL output contract; only its
         # input and expression qualifiers changed.
         return agg.model_copy(update={
             "input": joined, "group_by": group_by, "aggregates": select_list,
         })
+
+
+def _contains_eager_partial(node) -> bool:
+    """Whether the subtree already holds one of this rule's partials (a
+    SubqueryScan under the reserved alias prefix)."""
+    if isinstance(node, SubqueryScan) and node.alias.startswith(_EAGER_PREFIX):
+        return True
+    for child in node.children():
+        if _contains_eager_partial(child):
+            return True
+    return False
 
 
 def _plain_sum(entry: Expression) -> bool:
