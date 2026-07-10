@@ -67,8 +67,10 @@ DIFFERENTIAL GATE (run both implementations, compare stage output on all 121
 queries x placements; the results-level tallies stay the final arbiter -
 they are language-agnostic and already exist).
 
-- R0 (now, free): keep landing product features in Python; the accelerator
-  ships first. Freeze the IR schema as a versioned contract.
+- R0 (now, free): freeze the IR schema as a versioned contract; logical
+  optimizer work may keep landing in Python (its stage is untouched by R1),
+  but NO new physical/IR-layer features until R1 - the accelerator WAITS
+  for R1 (see Recommendation).
 - R1: PHYSICAL planning + SQL emission + IR construction in Rust; cut =
   optimized logical plan (JSON). Kills the transpile boundary and the IR
   serialization; the spike already de-risked the dialect question.
