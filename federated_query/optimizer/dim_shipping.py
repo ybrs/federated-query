@@ -18,6 +18,7 @@ foreign estimate declines (a mis-shipped big dimension would flood the source).
 """
 
 import os
+from typing import Optional
 
 from ..datasources.base import DataSourceCapability
 from ..datasources.postgresql import PostgreSQLDataSource
@@ -37,6 +38,7 @@ from ..plan.physical import (
     PhysicalShipment,
     PhysicalWindow,
 )
+from .subplan_signature import group_column_names
 
 # The schema a shipped temp table is referenced under, per target: DuckDB puts
 # CREATE TEMP TABLE in ``temp``; PostgreSQL puts a session temp table in
@@ -70,6 +72,13 @@ SHIP_MIN_RATIO = 20
 # dates, customers). Correlated keys from ONE dimension (i_item_id + i_item_desc)
 # share an owner and count once, so this is not fooled the way a raw key count is.
 HIGH_CARD_NDV = 10_000
+# A ship-target aggregate whose MEASURED group count keeps more than this
+# fraction of its estimated input rows does not collapse: shipping it moves a
+# large materialized result across the boundary instead of pipelining the
+# reduced fact. q23's measured 13.8M of ~28.8M (0.48) regressed ~13 percent;
+# the proven shipping winners collapse to well under a thousandth. This is a
+# decision threshold, not a statistic - the group count it judges is measured.
+SHIP_COLLAPSE_MAX_FRACTION = 0.1
 
 
 class DimShipping:
@@ -164,9 +173,44 @@ class DimShipping:
         move a large materialized result instead of pipelining the reduced fact
         (q23: store_sales grouped by item x date, 28.8M -> 13.8M). Declining is
         always safe: it keeps the proven no-ship plan, which never changes a
-        result. Runs only after _collapses_via_aggregate confirmed the root."""
+        result. Runs only after _collapses_via_aggregate confirmed the root.
+        A MEASURED group count (recorded by a previous run, island- or
+        coordinator-side) OVERRIDES the width heuristic - the gate then
+        self-corrects in both directions after its first sight of the shape."""
+        measured = self._measured_explosion(node)
+        if measured is not None:
+            return measured
         aggregate = self._ship_aggregate(node)
         return self._count_high_dimensions(aggregate) >= 2
+
+    def _measured_explosion(self, node) -> Optional[bool]:
+        """The measured collapse verdict for the ship-target aggregate, or None
+        when no prior run recorded its group count (or the input size is
+        unjudgeable). Explosion = the measured output keeps more than
+        SHIP_COLLAPSE_MAX_FRACTION of the aggregate's estimated input rows."""
+        observation = self._island_group_observation(node)
+        if observation is None:
+            return None
+        groups = self._learned_group_count(observation)
+        if groups is None:
+            return None
+        aggregate = self._ship_aggregate(node)
+        input_rows = self._planner.cost_model.estimate(aggregate.input).rows
+        if not input_rows:
+            return None
+        return groups > input_rows * SHIP_COLLAPSE_MAX_FRACTION
+
+    def _learned_group_count(self, observation) -> Optional[int]:
+        """The catalog's measured group count for a stamped subject/key set,
+        or None when no learned catalog is wired or nothing was recorded."""
+        collector = self._planner.cost_model.stats_collector
+        catalog = getattr(collector, "stats_catalog", None)
+        if catalog is None:
+            return None
+        return catalog.group_count(
+            observation["subject"], observation["columns"],
+            collector.learned_ttl_seconds,
+        )
 
     def _ship_aggregate(self, node):
         """The node under the row-preserving wrappers (Projection/Filter/Sort/
@@ -297,8 +341,29 @@ class DimShipping:
         fallback = self._planner.plan_without_shipping(node)
         if self._has_window(fallback) or not self._outputs_match(island, fallback):
             return None
-        island = island.model_copy(update={"seeded_schema": fallback.schema()})
+        island = island.model_copy(update={
+            "seeded_schema": fallback.schema(),
+            "group_observation": self._island_group_observation(node),
+        })
         return self._wrap_shipments(shipments, island, local)
+
+    def _island_group_observation(self, node):
+        """The learned-stats group provenance to stamp on the shipped island:
+        the PRE-SHIP aggregate's subject (the same key the cost model reads)
+        plus its group columns, so the island's materialized row count records
+        the aggregate's measured group count. None when a Filter or Limit sits
+        between the ship root and the aggregate (the island's row count is
+        then NOT the group count) or a group key is not a plain column."""
+        current = node
+        while isinstance(current, (Projection, Sort, SubqueryScan)):
+            current = current.children()[0]
+        if not isinstance(current, Aggregate) or current.grouping_sets:
+            return None
+        columns = group_column_names(current.group_by)
+        if columns is None:
+            return None
+        subject = self._planner.cost_model._group_subject(current.input)
+        return {"subject": subject, "columns": columns}
 
     def _has_window(self, node) -> bool:
         """Whether the plan contains a window function. Collapsing a window over

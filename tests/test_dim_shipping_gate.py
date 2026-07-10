@@ -174,3 +174,72 @@ def test_unknown_ndv_without_row_count_counts_as_high_card():
         [_col("item", "i_item_sk"), _col("mystery", "m_key")],
     )
     assert gate._dimension_explosion(agg) is True
+
+
+def _gate_with_learned(stats_by_table, stats_catalog):
+    """A DimShipping whose collector carries a learned-stats catalog."""
+    catalog = Catalog()
+    catalog.datasources["ds"] = _StatsSource(stats_by_table)
+    collector = StatisticsCollector(catalog, stats_catalog=stats_catalog)
+    cost_config = CostConfig(
+        cpu_tuple_cost=0.01, io_page_cost=1.0,
+        network_byte_cost=0.0001, network_rtt_ms=10.0,
+    )
+    cost_model = CostModel(cost_config, collector)
+    planner = types.SimpleNamespace(cost_model=cost_model)
+    return DimShipping(planner)
+
+
+def _measured_gate(group_count):
+    """A gate over the q23 shape with a MEASURED group count in the catalog."""
+    from federated_query.catalog.stats_catalog import StatsCatalog
+    from federated_query.optimizer.subplan_signature import subplan_signature
+
+    item = _scan("item", ["i_item_sk", "i_item_desc"])
+    date = _scan("date_dim", ["d_date"])
+    joined = _join(item, date)
+    agg = _aggregate(
+        joined, [_col("item", "i_item_sk"), _col("date_dim", "d_date")]
+    )
+    stats_catalog = StatsCatalog(":memory:")
+    stats_catalog.record_group(
+        subplan_signature(joined), ["i_item_sk", "d_date"], group_count
+    )
+    gate = _gate_with_learned(_STATS, stats_catalog)
+    return gate, agg
+
+
+def test_measured_collapse_overrides_width_heuristic():
+    """A MEASURED tiny group count SHIPS the very shape the width heuristic
+    declines (two independent high-card dimensions): the measurement is the
+    truth the heuristic only guesses at."""
+    gate, agg = _measured_gate(group_count=500)
+    assert gate._dimension_explosion(agg) is False
+
+
+def test_measured_non_collapse_declines():
+    """A MEASURED group count near the input rows declines the ship even
+    though it would also decline heuristically - and, self-correcting, would
+    still decline a shape the width heuristic mistakenly ships."""
+    gate, agg = _measured_gate(group_count=5_000_000)
+    assert gate._dimension_explosion(agg) is True
+
+
+def test_island_stamp_matches_gate_key():
+    """The observation dim shipping stamps on a shipped island keys by the
+    SAME subject the gate later reads - a mismatch would learn into a slot
+    nothing consults."""
+    from federated_query.optimizer.subplan_signature import subplan_signature
+
+    gate = _gate(_STATS)
+    item = _scan("item", ["i_item_sk", "i_item_desc"])
+    date = _scan("date_dim", ["d_date"])
+    joined = _join(item, date)
+    agg = _aggregate(
+        joined, [_col("item", "i_item_sk"), _col("date_dim", "d_date")]
+    )
+    observation = gate._island_group_observation(agg)
+    assert observation == {
+        "subject": subplan_signature(joined),
+        "columns": ["i_item_sk", "d_date"],
+    }

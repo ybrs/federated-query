@@ -1978,6 +1978,11 @@ class PhysicalRemoteQuery(PhysicalPlanNode):
     # references a temp table that lives on the engine's pinned connection, so
     # the python-side probe cannot see it. None everywhere else.
     seeded_schema: Optional[pa.Schema] = None
+    # Learned-stats group provenance {subject, columns} stamped on a SHIPPED
+    # island whose materialized row count IS the pre-ship aggregate's group
+    # count (only row-count-preserving wrappers above it). The subject is
+    # computed from the PRE-SHIP plan so it matches the cost model's read key.
+    group_observation: Optional[Dict[str, object]] = None
 
     @classmethod
     def create(
@@ -1992,6 +1997,7 @@ class PhysicalRemoteQuery(PhysicalPlanNode):
         output_estimated_rows: Optional[int] = None,
         column_ndv: Optional[Dict[str, int]] = None,
         seeded_schema: Optional[pa.Schema] = None,
+        group_observation: Optional[Dict[str, object]] = None,
     ) -> "PhysicalRemoteQuery":
         """Sanctioned fresh-construction path for PhysicalRemoteQuery.
         column_alias_map is explicit (the default_factory cannot be a parameter
@@ -2006,6 +2012,7 @@ class PhysicalRemoteQuery(PhysicalPlanNode):
             output_estimated_rows=output_estimated_rows,
             column_ndv=column_ndv,
             seeded_schema=seeded_schema,
+            group_observation=group_observation,
         )
 
     _schema: Optional[pa.Schema] = None
