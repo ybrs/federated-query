@@ -672,6 +672,78 @@ pub fn and_expressions(left: Option<Expr>, right: Option<Expr>) -> Option<Expr> 
     }
 }
 
+/// Map from an aggregate output name to its aggregate expression.
+///
+/// The `output_map` for `split_where_having`: an aggregate-bearing scan/node
+/// carries positionally aligned `output_names` and `aggregates`; each output that
+/// is an aggregate call maps to its expression (e.g. `total -> SUM(x)`). Ports
+/// `aggregate_output_map`.
+pub fn aggregate_output_map(
+    output_names: &[String],
+    aggregates: &[Expr],
+) -> std::collections::HashMap<String, Expr> {
+    let mut mapping = std::collections::HashMap::new();
+    for (name, expression) in output_names.iter().zip(aggregates.iter()) {
+        if expression.is_aggregate_call() {
+            mapping.insert(name.clone(), expression.clone());
+        }
+    }
+    mapping
+}
+
+/// Split a merged scan predicate into `(where_predicate, having_predicate)`.
+///
+/// The single source of truth for WHERE-vs-HAVING placement (ports
+/// `split_where_having`). When a GROUP BY query folds into one scan, its WHERE
+/// and HAVING conjuncts live together in the scan filter. A conjunct is HAVING if
+/// it references an aggregate-output column (a key of `output_map`, e.g. the
+/// alias `total` the binder rewrote `SUM(x)` to) OR directly contains an
+/// aggregate; its aggregate-output refs are substituted back to the aggregate
+/// expression so the source sees `HAVING SUM(x) > 10` rather than an alias. Every
+/// other conjunct is WHERE. Either side may be None.
+// The output map is always built by `aggregate_output_map` (default hasher), so
+// generalizing over the hasher would only add noise.
+#[allow(clippy::implicit_hasher)]
+pub fn split_where_having(
+    predicate: &Expr,
+    output_map: &std::collections::HashMap<String, Expr>,
+) -> (Option<Expr>, Option<Expr>) {
+    let mut where_terms = Vec::new();
+    let mut having_terms = Vec::new();
+    for conjunct in split_conjuncts(predicate) {
+        if is_having_conjunct(conjunct, output_map) {
+            having_terms.push(substitute_aggregate_refs(conjunct.clone(), output_map));
+        } else {
+            where_terms.push(conjunct.clone());
+        }
+    }
+    (combine_and(where_terms), combine_and(having_terms))
+}
+
+/// Whether a conjunct belongs in HAVING (references an aggregate).
+fn is_having_conjunct(expr: &Expr, output_map: &std::collections::HashMap<String, Expr>) -> bool {
+    if contains_aggregate(expr) {
+        return true;
+    }
+    column_refs(expr)
+        .iter()
+        .any(|col| output_map.contains_key(&col.column))
+}
+
+/// Replace aggregate-output column refs with their aggregate expressions.
+fn substitute_aggregate_refs(
+    expr: Expr,
+    output_map: &std::collections::HashMap<String, Expr>,
+) -> Expr {
+    if let Expr::Column(col) = &expr {
+        if let Some(aggregate) = output_map.get(&col.column) {
+            return aggregate.clone();
+        }
+        return expr;
+    }
+    expr.map_children(&mut |child| substitute_aggregate_refs(child, output_map))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -741,6 +813,49 @@ mod tests {
     #[test]
     fn combine_and_empty_is_none() {
         assert_eq!(combine_and(vec![]), None);
+    }
+
+    fn sum_of(name: &str) -> Expr {
+        Expr::FunctionCall {
+            function_name: "SUM".to_string(),
+            args: vec![col(name)],
+            is_aggregate: true,
+            distinct: false,
+            within_group_key: None,
+            within_group_desc: false,
+        }
+    }
+
+    fn gt(left: Expr, value: i64) -> Expr {
+        Expr::BinaryOp {
+            op: BinaryOpType::Gt,
+            left: Box::new(left),
+            right: Box::new(int(value)),
+        }
+    }
+
+    #[test]
+    fn split_where_having_routes_and_substitutes() {
+        // Folded predicate: (a > 1) AND (total > 10), where `total` is SUM(x).
+        let output_map =
+            aggregate_output_map(&["total".to_string()], std::slice::from_ref(&sum_of("x")));
+        let predicate = combine_and(vec![gt(col("a"), 1), gt(col("total"), 10)]).unwrap();
+
+        let (where_pred, having_pred) = split_where_having(&predicate, &output_map);
+
+        // WHERE keeps the plain conjunct.
+        assert_eq!(where_pred, Some(gt(col("a"), 1)));
+        // HAVING carries the aggregate conjunct with `total` substituted to SUM(x).
+        assert_eq!(having_pred, Some(gt(sum_of("x"), 10)));
+    }
+
+    #[test]
+    fn split_where_having_all_where_when_no_aggregate() {
+        let output_map = aggregate_output_map(&[], &[]);
+        let predicate = gt(col("a"), 1);
+        let (where_pred, having_pred) = split_where_having(&predicate, &output_map);
+        assert_eq!(where_pred, Some(gt(col("a"), 1)));
+        assert_eq!(having_pred, None);
     }
 
     #[test]

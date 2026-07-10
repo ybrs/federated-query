@@ -49,6 +49,32 @@ impl DataType {
             DataType::Null => "NULL",
         }
     }
+
+    /// Whether this type has an Arrow rendering - the connector type contract
+    /// (`arrow_types.py::is_renderable`). Exactly the types a connector's
+    /// `map_native_type` may produce; the ones that never reach a column
+    /// (INTERVAL, NULL) are not renderable. The catalog rejects a column whose
+    /// mapped type is not renderable, so a mistyped column fails loudly at load
+    /// rather than crashing mid-query.
+    ///
+    /// The DataType -> concrete Arrow type object (`arrow_type_for`) lives in
+    /// fq-exec, where the `arrow` crate is a dependency; only `is_renderable`
+    /// (a pure predicate) is needed this early, so only it lives here.
+    pub fn is_renderable(self) -> bool {
+        match self {
+            DataType::Integer
+            | DataType::BigInt
+            | DataType::Float
+            | DataType::Double
+            | DataType::Decimal
+            | DataType::Varchar
+            | DataType::Text
+            | DataType::Boolean
+            | DataType::Date
+            | DataType::Timestamp => true,
+            DataType::Interval | DataType::Null => false,
+        }
+    }
 }
 
 impl std::fmt::Display for DataType {
@@ -69,6 +95,28 @@ mod tests {
         assert_eq!(DataType::Varchar.value(), "VARCHAR");
         assert_eq!(DataType::Timestamp.value(), "TIMESTAMP");
         assert_eq!(DataType::Null.value(), "NULL");
+    }
+
+    #[test]
+    fn renderable_types_match_the_contract() {
+        // The ten types a connector may produce render; the two that never reach
+        // a column do not.
+        for renderable in [
+            DataType::Integer,
+            DataType::BigInt,
+            DataType::Float,
+            DataType::Double,
+            DataType::Decimal,
+            DataType::Varchar,
+            DataType::Text,
+            DataType::Boolean,
+            DataType::Date,
+            DataType::Timestamp,
+        ] {
+            assert!(renderable.is_renderable(), "{renderable} should render");
+        }
+        assert!(!DataType::Interval.is_renderable());
+        assert!(!DataType::Null.is_renderable());
     }
 
     #[test]
