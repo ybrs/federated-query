@@ -1,30 +1,18 @@
 //! The metadata registry. Ports `catalog/catalog.py`.
 //!
-//! PORT NOTE - `load_metadata` and `_require_renderable` are DEFERRED to the
-//! fq-connectors milestone. They call the full `DataSource` introspection surface
-//! (`list_schemas`/`list_tables`/`get_table_metadata`/`map_native_type`) and
-//! `plan/arrow_types::is_renderable`, none of which exist yet. No test in
-//! test_catalog.py exercises `load_metadata`, so nothing is lost here; when
-//! fq-connectors lands, the full `DataSource` trait and this orchestration land
-//! with it. Until then the registry (register/get) and the metadata tree are the
-//! testable surface.
+//! The `DataSource` trait (the catalog/statistics tier a connector exposes) lives
+//! in `datasource.rs`; the concrete connectors implement it in fq-connectors
+//! (dependency inversion, so fq-catalog needs no driver deps). `load_metadata`
+//! introspects every registered source into the schema tree.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::schema::{Schema, Table};
+use fq_common::DataType;
 
-/// The datasource interface the catalog depends on.
-///
-/// Minimal for now (only `name`, which `register_datasource` keys by). The full
-/// introspection/statistics/execution surface is added when fq-connectors is
-/// built and `Catalog::load_metadata` is ported; the concrete connectors live in
-/// fq-connectors and implement this trait (dependency inversion - the abstraction
-/// lives with its consumer, so fq-catalog stays a leaf).
-pub trait DataSource: Send + Sync {
-    /// The registered name of this data source.
-    fn name(&self) -> &str;
-}
+use crate::datasource::DataSource;
+use crate::error::CatalogError;
+use crate::schema::{Column, Schema, Table};
 
 /// Central catalog managing metadata from all data sources.
 #[derive(Default)]
@@ -92,11 +80,68 @@ impl Catalog {
         self.schemas.len()
     }
 
-    /// Whether `load_metadata` has run (false until the deferred orchestration
-    /// lands with fq-connectors).
+    /// Whether `load_metadata` has run.
     pub fn metadata_loaded(&self) -> bool {
         self.metadata_loaded
     }
+
+    /// Introspect every registered source into the schema tree: discover schemas,
+    /// tables, and columns, mapping each column's native type through the source
+    /// (so the catalog and execution path agree on what a column is) and rejecting
+    /// a non-renderable type loudly. Ports `catalog.py::load_metadata`.
+    pub fn load_metadata(&mut self) -> Result<(), CatalogError> {
+        // Collect first (immutable borrow of the sources), then insert, so we do
+        // not borrow self mutably and immutably at once.
+        let mut loaded: Vec<(String, String, Schema)> = Vec::new();
+        for (ds_name, source) in &self.datasources {
+            for schema_name in source.list_schemas()? {
+                let schema = load_one_schema(source.as_ref(), ds_name, &schema_name)?;
+                loaded.push((ds_name.clone(), schema_name, schema));
+            }
+        }
+        for (ds_name, schema_name, schema) in loaded {
+            self.schemas.insert((ds_name, schema_name), schema);
+        }
+        self.metadata_loaded = true;
+        Ok(())
+    }
+}
+
+/// Build one schema's `Schema` from a source: every base table, every column
+/// mapped to a renderable engine type.
+fn load_one_schema(
+    source: &dyn DataSource,
+    ds_name: &str,
+    schema_name: &str,
+) -> Result<Schema, CatalogError> {
+    let mut schema = Schema::new(schema_name, ds_name);
+    for table_name in source.list_tables(schema_name)? {
+        let metadata = source.get_table_metadata(schema_name, &table_name)?;
+        let mut columns = Vec::with_capacity(metadata.columns.len());
+        for column_meta in &metadata.columns {
+            let data_type = source.map_native_type(&column_meta.data_type)?;
+            require_renderable(&column_meta.name, data_type)?;
+            columns.push(Column::new(
+                column_meta.name.clone(),
+                data_type,
+                column_meta.nullable,
+            ));
+        }
+        schema.add_table(Table::new(table_name, columns));
+    }
+    Ok(schema)
+}
+
+/// Raise if a column's mapped `DataType` has no Arrow rendering (a connector
+/// bug), with the offending column, rather than crashing mid-query.
+fn require_renderable(column_name: &str, data_type: DataType) -> Result<(), CatalogError> {
+    if data_type.is_renderable() {
+        return Ok(());
+    }
+    Err(CatalogError::NonRenderableColumn {
+        column: column_name.to_string(),
+        data_type: data_type.value().to_string(),
+    })
 }
 
 impl std::fmt::Display for Catalog {

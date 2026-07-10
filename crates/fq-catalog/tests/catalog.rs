@@ -9,17 +9,96 @@
 
 use std::sync::Arc;
 
-use fq_catalog::{Catalog, Column, DataSource, Schema, Table};
+use fq_catalog::{
+    Catalog, CatalogError, Column, ColumnMetadata, DataSource, DataSourceCapability, Schema, Table,
+    TableMetadata, TableStatistics,
+};
 use fq_common::DataType;
 
-/// A minimal `DataSource` for registry tests (real connectors are a later crate).
+/// One column of the stub's fixed metadata: (name, native type name, nullable).
+type StubColumn = (String, String, bool);
+/// One table of the stub's fixed metadata: (schema, table, columns).
+type StubTable = (String, String, Vec<StubColumn>);
+
+/// A minimal in-crate `DataSource` for catalog tests (real connectors are a later
+/// crate). Serves a fixed metadata tree from memory - enough to drive
+/// `load_metadata` and the registry without any driver.
 struct StubSource {
     name: String,
+    tables: Vec<StubTable>,
+}
+
+impl StubSource {
+    fn empty(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            tables: Vec::new(),
+        }
+    }
 }
 
 impl DataSource for StubSource {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn capabilities(&self) -> Vec<DataSourceCapability> {
+        vec![DataSourceCapability::Joins]
+    }
+
+    fn list_schemas(&self) -> Result<Vec<String>, CatalogError> {
+        let mut schemas: Vec<String> = self.tables.iter().map(|(s, _, _)| s.clone()).collect();
+        schemas.sort();
+        schemas.dedup();
+        Ok(schemas)
+    }
+
+    fn list_tables(&self, schema: &str) -> Result<Vec<String>, CatalogError> {
+        let mut names = Vec::new();
+        for (s, table, _) in &self.tables {
+            if s == schema {
+                names.push(table.clone());
+            }
+        }
+        Ok(names)
+    }
+
+    fn get_table_metadata(&self, schema: &str, table: &str) -> Result<TableMetadata, CatalogError> {
+        for (s, t, cols) in &self.tables {
+            if s == schema && t == table {
+                let columns = cols
+                    .iter()
+                    .map(|(name, ty, nullable)| ColumnMetadata::new(name, ty, *nullable))
+                    .collect();
+                return Ok(TableMetadata {
+                    schema_name: schema.to_string(),
+                    table_name: table.to_string(),
+                    columns,
+                    row_count: None,
+                    size_bytes: None,
+                });
+            }
+        }
+        Err(CatalogError::Source(format!("no table {schema}.{table}")))
+    }
+
+    fn get_table_statistics(
+        &self,
+        _schema: &str,
+        _table: &str,
+        _columns: &[String],
+    ) -> Result<Option<TableStatistics>, CatalogError> {
+        Ok(None)
+    }
+
+    fn map_native_type(&self, type_str: &str) -> Result<DataType, CatalogError> {
+        // Model a source interval column as the non-renderable INTERVAL type, so
+        // load_metadata's renderability guard is exercised; everything else uses
+        // the default mapping.
+        if type_str.eq_ignore_ascii_case("INTERVAL") {
+            return Ok(DataType::Interval);
+        }
+        fq_catalog::map_native_type_default(type_str)
     }
 }
 
@@ -58,13 +137,62 @@ fn test_catalog_initialization() {
 #[test]
 fn test_register_datasource() {
     let mut catalog = Catalog::new();
-    let ds: Arc<dyn DataSource> = Arc::new(StubSource {
-        name: "test_duck".to_string(),
-    });
+    let ds: Arc<dyn DataSource> = Arc::new(StubSource::empty("test_duck"));
     catalog.register_datasource(ds.clone());
 
     let got = catalog.get_datasource("test_duck").expect("registered");
     assert!(Arc::ptr_eq(&got, &ds));
+}
+
+#[test]
+fn test_load_metadata_populates_tree_and_maps_types() {
+    let source = StubSource {
+        name: "duck".to_string(),
+        tables: vec![(
+            "main".to_string(),
+            "users".to_string(),
+            vec![
+                ("id".to_string(), "INTEGER".to_string(), false),
+                ("name".to_string(), "VARCHAR".to_string(), true),
+            ],
+        )],
+    };
+    let mut catalog = Catalog::new();
+    catalog.register_datasource(Arc::new(source));
+    assert!(!catalog.metadata_loaded());
+
+    catalog.load_metadata().expect("load");
+
+    assert!(catalog.metadata_loaded());
+    let table = catalog.get_table("duck", "main", "users").expect("table");
+    assert_eq!(table.columns.len(), 2);
+    // The native type names were mapped through the source to engine DataTypes.
+    assert_eq!(table.get_column("id").unwrap().data_type, DataType::Integer);
+    assert_eq!(
+        table.get_column("name").unwrap().data_type,
+        DataType::Varchar
+    );
+}
+
+#[test]
+fn test_load_metadata_rejects_nonrenderable_type() {
+    // A native type that maps to INTERVAL (non-renderable) must raise loudly at
+    // load, naming the column - not crash mid-query.
+    let source = StubSource {
+        name: "duck".to_string(),
+        tables: vec![(
+            "main".to_string(),
+            "t".to_string(),
+            vec![("span".to_string(), "INTERVAL".to_string(), true)],
+        )],
+    };
+    let mut catalog = Catalog::new();
+    catalog.register_datasource(Arc::new(source));
+    let error = catalog.load_metadata().expect_err("must reject");
+    match error {
+        CatalogError::NonRenderableColumn { column, .. } => assert_eq!(column, "span"),
+        other => panic!("expected NonRenderableColumn, got {other:?}"),
+    }
 }
 
 #[test]
