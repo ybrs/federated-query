@@ -332,17 +332,14 @@ pg conns, mutexed duck clone base). Kill switch FEDQRS_PARALLEL_STEPS=0.
 Measured: q23 5704->4991ms, SF10 totals 63.7s (0.89x, geo 1.34x), all
 gates green (99|0|0 x3 scales + adversarial, tpch 22/22 at 1.55x).
 
-NEXT - Phase B (parallel InjectedScans, the q78/q33 wins): needs (1) a real
-ready-set scheduler (injected scans DEPEND on their keys bindings, so
-upfront dispatch no longer works - dispatch when keys_from lands), and
-(2) the key-delivery audit: inline-IN is connection-free (safe anywhere);
-temp-table delivery creates per-CONNECTION state (each worker's own
-connection makes it naturally isolated - verify fedq_dyn_keys naming and
-the pg session-temp semantics per worker); parquet delivery writes a temp
-file (verify unique paths under concurrency). Measured caution: two
-CPU-heavy pushed-aggregate DUCK scans contend when concurrent (duck already
-uses all cores per query) - consider a per-source in-flight policy.
-Phase C after: parallel Ship uploads + explicit ship-visibility edges.
+Phase B DONE 2026-07-10 (fedqrs 8a0d41b): injections dispatch when their
+keys land, POSTGRES-ONLY - concurrent DUCK injections measured pure
+contention (in-process, already all-cores; q46 +82ms) and stay sequential;
+pg overlap is neutral on the loopback rig and scales with real source
+latency. Board after B: SF10 63.2s/0.89x, geomean 1.32x, 99|0|0 all scales
++ adversarial, tpch 22/22 1.56x. REMAINING - Phase C (parallel Ship
+uploads + explicit ship-visibility edges in the IR); smallest win, and the
+same loopback caveat applies.
 
 ALSO FIXED en route (federated-query 023cb5d): the tpcds harness's timing
 ORACLE now runs under its own interrupt budget (ORACLE_TIMEOUT_FRACTION) -

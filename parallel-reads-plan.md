@@ -110,11 +110,22 @@ A READY-SET SCHEDULER in `engine.rs::execute`, replacing the plain loop:
   PRE-EXISTING harness hole - the timing oracle ground past the child
   timeout on q85 - fixed by an oracle interrupt budget, federated-query
   023cb5d.)
-- B. Parallel InjectedScans. Requires auditing the key-delivery paths:
-  inline-IN and parquet-file delivery are connection-free (parallel-safe);
-  the temp-table delivery path creates per-read temp state and must either
-  pin to one worker or stay on the driving thread. Unlocks q78 (channel
-  facts) and q33's full chains.
+- B. Parallel InjectedScans. DONE 2026-07-10 (fedqrs 8a0d41b), POSTGRES-ONLY
+  after measurement. Delivery-path audit result: inline-IN is
+  connection-free; temp-table delivery is per-CONNECTION state, so each
+  worker's own connection ISOLATES the fixed fedq_dyn_keys name (pg session
+  temp tables, duck clone-scoped temp tables) - no pinning needed; the
+  unselective ctid fallback crosses to a different pool one-way (no cycle).
+  THE MEASURED SURPRISE: the predicted q78/q33 wins did NOT materialize on
+  this box - a DuckDB injected scan is in-process and already saturates
+  every core, so concurrent duck semi-joins pay contention for nothing
+  (q46 +82ms, q78 +60ms) and duck injections now stay sequential; pg
+  injections overlap cleanly but measure neutral against a LOOPBACK pg
+  (zero network latency is exactly what overlap hides). The mechanism's
+  value scales with real source latency; local gates are no-regression:
+  SF10 63.2s/0.89x geomean 1.32x, 99|0|0 all scales + adversarial, TPC-H
+  22/22 at 1.56x, suite 1313. Keys are Arc-shallow cloned into jobs; the
+  binding lifecycle stays single-threaded.
 - C. Parallel Ship uploads + exact ship-visibility edges in the IR (each
   island scan lists the ship tables it reads), releasing the conservative
   rule. Smallest win; do last.
