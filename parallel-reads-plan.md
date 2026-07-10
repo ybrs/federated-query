@@ -89,10 +89,27 @@ A READY-SET SCHEDULER in `engine.rs::execute`, replacing the plain loop:
 ## Phases
 
 - A. Scheduler + parallel plain SourceScans only. InjectedScan, Ship and
-  every scan on a ship-target datasource stay on the driving thread. This
-  alone overlaps q33's dim reads and q39's pre-ship dim scans.
-  Gates: full pytest; 99|0|0 at SF0.1/SF1/SF10 pg-dims + adversarial;
-  TPC-H 22/22; no tally regression; profile shows overlapped reads.
+  every scan on a ship-target datasource stay on the driving thread.
+  DONE 2026-07-10 (fedqrs 2624dea). Shape as landed: no general DAG yet -
+  plain SourceScans have no dependencies, so ALL prefetchable scans dispatch
+  to a persistent 6-worker pool (STEP_WORKERS) before the loop, which
+  consumes each receiver at its step index; workers go through the same
+  connectors::fetch as the sequential path (thread-correct by construction,
+  per-worker connections pool across queries). Errors defer to the
+  sequential arm (identical loud failure); kill switch
+  FEDQRS_PARALLEL_STEPS=0. MEASURED at SF10: q23 5704 -> 4991ms (its 1s
+  whole-fact duck read overlaps the 688ms injected scan), q02 -99ms,
+  q88 -75ms, tally totals 63.7s (0.89x, geomean 1.34x from 1.38x); q33/q78
+  are UNCHANGED as predicted - their serialized reads are injection chains
+  (Phase B). One measured caution for B: two CPU-heavy pushed-aggregate
+  DuckDB scans running concurrently contend (duck already parallelizes each
+  internally) - a per-source concurrency policy may be needed when
+  injected scans join the pool.
+  Gates PASSED: suite 1313; 99|0|0 at SF0.1/SF1/SF10 pg-dims AND
+  adversarial; TPC-H 22/22 at 1.55x. (The adversarial run also surfaced a
+  PRE-EXISTING harness hole - the timing oracle ground past the child
+  timeout on q85 - fixed by an oracle interrupt budget, federated-query
+  023cb5d.)
 - B. Parallel InjectedScans. Requires auditing the key-delivery paths:
   inline-IN and parquet-file delivery are connection-free (parallel-safe);
   the temp-table delivery path creates per-read temp state and must either
