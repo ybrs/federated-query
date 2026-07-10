@@ -319,6 +319,37 @@ execution (so profile lines are not miscounted across warmups); `full` warms the
 whole subset to reproduce the benchmark's accumulated-catalog context. This is
 how the 1925/2499/7438ms fused-body numbers above were measured.
 
+## PARALLEL READS - Phase A DONE 2026-07-10, resumable
+
+Branch feature/parallel-reads (BOTH repos, branched off feature/adaptive-
+catalog / its fedqrs counterpart). Plan: parallel-reads-plan.md (Phase A
+status + measurements recorded inline). fedqrs 2624dea: the step loop
+prefetches every PLAIN source scan (non-ctid-parallel, non-ship-target
+datasource) onto a persistent 6-worker pool before the loop; results are
+consumed at their step index, so bindings/use-counts/memory-budget stay
+single-threaded. Workers use connectors::fetch (thread-correct: per-thread
+pg conns, mutexed duck clone base). Kill switch FEDQRS_PARALLEL_STEPS=0.
+Measured: q23 5704->4991ms, SF10 totals 63.7s (0.89x, geo 1.34x), all
+gates green (99|0|0 x3 scales + adversarial, tpch 22/22 at 1.55x).
+
+NEXT - Phase B (parallel InjectedScans, the q78/q33 wins): needs (1) a real
+ready-set scheduler (injected scans DEPEND on their keys bindings, so
+upfront dispatch no longer works - dispatch when keys_from lands), and
+(2) the key-delivery audit: inline-IN is connection-free (safe anywhere);
+temp-table delivery creates per-CONNECTION state (each worker's own
+connection makes it naturally isolated - verify fedq_dyn_keys naming and
+the pg session-temp semantics per worker); parquet delivery writes a temp
+file (verify unique paths under concurrency). Measured caution: two
+CPU-heavy pushed-aggregate DUCK scans contend when concurrent (duck already
+uses all cores per query) - consider a per-source in-flight policy.
+Phase C after: parallel Ship uploads + explicit ship-visibility edges.
+
+ALSO FIXED en route (federated-query 023cb5d): the tpcds harness's timing
+ORACLE now runs under its own interrupt budget (ORACLE_TIMEOUT_FRACTION) -
+q85 adversarial's oracle ground past the child timeout (pre-existing,
+NOT the parallel change; verified with the kill switch and pre-round
+python) and misreported the correct-in-263ms engine as ERROR.
+
 ## OPEN ISSUES
 
 None blocking correctness (99|0|0 everywhere). Dim shipping is DONE but has
