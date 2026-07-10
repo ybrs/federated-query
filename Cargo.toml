@@ -1,0 +1,45 @@
+[workspace]
+# The Rust rewrite of the engine (see rewrite-python-to-rust-plan.md). One crate
+# per pipeline responsibility; every crate lives under crates/. The Python
+# package alongside this file stays the working product and behavioral reference
+# until the Rust engine passes the full gate, then it is deleted.
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+
+[workspace.lints.rust]
+# House rule: a crash never ships a lie, and warnings are not tolerated. Every
+# rustc warning is an error across the workspace.
+warnings = "deny"
+
+[workspace.lints.clippy]
+# The pedantic set is ENFORCED: warnings = "deny" above escalates these to
+# errors under `cargo clippy`. The individual `allow`s below are the curated
+# exceptions - pedantic lints that fight the Python port or add boilerplate
+# without catching a real bug. Each has a stated reason; add to this list only
+# with one. (Individual entries outrank the group via higher priority.)
+pedantic = { level = "warn", priority = -1 }
+# Config/flag structs (OptimizerConfig, ...) mirror the Python flag structs 1:1;
+# their bools are the domain, not a state-machine smell.
+struct_excessive_bools = "allow"
+# Every fallible pub fn returns a typed error enum (ConfigError, ...); an
+# `# Errors` prose section would only restate the enum.
+missing_errors_doc = "allow"
+# Doc prose is full of SQL keywords (TRY_CAST, UNPIVOT, DISTINCT ON, ...) that
+# are not code items; backticking every one is noise in a SQL engine.
+doc_markdown = "allow"
+# Fires on nearly every pure getter/accessor; #[must_use] on all of them is
+# boilerplate that catches no bug here.
+must_use_candidate = "allow"
+# Domain code is full of near-identical bindings (now_dt/observed_dt, l_key/r_key,
+# left/right); the "too similar" heuristic is noise here.
+similar_names = "allow"
+# Same rationale as missing_errors_doc: a `# Panics` prose section would restate
+# invariants already asserted at the call site.
+missing_panics_doc = "allow"
+# Cardinalities and costs are cast to f64 for ratio math throughout the cost
+# model; the estimates are correctness-neutral, so >2^52-row precision loss is
+# irrelevant to the answer.
+cast_precision_loss = "allow"

@@ -1,0 +1,4 @@
+# Workspace clippy tuning. Record/builder functions mirror multi-column SQL rows
+# and plan nodes with many fields, so a flat 7-arg limit fights the faithful port;
+# 10 keeps the lint meaningful without forcing artificial arg-structs.
+too-many-arguments-threshold = 10

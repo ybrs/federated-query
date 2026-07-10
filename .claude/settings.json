@@ -1,5 +1,17 @@
 {
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r \".tool_input.command\" | grep -q \"git commit\" && { export PATH=\"$HOME/.cargo/bin:$PATH\"; cd /workspace/federated-query && cargo fmt --all; } || true",
+            "statusMessage": "cargo fmt before commit"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write|MultiEdit",

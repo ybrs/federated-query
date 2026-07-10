@@ -1,0 +1,22 @@
+[package]
+name = "fq-catalog"
+version = "0.1.0"
+edition.workspace = true
+
+# fq-catalog: the metadata model (Schema/Table/Column) + the datasource registry
+# and (later) the learned-stats store. Ports catalog/catalog.py, catalog/schema.py,
+# and catalog/stats_catalog.py.
+
+[dependencies]
+fq-common = { path = "../fq-common" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+chrono = "0.4"
+thiserror = "2"
+
+[dev-dependencies]
+# Used by the stats-catalog tests to drive an injectable clock for TTL.
+chrono = "0.4"
+
+[lints]
+workspace = true

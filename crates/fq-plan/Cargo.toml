@@ -1,0 +1,14 @@
+[package]
+name = "fq-plan"
+version = "0.1.0"
+edition.workspace = true
+
+# fq-plan: the expression + logical + physical node model and the shared tree
+# walkers. Ports plan/expressions.py, plan/logical.py, plan/physical.py,
+# plan/arrow_types.py, plan/field_introspection.py.
+
+[dependencies]
+fq-common = { path = "../fq-common" }
+
+[lints]
+workspace = true

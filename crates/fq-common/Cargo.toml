@@ -1,0 +1,18 @@
+[package]
+name = "fq-common"
+version = "0.1.0"
+edition.workspace = true
+
+# fq-common: errors, config, logging - the leaf crate every other crate depends
+# on. Ports federated_query/model.py, config/config.py, utils/logging.py, and
+# parser/errors.py.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "json", "env-filter"] }
+
+[lints]
+workspace = true
