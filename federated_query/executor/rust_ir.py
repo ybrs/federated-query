@@ -633,12 +633,16 @@ def _emit_step_once(ctx, step, key=None):
     widened to the union on a hit: two branches reading different columns
     of the same rows share one read (q70's rollup and its ranked-states
     subquery scan the same reduced fact), and consumers resolve their
-    columns by name, so extra columns are invisible to them."""
+    columns by name, so extra columns are invisible to them. EXTRA
+    injections are likewise excluded and NARROWED to the intersection on a
+    hit: an extra only reduces and its parent join re-checks the condition,
+    so the shared read must carry only the extras EVERY consumer had."""
     if key is None:
         key = _step_cache_key(step)
     cached = ctx.step_cache.get(key)
     if cached is not None:
         _widen_cached_columns(cached, step)
+        _narrow_cached_extras(cached, step)
         return cached["binding"]
     ctx.steps.append(step)
     ctx.step_cache[key] = step
@@ -646,11 +650,12 @@ def _emit_step_once(ctx, step, key=None):
 
 
 def _step_cache_key(step) -> str:
-    """A step's identity: every field except its output name and, for a
-    structured scan spec, its mergeable column list."""
+    """A step's identity: every field except its output name, a structured
+    scan spec's mergeable column list, and the mergeable EXTRA injections
+    (the PRIMARY injection - inject_column + keys_from - stays identity)."""
     key_fields = {}
     for field, value in step.items():
-        if field == "binding":
+        if field in ("binding", "extra_injections"):
             continue
         if field == "scan" and isinstance(value, dict) and "columns" in value:
             narrowed = dict(value)
@@ -670,6 +675,24 @@ def _widen_cached_columns(cached, step) -> None:
     for column in new_scan["columns"]:
         if column not in cached_scan["columns"]:
             cached_scan["columns"].append(column)
+
+
+def _narrow_cached_extras(cached, step) -> None:
+    """Narrow an already-emitted scan's EXTRA injections to the intersection
+    with a new consumer's (matched by column + keys binding). The shared read
+    must be a SUPERSET for every consumer - an extra the new consumer did not
+    carry could drop rows it needs - so only common extras survive. q70: its
+    two 5.5M-row store_sales reads shared the date-key primary but one
+    carried a store-key extra; they now share ONE read without it."""
+    kept = []
+    new_extras = step.get("extra_injections") or []
+    for extra in cached.get("extra_injections") or []:
+        if extra in new_extras:
+            kept.append(extra)
+    if kept:
+        cached["extra_injections"] = kept
+    else:
+        cached.pop("extra_injections", None)
 
 
 def _source_scan_spec(node):
