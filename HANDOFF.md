@@ -280,8 +280,19 @@ THE PLAN (authoritative version in adaptive-catalog-plan.md, section
   stopped the dim-ship island collapse) and q21 144->539ms (DP order broke
   the nation+supplier pg island) until the source's estimates restored both
   to baseline (136ms / 152ms). Full detail in adaptive-catalog-plan.md.
-- Phase REFINE - remaining: predicate_stats systematic feed, dim-shipped
-  island group counts, gate consumption of group_stats.
+- Phase REFINE - DONE 2026-07-10 (all three; detail in the plan doc):
+  predicate_stats feed (filtered unreduced scans record measured output by
+  constant-neutral template; read fills gaps BEFORE ask-the-source),
+  dim-shipped island group counts (group_observation stamped on the island
+  RemoteQuery, row-count-preserving wrappers only), and gate consumption
+  (measured collapse overrides the width heuristic both ways,
+  SHIP_COLLAPSE_MAX_FRACTION = 0.1 of estimated input).
+  ALSO: the legacy untracked estimator family (estimate_cardinality /
+  estimate_selectivity / plan-cost methods, no production callers, all
+  hardcoded constants) is DELETED per user approval; cold_sources.py and
+  diag_profile.py disable per-table autovacuum while cold and VERIFY stats
+  stayed absent before restoring (a background autoanalyze would silently
+  measure the analyzed path).
 
 SUCCESS CRITERION MET at SF10 (cold_sources.py, now with an ANALYZED column):
 q39 ANALYZED 1570 | OFF 1563 | WARM 1563 (was OFF 4586 / WARM 8005 pre-fix);

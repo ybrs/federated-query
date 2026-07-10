@@ -208,13 +208,36 @@ correctness harness.
 
 ## Phase REFINE (third; existing passive machinery, now on honest ground)
 
-Unchanged in intent from the earlier list, now REFINING probed estimates with
-exact measurements instead of papering over fabricated ones:
-- Feed `predicate_stats` systematically from filtered UNREDUCED scans (input
-  rows = measured/probed base rows, output rows = the scan's measured output).
-- Dim-shipped island group counts: stamp the pre-ship aggregate's signature on
-  the island RemoteQuery (the handoff's open item).
-- Consume group_stats in the dim-shipping gate (robustness upgrade).
+ALL THREE LANDED 2026-07-10:
+- predicate_stats feed - DONE. A filtered, UNREDUCED plain scan records its
+  measured output rows keyed by the filter's CONSTANT-NEUTRAL template
+  (`scan_predicate_template`: sorted conjunct shapes, alias-neutral, constants
+  dropped - reusing the subplan-signature machinery). The persist step joins
+  the catalog's own base count so the stored selectivity ratio is
+  measurement-over-measurement; an unknown base stores the output alone.
+  READ: `_scan_filter_rows` consults the learned output BEFORE the source
+  planner (a measurement of this very predicate beats the source's guess),
+  and only when the engine's own pricing left gaps - fill, never override.
+  A reduced (injection-shrunk) scan's output is excluded: recording it would
+  learn a lie. Verified live: a warm SF1 session records d_year eq at
+  0.49966 percent, d_date BETWEEN at 0.0835 percent, plus templates whose
+  base was unknown (output rows only).
+- Dim-shipped island group counts - DONE. dim_shipping stamps
+  `group_observation` {pre-ship subject, group columns} on the island
+  RemoteQuery - the SAME key the cost model and the gate read - but ONLY when
+  the wrappers above the aggregate are row-count-preserving
+  (Projection/Sort/SubqueryScan; a Filter or Limit above would make the
+  island's row count NOT the group count). rust_ir records the island's
+  materialized rows as the measured group count.
+- Gate consumption - DONE. `_dimension_explosion` prefers the MEASURED group
+  count when a previous run (island- or coordinator-side) recorded this
+  aggregate's shape: explosion = measured output above
+  SHIP_COLLAPSE_MAX_FRACTION (0.1) of the aggregate's estimated input rows.
+  Self-correcting BOTH ways: a bad ship records its big island output and
+  declines next run; a declined ship records its coordinator group count and
+  may unlock next run. The width heuristic remains the unmeasured fallback.
+  Tests: tests/test_dim_shipping_gate.py (measured overrides in both
+  directions; the island stamp keys identically to the gate's read).
 
 ---
 
