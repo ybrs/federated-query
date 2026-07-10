@@ -24,6 +24,7 @@ from typing import Dict, FrozenSet, List, Optional, Set
 from ..model import StateModel
 from ..plan.expressions import and_expressions, combine_and
 from ..plan.logical import (
+    CTE,
     CTERef,
     Filter,
     Join,
@@ -34,12 +35,12 @@ from ..plan.logical import (
     transform_children,
 )
 from .estimate_defaults import (
-    DEFAULT_NDV_FRACTION,
     TRANSFER_WEIGHT,
     CardinalityEstimate,
     apply_conjunct_term,
     cap_composite_denom,
     combine_defaults,
+    max_known_ndv,
 )
 from .join_graph import (
     JoinConjunct,
@@ -263,12 +264,21 @@ def _extended_transfer(candidate: _Candidate, atom_source, atom_rows: int):
 
 def choose_order(
     region: JoinRegion, estimator: RegionEstimator, max_dp_size: int
-) -> RegionOrder:
+) -> Optional[RegionOrder]:
     """The chosen join order for a region: DP per connected component up to
-    max_dp_size atoms, greedy above, components CROSSed smallest-first."""
+    max_dp_size atoms, greedy above, components CROSSed smallest-first.
+
+    None when any atom's estimate is UNKNOWN: a DP over a mix of measured and
+    unknown sizes is confidently wrong (the verified q39 cold-source
+    inversion), and a DP over all-unknowns is noise - the caller keeps the
+    written order instead. Probing, not guessing, is how an unknown becomes
+    enumerable."""
     if not region.atoms:
         raise JoinOrderError("choose_order over a region with no atoms")
     atom_estimates = _atom_estimates(region, estimator)
+    for estimate in atom_estimates:
+        if estimate.rows is None:
+            return None
     atom_sources = _atom_source_list(region)
     ordered: List[ComponentOrder] = []
     for component in _connected_components(region):
@@ -792,7 +802,14 @@ class CostModelRegionEstimator(RegionEstimator):
         denominator (product of per-column NDVs) assumes the columns are
         independent and over-counts a composite key, so it is capped at the
         smaller side's rows - distinct key COMBINATIONS cannot exceed that -
-        or a foreign-key join is grossly under-estimated (q09's fact island)."""
+        or a foreign-key join is grossly under-estimated (q09's fact island).
+        choose_order gates enumeration on every atom being KNOWN, so an
+        unknown side here is an enumerator bug, never a statistics gap."""
+        if left.rows is None or atom.rows is None:
+            raise JoinOrderError(
+                "join_estimate over an UNKNOWN side; choose_order must "
+                "decline regions with unknown atoms before enumerating"
+            )
         denom, selectivity, equi_count, defaults = self._step_terms(
             region, left, atom, atom_index, conjuncts
         )
@@ -833,34 +850,35 @@ class CostModelRegionEstimator(RegionEstimator):
         atom_ref, other_ref = _orient_refs(region, conjunct, atom_index)
         atom_ndv, atom_defaults = self._ref_ndv(region, atom_ref, atom.rows)
         other_ndv, other_defaults = self._ref_ndv(region, other_ref, left.rows)
-        return True, max(atom_ndv, other_ndv), atom_defaults + other_defaults
+        return True, max_known_ndv(atom_ndv, other_ndv), atom_defaults + other_defaults
 
     def _ref_ndv(self, region, ref, side_rows: int):
-        """A key's NDV clamped by its side's current rows; the fallback is the
-        named NDV default, recorded with the key it applied to."""
+        """A key's NDV clamped by its side's current rows, or UNKNOWN (None)
+        with the gap recorded - never a fabricated fraction of the rows, which
+        pairs a guess with a measurement in the join denominator."""
         atom = _atom_owning(region, ref)
         ndv = self.cost_model.column_ndv(atom.plan, ref)
         if ndv is None:
-            fallback = max(1, int(side_rows * DEFAULT_NDV_FRACTION))
-            return fallback, [f"ndv({ref.table}.{ref.column})"]
+            return None, [f"ndv({ref.table}.{ref.column})"]
         return max(1, min(ndv, side_rows)), []
 
     def cross_estimate(self, region, left, right, conjuncts):
         """left x right, reduced by the selectivity of any spanning non-equi
         conjuncts (an equi conjunct here is an enumerator bug: equi edges
-        define the components, so they can never span two of them)."""
+        define the components, so they can never span two of them). Sides are
+        KNOWN by choose_order's gate; an UNKNOWN conjunct selectivity reduces
+        nothing (its ceiling is 1.0), leaving the product a valid bound."""
+        if left.rows is None or right.rows is None:
+            raise JoinOrderError(
+                "cross_estimate over an UNKNOWN side; choose_order must "
+                "decline regions with unknown atoms before enumerating"
+            )
         rows = float(left.rows) * float(right.rows)
         defaults: List[str] = []
         for conjunct in conjuncts:
-            if conjunct.is_equi:
-                raise JoinOrderError(
-                    "an equi conjunct spans two components; the component "
-                    "partition is broken"
-                )
-            factor, conjunct_defaults = self.cost_model.conjunct_selectivity(
-                conjunct.expression, "cross"
-            )
-            rows *= factor
+            factor, conjunct_defaults = self._spanning_factor(conjunct)
+            if factor is not None:
+                rows *= factor
             defaults.extend(conjunct_defaults)
         # The CROSS estimate with any spanning conjuncts' selectivity applied
         # and both sides' provenance carried through.
@@ -868,6 +886,18 @@ class CostModelRegionEstimator(RegionEstimator):
             rows=max(1, int(rows)),
             defaults_used=combine_defaults([left, right], defaults),
         )
+
+    def _spanning_factor(self, conjunct):
+        """The selectivity of one component-spanning conjunct, or UNKNOWN
+        (None, priced by the caller as no reduction). An equi conjunct here is
+        an enumerator bug: equi edges define the components, so one can never
+        span two of them."""
+        if conjunct.is_equi:
+            raise JoinOrderError(
+                "an equi conjunct spans two components; the component "
+                "partition is broken"
+            )
+        return self.cost_model.conjunct_selectivity(conjunct.expression, "cross")
 
 
 class JoinOrderingRule(OptimizationRule):
@@ -892,13 +922,20 @@ class JoinOrderingRule(OptimizationRule):
 
     def apply(self, plan: LogicalPlanNode) -> Optional[LogicalPlanNode]:
         """Reorder every region in the plan; None when nothing changed."""
+        # A fresh registry per plan walk: a previous query's same-named CTE
+        # body must never feed this plan's CTERef estimates.
+        self.cost_model.reset_cte_registry()
         rewritten = self._rewrite(plan)
         if rewritten is plan:
             return None
         return rewritten
 
     def _rewrite(self, plan: LogicalPlanNode) -> LogicalPlanNode:
-        """Reorder the region rooted here, or recurse into the children."""
+        """Reorder the region rooted here, or recurse into the children.
+        CTE bodies register on the way down, so a CTERef atom in any region
+        below estimates its body instead of being unknown."""
+        if isinstance(plan, CTE):
+            self.cost_model.register_cte(plan)
         region = extract_region(plan)
         if region is None:
             return transform_children(plan, self._rewrite)
@@ -906,10 +943,14 @@ class JoinOrderingRule(OptimizationRule):
 
     def _reorder_region(self, root, region: JoinRegion) -> LogicalPlanNode:
         """Order one region and re-emit it, preserving identity on no-change
-        so the optimizer's fixpoint terminates."""
+        so the optimizer's fixpoint terminates. A region choose_order declines
+        (an UNKNOWN atom) keeps its written order - the unknown policy - while
+        nested regions still get their chance."""
         if not self._worth_reordering(region, root):
             return transform_children(root, self._rewrite)
         order = choose_order(region, self.estimator, self.max_join_reorder_size)
+        if order is None:
+            return transform_children(root, self._rewrite)
         placed: List[int] = []
         rebuilt = self._emit(region, order, placed)
         self._verify_placement(len(region.conjuncts), placed)

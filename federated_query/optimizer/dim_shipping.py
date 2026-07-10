@@ -122,11 +122,13 @@ class DimShipping:
         return rows
 
     def _scan_rows(self, scan):
-        """One scan's row estimate, or None when the source has no statistics."""
+        """One scan's row estimate, or None when the source has no statistics
+        (an UNKNOWN estimate or one resting on any gap - the gate declines
+        rather than ship on a guess)."""
         if scan.estimated_rows is not None:
             return scan.estimated_rows
         estimate = self._planner.cost_model.estimate(scan)
-        if estimate.defaults_used:
+        if estimate.rows is None or estimate.defaults_used:
             return None
         return estimate.rows
 

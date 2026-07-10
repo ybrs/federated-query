@@ -31,6 +31,7 @@ from ..plan.expressions import (
     BetweenExpression,
     BinaryOp,
     Cast,
+    InList,
     UnaryOp,
     ColumnRef,
     DataType,
@@ -42,17 +43,11 @@ from ..plan.expressions import (
 )
 from ..config.config import CostConfig
 from ..optimizer.estimate_defaults import (
-    DEFAULT_ATOM_ROWS,
-    DEFAULT_EQ_SELECTIVITY,
-    DEFAULT_LIKE_SELECTIVITY,
-    DEFAULT_NDV_FRACTION,
-    DEFAULT_NULL_FRACTION,
-    DEFAULT_RANGE_SELECTIVITY,
-    DEFAULT_ROW_COUNT,
     CardinalityEstimate,
     apply_conjunct_term,
     cap_composite_denom,
     combine_defaults,
+    max_known_ndv,
 )
 from .subplan_signature import subplan_signature, group_column_names
 from ..optimizer.pushdown import bare_names
@@ -179,6 +174,34 @@ def _tightest(items, chooser):
     return chooser(points)
 
 
+def _add_rows(left, right) -> Optional[int]:
+    """A sum of row counts where UNKNOWN (None) propagates: a sum with an
+    unbounded term has no bound."""
+    if left is None or right is None:
+        return None
+    return left + right
+
+
+def _min_rows(left, right) -> Optional[int]:
+    """The smaller of two row counts, ignoring UNKNOWN sides: a minimum is
+    still bounded by whichever side is known; both unknown is unknown."""
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return min(left, right)
+
+
+def _mul_groups(groups, ndv) -> Optional[int]:
+    """A group-count product where UNKNOWN (None) propagates: a product with
+    an unknown factor has no value."""
+    if groups is None or ndv is None:
+        return None
+    return groups * ndv
+
+
+
+
 class CostModel:
     """Cost model for estimating query execution cost."""
 
@@ -193,6 +216,23 @@ class CostModel:
         """
         self.config = config
         self.stats_collector = stats_collector
+        # CTE bodies registered during the current plan walk, so a CTERef atom
+        # estimates its body instead of guessing. reset_cte_registry() scopes
+        # the registry to one plan (names could collide across queries).
+        self.cte_bodies: Dict[str, LogicalPlanNode] = {}
+
+    def reset_cte_registry(self) -> None:
+        """Drop every registered CTE body - called at the start of a plan walk
+        so a previous query's same-named CTE can never feed this one's
+        estimates."""
+        self.cte_bodies.clear()
+
+    def register_cte(self, cte: CTE) -> None:
+        """Make a CTE's body available to CTERef estimation by name. A
+        RECURSIVE body references its own name and would loop the estimator,
+        so it is not registered - its references estimate as unknown."""
+        if not cte.recursive:
+            self.cte_bodies[cte.name] = cte.cte_plan
 
     def estimate_cardinality(self, plan: LogicalPlanNode) -> int:
         """Estimate output cardinality of a plan.
@@ -529,13 +569,10 @@ class CostModel:
         if isinstance(plan, SetOperation):
             return self._estimate_setop_tracked(plan)
         if isinstance(plan, CTE):
+            self.register_cte(plan)
             return self.estimate(plan.child)
         if isinstance(plan, CTERef):
-            # A CTE reference has no catalog identity to fetch statistics
-            # for; it estimates from the named atom default, recorded.
-            return CardinalityEstimate.create(
-                rows=DEFAULT_ATOM_ROWS, defaults_used=[f"atom_rows(cte {plan.name})"]
-            )
+            return self._estimate_cte_ref_tracked(plan)
         if isinstance(plan, Values):
             # A VALUES relation's cardinality is literally its row count;
             # nothing is estimated, so the provenance stays empty.
@@ -544,6 +581,20 @@ class CostModel:
             )
         return self._estimate_guard_tracked(plan)
 
+    def _estimate_cte_ref_tracked(self, ref: CTERef) -> CardinalityEstimate:
+        """A CTE reference estimates its registered BODY - the body plan is a
+        real subtree with real statistics, not a guess. An unregistered name
+        (a recursive CTE, or an estimate outside a registering plan walk) is
+        honestly unknown."""
+        body = self.cte_bodies.get(ref.name)
+        if body is None:
+            # create, not model_copy: a fresh UNKNOWN leaf estimate with no
+            # prior node to copy from. Both fields named: rows + provenance.
+            return CardinalityEstimate.create(
+                rows=None, defaults_used=[f"row_count(cte {ref.name})"]
+            )
+        return self.estimate(body)
+
     def _estimate_guard_tracked(self, plan: LogicalPlanNode) -> CardinalityEstimate:
         """Decorrelation wrappers: guards and per-key limits bound their
         input's cardinality, laterals multiply the outer side."""
@@ -551,22 +602,26 @@ class CostModel:
             return self.estimate(plan.input)
         if isinstance(plan, LateralJoin):
             left = self.estimate(plan.left)
-            # The lateral body's per-outer-row multiplicity is unknowable
-            # from catalog statistics; the outer side's rows stand in.
+            # The lateral body's per-outer-row multiplicity is not a statistic
+            # any catalog holds; without it the product is unknowable, and an
+            # unknown must propagate rather than let the outer side's rows
+            # masquerade as the join's size.
             return CardinalityEstimate.create(
-                rows=left.rows,
+                rows=None,
                 defaults_used=combine_defaults([left], ["lateral_multiplicity"]),
             )
         raise ValueError(f"estimate has no rule for plan node {type(plan).__name__}")
 
     def _estimate_union_tracked(self, union: Union) -> CardinalityEstimate:
-        """A UNION's upper bound: the sum of its inputs."""
+        """A UNION's upper bound: the sum of its inputs. Any unknown branch
+        makes the sum unknown (there is no bound on a sum with an unbounded
+        term)."""
         total = 0
         parents: List[CardinalityEstimate] = []
         for child in union.inputs:
             child_estimate = self.estimate(child)
             parents.append(child_estimate)
-            total += child_estimate.rows
+            total = _add_rows(total, child_estimate.rows)
         # Upper bound: DISTINCT can only shrink the concatenation, so the sum
         # of the inputs is the honest (bounding) estimate either way.
         return CardinalityEstimate.create(
@@ -585,12 +640,15 @@ class CostModel:
             rows=rows, defaults_used=combine_defaults([left, right], [])
         )
 
-    def _setop_rows(self, kind, left_rows: int, right_rows: int) -> int:
-        """The bounding row count of one set-operation kind."""
+    def _setop_rows(self, kind, left_rows, right_rows) -> Optional[int]:
+        """The bounding row count of one set-operation kind. An unknown side
+        keeps whatever bound still holds without it: an INTERSECT is no larger
+        than either side alone, an EXCEPT no larger than its left side; a
+        UNION with an unknown branch has no bound."""
         if kind == SetOpKind.UNION:
-            return left_rows + right_rows
+            return _add_rows(left_rows, right_rows)
         if kind == SetOpKind.INTERSECT:
-            return min(left_rows, right_rows)
+            return _min_rows(left_rows, right_rows)
         if kind == SetOpKind.EXCEPT:
             return left_rows
         raise ValueError(f"no cardinality bound for set operation {kind}")
@@ -604,7 +662,12 @@ class CostModel:
         """
         total = 0.0
         if isinstance(plan, Join):
-            total += self.estimate(plan).rows
+            estimate = self.estimate(plan)
+            # An UNKNOWN join has no output estimate to add; callers that
+            # compare join_tree_cost values must check estimate() provenance
+            # before trusting a tree containing unknowns.
+            if estimate.rows is not None:
+                total += estimate.rows
         for child in plan.children():
             total += self.join_tree_cost(child)
         return total
@@ -624,9 +687,10 @@ class CostModel:
 
     def conjunct_selectivity(
         self, predicate: Expression, target: str
-    ) -> Tuple[float, List[str]]:
+    ) -> Tuple[Optional[float], List[str]]:
         """Tracked selectivity of one predicate with no table statistics in
-        scope (cross-relation residual conjuncts) - defaults are recorded.
+        scope (cross-relation residual conjuncts). None is UNKNOWN with the
+        gap recorded; the caller prices it at its no-reduction bound.
 
         Public entry for the join-ordering estimator."""
         return self._tracked_selectivity(predicate, None, target)
@@ -653,20 +717,57 @@ class CostModel:
 
     def _estimate_scan_tracked(self, scan: Scan) -> CardinalityEstimate:
         """Scan estimate: stats row count x filter selectivity, then pushed-
-        down grouping when the scan carries a remote aggregate."""
+        down grouping when the scan carries a remote aggregate. An unknown
+        base row count stays unknown through the filter (a fraction of an
+        unknown is unknown), but a pushed GROUP BY may still bound the output
+        by its keys' NDV product."""
         stats = self._scan_stats(scan)
         rows, defaults = self._tracked_base_rows(scan, stats)
-        if scan.filters is not None:
-            selectivity, filter_defaults = self._tracked_selectivity(
-                scan.filters, stats, self._scan_target(scan)
-            )
-            rows = max(1, int(rows * selectivity))
+        if scan.filters is not None and rows is not None:
+            rows, filter_defaults = self._scan_filter_rows(scan, stats, rows)
             defaults = defaults + filter_defaults
         if scan.group_by:
             return self._tracked_scan_groups(scan, stats, rows, defaults)
         # A leaf estimate straight from source statistics (or the recorded
-        # defaults); every non-leaf estimate above is derived from these.
+        # gaps); every non-leaf estimate above is derived from these.
         return CardinalityEstimate.create(rows=rows, defaults_used=defaults)
+
+    def _scan_filter_rows(self, scan, stats, rows) -> Tuple[int, List[str]]:
+        """(filtered rows, gap notes) for a scan's pushed predicate: the
+        engine's own pricing when it is complete; else the SOURCE PLANNER's
+        estimate for the rendered scan (the source prices a LIKE or a
+        column-vs-column range from ITS statistics - informed, with
+        provenance); else the no-reduction bound with the gaps recorded."""
+        selectivity, gaps = self._tracked_selectivity(
+            scan.filters, stats, self._scan_target(scan)
+        )
+        if not gaps:
+            return self._filtered_rows(rows, selectivity), []
+        planner_rows = self._source_scan_estimate(scan)
+        if planner_rows is not None:
+            # A filtered scan cannot outgrow its base table; clamp defensively.
+            return max(1, min(planner_rows, rows)), []
+        return self._filtered_rows(rows, selectivity), gaps
+
+    def _source_scan_estimate(self, scan) -> Optional[int]:
+        """The source planner's row estimate for this filtered scan via the
+        collector's cached EXPLAIN round trip; None when unavailable. Only a
+        PLAIN scan asks: a pushed-aggregate scan's filter is a HAVING over
+        aggregate OUTPUT names, which do not exist as stored columns - the
+        rendered probe would be invalid SQL at the source."""
+        if self.stats_collector is None:
+            return None
+        if scan.group_by or scan.aggregates or scan.grouping_sets:
+            return None
+        return self.stats_collector.scan_planner_estimate(scan)
+
+    def _filtered_rows(self, rows: int, selectivity: Optional[float]) -> int:
+        """Rows after a filter whose selectivity may be UNKNOWN: an unknown
+        predicate reduces nothing (its honest ceiling is 1.0), so the input
+        rows stand as the bound."""
+        if selectivity is None:
+            return rows
+        return max(1, int(rows * selectivity))
 
     def _scan_stats(self, scan: Scan) -> Optional[TableStatistics]:
         """The scan's table statistics covering its filter and group columns."""
@@ -693,34 +794,41 @@ class CostModel:
         """The scan's identity used in provenance entries."""
         return f"{scan.datasource}.{scan.schema_name}.{scan.table_name}"
 
-    def _tracked_base_rows(self, scan, stats) -> Tuple[int, List[str]]:
-        """The raw table row count, defaulting with provenance when unknown."""
+    def _tracked_base_rows(self, scan, stats) -> Tuple[Optional[int], List[str]]:
+        """The raw table row count: a measurement or honestly UNKNOWN (None),
+        never a fabricated constant - a made-up count next to a measured one
+        inverts every larger-side decision downstream."""
         if stats is not None and stats.row_count is not None:
             return stats.row_count, []
-        return DEFAULT_ROW_COUNT, [f"row_count({self._scan_target(scan)})"]
+        return None, [f"row_count({self._scan_target(scan)})"]
 
     def _tracked_scan_groups(self, scan, stats, rows, defaults) -> CardinalityEstimate:
-        """A scan with a pushed-down GROUP BY outputs its group count."""
+        """A scan with a pushed-down GROUP BY outputs its group count: the
+        product of its keys' NDVs bounded by the (filtered) input rows. A key
+        with no NDV makes the product unknown; the input rows remain a valid
+        bound, and both unknown is unknown."""
         groups = 1
         for key in scan.group_by:
             ndv, key_defaults = self._scan_key_ndv(key, stats, rows, scan)
-            groups *= ndv
+            groups = _mul_groups(groups, ndv)
             defaults = defaults + key_defaults
-        # The pushed aggregate's output cardinality: the product of its group
-        # keys' NDVs, never more than the (filtered) input rows.
+        # create, not model_copy: a fresh leaf estimate derived from source
+        # statistics, no prior node to copy. Both fields named.
         return CardinalityEstimate.create(
-            rows=min(rows, groups), defaults_used=defaults
+            rows=_min_rows(rows, groups), defaults_used=defaults
         )
 
-    def _scan_key_ndv(self, key, stats, rows, scan) -> Tuple[int, List[str]]:
-        """One pushed group key's NDV from the scan's own statistics."""
+    def _scan_key_ndv(self, key, stats, rows, scan) -> Tuple[Optional[int], List[str]]:
+        """One pushed group key's NDV from the scan's own statistics, or
+        UNKNOWN with its gap recorded - never a fabricated fraction of the
+        row count."""
         col_stats = None
         if isinstance(key, ColumnRef) and stats is not None:
             col_stats = stats.column_stats.get(key.column)
         if col_stats is None or col_stats.num_distinct is None:
-            fallback = max(1, int(rows * DEFAULT_NDV_FRACTION))
-            return fallback, [f"group_ndv({self._scan_target(scan)}.{self._key_name(key)})"]
-        return max(1, min(col_stats.num_distinct, rows)), []
+            gap = f"group_ndv({self._scan_target(scan)}.{self._key_name(key)})"
+            return None, [gap]
+        return max(1, _min_rows(col_stats.num_distinct, rows)), []
 
     def _key_name(self, key: Expression) -> str:
         """A group key's display name for provenance entries."""
@@ -729,24 +837,29 @@ class CostModel:
         return type(key).__name__
 
     def _estimate_filter_tracked(self, node: Filter) -> CardinalityEstimate:
-        """A standalone Filter: input estimate x tracked selectivity."""
+        """A standalone Filter: input estimate x tracked selectivity. An
+        unknown input stays unknown; an unknown selectivity reduces nothing
+        (its ceiling is 1.0), leaving the input rows as the bound."""
         input_estimate = self.estimate(node.input)
         selectivity, defaults = self._tracked_selectivity(
             node.predicate, None, "filter"
         )
-        rows = max(1, int(input_estimate.rows * selectivity))
-        # The filtered estimate inherits the input's provenance plus whatever
-        # defaults the selectivity of this predicate needed.
+        rows = input_estimate.rows
+        if rows is not None:
+            rows = self._filtered_rows(rows, selectivity)
+        # create, not model_copy: this derives a NEW estimate (filtered rows,
+        # merged provenance) from the input's, not a field tweak on it.
         return CardinalityEstimate.create(
             rows=rows, defaults_used=combine_defaults([input_estimate], defaults)
         )
 
     def _estimate_limit_tracked(self, node: Limit) -> CardinalityEstimate:
-        """LIMIT caps the input estimate at offset + limit."""
+        """LIMIT caps the input estimate at offset + limit. The cap is a
+        literal value, so it bounds the output even over an UNKNOWN input."""
         input_estimate = self.estimate(node.input)
-        rows = min(input_estimate.rows, node.offset + node.limit)
-        # Same provenance as the input; the cap itself never needs a default
-        # (offset and limit are literal values, not estimated quantities).
+        rows = _min_rows(input_estimate.rows, node.offset + node.limit)
+        # create, not model_copy: a NEW capped estimate carrying the input's
+        # provenance forward; both fields are named here.
         return CardinalityEstimate.create(
             rows=rows, defaults_used=input_estimate.defaults_used
         )
@@ -764,18 +877,20 @@ class CostModel:
         if learned is not None:
             # A MEASURED group count (exact, from a pushed single-table GROUP BY
             # the engine ran) replaces the NDV-independence product, which
-            # over-counts a correlated key set. No default: it is not estimated.
+            # over-counts a correlated key set. It stands even over an unknown
+            # input: the group count IS the output, not derived from the input.
             return CardinalityEstimate.create(
-                rows=min(input_estimate.rows, learned),
+                rows=_min_rows(input_estimate.rows, learned),
                 defaults_used=input_estimate.defaults_used,
             )
         groups, defaults = self._tracked_group_count(
             agg.group_by, agg.input, input_estimate.rows
         )
-        # More groups than input rows is impossible; the clamp keeps a wild
-        # NDV product from inflating the estimate past its input.
+        # More groups than input rows is impossible; either side of the clamp
+        # may be UNKNOWN and the other still bounds the output (a known key-NDV
+        # product bounds an unknown input's group count, and vice versa).
         return CardinalityEstimate.create(
-            rows=min(input_estimate.rows, groups),
+            rows=_min_rows(input_estimate.rows, groups),
             defaults_used=combine_defaults([input_estimate], defaults),
         )
 
@@ -800,30 +915,41 @@ class CostModel:
             return f"{input_node.datasource}.{input_node.schema_name}.{input_node.table_name}"
         return subplan_signature(input_node)
 
-    def _tracked_group_count(self, keys, input_node, input_rows) -> Tuple[int, List[str]]:
-        """The product of the group keys' NDVs over the input subtree."""
+    def _tracked_group_count(self, keys, input_node, input_rows):
+        """The product of the group keys' NDVs over the input subtree; a key
+        with no NDV makes the product UNKNOWN (the caller still bounds the
+        output by the input rows when those are known)."""
         groups = 1
         defaults: List[str] = []
         for key in keys:
             ndv, key_defaults = self._group_key_ndv(key, input_node, input_rows)
-            groups *= ndv
+            groups = _mul_groups(groups, ndv)
             defaults.extend(key_defaults)
         return groups, defaults
 
-    def _group_key_ndv(self, key, input_node, input_rows) -> Tuple[int, List[str]]:
-        """One group key's NDV; a non-column or stat-less key uses the default."""
+    def _group_key_ndv(self, key, input_node, input_rows):
+        """One group key's NDV, or UNKNOWN with its gap recorded - never a
+        fabricated fraction of the input rows."""
         if isinstance(key, ColumnRef) and key.table is not None:
             owner = self._find_relation(input_node, key.table)
             ndv = self._owner_column_ndv(owner, key.column)
             if ndv is not None:
-                return max(1, min(ndv, input_rows)), []
-        fallback = max(1, int(input_rows * DEFAULT_NDV_FRACTION))
-        return fallback, [f"group_ndv({self._key_name(key)})"]
+                return max(1, _min_rows(ndv, input_rows)), []
+        return None, [f"group_ndv({self._key_name(key)})"]
 
     def _estimate_join_tracked(self, join: Join) -> CardinalityEstimate:
-        """Join estimate: the NDV formula over equi keys, clamped by type."""
+        """Join estimate: the NDV formula over equi keys, clamped by type. A
+        join over an UNKNOWN side is unknown - a product with an unbounded
+        factor has no bound, and substituting anything would let a guess meet
+        a measurement in the same arithmetic."""
         left = self.estimate(join.left)
         right = self.estimate(join.right)
+        if left.rows is None or right.rows is None:
+            # create, not model_copy: a fresh UNKNOWN estimate merging both
+            # sides' provenance; there is no single node to copy from.
+            return CardinalityEstimate.create(
+                rows=None, defaults_used=combine_defaults([left, right], [])
+            )
         if join.condition is None or join.join_type == JoinType.CROSS:
             # No condition constrains anything: the honest estimate is the
             # full cross product (this is what join ordering must avoid).
@@ -834,7 +960,7 @@ class CostModel:
         inner, defaults = self._tracked_inner_rows(join, left, right)
         rows = self._clamp_join_rows(join.join_type, inner, left.rows, right.rows)
         # The type-clamped estimate inherits both sides' provenance plus the
-        # defaults its own condition's selectivities needed.
+        # gaps its own condition's selectivities hit.
         return CardinalityEstimate.create(
             rows=rows, defaults_used=combine_defaults([left, right], defaults)
         )
@@ -872,14 +998,15 @@ class CostModel:
     def _conjunct_term(self, join, conjunct, left, right):
         """(is_equi, value, defaults): for a cross-side equi key the value is
         its NDV (a denominator term); for anything else it is the tracked
-        selectivity (a multiplier)."""
+        selectivity (a multiplier). Either value may be None (UNKNOWN) - the
+        term then contributes its no-reduction bound downstream."""
         pair = self._equi_key_pair(join, conjunct)
         if pair is None:
             factor, defaults = self._tracked_selectivity(conjunct, None, "join")
             return False, factor, defaults
         left_ndv, left_defaults = self._side_key_ndv(join.left, pair[0], left.rows)
         right_ndv, right_defaults = self._side_key_ndv(join.right, pair[1], right.rows)
-        return True, max(left_ndv, right_ndv), left_defaults + right_defaults
+        return True, max_known_ndv(left_ndv, right_ndv), left_defaults + right_defaults
 
     def _equi_key_pair(self, join, conjunct):
         """(left_ref, right_ref) for a column=column equality across the two
@@ -951,9 +1078,12 @@ class CostModel:
         for child in node.children():
             self._collect_relations(child, qualifier, matches)
 
-    def _side_key_ndv(self, side, ref, side_rows) -> Tuple[int, List[str]]:
+    def _side_key_ndv(self, side, ref, side_rows) -> Tuple[Optional[int], List[str]]:
         """A join key's NDV on its side, clamped to the side's row estimate
-        (a filtered side cannot hold more distinct keys than rows)."""
+        (a filtered side cannot hold more distinct keys than rows). An unknown
+        NDV stays UNKNOWN with its gap recorded - never a fabricated fraction
+        of the rows, which pairs a guess with a measurement in the join
+        denominator (the verified q23 skew)."""
         owner = self._find_relation(side, ref.table)
         if owner is None:
             raise ValueError(
@@ -961,9 +1091,8 @@ class CostModel:
             )
         ndv = self._owner_column_ndv(owner, ref.column)
         if ndv is None:
-            fallback = max(1, int(side_rows * DEFAULT_NDV_FRACTION))
-            return fallback, [f"ndv({self._owner_target(owner, ref)})"]
-        return max(1, min(ndv, side_rows)), []
+            return None, [f"ndv({self._owner_target(owner, ref)})"]
+        return max(1, _min_rows(ndv, side_rows)), []
 
     def _owner_column_ndv(self, owner, column: str) -> Optional[int]:
         """The base NDV of a scan column from source statistics, else None."""
@@ -1041,17 +1170,30 @@ class CostModel:
 
     def _tracked_selectivity(
         self, predicate: Expression, stats: Optional[TableStatistics], target: str
-    ) -> Tuple[float, List[str]]:
-        """Selectivity plus the provenance of every default it used."""
+    ) -> Tuple[Optional[float], List[str]]:
+        """Selectivity from measured statistics, or UNKNOWN (None) with the
+        gap recorded - never a fabricated prior. Callers price an unknown at
+        its no-reduction bound (a selectivity's ceiling is 1.0)."""
         if isinstance(predicate, BinaryOp):
             return self._tracked_binary_selectivity(predicate, stats, target)
         if isinstance(predicate, UnaryOp):
             return self._tracked_unary_selectivity(predicate, stats, target)
         if isinstance(predicate, BetweenExpression):
             return self._tracked_between_selectivity(predicate, stats, target)
-        return DEFAULT_EQ_SELECTIVITY, [
-            f"selectivity({target}:{type(predicate).__name__})"
-        ]
+        if isinstance(predicate, InList):
+            return self._tracked_in_list_selectivity(predicate, stats, target)
+        return None, [f"selectivity({target}:{type(predicate).__name__})"]
+
+    def _tracked_in_list_selectivity(self, in_list, stats, target):
+        """IN over a column with a known NDV keeps len(options)/ndv of the
+        rows (each option matches ~1/ndv, options are distinct); an unknown
+        NDV or a non-column value is UNKNOWN."""
+        col_ref = in_list.value if isinstance(in_list.value, ColumnRef) else None
+        col_stats = self._column_stats_or_none(stats, col_ref)
+        if col_stats is None or not col_stats.num_distinct:
+            name = col_ref.column if col_ref else type(in_list.value).__name__
+            return None, [f"in_selectivity({target}.{name})"]
+        return min(1.0, len(in_list.options) / col_stats.num_distinct), []
 
     def _tracked_between_selectivity(self, between, stats, target):
         """BETWEEN as the equivalent both-bounded conjunction, so the interval
@@ -1079,15 +1221,20 @@ class CostModel:
         if binop.op in _RANGE_OPS:
             return self._tracked_range_selectivity(binop, stats, target)
         if binop.op == BinaryOpType.LIKE:
-            return DEFAULT_LIKE_SELECTIVITY, [f"like_selectivity({target})"]
-        return DEFAULT_EQ_SELECTIVITY, [f"selectivity({target}:{binop.op.value})"]
+            # Pattern selectivity is not derivable from catalog statistics.
+            return None, [f"like_selectivity({target})"]
+        return None, [f"selectivity({target}:{binop.op.value})"]
 
-    def _tracked_or_selectivity(self, binop, stats, target) -> Tuple[float, List[str]]:
-        """OR as the inclusion-exclusion complement of its two sides."""
+    def _tracked_or_selectivity(self, binop, stats, target):
+        """OR as the inclusion-exclusion complement of its two sides; either
+        side UNKNOWN makes the disjunction unknown (the complement of an
+        unknown is unknown)."""
         left_sel, left_defaults = self._tracked_selectivity(binop.left, stats, target)
         right_sel, right_defaults = self._tracked_selectivity(binop.right, stats, target)
-        combined = 1.0 - ((1.0 - left_sel) * (1.0 - right_sel))
-        return combined, left_defaults + right_defaults
+        defaults = left_defaults + right_defaults
+        if left_sel is None or right_sel is None:
+            return None, defaults
+        return 1.0 - ((1.0 - left_sel) * (1.0 - right_sel)), defaults
 
     def _tracked_conjunction(self, predicate, stats, target) -> Tuple[float, List[str]]:
         """An AND tree: both-bounded range pairs on one column combine into a
@@ -1100,7 +1247,10 @@ class CostModel:
         defaults: List[str] = []
         for conjunct in remaining:
             one, one_defaults = self._tracked_selectivity(conjunct, stats, target)
-            selectivity *= one
+            # An UNKNOWN conjunct reduces nothing (its ceiling is 1.0); the
+            # product of the known conjuncts remains a valid upper bound.
+            if one is not None:
+                selectivity *= one
             defaults.extend(one_defaults)
         return selectivity, defaults
 
@@ -1133,20 +1283,23 @@ class CostModel:
         entry["below" if below else "above"].append((point, conjunct))
         return True
 
-    def _tracked_equality_selectivity(self, binop, stats, target) -> Tuple[float, List[str]]:
-        """EQ is 1/ndv when the column's NDV is known; NEQ its complement."""
+    def _tracked_equality_selectivity(self, binop, stats, target):
+        """EQ is 1/ndv when the column's NDV is known; NEQ its complement.
+        The complement of an UNKNOWN is unknown."""
         selectivity, defaults = self._tracked_eq_base(binop, stats, target)
         if binop.op == BinaryOpType.NEQ:
+            if selectivity is None:
+                return None, defaults
             return 1.0 - selectivity, defaults
         return selectivity, defaults
 
-    def _tracked_eq_base(self, binop, stats, target) -> Tuple[float, List[str]]:
-        """The equality selectivity: 1/ndv or the recorded default."""
+    def _tracked_eq_base(self, binop, stats, target):
+        """The equality selectivity: 1/ndv, or UNKNOWN with the gap recorded."""
         col_ref = self._extract_column_ref(binop)
         col_stats = self._column_stats_or_none(stats, col_ref)
         if col_stats is None or col_stats.num_distinct is None:
             name = col_ref.column if col_ref else type(binop).__name__
-            return DEFAULT_EQ_SELECTIVITY, [f"eq_selectivity({target}.{name})"]
+            return None, [f"eq_selectivity({target}.{name})"]
         if col_stats.num_distinct == 0:
             return 0.0, []
         return min(1.0, 1.0 / col_stats.num_distinct), []
@@ -1157,11 +1310,12 @@ class CostModel:
             return None
         return stats.column_stats.get(col_ref.column)
 
-    def _tracked_range_selectivity(self, binop, stats, target) -> Tuple[float, List[str]]:
-        """min/max interpolation when possible, else the range default."""
+    def _tracked_range_selectivity(self, binop, stats, target):
+        """min/max interpolation when possible, else UNKNOWN with the gap
+        recorded."""
         fraction = self._range_fraction(binop, stats)
         if fraction is None:
-            return DEFAULT_RANGE_SELECTIVITY, [f"range_selectivity({target})"]
+            return None, [f"range_selectivity({target})"]
         return fraction, []
 
     def _range_fraction(self, binop, stats) -> Optional[float]:
@@ -1189,29 +1343,36 @@ class CostModel:
             return binop.right, left_value, binop.op not in below_ops
         return None, None, False
 
-    def _tracked_unary_selectivity(self, unop, stats, target) -> Tuple[float, List[str]]:
-        """NOT complements; IS NULL reads the null fraction when known."""
+    def _tracked_unary_selectivity(self, unop, stats, target):
+        """NOT complements (unknown stays unknown); IS NULL reads the null
+        fraction when known."""
         if unop.op == UnaryOpType.NOT:
             inner, defaults = self._tracked_selectivity(unop.operand, stats, target)
+            if inner is None:
+                return None, defaults
             return 1.0 - inner, defaults
         if unop.op in (UnaryOpType.IS_NULL, UnaryOpType.IS_NOT_NULL):
             return self._tracked_null_selectivity(unop, stats, target)
-        return DEFAULT_EQ_SELECTIVITY, [f"selectivity({target}:{unop.op.value})"]
+        return None, [f"selectivity({target}:{unop.op.value})"]
 
-    def _tracked_null_selectivity(self, unop, stats, target) -> Tuple[float, List[str]]:
-        """IS NULL from the column's null fraction; IS NOT NULL complements."""
+    def _tracked_null_selectivity(self, unop, stats, target):
+        """IS NULL from the column's null fraction; IS NOT NULL complements.
+        The complement of an UNKNOWN is unknown."""
         fraction, defaults = self._tracked_null_fraction(unop, stats, target)
         if unop.op == UnaryOpType.IS_NOT_NULL:
+            if fraction is None:
+                return None, defaults
             return 1.0 - fraction, defaults
         return fraction, defaults
 
-    def _tracked_null_fraction(self, unop, stats, target) -> Tuple[float, List[str]]:
-        """The operand column's null fraction, or the recorded default."""
+    def _tracked_null_fraction(self, unop, stats, target):
+        """The operand column's null fraction, or UNKNOWN with the gap
+        recorded."""
         col_ref = unop.operand if isinstance(unop.operand, ColumnRef) else None
         col_stats = self._column_stats_or_none(stats, col_ref)
         if col_stats is None:
             name = col_ref.column if col_ref else type(unop.operand).__name__
-            return DEFAULT_NULL_FRACTION, [f"null_fraction({target}.{name})"]
+            return None, [f"null_fraction({target}.{name})"]
         return col_stats.null_fraction, []
 
     def estimate_physical_plan_cost(self, plan: PhysicalPlanNode) -> float:

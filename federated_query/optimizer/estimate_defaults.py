@@ -1,48 +1,28 @@
-"""Named estimation defaults and the provenance-carrying cardinality estimate.
+"""The provenance-carrying cardinality estimate and its combination helpers.
 
-The cost-based optimizer estimates cardinalities from statistics fetched from
-the data sources' catalogs. When a statistic is missing (a table never
-ANALYZEd, a connector without NDV support), the estimator falls back to one of
-the NAMED defaults below and records WHICH default fed WHICH object in the
-estimate's ``defaults_used`` provenance list (e.g.
-``"ndv(duck.main.lineitem.l_suppkey)"``). EXPLAIN surfaces that list, so a
-plan built on guesses is never silently indistinguishable from a plan built on
-real statistics.
+A statistic feeding an estimate is either a MEASUREMENT with provenance (the
+source catalog, the learned catalog, a probe) or it is UNKNOWN - never a
+fabricated constant. A missing base row count makes the estimate's ``rows``
+None and unknown PROPAGATES through derived estimates; a missing NDV or an
+inestimable predicate contributes its honest BOUND (no reduction) instead of a
+mid-scale guess. Either way the gap is recorded in ``defaults_used`` (e.g.
+``"ndv(duck.main.lineitem.l_suppkey)"``), so EXPLAIN can show exactly which
+parts of a plan were costed from real statistics and which from bounds - and
+decision points can refuse to trust a gap-fed estimate.
+
+The fabricated constants that used to live here (DEFAULT_ROW_COUNT = 1000,
+DEFAULT_NDV_FRACTION and the selectivity priors) are deliberately GONE: a
+fabricated row count next to a measured one inverts every larger-side decision
+(the verified q39 cold-source regression), and a real row count paired with a
+fabricated NDV skews exactly the ratios that pick join order (q23).
 """
 
-from typing import List
+from typing import List, Optional
 
 from pydantic import Field
 
 from federated_query.model import StateModel
 
-
-# Row count assumed for a table whose source reports no row count (e.g. a
-# PostgreSQL table before its first ANALYZE reports reltuples = -1).
-DEFAULT_ROW_COUNT = 1000
-
-# Row count assumed for a join atom that is not a plain table scan (an opaque
-# subtree such as a CTE reference) and therefore has no catalog statistics.
-DEFAULT_ATOM_ROWS = 1000
-
-# NDV assumed as a fraction of row count when a column's distinct count is
-# unknown: ndv = max(1, rows * DEFAULT_NDV_FRACTION).
-DEFAULT_NDV_FRACTION = 0.1
-
-# Selectivity of an equality predicate whose column NDV is unknown.
-DEFAULT_EQ_SELECTIVITY = 0.1
-
-# Selectivity of a range predicate (<, <=, >, >=) when min/max interpolation
-# is not possible (missing bounds or a non-numeric column).
-DEFAULT_RANGE_SELECTIVITY = 0.33
-
-# Selectivity of a LIKE predicate; pattern selectivity is not estimable from
-# catalog statistics.
-DEFAULT_LIKE_SELECTIVITY = 0.1
-
-# Null fraction assumed for IS NULL when the column's null statistics are
-# unknown.
-DEFAULT_NULL_FRACTION = 0.05
 
 # Relative cost of one row CROSSING A SOURCE BOUNDARY versus one row of
 # coordinator join output (C_out). The join-order enumerator adds
@@ -56,10 +36,30 @@ TRANSFER_WEIGHT = 1.0
 def apply_conjunct_term(is_equi, value, denom, selectivity, equi_count):
     """Fold one join conjunct into the running estimate terms: an equi key
     multiplies the NDV denominator and counts toward the composite cap; a
-    non-equi conjunct multiplies the selectivity."""
+    non-equi conjunct multiplies the selectivity. A None value is an UNKNOWN
+    statistic: the term contributes its honest bound (no reduction - the
+    denominator's floor is 1, a selectivity's ceiling is 1.0) instead of a
+    fabricated factor; an unknown equi key still counts toward the composite
+    cap (it IS a key, and the cap can only widen the bound, never shrink it)."""
     if is_equi:
+        if value is None:
+            return denom, selectivity, equi_count + 1
         return denom * value, selectivity, equi_count + 1
+    if value is None:
+        return denom, selectivity, equi_count
     return denom, selectivity * value, equi_count
+
+
+def max_known_ndv(left, right) -> Optional[int]:
+    """The larger of two join-key NDVs, ignoring UNKNOWN (None) sides: the
+    known side's domain is a valid denominator on its own - the same
+    containment assumption `useless_key_reduction` applies. Both unknown is
+    unknown, and the equi term then prices at its no-reduction bound."""
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return max(left, right)
 
 
 def cap_composite_denom(denom, equi_count, left_rows, right_rows):
@@ -131,21 +131,25 @@ def useless_key_reduction(build_keys_ndv, build_rows, probe_column_ndv):
 
 
 class CardinalityEstimate(StateModel):
-    """A row-count estimate plus the provenance of every default that fed it.
+    """A row-count estimate plus the provenance of every statistics gap in it.
 
-    ``defaults_used`` entries name both the default and the object it was
-    applied to, so EXPLAIN can show exactly which parts of a plan were costed
-    from real statistics and which from documented guesses.
+    ``rows`` is None when the estimate is UNKNOWN - a base row count the
+    source, the learned catalog and a probe all lack; unknown propagates to
+    every estimate derived from this one. A non-None ``rows`` may still rest
+    on gaps (an unknown NDV or an inestimable predicate priced at its
+    no-reduction bound); ``defaults_used`` names each gap and the object it
+    applied to, so EXPLAIN surfaces them and decision points can refuse to
+    treat a gap-fed estimate as a known size.
     """
 
-    rows: int = Field(ge=0)
+    rows: Optional[int] = Field(ge=0)
     defaults_used: List[str]
 
     @classmethod
     def create(
         cls,
         *,
-        rows: int,
+        rows: Optional[int],
         defaults_used: List[str],
     ) -> "CardinalityEstimate":
         """Sanctioned fresh-construction path for CardinalityEstimate.

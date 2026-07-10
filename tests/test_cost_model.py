@@ -739,9 +739,11 @@ class TestProvenanceEstimate:
         estimate = model.estimate(join)
         assert estimate.rows == 1_500_000 * 150_000
 
-    def test_missing_row_count_default_recorded(self, cost_config):
+    def test_missing_row_count_is_unknown_with_provenance(self, cost_config):
         """A table whose source honestly reports row_count=None (never
-        analyzed) estimates from DEFAULT_ROW_COUNT and says so."""
+        analyzed) estimates as UNKNOWN (rows=None) with the gap recorded -
+        never a fabricated constant, which would invert every larger-side
+        decision against a measured table."""
         stats = _tpch_like_stats()
         stats[("public", "unknown_t")] = TableStatistics(
             row_count=None, total_size_bytes=0, column_stats={}
@@ -753,7 +755,7 @@ class TestProvenanceEstimate:
             columns=["x"],
         )
         estimate = model.estimate(scan)
-        assert estimate.rows == 1000
+        assert estimate.rows is None
         assert any("unknown_t" in entry for entry in estimate.defaults_used)
 
     def test_unknown_ndv_defaults_with_provenance(self, cost_config):

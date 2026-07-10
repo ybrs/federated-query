@@ -402,18 +402,21 @@ class PhysicalPlanner:
 
     def _scan_estimated_rows(self, scan: Scan) -> Optional[int]:
         """A scan's row estimate for reduction orientation: its own annotation
-        (from join reordering), else a non-defaulted cost estimate, else None.
+        (from join reordering), else the cost estimate, else None (UNKNOWN).
         Annotating EVERY scan - not only a join's immediate children - lets the
         reduction orient a join whose big side is wrapped in a derived table or
         union (its leaf scans still carry a size the orientation can descend to).
-        A defaulted estimate stays None: an untrusted guess must not masquerade
-        as a known size and flip a good orientation."""
+        A gap-fed estimate is used: with fabricated constants gone, a gap can
+        only price at its no-reduction bound, so the value is an UPPER BOUND -
+        and a side whose upper bound is smaller than the other side's measured
+        size is provably the smaller side (q65: date_dim's partially-priced
+        BETWEEN still bounds it far under the fact, which must stay the reduced
+        side). Only truly UNKNOWN (None) abstains."""
         if scan.estimated_rows is not None:
             return scan.estimated_rows
         if self.cost_model is None:
             return None
-        estimate = self.cost_model.estimate(scan)
-        return None if estimate.defaults_used else estimate.rows
+        return self.cost_model.estimate(scan).rows
 
     def _plan_filter(self, filter_node: Filter) -> PhysicalFilter:
         """Plan a filter node."""
@@ -706,7 +709,10 @@ class PhysicalPlanner:
         return join.model_copy(update=updates)
 
     def _annotated_scan(self, node, condition) -> Optional[Scan]:
-        """The side as an estimate+NDV-annotated Scan, or None to keep it."""
+        """The side as an estimate+NDV-annotated Scan, or None to keep it.
+        The size uses the SAME policy as _scan_estimated_rows: a gap-fed
+        value is an upper BOUND and is stamped; only a truly UNKNOWN size
+        stays None for the orientation reading the annotation."""
         if not isinstance(node, Scan) or node.estimated_rows is not None:
             return None
         ndv_map = {}
@@ -714,8 +720,11 @@ class PhysicalPlanner:
             ndv = self.cost_model.column_ndv(node, ref)
             if ndv is not None:
                 ndv_map[ref.column] = ndv
+        estimated = self._scan_estimated_rows(node)
+        if estimated is None and not ndv_map:
+            return None
         return node.model_copy(update={
-            "estimated_rows": self.cost_model.estimate(node).rows,
+            "estimated_rows": estimated,
             "column_ndv": ndv_map or None,
         })
 
