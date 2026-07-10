@@ -53,6 +53,7 @@ from ..plan.logical import (
     transform_children,
 )
 from .decorrelation import _replace_column_refs
+from .dim_shipping import SHIP_ROW_BUDGET
 from .rules import OptimizationRule
 from .subplan_signature import scan_qualifier
 
@@ -220,6 +221,8 @@ class EagerAggregationRule(OptimizationRule):
     def _evaluate_subset(self, agg, scans, conjuncts, peeled) -> Optional[Tuple]:
         """(collapse ratio, rewritten tree) for one peel subset, or None when
         the subset's shape or cost declines."""
+        if not self._rescues_unshippable(peeled):
+            return None
         split = self._partition_conjuncts(conjuncts, peeled)
         if split is None:
             return None
@@ -235,6 +238,20 @@ class EagerAggregationRule(OptimizationRule):
         if ratio is None or ratio > EAGER_COLLAPSE_MAX_RATIO:
             return None
         return ratio, self._build_final(agg, partial, peeled, lifted)
+
+    def _rescues_unshippable(self, peeled):
+        """Eager aggregation exists to RESCUE aggregates full dim-shipping
+        cannot collapse: at least one peeled dim must exceed the ship budget
+        (q04's 500k-row customer). When every peeled dim is shippable, the
+        FULL collapse dominates - one island crossing only the aggregate's
+        output beats a partial island crossing partial rows plus coordinator
+        joins (measured: q21 80 -> 214ms when eager pre-empted its full
+        ship) - so the rule steps aside and lets dim shipping have it."""
+        for scan in peeled:
+            estimate = self.cost_model.estimate(scan)
+            if estimate.rows is None or estimate.rows > SHIP_ROW_BUDGET:
+                return True
+        return False
 
     def _partition_conjuncts(self, conjuncts, peeled):
         """(conjuncts internal to S, conjuncts lifted above the partial).
