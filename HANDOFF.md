@@ -368,7 +368,12 @@ DONE:
   deferred: the optimizer manufactures/copies literals, so positional
   constant substitution is unsound.
 
-NEXT - EAGER AGGREGATION (eager-agg-plan.md, committed): rewrite
+EAGER AGGREGATION - LANDED 2026-07-10 (5716b64): q04 4184->1214ms (3.4x),
+q11 2264->754ms, q74 1418->512ms at SF10; partials SHIP. Cost gate prices
+against the LARGEST BASE SCAN (join estimates under-count, see plan doc);
+estimator gained literal-eq exactness + filter VALUE CAPS on group-key NDVs.
+Kill switch FEDQ_EAGER_AGG=0. Tests: tests/test_eager_aggregation.py.
+Original plan text follows: rewrite
 Aggregate-over-join into Final over Join(dims, Partial) so dim shipping
 collapses the PARTIAL at the fact's source (compose, don't extend
 dim_shipping). q04 reads 11M raw fact rows that become ~850k partials;

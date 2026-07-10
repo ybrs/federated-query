@@ -91,6 +91,22 @@ subquery atom). The rewrite must preserve pushdown's normal form so the
 fixpoint stays stable; the partial's subtree keeps its folded scan filters
 untouched.
 
+## STATUS 2026-07-10: Phase A LANDED (5716b64 + lint follow-up)
+
+Measured at SF10 (FEDQ_EAGER_AGG=0 A/B): q04 4184 -> 1214ms (3.4x),
+q11 2264 -> 754ms (3.0x), q74 1418 -> 512ms (2.8x); the partials SHIP and
+the fact side collapses to islands. Two implementation findings beyond the
+plan, both now in the code:
+- The cost gate compares partial groups against the LARGEST BASE SCAN in S,
+  NOT the S join estimate: the join estimate under-counts through
+  containment asymmetries (measured 304k of a true 10.9M) and would veto
+  exactly the rewrites that matter - the same max-base reasoning
+  single_source_pushdown._root_estimate documents.
+- Two estimator improvements the gate exposed: literal-vs-literal equality
+  is exactly computable (union-arm tags, no gap), and a filter's VALUE CAP
+  bounds a group key's NDV (d_year IN (2001,2002) allows two years) -
+  keeping the NDV product honest for filtered dims.
+
 ## Phases
 
 - A. The rule for the single-fact shape (q04/q11/q74: one fact, one shipped
