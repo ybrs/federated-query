@@ -47,16 +47,22 @@ probes 850k partial rows, not 11M.
 2. Aggregate INPUT expressions reference ONLY cols(S) - an expression mixing
    fact and decorating-dim columns cannot pre-aggregate.
 3. Every decorating join D_i is INNER and equi, and its key is UNIQUE on the
-   D_i side, PROVEN from statistics: ndv(key) == row_count(D_i) with BOTH
-   measured (source-ANALYZEd, probed, or learned - the honest-unknowns
-   regime guarantees these are measurements, never fabricated). Without the
-   uniqueness proof a partial row could join N dim rows and the merged SUM
-   would multiply-count - the rule DECLINES, never guesses. (pg PKs satisfy
-   this via n_distinct = -1.00 -> ndv == reltuples; the probe measures exact
-   NDVs for small tables; DuckDB's approx NDV needs the == check against
-   row_count with a small tolerance - NO: approx NDV must NOT prove
-   uniqueness. Only an EXACT source: pg n_distinct/probe count(distinct)/
-   learned exact NDV qualifies. An approximate NDV abstains.)
+   D_i side, proven from DECLARED CONSTRAINTS ONLY (PRIMARY KEY / UNIQUE
+   from the source's information schema - truths the source ENFORCES).
+   NEVER from statistics: a wrong uniqueness call multiply-counts the merged
+   SUM, i.e. changes the ANSWER, and the standing invariant is that
+   statistics only ever steer speed. Even an exact-looking measured NDV is a
+   snapshot, not a guarantee (a row inserted after measurement breaks it);
+   pg's n_distinct is itself sampled. Without a declared constraint the rule
+   DECLINES. PREREQUISITES this creates:
+   - connectors fetch constraint metadata (pg information_schema
+     key_column_usage/table_constraints; duckdb_constraints()) into the
+     existing ColumnMetadata.primary_key (present, currently never
+     populated) plus a unique flag;
+   - the TPC-DS loader declares dimension PKs (the spec defines them; the
+     loaded databases currently declare NONE, so q04 would decline today) -
+     idempotent ALTER TABLE ADD PRIMARY KEY on the dims, in
+     load_postgres.py and as a one-time migration for existing databases.
 4. INNER-join drop semantics are preserved by construction: a partial row
    whose key misses D_i drops exactly as its raw rows would have.
 5. Two customers sharing identical GROUP BY attribute tuples still merge
