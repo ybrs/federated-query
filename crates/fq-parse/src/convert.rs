@@ -6,18 +6,22 @@
 //! clause by clause in the Python order: FROM -> WHERE -> GROUP BY -> HAVING ->
 //! SELECT -> ORDER BY -> LIMIT.
 //!
-//! Coverage: base tables + left-deep JOINs + derived tables in FROM, catalog-
-//! driven star expansion, WHERE, GROUP BY + the five aggregates, HAVING, ORDER
-//! BY, LIMIT/OFFSET, DISTINCT, VALUES, and the binary set operations. CTEs (WITH)
-//! and comma joins still raise.
+//! Coverage: base tables + left-deep JOINs + derived tables + CTE references in
+//! FROM, non-recursive WITH, catalog-driven star expansion, WHERE, GROUP BY + the
+//! five aggregates, HAVING, ORDER BY, LIMIT/OFFSET, DISTINCT, VALUES, and the
+//! binary set operations. WITH RECURSIVE, comma joins, and typed scalar functions
+//! still raise.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 use fq_catalog::Catalog;
 use fq_plan::expr::NullsOrder;
 use fq_plan::{
-    Aggregate, ColumnRef, Expr, Filter, Join, JoinType, Limit, LogicalPlan, Projection, Scan,
-    SetOpKind, SetOperation, Sort, SubqueryScan, Values,
+    Aggregate, ColumnRef, Cte, CteRef, Expr, Filter, Join, JoinType, Limit, LogicalPlan,
+    Projection, Scan, SetOpKind, SetOperation, Sort, SubqueryScan, Values,
 };
-use polyglot_sql::expressions::{Expression, JoinKind, Ordered, Select, TableRef};
+use polyglot_sql::expressions::{Expression, JoinKind, Ordered, Select, TableRef, With};
 
 use crate::error::ParseError;
 
@@ -43,12 +47,19 @@ struct FromTable {
 /// The recursive AST -> logical-plan converter.
 pub struct Converter<'a> {
     catalog: &'a Catalog,
+    /// In-scope CTE names -> their output column lists. A bare FROM reference to
+    /// one becomes a `CteRef`; star expansion over it uses the recorded columns.
+    /// Interior mutability so the `&self` descent can push/pop a WITH's names.
+    ctes: RefCell<HashMap<String, Vec<String>>>,
 }
 
 impl<'a> Converter<'a> {
     /// A converter over `catalog` (used for star expansion).
     pub fn new(catalog: &'a Catalog) -> Self {
-        Self { catalog }
+        Self {
+            catalog,
+            ctes: RefCell::new(HashMap::new()),
+        }
     }
 
     /// Convert a query expression (SELECT, a set operation, a parenthesized
@@ -122,14 +133,62 @@ impl<'a> Converter<'a> {
         Ok(LogicalPlan::Values(Values { rows, output_names }))
     }
 
-    /// Convert a SELECT into a logical plan.
+    /// Convert a SELECT into a logical plan, handling a leading WITH first.
     fn select(&self, select: &Select) -> Result<LogicalPlan, ParseError> {
         reject_unsupported_clauses(select)?;
+        match &select.with {
+            Some(with) => self.select_with(with, select),
+            None => self.select_body(select),
+        }
+    }
+
+    /// The SELECT clause pipeline (FROM -> WHERE -> projection -> ORDER -> LIMIT),
+    /// with any WITH already bound into scope.
+    fn select_body(&self, select: &Select) -> Result<LogicalPlan, ParseError> {
         let (from, from_tables) = self.build_from(select)?;
         let filtered = self.apply_where(from, select)?;
         let projected = self.apply_projection(filtered, select, &from_tables)?;
         let sorted = self.apply_order_by(projected, select)?;
         apply_limit(sorted, select)
+    }
+
+    /// Bind a WITH's CTEs into scope, build the body, and wrap it in nested `Cte`
+    /// nodes (first CTE outermost). CTE names are pushed before any body is built
+    /// so a CTE may reference an earlier one; they are popped afterward.
+    fn select_with(&self, with: &With, select: &Select) -> Result<LogicalPlan, ParseError> {
+        if with.recursive {
+            return Err(ParseError::Unsupported("WITH RECURSIVE".to_string()));
+        }
+        let mut definitions = Vec::with_capacity(with.ctes.len());
+        for cte in &with.ctes {
+            let name = cte.alias.name.clone();
+            let body = self.query(&cte.this)?;
+            let columns: Vec<String> = if cte.columns.is_empty() {
+                body.schema()
+            } else {
+                cte.columns.iter().map(|ident| ident.name.clone()).collect()
+            };
+            self.ctes.borrow_mut().insert(name.clone(), columns.clone());
+            definitions.push((name, body, cte.columns.is_empty(), columns));
+        }
+        let mut plan = self.select_body(select)?;
+        for (name, body, inferred, columns) in definitions.iter().rev() {
+            plan = LogicalPlan::Cte(Cte {
+                name: name.clone(),
+                cte_plan: Box::new(body.clone()),
+                child: Box::new(plan),
+                recursive: false,
+                column_names: if *inferred {
+                    None
+                } else {
+                    Some(columns.clone())
+                },
+            });
+        }
+        for (name, ..) in &definitions {
+            self.ctes.borrow_mut().remove(name);
+        }
+        Ok(plan)
     }
 
     /// Build the FROM tree (base table then each JOIN folded left-deep) and the
@@ -159,26 +218,48 @@ impl<'a> Converter<'a> {
         tables: &mut Vec<FromTable>,
     ) -> Result<LogicalPlan, ParseError> {
         match item {
-            Expression::Table(table) => {
-                let key = table_key(table);
-                tables.push(FromTable {
-                    key: key.clone(),
-                    columns: ColumnSource::Catalog {
-                        datasource: table.catalog.as_ref().map(|ident| ident.name.clone()),
-                        schema: table.schema.as_ref().map(|ident| ident.name.clone()),
-                        table: table.name.name.clone(),
-                    },
-                });
-                Ok(LogicalPlan::Scan(Box::new(scan_from_table(
-                    select, table, &key,
-                ))))
-            }
+            Expression::Table(table) => Ok(self.table_or_cte_ref(select, table, tables)),
             Expression::Subquery(subquery) => self.derived_table(subquery, tables),
             other => Err(ParseError::Unsupported(format!(
                 "FROM/JOIN {}",
                 other.variant_name()
             ))),
         }
+    }
+
+    /// A bare table reference that names an in-scope CTE becomes a `CteRef`;
+    /// otherwise it is a base-table `Scan`.
+    fn table_or_cte_ref(
+        &self,
+        select: &Select,
+        table: &TableRef,
+        tables: &mut Vec<FromTable>,
+    ) -> LogicalPlan {
+        let key = table_key(table);
+        let unqualified = table.catalog.is_none() && table.schema.is_none();
+        if unqualified {
+            if let Some(columns) = self.ctes.borrow().get(&table.name.name).cloned() {
+                tables.push(FromTable {
+                    key: key.clone(),
+                    columns: ColumnSource::Explicit(columns.clone()),
+                });
+                return LogicalPlan::CteRef(CteRef {
+                    name: table.name.name.clone(),
+                    alias: table.alias.as_ref().map(|ident| ident.name.clone()),
+                    columns: Some(columns_for_table(select, &key)),
+                    output_names: Some(columns),
+                });
+            }
+        }
+        tables.push(FromTable {
+            key: key.clone(),
+            columns: ColumnSource::Catalog {
+                datasource: table.catalog.as_ref().map(|ident| ident.name.clone()),
+                schema: table.schema.as_ref().map(|ident| ident.name.clone()),
+                table: table.name.name.clone(),
+            },
+        });
+        LogicalPlan::Scan(Box::new(scan_from_table(select, table, &key)))
     }
 
     /// A derived table `(SELECT ...) AS alias`: convert the inner query and wrap
@@ -460,7 +541,6 @@ fn apply_limit(input: LogicalPlan, select: &Select) -> Result<LogicalPlan, Parse
 /// and so are absent here.
 fn reject_unsupported_clauses(select: &Select) -> Result<(), ParseError> {
     let unsupported = [
-        (select.with.is_some(), "WITH (CTE)"),
         (select.qualify.is_some(), "QUALIFY"),
         (select.prewhere.is_some(), "PREWHERE"),
         (!select.lateral_views.is_empty(), "LATERAL VIEW"),

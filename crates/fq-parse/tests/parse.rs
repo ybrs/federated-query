@@ -424,7 +424,23 @@ fn values_clause() {
 }
 
 #[test]
-fn cte_still_raises() {
-    let result = parse("WITH c AS (SELECT a FROM t) SELECT a FROM c");
+fn cte_builds_cte_node_and_ref() {
+    // WITH c AS (SELECT a FROM t) SELECT a FROM c
+    let plan = parse("WITH c AS (SELECT a FROM t) SELECT a FROM c").unwrap();
+    let LogicalPlan::Cte(cte) = plan else {
+        panic!("expected Cte, got {plan:?}");
+    };
+    assert_eq!(cte.name, "c");
+    assert!(matches!(cte.cte_plan.as_ref(), LogicalPlan::Projection(_)));
+    // The main body references the CTE by name (a CteRef, not a base Scan).
+    let LogicalPlan::Projection(main) = cte.child.as_ref() else {
+        panic!("expected Projection body");
+    };
+    assert!(matches!(main.input.as_ref(), LogicalPlan::CteRef(_)));
+}
+
+#[test]
+fn recursive_cte_raises() {
+    let result = parse("WITH RECURSIVE c AS (SELECT 1 AS n) SELECT n FROM c");
     assert!(matches!(result, Err(ParseError::Unsupported(_))));
 }
