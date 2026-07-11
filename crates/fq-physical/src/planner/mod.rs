@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use fq_catalog::Catalog;
+use fq_catalog::{Catalog, StatsCatalog};
 use fq_optimize::{group_column_names, subplan_signature, CostModel};
 use fq_plan::expr::Expr;
 use fq_plan::logical::{
@@ -54,6 +54,15 @@ pub struct PhysicalPlanner {
     /// CTE name -> its materializing producer, registered while a cross-source
     /// CTE's child is planned so each CteRef resolves to a shared scan.
     cte_producers: HashMap<String, PhysicalCte>,
+    /// The learned-stats catalog dim shipping reads MEASURED group counts from
+    /// (the collapse override). Held here because the cost model owns its
+    /// `StatisticsCollector` privately and exposes no accessor - the same
+    /// `Arc<StatsCatalog>` the collector holds is handed to the planner too. None
+    /// disables the measured override; the width heuristic then decides alone.
+    stats_catalog: Option<Arc<StatsCatalog>>,
+    /// Freshness bound (seconds) for a learned group count; None = no bound.
+    /// Matches the collector's `learned_ttl_seconds` so both read the same slot.
+    learned_ttl_seconds: Option<i64>,
 }
 
 impl PhysicalPlanner {
@@ -69,7 +78,26 @@ impl PhysicalPlanner {
             shipping_enabled: true,
             ship_counter: 0,
             cte_producers: HashMap::new(),
+            stats_catalog: None,
+            learned_ttl_seconds: None,
         }
+    }
+
+    /// Wire the learned-stats catalog (and its freshness bound) dim shipping reads
+    /// measured group counts from. Pass the SAME `Arc<StatsCatalog>` and TTL the
+    /// cost model's statistics collector holds, so the shipping gate reads the slot
+    /// the cost model writes and reads. Absent = the measured collapse override is
+    /// disabled and the width heuristic decides alone (still correct, just less
+    /// self-correcting).
+    #[must_use]
+    pub fn with_learned_stats(
+        mut self,
+        stats_catalog: Option<Arc<StatsCatalog>>,
+        learned_ttl_seconds: Option<i64>,
+    ) -> Self {
+        self.stats_catalog = stats_catalog;
+        self.learned_ttl_seconds = learned_ttl_seconds;
+        self
     }
 
     /// Convert a logical plan to a physical plan. Resets the per-query ship
@@ -114,9 +142,7 @@ impl PhysicalPlanner {
     // ---- helpers exposed to the sibling rules (all pub(crate)) ---------------
 
     /// A unique temp-table name for a shipped dimension within this query.
-    // M3 seam (SPEC-dim-shipping.md section 8): dim shipping is the only caller;
-    // held now so the stub's replacement matches the signature without churn.
-    #[allow(dead_code)]
+    // M3 seam (SPEC-dim-shipping.md section 8): dim shipping is the only caller.
     pub(crate) fn next_ship_name(&mut self) -> String {
         let name = format!("__fedq_ship_{}", self.ship_counter);
         self.ship_counter += 1;
@@ -126,7 +152,6 @@ impl PhysicalPlanner {
     /// Plan a subtree with dim shipping suppressed (the pure cross-source seed
     /// plan, also the decline path). Saves/restores the flag around the call.
     // M3 seam (SPEC-dim-shipping.md section 8): dim shipping is the only caller.
-    #[allow(dead_code)]
     pub(crate) fn plan_without_shipping(
         &mut self,
         node: &LogicalPlan,
@@ -151,6 +176,17 @@ impl PhysicalPlanner {
     /// Read access to the same-source pushdown, for dim shipping's island probe.
     pub(crate) fn single_source(&self) -> &SingleSourcePushdown {
         &self.single_source
+    }
+
+    /// The learned-stats catalog handle (cloned Arc), for dim shipping's measured
+    /// collapse override. None when no learned catalog is wired.
+    pub(crate) fn stats_catalog(&self) -> Option<Arc<StatsCatalog>> {
+        self.stats_catalog.clone()
+    }
+
+    /// The learned-stats freshness bound (seconds), for the measured group read.
+    pub(crate) fn learned_ttl_seconds(&self) -> Option<i64> {
+        self.learned_ttl_seconds
     }
 
     /// Collect every base `Scan` in a subtree (CTE references excluded, since a

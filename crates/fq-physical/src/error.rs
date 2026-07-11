@@ -54,4 +54,11 @@ pub enum PhysicalError {
     /// subquery reaching emit is a decorrelation bug), surfaced here verbatim.
     #[error(transparent)]
     SingleSource(#[from] EmitError),
+
+    /// A learned-stats catalog read failed while a dim-shipping gate consulted a
+    /// measured group count. Propagated, never mapped to a decline: a catalog
+    /// FAULT is not the same as a catalog that recorded nothing (the latter is an
+    /// `Ok(None)` decline; this is a real error the caller must see).
+    #[error(transparent)]
+    Stats(#[from] fq_catalog::StatsError),
 }
