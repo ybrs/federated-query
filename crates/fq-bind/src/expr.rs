@@ -14,9 +14,22 @@ use crate::error::BindError;
 
 impl Binder<'_> {
     /// Bind one expression against the current scope chain.
-    pub(crate) fn bind_expr(&self, expr: &Expr) -> Result<Expr, BindError> {
+    pub(crate) fn bind_expr(&mut self, expr: &Expr) -> Result<Expr, BindError> {
         match expr {
-            Expr::Column(column) => self.resolve_in_scopes(column),
+            Expr::Column(column) => {
+                // A bare reference to an output alias (HAVING/ORDER BY over a
+                // Projection/Aggregate) resolves to that output, not a base column.
+                if column.table.is_none() {
+                    if let Some(data_type) = self.output_alias_type(&column.column) {
+                        return Ok(Expr::Column(fq_plan::ColumnRef::new(
+                            None,
+                            column.column.clone(),
+                            Some(data_type),
+                        )));
+                    }
+                }
+                self.resolve_in_scopes(column)
+            }
             Expr::Literal { .. } | Expr::Interval { .. } => Ok(expr.clone()),
             Expr::BinaryOp { op, left, right } => Ok(Expr::BinaryOp {
                 op: *op,
@@ -95,19 +108,57 @@ impl Binder<'_> {
             Expr::Subquery { .. }
             | Expr::Exists { .. }
             | Expr::InSubquery { .. }
-            | Expr::QuantifiedComparison { .. } => {
-                Err(BindError::Unsupported("subquery expression".to_string()))
-            }
+            | Expr::QuantifiedComparison { .. } => self.bind_subquery_expr(expr),
+        }
+    }
+
+    /// Bind a subquery-bearing expression: its subplan binds with the enclosing
+    /// scopes visible (correlated refs resolve), and the outer operand (an IN
+    /// value, a quantified left side) binds normally.
+    fn bind_subquery_expr(&mut self, expr: &Expr) -> Result<Expr, BindError> {
+        match expr {
+            Expr::Subquery { subquery } => Ok(Expr::Subquery {
+                subquery: Box::new(self.bind_subplan(subquery)?),
+            }),
+            Expr::Exists { subquery, negated } => Ok(Expr::Exists {
+                subquery: Box::new(self.bind_subplan(subquery)?),
+                negated: *negated,
+            }),
+            Expr::InSubquery {
+                value,
+                subquery,
+                negated,
+            } => Ok(Expr::InSubquery {
+                value: Box::new(self.bind_expr(value)?),
+                subquery: Box::new(self.bind_subplan(subquery)?),
+                negated: *negated,
+            }),
+            Expr::QuantifiedComparison {
+                operator,
+                quantifier,
+                left,
+                subquery,
+            } => Ok(Expr::QuantifiedComparison {
+                operator: *operator,
+                quantifier: *quantifier,
+                left: Box::new(self.bind_expr(left)?),
+                subquery: Box::new(self.bind_subplan(subquery)?),
+            }),
+            _ => unreachable!("bind_subquery_expr called on a non-subquery expression"),
         }
     }
 
     /// Bind each expression in a list.
-    pub(crate) fn bind_expr_list(&self, exprs: &[Expr]) -> Result<Vec<Expr>, BindError> {
-        exprs.iter().map(|expr| self.bind_expr(expr)).collect()
+    pub(crate) fn bind_expr_list(&mut self, exprs: &[Expr]) -> Result<Vec<Expr>, BindError> {
+        let mut bound = Vec::with_capacity(exprs.len());
+        for expr in exprs {
+            bound.push(self.bind_expr(expr)?);
+        }
+        Ok(bound)
     }
 
     /// Bind an optional (boxed) expression.
-    fn bind_opt(&self, expr: Option<&Expr>) -> Result<Option<Box<Expr>>, BindError> {
+    fn bind_opt(&mut self, expr: Option<&Expr>) -> Result<Option<Box<Expr>>, BindError> {
         match expr {
             Some(expr) => Ok(Some(Box::new(self.bind_expr(expr)?))),
             None => Ok(None),
@@ -116,7 +167,7 @@ impl Binder<'_> {
 
     /// Bind a CASE's branch conditions/results and its ELSE.
     fn bind_case(
-        &self,
+        &mut self,
         when_clauses: &[(Expr, Expr)],
         else_result: Option<&Expr>,
     ) -> Result<Expr, BindError> {

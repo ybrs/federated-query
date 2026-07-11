@@ -5,9 +5,11 @@
 //! qualifier or typo'd column fails here, before any source is touched). Ports
 //! `parser/binder.py`.
 //!
-//! Build stage: base-table queries (Scan / Projection / Filter / Join / Sort /
-//! Limit / Aggregate). Derived tables, CTEs, set operations, subquery
-//! expressions, and the aggregate hoists are the next increments.
+//! Covers the query shapes fq-parse produces - base tables, joins, derived
+//! tables, CTEs, set operations, aggregates, subquery expressions (correlated),
+//! HAVING/ORDER-BY aliases and positional ordinals - closing SQL -> bound plan
+//! (Milestone A). The aggregate-call hoist for ORDER BY / HAVING calls absent
+//! from SELECT is a deferred correctness refinement.
 
 pub mod binder;
 pub mod error;

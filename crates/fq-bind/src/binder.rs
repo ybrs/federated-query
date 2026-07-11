@@ -7,13 +7,22 @@
 //! column; ambiguity/no-scope raises). Post-bind every `ColumnRef` carries its
 //! relation qualifier and `DataType`.
 //!
-//! Coverage (this stage): base-table queries - Scan / Projection / Filter / Join
-//! / Sort / Limit / Aggregate. Derived tables, CTEs, set operations, subquery
-//! expressions, and the HAVING/ORDER-BY-over-aggregate hoists are the next
-//! increments (each raises `BindError::Unsupported` until then).
+//! Coverage: Scan / Projection / Filter / Join / Sort / Limit / Aggregate over
+//! base tables, derived tables (SubqueryScan), CTE references + non-recursive
+//! WITH, set operations (with arity check), Values, Explain, the subquery
+//! expressions (correlated - the subplan binds with the enclosing scopes
+//! visible), and HAVING / ORDER-BY output-alias + positional-ordinal resolution.
+//! Deferred (correctness refinements, do not block binding): the aggregate-call
+//! HOIST/widening for ORDER BY / HAVING calls absent from the SELECT list, and
+//! WITH RECURSIVE.
 
-use fq_catalog::{Catalog, Table};
-use fq_plan::{Aggregate, Expr, Filter, Join, Limit, LogicalPlan, Projection, Scan, Sort};
+use std::collections::HashMap;
+
+use fq_catalog::{Catalog, Column, Table};
+use fq_plan::{
+    Aggregate, Cte, CteRef, Explain, Expr, Filter, Join, Limit, LogicalPlan, Projection, Scan,
+    SetOperation, Sort, SubqueryScan, Values,
+};
 
 use crate::error::BindError;
 
@@ -24,6 +33,13 @@ type Scope = Vec<(String, Table)>;
 pub struct Binder<'a> {
     catalog: &'a Catalog,
     scopes: Vec<Scope>,
+    /// Registered CTE name -> a synthetic Table of its output columns, so a
+    /// CteRef resolves against it like an ordinary relation.
+    ctes: HashMap<String, Table>,
+    /// Output-alias overlays (name -> type), pushed when binding HAVING or ORDER
+    /// BY over a Projection/Aggregate: a bare reference to an output alias (not a
+    /// base-table column) resolves here first. A stack for nested queries.
+    output_aliases: Vec<HashMap<String, fq_common::DataType>>,
 }
 
 /// Coerce an empty qualifier (a bare reference) to None so the catalog searches.
@@ -41,6 +57,8 @@ impl<'a> Binder<'a> {
         Self {
             catalog,
             scopes: Vec::new(),
+            ctes: HashMap::new(),
+            output_aliases: Vec::new(),
         }
     }
 
@@ -54,6 +72,12 @@ impl<'a> Binder<'a> {
             LogicalPlan::Limit(limit) => self.bind_limit(limit),
             LogicalPlan::Join(join) => self.bind_join(join),
             LogicalPlan::Aggregate(aggregate) => self.bind_aggregate(aggregate),
+            LogicalPlan::SubqueryScan(node) => self.bind_subquery_scan(node),
+            LogicalPlan::SetOperation(node) => self.bind_set_operation(node),
+            LogicalPlan::Cte(node) => self.bind_cte(node),
+            LogicalPlan::CteRef(node) => self.bind_cte_ref(node),
+            LogicalPlan::Values(node) => self.bind_values(node),
+            LogicalPlan::Explain(node) => self.bind_explain(node),
             other => Err(BindError::Unsupported(format!(
                 "plan node {}",
                 node_name(&other)
@@ -88,9 +112,14 @@ impl<'a> Binder<'a> {
     }
 
     /// Bind a Filter: bind the input, then the predicate against the input scope.
+    /// A HAVING (Filter over an Aggregate) also resolves bare references to the
+    /// aggregate's output aliases.
     fn bind_filter(&mut self, filter: Filter) -> Result<LogicalPlan, BindError> {
         let input = self.bind(*filter.input)?;
-        let predicate = self.with_scope(&input, |binder| binder.bind_expr(&filter.predicate))?;
+        let overlay = aggregate_overlay(&input);
+        let predicate = self.with_output_aliases(overlay, |binder| {
+            binder.with_scope(&input, |binder| binder.bind_expr(&filter.predicate))
+        })?;
         Ok(LogicalPlan::Filter(Filter {
             input: Box::new(input),
             predicate,
@@ -116,16 +145,73 @@ impl<'a> Binder<'a> {
         }))
     }
 
-    /// Bind a Sort: bind the input, then each sort key against the input scope.
+    /// Bind a Sort: bind each ORDER BY key against the input scope, also resolving
+    /// output aliases and positional ordinals (`ORDER BY <alias>` / `ORDER BY n`).
     fn bind_sort(&mut self, sort: Sort) -> Result<LogicalPlan, BindError> {
         let input = self.bind(*sort.input)?;
-        let sort_keys = self.with_scope(&input, |binder| binder.bind_expr_list(&sort.sort_keys))?;
+        let output_names = output_name_list(&input);
+        let overlay = aggregate_overlay(&input).or_else(|| projection_overlay(&input));
+        let sort_keys = self.with_output_aliases(overlay, |binder| {
+            binder.with_scope(&input, |binder| {
+                binder.bind_sort_keys(&sort.sort_keys, &output_names)
+            })
+        })?;
         Ok(LogicalPlan::Sort(Sort {
             input: Box::new(input),
             sort_keys,
             ascending: sort.ascending,
             nulls_order: sort.nulls_order,
         }))
+    }
+
+    /// Bind ORDER BY keys: a positional ordinal (`ORDER BY 2`) names the 2nd
+    /// output; otherwise the key binds normally (an output alias resolves via the
+    /// pushed overlay, a base column via the scope).
+    fn bind_sort_keys(
+        &mut self,
+        keys: &[Expr],
+        output_names: &[String],
+    ) -> Result<Vec<Expr>, BindError> {
+        let mut bound = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(index) = positional_index(key, output_names.len()) {
+                let name = &output_names[index];
+                let data_type = self.output_alias_type(name);
+                bound.push(Expr::Column(fq_plan::ColumnRef::new(
+                    None,
+                    name.clone(),
+                    data_type,
+                )));
+            } else {
+                bound.push(self.bind_expr(key)?);
+            }
+        }
+        Ok(bound)
+    }
+
+    /// Run `f` with `overlay` (if any) pushed as the current output-alias scope.
+    fn with_output_aliases<T>(
+        &mut self,
+        overlay: Option<HashMap<String, fq_common::DataType>>,
+        f: impl FnOnce(&mut Self) -> Result<T, BindError>,
+    ) -> Result<T, BindError> {
+        match overlay {
+            Some(overlay) => {
+                self.output_aliases.push(overlay);
+                let result = f(self);
+                self.output_aliases.pop();
+                result
+            }
+            None => f(self),
+        }
+    }
+
+    /// The type recorded for an output-alias name in the innermost overlay, if any.
+    pub(crate) fn output_alias_type(&self, name: &str) -> Option<fq_common::DataType> {
+        self.output_aliases
+            .iter()
+            .rev()
+            .find_map(|overlay| overlay.get(name).copied())
     }
 
     /// Bind a Limit: only the input needs binding (LIMIT/OFFSET are constants).
@@ -184,11 +270,207 @@ impl<'a> Binder<'a> {
         }))
     }
 
+    /// Bind a derived table: bind its inner plan, applying any column-alias
+    /// rename. The alias itself scopes references above it.
+    fn bind_subquery_scan(&mut self, node: SubqueryScan) -> Result<LogicalPlan, BindError> {
+        let input = self.bind(*node.input)?;
+        let input = match &node.column_names {
+            Some(names) => self.rename_derived_columns(input, names)?,
+            None => input,
+        };
+        Ok(LogicalPlan::SubqueryScan(SubqueryScan {
+            input: Box::new(input),
+            alias: node.alias,
+            column_names: node.column_names,
+        }))
+    }
+
+    /// Apply a derived table's column-alias list via a rename projection that
+    /// reads each output by its physical name and re-aliases it.
+    fn rename_derived_columns(
+        &self,
+        plan: LogicalPlan,
+        names: &[String],
+    ) -> Result<LogicalPlan, BindError> {
+        let columns = self.plan_output_columns(&plan)?;
+        if columns.len() != names.len() {
+            return Err(BindError::Unsupported(format!(
+                "derived-table column list has {} names but the subquery returns {}",
+                names.len(),
+                columns.len()
+            )));
+        }
+        guard_unique_output_names(&columns)?;
+        let expressions = columns
+            .iter()
+            .map(|column| {
+                Expr::Column(fq_plan::ColumnRef::new(
+                    None,
+                    column.name.clone(),
+                    Some(column.data_type),
+                ))
+            })
+            .collect();
+        Ok(LogicalPlan::Projection(Projection {
+            input: Box::new(plan),
+            expressions,
+            aliases: names.to_vec(),
+            distinct: false,
+            distinct_on: None,
+        }))
+    }
+
+    /// Bind both branches of a set operation and check their arity.
+    fn bind_set_operation(&mut self, node: SetOperation) -> Result<LogicalPlan, BindError> {
+        let left = self.bind(*node.left)?;
+        let right = self.bind(*node.right)?;
+        let (left_width, right_width) = (left.schema().len(), right.schema().len());
+        if left_width != right_width {
+            return Err(BindError::SetOpArity {
+                left: left_width,
+                right: right_width,
+            });
+        }
+        Ok(LogicalPlan::SetOperation(SetOperation {
+            left: Box::new(left),
+            right: Box::new(right),
+            kind: node.kind,
+            distinct: node.distinct,
+        }))
+    }
+
+    /// Bind a CTE: register its name as a relation (over its body's output
+    /// columns) so the child and later CTEs resolve a CteRef against it.
+    fn bind_cte(&mut self, node: Cte) -> Result<LogicalPlan, BindError> {
+        if node.recursive {
+            return Err(BindError::Unsupported("WITH RECURSIVE".to_string()));
+        }
+        let cte_plan = self.bind(*node.cte_plan)?;
+        let mut columns = self.plan_output_columns(&cte_plan)?;
+        if let Some(names) = &node.column_names {
+            columns = rename_columns(names, &columns)?;
+        }
+        let table = Table::new(node.name.clone(), columns);
+        let saved = self.ctes.insert(node.name.clone(), table);
+        let child = self.bind(*node.child);
+        match saved {
+            Some(previous) => {
+                self.ctes.insert(node.name.clone(), previous);
+            }
+            None => {
+                self.ctes.remove(&node.name);
+            }
+        }
+        let child = child?;
+        Ok(LogicalPlan::Cte(Cte {
+            name: node.name,
+            cte_plan: Box::new(cte_plan),
+            child: Box::new(child),
+            recursive: false,
+            column_names: node.column_names,
+        }))
+    }
+
+    /// Resolve a CTE reference to the registered CTE's output column names.
+    fn bind_cte_ref(&mut self, node: CteRef) -> Result<LogicalPlan, BindError> {
+        let table = self
+            .ctes
+            .get(&node.name)
+            .ok_or_else(|| BindError::TableNotFound(format!("CTE {}", node.name)))?;
+        let output_names = table.columns.iter().map(|col| col.name.clone()).collect();
+        Ok(LogicalPlan::CteRef(CteRef {
+            name: node.name,
+            alias: node.alias,
+            columns: node.columns,
+            output_names: Some(output_names),
+        }))
+    }
+
+    /// Bind a constant Values node (its expressions reference no input columns).
+    fn bind_values(&mut self, node: Values) -> Result<LogicalPlan, BindError> {
+        let mut rows = Vec::with_capacity(node.rows.len());
+        for row in &node.rows {
+            rows.push(self.bind_expr_list(row)?);
+        }
+        Ok(LogicalPlan::Values(Values {
+            rows,
+            output_names: node.output_names,
+        }))
+    }
+
+    /// Bind an EXPLAIN's wrapped plan.
+    fn bind_explain(&mut self, node: Explain) -> Result<LogicalPlan, BindError> {
+        let input = self.bind(*node.input)?;
+        Ok(LogicalPlan::Explain(Explain {
+            input: Box::new(input),
+            format: node.format,
+        }))
+    }
+
+    /// Derive output-column metadata (name + type) from a bound plan.
+    fn plan_output_columns(&self, plan: &LogicalPlan) -> Result<Vec<Column>, BindError> {
+        match plan {
+            LogicalPlan::Projection(node) => expression_columns(&plan.schema(), &node.expressions),
+            LogicalPlan::Aggregate(node) => {
+                expression_columns(&node.output_names, &node.aggregates)
+            }
+            LogicalPlan::Values(node) => match node.rows.first() {
+                Some(first) => expression_columns(&node.output_names, first),
+                None => Ok(Vec::new()),
+            },
+            LogicalPlan::SetOperation(node) => self.plan_output_columns(&node.left),
+            LogicalPlan::Scan(node) => self.scan_output_columns(node),
+            LogicalPlan::Join(node) => {
+                let mut columns = self.plan_output_columns(&node.left)?;
+                if !matches!(
+                    node.join_type,
+                    fq_plan::JoinType::Semi | fq_plan::JoinType::Anti
+                ) {
+                    columns.extend(self.plan_output_columns(&node.right)?);
+                }
+                Ok(columns)
+            }
+            LogicalPlan::CteRef(node) => self.cte_ref_columns(node),
+            LogicalPlan::SubqueryScan(node) => self.plan_output_columns(&node.input),
+            other => match other.children().as_slice() {
+                [child] => self.plan_output_columns(child),
+                _ => Err(BindError::Unsupported(format!(
+                    "output columns of {}",
+                    node_name(other)
+                ))),
+            },
+        }
+    }
+
+    /// Output columns of a scan, resolved from the catalog for its read-set.
+    fn scan_output_columns(&self, scan: &Scan) -> Result<Vec<Column>, BindError> {
+        let table = self.resolve_scan_table(scan)?;
+        let mut columns = Vec::with_capacity(scan.columns.len());
+        for name in &scan.columns {
+            let column = table
+                .get_column(name)
+                .ok_or_else(|| BindError::ColumnNotInTable {
+                    column: name.clone(),
+                    table: scan.table_name.clone(),
+                })?;
+            columns.push(column.clone());
+        }
+        Ok(columns)
+    }
+
+    /// The registered output columns of a CTE reference.
+    fn cte_ref_columns(&self, node: &CteRef) -> Result<Vec<Column>, BindError> {
+        self.ctes
+            .get(&node.name)
+            .map(|table| table.columns.clone())
+            .ok_or_else(|| BindError::TableNotFound(format!("CTE {}", node.name)))
+    }
+
     /// Run `f` with the scope exposed by `plan` pushed, popping afterward.
     fn with_scope<T>(
         &mut self,
         plan: &LogicalPlan,
-        f: impl FnOnce(&Self) -> Result<T, BindError>,
+        f: impl FnOnce(&mut Self) -> Result<T, BindError>,
     ) -> Result<T, BindError> {
         let mut scope = Scope::new();
         self.collect_scope(plan, &mut scope)?;
@@ -196,6 +478,13 @@ impl<'a> Binder<'a> {
         let result = f(self);
         self.scopes.pop();
         result
+    }
+
+    /// Bind a subquery's plan with the enclosing scopes still on the stack, so a
+    /// correlated reference resolves against an outer relation (innermost-first).
+    /// The subplan's own relations push above the outer scopes and pop when done.
+    pub(crate) fn bind_subplan(&mut self, plan: &LogicalPlan) -> Result<LogicalPlan, BindError> {
+        self.bind(plan.clone())
     }
 
     /// Collect alias -> Table entries from a bound plan subtree.
@@ -210,9 +499,22 @@ impl<'a> Binder<'a> {
                 scope.push((alias, table.clone()));
                 Ok(())
             }
-            LogicalPlan::SubqueryScan(_) | LogicalPlan::CteRef(_) => Err(BindError::Unsupported(
-                "derived table / CTE reference in scope".to_string(),
-            )),
+            LogicalPlan::SubqueryScan(node) => {
+                // A derived table exposes its output columns under its alias, like
+                // a base table; inner relation aliases stay hidden (SQL scoping).
+                let columns = self.plan_output_columns(&node.input)?;
+                scope.push((node.alias.clone(), Table::new(node.alias.clone(), columns)));
+                Ok(())
+            }
+            LogicalPlan::CteRef(node) => {
+                let table = self
+                    .ctes
+                    .get(&node.name)
+                    .ok_or_else(|| BindError::TableNotFound(format!("CTE {}", node.name)))?;
+                let alias = node.alias.clone().unwrap_or_else(|| node.name.clone());
+                scope.push((alias, table.clone()));
+                Ok(())
+            }
             other => {
                 for child in other.children() {
                     self.collect_scope(child, scope)?;
@@ -327,6 +629,120 @@ fn guard_no_star(table_name: &str, columns: &[String]) -> Result<(), BindError> 
         return Err(BindError::Unsupported(format!(
             "scan of '{table_name}' still has a '*' column after binding"
         )));
+    }
+    Ok(())
+}
+
+/// The output-alias overlay (name -> type) of an Aggregate, or of the Aggregate
+/// under a HAVING Filter; None for any other plan.
+fn aggregate_overlay(plan: &LogicalPlan) -> Option<HashMap<String, fq_common::DataType>> {
+    let aggregate = match plan {
+        LogicalPlan::Aggregate(node) => node,
+        LogicalPlan::Filter(filter) => match filter.input.as_ref() {
+            LogicalPlan::Aggregate(node) => node,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(
+        aggregate
+            .output_names
+            .iter()
+            .zip(aggregate.aggregates.iter())
+            .map(|(name, expr)| (name.clone(), expr.get_type()))
+            .collect(),
+    )
+}
+
+/// The output-alias overlay of a Projection (alias -> type); None otherwise.
+fn projection_overlay(plan: &LogicalPlan) -> Option<HashMap<String, fq_common::DataType>> {
+    let LogicalPlan::Projection(projection) = plan else {
+        return None;
+    };
+    Some(
+        projection
+            .aliases
+            .iter()
+            .zip(projection.expressions.iter())
+            .map(|(name, expr)| (name.clone(), expr.get_type()))
+            .collect(),
+    )
+}
+
+/// The ordered output names of a Projection/Aggregate (for positional ORDER BY),
+/// or empty for any other plan.
+fn output_name_list(plan: &LogicalPlan) -> Vec<String> {
+    match plan {
+        LogicalPlan::Projection(_) => plan.schema(),
+        LogicalPlan::Aggregate(node) => node.output_names.clone(),
+        LogicalPlan::Filter(filter) => match filter.input.as_ref() {
+            LogicalPlan::Aggregate(node) => node.output_names.clone(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// The 0-based output index a positional ORDER BY key (`ORDER BY n`, integer
+/// literal 1..=count) names, or None. A positional ordinal orders by the n-th
+/// output, not by the constant n.
+fn positional_index(key: &Expr, count: usize) -> Option<usize> {
+    if let Expr::Literal {
+        value: fq_plan::LiteralValue::Integer(number),
+        ..
+    } = key
+    {
+        if *number >= 1 && (*number as usize) <= count {
+            return Some((*number as usize) - 1);
+        }
+    }
+    None
+}
+
+/// Pair output names with their expressions' inferred types as Column metadata.
+fn expression_columns(names: &[String], expressions: &[Expr]) -> Result<Vec<Column>, BindError> {
+    if names.len() != expressions.len() {
+        return Err(BindError::Unsupported(format!(
+            "output arity mismatch: {} names, {} expressions",
+            names.len(),
+            expressions.len()
+        )));
+    }
+    let mut columns = Vec::with_capacity(names.len());
+    for (name, expression) in names.iter().zip(expressions.iter()) {
+        columns.push(Column::new(name.clone(), expression.get_type(), true));
+    }
+    Ok(columns)
+}
+
+/// Re-label output columns with an explicit CTE/derived-table column list; a
+/// count mismatch raises rather than silently dropping or overrunning columns.
+fn rename_columns(names: &[String], columns: &[Column]) -> Result<Vec<Column>, BindError> {
+    if names.len() != columns.len() {
+        return Err(BindError::Unsupported(format!(
+            "column list has {} names but the query returns {}",
+            names.len(),
+            columns.len()
+        )));
+    }
+    Ok(names
+        .iter()
+        .zip(columns.iter())
+        .map(|(name, column)| Column::new(name.clone(), column.data_type, true))
+        .collect())
+}
+
+/// Reject a column-alias rename when the subquery has duplicate output names (the
+/// rename reads each output by its physical name; a duplicate would alias wrong).
+fn guard_unique_output_names(columns: &[Column]) -> Result<(), BindError> {
+    let mut seen = std::collections::HashSet::new();
+    for column in columns {
+        if !seen.insert(&column.name) {
+            return Err(BindError::Unsupported(format!(
+                "derived table with a column-alias list has duplicate output name '{}'",
+                column.name
+            )));
+        }
     }
     Ok(())
 }

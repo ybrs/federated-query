@@ -233,3 +233,173 @@ fn aggregate_group_and_agg_resolve() {
     };
     assert_eq!(age.data_type, Some(DataType::Integer));
 }
+
+#[test]
+fn having_output_alias_resolves() {
+    // HAVING references the aggregate output alias `n` (not a base column).
+    let plan = bind_sql("SELECT age, COUNT(*) AS n FROM pg.public.users GROUP BY age HAVING n > 5")
+        .unwrap();
+    let LogicalPlan::Filter(filter) = &plan else {
+        panic!("expected HAVING Filter");
+    };
+    let Expr::BinaryOp { left, .. } = &filter.predicate else {
+        panic!("expected comparison");
+    };
+    let Expr::Column(n) = left.as_ref() else {
+        panic!("expected column");
+    };
+    // The alias reference stays bare (an output, not a base-table column) and
+    // takes the aggregate's type (COUNT -> BIGINT).
+    assert_eq!(n.table, None);
+    assert_eq!(n.column, "n");
+    assert_eq!(n.data_type, Some(DataType::BigInt));
+}
+
+#[test]
+fn order_by_output_alias_resolves() {
+    let plan =
+        bind_sql("SELECT age, COUNT(*) AS n FROM pg.public.users GROUP BY age ORDER BY n DESC")
+            .unwrap();
+    let LogicalPlan::Sort(sort) = &plan else {
+        panic!("expected Sort");
+    };
+    let Expr::Column(key) = &sort.sort_keys[0] else {
+        panic!("expected column key");
+    };
+    assert_eq!(key.column, "n");
+    assert_eq!(key.data_type, Some(DataType::BigInt));
+}
+
+#[test]
+fn order_by_positional_ordinal() {
+    // ORDER BY 2 orders by the 2nd output (name), not the constant 2.
+    let plan = bind_sql("SELECT name, age FROM pg.public.users ORDER BY 2").unwrap();
+    let LogicalPlan::Sort(sort) = &plan else {
+        panic!("expected Sort");
+    };
+    let Expr::Column(key) = &sort.sort_keys[0] else {
+        panic!("expected column, got {:?}", sort.sort_keys[0]);
+    };
+    assert_eq!(key.column, "age");
+}
+
+#[test]
+fn derived_table_binds_and_scopes() {
+    let plan =
+        bind_sql("SELECT d.total FROM (SELECT total FROM pg.public.orders WHERE total > 1) AS d")
+            .unwrap();
+    let LogicalPlan::Projection(projection) = &plan else {
+        panic!("expected Projection");
+    };
+    // Its input is a bound SubqueryScan whose alias `d` scoped d.total.
+    let LogicalPlan::SubqueryScan(subquery_scan) = projection.input.as_ref() else {
+        panic!("expected SubqueryScan");
+    };
+    assert_eq!(subquery_scan.alias, "d");
+    // d.total resolved with the DOUBLE type from the inner orders.total.
+    let Expr::Column(total) = &projection.expressions[0] else {
+        panic!("expected column");
+    };
+    assert_eq!(total.table.as_deref(), Some("d"));
+    assert_eq!(total.data_type, Some(DataType::Double));
+}
+
+#[test]
+fn cte_binds_and_reference_resolves() {
+    let plan = bind_sql(
+        "WITH recent AS (SELECT id, total FROM pg.public.orders) \
+         SELECT recent.total FROM recent",
+    )
+    .unwrap();
+    let LogicalPlan::Cte(cte) = &plan else {
+        panic!("expected Cte");
+    };
+    // The child body resolved recent.total against the CTE's output columns.
+    let LogicalPlan::Projection(body) = cte.child.as_ref() else {
+        panic!("expected Projection body");
+    };
+    let Expr::Column(total) = &body.expressions[0] else {
+        panic!("expected column");
+    };
+    assert_eq!(total.table.as_deref(), Some("recent"));
+    assert_eq!(total.data_type, Some(DataType::Double));
+}
+
+#[test]
+fn set_operation_arity_mismatch_raises() {
+    let result =
+        bind_sql("SELECT id, name FROM pg.public.users UNION SELECT id FROM pg.public.orders");
+    assert!(
+        matches!(result, Err(BindError::SetOpArity { .. })),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn set_operation_matching_arity_binds() {
+    let plan =
+        bind_sql("SELECT id FROM pg.public.users UNION SELECT id FROM pg.public.orders").unwrap();
+    assert!(matches!(plan, LogicalPlan::SetOperation(_)));
+}
+
+#[test]
+fn in_subquery_binds_inner_plan() {
+    let plan = bind_sql(
+        "SELECT name FROM pg.public.users \
+         WHERE id IN (SELECT user_id FROM pg.public.orders WHERE total > 100)",
+    )
+    .unwrap();
+    let LogicalPlan::Projection(projection) = &plan else {
+        panic!("expected Projection");
+    };
+    let LogicalPlan::Filter(filter) = projection.input.as_ref() else {
+        panic!("expected Filter");
+    };
+    let Expr::InSubquery {
+        value, subquery, ..
+    } = &filter.predicate
+    else {
+        panic!("expected InSubquery");
+    };
+    // The outer value resolved to users.id.
+    let Expr::Column(id) = value.as_ref() else {
+        panic!("expected column");
+    };
+    assert_eq!(id.table.as_deref(), Some("users"));
+    // The subquery's own plan is bound (a Projection over orders).
+    assert!(matches!(subquery.as_ref(), LogicalPlan::Projection(_)));
+}
+
+#[test]
+fn correlated_subquery_resolves_outer_column() {
+    // EXISTS subquery references the outer users.id (correlated).
+    let plan = bind_sql(
+        "SELECT name FROM pg.public.users AS u \
+         WHERE EXISTS (SELECT 1 FROM pg.public.orders AS o WHERE o.user_id = u.id)",
+    )
+    .unwrap();
+    let LogicalPlan::Projection(projection) = &plan else {
+        panic!("expected Projection");
+    };
+    let LogicalPlan::Filter(filter) = projection.input.as_ref() else {
+        panic!("expected Filter");
+    };
+    let Expr::Exists { subquery, .. } = &filter.predicate else {
+        panic!("expected Exists");
+    };
+    // The subquery bound: o.user_id = u.id, where u.id is the outer correlation.
+    let LogicalPlan::Projection(inner) = subquery.as_ref() else {
+        panic!("expected inner Projection");
+    };
+    let LogicalPlan::Filter(inner_filter) = inner.input.as_ref() else {
+        panic!("expected inner Filter");
+    };
+    let Expr::BinaryOp { right, .. } = &inner_filter.predicate else {
+        panic!("expected comparison");
+    };
+    let Expr::Column(outer) = right.as_ref() else {
+        panic!("expected column");
+    };
+    assert_eq!(outer.table.as_deref(), Some("u"));
+    assert_eq!(outer.data_type, Some(DataType::Integer));
+}

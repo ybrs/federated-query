@@ -46,3 +46,6 @@ cast_precision_loss = "allow"
 # Same rationale for the reverse cast (f64 estimate -> i64 row count): a truncated
 # cardinality estimate only changes plan choice, never the answer.
 cast_possible_truncation = "allow"
+# Sign-loss casts (i64 -> usize) are guarded by an explicit range check at the
+# call site (e.g. a positional ordinal 1..=count), so the sign is known positive.
+cast_sign_loss = "allow"
