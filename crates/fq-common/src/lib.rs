@@ -15,6 +15,8 @@ pub mod config;
 pub mod error;
 pub mod logging;
 pub mod types;
+#[macro_use]
+mod update;
 
 pub use config::{
     load_config, Config, CostConfig, DataSourceConfig, ExecutorConfig, OptimizerConfig,

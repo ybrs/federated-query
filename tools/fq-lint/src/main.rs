@@ -35,6 +35,18 @@ const NODE_ENUMS: &[&str] = &["Expr", "LogicalPlan", "PhysicalPlan"];
 /// on one is string-matching relation membership (FQ-NAMEMATCH).
 const RELATION_FIELDS: &[&str] = &["column", "table"];
 
+/// Node child-field names; a `.clone()` on one deep-copies a subtree (FQ-CLONE).
+const NODE_CHILD_FIELDS: &[&str] = &[
+    "input", "left", "right", "body", "child", "producer", "subquery", "operand", "value",
+];
+
+/// Bare bindings that conventionally hold a plan/expr node; a `.clone()` on one
+/// deep-copies a subtree (FQ-CLONE). A heuristic - a genuinely needed clone (a
+/// node reused twice, e.g. a shared CTE body) is justified with >= 2 comments.
+const NODE_BINDINGS: &[&str] = &[
+    "plan", "node", "subtree", "input", "left", "right", "body", "child",
+];
+
 /// One reported violation: file, 1-indexed line, rule code, and message.
 struct Violation {
     file: String,
@@ -217,7 +229,40 @@ impl<'ast> Visit<'ast> for Linter<'_> {
                     .to_string(),
             );
         }
+        if method == "clone"
+            && node.args.is_empty()
+            && receiver_is_node_subtree(&node.receiver)
+            && self.comments_above(node.method.span().start().line) < 2
+        {
+            self.record(
+                node.method.span().start(),
+                "FQ-CLONE",
+                "cloning a plan/expr subtree deep-copies every boxed descendant (the one \
+                 operation that hits the allocator); own the node or take &mut instead. A \
+                 genuinely-shared node (a CTE body reused twice) needs >=2 comment lines \
+                 above justifying the clone"
+                    .to_string(),
+            );
+        }
         syn::visit::visit_expr_method_call(self, node);
+    }
+}
+
+/// Whether a `.clone()` receiver is (heuristically) a plan/expr subtree: a node
+/// child field (`x.input`, `x.left`) or a conventional node binding (`plan`,
+/// `node`). Deliberately conservative - a false positive is silenced by the same
+/// >=2-comment justification, and a missed one is caught in review.
+fn receiver_is_node_subtree(expr: &syn::Expr) -> bool {
+    match expr {
+        syn::Expr::Field(field) => match &field.member {
+            syn::Member::Named(ident) => NODE_CHILD_FIELDS.contains(&ident.to_string().as_str()),
+            syn::Member::Unnamed(_) => false,
+        },
+        syn::Expr::Path(path) => path
+            .path
+            .get_ident()
+            .is_some_and(|ident| NODE_BINDINGS.contains(&ident.to_string().as_str())),
+        _ => false,
     }
 }
 
@@ -257,17 +302,13 @@ fn report(violations: &[Violation]) -> ExitCode {
     for v in &sorted {
         println!("{}:{}: {} {}", v.file, v.line, v.code, v.message);
     }
-    let construct = violations
-        .iter()
-        .filter(|v| v.code == "FQ-CONSTRUCT")
-        .count();
-    let namematch = violations
-        .iter()
-        .filter(|v| v.code == "FQ-NAMEMATCH")
-        .count();
+    let count = |code| violations.iter().filter(|v| v.code == code).count();
     println!(
-        "\nfq-lint: {} violation(s) - {construct} FQ-CONSTRUCT, {namematch} FQ-NAMEMATCH",
-        violations.len()
+        "\nfq-lint: {} violation(s) - {} FQ-CONSTRUCT, {} FQ-CLONE, {} FQ-NAMEMATCH",
+        violations.len(),
+        count("FQ-CONSTRUCT"),
+        count("FQ-CLONE"),
+        count("FQ-NAMEMATCH"),
     );
     ExitCode::FAILURE
 }
