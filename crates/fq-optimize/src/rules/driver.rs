@@ -6,11 +6,12 @@ use fq_common::OptimizerConfig;
 use fq_decorrelate::scope::validate_scope;
 use fq_plan::logical::{Explain, LogicalPlan};
 
+use crate::cost::CostModel;
 use crate::error::OptimizeError;
 
 use super::{
-    AggregatePushdown, LimitPushdown, OptimizationRule, OrderByPushdown, PredicatePushdown,
-    ProjectionPushdown, SemiJoinPushdown,
+    AggregatePushdown, JoinOrdering, LimitPushdown, OptimizationRule, OrderByPushdown,
+    PredicatePushdown, ProjectionPushdown, SemiJoinPushdown,
 };
 
 /// The hard iteration backstop: a full sweep that changes nothing breaks the
@@ -77,11 +78,15 @@ impl RuleBasedOptimizer {
 }
 
 /// The standard pushdown rule stack, honoring the optimizer configuration. Ports
-/// `build_optimizer` for the in-scope rules; the reserved slots for the
-/// out-of-scope rules (`CTEUnionFilterPushdown`, `EagerAggregation`,
-/// `JoinOrdering`) are marked so their registration order lands correctly when
-/// they arrive.
-pub fn build_optimizer(config: &OptimizerConfig) -> RuleBasedOptimizer {
+/// `build_optimizer` for the in-scope rules; the reserved slots for the remaining
+/// out-of-scope rules (`CTEUnionFilterPushdown`, `EagerAggregation`) are marked so
+/// their registration order lands correctly when they arrive.
+///
+/// `JoinOrdering` is the first rule needing a `CostModel`, so the caller
+/// constructs it (over the query's catalog/statistics) and passes it in; it is
+/// moved into the rule at Slot 5 when `enable_join_reordering` is set, and dropped
+/// otherwise.
+pub fn build_optimizer(config: &OptimizerConfig, cost_model: CostModel) -> RuleBasedOptimizer {
     let mut rules: Vec<Box<dyn OptimizationRule>> = Vec::new();
 
     if config.enable_predicate_pushdown {
@@ -97,10 +102,14 @@ pub fn build_optimizer(config: &OptimizerConfig) -> RuleBasedOptimizer {
 
     // Slot 4 (reserved, always on): EagerAggregation(cost_model) - before join
     // ordering, replaces the fact atom with a partial aggregate.
-    // Slot 5 (reserved, gated by enable_join_reordering):
-    // JoinOrdering(cost_model, max_join_reorder_size) - reads folded equi
-    // conditions and embedded scan filters, and must run BEFORE projection
-    // pushdown prunes columns.
+    if config.enable_join_reordering {
+        // Slot 5: JoinOrdering reads folded equi conditions and embedded scan
+        // filters, and must run BEFORE projection pushdown prunes columns.
+        rules.push(Box::new(JoinOrdering::new(
+            cost_model,
+            config.max_join_reorder_size as usize,
+        )));
+    }
 
     if config.enable_projection_pushdown {
         rules.push(Box::new(ProjectionPushdown));
@@ -116,8 +125,14 @@ pub fn build_optimizer(config: &OptimizerConfig) -> RuleBasedOptimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fq_common::CostConfig;
     use fq_plan::expr::{Expr, LiteralValue};
     use fq_plan::logical::{Filter, Scan};
+
+    /// A stats-free cost model (the registration-order tests never estimate).
+    fn cost_model() -> CostModel {
+        CostModel::new(CostConfig::default(), None)
+    }
 
     /// A one-column scan under a data source.
     fn scan(table: &str, columns: &[&str]) -> LogicalPlan {
@@ -230,12 +245,15 @@ mod tests {
 
     #[test]
     fn build_optimizer_registers_rules_in_the_spec_order() {
-        let optimizer = build_optimizer(&OptimizerConfig::default());
+        let optimizer = build_optimizer(&OptimizerConfig::default(), cost_model());
+        // Default config enables join reordering: JoinOrdering lands at Slot 5,
+        // after SemiJoinPushdown and before ProjectionPushdown.
         assert_eq!(
             optimizer.rule_names(),
             vec![
                 "PredicatePushdown",
                 "SemiJoinPushdown",
+                "JoinOrdering",
                 "ProjectionPushdown",
                 "AggregatePushdown",
                 "OrderByPushdown",
@@ -253,8 +271,9 @@ mod tests {
             enable_decorrelation: true,
             max_join_reorder_size: 10,
         };
-        let optimizer = build_optimizer(&config);
-        // Predicate and projection pushdown drop out; the always-on rules remain.
+        let optimizer = build_optimizer(&config, cost_model());
+        // Predicate/projection pushdown AND join ordering drop out; the always-on
+        // rules remain.
         assert_eq!(
             optimizer.rule_names(),
             vec![

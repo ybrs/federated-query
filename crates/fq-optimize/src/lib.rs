@@ -25,8 +25,8 @@ pub use join_graph::{
     extract_region, is_region_join, JoinAtom, JoinConjunct, JoinGraphError, JoinRegion,
 };
 pub use rules::{
-    build_optimizer, AggregatePushdown, LimitPushdown, OptimizationRule, OrderByPushdown,
-    PredicatePushdown, ProjectionPushdown, RuleBasedOptimizer, SemiJoinPushdown,
+    build_optimizer, AggregatePushdown, JoinOrdering, LimitPushdown, OptimizationRule,
+    OrderByPushdown, PredicatePushdown, ProjectionPushdown, RuleBasedOptimizer, SemiJoinPushdown,
 };
 pub use statistics::StatisticsCollector;
 pub use subplan_signature::{

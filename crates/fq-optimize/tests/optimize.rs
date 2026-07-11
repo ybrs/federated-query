@@ -5,8 +5,8 @@
 use std::sync::Arc;
 
 use fq_catalog::{Catalog, Column, Schema, Table};
-use fq_common::{DataType, OptimizerConfig};
-use fq_optimize::build_optimizer;
+use fq_common::{CostConfig, DataType, OptimizerConfig};
+use fq_optimize::{build_optimizer, CostModel};
 use fq_parse::parse_with_catalog;
 use fq_plan::logical::LogicalPlan;
 
@@ -44,7 +44,8 @@ fn optimize(catalog: &Catalog, sql: &str) -> LogicalPlan {
     let parsed = parse_with_catalog(sql, catalog).expect("parse");
     let bound = fq_bind::bind(catalog, parsed).expect("bind");
     let decorrelated = fq_decorrelate::decorrelate(bound).expect("decorrelate");
-    let optimizer = build_optimizer(&OptimizerConfig::default());
+    let cost_model = CostModel::new(CostConfig::default(), None);
+    let optimizer = build_optimizer(&OptimizerConfig::default(), cost_model);
     optimizer.optimize(decorrelated).expect("optimize")
 }
 

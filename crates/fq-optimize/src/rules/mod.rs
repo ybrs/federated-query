@@ -11,6 +11,7 @@
 
 mod aggregate;
 mod driver;
+mod join_ordering;
 mod limit;
 mod order_by;
 mod predicate;
@@ -23,6 +24,7 @@ use crate::error::OptimizeError;
 
 pub use aggregate::AggregatePushdown;
 pub use driver::{build_optimizer, RuleBasedOptimizer};
+pub use join_ordering::JoinOrdering;
 pub use limit::LimitPushdown;
 pub use order_by::OrderByPushdown;
 pub use predicate::PredicatePushdown;

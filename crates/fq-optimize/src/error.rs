@@ -9,18 +9,49 @@ use thiserror::Error;
 
 use fq_decorrelate::DecorrelationError;
 
+use crate::join_graph::JoinGraphError;
+
 /// A failure applying an optimization rule to a logical plan.
 ///
-/// Only ONE rule can raise: `ProjectionPushdown`'s column pruner, on a plan node
+/// `ProjectionPushdown`'s column pruner raises `PruneNoRule` on a plan node
 /// outside its modeled set (a silently-skipped node could leave scans with stale
-/// semantics). Every other rule DECLINES (returns the plan unchanged). The driver
-/// additionally raises `Scope` when a rule that changed the plan produced a
-/// mis-scoped one - the loud safety net that fails at the rule that broke it.
-#[derive(Debug, Error, PartialEq, Eq)]
+/// semantics). `JoinOrdering` raises `JoinOrder` on a violated enumerator/
+/// placement invariant (a dropped or duplicated predicate is worse than a crash),
+/// propagates a malformed-region `JoinGraph` error, and surfaces the estimator's
+/// `Estimate` failures. Every other rule DECLINES (returns the plan unchanged).
+/// The driver additionally raises `Scope` when a rule that changed the plan
+/// produced a mis-scoped one - the loud safety net that fails at the rule that
+/// broke it.
+///
+/// PartialEq is intentionally NOT derived: the wrapped `EstimateError` is not
+/// itself `PartialEq`. Tests match on variants with `matches!`.
+#[derive(Debug, Error)]
 pub enum OptimizeError {
     /// `ProjectionPushdown`'s pruner reached a plan node it has no rule for.
     #[error("projection pushdown has no prune rule for plan node {0}")]
     PruneNoRule(&'static str),
+
+    /// A subquery-bearing expression survived into the optimizer, where its
+    /// columns are invisible to `Expr::children`; pruning around it could drop a
+    /// needed column. Decorrelation must have removed it, so this is a violated
+    /// invariant, not a valid plan.
+    #[error("subquery expression {0} survived decorrelation into the optimizer")]
+    SubquerySurvived(&'static str),
+
+    /// A join-ordering invariant was violated (a bug, never a user error): a
+    /// dropped/duplicated predicate, a misplaced equi key, or an enumerator
+    /// state the connectivity guarantee makes impossible.
+    #[error("join ordering invariant violated: {0}")]
+    JoinOrder(String),
+
+    /// A join region whose predicates cannot be soundly mapped to its atoms
+    /// (unqualified or ambiguous reference); propagated, never swallowed.
+    #[error(transparent)]
+    JoinGraph(#[from] JoinGraphError),
+
+    /// A cardinality estimate the join-ordering enumerator consulted failed.
+    #[error(transparent)]
+    Estimate(#[from] EstimateError),
 
     /// A rule produced a plan where a qualified reference escaped its relation's
     /// scope, caught by `validate_scope` after the rule changed the plan.

@@ -28,7 +28,7 @@ impl OptimizationRule for ProjectionPushdown {
             return Ok(plan);
         }
         let mut required = HashSet::new();
-        collect_required_columns(&plan, &mut required);
+        collect_required_columns(&plan, &mut required)?;
         prune_columns(plan, &required)
     }
 }
@@ -58,30 +58,59 @@ fn has_explicit_projection(plan: &LogicalPlan) -> bool {
 /// and total; deliberately crosses naming-scope boundaries (global
 /// over-collection can only over-KEEP a column, never lose one). Ports
 /// `_collect_required_columns`.
-fn collect_required_columns(plan: &LogicalPlan, columns: &mut HashSet<String>) {
+fn collect_required_columns(
+    plan: &LogicalPlan,
+    columns: &mut HashSet<String>,
+) -> Result<(), OptimizeError> {
     for expression in plan.direct_expressions() {
-        collect_expression(expression, columns);
+        collect_expression(expression, columns)?;
     }
     for child in plan.children() {
-        collect_required_columns(child, columns);
+        collect_required_columns(child, columns)?;
     }
+    Ok(())
 }
 
 /// Names from one expression tree, EXCLUDING count-star calls (COUNT(*) needs no
-/// columns; its `*` argument must not poison the required set). Subquery-bearing
-/// expressions are dead post-decorrelation, so no special handling. Ports
+/// columns; its `*` argument must not poison the required set). Ports
 /// `_collect_expression`.
-fn collect_expression(expression: &Expr, columns: &mut HashSet<String>) {
+///
+/// A subquery-bearing Expr (`Subquery`/`Exists`/`InSubquery`/`QuantifiedComparison`)
+/// cannot appear here: decorrelation removes every Expr-level subquery before the
+/// optimizer runs. If one survives, its columns are invisible to `Expr::children`
+/// (which stops at subquery boundaries), so silently collecting nothing would let
+/// a NEEDED column be pruned - a wrong-rows failure. Raise loudly instead: this is
+/// a decorrelation-invariant violation, never a valid plan to prune.
+fn collect_expression(
+    expression: &Expr,
+    columns: &mut HashSet<String>,
+) -> Result<(), OptimizeError> {
+    if is_subquery_node(expression) {
+        return Err(OptimizeError::SubquerySurvived(expression.variant_label()));
+    }
     if is_count_star(expression) {
-        return;
+        return Ok(());
     }
     if let Expr::Column(_) = expression {
         columns.extend(qualified_or_bare_names(expression));
-        return;
+        return Ok(());
     }
     for child in expression.children() {
-        collect_expression(child, columns);
+        collect_expression(child, columns)?;
     }
+    Ok(())
+}
+
+/// Whether an expression IS one of the subquery-bearing nodes decorrelation must
+/// have removed before the optimizer runs.
+fn is_subquery_node(expression: &Expr) -> bool {
+    matches!(
+        expression,
+        Expr::Subquery { .. }
+            | Expr::Exists { .. }
+            | Expr::InSubquery { .. }
+            | Expr::QuantifiedComparison { .. }
+    )
 }
 
 /// A COUNT over a single star argument - the row-count aggregate. Ports
@@ -301,6 +330,32 @@ mod tests {
     }
 
     #[test]
+    fn surviving_subquery_expression_raises_rather_than_prunes() {
+        // A subquery Expr must never reach the optimizer (decorrelation removes
+        // it). If one does, its columns are invisible to the pruner, so pruning
+        // would silently drop a needed column - raise loudly instead of doing so.
+        let predicate = Expr::InSubquery {
+            value: Box::new(col("t", "a")),
+            subquery: Box::new(scan("other", &["a"])),
+            negated: false,
+        };
+        let plan = LogicalPlan::Projection(Projection {
+            input: Box::new(LogicalPlan::Filter(Filter {
+                input: Box::new(scan("t", &["a", "b"])),
+                predicate,
+            })),
+            expressions: vec![col("t", "a")],
+            aliases: vec!["a".to_string()],
+            distinct: false,
+            distinct_on: None,
+        });
+        let err = ProjectionPushdown
+            .apply(plan)
+            .expect_err("subquery survived");
+        assert!(matches!(err, OptimizeError::SubquerySurvived(_)));
+    }
+
+    #[test]
     fn join_query_prunes_each_scan_to_referenced_columns() {
         // SELECT o.id FROM orders o JOIN customer c ON o.cust_id = c.id
         //   WHERE c.region = 'EU'
@@ -365,7 +420,7 @@ mod tests {
             within_group_desc: false,
         };
         let mut columns = HashSet::new();
-        collect_expression(&count_star, &mut columns);
+        collect_expression(&count_star, &mut columns).unwrap();
         assert!(columns.is_empty(), "COUNT(*) collects no columns");
     }
 
