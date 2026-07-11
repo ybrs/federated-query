@@ -10,8 +10,9 @@
 //!
 //! Build stages within this crate:
 //! - (A) `expr` + `logical` [done].
-//! - (B) `physical` [done - node structs + `children`; the Arrow-typed `schema`
-//!   and `column_aliases` map are deferred to their consumers].
+//! - (B) `physical` [done - node structs + `children` + the typed `schema` + the
+//!   `column_aliases` resolution map and `physical_column_name`, the last two
+//!   added as a step-building (fq-physical) prerequisite].
 //! - (C) [partial] `DataType::is_renderable` (in fq-common) + the shared
 //!   `split_where_having` / `aggregate_output_map` utilities [done here].
 //!   Deferred out of fq-plan to their real consumers, never written blind:
@@ -26,8 +27,8 @@ pub mod physical;
 
 pub use expr::{
     aggregate_output_map, and_expressions, column_refs, combine_and, combine_or,
-    contains_aggregate, split_conjuncts, split_disjuncts, split_where_having, BinaryOpType,
-    ColumnRef, Expr, LiteralValue, NullsOrder, Quantifier, UnaryOpType,
+    contains_aggregate, contains_grouping, split_conjuncts, split_disjuncts, split_where_having,
+    BinaryOpType, ColumnRef, Expr, LiteralValue, NullsOrder, Quantifier, UnaryOpType,
 };
 pub use logical::{
     Aggregate, AggregateFunction, Cte, CteRef, Explain, ExplainFormat, Filter, GroupedLimit, Join,
@@ -35,5 +36,6 @@ pub use logical::{
     SingleRowGuard, Sort, SubqueryScan, Union, Values,
 };
 pub use physical::{
-    BuildSide, ColumnAliasMap, GroupObservation, PhysicalPlan, PhysicalRemoteQuery, SeededSchema,
+    physical_column_name, BuildSide, ColumnAliasMap, GroupObservation, PhysicalPlan,
+    PhysicalRemoteQuery, SeededSchema,
 };

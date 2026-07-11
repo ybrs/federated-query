@@ -623,6 +623,19 @@ pub fn contains_window(expr: &Expr) -> bool {
     expr.children().iter().any(|child| contains_window(child))
 }
 
+/// Whether an expression tree contains a `GROUPING(...)` call at any depth. Ports
+/// the Python `_expression_contains_grouping`; the window-split logic uses it to
+/// route a grouping-bearing window through the two-stage raw-SQL path (a single
+/// window fragment cannot carry a GROUPING() over grouped aggregates).
+pub fn contains_grouping(expr: &Expr) -> bool {
+    if let Expr::FunctionCall { function_name, .. } = expr {
+        if function_name.eq_ignore_ascii_case("grouping") {
+            return true;
+        }
+    }
+    expr.children().iter().any(|child| contains_grouping(child))
+}
+
 /// Flatten the top-level AND chain of a predicate into its conjuncts.
 pub fn split_conjuncts(expr: &Expr) -> Vec<&Expr> {
     let mut out = Vec::new();
@@ -798,6 +811,34 @@ mod tests {
             left: Box::new(col("a")),
             right: Box::new(int(1)),
         }));
+    }
+
+    fn call(name: &str, args: Vec<Expr>) -> Expr {
+        Expr::FunctionCall {
+            function_name: name.to_string(),
+            args,
+            is_aggregate: false,
+            distinct: false,
+            within_group_key: None,
+            within_group_desc: false,
+        }
+    }
+
+    #[test]
+    fn contains_grouping_detects_direct_nested_and_absent() {
+        // Direct GROUPING() call, case-insensitive on the name.
+        assert!(contains_grouping(&call("GROUPING", vec![col("a")])));
+        assert!(contains_grouping(&call("grouping", vec![col("a")])));
+        // Nested inside another expression is found via children.
+        let nested = Expr::BinaryOp {
+            op: BinaryOpType::Add,
+            left: Box::new(call("grouping", vec![col("a")])),
+            right: Box::new(int(1)),
+        };
+        assert!(contains_grouping(&nested));
+        // No GROUPING() present (a different function is not a match).
+        assert!(!contains_grouping(&call("sum", vec![col("a")])));
+        assert!(!contains_grouping(&col("a")));
     }
 
     #[test]

@@ -35,7 +35,7 @@ use std::collections::BTreeMap;
 
 use fq_common::DataType;
 
-use crate::expr::{contains_window, BinaryOpType, Expr, NullsOrder};
+use crate::expr::{contains_window, BinaryOpType, ColumnRef, Expr, NullsOrder};
 use crate::logical::{ExplainFormat, JoinType, SetOpKind};
 
 /// A `(table, column) -> physical output column name` map. `table` is None for
@@ -651,6 +651,332 @@ fn source_typed(node: &str) -> ! {
     panic!("{node}::schema is computed by the execution engine, not derivable in fq-plan")
 }
 
+impl PhysicalPlan {
+    /// The `(table, column) -> physical output column name` map for THIS node's
+    /// output: the resolution key every step-building expression resolves against
+    /// (via `physical_column_name`). Ports the per-node `column_aliases()` of
+    /// `plan/physical.py`.
+    ///
+    /// Exhaustive over every variant with NO `_` arm - a node that genuinely
+    /// exposes no aliasing returns an empty map, but is listed so a new variant
+    /// forces a decision. Row-preserving wrappers inherit their child's map; a
+    /// relation that introduces an alias (scan, derived table, CTE reference)
+    /// exposes each output column under that alias; a projection/aggregate maps a
+    /// passthrough source column to its output name; a join renames a colliding
+    /// right column under the left-wins rule; a remote query returns its
+    /// pre-built map.
+    ///
+    /// # Panics
+    /// A non-aggregate `RemoteJoin` panics loudly: its Python `column_aliases()`
+    /// reads `_column_alias_map`, the map built by the RemoteJoin SQL-assembly
+    /// machinery that the Rust port dropped. A bare RemoteJoin never reaches
+    /// step-building resolution - it is wrapped in a `RemoteQuery` first - so this
+    /// path is unreachable rather than a lie.
+    pub fn column_aliases(&self) -> ColumnAliasMap {
+        match self {
+            // No aliasing: an empty map. Listed explicitly (no `_` arm) so a new
+            // variant forces a decision. Ports the base-class default `{}`
+            // (LateralJoin overrides to the same empty map).
+            PhysicalPlan::Cte(_)
+            | PhysicalPlan::CteMergeQuery(_)
+            | PhysicalPlan::Limit(_)
+            | PhysicalPlan::Values(_)
+            | PhysicalPlan::RemoteSetOp(_)
+            | PhysicalPlan::SetOperation(_)
+            | PhysicalPlan::LateralJoin(_)
+            | PhysicalPlan::Explain(_)
+            | PhysicalPlan::Gather(_) => ColumnAliasMap::new(),
+            // Row-preserving wrappers resolve against their producing child.
+            PhysicalPlan::Filter(node) => node.input.column_aliases(),
+            PhysicalPlan::Sort(node) => node.input.column_aliases(),
+            PhysicalPlan::SingleRowGuard(node) => node.input.column_aliases(),
+            PhysicalPlan::GroupedLimit(node) => node.input.column_aliases(),
+            PhysicalPlan::Shipment(node) => node.child.column_aliases(),
+            // Relations that introduce an alias: expose each output under it.
+            PhysicalPlan::Scan(node) => {
+                alias_column_map(node.alias.as_deref(), &scan_output_names(node))
+            }
+            PhysicalPlan::AliasedRelation(node) => {
+                alias_column_map(Some(&node.alias), &output_column_names(&node.input))
+            }
+            PhysicalPlan::CteScan(node) => cte_scan_column_aliases(node),
+            // Output-defining nodes.
+            PhysicalPlan::Projection(node) => projection_column_aliases(node),
+            PhysicalPlan::HashAggregate(node) => aggregate_column_aliases(node),
+            PhysicalPlan::Window(node) => output_name_aliases(&node.output_names),
+            PhysicalPlan::Union(node) => {
+                output_name_aliases(&output_column_names(first_union_input(node)))
+            }
+            PhysicalPlan::RemoteQuery(node) => node.column_alias_map.clone(),
+            // Joins: left-wins collision renaming of the right side.
+            PhysicalPlan::HashJoin(node) => {
+                join_output_aliases(node.join_type, &node.left, &node.right)
+            }
+            PhysicalPlan::NestedLoopJoin(node) => {
+                join_output_aliases(node.join_type, &node.left, &node.right)
+            }
+            PhysicalPlan::RemoteJoin(node) => remote_join_column_aliases(node),
+        }
+    }
+}
+
+/// The physical output-column name for a column reference against an alias map.
+/// Resolves the `(table, column)` key through the map so a qualified reference
+/// reads the intended column; a reference the map does not carry (a column of a
+/// flat scan namespace) falls back to its own column name. Ports the free
+/// function `_physical_column_name`; the one resolver both the type path and the
+/// executed-output path go through, so a declared name and the real output agree.
+pub fn physical_column_name(col: &ColumnRef, aliases: &ColumnAliasMap) -> String {
+    aliases
+        .get(&(col.table.clone(), col.column.clone()))
+        .cloned()
+        .unwrap_or_else(|| col.column.clone())
+}
+
+/// Map every output column to itself under a relation alias. A relation that
+/// introduces an alias exposes `(alias, column) -> column` so a qualified
+/// reference resolves to a specific physical column instead of a bare name.
+/// Returns an empty map when there is no alias. Ports `_alias_column_map`.
+fn alias_column_map(alias: Option<&str>, names: &[String]) -> ColumnAliasMap {
+    let mut map = ColumnAliasMap::new();
+    let Some(alias) = alias else {
+        return map;
+    };
+    for name in names {
+        map.insert((Some(alias.to_string()), name.clone()), name.clone());
+    }
+    map
+}
+
+/// Expose each output column unqualified, keyed by its own output name
+/// (`(None, name) -> name`). A window/union output has no source column to carry,
+/// so it is reachable only by its bare name. Ports the Window/Union alias builders.
+fn output_name_aliases(names: &[String]) -> ColumnAliasMap {
+    let mut map = ColumnAliasMap::new();
+    for name in names {
+        map.insert((None, name.clone()), name.clone());
+    }
+    map
+}
+
+/// A CTE reference's aliases: expose the producer's columns under the reference
+/// alias, or the CTE name when unaliased. Ports `PhysicalCTEScan.column_aliases`.
+fn cte_scan_column_aliases(node: &PhysicalCteScan) -> ColumnAliasMap {
+    let relation = match &node.alias {
+        Some(alias) => alias.clone(),
+        None => match node.producer.as_ref() {
+            PhysicalPlan::Cte(cte) => cte.name.clone(),
+            _ => panic!("PhysicalCteScan.producer must be a PhysicalPlan::Cte"),
+        },
+    };
+    alias_column_map(Some(&relation), &output_column_names(&node.producer))
+}
+
+/// A projection's OUTPUT columns: each output reachable unqualified by its name,
+/// and a passthrough of a plain (non-star) source column also reachable by its
+/// source qualifier - so a renamed collision column resolves to the OUTPUT name.
+/// Ports `PhysicalProjection.column_aliases`.
+fn projection_column_aliases(node: &PhysicalProjection) -> ColumnAliasMap {
+    let mut aliases = ColumnAliasMap::new();
+    for (index, expr) in node.expressions.iter().enumerate() {
+        let name = &node.output_names[index];
+        aliases.insert((None, name.clone()), name.clone());
+        if let Expr::Column(col) = expr {
+            if col.column != "*" {
+                aliases.insert((col.table.clone(), col.column.clone()), name.clone());
+            }
+        }
+    }
+    aliases
+}
+
+/// An aggregate's OUTPUT columns: each output reachable unqualified by its name,
+/// and a group key that is a plain column also reachable by its source qualifier.
+/// Ports `PhysicalHashAggregate.column_aliases` (no star check - a group key is
+/// never a star). `aggregates` is the full output list parallel to `output_names`.
+fn aggregate_column_aliases(node: &PhysicalHashAggregate) -> ColumnAliasMap {
+    let mut aliases = ColumnAliasMap::new();
+    for (expr, name) in node.aggregates.iter().zip(&node.output_names) {
+        aliases.insert((None, name.clone()), name.clone());
+        if let Expr::Column(col) = expr {
+            aliases.insert((col.table.clone(), col.column.clone()), name.clone());
+        }
+    }
+    aliases
+}
+
+/// A binary join's `(table, column) -> output-name` map. A SEMI/ANTI join outputs
+/// left columns only. Otherwise left columns keep their names and a colliding
+/// right column is renamed under the left-wins rule; when both sides expose the
+/// same key the LEFT wins (the outer reference is what the user wrote). Ports
+/// `_join_output_aliases`.
+fn join_output_aliases(
+    join_type: JoinType,
+    left: &PhysicalPlan,
+    right: &PhysicalPlan,
+) -> ColumnAliasMap {
+    let mut alias_map = left.column_aliases();
+    if matches!(join_type, JoinType::Semi | JoinType::Anti) {
+        return alias_map;
+    }
+    let left_names = output_column_names(left);
+    for (key, physical_name) in right.column_aliases() {
+        alias_map
+            .entry(key)
+            .or_insert_with(|| right_output_name(&physical_name, &left_names));
+    }
+    alias_map
+}
+
+/// A non-aggregate `RemoteJoin` needs the dropped `_column_alias_map`; only its
+/// aggregate form is derivable. Ports `PhysicalRemoteJoin.column_aliases`.
+fn remote_join_column_aliases(node: &PhysicalRemoteJoin) -> ColumnAliasMap {
+    let has_aggregates = node
+        .aggregates
+        .as_ref()
+        .is_some_and(|aggs| !aggs.is_empty());
+    if has_aggregates {
+        if let Some(names) = &node.output_names {
+            if !names.is_empty() {
+                return output_name_aliases(names);
+            }
+        }
+    }
+    panic!(
+        "PhysicalRemoteJoin.column_aliases without aggregates reads the dropped \
+         `_column_alias_map` (built by RemoteJoin SQL assembly, deferred to \
+         fq-physical); a bare RemoteJoin never reaches step-building - it is \
+         wrapped in a RemoteQuery"
+    )
+}
+
+/// The output column NAMES of a node, without probing a source and without typing
+/// each column - the name side of Python's `schema().names`. `column_aliases`
+/// needs a relation's exposed names (scan self, join left, CTE producer, aliased
+/// input, union branch), but the typed `schema()` panics on a non-seeded scan or
+/// remote read, which are exactly the reads step-building resolves over; the names
+/// are structurally available, so this derives them without the type machinery.
+///
+/// # Panics
+/// A `Gather` (only a query string) and a non-aggregate `RemoteJoin` (needs the
+/// dropped SQL-assembly machinery) carry no structural names and panic loudly.
+fn output_column_names(plan: &PhysicalPlan) -> Vec<String> {
+    match plan {
+        PhysicalPlan::Cte(node) => cte_output_names(node),
+        PhysicalPlan::CteScan(node) => output_column_names(&node.producer),
+        PhysicalPlan::Shipment(node) => output_column_names(&node.child),
+        PhysicalPlan::AliasedRelation(node) => output_column_names(&node.input),
+        PhysicalPlan::CteMergeQuery(node) => node.output_names.clone(),
+        PhysicalPlan::Scan(node) => scan_output_names(node),
+        PhysicalPlan::Projection(node) => projection_output_names(node),
+        PhysicalPlan::Window(node) => node.output_names.clone(),
+        PhysicalPlan::Filter(node) => output_column_names(&node.input),
+        PhysicalPlan::HashJoin(node) => join_output_names(node.join_type, &node.left, &node.right),
+        PhysicalPlan::NestedLoopJoin(node) => {
+            join_output_names(node.join_type, &node.left, &node.right)
+        }
+        PhysicalPlan::HashAggregate(node) => node.output_names.clone(),
+        PhysicalPlan::Sort(node) => output_column_names(&node.input),
+        PhysicalPlan::Limit(node) => output_column_names(&node.input),
+        PhysicalPlan::Values(node) => node.output_names.clone(),
+        PhysicalPlan::RemoteQuery(node) => node.output_names.clone(),
+        PhysicalPlan::Union(node) => output_column_names(first_union_input(node)),
+        PhysicalPlan::SetOperation(node) => output_column_names(&node.left),
+        PhysicalPlan::RemoteSetOp(node) => output_column_names(&node.left),
+        PhysicalPlan::SingleRowGuard(node) => output_column_names(&node.input),
+        PhysicalPlan::GroupedLimit(node) => output_column_names(&node.input),
+        PhysicalPlan::LateralJoin(node) => node.output_names.clone(),
+        PhysicalPlan::Explain(_) => vec!["plan".to_string()],
+        PhysicalPlan::RemoteJoin(node) => remote_join_output_names(node),
+        PhysicalPlan::Gather(_) => panic!(
+            "Gather output column names need a live source probe; fq-plan carries \
+             only the query string"
+        ),
+    }
+}
+
+/// A scan's output names without a source probe: its seeded names when a shipped
+/// dimension seeds them, else its `output_names` (an aggregate/named scan), else
+/// its concrete `columns`. The name side of `PhysicalScan.schema().names`.
+fn scan_output_names(scan: &PhysicalScan) -> Vec<String> {
+    if let Some(seeded) = &scan.seeded_schema {
+        let mut names = Vec::with_capacity(seeded.len());
+        for (name, _) in seeded {
+            names.push(name.clone());
+        }
+        return names;
+    }
+    scan.output_names
+        .clone()
+        .unwrap_or_else(|| scan.columns.clone())
+}
+
+/// A projection's output names, splicing every input column in for a `*` column
+/// reference. The name side of `projection_schema`.
+fn projection_output_names(node: &PhysicalProjection) -> Vec<String> {
+    let mut names = Vec::new();
+    for (index, expr) in node.expressions.iter().enumerate() {
+        if let Expr::Column(col) = expr {
+            if col.column == "*" {
+                names.extend(output_column_names(&node.input));
+                continue;
+            }
+        }
+        names.push(node.output_names[index].clone());
+    }
+    names
+}
+
+/// A CTE's output names: the body's, relabeled when a differing `column_names`
+/// rename list is set. The name side of `PhysicalCTE.schema`.
+fn cte_output_names(node: &PhysicalCte) -> Vec<String> {
+    let base = output_column_names(&node.body);
+    match &node.column_names {
+        Some(names) if names != &base => names.clone(),
+        _ => base,
+    }
+}
+
+/// A binary join's output names: left names, then each right name renamed under
+/// the left-wins rule (SEMI/ANTI keep left only). The name side of
+/// `_join_output_schema`; `left_names` stays fixed as Python's does.
+fn join_output_names(
+    join_type: JoinType,
+    left: &PhysicalPlan,
+    right: &PhysicalPlan,
+) -> Vec<String> {
+    let mut names = output_column_names(left);
+    if matches!(join_type, JoinType::Semi | JoinType::Anti) {
+        return names;
+    }
+    let left_names = names.clone();
+    for right_name in output_column_names(right) {
+        names.push(right_output_name(&right_name, &left_names));
+    }
+    names
+}
+
+/// A non-aggregate `RemoteJoin` has no structural output names (they come from the
+/// dropped SQL-assembly machinery / a source probe); only its aggregate form does.
+fn remote_join_output_names(node: &PhysicalRemoteJoin) -> Vec<String> {
+    if let Some(names) = &node.output_names {
+        if !names.is_empty() {
+            return names.clone();
+        }
+    }
+    panic!(
+        "PhysicalRemoteJoin output column names need the dropped SQL-assembly \
+         machinery or a source probe; a bare RemoteJoin never reaches step-building"
+    )
+}
+
+/// The first branch of a union; a union always has at least one branch.
+fn first_union_input(node: &PhysicalUnion) -> &PhysicalPlan {
+    node.inputs
+        .first()
+        .expect("PhysicalUnion has at least one input branch")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -976,5 +1302,171 @@ mod tests {
             group_observation: None,
         }));
         let _ = remote.schema();
+    }
+
+    // ---- column_aliases() --------------------------------------------------
+
+    /// A scan of table `t` exposing `columns` under an optional alias.
+    fn scan_with(alias: Option<&str>, columns: &[&str]) -> PhysicalPlan {
+        let PhysicalPlan::Scan(mut base) = scan() else {
+            unreachable!()
+        };
+        base.alias = alias.map(str::to_string);
+        base.columns = columns.iter().map(|name| (*name).to_string()).collect();
+        PhysicalPlan::Scan(base)
+    }
+
+    /// A `(table, column)` alias-map key.
+    fn key(table: Option<&str>, column: &str) -> (Option<String>, String) {
+        (table.map(str::to_string), column.to_string())
+    }
+
+    #[test]
+    fn scan_exposes_its_columns_under_its_alias() {
+        let mut expected = ColumnAliasMap::new();
+        expected.insert(key(Some("o"), "id"), "id".to_string());
+        expected.insert(key(Some("o"), "amount"), "amount".to_string());
+        assert_eq!(
+            scan_with(Some("o"), &["id", "amount"]).column_aliases(),
+            expected
+        );
+    }
+
+    #[test]
+    fn scan_without_alias_exposes_nothing() {
+        assert!(scan_with(None, &["id", "amount"])
+            .column_aliases()
+            .is_empty());
+    }
+
+    #[test]
+    fn projection_maps_output_names_and_passthrough_sources() {
+        let projection = PhysicalPlan::Projection(PhysicalProjection {
+            input: Box::new(scan_with(Some("t"), &["region"])),
+            expressions: vec![column("t", "region", DataType::Varchar), int_literal(1)],
+            output_names: vec!["region".to_string(), "one".to_string()],
+            distinct: false,
+            distinct_on: None,
+        });
+        let mut expected = ColumnAliasMap::new();
+        expected.insert(key(None, "region"), "region".to_string());
+        expected.insert(key(Some("t"), "region"), "region".to_string());
+        expected.insert(key(None, "one"), "one".to_string());
+        assert_eq!(projection.column_aliases(), expected);
+    }
+
+    #[test]
+    fn aggregate_maps_group_key_source_and_output_names() {
+        let aggregate = PhysicalPlan::HashAggregate(PhysicalHashAggregate {
+            input: Box::new(scan_with(Some("t"), &["region"])),
+            group_by: vec![column("t", "region", DataType::Varchar)],
+            aggregates: vec![column("t", "region", DataType::Varchar), count_star()],
+            output_names: vec!["region".to_string(), "cnt".to_string()],
+            grouping_sets: None,
+            group_observation: None,
+        });
+        let mut expected = ColumnAliasMap::new();
+        expected.insert(key(None, "region"), "region".to_string());
+        expected.insert(key(Some("t"), "region"), "region".to_string());
+        expected.insert(key(None, "cnt"), "cnt".to_string());
+        assert_eq!(aggregate.column_aliases(), expected);
+    }
+
+    #[test]
+    fn inner_join_keeps_left_and_renames_colliding_right() {
+        let join = PhysicalPlan::HashJoin(PhysicalHashJoin {
+            left: Box::new(scan_with(Some("l"), &["id", "x"])),
+            right: Box::new(scan_with(Some("r"), &["id", "y"])),
+            join_type: JoinType::Inner,
+            left_keys: vec![],
+            right_keys: vec![],
+            build_side: BuildSide::Right,
+            estimated_rows: None,
+            estimate_defaults: None,
+        });
+        let mut expected = ColumnAliasMap::new();
+        expected.insert(key(Some("l"), "id"), "id".to_string());
+        expected.insert(key(Some("l"), "x"), "x".to_string());
+        // The right `id` collides with the left `id`, so it renames; `y` does not.
+        expected.insert(key(Some("r"), "id"), "right_id".to_string());
+        expected.insert(key(Some("r"), "y"), "y".to_string());
+        assert_eq!(join.column_aliases(), expected);
+    }
+
+    #[test]
+    fn semi_join_keeps_left_aliases_only() {
+        let join = PhysicalPlan::HashJoin(PhysicalHashJoin {
+            left: Box::new(scan_with(Some("l"), &["id"])),
+            right: Box::new(scan_with(Some("r"), &["id"])),
+            join_type: JoinType::Semi,
+            left_keys: vec![],
+            right_keys: vec![],
+            build_side: BuildSide::Right,
+            estimated_rows: None,
+            estimate_defaults: None,
+        });
+        let mut expected = ColumnAliasMap::new();
+        expected.insert(key(Some("l"), "id"), "id".to_string());
+        assert_eq!(join.column_aliases(), expected);
+    }
+
+    #[test]
+    fn filter_passes_through_its_child_aliases() {
+        let child = scan_with(Some("o"), &["id", "amount"]);
+        let filter = PhysicalPlan::Filter(PhysicalFilter {
+            input: Box::new(child.clone()),
+            predicate: Expr::Literal {
+                value: LiteralValue::Boolean(true),
+                data_type: DataType::Boolean,
+            },
+        });
+        assert_eq!(filter.column_aliases(), child.column_aliases());
+    }
+
+    #[test]
+    fn remote_query_returns_its_prebuilt_map() {
+        let mut map = ColumnAliasMap::new();
+        map.insert(key(Some("o"), "c_id"), "customer_id".to_string());
+        let remote = PhysicalPlan::RemoteQuery(Box::new(PhysicalRemoteQuery {
+            datasource: "duck".to_string(),
+            sql: "SELECT ...".to_string(),
+            output_names: vec!["customer_id".to_string()],
+            column_alias_map: map.clone(),
+            estimated_rows: None,
+            output_estimated_rows: None,
+            column_ndv: None,
+            seeded_schema: None,
+            group_observation: None,
+        }));
+        assert_eq!(remote.column_aliases(), map);
+    }
+
+    #[test]
+    fn limit_exposes_no_aliases() {
+        // A limit is one of the nodes that does NOT pass its child's aliases
+        // through (it returns the base empty map), unlike filter/sort.
+        let limit = PhysicalPlan::Limit(PhysicalLimit {
+            input: Box::new(scan_with(Some("o"), &["id"])),
+            limit: Some(10),
+            offset: 0,
+        });
+        assert!(limit.column_aliases().is_empty());
+    }
+
+    // ---- physical_column_name() --------------------------------------------
+
+    #[test]
+    fn physical_column_name_resolves_through_the_map() {
+        let mut aliases = ColumnAliasMap::new();
+        aliases.insert(key(Some("o"), "c_id"), "customer_id".to_string());
+        let hit = ColumnRef::new(Some("o".to_string()), "c_id", None);
+        assert_eq!(physical_column_name(&hit, &aliases), "customer_id");
+    }
+
+    #[test]
+    fn physical_column_name_falls_back_to_own_column() {
+        let aliases = ColumnAliasMap::new();
+        let miss = ColumnRef::new(Some("x".to_string()), "foo", None);
+        assert_eq!(physical_column_name(&miss, &aliases), "foo");
     }
 }
