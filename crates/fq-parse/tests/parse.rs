@@ -236,9 +236,12 @@ fn qualified_star_expands_one_table() {
 }
 
 #[test]
-fn distinct_is_rejected() {
-    let result = parse("SELECT DISTINCT name FROM t");
-    assert!(matches!(result, Err(ParseError::Unsupported(_))));
+fn distinct_sets_projection_flag() {
+    let plan = parse("SELECT DISTINCT name FROM t").unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection");
+    };
+    assert!(projection.distinct);
 }
 
 #[test]
@@ -247,4 +250,181 @@ fn garbage_sql_raises_parse_error() {
         parse("SELECT FROM WHERE"),
         Err(ParseError::Parse(_))
     ));
+}
+
+#[test]
+fn cast_carries_target_type() {
+    let plan = parse("SELECT CAST(a AS DECIMAL(10, 2)) AS d FROM t").unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection");
+    };
+    let Expr::Cast { target_type, .. } = &projection.expressions[0] else {
+        panic!("expected Cast, got {:?}", projection.expressions[0]);
+    };
+    assert_eq!(target_type, "DECIMAL(10, 2)");
+}
+
+#[test]
+fn double_colon_cast() {
+    let plan = parse("SELECT a::int FROM t").unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection");
+    };
+    assert!(matches!(projection.expressions[0], Expr::Cast { .. }));
+}
+
+#[test]
+fn simple_case_lowers_to_searched() {
+    // CASE x WHEN 1 THEN 'a' ELSE 'b' END -> searched form: WHEN x = 1 ...
+    let plan = parse("SELECT CASE x WHEN 1 THEN 'a' ELSE 'b' END AS c FROM t").unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection");
+    };
+    let Expr::Case { when_clauses, .. } = &projection.expressions[0] else {
+        panic!("expected Case");
+    };
+    // The branch condition is now `x = 1`, not the bare literal `1`.
+    assert!(matches!(
+        when_clauses[0].0,
+        Expr::BinaryOp {
+            op: BinaryOpType::Eq,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn between_in_where() {
+    let plan = parse("SELECT a FROM t WHERE a BETWEEN 1 AND 10").unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection");
+    };
+    let LogicalPlan::Filter(filter) = projection.input.as_ref() else {
+        panic!("expected Filter");
+    };
+    assert!(matches!(filter.predicate, Expr::Between { .. }));
+}
+
+#[test]
+fn not_between_wraps_in_not() {
+    let plan = parse("SELECT a FROM t WHERE a NOT BETWEEN 1 AND 10").unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection");
+    };
+    let LogicalPlan::Filter(filter) = projection.input.as_ref() else {
+        panic!("expected Filter");
+    };
+    assert!(matches!(
+        filter.predicate,
+        Expr::UnaryOp {
+            op: fq_plan::UnaryOpType::Not,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn in_list_predicate() {
+    let plan = parse("SELECT a FROM t WHERE a IN (1, 2, 3)").unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection");
+    };
+    let LogicalPlan::Filter(filter) = projection.input.as_ref() else {
+        panic!("expected Filter");
+    };
+    let Expr::InList { options, .. } = &filter.predicate else {
+        panic!("expected InList, got {:?}", filter.predicate);
+    };
+    assert_eq!(options.len(), 3);
+}
+
+#[test]
+fn in_subquery_predicate() {
+    let plan = parse("SELECT id FROM t WHERE id IN (SELECT uid FROM s)").unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection");
+    };
+    let LogicalPlan::Filter(filter) = projection.input.as_ref() else {
+        panic!("expected Filter");
+    };
+    let Expr::InSubquery { subquery, .. } = &filter.predicate else {
+        panic!("expected InSubquery");
+    };
+    // The subquery converted to a full plan.
+    assert!(matches!(subquery.as_ref(), LogicalPlan::Projection(_)));
+}
+
+#[test]
+fn exists_predicate() {
+    let plan = parse("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM s WHERE s.k = t.id)").unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection");
+    };
+    let LogicalPlan::Filter(filter) = projection.input.as_ref() else {
+        panic!("expected Filter");
+    };
+    assert!(matches!(filter.predicate, Expr::Exists { .. }));
+}
+
+#[test]
+fn scalar_subquery_in_select() {
+    let plan = parse("SELECT (SELECT MAX(v) FROM s) AS m FROM t").unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection");
+    };
+    assert!(matches!(projection.expressions[0], Expr::Subquery { .. }));
+}
+
+#[test]
+fn union_all_builds_set_operation() {
+    let plan = parse("SELECT a FROM t UNION ALL SELECT b FROM s").unwrap();
+    let LogicalPlan::SetOperation(setop) = plan else {
+        panic!("expected SetOperation, got {plan:?}");
+    };
+    assert_eq!(setop.kind, fq_plan::SetOpKind::Union);
+    assert!(!setop.distinct); // ALL
+}
+
+#[test]
+fn intersect_and_except() {
+    assert!(matches!(
+        parse("SELECT a FROM t INTERSECT SELECT b FROM s").unwrap(),
+        LogicalPlan::SetOperation(_)
+    ));
+    assert!(matches!(
+        parse("SELECT a FROM t EXCEPT SELECT b FROM s").unwrap(),
+        LogicalPlan::SetOperation(_)
+    ));
+}
+
+#[test]
+fn derived_table_in_from() {
+    let plan = parse("SELECT d.x FROM (SELECT x FROM t WHERE x > 1) AS d").unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection");
+    };
+    let LogicalPlan::SubqueryScan(subquery_scan) = projection.input.as_ref() else {
+        panic!("expected SubqueryScan, got {:?}", projection.input);
+    };
+    assert_eq!(subquery_scan.alias, "d");
+    assert!(matches!(
+        subquery_scan.input.as_ref(),
+        LogicalPlan::Projection(_)
+    ));
+}
+
+#[test]
+fn values_clause() {
+    let plan = parse("VALUES (1, 'a'), (2, 'b')").unwrap();
+    let LogicalPlan::Values(values) = plan else {
+        panic!("expected Values, got {plan:?}");
+    };
+    assert_eq!(values.rows.len(), 2);
+    assert_eq!(values.rows[0].len(), 2);
+}
+
+#[test]
+fn cte_still_raises() {
+    let result = parse("WITH c AS (SELECT a FROM t) SELECT a FROM c");
+    assert!(matches!(result, Err(ParseError::Unsupported(_))));
 }
