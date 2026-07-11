@@ -72,3 +72,6 @@ investigate-duckdb/duckdb-src/
 investigate-duckdb/pg-scanner-src/
 investigate-duckdb/bin/
 investigate-duckdb/clickhouse/
+
+# fedq-py build artifact symlink used by the benchmark runners
+benchmarks/**/fedq.so

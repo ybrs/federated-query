@@ -159,6 +159,61 @@ fn left_join_maps_join_type() {
 }
 
 #[test]
+fn comma_join_folds_into_cross_joins() {
+    // Implicit-join syntax (the TPC-H form): FROM a, b, c -> left-deep CROSS joins;
+    // the equi-predicates stay in WHERE for the optimizer to recover the graph.
+    let plan = parse("SELECT t.a FROM t, s, r WHERE t.id = s.id AND s.k = r.k").unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection");
+    };
+    let LogicalPlan::Filter(filter) = projection.input.as_ref() else {
+        panic!("expected Filter (the WHERE)");
+    };
+    // ((t CROSS s) CROSS r)
+    let LogicalPlan::Join(outer) = filter.input.as_ref() else {
+        panic!("expected outer Join");
+    };
+    assert_eq!(outer.join_type, fq_plan::JoinType::Cross);
+    assert!(outer.condition.is_none());
+    let LogicalPlan::Join(inner) = outer.left.as_ref() else {
+        panic!("expected inner Join");
+    };
+    assert_eq!(inner.join_type, fq_plan::JoinType::Cross);
+}
+
+#[test]
+fn like_and_ilike_map_to_binary_ops() {
+    use fq_plan::expr::BinaryOpType;
+    let plan = parse("SELECT a FROM t WHERE t.name LIKE 'x%'").unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection");
+    };
+    let LogicalPlan::Filter(filter) = projection.input.as_ref() else {
+        panic!("expected Filter");
+    };
+    let fq_plan::Expr::BinaryOp { op, .. } = &filter.predicate else {
+        panic!("expected a binary op predicate, got {:?}", filter.predicate);
+    };
+    assert_eq!(*op, BinaryOpType::Like);
+
+    // NOT LIKE wraps the Like in a NOT.
+    let plan = parse("SELECT a FROM t WHERE t.name NOT LIKE 'x%'").unwrap();
+    let LogicalPlan::Projection(p) = plan else {
+        panic!()
+    };
+    let LogicalPlan::Filter(f) = p.input.as_ref() else {
+        panic!()
+    };
+    assert!(matches!(
+        &f.predicate,
+        fq_plan::Expr::UnaryOp {
+            op: fq_plan::expr::UnaryOpType::Not,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn star_without_catalog_raises() {
     // No catalog -> the star cannot expand and must fail loudly.
     let result = parse("SELECT * FROM t");

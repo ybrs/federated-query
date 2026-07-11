@@ -11,7 +11,7 @@
 use fq_plan::expr::LiteralValue;
 use fq_plan::{BinaryOpType, ColumnRef, Expr, Quantifier, UnaryOpType};
 use polyglot_sql::expressions::{
-    AggFunc, Anonymous, Between, BinaryOp, Case, Cast, CountFunc, DataType, Expression, In,
+    AggFunc, Anonymous, Between, BinaryOp, Case, Cast, CountFunc, DataType, Expression, In, LikeOp,
     Literal, QuantifiedExpr,
 };
 
@@ -52,6 +52,8 @@ impl Converter<'_> {
             Expression::Cast(cast) => self.convert_cast(cast),
             Expression::Case(case) => self.convert_case(case),
             Expression::Between(between) => self.convert_between(between),
+            Expression::Like(like) => self.convert_like(like, BinaryOpType::Like),
+            Expression::ILike(like) => self.convert_like(like, BinaryOpType::Ilike),
             Expression::In(in_expr) => self.convert_in(in_expr),
             Expression::Exists(exists) => self.convert_exists(exists),
             Expression::Subquery(subquery) => self.convert_scalar_subquery(subquery),
@@ -169,6 +171,22 @@ impl Converter<'_> {
             upper: Box::new(self.expr(&between.high)?),
         };
         Ok(negate_if(between.not, range))
+    }
+
+    /// Convert `x LIKE y` / `x ILIKE y` to a binary op. An ESCAPE clause or a
+    /// quantifier (LIKE ANY/ALL) is not modeled, so it raises rather than drop it.
+    fn convert_like(&self, like: &LikeOp, op: BinaryOpType) -> Result<Expr, ParseError> {
+        if like.escape.is_some() {
+            return Err(ParseError::Unsupported("LIKE ... ESCAPE".to_string()));
+        }
+        if like.quantifier.is_some() {
+            return Err(ParseError::Unsupported("quantified LIKE".to_string()));
+        }
+        Ok(Expr::BinaryOp {
+            op,
+            left: Box::new(self.expr(&like.left)?),
+            right: Box::new(self.expr(&like.right)?),
+        })
     }
 
     /// Convert `x [NOT] IN (list)` or `x [NOT] IN (subquery)`.

@@ -198,11 +198,29 @@ impl<'a> Converter<'a> {
             .from
             .as_ref()
             .ok_or_else(|| ParseError::Unsupported("FROM-less SELECT".to_string()))?;
-        let [only] = from.expressions.as_slice() else {
-            return Err(ParseError::Unsupported("comma-joined FROM".to_string()));
-        };
+        let (first, rest) = from
+            .expressions
+            .split_first()
+            .ok_or_else(|| ParseError::Unsupported("FROM-less SELECT".to_string()))?;
         let mut tables = Vec::new();
-        let mut plan = self.convert_from_item(select, only, &mut tables)?;
+        let mut plan = self.convert_from_item(select, first, &mut tables)?;
+        // A comma-separated FROM list is an implicit CROSS JOIN of its items; fold
+        // each additional item left-deep. The equi-predicates that make it a real
+        // inner join live in WHERE, and the optimizer's join ordering recovers the
+        // join graph from the CROSS+filter region (so no join is missed here).
+        for item in rest {
+            let right = self.convert_from_item(select, item, &mut tables)?;
+            plan = LogicalPlan::Join(Join {
+                left: Box::new(plan),
+                right: Box::new(right),
+                join_type: JoinType::Cross,
+                condition: None,
+                natural: false,
+                using: None,
+                estimated_rows: None,
+                estimate_defaults: None,
+            });
+        }
         for join in &select.joins {
             plan = self.apply_join(select, plan, join, &mut tables)?;
         }
