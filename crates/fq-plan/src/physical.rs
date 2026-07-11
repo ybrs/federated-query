@@ -443,9 +443,7 @@ impl PhysicalPlan {
             PhysicalPlan::NestedLoopJoin(node) => {
                 join_schema(node.join_type, &node.left, &node.right)
             }
-            PhysicalPlan::HashAggregate(node) => {
-                typed_outputs(&node.aggregates, &node.output_names)
-            }
+            PhysicalPlan::HashAggregate(node) => aggregate_schema(node),
             PhysicalPlan::Sort(node) => node.input.schema(),
             PhysicalPlan::Limit(node) => node.input.schema(),
             PhysicalPlan::Values(node) => values_schema(node),
@@ -484,6 +482,62 @@ fn typed_outputs(exprs: &[Expr], names: &[String]) -> Vec<(String, DataType)> {
         fields.push((name.clone(), expr.get_type()));
     }
     fields
+}
+
+/// A hash aggregate's output schema. Its `aggregates` list is the full output
+/// list (group keys AND aggregate calls) parallel to `output_names`. A direct
+/// aggregate call is typed by the ARGUMENT-aware rule (`aggregate_output_type`);
+/// a group key or a scalar-over-aggregates falls back to structural `get_type`.
+/// Ports `PhysicalHashAggregate._infer_output_type`; the name-only aggregate
+/// typing in `get_type` would mis-declare SUM(float) as BIGINT and MIN/MAX as
+/// VARCHAR, corrupting the seeded island schema.
+fn aggregate_schema(node: &PhysicalHashAggregate) -> Vec<(String, DataType)> {
+    assert_eq!(
+        node.aggregates.len(),
+        node.output_names.len(),
+        "physical schema: aggregate output expression/name arity mismatch"
+    );
+    let mut fields = Vec::with_capacity(node.output_names.len());
+    for (name, expr) in node.output_names.iter().zip(&node.aggregates) {
+        fields.push((name.clone(), aggregate_output_type(expr)));
+    }
+    fields
+}
+
+/// The declared output type of one aggregate-list item. A direct aggregate call
+/// uses the argument-aware rule; anything else (a group key column, a scalar over
+/// aggregates) is typed structurally by `get_type`.
+fn aggregate_output_type(expr: &Expr) -> DataType {
+    if let Expr::FunctionCall {
+        function_name,
+        args,
+        is_aggregate: true,
+        ..
+    } = expr
+    {
+        return infer_aggregate_type(function_name, args);
+    }
+    expr.get_type()
+}
+
+/// The result type of an aggregate function from its name and first argument.
+/// Ports `_infer_aggregate_type` + `_sum_result_type`: COUNT is BIGINT; MIN/MAX
+/// preserve the argument type (so MIN(name) stays VARCHAR, not a numeric lie);
+/// AVG is DOUBLE; SUM widens integers to BIGINT but keeps float/decimal; any
+/// other aggregate falls back to its argument type.
+fn infer_aggregate_type(function_name: &str, args: &[Expr]) -> DataType {
+    let name = function_name.to_uppercase();
+    if name == "COUNT" || name == "COUNT_DISTINCT" {
+        return DataType::BigInt;
+    }
+    let arg_type = args.first().map_or(DataType::Null, Expr::get_type);
+    match name.as_str() {
+        "AVG" => DataType::Double,
+        "SUM" if matches!(arg_type, DataType::Integer | DataType::BigInt) => DataType::BigInt,
+        // MIN / MAX / SUM-of-float-or-decimal / any other aggregate: keep the
+        // argument type - the safest declaration.
+        _ => arg_type,
+    }
 }
 
 /// A projection's output schema: each expression typed by `get_type`, except a
@@ -768,6 +822,48 @@ mod tests {
             distinct_on: None,
         });
         assert_eq!(star.schema(), vec![("only".to_string(), DataType::Integer)]);
+    }
+
+    /// An aggregate call `name(col)` over a column of `arg_type`.
+    fn agg(name: &str, arg_type: DataType) -> Expr {
+        Expr::FunctionCall {
+            function_name: name.to_string(),
+            args: vec![column("t", "v", arg_type)],
+            is_aggregate: true,
+            distinct: false,
+            within_group_key: None,
+            within_group_desc: false,
+        }
+    }
+
+    #[test]
+    fn aggregate_output_types_are_argument_aware() {
+        // SUM keeps float/decimal, widens integer to BIGINT; MIN/MAX preserve the
+        // argument type; AVG is DOUBLE; COUNT is BIGINT. (The name-only get_type
+        // path mis-declared SUM(float) as BIGINT and MIN/MAX as VARCHAR.)
+        let cases = [
+            ("sum", DataType::Double, DataType::Double),
+            ("sum", DataType::Decimal, DataType::Decimal),
+            ("sum", DataType::Integer, DataType::BigInt),
+            ("min", DataType::Date, DataType::Date),
+            ("max", DataType::Double, DataType::Double),
+            ("avg", DataType::Double, DataType::Double),
+        ];
+        for (name, arg_type, expected) in cases {
+            let aggregate = PhysicalPlan::HashAggregate(PhysicalHashAggregate {
+                input: Box::new(scan()),
+                group_by: vec![],
+                aggregates: vec![agg(name, arg_type)],
+                output_names: vec!["out".to_string()],
+                grouping_sets: None,
+                group_observation: None,
+            });
+            assert_eq!(
+                aggregate.schema(),
+                vec![("out".to_string(), expected)],
+                "{name}({arg_type:?})"
+            );
+        }
     }
 
     #[test]
