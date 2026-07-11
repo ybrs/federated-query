@@ -7,6 +7,27 @@
 
 use thiserror::Error;
 
+use fq_decorrelate::DecorrelationError;
+
+/// A failure applying an optimization rule to a logical plan.
+///
+/// Only ONE rule can raise: `ProjectionPushdown`'s column pruner, on a plan node
+/// outside its modeled set (a silently-skipped node could leave scans with stale
+/// semantics). Every other rule DECLINES (returns the plan unchanged). The driver
+/// additionally raises `Scope` when a rule that changed the plan produced a
+/// mis-scoped one - the loud safety net that fails at the rule that broke it.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum OptimizeError {
+    /// `ProjectionPushdown`'s pruner reached a plan node it has no rule for.
+    #[error("projection pushdown has no prune rule for plan node {0}")]
+    PruneNoRule(&'static str),
+
+    /// A rule produced a plan where a qualified reference escaped its relation's
+    /// scope, caught by `validate_scope` after the rule changed the plan.
+    #[error(transparent)]
+    Scope(#[from] DecorrelationError),
+}
+
 /// A failure estimating a logical subplan's cardinality.
 ///
 /// PartialEq is intentionally NOT derived: the wrapped `CatalogError`/`StatsError`
