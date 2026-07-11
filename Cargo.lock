@@ -1822,6 +1822,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "fq-runtime"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "fq-bind",
+ "fq-catalog",
+ "fq-common",
+ "fq-connectors",
+ "fq-decorrelate",
+ "fq-exec",
+ "fq-optimize",
+ "fq-parse",
+ "fq-physical",
+ "fq-plan",
+ "serde_yaml",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "funty"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

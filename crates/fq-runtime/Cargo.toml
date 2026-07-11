@@ -1,0 +1,35 @@
+[package]
+name = "fq-runtime"
+version = "0.1.0"
+edition.workspace = true
+
+# fq-runtime: the config-driven orchestration that ties the whole Rust pipeline
+# together. `Runtime::from_config` wires each configured datasource into a shared
+# catalog (metadata/stats) AND the fq-exec data plane; `Runtime::execute(sql)`
+# runs parse -> bind -> decorrelate -> optimize -> physical-plan -> execute and
+# renames the result to the query's user-visible column names. This crate is
+# pyo3-FREE; the fedq-py crate wraps it behind the Python FFI.
+
+[dependencies]
+fq-common = { path = "../fq-common" }
+fq-catalog = { path = "../fq-catalog" }
+fq-plan = { path = "../fq-plan" }
+fq-connectors = { path = "../fq-connectors" }
+fq-parse = { path = "../fq-parse" }
+fq-bind = { path = "../fq-bind" }
+fq-decorrelate = { path = "../fq-decorrelate" }
+fq-optimize = { path = "../fq-optimize" }
+fq-physical = { path = "../fq-physical" }
+fq-exec = { path = "../fq-exec" }
+# The result rename rebuilds the final RecordBatch/Schema under user-visible names.
+arrow = "58"
+# Datasource connection params arrive as raw YAML values on DataSourceConfig.
+serde_yaml = "0.9"
+thiserror = "2"
+
+[dev-dependencies]
+# The DuckDB e2e tests write a temporary config file and assert Arrow rows.
+arrow-array = "58"
+
+[lints]
+workspace = true

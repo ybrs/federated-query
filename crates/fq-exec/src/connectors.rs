@@ -327,7 +327,17 @@ async fn register_parquet_dir(
 }
 
 fn open_duckdb(path: &str) -> Result<duckdb::Connection, String> {
-    duckdb::Connection::open(path).map_err(|e| format!("duckdb open '{path}': {e}"))
+    // Read-only open: DuckDB is single-writer per file per process, so the
+    // runtime's metadata/stats handle (fq-connectors, also read-only) and this
+    // execution handle must both be read-only to coexist on one file. The
+    // federated benchmarks are read-only; the only writes this engine issues are
+    // CREATE TEMP TABLE (dim shipping, semi-join reduction), which DuckDB allows
+    // on a read-only database because temp objects never touch the file.
+    let config = duckdb::Config::default()
+        .access_mode(duckdb::AccessMode::ReadOnly)
+        .map_err(|e| format!("duckdb config '{path}': {e}"))?;
+    duckdb::Connection::open_with_flags(path, config)
+        .map_err(|e| format!("duckdb open '{path}': {e}"))
 }
 
 // A per-fetch DuckDB cursor over ONE process-wide open database instance per

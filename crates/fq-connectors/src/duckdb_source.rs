@@ -33,6 +33,25 @@ impl DuckDbSource {
         })
     }
 
+    /// Open a DuckDB database file READ-ONLY as a named source.
+    ///
+    /// DuckDB is single-writer per file per process: two read-write handles on
+    /// one file conflict on the file lock. The runtime holds this metadata/stats
+    /// handle open for the whole session while the fq-exec data plane opens the
+    /// SAME file to read; opening both read-only lets the handles coexist. The
+    /// metadata/stats path never writes, so read-only loses nothing.
+    pub fn open_read_only(name: impl Into<String>, path: &str) -> Result<Self, CatalogError> {
+        let config = duckdb::Config::default()
+            .access_mode(duckdb::AccessMode::ReadOnly)
+            .map_err(|error| to_source_err(&error))?;
+        let connection =
+            Connection::open_with_flags(path, config).map_err(|error| to_source_err(&error))?;
+        Ok(Self {
+            name: name.into(),
+            connection: Mutex::new(connection),
+        })
+    }
+
     /// Open an in-memory DuckDB database (used by tests).
     pub fn open_in_memory(name: impl Into<String>) -> Result<Self, CatalogError> {
         let connection = Connection::open_in_memory().map_err(|error| to_source_err(&error))?;
