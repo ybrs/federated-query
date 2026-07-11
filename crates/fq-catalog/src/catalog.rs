@@ -109,6 +109,14 @@ impl Catalog {
         self.datasources.len()
     }
 
+    /// The names of every registered data source, sorted for determinism. Used
+    /// by single-source pushdown to resolve the sole source of a CTE-only body.
+    pub fn datasource_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.datasources.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     /// Number of registered schemas.
     pub fn schema_count(&self) -> usize {
         self.schemas.len()

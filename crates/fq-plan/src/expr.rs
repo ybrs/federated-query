@@ -612,6 +612,17 @@ pub fn contains_aggregate(expr: &Expr) -> bool {
         .any(|child| contains_aggregate(child))
 }
 
+/// Whether an expression tree contains a window function. Ports the Python
+/// `_expression_contains_window`; used to route a windowed aggregate output
+/// through the raw SQL emitter (a window over grouped aggregates cannot be
+/// expressed by the structured aggregate fragment).
+pub fn contains_window(expr: &Expr) -> bool {
+    if matches!(expr, Expr::Window { .. }) {
+        return true;
+    }
+    expr.children().iter().any(|child| contains_window(child))
+}
+
 /// Flatten the top-level AND chain of a predicate into its conjuncts.
 pub fn split_conjuncts(expr: &Expr) -> Vec<&Expr> {
     let mut out = Vec::new();
@@ -757,6 +768,36 @@ mod tests {
             value: LiteralValue::Integer(value),
             data_type: DataType::Integer,
         }
+    }
+
+    fn window(inner: Expr) -> Expr {
+        Expr::Window {
+            function: Box::new(inner),
+            partition_by: Vec::new(),
+            order_keys: Vec::new(),
+            order_ascending: Vec::new(),
+            order_nulls: Vec::new(),
+            frame: None,
+        }
+    }
+
+    #[test]
+    fn contains_window_detects_direct_and_nested() {
+        // Direct window.
+        assert!(contains_window(&window(col("a"))));
+        // Window nested inside an arithmetic expression is found via children.
+        let nested = Expr::BinaryOp {
+            op: BinaryOpType::Add,
+            left: Box::new(window(col("a"))),
+            right: Box::new(int(1)),
+        };
+        assert!(contains_window(&nested));
+        // No window present.
+        assert!(!contains_window(&Expr::BinaryOp {
+            op: BinaryOpType::Add,
+            left: Box::new(col("a")),
+            right: Box::new(int(1)),
+        }));
     }
 
     #[test]

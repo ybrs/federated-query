@@ -95,8 +95,9 @@ impl CostModel {
 }
 
 /// The catalog subject for an aggregate's input: a single UNFILTERED base table's
-/// name, else the input's subplan signature.
-fn group_subject(input: &LogicalPlan) -> String {
+/// name, else the input's subplan signature. Public so the physical planner and
+/// dim shipping stamp the SAME subject the cost model reads learned counts under.
+pub fn group_subject(input: &LogicalPlan) -> String {
     if let LogicalPlan::Scan(scan) = input {
         if scan.filters.is_none() {
             return format!(

@@ -34,4 +34,6 @@ pub use logical::{
     JoinType, LateralJoin, Limit, LogicalPlan, Projection, Scan, SetOpKind, SetOperation,
     SingleRowGuard, Sort, SubqueryScan, Union, Values,
 };
-pub use physical::{BuildSide, ColumnAliasMap, PhysicalPlan, SeededSchema};
+pub use physical::{
+    BuildSide, ColumnAliasMap, GroupObservation, PhysicalPlan, PhysicalRemoteQuery, SeededSchema,
+};

@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 
 use fq_common::DataType;
 
-use crate::expr::{Expr, NullsOrder};
+use crate::expr::{contains_window, BinaryOpType, Expr, NullsOrder};
 use crate::logical::{ExplainFormat, JoinType, SetOpKind};
 
 /// A `(table, column) -> physical output column name` map. `table` is None for
@@ -41,6 +41,16 @@ pub type ColumnAliasMap = BTreeMap<(Option<String>, String), String>;
 /// A seeded output schema: ordered (column name, engine type) pairs. Replaces the
 /// Arrow `pa.Schema` seeded onto shipped islands; fq-exec converts to Arrow.
 pub type SeededSchema = Vec<(String, DataType)>;
+
+/// A learned group-count provenance stamp. Ports the Python `group_observation`
+/// dict carried on aggregate producers: `subject` is the learned-stats subject
+/// key (a table name or a subplan signature) and `columns` the grouping columns,
+/// so a later run can read back the measured group count for this exact grouping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupObservation {
+    pub subject: String,
+    pub columns: Vec<String>,
+}
 
 /// Which side of a hash join is the build side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,6 +206,19 @@ pub struct PhysicalHashAggregate {
     pub aggregates: Vec<Expr>,
     pub output_names: Vec<String>,
     pub grouping_sets: Option<Vec<Vec<Expr>>>,
+    /// Learned group-count provenance for the coordinator aggregate, stamped by
+    /// the physical planner; None until then.
+    pub group_observation: Option<GroupObservation>,
+}
+
+impl PhysicalHashAggregate {
+    /// Whether an output aggregate expression carries a window function. Such an
+    /// aggregate (e.g. `sum(sum(x)) OVER (...) ... GROUP BY ...`) is valid SQL but
+    /// the structured aggregate fragment cannot express it, so it is emitted
+    /// through the raw aggregate-SQL path instead. Ports `has_window_output`.
+    pub fn has_window_output(&self) -> bool {
+        self.aggregates.iter().any(contains_window)
+    }
 }
 
 /// A cross-source sort.
@@ -235,6 +258,10 @@ pub struct PhysicalRemoteQuery {
     pub output_estimated_rows: Option<u64>,
     pub column_ndv: Option<BTreeMap<String, i64>>,
     pub seeded_schema: Option<SeededSchema>,
+    /// Learned group-count provenance stamped when this remote query is a shipped
+    /// dimension island whose aggregate collapses on the fact source; None
+    /// otherwise.
+    pub group_observation: Option<GroupObservation>,
 }
 
 /// An n-ary union of inputs sharing a schema.
@@ -287,8 +314,9 @@ pub struct PhysicalGroupedLimit {
 }
 
 /// A dependent (lateral) join whose right side (`lateral_sql`) is evaluated per
-/// left row. `correlations` pairs each outer reference name with its type and the
-/// inner parameter name.
+/// left row. `correlations` pairs each inner column with its comparison operator
+/// and the outer column it correlates to, so the base can be reduced to the
+/// left's correlation domain (a dynamic filter) before transfer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhysicalLateralJoin {
     pub left: Box<PhysicalPlan>,
@@ -299,7 +327,7 @@ pub struct PhysicalLateralJoin {
     pub lateral_sql: String,
     pub output_names: Vec<String>,
     pub join_type: JoinType,
-    pub correlations: Vec<(String, DataType, String)>,
+    pub correlations: Vec<(String, BinaryOpType, String)>,
 }
 
 /// Builds the EXPLAIN document without executing.

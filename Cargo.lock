@@ -795,6 +795,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fq-physical"
+version = "0.1.0"
+dependencies = [
+ "fq-bind",
+ "fq-catalog",
+ "fq-common",
+ "fq-connectors",
+ "fq-decorrelate",
+ "fq-emit",
+ "fq-optimize",
+ "fq-parse",
+ "fq-plan",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "fq-plan"
 version = "0.1.0"
 dependencies = [

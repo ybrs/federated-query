@@ -11,6 +11,8 @@ mod ordinal;
 mod scan;
 mod selectivity;
 
+pub use aggregate::group_subject;
+
 use std::collections::HashMap;
 
 use fq_common::CostConfig;
