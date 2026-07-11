@@ -31,6 +31,7 @@ fn scan(table: &str, alias: &str, rows: Option<u64>) -> PhysicalPlan {
         estimated_rows: rows,
         column_ndv: None,
         seeded_schema: None,
+        datasource_kind: fq_plan::physical::DatasourceKind::DuckDb,
     }))
 }
 

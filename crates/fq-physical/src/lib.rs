@@ -10,6 +10,8 @@ pub mod error;
 pub mod planner;
 mod relation_sql;
 pub mod single_source;
+pub mod steps;
 
 pub use error::PhysicalError;
 pub use planner::PhysicalPlanner;
+pub use steps::{build_steps, BuiltSteps, Fragment, Observation, ScanSpec, Step, StepError};

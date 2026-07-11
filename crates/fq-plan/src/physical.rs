@@ -63,6 +63,20 @@ pub enum BuildSide {
     Right,
 }
 
+/// The engine a scan's datasource speaks. Stamped on `PhysicalScan` by the
+/// physical planner (which already resolves the datasource) so step-building can
+/// pick the source render dialect and gate the Postgres-only parallel-scan path
+/// WITHOUT a catalog - keeping `build_steps` a pure function of the plan. Ports
+/// the Python step builder reading `isinstance(node.datasource_connection, ...)`
+/// off the node. fq-plan cannot depend on fq-catalog's `RenderDialect`, so this is
+/// a small local mirror the planner maps onto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatasourceKind {
+    Postgres,
+    DuckDb,
+    ClickHouse,
+}
+
 /// Materializes a cross-source CTE body once, shared by every reference.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhysicalCte {
@@ -133,6 +147,9 @@ pub struct PhysicalScan {
     pub estimated_rows: Option<u64>,
     pub column_ndv: Option<BTreeMap<String, i64>>,
     pub seeded_schema: Option<SeededSchema>,
+    /// The engine this scan's datasource speaks; the planner stamps it so
+    /// step-building picks the source dialect and gates the Postgres parallel path.
+    pub datasource_kind: DatasourceKind,
 }
 
 /// Projection (SELECT list) over an input.
@@ -860,7 +877,11 @@ fn remote_join_column_aliases(node: &PhysicalRemoteJoin) -> ColumnAliasMap {
 /// # Panics
 /// A `Gather` (only a query string) and a non-aggregate `RemoteJoin` (needs the
 /// dropped SQL-assembly machinery) carry no structural names and panic loudly.
-fn output_column_names(plan: &PhysicalPlan) -> Vec<String> {
+///
+/// Made public for step-building (fq-physical): the grouped-limit / CTE-relabel
+/// renderers need a node's output NAMES without probing a source or typing every
+/// column (which `schema()` would panic on for a non-seeded scan).
+pub fn output_column_names(plan: &PhysicalPlan) -> Vec<String> {
     match plan {
         PhysicalPlan::Cte(node) => cte_output_names(node),
         PhysicalPlan::CteScan(node) => output_column_names(&node.producer),
@@ -1004,6 +1025,7 @@ mod tests {
             estimated_rows: None,
             column_ndv: None,
             seeded_schema: None,
+            datasource_kind: DatasourceKind::Postgres,
         }))
     }
 

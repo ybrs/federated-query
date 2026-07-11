@@ -553,6 +553,7 @@ mod tests {
             estimated_rows: rows,
             column_ndv: None,
             seeded_schema: None,
+            datasource_kind: fq_plan::physical::DatasourceKind::Postgres,
         };
         PhysicalPlan::Scan(Box::new(scan))
     }

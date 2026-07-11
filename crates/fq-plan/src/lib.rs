@@ -36,6 +36,6 @@ pub use logical::{
     SingleRowGuard, Sort, SubqueryScan, Union, Values,
 };
 pub use physical::{
-    physical_column_name, BuildSide, ColumnAliasMap, GroupObservation, PhysicalPlan,
-    PhysicalRemoteQuery, SeededSchema,
+    output_column_names, physical_column_name, BuildSide, ColumnAliasMap, DatasourceKind,
+    GroupObservation, PhysicalPlan, PhysicalRemoteQuery, SeededSchema,
 };

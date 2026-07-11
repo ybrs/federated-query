@@ -18,13 +18,14 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use fq_catalog::{Catalog, StatsCatalog};
+use fq_catalog::{Catalog, RenderDialect, StatsCatalog};
 use fq_optimize::{group_column_names, subplan_signature, CostModel};
 use fq_plan::expr::Expr;
 use fq_plan::logical::{
     Aggregate, Explain, Filter, GroupedLimit, LogicalPlan, Projection, Scan, SingleRowGuard,
     SubqueryScan, Union, Values,
 };
+use fq_plan::physical::DatasourceKind;
 use fq_plan::physical::{
     GroupObservation, PhysicalAliasedRelation, PhysicalCte, PhysicalExplain, PhysicalFilter,
     PhysicalGroupedLimit, PhysicalHashAggregate, PhysicalLimit, PhysicalPlan, PhysicalProjection,
@@ -35,6 +36,17 @@ use fq_plan::physical::{
 use crate::dim_shipping::DimShipping;
 use crate::error::PhysicalError;
 use crate::single_source::SingleSourcePushdown;
+
+/// Map a resolved datasource's render dialect to the plan-level `DatasourceKind`
+/// stamped on a scan, so step-building needs no catalog to pick the source dialect
+/// or gate the Postgres parallel path.
+fn datasource_kind_of(dialect: RenderDialect) -> DatasourceKind {
+    match dialect {
+        RenderDialect::Postgres => DatasourceKind::Postgres,
+        RenderDialect::DuckDb => DatasourceKind::DuckDb,
+        RenderDialect::ClickHouse => DatasourceKind::ClickHouse,
+    }
+}
 
 /// Converts an optimized logical plan into a physical plan tree.
 pub struct PhysicalPlanner {
@@ -213,9 +225,10 @@ impl PhysicalPlanner {
     /// though the connection is not stored on the node), then annotates its row
     /// estimate for reduction orientation.
     fn plan_scan(&mut self, scan: &Scan) -> Result<PhysicalPlan, PhysicalError> {
-        if self.catalog.get_datasource(&scan.datasource).is_none() {
+        let Some(datasource) = self.catalog.get_datasource(&scan.datasource) else {
             return Err(PhysicalError::DatasourceNotFound(scan.datasource.clone()));
-        }
+        };
+        let datasource_kind = datasource_kind_of(datasource.render_dialect());
         let estimated_rows = self.scan_estimated_rows(scan)?;
         Ok(PhysicalPlan::Scan(Box::new(PhysicalScan {
             datasource: scan.datasource.clone(),
@@ -239,6 +252,7 @@ impl PhysicalPlanner {
             estimated_rows,
             column_ndv: scan.column_ndv.clone(),
             seeded_schema: None,
+            datasource_kind,
         })))
     }
 
