@@ -265,7 +265,10 @@ fn cross_source_non_equi_join_lowers_to_nested_loop() {
 }
 
 #[test]
-fn same_source_join_lowers_to_remote_join() {
+fn same_source_join_pushes_to_one_remote_query() {
+    // M2 enabled: single-source pushdown now fires FIRST and absorbs the whole
+    // projection-over-join subtree into one PhysicalRemoteQuery (previously this
+    // reached the planner's RemoteJoin path only because pushdown was stubbed).
     let catalog = catalog();
     let physical = plan_sql(
         &catalog,
@@ -273,18 +276,25 @@ fn same_source_join_lowers_to_remote_join() {
          JOIN pg.public.customer ON orders.cust_id = customer.id",
     );
     let remotes = find_all(&physical, &|node| {
-        matches!(node, PhysicalPlan::RemoteJoin(_))
+        matches!(node, PhysicalPlan::RemoteQuery(_))
     });
     assert_eq!(
         remotes.len(),
         1,
-        "same-source join collapses to a remote join"
+        "same-source join collapses to one remote query"
     );
-    let PhysicalPlan::RemoteJoin(remote) = remotes[0] else {
+    let PhysicalPlan::RemoteQuery(remote) = remotes[0] else {
         unreachable!()
     };
-    assert!(matches!(remote.left.as_ref(), PhysicalPlan::Scan(_)));
-    assert!(matches!(remote.right.as_ref(), PhysicalPlan::Scan(_)));
+    assert_eq!(remote.datasource, "pg");
+    assert!(
+        remote.sql.contains("JOIN"),
+        "the one remote query joins both tables: {}",
+        remote.sql
+    );
+    // No cross-source join node survives - the whole thing is pushed.
+    assert!(find_all(&physical, &|n| matches!(n, PhysicalPlan::RemoteJoin(_))).is_empty());
+    assert!(find_all(&physical, &|n| matches!(n, PhysicalPlan::HashJoin(_))).is_empty());
 }
 
 #[test]
@@ -633,17 +643,27 @@ fn cross_source_lateral_with_multiple_base_relations_raises() {
 }
 
 #[test]
-fn cross_source_lateral_raises_when_right_side_not_renderable() {
-    // A single base scan on the right, but single-source rendering is stubbed to
-    // decline this milestone, so the LATERAL is not renderable.
+fn cross_source_lateral_lowers_to_a_lateral_join() {
+    // M2 enabled: the LATERAL right side (a single base scan) now renders for the
+    // merge engine via render_correlated_sql, so the cross-source LATERAL lowers to
+    // a PhysicalLateralJoin (previously it raised only because rendering was
+    // stubbed to decline).
     let catalog = catalog();
     let lateral = LogicalPlan::LateralJoin(LateralJoin {
         left: Box::new(lscan("pg", "public", "orders", &["id"])),
         right: Box::new(lscan("duck", "main", "lineitem", &["l_orderkey"])),
         join_type: JoinType::Inner,
     });
-    let error = plan_logical(&catalog, &lateral).unwrap_err();
-    assert!(matches!(error, PhysicalError::LateralNotRenderable));
+    let physical = plan_logical(&catalog, &lateral).expect("plan");
+    let PhysicalPlan::LateralJoin(node) = &physical else {
+        panic!("cross-source LATERAL lowers to a lateral join, got {physical:?}")
+    };
+    // The right side is registered as `lat_b0` in the rendered lateral SQL.
+    assert!(
+        node.lateral_sql.contains("lat_b0"),
+        "the lateral SQL names the registered base relation: {}",
+        node.lateral_sql
+    );
 }
 
 // --------------------------------------------------------------------------
@@ -654,6 +674,10 @@ fn cross_source_lateral_raises_when_right_side_not_renderable() {
 fn window_projection_lowers_to_a_window_node() {
     // The Rust parser does not accept window syntax yet, so the window-bearing
     // projection is built directly. A Window expression selects PhysicalWindow.
+    // M2 note: a SINGLE-source window projection now pushes as one remote query
+    // (has_computed && !has_aggregate), so this drives the window over a
+    // CROSS-source join, where pushdown declines and the coordinator Window path
+    // is exercised.
     let catalog = catalog();
     let window = Expr::Window {
         function: Box::new(Expr::FunctionCall {
@@ -670,8 +694,18 @@ fn window_projection_lowers_to_a_window_node() {
         order_nulls: vec![None],
         frame: None,
     };
+    let join = LogicalPlan::Join(Join {
+        left: Box::new(lscan("pg", "public", "orders", &["id"])),
+        right: Box::new(lscan("duck", "main", "lineitem", &["l_orderkey"])),
+        join_type: JoinType::Inner,
+        condition: Some(eq(col("orders", "id"), col("lineitem", "l_orderkey"))),
+        natural: false,
+        using: None,
+        estimated_rows: None,
+        estimate_defaults: None,
+    });
     let projection = LogicalPlan::Projection(Projection {
-        input: Box::new(lscan("pg", "public", "orders", &["id"])),
+        input: Box::new(join),
         expressions: vec![col("orders", "id"), window],
         aliases: vec!["id".to_string(), "rn".to_string()],
         distinct: false,

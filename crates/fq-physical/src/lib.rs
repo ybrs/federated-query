@@ -8,6 +8,7 @@
 pub mod dim_shipping;
 pub mod error;
 pub mod planner;
+mod relation_sql;
 pub mod single_source;
 
 pub use error::PhysicalError;
