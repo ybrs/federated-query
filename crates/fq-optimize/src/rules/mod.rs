@@ -10,7 +10,9 @@
 //! plan unchanged.
 
 mod aggregate;
+mod cte_union_filter;
 mod driver;
+mod eager_aggregation;
 mod join_ordering;
 mod limit;
 mod order_by;
@@ -23,7 +25,9 @@ use fq_plan::logical::LogicalPlan;
 use crate::error::OptimizeError;
 
 pub use aggregate::AggregatePushdown;
+pub use cte_union_filter::CTEUnionFilterPushdown;
 pub use driver::{build_optimizer, RuleBasedOptimizer};
+pub use eager_aggregation::EagerAggregation;
 pub use join_ordering::JoinOrdering;
 pub use limit::LimitPushdown;
 pub use order_by::OrderByPushdown;

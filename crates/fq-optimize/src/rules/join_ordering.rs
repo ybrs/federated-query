@@ -21,6 +21,7 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 use fq_plan::expr::{and_expressions, combine_and, BinaryOpType, ColumnRef, Expr};
 use fq_plan::logical::{Filter, Join, JoinType, LogicalPlan};
@@ -1073,15 +1074,17 @@ fn verify_placement(total: usize, placed: &[usize]) -> Result<(), OptimizeError>
 /// region in pushdown's normal form. Every region conjunct must be placed exactly
 /// once - a mismatch raises instead of silently dropping a predicate.
 pub struct JoinOrdering {
-    cost_model: RefCell<CostModel>,
+    cost_model: Rc<RefCell<CostModel>>,
     max_join_reorder_size: usize,
 }
 
 impl JoinOrdering {
-    /// The rule over a cost model and the DP size limit.
-    pub fn new(cost_model: CostModel, max_join_reorder_size: usize) -> Self {
+    /// The rule over a SHARED cost model (the `Rc<RefCell<..>>` handle
+    /// `EagerAggregation` also holds - it is always on and needs the estimator
+    /// even when join reordering is off) and the DP size limit.
+    pub fn new(cost_model: Rc<RefCell<CostModel>>, max_join_reorder_size: usize) -> Self {
         Self {
-            cost_model: RefCell::new(cost_model),
+            cost_model,
             max_join_reorder_size,
         }
     }

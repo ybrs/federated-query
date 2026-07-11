@@ -7,7 +7,9 @@
 
 use super::*;
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use fq_catalog::datasource::{
@@ -24,6 +26,11 @@ use crate::statistics::StatisticsCollector;
 /// Whether two costs coincide within a tolerance (float comparisons are pedantic).
 fn close(actual: f64, expected: f64) -> bool {
     (actual - expected).abs() < 1e-9
+}
+
+/// Wrap a cost model in the shared handle `JoinOrdering::new` now takes.
+fn shared(cost: CostModel) -> Rc<RefCell<CostModel>> {
+    Rc::new(RefCell::new(cost))
 }
 
 // ------------------------------- shared builders ----------------------------
@@ -774,7 +781,7 @@ fn collect_scans(plan: &LogicalPlan, found: &mut BTreeMap<String, Scan>) {
 
 #[test]
 fn q09_shape_leaves_no_conditionless_join() {
-    let rule = JoinOrdering::new(q09_model(), 10);
+    let rule = JoinOrdering::new(shared(q09_model()), 10);
     let result = rule.apply(q09_from_order_tree()).unwrap();
     let mut joins = Vec::new();
     collect_joins(&result, &mut joins);
@@ -786,7 +793,7 @@ fn q09_shape_leaves_no_conditionless_join() {
 
 #[test]
 fn q09_shape_annotates_every_join_estimate() {
-    let rule = JoinOrdering::new(q09_model(), 10);
+    let rule = JoinOrdering::new(shared(q09_model()), 10);
     let result = rule.apply(q09_from_order_tree()).unwrap();
     let mut joins = Vec::new();
     collect_joins(&result, &mut joins);
@@ -799,7 +806,7 @@ fn q09_shape_annotates_every_join_estimate() {
 
 #[test]
 fn rule_is_idempotent() {
-    let rule = JoinOrdering::new(q09_model(), 10);
+    let rule = JoinOrdering::new(shared(q09_model()), 10);
     let once = rule.apply(q09_from_order_tree()).unwrap();
     let twice = rule.apply(once.clone()).unwrap();
     assert_eq!(once, twice);
@@ -813,7 +820,7 @@ fn left_join_root_is_untouched() {
         JoinType::Left,
         Some(eq(col("p", "p_partkey"), col("l", "l_partkey"))),
     );
-    let rule = JoinOrdering::new(q09_model(), 10);
+    let rule = JoinOrdering::new(shared(q09_model()), 10);
     assert_eq!(rule.apply(left.clone()).unwrap(), left);
 }
 
@@ -826,7 +833,7 @@ fn nested_region_below_projection_reorders() {
         distinct: false,
         distinct_on: None,
     });
-    let rule = JoinOrdering::new(q09_model(), 10);
+    let rule = JoinOrdering::new(shared(q09_model()), 10);
     let result = rule.apply(tree).unwrap();
     let mut joins = Vec::new();
     collect_joins(&result, &mut joins);
@@ -844,7 +851,7 @@ fn two_atom_join_with_condition_is_untouched() {
         JoinType::Inner,
         Some(eq(col("p", "p_partkey"), col("l", "l_partkey"))),
     );
-    let rule = JoinOrdering::new(q09_model(), 10);
+    let rule = JoinOrdering::new(shared(q09_model()), 10);
     assert_eq!(rule.apply(tree.clone()).unwrap(), tree);
 }
 
@@ -860,7 +867,7 @@ fn two_atom_cross_with_filter_becomes_inner() {
         input: Box::new(cross),
         predicate: eq(col("p", "p_partkey"), col("l", "l_partkey")),
     });
-    let rule = JoinOrdering::new(q09_model(), 10);
+    let rule = JoinOrdering::new(shared(q09_model()), 10);
     let result = rule.apply(tree).unwrap();
     let mut joins = Vec::new();
     collect_joins(&result, &mut joins);
@@ -893,7 +900,7 @@ fn local_filter_folds_into_scan() {
             right: Box::new(connect),
         },
     });
-    let rule = JoinOrdering::new(q09_model(), 10);
+    let rule = JoinOrdering::new(shared(q09_model()), 10);
     let result = rule.apply(tree).unwrap();
     let scans = scans_by_table(&result);
     assert!(
@@ -904,7 +911,7 @@ fn local_filter_folds_into_scan() {
 
 #[test]
 fn bare_scan_atom_is_stamped_with_estimate_and_key_ndv() {
-    let rule = JoinOrdering::new(q09_model(), 10);
+    let rule = JoinOrdering::new(shared(q09_model()), 10);
     let result = rule.apply(q09_from_order_tree()).unwrap();
     let scans = scans_by_table(&result);
     for scan in scans.values() {
@@ -970,7 +977,10 @@ fn a_broken_emit_that_drops_a_conjunct_triggers_the_guard() {
         cross_steps: Vec::new(),
     };
     let rule = JoinOrdering::new(
-        model(&[("p", 100, &[("k", 100)]), ("l", 1000, &[("k", 1000)])]),
+        shared(model(&[
+            ("p", 100, &[("k", 100)]),
+            ("l", 1000, &[("k", 1000)]),
+        ])),
         10,
     );
     let mut placed = Vec::new();
@@ -989,7 +999,7 @@ fn an_unknown_atom_leaves_the_written_order() {
     // No stats for part/supplier (absent from the model): their estimates are
     // UNKNOWN, so the 3-atom region declines and the tree is preserved verbatim.
     let rule = JoinOrdering::new(
-        model(&[("lineitem", 6_000_000, &[("l_partkey", 200_000)])]),
+        shared(model(&[("lineitem", 6_000_000, &[("l_partkey", 200_000)])])),
         10,
     );
     let tree = q09_from_order_tree();
@@ -1011,6 +1021,6 @@ fn unqualified_region_predicate_raises() {
             col("l", "l_partkey"),
         )),
     );
-    let rule = JoinOrdering::new(q09_model(), 10);
+    let rule = JoinOrdering::new(shared(q09_model()), 10);
     assert!(matches!(rule.apply(tree), Err(OptimizeError::JoinGraph(_))));
 }

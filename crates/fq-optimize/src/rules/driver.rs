@@ -2,6 +2,9 @@
 //! Ports `RuleBasedOptimizer.optimize` and `factory.build_optimizer` (the
 //! pushdown subset).
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use fq_common::OptimizerConfig;
 use fq_decorrelate::scope::validate_scope;
 use fq_plan::logical::{Explain, LogicalPlan};
@@ -10,8 +13,8 @@ use crate::cost::CostModel;
 use crate::error::OptimizeError;
 
 use super::{
-    AggregatePushdown, JoinOrdering, LimitPushdown, OptimizationRule, OrderByPushdown,
-    PredicatePushdown, ProjectionPushdown, SemiJoinPushdown,
+    AggregatePushdown, CTEUnionFilterPushdown, EagerAggregation, JoinOrdering, LimitPushdown,
+    OptimizationRule, OrderByPushdown, PredicatePushdown, ProjectionPushdown, SemiJoinPushdown,
 };
 
 /// The hard iteration backstop: a full sweep that changes nothing breaks the
@@ -78,21 +81,24 @@ impl RuleBasedOptimizer {
 }
 
 /// The standard pushdown rule stack, honoring the optimizer configuration. Ports
-/// `build_optimizer` for the in-scope rules; the reserved slots for the remaining
-/// out-of-scope rules (`CTEUnionFilterPushdown`, `EagerAggregation`) are marked so
-/// their registration order lands correctly when they arrive.
+/// `build_optimizer`.
 ///
-/// `JoinOrdering` is the first rule needing a `CostModel`, so the caller
-/// constructs it (over the query's catalog/statistics) and passes it in; it is
-/// moved into the rule at Slot 5 when `enable_join_reordering` is set, and dropped
-/// otherwise.
+/// The two cost-gated rules share ONE estimator through an `Rc<RefCell<CostModel>>`
+/// handle: `EagerAggregation` is ALWAYS on (it needs the cost model even when join
+/// reordering is off and `JoinOrdering` is not built), and `JoinOrdering` needs the
+/// same model, so a single `CostModel` is wrapped once and cloned into each. The
+/// optimizer is single-threaded (a fixpoint loop over one plan), so the non-`Send`
+/// `Rc`/`RefCell` is fine; the plan owner would switch to `Arc<Mutex<..>>` if a
+/// `Send` bound ever appears.
 pub fn build_optimizer(config: &OptimizerConfig, cost_model: CostModel) -> RuleBasedOptimizer {
+    let shared = Rc::new(RefCell::new(cost_model));
     let mut rules: Vec<Box<dyn OptimizationRule>> = Vec::new();
 
     if config.enable_predicate_pushdown {
-        // Slot 1 (reserved, gated by enable_predicate_pushdown):
-        // CTEUnionFilterPushdown - runs BEFORE PredicatePushdown so the ordinary
-        // pushdown then sinks the union filter it inserts to the body's scans.
+        // Slot 1: CTEUnionFilterPushdown runs BEFORE PredicatePushdown so the
+        // ordinary pushdown then sinks the union filter it inserts to the body's
+        // scans (which is what lets semi-join reduction inject dimension keys).
+        rules.push(Box::new(CTEUnionFilterPushdown));
         rules.push(Box::new(PredicatePushdown));
     }
 
@@ -100,13 +106,15 @@ pub fn build_optimizer(config: &OptimizerConfig, cost_model: CostModel) -> RuleB
     // the region the reorderer sees (a reduced input, not a top-level filter).
     rules.push(Box::new(SemiJoinPushdown));
 
-    // Slot 4 (reserved, always on): EagerAggregation(cost_model) - before join
-    // ordering, replaces the fact atom with a partial aggregate.
+    // Slot 4 (always on): EagerAggregation replaces the fact atom with a partial
+    // aggregate before join ordering re-costs the region.
+    rules.push(Box::new(EagerAggregation::new(shared.clone())));
+
     if config.enable_join_reordering {
-        // Slot 5: JoinOrdering reads folded equi conditions and embedded scan
-        // filters, and must run BEFORE projection pushdown prunes columns.
+        // JoinOrdering reads folded equi conditions and embedded scan filters, and
+        // must run BEFORE projection pushdown prunes columns.
         rules.push(Box::new(JoinOrdering::new(
-            cost_model,
+            shared.clone(),
             config.max_join_reorder_size as usize,
         )));
     }
@@ -246,13 +254,16 @@ mod tests {
     #[test]
     fn build_optimizer_registers_rules_in_the_spec_order() {
         let optimizer = build_optimizer(&OptimizerConfig::default(), cost_model());
-        // Default config enables join reordering: JoinOrdering lands at Slot 5,
-        // after SemiJoinPushdown and before ProjectionPushdown.
+        // Default config enables predicate pushdown and join reordering:
+        // CTEUnionFilterPushdown leads (before PredicatePushdown), EagerAggregation
+        // sits always-on after SemiJoinPushdown, JoinOrdering before projection.
         assert_eq!(
             optimizer.rule_names(),
             vec![
+                "CTEUnionFilterPushdown",
                 "PredicatePushdown",
                 "SemiJoinPushdown",
+                "EagerAggregation",
                 "JoinOrdering",
                 "ProjectionPushdown",
                 "AggregatePushdown",
@@ -273,11 +284,13 @@ mod tests {
         };
         let optimizer = build_optimizer(&config, cost_model());
         // Predicate/projection pushdown AND join ordering drop out; the always-on
-        // rules remain.
+        // rules remain. CTEUnionFilterPushdown drops with predicate pushdown, but
+        // EagerAggregation stays - it is always on.
         assert_eq!(
             optimizer.rule_names(),
             vec![
                 "SemiJoinPushdown",
+                "EagerAggregation",
                 "AggregatePushdown",
                 "OrderByPushdown",
                 "LimitPushdown",

@@ -44,6 +44,14 @@ pub enum OptimizeError {
     #[error("join ordering invariant violated: {0}")]
     JoinOrder(String),
 
+    /// An eager-aggregation invariant was violated (a bug, never a user error): a
+    /// peeled dim that joins nothing already in scope, or a lifted join conjunct
+    /// left unplaced. These fire only after every gate passed, so they can only
+    /// mean the rewrite itself is inconsistent - a dropped or misplaced predicate
+    /// manufactures wrong results, so it crashes rather than ships a lie.
+    #[error("eager aggregation invariant violated: {0}")]
+    EagerAggregation(String),
+
     /// A join region whose predicates cannot be soundly mapped to its atoms
     /// (unqualified or ambiguous reference); propagated, never swallowed.
     #[error(transparent)]
