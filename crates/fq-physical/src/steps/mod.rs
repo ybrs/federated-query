@@ -5,17 +5,19 @@
 //! No JSON, no serde: `Step` / `Fragment` / `ScanSpec` hold `fq_plan::Expr`
 //! directly (retagged in place, section `expr_retag`), and the enum IS the tag.
 //!
-//! STAGE STATUS: the straight node walk (`emit_nodes`) and step CSE (`cse`) are
-//! implemented. Semi-join REDUCTION (the `InjectedScan`/`CollectDistinct` path) and
-//! the OBSERVATION provenance recorders are deferred; a join emits both sides in
-//! full (correct, just reads more), and `observations` is empty (no learned-stats
-//! provenance, execution unaffected). Both are safe, correct-but-unoptimized
-//! deferrals, not silent wrong behavior.
+//! STAGE STATUS: the straight node walk (`emit_nodes`), step CSE (`cse`), semi-join
+//! REDUCTION (`reduction` - the `InjectedScan`/`CollectDistinct` path, orientation,
+//! tracing, winners, extra injections), and the OBSERVATION provenance recorders
+//! (`observe`) are implemented. DEFERRED sub-part: the `injected_sql` source-side
+//! key-filter placement inside island/aggregate probe bases (a pushdown speedup;
+//! its absence wraps the base output, which is equally correct - see `scan_spec`).
 
 mod cse;
 mod emit_nodes;
 pub mod error;
 mod expr_retag;
+mod observe;
+mod reduction;
 mod render_sql;
 mod scan_spec;
 mod types;
@@ -39,6 +41,13 @@ type NodeId = *const PhysicalPlan;
 /// clones a sub-plan, so this pointer is valid for `Ctx`'s lifetime.
 fn node_id(node: &PhysicalPlan) -> NodeId {
     std::ptr::from_ref(node)
+}
+
+/// Whether two plan-node references point at the SAME node (Python's `is`). Used to
+/// orient a reduced join back to its left/right positions and to short-circuit an
+/// already-injected base.
+fn same_node(a: &PhysicalPlan, b: &PhysicalPlan) -> bool {
+    std::ptr::eq(a, b)
 }
 
 /// Hands out unique binding (`b1`, `b2`, ...) and fragment (`f1`, ...) names.
@@ -71,8 +80,9 @@ impl Names {
 }
 
 /// The mutable accumulator threaded through the bottom-up walk. Ports `_Ctx`; maps
-/// keyed by `NodeId` where Python keyed on `id(node)`.
-struct Ctx {
+/// keyed by `NodeId` where Python keyed on `id(node)`. The `'p` lifetime is the
+/// borrowed plan tree's: the injection winners hold `&'p PhysicalPlan` build nodes.
+struct Ctx<'p> {
     steps: Vec<Step>,
     fragments: BTreeMap<String, Fragment>,
     names: Names,
@@ -82,13 +92,24 @@ struct Ctx {
     /// CTE producer id -> its single emitted binding (emit + execute a CTE once).
     cte_bindings: HashMap<NodeId, String>,
     /// base node id -> binding already emitted with an injected filter (reduction);
-    /// read by `emit` to short-circuit an already-reduced base. Unused until the
-    /// reduction stage populates it (kept so the walk's cache check is in place).
+    /// read by `emit` to short-circuit an already-reduced base.
     injected: HashMap<NodeId, String>,
     observations: BTreeMap<String, Observation>,
+    /// scan node id -> its emitted binding; a reduction collects its build keys from
+    /// the originating base scan instead of forcing a lazy join region.
+    scan_bindings: HashMap<NodeId, String>,
+    /// per traced-base id, the reduction candidates donating the fewest keys first
+    /// (built by the `injection_winners` pre-pass before emission).
+    injection_winners: HashMap<NodeId, Vec<reduction::Candidate<'p>>>,
+    /// build node id -> its emitted distinct-keys binding (a winner feeding several
+    /// bases collects once).
+    winner_keys: HashMap<NodeId, (String, String)>,
+    /// build node id -> its emitted read binding (a winner's early emission and its
+    /// own join's emission share one read).
+    build_bindings: HashMap<NodeId, String>,
 }
 
-impl Ctx {
+impl Ctx<'_> {
     /// A fresh, empty context.
     fn new() -> Self {
         Self {
@@ -99,6 +120,10 @@ impl Ctx {
             cte_bindings: HashMap::new(),
             injected: HashMap::new(),
             observations: BTreeMap::new(),
+            scan_bindings: HashMap::new(),
+            injection_winners: HashMap::new(),
+            winner_keys: HashMap::new(),
+            build_bindings: HashMap::new(),
         }
     }
 }
@@ -113,6 +138,7 @@ impl Ctx {
 /// gate and source dialect).
 pub fn build_steps(plan: &PhysicalPlan) -> Result<BuiltSteps, StepError> {
     let mut ctx = Ctx::new();
+    ctx.injection_winners = reduction::injection_winners(plan);
     let binding = emit_nodes::emit(plan, &mut ctx)?;
     ctx.steps.push(Step::Return { input: binding });
     Ok(BuiltSteps {
@@ -125,7 +151,7 @@ pub fn build_steps(plan: &PhysicalPlan) -> Result<BuiltSteps, StepError> {
 
 /// Append a merge step running `fragment` over `inputs`; return its binding. Ports
 /// `_merge_step`.
-fn merge_step(ctx: &mut Ctx, fragment: &str, inputs: BTreeMap<String, String>) -> String {
+fn merge_step(ctx: &mut Ctx<'_>, fragment: &str, inputs: BTreeMap<String, String>) -> String {
     let binding = ctx.names.binding();
     ctx.steps.push(Step::Merge {
         fragment: fragment.to_string(),
@@ -137,7 +163,7 @@ fn merge_step(ctx: &mut Ctx, fragment: &str, inputs: BTreeMap<String, String>) -
 
 /// Register a `raw_sql` fragment running `sql` over `inputs`, and a merge step over
 /// it; return its binding. Ports `_raw_sql_step`.
-fn raw_sql_step(ctx: &mut Ctx, sql: String, inputs: BTreeMap<String, String>) -> String {
+fn raw_sql_step(ctx: &mut Ctx<'_>, sql: String, inputs: BTreeMap<String, String>) -> String {
     let fragment = ctx.names.fragment();
     ctx.fragments
         .insert(fragment.clone(), Fragment::RawSql { sql });

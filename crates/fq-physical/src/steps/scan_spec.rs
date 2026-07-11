@@ -70,6 +70,24 @@ pub fn structured_scan_spec(scan: &PhysicalScan) -> Result<ScanSpec, StepError> 
     Ok(spec)
 }
 
+/// A structured spec for a plain probe base; pre-rendered SQL for a pushed remote
+/// query OR an aggregate scan (its output columns take the injected filter through
+/// the engine's output wrapper). Ports `_injected_probe_spec`.
+///
+/// DEFERRED (correct, slower): the `injected_sql` optimization (placing the key
+/// filter INSIDE the island/aggregate base relation rather than wrapping its output)
+/// is not built here (the RemoteQuery holds only rendered `sql`, not the AST the
+/// Python re-parses). Without it the engine wraps the base output, which is exactly
+/// as correct; only a source-side pushdown speedup is forfeited.
+pub fn injected_probe_spec(base: &PhysicalPlan) -> Result<ScanSpec, StepError> {
+    match base {
+        PhysicalPlan::RemoteQuery(_) => raw_scan_spec(base),
+        PhysicalPlan::Scan(scan) if scan_is_aggregate(scan) => raw_scan_spec(base),
+        PhysicalPlan::Scan(scan) => structured_scan_spec(scan),
+        other => raw_scan_spec(other),
+    }
+}
+
 /// Refuse a scan that already folds aggregation/ordering/limits: it cannot take a
 /// composed `col IN (...)` filter in its own WHERE. Ports `_reject_nonplain_scan`.
 fn reject_nonplain_scan(scan: &PhysicalScan) -> Result<(), StepError> {

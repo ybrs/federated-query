@@ -3,9 +3,9 @@
 //! which a parent resolves its expressions against. Ports the `_emit_*` functions of
 //! `executor/rust_ir.py`.
 //!
-//! JOIN REDUCTION IS DEFERRED: `emit_join` emits both sides in full then builds the
-//! hash-join fragment (correct; the semi-join `InjectedScan`/`CollectDistinct` path
-//! is a later stage). Every emitter is otherwise a faithful port.
+//! The `'p` lifetime is the borrowed plan tree's: a join's reduced path (`reduction`)
+//! passes build/probe sub-nodes back into `emit`, so the emit chain is generic over
+//! the plan lifetime (see `Ctx<'p>`).
 
 use std::collections::BTreeMap;
 
@@ -31,13 +31,13 @@ use super::scan_spec::{source_scan_spec, variant_name};
 use super::types::{
     AggCall, AggSelectItem, Fragment, JoinKind, Projection, SortKey, Step, WithinGroup,
 };
-use super::{merge_step, node_id, raw_sql_step, Ctx};
+use super::{merge_step, node_id, observe, raw_sql_step, reduction, Ctx};
 
 /// Emit steps for `node`, returning the binding that holds its output. First checks
 /// the injected-base cache (a base already reduced returns that binding), then
 /// dispatches on the variant. Ports `_emit` + `_NODE_EMITTERS`. An unmodeled node is
 /// a loud typed error, never a silent default.
-pub fn emit(node: &PhysicalPlan, ctx: &mut Ctx) -> Result<String, StepError> {
+pub(super) fn emit<'p>(node: &'p PhysicalPlan, ctx: &mut Ctx<'p>) -> Result<String, StepError> {
     if let Some(cached) = ctx.injected.get(&node_id(node)) {
         return Ok(cached.clone());
     }
@@ -70,9 +70,10 @@ pub fn emit(node: &PhysicalPlan, ctx: &mut Ctx) -> Result<String, StepError> {
     }
 }
 
-/// A source scan run natively (structured+parallel when it qualifies). Ports
-/// `_emit_source` (the observation recording is deferred).
-fn emit_source(node: &PhysicalPlan, ctx: &mut Ctx) -> Result<String, StepError> {
+/// A source scan run natively (structured+parallel when it qualifies). Records the
+/// scan binding (a reduction anchors its build keys here) and the scan observation.
+/// Ports `_emit_source`.
+fn emit_source<'p>(node: &'p PhysicalPlan, ctx: &mut Ctx<'p>) -> Result<String, StepError> {
     let binding = ctx.names.binding();
     let step = Step::SourceScan {
         datasource: source_datasource(node)?,
@@ -81,11 +82,14 @@ fn emit_source(node: &PhysicalPlan, ctx: &mut Ctx) -> Result<String, StepError> 
         materialize: false,
     };
     let key = scan_share_key(node, &step);
-    Ok(emit_step_once(ctx, step, Some(key)))
+    let binding = emit_step_once(ctx, step, Some(key));
+    ctx.scan_bindings.insert(node_id(node), binding.clone());
+    observe::record_scan_observation(ctx, node, &binding);
+    Ok(binding)
 }
 
 /// The datasource name of a source node. Ports the `node.datasource` reads.
-fn source_datasource(node: &PhysicalPlan) -> Result<String, StepError> {
+pub(super) fn source_datasource(node: &PhysicalPlan) -> Result<String, StepError> {
     match node {
         PhysicalPlan::Scan(scan) => Ok(scan.datasource.clone()),
         PhysicalPlan::RemoteQuery(remote) => Ok(remote.datasource.clone()),
@@ -94,16 +98,25 @@ fn source_datasource(node: &PhysicalPlan) -> Result<String, StepError> {
     }
 }
 
-/// A hash join over its two sides, then a `hash_join` fragment. Ports `_emit_join`
-/// WITHOUT the semi-join reduction (both sides emit in full).
-fn emit_join(
-    node: &PhysicalPlan,
-    join: &PhysicalHashJoin,
-    ctx: &mut Ctx,
+/// A hash join, reducing the probe by the build keys when the gates pass, else
+/// emitting both sides in full; either way it builds the coordinator hash-join
+/// fragment. Ports `_emit_join`.
+fn emit_join<'p>(
+    node: &'p PhysicalPlan,
+    join: &'p PhysicalHashJoin,
+    ctx: &mut Ctx<'p>,
 ) -> Result<String, StepError> {
     let kind = join_kind(join.join_type)?;
-    let left_binding = emit(&join.left, ctx)?;
-    let right_binding = emit(&join.right, ctx)?;
+    let (left_binding, right_binding) = if reduction::can_reduce(join)
+        && reduction::probe_base_resolvable(join)
+        && reduction::reduction_filters(join)
+    {
+        reduction::emit_reduced_join(join, ctx)?
+    } else {
+        let left = emit(&join.left, ctx)?;
+        let right = emit(&join.right, ctx)?;
+        (left, right)
+    };
     let fragment = Fragment::HashJoin {
         join_type: kind,
         left_keys: key_names(&join.left_keys, &join.left),
@@ -120,10 +133,10 @@ fn emit_join(
 }
 
 /// A non-equi (nested-loop) join. Ports `_emit_nested_loop_join`.
-fn emit_nested_loop_join(
-    node: &PhysicalPlan,
-    join: &PhysicalNestedLoopJoin,
-    ctx: &mut Ctx,
+fn emit_nested_loop_join<'p>(
+    node: &'p PhysicalPlan,
+    join: &'p PhysicalNestedLoopJoin,
+    ctx: &mut Ctx<'p>,
 ) -> Result<String, StepError> {
     let kind = nested_loop_kind(join)?;
     let left_binding = emit(&join.left, ctx)?;
@@ -257,7 +270,10 @@ fn uniquify_aliases(project: &mut [Projection]) {
 
 /// A projection, as a `project` fragment. A cross-source DISTINCT ON RAISES (no
 /// source ordering to pick a survivor). Ports `_emit_projection`.
-fn emit_projection(node: &PhysicalProjection, ctx: &mut Ctx) -> Result<String, StepError> {
+fn emit_projection<'p>(
+    node: &'p PhysicalProjection,
+    ctx: &mut Ctx<'p>,
+) -> Result<String, StepError> {
     if node.distinct_on.is_some() {
         return Err(StepError::DistinctOnCrossSource);
     }
@@ -308,7 +324,10 @@ fn is_star_column(expr: &Expr) -> bool {
 
 /// A GROUP BY / GROUPING SETS aggregate, as an `aggregate` fragment - or a rendered
 /// raw `SELECT ... GROUP BY` when an output carries a window. Ports `_emit_aggregate`.
-fn emit_aggregate(node: &PhysicalHashAggregate, ctx: &mut Ctx) -> Result<String, StepError> {
+fn emit_aggregate<'p>(
+    node: &'p PhysicalHashAggregate,
+    ctx: &mut Ctx<'p>,
+) -> Result<String, StepError> {
     let child = emit(&node.input, ctx)?;
     let aliases = node.input.column_aliases();
     if node.aggregates.iter().any(contains_window) {
@@ -322,7 +341,9 @@ fn emit_aggregate(node: &PhysicalHashAggregate, ctx: &mut Ctx) -> Result<String,
     let fragment = aggregate_fragment(node, &aliases);
     let name = ctx.names.fragment();
     ctx.fragments.insert(name.clone(), fragment);
-    Ok(merge_step(ctx, &name, single_input(child)))
+    let binding = merge_step(ctx, &name, single_input(child));
+    observe::record_group_signature(ctx, node, &binding);
+    Ok(binding)
 }
 
 /// Build the aggregate fragment: select list, group-by keys, optional grouping sets,
@@ -425,7 +446,7 @@ fn is_star_arg(args: &[Expr]) -> bool {
 }
 
 /// A boolean filter, as a `filter` fragment. Ports `_emit_filter`.
-fn emit_filter(node: &PhysicalFilter, ctx: &mut Ctx) -> Result<String, StepError> {
+fn emit_filter<'p>(node: &'p PhysicalFilter, ctx: &mut Ctx<'p>) -> Result<String, StepError> {
     let child = emit(&node.input, ctx)?;
     let predicate = over_input(&node.predicate, "in_0", &node.input.column_aliases());
     let fragment = Fragment::Filter { predicate };
@@ -436,9 +457,9 @@ fn emit_filter(node: &PhysicalFilter, ctx: &mut Ctx) -> Result<String, StepError
 
 /// The scalar-subquery cardinality guard, as a `single_row_guard` fragment. Ports
 /// `_emit_single_row_guard`.
-fn emit_single_row_guard(
-    node: &PhysicalSingleRowGuard,
-    ctx: &mut Ctx,
+fn emit_single_row_guard<'p>(
+    node: &'p PhysicalSingleRowGuard,
+    ctx: &mut Ctx<'p>,
 ) -> Result<String, StepError> {
     let child = emit(&node.input, ctx)?;
     let aliases = node.input.column_aliases();
@@ -453,7 +474,7 @@ fn emit_single_row_guard(
 }
 
 /// An ORDER BY, as a `sort` fragment. Ports `_emit_sort` + `_sort_keys`.
-fn emit_sort(node: &PhysicalSort, ctx: &mut Ctx) -> Result<String, StepError> {
+fn emit_sort<'p>(node: &'p PhysicalSort, ctx: &mut Ctx<'p>) -> Result<String, StepError> {
     let child = emit(&node.input, ctx)?;
     let aliases = node.input.column_aliases();
     let mut keys = Vec::with_capacity(node.sort_keys.len());
@@ -488,7 +509,7 @@ fn nulls_first(nulls_order: Option<&[Option<NullsOrder>]>, index: usize, ascendi
 }
 
 /// A LIMIT/OFFSET, as a `limit` fragment. Ports `_emit_limit`.
-fn emit_limit(node: &PhysicalLimit, ctx: &mut Ctx) -> Result<String, StepError> {
+fn emit_limit<'p>(node: &'p PhysicalLimit, ctx: &mut Ctx<'p>) -> Result<String, StepError> {
     let child = emit(&node.input, ctx)?;
     let fragment = Fragment::Limit {
         limit: node.limit,
@@ -500,13 +521,16 @@ fn emit_limit(node: &PhysicalLimit, ctx: &mut Ctx) -> Result<String, StepError> 
 }
 
 /// A VALUES relation, rendered to raw SQL over no inputs. Ports `_emit_values`.
-fn emit_values(node: &PhysicalValues, ctx: &mut Ctx) -> Result<String, StepError> {
+fn emit_values<'p>(node: &'p PhysicalValues, ctx: &mut Ctx<'p>) -> Result<String, StepError> {
     let sql = render_values_sql(&node.rows, &node.output_names)?;
     Ok(raw_sql_step(ctx, sql, BTreeMap::new()))
 }
 
 /// A whole WITH rendered as SQL over named inputs. Ports `_emit_cte_merge`.
-fn emit_cte_merge(node: &PhysicalCteMergeQuery, ctx: &mut Ctx) -> Result<String, StepError> {
+fn emit_cte_merge<'p>(
+    node: &'p PhysicalCteMergeQuery,
+    ctx: &mut Ctx<'p>,
+) -> Result<String, StepError> {
     let mut inputs = BTreeMap::new();
     for (name, subtree) in &node.inputs {
         inputs.insert(name.clone(), emit(subtree, ctx)?);
@@ -516,7 +540,7 @@ fn emit_cte_merge(node: &PhysicalCteMergeQuery, ctx: &mut Ctx) -> Result<String,
 
 /// A CTE reference: the producer's body is emitted (and executed) ONCE; later
 /// references reuse the binding. Ports `_emit_cte_scan`.
-fn emit_cte_scan(node: &PhysicalCteScan, ctx: &mut Ctx) -> Result<String, StepError> {
+fn emit_cte_scan<'p>(node: &'p PhysicalCteScan, ctx: &mut Ctx<'p>) -> Result<String, StepError> {
     let producer = node.producer.as_ref();
     if let Some(cached) = ctx.cte_bindings.get(&node_id(producer)) {
         return Ok(cached.clone());
@@ -534,7 +558,12 @@ fn emit_cte_scan(node: &PhysicalCteScan, ctx: &mut Ctx) -> Result<String, StepEr
 
 /// Project a binding's columns to a CTE's declared names, positionally. Ports
 /// `_relabel_columns`.
-fn relabel_columns(binding: String, cte: &PhysicalCte, names: &[String], ctx: &mut Ctx) -> String {
+fn relabel_columns(
+    binding: String,
+    cte: &PhysicalCte,
+    names: &[String],
+    ctx: &mut Ctx<'_>,
+) -> String {
     let mut project = Vec::new();
     for (source, target) in output_column_names(&cte.body).iter().zip(names) {
         project.push(Projection {
@@ -553,7 +582,7 @@ fn relabel_columns(binding: String, cte: &PhysicalCte, names: &[String], ctx: &m
 
 /// Ship a foreign relation into a target source, then run the island. The ORDER is
 /// load-bearing (ship BEFORE the island scan). Ports `_emit_shipment`.
-fn emit_shipment(node: &PhysicalShipment, ctx: &mut Ctx) -> Result<String, StepError> {
+fn emit_shipment<'p>(node: &'p PhysicalShipment, ctx: &mut Ctx<'p>) -> Result<String, StepError> {
     let body_binding = emit(&node.body, ctx)?;
     ctx.steps.push(Step::Ship {
         datasource: node.datasource.clone(),
@@ -565,7 +594,7 @@ fn emit_shipment(node: &PhysicalShipment, ctx: &mut Ctx) -> Result<String, StepE
 
 /// A window-bearing projection, rendered to raw SQL over `in_window`. Ports
 /// `_emit_window`.
-fn emit_window(node: &PhysicalWindow, ctx: &mut Ctx) -> Result<String, StepError> {
+fn emit_window<'p>(node: &'p PhysicalWindow, ctx: &mut Ctx<'p>) -> Result<String, StepError> {
     let child = emit(&node.input, ctx)?;
     let sql = render_window_sql(node, &node.input.column_aliases())?;
     let mut inputs = BTreeMap::new();
@@ -575,7 +604,10 @@ fn emit_window(node: &PhysicalWindow, ctx: &mut Ctx) -> Result<String, StepError
 
 /// A per-key LIMIT, wrapped in the row-index CTE the merge engine adds. Ports
 /// `_emit_grouped_limit`.
-fn emit_grouped_limit(node: &PhysicalGroupedLimit, ctx: &mut Ctx) -> Result<String, StepError> {
+fn emit_grouped_limit<'p>(
+    node: &'p PhysicalGroupedLimit,
+    ctx: &mut Ctx<'p>,
+) -> Result<String, StepError> {
     let child = emit(&node.input, ctx)?;
     let names = output_column_names(&node.input);
     let node_sql = render_grouped_limit_sql(node, &names)?;
@@ -591,8 +623,9 @@ fn emit_grouped_limit(node: &PhysicalGroupedLimit, ctx: &mut Ctx) -> Result<Stri
 
 /// A cross-source UNION [ALL], as a raw_sql fragment over its branches. Ports
 /// `_emit_union`.
-fn emit_union(node: &PhysicalUnion, ctx: &mut Ctx) -> Result<String, StepError> {
-    let (inputs, selects) = branch_inputs(ctx, node.inputs.iter().collect::<Vec<_>>())?;
+fn emit_union<'p>(node: &'p PhysicalUnion, ctx: &mut Ctx<'p>) -> Result<String, StepError> {
+    let branches: Vec<&PhysicalPlan> = node.inputs.iter().collect();
+    let (inputs, selects) = branch_inputs(ctx, &branches)?;
     let keyword = if node.distinct { "UNION" } else { "UNION ALL" };
     let sql = selects.join(&format!(" {keyword} "));
     Ok(raw_sql_step(ctx, sql, inputs))
@@ -600,8 +633,12 @@ fn emit_union(node: &PhysicalUnion, ctx: &mut Ctx) -> Result<String, StepError> 
 
 /// A cross-source INTERSECT / EXCEPT [ALL], as a raw_sql fragment. Ports
 /// `_emit_set_operation`.
-fn emit_set_operation(node: &PhysicalSetOperation, ctx: &mut Ctx) -> Result<String, StepError> {
-    let (inputs, selects) = branch_inputs(ctx, vec![&node.left, &node.right])?;
+fn emit_set_operation<'p>(
+    node: &'p PhysicalSetOperation,
+    ctx: &mut Ctx<'p>,
+) -> Result<String, StepError> {
+    let branches: Vec<&PhysicalPlan> = vec![&node.left, &node.right];
+    let (inputs, selects) = branch_inputs(ctx, &branches)?;
     let keyword = set_op_keyword(node.kind, node.distinct);
     let sql = selects.join(&format!(" {keyword} "));
     Ok(raw_sql_step(ctx, sql, inputs))
@@ -609,13 +646,13 @@ fn emit_set_operation(node: &PhysicalSetOperation, ctx: &mut Ctx) -> Result<Stri
 
 /// Emit each set-operation branch to an `in_<i>` binding; return the inputs map and
 /// the per-branch `SELECT * FROM in_<i>` statements. Ports `_branch_inputs`.
-fn branch_inputs(
-    ctx: &mut Ctx,
-    branches: Vec<&PhysicalPlan>,
+fn branch_inputs<'p>(
+    ctx: &mut Ctx<'p>,
+    branches: &[&'p PhysicalPlan],
 ) -> Result<(BTreeMap<String, String>, Vec<String>), StepError> {
     let mut inputs = BTreeMap::new();
     let mut selects = Vec::with_capacity(branches.len());
-    for (index, child) in branches.into_iter().enumerate() {
+    for (index, child) in branches.iter().enumerate() {
         let name = format!("in_{index}");
         inputs.insert(name.clone(), emit(child, ctx)?);
         selects.push(format!("SELECT * FROM {name}"));

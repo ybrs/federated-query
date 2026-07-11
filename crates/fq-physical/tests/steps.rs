@@ -364,3 +364,236 @@ fn identical_scans_share_one_read() {
         .expect("a raw_sql union fragment");
     assert!(raw.contains("UNION ALL"), "union sql: {raw}");
 }
+
+// --------------------------------------------------------------------------
+// hand-built semi-join reduction (test_reduction_gate.py structural half)
+// --------------------------------------------------------------------------
+
+use std::collections::BTreeMap;
+
+use fq_plan::expr::{BinaryOpType, ColumnRef, Expr, LiteralValue};
+use fq_plan::logical::JoinType;
+use fq_plan::physical::{BuildSide, PhysicalHashJoin};
+
+/// A qualified integer column reference.
+fn col(table: &str, name: &str) -> Expr {
+    Expr::Column(ColumnRef::new(
+        Some(table.to_string()),
+        name,
+        Some(DataType::Integer),
+    ))
+}
+
+/// A `col > 0` filter (makes a build side non-whole-domain).
+fn positive_filter(table: &str, name: &str) -> Expr {
+    Expr::BinaryOp {
+        op: BinaryOpType::Gt,
+        left: Box::new(col(table, name)),
+        right: Box::new(Expr::Literal {
+            value: LiteralValue::Integer(0),
+            data_type: DataType::Integer,
+        }),
+    }
+}
+
+/// A configurable plain scan for reduction wiring (filter, estimate, NDV, kind).
+#[allow(clippy::too_many_arguments)]
+fn rscan(
+    datasource: &str,
+    table: &str,
+    alias: &str,
+    columns: &[&str],
+    filters: Option<Expr>,
+    estimated_rows: Option<u64>,
+    ndv: &[(&str, i64)],
+    kind: DatasourceKind,
+) -> PhysicalPlan {
+    let mut ndv_map = BTreeMap::new();
+    for (name, value) in ndv {
+        ndv_map.insert((*name).to_string(), *value);
+    }
+    PhysicalPlan::Scan(Box::new(PhysicalScan {
+        datasource: datasource.to_string(),
+        schema_name: "public".to_string(),
+        table_name: table.to_string(),
+        columns: columns.iter().map(|c| (*c).to_string()).collect(),
+        filters,
+        sample: None,
+        group_by: None,
+        grouping_sets: None,
+        aggregates: None,
+        output_names: None,
+        alias: Some(alias.to_string()),
+        limit: None,
+        offset: 0,
+        order_by_keys: None,
+        order_by_ascending: None,
+        order_by_nulls: None,
+        distinct: false,
+        dynamic_filter_keys: None,
+        estimated_rows,
+        column_ndv: if ndv_map.is_empty() {
+            None
+        } else {
+            Some(ndv_map)
+        },
+        seeded_schema: None,
+        datasource_kind: kind,
+    }))
+}
+
+/// An INNER equi hash join over a big probe (left) and a small filtered build (right).
+fn reduction_join(probe: PhysicalPlan, build: PhysicalPlan) -> PhysicalPlan {
+    PhysicalPlan::HashJoin(PhysicalHashJoin {
+        left: Box::new(probe),
+        right: Box::new(build),
+        join_type: JoinType::Inner,
+        left_keys: vec![col("p", "key")],
+        right_keys: vec![col("b", "key")],
+        build_side: BuildSide::Right,
+        estimated_rows: None,
+        estimate_defaults: None,
+    })
+}
+
+/// Find the single CollectDistinct step, if any.
+fn collect_step(steps: &[Step]) -> Option<&Step> {
+    steps
+        .iter()
+        .find(|step| matches!(step, Step::CollectDistinct { .. }))
+}
+
+/// Find the single InjectedScan step, if any.
+fn injected_step(steps: &[Step]) -> Option<&Step> {
+    steps
+        .iter()
+        .find(|step| matches!(step, Step::InjectedScan { .. }))
+}
+
+#[test]
+fn filtered_build_reduces_the_big_probe() {
+    // A small FILTERED pg build (NDV 2) vs a big duck probe (NDV 100000): the
+    // reduction collects the build's distinct key and injects it into the probe.
+    let probe = rscan(
+        "duck",
+        "lineitem",
+        "p",
+        &["key", "data"],
+        None,
+        Some(100_000),
+        &[("key", 100_000)],
+        DatasourceKind::DuckDb,
+    );
+    let build = rscan(
+        "pg",
+        "orders",
+        "b",
+        &["key"],
+        Some(positive_filter("b", "key")),
+        Some(2),
+        &[("key", 2)],
+        DatasourceKind::Postgres,
+    );
+    let built = build_steps(&reduction_join(probe, build)).expect("build_steps");
+
+    let collect = collect_step(&built.steps).expect("a CollectDistinct step");
+    let injected = injected_step(&built.steps).expect("an InjectedScan step");
+    // The injection reduces the big DUCK probe on its "key" column, fed by the
+    // build's collected keys.
+    let Step::CollectDistinct { binding: keys, .. } = collect else {
+        unreachable!()
+    };
+    match injected {
+        Step::InjectedScan {
+            datasource,
+            inject_column,
+            keys_from,
+            inject_column_ndv,
+            ..
+        } => {
+            assert_eq!(datasource, "duck");
+            assert_eq!(inject_column, "key");
+            assert_eq!(keys_from, keys, "injection reads the collected keys");
+            assert_eq!(*inject_column_ndv, Some(100_000));
+        }
+        other => panic!("not an injected scan: {other:?}"),
+    }
+    // The build side is materialized (its keys are collected AND it feeds the join).
+    let build_materialized = built.steps.iter().any(|step| {
+        matches!(
+            step,
+            Step::SourceScan {
+                materialize: true,
+                ..
+            }
+        )
+    });
+    assert!(build_materialized, "steps: {:?}", built.steps);
+}
+
+#[test]
+fn unfiltered_build_donates_whole_domain_and_declines() {
+    // An UNFILTERED plain build donates its entire FK domain, so the injection keeps
+    // every probe row (pure overhead): no reduction, both sides read in full.
+    let probe = rscan(
+        "duck",
+        "lineitem",
+        "p",
+        &["key", "data"],
+        None,
+        Some(100_000),
+        &[("key", 100_000)],
+        DatasourceKind::DuckDb,
+    );
+    let build = rscan(
+        "pg",
+        "orders",
+        "b",
+        &["key"],
+        None,
+        Some(2),
+        &[("key", 2)],
+        DatasourceKind::Postgres,
+    );
+    let built = build_steps(&reduction_join(probe, build)).expect("build_steps");
+    assert!(
+        collect_step(&built.steps).is_none(),
+        "no reduction: {:?}",
+        built.steps
+    );
+    assert!(injected_step(&built.steps).is_none());
+    // Both sides read plainly; the join still merges them.
+    assert!(count_source_scans(&built.steps) >= 2);
+    assert!(count_merges(&built.steps) >= 1);
+}
+
+#[test]
+fn reduced_join_still_builds_the_hash_join_fragment() {
+    // Reduction changes HOW the inputs are read, not that the coordinator join runs.
+    let probe = rscan(
+        "duck",
+        "lineitem",
+        "p",
+        &["key", "data"],
+        None,
+        Some(100_000),
+        &[("key", 100_000)],
+        DatasourceKind::DuckDb,
+    );
+    let build = rscan(
+        "pg",
+        "orders",
+        "b",
+        &["key"],
+        Some(positive_filter("b", "key")),
+        Some(2),
+        &[("key", 2)],
+        DatasourceKind::Postgres,
+    );
+    let built = build_steps(&reduction_join(probe, build)).expect("build_steps");
+    let has_hash_join = built
+        .fragments
+        .values()
+        .any(|fragment| matches!(fragment, Fragment::HashJoin { .. }));
+    assert!(has_hash_join, "fragments: {:?}", built.fragments);
+}
