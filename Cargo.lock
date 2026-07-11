@@ -663,6 +663,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fq-bind"
+version = "0.1.0"
+dependencies = [
+ "fq-catalog",
+ "fq-common",
+ "fq-parse",
+ "fq-plan",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "fq-catalog"
 version = "0.1.0"
 dependencies = [
@@ -693,6 +704,18 @@ dependencies = [
  "fq-common",
  "postgres",
  "serde_json",
+]
+
+[[package]]
+name = "fq-decorrelate"
+version = "0.1.0"
+dependencies = [
+ "fq-bind",
+ "fq-catalog",
+ "fq-common",
+ "fq-parse",
+ "fq-plan",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -5,17 +5,18 @@
 //! time.
 //!
 //! PORT NOTES (never silent):
-//! - `with_children` / `transform_children` (the recurse-and-rebuild the pushdown
-//!   rules share) are DEFERRED to fq-optimize, where their consumers live; they
-//!   port with the rules' tests, not dead here.
+//! - `try_map_children` is the fallible recurse-and-rebuild the decorrelator and
+//!   the pushdown rules share (ports `transform_children`/`with_children`). It
+//!   landed with its first consumer, fq-decorrelate.
 //! - The `LogicalPlanVisitor` ABC retires (a `match` is the dispatch).
 //! - `NodeId` (Python `id()`-identity for binder caches / injection dedup / CTE
 //!   body sharing) is DEFERRED: the nodes are pure structural values now, and the
 //!   identity mechanism lands with its first consumer (the binder), chosen clean
 //!   rather than stamped speculatively.
-//! - `direct_expressions` (field-introspection over pydantic annotations) retires:
-//!   with typed structs the per-node expression access is direct; a shared
-//!   accessor lands with the pass that needs it.
+//! - `direct_expressions` (Python's field-introspection over pydantic
+//!   annotations) is a typed exhaustive accessor here; it landed with its first
+//!   consumer, the decorrelation post-pass invariant (no subquery expression
+//!   survives).
 
 use std::collections::BTreeMap;
 
@@ -440,6 +441,152 @@ impl LogicalPlan {
             }
         }
     }
+
+    /// Rebuild this node with `f` applied to each direct child plan, propagating
+    /// any error `f` returns. Leaves (`Scan`/`CteRef`/`Values`) pass through
+    /// unchanged. Exhaustive: a new node forces a new arm. Ports Python
+    /// `transform_children`/`with_children` (the recurse-and-rebuild the
+    /// decorrelator and pushdown rules share), made fallible so a rewrite can
+    /// fail loudly mid-tree rather than swallow the error.
+    pub fn try_map_children<E>(
+        self,
+        mut f: impl FnMut(LogicalPlan) -> Result<LogicalPlan, E>,
+    ) -> Result<LogicalPlan, E> {
+        Ok(match self {
+            LogicalPlan::Scan(_) | LogicalPlan::CteRef(_) | LogicalPlan::Values(_) => self,
+            LogicalPlan::Projection(mut node) => {
+                node.input = Box::new(f(*node.input)?);
+                LogicalPlan::Projection(node)
+            }
+            LogicalPlan::Filter(mut node) => {
+                node.input = Box::new(f(*node.input)?);
+                LogicalPlan::Filter(node)
+            }
+            LogicalPlan::Aggregate(mut node) => {
+                node.input = Box::new(f(*node.input)?);
+                LogicalPlan::Aggregate(node)
+            }
+            LogicalPlan::Sort(mut node) => {
+                node.input = Box::new(f(*node.input)?);
+                LogicalPlan::Sort(node)
+            }
+            LogicalPlan::Limit(mut node) => {
+                node.input = Box::new(f(*node.input)?);
+                LogicalPlan::Limit(node)
+            }
+            LogicalPlan::Explain(mut node) => {
+                node.input = Box::new(f(*node.input)?);
+                LogicalPlan::Explain(node)
+            }
+            LogicalPlan::SubqueryScan(mut node) => {
+                node.input = Box::new(f(*node.input)?);
+                LogicalPlan::SubqueryScan(node)
+            }
+            LogicalPlan::SingleRowGuard(mut node) => {
+                node.input = Box::new(f(*node.input)?);
+                LogicalPlan::SingleRowGuard(node)
+            }
+            LogicalPlan::GroupedLimit(mut node) => {
+                node.input = Box::new(f(*node.input)?);
+                LogicalPlan::GroupedLimit(node)
+            }
+            LogicalPlan::Join(mut node) => {
+                node.left = Box::new(f(*node.left)?);
+                node.right = Box::new(f(*node.right)?);
+                LogicalPlan::Join(node)
+            }
+            LogicalPlan::SetOperation(mut node) => {
+                node.left = Box::new(f(*node.left)?);
+                node.right = Box::new(f(*node.right)?);
+                LogicalPlan::SetOperation(node)
+            }
+            LogicalPlan::LateralJoin(mut node) => {
+                node.left = Box::new(f(*node.left)?);
+                node.right = Box::new(f(*node.right)?);
+                LogicalPlan::LateralJoin(node)
+            }
+            LogicalPlan::Cte(mut node) => {
+                node.cte_plan = Box::new(f(*node.cte_plan)?);
+                node.child = Box::new(f(*node.child)?);
+                LogicalPlan::Cte(node)
+            }
+            LogicalPlan::Union(mut node) => {
+                let mut inputs = Vec::with_capacity(node.inputs.len());
+                for input in node.inputs {
+                    inputs.push(f(input)?);
+                }
+                node.inputs = inputs;
+                LogicalPlan::Union(node)
+            }
+        })
+    }
+
+    /// Every expression attached DIRECTLY to this node, in a stable order.
+    /// Exhaustive: a new node forces a new arm, so a plan walk can never silently
+    /// miss a node's expressions. Does NOT descend into child plans - it reports
+    /// only this node's own expressions (predicates, projections, group/agg/sort
+    /// keys, ...). The decorrelation post-pass invariant walks this to prove no
+    /// subquery expression survived. Ports Python `direct_expressions`.
+    pub fn direct_expressions(&self) -> Vec<&Expr> {
+        match self {
+            LogicalPlan::Scan(node) => {
+                let mut exprs = Vec::new();
+                if let Some(filters) = &node.filters {
+                    exprs.push(filters);
+                }
+                extend_opt_vec(&mut exprs, node.group_by.as_deref());
+                extend_opt_grouping_sets(&mut exprs, node.grouping_sets.as_deref());
+                extend_opt_vec(&mut exprs, node.aggregates.as_deref());
+                extend_opt_vec(&mut exprs, node.order_by_keys.as_deref());
+                exprs
+            }
+            LogicalPlan::Projection(node) => {
+                let mut exprs: Vec<&Expr> = node.expressions.iter().collect();
+                extend_opt_vec(&mut exprs, node.distinct_on.as_deref());
+                exprs
+            }
+            LogicalPlan::Filter(node) => vec![&node.predicate],
+            LogicalPlan::Join(node) => node.condition.iter().collect(),
+            LogicalPlan::Aggregate(node) => {
+                let mut exprs: Vec<&Expr> = node.group_by.iter().collect();
+                exprs.extend(node.aggregates.iter());
+                extend_opt_grouping_sets(&mut exprs, node.grouping_sets.as_deref());
+                exprs
+            }
+            LogicalPlan::Sort(node) => node.sort_keys.iter().collect(),
+            LogicalPlan::Values(node) => node.rows.iter().flatten().collect(),
+            LogicalPlan::SingleRowGuard(node) => node.keys.iter().collect(),
+            LogicalPlan::GroupedLimit(node) => {
+                let mut exprs: Vec<&Expr> = node.keys.iter().collect();
+                extend_opt_vec(&mut exprs, node.order_by_keys.as_deref());
+                exprs
+            }
+            LogicalPlan::Limit(_)
+            | LogicalPlan::Union(_)
+            | LogicalPlan::SetOperation(_)
+            | LogicalPlan::Explain(_)
+            | LogicalPlan::Cte(_)
+            | LogicalPlan::CteRef(_)
+            | LogicalPlan::SubqueryScan(_)
+            | LogicalPlan::LateralJoin(_) => Vec::new(),
+        }
+    }
+}
+
+/// Append every expression of an optional expression vector to `exprs`.
+fn extend_opt_vec<'a>(exprs: &mut Vec<&'a Expr>, source: Option<&'a [Expr]>) {
+    if let Some(items) = source {
+        exprs.extend(items.iter());
+    }
+}
+
+/// Append every expression of optional grouping sets (a vec of vecs) to `exprs`.
+fn extend_opt_grouping_sets<'a>(exprs: &mut Vec<&'a Expr>, source: Option<&'a [Vec<Expr>]>) {
+    if let Some(sets) = source {
+        for set in sets {
+            exprs.extend(set.iter());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -525,5 +672,87 @@ mod tests {
             },
         });
         assert_eq!(filter.children().len(), 1);
+    }
+
+    fn col(table: &str, name: &str) -> Expr {
+        Expr::Column(ColumnRef::new(
+            Some(table.to_string()),
+            name,
+            Some(DataType::Integer),
+        ))
+    }
+
+    #[test]
+    fn try_map_children_rebuilds_both_join_sides() {
+        // A Join over two scans: swap every child scan for a fresh single-column
+        // scan; both sides must be rebuilt (proves left AND right are visited).
+        let join = LogicalPlan::Join(Join {
+            left: Box::new(scan("l", &["id", "name"])),
+            right: Box::new(scan("r", &["id", "total"])),
+            join_type: JoinType::Inner,
+            condition: None,
+            natural: false,
+            using: None,
+            estimated_rows: None,
+            estimate_defaults: None,
+        });
+        let rebuilt = join
+            .try_map_children(|_| -> Result<LogicalPlan, ()> { Ok(scan("x", &["marker"])) })
+            .unwrap();
+        assert_eq!(rebuilt.schema(), vec!["marker", "marker"]);
+    }
+
+    #[test]
+    fn try_map_children_leaf_passes_through_untouched() {
+        let leaf = scan("t", &["a"]);
+        let mapped = leaf
+            .clone()
+            .try_map_children(|_| -> Result<LogicalPlan, ()> { panic!("leaf has no children") })
+            .unwrap();
+        assert_eq!(mapped, leaf);
+    }
+
+    #[test]
+    fn try_map_children_propagates_error() {
+        let filter = LogicalPlan::Filter(Filter {
+            input: Box::new(scan("t", &["a"])),
+            predicate: col("t", "a"),
+        });
+        let result: Result<LogicalPlan, &str> =
+            filter.try_map_children(|_| Err("child rewrite failed"));
+        assert_eq!(result, Err("child rewrite failed"));
+    }
+
+    #[test]
+    fn direct_expressions_covers_filter_and_aggregate() {
+        let predicate = col("t", "a");
+        let filter = LogicalPlan::Filter(Filter {
+            input: Box::new(scan("t", &["a"])),
+            predicate: predicate.clone(),
+        });
+        assert_eq!(filter.direct_expressions(), vec![&predicate]);
+
+        let group = col("t", "region");
+        let aggregate = LogicalPlan::Aggregate(Aggregate {
+            input: Box::new(scan("t", &["region", "amount"])),
+            group_by: vec![group.clone()],
+            aggregates: vec![col("t", "amount")],
+            output_names: vec!["region".to_string(), "amount".to_string()],
+            grouping_sets: None,
+        });
+        // group_by then aggregates, no descent into the input scan.
+        assert_eq!(aggregate.direct_expressions().len(), 2);
+        assert_eq!(aggregate.direct_expressions()[0], &group);
+    }
+
+    #[test]
+    fn direct_expressions_empty_for_bare_nodes() {
+        // A Limit carries no expressions of its own.
+        let limit = LogicalPlan::Limit(Limit {
+            input: Box::new(scan("t", &["a"])),
+            limit: Some(10),
+            offset: 0,
+        });
+        assert!(limit.direct_expressions().is_empty());
     }
 }
