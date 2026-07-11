@@ -1,0 +1,30 @@
+[package]
+name = "fedq-py"
+version = "0.1.0"
+edition.workspace = true
+
+# fedq-py: the ONLY crate allowed to depend on pyo3. A thin native extension
+# module (`fedq`) that lets Python - the benchmark harness - drive the Rust
+# engine: build a `Runtime` from a config file, `execute(sql)`, and pull the
+# Arrow result back across the zero-copy Arrow C-stream boundary.
+
+[lib]
+# The module name Python imports is `fedq` (the #[pymodule] fn), so the built
+# library file (libfedq_py.so) is symlinked to fedq.so at import time; its init
+# symbol is PyInit_fedq regardless of the crate's lib name.
+name = "fedq_py"
+# cdylib ONLY (no rlib): keep this a leaf so `cargo test --workspace` never
+# tries to link the Python extension module (undefined Python symbols) into a
+# test binary. The extension resolves those symbols at import time.
+crate-type = ["cdylib"]
+
+[dependencies]
+# extension-module: link against Python at import time, not build time.
+pyo3 = { version = "0.26", features = ["extension-module"] }
+# ffi: the Arrow C stream interface for the zero-copy Python<->Rust handoff.
+arrow = { version = "58", features = ["ffi"] }
+fq-runtime = { path = "../fq-runtime" }
+fq-common = { path = "../fq-common" }
+
+[lints]
+workspace = true
