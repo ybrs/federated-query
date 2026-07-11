@@ -74,16 +74,17 @@ DATA-PLANE fetch tier (Arrow streaming, ship, ctid-parallel = today's
 pyo3-coupled `fedqrs` connectors.rs) is a separate concern that moves in with
 fq-exec, de-pyo3-ified.
 
-## Status: 383 tests green, clippy pedantic (deny) + rustfmt clean
+## Status: 417 tests green, clippy pedantic (deny) + rustfmt clean
 
-Done through **fq-optimize (build-order step 6)**. The SQL front-to-optimizer
-pipeline is complete in Rust: SQL string -> parse -> bind -> decorrelate ->
-optimize -> optimized logical plan. What remains is the back end: fq-emit (SQL
-rendering), fq-physical, fq-exec, fq-runtime, then the CLI/py bindings and the
-final delete of `federated_query/`.
+Done through **fq-emit (build-order step 4 / Milestone B toolkit)**. The SQL
+front-to-optimizer pipeline is complete in Rust (SQL string -> parse -> bind ->
+decorrelate -> optimize -> optimized logical plan), and the SQL-emission toolkit
+now exists: fq-plan expressions/clauses -> canonical Postgres text -> per-dialect
+transpile. What remains is the rest of the back end: fq-physical, fq-exec,
+fq-runtime, then the CLI/py bindings and the final delete of `federated_query/`.
 
 Per-crate test counts: fq-common 13, fq-catalog 30, fq-plan 24, fq-connectors 15,
-fq-parse 34, fq-bind 25, fq-decorrelate 57, fq-optimize 185. Total 383.
+fq-parse 34, fq-bind 25, fq-decorrelate 57, fq-optimize 185, fq-emit 34. Total 417.
 
 How the later crates were built (fq-decorrelate onward): each large crate/milestone
 went ANALYSIS-SPEC (a subagent reads the Python module(s) in full and writes a
@@ -281,24 +282,68 @@ exists (it needs SQL rendering to build the EXPLAIN probe); the physical orienta
 helpers land with fq-physical. NOT in fq-optimize: `single_source_pushdown.py` +
 `dim_shipping.py` are federated-EXECUTION features that belong to a later crate.
 
-## NEXT: fq-emit (SQL rendering per source dialect)
+### fq-emit (34 tests) - COMPLETE (SQL-emission toolkit)
 
-Port the SQL emitter (`plan/physical.py` to_sql delegation + the dialect renderers;
-polyglot-sql's `generate(&expr, dialect)` re-renders an expression tree to SQL - use
-it). fq-emit is both the data-plane query builder (renders each remote scan/join/
-aggregate the physical plan ships to a source) AND the thing that UN-BLOCKS
-`fq_optimize::statistics::scan_planner_estimate` (which needs a rendered scan SQL to
-send to the source's EXPLAIN). It also lets the deferred EXPLAIN document builder land.
+Ports `plan/emit/{expressions,clauses,resolver}.py` (~620 LOC) + the
+`plan/physical.py::to_source_sql` transpile boundary. KEY DESIGN (validated
+empirically before building, resolving the plan-vs-old-HANDOFF fork): the crate
+renders fq-plan `Expr`+clauses to canonical **Postgres-form** SQL TEXT directly
+(hand-built strings, NOT polyglot's AST/generator), then `to_source_sql(pg_sql,
+dialect)` transpiles via `polyglot_sql::transpile(sql, PostgreSQL, target)` -
+exactly as the Python engine reused sqlglot's transpiler. Proven: polyglot
+reproduces STRING_AGG->LISTAGG, TABLESAMPLE(10)->(10 PERCENT), PERCENTILE_CONT
+WITHIN GROUP->QUANTILE_CONT for DuckDB, and PostgreSQL->PostgreSQL is identity. So
+NO hand-rolled dialect-divergence table; polyglot owns the divergences. Because
+transpile RE-PARSES our canonical text, every emitted string must be parseable
+Postgres - the load-bearing invariant, tested by round-tripping representative
+shapes through `to_source_sql(.., Postgres/DuckDb)`.
 
-After fq-emit: fq-physical (physical planner: single-source pushdown, dim shipping,
-fragment fusion, the PhysicalPlan producer), fq-exec (move the `fedqrs` DataFusion +
-DuckDB streaming engine in, de-pyo3-ified, delete the IR), fq-runtime + fedq + fedq-py,
-then the DELETE of `federated_query/` at the final gate (tallies vs pure-DuckDB truth +
-the full SQL corpus).
+Modules: `dialect.rs` (Dialect enum {Postgres,DuckDb,ClickHouse,DataFusion} ->
+polyglot DialectType; `to_source_sql` requires exactly one statement, surfaces
+every transpile failure as `EmitError::Transpile`), `ident.rs` (quote_ident),
+`resolver.rs` (ColumnResolver trait returning TEXT; SourceResolver = quoted
+qualified / star; MergeResolver = physical-name via alias map, RAISES
+`ColumnResolution` on a qualified ref the relation does not expose, bare name for
+unqualified), `expr.rs` (render_expr: exhaustive match, every BinaryOp/UnaryOp/
+InList/Between fully parenthesized [load-bearing - AND/OR terms are string-joined
+downstream], the four subquery variants RAISE `SubqueryReachedEmit`, the shared
+ordered-key/NULLS rule [LAST for ASC, FIRST for DESC, explicit override] used by
+both ORDER BY and Window), `clauses.rs` (select_list, order_by, group_by/grouping
+sets, set_op_keyword, assemble_select via a `SelectPieces` struct). Error variants
+for closed-enum "unmapped operator/literal-type" are RETIRED (compiler is the
+guard, no dead runtime variant). Review-fixed defensive holes: NEGATE of a
+sign-leading operand (negative literal / nested negate) now parenthesizes so the
+`-` tokens never fuse into `--` (a SQL comment) = unparseable text; a non-finite
+float literal (NaN/Infinity) RAISES `UnrepresentableLiteral` instead of shipping
+`NaN`/`inf`.
+
+Deferred with clear seams (stated in the module docs): the fedqrs
+`core/src/sql.rs` `ScanSpec`/DataFusion-`Expr` runtime dynamic-filter renderer
+moves in with fq-exec (de-DataFusion-ified to reuse this crate's emitter); the
+per-physical-node query assembly (`PhysicalRemoteQuery._build_query`, single-source
+pushdown / injected / lateral island SQL, FROM/JOIN rendering) belongs to
+fq-physical, which will COMPOSE these clause builders; the EXPLAIN document builder
+stays with fq-runtime. `fq_optimize::statistics::scan_planner_estimate` stays
+blocked until fq-physical produces a rendered scan to EXPLAIN.
+
+## NEXT: fq-physical (physical planner)
+
+Port `optimizer/physical_planner.py` + `single_source_pushdown.py` +
+`dim_shipping.py` + the LOGIC of `executor/rust_ir.py` (step building, no JSON).
+Lowering dispatch (SingleSourcePushdown.try_build -> DimShipping.try_ship ->
+per-node lowering), the PhysicalPlan producer that COMPOSES fq-emit's clause
+builders into remote-query SQL, and bottom-up step building. This is the crate
+that consumes fq-emit and un-blocks scan_planner_estimate.
+
+After fq-physical: fq-exec (move the `fedqrs` DataFusion + DuckDB streaming engine
+in, de-pyo3-ified, delete the IR), fq-runtime + fedq + fedq-py, then the DELETE of
+`federated_query/` at the final gate (tallies vs pure-DuckDB truth + the full SQL
+corpus).
 
 ## Commit log (rewrite so far, newest first)
 
 ```
+<pending> fq-emit - canonical Postgres emitter + polyglot transpile boundary
 ae91273 fq-optimize M4 - eager aggregation + CTE union filter pushdown
 caf0ca8 fq-optimize M3 - cost-based join ordering (Selinger DP + GOO + locality)
 6f45e1a fq-optimize M2 - fixpoint rule driver + pushdown rules

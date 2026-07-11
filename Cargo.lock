@@ -757,6 +757,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fq-emit"
+version = "0.1.0"
+dependencies = [
+ "fq-common",
+ "fq-plan",
+ "polyglot-sql",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "fq-optimize"
 version = "0.1.0"
 dependencies = [
