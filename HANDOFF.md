@@ -343,7 +343,7 @@ corpus).
 ## Commit log (rewrite so far, newest first)
 
 ```
-<pending> fq-emit - canonical Postgres emitter + polyglot transpile boundary
+9138c75 fq-emit - canonical Postgres emitter + polyglot transpile boundary
 ae91273 fq-optimize M4 - eager aggregation + CTE union filter pushdown
 caf0ca8 fq-optimize M3 - cost-based join ordering (Selinger DP + GOO + locality)
 6f45e1a fq-optimize M2 - fixpoint rule driver + pushdown rules
