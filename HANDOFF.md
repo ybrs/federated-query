@@ -74,19 +74,19 @@ DATA-PLANE fetch tier (Arrow streaming, ship, ctid-parallel = today's
 pyo3-coupled `fedqrs` connectors.rs) is a separate concern that moves in with
 fq-exec, de-pyo3-ified.
 
-## Status: 492 tests green, clippy pedantic (deny) + rustfmt clean
+## Status: 534 tests green, clippy pedantic (deny) + rustfmt clean
 
-Done through **fq-physical (build-order step 6 / logical->physical lowering)**. The
-whole planning pipeline is complete in Rust: SQL string -> parse -> bind ->
+Done through **fq-physical INCLUDING step building (build-order step 6)**. The whole
+planning-and-lowering pipeline is complete in Rust: SQL string -> parse -> bind ->
 decorrelate -> optimize -> optimized logical plan -> PhysicalPlan (single-source
-pushdown + dim shipping + join-algorithm lowering). What remains is EXECUTION:
-fq-exec (move the fedqrs DataFusion + DuckDB engine in, delete the IR, add the
-step-building rust_ir logic), fq-runtime, the CLI/py bindings, then the final
-delete of `federated_query/`.
+pushdown + dim shipping + join-algorithm lowering) -> executable Step list +
+Fragments (the rust_ir port, no JSON). What remains is EXECUTION: fq-exec (move the
+fedqrs DataFusion + DuckDB engine in, delete the JSON IR, consume the Step list),
+fq-runtime, the CLI/py bindings, then the final delete of `federated_query/`.
 
-Per-crate test counts: fq-common 13, fq-catalog 30, fq-plan 35, fq-connectors 15,
+Per-crate test counts: fq-common 13, fq-catalog 30, fq-plan 47, fq-connectors 15,
 fq-parse 34, fq-bind 25, fq-decorrelate 57, fq-optimize 185, fq-emit 34,
-fq-physical 64. Total 492.
+fq-physical 91. Total 534.
 
 How the later crates were built (fq-decorrelate onward): each large crate/milestone
 went ANALYSIS-SPEC (a subagent reads the Python module(s) in full and writes a
@@ -378,22 +378,46 @@ analysis-spec -> coding subagent -> commit, then three parallel adversarial revi
   the raw shape errors loudly at the source, never silent-wrong); RIGHT-JOIN
   non-preserved filter.
 
-Test level: the crate is tested at the PhysicalPlan-TREE level (assert on the produced
-tree / `PhysicalRemoteQuery.sql` after parse->bind->decorrelate->optimize->plan), NOT
-via execution/EXPLAIN - the Python e2e_pushdown suites assert through the runtime
-(EXPLAIN FORMAT JSON), which needs fq-runtime + the EXPLAIN builder (later crates).
+- **M4 step building** (f5aa7ca M4b + 6f1df53 M4c + ba6be89 M4d review fixes):
+  ports `executor/rust_ir.py` (PhysicalPlan -> ordered `Step` list + named `Fragment`s,
+  NO JSON). Two clean-Rust decisions: (a) IrExpr is ELIMINATED (plan section 5) - the
+  `Step`/`Fragment`/`ScanSpec` plain structs (steps/types.rs, no serde, shapes from
+  fedqrs core/src/ir.rs) hold `fq_plan::Expr` directly, retiring the whole `_serialize_*`
+  layer; fragment col refs retagged via a `ColumnRef.table` rewrite; the Expr->DataFusion
+  lowering moves to fq-exec. (b) step building lives in fq-physical (plan 3.10 assigns
+  rust_ir semantics here; keeps the crate DataFusion-free), so fq-exec will CONSUME
+  `build_steps(plan) -> Vec<Step>`, not build it. Modules steps/{types,expr_retag,
+  scan_spec,render_sql,emit_nodes,cse,reduction,observe}.rs. Prerequisite M4a (00ee3bb):
+  ported physical `column_aliases()` onto PhysicalPlan (23 node methods) +
+  physical_column_name + contains_grouping. CORRECTNESS-CRITICAL bits reviewed: CSE share
+  key canonicalizes ScanSpec.filter via fq-emit `render_canonical` (Debug/pointer would
+  merge distinct scans = wrong rows); node identity = raw pointer of `&PhysicalPlan`
+  (non-mutating walk); the reduced join STILL emits the coordinator HashJoin (injection is
+  only a superset filter). Review fixed: RemoteSetOp had no renderer (same-source
+  `A UNION ALL B` errored) -> added render_remote_set_op; silent alias-miss fallbacks ->
+  raise (added `Expr::try_map_children`); self-join uniquify iterated sorted BTreeMap ->
+  schema order. Deferred (result-correct): the `injected_sql` source-side key placement
+  (RemoteQuery holds rendered SQL not an AST to splice; engine wraps the base with the IN
+  filter) and window-over-GROUPING() split (raises loudly). build_steps needs no
+  catalog/cost/stats - all stats pre-stamped on nodes; the sole external fact ("is source
+  Postgres?" for the parallel gate) is a `datasource_kind` field stamped on PhysicalScan.
 
-NOT in fq-physical (deferred to fq-exec, per the plan): the `executor/rust_ir.py`
-STEP-BUILDING logic (PhysicalPlan -> executable Step list) - the `Step` type lives with
-the engine, so it moves in with fq-exec (milestone C pairing). `scan_planner_estimate`
-stays blocked until the runtime can render a scan to EXPLAIN.
+Test level: the crate is tested at the PhysicalPlan-TREE and STEP-LIST level (assert on
+the produced tree / `PhysicalRemoteQuery.sql` / the `Vec<Step>` after
+parse->bind->decorrelate->optimize->plan->build_steps), NOT via execution/EXPLAIN - the
+Python e2e_pushdown suites assert through the runtime (EXPLAIN FORMAT JSON), which needs
+fq-runtime + the EXPLAIN builder (later crates).
+
+`scan_planner_estimate` stays blocked until the runtime can render a scan to EXPLAIN.
 
 ## NEXT: fq-exec (the execution engine; IR deletion) - MILESTONE C
 
 Absorb today's `fedqrs/src/engine.rs` + `core/` MINUS the IR: delete `core/src/ir.rs`
-and the serde/JSON entry point; `execute(plan: &PhysicalPlan)` consumes the fq-plan
-tree; the `Step` list is built IN-PROCESS by the rust_ir step-building logic (ported
-HERE with fq-exec, no JSON). Everything else stays as-is (already Rust, already tallied):
+and the serde/JSON entry point; `execute(plan: &PhysicalPlan)` runs the pipeline, and
+the `Step` list is built by `fq_physical::build_steps` (ALREADY DONE - it is in
+fq-physical, not here). fq-exec CONSUMES that `Vec<Step>` + fragments and adds the
+`fq_plan::Expr -> DataFusion Expr` conversion (replacing `core/src/expr.rs`). Everything
+else stays as-is (already Rust, already tallied):
 lazy fragment fusion into DataFusion regions, the FairSpillPool + tracked collection,
 binding spill, SMJ retry, reductions (inline-IN / temp-table / parquet delivery), ship
 execution, prefetch pools, ctid-parallel reads, aggregate metric harvest, per-step
@@ -410,6 +434,10 @@ final gate (tallies vs pure-DuckDB truth + the full SQL corpus).
 ## Commit log (rewrite so far, newest first)
 
 ```
+ba6be89 fq-physical M4d - step-building review fixes (RemoteSetOp render, loud alias miss)
+6f1df53 fq-physical M4c - semi-join reduction + observations
+f5aa7ca fq-physical M4b - step building (PhysicalPlan -> Step list + Fragments)
+00ee3bb fq-physical M4a - physical column_aliases() prerequisite
 a13236b fq-physical review fix - argument-aware aggregate output types
 c08018d fq-physical M3 - dim shipping + typed physical schema()
 be8be98 fq-physical M2 - single-source pushdown (subtree -> one remote query)
