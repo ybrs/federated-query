@@ -74,17 +74,19 @@ DATA-PLANE fetch tier (Arrow streaming, ship, ctid-parallel = today's
 pyo3-coupled `fedqrs` connectors.rs) is a separate concern that moves in with
 fq-exec, de-pyo3-ified.
 
-## Status: 417 tests green, clippy pedantic (deny) + rustfmt clean
+## Status: 492 tests green, clippy pedantic (deny) + rustfmt clean
 
-Done through **fq-emit (build-order step 4 / Milestone B toolkit)**. The SQL
-front-to-optimizer pipeline is complete in Rust (SQL string -> parse -> bind ->
-decorrelate -> optimize -> optimized logical plan), and the SQL-emission toolkit
-now exists: fq-plan expressions/clauses -> canonical Postgres text -> per-dialect
-transpile. What remains is the rest of the back end: fq-physical, fq-exec,
-fq-runtime, then the CLI/py bindings and the final delete of `federated_query/`.
+Done through **fq-physical (build-order step 6 / logical->physical lowering)**. The
+whole planning pipeline is complete in Rust: SQL string -> parse -> bind ->
+decorrelate -> optimize -> optimized logical plan -> PhysicalPlan (single-source
+pushdown + dim shipping + join-algorithm lowering). What remains is EXECUTION:
+fq-exec (move the fedqrs DataFusion + DuckDB engine in, delete the IR, add the
+step-building rust_ir logic), fq-runtime, the CLI/py bindings, then the final
+delete of `federated_query/`.
 
-Per-crate test counts: fq-common 13, fq-catalog 30, fq-plan 24, fq-connectors 15,
-fq-parse 34, fq-bind 25, fq-decorrelate 57, fq-optimize 185, fq-emit 34. Total 417.
+Per-crate test counts: fq-common 13, fq-catalog 30, fq-plan 35, fq-connectors 15,
+fq-parse 34, fq-bind 25, fq-decorrelate 57, fq-optimize 185, fq-emit 34,
+fq-physical 64. Total 492.
 
 How the later crates were built (fq-decorrelate onward): each large crate/milestone
 went ANALYSIS-SPEC (a subagent reads the Python module(s) in full and writes a
@@ -326,23 +328,94 @@ fq-physical, which will COMPOSE these clause builders; the EXPLAIN document buil
 stays with fq-runtime. `fq_optimize::statistics::scan_planner_estimate` stays
 blocked until fq-physical produces a rendered scan to EXPLAIN.
 
-## NEXT: fq-physical (physical planner)
+### fq-physical (64 tests) - COMPLETE (LogicalPlan -> PhysicalPlan)
 
-Port `optimizer/physical_planner.py` + `single_source_pushdown.py` +
-`dim_shipping.py` + the LOGIC of `executor/rust_ir.py` (step building, no JSON).
-Lowering dispatch (SingleSourcePushdown.try_build -> DimShipping.try_ship ->
-per-node lowering), the PhysicalPlan producer that COMPOSES fq-emit's clause
-builders into remote-query SQL, and bottom-up step building. This is the crate
-that consumes fq-emit and un-blocks scan_planner_estimate.
+Ports `optimizer/physical_planner.py` + `single_source_pushdown.py` +
+`dim_shipping.py` (the PhysicalPlan PRODUCER). Built in four milestones, each an
+analysis-spec -> coding subagent -> commit, then three parallel adversarial reviews
+(single-source SQL / planner+schema / dim-shipping gates) -> one fix.
 
-After fq-physical: fq-exec (move the `fedqrs` DataFusion + DuckDB streaming engine
-in, de-pyo3-ified, delete the IR), fq-runtime + fedq + fedq-py, then the DELETE of
-`federated_query/` at the final gate (tallies vs pure-DuckDB truth + the full SQL
-corpus).
+- **M0 prerequisites** (5a1de0f): fq-plan `PhysicalLateralJoin.correlations` retyped
+  to carry the `BinaryOpType` (the operator is load-bearing for the domain-filter
+  reduction; the old `DataType` slot was wrong); `GroupObservation` + an
+  `Option<GroupObservation>` field on `PhysicalHashAggregate`/`PhysicalRemoteQuery`;
+  `has_window_output` + the `contains_window` walker. fq-optimize `cost::group_subject`
+  made pub (same learned-stats subject both producers stamp and the cost model reads).
+  fq-catalog `datasource_names()`.
+- **M1 planner core** (49cd4bf): the `PhysicalPlanner` (cost_model behind
+  `Rc<RefCell>`), per-node lowering, join-algorithm selection + key orientation
+  (alias-then-name, RAISES on unorientable keys) + build-side (smaller side built) +
+  dynamic-filter marking on the PROBE, cross-source LATERAL, CTE producer registry,
+  scan estimate + coordinator-aggregate group_observation stamp. single_source and
+  dim_shipping were STUBS here.
+- **M2 single-source pushdown** (be8be98): `SingleSourcePushdown::try_build` absorbs a
+  one-source renderable subtree into one `PhysicalRemoteQuery`. The AST-vs-text gap
+  (Python accumulated sqlglot AST + rewrote it; fq-emit renders text) is resolved by a
+  two-level accumulator - `Vec<Expr>`+`Vec<String>` for the SELECT list / DISTINCT-ON
+  keys (the only pieces later rewrites touch), eagerly-rendered `String` for the rest.
+  `relation_sql.rs` holds the FROM/JOIN/EXISTS/WITH text builders (SEMI/ANTI ->
+  `WHERE [NOT] EXISTS(...)` built explicitly since sqlglot did it for free). Decline =
+  `Ok(None)`; a subquery Expr reaching emit propagates `EmitError` loudly.
+- **M3 dim shipping + typed schema** (c08018d): typed `PhysicalPlan::schema() ->
+  Vec<(String, DataType)>` in fq-plan (the deferred prerequisite; clean-Rust - a bound
+  ColumnRef carries its DataType so `Expr::get_type` needs no Arrow/kernels/column_
+  aliases; source-typed nodes panic loudly rather than guess). `DimShipping::try_ship`:
+  9 gates in order (kill switch, cost-model, shippable shape, plain aggregate,
+  dimension explosion with measured-group override, local source, ship target, foreign
+  scans, cost gate) -> build (synthetic scans -> replace -> single_source.try_build ->
+  fallback-seed -> outputs_match/has_window -> wrap_shipments). Every gate miss
+  DECLINES; estimate/group_key_dimension/plan_without_shipping/group_count errors
+  PROPAGATE (never laundered into a decline). Thresholds ported verbatim (floor 100k,
+  budget 200k, ratio 20, high-card NDV 10k, collapse fraction 0.1).
+- **Review fix** (a13236b): `HashAggregate::schema()` now types aggregate outputs by
+  the ARGUMENT-aware rule (`_infer_aggregate_type`: COUNT->BIGINT, MIN/MAX preserve arg
+  type, AVG->DOUBLE, SUM widens integer keeps float/decimal) instead of name-only
+  `get_type`, which had mis-declared SUM(float)->BIGINT and MIN/MAX->VARCHAR = a wrong
+  seeded island schema. Other review findings were faithful-to-Python + unreachable
+  through the current pipeline (documented, not changed): recursive-CTE Values-anchor
+  column aliasing (reachable only once WITH RECURSIVE parses, which still raises);
+  SEMI/ANTI over a filtered base-scan right (decorrelation wraps it in a SubqueryScan;
+  the raw shape errors loudly at the source, never silent-wrong); RIGHT-JOIN
+  non-preserved filter.
+
+Test level: the crate is tested at the PhysicalPlan-TREE level (assert on the produced
+tree / `PhysicalRemoteQuery.sql` after parse->bind->decorrelate->optimize->plan), NOT
+via execution/EXPLAIN - the Python e2e_pushdown suites assert through the runtime
+(EXPLAIN FORMAT JSON), which needs fq-runtime + the EXPLAIN builder (later crates).
+
+NOT in fq-physical (deferred to fq-exec, per the plan): the `executor/rust_ir.py`
+STEP-BUILDING logic (PhysicalPlan -> executable Step list) - the `Step` type lives with
+the engine, so it moves in with fq-exec (milestone C pairing). `scan_planner_estimate`
+stays blocked until the runtime can render a scan to EXPLAIN.
+
+## NEXT: fq-exec (the execution engine; IR deletion) - MILESTONE C
+
+Absorb today's `fedqrs/src/engine.rs` + `core/` MINUS the IR: delete `core/src/ir.rs`
+and the serde/JSON entry point; `execute(plan: &PhysicalPlan)` consumes the fq-plan
+tree; the `Step` list is built IN-PROCESS by the rust_ir step-building logic (ported
+HERE with fq-exec, no JSON). Everything else stays as-is (already Rust, already tallied):
+lazy fragment fusion into DataFusion regions, the FairSpillPool + tracked collection,
+binding spill, SMJ retry, reductions (inline-IN / temp-table / parquet delivery), ship
+execution, prefetch pools, ctid-parallel reads, aggregate metric harvest, per-step
+observations, profile output. Also absorbs the fedqrs `core/src/sql.rs`
+ScanSpec/DataFusion-Expr runtime dynamic-filter renderer (de-DataFusion-ified to reuse
+fq-emit). `expression_evaluator.py` call sites: each is either DataFusion-covered
+(retire) or a small kernel here. `fedqrs` has a matching `rewrite-python-to-rust` branch
+NOT yet merged into this workspace - the fq-exec step likely starts by importing it
+(git subtree per plan section 1).
+
+After fq-exec: fq-runtime + fedq + fedq-py, then the DELETE of `federated_query/` at the
+final gate (tallies vs pure-DuckDB truth + the full SQL corpus).
 
 ## Commit log (rewrite so far, newest first)
 
 ```
+a13236b fq-physical review fix - argument-aware aggregate output types
+c08018d fq-physical M3 - dim shipping + typed physical schema()
+be8be98 fq-physical M2 - single-source pushdown (subtree -> one remote query)
+49cd4bf fq-physical M1 - physical planner core (LogicalPlan -> PhysicalPlan)
+5a1de0f fq-physical M0 - cross-crate prerequisites + crate scaffold
+6e6a562 docs: record fq-emit commit hash in HANDOFF log
 9138c75 fq-emit - canonical Postgres emitter + polyglot transpile boundary
 ae91273 fq-optimize M4 - eager aggregation + CTE union filter pushdown
 caf0ca8 fq-optimize M3 - cost-based join ordering (Selinger DP + GOO + locality)
