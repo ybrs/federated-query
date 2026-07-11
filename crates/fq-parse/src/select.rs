@@ -9,8 +9,10 @@
 //! OFFSET. Stars, DISTINCT, CTEs, set operations, derived tables, and joins raise.
 
 use fq_plan::expr::NullsOrder;
-use fq_plan::{Aggregate, Expr, Filter, Limit, LogicalPlan, Projection, Scan, Sort};
-use polyglot_sql::expressions::{Expression, Ordered, Select, TableRef};
+use fq_plan::{
+    Aggregate, Expr, Filter, Join, JoinType, Limit, LogicalPlan, Projection, Scan, Sort,
+};
+use polyglot_sql::expressions::{Expression, JoinKind, Ordered, Select, TableRef};
 
 use crate::error::ParseError;
 use crate::expr::convert_expr;
@@ -18,8 +20,8 @@ use crate::expr::convert_expr;
 /// Convert a SELECT into a logical plan.
 pub fn convert_select(select: &Select) -> Result<LogicalPlan, ParseError> {
     reject_unsupported_clauses(select)?;
-    let scan = build_scan(select)?;
-    let filtered = apply_where(scan, select)?;
+    let from = build_from(select)?;
+    let filtered = apply_where(from, select)?;
     let projected = apply_projection(filtered, select)?;
     let sorted = apply_order_by(projected, select)?;
     apply_limit(sorted, select)
@@ -29,7 +31,6 @@ pub fn convert_select(select: &Select) -> Result<LogicalPlan, ParseError> {
 /// dropped. Mirrors the Python `SUPPORTED_SELECT_ARGS` allowlist.
 fn reject_unsupported_clauses(select: &Select) -> Result<(), ParseError> {
     let unsupported = [
-        (!select.joins.is_empty(), "JOIN"),
         (select.distinct, "DISTINCT"),
         (select.distinct_on.is_some(), "DISTINCT ON"),
         (select.with.is_some(), "WITH (CTE)"),
@@ -55,9 +56,10 @@ fn reject_unsupported_clauses(select: &Select) -> Result<(), ParseError> {
     Ok(())
 }
 
-/// Build the base `Scan` from a single-table FROM. Multiple FROM items (comma
-/// joins) and non-table FROM items (derived tables, VALUES) raise for now.
-fn build_scan(select: &Select) -> Result<LogicalPlan, ParseError> {
+/// Build the FROM tree: the base table then each JOIN folded left-deep over it.
+/// A single non-table FROM item (derived table, VALUES) and comma joins raise for
+/// now.
+fn build_from(select: &Select) -> Result<LogicalPlan, ParseError> {
     let from = select
         .from
         .as_ref()
@@ -65,18 +67,77 @@ fn build_scan(select: &Select) -> Result<LogicalPlan, ParseError> {
     let [only] = from.expressions.as_slice() else {
         return Err(ParseError::Unsupported("comma-joined FROM".to_string()));
     };
-    let Expression::Table(table) = only else {
+    let mut plan = scan_of(select, only)?;
+    for join in &select.joins {
+        plan = apply_join(select, plan, join)?;
+    }
+    Ok(plan)
+}
+
+/// A base-table FROM/JOIN item as a `Scan`. Derived tables and VALUES raise.
+fn scan_of(select: &Select, item: &Expression) -> Result<LogicalPlan, ParseError> {
+    let Expression::Table(table) = item else {
         return Err(ParseError::Unsupported(format!(
-            "FROM {}",
-            only.variant_name()
+            "FROM/JOIN {}",
+            item.variant_name()
         )));
     };
     Ok(LogicalPlan::Scan(Box::new(scan_from_table(select, table))))
 }
 
-/// Assemble a `Scan` for one table, over-collecting the referenced column names
-/// (the binder prunes/expands them against the catalog). `catalog`/`schema`
-/// default to the engine conventions when the reference omits them.
+/// Fold one JOIN onto the left plan.
+fn apply_join(
+    select: &Select,
+    left: LogicalPlan,
+    join: &polyglot_sql::expressions::Join,
+) -> Result<LogicalPlan, ParseError> {
+    let right = scan_of(select, &join.this)?;
+    let (join_type, natural) = map_join_kind(join.kind)?;
+    let condition = match &join.on {
+        Some(on) => Some(convert_expr(on)?),
+        None => None,
+    };
+    let using = if join.using.is_empty() {
+        None
+    } else {
+        Some(join.using.iter().map(|ident| ident.name.clone()).collect())
+    };
+    Ok(LogicalPlan::Join(Join {
+        left: Box::new(left),
+        right: Box::new(right),
+        join_type,
+        condition,
+        natural,
+        using,
+        estimated_rows: None,
+        estimate_defaults: None,
+    }))
+}
+
+/// Map a polyglot join kind to `(JoinType, natural)`; the exotic kinds (APPLY,
+/// ASOF, STRAIGHT, LATERAL) raise for now.
+fn map_join_kind(kind: JoinKind) -> Result<(JoinType, bool), ParseError> {
+    let mapped = match kind {
+        JoinKind::Inner => (JoinType::Inner, false),
+        JoinKind::Left => (JoinType::Left, false),
+        JoinKind::Right => (JoinType::Right, false),
+        JoinKind::Full | JoinKind::Outer => (JoinType::Full, false),
+        JoinKind::Cross => (JoinType::Cross, false),
+        JoinKind::Semi | JoinKind::LeftSemi => (JoinType::Semi, false),
+        JoinKind::Anti | JoinKind::LeftAnti => (JoinType::Anti, false),
+        JoinKind::Natural => (JoinType::Inner, true),
+        JoinKind::NaturalLeft => (JoinType::Left, true),
+        JoinKind::NaturalRight => (JoinType::Right, true),
+        JoinKind::NaturalFull => (JoinType::Full, true),
+        other => return Err(ParseError::Unsupported(format!("{other:?} JOIN"))),
+    };
+    Ok(mapped)
+}
+
+/// Assemble a `Scan` for one table, over-collecting the column names referenced
+/// for it (qualified by its alias/name, plus unqualified refs - the binder prunes
+/// and expands against the catalog). `catalog`/`schema` default to the engine
+/// conventions when the reference omits them.
 fn scan_from_table(select: &Select, table: &TableRef) -> Scan {
     let datasource = table
         .catalog
@@ -86,19 +147,22 @@ fn scan_from_table(select: &Select, table: &TableRef) -> Scan {
         .schema
         .as_ref()
         .map_or_else(|| "public".to_string(), |ident| ident.name.clone());
+    let alias = table.alias.as_ref().map(|ident| ident.name.clone());
+    // The name a qualified reference uses for this table: its alias if any.
+    let key = alias.clone().unwrap_or_else(|| table.name.name.clone());
     let mut scan = Scan::new(
         datasource,
         schema_name,
         table.name.name.clone(),
-        referenced_columns(select),
+        columns_for_table(select, &key),
     );
-    scan.alias = table.alias.as_ref().map(|ident| ident.name.clone());
+    scan.alias = alias;
     scan
 }
 
-/// Distinct column names referenced anywhere in the SELECT (over-collection; the
-/// binder prunes/expands against the catalog).
-fn referenced_columns(select: &Select) -> Vec<String> {
+/// Every root expression that may reference columns (SELECT list, WHERE, GROUP
+/// BY, HAVING, ORDER BY, and each JOIN condition).
+fn column_roots(select: &Select) -> Vec<&Expression> {
     let mut roots: Vec<&Expression> = select.expressions.iter().collect();
     if let Some(where_clause) = &select.where_clause {
         roots.push(&where_clause.this);
@@ -114,11 +178,27 @@ fn referenced_columns(select: &Select) -> Vec<String> {
             roots.push(&ordered.this);
         }
     }
+    for join in &select.joins {
+        if let Some(on) = &join.on {
+            roots.push(on);
+        }
+    }
+    roots
+}
+
+/// Distinct column names referenced for a table `key`: those qualified by `key`
+/// plus every unqualified reference (over-collection; the binder resolves which
+/// table actually owns an unqualified column).
+fn columns_for_table(select: &Select, key: &str) -> Vec<String> {
     let mut columns: Vec<String> = Vec::new();
-    for root in roots {
+    for root in column_roots(select) {
         for found in polyglot_sql::traversal::get_columns(root) {
             if let Expression::Column(column) = found {
-                if !columns.contains(&column.name.name) {
+                let matches = match &column.table {
+                    Some(qualifier) => qualifier.name == key,
+                    None => true,
+                };
+                if matches && !columns.contains(&column.name.name) {
                     columns.push(column.name.name.clone());
                 }
             }

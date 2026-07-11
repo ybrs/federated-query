@@ -108,9 +108,54 @@ fn multi_statement_raises() {
 }
 
 #[test]
-fn join_is_unsupported_for_now() {
-    let result = parse("SELECT a FROM t JOIN s ON t.id = s.id");
-    assert!(matches!(result, Err(ParseError::Unsupported(_))));
+fn inner_join_builds_join_node() {
+    // SELECT u.name, o.total FROM pg.public.users u JOIN duck.main.orders o ON ...
+    let plan = parse(
+        "SELECT u.name, o.total FROM pg.public.users AS u \
+         JOIN duck.main.orders AS o ON u.id = o.user_id WHERE u.age > 30",
+    )
+    .unwrap();
+    // Projection -> Filter -> Join(Scan u, Scan o).
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection");
+    };
+    let LogicalPlan::Filter(filter) = projection.input.as_ref() else {
+        panic!("expected Filter");
+    };
+    let LogicalPlan::Join(join) = filter.input.as_ref() else {
+        panic!("expected Join");
+    };
+    assert_eq!(join.join_type, fq_plan::JoinType::Inner);
+    assert!(join.condition.is_some());
+    let LogicalPlan::Scan(left) = join.left.as_ref() else {
+        panic!("left scan");
+    };
+    let LogicalPlan::Scan(right) = join.right.as_ref() else {
+        panic!("right scan");
+    };
+    assert_eq!(left.datasource, "pg");
+    assert_eq!(left.alias.as_deref(), Some("u"));
+    assert_eq!(right.datasource, "duck");
+    assert_eq!(right.table_name, "orders");
+    // Column over-collection is partitioned by qualifier: id/name/age -> u,
+    // user_id/total -> o.
+    assert!(left.columns.contains(&"name".to_string()));
+    assert!(left.columns.contains(&"id".to_string()));
+    assert!(right.columns.contains(&"total".to_string()));
+    assert!(right.columns.contains(&"user_id".to_string()));
+    assert!(!right.columns.contains(&"name".to_string()));
+}
+
+#[test]
+fn left_join_maps_join_type() {
+    let plan = parse("SELECT a FROM t LEFT JOIN s ON t.id = s.id").unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection");
+    };
+    let LogicalPlan::Join(join) = projection.input.as_ref() else {
+        panic!("expected Join");
+    };
+    assert_eq!(join.join_type, fq_plan::JoinType::Left);
 }
 
 #[test]
