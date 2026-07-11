@@ -1,0 +1,35 @@
+[package]
+name = "fq-exec"
+version = "0.1.0"
+edition.workspace = true
+
+# fq-exec: the federated execution engine. Imported from `fedqrs` (src/engine.rs
+# + src/connectors.rs + the core crate) and de-pyo3-ified. The engine reads every
+# source natively (ADBC Postgres, native DuckDB, DataFusion Parquet), runs the
+# relational fragments on DataFusion, and returns the Arrow result. The pyo3 FFI
+# boundary that used to wrap it moves to the later fedq-py crate.
+
+[dependencies]
+datafusion = "54"
+# arrow/arrow-array/arrow-schema pinned to the workspace's existing 58.x line
+# (Cargo.lock has arrow 58.3.0); DataFusion 54 pulls the same arrow 58.
+arrow = "58"
+arrow-array = "58"
+arrow-schema = "58"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+# Stream combinators for pool-tracked batch accumulation.
+futures = "0.3"
+# The IR keeps its serde for this milestone so the imported ir.rs unit tests run;
+# the JSON boundary moves to fedq-py.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# ADBC reads Postgres straight into Arrow (the same C driver the Python path used).
+adbc_core = "0.23"
+adbc_driver_manager = "0.23"
+# Native DuckDB source connector (reads .duckdb files and ingests temp tables via
+# the Arrow appender).
+duckdb = { version = "1.3", features = ["bundled", "appender-arrow"] }
+thiserror = "2"
+
+[lints]
+workspace = true
