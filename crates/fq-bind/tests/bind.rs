@@ -370,6 +370,105 @@ fn in_subquery_binds_inner_plan() {
     assert!(matches!(subquery.as_ref(), LogicalPlan::Projection(_)));
 }
 
+// --- regressions from the fq-bind review ---
+
+#[test]
+fn output_alias_does_not_leak_into_order_by_subquery() {
+    // Review bug #1 (soundness): `n` is a SELECT output alias of the OUTER query;
+    // inside the ORDER BY subquery, `n` is out of scope (orders has no `n`), so it
+    // MUST raise - the outer alias must not leak in.
+    let result = bind_sql(
+        "SELECT age AS n FROM pg.public.users \
+         ORDER BY (SELECT MAX(n) FROM pg.public.orders)",
+    );
+    assert!(
+        matches!(result, Err(BindError::ColumnNotInScope(_))),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn unsupported_cast_target_raises() {
+    // Review bug #2: an unmodeled CAST target must raise at bind (defense in
+    // depth - the parser also rejects it, so build the plan directly to reach the
+    // binder's guard), not leave an untyped Cast that later panics in get_type.
+    use fq_plan::{ColumnRef, Projection, Scan};
+    let scan = LogicalPlan::Scan(Box::new(Scan::new(
+        "pg",
+        "public",
+        "users",
+        vec!["id".to_string()],
+    )));
+    let cast = Expr::Cast {
+        expr: Box::new(Expr::Column(ColumnRef::new(None, "id", None))),
+        target_type: "JSON".to_string(),
+        data_type: None,
+    };
+    let plan = LogicalPlan::Projection(Projection {
+        input: Box::new(scan),
+        expressions: vec![cast],
+        aliases: vec!["j".to_string()],
+        distinct: false,
+        distinct_on: None,
+    });
+    let result = bind(&catalog(), plan);
+    assert!(
+        matches!(result, Err(BindError::Unsupported(_))),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn modeled_cast_target_types_the_cast() {
+    let plan = bind_sql("SELECT CAST(age AS DECIMAL(10, 2)) AS d FROM pg.public.users").unwrap();
+    let LogicalPlan::Projection(projection) = &plan else {
+        panic!("expected Projection");
+    };
+    let Expr::Cast { data_type, .. } = &projection.expressions[0] else {
+        panic!("expected Cast");
+    };
+    assert_eq!(*data_type, Some(DataType::Double));
+}
+
+#[test]
+fn group_by_output_alias_resolves() {
+    // Review bug #3: GROUP BY names the SELECT output alias `lname` (not a base
+    // column); it resolves to the aliased expression LOWER(users.name).
+    let plan =
+        bind_sql("SELECT LOWER(name) AS lname, COUNT(*) AS c FROM pg.public.users GROUP BY lname")
+            .unwrap();
+    let LogicalPlan::Aggregate(aggregate) = &plan else {
+        panic!("expected Aggregate, got {plan:?}");
+    };
+    // The grouping key became the aliased function call over a resolved column.
+    let Expr::FunctionCall {
+        function_name,
+        args,
+        ..
+    } = &aggregate.group_by[0]
+    else {
+        panic!(
+            "expected function call group key, got {:?}",
+            aggregate.group_by[0]
+        );
+    };
+    assert_eq!(function_name, "LOWER");
+    let Expr::Column(name) = &args[0] else {
+        panic!("expected column arg");
+    };
+    assert_eq!(name.table.as_deref(), Some("users"));
+}
+
+#[test]
+fn group_by_aggregate_alias_still_errors() {
+    // Grouping by an aggregate output alias is invalid and must raise.
+    let result = bind_sql("SELECT age, COUNT(*) AS c FROM pg.public.users GROUP BY c");
+    assert!(
+        matches!(result, Err(BindError::ColumnNotInScope(_))),
+        "{result:?}"
+    );
+}
+
 #[test]
 fn correlated_subquery_resolves_outer_column() {
     // EXISTS subquery references the outer users.id (correlated).

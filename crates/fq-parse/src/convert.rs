@@ -309,6 +309,11 @@ impl<'a> Converter<'a> {
         join: &polyglot_sql::expressions::Join,
         tables: &mut Vec<FromTable>,
     ) -> Result<LogicalPlan, ParseError> {
+        // Reject join modifiers the engine does not model rather than dropping
+        // them silently (a trailing PIVOT / ASOF match condition changes results).
+        if !join.pivots.is_empty() || join.match_condition.is_some() || join.join_hint.is_some() {
+            return Err(ParseError::Unsupported("join modifier".to_string()));
+        }
         let right = self.convert_from_item(select, &join.this, tables)?;
         let (join_type, natural) = map_join_kind(join.kind)?;
         let condition = match &join.on {
@@ -431,7 +436,17 @@ impl<'a> Converter<'a> {
         from_tables: &[FromTable],
     ) -> Result<Vec<(Expr, String)>, ParseError> {
         match item {
-            Expression::Star(star) => self.expand_star(star.table.as_ref(), from_tables),
+            Expression::Star(star) => {
+                // A star modifier (EXCEPT / REPLACE / RENAME) changes the column
+                // set; unhandled, it must raise, never silently expand to the
+                // wrong columns.
+                if star.except.is_some() || star.replace.is_some() || star.rename.is_some() {
+                    return Err(ParseError::Unsupported(
+                        "SELECT * with EXCEPT/REPLACE/RENAME".to_string(),
+                    ));
+                }
+                self.expand_star(star.table.as_ref(), from_tables)
+            }
             Expression::Alias(alias) => {
                 Ok(vec![(self.expr(&alias.this)?, alias.alias.name.clone())])
             }

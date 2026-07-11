@@ -7,10 +7,18 @@
 //! increment (they need the enclosing scopes threaded into their subplan).
 
 use fq_catalog::map_native_type_default;
+use fq_common::DataType;
 use fq_plan::Expr;
 
 use crate::binder::Binder;
 use crate::error::BindError;
+
+/// Resolve a CAST's SQL target-type text to an engine type; an unmodeled target
+/// raises (matching binder.py) rather than leaving an untyped Cast.
+pub(crate) fn cast_target_type(target_type: &str) -> Result<DataType, BindError> {
+    map_native_type_default(target_type)
+        .map_err(|_| BindError::Unsupported(format!("CAST target type '{target_type}'")))
+}
 
 impl Binder<'_> {
     /// Bind one expression against the current scope chain.
@@ -47,9 +55,10 @@ impl Binder<'_> {
             } => Ok(Expr::Cast {
                 expr: Box::new(self.bind_expr(inner)?),
                 target_type: target_type.clone(),
-                // Resolve the engine type from the SQL target-type text (used by
-                // local evaluation); an unmodeled type leaves it unresolved.
-                data_type: map_native_type_default(target_type).ok(),
+                // Resolve the engine type from the SQL target-type text. An
+                // unmodeled cast target RAISES (matching binder.py) rather than
+                // leaving an untyped Cast, which would later panic in get_type.
+                data_type: Some(crate::expr::cast_target_type(target_type)?),
             }),
             Expr::Between {
                 value,

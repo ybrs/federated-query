@@ -252,14 +252,18 @@ impl<'a> Binder<'a> {
         }))
     }
 
-    /// Bind an Aggregate: bind the input, then the GROUP BY keys and aggregate
-    /// expressions against the input scope.
+    /// Bind an Aggregate: bind the SELECT list (its `aggregates`), then the GROUP
+    /// BY keys against the input scope. A bare GROUP BY key naming a SELECT output
+    /// alias resolves to that (non-aggregate) output expression (Postgres allows
+    /// `GROUP BY <alias>`); grouping by an aggregate alias is an error.
     fn bind_aggregate(&mut self, aggregate: Aggregate) -> Result<LogicalPlan, BindError> {
         let input = self.bind(*aggregate.input)?;
-        let group_by =
-            self.with_scope(&input, |binder| binder.bind_expr_list(&aggregate.group_by))?;
         let aggregates = self.with_scope(&input, |binder| {
             binder.bind_expr_list(&aggregate.aggregates)
+        })?;
+        let alias_map = select_alias_map(&aggregate.output_names, &aggregates);
+        let group_by = self.with_scope(&input, |binder| {
+            binder.bind_group_keys(&aggregate.group_by, &alias_map)
         })?;
         Ok(LogicalPlan::Aggregate(Aggregate {
             input: Box::new(input),
@@ -268,6 +272,28 @@ impl<'a> Binder<'a> {
             output_names: aggregate.output_names,
             grouping_sets: aggregate.grouping_sets,
         }))
+    }
+
+    /// Bind GROUP BY keys, resolving a bare key that names a SELECT output alias
+    /// to that output's (non-aggregate) expression.
+    fn bind_group_keys(
+        &mut self,
+        keys: &[Expr],
+        alias_map: &HashMap<String, Expr>,
+    ) -> Result<Vec<Expr>, BindError> {
+        let mut bound = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Expr::Column(column) = key {
+                if column.table.is_none() {
+                    if let Some(aliased) = alias_map.get(&column.column) {
+                        bound.push(aliased.clone());
+                        continue;
+                    }
+                }
+            }
+            bound.push(self.bind_expr(key)?);
+        }
+        Ok(bound)
     }
 
     /// Bind a derived table: bind its inner plan, applying any column-alias
@@ -480,11 +506,17 @@ impl<'a> Binder<'a> {
         result
     }
 
-    /// Bind a subquery's plan with the enclosing scopes still on the stack, so a
-    /// correlated reference resolves against an outer relation (innermost-first).
-    /// The subplan's own relations push above the outer scopes and pop when done.
+    /// Bind a subquery's plan with the enclosing RELATION scopes still on the
+    /// stack, so a correlated reference resolves against an outer relation. The
+    /// enclosing query's OUTPUT ALIASES (a HAVING/ORDER-BY overlay) are NOT
+    /// visible inside a subquery, so they are cleared for the subplan and
+    /// restored after - else a bare reference that is out of the subquery's scope
+    /// but matches an outer SELECT alias would wrongly bind instead of raising.
     pub(crate) fn bind_subplan(&mut self, plan: &LogicalPlan) -> Result<LogicalPlan, BindError> {
-        self.bind(plan.clone())
+        let saved_aliases = std::mem::take(&mut self.output_aliases);
+        let result = self.bind(plan.clone());
+        self.output_aliases = saved_aliases;
+        result
     }
 
     /// Collect alias -> Table entries from a bound plan subtree.
@@ -631,6 +663,18 @@ fn guard_no_star(table_name: &str, columns: &[String]) -> Result<(), BindError> 
         )));
     }
     Ok(())
+}
+
+/// Map each SELECT output alias to its bound expression, EXCLUDING outputs that
+/// are aggregate calls (grouping by an aggregate alias is invalid; excluding it
+/// lets that case fall through to a scope-resolution error).
+fn select_alias_map(names: &[String], expressions: &[Expr]) -> HashMap<String, Expr> {
+    names
+        .iter()
+        .zip(expressions.iter())
+        .filter(|(_, expr)| !fq_plan::contains_aggregate(expr))
+        .map(|(name, expr)| (name.clone(), expr.clone()))
+        .collect()
 }
 
 /// The output-alias overlay (name -> type) of an Aggregate, or of the Aggregate

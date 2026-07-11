@@ -495,3 +495,53 @@ fn unknown_function_raises() {
     let result = parse("SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY a) FROM t");
     assert!(matches!(result, Err(ParseError::Unsupported(_))));
 }
+
+// --- regressions from the fq-parse review ---
+
+#[test]
+fn is_null_and_is_not_null() {
+    // Review bug #2: polyglot emits a dedicated IsNull variant; these must map to
+    // the unary IS NULL / IS NOT NULL, not be rejected as an unknown function.
+    let Expr::UnaryOp { op, .. } = select_pred("SELECT a FROM t WHERE a IS NULL") else {
+        panic!("expected unary");
+    };
+    assert_eq!(op, fq_plan::UnaryOpType::IsNull);
+    let Expr::UnaryOp { op, .. } = select_pred("SELECT a FROM t WHERE a IS NOT NULL") else {
+        panic!("expected unary");
+    };
+    assert_eq!(op, fq_plan::UnaryOpType::IsNotNull);
+}
+
+/// The WHERE predicate of `SELECT ... FROM t WHERE <pred>`.
+fn select_pred(sql: &str) -> Expr {
+    let LogicalPlan::Projection(projection) = parse(sql).unwrap() else {
+        panic!("expected Projection");
+    };
+    let LogicalPlan::Filter(filter) = *projection.input else {
+        panic!("expected Filter");
+    };
+    filter.predicate
+}
+
+#[test]
+fn star_except_raises_not_silently_drops() {
+    // Review bug #1: a star modifier changes the column set; unhandled it must
+    // raise, never silently expand to the wrong columns.
+    let result = parse("SELECT * EXCEPT (secret) FROM t");
+    assert!(
+        matches!(result, Err(ParseError::Unsupported(_))),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn simple_case_with_function_operand_raises() {
+    // Review bug #3: a function-bearing operand would be duplicated per branch.
+    let result = parse("SELECT CASE upper(a) WHEN 'X' THEN 1 ELSE 2 END FROM t");
+    assert!(
+        matches!(result, Err(ParseError::Unsupported(_))),
+        "{result:?}"
+    );
+    // A plain-column operand still lowers fine.
+    assert!(parse("SELECT CASE a WHEN 'X' THEN 1 ELSE 2 END FROM t").is_ok());
+}

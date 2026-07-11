@@ -37,6 +37,17 @@ impl Converter<'_> {
             Expression::Alias(alias) => self.expr(&alias.this),
             Expression::Not(unary) => self.unary(UnaryOpType::Not, &unary.this),
             Expression::Neg(unary) => self.unary(UnaryOpType::Negate, &unary.this),
+            // `x IS NULL` / `x IS NOT NULL` - polyglot's dedicated variant.
+            Expression::IsNull(is_null) => {
+                let op = if is_null.not {
+                    UnaryOpType::IsNotNull
+                } else {
+                    UnaryOpType::IsNull
+                };
+                self.unary(op, &is_null.this)
+            }
+            // The generic `a IS <primary>` form (IS TRUE, IS NULL via the older
+            // shape) - only the NULL cases are supported; the rest raise.
             Expression::Is(binary) => self.convert_is(binary),
             Expression::Cast(cast) => self.convert_cast(cast),
             Expression::Case(case) => self.convert_case(case),
@@ -114,7 +125,19 @@ impl Converter<'_> {
     /// effects across the expanded equalities).
     fn convert_case(&self, case: &Case) -> Result<Expr, ParseError> {
         let operand = match &case.operand {
-            Some(operand) => Some(self.expr(operand)?),
+            Some(operand) => {
+                let converted = self.expr(operand)?;
+                // A function-bearing operand is duplicated into every branch by
+                // the searched-form lowering; a volatile function (random(), ...)
+                // would then be re-evaluated per branch and could match the wrong
+                // arm. The engine carries no volatility metadata, so refuse.
+                if expr_has_function_call(&converted) {
+                    return Err(ParseError::Unsupported(
+                        "simple CASE with a function-call operand".to_string(),
+                    ));
+                }
+                Some(converted)
+            }
             None => None,
         };
         let mut when_clauses = Vec::with_capacity(case.whens.len());
@@ -157,6 +180,11 @@ impl Converter<'_> {
                 subquery: Box::new(self.query(query)?),
                 negated: in_expr.not,
             });
+        }
+        if in_expr.unnest.is_some() {
+            // `x IN UNNEST(array)` - a distinct shape; do not treat it as an
+            // empty IN-list (which would be an always-false predicate).
+            return Err(ParseError::Unsupported("IN UNNEST".to_string()));
         }
         let mut options = Vec::with_capacity(in_expr.expressions.len());
         for option in &in_expr.expressions {
@@ -269,6 +297,13 @@ pub(crate) fn scalar_function_call(name: String, args: Vec<Expr>) -> Expr {
     }
 }
 
+/// Whether a converted expression tree contains any function call (all function
+/// forms normalize to `Expr::FunctionCall`).
+fn expr_has_function_call(expr: &Expr) -> bool {
+    matches!(expr, Expr::FunctionCall { .. })
+        || expr.children().iter().any(|c| expr_has_function_call(c))
+}
+
 /// Wrap an expression in NOT when `negate` is set.
 fn negate_if(negate: bool, expr: Expr) -> Expr {
     if negate {
@@ -359,7 +394,7 @@ fn quantified_op(op: &polyglot_sql::expressions::QuantifiedOp) -> BinaryOpType {
 /// Convert a numeric/string literal.
 fn convert_literal(literal: &Literal) -> Result<Expr, ParseError> {
     match literal {
-        Literal::Number(text) => Ok(convert_number(text)),
+        Literal::Number(text) => convert_number(text),
         Literal::String(text) => Ok(Expr::Literal {
             value: LiteralValue::String(text.clone()),
             data_type: fq_common::DataType::Varchar,
@@ -368,19 +403,22 @@ fn convert_literal(literal: &Literal) -> Result<Expr, ParseError> {
     }
 }
 
-/// A numeric literal: integer when it parses as one, else a double.
-fn convert_number(text: &str) -> Expr {
+/// A numeric literal: integer when it parses as one, else a double; a numeric
+/// token that parses as neither raises rather than becoming a silent NaN.
+fn convert_number(text: &str) -> Result<Expr, ParseError> {
     if let Ok(integer) = text.parse::<i64>() {
-        return Expr::Literal {
+        return Ok(Expr::Literal {
             value: LiteralValue::Integer(integer),
             data_type: fq_common::DataType::Integer,
-        };
+        });
     }
-    let value = text.parse::<f64>().unwrap_or(f64::NAN);
-    Expr::Literal {
+    let value = text
+        .parse::<f64>()
+        .map_err(|_| ParseError::Unsupported(format!("numeric literal '{text}'")))?;
+    Ok(Expr::Literal {
         value: LiteralValue::Float(value),
         data_type: fq_common::DataType::Double,
-    }
+    })
 }
 
 /// Render a polyglot `DataType` back to SQL type text for a CAST target. Covers
