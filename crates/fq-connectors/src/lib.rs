@@ -6,9 +6,11 @@
 //! separate concern that moves in with fq-exec (today's fedqrs connectors.rs,
 //! de-pyo3-ified).
 //!
-//! Build status: DuckDB connector [done]. Postgres connector, and the
-//! `parquet`/`clickhouse` metadata surfaces, are the next units.
+//! Build status: DuckDB + Postgres connectors [done]. The `parquet`/`clickhouse`
+//! metadata surfaces are the next units.
 
 pub mod duckdb_source;
+pub mod postgres_source;
 
 pub use duckdb_source::DuckDbSource;
+pub use postgres_source::PostgresSource;

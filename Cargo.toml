@@ -43,3 +43,6 @@ missing_panics_doc = "allow"
 # model; the estimates are correctness-neutral, so >2^52-row precision loss is
 # irrelevant to the answer.
 cast_precision_loss = "allow"
+# Same rationale for the reverse cast (f64 estimate -> i64 row count): a truncated
+# cardinality estimate only changes plan choice, never the answer.
+cast_possible_truncation = "allow"
