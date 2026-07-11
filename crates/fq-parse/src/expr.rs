@@ -63,10 +63,7 @@ impl Converter<'_> {
             Expression::Min(agg) => self.convert_aggregate("MIN", agg),
             Expression::Max(agg) => self.convert_aggregate("MAX", agg),
             Expression::Anonymous(anon) => self.convert_anonymous(anon),
-            other => Err(ParseError::Unsupported(format!(
-                "expression `{}`",
-                other.variant_name()
-            ))),
+            other => self.scalar_function(other),
         }
     }
 
@@ -261,7 +258,7 @@ impl Converter<'_> {
 }
 
 /// Build a scalar function-call expression from a name and converted args.
-fn scalar_function_call(name: String, args: Vec<Expr>) -> Expr {
+pub(crate) fn scalar_function_call(name: String, args: Vec<Expr>) -> Expr {
     Expr::FunctionCall {
         function_name: name,
         args,

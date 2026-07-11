@@ -444,3 +444,54 @@ fn recursive_cte_raises() {
     let result = parse("WITH RECURSIVE c AS (SELECT 1 AS n) SELECT n FROM c");
     assert!(matches!(result, Err(ParseError::Unsupported(_))));
 }
+
+/// The converted single expression of `SELECT <expr> FROM t`.
+fn select_expr(sql: &str) -> Expr {
+    let plan = parse(sql).unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection");
+    };
+    projection.expressions.into_iter().next().unwrap()
+}
+
+#[test]
+fn typed_scalar_functions_become_function_calls() {
+    for (sql, name, arg_count) in [
+        ("SELECT UPPER(a) FROM t", "UPPER", 1),
+        ("SELECT LOWER(a) FROM t", "LOWER", 1),
+        ("SELECT ABS(a) FROM t", "ABS", 1),
+        ("SELECT COALESCE(a, b, 0) FROM t", "COALESCE", 3),
+        ("SELECT NULLIF(a, b) FROM t", "NULLIF", 2),
+        ("SELECT SUBSTRING(a FROM 1 FOR 3) FROM t", "SUBSTRING", 3),
+        ("SELECT ROUND(a, 2) FROM t", "ROUND", 2),
+        ("SELECT REPLACE(a, 'x', 'y') FROM t", "REPLACE", 3),
+    ] {
+        let Expr::FunctionCall {
+            function_name,
+            args,
+            is_aggregate,
+            ..
+        } = select_expr(sql)
+        else {
+            panic!("{sql}: expected FunctionCall");
+        };
+        assert_eq!(function_name, name, "{sql}");
+        assert_eq!(args.len(), arg_count, "{sql}");
+        assert!(!is_aggregate, "{sql}");
+    }
+}
+
+#[test]
+fn extract_becomes_extract_node() {
+    let Expr::Extract { field, .. } = select_expr("SELECT EXTRACT(YEAR FROM d) FROM t") else {
+        panic!("expected Extract");
+    };
+    assert_eq!(field, "YEAR");
+}
+
+#[test]
+fn unknown_function_raises() {
+    // A typed function the engine does not model fails loudly, not silently.
+    let result = parse("SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY a) FROM t");
+    assert!(matches!(result, Err(ParseError::Unsupported(_))));
+}

@@ -15,6 +15,7 @@
 pub mod convert;
 pub mod error;
 pub mod expr;
+pub mod functions;
 
 pub use error::ParseError;
 
