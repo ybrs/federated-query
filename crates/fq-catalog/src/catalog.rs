@@ -70,26 +70,38 @@ impl Catalog {
             .get_table(table_name)
     }
 
-    /// Resolve a (partial) table reference to its column names. `datasource` and
-    /// `schema` narrow the search when given (case-insensitive); a bare table
-    /// name searches every registered schema. Returns None when no schema holds a
-    /// matching table. Used by star expansion to list a table's columns.
+    /// Resolve a (partial) table reference to its `Table`. `datasource` and
+    /// `schema` narrow the search when given (case-insensitive); a bare table name
+    /// searches every registered schema. Returns None when no schema holds a
+    /// matching table. The binder uses this so a bare (unqualified) table
+    /// reference still resolves.
+    pub fn resolve_table(
+        &self,
+        datasource: Option<&str>,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Option<&Table> {
+        for ((ds_name, schema_name), schema_obj) in &self.schemas {
+            let ds_ok = datasource.is_none_or(|wanted| wanted.eq_ignore_ascii_case(ds_name));
+            let schema_ok = schema.is_none_or(|wanted| wanted.eq_ignore_ascii_case(schema_name));
+            if ds_ok && schema_ok {
+                if let Some(found) = schema_obj.get_table(table) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve a (partial) table reference to its column names (star expansion).
     pub fn resolve_table_columns(
         &self,
         datasource: Option<&str>,
         schema: Option<&str>,
         table: &str,
     ) -> Option<Vec<String>> {
-        for ((ds_name, schema_name), schema_obj) in &self.schemas {
-            let ds_ok = datasource.is_none_or(|wanted| wanted.eq_ignore_ascii_case(ds_name));
-            let schema_ok = schema.is_none_or(|wanted| wanted.eq_ignore_ascii_case(schema_name));
-            if ds_ok && schema_ok {
-                if let Some(found) = schema_obj.get_table(table) {
-                    return Some(found.columns.iter().map(|col| col.name.clone()).collect());
-                }
-            }
-        }
-        None
+        self.resolve_table(datasource, schema, table)
+            .map(|found| found.columns.iter().map(|col| col.name.clone()).collect())
     }
 
     /// Number of registered data sources.

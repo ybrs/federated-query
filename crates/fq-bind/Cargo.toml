@@ -1,0 +1,21 @@
+[package]
+name = "fq-bind"
+version = "0.1.0"
+edition.workspace = true
+
+# fq-bind: name resolution + typing. Resolves every table/column reference in a
+# LogicalPlan against the catalog, sets column types and qualifiers, and raises on
+# an invalid reference. Ports parser/binder.py.
+
+[dependencies]
+fq-common = { path = "../fq-common" }
+fq-plan = { path = "../fq-plan" }
+fq-catalog = { path = "../fq-catalog" }
+thiserror = "2"
+
+[dev-dependencies]
+# Tests drive real SQL through the parser, then bind the result.
+fq-parse = { path = "../fq-parse" }
+
+[lints]
+workspace = true
