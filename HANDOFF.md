@@ -74,19 +74,67 @@ DATA-PLANE fetch tier (Arrow streaming, ship, ctid-parallel = today's
 pyo3-coupled `fedqrs` connectors.rs) is a separate concern that moves in with
 fq-exec, de-pyo3-ified.
 
-## Status: 534 tests green, clippy pedantic (deny) + rustfmt clean
+## Status: 571 tests green + THE ENGINE RUNS END TO END; TPC-H 18/22 correct
 
-Done through **fq-physical INCLUDING step building (build-order step 6)**. The whole
-planning-and-lowering pipeline is complete in Rust: SQL string -> parse -> bind ->
-decorrelate -> optimize -> optimized logical plan -> PhysicalPlan (single-source
-pushdown + dim shipping + join-algorithm lowering) -> executable Step list +
-Fragments (the rust_ir port, no JSON). What remains is EXECUTION: fq-exec (move the
-fedqrs DataFusion + DuckDB engine in, delete the JSON IR, consume the Step list),
-fq-runtime, the CLI/py bindings, then the final delete of `federated_query/`.
+The WHOLE Rust engine now executes queries end to end, driven from Python. SQL ->
+parse -> bind -> decorrelate -> optimize -> PhysicalPlan -> Steps -> DataFusion
+execution -> Arrow -> Python. Cross-source federation (DuckDB x Postgres) works.
+**TPC-H tally on the Rust engine (single-source DuckDB sf0.01): 18/22 correct, ZERO
+wrong answers** (every query that plans+executes returns exact rows vs DuckDB truth).
 
 Per-crate test counts: fq-common 13, fq-catalog 30, fq-plan 47, fq-connectors 15,
-fq-parse 34, fq-bind 25, fq-decorrelate 57, fq-optimize 185, fq-emit 34,
-fq-physical 91. Total 534.
+fq-parse 37, fq-bind 25, fq-decorrelate 57, fq-optimize 185, fq-emit 34,
+fq-physical 91, fq-exec 31, fq-runtime 4, fedq-py 0 (cdylib). Total 571.
+
+### fq-exec / fq-runtime / fedq-py (Milestone C) - THE ENGINE RUNS
+
+- **fq-exec MC1** (9bdba53): imported the fedqrs DataFusion+DuckDB engine (engine.rs +
+  connectors.rs + core/{ir,expr,sql,partition,types}) as crates/fq-exec, DE-PYO3'd
+  (PyResult -> ExecError; the pyo3 FFI moved out). Vendored duckdb NOT needed. Imported
+  modules carry a documented `#![allow(clippy::all, clippy::pedantic)]` (battle-tested,
+  cleaned incrementally); real rustc warnings fixed. Entry `fq_exec::execute(&core::ir::Ir)`.
+- **fq-exec MC2** (ea297bb): the Step BRIDGE (bridge approach, engine untouched):
+  `bridge::to_ir(BuiltSteps, outputs)` field-copies fq_physical Step/Fragment/ScanSpec ->
+  core::ir + `serialize_expr` (fq_plan::Expr -> core::ir::IrExpr - the rust_ir _serialize_*
+  layer fq-physical skipped: EXTRACT->date_part, BETWEEN->AND, Cast->arrow-type, op maps;
+  unmapped RAISES). `execute_plan(&PhysicalPlan)`. FIRST end-to-end Rust execution
+  (tests/e2e_duckdb.rs, exact rows).
+- **fq-runtime MC3a** (14cf5be): `Runtime::from_config` (build Catalog via fq-connectors +
+  register the fq-exec data plane + live StatisticsCollector into the CostModel) +
+  `Runtime::execute(sql)` (full pipeline + output rename to user-visible names; invalid
+  query RAISES BindError). DuckDB single-writer lock solved by opening READ-ONLY on both
+  the catalog and exec sides. EXPLAIN = textual plan (costed builder still deferred).
+  CROSS-SOURCE federation verified (duck x pg via ADBC).
+- **fedq-py MC3b** (5cd291a): pyo3 cdylib wrapping fq-runtime. `fedq.Runtime(config_path)` +
+  `execute(sql) -> Arrow C-stream` (GIL released). Python drives the engine. The workspace
+  gate is unaffected (extension-module cdylib builds, contributes no tests).
+- **fq-parse comma joins + LIKE** (9483474): the two dominant TPC-H parser gaps - implicit
+  comma-join FROM (-> left-deep CROSS joins, optimizer recovers the graph) and LIKE/ILIKE
+  (-> BinaryOpType) - took the tally 3/22 -> 18/22.
+
+### PUNCH-LIST: remaining TPC-H failures (all ERRORs, NO wrong answers)
+
+Run: `cargo build -p fedq-py && ln -sf $CARGO_TARGET_DIR/debug/libfedq_py.so
+benchmarks/tpch/fedq.so && /workspace/venv-fedq/bin/python benchmarks/tpch/run_rust.py`.
+
+- **q18** `No field named in_0.c_name (valid: o_orderkey, o_orderdate, o_totalprice,
+  o_custkey)` - a JOIN merge fragment resolves a column (c_name, from customer) against the
+  wrong input (in_0 = orders). Step-building join-fragment column routing / two_sided retag.
+- **q22** `No field named __subq_1_k0 (valid: in_left.__subq_0_v0)` - decorrelation exposes
+  __subq_0's value but not __subq_1's key across TWO correlated subqueries; the synthetic
+  column is not threaded to the join condition. fq-decorrelate multi-subquery exposure.
+- **q15** `No field named in_0.s_suppkey (valid: supplier_no, total_revenue, __subq_0_v0)` -
+  a scalar subquery over a WITH view; the join to `supplier` references s_suppkey against the
+  CTE-side input. Similar column-routing/exposure class as q18/q22.
+- **q11** `type_coercion` caused by `No field named in_0.ps_supplycost (valid: ps_partkey,
+  value, __subq_0_v0)` - HAVING with a scalar-subquery threshold; the aggregate fragment
+  references a base column not threaded through the decorrelated aggregate.
+
+q15/q18/q22/q11 share a theme: a decorrelation/subquery synthetic-column or a join-fragment
+input-routing gap where a needed base column is not present in the fragment's `in_N` schema.
+Likely ONE or two root causes in fq-decorrelate column exposure and/or the step-building
+join/aggregate fragment column resolution. Debug with the textual EXPLAIN
+(`Runtime::execute("EXPLAIN <sql>")`) + the failing fragment's expected vs actual input schema.
 
 How the later crates were built (fq-decorrelate onward): each large crate/milestone
 went ANALYSIS-SPEC (a subagent reads the Python module(s) in full and writes a
@@ -410,30 +458,43 @@ fq-runtime + the EXPLAIN builder (later crates).
 
 `scan_planner_estimate` stays blocked until the runtime can render a scan to EXPLAIN.
 
-## NEXT: fq-exec (the execution engine; IR deletion) - MILESTONE C
+## NEXT: drive TPC-H to 22/22, then TPC-DS + the federated tallies
 
-Absorb today's `fedqrs/src/engine.rs` + `core/` MINUS the IR: delete `core/src/ir.rs`
-and the serde/JSON entry point; `execute(plan: &PhysicalPlan)` runs the pipeline, and
-the `Step` list is built by `fq_physical::build_steps` (ALREADY DONE - it is in
-fq-physical, not here). fq-exec CONSUMES that `Vec<Step>` + fragments and adds the
-`fq_plan::Expr -> DataFusion Expr` conversion (replacing `core/src/expr.rs`). Everything
-else stays as-is (already Rust, already tallied):
-lazy fragment fusion into DataFusion regions, the FairSpillPool + tracked collection,
-binding spill, SMJ retry, reductions (inline-IN / temp-table / parquet delivery), ship
-execution, prefetch pools, ctid-parallel reads, aggregate metric harvest, per-step
-observations, profile output. Also absorbs the fedqrs `core/src/sql.rs`
-ScanSpec/DataFusion-Expr runtime dynamic-filter renderer (de-DataFusion-ified to reuse
-fq-emit). `expression_evaluator.py` call sites: each is either DataFusion-covered
-(retire) or a small kernel here. `fedqrs` has a matching `rewrite-python-to-rust` branch
-NOT yet merged into this workspace - the fq-exec step likely starts by importing it
-(git subtree per plan section 1).
+The engine RUNS; the work now is coverage + correctness hardening against the tallies,
+then perf.
 
-After fq-exec: fq-runtime + fedq + fedq-py, then the DELETE of `federated_query/` at the
-final gate (tallies vs pure-DuckDB truth + the full SQL corpus).
+1. Fix the 4 remaining TPC-H failures (the PUNCH-LIST above) - the shared
+   decorrelation/subquery synthetic-column + join-fragment column-routing class. Re-run
+   `benchmarks/tpch/run_rust.py` after each. Target 22/22.
+2. Run the FEDERATED TPC-H tally (`benchmarks/tpch/run_federated.py` - adapt it to
+   `fedq.Runtime` like run_rust.py did for the single-source runner; load the split into
+   pg+duck via load_postgres.py). Cross-source path already proven on a hand-built join.
+3. TPC-DS: the bigger corpus (99 queries). Same driver pattern. Expect more parse-tail
+   gaps (window functions / WITH RECURSIVE still raise - see the fq-parse "still raising"
+   notes) and decorrelation shapes; each is a targeted fix.
+4. PERF (after correctness): the tally geomean vs pure-DuckDB. The costed EXPLAIN document
+   builder + `scan_planner_estimate` (still deferred) matter here; the imported engine's
+   fragment-fusion/spill/reduction machinery is already tuned.
+
+Deferred CLEANUP (not blocking benchmarks): the bridge keeps `core::ir` + IrExpr as an
+in-process type (no JSON). The plan's "delete the IR, one fq_plan::Expr->DataFusion
+conversion" is a post-benchmark refactor - only worthwhile if the double-hop
+(fq_plan::Expr -> IrExpr -> DataFusion) shows up in profiles. The imported engine modules
+still carry `#![allow(clippy::pedantic)]` (clean incrementally). The pyo3 FFI's
+`register_datasource`/parallel-read entry points from fedqrs lib.rs were not ported (only
+`Runtime.execute` is needed for benchmarks).
+
+FINAL GATE (unchanged): TPC-DS 99|0|0 at SF0.1/SF1/SF10 (pg-dims AND adversarial) + TPC-H
+22/22 + cold/warm, vs pure-DuckDB truth, then DELETE `federated_query/`.
 
 ## Commit log (rewrite so far, newest first)
 
 ```
+9483474 fq-parse comma joins + LIKE - TPC-H 3/22 -> 18/22 correct
+5cd291a fedq-py MC3b - pyo3 bindings; Python drives the Rust engine
+14cf5be fq-runtime MC3a - config-driven execute(sql), cross-source federation works
+ea297bb fq-exec MC2 - Step bridge + first end-to-end Rust query execution
+9bdba53 fq-exec MC1 - import the fedqrs execution engine (de-pyo3'd)
 ba6be89 fq-physical M4d - step-building review fixes (RemoteSetOp render, loud alias miss)
 6f1df53 fq-physical M4c - semi-join reduction + observations
 f5aa7ca fq-physical M4b - step building (PhysicalPlan -> Step list + Fragments)
