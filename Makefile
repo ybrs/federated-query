@@ -9,7 +9,7 @@ PYTHON ?= python3
 # otherwise falls back to the sibling ../venv-fedq. Override: make VENV=/path.
 VENV   ?= $(if $(VIRTUAL_ENV),$(VIRTUAL_ENV),../venv-fedq)
 
-.PHONY: download_postgres pg-start pg-stop test test-no-db install lint lint-ascii lint-construction
+.PHONY: download_postgres pg-start pg-stop test test-no-db install lint lint-ascii lint-construction fq-lint
 
 # Download the prebuilt PostgreSQL binaries into ./postgres-17 (one-time).
 download_postgres:
@@ -36,7 +36,9 @@ test-no-db:
 	$(VENV)/bin/python -m pytest -q --ignore=tests/e2e_decorrelation
 
 # Run all linters (same checks the PostToolUse hook runs per edited file).
-lint: lint-ascii lint-construction
+# fq-lint is the Rust construction linter (the rewrite's equivalent of the Python
+# lint-construction flake8 plugin).
+lint: lint-ascii lint-construction fq-lint
 
 # Codepoint rule: fail on any character above U+00FF anywhere in the repo.
 # --error makes semgrep exit non-zero when it finds a match.
@@ -47,3 +49,9 @@ lint-ascii:
 # >=2 comment lines) over the engine, via the flake8 plugin in lint/.
 lint-construction:
 	$(VENV)/bin/flake8 --select=FQ federated_query
+
+# The engine construction linter (ports lint/flake8_fedq.py): forbids re-listing
+# every field to rebuild a plan/expr node (use `Node { field: new, ..base }` or
+# clone-and-mutate), and forbids name-string-matching relation membership.
+fq-lint:
+	cargo run -q -p fq-lint -- .

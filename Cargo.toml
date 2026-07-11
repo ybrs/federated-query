@@ -4,7 +4,7 @@
 # package alongside this file stays the working product and behavioral reference
 # until the Rust engine passes the full gate, then it is deleted.
 resolver = "2"
-members = ["crates/*"]
+members = ["crates/*", "tools/fq-lint"]
 
 [workspace.package]
 edition = "2021"

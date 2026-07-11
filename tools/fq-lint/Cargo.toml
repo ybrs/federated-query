@@ -1,0 +1,20 @@
+[package]
+name = "fq-lint"
+version = "0.1.0"
+edition.workspace = true
+
+# The engine's construction linter. Ports lint/flake8_fedq.py to Rust: it forbids
+# reconstructing a plan/expression node by re-listing every field (which silently
+# resets a field to a wrong value on any transform) and pushes the shallow-copy
+# form `Node { field: new, ..base }` (Rust's model_copy - copies every other field)
+# or clone-and-mutate. It also forbids resolving relation membership by matching a
+# column/table NAME string. A syn AST walk, not a regex, so nested constructions
+# and struct definitions are handled correctly.
+
+[dependencies]
+syn = { version = "2", features = ["full", "visit", "extra-traits"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+walkdir = "2"
+
+[lints]
+workspace = true

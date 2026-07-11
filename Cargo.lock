@@ -1781,6 +1781,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fq-lint"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "syn 2.0.118",
+ "walkdir",
+]
+
+[[package]]
 name = "fq-optimize"
 version = "0.1.0"
 dependencies = [
