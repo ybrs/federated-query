@@ -45,6 +45,15 @@ pub enum StepError {
     #[error("a '*' must never appear in a bound scan's columns")]
     StarInScanColumns,
 
+    /// A join output/condition references a column its owning side's alias map does
+    /// not expose. A mis-qualified reference must RAISE - substituting the raw column
+    /// name would silently project the wrong or a nonexistent column.
+    #[error("join column {column:?} (relation {table:?}) is not exposed by its side")]
+    MissingColumnAlias {
+        table: Option<String>,
+        column: String,
+    },
+
     /// A two-stage window-over-GROUPING() aggregate the step builder does not yet
     /// render (the rare DataFusion planner-gap path); surfaced loudly, never
     /// mis-rendered as a single stage.

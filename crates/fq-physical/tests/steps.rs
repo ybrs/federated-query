@@ -597,3 +597,190 @@ fn reduced_join_still_builds_the_hash_join_fragment() {
         .any(|fragment| matches!(fragment, Fragment::HashJoin { .. }));
     assert!(has_hash_join, "fragments: {:?}", built.fragments);
 }
+
+// --------------------------------------------------------------------------
+// M4d regression tests
+// --------------------------------------------------------------------------
+
+use fq_plan::physical::PhysicalNestedLoopJoin;
+
+/// The raw_sql of the first SourceScan step.
+fn first_source_sql(steps: &[Step]) -> String {
+    steps
+        .iter()
+        .find_map(|step| match step {
+            Step::SourceScan {
+                scan:
+                    fq_physical::steps::ScanSpec {
+                        raw_sql: Some(sql), ..
+                    },
+                ..
+            } => Some(sql.clone()),
+            _ => None,
+        })
+        .expect("a raw_sql SourceScan")
+}
+
+#[test]
+fn same_source_union_all_renders_a_remote_set_op_scan() {
+    // FINDING 1: a same-source UNION ALL plans to a PhysicalRemoteSetOp; its source
+    // SQL must render both branches joined by UNION ALL (previously NoSourceSql).
+    let steps =
+        steps_of("SELECT id FROM pg.public.orders UNION ALL SELECT id FROM pg.public.customer");
+    let sql = first_source_sql(&steps).to_uppercase();
+    assert!(sql.contains("UNION ALL"), "set-op sql: {sql}");
+    assert!(sql.contains("ORDERS"), "set-op sql: {sql}");
+    assert!(sql.contains("CUSTOMER"), "set-op sql: {sql}");
+}
+
+#[test]
+fn mis_qualified_join_projection_raises() {
+    // FINDING 2: both sides aliased "t" so the join output map yields a (t, b) that
+    // the left side's alias map does not expose -> RAISE, never a wrong column.
+    let left = rscan(
+        "pg",
+        "orders",
+        "t",
+        &["a"],
+        None,
+        None,
+        &[],
+        DatasourceKind::Postgres,
+    );
+    let right = rscan(
+        "pg",
+        "customer",
+        "t",
+        &["b"],
+        None,
+        None,
+        &[],
+        DatasourceKind::Postgres,
+    );
+    let join = PhysicalPlan::HashJoin(PhysicalHashJoin {
+        left: Box::new(left),
+        right: Box::new(right),
+        join_type: JoinType::Inner,
+        left_keys: vec![col("t", "a")],
+        right_keys: vec![col("t", "b")],
+        build_side: BuildSide::Right,
+        estimated_rows: None,
+        estimate_defaults: None,
+    });
+    let err = build_steps(&join).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            fq_physical::steps::StepError::MissingColumnAlias { .. }
+        ),
+        "expected MissingColumnAlias, got {err:?}"
+    );
+}
+
+#[test]
+fn nested_loop_condition_with_unknown_column_raises() {
+    // FINDING 2: a nested-loop condition referencing a column neither side exposes
+    // must RAISE (two_sided), not resolve to a raw name.
+    let left = rscan(
+        "pg",
+        "orders",
+        "l",
+        &["a"],
+        None,
+        None,
+        &[],
+        DatasourceKind::Postgres,
+    );
+    let right = rscan(
+        "duck",
+        "lineitem",
+        "r",
+        &["b"],
+        None,
+        None,
+        &[],
+        DatasourceKind::DuckDb,
+    );
+    let condition = Expr::BinaryOp {
+        op: BinaryOpType::Eq,
+        left: Box::new(col("x", "foo")), // qualifier "x" is on neither side
+        right: Box::new(col("l", "a")),
+    };
+    let join = PhysicalPlan::NestedLoopJoin(PhysicalNestedLoopJoin {
+        left: Box::new(left),
+        right: Box::new(right),
+        join_type: JoinType::Inner,
+        condition: Some(condition),
+        estimated_rows: None,
+        estimate_defaults: None,
+    });
+    let err = build_steps(&join).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            fq_physical::steps::StepError::MissingColumnAlias { .. }
+        ),
+        "expected MissingColumnAlias, got {err:?}"
+    );
+}
+
+#[test]
+fn self_join_projection_follows_schema_order_not_sorted_keys() {
+    // FINDING 3: left alias "z" sorts AFTER right alias "a" in BTreeMap key order,
+    // but the join projection must follow OUTPUT-SCHEMA order (left columns first),
+    // so a parent reads the intended side.
+    let left = rscan(
+        "pg",
+        "orders",
+        "z",
+        &["k", "v"],
+        None,
+        None,
+        &[],
+        DatasourceKind::Postgres,
+    );
+    let right = rscan(
+        "pg",
+        "customer",
+        "a",
+        &["k", "w"],
+        None,
+        None,
+        &[],
+        DatasourceKind::Postgres,
+    );
+    let join = PhysicalPlan::HashJoin(PhysicalHashJoin {
+        left: Box::new(left),
+        right: Box::new(right),
+        join_type: JoinType::Inner,
+        left_keys: vec![col("z", "k")],
+        right_keys: vec![col("a", "k")],
+        build_side: BuildSide::Right,
+        estimated_rows: None,
+        estimate_defaults: None,
+    });
+    let built = build_steps(&join).expect("build_steps");
+    let project = built
+        .fragments
+        .values()
+        .find_map(|fragment| match fragment {
+            Fragment::HashJoin { project, .. } => Some(project.clone()),
+            _ => None,
+        })
+        .expect("a hash-join fragment");
+    // Output-schema order: left "k","v" (in_left) then right renamed "right_k","w".
+    let aliases: Vec<&str> = project.iter().map(|item| item.alias.as_str()).collect();
+    assert_eq!(
+        aliases,
+        vec!["k", "v", "right_k", "w"],
+        "project: {project:?}"
+    );
+    // The first column comes from the LEFT side, not the alphabetically-first right.
+    match &project[0].expr {
+        Expr::Column(reference) => {
+            assert_eq!(reference.table.as_deref(), Some("in_left"));
+            assert_eq!(reference.column, "k");
+        }
+        other => panic!("not a column: {other:?}"),
+    }
+}

@@ -508,6 +508,107 @@ impl Expr {
         }
     }
 
+    /// Rebuild this node with a FALLIBLE `f` applied to each direct child, short-
+    /// circuiting on the first error. The `Result` sibling of `map_children`: a
+    /// transform that must RAISE on a child (e.g. an unresolved column reference)
+    /// propagates the error instead of substituting a silent default. Exhaustive by
+    /// construction, so a new variant forces a new arm.
+    pub fn try_map_children<E>(
+        self,
+        f: &mut impl FnMut(Expr) -> Result<Expr, E>,
+    ) -> Result<Expr, E> {
+        Ok(match self {
+            Expr::Column(_)
+            | Expr::Literal { .. }
+            | Expr::Interval { .. }
+            | Expr::Subquery { .. }
+            | Expr::Exists { .. }
+            | Expr::InSubquery { .. }
+            | Expr::QuantifiedComparison { .. } => self,
+            Expr::BinaryOp { op, left, right } => Expr::BinaryOp {
+                op,
+                left: Box::new(f(*left)?),
+                right: Box::new(f(*right)?),
+            },
+            Expr::UnaryOp { op, operand } => Expr::UnaryOp {
+                op,
+                operand: Box::new(f(*operand)?),
+            },
+            Expr::Cast {
+                expr,
+                target_type,
+                data_type,
+            } => Expr::Cast {
+                expr: Box::new(f(*expr)?),
+                target_type,
+                data_type,
+            },
+            Expr::Extract { field, source } => Expr::Extract {
+                field,
+                source: Box::new(f(*source)?),
+            },
+            Expr::FunctionCall {
+                function_name,
+                args,
+                is_aggregate,
+                distinct,
+                within_group_key,
+                within_group_desc,
+            } => Expr::FunctionCall {
+                function_name,
+                args: try_map_vec(args, f)?,
+                is_aggregate,
+                distinct,
+                within_group_key: match within_group_key {
+                    Some(key) => Some(Box::new(f(*key)?)),
+                    None => None,
+                },
+                within_group_desc,
+            },
+            Expr::Case {
+                when_clauses,
+                else_result,
+            } => Expr::Case {
+                when_clauses: try_map_when_clauses(when_clauses, f)?,
+                else_result: match else_result {
+                    Some(else_expr) => Some(Box::new(f(*else_expr)?)),
+                    None => None,
+                },
+            },
+            Expr::InList { value, options } => Expr::InList {
+                value: Box::new(f(*value)?),
+                options: try_map_vec(options, f)?,
+            },
+            Expr::Between {
+                value,
+                lower,
+                upper,
+            } => Expr::Between {
+                value: Box::new(f(*value)?),
+                lower: Box::new(f(*lower)?),
+                upper: Box::new(f(*upper)?),
+            },
+            Expr::Tuple { items } => Expr::Tuple {
+                items: try_map_vec(items, f)?,
+            },
+            Expr::Window {
+                function,
+                partition_by,
+                order_keys,
+                order_ascending,
+                order_nulls,
+                frame,
+            } => Expr::Window {
+                function: Box::new(f(*function)?),
+                partition_by: try_map_vec(partition_by, f)?,
+                order_keys: try_map_vec(order_keys, f)?,
+                order_ascending,
+                order_nulls,
+                frame,
+            },
+        })
+    }
+
     /// Whether this expression is an aggregate function call.
     pub fn is_aggregate_call(&self) -> bool {
         matches!(
@@ -523,6 +624,30 @@ impl Expr {
 /// Apply `f` to each expression in a vector.
 fn map_vec(items: Vec<Expr>, f: &mut impl FnMut(Expr) -> Expr) -> Vec<Expr> {
     items.into_iter().map(f).collect()
+}
+
+/// Apply a FALLIBLE `f` to each expression in a vector, short-circuiting on error.
+fn try_map_vec<E>(
+    items: Vec<Expr>,
+    f: &mut impl FnMut(Expr) -> Result<Expr, E>,
+) -> Result<Vec<Expr>, E> {
+    let mut mapped = Vec::with_capacity(items.len());
+    for item in items {
+        mapped.push(f(item)?);
+    }
+    Ok(mapped)
+}
+
+/// Apply a FALLIBLE `f` to both sides of each CASE WHEN/THEN clause.
+fn try_map_when_clauses<E>(
+    clauses: Vec<WhenClause>,
+    f: &mut impl FnMut(Expr) -> Result<Expr, E>,
+) -> Result<Vec<WhenClause>, E> {
+    let mut mapped = Vec::with_capacity(clauses.len());
+    for (condition, result) in clauses {
+        mapped.push((f(condition)?, f(result)?));
+    }
+    Ok(mapped)
 }
 
 /// Result type of a binary op: boolean for comparison/logical/matching, VARCHAR
@@ -938,6 +1063,44 @@ mod tests {
         let (where_pred, having_pred) = split_where_having(&predicate, &output_map);
         assert_eq!(where_pred, Some(gt(col("a"), 1)));
         assert_eq!(having_pred, None);
+    }
+
+    /// A fallible column transform that rejects the column named `bad`, recursing
+    /// through `try_map_children`.
+    fn reject_bad(expr: Expr) -> Result<Expr, &'static str> {
+        if let Expr::Column(column) = &expr {
+            if column.column == "bad" {
+                return Err("rejected");
+            }
+        }
+        expr.try_map_children(&mut reject_bad)
+    }
+
+    #[test]
+    fn try_map_children_propagates_the_first_error() {
+        // A fallible transform that rejects a specific column short-circuits the
+        // whole tree instead of substituting a default.
+        let tree = Expr::BinaryOp {
+            op: BinaryOpType::Add,
+            left: Box::new(col("ok")),
+            right: Box::new(col("bad")),
+        };
+        assert_eq!(reject_bad(tree), Err("rejected"));
+    }
+
+    #[test]
+    fn try_map_children_rebuilds_on_success() {
+        // With an always-Ok transform it rebuilds identically to map_children.
+        let tree = Expr::BinaryOp {
+            op: BinaryOpType::Add,
+            left: Box::new(col("a")),
+            right: Box::new(int(1)),
+        };
+        let rebuilt = tree
+            .clone()
+            .try_map_children(&mut |child| Ok::<Expr, ()>(child))
+            .unwrap();
+        assert_eq!(rebuilt, tree);
     }
 
     #[test]

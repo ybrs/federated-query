@@ -7,7 +7,7 @@ use fq_plan::PhysicalPlan;
 
 use super::error::StepError;
 use super::expr_retag::plain;
-use super::render_sql::render_scan_sql;
+use super::render_sql::{render_remote_set_op, render_scan_sql};
 use super::types::ScanSpec;
 
 /// A plain PostgreSQL scan at least this many estimated rows reads through the
@@ -40,6 +40,7 @@ pub fn raw_scan_spec(node: &PhysicalPlan) -> Result<ScanSpec, StepError> {
     match node {
         PhysicalPlan::Scan(scan) => Ok(ScanSpec::raw(render_scan_sql(scan)?)),
         PhysicalPlan::RemoteQuery(remote) => Ok(ScanSpec::raw(remote.sql.clone())),
+        PhysicalPlan::RemoteSetOp(set_op) => Ok(ScanSpec::raw(render_remote_set_op(set_op)?)),
         other => Err(StepError::NoSourceSql(variant_name(other))),
     }
 }

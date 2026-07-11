@@ -8,13 +8,15 @@
 //! `datasource_kind`); the merge raw-SQL strings render to `DuckDb` (the merge
 //! engine's dialect, matching the Python `dialect="duckdb"`).
 
-use fq_emit::clauses::{assemble_select, group_by, order_by, select_list, SelectPieces};
+use fq_emit::clauses::{
+    assemble_select, group_by, order_by, select_list, set_op_keyword, SelectPieces,
+};
 use fq_emit::resolver::{AliasMap, MergeResolver};
 use fq_emit::{quote_ident, render_expr, to_source_sql, Dialect, SourceResolver};
 use fq_plan::expr::{aggregate_output_map, split_where_having};
 use fq_plan::physical::{
-    ColumnAliasMap, DatasourceKind, PhysicalGroupedLimit, PhysicalHashAggregate, PhysicalScan,
-    PhysicalWindow,
+    ColumnAliasMap, DatasourceKind, PhysicalGroupedLimit, PhysicalHashAggregate, PhysicalPlan,
+    PhysicalRemoteSetOp, PhysicalScan, PhysicalWindow,
 };
 use fq_plan::Expr;
 
@@ -57,11 +59,22 @@ pub fn merge_resolver(aliases: &ColumnAliasMap) -> MergeResolver {
 }
 
 /// Render a source scan to its source-dialect SQL. Ports `PhysicalScan._build_ast`
-/// and `_render_source_sql`: split the folded filter into WHERE/HAVING, build the
-/// SELECT items (aggregates, or the concrete columns; a `*` RAISES), the FROM via
-/// `relation_sql::table_ref`, GROUP BY / ORDER BY / DISTINCT / LIMIT / OFFSET, then
-/// assemble and transpile.
+/// and `_render_source_sql`: build the canonical Postgres SELECT, then transpile to
+/// the scan's source dialect.
 pub fn render_scan_sql(scan: &PhysicalScan) -> Result<String, StepError> {
+    let canonical = render_scan_canonical(scan)?;
+    Ok(to_source_sql(
+        &canonical,
+        scan_dialect(scan.datasource_kind),
+    )?)
+}
+
+/// Build a scan's canonical Postgres SELECT (no transpile): split the folded filter
+/// into WHERE/HAVING, build the SELECT items (aggregates, or the concrete columns; a
+/// `*` RAISES), the FROM via `relation_sql::table_ref`, GROUP BY / ORDER BY /
+/// DISTINCT / LIMIT / OFFSET, then assemble. The single-transpile callers (scan
+/// source SQL, remote set-op branch) compose this.
+pub fn render_scan_canonical(scan: &PhysicalScan) -> Result<String, StepError> {
     let (where_pred, having_pred) = scan_where_having(scan);
     let where_sql = render_opt(where_pred.as_ref())?;
     let having_sql = render_opt(having_pred.as_ref())?;
@@ -98,8 +111,83 @@ pub fn render_scan_sql(scan: &PhysicalScan) -> Result<String, StepError> {
             .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
         offset: i64::try_from(scan.offset).unwrap_or(i64::MAX),
     };
-    let sql = assemble_select(&pieces);
-    Ok(to_source_sql(&sql, scan_dialect(scan.datasource_kind))?)
+    Ok(assemble_select(&pieces))
+}
+
+/// Render a same-source set operation (`A UNION ALL B`, nested set ops, ORDER
+/// BY/LIMIT/OFFSET) to its source-dialect SQL. Ports `PhysicalRemoteSetOp._build_query`
+/// / `build_remote_ast`: combine each branch's canonical Postgres SELECT with the
+/// set-op keyword, wrap the outer ORDER BY/LIMIT/OFFSET, then transpile ONCE.
+pub fn render_remote_set_op(set_op: &PhysicalRemoteSetOp) -> Result<String, StepError> {
+    let canonical = remote_set_op_canonical(set_op)?;
+    Ok(to_source_sql(&canonical, set_op_dialect(set_op)?)?)
+}
+
+/// A remote set op's canonical Postgres text (branches combined + outer
+/// ORDER BY/LIMIT/OFFSET wrapper), before transpile. Ports `build_remote_ast`.
+fn remote_set_op_canonical(set_op: &PhysicalRemoteSetOp) -> Result<String, StepError> {
+    let left = set_op_branch_canonical(&set_op.left)?;
+    let right = set_op_branch_canonical(&set_op.right)?;
+    let keyword = set_op_keyword(set_op.kind, set_op.distinct);
+    let combined = format!("{left} {keyword} {right}");
+    if set_op.order_by_keys.is_none() && set_op.limit.is_none() && set_op.offset == 0 {
+        return Ok(combined);
+    }
+    wrap_set_op_order_limit(set_op, &combined)
+}
+
+/// One set-op branch's canonical Postgres text: a scan renders its SELECT; a nested
+/// set op renders (parenthesized to preserve associativity) its own combined form.
+/// Ports `_branch_ast` (a branch is a Scan or a nested RemoteSetOp).
+fn set_op_branch_canonical(branch: &PhysicalPlan) -> Result<String, StepError> {
+    match branch {
+        PhysicalPlan::Scan(scan) => render_scan_canonical(scan),
+        PhysicalPlan::RemoteSetOp(nested) => Ok(format!("({})", remote_set_op_canonical(nested)?)),
+        other => Err(StepError::NoSourceSql(super::scan_spec::variant_name(
+            other,
+        ))),
+    }
+}
+
+/// Wrap a set operation in an outer `SELECT * FROM (<body>) AS "_setop"` carrying
+/// ORDER BY / LIMIT / OFFSET. Ports `_wrap_order_limit`.
+fn wrap_set_op_order_limit(set_op: &PhysicalRemoteSetOp, body: &str) -> Result<String, StepError> {
+    let from_clause = crate::relation_sql::derived_table(body, "_setop");
+    let order = order_by(
+        set_op.order_by_keys.as_deref().unwrap_or(&[]),
+        set_op.order_by_ascending.as_deref().unwrap_or(&[]),
+        set_op.order_by_nulls.as_deref().unwrap_or(&[]),
+        &SourceResolver,
+    )?;
+    let pieces = SelectPieces {
+        from_clause: &from_clause,
+        select_items: "*",
+        joins: None,
+        where_: None,
+        group: None,
+        having: None,
+        distinct: false,
+        distinct_on: None,
+        order: order.as_deref(),
+        limit: set_op
+            .limit
+            .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
+        offset: i64::try_from(set_op.offset).unwrap_or(i64::MAX),
+    };
+    Ok(assemble_select(&pieces))
+}
+
+/// The source render dialect of a remote set op, from a leaf Scan branch (every
+/// branch is the same source). Ports the `self.datasource_connection` transpile
+/// target; a branch that is neither a Scan nor a nested set op RAISES.
+fn set_op_dialect(set_op: &PhysicalRemoteSetOp) -> Result<Dialect, StepError> {
+    match set_op.left.as_ref() {
+        PhysicalPlan::Scan(scan) => Ok(scan_dialect(scan.datasource_kind)),
+        PhysicalPlan::RemoteSetOp(nested) => set_op_dialect(nested),
+        other => Err(StepError::NoSourceSql(super::scan_spec::variant_name(
+            other,
+        ))),
+    }
 }
 
 /// Partition a scan's folded filter into (WHERE, HAVING). Ports

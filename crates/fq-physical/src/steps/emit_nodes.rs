@@ -121,7 +121,7 @@ fn emit_join<'p>(
         join_type: kind,
         left_keys: key_names(&join.left_keys, &join.left),
         right_keys: key_names(&join.right_keys, &join.right),
-        project: join_output_projection(node, &join.left, &join.right),
+        project: join_output_projection(node, &join.left, &join.right)?,
     };
     let name = ctx.names.fragment();
     ctx.fragments.insert(name.clone(), fragment);
@@ -144,11 +144,12 @@ fn emit_nested_loop_join<'p>(
     let condition = join
         .condition
         .as_ref()
-        .map(|condition| two_sided(condition, join));
+        .map(|condition| two_sided(condition, join))
+        .transpose()?;
     let fragment = Fragment::NestedLoopJoin {
         join_type: kind,
         condition,
-        project: join_output_projection(node, &join.left, &join.right),
+        project: join_output_projection(node, &join.left, &join.right)?,
     };
     let name = ctx.names.fragment();
     ctx.fragments.insert(name.clone(), fragment);
@@ -211,11 +212,16 @@ fn key_name(key: &Expr, aliases: &ColumnAliasMap) -> String {
 
 /// Every join output column, from whichever side owns it, canonically named and
 /// alias-uniquified. Ports `_join_output_projection`.
+///
+/// The projections are ordered by the join's OUTPUT-SCHEMA order (left columns then
+/// right), NOT the sorted `column_aliases` key order: for a self-join producing two
+/// identical output names, the SAME side wins the unsuffixed name as Python's
+/// insertion-order choice, so a parent reads the intended side's data.
 fn join_output_projection(
     node: &PhysicalPlan,
     left: &PhysicalPlan,
     right: &PhysicalPlan,
-) -> Vec<Projection> {
+) -> Result<Vec<Projection>, StepError> {
     let left_aliases = left.column_aliases();
     let right_aliases = right.column_aliases();
     let left_tables = relation_names(&left_aliases);
@@ -223,22 +229,47 @@ fn join_output_projection(
     for ((table, column), out_name) in node.column_aliases() {
         let key = (table.clone(), column);
         let (relation, physical) = if left_tables.contains(&table) {
-            ("in_left", resolve_side(&left_aliases, &key))
+            ("in_left", resolve_side(&left_aliases, &key)?)
         } else {
-            ("in_right", resolve_side(&right_aliases, &key))
+            ("in_right", resolve_side(&right_aliases, &key)?)
         };
         project.push(Projection {
             expr: side_column(relation, &physical),
             alias: out_name,
         });
     }
+    order_by_schema(&mut project, &output_column_names(node));
     uniquify_aliases(&mut project);
-    project
+    Ok(project)
 }
 
-/// The physical name a side exposes for a join output key.
-fn resolve_side(aliases: &ColumnAliasMap, key: &(Option<String>, String)) -> String {
-    aliases.get(key).cloned().unwrap_or_else(|| key.1.clone())
+/// Reorder projections into the node's output-schema order (a stable sort by each
+/// alias's position among the output names), so uniquify suffixes the LATER-in-schema
+/// duplicate - matching Python's insertion (left-side-first) order.
+fn order_by_schema(project: &mut [Projection], output_names: &[String]) {
+    project.sort_by_key(|item| {
+        output_names
+            .iter()
+            .position(|name| name == &item.alias)
+            .unwrap_or(usize::MAX)
+    });
+}
+
+/// The physical name a side exposes for a join output key, or RAISE when the side's
+/// alias map does not carry it. Ports `_join_projection_item`'s dict index (KeyError
+/// on a mis-qualified reference): substituting the raw name would silently project a
+/// wrong or nonexistent column.
+fn resolve_side(
+    aliases: &ColumnAliasMap,
+    key: &(Option<String>, String),
+) -> Result<String, StepError> {
+    aliases
+        .get(key)
+        .cloned()
+        .ok_or_else(|| StepError::MissingColumnAlias {
+            table: key.0.clone(),
+            column: key.1.clone(),
+        })
 }
 
 /// A projection item selecting `relation`.`name`, aliased to `name`.
