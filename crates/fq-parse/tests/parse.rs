@@ -159,9 +159,80 @@ fn left_join_maps_join_type() {
 }
 
 #[test]
-fn star_is_unsupported_for_now() {
+fn star_without_catalog_raises() {
+    // No catalog -> the star cannot expand and must fail loudly.
     let result = parse("SELECT * FROM t");
     assert!(matches!(result, Err(ParseError::Unsupported(_))));
+}
+
+#[test]
+fn star_expands_from_catalog() {
+    use fq_catalog::{Catalog, Column, Schema, Table};
+    use fq_common::DataType;
+    use fq_parse::parse_with_catalog;
+
+    let mut catalog = Catalog::new();
+    let users = Table::new(
+        "users",
+        vec![
+            Column::new("id", DataType::Integer, false),
+            Column::new("name", DataType::Varchar, true),
+        ],
+    );
+    catalog.insert_schema(
+        "pg",
+        "public",
+        Schema::with_tables("public", "pg", vec![users]),
+    );
+
+    let plan = parse_with_catalog("SELECT * FROM pg.public.users", &catalog).unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection");
+    };
+    // The star expanded to the table's concrete columns (no `*` survives).
+    assert_eq!(projection.aliases, vec!["id", "name"]);
+    assert_eq!(projection.expressions.len(), 2);
+    // Each expanded ref is qualified to the table.
+    let Expr::Column(first) = &projection.expressions[0] else {
+        panic!("expected qualified column");
+    };
+    assert_eq!(first.table.as_deref(), Some("users"));
+    assert_eq!(first.column, "id");
+}
+
+#[test]
+fn qualified_star_expands_one_table() {
+    use fq_catalog::{Catalog, Column, Schema, Table};
+    use fq_common::DataType;
+    use fq_parse::parse_with_catalog;
+
+    let mut catalog = Catalog::new();
+    catalog.insert_schema(
+        "pg",
+        "public",
+        Schema::with_tables(
+            "public",
+            "pg",
+            vec![
+                Table::new("users", vec![Column::new("id", DataType::Integer, false)]),
+                Table::new(
+                    "orders",
+                    vec![Column::new("total", DataType::Double, false)],
+                ),
+            ],
+        ),
+    );
+
+    // o.* -> only the orders columns.
+    let plan = parse_with_catalog(
+        "SELECT o.* FROM pg.public.users AS u JOIN pg.public.orders AS o ON u.id = o.total",
+        &catalog,
+    )
+    .unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection");
+    };
+    assert_eq!(projection.aliases, vec!["total"]);
 }
 
 #[test]
