@@ -9,6 +9,18 @@ members = ["crates/*", "tools/fq-lint"]
 [workspace.package]
 edition = "2021"
 
+[profile.dev]
+# Line tables only: enough DWARF for readable panic backtraces (file:line)
+# without the full debuginfo that otherwise dominates test-binary links. Every
+# `cargo test` executable statically links the whole DataFusion/Arrow stack,
+# and linking is the non-cacheable step paid on every bottom-crate change.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Dependencies carry no debuginfo at all: DataFusion/Arrow internals are not
+# stepped through in a debugger here, and their DWARF dominates link inputs.
+debug = false
+
 [workspace.lints.rust]
 # House rule: a crash never ships a lie, and warnings are not tolerated. Every
 # rustc warning is an error across the workspace.

@@ -3,9 +3,7 @@
 //! passthrough columns stay in scope), the loud rejection of a boolean flag over
 //! an unqualifiable input, and the correlated-HAVING-aggregate raise.
 
-mod common;
-
-use common::{catalog, decorrelate_err};
+use crate::common::{catalog, decorrelate_err};
 use fq_decorrelate::{decorrelate, DecorrelationError};
 
 /// Parse + bind, then decorrelate returning the raw Result (so a test can assert
@@ -30,7 +28,7 @@ fn two_flag_subqueries_nest_and_stay_in_scope() {
     )
     .expect("nested flag unions decorrelate to a well-scoped plan");
     // Sanity: no subquery expression survives.
-    common::assert_no_subquery(&plan);
+    crate::common::assert_no_subquery(&plan);
 }
 
 #[test]

@@ -4,9 +4,7 @@
 //! relational algebra - a DISTINCT domain, an INNER dependent join, a per-domain
 //! reduction (aggregate or ROW_NUMBER top-k), and a LEFT join-back.
 
-mod common;
-
-use common::{assert_col, assert_no_subquery, binary_parts, decorrelate_sql, walk_plan};
+use crate::common::{assert_col, assert_no_subquery, binary_parts, decorrelate_sql, walk_plan};
 use fq_plan::expr::{BinaryOpType, Expr, LiteralValue};
 use fq_plan::logical::{Aggregate, JoinType, LogicalPlan, Projection, SubqueryScan};
 

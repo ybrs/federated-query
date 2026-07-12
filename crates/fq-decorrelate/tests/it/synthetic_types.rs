@@ -3,9 +3,7 @@
 //! correlation-key and aggregate-value columns; each must be typed so a downstream
 //! `Expr::get_type` never hits an untyped post-binder reference.
 
-mod common;
-
-use common::{decorrelate_sql, walk_plan};
+use crate::common::{decorrelate_sql, walk_plan};
 use fq_plan::expr::{column_refs, Expr};
 use fq_plan::logical::LogicalPlan;
 

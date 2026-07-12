@@ -315,8 +315,8 @@ fn test_schema_table_column() {
     schema.add_table(table);
 
     let stored = schema.get_table("users").expect("table");
-    // Retired back-ref: instead of `table.schema == schema`, assert the stamped
-    // qualifier (the load-bearing content of that back-reference).
+    // The owning schema is denormalized onto the table as a stamped qualifier;
+    // assert that qualifier.
     let qualifier = stored.qualifier().expect("stamped");
     assert_eq!(qualifier.datasource, "postgres");
     assert_eq!(qualifier.schema_name, "public");

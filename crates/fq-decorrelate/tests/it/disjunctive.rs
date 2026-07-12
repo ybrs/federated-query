@@ -2,9 +2,7 @@
 //! collapse, the boolean-flag Union fallback, and the OR-inside-a-conjunct domain
 //! SEMI. Also pins the flag-branch passthrough columns as QUALIFIED (no star).
 
-mod common;
-
-use common::{
+use crate::common::{
     assert_col, assert_no_subquery, binary_parts, decorrelate_sql, has_single_row_guard, walk_plan,
 };
 use fq_plan::expr::{BinaryOpType, Expr, LiteralValue};

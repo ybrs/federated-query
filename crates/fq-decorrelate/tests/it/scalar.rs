@@ -2,9 +2,7 @@
 //! SingleRowGuard placement, COUNT -> COALESCE, correlated sort keys, the
 //! WHERE-equality tighten, and the dependent-join seam.
 
-mod common;
-
-use common::{
+use crate::common::{
     assert_col, assert_no_subquery, binary_parts, condition_mentions, decorrelate_err,
     decorrelate_sql, has_single_row_guard, walk_plan,
 };

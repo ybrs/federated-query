@@ -267,8 +267,7 @@ fn cross_source_non_equi_join_lowers_to_nested_loop() {
 #[test]
 fn same_source_join_pushes_to_one_remote_query() {
     // Single-source pushdown fires FIRST and absorbs the whole
-    // projection-over-join subtree into one PhysicalRemoteQuery (previously this
-    // reached the planner's RemoteJoin path only because pushdown was stubbed).
+    // projection-over-join subtree into one PhysicalRemoteQuery.
     let catalog = catalog();
     let physical = plan_sql(
         &catalog,
@@ -646,8 +645,7 @@ fn cross_source_lateral_with_multiple_base_relations_raises() {
 fn cross_source_lateral_lowers_to_a_lateral_join() {
     // The LATERAL right side (a single base scan) renders for the
     // merge engine via render_correlated_sql, so the cross-source LATERAL lowers to
-    // a PhysicalLateralJoin (previously it raised only because rendering was
-    // stubbed to decline).
+    // a PhysicalLateralJoin.
     let catalog = catalog();
     let lateral = LogicalPlan::LateralJoin(LateralJoin {
         left: Box::new(lscan("pg", "public", "orders", &["id"])),
@@ -672,7 +670,7 @@ fn cross_source_lateral_lowers_to_a_lateral_join() {
 
 #[test]
 fn window_projection_lowers_to_a_window_node() {
-    // The Rust parser does not accept window syntax yet, so the window-bearing
+    // The parser rejects window syntax, so the window-bearing
     // projection is built directly. A Window expression selects PhysicalWindow.
     // A SINGLE-source window projection pushes as one remote query
     // (has_computed && !has_aggregate), so this drives the window over a
