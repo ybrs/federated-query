@@ -280,7 +280,7 @@ mod tests {
             enable_projection_pushdown: false,
             enable_join_reordering: false,
             enable_decorrelation: true,
-            max_join_reorder_size: 10,
+            ..OptimizerConfig::default()
         };
         let optimizer = build_optimizer(&config, cost_model());
         // Predicate/projection pushdown AND join ordering drop out; the always-on

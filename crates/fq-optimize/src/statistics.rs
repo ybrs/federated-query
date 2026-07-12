@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use fq_catalog::datasource::{ColumnStatistics, DataSource, TableStatistics};
 use fq_catalog::Catalog;
+use fq_common::PlanBudget;
 use fq_plan::logical::Scan;
 
 use crate::error::{EstimateError, Result};
@@ -54,10 +55,14 @@ pub struct StatisticsCollector {
     catalog: Arc<Catalog>,
     stats_catalog: Option<Arc<fq_catalog::StatsCatalog>>,
     learned_ttl_seconds: Option<i64>,
+    /// The planning wall-clock budget shared with the pipeline. Checked around
+    /// every SOURCE fetch, so a plan-time data scan is killed at the fetch that
+    /// broke the budget and named in the error, not discovered later at a stage
+    /// boundary. `None` only for collectors outside a planning pipeline (tests).
+    plan_budget: Option<PlanBudget>,
     cache: RefCell<HashMap<(String, String, String), TableStatsEntry>>,
     // Source-planner (EXPLAIN) estimates keyed by (datasource, rendered SQL).
-    // Populated by scan_planner_estimate once the SQL renderer (fq-emit) lands;
-    // until then that method abstains, so this stays empty (see TODO there).
+    // Empty while `scan_planner_estimate` abstains (see that method).
     #[allow(dead_code)]
     planner_estimates: RefCell<HashMap<(String, String), Option<i64>>>,
 }
@@ -75,6 +80,7 @@ impl StatisticsCollector {
             catalog,
             stats_catalog,
             learned_ttl_seconds,
+            plan_budget: None,
             cache: RefCell::new(HashMap::new()),
             planner_estimates: RefCell::new(HashMap::new()),
         }
@@ -88,6 +94,28 @@ impl StatisticsCollector {
     /// The learned-stats TTL (seconds), or `None` for no freshness bound.
     pub fn learned_ttl_seconds(&self) -> Option<i64> {
         self.learned_ttl_seconds
+    }
+
+    /// Attach the pipeline's planning budget so source fetches are killed the
+    /// moment they push planning past it.
+    pub fn set_plan_budget(&mut self, budget: PlanBudget) {
+        self.plan_budget = Some(budget);
+    }
+
+    /// Raise `PlanBudget` when the shared planning clock has run out, naming
+    /// the fetch (`context`) the collector was working on.
+    fn check_plan_budget(&self, datasource: &str, schema: &str, table: &str) -> Result<()> {
+        let Some(budget) = self.plan_budget else {
+            return Ok(());
+        };
+        if !budget.exceeded() {
+            return Ok(());
+        }
+        Err(EstimateError::PlanBudget {
+            elapsed_ms: budget.elapsed_ms(),
+            budget_ms: budget.limit_ms(),
+            context: format!("statistics fetch for {datasource}.{schema}.{table}"),
+        })
     }
 
     /// Statistics for a table covering at least the requested columns, with
@@ -150,7 +178,13 @@ impl StatisticsCollector {
                 .get(&key)
                 .map(TableStatsEntry::merged_view));
         }
+        // Budget-check BOTH sides of the source round trip: before, so an
+        // already-exhausted plan does not start another fetch; after, so the
+        // fetch that itself blew the budget (a plan-time data scan) is the one
+        // named in the kill.
+        self.check_plan_budget(datasource, schema, table)?;
         let fetched = source.get_table_statistics(schema, table, &missing)?;
+        self.check_plan_budget(datasource, schema, table)?;
         let Some(fetched) = fetched else {
             // Source has nothing new; return the existing entry unchanged.
             return Ok(self
@@ -232,19 +266,19 @@ impl StatisticsCollector {
 
     /// The SOURCE PLANNER's row estimate for a filtered logical scan, or `None`.
     ///
-    /// TODO(fq-emit): rendering the probe SQL needs the SQL emitter, which does
-    /// not exist yet. The `DataSource::estimate_scan_rows` trait call and the
-    /// `planner_estimates` cache are the seam that lands here once fq-emit is
-    /// available: render the scan (minus grouping) in the source dialect, key the
-    /// cache by (datasource, rendered_sql), and memoize the trait call. Until
-    /// then this is an honest abstention (`Ok(None)`) - the cost model degrades
-    /// to the recorded-gap bound, which is correct, just less tight.
+    /// Always abstains (`Ok(None)`): the EXPLAIN-estimate path (render the scan
+    /// minus grouping via fq-emit, call `DataSource::estimate_scan_rows` -
+    /// DuckDB EXPLAIN `~N rows` / pg EXPLAIN JSON - memoized in
+    /// `planner_estimates`) is not wired. While it abstains, the cost model
+    /// falls through to SOURCE statistics, whose DuckDB path is an
+    /// approx-aggregate DATA SCAN per plan - the planning budget kills that at
+    /// scale.
     pub fn scan_planner_estimate(&self, scan: &Scan) -> Result<Option<i64>> {
         if !ask_source_enabled() {
             return Ok(None);
         }
         // An unknown datasource still RAISES (a typo would silently disable the
-        // probe for every query), even though the render seam is pending.
+        // probe for every query), even while the method abstains.
         self.catalog
             .get_datasource(&scan.datasource)
             .ok_or_else(|| EstimateError::UnknownDatasource(scan.datasource.clone()))?;
@@ -454,6 +488,32 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_plan_budget_kills_the_source_fetch_and_names_it() {
+        let source = Arc::new(FakeSource::new(Some(100), &["a"]));
+        let mut collector = collector_with(source.clone());
+        // A zero budget is exceeded before the first fetch starts.
+        collector.set_plan_budget(fq_common::PlanBudget::start(0));
+        let error = collector
+            .get_table_statistics("duck", "main", "t", &["a".to_string()])
+            .unwrap_err();
+        assert!(matches!(error, EstimateError::PlanBudget { .. }));
+        // The kill names the fetch it stopped, and the fetch never ran.
+        assert!(error.to_string().contains("duck.main.t"));
+        assert_eq!(source.call_count(), 0);
+    }
+
+    #[test]
+    fn a_generous_plan_budget_does_not_interfere() {
+        let source = Arc::new(FakeSource::new(Some(100), &["a"]));
+        let mut collector = collector_with(source);
+        collector.set_plan_budget(fq_common::PlanBudget::start(60_000));
+        let stats = collector
+            .get_table_statistics("duck", "main", "t", &["a".to_string()])
+            .unwrap();
+        assert!(stats.is_some());
+    }
+
+    #[test]
     fn unknown_datasource_raises() {
         let source = Arc::new(FakeSource::new(Some(100), &["a"]));
         let collector = collector_with(source);
@@ -499,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_planner_estimate_abstains_pending_emit() {
+    fn scan_planner_estimate_abstains() {
         let source = Arc::new(FakeSource::new(Some(100), &["a"]));
         let collector = collector_with(source);
         let scan = Scan::new("duck", "main", "t", vec!["a".to_string()]);

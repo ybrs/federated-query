@@ -57,6 +57,41 @@ The engine is CORRECT but SLOW. This section records what was measured, why it i
 slow, and exactly how to re-run every measurement. All of it lives under
 `benchmarks/plan_compare/` (scripts + dumped plans). Nothing here is committed.
 
+### FIXES LANDED 2026-07-12 (same day, after the investigation)
+
+1. ROOT CAUSE (B) FIXED - DuckDB is now the OFFICIAL PREBUILT library, never
+   compiled in cargo. `scripts/setup-duckdb-lib.sh` (or `make duckdb-lib`)
+   fetches the exact version Cargo.lock pins (v1.5.4, verified by loading the
+   .so) into `.duckdb-lib/current`; `.cargo/config.toml` wires
+   DUCKDB_LIB_DIR/DUCKDB_INCLUDE_DIR + rpath; the `bundled` feature is removed
+   and fq-lint rule FQ-BUNDLED rejects reintroducing it. Side effect: clean
+   release builds no longer pay ~10min of C++.
+2. PLANNING BUDGET GUARD - planning is O(metadata) BY DESIGN and now enforced:
+   `optimizer.planning_budget_ms` (default 100) is a hard wall-clock kill. The
+   runtime times every stage (parse/bind/decorrelate/optimize/physical,
+   `StageLog` in fq-runtime) and kills with a per-stage report; the
+   StatisticsCollector carries the same `PlanBudget` and kills AT the source
+   fetch that broke it, naming the table (`EstimateError::PlanBudget`). No off
+   switch; raise the config value only for a justified edge case.
+3. PERF HARNESS - `benchmarks/perf_compare/` (compare.py + worker.py + README)
+   is the ONLY sanctioned way to produce perf numbers: OLD vs NEW, cold (fresh
+   process + fresh runtime) AND warm (medians on a live runtime), duck +
+   parquet (+ optional pgduck), release builds only, budget kills reported as
+   KILLED, missing connectors as UNSUPPORTED. Results under
+   `benchmarks/perf_compare/results/<label>/`.
+4. PROCESS GUARDRAILS added to CLAUDE.md (top): O(metadata) planning, never
+   bundled DuckDB, perf numbers only from perf_compare, NO STALE DEFERRALS
+   (every deferral names its blocker; swept when the blocker lands). Initial
+   sweep done: the stale `scan_planner_estimate` "fq-emit does not exist yet"
+   comment now says UNBLOCKED-do-next; fq-bind's implemented HAVING hoist and
+   fq-physical's landed orientation helpers un-deferred in their docs.
+
+ROOT CAUSE (A) - plan-time data scan - is STILL OPEN and is punch-list item 1:
+wire `scan_planner_estimate` (EXPLAIN row estimate via fq-emit rendering),
+persist the StatisticsCollector across queries on the Runtime, wire the
+StatsCatalog learned overlay + the discarded execute observations. Until then
+the budget guard makes the cost visible (KILLED at scale) instead of silent.
+
 ### Headline findings (all measured, not guessed)
 
 1. CORRECTNESS holds. Federated TPC-H (pg-dims: dims on Postgres, facts on

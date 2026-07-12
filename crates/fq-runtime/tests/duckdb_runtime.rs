@@ -1,4 +1,4 @@
-//! MILESTONE C step 3a proof: a config-driven `Runtime` runs several real
+//! A config-driven `Runtime` runs several real
 //! queries against a bundled DuckDB fixture IN ONE SESSION and returns correct
 //! Arrow rows under the user-visible SELECT column names.
 //!
@@ -213,6 +213,37 @@ fn explain_returns_a_plan_without_executing() {
     assert!(
         joined.contains("region"),
         "EXPLAIN plan should name the scanned table, got:\n{joined}"
+    );
+}
+
+#[test]
+fn planning_budget_kill_reports_the_stage_timings() {
+    let path = fixture_path();
+    if !path.exists() {
+        eprintln!(
+            "skipping duckdb_runtime budget: fixture {} absent",
+            path.display()
+        );
+        return;
+    }
+    let path = path.to_str().expect("fixture path is valid UTF-8");
+    // A zero budget is exceeded the moment the clock starts: every plan MUST be
+    // killed, and the kill MUST report where the time went.
+    let mut config = duck_config(path);
+    config.optimizer.planning_budget_ms = 0;
+    let runtime = Runtime::from_config(&config).expect("from_config");
+
+    let error = runtime
+        .execute("SELECT r_regionkey FROM duck.main.region")
+        .expect_err("a blown planning budget must kill the query");
+    let message = error.to_string();
+    assert!(
+        message.contains("planning budget exceeded"),
+        "kill must self-identify, got: {message}"
+    );
+    assert!(
+        message.contains("parse"),
+        "kill must report per-stage timings, got: {message}"
     );
 }
 

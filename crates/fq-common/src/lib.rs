@@ -11,6 +11,7 @@
 //! is now owned by the type system and by serde, and is pinned by the
 //! deny-unknown-field test in `tests/config.rs`.
 
+pub mod budget;
 pub mod config;
 pub mod error;
 pub mod logging;
@@ -18,6 +19,7 @@ pub mod types;
 #[macro_use]
 mod update;
 
+pub use budget::PlanBudget;
 pub use config::{
     load_config, Config, CostConfig, DataSourceConfig, ExecutorConfig, OptimizerConfig,
 };

@@ -98,6 +98,21 @@ pub enum EstimateError {
     #[error("catalog knows no datasource {0:?}")]
     UnknownDatasource(String),
 
+    /// The planning wall-clock budget was blown inside statistics collection -
+    /// the collector was about to (or just did) run something O(data) at plan
+    /// time. Planning is O(metadata) by design, so this KILLS the plan and
+    /// names the fetch that broke the budget.
+    #[error(
+        "planning budget exceeded: {elapsed_ms:.1}ms > {budget_ms}ms budget during {context} \
+         (plan-time work must be O(metadata), never a data scan; raise \
+         optimizer.planning_budget_ms only for a justified edge case)"
+    )]
+    PlanBudget {
+        elapsed_ms: f64,
+        budget_ms: u64,
+        context: String,
+    },
+
     /// A metadata/type failure reported by the catalog layer.
     #[error(transparent)]
     Catalog(#[from] fq_catalog::CatalogError),

@@ -44,10 +44,18 @@ pub struct OptimizerConfig {
     pub enable_decorrelation: bool,
     /// Use the Selinger DP for at most this many tables; GOO greedy above it.
     pub max_join_reorder_size: u32,
+    /// Hard wall-clock budget for PLANNING one query, in milliseconds. Planning
+    /// is O(metadata) by design; blowing this budget means something O(data)
+    /// ran at plan time, and the pipeline KILLS the plan with a stage report
+    /// (`fq_common::PlanBudget`). Raise it explicitly for a genuine edge case;
+    /// there is no off switch.
+    pub planning_budget_ms: u64,
 }
 
 impl Default for OptimizerConfig {
-    /// Mirrors the Python defaults: every rule on, DP up to 10 tables.
+    /// Mirrors the Python defaults: every rule on, DP up to 10 tables. The
+    /// planning budget is Rust-new: 100ms, far above a healthy metadata-only
+    /// plan and far below any plan-time data scan.
     fn default() -> Self {
         Self {
             enable_predicate_pushdown: true,
@@ -55,6 +63,7 @@ impl Default for OptimizerConfig {
             enable_join_reordering: true,
             enable_decorrelation: true,
             max_join_reorder_size: 10,
+            planning_budget_ms: 100,
         }
     }
 }

@@ -1,8 +1,8 @@
 //! Minimal EXPLAIN support for the runtime.
 //!
-//! fq-parse does not yet emit an `Explain` logical node (a leading EXPLAIN raises
-//! `ParseError::Unsupported`), and the full EXPLAIN document builder
-//! (`_PlanFormatter` / estimated-cost annotation) is deferred to a later crate.
+//! fq-parse does not emit an `Explain` logical node (a leading EXPLAIN raises
+//! `ParseError::Unsupported`), and there is no costed EXPLAIN document builder
+//! (`_PlanFormatter` / estimated-cost annotation).
 //! So the runtime recognizes a leading `EXPLAIN` keyword, plans the inner
 //! statement through the normal pipeline, and renders a textual PHYSICAL plan
 //! tree WITHOUT executing it. The output is honest - a real plan, no fabricated

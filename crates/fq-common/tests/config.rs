@@ -57,6 +57,7 @@ fn test_load_example_config() {
     assert!(config.optimizer.enable_projection_pushdown);
     assert!(config.optimizer.enable_join_reordering);
     assert_eq!(config.optimizer.max_join_reorder_size, 10);
+    assert_eq!(config.optimizer.planning_budget_ms, 100);
 
     // Executor config.
     assert_eq!(config.executor.max_memory_mb, 2048);
@@ -202,6 +203,7 @@ optimizer:
   enable_predicate_pushdown: false
   enable_join_reordering: false
   max_join_reorder_size: 20
+  planning_budget_ms: 250
 ";
     let path = write_temp("optimizer_override", config_yaml);
     let config = load_config(path.to_str().unwrap()).expect("load config");
@@ -209,6 +211,7 @@ optimizer:
     assert!(!config.optimizer.enable_predicate_pushdown);
     assert!(!config.optimizer.enable_join_reordering);
     assert_eq!(config.optimizer.max_join_reorder_size, 20);
+    assert_eq!(config.optimizer.planning_budget_ms, 250);
 
     std::fs::remove_file(&path).ok();
 }

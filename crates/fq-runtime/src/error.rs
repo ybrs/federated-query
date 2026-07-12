@@ -56,6 +56,14 @@ pub enum RuntimeError {
     #[error("execution error: {0}")]
     Exec(#[from] ExecError),
 
+    /// Planning blew its wall-clock budget (`optimizer.planning_budget_ms`).
+    /// Planning is O(metadata) by design; the message reports every completed
+    /// stage's timing so the offender is visible. Deep kills inside statistics
+    /// collection surface as `Optimize`/`Physical` wrapping
+    /// `EstimateError::PlanBudget` instead, naming the exact fetch.
+    #[error("{0}")]
+    PlanningBudget(String),
+
     /// The engine returned a result whose column count does not match the plan's
     /// user-visible output names. This means the rename would drop or invent a
     /// column, so it RAISES rather than ship a mislabeled result.

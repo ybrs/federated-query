@@ -1,4 +1,4 @@
-//! MILESTONE C step 3a cross-source proof: a `Runtime` with a DuckDB source AND
+//! Cross-source proof: a `Runtime` with a DuckDB source AND
 //! a Postgres source runs a JOIN ACROSS the two sources, exercising the engine's
 //! federated path (per-source reads merged and reduced by the coordinator).
 //!

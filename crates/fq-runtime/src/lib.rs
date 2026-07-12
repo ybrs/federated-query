@@ -16,13 +16,14 @@ mod explain;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
 use serde_yaml::Value;
 
 use fq_catalog::Catalog;
-use fq_common::{Config, DataSourceConfig};
+use fq_common::{Config, DataSourceConfig, PlanBudget};
 use fq_connectors::{DuckDbSource, PostgresSource};
 use fq_exec::{connectors, execute_plan};
 use fq_optimize::{build_optimizer, CostModel, StatisticsCollector};
@@ -76,21 +77,36 @@ impl Runtime {
         rename_result(&schema, batches, &visible_names)
     }
 
-    /// Parse -> bind -> decorrelate -> optimize into an optimized logical plan.
-    fn optimize(&self, sql: &str) -> Result<LogicalPlan, RuntimeError> {
+    /// Parse -> bind -> decorrelate -> optimize into an optimized logical plan,
+    /// recording each stage's wall clock in `stages` (which kills the plan the
+    /// moment the shared budget is blown).
+    fn optimize(&self, sql: &str, stages: &mut StageLog) -> Result<LogicalPlan, RuntimeError> {
         let parsed = parse_with_catalog(sql, self.catalog.as_ref())?;
+        stages.finish("parse")?;
         let bound = fq_bind::bind(self.catalog.as_ref(), parsed)?;
+        stages.finish("bind")?;
         let decorrelated = fq_decorrelate::decorrelate(bound)?;
-        let optimizer = build_optimizer(&self.config.optimizer, self.cost_model());
-        Ok(optimizer.optimize(decorrelated)?)
+        stages.finish("decorrelate")?;
+        let optimizer = build_optimizer(&self.config.optimizer, self.cost_model(stages.budget));
+        let optimized = optimizer.optimize(decorrelated)?;
+        stages.finish("optimize")?;
+        Ok(optimized)
     }
 
-    /// Lower an optimized logical plan into an executable physical plan.
+    /// Lower SQL into an executable physical plan under the planning budget.
+    ///
+    /// Planning is O(metadata) BY DESIGN and budget-enforced: ONE clock covers
+    /// every stage AND the statistics fetches inside them (the cost models carry
+    /// the same `PlanBudget`), so a plan-time data scan or a slow remote probe is
+    /// KILLED and reported, never silently paid per query.
     fn plan(&self, sql: &str) -> Result<PhysicalPlan, RuntimeError> {
-        let optimized = self.optimize(sql)?;
-        let cost_model = Rc::new(RefCell::new(self.cost_model()));
+        let mut stages = StageLog::start(self.config.optimizer.planning_budget_ms);
+        let optimized = self.optimize(sql, &mut stages)?;
+        let cost_model = Rc::new(RefCell::new(self.cost_model(stages.budget)));
         let mut planner = PhysicalPlanner::new(Arc::clone(&self.catalog), Some(cost_model));
-        Ok(planner.plan(&optimized)?)
+        let physical = planner.plan(&optimized)?;
+        stages.finish("physical")?;
+        Ok(physical)
     }
 
     /// Plan the inner statement of an EXPLAIN and return its physical plan tree
@@ -112,9 +128,61 @@ impl Runtime {
     /// A fresh cost model wired to this session's catalog so cardinality and
     /// join-order decisions read the sources' LIVE statistics (honest-unknown
     /// defaults fill any gap; a suboptimal plan still returns correct rows).
-    fn cost_model(&self) -> CostModel {
-        let stats = StatisticsCollector::new(Arc::clone(&self.catalog), None, None);
+    /// Carries the pipeline's `PlanBudget` so a statistics fetch that pushes
+    /// planning over budget is killed at the fetch and named in the error.
+    fn cost_model(&self, budget: PlanBudget) -> CostModel {
+        let mut stats = StatisticsCollector::new(Arc::clone(&self.catalog), None, None);
+        stats.set_plan_budget(budget);
         CostModel::new(self.config.cost.clone(), Some(stats))
+    }
+}
+
+/// The per-stage planning wall-clock log backing the budget kill report. One
+/// `PlanBudget` clock spans all stages; `finish` records the stage that just
+/// completed and kills the plan with the full report once the clock runs out.
+struct StageLog {
+    budget: PlanBudget,
+    stage_start: Instant,
+    entries: Vec<(&'static str, f64)>,
+}
+
+impl StageLog {
+    /// Start the shared planning clock and the first stage's timer.
+    fn start(budget_ms: u64) -> Self {
+        Self {
+            budget: PlanBudget::start(budget_ms),
+            stage_start: Instant::now(),
+            entries: Vec::new(),
+        }
+    }
+
+    /// Record the just-completed stage's timing; raise `PlanningBudget` with
+    /// the per-stage report when the shared budget is now exceeded.
+    fn finish(&mut self, stage: &'static str) -> Result<(), RuntimeError> {
+        let elapsed_ms = self.stage_start.elapsed().as_secs_f64() * 1000.0;
+        self.entries.push((stage, elapsed_ms));
+        self.stage_start = Instant::now();
+        if !self.budget.exceeded() {
+            return Ok(());
+        }
+        Err(RuntimeError::PlanningBudget(self.report(stage)))
+    }
+
+    /// The kill message: total vs budget, the stage it died after, and every
+    /// completed stage's unrounded timing.
+    fn report(&self, killed_after: &str) -> String {
+        let mut parts = Vec::new();
+        for (stage, ms) in &self.entries {
+            parts.push(format!("{stage} {ms:.1}ms"));
+        }
+        format!(
+            "planning budget exceeded: {:.1}ms > {}ms budget; killed after {killed_after} ({}) \
+             - planning must be O(metadata); raise optimizer.planning_budget_ms only for a \
+             justified edge case",
+            self.budget.elapsed_ms(),
+            self.budget.limit_ms(),
+            parts.join(", ")
+        )
     }
 }
 
