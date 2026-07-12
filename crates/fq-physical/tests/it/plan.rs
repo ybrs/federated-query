@@ -529,6 +529,31 @@ fn cross_source_cte_registers_a_producer_and_resolves_the_reference() {
 }
 
 #[test]
+fn cte_consumed_twice_shares_one_producer_allocation() {
+    // Two references to one cross-source CTE resolve to CteScans over the SAME
+    // producer node (pointer-identical), so downstream once-per-producer caches
+    // (step-building's cte_bindings) fire across consumers and the body executes
+    // once, not once per reference.
+    let catalog = catalog();
+    let physical = plan_sql(
+        &catalog,
+        "WITH totals AS (SELECT o.id AS id, sum(l.l_quantity) AS qty \
+         FROM pg.public.orders o JOIN duck.main.lineitem l ON o.id = l.l_orderkey \
+         GROUP BY o.id) \
+         SELECT a.id, a.qty, b.qty FROM totals a JOIN totals b ON a.id = b.id",
+    );
+    let scans = find_all(&physical, &|node| matches!(node, PhysicalPlan::CteScan(_)));
+    assert_eq!(scans.len(), 2, "two references, two CteScans: {physical:?}");
+    let (PhysicalPlan::CteScan(first), PhysicalPlan::CteScan(second)) = (scans[0], scans[1]) else {
+        panic!("find_all returned non-CteScan nodes")
+    };
+    assert!(
+        std::ptr::eq(first.producer.as_ref(), second.producer.as_ref()),
+        "both CteScans must share one producer allocation"
+    );
+}
+
+#[test]
 fn recursive_cross_source_cte_raises_when_not_renderable() {
     // The recursive merge path renders via single-source pushdown, which
     // declines this shape, so it raises RecursiveCteNotRenderable.

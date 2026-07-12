@@ -31,6 +31,7 @@
 //!   key values) is not modeled here.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use fq_common::DataType;
 
@@ -85,10 +86,13 @@ pub struct PhysicalCte {
 }
 
 /// Reads a materialized CTE's rows; one per reference, shares the producer.
-/// `producer` is a `PhysicalPlan::Cte` (uniform traversal over the enum).
+/// `producer` is a `PhysicalPlan::Cte` held behind an `Arc`: every reference to
+/// one CTE points at the SAME allocation, so pointer-keyed once-per-producer
+/// caches (step-building's cte_bindings) fire across references and the body
+/// executes once, not once per reference.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhysicalCteScan {
-    pub producer: Box<PhysicalPlan>,
+    pub producer: Arc<PhysicalPlan>,
     pub alias: Option<String>,
 }
 

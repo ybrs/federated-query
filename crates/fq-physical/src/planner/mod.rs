@@ -27,7 +27,7 @@ use fq_plan::logical::{
 };
 use fq_plan::physical::DatasourceKind;
 use fq_plan::physical::{
-    GroupObservation, PhysicalAliasedRelation, PhysicalCte, PhysicalExplain, PhysicalFilter,
+    GroupObservation, PhysicalAliasedRelation, PhysicalExplain, PhysicalFilter,
     PhysicalGroupedLimit, PhysicalHashAggregate, PhysicalLimit, PhysicalPlan, PhysicalProjection,
     PhysicalScan, PhysicalSingleRowGuard, PhysicalSort, PhysicalUnion, PhysicalValues,
     PhysicalWindow,
@@ -63,9 +63,10 @@ pub struct PhysicalPlanner {
     shipping_enabled: bool,
     /// Per-query counter giving each shipped temp table a unique name.
     ship_counter: u64,
-    /// CTE name -> its materializing producer, registered while a cross-source
-    /// CTE's child is planned so each CteRef resolves to a shared scan.
-    cte_producers: HashMap<String, PhysicalCte>,
+    /// CTE name -> its materializing producer (an `Arc`'d `PhysicalPlan::Cte`),
+    /// registered while a cross-source CTE's child is planned. Every CteRef
+    /// resolves to a scan over the SAME allocation, so the body executes once.
+    cte_producers: HashMap<String, Arc<PhysicalPlan>>,
     /// The learned-stats catalog dim shipping reads MEASURED group counts from
     /// (the collapse override). Held here because the cost model owns its
     /// `StatisticsCollector` privately and exposes no accessor - the same

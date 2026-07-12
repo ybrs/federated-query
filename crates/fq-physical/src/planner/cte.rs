@@ -4,6 +4,7 @@
 //! pushdown before this point.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use fq_plan::logical::{Cte, CteRef, LogicalPlan, Scan};
 use fq_plan::physical::{PhysicalCte, PhysicalCteMergeQuery, PhysicalCteScan, PhysicalPlan};
@@ -30,11 +31,12 @@ impl PhysicalPlanner {
         let body = self.plan_node(&cte.cte_plan)?;
         // Fresh PhysicalCte producer built from the logical Cte and its lowered body:
         // a type change with no PhysicalCte base to copy, so every field is listed.
-        let producer = PhysicalCte {
+        // One Arc allocation per CTE: every reference shares this exact node.
+        let producer = Arc::new(PhysicalPlan::Cte(PhysicalCte {
             name: cte.name.clone(),
             body: Box::new(body),
             column_names: cte.column_names.clone(),
-        };
+        }));
         let saved = self.cte_producers.insert(cte.name.clone(), producer);
         let child = self.plan_node(&cte.child);
         match saved {
@@ -58,9 +60,10 @@ impl PhysicalPlanner {
         };
         // Fresh PhysicalCteScan resolving the reference to a scan over the shared
         // producer: no PhysicalCteScan base to copy, so both fields are listed. The
-        // producer is cloned because it is materialized once and shared by every ref.
+        // Arc clone is a pointer copy - every reference scans the SAME producer
+        // node, which is what lets step building emit and execute the body once.
         Ok(PhysicalPlan::CteScan(PhysicalCteScan {
-            producer: Box::new(PhysicalPlan::Cte(producer.clone())),
+            producer: Arc::clone(producer),
             alias: node.alias.clone(),
         }))
     }

@@ -1020,3 +1020,39 @@ fn window_function_that_is_an_aggregate_over_grouping_raises() {
         "expected WindowSplitUnsupported, got {error:?}"
     );
 }
+
+#[test]
+fn cte_consumed_twice_builds_its_body_fragments_once() {
+    // A cross-source CTE referenced twice: the producer body (its aggregate and
+    // join fragments) is emitted ONCE and both consumers read the same binding.
+    // A per-consumer copy would double every body fragment and re-execute the
+    // whole aggregation per reference.
+    let catalog = catalog();
+    let plan = plan_sql(
+        &catalog,
+        "WITH totals AS (SELECT o.id AS id, sum(l.l_quantity) AS qty \
+         FROM pg.public.orders o JOIN duck.main.lineitem l ON o.id = l.l_orderkey \
+         GROUP BY o.id) \
+         SELECT a.id, a.qty, b.qty FROM totals a JOIN totals b ON a.id = b.id",
+    );
+    let built = build_steps(&plan).expect("build_steps");
+    let aggregate_fragments = built
+        .fragments
+        .values()
+        .filter(|fragment| matches!(fragment, Fragment::Aggregate { .. }))
+        .count();
+    assert_eq!(
+        aggregate_fragments,
+        1,
+        "the CTE body aggregate must be built once, fragments: {:?}",
+        built.fragments.keys().collect::<Vec<_>>()
+    );
+    // Both source relations of the body are read once each: no per-consumer
+    // duplicate source reads survive scan CSE plus producer sharing.
+    assert_eq!(
+        count_source_scans(&built.steps),
+        2,
+        "steps: {:?}",
+        built.steps
+    );
+}
