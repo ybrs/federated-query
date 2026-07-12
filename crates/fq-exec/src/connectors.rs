@@ -1,5 +1,5 @@
-// Imported fedqrs connectors - already validated by the TPC tallies; pedantic-
-// cleaned incrementally, not on import.
+// Imported fedqrs connectors: the lint allow below exempts this module from
+// the workspace pedantic set (its house style predates the workspace's).
 #![allow(clippy::all, clippy::pedantic)]
 //! Native source connectors and the datasource registry.
 //!
@@ -22,8 +22,8 @@ use crate::core::partition::{ctid_ranges, selectivity_from_stats};
 use crate::core::types::DsKind;
 use crate::error::{ExecError, ExecResult};
 
-/// Connection parameters for one registered datasource. Parameters are stored
-/// (not a live handle) for now; pooling live connections is a later step.
+/// Connection parameters for one registered datasource. Parameters only, not a
+/// live handle: connections are opened (and per-thread cached) at fetch time.
 #[derive(Clone)]
 pub struct DsSpec {
     pub kind: DsKind,
@@ -1144,9 +1144,9 @@ fn duck_fraction(batches: &[RecordBatch], num_keys: usize) -> Option<f64> {
 /// Build a `DsSpec` from a datasource kind and its already-extracted
 /// parameters. `uri` is the source's location string (Postgres connection URI,
 /// DuckDB file path, or Parquet directory); `adbc_driver` is the ADBC driver
-/// path (Postgres only). The Python-dict extraction that used to live here (the
-/// pyo3 `register_datasource` entry) moves to the fedq-py crate; this keeps the
-/// kind -> `DsKind` mapping and the loud validation in Rust.
+/// path (Postgres only). Parameter extraction from the caller's config
+/// happens at the FFI boundary; this keeps the kind -> `DsKind` mapping and the
+/// loud validation in Rust.
 pub fn spec_from_kind(
     kind: &str,
     uri: Option<String>,

@@ -23,13 +23,12 @@
 //!   memoization (e.g. `OnceCell`) is added by the consumer if profiling wants it.
 //! - Pre-rendered source SQL (`query_ast`, `lateral_sql`, the CTE-merge `sql`,
 //!   `Gather.query`) is held as a `String`: the node carries the SQL to run on
-//!   the source. fq-emit produces it; fq-emit may later reshape this to render
-//!   on demand from the subtree instead.
+//!   the source, produced by fq-emit.
 //! - `seeded_schema: pa.Schema` becomes `Option<SeededSchema>` (name+DataType
 //!   pairs) - no Arrow dependency in fq-plan yet; fq-exec converts to Arrow.
-//! - `group_observation` (learned-catalog provenance stamp) and a scan's
-//!   `dynamic_filter_values` (EXPLAIN-sampled key values) are DEFERRED to their
-//!   producers in fq-physical / fq-exec / the EXPLAIN path.
+//! - `group_observation` (learned-catalog provenance stamp) is stamped by its
+//!   producers in fq-physical; a scan's `dynamic_filter_values` (EXPLAIN-sampled
+//!   key values) is not modeled here.
 
 use std::collections::BTreeMap;
 
@@ -861,7 +860,7 @@ fn remote_join_column_aliases(node: &PhysicalRemoteJoin) -> ColumnAliasMap {
     }
     panic!(
         "PhysicalRemoteJoin.column_aliases without aggregates reads the dropped \
-         `_column_alias_map` (built by RemoteJoin SQL assembly, deferred to \
+         `_column_alias_map` (built by RemoteJoin SQL assembly, which lives in \
          fq-physical); a bare RemoteJoin never reaches step-building - it is \
          wrapped in a RemoteQuery"
     )

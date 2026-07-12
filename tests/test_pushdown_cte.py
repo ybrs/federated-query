@@ -207,7 +207,7 @@ def _inner_join_of(plan):
 
 def test_q15_shape_explains_and_pushes_body_remote():
     """End to end on the q15 shape across two sources: EXPLAIN must not
-    crash (the dynamic-filter mark used to accept a CTEScan build side the
+    crash (the dynamic-filter mark must not accept a CTEScan build side the
     prefetch cannot execute), the CTE body's filter AND aggregate must render
     into the remote SQL, and the join must not be a conditionless cross."""
     import duckdb as duckdb_module
@@ -284,8 +284,8 @@ def test_q15_shape_explains_and_pushes_body_remote():
 def test_aggregate_pushdown_descends_below_an_unfoldable_aggregate():
     """A HAVING subquery under the main query's aggregate: the OUTER
     aggregate cannot fold (its input is a join), but the INNER aggregate
-    over a scan must still fold - the walker used to stop dead at the outer
-    one, leaving q18's subquery to aggregate 6M rows on the coordinator."""
+    over a scan must still fold - the walker must not stop dead at the outer
+    one, or q18's subquery aggregates 6M rows on the coordinator."""
     inner_agg = Aggregate(
         input=_scan("lineitem", "l2", ("l_o", "l_q")),
         group_by=[_col("l2", "l_o")],

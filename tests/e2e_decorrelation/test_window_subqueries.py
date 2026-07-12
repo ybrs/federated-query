@@ -1,4 +1,4 @@
-"""E2E tests for window functions inside correlated subqueries (Phase 9, 9.4).
+"""E2E tests for window functions inside correlated subqueries.
 
 A window inside a correlated scalar subquery decorrelates by lifting the
 correlation columns into the window's PARTITION BY, then routing the scalar
@@ -80,7 +80,8 @@ def test_correlated_window_non_equi_correlation_fails(catalog, setup_test_data):
     """A non-equality correlation cannot lift to PARTITION BY; fail fast.
 
     `amount < u.id` matches many key groups, so a per-key partition would not be
-    a per-outer-row window. This needs a general dependent join (Phase 10).
+    a per-outer-row window. Handling it would require a general dependent join,
+    which the pattern-based decorrelator does not implement, so it raises.
     """
     sql = """
         SELECT u.id,

@@ -10,11 +10,11 @@ mid-scale guess. Either way the gap is recorded in ``defaults_used`` (e.g.
 parts of a plan were costed from real statistics and which from bounds - and
 decision points can refuse to trust a gap-fed estimate.
 
-The fabricated constants that used to live here (DEFAULT_ROW_COUNT = 1000,
-DEFAULT_NDV_FRACTION and the selectivity priors) are deliberately GONE: a
-fabricated row count next to a measured one inverts every larger-side decision
-(the verified q39 cold-source regression), and a real row count paired with a
-fabricated NDV skews exactly the ratios that pick join order (q23).
+This module carries NO fabricated constants (no DEFAULT_ROW_COUNT, no
+DEFAULT_NDV_FRACTION, no selectivity priors): a fabricated row count next to a
+measured one inverts every larger-side decision (the q39 cold-source
+regression), and a real row count paired with a fabricated NDV skews exactly
+the ratios that pick join order (q23). A missing statistic stays UNKNOWN.
 """
 
 from typing import List, Optional

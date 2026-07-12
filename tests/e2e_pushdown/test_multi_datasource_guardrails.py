@@ -154,9 +154,9 @@ def test_cross_source_order_by_stays_local(multi_source_env):
     _assert_single_source_scan(products_query, "products")
     assert orders_query.args.get("order") is None
     assert products_query.args.get("order") is None
-    # ORDER BY at the root used to no-op projection pushdown entirely
-    # (the gate lacked a Sort arm): pin that both scans stay NARROW - the
-    # 9-column orders table ships exactly the referenced columns.
+    # ORDER BY at the root must not no-op projection pushdown (the gate needs
+    # a Sort arm): pin that both scans stay NARROW - the 9-column orders table
+    # ships exactly the referenced columns.
     assert set(select_column_names(orders_query)) == {"order_id", "product_id"}
     assert set(select_column_names(products_query)) == {"id", "name"}
 

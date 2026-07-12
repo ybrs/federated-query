@@ -76,7 +76,7 @@ def test_duckdb_fetches_only_requested_columns(duck_source):
 
 def test_duckdb_single_approx_scan_no_count_distinct(duck_source):
     """One stats scan per fetch, using approx_count_distinct, never
-    COUNT(DISTINCT ...) (the old full-scan-per-column path)."""
+    COUNT(DISTINCT ...), which would scan the full table once per column."""
     recorder = _RecordingConnection(duck_source.connection)
     duck_source.connection = recorder
     duck_source.get_table_statistics("main", "stats_t", ["id", "grp"])

@@ -4,9 +4,9 @@
 //!
 //! These modules were their own `fedqrs-core` crate; here they are a submodule
 //! of `fq-exec` so the whole engine lives in one workspace crate. The JSON IR
-//! (`ir.rs` serde) is retained for this milestone so the ported unit tests run;
-//! the Step-bridge that replaces it with `fq_plan` types lands in the next
-//! milestone (see HANDOFF "MILESTONE C").
+//! (`ir.rs` serde) is retained so the imported unit tests keep running; the
+//! engine's real entry is the Step bridge (`bridge`), which builds `core::ir`
+//! values from `fq_plan` types in-process.
 
 pub mod expr;
 pub mod ir;

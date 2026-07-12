@@ -1,9 +1,9 @@
 """Column pruning descends through a Sort, keeping its sort-key columns.
 
-ProjectionPushdownRule previously skipped Sort in both required-column collection
-and pruning. Handling it in both keeps them consistent: a scan beneath a Sort is
-pruned to the columns actually used, and the sort keys are always retained so the
-ORDER BY does not lose the column it sorts by.
+ProjectionPushdownRule must handle Sort in both required-column collection and
+pruning; handling it in only one makes them inconsistent. A scan beneath a Sort
+is pruned to the columns actually used, and the sort keys are always retained so
+the ORDER BY does not lose the column it sorts by.
 """
 
 from federated_query.optimizer.rules import ProjectionPushdownRule

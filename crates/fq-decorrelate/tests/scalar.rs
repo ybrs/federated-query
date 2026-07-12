@@ -1,6 +1,6 @@
 //! End-to-end tests for the scalar-subquery decorrelation path: LEFT joins,
 //! SingleRowGuard placement, COUNT -> COALESCE, correlated sort keys, the
-//! WHERE-equality tighten, and the milestone-3 dependent-join seam.
+//! WHERE-equality tighten, and the dependent-join seam.
 
 mod common;
 

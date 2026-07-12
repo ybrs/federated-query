@@ -111,8 +111,8 @@ class TestNestedExists:
         bound_plan = binder.bind(logical_plan)
 
         # Skip-level correlation (innermost subquery referencing the
-        # outermost query) is documented future work; the engine must
-        # refuse loudly rather than rewrite it incorrectly.
+        # outermost query) is unsupported; the engine refuses loudly
+        # rather than rewrite it incorrectly.
         with pytest.raises(DecorrelationError, match=r'"u"\."id"'):
             decorrelator.decorrelate(bound_plan)
 

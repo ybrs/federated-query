@@ -1,4 +1,4 @@
-"""Tests for additional optimization bugs found in Phase 6."""
+"""Tests for additional optimization bugs in the rule-based optimizer."""
 
 import pytest
 from federated_query.optimizer.rules import (
@@ -383,8 +383,8 @@ class TestColumnDetectionForWrappedJoins:
           ON o.customer_id = c.id
         WHERE o.customer_id > 100
 
-        Currently _get_column_names returns columns only for Projection,
-        but not for other wrappers. Need to handle this.
+        _get_column_names returns columns only for Projection wrappers,
+        not for other wrappers.
         """
         # Left side: Projection(Scan(...))
         left_scan = Scan(
@@ -858,9 +858,8 @@ class TestTableAliasBug:
         rule = PredicatePushdownRule()
         result = rule.apply(filter_node)
 
-        # Both filters should push to their respective sides
-        # (This is a complex case - ideally both predicates would split and push)
-        # For now, at minimum, the rule should not fail
+        # A conjunction of predicates over both join sides: the rule applies
+        # without failing and returns a plan.
         assert result is not None
 
 
@@ -1637,8 +1636,7 @@ class TestLimitPushdownNotRecursing:
         rule = LimitPushdownRule()
         result = rule.apply(filter_node)
 
-        # Currently the rule doesn't recurse into Filter, so nothing changes
-        # After fix: should have Filter(Projection(Limit(Scan)))
+        # The optimized plan is Filter(Projection(Limit(Scan))).
         assert isinstance(result, Filter), "Should still be Filter at root"
         assert isinstance(
             result.input, Projection
@@ -1703,8 +1701,7 @@ class TestLimitPushdownNotRecursing:
         rule = LimitPushdownRule()
         result = rule.apply(join)
 
-        # Currently the rule doesn't recurse into Join, so nothing changes
-        # After fix: left child should be Projection(Limit(Scan))
+        # The root stays a Join and the left child is Projection(Limit(Scan)).
         assert isinstance(result, Join), "Should still be Join at root"
         assert isinstance(
             result.left, Projection
@@ -1784,7 +1781,7 @@ class TestLimitPushdownNotRecursing:
         rule = LimitPushdownRule()
         result = rule.apply(outer_filter)
 
-        # After fix: the deeply nested Limit should have pushed below Projection
+        # The deeply nested Limit sits below the Projection in the optimized plan.
         assert isinstance(result, Filter), "Root should still be Filter"
         assert isinstance(result.input, Join), "Should have Join"
         assert isinstance(result.input.left, Filter), "Left should be Filter"

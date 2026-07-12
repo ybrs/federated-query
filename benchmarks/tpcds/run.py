@@ -13,7 +13,7 @@ amounts of memory becomes a clean ERROR row instead of hanging or OOM-ing the
 whole benchmark.
 
 The output is a per-query support matrix (PASS / MISMATCH / ERROR) and a
-summary. A query the engine cannot yet handle (an unsupported TPC-DS feature or
+summary. A query the engine cannot handle (an unsupported TPC-DS feature or
 a real engine limitation) is reported as ERROR with the exception (or Timeout /
 Killed); a query that runs but returns wrong rows is a MISMATCH.
 """

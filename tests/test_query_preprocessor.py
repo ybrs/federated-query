@@ -118,9 +118,8 @@ def test_pivot_with_group_by_rejected() -> None:
 def test_preprocess_expands_subquery_source() -> None:
     """A derived table's * expands from its inner projection (bottom-up).
 
-    Subquery/CTE sources used to be rejected; they now expand by resolving the
-    star against the relation's own output columns. See test_star_expansion_cte
-    for the full coverage.
+    Subquery/CTE sources expand by resolving the star against the relation's
+    own output columns. See test_star_expansion_cte for the full coverage.
     """
     catalog = _build_catalog()
     context = QueryContext("SELECT * FROM (SELECT * FROM testdb.main.users) t")

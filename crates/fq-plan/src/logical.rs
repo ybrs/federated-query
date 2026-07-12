@@ -6,17 +6,14 @@
 //!
 //! PORT NOTES (never silent):
 //! - `try_map_children` is the fallible recurse-and-rebuild the decorrelator and
-//!   the pushdown rules share (ports `transform_children`/`with_children`). It
-//!   landed with its first consumer, fq-decorrelate.
+//!   the pushdown rules share (ports `transform_children`/`with_children`).
 //! - The `LogicalPlanVisitor` ABC retires (a `match` is the dispatch).
 //! - `NodeId` (Python `id()`-identity for binder caches / injection dedup / CTE
-//!   body sharing) is DEFERRED: the nodes are pure structural values now, and the
-//!   identity mechanism lands with its first consumer (the binder), chosen clean
-//!   rather than stamped speculatively.
+//!   body sharing) is not ported: the nodes are pure structural values and no
+//!   current pass needs object identity.
 //! - `direct_expressions` (Python's field-introspection over pydantic
-//!   annotations) is a typed exhaustive accessor here; it landed with its first
-//!   consumer, the decorrelation post-pass invariant (no subquery expression
-//!   survives).
+//!   annotations) is a typed exhaustive accessor here; its consumer is the
+//!   decorrelation post-pass invariant (no subquery expression survives).
 
 use std::collections::BTreeMap;
 

@@ -178,11 +178,11 @@ class TestAmbiguousReferences:
 
 
 class TestUnsupportedPatterns:
-    """Test unsupported decorrelation patterns (future work)."""
+    """Test unsupported decorrelation patterns."""
 
-    # NOTE: window functions inside a correlated scalar subquery are now
-    # SUPPORTED (Phase 9 section 9.4, partition-lift decorrelation). Positive +
-    # fail-fast coverage moved to test_window_subqueries.py.
+    # NOTE: window functions inside a correlated scalar subquery are SUPPORTED
+    # via partition-lift decorrelation; positive and fail-fast coverage lives
+    # in test_window_subqueries.py.
 
     def test_recursive_cte_without_column_list_fails_fast(
         self, catalog, setup_test_data
@@ -789,9 +789,9 @@ class TestUnsupportedSubqueryShapes:
     """Pin the decorrelation engine's known fail-fast gaps.
 
     Each pattern is unnestable in principle (a general dependent join would
-    handle it) but the current pattern-based decorrelator rejects it with a
-    clear error rather than producing a wrong answer. These tests document
-    exactly what is unsupported today; when a gap is closed, flip its test.
+    handle it) but the pattern-based decorrelator rejects it with a clear
+    error rather than producing a wrong answer. These tests pin exactly what
+    the decorrelator rejects today.
     """
 
     def _decorrelate(self, catalog, sql):
@@ -873,8 +873,7 @@ class TestUnsupportedSubqueryShapes:
     def test_offset_in_correlated_subquery(self, catalog, setup_test_data):
         """OFFSET inside a correlated subquery is rejected.
 
-        Decorrelating an offset per correlation key is unsupported
-        (decorrelation-gaps.md D).
+        Decorrelating an offset per correlation key is unsupported.
         """
         sql = (
             "SELECT u.id FROM pg.users u WHERE u.id = ("
@@ -885,7 +884,7 @@ class TestUnsupportedSubqueryShapes:
             self._decorrelate(catalog, sql)
 
     def test_subquery_in_group_by(self, catalog, setup_test_data):
-        """A subquery in a GROUP BY position is rejected (decorrelation-gaps.md E)."""
+        """A subquery in a GROUP BY position is rejected."""
         sql = (
             "SELECT COUNT(*) FROM pg.users u "
             "GROUP BY (SELECT MAX(price) FROM pg.products)"
@@ -897,8 +896,8 @@ class TestUnsupportedSubqueryShapes:
         """A subquery correlating two levels up is rejected.
 
         The inner subquery references ``u`` (the outermost query), skipping the
-        middle relation -- the canonical dependent-join case the pattern-based
-        engine cannot handle yet (decorrelation-gaps.md C).
+        middle relation, the canonical dependent-join case the pattern-based
+        engine rejects.
         """
         sql = (
             "SELECT u.id FROM pg.users u WHERE EXISTS ("
@@ -909,7 +908,7 @@ class TestUnsupportedSubqueryShapes:
             self._decorrelate(catalog, sql)
 
     def test_select_star_value_subquery(self, catalog, setup_test_data):
-        """A ``SELECT *`` scalar/value subquery is rejected (decorrelation-gaps.md F)."""
+        """A ``SELECT *`` scalar/value subquery is rejected."""
         sql = (
             "SELECT u.id FROM pg.users u WHERE u.id > ("
             "  SELECT * FROM pg.orders o WHERE o.user_id = u.id)"

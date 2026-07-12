@@ -500,8 +500,8 @@ def _try_extend(
     # to mis-price island breaking (q03 74 -> 180ms), because the
     # coordinator-side join INPUT work the broken island then pays has no
     # cost term of its own (C_out prices outputs only). Pricing reduction
-    # here needs a matching coordinator-input term and a TRANSFER_WEIGHT
-    # recalibration - a gated experiment of its own (see perf-explore.md).
+    # here would need a matching coordinator-input term and a TRANSFER_WEIGHT
+    # recalibration, which this cost model does not have.
     transfer, island = _extended_transfer(
         candidate, atom_sources[atom_index], atom_estimates[atom_index].rows
     )

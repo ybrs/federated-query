@@ -265,9 +265,9 @@ class TestLimitPushdown:
         sql = "SELECT * FROM testdb.main.orders LIMIT 5"
         pushed_sql = get_pushed_sql(sql, catalog)
 
-        # Note: LIMIT pushdown is tricky - it may or may not be in the SQL
-        # depending on whether it's safe to push through projections
-        # For now, just verify the query works
+        # LIMIT may or may not appear in the pushed SQL depending on whether
+        # it is safe to push through projections, so this only asserts that
+        # the query generates SQL.
         assert pushed_sql is not None, "Query should generate SQL"
 
     def test_limit_with_filter(self, setup_test_db):

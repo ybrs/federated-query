@@ -5,12 +5,12 @@
 //! No JSON, no serde: `Step` / `Fragment` / `ScanSpec` hold `fq_plan::Expr`
 //! directly (retagged in place, section `expr_retag`), and the enum IS the tag.
 //!
-//! STAGE STATUS: the straight node walk (`emit_nodes`), step CSE (`cse`), semi-join
+//! Modules: the straight node walk (`emit_nodes`), step CSE (`cse`), semi-join
 //! REDUCTION (`reduction` - the `InjectedScan`/`CollectDistinct` path, orientation,
 //! tracing, winners, extra injections), and the OBSERVATION provenance recorders
-//! (`observe`) are implemented. DEFERRED sub-part: the `injected_sql` source-side
-//! key-filter placement inside island/aggregate probe bases (a pushdown speedup;
-//! its absence wraps the base output, which is equally correct - see `scan_spec`).
+//! (`observe`). Not implemented: the `injected_sql` source-side key-filter
+//! placement inside island/aggregate probe bases (a pushdown speedup; the engine
+//! wraps the base output instead, which is equally correct - see `scan_spec`).
 
 mod cse;
 mod emit_nodes;

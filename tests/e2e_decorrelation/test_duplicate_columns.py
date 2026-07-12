@@ -3,7 +3,7 @@
 Both ``users`` and ``orders`` expose an ``id`` column, so a pushed-down
 ``SELECT *`` join returns two columns named ``id``. The PostgreSQL connector
 must build the result positionally so the duplicate names round-trip instead of
-collapsing (which previously raised "Arrays were not all the same length").
+collapsing, which would raise "Arrays were not all the same length".
 """
 
 from federated_query.cli.fedq import FedQRuntime

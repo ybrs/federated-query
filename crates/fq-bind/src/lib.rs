@@ -7,9 +7,9 @@
 //!
 //! Covers the query shapes fq-parse produces - base tables, joins, derived
 //! tables, CTEs, set operations, aggregates, subquery expressions (correlated),
-//! HAVING/ORDER-BY aliases and positional ordinals - closing SQL -> bound plan
-//! (Milestone A). The aggregate-call hoist for ORDER BY / HAVING calls absent
-//! from SELECT is a deferred correctness refinement.
+//! HAVING/ORDER-BY aliases and positional ordinals - closing SQL -> bound plan.
+//! The HAVING aggregate-call hoist is implemented; the same hoist for ORDER BY
+//! aggregate calls absent from SELECT, and WITH RECURSIVE, are not.
 
 pub mod binder;
 pub mod error;

@@ -1,8 +1,8 @@
 //! The dim-shipping kill switch (`FEDQ_DIM_SHIPPING=0`) in its OWN test binary:
 //! the switch is a process-global environment read, so mutating it must not race a
 //! concurrent ship test. A separate integration binary is a separate process, so
-//! this file's single test owns the variable for its whole run. Ports the SPEC
-//! section 3.1 gate-1 decline.
+//! this file's single test owns the variable for its whole run. Ports the
+//! Python kill-switch decline.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;

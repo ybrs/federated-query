@@ -3,7 +3,7 @@
 //! serving catalogs, asserting the SHIP decision (ships vs declines) and the
 //! shipped SHAPE (a PhysicalShipment wrapping the island PhysicalRemoteQuery, its
 //! temp-scan seeding, the ship datasource). Ports the decisions of
-//! `tests/e2e_pushdown/test_dim_shipping.py` (SPEC 11.2) without a live engine:
+//! `tests/e2e_pushdown/test_dim_shipping.py` without a live engine:
 //! single-source rendering needs no DB, so the collapsed island builds from the
 //! emitter alone.
 

@@ -75,7 +75,7 @@ pub fn structured_scan_spec(scan: &PhysicalScan) -> Result<ScanSpec, StepError> 
 /// query OR an aggregate scan (its output columns take the injected filter through
 /// the engine's output wrapper). Ports `_injected_probe_spec`.
 ///
-/// DEFERRED (correct, slower): the `injected_sql` optimization (placing the key
+/// Not implemented (correct, slower): the `injected_sql` optimization (placing the key
 /// filter INSIDE the island/aggregate base relation rather than wrapping its output)
 /// is not built here (the RemoteQuery holds only rendered `sql`, not the AST the
 /// Python re-parses). Without it the engine wraps the base output, which is exactly

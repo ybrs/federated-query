@@ -43,7 +43,7 @@ use crate::helpers::expression_has_subquery;
 pub(crate) type Result<T> = std::result::Result<T, DecorrelationError>;
 
 /// Decorrelate a bound logical plan: remove every subquery expression, turning it
-/// into joins. Raises on any shape this milestone does not yet flatten, and on any
+/// into joins. Raises on any shape it does not flatten, and on any
 /// subquery expression that survives (a loud internal invariant).
 pub fn decorrelate(plan: LogicalPlan) -> std::result::Result<LogicalPlan, DecorrelationError> {
     let mut decorrelator = Decorrelator::new();
@@ -87,14 +87,14 @@ impl Decorrelator {
         }
     }
 
-    /// Rewrite a join: recurse into both sides. A subquery in a join condition is a
-    /// later milestone.
+    /// Rewrite a join: recurse into both sides. A subquery in a join condition
+    /// is not supported and raises.
     fn rewrite_join(&mut self, node: Join) -> Result<LogicalPlan> {
         let left = self.rewrite_plan(*node.left)?;
         let right = self.rewrite_plan(*node.right)?;
         if node.condition.as_ref().is_some_and(expression_has_subquery) {
             return Err(DecorrelationError::Unsupported(
-                "subquery in a join condition decorrelation not yet ported".to_string(),
+                "subquery in a join condition is not supported".to_string(),
             ));
         }
         Ok(LogicalPlan::Join(Join {

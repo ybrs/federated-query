@@ -1,15 +1,14 @@
-"""Backlog of intentionally-deferred, valid-SQL features.
+"""Valid-SQL features the engine rejects fail-fast.
 
-Each item below is legal SQL the engine deliberately rejects (fail-fast) for now
-rather than risk a silent wrong answer. These tests assert the DESIRED end state
-(the form is accepted), marked ``xfail(strict=True)`` so they fail-as-expected
-today and turn into a loud XPASS the moment a feature is implemented - the signal
-to finish wiring it up and remove it from this list (and drop the matching
-fail-fast guard + its raises-test).
+Each item below is legal SQL the engine deliberately rejects (fail-fast)
+rather than risk a silent wrong answer. Each test asserts the form is
+ACCEPTED, marked ``xfail(strict=True)``, so it fails-as-expected while the
+rejection stands and turns into a loud XPASS if the form starts being
+accepted - a signal that the rejection (and its matching fail-fast guard +
+raises-test) is stale.
 
-This is the executable backlog: it makes "what is intentionally missing" visible
-in the suite. Truly-invalid SQL (e.g. a window function in WHERE) and malformed
-input (ragged VALUES) are NOT here - those are rejected by design and keep only
+Truly-invalid SQL (e.g. a window function in WHERE) and malformed input
+(ragged VALUES) are NOT here - those are rejected by design and keep only
 their passing raises-tests.
 
 Cross-source NATURAL/USING lives in test_advanced_join_types.py (it needs the
@@ -26,15 +25,14 @@ from federated_query.processor import QueryContext, QueryPreprocessor
 
 
 def _deferred(id_, sql, reason):
-    """A parametrized case marked xfail(strict) with a backlog reason."""
+    """A parametrized case marked xfail(strict) with a reason string."""
     return pytest.param(
         sql, id=id_, marks=pytest.mark.xfail(strict=True, reason=reason)
     )
 
 
-# Features rejected at parse time. Asserting parse() accepts them is the flip
-# signal; full support (binding/planning/execution) is finished when the item is
-# removed from this list.
+# Features rejected at parse time. Each test asserts parse() accepts the form;
+# an XPASS signals the parse-time rejection changed.
 _PARSER_DEFERRED = [
     _deferred("try_cast", "SELECT TRY_CAST(x AS INT) FROM s.t", "TRY_CAST / SAFE_CAST"),
     _deferred(
@@ -97,7 +95,7 @@ _PARSER_DEFERRED = [
 
 @pytest.mark.parametrize("sql", _PARSER_DEFERRED)
 def test_parser_accepts_deferred_feature(sql):
-    """Valid SQL the parser deliberately rejects today; xfail until supported."""
+    """Valid SQL the parser deliberately rejects; xfail-strict pins the rejection."""
     Parser().parse(sql)
 
 
@@ -165,5 +163,5 @@ _PREPROCESSOR_DEFERRED = [
 
 @pytest.mark.parametrize("sql", _PREPROCESSOR_DEFERRED)
 def test_preprocessor_accepts_deferred_feature(sql):
-    """Valid SQL the preprocessor deliberately rejects today; xfail until supported."""
+    """Valid SQL the preprocessor rejects; xfail-strict pins the rejection."""
     QueryPreprocessor(_pivot_catalog()).preprocess(sql, QueryContext(sql))

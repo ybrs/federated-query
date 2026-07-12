@@ -10,8 +10,7 @@ dims (INNER plain-column equi joins whose columns feed no aggregate); K are
 the S-side join keys to them. NO uniqueness requirement on the D_i keys:
 join multiplicity is a function of the key alone and every raw row inside a
 partial shares that key, so the final merge counts each partial exactly as
-the original counted each raw row (Yan & Larson 1995). Full design and
-gates: eager-agg-plan.md.
+the original counted each raw row (Yan & Larson 1995).
 
 After the rewrite, dim shipping sees the partial as a plain aggregate root
 over the fact and its remaining small dims and can collapse it into one

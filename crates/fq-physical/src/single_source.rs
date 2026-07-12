@@ -1,8 +1,8 @@
 //! Same-source pushdown: absorbs a whole single-source subtree into ONE remote
-//! SQL query. Ports `optimizer/single_source_pushdown.py` (SPEC-single-source.md).
+//! SQL query. Ports `optimizer/single_source_pushdown.py`.
 //!
 //! The Python module accumulates sqlglot AST fragments and assembles once; here
-//! the accumulator is TWO-LEVEL (SPEC section 0): `fq_plan::Expr` for the pieces
+//! the accumulator is TWO-LEVEL: `fq_plan::Expr` for the pieces
 //! that undergo a later structural rewrite (the SELECT list, DISTINCT ON keys),
 //! and eagerly-rendered `String` for the pieces that do not (FROM/JOIN/WHERE/
 //! HAVING/GROUP BY/ORDER BY, each CTE body, each set-op branch). fq-emit renders
@@ -10,8 +10,8 @@
 //! builders live in `relation_sql.rs` + `render`.
 //!
 //! Two things sqlglot did for free and this module builds explicitly: a SEMI/ANTI
-//! join becomes `WHERE [NOT] EXISTS(...)` (SPEC 3.14), and the recursive-CTE base
-//! case is a FROM-less `SELECT <items>` branch (SPEC 6.5).
+//! join becomes `WHERE [NOT] EXISTS(...)`, and the recursive-CTE base
+//! case is a FROM-less `SELECT <items>` branch.
 //!
 //! The pure clause-shaping helpers are free functions (they touch no pass state);
 //! only the recursive absorb/render dispatch and the three catalog-reading entry
@@ -45,12 +45,12 @@ use crate::relation_sql::{cte_ref_sql, derived_table, table_ref};
 /// the SAME `&Scan` nodes it hands to `render_correlated_sql` (the cross-source
 /// LATERAL / recursive-CTE merge path, where exactly one tree is registered). A
 /// future caller that registers scans from a different tree instance must switch
-/// to a structural key. See SPEC flag F2.
+/// to a structural key.
 pub type ScanNames = HashMap<*const Scan, String>;
 
 /// One WITH definition: `name [(cols)] AS (body_sql)`. `body_sql` is the fully
 /// rendered CTE body (canonical Postgres), with anchor-column aliasing already
-/// applied during body render (SPEC 7.1).
+/// applied during body render.
 struct CteDef {
     name: String,
     columns: Option<Vec<String>>,
@@ -157,7 +157,7 @@ impl<'a> PushContext<'a> {
     }
 }
 
-/// Which right-side filter handling a nullable-preserving join needs (SPEC 3.15).
+/// Which right-side filter handling a nullable-preserving join needs.
 enum NullableRight {
     /// Render the right relation normally (its filter, if any, is collected).
     Normal,
@@ -529,7 +529,7 @@ impl SingleSourcePushdown {
     /// Build a derived table `(SELECT ...) AS alias`, keeping the user-visible
     /// alias. NOTE the STRICT `!=` source comparison (not `same_source`): a
     /// CTE-only inner body (datasource None) under a parent with a set source
-    /// DECLINES here (SPEC flag F3, ported faithfully).
+    /// DECLINES here.
     fn render_subquery_scan<'a>(
         &self,
         node: &'a SubqueryScan,
@@ -550,7 +550,7 @@ impl SingleSourcePushdown {
     }
 
     /// Build a projected sub-relation as `(SELECT ...) AS subq_N`. Same source
-    /// check as `render_subquery_scan` (STRICT `!=`, SPEC flag F3).
+    /// check as `render_subquery_scan` (STRICT `!=`).
     fn render_derived<'a>(
         &self,
         node: &'a LogicalPlan,
@@ -622,7 +622,7 @@ impl SingleSourcePushdown {
     /// Build one set-operation branch as a standalone SELECT on the same source.
     /// `anchor_columns` (a CTE column list) overrides the branch's output names in
     /// place BEFORE render, so the anchor SELECT emits `<expr> AS <ctecol>` (the
-    /// anchor-aliasing rewrite, SPEC 7.1).
+    /// anchor-aliasing rewrite).
     fn render_branch<'a>(
         &self,
         node: &'a LogicalPlan,
@@ -665,7 +665,7 @@ impl SingleSourcePushdown {
     }
 
     /// Build a set-operation CTE body (UNWRAPPED - no derived-table alias). Only
-    /// the LEFT (anchor) branch receives `anchor_columns` (SPEC 7.1).
+    /// the LEFT (anchor) branch receives `anchor_columns`.
     fn render_cte_set_body<'a>(
         &self,
         node: &'a SetOperation,
@@ -859,7 +859,7 @@ fn absorb_cte_ref_base(node: &CteRef, ctx: &mut PushContext) -> bool {
 
 /// Confirm a plain (non-aggregate) scan shares the data source and collect its
 /// filter (unless suppressed for a nullable-right ON carry). Fallible: a
-/// subquery-bearing filter reaching emit RAISES (SPEC flag F6), never dropped.
+/// subquery-bearing filter reaching emit RAISES, never dropped.
 fn claim_scan<'a>(
     scan: &'a Scan,
     ctx: &mut PushContext<'a>,
@@ -908,7 +908,7 @@ fn source_compatible(scan: &Scan, ctx: &PushContext) -> bool {
 
 /// Build the FROM table reference (always aliased) for a base scan. In merge-render
 /// mode a registered scan renders as its Arrow relation name (no schema, no sample)
-/// via `scan_names` pointer identity (SPEC 7.3).
+/// via `scan_names` pointer identity.
 fn scan_ref(scan: &Scan, ctx: &PushContext) -> String {
     let alias = scan.alias.as_deref().unwrap_or(&scan.table_name);
     if let Some(names) = ctx.scan_names {
@@ -1112,7 +1112,7 @@ fn cte_definition(cte: &CteDef) -> String {
 /// AND a list of already-parenthesized predicate fragments into one WHERE/HAVING
 /// text, or None when empty. Each term is a self-parenthesized `render_expr`
 /// fragment or an `EXISTS(...)` primary, so string-joining with ` AND ` never
-/// re-associates (SPEC flag F5).
+/// re-associates.
 fn combine_and_text(terms: &[String]) -> Option<String> {
     if terms.is_empty() {
         None
@@ -1132,7 +1132,7 @@ fn render_keys_csv(keys: &[Expr]) -> Result<String, EmitError> {
 
 // ---- join / relation shaping (pass-free) ------------------------------------
 
-/// Classify a nullable-preserving join's right-side filter handling (SPEC 3.15). A
+/// Classify a nullable-preserving join's right-side filter handling. A
 /// CLEAN-RUST deviation from Python's `model_copy(filters=None)` clone: keep the
 /// `&Scan` borrow and thread `suppress_filter` into `claim_scan` instead, so the
 /// scan's `scan_names` pointer identity is preserved.
@@ -1190,7 +1190,7 @@ fn join_prefix(join_type: JoinType) -> &'static str {
 
 /// Build one join clause text using ON, USING, or NATURAL. `on_extra` is a
 /// nullable-side filter conjunct that must evaluate as part of the match condition
-/// (SPEC 3.15/3.16).
+///.
 fn render_join_clause(
     join: &Join,
     right_ref: &str,

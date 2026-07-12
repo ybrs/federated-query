@@ -464,7 +464,7 @@ fn subquery_in_group_by_raises() {
 fn scalar_subquery_in_predicate_becomes_left_join() {
     // A correlated scalar in a WHERE equality: LEFT join on the widened key, with
     // the value equality kept as a residual filter (not tightened - it is not an
-    // ON-TRUE join). The scalar milestone now ports this shape.
+    // ON-TRUE join).
     let plan = decorrelate_sql(
         "SELECT id FROM pg.public.orders o \
          WHERE price = (SELECT max(p.price) FROM pg.public.products p WHERE p.category = o.region)",

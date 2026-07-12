@@ -1,4 +1,4 @@
-"""Tests for Phase 6 logical optimization rules."""
+"""Tests for logical optimization rules."""
 
 import pytest
 from federated_query.optimizer.rules import (
@@ -98,9 +98,9 @@ class TestPredicatePushdown:
     def test_push_filter_below_join_preserves_using(self):
         """Pushing a filter below a USING join must keep its USING columns.
 
-        The join was previously rebuilt with a raw Join(...) that dropped the
-        natural/using fields, silently turning a USING join into one with no
-        join condition.
+        Rebuilding the join with a raw Join(...) drops the natural/using
+        fields, silently turning a USING join into one with no join condition,
+        so the rewrite must preserve them.
         """
         left = Scan(
             datasource="d",

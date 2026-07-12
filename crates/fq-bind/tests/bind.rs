@@ -419,11 +419,11 @@ fn in_subquery_binds_inner_plan() {
     assert!(matches!(subquery.as_ref(), LogicalPlan::Projection(_)));
 }
 
-// --- regressions from the fq-bind review ---
+// --- binding edge cases that must not regress ---
 
 #[test]
 fn output_alias_does_not_leak_into_order_by_subquery() {
-    // Review bug #1 (soundness): `n` is a SELECT output alias of the OUTER query;
+    // Soundness: `n` is a SELECT output alias of the OUTER query;
     // inside the ORDER BY subquery, `n` is out of scope (orders has no `n`), so it
     // MUST raise - the outer alias must not leak in.
     let result = bind_sql(
@@ -438,7 +438,7 @@ fn output_alias_does_not_leak_into_order_by_subquery() {
 
 #[test]
 fn unsupported_cast_target_raises() {
-    // Review bug #2: an unmodeled CAST target must raise at bind (defense in
+    // An unmodeled CAST target must raise at bind (defense in
     // depth - the parser also rejects it, so build the plan directly to reach the
     // binder's guard), not leave an untyped Cast that later panics in get_type.
     use fq_plan::{ColumnRef, Projection, Scan};
@@ -481,7 +481,7 @@ fn modeled_cast_target_types_the_cast() {
 
 #[test]
 fn group_by_output_alias_resolves() {
-    // Review bug #3: GROUP BY names the SELECT output alias `lname` (not a base
+    // GROUP BY names the SELECT output alias `lname` (not a base
     // column); it resolves to the aliased expression LOWER(users.name).
     let plan =
         bind_sql("SELECT LOWER(name) AS lname, COUNT(*) AS c FROM pg.public.users GROUP BY lname")

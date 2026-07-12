@@ -14,11 +14,11 @@
 //!   nested-collection test becomes a `column_refs` ordering test.
 //! - `Literal.value: Any` becomes the typed `LiteralValue` enum. `NULLS
 //!   FIRST/LAST` string fields become the `NullsOrder` enum.
-//! - `to_sql` (emitter delegation) is DEFERRED to fq-emit; nothing in fq-plan
-//!   renders SQL.
-//! - `split_where_having` / `aggregate_output_map` (shared utilities that live in
-//!   expressions.py) are DEFERRED until their consumers - the binder and the
-//!   pushdown rules - land, so they are ported with tests then, not dead now.
+//! - `to_sql` has no equivalent here: SQL rendering lives in fq-emit; nothing
+//!   in fq-plan renders SQL.
+//! - `split_where_having` / `aggregate_output_map` (shared utilities from
+//!   expressions.py) live here; their consumers are the binder and the pushdown
+//!   rules.
 
 use fq_common::DataType;
 

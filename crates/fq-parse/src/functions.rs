@@ -109,7 +109,7 @@ impl Converter<'_> {
     }
 
     /// TRIM(this [, characters]). The default both-sides trim is supported; an
-    /// explicit LEADING/TRAILING trim raises (the position is not yet modeled)
+    /// explicit LEADING/TRAILING trim raises (the position is not modeled)
     /// rather than silently dropping it.
     fn convert_trim(&self, func: &polyglot_sql::expressions::TrimFunc) -> Result<Expr, ParseError> {
         if func.position != polyglot_sql::expressions::TrimPosition::Both {

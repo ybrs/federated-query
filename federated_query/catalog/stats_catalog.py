@@ -14,7 +14,7 @@ plan the optimizer picks (reduction orientation, gates, join order) - never the
 answer. A stale or wrong value costs a slow query, never a wrong one. So writes
 SELF-HEAL (every execution re-measures and upserts the truth) and reads apply a
 TTL (older-than-TTL falls through to source stats); nothing here can produce an
-incorrect result. See adaptive-catalog-plan.md.
+incorrect result.
 """
 
 import json

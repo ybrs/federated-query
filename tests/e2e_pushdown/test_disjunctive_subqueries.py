@@ -93,8 +93,8 @@ def _collect(plan, node_type):
 def test_same_key_or_of_exists_plans_as_domain_semi(multi_source_env):
     """A same-key OR of positive EXISTS plans as ONE SEMI over a domain union.
 
-    Phase 2 of the disjunctive plan (q10/q35): no flag split - the input is
-    not replicated into SEMI/ANTI union branches; instead one SEMI hash join
+    The disjunctive plan for q10/q35: no flag split - the input is not
+    replicated into SEMI/ANTI union branches; instead one SEMI hash join
     probes the UNION of the two subqueries' key domains.
     """
     from federated_query.plan.logical import JoinType

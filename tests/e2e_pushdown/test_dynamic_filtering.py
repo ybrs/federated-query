@@ -124,8 +124,8 @@ def test_build_side_chosen_by_filter_regardless_of_order(multi_source_env):
 
 def test_computed_build_side_still_reduces_the_probe(multi_source_env):
     """A build side that is itself a JOIN (not a plain scan) must still donate
-    its distinct keys: the reduction machinery is generic downstream, only the
-    gate used to require plain scans on BOTH sides. The chain
+    its distinct keys: the reduction machinery is generic downstream, and the
+    gate does not require plain scans on BOTH sides. The chain
     (customers JOIN orders) JOIN products must inject the pair's product ids
     into the products scan."""
     runtime = build_runtime(multi_source_env)
@@ -154,10 +154,10 @@ def test_computed_build_side_still_reduces_the_probe(multi_source_env):
 
 
 def test_large_key_set_against_duckdb_probe_is_correct():
-    """Above the IN cap (2000 keys) a DuckDB probe used to fall back to a
-    full fetch; it now takes the temp-table semi-join arm. Either way the
-    results must be exact - this pins correctness of the new arm end to end
-    with 3000 distinct build keys."""
+    """Above the IN cap (2000 keys) a DuckDB probe takes the temp-table
+    semi-join arm instead of a full fetch. Either way the results must be
+    exact; this pins correctness of the temp-table arm end to end with 3000
+    distinct build keys."""
     import duckdb as duckdb_module
     from federated_query.catalog import Catalog
     from federated_query.cli.fedq import FedQRuntime

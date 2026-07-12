@@ -7,22 +7,21 @@
 //! reduction: a selectivity's ceiling is 1.0, a denominator's floor is 1). Each
 //! gap is recorded in `defaults_used`.
 //!
-//! VESTIGIAL (deferred to the physical-costing milestone): `orientation_rows` /
-//! `larger_estimated_side` priced physical nodes via Python `getattr` reflection;
-//! the typed plan subsumes that reflection, so they are not ported in M1. They
-//! land as pure `Option<u64>`-taking functions with their fq-physical consumer.
+//! `orientation_rows` / `larger_estimated_side` (Python priced physical nodes
+//! via `getattr` reflection) live with their consumer in
+//! `fq_physical::planner::orient`, not here.
 
 use std::collections::HashSet;
 
 /// Relative cost of one row CROSSING A SOURCE BOUNDARY versus one row of
 /// coordinator join output (C_out). The join-order enumerator adds
 /// `TRANSFER_WEIGHT * rows_shipped` to a candidate; carried here for that
-/// consumer (the join-ordering milestone).
+/// consumer (join ordering).
 pub const TRANSFER_WEIGHT: f64 = 1.0;
 
 /// A dynamic filter is refused when its expected semi-join selectivity is at
 /// least this fraction (such a filter keeps nearly every probe row, so applying
-/// it is pure overhead). Consumed by the join-ordering milestone.
+/// it is pure overhead). Consumed by join ordering.
 pub const USELESS_KEYS_NDV_FRACTION: f64 = 0.8;
 
 /// A row-count estimate plus the provenance of every statistics gap behind it.
@@ -165,8 +164,8 @@ pub fn cap_composite_denom(denom: f64, equi_count: u32, left_rows: u64, right_ro
 /// True when a planned key reduction provably filters (almost) nothing.
 ///
 /// An unknown build NDV abstains (`false`, reduce-by-default); an unknown probe
-/// NDV falls back to the build domain alone (FK containment). Consumed by the
-/// join-ordering milestone.
+/// NDV falls back to the build domain alone (FK containment). Consumed by join
+/// ordering.
 pub fn useless_key_reduction(
     build_keys_ndv: Option<u64>,
     build_rows: Option<u64>,

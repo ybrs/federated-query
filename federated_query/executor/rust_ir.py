@@ -8,7 +8,7 @@ consumes.
 
 Column references are resolved to their physical Arrow column names HERE (in
 Python), so the Rust side stays mechanical and never needs the engine's alias
-model. Anything not yet supported raises ``UnsupportedIR`` rather than emitting
+model. Anything not supported raises ``UnsupportedIR`` rather than emitting
 a plan that would silently produce wrong rows.
 """
 
@@ -68,7 +68,7 @@ from ..plan.physical import (
 
 
 class UnsupportedIR(Exception):
-    """A physical node or expression the Rust IR does not yet represent."""
+    """A physical node or expression the Rust IR does not represent."""
 
 
 # Binary operators the Rust engine understands, keyed by the engine's enum.
@@ -405,7 +405,7 @@ class _Ctx:
         # binding name -> catalog provenance for the learned-stats write path:
         # what this binding's measured output-row count MEANS (a base table's
         # row count, a column's NDV). The engine reports one number per binding;
-        # this map assigns it meaning. See adaptive-catalog-plan.md.
+        # this map assigns it meaning.
         self.observations = {}
 
 

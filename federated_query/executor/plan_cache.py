@@ -20,8 +20,7 @@ Deliberate exclusions:
 - Keys are the EXACT rewritten SQL, not a constant-neutral template:
   the optimizer MANUFACTURES and COPIES literals (transitive constants,
   CTE union-filter pushdown), so substituting new constants into a cached
-  plan by position is not order-safe. Template-level caching is a later
-  refinement; the exact key needs no parse to hit.
+  plan by position is not order-safe. The exact key needs no parse to hit.
 
 Physical plans are immutable after construction (the documented invariant the
 per-node schema cache already relies on), so re-executing a cached plan is

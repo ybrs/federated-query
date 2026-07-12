@@ -12,13 +12,13 @@
 //! be valid Postgres that polyglot's Postgres parser round-trips, because
 //! `to_source_sql` RE-PARSES it. The round-trip tests pin this.
 //!
-//! DEFERRED (belongs to other crates, not guessed here):
-//! - The fedqrs `core/src/sql.rs` DataFusion/`ScanSpec` runtime dynamic-filter
-//!   renderer moves in with fq-exec (de-DataFusion-ified to reuse this emitter).
+//! Not in this crate (belongs elsewhere):
+//! - The DataFusion/`ScanSpec` runtime dynamic-filter renderer lives in
+//!   fq-exec.
 //! - The per-physical-node query assembly (`PhysicalRemoteQuery._build_query`,
 //!   single-source pushdown, injected/lateral island SQL, FROM/JOIN rendering)
 //!   belongs to fq-physical, which composes this crate's clause builders.
-//! - The EXPLAIN document builder stays deferred to fq-runtime.
+//! - The EXPLAIN document builder belongs to fq-runtime.
 
 pub mod clauses;
 pub mod dialect;

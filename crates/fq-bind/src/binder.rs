@@ -14,9 +14,8 @@
 //! visible), HAVING / ORDER-BY output-alias + positional-ordinal resolution, and
 //! the HAVING aggregate-call HOIST/widening (a HAVING aggregate EXPRESSION resolves
 //! to its aggregate output, or an absent one becomes a hidden __agg_N output with a
-//! restore projection). Deferred (correctness refinements, do not block binding):
-//! the same hoist for ORDER BY aggregate calls absent from the SELECT, and WITH
-//! RECURSIVE.
+//! restore projection). Not implemented: the same hoist for ORDER BY aggregate
+//! calls absent from the SELECT, and WITH RECURSIVE.
 
 use std::collections::HashMap;
 

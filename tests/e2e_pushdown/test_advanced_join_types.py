@@ -225,15 +225,15 @@ def test_cross_source_using_join_fails_fast(multi_source_env):
         runtime.execute(sql)
 
 
-# --- Deferred feature backlog (C1): cross-source NATURAL/USING SHOULD eventually
-# join on the matched columns like the equivalent explicit ON. These xfail until
-# the merge engine can disambiguate the duplicate join-column names; when that
-# lands they XPASS (strict) and signal the markers - and the fail-fast guards and
-# their raises-tests above - should be removed.
+# Cross-source NATURAL/USING joins are not supported: the merge engine cannot
+# disambiguate the duplicate join-column names. These xfail-strict tests assert
+# the equivalence to the explicit ON join that such a join would produce, so a
+# pass means the behavior changed and this pin (with the fail-fast guards and
+# their raises-tests above) is stale.
 
 
 @pytest.mark.xfail(
-    strict=True, reason="C1: cross-source NATURAL join not yet supported"
+    strict=True, reason="cross-source NATURAL join not supported"
 )
 def test_cross_source_natural_join_matches_explicit_on(multi_source_env):
     """A cross-source NATURAL join should equal the explicit ON join on the
@@ -251,7 +251,7 @@ def test_cross_source_natural_join_matches_explicit_on(multi_source_env):
 
 
 @pytest.mark.xfail(
-    strict=True, reason="C1: cross-source USING join not yet supported"
+    strict=True, reason="cross-source USING join not supported"
 )
 def test_cross_source_using_join_matches_explicit_on(multi_source_env):
     """A cross-source USING (customer_id) join should equal the explicit ON join."""

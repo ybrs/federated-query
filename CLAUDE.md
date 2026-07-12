@@ -24,6 +24,42 @@ engine.
 
 Only ascii edits are allowed.
 
+# RUST REWRITE GUARDRAILS (process rules - each one exists because it was violated once)
+
+1. PLANNING IS O(METADATA). Planning may read catalogs, cached/learned statistics,
+   and source planner estimates (EXPLAIN) - NEVER data. This is enforced at
+   runtime: planning has a hard wall-clock budget (`optimizer.planning_budget_ms`,
+   default 100ms). A blown budget KILLS the query with a per-stage report
+   (`fq-runtime` StageLog) or, when a statistics fetch broke it, names the exact
+   fetch (`EstimateError::PlanBudget`). There is NO off switch; a justified edge
+   case raises the configured budget explicitly and says why. Never "fix" a
+   budget kill by raising the budget - fix the O(data) work it caught.
+
+2. NEVER COMPILE DUCKDB IN CARGO. The `duckdb` crate's `bundled` feature compiles
+   the C++ amalgamation at the active cargo profile's opt level: a dev build is an
+   -O0 DuckDB (~10x slower execution) and a release build costs ~10min of C++ per
+   clean build. The workspace links the OFFICIAL prebuilt library:
+   `scripts/setup-duckdb-lib.sh` (or `make duckdb-lib`) fetches the version pinned
+   by Cargo.lock into `.duckdb-lib/current`, `.cargo/config.toml` wires
+   DUCKDB_LIB_DIR + rpath. fq-lint rule FQ-BUNDLED fails on any reintroduction.
+
+3. PERF NUMBERS ONLY FROM benchmarks/perf_compare. No ad-hoc timing runs: every
+   engine perf claim comes from `benchmarks/perf_compare/compare.py` (cold = fresh
+   process + fresh runtime, warm = medians on a live runtime, both ALWAYS
+   reported, release builds only, budget kills shown as KILLED, unsupported
+   sources shown as UNSUPPORTED). If a number was not produced by the harness it
+   does not go in a report, commit message, or decision.
+
+4. NO STALE DEFERRALS. Deferring work is fine ONLY as: a comment/doc note that
+   names WHAT is deferred and the BLOCKER it waits on (a crate, a feature, a
+   measurement). When the blocker lands, the deferral MUST be swept in that same
+   milestone - re-read every deferral note whose blocker was just built and
+   either do the work or re-justify against the new state. A deferral whose
+   stated blocker already exists is a lie in the codebase (this happened:
+   `scan_planner_estimate` kept "fq-emit does not exist yet" for four milestones
+   after fq-emit landed, hiding an O(data) planning path). At every milestone
+   close, grep the workspace for `deferred`/`TODO(` and re-adjudicate.
+
 Never fail silently. If something breaks it should throw an error. We don't want silent fails. You can only catch exceptions when we show it to the user in the cli. Otherwise all exceptions should be thrown. 
 
 ALL COLUMNS MUST BE QUALIFIED AFTER THE BINDER. Non-negotiable rule: once binding is done, every column reference (`ColumnRef`) flowing through the logical and physical plan MUST carry its relation qualifier (`table` set to the owning relation/alias). An unqualified column ref (`table` is None or empty) must NEVER pass through the plan after binding. This is not only the binder's job: any pass that MANUFACTURES columns (decorrelation's synthetic subquery outputs, optimizer-introduced projections, etc.) must qualify them to a real relation, exposing that relation under an alias if one does not already exist. Enforce it with a loud guard that walks the plan after binding/decorrelation and raises on any unqualified ref. Rationale: side-assignment, join-key orientation, and scope resolution all rely on the qualifier; an unqualified column silently defeats them and manufactures wrong or empty results.
@@ -47,6 +83,22 @@ Follow Python PEP8
 use meaningful names
 
 every function/method needs a comment with explaining what it does.
+
+COMMENTS DESCRIBE THE CODE, NEVER THE PROJECT. Code is not a todo list and not
+a changelog. A comment states what the code does, its invariants, and why - as
+it is TODAY. Forbidden in code comments: TODO/FIXME/XXX/HACK markers,
+milestone/phase/stage labels, commit ids, dates, task/ticket references, punch
+lists, review notes, "deferred to X" scheduling, "landed/implemented in"
+history, references to spec/plan documents. Work tracking lives in HANDOFF.md
+and the plan docs; history lives in git. If behavior is intentionally missing,
+state the current behavior as a fact ("X is not supported; this raises Y"),
+never as a plan. Enforced twice: fq-lint FQ-PMCOMMENT catches the mechanical
+markers instantly (Rust), and the SEMANTIC pre-commit gate (scripts/
+comment-gate: a haiku judge reviews every staged .rs/.py comment block and
+Python docstring against RUBRIC.md) catches what keyword lists cannot. The
+hook installs itself on session start (SessionStart hook -> scripts/
+install-hooks.sh; manual: `make hook-install`); a gate failure blocks the
+commit and prints each offending comment.
 
 This project is not a toy/homework project. Do real production quality software development. We need real-query-engine level behaviour.
 

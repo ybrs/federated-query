@@ -1,4 +1,4 @@
-"""End-to-end tests for aggregation queries (Phase 3)."""
+"""End-to-end tests for aggregation queries."""
 
 import pytest
 import duckdb

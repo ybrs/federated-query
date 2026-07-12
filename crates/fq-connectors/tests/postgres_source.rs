@@ -1,6 +1,6 @@
 //! Translation of the Postgres half of `tests/test_datasources.py` /
 //! `tests/test_statistics_layer.py` plus the pg uuid `map_native_type` override
-//! (deferred from `tests/test_catalog.py`).
+//! (from `tests/test_catalog.py`).
 //!
 //! Runs against a live Postgres (the harness starts one on :5432). Each test owns
 //! a uniquely-named schema, dropped on `Drop`, so parallel tests never collide.

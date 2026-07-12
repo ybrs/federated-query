@@ -1,5 +1,5 @@
-// Imported fedqrs engine - already validated by the TPC tallies; pedantic-
-// cleaned incrementally, not on import.
+// Imported fedqrs engine: the lint allow below exempts this module from the
+// workspace pedantic set (its house style predates the workspace's).
 #![allow(clippy::all, clippy::pedantic)]
 //! The IR interpreter: walks the orchestration steps, reads sources natively,
 //! runs relational fragments on DataFusion, and returns the result as an
@@ -407,7 +407,7 @@ pub fn execute(ir: &Ir) -> ExecResult<(SchemaRef, Vec<RecordBatch>, Vec<(String,
     let mut remaining = binding_use_counts(ir);
     // (binding, measured rows) for every materialized step, returned to Python
     // as the learned-stats WRITE stream: the engine reports one number per step
-    // and python decides what it means. See adaptive-catalog-plan.md.
+    // and the caller decides what it means.
     let mut observations: Vec<(String, usize)> = Vec::new();
     // Fresh group-count harvest for this query (aggregates run lazily; their
     // counts are read from AggregateExec metrics after each region collects).
@@ -1974,9 +1974,9 @@ fn export(
     }
 }
 
-/// Read a spilled relation back into memory for the final export (the result
-/// crosses to Python as one Arrow stream today; streaming the file across
-/// the boundary is a follow-up if a >2GB FINAL result ever matters).
+/// Read a spilled relation back into memory for the final export: the result
+/// crosses to Python as ONE in-memory Arrow stream, so a spilled final result
+/// is materialized here (the spill file itself never crosses the boundary).
 fn read_spilled(spilled: &SpilledBinding) -> ExecResult<(SchemaRef, Vec<RecordBatch>)> {
     let handle = std::fs::File::open(spilled.file.path())
         .map_err(|e| ExecError::runtime(format!("binding spill open: {e}")))?;

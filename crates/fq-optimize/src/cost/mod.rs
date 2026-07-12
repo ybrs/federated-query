@@ -161,8 +161,8 @@ impl CostModel {
     }
 
     /// C_out: the sum of every join's estimated output rows in a subtree. An
-    /// UNKNOWN join contributes nothing. THE SEAM where a locality/network term is
-    /// later added (join-ordering milestone) without touching the enumerator.
+    /// UNKNOWN join contributes nothing. THE SEAM where join ordering adds its
+    /// locality/network term without touching the enumerator.
     pub fn join_tree_cost(&mut self, plan: &LogicalPlan) -> Result<f64> {
         let mut total = 0.0;
         if let LogicalPlan::Join(_) = plan {

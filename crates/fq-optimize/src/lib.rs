@@ -1,10 +1,10 @@
-//! fq-optimize: the logical optimizer. Milestone 1 = the ESTIMATION FOUNDATION
-//! that the rewrite rules and join-ordering DP (later milestones) depend on:
-//! the cost model, the statistics collector, the estimate-defaults helpers, the
-//! byte-critical subplan signature, and the join-graph extraction.
+//! fq-optimize: the logical optimizer - the rewrite rules and the join-ordering
+//! DP, plus the ESTIMATION FOUNDATION they depend on: the cost model, the
+//! statistics collector, the estimate-defaults helpers, the byte-critical
+//! subplan signature, and the join-graph extraction.
 //!
-//! Ports `optimizer/{cost,statistics,estimate_defaults,subplan_signature,
-//! join_graph}.py`. The rewrite rules and join-ordering land in later milestones.
+//! Ports `optimizer/{rules,join_ordering,cost,statistics,estimate_defaults,
+//! subplan_signature,join_graph}.py`.
 
 pub mod cost;
 pub mod error;

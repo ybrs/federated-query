@@ -76,9 +76,8 @@ class Table(StateModel):
         """Point each column back at this table.
 
         Runs on construction only; ``model_copy`` does not re-run validators, so
-        a copied Table's columns would keep the original's back-ref. Catalog
-        objects are built once and never copied, so this is fine - revisit if
-        that changes.
+        a copied Table's columns would keep the original's back-ref. This relies
+        on catalog objects being built once and never copied.
         """
         for col in self.columns:
             col._table = self

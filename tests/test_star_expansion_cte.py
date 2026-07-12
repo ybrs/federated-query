@@ -1,9 +1,8 @@
 """Star expansion over CTEs and derived tables (subqueries in FROM).
 
-The preprocessor used to raise StarExpansionError for any non-base-table
-source. These cover expanding ``*`` / ``alias.*`` when the source is a derived
-table or a CTE, resolving the columns from the relation's own projection (or a
-CTE's explicit column list) instead of the catalog.
+These cover expanding ``*`` / ``alias.*`` when the source is a derived table or
+a CTE, resolving the columns from the relation's own projection (or a CTE's
+explicit column list) instead of the catalog.
 """
 
 import pytest

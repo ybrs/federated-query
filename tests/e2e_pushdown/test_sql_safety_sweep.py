@@ -1,10 +1,10 @@
 """Parser safety-sweep tests.
 
-The parser used to silently ignore SQL clauses it does not consume, which
-returned wrong answers (DISTINCT ON, named WINDOW, TABLESAMPLE, SELECT *
-EXCLUDE) or crashed deep in a source (GROUP BY ROLLUP, FETCH FIRST). Every such
-clause must now fail fast with UnsupportedSQLError, and the clauses that already
-work must keep working.
+The parser must not silently ignore SQL clauses it does not consume: doing so
+returns wrong answers (DISTINCT ON, named WINDOW, TABLESAMPLE, SELECT * EXCLUDE)
+or crashes deep in a source (GROUP BY ROLLUP, FETCH FIRST). Every such clause
+fails fast with UnsupportedSQLError, and the clauses that already work keep
+working.
 """
 
 import pytest

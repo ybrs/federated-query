@@ -1,4 +1,4 @@
-//! MILESTONE C proof: the WHOLE Rust pipeline executes a query end to end against
+//! End-to-end proof: the WHOLE Rust pipeline executes a query end to end against
 //! a real DuckDB fixture and returns correct Arrow rows.
 //!
 //! Flow: build a catalog from a real `.duckdb` file (fq-connectors `DuckDbSource`

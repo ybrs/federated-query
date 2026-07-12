@@ -162,7 +162,7 @@ def _inner(left, right, left_key, right_key, build="right"):
 def test_inner_reduces_the_larger_estimated_side():
     """The q11 fix: the bigger injectable side (partsupp 800k) becomes the
     probe (reduced), the smaller (supplier 400) donates keys - regardless of
-    the structural _probe_preference that used to pick the small remote."""
+    the structural _probe_preference, which alone would pick the small remote."""
     from federated_query.executor.rust_ir import _cardinality_probe
 
     big = _est_scan("partsupp", "ps", ["ps_partkey", "ps_suppkey"], 800000)
@@ -538,9 +538,9 @@ def test_join_subtree_is_not_an_injectable_base():
 
 def test_probe_base_resolvable_traces_through_a_join_probe():
     """A join-subtree probe whose key column passes through a PRESERVED side
-    now resolves: the keys inject into the base scan that originates the
-    column (the SF10 outlier-cluster fix - previously the whole fact
-    shipped because a composite probe was never injectable)."""
+    resolves: the keys inject into the base scan that originates the column.
+    Without this, a composite probe is not injectable and the whole fact
+    ships."""
     left = _scan("store", "s", ["s_store_sk"])
     r1 = _scan("store_sales", "ss", ["ss_store_sk", "ss_hdemo_sk"])
     r2 = _scan("household_demographics", "hd", ["hd_demo_sk"])

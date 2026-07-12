@@ -26,8 +26,9 @@ def test_available_columns_scan_has_bare_and_qualified():
 def test_available_columns_unions_both_join_sides():
     """A join exposes both sides - including a nested join (the B2 regression).
 
-    The order-by walker previously returned {} for a Join child, so on 3+-way
-    joins a sort key on a nested side was treated as unavailable and mis-pushed.
+    The order-by walker must return a Join child's columns; returning {} would
+    treat a sort key on a nested side as unavailable and mis-push it on 3+-way
+    joins.
     """
     nested = Join(
         left=_scan("a", ["id", "x"]),

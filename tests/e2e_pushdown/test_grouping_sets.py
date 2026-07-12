@@ -71,7 +71,7 @@ GROUPING_CASES = [
     "FROM {T} GROUP BY ROLLUP (region)",
     "SELECT region, status, SUM(price) AS s FROM {T} GROUP BY region, ROLLUP (status)",
     # Regression: ORDER BY / WHERE pushdown must not drop the grouping sets
-    # (the optimizer's scan rebuilds previously lost them, dropping super-aggregate rows).
+    # (the optimizer's scan rebuilds must carry them, or super-aggregate rows are dropped).
     "SELECT region, SUM(price) AS s FROM {T} GROUP BY ROLLUP (region) ORDER BY region",
     "SELECT region, SUM(price) AS s FROM {T} WHERE price > 30 GROUP BY ROLLUP (region)",
 ]

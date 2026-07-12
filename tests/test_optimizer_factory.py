@@ -1,5 +1,4 @@
-"""Tests for the optimizer factory wiring and the EXPLAIN estimate surface
-(M6 of the cost-based join optimizer).
+"""Tests for the optimizer factory wiring and the EXPLAIN estimate surface.
 
 The factory is the single place the rule stack is assembled, so the
 OptimizerConfig flags are real everywhere; EXPLAIN prints each join's

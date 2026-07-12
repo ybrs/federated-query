@@ -19,10 +19,9 @@ def _expect_explain_failure(runtime, sql: str, message: str) -> None:
 
 
 def test_window_function_pushes_down(single_source_env):
-    """A standalone window function now pushes to the source (Phase 9, section 9.3).
+    """A standalone window function pushes to the source.
 
-    Previously this surfaced a parser error; windows are now a supported
-    expression and ship as one remote query.
+    Windows are a supported expression and ship as one remote query.
     """
     runtime = build_runtime(single_source_env)
     sql = (

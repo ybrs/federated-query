@@ -19,9 +19,9 @@
 //!   time (a stronger guarantee than the runtime check), and no dynamic SQL over
 //!   an unvetted name is possible.
 //! - `source_identity`, `subplan_stats`, and `materialized_fragments` tables are
-//!   CREATED (schema parity) but their read/write methods are added when their
-//!   consumers (repoint detection, subplan signatures, the accelerator) are
-//!   ported; no test here exercises them.
+//!   CREATED (schema parity) but have no read/write surface here - nothing in
+//!   this workspace consumes them (repoint detection, subplan-stats reads, the
+//!   accelerator all read the store elsewhere); no test here exercises them.
 //! - The `_persist_observations` / `_plain_group_columns` tests and the
 //!   CostModel/StatisticsCollector overlay tests in test_stats_catalog.py test
 //!   OTHER crates (fq-physical/fq-runtime and fq-optimize); they translate with

@@ -70,7 +70,109 @@ fn main() -> ExitCode {
         }
         lint_file(path, &node_names, &mut violations);
     }
+    lint_pm_comments(root, &mut violations);
+    lint_cargo_manifests(root, &mut violations);
     report(&violations)
+}
+
+/// The project-management markers forbidden in code comments (CLAUDE.md:
+/// comments describe the code, never the project). Matched case-insensitively
+/// against the comment portion of every line in every crate `.rs` file,
+/// including tests.
+const PM_MARKERS: [&str; 8] = [
+    "todo",
+    "fixme",
+    "xxx:",
+    "hack:",
+    "milestone",
+    "punch-list",
+    "punch list",
+    "spec-",
+];
+
+/// FQ-PMCOMMENT: a code comment carrying project management (todo markers,
+/// milestones, punch lists, commit ids, spec-doc references). Work tracking
+/// belongs in HANDOFF.md / the plan docs; a comment states what the code does
+/// TODAY.
+fn lint_pm_comments(root: &Path, violations: &mut Vec<Violation>) {
+    for entry in WalkDir::new(root.join("crates"))
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(path).expect("source must be readable");
+        for (index, line) in source.lines().enumerate() {
+            // Only the comment portion of the line; "//" inside a string (a URL)
+            // is rare enough here that the simple split is acceptable for a lint.
+            let Some(position) = line.find("//") else {
+                continue;
+            };
+            if let Some(marker) = pm_marker_in(&line[position..]) {
+                violations.push(Violation {
+                    file: path.to_string_lossy().to_string(),
+                    line: index + 1,
+                    code: "FQ-PMCOMMENT",
+                    message: format!(
+                        "comment carries project management ({marker:?}); comments state \
+                         what the code does TODAY - track work in HANDOFF.md/plan docs"
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// The first forbidden marker found in one comment, or a commit-id reference.
+fn pm_marker_in(comment: &str) -> Option<String> {
+    let lowered = comment.to_lowercase();
+    for marker in PM_MARKERS {
+        if lowered.contains(marker) {
+            return Some(marker.to_string());
+        }
+    }
+    if let Some(position) = lowered.find("commit ") {
+        let tail = &lowered[position + 7..];
+        let hex_len = tail.chars().take_while(char::is_ascii_hexdigit).count();
+        if hex_len >= 6 {
+            return Some("commit <id>".to_string());
+        }
+    }
+    None
+}
+
+/// FQ-BUNDLED: the duckdb crate's "bundled" feature compiles the DuckDB C++
+/// amalgamation under the active cargo profile - a dev build yields an -O0
+/// DuckDB (~10x slower). The workspace links the official prebuilt library
+/// (scripts/setup-duckdb-lib.sh + .cargo/config.toml); a manifest must never
+/// bring the amalgamation back.
+fn lint_cargo_manifests(root: &Path, violations: &mut Vec<Violation>) {
+    for entry in WalkDir::new(root.join("crates"))
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if path.file_name().is_none_or(|name| name != "Cargo.toml") {
+            continue;
+        }
+        let source = std::fs::read_to_string(path).expect("manifest must be readable");
+        for (index, line) in source.lines().enumerate() {
+            let uncommented = line.split('#').next().expect("split yields a piece");
+            if uncommented.contains("duckdb") && uncommented.contains("bundled") {
+                violations.push(Violation {
+                    file: path.to_string_lossy().to_string(),
+                    line: index + 1,
+                    code: "FQ-BUNDLED",
+                    message: "the duckdb \"bundled\" feature compiles DuckDB at the cargo \
+                              profile's opt level; link the prebuilt library instead \
+                              (scripts/setup-duckdb-lib.sh)"
+                        .to_string(),
+                });
+            }
+        }
+    }
 }
 
 /// A `.rs` file under an engine crate's `src/`, excluding test code and the

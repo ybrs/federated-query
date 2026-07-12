@@ -1,5 +1,5 @@
 //! Translation of the DuckDB half of `tests/test_datasources.py` plus the
-//! DuckDB `map_native_type` cases deferred from `tests/test_catalog.py`.
+//! DuckDB `map_native_type` cases from `tests/test_catalog.py`.
 //!
 //! Uses a real in-memory DuckDB (embedded, no server), mirroring the Python
 //! fixture's create-schema-and-tables setup.

@@ -38,8 +38,8 @@ def _count_source_nodes(node):
     """Count the source-reading nodes in a physical plan.
 
     A same-source subtree collapses to exactly one such node, so ``== 1`` proves
-    the whole query (join included) is pushed as a single remote query - the
-    property the old runtime query-count assertion checked.
+    the whole query (join included) is pushed as a single remote query, the same
+    property a runtime query-count assertion would check.
     """
     if isinstance(node, (PhysicalScan, PhysicalRemoteQuery, PhysicalRemoteJoin)):
         return 1
@@ -559,7 +559,7 @@ class TestBuggyAggregates:
         binder = Binder(catalog)
         bound_plan = binder.bind(logical_plan)
 
-        # Optimizer WITHOUT AggregatePushdownRule (the old broken behavior)
+        # Optimizer WITHOUT AggregatePushdownRule (so the aggregate is not pushed)
         optimizer = RuleBasedOptimizer(catalog)
         optimizer.add_rule(PredicatePushdownRule())
         optimizer.add_rule(ProjectionPushdownRule())

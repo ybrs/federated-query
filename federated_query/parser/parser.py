@@ -2029,8 +2029,8 @@ class Parser:
     ) -> List[Expression]:
         """Extract an aggregate's arguments, including a STRING_AGG separator.
 
-        The separator (``STRING_AGG(x, ',')``) is a real second argument; it was
-        previously dropped, which silently changed the rendered aggregate. It is
+        The separator (``STRING_AGG(x, ',')``) is a real second argument;
+        dropping it would silently change the rendered aggregate. It is
         appended after the primary argument so the call round-trips faithfully.
         """
         args = self._extract_primary_args(func)

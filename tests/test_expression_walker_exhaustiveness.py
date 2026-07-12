@@ -189,7 +189,7 @@ def _direct_children(expr: Expression) -> list:
 
 
 # (name, callable returning an iterable of column-name strings). These are the
-# recursive collectors that previously silently dropped nested columns.
+# recursive collectors that must not silently drop nested columns.
 _WALKERS = [
     (
         "decorrelation._expression_column_refs",

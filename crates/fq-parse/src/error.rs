@@ -13,7 +13,7 @@ pub enum ParseError {
     #[error("expected a single SQL statement")]
     MultiStatement,
 
-    /// A construct that parses but the engine does not (yet) plan. Ports the
+    /// A construct that parses but the engine does not plan. Ports the
     /// Python `UnsupportedSQLError`: the engine fails fast rather than silently
     /// dropping a clause and returning a wrong answer.
     #[error("unsupported SQL: {0}")]

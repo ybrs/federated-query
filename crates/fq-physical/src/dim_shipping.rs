@@ -1,7 +1,6 @@
 //! Dim shipping: collapse a shippable cross-source fact-dimension subtree into ONE
 //! island by shipping the foreign (dimension) relations INTO the local (fact)
-//! source as temp tables. Ports `federated_query/optimizer/dim_shipping.py`
-//! (SPEC-dim-shipping.md).
+//! source as temp tables. Ports `federated_query/optimizer/dim_shipping.py`.
 //!
 //! When a large fact (on one source) INNER-joins small dimensions (on another) and
 //! the query GROUP BYs dimension columns, the fact cannot collapse into its own
@@ -36,7 +35,7 @@ use crate::planner::PhysicalPlanner;
 
 type Result<T> = std::result::Result<T, PhysicalError>;
 
-// --- constants (SPEC section 4; values are dim_shipping.py lines 46-81) --------
+// --- constants (values are dim_shipping.py lines 46-81) --------
 
 /// DuckDB `CREATE TEMP TABLE` schema qualifier (`_DUCK_SHIP_SCHEMA`).
 const DUCK_SHIP_SCHEMA: &str = "temp";
@@ -62,7 +61,7 @@ const SHIP_COLLAPSE_MAX_FRACTION: f64 = 0.1;
 /// A base scan's identity within the analyzed tree: its ADDRESS. The tree is
 /// borrowed (never cloned) from `collect_base_scans` through `replace`, so a scan's
 /// address is stable across the analysis, and a self-join's two structurally-equal
-/// scans key INDEPENDENTLY (a value-equality map would collide them). SPEC 6.4(A).
+/// scans key INDEPENDENTLY (a value-equality map would collide them).
 type ScanId = usize;
 
 /// The address of a borrowed scan node (its `ScanId`).
@@ -97,7 +96,7 @@ impl DimShipping {
     }
 }
 
-// --- analyze: the gate sequence (SPEC 3.1) ------------------------------------
+// --- analyze: the gate sequence ------------------------------------
 
 /// Run the gates IN ORDER; the FIRST miss returns `Ok(None)`. The ordering is
 /// load-bearing: `dimension_explosion` (5) reads the aggregate that
@@ -156,7 +155,7 @@ fn analyze(planner: &mut PhysicalPlanner, node: &LogicalPlan) -> Result<Option<S
 }
 
 /// Map each collected scan (by identity) to its row estimate, `None` when
-/// unknown. SPEC 3.2.
+/// unknown.
 fn scan_rows_map(
     cost_model: &mut CostModel,
     scans: &[&Scan],
@@ -182,7 +181,7 @@ fn scan_rows(cost_model: &mut CostModel, scan: &Scan) -> Result<Option<u64>> {
     Ok(estimate.rows)
 }
 
-// --- gate 5: dimension explosion (SPEC 3.5, 3.11, 3.12) -------------------
+// --- gate 5: dimension explosion -------------------
 
 /// The ship-target aggregate's GROUP BY spans two or more independent high-card
 /// dimensions, so it will not collapse. A MEASURED group count OVERRIDES the
@@ -227,7 +226,7 @@ fn measured_explosion(
 
 /// The catalog's MEASURED group count for a stamped subject/key set, or `None`
 /// when no learned catalog is wired or nothing was recorded. A catalog FAULT
-/// propagates (SPEC 3.12 / section 12.7): mapping it to `None` would silently
+/// propagates: mapping it to `None` would silently
 /// hide the fault; a genuinely-empty result is `Ok(None)`.
 fn learned_group_count(
     stats: Option<&StatsCatalog>,
@@ -242,7 +241,7 @@ fn learned_group_count(
 
 /// The number of distinct source dimensions contributing a high-card group key.
 /// Correlated keys from ONE relation share an owner (pointer identity) and count
-/// once; an ownerless high-card key counts as its own dimension. SPEC section 10.
+/// once; an ownerless high-card key counts as its own dimension.
 fn count_high_dimensions(cost_model: &CostModel, agg: &Aggregate) -> Result<usize> {
     let mut owners: HashSet<usize> = HashSet::new();
     let mut ownerless = 0usize;
@@ -279,7 +278,7 @@ fn high_card_owner(
     Ok((true, owner.map(|node| std::ptr::from_ref(node) as usize)))
 }
 
-// --- build: swap, collapse, wrap (SPEC 3.10, 3.13-3.17) -------------------
+// --- build: swap, collapse, wrap -------------------
 
 /// Swap the foreign scans for temp scans, collapse to one island, and wrap it in
 /// the shipments. `None` when the swap does not collapse into an island that
@@ -311,8 +310,8 @@ fn build(
 
 /// Build a temp scan for each foreign scan (in `collect_base_scans` DFS order);
 /// return the identity->temp map and the `(temp_table_name, foreign_scan)`
-/// shipment list. SPEC 3.13. The `next_ship_name` DFS order is what makes the
-/// N-th foreign scan get `__fedq_ship_N` deterministically (SPEC 6.4 invariant).
+/// shipment list. The `next_ship_name` DFS order is what makes the
+/// N-th foreign scan get `__fedq_ship_N` deterministically.
 fn synthetic_scans(
     planner: &mut PhysicalPlanner,
     node: &LogicalPlan,
@@ -339,7 +338,7 @@ fn synthetic_scans(
 /// Rebuild the subtree with each mapped scan replaced by its temp scan, walking
 /// the ORIGINAL borrowed tree so scan addresses match the mapping keys. The
 /// subtree is guaranteed shippable (`is_shippable_shape`), so only the shippable
-/// node kinds appear; any other is a violated invariant surfaced loudly. SPEC 3.14.
+/// node kinds appear; any other is a violated invariant surfaced loudly.
 fn replace(node: &LogicalPlan, mapping: &HashMap<ScanId, Scan>) -> LogicalPlan {
     match node {
         LogicalPlan::Scan(scan) => match mapping.get(&scan_id(scan)) {
@@ -387,7 +386,7 @@ fn replace(node: &LogicalPlan, mapping: &HashMap<ScanId, Scan>) -> LogicalPlan {
 /// Whether the plan contains a window function: collapsing a window over a
 /// grouping into one remote SELECT bypasses the two-stage window split and
 /// renders SQL the source cannot bind, so such a subtree keeps its coordinator
-/// plan. SPEC 3.15.
+/// plan.
 fn has_window(node: &PhysicalPlan) -> bool {
     if matches!(node, PhysicalPlan::Window(_)) {
         return true;
@@ -402,7 +401,7 @@ fn has_window(node: &PhysicalPlan) -> bool {
 
 /// Wrap the island in one `PhysicalShipment` per shipped foreign scan (innermost
 /// last-shipped, so the emit order materializes each body before the island
-/// reads it). Ships in REVERSE of the collection order. SPEC 3.17.
+/// reads it). Ships in REVERSE of the collection order.
 fn wrap_shipments(
     planner: &mut PhysicalPlanner,
     shipments: &[(String, Scan)],
@@ -432,7 +431,7 @@ fn wrap_shipments(
 // --- free helpers (no collaborator state) --------------------------------------
 
 /// Every node in the subtree is a deterministic INNER-only relational op a
-/// dimension can be safely shipped across. SPEC 3.3.
+/// dimension can be safely shipped across.
 fn is_shippable_shape(node: &LogicalPlan) -> bool {
     node_is_shippable(node)
         && node
@@ -468,7 +467,7 @@ fn node_is_shippable(node: &LogicalPlan) -> bool {
 
 /// The subtree must reduce its output through a PLAIN GROUP BY at its root (under
 /// any row-preserving wrappers). A ROLLUP/CUBE aggregate collapses poorly in one
-/// island; a bare join/scan ships the whole joined fact for no gain. SPEC 3.4.
+/// island; a bare join/scan ships the whole joined fact for no gain.
 fn collapses_via_aggregate(node: &LogicalPlan) -> bool {
     matches!(ship_aggregate(node), LogicalPlan::Aggregate(agg) if is_plain_group(agg))
 }
@@ -481,7 +480,7 @@ fn is_plain_group(agg: &Aggregate) -> bool {
 
 /// The node under the row-preserving wrappers {Projection, Filter, Sort, Limit,
 /// SubqueryScan}. NOTE this wrapper set INCLUDES Filter and Limit, unlike
-/// `island_group_observation`'s walk - the difference is intentional. SPEC 3.4.
+/// `island_group_observation`'s walk - the difference is intentional.
 fn ship_aggregate(node: &LogicalPlan) -> &LogicalPlan {
     let mut current = node;
     loop {
@@ -520,7 +519,7 @@ fn measured_collapse_exceeds(groups: i64, input_rows: u64) -> bool {
 /// aggregate's subject (the SAME key the cost model reads) plus its group column
 /// names. `None` when a Filter or Limit sits between the ship root and the
 /// aggregate (the island row count is then NOT the group count) or a key is not a
-/// plain column. SPEC 3.11.
+/// plain column.
 fn island_group_observation(node: &LogicalPlan) -> Option<GroupObservation> {
     let mut current = node;
     // Walk DOWN through {Projection, Sort, SubqueryScan} ONLY - NOT Filter, NOT
@@ -549,7 +548,7 @@ fn island_group_observation(node: &LogicalPlan) -> Option<GroupObservation> {
 }
 
 /// The datasource NAME holding the largest scan (the fact side), or `None` when no
-/// scan carries a cost estimate to compare by. SPEC 3.6.
+/// scan carries a cost estimate to compare by.
 fn local_source(scans: &[&Scan], rows: &HashMap<ScanId, Option<u64>>) -> Option<String> {
     let mut largest: Option<(&Scan, u64)> = None;
     for scan in scans {
@@ -564,7 +563,7 @@ fn local_source(scans: &[&Scan], rows: &HashMap<ScanId, Option<u64>>) -> Option<
 }
 
 /// The ship target (the fact source) must ACCEPT a shipped temp table - a physical
-/// capability, not a cost choice. SPEC 3.7.
+/// capability, not a cost choice.
 fn local_is_ship_target(planner: &PhysicalPlanner, local: &str) -> bool {
     match planner.catalog().get_datasource(local) {
         Some(source) => source.supports_capability(DataSourceCapability::ShipTarget),
@@ -574,7 +573,7 @@ fn local_is_ship_target(planner: &PhysicalPlanner, local: &str) -> bool {
 
 /// The temp-table schema qualifier for the target: `pg_temp` for a Postgres fact
 /// source, `temp` for DuckDB (a missing source falls to the DuckDB default,
-/// matching Python's else branch). SPEC 3.18.
+/// matching Python's else branch).
 fn ship_schema(planner: &PhysicalPlanner, local: &str) -> String {
     match planner
         .catalog()
@@ -589,7 +588,7 @@ fn ship_schema(planner: &PhysicalPlanner, local: &str) -> String {
 /// A LOCAL temp-table scan replacing a foreign scan, under the SAME alias and
 /// columns so every reference above resolves unchanged. It is a FRESH bare read:
 /// the foreign scan's filters/aggregates/ordering moved INTO the shipped body and
-/// must be ABSENT here (Scan::new zero-defaults every optional clause). SPEC 3.13.
+/// must be ABSENT here (Scan::new zero-defaults every optional clause).
 fn temp_scan(
     foreign: &Scan,
     table: &str,
@@ -609,7 +608,7 @@ fn temp_scan(
 }
 
 /// The local side is large, every foreign size is known and small, and the local
-/// side dwarfs the foreign total by the required factor. SPEC 3.9.
+/// side dwarfs the foreign total by the required factor.
 fn cost_gate_passes(
     scans: &[&Scan],
     rows: &HashMap<ScanId, Option<u64>>,
@@ -670,7 +669,7 @@ fn ratio_ok(local_rows: u64, foreign_rows: u64) -> bool {
 
 /// The collapsed island must expose EXACTLY the columns (in order) that the pure
 /// cross-source plan does. A shape that cannot cleanly collapse is DECLINED here
-/// rather than emitted as a broken plan. SPEC 3.16.
+/// rather than emitted as a broken plan.
 fn outputs_match(island: &PhysicalRemoteQuery, fallback: &PhysicalPlan) -> bool {
     let fallback_names: Vec<String> = fallback
         .schema()
@@ -685,7 +684,7 @@ mod tests {
     //! Gate unit tests: they exercise `dimension_explosion` and
     //! `island_group_observation` directly against a stats-backed cost model and a
     //! StatsCatalog test double - no live source or full planner. Ports
-    //! `tests/test_dim_shipping_gate.py` (SPEC 11.1). Each case builds
+    //! `tests/test_dim_shipping_gate.py`. Each case builds
     //! `Scan -> Join(INNER) -> Aggregate(plain)` and asserts on the gate.
 
     use std::collections::BTreeMap;
@@ -705,7 +704,7 @@ mod tests {
     /// A table's row count and per-column NDV statistics.
     type TableStats = (Option<i64>, BTreeMap<String, ColumnStatistics>);
 
-    /// A stats-serving fact/dimension source. Serves the SPEC 11.1 fixtures by
+    /// A stats-serving fact/dimension source. Serves the ported gate fixtures by
     /// table name; an unknown table returns `None` (no stats at all).
     struct FixtureSource {
         tables: BTreeMap<String, TableStats>,
@@ -777,7 +776,7 @@ mod tests {
         }
     }
 
-    /// The SPEC 11.1 fixtures: item 100000 rows (i_item_sk 100000, i_item_desc
+    /// The1 fixtures: item 100000 rows (i_item_sk 100000, i_item_desc
     /// 60000), date_dim 70000 (d_date 70000), store 100 (s_state 30), warehouse 10
     /// rows with NO column stats. `mystery` is intentionally absent (no stats).
     fn fixtures() -> BTreeMap<String, TableStats> {

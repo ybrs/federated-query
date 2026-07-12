@@ -9,7 +9,7 @@ PYTHON ?= python3
 # otherwise falls back to the sibling ../venv-fedq. Override: make VENV=/path.
 VENV   ?= $(if $(VIRTUAL_ENV),$(VIRTUAL_ENV),../venv-fedq)
 
-.PHONY: download_postgres pg-start pg-stop test test-no-db install lint lint-ascii lint-construction fq-lint
+.PHONY: download_postgres pg-start pg-stop test test-no-db install lint lint-ascii lint-construction fq-lint duckdb-lib
 
 # Download the prebuilt PostgreSQL binaries into ./postgres-17 (one-time).
 download_postgres:
@@ -22,6 +22,18 @@ pg-start:
 # Stop the background PostgreSQL instance.
 pg-stop:
 	./scripts/stop-postgres.sh
+
+# Fetch the official prebuilt libduckdb the workspace links against (one-time;
+# idempotent). DuckDB is NEVER compiled inside cargo - see .cargo/config.toml.
+duckdb-lib:
+	./scripts/setup-duckdb-lib.sh
+
+# Install the git hooks (idempotent; also runs automatically on session start
+# via the SessionStart hook in .claude/settings.json). pre-commit = the
+# semantic comment gate (a haiku judge reviews every staged .rs/.py comment
+# against scripts/comment-gate/RUBRIC.md).
+hook-install:
+	./scripts/install-hooks.sh
 
 # Install the package and dependencies into the virtualenv.
 install:

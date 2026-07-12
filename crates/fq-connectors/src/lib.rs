@@ -6,8 +6,8 @@
 //! separate concern that moves in with fq-exec (today's fedqrs connectors.rs,
 //! de-pyo3-ified).
 //!
-//! Build status: DuckDB + Postgres connectors [done]. The `parquet`/`clickhouse`
-//! metadata surfaces are the next units.
+//! Only DuckDB and Postgres have connectors; there is no `parquet`/`clickhouse`
+//! metadata surface, and registering such a source is rejected loudly.
 
 pub mod duckdb_source;
 pub mod postgres_source;

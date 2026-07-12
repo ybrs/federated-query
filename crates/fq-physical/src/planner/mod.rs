@@ -154,7 +154,7 @@ impl PhysicalPlanner {
     // ---- helpers exposed to the sibling rules (all pub(crate)) ---------------
 
     /// A unique temp-table name for a shipped dimension within this query.
-    // M3 seam (SPEC-dim-shipping.md section 8): dim shipping is the only caller.
+    // Dim shipping is the only caller.
     pub(crate) fn next_ship_name(&mut self) -> String {
         let name = format!("__fedq_ship_{}", self.ship_counter);
         self.ship_counter += 1;
@@ -163,7 +163,7 @@ impl PhysicalPlanner {
 
     /// Plan a subtree with dim shipping suppressed (the pure cross-source seed
     /// plan, also the decline path). Saves/restores the flag around the call.
-    // M3 seam (SPEC-dim-shipping.md section 8): dim shipping is the only caller.
+    // Dim shipping is the only caller.
     pub(crate) fn plan_without_shipping(
         &mut self,
         node: &LogicalPlan,

@@ -3,9 +3,9 @@
 //! join / set-op / CTE paths; the raise sites and fold-in-place lowerings are
 //! driven from hand-built logical plans (their exact SQL shape is not the point).
 //!
-//! Since single-source pushdown is stubbed to decline in this milestone, every
-//! single-source subtree lowers to LOCAL nodes (a plain `PhysicalScan`, etc.);
-//! the tests target the planner's own cross-source logic.
+//! The tests target the planner's own cross-source logic: the shapes used here
+//! make single-source pushdown decline, so a single-source subtree lowers to
+//! LOCAL nodes (a plain `PhysicalScan`, etc.).
 
 use std::sync::Arc;
 
@@ -266,7 +266,7 @@ fn cross_source_non_equi_join_lowers_to_nested_loop() {
 
 #[test]
 fn same_source_join_pushes_to_one_remote_query() {
-    // M2 enabled: single-source pushdown now fires FIRST and absorbs the whole
+    // Single-source pushdown fires FIRST and absorbs the whole
     // projection-over-join subtree into one PhysicalRemoteQuery (previously this
     // reached the planner's RemoteJoin path only because pushdown was stubbed).
     let catalog = catalog();
@@ -531,8 +531,8 @@ fn cross_source_cte_registers_a_producer_and_resolves_the_reference() {
 
 #[test]
 fn recursive_cross_source_cte_raises_when_not_renderable() {
-    // The recursive merge path renders via single-source pushdown, stubbed to
-    // decline in this milestone, so it raises RecursiveCteNotRenderable.
+    // The recursive merge path renders via single-source pushdown, which
+    // declines this shape, so it raises RecursiveCteNotRenderable.
     let catalog = catalog();
     let cte = LogicalPlan::Cte(Cte {
         name: "walk".to_string(),
@@ -644,7 +644,7 @@ fn cross_source_lateral_with_multiple_base_relations_raises() {
 
 #[test]
 fn cross_source_lateral_lowers_to_a_lateral_join() {
-    // M2 enabled: the LATERAL right side (a single base scan) now renders for the
+    // The LATERAL right side (a single base scan) renders for the
     // merge engine via render_correlated_sql, so the cross-source LATERAL lowers to
     // a PhysicalLateralJoin (previously it raised only because rendering was
     // stubbed to decline).
@@ -674,7 +674,7 @@ fn cross_source_lateral_lowers_to_a_lateral_join() {
 fn window_projection_lowers_to_a_window_node() {
     // The Rust parser does not accept window syntax yet, so the window-bearing
     // projection is built directly. A Window expression selects PhysicalWindow.
-    // M2 note: a SINGLE-source window projection now pushes as one remote query
+    // A SINGLE-source window projection pushes as one remote query
     // (has_computed && !has_aggregate), so this drives the window over a
     // CROSS-source join, where pushdown declines and the coordinator Window path
     // is exercised.

@@ -1,4 +1,4 @@
-"""Phase 1 pushdown tests: single-table selects and predicates."""
+"""Pushdown tests: single-table selects and predicates."""
 
 from sqlglot import exp
 

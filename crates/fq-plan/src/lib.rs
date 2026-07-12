@@ -3,23 +3,14 @@
 //! `plan/expressions.py`, `plan/logical.py`, `plan/physical.py`,
 //! `plan/arrow_types.py`.
 //!
-//! Design (from the rewrite plan): each of `Expr` / `LogicalPlan` /
+//! Design: each of `Expr` / `LogicalPlan` /
 //! `PhysicalPlan` is ONE enum, and every traversal is an exhaustive `match` with
 //! no `_` arm, so a new variant breaks every walker at compile time. That is the
 //! compiler-enforced replacement for the Python walker-exhaustiveness tests.
 //!
-//! Build stages within this crate:
-//! - (A) `expr` + `logical` [done].
-//! - (B) `physical` [done - node structs + `children` + the typed `schema` + the
-//!   `column_aliases` resolution map and `physical_column_name`, the last two
-//!   added as a step-building (fq-physical) prerequisite].
-//! - (C) [partial] `DataType::is_renderable` (in fq-common) + the shared
-//!   `split_where_having` / `aggregate_output_map` utilities [done here].
-//!   Deferred out of fq-plan to their real consumers, never written blind:
-//!   `arrow_type_for` -> fq-exec (needs the `arrow` crate); the EXPLAIN document
-//!   builder -> fq-runtime/fq-emit (it needs `estimated_cost`, expression
-//!   rendering, a physical-plan producer, and the e2e shape tests, none of which
-//!   exist yet).
+//! Not in this crate, by design: `arrow_type_for` lives in fq-exec (the only
+//! crate holding the `arrow` dependency); SQL rendering lives in fq-emit; the
+//! EXPLAIN document builder lives with the runtime.
 
 pub mod expr;
 pub mod logical;

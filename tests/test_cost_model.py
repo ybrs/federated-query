@@ -118,8 +118,9 @@ class TestProvenanceEstimate:
     """The provenance-carrying estimate() with the NDV join formula."""
 
     def test_inner_join_uses_ndv_formula(self, cost_config):
-        """1.5M orders x 150k customer on custkey is ~1.5M rows - the NDV
-        formula, not the old 0.1-of-cross-product guess (225 billion * 0.1)."""
+        """1.5M orders x 150k customer on custkey is ~1.5M rows from the NDV
+        formula, not the 225 billion * 0.1 a cross-product-times-selectivity
+        estimate would give."""
         model = _provenance_model(cost_config)
         estimate = model.estimate(_custkey_join())
         assert estimate.rows == 1_500_000
@@ -296,12 +297,12 @@ def test_pushed_aggregate_scan_ignores_having_columns_for_stats(cost_config):
 class TestSemiAntiMatchedRows:
     """The SEMI/ANTI distinct-match estimate (occupancy formula).
 
-    The bug: matched left rows were min(left, inner), which saturates to
-    left for a many-to-many inner (inner >= left) and forces ANTI to 0 - a
-    self-referential NOT-EXISTS fact atom then looked free to lead the join
-    order (TPC-H q21). The occupancy estimate matched = left * (1 - e^-fanout)
-    (fanout = inner/left) never saturates, so an ANTI is never spuriously
-    empty, while a selective semi (inner << left) is unchanged.
+    Matched left rows use the occupancy estimate matched = left * (1 - e^-fanout)
+    (fanout = inner/left), which never saturates to left. This keeps an ANTI
+    from being estimated as empty for a many-to-many inner (inner >= left);
+    a saturating min(left, inner) estimate would force ANTI to 0 and make a
+    self-referential NOT-EXISTS fact atom look free to lead the join order
+    (TPC-H q21). A selective semi (inner << left) still matches ~inner.
     """
 
     def _model(self):
@@ -313,14 +314,14 @@ class TestSemiAntiMatchedRows:
 
     def test_fanout_one_keeps_a_real_anti_fraction(self):
         """inner == left (fanout 1): matched ~ 0.63*left, so ANTI ~ 0.37*left,
-        never 0 - this is the q21 regime that used to collapse."""
+        never 0 - the q21 regime a saturating estimate would collapse to empty."""
         matched = self._model()._semi_matched_rows(1000, 1000)
         assert 600 <= matched <= 640
         assert 1000 - matched > 300
 
     def test_selective_inner_matches_the_inner_size(self):
-        """inner << left: matched ~ inner (unchanged from the old min(left,
-        inner) for a selective semi)."""
+        """inner << left: matched ~ inner, the selective-semi case where the
+        occupancy estimate agrees with min(left, inner)."""
         matched = self._model()._semi_matched_rows(10, 1000)
         assert 9 <= matched <= 10
 

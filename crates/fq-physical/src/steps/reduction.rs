@@ -4,9 +4,9 @@
 //! enforces exactness - injection is only a reduction). Ports the reduction /
 //! orientation / tracing / winners machinery of `executor/rust_ir.py`.
 //!
-//! DEFERRED sub-part: the `injected_sql` source-side key-filter placement inside an
-//! island / aggregate probe base (see `scan_spec::injected_probe_spec`). Its absence
-//! wraps the base output with the IN filter instead, which is equally correct.
+//! Not implemented here: the `injected_sql` source-side key-filter placement inside
+//! an island / aggregate probe base (see `scan_spec::injected_probe_spec`); the
+//! engine wraps the base output with the IN filter instead, which is equally correct.
 
 use std::collections::HashMap;
 

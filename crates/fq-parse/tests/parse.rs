@@ -620,11 +620,11 @@ fn unknown_function_raises() {
     assert!(matches!(result, Err(ParseError::Unsupported(_))));
 }
 
-// --- regressions from the fq-parse review ---
+// --- conversion edge cases that must not regress ---
 
 #[test]
 fn is_null_and_is_not_null() {
-    // Review bug #2: polyglot emits a dedicated IsNull variant; these must map to
+    // polyglot emits a dedicated IsNull variant; these must map to
     // the unary IS NULL / IS NOT NULL, not be rejected as an unknown function.
     let Expr::UnaryOp { op, .. } = select_pred("SELECT a FROM t WHERE a IS NULL") else {
         panic!("expected unary");
@@ -649,7 +649,7 @@ fn select_pred(sql: &str) -> Expr {
 
 #[test]
 fn star_except_raises_not_silently_drops() {
-    // Review bug #1: a star modifier changes the column set; unhandled it must
+    // A star modifier changes the column set; unhandled it must
     // raise, never silently expand to the wrong columns.
     let result = parse("SELECT * EXCEPT (secret) FROM t");
     assert!(
@@ -660,7 +660,7 @@ fn star_except_raises_not_silently_drops() {
 
 #[test]
 fn simple_case_with_function_operand_raises() {
-    // Review bug #3: a function-bearing operand would be duplicated per branch.
+    // A function-bearing operand would be duplicated per branch.
     let result = parse("SELECT CASE upper(a) WHEN 'X' THEN 1 ELSE 2 END FROM t");
     assert!(
         matches!(result, Err(ParseError::Unsupported(_))),

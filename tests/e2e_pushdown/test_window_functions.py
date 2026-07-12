@@ -1,4 +1,4 @@
-"""Window-function pushdown tests (Phase 9, section 9.3)."""
+"""Window-function pushdown tests."""
 
 import pytest
 from sqlglot import exp

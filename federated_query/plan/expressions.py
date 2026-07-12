@@ -298,7 +298,7 @@ class FunctionCall(Expression):
 
         COUNT/SUM and the integer ranking window functions (ROW_NUMBER, RANK,
         DENSE_RANK, NTILE) yield BIGINT; AVG yields DOUBLE. Any other function
-        is not yet typed here and defaults to VARCHAR.
+        is not typed here and defaults to VARCHAR.
         """
         name = self.function_name.upper()
         if name in ("COUNT", "SUM", "ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE"):

@@ -94,8 +94,8 @@ def test_bind_scan_with_invalid_column(catalog_with_test_data):
 def test_bind_invalid_column_in_compound_predicate_over_join(catalog_with_test_data):
     """An invalid column inside IN/BETWEEN/etc. in a join's WHERE must raise.
 
-    These compound predicates over a join were previously returned unbound, so
-    a nonexistent column inside them slipped through unvalidated.
+    A compound predicate over a join must be fully bound, or a nonexistent
+    column inside it slips through unvalidated.
     """
     parser = Parser()
     binder = Binder(catalog_with_test_data)
@@ -128,8 +128,8 @@ def test_bind_valid_compound_predicate_over_join(catalog_with_test_data):
 def test_bind_unknown_table_qualifier_over_join_raises(catalog_with_test_data):
     """A column with an unknown table qualifier must raise, not silently rebind.
 
-    `x` is not a table or alias in scope; previously the binder scanned the
-    other tables by column name and bound to the first match, accepting a typo.
+    `x` is not a table or alias in scope; the binder must not scan the other
+    tables by column name and bind to the first match, which would accept a typo.
     """
     parser = Parser()
     binder = Binder(catalog_with_test_data)

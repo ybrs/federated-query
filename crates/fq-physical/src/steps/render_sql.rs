@@ -1,6 +1,6 @@
 //! Per-node SQL renderers, composing fq-emit's clause builders. Ports the render
-//! methods dropped from `fq-plan`'s physical.rs (deferred here per the fq-emit lib
-//! note): a source scan's SELECT (`PhysicalScan._build_ast` / `_render_source_sql`),
+//! methods that in Python lived on the physical nodes: a source scan's SELECT
+//! (`PhysicalScan._build_ast` / `_render_source_sql`),
 //! and the merge-engine raw-SQL renderers (`_aggregate_sql`, `_window_sql`,
 //! `_grouped_limit_sql`, `_render_values_sql`).
 //!

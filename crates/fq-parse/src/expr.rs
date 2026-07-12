@@ -103,7 +103,7 @@ impl Converter<'_> {
         })
     }
 
-    /// Convert `x IS NULL` / `x IS NOT NULL`; other IS shapes are not yet handled.
+    /// Convert `x IS NULL` / `x IS NOT NULL`; any other IS shape raises.
     fn convert_is(&self, binary: &BinaryOp) -> Result<Expr, ParseError> {
         match &binary.right {
             Expression::Null(_) => self.unary(UnaryOpType::IsNull, &binary.left),

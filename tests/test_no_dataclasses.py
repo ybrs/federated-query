@@ -25,8 +25,8 @@ def _python_files():
     """Every .py file in the package and the test suite.
 
     The tests are covered too: a ``@dataclass`` in a test fixture (e.g. a
-    conftest) is the same silent field-drop hazard and previously slipped through
-    a package-only scan.
+    conftest) is the same silent field-drop hazard, which a package-only scan
+    would miss.
     """
     files = list(_PACKAGE_ROOT.rglob("*.py"))
     files.extend(_TESTS_ROOT.rglob("*.py"))

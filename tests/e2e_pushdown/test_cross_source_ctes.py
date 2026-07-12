@@ -385,11 +385,11 @@ def test_recursive_cross_source_unrenderable_fails_fast(monkeypatch, hierarchy_e
 def test_multiple_references_emit_body_once(multi_source_env):
     """The IR executes a twice-referenced CTE body exactly ONCE.
 
-    The shared producer used to be re-emitted per reference, re-running the
-    whole body (TPC-DS q04 executed its 6-times-referenced year_total body
-    18 times). The body's scan must appear once in the IR, and its binding
-    must feed BOTH references (the engine clones a shared binding until its
-    last consumer takes it).
+    Re-emitting the shared producer per reference re-runs the whole body
+    (TPC-DS q04's 6-times-referenced year_total body would execute 18 times).
+    The body's scan must appear once in the IR, and its binding must feed BOTH
+    references (the engine clones a shared binding until its last consumer
+    takes it).
     """
     from collections import Counter
 

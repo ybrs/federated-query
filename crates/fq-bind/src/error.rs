@@ -34,7 +34,7 @@ pub enum BindError {
     #[error("set operation branches have different column counts: {left} vs {right}")]
     SetOpArity { left: usize, right: usize },
 
-    /// A construct the binder does not handle yet.
+    /// A construct the binder does not handle; binding it raises.
     #[error("cannot bind: {0}")]
     Unsupported(String),
 }

@@ -848,9 +848,9 @@ class ProjectionPushdownRule(OptimizationRule):
         Pruning is only safe below an explicit Projection/Aggregate (their
         expression lists define what the query outputs). A plan with no
         projection anywhere (programmatic Filter(Scan) plans) means SELECT
-        everything: never prune it. Every pass-through node must be seen
-        through here - the missing Sort arm used to no-op the whole rule on
-        every ORDER BY query.
+        everything: never prune it. Every pass-through node (including Sort)
+        must be seen through here; omitting the Sort arm no-ops the whole rule
+        on every ORDER BY query.
         """
         if isinstance(plan, (Projection, Aggregate)):
             return True

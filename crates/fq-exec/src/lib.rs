@@ -11,7 +11,7 @@
 //! reductions (inline-IN, temp-table, parquet delivery), ship execution, the
 //! prefetch pools, ctid-parallel reads, and the per-step observation stream.
 //!
-//! MILESTONE C step 2 (the step bridge): `bridge::execute_plan` runs the whole
+//! The step bridge: `bridge::execute_plan` runs the whole
 //! Rust pipeline end to end. It consumes `fq_physical::build_steps` output (the
 //! `Step` list holding `fq_plan::Expr`), lowers each expression to the engine's
 //! `IrExpr` (`bridge::serialize_expr`, the ported `rust_ir.py` `_serialize_*`

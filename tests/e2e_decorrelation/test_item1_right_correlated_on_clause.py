@@ -1,18 +1,18 @@
-"""Item-1: a JOIN ON-clause subquery correlated to the join's RIGHT side.
+"""A JOIN ON-clause subquery correlated to the join's RIGHT side.
 
 _rewrite_inner_join_condition rewrites such a subquery against the LEFT input
 only, producing a SEMI join whose condition references a relation (the right
-side) that is not among the SEMI join's own inputs - a mis-scoped plan. Before
-the scope validator this was not caught at the plan layer: single-source it was
-masked by pushdown (rendered as one SQL where the reference still resolved),
-cross-source it crashed cryptically in the merge engine or silently rebound the
+side) that is not among the SEMI join's own inputs - a mis-scoped plan. Without
+the scope validator this is not caught at the plan layer: single-source it is
+masked by pushdown (rendered as one SQL where the reference still resolves),
+cross-source it crashes cryptically in the merge engine or silently rebinds the
 reference to a same-named left column.
 
-Now the scope validator rejects the mis-scoped plan loudly: decorrelation raises
+The scope validator rejects the mis-scoped plan loudly: decorrelation raises
 ScopeError naming the operator and the out-of-scope qualifier. These tests pin
-that loud rejection. Supporting the query properly (real right-side correlation)
-is future work; until then a loud, precise error is the correct behavior - far
-better than wrong rows or a downstream crash.
+that loud rejection. Real right-side correlation is not supported; the loud,
+precise error is the current behavior, far better than wrong rows or a
+downstream crash.
 """
 
 import pytest

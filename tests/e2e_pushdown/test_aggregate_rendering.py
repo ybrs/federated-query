@@ -1,11 +1,11 @@
 """Execution tests for aggregate function rendering.
 
 These execute the query through the engine and compare the result against the
-same query run directly on the underlying DuckDB (ground truth). They guard the
-fix for dialect-blind function rendering: aggregate names used to be derived
-from the sqlglot class name (VariancePop -> VARIANCEPOP), which no source
-accepts. EXPLAIN-only tests missed this because the bug is only visible when the
-remote query actually executes.
+same query run directly on the underlying DuckDB (ground truth). They guard
+against dialect-blind function rendering: an aggregate name derived from the
+sqlglot class name (VariancePop -> VARIANCEPOP) is one no source accepts, so
+names must render to the source dialect. EXPLAIN-only tests miss this because
+the bug is only visible when the remote query actually executes.
 """
 
 import pytest
@@ -50,8 +50,9 @@ def _ground_truth_rows(env, sql):
     return _normalize(records)
 
 
-# Each case: an aggregate expression that previously mis-rendered. The federated
-# query qualifies the table; the reference query uses the bare table name.
+# Each case: an aggregate expression whose name must render to one the source
+# accepts. The federated query qualifies the table; the reference query uses
+# the bare table name.
 RENDERING_CASES = [
     "VAR_POP(price)",
     "VAR_SAMP(price)",

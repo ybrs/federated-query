@@ -353,9 +353,9 @@ def test_cross_source_order_by(engine):
 
 
 def test_unsupported_shape_raises(engine):
-    """A shape the serializer does not yet cover (here a cross-source correlated
-    aggregate subquery with its own GROUP BY, which still decorrelates to a
-    LATERAL) must raise, never silently emit a plan that could produce wrong rows."""
+    """A shape the serializer does not cover (here a cross-source correlated
+    aggregate subquery with its own GROUP BY, which decorrelates to a LATERAL)
+    must raise, never silently emit a plan that could produce wrong rows."""
     qe, _ = engine
     sql = (
         "SELECT n.n_name, "

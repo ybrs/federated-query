@@ -10,8 +10,7 @@ Rewrites subquery expressions in bound logical plans into join-based plans:
 
 Uncorrelated subqueries are inlined as join inputs (executed per consuming
 join) rather than hoisted to CTEs: the execution layer has no CTE support,
-so an inlined subplan is the correct executable form. CTE reuse remains a
-future optimization.
+so an inlined subplan is the correct executable form.
 
 NULL semantics: WHERE-context rewrites are exact. NOT IN and ALL use
 anti-join match conditions augmented with IS NULL terms, so UNKNOWN
@@ -1944,7 +1943,8 @@ class Decorrelator:
         assume the subqueries correlate (at most) with the left side. A
         reference to a right-side column whose name does not exist on the
         left fails at execution; one whose name DOES overlap a left column
-        binds silently to the left (a known limitation, not yet rejected).
+        binds silently to the left, a known limitation this rewrite does not
+        reject.
         """
         kept: List[Expression] = []
         for conjunct in _split_conjuncts(node.condition):
@@ -2068,7 +2068,7 @@ class Decorrelator:
         subquery's inner relation on the (possibly non-equi) correlation predicate,
         aggregate once per domain value, and LEFT-join the result back onto the
         outer - ordinary relational algebra with no residual correlation. Falls
-        back to a LATERAL for a subquery shape not yet covered here.
+        back to a LATERAL for a subquery shape not covered here.
         """
         body = self._rewrite_plan(expr.subquery)
         aggregate = self._dependent_shape(body)
