@@ -11,10 +11,12 @@
 //! base tables, derived tables (SubqueryScan), CTE references + non-recursive
 //! WITH, set operations (with arity check), Values, Explain, the subquery
 //! expressions (correlated - the subplan binds with the enclosing scopes
-//! visible), and HAVING / ORDER-BY output-alias + positional-ordinal resolution.
-//! Deferred (correctness refinements, do not block binding): the aggregate-call
-//! HOIST/widening for ORDER BY / HAVING calls absent from the SELECT list, and
-//! WITH RECURSIVE.
+//! visible), HAVING / ORDER-BY output-alias + positional-ordinal resolution, and
+//! the HAVING aggregate-call HOIST/widening (a HAVING aggregate EXPRESSION resolves
+//! to its aggregate output, or an absent one becomes a hidden __agg_N output with a
+//! restore projection). Deferred (correctness refinements, do not block binding):
+//! the same hoist for ORDER BY aggregate calls absent from the SELECT, and WITH
+//! RECURSIVE.
 
 use std::collections::HashMap;
 
@@ -752,11 +754,7 @@ fn hoist_having_over_aggregate(aggregate: Aggregate, predicate: Expr) -> Logical
 
 /// Replace each aggregate-scoped call (an aggregate function or `GROUPING()`) in
 /// `expr` with an aggregate-output reference, appending hidden outputs as needed.
-fn hoist_aggregate_calls(
-    expr: Expr,
-    aggregates: &mut Vec<Expr>,
-    names: &mut Vec<String>,
-) -> Expr {
+fn hoist_aggregate_calls(expr: Expr, aggregates: &mut Vec<Expr>, names: &mut Vec<String>) -> Expr {
     if let Expr::FunctionCall {
         is_aggregate,
         function_name,
