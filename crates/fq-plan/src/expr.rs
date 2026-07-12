@@ -427,11 +427,15 @@ impl Expr {
             | Expr::Exists { .. }
             | Expr::InSubquery { .. }
             | Expr::QuantifiedComparison { .. } => self,
+            // Variant rebuild: the pattern moved every field out of `self`, so no
+            // base remains for `..`/update!; compiler forces all fields listed (loud).
             Expr::BinaryOp { op, left, right } => Expr::BinaryOp {
                 op,
                 left: Box::new(f(*left)),
                 right: Box::new(f(*right)),
             },
+            // Variant rebuild: the pattern moved every field out of `self`, so no
+            // base remains for `..`/update!; compiler forces all fields listed (loud).
             Expr::UnaryOp { op, operand } => Expr::UnaryOp {
                 op,
                 operand: Box::new(f(*operand)),
@@ -440,11 +444,17 @@ impl Expr {
                 expr,
                 target_type,
                 data_type,
-            } => Expr::Cast {
-                expr: Box::new(f(*expr)),
-                target_type,
-                data_type,
-            },
+            } => {
+                // Variant rebuild: the pattern moved every field out of `self`, so
+                // no base remains for `..`/update!; compiler forces all fields listed.
+                Expr::Cast {
+                    expr: Box::new(f(*expr)),
+                    target_type,
+                    data_type,
+                }
+            }
+            // Variant rebuild: the pattern moved every field out of `self`, so no
+            // base remains for `..`/update!; compiler forces all fields listed (loud).
             Expr::Extract { field, source } => Expr::Extract {
                 field,
                 source: Box::new(f(*source)),
@@ -456,24 +466,34 @@ impl Expr {
                 distinct,
                 within_group_key,
                 within_group_desc,
-            } => Expr::FunctionCall {
-                function_name,
-                args: map_vec(args, f),
-                is_aggregate,
-                distinct,
-                within_group_key: within_group_key.map(|key| Box::new(f(*key))),
-                within_group_desc,
-            },
+            } => {
+                // Variant rebuild: the pattern moved every field out of `self`, so
+                // no base remains for `..`/update!; compiler forces all fields listed.
+                Expr::FunctionCall {
+                    function_name,
+                    args: map_vec(args, f),
+                    is_aggregate,
+                    distinct,
+                    within_group_key: within_group_key.map(|key| Box::new(f(*key))),
+                    within_group_desc,
+                }
+            }
             Expr::Case {
                 when_clauses,
                 else_result,
-            } => Expr::Case {
-                when_clauses: when_clauses
-                    .into_iter()
-                    .map(|(condition, result)| (f(condition), f(result)))
-                    .collect(),
-                else_result: else_result.map(|else_expr| Box::new(f(*else_expr))),
-            },
+            } => {
+                // Variant rebuild: the pattern moved every field out of `self`, so
+                // no base remains for `..`/update!; compiler forces all fields listed.
+                Expr::Case {
+                    when_clauses: when_clauses
+                        .into_iter()
+                        .map(|(condition, result)| (f(condition), f(result)))
+                        .collect(),
+                    else_result: else_result.map(|else_expr| Box::new(f(*else_expr))),
+                }
+            }
+            // Variant rebuild: the pattern moved every field out of `self`, so no
+            // base remains for `..`/update!; compiler forces all fields listed (loud).
             Expr::InList { value, options } => Expr::InList {
                 value: Box::new(f(*value)),
                 options: map_vec(options, f),
@@ -482,11 +502,17 @@ impl Expr {
                 value,
                 lower,
                 upper,
-            } => Expr::Between {
-                value: Box::new(f(*value)),
-                lower: Box::new(f(*lower)),
-                upper: Box::new(f(*upper)),
-            },
+            } => {
+                // Variant rebuild: the pattern moved every field out of `self`, so
+                // no base remains for `..`/update!; compiler forces all fields listed.
+                Expr::Between {
+                    value: Box::new(f(*value)),
+                    lower: Box::new(f(*lower)),
+                    upper: Box::new(f(*upper)),
+                }
+            }
+            // Variant rebuild: the pattern moved every field out of `self`, so no
+            // base remains for `..`/update!; compiler forces all fields listed (loud).
             Expr::Tuple { items } => Expr::Tuple {
                 items: map_vec(items, f),
             },
@@ -497,14 +523,18 @@ impl Expr {
                 order_ascending,
                 order_nulls,
                 frame,
-            } => Expr::Window {
-                function: Box::new(f(*function)),
-                partition_by: map_vec(partition_by, f),
-                order_keys: map_vec(order_keys, f),
-                order_ascending,
-                order_nulls,
-                frame,
-            },
+            } => {
+                // Variant rebuild: the pattern moved every field out of `self`, so
+                // no base remains for `..`/update!; compiler forces all fields listed.
+                Expr::Window {
+                    function: Box::new(f(*function)),
+                    partition_by: map_vec(partition_by, f),
+                    order_keys: map_vec(order_keys, f),
+                    order_ascending,
+                    order_nulls,
+                    frame,
+                }
+            }
         }
     }
 
@@ -525,11 +555,15 @@ impl Expr {
             | Expr::Exists { .. }
             | Expr::InSubquery { .. }
             | Expr::QuantifiedComparison { .. } => self,
+            // Variant rebuild: the pattern moved every field out of `self`, so no
+            // base remains for `..`/update!; compiler forces all fields listed (loud).
             Expr::BinaryOp { op, left, right } => Expr::BinaryOp {
                 op,
                 left: Box::new(f(*left)?),
                 right: Box::new(f(*right)?),
             },
+            // Variant rebuild: the pattern moved every field out of `self`, so no
+            // base remains for `..`/update!; compiler forces all fields listed (loud).
             Expr::UnaryOp { op, operand } => Expr::UnaryOp {
                 op,
                 operand: Box::new(f(*operand)?),
@@ -538,11 +572,17 @@ impl Expr {
                 expr,
                 target_type,
                 data_type,
-            } => Expr::Cast {
-                expr: Box::new(f(*expr)?),
-                target_type,
-                data_type,
-            },
+            } => {
+                // Variant rebuild: the pattern moved every field out of `self`, so
+                // no base remains for `..`/update!; compiler forces all fields listed.
+                Expr::Cast {
+                    expr: Box::new(f(*expr)?),
+                    target_type,
+                    data_type,
+                }
+            }
+            // Variant rebuild: the pattern moved every field out of `self`, so no
+            // base remains for `..`/update!; compiler forces all fields listed (loud).
             Expr::Extract { field, source } => Expr::Extract {
                 field,
                 source: Box::new(f(*source)?),
@@ -554,27 +594,37 @@ impl Expr {
                 distinct,
                 within_group_key,
                 within_group_desc,
-            } => Expr::FunctionCall {
-                function_name,
-                args: try_map_vec(args, f)?,
-                is_aggregate,
-                distinct,
-                within_group_key: match within_group_key {
-                    Some(key) => Some(Box::new(f(*key)?)),
-                    None => None,
-                },
-                within_group_desc,
-            },
+            } => {
+                // Variant rebuild: the pattern moved every field out of `self`, so
+                // no base remains for `..`/update!; compiler forces all fields listed.
+                Expr::FunctionCall {
+                    function_name,
+                    args: try_map_vec(args, f)?,
+                    is_aggregate,
+                    distinct,
+                    within_group_key: match within_group_key {
+                        Some(key) => Some(Box::new(f(*key)?)),
+                        None => None,
+                    },
+                    within_group_desc,
+                }
+            }
             Expr::Case {
                 when_clauses,
                 else_result,
-            } => Expr::Case {
-                when_clauses: try_map_when_clauses(when_clauses, f)?,
-                else_result: match else_result {
-                    Some(else_expr) => Some(Box::new(f(*else_expr)?)),
-                    None => None,
-                },
-            },
+            } => {
+                // Variant rebuild: the pattern moved every field out of `self`, so
+                // no base remains for `..`/update!; compiler forces all fields listed.
+                Expr::Case {
+                    when_clauses: try_map_when_clauses(when_clauses, f)?,
+                    else_result: match else_result {
+                        Some(else_expr) => Some(Box::new(f(*else_expr)?)),
+                        None => None,
+                    },
+                }
+            }
+            // Variant rebuild: the pattern moved every field out of `self`, so no
+            // base remains for `..`/update!; compiler forces all fields listed (loud).
             Expr::InList { value, options } => Expr::InList {
                 value: Box::new(f(*value)?),
                 options: try_map_vec(options, f)?,
@@ -583,11 +633,17 @@ impl Expr {
                 value,
                 lower,
                 upper,
-            } => Expr::Between {
-                value: Box::new(f(*value)?),
-                lower: Box::new(f(*lower)?),
-                upper: Box::new(f(*upper)?),
-            },
+            } => {
+                // Variant rebuild: the pattern moved every field out of `self`, so
+                // no base remains for `..`/update!; compiler forces all fields listed.
+                Expr::Between {
+                    value: Box::new(f(*value)?),
+                    lower: Box::new(f(*lower)?),
+                    upper: Box::new(f(*upper)?),
+                }
+            }
+            // Variant rebuild: the pattern moved every field out of `self`, so no
+            // base remains for `..`/update!; compiler forces all fields listed (loud).
             Expr::Tuple { items } => Expr::Tuple {
                 items: try_map_vec(items, f)?,
             },
@@ -598,14 +654,18 @@ impl Expr {
                 order_ascending,
                 order_nulls,
                 frame,
-            } => Expr::Window {
-                function: Box::new(f(*function)?),
-                partition_by: try_map_vec(partition_by, f)?,
-                order_keys: try_map_vec(order_keys, f)?,
-                order_ascending,
-                order_nulls,
-                frame,
-            },
+            } => {
+                // Variant rebuild: the pattern moved every field out of `self`, so
+                // no base remains for `..`/update!; compiler forces all fields listed.
+                Expr::Window {
+                    function: Box::new(f(*function)?),
+                    partition_by: try_map_vec(partition_by, f)?,
+                    order_keys: try_map_vec(order_keys, f)?,
+                    order_ascending,
+                    order_nulls,
+                    frame,
+                }
+            }
         })
     }
 
@@ -801,6 +861,8 @@ pub fn combine_or(terms: Vec<Expr>) -> Option<Expr> {
 fn combine(terms: Vec<Expr>, op: BinaryOpType) -> Option<Expr> {
     let mut iter = terms.into_iter();
     let first = iter.next()?;
+    // Fresh node: each fold step builds a new BinaryOp joining the accumulator and
+    // the next term - there is no base to copy. Field list (op/left/right) complete.
     Some(iter.fold(first, |acc, term| Expr::BinaryOp {
         op,
         left: Box::new(acc),
@@ -813,6 +875,8 @@ pub fn and_expressions(left: Option<Expr>, right: Option<Expr>) -> Option<Expr> 
     match (left, right) {
         (None, right) => right,
         (left, None) => left,
+        // Fresh node: a new AND joining the two present operands - there is no base
+        // to copy. Field list (op/left/right) is the complete BinaryOp variant.
         (Some(left), Some(right)) => Some(Expr::BinaryOp {
             op: BinaryOpType::And,
             left: Box::new(left),
