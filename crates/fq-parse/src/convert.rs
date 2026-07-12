@@ -446,6 +446,85 @@ impl<'a> Converter<'a> {
         Ok(Some(converted))
     }
 
+    /// Expand one ROLLUP/CUBE/GROUPING SETS construct into the aggregate's
+    /// explicit `grouping_sets`, with any leading normal GROUP BY keys prepended
+    /// to every set. The returned `group_by` is the distinct union of keys
+    /// across the sets (order-preserving): every pass downstream that reasons
+    /// about grouping columns reads it, while the engine's aggregate fragment
+    /// renders the sets themselves as `GROUPING SETS (...)`.
+    fn expand_grouping(
+        &self,
+        normal_keys: &[Expr],
+        construct: &Expression,
+    ) -> Result<(Vec<Expr>, GroupingSets), ParseError> {
+        // Polyglot's Postgres parser emits ROLLUP/GROUPING SETS as dedicated
+        // variants but CUBE (and sometimes ROLLUP) as a generic Function call
+        // named after the construct - both shapes convert here.
+        let expanded = match construct {
+            Expression::Rollup(rollup) => rollup_sets(&self.expr_list(&rollup.expressions)?),
+            Expression::Cube(cube) => cube_sets(&self.expr_list(&cube.expressions)?),
+            Expression::GroupingSets(sets) => self.explicit_grouping_sets(&sets.expressions)?,
+            Expression::Function(function) if function.name.eq_ignore_ascii_case("rollup") => {
+                rollup_sets(&self.expr_list(&function.args)?)
+            }
+            Expression::Function(function) if function.name.eq_ignore_ascii_case("cube") => {
+                cube_sets(&self.expr_list(&function.args)?)
+            }
+            Expression::Function(function)
+                if function.name.eq_ignore_ascii_case("grouping sets") =>
+            {
+                self.explicit_grouping_sets(&function.args)?
+            }
+            other => {
+                return Err(ParseError::Unsupported(format!(
+                    "grouping construct {}",
+                    other.variant_name()
+                )))
+            }
+        };
+        let mut grouping_sets = Vec::with_capacity(expanded.len());
+        for set in expanded {
+            let mut keys = normal_keys.to_vec();
+            keys.extend(set);
+            grouping_sets.push(keys);
+        }
+        let mut group_by = Vec::new();
+        for set in &grouping_sets {
+            for key in set {
+                if !group_by.contains(key) {
+                    group_by.push(key.clone());
+                }
+            }
+        }
+        Ok((group_by, Some(grouping_sets)))
+    }
+
+    /// Convert a slice of polyglot expressions (grouping-construct keys).
+    fn expr_list(&self, keys: &[Expression]) -> Result<Vec<Expr>, ParseError> {
+        let mut converted = Vec::with_capacity(keys.len());
+        for key in keys {
+            converted.push(self.expr(key)?);
+        }
+        Ok(converted)
+    }
+
+    /// Convert explicit `GROUPING SETS ((a, b), (a), ())` elements: a tuple
+    /// contributes its members, a parenthesized key one member, a bare key one.
+    fn explicit_grouping_sets(
+        &self,
+        elements: &[Expression],
+    ) -> Result<Vec<Vec<Expr>>, ParseError> {
+        let mut sets = Vec::with_capacity(elements.len());
+        for element in elements {
+            match element {
+                Expression::Tuple(tuple) => sets.push(self.expr_list(&tuple.expressions)?),
+                Expression::Paren(paren) => sets.push(vec![self.expr(&paren.this)?]),
+                other => sets.push(vec![self.expr(other)?]),
+            }
+        }
+        Ok(sets)
+    }
+
     /// Build the `Aggregate` node (+ a HAVING `Filter` when present). The
     /// aggregate's `aggregates` list is the whole SELECT list, positionally
     /// aligned with `output_names`.
@@ -456,13 +535,32 @@ impl<'a> Converter<'a> {
         expressions: Vec<Expr>,
         names: Vec<String>,
     ) -> Result<LogicalPlan, ParseError> {
-        let mut group_by = Vec::new();
+        let mut normal_keys = Vec::new();
+        let mut constructs = Vec::new();
         if let Some(clause) = &select.group_by {
+            if clause.totals {
+                return Err(ParseError::Unsupported(
+                    "GROUP BY ... WITH TOTALS".to_string(),
+                ));
+            }
             for key in &clause.expressions {
-                reject_window_in_clause(key, "GROUP BY")?;
-                group_by.push(self.expr(key)?);
+                if is_grouping_construct(key) {
+                    constructs.push(key);
+                } else {
+                    reject_window_in_clause(key, "GROUP BY")?;
+                    normal_keys.push(self.expr(key)?);
+                }
             }
         }
+        if constructs.len() > 1 {
+            return Err(ParseError::Unsupported(
+                "combining multiple ROLLUP/CUBE/GROUPING SETS".to_string(),
+            ));
+        }
+        let (group_by, grouping_sets) = match constructs.pop() {
+            Some(construct) => self.expand_grouping(&normal_keys, construct)?,
+            None => (normal_keys, None),
+        };
         // Fresh aggregate realizing GROUP BY + the aggregate SELECT list, built from
         // the parsed clauses - no base to copy from. Field list (input/group_by/
         // aggregates/output_names/grouping_sets) is the complete Aggregate struct.
@@ -471,7 +569,7 @@ impl<'a> Converter<'a> {
             group_by,
             aggregates: expressions,
             output_names: names,
-            grouping_sets: None,
+            grouping_sets,
         });
         let Some(having) = &select.having else {
             return Ok(aggregate);
@@ -871,4 +969,47 @@ fn limit_value(expr: &Expression) -> Result<u64, ParseError> {
     Err(ParseError::Unsupported(
         "non-integer LIMIT/OFFSET".to_string(),
     ))
+}
+
+/// An aggregate's expanded grouping sets (`None` for a plain GROUP BY).
+type GroupingSets = Option<Vec<Vec<Expr>>>;
+
+/// `ROLLUP(k1..kn)`: the n+1 prefixes `[k1..kn], ..., [k1], []`.
+fn rollup_sets(keys: &[Expr]) -> Vec<Vec<Expr>> {
+    let mut sets = Vec::with_capacity(keys.len() + 1);
+    for size in (0..=keys.len()).rev() {
+        sets.push(keys[..size].to_vec());
+    }
+    sets
+}
+
+/// `CUBE(k1..kn)`: every subset of the keys, in bitmask order.
+fn cube_sets(keys: &[Expr]) -> Vec<Vec<Expr>> {
+    let count = 1usize << keys.len();
+    let mut sets = Vec::with_capacity(count);
+    for mask in 0..count {
+        let mut subset = Vec::new();
+        for (index, key) in keys.iter().enumerate() {
+            if mask & (1 << index) != 0 {
+                subset.push(key.clone());
+            }
+        }
+        sets.push(subset);
+    }
+    sets
+}
+
+/// Whether a GROUP BY key is a ROLLUP/CUBE/GROUPING SETS construct - either the
+/// dedicated polyglot variant or the generic-Function spelling its Postgres
+/// parser emits for CUBE.
+fn is_grouping_construct(key: &Expression) -> bool {
+    match key {
+        Expression::Rollup(_) | Expression::Cube(_) | Expression::GroupingSets(_) => true,
+        Expression::Function(function) => {
+            function.name.eq_ignore_ascii_case("rollup")
+                || function.name.eq_ignore_ascii_case("cube")
+                || function.name.eq_ignore_ascii_case("grouping sets")
+        }
+        _ => false,
+    }
 }

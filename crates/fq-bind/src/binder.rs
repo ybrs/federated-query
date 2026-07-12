@@ -274,11 +274,27 @@ impl<'a> Binder<'a> {
         let group_by = self.with_scope(&input, |binder| {
             binder.bind_group_keys(&aggregate.group_by, &alias_map)
         })?;
+        let grouping_sets = match &aggregate.grouping_sets {
+            Some(sets) => {
+                // Every grouping-set key binds exactly like a GROUP BY key: the
+                // engine's aggregate fragment renders the sets, so an unbound
+                // (unqualified) key there would defeat column resolution.
+                let mut bound_sets = Vec::with_capacity(sets.len());
+                for set in sets {
+                    bound_sets.push(
+                        self.with_scope(&input, |binder| binder.bind_group_keys(set, &alias_map))?,
+                    );
+                }
+                Some(bound_sets)
+            }
+            None => None,
+        };
         // In-place on the owned node: overwrite only the rebound input/aggregates/
-        // group_by; `output_names` and `grouping_sets` are preserved untouched.
+        // group_by/grouping_sets; `output_names` is preserved untouched.
         aggregate.input = Box::new(input);
         aggregate.aggregates = aggregates;
         aggregate.group_by = group_by;
+        aggregate.grouping_sets = grouping_sets;
         Ok(LogicalPlan::Aggregate(aggregate))
     }
 

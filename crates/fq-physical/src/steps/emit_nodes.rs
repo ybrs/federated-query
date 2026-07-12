@@ -24,8 +24,9 @@ use super::cse::{emit_step_once, scan_share_key};
 use super::error::StepError;
 use super::expr_retag::{over_input, relation_names, two_sided};
 use super::render_sql::{
-    render_aggregate_sql, render_grouped_limit_sql, render_values_sql, render_window_sql,
-    GROUPED_LIMIT_INDEX_COL, MERGE_GROUPED_LIMIT_RELATION, MERGE_WINDOW_RELATION,
+    render_aggregate_sql, render_grouped_limit_sql, render_split_window_aggregate_sqls,
+    render_values_sql, render_window_sql, GROUPED_LIMIT_INDEX_COL, MERGE_GROUPED_LIMIT_RELATION,
+    MERGE_WINDOW_RELATION,
 };
 use super::scan_spec::{source_scan_spec, variant_name};
 use super::types::{
@@ -372,8 +373,13 @@ fn emit_aggregate<'p>(
     let aliases = node.input.column_aliases();
     if node.aggregates.iter().any(contains_window) {
         if node.aggregates.iter().any(contains_grouping) {
-            // GROUPING() inside a window needs the two-stage split (DataFusion gap).
-            return Err(StepError::WindowSplitUnsupported);
+            // GROUPING() inside a window cannot run fused (DataFusion planner gap):
+            // stage 1 materializes the window operands as aggregate outputs, stage 2
+            // runs the window over those columns. An unsplittable shape RAISES inside
+            // the renderer rather than mis-render as a single stage.
+            let (stage1_sql, stage2_sql) = render_split_window_aggregate_sqls(node, &aliases)?;
+            let grouped = raw_sql_step(ctx, stage1_sql, single_input(child));
+            return Ok(raw_sql_step(ctx, stage2_sql, single_input(grouped)));
         }
         let sql = render_aggregate_sql(node, &aliases)?;
         return Ok(raw_sql_step(ctx, sql, single_input(child)));

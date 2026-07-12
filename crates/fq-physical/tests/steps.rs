@@ -784,3 +784,239 @@ fn self_join_projection_follows_schema_order_not_sorted_keys() {
         other => panic!("not a column: {other:?}"),
     }
 }
+
+// --------------------------------------------------------------------------
+// hand-built window-over-GROUPING() aggregate: the two-stage split
+// --------------------------------------------------------------------------
+
+use fq_plan::expr::NullsOrder;
+use fq_plan::physical::PhysicalHashAggregate;
+
+/// A qualified, typed column reference.
+fn agg_col(table: &str, name: &str) -> Expr {
+    Expr::Column(ColumnRef {
+        table: Some(table.to_string()),
+        column: name.to_string(),
+        data_type: Some(DataType::BigInt),
+    })
+}
+
+/// An aggregate function call over one argument (`sum(arg)` and friends).
+fn agg_call(name: &str, arg: Expr) -> Expr {
+    Expr::FunctionCall {
+        function_name: name.to_string(),
+        args: vec![arg],
+        is_aggregate: true,
+        distinct: false,
+        within_group_key: None,
+        within_group_desc: false,
+    }
+}
+
+/// A `GROUPING(col)` call (an aggregate-scoped function, not an aggregate).
+fn grouping_call(table: &str, name: &str) -> Expr {
+    Expr::FunctionCall {
+        function_name: "grouping".to_string(),
+        args: vec![agg_col(table, name)],
+        is_aggregate: false,
+        distinct: false,
+        within_group_key: None,
+        within_group_desc: false,
+    }
+}
+
+/// A bare window function call (`rank()`), no arguments.
+fn window_fn(name: &str) -> Expr {
+    Expr::FunctionCall {
+        function_name: name.to_string(),
+        args: vec![],
+        is_aggregate: false,
+        distinct: false,
+        within_group_key: None,
+        within_group_desc: false,
+    }
+}
+
+/// A scan on `item` exposing the columns the q86-shaped aggregate references.
+fn item_scan() -> PhysicalPlan {
+    pscan(
+        "duck",
+        "main",
+        "item",
+        &["i_category", "i_class", "ext_price"],
+    )
+}
+
+/// The q86 shape: `rank() OVER (PARTITION BY grouping(i_category)+grouping(i_class)
+/// ORDER BY sum(ext_price) DESC)` over a ROLLUP(i_category, i_class), plus a plain
+/// `sum(ext_price)` output and a group-key passthrough.
+fn window_over_grouping_aggregate() -> PhysicalPlan {
+    let sum_ext = agg_call("sum", agg_col("item", "ext_price"));
+    let partition = Expr::BinaryOp {
+        op: BinaryOpType::Add,
+        left: Box::new(grouping_call("item", "i_category")),
+        right: Box::new(grouping_call("item", "i_class")),
+    };
+    let window = Expr::Window {
+        function: Box::new(window_fn("rank")),
+        partition_by: vec![partition],
+        order_keys: vec![sum_ext.clone()],
+        order_ascending: vec![false],
+        order_nulls: vec![Some(NullsOrder::Last)],
+        frame: None,
+    };
+    PhysicalPlan::HashAggregate(PhysicalHashAggregate {
+        input: Box::new(item_scan()),
+        group_by: vec![agg_col("item", "i_category"), agg_col("item", "i_class")],
+        aggregates: vec![sum_ext, window, agg_col("item", "i_category")],
+        output_names: vec![
+            "total".to_string(),
+            "rk".to_string(),
+            "i_category".to_string(),
+        ],
+        grouping_sets: Some(vec![
+            vec![agg_col("item", "i_category"), agg_col("item", "i_class")],
+            vec![agg_col("item", "i_category")],
+            vec![],
+        ]),
+        group_observation: None,
+    })
+}
+
+/// The raw-SQL strings of every `RawSql` fragment, in fragment-name (emission) order.
+fn raw_sql_fragments(built: &fq_physical::steps::BuiltSteps) -> Vec<String> {
+    let mut sqls = Vec::new();
+    for fragment in built.fragments.values() {
+        if let Fragment::RawSql { sql } = fragment {
+            sqls.push(sql.clone());
+        }
+    }
+    sqls
+}
+
+#[test]
+fn window_over_grouping_splits_into_two_stages() {
+    let plan = window_over_grouping_aggregate();
+    let built = build_steps(&plan).expect("build_steps");
+    let raws = raw_sql_fragments(&built);
+    assert_eq!(raws.len(), 2, "expected two raw-SQL fragments: {raws:?}");
+    let stage1 = raws[0].to_lowercase();
+    let stage2 = raws[1].to_lowercase();
+    // Stage 1 is the GROUP BY: it computes the grouping() operands as columns (a
+    // hidden `__w` output) and carries no window.
+    assert!(stage1.contains("group by"), "stage1: {}", raws[0]);
+    assert!(stage1.contains("grouping"), "stage1: {}", raws[0]);
+    assert!(stage1.contains("__w"), "stage1: {}", raws[0]);
+    assert!(
+        !stage1.contains("over"),
+        "stage1 carries a window: {}",
+        raws[0]
+    );
+    // Stage 2 runs the window over stage-1 columns: no GROUPING()/GROUP BY, the
+    // rank window reads the materialized `__w` partition columns.
+    assert!(stage2.contains("rank"), "stage2: {}", raws[1]);
+    assert!(stage2.contains("over"), "stage2: {}", raws[1]);
+    assert!(stage2.contains("__w"), "stage2: {}", raws[1]);
+    assert!(
+        !stage2.contains("grouping("),
+        "stage2 re-runs grouping: {}",
+        raws[1]
+    );
+    assert!(
+        !stage2.contains("group by"),
+        "stage2 re-groups: {}",
+        raws[1]
+    );
+}
+
+#[test]
+fn window_over_grouping_wires_stage2_over_stage1() {
+    let plan = window_over_grouping_aggregate();
+    let built = build_steps(&plan).expect("build_steps");
+    // The two merge steps chain: stage 1 reads the scan binding, stage 2 reads
+    // stage 1's binding under `in_0`, and the Return names stage 2's output.
+    let merges: Vec<(&String, &BTreeMap<String, String>, &String)> = built
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::Merge {
+                fragment,
+                inputs,
+                binding,
+            } => Some((fragment, inputs, binding)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(merges.len(), 2, "steps: {:?}", built.steps);
+    let (_stage1_fragment, _stage1_inputs, stage1_binding) = merges[0];
+    let (_stage2_fragment, stage2_inputs, stage2_binding) = merges[1];
+    assert_eq!(
+        stage2_inputs.get("in_0"),
+        Some(stage1_binding),
+        "stage 2 must read stage 1's output: {:?}",
+        built.steps
+    );
+    let returns_stage2 = built
+        .steps
+        .iter()
+        .any(|step| matches!(step, Step::Return { input } if input == stage2_binding));
+    assert!(
+        returns_stage2,
+        "Return must name stage 2: {:?}",
+        built.steps
+    );
+}
+
+#[test]
+fn plain_window_aggregate_stays_one_fragment() {
+    // A window OUTPUT with no GROUPING() runs fused as a single raw-SQL aggregate
+    // (no split) - pins that the split path does not touch the plain window case.
+    let running_sum = Expr::Window {
+        function: Box::new(agg_call("sum", agg_col("item", "ext_price"))),
+        partition_by: vec![],
+        order_keys: vec![agg_col("item", "i_category")],
+        order_ascending: vec![true],
+        order_nulls: vec![Some(NullsOrder::Last)],
+        frame: None,
+    };
+    let plan = PhysicalPlan::HashAggregate(PhysicalHashAggregate {
+        input: Box::new(item_scan()),
+        group_by: vec![agg_col("item", "i_category")],
+        aggregates: vec![running_sum, agg_col("item", "i_category")],
+        output_names: vec!["running".to_string(), "i_category".to_string()],
+        grouping_sets: None,
+        group_observation: None,
+    });
+    let built = build_steps(&plan).expect("build_steps");
+    let raws = raw_sql_fragments(&built);
+    assert_eq!(raws.len(), 1, "plain window must stay fused: {raws:?}");
+    assert!(raws[0].to_lowercase().contains("over"), "sql: {}", raws[0]);
+}
+
+#[test]
+fn window_function_that_is_an_aggregate_over_grouping_raises() {
+    // The split rewrites each operand to a stage-1 column; a window whose FUNCTION
+    // is itself an aggregate would become a bare `col OVER (...)`, which it cannot
+    // soundly express, so it RAISES rather than mis-render.
+    let window = Expr::Window {
+        function: Box::new(agg_call("sum", agg_col("item", "ext_price"))),
+        partition_by: vec![grouping_call("item", "i_category")],
+        order_keys: vec![],
+        order_ascending: vec![],
+        order_nulls: vec![],
+        frame: None,
+    };
+    let plan = PhysicalPlan::HashAggregate(PhysicalHashAggregate {
+        input: Box::new(item_scan()),
+        group_by: vec![agg_col("item", "i_category")],
+        aggregates: vec![window],
+        output_names: vec!["x".to_string()],
+        grouping_sets: None,
+        group_observation: None,
+    });
+    let error = build_steps(&plan).expect_err("an unsound split must raise");
+    assert!(
+        matches!(error, fq_physical::steps::StepError::WindowSplitUnsupported),
+        "expected WindowSplitUnsupported, got {error:?}"
+    );
+}

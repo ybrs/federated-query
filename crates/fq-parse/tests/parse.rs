@@ -914,3 +914,69 @@ fn set_operation_as_scalar_expression_raises() {
         "{result:?}"
     );
 }
+
+// --- ROLLUP / CUBE / GROUPING SETS expand into explicit grouping sets ---
+
+/// The Aggregate under a plan root (unwrapping Sort/Limit/Projection).
+fn find_aggregate(plan: &LogicalPlan) -> &fq_plan::logical::Aggregate {
+    match plan {
+        LogicalPlan::Aggregate(aggregate) => aggregate,
+        LogicalPlan::Sort(sort) => find_aggregate(&sort.input),
+        LogicalPlan::Limit(limit) => find_aggregate(&limit.input),
+        LogicalPlan::Projection(projection) => find_aggregate(&projection.input),
+        LogicalPlan::Filter(filter) => find_aggregate(&filter.input),
+        other => panic!("expected an Aggregate in the plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn rollup_expands_to_prefix_grouping_sets() {
+    // ROLLUP(a, b) = the prefixes [a, b], [a], [] - and group_by carries the
+    // distinct union so every pass that reasons about grouping columns sees them.
+    let plan = parse("SELECT a, b, count(*) FROM t GROUP BY ROLLUP (a, b)").unwrap();
+    let aggregate = find_aggregate(&plan);
+    let sets = aggregate.grouping_sets.as_ref().expect("grouping sets");
+    assert_eq!(sets.len(), 3);
+    assert_eq!(sets[0].len(), 2);
+    assert_eq!(sets[1].len(), 1);
+    assert_eq!(sets[2].len(), 0);
+    assert_eq!(aggregate.group_by.len(), 2);
+}
+
+#[test]
+fn leading_keys_prepend_to_every_rollup_set() {
+    // GROUP BY k, ROLLUP(a): k joins every expanded set.
+    let plan = parse("SELECT k, a, count(*) FROM t GROUP BY k, ROLLUP (a)").unwrap();
+    let aggregate = find_aggregate(&plan);
+    let sets = aggregate.grouping_sets.as_ref().expect("grouping sets");
+    assert_eq!(sets.len(), 2);
+    assert_eq!(sets[0].len(), 2);
+    assert_eq!(sets[1].len(), 1);
+}
+
+#[test]
+fn cube_expands_to_all_subsets() {
+    let plan = parse("SELECT a, b, count(*) FROM t GROUP BY CUBE (a, b)").unwrap();
+    let aggregate = find_aggregate(&plan);
+    let sets = aggregate.grouping_sets.as_ref().expect("grouping sets");
+    assert_eq!(sets.len(), 4);
+}
+
+#[test]
+fn explicit_grouping_sets_convert_each_element() {
+    let plan =
+        parse("SELECT a, b, count(*) FROM t GROUP BY GROUPING SETS ((a, b), (a), ())").unwrap();
+    let aggregate = find_aggregate(&plan);
+    let sets = aggregate.grouping_sets.as_ref().expect("grouping sets");
+    assert_eq!(sets.len(), 3);
+    assert_eq!(sets[0].len(), 2);
+    assert_eq!(sets[1].len(), 1);
+    assert_eq!(sets[2].len(), 0);
+}
+
+#[test]
+fn plain_group_by_keeps_no_grouping_sets() {
+    let plan = parse("SELECT a, count(*) FROM t GROUP BY a").unwrap();
+    let aggregate = find_aggregate(&plan);
+    assert!(aggregate.grouping_sets.is_none());
+}

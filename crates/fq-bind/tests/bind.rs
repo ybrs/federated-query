@@ -637,3 +637,36 @@ fn order_by_aggregate_over_having_keeps_the_filter() {
         sort.input
     );
 }
+
+#[test]
+fn grouping_set_keys_bind_like_group_by_keys() {
+    // Every key inside a grouping set carries its qualifier and type after
+    // binding, exactly like a plain GROUP BY key.
+    fn find_aggregate(plan: &LogicalPlan) -> &fq_plan::logical::Aggregate {
+        match plan {
+            LogicalPlan::Aggregate(aggregate) => aggregate,
+            other => {
+                let child = other
+                    .children()
+                    .into_iter()
+                    .next()
+                    .expect("no aggregate found");
+                find_aggregate(child)
+            }
+        }
+    }
+    let plan =
+        bind_sql("SELECT user_id, count(*) AS c FROM pg.public.orders GROUP BY ROLLUP (user_id)")
+            .expect("bind");
+    let aggregate = find_aggregate(&plan);
+    let sets = aggregate.grouping_sets.as_ref().expect("grouping sets");
+    for set in sets {
+        for key in set {
+            let Expr::Column(column) = key else {
+                panic!("grouping key must be a column, got {key:?}");
+            };
+            assert!(column.table.is_some(), "unbound grouping-set key");
+            assert!(column.data_type.is_some(), "untyped grouping-set key");
+        }
+    }
+}

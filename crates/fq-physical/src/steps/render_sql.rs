@@ -8,17 +8,18 @@
 //! `datasource_kind`); the merge raw-SQL strings render to `DuckDb` (the merge
 //! engine's dialect, matching the Python `dialect="duckdb"`).
 
+use fq_common::DataType;
 use fq_emit::clauses::{
     assemble_select, group_by, order_by, select_list, set_op_keyword, SelectPieces,
 };
 use fq_emit::resolver::{AliasMap, MergeResolver};
 use fq_emit::{quote_ident, render_expr, to_source_sql, Dialect, SourceResolver};
-use fq_plan::expr::{aggregate_output_map, split_where_having};
+use fq_plan::expr::{aggregate_output_map, contains_window, split_where_having};
 use fq_plan::physical::{
     ColumnAliasMap, DatasourceKind, PhysicalGroupedLimit, PhysicalHashAggregate, PhysicalPlan,
     PhysicalRemoteSetOp, PhysicalScan, PhysicalWindow,
 };
-use fq_plan::Expr;
+use fq_plan::{ColumnRef, Expr};
 
 use super::error::StepError;
 
@@ -251,13 +252,219 @@ pub fn render_aggregate_sql(
     node: &PhysicalHashAggregate,
     aliases: &ColumnAliasMap,
 ) -> Result<String, StepError> {
+    render_grouped_select(
+        &node.aggregates,
+        &node.output_names,
+        &node.group_by,
+        node.grouping_sets.as_deref(),
+        aliases,
+    )
+}
+
+/// Render `SELECT <exprs> AS <names> FROM in_0 [GROUP BY <keys>]` for the merge
+/// engine over the given outputs and grouping. Both the single-stage aggregate SQL
+/// and a two-stage split's stage 1 compose it. Ports `_render_aggregate_sql`.
+fn render_grouped_select(
+    exprs: &[Expr],
+    names: &[String],
+    keys: &[Expr],
+    grouping_sets: Option<&[Vec<Expr>]>,
+    aliases: &ColumnAliasMap,
+) -> Result<String, StepError> {
     let resolver = merge_resolver(aliases);
-    let items = select_list(&node.aggregates, &node.output_names, &resolver)?;
+    let items = select_list(exprs, names, &resolver)?;
     let mut sql = format!("SELECT {items} FROM {MERGE_AGGREGATE_RELATION}");
-    if let Some(group) = group_by(&node.group_by, node.grouping_sets.as_deref(), &resolver)? {
+    if let Some(group) = group_by(keys, grouping_sets, &resolver)? {
         sql = format!("{sql} GROUP BY {group}");
     }
     Ok(to_source_sql(&sql, Dialect::DuckDb)?)
+}
+
+/// The two-stage SQL for a window over a GROUPING() aggregate (the DataFusion
+/// planner cannot run GROUPING() inside a window). Stage 1 is the GROUP BY whose
+/// outputs are the non-window outputs plus every window operand (grouping()/
+/// aggregate calls and key columns) materialized under a hidden name; stage 2 is
+/// the window SELECT over stage 1's result, each operand replaced by its stage-1
+/// output column and presenting exactly the declared output names. Ports
+/// `PhysicalHashAggregate.split_window_aggregate_sqls`.
+///
+/// The split rewrites each window operand to a plain stage-1 column - sound only
+/// while every window's FUNCTION is itself a window function (rank, lead, ...). A
+/// window whose function is an aggregate/column would be swallowed into a bare
+/// `col OVER (...)`, so such a shape RAISES rather than mis-render.
+pub fn render_split_window_aggregate_sqls(
+    node: &PhysicalHashAggregate,
+    aliases: &ColumnAliasMap,
+) -> Result<(String, String), StepError> {
+    if !node.aggregates.iter().all(window_functions_are_sound) {
+        return Err(StepError::WindowSplitUnsupported);
+    }
+    let mut stage1_exprs: Vec<Expr> = Vec::new();
+    let mut stage1_names: Vec<String> = Vec::new();
+    for (expr, name) in node.aggregates.iter().zip(&node.output_names) {
+        if !contains_window(expr) {
+            stage1_exprs.push(expr.clone());
+            stage1_names.push(name.clone());
+        }
+    }
+    let mut stage2_items: Vec<Expr> = Vec::with_capacity(node.aggregates.len());
+    for (expr, name) in node.aggregates.iter().zip(&node.output_names) {
+        stage2_items.push(stage2_item(
+            expr,
+            name,
+            &mut stage1_exprs,
+            &mut stage1_names,
+        ));
+    }
+    let stage1_sql = render_grouped_select(
+        &stage1_exprs,
+        &stage1_names,
+        &node.group_by,
+        node.grouping_sets.as_deref(),
+        aliases,
+    )?;
+    let stage2_sql = render_stage2_window(&stage2_items, &stage1_names, &node.output_names)?;
+    Ok((stage1_sql, stage2_sql))
+}
+
+/// Whether every window inside `expr` has a FUNCTION the two-stage split can carry:
+/// a real window function (not an aggregate/column the operand rewrite would replace
+/// with a bare column, yielding invalid `col OVER (...)`).
+fn window_functions_are_sound(expr: &Expr) -> bool {
+    if let Expr::Window { function, .. } = expr {
+        if is_stage1_operand(function) {
+            return false;
+        }
+    }
+    expr.children()
+        .iter()
+        .all(|child| window_functions_are_sound(child))
+}
+
+/// One stage-2 SELECT item: a pass-through of an already-aggregated output by name,
+/// or the window expression rewritten to read stage-1 output columns. Ports
+/// `_stage2_item`.
+fn stage2_item(expr: &Expr, name: &str, exprs: &mut Vec<Expr>, names: &mut Vec<String>) -> Expr {
+    if !contains_window(expr) {
+        // The stage-1 output passes through stage 2 unchanged, referenced by name.
+        return merge_output_ref(name.to_string(), None);
+    }
+    materialize_window_operands(expr.clone(), exprs, names)
+}
+
+/// Rewrite a window-bearing expression to read stage-1 output columns: a window is
+/// rebuilt so its operands live in stage 1 (see `rebuild_window`); any other node
+/// whose leaf is a stage-1 operand becomes a reference to the stage-1 output
+/// computing it (appended as a hidden output when none does yet). Ports
+/// `_materialize_window_operands`.
+fn materialize_window_operands(expr: Expr, exprs: &mut Vec<Expr>, names: &mut Vec<String>) -> Expr {
+    if let Expr::Window { .. } = &expr {
+        return rebuild_window(expr, exprs, names);
+    }
+    if is_stage1_operand(&expr) {
+        return stage1_output_ref(&expr, exprs, names);
+    }
+    expr.map_children(&mut |child| materialize_window_operands(child, exprs, names))
+}
+
+/// Rebuild a window over stage-1 columns: the function's leaf operands become
+/// stage-1 column refs, while each PARTITION BY / ORDER BY expression is
+/// materialized WHOLE as one stage-1 column so the window partitions and orders by
+/// plain columns. A computed PARTITION BY expression (`grouping(a)+grouping(b)`) is
+/// a group-level value a stage-1 column carries exactly, and the merge engine
+/// requires a plain ordered column there, rejecting the inline expression.
+fn rebuild_window(window: Expr, exprs: &mut Vec<Expr>, names: &mut Vec<String>) -> Expr {
+    let Expr::Window {
+        function,
+        partition_by,
+        order_keys,
+        order_ascending,
+        order_nulls,
+        frame,
+    } = window
+    else {
+        return window;
+    };
+    let mut new_partition = Vec::with_capacity(partition_by.len());
+    for item in partition_by {
+        new_partition.push(stage1_output_ref(&item, exprs, names));
+    }
+    let mut new_order = Vec::with_capacity(order_keys.len());
+    for key in order_keys {
+        new_order.push(stage1_output_ref(&key, exprs, names));
+    }
+    // Variant rebuild: the pattern moved every field out of `window`, so no base
+    // remains for `..`/update!; the compiler forces all fields listed (loud). The
+    // function keeps leaf materialization; partition/order become stage-1 columns.
+    Expr::Window {
+        function: Box::new(materialize_window_operands(*function, exprs, names)),
+        partition_by: new_partition,
+        order_keys: new_order,
+        order_ascending,
+        order_nulls,
+        frame,
+    }
+}
+
+/// A leaf stage 1 must compute: a column, an aggregate call, or GROUPING() (an
+/// aggregate-scoped function the window stage cannot run). Ports `_is_stage1_operand`.
+fn is_stage1_operand(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column(_) => true,
+        Expr::FunctionCall {
+            function_name,
+            is_aggregate,
+            ..
+        } => *is_aggregate || function_name.eq_ignore_ascii_case("grouping"),
+        _ => false,
+    }
+}
+
+/// The stage-1 output column computing `expr`, appending a hidden output (`__w<n>`)
+/// when no existing output matches structurally. Ports `_stage1_output_ref`.
+fn stage1_output_ref(expr: &Expr, exprs: &mut Vec<Expr>, names: &mut Vec<String>) -> Expr {
+    for (index, existing) in exprs.iter().enumerate() {
+        if existing == expr {
+            return merge_output_ref(names[index].clone(), Some(expr.get_type()));
+        }
+    }
+    let name = format!("__w{}", names.len());
+    exprs.push(expr.clone());
+    names.push(name.clone());
+    merge_output_ref(name, Some(expr.get_type()))
+}
+
+/// Render the stage-2 window SELECT over the stage-1 relation: a resolver mapping
+/// each stage-1 output name to itself, the window items aliased to the declared
+/// output names. Ports `_stage2_sql`.
+fn render_stage2_window(
+    items: &[Expr],
+    stage1_names: &[String],
+    output_names: &[String],
+) -> Result<String, StepError> {
+    let mut aliases = ColumnAliasMap::new();
+    for name in stage1_names {
+        aliases.insert((None, name.clone()), name.clone());
+    }
+    let resolver = merge_resolver(&aliases);
+    let select = select_list(items, output_names, &resolver)?;
+    Ok(to_source_sql(
+        &format!("SELECT {select} FROM {MERGE_AGGREGATE_RELATION}"),
+        Dialect::DuckDb,
+    )?)
+}
+
+/// A bare reference to a merge-relation output column by name (`table = None`) - the
+/// form a two-stage window's stage-2 items and its materialized operands use; the
+/// stage-2 resolver maps `(None, name)` to the physical column.
+fn merge_output_ref(name: String, data_type: Option<DataType>) -> Expr {
+    // Fresh ColumnRef for a merge output column: there is no source ColumnRef to
+    // copy from, so every field is listed (unqualified name, carried type).
+    Expr::Column(ColumnRef {
+        table: None,
+        column: name,
+        data_type,
+    })
 }
 
 /// Render the grouped-limit node SQL (before the engine's `WITH` wrapper): keep
