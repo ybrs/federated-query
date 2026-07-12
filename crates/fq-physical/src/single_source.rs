@@ -735,6 +735,10 @@ impl SingleSourcePushdown {
         let mut column_alias_map = ctx.column_aliases.clone();
         expose_computed_outputs(&mut column_alias_map, &ctx.output_names);
         let sql = render(ctx)?;
+        // Fresh PhysicalRemoteQuery built from the rendered same-source SQL and the
+        // push context: nothing of this type to copy from, so every field is listed
+        // (the estimated_rows / output_estimated_rows / column_ndv stamps are
+        // deliberate, seeded_schema / group_observation start None).
         Ok(Some(PhysicalRemoteQuery {
             datasource,
             sql,

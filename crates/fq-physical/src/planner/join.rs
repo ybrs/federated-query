@@ -158,6 +158,9 @@ fn build_hash_join(
 ) -> Result<PhysicalPlan, PhysicalError> {
     let (left_keys, right_keys) = orient_join_keys(left_keys, right_keys, join)?;
     let build_side = choose_build_side(join.join_type, &left, &right);
+    // Fresh PhysicalHashJoin built from the oriented equi-keys and the two lowered
+    // sides: no PhysicalHashJoin base to copy, so every field is listed (the join's
+    // estimated_rows / estimate_defaults stamps are carried through deliberately).
     let mut hash_join = PhysicalHashJoin {
         left: Box::new(left),
         right: Box::new(right),
@@ -176,6 +179,9 @@ fn build_hash_join(
 /// ORDER BY. Ports `_try_plan_remote_join` (candidacy is checked by the caller).
 fn build_remote_join(join: &Join, left: PhysicalPlan, right: PhysicalPlan) -> PhysicalPlan {
     let (order_by_keys, order_by_ascending, order_by_nulls) = pushed_order_by(&left, &right);
+    // Fresh PhysicalRemoteJoin built from the logical Join and the two lowered sides:
+    // no PhysicalRemoteJoin base to copy, so every field is listed (group_by /
+    // aggregates start None; a later aggregate fold sets them in place).
     PhysicalPlan::RemoteJoin(Box::new(PhysicalRemoteJoin {
         left: Box::new(left),
         right: Box::new(right),
@@ -224,6 +230,9 @@ fn pushed_order_by(left: &PhysicalPlan, right: &PhysicalPlan) -> PushedOrderBy {
 /// Fall back to a nested-loop join (no equi-keys, or no join condition). Ports
 /// `_plan_nested_loop`.
 fn build_nested_loop(join: &Join, left: PhysicalPlan, right: PhysicalPlan) -> PhysicalPlan {
+    // Fresh PhysicalNestedLoopJoin built from the logical Join and the two lowered
+    // sides: no base to copy, so every field is listed (the join's estimated_rows /
+    // estimate_defaults stamps are carried through deliberately).
     PhysicalPlan::NestedLoopJoin(PhysicalNestedLoopJoin {
         left: Box::new(left),
         right: Box::new(right),

@@ -344,6 +344,9 @@ fn replace(node: &LogicalPlan, mapping: &HashMap<ScanId, Scan>) -> LogicalPlan {
     match node {
         LogicalPlan::Scan(scan) => match mapping.get(&scan_id(scan)) {
             Some(temp) => LogicalPlan::Scan(Box::new(temp.clone())),
+            // Base case of a borrowed-tree rewrite (&LogicalPlan -> LogicalPlan): an
+            // unmapped scan leaf is preserved by copying it into the new tree. The
+            // original tree is walked by reference so scan addresses match the keys.
             None => node.clone(),
         },
         LogicalPlan::Filter(n) => LogicalPlan::Filter(fq_plan::logical::Filter {
@@ -413,6 +416,9 @@ fn wrap_shipments(
         // temp scan).
         let body =
             planner.plan_without_shipping(&LogicalPlan::Scan(Box::new(foreign_scan.clone())))?;
+        // Fresh PhysicalShipment wrapping the island: it has no prior node to copy
+        // from (it is synthesized here to materialize a foreign scan as a temp table),
+        // so all four fields are listed.
         child = PhysicalPlan::Shipment(PhysicalShipment {
             table: name.clone(),
             datasource: local.to_string(),
@@ -534,6 +540,8 @@ fn island_group_observation(node: &LogicalPlan) -> Option<GroupObservation> {
         return None;
     }
     let columns = group_column_names(&agg.group_by)?;
+    // Fresh GroupObservation built from the pre-ship aggregate's subject and group
+    // columns: nothing to copy from, so both fields are listed.
     Some(GroupObservation {
         subject: group_subject(&agg.input),
         columns,

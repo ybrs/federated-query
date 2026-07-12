@@ -230,6 +230,9 @@ impl PhysicalPlanner {
         };
         let datasource_kind = datasource_kind_of(datasource.render_dialect());
         let estimated_rows = self.scan_estimated_rows(scan)?;
+        // Fresh PhysicalScan lowered from the logical Scan: a type change with no
+        // PhysicalScan base to copy from, so every physical field is listed. The
+        // estimate stamps (estimated_rows, column_ndv) are carried deliberately.
         Ok(PhysicalPlan::Scan(Box::new(PhysicalScan {
             datasource: scan.datasource.clone(),
             schema_name: scan.schema_name.clone(),
@@ -275,6 +278,8 @@ impl PhysicalPlanner {
     /// Plan a filter node.
     fn plan_filter(&mut self, filter: &Filter) -> Result<PhysicalPlan, PhysicalError> {
         let input = self.plan_node(&filter.input)?;
+        // Fresh PhysicalFilter lowered from the logical Filter: a type change with no
+        // PhysicalFilter base to copy, so both fields are listed.
         Ok(PhysicalPlan::Filter(PhysicalFilter {
             input: Box::new(input),
             predicate: filter.predicate.clone(),
@@ -284,6 +289,8 @@ impl PhysicalPlanner {
     /// Plan an explain node.
     fn plan_explain(&mut self, explain: &Explain) -> Result<PhysicalPlan, PhysicalError> {
         let child = self.plan_node(&explain.input)?;
+        // Fresh PhysicalExplain lowered from the logical Explain: a type change with no
+        // PhysicalExplain base to copy, so both fields are listed.
         Ok(PhysicalPlan::Explain(PhysicalExplain {
             child: Box::new(child),
             format: explain.format,
@@ -293,6 +300,8 @@ impl PhysicalPlanner {
     /// Plan a Values node: emit the literal row tuples directly as an in-memory
     /// relation with the given output names. Pure - no child to plan.
     fn plan_values(values: &Values) -> PhysicalPlan {
+        // Fresh PhysicalValues lowered from the logical Values: a type change with no
+        // PhysicalValues base to copy, so both fields are listed.
         PhysicalPlan::Values(PhysicalValues {
             rows: values.rows.clone(),
             output_names: values.output_names.clone(),
@@ -306,6 +315,8 @@ impl PhysicalPlanner {
         subquery: &SubqueryScan,
     ) -> Result<PhysicalPlan, PhysicalError> {
         let input = self.plan_node(&subquery.input)?;
+        // Fresh PhysicalAliasedRelation lowered from the logical SubqueryScan: a type
+        // change with no PhysicalAliasedRelation base to copy, so both fields are listed.
         Ok(PhysicalPlan::AliasedRelation(PhysicalAliasedRelation {
             input: Box::new(input),
             alias: subquery.alias.clone(),
@@ -318,6 +329,8 @@ impl PhysicalPlanner {
         for child in &union.inputs {
             inputs.push(self.plan_node(child)?);
         }
+        // Fresh PhysicalUnion lowered from the logical Union: a type change with no
+        // PhysicalUnion base to copy, so both fields are listed.
         Ok(PhysicalPlan::Union(PhysicalUnion {
             inputs,
             distinct: union.distinct,
@@ -330,6 +343,8 @@ impl PhysicalPlanner {
         guard: &SingleRowGuard,
     ) -> Result<PhysicalPlan, PhysicalError> {
         let input = self.plan_node(&guard.input)?;
+        // Fresh PhysicalSingleRowGuard lowered from the logical SingleRowGuard: a type
+        // change with no PhysicalSingleRowGuard base to copy, so both fields are listed.
         Ok(PhysicalPlan::SingleRowGuard(PhysicalSingleRowGuard {
             input: Box::new(input),
             keys: guard.keys.clone(),
@@ -342,6 +357,8 @@ impl PhysicalPlanner {
         grouped: &GroupedLimit,
     ) -> Result<PhysicalPlan, PhysicalError> {
         let input = self.plan_node(&grouped.input)?;
+        // Fresh PhysicalGroupedLimit lowered from the logical GroupedLimit: a type
+        // change with no PhysicalGroupedLimit base to copy, so every field is listed.
         Ok(PhysicalPlan::GroupedLimit(PhysicalGroupedLimit {
             input: Box::new(input),
             keys: grouped.keys.clone(),
@@ -361,6 +378,8 @@ impl PhysicalPlanner {
         let mut input = self.plan_node(&projection.input)?;
         if projection_has_window(projection) {
             // DISTINCT over a window is rejected at parse, so no distinct handling.
+            // Fresh PhysicalWindow lowered from the logical Projection: a type change
+            // with no PhysicalWindow base to copy, so every field is listed.
             return Ok(PhysicalPlan::Window(PhysicalWindow {
                 input: Box::new(input),
                 expressions: projection.expressions.clone(),
@@ -370,6 +389,8 @@ impl PhysicalPlanner {
         if projection.distinct {
             propagate_distinct(&mut input);
         }
+        // Fresh PhysicalProjection lowered from the logical Projection: a type change
+        // with no PhysicalProjection base to copy, so every field is listed.
         Ok(PhysicalPlan::Projection(PhysicalProjection {
             input: Box::new(input),
             expressions: projection.expressions.clone(),
@@ -392,6 +413,8 @@ impl PhysicalPlanner {
             remote.offset = limit.offset;
             return Ok(PhysicalPlan::RemoteSetOp(remote));
         }
+        // Fresh PhysicalLimit lowered from the logical Limit: a type change with no
+        // PhysicalLimit base to copy, so every field is listed.
         Ok(PhysicalPlan::Limit(PhysicalLimit {
             input: Box::new(input),
             limit: limit.limit,
@@ -422,6 +445,8 @@ impl PhysicalPlanner {
                 set_op.order_by_nulls.clone_from(&sort.nulls_order);
                 Ok(PhysicalPlan::RemoteSetOp(set_op))
             }
+            // Fresh PhysicalSort lowered from the logical Sort (the non-pushdown fall-
+            // through): a type change with no PhysicalSort base to copy, all fields listed.
             other => Ok(PhysicalPlan::Sort(PhysicalSort {
                 input: Box::new(other),
                 sort_keys: sort.sort_keys.clone(),
@@ -445,6 +470,9 @@ impl PhysicalPlanner {
             remote.output_names = Some(aggregate.output_names.clone());
             return Ok(PhysicalPlan::RemoteJoin(remote));
         }
+        // Fresh PhysicalHashAggregate lowered from the logical Aggregate: a type change
+        // with no PhysicalHashAggregate base to copy, so every field is listed (the
+        // group_observation provenance is stamped deliberately).
         Ok(PhysicalPlan::HashAggregate(PhysicalHashAggregate {
             input: Box::new(input),
             group_by: aggregate.group_by.clone(),
@@ -469,6 +497,8 @@ fn group_observation(aggregate: &Aggregate) -> Option<GroupObservation> {
         return None;
     }
     let columns = group_column_names(&aggregate.group_by)?;
+    // Fresh GroupObservation built from the aggregate's subplan signature and group
+    // columns: nothing to copy from, so both fields are listed.
     Some(GroupObservation {
         subject: subplan_signature(&aggregate.input),
         columns,

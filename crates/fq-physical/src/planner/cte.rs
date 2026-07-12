@@ -28,6 +28,8 @@ impl PhysicalPlanner {
     /// stale producer never leaks). Ports `_plan_cross_source_cte`.
     fn plan_cross_source_cte(&mut self, cte: &Cte) -> Result<PhysicalPlan, PhysicalError> {
         let body = self.plan_node(&cte.cte_plan)?;
+        // Fresh PhysicalCte producer built from the logical Cte and its lowered body:
+        // a type change with no PhysicalCte base to copy, so every field is listed.
         let producer = PhysicalCte {
             name: cte.name.clone(),
             body: Box::new(body),
@@ -54,6 +56,9 @@ impl PhysicalPlanner {
                 name: node.name.clone(),
             });
         };
+        // Fresh PhysicalCteScan resolving the reference to a scan over the shared
+        // producer: no PhysicalCteScan base to copy, so both fields are listed. The
+        // producer is cloned because it is materialized once and shared by every ref.
         Ok(PhysicalPlan::CteScan(PhysicalCteScan {
             producer: Box::new(PhysicalPlan::Cte(producer.clone())),
             alias: node.alias.clone(),
@@ -82,6 +87,8 @@ impl PhysicalPlanner {
                 name: cte.name.clone(),
             });
         };
+        // Fresh PhysicalCteMergeQuery built from the rendered WITH SQL and the
+        // materialized base inputs: nothing to copy from, so every field is listed.
         Ok(PhysicalPlan::CteMergeQuery(PhysicalCteMergeQuery {
             sql,
             inputs,

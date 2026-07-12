@@ -233,6 +233,9 @@ fn join_output_projection(
         } else {
             ("in_right", resolve_side(&right_aliases, &key)?)
         };
+        // Fresh steps `Projection` fragment item (its name collides with the fq-plan
+        // Projection node, so the linter flags it): built from a resolved side column
+        // and its output alias, nothing to copy from, both fields listed.
         project.push(Projection {
             expr: side_column(relation, &physical),
             alias: out_name,
@@ -274,6 +277,8 @@ fn resolve_side(
 
 /// A projection item selecting `relation`.`name`, aliased to `name`.
 fn side_column(relation: &str, name: &str) -> Expr {
+    // Fresh ColumnRef built from a relation tag and a physical column name (both plain
+    // strings): there is no source ColumnRef to copy from, so all fields are listed.
     Expr::Column(ColumnRef {
         table: Some(relation.to_string()),
         column: name.to_string(),
@@ -333,12 +338,16 @@ fn projection_items(
     for (expr, name) in expressions.iter().zip(names) {
         if is_star_column(expr) {
             for input_name in output_column_names(input) {
+                // Fresh steps `Projection` fragment item (name collides with the fq-plan
+                // Projection node): one star-expanded input column, both fields listed.
                 items.push(Projection {
                     expr: side_column("in_0", &input_name),
                     alias: input_name,
                 });
             }
         } else {
+            // Fresh steps `Projection` fragment item (name collides with the fq-plan
+            // Projection node): one output expression aliased to its name, both listed.
             items.push(Projection {
                 expr: over_input(expr, "in_0", aliases),
                 alias: name.clone(),
@@ -393,6 +402,9 @@ fn aggregate_fragment(node: &PhysicalHashAggregate, aliases: &ColumnAliasMap) ->
         .as_ref()
         .map(|sets| retag_sets(sets, aliases))
         .unwrap_or_default();
+    // Fresh steps `Fragment::Aggregate` IR variant (the `Aggregate` name collides with
+    // the fq-plan Aggregate node, so the linter flags it): built from the retagged
+    // select / group-by / grouping-set lists, nothing to copy from, all fields listed.
     Fragment::Aggregate {
         select,
         group_by,
@@ -480,6 +492,8 @@ fn is_star_arg(args: &[Expr]) -> bool {
 fn emit_filter<'p>(node: &'p PhysicalFilter, ctx: &mut Ctx<'p>) -> Result<String, StepError> {
     let child = emit(&node.input, ctx)?;
     let predicate = over_input(&node.predicate, "in_0", &node.input.column_aliases());
+    // Fresh steps `Fragment::Filter` IR variant (the `Filter` name collides with the
+    // fq-plan Filter node): built from the retagged predicate, its one field listed.
     let fragment = Fragment::Filter { predicate };
     let name = ctx.names.fragment();
     ctx.fragments.insert(name.clone(), fragment);
@@ -498,6 +512,8 @@ fn emit_single_row_guard<'p>(
     for key in &node.keys {
         keys.push(over_input(key, "in_0", &aliases));
     }
+    // Fresh steps `Fragment::SingleRowGuard` IR variant (the `SingleRowGuard` name
+    // collides with the fq-plan node): built from the retagged keys, its field listed.
     let fragment = Fragment::SingleRowGuard { keys };
     let name = ctx.names.fragment();
     ctx.fragments.insert(name.clone(), fragment);
@@ -517,6 +533,8 @@ fn emit_sort<'p>(node: &'p PhysicalSort, ctx: &mut Ctx<'p>) -> Result<String, St
             nulls_first: nulls_first(node.nulls_order.as_deref(), index, ascending),
         });
     }
+    // Fresh steps `Fragment::Sort` IR variant (the `Sort` name collides with the
+    // fq-plan Sort node): built from the retagged sort keys, its one field listed.
     let fragment = Fragment::Sort { keys };
     let name = ctx.names.fragment();
     ctx.fragments.insert(name.clone(), fragment);
@@ -542,6 +560,8 @@ fn nulls_first(nulls_order: Option<&[Option<NullsOrder>]>, index: usize, ascendi
 /// A LIMIT/OFFSET, as a `limit` fragment. Ports `_emit_limit`.
 fn emit_limit<'p>(node: &'p PhysicalLimit, ctx: &mut Ctx<'p>) -> Result<String, StepError> {
     let child = emit(&node.input, ctx)?;
+    // Fresh steps `Fragment::Limit` IR variant (the `Limit` name collides with the
+    // fq-plan Limit node): built from the node's limit/offset, both fields listed.
     let fragment = Fragment::Limit {
         limit: node.limit,
         offset: node.offset,
@@ -597,6 +617,8 @@ fn relabel_columns(
 ) -> String {
     let mut project = Vec::new();
     for (source, target) in output_column_names(&cte.body).iter().zip(names) {
+        // Fresh steps `Projection` fragment item (name collides with the fq-plan
+        // Projection node): one column relabelled to its declared CTE name, both listed.
         project.push(Projection {
             expr: side_column("in_0", source),
             alias: target.clone(),

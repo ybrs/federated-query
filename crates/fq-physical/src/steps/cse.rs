@@ -9,7 +9,7 @@
 
 use fq_emit::render_canonical;
 use fq_plan::physical::PhysicalScan;
-use fq_plan::{ColumnRef, Expr, PhysicalPlan};
+use fq_plan::{Expr, PhysicalPlan};
 
 use super::render_sql::render_scan_sql;
 use super::scan_spec::injectable_scan;
@@ -161,12 +161,11 @@ fn canonical_scan_sql(scan: &PhysicalScan) -> Result<String, super::error::StepE
 /// Requalify every column reference of an expression to `table`. Mirrors the
 /// Python `_replace_column_refs` remap, applied uniformly for the share key.
 fn requalify(expr: Expr, table: &str) -> Expr {
-    if let Expr::Column(col) = expr {
-        return Expr::Column(ColumnRef {
-            table: Some(table.to_string()),
-            column: col.column,
-            data_type: col.data_type,
-        });
+    if let Expr::Column(mut col) = expr {
+        // Own-and-mutate: only the qualifier changes; column and data_type are
+        // preserved by identity (never re-listed, so never reset).
+        col.table = Some(table.to_string());
+        return Expr::Column(col);
     }
     expr.map_children(&mut |child| requalify(child, table))
 }

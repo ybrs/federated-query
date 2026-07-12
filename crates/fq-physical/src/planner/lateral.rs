@@ -75,6 +75,9 @@ impl PhysicalPlanner {
 
         let left = self.plan_node(&node.left)?;
         let base_scan = self.plan_scan_node(base)?;
+        // Fresh PhysicalLateralJoin built from the logical LateralJoin, the rendered
+        // right-side SQL, and the lowered left/base sides: no base to copy, every
+        // field is listed.
         Ok(PhysicalPlan::LateralJoin(Box::new(PhysicalLateralJoin {
             left: Box::new(left),
             left_name: "lat_left".to_string(),

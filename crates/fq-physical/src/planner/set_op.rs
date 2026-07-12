@@ -49,6 +49,9 @@ impl PhysicalPlanner {
         // longer carries it, so validate against the catalog by name).
         self.catalog().get_datasource(left_source)?;
         let datasource = left_source.to_string();
+        // Fresh PhysicalRemoteSetOp built from the logical SetOperation and the two
+        // pushable branches: no base to copy, so every field is listed (order_by /
+        // limit / offset start empty; a parent Sort or Limit folds them in later).
         Some(PhysicalPlan::RemoteSetOp(Box::new(PhysicalRemoteSetOp {
             left: Box::new(left_branch),
             right: Box::new(right_branch),
@@ -78,6 +81,9 @@ fn branch_datasource(branch: &PhysicalPlan) -> &str {
 /// projection collapsed onto its scan) or None. Ports `_as_pushable_set_branch`.
 fn as_pushable_set_branch(node: &PhysicalPlan) -> Option<PhysicalPlan> {
     match node {
+        // The branch subtree is cloned so the ORIGINAL left/right survive for the
+        // local-set-op fallback when the OTHER branch turns out not to be pushable
+        // (plan_set_operation moves the owned originals into whichever node is built).
         PhysicalPlan::Scan(_) | PhysicalPlan::RemoteSetOp(_) => Some(node.clone()),
         PhysicalPlan::Projection(projection) => {
             collapse_projection_scan(projection).map(|scan| PhysicalPlan::Scan(Box::new(scan)))
@@ -127,11 +133,15 @@ fn plan_local_set_op(
     right: PhysicalPlan,
 ) -> PhysicalPlan {
     match set_op.kind {
+        // Fresh PhysicalUnion lowered from the logical SetOperation: no base to copy,
+        // so both fields are listed.
         SetOpKind::Union => PhysicalPlan::Union(PhysicalUnion {
             inputs: vec![left, right],
             distinct: set_op.distinct,
         }),
         SetOpKind::Intersect | SetOpKind::Except => {
+            // Fresh PhysicalSetOperation lowered from the logical SetOperation: no base
+            // to copy, so every field is listed.
             PhysicalPlan::SetOperation(PhysicalSetOperation {
                 left: Box::new(left),
                 right: Box::new(right),

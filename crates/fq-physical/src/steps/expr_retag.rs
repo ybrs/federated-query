@@ -16,10 +16,15 @@ use super::error::StepError;
 /// each `Expr::Column(c)` becomes a column tagged with the single input relation
 /// (`in_0`, `in_left`, ...) and named by its physical output column.
 pub fn over_input(expr: &Expr, input_name: &str, aliases: &ColumnAliasMap) -> Expr {
-    retag(expr.clone(), &mut |col| ColumnRef {
-        table: Some(input_name.to_string()),
-        column: physical_column_name(&col, aliases),
-        data_type: col.data_type,
+    retag(expr.clone(), &mut |mut col| {
+        // Own-and-mutate the ColumnRef: resolve the physical name from its ORIGINAL
+        // (table, column) key BEFORE retagging the qualifier, then overwrite only the
+        // two changed fields. data_type is preserved by identity (never re-listed, so
+        // never reset).
+        let column = physical_column_name(&col, aliases);
+        col.table = Some(input_name.to_string());
+        col.column = column;
+        col
     })
 }
 
@@ -40,7 +45,7 @@ pub fn two_sided(expr: &Expr, join: &PhysicalNestedLoopJoin) -> Result<Expr, Ste
 /// Retag one column of a nested-loop condition to its owning side, or RAISE when it
 /// resolves to neither. Ports `_two_sided_column_fn`'s dict index (KeyError on miss).
 fn two_sided_column(
-    col: ColumnRef,
+    mut col: ColumnRef,
     left_tables: &HashSet<Option<String>>,
     left_aliases: &ColumnAliasMap,
     right_aliases: &ColumnAliasMap,
@@ -57,11 +62,12 @@ fn two_sided_column(
             column: col.column,
         });
     };
-    Ok(ColumnRef {
-        table: Some(relation.to_string()),
-        column: physical,
-        data_type: col.data_type,
-    })
+    // Own-and-mutate the ColumnRef: overwrite only the qualifier and its resolved
+    // physical name; data_type is preserved by identity (never re-listed, so never
+    // reset).
+    col.table = Some(relation.to_string());
+    col.column = physical;
+    Ok(col)
 }
 
 /// A source-side expression whose columns keep their OWN qualifier: an identity
