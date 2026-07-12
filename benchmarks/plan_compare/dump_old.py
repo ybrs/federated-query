@@ -45,7 +45,14 @@ COORD_WORK = {
 
 
 def _suite_module(suite):
-    """Import the suite's run_federated helpers (build_fedq, _qualify, ...)."""
+    """Import the suite's run_federated helpers (build_fedq, _qualify, ...).
+
+    Only tpch has a Python-engine runner; tpcds does not, so old-engine dumps
+    exist only for tpch and a tpcds request exits loudly.
+    """
+    if suite == "tpcds":
+        raise SystemExit(
+            "no Python-engine tpcds runner exists; old-engine dumps are tpch-only")
     bench_dir = os.path.join(ROOT, "benchmarks", suite)
     sys.path.insert(0, bench_dir)
     import run_federated as rf
