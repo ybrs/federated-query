@@ -38,6 +38,9 @@ struct OrderKeys {
 impl OrderKeys {
     /// A Sort over `input` carrying this order.
     fn into_sort(self, input: LogicalPlan) -> LogicalPlan {
+        // A fresh Sort built from this consumed OrderKeys bundle plus the input;
+        // OrderKeys mirrors exactly the Sort's order fields, so {input, sort_keys,
+        // ascending, nulls_order} is the complete field set (Sort has no stamps).
         LogicalPlan::Sort(Sort {
             input: Box::new(input),
             sort_keys: self.keys,
@@ -138,19 +141,12 @@ fn attach_order_metadata(node: LogicalPlan, order: &OrderKeys) -> LogicalPlan {
 /// input expressions. If the keys cannot all be resolved to the input, the Sort
 /// stays above. Ports `_push_through_projection`.
 fn push_through_projection(
-    projection: Projection,
+    mut projection: Projection,
     order: OrderKeys,
 ) -> Result<LogicalPlan, OptimizeError> {
     let Some(rewritten_keys) = rewrite_sort_keys_for_projection(&order.keys, &projection) else {
         return Ok(order.into_sort(LogicalPlan::Projection(projection)));
     };
-    let Projection {
-        input,
-        expressions,
-        aliases,
-        distinct,
-        distinct_on,
-    } = projection;
     // The rewritten sort keeps the original ascending/nulls, only the keys and
     // input change (it now sits directly over the projection's input).
     let inner_order = OrderKeys {
@@ -158,27 +154,21 @@ fn push_through_projection(
         ascending: order.ascending.clone(),
         nulls: order.nulls.clone(),
     };
-    let pushed_child = push_order_by(inner_order.into_sort(*input))?;
+    let pushed_child = push_order_by(inner_order.into_sort(*projection.input))?;
     match pushed_child {
         LogicalPlan::Sort(child_sort) => {
-            // The order could not descend; rebuild the projection over the sort's
-            // input and put the ORIGINAL sort back on top of the projection.
-            let rebuilt_projection = LogicalPlan::Projection(Projection {
-                input: child_sort.input,
-                expressions,
-                aliases,
-                distinct,
-                distinct_on,
-            });
-            Ok(order.into_sort(rebuilt_projection))
+            // The order could not descend; reattach the projection over the sort's
+            // input (in-place: expressions/aliases/distinct/distinct_on preserved by
+            // identity) and put the ORIGINAL sort back on top of the projection.
+            projection.input = child_sort.input;
+            Ok(order.into_sort(LogicalPlan::Projection(projection)))
         }
-        other => Ok(LogicalPlan::Projection(Projection {
-            input: Box::new(other),
-            expressions,
-            aliases,
-            distinct,
-            distinct_on,
-        })),
+        other => {
+            // In-place on the owned node: only the input is re-boxed to the pushed
+            // child; every other projection field is preserved by identity.
+            projection.input = Box::new(other);
+            Ok(LogicalPlan::Projection(projection))
+        }
     }
 }
 
@@ -244,7 +234,7 @@ fn map_projection_sort_column(
 /// Push ORDER BY through an aggregate when its keys are a subset of both the
 /// aggregate output and the GROUP BY keys. Ports `_push_through_aggregate`.
 fn push_through_aggregate(
-    aggregate: Aggregate,
+    mut aggregate: Aggregate,
     order: OrderKeys,
 ) -> Result<LogicalPlan, OptimizeError> {
     let sort_cols = column_key_set(&order.keys);
@@ -256,41 +246,28 @@ fn push_through_aggregate(
     if !sort_cols.is_subset(&group_cols) {
         return Ok(order.into_sort(LogicalPlan::Aggregate(aggregate)));
     }
-    let Aggregate {
-        input,
-        group_by,
-        aggregates,
-        output_names,
-        grouping_sets,
-    } = aggregate;
-    let pushed_child = push_sort_into_child(order.clone(), *input)?;
-    let new_aggregate = LogicalPlan::Aggregate(Aggregate {
-        input: Box::new(pushed_child),
-        group_by,
-        aggregates,
-        output_names,
-        grouping_sets,
-    });
-    Ok(order.into_sort(new_aggregate))
+    let pushed_child = push_sort_into_child(order.clone(), *aggregate.input)?;
+    // In-place on the owned node: only the input is re-boxed to the pushed child;
+    // group_by, aggregates, output_names, grouping_sets are preserved by identity.
+    aggregate.input = Box::new(pushed_child);
+    Ok(order.into_sort(LogicalPlan::Aggregate(aggregate)))
 }
 
 /// Propagate sort metadata into union inputs while keeping the top Sort. Ports
 /// `_push_through_union`.
-fn push_through_union(union: Union, order: OrderKeys) -> Result<LogicalPlan, OptimizeError> {
-    let Union { inputs, distinct } = union;
-    let mut new_inputs = Vec::with_capacity(inputs.len());
-    for child in inputs {
+fn push_through_union(mut union: Union, order: OrderKeys) -> Result<LogicalPlan, OptimizeError> {
+    let mut new_inputs = Vec::with_capacity(union.inputs.len());
+    // Take the inputs out to rewrite them; the union node itself is reused below
+    // (its `distinct` preserved by identity, not re-listed).
+    for child in std::mem::take(&mut union.inputs) {
         let pushed = push_sort_into_child(order.clone(), child)?;
         match pushed {
             LogicalPlan::Sort(sort) => new_inputs.push(*sort.input),
             other => new_inputs.push(other),
         }
     }
-    let new_union = LogicalPlan::Union(Union {
-        inputs: new_inputs,
-        distinct,
-    });
-    Ok(order.into_sort(new_union))
+    union.inputs = new_inputs;
+    Ok(order.into_sort(LogicalPlan::Union(union)))
 }
 
 /// Push an order into a child and return the result (order dissolved into scan
@@ -323,25 +300,26 @@ fn recurse_node(plan: LogicalPlan) -> Result<LogicalPlan, OptimizeError> {
 
 /// Recurse into a Filter, folding a HAVING predicate onto an aggregate-bearing
 /// scan the order pushdown just produced. Ports `_recurse_filter`.
-fn recurse_filter(filter: Filter) -> Result<LogicalPlan, OptimizeError> {
-    let Filter { input, predicate } = filter;
-    let before = (*input).clone();
-    let new_input = push_order_by(*input)?;
+fn recurse_filter(mut filter: Filter) -> Result<LogicalPlan, OptimizeError> {
+    let before = (*filter.input).clone();
+    let new_input = push_order_by(*filter.input)?;
     if new_input == before {
-        return Ok(LogicalPlan::Filter(Filter {
-            input: Box::new(new_input),
-            predicate,
-        }));
+        // Unchanged: reattach the child (in-place) and keep the filter as-is; its
+        // predicate is preserved by identity.
+        filter.input = Box::new(new_input);
+        return Ok(LogicalPlan::Filter(filter));
     }
     match new_input {
         LogicalPlan::Scan(mut scan) if scan.aggregates.is_some() => {
-            scan.filters = and_expressions(scan.filters.take(), Some(predicate));
+            scan.filters = and_expressions(scan.filters.take(), Some(filter.predicate));
             Ok(LogicalPlan::Scan(scan))
         }
-        other => Ok(LogicalPlan::Filter(Filter {
-            input: Box::new(other),
-            predicate,
-        })),
+        other => {
+            // In-place on the owned node: only the input is re-boxed to the pushed
+            // child; the predicate is preserved by identity.
+            filter.input = Box::new(other);
+            Ok(LogicalPlan::Filter(filter))
+        }
     }
 }
 

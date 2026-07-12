@@ -1028,6 +1028,8 @@ fn with_local_filters(plan: LogicalPlan, expressions: &[Expr]) -> LogicalPlan {
             scan.filters = and_expressions(scan.filters.take(), Some(predicate));
             LogicalPlan::Scan(scan)
         }
+        // A fresh Filter synthesized to carry the single-atom conjuncts above a
+        // non-scan atom; no base Filter, {input, predicate} is the complete set.
         other => LogicalPlan::Filter(Filter {
             input: Box::new(other),
             predicate,
@@ -1235,6 +1237,9 @@ impl JoinOrdering {
         let atom_tree = self.emit_atom(region, step.atom_index, placed)?;
         placed.extend(step.conjunct_positions.iter().copied());
         let (equi, residual) = split_step_conjuncts(region, &step.conjunct_positions);
+        // A genuinely fresh INNER join for the reordered tree; there is no base node,
+        // and its estimated_rows/estimate_defaults are freshly stamped FROM the DP
+        // search result (step.estimate). The field list here is the complete Join set.
         let join = LogicalPlan::Join(Join {
             left: Box::new(left_tree),
             right: Box::new(atom_tree),
@@ -1259,6 +1264,9 @@ fn emit_cross(
     placed: &mut Vec<usize>,
 ) -> LogicalPlan {
     placed.extend(cross.conjunct_positions.iter().copied());
+    // A genuinely fresh CROSS join for the reordered tree; no base node, and its
+    // estimated_rows/estimate_defaults are freshly stamped FROM the DP search result
+    // (cross.estimate). The field list here is the complete Join field set.
     let join = LogicalPlan::Join(Join {
         left: Box::new(left_tree),
         right: Box::new(right_tree),
@@ -1303,6 +1311,8 @@ fn worth_reordering(region: &JoinRegion, root: &LogicalPlan) -> bool {
 fn residual_filter(tree: LogicalPlan, expressions: Vec<Expr>) -> LogicalPlan {
     match combine_and(expressions) {
         None => tree,
+        // A fresh Filter synthesized to carry residual conjuncts above a reordered
+        // join step; no base Filter, {input, predicate} is the complete field set.
         Some(predicate) => LogicalPlan::Filter(Filter {
             input: Box::new(tree),
             predicate,

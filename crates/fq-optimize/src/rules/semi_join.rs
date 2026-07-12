@@ -146,60 +146,36 @@ fn classify_ref(
 /// Rebuild `INNER(X, Y)` with the semi/anti join wrapped around the named side;
 /// the inner join's type/condition/other side are otherwise untouched. Ports
 /// `_push_to_side` / `_wrap_semi`.
-fn push_to_side(semi: Join, side: Side) -> LogicalPlan {
-    let Join {
-        left,
-        right,
-        join_type,
-        condition,
-        natural,
-        using,
-        estimated_rows,
-        estimate_defaults,
-    } = semi;
-    let mut inner = match *left {
+fn push_to_side(mut semi: Join, side: Side) -> LogicalPlan {
+    // Pull the inner join out of the semi's left. The wrapped SEMI/ANTI is the SAME
+    // node as `semi` with only its `left` re-pointed at one of the inner join's
+    // inputs, so we keep `semi` owned and preserve its type/condition/other side and
+    // the estimated_rows/estimate_defaults STAMPS by identity (re-listing them risked
+    // resetting a stamp).
+    let mut inner = match *semi.left {
         LogicalPlan::Join(inner) => inner,
         other => {
             // Guarded unreachable in practice (the caller checked is_plain_inner);
-            // reconstruct the semi unchanged rather than risk a wrong rewrite.
-            return LogicalPlan::Join(Join {
-                left: Box::new(other),
-                right,
-                join_type,
-                condition,
-                natural,
-                using,
-                estimated_rows,
-                estimate_defaults,
-            });
+            // restore the semi's left and return it unchanged (fields preserved by
+            // identity) rather than risk a wrong rewrite.
+            semi.left = Box::new(other);
+            return LogicalPlan::Join(semi);
         }
     };
     match side {
         Side::Left => {
             let target = *inner.left;
-            inner.left = Box::new(LogicalPlan::Join(Join {
-                left: Box::new(target),
-                right,
-                join_type,
-                condition,
-                natural,
-                using,
-                estimated_rows,
-                estimate_defaults,
-            }));
+            // In-place: the semi wraps the inner join's LEFT input; only semi.left
+            // changes, every other semi field (incl. the stamps) is preserved.
+            semi.left = Box::new(target);
+            inner.left = Box::new(LogicalPlan::Join(semi));
         }
         Side::Right => {
             let target = *inner.right;
-            inner.right = Box::new(LogicalPlan::Join(Join {
-                left: Box::new(target),
-                right,
-                join_type,
-                condition,
-                natural,
-                using,
-                estimated_rows,
-                estimate_defaults,
-            }));
+            // In-place: the semi wraps the inner join's RIGHT input; only semi.left
+            // changes, every other semi field (incl. the stamps) is preserved.
+            semi.left = Box::new(target);
+            inner.right = Box::new(LogicalPlan::Join(semi));
         }
     }
     LogicalPlan::Join(inner)

@@ -98,6 +98,9 @@ fn pushed_union(union: &Union, consumers: &[(Filter, CteRef)]) -> Option<Logical
     for branch in &union.inputs {
         rebuilt.push(pushed_body(branch, consumers)?);
     }
+    // The source union is borrowed (&Union), so we cannot mutate it or `..`-copy it;
+    // build a fresh Union whose only new field is the rebuilt branches, copying the
+    // scalar `distinct`. {inputs, distinct} is the complete Union field set.
     Some(LogicalPlan::Union(Union {
         inputs: rebuilt,
         distinct: union.distinct,
@@ -112,6 +115,9 @@ fn pushed_set_operation(
 ) -> Option<LogicalPlan> {
     let left = pushed_body(&set_op.left, consumers)?;
     let right = pushed_body(&set_op.right, consumers)?;
+    // The source set operation is borrowed (&SetOperation), so we cannot mutate or
+    // `..`-copy it; build a fresh node with the rewritten branches, copying the
+    // scalar kind/distinct. {left, right, kind, distinct} is the complete field set.
     Some(LogicalPlan::SetOperation(SetOperation {
         left: Box::new(left),
         right: Box::new(right),
@@ -361,8 +367,13 @@ fn node_embeds_predicate(node: &LogicalPlan, predicate: &Expr) -> bool {
 /// The body rebuilt with the union filter directly under the aggregate (where
 /// ordinary pushdown then sinks it to the base scans).
 fn insert_filter(sink: &Sink, predicate: Expr) -> LogicalPlan {
+    // The sink is borrowed (&Sink), so clone the aggregate's input subtree for the
+    // freshly inserted Filter to own (we cannot move out of a borrow).
+    let aggregate_input = sink.aggregate.input.clone();
+    // A fresh Filter inserted directly under the aggregate; its {input, predicate}
+    // (the cloned input and the pushed predicate) is the complete Filter field set.
     let pushed = LogicalPlan::Filter(Filter {
-        input: sink.aggregate.input.clone(),
+        input: aggregate_input,
         predicate,
     });
     let mut aggregate = sink.aggregate.clone();

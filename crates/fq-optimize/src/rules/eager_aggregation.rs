@@ -539,6 +539,9 @@ fn conjunct_in_scope(conjunct: &Expr, in_scope: &HashSet<String>) -> bool {
 /// One left-deep INNER join step over an owned conjunct list (always non-empty at
 /// its call sites, so the condition is `Some`).
 fn inner_join(left: LogicalPlan, right: LogicalPlan, conjuncts: Vec<Expr>) -> LogicalPlan {
+    // A genuinely fresh INNER join the rule synthesizes for the rebuilt final tree;
+    // there is no base node, so it starts unstamped (estimated_rows/estimate_defaults
+    // None) and the field list here is the complete Join field set.
     LogicalPlan::Join(Join {
         left: Box::new(left),
         right: Box::new(right),
@@ -653,6 +656,9 @@ fn build_final(
     // Rewrite ONCE up front: the ordering walk and the coverage check must see the
     // same qualifiers (the S side of every lifted conjunct now reads the alias).
     let mut pending = rewrite_all(lifted, &mapping);
+    // A genuinely fresh SubqueryScan exposing the partial aggregate as a derived
+    // table (partial is borrowed, so its aggregate is cloned in); no base node, and
+    // {input, alias, column_names} is the complete SubqueryScan field set.
     let mut current = LogicalPlan::SubqueryScan(SubqueryScan {
         input: Box::new(partial.aggregate.clone()),
         alias: partial.alias.clone(),
@@ -784,6 +790,9 @@ fn final_aggregate(
     for entry in &agg.aggregates {
         select_list.push(merge_entry(entry, &partial.alias, mapping, &mut sum_names));
     }
+    // A genuinely fresh merge Aggregate over the rebuilt join tree (the source `agg`
+    // is borrowed, so its outputs are cloned/rewritten in); no base node to mutate,
+    // and {input, group_by, aggregates, output_names, grouping_sets} is complete.
     LogicalPlan::Aggregate(Aggregate {
         input: Box::new(joined),
         group_by,
@@ -826,11 +835,16 @@ fn merge_sum(entry: &Expr, alias: &str, sum_name: &str) -> Expr {
     else {
         unreachable!("sum_only_outputs guarantees a plain SUM FunctionCall here");
     };
+    // A genuinely fresh ColumnRef addressing the partial's synthetic SUM column under
+    // the derived-table alias; no base node, {table, column, data_type} is complete.
     let partial_ref = Expr::Column(ColumnRef {
         table: Some(alias.to_string()),
         column: sum_name.to_string(),
         data_type: Some(entry.get_type()),
     });
+    // A fresh merge FunctionCall: the original SUM with its argument swapped for the
+    // partial column. `entry` was destructured by REFERENCE, so there is no owned base
+    // to mutate; this inline-variant build lists the complete FunctionCall field set.
     Expr::FunctionCall {
         function_name: function_name.clone(),
         args: vec![partial_ref],

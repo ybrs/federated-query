@@ -129,9 +129,12 @@ fn descend(node: &LogicalPlan, atoms: &mut Vec<JoinAtom>, expressions: &mut Vec<
     }
     // Anything else stops the region: an opaque atom at the next index, keeping
     // the original left-to-right (FROM) order.
+    // `node` is borrowed; the join-ordering search needs an OWNED atom plan, so
+    // this clone of the opaque subtree is unavoidable (we cannot move out of &node).
+    let plan = node.clone();
     atoms.push(JoinAtom {
         index: atoms.len(),
-        plan: node.clone(),
+        plan,
         qualifiers: visible_qualifiers(node),
     });
 }

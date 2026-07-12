@@ -81,7 +81,7 @@ fn distinct_blocks_pushdown(projection: &Projection) -> bool {
 /// that was never pushed would corrupt pagination). Ports
 /// `_push_through_projection`.
 fn push_through_projection(
-    projection: Projection,
+    mut projection: Projection,
     limit_value: Option<u64>,
     offset: u64,
 ) -> LogicalPlan {
@@ -89,56 +89,38 @@ fn push_through_projection(
         return wrap_limit(LogicalPlan::Projection(projection), limit_value, offset);
     }
     let child_is_scan = matches!(&*projection.input, LogicalPlan::Scan(_));
-    let Projection {
-        input,
-        expressions,
-        aliases,
-        distinct,
-        distinct_on,
-    } = projection;
-    let pushed_child = apply_limit_metadata(*input, limit_value, offset);
+    let pushed_child = apply_limit_metadata(*projection.input, limit_value, offset);
     let retained_offset = if child_is_scan { 0 } else { offset };
     let limited = wrap_limit(pushed_child, limit_value, retained_offset);
-    LogicalPlan::Projection(Projection {
-        input: Box::new(limited),
-        expressions,
-        aliases,
-        distinct,
-        distinct_on,
-    })
+    // In-place on the owned node: only the input is re-boxed (to the limited child);
+    // expressions, aliases, distinct, distinct_on are preserved by identity.
+    projection.input = Box::new(limited);
+    LogicalPlan::Projection(projection)
 }
 
 /// Move a limit below a sort, folding order + limit into a scan when the sort's
 /// input is one. Ports `_push_limit_with_sort`.
 fn push_limit_with_sort(
-    sort: Sort,
+    mut sort: Sort,
     limit_value: Option<u64>,
     offset: u64,
 ) -> Result<LogicalPlan, OptimizeError> {
-    let Sort {
-        input,
-        sort_keys,
-        ascending,
-        nulls_order,
-    } = sort;
-    let sorted_input = rewrite_plan(*input)?;
+    let sorted_input = rewrite_plan(*sort.input)?;
     match sorted_input {
         LogicalPlan::Scan(mut scan) => {
-            scan.order_by_keys = Some(sort_keys);
-            scan.order_by_ascending = Some(ascending);
-            scan.order_by_nulls = nulls_order;
+            scan.order_by_keys = Some(sort.sort_keys);
+            scan.order_by_ascending = Some(sort.ascending);
+            scan.order_by_nulls = sort.nulls_order;
             scan.limit = limit_value;
             scan.offset = offset;
             Ok(wrap_limit(LogicalPlan::Scan(scan), limit_value, 0))
         }
         other => {
-            let new_sort = LogicalPlan::Sort(Sort {
-                input: Box::new(other),
-                sort_keys,
-                ascending,
-                nulls_order,
-            });
-            Ok(wrap_limit(new_sort, limit_value, offset))
+            // In-place on the owned node: only the input is re-boxed (to the
+            // rewritten child); sort_keys, ascending, nulls_order preserved by
+            // identity.
+            sort.input = Box::new(other);
+            Ok(wrap_limit(LogicalPlan::Sort(sort), limit_value, offset))
         }
     }
 }
@@ -179,6 +161,9 @@ fn apply_limit_to_scan(mut scan: Scan, limit_value: Option<u64>, offset_value: u
 
 /// A Limit over `input` with the given cap and offset.
 fn wrap_limit(input: LogicalPlan, limit: Option<u64>, offset: u64) -> LogicalPlan {
+    // A genuinely fresh Limit wrapper built from the three arguments; there is no
+    // base node to copy from, and {input, limit, offset} is the complete Limit
+    // field set (Limit carries no estimate/stamp fields).
     LogicalPlan::Limit(Limit {
         input: Box::new(input),
         limit,

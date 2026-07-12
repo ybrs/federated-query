@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use fq_common::OptimizerConfig;
 use fq_decorrelate::scope::validate_scope;
-use fq_plan::logical::{Explain, LogicalPlan};
+use fq_plan::logical::LogicalPlan;
 
 use crate::cost::CostModel;
 use crate::error::OptimizeError;
@@ -48,12 +48,12 @@ impl RuleBasedOptimizer {
     /// `Explain` is unwrapped, its query optimized, then re-wrapped so EXPLAIN
     /// reports the plan of the optimized query. Ports `optimize`.
     pub fn optimize(&self, plan: LogicalPlan) -> Result<LogicalPlan, OptimizeError> {
-        if let LogicalPlan::Explain(explain) = plan {
+        if let LogicalPlan::Explain(mut explain) = plan {
             let optimized = self.optimize(*explain.input)?;
-            return Ok(LogicalPlan::Explain(Explain {
-                input: Box::new(optimized),
-                format: explain.format,
-            }));
+            // In-place on the owned node: only the wrapped input is re-optimized;
+            // `format` is preserved by identity rather than re-listed.
+            explain.input = Box::new(optimized);
+            return Ok(LogicalPlan::Explain(explain));
         }
 
         let mut current = plan;
@@ -135,7 +135,7 @@ mod tests {
     use super::*;
     use fq_common::CostConfig;
     use fq_plan::expr::{Expr, LiteralValue};
-    use fq_plan::logical::{Filter, Scan};
+    use fq_plan::logical::{Explain, Filter, Scan};
 
     /// A stats-free cost model (the registration-order tests never estimate).
     fn cost_model() -> CostModel {

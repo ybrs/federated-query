@@ -52,10 +52,16 @@ fn tracked_binary(
 ) -> (Option<f64>, Vec<String>) {
     match op {
         BinaryOpType::And => {
+            // The caller destructured the AND into op + two borrowed &Expr operands;
+            // clone each into an owned box (we cannot move out of the borrows) so the
+            // node can be rebuilt below and priced as a conjunction.
+            let (left_box, right_box) = (Box::new(left.clone()), Box::new(right.clone()));
+            // Rebuild the AND as an owned inline-variant Expr; `op` plus the two boxed
+            // operands are the complete BinaryOp field set (a fresh node, no base).
             let combined = Expr::BinaryOp {
                 op,
-                left: Box::new(left.clone()),
-                right: Box::new(right.clone()),
+                left: left_box,
+                right: right_box,
             };
             let (fraction, defaults) = tracked_conjunction(&combined, stats, target);
             (Some(fraction), defaults)
@@ -130,11 +136,15 @@ fn tracked_between(
     stats: Option<&TableStatistics>,
     target: &str,
 ) -> (Option<f64>, Vec<String>) {
+    // BETWEEN lowered to its lower comparison bound so the interval pairing (not a
+    // product of two marginals) prices it; a fresh inline-variant Expr, no base node.
     let low = Expr::BinaryOp {
         op: BinaryOpType::Gte,
         left: Box::new(value.clone()),
         right: Box::new(lower.clone()),
     };
+    // Upper comparison bound of the same lowered BETWEEN; a fresh inline-variant Expr
+    // built from the borrowed operands (there is no base node to copy from).
     let high = Expr::BinaryOp {
         op: BinaryOpType::Lte,
         left: Box::new(value.clone()),

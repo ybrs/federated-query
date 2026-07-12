@@ -50,24 +50,27 @@ fn try_push_aggregate(aggregate: Aggregate) -> Result<LogicalPlan, OptimizeError
     };
     match *input {
         LogicalPlan::Scan(scan) => Ok(push_to_scan(*scan, None, clauses)),
-        LogicalPlan::Filter(filter) => {
-            let Filter {
-                input: filter_input,
-                predicate,
-            } = filter;
-            match *filter_input {
-                LogicalPlan::Scan(scan) => Ok(push_to_scan(*scan, Some(predicate), clauses)),
-                other_inner => {
-                    let rebuilt_filter = LogicalPlan::Filter(Filter {
-                        input: Box::new(other_inner),
-                        predicate,
-                    });
-                    recurse_aggregate(rebuilt_filter, clauses)
-                }
-            }
-        }
+        LogicalPlan::Filter(filter) => try_push_through_filter(filter, clauses),
         other => recurse_aggregate(other, clauses),
     }
+}
+
+/// Fold the aggregate onto a scan directly under a WHERE filter; otherwise the
+/// filter passes through UNCHANGED (by identity, not re-listed) and the aggregate
+/// recurses into it (a foldable aggregate may sit deeper).
+fn try_push_through_filter(
+    filter: Filter,
+    clauses: AggregateClauses,
+) -> Result<LogicalPlan, OptimizeError> {
+    // Peek without consuming: fold only when the filter sits directly over a scan.
+    if !matches!(*filter.input, LogicalPlan::Scan(_)) {
+        return recurse_aggregate(LogicalPlan::Filter(filter), clauses);
+    }
+    let Filter { input, predicate } = filter;
+    let LogicalPlan::Scan(scan) = *input else {
+        unreachable!("peeked a Scan above");
+    };
+    Ok(push_to_scan(*scan, Some(predicate), clauses))
 }
 
 /// The grouping clauses an aggregate carries, moved as a unit when folding onto a
@@ -85,6 +88,10 @@ fn recurse_aggregate(
     input: LogicalPlan,
     clauses: AggregateClauses,
 ) -> Result<LogicalPlan, OptimizeError> {
+    // Reassemble the aggregate from its moved-out clause bundle plus the new input.
+    // AggregateClauses mirrors EXACTLY the aggregate's non-input fields (group_by,
+    // aggregates, output_names, grouping_sets), so this field list is complete and
+    // nothing is reset; there is no owned Aggregate node left to mutate in place.
     let aggregate = LogicalPlan::Aggregate(Aggregate {
         input: Box::new(input),
         group_by: clauses.group_by,

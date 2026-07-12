@@ -287,16 +287,18 @@ fn sole_relation(expression: &Expr) -> Option<String> {
 
 /// Merge two adjacent filters into one AND, then re-run pushdown on the collapsed
 /// node. Ports `_merge_filters`.
-fn merge_filters(predicate: Expr, inner: Filter) -> Result<LogicalPlan, OptimizeError> {
+fn merge_filters(predicate: Expr, mut inner: Filter) -> Result<LogicalPlan, OptimizeError> {
+    // A fresh AND combining the two owned predicates; an inline enum variant with no
+    // base node, and {op, left, right} is the complete BinaryOp field set.
     let merged = Expr::BinaryOp {
         op: BinaryOpType::And,
         left: Box::new(predicate),
         right: Box::new(inner.predicate),
     };
-    push_down(LogicalPlan::Filter(Filter {
-        input: inner.input,
-        predicate: merged,
-    }))
+    // In-place on the owned inner filter: only the predicate becomes the merged AND;
+    // its `input` is preserved by identity (the collapsed node keeps the inner input).
+    inner.predicate = merged;
+    push_down(LogicalPlan::Filter(inner))
 }
 
 /// Push the conjuncts a projection's input can evaluate below it; the rest stay
@@ -525,6 +527,9 @@ fn transit_one(equi: &Expr, literals: &HashMap<(Option<String>, String), Expr>) 
             if let Some(literal) =
                 literals.get(&(source_col.table.clone(), source_col.column.clone()))
             {
+                // A fresh transitive `target = literal` equality; an inline enum
+                // variant with no base node, built from the borrowed target/literal
+                // (cloned to own them), with the complete BinaryOp field set.
                 return Some(Expr::BinaryOp {
                     op: BinaryOpType::Eq,
                     left: Box::new((**target).clone()),
@@ -584,6 +589,8 @@ fn push_side(side: LogicalPlan, conjuncts: Vec<Expr>) -> Result<LogicalPlan, Opt
         return push_down(side);
     }
     let predicate = combine_and(conjuncts).expect("non-empty");
+    // A fresh Filter synthesized to carry the pushed conjuncts into the side; there
+    // is no base Filter here, and {input, predicate} is the complete Filter field set.
     push_down(LogicalPlan::Filter(Filter {
         input: Box::new(side),
         predicate,
@@ -606,6 +613,8 @@ fn wrap_residual(new_join: LogicalPlan, residual: Vec<Expr>) -> LogicalPlan {
     if residual.is_empty() {
         return new_join;
     }
+    // A fresh Filter synthesized to re-home leftover cross-side conjuncts on top of
+    // the join; no base Filter, and {input, predicate} is the complete field set.
     LogicalPlan::Filter(Filter {
         input: Box::new(new_join),
         predicate: combine_and(residual).expect("non-empty"),
@@ -617,6 +626,8 @@ fn wrap_above(plan: LogicalPlan, above: Vec<Expr>) -> LogicalPlan {
     if above.is_empty() {
         return plan;
     }
+    // A fresh Filter synthesized to keep the non-pushable conjuncts above the node;
+    // no base Filter, and {input, predicate} is the complete Filter field set.
     LogicalPlan::Filter(Filter {
         input: Box::new(plan),
         predicate: combine_and(above).expect("non-empty"),
@@ -668,6 +679,8 @@ fn push_join_condition(mut join: Join) -> Join {
     match side {
         Side::Right => {
             let side_input = *join.right;
+            // A fresh Filter synthesized to sink the movable conjuncts into the
+            // right input; no base Filter, {input, predicate} is the complete set.
             join.right = Box::new(LogicalPlan::Filter(Filter {
                 input: Box::new(side_input),
                 predicate: filtered_predicate,
@@ -675,6 +688,8 @@ fn push_join_condition(mut join: Join) -> Join {
         }
         Side::Left => {
             let side_input = *join.left;
+            // A fresh Filter synthesized to sink the movable conjuncts into the
+            // left input; no base Filter, {input, predicate} is the complete set.
             join.left = Box::new(LogicalPlan::Filter(Filter {
                 input: Box::new(side_input),
                 predicate: filtered_predicate,
@@ -810,6 +825,8 @@ fn assemble_outer_join(
     if keep.is_empty() {
         return Ok(new_join);
     }
+    // A fresh Filter synthesized to keep the non-pushable conjuncts above the outer
+    // join; no base Filter, and {input, predicate} is the complete Filter field set.
     Ok(LogicalPlan::Filter(Filter {
         input: Box::new(new_join),
         predicate: combine_and(keep).expect("non-empty"),
@@ -823,6 +840,8 @@ fn rehome_filter_over_join(predicate: Expr, mut join: Join) -> Result<LogicalPla
     let right_input = *join.right;
     join.left = Box::new(push_down(left_input)?);
     join.right = Box::new(push_down(right_input)?);
+    // A fresh Filter re-homed above the FULL outer join (the original was decomposed
+    // into predicate + join by the caller); {input, predicate} is the complete set.
     Ok(LogicalPlan::Filter(Filter {
         input: Box::new(LogicalPlan::Join(join)),
         predicate,
@@ -838,6 +857,8 @@ fn rehome_filter_over_opaque(
     // Whether the child changed or not, the re-homed filter is structurally the
     // same node as the original when nothing moved, so change detection holds.
     let new_input = push_down(input)?;
+    // A fresh Filter re-homed above the opaque child (the original was decomposed
+    // into predicate + input by the caller); {input, predicate} is the complete set.
     Ok(LogicalPlan::Filter(Filter {
         input: Box::new(new_input),
         predicate,
