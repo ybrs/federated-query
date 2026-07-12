@@ -1,0 +1,25 @@
+QUERY: q90
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  Sort
+    Projection
+      NestedLoopJoin
+        AliasedRelation
+          HashAggregate
+            HashJoin
+              HashJoin
+                HashJoin
+                  Scan duck.main.web_sales +semijoin
+                  Scan pg.public.household_demographics +filter
+                Scan pg.public.time_dim +filter
+              Scan pg.public.web_page +filter
+        AliasedRelation
+          HashAggregate
+            HashJoin
+              HashJoin
+                HashJoin
+                  Scan duck.main.web_sales +semijoin
+                  Scan pg.public.household_demographics +filter
+                Scan pg.public.time_dim +filter
+              Scan pg.public.web_page +filter

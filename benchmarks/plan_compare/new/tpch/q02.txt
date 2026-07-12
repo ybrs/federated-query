@@ -1,0 +1,23 @@
+QUERY: q02
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  Sort
+    Projection
+      Filter
+        HashJoin
+          HashJoin
+            HashJoin
+              HashJoin
+                HashJoin
+                  Scan pg.public.part +filter
+                  Scan duck.main.partsupp +semijoin
+                Scan pg.public.supplier
+              Scan pg.public.nation
+            Scan pg.public.region +filter
+          AliasedRelation
+            Projection
+              HashAggregate
+                HashJoin
+                  RemoteQuery [pg] :: SELECT "nation"."n_nationkey" AS "n_nationkey", "nation"."n_name" AS "n_name", "nation"."n_regionkey" AS "n_regionkey", "region"."r_regionkey" AS "r_regionkey", "region"."r_name" AS "r_name", "supplier"."s_suppkey" AS "s_suppkey", "supplier"."s_name" AS "s_name", "supplier"."s_address" AS "s_address", "supplier"."s_nationkey" AS "s_nationkey", "supplier"."s_phone" AS "s_phone", "supplier"."s_acctbal" AS "s_acctbal", "supplier"."s_comment" AS "s_comment" FROM "public"."nation" AS "nation" INNER JOIN "public"."region" AS "region" ON ("nation"."n_regionkey" = "region"."r_regionkey") INNER JOIN "public"."supplier" AS "supplier" ON ("supplier"."s_nationkey" = "nation"."n_nationkey") WHERE ("region"."r_name" = 'EUROPE')
+                  Scan duck.main.partsupp +semijoin

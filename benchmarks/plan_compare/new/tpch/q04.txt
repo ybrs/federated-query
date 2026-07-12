@@ -1,0 +1,4 @@
+QUERY: q04
+ENGINE: new (rust) EXPLAIN
+
+RemoteQuery [duck] :: SELECT "orders"."o_orderpriority" AS "o_orderpriority", COUNT() AS "order_count" FROM "main"."orders" AS "orders" WHERE (("orders"."o_orderdate" >= CAST('1993-07-01' AS DATE)) AND ("orders"."o_orderdate" < CAST('1993-10-01' AS DATE))) AND EXISTS(SELECT 1 FROM (SELECT "lineitem"."l_orderkey" AS "__subq_0_k0" FROM "main"."lineitem" AS "lineitem" WHERE ("lineitem"."l_commitdate" < "lineitem"."l_receiptdate")) AS "__subq_0" WHERE ("__subq_0"."__subq_0_k0" = "orders"."o_orderkey")) GROUP BY "orders"."o_orderpriority" ORDER BY "o_orderpriority" NULLS LAST

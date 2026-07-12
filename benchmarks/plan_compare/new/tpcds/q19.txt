@@ -1,0 +1,18 @@
+QUERY: q19
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  Sort
+    HashAggregate
+      Filter
+        HashJoin
+          HashJoin
+            HashJoin
+              HashJoin
+                HashJoin
+                  Scan duck.main.store_sales +semijoin
+                  Scan pg.public.item +filter
+                Scan pg.public.date_dim +filter
+              Scan pg.public.customer
+            Scan pg.public.customer_address
+          Scan pg.public.store

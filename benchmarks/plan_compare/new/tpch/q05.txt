@@ -1,0 +1,12 @@
+QUERY: q05
+ENGINE: new (rust) EXPLAIN
+
+Sort
+  HashAggregate
+    HashJoin
+      HashJoin
+        HashJoin
+          RemoteQuery [pg] :: SELECT "nation"."n_nationkey" AS "n_nationkey", "nation"."n_name" AS "n_name", "nation"."n_regionkey" AS "n_regionkey", "region"."r_regionkey" AS "r_regionkey", "region"."r_name" AS "r_name", "supplier"."s_suppkey" AS "s_suppkey", "supplier"."s_nationkey" AS "s_nationkey" FROM "public"."nation" AS "nation" INNER JOIN "public"."region" AS "region" ON ("nation"."n_regionkey" = "region"."r_regionkey") INNER JOIN "public"."supplier" AS "supplier" ON ("supplier"."s_nationkey" = "nation"."n_nationkey") WHERE ("region"."r_name" = 'ASIA')
+          Scan duck.main.lineitem +semijoin
+        Scan duck.main.orders +filter
+      Scan pg.public.customer

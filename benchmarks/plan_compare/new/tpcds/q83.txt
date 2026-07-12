@@ -1,0 +1,32 @@
+QUERY: q83
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  Sort
+    Projection
+      HashJoin
+        HashJoin
+          CteScan
+            Cte
+              HashAggregate
+                HashJoin
+                  HashJoin
+                    Scan duck.main.store_returns
+                    RemoteQuery [pg] :: SELECT "date_dim"."d_date_sk" AS "d_date_sk", "date_dim"."d_date" AS "d_date", "date_dim"."d_week_seq" AS "d_week_seq" FROM "public"."date_dim" AS "date_dim" WHERE EXISTS(SELECT 1 FROM (SELECT "date_dim"."d_date" AS "__subq_0_v0" FROM "public"."date_dim" AS "date_dim" WHERE EXISTS(SELECT 1 FROM (SELECT "date_dim"."d_week_seq" AS "__subq_1_v0" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_date" IN ('2000-06-30', '2000-09-27', '2000-11-17'))) AS "__subq_1" WHERE ("date_dim"."d_week_seq" = "__subq_1"."__subq_1_v0"))) AS "__subq_0" WHERE ("date_dim"."d_date" = "__subq_0"."__subq_0_v0"))
+                  Scan pg.public.item
+          CteScan
+            Cte
+              HashAggregate
+                HashJoin
+                  HashJoin
+                    Scan duck.main.web_returns
+                    RemoteQuery [pg] :: SELECT "date_dim"."d_date_sk" AS "d_date_sk", "date_dim"."d_date" AS "d_date", "date_dim"."d_week_seq" AS "d_week_seq" FROM "public"."date_dim" AS "date_dim" WHERE EXISTS(SELECT 1 FROM (SELECT "date_dim"."d_date" AS "__subq_4_v0" FROM "public"."date_dim" AS "date_dim" WHERE EXISTS(SELECT 1 FROM (SELECT "date_dim"."d_week_seq" AS "__subq_5_v0" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_date" IN ('2000-06-30', '2000-09-27', '2000-11-17'))) AS "__subq_5" WHERE ("date_dim"."d_week_seq" = "__subq_5"."__subq_5_v0"))) AS "__subq_4" WHERE ("date_dim"."d_date" = "__subq_4"."__subq_4_v0"))
+                  Scan pg.public.item
+        CteScan
+          Cte
+            HashAggregate
+              HashJoin
+                HashJoin
+                  Scan duck.main.catalog_returns
+                  RemoteQuery [pg] :: SELECT "date_dim"."d_date_sk" AS "d_date_sk", "date_dim"."d_date" AS "d_date", "date_dim"."d_week_seq" AS "d_week_seq" FROM "public"."date_dim" AS "date_dim" WHERE EXISTS(SELECT 1 FROM (SELECT "date_dim"."d_date" AS "__subq_2_v0" FROM "public"."date_dim" AS "date_dim" WHERE EXISTS(SELECT 1 FROM (SELECT "date_dim"."d_week_seq" AS "__subq_3_v0" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_date" IN ('2000-06-30', '2000-09-27', '2000-11-17'))) AS "__subq_3" WHERE ("date_dim"."d_week_seq" = "__subq_3"."__subq_3_v0"))) AS "__subq_2" WHERE ("date_dim"."d_date" = "__subq_2"."__subq_2_v0"))
+                Scan pg.public.item

@@ -1,0 +1,12 @@
+QUERY: q07
+ENGINE: new (rust) EXPLAIN
+
+Shipment __fedq_ship_0 [duck]
+  Scan pg.public.customer_demographics +filter
+  Shipment __fedq_ship_1 [duck]
+    Scan pg.public.date_dim +filter
+    Shipment __fedq_ship_2 [duck]
+      Scan pg.public.item
+      Shipment __fedq_ship_3 [duck]
+        Scan pg.public.promotion +filter
+        RemoteQuery [duck] :: SELECT "item"."i_item_id" AS "i_item_id", AVG("store_sales"."ss_quantity") AS "agg1", AVG("store_sales"."ss_list_price") AS "agg2", AVG("store_sales"."ss_coupon_amt") AS "agg3", AVG("store_sales"."ss_sales_price") AS "agg4" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_0" AS "customer_demographics" ON ("store_sales"."ss_cdemo_sk" = "customer_demographics"."cd_demo_sk") INNER JOIN "temp"."__fedq_ship_1" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_2" AS "item" ON ("store_sales"."ss_item_sk" = "item"."i_item_sk") INNER JOIN "temp"."__fedq_ship_3" AS "promotion" ON ("store_sales"."ss_promo_sk" = "promotion"."p_promo_sk") GROUP BY "item"."i_item_id" ORDER BY "i_item_id" NULLS LAST LIMIT 100

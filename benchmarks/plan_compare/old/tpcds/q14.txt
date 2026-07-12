@@ -1,0 +1,178 @@
+QUERY: q14
+ENGINE: old (python)
+
+ISLANDS: 57
+PUSHES_AGG_OR_JOIN: False
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalHashAggregate, PhysicalUnion, PhysicalUnion, PhysicalFilter, PhysicalNestedLoopJoin, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalSetOperation, PhysicalSetOperation, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalSingleRowGuard, PhysicalHashAggregate, PhysicalUnion, PhysicalUnion, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalFilter, PhysicalNestedLoopJoin, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalSetOperation, PhysicalSetOperation, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalSingleRowGuard, PhysicalHashAggregate, PhysicalUnion, PhysicalUnion, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalFilter, PhysicalNestedLoopJoin, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalSetOperation, PhysicalSetOperation, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalSingleRowGuard, PhysicalHashAggregate, PhysicalUnion, PhysicalUnion, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=duck kind=scan ---
+SELECT "ss_quantity", "ss_list_price", "ss_sold_date_sk", "ss_item_sk" FROM "main"."store_sales" AS "store_sales"
+
+--- island 1 source=pg kind=scan ---
+SELECT "i_item_sk", "i_category_id", "i_brand_id", "i_class_id" FROM "public"."item" AS "item"
+
+--- island 2 source=duck kind=scan ---
+SELECT "ss_item_sk", "ss_sold_date_sk" FROM "main"."store_sales" AS "store_sales"
+
+--- island 3 source=pg kind=scan ---
+SELECT "d_year", "d_date_sk" FROM "public"."date_dim" AS "d1" WHERE ("d1"."d_year" BETWEEN 1999 AND (1999 + 2))
+
+--- island 4 source=pg kind=scan ---
+SELECT "i_brand_id", "i_class_id", "i_category_id", "i_item_sk" FROM "public"."item" AS "iss"
+
+--- island 5 source=duck kind=scan ---
+SELECT "cs_item_sk", "cs_sold_date_sk" FROM "main"."catalog_sales" AS "catalog_sales"
+
+--- island 6 source=pg kind=scan ---
+SELECT "d_year", "d_date_sk" FROM "public"."date_dim" AS "d2" WHERE ("d2"."d_year" BETWEEN 1999 AND (1999 + 2))
+
+--- island 7 source=pg kind=scan ---
+SELECT "i_brand_id", "i_class_id", "i_category_id", "i_item_sk" FROM "public"."item" AS "ics"
+
+--- island 8 source=duck kind=scan ---
+SELECT "ws_item_sk", "ws_sold_date_sk" FROM "main"."web_sales" AS "web_sales"
+
+--- island 9 source=pg kind=scan ---
+SELECT "d_year", "d_date_sk" FROM "public"."date_dim" AS "d3" WHERE ("d3"."d_year" BETWEEN 1999 AND (1999 + 2))
+
+--- island 10 source=pg kind=scan ---
+SELECT "i_brand_id", "i_class_id", "i_category_id", "i_item_sk" FROM "public"."item" AS "iws"
+
+--- island 11 source=pg kind=scan ---
+SELECT "d_moy", "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_year" = (1999 + 2)) AND ("date_dim"."d_moy" = 11))
+
+--- island 12 source=pg kind=scan ---
+SELECT "i_brand_id", "i_class_id", "i_category_id", "i_item_sk" FROM "public"."item" AS "item"
+
+--- island 13 source=duck kind=scan ---
+SELECT "ss_quantity", "ss_list_price", "ss_sold_date_sk" FROM "main"."store_sales" AS "store_sales"
+
+--- island 14 source=pg kind=scan ---
+SELECT "d_date_sk", "d_year" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_year" BETWEEN 1999 AND (1999 + 2))
+
+--- island 15 source=duck kind=scan ---
+SELECT "cs_quantity", "cs_list_price", "cs_sold_date_sk" FROM "main"."catalog_sales" AS "catalog_sales"
+
+--- island 16 source=pg kind=scan ---
+SELECT "d_date_sk", "d_year" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_year" BETWEEN 1999 AND (1999 + 2))
+
+--- island 17 source=duck kind=scan ---
+SELECT "ws_quantity", "ws_list_price", "ws_sold_date_sk" FROM "main"."web_sales" AS "web_sales"
+
+--- island 18 source=pg kind=scan ---
+SELECT "d_date_sk", "d_year" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_year" BETWEEN 1999 AND (1999 + 2))
+
+--- island 19 source=duck kind=scan ---
+SELECT "cs_quantity", "cs_list_price", "cs_sold_date_sk", "cs_item_sk" FROM "main"."catalog_sales" AS "catalog_sales"
+
+--- island 20 source=pg kind=scan ---
+SELECT "i_item_sk", "i_category_id", "i_brand_id", "i_class_id" FROM "public"."item" AS "item"
+
+--- island 21 source=duck kind=scan ---
+SELECT "ss_item_sk", "ss_sold_date_sk" FROM "main"."store_sales" AS "store_sales"
+
+--- island 22 source=pg kind=scan ---
+SELECT "d_year", "d_date_sk" FROM "public"."date_dim" AS "d1" WHERE ("d1"."d_year" BETWEEN 1999 AND (1999 + 2))
+
+--- island 23 source=pg kind=scan ---
+SELECT "i_brand_id", "i_class_id", "i_category_id", "i_item_sk" FROM "public"."item" AS "iss"
+
+--- island 24 source=duck kind=scan ---
+SELECT "cs_item_sk", "cs_sold_date_sk" FROM "main"."catalog_sales" AS "catalog_sales"
+
+--- island 25 source=pg kind=scan ---
+SELECT "d_year", "d_date_sk" FROM "public"."date_dim" AS "d2" WHERE ("d2"."d_year" BETWEEN 1999 AND (1999 + 2))
+
+--- island 26 source=pg kind=scan ---
+SELECT "i_brand_id", "i_class_id", "i_category_id", "i_item_sk" FROM "public"."item" AS "ics"
+
+--- island 27 source=duck kind=scan ---
+SELECT "ws_item_sk", "ws_sold_date_sk" FROM "main"."web_sales" AS "web_sales"
+
+--- island 28 source=pg kind=scan ---
+SELECT "d_year", "d_date_sk" FROM "public"."date_dim" AS "d3" WHERE ("d3"."d_year" BETWEEN 1999 AND (1999 + 2))
+
+--- island 29 source=pg kind=scan ---
+SELECT "i_brand_id", "i_class_id", "i_category_id", "i_item_sk" FROM "public"."item" AS "iws"
+
+--- island 30 source=pg kind=scan ---
+SELECT "d_moy", "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_year" = (1999 + 2)) AND ("date_dim"."d_moy" = 11))
+
+--- island 31 source=pg kind=scan ---
+SELECT "i_brand_id", "i_class_id", "i_category_id", "i_item_sk" FROM "public"."item" AS "item"
+
+--- island 32 source=duck kind=scan ---
+SELECT "ss_quantity", "ss_list_price", "ss_sold_date_sk" FROM "main"."store_sales" AS "store_sales"
+
+--- island 33 source=pg kind=scan ---
+SELECT "d_date_sk", "d_year" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_year" BETWEEN 1999 AND (1999 + 2))
+
+--- island 34 source=duck kind=scan ---
+SELECT "cs_quantity", "cs_list_price", "cs_sold_date_sk" FROM "main"."catalog_sales" AS "catalog_sales"
+
+--- island 35 source=pg kind=scan ---
+SELECT "d_date_sk", "d_year" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_year" BETWEEN 1999 AND (1999 + 2))
+
+--- island 36 source=duck kind=scan ---
+SELECT "ws_quantity", "ws_list_price", "ws_sold_date_sk" FROM "main"."web_sales" AS "web_sales"
+
+--- island 37 source=pg kind=scan ---
+SELECT "d_date_sk", "d_year" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_year" BETWEEN 1999 AND (1999 + 2))
+
+--- island 38 source=duck kind=scan ---
+SELECT "ws_quantity", "ws_list_price", "ws_sold_date_sk", "ws_item_sk" FROM "main"."web_sales" AS "web_sales"
+
+--- island 39 source=pg kind=scan ---
+SELECT "i_item_sk", "i_category_id", "i_brand_id", "i_class_id" FROM "public"."item" AS "item"
+
+--- island 40 source=duck kind=scan ---
+SELECT "ss_item_sk", "ss_sold_date_sk" FROM "main"."store_sales" AS "store_sales"
+
+--- island 41 source=pg kind=scan ---
+SELECT "d_year", "d_date_sk" FROM "public"."date_dim" AS "d1" WHERE ("d1"."d_year" BETWEEN 1999 AND (1999 + 2))
+
+--- island 42 source=pg kind=scan ---
+SELECT "i_brand_id", "i_class_id", "i_category_id", "i_item_sk" FROM "public"."item" AS "iss"
+
+--- island 43 source=duck kind=scan ---
+SELECT "cs_item_sk", "cs_sold_date_sk" FROM "main"."catalog_sales" AS "catalog_sales"
+
+--- island 44 source=pg kind=scan ---
+SELECT "d_year", "d_date_sk" FROM "public"."date_dim" AS "d2" WHERE ("d2"."d_year" BETWEEN 1999 AND (1999 + 2))
+
+--- island 45 source=pg kind=scan ---
+SELECT "i_brand_id", "i_class_id", "i_category_id", "i_item_sk" FROM "public"."item" AS "ics"
+
+--- island 46 source=duck kind=scan ---
+SELECT "ws_item_sk", "ws_sold_date_sk" FROM "main"."web_sales" AS "web_sales"
+
+--- island 47 source=pg kind=scan ---
+SELECT "d_year", "d_date_sk" FROM "public"."date_dim" AS "d3" WHERE ("d3"."d_year" BETWEEN 1999 AND (1999 + 2))
+
+--- island 48 source=pg kind=scan ---
+SELECT "i_brand_id", "i_class_id", "i_category_id", "i_item_sk" FROM "public"."item" AS "iws"
+
+--- island 49 source=pg kind=scan ---
+SELECT "d_moy", "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_year" = (1999 + 2)) AND ("date_dim"."d_moy" = 11))
+
+--- island 50 source=pg kind=scan ---
+SELECT "i_brand_id", "i_class_id", "i_category_id", "i_item_sk" FROM "public"."item" AS "item"
+
+--- island 51 source=duck kind=scan ---
+SELECT "ss_quantity", "ss_list_price", "ss_sold_date_sk" FROM "main"."store_sales" AS "store_sales"
+
+--- island 52 source=pg kind=scan ---
+SELECT "d_date_sk", "d_year" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_year" BETWEEN 1999 AND (1999 + 2))
+
+--- island 53 source=duck kind=scan ---
+SELECT "cs_quantity", "cs_list_price", "cs_sold_date_sk" FROM "main"."catalog_sales" AS "catalog_sales"
+
+--- island 54 source=pg kind=scan ---
+SELECT "d_date_sk", "d_year" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_year" BETWEEN 1999 AND (1999 + 2))
+
+--- island 55 source=duck kind=scan ---
+SELECT "ws_quantity", "ws_list_price", "ws_sold_date_sk" FROM "main"."web_sales" AS "web_sales"
+
+--- island 56 source=pg kind=scan ---
+SELECT "d_date_sk", "d_year" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_year" BETWEEN 1999 AND (1999 + 2))

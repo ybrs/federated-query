@@ -1,0 +1,17 @@
+QUERY: q15
+ENGINE: new (rust) EXPLAIN
+
+Sort
+  Projection
+    HashJoin
+      HashJoin
+        Scan pg.public.supplier
+        CteScan
+          Cte
+            Scan duck.main.lineitem +filter +agg(2) +groupby
+      AliasedRelation
+        Projection
+          HashAggregate
+            CteScan
+              Cte
+                Scan duck.main.lineitem +filter +agg(2) +groupby

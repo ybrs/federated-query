@@ -327,34 +327,47 @@ async fn register_parquet_dir(
 }
 
 fn open_duckdb(path: &str) -> Result<duckdb::Connection, String> {
-    // Read-only open: DuckDB is single-writer per file per process, so the
-    // runtime's metadata/stats handle (fq-connectors, also read-only) and this
-    // execution handle must both be read-only to coexist on one file. The
-    // federated benchmarks are read-only; the only writes this engine issues are
-    // CREATE TEMP TABLE (dim shipping, semi-join reduction), which DuckDB allows
-    // on a read-only database because temp objects never touch the file.
-    let config = duckdb::Config::default()
-        .access_mode(duckdb::AccessMode::ReadOnly)
-        .map_err(|e| format!("duckdb config '{path}': {e}"))?;
-    duckdb::Connection::open_with_flags(path, config)
-        .map_err(|e| format!("duckdb open '{path}': {e}"))
+    // Read-WRITE open. DuckDB is single-instance-per-file per process: a
+    // read-write instance takes an exclusive file lock, so a SECOND open on the
+    // same file (even read-only) conflicts. The engine writes to DuckDB - dim
+    // shipping and semi-join reduction CREATE TEMP TABLE and append Arrow via the
+    // duckdb Appender, which REQUIRES a read-write base connection (a read-only
+    // base rejects the append even though temp objects never touch the file).
+    // The runtime therefore opens each file ONCE (read-write, in the catalog
+    // DuckDbSource) and seeds that one instance here via `seed_duck_connection`,
+    // so this standalone open is only reached by tests that drive DuckDB without
+    // a catalog - where nothing else holds the file and read-write is safe.
+    duckdb::Connection::open(path).map_err(|e| format!("duckdb open '{path}': {e}"))
 }
 
-// A per-fetch DuckDB cursor over ONE process-wide open database instance per
-// file path. `Connection::open` instantiates a whole DuckDB database (built-in
-// function and type registration) - measured at ~7-10ms regardless of file size
-// - so re-opening per fetch was the dominant per-fetch cost. We open each file's
-// instance once (cached here, never dropped, so it stays live for the process)
-// and hand out cheap cursors via `try_clone`: a `duckdb_connect` on the
-// already-open database, microseconds. Each fetch gets its own cursor, so
-// connection-scoped temp tables stay isolated and drop with the cursor. The base
-// keeps the same read-write open mode as before, so it shares configuration with
-// any other DuckDB handle on the file in this process. Mirrors the Postgres pool
-// (PG_CACHE) and the Parquet SessionContext cache.
-fn duck_cursor(path: &str) -> ExecResult<duckdb::Connection> {
+/// The process-wide base DuckDB instance per file path. `duck_cursor` clones
+/// cheap per-fetch cursors off it. Seeded by the runtime with the ONE read-write
+/// instance the catalog opened (`seed_duck_connection`) so the whole process
+/// shares a single DuckDB instance per file - no second file open, no lock
+/// fight. A path absent here (tests) falls back to a standalone `open_duckdb`.
+fn duck_base_cache() -> &'static Mutex<HashMap<String, duckdb::Connection>> {
     static CACHE: OnceLock<Mutex<HashMap<String, duckdb::Connection>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = cache.lock().unwrap();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Register the catalog's already-open read-write DuckDB connection as the
+/// process-wide base for `path`, so the exec data plane clones cursors off the
+/// SAME instance instead of opening the file a second time. Called once per
+/// DuckDB datasource at runtime setup.
+pub fn seed_duck_connection(path: String, connection: duckdb::Connection) {
+    duck_base_cache().lock().unwrap().insert(path, connection);
+}
+
+// A per-fetch DuckDB cursor over the ONE process-wide instance for this file
+// (`duck_base_cache`, seeded by the runtime or opened standalone in tests).
+// `Connection::open` instantiates a whole DuckDB database (built-in function and
+// type registration) - ~7-10ms regardless of file size - so re-opening per fetch
+// was the dominant per-fetch cost. We hand out cheap cursors via `try_clone`: a
+// `duckdb_connect` on the already-open database, microseconds. Each fetch gets
+// its own cursor, so connection-scoped temp tables stay isolated and drop with
+// the cursor. Mirrors the Postgres pool (PG_CACHE) and the Parquet context cache.
+fn duck_cursor(path: &str) -> ExecResult<duckdb::Connection> {
+    let mut map = duck_base_cache().lock().unwrap();
     if !map.contains_key(path) {
         let base = open_duckdb(path).map_err(ExecError::runtime)?;
         map.insert(path.to_string(), base);
@@ -365,7 +378,23 @@ fn duck_cursor(path: &str) -> ExecResult<duckdb::Connection> {
         .map_err(|e| ExecError::runtime(format!("duckdb cursor '{path}': {e}")))
 }
 
+// Print every SQL string the engine pushes to a source, gated on
+// FEDQRS_TRACE_SQL=1. The single common artifact for diffing pushdown between
+// the old and new planners: it shows directly whether a whole single-source
+// subtree (aggregate/join) is pushed as one query or the raw table is pulled and
+// processed in the coordinator.
+fn trace_sql(source: &str, sql: &str) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        std::env::var("FEDQRS_TRACE_SQL").map_or(false, |v| v != "0" && !v.is_empty())
+    });
+    if on {
+        eprintln!("[fedqsql] source={source}\n{sql}\n");
+    }
+}
+
 fn fetch_duckdb(s: &DsSpec, sql: &str) -> ExecResult<(SchemaRef, Vec<RecordBatch>)> {
+    trace_sql(&s.uri, sql);
     // A query that shipped a temp table must keep reading on the pinned
     // connection - temp objects are invisible to other cursors.
     let pinned = PINNED_DUCK.with(|cache| {
@@ -433,6 +462,7 @@ fn open_pg(s: &DsSpec) -> Result<PgConn, String> {
 }
 
 fn fetch_postgres(name: &str, s: &DsSpec, sql: &str) -> ExecResult<(SchemaRef, Vec<RecordBatch>)> {
+    trace_sql(name, sql);
     PG_CACHE.with(|cache| {
         let mut map = cache.borrow_mut();
         if !map.contains_key(name) {

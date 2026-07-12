@@ -1,0 +1,29 @@
+QUERY: q72
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  Sort
+    HashAggregate
+      HashJoin
+        HashJoin
+          HashJoin
+            Filter
+              HashJoin
+                HashJoin
+                  Filter
+                    HashJoin
+                      HashJoin
+                        HashJoin
+                          HashJoin
+                            HashJoin
+                              Scan duck.main.catalog_sales +semijoin
+                              Scan pg.public.date_dim +filter
+                            Scan pg.public.household_demographics +filter
+                          Scan pg.public.item
+                        Scan pg.public.customer_demographics +filter
+                      Scan pg.public.date_dim
+                  Scan pg.public.date_dim
+                Scan duck.main.inventory
+            Scan pg.public.warehouse
+          Scan pg.public.promotion
+        Scan duck.main.catalog_returns

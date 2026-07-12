@@ -134,14 +134,18 @@ fn register_datasource(
     }
 }
 
-/// Register a DuckDB source: a read-only catalog handle plus the exec-plane spec
-/// under the datasource's name (the name the physical scans carry).
+/// Register a DuckDB source. The whole process shares ONE read-write DuckDB
+/// instance per file: the catalog opens it here, and the exec data plane is
+/// seeded with a clone of that same connection (`seed_duck_connection`) so it
+/// never opens the file a second time. Read-write is required because the engine
+/// ships dim/semi-join temp tables via the DuckDB Appender.
 fn register_duckdb(
     catalog: &mut Catalog,
     datasource: &DataSourceConfig,
 ) -> Result<(), RuntimeError> {
     let path = require_str(datasource, "path")?;
-    let source = DuckDbSource::open_read_only(datasource.name.clone(), &path)?;
+    let source = DuckDbSource::open(datasource.name.clone(), &path)?;
+    connectors::seed_duck_connection(path.clone(), source.clone_connection()?);
     catalog.register_datasource(Arc::new(source));
     let spec = connectors::spec_from_kind("duckdb", Some(path), None)?;
     connectors::register(datasource.name.clone(), spec);

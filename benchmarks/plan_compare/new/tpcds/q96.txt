@@ -1,0 +1,10 @@
+QUERY: q96
+ENGINE: new (rust) EXPLAIN
+
+Shipment __fedq_ship_0 [duck]
+  Scan pg.public.household_demographics +filter
+  Shipment __fedq_ship_1 [duck]
+    Scan pg.public.time_dim +filter
+    Shipment __fedq_ship_2 [duck]
+      Scan pg.public.store +filter
+      RemoteQuery [duck] :: SELECT COUNT() AS "col_0" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_0" AS "household_demographics" ON ("store_sales"."ss_hdemo_sk" = "household_demographics"."hd_demo_sk") INNER JOIN "temp"."__fedq_ship_1" AS "time_dim" ON ("store_sales"."ss_sold_time_sk" = "time_dim"."t_time_sk") INNER JOIN "temp"."__fedq_ship_2" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk") ORDER BY COUNT() NULLS LAST LIMIT 100

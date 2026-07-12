@@ -1,0 +1,22 @@
+QUERY: q28
+ENGINE: new (rust) EXPLAIN
+
+Projection
+  Limit
+    NestedLoopJoin
+      NestedLoopJoin
+        NestedLoopJoin
+          NestedLoopJoin
+            NestedLoopJoin
+              AliasedRelation
+                Scan duck.main.store_sales +filter +agg(3) +groupby
+              AliasedRelation
+                Scan duck.main.store_sales +filter +agg(3) +groupby
+            AliasedRelation
+              Scan duck.main.store_sales +filter +agg(3) +groupby
+          AliasedRelation
+            Scan duck.main.store_sales +filter +agg(3) +groupby
+        AliasedRelation
+          Scan duck.main.store_sales +filter +agg(3) +groupby
+      AliasedRelation
+        Scan duck.main.store_sales +filter +agg(3) +groupby

@@ -1,0 +1,4 @@
+QUERY: q14
+ENGINE: new (rust) EXPLAIN
+
+ERROR: RuntimeError: parse error: unsupported SQL: function `union`

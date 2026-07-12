@@ -1,0 +1,31 @@
+QUERY: q02
+ENGINE: old (python)
+
+ISLANDS: 8
+PUSHES_AGG_OR_JOIN: False
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalSort, PhysicalFilter, PhysicalNestedLoopJoin, PhysicalHashJoin, PhysicalHashAggregate, PhysicalHashJoin, PhysicalUnion, PhysicalHashJoin, PhysicalHashAggregate, PhysicalHashJoin, PhysicalUnion
+
+--- island 0 source=duck kind=scan ---
+SELECT "ws_sold_date_sk", "ws_ext_sales_price" FROM "main"."web_sales" AS "web_sales"
+
+--- island 1 source=duck kind=scan ---
+SELECT "cs_sold_date_sk", "cs_ext_sales_price" FROM "main"."catalog_sales" AS "catalog_sales"
+
+--- island 2 source=pg kind=scan ---
+SELECT "d_week_seq", "d_date_sk", "d_day_name" FROM "public"."date_dim" AS "date_dim"
+
+--- island 3 source=pg kind=scan ---
+SELECT "d_week_seq", "d_year" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_year" = 2001)
+
+--- island 4 source=duck kind=scan ---
+SELECT "ws_sold_date_sk", "ws_ext_sales_price" FROM "main"."web_sales" AS "web_sales"
+
+--- island 5 source=duck kind=scan ---
+SELECT "cs_sold_date_sk", "cs_ext_sales_price" FROM "main"."catalog_sales" AS "catalog_sales"
+
+--- island 6 source=pg kind=scan ---
+SELECT "d_week_seq", "d_date_sk", "d_day_name" FROM "public"."date_dim" AS "date_dim"
+
+--- island 7 source=pg kind=scan ---
+SELECT "d_week_seq", "d_year" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_year" = (2001 + 1))

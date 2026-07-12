@@ -1,0 +1,31 @@
+QUERY: q59
+ENGINE: old (python)
+
+ISLANDS: 8
+PUSHES_AGG_OR_JOIN: False
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalFilter, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashAggregate, PhysicalHashJoin
+
+--- island 0 source=duck kind=scan ---
+SELECT "ss_store_sk", "ss_sold_date_sk", "ss_sales_price" FROM "main"."store_sales" AS "store_sales"
+
+--- island 1 source=pg kind=scan ---
+SELECT "d_week_seq", "d_date_sk", "d_day_name" FROM "public"."date_dim" AS "date_dim"
+
+--- island 2 source=pg kind=scan ---
+SELECT "s_store_name", "s_store_id", "s_store_sk" FROM "public"."store" AS "store"
+
+--- island 3 source=pg kind=scan ---
+SELECT "d_month_seq", "d_week_seq" FROM "public"."date_dim" AS "d" WHERE ("d"."d_month_seq" BETWEEN 1212 AND (1212 + 11))
+
+--- island 4 source=duck kind=scan ---
+SELECT "ss_store_sk", "ss_sold_date_sk", "ss_sales_price" FROM "main"."store_sales" AS "store_sales"
+
+--- island 5 source=pg kind=scan ---
+SELECT "d_week_seq", "d_date_sk", "d_day_name" FROM "public"."date_dim" AS "date_dim"
+
+--- island 6 source=pg kind=scan ---
+SELECT "s_store_name", "s_store_id", "s_store_sk" FROM "public"."store" AS "store"
+
+--- island 7 source=pg kind=scan ---
+SELECT "d_month_seq", "d_week_seq" FROM "public"."date_dim" AS "d" WHERE ("d"."d_month_seq" BETWEEN (1212 + 12) AND (1212 + 23))

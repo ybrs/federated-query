@@ -1,0 +1,25 @@
+QUERY: q49
+ENGINE: old (python)
+
+ISLANDS: 6
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalUnion, PhysicalUnion, PhysicalFilter, PhysicalHashAggregate, PhysicalHashAggregate, PhysicalHashJoin, PhysicalFilter, PhysicalHashAggregate, PhysicalHashAggregate, PhysicalHashJoin, PhysicalFilter, PhysicalHashAggregate, PhysicalHashAggregate, PhysicalHashJoin
+
+--- island 0 source=duck kind=join ---
+SELECT "ws"."ws_item_sk" AS "ws_item_sk", "ws"."ws_order_number" AS "ws_order_number", "ws"."ws_quantity" AS "ws_quantity", "ws"."ws_net_paid" AS "ws_net_paid", "ws"."ws_net_profit" AS "ws_net_profit", "ws"."ws_sold_date_sk" AS "ws_sold_date_sk", "wr"."wr_order_number" AS "wr_order_number", "wr"."wr_item_sk" AS "wr_item_sk", "wr"."wr_return_quantity" AS "wr_return_quantity", "wr"."wr_return_amt" AS "wr_return_amt" FROM "main"."web_sales" AS "ws" LEFT JOIN "main"."web_returns" AS "wr" ON (("ws"."ws_order_number" = "wr"."wr_order_number") AND ("ws"."ws_item_sk" = "wr"."wr_item_sk")) WHERE ("wr"."wr_return_amt" > 10000) AND ((("ws"."ws_net_profit" > 1) AND ("ws"."ws_net_paid" > 0)) AND ("ws"."ws_quantity" > 0))
+
+--- island 1 source=pg kind=scan ---
+SELECT "d_moy", "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_year" = 2001) AND ("date_dim"."d_moy" = 12))
+
+--- island 2 source=duck kind=join ---
+SELECT "cs"."cs_item_sk" AS "cs_item_sk", "cs"."cs_order_number" AS "cs_order_number", "cs"."cs_quantity" AS "cs_quantity", "cs"."cs_net_paid" AS "cs_net_paid", "cs"."cs_net_profit" AS "cs_net_profit", "cs"."cs_sold_date_sk" AS "cs_sold_date_sk", "cr"."cr_order_number" AS "cr_order_number", "cr"."cr_item_sk" AS "cr_item_sk", "cr"."cr_return_quantity" AS "cr_return_quantity", "cr"."cr_return_amount" AS "cr_return_amount" FROM "main"."catalog_sales" AS "cs" LEFT JOIN "main"."catalog_returns" AS "cr" ON (("cs"."cs_order_number" = "cr"."cr_order_number") AND ("cs"."cs_item_sk" = "cr"."cr_item_sk")) WHERE ("cr"."cr_return_amount" > 10000) AND ((("cs"."cs_net_profit" > 1) AND ("cs"."cs_net_paid" > 0)) AND ("cs"."cs_quantity" > 0))
+
+--- island 3 source=pg kind=scan ---
+SELECT "d_moy", "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_year" = 2001) AND ("date_dim"."d_moy" = 12))
+
+--- island 4 source=duck kind=join ---
+SELECT "sts"."ss_item_sk" AS "ss_item_sk", "sts"."ss_ticket_number" AS "ss_ticket_number", "sts"."ss_quantity" AS "ss_quantity", "sts"."ss_net_paid" AS "ss_net_paid", "sts"."ss_net_profit" AS "ss_net_profit", "sts"."ss_sold_date_sk" AS "ss_sold_date_sk", "sr"."sr_ticket_number" AS "sr_ticket_number", "sr"."sr_item_sk" AS "sr_item_sk", "sr"."sr_return_quantity" AS "sr_return_quantity", "sr"."sr_return_amt" AS "sr_return_amt" FROM "main"."store_sales" AS "sts" LEFT JOIN "main"."store_returns" AS "sr" ON (("sts"."ss_ticket_number" = "sr"."sr_ticket_number") AND ("sts"."ss_item_sk" = "sr"."sr_item_sk")) WHERE ("sr"."sr_return_amt" > 10000) AND ((("sts"."ss_net_profit" > 1) AND ("sts"."ss_net_paid" > 0)) AND ("sts"."ss_quantity" > 0))
+
+--- island 5 source=pg kind=scan ---
+SELECT "d_moy", "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_year" = 2001) AND ("date_dim"."d_moy" = 12))

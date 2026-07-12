@@ -1,0 +1,44 @@
+QUERY: q54
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  Sort
+    HashAggregate
+      CteScan
+        Cte
+          Projection
+            CteScan
+              Cte
+                HashAggregate
+                  Filter
+                    NestedLoopJoin
+                      NestedLoopJoin
+                        HashJoin
+                          HashJoin
+                            HashJoin
+                              RemoteQuery [pg] :: SELECT "customer_address"."ca_address_sk" AS "ca_address_sk", "customer_address"."ca_county" AS "ca_county", "customer_address"."ca_state" AS "ca_state", "store"."s_county" AS "s_county", "store"."s_state" AS "s_state" FROM "public"."customer_address" AS "customer_address" INNER JOIN "public"."store" AS "store" ON (("customer_address"."ca_county" = "store"."s_county") AND ("customer_address"."ca_state" = "store"."s_state"))
+                              CteScan
+                                Cte
+                                  Projection
+                                    HashJoin
+                                      HashJoin
+                                        HashJoin
+                                          AliasedRelation
+                                            Union
+                                              Projection
+                                                Scan duck.main.catalog_sales
+                                              Projection
+                                                Scan duck.main.web_sales
+                                          Scan pg.public.item +filter
+                                        Scan pg.public.date_dim +filter
+                                      Scan pg.public.customer
+                            Scan duck.main.store_sales
+                          Scan pg.public.date_dim
+                        AliasedRelation
+                          SingleRowGuard
+                            Projection
+                              RemoteQuery [pg] :: SELECT DISTINCT ("date_dim"."d_month_seq" + 1) AS "col_0" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_year" = 1998) AND ("date_dim"."d_moy" = 12))
+                      AliasedRelation
+                        SingleRowGuard
+                          Projection
+                            RemoteQuery [pg] :: SELECT DISTINCT ("date_dim"."d_month_seq" + 3) AS "col_0" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_year" = 1998) AND ("date_dim"."d_moy" = 12))

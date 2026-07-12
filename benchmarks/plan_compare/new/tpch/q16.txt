@@ -1,0 +1,12 @@
+QUERY: q16
+ENGINE: new (rust) EXPLAIN
+
+Sort
+  HashAggregate
+    HashJoin
+      NestedLoopJoin
+        Scan duck.main.partsupp
+        AliasedRelation
+          Projection
+            Scan pg.public.supplier +filter
+      Scan pg.public.part +filter

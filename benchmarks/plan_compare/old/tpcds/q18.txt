@@ -1,0 +1,22 @@
+QUERY: q18
+ENGINE: old (python)
+
+ISLANDS: 5
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=pg kind=join ---
+SELECT "customer"."c_birth_year" AS "c_birth_year", "customer"."c_birth_month" AS "c_birth_month", "customer"."c_current_addr_sk" AS "c_current_addr_sk", "customer"."c_current_cdemo_sk" AS "c_current_cdemo_sk", "customer"."c_customer_sk" AS "c_customer_sk", "customer_address"."ca_country" AS "ca_country", "customer_address"."ca_state" AS "ca_state", "customer_address"."ca_county" AS "ca_county", "customer_address"."ca_address_sk" AS "ca_address_sk", "cd2"."cd_demo_sk" AS "cd_demo_sk" FROM "public"."customer" AS "customer" INNER JOIN "public"."customer_address" AS "customer_address" ON ("customer"."c_current_addr_sk" = "customer_address"."ca_address_sk") INNER JOIN "public"."customer_demographics" AS "cd2" ON ("customer"."c_current_cdemo_sk" = "cd2"."cd_demo_sk") WHERE ("customer"."c_birth_month" IN (1, 6, 8, 9, 12, 2)) AND ("customer_address"."ca_state" IN ('MS', 'IN', 'ND', 'OK', 'NM', 'VA', 'MS'))
+
+--- island 1 source=duck kind=scan ---
+SELECT "cs_quantity", "cs_list_price", "cs_coupon_amt", "cs_sales_price", "cs_net_profit", "cs_bill_customer_sk", "cs_bill_cdemo_sk", "cs_sold_date_sk", "cs_item_sk" FROM "main"."catalog_sales" AS "catalog_sales"
+
+--- island 2 source=pg kind=scan ---
+SELECT "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_year" = 1998)
+
+--- island 3 source=pg kind=scan ---
+SELECT "i_item_id", "i_item_sk" FROM "public"."item" AS "item"
+
+--- island 4 source=pg kind=scan ---
+SELECT "cd_dep_count", "cd_education_status", "cd_gender", "cd_demo_sk" FROM "public"."customer_demographics" AS "cd1" WHERE (("cd1"."cd_gender" = 'F') AND ("cd1"."cd_education_status" = 'Unknown'))

@@ -1,0 +1,8 @@
+QUERY: q37
+ENGINE: new (rust) EXPLAIN
+
+Shipment __fedq_ship_0 [duck]
+  Scan pg.public.item +filter
+  Shipment __fedq_ship_1 [duck]
+    Scan pg.public.date_dim +filter
+    RemoteQuery [duck] :: SELECT "item"."i_item_id" AS "i_item_id", "item"."i_item_desc" AS "i_item_desc", "item"."i_current_price" AS "i_current_price" FROM "temp"."__fedq_ship_0" AS "item" INNER JOIN "main"."inventory" AS "inventory" ON ("inventory"."inv_item_sk" = "item"."i_item_sk") INNER JOIN "temp"."__fedq_ship_1" AS "date_dim" ON ("date_dim"."d_date_sk" = "inventory"."inv_date_sk") INNER JOIN "main"."catalog_sales" AS "catalog_sales" ON ("catalog_sales"."cs_item_sk" = "item"."i_item_sk") WHERE ("inventory"."inv_quantity_on_hand" BETWEEN 100 AND 500) GROUP BY "item"."i_item_id", "item"."i_item_desc", "item"."i_current_price" ORDER BY "i_item_id" NULLS LAST LIMIT 100

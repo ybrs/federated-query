@@ -1,0 +1,22 @@
+QUERY: q20
+ENGINE: old (python)
+
+ISLANDS: 5
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalSort, PhysicalHashJoin, PhysicalHashJoin, PhysicalFilter, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=pg kind=scan ---
+SELECT "s_name", "s_address", "s_suppkey", "s_nationkey" FROM "public"."supplier" AS "supplier"
+
+--- island 1 source=duck kind=scan ---
+SELECT "ps_suppkey", "ps_partkey", "ps_availqty" FROM "main"."partsupp" AS "partsupp"
+
+--- island 2 source=pg kind=scan ---
+SELECT "p_partkey", "p_name" FROM "public"."part" AS "part" WHERE ("part"."p_name" LIKE 'forest%')
+
+--- island 3 source=duck kind=agg ---
+SELECT SUM("lineitem"."l_quantity") AS "__subq_9_v0", "lineitem"."l_partkey" AS "__subq_9_g0", "lineitem"."l_suppkey" AS "__subq_9_g1" FROM "main"."lineitem" AS "lineitem" WHERE (("lineitem"."l_shipdate" >= CAST('1994-01-01' AS DATE)) AND ("lineitem"."l_shipdate" < CAST('1995-01-01' AS DATE))) GROUP BY "lineitem"."l_partkey", "lineitem"."l_suppkey"
+
+--- island 4 source=pg kind=scan ---
+SELECT "n_name", "n_nationkey" FROM "public"."nation" AS "nation" WHERE ("nation"."n_name" = 'CANADA')

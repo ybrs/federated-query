@@ -1,0 +1,10 @@
+QUERY: q21
+ENGINE: new (rust) EXPLAIN
+
+Shipment __fedq_ship_0 [duck]
+  Scan pg.public.item +filter
+  Shipment __fedq_ship_1 [duck]
+    Scan pg.public.date_dim +filter
+    Shipment __fedq_ship_2 [duck]
+      Scan pg.public.warehouse
+      RemoteQuery [duck] :: SELECT "x"."w_warehouse_name" AS "w_warehouse_name", "x"."i_item_id" AS "i_item_id", "x"."inv_before" AS "inv_before", "x"."inv_after" AS "inv_after" FROM (SELECT "warehouse"."w_warehouse_name" AS "w_warehouse_name", "item"."i_item_id" AS "i_item_id", SUM(CASE WHEN (CAST("date_dim"."d_date" AS DATE) < CAST('2000-03-11' AS DATE)) THEN "inventory"."inv_quantity_on_hand" ELSE 0 END) AS "inv_before", SUM(CASE WHEN (CAST("date_dim"."d_date" AS DATE) >= CAST('2000-03-11' AS DATE)) THEN "inventory"."inv_quantity_on_hand" ELSE 0 END) AS "inv_after" FROM "main"."inventory" AS "inventory" INNER JOIN "temp"."__fedq_ship_0" AS "item" ON ("item"."i_item_sk" = "inventory"."inv_item_sk") INNER JOIN "temp"."__fedq_ship_1" AS "date_dim" ON ("inventory"."inv_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_2" AS "warehouse" ON ("inventory"."inv_warehouse_sk" = "warehouse"."w_warehouse_sk") GROUP BY "warehouse"."w_warehouse_name", "item"."i_item_id") AS "x" WHERE (CASE WHEN ("x"."inv_before" > 0) THEN (CAST(("x"."inv_after" * 1) AS DOUBLE) / NULLIF("x"."inv_before", 0)) ELSE NULL END BETWEEN (CAST(2 AS DOUBLE) / NULLIF(3, 0)) AND (CAST(3 AS DOUBLE) / NULLIF(2, 0))) ORDER BY "w_warehouse_name" NULLS FIRST, "i_item_id" NULLS FIRST LIMIT 100

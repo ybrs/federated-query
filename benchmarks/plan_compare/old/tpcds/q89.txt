@@ -1,0 +1,19 @@
+QUERY: q89
+ENGINE: old (python)
+
+ISLANDS: 4
+PUSHES_AGG_OR_JOIN: False
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalFilter, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=pg kind=scan ---
+SELECT "i_category", "i_class", "i_brand", "i_item_sk" FROM "public"."item" AS "item" WHERE ((("item"."i_category" IN ('Books', 'Electronics', 'Sports')) AND ("item"."i_class" IN ('computers', 'stereo', 'football'))) OR (("item"."i_category" IN ('Men', 'Jewelry', 'Women')) AND ("item"."i_class" IN ('shirts', 'birdal', 'dresses'))))
+
+--- island 1 source=duck kind=scan ---
+SELECT "ss_sales_price", "ss_store_sk", "ss_item_sk", "ss_sold_date_sk" FROM "main"."store_sales" AS "store_sales"
+
+--- island 2 source=pg kind=scan ---
+SELECT "d_moy", "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_year" = 1999)
+
+--- island 3 source=pg kind=scan ---
+SELECT "s_store_name", "s_company_name", "s_store_sk" FROM "public"."store" AS "store"

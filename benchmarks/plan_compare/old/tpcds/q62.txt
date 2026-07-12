@@ -1,0 +1,22 @@
+QUERY: q62
+ENGINE: old (python)
+
+ISLANDS: 5
+PUSHES_AGG_OR_JOIN: False
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=duck kind=scan ---
+SELECT "ws_web_site_sk", "ws_ship_mode_sk", "ws_warehouse_sk", "ws_ship_date_sk", "ws_sold_date_sk" FROM "main"."web_sales" AS "web_sales"
+
+--- island 1 source=pg kind=scan ---
+SELECT "d_month_seq", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_month_seq" BETWEEN 1200 AND (1200 + 11))
+
+--- island 2 source=pg kind=scan ---
+SELECT "sm_type", "sm_ship_mode_sk" FROM "public"."ship_mode" AS "ship_mode"
+
+--- island 3 source=pg kind=scan ---
+SELECT SUBSTRING("warehouse"."w_warehouse_name", 1, 20) AS "w_substr", "warehouse"."w_warehouse_sk" AS "w_warehouse_sk", "warehouse"."w_warehouse_id" AS "w_warehouse_id", "warehouse"."w_warehouse_name" AS "w_warehouse_name", "warehouse"."w_warehouse_sq_ft" AS "w_warehouse_sq_ft", "warehouse"."w_street_number" AS "w_street_number", "warehouse"."w_street_name" AS "w_street_name", "warehouse"."w_street_type" AS "w_street_type", "warehouse"."w_suite_number" AS "w_suite_number", "warehouse"."w_city" AS "w_city", "warehouse"."w_county" AS "w_county", "warehouse"."w_state" AS "w_state", "warehouse"."w_zip" AS "w_zip", "warehouse"."w_country" AS "w_country", "warehouse"."w_gmt_offset" AS "w_gmt_offset" FROM "public"."warehouse" AS "warehouse"
+
+--- island 4 source=pg kind=scan ---
+SELECT "web_name", "web_site_sk" FROM "public"."web_site" AS "web_site"

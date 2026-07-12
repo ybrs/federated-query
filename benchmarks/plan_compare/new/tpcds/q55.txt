@@ -1,0 +1,8 @@
+QUERY: q55
+ENGINE: new (rust) EXPLAIN
+
+Shipment __fedq_ship_0 [duck]
+  Scan pg.public.item +filter
+  Shipment __fedq_ship_1 [duck]
+    Scan pg.public.date_dim +filter
+    RemoteQuery [duck] :: SELECT "item"."i_brand_id" AS "brand_id", "item"."i_brand" AS "brand", SUM("store_sales"."ss_ext_sales_price") AS "ext_price" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_0" AS "item" ON ("store_sales"."ss_item_sk" = "item"."i_item_sk") INNER JOIN "temp"."__fedq_ship_1" AS "date_dim" ON ("date_dim"."d_date_sk" = "store_sales"."ss_sold_date_sk") GROUP BY "item"."i_brand", "item"."i_brand_id" ORDER BY "ext_price" DESC NULLS LAST, "item"."i_brand_id" NULLS LAST LIMIT 100

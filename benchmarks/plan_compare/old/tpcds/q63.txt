@@ -1,0 +1,19 @@
+QUERY: q63
+ENGINE: old (python)
+
+ISLANDS: 4
+PUSHES_AGG_OR_JOIN: False
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalFilter, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=pg kind=scan ---
+SELECT "i_manager_id", "i_item_sk", "i_brand", "i_category", "i_class" FROM "public"."item" AS "item" WHERE (((("item"."i_category" IN ('Books', 'Children', 'Electronics')) AND ("item"."i_class" IN ('personal', 'portable', 'reference', 'self-help'))) AND ("item"."i_brand" IN ('scholaramalgamalg #14', 'scholaramalgamalg #7', 'exportiunivamalg #9', 'scholaramalgamalg #9'))) OR ((("item"."i_category" IN ('Women', 'Music', 'Men')) AND ("item"."i_class" IN ('accessories', 'classical', 'fragrances', 'pants'))) AND ("item"."i_brand" IN ('amalgimporto #1', 'edu packscholar #1', 'exportiimporto #1', 'importoamalg #1'))))
+
+--- island 1 source=duck kind=scan ---
+SELECT "ss_sales_price", "ss_store_sk", "ss_item_sk", "ss_sold_date_sk" FROM "main"."store_sales" AS "store_sales"
+
+--- island 2 source=pg kind=scan ---
+SELECT "d_moy", "d_month_seq", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_month_seq" IN (1200, (1200 + 1), (1200 + 2), (1200 + 3), (1200 + 4), (1200 + 5), (1200 + 6), (1200 + 7), (1200 + 8), (1200 + 9), (1200 + 10), (1200 + 11)))
+
+--- island 3 source=pg kind=scan ---
+SELECT "s_store_sk" FROM "public"."store" AS "store"

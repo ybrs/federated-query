@@ -1,0 +1,28 @@
+QUERY: q95
+ENGINE: old (python)
+
+ISLANDS: 7
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=duck kind=scan ---
+SELECT "ws_ext_ship_cost", "ws_net_profit", "ws_order_number", "ws_warehouse_sk", "ws_web_site_sk", "ws_ship_addr_sk", "ws_ship_date_sk" FROM "main"."web_sales" AS "ws1"
+
+--- island 1 source=duck kind=join ---
+SELECT "ws1"."ws_order_number" AS "ws_order_number", "ws1"."ws_warehouse_sk" AS "wh1", "ws2"."ws_warehouse_sk" AS "wh2" FROM "main"."web_sales" AS "ws1" INNER JOIN "main"."web_sales" AS "ws2" ON ("ws1"."ws_order_number" = "ws2"."ws_order_number") WHERE ("ws1"."ws_warehouse_sk" <> "ws2"."ws_warehouse_sk")
+
+--- island 2 source=duck kind=scan ---
+SELECT "wr_order_number" FROM "main"."web_returns" AS "web_returns"
+
+--- island 3 source=duck kind=join ---
+SELECT "ws1"."ws_order_number" AS "ws_order_number", "ws1"."ws_warehouse_sk" AS "wh1", "ws2"."ws_warehouse_sk" AS "wh2" FROM "main"."web_sales" AS "ws1" INNER JOIN "main"."web_sales" AS "ws2" ON ("ws1"."ws_order_number" = "ws2"."ws_order_number") WHERE ("ws1"."ws_warehouse_sk" <> "ws2"."ws_warehouse_sk")
+
+--- island 4 source=pg kind=scan ---
+SELECT "ca_state", "ca_address_sk" FROM "public"."customer_address" AS "customer_address" WHERE ("customer_address"."ca_state" = 'IL')
+
+--- island 5 source=pg kind=scan ---
+SELECT "d_date", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_date" BETWEEN '1999-02-01' AND CAST('1999-04-02' AS DATE))
+
+--- island 6 source=pg kind=scan ---
+SELECT "web_company_name", "web_site_sk" FROM "public"."web_site" AS "web_site" WHERE ("web_site"."web_company_name" = 'pri')

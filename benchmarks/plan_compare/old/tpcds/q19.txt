@@ -1,0 +1,25 @@
+QUERY: q19
+ENGINE: old (python)
+
+ISLANDS: 6
+PUSHES_AGG_OR_JOIN: False
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalHashAggregate, PhysicalFilter, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=duck kind=scan ---
+SELECT "ss_ext_sales_price", "ss_store_sk", "ss_customer_sk", "ss_sold_date_sk", "ss_item_sk" FROM "main"."store_sales" AS "store_sales"
+
+--- island 1 source=pg kind=scan ---
+SELECT "i_manufact_id", "i_manufact", "i_brand_id", "i_brand", "i_manager_id", "i_item_sk" FROM "public"."item" AS "item" WHERE ("item"."i_manager_id" = 8)
+
+--- island 2 source=pg kind=scan ---
+SELECT "d_year", "d_moy", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_moy" = 11) AND ("date_dim"."d_year" = 1998))
+
+--- island 3 source=pg kind=scan ---
+SELECT "c_current_addr_sk", "c_customer_sk" FROM "public"."customer" AS "customer"
+
+--- island 4 source=pg kind=scan ---
+SELECT "ca_address_sk", "ca_zip" FROM "public"."customer_address" AS "customer_address"
+
+--- island 5 source=pg kind=scan ---
+SELECT "s_store_sk", "s_zip" FROM "public"."store" AS "store"

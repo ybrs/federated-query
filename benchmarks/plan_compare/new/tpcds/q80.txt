@@ -1,0 +1,4 @@
+QUERY: q80
+ENGINE: new (rust) EXPLAIN
+
+ERROR: RuntimeError: parse error: unsupported SQL: Implicit JOIN

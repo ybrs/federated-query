@@ -1,0 +1,34 @@
+QUERY: q83
+ENGINE: old (python)
+
+ISLANDS: 9
+PUSHES_AGG_OR_JOIN: False
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=duck kind=scan ---
+SELECT "sr_return_quantity", "sr_returned_date_sk", "sr_item_sk" FROM "main"."store_returns" AS "store_returns"
+
+--- island 1 source=pg kind=scan ---
+SELECT "date_dim"."d_date_sk" AS "d_date_sk", "date_dim"."d_date" AS "d_date", "date_dim"."d_week_seq" AS "d_week_seq" FROM "public"."date_dim" AS "date_dim" WHERE EXISTS(SELECT 1 FROM (SELECT "date_dim"."d_date" AS "__subq_66_v0" FROM "public"."date_dim" AS "date_dim" WHERE EXISTS(SELECT 1 FROM (SELECT "date_dim"."d_week_seq" AS "__subq_67_v0" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_date" IN ('2000-06-30', '2000-09-27', '2000-11-17'))) AS "__subq_67" WHERE ("date_dim"."d_week_seq" = "__subq_67"."__subq_67_v0"))) AS "__subq_66" WHERE ("date_dim"."d_date" = "__subq_66"."__subq_66_v0"))
+
+--- island 2 source=pg kind=scan ---
+SELECT "i_item_id", "i_item_sk" FROM "public"."item" AS "item"
+
+--- island 3 source=duck kind=scan ---
+SELECT "wr_return_quantity", "wr_returned_date_sk", "wr_item_sk" FROM "main"."web_returns" AS "web_returns"
+
+--- island 4 source=pg kind=scan ---
+SELECT "date_dim"."d_date_sk" AS "d_date_sk", "date_dim"."d_date" AS "d_date", "date_dim"."d_week_seq" AS "d_week_seq" FROM "public"."date_dim" AS "date_dim" WHERE EXISTS(SELECT 1 FROM (SELECT "date_dim"."d_date" AS "__subq_70_v0" FROM "public"."date_dim" AS "date_dim" WHERE EXISTS(SELECT 1 FROM (SELECT "date_dim"."d_week_seq" AS "__subq_71_v0" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_date" IN ('2000-06-30', '2000-09-27', '2000-11-17'))) AS "__subq_71" WHERE ("date_dim"."d_week_seq" = "__subq_71"."__subq_71_v0"))) AS "__subq_70" WHERE ("date_dim"."d_date" = "__subq_70"."__subq_70_v0"))
+
+--- island 5 source=pg kind=scan ---
+SELECT "i_item_id", "i_item_sk" FROM "public"."item" AS "item"
+
+--- island 6 source=duck kind=scan ---
+SELECT "cr_return_quantity", "cr_returned_date_sk", "cr_item_sk" FROM "main"."catalog_returns" AS "catalog_returns"
+
+--- island 7 source=pg kind=scan ---
+SELECT "date_dim"."d_date_sk" AS "d_date_sk", "date_dim"."d_date" AS "d_date", "date_dim"."d_week_seq" AS "d_week_seq" FROM "public"."date_dim" AS "date_dim" WHERE EXISTS(SELECT 1 FROM (SELECT "date_dim"."d_date" AS "__subq_68_v0" FROM "public"."date_dim" AS "date_dim" WHERE EXISTS(SELECT 1 FROM (SELECT "date_dim"."d_week_seq" AS "__subq_69_v0" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_date" IN ('2000-06-30', '2000-09-27', '2000-11-17'))) AS "__subq_69" WHERE ("date_dim"."d_week_seq" = "__subq_69"."__subq_69_v0"))) AS "__subq_68" WHERE ("date_dim"."d_date" = "__subq_68"."__subq_68_v0"))
+
+--- island 8 source=pg kind=scan ---
+SELECT "i_item_id", "i_item_sk" FROM "public"."item" AS "item"

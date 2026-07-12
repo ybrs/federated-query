@@ -1,0 +1,19 @@
+QUERY: q97
+ENGINE: old (python)
+
+ISLANDS: 4
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: __fedq_ship_0->duck, __fedq_ship_1->duck
+COORDINATOR_OPS: PhysicalLimit, PhysicalHashAggregate, PhysicalHashJoin
+
+--- island 0 source=pg kind=scan ---
+SELECT "d_date_sk", "d_month_seq" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_month_seq" BETWEEN 1200 AND (1200 + 11))
+
+--- island 1 source=duck kind=join ---
+SELECT "store_sales"."ss_customer_sk" AS "customer_sk", "store_sales"."ss_item_sk" AS "item_sk" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_0" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") GROUP BY "store_sales"."ss_customer_sk", "store_sales"."ss_item_sk"
+
+--- island 2 source=pg kind=scan ---
+SELECT "d_date_sk", "d_month_seq" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_month_seq" BETWEEN 1200 AND (1200 + 11))
+
+--- island 3 source=duck kind=join ---
+SELECT "catalog_sales"."cs_bill_customer_sk" AS "customer_sk", "catalog_sales"."cs_item_sk" AS "item_sk" FROM "main"."catalog_sales" AS "catalog_sales" INNER JOIN "temp"."__fedq_ship_1" AS "date_dim" ON ("catalog_sales"."cs_sold_date_sk" = "date_dim"."d_date_sk") GROUP BY "catalog_sales"."cs_bill_customer_sk", "catalog_sales"."cs_item_sk"

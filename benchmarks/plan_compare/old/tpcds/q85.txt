@@ -1,0 +1,28 @@
+QUERY: q85
+ENGINE: old (python)
+
+ISLANDS: 7
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalHashAggregate, PhysicalFilter, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalFilter, PhysicalHashJoin
+
+--- island 0 source=duck kind=join ---
+SELECT "web_sales"."ws_quantity" AS "ws_quantity", "web_sales"."ws_net_profit" AS "ws_net_profit", "web_sales"."ws_sales_price" AS "ws_sales_price", "web_sales"."ws_sold_date_sk" AS "ws_sold_date_sk", "web_sales"."ws_order_number" AS "ws_order_number", "web_sales"."ws_web_page_sk" AS "ws_web_page_sk", "web_sales"."ws_item_sk" AS "ws_item_sk", "web_returns"."wr_fee" AS "wr_fee", "web_returns"."wr_refunded_cash" AS "wr_refunded_cash", "web_returns"."wr_reason_sk" AS "wr_reason_sk", "web_returns"."wr_refunded_addr_sk" AS "wr_refunded_addr_sk", "web_returns"."wr_returning_cdemo_sk" AS "wr_returning_cdemo_sk", "web_returns"."wr_refunded_cdemo_sk" AS "wr_refunded_cdemo_sk", "web_returns"."wr_order_number" AS "wr_order_number", "web_returns"."wr_item_sk" AS "wr_item_sk" FROM "main"."web_sales" AS "web_sales" INNER JOIN "main"."web_returns" AS "web_returns" ON (("web_sales"."ws_item_sk" = "web_returns"."wr_item_sk") AND ("web_sales"."ws_order_number" = "web_returns"."wr_order_number")) WHERE (((("web_sales"."ws_sales_price" BETWEEN 100.0 AND 150.0) OR ("web_sales"."ws_sales_price" BETWEEN 50.0 AND 100.0)) OR ("web_sales"."ws_sales_price" BETWEEN 150.0 AND 200.0)) AND ((("web_sales"."ws_net_profit" BETWEEN 100 AND 200) OR ("web_sales"."ws_net_profit" BETWEEN 150 AND 300)) OR ("web_sales"."ws_net_profit" BETWEEN 50 AND 250)))
+
+--- island 1 source=pg kind=scan ---
+SELECT "ca_address_sk", "ca_country", "ca_state" FROM "public"."customer_address" AS "customer_address" WHERE (("customer_address"."ca_country" = 'United States') AND ((("customer_address"."ca_state" IN ('IN', 'OH', 'NJ')) OR ("customer_address"."ca_state" IN ('WI', 'CT', 'KY'))) OR ("customer_address"."ca_state" IN ('LA', 'IA', 'AR'))))
+
+--- island 2 source=pg kind=scan ---
+SELECT "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_year" = 2000)
+
+--- island 3 source=pg kind=scan ---
+SELECT "wp_web_page_sk" FROM "public"."web_page" AS "web_page"
+
+--- island 4 source=pg kind=scan ---
+SELECT "cd_demo_sk", "cd_education_status", "cd_marital_status" FROM "public"."customer_demographics" AS "cd2"
+
+--- island 5 source=pg kind=scan ---
+SELECT "r_reason_desc", "r_reason_sk" FROM "public"."reason" AS "reason"
+
+--- island 6 source=pg kind=scan ---
+SELECT "cd_demo_sk", "cd_education_status", "cd_marital_status" FROM "public"."customer_demographics" AS "cd1" WHERE (((("cd1"."cd_marital_status" = 'M') AND ("cd1"."cd_education_status" = 'Advanced Degree')) OR (("cd1"."cd_marital_status" = 'S') AND ("cd1"."cd_education_status" = 'College'))) OR (("cd1"."cd_marital_status" = 'W') AND ("cd1"."cd_education_status" = '2 yr Degree')))

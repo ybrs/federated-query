@@ -1,0 +1,22 @@
+QUERY: q99
+ENGINE: old (python)
+
+ISLANDS: 5
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: __fedq_ship_0->duck, __fedq_ship_1->duck, __fedq_ship_2->duck, __fedq_ship_3->duck
+COORDINATOR_OPS: none
+
+--- island 0 source=pg kind=scan ---
+SELECT "d_month_seq", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_month_seq" BETWEEN 1200 AND (1200 + 11))
+
+--- island 1 source=pg kind=scan ---
+SELECT "sm_type", "sm_ship_mode_sk" FROM "public"."ship_mode" AS "ship_mode"
+
+--- island 2 source=pg kind=scan ---
+SELECT "w_warehouse_name", "w_warehouse_sk", "w_warehouse_id", "w_warehouse_sq_ft", "w_street_number", "w_street_name", "w_street_type", "w_suite_number", "w_city", "w_county", "w_state", "w_zip", "w_country", "w_gmt_offset" FROM "public"."warehouse" AS "warehouse"
+
+--- island 3 source=pg kind=scan ---
+SELECT "cc_name", "cc_call_center_sk" FROM "public"."call_center" AS "call_center"
+
+--- island 4 source=duck kind=join ---
+SELECT "sq1"."w_substr" AS "w_substr", "ship_mode"."sm_type" AS "sm_type", LOWER("call_center"."cc_name") AS "cc_name_lower", SUM(CASE WHEN (("catalog_sales"."cs_ship_date_sk" - "catalog_sales"."cs_sold_date_sk") <= 30) THEN 1 ELSE 0 END) AS "30 days", SUM(CASE WHEN ((("catalog_sales"."cs_ship_date_sk" - "catalog_sales"."cs_sold_date_sk") > 30) AND (("catalog_sales"."cs_ship_date_sk" - "catalog_sales"."cs_sold_date_sk") <= 60)) THEN 1 ELSE 0 END) AS "31-60 days", SUM(CASE WHEN ((("catalog_sales"."cs_ship_date_sk" - "catalog_sales"."cs_sold_date_sk") > 60) AND (("catalog_sales"."cs_ship_date_sk" - "catalog_sales"."cs_sold_date_sk") <= 90)) THEN 1 ELSE 0 END) AS "61-90 days", SUM(CASE WHEN ((("catalog_sales"."cs_ship_date_sk" - "catalog_sales"."cs_sold_date_sk") > 90) AND (("catalog_sales"."cs_ship_date_sk" - "catalog_sales"."cs_sold_date_sk") <= 120)) THEN 1 ELSE 0 END) AS "91-120 days", SUM(CASE WHEN (("catalog_sales"."cs_ship_date_sk" - "catalog_sales"."cs_sold_date_sk") > 120) THEN 1 ELSE 0 END) AS ">120 days" FROM "main"."catalog_sales" AS "catalog_sales" INNER JOIN "temp"."__fedq_ship_0" AS "date_dim" ON ("catalog_sales"."cs_ship_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_1" AS "ship_mode" ON ("catalog_sales"."cs_ship_mode_sk" = "ship_mode"."sm_ship_mode_sk") INNER JOIN (SELECT SUBSTRING("warehouse"."w_warehouse_name", 1, 20) AS "w_substr", "warehouse"."w_warehouse_sk" AS "w_warehouse_sk", "warehouse"."w_warehouse_id" AS "w_warehouse_id", "warehouse"."w_warehouse_name" AS "w_warehouse_name", "warehouse"."w_warehouse_sq_ft" AS "w_warehouse_sq_ft", "warehouse"."w_street_number" AS "w_street_number", "warehouse"."w_street_name" AS "w_street_name", "warehouse"."w_street_type" AS "w_street_type", "warehouse"."w_suite_number" AS "w_suite_number", "warehouse"."w_city" AS "w_city", "warehouse"."w_county" AS "w_county", "warehouse"."w_state" AS "w_state", "warehouse"."w_zip" AS "w_zip", "warehouse"."w_country" AS "w_country", "warehouse"."w_gmt_offset" AS "w_gmt_offset" FROM "temp"."__fedq_ship_2" AS "warehouse") AS "sq1" ON ("catalog_sales"."cs_warehouse_sk" = "sq1"."w_warehouse_sk") INNER JOIN "temp"."__fedq_ship_3" AS "call_center" ON ("catalog_sales"."cs_call_center_sk" = "call_center"."cc_call_center_sk") GROUP BY "sq1"."w_substr", "ship_mode"."sm_type", "call_center"."cc_name" ORDER BY "w_substr" ASC NULLS FIRST, "sm_type" ASC NULLS FIRST, "cc_name_lower" ASC NULLS FIRST LIMIT 100

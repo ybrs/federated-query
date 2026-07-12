@@ -1,0 +1,13 @@
+QUERY: q93
+ENGINE: old (python)
+
+ISLANDS: 2
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalHashAggregate, PhysicalHashJoin
+
+--- island 0 source=duck kind=join ---
+SELECT "store_sales"."ss_item_sk" AS "ss_item_sk", "store_sales"."ss_ticket_number" AS "ss_ticket_number", "store_sales"."ss_customer_sk" AS "ss_customer_sk", "store_sales"."ss_sales_price" AS "ss_sales_price", "store_sales"."ss_quantity" AS "ss_quantity", "store_returns"."sr_reason_sk" AS "sr_reason_sk", "store_returns"."sr_item_sk" AS "sr_item_sk", "store_returns"."sr_ticket_number" AS "sr_ticket_number", "store_returns"."sr_return_quantity" AS "sr_return_quantity" FROM "main"."store_sales" AS "store_sales" LEFT JOIN "main"."store_returns" AS "store_returns" ON (("store_returns"."sr_item_sk" = "store_sales"."ss_item_sk") AND ("store_returns"."sr_ticket_number" = "store_sales"."ss_ticket_number"))
+
+--- island 1 source=pg kind=scan ---
+SELECT "r_reason_sk", "r_reason_desc" FROM "public"."reason" AS "reason" WHERE ("reason"."r_reason_desc" = 'reason 28')

@@ -1,0 +1,19 @@
+QUERY: q91
+ENGINE: old (python)
+
+ISLANDS: 4
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalSort, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=pg kind=join ---
+SELECT "customer"."c_current_addr_sk" AS "c_current_addr_sk", "customer"."c_current_hdemo_sk" AS "c_current_hdemo_sk", "customer"."c_current_cdemo_sk" AS "c_current_cdemo_sk", "customer"."c_customer_sk" AS "c_customer_sk", "household_demographics"."hd_buy_potential" AS "hd_buy_potential", "household_demographics"."hd_demo_sk" AS "hd_demo_sk", "customer_address"."ca_gmt_offset" AS "ca_gmt_offset", "customer_address"."ca_address_sk" AS "ca_address_sk", "customer_demographics"."cd_marital_status" AS "cd_marital_status", "customer_demographics"."cd_education_status" AS "cd_education_status", "customer_demographics"."cd_demo_sk" AS "cd_demo_sk" FROM "public"."customer" AS "customer" INNER JOIN "public"."household_demographics" AS "household_demographics" ON ("household_demographics"."hd_demo_sk" = "customer"."c_current_hdemo_sk") INNER JOIN "public"."customer_address" AS "customer_address" ON ("customer_address"."ca_address_sk" = "customer"."c_current_addr_sk") INNER JOIN "public"."customer_demographics" AS "customer_demographics" ON ("customer_demographics"."cd_demo_sk" = "customer"."c_current_cdemo_sk") WHERE ("household_demographics"."hd_buy_potential" LIKE 'Unknown%') AND ("customer_address"."ca_gmt_offset" = (-7)) AND ((("customer_demographics"."cd_marital_status" = 'M') AND ("customer_demographics"."cd_education_status" = 'Unknown')) OR (("customer_demographics"."cd_marital_status" = 'W') AND ("customer_demographics"."cd_education_status" = 'Advanced Degree')))
+
+--- island 1 source=duck kind=scan ---
+SELECT "cr_net_loss", "cr_returning_customer_sk", "cr_call_center_sk", "cr_returned_date_sk" FROM "main"."catalog_returns" AS "catalog_returns"
+
+--- island 2 source=pg kind=scan ---
+SELECT "d_moy", "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_year" = 1998) AND ("date_dim"."d_moy" = 11))
+
+--- island 3 source=pg kind=scan ---
+SELECT "cc_call_center_id", "cc_name", "cc_manager", "cc_call_center_sk" FROM "public"."call_center" AS "call_center"

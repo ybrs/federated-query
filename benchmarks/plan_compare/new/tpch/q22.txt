@@ -1,0 +1,17 @@
+QUERY: q22
+ENGINE: new (rust) EXPLAIN
+
+Sort
+  HashAggregate
+    AliasedRelation
+      Projection
+        HashJoin
+          Filter
+            NestedLoopJoin
+              Scan pg.public.customer +filter
+              AliasedRelation
+                Projection
+                  Scan pg.public.customer +filter +agg(1) +groupby
+          AliasedRelation
+            Projection
+              Scan duck.main.orders

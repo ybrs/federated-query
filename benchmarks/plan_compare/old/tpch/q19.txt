@@ -1,0 +1,13 @@
+QUERY: q19
+ENGINE: old (python)
+
+ISLANDS: 2
+PUSHES_AGG_OR_JOIN: False
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalHashAggregate, PhysicalFilter, PhysicalHashJoin
+
+--- island 0 source=duck kind=scan ---
+SELECT "l_extendedprice", "l_discount", "l_shipinstruct", "l_shipmode", "l_quantity", "l_partkey" FROM "main"."lineitem" AS "lineitem" WHERE ((("lineitem"."l_shipmode" IN ('AIR', 'AIR REG')) AND ("lineitem"."l_shipinstruct" = 'DELIVER IN PERSON')) AND (((("lineitem"."l_quantity" >= 1) AND ("lineitem"."l_quantity" <= (1 + 10))) OR (("lineitem"."l_quantity" >= 10) AND ("lineitem"."l_quantity" <= (10 + 10)))) OR (("lineitem"."l_quantity" >= 20) AND ("lineitem"."l_quantity" <= (20 + 10)))))
+
+--- island 1 source=pg kind=scan ---
+SELECT "p_size", "p_container", "p_partkey", "p_brand" FROM "public"."part" AS "part" WHERE ((((("part"."p_brand" = 'Brand#12') AND ("part"."p_container" IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG'))) AND ("part"."p_size" BETWEEN 1 AND 5)) OR ((("part"."p_brand" = 'Brand#23') AND ("part"."p_container" IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK'))) AND ("part"."p_size" BETWEEN 1 AND 10))) OR ((("part"."p_brand" = 'Brand#34') AND ("part"."p_container" IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG'))) AND ("part"."p_size" BETWEEN 1 AND 15)))

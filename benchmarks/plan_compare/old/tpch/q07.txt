@@ -1,0 +1,22 @@
+QUERY: q07
+ENGINE: old (python)
+
+ISLANDS: 5
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalSort, PhysicalHashAggregate, PhysicalFilter, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=pg kind=join ---
+SELECT "customer"."c_nationkey" AS "c_nationkey", "customer"."c_custkey" AS "c_custkey", "n2"."n_name" AS "n_name", "n2"."n_nationkey" AS "n_nationkey" FROM "public"."customer" AS "customer" INNER JOIN "public"."nation" AS "n2" ON ("customer"."c_nationkey" = "n2"."n_nationkey") WHERE (("n2"."n_name" = 'GERMANY') OR ("n2"."n_name" = 'FRANCE'))
+
+--- island 1 source=duck kind=scan ---
+SELECT "o_custkey", "o_orderkey" FROM "main"."orders" AS "orders"
+
+--- island 2 source=duck kind=scan ---
+SELECT "l_shipdate", "l_extendedprice", "l_discount", "l_suppkey", "l_orderkey" FROM "main"."lineitem" AS "lineitem" WHERE ("lineitem"."l_shipdate" BETWEEN CAST('1995-01-01' AS DATE) AND CAST('1996-12-31' AS DATE))
+
+--- island 3 source=pg kind=scan ---
+SELECT "s_nationkey", "s_suppkey" FROM "public"."supplier" AS "supplier"
+
+--- island 4 source=pg kind=scan ---
+SELECT "n_name", "n_nationkey" FROM "public"."nation" AS "n1" WHERE (("n1"."n_name" = 'FRANCE') OR ("n1"."n_name" = 'GERMANY'))

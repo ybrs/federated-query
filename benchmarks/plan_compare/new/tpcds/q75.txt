@@ -1,0 +1,72 @@
+QUERY: q75
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  Sort
+    Projection
+      Filter
+        HashJoin
+          Filter
+            CteScan
+              Cte
+                HashAggregate
+                  Filter
+                    AliasedRelation
+                      Union
+                        Union
+                          Projection
+                            HashJoin
+                              HashJoin
+                                HashJoin
+                                  Scan duck.main.catalog_sales +semijoin
+                                  Scan pg.public.item +filter
+                                Scan pg.public.date_dim
+                              Scan duck.main.catalog_returns
+                          Projection
+                            HashJoin
+                              HashJoin
+                                HashJoin
+                                  Scan duck.main.store_sales +semijoin
+                                  Scan pg.public.item +filter
+                                Scan pg.public.date_dim
+                              Scan duck.main.store_returns
+                        Projection
+                          HashJoin
+                            HashJoin
+                              HashJoin
+                                Scan duck.main.web_sales +semijoin
+                                Scan pg.public.item +filter
+                              Scan pg.public.date_dim
+                            Scan duck.main.web_returns
+          Filter
+            CteScan
+              Cte
+                HashAggregate
+                  Filter
+                    AliasedRelation
+                      Union
+                        Union
+                          Projection
+                            HashJoin
+                              HashJoin
+                                HashJoin
+                                  Scan duck.main.catalog_sales +semijoin
+                                  Scan pg.public.item +filter
+                                Scan pg.public.date_dim
+                              Scan duck.main.catalog_returns
+                          Projection
+                            HashJoin
+                              HashJoin
+                                HashJoin
+                                  Scan duck.main.store_sales +semijoin
+                                  Scan pg.public.item +filter
+                                Scan pg.public.date_dim
+                              Scan duck.main.store_returns
+                        Projection
+                          HashJoin
+                            HashJoin
+                              HashJoin
+                                Scan duck.main.web_sales +semijoin
+                                Scan pg.public.item +filter
+                              Scan pg.public.date_dim
+                            Scan duck.main.web_returns

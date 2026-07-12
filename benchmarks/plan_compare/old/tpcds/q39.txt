@@ -1,0 +1,31 @@
+QUERY: q39
+ENGINE: old (python)
+
+ISLANDS: 8
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: __fedq_ship_0->duck, __fedq_ship_1->duck, __fedq_ship_2->duck, __fedq_ship_0->duck, __fedq_ship_1->duck, __fedq_ship_2->duck
+COORDINATOR_OPS: PhysicalSort, PhysicalHashJoin, PhysicalFilter, PhysicalFilter
+
+--- island 0 source=pg kind=scan ---
+SELECT "i_item_sk" FROM "public"."item" AS "item"
+
+--- island 1 source=pg kind=scan ---
+SELECT "w_warehouse_name", "w_warehouse_sk" FROM "public"."warehouse" AS "warehouse"
+
+--- island 2 source=pg kind=scan ---
+SELECT "d_moy", "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_year" = 2001)
+
+--- island 3 source=duck kind=join ---
+SELECT "foo"."w_warehouse_name" AS "w_warehouse_name", "foo"."w_warehouse_sk" AS "w_warehouse_sk", "foo"."i_item_sk" AS "i_item_sk", "foo"."d_moy" AS "d_moy", "foo"."stdev" AS "stdev", "foo"."mean" AS "mean", CASE WHEN ("foo"."mean" = 0) THEN NULL ELSE (CAST("foo"."stdev" AS DOUBLE PRECISION) / NULLIF("foo"."mean", 0)) END AS "cov" FROM (SELECT "warehouse"."w_warehouse_name" AS "w_warehouse_name", "warehouse"."w_warehouse_sk" AS "w_warehouse_sk", "item"."i_item_sk" AS "i_item_sk", "date_dim"."d_moy" AS "d_moy", (STDDEV_SAMP("inventory"."inv_quantity_on_hand") * 1.0) AS "stdev", AVG("inventory"."inv_quantity_on_hand") AS "mean" FROM "main"."inventory" AS "inventory" INNER JOIN "temp"."__fedq_ship_0" AS "item" ON ("inventory"."inv_item_sk" = "item"."i_item_sk") INNER JOIN "temp"."__fedq_ship_1" AS "warehouse" ON ("inventory"."inv_warehouse_sk" = "warehouse"."w_warehouse_sk") INNER JOIN "temp"."__fedq_ship_2" AS "date_dim" ON ("inventory"."inv_date_sk" = "date_dim"."d_date_sk") GROUP BY "warehouse"."w_warehouse_name", "warehouse"."w_warehouse_sk", "item"."i_item_sk", "date_dim"."d_moy") AS "foo" WHERE (CASE WHEN ("foo"."mean" = 0) THEN 0 ELSE (CAST("foo"."stdev" AS DOUBLE PRECISION) / NULLIF("foo"."mean", 0)) END > 1)
+
+--- island 4 source=pg kind=scan ---
+SELECT "i_item_sk" FROM "public"."item" AS "item"
+
+--- island 5 source=pg kind=scan ---
+SELECT "w_warehouse_name", "w_warehouse_sk" FROM "public"."warehouse" AS "warehouse"
+
+--- island 6 source=pg kind=scan ---
+SELECT "d_moy", "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_year" = 2001)
+
+--- island 7 source=duck kind=join ---
+SELECT "foo"."w_warehouse_name" AS "w_warehouse_name", "foo"."w_warehouse_sk" AS "w_warehouse_sk", "foo"."i_item_sk" AS "i_item_sk", "foo"."d_moy" AS "d_moy", "foo"."stdev" AS "stdev", "foo"."mean" AS "mean", CASE WHEN ("foo"."mean" = 0) THEN NULL ELSE (CAST("foo"."stdev" AS DOUBLE PRECISION) / NULLIF("foo"."mean", 0)) END AS "cov" FROM (SELECT "warehouse"."w_warehouse_name" AS "w_warehouse_name", "warehouse"."w_warehouse_sk" AS "w_warehouse_sk", "item"."i_item_sk" AS "i_item_sk", "date_dim"."d_moy" AS "d_moy", (STDDEV_SAMP("inventory"."inv_quantity_on_hand") * 1.0) AS "stdev", AVG("inventory"."inv_quantity_on_hand") AS "mean" FROM "main"."inventory" AS "inventory" INNER JOIN "temp"."__fedq_ship_0" AS "item" ON ("inventory"."inv_item_sk" = "item"."i_item_sk") INNER JOIN "temp"."__fedq_ship_1" AS "warehouse" ON ("inventory"."inv_warehouse_sk" = "warehouse"."w_warehouse_sk") INNER JOIN "temp"."__fedq_ship_2" AS "date_dim" ON ("inventory"."inv_date_sk" = "date_dim"."d_date_sk") GROUP BY "warehouse"."w_warehouse_name", "warehouse"."w_warehouse_sk", "item"."i_item_sk", "date_dim"."d_moy") AS "foo" WHERE (CASE WHEN ("foo"."mean" = 0) THEN 0 ELSE (CAST("foo"."stdev" AS DOUBLE PRECISION) / NULLIF("foo"."mean", 0)) END > 1)

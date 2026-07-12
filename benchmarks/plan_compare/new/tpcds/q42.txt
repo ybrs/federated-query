@@ -1,0 +1,8 @@
+QUERY: q42
+ENGINE: new (rust) EXPLAIN
+
+Shipment __fedq_ship_0 [duck]
+  Scan pg.public.item +filter
+  Shipment __fedq_ship_1 [duck]
+    Scan pg.public.date_dim +filter
+    RemoteQuery [duck] :: SELECT "dt"."d_year" AS "d_year", "item"."i_category_id" AS "i_category_id", "item"."i_category" AS "i_category", SUM("store_sales"."ss_ext_sales_price") AS "col_3" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_0" AS "item" ON ("store_sales"."ss_item_sk" = "item"."i_item_sk") INNER JOIN "temp"."__fedq_ship_1" AS "dt" ON ("dt"."d_date_sk" = "store_sales"."ss_sold_date_sk") GROUP BY "dt"."d_year", "item"."i_category_id", "item"."i_category" ORDER BY SUM("store_sales"."ss_ext_sales_price") DESC NULLS LAST, "dt"."d_year" NULLS LAST, "item"."i_category_id" NULLS LAST, "item"."i_category" NULLS LAST LIMIT 100

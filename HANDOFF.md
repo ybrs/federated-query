@@ -51,6 +51,172 @@ Strategy (decided with the user):
   `federated-query/postgres-17`, trust auth; started via
   `scripts/run-postgres.sh`). DuckDB fixtures live under `benchmarks/*/data/`.
 
+## PERF INVESTIGATION 2026-07-12: federated benchmarks + plan comparison
+
+The engine is CORRECT but SLOW. This section records what was measured, why it is
+slow, and exactly how to re-run every measurement. All of it lives under
+`benchmarks/plan_compare/` (scripts + dumped plans). Nothing here is committed.
+
+### Headline findings (all measured, not guessed)
+
+1. CORRECTNESS holds. Federated TPC-H (pg-dims: dims on Postgres, facts on
+   DuckDB) is 22/22 correct at sf0.01. TPC-H single-source 22/22.
+2. PLANS are mostly the SAME as the old engine. The new planner keeps the old
+   federation shape (per-source pushdown, semi-join reduction, dim-shipping);
+   structurally identical on ~24 TPC-H and ~29 TPC-DS queries.
+3. PERF is badly regressed and it is NOT plan quality. On IDENTICAL plans, new is
+   ~10-20x slower end to end. TWO independent root causes:
+
+   A) PLANNING SCANS DATA (the existential problem). The new engine's metadata
+      estimate path `StatisticsCollector::scan_planner_estimate`
+      (`crates/fq-optimize/src/statistics.rs:242`) is a NO-OP stub ("render seam
+      pending", returns None). So cardinality/NDV falls through to
+      `approx_count_distinct(col)` over the fact table's needed columns
+      (`crates/fq-connectors/src/duckdb_source.rs:239`) - a REAL SCAN - on EVERY
+      plan. And `Runtime::cost_model()` (`crates/fq-runtime/src/lib.rs:115`)
+      builds a FRESH `StatisticsCollector` (empty cache) per query, called twice
+      per execute (lib.rs:84 optimizer, lib.rs:91 physical planner), so nothing
+      persists. Cold plan == warm plan == ~380ms at SF1; it is O(data), so SF10
+      is seconds and SF100 is tens of seconds PER QUERY before any row is
+      fetched. Caching does NOT fix this (a cold plan still scans; the first
+      query and every large-scale query pays it).
+
+      The OLD engine is O(1) in data at plan time: cardinality from DuckDB
+      `EXPLAIN` `~N rows` metadata (`federated_query/datasources/duckdb.py:180`),
+      NDV from a persisted LEARNED sqlite catalog measured lazily from real
+      execution (`federated_query/optimizer/statistics.py:107`), "never a full
+      COUNT(DISTINCT) pass". THE FIX (not yet done): wire `scan_planner_estimate`
+      to the EXPLAIN/parquet-metadata row estimate and pull NDV from the learned
+      catalog; NEVER run `approx_count_distinct` at plan time.
+
+   B) DuckDB is compiled -O0. The `duckdb` crate is used with the `bundled`
+      feature (`crates/fq-exec/Cargo.toml`), so the DuckDB C++ amalgamation is
+      compiled with the Rust dev profile's OPT_LEVEL=0. Same query, same data,
+      same DuckDB version 1.5.x, runs ~10x slower than native (285ms vs 25ms for
+      the SF1 q01 aggregate). THE FIX (not yet done, user's suggestion): link a
+      PREBUILT libduckdb.so instead of the bundled amalgamation (also kills the
+      ~10-min release compiles). A prebuilt lib already exists on this box at
+      `/workspace/duckdb-query-analyzer/duckdb-src/build/release/src/libduckdb.so`
+      (verify version matches crate 1.10504.0). NOTE: this only affects execution
+      and the plan-time scan constant; it does NOT make O(data) planning O(1) -
+      fix (A) is the one that matters for scale.
+
+4. NEW cannot plan over PARQUET at all. `register_datasource`
+   (`crates/fq-runtime/src/lib.rs`) only dispatches `duckdb`/`postgres`; there is
+   NO parquet catalog/stats source in fq-connectors (only exec-plane reading in
+   fq-exec). OLD parquet works (registers files as duckdb tables, same cheap
+   EXPLAIN-metadata path; cold plan 5-78ms). If NEW parquet were wired with the
+   current approach it would be WORSE: parquet has no NDV in metadata, so
+   `approx_count_distinct` would scan the whole file every plan.
+
+### Measured numbers (SF1, warm median unless noted)
+
+Same-plan end-to-end (ms): OLD total / NEW total
+  q01 32 / 646   q06 12 / 235   q12 24 / 535   q04 32 / 150
+NEW breakdown (ms): q01 plan 348 + duckfetch 290 ; q12 plan 405 + fetch 128.
+COLD plan (fresh runtime per query, ms): OLD duck / OLD parquet / NEW duck
+  q01 92 / 78 / 378    q06 55 / 52 / 172    q12 10 / 5 / 419
+Old federated TPC-H baseline (prior architecture, for reference): SF1 22/22,
+1683.8ms ours / 1078.7ms DuckDB = 1.56x (`benchmarks/tpch/reports/`).
+
+### HOW TO RUN EVERYTHING
+
+Environment (every command):
+```
+export PATH=$HOME/.cargo/bin:/tmp/.cargo/bin:$PATH
+export HOME=/tmp
+export CARGO_TARGET_DIR=/workspace/federated-query/target
+```
+Python interpreter: `/workspace/venv-fedq/bin/python`. Postgres on :5432
+(trust auth, user postgres). Build the pyo3 module after any Rust change:
+`cargo build -p fedq-py`  (produces `target/debug/libfedq_py.so`, symlinked to
+`benchmarks/tpch/fedq.so` and `benchmarks/tpcds/fedq.so`).
+
+Data state: TPC-H pg is in database `duckpoc` (sf0.01) and `duckpoc_sf1` (SF1);
+duck files `benchmarks/tpch/data/tpch_sf{0.01,1}.duckdb`. TPC-DS duck files
+`benchmarks/tpcds/data/tpcds_sf{0.1,1,10}.duckdb`; pg dims in `tpcds_sf01`.
+Reload TPC-H pg: `benchmarks/tpch/load_postgres.py --scale-factor <sf>
+--pg-database <db>`. Parquet SF1 (already generated):
+`benchmarks/tpch/data/parquet_sf1/` via
+`benchmarks/tpch/export_parquet.py --scale-factor 1 --target-dir data/parquet_sf1`.
+
+Dump ALL plans, both engines (fast, pure planning, sub-second/query):
+```
+cd benchmarks/plan_compare
+python dump_old.py tpch      # writes old/tpch/*.txt  (static physical-plan walk)
+python dump_old.py tpcds     # writes old/tpcds/*.txt
+python dump_new_explain.py tpch    # writes new/tpch/*.txt  (EXPLAIN, no execution)
+python dump_new_explain.py tpcds   # writes new/tpcds/*.txt
+python make_report.py        # writes REPORT.md (per-query table + divergences)
+```
+NOTE: `dump_new.py` (the ORIGINAL) EXECUTES queries to capture pushed SQL from the
+`FEDQRS_TRACE_SQL` trace and is SLOW (~13 min for 121). Use `dump_new_explain.py`
+(pure planning) unless you specifically need the runtime-rendered pushed SQL.
+
+Profile plan-vs-fetch-vs-total, one engine per process (they each link their own
+duckdb; do NOT combine in one process):
+```
+cd benchmarks/plan_compare
+python profile_engine.py old q01 q06 q12   # OLD, fresh runtime/query, cold+warm plan
+python profile_engine.py new q01 q06 q12   # NEW, same
+python profile_old_parquet.py q01 q06 q12  # OLD over the parquet source
+```
+`profile_engine.py` sets `FEDQRS_PROFILE=1` internally; the per-step `[fedqrs]
+...ms source_scan ds=...` lines it parses are the fetch times. Both engines honor
+`FEDQRS_PROFILE=1` (new = `crates/fq-exec/src/engine.rs:290`, old =
+`/workspace/fedqrs/src/engine.rs:290`) and the NEW engine also honors
+`FEDQRS_TRACE_SQL=1` (prints every pushed SQL to stderr,
+`crates/fq-exec/src/connectors.rs`).
+
+Run the federated TPC-H correctness/timing driver (NEW engine):
+```
+cd benchmarks/tpch
+python run_federated_rust.py --scale-factor 0.01 --pg-database duckpoc --warm-runs 1
+python run_federated_rust.py --scale-factor 1 --pg-database duckpoc_sf1 --warm-runs 3
+```
+(`--only 1,6,12` selects queries by NUMBER, not "q01".) OLD equivalent:
+`run_federated.py` (same flags shape).
+
+### UNCOMMITTED Rust changes I made (keep or revert deliberately)
+
+- `crates/fq-exec/src/connectors.rs` + `crates/fq-connectors/src/duckdb_source.rs`
+  + `crates/fq-runtime/src/lib.rs`: DuckDB now opens ONCE read-WRITE in the
+  catalog and the exec plane is seeded with a `try_clone()` of that one instance
+  (`seed_duck_connection` / `DuckDbSource::clone_connection`), instead of two
+  read-only handles fighting the file lock. This is a REAL FIX: the old
+  read-only exec handle made the DuckDB Appender reject the dim-ship/semi-join
+  temp-table writes ("Cannot append to a readonly database"), crashing 8 SF1
+  federated queries. `open_read_only` was removed. KEEP THIS.
+- `crates/fq-exec/src/connectors.rs`: added `FEDQRS_TRACE_SQL=1` trace (`trace_sql`
+  in `fetch_duckdb`/`fetch_postgres`). KEEP (used by the dumpers).
+- `crates/fq-runtime/src/explain.rs`: enriched `node_label` so EXPLAIN shows the
+  pushed `.sql` for RemoteQuery/Gather and `+filter/+agg/+groupby/+semijoin/...`
+  tags for Scan (they were single terse lines). KEEP (used by dump_new_explain).
+- `crates/fq-bind/tests/bind.rs`: untouched behavior; check `git diff`.
+  Verify `cargo build -p fedq-py` + `cargo clippy` + `cargo test` before commit.
+
+### BUG PUNCH-LIST (from the plan comparison, ranked)
+
+1. PLAN-TIME SCAN (perf, existential) - fix (A) above. This is the priority.
+2. Same-source fact-fact join NOT pushed (TPC-H q03, q08): OLD pushes
+   `orders JOIN lineitem` into DuckDB as one island; NEW pulls both facts to the
+   coordinator (semi-join reduced) and joins in DataFusion. Plan-quality gap.
+   See `benchmarks/plan_compare/{old,new}/tpch/q03.txt`.
+3. Untyped ColumnRef panic (TPC-DS q32; also q02/q11 at SF1):
+   `ColumnRef type must be set during binding` (`crates/fq-plan/src/expr.rs:320`).
+   Decorrelation mints synthetic columns with NO data type - `qualified_col`/
+   `unqualified_col` pass `None` (`crates/fq-decorrelate/src/helpers.rs:36,44`,
+   `dependent.rs:370`). They carry the qualifier but not the type; a plan path
+   that calls `get_type` panics. Fix: set the data type when minting them.
+4. `COUNT()` rendered instead of `COUNT(*)` (TPC-DS q08, q41): DuckDB tolerates
+   the empty parens (TPC-H q01 passes) but Postgres rejects it. Rendering bug.
+5. Parser gaps -> 21 TPC-DS queries don't PLAN: window functions (14), comma/
+   implicit joins (4), `stddev_samp` (2), `union` in one position (1). Feature
+   work in fq-parse. (ROLLUP + type_coercion queries PLAN fine; they were
+   EXECUTION errors in an earlier run, not planning.)
+
+Full per-query divergence table + ranked patterns: `benchmarks/plan_compare/REPORT.md`.
+
 ## Crate DAG (target)
 
 ```

@@ -1,0 +1,21 @@
+QUERY: q20
+ENGINE: new (rust) EXPLAIN
+
+Sort
+  Projection
+    HashJoin
+      HashJoin
+        Scan pg.public.supplier
+        AliasedRelation
+          Projection
+            Filter
+              HashJoin
+                HashJoin
+                  Scan duck.main.partsupp
+                  AliasedRelation
+                    Projection
+                      Scan pg.public.part +filter
+                AliasedRelation
+                  Projection
+                    Scan duck.main.lineitem +filter +agg(3) +groupby
+      Scan pg.public.nation +filter

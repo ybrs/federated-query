@@ -1,0 +1,30 @@
+QUERY: q78
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  Sort
+    Projection
+      Filter
+        HashJoin
+          HashJoin
+            Filter
+              CteScan
+                Cte
+                  HashAggregate
+                    HashJoin
+                      RemoteQuery [duck] :: SELECT "store_sales"."ss_sold_date_sk" AS "ss_sold_date_sk", "store_sales"."ss_item_sk" AS "ss_item_sk", "store_sales"."ss_customer_sk" AS "ss_customer_sk", "store_sales"."ss_ticket_number" AS "ss_ticket_number", "store_sales"."ss_quantity" AS "ss_quantity", "store_sales"."ss_wholesale_cost" AS "ss_wholesale_cost", "store_sales"."ss_sales_price" AS "ss_sales_price", "store_returns"."sr_item_sk" AS "sr_item_sk", "store_returns"."sr_ticket_number" AS "sr_ticket_number" FROM "main"."store_sales" AS "store_sales" LEFT JOIN "main"."store_returns" AS "store_returns" ON (("store_returns"."sr_ticket_number" = "store_sales"."ss_ticket_number") AND ("store_sales"."ss_item_sk" = "store_returns"."sr_item_sk")) WHERE ("store_returns"."sr_ticket_number" IS NULL)
+                      Scan pg.public.date_dim +filter
+            Filter
+              CteScan
+                Cte
+                  HashAggregate
+                    HashJoin
+                      RemoteQuery [duck] :: SELECT "web_sales"."ws_sold_date_sk" AS "ws_sold_date_sk", "web_sales"."ws_item_sk" AS "ws_item_sk", "web_sales"."ws_bill_customer_sk" AS "ws_bill_customer_sk", "web_sales"."ws_order_number" AS "ws_order_number", "web_sales"."ws_quantity" AS "ws_quantity", "web_sales"."ws_wholesale_cost" AS "ws_wholesale_cost", "web_sales"."ws_sales_price" AS "ws_sales_price", "web_returns"."wr_item_sk" AS "wr_item_sk", "web_returns"."wr_order_number" AS "wr_order_number" FROM "main"."web_sales" AS "web_sales" LEFT JOIN "main"."web_returns" AS "web_returns" ON (("web_returns"."wr_order_number" = "web_sales"."ws_order_number") AND ("web_sales"."ws_item_sk" = "web_returns"."wr_item_sk")) WHERE ("web_returns"."wr_order_number" IS NULL)
+                      Scan pg.public.date_dim +filter
+          Filter
+            CteScan
+              Cte
+                HashAggregate
+                  HashJoin
+                    RemoteQuery [duck] :: SELECT "catalog_sales"."cs_sold_date_sk" AS "cs_sold_date_sk", "catalog_sales"."cs_bill_customer_sk" AS "cs_bill_customer_sk", "catalog_sales"."cs_item_sk" AS "cs_item_sk", "catalog_sales"."cs_order_number" AS "cs_order_number", "catalog_sales"."cs_quantity" AS "cs_quantity", "catalog_sales"."cs_wholesale_cost" AS "cs_wholesale_cost", "catalog_sales"."cs_sales_price" AS "cs_sales_price", "catalog_returns"."cr_item_sk" AS "cr_item_sk", "catalog_returns"."cr_order_number" AS "cr_order_number" FROM "main"."catalog_sales" AS "catalog_sales" LEFT JOIN "main"."catalog_returns" AS "catalog_returns" ON (("catalog_returns"."cr_order_number" = "catalog_sales"."cs_order_number") AND ("catalog_sales"."cs_item_sk" = "catalog_returns"."cr_item_sk")) WHERE ("catalog_returns"."cr_order_number" IS NULL)
+                    Scan pg.public.date_dim +filter

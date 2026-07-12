@@ -1,0 +1,16 @@
+QUERY: q79
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  Sort
+    Projection
+      HashJoin
+        AliasedRelation
+          Shipment __fedq_ship_3 [duck]
+            Scan pg.public.date_dim +filter
+            Shipment __fedq_ship_4 [duck]
+              Scan pg.public.store +filter
+              Shipment __fedq_ship_5 [duck]
+                Scan pg.public.household_demographics +filter
+                RemoteQuery [duck] :: SELECT "store_sales"."ss_ticket_number" AS "ss_ticket_number", "store_sales"."ss_customer_sk" AS "ss_customer_sk", "store"."s_city" AS "s_city", SUM("store_sales"."ss_coupon_amt") AS "amt", SUM("store_sales"."ss_net_profit") AS "profit" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_3" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_4" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk") INNER JOIN "temp"."__fedq_ship_5" AS "household_demographics" ON ("store_sales"."ss_hdemo_sk" = "household_demographics"."hd_demo_sk") GROUP BY "store_sales"."ss_ticket_number", "store_sales"."ss_customer_sk", "store_sales"."ss_addr_sk", "store"."s_city"
+        Scan pg.public.customer

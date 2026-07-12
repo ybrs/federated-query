@@ -1,0 +1,13 @@
+QUERY: q84
+ENGINE: old (python)
+
+ISLANDS: 2
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalHashJoin
+
+--- island 0 source=pg kind=join ---
+SELECT "customer"."c_customer_id" AS "c_customer_id", "customer"."c_first_name" AS "c_first_name", "customer"."c_last_name" AS "c_last_name", "customer"."c_current_hdemo_sk" AS "c_current_hdemo_sk", "customer"."c_current_cdemo_sk" AS "c_current_cdemo_sk", "customer"."c_current_addr_sk" AS "c_current_addr_sk", "customer_address"."ca_city" AS "ca_city", "customer_address"."ca_address_sk" AS "ca_address_sk", "household_demographics"."hd_demo_sk" AS "hd_demo_sk", "household_demographics"."hd_income_band_sk" AS "hd_income_band_sk", "income_band"."ib_income_band_sk" AS "ib_income_band_sk", "income_band"."ib_upper_bound" AS "ib_upper_bound", "income_band"."ib_lower_bound" AS "ib_lower_bound", "customer_demographics"."cd_demo_sk" AS "cd_demo_sk" FROM "public"."customer" AS "customer" INNER JOIN "public"."customer_address" AS "customer_address" ON ("customer"."c_current_addr_sk" = "customer_address"."ca_address_sk") INNER JOIN "public"."household_demographics" AS "household_demographics" ON ("household_demographics"."hd_demo_sk" = "customer"."c_current_hdemo_sk") INNER JOIN "public"."income_band" AS "income_band" ON ("income_band"."ib_income_band_sk" = "household_demographics"."hd_income_band_sk") INNER JOIN "public"."customer_demographics" AS "customer_demographics" ON ("customer_demographics"."cd_demo_sk" = "customer"."c_current_cdemo_sk") WHERE ("customer_address"."ca_city" = 'Edgewood') AND (("income_band"."ib_lower_bound" >= 38128) AND ("income_band"."ib_upper_bound" <= (38128 + 50000)))
+
+--- island 1 source=duck kind=scan ---
+SELECT "sr_cdemo_sk" FROM "main"."store_returns" AS "store_returns"

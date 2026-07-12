@@ -1,0 +1,25 @@
+QUERY: q25
+ENGINE: old (python)
+
+ISLANDS: 6
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: __fedq_ship_0->duck, __fedq_ship_1->duck, __fedq_ship_2->duck, __fedq_ship_3->duck, __fedq_ship_4->duck
+COORDINATOR_OPS: none
+
+--- island 0 source=pg kind=scan ---
+SELECT "d_year", "d_moy", "d_date_sk" FROM "public"."date_dim" AS "d1" WHERE (("d1"."d_moy" = 4) AND ("d1"."d_year" = 2001))
+
+--- island 1 source=pg kind=scan ---
+SELECT "d_year", "d_moy", "d_date_sk" FROM "public"."date_dim" AS "d3" WHERE (("d3"."d_moy" BETWEEN 4 AND 10) AND ("d3"."d_year" = 2001))
+
+--- island 2 source=pg kind=scan ---
+SELECT "d_year", "d_moy", "d_date_sk" FROM "public"."date_dim" AS "d2" WHERE (("d2"."d_moy" BETWEEN 4 AND 10) AND ("d2"."d_year" = 2001))
+
+--- island 3 source=pg kind=scan ---
+SELECT "s_store_id", "s_store_name", "s_store_sk" FROM "public"."store" AS "store"
+
+--- island 4 source=pg kind=scan ---
+SELECT "i_item_id", "i_item_desc", "i_item_sk" FROM "public"."item" AS "item"
+
+--- island 5 source=duck kind=join ---
+SELECT "item"."i_item_id" AS "i_item_id", "item"."i_item_desc" AS "i_item_desc", "store"."s_store_id" AS "s_store_id", "store"."s_store_name" AS "s_store_name", SUM("store_sales"."ss_net_profit") AS "store_sales_profit", SUM("store_returns"."sr_net_loss") AS "store_returns_loss", SUM("catalog_sales"."cs_net_profit") AS "catalog_sales_profit" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_0" AS "d1" ON ("d1"."d_date_sk" = "store_sales"."ss_sold_date_sk") INNER JOIN "main"."store_returns" AS "store_returns" ON ((("store_sales"."ss_customer_sk" = "store_returns"."sr_customer_sk") AND ("store_sales"."ss_item_sk" = "store_returns"."sr_item_sk")) AND ("store_sales"."ss_ticket_number" = "store_returns"."sr_ticket_number")) INNER JOIN "main"."catalog_sales" AS "catalog_sales" ON (("store_returns"."sr_customer_sk" = "catalog_sales"."cs_bill_customer_sk") AND ("store_returns"."sr_item_sk" = "catalog_sales"."cs_item_sk")) INNER JOIN "temp"."__fedq_ship_1" AS "d3" ON ("catalog_sales"."cs_sold_date_sk" = "d3"."d_date_sk") INNER JOIN "temp"."__fedq_ship_2" AS "d2" ON ("store_returns"."sr_returned_date_sk" = "d2"."d_date_sk") INNER JOIN "temp"."__fedq_ship_3" AS "store" ON ("store"."s_store_sk" = "store_sales"."ss_store_sk") INNER JOIN "temp"."__fedq_ship_4" AS "item" ON ("item"."i_item_sk" = "store_sales"."ss_item_sk") GROUP BY "item"."i_item_id", "item"."i_item_desc", "store"."s_store_id", "store"."s_store_name" ORDER BY "i_item_id" ASC, "i_item_desc" ASC, "s_store_id" ASC, "s_store_name" ASC LIMIT 100

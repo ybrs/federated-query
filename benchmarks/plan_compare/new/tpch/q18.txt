@@ -1,0 +1,11 @@
+QUERY: q18
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  Sort
+    HashAggregate
+      HashJoin
+        HashJoin
+          Scan pg.public.customer
+          RemoteQuery [duck] :: SELECT "orders"."o_orderkey" AS "o_orderkey", "orders"."o_custkey" AS "o_custkey", "orders"."o_totalprice" AS "o_totalprice", "orders"."o_orderdate" AS "o_orderdate" FROM "main"."orders" AS "orders" WHERE EXISTS(SELECT 1 FROM (SELECT "lineitem"."l_orderkey" AS "__subq_0_v0" FROM "main"."lineitem" AS "lineitem" GROUP BY "lineitem"."l_orderkey" HAVING (SUM("lineitem"."l_quantity") > 300)) AS "__subq_0" WHERE ("orders"."o_orderkey" = "__subq_0"."__subq_0_v0"))
+        Scan duck.main.lineitem

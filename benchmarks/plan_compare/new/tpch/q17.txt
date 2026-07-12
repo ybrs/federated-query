@@ -1,0 +1,12 @@
+QUERY: q17
+ENGINE: new (rust) EXPLAIN
+
+HashAggregate
+  Filter
+    HashJoin
+      HashJoin
+        Scan duck.main.lineitem +semijoin
+        Scan pg.public.part +filter
+      AliasedRelation
+        Projection
+          Scan duck.main.lineitem +agg(2) +groupby

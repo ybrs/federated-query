@@ -1,0 +1,25 @@
+QUERY: q44
+ENGINE: old (python)
+
+ISLANDS: 6
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalFilter, PhysicalHashAggregate, PhysicalFilter, PhysicalNestedLoopJoin, PhysicalSingleRowGuard, PhysicalHashAggregate, PhysicalFilter, PhysicalHashAggregate, PhysicalFilter, PhysicalNestedLoopJoin, PhysicalSingleRowGuard, PhysicalHashAggregate
+
+--- island 0 source=duck kind=agg ---
+SELECT "ss1"."ss_item_sk" AS "item_sk", AVG("ss1"."ss_net_profit") AS "rank_col" FROM "main"."store_sales" AS "ss1" WHERE ("ss1"."ss_store_sk" = 4) GROUP BY "ss1"."ss_item_sk"
+
+--- island 1 source=duck kind=scan ---
+SELECT "ss_net_profit", "ss_store_sk", "ss_addr_sk" FROM "main"."store_sales" AS "store_sales" WHERE (("store_sales"."ss_store_sk" = 4) AND ("store_sales"."ss_addr_sk" IS NULL))
+
+--- island 2 source=duck kind=agg ---
+SELECT "ss1"."ss_item_sk" AS "item_sk", AVG("ss1"."ss_net_profit") AS "rank_col" FROM "main"."store_sales" AS "ss1" WHERE ("ss1"."ss_store_sk" = 4) GROUP BY "ss1"."ss_item_sk"
+
+--- island 3 source=duck kind=scan ---
+SELECT "ss_net_profit", "ss_store_sk", "ss_addr_sk" FROM "main"."store_sales" AS "store_sales" WHERE (("store_sales"."ss_store_sk" = 4) AND ("store_sales"."ss_addr_sk" IS NULL))
+
+--- island 4 source=pg kind=scan ---
+SELECT "i_product_name", "i_item_sk" FROM "public"."item" AS "i1"
+
+--- island 5 source=pg kind=scan ---
+SELECT "i_product_name", "i_item_sk" FROM "public"."item" AS "i2"

@@ -1,0 +1,17 @@
+QUERY: q11
+ENGINE: new (rust) EXPLAIN
+
+Sort
+  Projection
+    Filter
+      NestedLoopJoin
+        HashAggregate
+          HashJoin
+            RemoteQuery [pg] :: SELECT "supplier"."s_suppkey" AS "s_suppkey", "supplier"."s_nationkey" AS "s_nationkey", "nation"."n_nationkey" AS "n_nationkey", "nation"."n_name" AS "n_name" FROM "public"."supplier" AS "supplier" INNER JOIN "public"."nation" AS "nation" ON ("supplier"."s_nationkey" = "nation"."n_nationkey") WHERE ("nation"."n_name" = 'GERMANY')
+            Scan duck.main.partsupp +semijoin
+        AliasedRelation
+          Projection
+            HashAggregate
+              HashJoin
+                RemoteQuery [pg] :: SELECT "supplier"."s_suppkey" AS "s_suppkey", "supplier"."s_nationkey" AS "s_nationkey", "nation"."n_nationkey" AS "n_nationkey", "nation"."n_name" AS "n_name" FROM "public"."supplier" AS "supplier" INNER JOIN "public"."nation" AS "nation" ON ("supplier"."s_nationkey" = "nation"."n_nationkey") WHERE ("nation"."n_name" = 'GERMANY')
+                Scan duck.main.partsupp +semijoin

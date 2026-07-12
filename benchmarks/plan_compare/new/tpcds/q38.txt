@@ -1,0 +1,26 @@
+QUERY: q38
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  HashAggregate
+    AliasedRelation
+      SetOperation
+        SetOperation
+          Projection
+            HashJoin
+              HashJoin
+                Scan duck.main.store_sales +semijoin
+                Scan pg.public.date_dim +filter
+              Scan pg.public.customer
+          Projection
+            HashJoin
+              HashJoin
+                Scan duck.main.catalog_sales +semijoin
+                Scan pg.public.date_dim +filter
+              Scan pg.public.customer
+        Projection
+          HashJoin
+            HashJoin
+              Scan duck.main.web_sales +semijoin
+              Scan pg.public.date_dim +filter
+            Scan pg.public.customer

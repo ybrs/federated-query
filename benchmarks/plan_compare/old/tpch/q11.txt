@@ -1,0 +1,19 @@
+QUERY: q11
+ENGINE: old (python)
+
+ISLANDS: 4
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalSort, PhysicalFilter, PhysicalNestedLoopJoin, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashAggregate, PhysicalHashJoin
+
+--- island 0 source=pg kind=join ---
+SELECT "supplier"."s_suppkey" AS "s_suppkey", "supplier"."s_nationkey" AS "s_nationkey", "nation"."n_name" AS "n_name", "nation"."n_nationkey" AS "n_nationkey" FROM "public"."supplier" AS "supplier" INNER JOIN "public"."nation" AS "nation" ON ("supplier"."s_nationkey" = "nation"."n_nationkey") WHERE ("nation"."n_name" = 'GERMANY')
+
+--- island 1 source=duck kind=scan ---
+SELECT "ps_partkey", "ps_supplycost", "ps_availqty", "ps_suppkey" FROM "main"."partsupp" AS "partsupp"
+
+--- island 2 source=pg kind=join ---
+SELECT "supplier"."s_suppkey" AS "s_suppkey", "supplier"."s_nationkey" AS "s_nationkey", "nation"."n_name" AS "n_name", "nation"."n_nationkey" AS "n_nationkey" FROM "public"."supplier" AS "supplier" INNER JOIN "public"."nation" AS "nation" ON ("supplier"."s_nationkey" = "nation"."n_nationkey") WHERE ("nation"."n_name" = 'GERMANY')
+
+--- island 3 source=duck kind=scan ---
+SELECT "ps_supplycost", "ps_availqty", "ps_suppkey" FROM "main"."partsupp" AS "partsupp"

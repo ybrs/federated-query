@@ -1,0 +1,48 @@
+QUERY: q27
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  Sort
+    Projection
+      AliasedRelation
+        Union
+          Union
+            HashAggregate
+              CteScan
+                Cte
+                  Projection
+                    HashJoin
+                      HashJoin
+                        HashJoin
+                          HashJoin
+                            Scan duck.main.store_sales +semijoin
+                            Scan pg.public.customer_demographics +filter
+                          Scan pg.public.date_dim +filter
+                        Scan pg.public.item
+                      Scan pg.public.store +filter
+            HashAggregate
+              CteScan
+                Cte
+                  Projection
+                    HashJoin
+                      HashJoin
+                        HashJoin
+                          HashJoin
+                            Scan duck.main.store_sales +semijoin
+                            Scan pg.public.customer_demographics +filter
+                          Scan pg.public.date_dim +filter
+                        Scan pg.public.item
+                      Scan pg.public.store +filter
+          HashAggregate
+            CteScan
+              Cte
+                Projection
+                  HashJoin
+                    HashJoin
+                      HashJoin
+                        HashJoin
+                          Scan duck.main.store_sales +semijoin
+                          Scan pg.public.customer_demographics +filter
+                        Scan pg.public.date_dim +filter
+                      Scan pg.public.item
+                    Scan pg.public.store +filter

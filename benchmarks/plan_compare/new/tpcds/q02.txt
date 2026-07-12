@@ -1,0 +1,43 @@
+QUERY: q02
+ENGINE: new (rust) EXPLAIN
+
+Sort
+  Projection
+    Filter
+      NestedLoopJoin
+        AliasedRelation
+          Projection
+            HashJoin
+              CteScan
+                Cte
+                  HashAggregate
+                    HashJoin
+                      CteScan
+                        Cte
+                          Projection
+                            AliasedRelation
+                              Union
+                                Projection
+                                  Scan duck.main.web_sales
+                                Projection
+                                  Scan duck.main.catalog_sales
+                      Scan pg.public.date_dim
+              Scan pg.public.date_dim +filter
+        AliasedRelation
+          Projection
+            HashJoin
+              CteScan
+                Cte
+                  HashAggregate
+                    HashJoin
+                      CteScan
+                        Cte
+                          Projection
+                            AliasedRelation
+                              Union
+                                Projection
+                                  Scan duck.main.web_sales
+                                Projection
+                                  Scan duck.main.catalog_sales
+                      Scan pg.public.date_dim
+              Scan pg.public.date_dim +filter

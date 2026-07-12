@@ -1,0 +1,16 @@
+QUERY: q09
+ENGINE: new (rust) EXPLAIN
+
+Sort
+  HashAggregate
+    AliasedRelation
+      Projection
+        HashJoin
+          HashJoin
+            HashJoin
+              HashJoin
+                RemoteQuery [pg] :: SELECT "supplier"."s_suppkey" AS "s_suppkey", "supplier"."s_nationkey" AS "s_nationkey", "nation"."n_nationkey" AS "n_nationkey", "nation"."n_name" AS "n_name" FROM "public"."supplier" AS "supplier" INNER JOIN "public"."nation" AS "nation" ON ("supplier"."s_nationkey" = "nation"."n_nationkey")
+                Scan duck.main.lineitem +semijoin
+              Scan pg.public.part +filter
+            Scan duck.main.partsupp
+          Scan duck.main.orders

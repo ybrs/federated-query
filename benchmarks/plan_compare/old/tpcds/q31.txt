@@ -1,0 +1,61 @@
+QUERY: q31
+ENGINE: old (python)
+
+ISLANDS: 18
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: __fedq_ship_0->duck, __fedq_ship_1->duck, __fedq_ship_0->duck, __fedq_ship_1->duck, __fedq_ship_0->duck, __fedq_ship_1->duck
+COORDINATOR_OPS: PhysicalSort, PhysicalFilter, PhysicalHashJoin, PhysicalFilter, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalFilter, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalFilter, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalFilter, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalFilter, PhysicalFilter, PhysicalFilter
+
+--- island 0 source=duck kind=scan ---
+SELECT "ws_ext_sales_price", "ws_sold_date_sk", "ws_bill_addr_sk" FROM "main"."web_sales" AS "web_sales"
+
+--- island 1 source=pg kind=scan ---
+SELECT "d_qoy", "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_year" = 2000) AND ((("date_dim"."d_qoy" = 1) OR ("date_dim"."d_qoy" = 2)) OR ("date_dim"."d_qoy" = 3)))
+
+--- island 2 source=pg kind=scan ---
+SELECT "ca_county", "ca_address_sk" FROM "public"."customer_address" AS "customer_address"
+
+--- island 3 source=duck kind=scan ---
+SELECT "ws_ext_sales_price", "ws_sold_date_sk", "ws_bill_addr_sk" FROM "main"."web_sales" AS "web_sales"
+
+--- island 4 source=pg kind=scan ---
+SELECT "d_qoy", "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_year" = 2000) AND ((("date_dim"."d_qoy" = 1) OR ("date_dim"."d_qoy" = 2)) OR ("date_dim"."d_qoy" = 3)))
+
+--- island 5 source=pg kind=scan ---
+SELECT "ca_county", "ca_address_sk" FROM "public"."customer_address" AS "customer_address"
+
+--- island 6 source=duck kind=scan ---
+SELECT "ws_ext_sales_price", "ws_sold_date_sk", "ws_bill_addr_sk" FROM "main"."web_sales" AS "web_sales"
+
+--- island 7 source=pg kind=scan ---
+SELECT "d_qoy", "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_year" = 2000) AND ((("date_dim"."d_qoy" = 1) OR ("date_dim"."d_qoy" = 2)) OR ("date_dim"."d_qoy" = 3)))
+
+--- island 8 source=pg kind=scan ---
+SELECT "ca_county", "ca_address_sk" FROM "public"."customer_address" AS "customer_address"
+
+--- island 9 source=pg kind=scan ---
+SELECT "d_qoy", "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_year" = 2000) AND ((("date_dim"."d_qoy" = 1) OR ("date_dim"."d_qoy" = 2)) OR ("date_dim"."d_qoy" = 3)))
+
+--- island 10 source=pg kind=scan ---
+SELECT "ca_county", "ca_address_sk" FROM "public"."customer_address" AS "customer_address"
+
+--- island 11 source=duck kind=join ---
+SELECT "customer_address"."ca_county" AS "ca_county", "date_dim"."d_qoy" AS "d_qoy", "date_dim"."d_year" AS "d_year", SUM("store_sales"."ss_ext_sales_price") AS "store_sales" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_0" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_1" AS "customer_address" ON ("store_sales"."ss_addr_sk" = "customer_address"."ca_address_sk") GROUP BY "customer_address"."ca_county", "date_dim"."d_qoy", "date_dim"."d_year"
+
+--- island 12 source=pg kind=scan ---
+SELECT "d_qoy", "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_year" = 2000) AND ((("date_dim"."d_qoy" = 1) OR ("date_dim"."d_qoy" = 2)) OR ("date_dim"."d_qoy" = 3)))
+
+--- island 13 source=pg kind=scan ---
+SELECT "ca_county", "ca_address_sk" FROM "public"."customer_address" AS "customer_address"
+
+--- island 14 source=duck kind=join ---
+SELECT "customer_address"."ca_county" AS "ca_county", "date_dim"."d_qoy" AS "d_qoy", "date_dim"."d_year" AS "d_year", SUM("store_sales"."ss_ext_sales_price") AS "store_sales" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_0" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_1" AS "customer_address" ON ("store_sales"."ss_addr_sk" = "customer_address"."ca_address_sk") GROUP BY "customer_address"."ca_county", "date_dim"."d_qoy", "date_dim"."d_year"
+
+--- island 15 source=pg kind=scan ---
+SELECT "d_qoy", "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_year" = 2000) AND ((("date_dim"."d_qoy" = 1) OR ("date_dim"."d_qoy" = 2)) OR ("date_dim"."d_qoy" = 3)))
+
+--- island 16 source=pg kind=scan ---
+SELECT "ca_county", "ca_address_sk" FROM "public"."customer_address" AS "customer_address"
+
+--- island 17 source=duck kind=join ---
+SELECT "customer_address"."ca_county" AS "ca_county", "date_dim"."d_qoy" AS "d_qoy", "date_dim"."d_year" AS "d_year", SUM("store_sales"."ss_ext_sales_price") AS "store_sales" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_0" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_1" AS "customer_address" ON ("store_sales"."ss_addr_sk" = "customer_address"."ca_address_sk") GROUP BY "customer_address"."ca_county", "date_dim"."d_qoy", "date_dim"."d_year"

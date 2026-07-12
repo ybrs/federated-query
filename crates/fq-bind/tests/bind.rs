@@ -298,7 +298,10 @@ fn having_aggregate_absent_from_select_is_hoisted_hidden() {
         panic!("expected the widened Aggregate under the Filter");
     };
     // The aggregate was widened with the hidden HAVING output.
-    assert_eq!(widened.output_names, vec!["age".to_string(), "__agg_1".to_string()]);
+    assert_eq!(
+        widened.output_names,
+        vec!["age".to_string(), "__agg_1".to_string()]
+    );
 }
 
 #[test]

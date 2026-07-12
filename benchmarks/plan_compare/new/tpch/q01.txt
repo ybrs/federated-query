@@ -1,0 +1,4 @@
+QUERY: q01
+ENGINE: new (rust) EXPLAIN
+
+Scan duck.main.lineitem +filter +agg(10) +groupby +order

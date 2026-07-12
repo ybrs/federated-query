@@ -1,0 +1,16 @@
+QUERY: q18
+ENGINE: old (python)
+
+ISLANDS: 3
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=pg kind=scan ---
+SELECT "c_name", "c_custkey" FROM "public"."customer" AS "customer"
+
+--- island 1 source=duck kind=agg ---
+SELECT "orders"."o_orderkey" AS "o_orderkey", "orders"."o_orderdate" AS "o_orderdate", "orders"."o_totalprice" AS "o_totalprice", "orders"."o_custkey" AS "o_custkey" FROM "main"."orders" AS "orders" WHERE EXISTS(SELECT 1 FROM (SELECT "lineitem"."l_orderkey" AS "__subq_6_v0" FROM "main"."lineitem" AS "lineitem" GROUP BY "lineitem"."l_orderkey" HAVING (SUM("lineitem"."l_quantity") > 300)) AS "__subq_6" WHERE ("orders"."o_orderkey" = "__subq_6"."__subq_6_v0"))
+
+--- island 2 source=duck kind=scan ---
+SELECT "l_quantity", "l_orderkey" FROM "main"."lineitem" AS "lineitem"

@@ -1,0 +1,25 @@
+QUERY: q65
+ENGINE: old (python)
+
+ISLANDS: 6
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: __fedq_ship_1->duck, __fedq_ship_3->duck
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalFilter, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=pg kind=scan ---
+SELECT "s_store_name", "s_store_sk" FROM "public"."store" AS "store"
+
+--- island 1 source=pg kind=scan ---
+SELECT "d_date_sk", "d_month_seq" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_month_seq" BETWEEN 1176 AND (1176 + 11))
+
+--- island 2 source=duck kind=join ---
+SELECT "store_sales"."ss_store_sk" AS "ss_store_sk", "store_sales"."ss_item_sk" AS "ss_item_sk", SUM("store_sales"."ss_sales_price") AS "revenue" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_1" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") GROUP BY "store_sales"."ss_store_sk", "store_sales"."ss_item_sk"
+
+--- island 3 source=pg kind=scan ---
+SELECT "i_item_desc", "i_current_price", "i_wholesale_cost", "i_brand", "i_item_sk" FROM "public"."item" AS "item"
+
+--- island 4 source=pg kind=scan ---
+SELECT "d_date_sk", "d_month_seq" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_month_seq" BETWEEN 1176 AND (1176 + 11))
+
+--- island 5 source=duck kind=join ---
+SELECT "sa"."ss_store_sk" AS "ss_store_sk", AVG("sa"."revenue") AS "ave" FROM (SELECT "store_sales"."ss_store_sk" AS "ss_store_sk", "store_sales"."ss_item_sk" AS "ss_item_sk", SUM("store_sales"."ss_sales_price") AS "revenue" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_3" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") GROUP BY "store_sales"."ss_store_sk", "store_sales"."ss_item_sk") AS "sa" GROUP BY "sa"."ss_store_sk"

@@ -1,0 +1,19 @@
+QUERY: q15
+ENGINE: old (python)
+
+ISLANDS: 4
+PUSHES_AGG_OR_JOIN: False
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalHashAggregate, PhysicalFilter, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=duck kind=scan ---
+SELECT "cs_sales_price", "cs_sold_date_sk", "cs_bill_customer_sk" FROM "main"."catalog_sales" AS "catalog_sales"
+
+--- island 1 source=pg kind=scan ---
+SELECT "d_year", "d_qoy", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_qoy" = 2) AND ("date_dim"."d_year" = 2001))
+
+--- island 2 source=pg kind=scan ---
+SELECT "c_customer_sk", "c_current_addr_sk" FROM "public"."customer" AS "customer"
+
+--- island 3 source=pg kind=scan ---
+SELECT "ca_zip", "ca_address_sk", "ca_state" FROM "public"."customer_address" AS "customer_address"

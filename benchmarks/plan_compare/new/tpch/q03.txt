@@ -1,0 +1,11 @@
+QUERY: q03
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  Sort
+    HashAggregate
+      HashJoin
+        HashJoin
+          Scan pg.public.customer +filter
+          Scan duck.main.orders +filter +semijoin
+        Scan duck.main.lineitem +filter

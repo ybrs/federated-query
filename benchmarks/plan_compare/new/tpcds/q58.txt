@@ -1,0 +1,61 @@
+QUERY: q58
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  Sort
+    Projection
+      Filter
+        HashJoin
+          Filter
+            HashJoin
+              CteScan
+                Cte
+                  HashAggregate
+                    HashJoin
+                      HashJoin
+                        Scan duck.main.store_sales
+                        HashJoin
+                          Scan pg.public.date_dim
+                          AliasedRelation
+                            Projection
+                              HashJoin
+                                Scan pg.public.date_dim
+                                AliasedRelation
+                                  SingleRowGuard
+                                    Projection
+                                      Scan pg.public.date_dim +filter
+                      Scan pg.public.item
+              CteScan
+                Cte
+                  HashAggregate
+                    HashJoin
+                      HashJoin
+                        Scan duck.main.web_sales
+                        HashJoin
+                          Scan pg.public.date_dim
+                          AliasedRelation
+                            Projection
+                              HashJoin
+                                Scan pg.public.date_dim
+                                AliasedRelation
+                                  SingleRowGuard
+                                    Projection
+                                      Scan pg.public.date_dim +filter
+                      Scan pg.public.item
+          CteScan
+            Cte
+              HashAggregate
+                HashJoin
+                  HashJoin
+                    Scan duck.main.catalog_sales
+                    HashJoin
+                      Scan pg.public.date_dim
+                      AliasedRelation
+                        Projection
+                          HashJoin
+                            Scan pg.public.date_dim
+                            AliasedRelation
+                              SingleRowGuard
+                                Projection
+                                  Scan pg.public.date_dim +filter
+                  Scan pg.public.item

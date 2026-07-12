@@ -1,0 +1,37 @@
+QUERY: q66
+ENGINE: old (python)
+
+ISLANDS: 10
+PUSHES_AGG_OR_JOIN: False
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalHashAggregate, PhysicalUnion, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=duck kind=scan ---
+SELECT "ws_ext_sales_price", "ws_quantity", "ws_net_paid", "ws_ship_mode_sk", "ws_sold_time_sk", "ws_warehouse_sk", "ws_sold_date_sk" FROM "main"."web_sales" AS "web_sales"
+
+--- island 1 source=pg kind=scan ---
+SELECT "sm_carrier", "sm_ship_mode_sk" FROM "public"."ship_mode" AS "ship_mode" WHERE ("ship_mode"."sm_carrier" IN ('DHL', 'BARIAN'))
+
+--- island 2 source=pg kind=scan ---
+SELECT "d_year", "d_moy", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_year" = 2001)
+
+--- island 3 source=pg kind=scan ---
+SELECT "w_warehouse_name", "w_warehouse_sq_ft", "w_city", "w_county", "w_state", "w_country", "w_warehouse_sk" FROM "public"."warehouse" AS "warehouse"
+
+--- island 4 source=pg kind=scan ---
+SELECT "t_time", "t_time_sk" FROM "public"."time_dim" AS "time_dim" WHERE ("time_dim"."t_time" BETWEEN 30838 AND (30838 + 28800))
+
+--- island 5 source=duck kind=scan ---
+SELECT "cs_sales_price", "cs_quantity", "cs_net_paid_inc_tax", "cs_ship_mode_sk", "cs_sold_time_sk", "cs_warehouse_sk", "cs_sold_date_sk" FROM "main"."catalog_sales" AS "catalog_sales"
+
+--- island 6 source=pg kind=scan ---
+SELECT "sm_carrier", "sm_ship_mode_sk" FROM "public"."ship_mode" AS "ship_mode" WHERE ("ship_mode"."sm_carrier" IN ('DHL', 'BARIAN'))
+
+--- island 7 source=pg kind=scan ---
+SELECT "d_year", "d_moy", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_year" = 2001)
+
+--- island 8 source=pg kind=scan ---
+SELECT "w_warehouse_name", "w_warehouse_sq_ft", "w_city", "w_county", "w_state", "w_country", "w_warehouse_sk" FROM "public"."warehouse" AS "warehouse"
+
+--- island 9 source=pg kind=scan ---
+SELECT "t_time", "t_time_sk" FROM "public"."time_dim" AS "time_dim" WHERE ("time_dim"."t_time" BETWEEN 30838 AND (30838 + 28800))

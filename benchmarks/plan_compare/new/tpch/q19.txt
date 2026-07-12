@@ -1,0 +1,8 @@
+QUERY: q19
+ENGINE: new (rust) EXPLAIN
+
+HashAggregate
+  Filter
+    HashJoin
+      Scan duck.main.lineitem +filter +semijoin
+      Scan pg.public.part +filter

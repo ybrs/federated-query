@@ -1,0 +1,11 @@
+QUERY: q10
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  Sort
+    HashAggregate
+      HashJoin
+        HashJoin
+          RemoteQuery [pg] :: SELECT "customer"."c_custkey" AS "c_custkey", "customer"."c_name" AS "c_name", "customer"."c_address" AS "c_address", "customer"."c_nationkey" AS "c_nationkey", "customer"."c_phone" AS "c_phone", "customer"."c_acctbal" AS "c_acctbal", "customer"."c_comment" AS "c_comment", "nation"."n_nationkey" AS "n_nationkey", "nation"."n_name" AS "n_name" FROM "public"."customer" AS "customer" INNER JOIN "public"."nation" AS "nation" ON ("customer"."c_nationkey" = "nation"."n_nationkey")
+          Scan duck.main.orders +filter +semijoin
+        Scan duck.main.lineitem +filter

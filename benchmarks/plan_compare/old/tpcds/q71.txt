@@ -1,0 +1,31 @@
+QUERY: q71
+ENGINE: old (python)
+
+ISLANDS: 8
+PUSHES_AGG_OR_JOIN: False
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalSort, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalUnion, PhysicalUnion, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=pg kind=scan ---
+SELECT "i_brand_id", "i_brand", "i_item_sk", "i_manager_id" FROM "public"."item" AS "item" WHERE ("item"."i_manager_id" = 1)
+
+--- island 1 source=duck kind=scan ---
+SELECT "ws_ext_sales_price", "ws_sold_date_sk", "ws_item_sk", "ws_sold_time_sk" FROM "main"."web_sales" AS "web_sales"
+
+--- island 2 source=pg kind=scan ---
+SELECT "d_year", "d_date_sk", "d_moy" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_moy" = 11) AND ("date_dim"."d_year" = 1999))
+
+--- island 3 source=duck kind=scan ---
+SELECT "cs_ext_sales_price", "cs_sold_date_sk", "cs_item_sk", "cs_sold_time_sk" FROM "main"."catalog_sales" AS "catalog_sales"
+
+--- island 4 source=pg kind=scan ---
+SELECT "d_year", "d_date_sk", "d_moy" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_moy" = 11) AND ("date_dim"."d_year" = 1999))
+
+--- island 5 source=duck kind=scan ---
+SELECT "ss_ext_sales_price", "ss_sold_date_sk", "ss_item_sk", "ss_sold_time_sk" FROM "main"."store_sales" AS "store_sales"
+
+--- island 6 source=pg kind=scan ---
+SELECT "d_year", "d_date_sk", "d_moy" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_moy" = 11) AND ("date_dim"."d_year" = 1999))
+
+--- island 7 source=pg kind=scan ---
+SELECT "t_hour", "t_minute", "t_time_sk", "t_meal_time" FROM "public"."time_dim" AS "time_dim" WHERE (("time_dim"."t_meal_time" = 'breakfast') OR ("time_dim"."t_meal_time" = 'dinner'))

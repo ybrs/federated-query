@@ -1,0 +1,11 @@
+QUERY: q21
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  Sort
+    HashAggregate
+      HashJoin
+        HashJoin
+          RemoteQuery [duck] :: SELECT "l1"."l_orderkey" AS "l_orderkey", "l1"."l_suppkey" AS "l_suppkey", "l1"."l_commitdate" AS "l_commitdate", "l1"."l_receiptdate" AS "l_receiptdate", "orders"."o_orderkey" AS "o_orderkey", "orders"."o_orderstatus" AS "o_orderstatus" FROM "main"."lineitem" AS "l1" INNER JOIN "main"."orders" AS "orders" ON ("orders"."o_orderkey" = "l1"."l_orderkey") WHERE ("l1"."l_receiptdate" > "l1"."l_commitdate") AND EXISTS(SELECT 1 FROM (SELECT "l2"."l_orderkey" AS "__subq_0_k0", "l2"."l_suppkey" AS "__subq_0_k1" FROM "main"."lineitem" AS "l2") AS "__subq_0" WHERE (("__subq_0"."__subq_0_k0" = "l1"."l_orderkey") AND ("__subq_0"."__subq_0_k1" != "l1"."l_suppkey"))) AND NOT EXISTS(SELECT 1 FROM (SELECT "l3"."l_orderkey" AS "__subq_1_k0", "l3"."l_suppkey" AS "__subq_1_k1" FROM "main"."lineitem" AS "l3" WHERE ("l3"."l_receiptdate" > "l3"."l_commitdate")) AS "__subq_1" WHERE (("__subq_1"."__subq_1_k0" = "l1"."l_orderkey") AND ("__subq_1"."__subq_1_k1" != "l1"."l_suppkey"))) AND ("orders"."o_orderstatus" = 'F')
+          Scan pg.public.supplier
+        Scan pg.public.nation +filter

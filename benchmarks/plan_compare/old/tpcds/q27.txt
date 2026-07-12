@@ -1,0 +1,52 @@
+QUERY: q27
+ENGINE: old (python)
+
+ISLANDS: 15
+PUSHES_AGG_OR_JOIN: False
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalUnion, PhysicalUnion, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=duck kind=scan ---
+SELECT "ss_quantity", "ss_list_price", "ss_coupon_amt", "ss_sales_price", "ss_cdemo_sk", "ss_store_sk", "ss_sold_date_sk", "ss_item_sk" FROM "main"."store_sales" AS "store_sales"
+
+--- island 1 source=pg kind=scan ---
+SELECT "cd_education_status", "cd_marital_status", "cd_gender", "cd_demo_sk" FROM "public"."customer_demographics" AS "customer_demographics" WHERE ((("customer_demographics"."cd_gender" = 'M') AND ("customer_demographics"."cd_marital_status" = 'S')) AND ("customer_demographics"."cd_education_status" = 'College'))
+
+--- island 2 source=pg kind=scan ---
+SELECT "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_year" = 2002)
+
+--- island 3 source=pg kind=scan ---
+SELECT "i_item_id", "i_item_sk" FROM "public"."item" AS "item"
+
+--- island 4 source=pg kind=scan ---
+SELECT "s_state", "s_store_sk" FROM "public"."store" AS "store" WHERE ("store"."s_state" = 'TN')
+
+--- island 5 source=duck kind=scan ---
+SELECT "ss_quantity", "ss_list_price", "ss_coupon_amt", "ss_sales_price", "ss_cdemo_sk", "ss_store_sk", "ss_sold_date_sk", "ss_item_sk" FROM "main"."store_sales" AS "store_sales"
+
+--- island 6 source=pg kind=scan ---
+SELECT "cd_education_status", "cd_marital_status", "cd_gender", "cd_demo_sk" FROM "public"."customer_demographics" AS "customer_demographics" WHERE ((("customer_demographics"."cd_gender" = 'M') AND ("customer_demographics"."cd_marital_status" = 'S')) AND ("customer_demographics"."cd_education_status" = 'College'))
+
+--- island 7 source=pg kind=scan ---
+SELECT "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_year" = 2002)
+
+--- island 8 source=pg kind=scan ---
+SELECT "i_item_id", "i_item_sk" FROM "public"."item" AS "item"
+
+--- island 9 source=pg kind=scan ---
+SELECT "s_state", "s_store_sk" FROM "public"."store" AS "store" WHERE ("store"."s_state" = 'TN')
+
+--- island 10 source=duck kind=scan ---
+SELECT "ss_quantity", "ss_list_price", "ss_coupon_amt", "ss_sales_price", "ss_cdemo_sk", "ss_store_sk", "ss_sold_date_sk", "ss_item_sk" FROM "main"."store_sales" AS "store_sales"
+
+--- island 11 source=pg kind=scan ---
+SELECT "cd_education_status", "cd_marital_status", "cd_gender", "cd_demo_sk" FROM "public"."customer_demographics" AS "customer_demographics" WHERE ((("customer_demographics"."cd_gender" = 'M') AND ("customer_demographics"."cd_marital_status" = 'S')) AND ("customer_demographics"."cd_education_status" = 'College'))
+
+--- island 12 source=pg kind=scan ---
+SELECT "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_year" = 2002)
+
+--- island 13 source=pg kind=scan ---
+SELECT "i_item_id", "i_item_sk" FROM "public"."item" AS "item"
+
+--- island 14 source=pg kind=scan ---
+SELECT "s_state", "s_store_sk" FROM "public"."store" AS "store" WHERE ("store"."s_state" = 'TN')

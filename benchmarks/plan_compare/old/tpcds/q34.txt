@@ -1,0 +1,22 @@
+QUERY: q34
+ENGINE: old (python)
+
+ISLANDS: 5
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: __fedq_ship_6->duck, __fedq_ship_7->duck, __fedq_ship_8->duck
+COORDINATOR_OPS: PhysicalSort, PhysicalHashJoin, PhysicalFilter
+
+--- island 0 source=pg kind=scan ---
+SELECT "hd_vehicle_count", "hd_demo_sk", "hd_buy_potential", "hd_dep_count" FROM "public"."household_demographics" AS "household_demographics" WHERE (((("household_demographics"."hd_buy_potential" = '>10000') OR ("household_demographics"."hd_buy_potential" = 'Unknown')) AND ("household_demographics"."hd_vehicle_count" > 0)) AND (CASE WHEN ("household_demographics"."hd_vehicle_count" > 0) THEN (CAST(("household_demographics"."hd_dep_count" * 1.0) AS DOUBLE PRECISION) / NULLIF("household_demographics"."hd_vehicle_count", 0)) ELSE NULL END > 1.2))
+
+--- island 1 source=pg kind=scan ---
+SELECT "d_year", "d_date_sk", "d_dom" FROM "public"."date_dim" AS "date_dim" WHERE ((("date_dim"."d_dom" BETWEEN 1 AND 3) OR ("date_dim"."d_dom" BETWEEN 25 AND 28)) AND ("date_dim"."d_year" IN (1999, (1999 + 1), (1999 + 2))))
+
+--- island 2 source=pg kind=scan ---
+SELECT "s_county", "s_store_sk" FROM "public"."store" AS "store" WHERE ("store"."s_county" = 'Williamson County')
+
+--- island 3 source=duck kind=join ---
+SELECT "store_sales"."ss_ticket_number" AS "ss_ticket_number", "store_sales"."ss_customer_sk" AS "ss_customer_sk", COUNT(*) AS "cnt" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_6" AS "household_demographics" ON ("store_sales"."ss_hdemo_sk" = "household_demographics"."hd_demo_sk") INNER JOIN "temp"."__fedq_ship_7" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_8" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk") GROUP BY "store_sales"."ss_ticket_number", "store_sales"."ss_customer_sk"
+
+--- island 4 source=pg kind=scan ---
+SELECT "c_last_name", "c_first_name", "c_salutation", "c_preferred_cust_flag", "c_customer_sk" FROM "public"."customer" AS "customer"

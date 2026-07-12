@@ -1,0 +1,25 @@
+QUERY: q13
+ENGINE: old (python)
+
+ISLANDS: 6
+PUSHES_AGG_OR_JOIN: False
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalHashAggregate, PhysicalFilter, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalFilter, PhysicalHashJoin
+
+--- island 0 source=duck kind=scan ---
+SELECT "ss_ext_wholesale_cost", "ss_quantity", "ss_ext_sales_price", "ss_store_sk", "ss_sold_date_sk", "ss_net_profit", "ss_sales_price", "ss_addr_sk", "ss_hdemo_sk", "ss_cdemo_sk" FROM "main"."store_sales" AS "store_sales" WHERE (((("store_sales"."ss_sales_price" BETWEEN 100.0 AND 150.0) OR ("store_sales"."ss_sales_price" BETWEEN 50.0 AND 100.0)) OR ("store_sales"."ss_sales_price" BETWEEN 150.0 AND 200.0)) AND ((("store_sales"."ss_net_profit" BETWEEN 100 AND 200) OR ("store_sales"."ss_net_profit" BETWEEN 150 AND 300)) OR ("store_sales"."ss_net_profit" BETWEEN 50 AND 250)))
+
+--- island 1 source=pg kind=scan ---
+SELECT "ca_state", "ca_address_sk", "ca_country" FROM "public"."customer_address" AS "customer_address" WHERE (("customer_address"."ca_country" = 'United States') AND ((("customer_address"."ca_state" IN ('TX', 'OH', 'TX')) OR ("customer_address"."ca_state" IN ('OR', 'NM', 'KY'))) OR ("customer_address"."ca_state" IN ('VA', 'TX', 'MS'))))
+
+--- island 2 source=pg kind=scan ---
+SELECT "hd_dep_count", "hd_demo_sk" FROM "public"."household_demographics" AS "household_demographics" WHERE ((("household_demographics"."hd_dep_count" = 3) OR ("household_demographics"."hd_dep_count" = 1)) OR ("household_demographics"."hd_dep_count" = 1))
+
+--- island 3 source=pg kind=scan ---
+SELECT "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_year" = 2001)
+
+--- island 4 source=pg kind=scan ---
+SELECT "s_store_sk" FROM "public"."store" AS "store"
+
+--- island 5 source=pg kind=scan ---
+SELECT "cd_education_status", "cd_marital_status", "cd_demo_sk" FROM "public"."customer_demographics" AS "customer_demographics" WHERE (((("customer_demographics"."cd_marital_status" = 'M') AND ("customer_demographics"."cd_education_status" = 'Advanced Degree')) OR (("customer_demographics"."cd_marital_status" = 'S') AND ("customer_demographics"."cd_education_status" = 'College'))) OR (("customer_demographics"."cd_marital_status" = 'W') AND ("customer_demographics"."cd_education_status" = '2 yr Degree')))

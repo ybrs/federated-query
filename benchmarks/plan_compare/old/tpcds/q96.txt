@@ -1,0 +1,19 @@
+QUERY: q96
+ENGINE: old (python)
+
+ISLANDS: 4
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: __fedq_ship_0->duck, __fedq_ship_1->duck, __fedq_ship_2->duck
+COORDINATOR_OPS: none
+
+--- island 0 source=pg kind=scan ---
+SELECT "t_minute", "t_hour", "t_time_sk" FROM "public"."time_dim" AS "time_dim" WHERE (("time_dim"."t_hour" = 20) AND ("time_dim"."t_minute" >= 30))
+
+--- island 1 source=pg kind=scan ---
+SELECT "hd_dep_count", "hd_demo_sk" FROM "public"."household_demographics" AS "household_demographics" WHERE ("household_demographics"."hd_dep_count" = 7)
+
+--- island 2 source=pg kind=scan ---
+SELECT "s_store_name", "s_store_sk" FROM "public"."store" AS "store" WHERE ("store"."s_store_name" = 'ese')
+
+--- island 3 source=duck kind=join ---
+SELECT COUNT(*) AS "COUNT(*)" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_0" AS "time_dim" ON ("store_sales"."ss_sold_time_sk" = "time_dim"."t_time_sk") INNER JOIN "temp"."__fedq_ship_1" AS "household_demographics" ON ("store_sales"."ss_hdemo_sk" = "household_demographics"."hd_demo_sk") INNER JOIN "temp"."__fedq_ship_2" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk") ORDER BY "COUNT(*)" ASC LIMIT 100

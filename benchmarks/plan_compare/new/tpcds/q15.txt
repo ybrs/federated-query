@@ -1,0 +1,14 @@
+QUERY: q15
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  Sort
+    HashAggregate
+      Filter
+        HashJoin
+          HashJoin
+            HashJoin
+              Scan duck.main.catalog_sales +semijoin
+              Scan pg.public.date_dim +filter
+            Scan pg.public.customer
+          Scan pg.public.customer_address

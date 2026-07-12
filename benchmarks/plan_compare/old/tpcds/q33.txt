@@ -1,0 +1,43 @@
+QUERY: q33
+ENGINE: old (python)
+
+ISLANDS: 12
+PUSHES_AGG_OR_JOIN: False
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalHashAggregate, PhysicalUnion, PhysicalUnion, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=duck kind=scan ---
+SELECT "ss_ext_sales_price", "ss_addr_sk", "ss_sold_date_sk", "ss_item_sk" FROM "main"."store_sales" AS "store_sales"
+
+--- island 1 source=pg kind=scan ---
+SELECT "d_moy", "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_year" = 1998) AND ("date_dim"."d_moy" = 5))
+
+--- island 2 source=pg kind=scan ---
+SELECT "ca_gmt_offset", "ca_address_sk" FROM "public"."customer_address" AS "customer_address" WHERE ("customer_address"."ca_gmt_offset" = (-5))
+
+--- island 3 source=pg kind=scan ---
+SELECT "item"."i_manufact_id" AS "i_manufact_id", "item"."i_item_sk" AS "i_item_sk", "item"."i_category" AS "i_category" FROM "public"."item" AS "item" WHERE EXISTS(SELECT 1 FROM (SELECT "item"."i_manufact_id" AS "__subq_33_v0" FROM "public"."item" AS "item" WHERE ("item"."i_category" IN ('Electronics'))) AS "__subq_33" WHERE ("item"."i_manufact_id" = "__subq_33"."__subq_33_v0"))
+
+--- island 4 source=duck kind=scan ---
+SELECT "cs_ext_sales_price", "cs_bill_addr_sk", "cs_sold_date_sk", "cs_item_sk" FROM "main"."catalog_sales" AS "catalog_sales"
+
+--- island 5 source=pg kind=scan ---
+SELECT "d_moy", "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_year" = 1998) AND ("date_dim"."d_moy" = 5))
+
+--- island 6 source=pg kind=scan ---
+SELECT "item"."i_manufact_id" AS "i_manufact_id", "item"."i_item_sk" AS "i_item_sk", "item"."i_category" AS "i_category" FROM "public"."item" AS "item" WHERE EXISTS(SELECT 1 FROM (SELECT "item"."i_manufact_id" AS "__subq_34_v0" FROM "public"."item" AS "item" WHERE ("item"."i_category" IN ('Electronics'))) AS "__subq_34" WHERE ("item"."i_manufact_id" = "__subq_34"."__subq_34_v0"))
+
+--- island 7 source=pg kind=scan ---
+SELECT "ca_gmt_offset", "ca_address_sk" FROM "public"."customer_address" AS "customer_address" WHERE ("customer_address"."ca_gmt_offset" = (-5))
+
+--- island 8 source=duck kind=scan ---
+SELECT "ws_ext_sales_price", "ws_bill_addr_sk", "ws_sold_date_sk", "ws_item_sk" FROM "main"."web_sales" AS "web_sales"
+
+--- island 9 source=pg kind=scan ---
+SELECT "d_moy", "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_year" = 1998) AND ("date_dim"."d_moy" = 5))
+
+--- island 10 source=pg kind=scan ---
+SELECT "item"."i_manufact_id" AS "i_manufact_id", "item"."i_item_sk" AS "i_item_sk", "item"."i_category" AS "i_category" FROM "public"."item" AS "item" WHERE EXISTS(SELECT 1 FROM (SELECT "item"."i_manufact_id" AS "__subq_35_v0" FROM "public"."item" AS "item" WHERE ("item"."i_category" IN ('Electronics'))) AS "__subq_35" WHERE ("item"."i_manufact_id" = "__subq_35"."__subq_35_v0"))
+
+--- island 11 source=pg kind=scan ---
+SELECT "ca_gmt_offset", "ca_address_sk" FROM "public"."customer_address" AS "customer_address" WHERE ("customer_address"."ca_gmt_offset" = (-5))

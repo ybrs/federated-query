@@ -1,0 +1,16 @@
+QUERY: q17
+ENGINE: old (python)
+
+ISLANDS: 3
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalHashAggregate, PhysicalFilter, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=duck kind=scan ---
+SELECT "l_quantity", "l_extendedprice", "l_partkey" FROM "main"."lineitem" AS "lineitem"
+
+--- island 1 source=pg kind=scan ---
+SELECT "p_container", "p_partkey", "p_brand" FROM "public"."part" AS "part" WHERE (("part"."p_brand" = 'Brand#23') AND ("part"."p_container" = 'MED BOX'))
+
+--- island 2 source=duck kind=agg ---
+SELECT AVG("lineitem"."l_quantity") AS "__subq_5_v0", "lineitem"."l_partkey" AS "__subq_5_g0" FROM "main"."lineitem" AS "lineitem" GROUP BY "lineitem"."l_partkey"

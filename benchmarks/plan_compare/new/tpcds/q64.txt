@@ -1,0 +1,89 @@
+QUERY: q64
+ENGINE: new (rust) EXPLAIN
+
+Sort
+  Projection
+    Filter
+      HashJoin
+        Filter
+          CteScan
+            Cte
+              HashAggregate
+                Filter
+                  HashJoin
+                    HashJoin
+                      HashJoin
+                        HashJoin
+                          HashJoin
+                            HashJoin
+                              HashJoin
+                                HashJoin
+                                  HashJoin
+                                    HashJoin
+                                      HashJoin
+                                        HashJoin
+                                          HashJoin
+                                            HashJoin
+                                              HashJoin
+                                                HashJoin
+                                                  RemoteQuery [pg] :: SELECT "hd1"."hd_demo_sk" AS "hd_demo_sk", "hd1"."hd_income_band_sk" AS "hd_income_band_sk", "ib1"."ib_income_band_sk" AS "ib_income_band_sk" FROM "public"."household_demographics" AS "hd1" INNER JOIN "public"."income_band" AS "ib1" ON ("hd1"."hd_income_band_sk" = "ib1"."ib_income_band_sk")
+                                                  Scan duck.main.store_sales +semijoin
+                                                Scan pg.public.item +filter
+                                              Scan pg.public.date_dim +filter
+                                            CteScan
+                                              Cte
+                                                Filter
+                                                  RemoteQuery [duck] :: SELECT "catalog_sales"."cs_item_sk" AS "cs_item_sk", SUM("catalog_sales"."cs_ext_list_price") AS "sale", SUM((("catalog_returns"."cr_refunded_cash" + "catalog_returns"."cr_reversed_charge") + "catalog_returns"."cr_store_credit")) AS "refund" FROM "main"."catalog_sales" AS "catalog_sales" INNER JOIN "main"."catalog_returns" AS "catalog_returns" ON (("catalog_sales"."cs_item_sk" = "catalog_returns"."cr_item_sk") AND ("catalog_sales"."cs_order_number" = "catalog_returns"."cr_order_number")) GROUP BY "catalog_sales"."cs_item_sk"
+                                          Scan pg.public.store
+                                        Scan pg.public.promotion
+                                      Scan pg.public.customer_address
+                                    Scan pg.public.customer
+                                  Scan pg.public.customer_address
+                                Scan pg.public.household_demographics
+                              Scan pg.public.income_band
+                            Scan duck.main.store_returns
+                          Scan pg.public.date_dim
+                        Scan pg.public.date_dim
+                      Scan pg.public.customer_demographics
+                    Scan pg.public.customer_demographics
+        Filter
+          CteScan
+            Cte
+              HashAggregate
+                Filter
+                  HashJoin
+                    HashJoin
+                      HashJoin
+                        HashJoin
+                          HashJoin
+                            HashJoin
+                              HashJoin
+                                HashJoin
+                                  HashJoin
+                                    HashJoin
+                                      HashJoin
+                                        HashJoin
+                                          HashJoin
+                                            HashJoin
+                                              HashJoin
+                                                HashJoin
+                                                  RemoteQuery [pg] :: SELECT "hd1"."hd_demo_sk" AS "hd_demo_sk", "hd1"."hd_income_band_sk" AS "hd_income_band_sk", "ib1"."ib_income_band_sk" AS "ib_income_band_sk" FROM "public"."household_demographics" AS "hd1" INNER JOIN "public"."income_band" AS "ib1" ON ("hd1"."hd_income_band_sk" = "ib1"."ib_income_band_sk")
+                                                  Scan duck.main.store_sales +semijoin
+                                                Scan pg.public.item +filter
+                                              Scan pg.public.date_dim +filter
+                                            CteScan
+                                              Cte
+                                                Filter
+                                                  RemoteQuery [duck] :: SELECT "catalog_sales"."cs_item_sk" AS "cs_item_sk", SUM("catalog_sales"."cs_ext_list_price") AS "sale", SUM((("catalog_returns"."cr_refunded_cash" + "catalog_returns"."cr_reversed_charge") + "catalog_returns"."cr_store_credit")) AS "refund" FROM "main"."catalog_sales" AS "catalog_sales" INNER JOIN "main"."catalog_returns" AS "catalog_returns" ON (("catalog_sales"."cs_item_sk" = "catalog_returns"."cr_item_sk") AND ("catalog_sales"."cs_order_number" = "catalog_returns"."cr_order_number")) GROUP BY "catalog_sales"."cs_item_sk"
+                                          Scan pg.public.store
+                                        Scan pg.public.promotion
+                                      Scan pg.public.customer_address
+                                    Scan pg.public.customer
+                                  Scan pg.public.customer_address
+                                Scan pg.public.household_demographics
+                              Scan pg.public.income_band
+                            Scan duck.main.store_returns
+                          Scan pg.public.date_dim
+                        Scan pg.public.date_dim
+                      Scan pg.public.customer_demographics
+                    Scan pg.public.customer_demographics

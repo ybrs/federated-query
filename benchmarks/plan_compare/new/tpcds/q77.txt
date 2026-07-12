@@ -1,0 +1,57 @@
+QUERY: q77
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  Sort
+    HashAggregate
+      AliasedRelation
+        Union
+          Union
+            Projection
+              HashJoin
+                CteScan
+                  Cte
+                    Shipment __fedq_ship_0 [duck]
+                      Scan pg.public.date_dim +filter
+                      Shipment __fedq_ship_1 [duck]
+                        Scan pg.public.store
+                        RemoteQuery [duck] :: SELECT "store"."s_store_sk" AS "s_store_sk", SUM("store_sales"."ss_ext_sales_price") AS "sales", SUM("store_sales"."ss_net_profit") AS "profit" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_0" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_1" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk") GROUP BY "store"."s_store_sk"
+                CteScan
+                  Cte
+                    HashAggregate
+                      HashJoin
+                        HashJoin
+                          Scan duck.main.store_returns +semijoin
+                          Scan pg.public.date_dim +filter
+                        Scan pg.public.store
+            Projection
+              NestedLoopJoin
+                CteScan
+                  Cte
+                    Shipment __fedq_ship_2 [duck]
+                      Scan pg.public.date_dim +filter
+                      RemoteQuery [duck] :: SELECT "catalog_sales"."cs_call_center_sk" AS "cs_call_center_sk", SUM("catalog_sales"."cs_ext_sales_price") AS "sales", SUM("catalog_sales"."cs_net_profit") AS "profit" FROM "main"."catalog_sales" AS "catalog_sales" INNER JOIN "temp"."__fedq_ship_2" AS "date_dim" ON ("catalog_sales"."cs_sold_date_sk" = "date_dim"."d_date_sk") GROUP BY "catalog_sales"."cs_call_center_sk"
+                CteScan
+                  Cte
+                    HashAggregate
+                      HashJoin
+                        Scan duck.main.catalog_returns +semijoin
+                        Scan pg.public.date_dim +filter
+          Projection
+            HashJoin
+              CteScan
+                Cte
+                  HashAggregate
+                    HashJoin
+                      HashJoin
+                        Scan duck.main.web_sales +semijoin
+                        Scan pg.public.date_dim +filter
+                      Scan pg.public.web_page
+              CteScan
+                Cte
+                  HashAggregate
+                    HashJoin
+                      HashJoin
+                        Scan duck.main.web_returns +semijoin
+                        Scan pg.public.date_dim +filter
+                      Scan pg.public.web_page

@@ -1,0 +1,28 @@
+QUERY: q66
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  Sort
+    HashAggregate
+      AliasedRelation
+        Union
+          HashAggregate
+            HashJoin
+              HashJoin
+                HashJoin
+                  HashJoin
+                    Scan duck.main.web_sales +semijoin
+                    Scan pg.public.ship_mode +filter
+                  Scan pg.public.date_dim +filter
+                Scan pg.public.warehouse
+              Scan pg.public.time_dim +filter
+          HashAggregate
+            HashJoin
+              HashJoin
+                HashJoin
+                  HashJoin
+                    Scan duck.main.catalog_sales +semijoin
+                    Scan pg.public.ship_mode +filter
+                  Scan pg.public.date_dim +filter
+                Scan pg.public.warehouse
+              Scan pg.public.time_dim +filter

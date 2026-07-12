@@ -1,0 +1,16 @@
+QUERY: q22
+ENGINE: old (python)
+
+ISLANDS: 3
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalSort, PhysicalHashAggregate, PhysicalHashJoin, PhysicalFilter, PhysicalNestedLoopJoin
+
+--- island 0 source=pg kind=scan ---
+SELECT "c_phone", "c_acctbal", "c_custkey" FROM "public"."customer" AS "customer" WHERE (SUBSTRING("customer"."c_phone", 1, 2) IN ('13', '31', '23', '29', '30', '18', '17'))
+
+--- island 1 source=pg kind=agg ---
+SELECT AVG("customer"."c_acctbal") AS "__subq_12_v0" FROM "public"."customer" AS "customer" WHERE (("customer"."c_acctbal" > 0.0) AND (SUBSTRING("customer"."c_phone", 1, 2) IN ('13', '31', '23', '29', '30', '18', '17')))
+
+--- island 2 source=duck kind=scan ---
+SELECT "o_custkey" FROM "main"."orders" AS "orders"

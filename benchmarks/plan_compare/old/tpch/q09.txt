@@ -1,0 +1,25 @@
+QUERY: q09
+ENGINE: old (python)
+
+ISLANDS: 6
+PUSHES_AGG_OR_JOIN: False
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalSort, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=pg kind=scan ---
+SELECT "p_name", "p_partkey" FROM "public"."part" AS "part" WHERE ("part"."p_name" LIKE '%green%')
+
+--- island 1 source=duck kind=scan ---
+SELECT "l_extendedprice", "l_quantity", "l_discount", "l_orderkey", "l_partkey", "l_suppkey" FROM "main"."lineitem" AS "lineitem"
+
+--- island 2 source=pg kind=scan ---
+SELECT "s_nationkey", "s_suppkey" FROM "public"."supplier" AS "supplier"
+
+--- island 3 source=pg kind=scan ---
+SELECT "n_name", "n_nationkey" FROM "public"."nation" AS "nation"
+
+--- island 4 source=duck kind=scan ---
+SELECT "o_orderdate", "o_orderkey" FROM "main"."orders" AS "orders"
+
+--- island 5 source=duck kind=scan ---
+SELECT "ps_supplycost", "ps_partkey", "ps_suppkey" FROM "main"."partsupp" AS "partsupp"

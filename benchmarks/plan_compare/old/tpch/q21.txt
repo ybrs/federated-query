@@ -1,0 +1,16 @@
+QUERY: q21
+ENGINE: old (python)
+
+ISLANDS: 3
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=pg kind=join ---
+SELECT "supplier"."s_name" AS "s_name", "supplier"."s_nationkey" AS "s_nationkey", "supplier"."s_suppkey" AS "s_suppkey", "nation"."n_name" AS "n_name", "nation"."n_nationkey" AS "n_nationkey" FROM "public"."supplier" AS "supplier" INNER JOIN "public"."nation" AS "nation" ON ("supplier"."s_nationkey" = "nation"."n_nationkey") WHERE ("nation"."n_name" = 'SAUDI ARABIA')
+
+--- island 1 source=duck kind=scan ---
+SELECT "l1"."l_receiptdate" AS "l_receiptdate", "l1"."l_commitdate" AS "l_commitdate", "l1"."l_suppkey" AS "l_suppkey", "l1"."l_orderkey" AS "l_orderkey" FROM "main"."lineitem" AS "l1" WHERE (("l1"."l_receiptdate" > "l1"."l_commitdate") AND EXISTS(SELECT 1 FROM (SELECT "l2"."l_orderkey" AS "__subq_10_k0", "l2"."l_suppkey" AS "__subq_10_k1" FROM "main"."lineitem" AS "l2") AS "__subq_10" WHERE (("__subq_10"."__subq_10_k0" = "l1"."l_orderkey") AND ("__subq_10"."__subq_10_k1" <> "l1"."l_suppkey")))) AND NOT EXISTS(SELECT 1 FROM (SELECT "l3"."l_orderkey" AS "__subq_11_k0", "l3"."l_suppkey" AS "__subq_11_k1" FROM "main"."lineitem" AS "l3" WHERE ("l3"."l_receiptdate" > "l3"."l_commitdate")) AS "__subq_11" WHERE (("__subq_11"."__subq_11_k0" = "l1"."l_orderkey") AND ("__subq_11"."__subq_11_k1" <> "l1"."l_suppkey")))
+
+--- island 2 source=duck kind=scan ---
+SELECT "o_orderstatus", "o_orderkey" FROM "main"."orders" AS "orders" WHERE ("orders"."o_orderstatus" = 'F')

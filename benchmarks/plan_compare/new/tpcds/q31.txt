@@ -1,0 +1,63 @@
+QUERY: q31
+ENGINE: new (rust) EXPLAIN
+
+Sort
+  Projection
+    Filter
+      HashJoin
+        Filter
+          HashJoin
+            HashJoin
+              HashJoin
+                HashJoin
+                  Filter
+                    CteScan
+                      Cte
+                        Shipment __fedq_ship_0 [duck]
+                          Scan pg.public.date_dim +filter
+                          Shipment __fedq_ship_1 [duck]
+                            Scan pg.public.customer_address
+                            RemoteQuery [duck] :: SELECT "customer_address"."ca_county" AS "ca_county", "date_dim"."d_qoy" AS "d_qoy", "date_dim"."d_year" AS "d_year", SUM("store_sales"."ss_ext_sales_price") AS "store_sales" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_0" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_1" AS "customer_address" ON ("store_sales"."ss_addr_sk" = "customer_address"."ca_address_sk") GROUP BY "customer_address"."ca_county", "date_dim"."d_qoy", "date_dim"."d_year"
+                  Filter
+                    CteScan
+                      Cte
+                        Shipment __fedq_ship_0 [duck]
+                          Scan pg.public.date_dim +filter
+                          Shipment __fedq_ship_1 [duck]
+                            Scan pg.public.customer_address
+                            RemoteQuery [duck] :: SELECT "customer_address"."ca_county" AS "ca_county", "date_dim"."d_qoy" AS "d_qoy", "date_dim"."d_year" AS "d_year", SUM("store_sales"."ss_ext_sales_price") AS "store_sales" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_0" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_1" AS "customer_address" ON ("store_sales"."ss_addr_sk" = "customer_address"."ca_address_sk") GROUP BY "customer_address"."ca_county", "date_dim"."d_qoy", "date_dim"."d_year"
+                Filter
+                  CteScan
+                    Cte
+                      Shipment __fedq_ship_0 [duck]
+                        Scan pg.public.date_dim +filter
+                        Shipment __fedq_ship_1 [duck]
+                          Scan pg.public.customer_address
+                          RemoteQuery [duck] :: SELECT "customer_address"."ca_county" AS "ca_county", "date_dim"."d_qoy" AS "d_qoy", "date_dim"."d_year" AS "d_year", SUM("store_sales"."ss_ext_sales_price") AS "store_sales" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_0" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_1" AS "customer_address" ON ("store_sales"."ss_addr_sk" = "customer_address"."ca_address_sk") GROUP BY "customer_address"."ca_county", "date_dim"."d_qoy", "date_dim"."d_year"
+              Filter
+                CteScan
+                  Cte
+                    HashAggregate
+                      HashJoin
+                        HashJoin
+                          Scan duck.main.web_sales +semijoin
+                          Scan pg.public.date_dim +filter
+                        Scan pg.public.customer_address
+            Filter
+              CteScan
+                Cte
+                  HashAggregate
+                    HashJoin
+                      HashJoin
+                        Scan duck.main.web_sales +semijoin
+                        Scan pg.public.date_dim +filter
+                      Scan pg.public.customer_address
+        Filter
+          CteScan
+            Cte
+              HashAggregate
+                HashJoin
+                  HashJoin
+                    Scan duck.main.web_sales +semijoin
+                    Scan pg.public.date_dim +filter
+                  Scan pg.public.customer_address

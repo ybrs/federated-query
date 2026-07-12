@@ -1,0 +1,19 @@
+QUERY: q94
+ENGINE: old (python)
+
+ISLANDS: 4
+PUSHES_AGG_OR_JOIN: False
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=duck kind=scan ---
+SELECT "ws1"."ws_ext_ship_cost" AS "ws_ext_ship_cost", "ws1"."ws_net_profit" AS "ws_net_profit", "ws1"."ws_order_number" AS "ws_order_number", "ws1"."ws_ship_date_sk" AS "ws_ship_date_sk", "ws1"."ws_ship_addr_sk" AS "ws_ship_addr_sk", "ws1"."ws_web_site_sk" AS "ws_web_site_sk", "ws1"."ws_warehouse_sk" AS "ws_warehouse_sk" FROM "main"."web_sales" AS "ws1" WHERE EXISTS(SELECT 1 FROM (SELECT "ws2"."ws_order_number" AS "__subq_73_k0", "ws2"."ws_warehouse_sk" AS "__subq_73_k1" FROM "main"."web_sales" AS "ws2") AS "__subq_73" WHERE (("ws1"."ws_order_number" = "__subq_73"."__subq_73_k0") AND ("ws1"."ws_warehouse_sk" <> "__subq_73"."__subq_73_k1"))) AND NOT EXISTS(SELECT 1 FROM (SELECT "wr1"."wr_order_number" AS "__subq_74_k0" FROM "main"."web_returns" AS "wr1") AS "__subq_74" WHERE ("ws1"."ws_order_number" = "__subq_74"."__subq_74_k0"))
+
+--- island 1 source=pg kind=scan ---
+SELECT "ca_state", "ca_address_sk" FROM "public"."customer_address" AS "customer_address" WHERE ("customer_address"."ca_state" = 'IL')
+
+--- island 2 source=pg kind=scan ---
+SELECT "d_date", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_date" BETWEEN '1999-02-01' AND CAST('1999-04-02' AS DATE))
+
+--- island 3 source=pg kind=scan ---
+SELECT "web_company_name", "web_site_sk" FROM "public"."web_site" AS "web_site" WHERE ("web_site"."web_company_name" = 'pri')

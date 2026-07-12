@@ -1,0 +1,75 @@
+QUERY: q88
+ENGINE: new (rust) EXPLAIN
+
+Projection
+  NestedLoopJoin
+    NestedLoopJoin
+      NestedLoopJoin
+        NestedLoopJoin
+          NestedLoopJoin
+            NestedLoopJoin
+              NestedLoopJoin
+                AliasedRelation
+                  Shipment __fedq_ship_3 [duck]
+                    Scan pg.public.time_dim +filter
+                    Shipment __fedq_ship_4 [duck]
+                      Scan pg.public.household_demographics +filter
+                      Shipment __fedq_ship_5 [duck]
+                        Scan pg.public.store +filter
+                        RemoteQuery [duck] :: SELECT COUNT() AS "h8_30_to_9" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_3" AS "time_dim" ON ("store_sales"."ss_sold_time_sk" = "time_dim"."t_time_sk") INNER JOIN "temp"."__fedq_ship_4" AS "household_demographics" ON ("store_sales"."ss_hdemo_sk" = "household_demographics"."hd_demo_sk") INNER JOIN "temp"."__fedq_ship_5" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk")
+                AliasedRelation
+                  Shipment __fedq_ship_9 [duck]
+                    Scan pg.public.time_dim +filter
+                    Shipment __fedq_ship_10 [duck]
+                      Scan pg.public.household_demographics +filter
+                      Shipment __fedq_ship_11 [duck]
+                        Scan pg.public.store +filter
+                        RemoteQuery [duck] :: SELECT COUNT() AS "h9_to_9_30" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_9" AS "time_dim" ON ("store_sales"."ss_sold_time_sk" = "time_dim"."t_time_sk") INNER JOIN "temp"."__fedq_ship_10" AS "household_demographics" ON ("store_sales"."ss_hdemo_sk" = "household_demographics"."hd_demo_sk") INNER JOIN "temp"."__fedq_ship_11" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk")
+              AliasedRelation
+                Shipment __fedq_ship_15 [duck]
+                  Scan pg.public.time_dim +filter
+                  Shipment __fedq_ship_16 [duck]
+                    Scan pg.public.household_demographics +filter
+                    Shipment __fedq_ship_17 [duck]
+                      Scan pg.public.store +filter
+                      RemoteQuery [duck] :: SELECT COUNT() AS "h9_30_to_10" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_15" AS "time_dim" ON ("store_sales"."ss_sold_time_sk" = "time_dim"."t_time_sk") INNER JOIN "temp"."__fedq_ship_16" AS "household_demographics" ON ("store_sales"."ss_hdemo_sk" = "household_demographics"."hd_demo_sk") INNER JOIN "temp"."__fedq_ship_17" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk")
+            AliasedRelation
+              Shipment __fedq_ship_21 [duck]
+                Scan pg.public.time_dim +filter
+                Shipment __fedq_ship_22 [duck]
+                  Scan pg.public.household_demographics +filter
+                  Shipment __fedq_ship_23 [duck]
+                    Scan pg.public.store +filter
+                    RemoteQuery [duck] :: SELECT COUNT() AS "h10_to_10_30" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_21" AS "time_dim" ON ("store_sales"."ss_sold_time_sk" = "time_dim"."t_time_sk") INNER JOIN "temp"."__fedq_ship_22" AS "household_demographics" ON ("store_sales"."ss_hdemo_sk" = "household_demographics"."hd_demo_sk") INNER JOIN "temp"."__fedq_ship_23" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk")
+          AliasedRelation
+            Shipment __fedq_ship_27 [duck]
+              Scan pg.public.time_dim +filter
+              Shipment __fedq_ship_28 [duck]
+                Scan pg.public.household_demographics +filter
+                Shipment __fedq_ship_29 [duck]
+                  Scan pg.public.store +filter
+                  RemoteQuery [duck] :: SELECT COUNT() AS "h10_30_to_11" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_27" AS "time_dim" ON ("store_sales"."ss_sold_time_sk" = "time_dim"."t_time_sk") INNER JOIN "temp"."__fedq_ship_28" AS "household_demographics" ON ("store_sales"."ss_hdemo_sk" = "household_demographics"."hd_demo_sk") INNER JOIN "temp"."__fedq_ship_29" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk")
+        AliasedRelation
+          Shipment __fedq_ship_33 [duck]
+            Scan pg.public.time_dim +filter
+            Shipment __fedq_ship_34 [duck]
+              Scan pg.public.household_demographics +filter
+              Shipment __fedq_ship_35 [duck]
+                Scan pg.public.store +filter
+                RemoteQuery [duck] :: SELECT COUNT() AS "h11_to_11_30" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_33" AS "time_dim" ON ("store_sales"."ss_sold_time_sk" = "time_dim"."t_time_sk") INNER JOIN "temp"."__fedq_ship_34" AS "household_demographics" ON ("store_sales"."ss_hdemo_sk" = "household_demographics"."hd_demo_sk") INNER JOIN "temp"."__fedq_ship_35" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk")
+      AliasedRelation
+        Shipment __fedq_ship_39 [duck]
+          Scan pg.public.time_dim +filter
+          Shipment __fedq_ship_40 [duck]
+            Scan pg.public.household_demographics +filter
+            Shipment __fedq_ship_41 [duck]
+              Scan pg.public.store +filter
+              RemoteQuery [duck] :: SELECT COUNT() AS "h11_30_to_12" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_39" AS "time_dim" ON ("store_sales"."ss_sold_time_sk" = "time_dim"."t_time_sk") INNER JOIN "temp"."__fedq_ship_40" AS "household_demographics" ON ("store_sales"."ss_hdemo_sk" = "household_demographics"."hd_demo_sk") INNER JOIN "temp"."__fedq_ship_41" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk")
+    AliasedRelation
+      Shipment __fedq_ship_45 [duck]
+        Scan pg.public.time_dim +filter
+        Shipment __fedq_ship_46 [duck]
+          Scan pg.public.household_demographics +filter
+          Shipment __fedq_ship_47 [duck]
+            Scan pg.public.store +filter
+            RemoteQuery [duck] :: SELECT COUNT() AS "h12_to_12_30" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_45" AS "time_dim" ON ("store_sales"."ss_sold_time_sk" = "time_dim"."t_time_sk") INNER JOIN "temp"."__fedq_ship_46" AS "household_demographics" ON ("store_sales"."ss_hdemo_sk" = "household_demographics"."hd_demo_sk") INNER JOIN "temp"."__fedq_ship_47" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk")

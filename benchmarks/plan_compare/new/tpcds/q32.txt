@@ -1,0 +1,4 @@
+QUERY: q32
+ENGINE: new (rust) EXPLAIN
+
+ERROR: PanicException: ColumnRef type must be set during binding

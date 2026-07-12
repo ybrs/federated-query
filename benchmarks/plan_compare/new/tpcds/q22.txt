@@ -1,0 +1,11 @@
+QUERY: q22
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  Sort
+    HashAggregate
+      HashJoin
+        HashJoin
+          Scan duck.main.inventory +semijoin
+          Scan pg.public.item
+        Scan pg.public.date_dim +filter

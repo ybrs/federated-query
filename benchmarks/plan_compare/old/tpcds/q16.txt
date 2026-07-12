@@ -1,0 +1,19 @@
+QUERY: q16
+ENGINE: old (python)
+
+ISLANDS: 4
+PUSHES_AGG_OR_JOIN: False
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=duck kind=scan ---
+SELECT "cs1"."cs_ext_ship_cost" AS "cs_ext_ship_cost", "cs1"."cs_net_profit" AS "cs_net_profit", "cs1"."cs_order_number" AS "cs_order_number", "cs1"."cs_ship_date_sk" AS "cs_ship_date_sk", "cs1"."cs_ship_addr_sk" AS "cs_ship_addr_sk", "cs1"."cs_call_center_sk" AS "cs_call_center_sk", "cs1"."cs_warehouse_sk" AS "cs_warehouse_sk" FROM "main"."catalog_sales" AS "cs1" WHERE EXISTS(SELECT 1 FROM (SELECT "cs2"."cs_order_number" AS "__subq_28_k0", "cs2"."cs_warehouse_sk" AS "__subq_28_k1" FROM "main"."catalog_sales" AS "cs2") AS "__subq_28" WHERE (("cs1"."cs_order_number" = "__subq_28"."__subq_28_k0") AND ("cs1"."cs_warehouse_sk" <> "__subq_28"."__subq_28_k1"))) AND NOT EXISTS(SELECT 1 FROM (SELECT "cr1"."cr_order_number" AS "__subq_29_k0" FROM "main"."catalog_returns" AS "cr1") AS "__subq_29" WHERE ("cs1"."cs_order_number" = "__subq_29"."__subq_29_k0"))
+
+--- island 1 source=pg kind=scan ---
+SELECT "ca_state", "ca_address_sk" FROM "public"."customer_address" AS "customer_address" WHERE ("customer_address"."ca_state" = 'GA')
+
+--- island 2 source=pg kind=scan ---
+SELECT "d_date", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_date" BETWEEN '2002-02-01' AND CAST('2002-04-02' AS DATE))
+
+--- island 3 source=pg kind=scan ---
+SELECT "cc_county", "cc_call_center_sk" FROM "public"."call_center" AS "call_center" WHERE ("call_center"."cc_county" = 'Williamson County')

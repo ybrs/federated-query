@@ -1,0 +1,29 @@
+QUERY: q45
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  Sort
+    HashAggregate
+      Union
+        Filter
+          Projection
+            HashJoin
+              HashJoin
+                HashJoin
+                  HashJoin
+                    Scan duck.main.web_sales +semijoin
+                    RemoteQuery [pg] :: SELECT "item"."i_item_sk" AS "i_item_sk", "item"."i_item_id" AS "i_item_id", "item"."i_rec_start_date" AS "i_rec_start_date", "item"."i_rec_end_date" AS "i_rec_end_date", "item"."i_item_desc" AS "i_item_desc", "item"."i_current_price" AS "i_current_price", "item"."i_wholesale_cost" AS "i_wholesale_cost", "item"."i_brand_id" AS "i_brand_id", "item"."i_brand" AS "i_brand", "item"."i_class_id" AS "i_class_id", "item"."i_class" AS "i_class", "item"."i_category_id" AS "i_category_id", "item"."i_category" AS "i_category", "item"."i_manufact_id" AS "i_manufact_id", "item"."i_manufact" AS "i_manufact", "item"."i_size" AS "i_size", "item"."i_formulation" AS "i_formulation", "item"."i_color" AS "i_color", "item"."i_units" AS "i_units", "item"."i_container" AS "i_container", "item"."i_manager_id" AS "i_manager_id", "item"."i_product_name" AS "i_product_name" FROM "public"."item" AS "item" WHERE EXISTS(SELECT 1 FROM (SELECT "item"."i_item_id" AS "__subq_0_v0" FROM "public"."item" AS "item" WHERE ("item"."i_item_sk" IN (2, 3, 5, 7, 11, 13, 17, 19, 23, 29))) AS "__subq_0" WHERE ("item"."i_item_id" = "__subq_0"."__subq_0_v0"))
+                  Scan pg.public.date_dim +filter
+                Scan pg.public.customer
+              Scan pg.public.customer_address
+        Filter
+          Projection
+            HashJoin
+              HashJoin
+                HashJoin
+                  HashJoin
+                    Scan duck.main.web_sales +semijoin
+                    Scan pg.public.date_dim +filter
+                  RemoteQuery [pg] :: SELECT "item"."i_item_sk" AS "i_item_sk", "item"."i_item_id" AS "i_item_id", "item"."i_rec_start_date" AS "i_rec_start_date", "item"."i_rec_end_date" AS "i_rec_end_date", "item"."i_item_desc" AS "i_item_desc", "item"."i_current_price" AS "i_current_price", "item"."i_wholesale_cost" AS "i_wholesale_cost", "item"."i_brand_id" AS "i_brand_id", "item"."i_brand" AS "i_brand", "item"."i_class_id" AS "i_class_id", "item"."i_class" AS "i_class", "item"."i_category_id" AS "i_category_id", "item"."i_category" AS "i_category", "item"."i_manufact_id" AS "i_manufact_id", "item"."i_manufact" AS "i_manufact", "item"."i_size" AS "i_size", "item"."i_formulation" AS "i_formulation", "item"."i_color" AS "i_color", "item"."i_units" AS "i_units", "item"."i_container" AS "i_container", "item"."i_manager_id" AS "i_manager_id", "item"."i_product_name" AS "i_product_name" FROM "public"."item" AS "item" WHERE NOT EXISTS(SELECT 1 FROM (SELECT "item"."i_item_id" AS "__subq_0_v0" FROM "public"."item" AS "item" WHERE ("item"."i_item_sk" IN (2, 3, 5, 7, 11, 13, 17, 19, 23, 29))) AS "__subq_0" WHERE ("item"."i_item_id" = "__subq_0"."__subq_0_v0"))
+                Scan pg.public.customer
+              Scan pg.public.customer_address

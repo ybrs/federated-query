@@ -1,0 +1,24 @@
+QUERY: q65
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  Sort
+    Projection
+      Filter
+        HashJoin
+          HashJoin
+            HashJoin
+              Scan pg.public.store
+              AliasedRelation
+                HashAggregate
+                  HashJoin
+                    Scan duck.main.store_sales +semijoin
+                    Scan pg.public.date_dim +filter
+            Scan pg.public.item
+          AliasedRelation
+            HashAggregate
+              AliasedRelation
+                HashAggregate
+                  HashJoin
+                    Scan duck.main.store_sales +semijoin
+                    Scan pg.public.date_dim +filter

@@ -1,0 +1,55 @@
+QUERY: q77
+ENGINE: old (python)
+
+ISLANDS: 16
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: __fedq_ship_0->duck, __fedq_ship_1->duck, __fedq_ship_2->duck
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalHashAggregate, PhysicalUnion, PhysicalUnion, PhysicalHashJoin, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalNestedLoopJoin, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=pg kind=scan ---
+SELECT "d_date_sk", "d_date" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_date" BETWEEN CAST('2000-08-23' AS DATE) AND CAST('2000-09-22' AS DATE))
+
+--- island 1 source=pg kind=scan ---
+SELECT "s_store_sk" FROM "public"."store" AS "store"
+
+--- island 2 source=duck kind=join ---
+SELECT "store"."s_store_sk" AS "s_store_sk", SUM("store_sales"."ss_ext_sales_price") AS "sales", SUM("store_sales"."ss_net_profit") AS "profit" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_0" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_1" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk") GROUP BY "store"."s_store_sk"
+
+--- island 3 source=duck kind=scan ---
+SELECT "sr_return_amt", "sr_net_loss", "sr_store_sk", "sr_returned_date_sk" FROM "main"."store_returns" AS "store_returns"
+
+--- island 4 source=pg kind=scan ---
+SELECT "d_date_sk", "d_date" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_date" BETWEEN CAST('2000-08-23' AS DATE) AND CAST('2000-09-22' AS DATE))
+
+--- island 5 source=pg kind=scan ---
+SELECT "s_store_sk" FROM "public"."store" AS "store"
+
+--- island 6 source=pg kind=scan ---
+SELECT "d_date_sk", "d_date" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_date" BETWEEN CAST('2000-08-23' AS DATE) AND CAST('2000-09-22' AS DATE))
+
+--- island 7 source=duck kind=join ---
+SELECT "catalog_sales"."cs_call_center_sk" AS "cs_call_center_sk", SUM("catalog_sales"."cs_ext_sales_price") AS "sales", SUM("catalog_sales"."cs_net_profit") AS "profit" FROM "main"."catalog_sales" AS "catalog_sales" INNER JOIN "temp"."__fedq_ship_2" AS "date_dim" ON ("catalog_sales"."cs_sold_date_sk" = "date_dim"."d_date_sk") GROUP BY "catalog_sales"."cs_call_center_sk"
+
+--- island 8 source=duck kind=scan ---
+SELECT "cr_call_center_sk", "cr_return_amount", "cr_net_loss", "cr_returned_date_sk" FROM "main"."catalog_returns" AS "catalog_returns"
+
+--- island 9 source=pg kind=scan ---
+SELECT "d_date_sk", "d_date" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_date" BETWEEN CAST('2000-08-23' AS DATE) AND CAST('2000-09-22' AS DATE))
+
+--- island 10 source=duck kind=scan ---
+SELECT "ws_ext_sales_price", "ws_net_profit", "ws_web_page_sk", "ws_sold_date_sk" FROM "main"."web_sales" AS "web_sales"
+
+--- island 11 source=pg kind=scan ---
+SELECT "d_date_sk", "d_date" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_date" BETWEEN CAST('2000-08-23' AS DATE) AND CAST('2000-09-22' AS DATE))
+
+--- island 12 source=pg kind=scan ---
+SELECT "wp_web_page_sk" FROM "public"."web_page" AS "web_page"
+
+--- island 13 source=duck kind=scan ---
+SELECT "wr_return_amt", "wr_net_loss", "wr_web_page_sk", "wr_returned_date_sk" FROM "main"."web_returns" AS "web_returns"
+
+--- island 14 source=pg kind=scan ---
+SELECT "d_date_sk", "d_date" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_date" BETWEEN CAST('2000-08-23' AS DATE) AND CAST('2000-09-22' AS DATE))
+
+--- island 15 source=pg kind=scan ---
+SELECT "wp_web_page_sk" FROM "public"."web_page" AS "web_page"

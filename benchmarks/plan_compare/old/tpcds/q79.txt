@@ -1,0 +1,22 @@
+QUERY: q79
+ENGINE: old (python)
+
+ISLANDS: 5
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: __fedq_ship_3->duck, __fedq_ship_4->duck, __fedq_ship_5->duck
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalHashJoin
+
+--- island 0 source=pg kind=scan ---
+SELECT "d_year", "d_dow", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE (("date_dim"."d_dow" = 1) AND ("date_dim"."d_year" IN (1999, (1999 + 1), (1999 + 2))))
+
+--- island 1 source=pg kind=scan ---
+SELECT "hd_demo_sk", "hd_dep_count", "hd_vehicle_count" FROM "public"."household_demographics" AS "household_demographics" WHERE (("household_demographics"."hd_dep_count" = 6) OR ("household_demographics"."hd_vehicle_count" > 2))
+
+--- island 2 source=pg kind=scan ---
+SELECT "s_city", "s_number_employees", "s_store_sk" FROM "public"."store" AS "store" WHERE ("store"."s_number_employees" BETWEEN 200 AND 295)
+
+--- island 3 source=duck kind=join ---
+SELECT "store_sales"."ss_ticket_number" AS "ss_ticket_number", "store_sales"."ss_customer_sk" AS "ss_customer_sk", "store"."s_city" AS "s_city", SUM("store_sales"."ss_coupon_amt") AS "amt", SUM("store_sales"."ss_net_profit") AS "profit" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_3" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_4" AS "household_demographics" ON ("store_sales"."ss_hdemo_sk" = "household_demographics"."hd_demo_sk") INNER JOIN "temp"."__fedq_ship_5" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk") GROUP BY "store_sales"."ss_ticket_number", "store_sales"."ss_customer_sk", "store_sales"."ss_addr_sk", "store"."s_city"
+
+--- island 4 source=pg kind=scan ---
+SELECT "c_last_name", "c_first_name", "c_customer_sk" FROM "public"."customer" AS "customer"

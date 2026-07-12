@@ -1,0 +1,19 @@
+QUERY: q40
+ENGINE: old (python)
+
+ISLANDS: 4
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=duck kind=join ---
+SELECT "catalog_sales"."cs_order_number" AS "cs_order_number", "catalog_sales"."cs_item_sk" AS "cs_item_sk", "catalog_sales"."cs_sold_date_sk" AS "cs_sold_date_sk", "catalog_sales"."cs_sales_price" AS "cs_sales_price", "catalog_sales"."cs_warehouse_sk" AS "cs_warehouse_sk", "catalog_returns"."cr_order_number" AS "cr_order_number", "catalog_returns"."cr_item_sk" AS "cr_item_sk", "catalog_returns"."cr_refunded_cash" AS "cr_refunded_cash" FROM "main"."catalog_sales" AS "catalog_sales" LEFT JOIN "main"."catalog_returns" AS "catalog_returns" ON (("catalog_sales"."cs_order_number" = "catalog_returns"."cr_order_number") AND ("catalog_sales"."cs_item_sk" = "catalog_returns"."cr_item_sk"))
+
+--- island 1 source=pg kind=scan ---
+SELECT "i_item_id", "i_current_price", "i_item_sk" FROM "public"."item" AS "item" WHERE ("item"."i_current_price" BETWEEN 0.99 AND 1.49)
+
+--- island 2 source=pg kind=scan ---
+SELECT "d_date", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_date" BETWEEN CAST('2000-02-10' AS DATE) AND CAST('2000-04-10' AS DATE))
+
+--- island 3 source=pg kind=scan ---
+SELECT "w_state", "w_warehouse_sk" FROM "public"."warehouse" AS "warehouse"

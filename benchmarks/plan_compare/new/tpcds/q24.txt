@@ -1,0 +1,32 @@
+QUERY: q24
+ENGINE: new (rust) EXPLAIN
+
+Sort
+  Projection
+    Filter
+      NestedLoopJoin
+        HashAggregate
+          Filter
+            CteScan
+              Cte
+                HashAggregate
+                  HashJoin
+                    HashJoin
+                      HashJoin
+                        RemoteQuery [pg] :: SELECT "store"."s_store_sk" AS "s_store_sk", "store"."s_store_name" AS "s_store_name", "store"."s_market_id" AS "s_market_id", "store"."s_state" AS "s_state", "store"."s_zip" AS "s_zip", "customer_address"."ca_address_sk" AS "ca_address_sk", "customer_address"."ca_state" AS "ca_state", "customer_address"."ca_zip" AS "ca_zip", "customer_address"."ca_country" AS "ca_country", "customer"."c_customer_sk" AS "c_customer_sk", "customer"."c_current_addr_sk" AS "c_current_addr_sk", "customer"."c_first_name" AS "c_first_name", "customer"."c_last_name" AS "c_last_name", "customer"."c_birth_country" AS "c_birth_country" FROM "public"."store" AS "store" INNER JOIN "public"."customer_address" AS "customer_address" ON ("store"."s_zip" = "customer_address"."ca_zip") INNER JOIN "public"."customer" AS "customer" ON ("customer"."c_current_addr_sk" = "customer_address"."ca_address_sk") WHERE ("customer"."c_birth_country" != UPPER("customer_address"."ca_country")) AND ("store"."s_market_id" = 8)
+                        Scan duck.main.store_sales
+                      Scan pg.public.item
+                    Scan duck.main.store_returns
+        AliasedRelation
+          Projection
+            HashAggregate
+              CteScan
+                Cte
+                  HashAggregate
+                    HashJoin
+                      HashJoin
+                        HashJoin
+                          RemoteQuery [pg] :: SELECT "store"."s_store_sk" AS "s_store_sk", "store"."s_store_name" AS "s_store_name", "store"."s_market_id" AS "s_market_id", "store"."s_state" AS "s_state", "store"."s_zip" AS "s_zip", "customer_address"."ca_address_sk" AS "ca_address_sk", "customer_address"."ca_state" AS "ca_state", "customer_address"."ca_zip" AS "ca_zip", "customer_address"."ca_country" AS "ca_country", "customer"."c_customer_sk" AS "c_customer_sk", "customer"."c_current_addr_sk" AS "c_current_addr_sk", "customer"."c_first_name" AS "c_first_name", "customer"."c_last_name" AS "c_last_name", "customer"."c_birth_country" AS "c_birth_country" FROM "public"."store" AS "store" INNER JOIN "public"."customer_address" AS "customer_address" ON ("store"."s_zip" = "customer_address"."ca_zip") INNER JOIN "public"."customer" AS "customer" ON ("customer"."c_current_addr_sk" = "customer_address"."ca_address_sk") WHERE ("customer"."c_birth_country" != UPPER("customer_address"."ca_country")) AND ("store"."s_market_id" = 8)
+                          Scan duck.main.store_sales
+                        Scan pg.public.item
+                      Scan duck.main.store_returns

@@ -1,0 +1,25 @@
+QUERY: q70
+ENGINE: old (python)
+
+ISLANDS: 6
+PUSHES_AGG_OR_JOIN: False
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalFilter, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=duck kind=scan ---
+SELECT "ss_net_profit", "ss_store_sk", "ss_sold_date_sk" FROM "main"."store_sales" AS "store_sales"
+
+--- island 1 source=pg kind=scan ---
+SELECT "d_month_seq", "d_date_sk" FROM "public"."date_dim" AS "d1" WHERE ("d1"."d_month_seq" BETWEEN 1200 AND (1200 + 11))
+
+--- island 2 source=pg kind=scan ---
+SELECT "s_state", "s_county", "s_store_sk" FROM "public"."store" AS "store"
+
+--- island 3 source=duck kind=scan ---
+SELECT "ss_store_sk", "ss_sold_date_sk", "ss_net_profit" FROM "main"."store_sales" AS "store_sales"
+
+--- island 4 source=pg kind=scan ---
+SELECT "d_month_seq", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_month_seq" BETWEEN 1200 AND (1200 + 11))
+
+--- island 5 source=pg kind=scan ---
+SELECT "s_state", "s_store_sk" FROM "public"."store" AS "store"

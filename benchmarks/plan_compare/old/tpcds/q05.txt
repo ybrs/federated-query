@@ -1,0 +1,43 @@
+QUERY: q05
+ENGINE: old (python)
+
+ISLANDS: 12
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalHashAggregate, PhysicalUnion, PhysicalUnion, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalUnion, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalUnion, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalUnion
+
+--- island 0 source=duck kind=scan ---
+SELECT "store_sales"."ss_store_sk" AS "store_sk", "store_sales"."ss_sold_date_sk" AS "date_sk", "store_sales"."ss_ext_sales_price" AS "sales_price", "store_sales"."ss_net_profit" AS "profit", CAST(0 AS DECIMAL(7, 2)) AS "return_amt", CAST(0 AS DECIMAL(7, 2)) AS "net_loss" FROM "main"."store_sales" AS "store_sales"
+
+--- island 1 source=duck kind=scan ---
+SELECT "store_returns"."sr_store_sk" AS "store_sk", "store_returns"."sr_returned_date_sk" AS "date_sk", CAST(0 AS DECIMAL(7, 2)) AS "sales_price", CAST(0 AS DECIMAL(7, 2)) AS "profit", "store_returns"."sr_return_amt" AS "return_amt", "store_returns"."sr_net_loss" AS "net_loss" FROM "main"."store_returns" AS "store_returns"
+
+--- island 2 source=pg kind=scan ---
+SELECT "d_date_sk", "d_date" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_date" BETWEEN CAST('2000-08-23' AS DATE) AND CAST('2000-09-06' AS DATE))
+
+--- island 3 source=pg kind=scan ---
+SELECT "s_store_id", "s_store_sk" FROM "public"."store" AS "store"
+
+--- island 4 source=duck kind=scan ---
+SELECT "catalog_sales"."cs_catalog_page_sk" AS "page_sk", "catalog_sales"."cs_sold_date_sk" AS "date_sk", "catalog_sales"."cs_ext_sales_price" AS "sales_price", "catalog_sales"."cs_net_profit" AS "profit", CAST(0 AS DECIMAL(7, 2)) AS "return_amt", CAST(0 AS DECIMAL(7, 2)) AS "net_loss" FROM "main"."catalog_sales" AS "catalog_sales"
+
+--- island 5 source=duck kind=scan ---
+SELECT "catalog_returns"."cr_catalog_page_sk" AS "page_sk", "catalog_returns"."cr_returned_date_sk" AS "date_sk", CAST(0 AS DECIMAL(7, 2)) AS "sales_price", CAST(0 AS DECIMAL(7, 2)) AS "profit", "catalog_returns"."cr_return_amount" AS "return_amt", "catalog_returns"."cr_net_loss" AS "net_loss" FROM "main"."catalog_returns" AS "catalog_returns"
+
+--- island 6 source=pg kind=scan ---
+SELECT "d_date_sk", "d_date" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_date" BETWEEN CAST('2000-08-23' AS DATE) AND CAST('2000-09-06' AS DATE))
+
+--- island 7 source=pg kind=scan ---
+SELECT "cp_catalog_page_id", "cp_catalog_page_sk" FROM "public"."catalog_page" AS "catalog_page"
+
+--- island 8 source=duck kind=scan ---
+SELECT "web_sales"."ws_web_site_sk" AS "wsr_web_site_sk", "web_sales"."ws_sold_date_sk" AS "date_sk", "web_sales"."ws_ext_sales_price" AS "sales_price", "web_sales"."ws_net_profit" AS "profit", CAST(0 AS DECIMAL(7, 2)) AS "return_amt", CAST(0 AS DECIMAL(7, 2)) AS "net_loss" FROM "main"."web_sales" AS "web_sales"
+
+--- island 9 source=duck kind=join ---
+SELECT "web_sales"."ws_web_site_sk" AS "wsr_web_site_sk", "web_returns"."wr_returned_date_sk" AS "date_sk", CAST(0 AS DECIMAL(7, 2)) AS "sales_price", CAST(0 AS DECIMAL(7, 2)) AS "profit", "web_returns"."wr_return_amt" AS "return_amt", "web_returns"."wr_net_loss" AS "net_loss" FROM "main"."web_returns" AS "web_returns" LEFT JOIN "main"."web_sales" AS "web_sales" ON (("web_returns"."wr_item_sk" = "web_sales"."ws_item_sk") AND ("web_returns"."wr_order_number" = "web_sales"."ws_order_number"))
+
+--- island 10 source=pg kind=scan ---
+SELECT "d_date_sk", "d_date" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_date" BETWEEN CAST('2000-08-23' AS DATE) AND CAST('2000-09-06' AS DATE))
+
+--- island 11 source=pg kind=scan ---
+SELECT "web_site_id", "web_site_sk" FROM "public"."web_site" AS "web_site"

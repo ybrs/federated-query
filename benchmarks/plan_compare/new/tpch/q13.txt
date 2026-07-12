@@ -1,0 +1,11 @@
+QUERY: q13
+ENGINE: new (rust) EXPLAIN
+
+Sort
+  HashAggregate
+    AliasedRelation
+      Projection
+        HashAggregate
+          HashJoin
+            Scan pg.public.customer
+            Scan duck.main.orders +filter

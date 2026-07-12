@@ -1,0 +1,40 @@
+QUERY: q72
+ENGINE: old (python)
+
+ISLANDS: 11
+PUSHES_AGG_OR_JOIN: False
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalFilter, PhysicalHashJoin, PhysicalHashJoin, PhysicalFilter, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=duck kind=scan ---
+SELECT "cs_item_sk", "cs_bill_cdemo_sk", "cs_bill_hdemo_sk", "cs_sold_date_sk", "cs_ship_date_sk", "cs_promo_sk", "cs_order_number", "cs_quantity" FROM "main"."catalog_sales" AS "catalog_sales"
+
+--- island 1 source=pg kind=scan ---
+SELECT "d_week_seq", "d_date_sk", "d_year", "d_date" FROM "public"."date_dim" AS "d1" WHERE ("d1"."d_year" = 1999)
+
+--- island 2 source=pg kind=scan ---
+SELECT "hd_demo_sk", "hd_buy_potential" FROM "public"."household_demographics" AS "household_demographics" WHERE ("household_demographics"."hd_buy_potential" = '>10000')
+
+--- island 3 source=pg kind=scan ---
+SELECT "i_item_desc", "i_item_sk" FROM "public"."item" AS "item"
+
+--- island 4 source=pg kind=scan ---
+SELECT "cd_demo_sk", "cd_marital_status" FROM "public"."customer_demographics" AS "customer_demographics" WHERE ("customer_demographics"."cd_marital_status" = 'D')
+
+--- island 5 source=pg kind=scan ---
+SELECT "d_week_seq", "d_date_sk", "d_date" FROM "public"."date_dim" AS "d3"
+
+--- island 6 source=pg kind=scan ---
+SELECT "d_week_seq", "d_date_sk" FROM "public"."date_dim" AS "d2"
+
+--- island 7 source=duck kind=scan ---
+SELECT "inv_item_sk", "inv_warehouse_sk", "inv_date_sk", "inv_quantity_on_hand" FROM "main"."inventory" AS "inventory"
+
+--- island 8 source=pg kind=scan ---
+SELECT "w_warehouse_name", "w_warehouse_sk" FROM "public"."warehouse" AS "warehouse"
+
+--- island 9 source=pg kind=scan ---
+SELECT "p_promo_sk" FROM "public"."promotion" AS "promotion"
+
+--- island 10 source=duck kind=scan ---
+SELECT "cr_item_sk", "cr_order_number" FROM "main"."catalog_returns" AS "catalog_returns"

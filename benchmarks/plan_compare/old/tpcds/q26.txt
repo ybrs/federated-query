@@ -1,0 +1,22 @@
+QUERY: q26
+ENGINE: old (python)
+
+ISLANDS: 5
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: __fedq_ship_0->duck, __fedq_ship_1->duck, __fedq_ship_2->duck, __fedq_ship_3->duck
+COORDINATOR_OPS: none
+
+--- island 0 source=pg kind=scan ---
+SELECT "cd_education_status", "cd_marital_status", "cd_gender", "cd_demo_sk" FROM "public"."customer_demographics" AS "customer_demographics" WHERE ((("customer_demographics"."cd_gender" = 'M') AND ("customer_demographics"."cd_marital_status" = 'S')) AND ("customer_demographics"."cd_education_status" = 'College'))
+
+--- island 1 source=pg kind=scan ---
+SELECT "d_year", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE ("date_dim"."d_year" = 2000)
+
+--- island 2 source=pg kind=scan ---
+SELECT "i_item_id", "i_item_sk" FROM "public"."item" AS "item"
+
+--- island 3 source=pg kind=scan ---
+SELECT "p_channel_email", "p_channel_event", "p_promo_sk" FROM "public"."promotion" AS "promotion" WHERE (("promotion"."p_channel_email" = 'N') OR ("promotion"."p_channel_event" = 'N'))
+
+--- island 4 source=duck kind=join ---
+SELECT "item"."i_item_id" AS "i_item_id", AVG("catalog_sales"."cs_quantity") AS "agg1", AVG("catalog_sales"."cs_list_price") AS "agg2", AVG("catalog_sales"."cs_coupon_amt") AS "agg3", AVG("catalog_sales"."cs_sales_price") AS "agg4" FROM "main"."catalog_sales" AS "catalog_sales" INNER JOIN "temp"."__fedq_ship_0" AS "customer_demographics" ON ("catalog_sales"."cs_bill_cdemo_sk" = "customer_demographics"."cd_demo_sk") INNER JOIN "temp"."__fedq_ship_1" AS "date_dim" ON ("catalog_sales"."cs_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_2" AS "item" ON ("catalog_sales"."cs_item_sk" = "item"."i_item_sk") INNER JOIN "temp"."__fedq_ship_3" AS "promotion" ON ("catalog_sales"."cs_promo_sk" = "promotion"."p_promo_sk") GROUP BY "item"."i_item_id" ORDER BY "i_item_id" ASC LIMIT 100

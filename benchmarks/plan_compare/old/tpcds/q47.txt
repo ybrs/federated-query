@@ -1,0 +1,43 @@
+QUERY: q47
+ENGINE: old (python)
+
+ISLANDS: 12
+PUSHES_AGG_OR_JOIN: False
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalLimit, PhysicalSort, PhysicalFilter, PhysicalFilter, PhysicalHashJoin, PhysicalFilter, PhysicalHashJoin, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=duck kind=scan ---
+SELECT "ss_sales_price", "ss_store_sk", "ss_item_sk", "ss_sold_date_sk" FROM "main"."store_sales" AS "store_sales"
+
+--- island 1 source=pg kind=scan ---
+SELECT "d_year", "d_moy", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE ((("date_dim"."d_year" = 1999) OR (("date_dim"."d_year" = (1999 - 1)) AND ("date_dim"."d_moy" = 12))) OR (("date_dim"."d_year" = (1999 + 1)) AND ("date_dim"."d_moy" = 1)))
+
+--- island 2 source=pg kind=scan ---
+SELECT "i_category", "i_brand", "i_item_sk" FROM "public"."item" AS "item"
+
+--- island 3 source=pg kind=scan ---
+SELECT "s_store_name", "s_company_name", "s_store_sk" FROM "public"."store" AS "store"
+
+--- island 4 source=duck kind=scan ---
+SELECT "ss_sales_price", "ss_store_sk", "ss_item_sk", "ss_sold_date_sk" FROM "main"."store_sales" AS "store_sales"
+
+--- island 5 source=pg kind=scan ---
+SELECT "d_year", "d_moy", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE ((("date_dim"."d_year" = 1999) OR (("date_dim"."d_year" = (1999 - 1)) AND ("date_dim"."d_moy" = 12))) OR (("date_dim"."d_year" = (1999 + 1)) AND ("date_dim"."d_moy" = 1)))
+
+--- island 6 source=pg kind=scan ---
+SELECT "i_category", "i_brand", "i_item_sk" FROM "public"."item" AS "item"
+
+--- island 7 source=pg kind=scan ---
+SELECT "s_store_name", "s_company_name", "s_store_sk" FROM "public"."store" AS "store"
+
+--- island 8 source=duck kind=scan ---
+SELECT "ss_sales_price", "ss_store_sk", "ss_item_sk", "ss_sold_date_sk" FROM "main"."store_sales" AS "store_sales"
+
+--- island 9 source=pg kind=scan ---
+SELECT "d_year", "d_moy", "d_date_sk" FROM "public"."date_dim" AS "date_dim" WHERE ((("date_dim"."d_year" = 1999) OR (("date_dim"."d_year" = (1999 - 1)) AND ("date_dim"."d_moy" = 12))) OR (("date_dim"."d_year" = (1999 + 1)) AND ("date_dim"."d_moy" = 1)))
+
+--- island 10 source=pg kind=scan ---
+SELECT "i_category", "i_brand", "i_item_sk" FROM "public"."item" AS "item"
+
+--- island 11 source=pg kind=scan ---
+SELECT "s_store_name", "s_company_name", "s_store_sk" FROM "public"."store" AS "store"

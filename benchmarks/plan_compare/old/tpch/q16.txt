@@ -1,0 +1,16 @@
+QUERY: q16
+ENGINE: old (python)
+
+ISLANDS: 3
+PUSHES_AGG_OR_JOIN: False
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalSort, PhysicalHashAggregate, PhysicalHashJoin, PhysicalNestedLoopJoin
+
+--- island 0 source=duck kind=scan ---
+SELECT "ps_suppkey", "ps_partkey" FROM "main"."partsupp" AS "partsupp"
+
+--- island 1 source=pg kind=scan ---
+SELECT "s_suppkey", "s_comment" FROM "public"."supplier" AS "supplier" WHERE ("supplier"."s_comment" LIKE '%Customer%Complaints%')
+
+--- island 2 source=pg kind=scan ---
+SELECT "p_brand", "p_type", "p_size", "p_partkey" FROM "public"."part" AS "part" WHERE ((("part"."p_brand" <> 'Brand#45') AND (NOT ("part"."p_type" LIKE 'MEDIUM POLISHED%'))) AND ("part"."p_size" IN (49, 14, 23, 45, 19, 3, 36, 9)))

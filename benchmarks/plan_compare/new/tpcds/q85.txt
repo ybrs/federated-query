@@ -1,0 +1,23 @@
+QUERY: q85
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  Sort
+    HashAggregate
+      Filter
+        HashJoin
+          HashJoin
+            HashJoin
+              HashJoin
+                Filter
+                  HashJoin
+                    HashJoin
+                      HashJoin
+                        Scan duck.main.web_sales +filter +semijoin
+                        Scan pg.public.date_dim +filter
+                      Scan duck.main.web_returns
+                    Scan pg.public.customer_address +filter
+                Scan pg.public.web_page
+              Scan pg.public.customer_demographics
+            Scan pg.public.reason
+          Scan pg.public.customer_demographics +filter

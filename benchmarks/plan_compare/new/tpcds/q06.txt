@@ -1,0 +1,27 @@
+QUERY: q06
+ENGINE: new (rust) EXPLAIN
+
+Limit
+  Sort
+    Filter
+      HashAggregate
+        Filter
+          HashJoin
+            HashJoin
+              HashJoin
+                HashJoin
+                  HashJoin
+                    HashJoin
+                      Scan pg.public.date_dim
+                      AliasedRelation
+                        SingleRowGuard
+                          Projection
+                            Projection
+                              Scan pg.public.date_dim +filter +distinct
+                    Scan duck.main.store_sales
+                  Scan pg.public.item
+                Scan pg.public.customer
+              Scan pg.public.customer_address
+            AliasedRelation
+              Projection
+                Scan pg.public.item +agg(2) +groupby

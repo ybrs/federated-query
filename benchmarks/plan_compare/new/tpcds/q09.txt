@@ -1,0 +1,65 @@
+QUERY: q09
+ENGINE: new (rust) EXPLAIN
+
+Projection
+  NestedLoopJoin
+    NestedLoopJoin
+      NestedLoopJoin
+        NestedLoopJoin
+          NestedLoopJoin
+            NestedLoopJoin
+              NestedLoopJoin
+                NestedLoopJoin
+                  NestedLoopJoin
+                    NestedLoopJoin
+                      NestedLoopJoin
+                        NestedLoopJoin
+                          NestedLoopJoin
+                            NestedLoopJoin
+                              NestedLoopJoin
+                                Scan pg.public.reason +filter
+                                AliasedRelation
+                                  Projection
+                                    Scan duck.main.store_sales +filter +agg(1) +groupby
+                              AliasedRelation
+                                Projection
+                                  Scan duck.main.store_sales +filter +agg(1) +groupby
+                            AliasedRelation
+                              Projection
+                                Scan duck.main.store_sales +filter +agg(1) +groupby
+                          AliasedRelation
+                            Projection
+                              Scan duck.main.store_sales +filter +agg(1) +groupby
+                        AliasedRelation
+                          Projection
+                            Scan duck.main.store_sales +filter +agg(1) +groupby
+                      AliasedRelation
+                        Projection
+                          Scan duck.main.store_sales +filter +agg(1) +groupby
+                    AliasedRelation
+                      Projection
+                        Scan duck.main.store_sales +filter +agg(1) +groupby
+                  AliasedRelation
+                    Projection
+                      Scan duck.main.store_sales +filter +agg(1) +groupby
+                AliasedRelation
+                  Projection
+                    Scan duck.main.store_sales +filter +agg(1) +groupby
+              AliasedRelation
+                Projection
+                  Scan duck.main.store_sales +filter +agg(1) +groupby
+            AliasedRelation
+              Projection
+                Scan duck.main.store_sales +filter +agg(1) +groupby
+          AliasedRelation
+            Projection
+              Scan duck.main.store_sales +filter +agg(1) +groupby
+        AliasedRelation
+          Projection
+            Scan duck.main.store_sales +filter +agg(1) +groupby
+      AliasedRelation
+        Projection
+          Scan duck.main.store_sales +filter +agg(1) +groupby
+    AliasedRelation
+      Projection
+        Scan duck.main.store_sales +filter +agg(1) +groupby

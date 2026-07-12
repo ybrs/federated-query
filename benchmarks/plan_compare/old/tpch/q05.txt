@@ -1,0 +1,22 @@
+QUERY: q05
+ENGINE: old (python)
+
+ISLANDS: 5
+PUSHES_AGG_OR_JOIN: True
+SHIPMENTS: none
+COORDINATOR_OPS: PhysicalSort, PhysicalHashAggregate, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin, PhysicalHashJoin
+
+--- island 0 source=duck kind=join ---
+SELECT "orders"."o_orderdate" AS "o_orderdate", "orders"."o_custkey" AS "o_custkey", "orders"."o_orderkey" AS "o_orderkey", "lineitem"."l_extendedprice" AS "l_extendedprice", "lineitem"."l_discount" AS "l_discount", "lineitem"."l_suppkey" AS "l_suppkey", "lineitem"."l_orderkey" AS "l_orderkey" FROM "main"."orders" AS "orders" INNER JOIN "main"."lineitem" AS "lineitem" ON ("lineitem"."l_orderkey" = "orders"."o_orderkey") WHERE (("orders"."o_orderdate" >= CAST('1994-01-01' AS DATE)) AND ("orders"."o_orderdate" < CAST('1995-01-01' AS DATE)))
+
+--- island 1 source=pg kind=scan ---
+SELECT "s_nationkey", "s_suppkey" FROM "public"."supplier" AS "supplier"
+
+--- island 2 source=pg kind=scan ---
+SELECT "n_name", "n_regionkey", "n_nationkey" FROM "public"."nation" AS "nation"
+
+--- island 3 source=pg kind=scan ---
+SELECT "r_name", "r_regionkey" FROM "public"."region" AS "region" WHERE ("region"."r_name" = 'ASIA')
+
+--- island 4 source=pg kind=scan ---
+SELECT "c_nationkey", "c_custkey" FROM "public"."customer" AS "customer"
