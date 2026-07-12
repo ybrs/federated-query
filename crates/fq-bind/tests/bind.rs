@@ -256,6 +256,52 @@ fn having_output_alias_resolves() {
 }
 
 #[test]
+fn having_aggregate_expression_matches_select_output() {
+    // HAVING repeats the SELECT aggregate EXPRESSION (not its alias). A post-
+    // aggregate filter cannot recompute SUM, so it must reference the output `s`
+    // that already computes it (the q11 hoist). The Filter sits directly over the
+    // Aggregate (no hidden output was needed).
+    let plan =
+        bind_sql("SELECT age, SUM(id) AS s FROM pg.public.users GROUP BY age HAVING SUM(id) > 5")
+            .unwrap();
+    let LogicalPlan::Filter(filter) = &plan else {
+        panic!("expected HAVING Filter over the aggregate, got {plan:?}");
+    };
+    assert!(matches!(filter.input.as_ref(), LogicalPlan::Aggregate(_)));
+    let Expr::BinaryOp { left, .. } = &filter.predicate else {
+        panic!("expected comparison");
+    };
+    // The SUM(id) call was rewritten to a bare reference to the output `s`, not
+    // left as an aggregate over the (now-gone) base column `id`.
+    let Expr::Column(reference) = left.as_ref() else {
+        panic!("HAVING aggregate not hoisted to an output ref: {left:?}");
+    };
+    assert_eq!(reference.table, None);
+    assert_eq!(reference.column, "s");
+}
+
+#[test]
+fn having_aggregate_absent_from_select_is_hoisted_hidden() {
+    // The HAVING aggregate (SUM(id)) is NOT in the SELECT list, so it becomes a
+    // hidden __agg_N output on the aggregate and a projection restores the declared
+    // schema (dropping the hidden output).
+    let plan = bind_sql("SELECT age FROM pg.public.users GROUP BY age HAVING SUM(id) > 5").unwrap();
+    let LogicalPlan::Projection(restore) = &plan else {
+        panic!("expected a restore Projection at the root, got {plan:?}");
+    };
+    // The restore projects only the declared output (age), not the hidden __agg_0.
+    assert_eq!(restore.aliases, vec!["age".to_string()]);
+    let LogicalPlan::Filter(filter) = restore.input.as_ref() else {
+        panic!("expected Filter under the restore projection");
+    };
+    let LogicalPlan::Aggregate(widened) = filter.input.as_ref() else {
+        panic!("expected the widened Aggregate under the Filter");
+    };
+    // The aggregate was widened with the hidden HAVING output.
+    assert_eq!(widened.output_names, vec!["age".to_string(), "__agg_1".to_string()]);
+}
+
+#[test]
 fn order_by_output_alias_resolves() {
     let plan =
         bind_sql("SELECT age, COUNT(*) AS n FROM pg.public.users GROUP BY age ORDER BY n DESC")

@@ -19,6 +19,8 @@
 use std::collections::HashMap;
 
 use fq_catalog::{Catalog, Column, Table};
+use fq_common::update;
+use fq_plan::expr::ColumnRef;
 use fq_plan::{
     Aggregate, Cte, CteRef, Explain, Expr, Filter, Join, Limit, LogicalPlan, Projection, Scan,
     SetOperation, Sort, SubqueryScan, Values,
@@ -120,6 +122,13 @@ impl<'a> Binder<'a> {
         let predicate = self.with_output_aliases(overlay, |binder| {
             binder.with_scope(&input, |binder| binder.bind_expr(&filter.predicate))
         })?;
+        // A HAVING (Filter over an Aggregate) cannot compute an aggregate per row:
+        // hoist each aggregate call in the predicate to an aggregate OUTPUT
+        // reference (a call equal to an existing output references it; otherwise a
+        // hidden __agg_N output is appended and a projection restores the schema).
+        if let LogicalPlan::Aggregate(aggregate) = input {
+            return Ok(hoist_having_over_aggregate(aggregate, predicate));
+        }
         // In-place on the owned node: set the (rebound) input and predicate; any
         // other field the Filter grows is preserved rather than reset.
         filter.input = Box::new(input);
@@ -690,6 +699,90 @@ fn aggregate_overlay(plan: &LogicalPlan) -> Option<HashMap<String, fq_common::Da
             .map(|(name, expr)| (name.clone(), expr.get_type()))
             .collect(),
     )
+}
+
+/// Bind a HAVING predicate that sits over an Aggregate. Ports the Python
+/// `_hoist_aggregate_calls` machinery: every aggregate call in the (already-bound)
+/// predicate becomes an aggregate-OUTPUT reference, because a post-aggregate filter
+/// cannot recompute an aggregate over the grouped rows. A call structurally equal to
+/// an existing output references that output; a call absent from the SELECT list is
+/// appended as a hidden `__agg_N` output and a projection above restores the declared
+/// schema (so the hidden output never widens the result).
+fn hoist_having_over_aggregate(aggregate: Aggregate, predicate: Expr) -> LogicalPlan {
+    let original_names = aggregate.output_names.clone();
+    let original_aggregates = aggregate.aggregates.clone();
+    let mut aggregates = aggregate.aggregates.clone();
+    let mut names = aggregate.output_names.clone();
+    let rewritten = hoist_aggregate_calls(predicate, &mut aggregates, &mut names);
+    if names.len() == original_names.len() {
+        // No hidden output was appended: every call matched an existing output.
+        // Fresh Filter over the unchanged aggregate with the rewritten predicate -
+        // a genuine new node (the original Filter was consumed); field list complete.
+        return LogicalPlan::Filter(Filter {
+            input: Box::new(LogicalPlan::Aggregate(aggregate)),
+            predicate: rewritten,
+        });
+    }
+    // Widen the aggregate with the hidden outputs the predicate now names, in place.
+    let widened = update!(aggregate, { aggregates = aggregates, output_names = names });
+    // Fresh Filter over the widened aggregate - a genuine new node (the original
+    // Filter was consumed above); its two fields (input, predicate) are both listed.
+    let filtered = LogicalPlan::Filter(Filter {
+        input: Box::new(LogicalPlan::Aggregate(widened)),
+        predicate: rewritten,
+    });
+    let mut restore = Vec::with_capacity(original_names.len());
+    for (name, agg) in original_names.iter().zip(&original_aggregates) {
+        restore.push(Expr::Column(ColumnRef::new(
+            None,
+            name.clone(),
+            Some(agg.get_type()),
+        )));
+    }
+    // Restore the aggregate's declared schema above the hoisted filter, dropping the
+    // hidden HAVING outputs - a genuine new Projection; field list complete.
+    LogicalPlan::Projection(Projection {
+        input: Box::new(filtered),
+        expressions: restore,
+        aliases: original_names,
+        distinct: false,
+        distinct_on: None,
+    })
+}
+
+/// Replace each aggregate-scoped call (an aggregate function or `GROUPING()`) in
+/// `expr` with an aggregate-output reference, appending hidden outputs as needed.
+fn hoist_aggregate_calls(
+    expr: Expr,
+    aggregates: &mut Vec<Expr>,
+    names: &mut Vec<String>,
+) -> Expr {
+    if let Expr::FunctionCall {
+        is_aggregate,
+        function_name,
+        ..
+    } = &expr
+    {
+        if *is_aggregate || function_name.eq_ignore_ascii_case("grouping") {
+            return aggregate_call_ref(expr, aggregates, names);
+        }
+    }
+    expr.map_children(&mut |child| hoist_aggregate_calls(child, aggregates, names))
+}
+
+/// The aggregate-output reference for one HAVING aggregate call: the existing
+/// output that already computes it (structural equality), else a hidden appended one.
+fn aggregate_call_ref(call: Expr, aggregates: &mut Vec<Expr>, names: &mut Vec<String>) -> Expr {
+    let call_type = call.get_type();
+    for (index, existing) in aggregates.iter().enumerate() {
+        if index < names.len() && *existing == call {
+            return Expr::Column(ColumnRef::new(None, names[index].clone(), Some(call_type)));
+        }
+    }
+    let name = format!("__agg_{}", names.len());
+    aggregates.push(call);
+    names.push(name.clone());
+    Expr::Column(ColumnRef::new(None, name, Some(call_type)))
 }
 
 /// The output-alias overlay of a Projection (alias -> type); None otherwise.
