@@ -1,4 +1,16 @@
 QUERY: q89
 ENGINE: new (rust) EXPLAIN
 
-ERROR: RuntimeError: parse error: unsupported SQL: function `window_function`
+Limit
+  Sort
+    Projection
+      Filter
+        AliasedRelation
+          HashAggregate
+            HashJoin
+              HashJoin
+                HashJoin
+                  Scan pg.public.item +filter
+                  Scan duck.main.store_sales +semijoin
+                Scan pg.public.date_dim +filter
+              Scan pg.public.store

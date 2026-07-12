@@ -14,7 +14,7 @@ Limit
                   Projection
                     AliasedRelation
                       Filter
-                        RemoteQuery [pg] :: SELECT SUBSTRING("customer_address"."ca_zip", 1, 5) AS "ca_zip", COUNT() AS "cnt" FROM "public"."customer_address" AS "customer_address" INNER JOIN "public"."customer" AS "customer" ON ("customer_address"."ca_address_sk" = "customer"."c_current_addr_sk") WHERE ("customer"."c_preferred_cust_flag" = 'Y') GROUP BY SUBSTRING("customer_address"."ca_zip", 1, 5)
+                        RemoteQuery [pg] :: SELECT SUBSTRING("customer_address"."ca_zip", 1, 5) AS "ca_zip", COUNT(*) AS "cnt" FROM "public"."customer_address" AS "customer_address" INNER JOIN "public"."customer" AS "customer" ON ("customer_address"."ca_address_sk" = "customer"."c_current_addr_sk") WHERE ("customer"."c_preferred_cust_flag" = 'Y') GROUP BY SUBSTRING("customer_address"."ca_zip", 1, 5)
           HashJoin
             HashJoin
               Scan duck.main.store_sales +semijoin

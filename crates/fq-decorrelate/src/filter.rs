@@ -7,7 +7,7 @@ use fq_plan::logical::{Filter, Join, JoinType, LogicalPlan, Projection};
 
 use crate::boolean::{constant_exists_value, negated_subquery_conjunct};
 use crate::helpers::{
-    and_join, bool_literal, expression_has_subquery, is_subquery_node, unqualified_col,
+    and_join, bool_literal, expression_has_subquery, is_subquery_node, output_col,
 };
 use crate::value::tighten_scalar_equality;
 use crate::{Decorrelator, Result};
@@ -140,7 +140,7 @@ fn restore_filter_schema(plan: LogicalPlan, names: &[String]) -> LogicalPlan {
     }
     let mut expressions = Vec::with_capacity(names.len());
     for name in names {
-        expressions.push(unqualified_col(name));
+        expressions.push(output_col(name));
     }
     // Fresh projection re-exposing the pre-join column names - there is no base
     // projection to copy from. Field list is the complete Projection struct.

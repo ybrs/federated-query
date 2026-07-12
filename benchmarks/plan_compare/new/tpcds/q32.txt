@@ -1,4 +1,16 @@
 QUERY: q32
 ENGINE: new (rust) EXPLAIN
 
-ERROR: PanicException: ColumnRef type must be set during binding
+Limit
+  HashAggregate
+    Filter
+      HashJoin
+        HashJoin
+          HashJoin
+            Scan duck.main.catalog_sales +semijoin
+            Scan pg.public.item +filter
+          Scan pg.public.date_dim +filter
+        AliasedRelation
+          Shipment __fedq_ship_1 [duck]
+            Scan pg.public.date_dim +filter
+            RemoteQuery [duck] :: SELECT "catalog_sales"."cs_item_sk" AS "__subq_0_g0", AVG("catalog_sales"."cs_ext_discount_amt") AS "__subq_0_v0" FROM "main"."catalog_sales" AS "catalog_sales" INNER JOIN "temp"."__fedq_ship_1" AS "date_dim" ON ("date_dim"."d_date_sk" = "catalog_sales"."cs_sold_date_sk") GROUP BY "catalog_sales"."cs_item_sk"

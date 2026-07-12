@@ -18,8 +18,8 @@ Limit
                             Scan duck.main.store_sales +semijoin
                             Scan pg.public.customer_demographics +filter
                           Scan pg.public.date_dim +filter
-                        Scan pg.public.item
-                      Scan pg.public.store +filter
+                        Scan pg.public.store +filter
+                      Scan pg.public.item
             HashAggregate
               CteScan
                 Cte
@@ -31,8 +31,8 @@ Limit
                             Scan duck.main.store_sales +semijoin
                             Scan pg.public.customer_demographics +filter
                           Scan pg.public.date_dim +filter
-                        Scan pg.public.item
-                      Scan pg.public.store +filter
+                        Scan pg.public.store +filter
+                      Scan pg.public.item
           HashAggregate
             CteScan
               Cte
@@ -44,5 +44,5 @@ Limit
                           Scan duck.main.store_sales +semijoin
                           Scan pg.public.customer_demographics +filter
                         Scan pg.public.date_dim +filter
-                      Scan pg.public.item
-                    Scan pg.public.store +filter
+                      Scan pg.public.store +filter
+                    Scan pg.public.item

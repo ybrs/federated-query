@@ -1,4 +1,17 @@
 QUERY: q67
 ENGINE: new (rust) EXPLAIN
 
-ERROR: RuntimeError: parse error: unsupported SQL: function `window_function`
+Limit
+  Sort
+    Projection
+      Filter
+        AliasedRelation
+          Window
+            AliasedRelation
+              Shipment __fedq_ship_21 [duck]
+                Scan pg.public.date_dim +filter
+                Shipment __fedq_ship_22 [duck]
+                  Scan pg.public.store
+                  Shipment __fedq_ship_23 [duck]
+                    Scan pg.public.item
+                    RemoteQuery [duck] :: SELECT "item"."i_category" AS "i_category", "item"."i_class" AS "i_class", "item"."i_brand" AS "i_brand", "item"."i_product_name" AS "i_product_name", "date_dim"."d_year" AS "d_year", "date_dim"."d_qoy" AS "d_qoy", "date_dim"."d_moy" AS "d_moy", "store"."s_store_id" AS "s_store_id", SUM(COALESCE(("store_sales"."ss_sales_price" * "store_sales"."ss_quantity"), 0)) AS "sumsales" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_21" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_22" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk") INNER JOIN "temp"."__fedq_ship_23" AS "item" ON ("store_sales"."ss_item_sk" = "item"."i_item_sk") GROUP BY ROLLUP("item"."i_category", "item"."i_class", "item"."i_brand", "item"."i_product_name", "date_dim"."d_year", "date_dim"."d_qoy", "date_dim"."d_moy", "store"."s_store_id")

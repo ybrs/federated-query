@@ -9,20 +9,18 @@ Limit
           HashJoin
             Filter
               HashJoin
-                HashJoin
-                  Filter
+                Filter
+                  HashJoin
                     HashJoin
                       HashJoin
                         HashJoin
                           HashJoin
-                            HashJoin
-                              Scan duck.main.catalog_sales +semijoin
-                              Scan pg.public.date_dim +filter
-                            Scan pg.public.household_demographics +filter
+                            RemoteQuery [pg] :: SELECT "d1"."d_date_sk" AS "d_date_sk", "d1"."d_date" AS "d_date", "d1"."d_week_seq" AS "d_week_seq", "d1"."d_year" AS "d_year", "d2"."d_date_sk" AS "d_date_sk_1", "d2"."d_week_seq" AS "d_week_seq_1" FROM "public"."date_dim" AS "d1" INNER JOIN "public"."date_dim" AS "d2" ON ("d1"."d_week_seq" = "d2"."d_week_seq") WHERE ("d1"."d_year" = 1999)
+                            Scan duck.main.catalog_sales +semijoin
                           Scan pg.public.item
                         Scan pg.public.customer_demographics +filter
-                      Scan pg.public.date_dim
-                  Scan pg.public.date_dim
+                      Scan pg.public.household_demographics +filter
+                    Scan pg.public.date_dim
                 Scan duck.main.inventory
             Scan pg.public.warehouse
           Scan pg.public.promotion

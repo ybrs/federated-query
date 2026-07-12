@@ -61,8 +61,12 @@ impl Decorrelator {
         let prepared = self.preparer().prepare_values(subquery)?;
         let items = in_value_items(value, &prepared)?;
         let mut comparisons = Vec::with_capacity(items.len());
-        for (item, value_name) in items.into_iter().zip(prepared.values.iter()) {
-            let value_ref = qualified_col(&prepared.alias, value_name);
+        for ((item, value_name), value_type) in items
+            .into_iter()
+            .zip(prepared.values.iter())
+            .zip(prepared.value_types.iter())
+        {
+            let value_ref = qualified_col(&prepared.alias, value_name, *value_type);
             comparisons.push(match_term(item, value_ref, negated));
         }
         let condition = combine_condition(comparisons, prepared.condition)?;
@@ -85,7 +89,11 @@ impl Decorrelator {
                 "Quantified comparison subquery must return one column".to_string(),
             ));
         }
-        let value_ref = qualified_col(&prepared.alias, &prepared.values[0]);
+        let value_ref = qualified_col(
+            &prepared.alias,
+            &prepared.values[0],
+            prepared.value_types[0],
+        );
         // `left` and `value_ref` each feed both the comparison and (for ALL) the
         // violation term below, so the comparison gets its own copy of each.
         let comparison = binary(operator, left.clone(), value_ref.clone());

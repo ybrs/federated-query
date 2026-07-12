@@ -33,6 +33,7 @@ pub fn render_expr(expr: &Expr, resolver: &dyn ColumnResolver) -> Result<String,
         Expr::FunctionCall {
             function_name,
             args,
+            is_aggregate,
             distinct,
             within_group_key,
             within_group_desc,
@@ -40,6 +41,7 @@ pub fn render_expr(expr: &Expr, resolver: &dyn ColumnResolver) -> Result<String,
         } => render_function(
             function_name,
             args,
+            *is_aggregate,
             *distinct,
             within_group_key.as_deref(),
             *within_group_desc,
@@ -137,12 +139,21 @@ fn render_unary(
 fn render_function(
     name: &str,
     args: &[Expr],
+    is_aggregate: bool,
     distinct: bool,
     within_group_key: Option<&Expr>,
     within_group_desc: bool,
     resolver: &dyn ColumnResolver,
 ) -> Result<String, EmitError> {
-    let rendered = render_all(args, resolver)?.join(", ");
+    // A zero-argument AGGREGATE is the star form: `COUNT(*)`. Rendering the
+    // bare parens (`COUNT()`) is invalid Postgres ("count(*) must be used to
+    // call a parameterless aggregate function"); DuckDB merely tolerates it.
+    // A zero-argument SCALAR call (`now()`) keeps its empty parens.
+    let rendered = if is_aggregate && args.is_empty() {
+        "*".to_string()
+    } else {
+        render_all(args, resolver)?.join(", ")
+    };
     let mut call = if distinct {
         format!("{name}(DISTINCT {rendered})")
     } else {
@@ -439,6 +450,25 @@ mod tests {
     }
 
     #[test]
+    fn zero_argument_aggregate_renders_the_star_form() {
+        // COUNT with no arguments is COUNT(*): Postgres rejects bare COUNT().
+        assert_eq!(render(&func("COUNT", vec![], false)), "COUNT(*)");
+    }
+
+    #[test]
+    fn zero_argument_scalar_call_keeps_empty_parens() {
+        let call = Expr::FunctionCall {
+            function_name: "NOW".to_string(),
+            args: vec![],
+            is_aggregate: false,
+            distinct: false,
+            within_group_key: None,
+            within_group_desc: false,
+        };
+        assert_eq!(render(&call), "NOW()");
+    }
+
+    #[test]
     fn ordered_set_within_group_asc_and_desc() {
         let asc = Expr::FunctionCall {
             function_name: "PERCENTILE_CONT".to_string(),
@@ -565,8 +595,18 @@ mod tests {
         order_nulls: Vec<Option<NullsOrder>>,
         frame: Option<String>,
     ) -> Expr {
+        // ROW_NUMBER is a RANKING function, not an aggregate: it renders its
+        // empty parens verbatim (only a zero-argument AGGREGATE becomes `(*)`).
+        let function = Expr::FunctionCall {
+            function_name: "ROW_NUMBER".to_string(),
+            args: vec![],
+            is_aggregate: false,
+            distinct: false,
+            within_group_key: None,
+            within_group_desc: false,
+        };
         Expr::Window {
-            function: Box::new(func("ROW_NUMBER", vec![], false)),
+            function: Box::new(function),
             partition_by,
             order_keys,
             order_ascending,

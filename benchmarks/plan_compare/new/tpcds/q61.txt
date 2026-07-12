@@ -7,27 +7,27 @@ Limit
       NestedLoopJoin
         AliasedRelation
           Shipment __fedq_ship_6 [duck]
-            Scan pg.public.date_dim +filter
+            Scan pg.public.customer
             Shipment __fedq_ship_7 [duck]
-              Scan pg.public.item +filter
+              Scan pg.public.customer_address +filter
               Shipment __fedq_ship_8 [duck]
                 Scan pg.public.store +filter
                 Shipment __fedq_ship_9 [duck]
                   Scan pg.public.promotion +filter
                   Shipment __fedq_ship_10 [duck]
-                    Scan pg.public.customer
+                    Scan pg.public.date_dim +filter
                     Shipment __fedq_ship_11 [duck]
-                      Scan pg.public.customer_address +filter
-                      RemoteQuery [duck] :: SELECT SUM("store_sales"."ss_ext_sales_price") AS "promotions" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_6" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_7" AS "item" ON ("store_sales"."ss_item_sk" = "item"."i_item_sk") INNER JOIN "temp"."__fedq_ship_8" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk") INNER JOIN "temp"."__fedq_ship_9" AS "promotion" ON ("store_sales"."ss_promo_sk" = "promotion"."p_promo_sk") INNER JOIN "temp"."__fedq_ship_10" AS "customer" ON ("store_sales"."ss_customer_sk" = "customer"."c_customer_sk") INNER JOIN "temp"."__fedq_ship_11" AS "customer_address" ON ("customer_address"."ca_address_sk" = "customer"."c_current_addr_sk")
+                      Scan pg.public.item +filter
+                      RemoteQuery [duck] :: SELECT SUM("store_sales"."ss_ext_sales_price") AS "promotions" FROM "temp"."__fedq_ship_6" AS "customer" INNER JOIN "temp"."__fedq_ship_7" AS "customer_address" ON ("customer_address"."ca_address_sk" = "customer"."c_current_addr_sk") INNER JOIN "main"."store_sales" AS "store_sales" ON ("store_sales"."ss_customer_sk" = "customer"."c_customer_sk") INNER JOIN "temp"."__fedq_ship_8" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk") INNER JOIN "temp"."__fedq_ship_9" AS "promotion" ON ("store_sales"."ss_promo_sk" = "promotion"."p_promo_sk") INNER JOIN "temp"."__fedq_ship_10" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_11" AS "item" ON ("store_sales"."ss_item_sk" = "item"."i_item_sk")
         AliasedRelation
           Shipment __fedq_ship_17 [duck]
-            Scan pg.public.date_dim +filter
+            Scan pg.public.customer
             Shipment __fedq_ship_18 [duck]
-              Scan pg.public.item +filter
+              Scan pg.public.customer_address +filter
               Shipment __fedq_ship_19 [duck]
                 Scan pg.public.store +filter
                 Shipment __fedq_ship_20 [duck]
-                  Scan pg.public.customer
+                  Scan pg.public.date_dim +filter
                   Shipment __fedq_ship_21 [duck]
-                    Scan pg.public.customer_address +filter
-                    RemoteQuery [duck] :: SELECT SUM("store_sales"."ss_ext_sales_price") AS "total" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_17" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_18" AS "item" ON ("store_sales"."ss_item_sk" = "item"."i_item_sk") INNER JOIN "temp"."__fedq_ship_19" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk") INNER JOIN "temp"."__fedq_ship_20" AS "customer" ON ("store_sales"."ss_customer_sk" = "customer"."c_customer_sk") INNER JOIN "temp"."__fedq_ship_21" AS "customer_address" ON ("customer_address"."ca_address_sk" = "customer"."c_current_addr_sk")
+                    Scan pg.public.item +filter
+                    RemoteQuery [duck] :: SELECT SUM("store_sales"."ss_ext_sales_price") AS "total" FROM "temp"."__fedq_ship_17" AS "customer" INNER JOIN "temp"."__fedq_ship_18" AS "customer_address" ON ("customer_address"."ca_address_sk" = "customer"."c_current_addr_sk") INNER JOIN "main"."store_sales" AS "store_sales" ON ("store_sales"."ss_customer_sk" = "customer"."c_customer_sk") INNER JOIN "temp"."__fedq_ship_19" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk") INNER JOIN "temp"."__fedq_ship_20" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_21" AS "item" ON ("store_sales"."ss_item_sk" = "item"."i_item_sk")

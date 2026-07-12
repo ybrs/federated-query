@@ -8,9 +8,9 @@ Limit
         HashJoin
           HashJoin
             HashJoin
-              Scan duck.main.web_sales +semijoin
-              Scan pg.public.ship_mode
-            AliasedRelation
-              RemoteQuery [pg] :: SELECT SUBSTRING("warehouse"."w_warehouse_name", 1, 20) AS "w_substr", "warehouse"."w_warehouse_sk" AS "w_warehouse_sk", "warehouse"."w_warehouse_id" AS "w_warehouse_id", "warehouse"."w_warehouse_name" AS "w_warehouse_name", "warehouse"."w_warehouse_sq_ft" AS "w_warehouse_sq_ft", "warehouse"."w_street_number" AS "w_street_number", "warehouse"."w_street_name" AS "w_street_name", "warehouse"."w_street_type" AS "w_street_type", "warehouse"."w_suite_number" AS "w_suite_number", "warehouse"."w_city" AS "w_city", "warehouse"."w_county" AS "w_county", "warehouse"."w_state" AS "w_state", "warehouse"."w_zip" AS "w_zip", "warehouse"."w_country" AS "w_country", "warehouse"."w_gmt_offset" AS "w_gmt_offset" FROM "public"."warehouse" AS "warehouse"
+              Scan duck.main.web_sales
+              AliasedRelation
+                RemoteQuery [pg] :: SELECT SUBSTRING("warehouse"."w_warehouse_name", 1, 20) AS "w_substr", "warehouse"."w_warehouse_sk" AS "w_warehouse_sk", "warehouse"."w_warehouse_id" AS "w_warehouse_id", "warehouse"."w_warehouse_name" AS "w_warehouse_name", "warehouse"."w_warehouse_sq_ft" AS "w_warehouse_sq_ft", "warehouse"."w_street_number" AS "w_street_number", "warehouse"."w_street_name" AS "w_street_name", "warehouse"."w_street_type" AS "w_street_type", "warehouse"."w_suite_number" AS "w_suite_number", "warehouse"."w_city" AS "w_city", "warehouse"."w_county" AS "w_county", "warehouse"."w_state" AS "w_state", "warehouse"."w_zip" AS "w_zip", "warehouse"."w_country" AS "w_country", "warehouse"."w_gmt_offset" AS "w_gmt_offset" FROM "public"."warehouse" AS "warehouse"
+            Scan pg.public.ship_mode
           Scan pg.public.web_site
         Scan pg.public.date_dim +filter

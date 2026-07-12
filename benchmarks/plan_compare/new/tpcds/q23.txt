@@ -12,65 +12,65 @@ Limit
                 HashJoin
                   HashJoin
                     Scan duck.main.catalog_sales +semijoin
-                    Scan pg.public.date_dim +filter
-                  Scan pg.public.customer
+                    Scan pg.public.customer
+                  Scan pg.public.date_dim +filter
                 CteScan
                   Cte
-                    Filter
-                      HashAggregate
-                        HashJoin
-                          HashJoin
-                            Scan duck.main.store_sales +semijoin
-                            Scan pg.public.date_dim +filter
-                          AliasedRelation
-                            RemoteQuery [pg] :: SELECT SUBSTRING("item"."i_item_desc", 1, 30) AS "itemdesc", "item"."i_item_sk" AS "i_item_sk", "item"."i_item_id" AS "i_item_id", "item"."i_rec_start_date" AS "i_rec_start_date", "item"."i_rec_end_date" AS "i_rec_end_date", "item"."i_item_desc" AS "i_item_desc", "item"."i_current_price" AS "i_current_price", "item"."i_wholesale_cost" AS "i_wholesale_cost", "item"."i_brand_id" AS "i_brand_id", "item"."i_brand" AS "i_brand", "item"."i_class_id" AS "i_class_id", "item"."i_class" AS "i_class", "item"."i_category_id" AS "i_category_id", "item"."i_category" AS "i_category", "item"."i_manufact_id" AS "i_manufact_id", "item"."i_manufact" AS "i_manufact", "item"."i_size" AS "i_size", "item"."i_formulation" AS "i_formulation", "item"."i_color" AS "i_color", "item"."i_units" AS "i_units", "item"."i_container" AS "i_container", "item"."i_manager_id" AS "i_manager_id", "item"."i_product_name" AS "i_product_name" FROM "public"."item" AS "item"
+                    Projection
+                      Filter
+                        HashAggregate
+                          NestedLoopJoin
+                            CteScan
+                              Cte
+                                Shipment __fedq_ship_0 [duck]
+                                  Scan pg.public.customer
+                                  Shipment __fedq_ship_1 [duck]
+                                    Scan pg.public.date_dim +filter
+                                    RemoteQuery [duck] :: SELECT MAX("sq2"."csales") AS "tpcds_cmax" FROM (SELECT "customer"."c_customer_sk" AS "c_customer_sk", SUM(("store_sales"."ss_quantity" * "store_sales"."ss_sales_price")) AS "csales" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_0" AS "customer" ON ("store_sales"."ss_customer_sk" = "customer"."c_customer_sk") INNER JOIN "temp"."__fedq_ship_1" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") GROUP BY "customer"."c_customer_sk") AS "sq2"
+                            HashJoin
+                              Scan duck.main.store_sales +semijoin
+                              Scan pg.public.customer
               CteScan
                 Cte
-                  Projection
-                    Filter
-                      HashAggregate
-                        NestedLoopJoin
-                          CteScan
-                            Cte
-                              Shipment __fedq_ship_0 [duck]
-                                Scan pg.public.date_dim +filter
-                                Shipment __fedq_ship_1 [duck]
-                                  Scan pg.public.customer
-                                  RemoteQuery [duck] :: SELECT MAX("sq2"."csales") AS "tpcds_cmax" FROM (SELECT "customer"."c_customer_sk" AS "c_customer_sk", SUM(("store_sales"."ss_quantity" * "store_sales"."ss_sales_price")) AS "csales" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_0" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_1" AS "customer" ON ("store_sales"."ss_customer_sk" = "customer"."c_customer_sk") GROUP BY "customer"."c_customer_sk") AS "sq2"
-                          HashJoin
-                            Scan duck.main.store_sales +semijoin
-                            Scan pg.public.customer
+                  Filter
+                    HashAggregate
+                      HashJoin
+                        HashJoin
+                          Scan duck.main.store_sales +semijoin
+                          Scan pg.public.date_dim +filter
+                        AliasedRelation
+                          RemoteQuery [pg] :: SELECT SUBSTRING("item"."i_item_desc", 1, 30) AS "itemdesc", "item"."i_item_sk" AS "i_item_sk", "item"."i_item_id" AS "i_item_id", "item"."i_rec_start_date" AS "i_rec_start_date", "item"."i_rec_end_date" AS "i_rec_end_date", "item"."i_item_desc" AS "i_item_desc", "item"."i_current_price" AS "i_current_price", "item"."i_wholesale_cost" AS "i_wholesale_cost", "item"."i_brand_id" AS "i_brand_id", "item"."i_brand" AS "i_brand", "item"."i_class_id" AS "i_class_id", "item"."i_class" AS "i_class", "item"."i_category_id" AS "i_category_id", "item"."i_category" AS "i_category", "item"."i_manufact_id" AS "i_manufact_id", "item"."i_manufact" AS "i_manufact", "item"."i_size" AS "i_size", "item"."i_formulation" AS "i_formulation", "item"."i_color" AS "i_color", "item"."i_units" AS "i_units", "item"."i_container" AS "i_container", "item"."i_manager_id" AS "i_manager_id", "item"."i_product_name" AS "i_product_name" FROM "public"."item" AS "item"
           HashAggregate
             HashJoin
               HashJoin
                 HashJoin
                   HashJoin
                     Scan duck.main.web_sales +semijoin
-                    Scan pg.public.date_dim +filter
-                  Scan pg.public.customer
+                    Scan pg.public.customer
+                  Scan pg.public.date_dim +filter
                 CteScan
                   Cte
-                    Filter
-                      HashAggregate
-                        HashJoin
-                          HashJoin
-                            Scan duck.main.store_sales +semijoin
-                            Scan pg.public.date_dim +filter
-                          AliasedRelation
-                            RemoteQuery [pg] :: SELECT SUBSTRING("item"."i_item_desc", 1, 30) AS "itemdesc", "item"."i_item_sk" AS "i_item_sk", "item"."i_item_id" AS "i_item_id", "item"."i_rec_start_date" AS "i_rec_start_date", "item"."i_rec_end_date" AS "i_rec_end_date", "item"."i_item_desc" AS "i_item_desc", "item"."i_current_price" AS "i_current_price", "item"."i_wholesale_cost" AS "i_wholesale_cost", "item"."i_brand_id" AS "i_brand_id", "item"."i_brand" AS "i_brand", "item"."i_class_id" AS "i_class_id", "item"."i_class" AS "i_class", "item"."i_category_id" AS "i_category_id", "item"."i_category" AS "i_category", "item"."i_manufact_id" AS "i_manufact_id", "item"."i_manufact" AS "i_manufact", "item"."i_size" AS "i_size", "item"."i_formulation" AS "i_formulation", "item"."i_color" AS "i_color", "item"."i_units" AS "i_units", "item"."i_container" AS "i_container", "item"."i_manager_id" AS "i_manager_id", "item"."i_product_name" AS "i_product_name" FROM "public"."item" AS "item"
+                    Projection
+                      Filter
+                        HashAggregate
+                          NestedLoopJoin
+                            CteScan
+                              Cte
+                                Shipment __fedq_ship_0 [duck]
+                                  Scan pg.public.customer
+                                  Shipment __fedq_ship_1 [duck]
+                                    Scan pg.public.date_dim +filter
+                                    RemoteQuery [duck] :: SELECT MAX("sq2"."csales") AS "tpcds_cmax" FROM (SELECT "customer"."c_customer_sk" AS "c_customer_sk", SUM(("store_sales"."ss_quantity" * "store_sales"."ss_sales_price")) AS "csales" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_0" AS "customer" ON ("store_sales"."ss_customer_sk" = "customer"."c_customer_sk") INNER JOIN "temp"."__fedq_ship_1" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") GROUP BY "customer"."c_customer_sk") AS "sq2"
+                            HashJoin
+                              Scan duck.main.store_sales +semijoin
+                              Scan pg.public.customer
               CteScan
                 Cte
-                  Projection
-                    Filter
-                      HashAggregate
-                        NestedLoopJoin
-                          CteScan
-                            Cte
-                              Shipment __fedq_ship_0 [duck]
-                                Scan pg.public.date_dim +filter
-                                Shipment __fedq_ship_1 [duck]
-                                  Scan pg.public.customer
-                                  RemoteQuery [duck] :: SELECT MAX("sq2"."csales") AS "tpcds_cmax" FROM (SELECT "customer"."c_customer_sk" AS "c_customer_sk", SUM(("store_sales"."ss_quantity" * "store_sales"."ss_sales_price")) AS "csales" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_0" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_1" AS "customer" ON ("store_sales"."ss_customer_sk" = "customer"."c_customer_sk") GROUP BY "customer"."c_customer_sk") AS "sq2"
-                          HashJoin
-                            Scan duck.main.store_sales +semijoin
-                            Scan pg.public.customer
+                  Filter
+                    HashAggregate
+                      HashJoin
+                        HashJoin
+                          Scan duck.main.store_sales +semijoin
+                          Scan pg.public.date_dim +filter
+                        AliasedRelation
+                          RemoteQuery [pg] :: SELECT SUBSTRING("item"."i_item_desc", 1, 30) AS "itemdesc", "item"."i_item_sk" AS "i_item_sk", "item"."i_item_id" AS "i_item_id", "item"."i_rec_start_date" AS "i_rec_start_date", "item"."i_rec_end_date" AS "i_rec_end_date", "item"."i_item_desc" AS "i_item_desc", "item"."i_current_price" AS "i_current_price", "item"."i_wholesale_cost" AS "i_wholesale_cost", "item"."i_brand_id" AS "i_brand_id", "item"."i_brand" AS "i_brand", "item"."i_class_id" AS "i_class_id", "item"."i_class" AS "i_class", "item"."i_category_id" AS "i_category_id", "item"."i_category" AS "i_category", "item"."i_manufact_id" AS "i_manufact_id", "item"."i_manufact" AS "i_manufact", "item"."i_size" AS "i_size", "item"."i_formulation" AS "i_formulation", "item"."i_color" AS "i_color", "item"."i_units" AS "i_units", "item"."i_container" AS "i_container", "item"."i_manager_id" AS "i_manager_id", "item"."i_product_name" AS "i_product_name" FROM "public"."item" AS "item"

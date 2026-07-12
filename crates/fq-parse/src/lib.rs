@@ -8,9 +8,9 @@
 //! expansion, WHERE / GROUP BY (five aggregates) / HAVING / ORDER BY /
 //! LIMIT-OFFSET / DISTINCT, VALUES, binary set operations, and the expression
 //! nodes (columns, literals, binary/unary ops, IS NULL, Cast, Case, In, Between,
-//! and the subquery expressions). Each unsupported construct raises
-//! `ParseError::Unsupported`, never silently dropped. Still raising: CTEs (WITH),
-//! comma joins, typed scalar functions, windows.
+//! the subquery expressions, and window functions). Each unsupported construct
+//! raises `ParseError::Unsupported`, never silently dropped. Still raising:
+//! WITH RECURSIVE and named WINDOW clauses.
 
 pub mod convert;
 pub mod error;

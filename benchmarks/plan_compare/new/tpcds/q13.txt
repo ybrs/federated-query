@@ -2,16 +2,16 @@ QUERY: q13
 ENGINE: new (rust) EXPLAIN
 
 HashAggregate
-  Filter
-    HashJoin
+  HashJoin
+    Filter
       HashJoin
-        HashJoin
+        Filter
           HashJoin
-            Filter
+            HashJoin
               HashJoin
                 Scan duck.main.store_sales +filter +semijoin
-                Scan pg.public.customer_address +filter
-            Scan pg.public.date_dim +filter
-          Scan pg.public.household_demographics +filter
-        Scan pg.public.store
-      Scan pg.public.customer_demographics +filter
+                Scan pg.public.store
+              Scan pg.public.customer_demographics +filter
+            Scan pg.public.household_demographics +filter
+        Scan pg.public.customer_address +filter
+    Scan pg.public.date_dim +filter

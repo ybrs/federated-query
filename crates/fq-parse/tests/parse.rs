@@ -669,3 +669,248 @@ fn simple_case_with_function_operand_raises() {
     // A plain-column operand still lowers fine.
     assert!(parse("SELECT CASE a WHEN 'X' THEN 1 ELSE 2 END FROM t").is_ok());
 }
+
+/// The single window expression a `SELECT <window> FROM ...` projects. A window
+/// over an aggregate routes through an `Aggregate` node, a ranking window through
+/// a `Projection`, so read the first output expression from whichever holds it.
+fn only_window(sql: &str) -> Expr {
+    match parse(sql).unwrap() {
+        LogicalPlan::Projection(projection) => projection.expressions.into_iter().next().unwrap(),
+        LogicalPlan::Aggregate(aggregate) => aggregate.aggregates.into_iter().next().unwrap(),
+        other => panic!("expected Projection or Aggregate, got {other:?}"),
+    }
+}
+
+#[test]
+fn ranking_window_is_non_aggregate() {
+    // rank() OVER (...) mints a NON-aggregate zero-arg call: the emitter renders a
+    // zero-arg aggregate as the star form, so an aggregate RANK would emit RANK(*).
+    let expr = only_window("SELECT rank() OVER (PARTITION BY a ORDER BY b) AS r FROM t");
+    let Expr::Window {
+        function,
+        partition_by,
+        order_keys,
+        order_ascending,
+        frame,
+        ..
+    } = expr
+    else {
+        panic!("expected Window, got {expr:?}");
+    };
+    let Expr::FunctionCall {
+        function_name,
+        args,
+        is_aggregate,
+        ..
+    } = function.as_ref()
+    else {
+        panic!("expected FunctionCall function, got {function:?}");
+    };
+    assert_eq!(function_name, "RANK");
+    assert!(args.is_empty());
+    assert!(!is_aggregate, "ranking function must be non-aggregate");
+    assert_eq!(partition_by.len(), 1);
+    assert_eq!(order_keys.len(), 1);
+    assert_eq!(order_ascending, vec![true]);
+    assert!(frame.is_none());
+}
+
+#[test]
+fn aggregate_over_window_stays_aggregate() {
+    // sum(x) OVER (...) keeps is_aggregate true (COUNT(*) OVER ... renders right).
+    let expr = only_window("SELECT sum(x) OVER (PARTITION BY a) AS s FROM t");
+    let Expr::Window { function, .. } = expr else {
+        panic!("expected Window, got {expr:?}");
+    };
+    let Expr::FunctionCall {
+        function_name,
+        is_aggregate,
+        ..
+    } = function.as_ref()
+    else {
+        panic!("expected FunctionCall, got {function:?}");
+    };
+    assert_eq!(function_name, "SUM");
+    assert!(is_aggregate);
+}
+
+#[test]
+fn window_frame_carried_as_verbatim_text() {
+    // The ROWS/RANGE frame is carried verbatim so it re-renders to a source.
+    let expr = only_window(
+        "SELECT max(x) OVER (PARTITION BY a ORDER BY b \
+         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t",
+    );
+    let Expr::Window { frame, .. } = expr else {
+        panic!("expected Window, got {expr:?}");
+    };
+    assert_eq!(
+        frame,
+        Some("ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW".to_string())
+    );
+}
+
+#[test]
+fn window_order_desc_and_row_number() {
+    // row_number() with a DESC window ORDER BY records direction.
+    let expr = only_window("SELECT row_number() OVER (ORDER BY b DESC) FROM t");
+    let Expr::Window {
+        function,
+        order_ascending,
+        ..
+    } = expr
+    else {
+        panic!("expected Window, got {expr:?}");
+    };
+    let Expr::FunctionCall {
+        function_name,
+        is_aggregate,
+        ..
+    } = function.as_ref()
+    else {
+        panic!("expected FunctionCall, got {function:?}");
+    };
+    assert_eq!(function_name, "ROW_NUMBER");
+    assert!(!is_aggregate);
+    assert_eq!(order_ascending, vec![false]);
+}
+
+#[test]
+fn window_in_where_raises() {
+    // Window functions evaluate after WHERE, so one there is invalid SQL.
+    let result = parse("SELECT a FROM t WHERE rank() OVER (ORDER BY b) > 1");
+    assert!(
+        matches!(&result, Err(ParseError::Unsupported(message)) if message.contains("WHERE")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn window_in_having_raises() {
+    let result = parse("SELECT a, sum(x) FROM t GROUP BY a HAVING rank() OVER (ORDER BY a) > 1");
+    assert!(
+        matches!(&result, Err(ParseError::Unsupported(message)) if message.contains("HAVING")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn window_in_group_by_raises() {
+    let result = parse("SELECT a FROM t GROUP BY rank() OVER (ORDER BY a)");
+    assert!(
+        matches!(&result, Err(ParseError::Unsupported(message)) if message.contains("GROUP BY")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn window_in_nested_subquery_is_scoped() {
+    // A ranked derived table filtered by an outer WHERE is legal: the window
+    // belongs to the subquery's own SELECT, so the outer WHERE walk prunes it.
+    let plan = parse(
+        "SELECT item FROM \
+         (SELECT item, rank() OVER (ORDER BY s) AS rnk FROM t) v \
+         WHERE rnk < 11",
+    );
+    assert!(plan.is_ok(), "{plan:?}");
+}
+
+#[test]
+fn distinct_with_window_raises() {
+    // DISTINCT would be silently dropped over a windowed projection.
+    let result = parse("SELECT DISTINCT rank() OVER (ORDER BY b) FROM t");
+    assert!(
+        matches!(&result, Err(ParseError::Unsupported(message)) if message.contains("DISTINCT")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn named_window_reference_raises() {
+    // OVER w (a named-window reference) is not modeled and must not be dropped.
+    let result = parse("SELECT rank() OVER w FROM t WINDOW w AS (ORDER BY b)");
+    assert!(
+        matches!(result, Err(ParseError::Unsupported(_))),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn comma_join_mixed_with_explicit_join() {
+    // FROM a LEFT JOIN b ON ..., c, d : the comma items fold left-deep as CROSS
+    // joins onto the explicit-join chain (implicit joins).
+    let plan = parse(
+        "SELECT a.x FROM a LEFT JOIN b ON a.id = b.id, c, d \
+         WHERE a.k = c.k AND a.k = d.k",
+    )
+    .unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection, got {plan:?}");
+    };
+    let LogicalPlan::Filter(filter) = projection.input.as_ref() else {
+        panic!("expected Filter, got {:?}", projection.input);
+    };
+    // Two implicit CROSS folds (c then d) over the LEFT join of a and b.
+    let LogicalPlan::Join(outer) = filter.input.as_ref() else {
+        panic!("expected Join, got {:?}", filter.input);
+    };
+    assert!(matches!(outer.join_type, fq_plan::JoinType::Cross));
+    let LogicalPlan::Join(inner) = outer.left.as_ref() else {
+        panic!("expected nested Join, got {:?}", outer.left);
+    };
+    assert!(matches!(inner.join_type, fq_plan::JoinType::Cross));
+    let LogicalPlan::Join(base) = inner.left.as_ref() else {
+        panic!("expected base Join, got {:?}", inner.left);
+    };
+    assert!(matches!(base.join_type, fq_plan::JoinType::Left));
+}
+
+#[test]
+fn stddev_samp_is_an_aggregate() {
+    // STDDEV_SAMP reaches the aggregate machinery (is_aggregate), routing the
+    // query through an Aggregate node.
+    let plan = parse("SELECT stddev_samp(x) AS s FROM t").unwrap();
+    let LogicalPlan::Aggregate(aggregate) = plan else {
+        panic!("expected Aggregate, got {plan:?}");
+    };
+    let Expr::FunctionCall {
+        function_name,
+        is_aggregate,
+        ..
+    } = &aggregate.aggregates[0]
+    else {
+        panic!("expected FunctionCall, got {:?}", aggregate.aggregates[0]);
+    };
+    assert_eq!(function_name, "STDDEV_SAMP");
+    assert!(is_aggregate);
+}
+
+#[test]
+fn stddev_samp_argument_column_is_over_collected() {
+    // A column referenced only inside STDDEV_SAMP must still reach the scan, or
+    // the aggregate could not find it (the aggregate-argument column-drop class).
+    let plan = parse("SELECT stddev_samp(quantity) FROM t").unwrap();
+    let LogicalPlan::Aggregate(aggregate) = plan else {
+        panic!("expected Aggregate, got {plan:?}");
+    };
+    let LogicalPlan::Scan(scan) = aggregate.input.as_ref() else {
+        panic!("expected Scan, got {:?}", aggregate.input);
+    };
+    assert!(
+        scan.columns.contains(&"quantity".to_string()),
+        "scan columns {:?} must include the stddev argument",
+        scan.columns
+    );
+}
+
+#[test]
+fn set_operation_as_scalar_expression_raises() {
+    // A set operation is a query, not a scalar value. The parser attaches a
+    // trailing UNION to the scalar subquery operand, leaving a bare set operation
+    // where an expression is expected; it raises naming the actual construct.
+    let result = parse("SELECT a FROM t WHERE a > (SELECT m FROM u) UNION ALL SELECT b FROM v");
+    assert!(
+        matches!(&result, Err(ParseError::Unsupported(message)) if message.contains("set operation")),
+        "{result:?}"
+    );
+}

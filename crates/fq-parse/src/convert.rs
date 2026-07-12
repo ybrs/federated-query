@@ -6,11 +6,12 @@
 //! clause by clause in the Python order: FROM -> WHERE -> GROUP BY -> HAVING ->
 //! SELECT -> ORDER BY -> LIMIT.
 //!
-//! Coverage: base tables + left-deep JOINs + derived tables + CTE references in
-//! FROM, non-recursive WITH, catalog-driven star expansion, WHERE, GROUP BY + the
-//! five aggregates, HAVING, ORDER BY, LIMIT/OFFSET, DISTINCT, VALUES, and the
-//! binary set operations. WITH RECURSIVE, comma joins, and typed scalar functions
-//! still raise.
+//! Coverage: base tables + left-deep JOINs (explicit and comma/implicit) +
+//! derived tables + CTE references in FROM, non-recursive WITH, catalog-driven
+//! star expansion, WHERE, GROUP BY + the aggregates, HAVING, ORDER BY,
+//! LIMIT/OFFSET, DISTINCT, VALUES, and the binary set operations. A window
+//! function in WHERE / GROUP BY / HAVING raises (it is legal only in SELECT and
+//! ORDER BY). WITH RECURSIVE and named WINDOW clauses still raise.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -378,6 +379,7 @@ impl<'a> Converter<'a> {
         let Some(where_clause) = &select.where_clause else {
             return Ok(input);
         };
+        reject_window_in_clause(&where_clause.this, "WHERE")?;
         // Fresh WHERE filter wrapping the FROM plan, built from the parsed predicate
         // - no base to copy from. Field list (input/predicate) is the complete Filter.
         Ok(LogicalPlan::Filter(Filter {
@@ -402,6 +404,15 @@ impl<'a> Converter<'a> {
                 expressions.push(expr);
                 names.push(name);
             }
+        }
+        if select.distinct && expressions.iter().any(fq_plan::expr::contains_window) {
+            // A windowed aggregate routes through the aggregate path, which ignores
+            // DISTINCT; a ranking window would carry DISTINCT into a projection that
+            // drops post-window duplicates. Either way DISTINCT would be silently
+            // lost, so refuse the combination rather than return duplicate rows.
+            return Err(ParseError::Unsupported(
+                "SELECT DISTINCT with window functions".to_string(),
+            ));
         }
         if select.group_by.is_some() || expressions.iter().any(fq_plan::contains_aggregate) {
             if select.distinct {
@@ -448,6 +459,7 @@ impl<'a> Converter<'a> {
         let mut group_by = Vec::new();
         if let Some(clause) = &select.group_by {
             for key in &clause.expressions {
+                reject_window_in_clause(key, "GROUP BY")?;
                 group_by.push(self.expr(key)?);
             }
         }
@@ -464,6 +476,7 @@ impl<'a> Converter<'a> {
         let Some(having) = &select.having else {
             return Ok(aggregate);
         };
+        reject_window_in_clause(&having.this, "HAVING")?;
         // Fresh HAVING filter wrapping the aggregate, built from the parsed predicate
         // - no base to copy from. Field list (input/predicate) is the complete Filter.
         Ok(LogicalPlan::Filter(Filter {
@@ -644,7 +657,11 @@ fn map_join_kind(kind: JoinKind) -> Result<(JoinType, bool), ParseError> {
         JoinKind::Left => (JoinType::Left, false),
         JoinKind::Right => (JoinType::Right, false),
         JoinKind::Full | JoinKind::Outer => (JoinType::Full, false),
-        JoinKind::Cross => (JoinType::Cross, false),
+        // An implicit join is a comma-separated FROM item mixed into an
+        // explicit-JOIN chain (`FROM a LEFT JOIN b ON ..., c, d`): a CROSS product
+        // whose equi-predicates live in WHERE, folded left-deep exactly like a
+        // plain comma FROM list and like an explicit CROSS JOIN.
+        JoinKind::Cross | JoinKind::Implicit => (JoinType::Cross, false),
         JoinKind::Semi | JoinKind::LeftSemi => (JoinType::Semi, false),
         JoinKind::Anti | JoinKind::LeftAnti => (JoinType::Anti, false),
         JoinKind::Natural => (JoinType::Inner, true),
@@ -773,7 +790,8 @@ fn aggregate_arguments(root: &Expression) -> Vec<&Expression> {
             Expression::Sum(agg)
             | Expression::Avg(agg)
             | Expression::Min(agg)
-            | Expression::Max(agg) => args.push(&agg.this),
+            | Expression::Max(agg)
+            | Expression::StddevSamp(agg) => args.push(&agg.this),
             Expression::Count(count) => {
                 if let Some(inner) = &count.this {
                     args.push(inner);
@@ -785,7 +803,7 @@ fn aggregate_arguments(root: &Expression) -> Vec<&Expression> {
     args
 }
 
-/// Whether an expression is one of the five aggregate calls.
+/// Whether an expression is one of the aggregate calls.
 fn is_aggregate(expr: &Expression) -> bool {
     matches!(
         expr,
@@ -794,11 +812,44 @@ fn is_aggregate(expr: &Expression) -> bool {
             | Expression::Min(_)
             | Expression::Max(_)
             | Expression::Count(_)
+            | Expression::StddevSamp(_)
     )
 }
 
+/// Raise when `node` uses a window function directly in a `clause` where one is
+/// illegal (WHERE / GROUP BY / HAVING). Window functions evaluate after those
+/// clauses, so one there is invalid SQL and must fail loudly rather than reach a
+/// source or the merge path. Only this clause's own scope is checked: the walk
+/// prunes at any nested query, whose windows belong to that subquery's SELECT
+/// list (a ranked derived table filtered by an outer predicate is legal).
+fn reject_window_in_clause(node: &Expression, clause: &str) -> Result<(), ParseError> {
+    if contains_window_in_scope(node) {
+        return Err(ParseError::Unsupported(format!(
+            "window functions are not allowed in {clause}"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `node` contains a window function in its own scope, not descending
+/// into a nested query (a subquery's windows belong to that subquery's SELECT).
+fn contains_window_in_scope(node: &Expression) -> bool {
+    if matches!(node, Expression::WindowFunction(_)) {
+        return true;
+    }
+    if polyglot_sql::traversal::is_query(node)
+        || polyglot_sql::traversal::is_subquery(node)
+        || polyglot_sql::traversal::is_set_operation(node)
+    {
+        return false;
+    }
+    node.children()
+        .iter()
+        .any(|child| contains_window_in_scope(child))
+}
+
 /// The NULLS FIRST/LAST of an ORDER BY key, or None when unspecified.
-fn nulls_of(ordered: &Ordered) -> Option<NullsOrder> {
+pub(crate) fn nulls_of(ordered: &Ordered) -> Option<NullsOrder> {
     ordered.nulls_first.map(|first| {
         if first {
             NullsOrder::First

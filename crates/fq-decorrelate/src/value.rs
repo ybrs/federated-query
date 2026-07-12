@@ -7,12 +7,13 @@
 
 use std::collections::HashSet;
 
+use fq_common::DataType;
 use fq_plan::expr::{column_refs, BinaryOpType, Expr, LiteralValue};
 use fq_plan::logical::{Join, JoinType, LogicalPlan, Projection, Scan, Sort, Union};
 
 use crate::boolean::{any_has_subquery, constant_exists_value};
 use crate::error::DecorrelationError;
-use crate::helpers::{bool_literal, qualified_col, unqualified_col};
+use crate::helpers::{bool_literal, output_col, relation_col, unqualified_col};
 use crate::{Decorrelator, Result};
 
 impl Decorrelator {
@@ -245,7 +246,7 @@ impl Decorrelator {
             inputs: vec![match_branch, miss_branch],
             distinct: false,
         });
-        Ok((unqualified_col(&flag_name), union))
+        Ok((unqualified_col(&flag_name, DataType::Boolean), union))
     }
 }
 
@@ -364,7 +365,9 @@ fn projection_passthrough(node: &Projection) -> Result<Vec<Expr>> {
     for (expr, alias) in node.expressions.iter().zip(node.aliases.iter()) {
         match expr {
             Expr::Column(col) => columns.push(Expr::Column(col.clone())),
-            _ => columns.push(unqualified_col(alias)),
+            // A computed output has no owning relation; it is referenced unqualified
+            // by its alias, carrying the computed expression's type.
+            _ => columns.push(unqualified_col(alias, expr.get_type())),
         }
     }
     Ok(columns)
@@ -383,7 +386,7 @@ fn scan_qualifier(scan: &Scan) -> String {
 fn relation_columns(qualifier: &str, names: &[String]) -> Vec<Expr> {
     let mut columns = Vec::with_capacity(names.len());
     for name in names {
-        columns.push(qualified_col(qualifier, name));
+        columns.push(relation_col(qualifier, name));
     }
     columns
 }
@@ -394,7 +397,7 @@ fn relation_columns(qualifier: &str, names: &[String]) -> Vec<Expr> {
 fn widen_projection_for_keys(projection: &mut Projection, keys: &[Expr]) {
     let existing: HashSet<String> = projection.aliases.iter().cloned().collect();
     for name in sort_helper_columns(keys, &existing) {
-        projection.expressions.push(unqualified_col(&name));
+        projection.expressions.push(output_col(&name));
         projection.aliases.push(name);
     }
 }
@@ -417,7 +420,7 @@ fn sort_helper_columns(keys: &[Expr], existing: &HashSet<String>) -> Vec<String>
 fn prune_to_names(plan: LogicalPlan, names: &[String]) -> LogicalPlan {
     let mut expressions = Vec::with_capacity(names.len());
     for name in names {
-        expressions.push(unqualified_col(name));
+        expressions.push(output_col(name));
     }
     // Fresh projection re-exposing the requested output names, dropping the sort-key
     // helper columns - no base to copy from. Field list is the complete Projection.

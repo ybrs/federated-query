@@ -1,4 +1,48 @@
 QUERY: q80
 ENGINE: new (rust) EXPLAIN
 
-ERROR: RuntimeError: parse error: unsupported SQL: Implicit JOIN
+Limit
+  Sort
+    HashAggregate
+      AliasedRelation
+        Union
+          Union
+            Projection
+              CteScan
+                Cte
+                  HashAggregate
+                    HashJoin
+                      HashJoin
+                        HashJoin
+                          HashJoin
+                            RemoteQuery [duck] :: SELECT "store_sales"."ss_sold_date_sk" AS "ss_sold_date_sk", "store_sales"."ss_item_sk" AS "ss_item_sk", "store_sales"."ss_store_sk" AS "ss_store_sk", "store_sales"."ss_promo_sk" AS "ss_promo_sk", "store_sales"."ss_ticket_number" AS "ss_ticket_number", "store_sales"."ss_ext_sales_price" AS "ss_ext_sales_price", "store_sales"."ss_net_profit" AS "ss_net_profit", "store_returns"."sr_item_sk" AS "sr_item_sk", "store_returns"."sr_ticket_number" AS "sr_ticket_number", "store_returns"."sr_return_amt" AS "sr_return_amt", "store_returns"."sr_net_loss" AS "sr_net_loss" FROM "main"."store_sales" AS "store_sales" LEFT JOIN "main"."store_returns" AS "store_returns" ON (("store_sales"."ss_item_sk" = "store_returns"."sr_item_sk") AND ("store_sales"."ss_ticket_number" = "store_returns"."sr_ticket_number"))
+                            Scan pg.public.date_dim +filter
+                          Scan pg.public.store
+                        Scan pg.public.item +filter
+                      Scan pg.public.promotion +filter
+            Projection
+              CteScan
+                Cte
+                  HashAggregate
+                    HashJoin
+                      HashJoin
+                        HashJoin
+                          HashJoin
+                            RemoteQuery [duck] :: SELECT "catalog_sales"."cs_sold_date_sk" AS "cs_sold_date_sk", "catalog_sales"."cs_catalog_page_sk" AS "cs_catalog_page_sk", "catalog_sales"."cs_item_sk" AS "cs_item_sk", "catalog_sales"."cs_promo_sk" AS "cs_promo_sk", "catalog_sales"."cs_order_number" AS "cs_order_number", "catalog_sales"."cs_ext_sales_price" AS "cs_ext_sales_price", "catalog_sales"."cs_net_profit" AS "cs_net_profit", "catalog_returns"."cr_item_sk" AS "cr_item_sk", "catalog_returns"."cr_order_number" AS "cr_order_number", "catalog_returns"."cr_return_amount" AS "cr_return_amount", "catalog_returns"."cr_net_loss" AS "cr_net_loss" FROM "main"."catalog_sales" AS "catalog_sales" LEFT JOIN "main"."catalog_returns" AS "catalog_returns" ON (("catalog_sales"."cs_item_sk" = "catalog_returns"."cr_item_sk") AND ("catalog_sales"."cs_order_number" = "catalog_returns"."cr_order_number"))
+                            Scan pg.public.date_dim +filter
+                          Scan pg.public.catalog_page
+                        Scan pg.public.item +filter
+                      Scan pg.public.promotion +filter
+          Projection
+            CteScan
+              Cte
+                HashAggregate
+                  HashJoin
+                    HashJoin
+                      HashJoin
+                        HashJoin
+                          RemoteQuery [duck] :: SELECT "web_sales"."ws_sold_date_sk" AS "ws_sold_date_sk", "web_sales"."ws_item_sk" AS "ws_item_sk", "web_sales"."ws_web_site_sk" AS "ws_web_site_sk", "web_sales"."ws_promo_sk" AS "ws_promo_sk", "web_sales"."ws_order_number" AS "ws_order_number", "web_sales"."ws_ext_sales_price" AS "ws_ext_sales_price", "web_sales"."ws_net_profit" AS "ws_net_profit", "web_returns"."wr_item_sk" AS "wr_item_sk", "web_returns"."wr_order_number" AS "wr_order_number", "web_returns"."wr_return_amt" AS "wr_return_amt", "web_returns"."wr_net_loss" AS "wr_net_loss" FROM "main"."web_sales" AS "web_sales" LEFT JOIN "main"."web_returns" AS "web_returns" ON (("web_sales"."ws_item_sk" = "web_returns"."wr_item_sk") AND ("web_sales"."ws_order_number" = "web_returns"."wr_order_number"))
+                          Scan pg.public.date_dim +filter
+                        Scan pg.public.web_site
+                      Scan pg.public.item +filter
+                    Scan pg.public.promotion +filter

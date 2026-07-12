@@ -11,17 +11,15 @@ Limit
               HashJoin
                 HashJoin
                   HashJoin
-                    HashJoin
-                      Scan pg.public.date_dim
-                      AliasedRelation
-                        SingleRowGuard
-                          Projection
-                            Projection
-                              Scan pg.public.date_dim +filter +distinct
-                    Scan duck.main.store_sales
-                  Scan pg.public.item
-                Scan pg.public.customer
-              Scan pg.public.customer_address
+                    RemoteQuery [pg] :: SELECT "a"."ca_address_sk" AS "ca_address_sk", "a"."ca_state" AS "ca_state", "c"."c_customer_sk" AS "c_customer_sk", "c"."c_current_addr_sk" AS "c_current_addr_sk" FROM "public"."customer_address" AS "a" INNER JOIN "public"."customer" AS "c" ON ("a"."ca_address_sk" = "c"."c_current_addr_sk")
+                    Scan duck.main.store_sales +semijoin
+                  Scan pg.public.date_dim
+                AliasedRelation
+                  SingleRowGuard
+                    Projection
+                      Projection
+                        Scan pg.public.date_dim +filter +distinct
+              Scan pg.public.item
             AliasedRelation
               Projection
                 Scan pg.public.item +agg(2) +groupby

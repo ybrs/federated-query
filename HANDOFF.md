@@ -679,6 +679,33 @@ fq-runtime + the EXPLAIN builder (later crates).
 
 `scan_planner_estimate` stays blocked until the runtime can render a scan to EXPLAIN.
 
+## TPC-DS PUSH 2026-07-12: 92|0|7 federated at sf0.1
+
+`benchmarks/tpcds/run_federated_rust.py` (new) is the Rust-engine TPC-DS
+correctness runner: pg-dims split, compares against references_sf<sf>.duckdb,
+writes reports/rust-fed-sf<sf>.md. Tally moved 66|0|33 -> 92|0|7 in one push;
+ZERO wrong answers throughout. What closed:
+
+- fq-parse WINDOW FUNCTIONS (12 queries fixed): OVER with PARTITION BY/ORDER
+  BY/frames -> Expr::Window; ranking calls minted is_aggregate=false;
+  window-in-WHERE/GROUP BY/HAVING and DISTINCT-with-window raise; 53 parse
+  tests. Comma/implicit joins mixed with explicit JOINs (4 queries) fold as
+  CROSS like the plain comma list. stddev_samp routes as an aggregate (2).
+- fq-bind ORDER BY AGGREGATE HOIST (6 type_coercion queries fixed): a sort key
+  carrying an aggregate call binds to the aggregate OUTPUT (hidden __agg_N +
+  restore projection when absent from SELECT) - the same machinery as HAVING.
+- fq-emit ZERO-ARG AGGREGATE (2 queries fixed): COUNT() -> COUNT(*) (Postgres
+  rejects the bare form); zero-arg scalar calls keep their parens.
+- fq-decorrelate SYNTHETIC-COLUMN TYPES (q32 panic fixed): every minted
+  synthetic ref carries the DataType of the expression it stands for.
+
+REMAINING 7: ROLLUP reaches DataFusion which does not support it (q05 q18 q22
+q77 - route the grouping-sets island to the source, or lower ROLLUP to a
+grouping-sets union before the coordinator); window over GROUPING() two-stage
+split raises in step-building (q36 q70); q14 is a polyglot-sql parser bug (a
+trailing UNION ALL is attached to a scalar-subquery operand - needs an
+upstream fix or pre-parse normalization), surfaced with an honest error.
+
 ## NEXT: drive TPC-H to 22/22, then TPC-DS + the federated tallies
 
 The engine RUNS; the work now is coverage + correctness hardening against the tallies,

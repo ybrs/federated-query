@@ -27,8 +27,8 @@ Limit
                         HashJoin
                           Scan duck.main.catalog_sales +semijoin
                           Scan pg.public.date_dim +filter
-                        RemoteQuery [pg] :: SELECT "item"."i_item_sk" AS "i_item_sk", "item"."i_item_id" AS "i_item_id", "item"."i_category" AS "i_category" FROM "public"."item" AS "item" WHERE EXISTS(SELECT 1 FROM (SELECT "item"."i_item_id" AS "__subq_1_v0" FROM "public"."item" AS "item" WHERE ("item"."i_category" = 'Music')) AS "__subq_1" WHERE ("item"."i_item_id" = "__subq_1"."__subq_1_v0"))
-                      Scan pg.public.customer_address +filter
+                        Scan pg.public.customer_address +filter
+                      RemoteQuery [pg] :: SELECT "item"."i_item_sk" AS "i_item_sk", "item"."i_item_id" AS "i_item_id", "item"."i_category" AS "i_category" FROM "public"."item" AS "item" WHERE EXISTS(SELECT 1 FROM (SELECT "item"."i_item_id" AS "__subq_1_v0" FROM "public"."item" AS "item" WHERE ("item"."i_category" = 'Music')) AS "__subq_1" WHERE ("item"."i_item_id" = "__subq_1"."__subq_1_v0"))
           Projection
             CteScan
               Cte
@@ -38,5 +38,5 @@ Limit
                       HashJoin
                         Scan duck.main.web_sales +semijoin
                         Scan pg.public.date_dim +filter
-                      RemoteQuery [pg] :: SELECT "item"."i_item_sk" AS "i_item_sk", "item"."i_item_id" AS "i_item_id", "item"."i_category" AS "i_category" FROM "public"."item" AS "item" WHERE EXISTS(SELECT 1 FROM (SELECT "item"."i_item_id" AS "__subq_2_v0" FROM "public"."item" AS "item" WHERE ("item"."i_category" = 'Music')) AS "__subq_2" WHERE ("item"."i_item_id" = "__subq_2"."__subq_2_v0"))
-                    Scan pg.public.customer_address +filter
+                      Scan pg.public.customer_address +filter
+                    RemoteQuery [pg] :: SELECT "item"."i_item_sk" AS "i_item_sk", "item"."i_item_id" AS "i_item_id", "item"."i_category" AS "i_category" FROM "public"."item" AS "item" WHERE EXISTS(SELECT 1 FROM (SELECT "item"."i_item_id" AS "__subq_2_v0" FROM "public"."item" AS "item" WHERE ("item"."i_category" = 'Music')) AS "__subq_2" WHERE ("item"."i_item_id" = "__subq_2"."__subq_2_v0"))

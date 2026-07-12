@@ -29,19 +29,135 @@ pub fn binary(op: BinaryOpType, left: Expr, right: Expr) -> Expr {
     }
 }
 
-/// A column reference qualified to `table`. The manufactured join-condition and
-/// exposed-key refs use this so every ref the pass mints above the SubqueryScan
-/// boundary carries its relation qualifier.
-pub fn qualified_col(table: &str, column: &str) -> Expr {
-    Expr::Column(ColumnRef::new(Some(table.to_string()), column, None))
+/// A manufactured column reference qualified to `table`, carrying the data type of
+/// the value it stands for. The join-condition and exposed-key refs the pass mints
+/// above the SubqueryScan boundary use this, so every such ref carries both its
+/// relation qualifier AND its bound type (a post-binder ref must have both).
+pub fn qualified_col(table: &str, column: &str, data_type: DataType) -> Expr {
+    Expr::Column(ColumnRef::new(
+        Some(table.to_string()),
+        column,
+        Some(data_type),
+    ))
 }
 
-/// An UNqualified column reference (`table = None`). Used ONLY for the inner
-/// physical output names inside a subquery's own projection (the value columns
-/// and already-widened aggregate keys); the SubqueryScan alias above re-qualifies
-/// them. Ports the `ColumnRef.create(table=None, ...)` sites.
-pub fn unqualified_col(column: &str) -> Expr {
+/// A manufactured UNqualified column reference (`table = None`), carrying the data
+/// type of the value it stands for. Used for the inner physical output names inside
+/// a subquery's own projection (the value columns and already-widened aggregate
+/// keys); the SubqueryScan alias above re-qualifies them, but the type is set here.
+pub fn unqualified_col(column: &str, data_type: DataType) -> Expr {
+    Expr::Column(ColumnRef::new(None, column, Some(data_type)))
+}
+
+/// A re-read of an EXISTING relation output column by name, qualified to the
+/// relation `qualifier`. Unlike `qualified_col`, this does not manufacture a new
+/// value: it references a column the relation already exposes, whose type is the
+/// relation's own (a base table's catalog type). The decorrelator holds no catalog,
+/// so a base-table column type is not derivable here; the reference carries the
+/// qualifier and leaves the type for the relation that owns the column.
+pub fn relation_col(qualifier: &str, column: &str) -> Expr {
+    Expr::Column(ColumnRef::new(Some(qualifier.to_string()), column, None))
+}
+
+/// A re-read of an EXISTING inner relation output column by unqualified name, used
+/// where a wrapping projection re-exposes an input's columns by name (pruning
+/// helper columns back to the original output). The type is the input relation's;
+/// as with `relation_col`, a base-table column type is not derivable without the
+/// catalog, so it is left for the owning relation.
+pub fn output_col(column: &str) -> Expr {
     Expr::Column(ColumnRef::new(None, column, None))
+}
+
+/// The output column data types of a relation, one per output column, derived from
+/// the expressions that DEFINE those columns: a projection's select list, an
+/// aggregate's calls, or a VALUES row. Set operations and unions take their
+/// left/first branch (all branches share a type per position); single-input
+/// wrappers pass through; a SEMI/ANTI join exposes only its left. A relation whose
+/// outputs are raw catalog columns (a bare Scan or CteRef) has no locally derivable
+/// types - the decorrelator holds no catalog - and raises.
+pub(crate) fn relation_output_types(
+    plan: &LogicalPlan,
+) -> Result<Vec<DataType>, DecorrelationError> {
+    match plan {
+        LogicalPlan::Projection(node) => Ok(node.expressions.iter().map(Expr::get_type).collect()),
+        LogicalPlan::Aggregate(node) => Ok(node.aggregates.iter().map(Expr::get_type).collect()),
+        LogicalPlan::Values(node) => values_row_types(node),
+        LogicalPlan::SetOperation(node) => relation_output_types(&node.left),
+        LogicalPlan::Union(node) => match node.inputs.first() {
+            Some(first) => relation_output_types(first),
+            None => Err(DecorrelationError::Invariant(
+                "an empty union has no output column types".to_string(),
+            )),
+        },
+        LogicalPlan::Filter(node) => relation_output_types(&node.input),
+        LogicalPlan::Sort(node) => relation_output_types(&node.input),
+        LogicalPlan::Limit(node) => relation_output_types(&node.input),
+        LogicalPlan::GroupedLimit(node) => relation_output_types(&node.input),
+        LogicalPlan::SingleRowGuard(node) => relation_output_types(&node.input),
+        LogicalPlan::SubqueryScan(node) => relation_output_types(&node.input),
+        LogicalPlan::Join(node) => join_output_types(node),
+        other => Err(DecorrelationError::Unsupported(format!(
+            "cannot derive output column types for a {} relation without the catalog",
+            plan_kind(other)
+        ))),
+    }
+}
+
+/// The output column types of a VALUES relation, taken from its first row.
+fn values_row_types(node: &fq_plan::logical::Values) -> Result<Vec<DataType>, DecorrelationError> {
+    match node.rows.first() {
+        Some(row) => Ok(row.iter().map(Expr::get_type).collect()),
+        None => Err(DecorrelationError::Invariant(
+            "a VALUES relation with no rows has no output column types".to_string(),
+        )),
+    }
+}
+
+/// The output column types of a join: left types, plus right types unless the join
+/// is existential (SEMI/ANTI expose only the left side).
+fn join_output_types(node: &fq_plan::logical::Join) -> Result<Vec<DataType>, DecorrelationError> {
+    let mut types = relation_output_types(&node.left)?;
+    if !matches!(
+        node.join_type,
+        fq_plan::logical::JoinType::Semi | fq_plan::logical::JoinType::Anti
+    ) {
+        types.extend(relation_output_types(&node.right)?);
+    }
+    Ok(types)
+}
+
+/// One typed unqualified column reference per output name, pairing each name with
+/// its derived type. Raises when the name and type counts disagree - a length
+/// mismatch means the type derivation lost track of a column, and shipping an
+/// untyped or mis-typed ref would defeat the type contract.
+pub(crate) fn typed_output_refs(
+    names: &[String],
+    types: &[DataType],
+) -> Result<Vec<Expr>, DecorrelationError> {
+    if names.len() != types.len() {
+        return Err(DecorrelationError::Invariant(format!(
+            "relation exposes {} output names but {} derived types",
+            names.len(),
+            types.len()
+        )));
+    }
+    let mut refs = Vec::with_capacity(names.len());
+    for (name, data_type) in names.iter().zip(types.iter()) {
+        refs.push(unqualified_col(name, *data_type));
+    }
+    Ok(refs)
+}
+
+/// A node-kind label for the "cannot derive types" error message.
+fn plan_kind(plan: &LogicalPlan) -> &'static str {
+    match plan {
+        LogicalPlan::Scan(_) => "Scan",
+        LogicalPlan::CteRef(_) => "CteRef",
+        LogicalPlan::Cte(_) => "Cte",
+        LogicalPlan::Explain(_) => "Explain",
+        LogicalPlan::LateralJoin(_) => "LateralJoin",
+        _ => "unsupported",
+    }
 }
 
 /// A boolean literal expression (the constant-EXISTS residual).

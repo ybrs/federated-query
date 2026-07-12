@@ -8,6 +8,6 @@ Limit
         HashJoin
           HashJoin
             RemoteQuery [duck] :: SELECT "cs1"."cs_ship_date_sk" AS "cs_ship_date_sk", "cs1"."cs_ship_addr_sk" AS "cs_ship_addr_sk", "cs1"."cs_call_center_sk" AS "cs_call_center_sk", "cs1"."cs_warehouse_sk" AS "cs_warehouse_sk", "cs1"."cs_order_number" AS "cs_order_number", "cs1"."cs_ext_ship_cost" AS "cs_ext_ship_cost", "cs1"."cs_net_profit" AS "cs_net_profit" FROM "main"."catalog_sales" AS "cs1" WHERE EXISTS(SELECT 1 FROM (SELECT "cs2"."cs_order_number" AS "__subq_0_k0", "cs2"."cs_warehouse_sk" AS "__subq_0_k1" FROM "main"."catalog_sales" AS "cs2") AS "__subq_0" WHERE (("cs1"."cs_order_number" = "__subq_0"."__subq_0_k0") AND ("cs1"."cs_warehouse_sk" != "__subq_0"."__subq_0_k1"))) AND NOT EXISTS(SELECT 1 FROM (SELECT "cr1"."cr_order_number" AS "__subq_1_k0" FROM "main"."catalog_returns" AS "cr1") AS "__subq_1" WHERE ("cs1"."cs_order_number" = "__subq_1"."__subq_1_k0"))
-            Scan pg.public.customer_address +filter
-          Scan pg.public.date_dim +filter
+            Scan pg.public.date_dim +filter
+          Scan pg.public.customer_address +filter
         Scan pg.public.call_center +filter

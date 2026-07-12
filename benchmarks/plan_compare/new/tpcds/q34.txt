@@ -7,10 +7,10 @@ Sort
       Filter
         AliasedRelation
           Shipment __fedq_ship_6 [duck]
-            Scan pg.public.household_demographics +filter
+            Scan pg.public.date_dim +filter
             Shipment __fedq_ship_7 [duck]
-              Scan pg.public.date_dim +filter
+              Scan pg.public.store +filter
               Shipment __fedq_ship_8 [duck]
-                Scan pg.public.store +filter
-                RemoteQuery [duck] :: SELECT "store_sales"."ss_ticket_number" AS "ss_ticket_number", "store_sales"."ss_customer_sk" AS "ss_customer_sk", COUNT() AS "cnt" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_6" AS "household_demographics" ON ("store_sales"."ss_hdemo_sk" = "household_demographics"."hd_demo_sk") INNER JOIN "temp"."__fedq_ship_7" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_8" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk") GROUP BY "store_sales"."ss_ticket_number", "store_sales"."ss_customer_sk"
+                Scan pg.public.household_demographics +filter
+                RemoteQuery [duck] :: SELECT "store_sales"."ss_ticket_number" AS "ss_ticket_number", "store_sales"."ss_customer_sk" AS "ss_customer_sk", COUNT(*) AS "cnt" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_6" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_7" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk") INNER JOIN "temp"."__fedq_ship_8" AS "household_demographics" ON ("store_sales"."ss_hdemo_sk" = "household_demographics"."hd_demo_sk") GROUP BY "store_sales"."ss_ticket_number", "store_sales"."ss_customer_sk"
       Scan pg.public.customer

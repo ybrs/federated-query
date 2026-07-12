@@ -2,7 +2,7 @@ QUERY: q03
 ENGINE: new (rust) EXPLAIN
 
 Shipment __fedq_ship_0 [duck]
-  Scan pg.public.item +filter
+  Scan pg.public.date_dim +filter
   Shipment __fedq_ship_1 [duck]
-    Scan pg.public.date_dim +filter
-    RemoteQuery [duck] :: SELECT "dt"."d_year" AS "d_year", "item"."i_brand_id" AS "brand_id", "item"."i_brand" AS "brand", SUM("store_sales"."ss_ext_sales_price") AS "sum_agg" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_0" AS "item" ON ("store_sales"."ss_item_sk" = "item"."i_item_sk") INNER JOIN "temp"."__fedq_ship_1" AS "dt" ON ("dt"."d_date_sk" = "store_sales"."ss_sold_date_sk") GROUP BY "dt"."d_year", "item"."i_brand", "item"."i_brand_id" ORDER BY "dt"."d_year" NULLS LAST, "sum_agg" DESC NULLS LAST, "brand_id" NULLS LAST LIMIT 100
+    Scan pg.public.item +filter
+    RemoteQuery [duck] :: SELECT "dt"."d_year" AS "d_year", "item"."i_brand_id" AS "brand_id", "item"."i_brand" AS "brand", SUM("store_sales"."ss_ext_sales_price") AS "sum_agg" FROM "temp"."__fedq_ship_0" AS "dt" INNER JOIN "main"."store_sales" AS "store_sales" ON ("dt"."d_date_sk" = "store_sales"."ss_sold_date_sk") INNER JOIN "temp"."__fedq_ship_1" AS "item" ON ("store_sales"."ss_item_sk" = "item"."i_item_sk") GROUP BY "dt"."d_year", "item"."i_brand", "item"."i_brand_id" ORDER BY "dt"."d_year" NULLS LAST, "sum_agg" DESC NULLS LAST, "brand_id" NULLS LAST LIMIT 100

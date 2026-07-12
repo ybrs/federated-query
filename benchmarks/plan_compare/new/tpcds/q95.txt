@@ -22,6 +22,6 @@ Limit
                     CteScan
                       Cte
                         RemoteQuery [duck] :: SELECT "ws1"."ws_order_number" AS "ws_order_number", "ws1"."ws_warehouse_sk" AS "wh1", "ws2"."ws_warehouse_sk" AS "wh2" FROM "main"."web_sales" AS "ws1" INNER JOIN "main"."web_sales" AS "ws2" ON ("ws1"."ws_order_number" = "ws2"."ws_order_number") WHERE ("ws1"."ws_warehouse_sk" != "ws2"."ws_warehouse_sk")
-            Scan pg.public.customer_address +filter
-          Scan pg.public.date_dim +filter
+            Scan pg.public.date_dim +filter
+          Scan pg.public.customer_address +filter
         Scan pg.public.web_site +filter

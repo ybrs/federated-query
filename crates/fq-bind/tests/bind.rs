@@ -551,3 +551,89 @@ fn correlated_subquery_resolves_outer_column() {
     assert_eq!(outer.table.as_deref(), Some("u"));
     assert_eq!(outer.data_type, Some(DataType::Integer));
 }
+
+// --- ORDER BY aggregate-call hoist (sort keys bind to aggregate OUTPUTS) ---
+
+/// The Sort under a plan, unwrapping a restore Projection if one was added.
+fn find_sort(plan: &LogicalPlan) -> &fq_plan::logical::Sort {
+    match plan {
+        LogicalPlan::Sort(sort) => sort,
+        LogicalPlan::Projection(projection) => find_sort(&projection.input),
+        LogicalPlan::Limit(limit) => find_sort(&limit.input),
+        other => panic!("expected a Sort in the plan, got {other:?}"),
+    }
+}
+
+#[test]
+fn order_by_restating_a_select_aggregate_binds_to_its_output() {
+    // ORDER BY count(*) where the SELECT already computes it must reference
+    // THAT output by name - recomputing count(*) above the aggregate reads
+    // grouped rows whose raw inputs no longer exist.
+    let plan = bind_sql(
+        "SELECT user_id, count(*) AS order_count FROM pg.public.orders \
+         GROUP BY user_id ORDER BY count(*)",
+    )
+    .expect("bind");
+    let sort = find_sort(&plan);
+    let Expr::Column(key) = &sort.sort_keys[0] else {
+        panic!(
+            "sort key must be an output reference, got {:?}",
+            sort.sort_keys[0]
+        );
+    };
+    assert_eq!(key.column, "order_count");
+    // No hidden output was needed: the aggregate keeps its declared outputs.
+    let LogicalPlan::Aggregate(aggregate) = sort.input.as_ref() else {
+        panic!("sort input must be the aggregate, got {:?}", sort.input);
+    };
+    assert_eq!(aggregate.output_names, vec!["user_id", "order_count"]);
+}
+
+#[test]
+fn order_by_aggregate_absent_from_select_hoists_a_hidden_output() {
+    // ORDER BY sum(total) with no matching SELECT output: the call becomes a
+    // hidden __agg_N aggregate output the sort reads, and a projection above
+    // restores the declared schema so the hidden output never widens the result.
+    let plan = bind_sql(
+        "SELECT user_id, count(*) AS order_count FROM pg.public.orders \
+         GROUP BY user_id ORDER BY sum(total)",
+    )
+    .expect("bind");
+    let LogicalPlan::Projection(restore) = &plan else {
+        panic!("a hidden hoist must add a restore projection, got {plan:?}");
+    };
+    assert_eq!(restore.aliases, vec!["user_id", "order_count"]);
+    let sort = find_sort(&plan);
+    let Expr::Column(key) = &sort.sort_keys[0] else {
+        panic!("sort key must be an output reference");
+    };
+    assert_eq!(key.column, "__agg_2");
+    let LogicalPlan::Aggregate(aggregate) = sort.input.as_ref() else {
+        panic!("sort input must be the widened aggregate");
+    };
+    assert_eq!(
+        aggregate.output_names,
+        vec!["user_id", "order_count", "__agg_2"]
+    );
+}
+
+#[test]
+fn order_by_aggregate_over_having_keeps_the_filter() {
+    // The HAVING filter stays between the sort and the aggregate, and keeps
+    // resolving its own references (widening only appends outputs).
+    let plan = bind_sql(
+        "SELECT user_id, count(*) AS order_count FROM pg.public.orders \
+         GROUP BY user_id HAVING count(*) > 1 ORDER BY count(*)",
+    )
+    .expect("bind");
+    let sort = find_sort(&plan);
+    let Expr::Column(key) = &sort.sort_keys[0] else {
+        panic!("sort key must be an output reference");
+    };
+    assert_eq!(key.column, "order_count");
+    assert!(
+        matches!(sort.input.as_ref(), LogicalPlan::Filter(_)),
+        "the HAVING filter must stay under the sort, got {:?}",
+        sort.input
+    );
+}

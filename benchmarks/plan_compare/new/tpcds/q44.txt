@@ -1,4 +1,41 @@
 QUERY: q44
 ENGINE: new (rust) EXPLAIN
 
-ERROR: RuntimeError: parse error: unsupported SQL: function `window_function`
+Limit
+  Sort
+    Projection
+      HashJoin
+        HashJoin
+          HashJoin
+            AliasedRelation
+              Projection
+                Filter
+                  AliasedRelation
+                    Window
+                      AliasedRelation
+                        Projection
+                          Filter
+                            NestedLoopJoin
+                              Scan duck.main.store_sales +filter +agg(2) +groupby
+                              AliasedRelation
+                                SingleRowGuard
+                                  Projection
+                                    HashAggregate
+                                      Scan duck.main.store_sales +filter
+            Scan pg.public.item
+          AliasedRelation
+            Projection
+              Filter
+                AliasedRelation
+                  Window
+                    AliasedRelation
+                      Projection
+                        Filter
+                          NestedLoopJoin
+                            Scan duck.main.store_sales +filter +agg(2) +groupby
+                            AliasedRelation
+                              SingleRowGuard
+                                Projection
+                                  HashAggregate
+                                    Scan duck.main.store_sales +filter
+        Scan pg.public.item

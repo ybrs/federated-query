@@ -8,14 +8,15 @@
 //! `Converter` because the subquery-bearing nodes recurse back into query
 //! conversion (which needs the catalog for star expansion).
 
-use fq_plan::expr::LiteralValue;
+use fq_plan::expr::{LiteralValue, NullsOrder};
 use fq_plan::{BinaryOpType, ColumnRef, Expr, Quantifier, UnaryOpType};
 use polyglot_sql::expressions::{
     AggFunc, Anonymous, Between, BinaryOp, Case, Cast, CountFunc, DataType, Expression, In, LikeOp,
-    Literal, QuantifiedExpr,
+    Literal, Ordered, QuantifiedExpr, WindowFrame, WindowFrameBound, WindowFrameExclude,
+    WindowFrameKind, WindowFunction,
 };
 
-use crate::convert::Converter;
+use crate::convert::{nulls_of, Converter};
 use crate::error::ParseError;
 
 impl Converter<'_> {
@@ -61,6 +62,14 @@ impl Converter<'_> {
             Expression::Subquery(subquery) => self.convert_scalar_subquery(subquery),
             Expression::Any(quantified) => self.convert_quantified(Quantifier::Any, quantified),
             Expression::All(quantified) => self.convert_quantified(Quantifier::All, quantified),
+            Expression::WindowFunction(window) => self.convert_window(window),
+            // A set operation is a query, not a scalar value. It reaches the
+            // expression path only when the parser attaches a trailing
+            // UNION/INTERSECT/EXCEPT to a scalar subquery operand; naming the
+            // construct is clearer than the generic function fallthrough.
+            Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_) => Err(
+                ParseError::Unsupported("set operation used as a scalar expression".to_string()),
+            ),
             _ => self.convert_binary_or_aggregate(expr),
         }
     }
@@ -77,6 +86,7 @@ impl Converter<'_> {
             Expression::Avg(agg) => self.convert_aggregate("AVG", agg),
             Expression::Min(agg) => self.convert_aggregate("MIN", agg),
             Expression::Max(agg) => self.convert_aggregate("MAX", agg),
+            Expression::StddevSamp(agg) => self.convert_aggregate("STDDEV_SAMP", agg),
             Expression::Anonymous(anon) => self.convert_anonymous(anon),
             other => self.scalar_function(other),
         }
@@ -278,6 +288,70 @@ impl Converter<'_> {
         })
     }
 
+    /// Convert `func OVER (PARTITION BY ... ORDER BY ... frame)` into
+    /// `Expr::Window`. A named-window reference (`OVER w`) and Oracle's KEEP
+    /// clause are not modeled and raise rather than dropping window semantics.
+    fn convert_window(&self, window: &WindowFunction) -> Result<Expr, ParseError> {
+        if window.keep.is_some() {
+            return Err(ParseError::Unsupported("window KEEP clause".to_string()));
+        }
+        let over = &window.over;
+        if over.window_name.is_some() {
+            return Err(ParseError::Unsupported(
+                "named window reference".to_string(),
+            ));
+        }
+        let function = Box::new(self.convert_window_function(&window.this)?);
+        let mut partition_by = Vec::with_capacity(over.partition_by.len());
+        for part in &over.partition_by {
+            partition_by.push(self.expr(part)?);
+        }
+        let (order_keys, order_ascending, order_nulls) =
+            self.convert_window_order(&over.order_by)?;
+        let frame = match &over.frame {
+            Some(frame) => Some(render_window_frame(frame)?),
+            None => None,
+        };
+        // Fresh window expression built from the parsed OVER clause - no base to
+        // copy from. Field list (function/partition_by/order_keys/order_ascending/
+        // order_nulls/frame) is the complete Window variant.
+        Ok(Expr::Window {
+            function,
+            partition_by,
+            order_keys,
+            order_ascending,
+            order_nulls,
+            frame,
+        })
+    }
+
+    /// Convert the function under an OVER. The ranking functions (ROW_NUMBER,
+    /// RANK, DENSE_RANK) are meaningful only as a windowed call, so they are
+    /// recognized here, not in the general expression path where a bare `rank()`
+    /// still raises. Every other window function (SUM/AVG/... over a window)
+    /// converts through the normal expression path.
+    fn convert_window_function(&self, this: &Expression) -> Result<Expr, ParseError> {
+        match this {
+            Expression::RowNumber(_) => Ok(ranking_call("ROW_NUMBER")),
+            Expression::Rank(rank) => plain_ranking("RANK", &rank.args, rank.order_by.as_deref()),
+            Expression::DenseRank(dense) => plain_ranking("DENSE_RANK", &dense.args, None),
+            other => self.expr(other),
+        }
+    }
+
+    /// Convert a window's ORDER BY into aligned (keys, ascending, nulls) lists.
+    fn convert_window_order(&self, order_by: &[Ordered]) -> Result<WindowOrder, ParseError> {
+        let mut keys = Vec::with_capacity(order_by.len());
+        let mut ascending = Vec::with_capacity(order_by.len());
+        let mut nulls = Vec::with_capacity(order_by.len());
+        for ordered in order_by {
+            keys.push(self.expr(&ordered.this)?);
+            ascending.push(!ordered.desc);
+            nulls.push(nulls_of(ordered));
+        }
+        Ok((keys, ascending, nulls))
+    }
+
     /// Convert COUNT(*) / COUNT(expr) / COUNT(DISTINCT expr).
     fn convert_count(&self, count: &CountFunc) -> Result<Expr, ParseError> {
         let args = match &count.this {
@@ -345,6 +419,96 @@ pub(crate) fn scalar_function_call(name: String, args: Vec<Expr>) -> Expr {
         distinct: false,
         within_group_key: None,
         within_group_desc: false,
+    }
+}
+
+/// A window ORDER BY as aligned (keys, ascending, nulls) lists.
+type WindowOrder = (Vec<Expr>, Vec<bool>, Vec<Option<NullsOrder>>);
+
+/// A ranking window function with no in-function ORDER BY or hypothetical-set
+/// arguments (the only form the engine models). The DuckDB `RANK(ORDER BY x)` and
+/// Oracle `RANK(v) WITHIN GROUP (...)` forms carry ranking semantics the bare
+/// call cannot, so they raise rather than being silently dropped.
+fn plain_ranking(
+    name: &str,
+    args: &[Expression],
+    order_by: Option<&[Ordered]>,
+) -> Result<Expr, ParseError> {
+    if !args.is_empty() {
+        return Err(ParseError::Unsupported(
+            "hypothetical-set ranking arguments".to_string(),
+        ));
+    }
+    if order_by.is_some() {
+        return Err(ParseError::Unsupported(
+            "ORDER BY inside a ranking function".to_string(),
+        ));
+    }
+    Ok(ranking_call(name))
+}
+
+/// A ranking window function (`RANK()` etc.) as a NON-aggregate, zero-argument
+/// call. It must not be aggregate: the emitter renders a zero-argument aggregate
+/// as the star form (`COUNT()` -> `COUNT(*)`), which would make `RANK()` render
+/// as the invalid `RANK(*)`.
+fn ranking_call(name: &str) -> Expr {
+    scalar_function_call(name.to_string(), Vec::new())
+}
+
+/// Render a window frame (`ROWS/RANGE/GROUPS ...`) back to SQL text, carried
+/// verbatim on the Window node so it re-renders to a source. Covers the standard
+/// bounds and the EXCLUDE clause.
+fn render_window_frame(frame: &WindowFrame) -> Result<String, ParseError> {
+    let kind = match frame.kind {
+        WindowFrameKind::Rows => "ROWS",
+        WindowFrameKind::Range => "RANGE",
+        WindowFrameKind::Groups => "GROUPS",
+    };
+    let body = match &frame.end {
+        Some(end) => format!(
+            "BETWEEN {} AND {}",
+            frame_bound(&frame.start)?,
+            frame_bound(end)?
+        ),
+        None => frame_bound(&frame.start)?,
+    };
+    let mut text = format!("{kind} {body}");
+    if let Some(exclude) = &frame.exclude {
+        text.push_str(" EXCLUDE ");
+        text.push_str(frame_exclude(*exclude));
+    }
+    Ok(text)
+}
+
+/// One window-frame bound as SQL text.
+fn frame_bound(bound: &WindowFrameBound) -> Result<String, ParseError> {
+    let text = match bound {
+        WindowFrameBound::CurrentRow => "CURRENT ROW".to_string(),
+        WindowFrameBound::UnboundedPreceding => "UNBOUNDED PRECEDING".to_string(),
+        WindowFrameBound::UnboundedFollowing => "UNBOUNDED FOLLOWING".to_string(),
+        WindowFrameBound::Preceding(value) => format!("{} PRECEDING", frame_value(value)?),
+        WindowFrameBound::Following(value) => format!("{} FOLLOWING", frame_value(value)?),
+        WindowFrameBound::BarePreceding => "PRECEDING".to_string(),
+        WindowFrameBound::BareFollowing => "FOLLOWING".to_string(),
+        WindowFrameBound::Value(value) => frame_value(value)?,
+    };
+    Ok(text)
+}
+
+/// Render a frame-bound offset expression (the `1` in `1 PRECEDING`) to SQL text
+/// via polyglot's generator, so the frame re-renders to a source.
+fn frame_value(value: &Expression) -> Result<String, ParseError> {
+    polyglot_sql::generate(value, polyglot_sql::DialectType::PostgreSQL)
+        .map_err(|error| ParseError::Unsupported(format!("window frame bound: {error:?}")))
+}
+
+/// The keyword text for a frame EXCLUDE clause.
+fn frame_exclude(exclude: WindowFrameExclude) -> &'static str {
+    match exclude {
+        WindowFrameExclude::CurrentRow => "CURRENT ROW",
+        WindowFrameExclude::Group => "GROUP",
+        WindowFrameExclude::Ties => "TIES",
+        WindowFrameExclude::NoOthers => "NO OTHERS",
     }
 }
 

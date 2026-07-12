@@ -16,12 +16,12 @@ Limit
             Projection
               HashJoin
                 HashJoin
-                  Scan duck.main.web_sales +filter
-                  Scan pg.public.item +semijoin
+                  Scan duck.main.web_sales +filter +semijoin
+                  Scan pg.public.item
                 Scan pg.public.date_dim
           Projection
             HashJoin
               HashJoin
-                Scan duck.main.catalog_sales +filter
-                Scan pg.public.item +semijoin
+                Scan duck.main.catalog_sales +filter +semijoin
+                Scan pg.public.item
               Scan pg.public.date_dim

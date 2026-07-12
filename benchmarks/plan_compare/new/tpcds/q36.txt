@@ -1,4 +1,40 @@
 QUERY: q36
 ENGINE: new (rust) EXPLAIN
 
-ERROR: RuntimeError: parse error: unsupported SQL: function `window_function`
+Limit
+  Sort
+    Window
+      CteScan
+        Cte
+          Union
+            Union
+              Projection
+                CteScan
+                  Cte
+                    Shipment __fedq_ship_0 [duck]
+                      Scan pg.public.date_dim +filter
+                      Shipment __fedq_ship_1 [duck]
+                        Scan pg.public.item
+                        Shipment __fedq_ship_2 [duck]
+                          Scan pg.public.store +filter
+                          RemoteQuery [duck] :: SELECT SUM("store_sales"."ss_net_profit") AS "ss_net_profit", SUM("store_sales"."ss_ext_sales_price") AS "ss_ext_sales_price", (CAST((SUM("store_sales"."ss_net_profit") * 1) AS DOUBLE) / NULLIF(SUM("store_sales"."ss_ext_sales_price"), 0)) AS "gross_margin", "item"."i_category" AS "i_category", "item"."i_class" AS "i_class", 0 AS "g_category", 0 AS "g_class" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_0" AS "d1" ON ("d1"."d_date_sk" = "store_sales"."ss_sold_date_sk") INNER JOIN "temp"."__fedq_ship_1" AS "item" ON ("item"."i_item_sk" = "store_sales"."ss_item_sk") INNER JOIN "temp"."__fedq_ship_2" AS "store" ON ("store"."s_store_sk" = "store_sales"."ss_store_sk") GROUP BY "item"."i_category", "item"."i_class"
+              HashAggregate
+                CteScan
+                  Cte
+                    Shipment __fedq_ship_0 [duck]
+                      Scan pg.public.date_dim +filter
+                      Shipment __fedq_ship_1 [duck]
+                        Scan pg.public.item
+                        Shipment __fedq_ship_2 [duck]
+                          Scan pg.public.store +filter
+                          RemoteQuery [duck] :: SELECT SUM("store_sales"."ss_net_profit") AS "ss_net_profit", SUM("store_sales"."ss_ext_sales_price") AS "ss_ext_sales_price", (CAST((SUM("store_sales"."ss_net_profit") * 1) AS DOUBLE) / NULLIF(SUM("store_sales"."ss_ext_sales_price"), 0)) AS "gross_margin", "item"."i_category" AS "i_category", "item"."i_class" AS "i_class", 0 AS "g_category", 0 AS "g_class" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_0" AS "d1" ON ("d1"."d_date_sk" = "store_sales"."ss_sold_date_sk") INNER JOIN "temp"."__fedq_ship_1" AS "item" ON ("item"."i_item_sk" = "store_sales"."ss_item_sk") INNER JOIN "temp"."__fedq_ship_2" AS "store" ON ("store"."s_store_sk" = "store_sales"."ss_store_sk") GROUP BY "item"."i_category", "item"."i_class"
+            HashAggregate
+              CteScan
+                Cte
+                  Shipment __fedq_ship_0 [duck]
+                    Scan pg.public.date_dim +filter
+                    Shipment __fedq_ship_1 [duck]
+                      Scan pg.public.item
+                      Shipment __fedq_ship_2 [duck]
+                        Scan pg.public.store +filter
+                        RemoteQuery [duck] :: SELECT SUM("store_sales"."ss_net_profit") AS "ss_net_profit", SUM("store_sales"."ss_ext_sales_price") AS "ss_ext_sales_price", (CAST((SUM("store_sales"."ss_net_profit") * 1) AS DOUBLE) / NULLIF(SUM("store_sales"."ss_ext_sales_price"), 0)) AS "gross_margin", "item"."i_category" AS "i_category", "item"."i_class" AS "i_class", 0 AS "g_category", 0 AS "g_class" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_0" AS "d1" ON ("d1"."d_date_sk" = "store_sales"."ss_sold_date_sk") INNER JOIN "temp"."__fedq_ship_1" AS "item" ON ("item"."i_item_sk" = "store_sales"."ss_item_sk") INNER JOIN "temp"."__fedq_ship_2" AS "store" ON ("store"."s_store_sk" = "store_sales"."ss_store_sk") GROUP BY "item"."i_category", "item"."i_class"

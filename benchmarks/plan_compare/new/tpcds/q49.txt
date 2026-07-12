@@ -1,4 +1,36 @@
 QUERY: q49
 ENGINE: new (rust) EXPLAIN
 
-ERROR: RuntimeError: parse error: unsupported SQL: Implicit JOIN
+Limit
+  Sort
+    Projection
+      AliasedRelation
+        Union
+          Union
+            Projection
+              Filter
+                AliasedRelation
+                  Window
+                    AliasedRelation
+                      HashAggregate
+                        HashJoin
+                          RemoteQuery [duck] :: SELECT "ws"."ws_sold_date_sk" AS "ws_sold_date_sk", "ws"."ws_item_sk" AS "ws_item_sk", "ws"."ws_order_number" AS "ws_order_number", "ws"."ws_quantity" AS "ws_quantity", "ws"."ws_net_paid" AS "ws_net_paid", "ws"."ws_net_profit" AS "ws_net_profit", "wr"."wr_item_sk" AS "wr_item_sk", "wr"."wr_order_number" AS "wr_order_number", "wr"."wr_return_quantity" AS "wr_return_quantity", "wr"."wr_return_amt" AS "wr_return_amt" FROM "main"."web_sales" AS "ws" LEFT JOIN "main"."web_returns" AS "wr" ON (("ws"."ws_order_number" = "wr"."wr_order_number") AND ("ws"."ws_item_sk" = "wr"."wr_item_sk")) WHERE ("wr"."wr_return_amt" > 10000) AND ((("ws"."ws_net_profit" > 1) AND ("ws"."ws_net_paid" > 0)) AND ("ws"."ws_quantity" > 0))
+                          Scan pg.public.date_dim +filter
+            Projection
+              Filter
+                AliasedRelation
+                  Window
+                    AliasedRelation
+                      HashAggregate
+                        HashJoin
+                          RemoteQuery [duck] :: SELECT "cs"."cs_sold_date_sk" AS "cs_sold_date_sk", "cs"."cs_item_sk" AS "cs_item_sk", "cs"."cs_order_number" AS "cs_order_number", "cs"."cs_quantity" AS "cs_quantity", "cs"."cs_net_paid" AS "cs_net_paid", "cs"."cs_net_profit" AS "cs_net_profit", "cr"."cr_item_sk" AS "cr_item_sk", "cr"."cr_order_number" AS "cr_order_number", "cr"."cr_return_quantity" AS "cr_return_quantity", "cr"."cr_return_amount" AS "cr_return_amount" FROM "main"."catalog_sales" AS "cs" LEFT JOIN "main"."catalog_returns" AS "cr" ON (("cs"."cs_order_number" = "cr"."cr_order_number") AND ("cs"."cs_item_sk" = "cr"."cr_item_sk")) WHERE ("cr"."cr_return_amount" > 10000) AND ((("cs"."cs_net_profit" > 1) AND ("cs"."cs_net_paid" > 0)) AND ("cs"."cs_quantity" > 0))
+                          Scan pg.public.date_dim +filter
+          Projection
+            Filter
+              AliasedRelation
+                Window
+                  AliasedRelation
+                    HashAggregate
+                      HashJoin
+                        RemoteQuery [duck] :: SELECT "sts"."ss_sold_date_sk" AS "ss_sold_date_sk", "sts"."ss_item_sk" AS "ss_item_sk", "sts"."ss_ticket_number" AS "ss_ticket_number", "sts"."ss_quantity" AS "ss_quantity", "sts"."ss_net_paid" AS "ss_net_paid", "sts"."ss_net_profit" AS "ss_net_profit", "sr"."sr_item_sk" AS "sr_item_sk", "sr"."sr_ticket_number" AS "sr_ticket_number", "sr"."sr_return_quantity" AS "sr_return_quantity", "sr"."sr_return_amt" AS "sr_return_amt" FROM "main"."store_sales" AS "sts" LEFT JOIN "main"."store_returns" AS "sr" ON (("sts"."ss_ticket_number" = "sr"."sr_ticket_number") AND ("sts"."ss_item_sk" = "sr"."sr_item_sk")) WHERE ("sr"."sr_return_amt" > 10000) AND ((("sts"."ss_net_profit" > 1) AND ("sts"."ss_net_paid" > 0)) AND ("sts"."ss_quantity" > 0))
+                        Scan pg.public.date_dim +filter

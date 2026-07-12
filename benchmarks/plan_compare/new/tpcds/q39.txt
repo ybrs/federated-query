@@ -1,4 +1,26 @@
 QUERY: q39
 ENGINE: new (rust) EXPLAIN
 
-ERROR: RuntimeError: parse error: unsupported SQL: function `stddev_samp`
+Sort
+  Projection
+    HashJoin
+      Filter
+        CteScan
+          Cte
+            Shipment __fedq_ship_0 [duck]
+              Scan pg.public.item
+              Shipment __fedq_ship_1 [duck]
+                Scan pg.public.warehouse
+                Shipment __fedq_ship_2 [duck]
+                  Scan pg.public.date_dim +filter
+                  RemoteQuery [duck] :: SELECT "foo"."w_warehouse_name" AS "w_warehouse_name", "foo"."w_warehouse_sk" AS "w_warehouse_sk", "foo"."i_item_sk" AS "i_item_sk", "foo"."d_moy" AS "d_moy", "foo"."stdev" AS "stdev", "foo"."mean" AS "mean", CASE WHEN ("foo"."mean" = 0) THEN NULL ELSE (CAST("foo"."stdev" AS DOUBLE) / NULLIF("foo"."mean", 0)) END AS "cov" FROM (SELECT "warehouse"."w_warehouse_name" AS "w_warehouse_name", "warehouse"."w_warehouse_sk" AS "w_warehouse_sk", "item"."i_item_sk" AS "i_item_sk", "date_dim"."d_moy" AS "d_moy", (STDDEV_SAMP("inventory"."inv_quantity_on_hand") * 1) AS "stdev", AVG("inventory"."inv_quantity_on_hand") AS "mean" FROM "main"."inventory" AS "inventory" INNER JOIN "temp"."__fedq_ship_0" AS "item" ON ("inventory"."inv_item_sk" = "item"."i_item_sk") INNER JOIN "temp"."__fedq_ship_1" AS "warehouse" ON ("inventory"."inv_warehouse_sk" = "warehouse"."w_warehouse_sk") INNER JOIN "temp"."__fedq_ship_2" AS "date_dim" ON ("inventory"."inv_date_sk" = "date_dim"."d_date_sk") GROUP BY "warehouse"."w_warehouse_name", "warehouse"."w_warehouse_sk", "item"."i_item_sk", "date_dim"."d_moy") AS "foo" WHERE (CASE WHEN ("foo"."mean" = 0) THEN 0 ELSE (CAST("foo"."stdev" AS DOUBLE) / NULLIF("foo"."mean", 0)) END > 1)
+      Filter
+        CteScan
+          Cte
+            Shipment __fedq_ship_0 [duck]
+              Scan pg.public.item
+              Shipment __fedq_ship_1 [duck]
+                Scan pg.public.warehouse
+                Shipment __fedq_ship_2 [duck]
+                  Scan pg.public.date_dim +filter
+                  RemoteQuery [duck] :: SELECT "foo"."w_warehouse_name" AS "w_warehouse_name", "foo"."w_warehouse_sk" AS "w_warehouse_sk", "foo"."i_item_sk" AS "i_item_sk", "foo"."d_moy" AS "d_moy", "foo"."stdev" AS "stdev", "foo"."mean" AS "mean", CASE WHEN ("foo"."mean" = 0) THEN NULL ELSE (CAST("foo"."stdev" AS DOUBLE) / NULLIF("foo"."mean", 0)) END AS "cov" FROM (SELECT "warehouse"."w_warehouse_name" AS "w_warehouse_name", "warehouse"."w_warehouse_sk" AS "w_warehouse_sk", "item"."i_item_sk" AS "i_item_sk", "date_dim"."d_moy" AS "d_moy", (STDDEV_SAMP("inventory"."inv_quantity_on_hand") * 1) AS "stdev", AVG("inventory"."inv_quantity_on_hand") AS "mean" FROM "main"."inventory" AS "inventory" INNER JOIN "temp"."__fedq_ship_0" AS "item" ON ("inventory"."inv_item_sk" = "item"."i_item_sk") INNER JOIN "temp"."__fedq_ship_1" AS "warehouse" ON ("inventory"."inv_warehouse_sk" = "warehouse"."w_warehouse_sk") INNER JOIN "temp"."__fedq_ship_2" AS "date_dim" ON ("inventory"."inv_date_sk" = "date_dim"."d_date_sk") GROUP BY "warehouse"."w_warehouse_name", "warehouse"."w_warehouse_sk", "item"."i_item_sk", "date_dim"."d_moy") AS "foo" WHERE (CASE WHEN ("foo"."mean" = 0) THEN 0 ELSE (CAST("foo"."stdev" AS DOUBLE) / NULLIF("foo"."mean", 0)) END > 1)

@@ -9,11 +9,11 @@ Limit
           RemoteQuery [pg] :: SELECT "customer"."c_customer_sk" AS "c_customer_sk", "customer"."c_current_addr_sk" AS "c_current_addr_sk", "customer"."c_first_name" AS "c_first_name", "customer"."c_last_name" AS "c_last_name", "current_addr"."ca_address_sk" AS "ca_address_sk", "current_addr"."ca_city" AS "ca_city" FROM "public"."customer" AS "customer" INNER JOIN "public"."customer_address" AS "current_addr" ON ("customer"."c_current_addr_sk" = "current_addr"."ca_address_sk")
           AliasedRelation
             Shipment __fedq_ship_4 [duck]
-              Scan pg.public.household_demographics +filter
+              Scan pg.public.date_dim +filter
               Shipment __fedq_ship_5 [duck]
-                Scan pg.public.date_dim +filter
+                Scan pg.public.store +filter
                 Shipment __fedq_ship_6 [duck]
-                  Scan pg.public.customer_address
+                  Scan pg.public.household_demographics +filter
                   Shipment __fedq_ship_7 [duck]
-                    Scan pg.public.store +filter
-                    RemoteQuery [duck] :: SELECT "store_sales"."ss_ticket_number" AS "ss_ticket_number", "store_sales"."ss_customer_sk" AS "ss_customer_sk", "customer_address"."ca_city" AS "bought_city", SUM("store_sales"."ss_ext_sales_price") AS "extended_price", SUM("store_sales"."ss_ext_list_price") AS "list_price", SUM("store_sales"."ss_ext_tax") AS "extended_tax" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_4" AS "household_demographics" ON ("store_sales"."ss_hdemo_sk" = "household_demographics"."hd_demo_sk") INNER JOIN "temp"."__fedq_ship_5" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_6" AS "customer_address" ON ("store_sales"."ss_addr_sk" = "customer_address"."ca_address_sk") INNER JOIN "temp"."__fedq_ship_7" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk") GROUP BY "store_sales"."ss_ticket_number", "store_sales"."ss_customer_sk", "store_sales"."ss_addr_sk", "customer_address"."ca_city"
+                    Scan pg.public.customer_address
+                    RemoteQuery [duck] :: SELECT "store_sales"."ss_ticket_number" AS "ss_ticket_number", "store_sales"."ss_customer_sk" AS "ss_customer_sk", "customer_address"."ca_city" AS "bought_city", SUM("store_sales"."ss_ext_sales_price") AS "extended_price", SUM("store_sales"."ss_ext_list_price") AS "list_price", SUM("store_sales"."ss_ext_tax") AS "extended_tax" FROM "main"."store_sales" AS "store_sales" INNER JOIN "temp"."__fedq_ship_4" AS "date_dim" ON ("store_sales"."ss_sold_date_sk" = "date_dim"."d_date_sk") INNER JOIN "temp"."__fedq_ship_5" AS "store" ON ("store_sales"."ss_store_sk" = "store"."s_store_sk") INNER JOIN "temp"."__fedq_ship_6" AS "household_demographics" ON ("store_sales"."ss_hdemo_sk" = "household_demographics"."hd_demo_sk") INNER JOIN "temp"."__fedq_ship_7" AS "customer_address" ON ("store_sales"."ss_addr_sk" = "customer_address"."ca_address_sk") GROUP BY "store_sales"."ss_ticket_number", "store_sales"."ss_customer_sk", "store_sales"."ss_addr_sk", "customer_address"."ca_city"

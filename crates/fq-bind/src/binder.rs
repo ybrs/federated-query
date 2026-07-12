@@ -14,8 +14,8 @@
 //! visible), HAVING / ORDER-BY output-alias + positional-ordinal resolution, and
 //! the HAVING aggregate-call HOIST/widening (a HAVING aggregate EXPRESSION resolves
 //! to its aggregate output, or an absent one becomes a hidden __agg_N output with a
-//! restore projection). Not implemented: the same hoist for ORDER BY aggregate
-//! calls absent from the SELECT, and WITH RECURSIVE.
+//! restore projection), and the same hoist for ORDER BY keys carrying aggregate
+//! calls. Not implemented: WITH RECURSIVE.
 
 use std::collections::HashMap;
 
@@ -166,6 +166,10 @@ impl<'a> Binder<'a> {
                 binder.bind_sort_keys(&sort.sort_keys, &output_names)
             })
         })?;
+        if sort_keys.iter().any(needs_aggregate_hoist) && over_aggregate(&input) {
+            sort.input = Box::new(input);
+            return Ok(hoist_sort_over_aggregate(sort, sort_keys));
+        }
         // In-place on the owned node: overwrite only input and sort_keys; `ascending`
         // and `nulls_order` are preserved untouched (not re-listed, so never reset).
         sort.input = Box::new(input);
@@ -744,6 +748,105 @@ fn hoist_having_over_aggregate(aggregate: Aggregate, predicate: Expr) -> Logical
     // hidden HAVING outputs - a genuine new Projection; field list complete.
     LogicalPlan::Projection(Projection {
         input: Box::new(filtered),
+        expressions: restore,
+        aliases: original_names,
+        distinct: false,
+        distinct_on: None,
+    })
+}
+
+/// Whether a bound ORDER BY key contains an aggregate-scoped call (an aggregate
+/// function or `GROUPING()`). Such a key cannot be recomputed above the
+/// aggregate - the raw inputs are gone - so it must be hoisted onto aggregate
+/// OUTPUTS, exactly like a HAVING predicate.
+fn needs_aggregate_hoist(expr: &Expr) -> bool {
+    if let Expr::FunctionCall {
+        is_aggregate,
+        function_name,
+        ..
+    } = expr
+    {
+        if *is_aggregate || function_name.eq_ignore_ascii_case("grouping") {
+            return true;
+        }
+    }
+    expr.children()
+        .iter()
+        .any(|child| needs_aggregate_hoist(child))
+}
+
+/// Whether a bound Sort input is an Aggregate, directly or under its HAVING
+/// filter - the shapes whose ORDER BY keys hoist onto aggregate outputs.
+fn over_aggregate(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Aggregate(_) => true,
+        LogicalPlan::Filter(filter) => {
+            matches!(filter.input.as_ref(), LogicalPlan::Aggregate(_))
+        }
+        _ => false,
+    }
+}
+
+/// Bind ORDER BY over an Aggregate (optionally under its HAVING filter) when a
+/// key carries an aggregate call: each call becomes a reference to a (hidden)
+/// aggregate output the sort reads by name - `ORDER BY count(*)` where the
+/// SELECT already computes it references THAT output instead of recomputing
+/// over grouped rows (where the raw inputs no longer exist). A call absent
+/// from the SELECT list is appended as a hidden `__agg_N` output and a
+/// projection above restores the declared schema, the same hoist HAVING uses.
+/// Widening only APPENDS outputs, so a HAVING filter in between keeps
+/// resolving its own references unchanged.
+fn hoist_sort_over_aggregate(mut sort: Sort, bound_keys: Vec<Expr>) -> LogicalPlan {
+    let (aggregate, having) = match *sort.input {
+        LogicalPlan::Aggregate(aggregate) => (aggregate, None),
+        LogicalPlan::Filter(filter) => match *filter.input {
+            LogicalPlan::Aggregate(aggregate) => (aggregate, Some(filter.predicate)),
+            other => {
+                unreachable!("over_aggregate admitted a filter over a non-aggregate: {other:?}")
+            }
+        },
+        other => unreachable!("over_aggregate admitted a non-aggregate sort input: {other:?}"),
+    };
+    let original_names = aggregate.output_names.clone();
+    let original_aggregates = aggregate.aggregates.clone();
+    let mut aggregates = aggregate.aggregates.clone();
+    let mut names = aggregate.output_names.clone();
+    let mut rewritten = Vec::with_capacity(bound_keys.len());
+    for key in bound_keys {
+        rewritten.push(hoist_aggregate_calls(key, &mut aggregates, &mut names));
+    }
+    let widened_count = names.len() - original_names.len();
+    // Widen the aggregate with any hidden outputs the keys now name, in place.
+    let widened = update!(aggregate, { aggregates = aggregates, output_names = names });
+    let mut sorted_input = LogicalPlan::Aggregate(widened);
+    if let Some(predicate) = having {
+        // Fresh Filter restoring the HAVING over the (possibly widened) aggregate -
+        // a genuine new node (the original was consumed above); both fields listed.
+        sorted_input = LogicalPlan::Filter(Filter {
+            input: Box::new(sorted_input),
+            predicate,
+        });
+    }
+    // In-place on the owned Sort: only input and sort_keys change; `ascending`
+    // and `nulls_order` are preserved untouched.
+    sort.input = Box::new(sorted_input);
+    sort.sort_keys = rewritten;
+    let sorted = LogicalPlan::Sort(sort);
+    if widened_count == 0 {
+        return sorted;
+    }
+    let mut restore = Vec::with_capacity(original_names.len());
+    for (name, agg) in original_names.iter().zip(&original_aggregates) {
+        restore.push(Expr::Column(ColumnRef::new(
+            None,
+            name.clone(),
+            Some(agg.get_type()),
+        )));
+    }
+    // Restore the aggregate's declared schema above the sort, dropping the
+    // hidden ORDER BY outputs - a genuine new Projection; field list complete.
+    LogicalPlan::Projection(Projection {
+        input: Box::new(sorted),
         expressions: restore,
         aliases: original_names,
         distinct: false,

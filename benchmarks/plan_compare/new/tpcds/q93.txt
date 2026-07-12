@@ -1,4 +1,11 @@
 QUERY: q93
 ENGINE: new (rust) EXPLAIN
 
-ERROR: RuntimeError: parse error: unsupported SQL: Implicit JOIN
+Limit
+  Sort
+    HashAggregate
+      AliasedRelation
+        Projection
+          HashJoin
+            RemoteQuery [duck] :: SELECT "store_sales"."ss_item_sk" AS "ss_item_sk", "store_sales"."ss_customer_sk" AS "ss_customer_sk", "store_sales"."ss_ticket_number" AS "ss_ticket_number", "store_sales"."ss_quantity" AS "ss_quantity", "store_sales"."ss_sales_price" AS "ss_sales_price", "store_returns"."sr_item_sk" AS "sr_item_sk", "store_returns"."sr_reason_sk" AS "sr_reason_sk", "store_returns"."sr_ticket_number" AS "sr_ticket_number", "store_returns"."sr_return_quantity" AS "sr_return_quantity" FROM "main"."store_sales" AS "store_sales" LEFT JOIN "main"."store_returns" AS "store_returns" ON (("store_returns"."sr_item_sk" = "store_sales"."ss_item_sk") AND ("store_returns"."sr_ticket_number" = "store_sales"."ss_ticket_number"))
+            Scan pg.public.reason +filter

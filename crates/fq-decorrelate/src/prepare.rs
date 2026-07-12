@@ -17,7 +17,8 @@ use fq_plan::logical::{
 use crate::error::DecorrelationError;
 use crate::helpers::{
     and_join, binary, collect_inner_aliases, is_correlated, is_outer_ref, qualified_col,
-    references_inner, references_outer, replace_column_refs, unqualified_col,
+    references_inner, references_outer, relation_output_types, replace_column_refs,
+    typed_output_refs, unqualified_col,
 };
 use crate::{Decorrelator, Result};
 
@@ -35,6 +36,9 @@ pub(crate) struct PreparedSubquery {
     pub plan: LogicalPlan,
     pub condition: Option<Expr>,
     pub values: Vec<String>,
+    /// The data type of each value column in `values`, positionally aligned. A
+    /// comparison against a value column reads this type onto its qualified ref.
+    pub value_types: Vec<DataType>,
     pub alias: String,
 }
 
@@ -90,6 +94,7 @@ impl<'a> SubqueryPreparer<'a> {
                 }),
                 condition: None,
                 values: Vec::new(),
+                value_types: Vec::new(),
                 alias: self.prefix.clone(),
             };
             return Ok(self.finalize(capped));
@@ -153,7 +158,8 @@ impl<'a> SubqueryPreparer<'a> {
             LogicalPlan::Projection(node) => self.peel_values_projection(node),
             LogicalPlan::Values(node) => peel_values_node(node),
             LogicalPlan::Aggregate(node) => {
-                let refs = output_name_refs(&node.output_names);
+                let types: Vec<DataType> = node.aggregates.iter().map(Expr::get_type).collect();
+                let refs = typed_output_refs(&node.output_names, &types)?;
                 Ok((LogicalPlan::Aggregate(node), refs))
             }
             LogicalPlan::Sort(mut node) if allow_wrappers => {
@@ -168,7 +174,7 @@ impl<'a> SubqueryPreparer<'a> {
             }
             LogicalPlan::SetOperation(node) if allow_wrappers => {
                 let plan = LogicalPlan::SetOperation(node);
-                let refs = relation_value_refs(&plan);
+                let refs = relation_value_refs(&plan)?;
                 Ok((plan, refs))
             }
             other => Err(DecorrelationError::Unsupported(format!(
@@ -197,7 +203,7 @@ impl<'a> SubqueryPreparer<'a> {
                 "DISTINCT in a correlated value subquery is not supported".to_string(),
             ));
         }
-        let refs = relation_value_refs(&plan);
+        let refs = relation_value_refs(&plan)?;
         Ok((plan, refs))
     }
 
@@ -299,9 +305,10 @@ impl<'a> SubqueryPreparer<'a> {
     ) -> Expr {
         if expr.is_aggregate_call() {
             let name = format!("{}_h{}", self.prefix, names.len());
+            let data_type = expr.get_type();
             names.push(name.clone());
             aggregates.push(expr);
-            return unqualified_col(&name);
+            return unqualified_col(&name, data_type);
         }
         expr.map_children(&mut |child| self.hoist_having_expr(child, aggregates, names))
     }
@@ -333,9 +340,12 @@ impl<'a> SubqueryPreparer<'a> {
             let (inner_ref, outer_side) = self.key_equality(&predicate)?;
             add_group_key(&mut group_by, &inner_ref, had_group_by)?;
             let key_name = format!("{}_g{}", self.prefix, start + offset);
+            let key_type = inner_ref
+                .data_type
+                .expect("widened correlation key column carries its bound type");
             aggregates.push(Expr::Column(inner_ref));
             names.push(key_name.clone());
-            let renamed = qualified_col(&self.prefix, &key_name);
+            let renamed = qualified_col(&self.prefix, &key_name, key_type);
             self.pulled[start + offset] = binary(BinaryOpType::Eq, outer_side, renamed);
         }
         Ok(Aggregate {
@@ -438,6 +448,7 @@ impl<'a> SubqueryPreparer<'a> {
         let (exposures, condition) = self.expose_correlation_columns()?;
         self.validate_no_outer_left(&core)?;
         let value_exprs = self.partition_window_values(value_exprs, &exposures)?;
+        let value_types: Vec<DataType> = value_exprs.iter().map(Expr::get_type).collect();
         let mut expressions = Vec::new();
         let mut aliases = Vec::new();
         for (expr, alias) in exposures {
@@ -453,6 +464,9 @@ impl<'a> SubqueryPreparer<'a> {
         }
         let mut non_keys = value_names.clone();
         let order = self.build_order(&mut expressions, &mut aliases, &mut non_keys);
+        // The projected columns' types, positionally aligned with `aliases`, read off
+        // each defining expression; a per-key LIMIT reads its key columns' types here.
+        let alias_types: Vec<DataType> = expressions.iter().map(Expr::get_type).collect();
         // Fresh projection exposing the renamed correlation keys and value columns -
         // no base to copy from. Field list is the complete Projection struct.
         let plan = LogicalPlan::Projection(Projection {
@@ -462,11 +476,12 @@ impl<'a> SubqueryPreparer<'a> {
             distinct: false,
             distinct_on: None,
         });
-        let plan = self.apply_pending_limit(plan, &aliases, &non_keys, order)?;
+        let plan = self.apply_pending_limit(plan, &aliases, &alias_types, &non_keys, order)?;
         Ok(PreparedSubquery {
             plan,
             condition,
             values: value_names,
+            value_types,
             alias: self.prefix.clone(),
         })
     }
@@ -515,7 +530,10 @@ impl<'a> SubqueryPreparer<'a> {
             if self.is_renamed_ref(col) {
                 // A key already widened into the aggregate below: expose it by its
                 // inner physical name; the condition keeps the qualified ref.
-                exposures.push((unqualified_col(&col.column), col.column.clone()));
+                let data_type = col
+                    .data_type
+                    .expect("widened correlation key carries its bound type");
+                exposures.push((unqualified_col(&col.column, data_type), col.column.clone()));
                 exposure_names.insert(key, Expr::Column(col.clone()));
                 continue;
             }
@@ -530,8 +548,11 @@ impl<'a> SubqueryPreparer<'a> {
                 continue;
             }
             let name = format!("{}_k{}", self.prefix, exposures.len());
+            let data_type = col
+                .data_type
+                .expect("exposed correlation key carries its bound type");
             exposures.push((Expr::Column(col.clone()), name.clone()));
-            exposure_names.insert(key, qualified_col(&self.prefix, &name));
+            exposure_names.insert(key, qualified_col(&self.prefix, &name, data_type));
         }
         Ok(())
     }
@@ -603,8 +624,11 @@ impl<'a> SubqueryPreparer<'a> {
         let order = self.pending_order.as_ref()?;
         let mut order_keys = Vec::new();
         for sort_key in &order.sort_keys {
+            // The projected order column carries the sort key's type: the alias reads
+            // that same expression, projected as an extra when it was not already out.
+            let data_type = sort_key.get_type();
             let alias = self.order_alias(sort_key, expressions, aliases, non_keys);
-            order_keys.push(unqualified_col(&alias));
+            order_keys.push(unqualified_col(&alias, data_type));
         }
         Some((
             order_keys,
@@ -638,6 +662,7 @@ impl<'a> SubqueryPreparer<'a> {
         &self,
         plan: LogicalPlan,
         aliases: &[String],
+        alias_types: &[DataType],
         non_keys: &[String],
         order: Option<OrderSpec>,
     ) -> Result<LogicalPlan> {
@@ -645,9 +670,9 @@ impl<'a> SubqueryPreparer<'a> {
             return Ok(plan);
         };
         let mut keys = Vec::new();
-        for alias in aliases {
+        for (alias, data_type) in aliases.iter().zip(alias_types.iter()) {
             if !non_keys.contains(alias) {
-                keys.push(unqualified_col(alias));
+                keys.push(unqualified_col(alias, *data_type));
             }
         }
         if keys.is_empty() {
@@ -732,7 +757,7 @@ impl SubqueryPreparer<'_> {
         let (value_exprs, value_names) = hoisted_value_refs(&hoisted);
         let prepared = self.assemble(stripped, value_exprs, value_names)?;
         let condition = prepared.condition.clone();
-        let guarded = guard_scalar(prepared, original_grouped);
+        let guarded = guard_scalar(prepared, original_grouped)?;
         Ok(self.finalize_scalar(guarded, condition, replacement))
     }
 
@@ -742,7 +767,7 @@ impl SubqueryPreparer<'_> {
     fn hoist_aggregate_calls(&self, expr: Expr, hoisted: &mut Vec<(Expr, String)>) -> Expr {
         if expr.is_aggregate_call() {
             let name = format!("{}_v{}", self.prefix, hoisted.len());
-            let value_ref = qualified_col(&self.prefix, &name);
+            let value_ref = qualified_col(&self.prefix, &name, expr.get_type());
             let is_count = matches!(
                 &expr,
                 Expr::FunctionCall { function_name, .. }
@@ -766,6 +791,7 @@ impl SubqueryPreparer<'_> {
             ));
         }
         self.reject_outer_refs_in_value(&value_exprs[0])?;
+        let value_type = value_exprs[0].get_type();
         let stripped = self.strip(core)?;
         let value_name = format!("{}_v0", self.prefix);
         let prepared = self.assemble(stripped, value_exprs, vec![value_name.clone()])?;
@@ -773,8 +799,8 @@ impl SubqueryPreparer<'_> {
         // LIMIT 1 makes the body provably single-row, so no guard; anything else
         // needs the runtime cardinality guard.
         let needs_guard = self.pending_limit != Some(1);
-        let guarded = guard_scalar(prepared, needs_guard);
-        let replacement = qualified_col(&self.prefix, &value_name);
+        let guarded = guard_scalar(prepared, needs_guard)?;
+        let replacement = qualified_col(&self.prefix, &value_name, value_type);
         Ok(self.finalize_scalar(guarded, condition, replacement))
     }
 
@@ -819,22 +845,31 @@ impl SubqueryPreparer<'_> {
 /// proven single-row. With no keys the guard allows at most one row total; with
 /// keys, at most one row per correlation-key tuple (the key columns are the schema
 /// names that are not value columns).
-fn guard_scalar(prepared: PreparedSubquery, needs_guard: bool) -> LogicalPlan {
+fn guard_scalar(prepared: PreparedSubquery, needs_guard: bool) -> Result<LogicalPlan> {
     if !needs_guard {
-        return prepared.plan;
+        return Ok(prepared.plan);
+    }
+    let names = prepared.plan.schema();
+    let types = relation_output_types(&prepared.plan)?;
+    if names.len() != types.len() {
+        return Err(DecorrelationError::Invariant(format!(
+            "scalar side exposes {} columns but {} derived types",
+            names.len(),
+            types.len()
+        )));
     }
     let mut keys = Vec::new();
-    for name in prepared.plan.schema() {
-        if !prepared.values.contains(&name) {
-            keys.push(unqualified_col(&name));
+    for (name, data_type) in names.iter().zip(types.iter()) {
+        if !prepared.values.contains(name) {
+            keys.push(unqualified_col(name, *data_type));
         }
     }
     // Fresh cardinality guard wrapping the scalar side - no base to copy from. Field
     // list (input/keys) is the complete SingleRowGuard struct.
-    LogicalPlan::SingleRowGuard(SingleRowGuard {
+    Ok(LogicalPlan::SingleRowGuard(SingleRowGuard {
         input: Box::new(prepared.plan),
         keys,
-    })
+    }))
 }
 
 /// Rebuild the aggregate so it outputs only the hoisted pure aggregate calls; the
@@ -859,8 +894,8 @@ fn rebuild_hoisted_aggregate(plan: Aggregate, hoisted: &[(Expr, String)]) -> Log
 fn hoisted_value_refs(hoisted: &[(Expr, String)]) -> (Vec<Expr>, Vec<String>) {
     let mut exprs = Vec::with_capacity(hoisted.len());
     let mut names = Vec::with_capacity(hoisted.len());
-    for (_, name) in hoisted {
-        exprs.push(unqualified_col(name));
+    for (call, name) in hoisted {
+        exprs.push(unqualified_col(name, call.get_type()));
         names.push(name.clone());
     }
     (exprs, names)
@@ -904,22 +939,17 @@ fn peel_values_node(node: fq_plan::logical::Values) -> Result<(LogicalPlan, Vec<
             "Multi-row VALUES subqueries not supported".to_string(),
         ));
     }
-    let refs = output_name_refs(&node.output_names);
+    let types: Vec<DataType> = node.rows[0].iter().map(Expr::get_type).collect();
+    let refs = typed_output_refs(&node.output_names, &types)?;
     Ok((LogicalPlan::Values(node), refs))
 }
 
-/// References (by unqualified name) to a relation's output columns.
-fn relation_value_refs(plan: &LogicalPlan) -> Vec<Expr> {
-    output_name_refs(&plan.schema())
-}
-
-/// One unqualified column reference per output name.
-fn output_name_refs(names: &[String]) -> Vec<Expr> {
-    let mut refs = Vec::with_capacity(names.len());
-    for name in names {
-        refs.push(unqualified_col(name));
-    }
-    refs
+/// Typed references to a relation's output columns, deriving each column's type
+/// from the expression that defines it.
+fn relation_value_refs(plan: &LogicalPlan) -> Result<Vec<Expr>> {
+    let names = plan.schema();
+    let types = relation_output_types(plan)?;
+    typed_output_refs(&names, &types)
 }
 
 /// A star projection has no determinate value columns.

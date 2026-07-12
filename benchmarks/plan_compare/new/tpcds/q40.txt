@@ -1,4 +1,13 @@
 QUERY: q40
 ENGINE: new (rust) EXPLAIN
 
-ERROR: RuntimeError: parse error: unsupported SQL: Implicit JOIN
+Limit
+  Sort
+    HashAggregate
+      HashJoin
+        HashJoin
+          HashJoin
+            RemoteQuery [duck] :: SELECT "catalog_sales"."cs_sold_date_sk" AS "cs_sold_date_sk", "catalog_sales"."cs_warehouse_sk" AS "cs_warehouse_sk", "catalog_sales"."cs_item_sk" AS "cs_item_sk", "catalog_sales"."cs_order_number" AS "cs_order_number", "catalog_sales"."cs_sales_price" AS "cs_sales_price", "catalog_returns"."cr_item_sk" AS "cr_item_sk", "catalog_returns"."cr_order_number" AS "cr_order_number", "catalog_returns"."cr_refunded_cash" AS "cr_refunded_cash" FROM "main"."catalog_sales" AS "catalog_sales" LEFT JOIN "main"."catalog_returns" AS "catalog_returns" ON (("catalog_sales"."cs_order_number" = "catalog_returns"."cr_order_number") AND ("catalog_sales"."cs_item_sk" = "catalog_returns"."cr_item_sk"))
+            Scan pg.public.warehouse
+          Scan pg.public.item +filter
+        Scan pg.public.date_dim +filter

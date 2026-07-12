@@ -8,8 +8,8 @@
 //! Covers the query shapes fq-parse produces - base tables, joins, derived
 //! tables, CTEs, set operations, aggregates, subquery expressions (correlated),
 //! HAVING/ORDER-BY aliases and positional ordinals - closing SQL -> bound plan.
-//! The HAVING aggregate-call hoist is implemented; the same hoist for ORDER BY
-//! aggregate calls absent from SELECT, and WITH RECURSIVE, are not.
+//! The HAVING and ORDER BY aggregate-call hoists are implemented; WITH
+//! RECURSIVE is not.
 
 pub mod binder;
 pub mod error;

@@ -13,49 +13,49 @@ Limit
                   HashAggregate
                     HashJoin
                       HashJoin
-                        Scan duck.main.store_sales
-                        HashJoin
-                          Scan pg.public.date_dim
-                          AliasedRelation
-                            Projection
-                              HashJoin
-                                Scan pg.public.date_dim
-                                AliasedRelation
-                                  SingleRowGuard
-                                    Projection
-                                      Scan pg.public.date_dim +filter
-                      Scan pg.public.item
+                        Scan duck.main.store_sales +semijoin
+                        Scan pg.public.item
+                      HashJoin
+                        Scan pg.public.date_dim
+                        AliasedRelation
+                          Projection
+                            HashJoin
+                              Scan pg.public.date_dim
+                              AliasedRelation
+                                SingleRowGuard
+                                  Projection
+                                    Scan pg.public.date_dim +filter
               CteScan
                 Cte
                   HashAggregate
                     HashJoin
                       HashJoin
-                        Scan duck.main.web_sales
-                        HashJoin
-                          Scan pg.public.date_dim
-                          AliasedRelation
-                            Projection
-                              HashJoin
-                                Scan pg.public.date_dim
-                                AliasedRelation
-                                  SingleRowGuard
-                                    Projection
-                                      Scan pg.public.date_dim +filter
-                      Scan pg.public.item
+                        Scan duck.main.catalog_sales +semijoin
+                        Scan pg.public.item
+                      HashJoin
+                        Scan pg.public.date_dim
+                        AliasedRelation
+                          Projection
+                            HashJoin
+                              Scan pg.public.date_dim
+                              AliasedRelation
+                                SingleRowGuard
+                                  Projection
+                                    Scan pg.public.date_dim +filter
           CteScan
             Cte
               HashAggregate
                 HashJoin
                   HashJoin
-                    Scan duck.main.catalog_sales
-                    HashJoin
-                      Scan pg.public.date_dim
-                      AliasedRelation
-                        Projection
-                          HashJoin
-                            Scan pg.public.date_dim
-                            AliasedRelation
-                              SingleRowGuard
-                                Projection
-                                  Scan pg.public.date_dim +filter
-                  Scan pg.public.item
+                    Scan duck.main.web_sales +semijoin
+                    Scan pg.public.item
+                  HashJoin
+                    Scan pg.public.date_dim
+                    AliasedRelation
+                      Projection
+                        HashJoin
+                          Scan pg.public.date_dim
+                          AliasedRelation
+                            SingleRowGuard
+                              Projection
+                                Scan pg.public.date_dim +filter

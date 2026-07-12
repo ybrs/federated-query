@@ -29,7 +29,7 @@ use fq_plan::logical::{
 use crate::error::DecorrelationError;
 use crate::helpers::{
     and_join, binary, collect_inner_aliases, is_outer_ref, qualified_col, references_outer,
-    replace_column_refs,
+    relation_output_types, replace_column_refs,
 };
 use crate::prepare::coalesce_zero;
 use crate::{Decorrelator, Result};
@@ -149,6 +149,8 @@ impl Decorrelator {
         } = shape;
         let dom_prefix = self.next_prefix();
         let dep_prefix = self.next_prefix();
+        // The re-exposed top-k value carries the subquery value expression's type.
+        let value_type = value.get_type();
         // The outer plan is both the domain source and the join-back left side, so
         // the domain gets its own clone (`join_back` below consumes the original).
         let (domain, dom_map) = build_domain(plan.clone(), &free_vars, &dom_prefix);
@@ -168,7 +170,7 @@ impl Decorrelator {
         )?;
         let joined = join_back(plan, top_k, &free_vars, &dom_map, &dep_prefix)?;
         // A row subquery yields NULL (not 0) when no row matched, so no COALESCE.
-        Ok((qualified_col(&dep_prefix, UNNEST_VALUE), joined))
+        Ok((qualified_col(&dep_prefix, UNNEST_VALUE, value_type), joined))
     }
 
     /// `domain JOIN inner`, ranked by `ROW_NUMBER()` per domain value, capped to
@@ -205,7 +207,9 @@ impl Decorrelator {
             input: Box::new(ranked),
             predicate: row_number_cap(&win_prefix, limit)?,
         });
-        let projected = project_domain_values(capped, value_names, dom_map, &win_prefix);
+        let value_types: Vec<DataType> = value_exprs.iter().map(Expr::get_type).collect();
+        let projected =
+            project_domain_values(capped, value_names, &value_types, dom_map, &win_prefix);
         Ok(aliased(projected, prefix))
     }
 
@@ -220,6 +224,13 @@ impl Decorrelator {
         let prefix = self.next_prefix();
         let value_name = format!("{prefix}_v0");
         let right = aliased(project_lateral_value(body, &value_name)?, &prefix);
+        // The lateral body exposes exactly its single renamed value; its type is that
+        // value column's, read off the body's derived output schema.
+        let value_type = *relation_output_types(&right)?.first().ok_or_else(|| {
+            DecorrelationError::Invariant(
+                "a lateral scalar body exposes no value column".to_string(),
+            )
+        })?;
         // Fresh lateral join wrapping the outer plan and the per-outer-row body - no
         // base to copy from. Field list (left/right/join_type) is complete.
         let joined = LogicalPlan::LateralJoin(LateralJoin {
@@ -227,7 +238,7 @@ impl Decorrelator {
             right: Box::new(right),
             join_type: JoinType::Left,
         });
-        Ok((qualified_col(&prefix, &value_name), joined))
+        Ok((qualified_col(&prefix, &value_name, value_type), joined))
     }
 
     /// Rewrite a `LateralJoin` node in place: recurse into both sides and keep the
@@ -365,9 +376,14 @@ fn build_domain(plan: LogicalPlan, free_vars: &[ColumnRef], prefix: &str) -> (Lo
     for (index, free_var) in free_vars.iter().enumerate() {
         let name = format!("d{index}");
         names.push(name.clone());
+        // The domain column stands for its free variable, so it carries the bound
+        // outer column's type.
+        let data_type = free_var
+            .data_type
+            .expect("dependent-join free variable carries its bound type");
         dom_map.push((
             (free_var.table.clone(), free_var.column.clone()),
-            ColumnRef::new(Some(prefix.to_string()), name, None),
+            ColumnRef::new(Some(prefix.to_string()), name, Some(data_type)),
         ));
     }
     // Fresh DISTINCT projection of the outer free vars into the domain relation - no
@@ -472,7 +488,10 @@ fn join_back_condition(
                     "a free variable has no domain column in the dependent-join map".to_string(),
                 )
             })?;
-        let dependent_ref = qualified_col(dep_prefix, &domain_ref.column);
+        let domain_type = domain_ref
+            .data_type
+            .expect("domain column carries its bound type");
+        let dependent_ref = qualified_col(dep_prefix, &domain_ref.column, domain_type);
         equalities.push(binary(
             BinaryOpType::Eq,
             Expr::Column(free_var.clone()),
@@ -486,7 +505,7 @@ fn join_back_condition(
 /// an empty group must read 0, not the LEFT join's NULL (the Kim 1982 count bug),
 /// so a COUNT value is wrapped in `COALESCE(value, 0)`.
 fn scalar_value_ref(aggregate: &Expr, dep_prefix: &str) -> Expr {
-    let value_ref = qualified_col(dep_prefix, UNNEST_VALUE);
+    let value_ref = qualified_col(dep_prefix, UNNEST_VALUE, aggregate.get_type());
     if is_count_aggregate(aggregate) {
         return coalesce_zero(value_ref);
     }
@@ -604,7 +623,8 @@ fn row_number_cap(win_prefix: &str, limit: u64) -> Result<Expr> {
     };
     Ok(binary(
         BinaryOpType::Lte,
-        qualified_col(win_prefix, UNNEST_RANK),
+        // ROW_NUMBER() ranks as a BigInt, so the rank column is BigInt-typed.
+        qualified_col(win_prefix, UNNEST_RANK, DataType::BigInt),
         bound_literal,
     ))
 }
@@ -614,17 +634,21 @@ fn row_number_cap(win_prefix: &str, limit: u64) -> Result<Expr> {
 fn project_domain_values(
     capped: LogicalPlan,
     value_names: &[String],
+    value_types: &[DataType],
     dom_map: &DomMap,
     win_prefix: &str,
 ) -> LogicalPlan {
     let mut expressions = Vec::with_capacity(dom_map.len() + value_names.len());
     let mut names = Vec::with_capacity(dom_map.len() + value_names.len());
     for (_, domain_ref) in dom_map {
-        expressions.push(qualified_col(win_prefix, &domain_ref.column));
+        let domain_type = domain_ref
+            .data_type
+            .expect("domain column carries its bound type");
+        expressions.push(qualified_col(win_prefix, &domain_ref.column, domain_type));
         names.push(domain_ref.column.clone());
     }
-    for value_name in value_names {
-        expressions.push(qualified_col(win_prefix, value_name));
+    for (value_name, value_type) in value_names.iter().zip(value_types.iter()) {
+        expressions.push(qualified_col(win_prefix, value_name, *value_type));
         names.push(value_name.clone());
     }
     // Fresh projection of (domain columns, values) dropping the rank - no base to
