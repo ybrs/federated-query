@@ -214,6 +214,75 @@ fn like_and_ilike_map_to_binary_ops() {
 }
 
 #[test]
+fn unaliased_table_defaults_alias_to_its_name() {
+    // Every table carries an alias - its own name when none is written (ports
+    // Python `_extract_table_alias` -> `alias_or_name`). A None alias would make a
+    // column bound to the table name unresolvable in the physical alias map (q18).
+    let plan = parse("SELECT a FROM t WHERE b > 1").unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection");
+    };
+    let LogicalPlan::Filter(filter) = projection.input.as_ref() else {
+        panic!("expected Filter");
+    };
+    let LogicalPlan::Scan(scan) = filter.input.as_ref() else {
+        panic!("expected Scan");
+    };
+    assert_eq!(scan.alias.as_deref(), Some("t"));
+}
+
+#[test]
+fn aggregate_argument_columns_are_collected_without_catalog() {
+    // polyglot's get_columns does NOT descend into aggregate arguments; the
+    // catalog-free fallback must still collect a column referenced only inside an
+    // aggregate call (SUM(amount)), else a merge-engine aggregate loses it (q18).
+    let plan = parse("SELECT SUM(amount) FROM t WHERE id > 0").unwrap();
+    let scan = find_scan(&plan).expect("a Scan");
+    assert!(
+        scan.columns.contains(&"amount".to_string()),
+        "aggregate-argument column not collected: {:?}",
+        scan.columns
+    );
+}
+
+#[test]
+fn base_scan_over_collects_all_catalog_columns() {
+    use fq_catalog::{Catalog, Column, Schema, Table};
+    use fq_common::DataType;
+    use fq_parse::parse_with_catalog;
+
+    // With a catalog, a base scan over-collects the table's FULL column set (a
+    // guaranteed superset - polyglot under-collects typed-function args); projection
+    // pushdown trims later. Here only `id` is referenced, but `name`/`age` are kept.
+    let mut catalog = Catalog::new();
+    let users = Table::new(
+        "users",
+        vec![
+            Column::new("id", DataType::Integer, false),
+            Column::new("name", DataType::Varchar, true),
+            Column::new("age", DataType::Integer, true),
+        ],
+    );
+    catalog.insert_schema(
+        "pg",
+        "public",
+        Schema::with_tables("public", "pg", vec![users]),
+    );
+    let plan = parse_with_catalog("SELECT id FROM pg.public.users", &catalog).unwrap();
+    let scan = find_scan(&plan).expect("a Scan");
+    assert!(scan.columns.contains(&"name".to_string()));
+    assert!(scan.columns.contains(&"age".to_string()));
+}
+
+/// The first Scan found in depth-first order, if any.
+fn find_scan(plan: &LogicalPlan) -> Option<&fq_plan::logical::Scan> {
+    if let LogicalPlan::Scan(scan) = plan {
+        return Some(scan);
+    }
+    plan.children().into_iter().find_map(find_scan)
+}
+
+#[test]
 fn star_without_catalog_raises() {
     // No catalog -> the star cannot expand and must fail loudly.
     let result = parse("SELECT * FROM t");
