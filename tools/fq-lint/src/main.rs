@@ -83,6 +83,12 @@ fn is_lintable_file(path: &Path) -> bool {
     if !text.contains("/src/") || text.contains("/tests/") {
         return false;
     }
+    // A `tests.rs` file is unit-test code by convention (a crate splits its
+    // `#[cfg(test)] mod tests;` into a sibling file). The visitor cannot see the
+    // parent's cfg-test gate across files, so skip the whole file.
+    if path.file_name().is_some_and(|name| name == "tests.rs") {
+        return false;
+    }
     // The imported engine (fq-exec engine/connectors/core) is not ours to
     // restrict; it constructs its own IR types and carries its own allow.
     !(text.contains("/fq-exec/src/engine.rs")
@@ -141,14 +147,17 @@ impl Linter<'_> {
     /// Whether the path names a guarded node type: a bare node struct
     /// (`Scan { .. }`) or an enum struct-variant (`Expr::Literal { .. }`).
     fn is_node_path(&self, path: &syn::Path) -> bool {
+        let n = path.segments.len();
         let Some(last) = path.segments.last() else {
             return false;
         };
-        if self.node_names.contains(&last.ident.to_string()) {
-            return true;
+        if n == 1 {
+            // Bare construction: `Scan { .. }`.
+            return self.node_names.contains(&last.ident.to_string());
         }
-        let n = path.segments.len();
-        n >= 2 && NODE_ENUMS.contains(&path.segments[n - 2].ident.to_string().as_str())
+        // `X::Y { .. }` is a node only when X is a node enum, so a same-named
+        // variant of an unrelated enum (`Fragment::Aggregate`) is not flagged.
+        NODE_ENUMS.contains(&path.segments[n - 2].ident.to_string().as_str())
     }
 
     /// Count contiguous full-line `//` comments directly above 1-indexed `line`.
