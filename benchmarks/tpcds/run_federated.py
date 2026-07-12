@@ -972,8 +972,33 @@ def _staged_queries(options, placement):
     return prepared
 
 
+def _refuse_existing_references(options):
+    """Refuse to re-run the oracle when its results already exist. The
+    references (truth + oracle_timings) are functions of the DATA, measured
+    once per dataset; re-measuring them burns minutes-to-hours for nothing.
+    DETERMINISTIC: presence of a populated oracle_timings table refuses,
+    always - rebuilding requires DELETING the references file first, an
+    explicit human act."""
+    path = _refs_path(options)
+    if not os.path.exists(path):
+        return
+    existing = duckdb.connect(path, read_only=True)
+    try:
+        count = existing.execute("SELECT count(*) FROM oracle_timings").fetchone()[0]
+    except duckdb.CatalogException:
+        return
+    finally:
+        existing.close()
+    if count > 0:
+        raise SystemExit(
+            "REFUSED: {0} already holds {1} oracle timings. The oracle is "
+            "never re-run while its results exist; delete the file first if "
+            "the DATA changed.".format(path, count))
+
+
 def run_save_references(options, placement_name):
     """Step 1: persist truth rows and oracle timings for every query."""
+    _refuse_existing_references(options)
     placement = PLACEMENTS[placement_name]
     db_path = _db_path(DEFAULT_DATA_DIR, options.scale_factor)
     refs = duckdb.connect(_refs_path(options))

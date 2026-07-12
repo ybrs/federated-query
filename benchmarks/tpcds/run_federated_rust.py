@@ -39,6 +39,7 @@ import argparse
 import datetime
 import glob
 import multiprocessing
+import threading
 import os
 import re
 import sys
@@ -93,6 +94,32 @@ ADBC_CANDIDATES = [
     "/workspace/venv-fedq/lib/python3.13/site-packages/adbc_driver_postgresql/libadbc_driver_postgresql.so",
     "/workspace/venv/lib/python3.12/site-packages/adbc_driver_postgresql/libadbc_driver_postgresql.so",
 ]
+
+
+# Hard wall-clock budgets per scale factor, seconds. DETERMINISTIC and not
+# overridable: a run past its budget is killed outright (a watchdog thread
+# calls os._exit, so even a hung native call cannot outlive it). A benchmark
+# that needs longer is a regression to fix, not a budget to raise.
+WALL_BUDGET_SECONDS = {"0.1": 60, "1": 60, "10": 300}
+
+
+def _arm_watchdog(scale_factor):
+    """Kill the whole process when the scale's wall budget expires. A daemon
+    thread survives GIL-released native calls, so the kill is unconditional."""
+    budget = WALL_BUDGET_SECONDS.get(scale_factor, 60)
+
+    def _kill():
+        sys.stderr.write(
+            "WALL BUDGET EXCEEDED: sf{0} run past {1}s - killed. "
+            "Fix the regression; the budget does not move.\n".format(
+                scale_factor, budget))
+        sys.stderr.flush()
+        os._exit(124)
+
+    timer = threading.Timer(budget, _kill)
+    timer.daemon = True
+    timer.start()
+    print("[pg-dims] wall budget: {0}s (deterministic kill)".format(budget))
 
 
 def _pg_dims_placement():
@@ -592,6 +619,7 @@ def run(options):
     paths = _select_query_files(options.queries_dir, options.only)
     if not paths:
         raise SystemExit("No query files found in {0}".format(options.queries_dir))
+    _arm_watchdog(options.scale_factor)
     if options.cold_process:
         return _run_cold_process(options, paths)
     return _run_shared(options, paths)

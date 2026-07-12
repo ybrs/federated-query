@@ -19,9 +19,13 @@ ONE benchmark entry point. Do not create another runner script here - extend
   median of N), `--cold-process` (fresh process per query - the strict cold
   definition of benchmarks/perf_compare; slower), `--pg-database` per scale
   (tpcds_sf01 / tpcds_sf1 / tpcds_sf10).
-- Wall-time expectations (engine runs only; baseline is cached): sf0.1 about
-  20s with `--warm-runs 2`; sf1 about 1 minute with `--warm-runs 3`; sf10 is
-  minutes per pass - start with `--warm-runs 1`.
+- HARD WALL BUDGETS (deterministic, not overridable): sf0.1 and sf1 runs are
+  KILLED at 60s, sf10 at 300s (a watchdog thread os._exits the process, exit
+  code 124 - a hung native call cannot outlive it). A run past its budget is a
+  regression to fix, never a budget to raise.
+- The oracle is NEVER re-run while its results exist: `--mode save-refs`
+  refuses when references_sf<sf>.duckdb already holds oracle timings;
+  rebuilding requires deleting the file first (only when the DATA changed).
 - Report: `reports/rust-fed-sf<sf>.md`.
 
 ## One-time data setup (per scale factor)
