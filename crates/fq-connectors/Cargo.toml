@@ -11,7 +11,9 @@ edition.workspace = true
 [dependencies]
 fq-common = { path = "../fq-common" }
 fq-catalog = { path = "../fq-catalog" }
-duckdb = { version = "1.3", features = ["bundled"] }
+# NEVER "bundled": DuckDB links as the official prebuilt library, fetched by
+# scripts/setup-duckdb-lib.sh and wired via .cargo/config.toml (fq-lint enforces).
+duckdb = { version = "1.3" }
 # Sync Postgres client for the catalog/statistics tier (metadata, pg_stats,
 # reltuples, EXPLAIN). No Arrow here - the data-plane fetch is fq-exec's concern.
 postgres = { version = "0.19", features = ["with-serde_json-1"] }

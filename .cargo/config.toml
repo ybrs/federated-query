@@ -1,0 +1,21 @@
+# DuckDB is linked as the OFFICIAL prebuilt shared library - never compiled
+# inside cargo (a dev-profile amalgamation build is -O0 = ~10x slower DuckDB;
+# a release build costs ~10 min of C++ per clean build). Run
+# scripts/setup-duckdb-lib.sh once to populate .duckdb-lib/current; a missing
+# library fails the link loudly ("cannot find -lduckdb").
+# tools/fq-lint rejects any reintroduction of the "bundled" feature.
+
+[env]
+# Consumed by libduckdb-sys's build script (non-bundled linking mode).
+DUCKDB_LIB_DIR = { value = ".duckdb-lib/current", relative = true, force = true }
+DUCKDB_INCLUDE_DIR = { value = ".duckdb-lib/current", relative = true, force = true }
+
+[build]
+# rpath entries so every produced binary/cdylib (target/<profile>, its deps/
+# dir, and anything loaded via a symlink from benchmarks/) resolves
+# libduckdb.so at runtime without LD_LIBRARY_PATH.
+rustflags = [
+    "-C", "link-arg=-Wl,-rpath,/workspace/federated-query/.duckdb-lib/current",
+    "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../.duckdb-lib/current",
+    "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../../.duckdb-lib/current",
+]

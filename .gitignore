@@ -75,3 +75,6 @@ investigate-duckdb/clickhouse/
 
 # fedq-py build artifact symlink used by the benchmark runners
 benchmarks/**/fedq.so
+.duckdb-lib/
+benchmarks/perf_compare/results/
+benchmarks/perf_compare/fedq.so

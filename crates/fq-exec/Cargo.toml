@@ -34,7 +34,9 @@ adbc_core = "0.23"
 adbc_driver_manager = "0.23"
 # Native DuckDB source connector (reads .duckdb files and ingests temp tables via
 # the Arrow appender).
-duckdb = { version = "1.3", features = ["bundled", "appender-arrow"] }
+# NEVER "bundled": DuckDB links as the official prebuilt library, fetched by
+# scripts/setup-duckdb-lib.sh and wired via .cargo/config.toml (fq-lint enforces).
+duckdb = { version = "1.3", features = ["appender-arrow"] }
 thiserror = "2"
 
 [dev-dependencies]
