@@ -289,7 +289,7 @@ impl<'a> Converter<'a> {
                 table: table.name.name.clone(),
             },
         });
-        LogicalPlan::Scan(Box::new(scan_from_table(select, table, &key)))
+        LogicalPlan::Scan(Box::new(self.scan_from_table(select, table, &key)))
     }
 
     /// A derived table `(SELECT ...) AS alias`: convert the inner query and wrap
@@ -656,36 +656,50 @@ fn map_join_kind(kind: JoinKind) -> Result<(JoinType, bool), ParseError> {
     Ok(mapped)
 }
 
-/// Assemble a `Scan` for one table, over-collecting the columns referenced for it
-/// (qualified by `key`, plus unqualified refs - the binder prunes/expands).
-fn scan_from_table(select: &Select, table: &TableRef, key: &str) -> Scan {
-    let datasource = table
-        .catalog
-        .as_ref()
-        .map_or_else(String::new, |ident| ident.name.clone());
-    let schema_name = table
-        .schema
-        .as_ref()
-        .map_or_else(|| "public".to_string(), |ident| ident.name.clone());
-    let mut scan = Scan::new(
-        datasource,
-        schema_name,
-        table.name.name.clone(),
-        columns_for_table(select, key),
-    );
-    // Every table carries an alias - its explicit alias, else its own name (ports
-    // Python `_extract_table_alias` -> `alias_or_name`). This is the invariant the
-    // rest of the engine relies on: a column bound to an unaliased table qualifies
-    // to the table name, and the physical column_aliases map is keyed on the alias,
-    // so an absent alias makes those columns unresolvable (they vanish from join
-    // outputs - the q18 bug). Never leave a scan unaliased.
-    scan.alias = Some(
-        table
-            .alias
+impl Converter<'_> {
+    /// Assemble a `Scan` for one table. The scan over-collects a SUPERSET of the
+    /// columns it will need; the binder validates and projection pushdown trims to
+    /// the exact required set (via the exhaustive `fq_plan` walker). The superset is
+    /// the table's FULL catalog column list when the table is known, because
+    /// polyglot's `get_columns` reference analysis UNDER-collects - it does not
+    /// descend into typed-function arguments (SUM/SUBSTRING/EXTRACT/...), so a
+    /// column referenced only inside such a call would be dropped and a scan feeding
+    /// a merge-engine aggregate/projection could omit it (the q18/q22 class). Falls
+    /// back to reference analysis when the table is not in the catalog (a
+    /// catalog-free parse).
+    fn scan_from_table(&self, select: &Select, table: &TableRef, key: &str) -> Scan {
+        let datasource = table
+            .catalog
             .as_ref()
-            .map_or_else(|| table.name.name.clone(), |ident| ident.name.clone()),
-    );
-    scan
+            .map_or_else(String::new, |ident| ident.name.clone());
+        let schema_name = table
+            .schema
+            .as_ref()
+            .map_or_else(|| "public".to_string(), |ident| ident.name.clone());
+        let columns = self
+            .catalog
+            .resolve_table_columns(
+                table.catalog.as_ref().map(|ident| ident.name.as_str()),
+                table.schema.as_ref().map(|ident| ident.name.as_str()),
+                &table.name.name,
+            )
+            .filter(|cols| !cols.is_empty())
+            .unwrap_or_else(|| columns_for_table(select, key));
+        let mut scan = Scan::new(datasource, schema_name, table.name.name.clone(), columns);
+        // Every table carries an alias - its explicit alias, else its own name (ports
+        // Python `_extract_table_alias` -> `alias_or_name`). This is the invariant the
+        // rest of the engine relies on: a column bound to an unaliased table qualifies
+        // to the table name, and the physical column_aliases map is keyed on the alias,
+        // so an absent alias makes those columns unresolvable (they vanish from join
+        // outputs - the q18 bug). Never leave a scan unaliased.
+        scan.alias = Some(
+            table
+                .alias
+                .as_ref()
+                .map_or_else(|| table.name.name.clone(), |ident| ident.name.clone()),
+        );
+        scan
+    }
 }
 
 /// Every root expression that may reference columns.
