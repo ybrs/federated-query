@@ -672,7 +672,18 @@ fn scan_from_table(select: &Select, table: &TableRef, key: &str) -> Scan {
         table.name.name.clone(),
         columns_for_table(select, key),
     );
-    scan.alias = table.alias.as_ref().map(|ident| ident.name.clone());
+    // Every table carries an alias - its explicit alias, else its own name (ports
+    // Python `_extract_table_alias` -> `alias_or_name`). This is the invariant the
+    // rest of the engine relies on: a column bound to an unaliased table qualifies
+    // to the table name, and the physical column_aliases map is keyed on the alias,
+    // so an absent alias makes those columns unresolvable (they vanish from join
+    // outputs - the q18 bug). Never leave a scan unaliased.
+    scan.alias = Some(
+        table
+            .alias
+            .as_ref()
+            .map_or_else(|| table.name.name.clone(), |ident| ident.name.clone()),
+    );
     scan
 }
 
