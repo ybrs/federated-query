@@ -117,6 +117,13 @@ pub enum EstimateError {
     #[error(transparent)]
     Catalog(#[from] fq_catalog::CatalogError),
 
+    /// The scan probe `scan_planner_estimate` renders could not be emitted
+    /// (an expression shape the emitter refuses). Propagated, never laundered
+    /// into a silent None - an unrenderable probe usually means a malformed
+    /// scan filter, which would mis-cost far more than this one estimate.
+    #[error(transparent)]
+    Emit(#[from] fq_emit::EmitError),
+
     /// A failure talking to the learned-stats catalog.
     #[error(transparent)]
     Stats(#[from] fq_catalog::StatsError),

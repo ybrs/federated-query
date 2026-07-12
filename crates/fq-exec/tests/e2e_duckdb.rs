@@ -130,9 +130,8 @@ fn runs_projection_filter_limit_and_group_by_on_real_duckdb() {
     );
 
     // Projection + filter + limit: exactly the three lowest regions, in order.
-    let (_schema, batches, _observations) =
-        execute_plan(&plan_projection).expect("execute projection");
-    let rows = int_string_rows(&batches);
+    let execution = execute_plan(&plan_projection).expect("execute projection");
+    let rows = int_string_rows(&execution.batches);
     assert_eq!(
         rows,
         vec![
@@ -144,8 +143,8 @@ fn runs_projection_filter_limit_and_group_by_on_real_duckdb() {
     );
 
     // GROUP BY: five regions, five nations each (standard TPC-H distribution).
-    let (_schema, batches, _observations) = execute_plan(&plan_group_by).expect("execute group by");
-    let rows = int_count_rows(&batches);
+    let execution = execute_plan(&plan_group_by).expect("execute group by");
+    let rows = int_count_rows(&execution.batches);
     assert_eq!(
         rows,
         vec![(0, 5), (1, 5), (2, 5), (3, 5), (4, 5)],

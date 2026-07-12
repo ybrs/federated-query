@@ -26,21 +26,35 @@ use crate::core::ir;
 use crate::engine::execute;
 use crate::error::{ExecError, ExecResult};
 
-/// The engine's full result: the Arrow schema, its batches, and the per-step
-/// `(binding, measured-rows)` observation stream the learned-stats write path reads.
-type ExecOutput = (SchemaRef, Vec<RecordBatch>, Vec<(String, usize)>);
+/// The engine's full result: the Arrow schema and batches, the per-step
+/// `(binding, measured-rows)` stream, and the provenance mapping each binding to
+/// what its measurement MEANS for the learned-stats catalog (the write path the
+/// runtime persists after the result is materialized).
+pub struct PlanExecution {
+    pub schema: SchemaRef,
+    pub batches: Vec<RecordBatch>,
+    pub measurements: Vec<(String, usize)>,
+    pub observations: BTreeMap<String, steps::Observation>,
+}
 
 /// Plan a physical tree into steps, lower them to `core::ir`, and run the engine.
 /// The whole Rust pipeline (parse -> ... -> plan feeds this) terminates here in an
-/// Arrow result plus the per-step measured-row observations.
-pub fn execute_plan(plan: &PhysicalPlan) -> ExecResult<ExecOutput> {
-    let built = build_steps(plan).map_err(|error| ExecError::runtime(error.to_string()))?;
+/// Arrow result plus the per-step measured-row observations and their provenance.
+pub fn execute_plan(plan: &PhysicalPlan) -> ExecResult<PlanExecution> {
+    let mut built = build_steps(plan).map_err(|error| ExecError::runtime(error.to_string()))?;
+    let observations = std::mem::take(&mut built.observations);
     // The result column names come from the plan root (the top projection/scan
     // output). The engine returns the final binding's schema; these names are the
     // user-visible ordering the runtime layer renames onto it.
     let outputs = output_column_names(plan);
     let ir = to_ir(built, outputs)?;
-    execute(&ir)
+    let (schema, batches, measurements) = execute(&ir)?;
+    Ok(PlanExecution {
+        schema,
+        batches,
+        measurements,
+        observations,
+    })
 }
 
 /// Convert a `BuiltSteps` bundle (plus the plan's output column names) into the

@@ -22,12 +22,13 @@ use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
 use serde_yaml::Value;
 
-use fq_catalog::Catalog;
+use fq_catalog::{Catalog, StatsCatalog};
 use fq_common::{Config, DataSourceConfig, PlanBudget};
 use fq_connectors::{DuckDbSource, PostgresSource};
 use fq_exec::{connectors, execute_plan};
 use fq_optimize::{build_optimizer, CostModel, StatisticsCollector};
 use fq_parse::parse_with_catalog;
+use fq_physical::steps::Observation;
 use fq_physical::PhysicalPlanner;
 use fq_plan::logical::LogicalPlan;
 use fq_plan::output_column_names;
@@ -42,6 +43,12 @@ pub use error::RuntimeError;
 pub struct Runtime {
     catalog: Arc<Catalog>,
     config: Config,
+    /// ONE statistics collector for the whole session: its caches (source
+    /// stats, planner estimates) persist across queries, and its learned
+    /// overlay reads the stats catalog this runtime also WRITES after every
+    /// execution. A per-query collector would re-fetch every statistic on
+    /// every plan.
+    stats: Arc<StatisticsCollector>,
 }
 
 impl Runtime {
@@ -58,9 +65,17 @@ impl Runtime {
             register_datasource(&mut catalog, datasource)?;
         }
         catalog.load_metadata()?;
+        let catalog = Arc::new(catalog);
+        let learned = open_stats_catalog(config)?;
+        let stats = Arc::new(StatisticsCollector::new(
+            Arc::clone(&catalog),
+            learned,
+            None,
+        ));
         Ok(Self {
-            catalog: Arc::new(catalog),
+            catalog,
             config: config.clone(),
+            stats,
         })
     }
 
@@ -73,8 +88,13 @@ impl Runtime {
         }
         let physical = self.plan(sql)?;
         let visible_names = output_column_names(&physical);
-        let (schema, batches, _observations) = execute_plan(&physical)?;
-        rename_result(&schema, batches, &visible_names)
+        let execution = execute_plan(&physical)?;
+        // The learned-stats WRITE path: each measured (binding, rows) whose
+        // binding carries provenance lands in the stats catalog, AFTER the
+        // result is materialized (off the query's critical path). The next
+        // query's plans read these instead of asking the source.
+        self.persist_observations(&execution.measurements, &execution.observations)?;
+        rename_result(&execution.schema, execution.batches, &visible_names)
     }
 
     /// Parse -> bind -> decorrelate -> optimize into an optimized logical plan,
@@ -87,7 +107,7 @@ impl Runtime {
         stages.finish("bind")?;
         let decorrelated = fq_decorrelate::decorrelate(bound)?;
         stages.finish("decorrelate")?;
-        let optimizer = build_optimizer(&self.config.optimizer, self.cost_model(stages.budget));
+        let optimizer = build_optimizer(&self.config.optimizer, self.cost_model());
         let optimized = optimizer.optimize(decorrelated)?;
         stages.finish("optimize")?;
         Ok(optimized)
@@ -101,12 +121,39 @@ impl Runtime {
     /// KILLED and reported, never silently paid per query.
     fn plan(&self, sql: &str) -> Result<PhysicalPlan, RuntimeError> {
         let mut stages = StageLog::start(self.config.optimizer.planning_budget_ms);
+        // The SHARED collector carries this plan's budget so a statistics fetch
+        // that overruns it is killed at the fetch and named in the error.
+        self.stats.set_plan_budget(stages.budget);
         let optimized = self.optimize(sql, &mut stages)?;
-        let cost_model = Rc::new(RefCell::new(self.cost_model(stages.budget)));
+        let cost_model = Rc::new(RefCell::new(self.cost_model()));
         let mut planner = PhysicalPlanner::new(Arc::clone(&self.catalog), Some(cost_model));
         let physical = planner.plan(&optimized)?;
         stages.finish("physical")?;
         Ok(physical)
+    }
+
+    /// Write each measured (binding, rows) whose binding carries provenance into
+    /// the learned-stats catalog; a binding with no provenance (a merge fragment,
+    /// an unmapped step) is skipped. A no-op without a stats catalog.
+    fn persist_observations(
+        &self,
+        measurements: &[(String, usize)],
+        observations: &std::collections::BTreeMap<String, Observation>,
+    ) -> Result<(), RuntimeError> {
+        let Some(catalog) = self.stats.stats_catalog() else {
+            return Ok(());
+        };
+        for (binding, rows) in measurements {
+            if let Some(observation) = observations.get(binding) {
+                // A row count cannot exceed i64::MAX in practice; refuse to
+                // wrap rather than record a negative measurement.
+                let rows = i64::try_from(*rows).map_err(|_| {
+                    RuntimeError::ResultShape(format!("row count {rows} overflows"))
+                })?;
+                persist_one(catalog, observation, rows)?;
+            }
+        }
+        Ok(())
     }
 
     /// Plan the inner statement of an EXPLAIN and return its physical plan tree
@@ -125,16 +172,70 @@ impl Runtime {
         Ok((schema, vec![batch]))
     }
 
-    /// A fresh cost model wired to this session's catalog so cardinality and
-    /// join-order decisions read the sources' LIVE statistics (honest-unknown
-    /// defaults fill any gap; a suboptimal plan still returns correct rows).
-    /// Carries the pipeline's `PlanBudget` so a statistics fetch that pushes
-    /// planning over budget is killed at the fetch and named in the error.
-    fn cost_model(&self, budget: PlanBudget) -> CostModel {
-        let mut stats = StatisticsCollector::new(Arc::clone(&self.catalog), None, None);
-        stats.set_plan_budget(budget);
-        CostModel::new(self.config.cost.clone(), Some(stats))
+    /// A cost model over the SESSION's shared statistics collector: cardinality
+    /// and join-order decisions read cached/learned/EXPLAIN statistics
+    /// (honest-unknown defaults fill any gap; a suboptimal plan still returns
+    /// correct rows). The collector carries the active plan's budget, so a
+    /// statistics fetch that overruns it is killed at the fetch.
+    fn cost_model(&self) -> CostModel {
+        CostModel::with_shared_stats(self.config.cost.clone(), Some(Arc::clone(&self.stats)))
     }
+}
+
+/// Open the learned-stats catalog that lives NEXT TO the config file
+/// (`<config-stem>.stats.sqlite`, one catalog per configuration), or `None` for
+/// a programmatically built config with no source path.
+fn open_stats_catalog(config: &Config) -> Result<Option<Arc<StatsCatalog>>, RuntimeError> {
+    let Some(source_path) = config.source_path.as_deref() else {
+        return Ok(None);
+    };
+    let path = std::path::Path::new(source_path);
+    let stem = path
+        .file_stem()
+        .map_or_else(|| "fedq".to_string(), |s| s.to_string_lossy().to_string());
+    let stats_path = path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(stem + ".stats.sqlite");
+    let catalog = StatsCatalog::open(&stats_path.to_string_lossy())?;
+    Ok(Some(Arc::new(catalog)))
+}
+
+/// Dispatch one observation to its catalog table by provenance kind. The
+/// predicate arm reads the catalog's freshest base count so the stored
+/// selectivity is measurement-over-measurement; an unknown base stores the
+/// output alone.
+fn persist_one(
+    catalog: &StatsCatalog,
+    observation: &Observation,
+    rows: i64,
+) -> Result<(), RuntimeError> {
+    match observation {
+        Observation::TableRows {
+            datasource,
+            schema,
+            table,
+        } => catalog.record_table_rows(datasource, schema, table, rows)?,
+        Observation::ColumnNdv {
+            datasource,
+            schema,
+            table,
+            column,
+        } => catalog.record_column_ndv(datasource, schema, table, column, rows)?,
+        Observation::Group { subject, columns } => {
+            catalog.record_group(subject, columns, rows, None)?;
+        }
+        Observation::Predicate {
+            datasource,
+            schema,
+            table,
+            template,
+        } => {
+            let input_rows = catalog.table_rows(datasource, schema, table, None)?;
+            catalog.record_predicate(datasource, schema, table, template, input_rows, rows, "")?;
+        }
+    }
+    Ok(())
 }
 
 /// The per-stage planning wall-clock log backing the budget kill report. One

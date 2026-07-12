@@ -86,11 +86,31 @@ slow, and exactly how to re-run every measurement. All of it lives under
    comment now says UNBLOCKED-do-next; fq-bind's implemented HAVING hoist and
    fq-physical's landed orientation helpers un-deferred in their docs.
 
-ROOT CAUSE (A) - plan-time data scan - is STILL OPEN and is punch-list item 1:
-wire `scan_planner_estimate` (EXPLAIN row estimate via fq-emit rendering),
-persist the StatisticsCollector across queries on the Runtime, wire the
-StatsCatalog learned overlay + the discarded execute observations. Until then
-the budget guard makes the cost visible (KILLED at scale) instead of silent.
+ROOT CAUSE (A) - plan-time data scan - FIXED same day. Planning is now
+O(metadata), enforced AND implemented:
+
+- `DuckDbSource::get_table_statistics` is METADATA ONLY (duckdb_tables() row
+  count); the plan-time `approx_count_distinct` aggregate scan is DELETED.
+  DuckDB NDVs come from the learned overlay; filtered-row estimates from the
+  source planner.
+- `scan_planner_estimate` is WIRED: the scan (minus grouping) renders via
+  fq-emit in the source dialect, `DataSource::estimate_scan_rows` answers
+  (DuckDB EXPLAIN `~N rows` parse - new; pg EXPLAIN JSON - existing), memoized
+  per (datasource, rendered SQL). Consumed by the cost model's existing
+  learned-then-source fallback chain.
+- ONE StatisticsCollector per session on the Runtime (Arc + Mutex caches;
+  StatsCatalog is Sync via a Mutex'd connection), shared by the optimizer and
+  physical-planner cost models - stats fetch once per table per session, not
+  twice per query.
+- The learned loop is CLOSED: the Runtime opens `<config-stem>.stats.sqlite`
+  next to the config, the collector reads its overlay, and `execute` persists
+  the engine's measured observations (table rows / column NDV / group counts /
+  predicate outputs, provenance from build_steps) after each result.
+
+Measured (perf_compare sf1-stats-fix, duck): 22/22 ok, ZERO budget kills. NEW
+warm plan 1.2-11.4ms per query (OLD 3.8-25.9); cold totals NEW 3284.5ms vs OLD
+3430.2ms; warm totals 1135.7 vs 1091.7. The remaining warm-total tail is plan
+quality (q18 328ms cold), not planning cost.
 
 ### Headline findings (all measured, not guessed)
 
@@ -232,7 +252,7 @@ python run_federated_rust.py --scale-factor 1 --pg-database duckpoc_sf1 --warm-r
 
 ### BUG PUNCH-LIST (from the plan comparison, ranked)
 
-1. PLAN-TIME SCAN (perf, existential) - fix (A) above. This is the priority.
+1. PLAN-TIME SCAN - FIXED (see FIXES LANDED above).
 2. Same-source fact-fact join NOT pushed (TPC-H q03, q08): OLD pushes
    `orders JOIN lineitem` into DuckDB as one island; NEW pulls both facts to the
    coordinator (semi-join reduced) and joins in DataFusion. Plan-quality gap.

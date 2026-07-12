@@ -1799,6 +1799,7 @@ dependencies = [
  "fq-common",
  "fq-connectors",
  "fq-decorrelate",
+ "fq-emit",
  "fq-parse",
  "fq-plan",
  "serde_json",

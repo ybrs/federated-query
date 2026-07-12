@@ -96,17 +96,34 @@ fn test_metadata_native_types_map_to_engine_types() {
 }
 
 #[test]
-fn test_table_statistics_row_count_and_ndv() {
+fn test_table_statistics_are_metadata_only() {
+    // Planning never scans data: the row count is a duckdb_tables() catalog
+    // read, and NO per-column statistics are measured (NDV comes from the
+    // learned overlay; filtered-row estimates from EXPLAIN) - so requesting
+    // columns must NOT trigger an aggregate scan or return column stats.
     let source = seeded_source();
     let stats = source
         .get_table_statistics("main", "test_table", &["id".to_string()])
         .expect("stats")
         .expect("some");
     assert_eq!(stats.row_count, Some(3));
-    let id_stats = &stats.column_stats["id"];
-    // Three distinct ids, no nulls.
-    assert_eq!(id_stats.num_distinct, Some(3));
-    assert!((id_stats.null_fraction - 0.0).abs() < 1e-9);
+    assert!(stats.column_stats.is_empty());
+}
+
+#[test]
+fn test_estimate_scan_rows_parses_explain() {
+    // The source planner's estimate for a rendered scan comes from EXPLAIN's
+    // "~N rows" line - an O(1) catalog-statistics read, never an execution.
+    let source = seeded_source();
+    let estimate = source
+        .estimate_scan_rows("main", "test_table", "SELECT id FROM main.test_table")
+        .expect("estimate");
+    assert_eq!(estimate, Some(3));
+    // Unparseable probe SQL is an honest absence, not an error.
+    let absent = source
+        .estimate_scan_rows("main", "test_table", "SELECT nope FROM no_such_table")
+        .expect("absent");
+    assert_eq!(absent, None);
 }
 
 #[test]

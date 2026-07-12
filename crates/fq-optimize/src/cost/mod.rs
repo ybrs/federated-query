@@ -14,6 +14,7 @@ mod selectivity;
 pub use aggregate::group_subject;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use fq_common::CostConfig;
 use fq_plan::expr::{ColumnRef, Expr};
@@ -28,13 +29,20 @@ use crate::statistics::StatisticsCollector;
 /// catalog-derived estimates); `cte_bodies` is the per-walk CTE registry.
 pub struct CostModel {
     config: CostConfig,
-    stats: Option<StatisticsCollector>,
+    stats: Option<Arc<StatisticsCollector>>,
     cte_bodies: HashMap<String, LogicalPlan>,
 }
 
 impl CostModel {
     /// Build a cost model over an optional statistics collector.
     pub fn new(config: CostConfig, stats: Option<StatisticsCollector>) -> Self {
+        Self::with_shared_stats(config, stats.map(Arc::new))
+    }
+
+    /// Build a cost model over a SHARED statistics collector (the Runtime holds
+    /// one per session so caches persist across queries; a fresh collector per
+    /// query would re-fetch every statistic on every plan).
+    pub fn with_shared_stats(config: CostConfig, stats: Option<Arc<StatisticsCollector>>) -> Self {
         Self {
             config,
             stats,

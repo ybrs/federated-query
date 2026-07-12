@@ -148,7 +148,7 @@ pub fn group_key(columns: &[String]) -> String {
 
 /// A SQLite-backed store of learned cardinality observations for one config.
 pub struct StatsCatalog {
-    conn: Connection,
+    conn: std::sync::Mutex<Connection>,
     clock: Clock,
 }
 
@@ -161,7 +161,10 @@ impl StatsCatalog {
     /// Open the catalog with an injected clock (tests control freshness).
     pub fn open_with_clock(path: &str, clock: Clock) -> Result<Self, StatsError> {
         let conn = Connection::open(path)?;
-        let catalog = Self { conn, clock };
+        let catalog = Self {
+            conn: std::sync::Mutex::new(conn),
+            clock,
+        };
         catalog.tune()?;
         catalog.ensure_schema()?;
         Ok(catalog)
@@ -173,6 +176,8 @@ impl StatsCatalog {
     /// estimate next run. This is what lets stat collection be ALWAYS ON.
     fn tune(&self) -> Result<(), StatsError> {
         self.conn
+            .lock()
+            .expect("stats catalog lock poisoned")
             .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=OFF;")?;
         Ok(())
     }
@@ -180,7 +185,10 @@ impl StatsCatalog {
     /// Create every catalog table if absent (idempotent on every open).
     fn ensure_schema(&self) -> Result<(), StatsError> {
         for statement in SCHEMA {
-            self.conn.execute(statement, [])?;
+            self.conn
+                .lock()
+                .expect("stats catalog lock poisoned")
+                .execute(statement, [])?;
         }
         Ok(())
     }
@@ -245,10 +253,13 @@ impl StatsCatalog {
              DO UPDATE SET {field}=excluded.{field}, observed_at=excluded.observed_at, \
              observation_count=table_stats.observation_count+1"
         );
-        self.conn.execute(
-            &sql,
-            params![datasource, schema, table, column, value, (self.clock)()],
-        )?;
+        self.conn
+            .lock()
+            .expect("stats catalog lock poisoned")
+            .execute(
+                &sql,
+                params![datasource, schema, table, column, value, (self.clock)()],
+            )?;
         Ok(())
     }
 
@@ -264,8 +275,11 @@ impl StatsCatalog {
         param_bucket: &str,
     ) -> Result<(), StatsError> {
         let selectivity = selectivity(input_rows, output_rows);
-        self.conn.execute(
-            "INSERT INTO predicate_stats (datasource, schema_name, table_name, \
+        self.conn
+            .lock()
+            .expect("stats catalog lock poisoned")
+            .execute(
+                "INSERT INTO predicate_stats (datasource, schema_name, table_name, \
              predicate_template, param_bucket, measured_input_rows, \
              measured_output_rows, selectivity, observed_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
@@ -274,18 +288,18 @@ impl StatsCatalog {
              measured_output_rows=excluded.measured_output_rows, \
              selectivity=excluded.selectivity, observed_at=excluded.observed_at, \
              observation_count=predicate_stats.observation_count+1",
-            params![
-                datasource,
-                schema,
-                table,
-                template,
-                param_bucket,
-                input_rows,
-                output_rows,
-                selectivity,
-                (self.clock)()
-            ],
-        )?;
+                params![
+                    datasource,
+                    schema,
+                    table,
+                    template,
+                    param_bucket,
+                    input_rows,
+                    output_rows,
+                    selectivity,
+                    (self.clock)()
+                ],
+            )?;
         Ok(())
     }
 
@@ -298,22 +312,25 @@ impl StatsCatalog {
         group_count: i64,
         input_rows: Option<i64>,
     ) -> Result<(), StatsError> {
-        self.conn.execute(
-            "INSERT INTO group_stats (subject, group_key_set, measured_group_count, \
+        self.conn
+            .lock()
+            .expect("stats catalog lock poisoned")
+            .execute(
+                "INSERT INTO group_stats (subject, group_key_set, measured_group_count, \
              measured_input_rows, observed_at) VALUES (?1, ?2, ?3, ?4, ?5) \
              ON CONFLICT(subject, group_key_set) DO UPDATE SET \
              measured_group_count=excluded.measured_group_count, \
              measured_input_rows=excluded.measured_input_rows, \
              observed_at=excluded.observed_at, \
              observation_count=group_stats.observation_count+1",
-            params![
-                subject,
-                group_key(group_columns),
-                group_count,
-                input_rows,
-                (self.clock)()
-            ],
-        )?;
+                params![
+                    subject,
+                    group_key(group_columns),
+                    group_count,
+                    input_rows,
+                    (self.clock)()
+                ],
+            )?;
         Ok(())
     }
 
@@ -416,6 +433,8 @@ impl StatsCatalog {
     ) -> Result<Option<i64>, StatsError> {
         let count = self
             .conn
+            .lock()
+            .expect("stats catalog lock poisoned")
             .query_row(
                 "SELECT observation_count FROM table_stats WHERE \
                  datasource=?1 AND schema_name=?2 AND table_name=?3 AND column_name=?4",
@@ -440,6 +459,8 @@ impl StatsCatalog {
     {
         let row = self
             .conn
+            .lock()
+            .expect("stats catalog lock poisoned")
             .query_row(sql, params, |row| {
                 let value: Option<T> = row.get(0)?;
                 let observed_at: Option<String> = row.get(1)?;

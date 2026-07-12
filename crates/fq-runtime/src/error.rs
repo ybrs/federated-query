@@ -56,6 +56,12 @@ pub enum RuntimeError {
     #[error("execution error: {0}")]
     Exec(#[from] ExecError),
 
+    /// A learned-stats catalog failure (opening the sqlite next to the config,
+    /// or persisting an execution's observations). Never swallowed: a broken
+    /// write path would silently starve every future plan of measurements.
+    #[error("stats catalog error: {0}")]
+    Stats(#[from] fq_catalog::StatsError),
+
     /// Planning blew its wall-clock budget (`optimizer.planning_budget_ms`).
     /// Planning is O(metadata) by design; the message reports every completed
     /// stage's timing so the offender is visible. Deep kills inside statistics

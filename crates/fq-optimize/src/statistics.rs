@@ -5,19 +5,20 @@
 //! HONEST UNKNOWNS: a `None` returned by the source/catalog is the honest-unknown
 //! path; a driver `Err` PROPAGATES (fail loud) rather than being mapped to None.
 //!
-//! INTERIOR MUTABILITY: the per-column and planner caches are pure memoization,
-//! so they live behind `RefCell`, letting every query method take `&self`. That
-//! keeps the cost model's read helpers (`column_ndv`, ...) `&self` while still
-//! caching. This is not "immutability" - it is a cache detail kept off the public
-//! signature.
+//! INTERIOR MUTABILITY: the per-column and planner caches are pure memoization
+//! behind `Mutex`es, letting every query method take `&self` AND letting one
+//! collector be shared across queries via `Arc` (the Runtime holds it for the
+//! whole session - a per-query collector would re-fetch every statistic on
+//! every plan). This is not "immutability" - a cache detail kept off the public
+//! signature; the locks are uncontended (planning is single-threaded).
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use fq_catalog::datasource::{ColumnStatistics, DataSource, TableStatistics};
+use fq_catalog::datasource::{ColumnStatistics, DataSource, RenderDialect, TableStatistics};
 use fq_catalog::Catalog;
 use fq_common::PlanBudget;
+use fq_emit::{quote_ident, render_canonical, to_source_sql, Dialect};
 use fq_plan::logical::Scan;
 
 use crate::error::{EstimateError, Result};
@@ -59,12 +60,11 @@ pub struct StatisticsCollector {
     /// every SOURCE fetch, so a plan-time data scan is killed at the fetch that
     /// broke the budget and named in the error, not discovered later at a stage
     /// boundary. `None` only for collectors outside a planning pipeline (tests).
-    plan_budget: Option<PlanBudget>,
-    cache: RefCell<HashMap<(String, String, String), TableStatsEntry>>,
-    // Source-planner (EXPLAIN) estimates keyed by (datasource, rendered SQL).
-    // Empty while `scan_planner_estimate` abstains (see that method).
-    #[allow(dead_code)]
-    planner_estimates: RefCell<HashMap<(String, String), Option<i64>>>,
+    plan_budget: Mutex<Option<PlanBudget>>,
+    cache: Mutex<HashMap<(String, String, String), TableStatsEntry>>,
+    // Source-planner (EXPLAIN) estimates keyed by (datasource, rendered SQL),
+    // memoized by `scan_planner_estimate`.
+    planner_estimates: Mutex<HashMap<(String, String), Option<i64>>>,
 }
 
 impl StatisticsCollector {
@@ -80,9 +80,9 @@ impl StatisticsCollector {
             catalog,
             stats_catalog,
             learned_ttl_seconds,
-            plan_budget: None,
-            cache: RefCell::new(HashMap::new()),
-            planner_estimates: RefCell::new(HashMap::new()),
+            plan_budget: Mutex::new(None),
+            cache: Mutex::new(HashMap::new()),
+            planner_estimates: Mutex::new(HashMap::new()),
         }
     }
 
@@ -98,14 +98,14 @@ impl StatisticsCollector {
 
     /// Attach the pipeline's planning budget so source fetches are killed the
     /// moment they push planning past it.
-    pub fn set_plan_budget(&mut self, budget: PlanBudget) {
-        self.plan_budget = Some(budget);
+    pub fn set_plan_budget(&self, budget: PlanBudget) {
+        *self.plan_budget.lock().expect("budget lock poisoned") = Some(budget);
     }
 
     /// Raise `PlanBudget` when the shared planning clock has run out, naming
     /// the fetch (`context`) the collector was working on.
     fn check_plan_budget(&self, datasource: &str, schema: &str, table: &str) -> Result<()> {
-        let Some(budget) = self.plan_budget else {
+        let Some(budget) = *self.plan_budget.lock().expect("budget lock poisoned") else {
             return Ok(());
         };
         if !budget.exceeded() {
@@ -168,13 +168,18 @@ impl StatisticsCollector {
             table.to_string(),
         );
         let missing = self.missing_columns(&key, columns);
-        let has_entry = self.cache.borrow().contains_key(&key);
+        let has_entry = self
+            .cache
+            .lock()
+            .expect("stats cache lock poisoned")
+            .contains_key(&key);
         if has_entry && missing.is_empty() {
             // An entry exists and covers every requested column (or nothing was
             // requested): return its snapshot without a round trip.
             return Ok(self
                 .cache
-                .borrow()
+                .lock()
+                .expect("stats cache lock poisoned")
                 .get(&key)
                 .map(TableStatsEntry::merged_view));
         }
@@ -189,7 +194,8 @@ impl StatisticsCollector {
             // Source has nothing new; return the existing entry unchanged.
             return Ok(self
                 .cache
-                .borrow()
+                .lock()
+                .expect("stats cache lock poisoned")
                 .get(&key)
                 .map(TableStatsEntry::merged_view));
         };
@@ -199,7 +205,7 @@ impl StatisticsCollector {
     /// The requested columns the entry has not attempted yet (all of them when no
     /// entry), preserving the caller's order.
     fn missing_columns(&self, key: &(String, String, String), columns: &[String]) -> Vec<String> {
-        let cache = self.cache.borrow();
+        let cache = self.cache.lock().expect("stats cache lock poisoned");
         let entry = cache.get(key);
         let mut missing = Vec::new();
         for column in columns {
@@ -218,7 +224,7 @@ impl StatisticsCollector {
         fetched: TableStatistics,
         missing: &[String],
     ) -> TableStatistics {
-        let mut cache = self.cache.borrow_mut();
+        let mut cache = self.cache.lock().expect("stats cache lock poisoned");
         let entry = cache.entry(key).or_insert_with(|| TableStatsEntry {
             row_count: fetched.row_count,
             total_size_bytes: fetched.total_size_bytes,
@@ -264,30 +270,80 @@ impl StatisticsCollector {
         Ok(Some(merge_learned(source_stats, rows, &ndvs)))
     }
 
-    /// The SOURCE PLANNER's row estimate for a filtered logical scan, or `None`.
-    ///
-    /// Always abstains (`Ok(None)`): the EXPLAIN-estimate path (render the scan
-    /// minus grouping via fq-emit, call `DataSource::estimate_scan_rows` -
-    /// DuckDB EXPLAIN `~N rows` / pg EXPLAIN JSON - memoized in
-    /// `planner_estimates`) is not wired. While it abstains, the cost model
-    /// falls through to SOURCE statistics, whose DuckDB path is an
-    /// approx-aggregate DATA SCAN per plan - the planning budget kills that at
-    /// scale.
+    /// The SOURCE PLANNER's row estimate for a filtered logical scan, or `None`
+    /// (source offers none / kill switch off). Consulted by the cost model when
+    /// its own predicate pricing left gaps: the source prices the predicate from
+    /// ITS statistics (DuckDB EXPLAIN `~N rows`, pg EXPLAIN JSON) - an O(1)
+    /// catalog read at the source, NEVER an execution. Memoized per
+    /// (datasource, rendered SQL) for the collector's lifetime.
     pub fn scan_planner_estimate(&self, scan: &Scan) -> Result<Option<i64>> {
         if !ask_source_enabled() {
             return Ok(None);
         }
-        // An unknown datasource still RAISES (a typo would silently disable the
-        // probe for every query), even while the method abstains.
-        self.catalog
+        // An unknown datasource RAISES: a typo would silently disable the
+        // estimate for every query.
+        let source = self
+            .catalog
             .get_datasource(&scan.datasource)
             .ok_or_else(|| EstimateError::UnknownDatasource(scan.datasource.clone()))?;
-        Ok(None)
+        let sql = render_probe_scan(scan, source.render_dialect())?;
+        let key = (scan.datasource.clone(), sql.clone());
+        if let Some(cached) = self
+            .planner_estimates
+            .lock()
+            .expect("planner-estimate lock poisoned")
+            .get(&key)
+        {
+            return Ok(*cached);
+        }
+        let estimate = source.estimate_scan_rows(&scan.schema_name, &scan.table_name, &sql)?;
+        self.planner_estimates
+            .lock()
+            .expect("planner-estimate lock poisoned")
+            .insert(key, estimate);
+        Ok(estimate)
     }
 
     /// Drop every cached statistic (a fresh session's view).
     pub fn clear_cache(&self) {
-        self.cache.borrow_mut().clear();
+        self.cache
+            .lock()
+            .expect("stats cache lock poisoned")
+            .clear();
+    }
+}
+
+/// The scan rendered in the source dialect exactly as execution would render it
+/// (same emitter, same transpile boundary), minus any grouping: the estimate
+/// prices the FILTERED INPUT rows, which is what the group clamp consumes.
+fn render_probe_scan(scan: &Scan, dialect: RenderDialect) -> Result<String> {
+    let mut items = Vec::with_capacity(scan.columns.len());
+    for column in &scan.columns {
+        items.push(quote_ident(column));
+    }
+    let mut from_clause = format!(
+        "{}.{}",
+        quote_ident(&scan.schema_name),
+        quote_ident(&scan.table_name)
+    );
+    if let Some(alias) = scan.alias.as_deref() {
+        from_clause.push_str(" AS ");
+        from_clause.push_str(&quote_ident(alias));
+    }
+    let mut sql = format!("SELECT {} FROM {}", items.join(", "), from_clause);
+    if let Some(filters) = scan.filters.as_ref() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&render_canonical(filters)?);
+    }
+    Ok(to_source_sql(&sql, emit_dialect(dialect))?)
+}
+
+/// Map a source's declared render dialect onto the emitter's dialect enum.
+fn emit_dialect(dialect: RenderDialect) -> Dialect {
+    match dialect {
+        RenderDialect::Postgres => Dialect::Postgres,
+        RenderDialect::DuckDb => Dialect::DuckDb,
+        RenderDialect::ClickHouse => Dialect::ClickHouse,
     }
 }
 
@@ -490,7 +546,7 @@ mod tests {
     #[test]
     fn exhausted_plan_budget_kills_the_source_fetch_and_names_it() {
         let source = Arc::new(FakeSource::new(Some(100), &["a"]));
-        let mut collector = collector_with(source.clone());
+        let collector = collector_with(source.clone());
         // A zero budget is exceeded before the first fetch starts.
         collector.set_plan_budget(fq_common::PlanBudget::start(0));
         let error = collector
@@ -505,7 +561,7 @@ mod tests {
     #[test]
     fn a_generous_plan_budget_does_not_interfere() {
         let source = Arc::new(FakeSource::new(Some(100), &["a"]));
-        let mut collector = collector_with(source);
+        let collector = collector_with(source);
         collector.set_plan_budget(fq_common::PlanBudget::start(60_000));
         let stats = collector
             .get_table_statistics("duck", "main", "t", &["a".to_string()])
@@ -559,10 +615,29 @@ mod tests {
     }
 
     #[test]
-    fn scan_planner_estimate_abstains() {
+    fn scan_planner_estimate_abstains_when_the_source_offers_none() {
+        // FakeSource keeps the trait's default estimate (None): the collector
+        // must pass the absence through, never fabricate.
         let source = Arc::new(FakeSource::new(Some(100), &["a"]));
         let collector = collector_with(source);
         let scan = Scan::new("duck", "main", "t", vec!["a".to_string()]);
         assert_eq!(collector.scan_planner_estimate(&scan).unwrap(), None);
+    }
+
+    #[test]
+    fn scan_planner_estimate_reads_a_real_duckdb_explain() {
+        // End to end over a REAL source: the probe renders in the source
+        // dialect and the estimate comes from DuckDB's EXPLAIN - an O(1)
+        // catalog read, never a data scan or an execution.
+        let source = fq_connectors::DuckDbSource::open_in_memory("duck").unwrap();
+        source
+            .execute_batch("CREATE TABLE t (a INTEGER); INSERT INTO t SELECT * FROM range(100);")
+            .unwrap();
+        let mut catalog = Catalog::new();
+        catalog.register_datasource(Arc::new(source));
+        let collector = StatisticsCollector::new(Arc::new(catalog), None, None);
+        let scan = Scan::new("duck", "main", "t", vec!["a".to_string()]);
+        let estimate = collector.scan_planner_estimate(&scan).unwrap();
+        assert_eq!(estimate, Some(100));
     }
 }
