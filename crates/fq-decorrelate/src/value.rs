@@ -34,24 +34,14 @@ impl Decorrelator {
     }
 
     /// Rewrite sort keys; prune the helper columns added for subquery sort keys.
-    pub(crate) fn rewrite_sort(&mut self, node: Sort) -> Result<LogicalPlan> {
-        let Sort {
-            input,
-            sort_keys,
-            ascending,
-            nulls_order,
-        } = node;
-        let input_plan = self.rewrite_plan(*input)?;
-        let rebuilt = Sort {
-            input: Box::new(input_plan),
-            sort_keys,
-            ascending,
-            nulls_order,
-        };
-        if !any_has_subquery(&rebuilt.sort_keys) {
-            return Ok(LogicalPlan::Sort(rebuilt));
+    pub(crate) fn rewrite_sort(&mut self, mut node: Sort) -> Result<LogicalPlan> {
+        // In-place: only the (rewritten) input changed; sort keys and order flags
+        // are preserved by keeping the owned node.
+        node.input = Box::new(self.rewrite_plan(*node.input)?);
+        if !any_has_subquery(&node.sort_keys) {
+            return Ok(LogicalPlan::Sort(node));
         }
-        self.rewrite_sort_with_subqueries(rebuilt)
+        self.rewrite_sort_with_subqueries(node)
     }
 
     /// Join subquery sort-key values below the sort, then re-project.
@@ -73,60 +63,38 @@ impl Decorrelator {
     /// Plant sort-key subquery joins directly above the input, then prune.
     fn sort_subqueries_inline(
         &mut self,
-        node: Sort,
+        mut node: Sort,
         original_names: &[String],
     ) -> Result<LogicalPlan> {
-        let Sort {
-            input,
-            sort_keys,
-            ascending,
-            nulls_order,
-        } = node;
-        let (keys, plan) = self.rewrite_sort_keys(sort_keys, *input)?;
-        let sorted = LogicalPlan::Sort(Sort {
-            input: Box::new(plan),
-            sort_keys: keys,
-            ascending,
-            nulls_order,
-        });
-        Ok(prune_to_names(sorted, original_names))
+        // In-place: rewrite the sort keys (threading joins under the input), then set
+        // the two changed fields on the owned node; ascending/nulls_order preserved.
+        let (keys, plan) = self.rewrite_sort_keys(node.sort_keys, *node.input)?;
+        node.input = Box::new(plan);
+        node.sort_keys = keys;
+        Ok(prune_to_names(LogicalPlan::Sort(node), original_names))
     }
 
     /// Plant sort-key joins beneath the projection where the columns exist.
     fn sort_subqueries_below_projection(
         &mut self,
-        node: Sort,
+        mut node: Sort,
         original_names: &[String],
     ) -> Result<LogicalPlan> {
-        let Sort {
-            input,
-            sort_keys,
-            ascending,
-            nulls_order,
-        } = node;
-        let LogicalPlan::Projection(projection) = *input else {
+        let LogicalPlan::Projection(mut projection) = *node.input else {
             return Err(DecorrelationError::Invariant(
                 "sort-below-projection expected a projection input".to_string(),
             ));
         };
-        let Projection {
-            input: proj_input,
-            expressions,
-            aliases,
-            distinct,
-            distinct_on,
-        } = projection;
-        let rewritten = self.rewrite_plan(*proj_input)?;
-        let (keys, plan) = self.rewrite_sort_keys(sort_keys, rewritten)?;
-        let widened =
-            widen_projection_for_keys(expressions, aliases, distinct, distinct_on, plan, &keys);
-        let sorted = LogicalPlan::Sort(Sort {
-            input: Box::new(widened),
-            sort_keys: keys,
-            ascending,
-            nulls_order,
-        });
-        Ok(prune_to_names(sorted, original_names))
+        let rewritten = self.rewrite_plan(*projection.input)?;
+        let (keys, plan) = self.rewrite_sort_keys(node.sort_keys, rewritten)?;
+        // In-place: set the projection's (rewritten) input and widen it with the
+        // sort-key helper columns; distinct/distinct_on and the sort's order flags
+        // are preserved by keeping the owned nodes.
+        projection.input = Box::new(plan);
+        widen_projection_for_keys(&mut projection, &keys);
+        node.input = Box::new(LogicalPlan::Projection(projection));
+        node.sort_keys = keys;
+        Ok(prune_to_names(LogicalPlan::Sort(node), original_names))
     }
 
     /// Thread every sort key through the value rewrite, accumulating the plan.
@@ -223,6 +191,9 @@ impl Decorrelator {
         };
         // Uncorrelated -> ON TRUE; correlated -> ON the pulled condition.
         let condition = prepared.condition.unwrap_or_else(|| bool_literal(true));
+        // Fresh LEFT join wrapping the running plan and the prepared scalar side -
+        // there is no base join to copy from. Field list is the complete Join struct
+        // (no stamped estimates yet).
         let joined = LogicalPlan::Join(Join {
             left: Box::new(plan),
             right: Box::new(prepared.plan),
@@ -248,7 +219,12 @@ impl Decorrelator {
         let (right, condition, positive) = self.semi_anti_parts(expr)?;
         let flag_name = format!("{}_flag", self.next_prefix());
         let match_branch = flag_branch(
+            // The match (SEMI) and miss (ANTI) branches are two separate subtrees over
+            // the full left plan; the miss branch consumes the original below, so the
+            // match branch takes its own copy here.
             plan.clone(),
+            // The subquery right likewise feeds both branches; the match branch copies
+            // it here while the miss branch consumes the original below.
             right.clone(),
             condition.clone(),
             JoinType::Semi,
@@ -263,6 +239,8 @@ impl Decorrelator {
             !positive,
             &flag_name,
         )?;
+        // Fresh non-distinct union of the two flag branches - no base to copy from.
+        // Field list (inputs/distinct) is the complete Union struct.
         let union = LogicalPlan::Union(Union {
             inputs: vec![match_branch, miss_branch],
             distinct: false,
@@ -299,6 +277,8 @@ fn flag_branch(
     let mut aliases = names;
     expressions.push(bool_literal(flag_value));
     aliases.push(flag_name.to_string());
+    // Fresh join wrapping the branch's left plan and subquery right - no base to
+    // copy from. Field list is the complete Join struct (no stamped estimates yet).
     let joined = LogicalPlan::Join(Join {
         left: Box::new(plan),
         right: Box::new(right),
@@ -309,6 +289,8 @@ fn flag_branch(
         estimated_rows: None,
         estimate_defaults: None,
     });
+    // Fresh projection carrying the passthrough columns plus the literal flag - no
+    // base to copy from. Field list is the complete Projection struct.
     Ok(LogicalPlan::Projection(Projection {
         input: Box::new(joined),
         expressions,
@@ -406,28 +388,15 @@ fn relation_columns(qualifier: &str, names: &[String]) -> Vec<Expr> {
     columns
 }
 
-/// Re-project over `plan`, passing through the sort-key helper columns the
-/// projection did not already output so the ORDER BY above can still see them.
-fn widen_projection_for_keys(
-    mut expressions: Vec<Expr>,
-    mut aliases: Vec<String>,
-    distinct: bool,
-    distinct_on: Option<Vec<Expr>>,
-    plan: LogicalPlan,
-    keys: &[Expr],
-) -> LogicalPlan {
-    let existing: HashSet<String> = aliases.iter().cloned().collect();
+/// Widen a projection in place with the sort-key helper columns it did not already
+/// output, so the ORDER BY above can still see them. Mutates only `expressions` and
+/// `aliases`; every other field of the projection is left untouched.
+fn widen_projection_for_keys(projection: &mut Projection, keys: &[Expr]) {
+    let existing: HashSet<String> = projection.aliases.iter().cloned().collect();
     for name in sort_helper_columns(keys, &existing) {
-        expressions.push(unqualified_col(&name));
-        aliases.push(name);
+        projection.expressions.push(unqualified_col(&name));
+        projection.aliases.push(name);
     }
-    LogicalPlan::Projection(Projection {
-        input: Box::new(plan),
-        expressions,
-        aliases,
-        distinct,
-        distinct_on,
-    })
 }
 
 /// Names referenced by the sort keys that the projection does not already output.
@@ -450,6 +419,8 @@ fn prune_to_names(plan: LogicalPlan, names: &[String]) -> LogicalPlan {
     for name in names {
         expressions.push(unqualified_col(name));
     }
+    // Fresh projection re-exposing the requested output names, dropping the sort-key
+    // helper columns - no base to copy from. Field list is the complete Projection.
     LogicalPlan::Projection(Projection {
         input: Box::new(plan),
         expressions,

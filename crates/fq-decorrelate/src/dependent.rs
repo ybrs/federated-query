@@ -149,6 +149,8 @@ impl Decorrelator {
         } = shape;
         let dom_prefix = self.next_prefix();
         let dep_prefix = self.next_prefix();
+        // The outer plan is both the domain source and the join-back left side, so
+        // the domain gets its own clone (`join_back` below consumes the original).
         let (domain, dom_map) = build_domain(plan.clone(), &free_vars, &dom_prefix);
         let top_k = self.build_top_k_relation(
             &[value],
@@ -197,6 +199,8 @@ impl Decorrelator {
             dom_map,
             &win_prefix,
         );
+        // Fresh filter capping the ranked rows to the top-k per domain value - no
+        // base to copy from. Field list (input/predicate) is the complete Filter.
         let capped = LogicalPlan::Filter(Filter {
             input: Box::new(ranked),
             predicate: row_number_cap(&win_prefix, limit)?,
@@ -216,6 +220,8 @@ impl Decorrelator {
         let prefix = self.next_prefix();
         let value_name = format!("{prefix}_v0");
         let right = aliased(project_lateral_value(body, &value_name)?, &prefix);
+        // Fresh lateral join wrapping the outer plan and the per-outer-row body - no
+        // base to copy from. Field list (left/right/join_type) is complete.
         let joined = LogicalPlan::LateralJoin(LateralJoin {
             left: Box::new(plan),
             right: Box::new(right),
@@ -229,14 +235,11 @@ impl Decorrelator {
     /// user-written LATERAL binds as an ordinary `Join`), so there is no reachable
     /// body to unnest here; a `LateralJoin` the scalar fallback itself produced is
     /// already fully built and is never re-entered through this path.
-    pub(crate) fn rewrite_lateral_join(&mut self, node: LateralJoin) -> Result<LogicalPlan> {
-        let left = self.rewrite_plan(*node.left)?;
-        let right = self.rewrite_plan(*node.right)?;
-        Ok(LogicalPlan::LateralJoin(LateralJoin {
-            left: Box::new(left),
-            right: Box::new(right),
-            join_type: node.join_type,
-        }))
+    pub(crate) fn rewrite_lateral_join(&mut self, mut node: LateralJoin) -> Result<LogicalPlan> {
+        // In-place: recurse into both sides and keep the node; join_type preserved.
+        node.left = Box::new(self.rewrite_plan(*node.left)?);
+        node.right = Box::new(self.rewrite_plan(*node.right)?);
+        Ok(LogicalPlan::LateralJoin(node))
     }
 }
 
@@ -367,6 +370,8 @@ fn build_domain(plan: LogicalPlan, free_vars: &[ColumnRef], prefix: &str) -> (Lo
             ColumnRef::new(Some(prefix.to_string()), name, None),
         ));
     }
+    // Fresh DISTINCT projection of the outer free vars into the domain relation - no
+    // base to copy from. Field list is the complete Projection struct.
     let distinct = LogicalPlan::Projection(Projection {
         input: Box::new(plan),
         expressions: free_vars.iter().map(|c| Expr::Column(c.clone())).collect(),
@@ -404,6 +409,8 @@ fn build_dependent_relation(
         select_list.push(replace_outer_with_domain(output.clone(), dom_map));
     }
     output_names.extend(names.iter().cloned());
+    // Fresh aggregate reducing the domain join once per domain value - no base to
+    // copy from. Field list is the complete Aggregate struct.
     let aggregate = LogicalPlan::Aggregate(Aggregate {
         input: Box::new(dependent_input),
         group_by,
@@ -436,6 +443,8 @@ fn join_back(
     dep_prefix: &str,
 ) -> Result<LogicalPlan> {
     let condition = join_back_condition(free_vars, dom_map, dep_prefix)?;
+    // Fresh LEFT join-back of the reduced dependent relation onto the outer plan - no
+    // base to copy from. Field list is the complete Join struct (no estimates yet).
     Ok(LogicalPlan::Join(Join {
         left: Box::new(plan),
         right: Box::new(dependent),
@@ -507,6 +516,8 @@ fn project_join_values(
         expressions.push(replace_outer_with_domain(value.clone(), dom_map));
     }
     names.extend(value_names.iter().cloned());
+    // Fresh projection of (domain columns, output values) over the domain join - no
+    // base to copy from. Field list is the complete Projection struct.
     LogicalPlan::Projection(Projection {
         input: Box::new(joined),
         expressions,
@@ -536,6 +547,8 @@ fn rank_by_row_number(
     names.extend(value_names.iter().cloned());
     expressions.push(window);
     names.push(UNNEST_RANK.to_string());
+    // Fresh projection of (domain columns, values, ROW_NUMBER rank) - no base to
+    // copy from. Field list is the complete Projection struct.
     let projection = LogicalPlan::Projection(Projection {
         input: Box::new(joined),
         expressions,
@@ -549,6 +562,8 @@ fn rank_by_row_number(
 /// A `ROW_NUMBER()` window partitioned by the domain columns, ordered as the
 /// subquery asked (empty order when it had none).
 fn row_number_window(partition_by: Vec<Expr>, order: Option<&OrderSpec>) -> Expr {
+    // Fresh ROW_NUMBER() call built from scratch - no base to copy from. Field list
+    // is the complete FunctionCall variant.
     let row_number = Expr::FunctionCall {
         function_name: "ROW_NUMBER".to_string(),
         args: Vec::new(),
@@ -564,6 +579,8 @@ fn row_number_window(partition_by: Vec<Expr>, order: Option<&OrderSpec>) -> Expr
         }
         None => (Vec::new(), Vec::new(), Vec::new()),
     };
+    // Fresh window wrapping ROW_NUMBER() with the domain partition/order - no base to
+    // copy from. Field list is the complete Window variant.
     Expr::Window {
         function: Box::new(row_number),
         partition_by,
@@ -579,13 +596,16 @@ fn row_number_cap(win_prefix: &str, limit: u64) -> Result<Expr> {
     let bound = i64::try_from(limit).map_err(|_| {
         DecorrelationError::Unsupported("LIMIT exceeds the supported integer range".to_string())
     })?;
+    // Fresh integer literal for the row-number bound - no base to copy from. Field
+    // list (value/data_type) is the complete Literal variant.
+    let bound_literal = Expr::Literal {
+        value: LiteralValue::Integer(bound),
+        data_type: DataType::Integer,
+    };
     Ok(binary(
         BinaryOpType::Lte,
         qualified_col(win_prefix, UNNEST_RANK),
-        Expr::Literal {
-            value: LiteralValue::Integer(bound),
-            data_type: DataType::Integer,
-        },
+        bound_literal,
     ))
 }
 
@@ -607,6 +627,8 @@ fn project_domain_values(
         expressions.push(qualified_col(win_prefix, value_name));
         names.push(value_name.clone());
     }
+    // Fresh projection of (domain columns, values) dropping the rank - no base to
+    // copy from. Field list is the complete Projection struct.
     LogicalPlan::Projection(Projection {
         input: Box::new(capped),
         expressions,
@@ -685,6 +707,8 @@ fn replace_outer_with_domain(expr: Expr, dom_map: &DomMap) -> Expr {
 
 /// A plain INNER join over the two relations on `condition`.
 fn inner_join(left: LogicalPlan, right: LogicalPlan, condition: Expr) -> LogicalPlan {
+    // Fresh INNER join over two relations - no base to copy from. Field list is the
+    // complete Join struct (no stamped estimates yet).
     LogicalPlan::Join(Join {
         left: Box::new(left),
         right: Box::new(right),
@@ -700,6 +724,8 @@ fn inner_join(left: LogicalPlan, right: LogicalPlan, condition: Expr) -> Logical
 /// Wrap a relation under a boundary alias so its columns are addressable and
 /// qualified from the relation above.
 fn aliased(input: LogicalPlan, alias: &str) -> LogicalPlan {
+    // Fresh boundary alias wrapping a relation - no base to copy from. Field list
+    // (input/alias/column_names) is the complete SubqueryScan struct.
     LogicalPlan::SubqueryScan(SubqueryScan {
         input: Box::new(input),
         alias: alias.to_string(),

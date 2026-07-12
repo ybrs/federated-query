@@ -184,6 +184,9 @@ fn single(qualifier: String) -> HashSet<String> {
 
 /// The union of two qualifier sets.
 fn union_of(left: &HashSet<String>, right: &HashSet<String>) -> HashSet<String> {
+    // `left`/`right` are qualifier string SETS, not plan/expr subtrees: this clones
+    // a HashSet<String> (cheap, no allocator-heavy tree copy) to seed the union
+    // without mutating the caller's set.
     let mut set = left.clone();
     set.extend(right.iter().cloned());
     set

@@ -33,6 +33,8 @@ impl Decorrelator {
             plan = next;
             terms.push(term);
         }
+        // Fresh filter: the predicate is the OR of the per-disjunct flag terms over
+        // the join-threaded plan - no base to copy from. Field list is complete.
         Ok(LogicalPlan::Filter(fq_plan::logical::Filter {
             input: Box::new(plan),
             predicate: or_join(terms)?,
@@ -122,6 +124,9 @@ impl Decorrelator {
         let key_name = format!("{prefix}_k0");
         let mut branches = Vec::with_capacity(parts.len());
         for (_, right, key) in parts {
+            // Fresh projection of each disjunct's relation down to its single key
+            // column under a canonical name - no base to copy from. Field list is
+            // the complete Projection struct.
             branches.push(LogicalPlan::Projection(Projection {
                 input: Box::new(right),
                 expressions: vec![Expr::Column(key)],
@@ -136,6 +141,8 @@ impl Decorrelator {
             inputs: branches,
             distinct: false,
         });
+        // Fresh boundary alias wrapping the unioned key domains - no base to copy
+        // from. Field list is the complete SubqueryScan struct.
         let domain = LogicalPlan::SubqueryScan(SubqueryScan {
             input: Box::new(union),
             alias: prefix.clone(),
@@ -144,6 +151,8 @@ impl Decorrelator {
         // The domain key inherits the outer key's type: the equality's two sides
         // share it, and the outer side is bound.
         let key_type = outer_expr.get_type();
+        // Fresh equality built from the outer key and the domain key column - no
+        // base to copy from. Field list is the complete BinaryOp variant.
         let condition = Expr::BinaryOp {
             op: BinaryOpType::Eq,
             left: Box::new(outer_expr),
@@ -153,6 +162,8 @@ impl Decorrelator {
                 Some(key_type),
             ))),
         };
+        // Fresh SEMI join over the outer plan and the key domain - no base to copy
+        // from. Field list is the complete Join struct (no stamped estimates yet).
         LogicalPlan::Join(Join {
             left: Box::new(input_plan),
             right: Box::new(domain),

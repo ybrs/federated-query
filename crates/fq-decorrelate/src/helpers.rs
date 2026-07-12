@@ -20,6 +20,8 @@ use crate::error::DecorrelationError;
 /// shared by the match/violation/condition builders so no call site re-boxes the
 /// operands by hand.
 pub fn binary(op: BinaryOpType, left: Expr, right: Expr) -> Expr {
+    // Fresh node built from two operands passed in - there is no base node to copy
+    // from. Field list (op/left/right) is the complete BinaryOp variant.
     Expr::BinaryOp {
         op,
         left: Box::new(left),
@@ -44,6 +46,8 @@ pub fn unqualified_col(column: &str) -> Expr {
 
 /// A boolean literal expression (the constant-EXISTS residual).
 pub fn bool_literal(value: bool) -> Expr {
+    // Fresh node built from a bool constant - there is no base node to copy from.
+    // Field list (value/data_type) is the complete Literal variant.
     Expr::Literal {
         value: LiteralValue::Boolean(value),
         data_type: DataType::Boolean,
@@ -78,6 +82,8 @@ pub fn expression_has_subquery(expr: &Expr) -> bool {
 /// Build an `IS NULL` check over an operand. Ports `_is_null_check`'s construction
 /// site (the NULL-aware NOT IN / op ALL terms).
 pub fn null_check(operand: Expr) -> Expr {
+    // Fresh node wrapping an operand in IS NULL - there is no base node to copy
+    // from. Field list (op/operand) is the complete UnaryOp variant.
     Expr::UnaryOp {
         op: UnaryOpType::IsNull,
         operand: Box::new(operand),

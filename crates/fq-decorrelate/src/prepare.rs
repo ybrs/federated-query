@@ -81,6 +81,8 @@ impl<'a> SubqueryPreparer<'a> {
             // Uncorrelated EXISTS only asks whether any row exists, so the right
             // side is the subplan capped at one row with no correlation condition.
             let capped = PreparedSubquery {
+                // Fresh LIMIT 1 capping the uncorrelated existence subplan - no base
+                // to copy from. Field list (input/limit/offset) is the complete Limit.
                 plan: LogicalPlan::Limit(Limit {
                     input: Box::new(plan),
                     limit: Some(1),
@@ -122,6 +124,8 @@ impl<'a> SubqueryPreparer<'a> {
 
     /// Wrap a prepared subquery under its prefix alias as a derived relation.
     fn finalize(&self, mut prepared: PreparedSubquery) -> PreparedSubquery {
+        // Fresh boundary alias wrapping the prepared plan - no base to copy from.
+        // Field list (input/alias/column_names) is the complete SubqueryScan struct.
         prepared.plan = LogicalPlan::SubqueryScan(SubqueryScan {
             input: Box::new(prepared.plan),
             alias: self.prefix.clone(),
@@ -244,6 +248,8 @@ impl<'a> SubqueryPreparer<'a> {
         if kept.is_empty() {
             return Ok(stripped_input);
         }
+        // Fresh filter: the predicate is rebuilt from only the non-correlated kept
+        // conjuncts (no field survives a base). Field list is the complete Filter.
         Ok(LogicalPlan::Filter(Filter {
             input: Box::new(stripped_input),
             predicate: and_join(kept)?,
@@ -391,19 +397,17 @@ impl<'a> SubqueryPreparer<'a> {
     }
 
     /// Convert a correlated inner LIMIT into a pending per-key limit.
-    fn strip_limit(&mut self, node: Limit) -> Result<LogicalPlan> {
-        let (limit, offset) = (node.limit, node.offset);
+    fn strip_limit(&mut self, mut node: Limit) -> Result<LogicalPlan> {
         let before = self.pulled.len();
-        let stripped_input = self.strip(*node.input)?;
+        // In-place: set the stripped input on the owned node; limit/offset preserved.
+        node.input = Box::new(self.strip(*node.input)?);
         if self.pulled.len() == before {
-            return Ok(LogicalPlan::Limit(Limit {
-                input: Box::new(stripped_input),
-                limit,
-                offset,
-            }));
+            return Ok(LogicalPlan::Limit(node));
         }
-        self.record_limit(offset, limit)?;
-        Ok(stripped_input)
+        // A correlated LIMIT is pulled up as a per-key limit; the Limit node is
+        // dropped and its stripped input becomes the result.
+        self.record_limit(node.offset, node.limit)?;
+        Ok(*node.input)
     }
 
     /// Record a subquery-level LIMIT for later per-key placement.
@@ -449,6 +453,8 @@ impl<'a> SubqueryPreparer<'a> {
         }
         let mut non_keys = value_names.clone();
         let order = self.build_order(&mut expressions, &mut aliases, &mut non_keys);
+        // Fresh projection exposing the renamed correlation keys and value columns -
+        // no base to copy from. Field list is the complete Projection struct.
         let plan = LogicalPlan::Projection(Projection {
             input: Box::new(core),
             expressions,
@@ -796,6 +802,8 @@ impl SubqueryPreparer<'_> {
         replacement: Expr,
     ) -> PreparedScalar {
         PreparedScalar {
+            // Fresh boundary alias wrapping the guarded scalar side - no base to copy
+            // from. Field list (input/alias/column_names) is the complete SubqueryScan.
             plan: LogicalPlan::SubqueryScan(SubqueryScan {
                 input: Box::new(guarded),
                 alias: self.prefix.clone(),
@@ -821,6 +829,8 @@ fn guard_scalar(prepared: PreparedSubquery, needs_guard: bool) -> LogicalPlan {
             keys.push(unqualified_col(&name));
         }
     }
+    // Fresh cardinality guard wrapping the scalar side - no base to copy from. Field
+    // list (input/keys) is the complete SingleRowGuard struct.
     LogicalPlan::SingleRowGuard(SingleRowGuard {
         input: Box::new(prepared.plan),
         keys,
@@ -859,6 +869,8 @@ fn hoisted_value_refs(hoisted: &[(Expr, String)]) -> (Vec<Expr>, Vec<String>) {
 /// COALESCE(value_ref, 0): after a LEFT join an absent group reads NULL, and SQL
 /// COUNT must read as zero. Shared with the dependent-join (N-K) COUNT fix.
 pub(crate) fn coalesce_zero(value_ref: Expr) -> Expr {
+    // Fresh COALESCE(value, 0) call built from scratch - no base to copy from. Both
+    // the FunctionCall and its inner integer Literal are complete variant field lists.
     Expr::FunctionCall {
         function_name: "COALESCE".to_string(),
         args: vec![
@@ -948,6 +960,8 @@ fn add_group_key(group_by: &mut Vec<Expr>, key: &ColumnRef, had_group_by: bool) 
 /// A plain LIMIT, ordered when the subquery had ORDER BY ... LIMIT.
 fn unkeyed_limit(plan: LogicalPlan, order: Option<OrderSpec>, limit: u64) -> LogicalPlan {
     let plan = match order {
+        // Fresh sort from the captured ORDER BY parts - no base to copy from. Field
+        // list is the complete Sort struct.
         Some((keys, ascending, nulls)) => LogicalPlan::Sort(Sort {
             input: Box::new(plan),
             sort_keys: keys,
@@ -956,6 +970,8 @@ fn unkeyed_limit(plan: LogicalPlan, order: Option<OrderSpec>, limit: u64) -> Log
         }),
         None => plan,
     };
+    // Fresh LIMIT over the (optionally sorted) plan - no base to copy from. Field
+    // list (input/limit/offset) is the complete Limit struct.
     LogicalPlan::Limit(Limit {
         input: Box::new(plan),
         limit: Some(limit),
@@ -974,6 +990,8 @@ fn keyed_limit(
         Some((okeys, ascending, nulls)) => (Some(okeys), Some(ascending), nulls),
         None => (None, None, None),
     };
+    // Fresh per-key limit from the keys and captured ORDER BY - no base to copy
+    // from. Field list is the complete GroupedLimit struct.
     LogicalPlan::GroupedLimit(fq_plan::logical::GroupedLimit {
         input: Box::new(plan),
         keys,
@@ -1005,26 +1023,14 @@ fn contains_window(expr: &Expr) -> bool {
 
 /// Prepend the correlation keys to every window PARTITION BY in the tree.
 fn prepend_window_partitions(expr: Expr, keys: &[Expr]) -> Expr {
-    let rebuilt = expr.map_children(&mut |child| prepend_window_partitions(child, keys));
-    if let Expr::Window {
-        function,
-        partition_by,
-        order_keys,
-        order_ascending,
-        order_nulls,
-        frame,
-    } = rebuilt
-    {
+    let mut rebuilt = expr.map_children(&mut |child| prepend_window_partitions(child, keys));
+    // In-place: prepend the correlation keys to only the partition_by field, leaving
+    // the window function, order keys, and frame untouched (update!/..base cannot
+    // target an enum variant, so &mut on the field is the idiom).
+    if let Expr::Window { partition_by, .. } = &mut rebuilt {
         let mut new_partition = keys.to_vec();
-        new_partition.extend(partition_by);
-        return Expr::Window {
-            function,
-            partition_by: new_partition,
-            order_keys,
-            order_ascending,
-            order_nulls,
-            frame,
-        };
+        new_partition.extend(std::mem::take(partition_by));
+        *partition_by = new_partition;
     }
     rebuilt
 }

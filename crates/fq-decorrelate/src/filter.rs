@@ -16,13 +16,13 @@ impl Decorrelator {
     /// Rewrite a filter: joins for boolean subquery conjuncts. A HAVING (a filter
     /// over an aggregate) is re-projected back to the aggregate's columns; a WHERE
     /// filter is left as the join-threaded plan.
-    pub(crate) fn rewrite_filter(&mut self, node: Filter) -> Result<LogicalPlan> {
+    pub(crate) fn rewrite_filter(&mut self, mut node: Filter) -> Result<LogicalPlan> {
         let input_plan = self.rewrite_plan(*node.input)?;
         if !expression_has_subquery(&node.predicate) {
-            return Ok(LogicalPlan::Filter(Filter {
-                input: Box::new(input_plan),
-                predicate: node.predicate,
-            }));
+            // In-place: only the (rewritten) input changed; the predicate and every
+            // other field are preserved by keeping the owned node.
+            node.input = Box::new(input_plan);
+            return Ok(LogicalPlan::Filter(node));
         }
         let input_is_aggregate = matches!(input_plan, LogicalPlan::Aggregate(_));
         let original_schema = input_plan.schema();
@@ -66,6 +66,9 @@ impl Decorrelator {
         if kept.is_empty() {
             return Ok(plan);
         }
+        // Fresh residual filter: the predicate is rebuilt from the kept conjuncts
+        // (no field survives a base), over the join-threaded plan. Field list
+        // (input/predicate) is the complete Filter struct.
         Ok(LogicalPlan::Filter(Filter {
             input: Box::new(plan),
             predicate: and_join(kept)?,
@@ -93,6 +96,9 @@ impl Decorrelator {
             } else {
                 JoinType::Anti
             };
+            // Fresh SEMI/ANTI join wrapping the running plan and the decorrelated
+            // subquery side - there is no base join to copy from. Field list is the
+            // complete Join struct (no stamped estimates yet).
             let join = LogicalPlan::Join(Join {
                 left: Box::new(plan),
                 right: Box::new(right),
@@ -136,6 +142,8 @@ fn restore_filter_schema(plan: LogicalPlan, names: &[String]) -> LogicalPlan {
     for name in names {
         expressions.push(unqualified_col(name));
     }
+    // Fresh projection re-exposing the pre-join column names - there is no base
+    // projection to copy from. Field list is the complete Projection struct.
     LogicalPlan::Projection(Projection {
         input: Box::new(plan),
         expressions,

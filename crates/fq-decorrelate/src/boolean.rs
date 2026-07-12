@@ -86,6 +86,8 @@ impl Decorrelator {
             ));
         }
         let value_ref = qualified_col(&prepared.alias, &prepared.values[0]);
+        // `left` and `value_ref` each feed both the comparison and (for ALL) the
+        // violation term below, so the comparison gets its own copy of each.
         let comparison = binary(operator, left.clone(), value_ref.clone());
         match quantifier {
             Quantifier::Any | Quantifier::Some => {
@@ -156,6 +158,8 @@ fn match_term(outer_value: Expr, inner_ref: Expr, null_aware: bool) -> Expr {
 
 /// A row violating `x op ALL`: the comparison fails or is UNKNOWN.
 fn violation_term(comparison: Expr, left: Expr, value_ref: Expr) -> Expr {
+    // Fresh node wrapping the comparison in NOT - there is no base node to copy
+    // from. Field list (op/operand) is the complete UnaryOp variant.
     let negated = Expr::UnaryOp {
         op: UnaryOpType::Not,
         operand: Box::new(comparison),
@@ -176,19 +180,23 @@ fn combine_condition(comparisons: Vec<Expr>, correlation: Option<Expr>) -> Resul
 /// The logical negation of a boolean subquery predicate.
 fn negate_subquery_predicate(node: &Expr) -> Result<Expr> {
     match node {
-        Expr::Exists { subquery, negated } => Ok(Expr::Exists {
-            subquery: subquery.clone(),
-            negated: !negated,
-        }),
-        Expr::InSubquery {
-            value,
-            subquery,
-            negated,
-        } => Ok(Expr::InSubquery {
-            value: value.clone(),
-            subquery: subquery.clone(),
-            negated: !negated,
-        }),
+        Expr::Exists { .. } | Expr::InSubquery { .. } => {
+            // Clone-and-mutate: own a copy of the borrowed node and flip ONLY its
+            // `negated` flag, leaving the subquery (and IN value) untouched. update!/
+            // ..base cannot target an enum variant, so &mut on the clone is the idiom.
+            let mut negated_node = node.clone();
+            match &mut negated_node {
+                Expr::Exists { negated, .. } | Expr::InSubquery { negated, .. } => {
+                    *negated = !*negated;
+                }
+                _ => {
+                    return Err(DecorrelationError::Invariant(
+                        "negate_subquery_predicate matched a non-EXISTS/IN node".to_string(),
+                    ))
+                }
+            }
+            Ok(negated_node)
+        }
         Expr::QuantifiedComparison {
             operator,
             quantifier,
@@ -219,11 +227,17 @@ fn negate_quantified(
         Quantifier::Any | Quantifier::Some => Quantifier::All,
         Quantifier::All => Quantifier::Any,
     };
+    // De Morgan negation built from decomposed parts (no original node in scope):
+    // `left` is borrowed, so clone it into an owned child; `subquery` likewise.
+    let left = Box::new(left.clone());
+    let subquery = Box::new(subquery.clone());
+    // Fresh node: field list (operator/quantifier/left/subquery) is the complete
+    // QuantifiedComparison variant; there is no base to copy from.
     Ok(Expr::QuantifiedComparison {
         operator: negated_op,
         quantifier: flipped,
-        left: Box::new(left.clone()),
-        subquery: Box::new(subquery.clone()),
+        left,
+        subquery,
     })
 }
 

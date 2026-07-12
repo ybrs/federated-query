@@ -149,6 +149,8 @@ impl Decorrelator {
             plan = next;
             expressions.push(rewritten);
         }
+        // Fresh projection re-exposing the rewritten Values-row expressions under the
+        // original output names - no base to copy from. Field list is complete.
         Ok(LogicalPlan::Projection(Projection {
             input: Box::new(plan),
             expressions,
