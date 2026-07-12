@@ -60,6 +60,18 @@ Only ascii edits are allowed.
    after fq-emit landed, hiding an O(data) planning path). At every milestone
    close, grep the workspace for `deferred`/`TODO(` and re-adjudicate.
 
+5. ONE RUNNER PER BENCHMARK SUITE. Each benchmark directory has exactly ONE
+   runner script (tpcds: run_federated_rust.py; tpch: run_federated_rust.py;
+   cross-engine: perf_compare/compare.py). NEVER create a new benchmark/timing
+   script - extend the existing runner. Oracle/reference/baseline work is
+   measured ONCE per dataset by the suite's save-refs path and READ from the
+   references file at run time (oracle_timings table) - a runner that
+   re-measures a function of the data on every invocation is a bug (this
+   happened: a runner re-ran the DuckDB baseline 1+warm_runs times per query
+   per invocation; at SF10 that was minutes of re-measuring a constant).
+   Before running, a runner prints how many engine executions the invocation
+   will perform; expected wall times live in the suite README.
+
 Never fail silently. If something breaks it should throw an error. We don't want silent fails. You can only catch exceptions when we show it to the user in the cli. Otherwise all exceptions should be thrown. 
 
 ALL COLUMNS MUST BE QUALIFIED AFTER THE BINDER. Non-negotiable rule: once binding is done, every column reference (`ColumnRef`) flowing through the logical and physical plan MUST carry its relation qualifier (`table` set to the owning relation/alias). An unqualified column ref (`table` is None or empty) must NEVER pass through the plan after binding. This is not only the binder's job: any pass that MANUFACTURES columns (decorrelation's synthetic subquery outputs, optimizer-introduced projections, etc.) must qualify them to a real relation, exposing that relation under an alias if one does not already exist. Enforce it with a loud guard that walks the plan after binding/decorrelation and raises on any unqualified ref. Rationale: side-assignment, join-key orientation, and scope resolution all rely on the qualifier; an unqualified column silently defeats them and manufactures wrong or empty results.

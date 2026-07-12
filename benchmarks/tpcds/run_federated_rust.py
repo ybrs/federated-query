@@ -54,6 +54,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import fedq
 
+from run_federated import _oracle_ms
+
 from compare import compare_results
 from generate import (
     _db_path,
@@ -237,13 +239,14 @@ def _compared_result(name, engine_rows, truth_rows, decimals, cold_ms, warm_ms, 
     }
 
 
-def evaluate_query(runtime, duck_conn, refs, path, decimals, warm_runs):
-    """Run one query through the Rust engine and the pure-DuckDB baseline, time
-    both (cold-ish plus warm median), verify against the reference, classify it.
+def evaluate_query(runtime, refs, path, decimals, warm_runs):
+    """Run one query through the Rust engine, time it (cold-ish plus warm
+    median), verify against the reference, classify it.
 
-    The DuckDB baseline runs the ORIGINAL query text against the fact+dim file
-    with every table local, so its time is the single-source cost the federated
-    engine is measured against."""
+    The DuckDB baseline time is READ from the `oracle_timings` table the staged
+    reference build saved into the references db (run_federated.py --mode
+    save-refs measures every query ONCE per dataset) - the baseline is a
+    function of the data, never re-measured per run."""
     name = os.path.splitext(os.path.basename(path))[0]
     raw = _read_query(path)
     engine_sql = _qualify(raw, FEDQ_SOURCES, ENGINE_DIALECT)
@@ -257,12 +260,10 @@ def evaluate_query(runtime, duck_conn, refs, path, decimals, warm_runs):
         # BaseException (not Exception), so catch BaseException here to record a
         # panic as a per-query ERROR instead of aborting the whole run.
         return _error_result(name, error)
-    duck_cold_ms, duck_warm_ms, _rows = _median_ms(
-        lambda: duck_conn.execute(raw).fetchall(), warm_runs)
     truth_rows = _reference_rows(refs, name)
     return _compared_result(
         name, engine_rows, truth_rows, decimals, cold_ms, warm_ms,
-        _metric_ms(duck_cold_ms, duck_warm_ms))
+        _oracle_ms(refs, name))
 
 
 def _ms_text(value):
@@ -530,14 +531,16 @@ def _run_shared(options, paths):
     """
     config_path, db_path, database, adbc_driver = _build_context(options)
     runtime = fedq.Runtime(config_path)
-    duck_conn = duckdb.connect(db_path, read_only=True)
     refs = duckdb.connect(_refs_path(options.scale_factor), read_only=True)
     _print_header(db_path, database, adbc_driver)
+    print("[pg-dims] {0} queries x {1} engine run(s) each; baseline CACHED "
+          "(oracle_timings in the references db)".format(
+              len(paths), 1 + options.warm_runs))
     results = []
     started = time.perf_counter()
     for path in paths:
         result = evaluate_query(
-            runtime, duck_conn, refs, path, options.decimals, options.warm_runs)
+            runtime, refs, path, options.decimals, options.warm_runs)
         results.append(result)
         _print_result(result)
     return _finish(results, (time.perf_counter() - started) * 1000.0, options)
@@ -549,9 +552,8 @@ def _cold_worker(config_path, db_path, refs_path, path, decimals, warm_runs, res
     cold definition of benchmarks/perf_compare - no plan cache, pooled
     connection, or cached statistic can leak in from an earlier query."""
     runtime = fedq.Runtime(config_path)
-    duck_conn = duckdb.connect(db_path, read_only=True)
     refs = duckdb.connect(refs_path, read_only=True)
-    result = evaluate_query(runtime, duck_conn, refs, path, decimals, warm_runs)
+    result = evaluate_query(runtime, refs, path, decimals, warm_runs)
     result_queue.put(result)
 
 
