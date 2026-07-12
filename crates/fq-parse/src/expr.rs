@@ -29,6 +29,8 @@ impl Converter<'_> {
             ))),
             Expression::Literal(literal) => convert_literal(literal),
             Expression::Boolean(boolean) => Ok(bool_literal(boolean.value)),
+            // Fresh NULL literal built from the parsed AST - no base to copy from.
+            // Field list (value/data_type) is the complete Literal variant.
             Expression::Null(_) => Ok(Expr::Literal {
                 value: LiteralValue::Null,
                 data_type: fq_common::DataType::Null,
@@ -82,6 +84,8 @@ impl Converter<'_> {
 
     /// Build an engine binary op from operands.
     fn binary(&self, op: BinaryOpType, binary: &BinaryOp) -> Result<Expr, ParseError> {
+        // Fresh binary op built from the parsed operands - no base to copy from.
+        // Field list (op/left/right) is the complete BinaryOp variant.
         Ok(Expr::BinaryOp {
             op,
             left: Box::new(self.expr(&binary.left)?),
@@ -91,6 +95,8 @@ impl Converter<'_> {
 
     /// Build an engine unary op from an operand.
     fn unary(&self, op: UnaryOpType, operand: &Expression) -> Result<Expr, ParseError> {
+        // Fresh unary op built from the parsed operand - no base to copy from.
+        // Field list (op/operand) is the complete UnaryOp variant.
         Ok(Expr::UnaryOp {
             op,
             operand: Box::new(self.expr(operand)?),
@@ -114,6 +120,8 @@ impl Converter<'_> {
     /// Convert `CAST(x AS type)` (and `x::type`). The engine keeps the target type
     /// as SQL text so the cast re-renders verbatim to a source.
     fn convert_cast(&self, cast: &Cast) -> Result<Expr, ParseError> {
+        // Fresh cast built from the parsed CAST - no base to copy from. Field list
+        // (expr/target_type/data_type) is the complete Cast variant.
         Ok(Expr::Cast {
             expr: Box::new(self.expr(&cast.this)?),
             target_type: data_type_sql(&cast.to)?,
@@ -154,6 +162,8 @@ impl Converter<'_> {
             Some(else_expr) => Some(Box::new(self.expr(else_expr)?)),
             None => None,
         };
+        // Fresh CASE built from the parsed WHEN/ELSE branches - no base to copy from.
+        // Field list (when_clauses/else_result) is the complete Case variant.
         Ok(Expr::Case {
             when_clauses,
             else_result,
@@ -165,6 +175,8 @@ impl Converter<'_> {
         if between.symmetric == Some(true) {
             return Err(ParseError::Unsupported("BETWEEN SYMMETRIC".to_string()));
         }
+        // Fresh range test built from the parsed BETWEEN bounds - no base to copy
+        // from. Field list (value/lower/upper) is the complete Between variant.
         let range = Expr::Between {
             value: Box::new(self.expr(&between.this)?),
             lower: Box::new(self.expr(&between.low)?),
@@ -182,6 +194,8 @@ impl Converter<'_> {
         if like.quantifier.is_some() {
             return Err(ParseError::Unsupported("quantified LIKE".to_string()));
         }
+        // Fresh LIKE/ILIKE binary op built from the parsed operands - no base to copy
+        // from. Field list (op/left/right) is the complete BinaryOp variant.
         Ok(Expr::BinaryOp {
             op,
             left: Box::new(self.expr(&like.left)?),
@@ -193,6 +207,8 @@ impl Converter<'_> {
     fn convert_in(&self, in_expr: &In) -> Result<Expr, ParseError> {
         let value = self.expr(&in_expr.this)?;
         if let Some(query) = &in_expr.query {
+            // Fresh IN-subquery predicate built from the parsed value + subquery - no
+            // base to copy from. Field list (value/subquery/negated) is complete.
             return Ok(Expr::InSubquery {
                 value: Box::new(value),
                 subquery: Box::new(self.query(query)?),
@@ -208,6 +224,8 @@ impl Converter<'_> {
         for option in &in_expr.expressions {
             options.push(self.expr(option)?);
         }
+        // Fresh IN-list predicate built from the parsed value + option list - no base
+        // to copy from. Field list (value/options) is the complete InList variant.
         let list = Expr::InList {
             value: Box::new(value),
             options,
@@ -220,6 +238,8 @@ impl Converter<'_> {
         &self,
         exists: &polyglot_sql::expressions::Exists,
     ) -> Result<Expr, ParseError> {
+        // Fresh EXISTS predicate built from the parsed subquery - no base to copy
+        // from. Field list (subquery/negated) is the complete Exists variant.
         Ok(Expr::Exists {
             subquery: Box::new(self.query(&exists.this)?),
             negated: exists.not,
@@ -231,6 +251,8 @@ impl Converter<'_> {
         &self,
         subquery: &polyglot_sql::expressions::Subquery,
     ) -> Result<Expr, ParseError> {
+        // Fresh scalar-subquery expression built from the parsed subquery - no base
+        // to copy from. Field list (subquery) is the complete Subquery variant.
         Ok(Expr::Subquery {
             subquery: Box::new(self.query(&subquery.this)?),
         })
@@ -246,6 +268,8 @@ impl Converter<'_> {
             quantified.op.as_ref().map(quantified_op).ok_or_else(|| {
                 ParseError::Unsupported("quantified comparison operator".to_string())
             })?;
+        // Fresh quantified comparison built from the parsed ANY/ALL - no base to copy
+        // from. Field list (operator/quantifier/left/subquery) is complete.
         Ok(Expr::QuantifiedComparison {
             operator,
             quantifier,
@@ -260,6 +284,9 @@ impl Converter<'_> {
             Some(inner) => vec![self.expr(inner)?],
             None => Vec::new(),
         };
+        // Fresh COUNT call built from the parsed COUNT(*)/COUNT(expr) - no base to
+        // copy from. Field list (function_name/args/is_aggregate/distinct/
+        // within_group_key/within_group_desc) is the complete FunctionCall variant.
         Ok(Expr::FunctionCall {
             function_name: "COUNT".to_string(),
             args,
@@ -272,6 +299,9 @@ impl Converter<'_> {
 
     /// Convert SUM/AVG/MIN/MAX(expr).
     fn convert_aggregate(&self, name: &str, agg: &AggFunc) -> Result<Expr, ParseError> {
+        // Fresh SUM/AVG/MIN/MAX call built from the parsed aggregate - no base to copy
+        // from. Field list (function_name/args/is_aggregate/distinct/within_group_key/
+        // within_group_desc) is the complete FunctionCall variant.
         Ok(Expr::FunctionCall {
             function_name: name.to_string(),
             args: vec![self.expr(&agg.this)?],
@@ -305,6 +335,9 @@ impl Converter<'_> {
 
 /// Build a scalar function-call expression from a name and converted args.
 pub(crate) fn scalar_function_call(name: String, args: Vec<Expr>) -> Expr {
+    // Fresh scalar function call built from a name + converted args - no base to copy
+    // from. Field list (function_name/args/is_aggregate/distinct/within_group_key/
+    // within_group_desc) is the complete FunctionCall variant.
     Expr::FunctionCall {
         function_name: name,
         args,
@@ -325,6 +358,8 @@ fn expr_has_function_call(expr: &Expr) -> bool {
 /// Wrap an expression in NOT when `negate` is set.
 fn negate_if(negate: bool, expr: Expr) -> Expr {
     if negate {
+        // Fresh NOT wrapper around the built expression - no base to copy from.
+        // Field list (op/operand) is the complete UnaryOp variant.
         Expr::UnaryOp {
             op: UnaryOpType::Not,
             operand: Box::new(expr),
@@ -336,6 +371,8 @@ fn negate_if(negate: bool, expr: Expr) -> Expr {
 
 /// A boolean literal expression.
 fn bool_literal(value: bool) -> Expr {
+    // Fresh boolean literal built from a bool constant - no base to copy from.
+    // Field list (value/data_type) is the complete Literal variant.
     Expr::Literal {
         value: LiteralValue::Boolean(value),
         data_type: fq_common::DataType::Boolean,
@@ -344,6 +381,8 @@ fn bool_literal(value: bool) -> Expr {
 
 /// The searched-form condition for one simple-CASE branch: `operand = value`.
 fn searched_condition(operand: Expr, value: Expr) -> Expr {
+    // Fresh equality lowering one simple-CASE branch to searched form - no base to
+    // copy from. Field list (op/left/right) is the complete BinaryOp variant.
     Expr::BinaryOp {
         op: BinaryOpType::Eq,
         left: Box::new(operand),
@@ -413,6 +452,8 @@ fn quantified_op(op: &polyglot_sql::expressions::QuantifiedOp) -> BinaryOpType {
 fn convert_literal(literal: &Literal) -> Result<Expr, ParseError> {
     match literal {
         Literal::Number(text) => convert_number(text),
+        // Fresh string literal built from the parsed token - no base to copy from.
+        // Field list (value/data_type) is the complete Literal variant.
         Literal::String(text) => Ok(Expr::Literal {
             value: LiteralValue::String(text.clone()),
             data_type: fq_common::DataType::Varchar,
@@ -425,6 +466,8 @@ fn convert_literal(literal: &Literal) -> Result<Expr, ParseError> {
 /// token that parses as neither raises rather than becoming a silent NaN.
 fn convert_number(text: &str) -> Result<Expr, ParseError> {
     if let Ok(integer) = text.parse::<i64>() {
+        // Fresh integer literal built from the parsed numeric token - no base to copy
+        // from. Field list (value/data_type) is the complete Literal variant.
         return Ok(Expr::Literal {
             value: LiteralValue::Integer(integer),
             data_type: fq_common::DataType::Integer,
@@ -433,6 +476,8 @@ fn convert_number(text: &str) -> Result<Expr, ParseError> {
     let value = text
         .parse::<f64>()
         .map_err(|_| ParseError::Unsupported(format!("numeric literal '{text}'")))?;
+    // Fresh float literal built from the parsed numeric token - no base to copy from.
+    // Field list (value/data_type) is the complete Literal variant.
     Ok(Expr::Literal {
         value: LiteralValue::Float(value),
         data_type: fq_common::DataType::Double,

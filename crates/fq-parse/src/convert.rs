@@ -97,6 +97,9 @@ impl<'a> Converter<'a> {
         kind: SetOpKind,
         distinct: bool,
     ) -> Result<LogicalPlan, ParseError> {
+        // Fresh set-operation node built from the parsed UNION/INTERSECT/EXCEPT - no
+        // base to copy from. Field list (left/right/kind/distinct) is the complete
+        // SetOperation struct.
         Ok(LogicalPlan::SetOperation(SetOperation {
             left: Box::new(self.query(left)?),
             right: Box::new(self.query(right)?),
@@ -130,6 +133,8 @@ impl<'a> Converter<'a> {
                 .map(|ident| ident.name.clone())
                 .collect()
         };
+        // Fresh VALUES node built from the parsed constant rows - no base to copy
+        // from. Field list (rows/output_names) is the complete Values struct.
         Ok(LogicalPlan::Values(Values { rows, output_names }))
     }
 
@@ -172,21 +177,21 @@ impl<'a> Converter<'a> {
             definitions.push((name, body, cte.columns.is_empty(), columns));
         }
         let mut plan = self.select_body(select)?;
-        for (name, body, inferred, columns) in definitions.iter().rev() {
+        // Consume the definitions in reverse (first CTE outermost) so each body plan
+        // is MOVED into its Cte node - no clone of a subtree. The scope entry is
+        // dropped here too: every body plan is already built, so it is no longer read.
+        for (name, body, inferred, columns) in definitions.into_iter().rev() {
+            self.ctes.borrow_mut().remove(&name);
+            // Fresh CTE wrapper binding one WITH definition over the plan below it,
+            // built from the parsed WITH - no base to copy from. Field list
+            // (name/cte_plan/child/recursive/column_names) is the complete Cte struct.
             plan = LogicalPlan::Cte(Cte {
-                name: name.clone(),
-                cte_plan: Box::new(body.clone()),
+                name,
+                cte_plan: Box::new(body),
                 child: Box::new(plan),
                 recursive: false,
-                column_names: if *inferred {
-                    None
-                } else {
-                    Some(columns.clone())
-                },
+                column_names: if inferred { None } else { Some(columns) },
             });
-        }
-        for (name, ..) in &definitions {
-            self.ctes.borrow_mut().remove(name);
         }
         Ok(plan)
     }
@@ -210,6 +215,9 @@ impl<'a> Converter<'a> {
         // join graph from the CROSS+filter region (so no join is missed here).
         for item in rest {
             let right = self.convert_from_item(select, item, &mut tables)?;
+            // Fresh CROSS join folding the next comma-FROM item onto the left-deep
+            // plan - no base join to copy from. Field list is the complete Join struct
+            // (no condition/estimates yet; the optimizer stamps those later).
             plan = LogicalPlan::Join(Join {
                 left: Box::new(plan),
                 right: Box::new(right),
@@ -261,6 +269,9 @@ impl<'a> Converter<'a> {
                     key: key.clone(),
                     columns: ColumnSource::Explicit(columns.clone()),
                 });
+                // Fresh CteRef built from the parsed table reference to an in-scope
+                // CTE - no base to copy from. Field list (name/alias/columns/
+                // output_names) is the complete CteRef struct.
                 return LogicalPlan::CteRef(CteRef {
                     name: table.name.name.clone(),
                     alias: table.alias.as_ref().map(|ident| ident.name.clone()),
@@ -312,6 +323,9 @@ impl<'a> Converter<'a> {
         } else {
             Some(column_names)
         };
+        // Fresh boundary wrapper for a derived table `(SELECT ...) AS alias`, built
+        // from the parsed subquery - no base to copy from. Field list
+        // (input/alias/column_names) is the complete SubqueryScan struct.
         Ok(LogicalPlan::SubqueryScan(SubqueryScan {
             input: Box::new(input),
             alias,
@@ -343,6 +357,9 @@ impl<'a> Converter<'a> {
         } else {
             Some(join.using.iter().map(|ident| ident.name.clone()).collect())
         };
+        // Fresh join built from the parsed JOIN clause (kind + ON/USING) - no base
+        // join to copy from. Field list is the complete Join struct (no estimates
+        // yet; the optimizer stamps those later).
         Ok(LogicalPlan::Join(Join {
             left: Box::new(left),
             right: Box::new(right),
@@ -360,6 +377,8 @@ impl<'a> Converter<'a> {
         let Some(where_clause) = &select.where_clause else {
             return Ok(input);
         };
+        // Fresh WHERE filter wrapping the FROM plan, built from the parsed predicate
+        // - no base to copy from. Field list (input/predicate) is the complete Filter.
         Ok(LogicalPlan::Filter(Filter {
             input: Box::new(input),
             predicate: self.expr(&where_clause.this)?,
@@ -391,6 +410,9 @@ impl<'a> Converter<'a> {
             }
             return self.build_aggregate(input, select, expressions, names);
         }
+        // Fresh projection realizing the SELECT list over the input, built from the
+        // parsed items - no base to copy from. Field list (input/expressions/aliases/
+        // distinct/distinct_on) is the complete Projection struct.
         Ok(LogicalPlan::Projection(Projection {
             input: Box::new(input),
             expressions,
@@ -428,6 +450,9 @@ impl<'a> Converter<'a> {
                 group_by.push(self.expr(key)?);
             }
         }
+        // Fresh aggregate realizing GROUP BY + the aggregate SELECT list, built from
+        // the parsed clauses - no base to copy from. Field list (input/group_by/
+        // aggregates/output_names/grouping_sets) is the complete Aggregate struct.
         let aggregate = LogicalPlan::Aggregate(Aggregate {
             input: Box::new(input),
             group_by,
@@ -438,6 +463,8 @@ impl<'a> Converter<'a> {
         let Some(having) = &select.having else {
             return Ok(aggregate);
         };
+        // Fresh HAVING filter wrapping the aggregate, built from the parsed predicate
+        // - no base to copy from. Field list (input/predicate) is the complete Filter.
         Ok(LogicalPlan::Filter(Filter {
             input: Box::new(aggregate),
             predicate: self.expr(&having.this)?,
@@ -539,6 +566,9 @@ impl<'a> Converter<'a> {
             ascending.push(!ordered.desc);
             nulls_order.push(nulls_of(ordered));
         }
+        // Fresh sort wrapping the input, built from the parsed ORDER BY keys - no
+        // base to copy from. Field list (input/sort_keys/ascending/nulls_order) is
+        // the complete Sort struct.
         Ok(LogicalPlan::Sort(Sort {
             input: Box::new(input),
             sort_keys,
@@ -562,6 +592,8 @@ fn apply_limit(input: LogicalPlan, select: &Select) -> Result<LogicalPlan, Parse
     if limit.is_none() && offset == 0 {
         return Ok(input);
     }
+    // Fresh limit wrapping the input, built from the parsed LIMIT/OFFSET counts - no
+    // base to copy from. Field list (input/limit/offset) is the complete Limit struct.
     Ok(LogicalPlan::Limit(Limit {
         input: Box::new(input),
         limit,

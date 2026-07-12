@@ -62,6 +62,9 @@ impl Converter<'_> {
         for arg in &func.args {
             args.push(self.expr(arg)?);
         }
+        // Fresh function call built from the parsed generic Function node - no base to
+        // copy from. Field list (function_name/args/is_aggregate/distinct/
+        // within_group_key/within_group_desc) is the complete FunctionCall variant.
         Ok(Expr::FunctionCall {
             function_name: func.name.to_uppercase(),
             args,
@@ -124,6 +127,8 @@ impl Converter<'_> {
         &self,
         func: &polyglot_sql::expressions::ExtractFunc,
     ) -> Result<Expr, ParseError> {
+        // Fresh EXTRACT node built from the parsed field + source - no base to copy
+        // from. Field list (field/source) is the complete Extract variant.
         Ok(Expr::Extract {
             field: format!("{:?}", func.field).to_uppercase(),
             source: Box::new(self.expr(&func.this)?),
