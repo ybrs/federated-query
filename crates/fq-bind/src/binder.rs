@@ -114,20 +114,21 @@ impl<'a> Binder<'a> {
     /// Bind a Filter: bind the input, then the predicate against the input scope.
     /// A HAVING (Filter over an Aggregate) also resolves bare references to the
     /// aggregate's output aliases.
-    fn bind_filter(&mut self, filter: Filter) -> Result<LogicalPlan, BindError> {
+    fn bind_filter(&mut self, mut filter: Filter) -> Result<LogicalPlan, BindError> {
         let input = self.bind(*filter.input)?;
         let overlay = aggregate_overlay(&input);
         let predicate = self.with_output_aliases(overlay, |binder| {
             binder.with_scope(&input, |binder| binder.bind_expr(&filter.predicate))
         })?;
-        Ok(LogicalPlan::Filter(Filter {
-            input: Box::new(input),
-            predicate,
-        }))
+        // In-place on the owned node: set the (rebound) input and predicate; any
+        // other field the Filter grows is preserved rather than reset.
+        filter.input = Box::new(input);
+        filter.predicate = predicate;
+        Ok(LogicalPlan::Filter(filter))
     }
 
     /// Bind a Projection: bind the input, then each SELECT expression.
-    fn bind_projection(&mut self, projection: Projection) -> Result<LogicalPlan, BindError> {
+    fn bind_projection(&mut self, mut projection: Projection) -> Result<LogicalPlan, BindError> {
         let input = self.bind(*projection.input)?;
         let expressions = self.with_scope(&input, |binder| {
             binder.bind_expr_list(&projection.expressions)
@@ -136,18 +137,17 @@ impl<'a> Binder<'a> {
             Some(keys) => Some(self.with_scope(&input, |binder| binder.bind_expr_list(keys))?),
             None => None,
         };
-        Ok(LogicalPlan::Projection(Projection {
-            input: Box::new(input),
-            expressions,
-            aliases: projection.aliases,
-            distinct: projection.distinct,
-            distinct_on,
-        }))
+        // In-place on the owned node: overwrite only the rebound fields; `aliases`
+        // and `distinct` are preserved untouched (not re-listed, so never reset).
+        projection.input = Box::new(input);
+        projection.expressions = expressions;
+        projection.distinct_on = distinct_on;
+        Ok(LogicalPlan::Projection(projection))
     }
 
     /// Bind a Sort: bind each ORDER BY key against the input scope, also resolving
     /// output aliases and positional ordinals (`ORDER BY <alias>` / `ORDER BY n`).
-    fn bind_sort(&mut self, sort: Sort) -> Result<LogicalPlan, BindError> {
+    fn bind_sort(&mut self, mut sort: Sort) -> Result<LogicalPlan, BindError> {
         let input = self.bind(*sort.input)?;
         let output_names = output_name_list(&input);
         let overlay = aggregate_overlay(&input).or_else(|| projection_overlay(&input));
@@ -156,12 +156,11 @@ impl<'a> Binder<'a> {
                 binder.bind_sort_keys(&sort.sort_keys, &output_names)
             })
         })?;
-        Ok(LogicalPlan::Sort(Sort {
-            input: Box::new(input),
-            sort_keys,
-            ascending: sort.ascending,
-            nulls_order: sort.nulls_order,
-        }))
+        // In-place on the owned node: overwrite only input and sort_keys; `ascending`
+        // and `nulls_order` are preserved untouched (not re-listed, so never reset).
+        sort.input = Box::new(input);
+        sort.sort_keys = sort_keys;
+        Ok(LogicalPlan::Sort(sort))
     }
 
     /// Bind ORDER BY keys: a positional ordinal (`ORDER BY 2`) names the 2nd
@@ -215,17 +214,16 @@ impl<'a> Binder<'a> {
     }
 
     /// Bind a Limit: only the input needs binding (LIMIT/OFFSET are constants).
-    fn bind_limit(&mut self, limit: Limit) -> Result<LogicalPlan, BindError> {
+    fn bind_limit(&mut self, mut limit: Limit) -> Result<LogicalPlan, BindError> {
         let input = self.bind(*limit.input)?;
-        Ok(LogicalPlan::Limit(Limit {
-            input: Box::new(input),
-            limit: limit.limit,
-            offset: limit.offset,
-        }))
+        // In-place on the owned node: only the input is rebound; `limit`/`offset` are
+        // preserved untouched (LIMIT/OFFSET are constants that binding does not change).
+        limit.input = Box::new(input);
+        Ok(LogicalPlan::Limit(limit))
     }
 
     /// Bind a Join: bind both sides, then the ON condition against both scopes.
-    fn bind_join(&mut self, join: Join) -> Result<LogicalPlan, BindError> {
+    fn bind_join(&mut self, mut join: Join) -> Result<LogicalPlan, BindError> {
         let left = self.bind(*join.left)?;
         let right = self.bind(*join.right)?;
         let condition = match &join.condition {
@@ -240,23 +238,20 @@ impl<'a> Binder<'a> {
             }
             None => None,
         };
-        Ok(LogicalPlan::Join(Join {
-            left: Box::new(left),
-            right: Box::new(right),
-            join_type: join.join_type,
-            condition,
-            natural: join.natural,
-            using: join.using,
-            estimated_rows: join.estimated_rows,
-            estimate_defaults: join.estimate_defaults,
-        }))
+        // In-place on the owned node: overwrite only the rebound left/right/condition;
+        // `join_type`, `natural`, `using`, and the `estimated_rows`/`estimate_defaults`
+        // estimates are preserved untouched (re-listing them risked resetting a stamp).
+        join.left = Box::new(left);
+        join.right = Box::new(right);
+        join.condition = condition;
+        Ok(LogicalPlan::Join(join))
     }
 
     /// Bind an Aggregate: bind the SELECT list (its `aggregates`), then the GROUP
     /// BY keys against the input scope. A bare GROUP BY key naming a SELECT output
     /// alias resolves to that (non-aggregate) output expression (Postgres allows
     /// `GROUP BY <alias>`); grouping by an aggregate alias is an error.
-    fn bind_aggregate(&mut self, aggregate: Aggregate) -> Result<LogicalPlan, BindError> {
+    fn bind_aggregate(&mut self, mut aggregate: Aggregate) -> Result<LogicalPlan, BindError> {
         let input = self.bind(*aggregate.input)?;
         let aggregates = self.with_scope(&input, |binder| {
             binder.bind_expr_list(&aggregate.aggregates)
@@ -265,13 +260,12 @@ impl<'a> Binder<'a> {
         let group_by = self.with_scope(&input, |binder| {
             binder.bind_group_keys(&aggregate.group_by, &alias_map)
         })?;
-        Ok(LogicalPlan::Aggregate(Aggregate {
-            input: Box::new(input),
-            group_by,
-            aggregates,
-            output_names: aggregate.output_names,
-            grouping_sets: aggregate.grouping_sets,
-        }))
+        // In-place on the owned node: overwrite only the rebound input/aggregates/
+        // group_by; `output_names` and `grouping_sets` are preserved untouched.
+        aggregate.input = Box::new(input);
+        aggregate.aggregates = aggregates;
+        aggregate.group_by = group_by;
+        Ok(LogicalPlan::Aggregate(aggregate))
     }
 
     /// Bind GROUP BY keys, resolving a bare key that names a SELECT output alias
@@ -298,17 +292,16 @@ impl<'a> Binder<'a> {
 
     /// Bind a derived table: bind its inner plan, applying any column-alias
     /// rename. The alias itself scopes references above it.
-    fn bind_subquery_scan(&mut self, node: SubqueryScan) -> Result<LogicalPlan, BindError> {
+    fn bind_subquery_scan(&mut self, mut node: SubqueryScan) -> Result<LogicalPlan, BindError> {
         let input = self.bind(*node.input)?;
         let input = match &node.column_names {
             Some(names) => self.rename_derived_columns(input, names)?,
             None => input,
         };
-        Ok(LogicalPlan::SubqueryScan(SubqueryScan {
-            input: Box::new(input),
-            alias: node.alias,
-            column_names: node.column_names,
-        }))
+        // In-place on the owned node: only the input is rebound; `alias` and
+        // `column_names` are preserved untouched.
+        node.input = Box::new(input);
+        Ok(LogicalPlan::SubqueryScan(node))
     }
 
     /// Apply a derived table's column-alias list via a rename projection that
@@ -337,6 +330,9 @@ impl<'a> Binder<'a> {
                 ))
             })
             .collect();
+        // Fresh rename projection wrapping the derived-table plan - there is no base
+        // Projection to copy from. Field list (input/expressions/aliases/distinct/
+        // distinct_on) is the complete Projection struct.
         Ok(LogicalPlan::Projection(Projection {
             input: Box::new(plan),
             expressions,
@@ -347,7 +343,7 @@ impl<'a> Binder<'a> {
     }
 
     /// Bind both branches of a set operation and check their arity.
-    fn bind_set_operation(&mut self, node: SetOperation) -> Result<LogicalPlan, BindError> {
+    fn bind_set_operation(&mut self, mut node: SetOperation) -> Result<LogicalPlan, BindError> {
         let left = self.bind(*node.left)?;
         let right = self.bind(*node.right)?;
         let (left_width, right_width) = (left.schema().len(), right.schema().len());
@@ -357,17 +353,16 @@ impl<'a> Binder<'a> {
                 right: right_width,
             });
         }
-        Ok(LogicalPlan::SetOperation(SetOperation {
-            left: Box::new(left),
-            right: Box::new(right),
-            kind: node.kind,
-            distinct: node.distinct,
-        }))
+        // In-place on the owned node: only the two branches are rebound; `kind` and
+        // `distinct` are preserved untouched.
+        node.left = Box::new(left);
+        node.right = Box::new(right);
+        Ok(LogicalPlan::SetOperation(node))
     }
 
     /// Bind a CTE: register its name as a relation (over its body's output
     /// columns) so the child and later CTEs resolve a CteRef against it.
-    fn bind_cte(&mut self, node: Cte) -> Result<LogicalPlan, BindError> {
+    fn bind_cte(&mut self, mut node: Cte) -> Result<LogicalPlan, BindError> {
         if node.recursive {
             return Err(BindError::Unsupported("WITH RECURSIVE".to_string()));
         }
@@ -388,49 +383,45 @@ impl<'a> Binder<'a> {
             }
         }
         let child = child?;
-        Ok(LogicalPlan::Cte(Cte {
-            name: node.name,
-            cte_plan: Box::new(cte_plan),
-            child: Box::new(child),
-            recursive: false,
-            column_names: node.column_names,
-        }))
+        // In-place on the owned node: only cte_plan and child are rebound; `name`,
+        // `column_names`, and `recursive` (guarded to false above) are preserved.
+        node.cte_plan = Box::new(cte_plan);
+        node.child = Box::new(child);
+        Ok(LogicalPlan::Cte(node))
     }
 
     /// Resolve a CTE reference to the registered CTE's output column names.
-    fn bind_cte_ref(&mut self, node: CteRef) -> Result<LogicalPlan, BindError> {
+    fn bind_cte_ref(&mut self, mut node: CteRef) -> Result<LogicalPlan, BindError> {
         let table = self
             .ctes
             .get(&node.name)
             .ok_or_else(|| BindError::TableNotFound(format!("CTE {}", node.name)))?;
-        let output_names = table.columns.iter().map(|col| col.name.clone()).collect();
-        Ok(LogicalPlan::CteRef(CteRef {
-            name: node.name,
-            alias: node.alias,
-            columns: node.columns,
-            output_names: Some(output_names),
-        }))
+        let output_names: Vec<String> = table.columns.iter().map(|col| col.name.clone()).collect();
+        // In-place on the owned node: only output_names is resolved here; `name`,
+        // `alias`, and `columns` are preserved untouched.
+        node.output_names = Some(output_names);
+        Ok(LogicalPlan::CteRef(node))
     }
 
     /// Bind a constant Values node (its expressions reference no input columns).
-    fn bind_values(&mut self, node: Values) -> Result<LogicalPlan, BindError> {
+    fn bind_values(&mut self, mut node: Values) -> Result<LogicalPlan, BindError> {
         let mut rows = Vec::with_capacity(node.rows.len());
         for row in &node.rows {
             rows.push(self.bind_expr_list(row)?);
         }
-        Ok(LogicalPlan::Values(Values {
-            rows,
-            output_names: node.output_names,
-        }))
+        // In-place on the owned node: only the rows are rebound; `output_names` is
+        // preserved untouched.
+        node.rows = rows;
+        Ok(LogicalPlan::Values(node))
     }
 
     /// Bind an EXPLAIN's wrapped plan.
-    fn bind_explain(&mut self, node: Explain) -> Result<LogicalPlan, BindError> {
+    fn bind_explain(&mut self, mut node: Explain) -> Result<LogicalPlan, BindError> {
         let input = self.bind(*node.input)?;
-        Ok(LogicalPlan::Explain(Explain {
-            input: Box::new(input),
-            format: node.format,
-        }))
+        // In-place on the owned node: only the input is rebound; `format` is
+        // preserved untouched.
+        node.input = Box::new(input);
+        Ok(LogicalPlan::Explain(node))
     }
 
     /// Derive output-column metadata (name + type) from a bound plan.
@@ -514,6 +505,9 @@ impl<'a> Binder<'a> {
     /// but matches an outer SELECT alias would wrongly bind instead of raising.
     pub(crate) fn bind_subplan(&mut self, plan: &LogicalPlan) -> Result<LogicalPlan, BindError> {
         let saved_aliases = std::mem::take(&mut self.output_aliases);
+        // Genuine clone: `bind` consumes its plan by value, but the subquery expr node
+        // that owns this subplan is reached through a `&Expr` borrow (bind_expr binds
+        // borrowed trees), so there is no owned subplan to move - we own a copy to bind.
         let result = self.bind(plan.clone());
         self.output_aliases = saved_aliases;
         result
