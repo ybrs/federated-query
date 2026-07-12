@@ -22,6 +22,7 @@ use fq_plan::{
     Projection, Scan, SetOpKind, SetOperation, Sort, SubqueryScan, Values,
 };
 use polyglot_sql::expressions::{Expression, JoinKind, Ordered, Select, TableRef, With};
+use polyglot_sql::traversal::ExpressionWalk;
 
 use crate::error::ParseError;
 
@@ -718,19 +719,68 @@ fn column_roots(select: &Select) -> Vec<&Expression> {
 fn columns_for_table(select: &Select, key: &str) -> Vec<String> {
     let mut columns: Vec<String> = Vec::new();
     for root in column_roots(select) {
-        for found in polyglot_sql::traversal::get_columns(root) {
-            if let Expression::Column(column) = found {
-                let matches = match &column.table {
-                    Some(qualifier) => qualifier.name == key,
-                    None => true,
-                };
-                if matches && !columns.contains(&column.name.name) {
-                    columns.push(column.name.name.clone());
-                }
+        collect_columns(root, key, &mut columns);
+    }
+    columns
+}
+
+/// Collect column names referenced in `root` that belong to table `key` (or are
+/// unqualified), INCLUDING columns inside aggregate arguments. polyglot's
+/// `get_columns` stops at aggregate boundaries (`get_columns(SUM(x))` is empty),
+/// so an aggregate-argument column would never be over-collected; a scan feeding a
+/// merge-engine aggregate would then omit it and the aggregate could not find it
+/// (the q18-class column drop). Aggregate args are gathered separately and
+/// recursed into (so a column and a nested aggregate in the same arg both count).
+fn collect_columns(root: &Expression, key: &str, columns: &mut Vec<String>) {
+    for found in polyglot_sql::traversal::get_columns(root) {
+        if let Expression::Column(column) = found {
+            let matches = match &column.table {
+                Some(qualifier) => qualifier.name == key,
+                None => true,
+            };
+            if matches && !columns.contains(&column.name.name) {
+                columns.push(column.name.name.clone());
             }
         }
     }
-    columns
+    for arg in aggregate_arguments(root) {
+        collect_columns(arg, key, columns);
+    }
+}
+
+/// The argument expression of every aggregate call reachable in `root`
+/// (SUM/AVG/MIN/MAX carry `AggFunc.this`; COUNT carries an optional `CountFunc.this`,
+/// absent for `COUNT(*)`). `find_all` does not cross an aggregate boundary, so these
+/// are the args `get_columns` misses.
+fn aggregate_arguments(root: &Expression) -> Vec<&Expression> {
+    let mut args = Vec::new();
+    for aggregate in root.find_all(is_aggregate) {
+        match aggregate {
+            Expression::Sum(agg)
+            | Expression::Avg(agg)
+            | Expression::Min(agg)
+            | Expression::Max(agg) => args.push(&agg.this),
+            Expression::Count(count) => {
+                if let Some(inner) = &count.this {
+                    args.push(inner);
+                }
+            }
+            _ => {}
+        }
+    }
+    args
+}
+
+/// Whether an expression is one of the five aggregate calls.
+fn is_aggregate(expr: &Expression) -> bool {
+    matches!(
+        expr,
+        Expression::Sum(_)
+            | Expression::Avg(_)
+            | Expression::Min(_)
+            | Expression::Max(_)
+            | Expression::Count(_)
+    )
 }
 
 /// The NULLS FIRST/LAST of an ORDER BY key, or None when unspecified.
