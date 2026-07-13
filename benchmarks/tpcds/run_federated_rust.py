@@ -4,8 +4,8 @@ Subcommands (the first argument selects one; when none is given the runner
 defaults to ``run`` so the historical invocation keeps working):
 
   run        Drive all 99 queries through the RUST engine (fedq.Runtime) over
-             the pg-dims federated split (dimensions on PostgreSQL, facts on
-             DuckDB), verify each result against the cached pure-DuckDB truth in
+             a federated split selected by --placement (pg-dims or adversarial),
+             verify each result against the cached pure-DuckDB truth in
              references_sf<sf>.duckdb, and time it against the CACHED DuckDB
              baseline (the oracle_timings table in the same references file).
              The DuckDB baseline is NEVER re-measured here - it is a function of
@@ -22,14 +22,21 @@ defaults to ``run`` so the historical invocation keeps working):
              database (both sources then hold identical rows; a placement only
              decides which source each table is READ from).
 
-For ``run``, every dimension is placed on PostgreSQL and every fact on DuckDB,
-so each fact-dimension join crosses sources. Each query is classified OK
-(matches the reference), WRONG (runs but differs), or ERROR (raised in the
-engine); every per-query exception is caught and recorded so one failure cannot
-stop the whole run. The Rust engine's 100ms planning budget surfaces as an ERROR
-("planning budget exceeded") for the heaviest queries; that is reported as-is,
-never worked around.
+For ``run``, --placement selects which source each base table is READ from
+(both sources hold identical rows): ``pg-dims`` (the default) puts every
+dimension on PostgreSQL and every fact on DuckDB, so each fact-dimension join
+crosses sources; ``adversarial`` splits each sales fact from its matching
+returns fact and alternates the dimensions, forcing fact-fact AND
+fact-dimension joins across sources. Each query is classified OK (matches the
+reference), WRONG (runs but differs), or ERROR (raised in the engine); every
+per-query exception is caught and recorded so one failure cannot stop the whole
+run. The Rust engine's 100ms planning budget surfaces as an ERROR ("planning
+budget exceeded") for the heaviest queries; that is reported as-is, never
+worked around.
 
+  --placement {pg-dims,adversarial} (default pg-dims): the table-to-source
+    assignment. The report goes to reports/rust-fed-sf<sf>.md for pg-dims (the
+    historical name) and reports/rust-fed-<placement>-sf<sf>.md otherwise.
   --warm-runs N (default 0): with N == 0 each query runs once on a shared
     runtime (the historical behavior), reported as the cold-ISH column. With
     N > 0 the first run stays the cold-ish column and the median of N subsequent
@@ -394,15 +401,59 @@ def _pg_dims_placement():
 
 PG_DIMS = _pg_dims_placement()
 
+# Each placement maps every base table to the source it is READ from ("pg" is
+# the PostgreSQL source, "duck" the DuckDB source; both hold identical rows).
+# The adversarial assignment is the one the retired Python-engine harness used
+# for its adversarial boards: each sales fact is split from its matching
+# returns fact and the dimensions alternate, so fact-fact and fact-dimension
+# joins are both forced across sources.
+PLACEMENTS = {
+    "pg-dims": PG_DIMS,
+    "adversarial": {
+        "store_sales": "duck",
+        "store_returns": "pg",
+        "catalog_sales": "pg",
+        "catalog_returns": "duck",
+        "web_sales": "duck",
+        "web_returns": "pg",
+        "inventory": "pg",
+        "call_center": "pg",
+        "catalog_page": "duck",
+        "customer": "pg",
+        "customer_address": "duck",
+        "customer_demographics": "pg",
+        "date_dim": "pg",
+        "household_demographics": "duck",
+        "income_band": "pg",
+        "item": "duck",
+        "promotion": "pg",
+        "reason": "duck",
+        "ship_mode": "pg",
+        "store": "duck",
+        "time_dim": "pg",
+        "warehouse": "duck",
+        "web_page": "pg",
+        "web_site": "duck",
+    },
+}
 
-def _qualify(sql, source_map, dialect):
-    """Qualify each base TPC-DS table to the source that holds it under pg-dims."""
+# A placement that misses a table would silently leave it unqualified (the
+# engine would then fail to resolve it, or worse, a KeyError would abort one
+# query mid-run); every placement must assign every base table, checked here.
+for _name, _placement in PLACEMENTS.items():
+    if frozenset(_placement) != TPCDS_TABLES:
+        raise AssertionError(
+            "placement {0} does not cover the 24 base tables exactly".format(_name))
+
+
+def _qualify(sql, source_map, dialect, placement):
+    """Qualify each base TPC-DS table to the source `placement` assigns it."""
     tree = sqlglot.parse_one(sql, dialect="duckdb")
     for table in tree.find_all(exp.Table):
         name = table.name.lower()
         if name not in TPCDS_TABLES or table.args.get("db"):
             continue
-        catalog, schema = source_map[PG_DIMS[name]]
+        catalog, schema = source_map[placement[name]]
         table.set("db", exp.to_identifier(schema))
         if catalog is not None:
             table.set("catalog", exp.to_identifier(catalog))
@@ -472,30 +523,37 @@ def _oracle_ms(refs, name):
 
 # --- run: drive the Rust engine over the pg-dims split ------------------------
 
-# Hard wall-clock budgets per scale factor, seconds. DETERMINISTIC and not
-# overridable: a run past its budget is killed outright (a watchdog thread
-# calls os._exit, so even a hung native call cannot outlive it). A benchmark
-# that needs longer is a regression to fix, not a budget to raise.
-WALL_BUDGET_SECONDS = {"0.1": 60, "1": 60, "10": 300}
+# Hard wall-clock budgets per (placement, scale factor), seconds. DETERMINISTIC
+# and not overridable: a run past its budget is killed outright (a watchdog
+# thread calls os._exit, so even a hung native call cannot outlive it). A
+# benchmark that needs longer is a regression to fix, not a budget to raise.
+# The adversarial placement forces the big facts across sources, so its budgets
+# are set higher than pg-dims - fixed at introduction, they do not move either.
+WALL_BUDGET_SECONDS = {
+    "pg-dims": {"0.1": 60, "1": 60, "10": 300},
+    "adversarial": {"0.1": 120, "1": 240, "10": 900},
+}
 
 
-def _arm_watchdog(scale_factor):
-    """Kill the whole process when the scale's wall budget expires. A daemon
-    thread survives GIL-released native calls, so the kill is unconditional."""
-    budget = WALL_BUDGET_SECONDS.get(scale_factor, 60)
+def _arm_watchdog(scale_factor, placement_name):
+    """Kill the whole process when the placement/scale wall budget expires. A
+    daemon thread survives GIL-released native calls, so the kill is
+    unconditional."""
+    budget = WALL_BUDGET_SECONDS[placement_name].get(scale_factor, 60)
 
     def _kill():
         sys.stderr.write(
-            "WALL BUDGET EXCEEDED: sf{0} run past {1}s - killed. "
+            "WALL BUDGET EXCEEDED: {0} sf{1} run past {2}s - killed. "
             "Fix the regression; the budget does not move.\n".format(
-                scale_factor, budget))
+                placement_name, scale_factor, budget))
         sys.stderr.flush()
         os._exit(124)
 
     timer = threading.Timer(budget, _kill)
     timer.daemon = True
     timer.start()
-    print("[pg-dims] wall budget: {0}s (deterministic kill)".format(budget))
+    print("[{0}] wall budget: {1}s (deterministic kill)".format(
+        placement_name, budget))
 
 
 def write_config(db_path, database, adbc_driver, options):
@@ -591,7 +649,7 @@ def _compared_result(name, engine_rows, truth_rows, decimals, cold_ms, warm_ms, 
     }
 
 
-def evaluate_query(runtime, refs, path, decimals, warm_runs):
+def evaluate_query(runtime, refs, path, decimals, warm_runs, placement):
     """Run one query through the Rust engine, time it (cold-ish plus warm
     median), verify against the reference, classify it.
 
@@ -601,7 +659,7 @@ def evaluate_query(runtime, refs, path, decimals, warm_runs):
     re-measured per run."""
     name = os.path.splitext(os.path.basename(path))[0]
     raw = _read_query(path)
-    engine_sql = _qualify(raw, FEDQ_SOURCES, ENGINE_DIALECT)
+    engine_sql = _qualify(raw, FEDQ_SOURCES, ENGINE_DIALECT, placement)
     try:
         cold_ms, warm_ms, engine_rows = _median_ms(
             lambda: arrow_to_rows(runtime.execute(engine_sql)), warm_runs)
@@ -688,13 +746,15 @@ def _ratio_summary_line(ours_total, duck_total, ratios):
                 _geomean(ratios), len(ratios)))
 
 
-def _print_summary(results, tally, total_ms):
+def _print_summary(results, tally, total_ms, placement_name):
     """Print the OK/WRONG/ERROR tally and the tpch-style timing ratio line."""
     ours_total, duck_total, ratios = _timing_totals(results)
     print("-" * 72)
-    print("[pg-dims] {0} ok | {1} wrong | {2} error   (total {3:.1f}s)".format(
-        tally["OK"], tally["WRONG"], tally["ERROR"], total_ms / 1000.0))
-    print("[pg-dims] " + _ratio_summary_line(ours_total, duck_total, ratios))
+    print("[{0}] {1} ok | {2} wrong | {3} error   (total {4:.1f}s)".format(
+        placement_name, tally["OK"], tally["WRONG"], tally["ERROR"],
+        total_ms / 1000.0))
+    print("[{0}] ".format(placement_name)
+          + _ratio_summary_line(ours_total, duck_total, ratios))
 
 
 def _cluster_key(result):
@@ -785,7 +845,16 @@ def _timing_summary_lines(results):
     ]
 
 
-def _report_lines(results, tally, total_ms, scale_factor):
+# The one-line description of each placement, printed into the report header.
+PLACEMENT_DESCRIPTIONS = {
+    "pg-dims": "dimensions on PostgreSQL, facts on DuckDB",
+    "adversarial": ("sales facts split from their matching returns facts, "
+                    "dimensions alternated (the retired Python-engine "
+                    "harness's adversarial assignment)"),
+}
+
+
+def _report_lines(results, tally, total_ms, scale_factor, placement_name):
     """Assemble the full markdown report for the run."""
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     ours_total, duck_total, ratios = _timing_totals(results)
@@ -793,10 +862,12 @@ def _report_lines(results, tally, total_ms, scale_factor):
         "# TPC-DS federated benchmark report (Rust engine)",
         "",
         "Engine: fedq-py (Rust / DataFusion), driven via pyo3 fedq.Runtime.",
-        "Placement: pg-dims (dimensions on PostgreSQL, facts on DuckDB).",
+        "Placement: {0} ({1}).".format(
+            placement_name, PLACEMENT_DESCRIPTIONS[placement_name]),
         "Truth: cached pure-DuckDB references in references_sf{0}.duckdb.".format(
             scale_factor),
-        "Baseline: pure DuckDB over the fact+dim file (every table local).",
+        "Baseline: cached oracle_timings from the same references file, "
+        "measured once by save-refs over the pg-dims split.",
         "Generated: {0}".format(stamp),
         "",
         "Tally: {0} ok | {1} wrong | {2} error   (total {3} queries, {4:.1f}s)".format(
@@ -818,7 +889,8 @@ def _report_lines(results, tally, total_ms, scale_factor):
 
 def write_report(results, tally, total_ms, options, path):
     """Write the per-query markdown report for this run."""
-    lines = _report_lines(results, tally, total_ms, options.scale_factor)
+    lines = _report_lines(
+        results, tally, total_ms, options.scale_factor, options.placement)
     with open(path, "w") as handle:
         handle.write("\n".join(lines))
     print("Wrote report: {0}".format(path))
@@ -834,20 +906,30 @@ def _build_context(options):
     return config_path, db_path, database, adbc_driver
 
 
-def _print_header(db_path, database, adbc_driver):
+def _print_header(db_path, database, adbc_driver, placement_name):
     """Print the run banner and the per-query column headings."""
-    print("\n==== TPC-DS pg-dims (ours=fedq-rust vs pure-DuckDB baseline) ====")
+    print("\n==== TPC-DS {0} (ours=fedq-rust vs cached DuckDB baseline) ====".format(
+        placement_name))
     print("db={0} pg={1} adbc={2}".format(db_path, database, adbc_driver))
     print("{0:5} {1:6} {2:>9} {3:>9} {4:>9} {5:>7}".format(
         "query", "status", "cold", "warm", "duckdb", "ratio"))
 
 
+def _report_path(options):
+    """The report file for a run: the historical rust-fed-sf<sf>.md name for
+    pg-dims, rust-fed-<placement>-sf<sf>.md for every other placement."""
+    if options.placement == "pg-dims":
+        return os.path.join(
+            REPORTS_DIR, "rust-fed-sf{0}.md".format(options.scale_factor))
+    return os.path.join(REPORTS_DIR, "rust-fed-{0}-sf{1}.md".format(
+        options.placement, options.scale_factor))
+
+
 def _finish(results, total_ms, options):
     """Print the summary, write the report, and return the results."""
     tally = _tally(results)
-    _print_summary(results, tally, total_ms)
-    report_path = os.path.join(
-        REPORTS_DIR, "rust-fed-sf{0}.md".format(options.scale_factor))
+    _print_summary(results, tally, total_ms, options.placement)
+    report_path = _report_path(options)
     os.makedirs(REPORTS_DIR, exist_ok=True)
     write_report(results, tally, total_ms, options, report_path)
     return results
@@ -863,23 +945,25 @@ def _run_shared(options, paths):
     import fedq
 
     config_path, db_path, database, adbc_driver = _build_context(options)
+    placement = PLACEMENTS[options.placement]
     runtime = fedq.Runtime(config_path)
     refs = duckdb.connect(_refs_path(options.scale_factor), read_only=True)
-    _print_header(db_path, database, adbc_driver)
-    print("[pg-dims] {0} queries x {1} engine run(s) each; baseline CACHED "
+    _print_header(db_path, database, adbc_driver, options.placement)
+    print("[{0}] {1} queries x {2} engine run(s) each; baseline CACHED "
           "(oracle_timings in the references db)".format(
-              len(paths), 1 + options.warm_runs))
+              options.placement, len(paths), 1 + options.warm_runs))
     results = []
     started = time.perf_counter()
     for path in paths:
         result = evaluate_query(
-            runtime, refs, path, options.decimals, options.warm_runs)
+            runtime, refs, path, options.decimals, options.warm_runs, placement)
         results.append(result)
         _print_result(result)
     return _finish(results, (time.perf_counter() - started) * 1000.0, options)
 
 
-def _cold_worker(config_path, db_path, refs_path, path, decimals, warm_runs, result_queue):
+def _cold_worker(config_path, db_path, refs_path, path, decimals, warm_runs,
+                 placement, result_queue):
     """Child entry: build a FRESH runtime and DuckDB baseline, evaluate one
     query, and send its result back. A fresh runtime per query is the strict
     cold definition of benchmarks/perf_compare - no plan cache, pooled
@@ -888,7 +972,7 @@ def _cold_worker(config_path, db_path, refs_path, path, decimals, warm_runs, res
 
     runtime = fedq.Runtime(config_path)
     refs = duckdb.connect(refs_path, read_only=True)
-    result = evaluate_query(runtime, refs, path, decimals, warm_runs)
+    result = evaluate_query(runtime, refs, path, decimals, warm_runs, placement)
     result_queue.put(result)
 
 
@@ -899,7 +983,7 @@ def _evaluate_cold_process(config_path, db_path, refs_path, path, options):
     process = context.Process(
         target=_cold_worker,
         args=(config_path, db_path, refs_path, path, options.decimals,
-              options.warm_runs, result_queue))
+              options.warm_runs, PLACEMENTS[options.placement], result_queue))
     process.start()
     result = result_queue.get()
     process.join()
@@ -912,7 +996,7 @@ def _run_cold_process(options, paths):
     pays the full connect + statistics + planning cost with nothing cached."""
     config_path, db_path, database, adbc_driver = _build_context(options)
     refs_path = _refs_path(options.scale_factor)
-    _print_header(db_path, database, adbc_driver)
+    _print_header(db_path, database, adbc_driver, options.placement)
     results = []
     started = time.perf_counter()
     for path in paths:
@@ -923,11 +1007,11 @@ def _run_cold_process(options, paths):
 
 
 def run(options):
-    """Run every selected query under the pg-dims federated split and report."""
+    """Run every selected query under the --placement federated split and report."""
     paths = _select_query_files(options.queries_dir, options.only)
     if not paths:
         raise SystemExit("No query files found in {0}".format(options.queries_dir))
-    _arm_watchdog(options.scale_factor)
+    _arm_watchdog(options.scale_factor, options.placement)
     if options.cold_process:
         return _run_cold_process(options, paths)
     return _run_shared(options, paths)
@@ -1055,13 +1139,16 @@ def _save_refs_queries(options):
 
     truth_sql is the raw query run against PURE DuckDB (unqualified names
     resolve to the file's main schema) - the correctness reference. oracle_sql
-    is qualified to the pg-dims split for the DuckDB-over-Postgres timing oracle.
+    is ALWAYS qualified to the pg-dims split for the DuckDB-over-Postgres
+    timing oracle: the cached baseline is measured once per dataset over that
+    one split, and every placement's run reads it back as its fixed reference.
     """
     prepared = []
     for path in _select_query_files(options.queries_dir, options.only):
         name = os.path.splitext(os.path.basename(path))[0]
         raw = _read_query(path)
-        prepared.append((name, _qualify(raw, ORACLE_SOURCES, "duckdb"), raw))
+        prepared.append(
+            (name, _qualify(raw, ORACLE_SOURCES, "duckdb", PG_DIMS), raw))
     return prepared
 
 
@@ -1177,6 +1264,8 @@ def _build_parser():
     run_parser = subparsers.add_parser(
         "run", help="drive the queries through the Rust engine and report")
     run_parser.add_argument("--scale-factor", default="0.1")
+    run_parser.add_argument(
+        "--placement", choices=sorted(PLACEMENTS), default="pg-dims")
     run_parser.add_argument("--queries-dir", default=DEFAULT_QUERIES_DIR)
     run_parser.add_argument("--only", default=None)
     run_parser.add_argument("--decimals", type=int, default=2)

@@ -13,21 +13,30 @@ flags-only invocation keeps working.
 
 (equivalently, with no subcommand: `run_federated_rust.py --scale-factor 1 ...`)
 
-- Drives all 99 queries through the RUST engine over the pg-dims federated
-  split, verifies every result against the cached DuckDB truth, and reports
-  cold/warm ms per query next to the CACHED oracle baseline.
+- Drives all 99 queries through the RUST engine over the federated split
+  selected by `--placement`, verifies every result against the cached DuckDB
+  truth, and reports cold/warm ms per query next to the CACHED oracle baseline.
+- Placements (`--placement`, default `pg-dims`): `pg-dims` reads every
+  dimension from PostgreSQL and every fact from DuckDB; `adversarial` (the
+  retired Python-engine harness's assignment) splits each sales fact from its
+  matching returns fact and alternates the dimensions, forcing fact-fact AND
+  fact-dimension joins across sources. Both sources hold identical rows; a
+  placement only decides which source each table is READ from.
 - The DuckDB baseline is NEVER re-measured here: `oracle_timings` inside
   `data/references_sf<sf>.duckdb` was measured once per dataset by `save-refs`
-  below. Correctness truth comes from the same file.
+  below (over the pg-dims split; every placement reads the same fixed
+  baseline). Correctness truth comes from the same file.
 - Flags: `--only 1,5,70`, `--warm-runs N` (cold column = first run, warm =
   median of N), `--cold-process` (fresh process per query - the strict cold
   definition of benchmarks/perf_compare; slower), `--pg-database` per scale
   (tpcds_sf01 / tpcds_sf1 / tpcds_sf10).
-- HARD WALL BUDGETS (deterministic, not overridable): sf0.1 and sf1 runs are
-  KILLED at 60s, sf10 at 300s (a watchdog thread os._exits the process, exit
-  code 124 - a hung native call cannot outlive it). A run past its budget is a
-  regression to fix, never a budget to raise.
-- Report: `reports/rust-fed-sf<sf>.md`.
+- HARD WALL BUDGETS (deterministic, not overridable): pg-dims sf0.1/sf1 runs
+  are KILLED at 60s, sf10 at 300s; adversarial at 120s/240s/900s (a watchdog
+  thread os._exits the process, exit code 124 - a hung native call cannot
+  outlive it). A run past its budget is a regression to fix, never a budget
+  to raise.
+- Report: `reports/rust-fed-sf<sf>.md` (pg-dims keeps the historical name);
+  `reports/rust-fed-<placement>-sf<sf>.md` for other placements.
 
 ## Build the cached references (per scale factor)
 

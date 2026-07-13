@@ -200,15 +200,14 @@ def _dump_one(runtime, qualify, path, out_dir):
 def _make_qualifier(suite):
     """Build the per-suite table->source qualifier used before execution.
 
-    tpcds has a single runner (run_federated_rust.py) whose _qualify already
-    binds the pg-dims placement, so it takes only (sql, source_map, dialect).
-    tpch still carries the placement-parameterized run_federated._qualify.
+    Both suites' runners expose a placement-parameterized _qualify; the plan
+    dump always uses the pg-dims placement.
     """
     if suite == "tpcds":
         import run_federated_rust as rfr
 
         def qualify(raw):
-            return rfr._qualify(raw, rfr.FEDQ_SOURCES, "postgres")
+            return rfr._qualify(raw, rfr.FEDQ_SOURCES, "postgres", rfr.PG_DIMS)
 
         return qualify
     import run_federated as rf

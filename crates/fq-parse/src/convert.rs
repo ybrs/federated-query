@@ -23,7 +23,7 @@ use fq_plan::{
     Limit, LogicalPlan, Projection, Scan, SetOpKind, SetOperation, Sort, SubqueryScan, Values,
 };
 use polyglot_sql::expressions::{
-    Expression, JoinKind, Literal, Ordered, Sample, SampleMethod, Select, TableRef, With,
+    Expression, JoinKind, Literal, Null, Ordered, Sample, SampleMethod, Select, TableRef, With,
 };
 use polyglot_sql::traversal::ExpressionWalk;
 
@@ -63,6 +63,156 @@ struct SetOpModifiers<'e> {
     offset: Option<&'e Expression>,
 }
 
+/// A set operation polyglot swallowed into a scalar-subquery operand. Parsing
+/// `<select ending in a parenthesized subquery> UNION ALL <query>` attaches the
+/// trailing set operation to the subquery expression inside the first select's
+/// final WHERE/HAVING clause instead of combining the two statements; these are
+/// the detached pieces needed to rebuild the intended statement-level set
+/// operation.
+struct SwallowedSetOp {
+    kind: SetOpKind,
+    distinct: bool,
+    right: Expression,
+    with: Option<With>,
+    order_by: Option<polyglot_sql::expressions::OrderBy>,
+    limit: Option<Expression>,
+    offset: Option<Expression>,
+}
+
+/// Whether the rightmost operand spine of a predicate ends in the swallowed
+/// shape: a BARE set operation whose left operand is a parenthesized subquery.
+/// A genuine scalar set operation (`x > (SELECT .. UNION SELECT ..)`) is fully
+/// enclosed in a Subquery node and never appears bare inside an expression, so
+/// the bare node is unambiguously the parser mis-attachment.
+fn spine_has_swallowed_set_op(expr: &Expression) -> bool {
+    match expr {
+        Expression::Union(union) => matches!(union.left, Expression::Subquery(_)),
+        Expression::Intersect(intersect) => matches!(intersect.left, Expression::Subquery(_)),
+        Expression::Except(except) => matches!(except.left, Expression::Subquery(_)),
+        Expression::Not(unary) => spine_has_swallowed_set_op(&unary.this),
+        other => match crate::expr::binary_op_type(other) {
+            Some(_) => spine_has_swallowed_set_op(&crate::expr::binary_operands(other).right),
+            None => false,
+        },
+    }
+}
+
+/// Remove the swallowed set operation from the rightmost operand spine, leaving
+/// the scalar subquery it displaced in its place. Called only where
+/// `spine_has_swallowed_set_op` matched; the descent mirrors it exactly.
+fn detach_swallowed_set_op(expr: &mut Expression) -> SwallowedSetOp {
+    match expr {
+        Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_) => {
+            // The placeholder Null is overwritten with the set operation's own left
+            // operand immediately below; it never survives into the tree.
+            let node = std::mem::replace(expr, Expression::Null(Null));
+            let (scalar_subquery, tail) = split_set_op_node(node);
+            *expr = scalar_subquery;
+            tail
+        }
+        Expression::Not(unary) => detach_swallowed_set_op(&mut unary.this),
+        other => detach_swallowed_set_op(&mut crate::expr::binary_operands_mut(other).right),
+    }
+}
+
+/// Break a swallowed set-operation node into the scalar subquery it displaced
+/// (its left operand) and the statement-level pieces: the operator, the right
+/// branch, and the whole-result modifiers the parser attached to the node.
+fn split_set_op_node(node: Expression) -> (Expression, SwallowedSetOp) {
+    // The polyglot set-op structs implement Drop, so their fields cannot be
+    // moved out by destructuring; each one is taken out by replacement instead.
+    match node {
+        Expression::Union(mut union) => take_set_op_parts(
+            SetOpKind::Union,
+            !union.all,
+            &mut union.left,
+            &mut union.right,
+            &mut union.with,
+            &mut union.order_by,
+            &mut union.limit,
+            &mut union.offset,
+        ),
+        Expression::Intersect(mut intersect) => take_set_op_parts(
+            SetOpKind::Intersect,
+            !intersect.all,
+            &mut intersect.left,
+            &mut intersect.right,
+            &mut intersect.with,
+            &mut intersect.order_by,
+            &mut intersect.limit,
+            &mut intersect.offset,
+        ),
+        Expression::Except(mut except) => take_set_op_parts(
+            SetOpKind::Except,
+            !except.all,
+            &mut except.left,
+            &mut except.right,
+            &mut except.with,
+            &mut except.order_by,
+            &mut except.limit,
+            &mut except.offset,
+        ),
+        other => unreachable!("split_set_op_node called on `{}`", other.variant_name()),
+    }
+}
+
+/// Take the swallowed node's operands and whole-result modifiers out of its
+/// fields (leaving Null/None behind; the emptied node is dropped by the
+/// caller), pairing the displaced scalar subquery with the statement pieces.
+/// `distinct` already carries the `!all` mapping the regular set-operation
+/// conversion uses.
+#[allow(clippy::too_many_arguments)]
+fn take_set_op_parts(
+    kind: SetOpKind,
+    distinct: bool,
+    left: &mut Expression,
+    right: &mut Expression,
+    with: &mut Option<With>,
+    order_by: &mut Option<polyglot_sql::expressions::OrderBy>,
+    limit: &mut Option<Box<Expression>>,
+    offset: &mut Option<Box<Expression>>,
+) -> (Expression, SwallowedSetOp) {
+    let scalar_subquery = std::mem::replace(left, Expression::Null(Null));
+    // Owned pieces of the mis-attached node; the field list mirrors
+    // SetOpModifiers plus the operator and right branch.
+    let tail = SwallowedSetOp {
+        kind,
+        distinct,
+        right: std::mem::replace(right, Expression::Null(Null)),
+        with: with.take(),
+        order_by: order_by.take(),
+        limit: limit.take().map(|expr| *expr),
+        offset: offset.take().map(|expr| *expr),
+    };
+    (scalar_subquery, tail)
+}
+
+/// Detach a swallowed set operation from a select's final predicate clause,
+/// returning the repaired select and the detached statement-level pieces, or
+/// None when the select is well-formed. Only WHERE and HAVING can end the
+/// statement text with a scalar subquery here; HAVING is probed first because
+/// it is the later clause. The select is cloned only when a swallowed node is
+/// actually present.
+fn detach_from_select(select: &Select) -> Option<(Select, SwallowedSetOp)> {
+    if let Some(having) = &select.having {
+        if spine_has_swallowed_set_op(&having.this) {
+            let mut repaired = select.clone();
+            let clause = repaired.having.as_mut().expect("clone keeps HAVING");
+            let tail = detach_swallowed_set_op(&mut clause.this);
+            return Some((repaired, tail));
+        }
+    }
+    if let Some(where_clause) = &select.where_clause {
+        if spine_has_swallowed_set_op(&where_clause.this) {
+            let mut repaired = select.clone();
+            let clause = repaired.where_clause.as_mut().expect("clone keeps WHERE");
+            let tail = detach_swallowed_set_op(&mut clause.this);
+            return Some((repaired, tail));
+        }
+    }
+    None
+}
+
 /// The recursive AST -> logical-plan converter.
 pub struct Converter<'a> {
     catalog: &'a Catalog,
@@ -85,7 +235,10 @@ impl<'a> Converter<'a> {
     /// subquery, or VALUES) into a logical plan.
     pub(crate) fn query(&self, expr: &Expression) -> Result<LogicalPlan, ParseError> {
         match expr {
-            Expression::Select(select) => self.select(select),
+            Expression::Select(select) => match detach_from_select(select) {
+                Some((repaired, tail)) => self.reattached_set_operation(repaired, &tail),
+                None => self.select(select),
+            },
             Expression::Union(union) => self.set_operation(
                 &union.left,
                 &union.right,
@@ -159,6 +312,32 @@ impl<'a> Converter<'a> {
         });
         let sorted = self.apply_order_keys(combined, modifiers.order_by)?;
         set_op_limit(sorted, modifiers.limit, modifiers.offset)
+    }
+
+    /// Rebuild the statement-level set operation polyglot swallowed into a
+    /// select's final predicate: `repaired` (its scalar subquery restored) is
+    /// the left branch; `tail` supplies the operator, the right branch, and the
+    /// whole-result modifiers the parser attached to the swallowed node. The
+    /// right branch converts through `query`, so a chain of swallowed branches
+    /// (each select's HAVING hiding the next) unrolls recursively.
+    fn reattached_set_operation(
+        &self,
+        repaired: Select,
+        tail: &SwallowedSetOp,
+    ) -> Result<LogicalPlan, ParseError> {
+        let left = Expression::Select(Box::new(repaired));
+        self.set_operation(
+            &left,
+            &tail.right,
+            tail.kind,
+            tail.distinct,
+            SetOpModifiers {
+                with: tail.with.as_ref(),
+                order_by: tail.order_by.as_ref(),
+                limit: tail.limit.as_ref(),
+                offset: tail.offset.as_ref(),
+            },
+        )
     }
 
     /// Convert a VALUES clause into a `Values` node of constant rows.

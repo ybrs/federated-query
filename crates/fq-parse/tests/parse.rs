@@ -1379,15 +1379,66 @@ fn date_literal_carries_its_type() {
     assert_eq!(*data_type, DataType::Date);
 }
 
+/// The number of set-operation branch leaves: every plan that is not itself a
+/// `SetOperation` counts as one branch of the surrounding chain.
+fn set_op_leaf_count(plan: &LogicalPlan) -> usize {
+    match plan {
+        LogicalPlan::SetOperation(set_op) => {
+            set_op_leaf_count(&set_op.left) + set_op_leaf_count(&set_op.right)
+        }
+        _ => 1,
+    }
+}
+
+/// The topmost `SetOperation` in a plan, unwrapping the outer Projection /
+/// Sort / Limit / SubqueryScan wrappers a query places above it.
+fn find_set_operation(plan: &LogicalPlan) -> Option<&fq_plan::logical::SetOperation> {
+    if let LogicalPlan::SetOperation(set_op) = plan {
+        return Some(set_op);
+    }
+    plan.children().into_iter().find_map(find_set_operation)
+}
+
 #[test]
-fn set_operation_as_scalar_expression_raises() {
-    // A set operation is a query, not a scalar value. The parser attaches a
-    // trailing UNION to the scalar subquery operand, leaving a bare set operation
-    // where an expression is expected; it raises naming the actual construct.
-    let result = parse("SELECT a FROM t WHERE a > (SELECT m FROM u) UNION ALL SELECT b FROM v");
+fn set_operation_after_scalar_subquery_in_where_parses() {
+    // `<select with a WHERE scalar subquery> UNION ALL <select>` is a valid
+    // statement-level set operation, but polyglot attaches the trailing
+    // UNION ALL to the WHERE subquery operand, nesting the second branch inside
+    // the first branch's predicate. The converter splits it back into a proper
+    // two-branch set operation.
+    let plan =
+        parse("SELECT a FROM t WHERE a > (SELECT m FROM u) UNION ALL SELECT b FROM v").unwrap();
+    let set_op = find_set_operation(&plan).expect("a set operation");
+    assert_eq!(set_op.kind, fq_plan::SetOpKind::Union);
+    assert!(!set_op.distinct, "UNION ALL keeps duplicates");
+    assert_eq!(set_op_leaf_count(&plan), 2);
+}
+
+#[test]
+fn set_operation_after_scalar_subquery_in_having_parses() {
+    // The q14 shape: three aggregating branches, each ending in a HAVING scalar
+    // subquery, combined by UNION ALL. polyglot swallows every trailing
+    // UNION ALL into the preceding branch's HAVING comparison; the converter
+    // restores the flat three-branch set operation.
+    let sql = "SELECT sum(a) FROM t GROUP BY g HAVING sum(a) > (SELECT m FROM u) \
+               UNION ALL SELECT sum(b) FROM t2 GROUP BY g HAVING sum(b) > (SELECT m FROM u) \
+               UNION ALL SELECT sum(c) FROM t3 GROUP BY g HAVING sum(c) > (SELECT m FROM u)";
+    let plan = parse(sql).unwrap();
+    assert_eq!(set_op_leaf_count(&plan), 3);
+}
+
+#[test]
+fn set_operation_body_of_a_scalar_subquery_still_parses() {
+    // A set operation that is genuinely the body of a parenthesized scalar
+    // subquery (fully enclosed, no trailing branch) is a legitimate scalar and
+    // must keep parsing - the swallow fix must not disturb it.
+    let plan = parse("SELECT a FROM t WHERE a > (SELECT max(m) FROM u UNION SELECT max(n) FROM w)")
+        .unwrap();
+    assert!(find_set_operation(&plan).is_none(), "{plan:?}");
+    let filter = find_filter(&plan);
     assert!(
-        matches!(&result, Err(ParseError::Unsupported(message)) if message.contains("set operation")),
-        "{result:?}"
+        matches!(&filter.predicate, Expr::BinaryOp { right, .. } if matches!(right.as_ref(), Expr::Subquery { .. })),
+        "{filter:?}"
     );
 }
 

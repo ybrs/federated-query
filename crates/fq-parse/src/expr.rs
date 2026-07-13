@@ -71,8 +71,10 @@ impl Converter<'_> {
             Expression::Median(agg) => self.convert_median(agg),
             // A set operation is a query, not a scalar value. It reaches the
             // expression path only when the parser attaches a trailing
-            // UNION/INTERSECT/EXCEPT to a scalar subquery operand; naming the
-            // construct is clearer than the generic function fallthrough.
+            // UNION/INTERSECT/EXCEPT to a scalar subquery operand; the WHERE and
+            // HAVING shapes are repaired before conversion (`detach_from_select`
+            // in convert.rs), so anything arriving here sits in a clause the
+            // repair does not cover and raises naming the actual construct.
             Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_) => Err(
                 ParseError::Unsupported("set operation used as a scalar expression".to_string()),
             ),
@@ -696,7 +698,7 @@ fn searched_condition(operand: Expr, value: Expr) -> Expr {
 }
 
 /// Map a polyglot binary-operator variant to the engine operator, or None.
-fn binary_op_type(expr: &Expression) -> Option<BinaryOpType> {
+pub(crate) fn binary_op_type(expr: &Expression) -> Option<BinaryOpType> {
     let op = match expr {
         Expression::And(_) => BinaryOpType::And,
         Expression::Or(_) => BinaryOpType::Or,
@@ -719,7 +721,7 @@ fn binary_op_type(expr: &Expression) -> Option<BinaryOpType> {
 }
 
 /// The `BinaryOp` of any of the `Box<BinaryOp>` variants handled above.
-fn binary_operands(expr: &Expression) -> &BinaryOp {
+pub(crate) fn binary_operands(expr: &Expression) -> &BinaryOp {
     match expr {
         Expression::And(binary)
         | Expression::Or(binary)
@@ -737,6 +739,29 @@ fn binary_operands(expr: &Expression) -> &BinaryOp {
         | Expression::Concat(binary)
         | Expression::NullSafeEq(binary) => binary,
         _ => unreachable!("binary_operands called on a non-binary expression"),
+    }
+}
+
+/// The `BinaryOp` of any of the `Box<BinaryOp>` variants, mutably. Covers the
+/// same variant list as `binary_operands`.
+pub(crate) fn binary_operands_mut(expr: &mut Expression) -> &mut BinaryOp {
+    match expr {
+        Expression::And(binary)
+        | Expression::Or(binary)
+        | Expression::Add(binary)
+        | Expression::Sub(binary)
+        | Expression::Mul(binary)
+        | Expression::Div(binary)
+        | Expression::Mod(binary)
+        | Expression::Eq(binary)
+        | Expression::Neq(binary)
+        | Expression::Lt(binary)
+        | Expression::Lte(binary)
+        | Expression::Gt(binary)
+        | Expression::Gte(binary)
+        | Expression::Concat(binary)
+        | Expression::NullSafeEq(binary) => binary,
+        _ => unreachable!("binary_operands_mut called on a non-binary expression"),
     }
 }
 
