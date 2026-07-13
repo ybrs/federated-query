@@ -22,6 +22,9 @@ pub enum RenderDialect {
     DuckDb,
     ClickHouse,
     MySql,
+    /// The engine's materialized-view store, whose pushed SQL DataFusion
+    /// executes over local Arrow IPC chunks.
+    Materialized,
 }
 
 /// Capabilities a data source may support.

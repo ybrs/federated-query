@@ -10,12 +10,16 @@ use std::sync::Arc;
 
 use fq_common::DataType;
 
-use crate::datasource::DataSource;
+use crate::datasource::{DataSource, RenderDialect};
 use crate::error::CatalogError;
 use crate::schema::{Column, Schema, Table};
 
 /// Central catalog managing metadata from all data sources.
-#[derive(Default)]
+///
+/// Clone is cheap-ish (datasource handles are shared `Arc`s; the schema tree
+/// is owned metadata): the runtime clones the catalog to apply a materialized-
+/// view DDL as a copy-and-swap, so in-flight plans keep a consistent snapshot.
+#[derive(Default, Clone)]
 pub struct Catalog {
     datasources: BTreeMap<String, Arc<dyn DataSource>>,
     // Keyed by (datasource, schema_name), matching the Python tuple key.
@@ -109,10 +113,27 @@ impl Catalog {
         self.datasources.len()
     }
 
-    /// The names of every registered data source, sorted for determinism. Used
-    /// by single-source pushdown to resolve the sole source of a CTE-only body.
+    /// The names of every registered data source, sorted for determinism.
     pub fn datasource_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.datasources.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// The names of the registered REMOTE data sources, sorted - every source
+    /// except the internal materialized-view store. Single-source pushdown
+    /// resolves a pure-computation (constant/recursive) CTE body to the sole
+    /// source when exactly one exists; that target must be a real remote source
+    /// the engine can run the body against. The read-only materialized store is
+    /// never such a target, so it is excluded from the count (its presence must
+    /// not turn a genuine one-source query into a local fallback).
+    pub fn remote_datasource_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for (name, source) in &self.datasources {
+            if source.render_dialect() != RenderDialect::Materialized {
+                names.push(name.clone());
+            }
+        }
         names.sort();
         names
     }

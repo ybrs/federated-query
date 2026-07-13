@@ -3,4 +3,5 @@
 mod clickhouse_source;
 mod duckdb_source;
 mod mysql_source;
+mod parquet_source;
 mod postgres_source;

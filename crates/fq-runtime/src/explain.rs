@@ -150,12 +150,23 @@ fn node_label(
     producer_ids: &HashMap<*const PhysicalPlan, usize>,
 ) -> Result<String, StepError> {
     let label = match plan {
+        // A scan of the materialized-view store is labeled `MaterializedScan`
+        // with the VIEW name, so a plan over a materialized view is never
+        // indistinguishable from a source read; every other scan names its
+        // datasource. Both carry the exact pushed SQL.
         PhysicalPlan::Scan(node) => {
-            format!(
-                "Scan [{}] :: {}",
-                node.datasource,
-                one_line(&render_scan_sql(node)?)
-            )
+            let head = match node.datasource_kind {
+                fq_plan::physical::DatasourceKind::Materialized => {
+                    format!("MaterializedScan [{}]", node.table_name)
+                }
+                fq_plan::physical::DatasourceKind::Postgres
+                | fq_plan::physical::DatasourceKind::DuckDb
+                | fq_plan::physical::DatasourceKind::ClickHouse
+                | fq_plan::physical::DatasourceKind::MySql => {
+                    format!("Scan [{}]", node.datasource)
+                }
+            };
+            format!("{head} :: {}", one_line(&render_scan_sql(node)?))
         }
         PhysicalPlan::RemoteQuery(node) => {
             format!(

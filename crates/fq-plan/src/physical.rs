@@ -76,6 +76,10 @@ pub enum DatasourceKind {
     DuckDb,
     ClickHouse,
     MySql,
+    /// The engine's own materialized-view store: Arrow IPC chunk directories
+    /// read by DataFusion. Scans of it render DataFusion-dialect SQL and EXPLAIN
+    /// labels them `MaterializedScan`.
+    Materialized,
 }
 
 /// Materializes a cross-source CTE body once, shared by every reference.

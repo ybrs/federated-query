@@ -17,9 +17,11 @@ pub mod convert;
 pub mod error;
 pub mod expr;
 pub mod functions;
+pub mod statement;
 mod window;
 
 pub use error::ParseError;
+pub use statement::{classify_statement, Statement};
 
 use fq_catalog::Catalog;
 use polyglot_sql::DialectType;

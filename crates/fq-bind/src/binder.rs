@@ -90,10 +90,17 @@ impl<'a> Binder<'a> {
         }
     }
 
-    /// Bind a scan: resolve its table and prune its read-set to real column names
-    /// (expanding a star), so a bound scan never carries a `*`.
+    /// Bind a scan: resolve its table, stamp the RESOLVED datasource/schema
+    /// onto the scan (a bare reference arrives with an empty datasource and the
+    /// parser's default schema; downstream planning needs the real owner), and
+    /// prune its read-set to real column names (expanding a star), so a bound
+    /// scan never carries a `*`.
     fn bind_scan(&self, mut scan: Scan) -> Result<Scan, BindError> {
         let table = self.resolve_scan_table(&scan)?;
+        if let Some(qualifier) = table.qualifier() {
+            scan.datasource = qualifier.datasource.clone();
+            scan.schema_name = qualifier.schema_name.clone();
+        }
         let kept = scan_read_columns(&scan.columns, table);
         guard_no_star(&scan.table_name, &kept)?;
         scan.columns = kept;

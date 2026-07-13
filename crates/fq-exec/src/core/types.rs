@@ -11,4 +11,7 @@ pub enum DsKind {
     Parquet,
     ClickHouse,
     MySql,
+    /// The engine's materialized-view store: named tables of Arrow IPC chunk
+    /// files, read in-process through DataFusion.
+    Materialized,
 }

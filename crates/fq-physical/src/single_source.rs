@@ -762,7 +762,9 @@ impl SingleSourcePushdown {
         if !ctx.has_cte {
             return None;
         }
-        let names = self.catalog.datasource_names();
+        // The sole target must be a real remote source the body can run against;
+        // the internal materialized-view store is never one, so it is excluded.
+        let names = self.catalog.remote_datasource_names();
         if names.len() == 1 {
             names.into_iter().next()
         } else {

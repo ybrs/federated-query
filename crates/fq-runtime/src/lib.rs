@@ -12,22 +12,24 @@
 
 pub mod error;
 mod explain;
+mod materialized;
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
 use serde_yaml::Value;
 
+use fq_accel::Accelerator;
 use fq_catalog::{Catalog, StatsCatalog};
 use fq_common::{Config, DataSourceConfig, DataType, PlanBudget};
-use fq_connectors::{ClickHouseSource, DuckDbSource, MySqlSource, PostgresSource};
+use fq_connectors::{ClickHouseSource, DuckDbSource, MySqlSource, ParquetSource, PostgresSource};
 use fq_exec::{connectors, execute_plan};
 use fq_optimize::{build_optimizer, CostModel, StatisticsCollector};
-use fq_parse::parse_with_catalog;
+use fq_parse::{classify_statement, parse_with_catalog, Statement};
 use fq_physical::steps::Observation;
 use fq_physical::{PhysicalPlanner, ShipThresholds};
 use fq_plan::logical::LogicalPlan;
@@ -41,14 +43,24 @@ pub use error::RuntimeError;
 /// process-wide registry the constructor populates as a side effect, so it is
 /// not held here.
 pub struct Runtime {
-    catalog: Arc<Catalog>,
+    /// The metadata catalog behind a copy-and-swap: a materialized-view DDL
+    /// clones the catalog, applies the change, and swaps the `Arc`, so every
+    /// query plans against one consistent snapshot.
+    catalog: RwLock<Arc<Catalog>>,
     config: Config,
     /// ONE statistics collector for the whole session: its caches (source
     /// stats, planner estimates) persist across queries, and its learned
     /// overlay reads the stats catalog this runtime also WRITES after every
     /// execution. A per-query collector would re-fetch every statistic on
-    /// every plan.
-    stats: Arc<StatisticsCollector>,
+    /// every plan. Rebuilt (over the same learned catalog) when a DDL swaps
+    /// the metadata catalog it reads.
+    stats: RwLock<Arc<StatisticsCollector>>,
+    /// The learned-stats sqlite next to the config, kept to rebuild the
+    /// collector on a catalog swap and to persist observations.
+    learned: Option<Arc<StatsCatalog>>,
+    /// The materialized-view store, present when the config has a file path
+    /// (the store lives next to it). DDL against a path-less config raises.
+    accelerator: Option<Accelerator>,
 }
 
 impl Runtime {
@@ -64,28 +76,61 @@ impl Runtime {
         for datasource in config.datasources.values() {
             register_datasource(&mut catalog, datasource)?;
         }
+        // The materialized-view store registers as one more datasource (its
+        // views load through the same metadata path) and its chunk tables go
+        // to the exec data plane, so a NEW runtime over the same config sees
+        // every view a previous session created.
+        let accelerator = materialized::open_accelerator(config)?;
+        if let Some(accel) = &accelerator {
+            materialized::register_store(&mut catalog, accel)?;
+        }
         catalog.load_metadata()?;
         let catalog = Arc::new(catalog);
         let learned = open_stats_catalog(config)?;
         let stats = Arc::new(StatisticsCollector::new(
             Arc::clone(&catalog),
-            learned,
+            learned.clone(),
             None,
         ));
         Ok(Self {
-            catalog,
+            catalog: RwLock::new(catalog),
             config: config.clone(),
-            stats,
+            stats: RwLock::new(stats),
+            learned,
+            accelerator,
         })
+    }
+
+    /// The current catalog snapshot (consistent for the caller's whole plan).
+    fn catalog_snapshot(&self) -> Arc<Catalog> {
+        Arc::clone(&self.catalog.read().expect("catalog lock poisoned"))
+    }
+
+    /// The current statistics-collector snapshot.
+    fn stats_snapshot(&self) -> Arc<StatisticsCollector> {
+        Arc::clone(&self.stats.read().expect("stats lock poisoned"))
     }
 
     /// Run one SQL statement and return its Arrow result under the query's
     /// user-visible column names. A leading EXPLAIN short-circuits to a textual
-    /// plan WITHOUT executing.
+    /// plan WITHOUT executing. Materialized-view DDL dispatches to the store
+    /// and returns a one-row `status` table (the pg command-tag convention).
     pub fn execute(&self, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         if let Some(inner) = explain::strip_explain(sql) {
             return self.explain(inner);
         }
+        match classify_statement(sql)? {
+            Statement::Query(text) => self.execute_query(text),
+            Statement::CreateMaterializedView { name, select_sql } => {
+                self.create_materialized_view(&name, select_sql)
+            }
+            Statement::RefreshMaterializedView { name } => self.refresh_materialized_view(&name),
+            Statement::DropMaterializedView { name } => self.drop_materialized_view(&name),
+        }
+    }
+
+    /// Plan and run one SELECT/VALUES statement through the full pipeline.
+    fn execute_query(&self, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         let physical = self.plan(sql)?;
         let visible_names = output_column_names(&physical);
         let execution = execute_plan(&physical)?;
@@ -113,6 +158,11 @@ impl Runtime {
         if explain::strip_explain(sql).is_some() {
             return Ok(vec![("plan".to_owned(), DataType::Text)]);
         }
+        // Materialized-view DDL resolves to the single `status` column its
+        // execution returns, without touching the store.
+        if !matches!(classify_statement(sql)?, Statement::Query(_)) {
+            return Ok(vec![("status".to_owned(), DataType::Text)]);
+        }
         let physical = self.plan(sql)?;
         let names = output_column_names(&physical);
         let types = physical.schema();
@@ -133,10 +183,15 @@ impl Runtime {
     /// Parse -> bind -> decorrelate -> optimize into an optimized logical plan,
     /// recording each stage's wall clock in `stages` (which kills the plan the
     /// moment the shared budget is blown).
-    fn optimize(&self, sql: &str, stages: &mut StageLog) -> Result<LogicalPlan, RuntimeError> {
-        let parsed = parse_with_catalog(sql, self.catalog.as_ref())?;
+    fn optimize(
+        &self,
+        catalog: &Catalog,
+        sql: &str,
+        stages: &mut StageLog,
+    ) -> Result<LogicalPlan, RuntimeError> {
+        let parsed = parse_with_catalog(sql, catalog)?;
         stages.finish("parse")?;
-        let bound = fq_bind::bind(self.catalog.as_ref(), parsed)?;
+        let bound = fq_bind::bind(catalog, parsed)?;
         stages.finish("bind")?;
         let decorrelated = fq_decorrelate::decorrelate(bound)?;
         stages.finish("decorrelate")?;
@@ -153,17 +208,20 @@ impl Runtime {
     /// the same `PlanBudget`), so a plan-time data scan or a slow remote probe is
     /// KILLED and reported, never silently paid per query.
     fn plan(&self, sql: &str) -> Result<PhysicalPlan, RuntimeError> {
+        // One catalog snapshot for the whole plan, so a concurrent DDL swap
+        // cannot change the metadata mid-pipeline.
+        let catalog = self.catalog_snapshot();
         let mut stages = StageLog::start(self.config.optimizer.planning_budget_ms);
         // The SHARED collector carries this plan's budget so a statistics fetch
         // that overruns it is killed at the fetch and named in the error.
-        self.stats.set_plan_budget(stages.budget);
-        let optimized = self.optimize(sql, &mut stages)?;
+        self.stats_snapshot().set_plan_budget(stages.budget);
+        let optimized = self.optimize(&catalog, sql, &mut stages)?;
         let cost_model = Rc::new(RefCell::new(self.cost_model()));
         // The dim-shipping gates come from THIS runtime's optimizer config, so a
         // config that lowers them (small fixtures) or raises them (kill switch)
         // governs whether a dimension ships.
         let ship_thresholds = ShipThresholds::from_config(&self.config.optimizer);
-        let mut planner = PhysicalPlanner::new(Arc::clone(&self.catalog), Some(cost_model))
+        let mut planner = PhysicalPlanner::new(Arc::clone(&catalog), Some(cost_model))
             .with_ship_thresholds(ship_thresholds);
         let physical = planner.plan(&optimized)?;
         stages.finish("physical")?;
@@ -178,7 +236,7 @@ impl Runtime {
         measurements: &[(String, usize)],
         observations: &std::collections::BTreeMap<String, Observation>,
     ) -> Result<(), RuntimeError> {
-        let Some(catalog) = self.stats.stats_catalog() else {
+        let Some(catalog) = self.learned.as_deref() else {
             return Ok(());
         };
         for (binding, rows) in measurements {
@@ -216,7 +274,7 @@ impl Runtime {
     /// correct rows). The collector carries the active plan's budget, so a
     /// statistics fetch that overruns it is killed at the fetch.
     fn cost_model(&self) -> CostModel {
-        CostModel::with_shared_stats(self.config.cost.clone(), Some(Arc::clone(&self.stats)))
+        CostModel::with_shared_stats(self.config.cost.clone(), Some(self.stats_snapshot()))
     }
 }
 
@@ -336,11 +394,28 @@ fn register_datasource(
         "postgres" | "postgresql" => register_postgres(catalog, datasource),
         "clickhouse" => register_clickhouse(catalog, datasource),
         "mysql" => register_mysql(catalog, datasource),
+        "parquet" => register_parquet(catalog, datasource),
         other => Err(RuntimeError::Config(format!(
             "datasource '{}' has unsupported type '{other}'",
             datasource.name
         ))),
     }
+}
+
+/// Register a Parquet directory source: a footer-only catalog handle
+/// (schema/row-count/statistics) plus the exec-plane spec that points DataFusion
+/// at the same directory. Read-only: the catalog handle does not open the file
+/// data, and the exec plane reads the file bytes through DataFusion at fetch time.
+fn register_parquet(
+    catalog: &mut Catalog,
+    datasource: &DataSourceConfig,
+) -> Result<(), RuntimeError> {
+    let dir = require_str(datasource, "dir")?;
+    let source = ParquetSource::open(datasource.name.clone(), &dir)?;
+    catalog.register_datasource(Arc::new(source));
+    let spec = connectors::spec_from_kind("parquet", Some(dir), None)?;
+    connectors::register(datasource.name.clone(), spec);
+    Ok(())
 }
 
 /// Reject any connection-param key not in `allowed` for a datasource block, so a

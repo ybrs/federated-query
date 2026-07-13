@@ -26,6 +26,19 @@ ureq = { version = "3", default-features = false }
 # the Postgres tier). default-features off + "minimal" drops the TLS stack and
 # uses the pure-Rust compression backend: the engine talks plain TCP to the DB.
 mysql = { version = "28", default-features = false, features = ["minimal"] }
+# The Parquet connector reads FOOTERS ONLY (schema, exact row counts, row-group
+# min/max/null statistics) - never the row data, so metadata reads stay
+# O(metadata). Pinned to the workspace's 58.x arrow line (Cargo.lock has
+# parquet/arrow-schema 58.3.0); the data-plane read of the file bytes is fq-exec's
+# DataFusion scan.
+parquet = "58"
+arrow-schema = "58"
+
+[dev-dependencies]
+# The Parquet unit tests WRITE small real parquet files (via the parquet arrow
+# writer) and then read their footers back, so the arrow array + writer are test
+# dependencies only.
+arrow = "58"
 
 [lints]
 workspace = true

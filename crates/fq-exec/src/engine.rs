@@ -1005,9 +1005,10 @@ fn run_injected_scan(
         return fetch_scan(datasource, scan, Some(and_option(filter, extra_filter)));
     }
     let kind = connectors::kind(datasource)?;
-    // Parquet reads are in-process (DataFusion); the downstream join reduces
-    // without any transfer, so shipping keys anywhere would be pointless.
-    if kind == DsKind::Parquet {
+    // Parquet and materialized-view reads are in-process (DataFusion); the
+    // downstream join reduces without any transfer, so shipping keys anywhere
+    // would be pointless.
+    if matches!(kind, DsKind::Parquet | DsKind::Materialized) {
         return fetch_scan(datasource, scan, extra_filter);
     }
     // DuckDB: beyond the ingest ceiling, or a key type its temp-table ingest

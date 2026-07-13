@@ -1923,6 +1923,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "fq-accel"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "chrono",
+ "fq-catalog",
+ "fq-common",
+ "futures",
+ "object_store",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "fq-bind"
 version = "0.1.0"
 dependencies = [
@@ -1959,10 +1976,13 @@ dependencies = [
 name = "fq-connectors"
 version = "0.1.0"
 dependencies = [
+ "arrow",
+ "arrow-schema",
  "duckdb",
  "fq-catalog",
  "fq-common",
  "mysql",
+ "parquet",
  "postgres",
  "serde_json",
  "ureq",
@@ -2086,6 +2106,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "arrow-array",
+ "fq-accel",
  "fq-bind",
  "fq-catalog",
  "fq-common",
@@ -2096,6 +2117,7 @@ dependencies = [
  "fq-parse",
  "fq-physical",
  "fq-plan",
+ "parquet",
  "serde_yaml",
  "thiserror 2.0.18",
 ]

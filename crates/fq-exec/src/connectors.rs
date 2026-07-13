@@ -126,6 +126,10 @@ pub fn ship_table(
         DsKind::MySql => Err(ExecError::runtime(format!(
             "ship target '{name}' is a MySQL source; the engine does not ship into it"
         ))),
+        DsKind::Materialized => Err(ExecError::runtime(format!(
+            "ship target '{name}' is the read-only materialized-view store; \
+             cannot ship into it"
+        ))),
     }
 }
 
@@ -243,6 +247,7 @@ pub fn fetch(name: &str, sql: &str) -> ExecResult<(SchemaRef, Vec<RecordBatch>)>
         DsKind::Parquet => fetch_parquet(&s, sql),
         DsKind::ClickHouse => fetch_clickhouse(name, &s, sql),
         DsKind::MySql => fetch_mysql(&s, sql),
+        DsKind::Materialized => fetch_materialized(name, sql),
     }
 }
 
@@ -354,8 +359,13 @@ async fn register_parquet_dir(
         }
         let name = path.file_stem().unwrap().to_string_lossy().to_string();
         let url = ListingTableUrl::parse(path.to_string_lossy())?;
-        let options = ListingOptions::new(std::sync::Arc::new(ParquetFormat::default()))
-            .with_collect_stat(true);
+        // Infer string/binary columns as Utf8/Binary, NOT the Utf8View/BinaryView
+        // DataFusion 54 defaults to: schema inference bakes the column types into
+        // the ListingTable, and every other source yields plain Utf8, so a
+        // view-typed parquet column would not line up when the coordinator merges
+        // the two sides by Arrow type.
+        let format = ParquetFormat::default().with_force_view_types(false);
+        let options = ListingOptions::new(std::sync::Arc::new(format)).with_collect_stat(true);
         let file_schema = options.infer_schema(&ctx.state(), &url).await?;
         let config = ListingTableConfig::new(url)
             .with_listing_options(options)
@@ -367,6 +377,135 @@ async fn register_parquet_dir(
         .unwrap()
         .register_schema("main", schema)?;
     Ok(())
+}
+
+/// One materialized view's read shape for the data plane: its table name and
+/// the ordered Arrow IPC chunk files that compose it. The registrar (the
+/// runtime's DDL layer) passes the CATALOG's chunk list, never a directory
+/// listing, so a half-published refresh generation is never read.
+#[derive(Clone)]
+pub struct MaterializedTable {
+    pub table: String,
+    pub chunks: Vec<String>,
+}
+
+// The DataFusion context per materialized-view datasource, rebuilt WHOLE by
+// every `register_materialized` call (a DDL registers the full current table
+// set, so replacement is the correct semantics - a dropped view disappears, a
+// refreshed view points at its new chunk list).
+fn materialized_ctx_cache() -> &'static Mutex<HashMap<String, datafusion::prelude::SessionContext>>
+{
+    static CACHE: OnceLock<Mutex<HashMap<String, datafusion::prelude::SessionContext>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Register (or replace) a materialized-view datasource: the `DsSpec` under
+/// `name` plus a DataFusion context exposing every listed view as
+/// `main.<table>` over its Arrow IPC chunk files. Called at runtime setup and
+/// after every CREATE / REFRESH / DROP with the catalog's full current list.
+pub fn register_materialized(
+    name: String,
+    store_root: String,
+    tables: Vec<MaterializedTable>,
+) -> ExecResult<()> {
+    let ctx = materialized_ctx(&tables)
+        .map_err(|e| ExecError::runtime(format!("materialized store '{name}': {e}")))?;
+    materialized_ctx_cache()
+        .lock()
+        .unwrap()
+        .insert(name.clone(), ctx);
+    register(
+        name,
+        DsSpec {
+            kind: DsKind::Materialized,
+            uri: store_root,
+            adbc_driver: None,
+        },
+    );
+    Ok(())
+}
+
+// Build a DataFusion context with each view registered as `main.<table>` over
+// its chunk files. Shares the parquet path's runtime env (same memory pool).
+fn materialized_ctx(
+    tables: &[MaterializedTable],
+) -> Result<datafusion::prelude::SessionContext, datafusion::error::DataFusionError> {
+    let config = datafusion::execution::config::SessionConfig::new().with_collect_statistics(true);
+    let ctx = datafusion::prelude::SessionContext::new_with_config_rt(
+        config,
+        crate::engine::runtime_env(),
+    );
+    parquet_runtime().block_on(register_materialized_tables(&ctx, tables))?;
+    Ok(ctx)
+}
+
+// Register every view's chunk files as one listing table under a `public`
+// schema - the schema the planner's rendered SQL reads views from (the parser
+// defaults an unqualified reference's schema to `public`).
+async fn register_materialized_tables(
+    ctx: &datafusion::prelude::SessionContext,
+    tables: &[MaterializedTable],
+) -> Result<(), datafusion::error::DataFusionError> {
+    use datafusion::catalog::SchemaProvider;
+    use datafusion::datasource::file_format::arrow::ArrowFormat;
+    use datafusion::datasource::listing::{
+        ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+    };
+    let schema = std::sync::Arc::new(datafusion::catalog::MemorySchemaProvider::new());
+    for table in tables {
+        // A view always has at least one chunk (an empty result still writes a
+        // schema-bearing chunk); zero chunks is a registrar bug surfaced loudly.
+        if table.chunks.is_empty() {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "materialized view '{}' has no chunk files",
+                table.table
+            )));
+        }
+        let mut urls = Vec::with_capacity(table.chunks.len());
+        for chunk in &table.chunks {
+            urls.push(ListingTableUrl::parse(chunk)?);
+        }
+        let options = ListingOptions::new(std::sync::Arc::new(ArrowFormat))
+            .with_file_extension(".arrow")
+            .with_collect_stat(true);
+        // Every chunk of a view shares one schema by construction (a refresh
+        // that would change it is refused), so the first chunk's schema is the
+        // view's schema.
+        let file_schema = options.infer_schema(&ctx.state(), &urls[0]).await?;
+        let config = ListingTableConfig::new_with_multi_paths(urls)
+            .with_listing_options(options)
+            .with_schema(file_schema);
+        let listing = std::sync::Arc::new(ListingTable::try_new(config)?);
+        schema.register_table(table.table.clone(), listing)?;
+    }
+    ctx.catalog("datafusion")
+        .unwrap()
+        .register_schema("public", schema)?;
+    Ok(())
+}
+
+// Read the materialized-view store by running the pushed SQL through the
+// datasource's registered DataFusion context (its views live under `main`).
+fn fetch_materialized(name: &str, sql: &str) -> ExecResult<(SchemaRef, Vec<RecordBatch>)> {
+    let ctx = materialized_ctx_cache()
+        .lock()
+        .unwrap()
+        .get(name)
+        .cloned()
+        .ok_or_else(|| {
+            ExecError::runtime(format!(
+                "materialized store '{name}' has no registered view context"
+            ))
+        })?;
+    let sql = sql.to_string();
+    let result = parquet_runtime().block_on(async move {
+        let df = ctx.sql(&sql).await?;
+        let schema = std::sync::Arc::new(df.schema().as_arrow().clone());
+        let batches = df.collect().await?;
+        Ok::<(SchemaRef, Vec<RecordBatch>), datafusion::error::DataFusionError>((schema, batches))
+    });
+    result.map_err(|e| ExecError::runtime(format!("materialized query: {e}")))
 }
 
 fn open_duckdb(path: &str) -> Result<duckdb::Connection, String> {
@@ -1244,6 +1383,9 @@ pub fn fetch_temp_join(
         )),
         DsKind::MySql => Err(ExecError::runtime(
             "temp-join pushdown is not implemented for MySQL",
+        )),
+        DsKind::Materialized => Err(ExecError::runtime(
+            "temp-join pushdown does not apply to the in-process materialized-view store",
         )),
     }
 }

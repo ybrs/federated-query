@@ -21,6 +21,9 @@ fq-decorrelate = { path = "../fq-decorrelate" }
 fq-optimize = { path = "../fq-optimize" }
 fq-physical = { path = "../fq-physical" }
 fq-exec = { path = "../fq-exec" }
+# Materialized-view store: the DDL surface (CREATE/REFRESH/DROP MATERIALIZED
+# VIEW) executes here and persists through fq-accel.
+fq-accel = { path = "../fq-accel" }
 # The result rename rebuilds the final RecordBatch/Schema under user-visible names.
 arrow = "58"
 # Datasource connection params arrive as raw YAML values on DataSourceConfig.
@@ -30,6 +33,8 @@ thiserror = "2"
 [dev-dependencies]
 # The DuckDB e2e tests write a temporary config file and assert Arrow rows.
 arrow-array = "58"
+# The Parquet e2e writes a small real parquet directory to seed the file source.
+parquet = "58"
 
 [lints]
 workspace = true

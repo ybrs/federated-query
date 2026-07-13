@@ -4,3 +4,5 @@ mod cross_source;
 mod cross_source_clickhouse;
 mod ctes;
 mod duckdb_runtime;
+mod materialized_views;
+mod parquet_runtime;

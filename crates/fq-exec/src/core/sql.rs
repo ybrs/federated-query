@@ -61,6 +61,8 @@ fn dialect_for(kind: DsKind) -> Box<dyn Dialect> {
         // MySQL quotes identifiers with backticks (double quotes are string
         // literals by default), so the injected filter needs the MySQL dialect.
         DsKind::MySql => Box::new(MySqlDialect {}),
+        // The materialized-view store is read through DataFusion too.
+        DsKind::Materialized => Box::new(DefaultDialect {}),
     }
 }
 

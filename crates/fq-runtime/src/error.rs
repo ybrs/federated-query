@@ -81,4 +81,15 @@ pub enum RuntimeError {
     /// column, so it RAISES rather than ship a mislabeled result.
     #[error("result rename mismatch: {0}")]
     ResultShape(String),
+
+    /// A materialized-view store failure (registry, chunk store, or a schema
+    /// the store refuses to hold).
+    #[error("materialized view error: {0}")]
+    Accel(#[from] fq_accel::AccelError),
+
+    /// A materialized-view DDL statement the runtime rejects: a name collision
+    /// on CREATE, or DDL against a config with no file path (the store lives
+    /// next to the config file, so there is nowhere to put it).
+    #[error("materialized view error: {0}")]
+    MaterializedView(String),
 }

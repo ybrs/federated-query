@@ -1,0 +1,35 @@
+# fq-accel: the accelerator's materialized-view store - Arrow IPC chunk
+# directories behind object_store plus the view registry in the learned-stats
+# SQLite. A separate crate (not fq-catalog, not fq-exec) because it owns a
+# different concern than either neighbor: fq-catalog models metadata and must
+# stay driver/Arrow-free for the binder, while fq-exec is the imported
+# execution engine; the store needs Arrow + object_store + SQLite together,
+# which only this crate should pull. DAG: fq-accel -> fq-catalog, fq-common;
+# fq-runtime -> fq-accel (the DDL surface executes there).
+
+[package]
+name = "fq-accel"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+fq-common = { path = "../fq-common" }
+fq-catalog = { path = "../fq-catalog" }
+# Chunks are framed Arrow IPC files; the writer/reader live in the arrow crate.
+arrow = "58"
+# Every chunk read/write/delete goes through the object_store abstraction:
+# local filesystem today, an S3 bucket is a config change.
+object_store = "0.13"
+# object_store is async; the store drives it on a small private runtime.
+tokio = { version = "1", features = ["rt"] }
+futures = "0.3"
+# The view registry lives in the same SQLite file as the learned-stats catalog.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Chunk lists and output schemas are stored as JSON columns.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+thiserror = "2"
+
+[lints]
+workspace = true
