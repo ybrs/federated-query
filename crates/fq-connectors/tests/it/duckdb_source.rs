@@ -160,3 +160,57 @@ fn test_load_metadata_through_catalog() {
         DataType::Double
     );
 }
+
+#[test]
+fn test_source_token_in_memory_abstains() {
+    // An in-memory database has no file bytes to version; the token is an
+    // honest None, so a refresh over it always pulls.
+    let source = seeded_source();
+    assert_eq!(
+        source.source_token("main", "test_table").expect("token"),
+        None
+    );
+}
+
+#[test]
+fn test_source_token_moves_on_any_write_and_is_stable_otherwise() {
+    let path = std::env::temp_dir().join(format!(
+        "fq_duck_token_{}_{}.duckdb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let source =
+        DuckDbSource::open("token_duck", path.to_str().expect("utf-8 path")).expect("open");
+    source
+        .execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (1);")
+        .expect("seed");
+
+    let first = source
+        .source_token("main", "t")
+        .expect("token")
+        .expect("file-backed source has a token");
+    // Two reads with no intervening write agree.
+    let second = source
+        .source_token("main", "t")
+        .expect("token")
+        .expect("token");
+    assert_eq!(first, second);
+
+    // A write moves the token even before a checkpoint: the WAL sidecar is
+    // part of the stamp.
+    source
+        .execute_batch("INSERT INTO t VALUES (2);")
+        .expect("insert");
+    let third = source
+        .source_token("main", "t")
+        .expect("token")
+        .expect("token");
+    assert_ne!(first, third, "a committed write must move the token");
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("duckdb.wal"));
+}

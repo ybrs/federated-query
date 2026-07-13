@@ -38,4 +38,16 @@ pub enum AccelError {
     /// re-executed SELECT no longer matches the stored schema.
     #[error("materialized view schema: {0}")]
     InvalidSchema(String),
+
+    /// A malformed watermark operation: a column index outside the schema, or
+    /// a change-key column whose type drifted between pulls.
+    #[error("materialized view watermark: {0}")]
+    Watermark(String),
+
+    /// A merge refresh that cannot honor the primary-key declaration: a key
+    /// value duplicated in the fresh pull or in the stored chunks. The
+    /// declaration asserts uniqueness; merging on a duplicate would silently
+    /// drop or misplace rows.
+    #[error("materialized view merge: {0}")]
+    MergeKey(String),
 }

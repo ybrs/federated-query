@@ -4,6 +4,7 @@
 //! re-opened Accelerator (same config path) sees the same views and sweeps
 //! any drop a crash interrupted.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -56,6 +57,8 @@ fn create_registers_and_persists_readable_chunks() {
             "SELECT k, v FROM t",
             &schema(),
             std::slice::from_ref(&data),
+            BTreeMap::new(),
+            None,
         )
         .expect("create");
     assert_eq!(view.measured_rows, 2);
@@ -74,10 +77,24 @@ fn duplicate_create_raises_and_leaves_no_orphan_chunks() {
     let config = sandbox("dup");
     let accel = Accelerator::open(&config).expect("open");
     accel
-        .create_view("mv", "SELECT 1", &schema(), &[batch(&[(1, "a")])])
+        .create_view(
+            "mv",
+            "SELECT 1",
+            &schema(),
+            &[batch(&[(1, "a")])],
+            BTreeMap::new(),
+            None,
+        )
         .expect("first create");
     let error = accel
-        .create_view("mv", "SELECT 2", &schema(), &[batch(&[(2, "b")])])
+        .create_view(
+            "mv",
+            "SELECT 2",
+            &schema(),
+            &[batch(&[(2, "b")])],
+            BTreeMap::new(),
+            None,
+        )
         .unwrap_err();
     assert!(matches!(error, AccelError::DuplicateView(_)));
     // The loser's generation-0 files were its OWN (same names as the winner's
@@ -92,12 +109,25 @@ fn refresh_swaps_generations_and_unlinks_the_old_files() {
     let config = sandbox("refresh");
     let accel = Accelerator::open(&config).expect("open");
     let created = accel
-        .create_view("mv", "SELECT k, v FROM t", &schema(), &[batch(&[(1, "a")])])
+        .create_view(
+            "mv",
+            "SELECT k, v FROM t",
+            &schema(),
+            &[batch(&[(1, "a")])],
+            BTreeMap::new(),
+            None,
+        )
         .expect("create");
     let old_paths = accel.chunk_paths(&created);
 
     let refreshed = accel
-        .refresh_view("mv", &schema(), &[batch(&[(1, "a"), (2, "b")])])
+        .refresh_view(
+            "mv",
+            &schema(),
+            &[batch(&[(1, "a"), (2, "b")])],
+            &BTreeMap::new(),
+            None,
+        )
         .expect("refresh");
     assert_eq!(refreshed.measured_rows, 2);
     assert!(refreshed.refreshed_at.is_some());
@@ -112,7 +142,14 @@ fn refresh_with_a_drifted_schema_raises_and_keeps_the_view() {
     let config = sandbox("drift");
     let accel = Accelerator::open(&config).expect("open");
     accel
-        .create_view("mv", "SELECT k, v FROM t", &schema(), &[batch(&[(1, "a")])])
+        .create_view(
+            "mv",
+            "SELECT k, v FROM t",
+            &schema(),
+            &[batch(&[(1, "a")])],
+            BTreeMap::new(),
+            None,
+        )
         .expect("create");
     // The re-executed SELECT now produces one differently named column.
     let drifted: SchemaRef = Arc::new(Schema::new(vec![Field::new(
@@ -125,7 +162,9 @@ fn refresh_with_a_drifted_schema_raises_and_keeps_the_view() {
         vec![Arc::new(Int64Array::from(vec![1_i64]))],
     )
     .expect("drifted batch");
-    let error = accel.refresh_view("mv", &drifted, &[rows]).unwrap_err();
+    let error = accel
+        .refresh_view("mv", &drifted, &[rows], &BTreeMap::new(), None)
+        .unwrap_err();
     assert!(matches!(error, AccelError::InvalidSchema(_)), "{error}");
     // The view still serves its previous contents.
     let view = accel.view("mv").expect("kept");
@@ -138,7 +177,14 @@ fn drop_removes_the_row_and_the_files() {
     let config = sandbox("drop");
     let accel = Accelerator::open(&config).expect("open");
     let view = accel
-        .create_view("mv", "SELECT 1", &schema(), &[batch(&[(1, "a")])])
+        .create_view(
+            "mv",
+            "SELECT 1",
+            &schema(),
+            &[batch(&[(1, "a")])],
+            BTreeMap::new(),
+            None,
+        )
         .expect("create");
     let path = accel.chunk_paths(&view)[0].clone();
     accel.drop_view("mv").expect("drop");
@@ -159,7 +205,14 @@ fn reopen_sees_the_registered_views() {
     {
         let accel = Accelerator::open(&config).expect("open");
         accel
-            .create_view("mv", "SELECT k, v FROM t", &schema(), &[batch(&[(7, "z")])])
+            .create_view(
+                "mv",
+                "SELECT k, v FROM t",
+                &schema(),
+                &[batch(&[(7, "z")])],
+                BTreeMap::new(),
+                None,
+            )
             .expect("create");
     }
     let accel = Accelerator::open(&config).expect("reopen");
@@ -175,10 +228,24 @@ fn distinct_view_names_never_collide_on_chunk_keys() {
     let config = sandbox("collide");
     let accel = Accelerator::open(&config).expect("open");
     let a = accel
-        .create_view("a b", "SELECT 1", &schema(), &[batch(&[(1, "a")])])
+        .create_view(
+            "a b",
+            "SELECT 1",
+            &schema(),
+            &[batch(&[(1, "a")])],
+            BTreeMap::new(),
+            None,
+        )
         .expect("create a b");
     let b = accel
-        .create_view("a_b", "SELECT 2", &schema(), &[batch(&[(2, "b")])])
+        .create_view(
+            "a_b",
+            "SELECT 2",
+            &schema(),
+            &[batch(&[(2, "b")])],
+            BTreeMap::new(),
+            None,
+        )
         .expect("create a_b");
     assert_ne!(a.location, b.location);
 }

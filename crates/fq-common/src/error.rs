@@ -58,6 +58,12 @@ pub enum ConfigError {
     #[error("datasource '{0}' 'capabilities' must be a list of strings")]
     BadCapabilities(String),
 
+    /// A malformed `change_keys` block: a non-mapping value, a table key that
+    /// is not `schema.table`, a declaration without exactly one of
+    /// `column`/`primary_key`, or a non-string column name.
+    #[error("datasource '{0}' change_keys: {1}")]
+    BadChangeKeys(String, String),
+
     /// YAML parse failure (also covers `deny_unknown_fields` rejections in the
     /// optimizer/executor/cost sections - the analogue of `extra="forbid"`).
     #[error(transparent)]

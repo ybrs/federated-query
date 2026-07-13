@@ -10,6 +10,7 @@
 //!
 //! This crate is pyo3-FREE. The `fedq-py` crate wraps it behind the Python FFI.
 
+mod delta;
 pub mod error;
 mod explain;
 mod materialized;
@@ -85,6 +86,10 @@ impl Runtime {
             materialized::register_store(&mut catalog, accel)?;
         }
         catalog.load_metadata()?;
+        // A change-key declaration naming an unknown table/column, or a
+        // monotonic column whose type cannot carry a watermark, fails HERE at
+        // load - not silently at a refresh months later.
+        delta::validate_change_keys(&catalog, config)?;
         let catalog = Arc::new(catalog);
         let learned = open_stats_catalog(config)?;
         let stats = Arc::new(StatisticsCollector::new(

@@ -197,6 +197,27 @@ impl DataSource for ParquetSource {
     fn map_native_type(&self, type_str: &str) -> Result<DataType, CatalogError> {
         map_native_type_default(type_str)
     }
+
+    /// The version token is the table file's `(size, mtime_ns)` stamp. Parquet
+    /// files are immutable - a change replaces the file - so any change moves
+    /// the stamp; the stamp is exact for this one-file-per-table layout. The
+    /// file vanishing raises: the directory was scanned at open, so a missing
+    /// file is a source that changed shape under the engine.
+    fn source_token(&self, _schema: &str, table: &str) -> Result<Option<String>, CatalogError> {
+        let path = self.table_path(table)?;
+        let metadata = std::fs::metadata(path)
+            .map_err(|error| CatalogError::Source(format!("stat parquet '{table}': {error}")))?;
+        let mtime_ns = metadata
+            .modified()
+            .map_err(|error| CatalogError::Source(format!("mtime of parquet '{table}': {error}")))?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| CatalogError::Source(format!("mtime of parquet '{table}': {error}")))?
+            .as_nanos();
+        Ok(Some(format!(
+            "parquet-file:size={},mtime_ns={mtime_ns}",
+            metadata.len()
+        )))
+    }
 }
 
 /// Build one column's metadata from its Arrow field: the canonical native type

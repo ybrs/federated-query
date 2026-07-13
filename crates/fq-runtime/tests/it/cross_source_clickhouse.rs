@@ -84,6 +84,7 @@ fn cross_config(duck_path: &str, database: &str) -> Config {
             ty: "duckdb".to_string(),
             config: duck_params(duck_path),
             capabilities: Vec::new(),
+            change_keys: BTreeMap::new(),
         },
     );
     datasources.insert(
@@ -93,6 +94,7 @@ fn cross_config(duck_path: &str, database: &str) -> Config {
             ty: "clickhouse".to_string(),
             config: clickhouse_params(database),
             capabilities: Vec::new(),
+            change_keys: BTreeMap::new(),
         },
     );
     Config {

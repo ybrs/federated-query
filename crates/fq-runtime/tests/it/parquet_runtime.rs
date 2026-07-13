@@ -106,6 +106,7 @@ fn parquet_config(dir: &str) -> Config {
             ty: "parquet".to_string(),
             config: parquet_params(dir),
             capabilities: Vec::new(),
+            change_keys: BTreeMap::new(),
         },
     );
     base_config(datasources)
@@ -125,6 +126,7 @@ fn cross_config(duck_path: &str, parquet_dir: &str) -> Config {
             ty: "duckdb".to_string(),
             config: duck_params(duck_path),
             capabilities: Vec::new(),
+            change_keys: BTreeMap::new(),
         },
     );
     datasources.insert(
@@ -134,6 +136,7 @@ fn cross_config(duck_path: &str, parquet_dir: &str) -> Config {
             ty: "parquet".to_string(),
             config: parquet_params(parquet_dir),
             capabilities: Vec::new(),
+            change_keys: BTreeMap::new(),
         },
     );
     base_config(datasources)

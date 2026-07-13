@@ -170,6 +170,16 @@ pub trait DataSource: Send + Sync {
     fn map_native_type(&self, type_str: &str) -> Result<DataType, CatalogError> {
         map_native_type_default(type_str)
     }
+
+    /// An opaque version token for one table, read ONLY by REFRESH (never on
+    /// the query path): equal tokens mean the table has not changed since the
+    /// token was captured, so a refresh skips its pull. A source that cannot
+    /// answer cheaply returns None and the refresh pulls unconditionally - an
+    /// absent token costs work, never a wrong answer. Token text is
+    /// connector-private; the only defined operation on it is equality.
+    fn source_token(&self, _schema: &str, _table: &str) -> Result<Option<String>, CatalogError> {
+        Ok(None)
+    }
 }
 
 /// The default native-type mapping (the base-class logic). Most specific first:

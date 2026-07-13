@@ -120,6 +120,7 @@ fn cross_config(duck_path: &str, adbc_driver: &str) -> Config {
             ty: "duckdb".to_string(),
             config: duck_params(duck_path),
             capabilities: Vec::new(),
+            change_keys: BTreeMap::new(),
         },
     );
     datasources.insert(
@@ -129,6 +130,7 @@ fn cross_config(duck_path: &str, adbc_driver: &str) -> Config {
             ty: "postgres".to_string(),
             config: pg_params(adbc_driver),
             capabilities: Vec::new(),
+            change_keys: BTreeMap::new(),
         },
     );
     Config {

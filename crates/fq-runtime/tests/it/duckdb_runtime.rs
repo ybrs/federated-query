@@ -74,6 +74,7 @@ fn duck_config(path: &str) -> Config {
             ty: "duckdb".to_string(),
             config: params,
             capabilities: Vec::new(),
+            change_keys: BTreeMap::new(),
         },
     );
     Config {

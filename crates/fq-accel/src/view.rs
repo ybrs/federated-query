@@ -1,10 +1,13 @@
 //! The materialized-view record and its schema mapping.
 
+use std::collections::BTreeMap;
+
 use arrow::datatypes::{DataType as ArrowType, SchemaRef};
 use fq_common::DataType;
 use serde::{Deserialize, Serialize};
 
 use crate::error::AccelError;
+use crate::watermark::Watermark;
 
 /// One output column of a materialized view: the engine type the binder and
 /// planner see. The chunks hold the exact executed Arrow data; this is the
@@ -33,6 +36,27 @@ pub struct MaterializedView {
     pub created_at: String,
     /// The last successful REFRESH, or None if never refreshed since creation.
     pub refreshed_at: Option<String>,
+    /// Per-base-table version tokens captured just BEFORE the last pull, keyed
+    /// `datasource.schema.table`. REFRESH compares them against fresh tokens
+    /// and skips the pull when every one matches. Capturing before the pull
+    /// means a token can only UNDERSTATE freshness (an extra re-pull), never
+    /// overstate it (a wrong skip). Empty when no base table offered a token.
+    pub source_tokens: BTreeMap<String, String>,
+    /// The delta-append state of the last pull, present only when the view was
+    /// last pulled under a monotonic change-key declaration. Merge and whole
+    /// re-pulls carry no pull-to-pull state and store None.
+    pub change_key: Option<ChangeKeyState>,
+}
+
+/// The stored delta-append state: which view OUTPUT column carries the
+/// monotonic change key, and the high-water mark of the rows pulled so far.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeKeyState {
+    /// The view's output column (post-alias) the watermark tracks.
+    pub column: String,
+    /// The largest value pulled; None while the view holds no rows (the next
+    /// delta then pulls everything, which onto an empty view is exact).
+    pub watermark: Option<Watermark>,
 }
 
 /// Map an executed Arrow result schema onto view columns, validating that the

@@ -179,6 +179,40 @@ impl DataSource for PostgresSource {
         Ok(self.explain_rows(sql))
     }
 
+    /// The version token is `relfilenode` plus the cumulative tuple-counter
+    /// sum from `pg_stat_all_tables`. relfilenode alone catches rewrites
+    /// (TRUNCATE / VACUUM FULL / CLUSTER) but misses ordinary DML, so the
+    /// counter sum (`n_tup_ins + n_tup_upd + n_tup_del + n_dead_tup`) is
+    /// required; ANY difference - including a counter reset that DECREASES the
+    /// sum - compares unequal, which makes the refresh re-pull, the safe
+    /// direction. The cumulative-statistics flush is asynchronous, so a token
+    /// read racing a just-committed write may still show the old sum; that
+    /// refresh skips and the NEXT one (after the flush) sees the change - a
+    /// bounded staleness the operator accepts by relying on the skip. A table
+    /// pg does not know returns None (the refresh then pulls and the pull
+    /// itself raises loudly).
+    fn source_token(&self, schema: &str, table: &str) -> Result<Option<String>, CatalogError> {
+        self.with_client(|client| {
+            let row = client.query_opt(
+                "SELECT c.relfilenode::bigint, \
+                        coalesce(s.n_tup_ins, 0) + coalesce(s.n_tup_upd, 0) + \
+                        coalesce(s.n_tup_del, 0) + coalesce(s.n_dead_tup, 0) \
+                 FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 LEFT JOIN pg_stat_all_tables s ON s.relid = c.oid \
+                 WHERE n.nspname = $1 AND c.relname = $2",
+                &[&schema, &table],
+            )?;
+            Ok(row.map(|row| {
+                format!(
+                    "pg:relfilenode={},tup={}",
+                    row.get::<_, i64>(0),
+                    row.get::<_, i64>(1)
+                )
+            }))
+        })
+    }
+
     fn map_native_type(&self, type_str: &str) -> Result<DataType, CatalogError> {
         // Postgres uuid arrives as text on the fetch path, so the catalog maps it
         // to VARCHAR too (else the two paths would disagree on the same column).

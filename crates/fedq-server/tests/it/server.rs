@@ -69,6 +69,7 @@ fn shop_config(path: &str, server: ServerConfig) -> Config {
             ty: "duckdb".to_owned(),
             config: params,
             capabilities: Vec::new(),
+            change_keys: BTreeMap::new(),
         },
     );
     Config {

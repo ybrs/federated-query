@@ -19,6 +19,9 @@ use fq_catalog::{
 pub struct DuckDbSource {
     name: String,
     connection: Mutex<Connection>,
+    /// The database file path; None for an in-memory database (which has no
+    /// on-disk bytes to derive a version token from).
+    path: Option<String>,
 }
 
 impl DuckDbSource {
@@ -28,6 +31,7 @@ impl DuckDbSource {
         Ok(Self {
             name: name.into(),
             connection: Mutex::new(connection),
+            path: Some(path.to_string()),
         })
     }
 
@@ -49,6 +53,7 @@ impl DuckDbSource {
         Ok(Self {
             name: name.into(),
             connection: Mutex::new(connection),
+            path: None,
         })
     }
 
@@ -190,6 +195,46 @@ impl DataSource for DuckDbSource {
         }
         Ok(None)
     }
+
+    /// The version token is whole-file: DuckDB stores every table in one
+    /// database file, so any write moves the token and the requested table is
+    /// irrelevant to it. The token covers the main file AND its `.wal`
+    /// sidecar - between checkpoints a write lands only in the WAL, so the
+    /// main file's size/mtime alone would report an unchanged source while
+    /// committed rows sit in the WAL. An in-memory database has no file and
+    /// honestly abstains.
+    fn source_token(&self, _schema: &str, _table: &str) -> Result<Option<String>, CatalogError> {
+        let Some(path) = &self.path else {
+            return Ok(None);
+        };
+        let main = file_stamp(path)?.ok_or_else(|| {
+            CatalogError::Source(format!(
+                "duckdb database file '{path}' of source {} does not exist",
+                self.name
+            ))
+        })?;
+        // A missing WAL is the normal checkpointed state, not an error.
+        let wal = file_stamp(&format!("{path}.wal"))?.unwrap_or_else(|| "absent".to_string());
+        Ok(Some(format!("duckdb-file:{main};wal:{wal}")))
+    }
+}
+
+/// The `(size, mtime_ns)` stamp of one file, or None when it does not exist;
+/// any other filesystem failure raises.
+fn file_stamp(path: &str) -> Result<Option<String>, CatalogError> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(CatalogError::Source(format!("stat '{path}': {error}"))),
+    };
+    let modified = metadata
+        .modified()
+        .map_err(|error| CatalogError::Source(format!("mtime of '{path}': {error}")))?;
+    let mtime_ns = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| CatalogError::Source(format!("mtime of '{path}': {error}")))?
+        .as_nanos();
+    Ok(Some(format!("size={},mtime_ns={mtime_ns}", metadata.len())))
 }
 
 impl DuckDbSource {

@@ -17,8 +17,10 @@
 //!   name collision, and a drop that silently does nothing hides a typo'd name.
 //! - `WITH DATA` / `WITH NO DATA`: creation always populates; there is no
 //!   deferred-population form.
-//! - `REFRESH ... CONCURRENTLY` and any refresh data option: refresh is a whole
-//!   re-pull; delta/concurrent refresh is not supported and raises.
+//! - `REFRESH ... CONCURRENTLY` and any refresh data option: how a refresh
+//!   pulls (delta vs whole) is decided by the engine from the datasource
+//!   change-key config, not by statement options; publication is atomic and
+//!   never blocks readers, so CONCURRENTLY has no meaning here.
 //! - Storage options (`WITH (...)`, `USING`, `TABLESPACE`), `CASCADE`/`RESTRICT`,
 //!   and a schema-qualified view name: a materialized view lives in the engine's
 //!   own store, so none of these have a meaning here.
@@ -136,16 +138,19 @@ fn reject_trailing_data_option(select_sql: &str) -> Result<(), ParseError> {
     Ok(())
 }
 
-/// Parse `REFRESH MATERIALIZED VIEW <name>`, raising on CONCURRENTLY (a delta
-/// refresh option; refresh is a whole re-pull) and on any trailing tokens.
+/// Parse `REFRESH MATERIALIZED VIEW <name>`, raising on CONCURRENTLY and on
+/// any trailing tokens (WITH [NO] DATA, a second name). The statement takes no
+/// options: whether the refresh pulls a delta or the whole view is decided by
+/// the engine from the datasource change-key config, and chunk publication is
+/// already atomic (readers are never blocked), so CONCURRENTLY has no meaning.
 fn classify_refresh<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
     tokens.expect_keyword("REFRESH")?;
     tokens.expect_keyword("MATERIALIZED")?;
     tokens.expect_keyword("VIEW")?;
     if tokens.peek_word_is("CONCURRENTLY") {
         return Err(ParseError::Unsupported(
-            "REFRESH MATERIALIZED VIEW CONCURRENTLY: refresh re-pulls the whole \
-             view; concurrent/delta refresh is not supported"
+            "REFRESH MATERIALIZED VIEW CONCURRENTLY: publication is atomic and \
+             readers are never blocked, so CONCURRENTLY has no meaning here"
                 .to_string(),
         ));
     }

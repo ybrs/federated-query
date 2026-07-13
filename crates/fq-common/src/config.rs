@@ -24,13 +24,48 @@ const KNOWN_SECTIONS: [&str; 5] = ["datasources", "optimizer", "executor", "cost
 ///
 /// `ty` is the Python `type` field (renamed - `type` is a Rust keyword). `config`
 /// holds the connector-specific connection params (every block key that is not
-/// `type` or `capabilities`), preserved as raw YAML values.
+/// `type`, `capabilities`, or `change_keys`), preserved as raw YAML values.
+/// `change_keys` declares, per `schema.table`, how the table changes; REFRESH
+/// MATERIALIZED VIEW uses it to pull deltas instead of whole re-pulls.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DataSourceConfig {
     pub name: String,
     pub ty: String,
     pub config: BTreeMap<String, Value>,
     pub capabilities: Vec<String>,
+    pub change_keys: BTreeMap<String, ChangeKey>,
+}
+
+/// How one table changes, declared under a datasource's `change_keys` block,
+/// keyed by `schema.table`. The declaration is an ASSERTION about the table
+/// that a delta refresh trusts:
+///
+/// - `{ column: <name> }`: the column is monotonic and non-null (an
+///   `updated_at` timestamp, an append-only id) and rows are only ever ADDED
+///   with values above every previously seen one. Refresh pulls rows past the
+///   stored high-water mark and appends them.
+/// - `{ primary_key: <name> }`: the column uniquely keys every row; rows may
+///   be inserted, updated, and deleted arbitrarily. Refresh merges a fresh
+///   pull by key, rewriting only the chunks whose rows changed.
+///
+/// Exactly one of the two forms per table; declaring both raises at load
+/// (a watermarked merge cannot see deletes, so the combination would ship a
+/// deleted row as current).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangeKey {
+    /// Monotonic column: delta refresh appends rows past the watermark.
+    Monotonic { column: String },
+    /// Primary key: delta refresh merges a fresh pull by this key.
+    PrimaryKey { column: String },
+}
+
+impl ChangeKey {
+    /// The declared column name, whichever form carries it.
+    pub fn column(&self) -> &str {
+        match self {
+            ChangeKey::Monotonic { column } | ChangeKey::PrimaryKey { column } => column,
+        }
+    }
 }
 
 /// Configuration for the query optimizer: the rule enable flags, the
@@ -266,20 +301,30 @@ fn parse_datasources(mapping: &Mapping) -> Result<BTreeMap<String, DataSourceCon
     Ok(datasources)
 }
 
-/// Build one `DataSourceConfig` from its YAML block: pull out `type` and
-/// `capabilities`, and keep every other key as a connection param in `config`.
+/// Build one `DataSourceConfig` from its YAML block: pull out `type`,
+/// `capabilities`, and `change_keys`, and keep every other key as a connection
+/// param in `config`.
 fn parse_one_datasource(name: &str, block: &Value) -> Result<DataSourceConfig, ConfigError> {
     let map = block
         .as_mapping()
         .ok_or_else(|| ConfigError::DatasourceNotMapping(name.to_string()))?;
     let mut ty = None;
     let mut capabilities = Vec::new();
+    let mut change_keys = BTreeMap::new();
     let mut config = BTreeMap::new();
     for (key_value, value) in map {
         let key = key_value
             .as_str()
             .ok_or_else(|| ConfigError::NonStringDatasourceKey(name.to_string()))?;
-        assign_datasource_field(name, key, value, &mut ty, &mut capabilities, &mut config)?;
+        assign_datasource_field(
+            name,
+            key,
+            value,
+            &mut ty,
+            &mut capabilities,
+            &mut change_keys,
+            &mut config,
+        )?;
     }
     let ty = ty.ok_or_else(|| ConfigError::MissingDatasourceType(name.to_string()))?;
     Ok(DataSourceConfig {
@@ -287,17 +332,19 @@ fn parse_one_datasource(name: &str, block: &Value) -> Result<DataSourceConfig, C
         ty,
         config,
         capabilities,
+        change_keys,
     })
 }
 
-/// Route a single data-source block key into `type`, `capabilities`, or the
-/// leftover connection-param `config` map.
+/// Route a single data-source block key into `type`, `capabilities`,
+/// `change_keys`, or the leftover connection-param `config` map.
 fn assign_datasource_field(
     name: &str,
     key: &str,
     value: &Value,
     ty: &mut Option<String>,
     capabilities: &mut Vec<String>,
+    change_keys: &mut BTreeMap<String, ChangeKey>,
     config: &mut BTreeMap<String, Value>,
 ) -> Result<(), ConfigError> {
     match key {
@@ -310,11 +357,136 @@ fn assign_datasource_field(
         "capabilities" => {
             *capabilities = parse_capabilities(name, value)?;
         }
+        "change_keys" => {
+            *change_keys = parse_change_keys(name, value)?;
+        }
         other => {
             config.insert(other.to_string(), value.clone());
         }
     }
     Ok(())
+}
+
+/// Parse a datasource's `change_keys` block: a mapping of `schema.table` to
+/// one change-key declaration. Every malformed shape raises naming the
+/// datasource and the offense; a silently dropped declaration would leave the
+/// operator believing refreshes are deltas when they are whole re-pulls.
+fn parse_change_keys(
+    name: &str,
+    value: &Value,
+) -> Result<BTreeMap<String, ChangeKey>, ConfigError> {
+    let map = value.as_mapping().ok_or_else(|| {
+        ConfigError::BadChangeKeys(name.to_string(), "must be a mapping".to_string())
+    })?;
+    let mut change_keys = BTreeMap::new();
+    for (table_value, declaration) in map {
+        let table_key = table_value.as_str().ok_or_else(|| {
+            ConfigError::BadChangeKeys(name.to_string(), "table key must be a string".to_string())
+        })?;
+        require_schema_table_key(name, table_key)?;
+        change_keys.insert(
+            table_key.to_string(),
+            parse_one_change_key(name, table_key, declaration)?,
+        );
+    }
+    Ok(change_keys)
+}
+
+/// Raise unless `table_key` is a `schema.table` pair with both parts non-empty.
+/// The refresh path resolves the declaration against the catalog by that exact
+/// split; a bare or over-qualified name would silently never match a table.
+fn require_schema_table_key(name: &str, table_key: &str) -> Result<(), ConfigError> {
+    let well_formed = match table_key.split_once('.') {
+        Some((schema, table)) => !schema.is_empty() && !table.is_empty() && !table.contains('.'),
+        None => false,
+    };
+    if well_formed {
+        return Ok(());
+    }
+    Err(ConfigError::BadChangeKeys(
+        name.to_string(),
+        format!("table key '{table_key}' must be of the form schema.table"),
+    ))
+}
+
+/// Parse one change-key declaration: a mapping with exactly one of `column`
+/// (monotonic) or `primary_key` (merge), each a string.
+fn parse_one_change_key(
+    name: &str,
+    table_key: &str,
+    declaration: &Value,
+) -> Result<ChangeKey, ConfigError> {
+    let map = declaration.as_mapping().ok_or_else(|| {
+        ConfigError::BadChangeKeys(
+            name.to_string(),
+            format!("'{table_key}' declaration must be a mapping"),
+        )
+    })?;
+    let mut monotonic = None;
+    let mut primary_key = None;
+    for (key_value, value) in map {
+        let key = change_key_field(name, table_key, key_value)?;
+        let column = change_key_column(name, table_key, key, value)?;
+        match key {
+            "column" => monotonic = Some(column),
+            // `change_key_field` admits only the two names.
+            _ => primary_key = Some(column),
+        }
+    }
+    match (monotonic, primary_key) {
+        (Some(column), None) => Ok(ChangeKey::Monotonic { column }),
+        (None, Some(column)) => Ok(ChangeKey::PrimaryKey { column }),
+        (Some(_), Some(_)) => Err(ConfigError::BadChangeKeys(
+            name.to_string(),
+            format!(
+                "'{table_key}' declares both 'column' and 'primary_key'; a watermarked \
+                 merge cannot see deletes, declare exactly one"
+            ),
+        )),
+        (None, None) => Err(ConfigError::BadChangeKeys(
+            name.to_string(),
+            format!("'{table_key}' must declare 'column' or 'primary_key'"),
+        )),
+    }
+}
+
+/// The field name of one declaration entry; only `column` and `primary_key`
+/// exist, anything else is a typo and raises.
+fn change_key_field<'a>(
+    name: &str,
+    table_key: &str,
+    key_value: &'a Value,
+) -> Result<&'a str, ConfigError> {
+    let key = key_value.as_str().ok_or_else(|| {
+        ConfigError::BadChangeKeys(
+            name.to_string(),
+            format!("'{table_key}' declaration key must be a string"),
+        )
+    })?;
+    if key == "column" || key == "primary_key" {
+        return Ok(key);
+    }
+    Err(ConfigError::BadChangeKeys(
+        name.to_string(),
+        format!("'{table_key}' has unknown declaration key '{key}'"),
+    ))
+}
+
+/// The column name of one declaration entry; must be a non-empty string.
+fn change_key_column(
+    name: &str,
+    table_key: &str,
+    key: &str,
+    value: &Value,
+) -> Result<String, ConfigError> {
+    let column = value.as_str().unwrap_or("");
+    if column.is_empty() {
+        return Err(ConfigError::BadChangeKeys(
+            name.to_string(),
+            format!("'{table_key}' '{key}' must be a non-empty string"),
+        ));
+    }
+    Ok(column.to_string())
 }
 
 /// Parse a `capabilities` value into a list of strings, raising on any non-string

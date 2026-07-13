@@ -326,3 +326,145 @@ server:
     assert!(result.is_err(), "unknown user key must raise");
     std::fs::remove_file(&path).ok();
 }
+
+/// Load a one-datasource config whose block carries the given `change_keys`
+/// YAML fragment, returning the load result.
+fn load_with_change_keys(
+    name: &str,
+    change_keys_yaml: &str,
+) -> Result<fq_common::Config, ConfigError> {
+    let config_yaml = format!(
+        "
+datasources:
+  warehouse:
+    type: postgresql
+    host: localhost
+    database: test
+    user: test
+    change_keys:
+{change_keys_yaml}
+"
+    );
+    let path = write_temp(name, &config_yaml);
+    let result = load_config(path.to_str().unwrap());
+    std::fs::remove_file(&path).ok();
+    result
+}
+
+#[test]
+fn test_change_keys_parse_both_forms() {
+    let config = load_with_change_keys(
+        "change_keys_ok",
+        "      public.sales: { column: updated_at }
+      public.customer: { primary_key: c_custkey }",
+    )
+    .expect("load config");
+    let ds = &config.datasources["warehouse"];
+    assert_eq!(ds.change_keys.len(), 2);
+    assert_eq!(
+        ds.change_keys["public.sales"],
+        fq_common::ChangeKey::Monotonic {
+            column: "updated_at".to_string()
+        }
+    );
+    assert_eq!(
+        ds.change_keys["public.customer"],
+        fq_common::ChangeKey::PrimaryKey {
+            column: "c_custkey".to_string()
+        }
+    );
+    // change_keys is config structure, not a connection param.
+    assert!(!ds.config.contains_key("change_keys"));
+}
+
+#[test]
+fn test_change_keys_absent_is_empty() {
+    let minimal = "
+datasources:
+  test_duck:
+    type: duckdb
+    path: /tmp/x.duckdb
+";
+    let path = write_temp("change_keys_absent", minimal);
+    let config = load_config(path.to_str().unwrap()).expect("load config");
+    assert!(config.datasources["test_duck"].change_keys.is_empty());
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn test_change_keys_both_forms_on_one_table_raise() {
+    let error = load_with_change_keys(
+        "change_keys_both",
+        "      public.sales: { column: updated_at, primary_key: id }",
+    )
+    .expect_err("must raise");
+    match error {
+        ConfigError::BadChangeKeys(ds, message) => {
+            assert_eq!(ds, "warehouse");
+            assert!(message.contains("both"), "{message}");
+        }
+        other => panic!("expected BadChangeKeys, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_change_keys_empty_declaration_raises() {
+    let error = load_with_change_keys("change_keys_empty", "      public.sales: {}")
+        .expect_err("must raise");
+    assert!(
+        matches!(error, ConfigError::BadChangeKeys(_, _)),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn test_change_keys_unknown_declaration_key_raises() {
+    let error = load_with_change_keys(
+        "change_keys_unknown",
+        "      public.sales: { colunm: updated_at }",
+    )
+    .expect_err("must raise");
+    match error {
+        ConfigError::BadChangeKeys(_, message) => assert!(message.contains("colunm"), "{message}"),
+        other => panic!("expected BadChangeKeys, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_change_keys_table_key_must_be_schema_table() {
+    // A bare table name, an over-qualified name, and empty halves all raise:
+    // the refresh path matches declarations by an exact schema.table split.
+    for bad_key in ["sales", "db.public.sales", ".sales", "public."] {
+        let error = load_with_change_keys(
+            "change_keys_badtable",
+            &format!("      {bad_key}: {{ column: updated_at }}"),
+        )
+        .expect_err("must raise");
+        match error {
+            ConfigError::BadChangeKeys(_, message) => {
+                assert!(message.contains("schema.table"), "{bad_key}: {message}");
+            }
+            other => panic!("expected BadChangeKeys for '{bad_key}', got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_change_keys_non_string_column_raises() {
+    let error = load_with_change_keys("change_keys_nonstring", "      public.sales: { column: 7 }")
+        .expect_err("must raise");
+    assert!(
+        matches!(error, ConfigError::BadChangeKeys(_, _)),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn test_change_keys_non_mapping_raises() {
+    let error = load_with_change_keys("change_keys_nonmap", "      public.sales: updated_at")
+        .expect_err("must raise");
+    assert!(
+        matches!(error, ConfigError::BadChangeKeys(_, _)),
+        "{error:?}"
+    );
+}

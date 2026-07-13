@@ -203,3 +203,47 @@ fn test_probe_measures_statless_table() {
     assert_eq!(stats.row_count, Some(5));
     assert_eq!(stats.column_stats["grp"].num_distinct, Some(2));
 }
+
+#[test]
+fn test_source_token_is_stable_and_moves_on_a_rewrite() {
+    let Some(fixture) = people_fixture() else {
+        eprintln!("postgres unreachable; skipping");
+        return;
+    };
+    let first = fixture
+        .source
+        .source_token(&fixture.schema, "people")
+        .expect("token")
+        .expect("a known pg table has a token");
+    assert!(first.contains("relfilenode="), "{first}");
+    // Two reads with no intervening change agree.
+    let second = fixture
+        .source
+        .source_token(&fixture.schema, "people")
+        .expect("token")
+        .expect("token");
+    assert_eq!(first, second);
+
+    // TRUNCATE assigns a new relfilenode - a deterministic catalog change, no
+    // dependence on the asynchronous statistics flush.
+    fixture
+        .source
+        .execute(&format!("TRUNCATE {}.people", fixture.schema))
+        .expect("truncate");
+    let truncated = fixture
+        .source
+        .source_token(&fixture.schema, "people")
+        .expect("token")
+        .expect("token");
+    assert_ne!(first, truncated);
+
+    // A table pg does not know abstains (the refresh then pulls, and the pull
+    // raises loudly on the missing relation).
+    assert_eq!(
+        fixture
+            .source
+            .source_token(&fixture.schema, "ghost")
+            .expect("token"),
+        None
+    );
+}

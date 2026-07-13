@@ -226,3 +226,42 @@ fn a_directory_with_no_parquet_files_raises() {
 fn a_missing_directory_raises() {
     assert!(ParquetSource::open("pq", "/nonexistent/parquet/dir/xyz").is_err());
 }
+
+#[test]
+fn source_token_stamps_the_table_file_and_moves_when_it_is_replaced() {
+    let dir = temp_dir("token");
+    write_parquet(&dir, "region", &region_batch());
+    let source = ParquetSource::open("pq", dir.to_str().expect("utf-8")).expect("open");
+
+    let first = source
+        .source_token("main", "region")
+        .expect("token")
+        .expect("a parquet table has a token");
+    assert_eq!(
+        first,
+        source
+            .source_token("main", "region")
+            .expect("token")
+            .expect("token"),
+        "no change, same token"
+    );
+
+    // Replacing the file (the only way parquet data changes) moves the stamp.
+    // The replacement carries an extra row group so its SIZE differs; the test
+    // does not lean on filesystem mtime granularity.
+    let path = dir.join("region.parquet");
+    let file = File::create(&path).expect("recreate parquet file");
+    let batch = region_batch();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), None).expect("arrow writer");
+    writer.write(&batch).expect("write batch");
+    writer.write(&batch).expect("write batch again");
+    writer.close().expect("close writer");
+    let replaced = source
+        .source_token("main", "region")
+        .expect("token")
+        .expect("token");
+    assert_ne!(first, replaced);
+
+    // A table this source never listed raises loudly.
+    assert!(source.source_token("main", "ghost").is_err());
+}

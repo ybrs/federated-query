@@ -9,19 +9,20 @@
 //! tombstoned row stops resolving immediately, its files are unlinked after,
 //! and `sweep_tombstones` finishes any drop a crash interrupted.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::AccelError;
-use crate::view::{MaterializedView, ViewColumn};
+use crate::view::{ChangeKeyState, MaterializedView, ViewColumn};
 
 /// Supplies timestamp strings (RFC3339); injectable so tests control time.
 pub type Clock = fq_catalog::Clock;
 
-/// The registry table. `source_tokens` and `change_key` are declared but not
-/// read or written anywhere: refresh is a whole re-pull, and the statement
-/// layer raises on every delta-refresh option.
+/// The registry table. `source_tokens` is the JSON token map captured before
+/// the last pull; `change_key` is the JSON delta-append state (NULL for a
+/// view last pulled by merge or whole re-pull, which carry no state).
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS materialized_views (
     name TEXT PRIMARY KEY,
     definition_sql TEXT NOT NULL,
@@ -39,7 +40,7 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS materialized_views (
 
 /// The SELECT list every row read uses, in `row_to_view` order.
 const ROW_COLUMNS: &str = "name, definition_sql, location, chunk_list, output_schema, \
-     measured_rows, byte_size, created_at, refreshed_at";
+     measured_rows, byte_size, created_at, refreshed_at, source_tokens, change_key";
 
 /// A SQLite-backed registry of materialized views for one config.
 pub struct ViewCatalog {
@@ -79,8 +80,8 @@ impl ViewCatalog {
             .execute(
                 "INSERT OR IGNORE INTO materialized_views \
              (name, definition_sql, location, chunk_list, output_schema, \
-              measured_rows, byte_size, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+              measured_rows, byte_size, created_at, source_tokens, change_key) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     view.name,
                     view.definition_sql,
@@ -90,6 +91,8 @@ impl ViewCatalog {
                     view.measured_rows,
                     view.byte_size,
                     (self.clock)(),
+                    serde_json::to_string(&view.source_tokens)?,
+                    encode_change_key(view.change_key.as_ref())?,
                 ],
             )?;
         if inserted == 0 {
@@ -141,15 +144,18 @@ impl ViewCatalog {
     }
 
     /// Swap a live view's chunk list (a refresh publication) in one
-    /// transaction: the new chunks, sizes, and `refreshed_at` land together,
-    /// AFTER the new chunk files are already in place. Raises `UnknownView`
-    /// when the name is absent or tombstoned.
+    /// transaction: the new chunks, sizes, source tokens, change-key state,
+    /// and `refreshed_at` land together, AFTER the new chunk files are already
+    /// in place - a reader sees either the whole old row or the whole new one.
+    /// Raises `UnknownView` when the name is absent or tombstoned.
     pub fn publish_refresh(
         &self,
         name: &str,
         chunk_list: &[String],
         measured_rows: i64,
         byte_size: i64,
+        source_tokens: &BTreeMap<String, String>,
+        change_key: Option<&ChangeKeyState>,
     ) -> Result<(), AccelError> {
         let updated = self
             .conn
@@ -157,7 +163,7 @@ impl ViewCatalog {
             .expect("view catalog lock poisoned")
             .execute(
                 "UPDATE materialized_views SET chunk_list = ?2, measured_rows = ?3, \
-             byte_size = ?4, refreshed_at = ?5 \
+             byte_size = ?4, refreshed_at = ?5, source_tokens = ?6, change_key = ?7 \
              WHERE name = ?1 AND deleted_at IS NULL",
                 params![
                     name,
@@ -165,6 +171,8 @@ impl ViewCatalog {
                     measured_rows,
                     byte_size,
                     (self.clock)(),
+                    serde_json::to_string(source_tokens)?,
+                    encode_change_key(change_key)?,
                 ],
             )?;
         if updated == 0 {
@@ -221,6 +229,8 @@ type RawRow = (
     i64,
     String,
     Option<String>,
+    Option<String>,
+    Option<String>,
 );
 
 /// Read one row's columns in `ROW_COLUMNS` order.
@@ -235,6 +245,8 @@ fn row_to_raw(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
         row.get(6)?,
         row.get(7)?,
         row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
     ))
 }
 
@@ -250,6 +262,8 @@ fn raw_to_view(raw: RawRow) -> Result<MaterializedView, AccelError> {
         byte_size,
         created_at,
         refreshed_at,
+        source_tokens,
+        change_key,
     ) = raw;
     let chunk_list: Vec<String> = serde_json::from_str(&chunk_list)?;
     let columns: Vec<ViewColumn> = serde_json::from_str(&output_schema)?;
@@ -263,7 +277,33 @@ fn raw_to_view(raw: RawRow) -> Result<MaterializedView, AccelError> {
         byte_size,
         created_at,
         refreshed_at,
+        source_tokens: decode_tokens(source_tokens.as_deref())?,
+        change_key: decode_change_key(change_key.as_deref())?,
     })
+}
+
+/// Encode the optional change-key state for its nullable TEXT column.
+fn encode_change_key(state: Option<&ChangeKeyState>) -> Result<Option<String>, AccelError> {
+    match state {
+        Some(state) => Ok(Some(serde_json::to_string(state)?)),
+        None => Ok(None),
+    }
+}
+
+/// Decode the token map; a NULL column is an empty map.
+fn decode_tokens(text: Option<&str>) -> Result<BTreeMap<String, String>, AccelError> {
+    match text {
+        Some(text) => Ok(serde_json::from_str(text)?),
+        None => Ok(BTreeMap::new()),
+    }
+}
+
+/// Decode the optional change-key state.
+fn decode_change_key(text: Option<&str>) -> Result<Option<ChangeKeyState>, AccelError> {
+    match text {
+        Some(text) => Ok(Some(serde_json::from_str(text)?)),
+        None => Ok(None),
+    }
 }
 
 /// The wall-clock stamp: current UTC time as an RFC3339 string.

@@ -73,6 +73,7 @@ impl Sandbox {
                 ty: "duckdb".to_string(),
                 config: params,
                 capabilities: Vec::new(),
+                change_keys: BTreeMap::new(),
             },
         );
         Config {
@@ -206,11 +207,18 @@ fn serving_trusts_the_last_pull_until_refresh() {
         .expect("direct read");
     assert_eq!(int_string_rows(&direct).len(), 4);
 
-    // REFRESH re-pulls the whole view; it now serves the new row too.
+    // REFRESH re-pulls the whole view (this sandbox declares no change keys,
+    // and the status row says exactly that); it now serves the new row too.
     let refreshed = runtime
         .execute("REFRESH MATERIALIZED VIEW fresh_regions")
         .expect("refresh");
-    assert_status(&refreshed, "REFRESH MATERIALIZED VIEW");
+    let status = string_rows(&refreshed.1);
+    assert_eq!(status.len(), 1);
+    assert!(
+        status[0].starts_with("REFRESH MATERIALIZED VIEW (whole re-pull:"),
+        "{status:?}"
+    );
+    assert!(status[0].contains("no declared change key"), "{status:?}");
     let (_, current) = runtime
         .execute("SELECT r_regionkey, r_name FROM fresh_regions ORDER BY r_regionkey, r_name")
         .expect("fresh read");

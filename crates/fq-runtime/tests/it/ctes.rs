@@ -71,6 +71,7 @@ fn duck_datasource(name: &str, path: &str) -> DataSourceConfig {
         ty: "duckdb".to_string(),
         config: params,
         capabilities: Vec::new(),
+        change_keys: BTreeMap::new(),
     }
 }
 
