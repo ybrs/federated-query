@@ -9,12 +9,16 @@
 //! on the free variables. No correlation survives. Ports `_unnest_dependent_scalar`
 //! and its builders from `decorrelation.py`.
 //!
-//! The LATERAL fallback (`lateral_scalar`) is the last resort for a subquery
-//! shape neither recognizer matches: it emits a `LateralJoin` node (which the
-//! engine cannot execute) rather than a broken plan, and raises if even the
-//! lateral body is unshaped. A user-written LATERAL is not reachable through the
-//! current parser/binder (joins bind to `Join`, never `LateralJoin`), so
-//! `rewrite_lateral_join` recurses in place - the documented safe default.
+//! The LATERAL fallback (`lateral_scalar`) is the last resort for a correlated
+//! scalar subquery shape neither recognizer matches: it emits a `LateralJoin`
+//! node (which the engine cannot execute) rather than a broken plan, and raises
+//! if even the lateral body is unshaped.
+//!
+//! A user-written LATERAL join (from `FROM a, LATERAL (...)` or `JOIN LATERAL`)
+//! parses to a `LateralJoin`; `rewrite_lateral_join` flattens it through the same
+//! Case A / Case B recognizers, re-exposing the derived table's columns under its
+//! alias and driving the join-back with the lateral's own join type. A body
+//! neither recognizer matches raises.
 
 use std::collections::HashSet;
 
@@ -128,7 +132,14 @@ impl Decorrelator {
             &dom_map,
             &dep_prefix,
         )?;
-        let joined = join_back(plan, dependent, &free_vars, &dom_map, &dep_prefix)?;
+        let joined = join_back(
+            plan,
+            dependent,
+            &free_vars,
+            &dom_map,
+            &dep_prefix,
+            JoinType::Left,
+        )?;
         Ok((scalar_value_ref(&aggregates[0], &dep_prefix), joined))
     }
 
@@ -168,7 +179,14 @@ impl Decorrelator {
             &dom_map,
             &dep_prefix,
         )?;
-        let joined = join_back(plan, top_k, &free_vars, &dom_map, &dep_prefix)?;
+        let joined = join_back(
+            plan,
+            top_k,
+            &free_vars,
+            &dom_map,
+            &dep_prefix,
+            JoinType::Left,
+        )?;
         // A row subquery yields NULL (not 0) when no row matched, so no COALESCE.
         Ok((qualified_col(&dep_prefix, UNNEST_VALUE, value_type), joined))
     }
@@ -241,17 +259,124 @@ impl Decorrelator {
         Ok((qualified_col(&prefix, &value_name, value_type), joined))
     }
 
-    /// Rewrite a `LateralJoin` node in place: recurse into both sides and keep the
-    /// node. The current parser/binder never produces a `LateralJoin` (a
-    /// user-written LATERAL binds as an ordinary `Join`), so there is no reachable
-    /// body to unnest here; a `LateralJoin` the scalar fallback itself produced is
-    /// already fully built and is never re-entered through this path.
-    pub(crate) fn rewrite_lateral_join(&mut self, mut node: LateralJoin) -> Result<LogicalPlan> {
-        // In-place: recurse into both sides and keep the node; join_type preserved.
-        node.left = Box::new(self.rewrite_plan(*node.left)?);
-        node.right = Box::new(self.rewrite_plan(*node.right)?);
-        Ok(LogicalPlan::LateralJoin(node))
+    /// Flatten a user-written `LateralJoin` into the domain / per-domain-reduction
+    /// / join-back rewrite, so its columns become an ordinary joined relation the
+    /// engine executes cross-source. The right is a correlated derived table; its
+    /// body must be a recognized aggregate (Case A) or top-k (Case B) shape. The
+    /// derived table's own alias and output column names are re-exposed by the
+    /// reduced relation so references above the lateral resolve unchanged, and the
+    /// lateral's join type drives the join-back (LEFT keeps unmatched outer rows,
+    /// INNER drops them). An unrecognized body raises rather than emitting a plan
+    /// the engine cannot run.
+    pub(crate) fn rewrite_lateral_join(&mut self, node: LateralJoin) -> Result<LogicalPlan> {
+        let join_type = node.join_type;
+        let left = self.rewrite_plan(*node.left)?;
+        let (alias, output_names, body) = unwrap_lateral_derived(*node.right)?;
+        let body = self.rewrite_plan(body)?;
+        if let Some(shape) = dependent_shape(&body) {
+            return self.flatten_lateral_aggregate(left, shape, &alias, &output_names, join_type);
+        }
+        if let Some(shape) = dependent_limit_shape(&body) {
+            return self.flatten_lateral_limit(left, shape, &alias, &output_names, join_type);
+        }
+        Err(DecorrelationError::Unsupported(
+            "LATERAL body is neither an aggregate nor a top-k shape".to_string(),
+        ))
     }
+
+    /// Flatten a Case A (aggregate) LATERAL body: reduce the domain join once per
+    /// domain value into the derived table's columns, then join back.
+    fn flatten_lateral_aggregate(
+        &mut self,
+        left: LogicalPlan,
+        shape: DependentAggregate,
+        alias: &str,
+        output_names: &[String],
+        join_type: JoinType,
+    ) -> Result<LogicalPlan> {
+        let DependentAggregate {
+            correlated,
+            local,
+            inner,
+            free_vars,
+            aggregates,
+        } = shape;
+        let dom_prefix = self.next_prefix();
+        // The outer plan is both the domain source and the join-back left side, so
+        // the domain gets its own clone (`join_back` below consumes the original).
+        let (domain, dom_map) = build_domain(left.clone(), &free_vars, &dom_prefix);
+        let dependent = build_dependent_relation(
+            &aggregates,
+            output_names,
+            DomainJoin {
+                domain,
+                inner,
+                correlated,
+                local,
+            },
+            &dom_map,
+            alias,
+        )?;
+        join_back(left, dependent, &free_vars, &dom_map, alias, join_type)
+    }
+
+    /// Flatten a Case B (top-k) LATERAL body: rank the domain join per domain
+    /// value, cap to the top-k, expose the derived table's columns, then join back.
+    fn flatten_lateral_limit(
+        &mut self,
+        left: LogicalPlan,
+        shape: DependentLimit,
+        alias: &str,
+        output_names: &[String],
+        join_type: JoinType,
+    ) -> Result<LogicalPlan> {
+        let DependentLimit {
+            value,
+            order,
+            limit,
+            correlated,
+            local,
+            inner,
+            free_vars,
+        } = shape;
+        let dom_prefix = self.next_prefix();
+        // The outer plan is both the domain source and the join-back left side, so
+        // the domain gets its own clone (`join_back` below consumes the original).
+        let (domain, dom_map) = build_domain(left.clone(), &free_vars, &dom_prefix);
+        let top_k = self.build_top_k_relation(
+            &[value],
+            output_names,
+            order.as_ref(),
+            limit,
+            DomainJoin {
+                domain,
+                inner,
+                correlated,
+                local,
+            },
+            &dom_map,
+            alias,
+        )?;
+        join_back(left, top_k, &free_vars, &dom_map, alias, join_type)
+    }
+}
+
+/// Unwrap a LATERAL right (a derived table) into `(alias, output column names,
+/// body)`. The output names are the derived table's column-alias rename when it
+/// carries one, else the body's own output schema, so the flattened relation
+/// re-exposes exactly the names references above the lateral were bound to. A
+/// LATERAL right that is not a derived table raises.
+fn unwrap_lateral_derived(right: LogicalPlan) -> Result<(String, Vec<String>, LogicalPlan)> {
+    let LogicalPlan::SubqueryScan(node) = right else {
+        return Err(DecorrelationError::Unsupported(
+            "LATERAL right side is not a derived table".to_string(),
+        ));
+    };
+    let output_names = node
+        .column_names
+        .clone()
+        .unwrap_or_else(|| node.input.schema());
+    Ok((node.alias, output_names, *node.input))
 }
 
 /// Recognize `Aggregate([one agg], no GROUP BY, Filter(correlated, inner))`, the
@@ -448,23 +573,26 @@ fn dependent_join_condition(correlated: &[Expr], local: &[Expr], dom_map: &DomMa
     and_join(rewritten)
 }
 
-/// LEFT-join a reduced dependent relation back onto the outer plan, equating each
-/// outer free var to the dependent relation's re-exposed domain column. LEFT so an
-/// outer row with no matching group survives with a NULL value.
+/// Join a reduced dependent relation back onto the outer plan, equating each
+/// outer free var to the dependent relation's re-exposed domain column. A scalar
+/// subquery joins back LEFT (an outer row with no matching group survives with a
+/// NULL value); a user LATERAL uses its own join type (LEFT keeps unmatched outer
+/// rows, INNER drops them).
 fn join_back(
     plan: LogicalPlan,
     dependent: LogicalPlan,
     free_vars: &[ColumnRef],
     dom_map: &DomMap,
     dep_prefix: &str,
+    join_type: JoinType,
 ) -> Result<LogicalPlan> {
     let condition = join_back_condition(free_vars, dom_map, dep_prefix)?;
-    // Fresh LEFT join-back of the reduced dependent relation onto the outer plan - no
+    // Fresh join-back of the reduced dependent relation onto the outer plan - no
     // base to copy from. Field list is the complete Join struct (no estimates yet).
     Ok(LogicalPlan::Join(Join {
         left: Box::new(plan),
         right: Box::new(dependent),
-        join_type: JoinType::Left,
+        join_type,
         condition: Some(condition),
         natural: false,
         using: None,

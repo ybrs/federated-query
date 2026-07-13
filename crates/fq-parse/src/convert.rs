@@ -19,8 +19,8 @@ use std::collections::HashMap;
 use fq_catalog::Catalog;
 use fq_plan::expr::NullsOrder;
 use fq_plan::{
-    Aggregate, ColumnRef, Cte, CteRef, Expr, Filter, Join, JoinType, Limit, LogicalPlan,
-    Projection, Scan, SetOpKind, SetOperation, Sort, SubqueryScan, Values,
+    Aggregate, ColumnRef, Cte, CteRef, Expr, Filter, Join, JoinType, LateralJoin, Limit,
+    LogicalPlan, Projection, Scan, SetOpKind, SetOperation, Sort, SubqueryScan, Values,
 };
 use polyglot_sql::expressions::{Expression, JoinKind, Ordered, Select, TableRef, With};
 use polyglot_sql::traversal::ExpressionWalk;
@@ -216,25 +216,45 @@ impl<'a> Converter<'a> {
         // inner join live in WHERE, and the optimizer's join ordering recovers the
         // join graph from the CROSS+filter region (so no join is missed here).
         for item in rest {
-            let right = self.convert_from_item(select, item, &mut tables)?;
-            // Fresh CROSS join folding the next comma-FROM item onto the left-deep
-            // plan - no base join to copy from. Field list is the complete Join struct
-            // (no condition/estimates yet; the optimizer stamps those later).
-            plan = LogicalPlan::Join(Join {
-                left: Box::new(plan),
-                right: Box::new(right),
-                join_type: JoinType::Cross,
-                condition: None,
-                natural: false,
-                using: None,
-                estimated_rows: None,
-                estimate_defaults: None,
-            });
+            plan = self.fold_comma_item(select, plan, item, &mut tables)?;
         }
         for join in &select.joins {
             plan = self.apply_join(select, plan, join, &mut tables)?;
         }
         Ok((plan, tables))
+    }
+
+    /// Fold one comma-separated FROM item onto the left-deep plan. A
+    /// `LATERAL (subquery) alias` item is a dependent join whose right may
+    /// reference the left, so it becomes an INNER `LateralJoin`; any other item
+    /// is an implicit CROSS join.
+    fn fold_comma_item(
+        &self,
+        select: &Select,
+        left: LogicalPlan,
+        item: &Expression,
+        tables: &mut Vec<FromTable>,
+    ) -> Result<LogicalPlan, ParseError> {
+        if let Expression::Subquery(subquery) = item {
+            if subquery.lateral {
+                let right = self.derived_table(subquery, tables)?;
+                return Ok(lateral_join(left, right, JoinType::Inner));
+            }
+        }
+        let right = self.convert_from_item(select, item, tables)?;
+        // Fresh CROSS join folding the next comma-FROM item onto the left-deep
+        // plan - no base join to copy from. Field list is the complete Join struct
+        // (no condition/estimates yet; the optimizer stamps those later).
+        Ok(LogicalPlan::Join(Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: JoinType::Cross,
+            condition: None,
+            natural: false,
+            using: None,
+            estimated_rows: None,
+            estimate_defaults: None,
+        }))
     }
 
     /// Convert one FROM/JOIN item (base table or derived table), recording its
@@ -348,6 +368,11 @@ impl<'a> Converter<'a> {
         if !join.pivots.is_empty() || join.match_condition.is_some() || join.join_hint.is_some() {
             return Err(ParseError::Unsupported("join modifier".to_string()));
         }
+        if let Expression::Subquery(subquery) = &join.this {
+            if subquery.lateral {
+                return self.apply_lateral_join(left, join, subquery, tables);
+            }
+        }
         let right = self.convert_from_item(select, &join.this, tables)?;
         let (join_type, natural) = map_join_kind(join.kind)?;
         let condition = match &join.on {
@@ -372,6 +397,25 @@ impl<'a> Converter<'a> {
             estimated_rows: None,
             estimate_defaults: None,
         }))
+    }
+
+    /// Fold an explicit `JOIN LATERAL (subquery) alias ON ...` onto the left
+    /// plan as a `LateralJoin`. The right (a derived table) may reference the
+    /// left. `LEFT JOIN LATERAL` keeps non-matching left rows (join type LEFT);
+    /// plain/INNER/CROSS `JOIN LATERAL` is INNER. `LateralJoin` carries no ON
+    /// predicate, so the ON must be absent or the literal `TRUE`; any other ON
+    /// or a USING list cannot be represented and raises.
+    fn apply_lateral_join(
+        &self,
+        left: LogicalPlan,
+        join: &polyglot_sql::expressions::Join,
+        subquery: &polyglot_sql::expressions::Subquery,
+        tables: &mut Vec<FromTable>,
+    ) -> Result<LogicalPlan, ParseError> {
+        let join_type = lateral_join_type(join.kind)?;
+        require_trivial_lateral_on(join)?;
+        let right = self.derived_table(subquery, tables)?;
+        Ok(lateral_join(left, right, join_type))
     }
 
     /// Wrap the input in a `Filter` for the WHERE clause, if present.
@@ -746,6 +790,48 @@ fn table_key(table: &TableRef) -> String {
         .alias
         .as_ref()
         .map_or_else(|| table.name.name.clone(), |ident| ident.name.clone())
+}
+
+/// A dependent (INNER/LEFT) `LateralJoin` over the given sides. The right (a
+/// derived table) may reference the left; the node carries no ON predicate.
+fn lateral_join(left: LogicalPlan, right: LogicalPlan, join_type: JoinType) -> LogicalPlan {
+    // Fresh dependent join over the left plan and lateral derived table - no base
+    // to copy from. Field list (left/right/join_type) is the complete LateralJoin.
+    LogicalPlan::LateralJoin(LateralJoin {
+        left: Box::new(left),
+        right: Box::new(right),
+        join_type,
+    })
+}
+
+/// Map the join kind of a `JOIN LATERAL` to its `LateralJoin` join type. LEFT
+/// keeps unmatched left rows; INNER/CROSS/plain drops them. Other kinds
+/// (RIGHT/FULL/SEMI/...) have no lateral form and raise.
+fn lateral_join_type(kind: JoinKind) -> Result<JoinType, ParseError> {
+    match kind {
+        JoinKind::Left | JoinKind::LeftLateral => Ok(JoinType::Left),
+        JoinKind::Inner | JoinKind::Cross | JoinKind::Lateral => Ok(JoinType::Inner),
+        other => Err(ParseError::Unsupported(format!("{other:?} JOIN LATERAL"))),
+    }
+}
+
+/// A `LateralJoin` node carries no ON predicate, so an explicit `JOIN LATERAL`
+/// may only specify `ON TRUE` (or omit ON). Any other ON expression or a USING
+/// list carries a filter the node cannot represent and raises rather than being
+/// silently dropped.
+fn require_trivial_lateral_on(join: &polyglot_sql::expressions::Join) -> Result<(), ParseError> {
+    if !join.using.is_empty() {
+        return Err(ParseError::Unsupported(
+            "JOIN LATERAL ... USING".to_string(),
+        ));
+    }
+    match &join.on {
+        None => Ok(()),
+        Some(Expression::Boolean(boolean)) if boolean.value => Ok(()),
+        Some(_) => Err(ParseError::Unsupported(
+            "JOIN LATERAL with a non-trivial ON predicate".to_string(),
+        )),
+    }
 }
 
 /// Map a polyglot join kind to `(JoinType, natural)`; exotic kinds raise.

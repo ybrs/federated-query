@@ -23,8 +23,8 @@ use fq_catalog::{Catalog, Column, Table};
 use fq_common::update;
 use fq_plan::expr::ColumnRef;
 use fq_plan::{
-    Aggregate, Cte, CteRef, Explain, Expr, Filter, Join, Limit, LogicalPlan, Projection, Scan,
-    SetOperation, Sort, SubqueryScan, Values,
+    Aggregate, Cte, CteRef, Explain, Expr, Filter, Join, LateralJoin, Limit, LogicalPlan,
+    Projection, Scan, SetOperation, Sort, SubqueryScan, Values,
 };
 
 use crate::error::BindError;
@@ -74,6 +74,7 @@ impl<'a> Binder<'a> {
             LogicalPlan::Sort(sort) => self.bind_sort(sort),
             LogicalPlan::Limit(limit) => self.bind_limit(limit),
             LogicalPlan::Join(join) => self.bind_join(join),
+            LogicalPlan::LateralJoin(node) => self.bind_lateral_join(node),
             LogicalPlan::Aggregate(aggregate) => self.bind_aggregate(aggregate),
             LogicalPlan::SubqueryScan(node) => self.bind_subquery_scan(node),
             LogicalPlan::SetOperation(node) => self.bind_set_operation(node),
@@ -259,6 +260,23 @@ impl<'a> Binder<'a> {
         join.right = Box::new(right);
         join.condition = condition;
         Ok(LogicalPlan::Join(join))
+    }
+
+    /// Bind a LATERAL (dependent) join: bind the left, then bind the right WITH
+    /// the left's relation scope pushed, so a correlated reference in the right
+    /// resolves against the left. The lateral scope is popped before returning.
+    fn bind_lateral_join(&mut self, mut node: LateralJoin) -> Result<LogicalPlan, BindError> {
+        let left = self.bind(*node.left)?;
+        let mut scope = Scope::new();
+        self.collect_scope(&left, &mut scope)?;
+        self.scopes.push(scope);
+        let right = self.bind(*node.right);
+        self.scopes.pop();
+        // In-place on the owned node: overwrite only the rebound left/right;
+        // `join_type` is preserved untouched.
+        node.left = Box::new(left);
+        node.right = Box::new(right?);
+        Ok(LogicalPlan::LateralJoin(node))
     }
 
     /// Bind an Aggregate: bind the SELECT list (its `aggregates`), then the GROUP

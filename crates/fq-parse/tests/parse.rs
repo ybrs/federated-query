@@ -980,3 +980,111 @@ fn plain_group_by_keeps_no_grouping_sets() {
     let aggregate = find_aggregate(&plan);
     assert!(aggregate.grouping_sets.is_none());
 }
+
+/// Every column reference in an expression tree.
+fn collect_expr_column_refs(expr: &Expr, refs: &mut Vec<fq_plan::ColumnRef>) {
+    if let Expr::Column(column) = expr {
+        refs.push(column.clone());
+    }
+    for child in expr.children() {
+        collect_expr_column_refs(child, refs);
+    }
+}
+
+/// The single Filter node in a plan tree (panics if absent or ambiguous).
+fn find_filter(plan: &LogicalPlan) -> &fq_plan::Filter {
+    let mut found = None;
+    collect_filter(plan, &mut found);
+    found.expect("expected a Filter node")
+}
+
+/// Descend a plan tree looking for its (unique) Filter node.
+fn collect_filter<'a>(plan: &'a LogicalPlan, found: &mut Option<&'a fq_plan::Filter>) {
+    if let LogicalPlan::Filter(node) = plan {
+        assert!(found.is_none(), "more than one Filter in the plan");
+        *found = Some(node);
+    }
+    for child in plan.children() {
+        collect_filter(child, found);
+    }
+}
+
+#[test]
+fn left_join_lateral_becomes_left_lateral_join() {
+    // A LEFT JOIN LATERAL over a correlated derived table is a dependent join,
+    // not a plain derived table; the correlated outer reference stays intact.
+    let plan = parse(
+        "SELECT o.order_id, t.name FROM orders o \
+         LEFT JOIN LATERAL (SELECT p.name FROM products p WHERE p.id = o.product_id) t ON true",
+    )
+    .unwrap();
+    let lateral = find_lateral_join(&plan);
+    assert_eq!(lateral.join_type, fq_plan::JoinType::Left);
+    let LogicalPlan::SubqueryScan(right) = lateral.right.as_ref() else {
+        panic!(
+            "expected the lateral right to be a derived table, got {:?}",
+            lateral.right
+        );
+    };
+    assert_eq!(right.alias, "t");
+    // The subquery's WHERE keeps its correlated reference to the outer relation.
+    let filter = find_filter(&lateral.right);
+    let mut refs = Vec::new();
+    collect_expr_column_refs(&filter.predicate, &mut refs);
+    assert!(
+        refs.iter()
+            .any(|column| column.table.as_deref() == Some("o") && column.column == "product_id"),
+        "correlated ref o.product_id lost: {refs:?}",
+    );
+}
+
+#[test]
+fn comma_lateral_becomes_inner_lateral_join() {
+    // A comma-separated LATERAL is a dependent join with INNER semantics (an
+    // empty right drops the left row), never a plain implicit CROSS join.
+    let plan = parse(
+        "SELECT o.order_id, t.name FROM orders o, \
+         LATERAL (SELECT p.name FROM products p WHERE p.id = o.product_id) t",
+    )
+    .unwrap();
+    let lateral = find_lateral_join(&plan);
+    assert_eq!(lateral.join_type, fq_plan::JoinType::Inner);
+    let LogicalPlan::SubqueryScan(right) = lateral.right.as_ref() else {
+        panic!(
+            "expected the lateral right to be a derived table, got {:?}",
+            lateral.right
+        );
+    };
+    assert_eq!(right.alias, "t");
+}
+
+#[test]
+fn lateral_join_with_non_trivial_on_raises() {
+    // A LateralJoin carries no ON predicate; an ON that is not TRUE cannot be
+    // represented and must raise rather than silently drop the filter.
+    let error = parse(
+        "SELECT o.order_id, t.name FROM orders o \
+         LEFT JOIN LATERAL (SELECT p.name FROM products p WHERE p.id = o.product_id) t \
+         ON t.name = o.order_id",
+    )
+    .unwrap_err();
+    assert!(matches!(error, ParseError::Unsupported(_)), "got {error:?}");
+}
+
+/// The single LateralJoin node in a plan tree (panics if absent or ambiguous).
+fn find_lateral_join(plan: &LogicalPlan) -> &fq_plan::LateralJoin {
+    let mut found = None;
+    collect_lateral_join(plan, &mut found);
+    found.expect("expected a LateralJoin node")
+}
+
+/// Descend a plan tree looking for its (unique) LateralJoin node.
+fn collect_lateral_join<'a>(plan: &'a LogicalPlan, found: &mut Option<&'a fq_plan::LateralJoin>) {
+    if let LogicalPlan::LateralJoin(node) = plan {
+        assert!(found.is_none(), "more than one LateralJoin in the plan");
+        *found = Some(node);
+    }
+    for child in plan.children() {
+        collect_lateral_join(child, found);
+    }
+}
