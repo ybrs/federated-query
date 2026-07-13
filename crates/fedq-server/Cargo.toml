@@ -1,0 +1,44 @@
+[package]
+name = "fedq-server"
+version = "0.1.0"
+edition.workspace = true
+
+# fedq-server: a PostgreSQL wire-protocol front end over fq-runtime. It lets any
+# Postgres client (psql, tokio-postgres, JDBC, ...) run federated queries against
+# the engine as if it were a standalone database server. The library exposes the
+# accept loop (`serve`) and the pgwire handlers; the binary parses flags, loads a
+# config, and runs the loop. Execution is bridged to a per-connection worker
+# thread that owns its `Runtime` (see the lib.rs module doc for the rationale).
+
+[[bin]]
+name = "fedq-server"
+path = "src/main.rs"
+
+[dependencies]
+# The Postgres wire protocol server API, without the TLS/SCRAM crypto backends
+# (the `_ring`/`_aws-lc-rs` features). Trust startup needs no crypto, so the
+# plain `server-api` feature avoids pulling aws-lc-rs and its C toolchain build.
+pgwire = { version = "0.40", default-features = false, features = ["server-api"] }
+# The async runtime the pgwire server drives; `sync` provides the channels that
+# bridge the async handler to the per-connection Runtime worker thread.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync"] }
+# `stream::iter` turns a materialized Vec of encoded rows into the DataRow stream
+# QueryResponse consumes; `Sink` appears in the pgwire handler trait bounds.
+futures = "0.3"
+async-trait = "0.1"
+# Reading the engine's Arrow result: schema fields for the row description and
+# typed column downcasts for the wire encoding.
+arrow = "58"
+fq-common = { path = "../fq-common" }
+fq-runtime = { path = "../fq-runtime" }
+
+[dev-dependencies]
+# The integration test drives the server with a real Postgres client.
+tokio-postgres = "0.7"
+# The test seeds a tiny DuckDB fixture through the same connector the engine uses.
+fq-connectors = { path = "../fq-connectors" }
+# The test builds datasource config params as raw YAML values.
+serde_yaml = "0.9"
+
+[lints]
+workspace = true
