@@ -275,3 +275,54 @@ fn test_source_path_recorded() {
     assert_eq!(config.source_path.as_deref(), Some(path.to_str().unwrap()));
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn test_server_section_absent_means_no_users() {
+    // With no server section, the config defaults to an empty user list, which the
+    // wire server reads as trust authentication.
+    let path = write_temp("server_absent", "datasources: {}\n");
+    let config = load_config(path.to_str().unwrap()).expect("load config");
+    assert!(config.server.users.is_empty());
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn test_server_section_parses_users() {
+    // A server section carries the SCRAM credential fields verbatim; the plaintext
+    // password never appears - only the base64 salt and salted hash.
+    let config_yaml = "
+datasources: {}
+server:
+  users:
+    - name: alice
+      salt: c2FsdA==
+      salted_password: aGFzaA==
+";
+    let path = write_temp("server_users", config_yaml);
+    let config = load_config(path.to_str().unwrap()).expect("load config");
+    assert_eq!(config.server.users.len(), 1);
+    let user = &config.server.users[0];
+    assert_eq!(user.name, "alice");
+    assert_eq!(user.salt, "c2FsdA==");
+    assert_eq!(user.salted_password, "aGFzaA==");
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn test_server_user_unknown_key_raises() {
+    // An unknown key inside a user block must raise, not be silently dropped -
+    // a mistyped credential field is a configuration bug, not a default.
+    let config_yaml = "
+datasources: {}
+server:
+  users:
+    - name: alice
+      salt: c2FsdA==
+      salted_password: aGFzaA==
+      password: hunter2
+";
+    let path = write_temp("server_user_bad_key", config_yaml);
+    let result = load_config(path.to_str().unwrap());
+    assert!(result.is_err(), "unknown user key must raise");
+    std::fs::remove_file(&path).ok();
+}

@@ -22,6 +22,7 @@ mod update;
 pub use budget::PlanBudget;
 pub use config::{
     load_config, Config, CostConfig, DataSourceConfig, ExecutorConfig, OptimizerConfig,
+    ServerConfig, UserCredential, SCRAM_ITERATIONS,
 };
 pub use error::{ConfigError, UnsupportedSqlError};
 pub use logging::setup_logging;

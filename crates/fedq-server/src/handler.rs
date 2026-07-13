@@ -5,7 +5,8 @@
 //! the query string directly; the extended protocol (Parse/Bind/Describe/Execute)
 //! resolves a statement's result schema by planning (without executing) for
 //! Describe, and splices bound parameter values into the SQL at Execute.
-//! `TrustStartup` performs the no-auth handshake, and `FedqHandlers` bundles them
+//! `FedqStartup` performs either the trust handshake or the SCRAM-SHA-256
+//! handshake, and `FedqHandlers` bundles the query, startup, and cancel handlers
 //! for pgwire's `process_socket`.
 
 use std::fmt::Debug;
@@ -14,16 +15,20 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::Sink;
 use pgwire::api::auth::noop::NoopStartupHandler;
-use pgwire::api::auth::StartupHandler;
+use pgwire::api::auth::sasl::scram::ScramAuth;
+use pgwire::api::auth::sasl::SASLAuthStartupHandler;
+use pgwire::api::auth::{AuthSource, DefaultServerParameterProvider, StartupHandler};
+use pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{DescribePortalResponse, DescribeStatementResponse, Response};
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
-use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type};
+use pgwire::api::{ClientInfo, ClientPortalStore, ConnectionManager, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
-use pgwire::messages::PgWireBackendMessage;
+use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 
+use crate::auth::ConfigAuthSource;
 use crate::encode;
 use crate::params;
 use crate::session::Session;
@@ -165,27 +170,93 @@ fn declared_param_types(types: &[Option<Type>]) -> Vec<Type> {
     declared
 }
 
-/// The no-authentication startup handler: any user name is accepted with no
-/// password, and the rest of the handshake runs normally. A distinct type so a
-/// real auth source can replace it without touching the query path.
-pub struct TrustStartup;
+/// The trust startup handler: any user name is accepted with no password, and the
+/// rest of the handshake runs normally. It still registers the connection with the
+/// shared `ConnectionManager` and generates a backend key, so a cancel request can
+/// find and cancel this connection's running query exactly as under SCRAM.
+pub struct TrustStartup {
+    manager: Arc<ConnectionManager>,
+}
 
-impl NoopStartupHandler for TrustStartup {}
+impl NoopStartupHandler for TrustStartup {
+    /// Registering the connection here is what lets a later CancelRequest resolve
+    /// to this connection's cancel handle.
+    fn connection_manager(&self) -> Option<Arc<ConnectionManager>> {
+        Some(Arc::clone(&self.manager))
+    }
+}
+
+/// One connection's startup handler, chosen from the config: trust when no users
+/// are configured, SCRAM-SHA-256 otherwise. Both register the connection for
+/// cancellation; only the SCRAM arm verifies a password. This enum exists because
+/// `StartupHandler` is not object-safe (its method is generic over the client), so
+/// the two concrete handlers cannot share an `Arc<dyn StartupHandler>`.
+pub enum FedqStartup {
+    Trust(TrustStartup),
+    Scram(Box<SASLAuthStartupHandler<DefaultServerParameterProvider>>),
+}
+
+#[async_trait]
+impl StartupHandler for FedqStartup {
+    /// Delegate the startup exchange to whichever handler this connection uses.
+    async fn on_startup<C>(
+        &self,
+        client: &mut C,
+        message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        match self {
+            FedqStartup::Trust(handler) => handler.on_startup(client, message).await,
+            FedqStartup::Scram(handler) => handler.on_startup(client, message).await,
+        }
+    }
+}
 
 /// The handler bundle pgwire's `process_socket` consumes for one connection. Both
-/// query handlers share the single backend; copy/error/cancel use pgwire's
-/// defaults.
+/// query handlers share the single backend; the startup handler enforces the
+/// configured authentication, and the cancel handler routes a CancelRequest to the
+/// target connection's handle through the shared manager.
 pub struct FedqHandlers {
     backend: Arc<FedqBackend>,
+    startup: Arc<FedqStartup>,
+    cancel: Arc<DefaultCancelHandler>,
 }
 
 impl FedqHandlers {
-    /// Build the handler bundle for a connection from its session.
-    pub fn new(session: Session) -> Self {
+    /// Build the handler bundle for a connection: a fresh backend over its
+    /// session, and the startup handler the shared auth source selects. The
+    /// `ConnectionManager` is shared across all connections so a CancelRequest -
+    /// which arrives on its own connection - can find its target here.
+    pub fn new(
+        session: Session,
+        manager: Arc<ConnectionManager>,
+        auth: Arc<ConfigAuthSource>,
+    ) -> Self {
+        let startup = build_startup(manager.clone(), auth);
         Self {
             backend: Arc::new(FedqBackend::new(session)),
+            startup: Arc::new(startup),
+            cancel: Arc::new(DefaultCancelHandler::new(manager)),
         }
     }
+}
+
+/// Select and build this connection's startup handler: trust when no users are
+/// configured, SCRAM-SHA-256 over the shared auth source otherwise. The SCRAM
+/// handler is built per connection because it holds the per-connection SASL state
+/// machine; the auth source and manager it references are shared.
+fn build_startup(manager: Arc<ConnectionManager>, auth: Arc<ConfigAuthSource>) -> FedqStartup {
+    if auth.is_empty() {
+        return FedqStartup::Trust(TrustStartup { manager });
+    }
+    let scram = SASLAuthStartupHandler::new(Arc::new(DefaultServerParameterProvider::default()))
+        .with_scram(ScramAuth::new(auth as Arc<dyn AuthSource>))
+        .with_connection_manager(manager);
+    FedqStartup::Scram(Box::new(scram))
 }
 
 impl PgWireServerHandlers for FedqHandlers {
@@ -194,14 +265,20 @@ impl PgWireServerHandlers for FedqHandlers {
         Arc::clone(&self.backend)
     }
 
-    /// The extended query handler is the same backend, which refuses execution.
+    /// The extended query handler is the same backend.
     fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
         Arc::clone(&self.backend)
     }
 
-    /// Startup uses trust auth.
+    /// Startup enforces the configured authentication (trust or SCRAM-SHA-256).
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
-        Arc::new(TrustStartup)
+        Arc::clone(&self.startup)
+    }
+
+    /// A CancelRequest fires the target connection's cancel handle via the shared
+    /// manager, so a running query on that connection sees the cancel.
+    fn cancel_handler(&self) -> Arc<impl CancelHandler> {
+        Arc::clone(&self.cancel)
     }
 }
 

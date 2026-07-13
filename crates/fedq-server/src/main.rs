@@ -5,10 +5,14 @@
 //!   --config <path>   YAML engine config (required; same format the engine CLI
 //!                     and tests use).
 //!   --listen <addr>   host:port to bind (default 127.0.0.1:5432).
+//!
+//! Subcommand:
+//!   hash-password <user> <password>   Print the `server.users` YAML block for a
+//!                     user, storing a SCRAM salted hash instead of the plaintext.
 
 use std::process::exit;
 
-use fedq_server::serve;
+use fedq_server::{credential_yaml, hash_password, serve};
 use fq_common::load_config;
 use tokio::net::TcpListener;
 
@@ -20,7 +24,24 @@ struct Args {
 
 /// The usage text, shown on `--help` and on any argument error.
 fn usage() -> String {
-    "usage: fedq-server --config <path> [--listen <host:port>]".to_owned()
+    "usage: fedq-server --config <path> [--listen <host:port>]\n       \
+     fedq-server hash-password <user> <password>"
+        .to_owned()
+}
+
+/// Print the `server.users` YAML block for `user`/`password` and exit. The
+/// plaintext password is used only to derive the SCRAM salted hash; only the salt
+/// and salted hash are printed, so the config file never holds the plaintext.
+fn run_hash_password(mut args: impl Iterator<Item = String>) -> ! {
+    let user = args.next();
+    let password = args.next();
+    let (Some(user), Some(password)) = (user, password) else {
+        eprintln!("hash-password requires <user> <password>\n{}", usage());
+        exit(2);
+    };
+    let credential = hash_password(&user, &password);
+    print!("{}", credential_yaml(&credential));
+    exit(0);
 }
 
 /// Read the value that must follow a flag, or report the flag as missing it.
@@ -51,6 +72,10 @@ async fn main() {
     if raw.peek().is_some_and(|arg| arg == "--help" || arg == "-h") {
         println!("{}", usage());
         return;
+    }
+    if raw.peek().is_some_and(|arg| arg == "hash-password") {
+        raw.next();
+        run_hash_password(raw);
     }
 
     let args = match parse_args(raw) {

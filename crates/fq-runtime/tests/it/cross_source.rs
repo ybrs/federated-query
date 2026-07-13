@@ -16,14 +16,39 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use arrow::array::{RecordBatch, StringArray};
-use fq_common::{Config, CostConfig, DataSourceConfig, ExecutorConfig, OptimizerConfig};
+use fq_common::{
+    Config, CostConfig, DataSourceConfig, ExecutorConfig, OptimizerConfig, ServerConfig,
+};
 use fq_connectors::PostgresSource;
 use fq_runtime::Runtime;
 use serde_yaml::Value;
 
-/// The bundled DuckDB fixture (TPC-H SF 0.01).
-fn duck_fixture_path() -> PathBuf {
+/// The bundled DuckDB fixture (TPC-H SF 0.01), read-only and shared across test
+/// binaries.
+fn canonical_duck_fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/tpch/data/tpch_sf0.01.duckdb")
+}
+
+/// A private per-call copy of the fixture. DuckDB opens a file read-write (single
+/// writer per file per process), and this test ships temp tables INTO the fact
+/// source, so opening the one shared fixture would both contend with parallel test
+/// binaries and mutate a checked-in file; each caller gets its own copy. When the
+/// fixture is absent the canonical (nonexistent) path is returned unchanged, so
+/// the caller's `exists()` gate still skips the test.
+fn duck_fixture_path() -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let canonical = canonical_duck_fixture();
+    if !canonical.exists() {
+        return canonical;
+    }
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let unique = std::env::temp_dir().join(format!(
+        "fq_tpch_fixture_{}_{}.duckdb",
+        std::process::id(),
+        id
+    ));
+    std::fs::copy(&canonical, &unique).expect("copy tpch fixture to a private temp path");
+    unique
 }
 
 /// The libpq connection string for the local trust-auth Postgres.
@@ -102,6 +127,7 @@ fn cross_config(duck_path: &str, adbc_driver: &str) -> Config {
         optimizer: OptimizerConfig::default(),
         executor: ExecutorConfig::default(),
         cost: CostConfig::default(),
+        server: ServerConfig::default(),
         source_path: None,
     }
 }

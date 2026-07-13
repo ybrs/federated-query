@@ -18,7 +18,7 @@ use crate::error::ConfigError;
 
 /// The top-level sections `load_config` recognizes. Anything else is a typo and
 /// raises (`config.py`'s `known_sections`).
-const KNOWN_SECTIONS: [&str; 4] = ["datasources", "optimizer", "executor", "cost"];
+const KNOWN_SECTIONS: [&str; 5] = ["datasources", "optimizer", "executor", "cost", "server"];
 
 /// Configuration for a single data source.
 ///
@@ -139,6 +139,42 @@ impl Default for CostConfig {
     }
 }
 
+/// Authentication for the wire-protocol server (`fedq-server`).
+///
+/// An empty `users` list - the default, and the state when the `server:` section
+/// is absent - means trust authentication: every connection is accepted with no
+/// password, like a `trust` line in `pg_hba.conf`. A non-empty list turns on
+/// SCRAM-SHA-256: a connection must authenticate as one of these users. This
+/// section is inert for the engine library and the Python FFI; only the wire
+/// server reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct ServerConfig {
+    pub users: Vec<UserCredential>,
+}
+
+/// One user's stored SCRAM-SHA-256 credential.
+///
+/// The password itself is NEVER stored. `salted_password` is the base64 of
+/// `PBKDF2-HMAC-SHA256(password, salt, 4096)` - the same one-way salted hash the
+/// SCRAM handshake verifies a login against - and `salt` is the base64 of the
+/// random salt it was derived with. The iteration count is fixed at the SCRAM
+/// default (4096) for every user, because one handshake advertises one iteration
+/// count to the client. `fedq-server hash-password` produces these fields from a
+/// plaintext password so the plaintext never enters the config file.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserCredential {
+    pub name: String,
+    pub salt: String,
+    pub salted_password: String,
+}
+
+/// The SCRAM-SHA-256 iteration count every `UserCredential` is hashed with. Fixed
+/// because a single handshake advertises one iteration count to the client, so
+/// all users on one server must share it.
+pub const SCRAM_ITERATIONS: u32 = 4096;
+
 /// The fully assembled engine configuration.
 ///
 /// `source_path` is the YAML file this config was loaded from; the learned-stats
@@ -150,6 +186,7 @@ pub struct Config {
     pub optimizer: OptimizerConfig,
     pub executor: ExecutorConfig,
     pub cost: CostConfig,
+    pub server: ServerConfig,
     pub source_path: Option<String>,
 }
 
@@ -174,6 +211,7 @@ pub fn load_config(config_path: &str) -> Result<Config, ConfigError> {
         optimizer: parse_section(mapping, "optimizer")?,
         executor: parse_section(mapping, "executor")?,
         cost: parse_section(mapping, "cost")?,
+        server: parse_section(mapping, "server")?,
         source_path: Some(path.display().to_string()),
     })
 }

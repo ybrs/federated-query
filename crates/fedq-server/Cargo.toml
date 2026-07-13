@@ -15,10 +15,13 @@ name = "fedq-server"
 path = "src/main.rs"
 
 [dependencies]
-# The Postgres wire protocol server API, without the TLS/SCRAM crypto backends
-# (the `_ring`/`_aws-lc-rs` features). Trust startup needs no crypto, so the
-# plain `server-api` feature avoids pulling aws-lc-rs and its C toolchain build.
-pgwire = { version = "0.40", default-features = false, features = ["server-api"] }
+# The Postgres wire protocol server API with the `ring` crypto backend, which is
+# what compiles pgwire's SCRAM-SHA-256 handshake (the `sasl` module is gated
+# behind `_ring`/`_aws-lc-rs`). `ring` is chosen over `aws-lc-rs` because it is
+# already built elsewhere in this workspace and needs only a C compiler, not the
+# aws-lc-rs NASM/perl toolchain. TLS is not enabled here; only the SCRAM digest
+# and PBKDF2 primitives are used.
+pgwire = { version = "0.40", default-features = false, features = ["server-api-ring"] }
 # The async runtime the pgwire server drives; `sync` provides the channels that
 # bridge the async handler to the per-connection Runtime worker thread.
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync"] }
@@ -29,6 +32,11 @@ async-trait = "0.1"
 # Reading the engine's Arrow result: schema fields for the row description and
 # typed column downcasts for the wire encoding.
 arrow = "58"
+# Decoding the base64 salt and salted-password stored in a `UserCredential`, and
+# encoding them in `hash-password`. The SCRAM handshake consumes the raw bytes.
+base64 = "0.22"
+# A random salt for `hash-password` (credential generation only).
+rand = "0.9"
 fq-common = { path = "../fq-common" }
 fq-runtime = { path = "../fq-runtime" }
 

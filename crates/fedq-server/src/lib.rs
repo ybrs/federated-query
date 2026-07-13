@@ -40,14 +40,60 @@
 //! story here. A future writable server would need a single shared write handle,
 //! not one per connection.
 //!
-//! ## Startup and authentication: trust only
+//! ## Startup and authentication: trust or SCRAM-SHA-256, from config
 //!
-//! Startup uses pgwire's no-auth handshake (`NoopStartupHandler`): any user name
-//! is accepted with no password, like a `trust` line in `pg_hba.conf`. The
-//! handshake is otherwise complete (parameter status, backend key, ReadyForQuery)
-//! so real clients connect cleanly. Only trust auth is implemented; the handler
-//! is a distinct type (`TrustStartup`) so an md5/SCRAM/password source can
-//! replace it without touching the query path.
+//! Authentication is driven by the `server:` section of the engine config
+//! (`fq_common::ServerConfig`). With no users configured - the default, and the
+//! state when the section is absent - startup uses the trust handshake: any user
+//! name is accepted with no password, like a `trust` line in `pg_hba.conf`. With
+//! users configured, startup requires SCRAM-SHA-256: the client must authenticate
+//! as one of the configured users, and a wrong password or unknown user is refused
+//! with a Postgres authentication error. Both handshakes are otherwise complete
+//! (parameter status, backend key, ReadyForQuery), so real clients connect
+//! cleanly; the selection lives in `handler`'s `FedqStartup`.
+//!
+//! ### Credential storage: never plaintext
+//!
+//! A configured user stores a SCRAM credential, never a plaintext password: a
+//! base64 salt and the base64 of `PBKDF2-HMAC-SHA256(password, salt, 4096)` (the
+//! salted password the SCRAM handshake verifies a login's proof against). The
+//! iteration count is fixed at the SCRAM default (4096) for every user, because
+//! one handshake advertises one iteration count to the client. `fedq-server
+//! hash-password <user> <password>` derives these fields so the plaintext never
+//! enters the config file. `auth::ConfigAuthSource` decodes them at startup and
+//! answers the handshake's password queries; a malformed credential fails loudly
+//! at server start, not at a client's first login.
+//!
+//! ## Query cancellation: the client detaches; the engine is not interrupted
+//!
+//! Every connection completes the handshake with a BackendKeyData (pid + secret)
+//! and registers with a process-wide `ConnectionManager` (the startup handler's
+//! `connection_manager`). That registration installs the per-connection cancel
+//! handle pgwire's own query loop already races each query against: `on_query`
+//! selects the running `do_query` against that handle's receiver. A Postgres
+//! CancelRequest - which a client sends on its own side connection - reaches the
+//! `DefaultCancelHandler`, which through the manager fires that receiver. The
+//! query loop then abandons `do_query` and the client immediately gets an
+//! `ErrorResponse` with SQLSTATE 57014 (`query_canceled`); the connection stays
+//! open. This server therefore does not select on the handle itself - it supplies
+//! the manager, the registration, and the cancel handler that make pgwire's race
+//! resolve.
+//!
+//! This is an HONEST but PARTIAL cancel: it detaches the client from the result;
+//! it does NOT interrupt the engine. `Runtime::execute` is synchronous on the
+//! connection's single worker thread (see the session model above), and the engine
+//! exposes no interruption seam - fq-exec runs each step to completion over
+//! thread-local DuckDB/ADBC handles that are neither reachable from the async
+//! handler nor safe to poke from another thread, and a federated query spans
+//! several such steps, so no single DuckDB `interrupt_handle` would cover it.
+//! Consequently a cancelled query keeps running on its worker thread until it
+//! finishes; only its result is discarded. Because that worker serves the
+//! connection's queries in order, the connection's NEXT query waits behind the
+//! still-running cancelled one. True mid-query interruption is not supported: it
+//! needs a cooperative cancellation seam in the engine - a cancel token threaded
+//! through fq-exec's step loop and the source drivers - which does not exist. This
+//! server does not fake one; a cancel that loses the race lets the query complete
+//! normally and returns its rows.
 //!
 //! ## Query protocol: simple and extended
 //!
@@ -102,29 +148,46 @@
 //! special handling: `Runtime::execute` returns it as a text column and
 //! `Runtime::describe` reports a single text `plan` column.
 
+mod auth;
 mod encode;
 mod handler;
 mod params;
 mod session;
 
+pub use auth::{credential_yaml, hash_password};
 pub use handler::FedqHandlers;
 pub use session::Session;
 
+use std::io;
 use std::sync::Arc;
 
 use fq_common::Config;
+use pgwire::api::ConnectionManager;
 use pgwire::tokio::process_socket;
 use tokio::net::TcpListener;
+
+use crate::auth::ConfigAuthSource;
 
 /// Accept connections on `listener` forever, serving each over the Postgres wire
 /// protocol. Every accepted socket gets its own `Session` (a fresh `Runtime` on a
 /// dedicated worker thread) and is driven on its own tokio task, so slow or idle
 /// connections never block others. Returns only if `accept` itself fails.
 pub async fn serve(config: Config, listener: TcpListener) -> std::io::Result<()> {
+    // One auth source and one connection registry are shared by every connection:
+    // the auth source is read-only after this decode (a malformed credential fails
+    // server startup here, not a client's first login), and the registry must span
+    // connections so a CancelRequest arriving on its own connection can find its
+    // target.
+    let auth = Arc::new(ConfigAuthSource::from_config(&config.server).map_err(io::Error::other)?);
+    let manager = Arc::new(ConnectionManager::new());
     loop {
         let (socket, _peer) = listener.accept().await?;
         let session = Session::spawn(config.clone());
-        let handlers = Arc::new(FedqHandlers::new(session));
+        let handlers = Arc::new(FedqHandlers::new(
+            session,
+            Arc::clone(&manager),
+            Arc::clone(&auth),
+        ));
         // One task per connection: process_socket runs the whole startup +
         // query loop for this client. A protocol error inside it ends only this
         // connection, so the error is logged and the loop keeps accepting.

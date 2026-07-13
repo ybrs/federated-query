@@ -8,11 +8,16 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
-use fq_common::{Config, CostConfig, DataSourceConfig, ExecutorConfig, OptimizerConfig};
+use fq_common::{
+    Config, CostConfig, DataSourceConfig, ExecutorConfig, OptimizerConfig, ServerConfig,
+    UserCredential,
+};
 use fq_connectors::DuckDbSource;
 use serde_yaml::Value;
 use tokio::net::TcpListener;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
@@ -26,7 +31,8 @@ const SEED_SQL: &str = "\
     CREATE TABLE events (id INTEGER, day DATE, occurred TIMESTAMP, amount DECIMAL(10,2)); \
     INSERT INTO events VALUES \
     (1, DATE '2021-01-05', TIMESTAMP '2021-01-05 12:34:56', 19.95), \
-    (2, DATE '2022-07-13', TIMESTAMP '2022-07-13 00:00:00', 100.00);";
+    (2, DATE '2022-07-13', TIMESTAMP '2022-07-13 00:00:00', 100.00); \
+    CREATE TABLE nums AS SELECT * FROM range(64000) t(x);";
 
 /// A unique temp DuckDB file path per process run, so parallel tests never share
 /// a file or collide in the path-keyed exec cache.
@@ -50,8 +56,9 @@ fn seed_duck(path: &str, ddl: &str) {
 }
 
 /// A single-DuckDB-source config under the datasource name `shop`, which the
-/// `shop.main.items` table references resolve.
-fn shop_config(path: &str) -> Config {
+/// `shop.main.items` table references resolve. `server` carries the authentication
+/// config (an empty user list is trust auth).
+fn shop_config(path: &str, server: ServerConfig) -> Config {
     let mut params = BTreeMap::new();
     params.insert("path".to_owned(), Value::String(path.to_owned()));
     let mut datasources = BTreeMap::new();
@@ -69,30 +76,38 @@ fn shop_config(path: &str) -> Config {
         optimizer: OptimizerConfig::default(),
         executor: ExecutorConfig::default(),
         cost: CostConfig::default(),
+        server,
         source_path: None,
     }
 }
 
-/// Seed a fresh DuckDB fixture, start the server on an ephemeral port, and return
-/// a connected Postgres client over trust auth.
-async fn start_seeded_server() -> Client {
-    let path = temp_duck();
-    seed_duck(&path, SEED_SQL);
-    let config = shop_config(&path);
+/// Seed a fresh DuckDB fixture and start the server for `config` on an ephemeral
+/// port, returning the bound port. The server task runs for the test's duration.
+async fn start_server(config: Config) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
     tokio::spawn(fedq_server::serve(config, listener));
-    let conn_str = format!(
-        "host=127.0.0.1 port={} user=postgres dbname=fedq",
-        addr.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .expect("connect");
+    addr.port()
+}
+
+/// Connect a Postgres client to `port` with the given connection string suffix
+/// (user, and optionally password), spawning its connection driver task.
+async fn connect(port: u16, credentials: &str) -> Result<Client, tokio_postgres::Error> {
+    let conn_str = format!("host=127.0.0.1 port={port} dbname=fedq {credentials}");
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await?;
     tokio::spawn(async move {
         let _ = connection.await;
     });
-    client
+    Ok(client)
+}
+
+/// Seed a fresh DuckDB fixture, start a trust-auth server, and return a connected
+/// Postgres client.
+async fn start_seeded_server() -> Client {
+    let path = temp_duck();
+    seed_duck(&path, SEED_SQL);
+    let port = start_server(shop_config(&path, ServerConfig::default())).await;
+    connect(port, "user=postgres").await.expect("connect")
 }
 
 /// Collect the `Row` messages of a simple-query result as vectors of the
@@ -286,5 +301,138 @@ async fn extended_refuses_unmapped_parameter_type_loudly() {
         .simple_query("SELECT count(*) AS n FROM shop.main.items")
         .await
         .expect("query after refusal");
+    assert_eq!(rows(&messages, 1), vec![vec!["4".to_owned()]]);
+}
+
+/// Seed a fresh fixture and start a server that requires SCRAM-SHA-256 auth for
+/// the given users, returning the bound port.
+async fn start_scram_server(users: Vec<UserCredential>) -> u16 {
+    let path = temp_duck();
+    seed_duck(&path, SEED_SQL);
+    start_server(shop_config(&path, ServerConfig { users })).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scram_auth_accepts_the_correct_password() {
+    // A user configured with a SCRAM salted hash authenticates with the matching
+    // plaintext password and can then query.
+    let user = fedq_server::hash_password("alice", "hunter2");
+    let port = start_scram_server(vec![user]).await;
+
+    let client = connect(port, "user=alice password=hunter2")
+        .await
+        .expect("correct password must connect");
+    let messages = client
+        .simple_query("SELECT count(*) AS n FROM shop.main.items")
+        .await
+        .expect("query after auth");
+    assert_eq!(rows(&messages, 1), vec![vec!["4".to_owned()]]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scram_auth_refuses_a_wrong_password() {
+    // The same user with a wrong password is refused with a Postgres
+    // invalid-password error, never allowed to connect.
+    let user = fedq_server::hash_password("alice", "hunter2");
+    let port = start_scram_server(vec![user]).await;
+
+    let error = connect(port, "user=alice password=wrong")
+        .await
+        .expect_err("wrong password must be refused");
+    let db_error = error
+        .as_db_error()
+        .expect("refusal is a Postgres error, not a dropped connection");
+    assert_eq!(db_error.code(), &SqlState::INVALID_PASSWORD);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scram_auth_refuses_an_unknown_user() {
+    // A user that is not configured is refused, even with a password that would be
+    // correct for a configured user.
+    let user = fedq_server::hash_password("alice", "hunter2");
+    let port = start_scram_server(vec![user]).await;
+
+    let error = connect(port, "user=bob password=hunter2")
+        .await
+        .expect_err("unknown user must be refused");
+    let db_error = error
+        .as_db_error()
+        .expect("refusal is a Postgres error, not a dropped connection");
+    assert_eq!(db_error.code(), &SqlState::INVALID_PASSWORD);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trust_auth_accepts_any_user_without_a_password() {
+    // With no users configured, the server is trust auth: any user name connects
+    // with no password (the backward-compatible default).
+    let path = temp_duck();
+    seed_duck(&path, SEED_SQL);
+    let port = start_server(shop_config(&path, ServerConfig::default())).await;
+
+    let client = connect(port, "user=whoever")
+        .await
+        .expect("trust auth must connect any user");
+    let messages = client
+        .simple_query("SELECT count(*) AS n FROM shop.main.items")
+        .await
+        .expect("query after trust connect");
+    assert_eq!(rows(&messages, 1), vec![vec!["4".to_owned()]]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_request_cancels_a_running_query() {
+    // A long-running query is cancelled mid-flight by a Postgres CancelRequest. It
+    // is a self cross join over 64k rows with a per-pair arithmetic filter, so
+    // DuckDB must iterate all ~4e9 pairs (a plain count over a cross join it
+    // computes analytically in no time); the whole thing pushes down to DuckDB as
+    // one island and cannot finish before the cancel arrives on any machine. The
+    // client gets SQLSTATE 57014 (query_canceled) immediately - pgwire abandons the
+    // query rather than waiting for the worker - and the connection survives.
+    let path = temp_duck();
+    seed_duck(&path, SEED_SQL);
+    let port = start_server(shop_config(&path, ServerConfig::default())).await;
+    let client = connect(port, "user=postgres").await.expect("connect");
+    let cancel_token = client.cancel_token();
+
+    let query = tokio::spawn(async move {
+        let result = client
+            .simple_query(
+                "SELECT count(*) AS n FROM shop.main.nums a CROSS JOIN shop.main.nums b \
+                 WHERE (a.x * b.x) % 1000000007 = 0",
+            )
+            .await;
+        (client, result)
+    });
+
+    // The query is dispatched to the worker within a few milliseconds on
+    // localhost; wait past that so the cancel lands while it is executing.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    cancel_token
+        .cancel_query(NoTls)
+        .await
+        .expect("send cancel request");
+
+    let (client, result) = query.await.expect("query task joined");
+    let error = result.expect_err("a cancelled query must return an error");
+    let db_error = error
+        .as_db_error()
+        .expect("cancellation is a Postgres error, not a dropped connection");
+    assert_eq!(db_error.code(), &SqlState::QUERY_CANCELED);
+
+    // The cancelled connection stays open (a 57014 is a non-fatal error). A
+    // follow-up on THIS connection is not issued: it would block behind the
+    // cancelled query, which keeps running to completion on the worker thread (the
+    // engine has no interruption seam; see the crate module doc).
+    assert!(!client.is_closed(), "the connection survived the cancel");
+
+    // The server keeps serving other connections while that query runs: a fresh
+    // connection queries normally.
+    let other = connect(port, "user=postgres")
+        .await
+        .expect("second connection");
+    let messages = other
+        .simple_query("SELECT count(*) AS n FROM shop.main.items")
+        .await
+        .expect("query on a second connection");
     assert_eq!(rows(&messages, 1), vec![vec!["4".to_owned()]]);
 }

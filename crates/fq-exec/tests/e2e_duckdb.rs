@@ -24,9 +24,31 @@ use fq_physical::PhysicalPlanner;
 use fq_plan::physical::PhysicalPlan;
 
 /// The smallest bundled DuckDB fixture (TPC-H at SF 0.01: region has 5 rows,
-/// nation 25). Absolute, relative to this crate's manifest.
-fn fixture_path() -> PathBuf {
+/// nation 25). Absolute, relative to this crate's manifest. Read-only and shared
+/// across test binaries.
+fn canonical_fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/tpch/data/tpch_sf0.01.duckdb")
+}
+
+/// A private per-call copy of the fixture. DuckDB opens a file read-write (single
+/// writer per file per process), so parallel test binaries opening the one shared
+/// fixture would contend on its lock and intermittently fail; each caller instead
+/// gets its own copy. When the fixture is absent the canonical (nonexistent) path
+/// is returned unchanged, so a caller's `exists()` gate still skips the test.
+fn fixture_path() -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let canonical = canonical_fixture();
+    if !canonical.exists() {
+        return canonical;
+    }
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let unique = std::env::temp_dir().join(format!(
+        "fq_tpch_fixture_{}_{}.duckdb",
+        std::process::id(),
+        id
+    ));
+    std::fs::copy(&canonical, &unique).expect("copy tpch fixture to a private temp path");
+    unique
 }
 
 /// Drive parse -> bind -> decorrelate -> optimize into an optimized logical plan.

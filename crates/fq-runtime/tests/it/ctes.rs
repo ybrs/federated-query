@@ -17,7 +17,9 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use arrow::array::{Array, Int32Array, Int64Array, RecordBatch, StringArray};
-use fq_common::{Config, CostConfig, DataSourceConfig, ExecutorConfig, OptimizerConfig};
+use fq_common::{
+    Config, CostConfig, DataSourceConfig, ExecutorConfig, OptimizerConfig, ServerConfig,
+};
 use fq_connectors::DuckDbSource;
 use fq_runtime::Runtime;
 use serde_yaml::Value;
@@ -96,6 +98,7 @@ fn two_source_runtime(tag: &str) -> (Runtime, String, String) {
         optimizer: OptimizerConfig::default(),
         executor: ExecutorConfig::default(),
         cost: CostConfig::default(),
+        server: ServerConfig::default(),
         source_path: None,
     };
     let runtime = Runtime::from_config(&config).expect("from_config");
@@ -464,6 +467,7 @@ fn two_source_runtime_seeded(
         optimizer: OptimizerConfig::default(),
         executor: ExecutorConfig::default(),
         cost: CostConfig::default(),
+        server: ServerConfig::default(),
         source_path: None,
     };
     let runtime = Runtime::from_config(&config).expect("from_config");
