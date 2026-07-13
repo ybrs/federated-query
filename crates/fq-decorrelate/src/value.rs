@@ -5,7 +5,7 @@
 //! `_rewrite_value_expr`, `_join_scalar`, `_join_flag`, the projection/sort
 //! rewrites, and `_tighten_scalar_equality`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use fq_common::DataType;
 use fq_plan::expr::{column_refs, BinaryOpType, Expr, LiteralValue};
@@ -275,7 +275,7 @@ fn flag_branch(
             names.len()
         )));
     }
-    let mut aliases = names;
+    let mut aliases = uniquify_names(names);
     expressions.push(bool_literal(flag_value));
     aliases.push(flag_name.to_string());
     // Fresh join wrapping the branch's left plan and subquery right - no base to
@@ -299,6 +299,28 @@ fn flag_branch(
         distinct: false,
         distinct_on: None,
     }))
+}
+
+/// Suffix any repeated name (`name`, `name_1`, `name_2`, ...) so a flag branch
+/// over a join whose sides share a column name emits UNIQUE output aliases. The
+/// first occurrence keeps its name; each later duplicate takes the running-count
+/// suffix. Driven purely by schema order, so both flag branches (built over the
+/// same left schema) uniquify identically. Matches the physical step-builder's
+/// self-join alias uniquification, so a qualified reference above the union stays
+/// resolvable through the projection's `(qualifier, column) -> alias` map.
+fn uniquify_names(names: Vec<String>) -> Vec<String> {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut unique = Vec::with_capacity(names.len());
+    for name in names {
+        let count = seen.entry(name.clone()).or_insert(0);
+        if *count == 0 {
+            unique.push(name);
+        } else {
+            unique.push(format!("{name}_{count}"));
+        }
+        *count += 1;
+    }
+    unique
 }
 
 /// One QUALIFIED column reference per output column of `plan`, in schema order:

@@ -172,3 +172,52 @@ fn or_of_existentials_inside_a_conjunct_is_domain_semi() {
         LogicalPlan::Union(u) if !u.distinct && u.inputs.len() == 2
     ));
 }
+
+/// The single boolean-flag Union in the plan.
+fn flag_union(plan: &LogicalPlan) -> fq_plan::logical::Union {
+    let mut found = None;
+    walk_plan(plan, &mut |node| {
+        if let LogicalPlan::Union(union) = node {
+            found = Some(union.clone());
+        }
+    });
+    found.expect("expected a flag union")
+}
+
+#[test]
+fn flag_branches_over_a_shared_column_join_get_unique_identical_aliases() {
+    // The flag union's left is a join whose sides share column names (orders and
+    // products both carry `id` and `price`); each branch's passthrough must emit
+    // UNIQUE output aliases, identical across the SEMI and ANTI branches, or the
+    // merge fragment schema rejects the duplicate qualified field.
+    let plan = decorrelate_sql(
+        "SELECT o.id FROM pg.public.orders o \
+         JOIN pg.public.products p ON o.product_id = p.id \
+         WHERE EXISTS (SELECT 1 FROM pg.public.companies q WHERE q.id = o.company_id) \
+            OR o.price > 100",
+    );
+    assert_no_subquery(&plan);
+    let union = flag_union(&plan);
+    assert_eq!(union.inputs.len(), 2, "one branch per flag value");
+    let mut branch_passthroughs = Vec::new();
+    for branch in &union.inputs {
+        let LogicalPlan::Projection(projection) = branch else {
+            panic!("expected a branch projection, got {branch:?}");
+        };
+        // Drop the trailing flag alias; the passthrough aliases must be unique.
+        let (_flag, passthrough) = projection.aliases.split_last().expect("a flag alias");
+        let unique: std::collections::HashSet<&String> = passthrough.iter().collect();
+        assert_eq!(
+            unique.len(),
+            passthrough.len(),
+            "duplicate passthrough alias in a flag branch: {passthrough:?}"
+        );
+        branch_passthroughs.push(passthrough.to_vec());
+    }
+    // Both branches derive from the same left schema, so they uniquify identically.
+    assert_eq!(branch_passthroughs[0], branch_passthroughs[1]);
+    // The first `id`/`price` keep their names; the shared duplicates are suffixed.
+    assert!(branch_passthroughs[0].contains(&"id".to_string()));
+    assert!(branch_passthroughs[0].contains(&"id_1".to_string()));
+    assert!(branch_passthroughs[0].contains(&"price_1".to_string()));
+}
