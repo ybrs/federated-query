@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 
 use crate::error::ConfigError;
@@ -74,7 +74,7 @@ impl ChangeKey {
 /// The gates are configuration, not compile-time constants: a small-fixture test
 /// lowers them through the YAML `optimizer:` section to make shipping fire on
 /// tiny data, and a production deployment can retune them without a rebuild.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct OptimizerConfig {
     pub enable_predicate_pushdown: bool,
@@ -131,7 +131,7 @@ impl Default for OptimizerConfig {
 }
 
 /// Configuration for the query executor.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ExecutorConfig {
     pub max_memory_mb: u64,
@@ -153,7 +153,7 @@ impl Default for ExecutorConfig {
 }
 
 /// Configuration for the cost model.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CostConfig {
     pub cpu_tuple_cost: f64,

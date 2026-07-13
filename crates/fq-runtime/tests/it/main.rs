@@ -7,3 +7,4 @@ mod delta_refresh;
 mod duckdb_runtime;
 mod materialized_views;
 mod parquet_runtime;
+mod settings;

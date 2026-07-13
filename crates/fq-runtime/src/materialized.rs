@@ -87,7 +87,7 @@ impl Runtime {
                 "relation '{name}' already exists"
             )));
         }
-        let plan = delta::classify(&catalog, &self.config, select_sql)?;
+        let plan = delta::classify(&catalog, &self.config_snapshot(), select_sql)?;
         let tokens = delta::read_tokens(&catalog, &plan.base_tables)?;
         let (schema, batches) = self.execute_query(select_sql)?;
         let state = initial_change_key_state(&plan, &schema, &batches);
@@ -114,7 +114,7 @@ impl Runtime {
         let accel = self.accelerator()?;
         let view = accel.view(name)?;
         let catalog = self.catalog_snapshot();
-        let plan = delta::classify(&catalog, &self.config, &view.definition_sql)?;
+        let plan = delta::classify(&catalog, &self.config_snapshot(), &view.definition_sql)?;
         let tokens = delta::read_tokens(&catalog, &plan.base_tables)?;
         if delta::tokens_allow_skip(&view.source_tokens, &tokens, &plan.base_tables) {
             // Nothing is written: the stored row (chunks, tokens, watermark)

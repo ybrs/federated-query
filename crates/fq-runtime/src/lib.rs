@@ -14,10 +14,12 @@ mod delta;
 pub mod error;
 mod explain;
 mod materialized;
+mod settings;
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
 use arrow::array::{RecordBatch, StringArray};
@@ -48,7 +50,13 @@ pub struct Runtime {
     /// clones the catalog, applies the change, and swaps the `Arc`, so every
     /// query plans against one consistent snapshot.
     catalog: RwLock<Arc<Catalog>>,
-    config: Config,
+    /// The live engine config behind a lock so `SET`/`RESET` can swap a
+    /// session-mutable setting between queries. Each plan reads ONE snapshot
+    /// (`config_snapshot`), so a concurrent `SET` cannot change it mid-pipeline.
+    config: RwLock<Config>,
+    /// The setting names changed by `SET` on this runtime (cleared per name by
+    /// `RESET`). Drives the `source = set` column and `RESET ALL`.
+    settings_overrides: RwLock<BTreeSet<String>>,
     /// ONE statistics collector for the whole session: its caches (source
     /// stats, planner estimates) persist across queries, and its learned
     /// overlay reads the stats catalog this runtime also WRITES after every
@@ -99,7 +107,8 @@ impl Runtime {
         ));
         Ok(Self {
             catalog: RwLock::new(catalog),
-            config: config.clone(),
+            config: RwLock::new(config.clone()),
+            settings_overrides: RwLock::new(BTreeSet::new()),
             stats: RwLock::new(stats),
             learned,
             accelerator,
@@ -109,6 +118,26 @@ impl Runtime {
     /// The current catalog snapshot (consistent for the caller's whole plan).
     fn catalog_snapshot(&self) -> Arc<Catalog> {
         Arc::clone(&self.catalog.read().expect("catalog lock poisoned"))
+    }
+
+    /// The current config snapshot: ONE consistent copy for a whole plan, so a
+    /// concurrent `SET` cannot change the optimizer/cost/ship values mid-pipeline.
+    fn config_snapshot(&self) -> Config {
+        self.config.read().expect("config lock poisoned").clone()
+    }
+
+    /// The current set of SET-overridden setting names (for SHOW's source column).
+    fn settings_overrides(&self) -> RwLockReadGuard<'_, BTreeSet<String>> {
+        self.settings_overrides
+            .read()
+            .expect("settings overrides lock poisoned")
+    }
+
+    /// Mutable access to the SET-override set (for `SET`/`RESET`).
+    fn settings_overrides_mut(&self) -> RwLockWriteGuard<'_, BTreeSet<String>> {
+        self.settings_overrides
+            .write()
+            .expect("settings overrides lock poisoned")
     }
 
     /// The current statistics-collector snapshot.
@@ -131,6 +160,10 @@ impl Runtime {
             }
             Statement::RefreshMaterializedView { name } => self.refresh_materialized_view(&name),
             Statement::DropMaterializedView { name } => self.drop_materialized_view(&name),
+            Statement::ShowSettings => self.show_settings(),
+            Statement::ShowSetting { name } => self.show_setting(&name),
+            Statement::SetSetting { name, value } => self.set_setting(&name, &value),
+            Statement::ResetSetting { name } => self.reset_setting(name.as_deref()),
         }
     }
 
@@ -163,10 +196,16 @@ impl Runtime {
         if explain::strip_explain(sql).is_some() {
             return Ok(vec![("plan".to_owned(), DataType::Text)]);
         }
-        // Materialized-view DDL resolves to the single `status` column its
-        // execution returns, without touching the store.
-        if !matches!(classify_statement(sql)?, Statement::Query(_)) {
-            return Ok(vec![("status".to_owned(), DataType::Text)]);
+        // A non-query statement resolves to the columns its execution returns,
+        // without running it: SHOW resolves to the settings result columns, and
+        // materialized-view DDL / SET / RESET resolve to the single `status`
+        // column (the pg command-tag convention).
+        match classify_statement(sql)? {
+            Statement::Query(_) => {}
+            Statement::ShowSettings | Statement::ShowSetting { .. } => {
+                return Ok(settings::describe_columns());
+            }
+            _ => return Ok(vec![("status".to_owned(), DataType::Text)]),
         }
         let physical = self.plan(sql)?;
         let names = output_column_names(&physical);
@@ -193,6 +232,7 @@ impl Runtime {
         catalog: &Catalog,
         sql: &str,
         stages: &mut StageLog,
+        config: &Config,
     ) -> Result<LogicalPlan, RuntimeError> {
         let parsed = parse_with_catalog(sql, catalog)?;
         stages.finish("parse")?;
@@ -200,7 +240,7 @@ impl Runtime {
         stages.finish("bind")?;
         let decorrelated = fq_decorrelate::decorrelate(bound)?;
         stages.finish("decorrelate")?;
-        let optimizer = build_optimizer(&self.config.optimizer, self.cost_model());
+        let optimizer = build_optimizer(&config.optimizer, self.cost_model(config));
         let optimized = optimizer.optimize(decorrelated)?;
         stages.finish("optimize")?;
         Ok(optimized)
@@ -216,16 +256,19 @@ impl Runtime {
         // One catalog snapshot for the whole plan, so a concurrent DDL swap
         // cannot change the metadata mid-pipeline.
         let catalog = self.catalog_snapshot();
-        let mut stages = StageLog::start(self.config.optimizer.planning_budget_ms);
+        // One config snapshot for the whole plan, so a concurrent SET cannot
+        // change the optimizer/cost/ship values mid-pipeline.
+        let config = self.config_snapshot();
+        let mut stages = StageLog::start(config.optimizer.planning_budget_ms);
         // The SHARED collector carries this plan's budget so a statistics fetch
         // that overruns it is killed at the fetch and named in the error.
         self.stats_snapshot().set_plan_budget(stages.budget);
-        let optimized = self.optimize(&catalog, sql, &mut stages)?;
-        let cost_model = Rc::new(RefCell::new(self.cost_model()));
+        let optimized = self.optimize(&catalog, sql, &mut stages, &config)?;
+        let cost_model = Rc::new(RefCell::new(self.cost_model(&config)));
         // The dim-shipping gates come from THIS runtime's optimizer config, so a
         // config that lowers them (small fixtures) or raises them (kill switch)
         // governs whether a dimension ships.
-        let ship_thresholds = ShipThresholds::from_config(&self.config.optimizer);
+        let ship_thresholds = ShipThresholds::from_config(&config.optimizer);
         let mut planner = PhysicalPlanner::new(Arc::clone(&catalog), Some(cost_model))
             .with_ship_thresholds(ship_thresholds);
         let physical = planner.plan(&optimized)?;
@@ -278,8 +321,8 @@ impl Runtime {
     /// (honest-unknown defaults fill any gap; a suboptimal plan still returns
     /// correct rows). The collector carries the active plan's budget, so a
     /// statistics fetch that overruns it is killed at the fetch.
-    fn cost_model(&self) -> CostModel {
-        CostModel::with_shared_stats(self.config.cost.clone(), Some(self.stats_snapshot()))
+    fn cost_model(&self, config: &Config) -> CostModel {
+        CostModel::with_shared_stats(config.cost.clone(), Some(self.stats_snapshot()))
     }
 }
 

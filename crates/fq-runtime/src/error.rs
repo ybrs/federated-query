@@ -92,4 +92,10 @@ pub enum RuntimeError {
     /// next to the config file, so there is nowhere to put it).
     #[error("materialized view error: {0}")]
     MaterializedView(String),
+
+    /// A settings statement (SHOW SETTING / SET / RESET) the runtime rejects: an
+    /// unknown setting name, a SET on a static setting, or a value that does not
+    /// parse into the setting's type. Every invalid settings statement raises.
+    #[error("settings error: {0}")]
+    Settings(String),
 }

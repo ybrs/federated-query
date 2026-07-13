@@ -1,17 +1,25 @@
-//! Statement classification: materialized-view DDL vs a plain query.
+//! Statement classification: materialized-view DDL and the settings surface vs a
+//! plain query.
 //!
-//! The engine's statement surface is queries plus exactly three DDL forms:
+//! The engine's statement surface is queries plus three materialized-view DDL
+//! forms and four settings statements:
 //!
 //! - `CREATE MATERIALIZED VIEW <name> AS <select>`
 //! - `REFRESH MATERIALIZED VIEW <name>`
 //! - `DROP MATERIALIZED VIEW <name>`
+//! - `SHOW SETTINGS` / `SHOW SETTING <name>`
+//! - `SET <name> = <value>` (also `SET <name> TO <value>`)
+//! - `RESET <name>` / `RESET ALL`
 //!
-//! `classify_statement` recognizes the DDL forms LEXICALLY (a quote-aware
+//! `classify_statement` recognizes these forms LEXICALLY (a quote-aware
 //! tokenizer, no full SQL parse) and returns everything else untouched as
 //! `Statement::Query`, which the caller feeds through the normal
-//! parse -> bind -> plan pipeline. Every Postgres DDL option outside the three
-//! plain forms raises `ParseError::Unsupported` naming the option - never a
-//! silent partial acceptance:
+//! parse -> bind -> plan pipeline. A bare `SHOW <x>` that is not `SHOW SETTING(S)`
+//! stays a `Statement::Query` (the normal parser raises its own loud error on
+//! it); every `SET`/`RESET` is a settings statement, since the engine has no
+//! other SET meaning. Every Postgres DDL option outside the three plain
+//! materialized-view forms raises `ParseError::Unsupported` naming the option -
+//! never a silent partial acceptance:
 //!
 //! - `IF NOT EXISTS` / `IF EXISTS`: a create that silently does nothing hides a
 //!   name collision, and a drop that silently does nothing hides a typo'd name.
@@ -40,6 +48,18 @@ pub enum Statement<'a> {
     RefreshMaterializedView { name: String },
     /// `DROP MATERIALIZED VIEW <name>`.
     DropMaterializedView { name: String },
+    /// `SHOW SETTINGS`: list every engine setting.
+    ShowSettings,
+    /// `SHOW SETTING <name>`: show the one setting named (dotted, e.g.
+    /// `optimizer.planning_budget_ms`).
+    ShowSetting { name: String },
+    /// `SET <name> = <value>` (or `SET <name> TO <value>`): change one
+    /// session-mutable setting on the live runtime. `value` is the raw text after
+    /// the assignment (surrounding quotes stripped); the runtime type-checks it.
+    SetSetting { name: String, value: String },
+    /// `RESET <name>` restores one setting to its default; `RESET ALL`
+    /// (`name` is `None`) restores every session override.
+    ResetSetting { name: Option<String> },
 }
 
 /// Classify one SQL statement. Materialized-view DDL is recognized by its
@@ -56,8 +76,120 @@ pub fn classify_statement(sql: &str) -> Result<Statement<'_>, ParseError> {
         "REFRESH" => classify_refresh(&mut tokens),
         "CREATE" if second_word_is(sql, "MATERIALIZED") => classify_create(&mut tokens),
         "DROP" if second_word_is(sql, "MATERIALIZED") => classify_drop(&mut tokens),
+        // SHOW is ours only for SETTING(S); any other SHOW passes through.
+        "SHOW" if second_word_is(sql, "SETTINGS") || second_word_is(sql, "SETTING") => {
+            classify_show(&mut tokens)
+        }
+        // The engine has no SET/RESET beyond the settings surface, so every one
+        // is ours (an unknown name then raises loudly at the runtime).
+        "SET" => classify_set(sql, &mut tokens),
+        "RESET" => classify_reset(&mut tokens),
         _ => Ok(Statement::Query(sql)),
     }
+}
+
+/// Parse `SHOW SETTINGS` (all settings) or `SHOW SETTING <name>` (one setting).
+/// A trailing token after `SETTINGS`, or a missing name after `SETTING`, raises.
+fn classify_show<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("SHOW")?;
+    if tokens.peek_word_is("SETTINGS") {
+        tokens.expect_keyword("SETTINGS")?;
+        expect_end(tokens, "SHOW SETTINGS")?;
+        return Ok(Statement::ShowSettings);
+    }
+    tokens.expect_keyword("SETTING")?;
+    let name = dotted_name(tokens)?;
+    expect_end(tokens, "SHOW SETTING <name>")?;
+    Ok(Statement::ShowSetting { name })
+}
+
+/// Parse `SET <name> = <value>` / `SET <name> TO <value>`. The name is a dotted
+/// identifier; the value is the remaining text, trimmed, with one layer of
+/// surrounding quotes removed (the runtime type-checks it against the setting).
+fn classify_set<'a>(sql: &'a str, tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("SET")?;
+    let name = dotted_name(tokens)?;
+    expect_assignment(tokens)?;
+    let value = unquote(tokens.rest().trim());
+    if value.is_empty() {
+        return Err(ParseError::Parse(format!(
+            "SET {name} has no value after the '='"
+        )));
+    }
+    // sql is borrowed only to tie the returned Statement's lifetime to the input;
+    // SET carries owned strings, so nothing of sql is retained.
+    let _ = sql;
+    Ok(Statement::SetSetting { name, value })
+}
+
+/// Consume the `=` or `TO` that separates a SET name from its value.
+fn expect_assignment(tokens: &mut Tokenizer<'_>) -> Result<(), ParseError> {
+    if tokens.peek_word_is("TO") {
+        tokens.expect_keyword("TO")?;
+        return Ok(());
+    }
+    match tokens.next_token() {
+        Some(Token::Other('=')) => Ok(()),
+        Some(token) => Err(ParseError::Parse(format!(
+            "expected '=' or 'TO' in SET, found '{}'",
+            token.describe()
+        ))),
+        None => Err(ParseError::Parse(
+            "expected '=' or 'TO' in SET, found end of statement".to_string(),
+        )),
+    }
+}
+
+/// Parse `RESET <name>` or `RESET ALL`. `ALL` yields `None` (reset every
+/// override); a name yields `Some(name)`.
+fn classify_reset<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("RESET")?;
+    if tokens.peek_word_is("ALL") {
+        tokens.expect_keyword("ALL")?;
+        expect_end(tokens, "RESET ALL")?;
+        return Ok(Statement::ResetSetting { name: None });
+    }
+    let name = dotted_name(tokens)?;
+    expect_end(tokens, "RESET <name>")?;
+    Ok(Statement::ResetSetting { name: Some(name) })
+}
+
+/// Read a dotted setting name (`word` or `word.word.word`), lowercasing each
+/// bare word (setting names are lowercase). A missing first word raises.
+fn dotted_name(tokens: &mut Tokenizer<'_>) -> Result<String, ParseError> {
+    let mut parts = vec![name_word(tokens)?];
+    while matches!(tokens.peek(), Some(Token::Other('.'))) {
+        tokens.next_token();
+        parts.push(name_word(tokens)?);
+    }
+    Ok(parts.join("."))
+}
+
+/// Read one identifier word of a dotted name, lowercased.
+fn name_word(tokens: &mut Tokenizer<'_>) -> Result<String, ParseError> {
+    match tokens.next_token() {
+        Some(Token::Word(word)) => Ok(word.to_lowercase()),
+        Some(token) => Err(ParseError::Parse(format!(
+            "expected a setting name, found '{}'",
+            token.describe()
+        ))),
+        None => Err(ParseError::Parse(
+            "expected a setting name, found end of statement".to_string(),
+        )),
+    }
+}
+
+/// Strip one matching layer of single or double quotes from a SET value, so
+/// `'text'` and `"text"` yield `text` while a bare `100000` is untouched.
+fn unquote(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let quoted = value.len() >= 2
+        && (bytes[0] == b'\'' || bytes[0] == b'"')
+        && bytes[bytes.len() - 1] == bytes[0];
+    if quoted {
+        return value[1..value.len() - 1].to_string();
+    }
+    value.to_string()
 }
 
 /// Whether the statement's second word token is `keyword` (case-insensitive).
@@ -549,5 +681,111 @@ mod tests {
     fn empty_input_is_a_query() {
         // Blank text is not DDL; the normal parser raises its own error on it.
         assert_eq!(classify("   "), Statement::Query("   "));
+    }
+
+    #[test]
+    fn show_settings_lists_all() {
+        assert_eq!(classify("SHOW SETTINGS"), Statement::ShowSettings);
+        assert_eq!(classify("show settings"), Statement::ShowSettings);
+    }
+
+    #[test]
+    fn show_setting_extracts_a_dotted_name() {
+        assert_eq!(
+            classify("SHOW SETTING optimizer.planning_budget_ms"),
+            Statement::ShowSetting {
+                name: "optimizer.planning_budget_ms".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn show_setting_without_a_name_raises() {
+        let error = classify_statement("SHOW SETTING").unwrap_err();
+        assert!(matches!(error, ParseError::Parse(_)));
+    }
+
+    #[test]
+    fn show_settings_with_trailing_token_raises() {
+        let error = classify_statement("SHOW SETTINGS extra").unwrap_err();
+        assert!(matches!(error, ParseError::Unsupported(_)));
+    }
+
+    #[test]
+    fn other_show_stays_a_query() {
+        // SHOW that is not SHOW SETTING(S) passes through to the normal parser.
+        assert_eq!(
+            classify("SHOW search_path"),
+            Statement::Query("SHOW search_path")
+        );
+    }
+
+    #[test]
+    fn set_extracts_name_and_value() {
+        assert_eq!(
+            classify("SET optimizer.ship_local_floor = 5000"),
+            Statement::SetSetting {
+                name: "optimizer.ship_local_floor".to_string(),
+                value: "5000".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn set_accepts_the_to_keyword() {
+        assert_eq!(
+            classify("SET optimizer.enable_join_reordering TO false"),
+            Statement::SetSetting {
+                name: "optimizer.enable_join_reordering".to_string(),
+                value: "false".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn set_strips_surrounding_quotes() {
+        assert_eq!(
+            classify("SET cost.network_rtt_ms = '12.5'"),
+            Statement::SetSetting {
+                name: "cost.network_rtt_ms".to_string(),
+                value: "12.5".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn set_without_a_value_raises() {
+        let error = classify_statement("SET optimizer.ship_local_floor =").unwrap_err();
+        assert!(matches!(error, ParseError::Parse(_)));
+    }
+
+    #[test]
+    fn set_without_assignment_raises() {
+        let error = classify_statement("SET optimizer.ship_local_floor 5000").unwrap_err();
+        assert!(matches!(error, ParseError::Parse(_)));
+    }
+
+    #[test]
+    fn reset_extracts_a_name() {
+        assert_eq!(
+            classify("RESET optimizer.ship_local_floor"),
+            Statement::ResetSetting {
+                name: Some("optimizer.ship_local_floor".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn reset_all_has_no_name() {
+        assert_eq!(
+            classify("RESET ALL"),
+            Statement::ResetSetting { name: None }
+        );
+    }
+
+    #[test]
+    fn reset_with_trailing_token_raises() {
+        let error = classify_statement("RESET optimizer.ship_local_floor now").unwrap_err();
+        assert!(matches!(error, ParseError::Unsupported(_)));
     }
 }

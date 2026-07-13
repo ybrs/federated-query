@@ -44,7 +44,7 @@ use crate::error::{ExecError, ExecResult};
 /// IN list; above it we push a temp table unless the filter would select more
 /// than the source's full-scan fraction, in which case a full scan of the
 /// (bandwidth-bound) table wins. Partition count is tuned near the core count.
-const IN_CAP: usize = 2000;
+pub const IN_CAP: usize = 2000;
 /// DuckDB's full-scan alternative is one single-stream read.
 const FULL_SCAN_FRACTION: f64 = 0.40;
 /// Postgres' full-scan alternative is the 8-way ctid-parallel read, whose
@@ -61,15 +61,15 @@ const PG_FULL_SCAN_FRACTION: f64 = 0.15;
 /// real keys/NDV from the planner's statistics. So this only bounds the ingest
 /// work; a selective 100k-key set (q09: 108k green-part keys, 5.4% of lineitem)
 /// now reduces instead of reading 60M rows whole.
-const DUCK_TEMP_CAP: usize = 2_000_000;
-const PARALLEL_PARTITIONS: usize = 8;
+pub const DUCK_TEMP_CAP: usize = 2_000_000;
+pub const PARALLEL_PARTITIONS: usize = 8;
 const DYN_KEYS_TEMP_TABLE: &str = "fedq_dyn_keys";
 /// DataFusion memory cap. Every context draws from ONE shared pool, so the
 /// engine as a whole is bounded; a fragment that would blow past it (a CROSS
 /// join's cartesian product) fails with ResourcesExhausted instead of OOMing
 /// the server. Sorts and grouped aggregates spill to disk via the default
 /// DiskManager; hash and nested-loop joins do not spill and error instead.
-const MEMORY_LIMIT_BYTES: usize = 32 * 1024 * 1024 * 1024;
+pub const MEMORY_LIMIT_BYTES: usize = 32 * 1024 * 1024 * 1024;
 
 /// The shared memory-capped RuntimeEnv (FairSpillPool + default DiskManager)
 /// behind every DataFusion context the engine creates.
@@ -143,7 +143,7 @@ struct LazyRegion {
 /// MEASURED input bytes avoids paying a doomed first attempt (planner row
 /// estimates are absent on aggregate intermediates, so this runtime signal
 /// is the reliable one - TPC-DS q78's join inputs all estimate None).
-const REGION_SPILL_JOIN_INPUT_BYTES: usize = 8 * 1024 * 1024 * 1024;
+pub const REGION_SPILL_JOIN_INPUT_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
 /// Resident (in-memory) bindings may collectively hold this much before the
 /// LARGEST ones spill to disk. A per-binding threshold taxed every big-fact
@@ -153,7 +153,7 @@ const REGION_SPILL_JOIN_INPUT_BYTES: usize = 8 * 1024 * 1024 * 1024;
 /// bounds the sum. 16GiB keeps typical multi-fact pipelines resident while
 /// a q64-scale pile still spills, and leaves the 32GiB operator pool and
 /// the harness RSS watchdog their headroom.
-const RESIDENT_BINDINGS_BUDGET: usize = 16 * 1024 * 1024 * 1024;
+pub const RESIDENT_BINDINGS_BUDGET: usize = 16 * 1024 * 1024 * 1024;
 
 /// Total Arrow buffer bytes held by a materialized relation.
 fn batches_bytes(b: &Batches) -> usize {
