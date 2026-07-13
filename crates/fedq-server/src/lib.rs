@@ -49,28 +49,62 @@
 //! is a distinct type (`TrustStartup`) so an md5/SCRAM/password source can
 //! replace it without touching the query path.
 //!
-//! ## Query protocol: simple only, extended fails loudly
+//! ## Query protocol: simple and extended
 //!
-//! The simple query protocol (the `Query` message) is fully supported and is what
-//! psql and `tokio_postgres::simple_query` use. The extended protocol
-//! (Parse/Bind/Describe/Execute, used by parameterized `query`/`execute`) is NOT
-//! implemented. Per the wire protocol it must fail LOUDLY, never by dropping
-//! the connection: every extended entry point returns an `ErrorResponse` with
-//! SQLSTATE `0A000` (feature_not_supported) at severity `ERROR`, so the client
-//! sees a clean error and the connection stays open for the next statement.
+//! The simple query protocol (the `Query` message) runs the query string
+//! directly and is what psql and `tokio_postgres::simple_query` use. The extended
+//! protocol (Parse/Bind/Describe/Execute) is what most drivers use by default
+//! (psycopg, JDBC, Npgsql, tokio-postgres), so it is fully served. Two aspects of
+//! it need engine seams, because the engine takes a plain SQL string and has no
+//! parameter placeholders of its own:
+//!
+//! ### Describe resolves the schema by planning, never by executing
+//!
+//! A Describe asks for a statement's or portal's result columns before (and
+//! independently of) any Execute. Executing to learn the schema is rejected: it
+//! would scan source data and pay the query's cost at Describe time. Instead
+//! `Session::describe` calls `Runtime::describe`, which runs the parse -> bind ->
+//! optimize -> physical-plan pipeline and reads the plan root's output types.
+//! Planning is O(metadata) by the engine's design (catalog and statistics only,
+//! under the planning budget), so Describe is cheap and reads no data. The one
+//! looseness is a DECIMAL's scale, which is data-derived; the Postgres type both
+//! the planned and the executed column map to (NUMERIC) is identical, so the row
+//! description a client received from Describe always matches the rows Execute
+//! sends. A statement Describe (before any value is bound) plans a form of the SQL
+//! with each placeholder replaced by a typed `NULL`, which cannot change the
+//! output column types.
+//!
+//! ### Bind is the parameter-substitution seam
+//!
+//! The engine has no `$n` parameters yet, so `params` splices each bound value in
+//! as a SQL literal at Bind/Execute, producing an ordinary SQL string for
+//! `Runtime::execute`. A value arrives text- or binary-encoded; pgwire's
+//! `Portal::parameter` decodes either, and the server maps integers (2/4/8-byte),
+//! floats (4/8-byte), booleans, and text/varchar (plus the unknown type Postgres
+//! gives an undecorated literal). A parameter of any other type is refused loudly
+//! by SQLSTATE, naming the type, rather than guessing a literal the engine cannot
+//! place. This substitution is the seam real parameter support will replace; until
+//! then a parameterized statement is planned and run as its substituted SQL.
 //!
 //! ## Result type mapping
 //!
 //! `encode` maps Arrow `DataType`s to Postgres type OIDs for the row description
-//! and encodes each cell in the text format. Booleans, signed and unsigned
-//! integers, 32/64-bit floats, and UTF-8 strings are supported. Any other Arrow
-//! type (dates, timestamps, decimals, nested types) raises a proper Postgres
-//! `ErrorResponse` naming the column and type rather than shipping a mislabeled
-//! value. `EXPLAIN` needs no special handling: `Runtime::execute` already returns
-//! it as a text column, which encodes as a normal string result.
+//! and encodes each cell in the format the client requested (all-text for the
+//! simple protocol; the client's per-column choice for the extended one).
+//! Booleans, signed and unsigned integers, 32/64-bit floats, and UTF-8 strings
+//! have a native Rust wire value and encode in either text or binary format.
+//! Dates, timestamps (any time unit; UTC or unzoned), and decimals are rendered to
+//! their canonical Postgres text; a client that requests one of these columns in
+//! binary format is refused loudly, since a text rendering shipped under a binary
+//! format code would be silently misread. Any other Arrow type (a non-UTC zoned
+//! timestamp, nested types) raises a proper Postgres `ErrorResponse` naming the
+//! column and type rather than shipping a mislabeled value. `EXPLAIN` needs no
+//! special handling: `Runtime::execute` returns it as a text column and
+//! `Runtime::describe` reports a single text `plan` column.
 
 mod encode;
 mod handler;
+mod params;
 mod session;
 
 pub use handler::FedqHandlers;

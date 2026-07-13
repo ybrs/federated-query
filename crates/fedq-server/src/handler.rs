@@ -1,11 +1,12 @@
 //! The pgwire protocol handlers.
 //!
-//! `FedqBackend` serves the simple query protocol by running SQL on the
-//! connection's `Session` and encoding the Arrow result; it also implements the
-//! extended query protocol as a loud "not supported" error so parameterized
-//! clients get a clean `ErrorResponse` instead of a dropped connection.
-//! `TrustStartup` performs the no-auth handshake, and `FedqHandlers` bundles the
-//! three for pgwire's `process_socket`.
+//! `FedqBackend` serves both wire query protocols by running SQL on the
+//! connection's `Session` and encoding the Arrow result. The simple protocol runs
+//! the query string directly; the extended protocol (Parse/Bind/Describe/Execute)
+//! resolves a statement's result schema by planning (without executing) for
+//! Describe, and splices bound parameter values into the SQL at Execute.
+//! `TrustStartup` performs the no-auth handshake, and `FedqHandlers` bundles them
+//! for pgwire's `process_socket`.
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -14,21 +15,22 @@ use async_trait::async_trait;
 use futures::Sink;
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::auth::StartupHandler;
-use pgwire::api::portal::Portal;
+use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{DescribePortalResponse, DescribeStatementResponse, Response};
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
-use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers};
+use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 
 use crate::encode;
+use crate::params;
 use crate::session::Session;
 
 /// One connection's query handler. Holds the `Session` that owns the connection's
-/// runtime thread and a shared no-op parser used only to satisfy the extended
-/// query handler's associated type.
+/// runtime thread and the parser that stores each extended-protocol statement as
+/// its verbatim SQL string.
 pub struct FedqBackend {
     session: Session,
     query_parser: Arc<NoopQueryParser>,
@@ -65,7 +67,8 @@ impl SimpleQueryHandler for FedqBackend {
             .execute(query.to_owned())
             .await
             .map_err(engine_error)?;
-        let response = encode::to_response(&result.schema, &result.batches)?;
+        // The simple protocol always returns rows in text format.
+        let response = encode::to_response(&result.schema, &result.batches, &Format::UnifiedText)?;
         Ok(vec![response])
     }
 }
@@ -75,18 +78,21 @@ impl ExtendedQueryHandler for FedqBackend {
     type Statement = String;
     type QueryParser = NoopQueryParser;
 
-    /// The parser used by the default parse/bind machinery; never produces a
-    /// usable statement here because execution is refused below.
+    /// The parser used by the default Parse machinery: it stores the SQL string
+    /// verbatim as the statement (the engine parses it lazily at Execute), so no
+    /// parsing happens here.
     fn query_parser(&self) -> Arc<Self::QueryParser> {
         Arc::clone(&self.query_parser)
     }
 
-    /// Refuse extended-protocol execution loudly (feature_not_supported), keeping
-    /// the connection open for the next statement.
+    /// Execute a bound portal: splice its parameter values into the statement's
+    /// SQL, run it on the session, and encode the rows in the format the client
+    /// requested for the portal's result columns. pgwire applies the Execute
+    /// message's row limit to the returned response.
     async fn do_query<C>(
         &self,
         _client: &mut C,
-        _portal: &Portal<Self::Statement>,
+        portal: &Portal<Self::Statement>,
         _max_rows: usize,
     ) -> PgWireResult<Response>
     where
@@ -95,14 +101,23 @@ impl ExtendedQueryHandler for FedqBackend {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        Err(extended_unsupported())
+        let sql = params::substitute(portal)?;
+        let result = self.session.execute(sql).await.map_err(engine_error)?;
+        encode::to_response(
+            &result.schema,
+            &result.batches,
+            &portal.result_column_format,
+        )
     }
 
-    /// Refuse the Describe-statement step of the extended protocol loudly.
+    /// Describe a prepared statement before any value is bound: resolve its result
+    /// columns by planning a placeholder-free form of the SQL (parameter values do
+    /// not change the output types), and report the declared parameter types back
+    /// to the client. No rows are read.
     async fn do_describe_statement<C>(
         &self,
         _client: &mut C,
-        _target: &StoredStatement<Self::Statement>,
+        target: &StoredStatement<Self::Statement>,
     ) -> PgWireResult<DescribeStatementResponse>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -110,14 +125,21 @@ impl ExtendedQueryHandler for FedqBackend {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        Err(extended_unsupported())
+        let sql = params::substitute_nulls(&target.statement, &target.parameter_types)?;
+        let columns = self.session.describe(sql).await.map_err(engine_error)?;
+        let fields = encode::describe_fields(&columns)?;
+        Ok(DescribeStatementResponse::new(
+            declared_param_types(&target.parameter_types),
+            fields,
+        ))
     }
 
-    /// Refuse the Describe-portal step of the extended protocol loudly.
+    /// Describe a bound portal: resolve its result columns by planning the SQL
+    /// with the bound parameter values spliced in. No rows are read.
     async fn do_describe_portal<C>(
         &self,
         _client: &mut C,
-        _target: &Portal<Self::Statement>,
+        portal: &Portal<Self::Statement>,
     ) -> PgWireResult<DescribePortalResponse>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -125,8 +147,22 @@ impl ExtendedQueryHandler for FedqBackend {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        Err(extended_unsupported())
+        let sql = params::substitute(portal)?;
+        let columns = self.session.describe(sql).await.map_err(engine_error)?;
+        let fields = encode::describe_fields(&columns)?;
+        Ok(DescribePortalResponse::new(fields))
     }
+}
+
+/// The parameter types to report in a statement's parameter description: the
+/// client's declared type for each `$n`, or the unknown type where it declared
+/// none.
+fn declared_param_types(types: &[Option<Type>]) -> Vec<Type> {
+    let mut declared = Vec::with_capacity(types.len());
+    for pg_type in types {
+        declared.push(pg_type.clone().unwrap_or(Type::UNKNOWN));
+    }
+    declared
 }
 
 /// The no-authentication startup handler: any user name is accepted with no
@@ -177,14 +213,5 @@ fn engine_error(message: String) -> PgWireError {
         "ERROR".to_owned(),
         "XX000".to_owned(),
         message,
-    )))
-}
-
-/// The error returned for any extended query protocol request.
-fn extended_unsupported() -> PgWireError {
-    PgWireError::UserError(Box::new(ErrorInfo::new(
-        "ERROR".to_owned(),
-        "0A000".to_owned(),
-        "the extended query protocol (prepared statements) is not supported; use the simple query protocol".to_owned(),
     )))
 }

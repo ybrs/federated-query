@@ -23,7 +23,7 @@ use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
 use serde_yaml::Value;
 
 use fq_catalog::{Catalog, StatsCatalog};
-use fq_common::{Config, DataSourceConfig, PlanBudget};
+use fq_common::{Config, DataSourceConfig, DataType, PlanBudget};
 use fq_connectors::{DuckDbSource, PostgresSource};
 use fq_exec::{connectors, execute_plan};
 use fq_optimize::{build_optimizer, CostModel, StatisticsCollector};
@@ -95,6 +95,39 @@ impl Runtime {
         // query's plans read these instead of asking the source.
         self.persist_observations(&execution.measurements, &execution.observations)?;
         rename_result(&execution.schema, execution.batches, &visible_names)
+    }
+
+    /// Resolve the result schema of `sql` WITHOUT executing it: the ordered
+    /// (visible column name, engine type) pairs the query would produce. It
+    /// runs the same parse -> ... -> physical plan pipeline `execute` runs and
+    /// reads the plan root's output types, which planning derives from catalog
+    /// metadata alone (O(metadata), under the same planning budget) - no source
+    /// data is scanned. A leading EXPLAIN resolves to the single textual `plan`
+    /// column, matching what `execute` returns for it.
+    ///
+    /// The types are the engine's static types. A DECIMAL's runtime scale is
+    /// data-derived and may differ from the static DECIMAL here, but the Postgres
+    /// type the wire layer maps both to (NUMERIC) is the same, so the row
+    /// description stays consistent with the executed rows.
+    pub fn describe(&self, sql: &str) -> Result<Vec<(String, DataType)>, RuntimeError> {
+        if explain::strip_explain(sql).is_some() {
+            return Ok(vec![("plan".to_owned(), DataType::Text)]);
+        }
+        let physical = self.plan(sql)?;
+        let names = output_column_names(&physical);
+        let types = physical.schema();
+        if names.len() != types.len() {
+            return Err(RuntimeError::ResultShape(format!(
+                "plan names {} columns but its schema has {}",
+                names.len(),
+                types.len()
+            )));
+        }
+        let mut columns = Vec::with_capacity(names.len());
+        for (name, (_internal, data_type)) in names.into_iter().zip(types) {
+            columns.push((name, data_type));
+        }
+        Ok(columns)
     }
 
     /// Parse -> bind -> decorrelate -> optimize into an optimized logical plan,

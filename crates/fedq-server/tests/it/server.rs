@@ -1,8 +1,10 @@
 //! End-to-end: start fedq-server on an ephemeral port over a tiny seeded DuckDB
-//! config, connect with a real Postgres client (tokio-postgres), and assert that
-//! plain and filtered SELECTs return the right rows, that a bad query surfaces as
-//! a Postgres error without dropping the connection, and that the unsupported
-//! extended protocol fails loudly.
+//! config, connect with a real Postgres client (tokio-postgres), and assert the
+//! simple and extended query protocols both work: plain and filtered SELECTs, a
+//! bad query surfacing as a Postgres error without dropping the connection,
+//! prepared statements with and without parameters, date/timestamp/decimal
+//! columns rendering as text, and an unmapped parameter type being refused
+//! loudly while the connection survives.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -11,13 +13,20 @@ use fq_common::{Config, CostConfig, DataSourceConfig, ExecutorConfig, OptimizerC
 use fq_connectors::DuckDbSource;
 use serde_yaml::Value;
 use tokio::net::TcpListener;
-use tokio_postgres::{NoTls, SimpleQueryMessage};
+use tokio_postgres::types::Type;
+use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
-/// The seed table for the server tests: four items with a quantity column the
-/// filtered query selects on.
-const ITEMS_SQL: &str = "CREATE TABLE items (id INTEGER, name VARCHAR, qty INTEGER); \
+/// The seed tables for the server tests: `items` (four rows with an integer
+/// quantity the filtered queries select on) and `events` (a date, a timestamp,
+/// and a decimal column, to exercise the text renderings of those types).
+const SEED_SQL: &str = "\
+    CREATE TABLE items (id INTEGER, name VARCHAR, qty INTEGER); \
     INSERT INTO items VALUES \
-    (1, 'apple', 5), (2, 'banana', 3), (3, 'cherry', 9), (4, 'date', 1);";
+    (1, 'apple', 5), (2, 'banana', 3), (3, 'cherry', 9), (4, 'date', 1); \
+    CREATE TABLE events (id INTEGER, day DATE, occurred TIMESTAMP, amount DECIMAL(10,2)); \
+    INSERT INTO events VALUES \
+    (1, DATE '2021-01-05', TIMESTAMP '2021-01-05 12:34:56', 19.95), \
+    (2, DATE '2022-07-13', TIMESTAMP '2022-07-13 00:00:00', 100.00);";
 
 /// A unique temp DuckDB file path per process run, so parallel tests never share
 /// a file or collide in the path-keyed exec cache.
@@ -64,6 +73,28 @@ fn shop_config(path: &str) -> Config {
     }
 }
 
+/// Seed a fresh DuckDB fixture, start the server on an ephemeral port, and return
+/// a connected Postgres client over trust auth.
+async fn start_seeded_server() -> Client {
+    let path = temp_duck();
+    seed_duck(&path, SEED_SQL);
+    let config = shop_config(&path);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(fedq_server::serve(config, listener));
+    let conn_str = format!(
+        "host=127.0.0.1 port={} user=postgres dbname=fedq",
+        addr.port()
+    );
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .expect("connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+}
+
 /// Collect the `Row` messages of a simple-query result as vectors of the
 /// requested column values (as text), skipping command-complete markers.
 fn rows(messages: &[SimpleQueryMessage], columns: usize) -> Vec<Vec<String>> {
@@ -81,26 +112,8 @@ fn rows(messages: &[SimpleQueryMessage], columns: usize) -> Vec<Vec<String>> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn serves_selects_and_surfaces_errors() {
-    // Seed the fixture and start the server on an ephemeral port.
-    let path = temp_duck();
-    seed_duck(&path, ITEMS_SQL);
-    let config = shop_config(&path);
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("local addr");
-    tokio::spawn(fedq_server::serve(config, listener));
-
-    // Connect with a real Postgres client over trust auth.
-    let conn_str = format!(
-        "host=127.0.0.1 port={} user=postgres dbname=fedq",
-        addr.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
+async fn simple_query_serves_selects_and_surfaces_errors() {
+    let client = start_seeded_server().await;
 
     // Plain SELECT: all four rows, in key order.
     let messages = client
@@ -153,20 +166,125 @@ async fn serves_selects_and_surfaces_errors() {
         .expect("query after error");
     let counted = rows(&messages, 1);
     assert_eq!(counted, vec![vec!["4".to_owned()]]);
+}
 
-    // The extended query protocol is refused loudly (not by dropping): a
-    // parameterized query returns a db error and the connection stays usable.
-    let extended = client
-        .query("SELECT id FROM shop.main.items", &[])
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extended_serves_parameterless_prepared_statement() {
+    let client = start_seeded_server().await;
+
+    // tokio-postgres uses the extended protocol (Parse/Bind/Describe/Execute) for
+    // prepared statements. A parameterless one describes its columns by planning
+    // and returns typed rows.
+    let statement = client
+        .prepare("SELECT id, name, qty FROM shop.main.items ORDER BY id")
         .await
-        .expect_err("extended protocol must be refused");
-    assert!(
-        extended.as_db_error().is_some(),
-        "extended-protocol refusal must be a Postgres error response"
+        .expect("prepare");
+    let result = client.query(&statement, &[]).await.expect("execute");
+    assert_eq!(result.len(), 4);
+    let first = &result[0];
+    let id: i32 = first.get("id");
+    let name: &str = first.get("name");
+    let qty: i32 = first.get("qty");
+    assert_eq!((id, name, qty), (1, "apple", 5));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extended_serves_integer_parameter() {
+    let client = start_seeded_server().await;
+
+    // A declared INT4 parameter is bound (binary-encoded by tokio-postgres) and
+    // spliced into the SQL; only items with qty >= 5 come back.
+    let statement = client
+        .prepare_typed(
+            "SELECT id, name FROM shop.main.items WHERE qty >= $1 ORDER BY id",
+            &[Type::INT4],
+        )
+        .await
+        .expect("prepare typed");
+    let result = client.query(&statement, &[&5i32]).await.expect("execute");
+    let ids: Vec<i32> = result.iter().map(|row| row.get::<_, i32>("id")).collect();
+    assert_eq!(ids, vec![1, 3]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extended_serves_text_parameter() {
+    let client = start_seeded_server().await;
+
+    // A declared TEXT parameter is quoted into the SQL as a string literal.
+    let statement = client
+        .prepare_typed(
+            "SELECT id FROM shop.main.items WHERE name = $1",
+            &[Type::TEXT],
+        )
+        .await
+        .expect("prepare typed");
+    let result = client
+        .query(&statement, &[&"apple"])
+        .await
+        .expect("execute");
+    assert_eq!(result.len(), 1);
+    let id: i32 = result[0].get("id");
+    assert_eq!(id, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn temporal_and_decimal_columns_render_as_text() {
+    let client = start_seeded_server().await;
+
+    // Dates, timestamps, and decimals render to their canonical Postgres text;
+    // the simple protocol returns every column as text, so the rendering shows
+    // directly.
+    let messages = client
+        .simple_query("SELECT day, occurred, amount FROM shop.main.events ORDER BY id")
+        .await
+        .expect("temporal select");
+    let result = rows(&messages, 3);
+    assert_eq!(
+        result,
+        vec![
+            vec![
+                "2021-01-05".to_owned(),
+                "2021-01-05 12:34:56".to_owned(),
+                "19.95".to_owned(),
+            ],
+            vec![
+                "2022-07-13".to_owned(),
+                "2022-07-13 00:00:00".to_owned(),
+                "100.00".to_owned(),
+            ],
+        ],
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extended_refuses_unmapped_parameter_type_loudly() {
+    let client = start_seeded_server().await;
+
+    // A BYTEA parameter has no SQL-literal rendering, so binding one must fail
+    // loudly at Execute rather than guess a value the engine cannot place. The
+    // parameter is binary-encoded (tokio-postgres's default), so this also covers
+    // that an unmappable binary parameter is refused, not silently accepted.
+    let statement = client
+        .prepare_typed(
+            "SELECT id FROM shop.main.items WHERE name = $1",
+            &[Type::BYTEA],
+        )
+        .await
+        .expect("prepare typed");
+    let bytes: Vec<u8> = vec![1, 2, 3];
+    let error = client
+        .query(&statement, &[&bytes])
+        .await
+        .expect_err("unmapped parameter type must be refused");
+    assert!(
+        error.as_db_error().is_some(),
+        "refusal must be a Postgres error response, not a dropped connection"
+    );
+
+    // The connection survived the refusal: a follow-up query still works.
     let messages = client
         .simple_query("SELECT count(*) AS n FROM shop.main.items")
         .await
-        .expect("simple query after extended refusal");
+        .expect("query after refusal");
     assert_eq!(rows(&messages, 1), vec![vec!["4".to_owned()]]);
 }

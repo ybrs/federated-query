@@ -8,7 +8,7 @@
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
-use fq_common::Config;
+use fq_common::{Config, DataType};
 use fq_runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
 
@@ -20,11 +20,24 @@ pub struct QueryResult {
     pub batches: Vec<RecordBatch>,
 }
 
-/// One unit of work handed to the worker thread: a SQL string and the reply
-/// channel the result (or error message) is sent back on.
-struct Job {
-    sql: String,
-    reply: oneshot::Sender<Result<QueryResult, String>>,
+/// One result column's static description: its user-visible name and the
+/// engine type the plan resolved for it, produced by `describe` without
+/// executing.
+pub type ColumnDescription = (String, DataType);
+
+/// One unit of work handed to the worker thread. `Execute` runs the SQL and
+/// returns its rows; `Describe` resolves the SQL's result schema by planning
+/// only. Each carries the reply channel its answer (or error message) is sent
+/// back on.
+enum Job {
+    Execute {
+        sql: String,
+        reply: oneshot::Sender<Result<QueryResult, String>>,
+    },
+    Describe {
+        sql: String,
+        reply: oneshot::Sender<Result<Vec<ColumnDescription>, String>>,
+    },
 }
 
 /// A handle to one connection's execution thread. Dropping it closes the job
@@ -51,12 +64,33 @@ impl Session {
     /// (channel closed) is itself reported as an error, never silently ignored.
     pub async fn execute(&self, sql: String) -> Result<QueryResult, String> {
         let (reply, answer) = oneshot::channel();
+        let job = Job::Execute { sql, reply };
+        self.dispatch(job, answer).await
+    }
+
+    /// Resolve one SQL statement's result columns on this connection's runtime
+    /// WITHOUT executing it (planning only), for the extended protocol's Describe
+    /// step. Errors and a dead worker surface exactly as `execute`'s do.
+    pub async fn describe(&self, sql: String) -> Result<Vec<ColumnDescription>, String> {
+        let (reply, answer) = oneshot::channel();
+        let job = Job::Describe { sql, reply };
+        self.dispatch(job, answer).await
+    }
+
+    /// Send a job to the worker and await its reply on `answer`. A closed job
+    /// channel (worker gone) or a dropped reply is reported as an error, never
+    /// silently ignored.
+    async fn dispatch<T>(
+        &self,
+        job: Job,
+        answer: oneshot::Receiver<Result<T, String>>,
+    ) -> Result<T, String> {
         self.jobs
-            .send(Job { sql, reply })
+            .send(job)
             .map_err(|_| "session worker thread is not running".to_string())?;
         match answer.await {
             Ok(result) => result,
-            Err(_) => Err("session worker dropped the query without replying".to_string()),
+            Err(_) => Err("session worker dropped the request without replying".to_string()),
         }
     }
 }
@@ -68,15 +102,31 @@ impl Session {
 fn run_worker(config: &Config, mut receiver: mpsc::UnboundedReceiver<Job>) {
     let runtime = Runtime::from_config(config).map_err(|error| error.to_string());
     while let Some(job) = receiver.blocking_recv() {
-        let result = match &runtime {
-            Ok(runtime) => runtime
-                .execute(&job.sql)
-                .map(|(schema, batches)| QueryResult { schema, batches })
-                .map_err(|error| error.to_string()),
-            Err(build_error) => Err(build_error.clone()),
-        };
-        // The receiver is gone only if the client already disconnected; that is
-        // an expected race, not an error to surface.
-        let _ = job.reply.send(result);
+        serve_job(&runtime, job);
+    }
+}
+
+/// Answer one job on the worker thread. Both job kinds report a runtime that
+/// failed to build with that build error (loud on every request), and a dropped
+/// reply channel (client already disconnected) is an expected race, not an error.
+fn serve_job(runtime: &Result<Runtime, String>, job: Job) {
+    match job {
+        Job::Execute { sql, reply } => {
+            let result = match runtime {
+                Ok(runtime) => runtime
+                    .execute(&sql)
+                    .map(|(schema, batches)| QueryResult { schema, batches })
+                    .map_err(|error| error.to_string()),
+                Err(build_error) => Err(build_error.clone()),
+            };
+            let _ = reply.send(result);
+        }
+        Job::Describe { sql, reply } => {
+            let result = match runtime {
+                Ok(runtime) => runtime.describe(&sql).map_err(|error| error.to_string()),
+                Err(build_error) => Err(build_error.clone()),
+            };
+            let _ = reply.send(result);
+        }
     }
 }
