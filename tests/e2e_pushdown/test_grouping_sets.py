@@ -11,10 +11,9 @@ returns SUM as float64.
 import duckdb
 import pytest
 
-from federated_query.parser.errors import UnsupportedSQLError
-
 from tests.e2e_pushdown.conftest import _seed_customers, _seed_orders
 from tests.e2e_pushdown.helpers import build_runtime
+from tests.rust_runtime import assert_raises_engine_error
 from tests.duckdb_tmp import duckdb_path
 
 SINGLE = "duckdb_primary.main.orders"
@@ -140,7 +139,7 @@ def test_cross_source_grouping_sets(multi_source_env):
 def test_combining_multiple_constructs_fails_fast(single_source_env):
     """Combining several ROLLUP/CUBE/GROUPING SETS is rejected, not mis-expanded."""
     runtime = build_runtime(single_source_env)
-    with pytest.raises(UnsupportedSQLError):
+    with assert_raises_engine_error():
         runtime.execute(
             f"SELECT region FROM {SINGLE} GROUP BY ROLLUP (region), CUBE (status)"
         )

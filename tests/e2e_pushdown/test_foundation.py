@@ -1,22 +1,22 @@
-"""Foundation tests for EXPLAIN (FORMAT JSON) query capture."""
+"""Foundation tests for EXPLAIN remote-query capture."""
 
 from sqlglot import exp
 
-from federated_query.cli.fedq import FedQRuntime
-from federated_query.config import Config
+from tests.e2e_pushdown.helpers import build_runtime, explain_document
 
 
 def _build_runtime(env):
-    """Instantiate a FedQ runtime for the provided catalog fixture."""
-    runtime = FedQRuntime(env.catalog, Config())
-    return runtime
+    """Instantiate a Rust-engine runtime for the provided environment."""
+    return build_runtime(env)
 
 
-def _run_explain_json(runtime: FedQRuntime, sql: str):
-    """Execute EXPLAIN ... JSON and validate the returned document."""
-    document = runtime.execute(sql)
-    assert isinstance(document, dict)
-    return document
+def _run_explain_json(runtime, sql: str):
+    """Return the remote-query document for the (EXPLAIN-prefixed) statement."""
+    inner = sql
+    prefix = "EXPLAIN (FORMAT JSON) "
+    if inner.startswith(prefix):
+        inner = inner[len(prefix) :]
+    return explain_document(runtime, inner)
 
 
 def _single_query_entry(document):

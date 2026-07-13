@@ -2,34 +2,45 @@
 
 from typing import Callable, Dict, List, Optional
 
+import sqlglot
 from sqlglot import exp
 
-from federated_query.cli.fedq import FedQRuntime
-from federated_query.config import Config
+from tests.rust_runtime import RustRuntime
 
 
-def build_runtime(env) -> FedQRuntime:
-    """Create a FedQ runtime for the provided environment."""
-    runtime = FedQRuntime(env.catalog, Config())
+def build_runtime(env) -> RustRuntime:
+    """Create a Rust-engine runtime for the provided environment."""
+    runtime = RustRuntime(env.source_pairs())
     return runtime
 
 
-def explain_datasource_query(runtime: FedQRuntime, sql: str) -> exp.Expression:
-    """Return the remote query AST produced by EXPLAIN (FORMAT JSON)."""
-    statement = f"EXPLAIN (FORMAT JSON) {sql}"
-    document = runtime.execute(statement)
-    assert isinstance(document, dict)
-    queries = document.get("queries", [])
+def explain_datasource_query(runtime: RustRuntime, sql: str) -> exp.Expression:
+    """Return the single remote-query AST from the engine's EXPLAIN plan.
+
+    Asserts exactly one datasource query is emitted (the pushdown contract) and
+    parses its rendered SQL as a DuckDB-dialect AST.
+    """
+    queries = runtime.explain_queries(sql)
     assert len(queries) == 1
-    entry = queries[0]
-    return entry["query"]
+    _datasource, sql_text = queries[0]
+    return sqlglot.parse_one(sql_text, dialect="duckdb")
 
 
-def explain_document(runtime: FedQRuntime, sql: str) -> Dict[str, object]:
-    """Execute EXPLAIN (FORMAT JSON) and return the document."""
-    statement = f"EXPLAIN (FORMAT JSON) {sql}"
-    document = runtime.execute(statement)
-    assert isinstance(document, dict)
+def explain_document(runtime: RustRuntime, sql: str) -> Dict[str, object]:
+    """Return a document mapping ``queries`` to the engine's remote queries.
+
+    Each entry mirrors the old JSON shape: ``datasource_name`` plus the parsed
+    ``query`` AST, so callers that iterated the document keep working.
+    """
+    queries = runtime.explain_queries(sql)
+    entries: List[Dict[str, object]] = []
+    for datasource, sql_text in queries:
+        entry: Dict[str, object] = {}
+        entry["datasource_name"] = datasource
+        entry["query"] = sqlglot.parse_one(sql_text, dialect="duckdb")
+        entries.append(entry)
+    document: Dict[str, object] = {}
+    document["queries"] = entries
     return document
 
 

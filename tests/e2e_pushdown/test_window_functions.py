@@ -3,12 +3,12 @@
 import pytest
 from sqlglot import exp
 
-from federated_query.parser.errors import UnsupportedSQLError
 from tests.e2e_pushdown.helpers import (
     is_func,
     build_runtime,
     explain_datasource_query,
 )
+from tests.rust_runtime import assert_raises_engine_error
 
 
 def test_distinct_over_window_fails_fast(single_source_env):
@@ -23,7 +23,7 @@ def test_distinct_over_window_fails_fast(single_source_env):
         "SUM(price) OVER (PARTITION BY customer_id) AS s "
         "FROM duckdb_primary.main.orders"
     )
-    with pytest.raises(UnsupportedSQLError):
+    with assert_raises_engine_error():
         runtime.execute(sql)
 
 

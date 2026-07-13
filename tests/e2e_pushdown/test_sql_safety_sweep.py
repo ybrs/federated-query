@@ -9,9 +9,8 @@ working.
 
 import pytest
 
-from federated_query.parser.errors import UnsupportedSQLError
-
 from tests.e2e_pushdown.helpers import build_runtime
+from tests.rust_runtime import assert_raises_engine_error
 
 TABLE = "duckdb_primary.main.orders"
 
@@ -42,9 +41,9 @@ def test_fetch_first_only_works(single_source_env):
 
 @pytest.mark.parametrize("sql", REJECTED_SQL)
 def test_unsupported_clause_fails_fast(single_source_env, sql):
-    """An unconsumed clause raises UnsupportedSQLError instead of being dropped."""
+    """An unconsumed clause raises instead of being silently dropped."""
     runtime = build_runtime(single_source_env)
-    with pytest.raises(UnsupportedSQLError):
+    with assert_raises_engine_error():
         runtime.execute(sql)
 
 

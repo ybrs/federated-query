@@ -1,57 +1,85 @@
-"""Fixtures for exhaustive pushdown E2E tests."""
+"""Fixtures for exhaustive pushdown E2E tests, driven by the Rust engine.
+
+Each DuckDB source is a real file (the Rust engine opens files itself; an
+in-memory database is invisible to it). A source is seeded through a read-write
+DuckDB connection which is then CLOSED, and a fresh READ-ONLY connection is
+opened for ground-truth comparisons. Closing the seeding connection avoids any
+write-visibility ambiguity when the native engine opens the same file; a
+read-only ground-truth connection coexists with the engine's handle.
+"""
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import List, Optional, Tuple
 
-import sqlglot
-
+import duckdb
 import pytest
 
-from federated_query.catalog import Catalog
-from federated_query.datasources.duckdb import DuckDBDataSource
-from federated_query.model import StateModel
 from tests.duckdb_tmp import duckdb_path
 
 
-class ProxyingDuckDBDataSource(DuckDBDataSource):
-    """DuckDB source that captures the most recent query AST for assertions."""
+class SeededSource:
+    """One seeded DuckDB file: its datasource name, path, and a read-only handle.
 
-    def __init__(self, name: str, config: Dict[str, str]):
-        super().__init__(name, config)
-        self._last_ast: Optional[sqlglot.exp.Expression] = None
+    ``connection`` is a read-only DuckDB connection kept open for ground-truth
+    queries; it coexists with the native engine's own handle on the same file.
+    """
 
-    def execute_query(self, query: str):
-        self._last_ast = sqlglot.parse_one(query)
-        return super().execute_query(query)
+    def __init__(self, name: str, path: str, connection):
+        self.name = name
+        self.path = path
+        self.connection = connection
 
-    def reset_tracking(self) -> None:
-        self._last_ast = None
-
-    def last_query_ast(self) -> Optional[sqlglot.exp.Expression]:
-        return self._last_ast
+    def disconnect(self) -> None:
+        """Close the read-only ground-truth connection."""
+        self.connection.close()
 
 
-class QueryEnvironment(StateModel):
-    """Wrapper containing catalog + datasources for pushdown tests."""
+class ProxyingDuckDBDataSource:
+    """A seeded DuckDB file built incrementally: connect, seed, then read.
 
-    catalog: Catalog
-    datasources: List[ProxyingDuckDBDataSource]
+    Kept for suites that construct their own environment (connect, run seed
+    functions against ``connection``, then hand the source to a runtime). The
+    write connection stays open for seeding; ``path`` is what the engine reads.
+    """
 
-    def reset_datasources(self) -> None:
-        for ds in self.datasources:
-            ds.reset_tracking()
+    def __init__(self, name: str, config):
+        self.name = name
+        self.path = config["path"]
+        self.connection = None
 
-    def snapshot_asts(self) -> Dict[str, sqlglot.exp.Expression]:
-        asts: Dict[str, sqlglot.exp.Expression] = {}
-        for ds in self.datasources:
-            ast = ds.last_query_ast()
-            if ast is not None:
-                asts[ds.name] = ast
-        return asts
+    def connect(self) -> None:
+        """Open the read-write connection used to seed this source."""
+        self.connection = duckdb.connect(self.path)
+
+    def disconnect(self) -> None:
+        """Close the seeding connection."""
+        if self.connection is not None:
+            self.connection.close()
+
+
+class QueryEnvironment:
+    """Catalog-free wrapper carrying the seeded sources for a test.
+
+    ``datasources`` is the list of seeded sources (each exposing ``name``,
+    ``path``, and a ground-truth ``connection``). ``source_pairs`` are the
+    ``(name, path)`` tuples the Rust runtime config is built from.
+    """
+
+    def __init__(self, datasources, catalog=None):
+        self.datasources = datasources
+        self.catalog = catalog
+
+    def source_pairs(self) -> List[Tuple[str, str]]:
+        """Return the (datasource_name, duckdb_file_path) pairs for the config."""
+        pairs = []
+        for source in self.datasources:
+            pairs.append((source.name, source.path))
+        return pairs
 
 
 def _seed_orders(cursor) -> None:
+    """Create and populate the canonical orders table."""
     cursor.execute("""
         CREATE TABLE orders (
             order_id INTEGER,
@@ -81,6 +109,7 @@ def _seed_orders(cursor) -> None:
 
 
 def _seed_products(cursor) -> None:
+    """Create and populate the canonical products table."""
     cursor.execute("""
         CREATE TABLE products (
             id INTEGER,
@@ -106,6 +135,7 @@ def _seed_products(cursor) -> None:
 
 
 def _seed_customers(cursor) -> None:
+    """Create and populate the canonical customers table."""
     cursor.execute("""
         CREATE TABLE customers (
             customer_id INTEGER,
@@ -123,57 +153,40 @@ def _seed_customers(cursor) -> None:
         """)
 
 
-def _build_datasource(name: str) -> QueryCapturingDataSource:
-    config = {"path": duckdb_path(), "read_only": False}
-    ds = ProxyingDuckDBDataSource(name=name, config=config)
-    ds.connect()
-    return ds
+def build_seeded_source(name: str, seeds) -> SeededSource:
+    """Seed a fresh DuckDB file with the given seed functions, return the source.
+
+    Seeding runs on a read-write connection that is closed afterwards; a
+    read-only connection is opened for ground-truth queries.
+    """
+    path = duckdb_path()
+    writer = duckdb.connect(path)
+    for seed in seeds:
+        seed(writer)
+    writer.close()
+    reader = duckdb.connect(path, read_only=True)
+    return SeededSource(name=name, path=path, connection=reader)
 
 
 @pytest.fixture(scope="module")
 def single_source_env() -> QueryEnvironment:
     """Single DuckDB source with orders/products/customers."""
-
-    ds = _build_datasource("duckdb_primary")
-    cursor = ds.connection
-    _seed_orders(cursor)
-    _seed_products(cursor)
-    _seed_customers(cursor)
-
-    catalog = Catalog()
-    catalog.register_datasource(ds)
-    catalog.load_metadata()
-
-    env = QueryEnvironment(catalog=catalog, datasources=[ds])
+    source = build_seeded_source(
+        "duckdb_primary", (_seed_orders, _seed_products, _seed_customers)
+    )
+    env = QueryEnvironment(datasources=[source])
     yield env
-    ds.disconnect()
+    source.disconnect()
 
 
 @pytest.fixture(scope="module")
 def multi_source_env() -> QueryEnvironment:
-    """Two DuckDB sources to validate cross-source guardrails."""
-
-    ds_orders = _build_datasource("duckdb_orders")
-    _seed_orders(ds_orders.connection)
-
-    ds_products = _build_datasource("duckdb_products")
-    _seed_products(ds_products.connection)
-
-    ds_customers = _build_datasource("duckdb_customers")
-    _seed_customers(ds_customers.connection)
-
-    catalog = Catalog()
-    for ds in (ds_orders, ds_products, ds_customers):
-        catalog.register_datasource(ds)
-    catalog.load_metadata()
-
-    env = QueryEnvironment(
-        catalog=catalog,
-        datasources=[ds_orders, ds_products, ds_customers],
-    )
-
+    """Three DuckDB sources to validate cross-source pushdown."""
+    orders = build_seeded_source("duckdb_orders", (_seed_orders,))
+    products = build_seeded_source("duckdb_products", (_seed_products,))
+    customers = build_seeded_source("duckdb_customers", (_seed_customers,))
+    env = QueryEnvironment(datasources=[orders, products, customers])
     yield env
-
-    ds_orders.disconnect()
-    ds_products.disconnect()
-    ds_customers.disconnect()
+    orders.disconnect()
+    products.disconnect()
+    customers.disconnect()

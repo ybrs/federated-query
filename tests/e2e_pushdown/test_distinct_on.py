@@ -9,9 +9,8 @@ ORDER BY semantics, so it fails fast.
 
 import pytest
 
-from federated_query.executor.rust_ir import UnsupportedIR
-
 from tests.e2e_pushdown.helpers import build_runtime
+from tests.rust_runtime import assert_raises_engine_error
 
 SINGLE = "duckdb_primary.main.orders"
 
@@ -80,5 +79,5 @@ def test_cross_source_distinct_on_fails_fast(multi_source_env):
         "JOIN duckdb_customers.main.customers c ON o.customer_id = c.customer_id "
         "ORDER BY o.region, o.order_id"
     )
-    with pytest.raises(UnsupportedIR):
+    with assert_raises_engine_error(match="DISTINCT ON"):
         runtime.execute(sql)

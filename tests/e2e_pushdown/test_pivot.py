@@ -9,8 +9,8 @@ and produces the same result as a native PIVOT. Shapes the rewrite cannot handle
 import duckdb
 import pytest
 
-from federated_query.parser.errors import UnsupportedSQLError
 from tests.e2e_pushdown.helpers import build_runtime
+from tests.rust_runtime import assert_raises_engine_error
 from tests.duckdb_tmp import duckdb_path
 
 TABLE = "duckdb_primary.main.orders"
@@ -80,5 +80,5 @@ UNSUPPORTED = [
 def test_unsupported_pivot_fails_fast(single_source_env, template):
     """Unsupported pivot shapes raise rather than silently drop the pivot."""
     runtime = build_runtime(single_source_env)
-    with pytest.raises(UnsupportedSQLError):
+    with assert_raises_engine_error():
         runtime.execute(template.format(T=TABLE))

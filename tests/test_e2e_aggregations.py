@@ -2,28 +2,17 @@
 
 import pytest
 import duckdb
-import pyarrow as pa
 
-from federated_query.catalog import Catalog
-from federated_query.datasources.duckdb import DuckDBDataSource
-from federated_query.parser import Parser, Binder
-from federated_query.optimizer.physical_planner import PhysicalPlanner
-from federated_query.executor.executor import Executor
-from federated_query.config.config import ExecutorConfig
 from tests.duckdb_tmp import duckdb_path
+from tests.rust_runtime import RustRuntime
 
 
 @pytest.fixture
 def setup_test_db():
-    """Create in-memory DuckDB with test data."""
-    config = {
-        "path": duckdb_path(),
-        "read_only": False,
-    }
-    datasource = DuckDBDataSource(name="test_db", config=config)
-    datasource.connect()
-
-    datasource.connection.execute("""
+    """Seed a DuckDB file and return a Rust-engine runtime over it."""
+    path = duckdb_path()
+    writer = duckdb.connect(path)
+    writer.execute("""
         CREATE TABLE orders (
             id INTEGER,
             region VARCHAR,
@@ -31,8 +20,7 @@ def setup_test_db():
             quantity INTEGER
         )
     """)
-
-    datasource.connection.execute("""
+    writer.execute("""
         INSERT INTO orders VALUES
         (1, 'North', 100.0, 5),
         (2, 'South', 200.0, 10),
@@ -42,35 +30,21 @@ def setup_test_db():
         (6, 'North', 180.0, 9),
         (7, 'East', 220.0, 11)
     """)
-
-    catalog = Catalog()
-    catalog.register_datasource(datasource)
-    catalog.load_metadata()
-
-    yield catalog, datasource
-
-    datasource.disconnect()
+    writer.close()
+    runtime = RustRuntime([("test_db", path)])
+    yield runtime
 
 
 def test_simple_count(setup_test_db):
     """Test simple COUNT(*) aggregation."""
-    catalog, datasource = setup_test_db
+    runtime = setup_test_db
 
     sql = """
         SELECT COUNT(*) as total_count
         FROM test_db.main.orders
     """
 
-    parser = Parser()
-    binder = Binder(catalog)
-    planner = PhysicalPlanner(catalog)
-    executor = Executor(ExecutorConfig())
-
-    logical_plan = parser.parse_to_logical_plan(sql, catalog)
-    bound_plan = binder.bind(logical_plan)
-    physical_plan = planner.plan(bound_plan)
-
-    result_table = executor.execute_to_table(physical_plan)
+    result_table = runtime.execute(sql)
 
     assert result_table.num_rows == 1
     assert result_table.column(0)[0].as_py() == 7
@@ -78,7 +52,7 @@ def test_simple_count(setup_test_db):
 
 def test_group_by_with_count(setup_test_db):
     """Test GROUP BY with COUNT aggregation."""
-    catalog, datasource = setup_test_db
+    runtime = setup_test_db
 
     sql = """
         SELECT region, COUNT(*) as order_count
@@ -86,16 +60,7 @@ def test_group_by_with_count(setup_test_db):
         GROUP BY region
     """
 
-    parser = Parser()
-    binder = Binder(catalog)
-    planner = PhysicalPlanner(catalog)
-    executor = Executor(ExecutorConfig())
-
-    logical_plan = parser.parse_to_logical_plan(sql, catalog)
-    bound_plan = binder.bind(logical_plan)
-    physical_plan = planner.plan(bound_plan)
-
-    result_table = executor.execute_to_table(physical_plan)
+    result_table = runtime.execute(sql)
 
     assert result_table.num_rows == 3
 
@@ -113,7 +78,7 @@ def test_group_by_with_count(setup_test_db):
 
 def test_group_by_with_sum(setup_test_db):
     """Test GROUP BY with SUM aggregation."""
-    catalog, datasource = setup_test_db
+    runtime = setup_test_db
 
     sql = """
         SELECT region, SUM(amount) as total_amount
@@ -121,16 +86,7 @@ def test_group_by_with_sum(setup_test_db):
         GROUP BY region
     """
 
-    parser = Parser()
-    binder = Binder(catalog)
-    planner = PhysicalPlanner(catalog)
-    executor = Executor(ExecutorConfig())
-
-    logical_plan = parser.parse_to_logical_plan(sql, catalog)
-    bound_plan = binder.bind(logical_plan)
-    physical_plan = planner.plan(bound_plan)
-
-    result_table = executor.execute_to_table(physical_plan)
+    result_table = runtime.execute(sql)
 
     assert result_table.num_rows == 3
 
@@ -148,7 +104,7 @@ def test_group_by_with_sum(setup_test_db):
 
 def test_group_by_with_avg(setup_test_db):
     """Test GROUP BY with AVG aggregation."""
-    catalog, datasource = setup_test_db
+    runtime = setup_test_db
 
     sql = """
         SELECT region, AVG(amount) as avg_amount
@@ -156,16 +112,7 @@ def test_group_by_with_avg(setup_test_db):
         GROUP BY region
     """
 
-    parser = Parser()
-    binder = Binder(catalog)
-    planner = PhysicalPlanner(catalog)
-    executor = Executor(ExecutorConfig())
-
-    logical_plan = parser.parse_to_logical_plan(sql, catalog)
-    bound_plan = binder.bind(logical_plan)
-    physical_plan = planner.plan(bound_plan)
-
-    result_table = executor.execute_to_table(physical_plan)
+    result_table = runtime.execute(sql)
 
     assert result_table.num_rows == 3
 
@@ -183,7 +130,7 @@ def test_group_by_with_avg(setup_test_db):
 
 def test_group_by_with_min_max(setup_test_db):
     """Test GROUP BY with MIN and MAX aggregations."""
-    catalog, datasource = setup_test_db
+    runtime = setup_test_db
 
     sql = """
         SELECT region, MIN(amount) as min_amount, MAX(amount) as max_amount
@@ -191,16 +138,7 @@ def test_group_by_with_min_max(setup_test_db):
         GROUP BY region
     """
 
-    parser = Parser()
-    binder = Binder(catalog)
-    planner = PhysicalPlanner(catalog)
-    executor = Executor(ExecutorConfig())
-
-    logical_plan = parser.parse_to_logical_plan(sql, catalog)
-    bound_plan = binder.bind(logical_plan)
-    physical_plan = planner.plan(bound_plan)
-
-    result_table = executor.execute_to_table(physical_plan)
+    result_table = runtime.execute(sql)
 
     assert result_table.num_rows == 3
 
@@ -223,7 +161,7 @@ def test_group_by_with_min_max(setup_test_db):
 
 def test_group_by_multiple_aggregates(setup_test_db):
     """Test GROUP BY with multiple aggregate functions."""
-    catalog, datasource = setup_test_db
+    runtime = setup_test_db
 
     sql = """
         SELECT region, COUNT(*) as cnt, SUM(amount) as total, AVG(amount) as avg
@@ -231,16 +169,7 @@ def test_group_by_multiple_aggregates(setup_test_db):
         GROUP BY region
     """
 
-    parser = Parser()
-    binder = Binder(catalog)
-    planner = PhysicalPlanner(catalog)
-    executor = Executor(ExecutorConfig())
-
-    logical_plan = parser.parse_to_logical_plan(sql, catalog)
-    bound_plan = binder.bind(logical_plan)
-    physical_plan = planner.plan(bound_plan)
-
-    result_table = executor.execute_to_table(physical_plan)
+    result_table = runtime.execute(sql)
 
     assert result_table.num_rows == 3
     assert result_table.num_columns == 4
@@ -248,7 +177,7 @@ def test_group_by_multiple_aggregates(setup_test_db):
 
 def test_having_clause(setup_test_db):
     """Test HAVING clause with aggregation."""
-    catalog, datasource = setup_test_db
+    runtime = setup_test_db
 
     sql = """
         SELECT region, COUNT(*) as order_count
@@ -257,16 +186,7 @@ def test_having_clause(setup_test_db):
         HAVING COUNT(*) > 2
     """
 
-    parser = Parser()
-    binder = Binder(catalog)
-    planner = PhysicalPlanner(catalog)
-    executor = Executor(ExecutorConfig())
-
-    logical_plan = parser.parse_to_logical_plan(sql, catalog)
-    bound_plan = binder.bind(logical_plan)
-    physical_plan = planner.plan(bound_plan)
-
-    result_table = executor.execute_to_table(physical_plan)
+    result_table = runtime.execute(sql)
 
     assert result_table.num_rows == 1
 
@@ -279,7 +199,7 @@ def test_having_clause(setup_test_db):
 
 def test_having_with_sum(setup_test_db):
     """Test HAVING clause with SUM."""
-    catalog, datasource = setup_test_db
+    runtime = setup_test_db
 
     sql = """
         SELECT region, SUM(amount) as total_amount
@@ -288,16 +208,7 @@ def test_having_with_sum(setup_test_db):
         HAVING SUM(amount) >= 500
     """
 
-    parser = Parser()
-    binder = Binder(catalog)
-    planner = PhysicalPlanner(catalog)
-    executor = Executor(ExecutorConfig())
-
-    logical_plan = parser.parse_to_logical_plan(sql, catalog)
-    bound_plan = binder.bind(logical_plan)
-    physical_plan = planner.plan(bound_plan)
-
-    result_table = executor.execute_to_table(physical_plan)
+    result_table = runtime.execute(sql)
 
     assert result_table.num_rows == 1
 
@@ -310,23 +221,14 @@ def test_having_with_sum(setup_test_db):
 
 def test_aggregation_without_group_by(setup_test_db):
     """Test aggregation without GROUP BY (full table aggregation)."""
-    catalog, datasource = setup_test_db
+    runtime = setup_test_db
 
     sql = """
         SELECT COUNT(*) as total_orders, SUM(amount) as total_revenue
         FROM test_db.main.orders
     """
 
-    parser = Parser()
-    binder = Binder(catalog)
-    planner = PhysicalPlanner(catalog)
-    executor = Executor(ExecutorConfig())
-
-    logical_plan = parser.parse_to_logical_plan(sql, catalog)
-    bound_plan = binder.bind(logical_plan)
-    physical_plan = planner.plan(bound_plan)
-
-    result_table = executor.execute_to_table(physical_plan)
+    result_table = runtime.execute(sql)
 
     assert result_table.num_rows == 1
     assert result_table.column(0)[0].as_py() == 7
