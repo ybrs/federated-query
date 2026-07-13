@@ -193,12 +193,13 @@ mod tests {
     use arrow::datatypes::TimeUnit;
     use fq_common::events::{EventRoleColumns, EventWindow, WindowUnit};
 
-    /// The standard test roles over (user_id, ts, name).
+    /// The standard test roles over (user_id, ts, name), no tiebreak.
     fn roles() -> EventRoleColumns {
         EventRoleColumns {
             entity: "user_id".to_string(),
             timestamp: "ts".to_string(),
             event: "name".to_string(),
+            tiebreak: None,
         }
     }
 

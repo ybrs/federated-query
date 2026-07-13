@@ -1,8 +1,10 @@
 //! The sorted event stream the kernels scan: role columns normalized to one
 //! representation per role, plus a row cursor that VERIFIES the storage
-//! contract ((entity, timestamp) non-decreasing, no NULL roles) as it reads.
-//! A kernel never returns numbers computed over a stream whose ordering
-//! premise is broken - the cursor raises `ContractViolation` first.
+//! contract as it reads: (entity, timestamp) non-decreasing, the tiebreak
+//! non-decreasing within equal (entity, timestamp) when the view declares
+//! one, and no NULL roles. A kernel never returns numbers computed over a
+//! stream whose ordering premise is broken - the cursor raises
+//! `ContractViolation` first.
 
 use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow::compute::cast;
@@ -144,6 +146,15 @@ impl EntityKey {
     }
 }
 
+/// One row's tiebreak value, borrowed from its batch. A view's tiebreak
+/// column has one type, so mixed variants never meet in one stream and the
+/// derived cross-variant ordering is never consulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TiebreakRef<'a> {
+    Int(i64),
+    Text(&'a str),
+}
+
 /// One event row the cursor yields.
 #[derive(Debug)]
 pub struct EventRow<'a> {
@@ -151,6 +162,8 @@ pub struct EventRow<'a> {
     /// The timestamp in the stream's native `TimeScale` unit.
     pub time: i64,
     pub event: &'a str,
+    /// The tiebreak value; None on a view with no declared tiebreak.
+    pub tiebreak: Option<TiebreakRef<'a>>,
     /// True on the first row of each entity's contiguous run.
     pub new_entity: bool,
 }
@@ -161,11 +174,19 @@ enum EntityColumn {
     Text(StringArray),
 }
 
+/// A tiebreak column normalized to a single representation per kind (dates
+/// and timestamps keep their raw native-unit values as Int64).
+enum TiebreakColumn {
+    Int(Int64Array),
+    Text(StringArray),
+}
+
 /// One batch's normalized role columns.
 struct EventBatch {
     entity: EntityColumn,
     time: Int64Array,
     event: StringArray,
+    tiebreak: Option<TiebreakColumn>,
     rows: usize,
 }
 
@@ -185,17 +206,24 @@ impl EventStream {
         batches: &[RecordBatch],
         roles: &EventRoleColumns,
     ) -> Result<Self, EventError> {
-        let (entity_index, time_index, event_index) = role_indices(schema, roles)?;
-        let scale = TimeScale::of(schema.field(time_index).data_type())?;
-        require_entity_type(schema.field(entity_index).data_type())?;
-        require_text_type("event", schema.field(event_index).data_type())?;
+        let indices = role_indices(schema, roles)?;
+        let scale = TimeScale::of(schema.field(indices.time).data_type())?;
+        require_entity_type(schema.field(indices.entity).data_type())?;
+        require_text_type("event", schema.field(indices.event).data_type())?;
+        if let Some(tiebreak_index) = indices.tiebreak {
+            require_tiebreak_type(schema.field(tiebreak_index).data_type())?;
+        }
         let mut normalized = Vec::with_capacity(batches.len());
         for batch in batches {
-            require_no_role_nulls(view, batch, roles, &[entity_index, time_index, event_index])?;
+            require_no_role_nulls(view, batch, roles, &indices)?;
             normalized.push(EventBatch {
-                entity: normalize_entity(batch.column(entity_index))?,
-                time: cast_to_int64(batch.column(time_index))?,
-                event: cast_to_utf8(batch.column(event_index))?,
+                entity: normalize_entity(batch.column(indices.entity))?,
+                time: cast_to_int64(batch.column(indices.time))?,
+                event: cast_to_utf8(batch.column(indices.event))?,
+                tiebreak: match indices.tiebreak {
+                    Some(index) => Some(normalize_tiebreak(batch.column(index))?),
+                    None => None,
+                },
                 rows: batch.num_rows(),
             });
         }
@@ -222,39 +250,58 @@ impl EventStream {
 }
 
 /// The cursor `EventStream::rows` returns: yields each row and raises
-/// `ContractViolation` the moment (entity, timestamp) ordering regresses.
+/// `ContractViolation` the moment (entity, timestamp[, tiebreak]) ordering
+/// regresses.
 pub struct EventRows<'a> {
     stream: &'a EventStream,
     batch: usize,
     row: usize,
-    previous: Option<(EntityRef<'a>, i64)>,
+    previous: Option<(EntityRef<'a>, i64, Option<TiebreakRef<'a>>)>,
 }
 
 impl<'a> EventRows<'a> {
-    /// The (entity, time, event) values at the cursor's current position.
-    fn current(&self) -> (EntityRef<'a>, i64, &'a str) {
+    /// The (entity, time, event, tiebreak) values at the cursor's current
+    /// position.
+    fn current(&self) -> (EntityRef<'a>, i64, &'a str, Option<TiebreakRef<'a>>) {
         let batch = &self.stream.batches[self.batch];
         let entity = match &batch.entity {
             EntityColumn::Int(values) => EntityRef::Int(values.value(self.row)),
             EntityColumn::Text(values) => EntityRef::Text(values.value(self.row)),
         };
+        let tiebreak = match &batch.tiebreak {
+            Some(TiebreakColumn::Int(values)) => Some(TiebreakRef::Int(values.value(self.row))),
+            Some(TiebreakColumn::Text(values)) => Some(TiebreakRef::Text(values.value(self.row))),
+            None => None,
+        };
         (
             entity,
             batch.time.value(self.row),
             batch.event.value(self.row),
+            tiebreak,
         )
     }
 
-    /// Verify (entity, timestamp) did not regress from the previous row, and
-    /// tell whether this row starts a new entity run.
-    fn check_order(&self, entity: EntityRef<'a>, time: i64) -> Result<bool, EventError> {
-        let Some((previous_entity, previous_time)) = self.previous else {
+    /// Verify (entity, timestamp[, tiebreak]) did not regress from the
+    /// previous row, and tell whether this row starts a new entity run.
+    fn check_order(
+        &self,
+        entity: EntityRef<'a>,
+        time: i64,
+        tiebreak: Option<TiebreakRef<'a>>,
+    ) -> Result<bool, EventError> {
+        let Some((previous_entity, previous_time, previous_tiebreak)) = self.previous else {
             return Ok(true);
         };
         if entity == previous_entity {
             if time < previous_time {
                 return Err(EventError::ContractViolation(format!(
                     "timestamps regress within entity {entity:?}: {time} after {previous_time}"
+                )));
+            }
+            if time == previous_time && tiebreak < previous_tiebreak {
+                return Err(EventError::ContractViolation(format!(
+                    "tiebreak regresses within entity {entity:?} at timestamp {time}: \
+                     {tiebreak:?} after {previous_tiebreak:?}"
                 )));
             }
             return Ok(false);
@@ -281,17 +328,18 @@ impl<'a> Iterator for EventRows<'a> {
                 self.row = 0;
                 continue;
             }
-            let (entity, time, event) = self.current();
+            let (entity, time, event, tiebreak) = self.current();
             self.row += 1;
-            let new_entity = match self.check_order(entity, time) {
+            let new_entity = match self.check_order(entity, time, tiebreak) {
                 Ok(new_entity) => new_entity,
                 Err(error) => return Some(Err(error)),
             };
-            self.previous = Some((entity, time));
+            self.previous = Some((entity, time, tiebreak));
             return Some(Ok(EventRow {
                 entity,
                 time,
                 event,
+                tiebreak,
                 new_entity,
             }));
         }
@@ -299,23 +347,78 @@ impl<'a> Iterator for EventRows<'a> {
     }
 }
 
-/// Resolve the three role columns to schema indices, raising on a role that
-/// names no output column or on two roles sharing one column.
+/// The schema positions of an event view's role columns; `tiebreak` is None
+/// on a view with no declared tiebreak.
+pub struct RoleIndices {
+    pub entity: usize,
+    pub time: usize,
+    pub event: usize,
+    pub tiebreak: Option<usize>,
+}
+
+impl RoleIndices {
+    /// Every declared role as (schema index, role keyword, column name), in
+    /// declaration order - the shared walk for distinctness and NULL checks.
+    fn declared<'a>(&self, roles: &'a EventRoleColumns) -> Vec<(usize, &'static str, &'a str)> {
+        let mut declared = vec![
+            (self.entity, "ENTITY", roles.entity.as_str()),
+            (self.time, "TIMESTAMP", roles.timestamp.as_str()),
+            (self.event, "EVENT", roles.event.as_str()),
+        ];
+        if let Some(index) = self.tiebreak {
+            let column = roles
+                .tiebreak
+                .as_deref()
+                .expect("a tiebreak index implies a declared tiebreak column");
+            declared.push((index, "TIEBREAK", column));
+        }
+        declared
+    }
+}
+
+/// Resolve the role columns to schema indices, raising on a role that names
+/// no output column or on two roles sharing one column.
 pub fn role_indices(
     schema: &SchemaRef,
     roles: &EventRoleColumns,
-) -> Result<(usize, usize, usize), EventError> {
-    let entity = index_of(schema, "ENTITY", &roles.entity)?;
-    let time = index_of(schema, "TIMESTAMP", &roles.timestamp)?;
-    let event = index_of(schema, "EVENT", &roles.event)?;
-    if entity == time || entity == event || time == event {
-        return Err(EventError::InvalidRoles(format!(
-            "the ENTITY / TIMESTAMP / EVENT roles must name three distinct columns, got \
-             '{}', '{}', '{}'",
-            roles.entity, roles.timestamp, roles.event
-        )));
+) -> Result<RoleIndices, EventError> {
+    let indices = RoleIndices {
+        entity: index_of(schema, "ENTITY", &roles.entity)?,
+        time: index_of(schema, "TIMESTAMP", &roles.timestamp)?,
+        event: index_of(schema, "EVENT", &roles.event)?,
+        tiebreak: match &roles.tiebreak {
+            Some(column) => Some(index_of(schema, "TIEBREAK", column)?),
+            None => None,
+        },
+    };
+    require_distinct_roles(&indices, roles)?;
+    Ok(indices)
+}
+
+/// Raise when two declared roles share one column: a shared column can carry
+/// only one role's semantics (a tiebreak equal to a role column in particular
+/// adds no ordering information and is a declaration mistake).
+fn require_distinct_roles(
+    indices: &RoleIndices,
+    roles: &EventRoleColumns,
+) -> Result<(), EventError> {
+    let declared = indices.declared(roles);
+    for (position, (index, _, _)) in declared.iter().enumerate() {
+        for (later_index, _, _) in &declared[position + 1..] {
+            if index != later_index {
+                continue;
+            }
+            let mut rendered = Vec::with_capacity(declared.len());
+            for (_, role, column) in &declared {
+                rendered.push(format!("{role} '{column}'"));
+            }
+            return Err(EventError::InvalidRoles(format!(
+                "the roles must name distinct columns, got {}",
+                rendered.join(", ")
+            )));
+        }
     }
-    Ok((entity, time, event))
+    Ok(())
 }
 
 /// The schema index of one role's column, or a loud error naming the role,
@@ -359,6 +462,25 @@ pub fn require_text_type(role: &str, arrow: &ArrowType) -> Result<(), EventError
     )))
 }
 
+/// Enforce the tiebreak role's type contract: an orderable EXACT type -
+/// integer, text, date, or timestamp. Approximate or two-valued types (float,
+/// bool) cannot carry a total per-row order and are refused, never coerced.
+pub fn require_tiebreak_type(arrow: &ArrowType) -> Result<(), EventError> {
+    let orderable_exact = is_integer(arrow)
+        || is_text(arrow)
+        || matches!(
+            arrow,
+            ArrowType::Date32 | ArrowType::Date64 | ArrowType::Timestamp(_, _)
+        );
+    if orderable_exact {
+        return Ok(());
+    }
+    Err(EventError::InvalidRoles(format!(
+        "tiebreak role has type {arrow}; it must be an integer, text, date, or \
+         timestamp column"
+    )))
+}
+
 /// Whether an Arrow type is an integer the entity role accepts (widths that
 /// widen losslessly to Int64).
 fn is_integer(arrow: &ArrowType) -> bool {
@@ -388,11 +510,10 @@ fn require_no_role_nulls(
     view: &str,
     batch: &RecordBatch,
     roles: &EventRoleColumns,
-    indices: &[usize],
+    indices: &RoleIndices,
 ) -> Result<(), EventError> {
-    let names = [&roles.entity, &roles.timestamp, &roles.event];
-    for (index, name) in indices.iter().zip(names) {
-        let column = batch.column(*index);
+    for (index, _, name) in indices.declared(roles) {
+        let column = batch.column(index);
         if column.null_count() == 0 {
             continue;
         }
@@ -401,7 +522,7 @@ fn require_no_role_nulls(
             .expect("null_count > 0 implies a null row");
         return Err(EventError::ContractViolation(format!(
             "event view '{view}': role column '{name}' is NULL at row {first_null}; \
-             every event needs an entity, a timestamp, and a name"
+             every role value must be present on every event"
         )));
     }
     Ok(())
@@ -414,6 +535,16 @@ fn normalize_entity(column: &ArrayRef) -> Result<EntityColumn, EventError> {
         return Ok(EntityColumn::Int(cast_to_int64(column)?));
     }
     Ok(EntityColumn::Text(cast_to_utf8(column)?))
+}
+
+/// Normalize a tiebreak column to Int64 or Utf8. Integers widen losslessly;
+/// dates and timestamps keep their raw native-unit values, which preserve
+/// their order exactly.
+fn normalize_tiebreak(column: &ArrayRef) -> Result<TiebreakColumn, EventError> {
+    if is_text(column.data_type()) {
+        return Ok(TiebreakColumn::Text(cast_to_utf8(column)?));
+    }
+    Ok(TiebreakColumn::Int(cast_to_int64(column)?))
 }
 
 /// Cast a column to Int64 (timestamps keep their raw native-unit values).
@@ -444,13 +575,21 @@ mod tests {
     use arrow::datatypes::{Field, Schema};
     use std::sync::Arc;
 
-    /// The standard test roles over (user_id, ts, name).
+    /// The standard test roles over (user_id, ts, name), no tiebreak.
     fn roles() -> EventRoleColumns {
         EventRoleColumns {
             entity: "user_id".to_string(),
             timestamp: "ts".to_string(),
             event: "name".to_string(),
+            tiebreak: None,
         }
+    }
+
+    /// The test roles with the Int32 `seq` column as the tiebreak.
+    fn roles_with_tiebreak() -> EventRoleColumns {
+        let mut roles = roles();
+        roles.tiebreak = Some("seq".to_string());
+        roles
     }
 
     /// A (user_id Int32, ts Timestamp(us), name Utf8) batch from row tuples.
@@ -478,6 +617,41 @@ mod tests {
                 Arc::new(Int32Array::from(users)),
                 Arc::new(TimestampMicrosecondArray::from(times)),
                 Arc::new(StringArray::from(names)),
+            ],
+        )
+        .expect("batch");
+        (schema, batch)
+    }
+
+    /// A batch like `batch` plus an Int32 `seq` tiebreak column.
+    fn batch_with_seq(rows: &[(i32, i64, &str, i32)]) -> (SchemaRef, RecordBatch) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", ArrowType::Int32, true),
+            Field::new(
+                "ts",
+                ArrowType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new("name", ArrowType::Utf8, true),
+            Field::new("seq", ArrowType::Int32, true),
+        ]));
+        let mut users = Vec::new();
+        let mut times = Vec::new();
+        let mut names = Vec::new();
+        let mut seqs = Vec::new();
+        for (user, time, name, seq) in rows {
+            users.push(*user);
+            times.push(*time);
+            names.push(*name);
+            seqs.push(*seq);
+        }
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(users)),
+                Arc::new(TimestampMicrosecondArray::from(times)),
+                Arc::new(StringArray::from(names)),
+                Arc::new(Int32Array::from(seqs)),
             ],
         )
         .expect("batch");
@@ -550,6 +724,110 @@ mod tests {
         let text = format!("{error}");
         assert!(
             text.contains("uzer_id") && text.contains("user_id"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_regressing_tiebreak_within_equal_timestamps_raises() {
+        let (schema, data) = batch_with_seq(&[(1, 10, "a", 2), (1, 10, "b", 1)]);
+        let stream =
+            EventStream::open("ev", &schema, &[data], &roles_with_tiebreak()).expect("open");
+        let error = stream.rows().nth(1).expect("second row").unwrap_err();
+        let text = format!("{error}");
+        assert!(
+            matches!(error, EventError::ContractViolation(_)) && text.contains("tiebreak"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_tiebreak_orders_only_within_equal_timestamps() {
+        // The tiebreak may regress freely when the timestamp advances or the
+        // entity changes; only an equal-(entity, timestamp) pair constrains it.
+        let (schema, data) = batch_with_seq(&[
+            (1, 10, "a", 5),
+            (1, 10, "b", 6),
+            (1, 20, "c", 1),
+            (2, 5, "d", 0),
+        ]);
+        let stream =
+            EventStream::open("ev", &schema, &[data], &roles_with_tiebreak()).expect("open");
+        let mut tiebreaks = Vec::new();
+        for row in stream.rows() {
+            let row = row.expect("row");
+            tiebreaks.push(row.tiebreak.expect("tiebreak present"));
+        }
+        assert_eq!(
+            tiebreaks,
+            vec![
+                TiebreakRef::Int(5),
+                TiebreakRef::Int(6),
+                TiebreakRef::Int(1),
+                TiebreakRef::Int(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_null_tiebreak_value_raises_naming_column_and_row() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", ArrowType::Int32, true),
+            Field::new(
+                "ts",
+                ArrowType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new("name", ArrowType::Utf8, true),
+            Field::new("seq", ArrowType::Int32, true),
+        ]));
+        let data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1])),
+                Arc::new(TimestampMicrosecondArray::from(vec![10, 10])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(Int32Array::from(vec![Some(1), None])),
+            ],
+        )
+        .expect("batch");
+        let Err(error) = EventStream::open("ev", &schema, &[data], &roles_with_tiebreak()) else {
+            panic!("a NULL tiebreak value must raise");
+        };
+        let text = format!("{error}");
+        assert!(text.contains("seq") && text.contains("row 1"), "{text}");
+    }
+
+    #[test]
+    fn an_unorderable_tiebreak_type_raises() {
+        // Float and boolean columns are not exact orderable tiebreaks.
+        for unorderable in [ArrowType::Float64, ArrowType::Boolean] {
+            let error = require_tiebreak_type(&unorderable).unwrap_err();
+            assert!(matches!(error, EventError::InvalidRoles(_)), "{error}");
+        }
+        // The accepted exact types all pass.
+        for orderable in [
+            ArrowType::Int32,
+            ArrowType::Int64,
+            ArrowType::Utf8,
+            ArrowType::Date32,
+            ArrowType::Timestamp(TimeUnit::Microsecond, None),
+        ] {
+            require_tiebreak_type(&orderable).expect("orderable exact type");
+        }
+    }
+
+    #[test]
+    fn a_tiebreak_sharing_a_role_column_raises() {
+        let (schema, data) = batch(&[(1, 10, "a")]);
+        let mut shared = roles();
+        shared.tiebreak = Some("ts".to_string());
+        let Err(error) = EventStream::open("ev", &schema, &[data], &shared) else {
+            panic!("a tiebreak sharing a role column must raise");
+        };
+        let text = format!("{error}");
+        assert!(
+            text.contains("distinct") && text.contains("TIEBREAK"),
             "{text}"
         );
     }

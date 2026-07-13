@@ -3,8 +3,9 @@
 //! interpret them). Pure data - this module keeps the two crates decoupled
 //! (neither depends on the other; both depend here).
 
-/// The three role columns of an event view, each naming an output column of
-/// the view's defining SELECT. Every other output column is a property.
+/// The role columns of an event view, each naming an output column of the
+/// view's defining SELECT. Every output column not named by a role is a
+/// property.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventRoleColumns {
     /// The entity id column (who did it): INTEGER / BIGINT / TEXT-like.
@@ -13,6 +14,10 @@ pub struct EventRoleColumns {
     pub timestamp: String,
     /// The event-name column (what happened): TEXT-like.
     pub event: String,
+    /// The optional tiebreak column: orders events that share an (entity,
+    /// timestamp) pair. Orderable exact types only (integer / text / date /
+    /// timestamp); None means ties order by event name in the paths kernel.
+    pub tiebreak: Option<String>,
 }
 
 /// A parsed `FUNNEL OVER <view> STEPS (...) WITHIN <n> <unit>` statement.
@@ -67,6 +72,22 @@ pub struct SegmentSpec {
     pub event: Option<String>,
     /// The UTC calendar bucket events are grouped into.
     pub bucket: TimeBucket,
+}
+
+/// A parsed `PATHS OVER <view> [STARTING AT '<name>'] MAX DEPTH <n> TOP <k>`
+/// statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathsSpec {
+    /// The event view the path analysis runs over.
+    pub view: String,
+    /// The optional anchor event: each entity's path starts at its first
+    /// event with this name; None starts at the entity's first event.
+    pub starting_at: Option<String>,
+    /// The maximum number of steps a path keeps (collapsed steps, not raw
+    /// events); always positive.
+    pub max_depth: i64,
+    /// How many of the most common paths the result returns; always positive.
+    pub top: i64,
 }
 
 /// The segmentation measure: raw event count, or distinct entities.

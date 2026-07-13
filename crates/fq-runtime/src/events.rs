@@ -10,14 +10,14 @@
 //! - REFRESH re-runs the stored SELECT, re-applies the whole contract, and
 //!   swaps chunks through the store's publication path.
 //! - DROP removes the role row FIRST, then the materialized view.
-//! - FUNNEL / SEGMENT read the view's chunks and run the fq-events kernels;
-//!   they see exactly the last pull, like any read of the view.
+//! - FUNNEL / SEGMENT / PATHS read the view's chunks and run the fq-events
+//!   kernels; they see exactly the last pull, like any read of the view.
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
-use fq_common::events::{EventRoleColumns, FunnelSpec, SegmentSpec};
+use fq_common::events::{EventRoleColumns, FunnelSpec, PathsSpec, SegmentSpec};
 use fq_common::DataType;
-use fq_events::{build_event_view, read_chunks, run_funnel, run_segment, EventStream};
+use fq_events::{build_event_view, read_chunks, run_funnel, run_paths, run_segment, EventStream};
 use fq_events::{EventError, EventViewRegistry};
 
 use crate::delta;
@@ -55,6 +55,16 @@ pub fn segment_describe_columns() -> Vec<(String, DataType)> {
     vec![
         ("bucket".to_owned(), DataType::Timestamp),
         ("value".to_owned(), DataType::BigInt),
+    ]
+}
+
+/// The engine types of the PATHS result relation, for `describe`; the
+/// executed batches carry the same columns (`fq_events::paths_schema`).
+pub fn paths_describe_columns() -> Vec<(String, DataType)> {
+    vec![
+        ("path".to_owned(), DataType::Text),
+        ("entities".to_owned(), DataType::BigInt),
+        ("depth".to_owned(), DataType::BigInt),
     ]
 }
 
@@ -157,6 +167,15 @@ impl Runtime {
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         let stream = self.open_event_stream(&spec.view)?;
         Ok(run_segment(&stream, spec)?)
+    }
+
+    /// `PATHS OVER view ...`: run the paths kernel over the view's chunks.
+    pub(crate) fn run_paths_statement(
+        &self,
+        spec: &PathsSpec,
+    ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
+        let stream = self.open_event_stream(&spec.view)?;
+        Ok(run_paths(&stream, spec)?)
     }
 
     /// Whether `name` is a registered event view (used by the materialized-

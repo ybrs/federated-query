@@ -179,6 +179,7 @@ impl Runtime {
             Statement::DropEventView { name } => self.drop_event_view(&name),
             Statement::Funnel(spec) => self.run_funnel_statement(&spec),
             Statement::Segment(spec) => self.run_segment_statement(&spec),
+            Statement::Paths(spec) => self.run_paths_statement(&spec),
         }
     }
 
@@ -222,6 +223,7 @@ impl Runtime {
             }
             Statement::Funnel(_) => return Ok(events::funnel_describe_columns()),
             Statement::Segment(_) => return Ok(events::segment_describe_columns()),
+            Statement::Paths(_) => return Ok(events::paths_describe_columns()),
             _ => return Ok(vec![("status".to_owned(), DataType::Text)]),
         }
         let physical = self.plan(sql)?;

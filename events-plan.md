@@ -13,10 +13,12 @@ view with a sort/partition contract, and staleness is the MV refresh contract
 
 New crate `crates/fq-events`. It owns everything event-specific:
 
-- the event-view ROLE registry (which columns are entity/timestamp/event),
-- the materialization CONTRACT (validate roles, sort by (entity, timestamp),
-  raise on violations),
-- the analysis KERNELS (funnel, segmentation) that run over the sorted chunks.
+- the event-view ROLE registry (which columns are entity/timestamp/event and
+  the optional tiebreak),
+- the materialization CONTRACT (validate roles, sort by (entity, timestamp)
+  extended by the tiebreak when declared, raise on violations),
+- the analysis KERNELS (funnel, segmentation, paths) that run over the sorted
+  chunks.
 
 Why a separate crate and not:
 
@@ -59,7 +61,8 @@ CREATE EVENT VIEW page_events
   ENTITY user_id
   TIMESTAMP occurred_at
   EVENT event_name
-  AS SELECT user_id, occurred_at, event_name, device, country
+  [TIEBREAK sequence_no]
+  AS SELECT user_id, occurred_at, event_name, sequence_no, device, country
      FROM warehouse.public.web_events
 
 REFRESH EVENT VIEW page_events
@@ -69,9 +72,15 @@ DROP EVENT VIEW page_events
 Decisions:
 
 - ROLES NAME OUTPUT COLUMNS of the defining SELECT, in the fixed order ENTITY,
-  TIMESTAMP, EVENT (a fixed order keeps the grammar and error messages
-  unambiguous; a missing or misordered clause raises naming what was
-  expected). The three roles must name three DISTINCT existing output columns.
+  TIMESTAMP, EVENT, then the optional TIEBREAK (a fixed order keeps the
+  grammar and error messages unambiguous; a missing or misordered clause
+  raises naming what was expected). The declared roles must name DISTINCT
+  existing output columns (a tiebreak sharing a role column adds no ordering
+  information and raises as a declaration mistake).
+- TIEBREAK (optional) names a column that orders events sharing an (entity,
+  timestamp) pair - a source sequence number, a log offset, an ingestion id.
+  Declaring one makes equal-timestamp order a property of the DATA instead of
+  the documented event-name fallback (section 5).
 - PROPERTIES ARE IMPLICIT: every output column that is not a role column is a
   property. No PROPERTIES clause - the SELECT list already IS the declaration
   of what the view carries, and a separate list would be a second place for it
@@ -81,8 +90,11 @@ Decisions:
   expressible in the one place the engine already handles them.
 - ROLE TYPE CONTRACT (checked at build, raises `InvalidRoles`):
   entity: INTEGER / BIGINT / TEXT-like; timestamp: TIMESTAMP (any unit) /
-  DATE; event: TEXT-like. Anything else has no defined ordering/equality
-  semantics for sequence analysis and is refused, never coerced.
+  DATE; event: TEXT-like; tiebreak: an orderable EXACT type - INTEGER /
+  BIGINT / TEXT-like / DATE / TIMESTAMP (no float, no bool). Anything else
+  has no defined ordering/equality semantics for sequence analysis and is
+  refused, never coerced. NULL in any role column (the tiebreak included)
+  raises at build naming the view, column, and row.
 - LIFECYCLE mirrors the MV DDL: no IF [NOT] EXISTS, no schema-qualified names,
   no storage options - each raises with the same rationale as the MV forms.
 - `REFRESH EVENT VIEW` re-executes the stored SELECT and re-applies the whole
@@ -100,7 +112,8 @@ Decisions:
 
 The performant representation for sequence queries is per-entity time-ordered
 event streams. Decision: an event view is a materialized view whose chunks are
-GLOBALLY SORTED BY (entity ASC, timestamp ASC).
+GLOBALLY SORTED BY (entity ASC, timestamp ASC), extended to (entity ASC,
+timestamp ASC, tiebreak ASC) when the view declares a TIEBREAK role.
 
 - Sorting by entity first makes the stream ENTITY-PARTITIONED: all events of
   one entity are contiguous, so every sequence kernel is a single linear scan
@@ -122,9 +135,13 @@ event_views (
   entity_column    TEXT NOT NULL,
   timestamp_column TEXT NOT NULL,
   event_column     TEXT NOT NULL,
+  tiebreak_column  TEXT,              -- NULL = no declared tiebreak
   created_at       TEXT NOT NULL
 )
 ```
+
+A registry written before the tiebreak role existed migrates on open (the
+column is added; existing rows read back as NULL = no tiebreak).
 
 An event view = its `materialized_views` row (chunks, schema, sizes,
 timestamps) + its `event_views` row (the roles). Consequences:
@@ -145,20 +162,28 @@ timestamps) + its `event_views` row (the roles). Consequences:
 - AT BUILD: the runtime executes the SELECT, fq-events validates roles
   (existence, distinctness, types) and REJECTS any NULL in a role column
   (`ContractViolation` naming the view, column, and row ordinal - an event
-  without an entity, a time, or a name is not an event), then sorts the result
-  by (entity, timestamp) and hands the sorted batches to fq-accel. The
-  contract holds by construction; a violated precondition raises and nothing
-  is persisted.
+  without an entity, a time, or a name is not an event, and a declared
+  tiebreak that is missing on a row cannot break ties), then sorts the result
+  by (entity, timestamp[, tiebreak]) and hands the sorted batches to fq-accel.
+  The contract holds by construction; a violated precondition raises and
+  nothing is persisted.
 - AT SCAN: every kernel streams through a cursor that re-verifies monotonicity
-  ((entity, timestamp) non-decreasing) and role non-nullness as it reads, and
-  raises `ContractViolation` on the first regression. This defends against
-  out-of-band chunk edits and any future write-path bug: a kernel NEVER
-  returns numbers computed over a stream whose ordering premise is broken.
+  ((entity, timestamp) non-decreasing, and the tiebreak non-decreasing within
+  equal (entity, timestamp) when the view declares one) and role non-nullness
+  as it reads, and raises `ContractViolation` on the first regression. This
+  defends against out-of-band chunk edits and any future write-path bug: a
+  kernel NEVER returns numbers computed over a stream whose ordering premise
+  is broken.
 
-Ties: rows equal in (entity, timestamp) are stored in UNSPECIFIED relative
-order. This is deliberate, and it forces the semantic decision in section 5:
-analysis semantics must be independent of tie order, or results would change
-across rebuilds of the same data.
+Ties (DECIDED): rows equal in every sort key are stored in UNSPECIFIED
+relative order, so analysis semantics must never consult that residual order.
+Where an analysis needs an order among equal-timestamp DISTINCT events (path
+extraction), the pinned rule is: the declared TIEBREAK column when the view
+has one, and EVENT NAME ascending otherwise (event name also breaks ties
+WITHIN one tiebreak value). This is a deterministic, documented order - not a
+claim about true order - so identical data always yields identical results
+across rebuilds. Analyses that can be tie-independent stay tie-independent
+(funnel's strict-increase rule, collapse of equal-timestamp duplicates).
 
 ## 4. Query surface - dedicated statements
 
@@ -195,10 +220,10 @@ SEGMENT OVER <event_view>
   [EVENT 'purchase']                            -- optional single-event filter
   BY HOUR | DAY | WEEK | MONTH                  -- UTC calendar time bucket
 
-PATHS OVER <event_view>                         -- design-only, raises (section 6)
-  [STARTING AT 'signup']
-  MAX DEPTH <n>
-  TOP <k>
+PATHS OVER <event_view>
+  [STARTING AT 'signup']                        -- optional anchor event
+  MAX DEPTH <n>                                 -- positive step bound
+  TOP <k>                                       -- positive result cut
 ```
 
 Clauses appear in the fixed order shown; a misplaced or unknown clause raises.
@@ -214,6 +239,9 @@ Result relations (fixed schemas, also served by `describe`):
   conversion_from_start DOUBLE, conversion_from_previous DOUBLE`
 - SEGMENT: `bucket TIMESTAMP, value BIGINT` (buckets with no events are not
   emitted; gap filling is presentation, not measurement)
+- PATHS: `path TEXT (step names joined with " -> "), entities BIGINT,
+  depth BIGINT`, ordered by entities DESC then path ASC (the deterministic
+  cut among equal counts), at most TOP k rows
 
 ## 5. Semantics - pinned, not configurable
 
@@ -262,18 +290,26 @@ SEGMENTATION. A linear scan over the same sorted stream:
   instants they are (bucketed in UTC). Output is ordered by bucket.
 - `EVENT 'name'` filters by exact event-name equality before measuring.
 
-PATHS (design-only in v1; the statement raises `Unsupported` naming path
-analysis). Design: for each entity, emit the event-name sequence starting at
-the anchor (`STARTING AT`, else the entity's first event), truncated to MAX
-DEPTH; count identical sequences across entities; return the TOP k as
-`path TEXT (arrow-joined names), entities BIGINT, depth BIGINT`. Consecutive
-duplicate events collapse (a page-reload storm is one step) - the same
-tie-independence argument applies: collapsing consecutive duplicates makes
-equal-timestamp reorderings of the SAME event invisible; distinct events with
-equal timestamps remain order-unspecified, which is why paths ships only after
-a deterministic tie rule for that case is chosen (candidate: order ties by
-event name - deterministic, at the cost of a lie about true order; deferred
-until the surface is needed rather than guessed at).
+PATHS. For each entity, over its time-ordered events:
+
+- the path is the entity's event-name sequence starting at the anchor: the
+  first event named by `STARTING AT` (an entity with no such event
+  contributes no path), or the entity's first event when no anchor is given;
+- CONSECUTIVE DUPLICATES COLLAPSE into one step (a page-reload storm is one
+  step), which also makes equal-timestamp reorderings of the SAME event
+  invisible;
+- TIE RULE (DECIDED): the order among equal-timestamp DISTINCT events is the
+  view's declared TIEBREAK column when there is one, and EVENT NAME ascending
+  otherwise (event name also orders events sharing one tiebreak value). A
+  deterministic, documented order - not a claim about true order; determinism
+  pinned by tests that permute equal-timestamp input row order and assert
+  byte-identical results in both modes;
+- the path keeps at most MAX DEPTH collapsed steps; later events are dropped;
+- identical paths count across entities (each entity contributes exactly one
+  path); the TOP k most common return as `path TEXT (names joined with
+  " -> "), entities BIGINT, depth BIGINT`, ordered by entities DESC then path
+  ASC. A non-positive MAX DEPTH or TOP raises at parse and again at the
+  kernel.
 
 ## 6. Where computation runs
 
@@ -288,43 +324,47 @@ until the surface is needed rather than guessed at).
   off the query path, so its cost is paid once per REFRESH.
 - DATAFUSION: plain relational reads of an event view (`SELECT ... FROM ev`)
   go through the existing MV chunk-scan path untouched.
-- CUSTOM KERNELS (fq-events): funnel and segmentation are LINEAR operators
-  over the sorted stream - a shape DataFusion does not express (funnel windows
-  are not window frames; per-entity max-depth with re-entry is not an
-  aggregate composition). Decision: POST-SCAN KERNELS in fq-events reading the
-  view's chunks directly (Arrow IPC readers over the chunk paths the registry
-  publishes), NOT DataFusion UDAFs/window functions. Rationale: the stream is
-  already partitioned and sorted, so the kernels are single-pass with
-  per-entity working sets - a UDAF would re-partition and re-buffer inside
-  DataFusion's aggregate machinery to reconstruct exactly the layout the store
-  already guarantees, and would drag plan/optimizer surface with it. The
-  funnel kernel is O(step-1 occurrences x window span) per entity in the worst
-  case; the classic O(events x steps) DP is the refinement path, blocked on a
-  measured need (no perf claim without the harness, per CLAUDE.md).
+- CUSTOM KERNELS (fq-events): funnel, segmentation, and paths are LINEAR
+  operators over the sorted stream - a shape DataFusion does not express
+  (funnel windows are not window frames; per-entity max-depth with re-entry
+  is not an aggregate composition). Decision: POST-SCAN KERNELS in fq-events
+  reading the view's chunks directly (Arrow IPC readers over the chunk paths
+  the registry publishes), NOT DataFusion UDAFs/window functions. Rationale:
+  the stream is already partitioned and sorted, so the kernels are
+  single-pass with per-entity working sets - a UDAF would re-partition and
+  re-buffer inside DataFusion's aggregate machinery to reconstruct exactly
+  the layout the store already guarantees, and would drag plan/optimizer
+  surface with it. The funnel kernel is O(step-1 occurrences x window span)
+  per entity in the worst case; the classic O(events x steps) DP is the
+  refinement path, blocked on a measured need (no perf claim without the
+  harness, per CLAUDE.md). The paths kernel buffers one equal-(entity,
+  timestamp) group at a time plus the per-path tallies.
 - STALENESS: the MV contract verbatim. Serving trusts the last pull; FUNNEL /
-  SEGMENT / plain reads never check the source; `REFRESH EVENT VIEW` is the
-  only thing that moves the data forward. Never silent: freshness is visible
-  (`refreshed_at` in the registry), and the analyses run over exactly what a
-  plain SELECT of the view shows.
+  SEGMENT / PATHS / plain reads never check the source; `REFRESH EVENT VIEW`
+  is the only thing that moves the data forward. Never silent: freshness is
+  visible (`refreshed_at` in the registry), and the analyses run over exactly
+  what a plain SELECT of the view shows.
 
 ## 7. Implemented vs design-only (this milestone)
 
 IMPLEMENTED end to end:
 
-- `crates/fq-events`: registry, contract (validate + sort + scan-time
-  verification), funnel kernel, segmentation kernel, chunk reading.
+- `crates/fq-events`: registry (tiebreak-aware, with open-time migration),
+  contract (validate + sort + scan-time verification, tiebreak included),
+  funnel kernel, segmentation kernel, paths kernel, chunk reading.
 - `fq-common::events`: the spec types.
 - fq-parse: classification + full clause parsing of CREATE/REFRESH/DROP EVENT
-  VIEW, FUNNEL, SEGMENT; PATHS and the recognized-but-unimplemented clauses
-  raise `Unsupported` naming the surface.
+  VIEW (TIEBREAK included), FUNNEL, SEGMENT, PATHS; the
+  recognized-but-unimplemented clauses raise `Unsupported` naming the
+  surface.
 - fq-runtime: DDL execution (create/refresh/drop delegating to fq-accel),
-  FUNNEL and SEGMENT dispatch, cross-form guards, `describe` for every new
-  statement.
+  FUNNEL / SEGMENT / PATHS dispatch, cross-form guards, `describe` for every
+  new statement.
 
 DESIGN-ONLY (each raises loudly, naming itself):
 
-- PATHS (section 5 - blocked on the tie rule decision).
-- SEGMENT property WHERE / property GROUP BY, and FROM/TO time ranges.
+- Property WHERE / property GROUP BY, and FROM/TO time ranges on the
+  analyses.
 - Analyses as composable relations (FROM-clause embedding).
 - Incremental (delta) event-view refresh: refresh is a whole re-pull, exactly
   the MV machinery's contract; the append-only-source delta path belongs to
@@ -351,8 +391,19 @@ DESIGN-ONLY (each raises loudly, naming itself):
   the sort/partition contract changes physical order only, never content.
 - Segmentation fixtures: per-day event counts and distinct-entity counts,
   hand-computed, including an entity spanning multiple buckets.
+- Paths fixtures: consecutive-duplicate collapse, the tie rule in BOTH modes
+  (declared tiebreak vs event-name fallback, on a fixture where they
+  differ), MAX DEPTH truncation, STARTING AT anchoring (including an entity
+  with no anchor), TOP cut and the entities-DESC-then-path order, the empty
+  view; determinism pinned by permuting equal-timestamp input row order and
+  asserting byte-identical (Arrow IPC) result tables in both modes.
+- Tiebreak DDL: parse (optional clause, fixed position), validation raises
+  (missing column, shared role column, unorderable type, NULL values naming
+  view/column/row), the third sort key at build, scan-time tiebreak
+  monotonicity, registry round-trip and pre-tiebreak registry migration, and
+  the create -> PATHS -> refresh path end to end over a real DuckDB source.
 - Statement classification: every new form parses; every rejected option
-  raises naming itself (PATHS, GROUP BY, WHERE, IF EXISTS, ...).
+  raises naming itself (GROUP BY, WHERE, IF EXISTS, ...).
 
 ## 9. Non-goals for v1
 

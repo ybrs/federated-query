@@ -10,9 +10,8 @@
 //! - `SHOW SETTINGS` / `SHOW SETTING <name>`
 //! - `SET <name> = <value>` (also `SET <name> TO <value>`)
 //! - `RESET <name>` / `RESET ALL`
-//! - `CREATE / REFRESH / DROP EVENT VIEW`, `FUNNEL`, `SEGMENT` (the
-//!   event-analytics grammars live in `event_statement`; `PATHS` is named but
-//!   not implemented and raises)
+//! - `CREATE / REFRESH / DROP EVENT VIEW`, `FUNNEL`, `SEGMENT`, `PATHS` (the
+//!   event-analytics grammars live in `event_statement`)
 //!
 //! `classify_statement` recognizes these forms LEXICALLY (a quote-aware
 //! tokenizer, no full SQL parse) and returns everything else untouched as
@@ -37,7 +36,7 @@
 //!   own store, so none of these have a meaning here.
 
 use crate::error::ParseError;
-use fq_common::events::{EventRoleColumns, FunnelSpec, SegmentSpec};
+use fq_common::events::{EventRoleColumns, FunnelSpec, PathsSpec, SegmentSpec};
 
 /// One SQL statement, classified: a materialized-view DDL form, a settings
 /// statement, an event-analytics form, or a plain query passed through as text
@@ -66,7 +65,8 @@ pub enum Statement<'a> {
     /// (`name` is `None`) restores every session override.
     ResetSetting { name: Option<String> },
     /// `CREATE EVENT VIEW <name> ENTITY <col> TIMESTAMP <col> EVENT <col>
-    /// AS <select>`: the view name, its role columns, and the defining SELECT.
+    /// [TIEBREAK <col>] AS <select>`: the view name, its role columns, and
+    /// the defining SELECT.
     CreateEventView {
         name: String,
         roles: EventRoleColumns,
@@ -80,6 +80,8 @@ pub enum Statement<'a> {
     Funnel(FunnelSpec),
     /// `SEGMENT OVER <view> MEASURE <m> [EVENT '<name>'] BY <bucket>`.
     Segment(SegmentSpec),
+    /// `PATHS OVER <view> [STARTING AT '<name>'] MAX DEPTH <n> TOP <k>`.
+    Paths(PathsSpec),
 }
 
 /// Classify one SQL statement. Materialized-view DDL is recognized by its
@@ -108,11 +110,7 @@ pub fn classify_statement(sql: &str) -> Result<Statement<'_>, ParseError> {
         }
         "FUNNEL" => crate::event_statement::classify_funnel(&mut tokens),
         "SEGMENT" => crate::event_statement::classify_segment(&mut tokens),
-        "PATHS" => Err(ParseError::Unsupported(
-            "PATHS: path analysis is not implemented; FUNNEL and SEGMENT are the \
-             available event analyses"
-                .to_string(),
-        )),
+        "PATHS" => crate::event_statement::classify_paths(&mut tokens),
         // SHOW is ours only for SETTING(S); any other SHOW passes through.
         "SHOW" if second_word_is(sql, "SETTINGS") || second_word_is(sql, "SETTING") => {
             classify_show(&mut tokens)

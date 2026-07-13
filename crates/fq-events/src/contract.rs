@@ -1,5 +1,6 @@
 //! The materialization contract: an event view's chunks hold rows globally
-//! sorted by (entity ASC, timestamp ASC), with no NULL in a role column.
+//! sorted by (entity ASC, timestamp ASC) - extended by (tiebreak ASC) when
+//! the view declares a tiebreak role - with no NULL in a role column.
 //! `build_event_view` establishes it - it validates the executed result and
 //! returns it sorted, ready for the materialized-view store. The kernels'
 //! cursor (`EventStream::rows`) re-verifies the same ordering at every scan.
@@ -13,9 +14,10 @@ use crate::error::EventError;
 use crate::stream::EventStream;
 
 /// Validate an executed defining-SELECT result against the role contract and
-/// return its rows sorted by (entity, timestamp). Raises `InvalidRoles` on a
-/// role that is missing, duplicated, or mistyped, and `ContractViolation` on
-/// a NULL role value; nothing is meant to persist when this raises.
+/// return its rows sorted by (entity, timestamp[, tiebreak]). Raises
+/// `InvalidRoles` on a role that is missing, duplicated, or mistyped, and
+/// `ContractViolation` on a NULL role value; nothing is meant to persist when
+/// this raises.
 pub fn build_event_view(
     view: &str,
     schema: &SchemaRef,
@@ -27,28 +29,30 @@ pub fn build_event_view(
     // only needs the checks, not the rows.
     EventStream::open(view, schema, batches, roles)?;
     let combined = concat_batches(schema, batches)?;
-    let sorted = sort_by_entity_time(&combined, roles)?;
+    let sorted = sort_by_contract_keys(&combined, roles)?;
     Ok(vec![sorted])
 }
 
-/// Sort one batch by (entity ASC, timestamp ASC). Ties in the pair keep an
-/// UNSPECIFIED relative order; the analysis semantics are defined to be
-/// independent of tie order, so a rebuild never changes an answer.
-fn sort_by_entity_time(
+/// Sort one batch by (entity ASC, timestamp ASC), extended by (tiebreak ASC)
+/// when the view declares a tiebreak role. Rows equal in every sort key keep
+/// an UNSPECIFIED relative order; the analysis semantics are defined to be
+/// independent of that residual order, so a rebuild never changes an answer.
+fn sort_by_contract_keys(
     batch: &RecordBatch,
     roles: &EventRoleColumns,
 ) -> Result<RecordBatch, EventError> {
-    let (entity_index, time_index, _) = crate::stream::role_indices(&batch.schema(), roles)?;
-    let sort_columns = vec![
-        SortColumn {
-            values: batch.column(entity_index).clone(),
+    let role_positions = crate::stream::role_indices(&batch.schema(), roles)?;
+    let mut key_indices = vec![role_positions.entity, role_positions.time];
+    if let Some(tiebreak_index) = role_positions.tiebreak {
+        key_indices.push(tiebreak_index);
+    }
+    let mut sort_columns = Vec::with_capacity(key_indices.len());
+    for key_index in key_indices {
+        sort_columns.push(SortColumn {
+            values: batch.column(key_index).clone(),
             options: None,
-        },
-        SortColumn {
-            values: batch.column(time_index).clone(),
-            options: None,
-        },
-    ];
+        });
+    }
     let indices = lexsort_to_indices(&sort_columns, None)?;
     Ok(take_record_batch(batch, &indices)?)
 }
@@ -60,12 +64,13 @@ mod tests {
     use arrow::datatypes::{DataType as ArrowType, Field, Schema, TimeUnit};
     use std::sync::Arc;
 
-    /// The standard test roles over (user_id, ts, name).
+    /// The standard test roles over (user_id, ts, name), no tiebreak.
     fn roles() -> EventRoleColumns {
         EventRoleColumns {
             entity: "user_id".to_string(),
             timestamp: "ts".to_string(),
             event: "name".to_string(),
+            tiebreak: None,
         }
     }
 
@@ -151,6 +156,46 @@ mod tests {
         let (schema, empty) = batch(&[]);
         let sorted = build_event_view("ev", &schema, &[empty], &roles()).expect("build");
         assert_eq!(tuples(&sorted).len(), 0);
+    }
+
+    #[test]
+    fn a_declared_tiebreak_is_the_third_sort_key() {
+        // Equal (entity, timestamp) rows land in tiebreak order regardless of
+        // their input order.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", ArrowType::Int32, true),
+            Field::new(
+                "ts",
+                ArrowType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new("name", ArrowType::Utf8, true),
+            Field::new("seq", ArrowType::Int32, true),
+        ]));
+        let data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 1])),
+                Arc::new(TimestampMicrosecondArray::from(vec![10, 10, 5])),
+                Arc::new(StringArray::from(vec!["b", "a", "c"])),
+                Arc::new(Int32Array::from(vec![2, 1, 9])),
+            ],
+        )
+        .expect("batch");
+        let mut with_tiebreak = roles();
+        with_tiebreak.tiebreak = Some("seq".to_string());
+        let sorted = build_event_view("ev", &schema, &[data], &with_tiebreak).expect("build");
+        let names = sorted[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Utf8 names")
+            .clone();
+        let mut order = Vec::new();
+        for row in 0..sorted[0].num_rows() {
+            order.push(names.value(row).to_string());
+        }
+        assert_eq!(order, vec!["c", "a", "b"]);
     }
 
     #[test]

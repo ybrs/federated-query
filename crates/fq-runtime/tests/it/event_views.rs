@@ -122,6 +122,17 @@ impl Sandbox {
         Runtime::from_config(&self.config()).expect("from_config")
     }
 
+    /// Run extra seed SQL against the sandbox's DuckDB file. Only valid
+    /// BEFORE the runtime opens: the catalog loads its metadata at
+    /// construction, so a table created here is visible to a runtime built
+    /// afterwards.
+    fn seed(&self, sql: &str) {
+        let duck_path = self.dir.join("data.duckdb");
+        let source = DuckDbSource::open("seed", duck_path.to_str().expect("utf-8 path"))
+            .expect("open seed duckdb");
+        source.execute_batch(sql).expect("extra seed");
+    }
+
     /// Append one event row through the exec plane's shared DuckDB instance
     /// (the runtime holds the file's single read-write instance).
     fn insert_event(&self, user: i32, timestamp: &str, name: &str) {
@@ -524,6 +535,17 @@ fn describe_matches_the_executed_analysis_schemas() {
     assert_eq!(described.len(), schema.fields().len());
     assert_eq!(described[0].0, schema.field(0).name().as_str());
 
+    // PATHS describes to its fixed (path, entities, depth) relation, and the
+    // executed result carries the same columns in the same order.
+    let paths_sql = "PATHS OVER ev MAX DEPTH 3 TOP 5";
+    let described = runtime.describe(paths_sql).expect("describe paths");
+    let (schema, _) = runtime.execute(paths_sql).expect("run paths");
+    assert_eq!(described.len(), schema.fields().len());
+    for (index, (name, _)) in described.iter().enumerate() {
+        assert_eq!(name, schema.field(index).name());
+    }
+    assert_eq!(described[0].0, "path");
+
     // Event DDL describes to the status column; EXPLAIN of an analysis raises.
     let ddl = runtime
         .describe("DROP EVENT VIEW ev")
@@ -538,15 +560,183 @@ fn describe_matches_the_executed_analysis_schemas() {
     );
 }
 
+/// Flatten a paths result to (path, entities, depth) tuples.
+fn paths_rows(batches: &[RecordBatch]) -> Vec<(String, i64, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let paths = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("path Utf8");
+        let entities = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("entities Int64");
+        let depths = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("depth Int64");
+        for row in 0..batch.num_rows() {
+            rows.push((
+                paths.value(row).to_string(),
+                entities.value(row),
+                depths.value(row),
+            ));
+        }
+    }
+    rows
+}
+
 #[test]
-fn paths_raises_naming_the_unimplemented_surface() {
+fn paths_match_the_hand_computed_fixture() {
     let sandbox = Sandbox::new("paths");
     let runtime = sandbox.runtime();
-    let error = runtime
-        .execute("PATHS OVER ev MAX DEPTH 5 TOP 10")
-        .unwrap_err();
-    assert!(
-        format!("{error}").contains("path analysis is not implemented"),
-        "{error}"
+    runtime
+        .execute(&create_view_sql(&sandbox.datasource))
+        .expect("create");
+
+    // MAX DEPTH 2 collapses u5's double signup and truncates every walk to
+    // two steps; u6's same-instant pair has no tiebreak, so the pinned
+    // fallback orders it by event name (activate before signup).
+    let (schema, batches) = runtime
+        .execute("PATHS OVER ev MAX DEPTH 2 TOP 10")
+        .expect("paths");
+    assert_eq!(schema.field(0).name(), "path");
+    assert_eq!(
+        paths_rows(&batches),
+        vec![
+            ("signup -> activate".to_string(), 3, 2),
+            ("activate -> purchase".to_string(), 1, 2),
+            ("activate -> signup".to_string(), 1, 2),
+            ("signup -> purchase".to_string(), 1, 2),
+        ]
     );
+
+    // TOP 1 keeps only the most common path.
+    let (_, top_one) = runtime
+        .execute("PATHS OVER ev MAX DEPTH 2 TOP 1")
+        .expect("paths top 1");
+    assert_eq!(
+        paths_rows(&top_one),
+        vec![("signup -> activate".to_string(), 3, 2)]
+    );
+
+    // STARTING AT drops u4 (never signs up) and anchors u6 at its signup.
+    let (_, anchored) = runtime
+        .execute("PATHS OVER ev STARTING AT 'signup' MAX DEPTH 2 TOP 10")
+        .expect("paths anchored");
+    assert_eq!(
+        paths_rows(&anchored),
+        vec![
+            ("signup -> activate".to_string(), 3, 2),
+            ("signup".to_string(), 1, 1),
+            ("signup -> purchase".to_string(), 1, 2),
+        ]
+    );
+}
+
+#[test]
+fn a_declared_tiebreak_orders_equal_timestamps_end_to_end() {
+    let sandbox = Sandbox::new("tiebreak");
+    // A table whose `seq` column records the true order of same-instant
+    // events: u1's browse precedes its signup, u2's signup precedes its
+    // browse - the event-name fallback could not tell them apart.
+    sandbox.seed(
+        "CREATE TABLE seq_events (user_id INTEGER, ts TIMESTAMP, name VARCHAR, seq INTEGER); \
+         INSERT INTO seq_events VALUES \
+             (1, '2026-01-01 10:00:00', 'signup', 2), \
+             (1, '2026-01-01 10:00:00', 'browse', 1), \
+             (1, '2026-01-01 11:00:00', 'purchase', 3), \
+             (2, '2026-01-01 10:00:00', 'signup', 1), \
+             (2, '2026-01-01 10:00:00', 'browse', 2), \
+             (2, '2026-01-01 11:00:00', 'purchase', 3);",
+    );
+    let runtime = sandbox.runtime();
+    let ds = &sandbox.datasource;
+
+    let created = runtime
+        .execute(&format!(
+            "CREATE EVENT VIEW seq_ev ENTITY user_id TIMESTAMP ts EVENT name TIEBREAK seq \
+             AS SELECT user_id, ts, name, seq FROM {ds}.main.seq_events"
+        ))
+        .expect("create with tiebreak");
+    assert_status(&created, "CREATE EVENT VIEW");
+
+    let paths_sql = "PATHS OVER seq_ev MAX DEPTH 5 TOP 10";
+    let expected = vec![
+        ("browse -> signup -> purchase".to_string(), 1, 3),
+        ("signup -> browse -> purchase".to_string(), 1, 3),
+    ];
+    let (_, batches) = runtime.execute(paths_sql).expect("paths");
+    assert_eq!(paths_rows(&batches), expected);
+    // The same statement twice returns the same table (deterministic serving;
+    // the permutation-level determinism is pinned in the kernel tests).
+    let (_, again) = runtime.execute(paths_sql).expect("paths again");
+    assert_eq!(paths_rows(&again), expected);
+
+    // A refresh re-pulls and re-sorts with the third key: u3 repeats u2's
+    // true order and its path joins the count.
+    connectors::fetch(
+        ds,
+        "INSERT INTO seq_events VALUES \
+             (3, '2026-01-02 10:00:00', 'signup', 1), \
+             (3, '2026-01-02 10:00:00', 'browse', 2), \
+             (3, '2026-01-02 11:00:00', 'purchase', 3)",
+    )
+    .expect("insert u3");
+    let refreshed = runtime
+        .execute("REFRESH EVENT VIEW seq_ev")
+        .expect("refresh");
+    assert_status(&refreshed, "REFRESH EVENT VIEW");
+    let (_, fresh) = runtime.execute(paths_sql).expect("paths after refresh");
+    assert_eq!(
+        paths_rows(&fresh),
+        vec![
+            ("signup -> browse -> purchase".to_string(), 2, 3),
+            ("browse -> signup -> purchase".to_string(), 1, 3),
+        ]
+    );
+}
+
+#[test]
+fn bad_tiebreak_declarations_raise_and_persist_nothing() {
+    let sandbox = Sandbox::new("badtiebreak");
+    sandbox.seed(
+        "CREATE TABLE null_seq (user_id INTEGER, ts TIMESTAMP, name VARCHAR, seq INTEGER); \
+         INSERT INTO null_seq VALUES (1, '2026-01-01 10:00:00', 'signup', NULL);",
+    );
+    let runtime = sandbox.runtime();
+    let ds = &sandbox.datasource;
+
+    // A tiebreak naming a column the SELECT does not produce.
+    let missing = runtime
+        .execute(&format!(
+            "CREATE EVENT VIEW ev ENTITY user_id TIMESTAMP ts EVENT name TIEBREAK zzz \
+             AS SELECT user_id, ts, name FROM {ds}.main.events"
+        ))
+        .unwrap_err();
+    assert!(format!("{missing}").contains("zzz"), "{missing}");
+
+    // A tiebreak sharing a role column.
+    let shared = runtime
+        .execute(&format!(
+            "CREATE EVENT VIEW ev ENTITY user_id TIMESTAMP ts EVENT name TIEBREAK ts \
+             AS SELECT user_id, ts, name FROM {ds}.main.events"
+        ))
+        .unwrap_err();
+    assert!(format!("{shared}").contains("distinct"), "{shared}");
+
+    // A NULL tiebreak value fails the build and nothing persists.
+    let null_tiebreak = runtime
+        .execute(&format!(
+            "CREATE EVENT VIEW ev ENTITY user_id TIMESTAMP ts EVENT name TIEBREAK seq \
+             AS SELECT user_id, ts, name, seq FROM {ds}.main.null_seq"
+        ))
+        .unwrap_err();
+    let text = format!("{null_tiebreak}");
+    assert!(text.contains("contract") && text.contains("seq"), "{text}");
+    assert!(runtime.execute("SELECT user_id FROM ev").is_err());
 }

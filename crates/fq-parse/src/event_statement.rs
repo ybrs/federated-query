@@ -1,25 +1,28 @@
 //! The event-analytics statement grammars: EVENT VIEW DDL and the FUNNEL /
-//! SEGMENT analysis statements, parsed with the same quote-aware tokenizer as
-//! the materialized-view DDL.
+//! SEGMENT / PATHS analysis statements, parsed with the same quote-aware
+//! tokenizer as the materialized-view DDL.
 //!
 //! Clauses appear in a FIXED order (the grammars below); a missing, misplaced,
 //! or unknown clause raises naming what was expected. Surfaces that are
 //! designed but not implemented raise `ParseError::Unsupported` naming
-//! themselves: property WHERE filters and property GROUP BY on SEGMENT, and
-//! FROM/TO time ranges on both analyses (the interim expression of a filter
-//! is the event view's defining SELECT).
+//! themselves: property WHERE filters and property GROUP BY, and FROM/TO time
+//! ranges on the analyses (the interim expression of a filter is the event
+//! view's defining SELECT).
 
 use fq_common::events::{
-    EventRoleColumns, EventWindow, FunnelSpec, SegmentMeasure, SegmentSpec, TimeBucket, WindowUnit,
+    EventRoleColumns, EventWindow, FunnelSpec, PathsSpec, SegmentMeasure, SegmentSpec, TimeBucket,
+    WindowUnit,
 };
 
 use crate::error::ParseError;
 use crate::statement::{expect_end, view_name, Statement, Token, Tokenizer};
 
 /// Parse `CREATE EVENT VIEW <name> ENTITY <col> TIMESTAMP <col> EVENT <col>
-/// AS <select>`. The three role clauses are required, in that order, each
-/// naming one output column of the defining SELECT; every other output column
-/// is a property.
+/// [TIEBREAK <col>] AS <select>`. The three leading role clauses are
+/// required, in that order, each naming one output column of the defining
+/// SELECT; TIEBREAK optionally names a fourth column that orders events
+/// sharing an (entity, timestamp) pair. Every other output column is a
+/// property.
 pub(crate) fn classify_create_event<'a>(
     tokens: &mut Tokenizer<'a>,
 ) -> Result<Statement<'a>, ParseError> {
@@ -50,7 +53,7 @@ pub(crate) fn classify_create_event<'a>(
 }
 
 /// Parse the fixed-order role clauses: `ENTITY <col> TIMESTAMP <col> EVENT
-/// <col>`.
+/// <col> [TIEBREAK <col>]`.
 fn role_columns(tokens: &mut Tokenizer<'_>) -> Result<EventRoleColumns, ParseError> {
     tokens.expect_keyword("ENTITY")?;
     let entity = column_name(tokens, "ENTITY")?;
@@ -58,10 +61,17 @@ fn role_columns(tokens: &mut Tokenizer<'_>) -> Result<EventRoleColumns, ParseErr
     let timestamp = column_name(tokens, "TIMESTAMP")?;
     tokens.expect_keyword("EVENT")?;
     let event = column_name(tokens, "EVENT")?;
+    let tiebreak = if tokens.peek_word_is("TIEBREAK") {
+        tokens.expect_keyword("TIEBREAK")?;
+        Some(column_name(tokens, "TIEBREAK")?)
+    } else {
+        None
+    };
     Ok(EventRoleColumns {
         entity,
         timestamp,
         event,
+        tiebreak,
     })
 }
 
@@ -185,29 +195,8 @@ fn step_name(tokens: &mut Tokenizer<'_>) -> Result<String, ParseError> {
 
 /// Parse `WITHIN`'s duration: a positive integer count and a unit word.
 fn window_duration(tokens: &mut Tokenizer<'_>) -> Result<EventWindow, ParseError> {
-    let count = match tokens.next_token() {
-        Some(Token::Word(word)) => word.parse::<i64>().map_err(|_| {
-            ParseError::Parse(format!("WITHIN takes an integer count, found '{word}'"))
-        })?,
-        Some(token) => {
-            return Err(ParseError::Parse(format!(
-                "WITHIN takes an integer count, found '{}'",
-                token.describe()
-            )))
-        }
-        None => {
-            return Err(ParseError::Parse(
-                "WITHIN takes an integer count, found end of statement".to_string(),
-            ))
-        }
-    };
-    if count <= 0 {
-        return Err(ParseError::Parse(format!(
-            "WITHIN needs a positive duration, got {count}"
-        )));
-    }
     Ok(EventWindow {
-        count,
+        count: positive_count(tokens, "WITHIN")?,
         unit: window_unit(tokens)?,
     })
 }
@@ -306,6 +295,74 @@ fn time_bucket(tokens: &mut Tokenizer<'_>) -> Result<TimeBucket, ParseError> {
     }
 }
 
+/// Parse `PATHS OVER <view> [STARTING AT '<name>'] MAX DEPTH <n> TOP <k>`.
+pub(crate) fn classify_paths<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("PATHS")?;
+    tokens.expect_keyword("OVER")?;
+    let view = view_name(tokens, "event view")?;
+    let starting_at = optional_starting_at(tokens)?;
+    tokens.expect_keyword("MAX")?;
+    tokens.expect_keyword("DEPTH")?;
+    let max_depth = positive_count(tokens, "MAX DEPTH")?;
+    tokens.expect_keyword("TOP")?;
+    let top = positive_count(tokens, "TOP")?;
+    reject_designed_clauses(tokens, "PATHS")?;
+    expect_end(tokens, "PATHS")?;
+    Ok(Statement::Paths(PathsSpec {
+        view,
+        starting_at,
+        max_depth,
+        top,
+    }))
+}
+
+/// Read the optional `STARTING AT '<name>'` anchor clause.
+fn optional_starting_at(tokens: &mut Tokenizer<'_>) -> Result<Option<String>, ParseError> {
+    if !tokens.peek_word_is("STARTING") {
+        return Ok(None);
+    }
+    tokens.expect_keyword("STARTING")?;
+    tokens.expect_keyword("AT")?;
+    match tokens.next_token() {
+        Some(Token::StringLiteral(name)) => Ok(Some(name)),
+        Some(token) => Err(ParseError::Parse(format!(
+            "STARTING AT takes a quoted event name like 'signup', found '{}'",
+            token.describe()
+        ))),
+        None => Err(ParseError::Parse(
+            "STARTING AT takes a quoted event name like 'signup', found end of \
+             statement"
+                .to_string(),
+        )),
+    }
+}
+
+/// Read one clause's positive integer count, naming the clause on failure.
+fn positive_count(tokens: &mut Tokenizer<'_>, clause: &str) -> Result<i64, ParseError> {
+    let count = match tokens.next_token() {
+        Some(Token::Word(word)) => word.parse::<i64>().map_err(|_| {
+            ParseError::Parse(format!("{clause} takes an integer count, found '{word}'"))
+        })?,
+        Some(token) => {
+            return Err(ParseError::Parse(format!(
+                "{clause} takes an integer count, found '{}'",
+                token.describe()
+            )))
+        }
+        None => {
+            return Err(ParseError::Parse(format!(
+                "{clause} takes an integer count, found end of statement"
+            )))
+        }
+    };
+    if count <= 0 {
+        return Err(ParseError::Parse(format!(
+            "{clause} needs a positive count, got {count}"
+        )));
+    }
+    Ok(count)
+}
+
 /// Raise on the clauses that are designed but not implemented, naming each:
 /// property filters (WHERE), property group-by (GROUP BY), and FROM/TO time
 /// ranges. An event view whose defining SELECT carries the filter is the
@@ -372,9 +429,53 @@ mod tests {
                     entity: "user_id".to_string(),
                     timestamp: "ts".to_string(),
                     event: "name".to_string(),
+                    tiebreak: None,
                 },
                 select_sql: "SELECT user_id, ts, name, device FROM duck.main.events",
             }
+        );
+    }
+
+    #[test]
+    fn create_event_view_takes_an_optional_tiebreak_role() {
+        let statement = classify(
+            "CREATE EVENT VIEW ev ENTITY user_id TIMESTAMP ts EVENT name TIEBREAK seq \
+             AS SELECT user_id, ts, name, seq FROM duck.main.events",
+        );
+        assert_eq!(
+            statement,
+            Statement::CreateEventView {
+                name: "ev".to_string(),
+                roles: EventRoleColumns {
+                    entity: "user_id".to_string(),
+                    timestamp: "ts".to_string(),
+                    event: "name".to_string(),
+                    tiebreak: Some("seq".to_string()),
+                },
+                select_sql: "SELECT user_id, ts, name, seq FROM duck.main.events",
+            }
+        );
+    }
+
+    #[test]
+    fn tiebreak_follows_event_and_needs_a_column_name() {
+        // TIEBREAK before the EVENT clause is a misplaced clause.
+        let misplaced = classify_statement(
+            "CREATE EVENT VIEW ev ENTITY u TIMESTAMP t TIEBREAK s EVENT e AS SELECT 1",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(misplaced, ParseError::Parse(ref m) if m.contains("EVENT")),
+            "{misplaced}"
+        );
+        // TIEBREAK with no column name raises naming the clause.
+        let missing = classify_statement(
+            "CREATE EVENT VIEW ev ENTITY u TIMESTAMP t EVENT e TIEBREAK 'seq' AS SELECT 1",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(missing, ParseError::Parse(ref m) if m.contains("TIEBREAK")),
+            "{missing}"
         );
     }
 
@@ -526,12 +627,52 @@ mod tests {
     }
 
     #[test]
-    fn paths_raises_naming_path_analysis() {
-        let error = classify_statement("PATHS OVER ev MAX DEPTH 5 TOP 10").unwrap_err();
+    fn paths_extracts_view_depth_and_top() {
+        assert_eq!(
+            classify("PATHS OVER ev MAX DEPTH 5 TOP 10"),
+            Statement::Paths(PathsSpec {
+                view: "ev".to_string(),
+                starting_at: None,
+                max_depth: 5,
+                top: 10,
+            })
+        );
+        assert_eq!(
+            classify("PATHS OVER ev STARTING AT 'signup' MAX DEPTH 3 TOP 7"),
+            Statement::Paths(PathsSpec {
+                view: "ev".to_string(),
+                starting_at: Some("signup".to_string()),
+                max_depth: 3,
+                top: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn paths_rejects_bad_counts_and_missing_clauses() {
+        for sql in [
+            "PATHS OVER ev MAX DEPTH 0 TOP 10",
+            "PATHS OVER ev MAX DEPTH -2 TOP 10",
+            "PATHS OVER ev MAX DEPTH 5 TOP 0",
+            "PATHS OVER ev MAX DEPTH soon TOP 10",
+            "PATHS OVER ev TOP 10",
+            "PATHS OVER ev MAX DEPTH 5",
+            "PATHS OVER ev STARTING AT signup MAX DEPTH 5 TOP 10",
+        ] {
+            assert!(classify_statement(sql).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn paths_designed_clauses_raise_naming_themselves() {
+        let error = classify_statement("PATHS OVER ev MAX DEPTH 5 TOP 10 WHERE device = 'ios'")
+            .unwrap_err();
         assert!(
-            matches!(error, ParseError::Unsupported(ref m) if m.contains("path analysis")),
+            matches!(error, ParseError::Unsupported(ref m) if m.contains("property filters")),
             "{error}"
         );
+        let trailing = classify_statement("PATHS OVER ev MAX DEPTH 5 TOP 10 EXTRA").unwrap_err();
+        assert!(matches!(trailing, ParseError::Unsupported(_)), "{trailing}");
     }
 
     #[test]
