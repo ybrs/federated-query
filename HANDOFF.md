@@ -239,11 +239,13 @@ fedq-py -> fq-runtime      (fedq CLI: NOT built yet)
    fq-runtime explain.rs must emit the effective pushed SQL for Scans.
    Engine gaps the run surfaced (each errors loudly): parser lacks named
    WINDOW, star EXCEPT/REPLACE/RENAME, WITHIN GROUP + MEDIAN + MODE, PIVOT,
-   FETCH FIRST, QUALIFY; cross-source LEFT JOIN LATERAL binds "Table 'o'
-   not found in scope"; OR-of-IN decorrelation hits a DataFusion duplicate
-   qualified field (in_0.customer_id); star-over-VALUES is VALID on the
-   Rust engine (test_star_over_values_fails_fast pins a Python-only
-   limitation - product decision pending). Python-internal suites
+   FETCH FIRST, QUALIFY; star-over-VALUES is VALID on the Rust engine
+   (test_star_over_values_fails_fast pins a Python-only limitation -
+   product decision pending). FIXED since: user LATERAL joins (parse ->
+   LateralJoin, bind with left scope, decorrelation flattens via the
+   dependent shapes; PhysicalLateralJoin has NO exec path, so a
+   non-flattenable lateral raises) and the flag-union duplicate-alias
+   schema error (passthrough aliases uniquify). Python-internal suites
    (e2e_decorrelation, plan-object assertions) retire with the Python
    package, not converted.
 2. Adversarial placement: the tpcds runner only implements pg-dims; the gate
