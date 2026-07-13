@@ -780,6 +780,31 @@ fn collect_scans(plan: &LogicalPlan, found: &mut BTreeMap<String, Scan>) {
 }
 
 #[test]
+fn edgeless_cross_region_is_left_unreordered() {
+    // A region with no equi edge is a pure cross product: every atom ordering has
+    // the same total cost, so reordering can only churn the plan while paying a
+    // per-atom estimate for each atom (deep for an opaque subquery atom). The rule
+    // declines such a region and keeps the written order.
+    let rule = JoinOrdering::new(shared(q09_model()), 10);
+    let tree = join(
+        join(
+            scan("part", "p", &["p_partkey"]),
+            scan("supplier", "su", &["s_suppkey"]),
+            JoinType::Cross,
+            None,
+        ),
+        scan("lineitem", "l", &["l_partkey"]),
+        JoinType::Cross,
+        None,
+    );
+    let result = rule.apply(tree.clone()).unwrap();
+    assert_eq!(
+        result, tree,
+        "an edgeless cross-product region must be left exactly as written"
+    );
+}
+
+#[test]
 fn q09_shape_leaves_no_conditionless_join() {
     let rule = JoinOrdering::new(shared(q09_model()), 10);
     let result = rule.apply(q09_from_order_tree()).unwrap();

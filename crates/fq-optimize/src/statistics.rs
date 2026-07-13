@@ -313,14 +313,16 @@ impl StatisticsCollector {
     }
 }
 
-/// The scan rendered in the source dialect exactly as execution would render it
-/// (same emitter, same transpile boundary), minus any grouping: the estimate
-/// prices the FILTERED INPUT rows, which is what the group clamp consumes.
+/// The filtered scan rendered in the source dialect for a row-count probe: the
+/// table, its filter, minus any grouping (the estimate prices the FILTERED INPUT
+/// rows, which is what the group clamp consumes). The SELECT list is a CONSTANT,
+/// not the scan's columns: a source's row-count estimate for a filtered scan
+/// depends only on the WHERE clause, never on which columns are projected, so a
+/// constant projection lets the memo (keyed on the rendered SQL) reuse ONE probe
+/// across the estimate passes before and after projection pushdown prunes the
+/// column list - otherwise the same table+filter round-trips to the source once
+/// per distinct projection.
 fn render_probe_scan(scan: &Scan, dialect: RenderDialect) -> Result<String> {
-    let mut items = Vec::with_capacity(scan.columns.len());
-    for column in &scan.columns {
-        items.push(quote_ident(column));
-    }
     let mut from_clause = format!(
         "{}.{}",
         quote_ident(&scan.schema_name),
@@ -330,7 +332,7 @@ fn render_probe_scan(scan: &Scan, dialect: RenderDialect) -> Result<String> {
         from_clause.push_str(" AS ");
         from_clause.push_str(&quote_ident(alias));
     }
-    let mut sql = format!("SELECT {} FROM {}", items.join(", "), from_clause);
+    let mut sql = format!("SELECT 1 FROM {from_clause}");
     if let Some(filters) = scan.filters.as_ref() {
         sql.push_str(" WHERE ");
         sql.push_str(&render_canonical(filters)?);
@@ -496,6 +498,44 @@ mod tests {
         let mut catalog = Catalog::new();
         catalog.register_datasource(source);
         StatisticsCollector::new(Arc::new(catalog), None, None)
+    }
+
+    #[test]
+    fn probe_sql_is_independent_of_the_projected_columns() {
+        use fq_plan::expr::{BinaryOpType, ColumnRef, Expr, LiteralValue};
+        // A source's row-count estimate for a filtered scan depends only on the
+        // WHERE clause, never on which columns are projected. The probe SQL must
+        // therefore be identical for a wide and a pruned projection, so the memo
+        // reuses ONE round trip across the estimate passes before and after
+        // projection pushdown narrows the column list.
+        let filter = || {
+            Some(Expr::BinaryOp {
+                op: BinaryOpType::Eq,
+                left: Box::new(Expr::Column(ColumnRef::new(
+                    Some("t".to_string()),
+                    "a",
+                    Some(DataType::Integer),
+                ))),
+                right: Box::new(Expr::Literal {
+                    value: LiteralValue::Integer(1),
+                    data_type: DataType::Integer,
+                }),
+            })
+        };
+        let mut wide = Scan::new(
+            "pg",
+            "public",
+            "t",
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        );
+        wide.filters = filter();
+        let mut narrow = Scan::new("pg", "public", "t", vec!["a".to_string()]);
+        narrow.filters = filter();
+        assert_eq!(
+            render_probe_scan(&wide, RenderDialect::Postgres).unwrap(),
+            render_probe_scan(&narrow, RenderDialect::Postgres).unwrap(),
+            "the row-count probe must not vary with the projected columns"
+        );
     }
 
     #[test]

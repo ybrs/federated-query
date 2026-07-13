@@ -1297,13 +1297,20 @@ fn wrap_constant_conjuncts(
     residual_filter(tree, expressions)
 }
 
-/// 3+ atoms always; 2 atoms only when a condition-less join would gain a
-/// connecting equality (turning a cross product into an inner join).
+/// A region is worth reordering only when it has a join-graph edge to reorder
+/// around: with no equi edge every atom ordering is a pure cross product of the
+/// same total cost, so enumeration cannot improve the plan and only burns the
+/// per-atom estimates (deep for an opaque subquery atom). Given an edge: 3+ atoms
+/// always; 2 atoms only when a condition-less join would gain the connecting
+/// equality (turning a cross product into an inner join).
 fn worth_reordering(region: &JoinRegion, root: &LogicalPlan) -> bool {
+    if !has_edge(region) {
+        return false;
+    }
     if region.atoms.len() >= 3 {
         return true;
     }
-    has_edge(region) && has_conditionless_join(root)
+    has_conditionless_join(root)
 }
 
 /// A tree wrapped in a residual Filter of the given conjuncts, or the bare tree
