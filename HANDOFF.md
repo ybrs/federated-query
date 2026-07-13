@@ -231,10 +231,21 @@ fedq-py -> fq-runtime      (fedq CLI: NOT built yet)
 
 ## NEXT: Milestone D (the gate), in rough order
 
-1. Point the SQL-level Python e2e suites (tests/e2e_pushdown/, test_e2e_*)
-   at the Rust engine through fedq-py (plan 3.12 / section 6). Result-level
-   suites first; EXPLAIN-shape assertions need the EXPLAIN document builder
-   (item 5) or a textual-EXPLAIN adaptation.
+1. E2E suites -> Rust engine: STARTED. tests/rust_runtime.py drives fedq
+   (temp YAML per env, pa.Table results, pushed SQL re-parsed from textual
+   EXPLAIN); e2e_pushdown conftest/helpers rewired; row-based suites green
+   (44 tests). BLOCKER for the ~31 EXPLAIN-shape suites: the textual EXPLAIN
+   renders Scan-node pushdowns as tags (+filter/+agg) with NO rendered SQL -
+   fq-runtime explain.rs must emit the effective pushed SQL for Scans.
+   Engine gaps the run surfaced (each errors loudly): parser lacks named
+   WINDOW, star EXCEPT/REPLACE/RENAME, WITHIN GROUP + MEDIAN + MODE, PIVOT,
+   FETCH FIRST, QUALIFY; cross-source LEFT JOIN LATERAL binds "Table 'o'
+   not found in scope"; OR-of-IN decorrelation hits a DataFusion duplicate
+   qualified field (in_0.customer_id); star-over-VALUES is VALID on the
+   Rust engine (test_star_over_values_fails_fast pins a Python-only
+   limitation - product decision pending). Python-internal suites
+   (e2e_decorrelation, plan-object assertions) retire with the Python
+   package, not converted.
 2. Adversarial placement: the tpcds runner only implements pg-dims; the gate
    needs BOTH placements at sf0.1/sf1/sf10. Extend the ONE runner.
 3. q14: upstream polyglot-sql fix or pre-parse normalization -> 99|0|0.
