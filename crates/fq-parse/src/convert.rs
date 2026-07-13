@@ -11,7 +11,7 @@
 //! star expansion, WHERE, GROUP BY + the aggregates, HAVING, ORDER BY,
 //! LIMIT/OFFSET, DISTINCT, VALUES, and the binary set operations. A window
 //! function in WHERE / GROUP BY / HAVING raises (it is legal only in SELECT and
-//! ORDER BY). WITH RECURSIVE and named WINDOW clauses still raise.
+//! ORDER BY). WITH RECURSIVE still raises.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -26,6 +26,10 @@ use polyglot_sql::expressions::{Expression, JoinKind, Ordered, Select, TableRef,
 use polyglot_sql::traversal::ExpressionWalk;
 
 use crate::error::ParseError;
+
+/// The relation alias given to the subquery a QUALIFY clause wraps its input in,
+/// so the QUALIFY predicate's columns qualify to a real relation after binding.
+const QUALIFY_SUBQUERY_ALIAS: &str = "__qualify";
 
 /// Where a FROM item's columns come from, for star expansion.
 enum ColumnSource {
@@ -155,7 +159,8 @@ impl<'a> Converter<'a> {
         let (from, from_tables) = self.build_from(select)?;
         let filtered = self.apply_where(from, select)?;
         let projected = self.apply_projection(filtered, select, &from_tables)?;
-        let sorted = self.apply_order_by(projected, select)?;
+        let qualified = self.apply_qualify(projected, select)?;
+        let sorted = self.apply_order_by(qualified, select)?;
         apply_limit(sorted, select)
     }
 
@@ -637,17 +642,7 @@ impl<'a> Converter<'a> {
         from_tables: &[FromTable],
     ) -> Result<Vec<(Expr, String)>, ParseError> {
         match item {
-            Expression::Star(star) => {
-                // A star modifier (EXCEPT / REPLACE / RENAME) changes the column
-                // set; unhandled, it must raise, never silently expand to the
-                // wrong columns.
-                if star.except.is_some() || star.replace.is_some() || star.rename.is_some() {
-                    return Err(ParseError::Unsupported(
-                        "SELECT * with EXCEPT/REPLACE/RENAME".to_string(),
-                    ));
-                }
-                self.expand_star(star.table.as_ref(), from_tables)
-            }
+            Expression::Star(star) => self.expand_star(star, from_tables),
             Expression::Alias(alias) => {
                 Ok(vec![(self.expr(&alias.this)?, alias.alias.name.clone())])
             }
@@ -657,27 +652,29 @@ impl<'a> Converter<'a> {
     }
 
     /// Expand `*` (all FROM items) or `alias.*` (one item) into explicit qualified
-    /// column references. Raises when a table's columns cannot be resolved - a
-    /// star that cannot expand must fail loudly, never drop columns.
+    /// column references, honoring the DuckDB/BigQuery star modifiers: EXCLUDE /
+    /// EXCEPT drops columns, REPLACE substitutes a column's expression in place,
+    /// RENAME renames the output column. Raises when a table's columns cannot be
+    /// resolved - a star that cannot expand must fail loudly, never drop columns.
     fn expand_star(
         &self,
-        qualifier: Option<&polyglot_sql::expressions::Identifier>,
+        star: &polyglot_sql::expressions::Star,
         from_tables: &[FromTable],
     ) -> Result<Vec<(Expr, String)>, ParseError> {
         let mut outputs = Vec::new();
         for table in from_tables {
-            if qualifier.is_some_and(|ident| ident.name != table.key) {
+            if star
+                .table
+                .as_ref()
+                .is_some_and(|ident| ident.name != table.key)
+            {
                 continue;
             }
             for column in self.star_columns(table)? {
-                outputs.push((
-                    Expr::Column(ColumnRef::new(
-                        Some(table.key.clone()),
-                        column.clone(),
-                        None,
-                    )),
-                    column,
-                ));
+                if star_excludes(star, &column) {
+                    continue;
+                }
+                outputs.push(self.star_output(star, &table.key, column)?);
             }
         }
         if outputs.is_empty() {
@@ -686,6 +683,22 @@ impl<'a> Converter<'a> {
             ));
         }
         Ok(outputs)
+    }
+
+    /// One expanded star column as (expression, output name). REPLACE swaps the
+    /// column for its expression; RENAME renames the output. With neither, it is
+    /// the plain qualified column reference.
+    fn star_output(
+        &self,
+        star: &polyglot_sql::expressions::Star,
+        key: &str,
+        column: String,
+    ) -> Result<(Expr, String), ParseError> {
+        let expr = match star_replacement(star, &column) {
+            Some(replacement) => self.expr(replacement)?,
+            None => Expr::Column(ColumnRef::new(Some(key.to_string()), column.clone(), None)),
+        };
+        Ok((expr, star_output_name(star, column)))
     }
 
     /// The column names a FROM item contributes to a star.
@@ -703,6 +716,48 @@ impl<'a> Converter<'a> {
                     ParseError::Unsupported(format!("cannot expand * : unknown table {name}"))
                 }),
         }
+    }
+
+    /// Lower a QUALIFY clause: it filters on window-function outputs, which the
+    /// engine computes in the projection below. The projected rows become a
+    /// subquery and the QUALIFY predicate a `Filter` over it, so the predicate
+    /// references the window outputs as ordinary columns. Only a predicate over a
+    /// SELECT-list alias is modeled; an inline window in the predicate would build
+    /// an invalid filter (windows are illegal in a filter), so it raises.
+    fn apply_qualify(
+        &self,
+        input: LogicalPlan,
+        select: &Select,
+    ) -> Result<LogicalPlan, ParseError> {
+        let Some(qualify) = &select.qualify else {
+            return Ok(input);
+        };
+        let predicate = self.expr(&qualify.this)?;
+        if fq_plan::expr::contains_window(&predicate) {
+            return Err(ParseError::Unsupported(
+                "QUALIFY with an inline window function; alias it in the SELECT list".to_string(),
+            ));
+        }
+        let output_names = input.schema();
+        // Fresh subquery boundary wrapping the projected rows so the QUALIFY
+        // predicate can reference window outputs by name - no base to copy from.
+        // Field list (input/alias/column_names) is the complete SubqueryScan struct.
+        let subquery = LogicalPlan::SubqueryScan(SubqueryScan {
+            input: Box::new(input),
+            alias: QUALIFY_SUBQUERY_ALIAS.to_string(),
+            column_names: None,
+        });
+        // Fresh QUALIFY filter over the subquery - no base to copy from. Field list
+        // (input/predicate) is the complete Filter struct.
+        let filtered = LogicalPlan::Filter(Filter {
+            input: Box::new(subquery),
+            predicate,
+        });
+        Ok(project_relation_columns(
+            filtered,
+            QUALIFY_SUBQUERY_ALIAS,
+            output_names,
+        ))
     }
 
     /// Wrap the input in a `Sort` for the ORDER BY clause, if present.
@@ -739,7 +794,7 @@ impl<'a> Converter<'a> {
 fn apply_limit(input: LogicalPlan, select: &Select) -> Result<LogicalPlan, ParseError> {
     let limit = match &select.limit {
         Some(clause) => Some(limit_value(&clause.this)?),
-        None => None,
+        None => fetch_limit(select.fetch.as_ref())?,
     };
     let offset = match &select.offset {
         Some(clause) => limit_value(&clause.this)?,
@@ -757,12 +812,60 @@ fn apply_limit(input: LogicalPlan, select: &Select) -> Result<LogicalPlan, Parse
     }))
 }
 
+/// A `Projection` that re-exposes each of `names` as a column of relation
+/// `qualifier`, preserving the visible output names. Used to give a QUALIFY
+/// result a Projection root carrying the user-visible column names.
+fn project_relation_columns(
+    input: LogicalPlan,
+    qualifier: &str,
+    names: Vec<String>,
+) -> LogicalPlan {
+    let mut expressions = Vec::with_capacity(names.len());
+    for name in &names {
+        expressions.push(Expr::Column(ColumnRef::new(
+            Some(qualifier.to_string()),
+            name.clone(),
+            None,
+        )));
+    }
+    // Fresh projection re-exposing the subquery columns under their visible names -
+    // no base to copy from. Field list (input/expressions/aliases/distinct/
+    // distinct_on) is the complete Projection struct; this pass-through keeps no
+    // DISTINCT.
+    LogicalPlan::Projection(Projection {
+        input: Box::new(input),
+        expressions,
+        aliases: names,
+        distinct: false,
+        distinct_on: None,
+    })
+}
+
+/// The row count of a `FETCH FIRST n ROWS ONLY`, which is exactly `LIMIT n`.
+/// PERCENT and WITH TIES change the row set (a fraction, or ties past the count)
+/// and are not modeled, so they raise rather than being dropped.
+fn fetch_limit(
+    fetch: Option<&polyglot_sql::expressions::Fetch>,
+) -> Result<Option<u64>, ParseError> {
+    let Some(fetch) = fetch else {
+        return Ok(None);
+    };
+    if fetch.percent || fetch.with_ties {
+        return Err(ParseError::Unsupported(
+            "FETCH FIRST with PERCENT or WITH TIES".to_string(),
+        ));
+    }
+    match &fetch.count {
+        Some(count) => Ok(Some(limit_value(count)?)),
+        None => Ok(Some(1)),
+    }
+}
+
 /// Raise on any SELECT clause this stage does not handle (the Python
 /// `SUPPORTED_SELECT_ARGS` allowlist). JOIN, DISTINCT, and DISTINCT ON are handled
 /// and so are absent here.
 fn reject_unsupported_clauses(select: &Select) -> Result<(), ParseError> {
     let unsupported = [
-        (select.qualify.is_some(), "QUALIFY"),
         (select.prewhere.is_some(), "PREWHERE"),
         (!select.lateral_views.is_empty(), "LATERAL VIEW"),
         (select.distribute_by.is_some(), "DISTRIBUTE BY"),
@@ -771,7 +874,6 @@ fn reject_unsupported_clauses(select: &Select) -> Result<(), ParseError> {
         (select.windows.is_some(), "WINDOW"),
         (select.sample.is_some(), "TABLESAMPLE"),
         (select.top.is_some(), "TOP"),
-        (select.fetch.is_some(), "FETCH"),
         (select.limit_by.is_some(), "LIMIT BY"),
         (select.connect.is_some(), "CONNECT BY"),
         (select.into.is_some(), "SELECT INTO"),
@@ -903,6 +1005,42 @@ impl Converter<'_> {
     }
 }
 
+/// Whether a star's EXCLUDE/EXCEPT list drops `column`.
+fn star_excludes(star: &polyglot_sql::expressions::Star, column: &str) -> bool {
+    star.except.as_ref().is_some_and(|excepts| {
+        excepts
+            .iter()
+            .any(|ident| ident.name.eq_ignore_ascii_case(column))
+    })
+}
+
+/// The REPLACE expression substituting `column`, if the star names one.
+fn star_replacement<'a>(
+    star: &'a polyglot_sql::expressions::Star,
+    column: &str,
+) -> Option<&'a Expression> {
+    let replacements = star.replace.as_ref()?;
+    for replacement in replacements {
+        if replacement.alias.name.eq_ignore_ascii_case(column) {
+            return Some(&replacement.this);
+        }
+    }
+    None
+}
+
+/// The output name for `column`, applying a RENAME (old -> new) if the star
+/// names one, else the column's own name.
+fn star_output_name(star: &polyglot_sql::expressions::Star, column: String) -> String {
+    if let Some(renames) = &star.rename {
+        for (old, new) in renames {
+            if old.name.eq_ignore_ascii_case(&column) {
+                return new.name.clone();
+            }
+        }
+    }
+    column
+}
+
 /// Every root expression that may reference columns.
 fn column_roots(select: &Select) -> Vec<&Expression> {
     let mut roots: Vec<&Expression> = select.expressions.iter().collect();
@@ -967,6 +1105,10 @@ fn collect_columns(root: &Expression, key: &str, columns: &mut Vec<String>) {
 /// (SUM/AVG/MIN/MAX carry `AggFunc.this`; COUNT carries an optional `CountFunc.this`,
 /// absent for `COUNT(*)`). `find_all` does not cross an aggregate boundary, so these
 /// are the args `get_columns` misses.
+// The AggFunc arm and the StringAgg arm both push a single `.this` argument but
+// bind distinct polyglot function types (AggFunc vs StringAggFunc), so they cannot
+// share one pattern; the identical bodies are unavoidable, not a copy-paste slip.
+#[allow(clippy::match_same_arms)]
 fn aggregate_arguments(root: &Expression) -> Vec<&Expression> {
     let mut args = Vec::new();
     for aggregate in root.find_all(is_aggregate) {
@@ -975,7 +1117,22 @@ fn aggregate_arguments(root: &Expression) -> Vec<&Expression> {
             | Expression::Avg(agg)
             | Expression::Min(agg)
             | Expression::Max(agg)
-            | Expression::StddevSamp(agg) => args.push(&agg.this),
+            | Expression::StddevSamp(agg)
+            | Expression::StddevPop(agg)
+            | Expression::Stddev(agg)
+            | Expression::Variance(agg)
+            | Expression::VarPop(agg)
+            | Expression::VarSamp(agg)
+            | Expression::ArrayAgg(agg)
+            | Expression::LogicalAnd(agg)
+            | Expression::LogicalOr(agg)
+            | Expression::Median(agg) => args.push(&agg.this),
+            Expression::StringAgg(agg) => args.push(&agg.this),
+            Expression::WithinGroup(within) => {
+                for ordered in &within.order_by {
+                    args.push(&ordered.this);
+                }
+            }
             Expression::Count(count) => {
                 if let Some(inner) = &count.this {
                     args.push(inner);
@@ -997,6 +1154,17 @@ fn is_aggregate(expr: &Expression) -> bool {
             | Expression::Max(_)
             | Expression::Count(_)
             | Expression::StddevSamp(_)
+            | Expression::StddevPop(_)
+            | Expression::Stddev(_)
+            | Expression::Variance(_)
+            | Expression::VarPop(_)
+            | Expression::VarSamp(_)
+            | Expression::ArrayAgg(_)
+            | Expression::LogicalAnd(_)
+            | Expression::LogicalOr(_)
+            | Expression::StringAgg(_)
+            | Expression::Median(_)
+            | Expression::WithinGroup(_)
     )
 }
 

@@ -749,7 +749,9 @@ fn wider_numeric(left: DataType, right: DataType) -> DataType {
 fn function_call_type(function_name: &str) -> DataType {
     match function_name.to_uppercase().as_str() {
         "COUNT" | "SUM" | "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "NTILE" => DataType::BigInt,
-        "AVG" => DataType::Double,
+        "AVG" | "VARIANCE" | "VAR_POP" | "VAR_SAMP" | "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP"
+        | "PERCENTILE_CONT" => DataType::Double,
+        "BOOL_AND" | "BOOL_OR" => DataType::Boolean,
         _ => DataType::Varchar,
     }
 }

@@ -8,14 +8,16 @@
 //! expansion, WHERE / GROUP BY (five aggregates) / HAVING / ORDER BY /
 //! LIMIT-OFFSET / DISTINCT, VALUES, binary set operations, and the expression
 //! nodes (columns, literals, binary/unary ops, IS NULL, Cast, Case, In, Between,
-//! the subquery expressions, and window functions). Each unsupported construct
-//! raises `ParseError::Unsupported`, never silently dropped. Still raising:
-//! WITH RECURSIVE and named WINDOW clauses.
+//! the subquery expressions, and window functions). Named WINDOW clauses are
+//! inlined into their `OVER w` references before conversion. Each unsupported
+//! construct raises `ParseError::Unsupported`, never silently dropped. Still
+//! raising: WITH RECURSIVE.
 
 pub mod convert;
 pub mod error;
 pub mod expr;
 pub mod functions;
+mod window;
 
 pub use error::ParseError;
 
@@ -29,12 +31,13 @@ pub fn parse_with_catalog(
     sql: &str,
     catalog: &Catalog,
 ) -> Result<fq_plan::LogicalPlan, ParseError> {
-    let statements = polyglot_sql::parse(sql, DialectType::PostgreSQL)
+    let mut statements = polyglot_sql::parse(sql, DialectType::PostgreSQL)
         .map_err(|error| ParseError::Parse(format!("{error:?}")))?;
-    let [statement] = statements.as_slice() else {
+    if statements.len() != 1 {
         return Err(ParseError::MultiStatement);
-    };
-    convert::Converter::new(catalog).query(statement)
+    }
+    let statement = window::inline_named_windows(statements.remove(0))?;
+    convert::Converter::new(catalog).query(&statement)
 }
 
 /// Parse without a catalog. A `SELECT *` cannot expand and raises; structural

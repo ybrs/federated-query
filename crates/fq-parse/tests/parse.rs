@@ -325,6 +325,84 @@ fn star_expands_from_catalog() {
 }
 
 #[test]
+fn star_modifiers_exclude_and_replace() {
+    use fq_catalog::{Catalog, Column, Schema, Table};
+    use fq_common::DataType;
+    use fq_parse::parse_with_catalog;
+
+    let mut catalog = Catalog::new();
+    let orders = Table::new(
+        "orders",
+        vec![
+            Column::new("id", DataType::Integer, false),
+            Column::new("region", DataType::Varchar, true),
+            Column::new("price", DataType::Double, true),
+        ],
+    );
+    catalog.insert_schema(
+        "duck",
+        "main",
+        Schema::with_tables("main", "duck", vec![orders]),
+    );
+
+    // EXCLUDE drops region; the output list is id, price.
+    let plan =
+        parse_with_catalog("SELECT * EXCLUDE (region) FROM duck.main.orders", &catalog).unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection");
+    };
+    assert_eq!(projection.aliases, vec!["id", "price"]);
+
+    // REPLACE substitutes an expression for price, keeping its name and position.
+    let plan = parse_with_catalog(
+        "SELECT * REPLACE (price + 1 AS price) FROM duck.main.orders",
+        &catalog,
+    )
+    .unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection");
+    };
+    assert_eq!(projection.aliases, vec!["id", "region", "price"]);
+    // The price output is now an expression, not a bare column.
+    assert!(
+        matches!(projection.expressions[2], Expr::BinaryOp { .. }),
+        "price must be replaced by an expression, got {:?}",
+        projection.expressions[2]
+    );
+}
+
+#[test]
+fn star_rename_renames_output_column() {
+    use fq_catalog::{Catalog, Column, Schema, Table};
+    use fq_common::DataType;
+    use fq_parse::parse_with_catalog;
+
+    let mut catalog = Catalog::new();
+    let orders = Table::new(
+        "orders",
+        vec![
+            Column::new("id", DataType::Integer, false),
+            Column::new("region", DataType::Varchar, true),
+        ],
+    );
+    catalog.insert_schema(
+        "duck",
+        "main",
+        Schema::with_tables("main", "duck", vec![orders]),
+    );
+
+    let plan = parse_with_catalog(
+        "SELECT * RENAME (region AS area) FROM duck.main.orders",
+        &catalog,
+    )
+    .unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection");
+    };
+    assert_eq!(projection.aliases, vec!["id", "area"]);
+}
+
+#[test]
 fn qualified_star_expands_one_table() {
     use fq_catalog::{Catalog, Column, Schema, Table};
     use fq_common::DataType;
@@ -616,8 +694,11 @@ fn extract_becomes_extract_node() {
 #[test]
 fn unknown_function_raises() {
     // A typed function the engine does not model fails loudly, not silently.
-    let result = parse("SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY a) FROM t");
-    assert!(matches!(result, Err(ParseError::Unsupported(_))));
+    let result = parse("SELECT COVAR_POP(a, b) FROM t");
+    assert!(
+        matches!(result, Err(ParseError::Unsupported(_))),
+        "{result:?}"
+    );
 }
 
 // --- conversion edge cases that must not regress ---
@@ -826,9 +907,109 @@ fn distinct_with_window_raises() {
 }
 
 #[test]
-fn named_window_reference_raises() {
-    // OVER w (a named-window reference) is not modeled and must not be dropped.
-    let result = parse("SELECT rank() OVER w FROM t WINDOW w AS (ORDER BY b)");
+fn named_window_inlines_partition() {
+    // WINDOW w AS (PARTITION BY a) inlines into SUM(x) OVER w.
+    let expr = only_window("SELECT sum(x) OVER w AS s FROM t WINDOW w AS (PARTITION BY a)");
+    let Expr::Window {
+        partition_by,
+        order_keys,
+        ..
+    } = expr
+    else {
+        panic!("expected Window, got {expr:?}");
+    };
+    assert_eq!(partition_by.len(), 1);
+    assert!(order_keys.is_empty());
+}
+
+#[test]
+fn named_window_reference_merges_added_order_by() {
+    // OVER (w ORDER BY b DESC) takes PARTITION BY from w and ORDER BY from the
+    // reference.
+    let expr = only_window(
+        "SELECT rank() OVER (w ORDER BY b DESC) AS r FROM t WINDOW w AS (PARTITION BY a)",
+    );
+    let Expr::Window {
+        partition_by,
+        order_keys,
+        order_ascending,
+        ..
+    } = expr
+    else {
+        panic!("expected Window, got {expr:?}");
+    };
+    assert_eq!(partition_by.len(), 1);
+    assert_eq!(order_keys.len(), 1);
+    assert_eq!(order_ascending, vec![false]);
+}
+
+#[test]
+fn qualify_lowers_to_filter_over_subquery() {
+    // QUALIFY filters on window outputs: the SELECT becomes a subquery and the
+    // QUALIFY predicate a Filter over it.
+    let plan =
+        parse("SELECT order_id, row_number() OVER (ORDER BY price) AS rn FROM t QUALIFY rn = 1")
+            .unwrap();
+    // Root projection re-exposes the visible columns; under it a Filter over the
+    // wrapping subquery applies the QUALIFY predicate.
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection at root, got {plan:?}");
+    };
+    assert_eq!(projection.aliases, vec!["order_id", "rn"]);
+    let LogicalPlan::Filter(filter) = projection.input.as_ref() else {
+        panic!(
+            "expected Filter under projection, got {:?}",
+            projection.input
+        );
+    };
+    assert!(
+        matches!(filter.input.as_ref(), LogicalPlan::SubqueryScan(_)),
+        "QUALIFY filter must sit over a subquery, got {:?}",
+        filter.input
+    );
+}
+
+#[test]
+fn qualify_over_inline_window_raises() {
+    // Only a QUALIFY over a SELECT-list alias is modeled; an inline window in the
+    // predicate is not, and must fail loudly rather than build an invalid filter.
+    let result = parse("SELECT order_id FROM t QUALIFY row_number() OVER (ORDER BY price) = 1");
+    assert!(
+        matches!(result, Err(ParseError::Unsupported(_))),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn fetch_first_rows_only_becomes_limit() {
+    // FETCH FIRST n ROWS ONLY is exactly LIMIT n.
+    let plan = parse("SELECT a FROM t ORDER BY a FETCH FIRST 3 ROWS ONLY").unwrap();
+    let LogicalPlan::Limit(limit) = plan else {
+        panic!("expected Limit, got {plan:?}");
+    };
+    assert_eq!(limit.limit, Some(3));
+}
+
+#[test]
+fn fetch_with_ties_or_percent_raises() {
+    // WITH TIES and PERCENT change the row set and are not modeled; they raise.
+    for sql in [
+        "SELECT a FROM t ORDER BY a FETCH FIRST 2 ROWS WITH TIES",
+        "SELECT a FROM t ORDER BY a FETCH FIRST 10 PERCENT ROWS ONLY",
+    ] {
+        let result = parse(sql);
+        assert!(
+            matches!(result, Err(ParseError::Unsupported(_))),
+            "{sql}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn undefined_named_window_reference_raises() {
+    // An OVER w with no matching WINDOW clause cannot be resolved; it must not be
+    // silently dropped.
+    let result = parse("SELECT rank() OVER w FROM t");
     assert!(
         matches!(result, Err(ParseError::Unsupported(_))),
         "{result:?}"
@@ -901,6 +1082,216 @@ fn stddev_samp_argument_column_is_over_collected() {
         "scan columns {:?} must include the stddev argument",
         scan.columns
     );
+}
+
+/// Parse a single-aggregate SELECT and return the first aggregate expression's
+/// (function_name, is_aggregate). Each variance/stddev/string/bool aggregate must
+/// route through the aggregate machinery under a canonical name.
+fn only_aggregate_call(sql: &str) -> (String, bool) {
+    let LogicalPlan::Aggregate(aggregate) = parse(sql).unwrap() else {
+        panic!("expected Aggregate for {sql}");
+    };
+    let Expr::FunctionCall {
+        function_name,
+        is_aggregate,
+        ..
+    } = &aggregate.aggregates[0]
+    else {
+        panic!("expected FunctionCall, got {:?}", aggregate.aggregates[0]);
+    };
+    (function_name.clone(), *is_aggregate)
+}
+
+#[test]
+fn variance_family_are_aggregates() {
+    // The variance/stddev family each routes through an Aggregate node under its
+    // canonical name so it re-renders to a name every source accepts.
+    let cases = [
+        ("SELECT var_pop(x) FROM t", "VAR_POP"),
+        ("SELECT var_samp(x) FROM t", "VAR_SAMP"),
+        ("SELECT variance(x) FROM t", "VARIANCE"),
+        ("SELECT stddev(x) FROM t", "STDDEV"),
+        ("SELECT stddev_pop(x) FROM t", "STDDEV_POP"),
+        ("SELECT stddev_samp(x) FROM t", "STDDEV_SAMP"),
+    ];
+    for (sql, expected) in cases {
+        let (name, is_aggregate) = only_aggregate_call(sql);
+        assert_eq!(name, expected, "for {sql}");
+        assert!(is_aggregate, "{sql} must be an aggregate");
+    }
+}
+
+#[test]
+fn string_bool_array_aggregates() {
+    // STRING_AGG / ARRAY_AGG / BOOL_AND / BOOL_OR are aggregates under canonical
+    // names (BOOL_AND/BOOL_OR are the Postgres form of LOGICAL_AND/LOGICAL_OR).
+    let (string_name, string_is_agg) = only_aggregate_call("SELECT string_agg(s, ',') FROM t");
+    assert_eq!(string_name, "STRING_AGG");
+    assert!(string_is_agg);
+    let (array_name, array_is_agg) = only_aggregate_call("SELECT array_agg(s) FROM t");
+    assert_eq!(array_name, "ARRAY_AGG");
+    assert!(array_is_agg);
+    for sql in [
+        "SELECT bool_and(x > 1) FROM t",
+        "SELECT logical_and(x > 1) FROM t",
+    ] {
+        let (name, is_agg) = only_aggregate_call(sql);
+        assert_eq!(name, "BOOL_AND", "for {sql}");
+        assert!(is_agg);
+    }
+    for sql in [
+        "SELECT bool_or(x > 1) FROM t",
+        "SELECT logical_or(x > 1) FROM t",
+    ] {
+        let (name, is_agg) = only_aggregate_call(sql);
+        assert_eq!(name, "BOOL_OR", "for {sql}");
+        assert!(is_agg);
+    }
+}
+
+#[test]
+fn string_agg_carries_separator_argument() {
+    // STRING_AGG(value, separator) keeps both arguments so it re-renders exactly.
+    let LogicalPlan::Aggregate(aggregate) = parse("SELECT string_agg(s, ', ') FROM t").unwrap()
+    else {
+        panic!("expected Aggregate");
+    };
+    let Expr::FunctionCall { args, .. } = &aggregate.aggregates[0] else {
+        panic!("expected FunctionCall");
+    };
+    assert_eq!(args.len(), 2, "value and separator, got {args:?}");
+}
+
+#[test]
+fn variance_argument_column_is_over_collected() {
+    // A column referenced only inside VARIANCE must still reach the scan.
+    let LogicalPlan::Aggregate(aggregate) = parse("SELECT variance(quantity) FROM t").unwrap()
+    else {
+        panic!("expected Aggregate");
+    };
+    let LogicalPlan::Scan(scan) = aggregate.input.as_ref() else {
+        panic!("expected Scan");
+    };
+    assert!(
+        scan.columns.contains(&"quantity".to_string()),
+        "scan columns {:?} must include the variance argument",
+        scan.columns
+    );
+}
+
+/// The first aggregate expression of a single-aggregate SELECT, expected to be
+/// a FunctionCall carrying an ordered-set WITHIN GROUP key.
+fn only_ordered_set(sql: &str) -> (String, usize, bool) {
+    let LogicalPlan::Aggregate(aggregate) = parse(sql).unwrap() else {
+        panic!("expected Aggregate for {sql}");
+    };
+    let Expr::FunctionCall {
+        function_name,
+        args,
+        is_aggregate,
+        within_group_key,
+        within_group_desc,
+        ..
+    } = &aggregate.aggregates[0]
+    else {
+        panic!("expected FunctionCall, got {:?}", aggregate.aggregates[0]);
+    };
+    assert!(is_aggregate, "{sql} must be an aggregate");
+    assert!(
+        within_group_key.is_some(),
+        "{sql} must carry a WITHIN GROUP key"
+    );
+    (function_name.clone(), args.len(), *within_group_desc)
+}
+
+#[test]
+fn percentile_within_group_is_ordered_set_aggregate() {
+    // PERCENTILE_CONT/DISC carry their fraction as an argument and the ORDER BY
+    // column as the WITHIN GROUP key; DESC is recorded.
+    let (cont_name, cont_args, cont_desc) =
+        only_ordered_set("SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY price) FROM t");
+    assert_eq!(cont_name, "PERCENTILE_CONT");
+    assert_eq!(cont_args, 1);
+    assert!(!cont_desc);
+    let (disc_name, _, disc_desc) =
+        only_ordered_set("SELECT percentile_disc(0.9) WITHIN GROUP (ORDER BY price DESC) FROM t");
+    assert_eq!(disc_name, "PERCENTILE_DISC");
+    assert!(disc_desc, "DESC ordering must be recorded");
+}
+
+#[test]
+fn mode_within_group_has_no_arguments() {
+    // MODE() takes no arguments; the ORDER BY column is the WITHIN GROUP key.
+    let (name, arg_count, desc) =
+        only_ordered_set("SELECT mode() WITHIN GROUP (ORDER BY status) FROM t");
+    assert_eq!(name, "MODE");
+    assert_eq!(arg_count, 0);
+    assert!(!desc);
+}
+
+#[test]
+fn median_lowers_to_percentile_cont() {
+    // MEDIAN(price) has no canonical Postgres form; it lowers to
+    // PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price).
+    let (name, arg_count, _) = only_ordered_set("SELECT median(price) FROM t");
+    assert_eq!(name, "PERCENTILE_CONT");
+    assert_eq!(arg_count, 1, "the 0.5 fraction argument");
+}
+
+#[test]
+fn ordered_set_argument_column_is_over_collected() {
+    // The ordering column inside WITHIN GROUP must still reach the scan.
+    let LogicalPlan::Aggregate(aggregate) =
+        parse("SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY quantity) FROM t").unwrap()
+    else {
+        panic!("expected Aggregate");
+    };
+    let LogicalPlan::Scan(scan) = aggregate.input.as_ref() else {
+        panic!("expected Scan");
+    };
+    assert!(
+        scan.columns.contains(&"quantity".to_string()),
+        "scan columns {:?} must include the ordering column",
+        scan.columns
+    );
+}
+
+#[test]
+fn regexp_match_becomes_binary_op() {
+    use fq_plan::expr::BinaryOpType;
+    // `col ~ pattern` (polyglot REGEXP_LIKE) lowers to the RegexMatch binary op.
+    let pred = select_pred("SELECT a FROM t WHERE region ~ '^E[UW]$'");
+    let Expr::BinaryOp { op, .. } = pred else {
+        panic!("expected a binary op, got {pred:?}");
+    };
+    assert_eq!(op, BinaryOpType::RegexMatch);
+}
+
+#[test]
+fn timestamp_literal_carries_its_type() {
+    use fq_common::DataType;
+    // TIMESTAMP '...' is a typed literal, not a bare string.
+    let pred = select_pred("SELECT a FROM t WHERE created_at > TIMESTAMP '2024-01-01 00:00:00'");
+    let Expr::BinaryOp { right, .. } = pred else {
+        panic!("expected a binary op, got {pred:?}");
+    };
+    let Expr::Literal { data_type, .. } = right.as_ref() else {
+        panic!("expected a literal, got {right:?}");
+    };
+    assert_eq!(*data_type, DataType::Timestamp);
+}
+
+#[test]
+fn date_literal_carries_its_type() {
+    use fq_common::DataType;
+    let pred = select_pred("SELECT a FROM t WHERE created_at >= DATE '1970-01-01'");
+    let Expr::BinaryOp { right, .. } = pred else {
+        panic!("expected a binary op, got {pred:?}");
+    };
+    let Expr::Literal { data_type, .. } = right.as_ref() else {
+        panic!("expected a literal, got {right:?}");
+    };
+    assert_eq!(*data_type, DataType::Date);
 }
 
 #[test]

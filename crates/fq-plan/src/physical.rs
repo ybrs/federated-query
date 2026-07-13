@@ -532,12 +532,27 @@ fn aggregate_output_type(expr: &Expr) -> DataType {
         function_name,
         args,
         is_aggregate: true,
+        within_group_key,
         ..
     } = expr
     {
+        // PERCENTILE_DISC and MODE return a value drawn from the ordered column, so
+        // their type is that column's, not the fraction argument's.
+        if let Some(key) = within_group_key {
+            if is_value_drawing_ordered_set(function_name) {
+                return key.get_type();
+            }
+        }
         return infer_aggregate_type(function_name, args);
     }
     expr.get_type()
+}
+
+/// Whether an ordered-set aggregate returns one of the ordered input values
+/// (PERCENTILE_DISC, MODE) rather than an interpolated/derived value.
+fn is_value_drawing_ordered_set(function_name: &str) -> bool {
+    let name = function_name.to_uppercase();
+    name == "PERCENTILE_DISC" || name == "MODE"
 }
 
 /// The result type of an aggregate function from its name and first argument.
@@ -552,7 +567,9 @@ fn infer_aggregate_type(function_name: &str, args: &[Expr]) -> DataType {
     }
     let arg_type = args.first().map_or(DataType::Null, Expr::get_type);
     match name.as_str() {
-        "AVG" => DataType::Double,
+        "AVG" | "VARIANCE" | "VAR_POP" | "VAR_SAMP" | "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP"
+        | "PERCENTILE_CONT" => DataType::Double,
+        "BOOL_AND" | "BOOL_OR" => DataType::Boolean,
         "SUM" if matches!(arg_type, DataType::Integer | DataType::BigInt) => DataType::BigInt,
         // MIN / MAX / SUM-of-float-or-decimal / any other aggregate: keep the
         // argument type - the safest declaration.

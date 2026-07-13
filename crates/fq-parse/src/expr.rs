@@ -57,12 +57,17 @@ impl Converter<'_> {
             Expression::Between(between) => self.convert_between(between),
             Expression::Like(like) => self.convert_like(like, BinaryOpType::Like),
             Expression::ILike(like) => self.convert_like(like, BinaryOpType::Ilike),
+            Expression::RegexpLike(regexp) => self.convert_regexp(regexp),
             Expression::In(in_expr) => self.convert_in(in_expr),
             Expression::Exists(exists) => self.convert_exists(exists),
             Expression::Subquery(subquery) => self.convert_scalar_subquery(subquery),
             Expression::Any(quantified) => self.convert_quantified(Quantifier::Any, quantified),
             Expression::All(quantified) => self.convert_quantified(Quantifier::All, quantified),
             Expression::WindowFunction(window) => self.convert_window(window),
+            Expression::WithinGroup(within) => self.convert_within_group(within),
+            // MEDIAN has no canonical Postgres form; it lowers to an ordered-set
+            // PERCENTILE_CONT(0.5) over the argument column.
+            Expression::Median(agg) => self.convert_median(agg),
             // A set operation is a query, not a scalar value. It reaches the
             // expression path only when the parser attaches a trailing
             // UNION/INTERSECT/EXCEPT to a scalar subquery operand; naming the
@@ -87,6 +92,17 @@ impl Converter<'_> {
             Expression::Min(agg) => self.convert_aggregate("MIN", agg),
             Expression::Max(agg) => self.convert_aggregate("MAX", agg),
             Expression::StddevSamp(agg) => self.convert_aggregate("STDDEV_SAMP", agg),
+            Expression::StddevPop(agg) => self.convert_aggregate("STDDEV_POP", agg),
+            Expression::Stddev(agg) => self.convert_aggregate("STDDEV", agg),
+            Expression::Variance(agg) => self.convert_aggregate("VARIANCE", agg),
+            Expression::VarPop(agg) => self.convert_aggregate("VAR_POP", agg),
+            Expression::VarSamp(agg) => self.convert_aggregate("VAR_SAMP", agg),
+            Expression::ArrayAgg(agg) => self.convert_aggregate("ARRAY_AGG", agg),
+            // LOGICAL_AND/LOGICAL_OR are polyglot's canonical names; BOOL_AND/BOOL_OR
+            // are the Postgres form the canonical emitter renders.
+            Expression::LogicalAnd(agg) => self.convert_aggregate("BOOL_AND", agg),
+            Expression::LogicalOr(agg) => self.convert_aggregate("BOOL_OR", agg),
+            Expression::StringAgg(agg) => self.convert_string_agg(agg),
             Expression::Anonymous(anon) => self.convert_anonymous(anon),
             other => self.scalar_function(other),
         }
@@ -110,6 +126,26 @@ impl Converter<'_> {
         Ok(Expr::UnaryOp {
             op,
             operand: Box::new(self.expr(operand)?),
+        })
+    }
+
+    /// Convert a regexp match (`col ~ pattern`, polyglot's REGEXP_LIKE) to the
+    /// `RegexMatch` binary op. Case-insensitive/other flags are not modeled and
+    /// raise rather than being silently dropped.
+    fn convert_regexp(
+        &self,
+        regexp: &polyglot_sql::expressions::RegexpFunc,
+    ) -> Result<Expr, ParseError> {
+        if regexp.flags.is_some() {
+            return Err(ParseError::Unsupported("REGEXP with flags".to_string()));
+        }
+        // Fresh regexp-match binary op built from the parsed subject + pattern - no
+        // base to copy from. Field list (op/left/right) is the complete BinaryOp
+        // variant.
+        Ok(Expr::BinaryOp {
+            op: BinaryOpType::RegexMatch,
+            left: Box::new(self.expr(&regexp.this)?),
+            right: Box::new(self.expr(&regexp.pattern)?),
         })
     }
 
@@ -386,6 +422,110 @@ impl Converter<'_> {
         })
     }
 
+    /// Convert STRING_AGG(value, separator). The separator is a plain argument in
+    /// the canonical form. An in-aggregate ORDER BY, FILTER, or LIMIT changes the
+    /// concatenation and is not modeled, so it raises rather than being dropped.
+    fn convert_string_agg(
+        &self,
+        agg: &polyglot_sql::expressions::StringAggFunc,
+    ) -> Result<Expr, ParseError> {
+        if agg.order_by.as_ref().is_some_and(|order| !order.is_empty()) {
+            return Err(ParseError::Unsupported(
+                "ORDER BY inside STRING_AGG".to_string(),
+            ));
+        }
+        if agg.filter.is_some() || agg.limit.is_some() {
+            return Err(ParseError::Unsupported(
+                "FILTER/LIMIT inside STRING_AGG".to_string(),
+            ));
+        }
+        let mut args = vec![self.expr(&agg.this)?];
+        if let Some(separator) = &agg.separator {
+            args.push(self.expr(separator)?);
+        }
+        // Fresh STRING_AGG call built from value + separator - no base to copy from.
+        // Field list (function_name/args/is_aggregate/distinct/within_group_key/
+        // within_group_desc) is the complete FunctionCall variant.
+        Ok(Expr::FunctionCall {
+            function_name: "STRING_AGG".to_string(),
+            args,
+            is_aggregate: true,
+            distinct: agg.distinct,
+            within_group_key: None,
+            within_group_desc: false,
+        })
+    }
+
+    /// Convert an ordered-set aggregate `<agg> WITHIN GROUP (ORDER BY key)`
+    /// (PERCENTILE_CONT/PERCENTILE_DISC/MODE). Exactly one ordering key is
+    /// modeled; a multi-key WITHIN GROUP raises rather than dropping keys.
+    fn convert_within_group(
+        &self,
+        within: &polyglot_sql::expressions::WithinGroup,
+    ) -> Result<Expr, ParseError> {
+        let [ordered] = within.order_by.as_slice() else {
+            return Err(ParseError::Unsupported(
+                "WITHIN GROUP with other than one ordering key".to_string(),
+            ));
+        };
+        let (name, args, distinct) = self.within_group_inner(&within.this)?;
+        let key = Box::new(self.expr(&ordered.this)?);
+        // Fresh ordered-set aggregate call - no base to copy from. Field list
+        // (function_name/args/is_aggregate/distinct/within_group_key/
+        // within_group_desc) is the complete FunctionCall variant.
+        Ok(Expr::FunctionCall {
+            function_name: name,
+            args,
+            is_aggregate: true,
+            distinct,
+            within_group_key: Some(key),
+            within_group_desc: ordered.desc,
+        })
+    }
+
+    /// The (name, converted args, distinct) of the aggregate inside a WITHIN
+    /// GROUP. PERCENTILE_CONT/DISC arrive as a generic AggregateFunction; MODE()
+    /// arrives as the dedicated Mode node with no arguments. Anything else raises.
+    fn within_group_inner(
+        &self,
+        inner: &Expression,
+    ) -> Result<(String, Vec<Expr>, bool), ParseError> {
+        match inner {
+            Expression::AggregateFunction(func) => {
+                let mut args = Vec::with_capacity(func.args.len());
+                for arg in &func.args {
+                    args.push(self.expr(arg)?);
+                }
+                Ok((func.name.to_uppercase(), args, func.distinct))
+            }
+            Expression::Mode(agg) => Ok(("MODE".to_string(), Vec::new(), agg.distinct)),
+            other => Err(ParseError::Unsupported(format!(
+                "ordered-set aggregate `{}`",
+                other.variant_name()
+            ))),
+        }
+    }
+
+    /// Lower MEDIAN(x) to PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x): MEDIAN
+    /// has no canonical Postgres form, PERCENTILE_CONT does.
+    fn convert_median(&self, agg: &AggFunc) -> Result<Expr, ParseError> {
+        let key = Box::new(self.expr(&agg.this)?);
+        // Fresh PERCENTILE_CONT call standing in for MEDIAN - no base to copy from.
+        // Field list (function_name/args/is_aggregate/distinct/within_group_key/
+        // within_group_desc) is the complete FunctionCall variant.
+        Ok(Expr::FunctionCall {
+            function_name: "PERCENTILE_CONT".to_string(),
+            args: vec![Expr::Literal {
+                value: LiteralValue::Float(0.5),
+                data_type: fq_common::DataType::Double,
+            }],
+            is_aggregate: true,
+            distinct: agg.distinct,
+            within_group_key: Some(key),
+            within_group_desc: false,
+        })
+    }
+
     /// Convert an anonymous (unknown-name) scalar function call. Typed scalar
     /// function variants (UPPER, SUBSTRING, ...) are handled in `functions.rs`.
     fn convert_anonymous(&self, anon: &Anonymous) -> Result<Expr, ParseError> {
@@ -621,6 +761,20 @@ fn convert_literal(literal: &Literal) -> Result<Expr, ParseError> {
         Literal::String(text) => Ok(Expr::Literal {
             value: LiteralValue::String(text.clone()),
             data_type: fq_common::DataType::Varchar,
+        }),
+        // Fresh DATE literal carrying its type so the emitter re-renders the
+        // `DATE '...'` form rather than a bare string - no base to copy from. Field
+        // list (value/data_type) is the complete Literal variant.
+        Literal::Date(text) => Ok(Expr::Literal {
+            value: LiteralValue::String(text.clone()),
+            data_type: fq_common::DataType::Date,
+        }),
+        // Fresh TIMESTAMP literal (DATETIME is the same value shape) carrying its
+        // type so the emitter re-renders `TIMESTAMP '...'` - no base to copy from.
+        // Field list (value/data_type) is the complete Literal variant.
+        Literal::Timestamp(text) | Literal::Datetime(text) => Ok(Expr::Literal {
+            value: LiteralValue::String(text.clone()),
+            data_type: fq_common::DataType::Timestamp,
         }),
         other => Err(ParseError::Unsupported(format!("literal {other:?}"))),
     }

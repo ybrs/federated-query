@@ -314,14 +314,13 @@ fn narrow_union(union: Union, required: &HashSet<String>) -> Result<LogicalPlan,
             }
         }
     }
+    let mut union = union;
     let mut new_branches = Vec::with_capacity(union.inputs.len());
     for branch in union.inputs {
         new_branches.push(narrow_branch(branch, &keep, &augmented)?);
     }
-    Ok(LogicalPlan::Union(Union {
-        inputs: new_branches,
-        distinct: union.distinct,
-    }))
+    union.inputs = new_branches;
+    Ok(LogicalPlan::Union(union))
 }
 
 /// Rebuild one union branch with its pinning projection narrowed to the kept

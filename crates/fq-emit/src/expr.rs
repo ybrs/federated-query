@@ -108,7 +108,7 @@ fn render_literal(value: &LiteralValue, data_type: DataType) -> Result<String, E
             return Err(EmitError::UnrepresentableLiteral(f.to_string()));
         }
         LiteralValue::Float(f) => f.to_string(),
-        LiteralValue::String(s) => format!("'{}'", s.replace('\'', "''")),
+        LiteralValue::String(s) => render_string_literal(s, data_type),
     })
 }
 
@@ -148,8 +148,10 @@ fn render_function(
     // A zero-argument AGGREGATE is the star form: `COUNT(*)`. Rendering the
     // bare parens (`COUNT()`) is invalid Postgres ("count(*) must be used to
     // call a parameterless aggregate function"); DuckDB merely tolerates it.
-    // A zero-argument SCALAR call (`now()`) keeps its empty parens.
-    let rendered = if is_aggregate && args.is_empty() {
+    // A zero-argument SCALAR call (`now()`) keeps its empty parens. An ordered-set
+    // aggregate (`MODE() WITHIN GROUP (...)`) is parameterless by definition and
+    // takes empty parens, never the star form.
+    let rendered = if is_aggregate && args.is_empty() && within_group_key.is_none() {
         "*".to_string()
     } else {
         render_all(args, resolver)?.join(", ")
@@ -169,6 +171,18 @@ fn render_function(
         );
     }
     Ok(call)
+}
+
+/// Render a string-valued literal. A temporal type keeps its keyword prefix
+/// (`DATE '...'`, `TIMESTAMP '...'`) so the value is compared as a date/timestamp
+/// rather than a bare string; every other type renders as a quoted string.
+fn render_string_literal(text: &str, data_type: DataType) -> String {
+    let quoted = format!("'{}'", text.replace('\'', "''"));
+    match data_type {
+        DataType::Date => format!("DATE {quoted}"),
+        DataType::Timestamp => format!("TIMESTAMP {quoted}"),
+        _ => quoted,
+    }
 }
 
 /// Render a CASE as WHEN/THEN branches plus an optional ELSE.
@@ -312,6 +326,39 @@ mod tests {
             name,
             Some(DataType::Integer),
         ))
+    }
+
+    #[test]
+    fn temporal_literals_keep_their_type_keyword() {
+        let timestamp = Expr::Literal {
+            value: LiteralValue::String("2024-01-01 00:00:00".to_string()),
+            data_type: DataType::Timestamp,
+        };
+        assert_eq!(render(&timestamp), "TIMESTAMP '2024-01-01 00:00:00'");
+        let date = Expr::Literal {
+            value: LiteralValue::String("1970-01-01".to_string()),
+            data_type: DataType::Date,
+        };
+        assert_eq!(render(&date), "DATE '1970-01-01'");
+        // A plain string keeps bare quotes.
+        let text = Expr::Literal {
+            value: LiteralValue::String("hello".to_string()),
+            data_type: DataType::Varchar,
+        };
+        assert_eq!(render(&text), "'hello'");
+    }
+
+    #[test]
+    fn regexp_match_renders_tilde() {
+        let regexp = Expr::BinaryOp {
+            op: BinaryOpType::RegexMatch,
+            left: Box::new(col("t", "region")),
+            right: Box::new(Expr::Literal {
+                value: LiteralValue::String("^E[UW]$".to_string()),
+                data_type: DataType::Varchar,
+            }),
+        };
+        assert_eq!(render(&regexp), "(\"t\".\"region\" ~ '^E[UW]$')");
     }
 
     fn int(value: i64) -> Expr {
