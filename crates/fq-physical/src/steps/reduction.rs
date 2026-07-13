@@ -664,6 +664,22 @@ pub(super) fn injection_winners(plan: &PhysicalPlan) -> HashMap<NodeId, Vec<Cand
     winners
 }
 
+/// Per traced base, the inject column of the WINNING candidate (fewest keys).
+/// The EXPLAIN-facing projection of `injection_winners`: base node address ->
+/// the column execution will constrain with `IN (build keys)`.
+pub(super) fn winning_injections(plan: &PhysicalPlan) -> HashMap<NodeId, String> {
+    let mut columns = HashMap::new();
+    for (base, candidates) in injection_winners(plan) {
+        let Some(winner) = candidates.first() else {
+            continue;
+        };
+        if let Some(column) = winner.columns.get(&base) {
+            columns.insert(base, column.clone());
+        }
+    }
+    columns
+}
+
 /// Yield every node of a physical plan tree (pre-order). Ports `_walk_plan_nodes`.
 fn walk_plan_nodes<'p>(node: &'p PhysicalPlan, out: &mut Vec<&'p PhysicalPlan>) {
     out.push(node);

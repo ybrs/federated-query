@@ -8,6 +8,9 @@
 //! tree WITHOUT executing it. The output is honest - a real plan, no fabricated
 //! result rows - and clearly labeled as a structural (uncosted) description.
 
+use std::collections::HashMap;
+
+use fq_physical::steps::planned_injections;
 use fq_physical::{render_remote_set_op, render_scan_sql, StepError};
 use fq_plan::physical::PhysicalPlan;
 
@@ -37,7 +40,11 @@ pub fn strip_explain(sql: &str) -> Option<&str> {
 /// silently mislabeling the row.
 pub fn describe(plan: &PhysicalPlan) -> Result<Vec<String>, StepError> {
     let mut lines = Vec::new();
-    describe_into(plan, 0, &mut lines)?;
+    // The SAME winners pre-pass the step emitter runs: scans it will reduce get
+    // a `+inject(<column>)` tag, so the semi-join reduction is visible in the
+    // plan dump without executing anything.
+    let injections = planned_injections(plan);
+    describe_into(plan, 0, &injections, &mut lines)?;
     Ok(lines)
 }
 
@@ -45,10 +52,15 @@ pub fn describe(plan: &PhysicalPlan) -> Result<Vec<String>, StepError> {
 fn describe_into(
     plan: &PhysicalPlan,
     depth: usize,
+    injections: &HashMap<*const PhysicalPlan, String>,
     lines: &mut Vec<String>,
 ) -> Result<(), StepError> {
     let indent = "  ".repeat(depth);
-    lines.push(format!("{indent}{}", node_label(plan)?));
+    let mut label = node_label(plan)?;
+    if let Some(column) = injections.get(&std::ptr::from_ref(plan)) {
+        label = tag_injected(&label, column);
+    }
+    lines.push(format!("{indent}{label}"));
     // A same-source set operation renders its whole (possibly nested) combined SQL
     // in ONE round trip; its branch children are folded into that SQL and never
     // executed as separate reads, so the EXPLAIN treats it as a leaf.
@@ -56,9 +68,19 @@ fn describe_into(
         return Ok(());
     }
     for child in plan.children() {
-        describe_into(child, depth + 1, lines)?;
+        describe_into(child, depth + 1, injections, lines)?;
     }
     Ok(())
+}
+
+/// Insert a `+inject(<column>)` tag into a node label. The tag sits BEFORE the
+/// ` :: ` SQL separator so consumers that re-parse the rendered SQL after `::`
+/// never see the tag inside the SQL text.
+fn tag_injected(label: &str, column: &str) -> String {
+    match label.split_once(" :: ") {
+        Some((head, sql)) => format!("{head} +inject({column}) :: {sql}"),
+        None => format!("{label} +inject({column})"),
+    }
 }
 
 /// Collapse rendered SQL to a single line (newlines/tabs -> spaces, runs
@@ -115,7 +137,9 @@ fn node_label(plan: &PhysicalPlan) -> Result<String, StepError> {
         PhysicalPlan::Projection(_) => "Projection".to_string(),
         PhysicalPlan::Window(_) => "Window".to_string(),
         PhysicalPlan::Filter(_) => "Filter".to_string(),
-        PhysicalPlan::HashJoin(_) => "HashJoin".to_string(),
+        // The join type is part of the label: a SEMI/ANTI vs INNER distinction
+        // is plan shape, and tests pin it through the plan dump.
+        PhysicalPlan::HashJoin(node) => format!("HashJoin [{}]", node.join_type.value()),
         PhysicalPlan::RemoteJoin(_) => "RemoteJoin".to_string(),
         PhysicalPlan::NestedLoopJoin(_) => "NestedLoopJoin".to_string(),
         PhysicalPlan::HashAggregate(_) => "HashAggregate".to_string(),

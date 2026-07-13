@@ -158,8 +158,23 @@ impl<'a> Binder<'a> {
 
     /// Bind a Sort: bind each ORDER BY key against the input scope, also resolving
     /// output aliases and positional ordinals (`ORDER BY <alias>` / `ORDER BY n`).
+    /// A Sort directly over a set operation resolves ONLY against the combined
+    /// result's output columns (SQL scoping: the branch relations are not
+    /// visible, and resolving through them would be ambiguous).
     fn bind_sort(&mut self, mut sort: Sort) -> Result<LogicalPlan, BindError> {
         let input = self.bind(*sort.input)?;
+        if matches!(input, LogicalPlan::SetOperation(_)) {
+            let columns = self.plan_output_columns(&input)?;
+            let mut sort_keys = Vec::with_capacity(sort.sort_keys.len());
+            for key in &sort.sort_keys {
+                sort_keys.push(set_op_sort_key(key, &columns)?);
+            }
+            // In-place on the owned node: only input and sort_keys are rebound;
+            // `ascending` and `nulls_order` are preserved untouched.
+            sort.input = Box::new(input);
+            sort.sort_keys = sort_keys;
+            return Ok(LogicalPlan::Sort(sort));
+        }
         let output_names = output_name_list(&input);
         let overlay = aggregate_overlay(&input).or_else(|| projection_overlay(&input));
         let sort_keys = self.with_output_aliases(overlay, |binder| {
@@ -620,9 +635,12 @@ impl<'a> Binder<'a> {
                     table: qualifier.to_string(),
                 });
             };
+            // The reference normalizes to the CATALOG's column case (matching is
+            // case-insensitive): downstream planes address physical columns by
+            // exact name, so a user-cased spelling must not survive binding.
             return Ok(Expr::Column(fq_plan::ColumnRef::new(
                 Some(alias.clone()),
-                column,
+                found.name.clone(),
                 Some(found.data_type),
             )));
         }
@@ -664,9 +682,12 @@ fn match_in_scope(scope: &Scope, column: &str) -> Result<Option<Expr>, BindError
             if found.is_some() {
                 return Err(BindError::AmbiguousColumn(column.to_string()));
             }
+            // The reference normalizes to the CATALOG's column case (matching is
+            // case-insensitive): downstream planes address physical columns by
+            // exact name, so a user-cased spelling must not survive binding.
             found = Some(Expr::Column(fq_plan::ColumnRef::new(
                 Some(alias.clone()),
-                column,
+                catalog_column.name.clone(),
                 Some(catalog_column.data_type),
             )));
         }
@@ -675,15 +696,16 @@ fn match_in_scope(scope: &Scope, column: &str) -> Result<Option<Expr>, BindError
 }
 
 /// Resolve a scan's read-set to real column names, expanding a star or an
-/// attributes-nothing read-set to every column the table exposes.
+/// attributes-nothing read-set to every column the table exposes. Kept names
+/// normalize to the CATALOG's case (matching is case-insensitive), never the
+/// user's spelling - downstream planes address physical columns by exact name.
 fn scan_read_columns(columns: &[String], table: &Table) -> Vec<String> {
     if columns.iter().any(|name| name == "*") {
         return all_column_names(table);
     }
     let kept: Vec<String> = columns
         .iter()
-        .filter(|name| table.get_column(name).is_some())
-        .cloned()
+        .filter_map(|name| table.get_column(name).map(|column| column.name.clone()))
         .collect();
     if kept.is_empty() {
         return all_column_names(table);
@@ -962,6 +984,42 @@ fn positional_index(key: &Expr, count: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// Bind one ORDER BY key of a Sort over a set operation: an ordinal names the
+/// n-th output column, a bare name matches an output column case-insensitively.
+/// Anything else (a qualified reference, an expression) raises - the branch
+/// relations are out of scope after a UNION/INTERSECT/EXCEPT.
+fn set_op_sort_key(key: &Expr, columns: &[Column]) -> Result<Expr, BindError> {
+    if let Some(index) = positional_index(key, columns.len()) {
+        let column = &columns[index];
+        return Ok(Expr::Column(fq_plan::ColumnRef::new(
+            None,
+            column.name.clone(),
+            Some(column.data_type),
+        )));
+    }
+    let Expr::Column(reference) = key else {
+        return Err(BindError::Unsupported(
+            "ORDER BY after a set operation must name an output column or ordinal".to_string(),
+        ));
+    };
+    if reference.table.is_some() {
+        return Err(BindError::Unsupported(
+            "ORDER BY after a set operation cannot use a qualified column".to_string(),
+        ));
+    }
+    let found = columns
+        .iter()
+        .find(|column| column.name.eq_ignore_ascii_case(&reference.column));
+    match found {
+        Some(column) => Ok(Expr::Column(fq_plan::ColumnRef::new(
+            None,
+            column.name.clone(),
+            Some(column.data_type),
+        ))),
+        None => Err(BindError::ColumnNotInScope(reference.column.clone())),
+    }
 }
 
 /// Pair output names with their expressions' inferred types as Column metadata.

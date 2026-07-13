@@ -22,7 +22,9 @@ use fq_plan::{
     Aggregate, ColumnRef, Cte, CteRef, Expr, Filter, Join, JoinType, LateralJoin, Limit,
     LogicalPlan, Projection, Scan, SetOpKind, SetOperation, Sort, SubqueryScan, Values,
 };
-use polyglot_sql::expressions::{Expression, JoinKind, Ordered, Select, TableRef, With};
+use polyglot_sql::expressions::{
+    Expression, JoinKind, Literal, Ordered, Sample, SampleMethod, Select, TableRef, With,
+};
 use polyglot_sql::traversal::ExpressionWalk;
 
 use crate::error::ParseError;
@@ -50,6 +52,17 @@ struct FromTable {
     columns: ColumnSource,
 }
 
+/// The clauses a parsed set-operation node carries for its ENTIRE combined
+/// result (`SELECT .. UNION SELECT .. ORDER BY x LIMIT n`): polyglot attaches
+/// them to the Union/Intersect/Except node, not to either operand.
+#[derive(Clone, Copy)]
+struct SetOpModifiers<'e> {
+    with: Option<&'e With>,
+    order_by: Option<&'e polyglot_sql::expressions::OrderBy>,
+    limit: Option<&'e Expression>,
+    offset: Option<&'e Expression>,
+}
+
 /// The recursive AST -> logical-plan converter.
 pub struct Converter<'a> {
     catalog: &'a Catalog,
@@ -73,18 +86,42 @@ impl<'a> Converter<'a> {
     pub(crate) fn query(&self, expr: &Expression) -> Result<LogicalPlan, ParseError> {
         match expr {
             Expression::Select(select) => self.select(select),
-            Expression::Union(union) => {
-                self.set_operation(&union.left, &union.right, SetOpKind::Union, !union.all)
-            }
+            Expression::Union(union) => self.set_operation(
+                &union.left,
+                &union.right,
+                SetOpKind::Union,
+                !union.all,
+                SetOpModifiers {
+                    with: union.with.as_ref(),
+                    order_by: union.order_by.as_ref(),
+                    limit: union.limit.as_deref(),
+                    offset: union.offset.as_deref(),
+                },
+            ),
             Expression::Intersect(intersect) => self.set_operation(
                 &intersect.left,
                 &intersect.right,
                 SetOpKind::Intersect,
                 !intersect.all,
+                SetOpModifiers {
+                    with: intersect.with.as_ref(),
+                    order_by: intersect.order_by.as_ref(),
+                    limit: intersect.limit.as_deref(),
+                    offset: intersect.offset.as_deref(),
+                },
             ),
-            Expression::Except(except) => {
-                self.set_operation(&except.left, &except.right, SetOpKind::Except, !except.all)
-            }
+            Expression::Except(except) => self.set_operation(
+                &except.left,
+                &except.right,
+                SetOpKind::Except,
+                !except.all,
+                SetOpModifiers {
+                    with: except.with.as_ref(),
+                    order_by: except.order_by.as_ref(),
+                    limit: except.limit.as_deref(),
+                    offset: except.offset.as_deref(),
+                },
+            ),
             Expression::Subquery(subquery) => self.query(&subquery.this),
             Expression::Values(values) => self.values(values),
             other => Err(ParseError::Unsupported(format!(
@@ -95,23 +132,33 @@ impl<'a> Converter<'a> {
     }
 
     /// Convert a binary set operation. `distinct` is the bare form; ALL preserves
-    /// multiplicity.
+    /// multiplicity. The node's own ORDER BY / LIMIT / OFFSET apply to the entire
+    /// combined result and wrap the `SetOperation` in `Sort` / `Limit` nodes; a
+    /// WITH bound to the set operation itself is not supported and raises.
     fn set_operation(
         &self,
         left: &Expression,
         right: &Expression,
         kind: SetOpKind,
         distinct: bool,
+        modifiers: SetOpModifiers<'_>,
     ) -> Result<LogicalPlan, ParseError> {
+        if modifiers.with.is_some() {
+            return Err(ParseError::Unsupported(
+                "WITH bound to a set operation".to_string(),
+            ));
+        }
         // Fresh set-operation node built from the parsed UNION/INTERSECT/EXCEPT - no
         // base to copy from. Field list (left/right/kind/distinct) is the complete
         // SetOperation struct.
-        Ok(LogicalPlan::SetOperation(SetOperation {
+        let combined = LogicalPlan::SetOperation(SetOperation {
             left: Box::new(self.query(left)?),
             right: Box::new(self.query(right)?),
             kind,
             distinct,
-        }))
+        });
+        let sorted = self.apply_order_keys(combined, modifiers.order_by)?;
+        set_op_limit(sorted, modifiers.limit, modifiers.offset)
     }
 
     /// Convert a VALUES clause into a `Values` node of constant rows.
@@ -154,14 +201,63 @@ impl<'a> Converter<'a> {
     }
 
     /// The SELECT clause pipeline (FROM -> WHERE -> projection -> ORDER -> LIMIT),
-    /// with any WITH already bound into scope.
+    /// with any WITH already bound into scope. A FROM-less SELECT is a single
+    /// constant row (a one-row `Values`).
     fn select_body(&self, select: &Select) -> Result<LogicalPlan, ParseError> {
+        if select.from.is_none() {
+            return self.values_select(select);
+        }
         let (from, from_tables) = self.build_from(select)?;
         let filtered = self.apply_where(from, select)?;
         let projected = self.apply_projection(filtered, select, &from_tables)?;
         let qualified = self.apply_qualify(projected, select)?;
         let sorted = self.apply_order_by(qualified, select)?;
         apply_limit(sorted, select)
+    }
+
+    /// A FROM-less SELECT (`SELECT 1 AS n`) is a single constant row, modelled as
+    /// a one-row `Values` relation over the converted projection expressions.
+    /// Clauses that require an input relation (WHERE / GROUP BY / HAVING / ORDER
+    /// BY / LIMIT / OFFSET / DISTINCT / QUALIFY / a star) have nothing to act on
+    /// and raise rather than being silently dropped.
+    fn values_select(&self, select: &Select) -> Result<LogicalPlan, ParseError> {
+        let has_limit = select.limit.is_some() || select.offset.is_some() || select.fetch.is_some();
+        let unsupported = [
+            (select.where_clause.is_some(), "WHERE"),
+            (select.group_by.is_some(), "GROUP BY"),
+            (select.having.is_some(), "HAVING"),
+            (select.order_by.is_some(), "ORDER BY"),
+            (has_limit, "LIMIT/OFFSET"),
+            (select.distinct || select.distinct_on.is_some(), "DISTINCT"),
+            (!select.joins.is_empty(), "JOIN"),
+            (select.qualify.is_some(), "QUALIFY"),
+        ];
+        for (present, name) in unsupported {
+            if present {
+                return Err(ParseError::Unsupported(format!(
+                    "FROM-less SELECT with {name}"
+                )));
+            }
+        }
+        let mut row = Vec::with_capacity(select.expressions.len());
+        let mut names = Vec::with_capacity(select.expressions.len());
+        for item in &select.expressions {
+            if matches!(item, Expression::Star(_)) {
+                return Err(ParseError::Unsupported(
+                    "FROM-less SELECT with a star projection".to_string(),
+                ));
+            }
+            for (expr, name) in self.select_item(item, &[])? {
+                row.push(expr);
+                names.push(name);
+            }
+        }
+        // Fresh VALUES node holding the one constant row - no base to copy from.
+        // Field list (rows/output_names) is the complete Values struct.
+        Ok(LogicalPlan::Values(Values {
+            rows: vec![row],
+            output_names: names,
+        }))
     }
 
     /// Bind a WITH's CTEs into scope, build the body, and wrap it in nested `Cte`
@@ -271,7 +367,7 @@ impl<'a> Converter<'a> {
         tables: &mut Vec<FromTable>,
     ) -> Result<LogicalPlan, ParseError> {
         match item {
-            Expression::Table(table) => Ok(self.table_or_cte_ref(select, table, tables)),
+            Expression::Table(table) => self.table_or_cte_ref(select, table, tables),
             Expression::Subquery(subquery) => self.derived_table(subquery, tables),
             other => Err(ParseError::Unsupported(format!(
                 "FROM/JOIN {}",
@@ -287,11 +383,16 @@ impl<'a> Converter<'a> {
         select: &Select,
         table: &TableRef,
         tables: &mut Vec<FromTable>,
-    ) -> LogicalPlan {
+    ) -> Result<LogicalPlan, ParseError> {
         let key = table_key(table);
         let unqualified = table.catalog.is_none() && table.schema.is_none();
         if unqualified {
             if let Some(columns) = self.ctes.borrow().get(&table.name.name).cloned() {
+                if table.table_sample.is_some() {
+                    return Err(ParseError::Unsupported(
+                        "TABLESAMPLE on a CTE reference".to_string(),
+                    ));
+                }
                 tables.push(FromTable {
                     key: key.clone(),
                     columns: ColumnSource::Explicit(columns.clone()),
@@ -299,12 +400,12 @@ impl<'a> Converter<'a> {
                 // Fresh CteRef built from the parsed table reference to an in-scope
                 // CTE - no base to copy from. Field list (name/alias/columns/
                 // output_names) is the complete CteRef struct.
-                return LogicalPlan::CteRef(CteRef {
+                return Ok(LogicalPlan::CteRef(CteRef {
                     name: table.name.name.clone(),
                     alias: table.alias.as_ref().map(|ident| ident.name.clone()),
                     columns: Some(columns_for_table(select, &key)),
                     output_names: Some(columns),
-                });
+                }));
             }
         }
         tables.push(FromTable {
@@ -315,7 +416,9 @@ impl<'a> Converter<'a> {
                 table: table.name.name.clone(),
             },
         });
-        LogicalPlan::Scan(Box::new(self.scan_from_table(select, table, &key)))
+        Ok(LogicalPlan::Scan(Box::new(
+            self.scan_from_table(select, table, &key)?,
+        )))
     }
 
     /// A derived table `(SELECT ...) AS alias`: convert the inner query and wrap
@@ -448,8 +551,8 @@ impl<'a> Converter<'a> {
     ) -> Result<LogicalPlan, ParseError> {
         let mut expressions = Vec::new();
         let mut names = Vec::new();
-        for (index, item) in select.expressions.iter().enumerate() {
-            for (expr, name) in self.select_item(item, index, from_tables)? {
+        for item in &select.expressions {
+            for (expr, name) in self.select_item(item, from_tables)? {
                 expressions.push(expr);
                 names.push(name);
             }
@@ -634,11 +737,11 @@ impl<'a> Converter<'a> {
 
     /// One SELECT-list item expanded to `(expression, output_name)` pairs. A star
     /// expands from the catalog; an alias names the output; a bare column takes
-    /// its own name; anything else gets a positional name.
+    /// its own name; anything else takes the SQL text of the expression as its
+    /// visible name (an unaliased `COUNT(*)` presents as `COUNT(*)`).
     fn select_item(
         &self,
         item: &Expression,
-        index: usize,
         from_tables: &[FromTable],
     ) -> Result<Vec<(Expr, String)>, ParseError> {
         match item {
@@ -647,7 +750,7 @@ impl<'a> Converter<'a> {
                 Ok(vec![(self.expr(&alias.this)?, alias.alias.name.clone())])
             }
             Expression::Column(column) => Ok(vec![(self.expr(item)?, column.name.name.clone())]),
-            other => Ok(vec![(self.expr(other)?, format!("col_{index}"))]),
+            other => Ok(vec![(self.expr(other)?, output_name_for(other)?)]),
         }
     }
 
@@ -760,13 +863,24 @@ impl<'a> Converter<'a> {
         ))
     }
 
-    /// Wrap the input in a `Sort` for the ORDER BY clause, if present.
+    /// Wrap the input in a `Sort` for the SELECT's ORDER BY clause, if present.
     fn apply_order_by(
         &self,
         input: LogicalPlan,
         select: &Select,
     ) -> Result<LogicalPlan, ParseError> {
-        let Some(order_by) = &select.order_by else {
+        self.apply_order_keys(input, select.order_by.as_ref())
+    }
+
+    /// Wrap the input in a `Sort` for the given ORDER BY keys, if any. Shared by
+    /// the SELECT pipeline and set-operation modifiers (an ORDER BY after a
+    /// UNION/INTERSECT/EXCEPT sorts the entire combined result).
+    fn apply_order_keys(
+        &self,
+        input: LogicalPlan,
+        order_by: Option<&polyglot_sql::expressions::OrderBy>,
+    ) -> Result<LogicalPlan, ParseError> {
+        let Some(order_by) = order_by else {
             return Ok(input);
         };
         let mut sort_keys = Vec::with_capacity(order_by.expressions.len());
@@ -809,6 +923,28 @@ fn apply_limit(input: LogicalPlan, select: &Select) -> Result<LogicalPlan, Parse
         input: Box::new(input),
         limit,
         offset,
+    }))
+}
+
+/// Wrap the input in a `Limit` for a set operation's trailing LIMIT/OFFSET, if
+/// present. The counts are bare literal expressions on the set-operation node
+/// (unlike a SELECT's clause objects), so this converts them directly.
+fn set_op_limit(
+    input: LogicalPlan,
+    limit: Option<&Expression>,
+    offset: Option<&Expression>,
+) -> Result<LogicalPlan, ParseError> {
+    let limit_count = limit.map(limit_value).transpose()?;
+    let offset_count = offset.map(limit_value).transpose()?.unwrap_or(0);
+    if limit_count.is_none() && offset_count == 0 {
+        return Ok(input);
+    }
+    // Fresh limit wrapping the combined set-operation result - no base to copy
+    // from. Field list (input/limit/offset) is the complete Limit struct.
+    Ok(LogicalPlan::Limit(Limit {
+        input: Box::new(input),
+        limit: limit_count,
+        offset: offset_count,
     }))
 }
 
@@ -970,7 +1106,12 @@ impl Converter<'_> {
     /// a merge-engine aggregate/projection could omit it (the q18/q22 class). Falls
     /// back to reference analysis when the table is not in the catalog (a
     /// catalog-free parse).
-    fn scan_from_table(&self, select: &Select, table: &TableRef, key: &str) -> Scan {
+    fn scan_from_table(
+        &self,
+        select: &Select,
+        table: &TableRef,
+        key: &str,
+    ) -> Result<Scan, ParseError> {
         let datasource = table
             .catalog
             .as_ref()
@@ -1001,8 +1142,68 @@ impl Converter<'_> {
                 .as_ref()
                 .map_or_else(|| table.name.name.clone(), |ident| ident.name.clone()),
         );
-        scan
+        // TABLESAMPLE rides on the scan as canonical Postgres-form text; the
+        // FROM-clause renderer appends it verbatim and the fq-emit transpile
+        // boundary rewrites it to the source dialect (DuckDB's PERCENT form).
+        // Dropping it would silently return full-table rows for a sampled scan.
+        if let Some(sample) = table.table_sample.as_ref() {
+            scan.sample = Some(render_table_sample(sample)?);
+        }
+        Ok(scan)
     }
+}
+
+/// The visible output name for an unaliased projection that is neither a bare
+/// column nor a star: the SQL text of the expression (an unaliased `COUNT(*)`
+/// presents to the caller as `COUNT(*)`, an arithmetic `quantity * price` as
+/// `quantity * price`). Rendered by polyglot's generator so the name matches the
+/// canonical rendering the pushed query carries.
+fn output_name_for(item: &Expression) -> Result<String, ParseError> {
+    polyglot_sql::generate(item, polyglot_sql::DialectType::PostgreSQL)
+        .map_err(|error| ParseError::Unsupported(format!("projection name: {error:?}")))
+}
+
+/// Render a table's TABLESAMPLE clause to canonical Postgres-form text
+/// (`TABLESAMPLE BERNOULLI (10)`). Postgres admits only BERNOULLI and SYSTEM with
+/// a single numeric size; seeded, bucketed, DuckDB `USING SAMPLE`, and
+/// ClickHouse-offset samples are not carried and raise rather than drop silently.
+fn render_table_sample(sample: &Sample) -> Result<String, ParseError> {
+    if sample.seed.is_some()
+        || sample.offset.is_some()
+        || sample.bucket_numerator.is_some()
+        || sample.bucket_denominator.is_some()
+        || sample.bucket_field.is_some()
+        || sample.is_using_sample
+    {
+        return Err(ParseError::Unsupported(
+            "TABLESAMPLE with SEED, BUCKET, OFFSET, or USING SAMPLE".to_string(),
+        ));
+    }
+    let method = match sample.method {
+        SampleMethod::Bernoulli => "BERNOULLI",
+        SampleMethod::System => "SYSTEM",
+        SampleMethod::Block
+        | SampleMethod::Row
+        | SampleMethod::Percent
+        | SampleMethod::Bucket
+        | SampleMethod::Reservoir => {
+            return Err(ParseError::Unsupported(format!(
+                "TABLESAMPLE method {:?}",
+                sample.method
+            )));
+        }
+    };
+    let Expression::Literal(literal) = &sample.size else {
+        return Err(ParseError::Unsupported(
+            "TABLESAMPLE size must be a numeric literal".to_string(),
+        ));
+    };
+    let Literal::Number(size) = literal.as_ref() else {
+        return Err(ParseError::Unsupported(
+            "TABLESAMPLE size must be a numeric literal".to_string(),
+        ));
+    };
+    Ok(format!("TABLESAMPLE {method} ({size})"))
 }
 
 /// Whether a star's EXCLUDE/EXCEPT list drops `column`.

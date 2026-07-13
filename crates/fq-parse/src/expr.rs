@@ -11,9 +11,9 @@
 use fq_plan::expr::{LiteralValue, NullsOrder};
 use fq_plan::{BinaryOpType, ColumnRef, Expr, Quantifier, UnaryOpType};
 use polyglot_sql::expressions::{
-    AggFunc, Anonymous, Between, BinaryOp, Case, Cast, CountFunc, DataType, Expression, In, LikeOp,
-    Literal, Ordered, QuantifiedExpr, WindowFrame, WindowFrameBound, WindowFrameExclude,
-    WindowFrameKind, WindowFunction,
+    AggFunc, Anonymous, Between, BinaryOp, Case, Cast, CountFunc, DataType, Expression, In,
+    IntervalUnit, IntervalUnitSpec, LikeOp, Literal, Ordered, QuantifiedExpr, WindowFrame,
+    WindowFrameBound, WindowFrameExclude, WindowFrameKind, WindowFunction,
 };
 
 use crate::convert::{nulls_of, Converter};
@@ -38,6 +38,7 @@ impl Converter<'_> {
             }),
             Expression::Paren(paren) => self.expr(&paren.this),
             Expression::Alias(alias) => self.expr(&alias.this),
+            Expression::Interval(interval) => convert_interval(interval),
             Expression::Not(unary) => self.unary(UnaryOpType::Not, &unary.this),
             Expression::Neg(unary) => self.unary(UnaryOpType::Negate, &unary.this),
             // `x IS NULL` / `x IS NOT NULL` - polyglot's dedicated variant.
@@ -749,6 +750,71 @@ fn quantified_op(op: &polyglot_sql::expressions::QuantifiedOp) -> BinaryOpType {
         QuantifiedOp::Lte => BinaryOpType::Lte,
         QuantifiedOp::Gt => BinaryOpType::Gt,
         QuantifiedOp::Gte => BinaryOpType::Gte,
+    }
+}
+
+/// Convert an INTERVAL literal into `Expr::Interval`. The value must be a
+/// string or numeric literal; a simple unit keyword (`INTERVAL '1' YEAR`)
+/// carries through as its uppercase name (pluralized when written plural).
+/// Column-valued intervals and span units (`HOUR TO SECOND`) are not modeled
+/// and raise rather than being dropped.
+fn convert_interval(interval: &polyglot_sql::expressions::Interval) -> Result<Expr, ParseError> {
+    let Some(this) = &interval.this else {
+        return Err(ParseError::Unsupported(
+            "INTERVAL without a value".to_string(),
+        ));
+    };
+    let value = match this {
+        Expression::Literal(literal) => match literal.as_ref() {
+            Literal::String(text) | Literal::Number(text) => text.clone(),
+            other => {
+                return Err(ParseError::Unsupported(format!(
+                    "INTERVAL value literal `{other:?}`"
+                )));
+            }
+        },
+        other => {
+            return Err(ParseError::Unsupported(format!(
+                "INTERVAL value `{}`",
+                other.variant_name()
+            )));
+        }
+    };
+    let unit = match &interval.unit {
+        None => None,
+        Some(IntervalUnitSpec::Simple { unit, use_plural }) => {
+            Some(interval_unit_name(*unit, *use_plural))
+        }
+        Some(other) => {
+            return Err(ParseError::Unsupported(format!(
+                "INTERVAL unit `{other:?}`"
+            )));
+        }
+    };
+    // Fresh interval literal built from the parsed token - no base to copy from.
+    // Field list (value/unit) is the complete Interval variant.
+    Ok(Expr::Interval { value, unit })
+}
+
+/// The SQL keyword for a simple interval unit, pluralized when written plural.
+fn interval_unit_name(unit: IntervalUnit, use_plural: bool) -> String {
+    let base = match unit {
+        IntervalUnit::Year => "YEAR",
+        IntervalUnit::Quarter => "QUARTER",
+        IntervalUnit::Month => "MONTH",
+        IntervalUnit::Week => "WEEK",
+        IntervalUnit::Day => "DAY",
+        IntervalUnit::Hour => "HOUR",
+        IntervalUnit::Minute => "MINUTE",
+        IntervalUnit::Second => "SECOND",
+        IntervalUnit::Millisecond => "MILLISECOND",
+        IntervalUnit::Microsecond => "MICROSECOND",
+        IntervalUnit::Nanosecond => "NANOSECOND",
+    };
+    if use_plural {
+        format!("{base}S")
+    } else {
+        base.to_string()
     }
 }
 

@@ -600,6 +600,69 @@ fn intersect_and_except() {
 }
 
 #[test]
+fn interval_literals_convert_to_interval_exprs() {
+    // Postgres text form: the unit rides inside the quoted value.
+    let plan = parse("SELECT a FROM t WHERE d > CURRENT_DATE - INTERVAL '30 days'").unwrap();
+    let mut found = Vec::new();
+    collect_intervals(&plan, &mut found);
+    assert_eq!(found, vec![("30 days".to_string(), None)]);
+
+    // Unit-keyword form: INTERVAL '1' YEAR.
+    let plan = parse("SELECT a FROM t WHERE d < DATE '1994-01-01' + INTERVAL '1' YEAR").unwrap();
+    let mut found = Vec::new();
+    collect_intervals(&plan, &mut found);
+    assert_eq!(found, vec![("1".to_string(), Some("YEAR".to_string()))]);
+}
+
+/// Collect every `Expr::Interval` (value, unit) in a plan tree, in walk order.
+fn collect_intervals(plan: &LogicalPlan, found: &mut Vec<(String, Option<String>)>) {
+    for expr in plan.direct_expressions() {
+        collect_expr_intervals(expr, found);
+    }
+    for child in plan.children() {
+        collect_intervals(child, found);
+    }
+}
+
+fn collect_expr_intervals(expr: &Expr, found: &mut Vec<(String, Option<String>)>) {
+    if let Expr::Interval { value, unit } = expr {
+        found.push((value.clone(), unit.clone()));
+    }
+    for child in expr.children() {
+        collect_expr_intervals(child, found);
+    }
+}
+
+#[test]
+fn union_order_by_and_limit_wrap_the_set_operation() {
+    // ORDER BY / LIMIT / OFFSET after a set operation apply to the ENTIRE
+    // combined result: Limit over Sort over SetOperation.
+    let plan = parse("SELECT a FROM t UNION ALL SELECT b FROM s ORDER BY a DESC LIMIT 5 OFFSET 2")
+        .unwrap();
+    let LogicalPlan::Limit(limit) = plan else {
+        panic!("expected Limit, got {plan:?}");
+    };
+    assert_eq!(limit.limit, Some(5));
+    assert_eq!(limit.offset, 2);
+    let LogicalPlan::Sort(sort) = limit.input.as_ref() else {
+        panic!("expected Sort, got {:?}", limit.input);
+    };
+    assert_eq!(sort.sort_keys.len(), 1);
+    assert!(!sort.ascending[0]);
+    assert!(matches!(sort.input.as_ref(), LogicalPlan::SetOperation(_)));
+}
+
+#[test]
+fn union_limit_alone_wraps_the_set_operation() {
+    let plan = parse("SELECT a FROM t UNION ALL SELECT b FROM s LIMIT 20").unwrap();
+    let LogicalPlan::Limit(limit) = plan else {
+        panic!("expected Limit, got {plan:?}");
+    };
+    assert_eq!(limit.limit, Some(20));
+    assert!(matches!(limit.input.as_ref(), LogicalPlan::SetOperation(_)));
+}
+
+#[test]
 fn derived_table_in_from() {
     let plan = parse("SELECT d.x FROM (SELECT x FROM t WHERE x > 1) AS d").unwrap();
     let LogicalPlan::Projection(projection) = plan else {
@@ -613,6 +676,28 @@ fn derived_table_in_from() {
         subquery_scan.input.as_ref(),
         LogicalPlan::Projection(_)
     ));
+}
+
+#[test]
+fn from_less_select_builds_single_row_values() {
+    // SELECT 1 AS n is a single constant row, modelled as a Values relation.
+    let plan = parse("SELECT 1 AS n, 'x' AS s").unwrap();
+    let LogicalPlan::Values(values) = plan else {
+        panic!("expected Values, got {plan:?}");
+    };
+    assert_eq!(values.rows.len(), 1);
+    assert_eq!(values.rows[0].len(), 2);
+    assert_eq!(values.output_names, vec!["n", "s"]);
+}
+
+#[test]
+fn from_less_select_with_relation_clause_raises() {
+    // A clause that needs an input relation has nothing to act on.
+    let result = parse("SELECT 1 AS n WHERE n > 0");
+    assert!(
+        matches!(result, Err(ParseError::Unsupported(_))),
+        "{result:?}"
+    );
 }
 
 #[test]

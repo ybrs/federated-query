@@ -392,6 +392,78 @@ fn set_operation_matching_arity_binds() {
 }
 
 #[test]
+fn column_reference_normalizes_to_catalog_case() {
+    // Resolution is case-insensitive, but the bound reference carries the
+    // CATALOG's spelling - downstream planes address columns by exact name.
+    let plan = bind_sql("SELECT \"Name\" FROM pg.public.users WHERE \"AGE\" > 1").unwrap();
+    let LogicalPlan::Projection(projection) = &plan else {
+        panic!("expected Projection, got {plan:?}");
+    };
+    let Expr::Column(name_ref) = &projection.expressions[0] else {
+        panic!("expected column");
+    };
+    assert_eq!(name_ref.column, "name");
+    let LogicalPlan::Filter(filter) = projection.input.as_ref() else {
+        panic!("expected Filter, got {:?}", projection.input);
+    };
+    let Expr::BinaryOp { left, .. } = &filter.predicate else {
+        panic!("expected binary predicate");
+    };
+    let Expr::Column(age_ref) = left.as_ref() else {
+        panic!("expected column operand");
+    };
+    assert_eq!(age_ref.column, "age");
+}
+
+#[test]
+fn set_operation_order_by_binds_against_output_columns() {
+    // ORDER BY after a UNION resolves against the combined result's output
+    // columns, never against the branch relations (which would be ambiguous).
+    let plan = bind_sql(
+        "SELECT id, total FROM pg.public.orders UNION ALL \
+         SELECT id, total FROM pg.public.orders ORDER BY total DESC",
+    )
+    .unwrap();
+    let LogicalPlan::Sort(sort) = &plan else {
+        panic!("expected Sort, got {plan:?}");
+    };
+    assert!(matches!(sort.input.as_ref(), LogicalPlan::SetOperation(_)));
+    let Expr::Column(key) = &sort.sort_keys[0] else {
+        panic!("expected column sort key");
+    };
+    assert_eq!(key.column, "total");
+    assert_eq!(key.table, None);
+    assert_eq!(key.data_type, Some(DataType::Double));
+}
+
+#[test]
+fn set_operation_order_by_ordinal_binds_positionally() {
+    let plan = bind_sql(
+        "SELECT id, total FROM pg.public.orders UNION ALL \
+         SELECT id, total FROM pg.public.orders ORDER BY 2",
+    )
+    .unwrap();
+    let LogicalPlan::Sort(sort) = &plan else {
+        panic!("expected Sort, got {plan:?}");
+    };
+    let Expr::Column(key) = &sort.sort_keys[0] else {
+        panic!("expected column sort key");
+    };
+    assert_eq!(key.column, "total");
+}
+
+#[test]
+fn set_operation_order_by_unknown_output_raises() {
+    let result = bind_sql(
+        "SELECT id FROM pg.public.users UNION SELECT id FROM pg.public.orders ORDER BY name",
+    );
+    assert!(
+        matches!(result, Err(BindError::ColumnNotInScope(_))),
+        "{result:?}"
+    );
+}
+
+#[test]
 fn in_subquery_binds_inner_plan() {
     let plan = bind_sql(
         "SELECT name FROM pg.public.users \

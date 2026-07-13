@@ -51,6 +51,14 @@ fn same_node(a: &PhysicalPlan, b: &PhysicalPlan) -> bool {
     std::ptr::eq(a, b)
 }
 
+/// Per traced probe base (by node address), the join-key column the winning
+/// semi-join reduction injects as `col IN (build keys)` at execution. This runs
+/// the SAME `injection_winners` pre-pass the step emitter runs, so an EXPLAIN
+/// consumer tags exactly the scans execution will reduce.
+pub fn planned_injections(plan: &PhysicalPlan) -> HashMap<*const PhysicalPlan, String> {
+    reduction::winning_injections(plan)
+}
+
 /// Hands out unique binding (`b1`, `b2`, ...) and fragment (`f1`, ...) names.
 /// Ports `_Names` (pre-increment counters, so the first ids are `b1` / `f1`).
 struct Names {
