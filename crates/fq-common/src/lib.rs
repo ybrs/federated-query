@@ -2,7 +2,7 @@
 //! logging. Ports `federated_query/model.py`, `config/config.py`,
 //! `utils/logging.py`, and `parser/errors.py`.
 //!
-//! PORT NOTE - what retires here (never silent, per the plan's test strategy):
+//! PORT NOTE - what retires here (never silent,):
 //! the Python `StateModel` base (`model.py`) and its loudness pins
 //! (`test_state_model.py`: `extra="forbid"`, `model_copy` key validation, the
 //! no-dataclass sweep) do NOT translate. Rust's typed structs plus serde
@@ -14,6 +14,7 @@
 pub mod budget;
 pub mod config;
 pub mod error;
+pub mod events;
 pub mod logging;
 pub mod types;
 #[macro_use]

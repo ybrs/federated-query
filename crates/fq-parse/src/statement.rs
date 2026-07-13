@@ -1,8 +1,8 @@
-//! Statement classification: materialized-view DDL and the settings surface vs a
+//! Statement classification: the engine's non-SELECT statement surface vs a
 //! plain query.
 //!
 //! The engine's statement surface is queries plus three materialized-view DDL
-//! forms and four settings statements:
+//! forms, four settings statements, and the event-analytics forms:
 //!
 //! - `CREATE MATERIALIZED VIEW <name> AS <select>`
 //! - `REFRESH MATERIALIZED VIEW <name>`
@@ -10,6 +10,9 @@
 //! - `SHOW SETTINGS` / `SHOW SETTING <name>`
 //! - `SET <name> = <value>` (also `SET <name> TO <value>`)
 //! - `RESET <name>` / `RESET ALL`
+//! - `CREATE / REFRESH / DROP EVENT VIEW`, `FUNNEL`, `SEGMENT` (the
+//!   event-analytics grammars live in `event_statement`; `PATHS` is named but
+//!   not implemented and raises)
 //!
 //! `classify_statement` recognizes these forms LEXICALLY (a quote-aware
 //! tokenizer, no full SQL parse) and returns everything else untouched as
@@ -34,12 +37,14 @@
 //!   own store, so none of these have a meaning here.
 
 use crate::error::ParseError;
+use fq_common::events::{EventRoleColumns, FunnelSpec, SegmentSpec};
 
-/// One SQL statement, classified: a materialized-view DDL form, or a plain
-/// query passed through as text for the normal parse pipeline.
+/// One SQL statement, classified: a materialized-view DDL form, a settings
+/// statement, an event-analytics form, or a plain query passed through as text
+/// for the normal parse pipeline.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Statement<'a> {
-    /// Anything that is not materialized-view DDL; the full original text.
+    /// Anything that is not a recognized statement form; the full original text.
     Query(&'a str),
     /// `CREATE MATERIALIZED VIEW <name> AS <select>`: the view name and the
     /// defining SELECT text (stored verbatim as the view's definition).
@@ -60,6 +65,21 @@ pub enum Statement<'a> {
     /// `RESET <name>` restores one setting to its default; `RESET ALL`
     /// (`name` is `None`) restores every session override.
     ResetSetting { name: Option<String> },
+    /// `CREATE EVENT VIEW <name> ENTITY <col> TIMESTAMP <col> EVENT <col>
+    /// AS <select>`: the view name, its role columns, and the defining SELECT.
+    CreateEventView {
+        name: String,
+        roles: EventRoleColumns,
+        select_sql: &'a str,
+    },
+    /// `REFRESH EVENT VIEW <name>`.
+    RefreshEventView { name: String },
+    /// `DROP EVENT VIEW <name>`.
+    DropEventView { name: String },
+    /// `FUNNEL OVER <view> STEPS (...) WITHIN <n> <unit>`.
+    Funnel(FunnelSpec),
+    /// `SEGMENT OVER <view> MEASURE <m> [EVENT '<name>'] BY <bucket>`.
+    Segment(SegmentSpec),
 }
 
 /// Classify one SQL statement. Materialized-view DDL is recognized by its
@@ -72,10 +92,27 @@ pub fn classify_statement(sql: &str) -> Result<Statement<'_>, ParseError> {
         return Ok(Statement::Query(sql));
     };
     match first.to_ascii_uppercase().as_str() {
-        // REFRESH exists only for materialized views, so any REFRESH is ours.
+        "REFRESH" if second_word_is(sql, "EVENT") => {
+            crate::event_statement::classify_refresh_event(&mut tokens)
+        }
+        // Any other REFRESH is the materialized-view form (REFRESH exists for
+        // nothing else), so its errors name what that form expects.
         "REFRESH" => classify_refresh(&mut tokens),
         "CREATE" if second_word_is(sql, "MATERIALIZED") => classify_create(&mut tokens),
+        "CREATE" if second_word_is(sql, "EVENT") => {
+            crate::event_statement::classify_create_event(&mut tokens)
+        }
         "DROP" if second_word_is(sql, "MATERIALIZED") => classify_drop(&mut tokens),
+        "DROP" if second_word_is(sql, "EVENT") => {
+            crate::event_statement::classify_drop_event(&mut tokens)
+        }
+        "FUNNEL" => crate::event_statement::classify_funnel(&mut tokens),
+        "SEGMENT" => crate::event_statement::classify_segment(&mut tokens),
+        "PATHS" => Err(ParseError::Unsupported(
+            "PATHS: path analysis is not implemented; FUNNEL and SEGMENT are the \
+             available event analyses"
+                .to_string(),
+        )),
         // SHOW is ours only for SETTING(S); any other SHOW passes through.
         "SHOW" if second_word_is(sql, "SETTINGS") || second_word_is(sql, "SETTING") => {
             classify_show(&mut tokens)
@@ -217,7 +254,7 @@ fn classify_create<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, Pars
                 .to_string(),
         ));
     }
-    let name = view_name(tokens)?;
+    let name = view_name(tokens, "materialized view")?;
     reject_pre_as_options(tokens)?;
     tokens.expect_keyword("AS")?;
     let select_sql = tokens.rest().trim();
@@ -286,7 +323,7 @@ fn classify_refresh<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, Par
                 .to_string(),
         ));
     }
-    let name = view_name(tokens)?;
+    let name = view_name(tokens, "materialized view")?;
     expect_end(tokens, "REFRESH MATERIALIZED VIEW")?;
     Ok(Statement::RefreshMaterializedView { name })
 }
@@ -305,38 +342,34 @@ fn classify_drop<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseE
                 .to_string(),
         ));
     }
-    let name = view_name(tokens)?;
+    let name = view_name(tokens, "materialized view")?;
     expect_end(tokens, "DROP MATERIALIZED VIEW")?;
     Ok(Statement::DropMaterializedView { name })
 }
 
-/// Read the view name: a single unqualified identifier. An unquoted name
+/// Read a view name: a single unqualified identifier. An unquoted name
 /// lowercases (the Postgres identifier rule); a double-quoted name keeps its
 /// exact spelling. A qualified name (`schema.view`) raises: the view store is
-/// a single flat namespace.
-fn view_name(tokens: &mut Tokenizer<'_>) -> Result<String, ParseError> {
+/// a single flat namespace. `what` names the object kind in error text.
+pub(crate) fn view_name(tokens: &mut Tokenizer<'_>, what: &str) -> Result<String, ParseError> {
     let name = match tokens.next_token() {
         Some(Token::Word(word)) => word.to_lowercase(),
         Some(Token::QuotedIdent(name)) => name,
         Some(Token::Other(ch)) => {
             return Err(ParseError::Parse(format!(
-                "expected a materialized view name, found '{ch}'"
+                "expected a {what} name, found '{ch}'"
             )))
         }
-        Some(Token::StringLiteral) | None => {
-            return Err(ParseError::Parse(
-                "expected a materialized view name".to_string(),
-            ))
+        Some(Token::StringLiteral(_)) | None => {
+            return Err(ParseError::Parse(format!("expected a {what} name")))
         }
     };
     if name.is_empty() {
-        return Err(ParseError::Parse(
-            "materialized view name is empty".to_string(),
-        ));
+        return Err(ParseError::Parse(format!("{what} name is empty")));
     }
     if matches!(tokens.peek(), Some(Token::Other('.'))) {
         return Err(ParseError::Unsupported(format!(
-            "materialized view name '{name}...' is schema-qualified; the view \
+            "{what} name '{name}...' is schema-qualified; the view \
              store is a single flat namespace, use an unqualified name"
         )));
     }
@@ -344,8 +377,8 @@ fn view_name(tokens: &mut Tokenizer<'_>) -> Result<String, ParseError> {
 }
 
 /// Raise if any token follows where the statement must end; a trailing token is
-/// an option this DDL form does not take.
-fn expect_end(tokens: &mut Tokenizer<'_>, form: &str) -> Result<(), ParseError> {
+/// an option this statement form does not take.
+pub(crate) fn expect_end(tokens: &mut Tokenizer<'_>, form: &str) -> Result<(), ParseError> {
     match tokens.next_token() {
         None => Ok(()),
         Some(token) => Err(ParseError::Unsupported(format!(
@@ -355,26 +388,27 @@ fn expect_end(tokens: &mut Tokenizer<'_>, form: &str) -> Result<(), ParseError> 
     }
 }
 
-/// One lexical token of the DDL surface.
+/// One lexical token of the statement surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Token<'a> {
+pub(crate) enum Token<'a> {
     /// A bare word (identifier or keyword), as written.
     Word(&'a str),
     /// A `"double quoted"` identifier with `""` escapes resolved.
     QuotedIdent(String),
-    /// A `'single quoted'` string literal (content irrelevant to the DDL shape).
-    StringLiteral,
+    /// A `'single quoted'` string literal with `''` escapes resolved (funnel
+    /// steps and segment event filters read the content).
+    StringLiteral(String),
     /// Any other single character (punctuation, operator).
     Other(char),
 }
 
 impl Token<'_> {
     /// A short rendering for error messages.
-    fn describe(&self) -> String {
+    pub(crate) fn describe(&self) -> String {
         match self {
             Token::Word(word) => (*word).to_string(),
             Token::QuotedIdent(name) => format!("\"{name}\""),
-            Token::StringLiteral => "<string literal>".to_string(),
+            Token::StringLiteral(content) => format!("'{content}'"),
             Token::Other(ch) => ch.to_string(),
         }
     }
@@ -384,7 +418,7 @@ impl Token<'_> {
 /// single-quoted string literals, and single punctuation characters. Enough to
 /// recognize the DDL keyword shapes without misreading quoted text; a statement
 /// ending inside an unterminated quote raises.
-struct Tokenizer<'a> {
+pub(crate) struct Tokenizer<'a> {
     input: &'a str,
     /// Byte offset of the next unread character.
     pos: usize,
@@ -392,12 +426,12 @@ struct Tokenizer<'a> {
 
 impl<'a> Tokenizer<'a> {
     /// Start tokenizing at the beginning of `input`.
-    fn new(input: &'a str) -> Self {
+    pub(crate) fn new(input: &'a str) -> Self {
         Self { input, pos: 0 }
     }
 
     /// The unread remainder of the input (used for the `AS <select>` tail).
-    fn rest(&self) -> &'a str {
+    pub(crate) fn rest(&self) -> &'a str {
         &self.input[self.pos..]
     }
 
@@ -409,7 +443,7 @@ impl<'a> Tokenizer<'a> {
     }
 
     /// The next token, or None at end of input.
-    fn next_token(&mut self) -> Option<Token<'a>> {
+    pub(crate) fn next_token(&mut self) -> Option<Token<'a>> {
         self.skip_whitespace();
         let mut chars = self.input[self.pos..].chars();
         let first = chars.next()?;
@@ -425,7 +459,7 @@ impl<'a> Tokenizer<'a> {
     }
 
     /// Peek the next token without consuming it.
-    fn peek(&mut self) -> Option<Token<'a>> {
+    pub(crate) fn peek(&mut self) -> Option<Token<'a>> {
         let saved = self.pos;
         let token = self.next_token();
         self.pos = saved;
@@ -433,7 +467,7 @@ impl<'a> Tokenizer<'a> {
     }
 
     /// Peek the next token if it is a bare word.
-    fn peek_word(&mut self) -> Option<&'a str> {
+    pub(crate) fn peek_word(&mut self) -> Option<&'a str> {
         match self.peek() {
             Some(Token::Word(word)) => Some(word),
             _ => None,
@@ -441,7 +475,7 @@ impl<'a> Tokenizer<'a> {
     }
 
     /// Whether the next token is the bare word `keyword` (case-insensitive).
-    fn peek_word_is(&mut self, keyword: &str) -> bool {
+    pub(crate) fn peek_word_is(&mut self, keyword: &str) -> bool {
         match self.peek_word() {
             Some(word) => word.eq_ignore_ascii_case(keyword),
             None => false,
@@ -449,7 +483,7 @@ impl<'a> Tokenizer<'a> {
     }
 
     /// Consume the next token, requiring it to be `keyword` (case-insensitive).
-    fn expect_keyword(&mut self, keyword: &str) -> Result<(), ParseError> {
+    pub(crate) fn expect_keyword(&mut self, keyword: &str) -> Result<(), ParseError> {
         match self.next_token() {
             Some(Token::Word(word)) if word.eq_ignore_ascii_case(keyword) => Ok(()),
             Some(token) => Err(ParseError::Parse(format!(
@@ -499,7 +533,7 @@ impl<'a> Tokenizer<'a> {
         if quote == '"' {
             Token::QuotedIdent(content)
         } else {
-            Token::StringLiteral
+            Token::StringLiteral(content)
         }
     }
 }

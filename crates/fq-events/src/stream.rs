@@ -1,0 +1,585 @@
+//! The sorted event stream the kernels scan: role columns normalized to one
+//! representation per role, plus a row cursor that VERIFIES the storage
+//! contract ((entity, timestamp) non-decreasing, no NULL roles) as it reads.
+//! A kernel never returns numbers computed over a stream whose ordering
+//! premise is broken - the cursor raises `ContractViolation` first.
+
+use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
+use arrow::compute::cast;
+use arrow::datatypes::{DataType as ArrowType, SchemaRef, TimeUnit};
+use fq_common::events::{EventRoleColumns, EventWindow, WindowUnit};
+
+use crate::error::EventError;
+
+/// The native unit of the view's timestamp column. Kernel time arithmetic
+/// runs in this unit exactly (no lossy normalization across units).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeScale {
+    Seconds,
+    Millis,
+    Micros,
+    Nanos,
+    /// A DATE column: whole days since the epoch.
+    Days,
+}
+
+impl TimeScale {
+    /// The scale of an Arrow timestamp-role type; any other type has no event
+    /// time semantics and raises.
+    pub fn of(arrow: &ArrowType) -> Result<Self, EventError> {
+        match arrow {
+            ArrowType::Timestamp(TimeUnit::Second, _) => Ok(TimeScale::Seconds),
+            ArrowType::Timestamp(TimeUnit::Millisecond, _) | ArrowType::Date64 => {
+                Ok(TimeScale::Millis)
+            }
+            ArrowType::Timestamp(TimeUnit::Microsecond, _) => Ok(TimeScale::Micros),
+            ArrowType::Timestamp(TimeUnit::Nanosecond, _) => Ok(TimeScale::Nanos),
+            ArrowType::Date32 => Ok(TimeScale::Days),
+            other => Err(EventError::InvalidRoles(format!(
+                "timestamp role has type {other}, which is not a TIMESTAMP or DATE"
+            ))),
+        }
+    }
+
+    /// Convert a window duration into this scale's native unit with exact
+    /// integer arithmetic. Over a DATE column only whole-day units are
+    /// meaningful, so a sub-day unit raises; an overflowing window raises.
+    pub fn window_in_native(self, window: EventWindow) -> Result<i64, EventError> {
+        if window.count <= 0 {
+            return Err(EventError::Analysis(format!(
+                "WITHIN needs a positive duration, got {}",
+                window.count
+            )));
+        }
+        if self == TimeScale::Days {
+            if window.unit != WindowUnit::Days {
+                return Err(EventError::Analysis(
+                    "the view's timestamp column is a DATE; WITHIN must use DAYS".to_string(),
+                ));
+            }
+            return Ok(window.count);
+        }
+        window
+            .count
+            .checked_mul(window.unit.seconds())
+            .and_then(|seconds| seconds.checked_mul(self.per_second()))
+            .ok_or_else(|| {
+                EventError::Analysis(format!(
+                    "WITHIN {} overflows the timestamp domain",
+                    window.count
+                ))
+            })
+    }
+
+    /// Native units per second for the sub-day scales. `Days` never reaches
+    /// here (`window_in_native` handles it before multiplying).
+    fn per_second(self) -> i64 {
+        match self {
+            TimeScale::Seconds => 1,
+            TimeScale::Millis => 1_000,
+            TimeScale::Micros => 1_000_000,
+            TimeScale::Nanos => 1_000_000_000,
+            TimeScale::Days => unreachable!("day-scaled windows are whole day counts"),
+        }
+    }
+
+    /// The UTC instant of a native timestamp value, for calendar bucketing.
+    /// A value outside chrono's representable range raises.
+    pub fn to_utc(self, native: i64) -> Result<chrono::DateTime<chrono::Utc>, EventError> {
+        let out_of_range =
+            || EventError::Analysis(format!("timestamp value {native} is out of range"));
+        match self {
+            TimeScale::Seconds => {
+                chrono::DateTime::from_timestamp(native, 0).ok_or_else(out_of_range)
+            }
+            TimeScale::Millis => {
+                chrono::DateTime::from_timestamp_millis(native).ok_or_else(out_of_range)
+            }
+            TimeScale::Micros => {
+                chrono::DateTime::from_timestamp_micros(native).ok_or_else(out_of_range)
+            }
+            TimeScale::Nanos => Ok(chrono::DateTime::from_timestamp_nanos(native)),
+            TimeScale::Days => {
+                let seconds = native.checked_mul(86_400).ok_or_else(out_of_range)?;
+                chrono::DateTime::from_timestamp(seconds, 0).ok_or_else(out_of_range)
+            }
+        }
+    }
+}
+
+/// One row's entity value, borrowed from its batch. A view's entity column
+/// has one type, so mixed variants never meet in one stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EntityRef<'a> {
+    Int(i64),
+    Text(&'a str),
+}
+
+impl EntityRef<'_> {
+    /// An owned copy, taken only at entity boundaries (kernels that must
+    /// remember an entity across rows clone here, never per row).
+    pub fn to_owned_key(self) -> EntityKey {
+        match self {
+            EntityRef::Int(value) => EntityKey::Int(value),
+            EntityRef::Text(text) => EntityKey::Text(text.to_string()),
+        }
+    }
+}
+
+/// An owned entity value a kernel holds across rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntityKey {
+    Int(i64),
+    Text(String),
+}
+
+impl EntityKey {
+    /// Whether this held key equals a row's borrowed entity value.
+    pub fn matches(&self, entity: EntityRef<'_>) -> bool {
+        match (self, entity) {
+            (EntityKey::Int(held), EntityRef::Int(row)) => *held == row,
+            (EntityKey::Text(held), EntityRef::Text(row)) => held == row,
+            _ => false,
+        }
+    }
+}
+
+/// One event row the cursor yields.
+#[derive(Debug)]
+pub struct EventRow<'a> {
+    pub entity: EntityRef<'a>,
+    /// The timestamp in the stream's native `TimeScale` unit.
+    pub time: i64,
+    pub event: &'a str,
+    /// True on the first row of each entity's contiguous run.
+    pub new_entity: bool,
+}
+
+/// The entity column of one batch, normalized to a single width per kind.
+enum EntityColumn {
+    Int(Int64Array),
+    Text(StringArray),
+}
+
+/// One batch's normalized role columns.
+struct EventBatch {
+    entity: EntityColumn,
+    time: Int64Array,
+    event: StringArray,
+    rows: usize,
+}
+
+/// A whole event view's rows, normalized for the kernels.
+pub struct EventStream {
+    batches: Vec<EventBatch>,
+    scale: TimeScale,
+}
+
+impl EventStream {
+    /// Normalize `batches` for scanning: resolve the role columns by name,
+    /// enforce the role type contract, raise on any NULL role value, and cast
+    /// each role column to its single kernel representation.
+    pub fn open(
+        view: &str,
+        schema: &SchemaRef,
+        batches: &[RecordBatch],
+        roles: &EventRoleColumns,
+    ) -> Result<Self, EventError> {
+        let (entity_index, time_index, event_index) = role_indices(schema, roles)?;
+        let scale = TimeScale::of(schema.field(time_index).data_type())?;
+        require_entity_type(schema.field(entity_index).data_type())?;
+        require_text_type("event", schema.field(event_index).data_type())?;
+        let mut normalized = Vec::with_capacity(batches.len());
+        for batch in batches {
+            require_no_role_nulls(view, batch, roles, &[entity_index, time_index, event_index])?;
+            normalized.push(EventBatch {
+                entity: normalize_entity(batch.column(entity_index))?,
+                time: cast_to_int64(batch.column(time_index))?,
+                event: cast_to_utf8(batch.column(event_index))?,
+                rows: batch.num_rows(),
+            });
+        }
+        Ok(Self {
+            batches: normalized,
+            scale,
+        })
+    }
+
+    /// The native unit of the stream's timestamps.
+    pub fn scale(&self) -> TimeScale {
+        self.scale
+    }
+
+    /// A contract-verifying cursor over every row, in storage order.
+    pub fn rows(&self) -> EventRows<'_> {
+        EventRows {
+            stream: self,
+            batch: 0,
+            row: 0,
+            previous: None,
+        }
+    }
+}
+
+/// The cursor `EventStream::rows` returns: yields each row and raises
+/// `ContractViolation` the moment (entity, timestamp) ordering regresses.
+pub struct EventRows<'a> {
+    stream: &'a EventStream,
+    batch: usize,
+    row: usize,
+    previous: Option<(EntityRef<'a>, i64)>,
+}
+
+impl<'a> EventRows<'a> {
+    /// The (entity, time, event) values at the cursor's current position.
+    fn current(&self) -> (EntityRef<'a>, i64, &'a str) {
+        let batch = &self.stream.batches[self.batch];
+        let entity = match &batch.entity {
+            EntityColumn::Int(values) => EntityRef::Int(values.value(self.row)),
+            EntityColumn::Text(values) => EntityRef::Text(values.value(self.row)),
+        };
+        (
+            entity,
+            batch.time.value(self.row),
+            batch.event.value(self.row),
+        )
+    }
+
+    /// Verify (entity, timestamp) did not regress from the previous row, and
+    /// tell whether this row starts a new entity run.
+    fn check_order(&self, entity: EntityRef<'a>, time: i64) -> Result<bool, EventError> {
+        let Some((previous_entity, previous_time)) = self.previous else {
+            return Ok(true);
+        };
+        if entity == previous_entity {
+            if time < previous_time {
+                return Err(EventError::ContractViolation(format!(
+                    "timestamps regress within entity {entity:?}: {time} after {previous_time}"
+                )));
+            }
+            return Ok(false);
+        }
+        if entity < previous_entity {
+            return Err(EventError::ContractViolation(format!(
+                "entities regress: {entity:?} after {previous_entity:?}; the stream must be \
+                 sorted by (entity, timestamp)"
+            )));
+        }
+        Ok(true)
+    }
+}
+
+impl<'a> Iterator for EventRows<'a> {
+    type Item = Result<EventRow<'a>, EventError>;
+
+    /// The next row in storage order, or the contract violation that stops
+    /// the scan.
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.batch < self.stream.batches.len() {
+            if self.row >= self.stream.batches[self.batch].rows {
+                self.batch += 1;
+                self.row = 0;
+                continue;
+            }
+            let (entity, time, event) = self.current();
+            self.row += 1;
+            let new_entity = match self.check_order(entity, time) {
+                Ok(new_entity) => new_entity,
+                Err(error) => return Some(Err(error)),
+            };
+            self.previous = Some((entity, time));
+            return Some(Ok(EventRow {
+                entity,
+                time,
+                event,
+                new_entity,
+            }));
+        }
+        None
+    }
+}
+
+/// Resolve the three role columns to schema indices, raising on a role that
+/// names no output column or on two roles sharing one column.
+pub fn role_indices(
+    schema: &SchemaRef,
+    roles: &EventRoleColumns,
+) -> Result<(usize, usize, usize), EventError> {
+    let entity = index_of(schema, "ENTITY", &roles.entity)?;
+    let time = index_of(schema, "TIMESTAMP", &roles.timestamp)?;
+    let event = index_of(schema, "EVENT", &roles.event)?;
+    if entity == time || entity == event || time == event {
+        return Err(EventError::InvalidRoles(format!(
+            "the ENTITY / TIMESTAMP / EVENT roles must name three distinct columns, got \
+             '{}', '{}', '{}'",
+            roles.entity, roles.timestamp, roles.event
+        )));
+    }
+    Ok((entity, time, event))
+}
+
+/// The schema index of one role's column, or a loud error naming the role,
+/// the missing column, and the columns that do exist.
+fn index_of(schema: &SchemaRef, role: &str, column: &str) -> Result<usize, EventError> {
+    let position = schema
+        .fields()
+        .iter()
+        .position(|field| field.name() == column);
+    position.ok_or_else(|| {
+        let mut names = Vec::with_capacity(schema.fields().len());
+        for field in schema.fields() {
+            names.push(field.name().clone());
+        }
+        EventError::InvalidRoles(format!(
+            "{role} role names column '{column}', which the defining SELECT does not \
+             produce (its columns are: {})",
+            names.join(", ")
+        ))
+    })
+}
+
+/// Enforce the entity role's type contract: integers or text. Anything else
+/// has no defined identity semantics for sequence analysis.
+pub fn require_entity_type(arrow: &ArrowType) -> Result<(), EventError> {
+    if is_integer(arrow) || is_text(arrow) {
+        return Ok(());
+    }
+    Err(EventError::InvalidRoles(format!(
+        "entity role has type {arrow}; it must be an integer or text column"
+    )))
+}
+
+/// Enforce a text-typed role (the event name).
+pub fn require_text_type(role: &str, arrow: &ArrowType) -> Result<(), EventError> {
+    if is_text(arrow) {
+        return Ok(());
+    }
+    Err(EventError::InvalidRoles(format!(
+        "{role} role has type {arrow}; it must be a text column"
+    )))
+}
+
+/// Whether an Arrow type is an integer the entity role accepts (widths that
+/// widen losslessly to Int64).
+fn is_integer(arrow: &ArrowType) -> bool {
+    matches!(
+        arrow,
+        ArrowType::Int8
+            | ArrowType::Int16
+            | ArrowType::Int32
+            | ArrowType::Int64
+            | ArrowType::UInt8
+            | ArrowType::UInt16
+            | ArrowType::UInt32
+    )
+}
+
+/// Whether an Arrow type is a text type the entity/event roles accept.
+fn is_text(arrow: &ArrowType) -> bool {
+    matches!(
+        arrow,
+        ArrowType::Utf8 | ArrowType::LargeUtf8 | ArrowType::Utf8View
+    )
+}
+
+/// Raise `ContractViolation` if any role column of `batch` holds a NULL,
+/// naming the view, the column, and the first offending row ordinal.
+fn require_no_role_nulls(
+    view: &str,
+    batch: &RecordBatch,
+    roles: &EventRoleColumns,
+    indices: &[usize],
+) -> Result<(), EventError> {
+    let names = [&roles.entity, &roles.timestamp, &roles.event];
+    for (index, name) in indices.iter().zip(names) {
+        let column = batch.column(*index);
+        if column.null_count() == 0 {
+            continue;
+        }
+        let first_null = (0..column.len())
+            .find(|row| column.is_null(*row))
+            .expect("null_count > 0 implies a null row");
+        return Err(EventError::ContractViolation(format!(
+            "event view '{view}': role column '{name}' is NULL at row {first_null}; \
+             every event needs an entity, a timestamp, and a name"
+        )));
+    }
+    Ok(())
+}
+
+/// Normalize an entity column to Int64 or Utf8 (one representation per kind;
+/// the widening casts are lossless under the role type contract).
+fn normalize_entity(column: &ArrayRef) -> Result<EntityColumn, EventError> {
+    if is_integer(column.data_type()) {
+        return Ok(EntityColumn::Int(cast_to_int64(column)?));
+    }
+    Ok(EntityColumn::Text(cast_to_utf8(column)?))
+}
+
+/// Cast a column to Int64 (timestamps keep their raw native-unit values).
+fn cast_to_int64(column: &ArrayRef) -> Result<Int64Array, EventError> {
+    let casted = cast(column, &ArrowType::Int64)?;
+    Ok(casted
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("cast to Int64 yields Int64Array")
+        .clone())
+}
+
+/// Cast a column to Utf8.
+fn cast_to_utf8(column: &ArrayRef) -> Result<StringArray, EventError> {
+    let casted = cast(column, &ArrowType::Utf8)?;
+    Ok(casted
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("cast to Utf8 yields StringArray")
+        .clone())
+}
+
+/// The chunk-stored `Arc<Schema>` and rows the tests build streams from.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int32Array, TimestampMicrosecondArray};
+    use arrow::datatypes::{Field, Schema};
+    use std::sync::Arc;
+
+    /// The standard test roles over (user_id, ts, name).
+    fn roles() -> EventRoleColumns {
+        EventRoleColumns {
+            entity: "user_id".to_string(),
+            timestamp: "ts".to_string(),
+            event: "name".to_string(),
+        }
+    }
+
+    /// A (user_id Int32, ts Timestamp(us), name Utf8) batch from row tuples.
+    fn batch(rows: &[(i32, i64, &str)]) -> (SchemaRef, RecordBatch) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", ArrowType::Int32, true),
+            Field::new(
+                "ts",
+                ArrowType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new("name", ArrowType::Utf8, true),
+        ]));
+        let mut users = Vec::new();
+        let mut times = Vec::new();
+        let mut names = Vec::new();
+        for (user, time, name) in rows {
+            users.push(*user);
+            times.push(*time);
+            names.push(*name);
+        }
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(users)),
+                Arc::new(TimestampMicrosecondArray::from(times)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )
+        .expect("batch");
+        (schema, batch)
+    }
+
+    #[test]
+    fn cursor_yields_rows_with_entity_boundaries() {
+        let (schema, data) = batch(&[(1, 10, "a"), (1, 20, "b"), (2, 5, "a")]);
+        let stream = EventStream::open("ev", &schema, &[data], &roles()).expect("open");
+        let mut rows = Vec::new();
+        for row in stream.rows() {
+            let row = row.expect("row");
+            rows.push((row.time, row.new_entity));
+        }
+        assert_eq!(rows, vec![(10, true), (20, false), (5, true)]);
+    }
+
+    #[test]
+    fn unsorted_timestamps_within_an_entity_raise() {
+        let (schema, data) = batch(&[(1, 20, "a"), (1, 10, "b")]);
+        let stream = EventStream::open("ev", &schema, &[data], &roles()).expect("open");
+        let error = stream.rows().nth(1).expect("second row").unwrap_err();
+        assert!(matches!(error, EventError::ContractViolation(_)), "{error}");
+    }
+
+    #[test]
+    fn a_reappearing_entity_raises() {
+        let (schema, data) = batch(&[(1, 10, "a"), (2, 10, "a"), (1, 30, "b")]);
+        let stream = EventStream::open("ev", &schema, &[data], &roles()).expect("open");
+        let error = stream.rows().nth(2).expect("third row").unwrap_err();
+        assert!(matches!(error, EventError::ContractViolation(_)), "{error}");
+    }
+
+    #[test]
+    fn a_null_role_value_raises_naming_column_and_row() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", ArrowType::Int32, true),
+            Field::new(
+                "ts",
+                ArrowType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new("name", ArrowType::Utf8, true),
+        ]));
+        let data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), None])),
+                Arc::new(TimestampMicrosecondArray::from(vec![10, 20])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .expect("batch");
+        let Err(error) = EventStream::open("ev", &schema, &[data], &roles()) else {
+            panic!("a NULL role value must raise");
+        };
+        let text = format!("{error}");
+        assert!(text.contains("user_id") && text.contains("row 1"), "{text}");
+    }
+
+    #[test]
+    fn a_missing_role_column_raises_listing_the_columns() {
+        let (schema, data) = batch(&[(1, 10, "a")]);
+        let mut bad = roles();
+        bad.entity = "uzer_id".to_string();
+        let Err(error) = EventStream::open("ev", &schema, &[data], &bad) else {
+            panic!("a missing role column must raise");
+        };
+        let text = format!("{error}");
+        assert!(
+            text.contains("uzer_id") && text.contains("user_id"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn window_conversion_is_exact_per_scale() {
+        let window = EventWindow {
+            count: 2,
+            unit: WindowUnit::Hours,
+        };
+        assert_eq!(
+            TimeScale::Micros.window_in_native(window).expect("us"),
+            2 * 3600 * 1_000_000
+        );
+        assert_eq!(
+            TimeScale::Seconds.window_in_native(window).expect("s"),
+            7200
+        );
+        // A DATE column accepts whole-day windows only.
+        let days = EventWindow {
+            count: 7,
+            unit: WindowUnit::Days,
+        };
+        assert_eq!(TimeScale::Days.window_in_native(days).expect("d"), 7);
+        assert!(TimeScale::Days.window_in_native(window).is_err());
+        // Non-positive windows raise.
+        let zero = EventWindow {
+            count: 0,
+            unit: WindowUnit::Days,
+        };
+        assert!(TimeScale::Micros.window_in_native(zero).is_err());
+    }
+}

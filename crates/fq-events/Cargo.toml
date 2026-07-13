@@ -1,0 +1,29 @@
+# fq-events: the event-analytics extension - event-view roles, the sorted
+# (entity, timestamp) materialization contract, and the funnel / segmentation
+# kernels that run over the sorted chunks. A separate crate because it owns a
+# concern neither neighbor should: fq-accel is content-agnostic materialized-
+# view storage, fq-exec is the imported generic execution engine. fq-events
+# does NOT depend on fq-accel - fq-runtime composes the two (it executes the
+# defining SELECT, enforces the contract here, and persists via fq-accel).
+# DAG: fq-events -> fq-common; fq-runtime -> fq-events.
+
+[package]
+name = "fq-events"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+# The analysis spec types (roles, funnel/segment specs) live in
+# fq-common::events, shared with fq-parse without coupling the two crates.
+fq-common = { path = "../fq-common" }
+# Kernels read and produce Arrow batches; the contract sorts with the arrow
+# compute kernels; chunk files are framed Arrow IPC.
+arrow = "58"
+# The event-view role registry shares the config's learned-stats SQLite file.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Segmentation buckets are UTC calendar truncations; registry timestamps.
+chrono = "0.4"
+thiserror = "2"
+
+[lints]
+workspace = true

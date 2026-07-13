@@ -2011,6 +2011,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fq-events"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "chrono",
+ "fq-common",
+ "rusqlite",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "fq-exec"
 version = "0.1.0"
 dependencies = [
@@ -2112,6 +2123,7 @@ dependencies = [
  "fq-common",
  "fq-connectors",
  "fq-decorrelate",
+ "fq-events",
  "fq-exec",
  "fq-optimize",
  "fq-parse",

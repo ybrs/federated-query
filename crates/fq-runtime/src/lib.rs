@@ -12,6 +12,7 @@
 
 mod delta;
 pub mod error;
+mod events;
 mod explain;
 mod materialized;
 mod settings;
@@ -70,6 +71,9 @@ pub struct Runtime {
     /// The materialized-view store, present when the config has a file path
     /// (the store lives next to it). DDL against a path-less config raises.
     accelerator: Option<Accelerator>,
+    /// The event-view role registry, opened together with the accelerator
+    /// (same stats SQLite): an event view is a materialized view plus roles.
+    events: Option<fq_events::EventViewRegistry>,
 }
 
 impl Runtime {
@@ -98,6 +102,7 @@ impl Runtime {
         // monotonic column whose type cannot carry a watermark, fails HERE at
         // load - not silently at a refresh months later.
         delta::validate_change_keys(&catalog, config)?;
+        let events = events::open_event_registry(config)?;
         let catalog = Arc::new(catalog);
         let learned = open_stats_catalog(config)?;
         let stats = Arc::new(StatisticsCollector::new(
@@ -112,6 +117,7 @@ impl Runtime {
             stats: RwLock::new(stats),
             learned,
             accelerator,
+            events,
         })
     }
 
@@ -164,6 +170,15 @@ impl Runtime {
             Statement::ShowSetting { name } => self.show_setting(&name),
             Statement::SetSetting { name, value } => self.set_setting(&name, &value),
             Statement::ResetSetting { name } => self.reset_setting(name.as_deref()),
+            Statement::CreateEventView {
+                name,
+                roles,
+                select_sql,
+            } => self.create_event_view(&name, &roles, select_sql),
+            Statement::RefreshEventView { name } => self.refresh_event_view(&name),
+            Statement::DropEventView { name } => self.drop_event_view(&name),
+            Statement::Funnel(spec) => self.run_funnel_statement(&spec),
+            Statement::Segment(spec) => self.run_segment_statement(&spec),
         }
     }
 
@@ -197,14 +212,16 @@ impl Runtime {
             return Ok(vec![("plan".to_owned(), DataType::Text)]);
         }
         // A non-query statement resolves to the columns its execution returns,
-        // without running it: SHOW resolves to the settings result columns, and
-        // materialized-view DDL / SET / RESET resolve to the single `status`
-        // column (the pg command-tag convention).
+        // without running it: SHOW resolves to the settings result columns, the
+        // analysis forms to their fixed result relations, and every DDL / SET /
+        // RESET to the single `status` column (the pg command-tag convention).
         match classify_statement(sql)? {
             Statement::Query(_) => {}
             Statement::ShowSettings | Statement::ShowSetting { .. } => {
                 return Ok(settings::describe_columns());
             }
+            Statement::Funnel(_) => return Ok(events::funnel_describe_columns()),
+            Statement::Segment(_) => return Ok(events::segment_describe_columns()),
             _ => return Ok(vec![("status".to_owned(), DataType::Text)]),
         }
         let physical = self.plan(sql)?;
@@ -302,7 +319,16 @@ impl Runtime {
 
     /// Plan the inner statement of an EXPLAIN and return its physical plan tree
     /// as a single `plan` text column, one row per line. Nothing executes.
+    /// Only a query has a plan: EXPLAIN of a DDL, settings, or analysis
+    /// statement raises naming the form instead of feeding it to the SQL parser.
     fn explain(&self, inner: &str) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
+        if !matches!(classify_statement(inner)?, Statement::Query(_)) {
+            return Err(RuntimeError::Parse(fq_parse::ParseError::Unsupported(
+                "EXPLAIN takes a query; DDL, settings, and event-analysis \
+                 statements have no plan to explain"
+                    .to_string(),
+            )));
+        }
         let physical = self.plan(inner)?;
         let lines = explain::describe(&physical)?;
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -326,21 +352,29 @@ impl Runtime {
     }
 }
 
-/// Open the learned-stats catalog that lives NEXT TO the config file
-/// (`<config-stem>.stats.sqlite`, one catalog per configuration), or `None` for
-/// a programmatically built config with no source path.
-fn open_stats_catalog(config: &Config) -> Result<Option<Arc<StatsCatalog>>, RuntimeError> {
-    let Some(source_path) = config.source_path.as_deref() else {
-        return Ok(None);
-    };
+/// The path of the stats SQLite that lives NEXT TO the config file
+/// (`<config-stem>.stats.sqlite`, one per configuration; it also carries the
+/// materialized-view and event-view registries), or `None` for a
+/// programmatically built config with no source path.
+pub(crate) fn stats_sqlite_path(config: &Config) -> Option<std::path::PathBuf> {
+    let source_path = config.source_path.as_deref()?;
     let path = std::path::Path::new(source_path);
     let stem = path
         .file_stem()
         .map_or_else(|| "fedq".to_string(), |s| s.to_string_lossy().to_string());
-    let stats_path = path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join(stem + ".stats.sqlite");
+    Some(
+        path.parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(stem + ".stats.sqlite"),
+    )
+}
+
+/// Open the learned-stats catalog at the config's stats SQLite path, or
+/// `None` for a config with no source path.
+fn open_stats_catalog(config: &Config) -> Result<Option<Arc<StatsCatalog>>, RuntimeError> {
+    let Some(stats_path) = stats_sqlite_path(config) else {
+        return Ok(None);
+    };
     let catalog = StatsCatalog::open(&stats_path.to_string_lossy())?;
     Ok(Some(Arc::new(catalog)))
 }

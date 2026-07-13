@@ -24,6 +24,9 @@ fq-exec = { path = "../fq-exec" }
 # Materialized-view store: the DDL surface (CREATE/REFRESH/DROP MATERIALIZED
 # VIEW) executes here and persists through fq-accel.
 fq-accel = { path = "../fq-accel" }
+# Event analytics: the EVENT VIEW contract, role registry, and the FUNNEL /
+# SEGMENT kernels; the runtime composes it with fq-accel's storage.
+fq-events = { path = "../fq-events" }
 # The result rename rebuilds the final RecordBatch/Schema under user-visible names.
 arrow = "58"
 # Datasource connection params arrive as raw YAML values on DataSourceConfig.
