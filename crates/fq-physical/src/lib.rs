@@ -11,6 +11,7 @@ mod relation_sql;
 pub mod single_source;
 pub mod steps;
 
+pub use dim_shipping::ShipThresholds;
 pub use error::PhysicalError;
 pub use planner::PhysicalPlanner;
 pub use steps::{

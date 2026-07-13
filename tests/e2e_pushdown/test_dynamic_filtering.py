@@ -32,6 +32,27 @@ def _injected_scan(multi_source_env, sql):
     return None
 
 
+def _all_injected_scans(multi_source_env, sql):
+    """Map every EXPLAIN scan tagged with a dynamic-filter injection to its column.
+
+    The engine's EXPLAIN runs the SAME winners pre-pass the step emitter runs and
+    tags each scan it will reduce with ``+inject(<column>)``. This collects them as
+    ``{datasource: column}`` so a test can assert which sides are (and are not)
+    reduced by the semi-join reduction.
+    """
+    runtime = build_runtime(multi_source_env)
+    injected = {}
+    for line in runtime.explain_text(sql).splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("Scan [") or "+inject(" not in stripped:
+            continue
+        datasource = stripped[len("Scan [") : stripped.index("]")]
+        tag_start = stripped.index("+inject(") + len("+inject(")
+        column = stripped[tag_start : stripped.index(")", tag_start)]
+        injected[datasource] = column
+    return injected
+
+
 def test_cross_source_join_pushes_dynamic_filter(multi_source_env):
     """The probe scan carries an injected dynamic filter from the build keys.
 
@@ -136,11 +157,16 @@ def test_build_side_chosen_by_filter_regardless_of_order(multi_source_env):
 
 
 def test_computed_build_side_still_reduces_the_probe(multi_source_env):
-    """A build side that is itself a JOIN (not a plain scan) must still donate
-    its distinct keys: the reduction machinery is generic downstream, and the
-    gate does not require plain scans on BOTH sides. The chain
-    (customers JOIN orders) JOIN products must inject the pair's product ids
-    into the products scan."""
+    """A build side that is itself a JOIN (not a plain scan) still donates its
+    distinct keys; the reduction machinery does not require plain scans on both
+    sides.
+
+    Orientation (current Rust cost-based plan): for the chain
+    (customers JOIN orders) JOIN products, the cost model reduces the ORDERS
+    probe - the filtered customers build donates its customer ids, so the orders
+    scan carries ``+inject(customer_id)``. The products scan receives NO
+    injection under this orientation. The reduction never changes the result.
+    """
     runtime = build_runtime(multi_source_env)
     sql = (
         "SELECT O.order_id "
@@ -149,21 +175,15 @@ def test_computed_build_side_still_reduces_the_probe(multi_source_env):
         "JOIN duckdb_products.main.products P ON O.product_id = P.id "
         "WHERE C.segment = 'enterprise'"
     )
-    plan = runtime.query_executor._plan_pipeline(sql, None)
-    ir = build_ir(plan)
-    injected = []
-    for step in ir["steps"]:
-        if step.get("op") == "injected_scan":
-            injected.append(step)
-    products_injections = []
-    for step in injected:
-        if step["datasource"] == "duckdb_products":
-            products_injections.append(step)
-    assert products_injections, f"no injection into products; steps: {injected}"
-    assert products_injections[0]["inject_column"] == "id"
-    # And the reduced plan computes the same rows as the unreduced semantics.
+    injected = _all_injected_scans(multi_source_env, sql)
+    # orders (the probe) is reduced by the computed customers-side keys.
+    assert injected.get("duckdb_orders") == "customer_id"
+    # products receives no injection under this orientation.
+    assert "duckdb_products" not in injected
+    # The reduced plan computes the same rows as the unreduced semantics:
+    # enterprise customers 1,2 -> orders 1,2,6,7, all with a known product id.
     result = runtime.execute(sql)
-    assert result.num_rows > 0
+    assert result.num_rows == 4
 
 
 def test_large_key_set_against_duckdb_probe_is_correct():

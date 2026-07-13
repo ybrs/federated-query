@@ -9,6 +9,7 @@
 //! result rows - and clearly labeled as a structural (uncosted) description.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use fq_physical::steps::planned_injections;
 use fq_physical::{render_remote_set_op, render_scan_sql, StepError};
@@ -44,8 +45,33 @@ pub fn describe(plan: &PhysicalPlan) -> Result<Vec<String>, StepError> {
     // a `+inject(<column>)` tag, so the semi-join reduction is visible in the
     // plan dump without executing anything.
     let injections = planned_injections(plan);
-    describe_into(plan, 0, &injections, &mut lines)?;
+    // Each distinct CTE producer allocation gets one small id, printed on its
+    // `Cte` producer line AND on every `CteScan` that reads it, so that a body
+    // materialized ONCE and shared by many references is visible in the dump.
+    let producer_ids = cte_producer_ids(plan);
+    describe_into(plan, 0, &injections, &producer_ids, &mut lines)?;
     Ok(lines)
+}
+
+/// Assign each distinct CTE producer (by allocation address) a small sequential
+/// id. A `CteScan` keys on its shared producer's address, so two references to
+/// one materialized body resolve to the SAME id.
+fn cte_producer_ids(plan: &PhysicalPlan) -> HashMap<*const PhysicalPlan, usize> {
+    let mut ids = HashMap::new();
+    assign_producer_ids(plan, &mut ids);
+    ids
+}
+
+/// Walk the tree registering every CTE producer address in first-seen order.
+fn assign_producer_ids(plan: &PhysicalPlan, ids: &mut HashMap<*const PhysicalPlan, usize>) {
+    if let PhysicalPlan::CteScan(node) = plan {
+        let key = Arc::as_ptr(&node.producer);
+        let next = ids.len();
+        ids.entry(key).or_insert(next);
+    }
+    for child in plan.children() {
+        assign_producer_ids(child, ids);
+    }
 }
 
 /// Append one `depth`-indented label for `plan`, then recurse into its children.
@@ -53,10 +79,11 @@ fn describe_into(
     plan: &PhysicalPlan,
     depth: usize,
     injections: &HashMap<*const PhysicalPlan, String>,
+    producer_ids: &HashMap<*const PhysicalPlan, usize>,
     lines: &mut Vec<String>,
 ) -> Result<(), StepError> {
     let indent = "  ".repeat(depth);
-    let mut label = node_label(plan)?;
+    let mut label = node_label(plan, producer_ids)?;
     if let Some(column) = injections.get(&std::ptr::from_ref(plan)) {
         label = tag_injected(&label, column);
     }
@@ -68,9 +95,19 @@ fn describe_into(
         return Ok(());
     }
     for child in plan.children() {
-        describe_into(child, depth + 1, injections, lines)?;
+        describe_into(child, depth + 1, injections, producer_ids, lines)?;
     }
     Ok(())
+}
+
+/// The CTE name carried by a `CteScan`'s producer. The producer is always a
+/// `PhysicalPlan::Cte` (the planner builds it that way); any other node is a
+/// violated invariant surfaced loudly rather than mislabeled.
+fn producer_cte_name(producer: &PhysicalPlan) -> &str {
+    match producer {
+        PhysicalPlan::Cte(node) => &node.name,
+        _ => unreachable!("a CteScan producer must be a PhysicalPlan::Cte"),
+    }
 }
 
 /// Insert a `+inject(<column>)` tag into a node label. The tag sits BEFORE the
@@ -108,7 +145,10 @@ fn one_line(sql: &str) -> String {
 /// renders its effective pushed SQL through the SAME renderer the execution plane
 /// uses (`render_scan_sql`), so the plan dump shows the exact SELECT sent to the
 /// source with every folded filter/aggregate/group-by/order/limit/DISTINCT.
-fn node_label(plan: &PhysicalPlan) -> Result<String, StepError> {
+fn node_label(
+    plan: &PhysicalPlan,
+    producer_ids: &HashMap<*const PhysicalPlan, usize>,
+) -> Result<String, StepError> {
     let label = match plan {
         PhysicalPlan::Scan(node) => {
             format!(
@@ -127,8 +167,25 @@ fn node_label(plan: &PhysicalPlan) -> Result<String, StepError> {
         PhysicalPlan::Gather(node) => {
             format!("Gather [{}] :: {}", node.datasource, one_line(&node.query))
         }
-        PhysicalPlan::Cte(_) => "Cte".to_string(),
-        PhysicalPlan::CteScan(_) => "CteScan".to_string(),
+        // The producer carries its CTE name and its shared-allocation id. When it
+        // is reached as a CteScan child its address is the scan's producer key, so
+        // the id here matches the id on every reading CteScan.
+        PhysicalPlan::Cte(node) => {
+            let id = producer_ids
+                .get(&std::ptr::from_ref(plan))
+                .copied()
+                .unwrap_or(0);
+            format!("Cte [{}] #{}", node.name, id)
+        }
+        // A reference names the CTE it reads and the id of the SHARED producer, so
+        // two references over one materialized body print the same #id.
+        PhysicalPlan::CteScan(node) => {
+            let id = producer_ids
+                .get(&Arc::as_ptr(&node.producer))
+                .copied()
+                .unwrap_or(0);
+            format!("CteScan [{}] #{}", producer_cte_name(&node.producer), id)
+        }
         PhysicalPlan::Shipment(node) => {
             format!("Shipment {} [{}]", node.table, node.datasource)
         }

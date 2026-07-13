@@ -46,10 +46,16 @@ class RustRuntime:
     ``duckdb_primary``).
     """
 
-    def __init__(self, sources):
-        """Write the config for the given (name, path) pairs and open the engine."""
+    def __init__(self, sources, optimizer_config=None):
+        """Write the config for the given (name, path) pairs and open the engine.
+
+        ``optimizer_config`` is an optional dict written verbatim into the YAML
+        ``optimizer:`` section (e.g. lowering the dim-shipping gates so shipping
+        fires on tiny fixture data). Its keys must be real optimizer-config field
+        names; the engine rejects an unknown key loudly.
+        """
         fedq = _import_fedq()
-        self._config_path = _write_config(sources)
+        self._config_path = _write_config(sources, optimizer_config)
         self._runtime = fedq.Runtime(self._config_path)
 
     def execute(self, sql):
@@ -109,18 +115,34 @@ def _parse_remote_line(raw):
     return (datasource, sql_text)
 
 
-def _write_config(sources):
-    """Write a temp YAML config with one DuckDB datasource per (name, path) pair."""
+def _write_config(sources, optimizer_config=None):
+    """Write a temp YAML config with one DuckDB datasource per (name, path) pair.
+
+    When ``optimizer_config`` is given, an ``optimizer:`` section carrying its
+    keys is appended, so a test can retune the engine (e.g. the dim-shipping
+    gates) through configuration alone.
+    """
     lines = ["datasources:"]
     for name, path in sources:
         lines.append("  " + name + ":")
         lines.append("    type: duckdb")
         lines.append("    path: " + path)
+    if optimizer_config:
+        lines.append("optimizer:")
+        for key, value in optimizer_config.items():
+            lines.append("  " + str(key) + ": " + _yaml_scalar(value))
     text = "\n".join(lines) + "\n"
     handle = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
     handle.write(text)
     handle.close()
     return handle.name
+
+
+def _yaml_scalar(value):
+    """Render a Python scalar as a YAML scalar (bools lowercased, else str())."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
 
 
 def assert_raises_engine_error(match=None):

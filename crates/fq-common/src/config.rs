@@ -33,9 +33,13 @@ pub struct DataSourceConfig {
     pub capabilities: Vec<String>,
 }
 
-/// Configuration for the query optimizer: the rule enable flags and the
-/// join-reorder bound.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// Configuration for the query optimizer: the rule enable flags, the
+/// join-reorder bound, and the dim-shipping size/cardinality gates.
+///
+/// The gates are configuration, not compile-time constants: a small-fixture test
+/// lowers them through the YAML `optimizer:` section to make shipping fire on
+/// tiny data, and a production deployment can retune them without a rebuild.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct OptimizerConfig {
     pub enable_predicate_pushdown: bool,
@@ -50,12 +54,30 @@ pub struct OptimizerConfig {
     /// (`fq_common::PlanBudget`). Raise it explicitly for a genuine edge case;
     /// there is no off switch.
     pub planning_budget_ms: u64,
+    /// Dim shipping: the fact (local) side must clear this many rows before a
+    /// dimension ships into it; below it the fact transfer is cheap and the
+    /// temp-table build is not worth it.
+    pub ship_local_floor: u64,
+    /// Dim shipping: never ship more than this many foreign rows into a source; a
+    /// big shipped dim costs a big build AND means the fact is not the dominant
+    /// transfer.
+    pub ship_row_budget: u64,
+    /// Dim shipping: the local (fact) side must exceed the shipped foreign side by
+    /// at least this factor.
+    pub ship_min_ratio: u64,
+    /// Dim shipping: a group-key dimension with NDV at or above this is
+    /// high-cardinality (two independent high-card dimensions do not collapse).
+    pub ship_high_card_ndv: i64,
+    /// Dim shipping: a ship-target aggregate whose measured group count keeps more
+    /// than this fraction of its estimated input rows does not collapse.
+    pub ship_collapse_max_fraction: f64,
 }
 
 impl Default for OptimizerConfig {
     /// Mirrors the Python defaults: every rule on, DP up to 10 tables. The
     /// planning budget is Rust-new: 100ms, far above a healthy metadata-only
-    /// plan and far below any plan-time data scan.
+    /// plan and far below any plan-time data scan. The ship gates carry the
+    /// values dim shipping was tuned against on TPC-DS.
     fn default() -> Self {
         Self {
             enable_predicate_pushdown: true,
@@ -64,6 +86,11 @@ impl Default for OptimizerConfig {
             enable_decorrelation: true,
             max_join_reorder_size: 10,
             planning_budget_ms: 100,
+            ship_local_floor: 100_000,
+            ship_row_budget: 200_000,
+            ship_min_ratio: 20,
+            ship_high_card_ndv: 10_000,
+            ship_collapse_max_fraction: 0.1,
         }
     }
 }

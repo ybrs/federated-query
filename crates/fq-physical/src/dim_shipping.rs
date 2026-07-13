@@ -24,6 +24,7 @@ use std::rc::Rc;
 
 use fq_catalog::datasource::{DataSourceCapability, RenderDialect};
 use fq_catalog::StatsCatalog;
+use fq_common::OptimizerConfig;
 use fq_optimize::cost::group_subject;
 use fq_optimize::{group_column_names, CostModel};
 use fq_plan::expr::Expr;
@@ -35,28 +36,53 @@ use crate::planner::PhysicalPlanner;
 
 type Result<T> = std::result::Result<T, PhysicalError>;
 
-// --- constants (values are dim_shipping.py lines 46-81) --------
+// --- temp-table schema qualifiers (a physical capability, not a tunable gate) ---
 
-/// DuckDB `CREATE TEMP TABLE` schema qualifier (`_DUCK_SHIP_SCHEMA`).
+/// DuckDB `CREATE TEMP TABLE` schema qualifier.
 const DUCK_SHIP_SCHEMA: &str = "temp";
-/// Postgres session temp-table schema qualifier (`_PG_SHIP_SCHEMA`).
+/// Postgres session temp-table schema qualifier.
 const PG_SHIP_SCHEMA: &str = "pg_temp";
-/// The fact side must clear this many rows; below it the fact transfer is cheap
-/// and the temp-table build is not worth it (`SHIP_LOCAL_FLOOR`).
-const SHIP_LOCAL_FLOOR: u64 = 100_000;
-/// Never ship more than this many foreign rows into a source: a big shipped dim
-/// costs a big build AND means the fact is not the dominant transfer (excludes the
-/// q38/q87 ~500k customer regressions) (`SHIP_ROW_BUDGET`).
-const SHIP_ROW_BUDGET: u64 = 200_000;
-/// The local side must exceed the shipped foreign side by at least this factor
-/// (`SHIP_MIN_RATIO`).
-const SHIP_MIN_RATIO: u64 = 20;
-/// A group-key dimension with NDV >= this is high-cardinality; 10k sits with wide
-/// margin between every TPC-DS dim that ships (`HIGH_CARD_NDV`).
-const HIGH_CARD_NDV: i64 = 10_000;
-/// A ship-target aggregate whose MEASURED group count keeps more than this fraction
-/// of its estimated input rows does not collapse (`SHIP_COLLAPSE_MAX_FRACTION`).
-const SHIP_COLLAPSE_MAX_FRACTION: f64 = 0.1;
+
+/// The dim-shipping size/cardinality gates, drawn from `OptimizerConfig`. Held on
+/// the `PhysicalPlanner` and read by every gate, so the thresholds are engine
+/// configuration (retunable through the YAML `optimizer:` section) rather than
+/// compile-time constants. `from_config` is the ONLY source of the values; the
+/// defaults live once in `OptimizerConfig::default`.
+#[derive(Debug, Clone)]
+pub struct ShipThresholds {
+    /// The fact side must clear this many rows to justify a shipped temp table.
+    pub local_floor: u64,
+    /// Never ship more than this many foreign rows into a source.
+    pub row_budget: u64,
+    /// The local side must exceed the shipped foreign side by this factor.
+    pub min_ratio: u64,
+    /// A group-key dimension with NDV at or above this is high-cardinality.
+    pub high_card_ndv: i64,
+    /// A measured group count above this fraction of the input does not collapse.
+    pub collapse_max_fraction: f64,
+}
+
+impl ShipThresholds {
+    /// Read the five ship gates off an optimizer config.
+    #[must_use]
+    pub fn from_config(config: &OptimizerConfig) -> Self {
+        Self {
+            local_floor: config.ship_local_floor,
+            row_budget: config.ship_row_budget,
+            min_ratio: config.ship_min_ratio,
+            high_card_ndv: config.ship_high_card_ndv,
+            collapse_max_fraction: config.ship_collapse_max_fraction,
+        }
+    }
+}
+
+impl Default for ShipThresholds {
+    /// The default gates, sourced from `OptimizerConfig::default` so the values
+    /// live in exactly one place.
+    fn default() -> Self {
+        Self::from_config(&OptimizerConfig::default())
+    }
+}
 
 /// A base scan's identity within the analyzed tree: its ADDRESS. The tree is
 /// borrowed (never cloned) from `collect_base_scans` through `replace`, so a scan's
@@ -111,6 +137,9 @@ fn analyze(planner: &mut PhysicalPlanner, node: &LogicalPlan) -> Result<Option<S
     let Some(cost_rc) = planner.cost_model().map(Rc::clone) else {
         return Ok(None);
     };
+    // The configured gates (from OptimizerConfig), cloned so the analysis holds no
+    // borrow of the planner while the cost model below borrows it mutably.
+    let thresholds = planner.ship_thresholds().clone();
     // 3. SHIPPABLE SHAPE. 4. PLAIN-AGGREGATE-COLLAPSE ROOT.
     if !is_shippable_shape(node) || !collapses_via_aggregate(node) {
         return Ok(None);
@@ -120,7 +149,13 @@ fn analyze(planner: &mut PhysicalPlanner, node: &LogicalPlan) -> Result<Option<S
     let ttl = planner.learned_ttl_seconds();
     {
         let mut cost_model = cost_rc.borrow_mut();
-        if dimension_explosion(&mut cost_model, stats_catalog.as_deref(), ttl, node)? {
+        if dimension_explosion(
+            &mut cost_model,
+            stats_catalog.as_deref(),
+            ttl,
+            node,
+            &thresholds,
+        )? {
             return Ok(None);
         }
     }
@@ -148,7 +183,7 @@ fn analyze(planner: &mut PhysicalPlanner, node: &LogicalPlan) -> Result<Option<S
         return Ok(None);
     }
     // 9. COST GATE.
-    if !cost_gate_passes(&scans, &rows, &local, &foreign) {
+    if !cost_gate_passes(&scans, &rows, &local, &foreign, &thresholds) {
         return Ok(None);
     }
     Ok(Some(ShipAnalysis { local, rows }))
@@ -192,12 +227,13 @@ fn dimension_explosion(
     stats: Option<&StatsCatalog>,
     ttl: Option<i64>,
     node: &LogicalPlan,
+    thresholds: &ShipThresholds,
 ) -> Result<bool> {
-    if let Some(measured) = measured_explosion(cost_model, stats, ttl, node)? {
+    if let Some(measured) = measured_explosion(cost_model, stats, ttl, node, thresholds)? {
         return Ok(measured);
     }
     let agg = expect_ship_aggregate(node);
-    Ok(count_high_dimensions(cost_model, agg)? >= 2)
+    Ok(count_high_dimensions(cost_model, agg, thresholds)? >= 2)
 }
 
 /// The MEASURED collapse verdict, or `None` when nothing was learned / the input
@@ -208,6 +244,7 @@ fn measured_explosion(
     stats: Option<&StatsCatalog>,
     ttl: Option<i64>,
     node: &LogicalPlan,
+    thresholds: &ShipThresholds,
 ) -> Result<Option<bool>> {
     let Some(observation) = island_group_observation(node) else {
         return Ok(None);
@@ -221,7 +258,9 @@ fn measured_explosion(
     let Some(input_rows) = input_rows.filter(|&rows| rows != 0) else {
         return Ok(None);
     };
-    Ok(Some(measured_collapse_exceeds(groups, input_rows)))
+    Ok(Some(measured_collapse_exceeds(
+        groups, input_rows, thresholds,
+    )))
 }
 
 /// The catalog's MEASURED group count for a stamped subject/key set, or `None`
@@ -242,11 +281,15 @@ fn learned_group_count(
 /// The number of distinct source dimensions contributing a high-card group key.
 /// Correlated keys from ONE relation share an owner (pointer identity) and count
 /// once; an ownerless high-card key counts as its own dimension.
-fn count_high_dimensions(cost_model: &CostModel, agg: &Aggregate) -> Result<usize> {
+fn count_high_dimensions(
+    cost_model: &CostModel,
+    agg: &Aggregate,
+    thresholds: &ShipThresholds,
+) -> Result<usize> {
     let mut owners: HashSet<usize> = HashSet::new();
     let mut ownerless = 0usize;
     for key in &agg.group_by {
-        let (contributes, owner) = high_card_owner(cost_model, agg, key)?;
+        let (contributes, owner) = high_card_owner(cost_model, agg, key, thresholds)?;
         if !contributes {
             continue;
         }
@@ -268,10 +311,11 @@ fn high_card_owner(
     cost_model: &CostModel,
     agg: &Aggregate,
     key: &Expr,
+    thresholds: &ShipThresholds,
 ) -> Result<(bool, Option<usize>)> {
     let (owner, ndv) = cost_model.group_key_dimension(&agg.input, key)?;
     if let Some(ndv) = ndv {
-        if ndv < HIGH_CARD_NDV {
+        if ndv < thresholds.high_card_ndv {
             return Ok((false, None));
         }
     }
@@ -511,8 +555,8 @@ fn expect_ship_aggregate(node: &LogicalPlan) -> &Aggregate {
 /// the estimated input rows (the explosion verdict). Both sizes are large heuristic
 /// counts; the f64 widening is a threshold judgement, not an exact arithmetic.
 #[allow(clippy::cast_precision_loss)]
-fn measured_collapse_exceeds(groups: i64, input_rows: u64) -> bool {
-    groups as f64 > input_rows as f64 * SHIP_COLLAPSE_MAX_FRACTION
+fn measured_collapse_exceeds(groups: i64, input_rows: u64, thresholds: &ShipThresholds) -> bool {
+    groups as f64 > input_rows as f64 * thresholds.collapse_max_fraction
 }
 
 /// The learned-stats group provenance to stamp on the shipped island: the PRE-SHIP
@@ -614,13 +658,14 @@ fn cost_gate_passes(
     rows: &HashMap<ScanId, Option<u64>>,
     local: &str,
     foreign: &[&Scan],
+    thresholds: &ShipThresholds,
 ) -> bool {
     if !all_estimated(rows, foreign) {
         return false;
     }
     let local_rows = max_rows(scans, rows, local);
     let foreign_rows = sum_rows(rows, foreign);
-    ratio_ok(local_rows, foreign_rows)
+    ratio_ok(local_rows, foreign_rows, thresholds)
 }
 
 /// True when every foreign scan carries a row estimate: a single unknown foreign
@@ -657,14 +702,14 @@ fn sum_rows(rows: &HashMap<ScanId, Option<u64>>, foreign: &[&Scan]) -> u64 {
 
 /// The floor / budget / ratio gates on the two side sizes. The multiply is widened
 /// to u128 to avoid a u64 overflow on `foreign_rows * SHIP_MIN_RATIO`.
-fn ratio_ok(local_rows: u64, foreign_rows: u64) -> bool {
-    if local_rows < SHIP_LOCAL_FLOOR {
+fn ratio_ok(local_rows: u64, foreign_rows: u64, thresholds: &ShipThresholds) -> bool {
+    if local_rows < thresholds.local_floor {
         return false;
     }
-    if foreign_rows > SHIP_ROW_BUDGET {
+    if foreign_rows > thresholds.row_budget {
         return false;
     }
-    u128::from(local_rows) >= u128::from(foreign_rows) * u128::from(SHIP_MIN_RATIO)
+    u128::from(local_rows) >= u128::from(foreign_rows) * u128::from(thresholds.min_ratio)
 }
 
 /// The collapsed island must expose EXACTLY the columns (in order) that the pure
@@ -699,7 +744,7 @@ mod tests {
     use fq_plan::expr::{ColumnRef, Expr};
     use fq_plan::logical::{Aggregate, Join, JoinType, LogicalPlan, Scan};
 
-    use super::{dimension_explosion, island_group_observation, GroupObservation};
+    use super::{dimension_explosion, island_group_observation, GroupObservation, ShipThresholds};
 
     /// A table's row count and per-column NDV statistics.
     type TableStats = (Option<i64>, BTreeMap<String, ColumnStatistics>);
@@ -889,7 +934,9 @@ mod tests {
             vec![col("item", "i_item_sk"), col("date_dim", "d_date")],
         );
         let mut cost = cost_model(None);
-        assert!(dimension_explosion(&mut cost, None, None, &node).unwrap());
+        assert!(
+            dimension_explosion(&mut cost, None, None, &node, &ShipThresholds::default()).unwrap()
+        );
     }
 
     #[test]
@@ -905,7 +952,9 @@ mod tests {
             vec![col("item", "i_item_sk"), col("item", "i_item_desc")],
         );
         let mut cost = cost_model(None);
-        assert!(!dimension_explosion(&mut cost, None, None, &node).unwrap());
+        assert!(
+            !dimension_explosion(&mut cost, None, None, &node, &ShipThresholds::default()).unwrap()
+        );
     }
 
     #[test]
@@ -917,7 +966,9 @@ mod tests {
             vec![col("item", "i_item_sk"), col("store", "s_state")],
         );
         let mut cost = cost_model(None);
-        assert!(!dimension_explosion(&mut cost, None, None, &node).unwrap());
+        assert!(
+            !dimension_explosion(&mut cost, None, None, &node, &ShipThresholds::default()).unwrap()
+        );
     }
 
     #[test]
@@ -933,7 +984,9 @@ mod tests {
             ],
         );
         let mut cost = cost_model(None);
-        assert!(!dimension_explosion(&mut cost, None, None, &node).unwrap());
+        assert!(
+            !dimension_explosion(&mut cost, None, None, &node, &ShipThresholds::default()).unwrap()
+        );
     }
 
     #[test]
@@ -946,7 +999,9 @@ mod tests {
             vec![col("item", "i_item_sk"), col("mystery", "m_key")],
         );
         let mut cost = cost_model(None);
-        assert!(dimension_explosion(&mut cost, None, None, &node).unwrap());
+        assert!(
+            dimension_explosion(&mut cost, None, None, &node, &ShipThresholds::default()).unwrap()
+        );
     }
 
     #[test]
@@ -976,7 +1031,14 @@ mod tests {
             )
             .expect("record group");
         let mut cost = cost_model(Some(Arc::clone(&learned)));
-        assert!(!dimension_explosion(&mut cost, Some(&learned), None, &node).unwrap());
+        assert!(!dimension_explosion(
+            &mut cost,
+            Some(&learned),
+            None,
+            &node,
+            &ShipThresholds::default()
+        )
+        .unwrap());
     }
 
     #[test]
@@ -1005,7 +1067,14 @@ mod tests {
             )
             .expect("record group");
         let mut cost = cost_model(Some(Arc::clone(&learned)));
-        assert!(dimension_explosion(&mut cost, Some(&learned), None, &node).unwrap());
+        assert!(dimension_explosion(
+            &mut cost,
+            Some(&learned),
+            None,
+            &node,
+            &ShipThresholds::default()
+        )
+        .unwrap());
     }
 
     #[test]

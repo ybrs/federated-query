@@ -33,7 +33,7 @@ use fq_plan::physical::{
     PhysicalWindow,
 };
 
-use crate::dim_shipping::DimShipping;
+use crate::dim_shipping::{DimShipping, ShipThresholds};
 use crate::error::PhysicalError;
 use crate::single_source::SingleSourcePushdown;
 
@@ -76,6 +76,9 @@ pub struct PhysicalPlanner {
     /// Freshness bound (seconds) for a learned group count; None = no bound.
     /// Matches the collector's `learned_ttl_seconds` so both read the same slot.
     learned_ttl_seconds: Option<i64>,
+    /// The dim-shipping size/cardinality gates (from `OptimizerConfig`). Defaults
+    /// to the tuned constants; a runtime overrides them from its loaded config.
+    ship_thresholds: ShipThresholds,
 }
 
 impl PhysicalPlanner {
@@ -93,7 +96,17 @@ impl PhysicalPlanner {
             cte_producers: HashMap::new(),
             stats_catalog: None,
             learned_ttl_seconds: None,
+            ship_thresholds: ShipThresholds::default(),
         }
+    }
+
+    /// Override the dim-shipping gates with the ones drawn from the engine's
+    /// optimizer config, so a deployment (or a small-fixture test) retunes them
+    /// through the YAML `optimizer:` section without a rebuild.
+    #[must_use]
+    pub fn with_ship_thresholds(mut self, ship_thresholds: ShipThresholds) -> Self {
+        self.ship_thresholds = ship_thresholds;
+        self
     }
 
     /// Wire the learned-stats catalog (and its freshness bound) dim shipping reads
@@ -200,6 +213,11 @@ impl PhysicalPlanner {
     /// The learned-stats freshness bound (seconds), for the measured group read.
     pub(crate) fn learned_ttl_seconds(&self) -> Option<i64> {
         self.learned_ttl_seconds
+    }
+
+    /// The dim-shipping gates in force for this plan, for the shipping rule.
+    pub(crate) fn ship_thresholds(&self) -> &ShipThresholds {
+        &self.ship_thresholds
     }
 
     /// Collect every base `Scan` in a subtree (CTE references excluded, since a

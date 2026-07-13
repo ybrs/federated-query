@@ -29,7 +29,7 @@ use fq_exec::{connectors, execute_plan};
 use fq_optimize::{build_optimizer, CostModel, StatisticsCollector};
 use fq_parse::parse_with_catalog;
 use fq_physical::steps::Observation;
-use fq_physical::PhysicalPlanner;
+use fq_physical::{PhysicalPlanner, ShipThresholds};
 use fq_plan::logical::LogicalPlan;
 use fq_plan::output_column_names;
 use fq_plan::physical::PhysicalPlan;
@@ -126,7 +126,12 @@ impl Runtime {
         self.stats.set_plan_budget(stages.budget);
         let optimized = self.optimize(sql, &mut stages)?;
         let cost_model = Rc::new(RefCell::new(self.cost_model()));
-        let mut planner = PhysicalPlanner::new(Arc::clone(&self.catalog), Some(cost_model));
+        // The dim-shipping gates come from THIS runtime's optimizer config, so a
+        // config that lowers them (small fixtures) or raises them (kill switch)
+        // governs whether a dimension ships.
+        let ship_thresholds = ShipThresholds::from_config(&self.config.optimizer);
+        let mut planner = PhysicalPlanner::new(Arc::clone(&self.catalog), Some(cost_model))
+            .with_ship_thresholds(ship_thresholds);
         let physical = planner.plan(&optimized)?;
         stages.finish("physical")?;
         Ok(physical)
