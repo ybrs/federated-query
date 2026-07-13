@@ -112,33 +112,37 @@ Landed fixes (each with unit tests pinning the behavior):
    sees through row-preserving wrappers (Filter/Sort/Limit/GroupedLimit/
    SingleRowGuard).
 
-Remaining SF10 tail (ranked by warm excess vs DuckDB; diagnoses measured,
-fixes NOT started):
+Remaining SF10 tail (pg-dims geomean 1.25x; every item root-caused to the
+exact blocking gate; a fix attempt for q06's estimate REGRESSED and was
+reverted, so these are measured diagnoses, not guesses):
 
-- q04 +2.6s (2.99x): the year_total branch join+aggregate still runs on the
-  coordinator (customer 500k rows exceeds the 200k dim-ship budget; CTE-root
-  shape misses the shippable gate). Candidate: aggregate-collapse-aware ship
-  budget or eager aggregation below the customer join. Same class: q11, q23.
-- q78 +2.2s (2.78x): three channel CTEs (sales-minus-returns joins) pulled
-  and joined on the coordinator.
-- q95 +1.7s (2.75x): the ws_wh self-join CTE materializes 74.8M rows and
-  PULLS them to the coordinator; the EXISTS consumers should keep it inside
-  duck (q16 proves the pushed EXISTS shape works).
-- q39 +1.3s (4.14x): unchanged by producer sharing - the shipped duck island
-  re-runs per consumer (4 identical 381k-row island scans). The binding is
-  shared at step level; investigate why the island SourceScan re-executes.
-- q06 +1.2s (6.65x): the date filter arrives via a scalar subquery
-  (d_month_seq = (SELECT ...)), semi-join reduction cannot derive keys from
-  it, so 28.8M store_sales rows cross unfiltered. Needs scalar-first
-  evaluation or a two-phase reduction.
-- q59 (3.4x): the consumers' week-range filter reaches the CTE body only as
-  a join, so the body aggregates ALL weeks of store_sales; CTEUnionFilter
-  pushdown translates literal filters only.
-- q02 (2.6x): web_sales+catalog_sales pulled whole for the same reason
-  (d_week_seq filter via join).
-- q15 (3.4x): customer x customer_address remote join is narrow (5 cols) but
-  the zip/state/price OR filter stays on the coordinator instead of inside
-  the pg query.
+- q06-class (q06 6.9x): the date keys ARE derived (the guard-driven
+  d_month_seq injection reduces date_dim to ~31 rows), but store_sales still
+  reads full 28.8M because steps/reduction.rs reduction_filters gates
+  (build_donates_whole_domain / useless_key_reduction) price date_dim at its
+  STATIC 73k rows - the dynamic injection is not credited. Crediting
+  post-injection cardinality (chained-NDV reduction) would cut store_sales to
+  ~480k; it is a structural change to the injection-winner pre-pass with
+  cross-query regression risk.
+- q95: ws_wh is a duck-only CTE referenced twice, but
+  SingleSourcePushdown::try_build has no CTE producer scope, so
+  absorb_cte_ref_base declines and the 74.8M-row self-join is pulled. Fix =
+  thread visible CTE definitions into pushdown and inline, so the duck-only
+  subtree pushes as q16's proven inline-EXISTS shape; semi-join/DISTINCT
+  semantics need care.
+- q59/q02: the week-range filter arrives via a JOIN on d_week_seq;
+  CTEUnionFilterPushdown::record_consumer only accepts a Filter parent, so
+  the shared CTE body aggregates all weeks. Deriving the week set needs a
+  semi-join reduction across the materialized CTE boundary.
+- q04/q11/q23 residual: coordinator aggregate; the dim-ship collapse gate
+  cannot yet be extended soundly (NDV-independence mis-estimates, see
+  dim-shipping-open-problems.md).
+- q39 (4.1x): NOT a sharing bug - the shipped island executes exactly once
+  (profiled); the cost is inherent (ship 3 dims + aggregate 26.5M inventory
+  + self-join).
+- q15: the (zip OR state OR cs_sales_price) disjunction spans BOTH sources;
+  pushing it into the pg query would drop rows qualifying only via the duck
+  fact column. The coordinator filter is CORRECT; there is nothing to push.
 
 ## How to run everything
 
