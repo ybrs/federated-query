@@ -63,12 +63,25 @@ struct SetOpModifiers<'e> {
     offset: Option<&'e Expression>,
 }
 
-/// A set operation polyglot swallowed into a scalar-subquery operand. Parsing
-/// `<select ending in a parenthesized subquery> UNION ALL <query>` attaches the
-/// trailing set operation to the subquery expression inside the first select's
-/// final WHERE/HAVING clause instead of combining the two statements; these are
-/// the detached pieces needed to rebuild the intended statement-level set
-/// operation.
+/// A set operation polyglot swallowed into a scalar-subquery operand.
+///
+/// UPSTREAM PARSER DEFECT (polyglot-sql 0.5.15): parsing
+/// `<select ending in a parenthesized scalar subquery> UNION ALL <query>`
+/// attaches the trailing set operation to the subquery expression inside the
+/// first select's final WHERE/HAVING clause - a bare
+/// `Union { left: Subquery, right: <next Select> }` on the rightmost operand
+/// spine of the predicate - instead of ending the statement and combining the
+/// two selects. Minimal reproduction:
+/// `SELECT a FROM t HAVING sum(b) > (SELECT c FROM u) UNION ALL SELECT d FROM v`
+/// (TPC-DS q14 hits it three times, each branch nesting inside the previous
+/// branch's HAVING). A genuine scalar set operation is always fully enclosed
+/// in a Subquery node, so the bare shape identifies the mis-attachment with no
+/// ambiguity; the regression tests pin both sides of that boundary. This whole
+/// repair (`SwallowedSetOp`, `spine_has_swallowed_set_op`,
+/// `detach_swallowed_set_op` and their call sites) exists ONLY to undo that
+/// mis-parse: the detection matches nothing a correctly-nesting parser
+/// produces. These are the detached pieces needed to rebuild the intended
+/// statement-level set operation.
 struct SwallowedSetOp {
     kind: SetOpKind,
     distinct: bool,

@@ -287,3 +287,7 @@ ea297bb fq-exec MC2 - Step bridge + first end-to-end Rust query execution
 (fq-physical M0-M4d, fq-emit, fq-optimize M1-M4, fq-decorrelate, fq-bind,
  fq-parse, connectors, scaffold: see git log)
 ```
+
+UPSTREAM WATCH: the q14 set-op repair in fq-parse convert.rs (SwallowedSetOp)
+works around a polyglot-sql 0.5.15 mis-nesting; when a polyglot release nests
+trailing set operations correctly, delete the repair block and its tests.
