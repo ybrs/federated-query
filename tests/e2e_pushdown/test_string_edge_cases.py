@@ -9,6 +9,7 @@ from tests.e2e_pushdown.helpers import (
     explain_datasource_query,
     unwrap_parens,
 )
+from tests.rust_runtime import assert_raises_engine_error
 
 
 def test_empty_string_vs_null(single_source_env):
@@ -142,7 +143,7 @@ def test_sql_injection_patterns_rejected(single_source_env):
         "SELECT order_id FROM duckdb_primary.main.orders "
         "WHERE region = ''; DROP TABLE orders; --'"
     )
-    with pytest.raises(ValueError):
+    with assert_raises_engine_error(match="single SQL statement"):
         explain_datasource_query(runtime, sql)
 
 

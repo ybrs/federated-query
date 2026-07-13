@@ -25,12 +25,49 @@ from tests.e2e_pushdown.helpers import (
 )
 
 
+def _marker_body_relation(exists_node):
+    """Return the ``__subq_``-aliased derived relation of an EXISTS body, or None.
+
+    The ``__subq_`` relation alias is synthesized ONLY by the decorrelation
+    pass, so an EXISTS whose body reads from such a relation is provably the
+    engine's rendering of a decorrelated SEMI/ANTI join, never a verbatim
+    pass-through of the user's subquery expression.
+    """
+    body = exists_node.this
+    if not isinstance(body, exp.Select):
+        return None
+    from_clause = body.args.get("from_")
+    if from_clause is None:
+        return None
+    relation = from_clause.this
+    if isinstance(relation, exp.Subquery) and relation.alias.startswith("__subq_"):
+        return relation
+    return None
+
+
+def _semi_join_marker_kind(exists_node):
+    """Classify an EXISTS node as the engine's SEMI/ANTI join rendering, or None.
+
+    The physical plan carries a real SEMI/ANTI join; the SQL emitter renders it
+    as ``[NOT ]EXISTS(SELECT 1 FROM (<body>) AS "__subq_N" WHERE <keys>)``
+    because canonical Postgres form has no SEMI JOIN syntax. Returns "SEMI",
+    "ANTI" (when the EXISTS sits under NOT), or None for any other EXISTS.
+    """
+    if _marker_body_relation(exists_node) is None:
+        return None
+    if isinstance(exists_node.parent, exp.Not):
+        return "ANTI"
+    return "SEMI"
+
+
 def _join_kinds(ast):
     """Collect the join-shape tokens of an AST.
 
     sqlglot records SEMI/ANTI under a join's ``kind`` but LEFT/RIGHT/FULL under
     its ``side``, so both are gathered; ``["SEMI", "SEMI"]`` for two semi joins,
-    ``["LEFT"]`` for one left join.
+    ``["LEFT"]`` for one left join. The engine renders a physical SEMI/ANTI
+    join as its EXISTS marker (see ``_semi_join_marker_kind``), so recognized
+    markers count as SEMI/ANTI joins here.
     """
     kinds = []
     for join in ast.args.get("joins") or []:
@@ -38,6 +75,10 @@ def _join_kinds(ast):
             value = join.args.get(key)
             if value:
                 kinds.append(str(value).upper())
+    for exists_node in ast.find_all(exp.Exists):
+        kind = _semi_join_marker_kind(exists_node)
+        if kind is not None:
+            kinds.append(kind)
     return kinds
 
 
@@ -46,8 +87,14 @@ def _assert_no_subquery_expressions(ast):
 
     A subquery in FROM/JOIN position is a derived-table *relation* and is
     decorrelation must leave the physical plan free of subquery expressions.
+    An EXISTS that is the engine's semi-join marker is the RENDERING of the
+    decorrelated join, not a surviving subquery expression; any other EXISTS
+    is a failure.
     """
-    assert not list(ast.find_all(exp.Exists)), "EXISTS survived decorrelation"
+    for exists_node in ast.find_all(exp.Exists):
+        assert (
+            _semi_join_marker_kind(exists_node) is not None
+        ), "EXISTS survived decorrelation"
     assert not list(ast.find_all(exp.Any)), "ANY survived decorrelation"
     assert not list(ast.find_all(exp.All)), "ALL survived decorrelation"
     for in_node in ast.find_all(exp.In):
@@ -59,7 +106,9 @@ def _assert_only_relation_subqueries(ast):
     """Assert every surviving Subquery sits in a relation position.
 
     FROM/JOIN derived tables and the derived table of a ``LATERAL`` (dependent)
-    join are relations, not subquery expressions, and are allowed.
+    join are relations, not subquery expressions, and are allowed; a semi-join
+    marker's ``__subq_`` relation sits under the EXISTS body's FROM, so it
+    passes the same relation-position rule.
     """
     for subquery in ast.find_all(exp.Subquery):
         parent = subquery.parent
@@ -576,10 +625,11 @@ def test_cross_datasource_subquery_fallback(multi_source_env):
     )
 
     # both sources receive a query (the cross-source fallback)
-    doc = runtime.explain(sql)
-    datasources = doc.get("datasources") or {}
-    assert len(datasources.get("duckdb_orders", [])) >= 1
-    assert len(datasources.get("duckdb_products", [])) >= 1
+    queried_sources = []
+    for datasource, _sql_text in runtime.explain_queries(sql):
+        queried_sources.append(datasource)
+    assert queried_sources.count("duckdb_orders") >= 1
+    assert queried_sources.count("duckdb_products") >= 1
 
     # and the result matches the same query on one combined database
     engine_rows = sorted(runtime.execute(sql).column(0).to_pylist())

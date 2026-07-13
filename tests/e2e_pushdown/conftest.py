@@ -15,6 +15,7 @@ from typing import List, Optional, Tuple
 import duckdb
 import pytest
 
+from federated_query.datasources.duckdb import DuckDBDataSource
 from tests.duckdb_tmp import duckdb_path
 
 
@@ -35,27 +36,19 @@ class SeededSource:
         self.connection.close()
 
 
-class ProxyingDuckDBDataSource:
+class ProxyingDuckDBDataSource(DuckDBDataSource):
     """A seeded DuckDB file built incrementally: connect, seed, then read.
 
-    Kept for suites that construct their own environment (connect, run seed
-    functions against ``connection``, then hand the source to a runtime). The
-    write connection stays open for seeding; ``path`` is what the engine reads.
+    Subclasses the real ``DuckDBDataSource`` so a Python ``Catalog`` can load its
+    metadata (``is_connected``/``list_schemas``/... come from the base). The write
+    connection opened by ``connect`` stays open for seeding; ``path`` is the file
+    the engine reads (the base names it ``db_path``, this exposes both).
     """
 
-    def __init__(self, name: str, config):
-        self.name = name
-        self.path = config["path"]
-        self.connection = None
-
-    def connect(self) -> None:
-        """Open the read-write connection used to seed this source."""
-        self.connection = duckdb.connect(self.path)
-
-    def disconnect(self) -> None:
-        """Close the seeding connection."""
-        if self.connection is not None:
-            self.connection.close()
+    @property
+    def path(self) -> str:
+        """The DuckDB file path (the runtime config is built from this)."""
+        return self.db_path
 
 
 class QueryEnvironment:

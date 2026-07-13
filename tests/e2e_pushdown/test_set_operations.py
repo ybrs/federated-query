@@ -236,11 +236,9 @@ def test_cross_datasource_union_fallback(multi_source_env):
         "SELECT customer_id FROM duckdb_customers.main.customers"
     )
 
-    doc = runtime.explain(sql)
-    datasources = doc.get("datasources") or {}
+    queried_sources = []
+    for datasource, _sql_text in runtime.explain_queries(sql):
+        queried_sources.append(datasource)
 
-    products_queries = datasources.get("duckdb_products", [])
-    customers_queries = datasources.get("duckdb_customers", [])
-
-    assert len(products_queries) >= 1
-    assert len(customers_queries) >= 1
+    assert queried_sources.count("duckdb_products") >= 1
+    assert queried_sources.count("duckdb_customers") >= 1

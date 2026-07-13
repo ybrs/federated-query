@@ -14,16 +14,52 @@ def build_runtime(env) -> RustRuntime:
     return runtime
 
 
+def _unwrap_setop_operand_parens(ast: exp.Expression) -> exp.Expression:
+    """Drop alias-less Subquery wrappers around set-operation operands.
+
+    The engine parenthesizes a nested set-operation operand (`(A UNION B)
+    INTERSECT C` - required syntax for correct precedence); sqlglot parses that
+    paren as a Subquery node around the inner set operation. The paren carries
+    no alias and no semantics, so unwrapping it lets tests assert the operand's
+    real node type. Aliased subqueries (derived tables) are left untouched.
+    """
+    for subquery in list(ast.find_all(exp.Subquery)):
+        parent = subquery.parent
+        is_operand = isinstance(parent, (exp.Union, exp.Intersect, exp.Except))
+        if is_operand and not subquery.alias:
+            subquery.replace(subquery.this)
+    if isinstance(ast, exp.Subquery) and not ast.alias:
+        return ast.this
+    return ast
+
+
+def _normalize_trunc_nodes(ast: exp.Expression) -> exp.Expression:
+    """Map TimestampTrunc nodes to the equivalent DateTrunc nodes.
+
+    sqlglot's generic dialect parses ``DATE_TRUNC('month', x)`` to DateTrunc but
+    the duckdb/postgres dialects parse the SAME text to TimestampTrunc; both
+    render back to DATE_TRUNC. The split is a dialect artifact, so tests assert
+    one canonical node type (DateTrunc).
+    """
+    for node in list(ast.find_all(exp.TimestampTrunc)):
+        node.replace(exp.DateTrunc(**node.args))
+    return ast
+
+
 def explain_datasource_query(runtime: RustRuntime, sql: str) -> exp.Expression:
     """Return the single remote-query AST from the engine's EXPLAIN plan.
 
     Asserts exactly one datasource query is emitted (the pushdown contract) and
-    parses its rendered SQL as a DuckDB-dialect AST.
+    parses its rendered SQL as a DuckDB-dialect AST, unwrapping the purely
+    syntactic parens around nested set-operation operands and canonicalizing
+    the dialect-split trunc node types.
     """
     queries = runtime.explain_queries(sql)
     assert len(queries) == 1
     _datasource, sql_text = queries[0]
-    return sqlglot.parse_one(sql_text, dialect="duckdb")
+    ast = sqlglot.parse_one(sql_text, dialect="duckdb")
+    ast = _normalize_trunc_nodes(ast)
+    return _unwrap_setop_operand_parens(ast)
 
 
 def explain_document(runtime: RustRuntime, sql: str) -> Dict[str, object]:

@@ -3,7 +3,7 @@
 The decorrelator rewrites each subquery disjunct into a boolean flag via a
 SEMI/ANTI union split; predicate pushdown must then distribute the remaining
 WHERE conjuncts into every union branch, or the branches plan as cartesian
-products (TPC-DS q10/q35/q45 - they OOMed before the set-operation pushdown).
+products (the TPC-DS q10/q35/q45 shapes).
 These tests pin the execution semantics of the whole pipeline cross-source.
 """
 
@@ -74,32 +74,15 @@ def test_or_of_exists_preserves_outer_multiplicity(multi_source_env):
     assert table.column("order_id").to_pylist() == [2, 3, 5, 7, 8, 10]
 
 
-def _physical_plan(multi_source_env, sql):
-    """Build the physical plan for a query without executing it."""
-    runtime = build_runtime(multi_source_env)
-    return runtime.query_executor._plan_pipeline(sql, None)
-
-
-def _collect(plan, node_type):
-    """Collect every node of a given type in a physical plan tree."""
-    found = []
-    if isinstance(plan, node_type):
-        found.append(plan)
-    for child in plan.children():
-        found.extend(_collect(child, node_type))
-    return found
-
-
 def test_same_key_or_of_exists_plans_as_domain_semi(multi_source_env):
     """A same-key OR of positive EXISTS plans as ONE SEMI over a domain union.
 
     The disjunctive plan for q10/q35: no flag split - the input is not
     replicated into SEMI/ANTI union branches; instead one SEMI hash join
-    probes the UNION of the two subqueries' key domains.
+    probes the UNION of the two subqueries' key domains. Asserted through the
+    engine's EXPLAIN plan dump, which labels each hash join with its type.
     """
-    from federated_query.plan.logical import JoinType
-    from federated_query.plan.physical import PhysicalHashJoin, PhysicalUnion
-
+    runtime = build_runtime(multi_source_env)
     sql = (
         "SELECT c.customer_id FROM duckdb_customers.main.customers c "
         "WHERE EXISTS (SELECT 1 FROM duckdb_orders.main.orders o "
@@ -107,15 +90,19 @@ def test_same_key_or_of_exists_plans_as_domain_semi(multi_source_env):
         "   OR EXISTS (SELECT 1 FROM duckdb_orders.main.orders o "
         "              WHERE o.customer_id = c.customer_id AND o.region = 'APAC')"
     )
-    plan = _physical_plan(multi_source_env, sql)
-    semis = []
-    for join in _collect(plan, PhysicalHashJoin):
-        if join.join_type == JoinType.SEMI:
-            semis.append(join)
-    assert len(semis) == 1
+    plan_text = runtime.explain_text(sql)
+    semi_lines = []
+    union_lines = []
+    for line in plan_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("HashJoin [SEMI]"):
+            semi_lines.append(stripped)
+        if stripped == "Union" or stripped.startswith("Union "):
+            union_lines.append(stripped)
+    assert len(semi_lines) == 1, plan_text
     # Exactly the domain union under the SEMI's build side - a flag split
     # would instead put a Union of replicated input branches ABOVE the joins.
-    assert len(_collect(plan, PhysicalUnion)) == 1
+    assert len(union_lines) == 1, plan_text
 
 
 def test_mixed_plain_or_exists_falls_back_to_flags(multi_source_env):

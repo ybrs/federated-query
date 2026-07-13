@@ -20,7 +20,10 @@ def test_multiplication_in_where_clause(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
-    assert projection == ["order_id", "price", "quantity"]
+    # The read set is exactly these columns; the engine lists them in catalog
+    # order, so this compares membership, not ordering.
+    assert set(projection) == {"order_id", "price", "quantity"}
+    assert len(projection) == 3
 
     where_clause = ast.args.get("where")
     assert where_clause is not None

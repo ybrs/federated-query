@@ -3,7 +3,7 @@
 import pytest
 from sqlglot import exp
 
-from federated_query.parser.errors import UnsupportedSQLError
+from tests.rust_runtime import assert_raises_engine_error
 from tests.e2e_pushdown.helpers import (
     is_func,
     build_runtime,
@@ -194,8 +194,12 @@ def test_natural_join(single_source_env):
     _assert_join_count(ast, 1)
 
     join_node = _get_join_node(ast)
+    # sqlglot records the NATURAL keyword under `method` ("NATURAL"); older
+    # versions used a `natural` flag. Either representation pins that the
+    # pushed join is still NATURAL, not silently degraded.
     natural = join_node.args.get("natural")
-    assert natural is True or natural is not None
+    method = str(join_node.args.get("method") or "").upper()
+    assert natural is not None or method == "NATURAL"
 
 
 def test_cross_source_natural_join_fails_fast(multi_source_env):
@@ -210,7 +214,7 @@ def test_cross_source_natural_join_fails_fast(multi_source_env):
         "SELECT count(*) FROM duckdb_orders.main.orders "
         "NATURAL JOIN duckdb_customers.main.customers"
     )
-    with pytest.raises(UnsupportedSQLError):
+    with assert_raises_engine_error(match="NATURAL/USING"):
         runtime.execute(sql)
 
 
@@ -221,7 +225,7 @@ def test_cross_source_using_join_fails_fast(multi_source_env):
         "SELECT count(*) FROM duckdb_orders.main.orders o "
         "JOIN duckdb_customers.main.customers c USING (customer_id)"
     )
-    with pytest.raises(UnsupportedSQLError):
+    with assert_raises_engine_error(match="NATURAL/USING"):
         runtime.execute(sql)
 
 

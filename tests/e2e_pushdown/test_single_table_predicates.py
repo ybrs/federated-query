@@ -100,7 +100,10 @@ def test_compound_and_predicate(single_source_env):
     )
     ast = explain_datasource_query(runtime, sql)
     projection = select_column_names(ast)
-    assert projection == ["order_id", "region", "status"]
+    # The read set is exactly these columns; the engine lists them in catalog
+    # order, so this compares membership, not ordering.
+    assert set(projection) == {"order_id", "region", "status"}
+    assert len(projection) == 3
     where_clause = ast.args.get("where")
     assert where_clause is not None
     predicate = unwrap_parens(where_clause.this)

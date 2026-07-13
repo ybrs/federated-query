@@ -12,20 +12,23 @@ from tests.e2e_pushdown.helpers import build_runtime
 
 
 def _injected_scan(multi_source_env, sql):
-    """Return the Rust IR ``injected_scan`` step for the probe, if any.
+    """Return the probe scan the plan marks for key injection, if any.
 
-    The Rust engine runs the whole cross-source join and injects the build's
-    distinct keys into the probe's native query itself, so the Python proxy no
-    longer sees the runtime SQL. The plan's serialized IR is where the semi-join
-    reduction is now observable: an ``injected_scan`` step names the probe
-    datasource and the column the ``key IN (...)`` filter constrains.
+    The engine's EXPLAIN runs the SAME winners pre-pass the step emitter runs
+    and tags each scan it will reduce with ``+inject(<column>)``, so the
+    semi-join reduction is observable in the plan dump. Returns a dict with the
+    probe's ``datasource`` and ``inject_column``, or None when no scan is
+    tagged.
     """
     runtime = build_runtime(multi_source_env)
-    plan = runtime.query_executor._plan_pipeline(sql, None)
-    ir = build_ir(plan)
-    for step in ir["steps"]:
-        if step.get("op") == "injected_scan":
-            return step
+    for line in runtime.explain_text(sql).splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("Scan [") or "+inject(" not in stripped:
+            continue
+        datasource = stripped[len("Scan [") : stripped.index("]")]
+        tag_start = stripped.index("+inject(") + len("+inject(")
+        column = stripped[tag_start : stripped.index(")", tag_start)]
+        return {"datasource": datasource, "inject_column": column}
     return None
 
 
@@ -88,7 +91,13 @@ def test_cross_source_join_results_correct(multi_source_env):
 
 
 def test_explain_shows_dynamic_filter_with_real_values(multi_source_env):
-    """EXPLAIN renders the probe-side IN filter with the build's real keys."""
+    """EXPLAIN shows the probe constrained to the build's real key value.
+
+    Planning is O(metadata) in this engine (EXPLAIN never executes the build to
+    collect keys), so the literal build key reaches the probe as a plan-time
+    transitive constant on the probe scan's own pushed SQL - the same reduction
+    the runtime IN filter expressed, shown with the real value.
+    """
     runtime = build_runtime(multi_source_env)
     sql = (
         "EXPLAIN SELECT O.order_id "
@@ -98,13 +107,17 @@ def test_explain_shows_dynamic_filter_with_real_values(multi_source_env):
     )
     table = runtime.execute(sql)
     plan_text = "\n".join(row["plan"] for row in table.to_pylist())
-    # the build (products) is filtered to id 101, so the probe IN shows it
-    assert '"product_id" IN (101)' in plan_text
+    orders_lines = []
+    for line in plan_text.splitlines():
+        if "Scan [duckdb_orders]" in line:
+            orders_lines.append(line)
+    assert orders_lines, f"no orders scan in plan:\n{plan_text}"
+    assert '"product_id" = 101' in orders_lines[0], plan_text
 
 
 def test_build_side_chosen_by_filter_regardless_of_order(multi_source_env):
     """The filtered table is built from even when it is the left input, so the
-    dynamic IN filter still targets the other (big, unfiltered) side."""
+    dynamic key filter still targets the other (big, unfiltered) side."""
     runtime = build_runtime(multi_source_env)
     # filtered table (products) written FIRST (left input)
     sql = (
@@ -115,11 +128,11 @@ def test_build_side_chosen_by_filter_regardless_of_order(multi_source_env):
     table = runtime.execute(sql)
     assert table.schema.names == ["name", "order_id"]
 
-    plan = "\n".join(
-        row["plan"] for row in runtime.execute("EXPLAIN " + sql).to_pylist()
-    )
-    # orders (the big, unfiltered side) is the one carrying the IN filter
-    assert '"product_id" IN (101)' in plan
+    # orders (the big, unfiltered side) is the one marked for the key injection
+    step = _injected_scan(multi_source_env, sql)
+    assert step is not None
+    assert step["datasource"] == "duckdb_orders"
+    assert step["inject_column"] == "product_id"
 
 
 def test_computed_build_side_still_reduces_the_probe(multi_source_env):
