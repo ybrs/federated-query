@@ -1,0 +1,45 @@
+[package]
+name = "fedq"
+version = "0.1.0"
+edition.workspace = true
+
+# fedq: the engine's command-line front end over fq-runtime. It runs a single
+# statement (`--command`/`--file`) or opens an interactive REPL, and renders the
+# Arrow result to the terminal as an aligned table (default), CSV, or JSON. The
+# binary owns argument parsing (clap), result rendering, and the readline loop;
+# execution is delegated to fq_runtime::Runtime.
+
+[[bin]]
+name = "fedq"
+path = "src/main.rs"
+
+[dependencies]
+# The whole engine session behind one call: load_config + Runtime::execute.
+fq-common = { path = "../fq-common" }
+fq-runtime = { path = "../fq-runtime" }
+# Reading the engine result: schema field names for headers and per-cell text
+# rendering (ArrayFormatter) for the temporal/decimal columns, the same text
+# path fedq-server uses so a date/timestamp/decimal prints identically here.
+arrow = "58"
+# Derive-based argument parsing; the option surface grows, so the struct is the
+# single source of truth for flags and --help.
+clap = { version = "4", features = ["derive"] }
+# The interactive line editor (in-process history, multi-line editing, Ctrl-C /
+# Ctrl-D handling).
+rustyline = "18"
+# The `json` output format serializes one object per row with typed numbers and
+# booleans; everything else renders through the shared text path.
+serde_json = "1"
+# The `csv` output format quotes and escapes fields correctly (a value with a
+# comma, quote, or newline must not corrupt the row layout).
+csv = "1"
+
+[dev-dependencies]
+# The integration test seeds a tiny DuckDB fixture through the same connector the
+# engine reads, then runs the compiled binary against a config pointing at it.
+fq-connectors = { path = "../fq-connectors" }
+# Building hand-made RecordBatches (including null slots) for the render tests.
+arrow-array = "58"
+
+[lints]
+workspace = true
