@@ -1564,3 +1564,173 @@ fn collect_lateral_join<'a>(plan: &'a LogicalPlan, found: &mut Option<&'a fq_pla
         collect_lateral_join(child, found);
     }
 }
+
+/// A catalog holding a single `duckdb_primary.main.orders` table shaped like the
+/// e2e pivot fixture, for the PIVOT rewrite tests.
+fn orders_catalog() -> fq_catalog::Catalog {
+    use fq_catalog::{Catalog, Column, Schema, Table};
+    use fq_common::DataType;
+
+    let orders = Table::new(
+        "orders",
+        vec![
+            Column::new("order_id", DataType::Integer, false),
+            Column::new("customer_id", DataType::Integer, true),
+            Column::new("quantity", DataType::Integer, true),
+            Column::new("price", DataType::Double, true),
+            Column::new("status", DataType::Varchar, true),
+            Column::new("region", DataType::Varchar, true),
+        ],
+    );
+    let mut catalog = Catalog::new();
+    catalog.insert_schema(
+        "duckdb_primary",
+        "main",
+        Schema::with_tables("main", "duckdb_primary", vec![orders]),
+    );
+    catalog
+}
+
+#[test]
+fn recursive_with_marks_cte_and_registers_self_reference() {
+    // WITH RECURSIVE builds a `Cte { recursive: true }` whose body is the UNION,
+    // and the recursive branch's `FROM counter` resolves to a CteRef (the name is
+    // in scope before its own body is converted).
+    let sql = "WITH RECURSIVE counter(n) AS (\
+                 SELECT 1 UNION ALL SELECT n + 1 FROM counter WHERE n < 5\
+               ) SELECT n FROM counter";
+    let plan = parse(sql).unwrap();
+    let LogicalPlan::Cte(cte) = &plan else {
+        panic!("expected Cte, got {plan:?}");
+    };
+    assert!(cte.recursive, "the CTE is recursive");
+    assert_eq!(cte.name, "counter");
+    assert_eq!(cte.column_names, Some(vec!["n".to_string()]));
+    // The body is a UNION ALL (SetOperation), and its recursive branch names the
+    // CTE as a CteRef rather than a base-table Scan.
+    let LogicalPlan::SetOperation(body) = cte.cte_plan.as_ref() else {
+        panic!("expected a UNION body, got {:?}", cte.cte_plan);
+    };
+    let mut cte_refs = Vec::new();
+    collect_cte_refs(body.right.as_ref(), &mut cte_refs);
+    assert_eq!(cte_refs, vec!["counter".to_string()]);
+}
+
+#[test]
+fn recursive_with_without_column_list_raises() {
+    // A recursive CTE has no body schema to infer from, so an omitted column list
+    // fails loudly rather than guessing.
+    let sql = "WITH RECURSIVE r AS (\
+                 SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 5\
+               ) SELECT n FROM r";
+    let error = parse(sql).unwrap_err();
+    assert!(matches!(error, ParseError::Unsupported(_)), "got {error:?}");
+}
+
+/// Collect the names of every CteRef in a plan subtree.
+fn collect_cte_refs(plan: &LogicalPlan, names: &mut Vec<String>) {
+    if let LogicalPlan::CteRef(node) = plan {
+        names.push(node.name.clone());
+    }
+    for child in plan.children() {
+        collect_cte_refs(child, names);
+    }
+}
+
+#[test]
+fn pivot_rewrites_to_conditional_aggregation() {
+    use fq_parse::parse_with_catalog;
+
+    // SELECT * over a static PIVOT expands over the pivoted output: the group
+    // columns (every source column but the pivot column `region` and the aggregate
+    // argument `price`) plus one conditional-aggregate column per IN value.
+    let sql = "SELECT * FROM duckdb_primary.main.orders \
+               PIVOT (SUM(price) FOR region IN ('NA', 'EU', 'APAC'))";
+    let plan = parse_with_catalog(sql, &orders_catalog()).unwrap();
+
+    let aggregate = find_any_aggregate(&plan).expect("an Aggregate");
+    // The pivot column and the aggregate argument are dropped from the GROUP BY.
+    let group_names = column_ref_names(&aggregate.group_by);
+    assert!(!group_names.contains(&"region".to_string()));
+    assert!(!group_names.contains(&"price".to_string()));
+    assert!(group_names.contains(&"order_id".to_string()));
+
+    // The three IN values become the three trailing output columns.
+    let outputs = &aggregate.output_names;
+    assert_eq!(
+        &outputs[outputs.len() - 3..],
+        &["NA".to_string(), "EU".to_string(), "APAC".to_string()]
+    );
+    // Each value column is an aggregate over a single-branch CASE.
+    let value_aggregate = &aggregate.aggregates[aggregate.aggregates.len() - 1];
+    let Expr::FunctionCall {
+        function_name,
+        args,
+        ..
+    } = value_aggregate
+    else {
+        panic!("expected an aggregate call, got {value_aggregate:?}");
+    };
+    assert_eq!(function_name, "SUM");
+    assert!(matches!(args.as_slice(), [Expr::Case { .. }]));
+}
+
+#[test]
+fn pivot_with_aggregate_alias_suffixes_output_names() {
+    use fq_parse::parse_with_catalog;
+
+    // `SUM(price) AS total` suffixes each value column name with `_total`
+    // (DuckDB's naming), so the outputs are `processing_total` and `shipped_total`.
+    let sql = "SELECT * FROM duckdb_primary.main.orders \
+               PIVOT (SUM(price) AS total FOR status IN ('processing', 'shipped'))";
+    let plan = parse_with_catalog(sql, &orders_catalog()).unwrap();
+    let aggregate = find_any_aggregate(&plan).expect("an Aggregate");
+    let outputs = &aggregate.output_names;
+    assert_eq!(
+        &outputs[outputs.len() - 2..],
+        &["processing_total".to_string(), "shipped_total".to_string()]
+    );
+}
+
+#[test]
+fn unsupported_pivot_shapes_raise() {
+    use fq_parse::parse_with_catalog;
+
+    // COUNT(*), multiple aggregates, and UNPIVOT all fail loudly rather than
+    // silently dropping the pivot.
+    let catalog = orders_catalog();
+    let cases = [
+        "SELECT * FROM duckdb_primary.main.orders \
+         PIVOT (COUNT(*) FOR region IN ('NA', 'EU'))",
+        "SELECT * FROM duckdb_primary.main.orders \
+         PIVOT (SUM(price), COUNT(*) FOR region IN ('NA', 'EU'))",
+        "SELECT * FROM duckdb_primary.main.orders \
+         UNPIVOT (val FOR col IN (price, quantity))",
+    ];
+    for sql in cases {
+        let error = parse_with_catalog(sql, &catalog).unwrap_err();
+        assert!(
+            matches!(error, ParseError::Unsupported(_)),
+            "{sql} -> {error:?}"
+        );
+    }
+}
+
+/// The first Aggregate found in depth-first order, if any.
+fn find_any_aggregate(plan: &LogicalPlan) -> Option<&fq_plan::Aggregate> {
+    if let LogicalPlan::Aggregate(node) = plan {
+        return Some(node);
+    }
+    plan.children().into_iter().find_map(find_any_aggregate)
+}
+
+/// The column names of a list of expressions that are all bare column references.
+fn column_ref_names(exprs: &[Expr]) -> Vec<String> {
+    let mut names = Vec::new();
+    for expr in exprs {
+        if let Expr::Column(column) = expr {
+            names.push(column.column.clone());
+        }
+    }
+    names
+}

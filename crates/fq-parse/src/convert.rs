@@ -7,20 +7,20 @@
 //! SELECT -> ORDER BY -> LIMIT.
 //!
 //! Coverage: base tables + left-deep JOINs (explicit and comma/implicit) +
-//! derived tables + CTE references in FROM, non-recursive WITH, catalog-driven
-//! star expansion, WHERE, GROUP BY + the aggregates, HAVING, ORDER BY,
-//! LIMIT/OFFSET, DISTINCT, VALUES, and the binary set operations. A window
-//! function in WHERE / GROUP BY / HAVING raises (it is legal only in SELECT and
-//! ORDER BY). WITH RECURSIVE still raises.
+//! derived tables + CTE references in FROM, WITH (recursive and non-recursive),
+//! a static PIVOT rewritten to conditional aggregation, catalog-driven star
+//! expansion, WHERE, GROUP BY + the aggregates, HAVING, ORDER BY, LIMIT/OFFSET,
+//! DISTINCT, VALUES, and the binary set operations. A window function in WHERE /
+//! GROUP BY / HAVING raises (it is legal only in SELECT and ORDER BY).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 
 use fq_catalog::Catalog;
-use fq_plan::expr::NullsOrder;
+use fq_plan::expr::{LiteralValue, NullsOrder};
 use fq_plan::{
-    Aggregate, ColumnRef, Cte, CteRef, Expr, Filter, Join, JoinType, LateralJoin, Limit,
-    LogicalPlan, Projection, Scan, SetOpKind, SetOperation, Sort, SubqueryScan, Values,
+    Aggregate, BinaryOpType, ColumnRef, Cte, CteRef, Expr, Filter, Join, JoinType, LateralJoin,
+    Limit, LogicalPlan, Projection, Scan, SetOpKind, SetOperation, Sort, SubqueryScan, Values,
 };
 use polyglot_sql::expressions::{
     Expression, JoinKind, Literal, Ordered, Sample, SampleMethod, Select, TableRef, With,
@@ -262,21 +262,41 @@ impl<'a> Converter<'a> {
 
     /// Bind a WITH's CTEs into scope, build the body, and wrap it in nested `Cte`
     /// nodes (first CTE outermost). CTE names are pushed before any body is built
-    /// so a CTE may reference an earlier one; they are popped afterward.
+    /// so a CTE may reference an earlier one; they are popped afterward. A
+    /// `WITH RECURSIVE` marks every resulting `Cte` recursive and registers each
+    /// name BEFORE its own body is converted, so the body's self-reference (in the
+    /// recursive branch of its UNION) resolves as a `CteRef`.
     fn select_with(&self, with: &With, select: &Select) -> Result<LogicalPlan, ParseError> {
-        if with.recursive {
-            return Err(ParseError::Unsupported("WITH RECURSIVE".to_string()));
-        }
         let mut definitions = Vec::with_capacity(with.ctes.len());
         for cte in &with.ctes {
             let name = cte.alias.name.clone();
+            let declared: Vec<String> =
+                cte.columns.iter().map(|ident| ident.name.clone()).collect();
+            if with.recursive {
+                // The recursive body names the CTE itself, so the name is in scope
+                // before its body is built. A recursive CTE has no body schema to
+                // infer from yet, so its columns must be spelled out in the WITH.
+                if declared.is_empty() {
+                    return Err(ParseError::Unsupported(
+                        "WITH RECURSIVE without an explicit column list".to_string(),
+                    ));
+                }
+                self.ctes
+                    .borrow_mut()
+                    .insert(name.clone(), declared.clone());
+            }
             let body = self.query(&cte.this)?;
             let columns: Vec<String> = if cte.columns.is_empty() {
                 body.schema()
             } else {
-                cte.columns.iter().map(|ident| ident.name.clone()).collect()
+                declared
             };
-            self.ctes.borrow_mut().insert(name.clone(), columns.clone());
+            // A non-recursive CTE registers only now, after its body is built (its
+            // name is not visible inside its own body); a recursive one is already
+            // registered above.
+            if !with.recursive {
+                self.ctes.borrow_mut().insert(name.clone(), columns.clone());
+            }
             definitions.push((name, body, cte.columns.is_empty(), columns));
         }
         let mut plan = self.select_body(select)?;
@@ -292,7 +312,7 @@ impl<'a> Converter<'a> {
                 name,
                 cte_plan: Box::new(body),
                 child: Box::new(plan),
-                recursive: false,
+                recursive: with.recursive,
                 column_names: if inferred { None } else { Some(columns) },
             });
         }
@@ -369,11 +389,187 @@ impl<'a> Converter<'a> {
         match item {
             Expression::Table(table) => self.table_or_cte_ref(select, table, tables),
             Expression::Subquery(subquery) => self.derived_table(subquery, tables),
+            Expression::Pivot(pivot) => self.convert_pivot(select, pivot, tables),
             other => Err(ParseError::Unsupported(format!(
                 "FROM/JOIN {}",
                 other.variant_name()
             ))),
         }
+    }
+
+    /// Rewrite a static `PIVOT` into portable conditional aggregation: each
+    /// `IN` value becomes `agg(CASE WHEN pivot_col = value THEN arg END)` named for
+    /// that value, grouped by every source column that is neither the pivot column
+    /// nor the aggregate's argument. The rewrite is a derived table over the source
+    /// so the surrounding `SELECT *` expands over the pivoted output columns. Only
+    /// a single-aggregate, single-column, literal-`IN` PIVOT is modelled; every
+    /// other shape (UNPIVOT, multiple aggregates, `COUNT(*)`, an `IN` subquery, an
+    /// output-alias list) raises rather than silently dropping the pivot.
+    fn convert_pivot(
+        &self,
+        select: &Select,
+        pivot: &polyglot_sql::expressions::Pivot,
+        tables: &mut Vec<FromTable>,
+    ) -> Result<LogicalPlan, ParseError> {
+        let source = self.pivot_source_scan(select, pivot)?;
+        let aggregate = self.pivot_aggregate(pivot)?;
+        let (pivot_col, pivot_col_name) = self.pivot_column(pivot)?;
+        let group_columns = pivot_group_columns(&source, &pivot_col_name, &aggregate.arg_name);
+
+        let mut group_by = Vec::with_capacity(group_columns.len());
+        let mut aggregates = Vec::new();
+        let mut output_names = Vec::new();
+        for column in &group_columns {
+            group_by.push(Expr::Column(ColumnRef::new(None, column.clone(), None)));
+            aggregates.push(Expr::Column(ColumnRef::new(None, column.clone(), None)));
+            output_names.push(column.clone());
+        }
+        self.pivot_value_columns(
+            pivot,
+            &aggregate,
+            &pivot_col,
+            &mut aggregates,
+            &mut output_names,
+        )?;
+
+        let alias = pivot_alias(pivot, &source);
+        // Fresh conditional-aggregation node realizing the pivot: no base to copy
+        // from. Field list (input/group_by/aggregates/output_names/grouping_sets)
+        // is the complete Aggregate struct.
+        let plan = LogicalPlan::Aggregate(Aggregate {
+            input: Box::new(LogicalPlan::Scan(Box::new(source))),
+            group_by,
+            aggregates,
+            output_names: output_names.clone(),
+            grouping_sets: None,
+        });
+        tables.push(FromTable {
+            key: alias.clone(),
+            columns: ColumnSource::Explicit(output_names),
+        });
+        // Fresh boundary wrapping the pivot rewrite so the outer query references it
+        // by one relation alias - no base to copy from. Field list
+        // (input/alias/column_names) is the complete SubqueryScan struct; the body
+        // already carries the pivot output names, so no rename list is needed.
+        Ok(LogicalPlan::SubqueryScan(SubqueryScan {
+            input: Box::new(plan),
+            alias,
+            column_names: None,
+        }))
+    }
+
+    /// The base-table scan a PIVOT reads. A PIVOT over anything but a plain table
+    /// (a subquery, another pivot) is not modelled and raises.
+    fn pivot_source_scan(
+        &self,
+        select: &Select,
+        pivot: &polyglot_sql::expressions::Pivot,
+    ) -> Result<Scan, ParseError> {
+        reject_unsupported_pivot_shape(pivot)?;
+        let Expression::Table(table) = &pivot.this else {
+            return Err(ParseError::Unsupported(
+                "PIVOT over a non-table source".to_string(),
+            ));
+        };
+        self.scan_from_table(select, table, &table_key(table))
+    }
+
+    /// The single aggregate a PIVOT applies, as its function call plus the name of
+    /// its one argument column and any `AS` output-name suffix. Multiple aggregates,
+    /// `COUNT(*)`, or a non-column argument raise.
+    fn pivot_aggregate(
+        &self,
+        pivot: &polyglot_sql::expressions::Pivot,
+    ) -> Result<PivotAggregate, ParseError> {
+        let [field] = pivot.expressions.as_slice() else {
+            return Err(ParseError::Unsupported(
+                "PIVOT with other than one aggregate".to_string(),
+            ));
+        };
+        let (aggregate_ast, suffix) = match field {
+            Expression::Alias(alias) => (&alias.this, Some(alias.alias.name.clone())),
+            other => (other, None),
+        };
+        let call = self.expr(aggregate_ast)?;
+        let Expr::FunctionCall {
+            args,
+            is_aggregate: true,
+            ..
+        } = &call
+        else {
+            return Err(ParseError::Unsupported(
+                "PIVOT aggregate must be an aggregate function".to_string(),
+            ));
+        };
+        let [Expr::Column(arg)] = args.as_slice() else {
+            return Err(ParseError::Unsupported(
+                "PIVOT aggregate must take exactly one column argument".to_string(),
+            ));
+        };
+        Ok(PivotAggregate {
+            arg_name: arg.column.clone(),
+            call,
+            suffix,
+        })
+    }
+
+    /// The pivot column of the `FOR ... IN` clause, as its bound reference plus its
+    /// name. A pivot on other than one bare column, or an `IN` over a subquery,
+    /// raises.
+    fn pivot_column(
+        &self,
+        pivot: &polyglot_sql::expressions::Pivot,
+    ) -> Result<(Expr, String), ParseError> {
+        let [Expression::In(field)] = pivot.fields.as_slice() else {
+            return Err(ParseError::Unsupported(
+                "PIVOT with other than one FOR column".to_string(),
+            ));
+        };
+        if field.query.is_some() {
+            return Err(ParseError::Unsupported(
+                "PIVOT with an IN subquery (dynamic pivot)".to_string(),
+            ));
+        }
+        let Expression::Column(column) = &field.this else {
+            return Err(ParseError::Unsupported(
+                "PIVOT FOR must be a bare column".to_string(),
+            ));
+        };
+        Ok((self.expr(&field.this)?, column.name.name.clone()))
+    }
+
+    /// Append one conditional-aggregate output column per `IN` value: the value
+    /// names the column (suffixed by any aggregate `AS` alias), and its expression
+    /// is the aggregate over `CASE WHEN pivot_col = value THEN arg END`. A
+    /// non-literal `IN` value raises.
+    fn pivot_value_columns(
+        &self,
+        pivot: &polyglot_sql::expressions::Pivot,
+        aggregate: &PivotAggregate,
+        pivot_col: &Expr,
+        aggregates: &mut Vec<Expr>,
+        output_names: &mut Vec<String>,
+    ) -> Result<(), ParseError> {
+        let [Expression::In(field)] = pivot.fields.as_slice() else {
+            return Err(ParseError::Unsupported(
+                "PIVOT with other than one FOR column".to_string(),
+            ));
+        };
+        for value_ast in &field.expressions {
+            let value = self.expr(value_ast)?;
+            let Expr::Literal { value: literal, .. } = &value else {
+                return Err(ParseError::Unsupported(
+                    "PIVOT IN value must be a literal".to_string(),
+                ));
+            };
+            let output = match &aggregate.suffix {
+                Some(suffix) => format!("{}_{}", pivot_value_name(literal)?, suffix),
+                None => pivot_value_name(literal)?,
+            };
+            aggregates.push(aggregate.conditioned(pivot_col.clone(), value));
+            output_names.push(output);
+        }
+        Ok(())
     }
 
     /// A bare table reference that names an in-scope CTE becomes a `CteRef`;
@@ -1020,6 +1216,116 @@ fn reject_unsupported_clauses(select: &Select) -> Result<(), ParseError> {
         }
     }
     Ok(())
+}
+
+/// The single aggregate of a PIVOT, prepared for rewriting into conditional
+/// aggregation: the whole aggregate call, the name of its one argument column
+/// (excluded from the implicit GROUP BY), and any `AS` alias that suffixes each
+/// output column name.
+struct PivotAggregate {
+    arg_name: String,
+    call: Expr,
+    suffix: Option<String>,
+}
+
+impl PivotAggregate {
+    /// The aggregate applied to `CASE WHEN pivot_col = value THEN arg END`: a copy
+    /// of the original call with its single argument replaced by that CASE, so the
+    /// function name and DISTINCT flag are carried unchanged.
+    fn conditioned(&self, pivot_col: Expr, value: Expr) -> Expr {
+        let arg = match &self.call {
+            Expr::FunctionCall { args, .. } => args[0].clone(),
+            other => unreachable!("pivot aggregate is a validated function call, got {other:?}"),
+        };
+        // Fresh equality between the pivot column and one IN value - no base to copy
+        // from. Field list (op/left/right) is the complete BinaryOp variant.
+        let condition = Expr::BinaryOp {
+            op: BinaryOpType::Eq,
+            left: Box::new(pivot_col),
+            right: Box::new(value),
+        };
+        // Fresh single-branch CASE routing the argument only for the matching value
+        // - no base to copy from. Field list (when_clauses/else_result) is the
+        // complete Case variant; a non-matching row yields NULL (absent ELSE).
+        let case = Expr::Case {
+            when_clauses: vec![(condition, arg)],
+            else_result: None,
+        };
+        let mut call = self.call.clone();
+        if let Expr::FunctionCall { args, .. } = &mut call {
+            args[0] = case;
+        }
+        call
+    }
+}
+
+/// Reject the PIVOT shapes the conditional-aggregation rewrite does not model, so
+/// each fails loudly rather than silently producing wrong columns: UNPIVOT, the
+/// DuckDB simplified `USING` form, an inner GROUP BY, UNPIVOT `INTO`, an output
+/// column-alias list, and the UNPIVOT null-handling / default clauses.
+fn reject_unsupported_pivot_shape(
+    pivot: &polyglot_sql::expressions::Pivot,
+) -> Result<(), ParseError> {
+    let unsupported = [
+        (pivot.unpivot, "UNPIVOT"),
+        (
+            !pivot.using.is_empty(),
+            "PIVOT ... USING (DuckDB simplified form)",
+        ),
+        (pivot.group.is_some(), "PIVOT with an explicit GROUP BY"),
+        (pivot.into.is_some(), "UNPIVOT ... INTO"),
+        (
+            !pivot.alias_columns.is_empty(),
+            "PIVOT with an output column-alias list",
+        ),
+        (pivot.include_nulls.is_some(), "UNPIVOT null handling"),
+        (pivot.default_on_null.is_some(), "PIVOT ... DEFAULT ON NULL"),
+    ];
+    for (present, name) in unsupported {
+        if present {
+            return Err(ParseError::Unsupported(name.to_string()));
+        }
+    }
+    Ok(())
+}
+
+/// The implicit GROUP BY of a PIVOT: every source column except the pivot column
+/// and the aggregate's argument, in the source's column order (DuckDB's rule).
+fn pivot_group_columns(source: &Scan, pivot_col: &str, arg: &str) -> Vec<String> {
+    let mut columns = Vec::new();
+    for column in &source.columns {
+        if column != pivot_col && column != arg {
+            columns.push(column.clone());
+        }
+    }
+    columns
+}
+
+/// The relation alias the pivoted output is referenced by: the PIVOT's own alias
+/// if written, else the source table's alias/name (so `SELECT *` over an unaliased
+/// `FROM t PIVOT(...)` qualifies to `t`).
+fn pivot_alias(pivot: &polyglot_sql::expressions::Pivot, source: &Scan) -> String {
+    if let Some(alias) = &pivot.alias {
+        return alias.name.clone();
+    }
+    source
+        .alias
+        .clone()
+        .unwrap_or_else(|| source.table_name.clone())
+}
+
+/// The output-column name a PIVOT `IN` value contributes (before any aggregate
+/// alias suffix). A float or NULL pivot value has no well-defined column name and
+/// raises.
+fn pivot_value_name(value: &LiteralValue) -> Result<String, ParseError> {
+    match value {
+        LiteralValue::String(text) => Ok(text.clone()),
+        LiteralValue::Integer(number) => Ok(number.to_string()),
+        LiteralValue::Boolean(flag) => Ok(flag.to_string()),
+        LiteralValue::Float(_) | LiteralValue::Null => Err(ParseError::Unsupported(
+            "PIVOT IN value must be a string, integer, or boolean literal".to_string(),
+        )),
+    }
 }
 
 /// The qualifier a reference uses for a table: its alias if any, else its name.

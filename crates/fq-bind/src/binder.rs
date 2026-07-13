@@ -8,14 +8,15 @@
 //! relation qualifier and `DataType`.
 //!
 //! Coverage: Scan / Projection / Filter / Join / Sort / Limit / Aggregate over
-//! base tables, derived tables (SubqueryScan), CTE references + non-recursive
-//! WITH, set operations (with arity check), Values, Explain, the subquery
-//! expressions (correlated - the subplan binds with the enclosing scopes
+//! base tables, derived tables (SubqueryScan), CTE references + WITH (recursive
+//! and non-recursive), set operations (with arity check), Values, Explain, the
+//! subquery expressions (correlated - the subplan binds with the enclosing scopes
 //! visible), HAVING / ORDER-BY output-alias + positional-ordinal resolution, and
 //! the HAVING aggregate-call HOIST/widening (a HAVING aggregate EXPRESSION resolves
 //! to its aggregate output, or an absent one becomes a hidden __agg_N output with a
 //! restore projection), and the same hoist for ORDER BY keys carrying aggregate
-//! calls. Not implemented: WITH RECURSIVE.
+//! calls. A recursive WITH binds its anchor first to fix the CTE's columns, then
+//! registers the CTE so the recursive branch and child resolve against it.
 
 use std::collections::HashMap;
 
@@ -427,7 +428,7 @@ impl<'a> Binder<'a> {
     /// columns) so the child and later CTEs resolve a CteRef against it.
     fn bind_cte(&mut self, mut node: Cte) -> Result<LogicalPlan, BindError> {
         if node.recursive {
-            return Err(BindError::Unsupported("WITH RECURSIVE".to_string()));
+            return self.bind_recursive_cte(node);
         }
         let cte_plan = self.bind(*node.cte_plan)?;
         let mut columns = self.plan_output_columns(&cte_plan)?;
@@ -449,6 +450,54 @@ impl<'a> Binder<'a> {
         // In-place on the owned node: only cte_plan and child are rebound; `name`,
         // `column_names`, and `recursive` (guarded to false above) are preserved.
         node.cte_plan = Box::new(cte_plan);
+        node.child = Box::new(child);
+        Ok(LogicalPlan::Cte(node))
+    }
+
+    /// Bind a recursive CTE. Its body is a UNION of an anchor branch (which does
+    /// not name the CTE) and a recursive branch (which does). The anchor binds
+    /// first and fixes the CTE's output columns/types; the CTE is then registered
+    /// so the recursive branch and the child resolve their references against it.
+    fn bind_recursive_cte(&mut self, mut node: Cte) -> Result<LogicalPlan, BindError> {
+        let LogicalPlan::SetOperation(mut body) = *node.cte_plan else {
+            return Err(BindError::Unsupported(
+                "recursive CTE body must be a UNION of an anchor and a recursive branch"
+                    .to_string(),
+            ));
+        };
+        let anchor = self.bind(*body.left)?;
+        let mut columns = self.plan_output_columns(&anchor)?;
+        if let Some(names) = &node.column_names {
+            columns = rename_columns(names, &columns)?;
+        }
+        let table = Table::new(node.name.clone(), columns);
+        let saved = self.ctes.insert(node.name.clone(), table);
+        let branch = self.bind(*body.right);
+        let child = self.bind(*node.child);
+        match saved {
+            Some(previous) => {
+                self.ctes.insert(node.name.clone(), previous);
+            }
+            None => {
+                self.ctes.remove(&node.name);
+            }
+        }
+        let branch = branch?;
+        let child = child?;
+        let (anchor_width, branch_width) = (anchor.schema().len(), branch.schema().len());
+        if anchor_width != branch_width {
+            return Err(BindError::SetOpArity {
+                left: anchor_width,
+                right: branch_width,
+            });
+        }
+        // In-place on the owned set operation: only the two branches are rebound;
+        // kind and distinct are preserved untouched.
+        body.left = Box::new(anchor);
+        body.right = Box::new(branch);
+        // In-place on the owned Cte: cte_plan becomes the rebound UNION body and
+        // child the rebound child; name, column_names, and recursive are preserved.
+        node.cte_plan = Box::new(LogicalPlan::SetOperation(body));
         node.child = Box::new(child);
         Ok(LogicalPlan::Cte(node))
     }

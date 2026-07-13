@@ -1,10 +1,11 @@
 //! Cross-source CTE (WITH clause) execution, end to end through a `Runtime`.
 //!
 //! A CTE whose references span data sources cannot push to one source as a single
-//! `WITH`. The producer path materializes the body ONCE (a `PhysicalCte`) and
-//! every reference reads that one allocation (a `PhysicalCteScan`); the
-//! CTE-vs-other-source joins run in the merge engine. Ports the six non-recursive
-//! tests of `tests/e2e_pushdown/test_cross_source_ctes.py`.
+//! `WITH`. A non-recursive one takes the producer path: the body materializes
+//! ONCE (a `PhysicalCte`) and every reference reads that one allocation (a
+//! `PhysicalCteScan`). A recursive one runs wholly in the merge engine (a
+//! `CteMergeQuery`): the base sources materialize and the fixpoint computes
+//! locally. Either way the CTE-vs-other-source joins run in the merge engine.
 //!
 //! The two sources are two real DuckDB files (orders on one, customers on the
 //! other); a join across them is cross-source, so it exercises the same producer/
@@ -328,4 +329,160 @@ fn producer_id_of(line: &str) -> &str {
         Some((_, id)) => id,
         None => panic!("plan line has no shared-producer id: {line}"),
     }
+}
+
+#[test]
+fn recursive_cross_source_runs_in_the_merge_engine() {
+    // A recursive CTE (`seq` = 1,2,3) feeds a cross-source join: `seq` joins
+    // orders on one source and customers on another. The whole WITH RECURSIVE runs
+    // in the merge engine (a CteMergeQuery), which materializes both base sources
+    // and computes the fixpoint locally.
+    let (runtime, orders, customers) = two_source_runtime("rec1");
+    let sql = format!(
+        "WITH RECURSIVE seq(n) AS (\
+           SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 3) \
+         SELECT o.order_id, c.segment FROM seq \
+         JOIN {orders}.main.orders o ON o.quantity = seq.n \
+         JOIN {customers}.main.customers c ON o.customer_id = c.customer_id"
+    );
+    let (schema, batches) = runtime.execute(&sql).expect("recursive cross-source cte");
+
+    // The declared result column names are carried through to the output schema
+    // (the merge query's output_names, now observable end to end).
+    let names: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect();
+    assert_eq!(names, vec!["order_id".to_string(), "segment".to_string()]);
+
+    // quantity 1 -> order 4 (consumer); quantity 2 -> order 3 (smb); quantity 3 ->
+    // orders 1 and 7 (both enterprise).
+    assert_eq!(
+        sorted_i32_str(&batches),
+        vec![
+            (1, "enterprise".to_string()),
+            (3, "smb".to_string()),
+            (4, "consumer".to_string()),
+            (7, "enterprise".to_string()),
+        ]
+    );
+
+    // The plan carries exactly one CteMergeQuery, over both materialized sources.
+    let lines = explain_lines(&runtime, &sql);
+    let merge_lines: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.starts_with("CteMergeQuery"))
+        .collect();
+    assert_eq!(merge_lines.len(), 1, "one merge query in plan:\n{lines:#?}");
+    let scans = lines
+        .iter()
+        .filter(|line| line.starts_with("Scan ["))
+        .count();
+    assert_eq!(scans, 2, "both base sources materialized:\n{lines:#?}");
+}
+
+#[test]
+fn recursive_hierarchy_traversal_joins_a_second_source() {
+    // A management chain is walked recursively over one source (employees) and
+    // joined to a per-employee bonus table on a second source. The whole recursion
+    // runs in the merge engine.
+    let (runtime, emp, bonus) = two_source_runtime_seeded(
+        "rec2",
+        "CREATE TABLE employees (id INTEGER, manager_id INTEGER, name VARCHAR); \
+         INSERT INTO employees VALUES \
+         (1, NULL, 'ceo'), (2, 1, 'vp'), (3, 2, 'mgr'), (4, 3, 'eng'), (5, 1, 'cfo');",
+        "CREATE TABLE bonuses (emp_id INTEGER, amount INTEGER); \
+         INSERT INTO bonuses VALUES (1, 100), (2, 50), (3, 30), (4, 10), (5, 40);",
+    );
+    let sql = format!(
+        "WITH RECURSIVE chain(id, name, lvl) AS (\
+           SELECT id, name, 0 FROM {emp}.main.employees WHERE manager_id IS NULL \
+           UNION ALL \
+           SELECT e.id, e.name, c.lvl + 1 FROM {emp}.main.employees e \
+           JOIN chain c ON e.manager_id = c.id) \
+         SELECT ch.name, ch.lvl, b.amount FROM chain ch \
+         JOIN {bonus}.main.bonuses b ON b.emp_id = ch.id"
+    );
+    let (schema, batches) = runtime.execute(&sql).expect("recursive hierarchy cte");
+
+    let names: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["name".to_string(), "lvl".to_string(), "amount".to_string()]
+    );
+
+    // ceo(lvl 0), its reports vp+cfo(lvl 1), mgr(lvl 2), eng(lvl 3), with bonuses.
+    assert_eq!(
+        sorted_name_lvl_amount(&batches),
+        vec![
+            ("ceo".to_string(), 0, 100),
+            ("cfo".to_string(), 1, 40),
+            ("eng".to_string(), 3, 10),
+            ("mgr".to_string(), 2, 30),
+            ("vp".to_string(), 1, 50),
+        ]
+    );
+
+    let lines = explain_lines(&runtime, &sql);
+    let merge_lines = lines
+        .iter()
+        .filter(|line| line.starts_with("CteMergeQuery"))
+        .count();
+    assert_eq!(merge_lines, 1, "one merge query in plan:\n{lines:#?}");
+}
+
+/// A two-source runtime whose `<tag>_orders` / `<tag>_customers` datasources are
+/// seeded with arbitrary DDL (for fixtures other than the canonical orders).
+fn two_source_runtime_seeded(
+    tag: &str,
+    first_ddl: &str,
+    second_ddl: &str,
+) -> (Runtime, String, String) {
+    let first_name = format!("{tag}_orders");
+    let second_name = format!("{tag}_customers");
+    let first_path = temp_duck(&first_name);
+    let second_path = temp_duck(&second_name);
+    seed_duck(&first_path, first_ddl);
+    seed_duck(&second_path, second_ddl);
+
+    let mut datasources = BTreeMap::new();
+    datasources.insert(
+        first_name.clone(),
+        duck_datasource(&first_name, &first_path),
+    );
+    datasources.insert(
+        second_name.clone(),
+        duck_datasource(&second_name, &second_path),
+    );
+    let config = Config {
+        datasources,
+        optimizer: OptimizerConfig::default(),
+        executor: ExecutorConfig::default(),
+        cost: CostConfig::default(),
+        source_path: None,
+    };
+    let runtime = Runtime::from_config(&config).expect("from_config");
+    (runtime, first_name, second_name)
+}
+
+/// The `(name, lvl, amount)` rows, sorted. `lvl`/`amount` read as Int32 or Int64.
+fn sorted_name_lvl_amount(batches: &[RecordBatch]) -> Vec<(String, i64, i64)> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let names = str_col(batch, 0);
+        let mut lvl = Vec::new();
+        push_ints(batch.column(1).as_ref(), &mut lvl);
+        let mut amount = Vec::new();
+        push_ints(batch.column(2).as_ref(), &mut amount);
+        for row in 0..batch.num_rows() {
+            out.push((names.value(row).to_string(), lvl[row], amount[row]));
+        }
+    }
+    out.sort();
+    out
 }

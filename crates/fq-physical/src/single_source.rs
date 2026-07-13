@@ -630,7 +630,7 @@ impl SingleSourcePushdown {
         anchor_columns: Option<&[String]>,
     ) -> Result<Option<String>, EmitError> {
         if let LogicalPlan::Values(values) = node {
-            return render_values_branch(values);
+            return render_values_branch(values, anchor_columns);
         }
         let mut inner = ctx.child();
         if !self.absorb(node, &mut inner)? || inner.select_exprs.is_empty() {
@@ -1251,15 +1251,29 @@ fn set_op_sql(node: &SetOperation, left: &str, right: &str) -> String {
 /// Build a single constant row as a FROM-less `SELECT <items>` branch (the base
 /// case of a recursive CTE), bypassing `assemble_select` (which always emits FROM).
 /// A trailing alias is added only when it differs from the rendered expression.
-fn render_values_branch(node: &Values) -> Result<Option<String>, EmitError> {
+fn render_values_branch(
+    node: &Values,
+    anchor_columns: Option<&[String]>,
+) -> Result<Option<String>, EmitError> {
     if node.rows.len() != 1 {
         return Ok(None);
     }
     let mut items = Vec::with_capacity(node.output_names.len());
-    for (expr, name) in node.rows[0].iter().zip(node.output_names.iter()) {
+    for (index, (expr, name)) in node.rows[0]
+        .iter()
+        .zip(node.output_names.iter())
+        .enumerate()
+    {
+        // A CTE column list, when present, names each output column, so a recursive
+        // CTE's `SELECT <const>` anchor emits `<const> AS <ctecol>`. The merge engine
+        // ignores a `WITH name(cols)` list, so aliasing here makes the CTE self-named
+        // and its self-reference (`seq.n`) resolves.
+        let target = anchor_columns
+            .and_then(|columns| columns.get(index))
+            .map_or(name.as_str(), String::as_str);
         let mut fragment = render_expr(expr, &CANONICAL_SOURCE_RESOLVER)?;
-        if !name.is_empty() && *name != render_canonical(expr)? {
-            fragment = format!("{fragment} AS {}", quote_ident(name));
+        if !target.is_empty() && target != render_canonical(expr)? {
+            fragment = format!("{fragment} AS {}", quote_ident(target));
         }
         items.push(fragment);
     }
