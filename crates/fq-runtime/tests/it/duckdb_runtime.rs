@@ -18,35 +18,47 @@ use arrow::datatypes::SchemaRef;
 use fq_common::{
     Config, CostConfig, DataSourceConfig, ExecutorConfig, OptimizerConfig, ServerConfig,
 };
+use fq_connectors::DuckDbSource;
 use fq_runtime::Runtime;
 use serde_yaml::Value;
 
-/// The smallest bundled DuckDB fixture (TPC-H at SF 0.01: region has 5 rows,
-/// nation 25). Absolute, relative to this crate's manifest. Read-only and shared
-/// across test binaries.
-fn canonical_fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/tpch/data/tpch_sf0.01.duckdb")
-}
+/// The region + nation subset the assertions read: TPC-H's 5 regions and 25
+/// nations (5 per region), with the exact names and keys the queries expect
+/// (region 0 = AFRICA holds ALGERIA/ETHIOPIA/KENYA/MOROCCO/MOZAMBIQUE; the max
+/// nationkey is 24). Only the three columns the queries touch are seeded.
+const SEED_SQL: &str = "\
+    CREATE TABLE region (r_regionkey INTEGER, r_name VARCHAR); \
+    INSERT INTO region VALUES \
+        (0,'AFRICA'),(1,'AMERICA'),(2,'ASIA'),(3,'EUROPE'),(4,'MIDDLE EAST'); \
+    CREATE TABLE nation (n_nationkey INTEGER, n_name VARCHAR, n_regionkey INTEGER); \
+    INSERT INTO nation VALUES \
+        (0,'ALGERIA',0),(1,'ARGENTINA',1),(2,'BRAZIL',1),(3,'CANADA',1),(4,'EGYPT',4), \
+        (5,'ETHIOPIA',0),(6,'FRANCE',3),(7,'GERMANY',3),(8,'INDIA',2),(9,'INDONESIA',2), \
+        (10,'IRAN',4),(11,'IRAQ',4),(12,'JAPAN',2),(13,'JORDAN',4),(14,'KENYA',0), \
+        (15,'MOROCCO',0),(16,'MOZAMBIQUE',0),(17,'PERU',1),(18,'CHINA',2),(19,'ROMANIA',3), \
+        (20,'SAUDI ARABIA',4),(21,'VIETNAM',2),(22,'RUSSIA',3),(23,'UNITED KINGDOM',3), \
+        (24,'UNITED STATES',1);";
 
-/// A private per-call copy of the fixture. DuckDB opens a file read-write (single
-/// writer per file per process), so parallel test binaries opening the one shared
-/// fixture would contend on its lock and intermittently fail; each caller instead
-/// gets its own copy. When the fixture is absent the canonical (nonexistent) path
-/// is returned unchanged, so a caller's `exists()` gate still skips the test.
-fn fixture_path() -> PathBuf {
+/// Seed a fresh DuckDB file with the region/nation subset and return its path.
+/// DuckDB opens a file read-write (single writer per file per process), so every
+/// caller builds its OWN file at a unique temp path: parallel test binaries never
+/// contend on a shared file, and no checked-in database is ever opened.
+fn seed_fixture() -> PathBuf {
     static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let canonical = canonical_fixture();
-    if !canonical.exists() {
-        return canonical;
-    }
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let unique = std::env::temp_dir().join(format!(
-        "fq_tpch_fixture_{}_{}.duckdb",
+    let path = std::env::temp_dir().join(format!(
+        "fq_seed_region_nation_{}_{}.duckdb",
         std::process::id(),
         id
     ));
-    std::fs::copy(&canonical, &unique).expect("copy tpch fixture to a private temp path");
-    unique
+    // A leftover file from a crashed prior run would make CREATE TABLE fail; start
+    // from a clean path.
+    let _ = std::fs::remove_file(&path);
+    let source =
+        DuckDbSource::open("seed", path.to_str().expect("temp path is valid UTF-8")).expect("open");
+    source.execute_batch(SEED_SQL).expect("seed region/nation");
+    drop(source);
+    path
 }
 
 /// Build a single-DuckDB-source `Config` in code, pointing at `path` under the
@@ -151,11 +163,7 @@ fn downcast_str(batch: &RecordBatch, index: usize) -> &StringArray {
 
 #[test]
 fn runs_several_queries_in_one_session_on_real_duckdb() {
-    let path = fixture_path();
-    if !path.exists() {
-        eprintln!("skipping duckdb_runtime: fixture {} absent", path.display());
-        return;
-    }
+    let path = seed_fixture();
     let path = path.to_str().expect("fixture path is valid UTF-8");
     let runtime = Runtime::from_config(&duck_config(path)).expect("from_config");
 
@@ -216,14 +224,7 @@ fn runs_several_queries_in_one_session_on_real_duckdb() {
 
 #[test]
 fn explain_returns_a_plan_without_executing() {
-    let path = fixture_path();
-    if !path.exists() {
-        eprintln!(
-            "skipping duckdb_runtime explain: fixture {} absent",
-            path.display()
-        );
-        return;
-    }
+    let path = seed_fixture();
     let path = path.to_str().expect("fixture path is valid UTF-8");
     let runtime = Runtime::from_config(&duck_config(path)).expect("from_config");
 
@@ -243,14 +244,7 @@ fn explain_returns_a_plan_without_executing() {
 
 #[test]
 fn explain_scan_line_carries_the_effective_pushed_sql() {
-    let path = fixture_path();
-    if !path.exists() {
-        eprintln!(
-            "skipping duckdb_runtime explain sql: fixture {} absent",
-            path.display()
-        );
-        return;
-    }
+    let path = seed_fixture();
     let path = path.to_str().expect("fixture path is valid UTF-8");
     let runtime = Runtime::from_config(&duck_config(path)).expect("from_config");
 
@@ -282,14 +276,7 @@ fn explain_scan_line_carries_the_effective_pushed_sql() {
 
 #[test]
 fn planning_budget_kill_reports_the_stage_timings() {
-    let path = fixture_path();
-    if !path.exists() {
-        eprintln!(
-            "skipping duckdb_runtime budget: fixture {} absent",
-            path.display()
-        );
-        return;
-    }
+    let path = seed_fixture();
     let path = path.to_str().expect("fixture path is valid UTF-8");
     // A zero budget is exceeded the moment the clock starts: every plan MUST be
     // killed, and the kill MUST report where the time went.
@@ -313,14 +300,7 @@ fn planning_budget_kill_reports_the_stage_timings() {
 
 #[test]
 fn invalid_query_raises_not_returns_rows() {
-    let path = fixture_path();
-    if !path.exists() {
-        eprintln!(
-            "skipping duckdb_runtime invalid: fixture {} absent",
-            path.display()
-        );
-        return;
-    }
+    let path = seed_fixture();
     let path = path.to_str().expect("fixture path is valid UTF-8");
     let runtime = Runtime::from_config(&duck_config(path)).expect("from_config");
 

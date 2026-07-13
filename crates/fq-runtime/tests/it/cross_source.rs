@@ -19,36 +19,45 @@ use arrow::array::{RecordBatch, StringArray};
 use fq_common::{
     Config, CostConfig, DataSourceConfig, ExecutorConfig, OptimizerConfig, ServerConfig,
 };
-use fq_connectors::PostgresSource;
+use fq_connectors::{DuckDbSource, PostgresSource};
 use fq_runtime::Runtime;
 use serde_yaml::Value;
 
-/// The bundled DuckDB fixture (TPC-H SF 0.01), read-only and shared across test
-/// binaries.
-fn canonical_duck_fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/tpch/data/tpch_sf0.01.duckdb")
-}
+/// The nation subset the join reads: TPC-H's 25 nations (5 per region), with the
+/// real names and region keys. The join filters to region 0 (AFRICA), whose five
+/// nations are ALGERIA, ETHIOPIA, KENYA, MOROCCO, MOZAMBIQUE. Region lives on the
+/// Postgres side (see `create_pg_fixture`), so only nation is seeded here.
+const NATION_SEED_SQL: &str = "\
+    CREATE TABLE nation (n_nationkey INTEGER, n_name VARCHAR, n_regionkey INTEGER); \
+    INSERT INTO nation VALUES \
+        (0,'ALGERIA',0),(1,'ARGENTINA',1),(2,'BRAZIL',1),(3,'CANADA',1),(4,'EGYPT',4), \
+        (5,'ETHIOPIA',0),(6,'FRANCE',3),(7,'GERMANY',3),(8,'INDIA',2),(9,'INDONESIA',2), \
+        (10,'IRAN',4),(11,'IRAQ',4),(12,'JAPAN',2),(13,'JORDAN',4),(14,'KENYA',0), \
+        (15,'MOROCCO',0),(16,'MOZAMBIQUE',0),(17,'PERU',1),(18,'CHINA',2),(19,'ROMANIA',3), \
+        (20,'SAUDI ARABIA',4),(21,'VIETNAM',2),(22,'RUSSIA',3),(23,'UNITED KINGDOM',3), \
+        (24,'UNITED STATES',1);";
 
-/// A private per-call copy of the fixture. DuckDB opens a file read-write (single
-/// writer per file per process), and this test ships temp tables INTO the fact
-/// source, so opening the one shared fixture would both contend with parallel test
-/// binaries and mutate a checked-in file; each caller gets its own copy. When the
-/// fixture is absent the canonical (nonexistent) path is returned unchanged, so
-/// the caller's `exists()` gate still skips the test.
-fn duck_fixture_path() -> PathBuf {
+/// Seed a fresh DuckDB file with the nation subset and return its path. DuckDB
+/// opens a file read-write (single writer per file per process) and this test
+/// ships temp tables INTO the fact source, so every caller builds its OWN file at
+/// a unique temp path: parallel test binaries never contend, and no checked-in
+/// database is ever opened.
+fn seed_duck_fixture() -> PathBuf {
     static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let canonical = canonical_duck_fixture();
-    if !canonical.exists() {
-        return canonical;
-    }
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let unique = std::env::temp_dir().join(format!(
-        "fq_tpch_fixture_{}_{}.duckdb",
+    let path = std::env::temp_dir().join(format!(
+        "fq_seed_nation_{}_{}.duckdb",
         std::process::id(),
         id
     ));
-    std::fs::copy(&canonical, &unique).expect("copy tpch fixture to a private temp path");
-    unique
+    // A leftover file from a crashed prior run would make CREATE TABLE fail; start
+    // from a clean path.
+    let _ = std::fs::remove_file(&path);
+    let source =
+        DuckDbSource::open("seed", path.to_str().expect("temp path is valid UTF-8")).expect("open");
+    source.execute_batch(NATION_SEED_SQL).expect("seed nation");
+    drop(source);
+    path
 }
 
 /// The libpq connection string for the local trust-auth Postgres.
@@ -169,11 +178,7 @@ fn create_pg_fixture(source: &PostgresSource) {
 
 #[test]
 fn joins_duckdb_nation_against_postgres_region() {
-    let duck_path = duck_fixture_path();
-    if !duck_path.exists() {
-        eprintln!("skipping cross_source: duckdb fixture absent");
-        return;
-    }
+    let duck_path = seed_duck_fixture();
     let Some(adbc_driver) = adbc_driver_path() else {
         eprintln!("skipping cross_source: ADBC postgres driver not found");
         return;

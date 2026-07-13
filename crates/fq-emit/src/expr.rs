@@ -71,7 +71,7 @@ pub fn render_expr(expr: &Expr, resolver: &dyn ColumnResolver) -> Result<String,
         } => Ok(format!(
             "CAST({} AS {})",
             render_expr(expr, resolver)?,
-            target_type
+            canonical_type(target_type)
         )),
         Expr::Extract { field, source } => Ok(format!(
             "EXTRACT({} FROM {})",
@@ -88,6 +88,22 @@ pub fn render_expr(expr: &Expr, resolver: &dyn ColumnResolver) -> Result<String,
         Expr::QuantifiedComparison { .. } => {
             Err(EmitError::SubqueryReachedEmit("QuantifiedComparison"))
         }
+    }
+}
+
+/// Render a CAST target type in canonical Postgres form. The parser keeps the
+/// cast type as its source SQL text, and DuckDB spells the double type `DOUBLE`
+/// while Postgres spells it `DOUBLE PRECISION`; a bare `DOUBLE` is not a Postgres
+/// type. Since the canonical emitter must be valid Postgres (an island's rendered
+/// SQL is sent to Postgres verbatim, never re-transpiled), the `DOUBLE` spelling
+/// is rewritten to `DOUBLE PRECISION` here. Parameterized types (DECIMAL(p,s),
+/// VARCHAR(n)) and every other type already carry a Postgres-valid spelling, so
+/// they pass through unchanged.
+fn canonical_type(target_type: &str) -> &str {
+    if target_type.eq_ignore_ascii_case("DOUBLE") {
+        "DOUBLE PRECISION"
+    } else {
+        target_type
     }
 }
 
@@ -811,6 +827,34 @@ mod tests {
             to_source_sql(&rendered, Dialect::DuckDb)
                 .unwrap_or_else(|e| panic!("duckdb round-trip failed for {rendered}: {e}"));
         }
+    }
+
+    #[test]
+    fn float_cast_renders_double_precision_for_postgres_and_double_for_duckdb() {
+        // A DuckDB-spelled `DOUBLE` cast (what the parser keeps for a double cast)
+        // must reach each source as that source's valid double spelling: the
+        // canonical Postgres text is `DOUBLE PRECISION` (a bare `DOUBLE` is not a
+        // Postgres type), and the transpile boundary maps it per dialect. An
+        // island's rendered SQL is sent to Postgres verbatim, so the canonical
+        // text itself has to be valid Postgres.
+        let cast = Expr::Cast {
+            expr: Box::new(col("t", "a")),
+            target_type: "DOUBLE".to_string(),
+            data_type: Some(DataType::Double),
+        };
+        assert_eq!(render(&cast), "CAST(\"t\".\"a\" AS DOUBLE PRECISION)");
+
+        let rendered = format!("SELECT {} FROM \"main\".\"t\"", render(&cast));
+        let pg = to_source_sql(&rendered, Dialect::Postgres).unwrap();
+        assert!(
+            pg.contains("DOUBLE PRECISION"),
+            "postgres cast must be DOUBLE PRECISION: {pg}"
+        );
+        let duck = to_source_sql(&rendered, Dialect::DuckDb).unwrap();
+        assert!(
+            duck.contains("DOUBLE"),
+            "duckdb cast must carry a DOUBLE type: {duck}"
+        );
     }
 
     #[test]
