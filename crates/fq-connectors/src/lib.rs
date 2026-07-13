@@ -6,11 +6,15 @@
 //! separate concern that moves in with fq-exec (today's fedqrs connectors.rs,
 //! de-pyo3-ified).
 //!
-//! Only DuckDB and Postgres have connectors; there is no `parquet`/`clickhouse`
+//! DuckDB, Postgres, and ClickHouse have connectors; there is no `parquet`
 //! metadata surface, and registering such a source is rejected loudly.
 
+pub mod clickhouse_source;
 pub mod duckdb_source;
+pub mod mysql_source;
 pub mod postgres_source;
 
+pub use clickhouse_source::ClickHouseSource;
 pub use duckdb_source::DuckDbSource;
+pub use mysql_source::MySqlSource;
 pub use postgres_source::PostgresSource;

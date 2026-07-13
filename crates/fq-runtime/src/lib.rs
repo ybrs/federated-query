@@ -24,7 +24,7 @@ use serde_yaml::Value;
 
 use fq_catalog::{Catalog, StatsCatalog};
 use fq_common::{Config, DataSourceConfig, DataType, PlanBudget};
-use fq_connectors::{DuckDbSource, PostgresSource};
+use fq_connectors::{ClickHouseSource, DuckDbSource, MySqlSource, PostgresSource};
 use fq_exec::{connectors, execute_plan};
 use fq_optimize::{build_optimizer, CostModel, StatisticsCollector};
 use fq_parse::parse_with_catalog;
@@ -334,11 +334,193 @@ fn register_datasource(
     match datasource.ty.as_str() {
         "duckdb" => register_duckdb(catalog, datasource),
         "postgres" | "postgresql" => register_postgres(catalog, datasource),
+        "clickhouse" => register_clickhouse(catalog, datasource),
+        "mysql" => register_mysql(catalog, datasource),
         other => Err(RuntimeError::Config(format!(
             "datasource '{}' has unsupported type '{other}'",
             datasource.name
         ))),
     }
+}
+
+/// Reject any connection-param key not in `allowed` for a datasource block, so a
+/// typo (e.g. `hostt`) fails loud at load rather than being silently ignored. An
+/// allowlist, never a denylist: an unrecognized key is always an error.
+fn reject_unknown_keys(
+    datasource: &DataSourceConfig,
+    allowed: &[&str],
+) -> Result<(), RuntimeError> {
+    for key in datasource.config.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(RuntimeError::Config(format!(
+                "datasource '{}' has unknown parameter '{key}'",
+                datasource.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Register a ClickHouse source: an HTTP catalog handle (system tables, EXPLAIN
+/// ESTIMATE) plus the exec-plane spec, both from the same endpoint. The endpoint
+/// URI carries `?user=/&password=` auth so the data-plane POST needs no headers.
+fn register_clickhouse(
+    catalog: &mut Catalog,
+    datasource: &DataSourceConfig,
+) -> Result<(), RuntimeError> {
+    reject_unknown_keys(
+        datasource,
+        &[
+            "host", "port", "user", "username", "password", "database", "schemas",
+        ],
+    )?;
+    let base_url = clickhouse_base_url(datasource);
+    let user = optional_str(datasource, "user").or_else(|| optional_str(datasource, "username"));
+    let password = optional_str(datasource, "password");
+    let source = ClickHouseSource::connect(
+        datasource.name.clone(),
+        &base_url,
+        user.clone(),
+        password.clone(),
+        clickhouse_schemas(datasource)?,
+    )?;
+    catalog.register_datasource(Arc::new(source));
+    let spec = connectors::spec_from_kind(
+        "clickhouse",
+        Some(clickhouse_endpoint(&base_url, user, password)),
+        None,
+    )?;
+    connectors::register(datasource.name.clone(), spec);
+    Ok(())
+}
+
+/// Register a MySQL source: a sync catalog handle (information_schema, EXPLAIN)
+/// plus the exec-plane spec, both from the same `mysql://` URL built from the
+/// connection params.
+fn register_mysql(
+    catalog: &mut Catalog,
+    datasource: &DataSourceConfig,
+) -> Result<(), RuntimeError> {
+    reject_unknown_keys(
+        datasource,
+        &[
+            "host", "port", "user", "username", "password", "database", "schemas",
+        ],
+    )?;
+    let url = mysql_url(datasource)?;
+    let source = MySqlSource::connect(datasource.name.clone(), &url, mysql_schemas(datasource)?)?;
+    catalog.register_datasource(Arc::new(source));
+    let spec = connectors::spec_from_kind("mysql", Some(url), None)?;
+    connectors::register(datasource.name.clone(), spec);
+    Ok(())
+}
+
+/// The `mysql://` URL for a source from its `host`/`port`/`user`/`password`/
+/// `database` params (default `localhost:3306`). The default database is the
+/// first configured schema, so unqualified reads resolve.
+fn mysql_url(datasource: &DataSourceConfig) -> Result<String, RuntimeError> {
+    let host = string_param(datasource, "host").unwrap_or_else(|| "localhost".to_string());
+    let port = string_param(datasource, "port").unwrap_or_else(|| "3306".to_string());
+    let user = optional_str(datasource, "user")
+        .or_else(|| optional_str(datasource, "username"))
+        .unwrap_or_else(|| "root".to_string());
+    let database = mysql_schemas(datasource)?.remove(0);
+    let credentials = match string_param(datasource, "password") {
+        Some(password) => format!("{}:{}", url_encode(&user), url_encode(&password)),
+        None => url_encode(&user),
+    };
+    Ok(format!("mysql://{credentials}@{host}:{port}/{database}"))
+}
+
+/// The MySQL database list from the `schemas` sequence, or the single `database`
+/// param. An absent or empty list is a configuration error (MySQL has no default
+/// database name here).
+fn mysql_schemas(datasource: &DataSourceConfig) -> Result<Vec<String>, RuntimeError> {
+    let names = match datasource
+        .config
+        .get("schemas")
+        .and_then(Value::as_sequence)
+    {
+        Some(sequence) => collect_schema_names(sequence),
+        None => match optional_str(datasource, "database") {
+            Some(database) => vec![database],
+            None => Vec::new(),
+        },
+    };
+    if names.is_empty() {
+        return Err(RuntimeError::Config(format!(
+            "mysql datasource '{}' needs a 'database' or non-empty 'schemas'",
+            datasource.name
+        )));
+    }
+    Ok(names)
+}
+
+/// The base HTTP URL of a ClickHouse source from its `host`/`port` (defaults
+/// `localhost:8123`), used by the catalog handle (which sends auth as headers).
+fn clickhouse_base_url(datasource: &DataSourceConfig) -> String {
+    let host = string_param(datasource, "host").unwrap_or_else(|| "localhost".to_string());
+    let port = string_param(datasource, "port").unwrap_or_else(|| "8123".to_string());
+    format!("http://{host}:{port}/")
+}
+
+/// The data-plane endpoint URI: the base URL with any `user`/`password` embedded
+/// as query parameters (ClickHouse HTTP authenticates from the query string), so
+/// the streaming POST is a pure body request.
+fn clickhouse_endpoint(base_url: &str, user: Option<String>, password: Option<String>) -> String {
+    match user {
+        None => base_url.to_string(),
+        Some(user) => format!(
+            "{base_url}?user={}&password={}",
+            url_encode(&user),
+            url_encode(&password.unwrap_or_default())
+        ),
+    }
+}
+
+/// Percent-encode the characters that would break a URL query value. A narrow
+/// encoder for credential strings; the reserved set covers the shapes a password
+/// can contain that a query parser would otherwise misread.
+fn url_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            other => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                out.push('%');
+                out.push(HEX[(other >> 4) as usize] as char);
+                out.push(HEX[(other & 0x0F) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+/// The ClickHouse database list from the `schemas` config sequence. Unlike
+/// Postgres, a ClickHouse source has no default database name, so an absent or
+/// empty `schemas` is a configuration error rather than a silent default.
+fn clickhouse_schemas(datasource: &DataSourceConfig) -> Result<Vec<String>, RuntimeError> {
+    let names = match datasource
+        .config
+        .get("schemas")
+        .and_then(Value::as_sequence)
+    {
+        Some(sequence) => collect_schema_names(sequence),
+        None => match optional_str(datasource, "database") {
+            Some(database) => vec![database],
+            None => Vec::new(),
+        },
+    };
+    if names.is_empty() {
+        return Err(RuntimeError::Config(format!(
+            "clickhouse datasource '{}' needs a 'database' or non-empty 'schemas'",
+            datasource.name
+        )));
+    }
+    Ok(names)
 }
 
 /// Register a DuckDB source. The whole process shares ONE read-write DuckDB

@@ -1,5 +1,6 @@
 //! One integration-test binary for the crate: each module is a test suite.
 
 mod cross_source;
+mod cross_source_clickhouse;
 mod ctes;
 mod duckdb_runtime;

@@ -9,4 +9,6 @@ pub enum DsKind {
     Postgres,
     DuckDb,
     Parquet,
+    ClickHouse,
+    MySql,
 }

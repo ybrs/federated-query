@@ -21,6 +21,7 @@ pub enum RenderDialect {
     Postgres,
     DuckDb,
     ClickHouse,
+    MySql,
 }
 
 /// Capabilities a data source may support.

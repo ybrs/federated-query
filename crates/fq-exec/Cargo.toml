@@ -23,6 +23,12 @@ arrow = "58"
 arrow-array = "58"
 arrow-schema = "58"
 tokio = { version = "1", features = ["rt-multi-thread"] }
+# ClickHouse reads go over its HTTP interface (FORMAT ArrowStream); ureq is the
+# sync client, default-features off to drop TLS (plain HTTP to the endpoint).
+ureq = { version = "3", default-features = false }
+# MySQL reads go over the sync client; rows are decoded to Arrow here. minimal +
+# no default features drops the TLS stack (plain TCP to the DB).
+mysql = { version = "28", default-features = false, features = ["minimal"] }
 # Stream combinators for pool-tracked batch accumulation.
 futures = "0.3"
 # The IR keeps its serde for this milestone so the imported ir.rs unit tests run;

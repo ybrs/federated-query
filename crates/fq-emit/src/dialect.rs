@@ -12,6 +12,7 @@ pub enum Dialect {
     Postgres,
     DuckDb,
     ClickHouse,
+    MySql,
     DataFusion,
 }
 
@@ -22,6 +23,7 @@ impl Dialect {
             Dialect::Postgres => DialectType::PostgreSQL,
             Dialect::DuckDb => DialectType::DuckDB,
             Dialect::ClickHouse => DialectType::ClickHouse,
+            Dialect::MySql => DialectType::MySQL,
             Dialect::DataFusion => DialectType::DataFusion,
         }
     }
@@ -32,6 +34,7 @@ impl Dialect {
             Dialect::Postgres => "postgres",
             Dialect::DuckDb => "duckdb",
             Dialect::ClickHouse => "clickhouse",
+            Dialect::MySql => "mysql",
             Dialect::DataFusion => "datafusion",
         }
     }
@@ -99,6 +102,63 @@ mod tests {
             out.contains("PERCENT"),
             "duckdb tablesample uses PERCENT: {out}"
         );
+    }
+
+    #[test]
+    fn clickhouse_transpiles_representative_shapes() {
+        // A join + aggregate + filter + order/limit round-trips to a single
+        // ClickHouse statement (the shapes a pushed single-source subtree emits).
+        let sql = "SELECT \"o\".\"cust\", COUNT(*) AS n FROM \"main\".\"orders\" AS \"o\" \
+                   JOIN \"main\".\"line\" AS \"l\" ON \"o\".\"id\" = \"l\".\"oid\" \
+                   WHERE \"o\".\"total\" > 100 GROUP BY \"o\".\"cust\" \
+                   ORDER BY n DESC LIMIT 10";
+        let out = to_source_sql(sql, Dialect::ClickHouse).unwrap();
+        assert!(out.to_uppercase().contains("GROUP BY"), "{out}");
+        assert!(out.to_uppercase().contains("LIMIT 10"), "{out}");
+        assert!(out.to_uppercase().contains("JOIN"), "{out}");
+    }
+
+    #[test]
+    fn clickhouse_scalar_and_aggregate_forms_round_trip() {
+        // The common aggregate / CASE / cast shapes a pushed subtree emits
+        // transpile to one ClickHouse statement without corruption.
+        let sql = "SELECT SUM(\"t\".\"a\"), AVG(\"t\".\"b\"), \
+                   CASE WHEN \"t\".\"a\" > 0 THEN 1 ELSE 0 END, \
+                   CAST(\"t\".\"a\" AS DOUBLE PRECISION) FROM \"main\".\"t\"";
+        let out = to_source_sql(sql, Dialect::ClickHouse).unwrap();
+        assert!(out.to_uppercase().contains("SUM"), "{out}");
+        assert!(out.to_uppercase().contains("AVG"), "{out}");
+        assert!(out.to_uppercase().contains("CASE"), "{out}");
+    }
+
+    #[test]
+    fn mysql_transpiles_representative_shapes() {
+        // A join + aggregate + filter + order/limit round-trips to a single MySQL
+        // statement (the shapes a pushed single-source subtree emits). MySQL's
+        // backtick identifier quoting differs from Postgres, so this proves the
+        // new dialect target actually rewrites rather than pass through.
+        let sql = "SELECT \"o\".\"cust\", COUNT(*) AS n FROM \"main\".\"orders\" AS \"o\" \
+                   JOIN \"main\".\"line\" AS \"l\" ON \"o\".\"id\" = \"l\".\"oid\" \
+                   WHERE \"o\".\"total\" > 100 GROUP BY \"o\".\"cust\" \
+                   ORDER BY n DESC LIMIT 10";
+        let out = to_source_sql(sql, Dialect::MySql).unwrap();
+        assert!(
+            out.contains('`'),
+            "mysql quotes identifiers with backticks: {out}"
+        );
+        assert!(out.to_uppercase().contains("GROUP BY"), "{out}");
+        assert!(out.to_uppercase().contains("LIMIT 10"), "{out}");
+    }
+
+    #[test]
+    fn mysql_string_and_cast_forms_round_trip() {
+        // CONCAT / CASE / CAST shapes transpile to one MySQL statement.
+        let sql = "SELECT CONCAT(\"t\".\"a\", \"t\".\"b\"), \
+                   CASE WHEN \"t\".\"a\" > 0 THEN 1 ELSE 0 END, \
+                   CAST(\"t\".\"a\" AS DOUBLE PRECISION) FROM \"main\".\"t\"";
+        let out = to_source_sql(sql, Dialect::MySql).unwrap();
+        assert!(out.to_uppercase().contains("CONCAT"), "{out}");
+        assert!(out.to_uppercase().contains("CASE"), "{out}");
     }
 
     #[test]

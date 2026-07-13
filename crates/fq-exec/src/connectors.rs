@@ -92,8 +92,8 @@ thread_local! {
 /// the target (an ADBC binary-COPY of a giant relation into Postgres). Failing
 /// loud here turns that runaway into an immediate, honest crash - a crash never
 /// ships a lie. The value is a deliberately large multiple of the plan budget;
-/// there is no query-derived "right" number for a safety valve, so it is a fixed
-/// constant for now and will move to user-overridable settings later.
+/// there is no query-derived "right" number for a safety valve, so it is a
+/// fixed constant.
 const SHIP_MAX_ROWS: usize = 50_000_000;
 
 /// Materialize a relation as a TEMP TABLE on the target source (DuckDB or
@@ -119,6 +119,12 @@ pub fn ship_table(
         DsKind::Postgres => ship_table_postgres(name, &s, table, schema, batches),
         DsKind::Parquet => Err(ExecError::runtime(format!(
             "ship target '{name}' is a read-only Parquet source; cannot ship into it"
+        ))),
+        DsKind::ClickHouse => Err(ExecError::runtime(format!(
+            "ship target '{name}' is a ClickHouse source; the engine does not ship into it"
+        ))),
+        DsKind::MySql => Err(ExecError::runtime(format!(
+            "ship target '{name}' is a MySQL source; the engine does not ship into it"
         ))),
     }
 }
@@ -235,7 +241,44 @@ pub fn fetch(name: &str, sql: &str) -> ExecResult<(SchemaRef, Vec<RecordBatch>)>
         DsKind::Postgres => fetch_postgres(name, &s, sql),
         DsKind::DuckDb => fetch_duckdb(&s, sql),
         DsKind::Parquet => fetch_parquet(&s, sql),
+        DsKind::ClickHouse => fetch_clickhouse(name, &s, sql),
+        DsKind::MySql => fetch_mysql(&s, sql),
     }
+}
+
+/// A shared, cloneable ureq agent for ClickHouse HTTP reads (pools connections).
+fn clickhouse_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(ureq::Agent::new_with_defaults)
+}
+
+/// Read a ClickHouse source by POSTing `sql` to its HTTP interface with
+/// `FORMAT ArrowStream` and decoding the Arrow IPC stream straight into batches.
+/// ClickHouse does the Arrow encoding, so the schema is authoritative; an IPC
+/// decode failure names the failing frame and propagates rather than shipping a
+/// partial result. The endpoint URI already carries any `?user=/&password=` auth
+/// (built at registration), so this is a pure body POST.
+fn fetch_clickhouse(
+    name: &str,
+    s: &DsSpec,
+    sql: &str,
+) -> ExecResult<(SchemaRef, Vec<RecordBatch>)> {
+    trace_sql(name, sql);
+    let query = format!("{sql}\nFORMAT ArrowStream");
+    let response = clickhouse_agent()
+        .post(&s.uri)
+        .send(query.as_str())
+        .map_err(|e| ExecError::runtime(format!("clickhouse http: {e}")))?;
+    let reader = response.into_body().into_reader();
+    let stream = arrow::ipc::reader::StreamReader::try_new(reader, None)
+        .map_err(|e| ExecError::runtime(format!("clickhouse arrow stream: {e}")))?;
+    let schema = stream.schema();
+    let mut batches = Vec::new();
+    for batch in stream {
+        batches
+            .push(batch.map_err(|e| ExecError::runtime(format!("clickhouse arrow batch: {e}")))?);
+    }
+    Ok((schema, batches))
 }
 
 // A DataFusion runtime for reading Parquet sources. Source reads run in the
@@ -429,6 +472,290 @@ fn run_duckdb_query(
         batches.push(batch);
     }
     Ok((schema, batches))
+}
+
+// --- MySQL data plane ---------------------------------------------------------
+//
+// MySQL has no Arrow output format, so rows are decoded to Arrow here. Each
+// result column's MySQL protocol type picks an Arrow builder; a value that does
+// not fit its column's decoder (a non-UTF-8 byte string in a text column, an
+// unsigned value past i64) fails loud, naming the column and its MySQL type,
+// rather than shipping a corrupt or truncated batch.
+
+thread_local! {
+    // One live MySQL connection per datasource URL on the query-driving thread
+    // (mirrors the DuckDB cursor cache; the sync client is not Sync).
+    static MYSQL_CACHE: RefCell<HashMap<String, mysql::Conn>> = RefCell::new(HashMap::new());
+}
+
+/// The Arrow decoder chosen for one MySQL result column.
+#[derive(Clone, Copy)]
+enum MysqlDecoder {
+    Int64,
+    Float64,
+    Utf8,
+    Date32,
+    TimestampMicros,
+}
+
+/// Pick the Arrow decoder for a MySQL protocol column type. An unmodeled type
+/// (bit/geometry/vector) raises rather than guess a representation.
+fn mysql_decoder(ty: mysql::consts::ColumnType) -> Result<MysqlDecoder, String> {
+    use mysql::consts::ColumnType::*;
+    match ty {
+        MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT | MYSQL_TYPE_LONG | MYSQL_TYPE_INT24
+        | MYSQL_TYPE_LONGLONG | MYSQL_TYPE_YEAR => Ok(MysqlDecoder::Int64),
+        MYSQL_TYPE_FLOAT | MYSQL_TYPE_DOUBLE | MYSQL_TYPE_DECIMAL | MYSQL_TYPE_NEWDECIMAL => {
+            Ok(MysqlDecoder::Float64)
+        }
+        MYSQL_TYPE_VARCHAR
+        | MYSQL_TYPE_VAR_STRING
+        | MYSQL_TYPE_STRING
+        | MYSQL_TYPE_BLOB
+        | MYSQL_TYPE_TINY_BLOB
+        | MYSQL_TYPE_MEDIUM_BLOB
+        | MYSQL_TYPE_LONG_BLOB
+        | MYSQL_TYPE_ENUM
+        | MYSQL_TYPE_SET
+        | MYSQL_TYPE_JSON => Ok(MysqlDecoder::Utf8),
+        MYSQL_TYPE_DATE | MYSQL_TYPE_NEWDATE => Ok(MysqlDecoder::Date32),
+        MYSQL_TYPE_DATETIME
+        | MYSQL_TYPE_DATETIME2
+        | MYSQL_TYPE_TIMESTAMP
+        | MYSQL_TYPE_TIMESTAMP2
+        | MYSQL_TYPE_TIME
+        | MYSQL_TYPE_TIME2 => Ok(MysqlDecoder::TimestampMicros),
+        other => Err(format!("no Arrow decoder for MySQL column type {other:?}")),
+    }
+}
+
+/// The Arrow field type a decoder produces.
+fn mysql_arrow_type(decoder: MysqlDecoder) -> DataType {
+    match decoder {
+        MysqlDecoder::Int64 => DataType::Int64,
+        MysqlDecoder::Float64 => DataType::Float64,
+        MysqlDecoder::Utf8 => DataType::Utf8,
+        MysqlDecoder::Date32 => DataType::Date32,
+        MysqlDecoder::TimestampMicros => {
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+        }
+    }
+}
+
+/// Days from the civil date (proleptic Gregorian) to the Unix epoch. Hinnant's
+/// algorithm; valid for the full MySQL date range.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Decode one MySQL result column into an Arrow array, or a String error naming
+/// the column and MySQL type on the first value that does not fit the decoder.
+fn decode_mysql_column(
+    name: &str,
+    ty: mysql::consts::ColumnType,
+    decoder: MysqlDecoder,
+    rows: &[mysql::Row],
+    index: usize,
+) -> Result<ArrayRef, String> {
+    match decoder {
+        MysqlDecoder::Int64 => decode_mysql_int64(name, ty, rows, index),
+        MysqlDecoder::Float64 => decode_mysql_float64(name, ty, rows, index),
+        MysqlDecoder::Utf8 => decode_mysql_utf8(name, ty, rows, index),
+        MysqlDecoder::Date32 => decode_mysql_date32(name, ty, rows, index),
+        MysqlDecoder::TimestampMicros => decode_mysql_timestamp(name, ty, rows, index),
+    }
+}
+
+/// Report a value that does not fit its column's decoder, naming the column and
+/// its MySQL type (the loud decode-error contract).
+fn mysql_decode_err(name: &str, ty: mysql::consts::ColumnType, value: &mysql::Value) -> String {
+    format!("MySQL column '{name}' ({ty:?}): cannot decode value {value:?}")
+}
+
+fn decode_mysql_int64(
+    name: &str,
+    ty: mysql::consts::ColumnType,
+    rows: &[mysql::Row],
+    index: usize,
+) -> Result<ArrayRef, String> {
+    let mut builder = arrow::array::Int64Builder::with_capacity(rows.len());
+    for row in rows {
+        match row.as_ref(index).unwrap_or(&mysql::Value::NULL) {
+            mysql::Value::NULL => builder.append_null(),
+            mysql::Value::Int(v) => builder.append_value(*v),
+            mysql::Value::UInt(v) => builder.append_value(
+                i64::try_from(*v)
+                    .map_err(|_| mysql_decode_err(name, ty, &mysql::Value::UInt(*v)))?,
+            ),
+            mysql::Value::Bytes(bytes) => {
+                let text = std::str::from_utf8(bytes)
+                    .map_err(|_| mysql_decode_err(name, ty, &mysql::Value::Bytes(bytes.clone())))?;
+                builder.append_value(text.trim().parse::<i64>().map_err(|_| {
+                    mysql_decode_err(name, ty, &mysql::Value::Bytes(bytes.clone()))
+                })?);
+            }
+            other => return Err(mysql_decode_err(name, ty, other)),
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn decode_mysql_float64(
+    name: &str,
+    ty: mysql::consts::ColumnType,
+    rows: &[mysql::Row],
+    index: usize,
+) -> Result<ArrayRef, String> {
+    let mut builder = arrow::array::Float64Builder::with_capacity(rows.len());
+    for row in rows {
+        match row.as_ref(index).unwrap_or(&mysql::Value::NULL) {
+            mysql::Value::NULL => builder.append_null(),
+            mysql::Value::Double(v) => builder.append_value(*v),
+            mysql::Value::Float(v) => builder.append_value(f64::from(*v)),
+            mysql::Value::Int(v) => builder.append_value(*v as f64),
+            mysql::Value::UInt(v) => builder.append_value(*v as f64),
+            mysql::Value::Bytes(bytes) => {
+                let text = std::str::from_utf8(bytes)
+                    .map_err(|_| mysql_decode_err(name, ty, &mysql::Value::Bytes(bytes.clone())))?;
+                builder.append_value(text.trim().parse::<f64>().map_err(|_| {
+                    mysql_decode_err(name, ty, &mysql::Value::Bytes(bytes.clone()))
+                })?);
+            }
+            other => return Err(mysql_decode_err(name, ty, other)),
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn decode_mysql_utf8(
+    name: &str,
+    ty: mysql::consts::ColumnType,
+    rows: &[mysql::Row],
+    index: usize,
+) -> Result<ArrayRef, String> {
+    let mut builder = arrow::array::StringBuilder::new();
+    for row in rows {
+        match row.as_ref(index).unwrap_or(&mysql::Value::NULL) {
+            mysql::Value::NULL => builder.append_null(),
+            mysql::Value::Bytes(bytes) => {
+                let text = std::str::from_utf8(bytes)
+                    .map_err(|_| mysql_decode_err(name, ty, &mysql::Value::Bytes(bytes.clone())))?;
+                builder.append_value(text);
+            }
+            other => return Err(mysql_decode_err(name, ty, other)),
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn decode_mysql_date32(
+    name: &str,
+    ty: mysql::consts::ColumnType,
+    rows: &[mysql::Row],
+    index: usize,
+) -> Result<ArrayRef, String> {
+    let mut builder = arrow::array::Date32Builder::with_capacity(rows.len());
+    for row in rows {
+        match row.as_ref(index).unwrap_or(&mysql::Value::NULL) {
+            mysql::Value::NULL => builder.append_null(),
+            mysql::Value::Date(y, mo, d, _, _, _, _) => {
+                let days = days_from_civil(i64::from(*y), i64::from(*mo), i64::from(*d));
+                builder.append_value(
+                    i32::try_from(days)
+                        .map_err(|_| mysql_decode_err(name, ty, row.as_ref(index).unwrap()))?,
+                );
+            }
+            other => return Err(mysql_decode_err(name, ty, other)),
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn decode_mysql_timestamp(
+    name: &str,
+    ty: mysql::consts::ColumnType,
+    rows: &[mysql::Row],
+    index: usize,
+) -> Result<ArrayRef, String> {
+    let mut builder = arrow::array::TimestampMicrosecondBuilder::with_capacity(rows.len());
+    for row in rows {
+        match row.as_ref(index).unwrap_or(&mysql::Value::NULL) {
+            mysql::Value::NULL => builder.append_null(),
+            mysql::Value::Date(y, mo, d, h, mi, s, us) => {
+                let days = days_from_civil(i64::from(*y), i64::from(*mo), i64::from(*d));
+                let micros = days * 86_400_000_000
+                    + i64::from(*h) * 3_600_000_000
+                    + i64::from(*mi) * 60_000_000
+                    + i64::from(*s) * 1_000_000
+                    + i64::from(*us);
+                builder.append_value(micros);
+            }
+            other => return Err(mysql_decode_err(name, ty, other)),
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+/// Run `sql` against a MySQL source and decode the result set into one Arrow
+/// batch. The whole set is buffered (the engine's other source reads do the
+/// same) so column decoders see every row before a batch is built.
+fn fetch_mysql(s: &DsSpec, sql: &str) -> ExecResult<(SchemaRef, Vec<RecordBatch>)> {
+    trace_sql(&s.uri, sql);
+    MYSQL_CACHE.with(|cache| {
+        let mut map = cache.borrow_mut();
+        if !map.contains_key(&s.uri) {
+            map.insert(
+                s.uri.clone(),
+                open_mysql(&s.uri).map_err(ExecError::runtime)?,
+            );
+        }
+        let conn = map.get_mut(&s.uri).unwrap();
+        run_mysql_query(conn, sql).map_err(ExecError::runtime)
+    })
+}
+
+/// Open a MySQL connection from a `mysql://` URL.
+fn open_mysql(url: &str) -> Result<mysql::Conn, String> {
+    let opts = mysql::Opts::from_url(url).map_err(|e| format!("mysql url: {e}"))?;
+    mysql::Conn::new(mysql::OptsBuilder::from_opts(opts)).map_err(|e| format!("mysql connect: {e}"))
+}
+
+fn run_mysql_query(
+    conn: &mut mysql::Conn,
+    sql: &str,
+) -> Result<(SchemaRef, Vec<RecordBatch>), String> {
+    use mysql::prelude::Queryable;
+
+    let mut result = conn
+        .query_iter(sql)
+        .map_err(|e| format!("mysql query: {e}"))?;
+    let columns: Vec<mysql::Column> = result.columns().as_ref().to_vec();
+    let mut rows: Vec<mysql::Row> = Vec::new();
+    for row in result.by_ref() {
+        rows.push(row.map_err(|e| format!("mysql row: {e}"))?);
+    }
+
+    let mut fields = Vec::with_capacity(columns.len());
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
+    for (index, column) in columns.iter().enumerate() {
+        let name = column.name_str().to_string();
+        let ty = column.column_type();
+        let decoder = mysql_decoder(ty)?;
+        fields.push(Field::new(&name, mysql_arrow_type(decoder), true));
+        arrays.push(decode_mysql_column(&name, ty, decoder, &rows, index)?);
+    }
+    let schema: SchemaRef = Arc::new(Schema::new(fields));
+    if arrays.is_empty() {
+        return Ok((schema, Vec::new()));
+    }
+    let batch =
+        RecordBatch::try_new(schema.clone(), arrays).map_err(|e| format!("mysql batch: {e}"))?;
+    Ok((schema, vec![batch]))
 }
 
 // Returns a String error (not PyErr) so it can also run on a worker thread that
@@ -912,6 +1239,12 @@ pub fn fetch_temp_join(
         DsKind::Parquet => Err(ExecError::runtime(
             "temp-join pushdown does not apply to in-process Parquet",
         )),
+        DsKind::ClickHouse => Err(ExecError::runtime(
+            "temp-join pushdown is not implemented for ClickHouse",
+        )),
+        DsKind::MySql => Err(ExecError::runtime(
+            "temp-join pushdown is not implemented for MySQL",
+        )),
     }
 }
 
@@ -1173,6 +1506,23 @@ pub fn spec_from_kind(
             let uri = uri.ok_or_else(|| ExecError::value("parquet datasource needs 'dir'"))?;
             Ok(DsSpec {
                 kind: DsKind::Parquet,
+                uri,
+                adbc_driver: None,
+            })
+        }
+        "clickhouse" => {
+            let uri =
+                uri.ok_or_else(|| ExecError::value("clickhouse datasource needs an endpoint"))?;
+            Ok(DsSpec {
+                kind: DsKind::ClickHouse,
+                uri,
+                adbc_driver: None,
+            })
+        }
+        "mysql" => {
+            let uri = uri.ok_or_else(|| ExecError::value("mysql datasource needs a URL"))?;
+            Ok(DsSpec {
+                kind: DsKind::MySql,
                 uri,
                 adbc_driver: None,
             })

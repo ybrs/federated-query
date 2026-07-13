@@ -12,7 +12,9 @@
 
 use datafusion::common::DataFusionError;
 use datafusion::logical_expr::Expr;
-use datafusion::sql::unparser::dialect::{DefaultDialect, Dialect, PostgreSqlDialect};
+use datafusion::sql::unparser::dialect::{
+    DefaultDialect, Dialect, MySqlDialect, PostgreSqlDialect,
+};
 use datafusion::sql::unparser::Unparser;
 
 use crate::core::expr::to_df_expr;
@@ -53,6 +55,12 @@ fn dialect_for(kind: DsKind) -> Box<dyn Dialect> {
         DsKind::DuckDb => Box::new(DefaultDialect {}),
         // Parquet is read through DataFusion; the default dialect matches it.
         DsKind::Parquet => Box::new(DefaultDialect {}),
+        // ClickHouse accepts standard `col IN (...)` and double-quoted
+        // identifiers, so the default dialect renders the injected filter.
+        DsKind::ClickHouse => Box::new(DefaultDialect {}),
+        // MySQL quotes identifiers with backticks (double quotes are string
+        // literals by default), so the injected filter needs the MySQL dialect.
+        DsKind::MySql => Box::new(MySqlDialect {}),
     }
 }
 

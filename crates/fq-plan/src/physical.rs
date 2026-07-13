@@ -75,6 +75,7 @@ pub enum DatasourceKind {
     Postgres,
     DuckDb,
     ClickHouse,
+    MySql,
 }
 
 /// Materializes a cross-source CTE body once, shared by every reference.

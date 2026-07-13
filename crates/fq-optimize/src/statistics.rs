@@ -346,6 +346,7 @@ fn emit_dialect(dialect: RenderDialect) -> Dialect {
         RenderDialect::Postgres => Dialect::Postgres,
         RenderDialect::DuckDb => Dialect::DuckDb,
         RenderDialect::ClickHouse => Dialect::ClickHouse,
+        RenderDialect::MySql => Dialect::MySql,
     }
 }
 
