@@ -160,7 +160,7 @@ impl Runtime {
     /// as a single `plan` text column, one row per line. Nothing executes.
     fn explain(&self, inner: &str) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         let physical = self.plan(inner)?;
-        let lines = explain::describe(&physical);
+        let lines = explain::describe(&physical)?;
         let schema = Arc::new(Schema::new(vec![Field::new(
             "plan",
             ArrowDataType::Utf8,

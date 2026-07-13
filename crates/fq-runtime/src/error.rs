@@ -12,7 +12,7 @@ use fq_decorrelate::DecorrelationError;
 use fq_exec::ExecError;
 use fq_optimize::OptimizeError;
 use fq_parse::ParseError;
-use fq_physical::PhysicalError;
+use fq_physical::{PhysicalError, StepError};
 use thiserror::Error;
 
 /// Every way `Runtime::from_config` or `Runtime::execute` can fail.
@@ -55,6 +55,12 @@ pub enum RuntimeError {
     /// expression).
     #[error("execution error: {0}")]
     Exec(#[from] ExecError),
+
+    /// A step-render failure while describing a plan for EXPLAIN (a source-leaf
+    /// scan whose effective SQL cannot be rendered). Surfaced so an EXPLAIN never
+    /// emits a silently mislabeled scan row.
+    #[error("step render error: {0}")]
+    Step(#[from] StepError),
 
     /// A learned-stats catalog failure (opening the sqlite next to the config,
     /// or persisting an execution's observations). Never swallowed: a broken

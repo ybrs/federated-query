@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, HashMap};
 use fq_plan::PhysicalPlan;
 
 pub use error::StepError;
+pub use render_sql::{render_remote_set_op, render_scan_sql};
 pub use scan_spec::PARALLEL_SCAN_MIN_ROWS;
 pub use types::{
     AggCall, AggSelectItem, BuiltSteps, ExtraInjection, Fragment, JoinKind, Observation,

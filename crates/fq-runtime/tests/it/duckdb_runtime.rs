@@ -217,6 +217,45 @@ fn explain_returns_a_plan_without_executing() {
 }
 
 #[test]
+fn explain_scan_line_carries_the_effective_pushed_sql() {
+    let path = fixture_path();
+    if !path.exists() {
+        eprintln!(
+            "skipping duckdb_runtime explain sql: fixture {} absent",
+            path.display()
+        );
+        return;
+    }
+    let path = path.to_str().expect("fixture path is valid UTF-8");
+    let runtime = Runtime::from_config(&duck_config(path)).expect("from_config");
+
+    let (_schema, batches) = runtime
+        .execute("EXPLAIN SELECT r_regionkey FROM duck.main.region WHERE r_regionkey < 2")
+        .expect("explain query");
+    let lines = string_rows(&batches);
+    let joined = lines.join("\n");
+    // A plain single-table scan renders as `Scan [<ds>] :: <SQL>`, carrying the
+    // effective source SELECT with the folded WHERE, so the pushdown suites can
+    // assert on the exact SQL sent to the source.
+    let scan_line = lines
+        .iter()
+        .find(|line| line.trim_start().starts_with("Scan ["))
+        .unwrap_or_else(|| panic!("no `Scan [ds] :: SQL` line in EXPLAIN, got:\n{joined}"));
+    assert!(
+        scan_line.contains("Scan [duck] ::"),
+        "scan line should tag the datasource, got:\n{scan_line}"
+    );
+    assert!(
+        scan_line.contains("SELECT") && scan_line.contains("region"),
+        "scan line should carry the rendered SELECT over the table, got:\n{scan_line}"
+    );
+    assert!(
+        scan_line.contains("WHERE") && scan_line.contains("r_regionkey"),
+        "scan line should fold the WHERE into the pushed SQL, got:\n{scan_line}"
+    );
+}
+
+#[test]
 fn planning_budget_kill_reports_the_stage_timings() {
     let path = fixture_path();
     if !path.exists() {

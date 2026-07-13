@@ -8,8 +8,7 @@
 //! tree WITHOUT executing it. The output is honest - a real plan, no fabricated
 //! result rows - and clearly labeled as a structural (uncosted) description.
 
-use std::fmt::Write;
-
+use fq_physical::{render_remote_set_op, render_scan_sql, StepError};
 use fq_plan::physical::PhysicalPlan;
 
 /// If `sql` begins with the `EXPLAIN` keyword (case-insensitive, followed by
@@ -32,20 +31,34 @@ pub fn strip_explain(sql: &str) -> Option<&str> {
 }
 
 /// Render a physical plan as an indented tree of node labels, one line per node.
-/// Used as the EXPLAIN result: one `plan` column, one row per line.
-pub fn describe(plan: &PhysicalPlan) -> Vec<String> {
+/// Used as the EXPLAIN result: one `plan` column, one row per line. A source-leaf
+/// scan's label carries its effective pushed SQL (rendered from the same renderer
+/// that emits the execution SQL), so a render failure propagates rather than
+/// silently mislabeling the row.
+pub fn describe(plan: &PhysicalPlan) -> Result<Vec<String>, StepError> {
     let mut lines = Vec::new();
-    describe_into(plan, 0, &mut lines);
-    lines
+    describe_into(plan, 0, &mut lines)?;
+    Ok(lines)
 }
 
 /// Append one `depth`-indented label for `plan`, then recurse into its children.
-fn describe_into(plan: &PhysicalPlan, depth: usize, lines: &mut Vec<String>) {
+fn describe_into(
+    plan: &PhysicalPlan,
+    depth: usize,
+    lines: &mut Vec<String>,
+) -> Result<(), StepError> {
     let indent = "  ".repeat(depth);
-    lines.push(format!("{indent}{}", node_label(plan)));
-    for child in plan.children() {
-        describe_into(child, depth + 1, lines);
+    lines.push(format!("{indent}{}", node_label(plan)?));
+    // A same-source set operation renders its whole (possibly nested) combined SQL
+    // in ONE round trip; its branch children are folded into that SQL and never
+    // executed as separate reads, so the EXPLAIN treats it as a leaf.
+    if matches!(plan, PhysicalPlan::RemoteSetOp(_)) {
+        return Ok(());
     }
+    for child in plan.children() {
+        describe_into(child, depth + 1, lines)?;
+    }
+    Ok(())
 }
 
 /// Collapse rendered SQL to a single line (newlines/tabs -> spaces, runs
@@ -68,42 +81,18 @@ fn one_line(sql: &str) -> String {
 }
 
 /// A one-line label for a physical node: the variant name, plus the read target
-/// for the two source-leaf nodes. Exhaustive (no `_` arm) so a new node type is a
-/// compile error here, never a silently unlabeled row.
-fn node_label(plan: &PhysicalPlan) -> String {
-    match plan {
+/// for the source-leaf nodes. Exhaustive (no `_` arm) so a new node type is a
+/// compile error here, never a silently unlabeled row. A source-leaf `Scan`
+/// renders its effective pushed SQL through the SAME renderer the execution plane
+/// uses (`render_scan_sql`), so the plan dump shows the exact SELECT sent to the
+/// source with every folded filter/aggregate/group-by/order/limit/DISTINCT.
+fn node_label(plan: &PhysicalPlan) -> Result<String, StepError> {
+    let label = match plan {
         PhysicalPlan::Scan(node) => {
-            // A source scan's pushdown lives in structured fields, not a rendered
-            // SQL string. Tag what is pushed INTO the source so the plan dump
-            // shows a raw table pull vs a pushed aggregate/filter/semi-join.
-            let mut tags = String::new();
-            if node.filters.is_some() {
-                tags.push_str(" +filter");
-            }
-            if let Some(aggs) = &node.aggregates {
-                let _ = write!(tags, " +agg({})", aggs.len());
-            }
-            if node.group_by.is_some() {
-                tags.push_str(" +groupby");
-            }
-            if node.grouping_sets.is_some() {
-                tags.push_str(" +grouping_sets");
-            }
-            if node.dynamic_filter_keys.is_some() {
-                tags.push_str(" +semijoin");
-            }
-            if node.distinct {
-                tags.push_str(" +distinct");
-            }
-            if node.order_by_keys.is_some() {
-                tags.push_str(" +order");
-            }
-            if node.limit.is_some() {
-                tags.push_str(" +limit");
-            }
             format!(
-                "Scan {}.{}.{}{tags}",
-                node.datasource, node.schema_name, node.table_name
+                "Scan [{}] :: {}",
+                node.datasource,
+                one_line(&render_scan_sql(node)?)
             )
         }
         PhysicalPlan::RemoteQuery(node) => {
@@ -134,11 +123,18 @@ fn node_label(plan: &PhysicalPlan) -> String {
         PhysicalPlan::Limit(_) => "Limit".to_string(),
         PhysicalPlan::Values(_) => "Values".to_string(),
         PhysicalPlan::Union(_) => "Union".to_string(),
-        PhysicalPlan::RemoteSetOp(_) => "RemoteSetOp".to_string(),
+        PhysicalPlan::RemoteSetOp(node) => {
+            format!(
+                "RemoteSetOp [{}] :: {}",
+                node.datasource,
+                one_line(&render_remote_set_op(node)?)
+            )
+        }
         PhysicalPlan::SetOperation(_) => "SetOperation".to_string(),
         PhysicalPlan::SingleRowGuard(_) => "SingleRowGuard".to_string(),
         PhysicalPlan::GroupedLimit(_) => "GroupedLimit".to_string(),
         PhysicalPlan::LateralJoin(_) => "LateralJoin".to_string(),
         PhysicalPlan::Explain(_) => "Explain".to_string(),
-    }
+    };
+    Ok(label)
 }

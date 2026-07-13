@@ -69,9 +69,11 @@ class RustRuntime:
     def explain_queries(self, sql):
         """Parse the plan dump into (datasource_name, sql_text) remote queries.
 
-        Only nodes that carry a rendered SQL string appear here: ``RemoteQuery``
-        and ``Gather`` lines look like ``RemoteQuery [<ds>] :: <SQL>``. Structured
-        source-leaf ``Scan`` nodes carry no rendered SQL and are not returned.
+        Every node that carries a rendered SQL string appears here: source-leaf
+        ``Scan`` lines look like ``Scan [<ds>] :: <SQL>`` (the effective pushed
+        SELECT with folded filter/aggregate/order/limit), a same-source
+        ``RemoteSetOp`` renders its whole combined query on one line, and
+        ``RemoteQuery`` / ``Gather`` lines look like ``RemoteQuery [<ds>] :: <SQL>``.
         """
         text = self.explain_text(sql)
         queries = []
@@ -82,18 +84,22 @@ class RustRuntime:
         return queries
 
 
-def _parse_remote_line(raw):
-    """Parse one ``RemoteQuery [ds] :: sql`` / ``Gather [ds] :: sql`` plan line.
+_REMOTE_SQL_PREFIXES = ("Scan [", "RemoteQuery [", "RemoteSetOp [", "Gather [")
 
-    Returns ``(datasource_name, sql_text)`` or ``None`` when the line is not a
-    rendered-SQL remote node.
+
+def _parse_remote_line(raw):
+    """Parse one ``<Node> [ds] :: sql`` plan line into ``(datasource, sql)``.
+
+    Recognizes every node that renders SQL: ``Scan``, ``RemoteQuery`` and
+    ``Gather``. Returns ``(datasource_name, sql_text)`` or ``None`` when the line
+    is not a rendered-SQL node.
     """
     line = raw.strip()
     prefix = None
-    if line.startswith("RemoteQuery ["):
-        prefix = len("RemoteQuery [")
-    if line.startswith("Gather ["):
-        prefix = len("Gather [")
+    for candidate in _REMOTE_SQL_PREFIXES:
+        if line.startswith(candidate):
+            prefix = len(candidate)
+            break
     if prefix is None:
         return None
     close = line.index("]", prefix)

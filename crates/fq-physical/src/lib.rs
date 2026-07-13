@@ -13,4 +13,7 @@ pub mod steps;
 
 pub use error::PhysicalError;
 pub use planner::PhysicalPlanner;
-pub use steps::{build_steps, BuiltSteps, Fragment, Observation, ScanSpec, Step, StepError};
+pub use steps::{
+    build_steps, render_remote_set_op, render_scan_sql, BuiltSteps, Fragment, Observation,
+    ScanSpec, Step, StepError,
+};

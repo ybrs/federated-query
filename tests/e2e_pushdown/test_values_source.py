@@ -4,15 +4,13 @@
 in a derived table, so it works standalone, with WHERE, and joined to a real
 table. Results are compared against the same query on the underlying DuckDB.
 
-Note: ``SELECT *`` over a VALUES (or any derived) relation is a separate,
-pre-existing limitation of the star expander (it only expands base tables) and
-fails fast; these tests use explicit columns.
+``SELECT *`` over an aliased VALUES relation expands to the relation's declared
+alias columns; the engine answers it directly.
 """
 
 import duckdb
 import pytest
 
-from federated_query.processor.query_preprocessor import StarExpansionError
 from tests.e2e_pushdown.helpers import build_runtime
 from tests.duckdb_tmp import duckdb_path
 
@@ -98,8 +96,13 @@ def test_values_joined_to_real_table(single_source_env):
     )
 
 
-def test_star_over_values_fails_fast(single_source_env):
-    """SELECT * over a derived VALUES relation is the shared derived-table limit."""
+def test_star_over_values_expands_to_alias_columns(single_source_env):
+    """SELECT * over an aliased VALUES relation expands to its declared columns.
+
+    ``SELECT * FROM (VALUES ...) AS v(a, b)`` is valid SQL: the star expands to the
+    derived relation's alias columns. The engine answers it directly, returning the
+    constant rows under names ``a`` and ``b``.
+    """
     runtime = build_runtime(single_source_env)
-    with pytest.raises(StarExpansionError):
-        runtime.execute("SELECT * FROM (VALUES (1, 2), (3, 4)) AS v(a, b)")
+    table = runtime.execute("SELECT * FROM (VALUES (1, 2), (3, 4)) AS v(a, b)")
+    assert table.to_pylist() == [{"a": 1, "b": 2}, {"a": 3, "b": 4}]
