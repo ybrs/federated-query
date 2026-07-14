@@ -30,7 +30,7 @@ use std::sync::Arc;
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
 
-use fq_common::{Config, CostConfig, DataType, ExecutorConfig, OptimizerConfig};
+use fq_common::{AcceleratorConfig, Config, CostConfig, DataType, ExecutorConfig, OptimizerConfig};
 
 use crate::error::RuntimeError;
 use crate::Runtime;
@@ -464,6 +464,21 @@ static SETTINGS: &[SettingDef] = &[
         read: |c| SettingValue::Bool(c.executor.enable_parallel_fetch),
         apply: Some(|c, v| {
             c.executor.enable_parallel_fetch = v.as_bool()?;
+            Ok(())
+        }),
+    },
+    // --- accelerator: materialized-view substitution ------------------------
+    SettingDef {
+        name: "accelerator.enable_substitution",
+        description: "Automatically read a materialized view's chunks in place of \
+                      recomputing a query subtree that matches the view's definition \
+                      (cost-gated). Off restores the exact non-accelerated plan.",
+        mutability: Mutability::SessionMutable,
+        env_var: None,
+        default: || SettingValue::Bool(AcceleratorConfig::default().enable_substitution),
+        read: |c| SettingValue::Bool(c.accelerator.enable_substitution),
+        apply: Some(|c, v| {
+            c.accelerator.enable_substitution = v.as_bool()?;
             Ok(())
         }),
     },
@@ -943,6 +958,14 @@ mod tests {
     fn every_executor_field_is_registered() {
         let mapping = serde_yaml::to_value(ExecutorConfig::default()).expect("serialize executor");
         assert_fields_registered(&mapping, "executor");
+    }
+
+    /// Every `AcceleratorConfig` field is registered under `accelerator.`.
+    #[test]
+    fn every_accelerator_field_is_registered() {
+        let mapping =
+            serde_yaml::to_value(AcceleratorConfig::default()).expect("serialize accelerator");
+        assert_fields_registered(&mapping, "accelerator");
     }
 
     /// Assert every key of a serialized config section appears in the registry

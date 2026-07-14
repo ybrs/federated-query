@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::array::{RecordBatch, StringArray};
+use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
 
 use fq_accel::{
@@ -17,6 +17,7 @@ use fq_accel::{
     MaterializedViewSource, WatermarkScan, VIEW_SCHEMA_NAME,
 };
 use fq_catalog::Catalog;
+use fq_common::DataType;
 use fq_exec::connectors;
 use fq_optimize::StatisticsCollector;
 
@@ -89,7 +90,7 @@ impl Runtime {
         }
         let plan = delta::classify(&catalog, &self.config_snapshot(), select_sql)?;
         let tokens = delta::read_tokens(&catalog, &plan.base_tables)?;
-        let (schema, batches) = self.execute_query(select_sql)?;
+        let (schema, batches) = self.execute_source_query(select_sql)?;
         let state = initial_change_key_state(&plan, &schema, &batches);
         accel.create_view(name, select_sql, &schema, &batches, tokens, state)?;
         self.install_views()?;
@@ -151,7 +152,7 @@ impl Runtime {
         append_column: Option<&str>,
         reason: &str,
     ) -> Result<String, RuntimeError> {
-        let (schema, batches) = self.execute_query(&view.definition_sql)?;
+        let (schema, batches) = self.execute_source_query(&view.definition_sql)?;
         let state = match append_column {
             Some(column) => watermark_state(&schema, &batches, column),
             None => None,
@@ -185,7 +186,7 @@ impl Runtime {
             output_column,
             watermark.as_ref(),
         );
-        let (schema, batches) = self.execute_query(&sql)?;
+        let (schema, batches) = self.execute_source_query(&sql)?;
         let stored_schema = accel.stored_arrow_schema(view)?;
         if stored_schema.fields() != schema.fields() {
             return self.refresh_whole(
@@ -224,7 +225,7 @@ impl Runtime {
         tokens: &BTreeMap<String, String>,
         key_column: &str,
     ) -> Result<String, RuntimeError> {
-        let (schema, batches) = self.execute_query(&view.definition_sql)?;
+        let (schema, batches) = self.execute_source_query(&view.definition_sql)?;
         let stored_schema = accel.stored_arrow_schema(view)?;
         if stored_schema.fields() != schema.fields() {
             accel.refresh_view(&view.name, &schema, &batches, tokens, None)?;
@@ -304,6 +305,84 @@ impl Runtime {
             Arc::new(StatisticsCollector::new(next, self.learned.clone(), None));
         Ok(())
     }
+
+    /// `SHOW MATERIALIZED VIEWS`: one row per live view - its name, stored row
+    /// count and byte size, creation and last-refresh timestamps, and the
+    /// substitution benefit counters (`use_count`, `cost_saved`). Read FRESH
+    /// from the registry each time, so the counters reflect every substitution
+    /// recorded since (including by other runtimes on the same store), not a
+    /// planning snapshot.
+    pub(crate) fn show_materialized_views(
+        &self,
+    ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
+        let accel = self.accelerator()?;
+        let views = accel.views()?;
+        let schema = views_result_schema();
+        let batch = views_result_batch(&schema, &views)?;
+        Ok((schema, vec![batch]))
+    }
+}
+
+/// The (column name, engine type) pairs `SHOW MATERIALIZED VIEWS` reports for
+/// `describe`, matching `views_result_schema` positionally.
+pub(crate) fn views_describe_columns() -> Vec<(String, DataType)> {
+    vec![
+        ("name".to_owned(), DataType::Text),
+        ("rows".to_owned(), DataType::BigInt),
+        ("bytes".to_owned(), DataType::BigInt),
+        ("created".to_owned(), DataType::Text),
+        ("refreshed".to_owned(), DataType::Text),
+        ("use_count".to_owned(), DataType::BigInt),
+        ("cost_saved".to_owned(), DataType::Double),
+    ]
+}
+
+/// The Arrow result schema of `SHOW MATERIALIZED VIEWS`. `refreshed` is nullable
+/// (a view never refreshed since creation has no timestamp).
+fn views_result_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("name", ArrowDataType::Utf8, false),
+        Field::new("rows", ArrowDataType::Int64, false),
+        Field::new("bytes", ArrowDataType::Int64, false),
+        Field::new("created", ArrowDataType::Utf8, false),
+        Field::new("refreshed", ArrowDataType::Utf8, true),
+        Field::new("use_count", ArrowDataType::Int64, false),
+        Field::new("cost_saved", ArrowDataType::Float64, false),
+    ]))
+}
+
+/// Assemble the seven `SHOW MATERIALIZED VIEWS` columns over the live views.
+fn views_result_batch(
+    schema: &SchemaRef,
+    views: &[MaterializedView],
+) -> Result<RecordBatch, RuntimeError> {
+    let mut names = Vec::with_capacity(views.len());
+    let mut rows = Vec::with_capacity(views.len());
+    let mut bytes = Vec::with_capacity(views.len());
+    let mut created = Vec::with_capacity(views.len());
+    let mut refreshed = Vec::with_capacity(views.len());
+    let mut use_counts = Vec::with_capacity(views.len());
+    let mut cost_saved = Vec::with_capacity(views.len());
+    for view in views {
+        names.push(view.name.clone());
+        rows.push(view.measured_rows);
+        bytes.push(view.byte_size);
+        created.push(view.created_at.clone());
+        refreshed.push(view.refreshed_at.clone());
+        use_counts.push(view.use_count);
+        cost_saved.push(view.cost_saved);
+    }
+    let columns: Vec<Arc<dyn arrow::array::Array>> = vec![
+        Arc::new(StringArray::from(names)),
+        Arc::new(Int64Array::from(rows)),
+        Arc::new(Int64Array::from(bytes)),
+        Arc::new(StringArray::from(created)),
+        Arc::new(StringArray::from(refreshed)),
+        Arc::new(Int64Array::from(use_counts)),
+        Arc::new(Float64Array::from(cost_saved)),
+    ];
+    RecordBatch::try_new(Arc::clone(schema), columns)
+        .map_err(|error| RuntimeError::ResultShape(error.to_string()))
 }
 
 /// The watermark a delta pull filters against: the stored state when it

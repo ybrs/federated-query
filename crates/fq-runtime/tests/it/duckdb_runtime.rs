@@ -83,6 +83,7 @@ fn duck_config(path: &str) -> Config {
         executor: ExecutorConfig::default(),
         cost: CostConfig::default(),
         server: ServerConfig::default(),
+        accelerator: fq_common::AcceleratorConfig::default(),
         source_path: None,
     }
 }

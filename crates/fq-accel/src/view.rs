@@ -20,7 +20,7 @@ pub struct ViewColumn {
 }
 
 /// One registered materialized view: the catalog row, deserialized.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MaterializedView {
     pub name: String,
     /// The defining SELECT, stored verbatim; REFRESH re-executes it.
@@ -46,6 +46,15 @@ pub struct MaterializedView {
     /// last pulled under a monotonic change-key declaration. Merge and whole
     /// re-pulls carry no pull-to-pull state and store None.
     pub change_key: Option<ChangeKeyState>,
+    /// How many times automatic substitution has read this view in place of
+    /// recomputing a matching query subtree. Advanced by `record_substitution`
+    /// after a substituted query executes; persisted, so it accrues across
+    /// runtimes over one store.
+    pub use_count: i64,
+    /// The accumulated cost-model saving of those substitutions, in the cost
+    /// model's estimated units (recompute estimate minus cached-read estimate,
+    /// summed per reuse). An ESTIMATE, not a measured wall time.
+    pub cost_saved: f64,
 }
 
 /// The stored delta-append state: which view OUTPUT column carries the

@@ -100,6 +100,7 @@ fn two_source_runtime(tag: &str) -> (Runtime, String, String) {
         executor: ExecutorConfig::default(),
         cost: CostConfig::default(),
         server: ServerConfig::default(),
+        accelerator: fq_common::AcceleratorConfig::default(),
         source_path: None,
     };
     let runtime = Runtime::from_config(&config).expect("from_config");
@@ -469,6 +470,7 @@ fn two_source_runtime_seeded(
         executor: ExecutorConfig::default(),
         cost: CostConfig::default(),
         server: ServerConfig::default(),
+        accelerator: fq_common::AcceleratorConfig::default(),
         source_path: None,
     };
     let runtime = Runtime::from_config(&config).expect("from_config");

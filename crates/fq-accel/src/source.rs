@@ -199,6 +199,8 @@ mod tests {
             refreshed_at: None,
             source_tokens: std::collections::BTreeMap::new(),
             change_key: None,
+            use_count: 0,
+            cost_saved: 0.0,
         }
     }
 

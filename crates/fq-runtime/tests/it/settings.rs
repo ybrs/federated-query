@@ -22,6 +22,7 @@ fn empty_config() -> Config {
         executor: ExecutorConfig::default(),
         cost: CostConfig::default(),
         server: ServerConfig::default(),
+        accelerator: fq_common::AcceleratorConfig::default(),
         source_path: None,
     }
 }

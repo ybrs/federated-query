@@ -94,7 +94,7 @@ impl Runtime {
         // require - every refresh re-pulls whole and re-sorts.
         let plan = delta::classify(&catalog, &self.config_snapshot(), select_sql)?;
         let tokens = delta::read_tokens(&catalog, &plan.base_tables)?;
-        let (schema, batches) = self.execute_query(select_sql)?;
+        let (schema, batches) = self.execute_source_query(select_sql)?;
         let sorted = build_event_view(name, &schema, &batches, roles)?;
         accel.create_view(name, select_sql, &schema, &sorted, tokens, None)?;
         if let Err(error) = registry.register(name, roles) {
@@ -129,7 +129,7 @@ impl Runtime {
         if delta::tokens_allow_skip(&view.source_tokens, &tokens, &plan.base_tables) {
             return status_result("REFRESH EVENT VIEW (no-op: source tokens unchanged)");
         }
-        let (schema, batches) = self.execute_query(&view.definition_sql)?;
+        let (schema, batches) = self.execute_source_query(&view.definition_sql)?;
         let sorted = build_event_view(name, &schema, &batches, &roles)?;
         accel.refresh_view(name, &schema, &sorted, &tokens, None)?;
         self.install_views()?;

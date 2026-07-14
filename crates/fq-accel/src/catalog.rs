@@ -23,6 +23,9 @@ pub type Clock = fq_catalog::Clock;
 /// The registry table. `source_tokens` is the JSON token map captured before
 /// the last pull; `change_key` is the JSON delta-append state (NULL for a
 /// view last pulled by merge or whole re-pull, which carry no state).
+/// `use_count`/`cost_saved_ms` are the substitution benefit counters
+/// (`record_substitution`); a table created before they existed gains them
+/// through `add_benefit_columns`, with existing rows reading back as 0.
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS materialized_views (
     name TEXT PRIMARY KEY,
     definition_sql TEXT NOT NULL,
@@ -35,12 +38,15 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS materialized_views (
     byte_size INTEGER NOT NULL,
     created_at TEXT NOT NULL,
     refreshed_at TEXT,
-    deleted_at TEXT
+    deleted_at TEXT,
+    use_count INTEGER NOT NULL DEFAULT 0,
+    cost_saved_ms REAL NOT NULL DEFAULT 0
 )";
 
 /// The SELECT list every row read uses, in `row_to_view` order.
 const ROW_COLUMNS: &str = "name, definition_sql, location, chunk_list, output_schema, \
-     measured_rows, byte_size, created_at, refreshed_at, source_tokens, change_key";
+     measured_rows, byte_size, created_at, refreshed_at, source_tokens, change_key, \
+     use_count, cost_saved_ms";
 
 /// A SQLite-backed registry of materialized views for one config.
 pub struct ViewCatalog {
@@ -63,6 +69,7 @@ impl ViewCatalog {
         // stats side, view rows are durable state, so synchronous stays ON.
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute(SCHEMA, [])?;
+        add_benefit_columns(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             clock,
@@ -203,6 +210,25 @@ impl ViewCatalog {
         Ok(view)
     }
 
+    /// Record one automatic substitution against a live view: bump `use_count`
+    /// and add `saved` (the cost model's estimated saving) to `cost_saved_ms`,
+    /// in one short transaction. A tombstoned or absent view is a no-op (the
+    /// benefit of a view being dropped need not be recorded); the row-level
+    /// `use_count = use_count + 1` is atomic under SQLite's single writer, so
+    /// concurrent reuses across runtimes never lose a count.
+    pub fn record_substitution(&self, name: &str, saved: f64) -> Result<(), AccelError> {
+        self.conn
+            .lock()
+            .expect("view catalog lock poisoned")
+            .execute(
+                "UPDATE materialized_views \
+                 SET use_count = use_count + 1, cost_saved_ms = cost_saved_ms + ?2 \
+                 WHERE name = ?1 AND deleted_at IS NULL",
+                params![name, saved],
+            )?;
+        Ok(())
+    }
+
     /// Delete a tombstoned row outright (the final step of a drop, after its
     /// chunk files are gone).
     pub fn purge(&self, name: &str) -> Result<(), AccelError> {
@@ -231,6 +257,8 @@ type RawRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    i64,
+    f64,
 );
 
 /// Read one row's columns in `ROW_COLUMNS` order.
@@ -247,6 +275,8 @@ fn row_to_raw(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
         row.get(8)?,
         row.get(9)?,
         row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
     ))
 }
 
@@ -264,6 +294,8 @@ fn raw_to_view(raw: RawRow) -> Result<MaterializedView, AccelError> {
         refreshed_at,
         source_tokens,
         change_key,
+        use_count,
+        cost_saved,
     ) = raw;
     let chunk_list: Vec<String> = serde_json::from_str(&chunk_list)?;
     let columns: Vec<ViewColumn> = serde_json::from_str(&output_schema)?;
@@ -279,7 +311,34 @@ fn raw_to_view(raw: RawRow) -> Result<MaterializedView, AccelError> {
         refreshed_at,
         source_tokens: decode_tokens(source_tokens.as_deref())?,
         change_key: decode_change_key(change_key.as_deref())?,
+        use_count,
+        cost_saved,
     })
+}
+
+/// Add `use_count` / `cost_saved_ms` to a `materialized_views` table created
+/// before substitution benefit tracking existed. A no-op once both are present;
+/// existing rows read back as 0 (no substitutions recorded yet).
+fn add_benefit_columns(conn: &Connection) -> Result<(), AccelError> {
+    let mut present = std::collections::BTreeSet::new();
+    let mut statement = conn.prepare("SELECT name FROM pragma_table_info('materialized_views')")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        present.insert(row.get::<_, String>(0)?);
+    }
+    if !present.contains("use_count") {
+        conn.execute(
+            "ALTER TABLE materialized_views ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !present.contains("cost_saved_ms") {
+        conn.execute(
+            "ALTER TABLE materialized_views ADD COLUMN cost_saved_ms REAL NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 /// Encode the optional change-key state for its nullable TEXT column.

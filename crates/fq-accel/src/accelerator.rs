@@ -90,6 +90,14 @@ impl Accelerator {
         self.catalog.list_live()
     }
 
+    /// Record one automatic substitution that read `name` in place of a
+    /// recompute: advance its `use_count` and add `saved` (the cost model's
+    /// estimated saving) to `cost_saved`. Called AFTER a substituted query
+    /// executes, off its critical path. A dropped view is a no-op.
+    pub fn record_substitution(&self, name: &str, saved: f64) -> Result<(), AccelError> {
+        self.catalog.record_substitution(name, saved)
+    }
+
     /// The live view named `name`, or a loud `UnknownView`.
     pub fn view(&self, name: &str) -> Result<MaterializedView, AccelError> {
         self.catalog
@@ -142,6 +150,10 @@ impl Accelerator {
             refreshed_at: None,
             source_tokens,
             change_key,
+            // A new view has served no substitutions yet; the registry stamps
+            // and advances these, never this placeholder.
+            use_count: 0,
+            cost_saved: 0.0,
         };
         if let Err(error) = self.catalog.register(&view) {
             self.store.delete_chunks(&location, &chunk_list)?;

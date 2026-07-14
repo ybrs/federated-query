@@ -16,6 +16,7 @@ mod events;
 mod explain;
 mod materialized;
 mod settings;
+mod substitute;
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -168,6 +169,7 @@ impl Runtime {
             Statement::DropMaterializedView { name } => self.drop_materialized_view(&name),
             Statement::ShowSettings => self.show_settings(),
             Statement::ShowSetting { name } => self.show_setting(&name),
+            Statement::ShowMaterializedViews => self.show_materialized_views(),
             Statement::SetSetting { name, value } => self.set_setting(&name, &value),
             Statement::ResetSetting { name } => self.reset_setting(name.as_deref()),
             Statement::CreateEventView {
@@ -183,9 +185,10 @@ impl Runtime {
         }
     }
 
-    /// Plan and run one SELECT/VALUES statement through the full pipeline.
+    /// Plan and run one user SELECT/VALUES statement through the full pipeline,
+    /// with view substitution enabled.
     fn execute_query(&self, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-        let physical = self.plan(sql)?;
+        let (physical, substitutions) = self.plan_inner(sql, true)?;
         let visible_names = output_column_names(&physical);
         let execution = execute_plan(&physical)?;
         // The learned-stats WRITE path: each measured (binding, rows) whose
@@ -193,7 +196,43 @@ impl Runtime {
         // result is materialized (off the query's critical path). The next
         // query's plans read these instead of asking the source.
         self.persist_observations(&execution.measurements, &execution.observations)?;
+        // Substitution benefit accrues only for a query that actually SERVED a
+        // substitution - recorded here, after execution, never during planning
+        // (an EXPLAIN or describe plans without serving and records nothing).
+        self.record_substitutions(&substitutions)?;
         rename_result(&execution.schema, execution.batches, &visible_names)
+    }
+
+    /// Plan and run one statement that must read FROM THE SOURCE, with view
+    /// substitution disabled. The materialized-view DDL data pulls (CREATE's
+    /// initial pull, every REFRESH variant, the delta/watermark queries, an
+    /// event-view build) go through here: substituting a view for its own
+    /// defining SELECT would populate/refresh it from its own stale cache.
+    pub(crate) fn execute_source_query(
+        &self,
+        sql: &str,
+    ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
+        let (physical, _no_substitutions) = self.plan_inner(sql, false)?;
+        let visible_names = output_column_names(&physical);
+        let execution = execute_plan(&physical)?;
+        self.persist_observations(&execution.measurements, &execution.observations)?;
+        rename_result(&execution.schema, execution.batches, &visible_names)
+    }
+
+    /// Advance each substituted view's benefit counters (`use_count`,
+    /// `cost_saved`). A no-op when the query substituted nothing.
+    fn record_substitutions(
+        &self,
+        substitutions: &[substitute::AppliedSubstitution],
+    ) -> Result<(), RuntimeError> {
+        if substitutions.is_empty() {
+            return Ok(());
+        }
+        let accel = self.accelerator()?;
+        for substitution in substitutions {
+            accel.record_substitution(&substitution.view_name, substitution.cost_saved)?;
+        }
+        Ok(())
     }
 
     /// Resolve the result schema of `sql` WITHOUT executing it: the ordered
@@ -220,6 +259,9 @@ impl Runtime {
             Statement::Query(_) => {}
             Statement::ShowSettings | Statement::ShowSetting { .. } => {
                 return Ok(settings::describe_columns());
+            }
+            Statement::ShowMaterializedViews => {
+                return Ok(materialized::views_describe_columns());
             }
             Statement::Funnel(_) => return Ok(events::funnel_describe_columns()),
             Statement::Segment(_) => return Ok(events::segment_describe_columns()),
@@ -272,6 +314,23 @@ impl Runtime {
     /// the same `PlanBudget`), so a plan-time data scan or a slow remote probe is
     /// KILLED and reported, never silently paid per query.
     fn plan(&self, sql: &str) -> Result<PhysicalPlan, RuntimeError> {
+        Ok(self.plan_inner(sql, true)?.0)
+    }
+
+    /// The plan plus the substitutions it applied. `plan` discards the latter
+    /// (EXPLAIN / describe do not serve, so they record no benefit); only
+    /// `execute_query` keeps it, to advance the benefit counters after serving.
+    ///
+    /// `allow_substitution` is false for the materialized-view DDL data pulls
+    /// (`execute_source_query`): a REFRESH re-executes the view's definition to
+    /// pull FROM THE SOURCE, so substituting the view for its own definition
+    /// would read the stale cache and make refresh a no-op. Only user queries
+    /// substitute.
+    fn plan_inner(
+        &self,
+        sql: &str,
+        allow_substitution: bool,
+    ) -> Result<(PhysicalPlan, Vec<substitute::AppliedSubstitution>), RuntimeError> {
         // One catalog snapshot for the whole plan, so a concurrent DDL swap
         // cannot change the metadata mid-pipeline.
         let catalog = self.catalog_snapshot();
@@ -284,15 +343,25 @@ impl Runtime {
         self.stats_snapshot().set_plan_budget(stages.budget);
         let optimized = self.optimize(&catalog, sql, &mut stages, &config)?;
         let cost_model = Rc::new(RefCell::new(self.cost_model(&config)));
+        // Substitute matching materialized views for recomputed subtrees BEFORE
+        // physical planning, so the planner and step builder see the reduced
+        // tree (a substituted scan is a local leaf, so dim shipping leaves it
+        // alone). This step is O(views x metadata) and budget-tracked.
+        let (substituted, applied) = if allow_substitution {
+            self.substitute_views(optimized, &catalog, &config, &cost_model)?
+        } else {
+            (optimized, Vec::new())
+        };
+        stages.finish("substitute")?;
         // The dim-shipping gates come from THIS runtime's optimizer config, so a
         // config that lowers them (small fixtures) or raises them (kill switch)
         // governs whether a dimension ships.
         let ship_thresholds = ShipThresholds::from_config(&config.optimizer);
-        let mut planner = PhysicalPlanner::new(Arc::clone(&catalog), Some(cost_model))
+        let mut planner = PhysicalPlanner::new(Arc::clone(&catalog), Some(Rc::clone(&cost_model)))
             .with_ship_thresholds(ship_thresholds);
-        let physical = planner.plan(&optimized)?;
+        let physical = planner.plan(&substituted)?;
         stages.finish("physical")?;
-        Ok(physical)
+        Ok((physical, applied))
     }
 
     /// Write each measured (binding, rows) whose binding carries provenance into

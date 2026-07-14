@@ -82,6 +82,7 @@ impl Sandbox {
             executor: ExecutorConfig::default(),
             cost: CostConfig::default(),
             server: ServerConfig::default(),
+            accelerator: fq_common::AcceleratorConfig::default(),
             source_path: Some(self.dir.join("config.yaml").to_string_lossy().to_string()),
         }
     }

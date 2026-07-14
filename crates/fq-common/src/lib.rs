@@ -22,8 +22,8 @@ mod update;
 
 pub use budget::PlanBudget;
 pub use config::{
-    load_config, ChangeKey, Config, CostConfig, DataSourceConfig, ExecutorConfig, OptimizerConfig,
-    ServerConfig, UserCredential, SCRAM_ITERATIONS,
+    load_config, AcceleratorConfig, ChangeKey, Config, CostConfig, DataSourceConfig,
+    ExecutorConfig, OptimizerConfig, ServerConfig, UserCredential, SCRAM_ITERATIONS,
 };
 pub use error::{ConfigError, UnsupportedSqlError};
 pub use logging::setup_logging;

@@ -18,7 +18,14 @@ use crate::error::ConfigError;
 
 /// The top-level sections `load_config` recognizes. Anything else is a typo and
 /// raises (`config.py`'s `known_sections`).
-const KNOWN_SECTIONS: [&str; 5] = ["datasources", "optimizer", "executor", "cost", "server"];
+const KNOWN_SECTIONS: [&str; 6] = [
+    "datasources",
+    "optimizer",
+    "executor",
+    "cost",
+    "server",
+    "accelerator",
+];
 
 /// Configuration for a single data source.
 ///
@@ -174,6 +181,33 @@ impl Default for CostConfig {
     }
 }
 
+/// Configuration for the query accelerator: the materialized-view store and the
+/// automatic substitution that reads a view's chunks in place of recomputing a
+/// query subtree that matches the view's definition.
+///
+/// `enable_substitution` is the substitution kill switch. It is session-mutable
+/// (read fresh on every plan): `SET accelerator.enable_substitution = false`
+/// turns off view matching, the cost gate, and the rewrite on the live runtime,
+/// restoring the exact non-accelerated plan for the next query. It does NOT
+/// affect CREATE / REFRESH / DROP MATERIALIZED VIEW or an explicit `FROM <view>`
+/// read; only the automatic rewrite.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AcceleratorConfig {
+    pub enable_substitution: bool,
+}
+
+impl Default for AcceleratorConfig {
+    /// Substitution is ON by default: a registered view that a query subtree
+    /// matches exactly and that the cost gate clears is read in place of the
+    /// recompute.
+    fn default() -> Self {
+        Self {
+            enable_substitution: true,
+        }
+    }
+}
+
 /// Authentication for the wire-protocol server (`fedq-server`).
 ///
 /// An empty `users` list - the default, and the state when the `server:` section
@@ -222,6 +256,7 @@ pub struct Config {
     pub executor: ExecutorConfig,
     pub cost: CostConfig,
     pub server: ServerConfig,
+    pub accelerator: AcceleratorConfig,
     pub source_path: Option<String>,
 }
 
@@ -247,6 +282,7 @@ pub fn load_config(config_path: &str) -> Result<Config, ConfigError> {
         executor: parse_section(mapping, "executor")?,
         cost: parse_section(mapping, "cost")?,
         server: parse_section(mapping, "server")?,
+        accelerator: parse_section(mapping, "accelerator")?,
         source_path: Some(path.display().to_string()),
     })
 }

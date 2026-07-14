@@ -54,6 +54,9 @@ pub enum Statement<'a> {
     DropMaterializedView { name: String },
     /// `SHOW SETTINGS`: list every engine setting.
     ShowSettings,
+    /// `SHOW MATERIALIZED VIEWS`: list every registered materialized view with
+    /// its size, timestamps, and substitution benefit counters.
+    ShowMaterializedViews,
     /// `SHOW SETTING <name>`: show the one setting named (dotted, e.g.
     /// `optimizer.planning_budget_ms`).
     ShowSetting { name: String },
@@ -111,10 +114,12 @@ pub fn classify_statement(sql: &str) -> Result<Statement<'_>, ParseError> {
         "FUNNEL" => crate::event_statement::classify_funnel(&mut tokens),
         "SEGMENT" => crate::event_statement::classify_segment(&mut tokens),
         "PATHS" => crate::event_statement::classify_paths(&mut tokens),
-        // SHOW is ours only for SETTING(S); any other SHOW passes through.
+        // SHOW is ours only for SETTING(S) and MATERIALIZED VIEWS; any other
+        // SHOW passes through to the normal parser.
         "SHOW" if second_word_is(sql, "SETTINGS") || second_word_is(sql, "SETTING") => {
             classify_show(&mut tokens)
         }
+        "SHOW" if second_word_is(sql, "MATERIALIZED") => classify_show_materialized(&mut tokens),
         // The engine has no SET/RESET beyond the settings surface, so every one
         // is ours (an unknown name then raises loudly at the runtime).
         "SET" => classify_set(sql, &mut tokens),
@@ -136,6 +141,16 @@ fn classify_show<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseE
     let name = dotted_name(tokens)?;
     expect_end(tokens, "SHOW SETTING <name>")?;
     Ok(Statement::ShowSetting { name })
+}
+
+/// Parse `SHOW MATERIALIZED VIEWS`. A trailing token, or `VIEW` (singular, no
+/// per-view SHOW form exists), raises rather than being silently accepted.
+fn classify_show_materialized<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("SHOW")?;
+    tokens.expect_keyword("MATERIALIZED")?;
+    tokens.expect_keyword("VIEWS")?;
+    expect_end(tokens, "SHOW MATERIALIZED VIEWS")?;
+    Ok(Statement::ShowMaterializedViews)
 }
 
 /// Parse `SET <name> = <value>` / `SET <name> TO <value>`. The name is a dotted
@@ -719,6 +734,31 @@ mod tests {
     fn show_settings_lists_all() {
         assert_eq!(classify("SHOW SETTINGS"), Statement::ShowSettings);
         assert_eq!(classify("show settings"), Statement::ShowSettings);
+    }
+
+    #[test]
+    fn show_materialized_views_classifies() {
+        assert_eq!(
+            classify("SHOW MATERIALIZED VIEWS"),
+            Statement::ShowMaterializedViews
+        );
+        assert_eq!(
+            classify("show materialized views"),
+            Statement::ShowMaterializedViews
+        );
+    }
+
+    #[test]
+    fn show_materialized_view_singular_raises() {
+        // No per-view SHOW form: the singular keyword is not silently accepted.
+        let error = classify_statement("SHOW MATERIALIZED VIEW").unwrap_err();
+        assert!(matches!(error, ParseError::Parse(_)));
+    }
+
+    #[test]
+    fn show_materialized_views_with_trailing_token_raises() {
+        let error = classify_statement("SHOW MATERIALIZED VIEWS extra").unwrap_err();
+        assert!(matches!(error, ParseError::Unsupported(_)));
     }
 
     #[test]
