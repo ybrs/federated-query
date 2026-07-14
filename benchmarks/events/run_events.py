@@ -35,6 +35,7 @@ import argparse
 import datetime
 import json
 import os
+import resource
 import sys
 import threading
 import time
@@ -296,7 +297,11 @@ def generate(options):
 
 def _file_size(path):
     """A human-readable file size for the dataset banner."""
-    size = os.path.getsize(path)
+    return _human_bytes(os.path.getsize(path))
+
+
+def _human_bytes(size):
+    """A human-readable rendering of a raw byte count."""
     for unit in ("B", "KB", "MB", "GB"):
         if size < 1024.0 or unit == "GB":
             return "{0:.1f} {1}".format(size, unit)
@@ -733,6 +738,35 @@ def _arm_watchdog(scale):
     print("[{0}] wall budget: {1}s (deterministic kill)".format(scale, budget))
 
 
+def _store_dir(scale):
+    """The event-view chunk store directory for a scale (the derived-structure
+    sidecars live beside the chunks under it). The accelerator roots it at the
+    config file's stem, so the `.config.yaml` config yields `.config.mv/`."""
+    return os.path.join(DATA_DIR, "events_{0}.config.mv".format(scale))
+
+
+def _sidecar_sizes(scale):
+    """The on-disk bytes of the derived structures: (bitmaps, segment). Sums the
+    sidecar files under the store, which are named by their generation."""
+    bitmaps = 0
+    segagg = 0
+    for root, _dirs, files in os.walk(_store_dir(scale)):
+        for name in files:
+            full = os.path.join(root, name)
+            if name.startswith("bitmaps-") and name.endswith(".fqb"):
+                bitmaps += os.path.getsize(full)
+            elif name.startswith("segagg-") and name.endswith(".arrow"):
+                segagg += os.path.getsize(full)
+    return bitmaps, segagg
+
+
+def _peak_rss_mb():
+    """The run process's peak resident set in MB. ru_maxrss is the whole
+    process's high-water RSS (kilobytes on Linux), so it covers the engine, the
+    loaded chunks, and PyArrow - an honest ceiling, not a per-structure figure."""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+
+
 def _write_config(scale):
     """Write the engine config for a scale: one read-only DuckDB source over the
     dataset file. The event-view stores hang off this file's stem."""
@@ -943,10 +977,34 @@ def _print_result(result):
 def _finish(scale, results, create_ms, refresh_ms, total_ms, options):
     """Print the summary and write the markdown report."""
     _print_summary(scale, results, total_ms)
+    derived = _derived_facts(scale)
+    _print_derived(derived)
     os.makedirs(REPORTS_DIR, exist_ok=True)
     report_path = os.path.join(REPORTS_DIR, "events-{0}.md".format(scale))
-    _write_report(scale, results, create_ms, refresh_ms, total_ms, options, report_path)
+    _write_report(scale, results, create_ms, refresh_ms, total_ms, derived, options, report_path)
     print("wrote report: {0}".format(report_path))
+
+
+def _derived_facts(scale):
+    """The derived-structure measurements for the report: sidecar sizes on disk
+    and the run process's peak resident set."""
+    bitmaps_bytes, segagg_bytes = _sidecar_sizes(scale)
+    return {
+        "bitmaps_bytes": bitmaps_bytes,
+        "segagg_bytes": segagg_bytes,
+        "peak_rss_mb": _peak_rss_mb(),
+    }
+
+
+def _print_derived(derived):
+    """Print the derived-structure sidecar sizes and peak memory."""
+    print(
+        "derived sidecars: bitmaps {0}  segment {1}  |  peak RSS {2:.0f} MB".format(
+            _human_bytes(derived["bitmaps_bytes"]),
+            _human_bytes(derived["segagg_bytes"]),
+            derived["peak_rss_mb"],
+        )
+    )
 
 
 def _print_summary(scale, results, total_ms):
@@ -981,7 +1039,7 @@ def _report_row(result):
     )
 
 
-def _report_lines(scale, results, create_ms, refresh_ms, total_ms, options):
+def _report_lines(scale, results, create_ms, refresh_ms, total_ms, derived, options):
     """Assemble the full markdown report for a run."""
     shape = SCALES[scale]
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -996,8 +1054,13 @@ def _report_lines(scale, results, create_ms, refresh_ms, total_ms, options):
         "Baseline: pure-DuckDB SQL over the same file, cached once by save-refs "
         "in references_{0}.duckdb.".format(scale),
         "Build: CREATE {0:.0f}ms, REFRESH {1:.0f}ms (scan + global "
-        "(entity, timestamp, tiebreak) sort + chunk write).".format(
-            create_ms, refresh_ms
+        "(entity, timestamp, tiebreak) sort + chunk write + derived "
+        "sidecars).".format(create_ms, refresh_ms),
+        "Derived sidecars on disk: bitmaps {0}, segment {1}. Peak run RSS "
+        "{2:.0f} MB.".format(
+            _human_bytes(derived["bitmaps_bytes"]),
+            _human_bytes(derived["segagg_bytes"]),
+            derived["peak_rss_mb"],
         ),
         "Warm runs per analysis: {0}. Generated: {1}.".format(
             options.warm_runs, stamp
@@ -1018,9 +1081,11 @@ def _report_lines(scale, results, create_ms, refresh_ms, total_ms, options):
     return lines
 
 
-def _write_report(scale, results, create_ms, refresh_ms, total_ms, options, path):
+def _write_report(scale, results, create_ms, refresh_ms, total_ms, derived, options, path):
     """Write the per-analysis markdown report for this run."""
-    lines = _report_lines(scale, results, create_ms, refresh_ms, total_ms, options)
+    lines = _report_lines(
+        scale, results, create_ms, refresh_ms, total_ms, derived, options
+    )
     with open(path, "w") as handle:
         handle.write("\n".join(lines))
 

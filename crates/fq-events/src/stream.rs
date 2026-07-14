@@ -168,6 +168,30 @@ pub struct EventRow<'a> {
     pub new_entity: bool,
 }
 
+/// A sorted set of candidate entity values a kernel restricts its scan to. The
+/// variant matches the view's entity type; values are ascending - the order the
+/// sorted stream stores entities in - so a kernel seeks forward through it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntitySet {
+    Int(Vec<i64>),
+    Text(Vec<String>),
+}
+
+impl EntitySet {
+    /// The number of candidate entities.
+    pub fn len(&self) -> usize {
+        match self {
+            EntitySet::Int(values) => values.len(),
+            EntitySet::Text(values) => values.len(),
+        }
+    }
+
+    /// Whether the candidate set is empty (no entity can contribute).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// The entity column of one batch, normalized to a single width per kind.
 enum EntityColumn {
     Int(Int64Array),
@@ -246,6 +270,210 @@ impl EventStream {
             row: 0,
             previous: None,
         }
+    }
+
+    /// Whether the whole view is one stored batch. The candidate scan seeks by
+    /// binary search within a single sorted batch; a multi-batch stream (which
+    /// a whole-rewrite event view never produces) has the kernel keep its plain
+    /// full scan instead of pruning.
+    pub fn is_single_batch(&self) -> bool {
+        self.batches.len() == 1
+    }
+
+    /// A contract-verifying cursor over ONLY the rows of the candidate
+    /// entities, in storage order. Each candidate's contiguous run is found by
+    /// binary search over the single sorted batch, so non-candidate entities
+    /// are never touched. The rows yielded are a subsequence of `rows()`, so a
+    /// kernel folding them reaches the same numbers it would over the full scan
+    /// restricted to those entities. Only valid on a single-batch stream.
+    pub fn candidate_rows<'a>(&'a self, set: &EntitySet) -> CandidateRows<'a> {
+        let ranges = if self.batches.len() == 1 {
+            candidate_ranges(&self.batches[0], set)
+        } else {
+            Vec::new()
+        };
+        CandidateRows {
+            stream: self,
+            ranges,
+            range_index: 0,
+            row: 0,
+            previous: None,
+        }
+    }
+
+    /// The (entity, time, event, tiebreak) values at a batch row - the shared
+    /// accessor of both cursors.
+    fn row_values(
+        &self,
+        batch: usize,
+        row: usize,
+    ) -> (EntityRef<'_>, i64, &str, Option<TiebreakRef<'_>>) {
+        let batch = &self.batches[batch];
+        let entity = match &batch.entity {
+            EntityColumn::Int(values) => EntityRef::Int(values.value(row)),
+            EntityColumn::Text(values) => EntityRef::Text(values.value(row)),
+        };
+        let tiebreak = match &batch.tiebreak {
+            Some(TiebreakColumn::Int(values)) => Some(TiebreakRef::Int(values.value(row))),
+            Some(TiebreakColumn::Text(values)) => Some(TiebreakRef::Text(values.value(row))),
+            None => None,
+        };
+        (
+            entity,
+            batch.time.value(row),
+            batch.event.value(row),
+            tiebreak,
+        )
+    }
+}
+
+/// The half-open row ranges of each candidate entity within one sorted batch,
+/// in candidate order (ascending, the same order as the batch). A candidate the
+/// view has no rows for contributes no range. A candidate set whose type does
+/// not match the batch's entity column yields nothing.
+fn candidate_ranges(batch: &EventBatch, set: &EntitySet) -> Vec<(usize, usize)> {
+    match (&batch.entity, set) {
+        (EntityColumn::Int(column), EntitySet::Int(values)) => int_ranges(column, values),
+        (EntityColumn::Text(column), EntitySet::Text(values)) => text_ranges(column, values),
+        _ => Vec::new(),
+    }
+}
+
+/// The row ranges of each candidate integer entity, via `partition_point` over
+/// the sorted values slice.
+fn int_ranges(column: &Int64Array, values: &[i64]) -> Vec<(usize, usize)> {
+    let slice = column.values();
+    let mut ranges = Vec::with_capacity(values.len());
+    for value in values {
+        let low = slice.partition_point(|entry| entry < value);
+        let high = slice.partition_point(|entry| entry <= value);
+        if high > low {
+            ranges.push((low, high));
+        }
+    }
+    ranges
+}
+
+/// The row ranges of each candidate text entity, via binary search over the
+/// sorted string column.
+fn text_ranges(column: &StringArray, values: &[String]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::with_capacity(values.len());
+    for value in values {
+        let low = lower_bound(column, value);
+        let high = upper_bound(column, value);
+        if high > low {
+            ranges.push((low, high));
+        }
+    }
+    ranges
+}
+
+/// The first row whose entity is >= `value` in a sorted string column.
+fn lower_bound(column: &StringArray, value: &str) -> usize {
+    let (mut low, mut high) = (0usize, column.len());
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if column.value(mid) < value {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    low
+}
+
+/// The first row whose entity is > `value` in a sorted string column.
+fn upper_bound(column: &StringArray, value: &str) -> usize {
+    let (mut low, mut high) = (0usize, column.len());
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if column.value(mid) <= value {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    low
+}
+
+/// The cursor `EventStream::candidate_rows` returns: the rows of the candidate
+/// entities only, each range a distinct entity's full contiguous run, verifying
+/// ordering as it reads.
+pub struct CandidateRows<'a> {
+    stream: &'a EventStream,
+    ranges: Vec<(usize, usize)>,
+    range_index: usize,
+    row: usize,
+    previous: Option<(EntityRef<'a>, i64, Option<TiebreakRef<'a>>)>,
+}
+
+impl<'a> CandidateRows<'a> {
+    /// Verify the visited subsequence stays ordered: a new entity must exceed
+    /// the previous one, and within an entity timestamps (then tiebreaks at
+    /// equal timestamps) must not regress.
+    fn check_order(
+        &self,
+        entity: EntityRef<'a>,
+        time: i64,
+        tiebreak: Option<TiebreakRef<'a>>,
+        new_entity: bool,
+    ) -> Result<(), EventError> {
+        let Some((previous_entity, previous_time, previous_tiebreak)) = self.previous else {
+            return Ok(());
+        };
+        if new_entity {
+            if entity <= previous_entity {
+                return Err(EventError::ContractViolation(format!(
+                    "candidate entities regress: {entity:?} after {previous_entity:?}"
+                )));
+            }
+            return Ok(());
+        }
+        if time < previous_time {
+            return Err(EventError::ContractViolation(format!(
+                "timestamps regress within entity {entity:?}: {time} after {previous_time}"
+            )));
+        }
+        if time == previous_time && tiebreak < previous_tiebreak {
+            return Err(EventError::ContractViolation(format!(
+                "tiebreak regresses within entity {entity:?} at timestamp {time}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl<'a> Iterator for CandidateRows<'a> {
+    type Item = Result<EventRow<'a>, EventError>;
+
+    /// The next candidate row, or the contract violation that stops the scan.
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.range_index < self.ranges.len() {
+            let (start, end) = self.ranges[self.range_index];
+            if self.row < start {
+                self.row = start;
+            }
+            if self.row >= end {
+                self.range_index += 1;
+                self.row = 0;
+                continue;
+            }
+            let new_entity = self.row == start;
+            let (entity, time, event, tiebreak) = self.stream.row_values(0, self.row);
+            self.row += 1;
+            if let Err(error) = self.check_order(entity, time, tiebreak, new_entity) {
+                return Some(Err(error));
+            }
+            self.previous = Some((entity, time, tiebreak));
+            return Some(Ok(EventRow {
+                entity,
+                time,
+                event,
+                tiebreak,
+                new_entity,
+            }));
+        }
+        None
     }
 }
 

@@ -12,7 +12,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow::array::{
+    Array, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+};
 use arrow::datatypes::SchemaRef;
 use fq_common::{
     Config, CostConfig, DataSourceConfig, ExecutorConfig, OptimizerConfig, ServerConfig,
@@ -143,6 +145,69 @@ impl Sandbox {
         )
         .expect("insert event row");
     }
+
+    /// Delete every derived-structure sidecar under the view store, leaving the
+    /// chunks and the registry's stale sidecar record. A later analysis must
+    /// then fall back to the plain scan and return the identical answer.
+    fn delete_sidecars(&self) {
+        let store = self.dir.join("config.mv");
+        let locations = std::fs::read_dir(&store).expect("store dir");
+        for location in locations {
+            let location = location.expect("store entry").path();
+            if !location.is_dir() {
+                continue;
+            }
+            for file in std::fs::read_dir(&location).expect("location dir") {
+                let path = file.expect("file entry").path();
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                if name.starts_with("bitmaps-") || name.starts_with("segagg-") {
+                    std::fs::remove_file(&path).expect("remove sidecar");
+                }
+            }
+        }
+    }
+}
+
+/// Flatten a SEGMENT result to (bucket micros, value) rows.
+fn segment_rows(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let buckets = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("bucket Timestamp");
+        let values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("value Int64");
+        for row in 0..batch.num_rows() {
+            rows.push((buckets.value(row), values.value(row)));
+        }
+    }
+    rows
+}
+
+/// Flatten a PATHS result to (path, entities) rows.
+fn paths_pairs(batches: &[RecordBatch]) -> Vec<(String, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let paths = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("path Utf8");
+        let entities = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("entities Int64");
+        for row in 0..batch.num_rows() {
+            rows.push((paths.value(row).to_string(), entities.value(row)));
+        }
+    }
+    rows
 }
 
 /// One flattened funnel result row: (step, event, entities, from_start,
@@ -740,4 +805,46 @@ fn bad_tiebreak_declarations_raise_and_persist_nothing() {
     let text = format!("{null_tiebreak}");
     assert!(text.contains("contract") && text.contains("seq"), "{text}");
     assert!(runtime.execute("SELECT user_id FROM ev").is_err());
+}
+
+#[test]
+fn analyses_are_identical_with_and_without_the_sidecars() {
+    // The derived-structure identity gate: an analysis answered from the
+    // sidecars (bitmap-pruned funnel/paths, pre-aggregate segment) must equal
+    // the plain scan. CREATE builds the sidecars; deleting them forces the
+    // fallback, and the two answers must be byte-for-byte equal.
+    let sandbox = Sandbox::new("sidecar_identity");
+    let runtime = sandbox.runtime();
+    runtime
+        .execute(&create_view_sql(&sandbox.datasource))
+        .expect("create");
+    let paths_sql = "PATHS OVER ev STARTING AT 'signup' MAX DEPTH 5 TOP 10";
+    let events_sql = "SEGMENT OVER ev MEASURE EVENTS BY DAY";
+    let entities_sql = "SEGMENT OVER ev MEASURE ENTITIES BY WEEK";
+
+    let funnel_with = runtime.execute(FUNNEL_SQL).expect("funnel with sidecar");
+    let events_with = runtime.execute(events_sql).expect("segment events with");
+    let entities_with = runtime
+        .execute(entities_sql)
+        .expect("segment entities with");
+    let paths_with = runtime.execute(paths_sql).expect("paths with sidecar");
+
+    sandbox.delete_sidecars();
+
+    let funnel_scan = runtime.execute(FUNNEL_SQL).expect("funnel scan");
+    let events_scan = runtime.execute(events_sql).expect("segment events scan");
+    let entities_scan = runtime
+        .execute(entities_sql)
+        .expect("segment entities scan");
+    let paths_scan = runtime.execute(paths_sql).expect("paths scan");
+
+    assert_eq!(funnel_rows(&funnel_with.1), funnel_rows(&funnel_scan.1));
+    assert_eq!(segment_rows(&events_with.1), segment_rows(&events_scan.1));
+    assert_eq!(
+        segment_rows(&entities_with.1),
+        segment_rows(&entities_scan.1)
+    );
+    assert_eq!(paths_pairs(&paths_with.1), paths_pairs(&paths_scan.1));
+    // The sidecar path is the one under test: the funnel result is non-empty.
+    assert_eq!(funnel_rows(&funnel_with.1).len(), 3);
 }

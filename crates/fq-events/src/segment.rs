@@ -84,7 +84,7 @@ fn accumulate(cell: &mut Cell, measure: SegmentMeasure, row: &crate::stream::Eve
 /// The bucket start for an instant, as microseconds since the epoch: the UTC
 /// calendar truncation the spec asks for (hour, day, ISO week's Monday, or
 /// first of month), always at 00:00 except the hour bucket.
-fn bucket_start_micros(instant: DateTime<Utc>, bucket: TimeBucket) -> i64 {
+pub(crate) fn bucket_start_micros(instant: DateTime<Utc>, bucket: TimeBucket) -> i64 {
     let date = instant.date_naive();
     let start = match bucket {
         TimeBucket::Hour => date

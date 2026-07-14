@@ -24,6 +24,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # Segmentation buckets are UTC calendar truncations; registry timestamps.
 chrono = "0.4"
 thiserror = "2"
+# Per-event-name entity sets are roaring bitmaps over dense entity ordinals:
+# compressed membership with fast intersection, popcount, and sorted iteration.
+roaring = "0.11"
 
 [lints]
 workspace = true

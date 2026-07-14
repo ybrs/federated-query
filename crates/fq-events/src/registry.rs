@@ -16,15 +16,33 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::error::EventError;
 
 /// The role table beside `materialized_views`; `name` is the shared key.
-/// `tiebreak_column` is NULL for a view with no declared tiebreak.
+/// `tiebreak_column` is NULL for a view with no declared tiebreak. The
+/// `sidecar_*` columns record the derived structures (bitmaps + segment
+/// pre-aggregate) last written: their chunk generation and on-disk sizes.
+/// `sidecar_generation` NULL means no derived structures are recorded, so a
+/// kernel reads the plain chunks.
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS event_views (
     name TEXT PRIMARY KEY,
     entity_column TEXT NOT NULL,
     timestamp_column TEXT NOT NULL,
     event_column TEXT NOT NULL,
     tiebreak_column TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    sidecar_generation INTEGER,
+    bitmaps_bytes INTEGER,
+    segagg_bytes INTEGER
 )";
+
+/// The recorded derived-structure metadata of an event view: the chunk
+/// generation the sidecars were built for, and their on-disk byte sizes. A
+/// kernel trusts the sidecar files only when this generation matches the view's
+/// current chunk generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarMeta {
+    pub generation: i64,
+    pub bitmaps_bytes: i64,
+    pub segagg_bytes: i64,
+}
 
 /// A SQLite-backed registry of event-view roles for one config.
 pub struct EventViewRegistry {
@@ -43,6 +61,7 @@ impl EventViewRegistry {
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute(SCHEMA, [])?;
         add_tiebreak_column(&conn)?;
+        add_sidecar_columns(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -99,6 +118,50 @@ impl EventViewRegistry {
         Ok(row)
     }
 
+    /// Record the derived structures written for `name` at chunk `generation`,
+    /// with their on-disk sizes. Called after a create/refresh persists the
+    /// sidecars; a later kernel trusts them only while this generation matches
+    /// the view's current chunk generation. An unknown name raises.
+    pub fn record_sidecars(&self, name: &str, meta: &SidecarMeta) -> Result<(), EventError> {
+        let updated = self
+            .conn
+            .lock()
+            .expect("event registry lock poisoned")
+            .execute(
+                "UPDATE event_views SET sidecar_generation = ?2, bitmaps_bytes = ?3, \
+                 segagg_bytes = ?4 WHERE name = ?1",
+                params![name, meta.generation, meta.bitmaps_bytes, meta.segagg_bytes],
+            )?;
+        if updated == 0 {
+            return Err(EventError::UnknownEventView(name.to_string()));
+        }
+        Ok(())
+    }
+
+    /// The recorded sidecar metadata of `name`, or None when none is recorded
+    /// (the view predates the derived structures, or its build did not write
+    /// them). A caller compares the generation against the current chunks.
+    pub fn sidecar_meta(&self, name: &str) -> Result<Option<SidecarMeta>, EventError> {
+        let meta = self
+            .conn
+            .lock()
+            .expect("event registry lock poisoned")
+            .query_row(
+                "SELECT sidecar_generation, bitmaps_bytes, segagg_bytes \
+                 FROM event_views WHERE name = ?1 AND sidecar_generation IS NOT NULL",
+                params![name],
+                |row| {
+                    Ok(SidecarMeta {
+                        generation: row.get(0)?,
+                        bitmaps_bytes: row.get(1)?,
+                        segagg_bytes: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(meta)
+    }
+
     /// Remove an event view's role row (the first step of a drop). An unknown
     /// name raises `UnknownEventView`.
     pub fn remove(&self, name: &str) -> Result<(), EventError> {
@@ -129,6 +192,29 @@ fn add_tiebreak_column(conn: &Connection) -> Result<(), EventError> {
         "ALTER TABLE event_views ADD COLUMN tiebreak_column TEXT",
         [],
     )?;
+    Ok(())
+}
+
+/// Add the `sidecar_*` columns to an `event_views` table created before the
+/// derived structures existed. Each missing column is added; existing rows read
+/// back NULL, i.e. no recorded sidecars, so the kernels read the plain chunks
+/// until the next refresh writes them.
+fn add_sidecar_columns(conn: &Connection) -> Result<(), EventError> {
+    let mut present = std::collections::HashSet::new();
+    let mut statement = conn.prepare("SELECT name FROM pragma_table_info('event_views')")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let column: String = row.get(0)?;
+        present.insert(column);
+    }
+    for column in ["sidecar_generation", "bitmaps_bytes", "segagg_bytes"] {
+        if !present.contains(column) {
+            conn.execute(
+                &format!("ALTER TABLE event_views ADD COLUMN {column} INTEGER"),
+                [],
+            )?;
+        }
+    }
     Ok(())
 }
 

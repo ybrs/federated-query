@@ -15,10 +15,14 @@
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
+use fq_accel::{Accelerator, ChunkStore, MaterializedView};
 use fq_common::events::{EventRoleColumns, FunnelSpec, PathsSpec, SegmentSpec};
 use fq_common::DataType;
-use fq_events::{build_event_view, read_chunks, run_funnel, run_paths, run_segment, EventStream};
-use fq_events::{EventError, EventViewRegistry};
+use fq_events::{
+    build_event_view, build_sidecars, read_chunks, run_funnel, run_funnel_pruned, run_paths,
+    run_paths_pruned, run_segment, EntityBitmaps, EventStream, SegmentAggregate,
+};
+use fq_events::{EventError, EventViewRegistry, SidecarMeta};
 
 use crate::delta;
 use crate::error::RuntimeError;
@@ -103,6 +107,7 @@ impl Runtime {
             accel.drop_view(name)?;
             return Err(error.into());
         }
+        persist_sidecars(accel, registry, name, roles, &schema, &sorted)?;
         self.install_views()?;
         status_result("CREATE EVENT VIEW")
     }
@@ -132,6 +137,14 @@ impl Runtime {
         let (schema, batches) = self.execute_source_query(&view.definition_sql)?;
         let sorted = build_event_view(name, &schema, &batches, &roles)?;
         accel.refresh_view(name, &schema, &sorted, &tokens, None)?;
+        persist_sidecars(
+            accel,
+            self.event_registry()?,
+            name,
+            &roles,
+            &schema,
+            &sorted,
+        )?;
         self.install_views()?;
         status_result("REFRESH EVENT VIEW")
     }
@@ -150,32 +163,87 @@ impl Runtime {
         status_result("DROP EVENT VIEW")
     }
 
-    /// `FUNNEL OVER view ...`: run the funnel kernel over the view's chunks.
+    /// `FUNNEL OVER view ...`: run the funnel over the view's chunks, using the
+    /// entity bitmaps (step-1 popcount + candidate-only scan) when they load for
+    /// the current generation, else the plain full scan.
     pub(crate) fn run_funnel_statement(
         &self,
         spec: &FunnelSpec,
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         let stream = self.open_event_stream(&spec.view)?;
-        Ok(run_funnel(&stream, spec)?)
+        match self.load_bitmaps(&spec.view)? {
+            Some(bitmaps) => Ok(run_funnel_pruned(&stream, spec, &bitmaps)?),
+            None => Ok(run_funnel(&stream, spec)?),
+        }
     }
 
-    /// `SEGMENT OVER view ...`: run the segmentation kernel over the view's
-    /// chunks.
+    /// `SEGMENT OVER view ...`: answer from the time-bucketed pre-aggregate when
+    /// it loads and covers the bucket (DAY / WEEK / MONTH), avoiding the scan
+    /// entirely; otherwise (BY HOUR, or no usable sidecar) run the kernel.
     pub(crate) fn run_segment_statement(
         &self,
         spec: &SegmentSpec,
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
+        if let Some(aggregate) = self.load_segment(&spec.view)? {
+            if let Some(result) = aggregate.serve(spec)? {
+                return Ok(result);
+            }
+        }
         let stream = self.open_event_stream(&spec.view)?;
         Ok(run_segment(&stream, spec)?)
     }
 
-    /// `PATHS OVER view ...`: run the paths kernel over the view's chunks.
+    /// `PATHS OVER view ...`: run the paths kernel over the view's chunks, using
+    /// the anchor event's bitmap to scan only its entities when the statement is
+    /// anchored and the bitmaps load, else the plain full scan.
     pub(crate) fn run_paths_statement(
         &self,
         spec: &PathsSpec,
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         let stream = self.open_event_stream(&spec.view)?;
-        Ok(run_paths(&stream, spec)?)
+        match self.load_bitmaps(&spec.view)? {
+            Some(bitmaps) => Ok(run_paths_pruned(&stream, spec, &bitmaps)?),
+            None => Ok(run_paths(&stream, spec)?),
+        }
+    }
+
+    /// The bitmap sidecar for the view's current generation, or None (a missing,
+    /// stale-generation, or unreadable file falls back to the plain scan - the
+    /// derived structure is never a source of truth).
+    fn load_bitmaps(&self, name: &str) -> Result<Option<EntityBitmaps>, RuntimeError> {
+        let Some((dir, generation)) = self.sidecar_context(name)? else {
+            return Ok(None);
+        };
+        Ok(EntityBitmaps::load(&path_string(&dir, &bitmaps_name(generation))).ok())
+    }
+
+    /// The segment pre-aggregate sidecar for the view's current generation, or
+    /// None (same fallback rule as `load_bitmaps`).
+    fn load_segment(&self, name: &str) -> Result<Option<SegmentAggregate>, RuntimeError> {
+        let Some((dir, generation)) = self.sidecar_context(name)? else {
+            return Ok(None);
+        };
+        Ok(SegmentAggregate::load(&path_string(&dir, &segagg_name(generation))).ok())
+    }
+
+    /// The chunk directory and generation to read sidecars from, but ONLY when
+    /// the registry records sidecars for exactly the view's current chunk
+    /// generation. A mismatch (a build that predates the structures, or an
+    /// interrupted refresh) returns None, so the kernel scans the chunks.
+    fn sidecar_context(
+        &self,
+        name: &str,
+    ) -> Result<Option<(std::path::PathBuf, u64)>, RuntimeError> {
+        let accel = self.accelerator()?;
+        let view = accel.view(name)?;
+        let generation = current_generation(&view)?;
+        let Some(meta) = self.event_registry()?.sidecar_meta(name)? else {
+            return Ok(None);
+        };
+        if meta.generation != i64::try_from(generation).unwrap_or(i64::MIN) {
+            return Ok(None);
+        }
+        Ok(Some((accel.store_root().join(&view.location), generation)))
     }
 
     /// Whether `name` is a registered event view (used by the materialized-
@@ -215,4 +283,107 @@ impl Runtime {
             )
         })
     }
+}
+
+/// Build both derived sidecars over the just-published sorted rows and write
+/// them beside the chunks under the current generation, then record their
+/// generation and sizes in the registry. Old-generation sidecar files are
+/// unlinked. The registry record is written LAST, so a crash mid-write leaves
+/// the generation unrecorded and the kernels read the plain chunks.
+fn persist_sidecars(
+    accel: &Accelerator,
+    registry: &EventViewRegistry,
+    name: &str,
+    roles: &EventRoleColumns,
+    schema: &SchemaRef,
+    sorted: &[RecordBatch],
+) -> Result<(), RuntimeError> {
+    let view = accel.view(name)?;
+    let generation = current_generation(&view)?;
+    let directory = accel.store_root().join(&view.location);
+    let build = build_sidecars(name, schema, sorted, roles)?;
+    let bitmaps_bytes = write_sidecar(
+        &directory,
+        &bitmaps_name(generation),
+        &build.bitmaps.to_bytes()?,
+    )?;
+    let segagg_bytes = write_sidecar(
+        &directory,
+        &segagg_name(generation),
+        &build.segment.to_bytes()?,
+    )?;
+    remove_stale_sidecars(&directory, generation)?;
+    registry.record_sidecars(
+        name,
+        &SidecarMeta {
+            generation: i64::try_from(generation).expect("generation fits i64"),
+            bitmaps_bytes,
+            segagg_bytes,
+        },
+    )?;
+    Ok(())
+}
+
+/// The chunk generation a view currently serves. Every chunk of a whole-rewrite
+/// event view shares one generation, so the first chunk names it.
+fn current_generation(view: &MaterializedView) -> Result<u64, RuntimeError> {
+    let first = view.chunk_list.first().ok_or_else(|| {
+        RuntimeError::EventView(format!("event view '{}' has no chunks", view.name))
+    })?;
+    ChunkStore::next_generation(std::slice::from_ref(first))
+        .map(|next| next - 1)
+        .map_err(RuntimeError::from)
+}
+
+/// The bitmap sidecar file name for a generation.
+fn bitmaps_name(generation: u64) -> String {
+    format!("bitmaps-{generation}.fqb")
+}
+
+/// The segment pre-aggregate sidecar file name for a generation.
+fn segagg_name(generation: u64) -> String {
+    format!("segagg-{generation}.arrow")
+}
+
+/// The absolute path string of a file in the sidecar directory.
+fn path_string(directory: &std::path::Path, file: &str) -> String {
+    directory.join(file).to_string_lossy().to_string()
+}
+
+/// Write a sidecar file atomically (a temp file renamed into place, so a
+/// concurrent reader never sees a torn file) and return its byte size.
+fn write_sidecar(
+    directory: &std::path::Path,
+    file: &str,
+    bytes: &[u8],
+) -> Result<i64, RuntimeError> {
+    let final_path = directory.join(file);
+    let temp_path = directory.join(format!("{file}.tmp-{}", std::process::id()));
+    std::fs::write(&temp_path, bytes).map_err(EventError::from)?;
+    std::fs::rename(&temp_path, &final_path).map_err(EventError::from)?;
+    Ok(i64::try_from(bytes.len()).expect("sidecar size fits i64"))
+}
+
+/// Unlink sidecar files of a superseded generation left in the directory (the
+/// current generation's files are kept). A file already gone is fine.
+fn remove_stale_sidecars(directory: &std::path::Path, keep: u64) -> Result<(), RuntimeError> {
+    let keep_files = [bitmaps_name(keep), segagg_name(keep)];
+    let entries = std::fs::read_dir(directory).map_err(EventError::from)?;
+    for entry in entries {
+        let entry = entry.map_err(EventError::from)?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if is_sidecar_file(&name) && !keep_files.contains(&name) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
+}
+
+/// Whether a directory entry is a sidecar file (and not a chunk or a temp file).
+fn is_sidecar_file(name: &str) -> bool {
+    let extension = std::path::Path::new(name)
+        .extension()
+        .and_then(|value| value.to_str());
+    (name.starts_with("bitmaps-") && extension == Some("fqb"))
+        || (name.starts_with("segagg-") && extension == Some("arrow"))
 }

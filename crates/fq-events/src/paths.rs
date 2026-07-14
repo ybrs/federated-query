@@ -29,7 +29,8 @@ use arrow::datatypes::{DataType as ArrowType, Field, Schema, SchemaRef};
 use fq_common::events::PathsSpec;
 
 use crate::error::EventError;
-use crate::stream::{EventStream, TiebreakRef};
+use crate::sidecar::{worth_pruning, EntityBitmaps};
+use crate::stream::{EventRow, EventStream, TiebreakRef};
 
 /// The separator between a path's step names in the result's `path` column.
 const STEP_SEPARATOR: &str = " -> ";
@@ -56,6 +57,33 @@ pub fn run_paths(
     Ok((paths_schema(), vec![result_batch(counts, spec.top)?]))
 }
 
+/// Run an anchored path analysis using the anchor event's entity bitmap to
+/// scan only the entities that have the anchor - the sole entities that can
+/// contribute a path. The result is identical to `run_paths`.
+///
+/// Falls back to the plain scan when there is no anchor (every entity
+/// contributes, so nothing prunes) or the stream is multi-batch (which a
+/// whole-rewrite event view never produces).
+pub fn run_paths_pruned(
+    stream: &EventStream,
+    spec: &PathsSpec,
+    bitmaps: &EntityBitmaps,
+) -> Result<(SchemaRef, Vec<RecordBatch>), EventError> {
+    require_positive(spec.max_depth, "MAX DEPTH")?;
+    require_positive(spec.top, "TOP")?;
+    let Some(anchor) = spec.starting_at.as_deref() else {
+        return run_paths(stream, spec);
+    };
+    let candidates = bitmaps.anchor_candidates(anchor);
+    // Pruning only pays when the anchor is entity-selective and the stream is
+    // one seekable batch; otherwise the plain scan is the reference answer.
+    if !stream.is_single_batch() || !worth_pruning(candidates.len(), bitmaps.entity_count()) {
+        return run_paths(stream, spec);
+    }
+    let counts = accumulate_paths(stream.candidate_rows(&candidates), spec)?;
+    Ok((paths_schema(), vec![result_batch(counts, spec.top)?]))
+}
+
 /// Raise unless a clause's count is positive.
 fn require_positive(count: i64, clause: &str) -> Result<(), EventError> {
     if count > 0 {
@@ -74,6 +102,16 @@ fn count_paths<'a>(
     stream: &'a EventStream,
     spec: &PathsSpec,
 ) -> Result<HashMap<Vec<&'a str>, i64>, EventError> {
+    accumulate_paths(stream.rows(), spec)
+}
+
+/// Tally each entity's collapsed path from a row cursor - the shared body of
+/// the full scan (`count_paths`) and the anchor-pruned scan
+/// (`run_paths_pruned`); the two differ only in which rows the cursor yields.
+fn accumulate_paths<'a>(
+    rows: impl Iterator<Item = Result<EventRow<'a>, EventError>>,
+    spec: &PathsSpec,
+) -> Result<HashMap<Vec<&'a str>, i64>, EventError> {
     let mut counts: HashMap<Vec<&'a str>, i64> = HashMap::new();
     let mut collector = PathCollector::new(
         spec.starting_at.as_deref(),
@@ -81,7 +119,7 @@ fn count_paths<'a>(
     );
     let mut group: Vec<(Option<TiebreakRef<'a>>, &'a str)> = Vec::new();
     let mut group_time = 0i64;
-    for row in stream.rows() {
+    for row in rows {
         let row = row?;
         if row.new_entity {
             flush_group(&mut group, &mut collector);

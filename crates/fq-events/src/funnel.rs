@@ -18,6 +18,7 @@ use arrow::datatypes::{DataType as ArrowType, Field, Schema, SchemaRef};
 use fq_common::events::FunnelSpec;
 
 use crate::error::EventError;
+use crate::sidecar::{worth_pruning, EntityBitmaps};
 use crate::stream::EventStream;
 
 /// The most steps a funnel can declare; step matches per event are tracked
@@ -47,6 +48,72 @@ pub fn run_funnel(
     let window = stream.scale().window_in_native(spec.within)?;
     let reached = count_entities_per_depth(stream, &spec.steps, window)?;
     Ok((funnel_schema(), vec![result_batch(&spec.steps, &reached)?]))
+}
+
+/// Run a funnel using the per-event-name entity bitmaps to skip work: step 1's
+/// count is the exact popcount of its bitmap, and only entities with both a
+/// step-1 and a step-2 event (the sole entities that can reach depth >= 2) are
+/// scanned. The result is identical to `run_funnel` over the same stream.
+///
+/// A multi-batch stream (which a whole-rewrite event view never produces)
+/// cannot be seeked by binary search, so it keeps the plain full scan.
+pub fn run_funnel_pruned(
+    stream: &EventStream,
+    spec: &FunnelSpec,
+    bitmaps: &EntityBitmaps,
+) -> Result<(SchemaRef, Vec<RecordBatch>), EventError> {
+    require_step_count(spec.steps.len())?;
+    let candidates = bitmaps.funnel_candidates(&spec.steps[0], &spec.steps[1]);
+    // Pruning only pays when it skips enough entities and the stream is one
+    // seekable batch; otherwise the plain linear scan is the reference answer.
+    if !stream.is_single_batch() || !worth_pruning(candidates.len(), bitmaps.entity_count()) {
+        return run_funnel(stream, spec);
+    }
+    let window = stream.scale().window_in_native(spec.within)?;
+    let reached = count_entities_pruned(stream, &spec.steps, window, bitmaps, &candidates)?;
+    Ok((funnel_schema(), vec![result_batch(&spec.steps, &reached)?]))
+}
+
+/// The per-step counts computed from the bitmaps plus a candidate-only scan:
+/// step 1 is the bitmap popcount; steps 2.. come from scanning only the
+/// entities in `step1 & step2` and folding their depth into steps 2..=depth
+/// (step 1 is already counted, so a candidate never re-increments it).
+fn count_entities_pruned(
+    stream: &EventStream,
+    steps: &[String],
+    window: i64,
+    bitmaps: &EntityBitmaps,
+    candidates: &crate::stream::EntitySet,
+) -> Result<Vec<i64>, EventError> {
+    let mut reached = vec![0i64; steps.len()];
+    reached[0] = i64::try_from(bitmaps.event_entities(&steps[0])).expect("step-1 count fits i64");
+    if candidates.is_empty() {
+        return Ok(reached);
+    }
+    let mut entity_events: Vec<(i64, u16)> = Vec::new();
+    for row in stream.candidate_rows(candidates) {
+        let row = row?;
+        if row.new_entity {
+            tally_deep_steps(&mut reached, &entity_events, steps.len(), window);
+            entity_events.clear();
+        }
+        let mask = step_mask(steps, row.event);
+        if mask != 0 {
+            entity_events.push((row.time, mask));
+        }
+    }
+    tally_deep_steps(&mut reached, &entity_events, steps.len(), window);
+    Ok(reached)
+}
+
+/// Fold one candidate entity's depth into steps 2..=depth. Step 1 is counted by
+/// the bitmap popcount, so the range starts at index 1 (a depth-1 candidate
+/// adds nothing here).
+fn tally_deep_steps(reached: &mut [i64], events: &[(i64, u16)], step_count: usize, window: i64) {
+    let depth = entity_depth(events, step_count, window);
+    for step in reached.iter_mut().take(depth).skip(1) {
+        *step += 1;
+    }
 }
 
 /// Raise unless the declared step count is within 2..=16.

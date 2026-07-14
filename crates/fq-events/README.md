@@ -441,50 +441,76 @@ these are like-for-like timings. Ratio is engine (warm) / DuckDB baseline; below
 1.0x the engine is faster.
 
 SMALL (1,000,000 events over 50,000 entities, 20 event types, 30 days).
-Build: CREATE ~700 ms, REFRESH ~0 ms (no-op, source tokens unchanged). Full
-table in `benchmarks/events/reports/events-small.md`.
+Build: CREATE ~810 ms (scan + sort + chunk write + derived sidecars), REFRESH
+~0 ms (no-op). Full table in `benchmarks/events/reports/events-small.md`.
 
 | Analysis                          | Engine warm ms | DuckDB ms | Ratio |
 | --------------------------------- | -------------- | --------- | ----- |
-| FUNNEL common (3 frequent events) | 69.1           | 39.8      | 1.74x |
-| FUNNEL selective (3 rarer events) | 63.3           | 13.2      | 4.81x |
-| SEGMENT MEASURE EVENTS BY DAY     | 100.9          | 8.2       | 12.34x |
-| SEGMENT MEASURE ENTITIES BY DAY   | 100.5          | 23.0      | 4.36x |
-| PATHS MAX DEPTH 5 TOP 20          | 105.4          | 224.4     | 0.47x |
-| PATHS STARTING AT ... DEPTH 5     | 89.4           | 240.3     | 0.37x |
+| FUNNEL common (3 frequent events) | 69.5           | 39.8      | 1.75x |
+| FUNNEL selective (3 rarer events) | 52.8           | 13.2      | 4.01x |
+| SEGMENT MEASURE EVENTS BY DAY     | 0.2            | 8.2       | 0.02x |
+| SEGMENT MEASURE ENTITIES BY DAY   | 0.2            | 23.0      | 0.01x |
+| PATHS MAX DEPTH 5 TOP 20          | 103.3          | 224.4     | 0.46x |
+| PATHS STARTING AT ... DEPTH 5     | 91.8           | 240.3     | 0.38x |
 
 MEDIUM (100,000,000 events over 500,000 entities, 20 event types, 30 days).
-Build: CREATE ~201 s (scan 100M + global sort + chunk write), REFRESH ~0 ms
-(no-op). Full table in `benchmarks/events/reports/events-medium.md`.
+Build: CREATE ~222 s (scan 100M + global sort + chunk write + derived
+sidecars; ~21 s of that is the sidecar pass), REFRESH ~0 ms (no-op). Full
+table in `benchmarks/events/reports/events-medium.md`.
 
 | Analysis                          | Engine warm ms | DuckDB ms | Ratio |
 | --------------------------------- | -------------- | --------- | ------ |
-| FUNNEL common (3 frequent events) | 6658           | 38805     | 0.17x  |
-| FUNNEL selective (3 rarer events) | 6175           | 1760      | 3.51x  |
-| SEGMENT MEASURE EVENTS BY DAY     | 8886           | 342       | 25.95x |
-| SEGMENT MEASURE ENTITIES BY DAY   | 8931           | 2003      | 4.46x  |
-| PATHS MAX DEPTH 5 TOP 20          | 6964           | 20061     | 0.35x  |
-| PATHS STARTING AT ... DEPTH 5     | 6898           | 21778     | 0.32x  |
+| FUNNEL common (3 frequent events) | 6801           | 38805     | 0.18x  |
+| FUNNEL selective (3 rarer events) | 6243           | 1760      | 3.55x  |
+| SEGMENT MEASURE EVENTS BY DAY     | 0.3            | 342       | 0.00x  |
+| SEGMENT MEASURE ENTITIES BY DAY   | 0.2            | 2003      | 0.00x  |
+| PATHS MAX DEPTH 5 TOP 20          | 6949           | 20061     | 0.35x  |
+| PATHS STARTING AT ... DEPTH 5     | 6620           | 21778     | 0.30x  |
 
-At 100M events the pattern holds and sharpens: the engine's single-pass kernels
-run each analysis in ~6.7-9.0 s regardless of shape (they always scan the whole
-sorted stream), so they beat DuckDB where DuckDB does expensive work (the funnel
-self-join at 38.8 s, the paths window sorts at ~20 s) and lose where DuckDB is
-cheap (the plain per-day GROUP BY at 0.34 s).
+At 100M events SEGMENT is answered from the pre-aggregate sidecar in
+sub-millisecond (section 10), turning its 4.4x-26x deficit into a >1000x win.
+The funnel and paths kernels still scan the whole sorted stream (the entity
+bitmaps do not prune this event-dense view), so they beat DuckDB where DuckDB
+does expensive work (the funnel self-join at 38.8 s, the paths window sorts at
+~20 s) and lose on the selective funnel where DuckDB filters to the rare anchor
+rows first.
 
 Where the flat sorted-scan design is fast and where it is not:
 
-- PATHS beats the baseline (0.37x-0.47x): the kernel is a single linear pass
+- PATHS beats the baseline (0.30x-0.47x): the kernel is a single linear pass
   over an already entity-partitioned, time-ordered stream, while the baseline
   pays several window sorts.
-- SEGMENT loses to DuckDB's native GROUP BY (4.4x-12x): a per-UTC-day bucket
-  count is exactly the vectorized hash aggregate DuckDB is built for, and
-  reading Arrow chunks row-wise through the kernel cannot beat it.
-- FUNNEL is competitive on frequent steps (1.74x) but loses more on the
-  selective funnel (4.81x): the kernel scans the WHOLE stream even when the
-  step-1 event is comparatively rare, whereas the baseline filters to the anchor
-  rows first. A flat sorted scan has no per-event-name index. The funnel's other
-  edge is the per-entity worst case O(step-1 occurrences x window span): a
-  single very active entity (a Zipf head) can dominate the run. These are the
-  cases the sketched derived structures (per-event-name bitmaps to skip to
-  candidate entities; a per-entity event trie for paths) target.
+- FUNNEL is competitive on frequent steps (0.18x at 100M, where DuckDB's
+  self-join is expensive) but loses on the selective funnel (3.5x): the kernel
+  scans the WHOLE stream, whereas the baseline filters to the anchor rows first.
+
+## 10. Derived structures beside the chunks
+
+A refresh builds two derived sidecars next to the chunks, versioned with the
+chunk generation and recorded in the `event_views` registry; a missing or
+stale-generation sidecar makes the kernel fall back to the plain scan, which
+returns the identical answer (`sidecar.rs`).
+
+- SEGMENT TIME-BUCKETED PRE-AGGREGATE (`segagg-<generation>.arrow`): per
+  (calendar bucket, event name) event counts at day grain and distinct-entity
+  counts at day / week / month grain, all built in the refresh's sort pass.
+  SEGMENT BY DAY / WEEK / MONTH answers from it without touching the chunks;
+  BY HOUR falls back to the scan. Distinct counts are stored per grain, not
+  summed from days, because a distinct count does not roll up additively.
+  DECISIVE: at 100M events SEGMENT drops from 4.4x-26x behind DuckDB to
+  answering in sub-millisecond (the whole aggregate is a few thousand cells,
+  ~47 KB), a >1000x win over both the old kernel and the DuckDB GROUP BY.
+
+- PER-EVENT-NAME ENTITY BITMAPS (`bitmaps-<generation>.fqb`): one roaring
+  bitmap of entity ordinals per event name over a dictionary of the view's
+  distinct entities. A funnel reads step 1's bitmap popcount as its exact
+  step-1 count and scans only the entities in `step1 & step2`; anchored PATHS
+  scans only the anchor event's entities. This helps ONLY when the step events
+  are ENTITY-selective (few entities ever emit them). On the synthetic
+  benchmark's 100M view each entity emits ~200 events, so nearly every entity
+  emits every mid-frequency event and the candidate set is ~all entities; a
+  selectivity gate (`worth_pruning`) then keeps the plain scan, so the bitmap
+  neither helps nor regresses the 100M funnel. At the 1M scale (~20 events per
+  entity) the same funnel IS entity-selective and pruning engages. The
+  granularity that would cut the dense-entity selective funnel is a per-event
+  ROW index (skip to the ~8% step-event rows), not an entity index.
