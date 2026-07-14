@@ -17,7 +17,8 @@ use crate::error::EventError;
 
 /// The role table beside `materialized_views`; `name` is the shared key.
 /// `tiebreak_column` is NULL for a view with no declared tiebreak. The
-/// `sidecar_*` columns record the derived structures (bitmaps + segment
+/// `sidecar_*`, `bitmaps_bytes`, `rowindex_bytes`, and `segagg_bytes` columns
+/// record the derived structures (entity bitmaps + row index + segment
 /// pre-aggregate) last written: their chunk generation and on-disk sizes.
 /// `sidecar_generation` NULL means no derived structures are recorded, so a
 /// kernel reads the plain chunks.
@@ -30,6 +31,7 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS event_views (
     created_at TEXT NOT NULL,
     sidecar_generation INTEGER,
     bitmaps_bytes INTEGER,
+    rowindex_bytes INTEGER,
     segagg_bytes INTEGER
 )";
 
@@ -41,6 +43,7 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS event_views (
 pub struct SidecarMeta {
     pub generation: i64,
     pub bitmaps_bytes: i64,
+    pub rowindex_bytes: i64,
     pub segagg_bytes: i64,
 }
 
@@ -129,8 +132,14 @@ impl EventViewRegistry {
             .expect("event registry lock poisoned")
             .execute(
                 "UPDATE event_views SET sidecar_generation = ?2, bitmaps_bytes = ?3, \
-                 segagg_bytes = ?4 WHERE name = ?1",
-                params![name, meta.generation, meta.bitmaps_bytes, meta.segagg_bytes],
+                 rowindex_bytes = ?4, segagg_bytes = ?5 WHERE name = ?1",
+                params![
+                    name,
+                    meta.generation,
+                    meta.bitmaps_bytes,
+                    meta.rowindex_bytes,
+                    meta.segagg_bytes
+                ],
             )?;
         if updated == 0 {
             return Err(EventError::UnknownEventView(name.to_string()));
@@ -147,14 +156,15 @@ impl EventViewRegistry {
             .lock()
             .expect("event registry lock poisoned")
             .query_row(
-                "SELECT sidecar_generation, bitmaps_bytes, segagg_bytes \
+                "SELECT sidecar_generation, bitmaps_bytes, rowindex_bytes, segagg_bytes \
                  FROM event_views WHERE name = ?1 AND sidecar_generation IS NOT NULL",
                 params![name],
                 |row| {
                     Ok(SidecarMeta {
                         generation: row.get(0)?,
                         bitmaps_bytes: row.get(1)?,
-                        segagg_bytes: row.get(2)?,
+                        rowindex_bytes: row.get(2)?,
+                        segagg_bytes: row.get(3)?,
                     })
                 },
             )
@@ -207,7 +217,12 @@ fn add_sidecar_columns(conn: &Connection) -> Result<(), EventError> {
         let column: String = row.get(0)?;
         present.insert(column);
     }
-    for column in ["sidecar_generation", "bitmaps_bytes", "segagg_bytes"] {
+    for column in [
+        "sidecar_generation",
+        "bitmaps_bytes",
+        "rowindex_bytes",
+        "segagg_bytes",
+    ] {
         if !present.contains(column) {
             conn.execute(
                 &format!("ALTER TABLE event_views ADD COLUMN {column} INTEGER"),

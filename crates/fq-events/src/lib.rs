@@ -36,12 +36,15 @@ pub mod segment;
 pub mod sidecar;
 pub mod stream;
 
-pub use chunks::read_chunks;
+pub use chunks::{read_chunks, read_chunks_columns};
 pub use contract::build_event_view;
 pub use error::EventError;
-pub use funnel::{funnel_schema, run_funnel, run_funnel_pruned, MAX_STEPS};
+pub use funnel::{funnel_schema, run_funnel, run_funnel_pruned, run_funnel_row_indexed, MAX_STEPS};
 pub use paths::{paths_schema, run_paths, run_paths_pruned};
 pub use registry::{EventViewRegistry, SidecarMeta};
 pub use segment::{run_segment, segment_schema};
-pub use sidecar::{build_sidecars, worth_pruning, EntityBitmaps, SegmentAggregate, SidecarBuild};
+pub use sidecar::{
+    build_sidecars, take_indexed_rows, worth_pruning, worth_row_pruning, EntityBitmaps, RowIndex,
+    SegmentAggregate, SidecarBuild,
+};
 pub use stream::{EntitySet, EventStream};

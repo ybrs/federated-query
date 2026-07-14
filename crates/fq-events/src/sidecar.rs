@@ -1,25 +1,68 @@
 //! Derived structures built beside an event view's chunks, rebuilt with each
-//! generation and consulted by the kernels to skip work. Two structures share
+//! generation and consulted by the kernels to skip work. Three structures share
 //! one build scan over the sorted stream:
 //!
 //! - [`EntityBitmaps`]: one roaring bitmap of entity ordinals per event name,
 //!   over a dictionary of the view's distinct entities. FUNNEL reads step 1's
 //!   bitmap popcount as its exact step-1 count and scans only the entities in
 //!   `step1 & step2`; anchored PATHS scans only the anchor event's entities.
+//! - [`RowIndex`]: one roaring bitmap of ROW ORDINALS per event name, over the
+//!   single sorted stream. FUNNEL materializes only the rows whose event is in
+//!   the step set (the union of the step names' bitmaps) - a small fraction of
+//!   the stream for a SELECTIVE funnel - instead of scanning every row.
 //! - [`SegmentAggregate`]: per-(calendar-bucket, event-name) event counts and
 //!   distinct-entity counts, stored at day / week / month grain. SEGMENT BY
 //!   DAY / WEEK / MONTH answers from it; BY HOUR falls back to the scan.
 //!
-//! Both are DERIVED: a caller that cannot load them (a missing file, a
+//! All three are DERIVED: a caller that cannot load them (a missing file, a
 //! generation mismatch, a read error) falls back to the plain scan, which
 //! returns the identical answer. Nothing here is a source of truth; the chunks
 //! are.
+//!
+//! # The row index and why it exists
+//!
+//! The entity bitmaps prune by ENTITY: a funnel scans only the entities that
+//! have both step 1 and step 2. That fails on a SELECTIVE funnel whose step
+//! events are rare BUT smeared across nearly every entity - most entities emit
+//! a signup and a begin_checkout somewhere, so `step1 & step2` covers almost
+//! the whole entity space, the selectivity gate declines, and the kernel reads
+//! every row. Yet the step events themselves are a small fraction of the rows.
+//!
+//! The row index prunes by ROW instead. The stream is entity-major and, within
+//! each entity's contiguous run, timestamp-ordered; a per-event-name bitmap of
+//! ROW ORDINALS lets the kernel materialize ONLY the rows whose event is a step
+//! event, in one gather. Filtering a sorted sequence preserves order, so the
+//! kept rows are still grouped by entity and time-ordered - exactly the layout
+//! the funnel state machine consumes. Entity runs stay contiguous (a subset of a
+//! contiguous run is contiguous), so entity boundaries are still "the entity
+//! value changed from the previous KEPT row".
+//!
+//! Representation: roaring bitmaps of u32 row ordinals per event name, reusing
+//! the `roaring` dependency the entity bitmaps already use. Every row belongs to
+//! exactly one event name, so the bitmaps partition `0..total_rows`; their
+//! combined set-bit count is `total_rows`. A dense head event (`page_view`)
+//! stores as run/bitmap containers, a rare tail event (`cancel_account`) as a
+//! tiny sorted array - roaring picks per 65536-block. The union of a funnel's
+//! step names is materialized once and drives an Arrow `take` over the single
+//! sorted chunk, yielding a small batch the ordinary funnel kernel then scans.
+//! Chunk-level row ranges were rejected: an event view is one whole-rewrite
+//! chunk (a single Arrow batch), so a row-ordinal bitmap over that one batch is
+//! both the finest and the simplest representation, and the `take` reads only
+//! the kept rows' cells.
+//!
+//! Applicability: the funnel matcher consults ONLY step events (a non-step row
+//! contributes a zero step mask and is never buffered), so a funnel over the
+//! step-event rows equals a funnel over the full stream. Anchored PATHS consult
+//! ALL events after the anchor, not just a fixed step set, so the row index can
+//! only LOCATE anchor rows there - it cannot drop the intervening events a path
+//! is built from - and paths keep the entity-bitmap path.
 
 use std::collections::HashMap;
 
 use arrow::array::{
-    Array, Int64Array, Int8Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    Array, Int64Array, Int8Array, RecordBatch, StringArray, TimestampMicrosecondArray, UInt32Array,
 };
+use arrow::compute::take_record_batch;
 use arrow::datatypes::{DataType as ArrowType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::ipc::reader::FileReader;
 use arrow::ipc::writer::FileWriter;
@@ -193,6 +236,148 @@ impl EntityBitmaps {
     pub fn load(path: &str) -> Result<Self, EventError> {
         let bytes = std::fs::read(path)?;
         Self::from_bytes(&bytes)
+    }
+}
+
+/// A magic word framing the row-index sidecar; a file that does not open with
+/// it is not one of ours and the caller falls back to the scan.
+const ROWINDEX_MAGIC: u32 = 0x4657_5249; // "FWRI"
+
+/// The row-index sidecar format version; a file at another version is treated
+/// as unloadable (fall back to the scan), never misread.
+const ROWINDEX_VERSION: u8 = 1;
+
+/// One roaring bitmap of ROW ORDINALS per event name over the single sorted
+/// stream, plus the stream's total row count. A funnel unions the step names'
+/// bitmaps and materializes only those rows; the total count is the denominator
+/// the selectivity gate divides the union size by.
+#[derive(Debug, Clone)]
+pub struct RowIndex {
+    total_rows: u64,
+    per_event: HashMap<String, RoaringBitmap>,
+}
+
+impl RowIndex {
+    /// The number of rows in the indexed stream (the gate's denominator).
+    pub fn total_rows(&self) -> u64 {
+        self.total_rows
+    }
+
+    /// The ROW ordinals whose event is one of `steps`, as the union of the step
+    /// names' bitmaps. A duplicate step name (a `('view','view')` funnel) unions
+    /// its bitmap once; a step naming no stored event contributes nothing. The
+    /// result is ascending, so iterating it walks the stream in storage order.
+    pub fn step_rows(&self, steps: &[String]) -> RoaringBitmap {
+        let mut union = RoaringBitmap::new();
+        let mut unioned: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for step in steps {
+            if !unioned.insert(step.as_str()) {
+                continue;
+            }
+            if let Some(bitmap) = self.per_event.get(step) {
+                union |= bitmap;
+            }
+        }
+        union
+    }
+
+    /// Serialize to the framed row-index format: magic and version, the total
+    /// row count, then each event name with its roaring bitmap blob, in a stable
+    /// name order so a rebuild over identical rows yields identical bytes.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, EventError> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&ROWINDEX_MAGIC.to_le_bytes());
+        out.push(ROWINDEX_VERSION);
+        out.extend_from_slice(&self.total_rows.to_le_bytes());
+        write_u32(
+            &mut out,
+            u32::try_from(self.per_event.len()).expect("event count fits u32"),
+        );
+        let mut names: Vec<&String> = self.per_event.keys().collect();
+        names.sort_unstable();
+        for name in names {
+            write_str(&mut out, name);
+            let mut blob = Vec::new();
+            self.per_event[name]
+                .serialize_into(&mut blob)
+                .expect("roaring serialize into a vec never fails");
+            write_u32(
+                &mut out,
+                u32::try_from(blob.len()).expect("bitmap blob fits u32"),
+            );
+            out.extend_from_slice(&blob);
+        }
+        Ok(out)
+    }
+
+    /// Parse the framed row-index format. A wrong magic or version raises so the
+    /// caller falls back to the scan rather than trusting a foreign file.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, EventError> {
+        let mut reader = ByteReader::new(bytes);
+        if reader.read_u32()? != ROWINDEX_MAGIC {
+            return Err(bitmap_format("not a row-index sidecar (bad magic)"));
+        }
+        if reader.read_u8()? != ROWINDEX_VERSION {
+            return Err(bitmap_format("row-index sidecar version mismatch"));
+        }
+        let total_rows = reader.read_u64()?;
+        let event_count = reader.read_u32()?;
+        let mut per_event = HashMap::with_capacity(event_count as usize);
+        for _ in 0..event_count {
+            let name = reader.read_str()?;
+            let blob_len = reader.read_u32()? as usize;
+            let blob = reader.read_bytes(blob_len)?;
+            let bitmap = RoaringBitmap::deserialize_from(blob)
+                .map_err(|error| bitmap_format(&format!("corrupt row-index blob: {error}")))?;
+            per_event.insert(name, bitmap);
+        }
+        Ok(Self {
+            total_rows,
+            per_event,
+        })
+    }
+
+    /// Load a row-index sidecar from `path`, or a format/io error the caller
+    /// turns into a scan fallback.
+    pub fn load(path: &str) -> Result<Self, EventError> {
+        let bytes = std::fs::read(path)?;
+        Self::from_bytes(&bytes)
+    }
+}
+
+/// The per-event row-ordinal bitmaps assembled during the build scan. Row
+/// ordinals are pushed in ascending order (the scan reads the stream in storage
+/// order), so each bitmap is built by appending increasing values.
+struct RowIndexAccum {
+    total_rows: u64,
+    per_event: HashMap<String, RoaringBitmap>,
+}
+
+impl RowIndexAccum {
+    /// An empty accumulator.
+    fn new() -> Self {
+        Self {
+            total_rows: 0,
+            per_event: HashMap::new(),
+        }
+    }
+
+    /// Record that the row at `ordinal` carries event name `event`, and count
+    /// the row toward the stream total.
+    fn push(&mut self, ordinal: u32, event: &str) {
+        self.per_event
+            .entry(event.to_string())
+            .or_default()
+            .insert(ordinal);
+        self.total_rows += 1;
+    }
+
+    /// The finished row index.
+    fn finish(self) -> RowIndex {
+        RowIndex {
+            total_rows: self.total_rows,
+            per_event: self.per_event,
+        }
     }
 }
 
@@ -597,17 +782,19 @@ pub fn worth_pruning(candidates: usize, entities: usize) -> bool {
     entities > 0 && candidates * 20 < entities * 17
 }
 
-/// Both sidecars produced by one build scan over the sorted stream.
+/// All sidecars produced by one build scan over the sorted stream.
 pub struct SidecarBuild {
     pub bitmaps: EntityBitmaps,
+    pub row_index: RowIndex,
     pub segment: SegmentAggregate,
 }
 
-/// Build both sidecars in a single pass over the (entity, timestamp)-sorted
+/// Build every sidecar in a single pass over the (entity, timestamp)-sorted
 /// stream: assign each entity a dense ordinal at its run boundary, insert that
-/// ordinal into each event name's bitmap, and fold each event into the
-/// time-bucketed pre-aggregate. Opening the stream re-runs the full role and
-/// null contract, so a build over a broken stream raises here.
+/// ordinal into each event name's ENTITY bitmap, insert the ROW ordinal into
+/// each event name's row bitmap, and fold each event into the time-bucketed
+/// pre-aggregate. Opening the stream re-runs the full role and null contract, so
+/// a build over a broken stream raises here.
 pub fn build_sidecars(
     view: &str,
     schema: &SchemaRef,
@@ -617,8 +804,10 @@ pub fn build_sidecars(
     let stream = EventStream::open(view, schema, batches, roles)?;
     let scale = stream.scale();
     let mut bitmaps = BitmapAccum::new();
+    let mut row_index = RowIndexAccum::new();
     let mut segment = SegmentAccum::new();
     let mut ordinal: i64 = -1;
+    let mut row_ordinal: u32 = 0;
     for row in stream.rows() {
         let row = row?;
         if row.new_entity {
@@ -627,12 +816,46 @@ pub fn build_sidecars(
         }
         let dense = u32::try_from(ordinal).expect("entity ordinal fits u32");
         bitmaps.push_event(dense, row.event);
+        row_index.push(row_ordinal, row.event);
         segment.push(scale, ordinal, row.time, row.event)?;
+        row_ordinal = row_ordinal
+            .checked_add(1)
+            .expect("row ordinal fits u32 (row count within the roaring domain)");
     }
     Ok(SidecarBuild {
         bitmaps: bitmaps.finish(),
+        row_index: row_index.finish(),
         segment: segment.finish(),
     })
+}
+
+/// Whether reading only the `selected` step-event rows out of `total` is worth
+/// the row-index gather over the plain full scan. Materializing a small fraction
+/// of the rows is a decisive win; a large fraction pays the gather (a `take`
+/// over the whole chunk plus a re-normalization of the kept rows) for little
+/// pruning, so the plain linear scan wins. The share below is measured on the
+/// 100M-event view: a SELECTIVE funnel's three step events are ~8% of rows and
+/// pruning is a large win; the COMMON funnel's `page_view`-led steps are ~41%
+/// and the full scan already beats DuckDB, so pruning engages only below a 30%
+/// row share and never touches the common funnel.
+pub fn worth_row_pruning(selected: u64, total: u64) -> bool {
+    total > 0 && selected * 10 < total * 3
+}
+
+/// Gather the `rows` (ascending row ordinals) out of one sorted chunk into a
+/// smaller batch, preserving their storage order. The kept rows are a
+/// subsequence of the sorted stream, so the result stays (entity, timestamp)
+/// sorted and a kernel over it sees the same order it would over the full scan.
+pub fn take_indexed_rows(
+    batch: &RecordBatch,
+    rows: &RoaringBitmap,
+) -> Result<RecordBatch, EventError> {
+    let mut indices = Vec::with_capacity(rows.len() as usize);
+    for row in rows {
+        indices.push(row);
+    }
+    let index_array = UInt32Array::from(indices);
+    Ok(take_record_batch(batch, &index_array)?)
 }
 
 /// An all-events cell (the whole bucket's measure, over every event name).
@@ -868,6 +1091,12 @@ impl<'a> ByteReader<'a> {
     fn read_i64(&mut self) -> Result<i64, EventError> {
         let bytes = self.read_bytes(8)?;
         Ok(i64::from_le_bytes(bytes.try_into().expect("8 bytes")))
+    }
+
+    /// Read a little-endian u64.
+    fn read_u64(&mut self) -> Result<u64, EventError> {
+        let bytes = self.read_bytes(8)?;
+        Ok(u64::from_le_bytes(bytes.try_into().expect("8 bytes")))
     }
 
     /// Read one byte.
@@ -1196,6 +1425,95 @@ mod tests {
                 "steps {steps:?}"
             );
         }
+    }
+
+    /// Run a funnel over the raw sorted batch via the row index, the runtime's
+    /// row-pruned path. `built` returns a single sorted batch, so the row
+    /// ordinals in the index address exactly its rows.
+    fn row_indexed(rows: &[(i32, i64, &str)], steps: &[&str]) -> Vec<i64> {
+        let (schema, data) = batch(rows);
+        let sorted = build_event_view("ev", &schema, &[data], &roles()).expect("build");
+        let sidecars = build_sidecars("ev", &schema, &sorted, &roles()).expect("sidecars");
+        let spec = funnel_spec(steps);
+        let (_, result) = crate::funnel::run_funnel_row_indexed(
+            "ev",
+            &schema,
+            &sorted,
+            &roles(),
+            &spec,
+            &sidecars.row_index,
+        )
+        .expect("row-indexed funnel");
+        funnel_counts(&result)
+    }
+
+    #[test]
+    fn row_indexed_funnel_matches_the_scan_with_intervening_non_step_events() {
+        // Non-step events ('browse', 'idle') sit between the step events and
+        // must not change the result: the row index drops them, and the funnel
+        // never consulted them anyway. Force pruning to engage by making step
+        // events a small fraction of the rows.
+        let mut rows = Vec::new();
+        for user in 1..=6 {
+            rows.push((user, 0, "signup"));
+            for filler in 0..8 {
+                rows.push((user, 10 + filler, "browse"));
+            }
+            rows.push((user, HOUR / 2, "activate"));
+            rows.push((user, HOUR, "purchase"));
+        }
+        let (schema, data) = batch(&rows);
+        let sorted = build_event_view("ev", &schema, &[data], &roles()).expect("build");
+        let stream = EventStream::open("ev", &schema, &sorted, &roles()).expect("open");
+        let spec = funnel_spec(&["signup", "activate", "purchase"]);
+        let (_, scan) = run_funnel(&stream, &spec).expect("scan");
+        let counts = row_indexed(&rows, &["signup", "activate", "purchase"]);
+        assert_eq!(counts, funnel_counts(&scan));
+        assert_eq!(counts, vec![6, 6, 6]);
+    }
+
+    #[test]
+    fn row_indexed_funnel_matches_the_scan_on_the_six_user_fixture() {
+        // The dense six-user fixture: step events are most of the rows, so the
+        // gate declines and the row-indexed path falls back to the full scan -
+        // the answer must still match.
+        let (schema, data) = batch(&funnel_fixture());
+        let sorted = build_event_view("ev", &schema, &[data], &roles()).expect("build");
+        let stream = EventStream::open("ev", &schema, &sorted, &roles()).expect("open");
+        let spec = funnel_spec(&["signup", "activate", "purchase"]);
+        let (_, scan) = run_funnel(&stream, &spec).expect("scan");
+        let counts = row_indexed(&funnel_fixture(), &["signup", "activate", "purchase"]);
+        assert_eq!(counts, funnel_counts(&scan));
+    }
+
+    #[test]
+    fn row_pruning_engages_only_below_the_row_share_threshold() {
+        // No rows never prunes; a small step-event share prunes; a share at or
+        // above 30% does not (the common-funnel guard).
+        assert!(!worth_row_pruning(0, 0));
+        assert!(worth_row_pruning(8, 100));
+        assert!(worth_row_pruning(29, 100));
+        assert!(!worth_row_pruning(30, 100));
+        assert!(!worth_row_pruning(41, 100));
+    }
+
+    #[test]
+    fn the_row_index_round_trips_through_its_bytes() {
+        let (_, sidecars) = built(&funnel_fixture());
+        let bytes = sidecars.row_index.to_bytes().expect("to_bytes");
+        let loaded = RowIndex::from_bytes(&bytes).expect("from_bytes");
+        assert_eq!(loaded.total_rows(), sidecars.row_index.total_rows());
+        let steps = vec!["signup".to_string(), "activate".to_string()];
+        assert_eq!(
+            loaded.step_rows(&steps),
+            sidecars.row_index.step_rows(&steps)
+        );
+    }
+
+    #[test]
+    fn from_bytes_rejects_a_foreign_row_index_file() {
+        assert!(RowIndex::from_bytes(b"not a row index").is_err());
+        assert!(RowIndex::from_bytes(&[]).is_err());
     }
 
     #[test]

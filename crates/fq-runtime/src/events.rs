@@ -19,8 +19,9 @@ use fq_accel::{Accelerator, ChunkStore, MaterializedView};
 use fq_common::events::{EventRoleColumns, FunnelSpec, PathsSpec, SegmentSpec};
 use fq_common::DataType;
 use fq_events::{
-    build_event_view, build_sidecars, read_chunks, run_funnel, run_funnel_pruned, run_paths,
-    run_paths_pruned, run_segment, EntityBitmaps, EventStream, SegmentAggregate,
+    build_event_view, build_sidecars, read_chunks, read_chunks_columns, run_funnel,
+    run_funnel_pruned, run_funnel_row_indexed, run_paths, run_paths_pruned, run_segment,
+    EntityBitmaps, EventStream, RowIndex, SegmentAggregate,
 };
 use fq_events::{EventError, EventViewRegistry, SidecarMeta};
 
@@ -163,18 +164,57 @@ impl Runtime {
         status_result("DROP EVENT VIEW")
     }
 
-    /// `FUNNEL OVER view ...`: run the funnel over the view's chunks, using the
-    /// entity bitmaps (step-1 popcount + candidate-only scan) when they load for
-    /// the current generation, else the plain full scan.
+    /// `FUNNEL OVER view ...`: run the funnel over the view's chunks. When the
+    /// per-event ROW index loads for the current generation it drives the funnel
+    /// (materializing only the step-event rows, or falling back to the full scan
+    /// when they are too dense); otherwise the entity bitmaps prune by candidate
+    /// entity, and with neither the plain full scan runs.
+    ///
+    /// The funnel consults only the entity, timestamp, and event columns (its
+    /// matching is strict-increase, so tie order - the only thing a tiebreak
+    /// decides - never changes a count), so the chunks are read projected to
+    /// those three columns, skipping the decode of the property and tiebreak
+    /// columns that at 100M rows dominate the read.
     pub(crate) fn run_funnel_statement(
         &self,
         spec: &FunnelSpec,
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-        let stream = self.open_event_stream(&spec.view)?;
+        let (schema, batches, roles) = self.read_funnel_columns(&spec.view)?;
+        if let Some(index) = self.load_row_index(&spec.view)? {
+            return Ok(run_funnel_row_indexed(
+                &spec.view, &schema, &batches, &roles, spec, &index,
+            )?);
+        }
+        let stream = EventStream::open(&spec.view, &schema, &batches, &roles)?;
         match self.load_bitmaps(&spec.view)? {
             Some(bitmaps) => Ok(run_funnel_pruned(&stream, spec, &bitmaps)?),
             None => Ok(run_funnel(&stream, spec)?),
         }
+    }
+
+    /// An event view's chunks projected to the funnel's three consulted columns
+    /// (entity, timestamp, event), plus a tiebreak-free role set naming them.
+    /// Projection keeps every row, so the row index's ordinals still address the
+    /// same rows; dropping the tiebreak is sound because the funnel is
+    /// tie-independent (equal timestamps never advance a strict-increase match).
+    fn read_funnel_columns(
+        &self,
+        view_name: &str,
+    ) -> Result<(SchemaRef, Vec<RecordBatch>, EventRoleColumns), RuntimeError> {
+        let accel = self.accelerator()?;
+        let roles = self.event_roles(view_name)?;
+        let view = accel.view(view_name)?;
+        let (schema, batches) = read_chunks_columns(
+            &accel.chunk_paths(&view),
+            &[&roles.entity, &roles.timestamp, &roles.event],
+        )?;
+        let funnel_roles = EventRoleColumns {
+            entity: roles.entity,
+            timestamp: roles.timestamp,
+            event: roles.event,
+            tiebreak: None,
+        };
+        Ok((schema, batches, funnel_roles))
     }
 
     /// `SEGMENT OVER view ...`: answer from the time-bucketed pre-aggregate when
@@ -226,6 +266,16 @@ impl Runtime {
         Ok(SegmentAggregate::load(&path_string(&dir, &segagg_name(generation))).ok())
     }
 
+    /// The row-index sidecar for the view's current generation, or None (same
+    /// fallback rule as `load_bitmaps`: a missing, stale-generation, or
+    /// unreadable file falls back to the plain scan).
+    fn load_row_index(&self, name: &str) -> Result<Option<RowIndex>, RuntimeError> {
+        let Some((dir, generation)) = self.sidecar_context(name)? else {
+            return Ok(None);
+        };
+        Ok(RowIndex::load(&path_string(&dir, &rowindex_name(generation))).ok())
+    }
+
     /// The chunk directory and generation to read sidecars from, but ONLY when
     /// the registry records sidecars for exactly the view's current chunk
     /// generation. A mismatch (a build that predates the structures, or an
@@ -258,11 +308,23 @@ impl Runtime {
 
     /// The contract-verifying stream over an event view's stored chunks.
     fn open_event_stream(&self, view_name: &str) -> Result<EventStream, RuntimeError> {
+        let (schema, batches, roles) = self.read_event_view(view_name)?;
+        Ok(EventStream::open(view_name, &schema, &batches, &roles)?)
+    }
+
+    /// An event view's raw stored chunks (schema + batches) and its roles,
+    /// WITHOUT opening a stream. The funnel row-index path takes the raw batches
+    /// so it can gather only the step-event rows before normalizing them,
+    /// instead of normalizing the whole stream up front.
+    fn read_event_view(
+        &self,
+        view_name: &str,
+    ) -> Result<(SchemaRef, Vec<RecordBatch>, EventRoleColumns), RuntimeError> {
         let accel = self.accelerator()?;
         let roles = self.event_roles(view_name)?;
         let view = accel.view(view_name)?;
         let (schema, batches) = read_chunks(&accel.chunk_paths(&view))?;
-        Ok(EventStream::open(view_name, &schema, &batches, &roles)?)
+        Ok((schema, batches, roles))
     }
 
     /// The roles of a registered event view, or a loud `UnknownEventView`
@@ -307,6 +369,11 @@ fn persist_sidecars(
         &bitmaps_name(generation),
         &build.bitmaps.to_bytes()?,
     )?;
+    let rowindex_bytes = write_sidecar(
+        &directory,
+        &rowindex_name(generation),
+        &build.row_index.to_bytes()?,
+    )?;
     let segagg_bytes = write_sidecar(
         &directory,
         &segagg_name(generation),
@@ -318,6 +385,7 @@ fn persist_sidecars(
         &SidecarMeta {
             generation: i64::try_from(generation).expect("generation fits i64"),
             bitmaps_bytes,
+            rowindex_bytes,
             segagg_bytes,
         },
     )?;
@@ -338,6 +406,11 @@ fn current_generation(view: &MaterializedView) -> Result<u64, RuntimeError> {
 /// The bitmap sidecar file name for a generation.
 fn bitmaps_name(generation: u64) -> String {
     format!("bitmaps-{generation}.fqb")
+}
+
+/// The row-index sidecar file name for a generation.
+fn rowindex_name(generation: u64) -> String {
+    format!("rowindex-{generation}.fqr")
 }
 
 /// The segment pre-aggregate sidecar file name for a generation.
@@ -367,7 +440,7 @@ fn write_sidecar(
 /// Unlink sidecar files of a superseded generation left in the directory (the
 /// current generation's files are kept). A file already gone is fine.
 fn remove_stale_sidecars(directory: &std::path::Path, keep: u64) -> Result<(), RuntimeError> {
-    let keep_files = [bitmaps_name(keep), segagg_name(keep)];
+    let keep_files = [bitmaps_name(keep), rowindex_name(keep), segagg_name(keep)];
     let entries = std::fs::read_dir(directory).map_err(EventError::from)?;
     for entry in entries {
         let entry = entry.map_err(EventError::from)?;
@@ -385,5 +458,6 @@ fn is_sidecar_file(name: &str) -> bool {
         .extension()
         .and_then(|value| value.to_str());
     (name.starts_with("bitmaps-") && extension == Some("fqb"))
+        || (name.starts_with("rowindex-") && extension == Some("fqr"))
         || (name.starts_with("segagg-") && extension == Some("arrow"))
 }

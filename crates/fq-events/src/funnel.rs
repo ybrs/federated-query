@@ -15,10 +15,12 @@ use std::sync::Arc;
 
 use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType as ArrowType, Field, Schema, SchemaRef};
-use fq_common::events::FunnelSpec;
+use fq_common::events::{EventRoleColumns, FunnelSpec};
 
 use crate::error::EventError;
-use crate::sidecar::{worth_pruning, EntityBitmaps};
+use crate::sidecar::{
+    take_indexed_rows, worth_pruning, worth_row_pruning, EntityBitmaps, RowIndex,
+};
 use crate::stream::EventStream;
 
 /// The most steps a funnel can declare; step matches per event are tracked
@@ -72,6 +74,35 @@ pub fn run_funnel_pruned(
     let window = stream.scale().window_in_native(spec.within)?;
     let reached = count_entities_pruned(stream, &spec.steps, window, bitmaps, &candidates)?;
     Ok((funnel_schema(), vec![result_batch(&spec.steps, &reached)?]))
+}
+
+/// Run a funnel using the per-event-name ROW index to materialize only the
+/// step-event rows: union the step names' row bitmaps, gather just those rows
+/// from the single sorted chunk, and run the ordinary funnel over the small
+/// result. The funnel matcher consults only step events (a non-step row yields a
+/// zero step mask and is never buffered), so a funnel over the step-event rows
+/// equals a funnel over the full stream.
+///
+/// Falls back to the plain full scan when the stream is not one seekable chunk,
+/// or when the step events are too large a fraction of the rows for the gather
+/// to pay (a COMMON funnel whose head events dominate the log).
+pub fn run_funnel_row_indexed(
+    view: &str,
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+    roles: &EventRoleColumns,
+    spec: &FunnelSpec,
+    index: &RowIndex,
+) -> Result<(SchemaRef, Vec<RecordBatch>), EventError> {
+    require_step_count(spec.steps.len())?;
+    let selected = index.step_rows(&spec.steps);
+    if batches.len() != 1 || !worth_row_pruning(selected.len(), index.total_rows()) {
+        let stream = EventStream::open(view, schema, batches, roles)?;
+        return run_funnel(&stream, spec);
+    }
+    let subset = take_indexed_rows(&batches[0], &selected)?;
+    let stream = EventStream::open(view, schema, std::slice::from_ref(&subset), roles)?;
+    run_funnel(&stream, spec)
 }
 
 /// The per-step counts computed from the bitmaps plus a candidate-only scan:

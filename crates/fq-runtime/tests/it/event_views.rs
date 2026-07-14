@@ -160,7 +160,10 @@ impl Sandbox {
             for file in std::fs::read_dir(&location).expect("location dir") {
                 let path = file.expect("file entry").path();
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
-                if name.starts_with("bitmaps-") || name.starts_with("segagg-") {
+                if name.starts_with("bitmaps-")
+                    || name.starts_with("rowindex-")
+                    || name.starts_with("segagg-")
+                {
                     std::fs::remove_file(&path).expect("remove sidecar");
                 }
             }

@@ -746,18 +746,22 @@ def _store_dir(scale):
 
 
 def _sidecar_sizes(scale):
-    """The on-disk bytes of the derived structures: (bitmaps, segment). Sums the
-    sidecar files under the store, which are named by their generation."""
+    """The on-disk bytes of the derived structures: (bitmaps, rowindex, segment).
+    Sums the sidecar files under the store, which are named by their
+    generation."""
     bitmaps = 0
+    rowindex = 0
     segagg = 0
     for root, _dirs, files in os.walk(_store_dir(scale)):
         for name in files:
             full = os.path.join(root, name)
             if name.startswith("bitmaps-") and name.endswith(".fqb"):
                 bitmaps += os.path.getsize(full)
+            elif name.startswith("rowindex-") and name.endswith(".fqr"):
+                rowindex += os.path.getsize(full)
             elif name.startswith("segagg-") and name.endswith(".arrow"):
                 segagg += os.path.getsize(full)
-    return bitmaps, segagg
+    return bitmaps, rowindex, segagg
 
 
 def _peak_rss_mb():
@@ -988,9 +992,10 @@ def _finish(scale, results, create_ms, refresh_ms, total_ms, options):
 def _derived_facts(scale):
     """The derived-structure measurements for the report: sidecar sizes on disk
     and the run process's peak resident set."""
-    bitmaps_bytes, segagg_bytes = _sidecar_sizes(scale)
+    bitmaps_bytes, rowindex_bytes, segagg_bytes = _sidecar_sizes(scale)
     return {
         "bitmaps_bytes": bitmaps_bytes,
+        "rowindex_bytes": rowindex_bytes,
         "segagg_bytes": segagg_bytes,
         "peak_rss_mb": _peak_rss_mb(),
     }
@@ -999,8 +1004,10 @@ def _derived_facts(scale):
 def _print_derived(derived):
     """Print the derived-structure sidecar sizes and peak memory."""
     print(
-        "derived sidecars: bitmaps {0}  segment {1}  |  peak RSS {2:.0f} MB".format(
+        "derived sidecars: bitmaps {0}  rowindex {1}  segment {2}  |  "
+        "peak RSS {3:.0f} MB".format(
             _human_bytes(derived["bitmaps_bytes"]),
+            _human_bytes(derived["rowindex_bytes"]),
             _human_bytes(derived["segagg_bytes"]),
             derived["peak_rss_mb"],
         )
@@ -1056,9 +1063,10 @@ def _report_lines(scale, results, create_ms, refresh_ms, total_ms, derived, opti
         "Build: CREATE {0:.0f}ms, REFRESH {1:.0f}ms (scan + global "
         "(entity, timestamp, tiebreak) sort + chunk write + derived "
         "sidecars).".format(create_ms, refresh_ms),
-        "Derived sidecars on disk: bitmaps {0}, segment {1}. Peak run RSS "
-        "{2:.0f} MB.".format(
+        "Derived sidecars on disk: bitmaps {0}, rowindex {1}, segment {2}. Peak "
+        "run RSS {3:.0f} MB.".format(
             _human_bytes(derived["bitmaps_bytes"]),
+            _human_bytes(derived["rowindex_bytes"]),
             _human_bytes(derived["segagg_bytes"]),
             derived["peak_rss_mb"],
         ),
