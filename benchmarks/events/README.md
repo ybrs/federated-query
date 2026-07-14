@@ -6,9 +6,10 @@ subcommands; `run` is the default when none is named.
 
 This suite times the engine's event analytics (FUNNEL / SEGMENT / PATHS over an
 EVENT VIEW) against the honest pure-DuckDB SQL a user would otherwise write over
-the same file. The DuckDB baseline is measured ONCE per dataset by `save-refs`
-and read back by `run` - it is a function of the data, never re-measured per
-invocation.
+the same Parquet file. The engine reads the events from Parquet through its
+read-only Parquet connector. The DuckDB baseline is measured ONCE per dataset by
+`save-refs` and read back by `run` - it is a function of the data, never
+re-measured per invocation.
 
 ## One-time data setup (per scale)
 
@@ -17,12 +18,15 @@ invocation.
 /workspace/venv-fedq/bin/python run_events.py save-refs  --scale small
 ```
 
-- `generate` builds `data/events_<scale>.duckdb`: one `events` table of
-  synthetic events. Every column is a DETERMINISTIC function of the row index
-  (`hash(i, salt)`, not a thread-order-dependent RNG), so the same scale always
-  produces the same bytes regardless of DuckDB's parallelism.
+- `generate` writes `data/events_<scale>_parquet/events.parquet`: one `events`
+  table of synthetic events, synthesized in DuckDB and exported to Parquet (the
+  intermediate DuckDB build file is removed). Every column is a DETERMINISTIC
+  function of the row index (`hash(i, salt)`, not a thread-order-dependent RNG),
+  so the same scale always produces the same bytes regardless of DuckDB's
+  parallelism.
 - `save-refs` measures every analysis's DuckDB baseline once (timing plus a
-  result signature) into `data/references_<scale>.duckdb`. It REFUSES to
+  result signature) into `data/references_<scale>.duckdb`, reading the events
+  from the Parquet file via `read_parquet`. It REFUSES to
   overwrite a populated refs file; rebuild by deleting the file first (only when
   the DATA changed). A baseline that exceeds `--baseline-timeout` (default 300s)
   is interrupted and recorded as N/A with the reason - naive SQL not scaling is
@@ -36,10 +40,11 @@ invocation.
 
 (equivalently, with no subcommand: `run_events.py --scale small ...`)
 
-- Builds the config, then over one runtime: DROP any leftover view, CREATE EVENT
-  VIEW over the generated table (timed), REFRESH it (timed), and time each
-  analysis cold (first run) plus warm (median of `--warm-runs`), next to the
-  CACHED DuckDB baseline for each.
+- Builds the config (a `type: parquet` source over the exported file), then over
+  one runtime: DROP any leftover view, CREATE EVENT VIEW over the Parquet source
+  (timed; the engine sorts by the contract keys through its executor), REFRESH it
+  (timed), and time each analysis cold (first run) plus warm (median of
+  `--warm-runs`), next to the CACHED DuckDB baseline for each.
 - Cross-checks every engine result against the baseline's stored signature
   (AGREE = identical counts, DIFFER = a real divergence, N/A = the baseline was
   not measured). The baselines reproduce the engine's pinned semantics exactly,
@@ -54,11 +59,11 @@ BY DAY; PATHS MAX DEPTH 5 TOP 20 with and without STARTING AT.
 
 ## Scales
 
-| Scale  | Events        | Entities  | Approx file |
-| ------ | ------------- | --------- | ----------- |
-| small  | 1,000,000     | 50,000    | ~9 MB       |
-| medium | 100,000,000   | 500,000   | ~7-8 GB     |
-| large  | 1,000,000,000 | 5,000,000 | ~75 GB      |
+| Scale  | Events        | Entities  | Approx Parquet |
+| ------ | ------------- | --------- | -------------- |
+| small  | 1,000,000     | 50,000    | ~16 MB         |
+| medium | 100,000,000   | 500,000   | ~1.7 GB        |
+| large  | 1,000,000,000 | 5,000,000 | ~17 GB         |
 
 `--events N` / `--entities E` override the defaults for a custom size. `large`
 is defined but only builds where disk allows (`generate` prints the file size).
@@ -115,4 +120,5 @@ run-time cross-check is a real correctness gate, not decoration.
 
 - `run_events.py` - THE runner and the only .py file here (generate / save-refs
   / run).
-- `data/` - duck dataset files and references; `reports/` - runner output.
+- `data/` - Parquet dataset dirs (`events_<scale>_parquet/`) and the DuckDB
+  `references_<scale>.duckdb` baselines; `reports/` - runner output.

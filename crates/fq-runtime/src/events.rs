@@ -3,11 +3,12 @@
 //! the event registry; every intermediate state is a valid plain materialized
 //! view, so the two-registry lifecycle needs no cross-table transaction:
 //!
-//! - CREATE runs the defining SELECT through the normal pipeline, has
-//!   fq-events validate the roles and sort the rows (the materialization
-//!   contract), persists via the materialized-view store, and registers the
-//!   roles LAST.
-//! - REFRESH re-runs the stored SELECT, re-applies the whole contract, and
+//! - CREATE runs the defining SELECT through the normal pipeline WITH an
+//!   ORDER BY on the contract keys, so the executor's sort delivers ordered
+//!   rows; fq-events validates the roles and consolidates them into the one
+//!   stored chunk, then it persists via the materialized-view store and
+//!   registers the roles LAST.
+//! - REFRESH re-runs the stored SELECT the same ordered way, re-validates, and
 //!   swaps chunks through the store's publication path.
 //! - DROP removes the role row FIRST, then the materialized view.
 //! - FUNNEL / SEGMENT / PATHS read the view's chunks and run the fq-events
@@ -75,9 +76,9 @@ pub fn paths_describe_columns() -> Vec<(String, DataType)> {
 
 impl Runtime {
     /// `CREATE EVENT VIEW name ENTITY .. TIMESTAMP .. EVENT .. AS select`:
-    /// execute the SELECT, enforce the role and sort contract, persist the
-    /// sorted rows as a materialized view, then register the roles. A name
-    /// that already resolves anywhere raises instead of shadowing.
+    /// execute the SELECT ordered by the contract keys, validate the roles,
+    /// persist the ordered rows as a materialized view, then register the roles.
+    /// A name that already resolves anywhere raises instead of shadowing.
     pub(crate) fn create_event_view(
         &self,
         name: &str,
@@ -99,8 +100,9 @@ impl Runtime {
         // require - every refresh re-pulls whole and re-sorts.
         let plan = delta::classify(&catalog, &self.config_snapshot(), select_sql)?;
         let tokens = delta::read_tokens(&catalog, &plan.base_tables)?;
-        let (schema, batches) = self.execute_source_query(select_sql)?;
-        let sorted = build_event_view(name, &schema, &batches, roles)?;
+        let (schema, batches) =
+            self.execute_source_query(&contract_ordered_sql(select_sql, roles))?;
+        let sorted = build_event_view(name, &schema, batches, roles)?;
         accel.create_view(name, select_sql, &schema, &sorted, tokens, None)?;
         if let Err(error) = registry.register(name, roles) {
             // Never leave the half-created pair behind on a registration
@@ -114,8 +116,8 @@ impl Runtime {
     }
 
     /// `REFRESH EVENT VIEW name`: no-op when every base table's version token
-    /// still matches the last pull; otherwise re-execute the stored SELECT and
-    /// re-apply the whole contract (validate + sort) before the store's atomic
+    /// still matches the last pull; otherwise re-execute the stored SELECT
+    /// ordered by the contract keys and re-validate before the store's atomic
     /// chunk swap. The re-executed SELECT must still produce the stored schema.
     ///
     /// An event view always re-pulls WHOLE (never a delta append): the
@@ -135,8 +137,9 @@ impl Runtime {
         if delta::tokens_allow_skip(&view.source_tokens, &tokens, &plan.base_tables) {
             return status_result("REFRESH EVENT VIEW (no-op: source tokens unchanged)");
         }
-        let (schema, batches) = self.execute_source_query(&view.definition_sql)?;
-        let sorted = build_event_view(name, &schema, &batches, &roles)?;
+        let ordered_sql = contract_ordered_sql(&view.definition_sql, &roles);
+        let (schema, batches) = self.execute_source_query(&ordered_sql)?;
+        let sorted = build_event_view(name, &schema, batches, &roles)?;
         accel.refresh_view(name, &schema, &sorted, &tokens, None)?;
         persist_sidecars(
             accel,
@@ -345,6 +348,21 @@ impl Runtime {
             )
         })
     }
+}
+
+/// Wrap the defining SELECT so the engine's executor returns the rows already
+/// ordered by the contract keys (entity, timestamp[, tiebreak]). The event-view
+/// materialization sorts through the executor's spilling sort rather than
+/// re-sorting the whole result in memory, so CREATE/REFRESH never hold the extra
+/// copies an Arrow lexsort + gather would allocate. The inner SELECT is stored
+/// unchanged as the view definition; only the materialization pull is ordered.
+fn contract_ordered_sql(select_sql: &str, roles: &EventRoleColumns) -> String {
+    let mut keys = format!("{}, {}", roles.entity, roles.timestamp);
+    if let Some(tiebreak) = &roles.tiebreak {
+        keys.push_str(", ");
+        keys.push_str(tiebreak);
+    }
+    format!("SELECT * FROM ({select_sql}) AS event_source ORDER BY {keys}")
 }
 
 /// Build both derived sidecars over the just-published sorted rows and write

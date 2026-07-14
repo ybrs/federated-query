@@ -132,8 +132,21 @@ TIEBREAK_COL = "seq"
 
 
 def _db_path(scale):
-    """The DuckDB dataset file for a scale."""
+    """The DuckDB dataset file for a scale (generate/save-refs build and read it
+    here before it is exported to Parquet)."""
     return os.path.join(DATA_DIR, "events_{0}.duckdb".format(scale))
+
+
+def _parquet_dir(scale):
+    """The Parquet source directory for a scale. The engine reads the events
+    from `<dir>/events.parquet` through the read-only Parquet connector; the
+    event-view stores hang off the config file's stem next to it."""
+    return os.path.join(DATA_DIR, "events_{0}_parquet".format(scale))
+
+
+def _parquet_path(scale):
+    """The single Parquet file the events table is exposed as."""
+    return os.path.join(_parquet_dir(scale), "{0}.parquet".format(TABLE_NAME))
 
 
 def _config_path(scale):
@@ -272,7 +285,9 @@ def _report_dataset_shape(connection):
 
 
 def generate(options):
-    """generate subcommand: build the scale's DuckDB dataset file."""
+    """generate subcommand: synthesize the scale's events and write the Parquet
+    source file the engine reads. DuckDB is the synthesis engine only; the
+    dataset is exported to Parquet and the intermediate DuckDB file removed."""
     scale = options.scale
     shape = SCALES[scale]
     events = options.events or shape["events"]
@@ -281,9 +296,10 @@ def generate(options):
     db_path = _db_path(scale)
     if os.path.exists(db_path):
         os.remove(db_path)
+    parquet_path = _parquet_path(scale)
     print(
         "generating scale={0}: {1} events over ~{2} entities -> {3}".format(
-            scale, events, entities, db_path
+            scale, events, entities, parquet_path
         )
     )
     started = time.perf_counter()
@@ -291,8 +307,19 @@ def generate(options):
     connection.execute(_generate_sql(events, entities))
     elapsed = time.perf_counter() - started
     _report_dataset_shape(connection)
+    _export_to_parquet(connection, scale)
     connection.close()
-    print("generated in {0:.1f}s ({1})".format(elapsed, _file_size(db_path)))
+    os.remove(db_path)
+    print("generated in {0:.1f}s ({1})".format(elapsed, _file_size(parquet_path)))
+
+
+def _export_to_parquet(connection, scale):
+    """Export the synthesized events table to the Parquet source file (the
+    engine reads events through the read-only Parquet connector)."""
+    os.makedirs(_parquet_dir(scale), exist_ok=True)
+    connection.execute(
+        "COPY {0} TO '{1}' (FORMAT PARQUET)".format(TABLE_NAME, _parquet_path(scale))
+    )
 
 
 def _file_size(path):
@@ -661,7 +688,12 @@ def save_refs(options):
     store timings and signatures into references_<scale>.duckdb."""
     scale = options.scale
     _refuse_existing_refs(scale)
-    source = duckdb.connect(_db_path(scale), read_only=True)
+    source = duckdb.connect()
+    source.execute(
+        "CREATE VIEW {0} AS SELECT * FROM read_parquet('{1}')".format(
+            TABLE_NAME, _parquet_path(scale)
+        )
+    )
     if options.memory_limit > 0:
         source.execute("SET memory_limit='{0}MB'".format(options.memory_limit))
     refs = duckdb.connect(_refs_path(scale))
@@ -772,15 +804,15 @@ def _peak_rss_mb():
 
 
 def _write_config(scale):
-    """Write the engine config for a scale: one read-only DuckDB source over the
-    dataset file. The event-view stores hang off this file's stem."""
+    """Write the engine config for a scale: one read-only Parquet source over
+    the exported events file. The event-view stores hang off this config's
+    stem."""
     text = (
         "datasources:\n"
         "  {source}:\n"
-        "    type: duckdb\n"
-        "    path: {db_path}\n"
-        "    read_only: true\n"
-    ).format(source=SOURCE_NAME, db_path=_db_path(scale))
+        "    type: parquet\n"
+        "    dir: {dir}\n"
+    ).format(source=SOURCE_NAME, dir=_parquet_dir(scale))
     path = _config_path(scale)
     with open(path, "w") as handle:
         handle.write(text)
@@ -916,10 +948,10 @@ def run(options):
 def _require_dataset(scale):
     """Fail loudly when the dataset or its refs are missing (generate/save-refs
     must run first) rather than building an empty view."""
-    if not os.path.exists(_db_path(scale)):
+    if not os.path.exists(_parquet_path(scale)):
         raise SystemExit(
             "no dataset at {0}; run 'generate --scale {1}' first".format(
-                _db_path(scale), scale
+                _parquet_path(scale), scale
             )
         )
     if not os.path.exists(_refs_path(scale)):

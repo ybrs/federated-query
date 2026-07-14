@@ -1137,7 +1137,10 @@ mod tests {
         }
     }
 
-    /// A (user_id Int32, ts Timestamp(us), name Utf8) schema and batch.
+    /// A (user_id Int32, ts Timestamp(us), name Utf8) schema and batch. The rows
+    /// are put in contract order (entity, timestamp) first - the executor
+    /// delivers ordered rows to the build path, so a test builds from ordered
+    /// rows too.
     fn batch(rows: &[(i32, i64, &str)]) -> (SchemaRef, RecordBatch) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("user_id", ArrowType::Int32, true),
@@ -1148,10 +1151,12 @@ mod tests {
             ),
             Field::new("name", ArrowType::Utf8, true),
         ]));
+        let mut rows: Vec<(i32, i64, &str)> = rows.to_vec();
+        rows.sort_by_key(|row| (row.0, row.1));
         let mut users = Vec::new();
         let mut times = Vec::new();
         let mut names = Vec::new();
-        for (user, time, name) in rows {
+        for (user, time, name) in &rows {
             users.push(*user);
             times.push(*time);
             names.push(*name);
@@ -1172,7 +1177,7 @@ mod tests {
     /// the same sorted batches - the runtime's establish-then-serve pair.
     fn built(rows: &[(i32, i64, &str)]) -> (EventStream, SidecarBuild) {
         let (schema, data) = batch(rows);
-        let sorted = build_event_view("ev", &schema, &[data], &roles()).expect("build");
+        let sorted = build_event_view("ev", &schema, vec![data], &roles()).expect("build");
         let stream = EventStream::open("ev", &schema, &sorted, &roles()).expect("open");
         let sidecars = build_sidecars("ev", &schema, &sorted, &roles()).expect("sidecars");
         (stream, sidecars)
@@ -1432,7 +1437,7 @@ mod tests {
     /// ordinals in the index address exactly its rows.
     fn row_indexed(rows: &[(i32, i64, &str)], steps: &[&str]) -> Vec<i64> {
         let (schema, data) = batch(rows);
-        let sorted = build_event_view("ev", &schema, &[data], &roles()).expect("build");
+        let sorted = build_event_view("ev", &schema, vec![data], &roles()).expect("build");
         let sidecars = build_sidecars("ev", &schema, &sorted, &roles()).expect("sidecars");
         let spec = funnel_spec(steps);
         let (_, result) = crate::funnel::run_funnel_row_indexed(
@@ -1463,7 +1468,7 @@ mod tests {
             rows.push((user, HOUR, "purchase"));
         }
         let (schema, data) = batch(&rows);
-        let sorted = build_event_view("ev", &schema, &[data], &roles()).expect("build");
+        let sorted = build_event_view("ev", &schema, vec![data], &roles()).expect("build");
         let stream = EventStream::open("ev", &schema, &sorted, &roles()).expect("open");
         let spec = funnel_spec(&["signup", "activate", "purchase"]);
         let (_, scan) = run_funnel(&stream, &spec).expect("scan");
@@ -1478,7 +1483,7 @@ mod tests {
         // gate declines and the row-indexed path falls back to the full scan -
         // the answer must still match.
         let (schema, data) = batch(&funnel_fixture());
-        let sorted = build_event_view("ev", &schema, &[data], &roles()).expect("build");
+        let sorted = build_event_view("ev", &schema, vec![data], &roles()).expect("build");
         let stream = EventStream::open("ev", &schema, &sorted, &roles()).expect("open");
         let spec = funnel_spec(&["signup", "activate", "purchase"]);
         let (_, scan) = run_funnel(&stream, &spec).expect("scan");

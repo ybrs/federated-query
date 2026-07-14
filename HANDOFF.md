@@ -112,9 +112,10 @@ Feature surface built on top of the core engine:
 
 ## Branch, build, gates
 
-- Branch: `rewrite-python-to-rust` (this repo). The imported fedqrs engine now
-  lives in-tree as `fq-exec`; the standalone `/workspace/fedqrs` remnants are a
-  teardown item.
+- Branch: `rewrite-python-to-rust` (this repo). Local `main` is fast-forwarded
+  to this branch (identical, 0 commits apart); nothing is pushed to `origin`
+  yet. The imported fedqrs engine now lives in-tree as `fq-exec`; the standalone
+  `/workspace/fedqrs` remnants are a teardown item.
 - Toolchain: cargo 1.96.1 at `$HOME/.cargo/bin` (HOME=/tmp). Build env:
   `export CARGO_TARGET_DIR=/workspace/federated-query/target`.
 - Before every commit: `cargo fmt --all && cargo clippy --workspace
@@ -208,11 +209,49 @@ Events findings (from `benchmarks/events`):
 - SEGMENT is a decisive win (the pre-aggregate sidecar): sub-millisecond vs
   DuckDB's seconds at 100M events.
 - FUNNEL and PATHS beat DuckDB when the funnel/path is common (funnel common
-  0.18x, paths 0.30-0.35x at 100M), but a SELECTIVE funnel is slower (3.55x at
-  100M) because the funnel/paths kernels currently load ALL chunks into memory
-  before scanning - peak RSS ~29GB at 100M events. A SELECTIVE-FUNNEL ROW-INDEX
-  round is IN FLIGHT in a worktree agent (`.claude/worktrees/`); streaming the
-  kernels (never resident) is still open.
+  0.18x, paths 0.30-0.35x at 100M). The SELECTIVE-FUNNEL ROW-INDEX round has
+  LANDED (per-event-name row index + funnel column projection): a selective
+  funnel materializes only the step-event rows of the single sorted chunk and
+  reads just the three consulted columns, cutting the selective funnel from
+  3.55x to 2.48x at 100M.
+- MEMORY, apportioned by measurement (fresh-process peak `ru_maxrss`, one phase
+  each, over the built 100M view): every query kernel peaks at ~5.0-5.1 GB - the
+  size of the one materialized chunk, no blow-up (funnel common 5061 MB, funnel
+  selective 5060 MB, paths 5126 MB, segment 5059 MB). The whole-run peak was
+  ENTIRELY the CREATE EVENT VIEW step, NOT a query-path cost. So streaming the
+  query kernels was NOT the fix (the earlier HANDOFF item was a misdiagnosis);
+  the lever is CREATE.
+
+Events SOURCE is now Parquet (the runner exports the generated table to
+`data/events_<scale>_parquet/events.parquet` and the config is a `type: parquet`
+source; the DuckDB source files were removed - `references_<scale>.duckdb`
+baselines stay). CREATE reads the Parquet through the read-only connector.
+
+CREATE EVENT VIEW - the sort moved to the executor (LANDED). The in-memory
+Arrow lexsort + `take_record_batch` (three full copies + a 100M-row string
+gather) is gone: the materialization now runs the defining SELECT wrapped in an
+ORDER BY on the contract keys, so DataFusion sorts, and `build_event_view` only
+validates the roles (no column clone) and concatenates the ordered result into
+the single stored chunk. Result at 100M (runner, warm 1): 6 agree | 0 differ;
+CREATE 208s -> 68s (3x); peak RSS 29.3 GB -> 26.8 GB (barely moved). 986
+workspace tests green.
+
+CREATE memory + the last ~2x of time are STILL OPEN and PARKED pending a
+direction decision. Apportioned at 100M: DuckDB sorts+writes the same Parquet in
+12.8s; our engine's scan+sort alone is 24.6s / 13.4 GB (the ORDER BY is pushed
+into the one Parquet scan step - DataFusion is ~2x DuckDB at bulk parquet+sort,
+12 cores); the remaining ~43s and the memory doubling to 26.8 GB is CREATE's own
+post-sort work - the `concat_batches` copy, writing a 5 GB UNCOMPRESSED IPC
+chunk, and `persist_sidecars` re-normalizing all 100M rows a second time
+(`build_sidecars` opens a fresh `EventStream`, re-casting the string columns).
+The three candidate directions (not yet chosen): (a) cut the post-sort waste +
+bound the sort so it spills (keep the engine sort; est. ~30-35s / ~8 GB, no
+architectural risk); (b) a streaming materialization that pipes sorted batches
+once into chunk-write + sidecar-build in one bounded pass (touches the proven
+single-batch kernel/sidecar path); (c) let DuckDB do the build sort (the only
+path to ~13s, since our sort floor is ~2x). Note `MEMORY_LIMIT_BYTES` is a
+shared 32 GB `FairSpillPool`, so the 100M sort never spills - a per-build bounded
+budget would be needed for (a)/(b).
 
 ## How to run everything
 
@@ -320,9 +359,17 @@ fedq-py / fedq-server / fedq  -> fq-runtime
 Core engine and the feature surface are complete and gated; what remains is a
 short punch list plus the teardown, in rough order:
 
-1. Selective-funnel row-index round (IN FLIGHT in a worktree agent), then the
-   larger streaming-kernel work so FUNNEL/PATHS never load all chunks resident
-   (29GB peak at 100M is the open number).
+1. CREATE EVENT VIEW at 100M - time PARTLY fixed, memory PARKED (see the events
+   findings above for the full apportionment). The sort now runs in the executor
+   (ORDER BY on the contract keys) instead of an in-memory Arrow lexsort+gather:
+   CREATE 208s -> 68s, correctness held (6 agree). STILL OPEN and awaiting a
+   direction decision: peak RSS is still 26.8 GB and the last ~2x of time. The
+   post-sort work (concat copy + 5 GB uncompressed IPC write + a redundant 100M-
+   row sidecar re-normalize) is the ~43s / +14 GB to cut; the sort itself is
+   ~2x DuckDB (24.6s vs 12.8s) and never spills (shared 32 GB pool). Three
+   candidate directions in the events findings: (a) cut post-sort waste + bound
+   the sort, (b) streaming materialization, (c) DuckDB build sort. Streaming the
+   query kernels (~5 GB -> ~1-2 GB) is a separate, lower-value follow-up.
 2. Accelerator Phase D: S3 via `object_store` config + `max_bytes`
    LRU-by-benefit eviction + tombstone sweeper (see `accelerator-plan.md`
    section 7).
@@ -348,6 +395,8 @@ correctly, delete the repair block and its tests. See commit `26d3d9f`.
 ## Commit log (rewrite, newest first; earlier log in git history of this file)
 
 ```
+ac54283 Per-event-name row index + funnel column projection for selective funnels
+96eea41 HANDOFF + architecture docs rewritten against the current workspace
 df93802 Event sidecars: segment pre-aggregates (decisive win) + gated entity bitmaps
 38fe691 Substitution order guard walks the whole matched subtree; accelerator tutorial
 3baa0bf Accelerator Phase C: automatic substitution, cost gate, benefit tracking

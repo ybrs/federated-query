@@ -252,7 +252,10 @@ mod tests {
         roles
     }
 
-    /// A (user_id Int32, ts Timestamp(us), name Utf8, seq Int32) batch.
+    /// A (user_id Int32, ts Timestamp(us), name Utf8, seq Int32) batch. The
+    /// rows are put in contract order (entity, timestamp, tiebreak) first - the
+    /// executor delivers ordered rows to the build path, so a test builds from
+    /// ordered rows too.
     fn batch(rows: &[(i32, i64, &str, i32)]) -> (SchemaRef, RecordBatch) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("user_id", ArrowType::Int32, true),
@@ -264,11 +267,13 @@ mod tests {
             Field::new("name", ArrowType::Utf8, true),
             Field::new("seq", ArrowType::Int32, true),
         ]));
+        let mut rows: Vec<(i32, i64, &str, i32)> = rows.to_vec();
+        rows.sort_by_key(|row| (row.0, row.1, row.3));
         let mut users = Vec::new();
         let mut times = Vec::new();
         let mut names = Vec::new();
         let mut seqs = Vec::new();
-        for (user, time, name, seq) in rows {
+        for (user, time, name, seq) in &rows {
             users.push(*user);
             times.push(*time);
             names.push(*name);
@@ -291,7 +296,7 @@ mod tests {
     /// the same establish-then-scan pair the runtime performs.
     fn stream(rows: &[(i32, i64, &str, i32)], roles: &EventRoleColumns) -> EventStream {
         let (schema, data) = batch(rows);
-        let sorted = build_event_view("ev", &schema, &[data], roles).expect("build");
+        let sorted = build_event_view("ev", &schema, vec![data], roles).expect("build");
         EventStream::open("ev", &schema, &sorted, roles).expect("open")
     }
 

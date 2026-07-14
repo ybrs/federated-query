@@ -230,16 +230,11 @@ impl EventStream {
         batches: &[RecordBatch],
         roles: &EventRoleColumns,
     ) -> Result<Self, EventError> {
+        validate_roles(view, schema, batches, roles)?;
         let indices = role_indices(schema, roles)?;
         let scale = TimeScale::of(schema.field(indices.time).data_type())?;
-        require_entity_type(schema.field(indices.entity).data_type())?;
-        require_text_type("event", schema.field(indices.event).data_type())?;
-        if let Some(tiebreak_index) = indices.tiebreak {
-            require_tiebreak_type(schema.field(tiebreak_index).data_type())?;
-        }
         let mut normalized = Vec::with_capacity(batches.len());
         for batch in batches {
-            require_no_role_nulls(view, batch, roles, &indices)?;
             normalized.push(EventBatch {
                 entity: normalize_entity(batch.column(indices.entity))?,
                 time: cast_to_int64(batch.column(indices.time))?,
@@ -602,6 +597,30 @@ impl RoleIndices {
         }
         declared
     }
+}
+
+/// Check batches against the role contract WITHOUT materializing the normalized
+/// kernel columns: resolve the roles, enforce the type contract, and raise on
+/// any NULL role value. This is the whole check `EventStream::open` runs before
+/// it normalizes; the materialization path needs only the check, so it validates
+/// through here and never clones a column of the result.
+pub fn validate_roles(
+    view: &str,
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+    roles: &EventRoleColumns,
+) -> Result<(), EventError> {
+    let indices = role_indices(schema, roles)?;
+    TimeScale::of(schema.field(indices.time).data_type())?;
+    require_entity_type(schema.field(indices.entity).data_type())?;
+    require_text_type("event", schema.field(indices.event).data_type())?;
+    if let Some(tiebreak_index) = indices.tiebreak {
+        require_tiebreak_type(schema.field(tiebreak_index).data_type())?;
+    }
+    for batch in batches {
+        require_no_role_nulls(view, batch, roles, &indices)?;
+    }
+    Ok(())
 }
 
 /// Resolve the role columns to schema indices, raising on a role that names
