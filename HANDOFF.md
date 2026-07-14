@@ -6,12 +6,12 @@ the rewrite's earlier per-crate build log lives in git history of this file.
 
 ## What this is
 
-We are rewriting the entire engine (30,183 lines of Python under
+We rewrote the entire engine (originally 30,183 lines of Python under
 `federated_query/`) into Rust, as a single Cargo workspace under
-`federated-query/`. The governing technical plan is
+`federated-query/crates/`. The governing technical plan is
 `rewrite-python-to-rust-plan.md`.
 
-Strategy (decided with the user):
+Strategy (decided with the user, unchanged):
 
 - BIG-BANG, not incremental. The Rust engine is a parallel implementation.
   The Python engine stays the working product and the behavioral reference,
@@ -25,50 +25,116 @@ Strategy (decided with the user):
   BEHAVIOR, express it the natural Rust way.
 - Python is FROZEN during the rewrite (stable reference; no new features).
 
-## Where we stand (2026-07-13)
+## Where we stand (2026-07-14)
 
-ALL 13 CRATES ARE BUILT AND THE ENGINE IS COMPLETE END TO END: SQL -> parse ->
+ALL 17 CRATES ARE BUILT AND THE ENGINE IS COMPLETE END TO END: SQL -> parse ->
 bind -> decorrelate -> optimize -> PhysicalPlan -> Steps -> DataFusion
-execution -> Arrow -> Python (pyo3 `fedq.Runtime`). Cross-source federation
-(DuckDB x Postgres) works. 621 workspace tests green. Build-order steps 1-7
-of the plan are done; what remains is Milestone D (the gate) - see NEXT.
+execution -> Arrow. Cross-source federation (DuckDB x Postgres, plus
+ClickHouse/MySQL/Parquet connectors) works. There are three front doors over
+one `fq_runtime::Runtime`: the Python extension (`fedq-py`), the PostgreSQL
+wire server (`fedq-server`), and the `fedq` CLI. Around 979 workspace tests
+green.
 
 Correctness and perf, all measured by the suite runners (never ad hoc):
 
-- TPC-H: 22/22 correct, single-source AND federated pg-dims (sf0.01); SF1
-  22/22 via perf_compare, zero planning-budget kills, warm plan 1-11ms.
-- TPC-DS federated pg-dims (`benchmarks/tpcds/run_federated_rust.py`):
-  98 ok | 0 wrong | 1 error at ALL of sf0.1 / sf1 / sf10. The one error is
-  q14, an upstream polyglot-sql parser bug (trailing UNION ALL attached to a
-  scalar-subquery operand), surfaced loudly.
-- TPC-DS timings vs the cached pure-DuckDB baseline (warm, --warm-runs 1):
-  sf0.1 total 1.28x geomean 1.26x; sf1 total 1.02x geomean 0.97x; sf10
-  total 0.89x geomean 1.21x (ours 60.6s vs DuckDB 68.3s). The Rust engine
-  BEATS local DuckDB on sf10 totals. (The Python engine's final sf10 board
-  was 1.00x total / 1.61x geomean.)
+- TPC-DS federated, `benchmarks/tpcds/run_federated_rust.py`, BOTH placements
+  at ALL scales:
+  - pg-dims (dimensions on Postgres, facts on DuckDB): 99 ok | 0 wrong |
+    0 error at sf0.1 / sf1 / sf10.
+  - adversarial (sales facts split from their matching returns facts,
+    dimensions alternated): 99 ok | 0 wrong | 0 error at sf0.1 / sf1 / sf10.
+- TPC-DS timings vs the cached pure-DuckDB baseline (warm, `--warm-runs 1`):
+  - pg-dims: sf0.1 total 1.42x geomean 1.35x; sf1 total 1.04x geomean 1.00x;
+    sf10 total 0.91x geomean 1.25x (ours 65.1s vs DuckDB 71.4s). The Rust
+    engine BEATS local DuckDB on sf10 totals.
+  - adversarial: sf0.1 total 1.65x geomean 1.59x; sf1 total 2.61x geomean
+    1.79x; sf10 total 3.34x geomean 2.90x (ours 238.6s vs DuckDB 71.4s). The
+    adversarial split is the harder, still-open perf tail (see PERF ROUND).
+- TPC-H: 22/22 correct, single-source AND federated pg-dims; via the runner /
+  `perf_compare`, zero planning-budget kills, warm plan single-digit ms.
+- E2E SQL corpus: `tests/e2e_pushdown` runs against the Rust engine (temp YAML
+  per env, `pa.Table` results, pushed SQL re-parsed from the textual EXPLAIN);
+  416 pass, 0 fail.
+
+Feature surface built on top of the core engine:
+
+- MATERIALIZED VIEWS (fq-accel + fq-runtime): `CREATE / REFRESH / DROP
+  MATERIALIZED VIEW`, `SHOW MATERIALIZED VIEWS`. A view is a user-managed
+  cached result persisted as framed Arrow IPC chunks under `<config>.mv/`
+  through the `object_store` abstraction; the `materialized_views` row (in the
+  stats SQLite) is the source of truth for the chunk list. Freshness is
+  user-controlled: nothing on the query path checks the sources. REFRESH has
+  three mechanics: WHOLE re-pull, DELTA APPEND past a monotonic change key's
+  watermark (`change_keys` config), and PRIMARY-KEY MERGE (diff a fresh whole
+  pull by key, rewrite only changed/deleted chunks). A per-base-table source
+  token lets REFRESH skip the pull entirely when nothing changed (no-op skip).
+  AUTOMATIC SUBSTITUTION (`fq-runtime` substitute.rs) rewrites a query plan to
+  read from a view when it matches structurally, clears a name guard, and
+  clears a cost gate (estimated recompute cost must strictly exceed the read
+  cost); it is off-switchable per session (`accelerator.enable_substitution`,
+  read fresh per query) and tracks per-view benefit counters surfaced by SHOW
+  MATERIALIZED VIEWS. Design: `accelerator-plan.md`, `crates/fq-accel/README.md`.
+- SETTINGS (fq-runtime settings.rs): one registry of 33 tunables (optimizer,
+  cost, exec, executor, env toggles, accelerator, server) exposed as `SHOW
+  SETTINGS`, `SHOW SETTING <name>`, `SET <name> = <value>`, `RESET <name>`,
+  `RESET ALL`. SET/RESET mutate the live session; values are type-checked and a
+  bad value or unknown name raises (with a nearest-name suggestion).
+- EVENT ANALYTICS (fq-events + fq-runtime): an EVENT VIEW is a materialized
+  view whose columns are mapped onto event roles - entity id, timestamp, event
+  name, optional TIEBREAK; every other column is a property - and whose chunks
+  are globally sorted by (entity, timestamp[, tiebreak]) with no NULL role.
+  `CREATE / REFRESH / DROP EVENT VIEW`, then the analysis statements FUNNEL
+  (ordered step conversion within a window), SEGMENT (per-bucket event and
+  distinct-entity measures), and PATHS (top event sequences, optional STARTING
+  AT anchor). Two DERIVED sidecars rebuild with each generation over one scan:
+  a SEGMENT pre-aggregate (per-bucket counts at day/week/month grain) that
+  answers SEGMENT BY DAY/WEEK/MONTH from disk - roughly 1000x on the measured
+  suite (SEGMENT ~2000ms of DuckDB collapses to sub-millisecond) - and gated
+  per-event-name entity ROARING BITMAPS that give FUNNEL its exact step-1 count
+  and shrink the step-1-and-step-2 scan set. Both are non-authoritative: a
+  missing/mismatched sidecar falls back to the identical scan answer. Suite:
+  `benchmarks/events/run_events.py` (small ~1M events, medium ~100M).
+  Design: `events-plan.md`, `crates/fq-events/README.md`.
+- fedq-server (`crates/fedq-server`): a PostgreSQL wire-protocol server
+  (pgwire) over the runtime - simple and EXTENDED query protocol
+  (Parse/Bind/Describe/Execute), SCRAM auth, query cancellation. One `Runtime`
+  per connection on its own OS thread (the fq-exec data plane uses thread-local
+  caches, so a query must run single-threaded); sources open READ-ONLY.
+- fedq CLI (`crates/fedq`): clap-based. `fedq --config <yaml> --command
+  "<sql>"` (or `--file`) runs one statement and prints table/csv/json; with
+  neither, it opens an interactive REPL.
+- CONNECTORS (fq-connectors catalog/stats tier + fq-exec data plane): DuckDB,
+  Postgres, ClickHouse live-tested; MySQL full-stack but not live-verified;
+  Parquet is footer-only (schema, exact row counts, row-group stats), a
+  read-only file source. Iceberg is ABSENT: it needs a DataFusion-54 surface
+  the pinned crate does not expose (upstream gap). Any other source kind is
+  rejected loudly at registration.
 
 ## Branch, build, gates
 
-- Branch: `rewrite-python-to-rust` (in this repo; `fedqrs` has a matching
-  branch but has not been merged in yet).
+- Branch: `rewrite-python-to-rust` (this repo). The imported fedqrs engine now
+  lives in-tree as `fq-exec`; the standalone `/workspace/fedqrs` remnants are a
+  teardown item.
 - Toolchain: cargo 1.96.1 at `$HOME/.cargo/bin` (HOME=/tmp). Build env:
   `export CARGO_TARGET_DIR=/workspace/federated-query/target`.
 - Before every commit: `cargo fmt --all && cargo clippy --workspace
   --all-targets && cargo test --workspace`. The full gate after a one-line
-  bottom-crate change is ~7 SECONDS wall (was 30+ min): the dev profile
-  strips dependency debuginfo (`debug = "line-tables-only"` for workspace
-  code, `debug = false` for deps - linking, not compiling, was the cost) and
-  each crate links ONE integration-test binary (`tests/it/main.rs`, suites
-  as modules). Keep it that way: a new test file goes into the crate's
-  `tests/it/`, never as a new top-level `tests/*.rs` target.
+  bottom-crate change is ~7 SECONDS wall: the dev profile strips dependency
+  debuginfo (`debug = "line-tables-only"` for workspace code, `debug = false`
+  for deps - linking, not compiling, was the cost) and each crate links ONE
+  integration-test binary (`tests/it/main.rs`, suites as modules). Keep it that
+  way: a new test file goes into the crate's `tests/it/`, never as a new
+  top-level `tests/*.rs` target.
 - Lint: `warnings = "deny"` escalates clippy pedantic; curated allows in
   `Cargo.toml [workspace.lints.clippy]`. `make fq-lint` runs the house rules
   (FQ-BUNDLED, FQ-PMCOMMENT, ...). The semantic comment gate
-  (scripts/comment-gate) blocks commits whose comments describe project
-  history instead of the code.
+  (`scripts/comment-gate`) blocks commits whose comments describe project
+  history instead of the code (a haiku judge over staged comment blocks); it
+  installs itself on session start.
 - DuckDB is NEVER compiled in cargo: `make duckdb-lib` fetches the official
   prebuilt library pinned by Cargo.lock into `.duckdb-lib/current`;
-  `.cargo/config.toml` wires lib dir + rpath.
+  `.cargo/config.toml` wires lib dir + rpath. fq-lint FQ-BUNDLED fails on any
+  reintroduction of the `bundled` feature.
 - Planning is O(metadata), enforced: `optimizer.planning_budget_ms` (default
   100) is a hard kill with a per-stage report. No off switch.
 - Perf numbers come ONLY from the suite runners: `benchmarks/perf_compare/`
@@ -76,7 +142,7 @@ Correctness and perf, all measured by the suite runners (never ad hoc):
 - Test env: Postgres 17.4 on :5432 (binaries `postgres-17`, trust auth,
   started via `scripts/run-postgres.sh`). Python: `/workspace/venv-fedq`.
 
-## PERF ROUND 2026-07-13: outlier hunt on the TPC-DS boards
+## PERF ROUND (measured on the TPC-DS boards)
 
 Method: rank warm ratio AND absolute excess vs the cached DuckDB baseline at
 SF10 (the target scale), profile with `FEDQRS_PROFILE=1` through the suite
@@ -84,65 +150,69 @@ runner (`--only N,M`), read plans via `Runtime::execute("EXPLAIN <sql>")`.
 
 Landed fixes (each with unit tests pinning the behavior):
 
-1. CTE PRODUCER SHARING (fq-plan + fq-physical). `PhysicalCteScan.producer`
-   was a `Box`; `plan_cte_ref` deep-copied the lowered producer into every
-   reference, so step-building's pointer-keyed cte_bindings cache never hit
-   and the CTE body re-executed once per consumer (q04 ran its 3-channel
-   union aggregate SIX times). Now the planner registry holds one
-   `Arc<PhysicalPlan>` per CTE and every CteScan clones the pointer: the
-   body's fragments are built and executed once. q04 15227ms -> 3802ms,
-   q23 7589 -> 4420, q11 3132 -> 2014, q47 2549 -> 1085, q57/q59/q74/q75/q02
-   all dropped proportionally.
+1. CTE PRODUCER SHARING (fq-plan + fq-physical). A CTE producer is now one
+   `Arc<PhysicalPlan>` in the planner registry and every `PhysicalCteScan`
+   clones the pointer, so step-building's pointer-keyed cte_bindings cache hits
+   and the CTE body's fragments are built and executed ONCE (previously the
+   producer was deep-copied into each reference, re-executing the body per
+   consumer; q04's 3-channel union aggregate ran six times). q04 15227ms ->
+   3802ms, q23 7589 -> 4420, q11 3132 -> 2014, q47 2549 -> 1085, and the other
+   multi-consumer CTE queries dropped proportionally.
 2. FLAG-UNION PASSTHROUGH NARROWING (fq-optimize ProjectionPushdown).
-   Decorrelation's boolean-flag unions project EVERY input column as explicit
-   qualified passthroughs (the no-star rule); the pruner's GLOBAL
-   required-column collection treated each entry as a requirement, so one
-   flag union pinned every column of every relation and NO scan pruned
-   (q45 pulled all 32 columns of customer x customer_address, twice; Python
-   never hit this because its passthrough was a literal `*`, invisible to
-   collection). Narrowable unions (non-distinct, branches are wrapper chains
-   over plain projections, no positional consumer above) now resolve
-   passthroughs at the union: collection skips plain-column entries, pruning
-   keeps a position only when computed or name-referenced above, kept
-   columns re-enter the required set for the branch subtrees. Positional
-   consumers (set ops, column_names renames, outer unions) and DISTINCT
-   shapes keep every entry. q45 2000ms -> 482ms. NOTE: predicate pushdown
-   runs before projection pushdown and distributes filters INTO union
-   branches, so the branch shape is Filter-over-Projection - the narrowing
-   sees through row-preserving wrappers (Filter/Sort/Limit/GroupedLimit/
-   SingleRowGuard).
+   Decorrelation's boolean-flag unions project every input column as explicit
+   qualified passthroughs (the no-star rule); the pruner's global
+   required-column collection had treated each entry as a hard requirement, so
+   one flag union pinned every column of every relation and no scan pruned.
+   Narrowable unions (non-distinct, branches are wrapper chains over plain
+   projections, no positional consumer above) now resolve passthroughs at the
+   union: collection skips plain-column entries, pruning keeps a position only
+   when computed or name-referenced above. Positional consumers (set ops,
+   column_names renames, outer unions) and DISTINCT shapes keep every entry.
+   q45 2000ms -> 482ms. (Predicate pushdown runs first and distributes filters
+   into union branches, so the narrowing sees through row-preserving wrappers:
+   Filter/Sort/Limit/GroupedLimit/SingleRowGuard.)
 
-Remaining SF10 tail (pg-dims geomean 1.25x; every item root-caused to the
-exact blocking gate; a fix attempt for q06's estimate REGRESSED and was
-reverted, so these are measured diagnoses, not guesses):
+Remaining SF10 pg-dims tail (geomean 1.25x; every item root-caused to the exact
+blocking gate - these are MEASURED diagnoses, not guesses; a fix attempt for
+q06's estimate REGRESSED and was reverted):
 
 - q06-class (q06 6.9x): the date keys ARE derived (the guard-driven
   d_month_seq injection reduces date_dim to ~31 rows), but store_sales still
-  reads full 28.8M because steps/reduction.rs reduction_filters gates
+  reads full 28.8M because `steps/reduction.rs` reduction_filters gates
   (build_donates_whole_domain / useless_key_reduction) price date_dim at its
   STATIC 73k rows - the dynamic injection is not credited. Crediting
   post-injection cardinality (chained-NDV reduction) would cut store_sales to
   ~480k; it is a structural change to the injection-winner pre-pass with
   cross-query regression risk.
 - q95: ws_wh is a duck-only CTE referenced twice, but
-  SingleSourcePushdown::try_build has no CTE producer scope, so
+  `SingleSourcePushdown::try_build` has no CTE producer scope, so
   absorb_cte_ref_base declines and the 74.8M-row self-join is pulled. Fix =
   thread visible CTE definitions into pushdown and inline, so the duck-only
   subtree pushes as q16's proven inline-EXISTS shape; semi-join/DISTINCT
   semantics need care.
 - q59/q02: the week-range filter arrives via a JOIN on d_week_seq;
-  CTEUnionFilterPushdown::record_consumer only accepts a Filter parent, so
+  `CTEUnionFilterPushdown::record_consumer` only accepts a Filter parent, so
   the shared CTE body aggregates all weeks. Deriving the week set needs a
   semi-join reduction across the materialized CTE boundary.
 - q04/q11/q23 residual: coordinator aggregate; the dim-ship collapse gate
   cannot yet be extended soundly (NDV-independence mis-estimates, see
-  dim-shipping-open-problems.md).
-- q39 (4.1x): NOT a sharing bug - the shipped island executes exactly once
-  (profiled); the cost is inherent (ship 3 dims + aggregate 26.5M inventory
-  + self-join).
-- q15: the (zip OR state OR cs_sales_price) disjunction spans BOTH sources;
-  pushing it into the pg query would drop rows qualifying only via the duck
-  fact column. The coordinator filter is CORRECT; there is nothing to push.
+  `dim-shipping-open-problems.md`).
+- q39 (4.1x) is NOT a sharing bug: the shipped island executes exactly once
+  (profiled); the cost is inherent (ship 3 dims + aggregate 26.5M inventory +
+  self-join). q15 is NOT a bug: the (zip OR state OR cs_sales_price)
+  disjunction spans BOTH sources, so the coordinator filter is CORRECT and
+  there is nothing to push. Do not chase these two.
+
+Events findings (from `benchmarks/events`):
+
+- SEGMENT is a decisive win (the pre-aggregate sidecar): sub-millisecond vs
+  DuckDB's seconds at 100M events.
+- FUNNEL and PATHS beat DuckDB when the funnel/path is common (funnel common
+  0.18x, paths 0.30-0.35x at 100M), but a SELECTIVE funnel is slower (3.55x at
+  100M) because the funnel/paths kernels currently load ALL chunks into memory
+  before scanning - peak RSS ~29GB at 100M events. A SELECTIVE-FUNNEL ROW-INDEX
+  round is IN FLIGHT in a worktree agent (`.claude/worktrees/`); streaming the
+  kernels (never resident) is still open.
 
 ## How to run everything
 
@@ -155,143 +225,157 @@ export CARGO_TARGET_DIR=/workspace/federated-query/target
 Python interpreter: `/workspace/venv-fedq/bin/python`.
 
 Build the engine for the benchmark harnesses (release; the benchmark symlinks
-`benchmarks/{tpch,tpcds}/fedq.so` point at `target/release/libfedq_py.so`):
+`benchmarks/{tpch,tpcds,events}/fedq.so` point at
+`target/release/libfedq_py.so`):
 ```
 cargo build --release -p fedq-py
 ```
 
-TPC-DS (ONE runner; see benchmarks/tpcds/README.md for save-refs/generate):
+TPC-DS (ONE runner; see `benchmarks/tpcds/README.md` for save-refs/generate):
 ```
 cd benchmarks/tpcds
 python run_federated_rust.py run --scale-factor 10 --pg-database tpcds_sf10 --warm-runs 1
 ```
-Flags: `--only 4,45`, `--cold-process`. Hard wall budgets kill a run past
-60s (sf0.1/sf1) / 300s (sf10). Reports: `reports/rust-fed-sf<sf>.md`.
-Profiling: prefix `FEDQRS_PROFILE=1` (per-step ms on stderr); the engine also
-honors `FEDQRS_TRACE_SQL=1` (every pushed SQL). Plans:
+Flags: `--only 4,45`, `--cold-process`, and the placement selector for the
+pg-dims vs adversarial split. Hard wall budgets kill a run past 60s
+(sf0.1/sf1) / 300s (sf10). Reports: `reports/rust-fed-sf<sf>.md` and
+`reports/rust-fed-adversarial-sf<sf>.md`. Profiling: prefix `FEDQRS_PROFILE=1`
+(per-step ms on stderr); `FEDQRS_TRACE_SQL=1` prints every pushed SQL. Plans:
 `Runtime::execute("EXPLAIN <sql>")` (qualify table names first - see the
 runner's `_qualify`).
 
-TPC-H: `benchmarks/tpch/run_federated_rust.py` (same shape); data state:
-pg `duckpoc` (sf0.01) / `duckpoc_sf1`, duck files
-`benchmarks/tpch/data/tpch_sf{0.01,1}.duckdb`, parquet
-`benchmarks/tpch/data/parquet_sf1/`.
-TPC-DS data: duck `benchmarks/tpcds/data/tpcds_sf{0.1,1,10}.duckdb`; pg
-databases `tpcds_sf01` / `tpcds_sf1` / `tpcds_sf10`; cached truth+baseline in
-`data/references_sf<sf>.duckdb` (NEVER re-measured by a run).
+TPC-H: `benchmarks/tpch/run_federated_rust.py` (same shape). Events:
+`benchmarks/events/run_events.py` (build the view, then run the analyses vs the
+cached DuckDB baseline). Data locations live in each suite's README.
 
-Cross-engine perf: `benchmarks/perf_compare/compare.py` (the only sanctioned
-cold/warm cross-engine numbers; parquet on the NEW engine reports
-UNSUPPORTED until the parquet connector exists).
+Cross-engine perf: `benchmarks/perf_compare/compare.py` - the only sanctioned
+cold/warm cross-engine numbers.
 
 ## Crate map (all built; per-crate test counts in `cargo test`)
 
 ```
-fq-parse -> fq-plan -> fq-common          fq-emit -> fq-plan
-fq-bind -> fq-plan, fq-catalog            fq-exec -> fq-plan, fq-connectors
-fq-decorrelate -> fq-plan                 fq-runtime -> everything above
-fq-optimize -> fq-plan, fq-catalog, fq-connectors
-fq-physical -> fq-plan, fq-optimize, fq-emit
-fedq-py -> fq-runtime      (fedq CLI: NOT built yet)
+fq-common (leaf)
+fq-plan       -> fq-common
+fq-catalog    -> fq-common
+fq-connectors -> fq-catalog
+fq-parse      -> fq-plan, fq-catalog       fq-emit    -> fq-plan
+fq-bind       -> fq-plan, fq-catalog       fq-accel   -> storage half of MV
+fq-decorrelate-> fq-plan                   fq-events  -> fq-accel
+fq-optimize   -> fq-plan, fq-catalog, fq-connectors
+fq-physical   -> fq-plan, fq-optimize, fq-emit
+fq-exec       -> fq-plan, fq-connectors
+fq-runtime    -> everything above
+fedq-py / fedq-server / fedq  -> fq-runtime
 ```
 
-- fq-common: config (serde-YAML, deny_unknown_fields), errors, tracing,
-  DataType.
-- fq-catalog: Schema/Table/Column, DataSource trait (catalog/statistics tier
-  ONLY - no drivers), StatsCatalog on rusqlite.
-- fq-connectors: DuckDB (metadata-only stats; EXPLAIN "~N rows" estimates)
-  + Postgres (information_schema, pg_stats decode, statless probe, EXPLAIN
-  JSON estimates). NO parquet/clickhouse catalog tier yet.
+- fq-common: config (serde-YAML, `deny_unknown_fields`), errors, tracing,
+  DataType, PlanBudget, the event-statement value types.
+- fq-catalog: Schema/Table/Column, the `DataSource` trait (catalog/statistics
+  tier ONLY - no drivers), StatsCatalog on rusqlite.
+- fq-connectors: DuckDB, Postgres, ClickHouse, MySQL, Parquet catalog/stats
+  connectors implementing `DataSource`. The DATA-PLANE fetch tier lives in
+  fq-exec.
 - fq-plan: Expr/LogicalPlan/PhysicalPlan enums, exhaustive walkers (no `_`
-  arms), typed `schema()`. CTE producers are `Arc`-shared (one allocation
-  per CTE, every CteScan points at it).
+  arms), typed `schema()`. CTE producers are `Arc`-shared.
 - fq-parse: polyglot-sql 0.5.15 -> LogicalPlan; allowlist conversion, star
-  expansion, window functions, comma joins, LIKE. Still raises: WITH
-  RECURSIVE, positioned TRIM, APPLY/ASOF, BETWEEN SYMMETRIC.
+  expansion, window functions, comma joins, LIKE, WITH RECURSIVE, PIVOT. Also
+  classifies the non-query statement forms (MV DDL, settings, event DDL +
+  analyses) before the query pipeline.
 - fq-bind: scope chain + ONE resolver (invalid query MUST raise BindError),
   aggregate hoists for HAVING/ORDER BY, star read-set expansion.
 - fq-decorrelate: the always-decorrelate pass (EXISTS/IN/scalar/quantified,
-  NULL-aware, disjunctive domain-union + flag-union, Neumann-Kemper
-  dependent join, lateral fallback); synthetic columns carry qualifier AND
-  DataType; post-pass asserts no subquery survives + validate_scope.
-- fq-optimize: CostModel (honest unknowns, learned overlay, source
-  estimates), fixpoint driver, rules: CTEUnionFilter, Predicate, SemiJoin,
-  EagerAgg, JoinOrdering (Selinger DP + GOO + locality), Projection
+  NULL-aware, disjunctive domain-union + flag-union, Neumann-Kemper dependent
+  join, lateral fallback); synthetic columns carry qualifier AND DataType;
+  post-pass asserts no subquery survives + validate_scope.
+- fq-optimize: CostModel (honest unknowns, learned overlay, source estimates),
+  StatisticsCollector, fixpoint driver, rules: CTEUnionFilter, Predicate,
+  SemiJoin, EagerAgg, JoinOrdering (Selinger DP + GOO + locality), Projection
   (incl. flag-union narrowing), Aggregate, OrderBy, Limit.
 - fq-emit: canonical Postgres-form SQL text + polyglot transpile boundary
   (`to_source_sql`).
 - fq-physical: PhysicalPlanner (lowering, join algorithm/orientation,
-  dynamic-filter marking), SingleSourcePushdown (subtree -> one
-  RemoteQuery), DimShipping (9 gates), step building (PhysicalPlan ->
-  Vec<Step> + fragments, CSE, reduction orientation, observations).
-- fq-exec: the imported fedqrs DataFusion engine, de-pyo3'd (fragment
-  fusion, spill, reductions, ship, prefetch pools); bridge keeps core::ir
-  in-process (no JSON).
-- fq-runtime: config-driven Runtime, full pipeline, textual EXPLAIN,
+  dynamic-filter marking), SingleSourcePushdown (subtree -> one RemoteQuery),
+  DimShipping (9 gates), step building (PhysicalPlan -> Vec<Step> + fragments,
+  CSE, reduction orientation, observations).
+- fq-exec: the imported fedqrs DataFusion engine, de-pyo3'd (fragment fusion,
+  spill, reductions, ship, prefetch pools, ctid-parallel reads); the step
+  bridge runs the whole pipeline end to end in-process (no JSON).
+- fq-runtime: config-driven Runtime, full pipeline, textual + document EXPLAIN,
   session-shared StatisticsCollector, learned-stats persistence
-  (`<config>.stats.sqlite`), StageLog + planning-budget kill.
-- fedq-py: pyo3 cdylib; `fedq.Runtime(config_path).execute(sql)` -> Arrow
-  C stream (GIL released).
+  (`<config>.stats.sqlite`), StageLog + planning-budget kill, and the
+  statement dispatch for MV DDL / settings / event forms / substitution.
+- fq-accel: the materialized-view store (ChunkStore over object_store,
+  ViewCatalog, the create/refresh/drop lifecycle and the three refresh
+  mechanics).
+- fq-events: event-view contract, EventStream cursor, the FUNNEL/SEGMENT/PATHS
+  kernels, and the derived sidecars.
+- fedq-py: pyo3 cdylib; `fedq.Runtime(config_path).execute(sql)` -> Arrow C
+  stream (GIL released).
+- fedq-server: pgwire server (per-connection Runtime, extended protocol, SCRAM,
+  cancellation).
+- fedq: clap CLI (one-shot + REPL, table/csv/json output).
 
-## NEXT: Milestone D (the gate), in rough order
+## NEXT
 
-1. E2E suites -> Rust engine: STARTED. tests/rust_runtime.py drives fedq
-   (temp YAML per env, pa.Table results, pushed SQL re-parsed from textual
-   EXPLAIN); e2e_pushdown conftest/helpers rewired; row-based suites green
-   (44 tests). BLOCKER for the ~31 EXPLAIN-shape suites: the textual EXPLAIN
-   renders Scan-node pushdowns as tags (+filter/+agg) with NO rendered SQL -
-   fq-runtime explain.rs must emit the effective pushed SQL for Scans.
-   Engine gaps the run surfaced (each errors loudly): parser lacks named
-   WINDOW, star EXCEPT/REPLACE/RENAME, WITHIN GROUP + MEDIAN + MODE, PIVOT,
-   FETCH FIRST, QUALIFY; star-over-VALUES is VALID on the Rust engine
-   (test_star_over_values_fails_fast pins a Python-only limitation -
-   product decision pending). FIXED since: user LATERAL joins (parse ->
-   LateralJoin, bind with left scope, decorrelation flattens via the
-   dependent shapes; PhysicalLateralJoin has NO exec path, so a
-   non-flattenable lateral raises) and the flag-union duplicate-alias
-   schema error (passthrough aliases uniquify). Python-internal suites
-   (e2e_decorrelation, plan-object assertions) retire with the Python
-   package, not converted.
-2. Adversarial placement: the tpcds runner only implements pg-dims; the gate
-   needs BOTH placements at sf0.1/sf1/sf10. Extend the ONE runner.
-3. q14: upstream polyglot-sql fix or pre-parse normalization -> 99|0|0.
-4. Parquet connector (catalog/stats tier in fq-connectors; exec plane
-   already reads parquet). Unblocks perf_compare parquet columns.
-5. EXPLAIN document builder (costed, JSON shape the e2e suites assert on).
-6. fedq CLI binary (plan 3.12).
-7. Perf tail (see PERF ROUND above) - not gate-blocking; totals already beat
-   DuckDB at sf10.
-8. Teardown (only after 1-7): delete `federated_query/` and
-   `/workspace/fedqrs` remnants, move `lint/` rules into fq-lint, rewrite
-   HANDOFF/architecture docs against the crates.
+Core engine and the feature surface are complete and gated; what remains is a
+short punch list plus the teardown, in rough order:
 
-FINAL GATE (unchanged): TPC-DS 99|0|0 at SF0.1/SF1/SF10 (pg-dims AND
-adversarial) + TPC-H 22/22 + cold/warm columns, vs pure-DuckDB truth, then
-DELETE `federated_query/`.
+1. Selective-funnel row-index round (IN FLIGHT in a worktree agent), then the
+   larger streaming-kernel work so FUNNEL/PATHS never load all chunks resident
+   (29GB peak at 100M is the open number).
+2. Accelerator Phase D: S3 via `object_store` config + `max_bytes`
+   LRU-by-benefit eviction + tombstone sweeper (see `accelerator-plan.md`
+   section 7).
+3. A formal `perf_compare` gate run across all sources (parquet columns now
+   have a connector, so they no longer report UNSUPPORTED).
+4. MySQL LIVE verification (the connector is full-stack but unverified against
+   a running server).
+5. Adversarial SF10 perf tail (geomean 2.90x) - the harder split; not
+   gate-blocking, pg-dims totals already beat DuckDB.
+6. q14 (see UPSTREAM WATCH) is currently repaired in fq-parse; when a polyglot
+   release nests trailing set operations correctly, delete the repair.
+7. Python teardown: delete `federated_query/` and the `/workspace/fedqrs`
+   remnants, move `lint/` rules fully into fq-lint. This awaits the
+   maintainer's explicit call (no delete without approval).
+
+## UPSTREAM WATCH
+
+The q14 set-op repair in fq-parse `convert.rs` (SwallowedSetOp) works around a
+polyglot-sql 0.5.15 mis-nesting (a trailing UNION ALL attached to a
+scalar-subquery operand). When a polyglot release nests trailing set operations
+correctly, delete the repair block and its tests. See commit `26d3d9f`.
 
 ## Commit log (rewrite, newest first; earlier log in git history of this file)
 
 ```
-4c19228 TPC-DS boards after union narrowing: sf10 total 0.89x, sf1 geomean 0.97x
-dcdf73e ProjectionPushdown: narrow flag-union passthrough projections
-4ec6942 TPC-DS boards after CTE producer sharing: sf10 total 0.91x (beats DuckDB)
-1816716 CTE producer sharing: one Arc'd body per CTE, executed once per query
-5d1720e Build: strip dependency debuginfo + one integration-test binary per crate
-7017f51 TPC-DS boards refreshed: sf1 98|0|1 1.21x, sf10 98|0|1 1.22x geomean 1.31x
-27f8f39 TPC-DS: one self-contained runner, everything else deleted
-57700b4 TPC-DS: deterministic run guards - wall-budget kill + oracle-rerun refusal
-d094dd6 TPC-DS suite: one runner, cached oracle baseline, honest ratios
-cd35ec8 Rust rewrite: TPC-DS federated 98|0|1 at sf0.1 - ROLLUP, GROUPING-window split
-f35910f Rust rewrite: TPC-DS federated 66|0|33 -> 92|0|7 at sf0.1 (zero wrong answers)
-9483474 fq-parse comma joins + LIKE - TPC-H 3/22 -> 18/22 correct
-5cd291a fedq-py MC3b - pyo3 bindings; Python drives the Rust engine
-14cf5be fq-runtime MC3a - config-driven execute(sql), cross-source federation works
-ea297bb fq-exec MC2 - Step bridge + first end-to-end Rust query execution
-9bdba53 fq-exec MC1 - import the fedqrs execution engine (de-pyo3'd)
-(fq-physical M0-M4d, fq-emit, fq-optimize M1-M4, fq-decorrelate, fq-bind,
- fq-parse, connectors, scaffold: see git log)
+df93802 Event sidecars: segment pre-aggregates (decisive win) + gated entity bitmaps
+38fe691 Substitution order guard walks the whole matched subtree; accelerator tutorial
+3baa0bf Accelerator Phase C: automatic substitution, cost gate, benefit tracking
+f2e1ce4 Events benchmark suite + user tutorial
+4f69e1a PATHS analysis + TIEBREAK role: deterministic event sequences
+42cba35 Event analytics extension: EVENT VIEWs, FUNNEL and SEGMENT statements (fq-events)
+7e8bb21 Settings surface: one registry, SHOW SETTINGS, SET/RESET on live sessions
+cac1fad Accelerator Phase B: change-key delta refresh, PK merge, source-token no-op skips
+e66df52 HANDOFF: perf-tail diagnoses corrected from the measured round
+26d3d9f Document the polyglot 0.5.15 set-op mis-nesting the q14 repair undoes
+ee2d8e9 Materialized views (accelerator Phase A) + native parquet connector, integrated
+617e90a ClickHouse + MySQL connectors: full stack (config, catalog/stats, dialect, Arrow data plane)
+4be8e81 JoinOrdering skips edgeless regions; scan probes projection-independent: full sweep 99|0|0
+e5e9808 fedq CLI: clap-based one-shot + REPL over the Rust runtime
+c908705 Canonical float cast renders DOUBLE PRECISION: adversarial TPC-DS 99|0|0 at all scales
+14a5165 accelerator-plan.md rewritten: user-controlled freshness, Arrow IPC chunks, no LSM engine
+d557a1d fedq-server README: run, options, auth, behavior limits
+6e29ae3 fedq-server: SCRAM auth + cancellation; test fixtures stop sharing one duckdb file
+c81b768 q14 repaired + adversarial placement runner: TPC-DS pg-dims 99|0|0
+78f7857 fedq-server: extended query protocol (Parse/Bind/Describe/Execute)
+9e05a3e fedq-server: PostgreSQL wire-protocol server over the engine (pgwire)
+6437996 WITH RECURSIVE + PIVOT: the last e2e parser gaps close, e2e_pushdown 0 failed
+0e32510 accelerator-plan.md: fragment-cache design (keying, store, invalidation, phases)
+252b159 Dim-ship gates in optimizer config; cross-source CTE tests as Rust e2e; orientation re-pinned
+c8ae969 E2E suites: SEMI/ANTI marker classification, EXPLAIN-based dynamic-filter pins, fixture fixes
 ```
 
-UPSTREAM WATCH: the q14 set-op repair in fq-parse convert.rs (SwallowedSetOp)
-works around a polyglot-sql 0.5.15 mis-nesting; when a polyglot release nests
-trailing set operations correctly, delete the repair block and its tests.
+Older commits (fq-physical M0-M4d, fq-emit, fq-optimize M1-M4, fq-decorrelate,
+fq-bind, fq-parse, connectors, the TPC-DS climb 66|0|33 -> 99|0|0, the build/
+test-binary speedups, and the initial scaffold) are in this file's git history
+and the full `git log`.
