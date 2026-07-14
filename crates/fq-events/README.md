@@ -77,6 +77,10 @@ REFRESH MATERIALIZED VIEW recent_orders
 DROP MATERIALIZED VIEW recent_orders
 ```
 
+A registered materialized view also serves matching queries you did NOT rewrite:
+the accelerator reads its stored chunks in place of recomputing a matching
+subtree. See `crates/fq-accel/README.md` for that substitution flow end to end.
+
 REFRESH decides how to bring the view forward, in this order, and NAMES the
 choice in its status row:
 

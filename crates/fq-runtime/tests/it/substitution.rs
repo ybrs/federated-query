@@ -313,6 +313,68 @@ fn the_cost_gate_declines_a_trivial_passthrough() {
 }
 
 #[test]
+fn an_order_by_limit_view_declines_to_substitute() {
+    // An ORDER BY ... LIMIT view collapses rows (5 base -> 3 stored), so the cost
+    // gate would clear. It must still decline: after optimization the whole query
+    // is rooted in a Projection over Limit over a Scan carrying the folded ORDER
+    // BY / LIMIT, so ordering semantics live INSIDE the matched subtree, not at
+    // its root. A chunk read is an unordered set, so serving the view would drop
+    // the sort. The guard must walk the whole subtree and decline.
+    let sandbox = Sandbox::new("orderlimit");
+    let runtime = sandbox.runtime();
+    let ds = &sandbox.datasource;
+    let definition = format!(
+        "SELECT r_regionkey, r_name FROM {ds}.main.region ORDER BY r_regionkey DESC LIMIT 3"
+    );
+    runtime
+        .execute(&format!(
+            "CREATE MATERIALIZED VIEW top_regions AS {definition}"
+        ))
+        .expect("create");
+
+    // The structural pin: the ordered/limited shape does NOT substitute. The cold
+    // plan shows the Limit and the folded ORDER BY the recompute preserves.
+    let plan = explain_lines(&runtime, &definition);
+    assert!(
+        !substitutes(&plan, "top_regions"),
+        "an ORDER BY + LIMIT view must not substitute; plan: {plan:?}"
+    );
+    assert!(
+        plan.iter().any(|line| line.contains("Limit")),
+        "expected the cold plan to keep the Limit; plan: {plan:?}"
+    );
+    assert!(
+        plan.iter()
+            .any(|line| line.contains(&format!("Scan [{ds}]"))),
+        "expected a source scan when declined; plan: {plan:?}"
+    );
+
+    // The answer is ordered, so the identity contract includes ORDER: the served
+    // rows equal the recompute rows position by position, keys descending.
+    let (_, on_rows) = runtime.execute(&definition).expect("substitution on");
+    runtime
+        .execute("SET accelerator.enable_substitution = false")
+        .expect("disable");
+    assert!(!substitutes(
+        &explain_lines(&runtime, &definition),
+        "top_regions"
+    ));
+    let (_, off_rows) = runtime.execute(&definition).expect("substitution off");
+
+    let on_ordered = int_string_rows(&on_rows);
+    let off_ordered = int_string_rows(&off_rows);
+    assert_eq!(on_ordered, off_ordered);
+    assert_eq!(
+        on_ordered,
+        vec![
+            (4, "MIDDLE EAST".to_string()),
+            (3, "EUROPE".to_string()),
+            (2, "ASIA".to_string()),
+        ]
+    );
+}
+
+#[test]
 fn the_kill_switch_toggles_substitution_live() {
     let sandbox = Sandbox::new("killswitch");
     let runtime = sandbox.runtime();

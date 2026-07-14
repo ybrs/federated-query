@@ -38,6 +38,11 @@
 //! GATES. Substitution fires only when all hold:
 //! - the kill switch is off (`accelerator.enable_substitution`, read fresh per
 //!   plan, so `SET ... = false` disables it live);
+//! - the matched subtree imposes no ordering or row selection ANYWHERE within
+//!   it (no Sort, LIMIT, or scan with a folded ORDER BY/LIMIT at any depth): a
+//!   chunk read is an unordered set, so a subtree that fixes order would lose it
+//!   when served. An ordering the query applies ABOVE the match is unaffected;
+
 //! - the output column NAMES of the matched subtree equal the view's stored
 //!   columns in order (a belt-and-suspenders correctness guard: the replacement
 //!   must report the exact names the parent resolves against);
@@ -169,12 +174,13 @@ fn rewrite(
     applied: &mut Vec<AppliedSubstitution>,
 ) -> Result<LogicalPlan, RuntimeError> {
     // A substituted scan reads the view's chunks as a SET (chunk read order is
-    // not the definition's row order across chunks), so a subtree whose OWN root
-    // fixes output order or row selection - a Sort, a LIMIT, or a scan carrying a
-    // folded ORDER BY/LIMIT - is never substituted here; its ordering would be
-    // lost. An ordering the query applies OUTSIDE the matched subtree still holds
-    // (it re-sorts the substituted scan). This keeps substitution set-equivalent,
-    // so the identity contract holds for every query, not just single-row ones.
+    // not the definition's row order across chunks), so a subtree that fixes
+    // output order or row selection ANYWHERE within it - a Sort, a LIMIT, or a
+    // scan carrying a folded ORDER BY/LIMIT, at the root or nested under a
+    // Projection/Limit - is never substituted here; its ordering would be lost.
+    // An ordering the query applies OUTSIDE the matched subtree still holds (it
+    // re-sorts the substituted scan). This keeps substitution set-equivalent, so
+    // the identity contract holds for every query, not just single-row ones.
     if !order_sensitive(&node) {
         if let Some(result) = try_match(&node, candidates, accel_name, cost_model, applied)? {
             return Ok(result);
@@ -214,13 +220,31 @@ fn try_match(
     Ok(None)
 }
 
-/// Whether a subtree's OWN root fixes output order or row selection that a
-/// chunk read (an unordered set scan) would not reproduce: a Sort or LIMIT
-/// wrapper, or a scan with a folded ORDER BY / LIMIT. Such a subtree is not
-/// substituted (its ordering lives in the definition, not recoverable from the
-/// chunks); an ordering the query applies ABOVE the matched subtree is
-/// unaffected. Exhaustive: a new order-imposing node forces a decision here.
+/// Whether a subtree fixes output order or row selection ANYWHERE within it -
+/// order/limit semantics a chunk read (an unordered set scan) would not
+/// reproduce: a Sort or LIMIT node, or a scan with a folded ORDER BY / LIMIT,
+/// at the subtree root OR nested below it (optimization roots an
+/// `ORDER BY ... LIMIT n` query in a Projection over Limit over Scan, so the
+/// root alone is not enough). Such a subtree is not substituted - its ordering
+/// lives in the definition and is not recoverable from the chunks; an ordering
+/// the query applies ABOVE the matched subtree is unaffected. The per-node test
+/// is exhaustive: a new order-imposing node forces a decision here.
 fn order_sensitive(node: &LogicalPlan) -> bool {
+    if node_fixes_order(node) {
+        return true;
+    }
+    for child in node.children() {
+        if order_sensitive(child) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a single node imposes output order or row selection: a Sort, a LIMIT
+/// (plain or grouped), or a scan carrying a folded ORDER BY / LIMIT. Exhaustive:
+/// a new order-imposing node forces a decision here.
+fn node_fixes_order(node: &LogicalPlan) -> bool {
     match node {
         LogicalPlan::Sort(_) | LogicalPlan::Limit(_) | LogicalPlan::GroupedLimit(_) => true,
         LogicalPlan::Scan(scan) => scan.order_by_keys.is_some() || scan.limit.is_some(),
