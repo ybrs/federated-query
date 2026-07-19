@@ -3,11 +3,11 @@ name = "fq-physical"
 version = "0.1.0"
 edition.workspace = true
 
-# fq-physical: optimized LogicalPlan -> PhysicalPlan. Ports
-# optimizer/physical_planner.py + single_source_pushdown.py + dim_shipping.py.
-# The rust_ir.py step-building (PhysicalPlan -> executable steps) is DEFERRED to
-# the fq-exec pairing (milestone C), since the Step type lives with the engine.
-# fq-physical composes fq-emit for all remote-query SQL rendering.
+# fq-physical: optimized LogicalPlan -> PhysicalPlan (lowering, join
+# algorithm/orientation), single-source pushdown, dim shipping, and step
+# building (PhysicalPlan -> executable steps + fragments, CSE, reduction
+# orientation). fq-physical composes fq-emit for all remote-query SQL
+# rendering.
 
 [dependencies]
 fq-common = { path = "../fq-common" }

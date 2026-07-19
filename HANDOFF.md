@@ -122,10 +122,11 @@ Feature surface built on top of the core engine:
   --all-targets && cargo test --workspace`. The full gate after a one-line
   bottom-crate change is ~7 SECONDS wall: the dev profile strips dependency
   debuginfo (`debug = "line-tables-only"` for workspace code, `debug = false`
-  for deps - linking, not compiling, was the cost) and each crate links ONE
-  integration-test binary (`tests/it/main.rs`, suites as modules). Keep it that
-  way: a new test file goes into the crate's `tests/it/`, never as a new
-  top-level `tests/*.rs` target.
+  for deps - linking, not compiling, was the cost) and each crate links AT MOST
+  ONE integration-test binary (`tests/it/main.rs` with suites as modules, or a
+  single flat `tests/<name>.rs`; fq-emit and fq-events are unit-test-only in
+  `src/`). Keep it that way: a new test file goes into the crate's existing
+  test binary, never as a new top-level `tests/*.rs` target.
 - Lint: `warnings = "deny"` escalates clippy pedantic; curated allows in
   `Cargo.toml [workspace.lints.clippy]`. `make fq-lint` runs the house rules
   (FQ-BUNDLED, FQ-PMCOMMENT, ...). The semantic comment gate

@@ -3,13 +3,13 @@
 #![allow(clippy::all, clippy::pedantic)]
 //! Native source connectors and the datasource registry.
 //!
-//! Python registers each datasource once at session init via
-//! `register_datasource`; the engine then fetches from a source by name, in
-//! Rust, over a native driver. Fetched data stays in Rust (as Arrow) for the
-//! rest of the query - it is never revived into Python objects.
+//! The runtime registers each datasource once at session init via `register`;
+//! the engine then fetches from a source by name over a native driver. Fetched
+//! data stays in Rust (as Arrow) for the rest of the query.
 //!
-//! Postgres reads go over ADBC (the same C driver the Python path uses), which
-//! decodes the wire straight into Arrow. DuckDB lands in a later phase.
+//! Postgres reads go over ADBC, which decodes the wire straight into Arrow.
+//! DuckDB reads go over the native duckdb driver, with connections cached
+//! per thread and seeded for shipped temp tables.
 
 use std::cell::RefCell;
 use std::collections::HashMap;

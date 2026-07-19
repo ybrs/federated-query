@@ -140,7 +140,7 @@ pytest tests/e2e_decorrelation/ --cov=federated_query.optimizer.decorrelation --
 
 ## References
 
-See `decorrelation-plan.md` in the repository root for:
+See `historical-docs/design-history.md` (decorrelation sections; full removed plan docs are in git history) for:
 - Detailed rewrite rules
 - Architecture overview
 - NULL semantics specification

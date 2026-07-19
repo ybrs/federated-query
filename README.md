@@ -146,7 +146,7 @@ Pass `--config path/to/config.yaml` to point the CLI at your own catalog configu
 
 ## Development Status
 
-This project is under active development. See `tasks.md` for the implementation roadmap.
+This project is under active development. See `HANDOFF.md` for the roadmap.
 
 ### Completed Phases
 
@@ -267,8 +267,8 @@ pytest tests/test_parser.py
 
 ## Documentation
 
-- **[plan.md](plan.md)**: Detailed architecture and design decisions
-- **[tasks.md](tasks.md)**: Implementation roadmap broken down by phases
+- **[README-architecture.md](README-architecture.md)**: Detailed architecture and design decisions
+- **[HANDOFF.md](HANDOFF.md)**: Current working state and roadmap
 
 ## Key Design Principles
 
@@ -290,7 +290,7 @@ Not yet implemented (roadmap):
 
 ## Contributing
 
-Contributions are welcome! Please see the implementation roadmap in `tasks.md` for areas that need work.
+Contributions are welcome! Please see the roadmap in `HANDOFF.md` for areas that need work.
 
 ## License
 

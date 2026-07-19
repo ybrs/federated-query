@@ -343,3 +343,33 @@ Evidence noted; action is "delete pending your OK". Decide each.
 - Connection/cursor lifecycle in executor/datasources closes on error paths; no
   silent swallows (the two broad excepts - CLI top-level, ADBC best-effort option
   set - are both legitimate).
+
+## Appendix 2026-07-19: status sweep + carryovers from removed docs
+
+This checklist stays at the repo root as the live Python-tree punch list.
+The companion docs review-20260628.md, status-report-cleanup.md,
+todo-current-state.md, tasks.md, decorrelation-plan.md,
+decorrelation-tasks.md, and doc/limit-pushdown.md were removed after
+digesting into historical-docs/design-history.md (full text in git history),
+so references to them above are historical.
+
+Verified still open as of 2026-07-19: B4, R5, R7, M7, M9, M11, D3-D11, H2,
+H3, H4, H6. Verified resolved since: R1, R2, R4, M1, M2, M3, M6, M8, M12,
+D1, D12 (cost.py rewritten, finding moot); D2 half-resolved
+(ExpressionVisitor now used via SqlglotEmitter; LogicalPlanVisitor still has
+zero subclasses). H1 is out of scope by decision: benchmark data artifacts
+and the postgres log are left alone on purpose. H5 partially done (three
+docs archived; the rest removed 2026-07-19 per the digest above).
+
+Carryovers from the removed review-20260628.md, verified still present:
+
+- CORRECTNESS (ticketed in taskq): optimizer/decorrelation.py
+  `_rewrite_inner_join_condition` - a right-side correlation whose name
+  overlaps a left column binds silently to the left (its own docstring
+  states the limitation). Silent wrong join binding.
+- STYLE: cli/fedq.py has 7 `while index < len(...)` loops (lines ~184-255),
+  a banned pattern.
+- DUPLICATION (unverified since physical.py was refactored, low priority):
+  join-schema/alias duplication across PhysicalHashJoin /
+  PhysicalNestedLoopJoin, merge-SQL builders, source-compatibility decided
+  in 3+ places.

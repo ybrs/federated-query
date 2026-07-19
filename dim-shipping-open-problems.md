@@ -6,13 +6,15 @@ perf-positive at SF10 (70.6s vs 73.1s no-ship). This doc records the KNOWN
 open problems to revisit - the gate is a heuristic, not a cost decision, and
 there is one real tail-risk edge to harden.
 
-See `dim-shipping-plan.md` for the design and the gates as implemented.
+The design and the gates as implemented are digested in
+`historical-docs/design-history.md` (dim shipping section); the full removed
+plan docs are in git history.
 
 RESOLVED 2026-07-08 (sections 1-3, the q23 gating problem): a
 dimension-width gate now declines a plain aggregate whose GROUP BY spans two or
 more INDEPENDENT high-cardinality dimensions. Full design, measured evidence,
-and the correction to this doc's "intractable" framing are in
-`dim-shipping-collapse-gate-plan.md`. Key facts: the distinguishing signal is
+and the correction to this doc's "intractable" framing are digested in
+`historical-docs/design-history.md` (collapse-gate section). Key facts: the distinguishing signal is
 the number of distinct high-card SOURCE DIMENSIONS (owner relations), NOT the
 number of high-card keys - correlated keys from one dimension (i_item_id +
 i_item_desc) still collapse. Option 2 (group-width) looked broken only because
@@ -99,8 +101,8 @@ to ~20 and `i_item_sk` (q23) resolves to ~100k. That is a cost-model project
 
 ## 4. Tail risk / "is it a bomb?" - mostly bounded, one real edge
 
-RESOLVED 2026-07-09 (fedqrs `connectors.rs`; see
-`dim-shipping-ship-cap-plan.md`). The proposed hardening below is now
+RESOLVED 2026-07-09 (fedqrs `connectors.rs`; digested in
+`historical-docs/design-history.md`, ship-cap section). The proposed hardening below is now
 implemented: a hard row cap `SHIP_MAX_ROWS = 50_000_000` in `ship_table` raises
 loudly BEFORE ingesting an over-cap relation (converting a stale-stats runaway
 into an immediate honest crash), and the shipped Postgres temp table is ANALYZEd
@@ -127,7 +129,7 @@ stats are stale - estimated 100k, actually 100M - we would ship a huge
 relation. Into Postgres via ADBC COPY that is exactly the "hammer pg / saturate
 bandwidth" case. Narrow (stale ANALYZE) but real, and unbounded.
 
-### Proposed hardening (not yet implemented)
+### Hardening (implemented 2026-07-09; kept as the rationale record)
 
 - HARD RUNTIME CAP on the shipped relation. At the `ship` step the binding is
   already materialized in memory; check its ACTUAL row count and RAISE loudly

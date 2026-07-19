@@ -16,7 +16,7 @@ an LSM storage engine); that design is deleted, its rejected pieces in section 5
 ## Sequencing prerequisite
 
 The accelerator WAITS for R1 (physical planner + SQL emission + IR construction
-in Rust), per `rust-rewrite-plan.md`. Its machinery concentrates at exactly the
+in Rust), per `rewrite-python-to-rust-plan.md`. Its machinery concentrates at exactly the
 layer R1 moves: fragments are WRITTEN by the engine (Rust holds every
 materialized binding in `fq-exec/src/engine.rs`), READ as local Arrow IPC scans,
 and matched at plan time by scan identity then substituted into the physical

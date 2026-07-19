@@ -459,7 +459,7 @@ This project is in **Phase 0** (completed) with basic infrastructure:
 - Test infrastructure
 - Data source connectors (PostgreSQL, DuckDB)
 
-See `tasks.md` for the full roadmap.
+See `HANDOFF.md` for the current working state and roadmap.
 
 ## Testing Strategy
 
@@ -470,8 +470,9 @@ See `tasks.md` for the full roadmap.
 
 ## Resources
 
-- **Architecture details:** See `plan.md`
-- **Implementation roadmap:** See `tasks.md`
+- **Architecture details:** See `README-architecture.md`
+- **Working state and roadmap:** See `HANDOFF.md`; design history of removed
+  plan docs is digested in `historical-docs/design-history.md`
 - **Example config:** See `config/example_config.yaml`
 - **README:** See `README.md` for user-facing documentation
 
