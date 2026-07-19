@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use fq_emit::set_op_keyword;
+use fq_emit::{quote_ident, set_op_keyword};
 use fq_plan::expr::{contains_grouping, contains_window};
 use fq_plan::physical::{
     physical_column_name, ColumnAliasMap, PhysicalCte, PhysicalCteMergeQuery, PhysicalCteScan,
@@ -690,17 +690,64 @@ fn emit_union<'p>(node: &'p PhysicalUnion, ctx: &mut Ctx<'p>) -> Result<String, 
     Ok(raw_sql_step(ctx, sql, inputs))
 }
 
-/// A cross-source INTERSECT / EXCEPT [ALL], as a raw_sql fragment. Ports
-/// `_emit_set_operation`.
+/// A cross-source INTERSECT / EXCEPT, executed by the coordinator, as a raw_sql
+/// fragment. The DISTINCT variants join positionally; the ALL variants take the
+/// counted rewrite in `all_setop_sql`, because DataFusion lowers a bare
+/// `INTERSECT ALL` / `EXCEPT ALL` to a plain semi/anti join (keeping every
+/// matching / non-matching left row) rather than the per-row min / difference
+/// the multiset ALL semantics require. Ports `_emit_set_operation`.
 fn emit_set_operation<'p>(
     node: &'p PhysicalSetOperation,
     ctx: &mut Ctx<'p>,
 ) -> Result<String, StepError> {
     let branches: Vec<&PhysicalPlan> = vec![&node.left, &node.right];
     let (inputs, selects) = branch_inputs(ctx, &branches)?;
-    let keyword = set_op_keyword(node.kind, node.distinct);
-    let sql = selects.join(&format!(" {keyword} "));
+    let sql = if node.distinct {
+        let keyword = set_op_keyword(node.kind, true);
+        selects.join(&format!(" {keyword} "))
+    } else {
+        all_setop_sql(node, &selects)
+    };
     Ok(raw_sql_step(ctx, sql, inputs))
+}
+
+/// Coordinator SQL for INTERSECT ALL / EXCEPT ALL that preserves multiset counts.
+/// Each branch tags equal rows with a per-duplicate ordinal via `row_number()`
+/// over a partition of all its columns, so the two branches expose the pairs
+/// `(row, 1..count)`. A DISTINCT INTERSECT / EXCEPT over `(columns, ordinal)`
+/// then keeps `min(count_left, count_right)` rows for INTERSECT and
+/// `max(count_left - count_right, 0)` rows for EXCEPT; the outer select projects
+/// the ordinal away, restoring the branch's output columns.
+fn all_setop_sql(node: &PhysicalSetOperation, selects: &[String]) -> String {
+    let left_columns = output_column_names(&node.left);
+    let right_columns = output_column_names(&node.right);
+    let left_augmented = augmented_branch_sql(&left_columns, &selects[0], 0);
+    let right_augmented = augmented_branch_sql(&right_columns, &selects[1], 1);
+    let keyword = set_op_keyword(node.kind, true);
+    let projected = column_list_sql(&left_columns);
+    format!(
+        "SELECT {projected} FROM (({left_augmented}) {keyword} ({right_augmented})) AS __fq_setop"
+    )
+}
+
+/// Wrap one set-operation branch with a `row_number()` ordinal partitioned by all
+/// its columns, so equal rows receive distinct ordinals `1..count` and a DISTINCT
+/// INTERSECT / EXCEPT over `(columns, ordinal)` reproduces the ALL multiset.
+fn augmented_branch_sql(columns: &[String], branch_sql: &str, index: usize) -> String {
+    let column_list = column_list_sql(columns);
+    format!(
+        "SELECT {column_list}, row_number() OVER (PARTITION BY {column_list}) \
+         AS __fq_setop_rn FROM ({branch_sql}) AS __fq_setop_branch_{index}"
+    )
+}
+
+/// Comma-join the quoted column identifiers of a set-operation branch.
+fn column_list_sql(columns: &[String]) -> String {
+    let mut quoted = Vec::with_capacity(columns.len());
+    for column in columns {
+        quoted.push(quote_ident(column));
+    }
+    quoted.join(", ")
 }
 
 /// Emit each set-operation branch to an `in_<i>` binding; return the inputs map and

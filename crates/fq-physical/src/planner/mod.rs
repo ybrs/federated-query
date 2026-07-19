@@ -47,6 +47,7 @@ fn datasource_kind_of(dialect: RenderDialect) -> DatasourceKind {
         RenderDialect::ClickHouse => DatasourceKind::ClickHouse,
         RenderDialect::MySql => DatasourceKind::MySql,
         RenderDialect::Materialized => DatasourceKind::Materialized,
+        RenderDialect::Parquet => DatasourceKind::Parquet,
     }
 }
 

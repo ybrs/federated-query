@@ -162,7 +162,8 @@ fn node_label(
                 fq_plan::physical::DatasourceKind::Postgres
                 | fq_plan::physical::DatasourceKind::DuckDb
                 | fq_plan::physical::DatasourceKind::ClickHouse
-                | fq_plan::physical::DatasourceKind::MySql => {
+                | fq_plan::physical::DatasourceKind::MySql
+                | fq_plan::physical::DatasourceKind::Parquet => {
                     format!("Scan [{}]", node.datasource)
                 }
             };

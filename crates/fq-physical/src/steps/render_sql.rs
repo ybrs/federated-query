@@ -47,7 +47,7 @@ pub fn scan_dialect(kind: DatasourceKind) -> Dialect {
         DatasourceKind::DuckDb => Dialect::DuckDb,
         DatasourceKind::ClickHouse => Dialect::ClickHouse,
         DatasourceKind::MySql => Dialect::MySql,
-        DatasourceKind::Materialized => Dialect::DataFusion,
+        DatasourceKind::Materialized | DatasourceKind::Parquet => Dialect::DataFusion,
     }
 }
 

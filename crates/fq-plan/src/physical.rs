@@ -80,6 +80,10 @@ pub enum DatasourceKind {
     /// read by DataFusion. Scans of it render DataFusion-dialect SQL and EXPLAIN
     /// labels them `MaterializedScan`.
     Materialized,
+    /// A Parquet directory read by DataFusion. Scans of it render
+    /// DataFusion-dialect SQL (the engine that executes them), keeping it a
+    /// distinct named source rather than the materialized-view store.
+    Parquet,
 }
 
 /// Materializes a cross-source CTE body once, shared by every reference.

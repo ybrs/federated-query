@@ -114,11 +114,13 @@ impl DataSource for ParquetSource {
         &self.name
     }
 
-    /// DuckDB dialect: the pushed scan SQL runs through the exec plane's
-    /// DataFusion, which parses the DuckDB rendering the engine already emits for
-    /// its merge engine.
+    /// DataFusion dialect: the pushed scan SQL runs through the exec plane's
+    /// DataFusion over the local files, so it must render in DataFusion's own
+    /// dialect. Rendering as another engine's dialect drops clauses that engine
+    /// treats as its default but DataFusion does not (a DESC ORDER BY without an
+    /// explicit NULLS placement sorts nulls first in DataFusion, last in DuckDB).
     fn render_dialect(&self) -> RenderDialect {
-        RenderDialect::DuckDb
+        RenderDialect::Parquet
     }
 
     /// Everything DataFusion executes over a single pushed relation, and nothing

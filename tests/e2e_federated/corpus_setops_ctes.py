@@ -17,9 +17,8 @@ Two shapes raise loudly rather than run: a ``WITH`` clause bound directly to a
 top-level set operation is an unsupported parse shape (worked around here by
 wrapping the union in a derived-table ``SELECT``, which the engine does
 support), pinned nowhere further since it is a designed restriction, not a
-wrong answer. ``INTERSECT ALL`` / ``EXCEPT ALL`` and a WHERE predicate on a
-BOOLEAN column pushed to PostgreSQL are genuine bugs (wrong multiset counts
-cross-source; a physical-planning crash) and are pinned as reproductions in
+wrong answer. A WHERE predicate on a BOOLEAN column pushed to PostgreSQL is a
+genuine bug (a physical-planning crash) and is pinned as a reproduction in
 ``SUSPECTED_ENGINE_BUGS`` below instead of being asserted here.
 """
 
@@ -73,6 +72,16 @@ CASES = [
         "name": "set_except_dup_keys_distinct",
         "tables": ["t_dup_a", "t_dup_b"],
         "query": "SELECT k FROM {t_dup_a} EXCEPT SELECT k FROM {t_dup_b}",
+    },
+    {
+        "name": "set_intersect_all_shared_ids",
+        "tables": ["t_dup_a", "t_dup_b"],
+        "query": "SELECT k FROM {t_dup_a} INTERSECT ALL SELECT k FROM {t_dup_b}",
+    },
+    {
+        "name": "set_except_all_shared_ids",
+        "tables": ["t_dup_a", "t_dup_b"],
+        "query": "SELECT k FROM {t_dup_a} EXCEPT ALL SELECT k FROM {t_dup_b}",
     },
     {
         "name": "set_union_branch_is_join",
@@ -459,35 +468,6 @@ CASES = [
 # corpus stays green. Not run by the harness (only ``CASES`` is collected);
 # each entry is a pinned repro plus the observed finding.
 SUSPECTED_ENGINE_BUGS = {
-    "set_intersect_all_shared_ids": {
-        "tables": ["t_dup_a", "t_dup_b"],
-        "query": "SELECT k FROM {t_dup_a} INTERSECT ALL SELECT k FROM {t_dup_b}",
-        "finding": (
-            "INTERSECT ALL is wrong whenever the two branches are split across "
-            "distinct sources (even duck_duck, two plain DuckDB files - this is "
-            "not PostgreSQL-specific). t_dup_a.k = [1,1,2,2,3], "
-            "t_dup_b.k = [1,1,2,4]; standard multiset semantics take "
-            "min(count_a, count_b) per value, so the correct INTERSECT ALL is "
-            "[1,1,2] (oracle_single_duck returns exactly this). Every "
-            "cross-source placement (duck_duck, pg_duck, duck_pg, all_pg, "
-            "parquet_duck, parquet_pg) instead returns [1,1,2,2]: engine 4 rows "
-            "vs oracle 3 rows, as if the per-source local results were unioned "
-            "without reconciling multiplicities across sources."
-        ),
-    },
-    "set_except_all_shared_ids": {
-        "tables": ["t_dup_a", "t_dup_b"],
-        "query": "SELECT k FROM {t_dup_a} EXCEPT ALL SELECT k FROM {t_dup_b}",
-        "finding": (
-            "EXCEPT ALL has the same cross-source defect as INTERSECT ALL "
-            "above. With t_dup_a.k = [1,1,2,2,3] and t_dup_b.k = [1,1,2,4], the "
-            "correct EXCEPT ALL (count_a - count_b, floored at 0) is [2,3] "
-            "(oracle_single_duck returns exactly this, 2 rows). Every "
-            "cross-source placement (duck_duck, pg_duck, duck_pg, all_pg, "
-            "parquet_duck, parquet_pg) instead returns only [3]: engine 1 row "
-            "vs oracle 2 rows, dropping the k=2 remainder entirely."
-        ),
-    },
     "set_boolean_predicate_pushdown_to_postgres_crashes": {
         "tables": ["products"],
         "query": "SELECT product_id FROM {products} WHERE active = TRUE",

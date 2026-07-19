@@ -396,6 +396,12 @@ CASES = [
         "query": "SELECT id, k FROM {t_null_a} ORDER BY k NULLS FIRST, id",
     },
     {
+        "name": "win_order_by_nulls_last",
+        "tables": ["t_null_a"],
+        "order_sensitive": True,
+        "query": "SELECT id, k FROM {t_null_a} ORDER BY k DESC NULLS LAST, id",
+    },
+    {
         "name": "win_order_by_multi_key_mixed",
         "tables": ["orders", "customers"],
         "order_sensitive": True,
@@ -542,19 +548,6 @@ SUSPECTED_ENGINE_BUGS = {
             "implementation computes in a fixed 6-digit-scale DECIMAL rather "
             "than DOUBLE, losing precision and failing the comparator's "
             "exact-Decimal rule."
-        ),
-    },
-    "win_order_by_nulls_last": {
-        "query": "SELECT id, k FROM {t_null_a} ORDER BY k DESC NULLS LAST, id",
-        "finding": (
-            "parquet_duck and parquet_pg (the only placements that seat "
-            "t_null_a on the Parquet source) return NULLs first despite "
-            "DESC NULLS LAST: engine rows start "
-            "[(3, None), (4, None), (5, 30), ...] vs. oracle rows "
-            "[(5, 30), (2, 20), (1, 10), (3, None), (4, None)]. duck_duck, "
-            "pg_duck, duck_pg, and all_pg (t_null_a on DuckDB or PostgreSQL "
-            "in those placements) all sort correctly, isolating the bug to "
-            "the Parquet connector's handling of DESC NULLS LAST."
         ),
     },
 }

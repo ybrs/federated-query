@@ -55,11 +55,14 @@ fn region_batch() -> RecordBatch {
 }
 
 #[test]
-fn render_dialect_is_duckdb_which_datafusion_parses() {
+fn render_dialect_is_parquet_so_datafusion_semantics_hold() {
+    // Parquet SQL runs on the exec plane's DataFusion, so it renders the Parquet
+    // dialect (DataFusion semantics), not another engine whose defaults DataFusion
+    // does not share (a DESC ORDER BY's null placement diverges from DuckDB).
     let dir = temp_dir("dialect");
     write_parquet(&dir, "region", &region_batch());
     let source = ParquetSource::open("pq", dir.to_str().unwrap()).expect("open");
-    assert_eq!(source.render_dialect(), RenderDialect::DuckDb);
+    assert_eq!(source.render_dialect(), RenderDialect::Parquet);
 }
 
 #[test]

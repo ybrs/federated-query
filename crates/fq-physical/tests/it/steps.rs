@@ -295,6 +295,55 @@ fn pscan(datasource: &str, schema: &str, table: &str, columns: &[&str]) -> Physi
     }))
 }
 
+/// A Parquet-seated scan of `t.k` ordered by `k`, with the given direction and an
+/// optional explicit NULLS placement (None leaves the emitter's canonical default).
+fn parquet_ordered_scan(ascending: bool, nulls: Option<NullsOrder>) -> PhysicalScan {
+    let mut scan = match pscan("pq", "main", "t", &["k"]) {
+        PhysicalPlan::Scan(scan) => *scan,
+        _ => unreachable!("pscan builds a Scan"),
+    };
+    scan.datasource_kind = DatasourceKind::Parquet;
+    scan.order_by_keys = Some(vec![Expr::Column(ColumnRef::new(
+        Some("t".to_string()),
+        "k",
+        Some(DataType::Integer),
+    ))]);
+    scan.order_by_ascending = Some(vec![ascending]);
+    scan.order_by_nulls = Some(vec![nulls]);
+    scan
+}
+
+#[test]
+fn parquet_scan_keeps_explicit_nulls_last_on_desc() {
+    // Parquet SQL runs on DataFusion (DESC defaults to NULLS FIRST there). An
+    // explicit DESC NULLS LAST must survive rendering: a DuckDB rendering would
+    // drop it as DuckDB's default, then DataFusion would sort nulls first.
+    let scan = parquet_ordered_scan(false, Some(NullsOrder::Last));
+    let sql = fq_physical::render_scan_sql(&scan).expect("render");
+    let upper = sql.to_uppercase();
+    assert!(upper.contains("DESC"), "sql: {sql}");
+    assert!(upper.contains("NULLS LAST"), "sql: {sql}");
+}
+
+#[test]
+fn parquet_scan_keeps_explicit_nulls_first_on_asc() {
+    // The mirror case: ASC defaults to NULLS LAST on DataFusion, so an explicit
+    // ASC NULLS FIRST must likewise survive.
+    let scan = parquet_ordered_scan(true, Some(NullsOrder::First));
+    let sql = fq_physical::render_scan_sql(&scan).expect("render");
+    assert!(sql.to_uppercase().contains("NULLS FIRST"), "sql: {sql}");
+}
+
+#[test]
+fn parquet_scan_desc_default_nulls_placement_is_explicit() {
+    // With no explicit NULLS clause the canonical Postgres form makes DESC's
+    // default (NULLS FIRST) explicit; it must reach DataFusion verbatim so the
+    // placement never depends on the executing engine's own default.
+    let scan = parquet_ordered_scan(false, None);
+    let sql = fq_physical::render_scan_sql(&scan).expect("render");
+    assert!(sql.to_uppercase().contains("NULLS FIRST"), "sql: {sql}");
+}
+
 #[test]
 fn shipment_emits_body_then_ship_then_island_in_order() {
     // Ship a pg dimension body into duck, then read the duck island.
@@ -631,6 +680,74 @@ fn same_source_union_all_renders_a_remote_set_op_scan() {
     assert!(sql.contains("UNION ALL"), "set-op sql: {sql}");
     assert!(sql.contains("ORDERS"), "set-op sql: {sql}");
     assert!(sql.contains("CUSTOMER"), "set-op sql: {sql}");
+}
+
+/// The single coordinator raw-SQL fragment whose text names `keyword`.
+fn coordinator_setop_sql(catalog: &Arc<Catalog>, sql: &str, keyword: &str) -> String {
+    let plan = plan_sql(catalog, sql);
+    let built = build_steps(&plan).expect("build_steps");
+    raw_sql_fragments(&built)
+        .into_iter()
+        .find(|text| text.to_uppercase().contains(keyword))
+        .unwrap_or_else(|| panic!("no coordinator {keyword} fragment"))
+}
+
+#[test]
+fn cross_source_intersect_all_renders_counted_rewrite() {
+    // A cross-source INTERSECT ALL runs on the coordinator (DataFusion), which
+    // lowers a bare INTERSECT ALL to a semi join (every matching left row) instead
+    // of min(count_left, count_right). The emitter must instead tag duplicates with
+    // a row_number ordinal and take a DISTINCT INTERSECT over (columns, ordinal).
+    let catalog = catalog();
+    let sql = coordinator_setop_sql(
+        &catalog,
+        "SELECT id FROM pg.public.orders INTERSECT ALL SELECT l_orderkey FROM duck.main.lineitem",
+        "INTERSECT",
+    );
+    let lowered = sql.to_lowercase();
+    assert!(lowered.contains("row_number"), "sql: {sql}");
+    assert!(lowered.contains("partition by"), "sql: {sql}");
+    assert!(lowered.contains("__fq_setop_rn"), "sql: {sql}");
+    assert!(
+        !sql.to_uppercase().contains("INTERSECT ALL"),
+        "bare INTERSECT ALL must not reach DataFusion: {sql}"
+    );
+}
+
+#[test]
+fn cross_source_except_all_renders_counted_rewrite() {
+    // EXCEPT ALL takes the same counted rewrite: a bare EXCEPT ALL lowers to an anti
+    // join (every non-matching left row) instead of max(count_left - count_right, 0).
+    let catalog = catalog();
+    let sql = coordinator_setop_sql(
+        &catalog,
+        "SELECT id FROM pg.public.orders EXCEPT ALL SELECT l_orderkey FROM duck.main.lineitem",
+        "EXCEPT",
+    );
+    let lowered = sql.to_lowercase();
+    assert!(lowered.contains("row_number"), "sql: {sql}");
+    assert!(lowered.contains("partition by"), "sql: {sql}");
+    assert!(lowered.contains("__fq_setop_rn"), "sql: {sql}");
+    assert!(
+        !sql.to_uppercase().contains("EXCEPT ALL"),
+        "bare EXCEPT ALL must not reach DataFusion: {sql}"
+    );
+}
+
+#[test]
+fn cross_source_intersect_distinct_stays_plain() {
+    // The DISTINCT variant is correct as a plain positional INTERSECT (DataFusion
+    // handles distinct set semantics); it must not take the counted rewrite.
+    let catalog = catalog();
+    let sql = coordinator_setop_sql(
+        &catalog,
+        "SELECT id FROM pg.public.orders INTERSECT SELECT l_orderkey FROM duck.main.lineitem",
+        "INTERSECT",
+    );
+    assert!(
+        !sql.to_lowercase().contains("row_number"),
+        "distinct INTERSECT must stay plain: {sql}"
+    );
 }
 
 #[test]

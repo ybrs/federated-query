@@ -25,6 +25,11 @@ pub enum RenderDialect {
     /// The engine's materialized-view store, whose pushed SQL DataFusion
     /// executes over local Arrow IPC chunks.
     Materialized,
+    /// A Parquet directory, whose pushed SQL DataFusion executes over the local
+    /// files. Its rendering must match DataFusion's own semantics (in particular
+    /// the DESC-default null placement), not another engine the query never runs
+    /// on.
+    Parquet,
 }
 
 /// Capabilities a data source may support.
