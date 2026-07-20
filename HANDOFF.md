@@ -104,22 +104,9 @@ Feature surface built on top of the core engine:
   SETTINGS`, `SHOW SETTING <name>`, `SET <name> = <value>`, `RESET <name>`,
   `RESET ALL`. SET/RESET mutate the live session; values are type-checked and a
   bad value or unknown name raises (with a nearest-name suggestion).
-- EVENT ANALYTICS (fq-events + fq-runtime): an EVENT VIEW is a materialized
-  view whose columns are mapped onto event roles - entity id, timestamp, event
-  name, optional TIEBREAK; every other column is a property - and whose chunks
-  are globally sorted by (entity, timestamp[, tiebreak]) with no NULL role.
-  `CREATE / REFRESH / DROP EVENT VIEW`, then the analysis statements FUNNEL
-  (ordered step conversion within a window), SEGMENT (per-bucket event and
-  distinct-entity measures), and PATHS (top event sequences, optional STARTING
-  AT anchor). Two DERIVED sidecars rebuild with each generation over one scan:
-  a SEGMENT pre-aggregate (per-bucket counts at day/week/month grain) that
-  answers SEGMENT BY DAY/WEEK/MONTH from disk - roughly 1000x on the measured
-  suite (SEGMENT ~2000ms of DuckDB collapses to sub-millisecond) - and gated
-  per-event-name entity ROARING BITMAPS that give FUNNEL its exact step-1 count
-  and shrink the step-1-and-step-2 scan set. Both are non-authoritative: a
-  missing/mismatched sidecar falls back to the identical scan answer. Suite:
-  `benchmarks/events/run_events.py` (small ~1M events, medium ~100M).
-  Design: `events-plan.md`, `crates/fq-events/README.md`.
+- Event analytics is done in plain DuckDB SQL (see `event-sql-poc/`), not an
+  in-engine extension; the fq-events extension was removed. The event parquet
+  lives under `benchmarks/events/data`.
 - fedq-server (`crates/fedq-server`): a PostgreSQL wire-protocol server
   (pgwire) over the runtime - simple and EXTENDED query protocol
   (Parse/Bind/Describe/Execute), SCRAM auth, query cancellation. One `Runtime`
@@ -149,8 +136,8 @@ Feature surface built on top of the core engine:
   debuginfo (`debug = "line-tables-only"` for workspace code, `debug = false`
   for deps - linking, not compiling, was the cost) and each crate links AT MOST
   ONE integration-test binary (`tests/it/main.rs` with suites as modules, or a
-  single flat `tests/<name>.rs`; fq-emit and fq-events are unit-test-only in
-  `src/`). Keep it that way: a new test file goes into the crate's existing
+  single flat `tests/<name>.rs`; fq-emit is unit-test-only in `src/`). Keep it
+  that way: a new test file goes into the crate's existing
   test binary, never as a new top-level `tests/*.rs` target. ONE sanctioned
   exception: `fq-physical/tests/dim_shipping_kill_switch.rs` is its own binary
   because it mutates the process-global `FEDQ_DIM_SHIPPING` env var, which cannot
@@ -233,55 +220,6 @@ q06's estimate REGRESSED and was reverted):
   disjunction spans BOTH sources, so the coordinator filter is CORRECT and
   there is nothing to push. Do not chase these two.
 
-Events findings (from `benchmarks/events`):
-
-- SEGMENT is a decisive win (the pre-aggregate sidecar): sub-millisecond vs
-  DuckDB's seconds at 100M events.
-- FUNNEL and PATHS beat DuckDB when the funnel/path is common (funnel common
-  0.18x, paths 0.30-0.35x at 100M). The SELECTIVE-FUNNEL ROW-INDEX round has
-  LANDED (per-event-name row index + funnel column projection): a selective
-  funnel materializes only the step-event rows of the single sorted chunk and
-  reads just the three consulted columns, cutting the selective funnel from
-  3.55x to 2.48x at 100M.
-- MEMORY, apportioned by measurement (fresh-process peak `ru_maxrss`, one phase
-  each, over the built 100M view): every query kernel peaks at ~5.0-5.1 GB - the
-  size of the one materialized chunk, no blow-up (funnel common 5061 MB, funnel
-  selective 5060 MB, paths 5126 MB, segment 5059 MB). The whole-run peak was
-  ENTIRELY the CREATE EVENT VIEW step, NOT a query-path cost. So streaming the
-  query kernels was NOT the fix (the earlier HANDOFF item was a misdiagnosis);
-  the lever is CREATE.
-
-Events SOURCE is now Parquet (the runner exports the generated table to
-`data/events_<scale>_parquet/events.parquet` and the config is a `type: parquet`
-source; the DuckDB source files were removed - `references_<scale>.duckdb`
-baselines stay). CREATE reads the Parquet through the read-only connector.
-
-CREATE EVENT VIEW - the sort moved to the executor (LANDED). The in-memory
-Arrow lexsort + `take_record_batch` (three full copies + a 100M-row string
-gather) is gone: the materialization now runs the defining SELECT wrapped in an
-ORDER BY on the contract keys, so DataFusion sorts, and `build_event_view` only
-validates the roles (no column clone) and concatenates the ordered result into
-the single stored chunk. Result at 100M (runner, warm 1): 6 agree | 0 differ;
-CREATE 208s -> 68s (3x); peak RSS 29.3 GB -> 26.8 GB (barely moved). 986
-workspace tests green.
-
-CREATE memory + the last ~2x of time are STILL OPEN and PARKED pending a
-direction decision. Apportioned at 100M: DuckDB sorts+writes the same Parquet in
-12.8s; our engine's scan+sort alone is 24.6s / 13.4 GB (the ORDER BY is pushed
-into the one Parquet scan step - DataFusion is ~2x DuckDB at bulk parquet+sort,
-12 cores); the remaining ~43s and the memory doubling to 26.8 GB is CREATE's own
-post-sort work - the `concat_batches` copy, writing a 5 GB UNCOMPRESSED IPC
-chunk, and `persist_sidecars` re-normalizing all 100M rows a second time
-(`build_sidecars` opens a fresh `EventStream`, re-casting the string columns).
-The three candidate directions (not yet chosen): (a) cut the post-sort waste +
-bound the sort so it spills (keep the engine sort; est. ~30-35s / ~8 GB, no
-architectural risk); (b) a streaming materialization that pipes sorted batches
-once into chunk-write + sidecar-build in one bounded pass (touches the proven
-single-batch kernel/sidecar path); (c) let DuckDB do the build sort (the only
-path to ~13s, since our sort floor is ~2x). Note `MEMORY_LIMIT_BYTES` is a
-shared 32 GB `FairSpillPool`, so the 100M sort never spills - a per-build bounded
-budget would be needed for (a)/(b).
-
 ## How to run everything
 
 Environment for every command:
@@ -293,7 +231,7 @@ export CARGO_TARGET_DIR=/workspace/federated-query/target
 Python interpreter: `/workspace/venv-fedq/bin/python`.
 
 Build the engine for the benchmark harnesses (release; the benchmark symlinks
-`benchmarks/{tpch,tpcds,events}/fedq.so` point at
+`benchmarks/{tpch,tpcds}/fedq.so` point at
 `target/release/libfedq_py.so`):
 ```
 cargo build --release -p fedq-py
@@ -312,9 +250,8 @@ pg-dims vs adversarial split. Hard wall budgets kill a run past 60s
 `Runtime::execute("EXPLAIN <sql>")` (qualify table names first - see the
 runner's `_qualify`).
 
-TPC-H: `benchmarks/tpch/run_federated_rust.py` (same shape). Events:
-`benchmarks/events/run_events.py` (build the view, then run the analyses vs the
-cached DuckDB baseline). Data locations live in each suite's README.
+TPC-H: `benchmarks/tpch/run_federated_rust.py` (same shape). Data locations
+live in each suite's README.
 
 Cross-engine perf: `benchmarks/perf_compare/compare.py` - the only sanctioned
 cold/warm cross-engine numbers.
@@ -328,7 +265,7 @@ fq-catalog    -> fq-common
 fq-connectors -> fq-catalog
 fq-parse      -> fq-plan, fq-catalog       fq-emit    -> fq-plan
 fq-bind       -> fq-plan, fq-catalog       fq-accel   -> storage half of MV
-fq-decorrelate-> fq-plan                   fq-events  -> fq-accel
+fq-decorrelate-> fq-plan
 fq-optimize   -> fq-plan, fq-catalog, fq-connectors
 fq-physical   -> fq-plan, fq-optimize, fq-emit
 fq-exec       -> fq-plan, fq-connectors
@@ -337,7 +274,7 @@ fedq-py / fedq-server / fedq  -> fq-runtime
 ```
 
 - fq-common: config (serde-YAML, `deny_unknown_fields`), errors, tracing,
-  DataType, PlanBudget, the event-statement value types.
+  DataType, PlanBudget.
 - fq-catalog: Schema/Table/Column, the `DataSource` trait (catalog/statistics
   tier ONLY - no drivers), StatsCatalog on rusqlite.
 - fq-connectors: DuckDB, Postgres, ClickHouse, MySQL, Parquet catalog/stats
@@ -347,8 +284,8 @@ fedq-py / fedq-server / fedq  -> fq-runtime
   arms), typed `schema()`. CTE producers are `Arc`-shared.
 - fq-parse: polyglot-sql 0.5.15 -> LogicalPlan; allowlist conversion, star
   expansion, window functions, comma joins, LIKE, WITH RECURSIVE, PIVOT. Also
-  classifies the non-query statement forms (MV DDL, settings, event DDL +
-  analyses) before the query pipeline.
+  classifies the non-query statement forms (MV DDL, settings) before the query
+  pipeline.
 - fq-bind: scope chain + ONE resolver (invalid query MUST raise BindError),
   aggregate hoists for HAVING/ORDER BY, star read-set expansion.
 - fq-decorrelate: the always-decorrelate pass (EXISTS/IN/scalar/quantified,
@@ -371,12 +308,10 @@ fedq-py / fedq-server / fedq  -> fq-runtime
 - fq-runtime: config-driven Runtime, full pipeline, textual + document EXPLAIN,
   session-shared StatisticsCollector, learned-stats persistence
   (`<config>.stats.sqlite`), StageLog + planning-budget kill, and the
-  statement dispatch for MV DDL / settings / event forms / substitution.
+  statement dispatch for MV DDL / settings / substitution.
 - fq-accel: the materialized-view store (ChunkStore over object_store,
   ViewCatalog, the create/refresh/drop lifecycle and the three refresh
   mechanics).
-- fq-events: event-view contract, EventStream cursor, the FUNNEL/SEGMENT/PATHS
-  kernels, and the derived sidecars.
 - fedq-py: pyo3 cdylib; `fedq.Runtime(config_path).execute(sql)` -> Arrow C
   stream (GIL released).
 - fedq-server: pgwire server (per-connection Runtime, extended protocol, SCRAM,
@@ -388,29 +323,18 @@ fedq-py / fedq-server / fedq  -> fq-runtime
 Core engine and the feature surface are complete and gated; what remains is a
 short punch list plus the teardown, in rough order:
 
-1. CREATE EVENT VIEW at 100M - time PARTLY fixed, memory PARKED (see the events
-   findings above for the full apportionment). The sort now runs in the executor
-   (ORDER BY on the contract keys) instead of an in-memory Arrow lexsort+gather:
-   CREATE 208s -> 68s, correctness held (6 agree). STILL OPEN and awaiting a
-   direction decision: peak RSS is still 26.8 GB and the last ~2x of time. The
-   post-sort work (concat copy + 5 GB uncompressed IPC write + a redundant 100M-
-   row sidecar re-normalize) is the ~43s / +14 GB to cut; the sort itself is
-   ~2x DuckDB (24.6s vs 12.8s) and never spills (shared 32 GB pool). Three
-   candidate directions in the events findings: (a) cut post-sort waste + bound
-   the sort, (b) streaming materialization, (c) DuckDB build sort. Streaming the
-   query kernels (~5 GB -> ~1-2 GB) is a separate, lower-value follow-up.
-2. Accelerator Phase D: S3 via `object_store` config + `max_bytes`
+1. Accelerator Phase D: S3 via `object_store` config + `max_bytes`
    LRU-by-benefit eviction + tombstone sweeper (see `accelerator-plan.md`
    section 7).
-3. A formal `perf_compare` gate run across all sources (parquet columns now
+2. A formal `perf_compare` gate run across all sources (parquet columns now
    have a connector, so they no longer report UNSUPPORTED).
-4. MySQL LIVE verification (the connector is full-stack but unverified against
+3. MySQL LIVE verification (the connector is full-stack but unverified against
    a running server).
-5. Adversarial SF10 perf tail (geomean 2.90x) - the harder split; not
+4. Adversarial SF10 perf tail (geomean 2.90x) - the harder split; not
    gate-blocking, pg-dims totals already beat DuckDB.
-6. q14 (see UPSTREAM WATCH) is currently repaired in fq-parse; when a polyglot
+5. q14 (see UPSTREAM WATCH) is currently repaired in fq-parse; when a polyglot
    release nests trailing set operations correctly, delete the repair.
-7. Python teardown: delete `federated_query/` and the `/workspace/fedqrs`
+6. Python teardown: delete `federated_query/` and the `/workspace/fedqrs`
    remnants, move `lint/` rules fully into fq-lint. This awaits the
    maintainer's explicit call (no delete without approval).
 

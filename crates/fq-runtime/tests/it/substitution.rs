@@ -35,18 +35,6 @@ struct Sandbox {
     datasource: String,
 }
 
-/// A hand-verifiable event fixture: six rows, four on device 'ios'. The event
-/// view over the 'ios' subset reduces 6 base rows to 4, so the cost gate clears.
-const EVENTS_SEED: &str = "\
-    CREATE TABLE events (user_id INTEGER, ts TIMESTAMP, name VARCHAR, device VARCHAR); \
-    INSERT INTO events VALUES \
-        (1,'2026-01-01 10:00:00','signup',  'ios'), \
-        (1,'2026-01-01 10:30:00','activate','ios'), \
-        (2,'2026-01-01 11:00:00','signup',  'web'), \
-        (2,'2026-01-01 11:30:00','purchase','web'), \
-        (3,'2026-01-01 12:00:00','signup',  'ios'), \
-        (3,'2026-01-01 12:30:00','activate','ios');";
-
 impl Sandbox {
     /// Seed a fresh sandbox with the region fixture.
     fn new(tag: &str) -> Self {
@@ -513,72 +501,4 @@ fn benefit_counters_advance_and_persist_across_runtimes() {
     let (_, _, _, use_count, cost_saved) = show_row(&runtime, "region_count");
     assert_eq!(use_count, 2);
     assert!((cost_saved - 8.0).abs() < 1e-9);
-}
-
-/// Flatten `(user_id, name)` from a `(user_id, ts, name)` event result - columns
-/// 0 (Int32) and 2 (Utf8), skipping the timestamp.
-fn user_name_rows(batches: &[RecordBatch]) -> Vec<(i32, String)> {
-    let mut rows = Vec::new();
-    for batch in batches {
-        let users = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("Int32 user_id");
-        let names = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Utf8 name");
-        for row in 0..batch.num_rows() {
-            rows.push((users.value(row), names.value(row).to_string()));
-        }
-    }
-    rows
-}
-
-#[test]
-fn an_event_view_is_a_substitution_candidate() {
-    // Event views are stored as materialized views (plus role metadata), so they
-    // are substitution candidates like any other view. Their chunks are sorted
-    // by (entity, timestamp) - a permutation of the definition's rows, i.e. the
-    // same SET - so substituting a matching plain SELECT is sound: the row set is
-    // preserved, and an outer ORDER BY (above the substituted scan) fixes order.
-    let sandbox = Sandbox::with_seed("eventview", EVENTS_SEED);
-    let runtime = sandbox.runtime();
-    let ds = &sandbox.datasource;
-    let definition = format!("SELECT user_id, ts, name FROM {ds}.main.events WHERE device = 'ios'");
-    runtime
-        .execute(&format!(
-            "CREATE EVENT VIEW ios_ev ENTITY user_id TIMESTAMP ts EVENT name AS {definition}"
-        ))
-        .expect("create event view");
-
-    // The event view's definition matches and the gate clears (6 base > 4 read).
-    assert!(substitutes(&explain_lines(&runtime, &definition), "ios_ev"));
-    let (_, on_rows) = runtime.execute(&definition).expect("substituted");
-
-    runtime
-        .execute("SET accelerator.enable_substitution = false")
-        .expect("disable");
-    assert!(!substitutes(
-        &explain_lines(&runtime, &definition),
-        "ios_ev"
-    ));
-    let (_, off_rows) = runtime.execute(&definition).expect("unsubstituted");
-
-    let mut on_sorted = user_name_rows(&on_rows);
-    let mut off_sorted = user_name_rows(&off_rows);
-    on_sorted.sort();
-    off_sorted.sort();
-    assert_eq!(on_sorted, off_sorted);
-    assert_eq!(
-        on_sorted,
-        vec![
-            (1, "activate".to_string()),
-            (1, "signup".to_string()),
-            (3, "activate".to_string()),
-            (3, "signup".to_string()),
-        ]
-    );
 }

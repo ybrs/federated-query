@@ -14,7 +14,6 @@ mod acl;
 mod delta;
 mod dynamic_catalog;
 pub mod error;
-mod events;
 mod explain;
 mod materialized;
 mod settings;
@@ -81,9 +80,6 @@ pub struct Runtime {
     /// The materialized-view store, present when the config has a file path
     /// (the store lives next to it). DDL against a path-less config raises.
     accelerator: Option<Accelerator>,
-    /// The event-view role registry, opened together with the accelerator
-    /// (same stats SQLite): an event view is a materialized view plus roles.
-    events: Option<fq_events::EventViewRegistry>,
     /// The live authorization state: the principal, its effective superuser
     /// flag, and the generation-gated grant cache. Embedded/trust builds hold an
     /// implicit superuser with enforcement off; a wire connection calls
@@ -144,7 +140,6 @@ impl Runtime {
         if let Some(accel) = &accelerator {
             acl::import_bootstrap_users(accel, &config.server.users)?;
         }
-        let events = events::open_event_registry(config)?;
         let catalog = Arc::new(catalog);
         let learned = open_stats_catalog(config)?;
         let stats = Arc::new(StatisticsCollector::new(
@@ -160,7 +155,6 @@ impl Runtime {
             stats: RwLock::new(stats),
             learned,
             accelerator,
-            events,
             authz: RwLock::new(acl::AclState::embedded()),
         })
     }
@@ -227,16 +221,6 @@ impl Runtime {
             Statement::ShowMaterializedViews => self.show_materialized_views(),
             Statement::SetSetting { name, value } => self.set_setting(&name, &value),
             Statement::ResetSetting { name } => self.reset_setting(name.as_deref()),
-            Statement::CreateEventView {
-                name,
-                roles,
-                select_sql,
-            } => self.create_event_view(&name, &roles, select_sql),
-            Statement::RefreshEventView { name } => self.refresh_event_view(&name),
-            Statement::DropEventView { name } => self.drop_event_view(&name),
-            Statement::Funnel(spec) => self.run_funnel_statement(&spec),
-            Statement::Segment(spec) => self.run_segment_statement(&spec),
-            Statement::Paths(spec) => self.run_paths_statement(&spec),
             Statement::CreateDatasource { name, kind, params } => {
                 self.create_datasource(&name, &kind, &params)
             }
@@ -281,9 +265,9 @@ impl Runtime {
 
     /// Plan and run one statement that must read FROM THE SOURCE, with view
     /// substitution disabled. The materialized-view DDL data pulls (CREATE's
-    /// initial pull, every REFRESH variant, the delta/watermark queries, an
-    /// event-view build) go through here: substituting a view for its own
-    /// defining SELECT would populate/refresh it from its own stale cache.
+    /// initial pull, every REFRESH variant, the delta/watermark queries) go
+    /// through here: substituting a view for its own defining SELECT would
+    /// populate/refresh it from its own stale cache.
     pub(crate) fn execute_source_query(
         &self,
         sql: &str,
@@ -344,9 +328,6 @@ impl Runtime {
             }
             Statement::ShowUsers => return Ok(acl::users_describe_columns()),
             Statement::ShowGrants { .. } => return Ok(acl::grants_describe_columns()),
-            Statement::Funnel(_) => return Ok(events::funnel_describe_columns()),
-            Statement::Segment(_) => return Ok(events::segment_describe_columns()),
-            Statement::Paths(_) => return Ok(events::paths_describe_columns()),
             _ => return Ok(vec![("status".to_owned(), DataType::Text)]),
         }
         let physical = self.plan(sql)?;
@@ -479,8 +460,8 @@ impl Runtime {
     fn explain(&self, inner: &str) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         if !matches!(classify_statement(inner)?, Statement::Query(_)) {
             return Err(RuntimeError::Parse(fq_parse::ParseError::Unsupported(
-                "EXPLAIN takes a query; DDL, settings, and event-analysis \
-                 statements have no plan to explain"
+                "EXPLAIN takes a query; DDL and settings statements have no \
+                 plan to explain"
                     .to_string(),
             )));
         }
@@ -521,8 +502,8 @@ impl Drop for Runtime {
 
 /// The path of the stats SQLite that lives NEXT TO the config file
 /// (`<config-stem>.stats.sqlite`, one per configuration; it also carries the
-/// materialized-view and event-view registries), or `None` for a
-/// programmatically built config with no source path.
+/// materialized-view registry), or `None` for a programmatically built config
+/// with no source path.
 pub(crate) fn stats_sqlite_path(config: &Config) -> Option<std::path::PathBuf> {
     let source_path = config.source_path.as_deref()?;
     let path = std::path::Path::new(source_path);

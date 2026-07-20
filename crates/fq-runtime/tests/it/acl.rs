@@ -117,7 +117,9 @@ fn server_with_admin() -> ServerConfig {
 
 /// Run a DDL/admin statement as the embedded superuser, asserting success.
 fn run(runtime: &Runtime, sql: &str) {
-    runtime.execute(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+    runtime
+        .execute(sql)
+        .unwrap_or_else(|error| panic!("{sql}: {error}"));
 }
 
 /// Whether `describe` of `sql` binds (the principal is authorized for it).
@@ -137,7 +139,10 @@ fn a_table_grant_authorizes_that_table_and_denies_a_sibling() {
     let (_schema, batches) = runtime
         .execute("SELECT id FROM duck.main.orders")
         .expect("authorized query runs");
-    let rows: usize = batches.iter().map(arrow::array::RecordBatch::num_rows).sum();
+    let rows: usize = batches
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
     assert_eq!(rows, 2);
     // The sibling table is denied - and the deny is INDISTINGUISHABLE from a
     // genuinely missing table (existence non-leak).
@@ -238,6 +243,8 @@ fn bootstrap_refuses_to_start_without_a_superuser() {
         superuser: false,
     }];
     fq_runtime::import_bootstrap_users(&accel, &users).expect("import");
-    let error = fq_runtime::require_a_superuser(&accel).unwrap_err().to_string();
+    let error = fq_runtime::require_a_superuser(&accel)
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("superuser"), "refuse-start message: {error}");
 }

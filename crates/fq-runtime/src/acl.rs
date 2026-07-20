@@ -169,9 +169,6 @@ pub(crate) fn superuser_action(statement: &Statement) -> Option<&'static str> {
         Statement::CreateMaterializedView { .. } => Some("CREATE MATERIALIZED VIEW"),
         Statement::RefreshMaterializedView { .. } => Some("REFRESH MATERIALIZED VIEW"),
         Statement::DropMaterializedView { .. } => Some("DROP MATERIALIZED VIEW"),
-        Statement::CreateEventView { .. } => Some("CREATE EVENT VIEW"),
-        Statement::RefreshEventView { .. } => Some("REFRESH EVENT VIEW"),
-        Statement::DropEventView { .. } => Some("DROP EVENT VIEW"),
         _ => None,
     }
 }

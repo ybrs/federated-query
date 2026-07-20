@@ -99,16 +99,6 @@ pub enum RuntimeError {
     #[error("settings error: {0}")]
     Settings(String),
 
-    /// An event-view failure from fq-events: a role/contract violation, an
-    /// analysis spec the kernels refuse, or a registry miss.
-    #[error("event view error: {0}")]
-    Event(#[from] fq_events::EventError),
-
-    /// An event statement the runtime itself rejects: a name collision on
-    /// CREATE EVENT VIEW, or event DDL against a config with no file path.
-    #[error("event view error: {0}")]
-    EventView(String),
-
     /// A non-superuser tried to run an admin statement, or a `SHOW GRANTS FOR`
     /// another principal. An explicit message is correct here: a capability check
     /// names no object whose existence could leak (the statement kind is not a

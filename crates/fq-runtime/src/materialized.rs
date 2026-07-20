@@ -114,15 +114,11 @@ impl Runtime {
     /// 3. MERGE when the base table declares a primary key: re-pull whole,
     ///    rewrite only the chunks whose rows changed.
     /// 4. WHOLE re-pull otherwise; the status row names the reason.
-    ///
-    /// An EVENT view raises: its refresh must re-apply the (entity, timestamp)
-    /// sort contract, which this form skips - the EVENT VIEW forms own it.
     pub(crate) fn refresh_materialized_view(
         &self,
         name: &str,
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         let accel = self.accelerator()?;
-        self.reject_event_view(name, "REFRESH")?;
         let view = accel.view(name)?;
         let catalog = self.catalog_snapshot();
         let plan = delta::classify(&catalog, &self.config_snapshot(), &view.definition_sql)?;
@@ -250,30 +246,15 @@ impl Runtime {
     }
 
     /// `DROP MATERIALIZED VIEW name`: remove the registry row and the chunks;
-    /// the next statement no longer resolves the name. An EVENT view raises:
-    /// dropping it here would orphan its role row.
+    /// the next statement no longer resolves the name.
     pub(crate) fn drop_materialized_view(
         &self,
         name: &str,
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         let accel = self.accelerator()?;
-        self.reject_event_view(name, "DROP")?;
         accel.drop_view(name)?;
         self.install_views()?;
         status_result("DROP MATERIALIZED VIEW")
-    }
-
-    /// Raise when `name` is an event view: the materialized-view DDL forms must
-    /// not operate on one (the EVENT VIEW forms own its lifecycle; a plain-MV
-    /// refresh would skip the sort contract, a plain-MV drop would orphan the
-    /// role row).
-    fn reject_event_view(&self, name: &str, verb: &str) -> Result<(), RuntimeError> {
-        if self.is_event_view(name)? {
-            return Err(RuntimeError::MaterializedView(format!(
-                "'{name}' is an event view; use {verb} EVENT VIEW"
-            )));
-        }
-        Ok(())
     }
 
     /// The store, or a loud error for a config with no file path.

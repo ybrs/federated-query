@@ -24,9 +24,6 @@ fq-exec = { path = "../fq-exec" }
 # Materialized-view store: the DDL surface (CREATE/REFRESH/DROP MATERIALIZED
 # VIEW) executes here and persists through fq-accel.
 fq-accel = { path = "../fq-accel" }
-# Event analytics: the EVENT VIEW contract, role registry, and the FUNNEL /
-# SEGMENT kernels; the runtime composes it with fq-accel's storage.
-fq-events = { path = "../fq-events" }
 # CREATE/ALTER USER hashes a plaintext password into a stored SCRAM verifier
 # server-side; the plaintext lives only for the call frame and is never stored.
 fq-scram = { path = "../fq-scram" }

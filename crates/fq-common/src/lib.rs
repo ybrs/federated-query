@@ -14,7 +14,6 @@
 pub mod budget;
 pub mod config;
 pub mod error;
-pub mod events;
 pub mod logging;
 pub mod types;
 #[macro_use]

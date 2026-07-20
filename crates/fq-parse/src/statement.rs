@@ -2,7 +2,7 @@
 //! plain query.
 //!
 //! The engine's statement surface is queries plus three materialized-view DDL
-//! forms, four settings statements, and the event-analytics forms:
+//! forms and four settings statements:
 //!
 //! - `CREATE MATERIALIZED VIEW <name> AS <select>`
 //! - `REFRESH MATERIALIZED VIEW <name>`
@@ -10,8 +10,6 @@
 //! - `SHOW SETTINGS` / `SHOW SETTING <name>`
 //! - `SET <name> = <value>` (also `SET <name> TO <value>`)
 //! - `RESET <name>` / `RESET ALL`
-//! - `CREATE / REFRESH / DROP EVENT VIEW`, `FUNNEL`, `SEGMENT`, `PATHS` (the
-//!   event-analytics grammars live in `event_statement`)
 //!
 //! `classify_statement` recognizes these forms LEXICALLY (a quote-aware
 //! tokenizer, no full SQL parse) and returns everything else untouched as
@@ -36,11 +34,10 @@
 //!   own store, so none of these have a meaning here.
 
 use crate::error::ParseError;
-use fq_common::events::{EventRoleColumns, FunnelSpec, PathsSpec, SegmentSpec};
 
 /// One SQL statement, classified: a materialized-view DDL form, a settings
-/// statement, an event-analytics form, or a plain query passed through as text
-/// for the normal parse pipeline.
+/// statement, or a plain query passed through as text for the normal parse
+/// pipeline.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Statement<'a> {
     /// Anything that is not a recognized statement form; the full original text.
@@ -67,24 +64,6 @@ pub enum Statement<'a> {
     /// `RESET <name>` restores one setting to its default; `RESET ALL`
     /// (`name` is `None`) restores every session override.
     ResetSetting { name: Option<String> },
-    /// `CREATE EVENT VIEW <name> ENTITY <col> TIMESTAMP <col> EVENT <col>
-    /// [TIEBREAK <col>] AS <select>`: the view name, its role columns, and
-    /// the defining SELECT.
-    CreateEventView {
-        name: String,
-        roles: EventRoleColumns,
-        select_sql: &'a str,
-    },
-    /// `REFRESH EVENT VIEW <name>`.
-    RefreshEventView { name: String },
-    /// `DROP EVENT VIEW <name>`.
-    DropEventView { name: String },
-    /// `FUNNEL OVER <view> STEPS (...) WITHIN <n> <unit>`.
-    Funnel(FunnelSpec),
-    /// `SEGMENT OVER <view> MEASURE <m> [EVENT '<name>'] BY <bucket>`.
-    Segment(SegmentSpec),
-    /// `PATHS OVER <view> [STARTING AT '<name>'] MAX DEPTH <n> TOP <k>`.
-    Paths(PathsSpec),
     /// `CREATE DATASOURCE <name> TYPE <kind> WITH ( key = 'value', ... )`: the
     /// datasource name, its connector kind, and the ordered connection params.
     /// Values are strings (a bare integer is accepted for numeric params); the
@@ -178,16 +157,10 @@ pub fn classify_statement(sql: &str) -> Result<Statement<'_>, ParseError> {
         return Ok(Statement::Query(sql));
     };
     match first.to_ascii_uppercase().as_str() {
-        "REFRESH" if second_word_is(sql, "EVENT") => {
-            crate::event_statement::classify_refresh_event(&mut tokens)
-        }
-        // Any other REFRESH is the materialized-view form (REFRESH exists for
-        // nothing else), so its errors name what that form expects.
+        // REFRESH exists for nothing but the materialized-view form, so its
+        // errors name what that form expects.
         "REFRESH" => classify_refresh(&mut tokens),
         "CREATE" if second_word_is(sql, "MATERIALIZED") => classify_create(&mut tokens),
-        "CREATE" if second_word_is(sql, "EVENT") => {
-            crate::event_statement::classify_create_event(&mut tokens)
-        }
         "CREATE" if second_word_is(sql, "DATASOURCE") => classify_create_datasource(&mut tokens),
         "CREATE" if second_word_is(sql, "USER") => classify_create_user(&mut tokens),
         "ALTER" if second_word_is(sql, "USER") => classify_alter_user(&mut tokens),
@@ -204,9 +177,6 @@ pub fn classify_statement(sql: &str) -> Result<Statement<'_>, ParseError> {
                 .to_string(),
         )),
         "DROP" if second_word_is(sql, "MATERIALIZED") => classify_drop(&mut tokens),
-        "DROP" if second_word_is(sql, "EVENT") => {
-            crate::event_statement::classify_drop_event(&mut tokens)
-        }
         "DROP" if second_word_is(sql, "DATASOURCE") => classify_drop_datasource(&mut tokens),
         // ALTER exists in the engine only as a rejected datasource form: an
         // in-place repoint with partial-failure semantics has no atomic
@@ -216,9 +186,6 @@ pub fn classify_statement(sql: &str) -> Result<Statement<'_>, ParseError> {
              step; change a datasource with DROP DATASOURCE then CREATE DATASOURCE"
                 .to_string(),
         )),
-        "FUNNEL" => crate::event_statement::classify_funnel(&mut tokens),
-        "SEGMENT" => crate::event_statement::classify_segment(&mut tokens),
-        "PATHS" => crate::event_statement::classify_paths(&mut tokens),
         // SHOW is ours only for SETTING(S) and MATERIALIZED VIEWS; any other
         // SHOW passes through to the normal parser.
         "SHOW" if second_word_is(sql, "SETTINGS") || second_word_is(sql, "SETTING") => {
@@ -969,8 +936,8 @@ pub(crate) enum Token<'a> {
     Word(&'a str),
     /// A `"double quoted"` identifier with `""` escapes resolved.
     QuotedIdent(String),
-    /// A `'single quoted'` string literal with `''` escapes resolved (funnel
-    /// steps and segment event filters read the content).
+    /// A `'single quoted'` string literal with `''` escapes resolved (a
+    /// CREATE DATASOURCE WITH param value, a WITH PASSWORD literal).
     StringLiteral(String),
     /// Any other single character (punctuation, operator).
     Other(char),

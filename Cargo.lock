@@ -649,12 +649,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bytemuck"
-version = "1.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
-
-[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2021,18 +2015,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fq-events"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "chrono",
- "fq-common",
- "roaring",
- "rusqlite",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "fq-exec"
 version = "0.1.0"
 dependencies = [
@@ -2134,7 +2116,6 @@ dependencies = [
  "fq-common",
  "fq-connectors",
  "fq-decorrelate",
- "fq-events",
  "fq-exec",
  "fq-optimize",
  "fq-parse",
@@ -3991,16 +3972,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
-]
-
-[[package]]
-name = "roaring"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ba9ce64a8f45d7fc86358410bb1a82e8c987504c0d4900e9141d69a9f26c885"
-dependencies = [
- "bytemuck",
- "byteorder",
 ]
 
 [[package]]
