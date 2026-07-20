@@ -6,8 +6,8 @@
 //! (fq-physical/fq-runtime) and the CostModel/StatisticsCollector overlay
 //! (fq-optimize). They translate with those crates.
 //!
-//! `test_unknown_field_raises` retires: the upsert field is a compile-time enum,
-//! so an invalid column is unrepresentable (see the port note).
+//! There is no unknown-upsert-field test here: the upsert field is a
+//! compile-time enum, so an invalid column is unrepresentable.
 
 use std::sync::{Arc, Mutex};
 
@@ -308,6 +308,59 @@ fn test_predicate_output_rows_roundtrip() {
             .unwrap(),
         None
     );
+}
+
+#[test]
+fn test_concurrent_writers_over_one_file_all_succeed() {
+    // Two runtimes over the SAME config each hold their OWN Connection to the one
+    // stats SQLite and both write observations after their queries. WAL mode
+    // serializes writers and rusqlite installs a 5000ms busy handler, so a write
+    // that meets the write lock WAITS rather than failing - a concurrent write
+    // must never surface SQLITE_BUSY and fail an otherwise-correct query. Each
+    // writer targets its own table, so the round-trip reads confirm no write was
+    // lost under contention.
+    //
+    // The catalogs are opened up front (sequentially): concurrent WRITES are
+    // safe, but concurrent OPEN on a fresh file is not - the journal-mode-to-WAL
+    // transition and schema creation race outside the busy handler. That open
+    // race is reported as a finding, not pinned here.
+    let temp = TempPath::new("concurrent_writers");
+    let writers = 4;
+    let per_writer = 500;
+    let mut catalogs = Vec::new();
+    for _ in 0..writers {
+        catalogs.push(Arc::new(
+            StatsCatalog::open(&temp.path).expect("open stats catalog"),
+        ));
+    }
+    let start = Arc::new(std::sync::Barrier::new(writers));
+    let mut handles = Vec::new();
+    for (id, catalog) in catalogs.into_iter().enumerate() {
+        let start = Arc::clone(&start);
+        handles.push(std::thread::spawn(move || {
+            let table = format!("t{id}");
+            // Start every writer at once so their writes genuinely contend.
+            start.wait();
+            for value in 0..per_writer {
+                catalog
+                    .record_table_rows("ds", "public", &table, value)
+                    .expect("concurrent write must not fail with SQLITE_BUSY");
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("writer thread panicked");
+    }
+    // Every writer's last write is durable and readable through a fresh handle.
+    let reader = StatsCatalog::open(&temp.path).expect("reopen");
+    for id in 0..writers {
+        assert_eq!(
+            reader
+                .table_rows("ds", "public", &format!("t{id}"), None)
+                .unwrap(),
+            Some(per_writer - 1)
+        );
+    }
 }
 
 #[test]
