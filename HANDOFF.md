@@ -3,6 +3,8 @@
 This document is the working state of the Python->Rust rewrite of the engine.
 The Python engine's own development history is preserved in `oldhandoff.md`;
 the rewrite's earlier per-crate build log lives in git history of this file.
+Superseded plan docs were removed 2026-07-19 after digesting their decisions
+into `historical-docs/design-history.md` (full text in git history).
 
 ## What this is
 
@@ -25,7 +27,7 @@ Strategy (decided with the user, unchanged):
   BEHAVIOR, express it the natural Rust way.
 - Python is FROZEN during the rewrite (stable reference; no new features).
 
-## Where we stand (2026-07-14)
+## Where we stand (2026-07-20)
 
 ALL 17 CRATES ARE BUILT AND THE ENGINE IS COMPLETE END TO END: SQL -> parse ->
 bind -> decorrelate -> optimize -> PhysicalPlan -> Steps -> DataFusion
@@ -55,6 +57,29 @@ Correctness and perf, all measured by the suite runners (never ad hoc):
 - E2E SQL corpus: `tests/e2e_pushdown` runs against the Rust engine (temp YAML
   per env, `pa.Table` results, pushed SQL re-parsed from the textual EXPLAIN);
   416 pass, 0 fail.
+- FEDERATED PLACEMENT CORPUS: `tests/e2e_federated` - ~355 data-driven cases,
+  each run under 7 table placements (single-DuckDB oracle, duck|duck, pg|duck,
+  duck|pg, all-pg, parquet|duck, parquet|pg) and diffed value-by-value against
+  the single-DuckDB oracle; 2475 passing checks in ~130s, one process (the
+  suite README documents the harness, FEDQ_E2E_CORPUS module selection, and
+  the bounded env LRU). This is the placement-differential gate the TPC
+  tallies cannot provide at small scale.
+- CORRECTNESS ROUND (2026-07-19/20): the corpus found 8 engine bugs on its
+  first sweep; ALL are fixed, each with the corpus repro re-enabled as the
+  regression guard (commits ece36bc, cb721cf, b5055ed, 6615543, 8b407ef):
+  INTERSECT/EXCEPT ALL cross-source multisets (DataFusion is_all lowering is
+  semi/anti; coordinator rewrites with row_number tags), parquet NULLS
+  FIRST/LAST (parquet scans now render in DataFusion dialect), the pg stats
+  probe on unorderable column types (fail-closed orderability allowlist +
+  real pg error text surfaced), coordinator AVG over DECIMAL truncation
+  (double-cast at the three coordinator render paths; TPC-DS sf0.1 99|0|0
+  and TPC-H 22/22 re-verified), LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTILE,
+  the || execution IR form (StringConcat, null-propagating), IS DISTINCT
+  FROM as a general predicate, LIKE ... ESCAPE (first-class Expr::Like),
+  and the SESSION-SCOPED DATA PLANE: every fq-exec registry/cache/pool
+  connection keys on the runtime's SessionId and Runtime::drop releases
+  them - no cross-runtime table bleed, bounded pg connections, and the
+  full corpus runs in one process.
 
 Feature surface built on top of the core engine:
 
@@ -396,6 +421,14 @@ correctly, delete the repair block and its tests. See commit `26d3d9f`.
 ## Commit log (rewrite, newest first; earlier log in git history of this file)
 
 ```
+8b407ef Session-scoped data plane: no cross-runtime bleed, connections release
+6615543 LIKE gains a first-class plan variant carrying ESCAPE
+b5055ed Coordinator AVG over DECIMAL computes in double precision
+cb721cf Four engine fixes: || execution, IS DISTINCT FROM, window tail, pg probe
+ece36bc Fix INTERSECT ALL / EXCEPT ALL multisets and parquet null ordering
+2d722d3 Federated e2e correctness corpus: placement-matrix suite
+88188b2 Sweep stale docs into a design-history digest; fix stale deferral comments
+b073e92 Event view CREATE: sort in the executor; Parquet source for the events suite
 ac54283 Per-event-name row index + funnel column projection for selective funnels
 96eea41 HANDOFF + architecture docs rewritten against the current workspace
 df93802 Event sidecars: segment pre-aggregates (decisive win) + gated entity bitmaps
