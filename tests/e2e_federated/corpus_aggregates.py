@@ -519,33 +519,19 @@ CASES = [
             "THEN 'durable' ELSE 'other' END"
         ),
     },
-]
-
-SUSPECTED_ENGINE_BUGS = {
-    "agg_avg_decimal_price_by_category": {
+    {
+        "name": "agg_avg_decimal_price_by_category",
+        "tables": ["orders", "products"],
         "query": (
             "SELECT p.category AS cat, "
             "CAST(AVG(o.price) AS DOUBLE PRECISION) AS avg_price "
             "FROM {orders} o JOIN {products} p "
             "ON o.product_id = p.product_id GROUP BY p.category"
         ),
-        "tables": ["orders", "products"],
-        "finding": (
-            "CAST(AVG(decimal_column) AS DOUBLE PRECISION) over a cross-source "
-            "join loses precision to 6 fractional digits instead of full double "
-            "precision. Reproduced at placements duck_duck and pg_duck (no "
-            "PostgreSQL required to trigger it) and at oracle_single_duck it is "
-            "correct, so the divergence is specific to the multi-source merge "
-            "path's DECIMAL division, not to any one connector. For the "
-            "'electronics' category (orders 3, 4, 8 at prices 75.00, 125.00, "
-            "15.00): engine returned 71.666666, oracle (single DuckDB) returned "
-            "71.66666666666667. The 1e-9 relative-tolerance comparator still "
-            "catches this because the truncation error (~9.3e-9 relative) "
-            "exceeds tolerance. Removed from CASES so the suite stays green; "
-            "re-add once the merge engine's decimal-average division is fixed "
-            "to compute at double (or full decimal) precision before casting."
-        ),
     },
+]
+
+SUSPECTED_ENGINE_BUGS = {
     "agg_minmax_boolean_group_products": {
         "query": (
             "SELECT p.active AS active, MIN(o.price) AS min_price, "

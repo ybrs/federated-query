@@ -618,9 +618,9 @@ fn note_use(remaining: &mut HashMap<String, usize>, name: &str) {
 /// A plain source read. A spec the planner marked `parallel` goes through the
 /// ctid-partitioned parallel Postgres path (each partition on its own pooled
 /// connection; NOTE: separate connections read separate snapshots, the same
-/// trade-off the parallel probe scan already makes - a shared exported
-/// snapshot is the follow-up for concurrent-write sources). Everything else
-/// is a single-stream fetch.
+/// trade-off the parallel probe scan already makes - there is no shared
+/// exported snapshot, so a concurrently-written source can yield a torn
+/// read across partitions). Everything else is a single-stream fetch.
 fn fetch_source(datasource: &str, scan: &ScanSpec) -> ExecResult<Batches> {
     if !scan.parallel {
         return fetch_scan(datasource, scan, None);
@@ -774,7 +774,7 @@ fn parallel_steps_enabled() -> bool {
 /// reference a shipped TEMP table that exists only on the driving thread's
 /// PINNED connection, so it must never run on a prefetch worker (whose own
 /// connection cannot see it). Conservative by datasource, not by table: the
-/// IR does not yet carry per-scan ship-visibility edges.
+/// IR carries no per-scan ship-visibility edges.
 fn ship_target_datasources(ir: &Ir) -> HashSet<String> {
     let mut targets = HashSet::new();
     for step in &ir.steps {
@@ -1737,15 +1737,7 @@ fn grouping_sets_clause(
 }
 
 fn render_agg(agg: &AggCall) -> Result<String, DataFusionError> {
-    let inner = if agg.star {
-        "*".to_string()
-    } else {
-        let mut parts = Vec::with_capacity(agg.args.len());
-        for a in &agg.args {
-            parts.push(render_expr(&to_df_expr(a)?)?);
-        }
-        parts.join(", ")
-    };
+    let inner = render_agg_inner(agg)?;
     let distinct = if agg.distinct { "DISTINCT " } else { "" };
     let mut sql = format!("{}({}{})", agg.func, distinct, inner);
     if let Some(wg) = &agg.within_group {
@@ -1756,9 +1748,70 @@ fn render_agg(agg: &AggCall) -> Result<String, DataFusionError> {
     Ok(sql)
 }
 
+/// The parenthesized argument text of an aggregate call. `avg(x)` wraps its single
+/// argument in a cast to double so this DataFusion-coordinator aggregate computes
+/// the average at double precision: DataFusion's avg(Decimal(p,s)) returns
+/// Decimal(p+4, s+4) - scale 6 for a scale-2 input, which truncates the true
+/// average - while every source's avg and the DuckDB oracle return double. Casting
+/// the argument first makes the coordinator result a double that matches them.
+fn render_agg_inner(agg: &AggCall) -> Result<String, DataFusionError> {
+    if agg.star {
+        return Ok("*".to_string());
+    }
+    let mut parts = Vec::with_capacity(agg.args.len());
+    for a in &agg.args {
+        parts.push(render_expr(&to_df_expr(a)?)?);
+    }
+    if agg.func.eq_ignore_ascii_case("avg") && parts.len() == 1 {
+        return Ok(format!("CAST({} AS DOUBLE PRECISION)", parts[0]));
+    }
+    Ok(parts.join(", "))
+}
+
 /// Double-quote an identifier for a DataFusion SQL alias.
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+#[cfg(test)]
+mod render_agg_tests {
+    use super::render_agg;
+    use crate::core::ir::{AggCall, IrExpr};
+
+    fn col(name: &str) -> IrExpr {
+        IrExpr::Column {
+            relation: Some("o".to_string()),
+            name: name.to_string(),
+        }
+    }
+
+    fn agg(func: &str, args: Vec<IrExpr>) -> AggCall {
+        AggCall {
+            func: func.to_string(),
+            distinct: false,
+            star: false,
+            args,
+            within_group: None,
+        }
+    }
+
+    #[test]
+    fn avg_single_argument_casts_to_double() {
+        let sql = render_agg(&agg("avg", vec![col("price")]))
+            .expect("render")
+            .to_uppercase();
+        assert!(sql.starts_with("AVG("), "{sql}");
+        assert!(sql.contains("CAST("), "{sql}");
+        assert!(sql.contains("DOUBLE PRECISION"), "{sql}");
+    }
+
+    #[test]
+    fn sum_argument_is_not_cast() {
+        let sql = render_agg(&agg("sum", vec![col("price")]))
+            .expect("render")
+            .to_uppercase();
+        assert!(!sql.contains("CAST("), "{sql}");
+    }
 }
 
 /// Project a composed frame to its output columns, lazily when possible.

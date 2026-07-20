@@ -565,6 +565,16 @@ CASES = [
             "WHERE ROW_NUMBER() OVER (ORDER BY o.order_id) > 1"
         ),
     },
+    {
+        "name": "win_running_avg_partition_order",
+        "tables": ["orders", "customers"],
+        "query": (
+            "SELECT o.order_id, c.segment, "
+            "AVG(o.price) OVER (PARTITION BY c.segment ORDER BY o.order_id) "
+            "AS running_avg "
+            "FROM {orders} o JOIN {customers} c ON o.customer_id = c.customer_id"
+        ),
+    },
 ]
 
 # LAG, LEAD, FIRST_VALUE, LAST_VALUE, and NTILE are supported window functions
@@ -574,28 +584,3 @@ CASES = [
 # string-concatenation operator lowers to the `||` execution operator and runs
 # in every placement, cross-source included; CONCAT(...) remains available and
 # is exercised by win_concat_function.
-
-# Verified engine-vs-oracle mismatches, kept out of CASES (a case must never
-# be left red); each entry names the query, the placement(s) that reproduce
-# it, and the concrete expected vs. actual values.
-SUSPECTED_ENGINE_BUGS = {
-    "win_running_avg_partition_order": {
-        "query": (
-            "SELECT o.order_id, c.segment, "
-            "AVG(o.price) OVER (PARTITION BY c.segment ORDER BY o.order_id) "
-            "AS running_avg "
-            "FROM {orders} o JOIN {customers} c ON o.customer_id = c.customer_id"
-        ),
-        "finding": (
-            "duck_duck, pg_duck, duck_pg, all_pg, parquet_duck, and "
-            "parquet_pg (every placement except the fully-pushed-down "
-            "oracle_single_duck) return a truncated Decimal for the running "
-            "AVG instead of a double: engine row (8, 'smb', "
-            "Decimal('41.666666')) vs. oracle row (8, 'smb', "
-            "41.666666666666664). The merge engine's AVG(...) OVER "
-            "implementation computes in a fixed 6-digit-scale DECIMAL rather "
-            "than DOUBLE, losing precision and failing the comparator's "
-            "exact-Decimal rule."
-        ),
-    },
-}

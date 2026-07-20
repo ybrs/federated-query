@@ -413,11 +413,9 @@ pub fn serialize_expr(expr: &Expr) -> ExecResult<ir::IrExpr> {
         Expr::FunctionCall {
             function_name,
             args,
+            is_aggregate,
             ..
-        } => Ok(ir::IrExpr::Function {
-            name: function_name.to_lowercase(),
-            args: serialize_exprs(args)?,
-        }),
+        } => serialize_call(function_name, args, *is_aggregate),
         Expr::Window { .. }
         | Expr::Interval { .. }
         | Expr::Tuple { .. }
@@ -430,6 +428,42 @@ pub fn serialize_expr(expr: &Expr) -> ExecResult<ir::IrExpr> {
             expr.variant_label()
         ))),
     }
+}
+
+/// Lower a function/aggregate call to its execution IR. A coordinator `avg` over a
+/// double-typed argument wraps that argument in a cast to double. The engine models a
+/// DECIMAL source column's logical type as double, yet DataFusion reads the arrow
+/// Decimal128 the source actually returns and its avg(Decimal(p,s)) yields
+/// Decimal(p+4, s+4) - scale 6 for a scale-2 input, which truncates the true average -
+/// while every source's avg and the DuckDB oracle return double. Casting the argument
+/// first forces double-precision averaging that matches them; over a genuine double it
+/// is a value-preserving no-op. Only a single-argument double/decimal avg is rewritten;
+/// integer avg (already double in both engines) and other functions serialize unchanged.
+/// This IR only ever executes on the DataFusion coordinator, so source-pushdown SQL
+/// (rendered separately by fq-emit) is untouched.
+fn serialize_call(
+    function_name: &str,
+    args: &[Expr],
+    is_aggregate: bool,
+) -> ExecResult<ir::IrExpr> {
+    let name = function_name.to_lowercase();
+    if is_aggregate
+        && name == "avg"
+        && args.len() == 1
+        && matches!(args[0].get_type(), DataType::Double | DataType::Decimal)
+    {
+        return Ok(ir::IrExpr::Function {
+            name,
+            args: vec![ir::IrExpr::Cast {
+                expr: Box::new(serialize_expr(&args[0])?),
+                to: "float64".to_string(),
+            }],
+        });
+    }
+    Ok(ir::IrExpr::Function {
+        name,
+        args: serialize_exprs(args)?,
+    })
 }
 
 /// Lower a unary op: NOT / negate become `Unary`, IS [NOT] NULL become `IsNull`.
@@ -666,6 +700,59 @@ mod tests {
             serialize_expr(&expr).unwrap(),
             ir::IrExpr::Cast { to, .. } if to == "int64"
         ));
+    }
+
+    fn typed_column(table: &str, name: &str, data_type: DataType) -> Expr {
+        Expr::Column(ColumnRef::new(
+            Some(table.to_string()),
+            name,
+            Some(data_type),
+        ))
+    }
+
+    fn avg_call(arg: Expr) -> Expr {
+        Expr::FunctionCall {
+            function_name: "AVG".to_string(),
+            args: vec![arg],
+            is_aggregate: true,
+            distinct: false,
+            within_group_key: None,
+            within_group_desc: false,
+        }
+    }
+
+    #[test]
+    fn avg_decimal_argument_wraps_in_a_double_cast() {
+        // A DECIMAL source column binds to the logical Double type.
+        let expr = avg_call(typed_column("o", "price", DataType::Double));
+        match serialize_expr(&expr).unwrap() {
+            ir::IrExpr::Function { name, args } => {
+                assert_eq!(name, "avg");
+                assert_eq!(args.len(), 1);
+                assert!(
+                    matches!(&args[0], ir::IrExpr::Cast { to, .. } if to == "float64"),
+                    "expected a float64 cast, got {:?}",
+                    args[0]
+                );
+            }
+            other => panic!("expected avg function, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn avg_integer_argument_serializes_unchanged() {
+        let expr = avg_call(typed_column("o", "qty", DataType::BigInt));
+        match serialize_expr(&expr).unwrap() {
+            ir::IrExpr::Function { name, args } => {
+                assert_eq!(name, "avg");
+                assert!(
+                    matches!(&args[0], ir::IrExpr::Column { .. }),
+                    "integer avg must not be cast, got {:?}",
+                    args[0]
+                );
+            }
+            other => panic!("expected avg function, got {other:?}"),
+        }
     }
 
     #[test]

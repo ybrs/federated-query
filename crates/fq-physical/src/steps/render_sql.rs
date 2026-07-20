@@ -242,9 +242,57 @@ pub fn render_window_sql(
     aliases: &ColumnAliasMap,
 ) -> Result<String, StepError> {
     let resolver = merge_resolver(aliases);
-    let items = select_list(&node.expressions, &node.output_names, &resolver)?;
+    let exprs = cast_avg_exprs(&node.expressions);
+    let items = select_list(&exprs, &node.output_names, &resolver)?;
     let sql = format!("SELECT {items} FROM {MERGE_WINDOW_RELATION}");
     Ok(to_source_sql(&sql, Dialect::DuckDb)?)
+}
+
+/// The merge SELECT expressions with every coordinator `avg(decimal)` argument cast
+/// to double (see `cast_merge_avg_double`). Returns an owned rewritten copy so the
+/// shared plan node stays untouched. Called only from merge-engine (coordinator)
+/// renders; source-pushdown SQL never routes through it.
+fn cast_avg_exprs(exprs: &[Expr]) -> Vec<Expr> {
+    let mut out = Vec::with_capacity(exprs.len());
+    for expr in exprs {
+        out.push(cast_merge_avg_double(expr.clone()));
+    }
+    out
+}
+
+/// Wrap a coordinator `avg`'s double-typed argument in a cast to double. The merge
+/// engine runs this SQL on DataFusion; the engine models a DECIMAL column's logical
+/// type as double, yet DataFusion reads the arrow Decimal128 the source returns and
+/// its avg(Decimal(p,s)) yields Decimal(p+4, s+4) - scale 6 for a scale-2 input, which
+/// truncates the true average - while every source's avg and the DuckDB oracle return
+/// double. Casting the argument first forces double-precision averaging that matches
+/// them; over a genuine double it is a value-preserving no-op. Only a single-argument
+/// double/decimal avg is rewritten; integer avg and other functions pass through.
+fn cast_merge_avg_double(expr: Expr) -> Expr {
+    let mut expr = expr.map_children(&mut |child| cast_merge_avg_double(child));
+    if let Expr::FunctionCall {
+        function_name,
+        args,
+        is_aggregate,
+        ..
+    } = &mut expr
+    {
+        if *is_aggregate
+            && function_name.eq_ignore_ascii_case("avg")
+            && args.len() == 1
+            && matches!(args[0].get_type(), DataType::Double | DataType::Decimal)
+        {
+            let arg = args.remove(0);
+            // Fresh Cast node wrapping avg's decimal argument as double: there is no
+            // source Cast to copy from, so every field is listed here.
+            args.push(Expr::Cast {
+                expr: Box::new(arg),
+                target_type: "DOUBLE".to_string(),
+                data_type: Some(DataType::Double),
+            });
+        }
+    }
+    expr
 }
 
 /// Render `SELECT <outputs> FROM in_0 [GROUP BY <keys>]` for the merge engine, used
@@ -274,7 +322,8 @@ fn render_grouped_select(
     aliases: &ColumnAliasMap,
 ) -> Result<String, StepError> {
     let resolver = merge_resolver(aliases);
-    let items = select_list(exprs, names, &resolver)?;
+    let cast_exprs = cast_avg_exprs(exprs);
+    let items = select_list(&cast_exprs, names, &resolver)?;
     let mut sql = format!("SELECT {items} FROM {MERGE_AGGREGATE_RELATION}");
     if let Some(group) = group_by(keys, grouping_sets, &resolver)? {
         sql = format!("{sql} GROUP BY {group}");
@@ -449,7 +498,8 @@ fn render_stage2_window(
         aliases.insert((None, name.clone()), name.clone());
     }
     let resolver = merge_resolver(&aliases);
-    let select = select_list(items, output_names, &resolver)?;
+    let cast_items = cast_avg_exprs(items);
+    let select = select_list(&cast_items, output_names, &resolver)?;
     Ok(to_source_sql(
         &format!("SELECT {select} FROM {MERGE_AGGREGATE_RELATION}"),
         Dialect::DuckDb,
@@ -580,4 +630,126 @@ fn quote_names(names: &[String]) -> String {
         parts.push(quote_ident(name));
     }
     parts.join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fq_plan::physical::PhysicalPlan;
+
+    /// A minimal DuckDb scan used only as a window node's ignored input.
+    fn scan_stub() -> PhysicalScan {
+        PhysicalScan {
+            datasource: "duck".to_string(),
+            schema_name: "main".to_string(),
+            table_name: "orders".to_string(),
+            columns: vec!["price".to_string()],
+            filters: None,
+            sample: None,
+            group_by: None,
+            grouping_sets: None,
+            aggregates: None,
+            output_names: None,
+            alias: Some("o".to_string()),
+            limit: None,
+            offset: 0,
+            order_by_keys: None,
+            order_by_ascending: None,
+            order_by_nulls: None,
+            distinct: false,
+            dynamic_filter_keys: None,
+            estimated_rows: None,
+            column_ndv: None,
+            seeded_schema: None,
+            datasource_kind: DatasourceKind::DuckDb,
+        }
+    }
+
+    /// A typed, unqualified column (resolves to its bare name in the merge engine).
+    fn merge_col(name: &str, data_type: DataType) -> Expr {
+        Expr::Column(ColumnRef {
+            table: None,
+            column: name.to_string(),
+            data_type: Some(data_type),
+        })
+    }
+
+    /// `avg(arg) OVER ()` - a coordinator running average.
+    fn avg_over(arg: Expr) -> Expr {
+        Expr::Window {
+            function: Box::new(Expr::FunctionCall {
+                function_name: "avg".to_string(),
+                args: vec![arg],
+                is_aggregate: true,
+                distinct: false,
+                within_group_key: None,
+                within_group_desc: false,
+            }),
+            partition_by: vec![],
+            order_keys: vec![],
+            order_ascending: vec![],
+            order_nulls: vec![],
+            frame: None,
+        }
+    }
+
+    fn window_node(expr: Expr) -> PhysicalWindow {
+        PhysicalWindow {
+            input: Box::new(PhysicalPlan::Scan(Box::new(scan_stub()))),
+            expressions: vec![expr],
+            output_names: vec!["running_avg".to_string()],
+        }
+    }
+
+    #[test]
+    fn merge_window_avg_decimal_wraps_argument_in_double_cast() {
+        // A DECIMAL source column binds to the logical Double type.
+        let node = window_node(avg_over(merge_col("price", DataType::Double)));
+        let sql = render_window_sql(&node, &ColumnAliasMap::new())
+            .expect("render window")
+            .to_uppercase();
+        // The DataFusion-executed merge SQL averages a double, not a decimal.
+        assert!(sql.contains("CAST("), "expected a cast: {sql}");
+        assert!(sql.contains("DOUBLE"), "expected a double cast: {sql}");
+        assert!(sql.contains("OVER"), "expected a window: {sql}");
+    }
+
+    #[test]
+    fn merge_window_avg_integer_argument_is_unchanged() {
+        let node = window_node(avg_over(merge_col("qty", DataType::BigInt)));
+        let sql = render_window_sql(&node, &ColumnAliasMap::new())
+            .expect("render window")
+            .to_uppercase();
+        // Only decimal avg is rewritten; an integer avg keeps its plain form.
+        assert!(
+            !sql.contains("CAST("),
+            "integer avg must not be cast: {sql}"
+        );
+    }
+
+    #[test]
+    fn source_pushdown_avg_decimal_render_is_untouched() {
+        // A DuckDb-source aggregate scan (source pushdown, not the coordinator) must
+        // render avg plainly: the double-cast fix touches only merge-engine SQL.
+        let mut scan = scan_stub();
+        scan.aggregates = Some(vec![Expr::FunctionCall {
+            function_name: "avg".to_string(),
+            args: vec![Expr::Column(ColumnRef {
+                table: Some("o".to_string()),
+                column: "price".to_string(),
+                data_type: Some(DataType::Double),
+            })],
+            is_aggregate: true,
+            distinct: false,
+            within_group_key: None,
+            within_group_desc: false,
+        }]);
+        scan.output_names = Some(vec!["avg_price".to_string()]);
+        let sql = render_scan_sql(&scan).expect("render scan").to_uppercase();
+        assert!(sql.contains("AVG("), "expected an avg call: {sql}");
+        assert!(
+            !sql.contains("CAST("),
+            "source pushdown avg must not gain a cast: {sql}"
+        );
+    }
 }
