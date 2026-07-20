@@ -57,8 +57,8 @@ impl Converter<'_> {
             Expression::Cast(cast) => self.convert_cast(cast),
             Expression::Case(case) => self.convert_case(case),
             Expression::Between(between) => self.convert_between(between),
-            Expression::Like(like) => self.convert_like(like, BinaryOpType::Like),
-            Expression::ILike(like) => self.convert_like(like, BinaryOpType::Ilike),
+            Expression::Like(like) => self.convert_like(like, false),
+            Expression::ILike(like) => self.convert_like(like, true),
             Expression::RegexpLike(regexp) => self.convert_regexp(regexp),
             Expression::In(in_expr) => self.convert_in(in_expr),
             Expression::Exists(exists) => self.convert_exists(exists),
@@ -235,22 +235,47 @@ impl Converter<'_> {
         Ok(negate_if(between.not, range))
     }
 
-    /// Convert `x LIKE y` / `x ILIKE y` to a binary op. An ESCAPE clause or a
+    /// Convert `x [I]LIKE y [ESCAPE 'c']`. `case_insensitive` is set for ILIKE. A
     /// quantifier (LIKE ANY/ALL) is not modeled, so it raises rather than drop it.
-    fn convert_like(&self, like: &LikeOp, op: BinaryOpType) -> Result<Expr, ParseError> {
-        if like.escape.is_some() {
-            return Err(ParseError::Unsupported("LIKE ... ESCAPE".to_string()));
-        }
+    /// Negation (`x NOT LIKE y`) arrives as a wrapping `Expression::Not`, so this
+    /// node itself is never negated.
+    fn convert_like(&self, like: &LikeOp, case_insensitive: bool) -> Result<Expr, ParseError> {
         if like.quantifier.is_some() {
             return Err(ParseError::Unsupported("quantified LIKE".to_string()));
         }
-        // Fresh LIKE/ILIKE binary op built from the parsed operands - no base to copy
-        // from. Field list (op/left/right) is the complete BinaryOp variant.
-        Ok(Expr::BinaryOp {
-            op,
-            left: Box::new(self.expr(&like.left)?),
-            right: Box::new(self.expr(&like.right)?),
+        let escape = match &like.escape {
+            Some(escape) => Some(self.escape_char(escape)?),
+            None => None,
+        };
+        // Fresh LIKE/ILIKE predicate built from the parsed operands - no base to copy
+        // from. Field list (case_insensitive/expr/pattern/escape) is complete.
+        Ok(Expr::Like {
+            case_insensitive,
+            expr: Box::new(self.expr(&like.left)?),
+            pattern: Box::new(self.expr(&like.right)?),
+            escape,
         })
+    }
+
+    /// The single-character escape string of a LIKE `ESCAPE` clause. SQL requires
+    /// exactly one character; an empty or multi-character string, or a non-literal
+    /// escape expression, RAISES rather than silently truncate or drop it.
+    fn escape_char(&self, escape: &Expression) -> Result<String, ParseError> {
+        let Expr::Literal {
+            value: LiteralValue::String(text),
+            ..
+        } = self.expr(escape)?
+        else {
+            return Err(ParseError::Unsupported(
+                "LIKE ESCAPE with a non-string-literal escape".to_string(),
+            ));
+        };
+        if text.chars().count() != 1 {
+            return Err(ParseError::Unsupported(format!(
+                "LIKE ESCAPE must be a single character, got '{text}'"
+            )));
+        }
+        Ok(text)
     }
 
     /// Convert `x [NOT] IN (list)` or `x [NOT] IN (subquery)`.

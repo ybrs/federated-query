@@ -821,13 +821,14 @@ mod tests {
 
         let mut node = Scan::new("duck", "main", "t", vec!["name".to_string()]);
         node.alias = Some("t".to_string());
-        node.filters = Some(Expr::BinaryOp {
-            op: BinaryOpType::Like,
-            left: Box::new(col("t", "name")),
-            right: Box::new(Expr::Literal {
+        node.filters = Some(Expr::Like {
+            case_insensitive: false,
+            expr: Box::new(col("t", "name")),
+            pattern: Box::new(Expr::Literal {
                 value: LiteralValue::String("%x%".into()),
                 data_type: DataType::Varchar,
             }),
+            escape: None,
         });
         let estimate = cost.estimate(&LogicalPlan::Scan(Box::new(node))).unwrap();
         // The measured output (5) beats the no-reduction bound (1000); no gap.

@@ -104,6 +104,7 @@ pub fn python_class_name(expr: &Expr) -> &'static str {
         Expr::Case { .. } => "CaseExpr",
         Expr::InList { .. } => "InList",
         Expr::Between { .. } => "BetweenExpression",
+        Expr::Like { .. } => "LikeExpression",
         Expr::Cast { .. } => "Cast",
         Expr::Window { .. } => "WindowExpr",
         Expr::Extract { .. } => "Extract",
@@ -244,6 +245,16 @@ fn node_predicate(node: &LogicalPlan) -> Option<&Expr> {
 fn conjunct_shape(conjunct: &Expr, alias_map: &HashMap<String, String>) -> String {
     let operator = match conjunct {
         Expr::BinaryOp { op, .. } => op.value(),
+        // A LIKE/ILIKE predicate keys by its SQL token (not the class name) so the
+        // learned-predicate template stays the readable `LIKE(col)` / `ILIKE(col)`.
+        Expr::Like {
+            case_insensitive: true,
+            ..
+        } => "ILIKE",
+        Expr::Like {
+            case_insensitive: false,
+            ..
+        } => "LIKE",
         other => python_class_name(other),
     };
     let mut columns = Vec::new();

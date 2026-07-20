@@ -334,6 +334,17 @@ pub enum IrExpr {
         #[serde(default)]
         negated: bool,
     },
+    /// `expr [I]LIKE pattern [ESCAPE 'c']`. `escape` is the single escape
+    /// character; `case_insensitive` selects ILIKE. Negation is carried by a
+    /// wrapping `Unary { op: "not" }`, so this node is never negated on its own.
+    Like {
+        expr: Box<IrExpr>,
+        pattern: Box<IrExpr>,
+        #[serde(default)]
+        case_insensitive: bool,
+        #[serde(default)]
+        escape: Option<char>,
+    },
     /// A scalar function call resolved by name against DataFusion's built-in
     /// functions (e.g. `date_part`, `substr`). EXTRACT lowers to `date_part`.
     Function {

@@ -16,7 +16,7 @@ use arrow::datatypes::DataType;
 use datafusion::common::{Column, DataFusionError, ScalarValue, TableReference};
 use datafusion::functions::all_default_functions;
 use datafusion::functions_aggregate::all_default_aggregate_functions;
-use datafusion::logical_expr::expr::{AggregateFunction, Case, InList, ScalarFunction};
+use datafusion::logical_expr::expr::{AggregateFunction, Case, InList, Like, ScalarFunction};
 use datafusion::logical_expr::{AggregateUDF, BinaryExpr, Cast, Expr, Operator, ScalarUDF};
 use datafusion::prelude::lit;
 
@@ -96,6 +96,24 @@ pub fn to_df_expr(e: &IrExpr) -> Result<Expr, DataFusionError> {
             } else {
                 inner.is_null()
             })
+        }
+        IrExpr::Like {
+            expr,
+            pattern,
+            case_insensitive,
+            escape,
+        } => {
+            let inner = to_df_expr(expr)?;
+            let pat = to_df_expr(pattern)?;
+            // Negation is a wrapping `Unary { op: "not" }` node, so the LIKE itself is
+            // never negated here.
+            Ok(Expr::Like(Like::new(
+                false,
+                Box::new(inner),
+                Box::new(pat),
+                *escape,
+                *case_insensitive,
+            )))
         }
         IrExpr::Function { name, args } => {
             let mut df_args = Vec::with_capacity(args.len());
@@ -252,5 +270,30 @@ mod tests {
     #[test]
     fn double_pipe_maps_to_string_concat() {
         assert_eq!(operator("||").unwrap(), Operator::StringConcat);
+    }
+
+    #[test]
+    fn like_lowers_to_datafusion_like_with_escape() {
+        // A plain LIKE lowers to an Expr::Like with no escape and case-sensitive.
+        let plain = parse(
+            r#"{"node":"like","expr":{"node":"column","relation":"t","name":"a"},
+                "pattern":{"node":"literal","value":{"lit":"str","value":"x%"}}}"#,
+        );
+        let df = to_df_expr(&plain).unwrap();
+        let Expr::Like(like) = df else {
+            panic!("expected Expr::Like, got {df:?}");
+        };
+        assert!(!like.negated && !like.case_insensitive && like.escape_char.is_none());
+
+        // ILIKE ... ESCAPE carries both the escape char and case-insensitivity.
+        let escaped = parse(
+            r#"{"node":"like","expr":{"node":"column","relation":"t","name":"a"},
+                "pattern":{"node":"literal","value":{"lit":"str","value":"x@%"}},
+                "case_insensitive":true,"escape":"@"}"#,
+        );
+        let Expr::Like(like) = to_df_expr(&escaped).unwrap() else {
+            panic!("expected Expr::Like");
+        };
+        assert!(like.case_insensitive && like.escape_char == Some('@'));
     }
 }

@@ -66,6 +66,18 @@ pub fn render_expr(expr: &Expr, resolver: &dyn ColumnResolver) -> Result<String,
             render_expr(lower, resolver)?,
             render_expr(upper, resolver)?
         )),
+        Expr::Like {
+            case_insensitive,
+            expr,
+            pattern,
+            escape,
+        } => render_like(
+            *case_insensitive,
+            expr,
+            pattern,
+            escape.as_deref(),
+            resolver,
+        ),
         Expr::Cast {
             expr, target_type, ..
         } => Ok(format!(
@@ -146,6 +158,29 @@ fn render_unary(
         UnaryOpType::Negate => format!("(-{inner})"),
         UnaryOpType::IsNull => format!("({inner} IS NULL)"),
         UnaryOpType::IsNotNull => format!("({inner} IS NOT NULL)"),
+    })
+}
+
+/// Render `expr [I]LIKE pattern [ESCAPE 'c']`, whole thing parenthesized like the
+/// other predicate forms. ILIKE and the ESCAPE clause are both valid Postgres that
+/// polyglot round-trips, so the transpile boundary carries them to each dialect.
+fn render_like(
+    case_insensitive: bool,
+    expr: &Expr,
+    pattern: &Expr,
+    escape: Option<&str>,
+    resolver: &dyn ColumnResolver,
+) -> Result<String, EmitError> {
+    let keyword = if case_insensitive { "ILIKE" } else { "LIKE" };
+    let base = format!(
+        "{} {} {}",
+        render_expr(expr, resolver)?,
+        keyword,
+        render_expr(pattern, resolver)?
+    );
+    Ok(match escape {
+        Some(character) => format!("({base} ESCAPE '{}')", character.replace('\'', "''")),
+        None => format!("({base})"),
     })
 }
 
@@ -915,6 +950,40 @@ mod tests {
         let rendered = format!("SELECT {} FROM \"main\".\"t\"", render(&div));
         to_source_sql(&rendered, Dialect::Postgres).unwrap();
         to_source_sql(&rendered, Dialect::DuckDb).unwrap();
+    }
+
+    #[test]
+    fn like_renders_and_escape_survives_transpile() {
+        // Plain LIKE and ILIKE render as parenthesized predicates.
+        let like = Expr::Like {
+            case_insensitive: false,
+            expr: Box::new(col("t", "name")),
+            pattern: Box::new(string("x%")),
+            escape: None,
+        };
+        assert_eq!(render(&like), "(\"t\".\"name\" LIKE 'x%')");
+        let ilike = Expr::Like {
+            case_insensitive: true,
+            expr: Box::new(col("t", "name")),
+            pattern: Box::new(string("x%")),
+            escape: None,
+        };
+        assert_eq!(render(&ilike), "(\"t\".\"name\" ILIKE 'x%')");
+
+        // The ESCAPE clause renders after the pattern and survives transpilation to
+        // both Postgres and DuckDB (both support LIKE ... ESCAPE).
+        let escaped = Expr::Like {
+            case_insensitive: false,
+            expr: Box::new(col("t", "name")),
+            pattern: Box::new(string("x!%%")),
+            escape: Some("!".to_string()),
+        };
+        assert_eq!(render(&escaped), "(\"t\".\"name\" LIKE 'x!%%' ESCAPE '!')");
+        let rendered = format!("SELECT {} FROM \"main\".\"t\"", render(&escaped));
+        let pg = to_source_sql(&rendered, Dialect::Postgres).unwrap();
+        assert!(pg.to_uppercase().contains("ESCAPE"), "postgres: {pg}");
+        let duck = to_source_sql(&rendered, Dialect::DuckDb).unwrap();
+        assert!(duck.to_uppercase().contains("ESCAPE"), "duckdb: {duck}");
     }
 
     #[test]

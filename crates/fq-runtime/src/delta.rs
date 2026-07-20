@@ -260,6 +260,7 @@ fn require_deterministic(expr: &Expr) -> Result<(), String> {
         | Expr::Case { .. }
         | Expr::InList { .. }
         | Expr::Between { .. }
+        | Expr::Like { .. }
         | Expr::Cast { .. }
         | Expr::Extract { .. }
         | Expr::Interval { .. }

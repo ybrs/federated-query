@@ -273,6 +273,7 @@ fn is_pushable_shape(expr: &Expr) -> bool {
             | Expr::Literal { .. }
             | Expr::InList { .. }
             | Expr::Between { .. }
+            | Expr::Like { .. }
     )
 }
 

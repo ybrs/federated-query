@@ -92,6 +92,22 @@ impl Binder<'_> {
                 value: Box::new(self.bind_expr(value)?),
                 options: self.bind_expr_list(options)?,
             }),
+            Expr::Like {
+                case_insensitive,
+                expr: inner,
+                pattern,
+                escape,
+            } => {
+                // Fresh bound copy from the borrowed source (no `..base` on an enum
+                // variant): both operands rebound, case_insensitive and escape copied.
+                // Field list (case_insensitive/expr/pattern/escape) is complete.
+                Ok(Expr::Like {
+                    case_insensitive: *case_insensitive,
+                    expr: Box::new(self.bind_expr(inner)?),
+                    pattern: Box::new(self.bind_expr(pattern)?),
+                    escape: escape.clone(),
+                })
+            }
             Expr::Case {
                 when_clauses,
                 else_result,

@@ -32,6 +32,8 @@ pub fn tracked_selectivity(
             upper,
         } => tracked_between(value, lower, upper, stats, target),
         Expr::InList { value, options } => tracked_in_list(value, options, stats, target),
+        // Pattern selectivity is not derivable from catalog statistics.
+        Expr::Like { .. } => (None, vec![format!("like_selectivity({target})")]),
         other => (
             None,
             vec![format!(
@@ -74,8 +76,6 @@ fn tracked_binary(
                 None => (None, vec![format!("range_selectivity({target})")]),
             }
         }
-        // Pattern selectivity is not derivable from catalog statistics.
-        BinaryOpType::Like => (None, vec![format!("like_selectivity({target})")]),
         other => (
             None,
             vec![format!("selectivity({target}:{})", other.value())],
@@ -546,14 +546,15 @@ mod tests {
 
     #[test]
     fn like_records_gap() {
-        let like = binop(
-            BinaryOpType::Like,
-            col("a"),
-            Expr::Literal {
+        let like = Expr::Like {
+            case_insensitive: false,
+            expr: Box::new(col("a")),
+            pattern: Box::new(Expr::Literal {
                 value: LiteralValue::String("%x%".into()),
                 data_type: DataType::Varchar,
-            },
-        );
+            }),
+            escape: None,
+        };
         let (sel, gaps) = tracked_selectivity(&like, None, "t");
         assert_eq!(sel, None);
         assert_eq!(gaps, vec!["like_selectivity(t)"]);

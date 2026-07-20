@@ -181,36 +181,79 @@ fn comma_join_folds_into_cross_joins() {
     assert_eq!(inner.join_type, fq_plan::JoinType::Cross);
 }
 
-#[test]
-fn like_and_ilike_map_to_binary_ops() {
-    use fq_plan::expr::BinaryOpType;
-    let plan = parse("SELECT a FROM t WHERE t.name LIKE 'x%'").unwrap();
+/// The WHERE predicate of `SELECT a FROM t WHERE <sql>`.
+fn where_predicate(sql: &str) -> fq_plan::Expr {
+    let plan = parse(&format!("SELECT a FROM t WHERE {sql}")).unwrap();
     let LogicalPlan::Projection(projection) = plan else {
         panic!("expected Projection");
     };
     let LogicalPlan::Filter(filter) = projection.input.as_ref() else {
         panic!("expected Filter");
     };
-    let fq_plan::Expr::BinaryOp { op, .. } = &filter.predicate else {
-        panic!("expected a binary op predicate, got {:?}", filter.predicate);
+    filter.predicate.clone()
+}
+
+#[test]
+fn like_and_ilike_map_to_like_nodes() {
+    // Plain LIKE: a case-sensitive Like with no escape.
+    let fq_plan::Expr::Like {
+        case_insensitive,
+        escape,
+        ..
+    } = where_predicate("t.name LIKE 'x%'")
+    else {
+        panic!("expected a Like predicate");
     };
-    assert_eq!(*op, BinaryOpType::Like);
+    assert!(!case_insensitive);
+    assert_eq!(escape, None);
+
+    // ILIKE sets case_insensitive.
+    let fq_plan::Expr::Like {
+        case_insensitive, ..
+    } = where_predicate("t.name ILIKE 'x%'")
+    else {
+        panic!("expected a Like predicate");
+    };
+    assert!(case_insensitive);
 
     // NOT LIKE wraps the Like in a NOT.
-    let plan = parse("SELECT a FROM t WHERE t.name NOT LIKE 'x%'").unwrap();
-    let LogicalPlan::Projection(p) = plan else {
-        panic!()
-    };
-    let LogicalPlan::Filter(f) = p.input.as_ref() else {
-        panic!()
-    };
     assert!(matches!(
-        &f.predicate,
+        where_predicate("t.name NOT LIKE 'x%'"),
         fq_plan::Expr::UnaryOp {
             op: fq_plan::expr::UnaryOpType::Not,
             ..
         }
     ));
+}
+
+#[test]
+fn like_escape_clause_is_carried() {
+    // LIKE ... ESCAPE keeps the single escape character on the Like node.
+    let fq_plan::Expr::Like { escape, .. } = where_predicate("t.name LIKE 'x!%%' ESCAPE '!'")
+    else {
+        panic!("expected a Like predicate");
+    };
+    assert_eq!(escape.as_deref(), Some("!"));
+
+    // ILIKE ... ESCAPE combines case-insensitivity with the escape character.
+    let fq_plan::Expr::Like {
+        case_insensitive,
+        escape,
+        ..
+    } = where_predicate("t.name ILIKE 'x@_' ESCAPE '@'")
+    else {
+        panic!("expected a Like predicate");
+    };
+    assert!(case_insensitive);
+    assert_eq!(escape.as_deref(), Some("@"));
+}
+
+#[test]
+fn like_escape_must_be_single_character() {
+    // A multi-character or empty escape string is invalid SQL and RAISES rather
+    // than being silently truncated or dropped.
+    assert!(parse("SELECT a FROM t WHERE t.name LIKE 'x' ESCAPE '!!'").is_err());
+    assert!(parse("SELECT a FROM t WHERE t.name LIKE 'x' ESCAPE ''").is_err());
 }
 
 #[test]

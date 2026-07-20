@@ -66,8 +66,6 @@ pub enum BinaryOpType {
     Or,
     // String
     Concat,
-    Like,
-    Ilike,
     RegexMatch,
     RegexImatch,
 }
@@ -92,8 +90,6 @@ impl BinaryOpType {
             BinaryOpType::And => "AND",
             BinaryOpType::Or => "OR",
             BinaryOpType::Concat => "||",
-            BinaryOpType::Like => "LIKE",
-            BinaryOpType::Ilike => "ILIKE",
             BinaryOpType::RegexMatch => "~",
             BinaryOpType::RegexImatch => "~*",
         }
@@ -111,8 +107,6 @@ impl BinaryOpType {
                 | BinaryOpType::Lte
                 | BinaryOpType::Gt
                 | BinaryOpType::Gte
-                | BinaryOpType::Like
-                | BinaryOpType::Ilike
                 | BinaryOpType::NullSafeEq
                 | BinaryOpType::NullSafeNeq
                 | BinaryOpType::RegexMatch
@@ -233,6 +227,17 @@ pub enum Expr {
         lower: Box<Expr>,
         upper: Box<Expr>,
     },
+    /// `expr [I]LIKE pattern [ESCAPE 'c']`. `case_insensitive` distinguishes ILIKE
+    /// from LIKE; `escape` is the single-character escape string when an ESCAPE
+    /// clause is present, else None. Negation is carried by a wrapping
+    /// `UnaryOp::Not` (as for Between and InList), so this node is never negated
+    /// on its own.
+    Like {
+        case_insensitive: bool,
+        expr: Box<Expr>,
+        pattern: Box<Expr>,
+        escape: Option<String>,
+    },
     Cast {
         expr: Box<Expr>,
         /// Original SQL type text, so the cast re-renders verbatim to a source.
@@ -294,6 +299,7 @@ impl Expr {
             Expr::Case { .. } => "case_expr",
             Expr::InList { .. } => "in_list",
             Expr::Between { .. } => "between",
+            Expr::Like { .. } => "like",
             Expr::Cast { .. } => "cast",
             Expr::Window { .. } => "window_expr",
             Expr::Extract { .. } => "extract",
@@ -338,7 +344,7 @@ impl Expr {
                 when_clauses,
                 else_result,
             } => case_type(when_clauses, else_result.as_deref()),
-            Expr::InList { .. } | Expr::Between { .. } => DataType::Boolean,
+            Expr::InList { .. } | Expr::Between { .. } | Expr::Like { .. } => DataType::Boolean,
             Expr::Window { function, .. } => function.get_type(),
             Expr::Extract { .. } => DataType::BigInt,
             Expr::Interval { .. } => DataType::Interval,
@@ -403,6 +409,8 @@ impl Expr {
                 lower,
                 upper,
             } => vec![value, lower, upper],
+            // The escape is a fixed single-character string, not a sub-expression.
+            Expr::Like { expr, pattern, .. } => vec![expr, pattern],
             Expr::Tuple { items } => items.iter().collect(),
             Expr::Window {
                 function,
@@ -448,15 +456,7 @@ impl Expr {
                 expr,
                 target_type,
                 data_type,
-            } => {
-                // Variant rebuild: the pattern moved every field out of `self`, so
-                // no base remains for `..`/update!; compiler forces all fields listed.
-                Expr::Cast {
-                    expr: Box::new(f(*expr)),
-                    target_type,
-                    data_type,
-                }
-            }
+            } => map_cast(*expr, target_type, data_type, f),
             // Variant rebuild: the pattern moved every field out of `self`, so no
             // base remains for `..`/update!; compiler forces all fields listed (loud).
             Expr::Extract { field, source } => Expr::Extract {
@@ -470,18 +470,15 @@ impl Expr {
                 distinct,
                 within_group_key,
                 within_group_desc,
-            } => {
-                // Variant rebuild: the pattern moved every field out of `self`, so
-                // no base remains for `..`/update!; compiler forces all fields listed.
-                Expr::FunctionCall {
-                    function_name,
-                    args: map_vec(args, f),
-                    is_aggregate,
-                    distinct,
-                    within_group_key: within_group_key.map(|key| Box::new(f(*key))),
-                    within_group_desc,
-                }
-            }
+            } => map_function_call(
+                function_name,
+                args,
+                is_aggregate,
+                distinct,
+                within_group_key,
+                within_group_desc,
+                f,
+            ),
             Expr::Case {
                 when_clauses,
                 else_result,
@@ -506,13 +503,20 @@ impl Expr {
                 value,
                 lower,
                 upper,
+            } => map_between(*value, *lower, *upper, f),
+            Expr::Like {
+                case_insensitive,
+                expr,
+                pattern,
+                escape,
             } => {
                 // Variant rebuild: the pattern moved every field out of `self`, so
                 // no base remains for `..`/update!; compiler forces all fields listed.
-                Expr::Between {
-                    value: Box::new(f(*value)),
-                    lower: Box::new(f(*lower)),
-                    upper: Box::new(f(*upper)),
+                Expr::Like {
+                    case_insensitive,
+                    expr: Box::new(f(*expr)),
+                    pattern: Box::new(f(*pattern)),
+                    escape,
                 }
             }
             // Variant rebuild: the pattern moved every field out of `self`, so no
@@ -527,18 +531,15 @@ impl Expr {
                 order_ascending,
                 order_nulls,
                 frame,
-            } => {
-                // Variant rebuild: the pattern moved every field out of `self`, so
-                // no base remains for `..`/update!; compiler forces all fields listed.
-                Expr::Window {
-                    function: Box::new(f(*function)),
-                    partition_by: map_vec(partition_by, f),
-                    order_keys: map_vec(order_keys, f),
-                    order_ascending,
-                    order_nulls,
-                    frame,
-                }
-            }
+            } => map_window(
+                *function,
+                partition_by,
+                order_keys,
+                order_ascending,
+                order_nulls,
+                frame,
+                f,
+            ),
         }
     }
 
@@ -576,15 +577,7 @@ impl Expr {
                 expr,
                 target_type,
                 data_type,
-            } => {
-                // Variant rebuild: the pattern moved every field out of `self`, so
-                // no base remains for `..`/update!; compiler forces all fields listed.
-                Expr::Cast {
-                    expr: Box::new(f(*expr)?),
-                    target_type,
-                    data_type,
-                }
-            }
+            } => try_map_cast(*expr, target_type, data_type, f)?,
             // Variant rebuild: the pattern moved every field out of `self`, so no
             // base remains for `..`/update!; compiler forces all fields listed (loud).
             Expr::Extract { field, source } => Expr::Extract {
@@ -598,21 +591,15 @@ impl Expr {
                 distinct,
                 within_group_key,
                 within_group_desc,
-            } => {
-                // Variant rebuild: the pattern moved every field out of `self`, so
-                // no base remains for `..`/update!; compiler forces all fields listed.
-                Expr::FunctionCall {
-                    function_name,
-                    args: try_map_vec(args, f)?,
-                    is_aggregate,
-                    distinct,
-                    within_group_key: match within_group_key {
-                        Some(key) => Some(Box::new(f(*key)?)),
-                        None => None,
-                    },
-                    within_group_desc,
-                }
-            }
+            } => try_map_function_call(
+                function_name,
+                args,
+                is_aggregate,
+                distinct,
+                within_group_key,
+                within_group_desc,
+                f,
+            )?,
             Expr::Case {
                 when_clauses,
                 else_result,
@@ -637,13 +624,20 @@ impl Expr {
                 value,
                 lower,
                 upper,
+            } => try_map_between(*value, *lower, *upper, f)?,
+            Expr::Like {
+                case_insensitive,
+                expr,
+                pattern,
+                escape,
             } => {
                 // Variant rebuild: the pattern moved every field out of `self`, so
                 // no base remains for `..`/update!; compiler forces all fields listed.
-                Expr::Between {
-                    value: Box::new(f(*value)?),
-                    lower: Box::new(f(*lower)?),
-                    upper: Box::new(f(*upper)?),
+                Expr::Like {
+                    case_insensitive,
+                    expr: Box::new(f(*expr)?),
+                    pattern: Box::new(f(*pattern)?),
+                    escape,
                 }
             }
             // Variant rebuild: the pattern moved every field out of `self`, so no
@@ -658,18 +652,15 @@ impl Expr {
                 order_ascending,
                 order_nulls,
                 frame,
-            } => {
-                // Variant rebuild: the pattern moved every field out of `self`, so
-                // no base remains for `..`/update!; compiler forces all fields listed.
-                Expr::Window {
-                    function: Box::new(f(*function)?),
-                    partition_by: try_map_vec(partition_by, f)?,
-                    order_keys: try_map_vec(order_keys, f)?,
-                    order_ascending,
-                    order_nulls,
-                    frame,
-                }
-            }
+            } => try_map_window(
+                *function,
+                partition_by,
+                order_keys,
+                order_ascending,
+                order_nulls,
+                frame,
+                f,
+            )?,
         })
     }
 
@@ -688,6 +679,161 @@ impl Expr {
 /// Apply `f` to each expression in a vector.
 fn map_vec(items: Vec<Expr>, f: &mut impl FnMut(Expr) -> Expr) -> Vec<Expr> {
     items.into_iter().map(f).collect()
+}
+
+/// Rebuild a `FunctionCall` with `f` mapped over its arguments and optional
+/// ordered-set key; the name and the aggregate/distinct/direction flags carry over.
+fn map_function_call(
+    function_name: String,
+    args: Vec<Expr>,
+    is_aggregate: bool,
+    distinct: bool,
+    within_group_key: Option<Box<Expr>>,
+    within_group_desc: bool,
+    f: &mut impl FnMut(Expr) -> Expr,
+) -> Expr {
+    // Variant rebuild: every field is listed explicitly (args and the ordered-set
+    // key remapped, the flags carried) so no field can be silently dropped.
+    Expr::FunctionCall {
+        function_name,
+        args: map_vec(args, f),
+        is_aggregate,
+        distinct,
+        within_group_key: within_group_key.map(|key| Box::new(f(*key))),
+        within_group_desc,
+    }
+}
+
+/// The fallible sibling of `map_function_call`, short-circuiting on the first
+/// error a child raises.
+fn try_map_function_call<E>(
+    function_name: String,
+    args: Vec<Expr>,
+    is_aggregate: bool,
+    distinct: bool,
+    within_group_key: Option<Box<Expr>>,
+    within_group_desc: bool,
+    f: &mut impl FnMut(Expr) -> Result<Expr, E>,
+) -> Result<Expr, E> {
+    // Variant rebuild: every field is listed explicitly (args and the ordered-set
+    // key remapped, the flags carried) so no field can be silently dropped.
+    Ok(Expr::FunctionCall {
+        function_name,
+        args: try_map_vec(args, f)?,
+        is_aggregate,
+        distinct,
+        within_group_key: match within_group_key {
+            Some(key) => Some(Box::new(f(*key)?)),
+            None => None,
+        },
+        within_group_desc,
+    })
+}
+
+/// Rebuild a `Window` with `f` mapped over its function and partition/order child
+/// expressions; the non-expression direction and frame fields carry over.
+fn map_window(
+    function: Expr,
+    partition_by: Vec<Expr>,
+    order_keys: Vec<Expr>,
+    order_ascending: Vec<bool>,
+    order_nulls: Vec<Option<NullsOrder>>,
+    frame: Option<String>,
+    f: &mut impl FnMut(Expr) -> Expr,
+) -> Expr {
+    // Variant rebuild: every field is listed explicitly (function/partition/order
+    // remapped, the direction and frame carried) so no field can be silently dropped.
+    Expr::Window {
+        function: Box::new(f(function)),
+        partition_by: map_vec(partition_by, f),
+        order_keys: map_vec(order_keys, f),
+        order_ascending,
+        order_nulls,
+        frame,
+    }
+}
+
+/// The fallible sibling of `map_window`, short-circuiting on the first error a
+/// child raises.
+fn try_map_window<E>(
+    function: Expr,
+    partition_by: Vec<Expr>,
+    order_keys: Vec<Expr>,
+    order_ascending: Vec<bool>,
+    order_nulls: Vec<Option<NullsOrder>>,
+    frame: Option<String>,
+    f: &mut impl FnMut(Expr) -> Result<Expr, E>,
+) -> Result<Expr, E> {
+    // Variant rebuild: every field is listed explicitly (function/partition/order
+    // remapped, the direction and frame carried) so no field can be silently dropped.
+    Ok(Expr::Window {
+        function: Box::new(f(function)?),
+        partition_by: try_map_vec(partition_by, f)?,
+        order_keys: try_map_vec(order_keys, f)?,
+        order_ascending,
+        order_nulls,
+        frame,
+    })
+}
+
+/// Rebuild a `Cast` with `f` applied to its inner expression; the SQL target-type
+/// text and resolved data type carry over.
+fn map_cast(
+    expr: Expr,
+    target_type: String,
+    data_type: Option<DataType>,
+    f: &mut impl FnMut(Expr) -> Expr,
+) -> Expr {
+    // Variant rebuild: the inner expression is remapped and the target-type text and
+    // resolved data type carry over, so no field can be silently dropped.
+    Expr::Cast {
+        expr: Box::new(f(expr)),
+        target_type,
+        data_type,
+    }
+}
+
+/// The fallible sibling of `map_cast`, short-circuiting on the first error.
+fn try_map_cast<E>(
+    expr: Expr,
+    target_type: String,
+    data_type: Option<DataType>,
+    f: &mut impl FnMut(Expr) -> Result<Expr, E>,
+) -> Result<Expr, E> {
+    // Variant rebuild: the inner expression is remapped and the target-type text and
+    // resolved data type carry over, so no field can be silently dropped.
+    Ok(Expr::Cast {
+        expr: Box::new(f(expr)?),
+        target_type,
+        data_type,
+    })
+}
+
+/// Rebuild a `Between` with `f` applied to its value and the two bound expressions.
+fn map_between(value: Expr, lower: Expr, upper: Expr, f: &mut impl FnMut(Expr) -> Expr) -> Expr {
+    // Variant rebuild: all three operands are listed explicitly and remapped, so no
+    // field can be silently dropped (there is no base node to copy from).
+    Expr::Between {
+        value: Box::new(f(value)),
+        lower: Box::new(f(lower)),
+        upper: Box::new(f(upper)),
+    }
+}
+
+/// The fallible sibling of `map_between`, short-circuiting on the first error.
+fn try_map_between<E>(
+    value: Expr,
+    lower: Expr,
+    upper: Expr,
+    f: &mut impl FnMut(Expr) -> Result<Expr, E>,
+) -> Result<Expr, E> {
+    // Variant rebuild: all three operands are listed explicitly and remapped, so no
+    // field can be silently dropped (there is no base node to copy from).
+    Ok(Expr::Between {
+        value: Box::new(f(value)?),
+        lower: Box::new(f(lower)?),
+        upper: Box::new(f(upper)?),
+    })
 }
 
 /// Apply a FALLIBLE `f` to each expression in a vector, short-circuiting on error.

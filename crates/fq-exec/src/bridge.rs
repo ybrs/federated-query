@@ -409,6 +409,12 @@ pub fn serialize_expr(expr: &Expr) -> ExecResult<ir::IrExpr> {
             lower,
             upper,
         } => serialize_between(value, lower, upper),
+        Expr::Like {
+            case_insensitive,
+            expr,
+            pattern,
+            escape,
+        } => serialize_like(*case_insensitive, expr, pattern, escape.as_deref()),
         Expr::Extract { field, source } => serialize_extract(field, source),
         Expr::FunctionCall {
             function_name,
@@ -529,6 +535,38 @@ fn serialize_between(value: &Expr, lower: &Expr, upper: &Expr) -> ExecResult<ir:
     })
 }
 
+/// Lower `expr [I]LIKE pattern [ESCAPE 'c']` to the engine's `Like` IR. The escape
+/// string is a single character (validated at parse); a longer string here is a
+/// contract violation and RAISES rather than silently truncate.
+fn serialize_like(
+    case_insensitive: bool,
+    expr: &Expr,
+    pattern: &Expr,
+    escape: Option<&str>,
+) -> ExecResult<ir::IrExpr> {
+    let escape_char = match escape {
+        Some(text) => Some(single_escape_char(text)?),
+        None => None,
+    };
+    Ok(ir::IrExpr::Like {
+        expr: Box::new(serialize_expr(expr)?),
+        pattern: Box::new(serialize_expr(pattern)?),
+        case_insensitive,
+        escape: escape_char,
+    })
+}
+
+/// The one `char` of a LIKE escape string, or an error if it is not exactly one.
+fn single_escape_char(text: &str) -> ExecResult<char> {
+    let mut chars = text.chars();
+    match (chars.next(), chars.next()) {
+        (Some(character), None) => Ok(character),
+        _ => Err(ExecError::runtime(format!(
+            "LIKE ESCAPE must be a single character, got '{text}'"
+        ))),
+    }
+}
+
 /// Lower `EXTRACT(field FROM source)` to `date_part('field', source)`.
 fn serialize_extract(field: &str, source: &Expr) -> ExecResult<ir::IrExpr> {
     let field_literal = ir::IrExpr::Literal {
@@ -572,8 +610,6 @@ fn binary_op_token(op: BinaryOpType) -> ExecResult<&'static str> {
         BinaryOpType::Gte => ">=",
         BinaryOpType::And => "and",
         BinaryOpType::Or => "or",
-        BinaryOpType::Like => "like",
-        BinaryOpType::Ilike => "ilike",
         BinaryOpType::NullSafeEq => "is_not_distinct_from",
         BinaryOpType::NullSafeNeq => "is_distinct_from",
         BinaryOpType::Concat => "||",
@@ -657,6 +693,46 @@ mod tests {
             }
             other => panic!("expected an AND, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn like_lowers_to_like_ir_with_escape() {
+        let expr = Expr::Like {
+            case_insensitive: true,
+            expr: Box::new(column("t", "a")),
+            pattern: Box::new(Expr::Literal {
+                value: LiteralValue::String("x@%".to_string()),
+                data_type: DataType::Varchar,
+            }),
+            escape: Some("@".to_string()),
+        };
+        match serialize_expr(&expr).unwrap() {
+            ir::IrExpr::Like {
+                case_insensitive,
+                escape,
+                ..
+            } => {
+                assert!(case_insensitive);
+                assert_eq!(escape, Some('@'));
+            }
+            other => panic!("expected a Like, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn like_escape_longer_than_one_char_raises() {
+        // The parser validates escape length, so a multi-character escape reaching
+        // lowering is a contract violation and must raise, not silently truncate.
+        let expr = Expr::Like {
+            case_insensitive: false,
+            expr: Box::new(column("t", "a")),
+            pattern: Box::new(Expr::Literal {
+                value: LiteralValue::String("x".to_string()),
+                data_type: DataType::Varchar,
+            }),
+            escape: Some("!!".to_string()),
+        };
+        assert!(serialize_expr(&expr).is_err());
     }
 
     #[test]

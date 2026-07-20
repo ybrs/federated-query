@@ -16,8 +16,7 @@ date/timestamp join keys, case-sensitive varchar equality, a boolean-column
 join key); cross-type joins through an explicit CAST; a ``||`` string
 concatenation over a CAST; a null-safe ``IS DISTINCT FROM`` WHERE predicate;
 and ``t_text`` edges (NULLIF/TRIM on blank-vs-space values, a quoted value,
-LIKE wildcard matches, and the engine's current LIKE ... ESCAPE behavior,
-pinned as it stands today).
+LIKE wildcard matches, and LIKE ... ESCAPE matching a literal wildcard).
 """
 
 CASES = [
@@ -326,8 +325,8 @@ CASES = [
         "query": "SELECT order_id FROM {orders} WHERE CAST(order_id AS VARCHAR) = '5'",
     },
     # t_text edges: NULLIF/TRIM on blank-vs-space, a quoted value, a LIKE
-    # wildcard match, a tab-embedded value, and the engine's current
-    # LIKE ... ESCAPE behavior (pinned as it stands today).
+    # wildcard match, a tab-embedded value, and LIKE ... ESCAPE matching a
+    # literal wildcard, each result-checked against the DuckDB oracle.
     {
         "name": "edge_text_nullif_empty_vs_space",
         "tables": ["t_text"],
@@ -364,13 +363,11 @@ CASES = [
     {
         "name": "edge_text_like_escape_percent_literal",
         "tables": ["t_text"],
-        "expect_error": "ESCAPE",
         "query": "SELECT s_id FROM {t_text} WHERE s LIKE '%per\\%cent%' ESCAPE '\\'",
     },
     {
         "name": "edge_text_like_escape_underscore_literal",
         "tables": ["t_text"],
-        "expect_error": "ESCAPE",
         "query": "SELECT s_id FROM {t_text} WHERE s LIKE '%under\\_score%' ESCAPE '\\'",
     },
     # Cross-source-only variants (min_sources=2) of the NULL-key and
