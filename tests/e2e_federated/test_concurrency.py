@@ -29,7 +29,8 @@ import pytest
 
 from tests.e2e_federated import placements as placement_mod
 from tests.e2e_federated import runtime as runtime_mod
-from tests.e2e_federated.cases import all_cases, case_table_specs
+from tests.e2e_federated.cases import case_table_specs
+from tests.e2e_federated.sanity import corpus as sanity_corpus
 from tests.e2e_federated.compare import compare_tables
 from tests.e2e_federated.oracle import build_oracle
 
@@ -56,9 +57,14 @@ def _pick_placement(pg_state):
 
 
 def _mix_cases():
-    """Return the join cases used as the concurrent query mix, in a fixed order."""
+    """Return the join cases used as the concurrent query mix, in a fixed order.
+
+    The mix is read from the sanity corpus module directly, not from the
+    FEDQ_E2E_CORPUS-filtered collection, so this file runs under any module
+    selection.
+    """
     by_name = {}
-    for case in all_cases():
+    for case in sanity_corpus.CASES:
         if case["name"] in _MIX_CASE_NAMES:
             by_name[case["name"]] = case
     cases = []
