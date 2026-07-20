@@ -21,10 +21,9 @@ orders(o_orderkey, o_custkey, o_region, o_total)   -- 12 rows
 region_dim(rd_name, rd_manager)                    -- US/Alice, EU/Bob, ASIA/Carol
 ```
 
-The config is one file; the view store hangs off its stem, exactly as the
-event-view store does (`<stem>.mv/` for chunks, `<stem>.stats.sqlite` for the
-registry). See `crates/fq-events/README.md` section 1 for the config surface -
-the DDL (`CREATE / REFRESH / DROP MATERIALIZED VIEW`, `change_keys`) is shared.
+The config is one file; the view store hangs off its stem (`<stem>.mv/` for
+chunks, `<stem>.stats.sqlite` for the registry). The DDL is `CREATE / REFRESH /
+DROP MATERIALIZED VIEW` with an optional `change_keys` entry.
 
 --------------------------------------------------------------------------------
 
@@ -338,7 +337,7 @@ SELECT ... WHERE o_region = 'US'                                     -> s = 1570
 Substitution did not return a wrong answer - it returned exactly the rows the
 view holds. Bringing those rows up to date is YOUR REFRESH, never a query-path
 check. (A table with a declared `change_keys` entry refreshes incrementally
-instead of whole; see the fq-events README section 2.)
+instead of whole.)
 
 --------------------------------------------------------------------------------
 
@@ -376,9 +375,8 @@ elided minus stored rows read), not a measured time. This tutorial deliberately
 quotes no latency numbers: per the repo's rule, engine perf claims come only
 from `benchmarks/perf_compare`. For a like-for-like measured comparison of the
 same store machinery (build once, serve warm, agree with a baseline signature),
-the pattern to follow is the event-analytics benchmark in `benchmarks/events`
-(`crates/fq-events/README.md` section 9) - it reports engine-versus-baseline
-ratios from a real harness rather than a counter.
+follow a real benchmark harness that reports engine-versus-baseline ratios
+rather than a counter.
 
 --------------------------------------------------------------------------------
 

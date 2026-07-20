@@ -244,7 +244,7 @@ SHOW GRANTS [FOR <grantee>]
   expansion without a grammar change.
 - SYSTEM CAPABILITIES ARE NOT GRANTABLE IN V1; they are the SUPERUSER FLAG. All
   server-mutating DDL - `CREATE/DROP DATASOURCE`, `CREATE/REFRESH/DROP
-  MATERIALIZED VIEW`, `CREATE/REFRESH/DROP EVENT VIEW`, and user/grant DDL -
+  MATERIALIZED VIEW` and user/grant DDL -
   requires superuser. Rationale: inventing grantable system privileges
   (`CREATE DATASOURCE` as a per-user right) in v1 multiplies the privilege space
   for a feature only an operator uses; a single superuser flag covers every admin

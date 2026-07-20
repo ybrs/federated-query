@@ -104,9 +104,6 @@ Feature surface built on top of the core engine:
   SETTINGS`, `SHOW SETTING <name>`, `SET <name> = <value>`, `RESET <name>`,
   `RESET ALL`. SET/RESET mutate the live session; values are type-checked and a
   bad value or unknown name raises (with a nearest-name suggestion).
-- Event analytics is done in plain DuckDB SQL (see `event-sql-poc/`), not an
-  in-engine extension; the fq-events extension was removed. The event parquet
-  lives under `benchmarks/events/data`.
 - fedq-server (`crates/fedq-server`): a PostgreSQL wire-protocol server
   (pgwire) over the runtime - simple and EXTENDED query protocol
   (Parse/Bind/Describe/Execute), SCRAM auth, query cancellation. One `Runtime`
@@ -364,15 +361,9 @@ cb721cf Four engine fixes: || execution, IS DISTINCT FROM, window tail, pg probe
 ece36bc Fix INTERSECT ALL / EXCEPT ALL multisets and parquet null ordering
 2d722d3 Federated e2e correctness corpus: placement-matrix suite
 88188b2 Sweep stale docs into a design-history digest; fix stale deferral comments
-b073e92 Event view CREATE: sort in the executor; Parquet source for the events suite
-ac54283 Per-event-name row index + funnel column projection for selective funnels
 96eea41 HANDOFF + architecture docs rewritten against the current workspace
-df93802 Event sidecars: segment pre-aggregates (decisive win) + gated entity bitmaps
 38fe691 Substitution order guard walks the whole matched subtree; accelerator tutorial
 3baa0bf Accelerator Phase C: automatic substitution, cost gate, benefit tracking
-f2e1ce4 Events benchmark suite + user tutorial
-4f69e1a PATHS analysis + TIEBREAK role: deterministic event sequences
-42cba35 Event analytics extension: EVENT VIEWs, FUNNEL and SEGMENT statements (fq-events)
 7e8bb21 Settings surface: one registry, SHOW SETTINGS, SET/RESET on live sessions
 cac1fad Accelerator Phase B: change-key delta refresh, PK merge, source-token no-op skips
 e66df52 HANDOFF: perf-tail diagnoses corrected from the measured round

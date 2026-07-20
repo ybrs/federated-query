@@ -142,7 +142,7 @@ Columns: `name TEXT, type TEXT, origin TEXT, summary TEXT, created TEXT`.
   that only unregistered it from the live session would resurrect the source on
   the next reconnect (it is still in YAML) - a silent non-persistence. Loud
   refusal instead.
-- When a persisted materialized view or event view's definition references the
+- When a persisted materialized view's definition references the
   source: RAISES naming the dependent view(s) (section 7). The operator drops
   the views first. This replaces CASCADE.
 
@@ -252,7 +252,7 @@ removed. Critically there is no correctness need: a datasource is a namespace,
 so a peer's queries that do not name the new source are unaffected, and a peer
 that wants it reconnects (cheap). This mirrors `SET` (session-mutable, read
 fresh per query within the session, invisible to peers) and is IDENTICAL to how
-`CREATE MATERIALIZED VIEW` / `CREATE EVENT VIEW` already behave: `install_views`
+`CREATE MATERIALIZED VIEW` already behaves: `install_views`
 swaps only the calling runtime's catalog, and a peer connection sees the new
 view only after its own `from_config` re-reads the store on reconnect. Dynamic
 datasources add no new visibility model.
@@ -350,7 +350,7 @@ only the STORAGE shape so the column is future-proof today.
   plan choice) and SELF-HEAL on the next measurement, so a purge is safe and
   simple. `source_identity`'s existing repoint-fingerprint would ALSO catch a
   changed source, but purge-on-drop is the clean primary mechanism.
-- MATERIALIZED / EVENT VIEWS referencing the source. `DROP DATASOURCE` scans the
+- MATERIALIZED VIEWS referencing the source. `DROP DATASOURCE` scans the
   persisted view definitions (`materialized_views.definition_sql`, the event-view
   registry) for a base table in the datasource and RAISES naming the dependent
   view(s) rather than orphaning a view whose next refresh would fail to bind.

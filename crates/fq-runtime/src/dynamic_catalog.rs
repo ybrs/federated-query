@@ -294,7 +294,7 @@ impl Runtime {
     /// `DROP DATASOURCE name`: remove a DYNAMIC source's persisted row, purge
     /// its learned stats, and deregister it from this session. A bootstrap
     /// (YAML) source raises (removing it here would resurrect it on reconnect);
-    /// a source a materialized/event view depends on raises naming the view(s);
+    /// a source a materialized view depends on raises naming the view(s);
     /// an unknown name raises.
     pub(crate) fn drop_datasource(
         &self,
@@ -307,7 +307,7 @@ impl Runtime {
         let dependents = self.views_referencing(name)?;
         if !dependents.is_empty() {
             return Err(RuntimeError::Config(format!(
-                "DROP DATASOURCE: '{name}' is referenced by materialized/event view(s) \
+                "DROP DATASOURCE: '{name}' is referenced by materialized view(s) \
                  {}; drop the view(s) first",
                 dependents.join(", ")
             )));
@@ -341,7 +341,7 @@ impl Runtime {
         ))
     }
 
-    /// The names of the materialized/event views whose definition reads a base
+    /// The names of the materialized views whose definition reads a base
     /// table in datasource `name`. Each view's stored SELECT is bound against
     /// the live catalog (the source is still registered at this point); if a
     /// definition no longer binds, a conservative textual check on the
