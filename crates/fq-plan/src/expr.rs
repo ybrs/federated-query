@@ -329,7 +329,11 @@ impl Expr {
                 }
                 UnaryOpType::Negate => operand.get_type(),
             },
-            Expr::FunctionCall { function_name, .. } => function_call_type(function_name),
+            Expr::FunctionCall {
+                function_name,
+                args,
+                ..
+            } => function_call_type(function_name, args),
             Expr::Case {
                 when_clauses,
                 else_result,
@@ -745,13 +749,19 @@ fn wider_numeric(left: DataType, right: DataType) -> DataType {
 }
 
 /// Result type of a function call by family: COUNT/SUM and the integer ranking
-/// window functions yield BIGINT, AVG yields DOUBLE, anything else VARCHAR.
-fn function_call_type(function_name: &str) -> DataType {
+/// window functions yield BIGINT, AVG yields DOUBLE. The value-carrying window
+/// functions (LAG/LEAD/FIRST_VALUE/LAST_VALUE) yield their first argument's type.
+/// Anything else yields VARCHAR.
+fn function_call_type(function_name: &str, args: &[Expr]) -> DataType {
     match function_name.to_uppercase().as_str() {
         "COUNT" | "SUM" | "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "NTILE" => DataType::BigInt,
         "AVG" | "VARIANCE" | "VAR_POP" | "VAR_SAMP" | "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP"
         | "PERCENTILE_CONT" => DataType::Double,
         "BOOL_AND" | "BOOL_OR" => DataType::Boolean,
+        "LAG" | "LEAD" | "FIRST_VALUE" | "LAST_VALUE" => match args.first() {
+            Some(first) => first.get_type(),
+            None => DataType::Varchar,
+        },
         _ => DataType::Varchar,
     }
 }

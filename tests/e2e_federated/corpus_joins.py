@@ -674,37 +674,20 @@ CASES = [
             "FROM {t_dup_a} a RIGHT JOIN {t_dup_b} b ON a.k = b.k"
         ),
     },
-]
-
-
-SUSPECTED_ENGINE_BUGS = [
+    # A boolean-column filter (`p.active = TRUE`) alongside a join. The boolean
+    # column is probed for statistics; the probe omits min/max for it (Postgres
+    # has none) so the filter pushes to a PostgreSQL-hosted products table.
     {
-        "name": "join_comma_style_filtered_boolean_probe_bug",
+        "name": "join_comma_style_filtered_boolean_probe",
         "tables": ["orders", "products", "customers"],
         "query": (
             "SELECT p.name, o.order_id "
             "FROM {products} p, {orders} o "
             "WHERE p.product_id = o.product_id AND p.active = TRUE"
         ),
-        "finding": (
-            "Placements pg_duck, all_pg, parquet_pg (any placement where "
-            "products is PostgreSQL-hosted) raise RuntimeError('optimize "
-            "error: datasource error: db error') instead of returning rows; "
-            "duck_duck and oracle_single_duck return the correct 8 rows. "
-            "postgres-server.log shows the root cause: PostgreSQLDataSource."
-            "_probe_exact_sql (federated_query/datasources/postgresql.py) "
-            "unconditionally emits min(col)/max(col) for every probed column, "
-            "and issues 'min(\"active\")' against the BOOLEAN column "
-            "products.active; PostgreSQL has no min/max aggregate for "
-            "boolean (error: 'function min(boolean) does not exist'), while "
-            "DuckDB does support it, so the bug is invisible unless the "
-            "table with a boolean column is PostgreSQL-hosted and small "
-            "enough to hit the exact-probe path. Expected: the same 8 rows "
-            "as oracle_single_duck/duck_duck; got: a hard crash."
-        ),
     },
     {
-        "name": "join_filter_and_projection_combo_boolean_probe_bug",
+        "name": "join_filter_and_projection_combo_boolean_probe",
         "tables": ["orders", "products", "customers"],
         "query": (
             "SELECT p.category, c.segment "
@@ -712,17 +695,6 @@ SUSPECTED_ENGINE_BUGS = [
             "JOIN {products} p ON o.product_id = p.product_id "
             "JOIN {customers} c ON o.customer_id = c.customer_id "
             "WHERE o.quantity > 1 AND p.active = TRUE"
-        ),
-        "finding": (
-            "Same root cause as join_comma_style_filtered_boolean_probe_bug: "
-            "placements pg_duck, all_pg, parquet_pg raise RuntimeError("
-            "'optimize error: datasource error: db error') while duck_duck "
-            "and oracle_single_duck return the correct 7 rows. The "
-            "PostgreSQL statistics prober's exact-probe SQL runs "
-            'min("active")/max("active") on a BOOLEAN column, which '
-            "PostgreSQL rejects with 'function min(boolean) does not "
-            "exist'. Expected: the same 7 rows as oracle_single_duck; got: "
-            "a hard crash whenever products lands on the PostgreSQL slot."
         ),
     },
 ]

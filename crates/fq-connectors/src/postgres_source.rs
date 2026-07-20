@@ -72,8 +72,18 @@ impl PostgresSource {
     }
 }
 
-/// Map a postgres driver error into the driver-agnostic catalog error.
+/// Map a postgres driver error into the driver-agnostic catalog error. The
+/// driver's own `Display` is only the generic "db error"; the server's real
+/// message and SQLSTATE live on the attached `DbError`, so surface them when
+/// present rather than discarding the actual cause.
 fn to_source_err(error: &postgres::Error) -> CatalogError {
+    if let Some(db_error) = error.as_db_error() {
+        return CatalogError::Source(format!(
+            "{} (SQLSTATE {})",
+            db_error.message(),
+            db_error.code().code()
+        ));
+    }
     CatalogError::Source(error.to_string())
 }
 
@@ -376,7 +386,8 @@ impl PostgresSource {
         columns: &[String],
         size: i64,
     ) -> Result<TableStatistics, CatalogError> {
-        let sql = probe_exact_sql(schema, table, columns);
+        let column_types = self.probe_column_types(schema, table, columns)?;
+        let sql = probe_exact_sql(schema, table, columns, &column_types);
         let row = self.with_client(|client| client.query_one(&sql, &[]))?;
         let rows: i64 = row.get("probe_rows");
         let mut stats = std::collections::BTreeMap::new();
@@ -388,6 +399,39 @@ impl PostgresSource {
             total_size_bytes: size,
             column_stats: stats,
         })
+    }
+
+    /// The Postgres internal type name (`udt_name`) of each requested column, in
+    /// the same order as `columns`. This drives the type-aware probe measures.
+    /// A requested column absent from the catalog is a caller inconsistency and
+    /// raises rather than guessing a type.
+    fn probe_column_types(
+        &self,
+        schema: &str,
+        table: &str,
+        columns: &[String],
+    ) -> Result<Vec<String>, CatalogError> {
+        let by_name: std::collections::BTreeMap<String, String> = self.with_client(|client| {
+            let rows = client.query(
+                "SELECT column_name, udt_name FROM information_schema.columns \
+                 WHERE table_schema = $1 AND table_name = $2",
+                &[&schema, &table],
+            )?;
+            Ok(rows
+                .iter()
+                .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+                .collect())
+        })?;
+        let mut types = Vec::with_capacity(columns.len());
+        for column in columns {
+            let udt = by_name.get(column).ok_or_else(|| {
+                CatalogError::Source(format!(
+                    "probe column \"{column}\" not found in {schema}.{table}"
+                ))
+            })?;
+            types.push(udt.clone());
+        }
+        Ok(types)
     }
 
     /// A TABLESAMPLE SYSTEM row-count estimate for a large statless table; column
@@ -421,23 +465,95 @@ impl PostgresSource {
     }
 }
 
-/// The single-scan probe query: count(*) plus four text-cast measures per
-/// requested column, aliased by position for the unpack.
-fn probe_exact_sql(schema: &str, table: &str, columns: &[String]) -> String {
+/// The single-scan probe query: count(*) plus four measures per requested
+/// column, aliased by position for the unpack. The measures are type-aware: a
+/// non-null count is emitted for every type, but a distinct count is emitted
+/// only for types Postgres can compare for equality, and min/max only for types
+/// it can order. A type lacking either capability gets a NULL placeholder in the
+/// same position so the positional unpack stays aligned and the missing measure
+/// reads back as an honest unknown - Postgres has no min/max for booleans, byte
+/// and bit strings, uuid, and the JSON/XML/geometric types, and no equality at
+/// all for the JSON/XML/geometric types, so an unconditional aggregate on such a
+/// column would fail the whole probe query.
+fn probe_exact_sql(
+    schema: &str,
+    table: &str,
+    columns: &[String],
+    column_types: &[String],
+) -> String {
     let mut parts = vec!["count(*) AS probe_rows".to_string()];
     for (index, column) in columns.iter().enumerate() {
         let quoted = format!("\"{}\"", column.replace('"', "\"\""));
-        parts.push(format!("count(DISTINCT {quoted}) AS ndv_{index}"));
+        let udt = column_types[index].as_str();
+        let ndv = if pg_type_has_equality(udt) {
+            format!("count(DISTINCT {quoted})")
+        } else {
+            "NULL::bigint".to_string()
+        };
+        parts.push(format!("{ndv} AS ndv_{index}"));
         parts.push(format!("count({quoted}) AS nonnull_{index}"));
-        parts.push(format!("min({quoted})::text AS min_{index}"));
-        parts.push(format!("max({quoted})::text AS max_{index}"));
+        let (min_measure, max_measure) = if pg_type_has_min_max(udt) {
+            (
+                format!("min({quoted})::text"),
+                format!("max({quoted})::text"),
+            )
+        } else {
+            ("NULL::text".to_string(), "NULL::text".to_string())
+        };
+        parts.push(format!("{min_measure} AS min_{index}"));
+        parts.push(format!("{max_measure} AS max_{index}"));
     }
     format!("SELECT {} FROM \"{schema}\".\"{table}\"", parts.join(", "))
 }
 
-/// Per-column statistics from one probe row (exact NDV, null fraction, min/max).
+/// Whether Postgres has a `min`/`max` aggregate for a type (by `udt_name`).
+/// This is an allowlist of the ordered scalar families - integer, floating and
+/// exact numeric, money, character strings, the date/time types, and the
+/// network address types. Every other type (booleans, byte/bit strings, uuid,
+/// JSON/XML/geometric, and any type not listed) yields no min/max, so the probe
+/// leaves its bounds unknown rather than emitting an aggregate Postgres rejects.
+fn pg_type_has_min_max(udt_name: &str) -> bool {
+    matches!(
+        udt_name,
+        "int2"
+            | "int4"
+            | "int8"
+            | "float4"
+            | "float8"
+            | "numeric"
+            | "money"
+            | "text"
+            | "varchar"
+            | "bpchar"
+            | "name"
+            | "date"
+            | "time"
+            | "timetz"
+            | "timestamp"
+            | "timestamptz"
+            | "interval"
+            | "inet"
+            | "cidr"
+    )
+}
+
+/// Whether Postgres can compare a type for equality, which `count(DISTINCT ...)`
+/// requires. The JSON document type, XML, and the geometric types carry no
+/// default equality operator; every other type does, so distinct counting stays
+/// on for them (including booleans, uuid, and jsonb, which order poorly or not
+/// at all yet still hash for DISTINCT).
+fn pg_type_has_equality(udt_name: &str) -> bool {
+    !matches!(
+        udt_name,
+        "json" | "xml" | "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle"
+    )
+}
+
+/// Per-column statistics from one probe row: null fraction (always), plus the
+/// exact NDV and min/max where the column's type supports those measures (a NULL
+/// placeholder reads back as an unknown for a type that does not).
 fn unpack_probe_column(row: &postgres::Row, index: usize, rows: i64) -> ColumnStatistics {
-    let ndv: i64 = row.get(format!("ndv_{index}").as_str());
+    let num_distinct: Option<i64> = row.get(format!("ndv_{index}").as_str());
     let non_null: i64 = row.get(format!("nonnull_{index}").as_str());
     let min_value: Option<String> = row.get(format!("min_{index}").as_str());
     let max_value: Option<String> = row.get(format!("max_{index}").as_str());
@@ -447,10 +563,58 @@ fn unpack_probe_column(row: &postgres::Row, index: usize, rows: i64) -> ColumnSt
         0.0
     };
     ColumnStatistics {
-        num_distinct: Some(ndv),
+        num_distinct,
         null_fraction,
         avg_width: 10,
         min_value: min_value.as_deref().map(parse_bound),
         max_value: max_value.as_deref().map(parse_bound),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pg_type_has_equality, pg_type_has_min_max, probe_exact_sql};
+
+    #[test]
+    fn probe_sql_omits_min_max_for_unorderable_types_keeps_orderable() {
+        let columns = vec!["flag".to_string(), "doc".to_string(), "amount".to_string()];
+        let types = vec![
+            "bool".to_string(),
+            "json".to_string(),
+            "numeric".to_string(),
+        ];
+        let sql = probe_exact_sql("public", "t", &columns, &types);
+        // The orderable neighbour keeps real min/max and a distinct count.
+        assert!(sql.contains("min(\"amount\")::text AS min_2"));
+        assert!(sql.contains("max(\"amount\")::text AS max_2"));
+        assert!(sql.contains("count(DISTINCT \"amount\") AS ndv_2"));
+        // Boolean has no min/max but is still distinct-countable.
+        assert!(!sql.contains("min(\"flag\")"));
+        assert!(!sql.contains("max(\"flag\")"));
+        assert!(sql.contains("NULL::text AS min_0"));
+        assert!(sql.contains("NULL::text AS max_0"));
+        assert!(sql.contains("count(DISTINCT \"flag\") AS ndv_0"));
+        // json has neither min/max nor equality, so both are NULL placeholders.
+        assert!(!sql.contains("min(\"doc\")"));
+        assert!(!sql.contains("count(DISTINCT \"doc\")"));
+        assert!(sql.contains("NULL::bigint AS ndv_1"));
+        assert!(sql.contains("NULL::text AS min_1"));
+        // A non-null count is kept for every column regardless of type.
+        assert!(sql.contains("count(\"flag\") AS nonnull_0"));
+        assert!(sql.contains("count(\"doc\") AS nonnull_1"));
+        assert!(sql.contains("count(\"amount\") AS nonnull_2"));
+    }
+
+    #[test]
+    fn type_capability_predicates_match_postgres() {
+        assert!(pg_type_has_min_max("int4"));
+        assert!(pg_type_has_min_max("timestamp"));
+        assert!(!pg_type_has_min_max("bool"));
+        assert!(!pg_type_has_min_max("uuid"));
+        assert!(!pg_type_has_min_max("jsonb"));
+        assert!(pg_type_has_equality("bool"));
+        assert!(pg_type_has_equality("jsonb"));
+        assert!(!pg_type_has_equality("json"));
+        assert!(!pg_type_has_equality("point"));
     }
 }

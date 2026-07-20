@@ -13,13 +13,14 @@ CTE and a CTE feeding EXISTS), chained CTEs, derived tables (joined, stacked
 two deep, with an inner LIMIT), and WITH RECURSIVE (an integer series and an
 employee/manager hierarchy walk joined cross-source).
 
-Two shapes raise loudly rather than run: a ``WITH`` clause bound directly to a
+One shape raises loudly rather than run: a ``WITH`` clause bound directly to a
 top-level set operation is an unsupported parse shape (worked around here by
 wrapping the union in a derived-table ``SELECT``, which the engine does
 support), pinned nowhere further since it is a designed restriction, not a
-wrong answer. A WHERE predicate on a BOOLEAN column pushed to PostgreSQL is a
-genuine bug (a physical-planning crash) and is pinned as a reproduction in
-``SUSPECTED_ENGINE_BUGS`` below instead of being asserted here.
+wrong answer. A WHERE predicate on a BOOLEAN column pushed to PostgreSQL is
+exercised directly (``set_boolean_predicate_pushdown_to_postgres``): the
+boolean column's statistics probe omits the min/max Postgres cannot compute,
+so the predicate pushes down and returns rows.
 """
 
 CASES = [
@@ -461,33 +462,12 @@ CASES = [
             "UNION SELECT customer_id FROM {customers}"
         ),
     },
-]
-
-
-# Verified engine-vs-oracle mismatches or crashes, pulled out of CASES so the
-# corpus stays green. Not run by the harness (only ``CASES`` is collected);
-# each entry is a pinned repro plus the observed finding.
-SUSPECTED_ENGINE_BUGS = {
-    "set_boolean_predicate_pushdown_to_postgres_crashes": {
+    # A WHERE predicate over a BOOLEAN column, pushed to a PostgreSQL-hosted
+    # products table. The boolean column drives a statistics probe that omits
+    # min/max (Postgres has none for booleans) so the predicate pushes down.
+    {
+        "name": "set_boolean_predicate_pushdown_to_postgres",
         "tables": ["products"],
         "query": "SELECT product_id FROM {products} WHERE active = TRUE",
-        "finding": (
-            "Any WHERE predicate over a BOOLEAN column crashes physical "
-            "planning once that table is placed on PostgreSQL - not specific "
-            "to this corpus's set-ops (found while building "
-            "set_except_where_each_branch, whose products branch originally "
-            "filtered on 'active = FALSE'). Reproduced directly against a "
-            "pg_duck environment seeded with orders/products/customers: "
-            "'SELECT product_id, active FROM products' (no predicate) and "
-            "predicates on VARCHAR/DECIMAL columns (category, unit_price) both "
-            "succeed; 'WHERE active = TRUE', 'WHERE active = FALSE', and "
-            "'WHERE NOT active' each raise 'physical planning error: "
-            "datasource error: db error' with no further detail (consistent "
-            "across repeated clean-state runs). 'WHERE active IS FALSE' fails "
-            'differently, at parse time: "unsupported SQL: function '
-            "'is_false'\". The corpus's set_except_where_each_branch case was "
-            "rewritten to filter on category instead of active to route "
-            "around this and stay green; this entry pins the underlying bug."
-        ),
     },
-}
+]

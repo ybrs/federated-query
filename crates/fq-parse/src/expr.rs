@@ -12,8 +12,9 @@ use fq_plan::expr::{LiteralValue, NullsOrder};
 use fq_plan::{BinaryOpType, ColumnRef, Expr, Quantifier, UnaryOpType};
 use polyglot_sql::expressions::{
     AggFunc, Anonymous, Between, BinaryOp, Case, Cast, CountFunc, DataType, Expression, In,
-    IntervalUnit, IntervalUnitSpec, LikeOp, Literal, Ordered, QuantifiedExpr, WindowFrame,
-    WindowFrameBound, WindowFrameExclude, WindowFrameKind, WindowFunction,
+    IntervalUnit, IntervalUnitSpec, LeadLagFunc, LikeOp, Literal, NTileFunc, Ordered,
+    QuantifiedExpr, ValueFunc, WindowFrame, WindowFrameBound, WindowFrameExclude, WindowFrameKind,
+    WindowFunction,
 };
 
 use crate::convert::{nulls_of, Converter};
@@ -364,18 +365,78 @@ impl Converter<'_> {
         })
     }
 
-    /// Convert the function under an OVER. The ranking functions (ROW_NUMBER,
-    /// RANK, DENSE_RANK) are meaningful only as a windowed call, so they are
-    /// recognized here, not in the general expression path where a bare `rank()`
-    /// still raises. Every other window function (SUM/AVG/... over a window)
-    /// converts through the normal expression path.
+    /// Convert the function under an OVER. The pure window functions (ROW_NUMBER,
+    /// RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTILE) are meaningful
+    /// only as a windowed call, so they are recognized here, not in the general
+    /// expression path where a bare `rank()` still raises. Every other window
+    /// function (SUM/AVG/... over a window) converts through the normal path.
     fn convert_window_function(&self, this: &Expression) -> Result<Expr, ParseError> {
         match this {
             Expression::RowNumber(_) => Ok(ranking_call("ROW_NUMBER")),
             Expression::Rank(rank) => plain_ranking("RANK", &rank.args, rank.order_by.as_deref()),
             Expression::DenseRank(dense) => plain_ranking("DENSE_RANK", &dense.args, None),
+            Expression::Lag(func) => self.convert_lead_lag("LAG", func),
+            Expression::Lead(func) => self.convert_lead_lag("LEAD", func),
+            Expression::FirstValue(func) => self.convert_value_fn("FIRST_VALUE", func),
+            Expression::LastValue(func) => self.convert_value_fn("LAST_VALUE", func),
+            Expression::NTile(func) => self.convert_ntile(func),
             other => self.expr(other),
         }
+    }
+
+    /// Convert LAG/LEAD into `NAME(expr [, offset [, default]])`. The engine's
+    /// window plan carries no null-treatment modifier, so IGNORE NULLS raises
+    /// rather than dropping it. A default without an offset is not expressible
+    /// as positional args and raises.
+    fn convert_lead_lag(&self, name: &str, func: &LeadLagFunc) -> Result<Expr, ParseError> {
+        if func.ignore_nulls == Some(true) {
+            return Err(ParseError::Unsupported(format!("IGNORE NULLS in {name}")));
+        }
+        if func.default.is_some() && func.offset.is_none() {
+            return Err(ParseError::Unsupported(format!(
+                "{name} default value without an offset"
+            )));
+        }
+        let mut args = vec![self.expr(&func.this)?];
+        if let Some(offset) = &func.offset {
+            args.push(self.expr(offset)?);
+        }
+        if let Some(default) = &func.default {
+            args.push(self.expr(default)?);
+        }
+        Ok(scalar_function_call(name.to_string(), args))
+    }
+
+    /// Convert FIRST_VALUE/LAST_VALUE into `NAME(expr)`. IGNORE NULLS and a
+    /// function-internal ORDER BY have no engine window-plan form and raise.
+    fn convert_value_fn(&self, name: &str, func: &ValueFunc) -> Result<Expr, ParseError> {
+        if func.ignore_nulls == Some(true) {
+            return Err(ParseError::Unsupported(format!("IGNORE NULLS in {name}")));
+        }
+        if !func.order_by.is_empty() {
+            return Err(ParseError::Unsupported(format!("ORDER BY inside {name}")));
+        }
+        Ok(scalar_function_call(
+            name.to_string(),
+            vec![self.expr(&func.this)?],
+        ))
+    }
+
+    /// Convert NTILE into `NTILE(bucket_count)`. NTILE requires a bucket count;
+    /// its absence raises rather than emitting an invalid `NTILE()`. A
+    /// function-internal ORDER BY has no engine window-plan form and raises.
+    fn convert_ntile(&self, func: &NTileFunc) -> Result<Expr, ParseError> {
+        if func.order_by.is_some() {
+            return Err(ParseError::Unsupported("ORDER BY inside NTILE".to_string()));
+        }
+        let bucket = func
+            .num_buckets
+            .as_ref()
+            .ok_or_else(|| ParseError::Unsupported("NTILE without a bucket count".to_string()))?;
+        Ok(scalar_function_call(
+            "NTILE".to_string(),
+            vec![self.expr(bucket)?],
+        ))
     }
 
     /// Convert a window's ORDER BY into aligned (keys, ascending, nulls) lists.
@@ -715,6 +776,7 @@ pub(crate) fn binary_op_type(expr: &Expression) -> Option<BinaryOpType> {
         Expression::Gte(_) => BinaryOpType::Gte,
         Expression::Concat(_) => BinaryOpType::Concat,
         Expression::NullSafeEq(_) => BinaryOpType::NullSafeEq,
+        Expression::NullSafeNeq(_) => BinaryOpType::NullSafeNeq,
         _ => return None,
     };
     Some(op)
@@ -737,7 +799,8 @@ pub(crate) fn binary_operands(expr: &Expression) -> &BinaryOp {
         | Expression::Gt(binary)
         | Expression::Gte(binary)
         | Expression::Concat(binary)
-        | Expression::NullSafeEq(binary) => binary,
+        | Expression::NullSafeEq(binary)
+        | Expression::NullSafeNeq(binary) => binary,
         _ => unreachable!("binary_operands called on a non-binary expression"),
     }
 }
@@ -760,7 +823,8 @@ pub(crate) fn binary_operands_mut(expr: &mut Expression) -> &mut BinaryOp {
         | Expression::Gt(binary)
         | Expression::Gte(binary)
         | Expression::Concat(binary)
-        | Expression::NullSafeEq(binary) => binary,
+        | Expression::NullSafeEq(binary)
+        | Expression::NullSafeNeq(binary) => binary,
         _ => unreachable!("binary_operands_mut called on a non-binary expression"),
     }
 }

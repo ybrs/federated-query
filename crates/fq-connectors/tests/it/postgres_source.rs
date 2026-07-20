@@ -247,3 +247,51 @@ fn test_source_token_is_stable_and_moves_on_a_rewrite() {
         None
     );
 }
+
+/// A driver error surfaces the server's real message text and SQLSTATE, not the
+/// driver's generic "db error" Display.
+#[test]
+fn db_error_surfaces_message_and_sqlstate() {
+    let Some(fixture) = PgFixture::new("") else {
+        return;
+    };
+    let error = fixture
+        .source
+        .execute(&format!(
+            "SELECT 1 FROM {}.no_such_relation_zzz",
+            fixture.schema
+        ))
+        .expect_err("a query on a missing relation must fail");
+    let text = error.to_string();
+    assert!(text.contains("does not exist"), "message text lost: {text}");
+    assert!(text.contains("SQLSTATE 42P01"), "sqlstate lost: {text}");
+}
+
+/// A never-ANALYZEd table with a boolean column probes without error: Postgres
+/// has no min/max for booleans, so the probe omits those bounds yet still
+/// returns the exact distinct count (booleans compare for equality).
+#[test]
+fn probe_handles_boolean_column() {
+    let Some(fixture) = PgFixture::new(
+        "CREATE TABLE {s}.flags (id int, active boolean); \
+         INSERT INTO {s}.flags VALUES (1, true), (2, false), (3, true)",
+    ) else {
+        return;
+    };
+    let stats = fixture
+        .source
+        .get_table_statistics(
+            &fixture.schema,
+            "flags",
+            &["id".to_string(), "active".to_string()],
+        )
+        .expect("probe must not fail on a boolean column")
+        .expect("stats present");
+    assert_eq!(stats.row_count, Some(3));
+    let active = &stats.column_stats["active"];
+    assert!(active.min_value.is_none(), "boolean has no min bound");
+    assert!(active.max_value.is_none(), "boolean has no max bound");
+    assert_eq!(active.num_distinct, Some(2));
+    let id = &stats.column_stats["id"];
+    assert!(id.min_value.is_some(), "orderable neighbour keeps its min");
+}

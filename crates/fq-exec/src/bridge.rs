@@ -521,9 +521,8 @@ fn literal_value(value: &LiteralValue) -> ir::LiteralValue {
     }
 }
 
-/// The engine's binary-operator token for a `BinaryOpType`. The three operators
-/// the engine's IR has no token for (string concat and the two regex matches)
-/// RAISE, matching the Python `_BINARY_OP_TOKENS` allowlist.
+/// The engine's binary-operator token for a `BinaryOpType`. String concat lowers
+/// to the `||` token; the two regex matches have no execution IR form and RAISE.
 fn binary_op_token(op: BinaryOpType) -> ExecResult<&'static str> {
     Ok(match op {
         BinaryOpType::Add => "+",
@@ -543,7 +542,8 @@ fn binary_op_token(op: BinaryOpType) -> ExecResult<&'static str> {
         BinaryOpType::Ilike => "ilike",
         BinaryOpType::NullSafeEq => "is_not_distinct_from",
         BinaryOpType::NullSafeNeq => "is_distinct_from",
-        BinaryOpType::Concat | BinaryOpType::RegexMatch | BinaryOpType::RegexImatch => {
+        BinaryOpType::Concat => "||",
+        BinaryOpType::RegexMatch | BinaryOpType::RegexImatch => {
             return Err(ExecError::runtime(format!(
                 "binary operator '{}' has no execution IR form",
                 op.value()
@@ -675,11 +675,24 @@ mod tests {
             unit: Some("DAY".to_string()),
         };
         assert!(serialize_expr(&interval).is_err());
+        let regex = Expr::BinaryOp {
+            op: BinaryOpType::RegexMatch,
+            left: Box::new(column("t", "a")),
+            right: Box::new(column("t", "b")),
+        };
+        assert!(serialize_expr(&regex).is_err());
+    }
+
+    #[test]
+    fn concat_lowers_to_the_double_pipe_token() {
         let concat = Expr::BinaryOp {
             op: BinaryOpType::Concat,
             left: Box::new(column("t", "a")),
             right: Box::new(column("t", "b")),
         };
-        assert!(serialize_expr(&concat).is_err());
+        match serialize_expr(&concat).unwrap() {
+            ir::IrExpr::Binary { op, .. } => assert_eq!(op, "||"),
+            other => panic!("expected a binary ||, got {other:?}"),
+        }
     }
 }

@@ -168,6 +168,57 @@ CASES = [
             ") t ON true"
         ),
     },
+    # Offset and value window functions over cross-source join results, each
+    # with a deterministic partition + ORDER BY (o.order_id is unique).
+    {
+        "name": "win_lag_price_prior_row",
+        "tables": ["orders", "customers"],
+        "query": (
+            "SELECT o.order_id, c.segment, "
+            "LAG(o.price, 1) OVER (PARTITION BY c.segment ORDER BY o.order_id) "
+            "AS prev_price "
+            "FROM {orders} o JOIN {customers} c ON o.customer_id = c.customer_id"
+        ),
+    },
+    {
+        "name": "win_lead_price_next_row_default",
+        "tables": ["orders", "customers"],
+        "query": (
+            "SELECT o.order_id, c.segment, "
+            "LEAD(o.price, 1, 0) OVER (PARTITION BY c.segment ORDER BY o.order_id) "
+            "AS next_price "
+            "FROM {orders} o JOIN {customers} c ON o.customer_id = c.customer_id"
+        ),
+    },
+    {
+        "name": "win_first_value_price_in_partition",
+        "tables": ["orders", "customers"],
+        "query": (
+            "SELECT o.order_id, c.segment, "
+            "FIRST_VALUE(o.price) OVER (PARTITION BY c.segment ORDER BY o.order_id) "
+            "AS first_price "
+            "FROM {orders} o JOIN {customers} c ON o.customer_id = c.customer_id"
+        ),
+    },
+    {
+        "name": "win_last_value_price_running_frame",
+        "tables": ["orders", "customers"],
+        "query": (
+            "SELECT o.order_id, c.segment, "
+            "LAST_VALUE(o.price) OVER (PARTITION BY c.segment ORDER BY o.order_id) "
+            "AS last_price "
+            "FROM {orders} o JOIN {customers} c ON o.customer_id = c.customer_id"
+        ),
+    },
+    {
+        "name": "win_ntile_two_buckets",
+        "tables": ["orders", "customers"],
+        "query": (
+            "SELECT o.order_id, c.segment, "
+            "NTILE(2) OVER (PARTITION BY c.segment ORDER BY o.order_id) AS bucket "
+            "FROM {orders} o JOIN {customers} c ON o.customer_id = c.customer_id"
+        ),
+    },
     # Expressions over cross-source joins: CASE, COALESCE/NULLIF, CASTs,
     # string functions, date functions, decimal arithmetic.
     {
@@ -516,16 +567,13 @@ CASES = [
     },
 ]
 
-# Constructs the engine rejects with a loud parse-time error in every
-# placement (never a silently wrong answer), so this corpus carries no case
-# for them: LAG(...), LEAD(...), FIRST_VALUE(...),
-# LAST_VALUE(...) and NTILE(...) each raise "parse error: unsupported SQL:
-# function <name>"; the `||` concatenation operator raises "binary operator
-# '||' has no execution IR form" in every cross-source placement (single-source
-# placements push it down and succeed). CONCAT(...) is supported and is used in
-# win_concat_function instead of `||`. None of these are pinned as
-# expect_error cases because the rejection is an unimplemented shape, not a
-# documented, designed restriction.
+# LAG, LEAD, FIRST_VALUE, LAST_VALUE, and NTILE are supported window functions
+# (win_lag_price_prior_row, win_lead_price_next_row_default,
+# win_first_value_price_in_partition, win_last_value_price_running_frame,
+# win_ntile_two_buckets above); they run wherever ROW_NUMBER does. The `||`
+# string-concatenation operator lowers to the `||` execution operator and runs
+# in every placement, cross-source included; CONCAT(...) remains available and
+# is exercised by win_concat_function.
 
 # Verified engine-vs-oracle mismatches, kept out of CASES (a case must never
 # be left red); each entry names the query, the placement(s) that reproduce

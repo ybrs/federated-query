@@ -941,6 +941,91 @@ fn window_order_desc_and_row_number() {
     assert_eq!(order_ascending, vec![false]);
 }
 
+/// The (function_name, arg_count) of the single windowed function call a
+/// `SELECT <window> FROM ...` projects. The function under an OVER must be a
+/// non-aggregate FunctionCall.
+fn windowed_call(sql: &str) -> (String, usize) {
+    let Expr::Window { function, .. } = only_window(sql) else {
+        panic!("expected Window");
+    };
+    let Expr::FunctionCall {
+        function_name,
+        args,
+        is_aggregate,
+        ..
+    } = function.as_ref()
+    else {
+        panic!("expected FunctionCall, got {function:?}");
+    };
+    assert!(!is_aggregate, "pure window function must be non-aggregate");
+    (function_name.clone(), args.len())
+}
+
+#[test]
+fn lag_lead_carry_expr_offset_default() {
+    // LAG/LEAD lower to NAME(expr [, offset [, default]]) inside the window.
+    assert_eq!(
+        windowed_call("SELECT lag(v) OVER (ORDER BY k) FROM t"),
+        ("LAG".to_string(), 1)
+    );
+    assert_eq!(
+        windowed_call("SELECT lag(v, 2) OVER (ORDER BY k) FROM t"),
+        ("LAG".to_string(), 2)
+    );
+    assert_eq!(
+        windowed_call("SELECT lead(v, 1, 0) OVER (ORDER BY k) FROM t"),
+        ("LEAD".to_string(), 3)
+    );
+}
+
+#[test]
+fn first_last_value_carry_their_argument() {
+    assert_eq!(
+        windowed_call("SELECT first_value(v) OVER (ORDER BY k) FROM t"),
+        ("FIRST_VALUE".to_string(), 1)
+    );
+    assert_eq!(
+        windowed_call("SELECT last_value(v) OVER (ORDER BY k) FROM t"),
+        ("LAST_VALUE".to_string(), 1)
+    );
+}
+
+#[test]
+fn ntile_carries_its_bucket_count() {
+    assert_eq!(
+        windowed_call("SELECT ntile(4) OVER (ORDER BY k) FROM t"),
+        ("NTILE".to_string(), 1)
+    );
+}
+
+#[test]
+fn ignore_nulls_window_modifier_raises() {
+    // The engine window plan carries no null-treatment modifier; IGNORE NULLS
+    // must raise rather than silently drop the requested semantics.
+    let result = parse("SELECT lag(v IGNORE NULLS) OVER (ORDER BY k) FROM t");
+    assert!(matches!(result, Err(ParseError::Unsupported(_))));
+}
+
+#[test]
+fn is_distinct_from_becomes_null_safe_neq_predicate() {
+    // a IS DISTINCT FROM b is a general predicate lowering to the NullSafeNeq
+    // binary operator, not an unsupported scalar function.
+    let plan = parse("SELECT a FROM t WHERE a IS DISTINCT FROM b").unwrap();
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection");
+    };
+    let LogicalPlan::Filter(filter) = projection.input.as_ref() else {
+        panic!("expected Filter under Projection");
+    };
+    assert!(matches!(
+        filter.predicate,
+        Expr::BinaryOp {
+            op: BinaryOpType::NullSafeNeq,
+            ..
+        }
+    ));
+}
+
 #[test]
 fn window_in_where_raises() {
     // Window functions evaluate after WHERE, so one there is invalid SQL.

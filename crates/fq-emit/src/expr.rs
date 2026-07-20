@@ -377,6 +377,29 @@ mod tests {
         assert_eq!(render(&regexp), "(\"t\".\"region\" ~ '^E[UW]$')");
     }
 
+    #[test]
+    fn concat_renders_double_pipe() {
+        let concat = Expr::BinaryOp {
+            op: BinaryOpType::Concat,
+            left: Box::new(col("t", "a")),
+            right: Box::new(col("t", "b")),
+        };
+        assert_eq!(render(&concat), "(\"t\".\"a\" || \"t\".\"b\")");
+    }
+
+    #[test]
+    fn is_distinct_from_renders_the_predicate() {
+        let distinct = Expr::BinaryOp {
+            op: BinaryOpType::NullSafeNeq,
+            left: Box::new(col("t", "a")),
+            right: Box::new(col("t", "b")),
+        };
+        assert_eq!(
+            render(&distinct),
+            "(\"t\".\"a\" IS DISTINCT FROM \"t\".\"b\")"
+        );
+    }
+
     fn int(value: i64) -> Expr {
         Expr::Literal {
             value: LiteralValue::Integer(value),
@@ -724,6 +747,30 @@ mod tests {
         );
         let bare = window(vec![], vec![], vec![], vec![], None);
         assert_eq!(render(&bare), "ROW_NUMBER() OVER ()");
+    }
+
+    #[test]
+    fn lag_window_renders_its_arguments() {
+        let lag = Expr::FunctionCall {
+            function_name: "LAG".to_string(),
+            args: vec![col("t", "v"), int(1)],
+            is_aggregate: false,
+            distinct: false,
+            within_group_key: None,
+            within_group_desc: false,
+        };
+        let windowed = Expr::Window {
+            function: Box::new(lag),
+            partition_by: vec![col("t", "p")],
+            order_keys: vec![col("t", "k")],
+            order_ascending: vec![true],
+            order_nulls: vec![None],
+            frame: None,
+        };
+        assert_eq!(
+            render(&windowed),
+            "LAG(\"t\".\"v\", 1) OVER (PARTITION BY \"t\".\"p\" ORDER BY \"t\".\"k\" NULLS LAST)"
+        );
     }
 
     fn empty_subplan() -> Box<LogicalPlan> {

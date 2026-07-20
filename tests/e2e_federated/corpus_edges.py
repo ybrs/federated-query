@@ -12,16 +12,12 @@ right, and both sides of every join type plus a runtime-emptied join and an
 aggregate over zero rows; single-row joins (including a single-row FULL JOIN
 with no match) built by filtering a library table down to one row; type
 edges from ``t_types`` (bigint and decimal precision, double arithmetic,
-date/timestamp join keys, case-sensitive varchar equality); cross-type joins
-through an explicit CAST; and ``t_text`` edges (NULLIF/TRIM on blank-vs-space
-values, a quoted value, LIKE wildcard matches, and the engine's current
-LIKE ... ESCAPE behavior, pinned as it stands today).
-
-``SUSPECTED_ENGINE_BUGS`` (module-level, not run by the suite) holds two
-cases pulled out of CASES because the live engine raised instead of
-returning a result: a boolean-column equality predicate against a
-PostgreSQL source, and the ``||`` concatenation operator against a Parquet
-source. Each carries a ``finding`` with the exact reproduction and error.
+date/timestamp join keys, case-sensitive varchar equality, a boolean-column
+join key); cross-type joins through an explicit CAST; a ``||`` string
+concatenation over a CAST; a null-safe ``IS DISTINCT FROM`` WHERE predicate;
+and ``t_text`` edges (NULLIF/TRIM on blank-vs-space values, a quoted value,
+LIKE wildcard matches, and the engine's current LIKE ... ESCAPE behavior,
+pinned as it stands today).
 """
 
 CASES = [
@@ -70,7 +66,6 @@ CASES = [
     {
         "name": "edge_null_safe_not_equal_filter",
         "tables": ["t_null_a", "t_null_b"],
-        "expect_error": "null_safe_neq",
         "query": (
             "SELECT a.id, a.k AS a_k, b.k AS b_k "
             "FROM {t_null_a} a JOIN {t_null_b} b ON a.id = b.id "
@@ -396,13 +391,9 @@ CASES = [
             "SELECT a.tag, b.note " "FROM {t_dup_a} a JOIN {t_dup_b} b ON a.k = b.k"
         ),
     },
-]
-
-# Cases pulled out of CASES because a run against the live engine raised
-# instead of returning a result. Each carries a "finding" describing the
-# reproduction and the exact error text observed, so the gap stays visible
-# instead of being silently dropped.
-SUSPECTED_ENGINE_BUGS = [
+    # A boolean-column equality join key: the referenced boolean column drives
+    # a statistics probe that omits min/max (Postgres has none for booleans)
+    # yet still pushes the equality predicate to a PostgreSQL source.
     {
         "name": "edge_types_boolean_join_key",
         "tables": ["products", "t_types"],
@@ -410,35 +401,14 @@ SUSPECTED_ENGINE_BUGS = [
             "SELECT p.name, t.t_str "
             "FROM {products} p JOIN {t_types} t ON p.active = t.t_bool"
         ),
-        "finding": (
-            "Any boolean-column equality predicate pushed to a PostgreSQL "
-            "source raises, not just this join. Minimal repro on the plain "
-            "library 'products' table alone (no join, no t_types): placement "
-            'pg_duck, query "SELECT name FROM {products} WHERE active = TRUE" '
-            "raises RuntimeError('physical planning error: datasource error: "
-            "db error'); the identical query against a duck_duck placement "
-            "returns 6 rows. Also reproduces with 'WHERE active' (bare) and "
-            "'WHERE active = FALSE'. This case itself fails under pg_duck, "
-            "duck_pg, all_pg, and parquet_pg (every placement with a "
-            "PostgreSQL slot) with the same error; oracle_single_duck, "
-            "duck_duck, and parquet_duck pass."
-        ),
     },
+    # The `||` string-concatenation operator over a CAST, exercised on every
+    # connector including Parquet (it lowers to the `||` execution operator).
     {
         "name": "edge_null_concat_cast",
         "tables": ["t_null_a"],
         "query": (
             "SELECT id, CAST(k AS VARCHAR) || '-suffix' AS tagged FROM {t_null_a}"
-        ),
-        "finding": (
-            "The '||' concatenation operator raises whenever the scanned "
-            "table sits on the Parquet connector: placements parquet_duck "
-            'and parquet_pg both raise RuntimeError("execution error: '
-            "binary operator '||' has no execution IR form\"); the identical "
-            "query passes under oracle_single_duck, duck_duck, pg_duck, "
-            "duck_pg, and all_pg. Since the table set has only one table, "
-            "parquet_duck/parquet_pg always place it on the Parquet slot, so "
-            "no placement of this case can avoid the gap."
         ),
     },
 ]

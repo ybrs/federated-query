@@ -180,6 +180,7 @@ fn operator(op: &str) -> Result<Operator, DataFusionError> {
         "ilike" => Operator::ILikeMatch,
         "is_distinct_from" => Operator::IsDistinctFrom,
         "is_not_distinct_from" => Operator::IsNotDistinctFrom,
+        "||" => Operator::StringConcat,
         other => return plan_err(format!("unsupported binary operator '{other}'")),
     })
 }
@@ -246,5 +247,10 @@ mod tests {
     fn rejects_unknown_cast_type() {
         let e = parse(r#"{"node":"cast","expr":{"node":"column","name":"a"},"to":"jsonb"}"#);
         assert!(to_df_expr(&e).is_err());
+    }
+
+    #[test]
+    fn double_pipe_maps_to_string_concat() {
+        assert_eq!(operator("||").unwrap(), Operator::StringConcat);
     }
 }
