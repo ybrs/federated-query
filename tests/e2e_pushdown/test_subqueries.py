@@ -220,7 +220,12 @@ def test_scalar_subquery_max(single_source_env):
 
 
 def test_scalar_subquery_avg_comparison(single_source_env):
-    """A scalar ``> (SELECT AVG(...))`` pushes as a LEFT JOIN, no subquery expr."""
+    """A scalar ``> (SELECT AVG(...))`` pushes as an INNER JOIN, no subquery expr.
+
+    The decorrelated subquery output sits on the null-extended side of the join;
+    the ``price > <subquery>`` comparison rejects a NULL there, so the outer join
+    simplifies to INNER (a row with no subquery match is dropped either way).
+    """
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id, price FROM duckdb_primary.main.orders "
@@ -229,7 +234,7 @@ def test_scalar_subquery_avg_comparison(single_source_env):
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
-    assert "LEFT" in _join_kinds(ast)
+    assert "INNER" in _join_kinds(ast)
     _assert_no_subquery_expressions(ast)
 
 
@@ -256,7 +261,11 @@ def test_scalar_subquery_in_having(single_source_env):
 
 
 def test_correlated_subquery_in_where(single_source_env):
-    """A correlated scalar in WHERE pushes as a LEFT JOIN, no subquery expr."""
+    """A correlated scalar in WHERE pushes as an INNER JOIN, no subquery expr.
+
+    As with the uncorrelated case, the ``price > <subquery>`` comparison rejects
+    a NULL subquery output, so the decorrelated outer join simplifies to INNER.
+    """
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id, price FROM duckdb_primary.main.orders O "
@@ -266,7 +275,7 @@ def test_correlated_subquery_in_where(single_source_env):
         ")"
     )
     ast = explain_datasource_query(runtime, sql)
-    assert "LEFT" in _join_kinds(ast)
+    assert "INNER" in _join_kinds(ast)
     _assert_no_subquery_expressions(ast)
 
 

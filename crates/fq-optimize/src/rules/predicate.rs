@@ -9,6 +9,7 @@ use std::collections::HashSet;
 
 use fq_plan::expr::{
     and_expressions, combine_and, combine_or, split_conjuncts, split_disjuncts, BinaryOpType, Expr,
+    UnaryOpType,
 };
 use fq_plan::logical::{Filter, Join, JoinType, LogicalPlan, Scan};
 
@@ -738,7 +739,21 @@ fn movable_conjunct(
 
 /// Push only preserved-side conjuncts below an outer join; keep the rest above.
 /// Ports `_push_filter_below_outer_join`.
-fn push_filter_below_outer_join(predicate: Expr, join: Join) -> Result<LogicalPlan, OptimizeError> {
+fn push_filter_below_outer_join(
+    predicate: Expr,
+    mut join: Join,
+) -> Result<LogicalPlan, OptimizeError> {
+    // A WHERE predicate that rejects nulls on a null-extended side removes the
+    // rows that side's null-extension produces, so the outer join simplifies
+    // (RIGHT/LEFT -> INNER, FULL -> LEFT/RIGHT/INNER). The reduced join re-enters
+    // the general dispatch, which routes conjuncts to the now-safe sides. Real
+    // engines do this both for correctness under downstream planners and because
+    // inner joins unlock reordering and pushdown.
+    let simplified = simplify_outer_join_type(&join, &predicate);
+    if simplified != join.join_type {
+        join.join_type = simplified;
+        return push_filter_below_join(predicate, join);
+    }
     let Some(preserved) = preserved_side(join.join_type) else {
         return rehome_filter_over_join(predicate, join);
     };
@@ -750,6 +765,146 @@ fn push_filter_below_outer_join(predicate: Expr, join: Join) -> Result<LogicalPl
     let join = push_join_condition(join);
     let (down, keep) = partition_preserved(&conjuncts, &join, preserved);
     assemble_outer_join(join, down, keep, preserved)
+}
+
+/// The join type an outer join reduces to under a null-rejecting WHERE predicate,
+/// or the original type when nothing simplifies.
+///
+/// A predicate that cannot be TRUE when a side is all-NULL discards that side's
+/// null-extended rows: RIGHT loses its left null-extension, LEFT its right, and
+/// FULL loses one or both. The predicate here is the WHERE above the join, NEVER
+/// the ON condition (a null-rejecting ON predicate is the defining behavior of an
+/// outer join, not a simplification).
+fn simplify_outer_join_type(join: &Join, predicate: &Expr) -> JoinType {
+    // Every post-binder column carries a relation qualifier; the sole exception is
+    // a decorrelation-produced bare aggregate output, whose join is deliberately
+    // left as-is (its correlated structure feeds join reordering and eager
+    // aggregation, which need qualified references). A bare column in the WHERE
+    // marks that case, so the join is not simplified.
+    if predicate_has_unqualified_column(predicate) {
+        return join.join_type;
+    }
+    let left_cols = available_columns(&join.left);
+    let right_cols = available_columns(&join.right);
+    let rejects_left = rejects_null_on_side(predicate, &left_cols, &right_cols);
+    let rejects_right = rejects_null_on_side(predicate, &right_cols, &left_cols);
+    match join.join_type {
+        JoinType::Right if rejects_left => JoinType::Inner,
+        JoinType::Left if rejects_right => JoinType::Inner,
+        JoinType::Full => match (rejects_left, rejects_right) {
+            (true, true) => JoinType::Inner,
+            (true, false) => JoinType::Left,
+            (false, true) => JoinType::Right,
+            (false, false) => JoinType::Full,
+        },
+        other => other,
+    }
+}
+
+/// Whether any column in `predicate` lacks a relation qualifier.
+fn predicate_has_unqualified_column(predicate: &Expr) -> bool {
+    fq_plan::expr::column_refs(predicate)
+        .into_iter()
+        .any(|reference| reference.table.as_deref().unwrap_or("").is_empty())
+}
+
+/// Whether `predicate` cannot evaluate to TRUE when every column of `side_cols`
+/// is NULL - so it removes the rows where that side is null-extended. A
+/// conservative allowlist of NULL-propagating shapes; every unrecognized shape
+/// returns false (leaving the join type unchanged). AND rejects when EITHER arm
+/// does; OR only when BOTH do; a NULL-safe comparison (IS NOT DISTINCT FROM) and
+/// IS NULL are deliberately absent (they are TRUE on an all-NULL side).
+fn rejects_null_on_side(
+    predicate: &Expr,
+    side_cols: &HashSet<String>,
+    other_cols: &HashSet<String>,
+) -> bool {
+    match predicate {
+        Expr::BinaryOp {
+            op: BinaryOpType::And,
+            left,
+            right,
+        } => {
+            rejects_null_on_side(left, side_cols, other_cols)
+                || rejects_null_on_side(right, side_cols, other_cols)
+        }
+        Expr::BinaryOp {
+            op: BinaryOpType::Or,
+            left,
+            right,
+        } => {
+            rejects_null_on_side(left, side_cols, other_cols)
+                && rejects_null_on_side(right, side_cols, other_cols)
+        }
+        Expr::BinaryOp { op, left, right } if is_null_propagating_comparison(*op) => {
+            strict_null_on_side(left, side_cols, other_cols)
+                || strict_null_on_side(right, side_cols, other_cols)
+        }
+        Expr::UnaryOp {
+            op: UnaryOpType::IsNotNull,
+            operand,
+        } => strict_null_on_side(operand, side_cols, other_cols),
+        Expr::Between { value, .. } | Expr::InList { value, .. } => {
+            strict_null_on_side(value, side_cols, other_cols)
+        }
+        Expr::Like { expr, .. } => strict_null_on_side(expr, side_cols, other_cols),
+        _ => false,
+    }
+}
+
+/// Whether `expr` is guaranteed NULL when every column of `side_cols` is NULL
+/// (columns of `other_cols` may hold any value). NULL propagates through a
+/// column of that side, a cast, a negation, and strict arithmetic; every other
+/// shape (a literal, a function call, COALESCE) is conservatively NOT strict.
+fn strict_null_on_side(
+    expr: &Expr,
+    side_cols: &HashSet<String>,
+    other_cols: &HashSet<String>,
+) -> bool {
+    match expr {
+        Expr::Column(_) => {
+            let names = qualified_or_bare_names(expr);
+            !names.is_empty() && columns_belong_to_side(&names, side_cols, other_cols)
+        }
+        Expr::Cast { expr, .. } => strict_null_on_side(expr, side_cols, other_cols),
+        Expr::UnaryOp {
+            op: UnaryOpType::Negate,
+            operand,
+        } => strict_null_on_side(operand, side_cols, other_cols),
+        Expr::BinaryOp { op, left, right } if is_strict_arithmetic(*op) => {
+            strict_null_on_side(left, side_cols, other_cols)
+                || strict_null_on_side(right, side_cols, other_cols)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a comparison yields NULL (never TRUE) when either operand is NULL. The
+/// standard comparisons qualify; the NULL-safe operators (IS [NOT] DISTINCT FROM)
+/// are excluded because they compare NULL as an ordinary value.
+fn is_null_propagating_comparison(op: BinaryOpType) -> bool {
+    matches!(
+        op,
+        BinaryOpType::Eq
+            | BinaryOpType::Neq
+            | BinaryOpType::Lt
+            | BinaryOpType::Lte
+            | BinaryOpType::Gt
+            | BinaryOpType::Gte
+    )
+}
+
+/// Whether an arithmetic operator propagates a NULL operand to a NULL result.
+fn is_strict_arithmetic(op: BinaryOpType) -> bool {
+    matches!(
+        op,
+        BinaryOpType::Add
+            | BinaryOpType::Subtract
+            | BinaryOpType::Multiply
+            | BinaryOpType::Divide
+            | BinaryOpType::Modulo
+            | BinaryOpType::Concat
+    )
 }
 
 /// AND constants derived from PRESERVED-side filter conjuncts into the outer
@@ -930,16 +1085,62 @@ mod tests {
 
     /// An inner join over two inputs with an ON condition.
     fn inner_join(left: LogicalPlan, right: LogicalPlan, condition: Expr) -> LogicalPlan {
+        outer_join(left, right, JoinType::Inner, condition)
+    }
+
+    /// A join of a given type over two inputs with an ON condition.
+    fn outer_join(
+        left: LogicalPlan,
+        right: LogicalPlan,
+        join_type: JoinType,
+        condition: Expr,
+    ) -> LogicalPlan {
         LogicalPlan::Join(Join {
             left: Box::new(left),
             right: Box::new(right),
-            join_type: JoinType::Inner,
+            join_type,
             condition: Some(condition),
             natural: false,
             using: None,
             estimated_rows: None,
             estimate_defaults: None,
         })
+    }
+
+    /// `expr IS NOT NULL`.
+    fn is_not_null(expr: Expr) -> Expr {
+        Expr::UnaryOp {
+            op: UnaryOpType::IsNotNull,
+            operand: Box::new(expr),
+        }
+    }
+
+    /// `expr IS NULL`.
+    fn is_null(expr: Expr) -> Expr {
+        Expr::UnaryOp {
+            op: UnaryOpType::IsNull,
+            operand: Box::new(expr),
+        }
+    }
+
+    /// The join type the optimizer leaves after pushing `predicate` through a
+    /// `join_type` join keyed on `l.k = r.k`, with a left `a` and right `b` column.
+    fn simplified_type(join_type: JoinType, predicate: Expr) -> JoinType {
+        let join = outer_join(
+            scan("l", &["a", "k"]),
+            scan("r", &["b", "k"]),
+            join_type,
+            eq(col("l", "k"), col("r", "k")),
+        );
+        let mut plan = PredicatePushdown.apply(filter(join, predicate)).unwrap();
+        // The reduced join surfaces either bare or under a residual filter.
+        if let LogicalPlan::Filter(top) = plan {
+            plan = *top.input;
+        }
+        match plan {
+            LogicalPlan::Join(join) => join.join_type,
+            other => panic!("expected a join, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1016,36 +1217,153 @@ mod tests {
 
     #[test]
     fn left_join_only_pushes_preserved_side() {
-        // LEFT JOIN, WHERE l.a = 1 (left/preserved) AND r.b = 2 (nullable).
-        let join = LogicalPlan::Join(Join {
-            left: Box::new(scan("l", &["a", "k"])),
-            right: Box::new(scan("r", &["b", "k"])),
-            join_type: JoinType::Left,
-            condition: Some(eq(col("l", "k"), col("r", "k"))),
-            natural: false,
-            using: None,
-            estimated_rows: None,
-            estimate_defaults: None,
-        });
+        // LEFT JOIN, WHERE l.a = 1 (left/preserved) AND r.b IS NULL (nullable). The
+        // nullable conjunct is NOT null-rejecting (IS NULL keeps null-extended rows),
+        // so the join stays LEFT and only the preserved conjunct descends.
+        let join = outer_join(
+            scan("l", &["a", "k"]),
+            scan("r", &["b", "k"]),
+            JoinType::Left,
+            eq(col("l", "k"), col("r", "k")),
+        );
         let predicate = binop(
             BinaryOpType::And,
             eq(col("l", "a"), int(1)),
-            eq(col("r", "b"), int(2)),
+            is_null(col("r", "b")),
         );
         let result = PredicatePushdown.apply(filter(join, predicate)).unwrap();
         // The nullable-side conjunct stays above; only the left one descends.
         let LogicalPlan::Filter(top) = result else {
-            panic!("the r.b = 2 conjunct is kept above the outer join");
+            panic!("the r.b IS NULL conjunct is kept above the outer join");
         };
-        assert_eq!(top.predicate, eq(col("r", "b"), int(2)));
+        assert_eq!(top.predicate, is_null(col("r", "b")));
         let LogicalPlan::Join(join) = *top.input else {
             panic!("a join under the residual filter");
         };
+        assert_eq!(join.join_type, JoinType::Left);
         // Left scan got l.a = 1.
         let LogicalPlan::Scan(left) = *join.left else {
             panic!("left scan");
         };
         assert_eq!(left.filters, Some(eq(col("l", "a"), int(1))));
+    }
+
+    #[test]
+    fn right_join_null_rejecting_where_becomes_inner() {
+        // RIGHT JOIN with r.b > 3 (preserved) AND l.a IS NOT NULL (null-extended
+        // left): the IS NOT NULL rejects the left null-extension, so RIGHT -> INNER
+        // and both conjuncts sink to their scans, leaving no residual filter.
+        let predicate = binop(
+            BinaryOpType::And,
+            is_not_null(col("l", "a")),
+            binop(BinaryOpType::Gt, col("r", "b"), int(3)),
+        );
+        let join = outer_join(
+            scan("l", &["a", "k"]),
+            scan("r", &["b", "k"]),
+            JoinType::Right,
+            eq(col("l", "k"), col("r", "k")),
+        );
+        let result = PredicatePushdown.apply(filter(join, predicate)).unwrap();
+        let LogicalPlan::Join(join) = result else {
+            panic!("both conjuncts sink into the scans, the join surfaces bare");
+        };
+        assert_eq!(join.join_type, JoinType::Inner);
+        let LogicalPlan::Scan(left) = *join.left else {
+            panic!("left scan");
+        };
+        assert_eq!(left.filters, Some(is_not_null(col("l", "a"))));
+    }
+
+    #[test]
+    fn left_join_null_rejecting_nullable_where_becomes_inner() {
+        // The mirror: LEFT JOIN with a null-rejecting predicate on the nullable
+        // RIGHT side reduces to INNER.
+        assert_eq!(
+            simplified_type(JoinType::Left, is_not_null(col("r", "b"))),
+            JoinType::Inner,
+        );
+    }
+
+    #[test]
+    fn right_join_is_null_does_not_simplify() {
+        // IS NULL keeps null-extended rows, so it is NOT null-rejecting: the RIGHT
+        // join is preserved.
+        assert_eq!(
+            simplified_type(JoinType::Right, is_null(col("l", "a"))),
+            JoinType::Right,
+        );
+    }
+
+    #[test]
+    fn right_join_preserved_side_predicate_does_not_simplify() {
+        // A predicate over ONLY the preserved (right) side says nothing about the
+        // null-extended left, so the RIGHT join is preserved.
+        assert_eq!(
+            simplified_type(
+                JoinType::Right,
+                binop(BinaryOpType::Gt, col("r", "b"), int(3))
+            ),
+            JoinType::Right,
+        );
+    }
+
+    #[test]
+    fn full_join_null_rejecting_one_side_reduces_to_that_side() {
+        // Rejecting nulls on the LEFT drops the unmatched-right (null-left) rows,
+        // leaving a LEFT join; the mirror leaves a RIGHT join.
+        assert_eq!(
+            simplified_type(JoinType::Full, is_not_null(col("l", "a"))),
+            JoinType::Left,
+        );
+        assert_eq!(
+            simplified_type(JoinType::Full, is_not_null(col("r", "b"))),
+            JoinType::Right,
+        );
+    }
+
+    #[test]
+    fn unqualified_predicate_column_blocks_simplification() {
+        // A bare (unqualified) column - a decorrelation aggregate output - keeps the
+        // outer join as-is, so the correlated structure is not fed to reordering.
+        let bare = Expr::UnaryOp {
+            op: UnaryOpType::IsNotNull,
+            operand: Box::new(Expr::Column(ColumnRef::new(
+                None,
+                "a",
+                Some(DataType::Integer),
+            ))),
+        };
+        assert_eq!(simplified_type(JoinType::Right, bare), JoinType::Right);
+    }
+
+    #[test]
+    fn full_join_null_rejecting_both_sides_becomes_inner() {
+        let predicate = binop(
+            BinaryOpType::And,
+            is_not_null(col("l", "a")),
+            is_not_null(col("r", "b")),
+        );
+        assert_eq!(simplified_type(JoinType::Full, predicate), JoinType::Inner);
+    }
+
+    #[test]
+    fn or_of_null_rejecting_branches_simplifies_but_a_mixed_or_does_not() {
+        // Both OR branches reject the left null-extension -> INNER.
+        let both = binop(
+            BinaryOpType::Or,
+            eq(col("l", "a"), int(1)),
+            is_not_null(col("l", "k")),
+        );
+        assert_eq!(simplified_type(JoinType::Right, both), JoinType::Inner);
+        // One branch is IS NULL (not rejecting), so the OR can be TRUE on an
+        // all-NULL left row: the RIGHT join is preserved.
+        let mixed = binop(
+            BinaryOpType::Or,
+            eq(col("l", "a"), int(1)),
+            is_null(col("l", "k")),
+        );
+        assert_eq!(simplified_type(JoinType::Right, mixed), JoinType::Right);
     }
 
     #[test]

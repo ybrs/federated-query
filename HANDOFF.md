@@ -421,6 +421,15 @@ polyglot-sql 0.5.15 mis-nesting (a trailing UNION ALL attached to a
 scalar-subquery operand). When a polyglot release nests trailing set operations
 correctly, delete the repair block and its tests. See commit `26d3d9f`.
 
+DataFusion 54 mis-executes `Filter` over an outer join in a fused plan when an
+intervening projection blocks its own outer-join elimination (a null-extended
+row that the filter must remove survives). Our optimizer now simplifies
+null-rejecting-filtered outer joins to inner joins before lowering
+(fq-optimize predicate.rs), so DataFusion never receives the fragile shape;
+if a future DataFusion release fixes the execution, the simplification stays
+(it is a standard optimization), but the fuzzer's RIGHT-join findings are the
+canary if any unsimplifiable shape resurfaces.
+
 ## Commit log (rewrite, newest first; earlier log in git history of this file)
 
 ```
