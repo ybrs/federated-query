@@ -118,6 +118,84 @@ pub struct DynamicDatasource {
     pub created_at: String,
 }
 
+/// The users table, in the same durable SQLite file (synchronous=ON). `verifier`
+/// is the pg_authid SCRAM string - never a plaintext or the SaltedPassword; a
+/// stolen verifier does not yield client-auth capability. `name` is the primary
+/// key so a concurrent CREATE USER races on INSERT OR IGNORE (first-writer wins).
+/// `created_by` is the creating principal, or 'bootstrap-import' for a config
+/// seed. A dropped user leaves no dangling grant (DROP removes both in one txn).
+const USERS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS users (
+    name        TEXT PRIMARY KEY,
+    verifier    TEXT NOT NULL,
+    superuser   INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL,
+    created_by  TEXT
+)";
+
+/// The grants table. A grant authorizes `grantee` (a user name or the reserved
+/// pseudo-grantee 'PUBLIC') to `privilege` ('SELECT' in v1) on an object at one
+/// of three containment levels (`object_kind` datasource|schema|table, with
+/// `object_path` d | d.s | d.s.t). The composite primary key makes GRANT
+/// idempotent (a re-grant is a no-op success); the bind-time check queries the
+/// three candidate paths of a table for {user, PUBLIC}.
+const GRANTS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS grants (
+    grantee     TEXT NOT NULL,
+    privilege   TEXT NOT NULL,
+    object_kind TEXT NOT NULL,
+    object_path TEXT NOT NULL,
+    granted_by  TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (grantee, privilege, object_kind, object_path)
+)";
+
+/// The index the bind-time grant lookup rides: it queries by `(grantee,
+/// object_path)` for {user, PUBLIC} across a table's three candidate paths.
+const GRANTS_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS grants_grantee_path ON grants (grantee, object_path)";
+
+/// The ACL generation counter, one row. Every user/grant DDL write increments it
+/// in the SAME transaction, so a live session detects a privilege change with one
+/// O(1) read and reloads its cached grants only when it actually changed.
+const ACL_META_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS acl_meta (
+    key         TEXT PRIMARY KEY,
+    value       INTEGER NOT NULL
+)";
+
+/// One persisted user: the SCRAM verifier, the superuser flag, and provenance.
+#[derive(Clone, PartialEq, Eq)]
+pub struct User {
+    pub name: String,
+    pub verifier: String,
+    pub superuser: bool,
+    pub created_at: String,
+    pub created_by: Option<String>,
+}
+
+/// Redact the verifier under `Debug`: it is sensitive (offline attack + server
+/// impersonation), so it is never rendered into a log or panic message.
+impl std::fmt::Debug for User {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("User")
+            .field("name", &self.name)
+            .field("verifier", &"<redacted>")
+            .field("superuser", &self.superuser)
+            .field("created_at", &self.created_at)
+            .field("created_by", &self.created_by)
+            .finish()
+    }
+}
+
+/// One persisted grant row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grant {
+    pub grantee: String,
+    pub privilege: String,
+    pub object_kind: String,
+    pub object_path: String,
+    pub granted_by: String,
+    pub created_at: String,
+}
+
 /// A SQLite-backed registry of materialized views for one config.
 pub struct ViewCatalog {
     conn: Mutex<Connection>,
@@ -383,6 +461,272 @@ impl ViewCatalog {
             )?;
         Ok(deleted > 0)
     }
+
+    /// Insert a user with `INSERT OR IGNORE` on the name primary key. Returns
+    /// whether THIS call inserted the row: `false` means the name already exists,
+    /// and the caller raises `already exists` (first-writer wins, never a silent
+    /// replace). A successful insert bumps the ACL generation in the same
+    /// transaction, so a live session's next query observes the new user.
+    pub fn create_user(
+        &self,
+        name: &str,
+        verifier: &str,
+        superuser: bool,
+        created_by: &str,
+    ) -> Result<bool, AccelError> {
+        let mut guard = self.conn.lock().expect("view catalog lock poisoned");
+        let tx = guard.transaction()?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO users (name, verifier, superuser, created_at, created_by) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                name,
+                verifier,
+                i64::from(superuser),
+                (self.clock)(),
+                created_by
+            ],
+        )?;
+        if inserted == 1 {
+            bump_generation(&tx)?;
+        }
+        tx.commit()?;
+        Ok(inserted == 1)
+    }
+
+    /// Overwrite a user's verifier (`ALTER USER ... WITH PASSWORD`). Returns
+    /// whether a row was updated (a missing name lets the caller raise). Bumps the
+    /// generation so a live session refreshes, though the verifier is only
+    /// consulted at a NEW connection's handshake.
+    pub fn set_user_password(&self, name: &str, verifier: &str) -> Result<bool, AccelError> {
+        self.update_user("verifier = ?2", params![name, verifier])
+    }
+
+    /// Set a user's superuser flag (`ALTER USER ... [NO]SUPERUSER`). Returns
+    /// whether a row was updated; bumps the generation so an in-flight session
+    /// cannot keep administering after its superuser bit is cleared.
+    pub fn set_user_superuser(&self, name: &str, superuser: bool) -> Result<bool, AccelError> {
+        self.update_user("superuser = ?2", params![name, i64::from(superuser)])
+    }
+
+    /// Run a single-column user UPDATE (keyed on `name` at `?1`) inside a
+    /// generation-bumping transaction.
+    fn update_user(
+        &self,
+        set_clause: &str,
+        values: &[&dyn rusqlite::ToSql],
+    ) -> Result<bool, AccelError> {
+        let mut guard = self.conn.lock().expect("view catalog lock poisoned");
+        let tx = guard.transaction()?;
+        let sql = format!("UPDATE users SET {set_clause} WHERE name = ?1");
+        let updated = tx.execute(&sql, values)?;
+        if updated > 0 {
+            bump_generation(&tx)?;
+        }
+        tx.commit()?;
+        Ok(updated > 0)
+    }
+
+    /// Drop a user AND every grant it holds in one transaction (a dropped user
+    /// leaves no dangling grant). Returns whether the user existed; a successful
+    /// drop bumps the generation, so a live session of the dropped user is denied
+    /// at its next query.
+    pub fn drop_user(&self, name: &str) -> Result<bool, AccelError> {
+        let mut guard = self.conn.lock().expect("view catalog lock poisoned");
+        let tx = guard.transaction()?;
+        tx.execute("DELETE FROM grants WHERE grantee = ?1", params![name])?;
+        let deleted = tx.execute("DELETE FROM users WHERE name = ?1", params![name])?;
+        if deleted > 0 {
+            bump_generation(&tx)?;
+        }
+        tx.commit()?;
+        Ok(deleted > 0)
+    }
+
+    /// The user named `name`, or None.
+    pub fn get_user(&self, name: &str) -> Result<Option<User>, AccelError> {
+        let user = self
+            .conn
+            .lock()
+            .expect("view catalog lock poisoned")
+            .query_row(
+                "SELECT name, verifier, superuser, created_at, created_by \
+                 FROM users WHERE name = ?1",
+                params![name],
+                user_row,
+            )
+            .optional()?;
+        Ok(user)
+    }
+
+    /// Every user, ordered by name.
+    pub fn list_users(&self) -> Result<Vec<User>, AccelError> {
+        let conn = self.conn.lock().expect("view catalog lock poisoned");
+        let mut statement = conn.prepare(
+            "SELECT name, verifier, superuser, created_at, created_by FROM users ORDER BY name",
+        )?;
+        let rows = statement.query_map([], user_row)?;
+        let mut users = Vec::new();
+        for row in rows {
+            users.push(row?);
+        }
+        Ok(users)
+    }
+
+    /// The number of superusers, for the refuse-start-without-superuser check.
+    pub fn count_superusers(&self) -> Result<i64, AccelError> {
+        let count = self
+            .conn
+            .lock()
+            .expect("view catalog lock poisoned")
+            .query_row(
+                "SELECT COUNT(*) FROM users WHERE superuser <> 0",
+                [],
+                |row| row.get(0),
+            )?;
+        Ok(count)
+    }
+
+    /// Grant a privilege on an object to a grantee, idempotently: `INSERT OR
+    /// IGNORE` on the composite key, so a re-grant is a no-op success (matching
+    /// Postgres). Bumps the generation only when a new grant is actually added.
+    pub fn grant(
+        &self,
+        grantee: &str,
+        privilege: &str,
+        object_kind: &str,
+        object_path: &str,
+        granted_by: &str,
+    ) -> Result<(), AccelError> {
+        let mut guard = self.conn.lock().expect("view catalog lock poisoned");
+        let tx = guard.transaction()?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO grants \
+             (grantee, privilege, object_kind, object_path, granted_by, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                grantee,
+                privilege,
+                object_kind,
+                object_path,
+                granted_by,
+                (self.clock)()
+            ],
+        )?;
+        if inserted > 0 {
+            bump_generation(&tx)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Revoke a grant. Returns whether a matching row existed; a revoke that
+    /// matches nothing lets the caller RAISE (a silent no-op hides a typo). A
+    /// successful revoke bumps the generation, so a peer loses access at its next
+    /// query.
+    pub fn revoke(
+        &self,
+        grantee: &str,
+        privilege: &str,
+        object_kind: &str,
+        object_path: &str,
+    ) -> Result<bool, AccelError> {
+        let mut guard = self.conn.lock().expect("view catalog lock poisoned");
+        let tx = guard.transaction()?;
+        let deleted = tx.execute(
+            "DELETE FROM grants WHERE grantee = ?1 AND privilege = ?2 \
+             AND object_kind = ?3 AND object_path = ?4",
+            params![grantee, privilege, object_kind, object_path],
+        )?;
+        if deleted > 0 {
+            bump_generation(&tx)?;
+        }
+        tx.commit()?;
+        Ok(deleted > 0)
+    }
+
+    /// Every grant, ordered for a stable `SHOW GRANTS`.
+    pub fn list_grants(&self) -> Result<Vec<Grant>, AccelError> {
+        self.query_grants(
+            "SELECT grantee, privilege, object_kind, object_path, granted_by, created_at \
+             FROM grants ORDER BY grantee, object_path, object_kind",
+            params![],
+        )
+    }
+
+    /// Every grant held by `grantee` (a user name, or 'PUBLIC'), for the bind-time
+    /// cache reload and `SHOW GRANTS FOR`.
+    pub fn grants_for(&self, grantee: &str) -> Result<Vec<Grant>, AccelError> {
+        self.query_grants(
+            "SELECT grantee, privilege, object_kind, object_path, granted_by, created_at \
+             FROM grants WHERE grantee = ?1 ORDER BY object_path, object_kind",
+            params![grantee],
+        )
+    }
+
+    /// Run a grant SELECT and collect the rows.
+    fn query_grants(
+        &self,
+        sql: &str,
+        args: &[&dyn rusqlite::ToSql],
+    ) -> Result<Vec<Grant>, AccelError> {
+        let conn = self.conn.lock().expect("view catalog lock poisoned");
+        let mut statement = conn.prepare(sql)?;
+        let rows = statement.query_map(args, grant_row)?;
+        let mut grants = Vec::new();
+        for row in rows {
+            grants.push(row?);
+        }
+        Ok(grants)
+    }
+
+    /// The current ACL generation counter (one indexed single-row read). A live
+    /// session compares it to its cached value to decide whether to reload grants.
+    pub fn acl_generation(&self) -> Result<i64, AccelError> {
+        let generation = self
+            .conn
+            .lock()
+            .expect("view catalog lock poisoned")
+            .query_row(
+                "SELECT value FROM acl_meta WHERE key = 'generation'",
+                [],
+                |row| row.get(0),
+            )?;
+        Ok(generation)
+    }
+}
+
+/// Increment the ACL generation inside a write transaction, so a grant/user
+/// change is never observed without the matching generation bump.
+fn bump_generation(tx: &Connection) -> Result<(), AccelError> {
+    tx.execute(
+        "UPDATE acl_meta SET value = value + 1 WHERE key = 'generation'",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Read one user row (name, verifier, superuser, created_at, created_by).
+fn user_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
+    Ok(User {
+        name: row.get(0)?,
+        verifier: row.get(1)?,
+        superuser: row.get::<_, i64>(2)? != 0,
+        created_at: row.get(3)?,
+        created_by: row.get(4)?,
+    })
+}
+
+/// Read one grant row.
+fn grant_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Grant> {
+    Ok(Grant {
+        grantee: row.get(0)?,
+        privilege: row.get(1)?,
+        object_kind: row.get(2)?,
+        object_path: row.get(3)?,
+        granted_by: row.get(4)?,
+        created_at: row.get(5)?,
+    })
 }
 
 /// The raw dynamic-datasource row before JSON decoding of `params`.
@@ -414,6 +758,16 @@ fn ensure_schema(conn: &Connection) -> Result<(), AccelError> {
     add_benefit_columns(conn)?;
     conn.execute(DATASOURCE_SCHEMA, [])?;
     add_datasource_optional_columns(conn)?;
+    conn.execute(USERS_SCHEMA, [])?;
+    conn.execute(GRANTS_SCHEMA, [])?;
+    conn.execute(GRANTS_INDEX, [])?;
+    conn.execute(ACL_META_SCHEMA, [])?;
+    // Seed the single generation row at 0 on a fresh store; a pre-existing row
+    // keeps its counter (INSERT OR IGNORE never rewinds a live generation).
+    conn.execute(
+        "INSERT OR IGNORE INTO acl_meta (key, value) VALUES ('generation', 0)",
+        [],
+    )?;
     Ok(())
 }
 
@@ -632,6 +986,88 @@ mod datasource_tests {
             !catalog.delete_datasource("sales").expect("delete again"),
             "deleting a missing name removes nothing"
         );
+    }
+
+    #[test]
+    fn users_round_trip_and_first_writer_wins() {
+        let catalog = ViewCatalog::open(&temp_db("users")).expect("open");
+        assert!(catalog
+            .create_user("alice", "verifier-a", true, "bootstrap-import")
+            .expect("create"));
+        // A duplicate name inserts nothing (first-writer-wins).
+        assert!(!catalog
+            .create_user("alice", "verifier-b", false, "alice")
+            .expect("dup"));
+        let alice = catalog.get_user("alice").expect("get").expect("present");
+        assert_eq!(alice.verifier, "verifier-a");
+        assert!(alice.superuser);
+        assert_eq!(catalog.count_superusers().expect("count"), 1);
+    }
+
+    #[test]
+    fn alter_and_drop_user_bump_the_generation() {
+        let catalog = ViewCatalog::open(&temp_db("users_gen")).expect("open");
+        let gen0 = catalog.acl_generation().expect("gen0");
+        catalog
+            .create_user("bob", "v", false, "root")
+            .expect("create");
+        assert!(catalog.acl_generation().expect("gen1") > gen0);
+        let gen1 = catalog.acl_generation().expect("gen1");
+        assert!(catalog.set_user_password("bob", "v2").expect("alter pw"));
+        assert!(catalog.set_user_superuser("bob", true).expect("alter su"));
+        assert!(catalog.acl_generation().expect("gen2") > gen1);
+        assert!(
+            catalog
+                .get_user("bob")
+                .expect("get")
+                .expect("bob")
+                .superuser
+        );
+        // A no-op alter of a missing user does not bump.
+        let before = catalog.acl_generation().expect("before");
+        assert!(!catalog.set_user_password("ghost", "x").expect("miss"));
+        assert_eq!(catalog.acl_generation().expect("after"), before);
+    }
+
+    #[test]
+    fn grants_are_idempotent_and_revoke_is_loud() {
+        let catalog = ViewCatalog::open(&temp_db("grants")).expect("open");
+        catalog
+            .grant("alice", "SELECT", "table", "d.s.t", "root")
+            .expect("grant");
+        let gen1 = catalog.acl_generation().expect("gen1");
+        // Re-granting the same row is a no-op success and does not bump.
+        catalog
+            .grant("alice", "SELECT", "table", "d.s.t", "root")
+            .expect("regrant");
+        assert_eq!(catalog.acl_generation().expect("gen2"), gen1);
+        catalog
+            .grant("PUBLIC", "SELECT", "datasource", "d", "root")
+            .expect("public grant");
+        assert_eq!(catalog.grants_for("alice").expect("for alice").len(), 1);
+        assert_eq!(catalog.list_grants().expect("all").len(), 2);
+        // A real revoke removes and bumps; a phantom revoke returns false.
+        assert!(catalog
+            .revoke("alice", "SELECT", "table", "d.s.t")
+            .expect("revoke"));
+        assert!(!catalog
+            .revoke("alice", "SELECT", "table", "d.s.t")
+            .expect("revoke again"));
+    }
+
+    #[test]
+    fn drop_user_removes_its_grants() {
+        let catalog = ViewCatalog::open(&temp_db("drop_user")).expect("open");
+        catalog
+            .create_user("carol", "v", false, "root")
+            .expect("create");
+        catalog
+            .grant("carol", "SELECT", "table", "d.s.t", "root")
+            .expect("grant");
+        assert!(catalog.drop_user("carol").expect("drop"));
+        assert!(catalog.get_user("carol").expect("get").is_none());
+        assert!(catalog.grants_for("carol").expect("grants").is_empty());
+        assert!(!catalog.drop_user("carol").expect("drop again"));
     }
 
     #[test]

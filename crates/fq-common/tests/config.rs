@@ -288,23 +288,46 @@ fn test_server_section_absent_means_no_users() {
 
 #[test]
 fn test_server_section_parses_users() {
-    // A server section carries the SCRAM credential fields verbatim; the plaintext
-    // password never appears - only the base64 salt and salted hash.
+    // A server section carries the SCRAM VERIFIER verbatim; the plaintext password
+    // never appears - only the pg_authid string. The optional superuser flag
+    // defaults false when absent.
     let config_yaml = "
 datasources: {}
 server:
   users:
     - name: alice
-      salt: c2FsdA==
-      salted_password: aGFzaA==
+      verifier: SCRAM-SHA-256$4096:c2FsdA==$AAAA:BBBB
+      superuser: true
+    - name: bob
+      verifier: SCRAM-SHA-256$4096:c2FsdA==$AAAA:BBBB
 ";
     let path = write_temp("server_users", config_yaml);
     let config = load_config(path.to_str().unwrap()).expect("load config");
-    assert_eq!(config.server.users.len(), 1);
-    let user = &config.server.users[0];
-    assert_eq!(user.name, "alice");
-    assert_eq!(user.salt, "c2FsdA==");
-    assert_eq!(user.salted_password, "aGFzaA==");
+    assert_eq!(config.server.users.len(), 2);
+    let alice = &config.server.users[0];
+    assert_eq!(alice.name, "alice");
+    assert_eq!(alice.verifier, "SCRAM-SHA-256$4096:c2FsdA==$AAAA:BBBB");
+    assert!(alice.superuser);
+    assert!(
+        !config.server.users[1].superuser,
+        "superuser defaults false"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn test_server_scram_iterations_below_floor_raises() {
+    // A work factor below the RFC 7677 floor is refused at load, not clamped.
+    let config_yaml = "
+datasources: {}
+server:
+  scram_iterations: 1000
+";
+    let path = write_temp("server_low_iters", config_yaml);
+    assert!(
+        load_config(path.to_str().unwrap()).is_err(),
+        "scram_iterations below 4096 must raise"
+    );
     std::fs::remove_file(&path).ok();
 }
 
@@ -317,8 +340,7 @@ datasources: {}
 server:
   users:
     - name: alice
-      salt: c2FsdA==
-      salted_password: aGFzaA==
+      verifier: SCRAM-SHA-256$4096:c2FsdA==$AAAA:BBBB
       password: hunter2
 ";
     let path = write_temp("server_user_bad_key", config_yaml);

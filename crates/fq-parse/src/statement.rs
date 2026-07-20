@@ -98,6 +98,74 @@ pub enum Statement<'a> {
     DropDatasource { name: String },
     /// `SHOW DATASOURCES`: list every bootstrap and dynamic datasource.
     ShowDatasources,
+    /// `CREATE USER <name> WITH PASSWORD '<plaintext>' [SUPERUSER]`. The
+    /// plaintext is hashed to a verifier in the runtime and never logged.
+    CreateUser {
+        name: String,
+        password: String,
+        superuser: bool,
+    },
+    /// `ALTER USER <name> WITH PASSWORD '<plaintext>'`.
+    AlterUserPassword { name: String, password: String },
+    /// `ALTER USER <name> WITH [SUPERUSER | NOSUPERUSER]`.
+    AlterUserSuperuser { name: String, superuser: bool },
+    /// `DROP USER <name>`.
+    DropUser { name: String },
+    /// `GRANT SELECT ON <object> TO <grantee>`.
+    Grant {
+        object: GrantObject,
+        grantee: String,
+    },
+    /// `REVOKE SELECT ON <object> FROM <grantee>`.
+    Revoke {
+        object: GrantObject,
+        grantee: String,
+    },
+    /// `SHOW USERS`: list every user (superuser-gated).
+    ShowUsers,
+    /// `SHOW GRANTS [FOR <grantee>]`.
+    ShowGrants { grantee: Option<String> },
+}
+
+/// The object a GRANT/REVOKE names, at one of three containment levels. A grant
+/// at a higher level implies every object beneath it (the LEVEL is the wildcard;
+/// there is no wildcard syntax).
+#[derive(Debug, PartialEq, Eq)]
+pub enum GrantObject {
+    /// `DATASOURCE <d>`: authorizes every schema and table under `d`.
+    Datasource(String),
+    /// `SCHEMA <d>.<s>`: authorizes every table under `d.s`.
+    Schema { datasource: String, schema: String },
+    /// `TABLE <d>.<s>.<t>`: authorizes exactly that table.
+    Table {
+        datasource: String,
+        schema: String,
+        table: String,
+    },
+}
+
+impl GrantObject {
+    /// The `object_kind` string persisted for this level.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            GrantObject::Datasource(_) => "datasource",
+            GrantObject::Schema { .. } => "schema",
+            GrantObject::Table { .. } => "table",
+        }
+    }
+
+    /// The canonical dotted `object_path` persisted for this object.
+    pub fn path(&self) -> String {
+        match self {
+            GrantObject::Datasource(datasource) => datasource.clone(),
+            GrantObject::Schema { datasource, schema } => format!("{datasource}.{schema}"),
+            GrantObject::Table {
+                datasource,
+                schema,
+                table,
+            } => format!("{datasource}.{schema}.{table}"),
+        }
+    }
 }
 
 /// Classify one SQL statement. Materialized-view DDL is recognized by its
@@ -121,6 +189,11 @@ pub fn classify_statement(sql: &str) -> Result<Statement<'_>, ParseError> {
             crate::event_statement::classify_create_event(&mut tokens)
         }
         "CREATE" if second_word_is(sql, "DATASOURCE") => classify_create_datasource(&mut tokens),
+        "CREATE" if second_word_is(sql, "USER") => classify_create_user(&mut tokens),
+        "ALTER" if second_word_is(sql, "USER") => classify_alter_user(&mut tokens),
+        "DROP" if second_word_is(sql, "USER") => classify_drop_user(&mut tokens),
+        "GRANT" => classify_grant(&mut tokens),
+        "REVOKE" => classify_revoke(&mut tokens),
         // `CREATE OR REPLACE DATASOURCE` has `OR` as its second word, so it does
         // not match the arm above; route it here to raise (OR REPLACE would
         // silently repoint a live name).
@@ -153,6 +226,8 @@ pub fn classify_statement(sql: &str) -> Result<Statement<'_>, ParseError> {
         }
         "SHOW" if second_word_is(sql, "MATERIALIZED") => classify_show_materialized(&mut tokens),
         "SHOW" if second_word_is(sql, "DATASOURCES") => classify_show_datasources(&mut tokens),
+        "SHOW" if second_word_is(sql, "USERS") => classify_show_users(&mut tokens),
+        "SHOW" if second_word_is(sql, "GRANTS") => classify_show_grants(&mut tokens),
         // The engine has no SET/RESET beyond the settings surface, so every one
         // is ours (an unknown name then raises loudly at the runtime).
         "SET" => classify_set(sql, &mut tokens),
@@ -370,6 +445,273 @@ fn classify_show_datasources<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement
     tokens.expect_keyword("DATASOURCES")?;
     expect_end(tokens, "SHOW DATASOURCES")?;
     Ok(Statement::ShowDatasources)
+}
+
+/// Parse `CREATE USER <name> WITH PASSWORD '<pw>' [SUPERUSER]`, raising on
+/// IF NOT EXISTS (a silent no-op hides a name collision) and on any trailing
+/// token (only SUPERUSER may follow the password).
+fn classify_create_user<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("CREATE")?;
+    tokens.expect_keyword("USER")?;
+    if tokens.peek_word_is("IF") {
+        return Err(ParseError::Unsupported(
+            "CREATE USER IF NOT EXISTS: a create that silently does nothing hides a \
+             name collision; create without IF NOT EXISTS"
+                .to_string(),
+        ));
+    }
+    let name = acl_identifier(tokens, "user")?;
+    tokens.expect_keyword("WITH")?;
+    tokens.expect_keyword("PASSWORD")?;
+    let password = read_password(tokens)?;
+    let superuser = consume_keyword(tokens, "SUPERUSER");
+    expect_end(tokens, "CREATE USER")?;
+    Ok(Statement::CreateUser {
+        name,
+        password,
+        superuser,
+    })
+}
+
+/// Parse `ALTER USER <name> WITH PASSWORD '<pw>'` or
+/// `ALTER USER <name> WITH [SUPERUSER | NOSUPERUSER]`.
+fn classify_alter_user<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("ALTER")?;
+    tokens.expect_keyword("USER")?;
+    let name = acl_identifier(tokens, "user")?;
+    tokens.expect_keyword("WITH")?;
+    if consume_keyword(tokens, "PASSWORD") {
+        let password = read_password(tokens)?;
+        expect_end(tokens, "ALTER USER ... WITH PASSWORD")?;
+        return Ok(Statement::AlterUserPassword { name, password });
+    }
+    let superuser = read_superuser_flag(tokens)?;
+    expect_end(tokens, "ALTER USER ... WITH [NO]SUPERUSER")?;
+    Ok(Statement::AlterUserSuperuser { name, superuser })
+}
+
+/// Read the `SUPERUSER` / `NOSUPERUSER` flag of an ALTER USER, raising on any
+/// other word (there is no partial-accept: an unknown option must fail).
+fn read_superuser_flag(tokens: &mut Tokenizer<'_>) -> Result<bool, ParseError> {
+    if consume_keyword(tokens, "SUPERUSER") {
+        return Ok(true);
+    }
+    if consume_keyword(tokens, "NOSUPERUSER") {
+        return Ok(false);
+    }
+    Err(ParseError::Parse(
+        "expected PASSWORD, SUPERUSER, or NOSUPERUSER after ALTER USER ... WITH".to_string(),
+    ))
+}
+
+/// Parse `DROP USER <name>`, raising on IF EXISTS (a silent no-op hides a typo)
+/// and on any trailing token (CASCADE, a second name).
+fn classify_drop_user<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("DROP")?;
+    tokens.expect_keyword("USER")?;
+    if tokens.peek_word_is("IF") {
+        return Err(ParseError::Unsupported(
+            "DROP USER IF EXISTS: a drop that silently does nothing hides a typo'd \
+             user name; drop without IF EXISTS"
+                .to_string(),
+        ));
+    }
+    let name = acl_identifier(tokens, "user")?;
+    expect_end(tokens, "DROP USER")?;
+    Ok(Statement::DropUser { name })
+}
+
+/// Parse `GRANT SELECT ON <object> TO <grantee>`.
+fn classify_grant<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("GRANT")?;
+    require_select(tokens)?;
+    tokens.expect_keyword("ON")?;
+    let object = read_grant_object(tokens)?;
+    tokens.expect_keyword("TO")?;
+    let grantee = read_grantee(tokens)?;
+    expect_end(tokens, "GRANT")?;
+    Ok(Statement::Grant { object, grantee })
+}
+
+/// Parse `REVOKE SELECT ON <object> FROM <grantee>`.
+fn classify_revoke<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("REVOKE")?;
+    require_select(tokens)?;
+    tokens.expect_keyword("ON")?;
+    let object = read_grant_object(tokens)?;
+    tokens.expect_keyword("FROM")?;
+    let grantee = read_grantee(tokens)?;
+    expect_end(tokens, "REVOKE")?;
+    Ok(Statement::Revoke { object, grantee })
+}
+
+/// Require the single grantable privilege `SELECT`; any other privilege raises
+/// naming it (the engine is read-only, so SELECT is the only data privilege).
+fn require_select(tokens: &mut Tokenizer<'_>) -> Result<(), ParseError> {
+    let word = match tokens.next_token() {
+        Some(Token::Word(word)) => word,
+        other => {
+            return Err(ParseError::Parse(format!(
+                "expected the privilege SELECT, found '{}'",
+                describe_opt(other.as_ref())
+            )))
+        }
+    };
+    if word.eq_ignore_ascii_case("SELECT") {
+        return Ok(());
+    }
+    Err(ParseError::Unsupported(format!(
+        "privilege '{word}' is not grantable; v1 grants only SELECT (the engine is \
+         read-only over sources)"
+    )))
+}
+
+/// Parse the object of a GRANT/REVOKE at one of the three containment levels.
+/// A wrong arity for the level raises.
+fn read_grant_object(tokens: &mut Tokenizer<'_>) -> Result<GrantObject, ParseError> {
+    let level = match tokens.next_token() {
+        Some(Token::Word(word)) => word.to_ascii_uppercase(),
+        other => {
+            return Err(ParseError::Parse(format!(
+                "expected DATASOURCE, SCHEMA, or TABLE after ON, found '{}'",
+                describe_opt(other.as_ref())
+            )))
+        }
+    };
+    match level.as_str() {
+        "DATASOURCE" => Ok(GrantObject::Datasource(read_ident(tokens, "datasource")?)),
+        "SCHEMA" => read_schema_object(tokens),
+        "TABLE" => read_table_object(tokens),
+        other => Err(ParseError::Unsupported(format!(
+            "grant object level '{other}' is not supported; use DATASOURCE, SCHEMA, or TABLE"
+        ))),
+    }
+}
+
+/// Parse `SCHEMA <ds>.<schema>` (a two-part dotted path).
+fn read_schema_object(tokens: &mut Tokenizer<'_>) -> Result<GrantObject, ParseError> {
+    let datasource = read_ident(tokens, "datasource")?;
+    expect_char(tokens, '.', "SCHEMA <datasource>.<schema>")?;
+    let schema = read_ident(tokens, "schema")?;
+    Ok(GrantObject::Schema { datasource, schema })
+}
+
+/// Parse `TABLE <ds>.<schema>.<table>` (a three-part dotted path).
+fn read_table_object(tokens: &mut Tokenizer<'_>) -> Result<GrantObject, ParseError> {
+    let datasource = read_ident(tokens, "datasource")?;
+    expect_char(tokens, '.', "TABLE <datasource>.<schema>.<table>")?;
+    let schema = read_ident(tokens, "schema")?;
+    expect_char(tokens, '.', "TABLE <datasource>.<schema>.<table>")?;
+    let table = read_ident(tokens, "table")?;
+    Ok(GrantObject::Table {
+        datasource,
+        schema,
+        table,
+    })
+}
+
+/// Read a grantee: a user name, or the reserved pseudo-grantee PUBLIC
+/// (case-insensitive, normalized to `PUBLIC`). A bare word lowercases; a quoted
+/// identifier keeps its spelling.
+fn read_grantee(tokens: &mut Tokenizer<'_>) -> Result<String, ParseError> {
+    match tokens.next_token() {
+        Some(Token::Word(word)) if word.eq_ignore_ascii_case("PUBLIC") => Ok("PUBLIC".to_string()),
+        Some(Token::Word(word)) => Ok(word.to_lowercase()),
+        Some(Token::QuotedIdent(name)) => Ok(name),
+        other => Err(ParseError::Parse(format!(
+            "expected a grantee (a user name or PUBLIC), found '{}'",
+            describe_opt(other.as_ref())
+        ))),
+    }
+}
+
+/// Read one identifier of an object path: a bare word lowercases (Postgres
+/// rule), a quoted identifier keeps its spelling. Does not consume a following
+/// dot (the caller drives the path structure).
+fn read_ident(tokens: &mut Tokenizer<'_>, what: &str) -> Result<String, ParseError> {
+    let name = match tokens.next_token() {
+        Some(Token::Word(word)) => word.to_lowercase(),
+        Some(Token::QuotedIdent(name)) => name,
+        other => {
+            return Err(ParseError::Parse(format!(
+                "expected a {what} name, found '{}'",
+                describe_opt(other.as_ref())
+            )))
+        }
+    };
+    if name.is_empty() {
+        return Err(ParseError::Parse(format!("{what} name is empty")));
+    }
+    Ok(name)
+}
+
+/// Read a single unqualified ACL identifier (a user name): a bare word
+/// lowercases, a quoted identifier keeps its spelling; a qualified name raises.
+fn acl_identifier(tokens: &mut Tokenizer<'_>, what: &str) -> Result<String, ParseError> {
+    let name = read_ident(tokens, what)?;
+    if matches!(tokens.peek(), Some(Token::Other('.'))) {
+        return Err(ParseError::Unsupported(format!(
+            "{what} name '{name}...' is qualified; a {what} name is a single unqualified \
+             identifier"
+        )));
+    }
+    Ok(name)
+}
+
+/// Read a `WITH PASSWORD` value: a single-quoted string literal (the only
+/// accepted form); an empty password raises.
+fn read_password(tokens: &mut Tokenizer<'_>) -> Result<String, ParseError> {
+    match tokens.next_token() {
+        Some(Token::StringLiteral(text)) if !text.is_empty() => Ok(text),
+        Some(Token::StringLiteral(_)) => Err(ParseError::Parse(
+            "PASSWORD must be a non-empty single-quoted string".to_string(),
+        )),
+        other => Err(ParseError::Parse(format!(
+            "expected a single-quoted PASSWORD string, found '{}'",
+            describe_opt(other.as_ref())
+        ))),
+    }
+}
+
+/// Parse `SHOW USERS`. A trailing token raises rather than being silently
+/// accepted.
+fn classify_show_users<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("SHOW")?;
+    tokens.expect_keyword("USERS")?;
+    expect_end(tokens, "SHOW USERS")?;
+    Ok(Statement::ShowUsers)
+}
+
+/// Parse `SHOW GRANTS [FOR <grantee>]`.
+fn classify_show_grants<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("SHOW")?;
+    tokens.expect_keyword("GRANTS")?;
+    let grantee = if consume_keyword(tokens, "FOR") {
+        Some(read_grantee(tokens)?)
+    } else {
+        None
+    };
+    expect_end(tokens, "SHOW GRANTS [FOR <grantee>]")?;
+    Ok(Statement::ShowGrants { grantee })
+}
+
+/// Consume the next token if it is the bare word `keyword` (case-insensitive),
+/// returning whether it was consumed.
+fn consume_keyword(tokens: &mut Tokenizer<'_>, keyword: &str) -> bool {
+    if tokens.peek_word_is(keyword) {
+        tokens.next_token();
+        return true;
+    }
+    false
+}
+
+/// A short rendering of an optional token for error messages (end-of-statement
+/// when there is none).
+fn describe_opt(token: Option<&Token<'_>>) -> String {
+    match token {
+        Some(token) => token.describe(),
+        None => "end of statement".to_string(),
+    }
 }
 
 /// Parse `SET <name> = <value>` / `SET <name> TO <value>`. The name is a dotted
@@ -1209,5 +1551,196 @@ mod tests {
     fn show_datasources_with_trailing_token_raises() {
         let error = classify_statement("SHOW DATASOURCES extra").unwrap_err();
         assert!(matches!(error, ParseError::Unsupported(_)));
+    }
+
+    #[test]
+    fn create_user_extracts_name_password_and_superuser() {
+        assert_eq!(
+            classify("CREATE USER alice WITH PASSWORD 'hunter2' SUPERUSER"),
+            Statement::CreateUser {
+                name: "alice".to_string(),
+                password: "hunter2".to_string(),
+                superuser: true,
+            }
+        );
+        assert_eq!(
+            classify("CREATE USER Bob WITH PASSWORD 'pw'"),
+            Statement::CreateUser {
+                name: "bob".to_string(),
+                password: "pw".to_string(),
+                superuser: false,
+            }
+        );
+    }
+
+    #[test]
+    fn create_user_keeps_a_quoted_name_exact() {
+        assert!(matches!(
+            classify("CREATE USER \"Alice\" WITH PASSWORD 'pw'"),
+            Statement::CreateUser { ref name, .. } if name == "Alice"
+        ));
+    }
+
+    #[test]
+    fn create_user_empty_or_missing_password_raises() {
+        assert!(classify_statement("CREATE USER a WITH PASSWORD ''").is_err());
+        assert!(classify_statement("CREATE USER a WITH PASSWORD").is_err());
+        // A bare word (not single-quoted) is not an accepted password form.
+        assert!(classify_statement("CREATE USER a WITH PASSWORD hunter2").is_err());
+    }
+
+    #[test]
+    fn create_user_if_not_exists_raises() {
+        let error =
+            classify_statement("CREATE USER IF NOT EXISTS a WITH PASSWORD 'p'").unwrap_err();
+        assert!(matches!(error, ParseError::Unsupported(ref m) if m.contains("IF NOT EXISTS")));
+    }
+
+    #[test]
+    fn create_user_qualified_name_raises() {
+        let error = classify_statement("CREATE USER a.b WITH PASSWORD 'p'").unwrap_err();
+        assert!(matches!(error, ParseError::Unsupported(ref m) if m.contains("qualified")));
+    }
+
+    #[test]
+    fn alter_user_password_and_superuser_forms() {
+        assert_eq!(
+            classify("ALTER USER alice WITH PASSWORD 'new'"),
+            Statement::AlterUserPassword {
+                name: "alice".to_string(),
+                password: "new".to_string(),
+            }
+        );
+        assert_eq!(
+            classify("ALTER USER alice WITH SUPERUSER"),
+            Statement::AlterUserSuperuser {
+                name: "alice".to_string(),
+                superuser: true,
+            }
+        );
+        assert_eq!(
+            classify("ALTER USER alice WITH NOSUPERUSER"),
+            Statement::AlterUserSuperuser {
+                name: "alice".to_string(),
+                superuser: false,
+            }
+        );
+    }
+
+    #[test]
+    fn alter_user_unknown_option_raises() {
+        assert!(classify_statement("ALTER USER a WITH LOGIN").is_err());
+    }
+
+    #[test]
+    fn drop_user_extracts_name_and_rejects_if_exists() {
+        assert_eq!(
+            classify("DROP USER alice"),
+            Statement::DropUser {
+                name: "alice".to_string()
+            }
+        );
+        assert!(classify_statement("DROP USER IF EXISTS alice").is_err());
+        assert!(classify_statement("DROP USER alice CASCADE").is_err());
+    }
+
+    #[test]
+    fn grant_parses_the_three_object_levels() {
+        assert_eq!(
+            classify("GRANT SELECT ON DATASOURCE sales TO alice"),
+            Statement::Grant {
+                object: GrantObject::Datasource("sales".to_string()),
+                grantee: "alice".to_string(),
+            }
+        );
+        assert_eq!(
+            classify("GRANT SELECT ON SCHEMA sales.public TO alice"),
+            Statement::Grant {
+                object: GrantObject::Schema {
+                    datasource: "sales".to_string(),
+                    schema: "public".to_string(),
+                },
+                grantee: "alice".to_string(),
+            }
+        );
+        assert_eq!(
+            classify("GRANT SELECT ON TABLE sales.public.orders TO PUBLIC"),
+            Statement::Grant {
+                object: GrantObject::Table {
+                    datasource: "sales".to_string(),
+                    schema: "public".to_string(),
+                    table: "orders".to_string(),
+                },
+                grantee: "PUBLIC".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn revoke_uses_from_and_mirrors_grant() {
+        assert_eq!(
+            classify("REVOKE SELECT ON TABLE d.s.t FROM alice"),
+            Statement::Revoke {
+                object: GrantObject::Table {
+                    datasource: "d".to_string(),
+                    schema: "s".to_string(),
+                    table: "t".to_string(),
+                },
+                grantee: "alice".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn grant_wrong_arity_raises() {
+        // A two-part path at TABLE level is missing the table component.
+        assert!(classify_statement("GRANT SELECT ON TABLE d.s TO alice").is_err());
+        // A three-part path at SCHEMA level over-qualifies.
+        assert!(classify_statement("GRANT SELECT ON SCHEMA d.s.t TO alice").is_err());
+    }
+
+    #[test]
+    fn grant_non_select_privilege_raises() {
+        let error = classify_statement("GRANT INSERT ON DATASOURCE d TO alice").unwrap_err();
+        assert!(matches!(error, ParseError::Unsupported(ref m) if m.contains("INSERT")));
+    }
+
+    #[test]
+    fn grant_multiple_grantees_raise() {
+        // A grantee list is v1-unsupported: the trailing comma is a trailing token.
+        assert!(classify_statement("GRANT SELECT ON DATASOURCE d TO alice, bob").is_err());
+    }
+
+    #[test]
+    fn show_users_and_grants_classify() {
+        assert_eq!(classify("SHOW USERS"), Statement::ShowUsers);
+        assert_eq!(
+            classify("SHOW GRANTS"),
+            Statement::ShowGrants { grantee: None }
+        );
+        assert_eq!(
+            classify("SHOW GRANTS FOR alice"),
+            Statement::ShowGrants {
+                grantee: Some("alice".to_string())
+            }
+        );
+        assert_eq!(
+            classify("SHOW GRANTS FOR PUBLIC"),
+            Statement::ShowGrants {
+                grantee: Some("PUBLIC".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn grant_object_kind_and_path_are_canonical() {
+        let table = GrantObject::Table {
+            datasource: "d".to_string(),
+            schema: "s".to_string(),
+            table: "t".to_string(),
+        };
+        assert_eq!(table.kind(), "table");
+        assert_eq!(table.path(), "d.s.t");
+        assert_eq!(GrantObject::Datasource("d".to_string()).path(), "d");
     }
 }

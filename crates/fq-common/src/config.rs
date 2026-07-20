@@ -237,37 +237,96 @@ impl Default for CatalogConfig {
 ///
 /// An empty `users` list - the default, and the state when the `server:` section
 /// is absent - means trust authentication: every connection is accepted with no
-/// password, like a `trust` line in `pg_hba.conf`. A non-empty list turns on
-/// SCRAM-SHA-256: a connection must authenticate as one of these users. This
-/// section is inert for the engine library and the Python FFI; only the wire
-/// server reads it.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+/// password, like a `trust` line in `pg_hba.conf`, and ACL enforcement is off. A
+/// non-empty list turns on SCRAM-SHA-256 and bind-time enforcement: a connection
+/// must authenticate as one of these users, imported into the persisted `users`
+/// table as the bootstrap seed. This section is inert for the engine library and
+/// the Python FFI (embedded runs as an implicit superuser); only the wire server
+/// reads it. `scram_iterations` is the work factor NEW verifiers are derived
+/// with; existing verifiers carry their own count.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
     pub users: Vec<UserCredential>,
+    pub scram_iterations: u32,
 }
 
-/// One user's stored SCRAM-SHA-256 credential.
+impl Default for ServerConfig {
+    /// No users (trust mode) and the SCRAM iteration default; a fresh server is
+    /// a single-tenant trust deployment until users are configured.
+    fn default() -> Self {
+        Self {
+            users: Vec::new(),
+            scram_iterations: SCRAM_ITERATIONS,
+        }
+    }
+}
+
+/// One user's stored SCRAM-SHA-256 credential and superuser flag.
 ///
-/// The password itself is NEVER stored. `salted_password` is the base64 of
-/// `PBKDF2-HMAC-SHA256(password, salt, 4096)` - the same one-way salted hash the
-/// SCRAM handshake verifies a login against - and `salt` is the base64 of the
-/// random salt it was derived with. The iteration count is fixed at the SCRAM
-/// default (4096) for every user, because one handshake advertises one iteration
-/// count to the client. `fedq-server hash-password` produces these fields from a
-/// plaintext password so the plaintext never enters the config file.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// The password itself is NEVER stored, and neither is the `SaltedPassword`
+/// master secret. `verifier` is the PostgreSQL `pg_authid`-shaped string
+/// `SCRAM-SHA-256$<i>:<b64 salt>$<b64 StoredKey>:<b64 ServerKey>`: a stolen
+/// verifier does not yield client-auth capability (recovering `ClientKey` needs
+/// a `SHA-256` preimage of `StoredKey`). `superuser` bypasses bind-time grant
+/// checks and gates admin DDL. `fedq-server hash-password` derives the verifier
+/// from a plaintext so the plaintext never enters the config file.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserCredential {
     pub name: String,
-    pub salt: String,
-    pub salted_password: String,
+    pub verifier: String,
+    #[serde(default)]
+    pub superuser: bool,
 }
 
-/// The SCRAM-SHA-256 iteration count every `UserCredential` is hashed with. Fixed
-/// because a single handshake advertises one iteration count to the client, so
-/// all users on one server must share it.
+/// Redact the verifier under `Debug`: it is sensitive (enables the offline
+/// attack and server impersonation), so a derived `Debug` on `Config` never
+/// prints it verbatim into a log or panic message.
+impl std::fmt::Debug for UserCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserCredential")
+            .field("name", &self.name)
+            .field("verifier", &"<redacted>")
+            .field("superuser", &self.superuser)
+            .finish()
+    }
+}
+
+/// The default SCRAM-SHA-256 iteration count NEW verifiers are derived with, and
+/// the RFC 7677 floor. A single handshake advertises the verifier's OWN stored
+/// count to the client, so users may carry different counts; this is only the
+/// default a fresh derivation uses.
 pub const SCRAM_ITERATIONS: u32 = 4096;
+
+/// The authenticated identity a query runs as, for bind-time authorization. A
+/// superuser bypasses every grant check; a normal principal is authorized
+/// against its grants (and PUBLIC's) at the one resolver. Trust mode and the
+/// embedded process run as an implicit superuser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Principal {
+    pub name: String,
+    pub superuser: bool,
+}
+
+impl Principal {
+    /// An implicit-superuser principal (trust mode, embedded, or a bootstrap
+    /// admin): bind-time grant checks are bypassed.
+    pub fn superuser(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            superuser: true,
+        }
+    }
+
+    /// A principal whose data access is enforced against its grants.
+    pub fn user(name: impl Into<String>, superuser: bool) -> Self {
+        Self {
+            name: name.into(),
+            superuser,
+        }
+    }
+}
 
 /// The fully assembled engine configuration.
 ///
@@ -302,12 +361,16 @@ pub fn load_config(config_path: &str) -> Result<Config, ConfigError> {
 
     reject_unknown_sections(mapping)?;
 
+    let server: ServerConfig = parse_section(mapping, "server")?;
+    if server.scram_iterations < SCRAM_ITERATIONS {
+        return Err(ConfigError::ScramIterationsTooLow(server.scram_iterations));
+    }
     Ok(Config {
         datasources: parse_datasources(mapping)?,
         optimizer: parse_section(mapping, "optimizer")?,
         executor: parse_section(mapping, "executor")?,
         cost: parse_section(mapping, "cost")?,
-        server: parse_section(mapping, "server")?,
+        server,
         accelerator: parse_section(mapping, "accelerator")?,
         catalog: parse_section(mapping, "catalog")?,
         source_path: Some(path.display().to_string()),

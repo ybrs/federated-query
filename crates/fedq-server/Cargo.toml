@@ -37,12 +37,23 @@ arrow = "58"
 base64 = "0.22"
 # A random salt for `hash-password` (credential generation only).
 rand = "0.9"
+# Structured audit lines (login success/failure) to the server log.
+tracing = "0.1"
 fq-common = { path = "../fq-common" }
 fq-runtime = { path = "../fq-runtime" }
+# The vendored RFC-5802 SCRAM verification (from StoredKey/ServerKey) and verifier
+# derivation, since pgwire's stock ScramAuth can only verify from SaltedPassword.
+fq-scram = { path = "../fq-scram" }
+# The durable store the auth source reads verifiers from and the server seeds the
+# bootstrap users into at startup.
+fq-accel = { path = "../fq-accel" }
 
 [dev-dependencies]
 # The integration test drives the server with a real Postgres client.
 tokio-postgres = "0.7"
+# The credential-upgrade unit test derives an old-form SaltedPassword to feed the
+# upgrade path (already linked via the SCRAM backend).
+ring = "0.17"
 # The test seeds a tiny DuckDB fixture through the same connector the engine uses.
 fq-connectors = { path = "../fq-connectors" }
 # The test builds datasource config params as raw YAML values.

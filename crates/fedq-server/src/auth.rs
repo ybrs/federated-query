@@ -1,127 +1,115 @@
-//! Config-driven SCRAM-SHA-256 authentication.
+//! The verifier-backed authentication source and credential tooling.
 //!
-//! The `server:` config section lists users, each with a stored SCRAM credential
-//! (a salt and a salted password, both base64; see `fq_common::UserCredential`).
-//! `ConfigAuthSource` is the pgwire `AuthSource` the SCRAM handshake queries: for
-//! a named user it returns that user's salt and salted password so pgwire can
-//! verify the client's proof, and for an unknown user it refuses. The password
-//! itself is never held - only the PBKDF2 salted hash the client's proof is
-//! checked against.
-//!
-//! `hash_password` is the inverse used by the `hash-password` CLI: it turns a
-//! plaintext password into a `UserCredential` so the plaintext never enters the
-//! config file.
+//! A user's password is stored as a SCRAM-SHA-256 VERIFIER (the PostgreSQL
+//! `pg_authid` shape: salt, iteration count, StoredKey, ServerKey) - never a
+//! plaintext and never the SaltedPassword master secret. `StoreAuthSource` looks
+//! a verifier up by username from the persisted `users` table for the vendored
+//! SCRAM handshake; for an unknown user it synthesizes a DETERMINISTIC mock
+//! verifier so the handshake fails on the same code path with the same timing
+//! (no enumeration / timing oracle). `hash_password` / `upgrade_credential` are
+//! the `fedq-server` subcommands that derive a verifier so the plaintext never
+//! enters the config.
 
-use std::collections::HashMap;
+use std::sync::Arc;
 
-use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use pgwire::api::auth::sasl::scram::gen_salted_password;
-use pgwire::api::auth::{AuthSource, LoginInfo, Password};
-use pgwire::error::{PgWireError, PgWireResult};
-use rand::RngCore;
 
-use fq_common::{ServerConfig, UserCredential, SCRAM_ITERATIONS};
+use fq_accel::Accelerator;
+use fq_common::UserCredential;
+use fq_scram::Verifier;
 
-/// The random salt length, in bytes, for a generated SCRAM credential.
-const SALT_LEN: usize = 16;
-
-/// One decoded user credential: the raw salt and the raw PBKDF2 salted password
-/// the SCRAM handshake verifies a login against.
-#[derive(Debug, Clone)]
-struct StoredCredential {
-    salt: Vec<u8>,
-    salted_password: Vec<u8>,
+/// The verifier source the vendored SCRAM handshake queries: the persisted
+/// `users` table, with a mock verifier for unknown users. It holds the store, the
+/// iteration count NEW mock salts advertise, and a per-server random secret the
+/// mock verifier is derived from (never persisted to a client-visible place).
+pub struct StoreAuthSource {
+    store: Arc<Accelerator>,
+    iterations: u32,
+    mock_secret: Vec<u8>,
 }
 
-/// The pgwire `AuthSource` backed by the configured user list. It holds each
-/// user's decoded salt and salted password, keyed by user name.
-#[derive(Debug)]
-pub struct ConfigAuthSource {
-    users: HashMap<String, StoredCredential>,
-}
+impl StoreAuthSource {
+    /// Build the source over the shared store, with a fresh per-server mock
+    /// secret generated at startup.
+    pub fn new(store: Arc<Accelerator>, iterations: u32) -> Self {
+        Self {
+            store,
+            iterations,
+            mock_secret: fq_scram::random_bytes(32),
+        }
+    }
 
-impl ConfigAuthSource {
-    /// Decode every configured user's base64 salt and salted password once, at
-    /// server startup. A malformed base64 field or a duplicate user name fails
-    /// loudly here rather than at a client's first login attempt.
-    pub fn from_config(server: &ServerConfig) -> Result<Self, String> {
-        let mut users = HashMap::with_capacity(server.users.len());
-        for user in &server.users {
-            let credential = decode_credential(user)?;
-            if users.insert(user.name.clone(), credential).is_some() {
-                return Err(format!("duplicate server user '{}'", user.name));
+    /// The verifier to check `username`'s login against: the stored verifier, or a
+    /// deterministic mock for an unknown user (or an unreadable/malformed stored
+    /// verifier). The handshake runs its full proof check either way, failing at
+    /// the end exactly as a wrong password does, so "no such user" is
+    /// indistinguishable from "wrong password".
+    pub fn verifier_for(&self, username: &str) -> Verifier {
+        if let Ok(Some(user)) = self.store.get_user(username) {
+            if let Ok(verifier) = Verifier::parse(&user.verifier) {
+                return verifier;
             }
         }
-        Ok(Self { users })
-    }
-
-    /// Whether any user is configured. An empty source means trust auth.
-    pub fn is_empty(&self) -> bool {
-        self.users.is_empty()
+        fq_scram::mock_verifier(username, &self.mock_secret, self.iterations)
     }
 }
 
-/// Decode one config user's base64 salt and salted password into raw bytes,
-/// naming the user on a malformed field.
-fn decode_credential(user: &UserCredential) -> Result<StoredCredential, String> {
-    let salt = STANDARD
-        .decode(&user.salt)
-        .map_err(|error| format!("user '{}' has an invalid base64 salt: {error}", user.name))?;
-    let salted_password = STANDARD.decode(&user.salted_password).map_err(|error| {
-        format!(
-            "user '{}' has an invalid base64 salted_password: {error}",
-            user.name
-        )
-    })?;
-    Ok(StoredCredential {
-        salt,
-        salted_password,
+/// Derive a stored verifier for `user`/`password` at `iterations` with a fresh
+/// random salt. The plaintext is used only to derive the one-way verifier and is
+/// never returned or stored.
+pub fn hash_password(
+    user: &str,
+    password: &str,
+    superuser: bool,
+    iterations: u32,
+) -> Result<UserCredential, String> {
+    let verifier = fq_scram::derive_verifier_random_salt(password, iterations)
+        .map_err(|error| error.to_string())?;
+    Ok(UserCredential {
+        name: user.to_owned(),
+        verifier: verifier.to_authid_string(),
+        superuser,
     })
 }
 
-#[async_trait]
-impl AuthSource for ConfigAuthSource {
-    /// Return the named user's salt and salted password for the SCRAM handshake.
-    /// An unknown user, or a startup that named no user, is refused with an
-    /// invalid-password error so the client sees a clean authentication failure.
-    async fn get_password(&self, login: &LoginInfo) -> PgWireResult<Password> {
-        let user = login
-            .user()
-            .ok_or_else(|| PgWireError::InvalidPassword(String::new()))?;
-        let credential = self
-            .users
-            .get(user)
-            .ok_or_else(|| PgWireError::InvalidPassword(user.to_owned()))?;
-        Ok(Password::new(
-            Some(credential.salt.clone()),
-            credential.salted_password.clone(),
-        ))
-    }
-}
-
-/// Turn a plaintext password into a stored SCRAM credential for `user`: a fresh
-/// random salt and the base64 of `PBKDF2-HMAC-SHA256(password, salt, 4096)`. The
-/// plaintext is used only to derive the one-way hash and is never returned.
-pub fn hash_password(user: &str, password: &str) -> UserCredential {
-    let mut salt = [0u8; SALT_LEN];
-    rand::rng().fill_bytes(&mut salt);
-    let salted = gen_salted_password(password, &salt, SCRAM_ITERATIONS as usize);
-    UserCredential {
+/// Reshape a pre-verifier credential (a base64 salt + base64 SaltedPassword) into
+/// a verifier WITHOUT the plaintext: StoredKey/ServerKey are derivable from the
+/// SaltedPassword. For an operator upgrading an old `server.users` block.
+pub fn upgrade_credential(
+    user: &str,
+    salt_b64: &str,
+    salted_password_b64: &str,
+    superuser: bool,
+    iterations: u32,
+) -> Result<UserCredential, String> {
+    let salt = STANDARD
+        .decode(salt_b64)
+        .map_err(|error| format!("invalid base64 salt: {error}"))?;
+    let salted = STANDARD
+        .decode(salted_password_b64)
+        .map_err(|error| format!("invalid base64 salted_password: {error}"))?;
+    let verifier = fq_scram::upgrade_from_salted_password(&salted, salt, iterations)
+        .map_err(|error| error.to_string())?;
+    Ok(UserCredential {
         name: user.to_owned(),
-        salt: STANDARD.encode(salt),
-        salted_password: STANDARD.encode(salted),
-    }
+        verifier: verifier.to_authid_string(),
+        superuser,
+    })
 }
 
 /// Render a `UserCredential` as the YAML block that goes under `server.users`,
-/// ready to paste into a config file.
+/// ready to paste into a config file. The verifier is a one-way credential; the
+/// plaintext is never present.
 pub fn credential_yaml(credential: &UserCredential) -> String {
-    format!(
-        "    - name: {}\n      salt: {}\n      salted_password: {}\n",
-        credential.name, credential.salt, credential.salted_password
-    )
+    let mut block = format!(
+        "    - name: {}\n      verifier: {}\n",
+        credential.name, credential.verifier
+    );
+    if credential.superuser {
+        block.push_str("      superuser: true\n");
+    }
+    block
 }
 
 #[cfg(test)]
@@ -129,40 +117,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hashed_password_round_trips_through_the_auth_source() {
-        // A credential generated by `hash_password` decodes back into a stored
-        // credential whose salted password matches re-deriving it from the same
-        // plaintext and salt - the invariant the SCRAM handshake relies on.
-        let credential = hash_password("alice", "hunter2");
-        let server = ServerConfig {
-            users: vec![credential.clone()],
-        };
-        let source = ConfigAuthSource::from_config(&server).expect("build source");
-        assert!(!source.is_empty());
-
-        let salt = STANDARD.decode(&credential.salt).expect("decode salt");
-        let expected = gen_salted_password("hunter2", &salt, SCRAM_ITERATIONS as usize);
-        let stored = source.users.get("alice").expect("user present");
-        assert_eq!(stored.salted_password, expected);
+    fn a_hashed_password_yields_a_parseable_verifier() {
+        let credential = hash_password("alice", "hunter2", true, 4096).expect("hash");
+        assert_eq!(credential.name, "alice");
+        assert!(credential.superuser);
+        // The stored field is a verifier, never the plaintext or SaltedPassword.
+        assert!(credential.verifier.starts_with("SCRAM-SHA-256$"));
+        assert!(!credential.verifier.contains("hunter2"));
+        assert!(Verifier::parse(&credential.verifier).is_ok());
     }
 
     #[test]
-    fn a_duplicate_user_name_is_refused() {
-        let server = ServerConfig {
-            users: vec![hash_password("alice", "a"), hash_password("alice", "b")],
-        };
-        assert!(ConfigAuthSource::from_config(&server).is_err());
+    fn the_yaml_block_carries_the_verifier_not_a_plaintext() {
+        let credential = hash_password("bob", "secret-pw", false, 4096).expect("hash");
+        let yaml = credential_yaml(&credential);
+        assert!(yaml.contains("verifier: SCRAM-SHA-256$"));
+        assert!(!yaml.contains("secret-pw"));
+        assert!(!yaml.contains("superuser"), "non-superuser omits the flag");
     }
 
     #[test]
-    fn invalid_base64_is_refused() {
-        let server = ServerConfig {
-            users: vec![UserCredential {
-                name: "bob".to_owned(),
-                salt: "not base64 !!!".to_owned(),
-                salted_password: "aGFzaA==".to_owned(),
-            }],
-        };
-        assert!(ConfigAuthSource::from_config(&server).is_err());
+    fn upgrade_reshapes_a_salted_password_into_a_verifier() {
+        // Derive an old-form SaltedPassword, then upgrade it and confirm the
+        // resulting verifier matches a fresh derive of the same password.
+        let salt = b"0123456789abcdef";
+        let fresh = fq_scram::derive_verifier(salt_password_password(), salt, 4096).expect("fresh");
+        let salted = old_salted_password(salt_password_password(), salt, 4096);
+        let upgraded = upgrade_credential(
+            "carol",
+            &STANDARD.encode(salt),
+            &STANDARD.encode(salted),
+            false,
+            4096,
+        )
+        .expect("upgrade");
+        assert_eq!(
+            upgraded.verifier,
+            fresh.to_authid_string(),
+            "upgrade reproduces the verifier a fresh derive makes"
+        );
+    }
+
+    /// The plaintext the upgrade round-trip test derives from.
+    fn salt_password_password() -> &'static str {
+        "hunter2"
+    }
+
+    /// The old-form SaltedPassword: PBKDF2 of the password (what the pre-verifier
+    /// store held).
+    fn old_salted_password(password: &str, salt: &[u8], iterations: u32) -> Vec<u8> {
+        use ring::pbkdf2;
+        use std::num::NonZeroU32;
+        let mut out = [0u8; 32];
+        pbkdf2::derive(
+            pbkdf2::PBKDF2_HMAC_SHA256,
+            NonZeroU32::new(iterations).unwrap(),
+            salt,
+            password.as_bytes(),
+            &mut out,
+        );
+        out.to_vec()
     }
 }

@@ -27,17 +27,31 @@ pub type ColumnDescription = (String, DataType);
 
 /// One unit of work handed to the worker thread. `Execute` runs the SQL and
 /// returns its rows; `Describe` resolves the SQL's result schema by planning
-/// only. Each carries the reply channel its answer (or error message) is sent
-/// back on.
+/// only. Each carries the authenticated principal (the connection's user, or
+/// None in trust mode) so the worker sets it on the runtime before running, and
+/// the reply channel its answer (or error message) is sent back on.
 enum Job {
     Execute {
         sql: String,
+        principal: Option<String>,
         reply: oneshot::Sender<Result<QueryResult, String>>,
     },
     Describe {
         sql: String,
+        principal: Option<String>,
         reply: oneshot::Sender<Result<Vec<ColumnDescription>, String>>,
     },
+}
+
+impl Job {
+    /// The authenticated principal this job runs as, if any.
+    fn principal(&self) -> Option<&str> {
+        match self {
+            Job::Execute { principal, .. } | Job::Describe { principal, .. } => {
+                principal.as_deref()
+            }
+        }
+    }
 }
 
 /// A handle to one connection's execution thread. Dropping it closes the job
@@ -59,21 +73,39 @@ impl Session {
         Session { jobs }
     }
 
-    /// Run one SQL statement on this connection's runtime and await the Arrow
-    /// result. Errors come back as their engine message string; a dead worker
-    /// (channel closed) is itself reported as an error, never silently ignored.
-    pub async fn execute(&self, sql: String) -> Result<QueryResult, String> {
+    /// Run one SQL statement on this connection's runtime as `principal` and await
+    /// the Arrow result. Errors come back as their engine message string; a dead
+    /// worker (channel closed) is itself reported as an error, never silently
+    /// ignored.
+    pub async fn execute(
+        &self,
+        sql: String,
+        principal: Option<String>,
+    ) -> Result<QueryResult, String> {
         let (reply, answer) = oneshot::channel();
-        let job = Job::Execute { sql, reply };
+        let job = Job::Execute {
+            sql,
+            principal,
+            reply,
+        };
         self.dispatch(job, answer).await
     }
 
     /// Resolve one SQL statement's result columns on this connection's runtime
-    /// WITHOUT executing it (planning only), for the extended protocol's Describe
-    /// step. Errors and a dead worker surface exactly as `execute`'s do.
-    pub async fn describe(&self, sql: String) -> Result<Vec<ColumnDescription>, String> {
+    /// WITHOUT executing it (planning only) as `principal`, for the extended
+    /// protocol's Describe step. Errors and a dead worker surface exactly as
+    /// `execute`'s do.
+    pub async fn describe(
+        &self,
+        sql: String,
+        principal: Option<String>,
+    ) -> Result<Vec<ColumnDescription>, String> {
         let (reply, answer) = oneshot::channel();
-        let job = Job::Describe { sql, reply };
+        let job = Job::Describe {
+            sql,
+            principal,
+            reply,
+        };
         self.dispatch(job, answer).await
     }
 
@@ -101,9 +133,36 @@ impl Session {
 /// connection reports the real cause instead of a silent drop.
 fn run_worker(config: &Config, mut receiver: mpsc::UnboundedReceiver<Job>) {
     let runtime = Runtime::from_config(config).map_err(|error| error.to_string());
+    // The principal is constant for a connection, so it is applied to the runtime
+    // once, when the worker first sees it. A failure to apply leaves enforcement
+    // ON (fail-closed): the per-query bind re-reads the store and errors loudly.
+    let mut applied_principal: Option<String> = None;
     while let Some(job) = receiver.blocking_recv() {
+        apply_principal(&runtime, &mut applied_principal, job.principal());
         serve_job(&runtime, job);
     }
+}
+
+/// Set the runtime's principal the first time the worker sees it (or if it
+/// changes). A store failure is logged, not swallowed silently: enforcement stays
+/// on, so the query's own bind fails closed.
+fn apply_principal(
+    runtime: &Result<Runtime, String>,
+    applied: &mut Option<String>,
+    principal: Option<&str>,
+) {
+    let Some(name) = principal else {
+        return;
+    };
+    if applied.as_deref() == Some(name) {
+        return;
+    }
+    if let Ok(runtime) = runtime {
+        if let Err(error) = runtime.set_principal(name) {
+            eprintln!("failed to apply principal '{name}': {error}");
+        }
+    }
+    *applied = Some(name.to_owned());
 }
 
 /// Answer one job on the worker thread. Both job kinds report a runtime that
@@ -111,7 +170,7 @@ fn run_worker(config: &Config, mut receiver: mpsc::UnboundedReceiver<Job>) {
 /// reply channel (client already disconnected) is an expected race, not an error.
 fn serve_job(runtime: &Result<Runtime, String>, job: Job) {
     match job {
-        Job::Execute { sql, reply } => {
+        Job::Execute { sql, reply, .. } => {
             let result = match runtime {
                 Ok(runtime) => runtime
                     .execute(&sql)
@@ -121,7 +180,7 @@ fn serve_job(runtime: &Result<Runtime, String>, job: Job) {
             };
             let _ = reply.send(result);
         }
-        Job::Describe { sql, reply } => {
+        Job::Describe { sql, reply, .. } => {
             let result = match runtime {
                 Ok(runtime) => runtime.describe(&sql).map_err(|error| error.to_string()),
                 Err(build_error) => Err(build_error.clone()),

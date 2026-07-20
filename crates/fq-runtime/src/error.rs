@@ -108,4 +108,17 @@ pub enum RuntimeError {
     /// CREATE EVENT VIEW, or event DDL against a config with no file path.
     #[error("event view error: {0}")]
     EventView(String),
+
+    /// A non-superuser tried to run an admin statement, or a `SHOW GRANTS FOR`
+    /// another principal. An explicit message is correct here: a capability check
+    /// names no object whose existence could leak (the statement kind is not a
+    /// secret).
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
+
+    /// A user/grant DDL statement the runtime rejects: a name collision on CREATE
+    /// USER, a missing user on ALTER/DROP/GRANT, a no-op REVOKE, a reserved name,
+    /// or a malformed stored verifier. Every invalid ACL statement raises.
+    #[error("acl error: {0}")]
+    Acl(String),
 }

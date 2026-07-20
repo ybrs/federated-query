@@ -22,7 +22,7 @@ pub mod statement;
 mod window;
 
 pub use error::ParseError;
-pub use statement::{classify_statement, Statement};
+pub use statement::{classify_statement, GrantObject, Statement};
 
 use fq_catalog::Catalog;
 use polyglot_sql::DialectType;

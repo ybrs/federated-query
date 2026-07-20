@@ -80,7 +80,9 @@ fn shop_config(path: &str, server: ServerConfig) -> Config {
         server,
         accelerator: fq_common::AcceleratorConfig::default(),
         catalog: fq_common::CatalogConfig::default(),
-        source_path: None,
+        // A source path is required for the ACL/verifier store (it lives next to
+        // the config); derive a unique sibling of the fixture's DuckDB file.
+        source_path: Some(format!("{path}.fedq.yaml")),
     }
 }
 
@@ -312,14 +314,21 @@ async fn extended_refuses_unmapped_parameter_type_loudly() {
 async fn start_scram_server(users: Vec<UserCredential>) -> u16 {
     let path = temp_duck();
     seed_duck(&path, SEED_SQL);
-    start_server(shop_config(&path, ServerConfig { users })).await
+    start_server(shop_config(
+        &path,
+        ServerConfig {
+            users,
+            ..ServerConfig::default()
+        },
+    ))
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scram_auth_accepts_the_correct_password() {
     // A user configured with a SCRAM salted hash authenticates with the matching
     // plaintext password and can then query.
-    let user = fedq_server::hash_password("alice", "hunter2");
+    let user = fedq_server::hash_password("alice", "hunter2", true, 4096).expect("hash");
     let port = start_scram_server(vec![user]).await;
 
     let client = connect(port, "user=alice password=hunter2")
@@ -336,7 +345,7 @@ async fn scram_auth_accepts_the_correct_password() {
 async fn scram_auth_refuses_a_wrong_password() {
     // The same user with a wrong password is refused with a Postgres
     // invalid-password error, never allowed to connect.
-    let user = fedq_server::hash_password("alice", "hunter2");
+    let user = fedq_server::hash_password("alice", "hunter2", true, 4096).expect("hash");
     let port = start_scram_server(vec![user]).await;
 
     let error = connect(port, "user=alice password=wrong")
@@ -352,7 +361,7 @@ async fn scram_auth_refuses_a_wrong_password() {
 async fn scram_auth_refuses_an_unknown_user() {
     // A user that is not configured is refused, even with a password that would be
     // correct for a configured user.
-    let user = fedq_server::hash_password("alice", "hunter2");
+    let user = fedq_server::hash_password("alice", "hunter2", true, 4096).expect("hash");
     let port = start_scram_server(vec![user]).await;
 
     let error = connect(port, "user=bob password=hunter2")

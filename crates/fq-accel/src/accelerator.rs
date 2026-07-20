@@ -469,6 +469,88 @@ impl Accelerator {
         self.catalog.delete_datasource(name)
     }
 
+    /// Insert a user (INSERT OR IGNORE); false = the name already exists.
+    pub fn create_user(
+        &self,
+        name: &str,
+        verifier: &str,
+        superuser: bool,
+        created_by: &str,
+    ) -> Result<bool, AccelError> {
+        self.catalog
+            .create_user(name, verifier, superuser, created_by)
+    }
+
+    /// Overwrite a user's verifier; false = no such user.
+    pub fn set_user_password(&self, name: &str, verifier: &str) -> Result<bool, AccelError> {
+        self.catalog.set_user_password(name, verifier)
+    }
+
+    /// Set a user's superuser flag; false = no such user.
+    pub fn set_user_superuser(&self, name: &str, superuser: bool) -> Result<bool, AccelError> {
+        self.catalog.set_user_superuser(name, superuser)
+    }
+
+    /// Drop a user and every grant it holds; false = no such user.
+    pub fn drop_user(&self, name: &str) -> Result<bool, AccelError> {
+        self.catalog.drop_user(name)
+    }
+
+    /// The user named `name`, or None.
+    pub fn get_user(&self, name: &str) -> Result<Option<crate::catalog::User>, AccelError> {
+        self.catalog.get_user(name)
+    }
+
+    /// Every user, ordered by name.
+    pub fn list_users(&self) -> Result<Vec<crate::catalog::User>, AccelError> {
+        self.catalog.list_users()
+    }
+
+    /// The number of superusers (the refuse-start-without-superuser check).
+    pub fn count_superusers(&self) -> Result<i64, AccelError> {
+        self.catalog.count_superusers()
+    }
+
+    /// Grant a privilege on an object to a grantee (idempotent).
+    pub fn grant(
+        &self,
+        grantee: &str,
+        privilege: &str,
+        object_kind: &str,
+        object_path: &str,
+        granted_by: &str,
+    ) -> Result<(), AccelError> {
+        self.catalog
+            .grant(grantee, privilege, object_kind, object_path, granted_by)
+    }
+
+    /// Revoke a grant; false = no such grant (the caller raises).
+    pub fn revoke(
+        &self,
+        grantee: &str,
+        privilege: &str,
+        object_kind: &str,
+        object_path: &str,
+    ) -> Result<bool, AccelError> {
+        self.catalog
+            .revoke(grantee, privilege, object_kind, object_path)
+    }
+
+    /// Every grant, ordered for a stable SHOW GRANTS.
+    pub fn list_grants(&self) -> Result<Vec<crate::catalog::Grant>, AccelError> {
+        self.catalog.list_grants()
+    }
+
+    /// Every grant held by one grantee (a user name, or 'PUBLIC').
+    pub fn grants_for(&self, grantee: &str) -> Result<Vec<crate::catalog::Grant>, AccelError> {
+        self.catalog.grants_for(grantee)
+    }
+
+    /// The current ACL generation counter (one O(1) read).
+    pub fn acl_generation(&self) -> Result<i64, AccelError> {
+        self.catalog.acl_generation()
+    }
+
     /// Finish every drop a crash interrupted: a tombstoned row's files are
     /// removed and the row purged.
     fn sweep_tombstones(&self) -> Result<(), AccelError> {

@@ -64,6 +64,12 @@ pub enum ConfigError {
     #[error("datasource '{0}' change_keys: {1}")]
     BadChangeKeys(String, String),
 
+    /// The `server.scram_iterations` value is below the RFC 7677 floor of 4096.
+    /// A weaker work factor is refused at load rather than silently clamped, so
+    /// the operator sees the misconfiguration.
+    #[error("server.scram_iterations must be at least 4096 (RFC 7677 floor), got {0}")]
+    ScramIterationsTooLow(u32),
+
     /// YAML parse failure (also covers `deny_unknown_fields` rejections in the
     /// optimizer/executor/cost sections - the analogue of `extra="forbid"`).
     #[error(transparent)]

@@ -510,6 +510,17 @@ static SETTINGS: &[SettingDef] = &[
         read: |c| SettingValue::Text(server_users_summary(&c.server.users)),
         apply: None,
     },
+    SettingDef {
+        name: "server.scram_iterations",
+        description: "Wire-server auth: the PBKDF2 work factor NEW SCRAM verifiers are \
+                      derived with (CREATE/ALTER USER, hash-password). Existing verifiers \
+                      carry their own count. Read at startup; the RFC 7677 floor is 4096.",
+        mutability: Mutability::Static,
+        env_var: None,
+        default: || SettingValue::U64(u64::from(fq_common::SCRAM_ITERATIONS)),
+        read: |c| SettingValue::U64(u64::from(c.server.scram_iterations)),
+        apply: None,
+    },
     // --- environment kill switches / trace flags: process-global, static ----
     SettingDef {
         name: "env.dim_shipping",

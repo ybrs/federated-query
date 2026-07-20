@@ -1852,15 +1852,19 @@ dependencies = [
  "arrow",
  "async-trait",
  "base64",
+ "fq-accel",
  "fq-common",
  "fq-connectors",
  "fq-runtime",
+ "fq-scram",
  "futures",
  "pgwire",
  "rand 0.9.5",
+ "ring",
  "serde_yaml",
  "tokio",
  "tokio-postgres",
+ "tracing",
 ]
 
 [[package]]
@@ -2136,9 +2140,22 @@ dependencies = [
  "fq-parse",
  "fq-physical",
  "fq-plan",
+ "fq-scram",
  "parquet",
  "serde_yaml",
  "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "fq-scram"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "rand 0.9.5",
+ "ring",
+ "stringprep",
+ "subtle",
 ]
 
 [[package]]

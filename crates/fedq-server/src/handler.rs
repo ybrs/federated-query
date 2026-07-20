@@ -15,9 +15,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::Sink;
 use pgwire::api::auth::noop::NoopStartupHandler;
-use pgwire::api::auth::sasl::scram::ScramAuth;
-use pgwire::api::auth::sasl::SASLAuthStartupHandler;
-use pgwire::api::auth::{AuthSource, DefaultServerParameterProvider, StartupHandler};
+use pgwire::api::auth::{LoginInfo, StartupHandler};
 use pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
@@ -28,10 +26,20 @@ use pgwire::api::{ClientInfo, ClientPortalStore, ConnectionManager, PgWireServer
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 
-use crate::auth::ConfigAuthSource;
+use crate::auth::StoreAuthSource;
 use crate::encode;
 use crate::params;
+use crate::scram::ScramStartupHandler;
 use crate::session::Session;
+
+/// The authenticated principal of a connection, read from the startup metadata
+/// (the SCRAM handshake verified the client knows this user's password). None in
+/// trust mode, where the runtime runs as an implicit superuser regardless.
+fn principal_of<C: ClientInfo>(client: &C) -> Option<String> {
+    LoginInfo::from_client_info(client)
+        .user()
+        .map(str::to_owned)
+}
 
 /// One connection's query handler. Holds the `Session` that owns the connection's
 /// runtime thread and the parser that stores each extended-protocol statement as
@@ -57,7 +65,7 @@ impl SimpleQueryHandler for FedqBackend {
     /// response, otherwise the SQL runs on the session and its Arrow result is
     /// encoded to Postgres rows. An engine error becomes an `ErrorResponse`
     /// carrying the engine's own message.
-    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
@@ -69,7 +77,7 @@ impl SimpleQueryHandler for FedqBackend {
         }
         let result = self
             .session
-            .execute(query.to_owned())
+            .execute(query.to_owned(), principal_of(client))
             .await
             .map_err(engine_error)?;
         // The simple protocol always returns rows in text format.
@@ -96,7 +104,7 @@ impl ExtendedQueryHandler for FedqBackend {
     /// message's row limit to the returned response.
     async fn do_query<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         portal: &Portal<Self::Statement>,
         _max_rows: usize,
     ) -> PgWireResult<Response>
@@ -107,7 +115,11 @@ impl ExtendedQueryHandler for FedqBackend {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let sql = params::substitute(portal)?;
-        let result = self.session.execute(sql).await.map_err(engine_error)?;
+        let result = self
+            .session
+            .execute(sql, principal_of(client))
+            .await
+            .map_err(engine_error)?;
         encode::to_response(
             &result.schema,
             &result.batches,
@@ -121,7 +133,7 @@ impl ExtendedQueryHandler for FedqBackend {
     /// to the client. No rows are read.
     async fn do_describe_statement<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         target: &StoredStatement<Self::Statement>,
     ) -> PgWireResult<DescribeStatementResponse>
     where
@@ -131,7 +143,11 @@ impl ExtendedQueryHandler for FedqBackend {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let sql = params::substitute_nulls(&target.statement, &target.parameter_types)?;
-        let columns = self.session.describe(sql).await.map_err(engine_error)?;
+        let columns = self
+            .session
+            .describe(sql, principal_of(client))
+            .await
+            .map_err(engine_error)?;
         let fields = encode::describe_fields(&columns)?;
         Ok(DescribeStatementResponse::new(
             declared_param_types(&target.parameter_types),
@@ -143,7 +159,7 @@ impl ExtendedQueryHandler for FedqBackend {
     /// with the bound parameter values spliced in. No rows are read.
     async fn do_describe_portal<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         portal: &Portal<Self::Statement>,
     ) -> PgWireResult<DescribePortalResponse>
     where
@@ -153,7 +169,11 @@ impl ExtendedQueryHandler for FedqBackend {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let sql = params::substitute(portal)?;
-        let columns = self.session.describe(sql).await.map_err(engine_error)?;
+        let columns = self
+            .session
+            .describe(sql, principal_of(client))
+            .await
+            .map_err(engine_error)?;
         let fields = encode::describe_fields(&columns)?;
         Ok(DescribePortalResponse::new(fields))
     }
@@ -187,13 +207,14 @@ impl NoopStartupHandler for TrustStartup {
 }
 
 /// One connection's startup handler, chosen from the config: trust when no users
-/// are configured, SCRAM-SHA-256 otherwise. Both register the connection for
-/// cancellation; only the SCRAM arm verifies a password. This enum exists because
-/// `StartupHandler` is not object-safe (its method is generic over the client), so
-/// the two concrete handlers cannot share an `Arc<dyn StartupHandler>`.
+/// are configured, the vendored SCRAM-SHA-256 handler otherwise. Both register the
+/// connection for cancellation; only the SCRAM arm verifies a password. This enum
+/// exists because `StartupHandler` is not object-safe (its method is generic over
+/// the client), so the two concrete handlers cannot share an `Arc<dyn
+/// StartupHandler>`.
 pub enum FedqStartup {
     Trust(TrustStartup),
-    Scram(Box<SASLAuthStartupHandler<DefaultServerParameterProvider>>),
+    Scram(Box<ScramStartupHandler>),
 }
 
 #[async_trait]
@@ -234,7 +255,7 @@ impl FedqHandlers {
     pub fn new(
         session: Session,
         manager: Arc<ConnectionManager>,
-        auth: Arc<ConfigAuthSource>,
+        auth: Option<Arc<StoreAuthSource>>,
     ) -> Self {
         let startup = build_startup(manager.clone(), auth);
         Self {
@@ -245,18 +266,18 @@ impl FedqHandlers {
     }
 }
 
-/// Select and build this connection's startup handler: trust when no users are
-/// configured, SCRAM-SHA-256 over the shared auth source otherwise. The SCRAM
-/// handler is built per connection because it holds the per-connection SASL state
-/// machine; the auth source and manager it references are shared.
-fn build_startup(manager: Arc<ConnectionManager>, auth: Arc<ConfigAuthSource>) -> FedqStartup {
-    if auth.is_empty() {
-        return FedqStartup::Trust(TrustStartup { manager });
+/// Select and build this connection's startup handler: trust when no auth source
+/// is configured, the vendored SCRAM-SHA-256 handler otherwise. The SCRAM handler
+/// is built per connection because it holds the per-connection SASL state machine;
+/// the auth source and manager it references are shared.
+fn build_startup(
+    manager: Arc<ConnectionManager>,
+    auth: Option<Arc<StoreAuthSource>>,
+) -> FedqStartup {
+    match auth {
+        None => FedqStartup::Trust(TrustStartup { manager }),
+        Some(auth) => FedqStartup::Scram(Box::new(ScramStartupHandler::new(auth, manager))),
     }
-    let scram = SASLAuthStartupHandler::new(Arc::new(DefaultServerParameterProvider::default()))
-        .with_scram(ScramAuth::new(auth as Arc<dyn AuthSource>))
-        .with_connection_manager(manager);
-    FedqStartup::Scram(Box::new(scram))
 }
 
 impl PgWireServerHandlers for FedqHandlers {

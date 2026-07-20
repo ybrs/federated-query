@@ -6,14 +6,18 @@
 //!                     and tests use).
 //!   --listen <addr>   host:port to bind (default 127.0.0.1:5432).
 //!
-//! Subcommand:
-//!   hash-password <user> <password>   Print the `server.users` YAML block for a
-//!                     user, storing a SCRAM salted hash instead of the plaintext.
+//! Subcommands:
+//!   hash-password [--superuser] <user> <password>
+//!                     Print the `server.users` YAML block for a user, storing a
+//!                     SCRAM VERIFIER (never the plaintext or SaltedPassword).
+//!   upgrade-credential [--superuser] <user> <salt> <salted_password>
+//!                     Reshape a pre-verifier credential (base64 salt + base64
+//!                     SaltedPassword) into a verifier block, without the plaintext.
 
 use std::process::exit;
 
-use fedq_server::{credential_yaml, hash_password, serve};
-use fq_common::load_config;
+use fedq_server::{credential_yaml, hash_password, serve, upgrade_credential};
+use fq_common::{load_config, SCRAM_ITERATIONS};
 use tokio::net::TcpListener;
 
 /// Parsed command-line arguments.
@@ -25,23 +29,65 @@ struct Args {
 /// The usage text, shown on `--help` and on any argument error.
 fn usage() -> String {
     "usage: fedq-server --config <path> [--listen <host:port>]\n       \
-     fedq-server hash-password <user> <password>"
+     fedq-server hash-password [--superuser] <user> <password>\n       \
+     fedq-server upgrade-credential [--superuser] <user> <salt> <salted_password>"
         .to_owned()
 }
 
+/// Consume a leading `--superuser` flag from the argument list, returning whether
+/// it was present.
+fn take_superuser_flag(args: &mut std::iter::Peekable<impl Iterator<Item = String>>) -> bool {
+    if args.peek().is_some_and(|arg| arg == "--superuser") {
+        args.next();
+        return true;
+    }
+    false
+}
+
 /// Print the `server.users` YAML block for `user`/`password` and exit. The
-/// plaintext password is used only to derive the SCRAM salted hash; only the salt
-/// and salted hash are printed, so the config file never holds the plaintext.
+/// plaintext is used only to derive the SCRAM verifier; only the verifier is
+/// printed, so the config file never holds the plaintext or the SaltedPassword.
 fn run_hash_password(mut args: impl Iterator<Item = String>) -> ! {
-    let user = args.next();
-    let password = args.next();
-    let (Some(user), Some(password)) = (user, password) else {
+    let mut args = args.by_ref().peekable();
+    let superuser = take_superuser_flag(&mut args);
+    let (Some(user), Some(password)) = (args.next(), args.next()) else {
         eprintln!("hash-password requires <user> <password>\n{}", usage());
         exit(2);
     };
-    let credential = hash_password(&user, &password);
-    print!("{}", credential_yaml(&credential));
-    exit(0);
+    match hash_password(&user, &password, superuser, SCRAM_ITERATIONS) {
+        Ok(credential) => {
+            print!("{}", credential_yaml(&credential));
+            exit(0);
+        }
+        Err(error) => {
+            eprintln!("hash-password failed: {error}");
+            exit(2);
+        }
+    }
+}
+
+/// Reshape a pre-verifier credential (base64 salt + base64 SaltedPassword) into a
+/// verifier YAML block and exit. No plaintext is involved.
+fn run_upgrade_credential(mut args: impl Iterator<Item = String>) -> ! {
+    let mut args = args.by_ref().peekable();
+    let superuser = take_superuser_flag(&mut args);
+    let (Some(user), Some(salt), Some(salted)) = (args.next(), args.next(), args.next()) else {
+        eprintln!(
+            "upgrade-credential requires <user> <salt> <salted_password>\n{}",
+            usage()
+        );
+        exit(2);
+    };
+    match upgrade_credential(&user, &salt, &salted, superuser, SCRAM_ITERATIONS) {
+        Ok(credential) => {
+            print!("{}", credential_yaml(&credential));
+            exit(0);
+        }
+        Err(error) => {
+            eprintln!("upgrade-credential failed: {error}");
+            exit(2);
+        }
+    }
 }
 
 /// Read the value that must follow a flag, or report the flag as missing it.
@@ -77,6 +123,13 @@ async fn main() {
         raw.next();
         run_hash_password(raw);
     }
+    if raw.peek().is_some_and(|arg| arg == "upgrade-credential") {
+        raw.next();
+        run_upgrade_credential(raw);
+    }
+    // Audit lines (login success/failure, DDL, denied access) go to the server
+    // log; install the subscriber before serving so they are emitted.
+    fq_common::setup_logging("info", false);
 
     let args = match parse_args(raw) {
         Ok(args) => args,

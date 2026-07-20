@@ -45,24 +45,32 @@
 //! Authentication is driven by the `server:` section of the engine config
 //! (`fq_common::ServerConfig`). With no users configured - the default, and the
 //! state when the section is absent - startup uses the trust handshake: any user
-//! name is accepted with no password, like a `trust` line in `pg_hba.conf`. With
-//! users configured, startup requires SCRAM-SHA-256: the client must authenticate
-//! as one of the configured users, and a wrong password or unknown user is refused
-//! with a Postgres authentication error. Both handshakes are otherwise complete
+//! name is accepted with no password, like a `trust` line in `pg_hba.conf`, and
+//! ACL enforcement is off (every connection is an implicit superuser). With users
+//! configured, startup requires SCRAM-SHA-256 and turns bind-time enforcement on:
+//! the client must authenticate as one of the users (seeded into the durable
+//! store at startup), and a wrong password or unknown user is refused with a
+//! Postgres authentication error. Both handshakes are otherwise complete
 //! (parameter status, backend key, ReadyForQuery), so real clients connect
 //! cleanly; the selection lives in `handler`'s `FedqStartup`.
 //!
-//! ### Credential storage: never plaintext
+//! ### Credential storage: a verifier, never plaintext or the master secret
 //!
-//! A configured user stores a SCRAM credential, never a plaintext password: a
-//! base64 salt and the base64 of `PBKDF2-HMAC-SHA256(password, salt, 4096)` (the
-//! salted password the SCRAM handshake verifies a login's proof against). The
-//! iteration count is fixed at the SCRAM default (4096) for every user, because
-//! one handshake advertises one iteration count to the client. `fedq-server
-//! hash-password <user> <password>` derives these fields so the plaintext never
-//! enters the config file. `auth::ConfigAuthSource` decodes them at startup and
-//! answers the handshake's password queries; a malformed credential fails loudly
-//! at server start, not at a client's first login.
+//! A user's password is stored as a SCRAM-SHA-256 VERIFIER in the PostgreSQL
+//! `pg_authid` shape - salt, iteration count, StoredKey, ServerKey - never the
+//! plaintext and never the `SaltedPassword` master secret. A stolen verifier does
+//! NOT yield client-auth capability (recovering `ClientKey` needs a `SHA-256`
+//! preimage of `StoredKey`); it yields only server impersonation and an offline
+//! attack whose work factor is the iteration count. Because pgwire's stock
+//! `ScramAuth` can only verify from `SaltedPassword`, `scram::ScramStartupHandler`
+//! vendors the RFC-5802 server-side verification from `StoredKey`/`ServerKey`
+//! (`fq_scram`). `StoreAuthSource` looks the verifier up by username from the
+//! persisted `users` table; an unknown user is checked against a deterministic
+//! mock verifier so "no such user" is indistinguishable from "wrong password"
+//! (no enumeration / timing oracle). `fedq-server hash-password [--superuser]
+//! <user> <password>` (and `upgrade-credential` for an old block) derives a
+//! verifier so the plaintext never enters the config file. A server with auth
+//! enabled but no superuser REFUSES TO START.
 //!
 //! ## Query cancellation: the client detaches; the engine is not interrupted
 //!
@@ -152,33 +160,37 @@ mod auth;
 mod encode;
 mod handler;
 mod params;
+mod scram;
 mod session;
 
-pub use auth::{credential_yaml, hash_password};
+pub use auth::{credential_yaml, hash_password, upgrade_credential};
 pub use handler::FedqHandlers;
 pub use session::Session;
 
 use std::io;
+use std::path::Path;
 use std::sync::Arc;
 
+use fq_accel::Accelerator;
 use fq_common::Config;
 use pgwire::api::ConnectionManager;
 use pgwire::tokio::process_socket;
 use tokio::net::TcpListener;
 
-use crate::auth::ConfigAuthSource;
+use crate::auth::StoreAuthSource;
 
 /// Accept connections on `listener` forever, serving each over the Postgres wire
 /// protocol. Every accepted socket gets its own `Session` (a fresh `Runtime` on a
 /// dedicated worker thread) and is driven on its own tokio task, so slow or idle
 /// connections never block others. Returns only if `accept` itself fails.
 pub async fn serve(config: Config, listener: TcpListener) -> std::io::Result<()> {
-    // One auth source and one connection registry are shared by every connection:
-    // the auth source is read-only after this decode (a malformed credential fails
-    // server startup here, not a client's first login), and the registry must span
-    // connections so a CancelRequest arriving on its own connection can find its
-    // target.
-    let auth = Arc::new(ConfigAuthSource::from_config(&config.server).map_err(io::Error::other)?);
+    // One auth source and one connection registry are shared by every connection.
+    // Building the auth source seeds the bootstrap users into the durable store
+    // and refuses to start without a superuser, BEFORE the first connection can
+    // authenticate. The registry must span connections so a CancelRequest arriving
+    // on its own connection can find its target. `None` is trust mode (no auth,
+    // no enforcement).
+    let auth = build_auth_source(&config).map_err(io::Error::other)?;
     let manager = Arc::new(ConnectionManager::new());
     loop {
         let (socket, _peer) = listener.accept().await?;
@@ -186,7 +198,7 @@ pub async fn serve(config: Config, listener: TcpListener) -> std::io::Result<()>
         let handlers = Arc::new(FedqHandlers::new(
             session,
             Arc::clone(&manager),
-            Arc::clone(&auth),
+            auth.clone(),
         ));
         // One task per connection: process_socket runs the whole startup +
         // query loop for this client. A protocol error inside it ends only this
@@ -197,4 +209,29 @@ pub async fn serve(config: Config, listener: TcpListener) -> std::io::Result<()>
             }
         });
     }
+}
+
+/// Build the verifier-backed auth source when authentication is configured (the
+/// `server.users` list is non-empty), seeding the bootstrap users into the
+/// durable store and refusing to start when no user is a superuser. Returns
+/// `None` for trust mode (no users), where every connection runs as an implicit
+/// superuser with enforcement off.
+fn build_auth_source(config: &Config) -> Result<Option<Arc<StoreAuthSource>>, String> {
+    if config.server.users.is_empty() {
+        return Ok(None);
+    }
+    let source_path = config.source_path.as_deref().ok_or_else(|| {
+        "server authentication requires a file-based config (the ACL store lives \
+         next to it), but this config has no source path"
+            .to_string()
+    })?;
+    let store =
+        Arc::new(Accelerator::open(Path::new(source_path)).map_err(|error| error.to_string())?);
+    fq_runtime::import_bootstrap_users(&store, &config.server.users)
+        .map_err(|error| error.to_string())?;
+    fq_runtime::require_a_superuser(&store).map_err(|error| error.to_string())?;
+    Ok(Some(Arc::new(StoreAuthSource::new(
+        store,
+        config.server.scram_iterations,
+    ))))
 }

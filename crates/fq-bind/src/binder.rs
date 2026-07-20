@@ -44,6 +44,14 @@ pub struct Binder<'a> {
     /// BY over a Projection/Aggregate: a bare reference to an output alias (not a
     /// base-table column) resolves here first. A stack for nested queries.
     output_aliases: Vec<HashMap<String, fq_common::DataType>>,
+    /// Whether the principal is a superuser: a superuser short-circuits the
+    /// bind-time grant check (its queries pay nothing). `true` for the embedded /
+    /// no-enforcement path built by `new`.
+    superuser: bool,
+    /// The bind-time authorization hook, consulted for a non-superuser principal
+    /// in `resolve_scan_table`. `None` for the no-enforcement path (`new`), where
+    /// `superuser` is also true, so it is never consulted.
+    authorizer: Option<&'a dyn crate::Authorizer>,
 }
 
 /// Coerce an empty qualifier (a bare reference) to None so the catalog searches.
@@ -56,13 +64,33 @@ fn optional(value: &str) -> Option<&str> {
 }
 
 impl<'a> Binder<'a> {
-    /// A binder over `catalog`.
+    /// A binder over `catalog` with NO bind-time enforcement (an implicit
+    /// superuser). The embedded process and tests bind through here.
     pub fn new(catalog: &'a Catalog) -> Self {
         Self {
             catalog,
             scopes: Vec::new(),
             ctes: HashMap::new(),
             output_aliases: Vec::new(),
+            superuser: true,
+            authorizer: None,
+        }
+    }
+
+    /// A binder that authorizes every base-table reference through `authorizer`
+    /// unless `superuser` short-circuits it.
+    pub fn with_principal(
+        catalog: &'a Catalog,
+        superuser: bool,
+        authorizer: &'a dyn crate::Authorizer,
+    ) -> Self {
+        Self {
+            catalog,
+            scopes: Vec::new(),
+            ctes: HashMap::new(),
+            output_aliases: Vec::new(),
+            superuser,
+            authorizer: Some(authorizer),
         }
     }
 
@@ -117,6 +145,7 @@ impl<'a> Binder<'a> {
             optional(&scan.schema_name),
             &scan.table_name,
         ) {
+            self.authorize_table(table)?;
             return Ok(table);
         }
         if !scan.datasource.is_empty() {
@@ -130,6 +159,32 @@ impl<'a> Binder<'a> {
         Err(BindError::TableNotFound(format!(
             "{}.{}.{}",
             scan.datasource, scan.schema_name, scan.table_name
+        )))
+    }
+
+    /// The single privilege hook: authorize a resolved base table against the
+    /// principal's grants. A superuser (or a binder built without enforcement)
+    /// passes immediately. A denial raises `TableNotFound` with the SAME shape as
+    /// a genuinely missing table, so an unauthorized reference is indistinguishable
+    /// from a nonexistent one at the client (the true reason is audited
+    /// server-side by the authorizer). A free-standing table (no qualifier - a
+    /// synthetic CTE relation) is not a base-table access and is not checked here.
+    fn authorize_table(&self, table: &Table) -> Result<(), BindError> {
+        if self.superuser {
+            return Ok(());
+        }
+        let Some(authorizer) = self.authorizer else {
+            return Ok(());
+        };
+        let Some(qualifier) = table.qualifier() else {
+            return Ok(());
+        };
+        if authorizer.authorize_select(&qualifier.datasource, &qualifier.schema_name, &table.name) {
+            return Ok(());
+        }
+        Err(BindError::TableNotFound(format!(
+            "{}.{}.{}",
+            qualifier.datasource, qualifier.schema_name, table.name
         )))
     }
 

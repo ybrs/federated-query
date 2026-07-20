@@ -1,0 +1,35 @@
+[package]
+name = "fq-scram"
+version = "0.1.0"
+edition.workspace = true
+
+# fq-scram: SCRAM-SHA-256 verifier derivation and RFC-5802 server-side proof
+# verification. The engine stores a PostgreSQL pg_authid-shaped VERIFIER
+# (salt, iteration count, StoredKey, ServerKey) - never the plaintext and never
+# the SaltedPassword master secret. This crate derives that verifier from a
+# plaintext (CREATE/ALTER USER, hash-password), parses/renders the pg_authid
+# string, and verifies a client's SCRAM proof from the stored StoredKey/ServerKey
+# alone (the verification pgwire's stock ScramAuth cannot do, since it recomputes
+# from SaltedPassword). It is pgwire-free so it unit-tests without the wire stack;
+# fedq-server wraps the handshake state machine here behind a pgwire StartupHandler.
+
+[dependencies]
+# PBKDF2-HMAC-SHA256, HMAC-SHA256, and SHA-256, all from the ring backend already
+# linked by the workspace (pgwire's crypto backend). No second crypto stack is
+# introduced.
+ring = "0.17"
+# Base64 for the salt/StoredKey/ServerKey fields of the pg_authid verifier string
+# and for the SCRAM wire messages (nonces, proofs, signatures).
+base64 = "0.22"
+# A CSPRNG for fresh salts and the per-server mock secret / handshake nonces.
+rand = "0.9"
+# SASLprep normalization of the plaintext password before PBKDF2, matching what
+# PostgreSQL and pgwire's client do so a password normalizes identically here.
+stringprep = "0.1"
+# Constant-time byte comparison for the StoredKey proof check, so verifying a
+# client's proof does not leak through timing (ring's own equality helper is
+# deprecated for external use).
+subtle = "2"
+
+[lints]
+workspace = true

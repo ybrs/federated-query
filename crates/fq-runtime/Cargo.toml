@@ -27,6 +27,11 @@ fq-accel = { path = "../fq-accel" }
 # Event analytics: the EVENT VIEW contract, role registry, and the FUNNEL /
 # SEGMENT kernels; the runtime composes it with fq-accel's storage.
 fq-events = { path = "../fq-events" }
+# CREATE/ALTER USER hashes a plaintext password into a stored SCRAM verifier
+# server-side; the plaintext lives only for the call frame and is never stored.
+fq-scram = { path = "../fq-scram" }
+# Structured audit lines (auth, DDL, denied access) go to the server log.
+tracing = "0.1"
 # The result rename rebuilds the final RecordBatch/Schema under user-visible names.
 arrow = "58"
 # Datasource connection params arrive as raw YAML values on DataSourceConfig.
@@ -38,6 +43,10 @@ thiserror = "2"
 arrow-array = "58"
 # The Parquet e2e writes a small real parquet directory to seed the file source.
 parquet = "58"
+# The ACL e2e derives a bootstrap admin verifier for the config's server.users.
+fq-scram = { path = "../fq-scram" }
+# The live-revoke test opens a second store handle to simulate a peer's write.
+fq-accel = { path = "../fq-accel" }
 
 [lints]
 workspace = true

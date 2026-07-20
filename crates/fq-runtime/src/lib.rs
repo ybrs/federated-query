@@ -10,6 +10,7 @@
 //!
 //! This crate is pyo3-FREE. The `fedq-py` crate wraps it behind the Python FFI.
 
+mod acl;
 mod delta;
 mod dynamic_catalog;
 pub mod error;
@@ -18,6 +19,8 @@ mod explain;
 mod materialized;
 mod settings;
 mod substitute;
+
+pub use acl::{import_bootstrap_users, require_a_superuser};
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -81,6 +84,11 @@ pub struct Runtime {
     /// The event-view role registry, opened together with the accelerator
     /// (same stats SQLite): an event view is a materialized view plus roles.
     events: Option<fq_events::EventViewRegistry>,
+    /// The live authorization state: the principal, its effective superuser
+    /// flag, and the generation-gated grant cache. Embedded/trust builds hold an
+    /// implicit superuser with enforcement off; a wire connection calls
+    /// `set_principal` to turn enforcement on.
+    authz: RwLock<acl::AclState>,
 }
 
 impl Runtime {
@@ -129,6 +137,13 @@ impl Runtime {
         // monotonic column whose type cannot carry a watermark, fails HERE at
         // load - not silently at a refresh months later.
         delta::validate_change_keys(&catalog, config)?;
+        // Seed the persisted users table from the config's bootstrap list
+        // (idempotent); thereafter the persisted table is authoritative. The
+        // embedded process runs as an implicit superuser, so it does not enforce,
+        // but it can still administer the store a wire server enforces against.
+        if let Some(accel) = &accelerator {
+            acl::import_bootstrap_users(accel, &config.server.users)?;
+        }
         let events = events::open_event_registry(config)?;
         let catalog = Arc::new(catalog);
         let learned = open_stats_catalog(config)?;
@@ -146,6 +161,7 @@ impl Runtime {
             learned,
             accelerator,
             events,
+            authz: RwLock::new(acl::AclState::embedded()),
         })
     }
 
@@ -193,7 +209,13 @@ impl Runtime {
         if let Some(inner) = explain::strip_explain(sql) {
             return self.explain(inner);
         }
-        match classify_statement(sql)? {
+        let statement = classify_statement(sql)?;
+        // Admin DDL is superuser-gated BEFORE the handler runs: a non-superuser
+        // gets an explicit permission error (the statement kind is not a secret).
+        if let Some(action) = acl::superuser_action(&statement) {
+            self.require_superuser(action)?;
+        }
+        match statement {
             Statement::Query(text) => self.execute_query(text),
             Statement::CreateMaterializedView { name, select_sql } => {
                 self.create_materialized_view(&name, select_sql)
@@ -220,6 +242,22 @@ impl Runtime {
             }
             Statement::DropDatasource { name } => self.drop_datasource(&name),
             Statement::ShowDatasources => self.show_datasources(),
+            Statement::CreateUser {
+                name,
+                password,
+                superuser,
+            } => self.create_user(&name, &password, superuser),
+            Statement::AlterUserPassword { name, password } => {
+                self.alter_user_password(&name, &password)
+            }
+            Statement::AlterUserSuperuser { name, superuser } => {
+                self.alter_user_superuser(&name, superuser)
+            }
+            Statement::DropUser { name } => self.drop_user(&name),
+            Statement::Grant { object, grantee } => self.grant(&object, &grantee),
+            Statement::Revoke { object, grantee } => self.revoke(&object, &grantee),
+            Statement::ShowUsers => self.show_users(),
+            Statement::ShowGrants { grantee } => self.show_grants(grantee.as_deref()),
         }
     }
 
@@ -304,6 +342,8 @@ impl Runtime {
             Statement::ShowDatasources => {
                 return Ok(dynamic_catalog::datasources_describe_columns());
             }
+            Statement::ShowUsers => return Ok(acl::users_describe_columns()),
+            Statement::ShowGrants { .. } => return Ok(acl::grants_describe_columns()),
             Statement::Funnel(_) => return Ok(events::funnel_describe_columns()),
             Statement::Segment(_) => return Ok(events::segment_describe_columns()),
             Statement::Paths(_) => return Ok(events::paths_describe_columns()),
@@ -338,7 +378,10 @@ impl Runtime {
     ) -> Result<LogicalPlan, RuntimeError> {
         let parsed = parse_with_catalog(sql, catalog)?;
         stages.finish("parse")?;
-        let bound = fq_bind::bind(catalog, parsed)?;
+        // Bind under the live principal: a superuser (or the embedded/trust build)
+        // pays nothing; an enforced non-superuser's unauthorized base-table
+        // reference raises a non-leaking not-found in the one resolver.
+        let bound = self.bind_with_authz(catalog, parsed)?;
         stages.finish("bind")?;
         let decorrelated = fq_decorrelate::decorrelate(bound)?;
         stages.finish("decorrelate")?;
