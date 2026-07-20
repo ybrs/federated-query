@@ -31,7 +31,8 @@ use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
 
 use fq_common::{
-    AcceleratorConfig, CatalogConfig, Config, CostConfig, DataType, ExecutorConfig, OptimizerConfig,
+    AcceleratorConfig, CatalogConfig, Config, CostConfig, DataType, EventsConfig, ExecutorConfig,
+    OptimizerConfig,
 };
 
 use crate::error::RuntimeError;
@@ -154,6 +155,14 @@ impl SettingValue {
         match self {
             SettingValue::F64(value) => Ok(*value),
             other => Err(SettingsError::internal_type(other, "number")),
+        }
+    }
+
+    /// Extract a `usize`, or raise if this is not an unsigned value.
+    fn as_usize(&self) -> Result<usize, SettingsError> {
+        match self {
+            SettingValue::Usize(value) => Ok(*value),
+            other => Err(SettingsError::internal_type(other, "unsigned integer")),
         }
     }
 
@@ -641,6 +650,106 @@ static SETTINGS: &[SettingDef] = &[
         read: |_| SettingValue::Usize(fq_exec::engine::DUCK_TEMP_CAP),
         apply: None,
     },
+    // --- events: the event-analytics store's build and query budgets --------
+    SettingDef {
+        name: "events.build_memory_bytes",
+        description: "Peak memory budget of an event dataset build; shard sizing and \
+                      spill buffers derive from it, so peak RSS is independent of \
+                      total row count.",
+        mutability: Mutability::SessionMutable,
+        env_var: None,
+        default: || SettingValue::U64(EventsConfig::default().build_memory_bytes),
+        read: |c| SettingValue::U64(c.events.build_memory_bytes),
+        apply: Some(|c, v| {
+            c.events.build_memory_bytes = v.as_u64()?;
+            Ok(())
+        }),
+    },
+    SettingDef {
+        name: "events.build_threads",
+        description: "Event build worker threads; 0 uses every core.",
+        mutability: Mutability::SessionMutable,
+        env_var: None,
+        default: || SettingValue::Usize(EventsConfig::default().build_threads),
+        read: |c| SettingValue::Usize(c.events.build_threads),
+        apply: Some(|c, v| {
+            c.events.build_threads = v.as_usize()?;
+            Ok(())
+        }),
+    },
+    SettingDef {
+        name: "events.target_shard_bytes",
+        description: "Raw columnar bytes targeted per shard when deriving an event \
+                      dataset's shard count (fixed at CREATE for the dataset's life).",
+        mutability: Mutability::Static,
+        env_var: None,
+        default: || SettingValue::U64(EventsConfig::default().target_shard_bytes),
+        read: |c| SettingValue::U64(c.events.target_shard_bytes),
+        apply: None,
+    },
+    SettingDef {
+        name: "events.dict_max_bytes",
+        description: "Per-property build-dictionary budget; a property whose value map \
+                      exceeds it is promoted to raw-string encoding.",
+        mutability: Mutability::SessionMutable,
+        env_var: None,
+        default: || SettingValue::U64(EventsConfig::default().dict_max_bytes),
+        read: |c| SettingValue::U64(c.events.dict_max_bytes),
+        apply: Some(|c, v| {
+            c.events.dict_max_bytes = v.as_u64()?;
+            Ok(())
+        }),
+    },
+    SettingDef {
+        name: "events.cache_bytes",
+        description: "Decoded-block cache budget for warm event analyses.",
+        mutability: Mutability::SessionMutable,
+        env_var: None,
+        default: || SettingValue::U64(EventsConfig::default().cache_bytes),
+        read: |c| SettingValue::U64(c.events.cache_bytes),
+        apply: Some(|c, v| {
+            c.events.cache_bytes = v.as_u64()?;
+            Ok(())
+        }),
+    },
+    SettingDef {
+        name: "events.query_memory_bytes",
+        description: "Per-query group/partial memory budget of the event analyses.",
+        mutability: Mutability::SessionMutable,
+        env_var: None,
+        default: || SettingValue::U64(EventsConfig::default().query_memory_bytes),
+        read: |c| SettingValue::U64(c.events.query_memory_bytes),
+        apply: Some(|c, v| {
+            c.events.query_memory_bytes = v.as_u64()?;
+            Ok(())
+        }),
+    },
+    SettingDef {
+        name: "events.max_generations",
+        description: "Generation count per shard past which the next refresh compacts \
+                      it.",
+        mutability: Mutability::SessionMutable,
+        env_var: None,
+        default: || SettingValue::U64(EventsConfig::default().max_generations),
+        read: |c| SettingValue::U64(c.events.max_generations),
+        apply: Some(|c, v| {
+            c.events.max_generations = v.as_u64()?;
+            Ok(())
+        }),
+    },
+    SettingDef {
+        name: "events.allow_unknown_names",
+        description: "Whether an unknown event NAME in an analysis statement matches \
+                      nothing instead of raising the unknown-name error.",
+        mutability: Mutability::SessionMutable,
+        env_var: None,
+        default: || SettingValue::Bool(EventsConfig::default().allow_unknown_names),
+        read: |c| SettingValue::Bool(c.events.allow_unknown_names),
+        apply: Some(|c, v| {
+            c.events.allow_unknown_names = v.as_bool()?;
+            Ok(())
+        }),
+    },
 ];
 
 /// Whether an env kill switch is on: only the exact string `"0"` turns it off;
@@ -1001,6 +1110,13 @@ mod tests {
     fn every_catalog_field_is_registered() {
         let mapping = serde_yaml::to_value(CatalogConfig::default()).expect("serialize catalog");
         assert_fields_registered(&mapping, "catalog");
+    }
+
+    /// Every `EventsConfig` field is registered under `events.`.
+    #[test]
+    fn every_events_field_is_registered() {
+        let mapping = serde_yaml::to_value(EventsConfig::default()).expect("serialize events");
+        assert_fields_registered(&mapping, "events");
     }
 
     /// Assert every key of a serialized config section appears in the registry

@@ -2076,3 +2076,73 @@ mod tests {
         prune_session(keep);
     }
 }
+
+/// A pull-based batch stream over one source read. The Parquet path streams
+/// the DataFusion execution (bounded memory: batches are pulled one at a
+/// time, upstream partitions decode in parallel); every other source kind
+/// materializes the whole result first and replays it batch by batch, so its
+/// memory belongs to the query pipeline, not the consumer.
+pub struct FetchStream {
+    schema: SchemaRef,
+    inner: FetchStreamInner,
+}
+
+/// The two stream backings.
+enum FetchStreamInner {
+    Streaming(datafusion::physical_plan::SendableRecordBatchStream),
+    Materialized(std::vec::IntoIter<RecordBatch>),
+}
+
+impl FetchStream {
+    /// The result schema.
+    pub fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    /// The next batch, or None at end of stream.
+    pub fn next_batch(&mut self) -> ExecResult<Option<RecordBatch>> {
+        match &mut self.inner {
+            FetchStreamInner::Streaming(stream) => parquet_runtime()
+                .block_on(futures::StreamExt::next(stream))
+                .transpose()
+                .map_err(|e| ExecError::runtime(format!("parquet stream: {e}"))),
+            FetchStreamInner::Materialized(batches) => Ok(batches.next()),
+        }
+    }
+}
+
+/// Run `sql` against the named source and return a pull-based batch stream.
+/// The caller must be inside a `SessionScope` (like every fetch).
+pub fn fetch_stream(name: &str, sql: &str) -> ExecResult<FetchStream> {
+    let s = spec(name)?;
+    match s.kind {
+        DsKind::Parquet => {
+            let ctx = parquet_ctx(current_session(), &s.uri)
+                .map_err(|e| ExecError::runtime(format!("parquet: {e}")))?;
+            let sql = sql.to_string();
+            let (schema, stream) = parquet_runtime()
+                .block_on(async move {
+                    let df = ctx.sql(&sql).await?;
+                    let schema = std::sync::Arc::new(df.schema().as_arrow().clone());
+                    let stream = df.execute_stream().await?;
+                    Ok::<_, datafusion::error::DataFusionError>((schema, stream))
+                })
+                .map_err(|e| ExecError::runtime(format!("parquet query: {e}")))?;
+            Ok(FetchStream {
+                schema,
+                inner: FetchStreamInner::Streaming(stream),
+            })
+        }
+        DsKind::Postgres
+        | DsKind::DuckDb
+        | DsKind::ClickHouse
+        | DsKind::MySql
+        | DsKind::Materialized => {
+            let (schema, batches) = fetch(name, sql)?;
+            Ok(FetchStream {
+                schema,
+                inner: FetchStreamInner::Materialized(batches.into_iter()),
+            })
+        }
+    }
+}

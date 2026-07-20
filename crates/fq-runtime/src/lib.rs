@@ -14,6 +14,7 @@ mod acl;
 mod delta;
 mod dynamic_catalog;
 pub mod error;
+mod events;
 mod explain;
 mod materialized;
 mod settings;
@@ -85,6 +86,10 @@ pub struct Runtime {
     /// implicit superuser with enforcement off; a wire connection calls
     /// `set_principal` to turn enforcement on.
     authz: RwLock<acl::AclState>,
+    /// The event-analytics store, opened lazily on the first event statement
+    /// (like the materialized-view store, it lives next to the config file;
+    /// a path-less config raises).
+    events: events::EventStoreSlot,
 }
 
 impl Runtime {
@@ -156,6 +161,7 @@ impl Runtime {
             learned,
             accelerator,
             authz: RwLock::new(acl::AclState::embedded()),
+            events: std::sync::Mutex::new(None),
         })
     }
 
@@ -242,6 +248,15 @@ impl Runtime {
             Statement::Revoke { object, grantee } => self.revoke(&object, &grantee),
             Statement::ShowUsers => self.show_users(),
             Statement::ShowGrants { grantee } => self.show_grants(grantee.as_deref()),
+            Statement::CreateEventDataset(def) => self.create_event_dataset(&def),
+            Statement::RefreshEventDataset { name } => self.refresh_event_dataset(&name),
+            Statement::RebuildEventDataset { name } => self.rebuild_event_dataset(&name),
+            Statement::DropEventDataset { name } => self.drop_event_dataset(&name),
+            Statement::ShowEventDatasets => self.show_event_datasets(),
+            Statement::EventFunnel(spec) => self.run_event_funnel(&spec),
+            Statement::EventRetention(spec) => self.run_event_retention(&spec),
+            Statement::EventSegment(spec) => self.run_event_segment(&spec),
+            Statement::EventPaths(spec) => self.run_event_paths(&spec),
         }
     }
 
@@ -328,6 +343,19 @@ impl Runtime {
             }
             Statement::ShowUsers => return Ok(acl::users_describe_columns()),
             Statement::ShowGrants { .. } => return Ok(acl::grants_describe_columns()),
+            Statement::ShowEventDatasets => {
+                return Ok(events::show_event_datasets_columns());
+            }
+            Statement::EventFunnel(spec) => {
+                return Ok(events::funnel_describe_columns(&spec));
+            }
+            Statement::EventRetention(spec) => {
+                return Ok(events::retention_describe_columns(&spec));
+            }
+            Statement::EventSegment(spec) => {
+                return Ok(events::segment_describe_columns(&spec));
+            }
+            Statement::EventPaths(_) => return Ok(events::paths_describe_columns()),
             _ => return Ok(vec![("status".to_owned(), DataType::Text)]),
         }
         let physical = self.plan(sql)?;

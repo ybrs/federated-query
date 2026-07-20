@@ -36,9 +36,13 @@
 use crate::error::ParseError;
 
 /// One SQL statement, classified: a materialized-view DDL form, a settings
-/// statement, or a plain query passed through as text for the normal parse
-/// pipeline.
-#[derive(Debug, PartialEq, Eq)]
+/// statement, an event-analytics statement, or a plain query passed through as
+/// text for the normal parse pipeline.
+///
+/// The event family reserves the leading keywords `FUNNEL`, `RETENTION`,
+/// `SEGMENT`, `PATHS`, and `REBUILD` for its analysis and DDL forms; none of
+/// them starts a plannable SQL query, so classification is unambiguous.
+#[derive(Debug, PartialEq)]
 pub enum Statement<'a> {
     /// Anything that is not a recognized statement form; the full original text.
     Query(&'a str),
@@ -104,6 +108,24 @@ pub enum Statement<'a> {
     ShowUsers,
     /// `SHOW GRANTS [FOR <grantee>]`.
     ShowGrants { grantee: Option<String> },
+    /// `CREATE EVENT DATASET <name> FROM ... ACTOR ... TIME ... EVENT ...`.
+    CreateEventDataset(fq_common::events::EventDatasetDef),
+    /// `REFRESH EVENT DATASET <name>`: incremental append past the watermark.
+    RefreshEventDataset { name: String },
+    /// `REBUILD EVENT DATASET <name>`: full re-ingest from the source.
+    RebuildEventDataset { name: String },
+    /// `DROP EVENT DATASET <name>`.
+    DropEventDataset { name: String },
+    /// `SHOW EVENT DATASETS`: list every event dataset with its build state.
+    ShowEventDatasets,
+    /// `FUNNEL ( <event>, ... ) ON <dataset> WINDOW <interval> ...`.
+    EventFunnel(fq_common::events::FunnelSpec),
+    /// `RETENTION ON <dataset> BIRTH ... RETURN ... PERIOD ...`.
+    EventRetention(fq_common::events::RetentionSpec),
+    /// `SEGMENT <measure> ON <dataset> BUCKET <grain> ...`.
+    EventSegment(fq_common::events::SegmentSpec),
+    /// `PATHS ON <dataset> [STARTING AT ... | ENDING AT ...] ...`.
+    EventPaths(fq_common::events::PathsSpec),
 }
 
 /// The object a GRANT/REVOKE names, at one of three containment levels. A grant
@@ -157,9 +179,22 @@ pub fn classify_statement(sql: &str) -> Result<Statement<'_>, ParseError> {
         return Ok(Statement::Query(sql));
     };
     match first.to_ascii_uppercase().as_str() {
-        // REFRESH exists for nothing but the materialized-view form, so its
-        // errors name what that form expects.
+        // REFRESH exists only for the materialized-view and event-dataset
+        // forms; the second word picks the family.
+        "REFRESH" if second_word_is(sql, "EVENT") => {
+            crate::events::classify_refresh_event(&mut tokens)
+        }
         "REFRESH" => classify_refresh(&mut tokens),
+        "REBUILD" => crate::events::classify_rebuild_event(&mut tokens),
+        "CREATE" if second_word_is(sql, "EVENT") => {
+            crate::events::classify_create_event(&mut tokens)
+        }
+        "DROP" if second_word_is(sql, "EVENT") => crate::events::classify_drop_event(&mut tokens),
+        "SHOW" if second_word_is(sql, "EVENT") => crate::events::classify_show_event(&mut tokens),
+        "FUNNEL" => crate::events::classify_funnel(&mut tokens),
+        "RETENTION" => crate::events::classify_retention(&mut tokens),
+        "SEGMENT" => crate::events::classify_segment(&mut tokens),
+        "PATHS" => crate::events::classify_paths(&mut tokens),
         "CREATE" if second_word_is(sql, "MATERIALIZED") => classify_create(&mut tokens),
         "CREATE" if second_word_is(sql, "DATASOURCE") => classify_create_datasource(&mut tokens),
         "CREATE" if second_word_is(sql, "USER") => classify_create_user(&mut tokens),
@@ -307,7 +342,9 @@ fn datasource_kind(tokens: &mut Tokenizer<'_>) -> Result<String, ParseError> {
 /// are bare words, lowercased; a duplicate key raises. Values are string
 /// literals or a bare word (a bare integer for a numeric param). An empty list
 /// `( )` is accepted; each kind's required params are checked at validation.
-fn parse_with_params(tokens: &mut Tokenizer<'_>) -> Result<Vec<(String, String)>, ParseError> {
+pub(crate) fn parse_with_params(
+    tokens: &mut Tokenizer<'_>,
+) -> Result<Vec<(String, String)>, ParseError> {
     expect_char(tokens, '(', "WITH (")?;
     let mut params: Vec<(String, String)> = Vec::new();
     if consume_char(tokens, ')') {
@@ -364,7 +401,11 @@ fn parse_one_param(tokens: &mut Tokenizer<'_>) -> Result<(String, String), Parse
 }
 
 /// Consume the next token, requiring it to be the single character `ch`.
-fn expect_char(tokens: &mut Tokenizer<'_>, ch: char, form: &str) -> Result<(), ParseError> {
+pub(crate) fn expect_char(
+    tokens: &mut Tokenizer<'_>,
+    ch: char,
+    form: &str,
+) -> Result<(), ParseError> {
     match tokens.next_token() {
         Some(Token::Other(found)) if found == ch => Ok(()),
         Some(token) => Err(ParseError::Parse(format!(
@@ -379,7 +420,7 @@ fn expect_char(tokens: &mut Tokenizer<'_>, ch: char, form: &str) -> Result<(), P
 
 /// Consume the next token if it is the single character `ch`, returning whether
 /// it was consumed.
-fn consume_char(tokens: &mut Tokenizer<'_>, ch: char) -> bool {
+pub(crate) fn consume_char(tokens: &mut Tokenizer<'_>, ch: char) -> bool {
     if matches!(tokens.peek(), Some(Token::Other(found)) if found == ch) {
         tokens.next_token();
         return true;
@@ -664,7 +705,7 @@ fn classify_show_grants<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>,
 
 /// Consume the next token if it is the bare word `keyword` (case-insensitive),
 /// returning whether it was consumed.
-fn consume_keyword(tokens: &mut Tokenizer<'_>, keyword: &str) -> bool {
+pub(crate) fn consume_keyword(tokens: &mut Tokenizer<'_>, keyword: &str) -> bool {
     if tokens.peek_word_is(keyword) {
         tokens.next_token();
         return true;
@@ -674,7 +715,7 @@ fn consume_keyword(tokens: &mut Tokenizer<'_>, keyword: &str) -> bool {
 
 /// A short rendering of an optional token for error messages (end-of-statement
 /// when there is none).
-fn describe_opt(token: Option<&Token<'_>>) -> String {
+pub(crate) fn describe_opt(token: Option<&Token<'_>>) -> String {
     match token {
         Some(token) => token.describe(),
         None => "end of statement".to_string(),
@@ -1034,6 +1075,42 @@ impl<'a> Tokenizer<'a> {
             None => Err(ParseError::Parse(format!(
                 "expected '{keyword}', found end of statement"
             ))),
+        }
+    }
+
+    /// Consume a balanced `( ... )` group and return the text between the
+    /// outer parentheses (quote-aware; nested parentheses stay balanced). The
+    /// opening parenthesis must be the next token; a statement ending before
+    /// the matching close raises.
+    pub(crate) fn take_parenthesized(&mut self, form: &str) -> Result<&'a str, ParseError> {
+        match self.next_token() {
+            Some(Token::Other('(')) => {}
+            other => {
+                return Err(ParseError::Parse(format!(
+                    "expected '(' in {form}, found '{}'",
+                    describe_opt(other.as_ref())
+                )))
+            }
+        }
+        let start = self.pos;
+        let mut depth = 1usize;
+        loop {
+            let before = self.pos;
+            match self.next_token() {
+                Some(Token::Other('(')) => depth += 1,
+                Some(Token::Other(')')) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(&self.input[start..before]);
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    return Err(ParseError::Parse(format!(
+                        "{form} has an unclosed '(' before end of statement"
+                    )))
+                }
+            }
         }
     }
 

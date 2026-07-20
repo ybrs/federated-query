@@ -169,6 +169,10 @@ pub(crate) fn superuser_action(statement: &Statement) -> Option<&'static str> {
         Statement::CreateMaterializedView { .. } => Some("CREATE MATERIALIZED VIEW"),
         Statement::RefreshMaterializedView { .. } => Some("REFRESH MATERIALIZED VIEW"),
         Statement::DropMaterializedView { .. } => Some("DROP MATERIALIZED VIEW"),
+        Statement::CreateEventDataset(_) => Some("CREATE EVENT DATASET"),
+        Statement::RefreshEventDataset { .. } => Some("REFRESH EVENT DATASET"),
+        Statement::RebuildEventDataset { .. } => Some("REBUILD EVENT DATASET"),
+        Statement::DropEventDataset { .. } => Some("DROP EVENT DATASET"),
         _ => None,
     }
 }

@@ -81,6 +81,7 @@ fn duck_config(path: &str) -> Config {
         server: ServerConfig::default(),
         accelerator: fq_common::AcceleratorConfig::default(),
         catalog: fq_common::CatalogConfig::default(),
+        events: fq_common::EventsConfig::default(),
         source_path: None,
     }
 }

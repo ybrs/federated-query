@@ -84,6 +84,7 @@ impl Sandbox {
             server: ServerConfig::default(),
             accelerator: fq_common::AcceleratorConfig::default(),
             catalog: fq_common::CatalogConfig::default(),
+            events: fq_common::EventsConfig::default(),
             source_path: Some(self.dir.join("config.yaml").to_string_lossy().to_string()),
         }
     }
