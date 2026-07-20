@@ -39,6 +39,7 @@ from tests.e2e_federated import corpus_subqueries
 from tests.e2e_federated import corpus_windows_expressions
 from tests.e2e_federated import tables as table_library
 from tests.e2e_federated.sanity import corpus as sanity_corpus
+from fuzz import findings_corpus
 
 CORPUS_MODULES = {
     "sanity": sanity_corpus,
@@ -50,6 +51,7 @@ CORPUS_MODULES = {
     "corpus_windows_expressions": corpus_windows_expressions,
     "corpus_gaps": corpus_gaps,
     "corpus_multisource": corpus_multisource,
+    "fuzz_findings": findings_corpus,
 }
 
 REQUIRED_KEYS = ("name", "tables", "query")

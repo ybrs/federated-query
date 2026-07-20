@@ -79,3 +79,4 @@ benchmarks/**/fedq.so
 benchmarks/perf_compare/results/
 benchmarks/perf_compare/fedq.so
 .claude/worktrees/
+fuzz/artifacts/
