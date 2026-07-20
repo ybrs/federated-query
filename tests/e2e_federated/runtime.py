@@ -111,6 +111,16 @@ class Environment:
         rendered = self.render(query)
         return pa.table(self.runtime().execute(rendered))
 
+    def close(self):
+        """Release the engine runtime so its session's connections are freed.
+
+        Dropping the only reference to the native runtime runs its Rust Drop,
+        which prunes the session from the exec-plane registry and closes the
+        PostgreSQL connections it opened. Called on LRU eviction and at session
+        teardown; a rebuilt environment reseeds, so closing is safe.
+        """
+        self._runtime = None
+
 
 def build_environment(placement, specs, pg_connection):
     """Seed a placement of the given table specs and return its Environment.

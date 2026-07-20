@@ -11,8 +11,9 @@
 //! DuckDB reads go over the native duckdb driver, with connections cached
 //! per thread and seeded for shipped temp tables.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, RecordBatchReader, StringArray};
@@ -33,22 +34,138 @@ pub struct DsSpec {
     pub adbc_driver: Option<String>,
 }
 
-static REGISTRY: OnceLock<Mutex<HashMap<String, DsSpec>>> = OnceLock::new();
+/// The identity of one engine session (one `Runtime`). Every process-wide data
+/// plane map keys its entries on `(SessionId, name)`, so two runtimes that reuse
+/// a datasource name never read each other's source, and a dropped runtime's
+/// state can be pruned by its id alone. A plain incrementing counter: sessions
+/// are minted rarely (once per runtime) and never need to be reconstructed.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct SessionId(u64);
 
-fn registry() -> &'static Mutex<HashMap<String, DsSpec>> {
+/// Mint a fresh session id and record it as live. The caller (a `Runtime`)
+/// registers its datasources under the returned id and prunes them with
+/// `prune_session` when it drops.
+pub fn open_session() -> SessionId {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let id = SessionId(NEXT.fetch_add(1, Ordering::Relaxed));
+    live_sessions().lock().unwrap().insert(id);
+    id
+}
+
+/// The live-session set: the id of every runtime that has not yet dropped. Read
+/// by `reap_dead_sessions` to drop the thread-local connections of a session
+/// that dropped on another thread; written by `open_session` / `prune_session`.
+fn live_sessions() -> &'static Mutex<HashSet<SessionId>> {
+    static LIVE: OnceLock<Mutex<HashSet<SessionId>>> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+thread_local! {
+    // The session whose datasources every data-plane call on THIS thread reads.
+    // A `SessionScope` sets it for the duration of one execution (or one pool
+    // job); the accessors below key their maps on it. `None` outside a scope is a
+    // programming error - a fetch with no session installed cannot pick a source.
+    static CURRENT_SESSION: Cell<Option<SessionId>> = const { Cell::new(None) };
+}
+
+/// Install `session` as the current data-plane session for the life of the
+/// returned guard, restoring the previous session (nesting-safe) when it drops.
+/// The execution entry point and every pool worker install one before touching a
+/// source, so all session-keyed lookups on the thread resolve to `session`.
+pub struct SessionScope {
+    previous: Option<SessionId>,
+}
+
+impl SessionScope {
+    /// Enter `session` on the current thread.
+    pub fn enter(session: SessionId) -> SessionScope {
+        let previous = CURRENT_SESSION.with(|current| current.replace(Some(session)));
+        SessionScope { previous }
+    }
+}
+
+impl Drop for SessionScope {
+    fn drop(&mut self) {
+        CURRENT_SESSION.with(|current| current.set(self.previous));
+    }
+}
+
+/// The session installed on this thread. Panics when none is installed: every
+/// data-plane read runs inside a `SessionScope`, so a missing session is a bug
+/// (a source read with no session cannot be resolved without guessing).
+pub fn current_session() -> SessionId {
+    CURRENT_SESSION
+        .with(Cell::get)
+        .expect("no data-plane session installed on this thread; enter a SessionScope first")
+}
+
+/// Drop every trace of `session` from the data plane: its registry entries,
+/// cached contexts and connections in the process-wide maps, this thread's
+/// pooled connections for it, and the same in both worker pools. Called by a
+/// `Runtime` as it drops. Only `session`'s entries are touched, so other live
+/// sessions keep running.
+pub fn prune_session(session: SessionId) {
+    live_sessions().lock().unwrap().remove(&session);
+    registry().lock().unwrap().retain(|key, _| key.0 != session);
+    duck_base_cache()
+        .lock()
+        .unwrap()
+        .retain(|key, _| key.0 != session);
+    materialized_ctx_cache()
+        .lock()
+        .unwrap()
+        .retain(|key, _| key.0 != session);
+    parquet_ctx_cache()
+        .lock()
+        .unwrap()
+        .retain(|key, _| key.0 != session);
+    index_cache()
+        .lock()
+        .unwrap()
+        .retain(|key, _| key.0 != session);
+    prune_thread_local_caches(session);
+    prune_parallel_pool(session);
+    crate::engine::prune_step_pool(session);
+}
+
+/// Drop this thread's pooled Postgres/DuckDB/MySQL connections for a session
+/// (shipped-table records with them). Runs on the thread that pruned or reaped
+/// the session; only that thread's non-`Send` connection handles are touched.
+pub(crate) fn prune_thread_local_caches(session: SessionId) {
+    PG_CACHE.with(|cache| cache.borrow_mut().retain(|key, _| key.0 != session));
+    PINNED_DUCK.with(|cache| cache.borrow_mut().retain(|key, _| key.0 != session));
+    MYSQL_CACHE.with(|cache| cache.borrow_mut().retain(|key, _| key.0 != session));
+    SHIPPED_PG.with(|shipped| shipped.borrow_mut().retain(|entry| entry.0 != session));
+}
+
+/// Drop this thread's pooled connections for every session that has since
+/// dropped. The execution entry point calls it so a runtime dropped on another
+/// thread still releases the connections it opened on THIS driving thread.
+pub fn reap_dead_sessions() {
+    let live = live_sessions().lock().unwrap().clone();
+    PG_CACHE.with(|cache| cache.borrow_mut().retain(|key, _| live.contains(&key.0)));
+    PINNED_DUCK.with(|cache| cache.borrow_mut().retain(|key, _| live.contains(&key.0)));
+    MYSQL_CACHE.with(|cache| cache.borrow_mut().retain(|key, _| live.contains(&key.0)));
+    SHIPPED_PG.with(|shipped| shipped.borrow_mut().retain(|entry| live.contains(&entry.0)));
+}
+
+static REGISTRY: OnceLock<Mutex<HashMap<(SessionId, String), DsSpec>>> = OnceLock::new();
+
+fn registry() -> &'static Mutex<HashMap<(SessionId, String), DsSpec>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Register (or replace) a datasource under `name`.
-pub fn register(name: String, spec: DsSpec) {
-    registry().lock().unwrap().insert(name, spec);
+/// Register (or replace) a datasource under `(session, name)`.
+pub fn register(session: SessionId, name: String, spec: DsSpec) {
+    registry().lock().unwrap().insert((session, name), spec);
 }
 
 fn spec(name: &str) -> ExecResult<DsSpec> {
+    let session = current_session();
     registry()
         .lock()
         .unwrap()
-        .get(name)
+        .get(&(session, name.to_string()))
         .cloned()
         .ok_or_else(|| ExecError::runtime(format!("datasource '{name}' is not registered")))
 }
@@ -66,22 +183,25 @@ struct PgConn {
 }
 
 thread_local! {
-    // One live connection per datasource name, on the query-driving thread.
-    // ADBC handles are not Send, and all fetches run on this one thread, so a
-    // thread-local cache pools connections without any locking.
-    static PG_CACHE: RefCell<HashMap<String, PgConn>> = RefCell::new(HashMap::new());
-    // DuckDB connections PINNED for the current query, keyed by database
-    // path. A pinned connection exists only after a `ship` step created a
+    // One live connection per (session, datasource name), on the query-driving
+    // thread. ADBC handles are not Send, and all fetches run on this one thread,
+    // so a thread-local cache pools connections without any locking. The session
+    // is part of the key so two runtimes reusing a name keep separate connections
+    // and a dropped runtime's connections can be pruned by session.
+    static PG_CACHE: RefCell<HashMap<(SessionId, String), PgConn>> = RefCell::new(HashMap::new());
+    // DuckDB connections PINNED for the current query, keyed by (session, database
+    // path). A pinned connection exists only after a `ship` step created a
     // temp table on it: temp objects are per-connection, so every later
     // fetch against that database must run on the SAME connection to see
     // the shipped relation. Cleared (dropping the temp tables with it) at
     // query end by `clear_shipments`.
-    static PINNED_DUCK: RefCell<HashMap<String, duckdb::Connection>> = RefCell::new(HashMap::new());
-    // (datasource name, table) pairs shipped as Postgres session TEMP TABLEs on
-    // the pooled PG_CACHE connection this query. Unlike DuckDB (where dropping
-    // the pinned connection drops its temp tables), the PG connection is reused
-    // across queries, so each shipped table is DROPped by name at query end.
-    static SHIPPED_PG: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
+    static PINNED_DUCK: RefCell<HashMap<(SessionId, String), duckdb::Connection>> =
+        RefCell::new(HashMap::new());
+    // (session, datasource name, table) triples shipped as Postgres session TEMP
+    // TABLEs on the pooled PG_CACHE connection this query. Unlike DuckDB (where
+    // dropping the pinned connection drops its temp tables), the PG connection is
+    // reused across queries, so each shipped table is DROPped by name at query end.
+    static SHIPPED_PG: RefCell<Vec<(SessionId, String, String)>> = RefCell::new(Vec::new());
 }
 
 /// A hard safety backstop on how many rows a single shipped relation may hold.
@@ -141,12 +261,13 @@ fn ship_table_duckdb(
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
 ) -> ExecResult<()> {
+    let key = (current_session(), s.uri.clone());
     PINNED_DUCK.with(|cache| {
         let mut map = cache.borrow_mut();
-        if !map.contains_key(&s.uri) {
-            map.insert(s.uri.clone(), duck_cursor(&s.uri)?);
+        if !map.contains_key(&key) {
+            map.insert(key.clone(), duck_cursor(&s.uri)?);
         }
-        let conn = map.get(&s.uri).unwrap();
+        let conn = map.get(&key).unwrap();
         create_shipped_table(conn, table, &schema, batches)
     })
 }
@@ -162,13 +283,15 @@ fn ship_table_postgres(
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
 ) -> ExecResult<()> {
+    let session = current_session();
+    let key = (session, name.to_string());
     let drop_sql = format!("DROP TABLE IF EXISTS \"{}\"", table.replace('"', "\"\""));
     PG_CACHE.with(|cache| {
         let mut map = cache.borrow_mut();
-        if !map.contains_key(name) {
-            map.insert(name.to_string(), open_pg(s).map_err(ExecError::runtime)?);
+        if !map.contains_key(&key) {
+            map.insert(key.clone(), open_pg(s).map_err(ExecError::runtime)?);
         }
-        let pg = map.get_mut(name).unwrap();
+        let pg = map.get_mut(&key).unwrap();
         exec_update(&mut pg.conn, &drop_sql).map_err(ExecError::runtime)?;
         ingest_temp(&mut pg.conn, table, schema, batches).map_err(ExecError::runtime)?;
         // ANALYZE the freshly-ingested temp table so Postgres plans the island
@@ -178,7 +301,10 @@ fn ship_table_postgres(
         let analyze_sql = format!("ANALYZE \"{}\"", table.replace('"', "\"\""));
         exec_update(&mut pg.conn, &analyze_sql).map_err(ExecError::runtime)
     })?;
-    SHIPPED_PG.with(|s| s.borrow_mut().push((name.to_string(), table.to_string())));
+    SHIPPED_PG.with(|s| {
+        s.borrow_mut()
+            .push((session, name.to_string(), table.to_string()))
+    });
     Ok(())
 }
 
@@ -186,17 +312,29 @@ fn ship_table_postgres(
 /// tables with them), and each Postgres shipped table by name on its pooled
 /// connection. Runs on every query exit path.
 pub fn clear_shipments() {
-    PINNED_DUCK.with(|cache| cache.borrow_mut().clear());
-    drop_shipped_pg();
+    let session = current_session();
+    PINNED_DUCK.with(|cache| cache.borrow_mut().retain(|key, _| key.0 != session));
+    drop_shipped_pg(session);
 }
 
-/// DROP each Postgres shipped table on its pooled connection, then forget them.
-fn drop_shipped_pg() {
-    let shipped: Vec<(String, String)> = SHIPPED_PG.with(|s| s.borrow_mut().drain(..).collect());
+/// DROP each of this session's Postgres shipped tables on its pooled connection,
+/// then forget them (leaving any other session's shipments untouched).
+fn drop_shipped_pg(session: SessionId) {
+    let mut shipped = Vec::new();
+    SHIPPED_PG.with(|s| {
+        s.borrow_mut().retain(|entry| {
+            if entry.0 == session {
+                shipped.push(entry.clone());
+                false
+            } else {
+                true
+            }
+        })
+    });
     PG_CACHE.with(|cache| {
         let mut map = cache.borrow_mut();
-        for (name, table) in shipped {
-            if let Some(pg) = map.get_mut(&name) {
+        for (_session, name, table) in shipped {
+            if let Some(pg) = map.get_mut(&(session, name)) {
                 let drop_sql = format!("DROP TABLE IF EXISTS \"{}\"", table.replace('"', "\"\""));
                 let _ = exec_update(&mut pg.conn, &drop_sql);
             }
@@ -299,7 +437,8 @@ fn parquet_runtime() -> &'static tokio::runtime::Runtime {
 // gives DataFusion's native projection / filter / row-group pushdown - the fair
 // comparison point against DuckDB's read_parquet.
 fn fetch_parquet(s: &DsSpec, sql: &str) -> ExecResult<(SchemaRef, Vec<RecordBatch>)> {
-    let ctx = parquet_ctx(&s.uri).map_err(|e| ExecError::runtime(format!("parquet: {e}")))?;
+    let ctx = parquet_ctx(current_session(), &s.uri)
+        .map_err(|e| ExecError::runtime(format!("parquet: {e}")))?;
     let sql = sql.to_string();
     let result = parquet_runtime().block_on(async move {
         let df = ctx.sql(&sql).await?;
@@ -314,13 +453,13 @@ fn fetch_parquet(s: &DsSpec, sql: &str) -> ExecResult<(SchemaRef, Vec<RecordBatc
 // every file is not repeated per query) and reused - SessionContext is Arc-cheap
 // to clone.
 fn parquet_ctx(
+    session: SessionId,
     dir: &str,
 ) -> Result<datafusion::prelude::SessionContext, datafusion::error::DataFusionError> {
-    static CACHE: OnceLock<Mutex<HashMap<String, datafusion::prelude::SessionContext>>> =
-        OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = parquet_ctx_cache();
+    let key = (session, dir.to_string());
     let mut map = cache.lock().unwrap();
-    if let Some(ctx) = map.get(dir) {
+    if let Some(ctx) = map.get(&key) {
         return Ok(ctx.clone());
     }
     // Collect statistics from Parquet metadata so DataFusion's cost-based join
@@ -333,8 +472,19 @@ fn parquet_ctx(
         crate::engine::runtime_env(),
     );
     parquet_runtime().block_on(register_parquet_dir(&ctx, dir))?;
-    map.insert(dir.to_string(), ctx.clone());
+    map.insert(key, ctx.clone());
     Ok(ctx)
+}
+
+// A DataFusion context per (session, Parquet directory). Session-keyed so a
+// dropped runtime's inferred-schema contexts prune with it and two runtimes over
+// the same directory keep independent contexts.
+fn parquet_ctx_cache(
+) -> &'static Mutex<HashMap<(SessionId, String), datafusion::prelude::SessionContext>> {
+    static CACHE: OnceLock<
+        Mutex<HashMap<(SessionId, String), datafusion::prelude::SessionContext>>,
+    > = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 // Register every `<dir>/<table>.parquet` as `main.<table>` in `ctx`.
@@ -393,10 +543,11 @@ pub struct MaterializedTable {
 // every `register_materialized` call (a DDL registers the full current table
 // set, so replacement is the correct semantics - a dropped view disappears, a
 // refreshed view points at its new chunk list).
-fn materialized_ctx_cache() -> &'static Mutex<HashMap<String, datafusion::prelude::SessionContext>>
-{
-    static CACHE: OnceLock<Mutex<HashMap<String, datafusion::prelude::SessionContext>>> =
-        OnceLock::new();
+fn materialized_ctx_cache(
+) -> &'static Mutex<HashMap<(SessionId, String), datafusion::prelude::SessionContext>> {
+    static CACHE: OnceLock<
+        Mutex<HashMap<(SessionId, String), datafusion::prelude::SessionContext>>,
+    > = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -405,6 +556,7 @@ fn materialized_ctx_cache() -> &'static Mutex<HashMap<String, datafusion::prelud
 /// `main.<table>` over its Arrow IPC chunk files. Called at runtime setup and
 /// after every CREATE / REFRESH / DROP with the catalog's full current list.
 pub fn register_materialized(
+    session: SessionId,
     name: String,
     store_root: String,
     tables: Vec<MaterializedTable>,
@@ -414,8 +566,9 @@ pub fn register_materialized(
     materialized_ctx_cache()
         .lock()
         .unwrap()
-        .insert(name.clone(), ctx);
+        .insert((session, name.clone()), ctx);
     register(
+        session,
         name,
         DsSpec {
             kind: DsKind::Materialized,
@@ -491,7 +644,7 @@ fn fetch_materialized(name: &str, sql: &str) -> ExecResult<(SchemaRef, Vec<Recor
     let ctx = materialized_ctx_cache()
         .lock()
         .unwrap()
-        .get(name)
+        .get(&(current_session(), name.to_string()))
         .cloned()
         .ok_or_else(|| {
             ExecError::runtime(format!(
@@ -527,8 +680,9 @@ fn open_duckdb(path: &str) -> Result<duckdb::Connection, String> {
 /// instance the catalog opened (`seed_duck_connection`) so the whole process
 /// shares a single DuckDB instance per file - no second file open, no lock
 /// fight. A path absent here (tests) falls back to a standalone `open_duckdb`.
-fn duck_base_cache() -> &'static Mutex<HashMap<String, duckdb::Connection>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, duckdb::Connection>>> = OnceLock::new();
+fn duck_base_cache() -> &'static Mutex<HashMap<(SessionId, String), duckdb::Connection>> {
+    static CACHE: OnceLock<Mutex<HashMap<(SessionId, String), duckdb::Connection>>> =
+        OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -536,8 +690,11 @@ fn duck_base_cache() -> &'static Mutex<HashMap<String, duckdb::Connection>> {
 /// process-wide base for `path`, so the exec data plane clones cursors off the
 /// SAME instance instead of opening the file a second time. Called once per
 /// DuckDB datasource at runtime setup.
-pub fn seed_duck_connection(path: String, connection: duckdb::Connection) {
-    duck_base_cache().lock().unwrap().insert(path, connection);
+pub fn seed_duck_connection(session: SessionId, path: String, connection: duckdb::Connection) {
+    duck_base_cache()
+        .lock()
+        .unwrap()
+        .insert((session, path), connection);
 }
 
 // A per-fetch DuckDB cursor over the ONE process-wide instance for this file
@@ -549,12 +706,13 @@ pub fn seed_duck_connection(path: String, connection: duckdb::Connection) {
 // its own cursor, so connection-scoped temp tables stay isolated and drop with
 // the cursor. Mirrors the Postgres pool (PG_CACHE) and the Parquet context cache.
 fn duck_cursor(path: &str) -> ExecResult<duckdb::Connection> {
+    let key = (current_session(), path.to_string());
     let mut map = duck_base_cache().lock().unwrap();
-    if !map.contains_key(path) {
+    if !map.contains_key(&key) {
         let base = open_duckdb(path).map_err(ExecError::runtime)?;
-        map.insert(path.to_string(), base);
+        map.insert(key.clone(), base);
     }
-    map.get(path)
+    map.get(&key)
         .unwrap()
         .try_clone()
         .map_err(|e| ExecError::runtime(format!("duckdb cursor '{path}': {e}")))
@@ -579,9 +737,10 @@ fn fetch_duckdb(s: &DsSpec, sql: &str) -> ExecResult<(SchemaRef, Vec<RecordBatch
     trace_sql(&s.uri, sql);
     // A query that shipped a temp table must keep reading on the pinned
     // connection - temp objects are invisible to other cursors.
+    let key = (current_session(), s.uri.clone());
     let pinned = PINNED_DUCK.with(|cache| {
         let map = cache.borrow();
-        match map.get(&s.uri) {
+        match map.get(&key) {
             Some(conn) => Some(run_duckdb_query(conn, sql)),
             None => None,
         }
@@ -622,9 +781,10 @@ fn run_duckdb_query(
 // rather than shipping a corrupt or truncated batch.
 
 thread_local! {
-    // One live MySQL connection per datasource URL on the query-driving thread
-    // (mirrors the DuckDB cursor cache; the sync client is not Sync).
-    static MYSQL_CACHE: RefCell<HashMap<String, mysql::Conn>> = RefCell::new(HashMap::new());
+    // One live MySQL connection per (session, datasource URL) on the query-driving
+    // thread (mirrors the DuckDB cursor cache; the sync client is not Sync).
+    static MYSQL_CACHE: RefCell<HashMap<(SessionId, String), mysql::Conn>> =
+        RefCell::new(HashMap::new());
 }
 
 /// The Arrow decoder chosen for one MySQL result column.
@@ -845,15 +1005,13 @@ fn decode_mysql_timestamp(
 /// same) so column decoders see every row before a batch is built.
 fn fetch_mysql(s: &DsSpec, sql: &str) -> ExecResult<(SchemaRef, Vec<RecordBatch>)> {
     trace_sql(&s.uri, sql);
+    let key = (current_session(), s.uri.clone());
     MYSQL_CACHE.with(|cache| {
         let mut map = cache.borrow_mut();
-        if !map.contains_key(&s.uri) {
-            map.insert(
-                s.uri.clone(),
-                open_mysql(&s.uri).map_err(ExecError::runtime)?,
-            );
+        if !map.contains_key(&key) {
+            map.insert(key.clone(), open_mysql(&s.uri).map_err(ExecError::runtime)?);
         }
-        let conn = map.get_mut(&s.uri).unwrap();
+        let conn = map.get_mut(&key).unwrap();
         run_mysql_query(conn, sql).map_err(ExecError::runtime)
     })
 }
@@ -929,12 +1087,13 @@ fn open_pg(s: &DsSpec) -> Result<PgConn, String> {
 
 fn fetch_postgres(name: &str, s: &DsSpec, sql: &str) -> ExecResult<(SchemaRef, Vec<RecordBatch>)> {
     trace_sql(name, sql);
+    let key = (current_session(), name.to_string());
     PG_CACHE.with(|cache| {
         let mut map = cache.borrow_mut();
-        if !map.contains_key(name) {
-            map.insert(name.to_string(), open_pg(s).map_err(ExecError::runtime)?);
+        if !map.contains_key(&key) {
+            map.insert(key.clone(), open_pg(s).map_err(ExecError::runtime)?);
         }
-        let pg = map.get_mut(name).unwrap();
+        let pg = map.get_mut(&key).unwrap();
         run_query(&mut pg.conn, sql).map_err(ExecError::runtime)
     })
 }
@@ -1202,22 +1361,32 @@ type QueryResult = Result<(SchemaRef, Vec<RecordBatch>), String>;
 
 /// A partition read for a worker to run. The connection stays on the worker
 /// (ADBC handles are not Send); only the job and its Arrow result cross channels.
+/// `session` keys the worker's connection cache so two runtimes reusing a name
+/// keep separate connections and a dropped runtime's are pruned.
 struct Job {
+    session: SessionId,
     name: String,
     spec: DsSpec,
     sql: String,
     reply: std::sync::mpsc::Sender<QueryResult>,
 }
 
+/// A message to a ctid reader worker: a partition read, or a prune dropping one
+/// session's cached connections on that worker.
+enum ParallelMsg {
+    Run(Job),
+    Prune(SessionId),
+}
+
 /// A fixed pool of long-lived reader threads, each keeping its own connections.
 /// Persisting the threads pools connections across parallel scans, so repeated
 /// reads pay no reconnect cost (the reason a spawn-per-call design was slower).
-fn parallel_pool() -> &'static Vec<std::sync::mpsc::Sender<Job>> {
-    static POOL: OnceLock<Vec<std::sync::mpsc::Sender<Job>>> = OnceLock::new();
+fn parallel_pool() -> &'static Vec<std::sync::mpsc::Sender<ParallelMsg>> {
+    static POOL: OnceLock<Vec<std::sync::mpsc::Sender<ParallelMsg>>> = OnceLock::new();
     POOL.get_or_init(|| {
         let mut senders = Vec::new();
         for _ in 0..PARALLEL_WORKERS {
-            let (tx, rx) = std::sync::mpsc::channel::<Job>();
+            let (tx, rx) = std::sync::mpsc::channel::<ParallelMsg>();
             std::thread::spawn(move || worker_loop(rx));
             senders.push(tx);
         }
@@ -1225,20 +1394,34 @@ fn parallel_pool() -> &'static Vec<std::sync::mpsc::Sender<Job>> {
     })
 }
 
-/// One reader thread: keep a per-datasource connection and serve jobs until the
-/// pool is dropped (process exit).
-fn worker_loop(rx: std::sync::mpsc::Receiver<Job>) {
-    let mut conns: HashMap<String, PgConn> = HashMap::new();
-    while let Ok(job) = rx.recv() {
-        let _ = job.reply.send(run_job(&mut conns, &job));
+/// Drop `session`'s cached connections on every ctid reader worker (the pool
+/// threads stay alive). Sent by `prune_session` as a runtime drops.
+fn prune_parallel_pool(session: SessionId) {
+    for sender in parallel_pool() {
+        let _ = sender.send(ParallelMsg::Prune(session));
     }
 }
 
-fn run_job(conns: &mut HashMap<String, PgConn>, job: &Job) -> QueryResult {
-    if !conns.contains_key(&job.name) {
-        conns.insert(job.name.clone(), open_pg(&job.spec)?);
+/// One reader thread: keep a per-(session, datasource) connection and serve jobs
+/// until the pool is dropped (process exit).
+fn worker_loop(rx: std::sync::mpsc::Receiver<ParallelMsg>) {
+    let mut conns: HashMap<(SessionId, String), PgConn> = HashMap::new();
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            ParallelMsg::Run(job) => {
+                let _ = job.reply.send(run_job(&mut conns, &job));
+            }
+            ParallelMsg::Prune(session) => conns.retain(|key, _| key.0 != session),
+        }
     }
-    let pg = conns.get_mut(&job.name).unwrap();
+}
+
+fn run_job(conns: &mut HashMap<(SessionId, String), PgConn>, job: &Job) -> QueryResult {
+    let key = (job.session, job.name.clone());
+    if !conns.contains_key(&key) {
+        conns.insert(key.clone(), open_pg(&job.spec)?);
+    }
+    let pg = conns.get_mut(&key).unwrap();
     run_query(&mut pg.conn, &job.sql)
 }
 
@@ -1273,6 +1456,7 @@ pub fn fetch_parallel(
         None => String::new(),
     };
 
+    let session = current_session();
     let pool = parallel_pool();
     let mut replies = Vec::new();
     for (i, (lo, hi)) in ctid_ranges(pages, partitions).into_iter().enumerate() {
@@ -1282,13 +1466,14 @@ pub fn fetch_parallel(
         );
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         let job = Job {
+            session,
             name: name.to_string(),
             spec: s.clone(),
             sql,
             reply: reply_tx,
         };
         pool[i % pool.len()]
-            .send(job)
+            .send(ParallelMsg::Run(job))
             .map_err(|_| ExecError::runtime("parallel worker gone"))?;
         replies.push(reply_rx);
     }
@@ -1398,16 +1583,17 @@ fn fetch_temp_join_pg(
     keys_batches: Vec<RecordBatch>,
     join_sql: &str,
 ) -> ExecResult<(SchemaRef, Vec<RecordBatch>)> {
+    let key = (current_session(), name.to_string());
     let drop_sql = format!(
         "DROP TABLE IF EXISTS \"{}\"",
         temp_table.replace('"', "\"\"")
     );
     PG_CACHE.with(|cache| {
         let mut map = cache.borrow_mut();
-        if !map.contains_key(name) {
-            map.insert(name.to_string(), open_pg(s).map_err(ExecError::runtime)?);
+        if !map.contains_key(&key) {
+            map.insert(key.clone(), open_pg(s).map_err(ExecError::runtime)?);
         }
-        let pg = map.get_mut(name).unwrap();
+        let pg = map.get_mut(&key).unwrap();
 
         exec_update(&mut pg.conn, &drop_sql).map_err(ExecError::runtime)?;
         ingest_temp(&mut pg.conn, temp_table, keys_schema, keys_batches)
@@ -1544,11 +1730,13 @@ pub fn column_has_index(
     table: &str,
     column: &str,
 ) -> ExecResult<bool> {
-    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = format!(
-        "{name}\u{1}{}\u{1}{table}\u{1}{column}",
-        schema.unwrap_or("")
+    let cache = index_cache();
+    let key = (
+        current_session(),
+        format!(
+            "{name}\u{1}{}\u{1}{table}\u{1}{column}",
+            schema.unwrap_or("")
+        ),
     );
     if let Some(cached) = cache.lock().unwrap().get(&key) {
         return Ok(*cached);
@@ -1556,6 +1744,13 @@ pub fn column_has_index(
     let indexed = pg_column_indexed(name, schema, table, column)?;
     cache.lock().unwrap().insert(key, indexed);
     Ok(indexed)
+}
+
+// The `column_has_index` result cache, keyed by (session, datasource/schema/
+// table/column). Session-keyed so it prunes with the runtime that populated it.
+fn index_cache() -> &'static Mutex<HashMap<(SessionId, String), bool>> {
+    static CACHE: OnceLock<Mutex<HashMap<(SessionId, String), bool>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// The catalog query behind `column_has_index`: an index on this table whose
@@ -1743,5 +1938,103 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 3);
+    }
+
+    /// Seed an in-memory DuckDB instance holding one BIGINT value under `uri` for
+    /// `session`, and register the datasource `name` pointing at it.
+    fn seed_named_duck(session: SessionId, name: &str, uri: &str, value: i64) {
+        register(
+            session,
+            name.to_string(),
+            DsSpec {
+                kind: DsKind::DuckDb,
+                uri: uri.to_string(),
+                adbc_driver: None,
+            },
+        );
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE t(v BIGINT); INSERT INTO t VALUES ({value})"
+        ))
+        .unwrap();
+        seed_duck_connection(session, uri.to_string(), conn);
+    }
+
+    /// The single BIGINT value the current session reads from `name`.
+    fn read_single_bigint(name: &str) -> i64 {
+        let (_schema, batches) = fetch(name, "SELECT v FROM t").unwrap();
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
+    }
+
+    #[test]
+    fn two_sessions_reusing_a_name_read_their_own_source() {
+        // Two sessions register the SAME datasource name pointing at different
+        // DuckDB instances; the session-keyed registry must give each session
+        // its own source. A name-only registry would let one registration
+        // clobber the other and both sessions would read one source.
+        let s1 = open_session();
+        let s2 = open_session();
+        seed_named_duck(s1, "shared", "bleed_uri_1", 111);
+        seed_named_duck(s2, "shared", "bleed_uri_2", 222);
+
+        let v1 = {
+            let _scope = SessionScope::enter(s1);
+            read_single_bigint("shared")
+        };
+        let v2 = {
+            let _scope = SessionScope::enter(s2);
+            read_single_bigint("shared")
+        };
+        assert_eq!(v1, 111, "session 1 must read its own source");
+        assert_eq!(v2, 222, "session 2 must read its own source");
+
+        prune_session(s1);
+        prune_session(s2);
+    }
+
+    #[test]
+    fn prune_session_drops_every_map_entry_for_it() {
+        // A dropped runtime's state must leave the process-wide maps so its
+        // connections/contexts are released and cannot be read again.
+        let session = open_session();
+        seed_named_duck(session, "d", "prune_uri", 7);
+        let reg_key = (session, "d".to_string());
+        let duck_key = (session, "prune_uri".to_string());
+        assert!(registry().lock().unwrap().contains_key(&reg_key));
+        assert!(duck_base_cache().lock().unwrap().contains_key(&duck_key));
+        assert!(live_sessions().lock().unwrap().contains(&session));
+
+        prune_session(session);
+
+        assert!(!registry().lock().unwrap().contains_key(&reg_key));
+        assert!(!duck_base_cache().lock().unwrap().contains_key(&duck_key));
+        assert!(!live_sessions().lock().unwrap().contains(&session));
+    }
+
+    #[test]
+    fn one_session_prune_leaves_another_running() {
+        // Pruning one session must not touch a concurrently live session's state.
+        let keep = open_session();
+        let drop_it = open_session();
+        seed_named_duck(keep, "src", "keep_uri", 55);
+        seed_named_duck(drop_it, "src", "drop_uri", 99);
+
+        prune_session(drop_it);
+
+        let kept = {
+            let _scope = SessionScope::enter(keep);
+            read_single_bigint("src")
+        };
+        assert_eq!(kept, 55, "the surviving session still reads its source");
+        assert!(!registry()
+            .lock()
+            .unwrap()
+            .contains_key(&(drop_it, "src".to_string())));
+        prune_session(keep);
     }
 }

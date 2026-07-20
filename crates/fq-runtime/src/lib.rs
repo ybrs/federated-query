@@ -45,9 +45,14 @@ pub use error::RuntimeError;
 
 /// One assembled engine session: a shared catalog (metadata + statistics) plus
 /// the config that governs optimization and cost. The fq-exec data plane is a
-/// process-wide registry the constructor populates as a side effect, so it is
-/// not held here.
+/// process-wide registry the constructor populates under this runtime's
+/// `session` id; `Drop` prunes every entry under that id.
 pub struct Runtime {
+    /// This runtime's data-plane session. Every datasource it registers in the
+    /// fq-exec registry, and every connection/context those reads cache, key on
+    /// this id, so two runtimes reusing a datasource name never read each other's
+    /// source. `Drop` prunes every entry under this id.
+    session: connectors::SessionId,
     /// The metadata catalog behind a copy-and-swap: a materialized-view DDL
     /// clones the catalog, applies the change, and swaps the `Arc`, so every
     /// query plans against one consistent snapshot.
@@ -86,9 +91,10 @@ impl Runtime {
     /// and the exec read handle coexist on the same file for the whole session
     /// (DuckDB is single-writer per file per process).
     pub fn from_config(config: &Config) -> Result<Self, RuntimeError> {
+        let session = connectors::open_session();
         let mut catalog = Catalog::new();
         for datasource in config.datasources.values() {
-            register_datasource(&mut catalog, datasource)?;
+            register_datasource(session, &mut catalog, datasource)?;
         }
         // The materialized-view store registers as one more datasource (its
         // views load through the same metadata path) and its chunk tables go
@@ -96,7 +102,7 @@ impl Runtime {
         // every view a previous session created.
         let accelerator = materialized::open_accelerator(config)?;
         if let Some(accel) = &accelerator {
-            materialized::register_store(&mut catalog, accel)?;
+            materialized::register_store(session, &mut catalog, accel)?;
         }
         catalog.load_metadata()?;
         // A change-key declaration naming an unknown table/column, or a
@@ -112,6 +118,7 @@ impl Runtime {
             None,
         ));
         Ok(Self {
+            session,
             catalog: RwLock::new(catalog),
             config: RwLock::new(config.clone()),
             settings_overrides: RwLock::new(BTreeSet::new()),
@@ -120,6 +127,12 @@ impl Runtime {
             accelerator,
             events,
         })
+    }
+
+    /// This runtime's data-plane session id, for a test/tool that reads the
+    /// exec-plane registry directly (it must enter this session first).
+    pub fn exec_session(&self) -> connectors::SessionId {
+        self.session
     }
 
     /// The current catalog snapshot (consistent for the caller's whole plan).
@@ -190,7 +203,7 @@ impl Runtime {
     fn execute_query(&self, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         let (physical, substitutions) = self.plan_inner(sql, true)?;
         let visible_names = output_column_names(&physical);
-        let execution = execute_plan(&physical)?;
+        let execution = execute_plan(self.session, &physical)?;
         // The learned-stats WRITE path: each measured (binding, rows) whose
         // binding carries provenance lands in the stats catalog, AFTER the
         // result is materialized (off the query's critical path). The next
@@ -214,7 +227,7 @@ impl Runtime {
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         let (physical, _no_substitutions) = self.plan_inner(sql, false)?;
         let visible_names = output_column_names(&physical);
-        let execution = execute_plan(&physical)?;
+        let execution = execute_plan(self.session, &physical)?;
         self.persist_observations(&execution.measurements, &execution.observations)?;
         rename_result(&execution.schema, execution.batches, &visible_names)
     }
@@ -423,6 +436,18 @@ impl Runtime {
     }
 }
 
+impl Drop for Runtime {
+    /// Release this runtime's data-plane footprint: prune every registry entry,
+    /// cached context, and pooled connection keyed on its session (the pool
+    /// threads and other live sessions are untouched). Without this, a runtime's
+    /// Postgres connections and DuckDB instances would live for the whole process,
+    /// so building many runtimes (one per corpus module, one per client) would
+    /// exhaust the source's connection limit.
+    fn drop(&mut self) {
+        connectors::prune_session(self.session);
+    }
+}
+
 /// The path of the stats SQLite that lives NEXT TO the config file
 /// (`<config-stem>.stats.sqlite`, one per configuration; it also carries the
 /// materialized-view and event-view registries), or `None` for a
@@ -539,15 +564,16 @@ impl StageLog {
 /// Build one datasource's catalog handle and register it in the fq-exec data
 /// plane, dispatching on the declared `type`.
 fn register_datasource(
+    session: connectors::SessionId,
     catalog: &mut Catalog,
     datasource: &DataSourceConfig,
 ) -> Result<(), RuntimeError> {
     match datasource.ty.as_str() {
-        "duckdb" => register_duckdb(catalog, datasource),
-        "postgres" | "postgresql" => register_postgres(catalog, datasource),
-        "clickhouse" => register_clickhouse(catalog, datasource),
-        "mysql" => register_mysql(catalog, datasource),
-        "parquet" => register_parquet(catalog, datasource),
+        "duckdb" => register_duckdb(session, catalog, datasource),
+        "postgres" | "postgresql" => register_postgres(session, catalog, datasource),
+        "clickhouse" => register_clickhouse(session, catalog, datasource),
+        "mysql" => register_mysql(session, catalog, datasource),
+        "parquet" => register_parquet(session, catalog, datasource),
         other => Err(RuntimeError::Config(format!(
             "datasource '{}' has unsupported type '{other}'",
             datasource.name
@@ -560,6 +586,7 @@ fn register_datasource(
 /// at the same directory. Read-only: the catalog handle does not open the file
 /// data, and the exec plane reads the file bytes through DataFusion at fetch time.
 fn register_parquet(
+    session: connectors::SessionId,
     catalog: &mut Catalog,
     datasource: &DataSourceConfig,
 ) -> Result<(), RuntimeError> {
@@ -567,7 +594,7 @@ fn register_parquet(
     let source = ParquetSource::open(datasource.name.clone(), &dir)?;
     catalog.register_datasource(Arc::new(source));
     let spec = connectors::spec_from_kind("parquet", Some(dir), None)?;
-    connectors::register(datasource.name.clone(), spec);
+    connectors::register(session, datasource.name.clone(), spec);
     Ok(())
 }
 
@@ -593,6 +620,7 @@ fn reject_unknown_keys(
 /// ESTIMATE) plus the exec-plane spec, both from the same endpoint. The endpoint
 /// URI carries `?user=/&password=` auth so the data-plane POST needs no headers.
 fn register_clickhouse(
+    session: connectors::SessionId,
     catalog: &mut Catalog,
     datasource: &DataSourceConfig,
 ) -> Result<(), RuntimeError> {
@@ -618,7 +646,7 @@ fn register_clickhouse(
         Some(clickhouse_endpoint(&base_url, user, password)),
         None,
     )?;
-    connectors::register(datasource.name.clone(), spec);
+    connectors::register(session, datasource.name.clone(), spec);
     Ok(())
 }
 
@@ -626,6 +654,7 @@ fn register_clickhouse(
 /// plus the exec-plane spec, both from the same `mysql://` URL built from the
 /// connection params.
 fn register_mysql(
+    session: connectors::SessionId,
     catalog: &mut Catalog,
     datasource: &DataSourceConfig,
 ) -> Result<(), RuntimeError> {
@@ -639,7 +668,7 @@ fn register_mysql(
     let source = MySqlSource::connect(datasource.name.clone(), &url, mysql_schemas(datasource)?)?;
     catalog.register_datasource(Arc::new(source));
     let spec = connectors::spec_from_kind("mysql", Some(url), None)?;
-    connectors::register(datasource.name.clone(), spec);
+    connectors::register(session, datasource.name.clone(), spec);
     Ok(())
 }
 
@@ -757,21 +786,23 @@ fn clickhouse_schemas(datasource: &DataSourceConfig) -> Result<Vec<String>, Runt
 /// never opens the file a second time. Read-write is required because the engine
 /// ships dim/semi-join temp tables via the DuckDB Appender.
 fn register_duckdb(
+    session: connectors::SessionId,
     catalog: &mut Catalog,
     datasource: &DataSourceConfig,
 ) -> Result<(), RuntimeError> {
     let path = require_str(datasource, "path")?;
     let source = DuckDbSource::open(datasource.name.clone(), &path)?;
-    connectors::seed_duck_connection(path.clone(), source.clone_connection()?);
+    connectors::seed_duck_connection(session, path.clone(), source.clone_connection()?);
     catalog.register_datasource(Arc::new(source));
     let spec = connectors::spec_from_kind("duckdb", Some(path), None)?;
-    connectors::register(datasource.name.clone(), spec);
+    connectors::register(session, datasource.name.clone(), spec);
     Ok(())
 }
 
 /// Register a Postgres source: a libpq catalog handle (metadata/stats) plus the
 /// exec-plane ADBC spec built from the same connection parameters.
 fn register_postgres(
+    session: connectors::SessionId,
     catalog: &mut Catalog,
     datasource: &DataSourceConfig,
 ) -> Result<(), RuntimeError> {
@@ -784,7 +815,7 @@ fn register_postgres(
     let adbc_driver = optional_str(datasource, "adbc_driver");
     let spec =
         connectors::spec_from_kind("postgres", Some(postgres_uri(datasource)?), adbc_driver)?;
-    connectors::register(datasource.name.clone(), spec);
+    connectors::register(session, datasource.name.clone(), spec);
     Ok(())
 }
 

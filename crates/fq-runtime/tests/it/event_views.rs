@@ -136,9 +136,11 @@ impl Sandbox {
         source.execute_batch(sql).expect("extra seed");
     }
 
-    /// Append one event row through the exec plane's shared DuckDB instance
-    /// (the runtime holds the file's single read-write instance).
-    fn insert_event(&self, user: i32, timestamp: &str, name: &str) {
+    /// Append one event row through the exec plane's shared DuckDB instance (the
+    /// runtime holds the file's single read-write instance). The registry is
+    /// session-keyed, so the insert runs inside the runtime's session.
+    fn insert_event(&self, runtime: &Runtime, user: i32, timestamp: &str, name: &str) {
+        let _scope = connectors::SessionScope::enter(runtime.exec_session());
         connectors::fetch(
             &self.datasource,
             &format!("INSERT INTO main.events VALUES ({user}, '{timestamp}', '{name}', 'web')"),
@@ -366,8 +368,8 @@ fn analyses_see_the_last_pull_until_refresh() {
         .expect("create");
 
     // Mutate the SOURCE: u7 signs up and activates within the window.
-    sandbox.insert_event(7, "2026-01-03 10:00:00", "signup");
-    sandbox.insert_event(7, "2026-01-03 11:00:00", "activate");
+    sandbox.insert_event(&runtime, 7, "2026-01-03 10:00:00", "signup");
+    sandbox.insert_event(&runtime, 7, "2026-01-03 11:00:00", "activate");
 
     // The funnel still serves the LAST PULL: nothing on the analysis path
     // checks the source.
@@ -485,12 +487,15 @@ fn a_null_role_value_fails_the_create_and_persists_nothing() {
     let sandbox = Sandbox::new("nullrole");
     let runtime = sandbox.runtime();
     let ds = &sandbox.datasource;
-    sandbox.insert_event(8, "2026-01-01 10:00:00", "signup");
-    connectors::fetch(
-        ds,
-        "INSERT INTO main.events VALUES (8, '2026-01-01 11:00:00', NULL, 'web')",
-    )
-    .expect("insert a null-named event");
+    sandbox.insert_event(&runtime, 8, "2026-01-01 10:00:00", "signup");
+    {
+        let _scope = connectors::SessionScope::enter(runtime.exec_session());
+        connectors::fetch(
+            ds,
+            "INSERT INTO main.events VALUES (8, '2026-01-01 11:00:00', NULL, 'web')",
+        )
+        .expect("insert a null-named event");
+    }
 
     let error = runtime.execute(&create_view_sql(ds)).unwrap_err();
     let text = format!("{error}");
@@ -748,14 +753,17 @@ fn a_declared_tiebreak_orders_equal_timestamps_end_to_end() {
 
     // A refresh re-pulls and re-sorts with the third key: u3 repeats u2's
     // true order and its path joins the count.
-    connectors::fetch(
-        ds,
-        "INSERT INTO seq_events VALUES \
-             (3, '2026-01-02 10:00:00', 'signup', 1), \
-             (3, '2026-01-02 10:00:00', 'browse', 2), \
-             (3, '2026-01-02 11:00:00', 'purchase', 3)",
-    )
-    .expect("insert u3");
+    {
+        let _scope = connectors::SessionScope::enter(runtime.exec_session());
+        connectors::fetch(
+            ds,
+            "INSERT INTO seq_events VALUES \
+                 (3, '2026-01-02 10:00:00', 'signup', 1), \
+                 (3, '2026-01-02 10:00:00', 'browse', 2), \
+                 (3, '2026-01-02 11:00:00', 'purchase', 3)",
+        )
+        .expect("insert u3");
+    }
     let refreshed = runtime
         .execute("REFRESH EVENT VIEW seq_ev")
         .expect("refresh");

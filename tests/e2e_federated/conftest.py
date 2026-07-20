@@ -11,6 +11,7 @@ skip. Otherwise a live connection is required and a failure to connect raises
 loudly rather than silently skipping.
 """
 
+import collections
 import os
 
 import psycopg2
@@ -18,6 +19,58 @@ import pytest
 
 from tests.e2e_federated.cases import all_cases
 from tests.e2e_federated.placements import PLACEMENTS
+
+
+def _max_envs():
+    """Return the environment-cache cap from FEDQ_E2E_MAX_ENVS (default 24)."""
+    raw = os.environ.get("FEDQ_E2E_MAX_ENVS", "24")
+    cap = int(raw)
+    if cap < 1:
+        raise ValueError("FEDQ_E2E_MAX_ENVS must be >= 1, got '" + raw + "'")
+    return cap
+
+
+class EnvCache:
+    """An LRU cache of built environments keyed by (tables, placement name).
+
+    Bounded at ``FEDQ_E2E_MAX_ENVS`` live environments so a single-process run
+    over the whole corpus does not accumulate one engine runtime (and its
+    PostgreSQL connections) per distinct (tables, placement) pair. Evicting an
+    environment closes it, dropping its runtime so the engine's Drop releases the
+    session's connections; a later miss rebuilds it, so eviction is safe.
+    """
+
+    def __init__(self, cap):
+        """Store the cap and the empty ordered item map."""
+        self._cap = cap
+        self._items = collections.OrderedDict()
+
+    def __contains__(self, key):
+        """Whether an environment is cached for ``key``."""
+        return key in self._items
+
+    def __getitem__(self, key):
+        """Return the environment for ``key``, marking it most-recently used."""
+        self._items.move_to_end(key)
+        return self._items[key]
+
+    def __setitem__(self, key, value):
+        """Cache ``value`` for ``key`` and evict the oldest beyond the cap."""
+        self._items[key] = value
+        self._items.move_to_end(key)
+        self._evict_over_cap()
+
+    def _evict_over_cap(self):
+        """Close and drop the least-recently-used environments beyond the cap."""
+        while len(self._items) > self._cap:
+            _key, evicted = self._items.popitem(last=False)
+            evicted.close()
+
+    def close_all(self):
+        """Close every cached environment (end-of-session teardown)."""
+        for environment in self._items.values():
+            environment.close()
+        self._items.clear()
 
 
 class PgState:
@@ -72,8 +125,15 @@ def pg_state():
 
 @pytest.fixture(scope="session")
 def env_registry():
-    """A session cache: (frozenset tables, placement name) -> Environment."""
-    return {}
+    """A session-scoped LRU cache of environments, closed at teardown.
+
+    Bounding the cache (FEDQ_E2E_MAX_ENVS) keeps the number of live engine
+    runtimes - and therefore open PostgreSQL connections - bounded across a
+    single-process run of the whole corpus.
+    """
+    cache = EnvCache(_max_envs())
+    yield cache
+    cache.close_all()
 
 
 @pytest.fixture(scope="session")

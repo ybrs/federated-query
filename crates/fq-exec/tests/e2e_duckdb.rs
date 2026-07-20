@@ -152,14 +152,16 @@ fn runs_projection_filter_limit_and_group_by_on_real_duckdb() {
     };
 
     // Register the same file as the native execution source, under the name the
-    // physical scans carry ("duck").
+    // physical scans carry ("duck"), for a fresh data-plane session.
+    let session = connectors::open_session();
     connectors::register(
+        session,
         "duck".to_string(),
         connectors::spec_from_kind("duckdb", Some(path.clone()), None).expect("spec"),
     );
 
     // Projection + filter + limit: exactly the three lowest regions, in order.
-    let execution = execute_plan(&plan_projection).expect("execute projection");
+    let execution = execute_plan(session, &plan_projection).expect("execute projection");
     let rows = int_string_rows(&execution.batches);
     assert_eq!(
         rows,
@@ -172,7 +174,7 @@ fn runs_projection_filter_limit_and_group_by_on_real_duckdb() {
     );
 
     // GROUP BY: five regions, five nations each (standard TPC-H distribution).
-    let execution = execute_plan(&plan_group_by).expect("execute group by");
+    let execution = execute_plan(session, &plan_group_by).expect("execute group by");
     let rows = int_count_rows(&execution.batches);
     assert_eq!(
         rows,

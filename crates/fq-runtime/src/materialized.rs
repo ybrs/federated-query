@@ -38,9 +38,13 @@ pub fn open_accelerator(config: &fq_common::Config) -> Result<Option<Accelerator
 /// Register the store's current views in a catalog (as the datasource the
 /// binder resolves) and in the exec data plane (the chunk tables DataFusion
 /// reads). Runs at construction and after every DDL.
-pub fn register_store(catalog: &mut Catalog, accel: &Accelerator) -> Result<(), RuntimeError> {
+pub fn register_store(
+    session: connectors::SessionId,
+    catalog: &mut Catalog,
+    accel: &Accelerator,
+) -> Result<(), RuntimeError> {
     let views = accel.views()?;
-    register_data_plane(accel, &views)?;
+    register_data_plane(session, accel, &views)?;
     catalog.register_datasource(Arc::new(MaterializedViewSource::new(
         accel.datasource_name(),
         views,
@@ -48,8 +52,9 @@ pub fn register_store(catalog: &mut Catalog, accel: &Accelerator) -> Result<(), 
     Ok(())
 }
 
-/// Point the exec data plane at the store's current chunk tables.
+/// Point the exec data plane at the store's current chunk tables for `session`.
 fn register_data_plane(
+    session: connectors::SessionId,
     accel: &Accelerator,
     views: &[MaterializedView],
 ) -> Result<(), RuntimeError> {
@@ -61,6 +66,7 @@ fn register_data_plane(
         });
     }
     connectors::register_materialized(
+        session,
         accel.datasource_name().to_string(),
         accel.store_root().to_string_lossy().to_string(),
         tables,
@@ -288,7 +294,7 @@ impl Runtime {
     pub(crate) fn install_views(&self) -> Result<(), RuntimeError> {
         let accel = self.accelerator()?;
         let views = accel.views()?;
-        register_data_plane(accel, &views)?;
+        register_data_plane(self.session, accel, &views)?;
         let mut next = (*self.catalog_snapshot()).clone();
         next.insert_schema(
             accel.datasource_name(),

@@ -689,21 +689,31 @@ enum PrefetchWork {
     },
 }
 
-/// One prefetch job: the work plus its reply channel.
+/// One prefetch job: the work, the session whose sources it reads, and its reply
+/// channel. The worker installs `session` before running so its own source
+/// connections key on it (isolated per runtime, prunable on drop).
 struct PrefetchJob {
+    session: connectors::SessionId,
     work: PrefetchWork,
     reply: std::sync::mpsc::Sender<PrefetchReply>,
+}
+
+/// A message to a prefetch worker: a job to run, or a prune dropping one
+/// session's cached connections on that worker.
+enum StepMsg {
+    Run(PrefetchJob),
+    Prune(connectors::SessionId),
 }
 
 /// The fixed pool of long-lived prefetch workers. Persisting the threads
 /// pools their per-thread source connections across queries, so repeated
 /// prefetches pay no reconnect cost (the same rationale as the ctid pool).
-fn step_pool() -> &'static Vec<std::sync::mpsc::Sender<PrefetchJob>> {
-    static POOL: OnceLock<Vec<std::sync::mpsc::Sender<PrefetchJob>>> = OnceLock::new();
+fn step_pool() -> &'static Vec<std::sync::mpsc::Sender<StepMsg>> {
+    static POOL: OnceLock<Vec<std::sync::mpsc::Sender<StepMsg>>> = OnceLock::new();
     POOL.get_or_init(|| {
         let mut senders = Vec::new();
         for _ in 0..STEP_WORKERS {
-            let (tx, rx) = std::sync::mpsc::channel::<PrefetchJob>();
+            let (tx, rx) = std::sync::mpsc::channel::<StepMsg>();
             std::thread::spawn(move || prefetch_worker_loop(rx));
             senders.push(tx);
         }
@@ -711,17 +721,36 @@ fn step_pool() -> &'static Vec<std::sync::mpsc::Sender<PrefetchJob>> {
     })
 }
 
+/// Drop `session`'s cached source connections on every prefetch worker (the
+/// pool threads stay alive). Called by `connectors::prune_session` as a runtime
+/// drops; the worker clears its own thread-local caches for the session.
+pub fn prune_step_pool(session: connectors::SessionId) {
+    for sender in step_pool() {
+        let _ = sender.send(StepMsg::Prune(session));
+    }
+}
+
 /// One prefetch worker: serve remote reads until process exit. A send
 /// failure means the query abandoned its receiver (an error unwound the step
 /// loop) - the fetch is discarded and the worker moves on.
-fn prefetch_worker_loop(rx: std::sync::mpsc::Receiver<PrefetchJob>) {
-    while let Ok(job) = rx.recv() {
-        let started = std::time::Instant::now();
-        let result = run_prefetch_work(&job.work)
-            .map(|batches| (batches, started.elapsed().as_secs_f64() * 1000.0))
-            .map_err(stringify_error);
-        let _ = job.reply.send(result);
+fn prefetch_worker_loop(rx: std::sync::mpsc::Receiver<StepMsg>) {
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            StepMsg::Run(job) => run_prefetch_job(job),
+            StepMsg::Prune(session) => connectors::prune_thread_local_caches(session),
+        }
     }
+}
+
+/// Run one prefetch job under its session and reply with the batches and the
+/// worker-measured fetch time (or the stringified error).
+fn run_prefetch_job(job: PrefetchJob) {
+    let _scope = connectors::SessionScope::enter(job.session);
+    let started = std::time::Instant::now();
+    let result = run_prefetch_work(&job.work)
+        .map(|batches| (batches, started.elapsed().as_secs_f64() * 1000.0))
+        .map_err(stringify_error);
+    let _ = job.reply.send(result);
 }
 
 /// Execute one prefetch work item on the worker's own connections.
@@ -822,8 +851,15 @@ impl Prefetches {
     fn dispatch(&mut self, index: usize, work: PrefetchWork) {
         let pool = step_pool();
         let (tx, rx) = std::sync::mpsc::channel();
-        let job = PrefetchJob { work, reply: tx };
-        if pool[self.next_worker % pool.len()].send(job).is_ok() {
+        let job = PrefetchJob {
+            session: connectors::current_session(),
+            work,
+            reply: tx,
+        };
+        if pool[self.next_worker % pool.len()]
+            .send(StepMsg::Run(job))
+            .is_ok()
+        {
             self.receivers.insert(index, rx);
         }
         self.next_worker += 1;

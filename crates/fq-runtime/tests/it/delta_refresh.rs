@@ -99,8 +99,11 @@ impl Sandbox {
     }
 
     /// Run a mutation through the exec plane's shared DuckDB instance (the
-    /// runtime holds the file's single read-write instance).
-    fn mutate(&self, sql: &str) {
+    /// runtime holds the file's single read-write instance). The datasource
+    /// registry is session-keyed, so the mutation runs inside the runtime's
+    /// session to reach the same instance the runtime reads.
+    fn mutate(&self, runtime: &Runtime, sql: &str) {
+        let _scope = connectors::SessionScope::enter(runtime.exec_session());
         connectors::fetch(&self.datasource, sql).expect("mutate source");
     }
 
@@ -182,8 +185,14 @@ fn append_delta_pulls_only_new_rows_and_keeps_old_chunks() {
     assert_eq!(state.watermark, Some(fq_accel::Watermark::Int(3)));
     assert!(!created.source_tokens.is_empty());
 
-    sandbox.mutate("INSERT INTO main.events VALUES (4, TIMESTAMP '2026-01-04 11:00:00', 'delta')");
-    sandbox.mutate("INSERT INTO main.events VALUES (5, TIMESTAMP '2026-01-05 12:00:00', 'edges')");
+    sandbox.mutate(
+        &runtime,
+        "INSERT INTO main.events VALUES (4, TIMESTAMP '2026-01-04 11:00:00', 'delta')",
+    );
+    sandbox.mutate(
+        &runtime,
+        "INSERT INTO main.events VALUES (5, TIMESTAMP '2026-01-05 12:00:00', 'edges')",
+    );
 
     let refreshed = runtime
         .execute("REFRESH MATERIALIZED VIEW ev")
@@ -234,7 +243,10 @@ fn timestamp_watermarks_append_through_the_engine() {
         .execute(&format!("CREATE MATERIALIZED VIEW recent AS {select}"))
         .expect("create");
 
-    sandbox.mutate("INSERT INTO main.events VALUES (9, TIMESTAMP '2026-02-01 07:15:30', 'later')");
+    sandbox.mutate(
+        &runtime,
+        "INSERT INTO main.events VALUES (9, TIMESTAMP '2026-02-01 07:15:30', 'later')",
+    );
     let refreshed = runtime
         .execute("REFRESH MATERIALIZED VIEW recent")
         .expect("refresh");
@@ -272,7 +284,10 @@ fn unchanged_source_tokens_make_refresh_a_no_op_that_writes_nothing() {
 
     // A real change moves the token; the next refresh pulls, and the one
     // after that no-ops again on the tokens the pull stored.
-    sandbox.mutate("INSERT INTO main.events VALUES (4, TIMESTAMP '2026-01-04 11:00:00', 'delta')");
+    sandbox.mutate(
+        &runtime,
+        "INSERT INTO main.events VALUES (4, TIMESTAMP '2026-01-04 11:00:00', 'delta')",
+    );
     let pulled = runtime
         .execute("REFRESH MATERIALIZED VIEW ev")
         .expect("refresh after change");
@@ -308,9 +323,12 @@ fn primary_key_merge_rewrites_only_affected_chunks() {
     assert_eq!(created.change_key, None);
 
     // Update one row, delete one, insert one.
-    sandbox.mutate("UPDATE main.customers SET c_name = 'ADA' WHERE c_id = 1");
-    sandbox.mutate("DELETE FROM main.customers WHERE c_id = 2");
-    sandbox.mutate("INSERT INTO main.customers VALUES (4, 'dan')");
+    sandbox.mutate(
+        &runtime,
+        "UPDATE main.customers SET c_name = 'ADA' WHERE c_id = 1",
+    );
+    sandbox.mutate(&runtime, "DELETE FROM main.customers WHERE c_id = 2");
+    sandbox.mutate(&runtime, "INSERT INTO main.customers VALUES (4, 'dan')");
 
     let refreshed = runtime
         .execute("REFRESH MATERIALIZED VIEW cust")
@@ -369,8 +387,11 @@ fn a_non_admissible_view_falls_back_to_whole_re_pull_and_says_why() {
     runtime
         .execute(&format!("CREATE MATERIALIZED VIEW joined AS {select}"))
         .expect("create");
-    sandbox.mutate("INSERT INTO main.customers VALUES (4, 'dan')");
-    sandbox.mutate("INSERT INTO main.events VALUES (4, TIMESTAMP '2026-01-04 11:00:00', 'delta')");
+    sandbox.mutate(&runtime, "INSERT INTO main.customers VALUES (4, 'dan')");
+    sandbox.mutate(
+        &runtime,
+        "INSERT INTO main.events VALUES (4, TIMESTAMP '2026-01-04 11:00:00', 'delta')",
+    );
 
     let refreshed = runtime
         .execute("REFRESH MATERIALIZED VIEW joined")
@@ -398,7 +419,10 @@ fn a_projection_that_drops_the_change_key_falls_back_and_says_why() {
     runtime
         .execute(&format!("CREATE MATERIALIZED VIEW hidden AS {dropped}"))
         .expect("create hidden");
-    sandbox.mutate("INSERT INTO main.events VALUES (4, TIMESTAMP '2026-01-04 11:00:00', 'delta')");
+    sandbox.mutate(
+        &runtime,
+        "INSERT INTO main.events VALUES (4, TIMESTAMP '2026-01-04 11:00:00', 'delta')",
+    );
 
     let refreshed = runtime
         .execute("REFRESH MATERIALIZED VIEW hidden")
@@ -441,7 +465,10 @@ fn a_change_key_declared_after_creation_still_deltas_via_the_stored_chunks() {
         },
     );
     let runtime = sandbox.runtime();
-    sandbox.mutate("INSERT INTO main.events VALUES (4, TIMESTAMP '2026-01-04 11:00:00', 'delta')");
+    sandbox.mutate(
+        &runtime,
+        "INSERT INTO main.events VALUES (4, TIMESTAMP '2026-01-04 11:00:00', 'delta')",
+    );
     let refreshed = runtime
         .execute("REFRESH MATERIALIZED VIEW ev")
         .expect("refresh");

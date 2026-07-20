@@ -95,7 +95,8 @@ impl Sandbox {
     /// Append one region row through the exec plane's shared DuckDB instance
     /// (the runtime holds the file's single read-write instance, so a second
     /// standalone open would fight its lock).
-    fn insert_region(&self, key: i32, name: &str) {
+    fn insert_region(&self, runtime: &Runtime, key: i32, name: &str) {
+        let _scope = connectors::SessionScope::enter(runtime.exec_session());
         connectors::fetch(
             &self.datasource,
             &format!("INSERT INTO main.region VALUES ({key}, '{name}')"),
@@ -192,7 +193,7 @@ fn serving_trusts_the_last_pull_until_refresh() {
         .expect("create");
 
     // Mutate the SOURCE: a new row that matches the view's filter.
-    sandbox.insert_region(2, "ATLANTIS");
+    sandbox.insert_region(&runtime, 2, "ATLANTIS");
 
     // The view still serves the LAST PULL (three rows) while a direct query
     // sees four: nothing on the query path checks the source.

@@ -37,10 +37,21 @@ pub struct PlanExecution {
     pub observations: BTreeMap<String, steps::Observation>,
 }
 
-/// Plan a physical tree into steps, lower them to `core::ir`, and run the engine.
-/// The whole Rust pipeline (parse -> ... -> plan feeds this) terminates here in an
-/// Arrow result plus the per-step measured-row observations and their provenance.
-pub fn execute_plan(plan: &PhysicalPlan) -> ExecResult<PlanExecution> {
+/// Plan a physical tree into steps, lower them to `core::ir`, and run the engine
+/// for one session. The whole Rust pipeline (parse -> ... -> plan feeds this)
+/// terminates here in an Arrow result plus the per-step measured-row observations
+/// and their provenance.
+///
+/// `session` names the runtime whose datasources the reads resolve to. It is
+/// installed on this (driving) thread for the whole execution, so every
+/// registry/connection lookup keys on it, and every stale session's pooled
+/// connections on this thread are reaped first.
+pub fn execute_plan(
+    session: crate::connectors::SessionId,
+    plan: &PhysicalPlan,
+) -> ExecResult<PlanExecution> {
+    let _scope = crate::connectors::SessionScope::enter(session);
+    crate::connectors::reap_dead_sessions();
     let mut built = build_steps(plan).map_err(|error| ExecError::runtime(error.to_string()))?;
     let observations = std::mem::take(&mut built.observations);
     // The result column names come from the plan root (the top projection/scan

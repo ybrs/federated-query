@@ -20,24 +20,21 @@ skips appear in the pytest output.
 
 `FEDQ_E2E_CORPUS` selects which corpus modules are collected (comma-separated
 keys of `cases.CORPUS_MODULES`, e.g. `FEDQ_E2E_CORPUS=sanity,corpus_joins`);
-unset collects all of them.
+unset collects all of them. A single command over all modules runs in one
+process and is the normal way to run the suite.
 
-The reliable full pass is ONE PROCESS PER MODULE, run sequentially:
+The engine's connector registry keys every datasource on the runtime's session,
+and a runtime releases its PostgreSQL connections when it drops. The environment
+cache is a bounded LRU (`FEDQ_E2E_MAX_ENVS`, default 24): once more than that
+many `(tables, placement)` environments are live, the least-recently-used one is
+closed, dropping its runtime and freeing that session's connections; the cache is
+also emptied at session teardown. So a full single-process run holds at most
+`FEDQ_E2E_MAX_ENVS` runtimes at once and stays well under the server's connection
+ceiling. Lower `FEDQ_E2E_MAX_ENVS` to bound connections harder (more reseeding);
+raise it to keep more environments warm.
 
-```bash
-for m in sanity corpus_joins corpus_edges corpus_subqueries \
-         corpus_aggregates corpus_setops_ctes corpus_windows_expressions; do
-  FEDQ_E2E_CORPUS=$m /workspace/venv-fedq/bin/python -m pytest tests/e2e_federated -q
-done
-```
-
-A single all-modules process accumulates every environment's PostgreSQL
-connections for the process lifetime (the engine's connector registry is
-process-global and name-keyed, so the suite must mint unique datasource names
-per environment, which defeats connection reuse and prevents release) and
-fails late pg placements with `catalog error: datasource error: db error`
-once the server's connection ceiling is hit. Per-module processes release
-connections at exit and stay comfortably under it.
+Running one module at a time is still supported (`FEDQ_E2E_CORPUS=<module>`), for
+narrowing a failure to a single corpus.
 
 Each corpus module may carry a `SUSPECTED_ENGINE_BUGS` list: verified
 engine-vs-oracle mismatches parked out of `CASES` so the suite stays green,
@@ -95,16 +92,23 @@ than slots yields fewer distinct sources.
 DuckDB slots seed a temp `.duckdb` file. Parquet slots export each table to
 `<dir>/<table>.parquet` (exposed under schema `main`). PostgreSQL slots seed a
 uniquely named `fed_*` schema in the shared test database. Datasource names and
-PostgreSQL schema names both carry a per-environment hash, because the engine's
-exec-plane connector registry is process-global and keyed by datasource name; a
-reused name would let two environments collide.
+PostgreSQL schema names both carry a per-environment hash. The schema hash is
+required: the PostgreSQL database is genuinely shared across environments, so two
+environments' schemas must not collide. The datasource-name hash keeps names
+distinct as well; the engine's connector registry is session-keyed (each runtime
+reads only its own datasources), so name reuse across environments would be safe,
+but distinct names keep the config and any cross-environment debugging clear.
 
 ## Caching
 
-Seeded environments and their runtimes are cached at session scope keyed by
-(frozenset-of-tables, placement name), and oracles by frozenset-of-tables. Cases
-that share a table set and placement reuse one seeded environment and one runtime,
-so the whole corpus runs in a few seconds.
+Seeded environments and their runtimes are cached at session scope in a bounded
+LRU (`FEDQ_E2E_MAX_ENVS`, default 24) keyed by (frozenset-of-tables, placement
+name); oracles are cached by frozenset-of-tables. Cases that share a table set
+and placement reuse one seeded environment and one runtime. When the live
+environment count exceeds the cap, the least-recently-used environment is closed
+(its runtime dropped, releasing that session's PostgreSQL connections) and
+rebuilt on the next miss, so a whole-corpus single-process run stays bounded in
+open connections.
 
 ## Adding a case
 
