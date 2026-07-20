@@ -24,6 +24,12 @@ pub struct Catalog {
     datasources: BTreeMap<String, Arc<dyn DataSource>>,
     // Keyed by (datasource, schema_name), matching the Python tuple key.
     schemas: BTreeMap<(String, String), Schema>,
+    // Datasources that failed to connect/load at construction, mapped to the
+    // real connector error. Not registered as sources (nothing resolves them
+    // silently), but a QUALIFIED reference to one raises the stored error naming
+    // it, so a transient outage of a persisted source defers its raise to the
+    // reference instead of aborting the whole runtime.
+    unavailable: BTreeMap<String, String>,
     metadata_loaded: bool,
 }
 
@@ -42,6 +48,49 @@ impl Catalog {
     /// Get a data source by name.
     pub fn get_datasource(&self, name: &str) -> Option<Arc<dyn DataSource>> {
         self.datasources.get(name).cloned()
+    }
+
+    /// Remove a data source and every schema it owns (a `DROP DATASOURCE` swap).
+    /// Also clears any unavailable mark for the name. A missing name is a no-op.
+    pub fn remove_datasource(&mut self, name: &str) {
+        self.datasources.remove(name);
+        self.schemas.retain(|(ds, _), _| ds != name);
+        self.unavailable.remove(name);
+    }
+
+    /// Mark a datasource UNAVAILABLE, capturing the real connector error. The
+    /// source is not registered, so nothing resolves it, but a qualified
+    /// reference to it raises `error` naming the source.
+    pub fn mark_unavailable(&mut self, name: impl Into<String>, error: impl Into<String>) {
+        self.unavailable.insert(name.into(), error.into());
+    }
+
+    /// The stored connector error for an unavailable datasource, or None. The
+    /// binder raises this when a reference names an unavailable source.
+    pub fn unavailable_error(&self, name: &str) -> Option<&str> {
+        for (candidate, error) in &self.unavailable {
+            if candidate.eq_ignore_ascii_case(name) {
+                return Some(error);
+            }
+        }
+        None
+    }
+
+    /// Copy the datasource handle named `name` and every schema it owns from
+    /// `other` into this catalog (the install half of a `CREATE DATASOURCE`
+    /// swap, after the source was validated in an isolated probe catalog).
+    pub fn take_datasource_from(&mut self, other: &Catalog, name: &str) {
+        if let Some(source) = other.datasources.get(name) {
+            self.datasources
+                .insert(name.to_string(), Arc::clone(source));
+        }
+        for ((ds_name, schema_name), schema) in &other.schemas {
+            if ds_name == name {
+                self.schemas
+                    .insert((ds_name.clone(), schema_name.clone()), schema.clone());
+            }
+        }
+        self.unavailable.remove(name);
     }
 
     /// Insert a schema under (datasource, schema_name). This is the direct

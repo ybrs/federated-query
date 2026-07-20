@@ -445,6 +445,30 @@ impl Accelerator {
         self.catalog.purge(name)
     }
 
+    /// Persist a dynamic datasource; returns whether this call inserted it
+    /// (false = a concurrent create of the same name won).
+    pub fn insert_datasource(&self, ds: &crate::DynamicDatasource) -> Result<bool, AccelError> {
+        self.catalog.insert_datasource(ds)
+    }
+
+    /// The persisted dynamic datasource named `name`, or None.
+    pub fn get_datasource(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::DynamicDatasource>, AccelError> {
+        self.catalog.get_datasource(name)
+    }
+
+    /// Every persisted dynamic datasource, ordered by name.
+    pub fn list_datasources(&self) -> Result<Vec<crate::DynamicDatasource>, AccelError> {
+        self.catalog.list_datasources()
+    }
+
+    /// Remove a persisted dynamic datasource; returns whether a row was removed.
+    pub fn delete_datasource(&self, name: &str) -> Result<bool, AccelError> {
+        self.catalog.delete_datasource(name)
+    }
+
     /// Finish every drop a crash interrupted: a tombstoned row's files are
     /// removed and the row purged.
     fn sweep_tombstones(&self) -> Result<(), AccelError> {

@@ -140,6 +140,7 @@ fn cross_config(duck_path: &str, adbc_driver: &str) -> Config {
         cost: CostConfig::default(),
         server: ServerConfig::default(),
         accelerator: fq_common::AcceleratorConfig::default(),
+        catalog: fq_common::CatalogConfig::default(),
         source_path: None,
     }
 }

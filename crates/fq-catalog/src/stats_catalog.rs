@@ -379,6 +379,34 @@ impl StatsCatalog {
         Ok(())
     }
 
+    /// Purge every learned row keyed on `datasource`: its `table_stats`,
+    /// `predicate_stats`, and `source_identity` rows, and the `group_stats` rows
+    /// whose subject is one of its tables (`datasource.schema.table`).
+    /// Subplan-signature subjects carry no datasource prefix and are left to
+    /// self-heal. Run on `DROP DATASOURCE` so a later create reusing the name
+    /// (pointing elsewhere) does not inherit the old source's measurements.
+    pub fn purge_datasource(&self, datasource: &str) -> Result<(), StatsError> {
+        let conn = self.conn.lock().expect("stats catalog lock poisoned");
+        conn.execute(
+            "DELETE FROM table_stats WHERE datasource = ?1",
+            params![datasource],
+        )?;
+        conn.execute(
+            "DELETE FROM predicate_stats WHERE datasource = ?1",
+            params![datasource],
+        )?;
+        conn.execute(
+            "DELETE FROM source_identity WHERE datasource = ?1",
+            params![datasource],
+        )?;
+        let prefix = format!("{}.", like_escape(datasource));
+        conn.execute(
+            "DELETE FROM group_stats WHERE subject = ?1 OR subject LIKE ?2 ESCAPE '\\'",
+            params![datasource, format!("{prefix}%")],
+        )?;
+        Ok(())
+    }
+
     // --- read path (warm the planner; TTL falls through to source stats) -------
 
     /// The learned base row count, or None when absent or older than the TTL.
@@ -543,6 +571,20 @@ impl StatsCatalog {
         };
         (now_dt - observed_dt).num_seconds() > max_age
     }
+}
+
+/// Escape the LIKE wildcards (`%`, `_`) and the escape char itself in a literal
+/// so a datasource name containing one is matched as an exact prefix, not a
+/// pattern (paired with `ESCAPE '\'`).
+fn like_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// output/input as a fraction, or None when the input row count is unknown or

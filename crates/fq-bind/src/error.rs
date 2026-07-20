@@ -37,4 +37,10 @@ pub enum BindError {
     /// A construct the binder does not handle; binding it raises.
     #[error("cannot bind: {0}")]
     Unsupported(String),
+
+    /// A reference to a datasource that failed to connect/load at construction:
+    /// carries the real connector error naming the source, deferred here so an
+    /// unreferenced unavailable source blocks nothing.
+    #[error("datasource '{name}' is unavailable: {error}")]
+    DatasourceUnavailable { name: String, error: String },
 }

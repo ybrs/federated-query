@@ -79,6 +79,7 @@ fn shop_config(path: &str, server: ServerConfig) -> Config {
         cost: CostConfig::default(),
         server,
         accelerator: fq_common::AcceleratorConfig::default(),
+        catalog: fq_common::CatalogConfig::default(),
         source_path: None,
     }
 }

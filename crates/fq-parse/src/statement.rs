@@ -85,6 +85,19 @@ pub enum Statement<'a> {
     Segment(SegmentSpec),
     /// `PATHS OVER <view> [STARTING AT '<name>'] MAX DEPTH <n> TOP <k>`.
     Paths(PathsSpec),
+    /// `CREATE DATASOURCE <name> TYPE <kind> WITH ( key = 'value', ... )`: the
+    /// datasource name, its connector kind, and the ordered connection params.
+    /// Values are strings (a bare integer is accepted for numeric params); the
+    /// runtime validates them against the per-kind param allowlist.
+    CreateDatasource {
+        name: String,
+        kind: String,
+        params: Vec<(String, String)>,
+    },
+    /// `DROP DATASOURCE <name>`.
+    DropDatasource { name: String },
+    /// `SHOW DATASOURCES`: list every bootstrap and dynamic datasource.
+    ShowDatasources,
 }
 
 /// Classify one SQL statement. Materialized-view DDL is recognized by its
@@ -107,10 +120,29 @@ pub fn classify_statement(sql: &str) -> Result<Statement<'_>, ParseError> {
         "CREATE" if second_word_is(sql, "EVENT") => {
             crate::event_statement::classify_create_event(&mut tokens)
         }
+        "CREATE" if second_word_is(sql, "DATASOURCE") => classify_create_datasource(&mut tokens),
+        // `CREATE OR REPLACE DATASOURCE` has `OR` as its second word, so it does
+        // not match the arm above; route it here to raise (OR REPLACE would
+        // silently repoint a live name).
+        "CREATE" if create_or_replace_datasource(sql) => Err(ParseError::Unsupported(
+            "CREATE OR REPLACE DATASOURCE: a replace silently repoints a live name \
+             while other sessions may hold the old source; use DROP DATASOURCE then \
+             CREATE DATASOURCE"
+                .to_string(),
+        )),
         "DROP" if second_word_is(sql, "MATERIALIZED") => classify_drop(&mut tokens),
         "DROP" if second_word_is(sql, "EVENT") => {
             crate::event_statement::classify_drop_event(&mut tokens)
         }
+        "DROP" if second_word_is(sql, "DATASOURCE") => classify_drop_datasource(&mut tokens),
+        // ALTER exists in the engine only as a rejected datasource form: an
+        // in-place repoint with partial-failure semantics has no atomic
+        // validate-then-persist, so a change is DROP + CREATE.
+        "ALTER" if second_word_is(sql, "DATASOURCE") => Err(ParseError::Unsupported(
+            "ALTER DATASOURCE: an in-place repoint has no atomic validate-then-persist \
+             step; change a datasource with DROP DATASOURCE then CREATE DATASOURCE"
+                .to_string(),
+        )),
         "FUNNEL" => crate::event_statement::classify_funnel(&mut tokens),
         "SEGMENT" => crate::event_statement::classify_segment(&mut tokens),
         "PATHS" => crate::event_statement::classify_paths(&mut tokens),
@@ -120,6 +152,7 @@ pub fn classify_statement(sql: &str) -> Result<Statement<'_>, ParseError> {
             classify_show(&mut tokens)
         }
         "SHOW" if second_word_is(sql, "MATERIALIZED") => classify_show_materialized(&mut tokens),
+        "SHOW" if second_word_is(sql, "DATASOURCES") => classify_show_datasources(&mut tokens),
         // The engine has no SET/RESET beyond the settings surface, so every one
         // is ours (an unknown name then raises loudly at the runtime).
         "SET" => classify_set(sql, &mut tokens),
@@ -151,6 +184,192 @@ fn classify_show_materialized<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statemen
     tokens.expect_keyword("VIEWS")?;
     expect_end(tokens, "SHOW MATERIALIZED VIEWS")?;
     Ok(Statement::ShowMaterializedViews)
+}
+
+/// The connector kinds a `CREATE DATASOURCE` may name, the same set the runtime
+/// dispatches on. An unknown kind raises at classify.
+const DATASOURCE_KINDS: [&str; 6] = [
+    "duckdb",
+    "postgres",
+    "postgresql",
+    "clickhouse",
+    "mysql",
+    "parquet",
+];
+
+/// Whether the statement is `CREATE OR REPLACE DATASOURCE ...` (words two, three,
+/// four are `OR REPLACE DATASOURCE`), so it can be rejected rather than falling
+/// through to the normal parser as an unrecognized query.
+fn create_or_replace_datasource(sql: &str) -> bool {
+    let mut tokens = Tokenizer::new(sql);
+    tokens.next_token();
+    for expected in ["OR", "REPLACE", "DATASOURCE"] {
+        match tokens.peek_word() {
+            Some(word) if word.eq_ignore_ascii_case(expected) => {
+                tokens.next_token();
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Parse `CREATE DATASOURCE <name> TYPE <kind> WITH ( key = 'value', ... )`,
+/// raising on IF NOT EXISTS and on an unknown connector kind.
+fn classify_create_datasource<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("CREATE")?;
+    tokens.expect_keyword("DATASOURCE")?;
+    if tokens.peek_word_is("IF") {
+        return Err(ParseError::Unsupported(
+            "CREATE DATASOURCE IF NOT EXISTS: a create that silently does nothing \
+             hides a name collision; create without IF NOT EXISTS"
+                .to_string(),
+        ));
+    }
+    let name = view_name(tokens, "datasource")?;
+    tokens.expect_keyword("TYPE")?;
+    let kind = datasource_kind(tokens)?;
+    tokens.expect_keyword("WITH")?;
+    let params = parse_with_params(tokens)?;
+    expect_end(tokens, "CREATE DATASOURCE")?;
+    Ok(Statement::CreateDatasource { name, kind, params })
+}
+
+/// Read the connector kind after `TYPE`: one bare word, lowercased, checked
+/// against the supported set. An unknown kind raises naming it.
+fn datasource_kind(tokens: &mut Tokenizer<'_>) -> Result<String, ParseError> {
+    let kind = match tokens.next_token() {
+        Some(Token::Word(word)) => word.to_lowercase(),
+        Some(token) => {
+            return Err(ParseError::Parse(format!(
+                "expected a datasource kind after TYPE, found '{}'",
+                token.describe()
+            )))
+        }
+        None => {
+            return Err(ParseError::Parse(
+                "expected a datasource kind after TYPE".to_string(),
+            ))
+        }
+    };
+    if DATASOURCE_KINDS.contains(&kind.as_str()) {
+        return Ok(kind);
+    }
+    Err(ParseError::Unsupported(format!(
+        "datasource kind '{kind}' is not supported; use one of duckdb, postgres, \
+         clickhouse, mysql, parquet"
+    )))
+}
+
+/// Parse the `( key = 'value' [, key = 'value'] )` connection-param list. Keys
+/// are bare words, lowercased; a duplicate key raises. Values are string
+/// literals or a bare word (a bare integer for a numeric param). An empty list
+/// `( )` is accepted; each kind's required params are checked at validation.
+fn parse_with_params(tokens: &mut Tokenizer<'_>) -> Result<Vec<(String, String)>, ParseError> {
+    expect_char(tokens, '(', "WITH (")?;
+    let mut params: Vec<(String, String)> = Vec::new();
+    if consume_char(tokens, ')') {
+        return Ok(params);
+    }
+    loop {
+        let (key, value) = parse_one_param(tokens)?;
+        if params.iter().any(|(existing, _)| existing == &key) {
+            return Err(ParseError::Parse(format!(
+                "WITH parameter '{key}' is set more than once"
+            )));
+        }
+        params.push((key, value));
+        if consume_char(tokens, ')') {
+            return Ok(params);
+        }
+        expect_char(tokens, ',', "WITH parameter list")?;
+    }
+}
+
+/// Parse one `key = value` connection-param entry.
+fn parse_one_param(tokens: &mut Tokenizer<'_>) -> Result<(String, String), ParseError> {
+    let key = match tokens.next_token() {
+        Some(Token::Word(word)) => word.to_lowercase(),
+        Some(token) => {
+            return Err(ParseError::Parse(format!(
+                "expected a WITH parameter name, found '{}'",
+                token.describe()
+            )))
+        }
+        None => {
+            return Err(ParseError::Parse(
+                "expected a WITH parameter name".to_string(),
+            ))
+        }
+    };
+    expect_char(tokens, '=', "WITH parameter")?;
+    let value = match tokens.next_token() {
+        Some(Token::StringLiteral(text)) => text,
+        Some(Token::Word(word)) => word.to_string(),
+        Some(token) => {
+            return Err(ParseError::Parse(format!(
+                "expected a value for WITH parameter '{key}', found '{}'",
+                token.describe()
+            )))
+        }
+        None => {
+            return Err(ParseError::Parse(format!(
+                "expected a value for WITH parameter '{key}'"
+            )))
+        }
+    };
+    Ok((key, value))
+}
+
+/// Consume the next token, requiring it to be the single character `ch`.
+fn expect_char(tokens: &mut Tokenizer<'_>, ch: char, form: &str) -> Result<(), ParseError> {
+    match tokens.next_token() {
+        Some(Token::Other(found)) if found == ch => Ok(()),
+        Some(token) => Err(ParseError::Parse(format!(
+            "expected '{ch}' in {form}, found '{}'",
+            token.describe()
+        ))),
+        None => Err(ParseError::Parse(format!(
+            "expected '{ch}' in {form}, found end of statement"
+        ))),
+    }
+}
+
+/// Consume the next token if it is the single character `ch`, returning whether
+/// it was consumed.
+fn consume_char(tokens: &mut Tokenizer<'_>, ch: char) -> bool {
+    if matches!(tokens.peek(), Some(Token::Other(found)) if found == ch) {
+        tokens.next_token();
+        return true;
+    }
+    false
+}
+
+/// Parse `DROP DATASOURCE <name>`, raising on IF EXISTS (a drop that silently
+/// does nothing hides a typo'd name) and on any trailing token (CASCADE /
+/// RESTRICT, a second name).
+fn classify_drop_datasource<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("DROP")?;
+    tokens.expect_keyword("DATASOURCE")?;
+    if tokens.peek_word_is("IF") {
+        return Err(ParseError::Unsupported(
+            "DROP DATASOURCE IF EXISTS: a drop that silently does nothing hides a \
+             typo'd datasource name; drop without IF EXISTS"
+                .to_string(),
+        ));
+    }
+    let name = view_name(tokens, "datasource")?;
+    expect_end(tokens, "DROP DATASOURCE")?;
+    Ok(Statement::DropDatasource { name })
+}
+
+/// Parse `SHOW DATASOURCES`. A trailing token raises rather than being silently
+/// accepted.
+fn classify_show_datasources<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("SHOW")?;
+    tokens.expect_keyword("DATASOURCES")?;
+    expect_end(tokens, "SHOW DATASOURCES")?;
+    Ok(Statement::ShowDatasources)
 }
 
 /// Parse `SET <name> = <value>` / `SET <name> TO <value>`. The name is a dotted
@@ -395,7 +614,7 @@ pub(crate) fn expect_end(tokens: &mut Tokenizer<'_>, form: &str) -> Result<(), P
     match tokens.next_token() {
         None => Ok(()),
         Some(token) => Err(ParseError::Unsupported(format!(
-            "{form} takes a bare view name; unexpected trailing '{}'",
+            "{form} takes no further tokens; unexpected trailing '{}'",
             token.describe()
         ))),
     }
@@ -858,6 +1077,137 @@ mod tests {
     #[test]
     fn reset_with_trailing_token_raises() {
         let error = classify_statement("RESET optimizer.ship_local_floor now").unwrap_err();
+        assert!(matches!(error, ParseError::Unsupported(_)));
+    }
+
+    #[test]
+    fn create_datasource_extracts_name_kind_and_params() {
+        let statement = classify(
+            "CREATE DATASOURCE sales TYPE postgres WITH (host = 'pg1', port = 5432, \
+             schemas = 'public,inventory')",
+        );
+        assert_eq!(
+            statement,
+            Statement::CreateDatasource {
+                name: "sales".to_string(),
+                kind: "postgres".to_string(),
+                params: vec![
+                    ("host".to_string(), "pg1".to_string()),
+                    ("port".to_string(), "5432".to_string()),
+                    ("schemas".to_string(), "public,inventory".to_string()),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn create_datasource_lowercases_name_and_keys() {
+        let statement = classify("CREATE DATASOURCE Sales TYPE DuckDB WITH (PATH = '/tmp/a.db')");
+        assert_eq!(
+            statement,
+            Statement::CreateDatasource {
+                name: "sales".to_string(),
+                kind: "duckdb".to_string(),
+                params: vec![("path".to_string(), "/tmp/a.db".to_string())],
+            }
+        );
+    }
+
+    #[test]
+    fn create_datasource_keeps_a_quoted_name_exact() {
+        let statement = classify("CREATE DATASOURCE \"Sales\" TYPE duckdb WITH (path = '/a')");
+        assert!(matches!(
+            statement,
+            Statement::CreateDatasource { ref name, .. } if name == "Sales"
+        ));
+    }
+
+    #[test]
+    fn create_datasource_if_not_exists_raises() {
+        let error =
+            classify_statement("CREATE DATASOURCE IF NOT EXISTS d TYPE duckdb WITH (path='/a')")
+                .unwrap_err();
+        assert!(matches!(error, ParseError::Unsupported(ref m) if m.contains("IF NOT EXISTS")));
+    }
+
+    #[test]
+    fn create_datasource_or_replace_raises() {
+        let error =
+            classify_statement("CREATE OR REPLACE DATASOURCE d TYPE duckdb WITH (path='/a')")
+                .unwrap_err();
+        assert!(matches!(error, ParseError::Unsupported(ref m) if m.contains("OR REPLACE")));
+    }
+
+    #[test]
+    fn create_datasource_unknown_kind_raises() {
+        let error =
+            classify_statement("CREATE DATASOURCE d TYPE oracle WITH (path='/a')").unwrap_err();
+        assert!(matches!(error, ParseError::Unsupported(ref m) if m.contains("oracle")));
+    }
+
+    #[test]
+    fn create_datasource_qualified_name_raises() {
+        let error =
+            classify_statement("CREATE DATASOURCE a.b TYPE duckdb WITH (path='/a')").unwrap_err();
+        assert!(matches!(error, ParseError::Unsupported(ref m) if m.contains("qualified")));
+    }
+
+    #[test]
+    fn create_datasource_duplicate_param_raises() {
+        let error =
+            classify_statement("CREATE DATASOURCE d TYPE duckdb WITH (path='/a', path='/b')")
+                .unwrap_err();
+        assert!(matches!(error, ParseError::Parse(ref m) if m.contains("more than once")));
+    }
+
+    #[test]
+    fn create_datasource_empty_param_list_classifies() {
+        let statement = classify("CREATE DATASOURCE d TYPE duckdb WITH ()");
+        assert!(matches!(
+            statement,
+            Statement::CreateDatasource { ref params, .. } if params.is_empty()
+        ));
+    }
+
+    #[test]
+    fn alter_datasource_raises() {
+        let error = classify_statement("ALTER DATASOURCE d TYPE duckdb").unwrap_err();
+        assert!(matches!(error, ParseError::Unsupported(ref m) if m.contains("ALTER DATASOURCE")));
+    }
+
+    #[test]
+    fn drop_datasource_extracts_the_name() {
+        assert_eq!(
+            classify("DROP DATASOURCE sales"),
+            Statement::DropDatasource {
+                name: "sales".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn drop_datasource_if_exists_raises() {
+        let error = classify_statement("DROP DATASOURCE IF EXISTS d").unwrap_err();
+        assert!(matches!(error, ParseError::Unsupported(ref m) if m.contains("IF EXISTS")));
+    }
+
+    #[test]
+    fn drop_datasource_cascade_raises() {
+        for sql in ["DROP DATASOURCE d CASCADE", "DROP DATASOURCE d RESTRICT"] {
+            let error = classify_statement(sql).unwrap_err();
+            assert!(matches!(error, ParseError::Unsupported(_)), "{sql}");
+        }
+    }
+
+    #[test]
+    fn show_datasources_classifies() {
+        assert_eq!(classify("SHOW DATASOURCES"), Statement::ShowDatasources);
+        assert_eq!(classify("show datasources"), Statement::ShowDatasources);
+    }
+
+    #[test]
+    fn show_datasources_with_trailing_token_raises() {
+        let error = classify_statement("SHOW DATASOURCES extra").unwrap_err();
         assert!(matches!(error, ParseError::Unsupported(_)));
     }
 }

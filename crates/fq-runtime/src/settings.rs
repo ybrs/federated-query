@@ -30,7 +30,9 @@ use std::sync::Arc;
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
 
-use fq_common::{AcceleratorConfig, Config, CostConfig, DataType, ExecutorConfig, OptimizerConfig};
+use fq_common::{
+    AcceleratorConfig, CatalogConfig, Config, CostConfig, DataType, ExecutorConfig, OptimizerConfig,
+};
 
 use crate::error::RuntimeError;
 use crate::Runtime;
@@ -479,6 +481,21 @@ static SETTINGS: &[SettingDef] = &[
         read: |c| SettingValue::Bool(c.accelerator.enable_substitution),
         apply: Some(|c, v| {
             c.accelerator.enable_substitution = v.as_bool()?;
+            Ok(())
+        }),
+    },
+    // --- catalog: runtime datasource DDL ------------------------------------
+    SettingDef {
+        name: "catalog.create_connect_timeout_ms",
+        description: "CREATE DATASOURCE: cap on the connect + metadata load before it \
+                      raises, so an unreachable host fails promptly (DDL I/O is exempt \
+                      from the O(metadata) planning budget).",
+        mutability: Mutability::SessionMutable,
+        env_var: None,
+        default: || SettingValue::U64(CatalogConfig::default().create_connect_timeout_ms),
+        read: |c| SettingValue::U64(c.catalog.create_connect_timeout_ms),
+        apply: Some(|c, v| {
+            c.catalog.create_connect_timeout_ms = v.as_u64()?;
             Ok(())
         }),
     },
@@ -966,6 +983,13 @@ mod tests {
         let mapping =
             serde_yaml::to_value(AcceleratorConfig::default()).expect("serialize accelerator");
         assert_fields_registered(&mapping, "accelerator");
+    }
+
+    /// Every `CatalogConfig` field is registered under `catalog.`.
+    #[test]
+    fn every_catalog_field_is_registered() {
+        let mapping = serde_yaml::to_value(CatalogConfig::default()).expect("serialize catalog");
+        assert_fields_registered(&mapping, "catalog");
     }
 
     /// Assert every key of a serialized config section appears in the registry

@@ -59,7 +59,7 @@ pub mod view;
 pub mod watermark;
 
 pub use accelerator::{Accelerator, MergeOutcome};
-pub use catalog::ViewCatalog;
+pub use catalog::{DynamicDatasource, ViewCatalog};
 pub use error::AccelError;
 pub use source::{views_schema, MaterializedViewSource, VIEW_SCHEMA_NAME};
 pub use store::ChunkStore;

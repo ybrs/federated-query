@@ -18,13 +18,14 @@ use crate::error::ConfigError;
 
 /// The top-level sections `load_config` recognizes. Anything else is a typo and
 /// raises (`config.py`'s `known_sections`).
-const KNOWN_SECTIONS: [&str; 6] = [
+const KNOWN_SECTIONS: [&str; 7] = [
     "datasources",
     "optimizer",
     "executor",
     "cost",
     "server",
     "accelerator",
+    "catalog",
 ];
 
 /// Configuration for a single data source.
@@ -208,6 +209,30 @@ impl Default for AcceleratorConfig {
     }
 }
 
+/// Configuration for the runtime datasource catalog: the bounds that govern
+/// creating a datasource through DDL at runtime.
+///
+/// `create_connect_timeout_ms` caps how long `CREATE DATASOURCE` waits for the
+/// new source to connect and load its metadata before it raises. DDL does
+/// deliberate I/O and is exempt from the O(metadata) planning budget, but an
+/// unreachable host must still fail promptly instead of hanging on the driver's
+/// default TCP timeout.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CatalogConfig {
+    pub create_connect_timeout_ms: u64,
+}
+
+impl Default for CatalogConfig {
+    /// Ten seconds: comfortably above a healthy connect + metadata introspection
+    /// over a LAN and far below a driver's minutes-long default TCP timeout.
+    fn default() -> Self {
+        Self {
+            create_connect_timeout_ms: 10_000,
+        }
+    }
+}
+
 /// Authentication for the wire-protocol server (`fedq-server`).
 ///
 /// An empty `users` list - the default, and the state when the `server:` section
@@ -257,6 +282,7 @@ pub struct Config {
     pub cost: CostConfig,
     pub server: ServerConfig,
     pub accelerator: AcceleratorConfig,
+    pub catalog: CatalogConfig,
     pub source_path: Option<String>,
 }
 
@@ -283,6 +309,7 @@ pub fn load_config(config_path: &str) -> Result<Config, ConfigError> {
         cost: parse_section(mapping, "cost")?,
         server: parse_section(mapping, "server")?,
         accelerator: parse_section(mapping, "accelerator")?,
+        catalog: parse_section(mapping, "catalog")?,
         source_path: Some(path.display().to_string()),
     })
 }

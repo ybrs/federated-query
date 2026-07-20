@@ -108,19 +108,29 @@ impl<'a> Binder<'a> {
     }
 
     /// The catalog `Table` a scan reads (searching when the reference is bare).
+    /// A qualified reference to a datasource that failed to connect/load at
+    /// construction raises the captured connector error naming the source
+    /// instead of a generic not-found.
     fn resolve_scan_table(&self, scan: &Scan) -> Result<&'a Table, BindError> {
-        self.catalog
-            .resolve_table(
-                optional(&scan.datasource),
-                optional(&scan.schema_name),
-                &scan.table_name,
-            )
-            .ok_or_else(|| {
-                BindError::TableNotFound(format!(
-                    "{}.{}.{}",
-                    scan.datasource, scan.schema_name, scan.table_name
-                ))
-            })
+        if let Some(table) = self.catalog.resolve_table(
+            optional(&scan.datasource),
+            optional(&scan.schema_name),
+            &scan.table_name,
+        ) {
+            return Ok(table);
+        }
+        if !scan.datasource.is_empty() {
+            if let Some(error) = self.catalog.unavailable_error(&scan.datasource) {
+                return Err(BindError::DatasourceUnavailable {
+                    name: scan.datasource.clone(),
+                    error: error.to_string(),
+                });
+            }
+        }
+        Err(BindError::TableNotFound(format!(
+            "{}.{}.{}",
+            scan.datasource, scan.schema_name, scan.table_name
+        )))
     }
 
     /// Bind a Filter: bind the input, then the predicate against the input scope.

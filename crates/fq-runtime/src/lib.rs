@@ -11,6 +11,7 @@
 //! This crate is pyo3-FREE. The `fedq-py` crate wraps it behind the Python FFI.
 
 mod delta;
+mod dynamic_catalog;
 pub mod error;
 mod events;
 mod explain;
@@ -92,7 +93,18 @@ impl Runtime {
     /// (DuckDB is single-writer per file per process).
     pub fn from_config(config: &Config) -> Result<Self, RuntimeError> {
         let session = connectors::open_session();
+        // The materialized-view store also holds the persisted dynamic-datasource
+        // registry (both live in the config's stats SQLite); open it first so the
+        // persisted sources merge with the YAML bootstrap set below.
+        let accelerator = materialized::open_accelerator(config)?;
+        let persisted = match &accelerator {
+            Some(accel) => accel.list_datasources()?,
+            None => Vec::new(),
+        };
+        dynamic_catalog::reject_bootstrap_collision(config, &persisted)?;
         let mut catalog = Catalog::new();
+        // YAML (bootstrap) sources are operator-controlled at deploy time, so a
+        // failure to connect one aborts construction (unchanged behavior).
         for datasource in config.datasources.values() {
             register_datasource(session, &mut catalog, datasource)?;
         }
@@ -100,11 +112,19 @@ impl Runtime {
         // views load through the same metadata path) and its chunk tables go
         // to the exec data plane, so a NEW runtime over the same config sees
         // every view a previous session created.
-        let accelerator = materialized::open_accelerator(config)?;
         if let Some(accel) = &accelerator {
             materialized::register_store(session, &mut catalog, accel)?;
         }
         catalog.load_metadata()?;
+        // Persisted dynamic sources are added post-deploy and may be transiently
+        // offline; each is validated in isolation and a failure marks THAT source
+        // unavailable (its reference raises the stored error) instead of aborting.
+        dynamic_catalog::install_persisted_datasources(
+            session,
+            &mut catalog,
+            &persisted,
+            config.catalog.create_connect_timeout_ms,
+        );
         // A change-key declaration naming an unknown table/column, or a
         // monotonic column whose type cannot carry a watermark, fails HERE at
         // load - not silently at a refresh months later.
@@ -195,6 +215,11 @@ impl Runtime {
             Statement::Funnel(spec) => self.run_funnel_statement(&spec),
             Statement::Segment(spec) => self.run_segment_statement(&spec),
             Statement::Paths(spec) => self.run_paths_statement(&spec),
+            Statement::CreateDatasource { name, kind, params } => {
+                self.create_datasource(&name, &kind, &params)
+            }
+            Statement::DropDatasource { name } => self.drop_datasource(&name),
+            Statement::ShowDatasources => self.show_datasources(),
         }
     }
 
@@ -275,6 +300,9 @@ impl Runtime {
             }
             Statement::ShowMaterializedViews => {
                 return Ok(materialized::views_describe_columns());
+            }
+            Statement::ShowDatasources => {
+                return Ok(dynamic_catalog::datasources_describe_columns());
             }
             Statement::Funnel(_) => return Ok(events::funnel_describe_columns()),
             Statement::Segment(_) => return Ok(events::segment_describe_columns()),
@@ -563,7 +591,7 @@ impl StageLog {
 
 /// Build one datasource's catalog handle and register it in the fq-exec data
 /// plane, dispatching on the declared `type`.
-fn register_datasource(
+pub(crate) fn register_datasource(
     session: connectors::SessionId,
     catalog: &mut Catalog,
     datasource: &DataSourceConfig,

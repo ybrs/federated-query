@@ -536,6 +536,7 @@ mod tests {
             cost: CostConfig::default(),
             server: ServerConfig::default(),
             accelerator: fq_common::AcceleratorConfig::default(),
+            catalog: fq_common::CatalogConfig::default(),
             source_path: None,
         }
     }

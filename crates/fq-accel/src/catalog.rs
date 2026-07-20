@@ -11,11 +11,51 @@
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::time::Duration;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 
 use crate::error::AccelError;
 use crate::view::{ChangeKeyState, MaterializedView, ViewColumn};
+
+/// How long a statement waits on a held write lock before SQLite gives up. The
+/// busy handler covers ordinary contention; the open-time retry covers the
+/// journal-mode transition the handler does not.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Retries granted to a busy open step before its real SQLite error surfaces.
+/// The backoff doubles from 2ms, so the total wait is bounded and the open
+/// FAILS LOUDLY rather than hanging when the lock never clears.
+const OPEN_BUSY_RETRIES: u32 = 8;
+
+/// Whether a SQLite error is transient lock contention (BUSY or LOCKED) a retry
+/// may clear, as opposed to a real failure.
+fn is_busy(error: &AccelError) -> bool {
+    matches!(
+        error,
+        AccelError::Sqlite(rusqlite::Error::SqliteFailure(inner, _))
+            if matches!(inner.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
+}
+
+/// Run an idempotent open step, retrying on BUSY/LOCKED with a doubling backoff.
+/// SQLite can return BUSY for the WAL journal-mode transition and the CREATE
+/// TABLE DDL WITHOUT invoking the busy handler when concurrent opens of one
+/// fresh file contend, so the step is retried explicitly; after the bounded
+/// retries the genuine error surfaces.
+fn with_busy_retry<T>(mut step: impl FnMut() -> Result<T, AccelError>) -> Result<T, AccelError> {
+    let mut backoff = Duration::from_millis(2);
+    for _ in 0..OPEN_BUSY_RETRIES {
+        match step() {
+            Err(error) if is_busy(&error) => {
+                std::thread::sleep(backoff);
+                backoff = backoff.saturating_mul(2);
+            }
+            result => return result,
+        }
+    }
+    step()
+}
 
 /// Supplies timestamp strings (RFC3339); injectable so tests control time.
 pub type Clock = fq_catalog::Clock;
@@ -48,6 +88,36 @@ const ROW_COLUMNS: &str = "name, definition_sql, location, chunk_list, output_sc
      measured_rows, byte_size, created_at, refreshed_at, source_tokens, change_key, \
      use_count, cost_saved_ms";
 
+/// The dynamic-datasource registry table, in the same SQLite file (one store per
+/// config). `params` is the JSON object of connection params as they were
+/// authored (scalars); `type` is the connector kind. `capabilities`,
+/// `change_keys`, and `updated_by` carry NULL: the DDL surface sets none of them
+/// and they are the storage hooks a later credential-reference / ownership layer
+/// fills. A table created before those columns existed gains them through
+/// `add_datasource_optional_columns` on open. `synchronous` stays ON (durable
+/// operator state), and the name is the PRIMARY KEY so a concurrent create
+/// races on `INSERT OR IGNORE`.
+const DATASOURCE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS dynamic_datasources (
+    name          TEXT PRIMARY KEY,
+    type          TEXT NOT NULL,
+    params        TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    capabilities  TEXT,
+    change_keys   TEXT,
+    updated_by    TEXT
+)";
+
+/// One persisted dynamic datasource: its name, connector kind, and the JSON
+/// connection params as authored (all string scalars). The runtime rebuilds a
+/// `DataSourceConfig` from these to connect the source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicDatasource {
+    pub name: String,
+    pub kind: String,
+    pub params: BTreeMap<String, String>,
+    pub created_at: String,
+}
+
 /// A SQLite-backed registry of materialized views for one config.
 pub struct ViewCatalog {
     conn: Mutex<Connection>,
@@ -64,12 +134,15 @@ impl ViewCatalog {
     /// Open the registry with an injected clock (tests control timestamps).
     pub fn open_with_clock(path: &str, clock: Clock) -> Result<Self, AccelError> {
         let conn = Connection::open(path)?;
-        // WAL matches the learned-stats catalog sharing this file: many
-        // readers plus one writer across the runtimes on one store. Unlike the
-        // stats side, view rows are durable state, so synchronous stays ON.
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
-        conn.execute(SCHEMA, [])?;
-        add_benefit_columns(&conn)?;
+        // Make ordinary statement contention WAIT for the write lock rather than
+        // fail immediately (the learned-stats catalog sharing this file relies
+        // on the same handler).
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        // The WAL transition and CREATE TABLE DDL need a momentary exclusive lock
+        // that concurrent opens of one fresh file contend for; SQLite can return
+        // BUSY for these WITHOUT invoking the busy handler, so the idempotent
+        // setup is retried explicitly.
+        with_busy_retry(|| ensure_schema(&conn))?;
         Ok(Self {
             conn: Mutex::new(conn),
             clock,
@@ -241,6 +314,130 @@ impl ViewCatalog {
             )?;
         Ok(())
     }
+
+    /// Persist a dynamic datasource with `INSERT OR IGNORE` on the name primary
+    /// key. Returns whether THIS call inserted the row: `false` means a
+    /// concurrent create of the same name already won, and the caller raises
+    /// `already exists` and discards its validated connection (first-writer
+    /// wins, never a silent replace). `created_at` is stamped here.
+    pub fn insert_datasource(&self, ds: &DynamicDatasource) -> Result<bool, AccelError> {
+        let inserted = self
+            .conn
+            .lock()
+            .expect("view catalog lock poisoned")
+            .execute(
+                "INSERT OR IGNORE INTO dynamic_datasources (name, type, params, created_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    ds.name,
+                    ds.kind,
+                    serde_json::to_string(&ds.params)?,
+                    (self.clock)(),
+                ],
+            )?;
+        Ok(inserted == 1)
+    }
+
+    /// The persisted dynamic datasource named `name`, or None.
+    pub fn get_datasource(&self, name: &str) -> Result<Option<DynamicDatasource>, AccelError> {
+        let row = self
+            .conn
+            .lock()
+            .expect("view catalog lock poisoned")
+            .query_row(
+                "SELECT name, type, params, created_at FROM dynamic_datasources WHERE name = ?1",
+                params![name],
+                datasource_row,
+            )
+            .optional()?;
+        match row {
+            Some(raw) => Ok(Some(raw_to_datasource(raw)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Every persisted dynamic datasource, ordered by name.
+    pub fn list_datasources(&self) -> Result<Vec<DynamicDatasource>, AccelError> {
+        let conn = self.conn.lock().expect("view catalog lock poisoned");
+        let mut statement = conn.prepare(
+            "SELECT name, type, params, created_at FROM dynamic_datasources ORDER BY name",
+        )?;
+        let rows = statement.query_map([], datasource_row)?;
+        let mut datasources = Vec::new();
+        for raw in rows {
+            datasources.push(raw_to_datasource(raw?)?);
+        }
+        Ok(datasources)
+    }
+
+    /// Delete a persisted dynamic datasource. Returns whether a row was removed
+    /// (so a caller can distinguish a real drop from a missing name).
+    pub fn delete_datasource(&self, name: &str) -> Result<bool, AccelError> {
+        let deleted = self
+            .conn
+            .lock()
+            .expect("view catalog lock poisoned")
+            .execute(
+                "DELETE FROM dynamic_datasources WHERE name = ?1",
+                params![name],
+            )?;
+        Ok(deleted > 0)
+    }
+}
+
+/// The raw dynamic-datasource row before JSON decoding of `params`.
+type DatasourceRow = (String, String, String, String);
+
+/// Read one dynamic-datasource row (name, type, params JSON, created_at).
+fn datasource_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatasourceRow> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+}
+
+/// Decode a raw row's `params` JSON into the datasource record.
+fn raw_to_datasource(raw: DatasourceRow) -> Result<DynamicDatasource, AccelError> {
+    let (name, kind, params, created_at) = raw;
+    Ok(DynamicDatasource {
+        name,
+        kind,
+        params: serde_json::from_str(&params)?,
+        created_at,
+    })
+}
+
+/// Set WAL and create/migrate both registry tables (idempotent on every open).
+/// WAL matches the learned-stats catalog sharing this file: many readers plus
+/// one writer across the runtimes on one store. Unlike the stats side, these
+/// rows are durable operator state, so synchronous stays ON.
+fn ensure_schema(conn: &Connection) -> Result<(), AccelError> {
+    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+    conn.execute(SCHEMA, [])?;
+    add_benefit_columns(conn)?;
+    conn.execute(DATASOURCE_SCHEMA, [])?;
+    add_datasource_optional_columns(conn)?;
+    Ok(())
+}
+
+/// Add `capabilities`, `change_keys`, and `updated_by` to a
+/// `dynamic_datasources` table created before they existed. The DDL surface
+/// sets none of them today, so they read back NULL; the columns are the storage
+/// hooks a later credential-reference / ownership layer writes into.
+fn add_datasource_optional_columns(conn: &Connection) -> Result<(), AccelError> {
+    let mut present = std::collections::BTreeSet::new();
+    let mut statement =
+        conn.prepare("SELECT name FROM pragma_table_info('dynamic_datasources')")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        present.insert(row.get::<_, String>(0)?);
+    }
+    for column in ["capabilities", "change_keys", "updated_by"] {
+        if !present.contains(column) {
+            conn.execute(
+                &format!("ALTER TABLE dynamic_datasources ADD COLUMN {column} TEXT"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// The raw row tuple before JSON decoding (rusqlite's closure cannot return
@@ -368,4 +565,105 @@ fn decode_change_key(text: Option<&str>) -> Result<Option<ChangeKeyState>, Accel
 /// The wall-clock stamp: current UTC time as an RFC3339 string.
 fn default_clock() -> Clock {
     std::sync::Arc::new(|| chrono::Utc::now().to_rfc3339())
+}
+
+#[cfg(test)]
+mod datasource_tests {
+    use super::*;
+
+    /// A fresh temp SQLite path under a unique directory.
+    fn temp_db(tag: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("fq_ds_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+        dir.join("store.sqlite").to_string_lossy().to_string()
+    }
+
+    /// One dynamic datasource with two params.
+    fn sample() -> DynamicDatasource {
+        let mut params = BTreeMap::new();
+        params.insert("path".to_string(), "/data/a.db".to_string());
+        params.insert("schemas".to_string(), "public,staging".to_string());
+        DynamicDatasource {
+            name: "sales".to_string(),
+            kind: "duckdb".to_string(),
+            params,
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn insert_and_read_back_round_trips() {
+        let catalog = ViewCatalog::open(&temp_db("roundtrip")).expect("open");
+        let ds = sample();
+        assert!(catalog.insert_datasource(&ds).expect("insert"));
+        let read = catalog
+            .get_datasource("sales")
+            .expect("get")
+            .expect("present");
+        assert_eq!(read.name, ds.name);
+        assert_eq!(read.kind, ds.kind);
+        assert_eq!(read.params, ds.params);
+        assert!(
+            !read.created_at.is_empty(),
+            "created_at is stamped on insert"
+        );
+        let all = catalog.list_datasources().expect("list");
+        assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn insert_or_ignore_makes_the_second_writer_lose() {
+        let catalog = ViewCatalog::open(&temp_db("ignore")).expect("open");
+        assert!(catalog.insert_datasource(&sample()).expect("first insert"));
+        assert!(
+            !catalog.insert_datasource(&sample()).expect("second insert"),
+            "a duplicate name inserts nothing"
+        );
+    }
+
+    #[test]
+    fn delete_removes_the_row() {
+        let catalog = ViewCatalog::open(&temp_db("delete")).expect("open");
+        catalog.insert_datasource(&sample()).expect("insert");
+        assert!(catalog.delete_datasource("sales").expect("delete"));
+        assert!(catalog.get_datasource("sales").expect("get").is_none());
+        assert!(
+            !catalog.delete_datasource("sales").expect("delete again"),
+            "deleting a missing name removes nothing"
+        );
+    }
+
+    #[test]
+    fn open_migrates_an_old_shape_table() {
+        let path = temp_db("migrate");
+        // An old-shape table lacking the optional columns.
+        let conn = Connection::open(&path).expect("open raw");
+        conn.execute(
+            "CREATE TABLE dynamic_datasources (
+                name TEXT PRIMARY KEY,
+                type TEXT NOT NULL,
+                params TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )",
+            [],
+        )
+        .expect("create old table");
+        conn.execute(
+            "INSERT INTO dynamic_datasources (name, type, params, created_at) \
+             VALUES ('old', 'duckdb', '{\"path\":\"/x\"}', '2020-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("seed old row");
+        drop(conn);
+        // Reopening runs the migration (adding the optional columns) and reads
+        // the pre-existing row back unchanged.
+        let catalog = ViewCatalog::open(&path).expect("open migrates");
+        let read = catalog
+            .get_datasource("old")
+            .expect("get")
+            .expect("present");
+        assert_eq!(read.kind, "duckdb");
+        assert_eq!(read.params.get("path"), Some(&"/x".to_string()));
+    }
 }

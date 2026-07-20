@@ -160,6 +160,44 @@ pub fn register(session: SessionId, name: String, spec: DsSpec) {
     registry().lock().unwrap().insert((session, name), spec);
 }
 
+/// Drop one datasource `(session, name)` from the data plane: its registry spec
+/// plus every cached context and connection it seeded. A `DROP DATASOURCE` calls
+/// this so the dropped name no longer resolves in the dropping session AND a
+/// later create reusing the name (pointing elsewhere) never reads a stale cached
+/// connection. The URI-keyed caches (DuckDB, Parquet, MySQL) are purged by the
+/// spec's URI, so the spec is read before it is removed. Only this session's
+/// entries for this name are touched; peers and other sources are untouched.
+pub fn deregister(session: SessionId, name: &str) {
+    let spec = registry()
+        .lock()
+        .unwrap()
+        .remove(&(session, name.to_string()));
+    let uri = spec.map(|spec| spec.uri);
+    materialized_ctx_cache()
+        .lock()
+        .unwrap()
+        .remove(&(session, name.to_string()));
+    index_cache()
+        .lock()
+        .unwrap()
+        .remove(&(session, name.to_string()));
+    if let Some(uri) = uri {
+        duck_base_cache()
+            .lock()
+            .unwrap()
+            .remove(&(session, uri.clone()));
+        parquet_ctx_cache().lock().unwrap().remove(&(session, uri));
+    }
+    PG_CACHE.with(|cache| {
+        cache.borrow_mut().remove(&(session, name.to_string()));
+    });
+    SHIPPED_PG.with(|shipped| {
+        shipped
+            .borrow_mut()
+            .retain(|entry| !(entry.0 == session && entry.1 == name));
+    });
+}
+
 fn spec(name: &str) -> ExecResult<DsSpec> {
     let session = current_session();
     registry()

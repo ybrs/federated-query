@@ -151,6 +151,7 @@ fn base_config(datasources: BTreeMap<String, DataSourceConfig>) -> Config {
         cost: CostConfig::default(),
         server: ServerConfig::default(),
         accelerator: fq_common::AcceleratorConfig::default(),
+        catalog: fq_common::CatalogConfig::default(),
         source_path: None,
     }
 }
