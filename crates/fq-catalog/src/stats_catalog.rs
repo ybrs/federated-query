@@ -28,8 +28,9 @@
 //!   those crates, not here.
 
 use chrono::DateTime;
-use rusqlite::{params, Connection, OptionalExtension, Params};
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension, Params};
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 
 /// The table-level row count has no column; SQLite treats NULL as distinct in a
@@ -146,6 +147,43 @@ pub fn group_key(columns: &[String]) -> String {
     format!("[{}]", parts.join(", "))
 }
 
+/// How long a statement waits on a held write lock before SQLite gives up. The
+/// busy handler covers ordinary contention; the open-time retry covers the
+/// journal-mode transition the handler does not.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Retries granted to a busy open step before its real SQLite error surfaces.
+/// The backoff doubles from 2ms, so the total wait is bounded (~0.5s) and the
+/// open FAILS LOUDLY rather than hanging when the lock never clears.
+const OPEN_BUSY_RETRIES: u32 = 8;
+
+/// Whether a SQLite error is a transient lock contention (BUSY or LOCKED) that a
+/// retry may clear, as opposed to a real failure.
+fn is_busy(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if matches!(inner.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
+}
+
+/// Run an idempotent open step, retrying on BUSY/LOCKED with a doubling backoff.
+/// Bounded: after `OPEN_BUSY_RETRIES` waits a final attempt runs and its result -
+/// success or the genuine error - is returned, so a persistent lock never hangs.
+fn with_busy_retry<T>(mut step: impl FnMut() -> Result<T, StatsError>) -> Result<T, StatsError> {
+    let mut backoff = Duration::from_millis(2);
+    for _ in 0..OPEN_BUSY_RETRIES {
+        match step() {
+            Err(StatsError::Sqlite(err)) if is_busy(&err) => {
+                std::thread::sleep(backoff);
+                backoff = backoff.saturating_mul(2);
+            }
+            result => return result,
+        }
+    }
+    step()
+}
+
 /// A SQLite-backed store of learned cardinality observations for one config.
 pub struct StatsCatalog {
     conn: std::sync::Mutex<Connection>,
@@ -161,12 +199,19 @@ impl StatsCatalog {
     /// Open the catalog with an injected clock (tests control freshness).
     pub fn open_with_clock(path: &str, clock: Clock) -> Result<Self, StatsError> {
         let conn = Connection::open(path)?;
+        // Make ordinary statement contention WAIT for the write lock rather than
+        // fail immediately; the write path relies on this handler.
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         let catalog = Self {
             conn: std::sync::Mutex::new(conn),
             clock,
         };
-        catalog.tune()?;
-        catalog.ensure_schema()?;
+        // The WAL transition and CREATE TABLE DDL need a momentary exclusive lock
+        // that concurrent opens of one fresh file contend for; SQLite can return
+        // BUSY for the journal-mode change WITHOUT invoking the busy handler, so
+        // these idempotent steps are retried explicitly.
+        with_busy_retry(|| catalog.tune())?;
+        with_busy_retry(|| catalog.ensure_schema())?;
         Ok(catalog)
     }
 

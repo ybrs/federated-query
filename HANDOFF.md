@@ -151,7 +151,10 @@ Feature surface built on top of the core engine:
   ONE integration-test binary (`tests/it/main.rs` with suites as modules, or a
   single flat `tests/<name>.rs`; fq-emit and fq-events are unit-test-only in
   `src/`). Keep it that way: a new test file goes into the crate's existing
-  test binary, never as a new top-level `tests/*.rs` target.
+  test binary, never as a new top-level `tests/*.rs` target. ONE sanctioned
+  exception: `fq-physical/tests/dim_shipping_kill_switch.rs` is its own binary
+  because it mutates the process-global `FEDQ_DIM_SHIPPING` env var, which cannot
+  share a binary with the parallel dim-ship tests that read it at plan time.
 - Lint: `warnings = "deny"` escalates clippy pedantic; curated allows in
   `Cargo.toml [workspace.lints.clippy]`. `make fq-lint` runs the house rules
   (FQ-BUNDLED, FQ-PMCOMMENT, ...). The semantic comment gate

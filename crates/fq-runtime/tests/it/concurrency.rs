@@ -196,6 +196,56 @@ fn concurrent_own_runtimes_over_one_duckdb_file_stay_correct() {
 }
 
 #[test]
+fn concurrent_from_config_over_one_shared_config_all_build() {
+    // The fedq-server case: several client connections each build a Runtime from
+    // the SAME config at once. A config with a source_path opens the shared learned-
+    // stats SQLite during from_config, so six concurrent builds contend on ONE fresh
+    // stats file - every build must succeed, none may inherit a stats-open race.
+    let path = seed_fixture();
+    let path = path
+        .to_str()
+        .expect("fixture path is valid UTF-8")
+        .to_string();
+
+    // A fresh config source_path (unique via the fixture stem) whose sibling
+    // <stem>.stats.sqlite the builds open and race on; remove any prior run's stats
+    // file so this open is a genuinely fresh one.
+    let config_path = std::path::Path::new(&path).with_extension("cfg.yaml");
+    let stats_path = config_path.with_file_name(format!(
+        "{}.stats.sqlite",
+        config_path.file_stem().unwrap().to_string_lossy()
+    ));
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", stats_path.to_string_lossy()));
+    }
+
+    let mut config = duck_config(&path);
+    config.source_path = Some(config_path.to_string_lossy().into_owned());
+    let config = Arc::new(config);
+
+    let threads = 6;
+    let barrier = Arc::new(Barrier::new(threads));
+    let mut handles = Vec::new();
+    for _ in 0..threads {
+        let config = Arc::clone(&config);
+        let barrier = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            // Build all runtimes at once so their stats-catalog opens truly overlap.
+            barrier.wait();
+            Runtime::from_config(&config).expect("concurrent from_config must build");
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("builder thread panicked");
+    }
+
+    let _ = std::fs::remove_file(&path);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", stats_path.to_string_lossy()));
+    }
+}
+
+#[test]
 fn dropping_one_runtime_does_not_disturb_a_concurrently_running_one() {
     // A long-lived runtime runs a query loop while short-lived runtimes over the
     // SAME file are built and dropped underneath it. Each drop prunes its own

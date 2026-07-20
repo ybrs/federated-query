@@ -1,8 +1,12 @@
-//! The dim-shipping kill switch (`FEDQ_DIM_SHIPPING=0`) in its OWN test binary:
-//! the switch is a process-global environment read, so mutating it must not race a
-//! concurrent ship test. A separate integration binary is a separate process, so
-//! this file's single test owns the variable for its whole run. Ports the
-//! Python kill-switch decline.
+//! The dim-shipping kill switch (`FEDQ_DIM_SHIPPING=0`) decline, in a DEDICATED
+//! top-level test binary rather than a suite in `tests/it`.
+//!
+//! The switch is a process-global environment read at plan time, so this test
+//! MUTATES `FEDQ_DIM_SHIPPING`. Cargo runs a binary's tests on parallel threads
+//! in ONE process; a sibling ship test that reads the variable while it is set
+//! would see a suppressed plan. A separate top-level file is a separate binary
+//! (its own process), so the mutation is isolated to this file's single test.
+//! Ports the Python kill-switch decline.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;

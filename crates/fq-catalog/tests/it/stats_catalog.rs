@@ -364,6 +364,33 @@ fn test_concurrent_writers_over_one_file_all_succeed() {
 }
 
 #[test]
+fn test_concurrent_open_over_one_fresh_file_all_succeed() {
+    // Many threads opening the SAME fresh file at once contend for the momentary
+    // exclusive lock the WAL transition and CREATE TABLE DDL need; the open must
+    // wait-and-retry that contention rather than surface SQLITE_BUSY. Several
+    // rounds on one file, plus a barrier so the opens genuinely overlap.
+    let temp = TempPath::new("concurrent_open");
+    let openers = 6;
+    let rounds = 5;
+    for _ in 0..rounds {
+        let start = Arc::new(std::sync::Barrier::new(openers));
+        let mut handles = Vec::new();
+        for _ in 0..openers {
+            let path = temp.path.clone();
+            let start = Arc::clone(&start);
+            handles.push(std::thread::spawn(move || {
+                // Open all at once so the WAL/schema transitions truly race.
+                start.wait();
+                StatsCatalog::open(&path).expect("concurrent open must not fail with SQLITE_BUSY");
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("opener thread panicked");
+        }
+    }
+}
+
+#[test]
 fn test_group_key_matches_python_json_dumps() {
     // Byte-compat guard: the key format must match Python json.dumps(sorted(...)),
     // including the ", " element separator, or a shared catalog would miss.
