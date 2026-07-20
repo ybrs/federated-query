@@ -54,7 +54,7 @@ Test ids read as `case_name[placement]`, e.g.
 - `cases.py` - the case model and `validate_case` (raises on unknown or missing
   keys); `all_cases()` collects and validates the corpus.
 - `sanity/corpus.py` - the sanity cases themselves.
-- `placements.py` - the seven placement strategies.
+- `placements.py` - the ten placement strategies.
 - `runtime.py` - config building, seeding, and the engine adapter (`Environment`).
 - `oracle.py` + `compare.py` - the single-DuckDB ground truth and the diff.
 - `conftest.py` + `test_corpus.py` - parametrization, caching, and the test.
@@ -83,11 +83,26 @@ A placement names a fixed list of source slots and a rule for assigning a case's
 | `all_pg`             | two PostgreSQL schemas | round-robin |
 | `parquet_duck`       | Parquet, DuckDB  | first isolated |
 | `parquet_pg`         | Parquet, PostgreSQL | first isolated |
+| `tri_source`         | DuckDB, PostgreSQL, Parquet | round-robin |
+| `tri_source_rev`     | Parquet, PostgreSQL, DuckDB | round-robin |
+| `quad_source`        | DuckDB, PostgreSQL A, Parquet, PostgreSQL B | round-robin |
 
 Round-robin deals tables cyclically across the slots; first-isolated pins the
 first table to the (read-only) Parquet slot and sends the rest to the other slot.
 Only slots that receive a table become datasources, so a case with fewer tables
 than slots yields fewer distinct sources.
+
+`tri_source` and `tri_source_rev` place the same three kinds (DuckDB,
+PostgreSQL, Parquet) in opposite slot orders, so a given table lands on a
+different source under each. `quad_source` adds a second PostgreSQL slot, a
+distinct `fed_*` schema from the first (the slot-letter-keyed schema naming
+keeps the two schemas separate, exactly as `all_pg` already does with its two
+PostgreSQL slots). These three placements carry a `min_tables` equal to their
+slot count (3, 3, and 4): a case that declares fewer tables would only fill a
+prefix of the slots and reproduce a two-source shape the two-slot placements
+already cover, so it is skipped visibly. A case with three or more tables thus
+gains `tri_source`/`tri_source_rev` runs and one with four or more gains
+`quad_source` runs, with no extra cases to write.
 
 DuckDB slots seed a temp `.duckdb` file. Parquet slots export each table to
 `<dir>/<table>.parquet` (exposed under schema `main`). PostgreSQL slots seed a

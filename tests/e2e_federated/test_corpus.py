@@ -28,7 +28,11 @@ def test_corpus(case, placement, pg_state, env_registry, oracle_registry):
 
 
 def _maybe_skip(case, placement, specs, pg_state):
-    """Skip visibly for a toggled-off pg placement or an unmet min_sources."""
+    """Skip visibly for a toggled-off pg placement, few tables, or min_sources."""
+    if len(specs) < placement.min_tables:
+        pytest.skip(
+            "placement needs >= " + str(placement.min_tables) + " tables"
+        )
     used_slots, _mapping = placement.assign(specs.keys())
     if pg_state.skip_pg and placement_uses_postgres(placement, used_slots):
         pytest.skip("FEDQ_E2E_SKIP_PG=1: PostgreSQL placement skipped")

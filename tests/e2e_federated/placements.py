@@ -44,13 +44,21 @@ class Slot:
 class Placement:
     """A named table-to-source strategy over a fixed list of slots."""
 
-    def __init__(self, name, slots, mode):
-        """Store the placement name, its ordered slots, and its assignment mode."""
+    def __init__(self, name, slots, mode, min_tables=1):
+        """Store the placement name, its slots, mode, and minimum table count.
+
+        ``min_tables`` is the fewest tables a case must declare for this
+        placement to run it. A placement with more slots than a case has tables
+        would only fill a prefix of its slots and reproduce a shape a
+        smaller-slot placement already covers, so such a case is skipped
+        visibly. Two-slot and single-slot placements keep the default of 1.
+        """
         if mode not in _MODES:
             raise ValueError("unknown placement mode '" + str(mode) + "'")
         self.name = name
         self.slots = slots
         self.mode = mode
+        self.min_tables = min_tables
 
     def assign(self, table_names):
         """Return (used_slots, table -> slot-letter) for a case's tables.
@@ -101,7 +109,7 @@ class Placement:
 
 
 def _build_placements():
-    """Construct the ordered list of the suite's seven placement strategies."""
+    """Construct the ordered list of the suite's ten placement strategies."""
     placements = [
         Placement("oracle_single_duck", [Slot("a", DUCK)], ROUND_ROBIN),
         Placement("duck_duck", [Slot("a", DUCK), Slot("b", DUCK)], ROUND_ROBIN),
@@ -111,7 +119,26 @@ def _build_placements():
         Placement("parquet_duck", [Slot("a", PARQUET), Slot("b", DUCK)], FIRST_ISOLATED),
         Placement("parquet_pg", [Slot("a", PARQUET), Slot("b", PG)], FIRST_ISOLATED),
     ]
+    _add_multi_source_placements(placements)
     return placements
+
+
+def _add_multi_source_placements(placements):
+    """Append the three- and four-source placements to the placement list.
+
+    Each deals a case's tables round-robin over three or four slots that mix
+    DuckDB, Parquet, and two distinct PostgreSQL schemas, and carries a
+    ``min_tables`` equal to its slot count so a case with fewer tables (which
+    would only fill a prefix of the slots) is skipped rather than run as an
+    already-covered shape. ``tri_source_rev`` reverses the slot kinds of
+    ``tri_source`` so the same tables land on different sources.
+    """
+    tri = [Slot("a", DUCK), Slot("b", PG), Slot("c", PARQUET)]
+    tri_rev = [Slot("a", PARQUET), Slot("b", PG), Slot("c", DUCK)]
+    quad = [Slot("a", DUCK), Slot("b", PG), Slot("c", PARQUET), Slot("d", PG)]
+    placements.append(Placement("tri_source", tri, ROUND_ROBIN, min_tables=3))
+    placements.append(Placement("tri_source_rev", tri_rev, ROUND_ROBIN, min_tables=3))
+    placements.append(Placement("quad_source", quad, ROUND_ROBIN, min_tables=4))
 
 
 PLACEMENTS = _build_placements()

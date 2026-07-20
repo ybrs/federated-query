@@ -33,6 +33,7 @@ from tests.e2e_federated import corpus_aggregates
 from tests.e2e_federated import corpus_edges
 from tests.e2e_federated import corpus_gaps
 from tests.e2e_federated import corpus_joins
+from tests.e2e_federated import corpus_multisource
 from tests.e2e_federated import corpus_setops_ctes
 from tests.e2e_federated import corpus_subqueries
 from tests.e2e_federated import corpus_windows_expressions
@@ -48,6 +49,7 @@ CORPUS_MODULES = {
     "corpus_setops_ctes": corpus_setops_ctes,
     "corpus_windows_expressions": corpus_windows_expressions,
     "corpus_gaps": corpus_gaps,
+    "corpus_multisource": corpus_multisource,
 }
 
 REQUIRED_KEYS = ("name", "tables", "query")
