@@ -652,6 +652,7 @@ mod tests {
             distinct: false,
             within_group_key: None,
             within_group_desc: false,
+            filter: None,
         };
         let mut columns = HashSet::new();
         collect_expression(&count_star, &mut columns).unwrap();

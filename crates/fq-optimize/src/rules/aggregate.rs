@@ -169,6 +169,7 @@ mod tests {
             distinct: false,
             within_group_key: None,
             within_group_desc: false,
+            filter: None,
         }
     }
 
@@ -195,6 +196,45 @@ mod tests {
             scan.output_names,
             Some(vec!["region".to_string(), "amount".to_string()])
         );
+    }
+
+    /// SUM(table.amount) FILTER (WHERE table.amount > 0) as an aggregate call.
+    fn filtered_sum(table: &str) -> Expr {
+        let mut call = sum(table, "amount");
+        let Expr::FunctionCall { filter, .. } = &mut call else {
+            unreachable!("sum builds a FunctionCall");
+        };
+        *filter = Some(Box::new(Expr::BinaryOp {
+            op: fq_plan::BinaryOpType::Gt,
+            left: Box::new(col(table, "amount")),
+            right: Box::new(Expr::Literal {
+                value: fq_plan::LiteralValue::Integer(0),
+                data_type: DataType::Integer,
+            }),
+        }));
+        call
+    }
+
+    #[test]
+    fn filtered_aggregate_folds_onto_scan_whole() {
+        // A FILTERed aggregate over a single scan pushes WHOLE: the source computes the
+        // filtered aggregate, so the FILTER predicate must ride onto the scan intact
+        // (never dropped, which would return the unfiltered aggregate).
+        let plan = LogicalPlan::Aggregate(Aggregate {
+            input: Box::new(scan("sales", &["region", "amount"])),
+            group_by: vec![col("sales", "region")],
+            aggregates: vec![filtered_sum("sales")],
+            output_names: vec!["region".to_string(), "amount".to_string()],
+            grouping_sets: None,
+        });
+        let LogicalPlan::Scan(scan) = AggregatePushdown.apply(plan).unwrap() else {
+            panic!("the filtered aggregate collapses onto the scan");
+        };
+        let pushed = scan.aggregates.expect("aggregates pushed to scan");
+        let Expr::FunctionCall { filter, .. } = &pushed[0] else {
+            panic!("expected the SUM FunctionCall on the scan");
+        };
+        assert!(filter.is_some(), "the FILTER predicate rode onto the scan");
     }
 
     #[test]

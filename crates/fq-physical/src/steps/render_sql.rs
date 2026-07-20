@@ -684,6 +684,7 @@ mod tests {
                 distinct: false,
                 within_group_key: None,
                 within_group_desc: false,
+                filter: None,
             }),
             partition_by: vec![],
             order_keys: vec![],
@@ -743,6 +744,7 @@ mod tests {
             distinct: false,
             within_group_key: None,
             within_group_desc: false,
+            filter: None,
         }]);
         scan.output_names = Some(vec!["avg_price".to_string()]);
         let sql = render_scan_sql(&scan).expect("render scan").to_uppercase();

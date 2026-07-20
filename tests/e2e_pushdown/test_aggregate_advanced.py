@@ -29,14 +29,14 @@ def test_filter_clause_basic(single_source_env):
     assert "region" in projection
     assert "expensive_count" in projection
 
+    # `COUNT(*) FILTER (WHERE ...)` pushes as an `exp.Filter` wrapping the COUNT:
+    # the FILTER predicate reaches the source, never dropped (which would push a
+    # bare COUNT and return the unfiltered count).
     count_expr = find_alias_expression(ast, "expensive_count")
     assert count_expr is not None
-    assert is_func(count_expr, "COUNT")
-
-    filter_clause = count_expr.args.get("filter")
-    if filter_clause:
-        filter_where = filter_clause.this
-        assert isinstance(filter_where, exp.Where)
+    assert isinstance(count_expr, exp.Filter)
+    assert is_func(count_expr.this, "COUNT")
+    assert isinstance(count_expr.expression, exp.Where)
 
 
 def test_string_agg_function(single_source_env):

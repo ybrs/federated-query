@@ -37,9 +37,11 @@ Coverage added here, each absent from the six existing corpus modules:
   EXCEPT ALL (the set module has only two-branch, non-null ALL forms).
 - Two designed raises on valid-but-unsupported SQL: a tuple/row IN-subquery and
   an ORDER BY inside STRING_AGG.
-
-``SUSPECTED_ENGINE_BUGS`` parks one verified silent-wrong-answer found here (the
-aggregate FILTER clause is dropped), so ``CASES`` stays green.
+- Aggregate FILTER (WHERE ...): COUNT/SUM FILTER cross-source and single-source,
+  several filtered aggregates with different predicates in one SELECT, a FILTER
+  whose predicate reads the OTHER source's column, COUNT(DISTINCT ...) FILTER,
+  and a SUM(...) FILTER over a duplicate-key fan-out. A FILTER on STRING_AGG and
+  on an ordered-set aggregate (MEDIAN) each raise rather than drop the predicate.
 """
 
 CASES = [
@@ -383,32 +385,79 @@ CASES = [
             "ON o.customer_id = c.customer_id GROUP BY c.segment"
         ),
     },
-]
-
-SUSPECTED_ENGINE_BUGS = {
-    "gap_aggregate_filter_clause_ignored": {
+    # --- Aggregate FILTER (WHERE ...): the predicate must reach the aggregate. A
+    # COUNT(*) FILTER (WHERE o.status = 'processing') that returns the plain
+    # COUNT(*) means the FILTER was dropped - a manufactured wrong answer. ---
+    {
+        "name": "gap_aggregate_filter_clause",
+        "tables": ["orders", "customers"],
         "query": (
             "SELECT c.segment AS seg, "
             "COUNT(*) FILTER (WHERE o.status = 'processing') AS n_proc "
             "FROM {orders} o JOIN {customers} c "
             "ON o.customer_id = c.customer_id GROUP BY c.segment"
         ),
-        "tables": ["orders", "customers"],
-        "finding": (
-            "The aggregate FILTER (WHERE ...) clause is silently dropped: the "
-            "engine returns the UNFILTERED aggregate and presents it as the "
-            "filtered one - a silent wrong answer, not a raise. For segment "
-            "'enterprise' the engine returns COUNT = 5 (every enterprise order) "
-            "where the FILTER (WHERE o.status = 'processing') restricts it to 2; "
-            "'consumer' and 'smb' are wrong the same way. Reproduced at ALL "
-            "seven placements (oracle_single_duck, duck_duck, pg_duck, duck_pg, "
-            "all_pg, parquet_duck, parquet_pg), so it is source-independent - "
-            "the FILTER is discarded during parse/bind before any placement "
-            "decision. A COUNT(*) FILTER (WHERE ...) that yields the plain "
-            "COUNT(*) means the predicate never reaches the aggregate. Kept out "
-            "of CASES so the suite stays green; re-add as the regression guard "
-            "once the parser either honors the FILTER clause or raises "
-            "'unsupported SQL' on it (answering it wrong is worse than raising)."
+    },
+    {
+        "name": "gap_aggregate_filter_single_source",
+        "tables": ["orders"],
+        "query": (
+            "SELECT COUNT(*) FILTER (WHERE o.status = 'processing') AS n_proc, "
+            "SUM(o.quantity) FILTER (WHERE o.status = 'shipped') AS q_ship "
+            "FROM {orders} o"
         ),
     },
-}
+    {
+        "name": "gap_aggregate_filter_multiple_different_predicates",
+        "tables": ["orders"],
+        "query": (
+            "SELECT o.customer_id AS cid, "
+            "COUNT(*) FILTER (WHERE o.status = 'processing') AS n_proc, "
+            "COUNT(*) FILTER (WHERE o.status = 'shipped') AS n_ship, "
+            "SUM(o.price) FILTER (WHERE o.quantity > 3) AS big_total, "
+            "COUNT(*) AS n_all "
+            "FROM {orders} o GROUP BY o.customer_id"
+        ),
+    },
+    {
+        "name": "gap_aggregate_filter_predicate_on_other_source",
+        "tables": ["orders", "customers"],
+        "query": (
+            "SELECT c.segment AS seg, "
+            "COUNT(*) FILTER (WHERE c.city = 'Boston') AS n_boston, "
+            "SUM(o.price) FILTER (WHERE c.segment = 'enterprise') AS ent_total "
+            "FROM {orders} o JOIN {customers} c "
+            "ON o.customer_id = c.customer_id GROUP BY c.segment"
+        ),
+    },
+    {
+        "name": "gap_aggregate_count_distinct_filter",
+        "tables": ["orders", "customers"],
+        "query": (
+            "SELECT c.segment AS seg, "
+            "COUNT(DISTINCT o.customer_id) "
+            "FILTER (WHERE o.status = 'processing') AS distinct_proc "
+            "FROM {orders} o JOIN {customers} c "
+            "ON o.customer_id = c.customer_id GROUP BY c.segment"
+        ),
+    },
+    {
+        "name": "gap_aggregate_filter_over_dup_fanout",
+        "tables": ["t_dup_a", "t_dup_b"],
+        "query": (
+            "SELECT a.k AS k, "
+            "SUM(a.k) FILTER (WHERE b.note LIKE 'b1%') AS k_b1 "
+            "FROM {t_dup_a} a JOIN {t_dup_b} b ON a.k = b.k "
+            "GROUP BY a.k"
+        ),
+    },
+    {
+        "name": "gap_aggregate_filter_on_median_raises",
+        "tables": ["orders"],
+        "expect_error": "ordered-set aggregate",
+        "query": (
+            "SELECT MEDIAN(o.price) FILTER (WHERE o.status = 'processing') "
+            "FROM {orders} o"
+        ),
+    },
+]

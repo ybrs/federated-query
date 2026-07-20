@@ -477,7 +477,21 @@ impl Converter<'_> {
         Ok((keys, ascending, nulls))
     }
 
-    /// Convert COUNT(*) / COUNT(expr) / COUNT(DISTINCT expr).
+    /// Convert an aggregate's optional `FILTER (WHERE predicate)` clause into a
+    /// boxed engine predicate. Dropping it would return the unfiltered aggregate
+    /// under the filtered column's name, so it is threaded, never ignored.
+    fn convert_agg_filter(
+        &self,
+        filter: Option<&Expression>,
+    ) -> Result<Option<Box<Expr>>, ParseError> {
+        match filter {
+            Some(predicate) => Ok(Some(Box::new(self.expr(predicate)?))),
+            None => Ok(None),
+        }
+    }
+
+    /// Convert COUNT(*) / COUNT(expr) / COUNT(DISTINCT expr), carrying an optional
+    /// FILTER (WHERE ...) clause.
     fn convert_count(&self, count: &CountFunc) -> Result<Expr, ParseError> {
         let args = match &count.this {
             Some(inner) => vec![self.expr(inner)?],
@@ -485,7 +499,8 @@ impl Converter<'_> {
         };
         // Fresh COUNT call built from the parsed COUNT(*)/COUNT(expr) - no base to
         // copy from. Field list (function_name/args/is_aggregate/distinct/
-        // within_group_key/within_group_desc) is the complete FunctionCall variant.
+        // within_group_key/within_group_desc/filter) is the complete FunctionCall
+        // variant.
         Ok(Expr::FunctionCall {
             function_name: "COUNT".to_string(),
             args,
@@ -493,14 +508,15 @@ impl Converter<'_> {
             distinct: count.distinct,
             within_group_key: None,
             within_group_desc: false,
+            filter: self.convert_agg_filter(count.filter.as_ref())?,
         })
     }
 
-    /// Convert SUM/AVG/MIN/MAX(expr).
+    /// Convert SUM/AVG/MIN/MAX(expr), carrying an optional FILTER (WHERE ...) clause.
     fn convert_aggregate(&self, name: &str, agg: &AggFunc) -> Result<Expr, ParseError> {
         // Fresh SUM/AVG/MIN/MAX call built from the parsed aggregate - no base to copy
         // from. Field list (function_name/args/is_aggregate/distinct/within_group_key/
-        // within_group_desc) is the complete FunctionCall variant.
+        // within_group_desc/filter) is the complete FunctionCall variant.
         Ok(Expr::FunctionCall {
             function_name: name.to_string(),
             args: vec![self.expr(&agg.this)?],
@@ -508,6 +524,7 @@ impl Converter<'_> {
             distinct: agg.distinct,
             within_group_key: None,
             within_group_desc: false,
+            filter: self.convert_agg_filter(agg.filter.as_ref())?,
         })
     }
 
@@ -534,7 +551,8 @@ impl Converter<'_> {
         }
         // Fresh STRING_AGG call built from value + separator - no base to copy from.
         // Field list (function_name/args/is_aggregate/distinct/within_group_key/
-        // within_group_desc) is the complete FunctionCall variant.
+        // within_group_desc/filter) is the complete FunctionCall variant. A FILTER on
+        // STRING_AGG already raised above, so filter is always None here.
         Ok(Expr::FunctionCall {
             function_name: "STRING_AGG".to_string(),
             args,
@@ -542,6 +560,7 @@ impl Converter<'_> {
             distinct: agg.distinct,
             within_group_key: None,
             within_group_desc: false,
+            filter: None,
         })
     }
 
@@ -561,7 +580,9 @@ impl Converter<'_> {
         let key = Box::new(self.expr(&ordered.this)?);
         // Fresh ordered-set aggregate call - no base to copy from. Field list
         // (function_name/args/is_aggregate/distinct/within_group_key/
-        // within_group_desc) is the complete FunctionCall variant.
+        // within_group_desc/filter) is the complete FunctionCall variant. A FILTER on
+        // an ordered-set aggregate already raised in `within_group_inner`, so filter
+        // is always None here.
         Ok(Expr::FunctionCall {
             function_name: name,
             args,
@@ -569,25 +590,32 @@ impl Converter<'_> {
             distinct,
             within_group_key: Some(key),
             within_group_desc: ordered.desc,
+            filter: None,
         })
     }
 
     /// The (name, converted args, distinct) of the aggregate inside a WITHIN
     /// GROUP. PERCENTILE_CONT/DISC arrive as a generic AggregateFunction; MODE()
     /// arrives as the dedicated Mode node with no arguments. Anything else raises.
+    /// A FILTER (WHERE ...) on an ordered-set aggregate is not modeled and raises
+    /// rather than being dropped.
     fn within_group_inner(
         &self,
         inner: &Expression,
     ) -> Result<(String, Vec<Expr>, bool), ParseError> {
         match inner {
             Expression::AggregateFunction(func) => {
+                reject_ordered_set_filter(func.filter.as_ref())?;
                 let mut args = Vec::with_capacity(func.args.len());
                 for arg in &func.args {
                     args.push(self.expr(arg)?);
                 }
                 Ok((func.name.to_uppercase(), args, func.distinct))
             }
-            Expression::Mode(agg) => Ok(("MODE".to_string(), Vec::new(), agg.distinct)),
+            Expression::Mode(agg) => {
+                reject_ordered_set_filter(agg.filter.as_ref())?;
+                Ok(("MODE".to_string(), Vec::new(), agg.distinct))
+            }
             other => Err(ParseError::Unsupported(format!(
                 "ordered-set aggregate `{}`",
                 other.variant_name()
@@ -598,10 +626,13 @@ impl Converter<'_> {
     /// Lower MEDIAN(x) to PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x): MEDIAN
     /// has no canonical Postgres form, PERCENTILE_CONT does.
     fn convert_median(&self, agg: &AggFunc) -> Result<Expr, ParseError> {
+        // MEDIAN lowers to an ordered-set PERCENTILE_CONT; a FILTER on an ordered-set
+        // aggregate is not modeled and raises rather than being dropped.
+        reject_ordered_set_filter(agg.filter.as_ref())?;
         let key = Box::new(self.expr(&agg.this)?);
         // Fresh PERCENTILE_CONT call standing in for MEDIAN - no base to copy from.
         // Field list (function_name/args/is_aggregate/distinct/within_group_key/
-        // within_group_desc) is the complete FunctionCall variant.
+        // within_group_desc/filter) is the complete FunctionCall variant.
         Ok(Expr::FunctionCall {
             function_name: "PERCENTILE_CONT".to_string(),
             args: vec![Expr::Literal {
@@ -612,6 +643,7 @@ impl Converter<'_> {
             distinct: agg.distinct,
             within_group_key: Some(key),
             within_group_desc: false,
+            filter: None,
         })
     }
 
@@ -636,11 +668,24 @@ impl Converter<'_> {
     }
 }
 
-/// Build a scalar function-call expression from a name and converted args.
+/// Raise when an ordered-set aggregate (PERCENTILE_CONT/DISC/MODE/MEDIAN) carries a
+/// FILTER (WHERE ...) clause: the combination is not modeled, and dropping the
+/// filter would return the unfiltered ordered-set result under the filtered name.
+fn reject_ordered_set_filter(filter: Option<&Expression>) -> Result<(), ParseError> {
+    if filter.is_some() {
+        return Err(ParseError::Unsupported(
+            "FILTER on an ordered-set aggregate".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Build a scalar function-call expression from a name and converted args. A scalar
+/// call never carries a FILTER (that is an aggregate-only clause), so filter is None.
 pub(crate) fn scalar_function_call(name: String, args: Vec<Expr>) -> Expr {
     // Fresh scalar function call built from a name + converted args - no base to copy
     // from. Field list (function_name/args/is_aggregate/distinct/within_group_key/
-    // within_group_desc) is the complete FunctionCall variant.
+    // within_group_desc/filter) is the complete FunctionCall variant.
     Expr::FunctionCall {
         function_name: name,
         args,
@@ -648,6 +693,7 @@ pub(crate) fn scalar_function_call(name: String, args: Vec<Expr>) -> Expr {
         distinct: false,
         within_group_key: None,
         within_group_desc: false,
+        filter: None,
     }
 }
 

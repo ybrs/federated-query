@@ -927,6 +927,7 @@ fn agg_call(name: &str, arg: Expr) -> Expr {
         distinct: false,
         within_group_key: None,
         within_group_desc: false,
+        filter: None,
     }
 }
 
@@ -939,6 +940,7 @@ fn grouping_call(table: &str, name: &str) -> Expr {
         distinct: false,
         within_group_key: None,
         within_group_desc: false,
+        filter: None,
     }
 }
 
@@ -951,6 +953,7 @@ fn window_fn(name: &str) -> Expr {
         distinct: false,
         within_group_key: None,
         within_group_desc: false,
+        filter: None,
     }
 }
 

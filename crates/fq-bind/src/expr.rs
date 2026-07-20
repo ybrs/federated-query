@@ -195,16 +195,19 @@ impl Binder<'_> {
             distinct,
             within_group_key,
             within_group_desc,
+            filter,
         } = expr
         else {
             unreachable!("bind_function_call called on a non-FunctionCall expression");
         };
         let bound_args = self.bind_expr_list(args)?;
         let bound_within_group = self.bind_opt(within_group_key.as_deref())?;
+        let bound_filter = self.bind_opt(filter.as_deref())?;
         // Fresh bound copy from the borrowed source (no `..base` on an enum variant):
-        // args and within_group_key rebound; function_name and the is_aggregate/
-        // distinct/within_group_desc flags copied. Field list (function_name/args/
-        // is_aggregate/distinct/within_group_key/within_group_desc) is complete.
+        // args, within_group_key, and the FILTER predicate rebound; function_name and
+        // the is_aggregate/distinct/within_group_desc flags copied. Field list
+        // (function_name/args/is_aggregate/distinct/within_group_key/
+        // within_group_desc/filter) is complete.
         Ok(Expr::FunctionCall {
             function_name: function_name.clone(),
             args: bound_args,
@@ -212,6 +215,7 @@ impl Binder<'_> {
             distinct: *distinct,
             within_group_key: bound_within_group,
             within_group_desc: *within_group_desc,
+            filter: bound_filter,
         })
     }
 

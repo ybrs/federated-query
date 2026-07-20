@@ -156,6 +156,7 @@ fn sum(table: &str, column: &str) -> Expr {
         distinct: false,
         within_group_key: None,
         within_group_desc: false,
+        filter: None,
     }
 }
 
@@ -174,6 +175,7 @@ fn merge_sum(alias: &str, column: &str) -> Expr {
         distinct: false,
         within_group_key: None,
         within_group_desc: false,
+        filter: None,
     }
 }
 
@@ -291,6 +293,7 @@ fn non_sum_aggregate_declines() {
         distinct: false,
         within_group_key: None,
         within_group_desc: false,
+        filter: None,
     };
     let plan = aggregate(
         join,
@@ -315,11 +318,46 @@ fn distinct_sum_declines() {
         distinct: true,
         within_group_key: None,
         within_group_desc: false,
+        filter: None,
     };
     let plan = aggregate(
         join,
         vec![col("c", "mktsegment")],
         vec![col("c", "mktsegment"), distinct_sum],
+        &["mktsegment", "revenue"],
+    );
+    assert_eq!(rule(q04_model()).apply(plan.clone()).unwrap(), plan);
+}
+
+#[test]
+fn filtered_sum_declines() {
+    // A SUM(...) FILTER (WHERE ...) cannot be split into partial+merge without the
+    // predicate being applied in the partial stage, which the rewrite does not model,
+    // so the rule declines and the aggregate stays whole (correct-but-slower).
+    let join = inner(
+        scan("duck", "orders", "o", &["custkey", "total"]),
+        scan("pg", "customer", "c", &["custkey", "mktsegment"]),
+        eq(col("o", "custkey"), col("c", "custkey")),
+    );
+    let filtered_sum = Expr::FunctionCall {
+        function_name: "SUM".to_string(),
+        args: vec![col("o", "total")],
+        is_aggregate: true,
+        distinct: false,
+        within_group_key: None,
+        within_group_desc: false,
+        filter: Some(Box::new(gt(
+            col("o", "total"),
+            Expr::Literal {
+                value: LiteralValue::Integer(0),
+                data_type: DataType::Integer,
+            },
+        ))),
+    };
+    let plan = aggregate(
+        join,
+        vec![col("c", "mktsegment")],
+        vec![col("c", "mktsegment"), filtered_sum],
         &["mktsegment", "revenue"],
     );
     assert_eq!(rule(q04_model()).apply(plan.clone()).unwrap(), plan);

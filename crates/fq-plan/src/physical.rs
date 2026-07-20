@@ -1150,6 +1150,7 @@ mod tests {
             distinct: false,
             within_group_key: None,
             within_group_desc: false,
+            filter: None,
         }
     }
 
@@ -1210,6 +1211,7 @@ mod tests {
             distinct: false,
             within_group_key: None,
             within_group_desc: false,
+            filter: None,
         }
     }
 

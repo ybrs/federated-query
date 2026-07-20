@@ -261,6 +261,10 @@ pub struct AggCall {
     /// Present for an ordered-set aggregate: the `WITHIN GROUP (ORDER BY ...)`.
     #[serde(default)]
     pub within_group: Option<WithinGroup>,
+    /// `FILTER (WHERE predicate)`: restricts which rows this aggregate consumes.
+    /// None when the aggregate carries no filter.
+    #[serde(default)]
+    pub filter: Option<IrExpr>,
 }
 
 /// The `WITHIN GROUP (ORDER BY key [DESC])` of an ordered-set aggregate.

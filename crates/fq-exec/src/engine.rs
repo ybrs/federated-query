@@ -1781,6 +1781,12 @@ fn render_agg(agg: &AggCall) -> Result<String, DataFusionError> {
         let direction = if wg.desc { " DESC" } else { "" };
         sql.push_str(&format!(" WITHIN GROUP (ORDER BY {key}{direction})"));
     }
+    if let Some(predicate) = &agg.filter {
+        // DataFusion's SQL planner applies `agg(...) FILTER (WHERE predicate)` to the
+        // aggregate; dropping it would compute the coordinator aggregate over every row.
+        let rendered = render_expr(&to_df_expr(predicate)?)?;
+        sql.push_str(&format!(" FILTER (WHERE {rendered})"));
+    }
     Ok(sql)
 }
 
@@ -1828,6 +1834,7 @@ mod render_agg_tests {
             star: false,
             args,
             within_group: None,
+            filter: None,
         }
     }
 
@@ -1847,6 +1854,27 @@ mod render_agg_tests {
             .expect("render")
             .to_uppercase();
         assert!(!sql.contains("CAST("), "{sql}");
+    }
+
+    #[test]
+    fn filter_clause_lowers_to_datafusion_sql() {
+        // The coordinator aggregate carries its FILTER into the DataFusion SQL it runs;
+        // dropping it would aggregate over every row and return the unfiltered count.
+        let mut call = agg("count", vec![]);
+        call.star = true;
+        call.filter = Some(IrExpr::Binary {
+            op: "=".to_string(),
+            left: Box::new(col("status")),
+            right: Box::new(IrExpr::Literal {
+                value: crate::core::ir::LiteralValue::Str {
+                    value: "processing".to_string(),
+                },
+            }),
+        });
+        let sql = render_agg(&call).expect("render").to_uppercase();
+        assert!(sql.starts_with("COUNT(*)"), "{sql}");
+        assert!(sql.contains("FILTER (WHERE"), "{sql}");
+        assert!(sql.contains("PROCESSING"), "{sql}");
     }
 }
 

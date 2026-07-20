@@ -718,6 +718,7 @@ fn row_number_window(partition_by: Vec<Expr>, order: Option<&OrderSpec>) -> Expr
         distinct: false,
         within_group_key: None,
         within_group_desc: false,
+        filter: None,
     };
     let (order_keys, order_ascending, order_nulls) = match order {
         Some((keys, ascending, nulls)) => {

@@ -70,6 +70,7 @@ fn one_of_each() -> Vec<(Expr, &'static str)> {
                 distinct: false,
                 within_group_key: None,
                 within_group_desc: false,
+                filter: None,
             },
             "function_call",
         ),
@@ -126,6 +127,7 @@ fn one_of_each() -> Vec<(Expr, &'static str)> {
                     distinct: false,
                     within_group_key: None,
                     within_group_desc: false,
+                    filter: None,
                 }),
                 partition_by: vec![col()],
                 order_keys: vec![col()],
@@ -223,6 +225,7 @@ fn column_refs_collects_nested_in_order() {
             distinct: false,
             within_group_key: None,
             within_group_desc: false,
+            filter: None,
         }),
         lower: Box::new(Expr::Column(ColumnRef::new(None, "b", None))),
         upper: Box::new(Expr::Cast {

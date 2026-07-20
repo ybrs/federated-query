@@ -37,7 +37,7 @@ pub fn render_expr(expr: &Expr, resolver: &dyn ColumnResolver) -> Result<String,
             distinct,
             within_group_key,
             within_group_desc,
-            ..
+            filter,
         } => render_function(
             function_name,
             args,
@@ -45,6 +45,7 @@ pub fn render_expr(expr: &Expr, resolver: &dyn ColumnResolver) -> Result<String,
             *distinct,
             within_group_key.as_deref(),
             *within_group_desc,
+            filter.as_deref(),
             resolver,
         ),
         Expr::Case {
@@ -194,6 +195,7 @@ fn render_function(
     distinct: bool,
     within_group_key: Option<&Expr>,
     within_group_desc: bool,
+    filter: Option<&Expr>,
     resolver: &dyn ColumnResolver,
 ) -> Result<String, EmitError> {
     // A zero-argument AGGREGATE is the star form: `COUNT(*)`. Rendering the
@@ -219,6 +221,15 @@ fn render_function(
         call = format!(
             "{call} WITHIN GROUP (ORDER BY {}{direction})",
             render_expr(key, resolver)?
+        );
+    }
+    if let Some(predicate) = filter {
+        // `agg(...) FILTER (WHERE predicate)`: standard SQL that Postgres, DuckDB,
+        // and DataFusion all accept, and that polyglot round-trips to each dialect at
+        // the transpile boundary. Dropping it would present the unfiltered aggregate.
+        call = format!(
+            "{call} FILTER (WHERE {})",
+            render_expr(predicate, resolver)?
         );
     }
     Ok(call)
@@ -555,6 +566,7 @@ mod tests {
             distinct,
             within_group_key: None,
             within_group_desc: false,
+            filter: None,
         }
     }
 
@@ -585,6 +597,7 @@ mod tests {
             distinct: false,
             within_group_key: None,
             within_group_desc: false,
+            filter: None,
         };
         assert_eq!(render(&call), "NOW()");
     }
@@ -601,6 +614,7 @@ mod tests {
             distinct: false,
             within_group_key: Some(Box::new(col("t", "x"))),
             within_group_desc: false,
+            filter: None,
         };
         assert_eq!(
             render(&asc),
@@ -616,10 +630,73 @@ mod tests {
             distinct: false,
             within_group_key: Some(Box::new(col("t", "x"))),
             within_group_desc: true,
+            filter: None,
         };
         assert_eq!(
             render(&desc),
             "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY \"t\".\"x\" DESC)"
+        );
+    }
+
+    fn count_filtered(predicate: Expr) -> Expr {
+        Expr::FunctionCall {
+            function_name: "COUNT".to_string(),
+            args: vec![],
+            is_aggregate: true,
+            distinct: false,
+            within_group_key: None,
+            within_group_desc: false,
+            filter: Some(Box::new(predicate)),
+        }
+    }
+
+    #[test]
+    fn aggregate_filter_renders_and_transpiles() {
+        // `COUNT(*) FILTER (WHERE x = 1)` renders the canonical Postgres FILTER form,
+        // and the transpile boundary carries it verbatim to the DuckDB and DataFusion
+        // dialects (all three accept the aggregate FILTER clause).
+        let predicate = Expr::BinaryOp {
+            op: BinaryOpType::Eq,
+            left: Box::new(col("t", "x")),
+            right: Box::new(Expr::Literal {
+                value: LiteralValue::Integer(1),
+                data_type: DataType::Integer,
+            }),
+        };
+        let canonical = render(&count_filtered(predicate));
+        assert_eq!(canonical, "COUNT(*) FILTER (WHERE (\"t\".\"x\" = 1))");
+        // Each dialect keeps the FILTER clause through the transpile (polyglot's
+        // generator omits the space, rendering `FILTER(WHERE ...)`, still valid SQL).
+        for dialect in [Dialect::Postgres, Dialect::DuckDb, Dialect::DataFusion] {
+            let sql = to_source_sql(&format!("SELECT {canonical}"), dialect).unwrap();
+            assert!(sql.to_uppercase().contains("FILTER"), "{dialect:?}: {sql}");
+            assert!(sql.to_uppercase().contains("WHERE"), "{dialect:?}: {sql}");
+        }
+    }
+
+    #[test]
+    fn distinct_aggregate_filter_renders() {
+        // COUNT(DISTINCT x) FILTER (WHERE ...) keeps both the DISTINCT and the FILTER.
+        let predicate = Expr::BinaryOp {
+            op: BinaryOpType::Gt,
+            left: Box::new(col("t", "x")),
+            right: Box::new(Expr::Literal {
+                value: LiteralValue::Integer(0),
+                data_type: DataType::Integer,
+            }),
+        };
+        let call = Expr::FunctionCall {
+            function_name: "COUNT".to_string(),
+            args: vec![col("t", "x")],
+            is_aggregate: true,
+            distinct: true,
+            within_group_key: None,
+            within_group_desc: false,
+            filter: Some(Box::new(predicate)),
+        };
+        assert_eq!(
+            render(&call),
+            "COUNT(DISTINCT \"t\".\"x\") FILTER (WHERE (\"t\".\"x\" > 0))"
         );
     }
 
@@ -725,6 +802,7 @@ mod tests {
             distinct: false,
             within_group_key: None,
             within_group_desc: false,
+            filter: None,
         };
         Expr::Window {
             function: Box::new(function),
@@ -793,6 +871,7 @@ mod tests {
             distinct: false,
             within_group_key: None,
             within_group_desc: false,
+            filter: None,
         };
         let windowed = Expr::Window {
             function: Box::new(lag),

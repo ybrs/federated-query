@@ -213,6 +213,13 @@ pub enum Expr {
         /// Ordered-set aggregates carry their WITHIN GROUP sort key here.
         within_group_key: Option<Box<Expr>>,
         within_group_desc: bool,
+        /// `agg(...) FILTER (WHERE predicate)`: a per-aggregate boolean predicate
+        /// restricting which input rows the aggregate consumes. Only an aggregate
+        /// call carries one (scalar calls hold None). The predicate is a child
+        /// expression - it is walked, bound, retagged, and pushed exactly like the
+        /// arguments - so two aggregates that differ only in this predicate are
+        /// distinct calls, never interchangeable.
+        filter: Option<Box<Expr>>,
     },
     Case {
         when_clauses: Vec<WhenClause>,
@@ -377,11 +384,15 @@ impl Expr {
             Expr::FunctionCall {
                 args,
                 within_group_key,
+                filter,
                 ..
             } => {
                 let mut children: Vec<&Expr> = args.iter().collect();
                 if let Some(key) = within_group_key {
                     children.push(key);
+                }
+                if let Some(predicate) = filter {
+                    children.push(predicate);
                 }
                 children
             }
@@ -470,6 +481,7 @@ impl Expr {
                 distinct,
                 within_group_key,
                 within_group_desc,
+                filter,
             } => map_function_call(
                 function_name,
                 args,
@@ -477,6 +489,7 @@ impl Expr {
                 distinct,
                 within_group_key,
                 within_group_desc,
+                filter,
                 f,
             ),
             Expr::Case {
@@ -591,6 +604,7 @@ impl Expr {
                 distinct,
                 within_group_key,
                 within_group_desc,
+                filter,
             } => try_map_function_call(
                 function_name,
                 args,
@@ -598,6 +612,7 @@ impl Expr {
                 distinct,
                 within_group_key,
                 within_group_desc,
+                filter,
                 f,
             )?,
             Expr::Case {
@@ -690,10 +705,12 @@ fn map_function_call(
     distinct: bool,
     within_group_key: Option<Box<Expr>>,
     within_group_desc: bool,
+    filter: Option<Box<Expr>>,
     f: &mut impl FnMut(Expr) -> Expr,
 ) -> Expr {
-    // Variant rebuild: every field is listed explicitly (args and the ordered-set
-    // key remapped, the flags carried) so no field can be silently dropped.
+    // Variant rebuild: every field is listed explicitly (args, the ordered-set key,
+    // and the FILTER predicate remapped, the flags carried) so no field can be
+    // silently dropped.
     Expr::FunctionCall {
         function_name,
         args: map_vec(args, f),
@@ -701,6 +718,7 @@ fn map_function_call(
         distinct,
         within_group_key: within_group_key.map(|key| Box::new(f(*key))),
         within_group_desc,
+        filter: filter.map(|predicate| Box::new(f(*predicate))),
     }
 }
 
@@ -713,10 +731,12 @@ fn try_map_function_call<E>(
     distinct: bool,
     within_group_key: Option<Box<Expr>>,
     within_group_desc: bool,
+    filter: Option<Box<Expr>>,
     f: &mut impl FnMut(Expr) -> Result<Expr, E>,
 ) -> Result<Expr, E> {
-    // Variant rebuild: every field is listed explicitly (args and the ordered-set
-    // key remapped, the flags carried) so no field can be silently dropped.
+    // Variant rebuild: every field is listed explicitly (args, the ordered-set key,
+    // and the FILTER predicate remapped, the flags carried) so no field can be
+    // silently dropped.
     Ok(Expr::FunctionCall {
         function_name,
         args: try_map_vec(args, f)?,
@@ -727,6 +747,10 @@ fn try_map_function_call<E>(
             None => None,
         },
         within_group_desc,
+        filter: match filter {
+            Some(predicate) => Some(Box::new(f(*predicate)?)),
+            None => None,
+        },
     })
 }
 
@@ -1168,6 +1192,7 @@ mod tests {
             distinct: false,
             within_group_key: None,
             within_group_desc: false,
+            filter: None,
         }
     }
 
@@ -1252,6 +1277,7 @@ mod tests {
             distinct: false,
             within_group_key: None,
             within_group_desc: false,
+            filter: None,
         }
     }
 
@@ -1335,6 +1361,7 @@ mod tests {
             distinct: false,
             within_group_key: None,
             within_group_desc: false,
+            filter: None,
         };
         let upper = Expr::FunctionCall {
             function_name: "UPPER".to_string(),
@@ -1343,6 +1370,7 @@ mod tests {
             distinct: false,
             within_group_key: None,
             within_group_desc: false,
+            filter: None,
         };
         assert!(contains_aggregate(&upper));
         assert!(!contains_aggregate(&col("a")));

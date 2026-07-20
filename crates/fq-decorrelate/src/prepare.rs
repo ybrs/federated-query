@@ -919,6 +919,7 @@ pub(crate) fn coalesce_zero(value_ref: Expr) -> Expr {
         distinct: false,
         within_group_key: None,
         within_group_desc: false,
+        filter: None,
     }
 }
 

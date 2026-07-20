@@ -61,6 +61,7 @@ fn sum(table: &str, column: &str) -> Expr {
         distinct: false,
         within_group_key: None,
         within_group_desc: false,
+        filter: None,
     }
 }
 

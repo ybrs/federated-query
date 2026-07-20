@@ -294,19 +294,23 @@ fn sum_only_outputs(agg: &Aggregate) -> bool {
     !contains_eager_partial(&agg.input)
 }
 
-/// Whether an output entry is a plain (non-DISTINCT, non-ordered-set) SUM call.
+/// Whether an output entry is a plain (non-DISTINCT, non-ordered-set, non-FILTERed)
+/// SUM call. A FILTERed SUM would need its predicate applied in the partial stage and
+/// re-applied nowhere in the merge; the split does not model that, so a FILTER
+/// disqualifies the SUM and the rule declines (the aggregate stays whole).
 fn plain_sum(entry: &Expr) -> bool {
     let Expr::FunctionCall {
         function_name,
         is_aggregate,
         distinct,
         within_group_key,
+        filter,
         ..
     } = entry
     else {
         return false;
     };
-    if !is_aggregate || *distinct || within_group_key.is_some() {
+    if !is_aggregate || *distinct || within_group_key.is_some() || filter.is_some() {
         return false;
     }
     function_name.eq_ignore_ascii_case("SUM")
@@ -823,7 +827,7 @@ fn merge_entry(
 }
 
 /// The merge SUM: the original call with its argument swapped for the partial's
-/// synthetic column (distinct/within-group flags are gate-guaranteed empty).
+/// synthetic column (distinct/within-group/filter are gate-guaranteed empty).
 fn merge_sum(entry: &Expr, alias: &str, sum_name: &str) -> Expr {
     let Expr::FunctionCall {
         function_name,
@@ -852,6 +856,7 @@ fn merge_sum(entry: &Expr, alias: &str, sum_name: &str) -> Expr {
         distinct: *distinct,
         within_group_key: None,
         within_group_desc: *within_group_desc,
+        filter: None,
     }
 }
 

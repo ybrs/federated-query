@@ -710,6 +710,7 @@ fn window_projection_lowers_to_a_window_node() {
             distinct: false,
             within_group_key: None,
             within_group_desc: false,
+            filter: None,
         }),
         partition_by: vec![],
         order_keys: vec![col("orders", "id")],

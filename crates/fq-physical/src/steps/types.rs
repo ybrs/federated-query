@@ -183,6 +183,9 @@ pub struct AggCall {
     pub star: bool,
     pub args: Vec<Expr>,
     pub within_group: Option<WithinGroup>,
+    /// `FILTER (WHERE predicate)`, retagged over the fragment input; None when the
+    /// aggregate carries no filter.
+    pub filter: Option<Expr>,
 }
 
 /// An ordered-set aggregate's WITHIN GROUP sort key. (ir.rs `WithinGroup`.)

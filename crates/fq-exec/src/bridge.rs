@@ -294,6 +294,7 @@ fn convert_agg_call(call: steps::AggCall) -> ExecResult<ir::AggCall> {
         star: call.star,
         args: serialize_exprs(&call.args)?,
         within_group,
+        filter: serialize_optional(call.filter.as_ref())?,
     })
 }
 
@@ -431,8 +432,22 @@ pub fn serialize_expr(expr: &Expr) -> ExecResult<ir::IrExpr> {
             function_name,
             args,
             is_aggregate,
+            filter,
             ..
-        } => serialize_call(function_name, args, *is_aggregate),
+        } => {
+            // A top-level aggregate SELECT item lowers through the structured `AggCall`
+            // path (which carries the FILTER); this expression path only sees an
+            // aggregate when one is nested inside a larger expression, where the IR
+            // `Function` node has no filter slot. Raising keeps the FILTER from being
+            // dropped into a wrong answer.
+            if *is_aggregate && filter.is_some() {
+                return Err(ExecError::runtime(format!(
+                    "aggregate '{function_name}' with a FILTER clause nested inside an \
+                     expression has no execution IR form"
+                )));
+            }
+            serialize_call(function_name, args, *is_aggregate)
+        }
         Expr::Window { .. }
         | Expr::Interval { .. }
         | Expr::Tuple { .. }
@@ -805,6 +820,7 @@ mod tests {
             distinct: false,
             within_group_key: None,
             within_group_desc: false,
+            filter: None,
         }
     }
 

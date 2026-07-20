@@ -80,6 +80,68 @@ fn group_by_aggregate_pipeline() {
 }
 
 #[test]
+fn aggregate_filter_clause_is_carried() {
+    // COUNT(*) FILTER (WHERE status = 'x') must carry the predicate on the call, not
+    // silently drop it (which would return the unfiltered count).
+    let plan = parse("SELECT city, COUNT(*) FILTER (WHERE age > 30) AS n FROM users GROUP BY city")
+        .unwrap();
+    let LogicalPlan::Aggregate(aggregate) = plan else {
+        panic!("expected Aggregate at root");
+    };
+    let Expr::FunctionCall {
+        function_name,
+        filter,
+        ..
+    } = &aggregate.aggregates[1]
+    else {
+        panic!("expected a COUNT FunctionCall");
+    };
+    assert_eq!(function_name, "COUNT");
+    let filter = filter.as_ref().expect("FILTER predicate carried");
+    assert!(matches!(
+        filter.as_ref(),
+        Expr::BinaryOp {
+            op: BinaryOpType::Gt,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn sum_filter_clause_is_carried() {
+    let plan = parse("SELECT SUM(age) FILTER (WHERE age > 10) AS s FROM users").unwrap();
+    let LogicalPlan::Aggregate(aggregate) = plan else {
+        panic!("expected Aggregate at root");
+    };
+    let Expr::FunctionCall { filter, .. } = &aggregate.aggregates[0] else {
+        panic!("expected a SUM FunctionCall");
+    };
+    assert!(filter.is_some(), "SUM FILTER predicate must be carried");
+}
+
+#[test]
+fn string_agg_filter_raises() {
+    // A FILTER on STRING_AGG changes the concatenation and is not modeled; it raises
+    // rather than being dropped.
+    let result = parse("SELECT STRING_AGG(name, ',') FILTER (WHERE age > 30) FROM users");
+    assert!(
+        matches!(result, Err(ParseError::Unsupported(ref m)) if m.contains("STRING_AGG")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn ordered_set_filter_raises() {
+    // A FILTER on an ordered-set aggregate (here via MEDIAN) is not modeled; it raises
+    // rather than dropping the predicate.
+    let result = parse("SELECT MEDIAN(age) FILTER (WHERE age > 30) FROM users");
+    assert!(
+        matches!(result, Err(ParseError::Unsupported(ref m)) if m.contains("ordered-set")),
+        "{result:?}"
+    );
+}
+
+#[test]
 fn having_wraps_aggregate() {
     let plan =
         parse("SELECT city, COUNT(*) AS n FROM users GROUP BY city HAVING COUNT(*) > 5").unwrap();

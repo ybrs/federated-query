@@ -64,7 +64,9 @@ impl Converter<'_> {
         }
         // Fresh function call built from the parsed generic Function node - no base to
         // copy from. Field list (function_name/args/is_aggregate/distinct/
-        // within_group_key/within_group_desc) is the complete FunctionCall variant.
+        // within_group_key/within_group_desc/filter) is the complete FunctionCall
+        // variant. The generic Function node carries no FILTER (that clause only
+        // attaches to typed aggregate nodes), so filter is None.
         Ok(Expr::FunctionCall {
             function_name: func.name.to_uppercase(),
             args,
@@ -72,6 +74,7 @@ impl Converter<'_> {
             distinct: func.distinct,
             within_group_key: None,
             within_group_desc: false,
+            filter: None,
         })
     }
 

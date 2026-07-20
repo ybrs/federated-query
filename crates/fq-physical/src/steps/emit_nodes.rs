@@ -461,6 +461,7 @@ fn agg_call(expr: &Expr, aliases: &ColumnAliasMap) -> AggCall {
         distinct,
         within_group_key,
         within_group_desc,
+        filter,
         ..
     } = expr
     else {
@@ -480,12 +481,18 @@ fn agg_call(expr: &Expr, aliases: &ColumnAliasMap) -> AggCall {
         key: over_input(key, "in_0", aliases),
         desc: *within_group_desc,
     });
+    // The FILTER predicate references the same input columns as the arguments, so it
+    // is retagged over `in_0` the same way; dropping it would sum/count the whole group.
+    let filter = filter
+        .as_ref()
+        .map(|predicate| over_input(predicate, "in_0", aliases));
     AggCall {
         func: function_name.clone(),
         distinct: *distinct,
         star,
         args: call_args,
         within_group,
+        filter,
     }
 }
 

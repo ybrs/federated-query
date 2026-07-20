@@ -635,6 +635,7 @@ fn aggregate_over_same_source_join_pushes_with_group_by() {
         distinct: false,
         within_group_key: None,
         within_group_desc: false,
+        filter: None,
     };
     let node = LogicalPlan::Aggregate(Aggregate {
         input: Box::new(inner_join),
