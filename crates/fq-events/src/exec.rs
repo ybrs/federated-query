@@ -9,6 +9,8 @@
 //! oracle-checked by the events benchmark battery.
 
 use std::collections::HashMap;
+
+use crate::model::FastMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -1039,9 +1041,16 @@ fn render_funnel(
         .map(|key| (render_group_key(dataset, breakdown_prop, key), key.clone()))
         .collect();
     groups.sort_by_key(|(rendered, _)| breakdown_sort_key(rendered.as_ref()));
+    // A funnel nobody entered still reports its steps: without a breakdown
+    // the relation is one all-zero row per step (a breakdown with no entrant
+    // values has no rows to attribute).
+    if groups.is_empty() && spec.breakdown.is_none() {
+        groups.push((None, GroupKey::All));
+    }
     let mut rows = Vec::new();
+    let zero_entered = vec![0u64; spec.steps.len()];
     for (rendered, key) in groups {
-        let entered = &merged.entered[&key];
+        let entered = merged.entered.get(&key).unwrap_or(&zero_entered);
         let empty: Vec<Vec<i64>> = Vec::new();
         let durations = merged.durations.get(&key).unwrap_or(&empty);
         let start = entered[0];
@@ -1577,7 +1586,7 @@ fn segment_shard(
     math: BucketMath,
     cfg: &EventsConfig,
 ) -> Result<SegmentGroups, EventError> {
-    let mut groups: HashMap<(i64, GroupKey), (u64, u64, u64)> = HashMap::new();
+    let mut groups: FastMap<(i64, GroupKey), (u64, u64, u64)> = FastMap::default();
     let budget = cfg.query_memory_bytes / 16;
     for (run_index, run) in scan.actor_runs().into_iter().enumerate() {
         // Sequence numbers start at 1: a group slot's marker of 0 means the
@@ -1636,10 +1645,21 @@ fn approximate_group_bytes(entries: usize) -> u64 {
 const MAX_DEPTH: u32 = 10;
 
 /// One path sequence key: the exact code sequence, inline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PathKey {
     codes: [u64; MAX_DEPTH as usize],
     len: u8,
+}
+
+/// Hash only the filled prefix: unfilled slots are always zero, so equal
+/// keys hash equal while short paths skip the empty tail.
+impl std::hash::Hash for PathKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u8(self.len);
+        for code in &self.codes[..usize::from(self.len)] {
+            state.write_u64(*code);
+        }
+    }
 }
 
 /// Run a paths analysis per section 7.4.
@@ -1661,7 +1681,7 @@ pub fn run_paths(
         PathAnchor::StartingAt(name) => Some((resolve_event_code(dataset, name, cfg)?, true)),
         PathAnchor::EndingAt(name) => Some((resolve_event_code(dataset, name, cfg)?, false)),
     };
-    let mut merged: HashMap<PathKey, u64> = HashMap::new();
+    let mut merged: FastMap<PathKey, u64> = FastMap::default();
     run_sharded(
         io,
         dataset,
@@ -1689,8 +1709,8 @@ fn paths_shard(
     spec: &PathsSpec,
     anchor: Option<(u64, bool)>,
     cfg: &EventsConfig,
-) -> Result<HashMap<PathKey, u64>, EventError> {
-    let mut counts: HashMap<PathKey, u64> = HashMap::new();
+) -> Result<FastMap<PathKey, u64>, EventError> {
+    let mut counts: FastMap<PathKey, u64> = FastMap::default();
     // The collapsed stream: (code, fragment id).
     let mut stream: Vec<(u64, u32)> = Vec::new();
     let budget = cfg.query_memory_bytes / 16;
@@ -1752,7 +1772,7 @@ fn enumerate_windows(
     stream: &[(u64, u32)],
     spec: &PathsSpec,
     anchor: Option<(u64, bool)>,
-    counts: &mut HashMap<PathKey, u64>,
+    counts: &mut FastMap<PathKey, u64>,
 ) {
     let depth = spec.depth as usize;
     let n = stream.len();
@@ -1802,7 +1822,7 @@ fn count_window(
     stream: &[(u64, u32)],
     start: usize,
     end: usize,
-    counts: &mut HashMap<PathKey, u64>,
+    counts: &mut FastMap<PathKey, u64>,
 ) {
     let mut key = PathKey {
         codes: [0; MAX_DEPTH as usize],
@@ -1820,7 +1840,7 @@ fn count_window(
 fn render_paths(
     dataset: &Dataset,
     spec: &PathsSpec,
-    merged: &HashMap<PathKey, u64>,
+    merged: &FastMap<PathKey, u64>,
 ) -> PathsResult {
     let total: u64 = merged.values().sum();
     let mut named: Vec<(u64, String)> = merged

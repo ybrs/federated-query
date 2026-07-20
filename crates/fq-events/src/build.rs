@@ -706,8 +706,10 @@ fn append_frame(
             });
         }
     }
-    for _ in 0..rows {
-        columns.hashes.push(reader.u64().map_err(map_err)?);
+    for chunk in reader.take(rows * 8).map_err(map_err)?.chunks_exact(8) {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(chunk);
+        columns.hashes.push(u64::from_le_bytes(raw));
     }
     let mut key_total = *columns.key_offsets.last().expect("offsets seeded");
     let mut lens = Vec::with_capacity(rows);
@@ -721,11 +723,15 @@ fn append_frame(
     columns
         .key_bytes
         .extend_from_slice(reader.take(total as usize).map_err(map_err)?);
-    for _ in 0..rows {
-        columns.ts.push(reader.i64().map_err(map_err)?);
+    for chunk in reader.take(rows * 8).map_err(map_err)?.chunks_exact(8) {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(chunk);
+        columns.ts.push(i64::from_le_bytes(raw));
     }
-    for _ in 0..rows {
-        columns.tiebreak.push(reader.i64().map_err(map_err)?);
+    for chunk in reader.take(rows * 8).map_err(map_err)?.chunks_exact(8) {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(chunk);
+        columns.tiebreak.push(i64::from_le_bytes(raw));
     }
     for _ in 0..rows {
         columns.event.push(reader.varint().map_err(map_err)?);
@@ -765,14 +771,18 @@ fn append_frame_prop(
         }
         PropColumns::I64 { validity, values } => {
             validity.extend_from_slice(reader.take(rows)?);
-            for _ in 0..rows {
-                values.push(reader.i64()?);
+            for chunk in reader.take(rows * 8)?.chunks_exact(8) {
+                let mut raw = [0u8; 8];
+                raw.copy_from_slice(chunk);
+                values.push(i64::from_le_bytes(raw));
             }
         }
         PropColumns::F64 { validity, values } => {
             validity.extend_from_slice(reader.take(rows)?);
-            for _ in 0..rows {
-                values.push(f64::from_bits(reader.u64()?));
+            for chunk in reader.take(rows * 8)?.chunks_exact(8) {
+                let mut raw = [0u8; 8];
+                raw.copy_from_slice(chunk);
+                values.push(f64::from_bits(u64::from_le_bytes(raw)));
             }
         }
         PropColumns::Bool { validity, values } => {
@@ -1754,34 +1764,40 @@ fn finalize_in_memory(
     })?;
     let rows = columns.rows();
     let assignment = assign_local_ids(&columns, priors, shard as u32)?;
-    // Sort a permutation by the full (local, ts, tiebreak) key.
-    let mut permutation: Vec<u32> = (0..rows as u32).collect();
-    permutation.sort_unstable_by_key(|&row| {
-        let row = row as usize;
-        (
+    // Sort materialized (local, ts, tiebreak, row) records: one contiguous
+    // comparison per element instead of three random array loads per key
+    // evaluation (the closure-keyed sort was the finalize hot spot).
+    let mut keyed: Vec<(u64, i64, i64, u32)> = Vec::with_capacity(rows);
+    for row in 0..rows {
+        keyed.push((
             assignment.row_locals[row],
             columns.ts[row],
             columns.tiebreak[row],
-        )
-    });
+            row as u32,
+        ));
+    }
+    keyed.sort_unstable();
     let promoted = promotion_flags(layout, dicts);
     let encodings = final_encodings(layout, &promoted);
     let mut encoder = SegEncoder::new(shard as u32, params.generation, &encodings);
     let mut cells: Vec<PropCell<'_>> = Vec::with_capacity(layout.props.len());
     let mut min_ts = None;
     let mut max_ts = None;
-    for &row in &permutation {
-        let row = row as usize;
+    // The sorted key tuples already hold (local, ts, tiebreak) in output
+    // order, so the encoder reads them sequentially; only the event code,
+    // property cells, and key bytes gather through the permutation.
+    for (local, ts, tiebreak, row) in &keyed {
+        let row = *row as usize;
         cells.clear();
         for (prop, is_promoted) in promoted.iter().enumerate() {
             cells.push(columns.cell(prop, *is_promoted, row));
         }
-        min_ts = merge_min(min_ts, Some(columns.ts[row]));
-        max_ts = merge_max(max_ts, Some(columns.ts[row]));
+        min_ts = merge_min(min_ts, Some(*ts));
+        max_ts = merge_max(max_ts, Some(*ts));
         encoder.push_row(
-            assignment.row_locals[row],
-            columns.ts[row],
-            columns.tiebreak[row],
+            *local,
+            *ts,
+            *tiebreak,
             columns.event[row],
             &cells,
             columns.key(row),
@@ -1844,7 +1860,7 @@ pub(crate) struct IdAssignment {
     pub first_new_local: u64,
 }
 
-/// Deduplicate actors and assign dense local ids: rows sort by `(hash, key
+/// Deduplicate actors and assign dense local ids: rows group by `(hash, key
 /// bytes)`; equal-hash different-key pairs stay distinct (collision safety);
 /// returning actors resolve through the prior sidecar indexes; unseen actors
 /// get new ids in `(hash, key)` order continuing from the priors' maximum.
@@ -1854,12 +1870,13 @@ fn assign_local_ids(
     shard: u32,
 ) -> Result<IdAssignment, EventError> {
     let rows = columns.rows();
-    let mut order: Vec<u32> = (0..rows as u32).collect();
-    order.sort_unstable_by(|&a, &b| {
-        let a = a as usize;
-        let b = b as usize;
-        (columns.hashes[a], columns.key(a)).cmp(&(columns.hashes[b], columns.key(b)))
-    });
+    // Sort (hash, row) pairs; the key bytes are consulted per equal-hash RUN,
+    // not per comparison (same-actor rows dominate equal-hash runs).
+    let mut order: Vec<(u64, u32)> = Vec::with_capacity(rows);
+    for row in 0..rows {
+        order.push((columns.hashes[row], row as u32));
+    }
+    order.sort_unstable();
     let mut next_local: u64 = priors
         .iter()
         .map(|sidecar| sidecar.first_local_id + sidecar.index.len() as u64)
@@ -1872,30 +1889,59 @@ fn assign_local_ids(
     let mut new_hashes = Vec::new();
     let mut index = 0usize;
     while index < rows {
-        let row = order[index] as usize;
-        let hash = columns.hashes[row];
-        let key = columns.key(row);
-        let local = if let Some(local) = lookup_prior(priors, hash, key) {
-            local
-        } else {
-            let local = next_local;
-            next_local = next_local
-                .checked_add(1)
-                .ok_or(EventBuildError::ShardOverflow { shard })?;
-            new_locals.push(local);
-            new_keys.push(key.to_vec());
-            new_hashes.push(hash);
-            local
-        };
-        // Assign the whole equal-key run.
-        while index < rows {
-            let candidate = order[index] as usize;
-            if columns.hashes[candidate] != hash || columns.key(candidate) != key {
-                break;
-            }
-            row_locals[candidate] = local;
-            index += 1;
+        let hash = order[index].0;
+        let mut run_end = index + 1;
+        while run_end < rows && order[run_end].0 == hash {
+            run_end += 1;
         }
+        // The common case: every row of the run carries the same key.
+        let first_key = columns.key(order[index].1 as usize);
+        let uniform = order[index + 1..run_end]
+            .iter()
+            .all(|(_, row)| columns.key(*row as usize) == first_key);
+        if uniform {
+            let local = resolve_or_assign(
+                priors,
+                hash,
+                first_key,
+                &mut next_local,
+                &mut new_locals,
+                &mut new_keys,
+                &mut new_hashes,
+                shard,
+            )?;
+            for (_, row) in &order[index..run_end] {
+                row_locals[*row as usize] = local;
+            }
+        } else {
+            // A genuine hash collision: order the run by raw key bytes so the
+            // deterministic (hash, key) assignment order holds, then assign
+            // per distinct key.
+            let mut run: Vec<u32> = Vec::with_capacity(run_end - index);
+            for (_, row) in &order[index..run_end] {
+                run.push(*row);
+            }
+            run.sort_by(|a, b| columns.key(*a as usize).cmp(columns.key(*b as usize)));
+            let mut position = 0usize;
+            while position < run.len() {
+                let key = columns.key(run[position] as usize);
+                let local = resolve_or_assign(
+                    priors,
+                    hash,
+                    key,
+                    &mut next_local,
+                    &mut new_locals,
+                    &mut new_keys,
+                    &mut new_hashes,
+                    shard,
+                )?;
+                while position < run.len() && columns.key(run[position] as usize) == key {
+                    row_locals[run[position] as usize] = local;
+                    position += 1;
+                }
+            }
+        }
+        index = run_end;
     }
     Ok(IdAssignment {
         row_locals,
@@ -1904,6 +1950,33 @@ fn assign_local_ids(
         new_hashes,
         first_new_local,
     })
+}
+
+/// Resolve one `(hash, key)` to its local id: a prior-generation actor keeps
+/// its id; an unseen actor takes the next dense id and is recorded for the
+/// sidecar.
+#[allow(clippy::too_many_arguments)]
+fn resolve_or_assign(
+    priors: &[Arc<ActorSidecar>],
+    hash: u64,
+    key: &[u8],
+    next_local: &mut u64,
+    new_locals: &mut Vec<u64>,
+    new_keys: &mut Vec<Vec<u8>>,
+    new_hashes: &mut Vec<u64>,
+    shard: u32,
+) -> Result<u64, EventError> {
+    if let Some(local) = lookup_prior(priors, hash, key) {
+        return Ok(local);
+    }
+    let local = *next_local;
+    *next_local = next_local
+        .checked_add(1)
+        .ok_or(EventBuildError::ShardOverflow { shard })?;
+    new_locals.push(local);
+    new_keys.push(key.to_vec());
+    new_hashes.push(hash);
+    Ok(local)
 }
 
 /// Resolve `(hash, key)` against prior generations' sidecars.

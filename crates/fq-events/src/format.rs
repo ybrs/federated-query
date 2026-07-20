@@ -15,7 +15,7 @@
 //! encoded and zstd-compressed blocks of `BLOCK_ROWS` events, so decode is
 //! block-granular and cacheable.
 
-use std::collections::HashMap;
+use crate::model::FastMap;
 
 use crate::error::{EventBuildError, EventStoreError};
 use crate::model::{describe_key, CodeVec, PropertyEncoding};
@@ -1257,12 +1257,14 @@ pub struct SegEncoder {
     generation: u64,
     columns: Vec<ColumnEncoder>,
     dir: ActorDirectory,
-    preagg_map: HashMap<u64, u64>,
-    totals_map: HashMap<u64, u64>,
+    preagg_map: FastMap<u64, u64>,
+    totals_map: FastMap<u64, u64>,
     event_count: u64,
     /// The previous row's full sort key, for the ambiguous-order guard.
     previous: Option<(u64, i64, i64)>,
-    previous_key_display: String,
+    /// The previous row's canonical key bytes (reused storage; rendered only
+    /// when the guard fires).
+    previous_key: Vec<u8>,
 }
 
 impl SegEncoder {
@@ -1286,11 +1288,11 @@ impl SegEncoder {
                 offsets: vec![0],
                 first_ts: Vec::new(),
             },
-            preagg_map: HashMap::new(),
-            totals_map: HashMap::new(),
+            preagg_map: FastMap::default(),
+            totals_map: FastMap::default(),
             event_count: 0,
             previous: None,
-            previous_key_display: String::new(),
+            previous_key: Vec::new(),
         }
     }
 
@@ -1314,7 +1316,7 @@ impl SegEncoder {
             );
             if (previous_local, previous_ts, previous_tb) == (local, ts, tiebreak) {
                 return Err(EventBuildError::AmbiguousOrder {
-                    actor_key: self.previous_key_display.clone(),
+                    actor_key: describe_key(&self.previous_key),
                     ts,
                 });
             }
@@ -1325,7 +1327,8 @@ impl SegEncoder {
             self.dir.first_ts.push(ts);
         }
         self.previous = Some((local, ts, tiebreak));
-        self.previous_key_display = describe_key(key_bytes);
+        self.previous_key.clear();
+        self.previous_key.extend_from_slice(key_bytes);
         self.push_columns(ts, tiebreak, event_code, props);
         let day = fq_common::events::day_of_micros(ts);
         *self

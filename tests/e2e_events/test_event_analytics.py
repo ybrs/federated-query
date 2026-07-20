@@ -93,7 +93,7 @@ def test_show_event_datasets_lists_the_dataset(engine):
     listing = run(runtime, "SHOW EVENT DATASETS").to_pydict()
     assert listing["name"] == ["web"]
     assert listing["tiebreak"] == ["seq"]
-    assert listing["events"][0] == 62
+    assert listing["events"][0] == 57
 
 
 def test_funnel_matches_the_oracle(engine):

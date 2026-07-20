@@ -6,6 +6,11 @@
 //! cardinality, forced-spill (external merge) build determinism, and loud
 //! corruption failures.
 
+// Generated test values are small by construction (bounded counts, bounded
+// ordinals), so widening casts cannot wrap; the seeded battery reads better
+// as one function than split across helpers.
+#![allow(clippy::cast_possible_wrap, clippy::too_many_lines)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -158,9 +163,10 @@ fn dataset_def(name: &str) -> EventDatasetDef {
 
 /// A small-config EventsConfig (tiny shards, modest budgets).
 fn test_config() -> EventsConfig {
-    let mut config = EventsConfig::default();
-    config.build_threads = 2;
-    config
+    EventsConfig {
+        build_threads: 2,
+        ..EventsConfig::default()
+    }
 }
 
 /// Build a dataset from rows and return it loaded.
@@ -208,10 +214,11 @@ fn chain_exists(events: &[Row], steps: &[String], position: usize, deadline: i64
         return true;
     }
     for (index, row) in events.iter().enumerate().skip(position) {
-        if row.name == steps[0] && row.ts <= deadline {
-            if chain_exists(events, &steps[1..], index + 1, deadline) {
-                return true;
-            }
+        if row.name == steps[0]
+            && row.ts <= deadline
+            && chain_exists(events, &steps[1..], index + 1, deadline)
+        {
+            return true;
         }
     }
     false
@@ -241,8 +248,8 @@ fn funnel_bf(rows: &[Row], steps: &[String], window: i64) -> Vec<u64> {
     let mut entered = vec![0u64; steps.len()];
     for events in ordered(rows).values() {
         let depth = funnel_depth_bf(events, steps, window);
-        for step in 0..depth {
-            entered[step] += 1;
+        for slot in entered.iter_mut().take(depth) {
+            *slot += 1;
         }
     }
     entered

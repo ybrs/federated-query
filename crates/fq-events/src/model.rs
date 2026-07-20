@@ -82,6 +82,66 @@ pub fn hash_key(key_bytes: &[u8]) -> u64 {
     mix64(fnv1a64(key_bytes))
 }
 
+/// A fast non-cryptographic hasher for the engine's hot count maps (the
+/// FxHash fold: rotate, xor, multiply). Never used for identity or on-disk
+/// state - routing and checksums stay on the keyed FNV-1a/splitmix pair.
+#[derive(Default, Clone, Copy)]
+pub struct FxHasher(u64);
+
+impl std::hash::Hasher for FxHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.add(u64::from(*byte));
+        }
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.add(u64::from(value));
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.add(u64::from(value));
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.add(value);
+    }
+
+    fn write_i64(&mut self, value: i64) {
+        self.add(value as u64);
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.add(value as u64);
+    }
+}
+
+impl FxHasher {
+    /// Fold one word into the state.
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+/// The build-hasher of `FastMap`.
+#[derive(Default, Clone, Copy)]
+pub struct FxBuild;
+
+impl std::hash::BuildHasher for FxBuild {
+    type Hasher = FxHasher;
+
+    fn build_hasher(&self) -> FxHasher {
+        FxHasher::default()
+    }
+}
+
+/// A hash map over the fast hasher, for per-event count maps.
+pub type FastMap<K, V> = std::collections::HashMap<K, V, FxBuild>;
+
 /// A width-adaptive vector of dictionary codes: the in-memory decoded form of
 /// a code column block. The width is chosen from the data's maximum code;
 /// nothing caps the code space (codes are u64 logically).

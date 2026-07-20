@@ -135,9 +135,8 @@ def funnel_oracle_sql(parquet, steps, window_days, where=None, time_from=None,
         "agg AS (SELECT %s%s, %s FROM witness GROUP BY ALL)"
         % (group, ", ".join(entered_selects), ", ".join(duration_selects))
     )
-    return "WITH ".join(["", ""]).join(["", ""]) or (
-        ",\n".join(parts) + "\nSELECT * FROM agg" + (" ORDER BY bd NULLS LAST" if breakdown else "")
-    )
+    order = " ORDER BY bd NULLS LAST" if breakdown else ""
+    return ",\n".join(parts) + "\nSELECT * FROM agg" + order
 
 
 def funnel_oracle(con, parquet, steps, window_days, where=None, time_from=None,
@@ -341,11 +340,11 @@ def paths_oracle(con, parquet, depth, top, anchor=None, direction="forward",
             path += "coalesce(g%d || ' -> ', '') || " % i
         path += "name"
         condition = "name = '%s' AND g1 IS NOT NULL" % anchor
-    sql = ("WITH %s, %s, %s, counted AS (SELECT %s AS path, count(*) AS occ "
+    sql = ("WITH %s, %s, %s, %s, counted AS (SELECT %s AS path, count(*) AS occ "
            "FROM strung WHERE %s GROUP BY 1) "
            "SELECT path, occ, occ * 1.0 / sum(occ) OVER () AS share "
            "FROM counted ORDER BY occ DESC, path LIMIT %d"
-           % (base, gap, collapsed, path, condition, top))
+           % (base, gap, collapsed, strung, path, condition, top))
     rows = []
     rank = 0
     for record in con.execute(sql).fetchall():
