@@ -2,15 +2,19 @@
 //!
 //! Phase B1 (partition) streams source record batches, canonicalizes and
 //! hashes actor keys, dictionary-encodes the event name and every dict
-//! property, and spills rows to per-shard lz4 frame files. Phase B2
-//! (finalize) runs per shard: read the shard's spill, deduplicate actors and
-//! assign dense local ids in deterministic `(hash64, key bytes)` order, sort
-//! by `(local, ts, tiebreak)`, and stream the rows through the segment
-//! encoder. Nothing ever requires the dataset, a full column, or a full
-//! dictionary-encoded copy resident in memory: B1 memory is the shard
-//! buffers plus the budgeted dictionaries, and B2 memory is per-shard, with
-//! an external sort-merge fallback for a shard whose spill outgrows its
-//! budget (extreme actor skew).
+//! property, and appends rows as per-shard spill frames. Frames accumulate
+//! uncompressed in memory while their total stays inside the build budget's
+//! resident share; the first breach switches the build to disk, converting
+//! each shard's held frames to its lz4 spill file at its next flush. Phase B2
+//! (finalize) runs per shard: decode the shard's frames (from memory or its
+//! spill file), deduplicate actors and assign dense local ids in
+//! deterministic `(hash64, key bytes)` order, sort by `(local, ts,
+//! tiebreak)`, and stream the rows through the segment encoder. Nothing ever
+//! requires the dataset, a full column, or a full dictionary-encoded copy
+//! resident beyond the budget: B1 memory is the resident frames (capped)
+//! plus the shard buffers and the budgeted dictionaries, and B2 memory is
+//! per-shard, with an external sort-merge fallback for a shard whose spill
+//! outgrows its budget (extreme actor skew).
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -578,6 +582,50 @@ enum PropColumns {
 }
 
 impl SpillColumns {
+    /// Seed the property slots and size every vector for `rows` rows and at
+    /// most `bytes` total frame bytes up front, so decoding appends without
+    /// growth-doubling (capacity is address space; only written pages become
+    /// resident).
+    fn reserve(&mut self, props: &[(usize, PropertyDef)], rows: usize, bytes: usize) {
+        assert!(
+            self.key_offsets.is_empty(),
+            "reserve seeds the property slots and must run before any frame decodes"
+        );
+        self.hashes.reserve_exact(rows);
+        self.key_offsets.reserve_exact(rows + 1);
+        self.key_offsets.push(0);
+        self.key_bytes.reserve_exact(bytes);
+        self.ts.reserve_exact(rows);
+        self.tiebreak.reserve_exact(rows);
+        self.event.reserve_exact(rows);
+        for (_, def) in props {
+            self.props.push(match def.encoding {
+                PropertyEncoding::Dict | PropertyEncoding::RawString => {
+                    let mut raw_offsets = Vec::with_capacity(rows + 1);
+                    raw_offsets.push(0);
+                    PropColumns::Dict {
+                        validity: Vec::with_capacity(rows),
+                        codes: Vec::with_capacity(rows),
+                        raw_offsets,
+                        raw_bytes: Vec::with_capacity(bytes),
+                    }
+                }
+                PropertyEncoding::I64 => PropColumns::I64 {
+                    validity: Vec::with_capacity(rows),
+                    values: Vec::with_capacity(rows),
+                },
+                PropertyEncoding::F64 => PropColumns::F64 {
+                    validity: Vec::with_capacity(rows),
+                    values: Vec::with_capacity(rows),
+                },
+                PropertyEncoding::Bool => PropColumns::Bool {
+                    validity: Vec::with_capacity(rows),
+                    values: Vec::with_capacity(rows),
+                },
+            });
+        }
+    }
+
     /// The key bytes of row `row`.
     fn key(&self, row: usize) -> &[u8] {
         &self.key_bytes[self.key_offsets[row] as usize..self.key_offsets[row + 1] as usize]
@@ -797,17 +845,63 @@ fn append_frame_prop(
 // B1: partition
 // ---------------------------------------------------------------------------
 
+/// Where one shard's spill frames live: resident payloads while the build
+/// fits the budget's resident share, or the shard's lz4 spill file once the
+/// build has switched to disk.
+enum SpillSink {
+    /// Uncompressed frame payloads in flush order.
+    Memory(Vec<Vec<u8>>),
+    File(std::fs::File),
+}
+
 /// The shared B1 state across workers.
 struct Partition<'a> {
     layout: &'a SourceLayout,
     dicts: &'a BuildDicts,
     shards: u32,
     buffer_bytes: usize,
-    spill_files: Vec<Mutex<std::fs::File>>,
-    /// Uncompressed spilled bytes per shard (sizes B2 concurrency and the
-    /// whale fallback).
+    build_dir: &'a std::path::Path,
+    sinks: Vec<Mutex<SpillSink>>,
+    /// Uncompressed frame bytes held resident across all shards.
+    resident_bytes: AtomicU64,
+    /// The resident cap: half of the build budget, the other half being the
+    /// finalize working sets and the workers' shard buffers.
+    resident_budget: u64,
+    /// Set on the first resident-cap breach; every later flush goes to disk,
+    /// converting the shard's held frames first.
+    to_disk: std::sync::atomic::AtomicBool,
+    /// Uncompressed frame bytes per shard (sizes B2 concurrency and the
+    /// whale fallback), independent of where the frames live.
     shard_bytes: Vec<AtomicU64>,
+    /// Uncompressed bytes actually written to spill files.
     spill_total: AtomicU64,
+}
+
+impl Partition<'_> {
+    /// The spill-file path of `shard`.
+    fn spill_path(&self, shard: usize) -> std::path::PathBuf {
+        self.build_dir.join(format!("spill-{shard:04}.tmp"))
+    }
+
+    /// Turn a memory sink into its spill file, writing the held frames in
+    /// order. A file sink passes through unchanged.
+    fn sink_to_file(&self, shard: usize, sink: &mut SpillSink) -> Result<(), EventBuildError> {
+        let SpillSink::Memory(frames) = sink else {
+            return Ok(());
+        };
+        let path = self.spill_path(shard);
+        let mut file = std::fs::File::create(&path)
+            .map_err(|error| EventBuildError::Io(format!("spill create: {error}")))?;
+        for payload in frames.drain(..) {
+            write_frame(&mut file, &payload)?;
+            self.resident_bytes
+                .fetch_sub(payload.len() as u64, Ordering::Relaxed);
+            self.spill_total
+                .fetch_add(payload.len() as u64, Ordering::Relaxed);
+        }
+        *sink = SpillSink::File(file);
+        Ok(())
+    }
 }
 
 /// One dispatched unit: a batch plus the global ordinal of its first row.
@@ -921,7 +1015,8 @@ fn worker_loop(
     }
 }
 
-/// Spill one shard buffer as a frame.
+/// Flush one shard buffer as a frame: append it to the shard's resident
+/// frames while the build fits the resident cap, else to its spill file.
 fn flush_shard(
     partition: &Partition<'_>,
     shard: usize,
@@ -929,13 +1024,32 @@ fn flush_shard(
 ) -> Result<(), EventBuildError> {
     let payload = buffer.drain_frame();
     partition.shard_bytes[shard].fetch_add(payload.len() as u64, Ordering::Relaxed);
-    partition
-        .spill_total
-        .fetch_add(payload.len() as u64, Ordering::Relaxed);
-    let mut file = partition.spill_files[shard]
-        .lock()
-        .expect("spill file lock poisoned");
-    write_frame(&mut file, &payload)
+    let mut sink = partition.sinks[shard].lock().expect("sink lock poisoned");
+    if partition.to_disk.load(Ordering::Relaxed) {
+        partition.sink_to_file(shard, &mut sink)?;
+    }
+    match &mut *sink {
+        SpillSink::Memory(frames) => {
+            let resident = partition
+                .resident_bytes
+                .fetch_add(payload.len() as u64, Ordering::Relaxed)
+                + payload.len() as u64;
+            frames.push(payload);
+            // Past the cap the whole build goes to disk; this shard converts
+            // now, every other shard at its own next flush.
+            if resident > partition.resident_budget {
+                partition.to_disk.store(true, Ordering::Relaxed);
+                partition.sink_to_file(shard, &mut sink)?;
+            }
+            Ok(())
+        }
+        SpillSink::File(file) => {
+            partition
+                .spill_total
+                .fetch_add(payload.len() as u64, Ordering::Relaxed);
+            write_frame(file, &payload)
+        }
+    }
 }
 
 /// Partition one batch into the worker's shard buffers.
@@ -1427,21 +1541,29 @@ fn run_build_inner(
         params.threads
     };
     let shards = params.shards as usize;
-    let buffer_bytes = (params.memory_bytes / (4 * u64::from(params.shards)))
+    // Every worker holds one buffer per shard, so the flush grain divides a
+    // quarter of the budget across threads x shards: the buffers' worst-case
+    // total footprint stays at budget/4 even with every buffer full.
+    let buffer_bytes = (params.memory_bytes / (4 * (threads as u64) * u64::from(params.shards)))
         .clamp(256 * 1024, 4 * 1024 * 1024) as usize;
-    let mut spill_files = Vec::with_capacity(shards);
-    for shard in 0..shards {
-        let path = build_dir.join(format!("spill-{shard:04}.tmp"));
-        let file = std::fs::File::create(&path)
-            .map_err(|error| EventBuildError::Io(format!("spill create: {error}")))?;
-        spill_files.push(Mutex::new(file));
-    }
     let partition = Partition {
         layout: &layout,
         dicts,
         shards: params.shards,
         buffer_bytes,
-        spill_files,
+        build_dir,
+        sinks: (0..shards)
+            .map(|_| Mutex::new(SpillSink::Memory(Vec::new())))
+            .collect(),
+        resident_bytes: AtomicU64::new(0),
+        // Half the budget covers the finalize working sets (a decoded shard
+        // plus its sort permutation runs ~2.6x its frame bytes per worker);
+        // resident frames get the other half MINUS the workers' worst-case
+        // shard-buffer footprint, so partition-time memory stays inside the
+        // budget even with every buffer full.
+        resident_budget: (params.memory_bytes / 2)
+            .saturating_sub((threads * shards) as u64 * buffer_bytes as u64),
+        to_disk: std::sync::atomic::AtomicBool::new(false),
         shard_bytes: (0..shards).map(|_| AtomicU64::new(0)).collect(),
         spill_total: AtomicU64::new(0),
     };
@@ -1452,18 +1574,13 @@ fn run_build_inner(
     };
     let events = run_partition(&partition, &mut prefixed, threads, params.ordinal_start)?;
     let partition_millis = partition_started.elapsed().as_millis() as u64;
-    drop(partition.spill_files);
-    // B2 concurrency: bounded by the memory budget over the largest shard's
-    // working set (raw columns + permutation + gather, ~3x its spill bytes).
-    let largest = partition
-        .shard_bytes
-        .iter()
-        .map(|bytes| bytes.load(Ordering::Relaxed))
-        .max()
-        .unwrap_or(0)
-        .max(1);
-    let by_memory = (params.memory_bytes / (largest * 3)).max(1) as usize;
-    let workers = threads.min(by_memory).max(1);
+    // A build that crossed the resident cap converts every still-resident
+    // shard now: keeping partial residue through finalize would stack the
+    // finalize working sets on top of it and push peak RSS past the budget.
+    if partition.to_disk.load(Ordering::Relaxed) {
+        convert_resident_sinks(&partition, threads)?;
+    }
+    let workers = finalize_workers(params, &partition, threads);
     let peak_shard_budget = (params.memory_bytes / threads as u64).max(1024 * 1024);
     let shard_results = finalize_shards(
         io,
@@ -1472,8 +1589,7 @@ fn run_build_inner(
         &layout,
         dicts,
         prior_sidecars,
-        build_dir,
-        &partition.shard_bytes,
+        &partition,
         peak_shard_budget,
         workers,
     )?;
@@ -1628,6 +1744,59 @@ impl BatchSource for PrefixedSource<'_> {
     }
 }
 
+/// B2 concurrency: bounded by the budget headroom over the largest shard's
+/// working set. A resident shard's decode frees its frames as it goes, so
+/// its net working set is ~2x its frame bytes (decoded columns plus the sort
+/// permutation, minus the freed frames); a file shard loads its columns on
+/// top of nothing resident, ~3x.
+fn finalize_workers(params: &BuildParams, partition: &Partition<'_>, threads: usize) -> usize {
+    let resident = partition.resident_bytes.load(Ordering::Relaxed);
+    let largest = partition
+        .shard_bytes
+        .iter()
+        .map(|bytes| bytes.load(Ordering::Relaxed))
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let worker_cost = if resident > 0 {
+        largest * 2
+    } else {
+        largest * 3
+    };
+    let headroom = params.memory_bytes.saturating_sub(resident).max(1);
+    let by_memory = (headroom / worker_cost).max(1) as usize;
+    threads.min(by_memory).max(1)
+}
+
+/// Convert every still-resident shard to its spill file, `threads` shards at
+/// a time (each conversion lz4-compresses and writes its shard's frames).
+fn convert_resident_sinks(partition: &Partition<'_>, threads: usize) -> Result<(), EventError> {
+    let next = AtomicUsize::new(0);
+    let failure: Mutex<Option<EventError>> = Mutex::new(None);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| loop {
+                let shard = next.fetch_add(1, Ordering::Relaxed);
+                if shard >= partition.sinks.len() || failure.lock().expect("failure lock").is_some()
+                {
+                    return;
+                }
+                let mut sink = partition.sinks[shard].lock().expect("sink lock poisoned");
+                if let Err(error) = partition.sink_to_file(shard, &mut sink) {
+                    let mut slot = failure.lock().expect("failure lock");
+                    if slot.is_none() {
+                        *slot = Some(error.into());
+                    }
+                }
+            });
+        }
+    });
+    match failure.into_inner().expect("failure lock") {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 /// Run B2 across shards on a shared work index.
 #[allow(clippy::too_many_arguments)]
 fn finalize_shards(
@@ -1637,8 +1806,7 @@ fn finalize_shards(
     layout: &SourceLayout,
     dicts: &BuildDicts,
     prior_sidecars: &[Vec<Arc<ActorSidecar>>],
-    build_dir: &std::path::Path,
-    shard_bytes: &[AtomicU64],
+    partition: &Partition<'_>,
     peak_shard_budget: u64,
     workers: usize,
 ) -> Result<Vec<ShardResult>, EventError> {
@@ -1661,9 +1829,8 @@ fn finalize_shards(
                     layout,
                     dicts,
                     prior_sidecars,
-                    build_dir,
+                    partition,
                     shard,
-                    shard_bytes[shard].load(Ordering::Relaxed),
                     peak_shard_budget,
                 );
                 match outcome {
@@ -1696,14 +1863,16 @@ fn finalize_one_shard(
     layout: &SourceLayout,
     dicts: &BuildDicts,
     prior_sidecars: &[Vec<Arc<ActorSidecar>>],
-    build_dir: &std::path::Path,
+    partition: &Partition<'_>,
     shard: usize,
-    spilled_bytes: u64,
     peak_shard_budget: u64,
 ) -> Result<ShardResult, EventError> {
-    let spill_path = build_dir.join(format!("spill-{shard:04}.tmp"));
-    if spilled_bytes == 0 {
-        std::fs::remove_file(&spill_path).ok();
+    let frame_bytes = partition.shard_bytes[shard].load(Ordering::Relaxed);
+    let mut sink = {
+        let mut guard = partition.sinks[shard].lock().expect("sink lock poisoned");
+        std::mem::replace(&mut *guard, SpillSink::Memory(Vec::new()))
+    };
+    if frame_bytes == 0 {
         return Ok(ShardResult {
             entry: None,
             min_ts: None,
@@ -1711,8 +1880,13 @@ fn finalize_one_shard(
         });
     }
     let priors = prior_sidecars.get(shard).map_or(&[][..], Vec::as_slice);
-    let result = if spilled_bytes > peak_shard_budget * 2 {
-        crate::build_external::finalize_external(
+    if frame_bytes > peak_shard_budget * 2 {
+        // A whale shard finalizes through the bounded external merge, which
+        // reads frame chunks from disk; resident frames convert first.
+        partition.sink_to_file(shard, &mut sink)?;
+        drop(sink);
+        let spill_path = partition.spill_path(shard);
+        let result = crate::build_external::finalize_external(
             io,
             location,
             params,
@@ -1722,22 +1896,46 @@ fn finalize_one_shard(
             &spill_path,
             shard,
             peak_shard_budget,
-        )?
-    } else {
-        finalize_in_memory(
-            io,
-            location,
-            params,
-            layout,
-            dicts,
-            priors,
-            &spill_path,
-            shard,
-        )?
-    };
-    std::fs::remove_file(&spill_path)
-        .map_err(|error| EventBuildError::Io(format!("spill unlink: {error}")))?;
-    Ok(result)
+        )?;
+        std::fs::remove_file(&spill_path)
+            .map_err(|error| EventBuildError::Io(format!("spill unlink: {error}")))?;
+        return Ok(result);
+    }
+    let mut columns = SpillColumns::default();
+    match sink {
+        SpillSink::Memory(frames) => {
+            // Every frame's row count is in its header, so the columns size
+            // exactly up front instead of growth-doubling mid-decode.
+            let rows_total: usize = frames
+                .iter()
+                .map(|payload| {
+                    let header: [u8; 4] = payload[..4]
+                        .try_into()
+                        .expect("a resident frame carries its row-count header");
+                    u32::from_le_bytes(header) as usize
+                })
+                .sum();
+            columns.reserve(&layout.props, rows_total, frame_bytes as usize);
+            // Each decoded frame drops immediately, so the shard's resident
+            // bytes hand over to the decoded columns as decode progresses.
+            for payload in frames {
+                append_frame(&payload, &layout.props, &mut columns)?;
+                partition
+                    .resident_bytes
+                    .fetch_sub(payload.len() as u64, Ordering::Relaxed);
+            }
+        }
+        SpillSink::File(file) => {
+            drop(file);
+            let spill_path = partition.spill_path(shard);
+            read_frames(&spill_path, |payload| {
+                append_frame(payload, &layout.props, &mut columns)
+            })?;
+            std::fs::remove_file(&spill_path)
+                .map_err(|error| EventBuildError::Io(format!("spill unlink: {error}")))?;
+        }
+    }
+    finalize_in_memory(io, location, params, layout, dicts, priors, &columns, shard)
 }
 
 /// The property declarations of a layout (for the external path).
@@ -1745,8 +1943,11 @@ fn layout_props(layout: &SourceLayout) -> Vec<PropertyDef> {
     layout.props.iter().map(|(_, def)| def.clone()).collect()
 }
 
-/// The in-memory finalize path: load the shard's spill whole, assign ids,
-/// sort a permutation, and stream rows into the segment encoder.
+/// The in-memory finalize path over a shard's decoded spill columns. A
+/// first-generation shard (no priors) sorts once by `(hash, ts, tiebreak)`
+/// and assigns dense ids while streaming the runs into the encoder; a
+/// refresh resolves returning actors through the priors first, then sorts by
+/// the assigned ids.
 #[allow(clippy::too_many_arguments)]
 fn finalize_in_memory(
     io: &StoreIo,
@@ -1755,15 +1956,17 @@ fn finalize_in_memory(
     layout: &SourceLayout,
     dicts: &BuildDicts,
     priors: &[Arc<ActorSidecar>],
-    spill_path: &std::path::Path,
+    columns: &SpillColumns,
     shard: usize,
 ) -> Result<ShardResult, EventError> {
-    let mut columns = SpillColumns::default();
-    read_frames(spill_path, |payload| {
-        append_frame(payload, &layout.props, &mut columns)
-    })?;
+    let promoted = promotion_flags(layout, dicts);
+    let encodings = final_encodings(layout, &promoted);
+    let mut encoder = SegEncoder::new(shard as u32, params.generation, &encodings);
     let rows = columns.rows();
-    let assignment = assign_local_ids(&columns, priors, shard as u32)?;
+    if priors.is_empty() {
+        return finalize_first_generation(io, location, params, &promoted, columns, shard, encoder);
+    }
+    let assignment = assign_local_ids(columns, priors, shard as u32)?;
     // Sort materialized (local, ts, tiebreak, row) records: one contiguous
     // comparison per element instead of three random array loads per key
     // evaluation (the closure-keyed sort was the finalize hot spot).
@@ -1777,10 +1980,7 @@ fn finalize_in_memory(
         ));
     }
     keyed.sort_unstable();
-    let promoted = promotion_flags(layout, dicts);
-    let encodings = final_encodings(layout, &promoted);
-    let mut encoder = SegEncoder::new(shard as u32, params.generation, &encodings);
-    let mut cells: Vec<PropCell<'_>> = Vec::with_capacity(layout.props.len());
+    let mut cells: Vec<PropCell<'_>> = Vec::with_capacity(promoted.len());
     let mut min_ts = None;
     let mut max_ts = None;
     // The sorted key tuples already hold (local, ts, tiebreak) in output
@@ -1816,6 +2016,172 @@ fn finalize_in_memory(
         min_ts,
         max_ts,
     })
+}
+
+/// First-generation finalize: every actor is new, so dense ids follow the
+/// `(hash, key bytes)` order directly. One sort of `(hash, ts, tiebreak,
+/// row)` yields the runs in id order with each run's rows already in event
+/// order; ids assign during the walk and rows stream straight into the
+/// encoder. A run whose rows carry different keys under one hash (a genuine
+/// collision) re-orders by key bytes so the deterministic id order holds.
+#[allow(clippy::too_many_arguments)]
+fn finalize_first_generation(
+    io: &StoreIo,
+    location: &str,
+    params: &BuildParams,
+    promoted: &[bool],
+    columns: &SpillColumns,
+    shard: usize,
+    mut encoder: SegEncoder,
+) -> Result<ShardResult, EventError> {
+    let rows = columns.rows();
+    let mut order: Vec<(u64, i64, i64, u32)> = Vec::with_capacity(rows);
+    for row in 0..rows {
+        order.push((
+            columns.hashes[row],
+            columns.ts[row],
+            columns.tiebreak[row],
+            row as u32,
+        ));
+    }
+    order.sort_unstable();
+    // Rows stream into the encoder during the walk itself, so no per-row
+    // local-id table is materialized; only the sidecar's new-actor record
+    // fills in.
+    let mut assignment = IdAssignment {
+        row_locals: Vec::new(),
+        new_locals: Vec::new(),
+        new_keys: Vec::new(),
+        new_hashes: Vec::new(),
+        first_new_local: 0,
+    };
+    let mut min_ts = None;
+    let mut max_ts = None;
+    let mut cells: Vec<PropCell<'_>> = Vec::with_capacity(promoted.len());
+    let mut index = 0usize;
+    while index < rows {
+        let hash = order[index].0;
+        let mut run_end = index + 1;
+        while run_end < rows && order[run_end].0 == hash {
+            run_end += 1;
+        }
+        // The common case: every row of the run carries the same key.
+        let first_key = columns.key(order[index].3 as usize);
+        let uniform = order[index + 1..run_end]
+            .iter()
+            .all(|(_, _, _, row)| columns.key(*row as usize) == first_key);
+        if uniform {
+            let local = next_first_generation_local(&mut assignment, hash, first_key, shard)?;
+            for entry in &order[index..run_end] {
+                push_walk_row(
+                    columns,
+                    promoted,
+                    local,
+                    entry,
+                    &mut encoder,
+                    &mut cells,
+                    &mut min_ts,
+                    &mut max_ts,
+                )?;
+            }
+        } else {
+            // A genuine hash collision: group the run by raw key bytes (rows
+            // within a key keep their (ts, tiebreak) order) so ids assign in
+            // deterministic (hash, key) order.
+            let mut run: Vec<(u64, i64, i64, u32)> = order[index..run_end].to_vec();
+            run.sort_by(|a, b| {
+                columns
+                    .key(a.3 as usize)
+                    .cmp(columns.key(b.3 as usize))
+                    .then((a.1, a.2).cmp(&(b.1, b.2)))
+            });
+            let mut position = 0usize;
+            while position < run.len() {
+                let key = columns.key(run[position].3 as usize).to_vec();
+                let local = next_first_generation_local(&mut assignment, hash, &key, shard)?;
+                while position < run.len() && columns.key(run[position].3 as usize) == key {
+                    push_walk_row(
+                        columns,
+                        promoted,
+                        local,
+                        &run[position],
+                        &mut encoder,
+                        &mut cells,
+                        &mut min_ts,
+                        &mut max_ts,
+                    )?;
+                    position += 1;
+                }
+            }
+        }
+        index = run_end;
+    }
+    let entry = write_shard_files(
+        io,
+        location,
+        params.generation,
+        shard as u32,
+        encoder,
+        &assignment,
+    )?;
+    Ok(ShardResult {
+        entry: Some(entry),
+        min_ts,
+        max_ts,
+    })
+}
+
+/// Gather one walked row's cells and stream it into the encoder, folding its
+/// timestamp into the shard bounds.
+#[allow(clippy::too_many_arguments)]
+fn push_walk_row<'a>(
+    columns: &'a SpillColumns,
+    promoted: &[bool],
+    local: u64,
+    entry: &(u64, i64, i64, u32),
+    encoder: &mut SegEncoder,
+    cells: &mut Vec<PropCell<'a>>,
+    min_ts: &mut Option<i64>,
+    max_ts: &mut Option<i64>,
+) -> Result<(), EventError> {
+    let (_, ts, tiebreak, row) = *entry;
+    let row = row as usize;
+    cells.clear();
+    for (prop, is_promoted) in promoted.iter().enumerate() {
+        cells.push(columns.cell(prop, *is_promoted, row));
+    }
+    *min_ts = merge_min(*min_ts, Some(ts));
+    *max_ts = merge_max(*max_ts, Some(ts));
+    encoder.push_row(
+        local,
+        ts,
+        tiebreak,
+        columns.event[row],
+        cells,
+        columns.key(row),
+    )?;
+    Ok(())
+}
+
+/// Assign the next dense first-generation id to an unseen `(hash, key)` and
+/// record it for the actor sidecar.
+fn next_first_generation_local(
+    assignment: &mut IdAssignment,
+    hash: u64,
+    key: &[u8],
+    shard: usize,
+) -> Result<u64, EventError> {
+    let local = assignment.new_locals.len() as u64;
+    if local == u64::MAX {
+        return Err(EventBuildError::ShardOverflow {
+            shard: shard as u32,
+        }
+        .into());
+    }
+    assignment.new_locals.push(local);
+    assignment.new_keys.push(key.to_vec());
+    assignment.new_hashes.push(hash);
+    Ok(local)
 }
 
 /// Which dict properties ended the build promoted, positionally per property.

@@ -227,6 +227,8 @@ pub struct PathsSpec {
 pub struct EventsConfig {
     /// Peak build memory budget in bytes; the build's shard sizing and spill
     /// buffers derive from it, so peak RSS is independent of total row count.
+    /// A build whose partition output fits the budget's resident share keeps
+    /// its spill frames in memory and never touches disk.
     pub build_memory_bytes: u64,
     /// Build worker threads; 0 means all cores.
     pub build_threads: usize,

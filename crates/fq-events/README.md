@@ -126,8 +126,13 @@ nearest known names.
 ## Performance characteristics
 
 Measured on a 100M-event dataset (single node, 12 cores):
-- Build (once): ~24s, peak RSS ~4.3 GiB, store ~850 MB (bounded-memory,
-  spilling; scales to billions).
+- Build (once), 16 GiB `events.build_memory_bytes`: ~16s, peak RSS ~8.9 GiB,
+  store ~846 MB. The partition output (~4.7 GB of spill frames) fits the
+  budget's resident share, so the build keeps frames in memory and never
+  touches disk.
+- Build (once), default 6 GiB budget: ~20s, peak RSS ~4.0 GiB - the same
+  build spills to disk (bounded memory; scales to billions). The two paths
+  produce byte-identical stores.
 - Queries (warm), all against the one built store:
   funnels ~0.2-0.6s, retention ~0.2-0.3s, segmentation sub-millisecond
   (pre-aggregate) to ~0.4s, paths ~0.3-0.7s.

@@ -1258,13 +1258,9 @@ pub struct SegEncoder {
     columns: Vec<ColumnEncoder>,
     dir: ActorDirectory,
     preagg_map: FastMap<u64, u64>,
-    totals_map: FastMap<u64, u64>,
     event_count: u64,
     /// The previous row's full sort key, for the ambiguous-order guard.
     previous: Option<(u64, i64, i64)>,
-    /// The previous row's canonical key bytes (reused storage; rendered only
-    /// when the guard fires).
-    previous_key: Vec<u8>,
 }
 
 impl SegEncoder {
@@ -1289,10 +1285,8 @@ impl SegEncoder {
                 first_ts: Vec::new(),
             },
             preagg_map: FastMap::default(),
-            totals_map: FastMap::default(),
             event_count: 0,
             previous: None,
-            previous_key: Vec::new(),
         }
     }
 
@@ -1315,8 +1309,10 @@ impl SegEncoder {
                 "segment rows pushed out of order"
             );
             if (previous_local, previous_ts, previous_tb) == (local, ts, tiebreak) {
+                // Equal locals mean the same actor, so the current row's key
+                // bytes are the duplicate actor's canonical key.
                 return Err(EventBuildError::AmbiguousOrder {
-                    actor_key: describe_key(&self.previous_key),
+                    actor_key: describe_key(key_bytes),
                     ts,
                 });
             }
@@ -1327,15 +1323,12 @@ impl SegEncoder {
             self.dir.first_ts.push(ts);
         }
         self.previous = Some((local, ts, tiebreak));
-        self.previous_key.clear();
-        self.previous_key.extend_from_slice(key_bytes);
         self.push_columns(ts, tiebreak, event_code, props);
         let day = fq_common::events::day_of_micros(ts);
         *self
             .preagg_map
             .entry(preagg_key(event_code, day))
             .or_insert(0) += 1;
-        *self.totals_map.entry(event_code).or_insert(0) += 1;
         self.event_count += 1;
         *self.dir.offsets.last_mut().expect("offsets never empty") = self.event_count;
         Ok(())
@@ -1422,12 +1415,15 @@ impl SegEncoder {
             })
             .collect();
         entries.sort_unstable();
-        let mut totals: Vec<(u64, u64)> = self
-            .totals_map
-            .iter()
-            .map(|(code, total)| (*code, *total))
-            .collect();
-        totals.sort_unstable();
+        // Per-code totals are the day sums; the sorted entries group by code,
+        // so one pass over the code runs yields them already sorted.
+        let mut totals: Vec<(u64, u64)> = Vec::new();
+        for (code, _, count) in &entries {
+            match totals.last_mut() {
+                Some((last_code, total)) if last_code == code => *total += count,
+                _ => totals.push((*code, *count)),
+            }
+        }
         Preagg { entries, totals }
     }
 

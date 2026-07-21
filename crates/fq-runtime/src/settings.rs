@@ -655,7 +655,9 @@ static SETTINGS: &[SettingDef] = &[
         name: "events.build_memory_bytes",
         description: "Peak memory budget of an event dataset build; shard sizing and \
                       spill buffers derive from it, so peak RSS is independent of \
-                      total row count.",
+                      total row count. A build whose partition output fits the \
+                      budget's resident share keeps its spill frames in memory and \
+                      never touches disk.",
         mutability: Mutability::SessionMutable,
         env_var: None,
         default: || SettingValue::U64(EventsConfig::default().build_memory_bytes),

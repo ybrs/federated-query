@@ -18,6 +18,12 @@ Staged modes, mirroring the tpcds harness:
 
 Before running, the runner prints how many engine executions the invocation
 performs.
+
+The medium config (``data/events_medium.config.yaml``) sets
+``events.build_memory_bytes`` to 16 GiB: the 100M-event partition output
+(~4.7 GB of spill frames) then fits the budget's resident share, so the build
+keeps frames in memory instead of spilling to disk. Under the default 6 GiB
+budget the same build spills to disk and stays bounded.
 """
 
 import argparse
