@@ -30,11 +30,14 @@ engineering diagnosis; they are never quoted as the build time and never used
 to claim a goal is met. Reporting a stage as the build time is lying with a
 stopwatch.
 
-# No animal jargon for customers
+# One class of customers
 
-Customers are customers (or users). Never "whales" or any animal-farm
-vocabulary for people or tenants, anywhere: code, docs, tickets, comments,
-messages.
+There is exactly ONE class of customers. No tiers, no size classes, no
+"large/small customer" framing, and no animal vocabulary ("whales" or any
+other) for people or tenants, anywhere: code, docs, tickets, comments,
+messages. Data-size handling (an actor with an outsized stream, a dataset
+that spills) is an engineering property of the DATA and is named as such,
+never as a class of customer.
 
 # No ascii
 
