@@ -1,7 +1,8 @@
 //! The Parquet connector (catalog/statistics tier). A directory of
 //! `<table>.parquet` files is one federated source; every file is a table under
 //! the schema `main` (the schema the fq-exec DataFusion reader registers the
-//! files under, so a pushed `SELECT ... FROM main.<table>` resolves there).
+//! files under, so a pushed `SELECT ... FROM main.<table>` resolves there). A
+//! single-file source (`file = ...`) is one table named after the datasource.
 //!
 //! Everything here reads FOOTERS ONLY - the Parquet metadata block at the tail of
 //! each file - so it is O(metadata), never a data scan: the schema, the exact row
@@ -48,32 +49,45 @@ pub struct ParquetSource {
 
 impl ParquetSource {
     /// Open a directory of Parquet files as a named source. Every `<name>.parquet`
-    /// in the directory becomes a table `<name>`. Raises if the directory does not
-    /// exist, cannot be read, or holds no Parquet file (a Parquet source pointed at
-    /// a directory with no tables is a misconfiguration, not an empty success).
-    pub fn open(name: impl Into<String>, dir: &str) -> Result<Self, CatalogError> {
-        let dir_path = Path::new(dir);
-        let entries = std::fs::read_dir(dir_path).map_err(|error| {
-            CatalogError::Source(format!("parquet dir '{dir}' cannot be read: {error}"))
-        })?;
+    /// in the directory becomes a table `<name>`. A single-file source is one
+    /// table NAMED AFTER THE DATASOURCE, so `SELECT * FROM <datasource>` resolves
+    /// it as a bare table reference. Raises if the directory does not exist,
+    /// cannot be read, or holds no Parquet file (a Parquet source pointed at a
+    /// directory with no tables is a misconfiguration, not an empty success).
+    pub fn open(name: impl Into<String>, path: &str) -> Result<Self, CatalogError> {
+        let name = name.into();
+        let root = Path::new(path);
         let mut tables = BTreeMap::new();
-        for entry in entries {
-            let path = entry
-                .map_err(|error| CatalogError::Source(format!("parquet dir '{dir}': {error}")))?
-                .path();
-            if let Some(table) = parquet_table_name(&path) {
-                tables.insert(table, path);
+        if root.is_file() {
+            // A single `.parquet` file is one table named after the datasource
+            // (the exec plane registers it in DataFusion under the same name).
+            if parquet_table_name(root).is_none() {
+                return Err(CatalogError::Source(format!(
+                    "parquet file '{path}' is not a .parquet file"
+                )));
+            }
+            tables.insert(name.clone(), root.to_path_buf());
+        } else {
+            let entries = std::fs::read_dir(root).map_err(|error| {
+                CatalogError::Source(format!("parquet path '{path}' cannot be read: {error}"))
+            })?;
+            for entry in entries {
+                let child = entry
+                    .map_err(|error| {
+                        CatalogError::Source(format!("parquet dir '{path}': {error}"))
+                    })?
+                    .path();
+                if let Some(table) = parquet_table_name(&child) {
+                    tables.insert(table, child);
+                }
+            }
+            if tables.is_empty() {
+                return Err(CatalogError::Source(format!(
+                    "parquet dir '{path}' holds no <table>.parquet files"
+                )));
             }
         }
-        if tables.is_empty() {
-            return Err(CatalogError::Source(format!(
-                "parquet dir '{dir}' holds no <table>.parquet files"
-            )));
-        }
-        Ok(Self {
-            name: name.into(),
-            tables,
-        })
+        Ok(Self { name, tables })
     }
 
     /// The path of one table's Parquet file, raising if this source has no such

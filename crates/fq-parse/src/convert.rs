@@ -1614,10 +1614,14 @@ impl Converter<'_> {
             .catalog
             .as_ref()
             .map_or_else(String::new, |ident| ident.name.clone());
+        // A bare reference leaves the schema EMPTY (like the datasource): the
+        // binder searches every registered schema and stamps the resolved
+        // owner. A fabricated default here would pin the reference to one
+        // schema name and mis-resolve every bare table living elsewhere.
         let schema_name = table
             .schema
             .as_ref()
-            .map_or_else(|| "public".to_string(), |ident| ident.name.clone());
+            .map_or_else(String::new, |ident| ident.name.clone());
         let columns = self
             .catalog
             .resolve_table_columns(

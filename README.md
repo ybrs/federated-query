@@ -1,23 +1,72 @@
-# Disclaimer
+# Federated Query Engine (fedq)
 
-This is an experiment for building a federated query engine in python and rust.
+A federated SQL query engine in Rust that runs queries across heterogeneous data
+sources (PostgreSQL, DuckDB, ClickHouse, MySQL, Parquet), pushing work down to
+each source and joining across them. On top of the engine sits a materialized
+event-analytics layer (Mixpanel/Amplitude-class: funnels, retention/cohorts,
+segmentation, flows/paths) and a dynamic catalog for adding sources at runtime.
 
-We have just bootstrapped the project and have tests covering areas. The document below and documents in the repo can mean anything else, but this is very early phase of the project.
+Three front doors over one runtime: a Python extension (`fedq`), a PostgreSQL
+wire-protocol server (`fedq-server`), and a CLI (`fedq`).
 
-# Federated Query Engine
+## Quick start (build and run locally)
 
-A production-grade federated query engine written in Python that executes SQL queries across multiple heterogeneous data sources (PostgreSQL, DuckDB) in an optimal way.
+Prerequisites: a Rust toolchain (`cargo`), `curl` + `unzip` (to fetch the
+prebuilt DuckDB library), and a working `python3` - the `fedq-py` extension is
+built via pyo3. If a stale `VIRTUAL_ENV` points at a missing interpreter,
+`make build` stops with a clear error and the fix (set `PYO3_PYTHON` or activate
+a real venv) before compiling.
+
+```
+# Build the whole workspace in ONE command. The first run downloads the
+# prebuilt libduckdb the engine links against (matching Cargo.lock, into
+# .duckdb-lib/ - DuckDB is never compiled inside cargo); after that it just
+# compiles. Needs internet access on the first run.
+make build            # release build
+# or:  make dev-build  # faster debug build
+
+# Run the PostgreSQL-wire server over a config (no static sources needed -
+# add them at runtime with the dynamic catalog).
+printf 'datasources: {}\n' > fedq.yaml
+target/release/fedq-server --config fedq.yaml --listen 127.0.0.1:5433
+
+# Connect with any PostgreSQL client and query.
+psql "host=127.0.0.1 port=5433 user=me dbname=fedq"
+```
+
+(`make build` runs `make setup` for you; run `make setup` alone if you only
+want to fetch libduckdb without compiling.)
+
+Then, in the psql session, register a source and run analytics:
+
+```sql
+CREATE DATASOURCE ev TYPE parquet WITH (dir = '/path/to/your/parquet_dir');
+CREATE EVENT DATASET web FROM ev.main.events
+  ACTOR user_id TIME ts EVENT event_name PROPERTIES (device, country);
+FUNNEL ('page_view', 'view_item', 'add_to_cart') ON web WINDOW 7 DAY;
+```
+
+A full walkthrough (funnels, retention, segmentation, paths, refresh, auth) is
+in `doc/event-analytics-tutorial.md`.
+
+The CLI runs one statement without a server:
+`target/release/fedq --config fedq.yaml --command "SHOW DATASOURCES"`.
 
 ## Features
 
-- **Multi-Source Querying**: Execute SQL queries across PostgreSQL and DuckDB data sources
-- **Pushdown Optimization**: Predicate, projection, aggregate, order-by, and limit pushdown; same-source joins and set operations pushed to the source as a single remote query
-- **Set Operations**: `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT`, pushed down when single-source and evaluated locally (multiset semantics) when cross-source
-- **Decorrelation**: Automatic transformation of correlated subqueries (EXISTS/IN/ANY/ALL/scalar) into efficient joins with exact three-valued-logic NULL semantics
-- **Flexible Execution**: Hash joins, nested-loop joins, and remote (single-source) joins
-- **Native EXPLAIN**: Inspect the physical plan and the exact remote SQL each source will run, without touching the data
-- **Arrow-Based**: Uses Apache Arrow for efficient in-memory data representation and transfer
-- **Fail-Fast**: Errors surface instead of being silently swallowed or producing wrong results
+- **Multi-source federation**: query across PostgreSQL, DuckDB, ClickHouse,
+  MySQL, and Parquet, with same-source subtrees pushed down as one remote query.
+- **Pushdown optimization**: predicate, projection, aggregate, order-by, limit,
+  and same-source joins/set-ops pushed to the source.
+- **Decorrelation**: correlated subqueries (EXISTS/IN/ANY/ALL/scalar) rewritten
+  to joins with exact three-valued NULL semantics.
+- **Dynamic catalog**: `CREATE / DROP / SHOW DATASOURCE` at runtime; the config
+  is just bootstrap.
+- **Event analytics**: materialized event datasets with funnel, retention,
+  segmentation, and path analyses (see `crates/fq-events/README.md`).
+- **Materialized views**, **users/ACLs (SCRAM)**, and native **EXPLAIN**.
+- **Fail-fast**: errors surface; invalid queries raise instead of returning
+  wrong rows.
 
 ## Architecture
 

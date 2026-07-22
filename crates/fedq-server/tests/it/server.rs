@@ -80,6 +80,7 @@ fn shop_config(path: &str, server: ServerConfig) -> Config {
         server,
         accelerator: fq_common::AcceleratorConfig::default(),
         catalog: fq_common::CatalogConfig::default(),
+        events: fq_common::EventsConfig::default(),
         // A source path is required for the ACL/verifier store (it lives next to
         // the config); derive a unique sibling of the fixture's DuckDB file.
         source_path: Some(format!("{path}.fedq.yaml")),

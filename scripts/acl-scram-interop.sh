@@ -7,10 +7,10 @@
 # (must be absent).
 set -u
 
-ROOT=/workspace/federated-query
-PSQL=$ROOT/postgres-17/bin/psql
-SERVER=$ROOT/target/release/fedq-server
-PY=/workspace/venv-fedq/bin/python
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PSQL="${PSQL:-$ROOT/postgres-17/bin/psql}"
+SERVER="$ROOT/target/release/fedq-server"
+PY="${PY:-python3}"
 WORK=$(mktemp -d /tmp/acl-interop.XXXXXX)
 PORT=54329
 PASSWORD='s3cr3t-Pa55!interop'

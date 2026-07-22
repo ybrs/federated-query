@@ -14,7 +14,9 @@ mod acl;
 mod delta;
 mod dynamic_catalog;
 pub mod error;
+mod events;
 mod explain;
+mod introspect;
 mod materialized;
 mod settings;
 mod substitute;
@@ -85,6 +87,10 @@ pub struct Runtime {
     /// implicit superuser with enforcement off; a wire connection calls
     /// `set_principal` to turn enforcement on.
     authz: RwLock<acl::AclState>,
+    /// The event-analytics store, opened lazily on the first event statement
+    /// (like the materialized-view store, it lives next to the config file;
+    /// a path-less config raises).
+    events: events::EventStoreSlot,
 }
 
 impl Runtime {
@@ -105,10 +111,22 @@ impl Runtime {
             Some(accel) => accel.list_datasources()?,
             None => Vec::new(),
         };
+        // Persisted SET overrides apply on top of the YAML config BEFORE
+        // anything reads a setting, so a SET from an earlier session governs
+        // this construction exactly like it governed the session that set it.
+        let mut config = config.clone();
+        let mut persisted_overrides = BTreeSet::new();
+        if let Some(accel) = &accelerator {
+            for (name, value) in accel.list_settings()? {
+                Self::apply_persisted_setting(&mut config, &name, &value)?;
+                persisted_overrides.insert(name);
+            }
+        }
+        let config = &config;
         dynamic_catalog::reject_bootstrap_collision(config, &persisted)?;
         let mut catalog = Catalog::new();
         // YAML (bootstrap) sources are operator-controlled at deploy time, so a
-        // failure to connect one aborts construction (unchanged behavior).
+        // failure to connect one aborts construction.
         for datasource in config.datasources.values() {
             register_datasource(session, &mut catalog, datasource)?;
         }
@@ -147,15 +165,38 @@ impl Runtime {
             learned.clone(),
             None,
         ));
+        // Prewarm the paths indexes on a background thread: the block cache
+        // is process-global, so a throwaway store handle warms the same cache
+        // the session's store reads later. A prewarm failure only prints; the
+        // first event statement re-runs the load and raises loudly.
+        if let Some(source_path) = config.source_path.as_deref() {
+            let root = events::events_root_path(source_path);
+            if root.exists() {
+                let stats_path = stats_sqlite_path(config)
+                    .expect("a config with a source path has a stats path");
+                let events_config = config.events.clone();
+                std::thread::spawn(move || {
+                    match fq_events::EventStore::open(&stats_path, &root) {
+                        Ok(store) => {
+                            if let Err(error) = store.prewarm_paths(&events_config) {
+                                eprintln!("paths index prewarm: {error}");
+                            }
+                        }
+                        Err(error) => eprintln!("paths index prewarm open: {error}"),
+                    }
+                });
+            }
+        }
         Ok(Self {
             session,
             catalog: RwLock::new(catalog),
             config: RwLock::new(config.clone()),
-            settings_overrides: RwLock::new(BTreeSet::new()),
+            settings_overrides: RwLock::new(persisted_overrides),
             stats: RwLock::new(stats),
             learned,
             accelerator,
             authz: RwLock::new(acl::AclState::embedded()),
+            events: std::sync::Mutex::new(None),
         })
     }
 
@@ -226,6 +267,12 @@ impl Runtime {
             }
             Statement::DropDatasource { name } => self.drop_datasource(&name),
             Statement::ShowDatasources => self.show_datasources(),
+            Statement::ShowTables { datasource } => self.show_tables(datasource.as_deref()),
+            Statement::DescribeTable {
+                datasource,
+                schema,
+                table,
+            } => self.describe_table(datasource.as_deref(), schema.as_deref(), &table),
             Statement::CreateUser {
                 name,
                 password,
@@ -242,6 +289,16 @@ impl Runtime {
             Statement::Revoke { object, grantee } => self.revoke(&object, &grantee),
             Statement::ShowUsers => self.show_users(),
             Statement::ShowGrants { grantee } => self.show_grants(grantee.as_deref()),
+            Statement::CreateEventDataset(def) => self.create_event_dataset(&def),
+            Statement::RefreshEventDataset { name } => self.refresh_event_dataset(&name),
+            Statement::RebuildEventDataset { name } => self.rebuild_event_dataset(&name),
+            Statement::DropEventDataset { name } => self.drop_event_dataset(&name),
+            Statement::ShowEventDatasets => self.show_event_datasets(),
+            Statement::ShowEvents { dataset } => self.show_events(&dataset),
+            Statement::EventFunnel(spec) => self.run_event_funnel(&spec),
+            Statement::EventRetention(spec) => self.run_event_retention(&spec),
+            Statement::EventSegment(spec) => self.run_event_segment(&spec),
+            Statement::EventPaths(spec) => self.run_event_paths(&spec),
         }
     }
 
@@ -326,8 +383,30 @@ impl Runtime {
             Statement::ShowDatasources => {
                 return Ok(dynamic_catalog::datasources_describe_columns());
             }
+            Statement::ShowTables { .. } => {
+                return Ok(introspect::tables_describe_columns());
+            }
+            Statement::DescribeTable { .. } => {
+                return Ok(introspect::describe_table_columns());
+            }
             Statement::ShowUsers => return Ok(acl::users_describe_columns()),
             Statement::ShowGrants { .. } => return Ok(acl::grants_describe_columns()),
+            Statement::ShowEventDatasets => {
+                return Ok(events::show_event_datasets_columns());
+            }
+            Statement::ShowEvents { .. } => {
+                return Ok(vec![("event".to_owned(), DataType::Text)]);
+            }
+            Statement::EventFunnel(spec) => {
+                return Ok(events::funnel_describe_columns(&spec));
+            }
+            Statement::EventRetention(spec) => {
+                return Ok(events::retention_describe_columns(&spec));
+            }
+            Statement::EventSegment(spec) => {
+                return Ok(events::segment_describe_columns(&spec));
+            }
+            Statement::EventPaths(_) => return Ok(events::paths_describe_columns()),
             _ => return Ok(vec![("status".to_owned(), DataType::Text)]),
         }
         let physical = self.plan(sql)?;
@@ -642,12 +721,34 @@ fn register_parquet(
     catalog: &mut Catalog,
     datasource: &DataSourceConfig,
 ) -> Result<(), RuntimeError> {
-    let dir = require_str(datasource, "dir")?;
-    let source = ParquetSource::open(datasource.name.clone(), &dir)?;
+    let path = parquet_source_path(datasource)?;
+    let source = ParquetSource::open(datasource.name.clone(), &path)?;
     catalog.register_datasource(Arc::new(source));
-    let spec = connectors::spec_from_kind("parquet", Some(dir), None)?;
+    let spec = connectors::spec_from_kind("parquet", Some(path), None)?;
     connectors::register(session, datasource.name.clone(), spec);
     Ok(())
+}
+
+/// The filesystem path of a Parquet source: a directory (`dir`, every
+/// `<table>.parquet` in it is a table) or a single file (`file`, one table
+/// named after the datasource). Exactly one of the two must be given.
+fn parquet_source_path(datasource: &DataSourceConfig) -> Result<String, RuntimeError> {
+    match (
+        optional_str(datasource, "dir"),
+        optional_str(datasource, "file"),
+    ) {
+        (Some(dir), None) => Ok(dir),
+        (None, Some(file)) => Ok(file),
+        (Some(_), Some(_)) => Err(RuntimeError::Config(format!(
+            "parquet datasource '{}' has both 'dir' and 'file'; give exactly one",
+            datasource.name
+        ))),
+        (None, None) => Err(RuntimeError::Config(format!(
+            "parquet datasource '{}' needs a 'dir' (a directory of .parquet files) \
+             or a 'file' (a single .parquet file)",
+            datasource.name
+        ))),
+    }
 }
 
 /// Reject any connection-param key not in `allowed` for a datasource block, so a

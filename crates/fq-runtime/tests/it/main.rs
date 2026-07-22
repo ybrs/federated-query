@@ -8,6 +8,7 @@ mod ctes;
 mod delta_refresh;
 mod duckdb_runtime;
 mod dynamic_catalog;
+mod event_dataset;
 mod materialized_views;
 mod parquet_runtime;
 mod settings;

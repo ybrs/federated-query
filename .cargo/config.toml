@@ -15,7 +15,6 @@ DUCKDB_INCLUDE_DIR = { value = ".duckdb-lib/current", relative = true, force = t
 # dir, and anything loaded via a symlink from benchmarks/) resolves
 # libduckdb.so at runtime without LD_LIBRARY_PATH.
 rustflags = [
-    "-C", "link-arg=-Wl,-rpath,/workspace/federated-query/.duckdb-lib/current",
     "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../.duckdb-lib/current",
     "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../../.duckdb-lib/current",
 ]

@@ -24,6 +24,7 @@ fn empty_config() -> Config {
         server: ServerConfig::default(),
         accelerator: fq_common::AcceleratorConfig::default(),
         catalog: fq_common::CatalogConfig::default(),
+        events: fq_common::EventsConfig::default(),
         source_path: None,
     }
 }
@@ -274,4 +275,70 @@ fn set_predicate_pushdown_changes_the_plan_text() {
     runtime.execute("RESET ALL").expect("reset all");
     assert_eq!(explain_text(&runtime, query), with_pushdown);
     let _ = std::fs::remove_file(&path);
+}
+
+/// A store-backed config in a fresh temp dir (persisted settings live in the
+/// store next to the config path).
+fn stored_config(tag: &str) -> Config {
+    let dir = std::env::temp_dir().join(format!(
+        "fq_set_{tag}_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after 1970")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("create sandbox dir");
+    let mut config = empty_config();
+    config.source_path = Some(dir.join("config.yaml").to_string_lossy().to_string());
+    config
+}
+
+/// Whether any cell of the result contains `needle`.
+fn result_contains(batches: &[RecordBatch], needle: &str) -> bool {
+    for batch in batches {
+        for column in 0..batch.num_columns() {
+            if text_column(batch, column)
+                .iter()
+                .any(|cell| cell.contains(needle))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[test]
+fn a_set_survives_into_a_new_runtime_over_the_same_store() {
+    let config = stored_config("persist");
+    let runtime = Runtime::from_config(&config).expect("from_config");
+    runtime
+        .execute("SET events.build_memory_bytes = 12345678901")
+        .expect("set");
+    drop(runtime);
+
+    // A fresh runtime over the same config re-applies the persisted SET.
+    let runtime = Runtime::from_config(&config).expect("from_config");
+    let (_, batches) = runtime
+        .execute("SHOW SETTING events.build_memory_bytes")
+        .expect("show");
+    assert!(
+        result_contains(&batches, "12345678901"),
+        "persisted value visible after restart"
+    );
+
+    // RESET removes the persisted row: the next runtime is back on defaults.
+    runtime
+        .execute("RESET events.build_memory_bytes")
+        .expect("reset");
+    drop(runtime);
+    let runtime = Runtime::from_config(&config).expect("from_config");
+    let (_, batches) = runtime
+        .execute("SHOW SETTING events.build_memory_bytes")
+        .expect("show");
+    assert!(
+        !result_contains(&batches, "12345678901"),
+        "reset value gone after restart"
+    );
 }

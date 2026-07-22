@@ -32,6 +32,11 @@ pub enum Watermark {
     /// units are refused (truncation would re-pull boundary rows as
     /// duplicates).
     TimestampMicros(i64),
+    /// A UTC-zoned timestamp as microseconds since the Unix epoch. Only a
+    /// UTC-equivalent zone is accepted at scan (any other zone is refused);
+    /// the value is an absolute instant, rendered with an explicit `+00:00`
+    /// offset so every source dialect compares it exactly.
+    TimestampTzMicros(i64),
 }
 
 impl Watermark {
@@ -44,6 +49,9 @@ impl Watermark {
             (Watermark::DateDays(a), Watermark::DateDays(b)) => Ok(Watermark::DateDays(a.max(b))),
             (Watermark::TimestampMicros(a), Watermark::TimestampMicros(b)) => {
                 Ok(Watermark::TimestampMicros(a.max(b)))
+            }
+            (Watermark::TimestampTzMicros(a), Watermark::TimestampTzMicros(b)) => {
+                Ok(Watermark::TimestampTzMicros(a.max(b)))
             }
             (a, b) => Err(AccelError::Watermark(format!(
                 "watermark type changed between pulls ({a:?} vs {b:?}); the \
@@ -66,6 +74,17 @@ impl Watermark {
                     .expect("stored watermark micros are in chrono range")
                     .naive_utc();
                 format!("TIMESTAMP '{}'", timestamp.format("%Y-%m-%d %H:%M:%S%.6f"))
+            }
+            // A plain quoted string, not a TIMESTAMP keyword literal: the
+            // TIMESTAMP keyword names the zone-less type in the source
+            // dialects, which would drop the offset; a string with an explicit
+            // offset coerces to the column's zoned type exactly everywhere the
+            // engine pushes (DataFusion, DuckDB, Postgres).
+            Watermark::TimestampTzMicros(micros) => {
+                let timestamp = chrono::DateTime::from_timestamp_micros(*micros)
+                    .expect("stored watermark micros are in chrono range")
+                    .naive_utc();
+                format!("'{}+00:00'", timestamp.format("%Y-%m-%d %H:%M:%S%.6f"))
             }
         }
     }
@@ -131,7 +150,7 @@ fn batch_watermark(batch: &RecordBatch, column_index: usize) -> WatermarkScan {
     let name = batch.schema().field(column_index).name().clone();
     if array.null_count() > 0 {
         return WatermarkScan::Unsupported(format!(
-            "change-key column '{name}' holds NULL; a NULL never passes the \
+            "watermark column '{name}' holds NULL; a NULL never passes the \
              delta filter, so rows would be missed"
         ));
     }
@@ -155,12 +174,28 @@ fn typed_max(array: &dyn Array, name: &str) -> WatermarkScan {
         ArrowType::Utf8View => text_max(&array.as_string_view()),
         ArrowType::Date32 => date32_max(array),
         ArrowType::Date64 => date64_max(array),
-        ArrowType::Timestamp(unit, None) => timestamp_max(array, *unit, name),
+        ArrowType::Timestamp(unit, None) => timestamp_max(array, *unit, name, false),
+        ArrowType::Timestamp(unit, Some(zone)) if is_utc_zone(zone) => {
+            timestamp_max(array, *unit, name, true)
+        }
+        ArrowType::Timestamp(_, Some(zone)) => WatermarkScan::Unsupported(format!(
+            "watermark column '{name}' carries zone '{zone}'; only a UTC zone \
+             compares exactly across sources"
+        )),
         other => WatermarkScan::Unsupported(format!(
-            "change-key column '{name}' has type {other}, which cannot carry \
+            "watermark column '{name}' has type {other}, which cannot carry \
              an exact watermark"
         )),
     }
+}
+
+/// Whether an arrow timestamp zone string denotes UTC (the zero offset under
+/// any of its spellings).
+fn is_utc_zone(zone: &str) -> bool {
+    matches!(
+        zone.to_ascii_uppercase().as_str(),
+        "UTC" | "Z" | "+00:00" | "+0000" | "+00"
+    )
 }
 
 /// Max of an integer-family primitive array, widened to i64.
@@ -210,11 +245,12 @@ fn date64_max(array: &dyn Array) -> WatermarkScan {
     }
 }
 
-/// Max of a zone-less timestamp array, widened exactly to microseconds.
+/// Max of a timestamp array, widened exactly to microseconds; `zoned` picks
+/// the UTC-zoned variant (the caller already verified the zone is UTC).
 /// Nanosecond timestamps are refused: truncating to microseconds would set the
 /// watermark BELOW the true max and the next delta would re-pull (duplicate)
 /// the boundary rows.
-fn timestamp_max(array: &dyn Array, unit: TimeUnit, name: &str) -> WatermarkScan {
+fn timestamp_max(array: &dyn Array, unit: TimeUnit, name: &str, zoned: bool) -> WatermarkScan {
     use arrow::datatypes as adt;
     let (raw, per_unit_micros) = match unit {
         TimeUnit::Second => (
@@ -231,7 +267,7 @@ fn timestamp_max(array: &dyn Array, unit: TimeUnit, name: &str) -> WatermarkScan
         ),
         TimeUnit::Nanosecond => {
             return WatermarkScan::Unsupported(format!(
-                "change-key column '{name}' is a nanosecond timestamp; a \
+                "watermark column '{name}' is a nanosecond timestamp; a \
                  microsecond watermark would duplicate boundary rows"
             ));
         }
@@ -239,9 +275,12 @@ fn timestamp_max(array: &dyn Array, unit: TimeUnit, name: &str) -> WatermarkScan
     match raw {
         None => WatermarkScan::Value(None),
         Some(value) => match value.checked_mul(per_unit_micros) {
+            Some(micros) if zoned => {
+                WatermarkScan::Value(Some(Watermark::TimestampTzMicros(micros)))
+            }
             Some(micros) => WatermarkScan::Value(Some(Watermark::TimestampMicros(micros))),
             None => WatermarkScan::Unsupported(format!(
-                "change-key column '{name}' timestamp overflows microseconds"
+                "watermark column '{name}' timestamp overflows microseconds"
             )),
         },
     }
@@ -343,6 +382,34 @@ mod tests {
     }
 
     #[test]
+    fn utc_zoned_timestamps_carry_a_zoned_watermark() {
+        let array = TimestampMicrosecondArray::from(vec![5_000_000_i64, 9_000_000])
+            .with_timezone("UTC");
+        let zoned = batch(Arc::new(array));
+        assert_eq!(
+            scan_watermark(std::slice::from_ref(&zoned), 0).expect("scan"),
+            WatermarkScan::Value(Some(Watermark::TimestampTzMicros(9_000_000)))
+        );
+        // The literal is a plain quoted string carrying the explicit offset.
+        assert_eq!(
+            Watermark::TimestampTzMicros(1_583_020_800_123_456).sql_literal(),
+            "'2020-03-01 00:00:00.123456+00:00'"
+        );
+    }
+
+    #[test]
+    fn a_non_utc_zone_is_unsupported_naming_the_zone() {
+        let array = TimestampMicrosecondArray::from(vec![1_i64]).with_timezone("+02:00");
+        let zoned = batch(Arc::new(array));
+        match scan_watermark(&[zoned], 0).expect("scan") {
+            WatermarkScan::Unsupported(reason) => {
+                assert!(reason.contains("+02:00"), "{reason}");
+            }
+            WatermarkScan::Value(other) => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn max_with_rejects_a_type_change() {
         let error = Watermark::Int(1)
             .max_with(Watermark::Text("a".to_string()))
@@ -357,6 +424,7 @@ mod tests {
             Watermark::Text("t".to_string()),
             Watermark::DateDays(1),
             Watermark::TimestampMicros(2),
+            Watermark::TimestampTzMicros(3),
         ] {
             let json = serde_json::to_string(&watermark).expect("serialize");
             let back: Watermark = serde_json::from_str(&json).expect("deserialize");

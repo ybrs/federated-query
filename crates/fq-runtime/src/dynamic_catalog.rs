@@ -31,7 +31,8 @@ use crate::{register_datasource, Runtime};
 /// The connection-param keys `SHOW DATASOURCES` may render: an ALLOWLIST, so a
 /// credential (or any key not listed) is redacted by omission. A password, or
 /// any param added later, never appears unless it is added here deliberately.
-const SAFE_DISPLAY_KEYS: [&str; 6] = ["host", "port", "database", "schemas", "path", "dir"];
+const SAFE_DISPLAY_KEYS: [&str; 7] =
+    ["host", "port", "database", "schemas", "path", "dir", "file"];
 
 /// The connection-param keys each connector kind accepts. An unknown key raises
 /// at CREATE naming it (a typo must fail loud, not connect and be ignored).
@@ -52,7 +53,7 @@ fn allowed_keys(kind: &str) -> &'static [&'static str] {
             "host", "port", "user", "username", "password", "database", "schemas",
         ],
         "duckdb" => &["path"],
-        "parquet" => &["dir"],
+        "parquet" => &["dir", "file"],
         // The parser admits only the five kinds; a value here is a wiring bug.
         other => unreachable!("unsupported datasource kind '{other}' reached validation"),
     }

@@ -14,6 +14,7 @@
 pub mod budget;
 pub mod config;
 pub mod error;
+pub mod events;
 pub mod logging;
 pub mod types;
 #[macro_use]
@@ -25,5 +26,6 @@ pub use config::{
     ExecutorConfig, OptimizerConfig, Principal, ServerConfig, UserCredential, SCRAM_ITERATIONS,
 };
 pub use error::{ConfigError, UnsupportedSqlError};
+pub use events::EventsConfig;
 pub use logging::setup_logging;
 pub use types::DataType;

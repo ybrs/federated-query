@@ -80,3 +80,10 @@ benchmarks/perf_compare/results/
 benchmarks/perf_compare/fedq.so
 .claude/worktrees/
 fuzz/artifacts/
+event-analytics/fedq.events/
+event-analytics/fedq.mv/
+event-analytics/fedq.stats.sqlite*
+event-analytics/*.events/
+
+# The materialized event store of the repo-root config; runtime state, never tracked.
+event-analytics/

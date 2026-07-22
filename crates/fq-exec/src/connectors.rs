@@ -164,9 +164,9 @@ pub fn register(session: SessionId, name: String, spec: DsSpec) {
 /// plus every cached context and connection it seeded. A `DROP DATASOURCE` calls
 /// this so the dropped name no longer resolves in the dropping session AND a
 /// later create reusing the name (pointing elsewhere) never reads a stale cached
-/// connection. The URI-keyed caches (DuckDB, Parquet, MySQL) are purged by the
-/// spec's URI, so the spec is read before it is removed. Only this session's
-/// entries for this name are touched; peers and other sources are untouched.
+/// connection. The URI-keyed DuckDB cache is purged by the spec's URI, so the
+/// spec is read before it is removed. Only this session's entries for this name
+/// are touched; peers and other sources are untouched.
 pub fn deregister(session: SessionId, name: &str) {
     let spec = registry()
         .lock()
@@ -181,12 +181,12 @@ pub fn deregister(session: SessionId, name: &str) {
         .lock()
         .unwrap()
         .remove(&(session, name.to_string()));
+    parquet_ctx_cache()
+        .lock()
+        .unwrap()
+        .remove(&(session, name.to_string()));
     if let Some(uri) = uri {
-        duck_base_cache()
-            .lock()
-            .unwrap()
-            .remove(&(session, uri.clone()));
-        parquet_ctx_cache().lock().unwrap().remove(&(session, uri));
+        duck_base_cache().lock().unwrap().remove(&(session, uri));
     }
     PG_CACHE.with(|cache| {
         cache.borrow_mut().remove(&(session, name.to_string()));
@@ -420,7 +420,7 @@ pub fn fetch(name: &str, sql: &str) -> ExecResult<(SchemaRef, Vec<RecordBatch>)>
     match s.kind {
         DsKind::Postgres => fetch_postgres(name, &s, sql),
         DsKind::DuckDb => fetch_duckdb(&s, sql),
-        DsKind::Parquet => fetch_parquet(&s, sql),
+        DsKind::Parquet => fetch_parquet(name, &s, sql),
         DsKind::ClickHouse => fetch_clickhouse(name, &s, sql),
         DsKind::MySql => fetch_mysql(&s, sql),
         DsKind::Materialized => fetch_materialized(name, sql),
@@ -474,8 +474,8 @@ fn parquet_runtime() -> &'static tokio::runtime::Runtime {
 // directory's `<table>.parquet` files (registered under a `main` schema). This
 // gives DataFusion's native projection / filter / row-group pushdown - the fair
 // comparison point against DuckDB's read_parquet.
-fn fetch_parquet(s: &DsSpec, sql: &str) -> ExecResult<(SchemaRef, Vec<RecordBatch>)> {
-    let ctx = parquet_ctx(current_session(), &s.uri)
+fn fetch_parquet(name: &str, s: &DsSpec, sql: &str) -> ExecResult<(SchemaRef, Vec<RecordBatch>)> {
+    let ctx = parquet_ctx(current_session(), name, &s.uri)
         .map_err(|e| ExecError::runtime(format!("parquet: {e}")))?;
     let sql = sql.to_string();
     let result = parquet_runtime().block_on(async move {
@@ -487,15 +487,16 @@ fn fetch_parquet(s: &DsSpec, sql: &str) -> ExecResult<(SchemaRef, Vec<RecordBatc
     result.map_err(|e| ExecError::runtime(format!("parquet query: {e}")))
 }
 
-// A DataFusion context per Parquet directory, built once (schema inference of
+// A DataFusion context per Parquet datasource, built once (schema inference of
 // every file is not repeated per query) and reused - SessionContext is Arc-cheap
 // to clone.
 fn parquet_ctx(
     session: SessionId,
+    name: &str,
     dir: &str,
 ) -> Result<datafusion::prelude::SessionContext, datafusion::error::DataFusionError> {
     let cache = parquet_ctx_cache();
-    let key = (session, dir.to_string());
+    let key = (session, name.to_string());
     let mut map = cache.lock().unwrap();
     if let Some(ctx) = map.get(&key) {
         return Ok(ctx.clone());
@@ -509,14 +510,16 @@ fn parquet_ctx(
         config,
         crate::engine::runtime_env(),
     );
-    parquet_runtime().block_on(register_parquet_dir(&ctx, dir))?;
+    parquet_runtime().block_on(register_parquet_dir(&ctx, name, dir))?;
     map.insert(key, ctx.clone());
     Ok(ctx)
 }
 
-// A DataFusion context per (session, Parquet directory). Session-keyed so a
+// A DataFusion context per (session, datasource name). Session-keyed so a
 // dropped runtime's inferred-schema contexts prune with it and two runtimes over
-// the same directory keep independent contexts.
+// the same directory keep independent contexts. Name-keyed (not path-keyed)
+// because a single-file context registers its table under the datasource name,
+// so two names over the same file must not share a context.
 fn parquet_ctx_cache(
 ) -> &'static Mutex<HashMap<(SessionId, String), datafusion::prelude::SessionContext>> {
     static CACHE: OnceLock<
@@ -525,9 +528,12 @@ fn parquet_ctx_cache(
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-// Register every `<dir>/<table>.parquet` as `main.<table>` in `ctx`.
+// Register every `<dir>/<table>.parquet` as `main.<table>` in `ctx`. A single
+// file registers as one table named after the datasource (`source_name`),
+// matching the catalog tier's naming so a rendered `FROM main.<name>` resolves.
 async fn register_parquet_dir(
     ctx: &datafusion::prelude::SessionContext,
+    source_name: &str,
     dir: &str,
 ) -> Result<(), datafusion::error::DataFusionError> {
     use datafusion::catalog::SchemaProvider;
@@ -536,16 +542,26 @@ async fn register_parquet_dir(
         ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
     };
     let schema = std::sync::Arc::new(datafusion::catalog::MemorySchemaProvider::new());
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
-    for entry in entries {
-        let path = entry
-            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
-            .path();
-        if path.extension().and_then(|e| e.to_str()) != Some("parquet") {
-            continue;
+    let root = std::path::Path::new(dir);
+    let tables: Vec<(String, std::path::PathBuf)> = if root.is_file() {
+        // A single `.parquet` file is one table named after the datasource.
+        vec![(source_name.to_string(), root.to_path_buf())]
+    } else {
+        let mut collected = Vec::new();
+        let entries = std::fs::read_dir(dir)
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+        for entry in entries {
+            let path = entry
+                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
+                .path();
+            if path.extension().and_then(|e| e.to_str()) == Some("parquet") {
+                let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+                collected.push((stem, path));
+            }
         }
-        let name = path.file_stem().unwrap().to_string_lossy().to_string();
+        collected
+    };
+    for (name, path) in tables {
         let url = ListingTableUrl::parse(path.to_string_lossy())?;
         // Infer string/binary columns as Utf8/Binary, NOT the Utf8View/BinaryView
         // DataFusion 54 defaults to: schema inference bakes the column types into
@@ -2074,5 +2090,75 @@ mod tests {
             .unwrap()
             .contains_key(&(drop_it, "src".to_string())));
         prune_session(keep);
+    }
+}
+
+/// A pull-based batch stream over one source read. The Parquet path streams
+/// the DataFusion execution (bounded memory: batches are pulled one at a
+/// time, upstream partitions decode in parallel); every other source kind
+/// materializes the whole result first and replays it batch by batch, so its
+/// memory belongs to the query pipeline, not the consumer.
+pub struct FetchStream {
+    schema: SchemaRef,
+    inner: FetchStreamInner,
+}
+
+/// The two stream backings.
+enum FetchStreamInner {
+    Streaming(datafusion::physical_plan::SendableRecordBatchStream),
+    Materialized(std::vec::IntoIter<RecordBatch>),
+}
+
+impl FetchStream {
+    /// The result schema.
+    pub fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    /// The next batch, or None at end of stream.
+    pub fn next_batch(&mut self) -> ExecResult<Option<RecordBatch>> {
+        match &mut self.inner {
+            FetchStreamInner::Streaming(stream) => parquet_runtime()
+                .block_on(futures::StreamExt::next(stream))
+                .transpose()
+                .map_err(|e| ExecError::runtime(format!("parquet stream: {e}"))),
+            FetchStreamInner::Materialized(batches) => Ok(batches.next()),
+        }
+    }
+}
+
+/// Run `sql` against the named source and return a pull-based batch stream.
+/// The caller must be inside a `SessionScope` (like every fetch).
+pub fn fetch_stream(name: &str, sql: &str) -> ExecResult<FetchStream> {
+    let s = spec(name)?;
+    match s.kind {
+        DsKind::Parquet => {
+            let ctx = parquet_ctx(current_session(), name, &s.uri)
+                .map_err(|e| ExecError::runtime(format!("parquet: {e}")))?;
+            let sql = sql.to_string();
+            let (schema, stream) = parquet_runtime()
+                .block_on(async move {
+                    let df = ctx.sql(&sql).await?;
+                    let schema = std::sync::Arc::new(df.schema().as_arrow().clone());
+                    let stream = df.execute_stream().await?;
+                    Ok::<_, datafusion::error::DataFusionError>((schema, stream))
+                })
+                .map_err(|e| ExecError::runtime(format!("parquet query: {e}")))?;
+            Ok(FetchStream {
+                schema,
+                inner: FetchStreamInner::Streaming(stream),
+            })
+        }
+        DsKind::Postgres
+        | DsKind::DuckDb
+        | DsKind::ClickHouse
+        | DsKind::MySql
+        | DsKind::Materialized => {
+            let (schema, batches) = fetch(name, sql)?;
+            Ok(FetchStream {
+                schema,
+                inner: FetchStreamInner::Materialized(batches.into_iter()),
+            })
+        }
     }
 }

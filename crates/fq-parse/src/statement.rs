@@ -36,9 +36,13 @@
 use crate::error::ParseError;
 
 /// One SQL statement, classified: a materialized-view DDL form, a settings
-/// statement, or a plain query passed through as text for the normal parse
-/// pipeline.
-#[derive(Debug, PartialEq, Eq)]
+/// statement, an event-analytics statement, or a plain query passed through as
+/// text for the normal parse pipeline.
+///
+/// The event family reserves the leading keywords `FUNNEL`, `RETENTION`,
+/// `SEGMENT`, `PATHS`, and `REBUILD` for its analysis and DDL forms; none of
+/// them starts a plannable SQL query, so classification is unambiguous.
+#[derive(Debug, PartialEq)]
 pub enum Statement<'a> {
     /// Anything that is not a recognized statement form; the full original text.
     Query(&'a str),
@@ -77,6 +81,17 @@ pub enum Statement<'a> {
     DropDatasource { name: String },
     /// `SHOW DATASOURCES`: list every bootstrap and dynamic datasource.
     ShowDatasources,
+    /// `SHOW TABLES [FROM <datasource>]`: list every catalog table as
+    /// (datasource, schema, table) rows, narrowed to one datasource when named.
+    ShowTables { datasource: Option<String> },
+    /// `DESCRIBE <table>` / `<schema>.<table>` / `<datasource>.<schema>.<table>`:
+    /// the columns of one catalog table, resolved with the same semantics as a
+    /// FROM reference (missing qualifiers search every registered schema).
+    DescribeTable {
+        datasource: Option<String>,
+        schema: Option<String>,
+        table: String,
+    },
     /// `CREATE USER <name> WITH PASSWORD '<plaintext>' [SUPERUSER]`. The
     /// plaintext is hashed to a verifier in the runtime and never logged.
     CreateUser {
@@ -104,6 +119,27 @@ pub enum Statement<'a> {
     ShowUsers,
     /// `SHOW GRANTS [FOR <grantee>]`.
     ShowGrants { grantee: Option<String> },
+    /// `CREATE EVENT DATASET <name> FROM ... ACTOR ... TIME ... EVENT ...`.
+    CreateEventDataset(fq_common::events::EventDatasetDef),
+    /// `REFRESH EVENT DATASET <name>`: incremental append past the watermark.
+    RefreshEventDataset { name: String },
+    /// `REBUILD EVENT DATASET <name>`: full re-ingest from the source.
+    RebuildEventDataset { name: String },
+    /// `DROP EVENT DATASET <name>`.
+    DropEventDataset { name: String },
+    /// `SHOW EVENT DATASETS`: list every event dataset with its build state.
+    ShowEventDatasets,
+    /// `SHOW EVENTS FROM <dataset>`: the distinct event names of one dataset,
+    /// read from its dictionary (no data scan).
+    ShowEvents { dataset: String },
+    /// `FUNNEL ( <event>, ... ) ON <dataset> WINDOW <interval> ...`.
+    EventFunnel(fq_common::events::FunnelSpec),
+    /// `RETENTION ON <dataset> BIRTH ... RETURN ... PERIOD ...`.
+    EventRetention(fq_common::events::RetentionSpec),
+    /// `SEGMENT <measure> ON <dataset> BUCKET <grain> ...`.
+    EventSegment(fq_common::events::SegmentSpec),
+    /// `PATHS ON <dataset> [STARTING AT ... | ENDING AT ...] ...`.
+    EventPaths(fq_common::events::PathsSpec),
 }
 
 /// The object a GRANT/REVOKE names, at one of three containment levels. A grant
@@ -157,9 +193,23 @@ pub fn classify_statement(sql: &str) -> Result<Statement<'_>, ParseError> {
         return Ok(Statement::Query(sql));
     };
     match first.to_ascii_uppercase().as_str() {
-        // REFRESH exists for nothing but the materialized-view form, so its
-        // errors name what that form expects.
+        // REFRESH exists only for the materialized-view and event-dataset
+        // forms; the second word picks the family.
+        "REFRESH" if second_word_is(sql, "EVENT") => {
+            crate::events::classify_refresh_event(&mut tokens)
+        }
         "REFRESH" => classify_refresh(&mut tokens),
+        "REBUILD" => crate::events::classify_rebuild_event(&mut tokens),
+        "CREATE" if second_word_is(sql, "EVENT") => {
+            crate::events::classify_create_event(&mut tokens)
+        }
+        "DROP" if second_word_is(sql, "EVENT") => crate::events::classify_drop_event(&mut tokens),
+        "SHOW" if second_word_is(sql, "EVENT") => crate::events::classify_show_event(&mut tokens),
+        "SHOW" if second_word_is(sql, "EVENTS") => crate::events::classify_show_events(&mut tokens),
+        "FUNNEL" => crate::events::classify_funnel(&mut tokens),
+        "RETENTION" => crate::events::classify_retention(&mut tokens),
+        "SEGMENT" => crate::events::classify_segment(&mut tokens),
+        "PATHS" => crate::events::classify_paths(&mut tokens),
         "CREATE" if second_word_is(sql, "MATERIALIZED") => classify_create(&mut tokens),
         "CREATE" if second_word_is(sql, "DATASOURCE") => classify_create_datasource(&mut tokens),
         "CREATE" if second_word_is(sql, "USER") => classify_create_user(&mut tokens),
@@ -193,6 +243,8 @@ pub fn classify_statement(sql: &str) -> Result<Statement<'_>, ParseError> {
         }
         "SHOW" if second_word_is(sql, "MATERIALIZED") => classify_show_materialized(&mut tokens),
         "SHOW" if second_word_is(sql, "DATASOURCES") => classify_show_datasources(&mut tokens),
+        "SHOW" if second_word_is(sql, "TABLES") => classify_show_tables(&mut tokens),
+        "DESCRIBE" => classify_describe(&mut tokens),
         "SHOW" if second_word_is(sql, "USERS") => classify_show_users(&mut tokens),
         "SHOW" if second_word_is(sql, "GRANTS") => classify_show_grants(&mut tokens),
         // The engine has no SET/RESET beyond the settings surface, so every one
@@ -307,7 +359,9 @@ fn datasource_kind(tokens: &mut Tokenizer<'_>) -> Result<String, ParseError> {
 /// are bare words, lowercased; a duplicate key raises. Values are string
 /// literals or a bare word (a bare integer for a numeric param). An empty list
 /// `( )` is accepted; each kind's required params are checked at validation.
-fn parse_with_params(tokens: &mut Tokenizer<'_>) -> Result<Vec<(String, String)>, ParseError> {
+pub(crate) fn parse_with_params(
+    tokens: &mut Tokenizer<'_>,
+) -> Result<Vec<(String, String)>, ParseError> {
     expect_char(tokens, '(', "WITH (")?;
     let mut params: Vec<(String, String)> = Vec::new();
     if consume_char(tokens, ')') {
@@ -364,7 +418,11 @@ fn parse_one_param(tokens: &mut Tokenizer<'_>) -> Result<(String, String), Parse
 }
 
 /// Consume the next token, requiring it to be the single character `ch`.
-fn expect_char(tokens: &mut Tokenizer<'_>, ch: char, form: &str) -> Result<(), ParseError> {
+pub(crate) fn expect_char(
+    tokens: &mut Tokenizer<'_>,
+    ch: char,
+    form: &str,
+) -> Result<(), ParseError> {
     match tokens.next_token() {
         Some(Token::Other(found)) if found == ch => Ok(()),
         Some(token) => Err(ParseError::Parse(format!(
@@ -379,7 +437,7 @@ fn expect_char(tokens: &mut Tokenizer<'_>, ch: char, form: &str) -> Result<(), P
 
 /// Consume the next token if it is the single character `ch`, returning whether
 /// it was consumed.
-fn consume_char(tokens: &mut Tokenizer<'_>, ch: char) -> bool {
+pub(crate) fn consume_char(tokens: &mut Tokenizer<'_>, ch: char) -> bool {
     if matches!(tokens.peek(), Some(Token::Other(found)) if found == ch) {
         tokens.next_token();
         return true;
@@ -412,6 +470,66 @@ fn classify_show_datasources<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement
     tokens.expect_keyword("DATASOURCES")?;
     expect_end(tokens, "SHOW DATASOURCES")?;
     Ok(Statement::ShowDatasources)
+}
+
+/// Parse `SHOW TABLES [FROM <datasource>]` (`IN` is accepted for `FROM`). A
+/// trailing token after the form raises rather than being silently accepted.
+fn classify_show_tables<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("SHOW")?;
+    tokens.expect_keyword("TABLES")?;
+    if tokens.peek_word_is("FROM") || tokens.peek_word_is("IN") {
+        tokens.next_token();
+        let datasource = view_name(tokens, "datasource")?;
+        expect_end(tokens, "SHOW TABLES FROM <datasource>")?;
+        return Ok(Statement::ShowTables {
+            datasource: Some(datasource),
+        });
+    }
+    expect_end(tokens, "SHOW TABLES")?;
+    Ok(Statement::ShowTables { datasource: None })
+}
+
+/// Parse `DESCRIBE <table>` / `<schema>.<table>` / `<datasource>.<schema>.<table>`.
+/// More than three dotted parts, or any token after the reference, raises.
+fn classify_describe<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("DESCRIBE")?;
+    let mut parts = vec![table_ref_part(tokens)?];
+    while matches!(tokens.peek(), Some(Token::Other('.'))) {
+        tokens.next_token();
+        parts.push(table_ref_part(tokens)?);
+    }
+    expect_end(tokens, "DESCRIBE <table>")?;
+    if parts.len() > 3 {
+        return Err(ParseError::Parse(format!(
+            "DESCRIBE takes at most <datasource>.<schema>.<table>, found {} name parts",
+            parts.len()
+        )));
+    }
+    let table = parts.pop().expect("table_ref_part read at least one part");
+    let schema = parts.pop();
+    let datasource = parts.pop();
+    Ok(Statement::DescribeTable {
+        datasource,
+        schema,
+        table,
+    })
+}
+
+/// Read one identifier part of a dotted table reference: an unquoted word
+/// lowercases (the Postgres identifier rule); a double-quoted one keeps its
+/// exact spelling.
+fn table_ref_part(tokens: &mut Tokenizer<'_>) -> Result<String, ParseError> {
+    match tokens.next_token() {
+        Some(Token::Word(word)) => Ok(word.to_lowercase()),
+        Some(Token::QuotedIdent(name)) => Ok(name),
+        Some(token) => Err(ParseError::Parse(format!(
+            "expected a table name part, found '{}'",
+            token.describe()
+        ))),
+        None => Err(ParseError::Parse(
+            "expected a table name, found end of statement".to_string(),
+        )),
+    }
 }
 
 /// Parse `CREATE USER <name> WITH PASSWORD '<pw>' [SUPERUSER]`, raising on
@@ -664,7 +782,7 @@ fn classify_show_grants<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>,
 
 /// Consume the next token if it is the bare word `keyword` (case-insensitive),
 /// returning whether it was consumed.
-fn consume_keyword(tokens: &mut Tokenizer<'_>, keyword: &str) -> bool {
+pub(crate) fn consume_keyword(tokens: &mut Tokenizer<'_>, keyword: &str) -> bool {
     if tokens.peek_word_is(keyword) {
         tokens.next_token();
         return true;
@@ -674,7 +792,7 @@ fn consume_keyword(tokens: &mut Tokenizer<'_>, keyword: &str) -> bool {
 
 /// A short rendering of an optional token for error messages (end-of-statement
 /// when there is none).
-fn describe_opt(token: Option<&Token<'_>>) -> String {
+pub(crate) fn describe_opt(token: Option<&Token<'_>>) -> String {
     match token {
         Some(token) => token.describe(),
         None => "end of statement".to_string(),
@@ -688,7 +806,12 @@ fn classify_set<'a>(sql: &'a str, tokens: &mut Tokenizer<'a>) -> Result<Statemen
     tokens.expect_keyword("SET")?;
     let name = dotted_name(tokens)?;
     expect_assignment(tokens)?;
-    let value = unquote(tokens.rest().trim());
+    let raw = tokens.rest().trim();
+    // A trailing ';' is the statement terminator SQL clients append, never
+    // part of the value: a value containing ';' is quoted, and the raw text
+    // then ends with its closing quote, not the ';'.
+    let raw = raw.strip_suffix(';').map_or(raw, str::trim_end);
+    let value = unquote(raw);
     if value.is_empty() {
         return Err(ParseError::Parse(format!(
             "SET {name} has no value after the '='"
@@ -918,9 +1041,14 @@ pub(crate) fn view_name(tokens: &mut Tokenizer<'_>, what: &str) -> Result<String
 }
 
 /// Raise if any token follows where the statement must end; a trailing token is
-/// an option this statement form does not take.
+/// an option this statement form does not take. A single trailing statement
+/// terminator (`;`) is accepted, since SQL clients append one to every command.
 pub(crate) fn expect_end(tokens: &mut Tokenizer<'_>, form: &str) -> Result<(), ParseError> {
-    match tokens.next_token() {
+    let mut token = tokens.next_token();
+    if matches!(token, Some(Token::Other(';'))) {
+        token = tokens.next_token();
+    }
+    match token {
         None => Ok(()),
         Some(token) => Err(ParseError::Unsupported(format!(
             "{form} takes no further tokens; unexpected trailing '{}'",
@@ -1034,6 +1162,42 @@ impl<'a> Tokenizer<'a> {
             None => Err(ParseError::Parse(format!(
                 "expected '{keyword}', found end of statement"
             ))),
+        }
+    }
+
+    /// Consume a balanced `( ... )` group and return the text between the
+    /// outer parentheses (quote-aware; nested parentheses stay balanced). The
+    /// opening parenthesis must be the next token; a statement ending before
+    /// the matching close raises.
+    pub(crate) fn take_parenthesized(&mut self, form: &str) -> Result<&'a str, ParseError> {
+        match self.next_token() {
+            Some(Token::Other('(')) => {}
+            other => {
+                return Err(ParseError::Parse(format!(
+                    "expected '(' in {form}, found '{}'",
+                    describe_opt(other.as_ref())
+                )))
+            }
+        }
+        let start = self.pos;
+        let mut depth = 1usize;
+        loop {
+            let before = self.pos;
+            match self.next_token() {
+                Some(Token::Other('(')) => depth += 1,
+                Some(Token::Other(')')) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(&self.input[start..before]);
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    return Err(ParseError::Parse(format!(
+                        "{form} has an unclosed '(' before end of statement"
+                    )))
+                }
+            }
         }
     }
 
@@ -1518,6 +1682,95 @@ mod tests {
     fn show_datasources_with_trailing_token_raises() {
         let error = classify_statement("SHOW DATASOURCES extra").unwrap_err();
         assert!(matches!(error, ParseError::Unsupported(_)));
+    }
+
+    #[test]
+    fn show_tables_classifies_with_and_without_a_datasource() {
+        assert_eq!(
+            classify("SHOW TABLES"),
+            Statement::ShowTables { datasource: None }
+        );
+        // FROM and IN both narrow; an unquoted name lowercases.
+        for sql in ["SHOW TABLES FROM Ev", "show tables in EV"] {
+            assert_eq!(
+                classify(sql),
+                Statement::ShowTables {
+                    datasource: Some("ev".to_string())
+                },
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn show_tables_with_a_trailing_token_raises() {
+        for sql in ["SHOW TABLES extra", "SHOW TABLES FROM ev extra"] {
+            let error = classify_statement(sql).unwrap_err();
+            assert!(matches!(error, ParseError::Unsupported(_)), "{sql}");
+        }
+    }
+
+    #[test]
+    fn describe_splits_the_dotted_reference_like_a_from_clause() {
+        assert_eq!(
+            classify("DESCRIBE ev"),
+            Statement::DescribeTable {
+                datasource: None,
+                schema: None,
+                table: "ev".to_string(),
+            }
+        );
+        assert_eq!(
+            classify("describe main.Region"),
+            Statement::DescribeTable {
+                datasource: None,
+                schema: Some("main".to_string()),
+                table: "region".to_string(),
+            }
+        );
+        assert_eq!(
+            classify("DESCRIBE pq.main.\"Region\""),
+            Statement::DescribeTable {
+                datasource: Some("pq".to_string()),
+                schema: Some("main".to_string()),
+                table: "Region".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn describe_with_no_name_four_parts_or_a_trailing_token_raises() {
+        assert!(classify_statement("DESCRIBE").is_err());
+        assert!(classify_statement("DESCRIBE a.b.c.d").is_err());
+        assert!(classify_statement("DESCRIBE t extra").is_err());
+    }
+
+    #[test]
+    fn set_strips_the_statement_terminator_from_the_value() {
+        assert_eq!(
+            classify("SET events.build_memory_bytes = 17179869184;"),
+            Statement::SetSetting {
+                name: "events.build_memory_bytes".to_string(),
+                value: "17179869184".to_string(),
+            }
+        );
+        // A quoted value keeps a ';' INSIDE the quotes.
+        assert_eq!(
+            classify("SET a.b = 'x;';"),
+            Statement::SetSetting {
+                name: "a.b".to_string(),
+                value: "x;".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_trailing_semicolon_is_accepted() {
+        assert!(matches!(
+            classify_statement("SHOW DATASOURCES;").unwrap(),
+            Statement::ShowDatasources
+        ));
+        assert!(classify_statement("SHOW MATERIALIZED VIEWS ;").is_ok());
     }
 
     #[test]

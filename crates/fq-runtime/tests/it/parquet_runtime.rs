@@ -152,6 +152,7 @@ fn base_config(datasources: BTreeMap<String, DataSourceConfig>) -> Config {
         server: ServerConfig::default(),
         accelerator: fq_common::AcceleratorConfig::default(),
         catalog: fq_common::CatalogConfig::default(),
+        events: fq_common::EventsConfig::default(),
         source_path: None,
     }
 }
@@ -279,5 +280,131 @@ fn invalid_column_over_parquet_raises_not_returns_rows() {
     assert!(
         result.is_err(),
         "an invalid column reference must raise, not manufacture a result"
+    );
+}
+
+/// Assemble a single-FILE Parquet-source `Config`: datasource `name` reading the
+/// one `.parquet` file at `path` (the `file` param, not `dir`).
+fn parquet_file_config(name: &str, path: &str) -> Config {
+    let mut params = BTreeMap::new();
+    params.insert("file".to_string(), Value::String(path.to_string()));
+    let mut datasources = BTreeMap::new();
+    datasources.insert(
+        name.to_string(),
+        DataSourceConfig {
+            name: name.to_string(),
+            ty: "parquet".to_string(),
+            config: params,
+            capabilities: Vec::new(),
+            change_keys: BTreeMap::new(),
+        },
+    );
+    base_config(datasources)
+}
+
+/// Flatten one Utf8 column (by index) across batches, in batch order.
+fn string_rows_at(batches: &[RecordBatch], index: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let column = downcast_str(batch, index);
+        for row in 0..batch.num_rows() {
+            rows.push(column.value(row).to_string());
+        }
+    }
+    rows
+}
+
+#[test]
+fn a_single_file_source_is_one_table_named_after_the_datasource() {
+    let dir = temp_parquet_dir("file");
+    write_region_parquet(&dir);
+    let file = dir.join("region.parquet");
+    let runtime = Runtime::from_config(&parquet_file_config("ev", file.to_str().unwrap()))
+        .expect("from_config");
+
+    // The bare datasource name resolves as a table reference, star-expanded
+    // from catalog metadata and executed through DataFusion.
+    let (schema, batches) = runtime
+        .execute("SELECT * FROM ev ORDER BY r_regionkey LIMIT 2")
+        .expect("bare-name select");
+    assert_eq!(column_names(&schema), vec!["r_regionkey", "r_name"]);
+    assert_eq!(string_rows_at(&batches, 1), vec!["AFRICA", "AMERICA"]);
+
+    // The fully qualified form names the same table.
+    let (_, qualified) = runtime
+        .execute("SELECT r_name FROM ev.main.ev ORDER BY r_regionkey")
+        .expect("qualified select");
+    assert_eq!(string_rows(&qualified).len(), 5);
+}
+
+#[test]
+fn show_tables_and_describe_surface_a_single_file_table() {
+    let dir = temp_parquet_dir("intro");
+    write_region_parquet(&dir);
+    let file = dir.join("region.parquet");
+    let runtime = Runtime::from_config(&parquet_file_config("evd", file.to_str().unwrap()))
+        .expect("from_config");
+
+    let (schema, batches) = runtime.execute("SHOW TABLES").expect("show tables");
+    assert_eq!(
+        column_names(&schema),
+        vec!["datasource", "schema", "table"]
+    );
+    assert_eq!(string_rows_at(&batches, 0), vec!["evd"]);
+    assert_eq!(string_rows_at(&batches, 1), vec!["main"]);
+    assert_eq!(string_rows_at(&batches, 2), vec!["evd"]);
+
+    let (schema, batches) = runtime.execute("DESCRIBE evd").expect("describe");
+    assert_eq!(column_names(&schema), vec!["column", "type", "nullable"]);
+    assert_eq!(
+        string_rows_at(&batches, 0),
+        vec!["r_regionkey", "r_name"]
+    );
+    assert_eq!(string_rows_at(&batches, 1), vec!["INTEGER", "VARCHAR"]);
+}
+
+#[test]
+fn show_tables_narrows_to_one_datasource_and_an_unknown_one_raises() {
+    let duck_path = seed_duck_fixture();
+    let dir = temp_parquet_dir("narrow");
+    write_region_parquet(&dir);
+    let duck_path = duck_path.to_str().expect("fixture path is valid UTF-8");
+    let runtime =
+        Runtime::from_config(&cross_config(duck_path, dir.to_str().unwrap())).expect("from_config");
+
+    let (_, batches) = runtime
+        .execute("SHOW TABLES FROM pq")
+        .expect("show tables from");
+    assert_eq!(string_rows_at(&batches, 0), vec!["pq"]);
+    assert_eq!(string_rows_at(&batches, 2), vec!["region"]);
+
+    let error = runtime.execute("SHOW TABLES FROM nope").unwrap_err();
+    assert!(
+        format!("{error}").contains("'nope' does not exist"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn describe_resolves_qualified_references_and_an_unknown_table_raises() {
+    let dir = temp_parquet_dir("descq");
+    write_region_parquet(&dir);
+    let runtime =
+        Runtime::from_config(&parquet_config(dir.to_str().unwrap())).expect("from_config");
+
+    // Every qualification level resolves to the same table.
+    for sql in ["DESCRIBE region", "DESCRIBE main.region", "DESCRIBE pq.main.region"] {
+        let (_, batches) = runtime.execute(sql).expect(sql);
+        assert_eq!(
+            string_rows_at(&batches, 0),
+            vec!["r_regionkey", "r_name"],
+            "{sql}"
+        );
+    }
+
+    let error = runtime.execute("DESCRIBE pq.main.nope").unwrap_err();
+    assert!(
+        format!("{error}").contains("not found in the catalog"),
+        "unexpected error: {error}"
     );
 }

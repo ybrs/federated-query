@@ -1,0 +1,49 @@
+# fq-events: the materialized event-analytics store and its four analysis
+# executors (funnels, retention, segmentation, paths). A separate crate because
+# it owns a concern no neighbor has: an actor-major columnar segment format
+# with dictionaries and per-file indexes, a bounded-memory two-phase build, and
+# streaming analysis kernels over that layout. DAG: fq-events -> fq-common;
+# fq-runtime -> fq-events (the statement surface executes there). No pyo3, no
+# server code, and deliberately no query-pipeline dependency: analyses never
+# enter parse -> bind -> optimize.
+
+[package]
+name = "fq-events"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+fq-common = { path = "../fq-common" }
+# The build ingests Arrow record batches; only array/schema access is used.
+arrow = "58"
+# Every store file read/write/delete goes through the object_store abstraction:
+# local filesystem today, an S3 bucket is a backend swap, not a format change.
+object_store = "0.13"
+# object_store is async; the store drives it on a small private runtime.
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+futures = "0.3"
+# The dataset registry lives in the same SQLite file as the learned-stats
+# catalog and the materialized-view registry.
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+thiserror = "2"
+# Segment blocks are zstd-compressed (level 1; raw-string blocks level 3).
+zstd = "0.13"
+# Build spill frames are lz4 (written once, read once; speed over ratio).
+lz4_flex = "0.13"
+# Refcounted write payloads: put_verified retries a mismatched write
+# without copying the buffer.
+bytes = "1"
+# The paths scan fingerprints windows with xxh3-128 so count-map keys stay 16
+# bytes at any DEPTH instead of carrying the window's code sequence.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[build-dependencies]
+# Compiles the vendored libsais C file (csrc/); one small translation unit,
+# nothing like the DuckDB amalgamation the workspace bans from cargo builds.
+cc = "1"
+
+[lints]
+workspace = true

@@ -46,8 +46,9 @@ fn where_becomes_filter_over_scan() {
     };
     assert!(scan.columns.contains(&"name".to_string()));
     assert!(scan.columns.contains(&"age".to_string()));
-    // A bare table name defaults schema to public, datasource empty.
-    assert_eq!(scan.schema_name, "public");
+    // A bare table name leaves schema and datasource empty; the binder
+    // resolves and stamps the real owner.
+    assert_eq!(scan.schema_name, "");
 }
 
 #[test]

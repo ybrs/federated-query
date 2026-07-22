@@ -190,6 +190,11 @@ impl Schema {
     pub fn table_count(&self) -> usize {
         self.tables.len()
     }
+
+    /// The tables of the schema, in lowercase-name order (the BTreeMap key).
+    pub fn tables(&self) -> impl Iterator<Item = &Table> {
+        self.tables.values()
+    }
 }
 
 impl std::fmt::Display for Schema {

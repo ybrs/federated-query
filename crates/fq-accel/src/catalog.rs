@@ -161,6 +161,14 @@ const ACL_META_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS acl_meta (
     value       INTEGER NOT NULL
 )";
 
+/// One persisted engine setting override: `SET` writes it, `RESET` removes
+/// it, and every runtime construction re-applies the surviving rows on top of
+/// the YAML config, so a setting outlives the session that set it.
+const SETTINGS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS engine_settings (
+    name        TEXT PRIMARY KEY,
+    value       TEXT NOT NULL
+)";
+
 /// One persisted user: the SCRAM verifier, the superuser flag, and provenance.
 #[derive(Clone, PartialEq, Eq)]
 pub struct User {
@@ -446,6 +454,51 @@ impl ViewCatalog {
             datasources.push(raw_to_datasource(raw?)?);
         }
         Ok(datasources)
+    }
+
+    /// Persist one setting override (`INSERT OR REPLACE`): the latest SET of
+    /// a name wins.
+    pub fn upsert_setting(&self, name: &str, value: &str) -> Result<(), AccelError> {
+        self.conn
+            .lock()
+            .expect("view catalog lock poisoned")
+            .execute(
+                "INSERT OR REPLACE INTO engine_settings (name, value) VALUES (?1, ?2)",
+                params![name, value],
+            )?;
+        Ok(())
+    }
+
+    /// Remove one persisted setting override; whether a row existed.
+    pub fn delete_setting(&self, name: &str) -> Result<bool, AccelError> {
+        let deleted = self
+            .conn
+            .lock()
+            .expect("view catalog lock poisoned")
+            .execute("DELETE FROM engine_settings WHERE name = ?1", params![name])?;
+        Ok(deleted == 1)
+    }
+
+    /// Remove every persisted setting override (`RESET ALL`).
+    pub fn clear_settings(&self) -> Result<(), AccelError> {
+        self.conn
+            .lock()
+            .expect("view catalog lock poisoned")
+            .execute("DELETE FROM engine_settings", [])?;
+        Ok(())
+    }
+
+    /// Every persisted setting override, name-ordered.
+    pub fn list_settings(&self) -> Result<Vec<(String, String)>, AccelError> {
+        let conn = self.conn.lock().expect("view catalog lock poisoned");
+        let mut statement =
+            conn.prepare("SELECT name, value FROM engine_settings ORDER BY name")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut settings = Vec::new();
+        for row in rows {
+            settings.push(row?);
+        }
+        Ok(settings)
     }
 
     /// Delete a persisted dynamic datasource. Returns whether a row was removed
@@ -762,6 +815,7 @@ fn ensure_schema(conn: &Connection) -> Result<(), AccelError> {
     conn.execute(GRANTS_SCHEMA, [])?;
     conn.execute(GRANTS_INDEX, [])?;
     conn.execute(ACL_META_SCHEMA, [])?;
+    conn.execute(SETTINGS_SCHEMA, [])?;
     // Seed the single generation row at 0 on a fresh store; a pre-existing row
     // keeps its counter (INSERT OR IGNORE never rewinds a live generation).
     conn.execute(

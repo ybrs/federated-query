@@ -157,6 +157,18 @@ impl Catalog {
             .map(|found| found.columns.iter().map(|col| col.name.clone()).collect())
     }
 
+    /// Every (datasource, schema, table) triple in the catalog, ordered by
+    /// datasource then schema (the map key) then table name.
+    pub fn list_tables(&self) -> Vec<(String, String, String)> {
+        let mut rows = Vec::new();
+        for ((ds_name, schema_name), schema) in &self.schemas {
+            for table in schema.tables() {
+                rows.push((ds_name.clone(), schema_name.clone(), table.name.clone()));
+            }
+        }
+        rows
+    }
+
     /// Number of registered data sources.
     pub fn datasource_count(&self) -> usize {
         self.datasources.len()

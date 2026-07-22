@@ -268,3 +268,19 @@ fn source_token_stamps_the_table_file_and_moves_when_it_is_replaced() {
     // A table this source never listed raises loudly.
     assert!(source.source_token("main", "ghost").is_err());
 }
+
+#[test]
+fn a_single_file_source_names_its_table_after_the_datasource() {
+    let dir = temp_dir("singlefile");
+    write_parquet(&dir, "region", &region_batch());
+    let file = dir.join("region.parquet");
+    let source = ParquetSource::open("ev", file.to_str().unwrap()).expect("open");
+    assert_eq!(source.list_tables("main").unwrap(), vec!["ev".to_string()]);
+    let metadata = source.get_table_metadata("main", "ev").expect("metadata");
+    assert_eq!(metadata.row_count, Some(5));
+
+    // A single-file source pointed at a non-parquet file raises.
+    let bogus = dir.join("notes.txt");
+    std::fs::write(&bogus, "x").expect("write bogus file");
+    assert!(ParquetSource::open("ev", bogus.to_str().unwrap()).is_err());
+}

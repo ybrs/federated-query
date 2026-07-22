@@ -464,6 +464,26 @@ impl Accelerator {
         self.catalog.list_datasources()
     }
 
+    /// Persist one engine-setting override; the latest SET of a name wins.
+    pub fn upsert_setting(&self, name: &str, value: &str) -> Result<(), AccelError> {
+        self.catalog.upsert_setting(name, value)
+    }
+
+    /// Remove one persisted setting override; whether a row existed.
+    pub fn delete_setting(&self, name: &str) -> Result<bool, AccelError> {
+        self.catalog.delete_setting(name)
+    }
+
+    /// Remove every persisted setting override.
+    pub fn clear_settings(&self) -> Result<(), AccelError> {
+        self.catalog.clear_settings()
+    }
+
+    /// Every persisted setting override, name-ordered.
+    pub fn list_settings(&self) -> Result<Vec<(String, String)>, AccelError> {
+        self.catalog.list_settings()
+    }
+
     /// Remove a persisted dynamic datasource; returns whether a row was removed.
     pub fn delete_datasource(&self, name: &str) -> Result<bool, AccelError> {
         self.catalog.delete_datasource(name)

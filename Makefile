@@ -9,7 +9,7 @@ PYTHON ?= python3
 # otherwise falls back to the sibling ../venv-fedq. Override: make VENV=/path.
 VENV   ?= $(if $(VIRTUAL_ENV),$(VIRTUAL_ENV),../venv-fedq)
 
-.PHONY: download_postgres pg-start pg-stop test test-no-db install lint lint-ascii lint-construction fq-lint duckdb-lib
+.PHONY: build dev-build check-python setup download_postgres pg-start pg-stop test test-no-db install lint lint-ascii lint-construction fq-lint duckdb-lib
 
 # Download the prebuilt PostgreSQL binaries into ./postgres-17 (one-time).
 download_postgres:
@@ -22,6 +22,35 @@ pg-start:
 # Stop the background PostgreSQL instance.
 pg-stop:
 	./scripts/stop-postgres.sh
+
+# Build the WHOLE workspace in ONE command: fetch the prebuilt libduckdb, verify
+# Python is usable (the fedq-py extension needs it), then compile everything.
+# `make build` = release, `make dev-build` = debug.
+build: duckdb-lib check-python
+	cargo build --release
+
+dev-build: duckdb-lib check-python
+	cargo build
+
+# Fail with a clear message if pyo3 (the fedq-py extension) has no usable Python
+# interpreter, checked in pyo3's own search order - instead of the cryptic
+# "failed to run the Python interpreter" error deep in the build.
+check-python:
+	@py=""; \
+	if [ -n "$$PYO3_PYTHON" ]; then py="$$PYO3_PYTHON"; \
+	elif [ -n "$$VIRTUAL_ENV" ]; then py="$$VIRTUAL_ENV/bin/python"; \
+	elif [ -n "$$CONDA_PREFIX" ]; then py="$$CONDA_PREFIX/bin/python"; \
+	else py="$$(command -v python3 || true)"; fi; \
+	if [ -z "$$py" ] || [ ! -x "$$py" ]; then \
+		echo "ERROR: no usable Python interpreter for the fedq-py extension (pyo3)." >&2; \
+		echo "  tried: $${py:-<none>}   (VIRTUAL_ENV=$${VIRTUAL_ENV:-<unset>})" >&2; \
+		echo "  fix: install python3, activate a real venv, or set PYO3_PYTHON=\$$(command -v python3)" >&2; \
+		exit 1; \
+	fi; \
+	echo "pyo3 will use Python: $$py"
+
+setup: duckdb-lib
+	@echo "Setup done. Build with: make build (release) or make dev-build (debug)."
 
 # Fetch the official prebuilt libduckdb the workspace links against (one-time;
 # idempotent). DuckDB is NEVER compiled inside cargo - see .cargo/config.toml.

@@ -111,4 +111,15 @@ pub enum RuntimeError {
     /// or a malformed stored verifier. Every invalid ACL statement raises.
     #[error("acl error: {0}")]
     Acl(String),
+
+    /// An event-analytics failure from the fq-events store or executors: the
+    /// typed component error propagates unwrapped.
+    #[error("event analytics error: {0}")]
+    Events(#[from] fq_events::error::EventError),
+
+    /// An event statement the runtime itself rejects before the store is
+    /// involved: a name collision, a missing source table/column, a config
+    /// with no file path, or a refresh key that cannot be tracked.
+    #[error("event statement error: {0}")]
+    EventStatement(String),
 }
