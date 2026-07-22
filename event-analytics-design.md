@@ -43,7 +43,7 @@ Reference dataset shape (measured):
   `seq BIGINT`, `device VARCHAR`, `country VARCHAR`. No nulls.
 - 500,000 actors, ids dense 1..500000 (the GENERAL design must not rely on
   this; see section 3). Events per actor: min 61, median 142, p90 317,
-  p99 1000, max 141,456 (one whale actor).
+  p99 1000, max 141,456 (one outsized actor).
 - 20 event names, skewed: `page_view` 22.76M down to `cancel_account` 1.60M.
 - `seq` is a global 0..99,999,999 arrival-order counter - the declared
   tiebreak. 708,318 `(entity_id, ts)` groups carry more than one event, so
@@ -708,9 +708,9 @@ Per shard worker:
    (`Vec<u32>` when rows < 4B else `Vec<u64>` - width enum, no cap), then
    gather each column once. Adjacent-equal sort keys raise
    `AmbiguousOrder` (3.4).
-5. Detect whale overflow: if a shard's spill exceeds
+5. Detect outsized-actor overflow: if a shard's spill exceeds
    `2 x peak budget` (extreme actor skew - hashing bounds this to
-   single-actor whales), fall back to EXTERNAL merge for that shard: sort
+   single-actor overflow), fall back to EXTERNAL merge for that shard: sort
    each spill sub-run independently (each fits), then k-way merge-stream
    into the encoder. Same output bytes, bounded memory, slower - and
    logged.
@@ -1045,7 +1045,7 @@ Definitions (pinned):
   default 5. `TOP <n>` default 20, max 1000.
 
 Algorithm: per shard, per actor, materialize the collapsed code stream
-into a reused scratch buffer (avg 200 codes; a whale actor streams
+into a reused scratch buffer (avg 200 codes; an outsized actor streams
 through a chunked buffer with `DEPTH - 1` overlap so windows never miss a
 boundary - bounded memory even for a 100M-event actor); enumerate windows
 per the variant; count into a hash map keyed by the packed code sequence
@@ -1648,7 +1648,7 @@ style):
 - `registry` - the `event_datasets` table: open/register/publish/
   tombstone/purge (rusqlite, ViewCatalog discipline).
 - `build` - B1 partition (spill writer, ordinals), B2 finalize (dedup,
-  id assignment, sort, whale fallback, encode), the coordinator and
+  id assignment, sort, outsized-actor fallback, encode), the coordinator and
   memory governor.
 - `refresh` - watermark delta, generation append, compaction, rebuild.
 - `cursor` - `ActorEvents`: per-shard actor iteration with the
@@ -1686,7 +1686,7 @@ Phase E2 - retention, paths, full surface, generality:
 
 - Scope: retention + paths executors; RETENTION/PATHS/REBUILD statements;
   predicate grammar + breakdowns everywhere; unknown-name guard;
-  dictionary promotion; whale/spill fallbacks; describe() arms; all three
+  dictionary promotion; outsized-actor/spill fallbacks; describe() arms; all three
   front doors.
 - Tests: full battery on small + medium; ALL crafted datasets including
   `crafted_uuid` collision pair, `crafted_wide` promotion,
@@ -1719,7 +1719,7 @@ construction), per-dataset grants, distribution.
 
 - Billion-row bounded-memory build: met structurally (per-shard peak is
   set by `target_shard_bytes`, S scales with data, dictionaries are
-  budgeted with a defined overflow behavior, sorts are per shard, whale
+  budgeted with a defined overflow behavior, sorts are per shard, outsized
   shards degrade to external merge). Residual risk: spill IO volume
   (~2.5x store size) makes build disk-bandwidth-bound on slow disks;
   the builder reports spill bytes and per-phase time so this is visible,

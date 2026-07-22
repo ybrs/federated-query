@@ -1,9 +1,9 @@
 //! The external-merge finalize fallback for a shard whose spill outgrew its
-//! memory budget (extreme actor skew concentrating on single-actor whales).
+//! memory budget (extreme actor skew concentrating on single-actor overflow).
 //!
 //! Two extra spill passes replace the in-memory sort: pass one streams the
 //! shard's frames collecting only distinct `(hash, key)` pairs (bounded by
-//! distinct actors, tiny for a whale shard) and assigns local ids in the same
+//! distinct actors, tiny for an outsized shard) and assigns local ids in the same
 //! deterministic `(hash, key)` order the in-memory path uses; pass two
 //! re-streams the frames into budget-sized runs, sorts each run by
 //! `(local, ts, tiebreak)`, and spills it row-major; a k-way heap merge then
@@ -60,7 +60,7 @@ impl RunRow {
     }
 }
 
-/// Finalize one whale shard externally.
+/// Finalize one outsized shard externally.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finalize_external(
     io: &StoreIo,

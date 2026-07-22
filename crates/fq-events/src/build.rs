@@ -883,7 +883,7 @@ struct Partition<'a> {
     buffer_bytes: usize,
     spill_files: Vec<Mutex<std::fs::File>>,
     /// Uncompressed spilled bytes per shard (sizes B2 concurrency and the
-    /// whale fallback).
+    /// outsized-actor fallback).
     shard_bytes: Vec<AtomicU64>,
     spill_total: AtomicU64,
 }

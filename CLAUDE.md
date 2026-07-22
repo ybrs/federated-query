@@ -20,6 +20,22 @@ the query was invalid, so any result is wrong. Never describe this as
 acceptable, normal, or a minor issue. It is the most severe failure mode in the
 engine.
 
+# BUILD TIME IS ONE NUMBER
+
+A build time is the wall clock from the statement being issued to the
+statement returning, everything included. There is no "base build", no
+"ingest vs index split", no stage arithmetic in any user-facing number,
+ticket, doc, or report. Stage timings exist ONLY inside status strings for
+engineering diagnosis; they are never quoted as the build time and never used
+to claim a goal is met. Reporting a stage as the build time is lying with a
+stopwatch.
+
+# No animal jargon for customers
+
+Customers are customers (or users). Never "whales" or any animal-farm
+vocabulary for people or tenants, anywhere: code, docs, tickets, comments,
+messages.
+
 # No ascii
 
 Only ascii edits are allowed.
