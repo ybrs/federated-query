@@ -16,12 +16,6 @@ pub enum PhysicalError {
     #[error("data source not found: {0}")]
     DatasourceNotFound(String),
 
-    /// A table-valued analysis call (`FROM paths(...)`) reached the physical
-    /// planner, which has no execution form for it. A valid query must never be
-    /// answered wrong, so the planner fails loud rather than dropping the call.
-    #[error("table function '{0}(...)' in FROM has no execution form in the SQL pipeline")]
-    TableFunctionNotExecutable(String),
-
     /// A cross-source LATERAL whose right side collects more than one base scan.
     #[error("cross-source LATERAL with multiple base relations is not supported yet")]
     LateralMultipleBaseRelations,

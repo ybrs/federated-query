@@ -103,8 +103,24 @@ pub enum Step {
         binding: String,
     },
 
+    /// Run an event-analytics analysis (e.g. `paths(...)`) against the session's
+    /// event store and bind its Arrow result. Self-contained: the spec carries
+    /// every parameter, and the store is resolved from the current session.
+    EventAnalysis {
+        analysis: EventAnalysisSpec,
+        binding: String,
+    },
+
     /// The binding whose Arrow stream is exported back to Python.
     Return { input: String },
+}
+
+/// The analysis an `EventAnalysis` step runs. One variant per analysis kind
+/// (PATHS is the first); each carries the typed spec fq-common defines, so the
+/// engine and the statement path share one contract.
+#[derive(Debug, Clone, Deserialize)]
+pub enum EventAnalysisSpec {
+    Paths(fq_common::events::PathsSpec),
 }
 
 /// A source scan. Either a structured single-table scan that Rust renders to

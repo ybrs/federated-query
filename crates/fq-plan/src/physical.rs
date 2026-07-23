@@ -36,7 +36,7 @@ use std::sync::Arc;
 use fq_common::DataType;
 
 use crate::expr::{contains_window, BinaryOpType, ColumnRef, Expr, NullsOrder};
-use crate::logical::{ExplainFormat, JoinType, SetOpKind};
+use crate::logical::{AnalysisCall, ExplainFormat, JoinType, SetOpKind};
 
 /// A `(table, column) -> physical output column name` map. `table` is None for
 /// an unqualified reference. The resolution key the IR serializer uses.
@@ -278,6 +278,20 @@ pub struct PhysicalValues {
     pub output_names: Vec<String>,
 }
 
+/// A table-valued event-analysis call surfaced as a relation (`FROM paths(...)`).
+/// Executed at run time by the fq-events kernel into in-memory batches, then
+/// consumed like any other relation. A leaf: its parameters are baked into the
+/// spec, so it has no child plans.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalTableFunction {
+    pub call: AnalysisCall,
+    /// The relation qualifier its output columns carry (the FROM alias, or the
+    /// function name when unaliased).
+    pub alias: String,
+    /// Output column names in order (with any user column-alias rename applied).
+    pub output_names: Vec<String>,
+}
+
 /// An entire same-source subtree rendered as one query, executed in one round
 /// trip. `sql` is the rendered source SQL; `column_alias_map` resolves references
 /// to physical output names.
@@ -400,6 +414,7 @@ pub enum PhysicalPlan {
     Sort(PhysicalSort),
     Limit(PhysicalLimit),
     Values(PhysicalValues),
+    TableFunction(PhysicalTableFunction),
     RemoteQuery(Box<PhysicalRemoteQuery>),
     Union(PhysicalUnion),
     RemoteSetOp(Box<PhysicalRemoteSetOp>),
@@ -417,6 +432,7 @@ impl PhysicalPlan {
         match self {
             PhysicalPlan::Scan(_)
             | PhysicalPlan::Values(_)
+            | PhysicalPlan::TableFunction(_)
             | PhysicalPlan::RemoteQuery(_)
             | PhysicalPlan::Gather(_) => Vec::new(),
             PhysicalPlan::Cte(node) => vec![&node.body],
@@ -476,6 +492,7 @@ impl PhysicalPlan {
             PhysicalPlan::Sort(node) => node.input.schema(),
             PhysicalPlan::Limit(node) => node.input.schema(),
             PhysicalPlan::Values(node) => values_schema(node),
+            PhysicalPlan::TableFunction(node) => table_function_schema(node),
             PhysicalPlan::RemoteQuery(node) => {
                 seeded_schema(node.seeded_schema.as_ref(), "PhysicalRemoteQuery")
             }
@@ -616,6 +633,19 @@ fn values_schema(node: &PhysicalValues) -> Vec<(String, DataType)> {
     fields
 }
 
+/// A table-valued analysis call's schema: the FROM output names carrying the
+/// analysis kind's fixed types. The two lists are parallel by construction (the
+/// parser enforces the count), so they zip.
+fn table_function_schema(node: &PhysicalTableFunction) -> Vec<(String, DataType)> {
+    let mut fields = Vec::with_capacity(node.output_names.len());
+    for (name, (_default_name, data_type)) in
+        node.output_names.iter().zip(node.call.output_columns())
+    {
+        fields.push((name.clone(), data_type));
+    }
+    fields
+}
+
 /// A CTE's schema: the body's, relabeled by `column_names` when a rename list is
 /// set and differs from the body's own names (Python `PhysicalCTE.schema`).
 fn cte_schema(node: &PhysicalCte) -> Vec<(String, DataType)> {
@@ -744,6 +774,9 @@ impl PhysicalPlan {
             }
             PhysicalPlan::AliasedRelation(node) => {
                 alias_column_map(Some(&node.alias), &output_column_names(&node.input))
+            }
+            PhysicalPlan::TableFunction(node) => {
+                alias_column_map(Some(&node.alias), &node.output_names)
             }
             PhysicalPlan::CteScan(node) => cte_scan_column_aliases(node),
             // Output-defining nodes.
@@ -929,6 +962,7 @@ pub fn output_column_names(plan: &PhysicalPlan) -> Vec<String> {
         PhysicalPlan::Sort(node) => output_column_names(&node.input),
         PhysicalPlan::Limit(node) => output_column_names(&node.input),
         PhysicalPlan::Values(node) => node.output_names.clone(),
+        PhysicalPlan::TableFunction(node) => node.output_names.clone(),
         PhysicalPlan::RemoteQuery(node) => node.output_names.clone(),
         PhysicalPlan::Union(node) => output_column_names(first_union_input(node)),
         PhysicalPlan::SetOperation(node) => output_column_names(&node.left),

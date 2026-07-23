@@ -40,8 +40,8 @@ pub use crate::error::{
     EventUnknownName, EventUnsupported,
 };
 pub use crate::exec::{
-    run_funnel, run_paths, run_retention, run_segment, FunnelResult, FunnelRow, PathsResult,
-    PathsRow, RetentionResult, RetentionRow, SegmentResult, SegmentRow,
+    paths_to_batches, run_funnel, run_paths, run_retention, run_segment, FunnelResult, FunnelRow,
+    PathsResult, PathsRow, RetentionResult, RetentionRow, SegmentResult, SegmentRow,
 };
 
 /// The event store of one engine configuration: the registry rows in the

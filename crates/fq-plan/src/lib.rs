@@ -28,5 +28,5 @@ pub use logical::{
 };
 pub use physical::{
     output_column_names, physical_column_name, BuildSide, ColumnAliasMap, DatasourceKind,
-    GroupObservation, PhysicalPlan, PhysicalRemoteQuery, SeededSchema,
+    GroupObservation, PhysicalPlan, PhysicalRemoteQuery, PhysicalTableFunction, SeededSchema,
 };

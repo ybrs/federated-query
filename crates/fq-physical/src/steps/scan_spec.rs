@@ -171,6 +171,7 @@ pub fn variant_name(node: &PhysicalPlan) -> &'static str {
         PhysicalPlan::AliasedRelation(_) => "AliasedRelation",
         PhysicalPlan::CteMergeQuery(_) => "CteMergeQuery",
         PhysicalPlan::Scan(_) => "Scan",
+        PhysicalPlan::TableFunction(_) => "TableFunction",
         PhysicalPlan::Projection(_) => "Projection",
         PhysicalPlan::Window(_) => "Window",
         PhysicalPlan::Filter(_) => "Filter",

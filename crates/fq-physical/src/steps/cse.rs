@@ -94,6 +94,10 @@ pub fn step_cache_key(step: &Step) -> String {
         Step::Merge {
             fragment, inputs, ..
         } => format!("merge|frag={fragment}|inputs={inputs:?}"),
+        // The spec IS the identity: two identical analysis calls dedupe (same
+        // result); different specs never merge. Binding is excluded, like the
+        // other producing steps.
+        Step::EventAnalysis { call, .. } => format!("event_analysis|{call:?}"),
         Step::Return { input } => format!("return|in={input}"),
     }
 }

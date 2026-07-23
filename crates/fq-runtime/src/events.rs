@@ -46,7 +46,7 @@ pub(crate) fn events_root_path(source_path: &str) -> std::path::PathBuf {
 impl Runtime {
     /// The event store, opened on first use. A programmatic config with no
     /// file path has no event store and every event statement raises.
-    fn event_store(&self) -> Result<Arc<EventStore>, RuntimeError> {
+    pub(crate) fn event_store(&self) -> Result<Arc<EventStore>, RuntimeError> {
         let mut slot = self.events.lock().expect("event store lock poisoned");
         if let Some(store) = slot.as_ref() {
             return Ok(Arc::clone(store));
@@ -506,7 +506,10 @@ impl Runtime {
         let dataset = store.dataset(&spec.dataset)?;
         let config = self.config_snapshot();
         let result = fq_events::run_paths(store.io(), &dataset, spec, &config.events)?;
-        paths_to_arrow(&result)
+        // The Arrow encoder is shared with the `paths(...)` table function
+        // (fq-events), so the statement and the table function surface identical
+        // rows.
+        Ok(fq_events::paths_to_batches(&result))
     }
 }
 
@@ -986,45 +989,6 @@ pub(crate) fn segment_describe_columns(spec: &SegmentSpec) -> Vec<(String, DataT
     columns
 }
 
-/// Map a paths result onto Arrow: one row PER STEP of each ranked path, so the
-/// result is directly processable (grouping, joining, pivoting) instead of a
-/// display-only joined string. `path_id` is the path's rank; `occurrences` and
-/// `share` are the WHOLE path's values, repeated on each of its step rows.
-fn paths_to_arrow(
-    result: &fq_events::PathsResult,
-) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("path_id", ArrowDataType::Int32, false),
-        Field::new("seq", ArrowDataType::Int32, false),
-        Field::new("event", ArrowDataType::Utf8, false),
-        Field::new("occurrences", ArrowDataType::Int64, false),
-        Field::new("share", ArrowDataType::Float64, false),
-    ]));
-    let mut path_ids = Vec::new();
-    let mut seqs = Vec::new();
-    let mut events = Vec::new();
-    let mut occurrences = Vec::new();
-    let mut shares = Vec::new();
-    for row in &result.rows {
-        for (index, step) in row.steps.iter().enumerate() {
-            path_ids.push(i32::try_from(row.rank).expect("rank fits i32"));
-            seqs.push(i32::try_from(index + 1).expect("step index fits i32"));
-            events.push(step.clone());
-            occurrences.push(i64::try_from(row.occurrences).expect("count fits i64"));
-            shares.push(row.share);
-        }
-    }
-    let columns: Vec<Arc<dyn arrow::array::Array>> = vec![
-        Arc::new(Int32Array::from(path_ids)),
-        Arc::new(Int32Array::from(seqs)),
-        Arc::new(StringArray::from(events)),
-        Arc::new(Int64Array::from(occurrences)),
-        Arc::new(Float64Array::from(shares)),
-    ];
-    let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
-        .map_err(|error| RuntimeError::ResultShape(error.to_string()))?;
-    Ok((schema, vec![batch]))
-}
 
 /// The paths describe columns.
 pub(crate) fn paths_describe_columns() -> Vec<(String, DataType)> {

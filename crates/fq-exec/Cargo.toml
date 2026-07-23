@@ -16,6 +16,8 @@ edition.workspace = true
 fq-plan = { path = "../fq-plan" }
 fq-common = { path = "../fq-common" }
 fq-physical = { path = "../fq-physical" }
+# The event-analytics kernels a `paths(...)` table function executes at run time.
+fq-events = { path = "../fq-events" }
 datafusion = "54"
 # arrow/arrow-array/arrow-schema pinned to the workspace's existing 58.x line
 # (Cargo.lock has arrow 58.3.0); DataFusion 54 pulls the same arrow 58.

@@ -203,6 +203,13 @@ fn node_label(
         }
         PhysicalPlan::AliasedRelation(_) => "AliasedRelation".to_string(),
         PhysicalPlan::CteMergeQuery(_) => "CteMergeQuery".to_string(),
+        PhysicalPlan::TableFunction(node) => {
+            format!(
+                "EventAnalysis [{}({})]",
+                node.call.function_name(),
+                node.call.dataset()
+            )
+        }
         PhysicalPlan::Projection(_) => "Projection".to_string(),
         PhysicalPlan::Window(_) => "Window".to_string(),
         PhysicalPlan::Filter(_) => "Filter".to_string(),

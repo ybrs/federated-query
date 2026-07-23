@@ -2051,6 +2051,7 @@ dependencies = [
  "fq-common",
  "fq-connectors",
  "fq-decorrelate",
+ "fq-events",
  "fq-optimize",
  "fq-parse",
  "fq-physical",

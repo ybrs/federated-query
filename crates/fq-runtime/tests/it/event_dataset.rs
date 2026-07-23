@@ -10,7 +10,9 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, RecordBatch, StringArray, TimestampMicrosecondArray};
+use arrow::array::{
+    Array, ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, TimeUnit};
 use fq_common::{
     Config, CostConfig, DataSourceConfig, ExecutorConfig, OptimizerConfig, ServerConfig,
@@ -212,4 +214,65 @@ fn a_refresh_key_that_cannot_carry_a_watermark_raises_at_create() {
         format!("{error}").contains("cannot carry an exact watermark"),
         "unexpected error: {error}"
     );
+}
+
+#[test]
+fn paths_table_function_runs_and_aggregates() {
+    let dir = sandbox("pathstvf");
+    let file = dir.join("clicks.parquet");
+    write_events(
+        &file,
+        vec![1_000_000, 2_000_000, 3_000_000, 4_000_000],
+        vec!["open", "click", "close", "purchase"],
+        vec!["u1", "u2", "u1", "u2"],
+    );
+    let runtime = Runtime::from_config(&event_config(&dir, "evtvf", &file)).expect("from_config");
+    runtime
+        .execute(
+            "CREATE EVENT DATASET web FROM evtvf.main.evtvf \
+             ACTOR user_id TIME created_at EVENT event \
+             WITH (refresh_key = 'created_at')",
+        )
+        .expect("create event dataset");
+
+    // The table function surfaces the SAME rows as `PATHS ON web DEPTH 2 TOP 5`,
+    // now as a relation SQL can read: u2's click->purchase (path 1) and u1's
+    // open->close (path 2).
+    let (schema, batches) = runtime
+        .execute(
+            "SELECT path_id, seq, event, occurrences, share \
+             FROM paths('web', depth => 2, top => 5) ORDER BY path_id, seq",
+        )
+        .expect("paths table function");
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(names, vec!["path_id", "seq", "event", "occurrences", "share"]);
+    let events = batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("event names are Utf8");
+    let steps: Vec<&str> = (0..events.len()).map(|row| events.value(row)).collect();
+    assert_eq!(steps, vec!["click", "purchase", "open", "close"]);
+
+    // Outer SQL aggregation over the analysis output: two paths of two step rows
+    // each, so four rows total. This is the whole point - SQL on top of paths().
+    let (_, batches) = runtime
+        .execute("SELECT count(*) AS n FROM paths('web', depth => 2, top => 5)")
+        .expect("count over paths");
+    let n = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count is Int64");
+    assert_eq!(n.value(0), 4);
+
+    // GROUP BY over the surfaced relation: one group per path.
+    let (_, batches) = runtime
+        .execute(
+            "SELECT path_id, sum(occurrences) AS occ \
+             FROM paths('web', depth => 2, top => 5) GROUP BY path_id",
+        )
+        .expect("group by over paths");
+    let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(total_rows, 2);
 }

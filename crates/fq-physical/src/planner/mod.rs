@@ -23,14 +23,14 @@ use fq_optimize::{group_column_names, subplan_signature, CostModel};
 use fq_plan::expr::Expr;
 use fq_plan::logical::{
     Aggregate, Explain, Filter, GroupedLimit, LogicalPlan, Projection, Scan, SingleRowGuard,
-    SubqueryScan, Union, Values,
+    SubqueryScan, TableFunction, Union, Values,
 };
 use fq_plan::physical::DatasourceKind;
 use fq_plan::physical::{
     GroupObservation, PhysicalAliasedRelation, PhysicalExplain, PhysicalFilter,
     PhysicalGroupedLimit, PhysicalHashAggregate, PhysicalLimit, PhysicalPlan, PhysicalProjection,
-    PhysicalScan, PhysicalSingleRowGuard, PhysicalSort, PhysicalUnion, PhysicalValues,
-    PhysicalWindow,
+    PhysicalScan, PhysicalSingleRowGuard, PhysicalSort, PhysicalTableFunction, PhysicalUnion,
+    PhysicalValues, PhysicalWindow,
 };
 
 use crate::dim_shipping::{DimShipping, ShipThresholds};
@@ -165,9 +165,7 @@ impl PhysicalPlanner {
             LogicalPlan::LateralJoin(lj) => self.plan_lateral_join(lj),
             LogicalPlan::SingleRowGuard(g) => self.plan_single_row_guard(g),
             LogicalPlan::GroupedLimit(gl) => self.plan_grouped_limit(gl),
-            LogicalPlan::TableFunction(tf) => Err(PhysicalError::TableFunctionNotExecutable(
-                tf.call.function_name().to_string(),
-            )),
+            LogicalPlan::TableFunction(tf) => Ok(Self::plan_table_function(tf)),
         }
     }
 
@@ -330,6 +328,17 @@ impl PhysicalPlanner {
         PhysicalPlan::Values(PhysicalValues {
             rows: values.rows.clone(),
             output_names: values.output_names.clone(),
+        })
+    }
+
+    /// Plan a table-valued analysis call: carry the spec and its surfaced schema
+    /// to the physical node unchanged. The analysis runs (into in-memory batches)
+    /// at execution, never at plan time - planning stays O(metadata).
+    fn plan_table_function(node: &TableFunction) -> PhysicalPlan {
+        PhysicalPlan::TableFunction(PhysicalTableFunction {
+            call: node.call.clone(),
+            alias: node.alias.clone(),
+            output_names: node.output_names.clone(),
         })
     }
 

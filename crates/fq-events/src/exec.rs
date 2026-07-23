@@ -108,6 +108,52 @@ pub struct PathsResult {
     pub rows: Vec<PathsRow>,
 }
 
+/// Encode a `PathsResult` into its Arrow relation: one row per (path, step),
+/// columns path_id/seq/event/occurrences/share matching
+/// `fq_common::events::paths_output_columns`. Shared by the `PATHS` statement
+/// and the `paths(...)` table function so both surface identical rows. The
+/// column builders run in lockstep over the same rows, so a `try_new` mismatch
+/// is a broken code invariant and panics loudly rather than shipping a
+/// mis-shaped batch.
+pub fn paths_to_batches(
+    result: &PathsResult,
+) -> (arrow::datatypes::SchemaRef, Vec<arrow::array::RecordBatch>) {
+    use arrow::array::{Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("path_id", DataType::Int32, false),
+        Field::new("seq", DataType::Int32, false),
+        Field::new("event", DataType::Utf8, false),
+        Field::new("occurrences", DataType::Int64, false),
+        Field::new("share", DataType::Float64, false),
+    ]));
+    let mut path_ids = Vec::new();
+    let mut seqs = Vec::new();
+    let mut events = Vec::new();
+    let mut occurrences = Vec::new();
+    let mut shares = Vec::new();
+    for row in &result.rows {
+        for (index, step) in row.steps.iter().enumerate() {
+            path_ids.push(i32::try_from(row.rank).expect("rank fits i32"));
+            seqs.push(i32::try_from(index + 1).expect("step index fits i32"));
+            events.push(step.clone());
+            occurrences.push(i64::try_from(row.occurrences).expect("count fits i64"));
+            shares.push(row.share);
+        }
+    }
+    let columns: Vec<Arc<dyn Array>> = vec![
+        Arc::new(Int32Array::from(path_ids)),
+        Arc::new(Int32Array::from(seqs)),
+        Arc::new(StringArray::from(events)),
+        Arc::new(Int64Array::from(occurrences)),
+        Arc::new(Float64Array::from(shares)),
+    ];
+    let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
+        .expect("paths batch columns match the fixed schema");
+    (schema, vec![batch])
+}
+
 // ---------------------------------------------------------------------------
 // Name binding
 // ---------------------------------------------------------------------------

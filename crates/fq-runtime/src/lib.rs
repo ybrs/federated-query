@@ -307,6 +307,7 @@ impl Runtime {
     fn execute_query(&self, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         let (physical, substitutions) = self.plan_inner(sql, true)?;
         let visible_names = output_column_names(&physical);
+        self.ensure_event_analysis_ready(&physical)?;
         let execution = execute_plan(self.session, &physical)?;
         // The learned-stats WRITE path: each measured (binding, rows) whose
         // binding carries provenance lands in the stats catalog, AFTER the
@@ -331,9 +332,24 @@ impl Runtime {
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         let (physical, _no_substitutions) = self.plan_inner(sql, false)?;
         let visible_names = output_column_names(&physical);
+        self.ensure_event_analysis_ready(&physical)?;
         let execution = execute_plan(self.session, &physical)?;
         self.persist_observations(&execution.measurements, &execution.observations)?;
         rename_result(&execution.schema, execution.batches, &visible_names)
+    }
+
+    /// If the plan runs an event analysis (`FROM paths(...)`), register this
+    /// session's event store with the execution data plane so the engine can run
+    /// the kernel against it. A plan without one registers nothing, so a runtime
+    /// with no config file (and thus no event store) is unaffected.
+    fn ensure_event_analysis_ready(&self, physical: &PhysicalPlan) -> Result<(), RuntimeError> {
+        if !plan_uses_event_analysis(physical) {
+            return Ok(());
+        }
+        let store = self.event_store()?;
+        let config = self.config_snapshot();
+        connectors::register_event_store(self.session, store, config.events.clone());
+        Ok(())
     }
 
     /// Advance each substituted view's benefit counters (`use_count`,
@@ -598,6 +614,16 @@ pub(crate) fn stats_sqlite_path(config: &Config) -> Option<std::path::PathBuf> {
 
 /// Open the learned-stats catalog at the config's stats SQLite path, or
 /// `None` for a config with no source path.
+/// Whether any node in the physical plan is a table-valued event analysis
+/// (`FROM paths(...)`), so the runtime knows to wire the event store.
+fn plan_uses_event_analysis(plan: &PhysicalPlan) -> bool {
+    matches!(plan, PhysicalPlan::TableFunction(_))
+        || plan
+            .children()
+            .iter()
+            .any(|child| plan_uses_event_analysis(child))
+}
+
 fn open_stats_catalog(config: &Config) -> Result<Option<Arc<StatsCatalog>>, RuntimeError> {
     let Some(stats_path) = stats_sqlite_path(config) else {
         return Ok(None);

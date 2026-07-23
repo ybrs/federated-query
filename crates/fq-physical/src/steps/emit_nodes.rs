@@ -15,8 +15,8 @@ use fq_plan::physical::{
     physical_column_name, ColumnAliasMap, PhysicalCte, PhysicalCteMergeQuery, PhysicalCteScan,
     PhysicalFilter, PhysicalGroupedLimit, PhysicalHashAggregate, PhysicalHashJoin, PhysicalLimit,
     PhysicalNestedLoopJoin, PhysicalPlan, PhysicalProjection, PhysicalSetOperation,
-    PhysicalShipment, PhysicalSingleRowGuard, PhysicalSort, PhysicalUnion, PhysicalValues,
-    PhysicalWindow,
+    PhysicalShipment, PhysicalSingleRowGuard, PhysicalSort, PhysicalTableFunction, PhysicalUnion,
+    PhysicalValues, PhysicalWindow,
 };
 use fq_plan::{output_column_names, ColumnRef, Expr, JoinType, NullsOrder};
 
@@ -54,6 +54,7 @@ pub(super) fn emit<'p>(node: &'p PhysicalPlan, ctx: &mut Ctx<'p>) -> Result<Stri
         PhysicalPlan::Filter(filter) => emit_filter(filter, ctx),
         PhysicalPlan::Limit(limit) => emit_limit(limit, ctx),
         PhysicalPlan::Values(values) => emit_values(values, ctx),
+        PhysicalPlan::TableFunction(table_function) => Ok(emit_table_function(table_function, ctx)),
         PhysicalPlan::CteMergeQuery(cte_merge) => emit_cte_merge(cte_merge, ctx),
         PhysicalPlan::CteScan(cte_scan) => emit_cte_scan(cte_scan, ctx),
         PhysicalPlan::Shipment(shipment) => emit_shipment(shipment, ctx),
@@ -588,6 +589,18 @@ fn emit_limit<'p>(node: &'p PhysicalLimit, ctx: &mut Ctx<'p>) -> Result<String, 
 fn emit_values<'p>(node: &'p PhysicalValues, ctx: &mut Ctx<'p>) -> Result<String, StepError> {
     let sql = render_values_sql(&node.rows, &node.output_names)?;
     Ok(raw_sql_step(ctx, sql, BTreeMap::new()))
+}
+
+/// A table-valued analysis call: emit an EventAnalysis step that runs the
+/// fq-events kernel into an in-memory relation at execution time. No inputs; the
+/// spec is self-contained.
+fn emit_table_function<'p>(node: &'p PhysicalTableFunction, ctx: &mut Ctx<'p>) -> String {
+    let binding = ctx.names.binding();
+    ctx.steps.push(Step::EventAnalysis {
+        call: node.call.clone(),
+        binding: binding.clone(),
+    });
+    binding
 }
 
 /// A whole WITH rendered as SQL over named inputs. Ports `_emit_cte_merge`.

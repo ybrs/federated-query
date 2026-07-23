@@ -107,6 +107,7 @@ pub fn current_session() -> SessionId {
 pub fn prune_session(session: SessionId) {
     live_sessions().lock().unwrap().remove(&session);
     registry().lock().unwrap().retain(|key, _| key.0 != session);
+    event_contexts().lock().unwrap().remove(&session);
     duck_base_cache()
         .lock()
         .unwrap()
@@ -153,6 +154,52 @@ static REGISTRY: OnceLock<Mutex<HashMap<(SessionId, String), DsSpec>>> = OnceLoc
 
 fn registry() -> &'static Mutex<HashMap<(SessionId, String), DsSpec>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The event store plus its config for one session, so an `EventAnalysis` step
+/// (`paths(...)`) can run against it. The runtime registers it when a plan uses a
+/// table function; it is pruned with the session.
+struct EventContext {
+    store: Arc<fq_events::EventStore>,
+    config: fq_common::events::EventsConfig,
+}
+
+static EVENT_CONTEXTS: OnceLock<Mutex<HashMap<SessionId, EventContext>>> = OnceLock::new();
+
+fn event_contexts() -> &'static Mutex<HashMap<SessionId, EventContext>> {
+    EVENT_CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Register the session's event store so a `paths(...)` step can run against it.
+pub fn register_event_store(
+    session: SessionId,
+    store: Arc<fq_events::EventStore>,
+    config: fq_common::events::EventsConfig,
+) {
+    event_contexts()
+        .lock()
+        .unwrap()
+        .insert(session, EventContext { store, config });
+}
+
+/// The session's event store and events config, or a loud error when none was
+/// registered: a table-function plan reached execution without the runtime
+/// wiring its event store, which is a bug, not a silent empty result.
+pub fn event_store(
+    session: SessionId,
+) -> ExecResult<(Arc<fq_events::EventStore>, fq_common::events::EventsConfig)> {
+    event_contexts()
+        .lock()
+        .unwrap()
+        .get(&session)
+        .map(|ctx| (Arc::clone(&ctx.store), ctx.config.clone()))
+        .ok_or_else(|| {
+            ExecError::runtime(
+                "no event store is registered for this session; a table-function step \
+                 cannot run"
+                    .to_string(),
+            )
+        })
 }
 
 /// Register (or replace) a datasource under `(session, name)`.

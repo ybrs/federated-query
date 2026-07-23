@@ -147,7 +147,19 @@ fn convert_step(step: steps::Step) -> ExecResult<ir::Step> {
             inputs,
             binding,
         }),
+        steps::Step::EventAnalysis { call, binding } => Ok(ir::Step::EventAnalysis {
+            analysis: convert_analysis_call(call),
+            binding,
+        }),
         steps::Step::Return { input } => Ok(ir::Step::Return { input }),
+    }
+}
+
+/// Lower a planner analysis call onto the engine's serde-friendly spec. The
+/// spec value passes through unchanged - only the enum layer differs.
+fn convert_analysis_call(call: fq_plan::AnalysisCall) -> ir::EventAnalysisSpec {
+    match call {
+        fq_plan::AnalysisCall::Paths(spec) => ir::EventAnalysisSpec::Paths(spec),
     }
 }
 
