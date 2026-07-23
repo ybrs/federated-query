@@ -645,6 +645,18 @@ fn parse_where(tokens: &mut Tokenizer<'_>) -> Result<Option<EventPredicate>, Par
     Ok(Some(parse_or(tokens)?))
 }
 
+/// Parse a bare event-property predicate string (no `WHERE` keyword) into an
+/// `EventPredicate`, using the same grammar the statement's `WHERE` clause uses.
+/// This is the `filter => '<predicate>'` argument of an analysis table function,
+/// so the two front doors share one predicate parser. Trailing input raises
+/// rather than being silently dropped.
+pub(crate) fn parse_filter_expr(text: &str) -> Result<EventPredicate, ParseError> {
+    let mut tokens = Tokenizer::new(text);
+    let predicate = parse_or(&mut tokens)?;
+    expect_end(&mut tokens, "filter")?;
+    Ok(predicate)
+}
+
 /// Parse an OR chain of the predicate grammar.
 fn parse_or(tokens: &mut Tokenizer<'_>) -> Result<EventPredicate, ParseError> {
     let mut terms = vec![parse_and(tokens)?];

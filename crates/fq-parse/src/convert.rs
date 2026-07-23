@@ -18,8 +18,8 @@ use std::collections::HashMap;
 
 use fq_catalog::Catalog;
 use fq_common::events::{
-    BucketGrain, EventMatch, FunnelMode, FunnelSpec, PathAnchor, PathsSpec, PeriodGrain,
-    RetentionMode, RetentionSpec, SegmentMeasure, SegmentSpec, TimeRange,
+    BucketGrain, EventMatch, EventPredicate, FunnelMode, FunnelSpec, PathAnchor, PathsSpec,
+    PeriodGrain, RetentionMode, RetentionSpec, SegmentMeasure, SegmentSpec, TimeRange,
 };
 use fq_plan::expr::{LiteralValue, NullsOrder};
 use fq_plan::{
@@ -1575,13 +1575,21 @@ fn build_analysis_call(function: &Function) -> Result<AnalysisCall, ParseError> 
 }
 
 /// The error for an analysis option that only the statement form carries (a time
-/// range or a property filter), stated as current behavior.
+/// range), stated as current behavior.
 fn deferred_analysis_option(func: &str, option: &str) -> ParseError {
     ParseError::Unsupported(format!(
         "{func}() option '{option}' is not a table-function argument; the {} statement carries a \
-         time range and a property filter",
+         time range",
         func.to_ascii_uppercase()
     ))
+}
+
+/// Read an analysis `filter => '<predicate>'` argument: a bare event-property
+/// predicate parsed with the same grammar the statement's WHERE clause uses, so
+/// the table function and the statement share one filter parser.
+fn filter_arg(expr: &Expression, what: &str) -> Result<EventPredicate, ParseError> {
+    let text = string_arg(expr, what)?;
+    crate::events::parse_filter_expr(&text)
 }
 
 /// Map `funnel('<ds>', '<step1>', '<step2>'[, ...], window => '<interval>'
@@ -1595,6 +1603,7 @@ fn build_funnel_spec(args: &[Expression]) -> Result<FunnelSpec, ParseError> {
     let mut window_micros: Option<i64> = None;
     let mut mode = FunnelMode::StrictOrder;
     let mut breakdown: Option<String> = None;
+    let mut filter: Option<EventPredicate> = None;
     for (index, arg) in args.iter().enumerate() {
         match arg {
             Expression::NamedArgument(named) => match named.name.name.to_ascii_lowercase().as_str()
@@ -1606,7 +1615,10 @@ fn build_funnel_spec(args: &[Expression]) -> Result<FunnelSpec, ParseError> {
                 "breakdown" => {
                     breakdown = Some(string_arg(&named.value, "funnel() breakdown")?);
                 }
-                name @ ("from" | "to" | "where" | "filter") => {
+                "filter" | "where" => {
+                    filter = Some(filter_arg(&named.value, "funnel() filter")?);
+                }
+                name @ ("from" | "to") => {
                     return Err(deferred_analysis_option("funnel", name));
                 }
                 other => {
@@ -1645,7 +1657,7 @@ fn build_funnel_spec(args: &[Expression]) -> Result<FunnelSpec, ParseError> {
             from: None,
             to: None,
         },
-        filter: None,
+        filter,
         breakdown,
     })
 }
@@ -1664,6 +1676,7 @@ fn build_retention_spec(args: &[Expression]) -> Result<RetentionSpec, ParseError
     let mut periods: Option<u32> = None;
     let mut at: Option<u32> = None;
     let mut breakdown: Option<String> = None;
+    let mut filter: Option<EventPredicate> = None;
     for (index, arg) in args.iter().enumerate() {
         match arg {
             Expression::NamedArgument(named) => match named.name.name.to_ascii_lowercase().as_str()
@@ -1679,7 +1692,10 @@ fn build_retention_spec(args: &[Expression]) -> Result<RetentionSpec, ParseError
                 "breakdown" => {
                     breakdown = Some(string_arg(&named.value, "retention() breakdown")?);
                 }
-                name @ ("from" | "to" | "where" | "filter") => {
+                "filter" | "where" => {
+                    filter = Some(filter_arg(&named.value, "retention() filter")?);
+                }
+                name @ ("from" | "to") => {
                     return Err(deferred_analysis_option("retention", name));
                 }
                 other => {
@@ -1721,7 +1737,7 @@ fn build_retention_spec(args: &[Expression]) -> Result<RetentionSpec, ParseError
             from: None,
             to: None,
         },
-        filter: None,
+        filter,
         breakdown,
     })
 }
@@ -1736,6 +1752,7 @@ fn build_segment_spec(args: &[Expression]) -> Result<SegmentSpec, ParseError> {
     let mut event: Option<String> = None;
     let mut bucket: Option<BucketGrain> = None;
     let mut breakdown: Option<String> = None;
+    let mut filter: Option<EventPredicate> = None;
     for (index, arg) in args.iter().enumerate() {
         match arg {
             Expression::NamedArgument(named) => match named.name.name.to_ascii_lowercase().as_str()
@@ -1746,7 +1763,10 @@ fn build_segment_spec(args: &[Expression]) -> Result<SegmentSpec, ParseError> {
                 "breakdown" => {
                     breakdown = Some(string_arg(&named.value, "segment() breakdown")?);
                 }
-                name @ ("from" | "to" | "where" | "filter") => {
+                "filter" | "where" => {
+                    filter = Some(filter_arg(&named.value, "segment() filter")?);
+                }
+                name @ ("from" | "to") => {
                     return Err(deferred_analysis_option("segment", name));
                 }
                 other => {
@@ -1784,7 +1804,7 @@ fn build_segment_spec(args: &[Expression]) -> Result<SegmentSpec, ParseError> {
             from: None,
             to: None,
         },
-        filter: None,
+        filter,
         breakdown,
     })
 }
@@ -1914,10 +1934,11 @@ fn build_paths_spec(args: &[Expression]) -> Result<PathsSpec, ParseError> {
     let mut anchor: Option<PathAnchor> = None;
     let mut depth: u32 = 5;
     let mut top: u32 = 20;
+    let mut filter: Option<EventPredicate> = None;
     for (index, arg) in args.iter().enumerate() {
         match arg {
             Expression::NamedArgument(named) => {
-                apply_paths_named_arg(named, &mut anchor, &mut depth, &mut top)?;
+                apply_paths_named_arg(named, &mut anchor, &mut depth, &mut top, &mut filter)?;
             }
             positional => {
                 if index != 0 {
@@ -1945,7 +1966,7 @@ fn build_paths_spec(args: &[Expression]) -> Result<PathsSpec, ParseError> {
             from: None,
             to: None,
         },
-        filter: None,
+        filter,
     })
 }
 
@@ -1955,6 +1976,7 @@ fn apply_paths_named_arg(
     anchor: &mut Option<PathAnchor>,
     depth: &mut u32,
     top: &mut u32,
+    filter: &mut Option<EventPredicate>,
 ) -> Result<(), ParseError> {
     let name = named.name.name.to_ascii_lowercase();
     match name.as_str() {
@@ -1974,8 +1996,12 @@ fn apply_paths_named_arg(
             *top = count_arg(&named.value, "paths() top")?;
             Ok(())
         }
-        "maxgap" | "from" | "to" | "where" | "filter" => Err(ParseError::Unsupported(format!(
-            "paths() option '{name}' is not a table-function argument; the PATHS statement carries maxgap, a time range, and a property filter"
+        "filter" | "where" => {
+            *filter = Some(filter_arg(&named.value, "paths() filter")?);
+            Ok(())
+        }
+        "maxgap" | "from" | "to" => Err(ParseError::Unsupported(format!(
+            "paths() option '{name}' is not a table-function argument; the PATHS statement carries maxgap and a time range"
         ))),
         other => Err(ParseError::Parse(format!("unknown paths() option '{other}'"))),
     }

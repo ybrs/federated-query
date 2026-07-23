@@ -2229,3 +2229,37 @@ fn segment_table_function_requires_measure_and_bucket() {
         ParseError::Parse(_)
     ));
 }
+
+#[test]
+fn paths_table_function_filter_arg_parses_predicate() {
+    // `filter => '<predicate>'` uses the same grammar as the statement's WHERE.
+    let plan = parse("SELECT path_id FROM paths('web', filter => 'device = ''ios''')").unwrap();
+    let spec = paths_spec(table_function_of(&plan));
+    let Some(fq_common::events::EventPredicate::Compare { property, .. }) = &spec.filter else {
+        panic!("expected a Compare filter, got {:?}", spec.filter);
+    };
+    assert_eq!(property, "device");
+}
+
+#[test]
+fn segment_table_function_filter_arg_parses_compound_predicate() {
+    let plan = parse(
+        "SELECT value FROM segment('web', measure => 'count', bucket => 'day', \
+         filter => 'device = ''ios'' AND country = ''US''')",
+    )
+    .unwrap();
+    let spec = segment_spec(table_function_of(&plan));
+    let Some(fq_common::events::EventPredicate::And(terms)) = &spec.filter else {
+        panic!("expected an AND filter, got {:?}", spec.filter);
+    };
+    assert_eq!(terms.len(), 2);
+}
+
+#[test]
+fn table_function_malformed_filter_raises() {
+    // A bare column with no operator is not a predicate; it raises rather than
+    // being silently dropped.
+    let error =
+        parse("SELECT path_id FROM paths('web', filter => 'device')").unwrap_err();
+    assert!(matches!(error, ParseError::Parse(_)), "got {error:?}");
+}

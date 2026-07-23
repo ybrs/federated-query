@@ -351,3 +351,66 @@ fn funnel_retention_segment_table_functions_run() {
         .expect("count is Int64");
     assert!(n.value(0) >= 1, "retention returned no rows");
 }
+
+#[test]
+fn table_function_filter_narrows_the_analysis() {
+    let dir = sandbox("tvffilter");
+    let file = dir.join("ev.parquet");
+    // A device property to filter on: three ios events, one android.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "created_at",
+            ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+        Field::new("event", ArrowDataType::Utf8, false),
+        Field::new("user_id", ArrowDataType::Utf8, false),
+        Field::new("device", ArrowDataType::Utf8, false),
+    ]));
+    let day = 86_400_000_000_i64;
+    let created: ArrayRef =
+        Arc::new(TimestampMicrosecondArray::from(vec![day, day, day, 2 * day]).with_timezone("UTC"));
+    let event: ArrayRef = Arc::new(StringArray::from(vec!["view", "view", "view", "view"]));
+    let user: ArrayRef = Arc::new(StringArray::from(vec!["u1", "u2", "u3", "u4"]));
+    let device: ArrayRef = Arc::new(StringArray::from(vec!["ios", "android", "ios", "ios"]));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![created, event, user, device]).expect("batch");
+    let out = File::create(&file).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(out, batch.schema(), None).expect("arrow writer");
+    writer.write(&batch).expect("write batch");
+    writer.close().expect("close writer");
+
+    let runtime = Runtime::from_config(&event_config(&dir, "evf", &file)).expect("from_config");
+    runtime
+        .execute(
+            "CREATE EVENT DATASET web FROM evf.main.evf \
+             ACTOR user_id TIME created_at EVENT event PROPERTIES (device) \
+             WITH (refresh_key = 'created_at')",
+        )
+        .expect("create event dataset");
+
+    // Unfiltered: all four view events counted across the day buckets.
+    let (_, batches) = runtime
+        .execute("SELECT sum(value) AS total FROM segment('web', measure => 'count', bucket => 'day')")
+        .expect("segment unfiltered");
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("sum is Int64");
+    assert_eq!(total.value(0), 4);
+
+    // filter => device='ios' narrows to the three ios events.
+    let (_, batches) = runtime
+        .execute(
+            "SELECT sum(value) AS total FROM segment('web', measure => 'count', bucket => 'day', \
+             filter => 'device = ''ios''')",
+        )
+        .expect("segment filtered");
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("sum is Int64");
+    assert_eq!(total.value(0), 3);
+}
