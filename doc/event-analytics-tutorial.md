@@ -126,6 +126,21 @@ actor 42:  ts 09:00 page_view
            ts +8d   purchase
 ```
 
+Each analysis has two equivalent forms:
+
+- A **statement** - concise, one question per line: `FUNNEL (...) ON web ...`.
+- A **table function** in a SQL `FROM` clause -
+  `SELECT ... FROM funnel('web', ...)` - so you can aggregate, filter, join, and
+  order the result with ordinary SQL.
+
+Both run the same engine over the same materialized dataset and return the same
+rows; the table function just hands them to the SQL layer. The argument
+conventions are ClickHouse-style: the dataset is the first positional argument,
+every option is a named argument (`depth => 4`, `window => '7 days'`,
+`breakdown => 'device'`), and the property filter is `filter => '<predicate>'`
+using the same predicate grammar as the statement's `WHERE`. Alias the relation
+like any other: `FROM paths('web', depth => 3) AS p`.
+
 ### FUNNEL - "of the actors who did A, how many went on to B, then C?"
 
 Ordered conversion within a time window, counted once per actor (first
@@ -155,6 +170,24 @@ FUNNEL ('page_view', 'add_to_cart') ON web WINDOW 3 DAY BREAKDOWN BY device;
 FUNNEL ('signup', 'purchase') ON web WINDOW 3 DAY WHERE country = 'US';
 ```
 
+As a table function - the dataset first, then the ordered steps, then the
+options (`window` is required; `mode => 'strict'|'any'`):
+
+```sql
+SELECT * FROM funnel('web', 'page_view', 'view_item', 'add_to_cart', window => '7 days');
+SELECT * FROM funnel('web', 'page_view', 'add_to_cart', window => '3 days', breakdown => 'device');
+SELECT * FROM funnel('web', 'signup', 'purchase', window => '3 days', filter => 'country = ''US''');
+```
+
+Now SQL composes on top - e.g. the overall conversion to the last step:
+
+```sql
+SELECT conversion_from_start
+FROM funnel('web', 'page_view', 'view_item', 'add_to_cart', window => '7 days')
+ORDER BY step_index DESC
+LIMIT 1;
+```
+
 ### RETENTION - "do actors come back?"
 
 Cohorts by a birth event, return by a return event, on a period grid. Use it
@@ -177,6 +210,21 @@ days later marks it retained at period offset 1. The result is one row per
  ...
 ```
 
+As a table function (`birth`/`return` take an event name, or `'any'` for the
+statement's `ANY EVENT`; `mode => 'bounded'|'unbounded'`, plus `periods` / `at`):
+
+```sql
+SELECT * FROM retention('web', birth => 'signup', return => 'any', period => 'week');
+```
+
+Keep only the sizeable cohorts and the first eight offsets, in SQL:
+
+```sql
+SELECT * FROM retention('web', birth => 'signup', return => 'any', period => 'week')
+WHERE cohort_size > 500 AND period_offset <= 8
+ORDER BY cohort_start, period_offset;
+```
+
 ### SEGMENT - "how much activity, over time?"
 
 A measure per time bucket: event counts, unique actors, or events-per-unique.
@@ -186,6 +234,24 @@ Use it for dashboards and trend lines.
 SEGMENT COUNT ON web BUCKET DAY;                              -- events/day
 SEGMENT UNIQUES ON web EVENT 'purchase' BUCKET DAY WHERE country = 'DE';
 SEGMENT UNIQUES ON web BUCKET DAY BREAKDOWN BY device;        -- DAU by device
+```
+
+As a table function (`measure` and `bucket` are required; `event` restricts to
+one event name):
+
+```sql
+SELECT * FROM segment('web', measure => 'count', bucket => 'day');
+SELECT * FROM segment('web', measure => 'uniques', bucket => 'day', event => 'purchase', filter => 'country = ''DE''');
+SELECT * FROM segment('web', measure => 'uniques', bucket => 'day', breakdown => 'device');
+```
+
+Ordinary SQL over the buckets - the busiest days, or a grand total:
+
+```sql
+SELECT bucket, value FROM segment('web', measure => 'count', bucket => 'day')
+ORDER BY value DESC LIMIT 5;
+
+SELECT sum(value) AS total_events FROM segment('web', measure => 'count', bucket => 'day');
 ```
 
 Actor 42 contributes 4 events to its day's COUNT bucket and exactly 1 to its
@@ -209,6 +275,27 @@ PATHS ON web ENDING AT 'purchase' DEPTH 5 TOP 10;       -- what led INTO an even
 PATHS ON web DEPTH 50 TOP 10;                           -- depth is unbounded
 PATHS ON web DEPTH 10 TOP 10 FROM '2026-06-17' TO '2026-06-22';
 PATHS ON web DEPTH 6 TOP 10 MAXGAP 30 MINUTE;           -- session-break on gaps
+```
+
+As a table function - dataset first, options named:
+
+```sql
+SELECT * FROM paths('web', depth => 3, top => 20);
+SELECT * FROM paths('web', starting_at => 'page_view', depth => 4, top => 10);
+SELECT * FROM paths('web', ending_at => 'purchase', depth => 5, top => 10);
+SELECT * FROM paths('web', depth => 6, top => 10, filter => 'device = ''ios''');
+```
+
+The range (`FROM`/`TO`) and `MAXGAP` are statement-only for now; the anchor,
+depth, top, and the property filter are available in both forms. Because it is a
+relation, SQL sits on top - e.g. how often each event appears across the top
+routes (grouping by `event`, not `path_id`, avoids the per-step repetition):
+
+```sql
+SELECT event, sum(occurrences) AS total
+FROM paths('web', depth => 3, top => 100)
+GROUP BY event
+ORDER BY total DESC;
 ```
 
 The result is one row per STEP of each ranked path, so it pivots and joins
@@ -292,6 +379,9 @@ index, write verification) is ~28s on 12 cores.
 
 ## Other front doors
 
-The same statements work without the server:
-- CLI: `fedq --config fedq.yaml --command "FUNNEL (...) ON web WINDOW 7 DAY"`.
-- Python: `import fedq; rt = fedq.Runtime("fedq.yaml"); rt.execute("...")`.
+Both forms - the statements and the `FROM <analysis>(...)` table functions -
+work without the server:
+- CLI: `fedq --config fedq.yaml --command "FUNNEL (...) ON web WINDOW 7 DAY"`, or
+  `fedq --config fedq.yaml --command "SELECT * FROM funnel('web', 'a', 'b', window => '7 days')"`.
+- Python: `import fedq; rt = fedq.Runtime("fedq.yaml"); rt.execute("...")` - pass
+  either a statement or a `SELECT ... FROM paths('web', ...)` query.
