@@ -1976,3 +1976,111 @@ fn column_ref_names(exprs: &[Expr]) -> Vec<String> {
     }
     names
 }
+
+// ---- event-analysis table functions (`FROM paths(...)`) ----------------------
+
+/// The `TableFunction` leaf a `SELECT ... FROM <analysis>(...)` lowers to, under
+/// its top Projection.
+fn table_function_of(plan: &LogicalPlan) -> &fq_plan::TableFunction {
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected Projection, got {plan:?}");
+    };
+    let LogicalPlan::TableFunction(node) = projection.input.as_ref() else {
+        panic!("expected TableFunction under Projection, got {:?}", projection.input);
+    };
+    node
+}
+
+/// The PATHS spec of a table-function leaf (the enum has a single variant today).
+fn paths_spec(node: &fq_plan::TableFunction) -> &fq_common::events::PathsSpec {
+    let fq_plan::AnalysisCall::Paths(spec) = &node.call;
+    spec
+}
+
+#[test]
+fn paths_table_function_named_args_map_onto_spec() {
+    let plan =
+        parse("SELECT path_id FROM paths('web', starting_at => 'home', depth => 4, top => 10)")
+            .unwrap();
+    let node = table_function_of(&plan);
+    assert_eq!(node.alias, "paths");
+    assert_eq!(
+        node.output_names,
+        vec!["path_id", "seq", "event", "occurrences", "share"]
+    );
+    let spec = paths_spec(node);
+    assert_eq!(spec.dataset, "web");
+    assert_eq!(spec.depth, 4);
+    assert_eq!(spec.top, 10);
+    assert!(matches!(
+        &spec.anchor,
+        fq_common::events::PathAnchor::StartingAt(name) if name == "home"
+    ));
+}
+
+#[test]
+fn paths_table_function_defaults_match_statement() {
+    // Only the dataset given: depth 5, top 20, unanchored - the PATHS statement's
+    // defaults.
+    let plan = parse("SELECT path_id FROM paths('web')").unwrap();
+    let spec = paths_spec(table_function_of(&plan));
+    assert_eq!(spec.dataset, "web");
+    assert_eq!(spec.depth, 5);
+    assert_eq!(spec.top, 20);
+    assert!(matches!(spec.anchor, fq_common::events::PathAnchor::Unanchored));
+}
+
+#[test]
+fn paths_table_function_ending_at_anchor() {
+    let plan = parse("SELECT path_id FROM paths('web', ending_at => 'checkout')").unwrap();
+    let spec = paths_spec(table_function_of(&plan));
+    assert!(matches!(
+        &spec.anchor,
+        fq_common::events::PathAnchor::EndingAt(name) if name == "checkout"
+    ));
+}
+
+#[test]
+fn paths_table_function_alias_and_column_aliases() {
+    let plan = parse("SELECT a FROM paths('web') AS p (a, b, c, d, e)").unwrap();
+    let node = table_function_of(&plan);
+    assert_eq!(node.alias, "p");
+    assert_eq!(node.output_names, vec!["a", "b", "c", "d", "e"]);
+}
+
+#[test]
+fn paths_table_function_missing_dataset_raises() {
+    let error = parse("SELECT path_id FROM paths()").unwrap_err();
+    assert!(matches!(error, ParseError::Parse(_)), "got {error:?}");
+}
+
+#[test]
+fn paths_table_function_unknown_option_raises() {
+    let error = parse("SELECT path_id FROM paths('web', bogus => 1)").unwrap_err();
+    assert!(matches!(error, ParseError::Parse(_)), "got {error:?}");
+}
+
+#[test]
+fn paths_table_function_maxgap_arg_not_yet_supported() {
+    let error = parse("SELECT path_id FROM paths('web', maxgap => 5)").unwrap_err();
+    assert!(matches!(error, ParseError::Unsupported(_)), "got {error:?}");
+}
+
+#[test]
+fn paths_table_function_two_anchors_raise() {
+    let error =
+        parse("SELECT path_id FROM paths('web', starting_at => 'a', ending_at => 'b')").unwrap_err();
+    assert!(matches!(error, ParseError::Parse(_)), "got {error:?}");
+}
+
+#[test]
+fn paths_table_function_column_alias_count_mismatch_raises() {
+    let error = parse("SELECT a FROM paths('web') AS p (a, b)").unwrap_err();
+    assert!(matches!(error, ParseError::Parse(_)), "got {error:?}");
+}
+
+#[test]
+fn unknown_table_function_raises() {
+    let error = parse("SELECT x FROM totally_made_up('web')").unwrap_err();
+    assert!(matches!(error, ParseError::Unsupported(_)), "got {error:?}");
+}

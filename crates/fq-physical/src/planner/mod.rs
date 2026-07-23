@@ -165,6 +165,9 @@ impl PhysicalPlanner {
             LogicalPlan::LateralJoin(lj) => self.plan_lateral_join(lj),
             LogicalPlan::SingleRowGuard(g) => self.plan_single_row_guard(g),
             LogicalPlan::GroupedLimit(gl) => self.plan_grouped_limit(gl),
+            LogicalPlan::TableFunction(tf) => Err(PhysicalError::TableFunctionNotExecutable(
+                tf.call.function_name().to_string(),
+            )),
         }
     }
 

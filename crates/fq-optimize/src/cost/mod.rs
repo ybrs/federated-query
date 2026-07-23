@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use fq_common::CostConfig;
 use fq_plan::expr::{ColumnRef, Expr};
-use fq_plan::logical::{Cte, LogicalPlan, Scan, SetOpKind};
+use fq_plan::logical::{AnalysisCall, Cte, LogicalPlan, Scan, SetOpKind, TableFunction};
 
 use crate::error::{EstimateError, Result};
 use crate::estimate_defaults::{add_rows, combine_defaults, min_rows, CardinalityEstimate};
@@ -103,6 +103,10 @@ impl CostModel {
                     &["lateral_multiplicity".to_string()],
                 )))
             }
+            LogicalPlan::TableFunction(node) => Ok(CardinalityEstimate::known(
+                table_function_row_bound(node),
+                vec!["table_function_output_bound".to_string()],
+            )),
             LogicalPlan::Explain(_) => Err(EstimateError::NoRule("Explain")),
         }
     }
@@ -362,6 +366,16 @@ fn key_name(key: &Expr) -> String {
 /// negative count (a source contract violation) reads as UNKNOWN.
 fn ndv_u64(value: Option<i64>) -> Option<u64> {
     value.and_then(|number| u64::try_from(number).ok())
+}
+
+/// An upper bound on a table-valued analysis's output rows. The analysis is
+/// inherently bounded - PATHS returns at most `top` paths of at most `depth`
+/// step-rows each - so the cost model treats it as a small known relation rather
+/// than an unknown, which keeps join ordering around it sane.
+fn table_function_row_bound(node: &TableFunction) -> u64 {
+    match &node.call {
+        AnalysisCall::Paths(spec) => u64::from(spec.top).saturating_mul(u64::from(spec.depth)),
+    }
 }
 
 #[cfg(test)]

@@ -251,7 +251,8 @@ impl SingleSourcePushdown {
             | LogicalPlan::Values(_)
             | LogicalPlan::Explain(_)
             | LogicalPlan::SingleRowGuard(_)
-            | LogicalPlan::GroupedLimit(_) => Ok(false),
+            | LogicalPlan::GroupedLimit(_)
+            | LogicalPlan::TableFunction(_) => Ok(false),
         }
     }
 

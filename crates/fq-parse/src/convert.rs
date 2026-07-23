@@ -17,13 +17,16 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use fq_catalog::Catalog;
+use fq_common::events::{PathAnchor, PathsSpec, TimeRange};
 use fq_plan::expr::{LiteralValue, NullsOrder};
 use fq_plan::{
-    Aggregate, BinaryOpType, ColumnRef, Cte, CteRef, Expr, Filter, Join, JoinType, LateralJoin,
-    Limit, LogicalPlan, Projection, Scan, SetOpKind, SetOperation, Sort, SubqueryScan, Values,
+    Aggregate, AnalysisCall, BinaryOpType, ColumnRef, Cte, CteRef, Expr, Filter, Join, JoinType,
+    LateralJoin, Limit, LogicalPlan, Projection, Scan, SetOpKind, SetOperation, Sort, SubqueryScan,
+    TableFunction, Values,
 };
 use polyglot_sql::expressions::{
-    Expression, JoinKind, Literal, Null, Ordered, Sample, SampleMethod, Select, TableRef, With,
+    Expression, Function, Identifier, JoinKind, Literal, NamedArgument, Null, Ordered, Sample,
+    SampleMethod, Select, TableRef, With,
 };
 use polyglot_sql::traversal::ExpressionWalk;
 
@@ -582,6 +585,16 @@ impl<'a> Converter<'a> {
             Expression::Table(table) => self.table_or_cte_ref(select, table, tables),
             Expression::Subquery(subquery) => self.derived_table(subquery, tables),
             Expression::Pivot(pivot) => self.convert_pivot(select, pivot, tables),
+            Expression::Function(function) => table_function(function.as_ref(), None, &[], tables),
+            Expression::Alias(alias) => match &alias.this {
+                Expression::Function(function) => table_function(
+                    function.as_ref(),
+                    Some(alias.alias.name.clone()),
+                    &alias.column_aliases,
+                    tables,
+                ),
+                other => Err(ParseError::Unsupported(format!("FROM/JOIN {}", other.variant_name()))),
+            },
             other => Err(ParseError::Unsupported(format!(
                 "FROM/JOIN {}",
                 other.variant_name()
@@ -1518,6 +1531,188 @@ fn pivot_value_name(value: &LiteralValue) -> Result<String, ParseError> {
             "PIVOT IN value must be a string, integer, or boolean literal".to_string(),
         )),
     }
+}
+
+/// Lower a recognized event-analysis function call in FROM position
+/// (`paths('web', depth => 4) [AS a[(c1, ...)]]`) into a `TableFunction` leaf,
+/// recording its output columns for star expansion. An unrecognized function
+/// name raises: FROM admits only the event-analysis table functions, never an
+/// arbitrary SQL function.
+fn table_function(
+    function: &Function,
+    alias: Option<String>,
+    column_aliases: &[Identifier],
+    tables: &mut Vec<FromTable>,
+) -> Result<LogicalPlan, ParseError> {
+    let call = build_analysis_call(function)?;
+    let key = alias.unwrap_or_else(|| call.function_name().to_string());
+    let output_names = analysis_output_names(&call, column_aliases)?;
+    tables.push(FromTable {
+        key: key.clone(),
+        columns: ColumnSource::Explicit(output_names.clone()),
+    });
+    Ok(LogicalPlan::TableFunction(TableFunction {
+        call,
+        alias: key,
+        output_names,
+    }))
+}
+
+/// Dispatch a FROM function call by name to its analysis-spec builder.
+fn build_analysis_call(function: &Function) -> Result<AnalysisCall, ParseError> {
+    match function.name.to_ascii_lowercase().as_str() {
+        "paths" => Ok(AnalysisCall::Paths(build_paths_spec(&function.args)?)),
+        other => Err(ParseError::Unsupported(format!(
+            "table function {other}(...) in FROM"
+        ))),
+    }
+}
+
+/// Map `paths('<dataset>', starting_at => '<event>', depth => <n>, top => <n>)`
+/// arguments onto a `PathsSpec`. The dataset is the sole positional argument;
+/// every option is named. Defaults match the `PATHS` statement (depth 5, top
+/// 20, unanchored). The accepted options are the anchor, depth, and top; a
+/// maxgap / from / to / where argument raises, and so does an unknown option.
+/// The `PATHS` statement is the form that carries maxgap, a time range, and a
+/// property filter.
+fn build_paths_spec(args: &[Expression]) -> Result<PathsSpec, ParseError> {
+    let mut dataset: Option<String> = None;
+    let mut anchor: Option<PathAnchor> = None;
+    let mut depth: u32 = 5;
+    let mut top: u32 = 20;
+    for (index, arg) in args.iter().enumerate() {
+        match arg {
+            Expression::NamedArgument(named) => {
+                apply_paths_named_arg(named, &mut anchor, &mut depth, &mut top)?;
+            }
+            positional => {
+                if index != 0 {
+                    return Err(ParseError::Unsupported(
+                        "paths() takes only the dataset positionally; pass options by name, e.g. paths('web', depth => 4)".to_string(),
+                    ));
+                }
+                dataset = Some(string_arg(positional, "paths() dataset")?);
+            }
+        }
+    }
+    let dataset = dataset.ok_or_else(|| {
+        ParseError::Parse(
+            "paths() requires the dataset as its first argument, e.g. paths('web', depth => 4)"
+                .to_string(),
+        )
+    })?;
+    Ok(PathsSpec {
+        dataset,
+        anchor: anchor.unwrap_or(PathAnchor::Unanchored),
+        depth,
+        top,
+        maxgap_micros: None,
+        range: TimeRange {
+            from: None,
+            to: None,
+        },
+        filter: None,
+    })
+}
+
+/// Apply one named `paths()` option to the spec-in-progress.
+fn apply_paths_named_arg(
+    named: &NamedArgument,
+    anchor: &mut Option<PathAnchor>,
+    depth: &mut u32,
+    top: &mut u32,
+) -> Result<(), ParseError> {
+    let name = named.name.name.to_ascii_lowercase();
+    match name.as_str() {
+        "starting_at" => set_anchor(
+            anchor,
+            PathAnchor::StartingAt(string_arg(&named.value, "paths() starting_at")?),
+        ),
+        "ending_at" => set_anchor(
+            anchor,
+            PathAnchor::EndingAt(string_arg(&named.value, "paths() ending_at")?),
+        ),
+        "depth" => {
+            *depth = count_arg(&named.value, "paths() depth")?;
+            Ok(())
+        }
+        "top" => {
+            *top = count_arg(&named.value, "paths() top")?;
+            Ok(())
+        }
+        "maxgap" | "from" | "to" | "where" | "filter" => Err(ParseError::Unsupported(format!(
+            "paths() option '{name}' is not a table-function argument; the PATHS statement carries maxgap, a time range, and a property filter"
+        ))),
+        other => Err(ParseError::Parse(format!("unknown paths() option '{other}'"))),
+    }
+}
+
+/// Set the path anchor, raising if one was already given (starting_at and
+/// ending_at are mutually exclusive, and neither may repeat).
+fn set_anchor(slot: &mut Option<PathAnchor>, value: PathAnchor) -> Result<(), ParseError> {
+    if slot.is_some() {
+        return Err(ParseError::Parse(
+            "paths() accepts only one of starting_at or ending_at".to_string(),
+        ));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+/// Read a string-literal function argument, or raise naming the argument.
+fn string_arg(expr: &Expression, what: &str) -> Result<String, ParseError> {
+    if let Expression::Literal(literal) = expr {
+        if let Literal::String(text) = literal.as_ref() {
+            return Ok(text.clone());
+        }
+    }
+    Err(ParseError::Parse(format!("{what} must be a string literal")))
+}
+
+/// Read a non-negative-integer-literal function argument, or raise naming it.
+/// Semantic bounds (depth at least 2, top in 1..=1000) are the fq-events
+/// executor's to enforce, so the two front doors share one validator.
+fn count_arg(expr: &Expression, what: &str) -> Result<u32, ParseError> {
+    if let Expression::Literal(literal) = expr {
+        if let Literal::Number(text) = literal.as_ref() {
+            let value = text.parse::<u32>().map_err(|_| {
+                ParseError::Parse(format!("{what} must be a non-negative integer, found '{text}'"))
+            })?;
+            return Ok(value);
+        }
+    }
+    Err(ParseError::Parse(format!(
+        "{what} must be a non-negative integer"
+    )))
+}
+
+/// The surfaced relation's column names: the analysis kind's fixed names, or the
+/// user's column aliases when the FROM item renamed them. A mismatched alias
+/// count raises.
+fn analysis_output_names(
+    call: &AnalysisCall,
+    column_aliases: &[Identifier],
+) -> Result<Vec<String>, ParseError> {
+    let mut defaults = Vec::new();
+    for (name, _type) in call.output_columns() {
+        defaults.push(name.to_string());
+    }
+    if column_aliases.is_empty() {
+        return Ok(defaults);
+    }
+    if column_aliases.len() != defaults.len() {
+        return Err(ParseError::Parse(format!(
+            "{}(...) produces {} columns but {} column aliases were given",
+            call.function_name(),
+            defaults.len(),
+            column_aliases.len()
+        )));
+    }
+    let mut names = Vec::new();
+    for ident in column_aliases {
+        names.push(ident.name.clone());
+    }
+    Ok(names)
 }
 
 /// The qualifier a reference uses for a table: its alias if any, else its name.

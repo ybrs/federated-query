@@ -77,6 +77,7 @@ fn output_qualifiers(plan: &LogicalPlan) -> HashSet<String> {
                 .unwrap_or_else(|| scan.table_name.clone()),
         ),
         LogicalPlan::SubqueryScan(node) => single(node.alias.clone()),
+        LogicalPlan::TableFunction(node) => single(node.alias.clone()),
         LogicalPlan::CteRef(node) => {
             single(node.alias.clone().unwrap_or_else(|| node.name.clone()))
         }
@@ -149,6 +150,7 @@ fn available_qualifiers(plan: &LogicalPlan) -> HashSet<String> {
         | LogicalPlan::Values(_)
         | LogicalPlan::Cte(_)
         | LogicalPlan::CteRef(_)
+        | LogicalPlan::TableFunction(_)
         | LogicalPlan::SubqueryScan(_) => HashSet::new(),
     }
 }
@@ -220,6 +222,7 @@ fn plan_label(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::SingleRowGuard(_) => "SingleRowGuard",
         LogicalPlan::GroupedLimit(_) => "GroupedLimit",
         LogicalPlan::LateralJoin(_) => "LateralJoin",
+        LogicalPlan::TableFunction(_) => "TableFunction",
     }
 }
 

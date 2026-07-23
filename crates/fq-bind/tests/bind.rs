@@ -742,3 +742,65 @@ fn grouping_set_keys_bind_like_group_by_keys() {
         }
     }
 }
+
+// ---- event-analysis table functions (`FROM paths(...)`) ----------------------
+
+#[test]
+fn paths_table_function_columns_bind_qualified_and_typed() {
+    // The event dataset is NOT in the catalog (it lives in the event store,
+    // resolved at execution); binding still qualifies and types the surfaced
+    // columns under the alias.
+    let plan =
+        bind_sql("SELECT p.path_id, p.occurrences FROM paths('web') AS p").unwrap();
+    assert_all_qualified(&plan);
+    let LogicalPlan::Projection(projection) = &plan else {
+        panic!("expected Projection");
+    };
+    let Expr::Column(path_id) = &projection.expressions[0] else {
+        panic!("expected column");
+    };
+    assert_eq!(path_id.table.as_deref(), Some("p"));
+    assert_eq!(path_id.data_type, Some(DataType::Integer));
+    let Expr::Column(occurrences) = &projection.expressions[1] else {
+        panic!("expected column");
+    };
+    assert_eq!(occurrences.table.as_deref(), Some("p"));
+    assert_eq!(occurrences.data_type, Some(DataType::BigInt));
+}
+
+#[test]
+fn paths_table_function_unaliased_qualifies_under_function_name() {
+    let plan = bind_sql("SELECT event FROM paths('web')").unwrap();
+    assert_all_qualified(&plan);
+    let LogicalPlan::Projection(projection) = &plan else {
+        panic!("expected Projection");
+    };
+    let Expr::Column(event) = &projection.expressions[0] else {
+        panic!("expected column");
+    };
+    assert_eq!(event.table.as_deref(), Some("paths"));
+    assert_eq!(event.data_type, Some(DataType::Varchar));
+}
+
+#[test]
+fn paths_table_function_supports_outer_aggregation() {
+    // The whole point: aggregate over the analysis output in plain SQL.
+    let plan = bind_sql(
+        "SELECT p.path_id, sum(p.occurrences) FROM paths('web') AS p GROUP BY p.path_id",
+    )
+    .unwrap();
+    assert_all_qualified(&plan);
+}
+
+#[test]
+fn paths_table_function_unknown_column_raises() {
+    // A column the analysis does not expose fails to bind, like any relation.
+    let error = bind_sql("SELECT p.not_a_column FROM paths('web') AS p").unwrap_err();
+    assert!(
+        matches!(
+            error,
+            BindError::ColumnNotInTable { .. } | BindError::ColumnNotInScope(_)
+        ),
+        "got {error:?}"
+    );
+}

@@ -17,6 +17,9 @@
 
 use std::collections::BTreeMap;
 
+use fq_common::events::PathsSpec;
+use fq_common::DataType;
+
 use crate::expr::{Expr, NullsOrder};
 
 /// Join types.
@@ -366,6 +369,64 @@ pub struct LateralJoin {
     pub join_type: JoinType,
 }
 
+/// A table-valued event-analysis call in FROM position (e.g.
+/// `paths('web', depth => 4)`): an analysis surfaced as a relation so SQL can
+/// aggregate and filter over its output rows. Executes by running the fq-events
+/// kernel at execution time into in-memory batches; the standalone statement
+/// forms (`PATHS ON ...`) share the same spec types. A leaf: its parameters are
+/// baked into the spec, so it has no child plans and carries no coordinator
+/// expressions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableFunction {
+    pub call: AnalysisCall,
+    /// The relation qualifier its output columns bind under: the FROM alias, or
+    /// the function name when the call is unaliased.
+    pub alias: String,
+    /// Output column names in order. Equal to the analysis kind's fixed column
+    /// names, unless the FROM item renamed them (`paths(...) AS a(c1, c2, ...)`).
+    pub output_names: Vec<String>,
+}
+
+impl TableFunction {
+    /// Output column names of the surfaced relation.
+    fn schema(&self) -> Vec<String> {
+        self.output_names.clone()
+    }
+}
+
+/// The specific event analysis a `TableFunction` runs. One variant per analysis
+/// kind (PATHS is the first); each carries the same typed spec the standalone
+/// statement parser produces, so the two front doors cannot drift.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AnalysisCall {
+    Paths(PathsSpec),
+}
+
+impl AnalysisCall {
+    /// The dataset this analysis reads.
+    pub fn dataset(&self) -> &str {
+        match self {
+            AnalysisCall::Paths(spec) => &spec.dataset,
+        }
+    }
+
+    /// The analysis function's name as written in FROM; also the default
+    /// relation qualifier when the call is unaliased.
+    pub fn function_name(&self) -> &'static str {
+        match self {
+            AnalysisCall::Paths(_) => "paths",
+        }
+    }
+
+    /// The fixed `(name, type)` output columns of this analysis kind, before any
+    /// user column-alias rename.
+    pub fn output_columns(&self) -> Vec<(&'static str, DataType)> {
+        match self {
+            AnalysisCall::Paths(_) => fq_common::events::paths_output_columns(),
+        }
+    }
+}
+
 /// A logical plan node. One enum over the node structs above.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalPlan {
@@ -388,13 +449,17 @@ pub enum LogicalPlan {
     SingleRowGuard(SingleRowGuard),
     GroupedLimit(GroupedLimit),
     LateralJoin(LateralJoin),
+    TableFunction(TableFunction),
 }
 
 impl LogicalPlan {
     /// Direct child plan nodes. Exhaustive: a new node forces a new arm.
     pub fn children(&self) -> Vec<&LogicalPlan> {
         match self {
-            LogicalPlan::Scan(_) | LogicalPlan::CteRef(_) | LogicalPlan::Values(_) => Vec::new(),
+            LogicalPlan::Scan(_)
+            | LogicalPlan::CteRef(_)
+            | LogicalPlan::Values(_)
+            | LogicalPlan::TableFunction(_) => Vec::new(),
             LogicalPlan::Projection(node) => vec![&node.input],
             LogicalPlan::Filter(node) => vec![&node.input],
             LogicalPlan::Aggregate(node) => vec![&node.input],
@@ -436,6 +501,7 @@ impl LogicalPlan {
                 names.extend(node.right.schema());
                 names
             }
+            LogicalPlan::TableFunction(node) => node.schema(),
         }
     }
 
@@ -450,7 +516,10 @@ impl LogicalPlan {
         mut f: impl FnMut(LogicalPlan) -> Result<LogicalPlan, E>,
     ) -> Result<LogicalPlan, E> {
         Ok(match self {
-            LogicalPlan::Scan(_) | LogicalPlan::CteRef(_) | LogicalPlan::Values(_) => self,
+            LogicalPlan::Scan(_)
+            | LogicalPlan::CteRef(_)
+            | LogicalPlan::Values(_)
+            | LogicalPlan::TableFunction(_) => self,
             LogicalPlan::Projection(mut node) => {
                 node.input = Box::new(f(*node.input)?);
                 LogicalPlan::Projection(node)
@@ -565,7 +634,8 @@ impl LogicalPlan {
             | LogicalPlan::Cte(_)
             | LogicalPlan::CteRef(_)
             | LogicalPlan::SubqueryScan(_)
-            | LogicalPlan::LateralJoin(_) => Vec::new(),
+            | LogicalPlan::LateralJoin(_)
+            | LogicalPlan::TableFunction(_) => Vec::new(),
         }
     }
 }

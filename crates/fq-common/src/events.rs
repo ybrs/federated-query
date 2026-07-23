@@ -227,6 +227,22 @@ pub struct PathsSpec {
     pub filter: Option<EventPredicate>,
 }
 
+/// The fixed output relation of a `PATHS` analysis, whether reported by the
+/// standalone `PATHS ON ...` statement or surfaced as a table function
+/// (`FROM paths(...)`): one row per (path, step), ordered by rank then step.
+/// `occurrences` and `share` are the WHOLE path's values, repeated on each of
+/// its step rows. One source of truth so the statement result, the table
+/// function's bound schema, and the Arrow encoder never drift.
+pub fn paths_output_columns() -> Vec<(&'static str, crate::DataType)> {
+    vec![
+        ("path_id", crate::DataType::Integer),
+        ("seq", crate::DataType::Integer),
+        ("event", crate::DataType::Varchar),
+        ("occurrences", crate::DataType::BigInt),
+        ("share", crate::DataType::Double),
+    ]
+}
+
 /// Engine settings for the event-analytics store (`events:` config section).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]

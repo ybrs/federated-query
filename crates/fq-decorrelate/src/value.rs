@@ -331,6 +331,7 @@ fn passthrough_columns(plan: &LogicalPlan) -> Result<Vec<Expr>> {
     match plan {
         LogicalPlan::Scan(scan) => Ok(relation_columns(&scan_qualifier(scan), &plan.schema())),
         LogicalPlan::SubqueryScan(node) => Ok(relation_columns(&node.alias, &plan.schema())),
+        LogicalPlan::TableFunction(node) => Ok(relation_columns(&node.alias, &plan.schema())),
         LogicalPlan::CteRef(node) => {
             let qualifier = node.alias.clone().unwrap_or_else(|| node.name.clone());
             Ok(relation_columns(&qualifier, &plan.schema()))
