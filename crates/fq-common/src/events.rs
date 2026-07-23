@@ -243,6 +243,62 @@ pub fn paths_output_columns() -> Vec<(&'static str, crate::DataType)> {
     ]
 }
 
+/// The output relation of a `FUNNEL` analysis: one row per step (per breakdown
+/// group when `BREAKDOWN BY` is set). The `breakdown` column is present only for
+/// a breakdown query, so the schema depends on the spec. Shared by the statement
+/// and the `funnel(...)` table function.
+pub fn funnel_output_columns(spec: &FunnelSpec) -> Vec<(&'static str, crate::DataType)> {
+    let mut columns = Vec::new();
+    if spec.breakdown.is_some() {
+        columns.push(("breakdown", crate::DataType::Varchar));
+    }
+    columns.extend([
+        ("step_index", crate::DataType::Integer),
+        ("step_name", crate::DataType::Varchar),
+        ("entered", crate::DataType::BigInt),
+        ("conversion_from_previous", crate::DataType::Double),
+        ("conversion_from_start", crate::DataType::Double),
+        ("median_seconds_from_previous", crate::DataType::Double),
+        ("p90_seconds_from_previous", crate::DataType::Double),
+    ]);
+    columns
+}
+
+/// The output relation of a `RETENTION` analysis: one row per (cohort, period
+/// offset), plus a leading `breakdown` column when `BREAKDOWN BY` is set. Shared
+/// by the statement and the `retention(...)` table function.
+pub fn retention_output_columns(spec: &RetentionSpec) -> Vec<(&'static str, crate::DataType)> {
+    let mut columns = Vec::new();
+    if spec.breakdown.is_some() {
+        columns.push(("breakdown", crate::DataType::Varchar));
+    }
+    columns.extend([
+        ("cohort_start", crate::DataType::Timestamp),
+        ("cohort_size", crate::DataType::BigInt),
+        ("period_offset", crate::DataType::Integer),
+        ("retained", crate::DataType::BigInt),
+        ("retention_rate", crate::DataType::Double),
+    ]);
+    columns
+}
+
+/// The output relation of a `SEGMENT` analysis: one row per time bucket (per
+/// breakdown group when set). The `value` column's type follows the measure
+/// (COUNT/UNIQUES are integer counts, COUNT_PER_UNIQUE is a ratio). Shared by the
+/// statement and the `segment(...)` table function.
+pub fn segment_output_columns(spec: &SegmentSpec) -> Vec<(&'static str, crate::DataType)> {
+    let mut columns = vec![("bucket", crate::DataType::Timestamp)];
+    if spec.breakdown.is_some() {
+        columns.push(("breakdown", crate::DataType::Varchar));
+    }
+    let value_type = match spec.measure {
+        SegmentMeasure::Count | SegmentMeasure::Uniques => crate::DataType::BigInt,
+        SegmentMeasure::CountPerUnique => crate::DataType::Double,
+    };
+    columns.push(("value", value_type));
+    columns
+}
+
 /// Engine settings for the event-analytics store (`events:` config section).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]

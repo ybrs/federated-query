@@ -103,10 +103,7 @@ impl CostModel {
                     &["lateral_multiplicity".to_string()],
                 )))
             }
-            LogicalPlan::TableFunction(node) => Ok(CardinalityEstimate::known(
-                table_function_row_bound(node),
-                vec!["table_function_output_bound".to_string()],
-            )),
+            LogicalPlan::TableFunction(node) => Ok(estimate_table_function(node)),
             LogicalPlan::Explain(_) => Err(EstimateError::NoRule("Explain")),
         }
     }
@@ -368,13 +365,24 @@ fn ndv_u64(value: Option<i64>) -> Option<u64> {
     value.and_then(|number| u64::try_from(number).ok())
 }
 
-/// An upper bound on a table-valued analysis's output rows. The analysis is
-/// inherently bounded - PATHS returns at most `top` paths of at most `depth`
-/// step-rows each - so the cost model treats it as a small known relation rather
-/// than an unknown, which keeps join ordering around it sane.
-fn table_function_row_bound(node: &TableFunction) -> u64 {
+/// A cardinality estimate for a table-valued analysis. Some analyses are bounded
+/// by metadata alone (PATHS by top*depth; a no-breakdown FUNNEL is exactly one
+/// row per step), so they estimate KNOWN; the rest depend on cohort/bucket counts
+/// and breakdown cardinality that only data reveals, so they estimate UNKNOWN
+/// rather than invent a number.
+fn estimate_table_function(node: &TableFunction) -> CardinalityEstimate {
     match &node.call {
-        AnalysisCall::Paths(spec) => u64::from(spec.top).saturating_mul(u64::from(spec.depth)),
+        AnalysisCall::Paths(spec) => CardinalityEstimate::known(
+            u64::from(spec.top).saturating_mul(u64::from(spec.depth)),
+            vec!["table_function_output_bound".to_string()],
+        ),
+        AnalysisCall::Funnel(spec) if spec.breakdown.is_none() => CardinalityEstimate::known(
+            spec.steps.len() as u64,
+            vec!["table_function_output_bound".to_string()],
+        ),
+        AnalysisCall::Funnel(_) | AnalysisCall::Retention(_) | AnalysisCall::Segment(_) => {
+            CardinalityEstimate::unknown(vec!["table_function_output_unbounded".to_string()])
+        }
     }
 }
 

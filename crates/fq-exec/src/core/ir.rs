@@ -121,6 +121,9 @@ pub enum Step {
 #[derive(Debug, Clone, Deserialize)]
 pub enum EventAnalysisSpec {
     Paths(fq_common::events::PathsSpec),
+    Funnel(fq_common::events::FunnelSpec),
+    Retention(fq_common::events::RetentionSpec),
+    Segment(fq_common::events::SegmentSpec),
 }
 
 /// A source scan. Either a structured single-table scan that Rust renders to

@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 
-use fq_common::events::PathsSpec;
+use fq_common::events::{FunnelSpec, PathsSpec, RetentionSpec, SegmentSpec};
 use fq_common::DataType;
 
 use crate::expr::{Expr, NullsOrder};
@@ -400,6 +400,9 @@ impl TableFunction {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AnalysisCall {
     Paths(PathsSpec),
+    Funnel(FunnelSpec),
+    Retention(RetentionSpec),
+    Segment(SegmentSpec),
 }
 
 impl AnalysisCall {
@@ -407,6 +410,9 @@ impl AnalysisCall {
     pub fn dataset(&self) -> &str {
         match self {
             AnalysisCall::Paths(spec) => &spec.dataset,
+            AnalysisCall::Funnel(spec) => &spec.dataset,
+            AnalysisCall::Retention(spec) => &spec.dataset,
+            AnalysisCall::Segment(spec) => &spec.dataset,
         }
     }
 
@@ -415,14 +421,21 @@ impl AnalysisCall {
     pub fn function_name(&self) -> &'static str {
         match self {
             AnalysisCall::Paths(_) => "paths",
+            AnalysisCall::Funnel(_) => "funnel",
+            AnalysisCall::Retention(_) => "retention",
+            AnalysisCall::Segment(_) => "segment",
         }
     }
 
-    /// The fixed `(name, type)` output columns of this analysis kind, before any
-    /// user column-alias rename.
+    /// The `(name, type)` output columns of this analysis kind, before any user
+    /// column-alias rename. The schema can depend on the spec (a `BREAKDOWN`
+    /// column, the segment measure's value type), so the spec is threaded in.
     pub fn output_columns(&self) -> Vec<(&'static str, DataType)> {
         match self {
             AnalysisCall::Paths(_) => fq_common::events::paths_output_columns(),
+            AnalysisCall::Funnel(spec) => fq_common::events::funnel_output_columns(spec),
+            AnalysisCall::Retention(spec) => fq_common::events::retention_output_columns(spec),
+            AnalysisCall::Segment(spec) => fq_common::events::segment_output_columns(spec),
         }
     }
 }

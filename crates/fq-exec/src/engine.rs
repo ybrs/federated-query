@@ -592,16 +592,41 @@ fn observable_binding(step: &Step) -> Option<&String> {
 /// silently empty.
 fn run_event_analysis(analysis: &EventAnalysisSpec) -> ExecResult<Batches> {
     let (store, config) = connectors::event_store(connectors::current_session())?;
-    match analysis {
+    let dataset = store
+        .dataset(analysis_dataset(analysis))
+        .map_err(|error| ExecError::runtime(error.to_string()))?;
+    let to_exec = |error: fq_events::error::EventError| ExecError::runtime(error.to_string());
+    let (schema, batches) = match analysis {
         EventAnalysisSpec::Paths(spec) => {
-            let dataset = store
-                .dataset(&spec.dataset)
-                .map_err(|error| ExecError::runtime(error.to_string()))?;
-            let result = fq_events::run_paths(store.io(), &dataset, spec, &config)
-                .map_err(|error| ExecError::runtime(error.to_string()))?;
-            let (schema, batches) = fq_events::paths_to_batches(&result);
-            Ok(Batches { schema, batches })
+            let result = fq_events::run_paths(store.io(), &dataset, spec, &config).map_err(to_exec)?;
+            fq_events::paths_to_batches(&result)
         }
+        EventAnalysisSpec::Funnel(spec) => {
+            let result =
+                fq_events::run_funnel(store.io(), &dataset, spec, &config).map_err(to_exec)?;
+            fq_events::funnel_to_batches(&result)
+        }
+        EventAnalysisSpec::Retention(spec) => {
+            let result =
+                fq_events::run_retention(store.io(), &dataset, spec, &config).map_err(to_exec)?;
+            fq_events::retention_to_batches(&result)
+        }
+        EventAnalysisSpec::Segment(spec) => {
+            let result =
+                fq_events::run_segment(store.io(), &dataset, spec, &config).map_err(to_exec)?;
+            fq_events::segment_to_batches(&result)
+        }
+    };
+    Ok(Batches { schema, batches })
+}
+
+/// The dataset name an analysis reads.
+fn analysis_dataset(analysis: &EventAnalysisSpec) -> &str {
+    match analysis {
+        EventAnalysisSpec::Paths(spec) => &spec.dataset,
+        EventAnalysisSpec::Funnel(spec) => &spec.dataset,
+        EventAnalysisSpec::Retention(spec) => &spec.dataset,
+        EventAnalysisSpec::Segment(spec) => &spec.dataset,
     }
 }
 

@@ -276,3 +276,78 @@ fn paths_table_function_runs_and_aggregates() {
     let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
     assert_eq!(total_rows, 2);
 }
+
+#[test]
+fn funnel_retention_segment_table_functions_run() {
+    let dir = sandbox("analyticstvf");
+    let file = dir.join("ev.parquet");
+    let day = 86_400_000_000_i64;
+    let hour = 3_600_000_000_i64;
+    write_events(
+        &file,
+        vec![day, day + hour, day, 2 * day, 4 * day],
+        vec!["view", "buy", "view", "view", "buy"],
+        vec!["u1", "u1", "u2", "u3", "u3"],
+    );
+    let runtime = Runtime::from_config(&event_config(&dir, "evx", &file)).expect("from_config");
+    runtime
+        .execute(
+            "CREATE EVENT DATASET web FROM evx.main.evx \
+             ACTOR user_id TIME created_at EVENT event \
+             WITH (refresh_key = 'created_at')",
+        )
+        .expect("create event dataset");
+
+    // funnel(): two ordered steps, view -> buy within the window.
+    let (schema, batches) = runtime
+        .execute(
+            "SELECT step_name, entered FROM funnel('web', 'view', 'buy', window => '30 days') \
+             ORDER BY step_index",
+        )
+        .expect("funnel table function");
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(names, vec!["step_name", "entered"]);
+    let steps = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("step names are Utf8");
+    let step_names: Vec<&str> = (0..steps.len()).map(|row| steps.value(row)).collect();
+    assert_eq!(step_names, vec!["view", "buy"]);
+
+    // Outer aggregation over the funnel output: 3 entered view + 2 reached buy.
+    let (_, batches) = runtime
+        .execute("SELECT sum(entered) AS total FROM funnel('web', 'view', 'buy', window => '30 days')")
+        .expect("sum over funnel");
+    let total = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("sum is Int64");
+    assert_eq!(total.value(0), 5);
+
+    // segment(): count events per day bucket -> three distinct days.
+    let (_, batches) = runtime
+        .execute("SELECT count(*) AS n FROM segment('web', measure => 'count', bucket => 'day')")
+        .expect("segment table function");
+    let n = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count is Int64");
+    assert_eq!(n.value(0), 3);
+
+    // retention(): runs end to end and returns at least one cohort row.
+    let (_, batches) = runtime
+        .execute(
+            "SELECT count(*) AS n FROM retention('web', birth => 'view', return => 'buy', \
+             period => 'day', periods => 7)",
+        )
+        .expect("retention table function");
+    let n = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count is Int64");
+    assert!(n.value(0) >= 1, "retention returned no rows");
+}

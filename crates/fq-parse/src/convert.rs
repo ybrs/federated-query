@@ -17,7 +17,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use fq_catalog::Catalog;
-use fq_common::events::{PathAnchor, PathsSpec, TimeRange};
+use fq_common::events::{
+    BucketGrain, EventMatch, FunnelMode, FunnelSpec, PathAnchor, PathsSpec, PeriodGrain,
+    RetentionMode, RetentionSpec, SegmentMeasure, SegmentSpec, TimeRange,
+};
 use fq_plan::expr::{LiteralValue, NullsOrder};
 use fq_plan::{
     Aggregate, AnalysisCall, BinaryOpType, ColumnRef, Cte, CteRef, Expr, Filter, Join, JoinType,
@@ -1562,8 +1565,339 @@ fn table_function(
 fn build_analysis_call(function: &Function) -> Result<AnalysisCall, ParseError> {
     match function.name.to_ascii_lowercase().as_str() {
         "paths" => Ok(AnalysisCall::Paths(build_paths_spec(&function.args)?)),
+        "funnel" => Ok(AnalysisCall::Funnel(build_funnel_spec(&function.args)?)),
+        "retention" => Ok(AnalysisCall::Retention(build_retention_spec(&function.args)?)),
+        "segment" => Ok(AnalysisCall::Segment(build_segment_spec(&function.args)?)),
         other => Err(ParseError::Unsupported(format!(
             "table function {other}(...) in FROM"
+        ))),
+    }
+}
+
+/// The error for an analysis option that only the statement form carries (a time
+/// range or a property filter), stated as current behavior.
+fn deferred_analysis_option(func: &str, option: &str) -> ParseError {
+    ParseError::Unsupported(format!(
+        "{func}() option '{option}' is not a table-function argument; the {} statement carries a \
+         time range and a property filter",
+        func.to_ascii_uppercase()
+    ))
+}
+
+/// Map `funnel('<ds>', '<step1>', '<step2>'[, ...], window => '<interval>'
+/// [, mode => 'strict'|'any'][, breakdown => '<prop>'])` onto a `FunnelSpec`.
+/// The dataset is positional[0] and the ordered steps are the remaining
+/// positionals (at least two); window is a required named interval. Defaults
+/// match the statement (strict order). from / to / where raise.
+fn build_funnel_spec(args: &[Expression]) -> Result<FunnelSpec, ParseError> {
+    let mut dataset: Option<String> = None;
+    let mut steps: Vec<String> = Vec::new();
+    let mut window_micros: Option<i64> = None;
+    let mut mode = FunnelMode::StrictOrder;
+    let mut breakdown: Option<String> = None;
+    for (index, arg) in args.iter().enumerate() {
+        match arg {
+            Expression::NamedArgument(named) => match named.name.name.to_ascii_lowercase().as_str()
+            {
+                "window" => {
+                    window_micros = Some(interval_micros_arg(&named.value, "funnel() window")?);
+                }
+                "mode" => mode = funnel_mode_arg(&named.value)?,
+                "breakdown" => {
+                    breakdown = Some(string_arg(&named.value, "funnel() breakdown")?);
+                }
+                name @ ("from" | "to" | "where" | "filter") => {
+                    return Err(deferred_analysis_option("funnel", name));
+                }
+                other => {
+                    return Err(ParseError::Parse(format!("unknown funnel() option '{other}'")));
+                }
+            },
+            positional if index == 0 => {
+                dataset = Some(string_arg(positional, "funnel() dataset")?);
+            }
+            positional => steps.push(string_arg(positional, "funnel() step")?),
+        }
+    }
+    let dataset = dataset.ok_or_else(|| {
+        ParseError::Parse(
+            "funnel() requires the dataset as its first argument, e.g. \
+             funnel('web', 'view', 'buy', window => '7 days')"
+                .to_string(),
+        )
+    })?;
+    if steps.len() < 2 {
+        return Err(ParseError::Parse(
+            "funnel() needs at least two step events, e.g. \
+             funnel('web', 'view', 'buy', window => '7 days')"
+                .to_string(),
+        ));
+    }
+    let window_micros = window_micros.ok_or_else(|| {
+        ParseError::Parse("funnel() requires a window, e.g. window => '7 days'".to_string())
+    })?;
+    Ok(FunnelSpec {
+        dataset,
+        steps,
+        window_micros,
+        mode,
+        range: TimeRange {
+            from: None,
+            to: None,
+        },
+        filter: None,
+        breakdown,
+    })
+}
+
+/// Map `retention('<ds>', birth => '<event>'|'any', return => '<event>'|'any',
+/// period => 'day'|'week'|'month'[, mode => 'bounded'|'unbounded']
+/// [, periods => <n>][, at => <n>][, breakdown => '<prop>'])` onto a
+/// `RetentionSpec`. birth/return/period are required named args. from / to /
+/// where raise.
+fn build_retention_spec(args: &[Expression]) -> Result<RetentionSpec, ParseError> {
+    let mut dataset: Option<String> = None;
+    let mut birth: Option<EventMatch> = None;
+    let mut return_event: Option<EventMatch> = None;
+    let mut period: Option<PeriodGrain> = None;
+    let mut mode = RetentionMode::Bounded;
+    let mut periods: Option<u32> = None;
+    let mut at: Option<u32> = None;
+    let mut breakdown: Option<String> = None;
+    for (index, arg) in args.iter().enumerate() {
+        match arg {
+            Expression::NamedArgument(named) => match named.name.name.to_ascii_lowercase().as_str()
+            {
+                "birth" => birth = Some(event_match_arg(&named.value, "retention() birth")?),
+                "return" => {
+                    return_event = Some(event_match_arg(&named.value, "retention() return")?);
+                }
+                "period" => period = Some(period_grain_arg(&named.value)?),
+                "mode" => mode = retention_mode_arg(&named.value)?,
+                "periods" => periods = Some(count_arg(&named.value, "retention() periods")?),
+                "at" => at = Some(count_arg(&named.value, "retention() at")?),
+                "breakdown" => {
+                    breakdown = Some(string_arg(&named.value, "retention() breakdown")?);
+                }
+                name @ ("from" | "to" | "where" | "filter") => {
+                    return Err(deferred_analysis_option("retention", name));
+                }
+                other => {
+                    return Err(ParseError::Parse(format!(
+                        "unknown retention() option '{other}'"
+                    )));
+                }
+            },
+            positional if index == 0 => {
+                dataset = Some(string_arg(positional, "retention() dataset")?);
+            }
+            _ => {
+                return Err(ParseError::Unsupported(
+                    "retention() takes only the dataset positionally; pass options by name"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    let dataset = dataset.ok_or_else(|| {
+        ParseError::Parse("retention() requires the dataset as its first argument".to_string())
+    })?;
+    let birth =
+        birth.ok_or_else(|| ParseError::Parse("retention() requires birth => '<event>'".into()))?;
+    let return_event = return_event
+        .ok_or_else(|| ParseError::Parse("retention() requires return => '<event>'".into()))?;
+    let period = period.ok_or_else(|| {
+        ParseError::Parse("retention() requires period => 'day' | 'week' | 'month'".into())
+    })?;
+    Ok(RetentionSpec {
+        dataset,
+        birth,
+        return_event,
+        period,
+        mode,
+        periods,
+        at,
+        range: TimeRange {
+            from: None,
+            to: None,
+        },
+        filter: None,
+        breakdown,
+    })
+}
+
+/// Map `segment('<ds>', measure => 'count'|'uniques'|'count_per_unique',
+/// bucket => 'hour'|'day'|'week'|'month'[, event => '<name>']
+/// [, breakdown => '<prop>'])` onto a `SegmentSpec`. measure and bucket are
+/// required. from / to / where raise.
+fn build_segment_spec(args: &[Expression]) -> Result<SegmentSpec, ParseError> {
+    let mut dataset: Option<String> = None;
+    let mut measure: Option<SegmentMeasure> = None;
+    let mut event: Option<String> = None;
+    let mut bucket: Option<BucketGrain> = None;
+    let mut breakdown: Option<String> = None;
+    for (index, arg) in args.iter().enumerate() {
+        match arg {
+            Expression::NamedArgument(named) => match named.name.name.to_ascii_lowercase().as_str()
+            {
+                "measure" => measure = Some(segment_measure_arg(&named.value)?),
+                "bucket" => bucket = Some(bucket_grain_arg(&named.value)?),
+                "event" => event = Some(string_arg(&named.value, "segment() event")?),
+                "breakdown" => {
+                    breakdown = Some(string_arg(&named.value, "segment() breakdown")?);
+                }
+                name @ ("from" | "to" | "where" | "filter") => {
+                    return Err(deferred_analysis_option("segment", name));
+                }
+                other => {
+                    return Err(ParseError::Parse(format!("unknown segment() option '{other}'")));
+                }
+            },
+            positional if index == 0 => {
+                dataset = Some(string_arg(positional, "segment() dataset")?);
+            }
+            _ => {
+                return Err(ParseError::Unsupported(
+                    "segment() takes only the dataset positionally; pass options by name"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    let dataset = dataset.ok_or_else(|| {
+        ParseError::Parse("segment() requires the dataset as its first argument".to_string())
+    })?;
+    let measure = measure.ok_or_else(|| {
+        ParseError::Parse(
+            "segment() requires measure => 'count' | 'uniques' | 'count_per_unique'".into(),
+        )
+    })?;
+    let bucket = bucket.ok_or_else(|| {
+        ParseError::Parse("segment() requires bucket => 'hour' | 'day' | 'week' | 'month'".into())
+    })?;
+    Ok(SegmentSpec {
+        dataset,
+        measure,
+        event,
+        bucket,
+        range: TimeRange {
+            from: None,
+            to: None,
+        },
+        filter: None,
+        breakdown,
+    })
+}
+
+/// Read a string interval argument (`'7 days'`) as microseconds. Mirrors the
+/// statement grammar's interval units (minute/hour/day/week).
+fn interval_micros_arg(expr: &Expression, what: &str) -> Result<i64, ParseError> {
+    let text = string_arg(expr, what)?;
+    let mut parts = text.split_whitespace();
+    let count = parts
+        .next()
+        .and_then(|number| number.parse::<i64>().ok())
+        .filter(|count| *count > 0)
+        .ok_or_else(|| {
+            ParseError::Parse(format!(
+                "{what} must be a positive interval like '7 days', found '{text}'"
+            ))
+        })?;
+    let unit = parts.next().unwrap_or("").to_ascii_uppercase();
+    let unit_micros = match unit.as_str() {
+        "MINUTE" | "MINUTES" => 60_000_000_i64,
+        "HOUR" | "HOURS" => 3_600_000_000_i64,
+        "DAY" | "DAYS" => 86_400_000_000_i64,
+        "WEEK" | "WEEKS" => 604_800_000_000_i64,
+        other => {
+            return Err(ParseError::Parse(format!(
+                "{what}: interval unit '{other}' is not supported; use minute, hour, day, or week"
+            )))
+        }
+    };
+    count
+        .checked_mul(unit_micros)
+        .ok_or_else(|| ParseError::Parse(format!("{what} interval overflows microseconds")))
+}
+
+/// Read a funnel mode string argument.
+fn funnel_mode_arg(expr: &Expression) -> Result<FunnelMode, ParseError> {
+    match string_arg(expr, "funnel() mode")?.to_ascii_lowercase().as_str() {
+        "strict" | "strict_order" => Ok(FunnelMode::StrictOrder),
+        "any" | "any_order" => Ok(FunnelMode::AnyOrder),
+        other => Err(ParseError::Parse(format!(
+            "funnel() mode must be 'strict' or 'any', found '{other}'"
+        ))),
+    }
+}
+
+/// Read a retention birth/return event argument: the literal `'any'` matches any
+/// event (the statement's `ANY EVENT`); any other string names one event.
+fn event_match_arg(expr: &Expression, what: &str) -> Result<EventMatch, ParseError> {
+    let text = string_arg(expr, what)?;
+    if text.eq_ignore_ascii_case("any") {
+        Ok(EventMatch::Any)
+    } else {
+        Ok(EventMatch::Named(text))
+    }
+}
+
+/// Read a retention period grain string argument.
+fn period_grain_arg(expr: &Expression) -> Result<PeriodGrain, ParseError> {
+    match string_arg(expr, "retention() period")?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "day" => Ok(PeriodGrain::Day),
+        "week" => Ok(PeriodGrain::Week),
+        "month" => Ok(PeriodGrain::Month),
+        other => Err(ParseError::Parse(format!(
+            "retention() period must be 'day', 'week', or 'month', found '{other}'"
+        ))),
+    }
+}
+
+/// Read a retention mode string argument.
+fn retention_mode_arg(expr: &Expression) -> Result<RetentionMode, ParseError> {
+    match string_arg(expr, "retention() mode")?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "bounded" => Ok(RetentionMode::Bounded),
+        "unbounded" => Ok(RetentionMode::Unbounded),
+        other => Err(ParseError::Parse(format!(
+            "retention() mode must be 'bounded' or 'unbounded', found '{other}'"
+        ))),
+    }
+}
+
+/// Read a segment measure string argument.
+fn segment_measure_arg(expr: &Expression) -> Result<SegmentMeasure, ParseError> {
+    match string_arg(expr, "segment() measure")?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "count" => Ok(SegmentMeasure::Count),
+        "uniques" => Ok(SegmentMeasure::Uniques),
+        "count_per_unique" => Ok(SegmentMeasure::CountPerUnique),
+        other => Err(ParseError::Parse(format!(
+            "segment() measure must be 'count', 'uniques', or 'count_per_unique', found '{other}'"
+        ))),
+    }
+}
+
+/// Read a segment bucket grain string argument.
+fn bucket_grain_arg(expr: &Expression) -> Result<BucketGrain, ParseError> {
+    match string_arg(expr, "segment() bucket")?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "hour" => Ok(BucketGrain::Hour),
+        "day" => Ok(BucketGrain::Day),
+        "week" => Ok(BucketGrain::Week),
+        "month" => Ok(BucketGrain::Month),
+        other => Err(ParseError::Parse(format!(
+            "segment() bucket must be 'hour', 'day', 'week', or 'month', found '{other}'"
         ))),
     }
 }

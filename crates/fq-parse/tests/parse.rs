@@ -1991,9 +1991,35 @@ fn table_function_of(plan: &LogicalPlan) -> &fq_plan::TableFunction {
     node
 }
 
-/// The PATHS spec of a table-function leaf (the enum has a single variant today).
+/// The PATHS spec of a table-function leaf.
 fn paths_spec(node: &fq_plan::TableFunction) -> &fq_common::events::PathsSpec {
-    let fq_plan::AnalysisCall::Paths(spec) = &node.call;
+    let fq_plan::AnalysisCall::Paths(spec) = &node.call else {
+        panic!("expected a PATHS call, got {:?}", node.call);
+    };
+    spec
+}
+
+/// The FUNNEL spec of a table-function leaf.
+fn funnel_spec(node: &fq_plan::TableFunction) -> &fq_common::events::FunnelSpec {
+    let fq_plan::AnalysisCall::Funnel(spec) = &node.call else {
+        panic!("expected a FUNNEL call, got {:?}", node.call);
+    };
+    spec
+}
+
+/// The RETENTION spec of a table-function leaf.
+fn retention_spec(node: &fq_plan::TableFunction) -> &fq_common::events::RetentionSpec {
+    let fq_plan::AnalysisCall::Retention(spec) = &node.call else {
+        panic!("expected a RETENTION call, got {:?}", node.call);
+    };
+    spec
+}
+
+/// The SEGMENT spec of a table-function leaf.
+fn segment_spec(node: &fq_plan::TableFunction) -> &fq_common::events::SegmentSpec {
+    let fq_plan::AnalysisCall::Segment(spec) = &node.call else {
+        panic!("expected a SEGMENT call, got {:?}", node.call);
+    };
     spec
 }
 
@@ -2083,4 +2109,123 @@ fn paths_table_function_column_alias_count_mismatch_raises() {
 fn unknown_table_function_raises() {
     let error = parse("SELECT x FROM totally_made_up('web')").unwrap_err();
     assert!(matches!(error, ParseError::Unsupported(_)), "got {error:?}");
+}
+
+#[test]
+fn funnel_table_function_maps_steps_and_options() {
+    let plan = parse(
+        "SELECT step_name FROM funnel('web', 'view', 'buy', window => '7 days', \
+         mode => 'any', breakdown => 'device')",
+    )
+    .unwrap();
+    let node = table_function_of(&plan);
+    assert_eq!(node.alias, "funnel");
+    // Breakdown funnel: the leading breakdown column is part of the schema.
+    assert_eq!(
+        node.output_names,
+        vec![
+            "breakdown",
+            "step_index",
+            "step_name",
+            "entered",
+            "conversion_from_previous",
+            "conversion_from_start",
+            "median_seconds_from_previous",
+            "p90_seconds_from_previous",
+        ]
+    );
+    let spec = funnel_spec(node);
+    assert_eq!(spec.dataset, "web");
+    assert_eq!(spec.steps, vec!["view", "buy"]);
+    assert_eq!(spec.window_micros, 7 * 86_400_000_000);
+    assert!(matches!(spec.mode, fq_common::events::FunnelMode::AnyOrder));
+    assert_eq!(spec.breakdown.as_deref(), Some("device"));
+}
+
+#[test]
+fn funnel_table_function_defaults_and_no_breakdown_schema() {
+    let plan = parse("SELECT step_name FROM funnel('web', 'a', 'b', window => '1 hour')").unwrap();
+    let node = table_function_of(&plan);
+    // No breakdown: schema starts at step_index.
+    assert_eq!(node.output_names[0], "step_index");
+    let spec = funnel_spec(node);
+    assert!(matches!(spec.mode, fq_common::events::FunnelMode::StrictOrder));
+    assert_eq!(spec.window_micros, 3_600_000_000);
+    assert!(spec.breakdown.is_none());
+}
+
+#[test]
+fn funnel_table_function_requires_window_and_two_steps() {
+    assert!(matches!(
+        parse("SELECT step_name FROM funnel('web', 'a', 'b')").unwrap_err(),
+        ParseError::Parse(_)
+    ));
+    assert!(matches!(
+        parse("SELECT step_name FROM funnel('web', 'a', window => '1 day')").unwrap_err(),
+        ParseError::Parse(_)
+    ));
+}
+
+#[test]
+fn funnel_table_function_unknown_option_raises() {
+    // An unrecognized option raises loudly rather than being silently dropped.
+    let error =
+        parse("SELECT step_name FROM funnel('web', 'a', 'b', window => '1 day', bogus => 1)")
+            .unwrap_err();
+    assert!(matches!(error, ParseError::Parse(_)), "got {error:?}");
+}
+
+#[test]
+fn retention_table_function_maps_options() {
+    let plan = parse(
+        "SELECT retained FROM retention('web', birth => 'signup', return => 'any', \
+         period => 'week', mode => 'unbounded', periods => 8, at => 3)",
+    )
+    .unwrap();
+    let spec = retention_spec(table_function_of(&plan));
+    assert_eq!(spec.dataset, "web");
+    assert!(matches!(&spec.birth, fq_common::events::EventMatch::Named(n) if n == "signup"));
+    assert!(matches!(spec.return_event, fq_common::events::EventMatch::Any));
+    assert!(matches!(spec.period, fq_common::events::PeriodGrain::Week));
+    assert!(matches!(spec.mode, fq_common::events::RetentionMode::Unbounded));
+    assert_eq!(spec.periods, Some(8));
+    assert_eq!(spec.at, Some(3));
+}
+
+#[test]
+fn retention_table_function_requires_core_args() {
+    let error = parse("SELECT retained FROM retention('web', birth => 'signup')").unwrap_err();
+    assert!(matches!(error, ParseError::Parse(_)), "got {error:?}");
+}
+
+#[test]
+fn segment_table_function_maps_options_and_value_type() {
+    let plan = parse(
+        "SELECT bucket, value FROM segment('web', measure => 'count_per_unique', \
+         bucket => 'day', event => 'click', breakdown => 'country')",
+    )
+    .unwrap();
+    let node = table_function_of(&plan);
+    // With a breakdown: bucket, breakdown, value.
+    assert_eq!(node.output_names, vec!["bucket", "breakdown", "value"]);
+    let spec = segment_spec(node);
+    assert!(matches!(
+        spec.measure,
+        fq_common::events::SegmentMeasure::CountPerUnique
+    ));
+    assert!(matches!(spec.bucket, fq_common::events::BucketGrain::Day));
+    assert_eq!(spec.event.as_deref(), Some("click"));
+    assert_eq!(spec.breakdown.as_deref(), Some("country"));
+}
+
+#[test]
+fn segment_table_function_requires_measure_and_bucket() {
+    assert!(matches!(
+        parse("SELECT value FROM segment('web', bucket => 'day')").unwrap_err(),
+        ParseError::Parse(_)
+    ));
+    assert!(matches!(
+        parse("SELECT value FROM segment('web', measure => 'count')").unwrap_err(),
+        ParseError::Parse(_)
+    ));
 }

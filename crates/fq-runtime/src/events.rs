@@ -6,16 +6,12 @@
 
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{
-    Float64Array, Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
-};
-use arrow::datatypes::{
-    DataType as ArrowDataType, Field, Schema, SchemaRef, TimeUnit as ArrowTimeUnit,
-};
+use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
 
 use fq_accel::{scan_watermark, Watermark, WatermarkScan};
 use fq_common::events::{
-    EventDatasetDef, EventSource, FunnelSpec, PathsSpec, RetentionSpec, SegmentMeasure, SegmentSpec,
+    EventDatasetDef, EventSource, FunnelSpec, PathsSpec, RetentionSpec, SegmentSpec,
 };
 use fq_common::DataType;
 use fq_events::build::BatchSource;
@@ -470,7 +466,8 @@ impl Runtime {
         let dataset = store.dataset(&spec.dataset)?;
         let config = self.config_snapshot();
         let result = fq_events::run_funnel(store.io(), &dataset, spec, &config.events)?;
-        funnel_to_arrow(&result)
+        // Shared encoder with the `funnel(...)` table function (fq-events).
+        Ok(fq_events::funnel_to_batches(&result))
     }
 
     /// `RETENTION ON <dataset>`.
@@ -482,7 +479,8 @@ impl Runtime {
         let dataset = store.dataset(&spec.dataset)?;
         let config = self.config_snapshot();
         let result = fq_events::run_retention(store.io(), &dataset, spec, &config.events)?;
-        retention_to_arrow(&result)
+        // Shared encoder with the `retention(...)` table function (fq-events).
+        Ok(fq_events::retention_to_batches(&result))
     }
 
     /// `SEGMENT ... ON <dataset>`.
@@ -494,7 +492,8 @@ impl Runtime {
         let dataset = store.dataset(&spec.dataset)?;
         let config = self.config_snapshot();
         let result = fq_events::run_segment(store.io(), &dataset, spec, &config.events)?;
-        segment_to_arrow(&result)
+        // Shared encoder with the `segment(...)` table function (fq-events).
+        Ok(fq_events::segment_to_batches(&result))
     }
 
     /// `PATHS ON <dataset>`.
@@ -689,11 +688,6 @@ impl BatchSource for ReplaySource {
 // Result relation mapping
 // ---------------------------------------------------------------------------
 
-/// The microsecond-timestamp Arrow type of bucket/cohort labels.
-fn micros_type() -> ArrowDataType {
-    ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, None)
-}
-
 /// The `SHOW EVENT DATASETS` Arrow schema.
 fn show_event_datasets_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -728,275 +722,34 @@ pub(crate) fn show_event_datasets_columns() -> Vec<(String, DataType)> {
     ]
 }
 
-/// Map a funnel result onto Arrow (breakdown column only when the clause is).
-fn funnel_to_arrow(
-    result: &fq_events::FunnelResult,
-) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-    let mut fields = Vec::new();
-    if result.has_breakdown {
-        fields.push(Field::new("breakdown", ArrowDataType::Utf8, true));
-    }
-    fields.extend([
-        Field::new("step_index", ArrowDataType::Int32, false),
-        Field::new("step_name", ArrowDataType::Utf8, false),
-        Field::new("entered", ArrowDataType::Int64, false),
-        Field::new("conversion_from_previous", ArrowDataType::Float64, false),
-        Field::new("conversion_from_start", ArrowDataType::Float64, false),
-        Field::new("median_seconds_from_previous", ArrowDataType::Float64, true),
-        Field::new("p90_seconds_from_previous", ArrowDataType::Float64, true),
-    ]);
-    let schema = Arc::new(Schema::new(fields));
-    let mut columns: Vec<Arc<dyn arrow::array::Array>> = Vec::new();
-    if result.has_breakdown {
-        let breakdowns: Vec<Option<String>> = result
-            .rows
-            .iter()
-            .map(|row| row.breakdown.clone())
-            .collect();
-        columns.push(Arc::new(StringArray::from(breakdowns)));
-    }
-    columns.push(Arc::new(Int32Array::from(
-        result
-            .rows
-            .iter()
-            .map(|row| i32::try_from(row.step_index).expect("step fits i32"))
-            .collect::<Vec<_>>(),
-    )));
-    columns.push(Arc::new(StringArray::from(
-        result
-            .rows
-            .iter()
-            .map(|row| row.step_name.clone())
-            .collect::<Vec<_>>(),
-    )));
-    columns.push(Arc::new(Int64Array::from(
-        result
-            .rows
-            .iter()
-            .map(|row| i64::try_from(row.entered).expect("count fits i64"))
-            .collect::<Vec<_>>(),
-    )));
-    columns.push(Arc::new(Float64Array::from(
-        result
-            .rows
-            .iter()
-            .map(|row| row.conversion_from_previous)
-            .collect::<Vec<_>>(),
-    )));
-    columns.push(Arc::new(Float64Array::from(
-        result
-            .rows
-            .iter()
-            .map(|row| row.conversion_from_start)
-            .collect::<Vec<_>>(),
-    )));
-    columns.push(Arc::new(Float64Array::from(
-        result
-            .rows
-            .iter()
-            .map(|row| row.median_seconds_from_previous)
-            .collect::<Vec<_>>(),
-    )));
-    columns.push(Arc::new(Float64Array::from(
-        result
-            .rows
-            .iter()
-            .map(|row| row.p90_seconds_from_previous)
-            .collect::<Vec<_>>(),
-    )));
-    let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
-        .map_err(|error| RuntimeError::ResultShape(error.to_string()))?;
-    Ok((schema, vec![batch]))
-}
-
 /// The funnel describe columns for a spec.
 pub(crate) fn funnel_describe_columns(spec: &FunnelSpec) -> Vec<(String, DataType)> {
-    let mut columns = Vec::new();
-    if spec.breakdown.is_some() {
-        columns.push(("breakdown".to_owned(), DataType::Varchar));
-    }
-    columns.extend([
-        ("step_index".to_owned(), DataType::Integer),
-        ("step_name".to_owned(), DataType::Varchar),
-        ("entered".to_owned(), DataType::BigInt),
-        ("conversion_from_previous".to_owned(), DataType::Double),
-        ("conversion_from_start".to_owned(), DataType::Double),
-        ("median_seconds_from_previous".to_owned(), DataType::Double),
-        ("p90_seconds_from_previous".to_owned(), DataType::Double),
-    ]);
-    columns
-}
-
-/// Map a retention result onto Arrow.
-fn retention_to_arrow(
-    result: &fq_events::RetentionResult,
-) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-    let mut fields = Vec::new();
-    if result.has_breakdown {
-        fields.push(Field::new("breakdown", ArrowDataType::Utf8, true));
-    }
-    fields.extend([
-        Field::new("cohort_start", micros_type(), false),
-        Field::new("cohort_size", ArrowDataType::Int64, false),
-        Field::new("period_offset", ArrowDataType::Int32, false),
-        Field::new("retained", ArrowDataType::Int64, false),
-        Field::new("retention_rate", ArrowDataType::Float64, true),
-    ]);
-    let schema = Arc::new(Schema::new(fields));
-    let mut columns: Vec<Arc<dyn arrow::array::Array>> = Vec::new();
-    if result.has_breakdown {
-        let breakdowns: Vec<Option<String>> = result
-            .rows
-            .iter()
-            .map(|row| row.breakdown.clone())
-            .collect();
-        columns.push(Arc::new(StringArray::from(breakdowns)));
-    }
-    columns.push(Arc::new(TimestampMicrosecondArray::from(
-        result
-            .rows
-            .iter()
-            .map(|row| row.cohort_start)
-            .collect::<Vec<_>>(),
-    )));
-    columns.push(Arc::new(Int64Array::from(
-        result
-            .rows
-            .iter()
-            .map(|row| i64::try_from(row.cohort_size).expect("size fits i64"))
-            .collect::<Vec<_>>(),
-    )));
-    columns.push(Arc::new(Int32Array::from(
-        result
-            .rows
-            .iter()
-            .map(|row| i32::try_from(row.period_offset).expect("offset fits i32"))
-            .collect::<Vec<_>>(),
-    )));
-    columns.push(Arc::new(Int64Array::from(
-        result
-            .rows
-            .iter()
-            .map(|row| i64::try_from(row.retained).expect("count fits i64"))
-            .collect::<Vec<_>>(),
-    )));
-    columns.push(Arc::new(Float64Array::from(
-        result
-            .rows
-            .iter()
-            .map(|row| row.retention_rate)
-            .collect::<Vec<_>>(),
-    )));
-    let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
-        .map_err(|error| RuntimeError::ResultShape(error.to_string()))?;
-    Ok((schema, vec![batch]))
+    owned_columns(fq_common::events::funnel_output_columns(spec))
 }
 
 /// The retention describe columns for a spec.
 pub(crate) fn retention_describe_columns(spec: &RetentionSpec) -> Vec<(String, DataType)> {
-    let mut columns = Vec::new();
-    if spec.breakdown.is_some() {
-        columns.push(("breakdown".to_owned(), DataType::Varchar));
-    }
-    columns.extend([
-        ("cohort_start".to_owned(), DataType::Timestamp),
-        ("cohort_size".to_owned(), DataType::BigInt),
-        ("period_offset".to_owned(), DataType::Integer),
-        ("retained".to_owned(), DataType::BigInt),
-        ("retention_rate".to_owned(), DataType::Double),
-    ]);
-    columns
-}
-
-/// Map a segmentation result onto Arrow: `value` is BIGINT for COUNT /
-/// UNIQUES and DOUBLE for COUNT_PER_UNIQUE (NULL when uniques is zero).
-fn segment_to_arrow(
-    result: &fq_events::SegmentResult,
-) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-    let value_type = match result.measure {
-        SegmentMeasure::Count | SegmentMeasure::Uniques => ArrowDataType::Int64,
-        SegmentMeasure::CountPerUnique => ArrowDataType::Float64,
-    };
-    let mut fields = vec![Field::new("bucket", micros_type(), false)];
-    if result.has_breakdown {
-        fields.push(Field::new("breakdown", ArrowDataType::Utf8, true));
-    }
-    fields.push(Field::new(
-        "value",
-        value_type,
-        result.measure == SegmentMeasure::CountPerUnique,
-    ));
-    let schema = Arc::new(Schema::new(fields));
-    let mut columns: Vec<Arc<dyn arrow::array::Array>> =
-        vec![Arc::new(TimestampMicrosecondArray::from(
-            result.rows.iter().map(|row| row.bucket).collect::<Vec<_>>(),
-        ))];
-    if result.has_breakdown {
-        let breakdowns: Vec<Option<String>> = result
-            .rows
-            .iter()
-            .map(|row| row.breakdown.clone())
-            .collect();
-        columns.push(Arc::new(StringArray::from(breakdowns)));
-    }
-    match result.measure {
-        SegmentMeasure::Count => columns.push(Arc::new(Int64Array::from(
-            result
-                .rows
-                .iter()
-                .map(|row| i64::try_from(row.count).expect("count fits i64"))
-                .collect::<Vec<_>>(),
-        ))),
-        SegmentMeasure::Uniques => columns.push(Arc::new(Int64Array::from(
-            result
-                .rows
-                .iter()
-                .map(|row| i64::try_from(row.uniques).expect("count fits i64"))
-                .collect::<Vec<_>>(),
-        ))),
-        SegmentMeasure::CountPerUnique => columns.push(Arc::new(Float64Array::from(
-            result
-                .rows
-                .iter()
-                .map(|row| {
-                    if row.uniques == 0 {
-                        None
-                    } else {
-                        Some(row.count as f64 / row.uniques as f64)
-                    }
-                })
-                .collect::<Vec<_>>(),
-        ))),
-    }
-    let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
-        .map_err(|error| RuntimeError::ResultShape(error.to_string()))?;
-    Ok((schema, vec![batch]))
+    owned_columns(fq_common::events::retention_output_columns(spec))
 }
 
 /// The segmentation describe columns for a spec.
 pub(crate) fn segment_describe_columns(spec: &SegmentSpec) -> Vec<(String, DataType)> {
-    let mut columns = vec![("bucket".to_owned(), DataType::Timestamp)];
-    if spec.breakdown.is_some() {
-        columns.push(("breakdown".to_owned(), DataType::Varchar));
-    }
-    columns.push((
-        "value".to_owned(),
-        match spec.measure {
-            SegmentMeasure::Count | SegmentMeasure::Uniques => DataType::BigInt,
-            SegmentMeasure::CountPerUnique => DataType::Double,
-        },
-    ));
-    columns
+    owned_columns(fq_common::events::segment_output_columns(spec))
 }
 
 
 /// The paths describe columns.
 pub(crate) fn paths_describe_columns() -> Vec<(String, DataType)> {
-    vec![
-        ("path_id".to_owned(), DataType::Integer),
-        ("seq".to_owned(), DataType::Integer),
-        ("event".to_owned(), DataType::Varchar),
-        ("occurrences".to_owned(), DataType::BigInt),
-        ("share".to_owned(), DataType::Double),
-    ]
+    owned_columns(fq_common::events::paths_output_columns())
+}
+
+/// Own the `(name, type)` pairs a shared output-columns helper reports, for the
+/// statement describe/schema path (the analyses' bound schema is single-sourced
+/// in `fq_common::events`).
+fn owned_columns(columns: Vec<(&'static str, DataType)>) -> Vec<(String, DataType)> {
+    let mut owned = Vec::with_capacity(columns.len());
+    for (name, data_type) in columns {
+        owned.push((name.to_owned(), data_type));
+    }
+    owned
 }

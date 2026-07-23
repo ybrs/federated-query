@@ -160,6 +160,9 @@ fn convert_step(step: steps::Step) -> ExecResult<ir::Step> {
 fn convert_analysis_call(call: fq_plan::AnalysisCall) -> ir::EventAnalysisSpec {
     match call {
         fq_plan::AnalysisCall::Paths(spec) => ir::EventAnalysisSpec::Paths(spec),
+        fq_plan::AnalysisCall::Funnel(spec) => ir::EventAnalysisSpec::Funnel(spec),
+        fq_plan::AnalysisCall::Retention(spec) => ir::EventAnalysisSpec::Retention(spec),
+        fq_plan::AnalysisCall::Segment(spec) => ir::EventAnalysisSpec::Segment(spec),
     }
 }
 
