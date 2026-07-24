@@ -1,11 +1,17 @@
 """PreToolUse hook: a ticket cannot reach `done` over a red tree.
 
 Fires on the taskq status tools. When the requested status is `done`, it runs
-the whole project gate - `make lint`, `cargo test --workspace`, then the full
-pytest e2e suite - and DENIES the tool call if any of them fails, handing the
-failing output back so the model fixes the tree instead of closing the ticket
-over it. Any other status passes straight through, so `in_progress`/`blocked`/
-`todo` transitions stay instant.
+every check this project has - `make lint`, `cargo clippy --workspace
+--all-targets`, `cargo test --workspace`, then the full pytest e2e suite - and
+DENIES the tool call if any of them fails, handing the failing output back so
+the model fixes the tree instead of closing the ticket over it. Any other
+status passes straight through, so `in_progress`/`blocked`/`todo` transitions
+stay instant.
+
+There is NO override and NO skip. Not an environment variable, not a "nothing
+changed since the last green run" shortcut, not a fast path for a ticket that
+looks trivial. Every done-transition runs the whole harness. The moment a gate
+grows an exception, the exception becomes the path everything takes.
 
 A suite that cannot RUN denies too, naming what was missing. Missing toolchain,
 missing venv, absent libduckdb, a database that is down: each would otherwise
@@ -14,8 +20,7 @@ result. It is checked up front and reported as a failure.
 
 Why this exists: per-file lint feedback only ever sees files the current agent
 edited, so drift in untouched files accumulates invisibly. The ticket boundary
-is the one place a whole-repo check is both cheap enough to afford and late
-enough to be meaningful.
+is where a whole-repo check is late enough to be meaningful.
 
 Exit 0 with a deny decision blocks the call; exit 0 with no output allows it.
 A gate that cannot run its own tools DENIES rather than waving the ticket
@@ -29,10 +34,6 @@ import sys
 
 # Statuses that close work out. Everything else is a cheap transition.
 _GATED_STATUSES = {"done"}
-
-# Set to 1 to close a ticket over a red tree. The skip is reported in the
-# decision output, so it can never be silent.
-_OVERRIDE = "FQ_SKIP_DONE_GATE"
 
 
 def _repo_root():
@@ -152,17 +153,13 @@ def main():
         return 0
     if _requested_status(payload) not in _GATED_STATUSES:
         return 0
-    if os.environ.get(_OVERRIDE) == "1":
-        print(f"{_OVERRIDE}=1: closing this ticket WITHOUT running lint or tests.",
-              file=sys.stderr)
-        return 0
     root = _repo_root()
     env = _cargo_env()
     if env is None:
         return _deny(
-            "Done-gate cannot run: no cargo toolchain found, so lint and tests "
-            "could not be verified. Install the toolchain or set "
-            f"{_OVERRIDE}=1 to close this ticket without the gate."
+            "Done-gate cannot run: no cargo toolchain found, so nothing could be "
+            "verified. Install the toolchain - there is no way to close a ticket "
+            "without the gate."
         )
     blocker = _preconditions(root)
     if blocker:
@@ -174,6 +171,7 @@ def main():
     failures = []
     for label, command in (
         ("Lint", ["make", "lint"]),
+        ("Clippy", ["cargo", "clippy", "--workspace", "--all-targets"]),
         ("Rust tests", ["cargo", "test", "--workspace"]),
         ("e2e suite", [_venv_python(root), "-m", "pytest", "-q", "-p", "no:cacheprovider"]),
     ):

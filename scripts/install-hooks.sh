@@ -4,10 +4,11 @@
 # does exactly that), so a fresh checkout or rebuilt environment is always
 # gated without manual setup.
 #
-# pre-commit runs the FULL gate on EVERY commit, with no file-type filter and
-# no staged-file narrowing: lint, the Rust test suite, the e2e test suite, then
-# the semantic comment gate. A commit that touches only README.md runs exactly
-# the same checks as one that rewrites the optimizer.
+# pre-commit runs EVERY check this project has on EVERY commit, with no
+# file-type filter and no staged-file narrowing: lint, clippy, the Rust test
+# suite, the e2e test suite, then the semantic comment gate. A commit that
+# touches only README.md runs exactly the same checks as one that rewrites the
+# optimizer. There is no fast path and no skip.
 #
 # The rule the hook exists to enforce: a check that cannot RUN is a failure,
 # never a pass. Missing toolchain, missing venv, a database that is not up, a
@@ -29,9 +30,9 @@ cat > "$hook_dir/pre-commit" <<'EOF'
 #!/usr/bin/env bash
 # Installed by scripts/install-hooks.sh (re-run anytime; `make hook-install`).
 #
-# EVERY commit runs: make lint, cargo test --workspace, the full pytest e2e
-# suite, and the semantic comment gate. No file-type filter, no staged-only
-# narrowing, no fast path for a docs-only change.
+# EVERY commit runs: make lint, cargo clippy, cargo test --workspace, the full
+# pytest e2e suite, and the semantic comment gate. No file-type filter, no
+# staged-only narrowing, no fast path for a docs-only change.
 #
 # A check that cannot run BLOCKS. It is never skipped and never assumed clean.
 set -uo pipefail
@@ -97,6 +98,9 @@ fi
 make -C "$root" lint \
     || block "make lint" "Lint violations above. Fix them."
 
+cargo clippy --workspace --all-targets --manifest-path "$root/Cargo.toml" \
+    || block "cargo clippy --workspace --all-targets" "Clippy errors above. Fix them."
+
 cargo test --workspace --manifest-path "$root/Cargo.toml" \
     || block "cargo test --workspace" "Rust test failures above. Fix them."
 
@@ -109,4 +113,4 @@ cargo test --workspace --manifest-path "$root/Cargo.toml" \
 exec "$root/scripts/comment-gate/gate.sh"
 EOF
 chmod +x "$hook_dir/pre-commit"
-echo "install-hooks: pre-commit -> lint + cargo test + pytest e2e + comment gate (no exceptions)"
+echo "install-hooks: pre-commit -> lint + clippy + cargo test + pytest e2e + comment gate (no exceptions)"
