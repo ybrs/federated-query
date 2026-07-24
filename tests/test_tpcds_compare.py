@@ -15,7 +15,7 @@ sys.path.insert(
     os.path.join(os.path.dirname(__file__), "..", "benchmarks", "tpcds"),
 )
 
-from compare import compare_results  # noqa: E402
+from run_federated_rust import compare_results  # noqa: E402
 
 
 def test_rounding_boundary_float_noise_matches():

@@ -1,6 +1,8 @@
-"""The cross-query plan cache: unit behavior (LRU, TTL, kill switch) and the
-end-to-end contract - a hit skips planning but re-executes against the source,
-so results always reflect CURRENT data."""
+"""The cross-query plan cache: LRU, TTL, the kill switch, and that a cached
+plan re-executes against the source so results reflect CURRENT data.
+
+The cache is a Python-engine component; the Rust engine has none, so these are
+unit tests over PlanCache itself with no end-to-end half."""
 
 import pyarrow as pa
 
@@ -8,8 +10,6 @@ from federated_query.executor.plan_cache import (
     PlanCache,
     plan_cache_from_env,
 )
-from tests.e2e_pushdown.conftest import *  # noqa: F401,F403 (env fixtures)
-from tests.e2e_pushdown.helpers import build_runtime
 
 
 class _Clock:
@@ -110,14 +110,3 @@ def test_cached_plan_reexecutes_and_sees_new_data():
         connection.commit()
         source._return_connection(connection)
         source.disconnect()
-
-
-def test_explain_never_caches(single_source_env):
-    """EXPLAIN output must reflect current planning decisions; its plan is
-    never stored and never served."""
-    runtime = build_runtime(single_source_env)
-    executor = runtime.query_executor
-    sql = "EXPLAIN SELECT id FROM duckdb_primary.main.products"
-    runtime.execute(sql)
-    runtime.execute(sql)
-    assert executor.plan_cache.hits == 0

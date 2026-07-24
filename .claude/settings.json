@@ -21,6 +21,17 @@
             "statusMessage": "cargo fmt before commit"
           }
         ]
+      },
+      {
+        "matcher": "mcp__taskq__set_task_status|mcp__taskq__create_task|mcp__taskq__update_task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/done_gate.py\"",
+            "timeout": 900,
+            "statusMessage": "done-gate: make lint + cargo test --workspace"
+          }
+        ]
       }
     ],
     "PostToolUse": [

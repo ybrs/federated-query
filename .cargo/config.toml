@@ -11,10 +11,14 @@ DUCKDB_LIB_DIR = { value = ".duckdb-lib/current", relative = true, force = true 
 DUCKDB_INCLUDE_DIR = { value = ".duckdb-lib/current", relative = true, force = true }
 
 [build]
-# rpath entries so every produced binary/cdylib (target/<profile>, its deps/
-# dir, and anything loaded via a symlink from benchmarks/) resolves
-# libduckdb.so at runtime without LD_LIBRARY_PATH.
+# rpath entries so every produced binary/cdylib resolves libduckdb.so at
+# runtime without LD_LIBRARY_PATH. $ORIGIN is expanded from the path the
+# object is OPENED by, not its realpath, so a symlink to target/<profile>
+# needs an entry for the SYMLINK's depth, not the real file's: one level for
+# tests/fedq.so, two for target/<profile> and benchmarks/<suite>/fedq.so,
+# three for target/<profile>/deps.
 rustflags = [
+    "-C", "link-arg=-Wl,-rpath,$ORIGIN/../.duckdb-lib/current",
     "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../.duckdb-lib/current",
     "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../../.duckdb-lib/current",
 ]
