@@ -240,6 +240,48 @@ impl Runtime {
         Arc::clone(&self.stats.read().expect("stats lock poisoned"))
     }
 
+    /// What already holds `name` in the relation namespace, if anything: a
+    /// source table or materialized view (both resolve as catalog tables), a
+    /// non-materialized view, or an event dataset. Every CREATE that introduces
+    /// a relation checks this first. One name standing for two relations is not
+    /// a cosmetic clash - a reference resolves to whichever kind the resolver
+    /// reaches first (a view is expanded before a table is looked up), so the
+    /// loser is silently read from the wrong relation.
+    pub(crate) fn relation_name_holder(
+        &self,
+        name: &str,
+    ) -> Result<Option<&'static str>, RuntimeError> {
+        let catalog = self.catalog_snapshot();
+        if catalog.resolve_table(None, None, name).is_some() {
+            return Ok(Some("a table or materialized view"));
+        }
+        if catalog.get_view(name).is_some() {
+            return Ok(Some("a view"));
+        }
+        if self.event_dataset_exists(name)? {
+            return Ok(Some("an event dataset"));
+        }
+        Ok(None)
+    }
+
+    /// Whether a live event dataset holds `name`, read straight from the
+    /// registry in the stats SQLite. A name check must not open the event store:
+    /// that would create the store's directory and its runtime as a side effect
+    /// of unrelated DDL. A config with no file path has no registry, so no
+    /// dataset can exist.
+    fn event_dataset_exists(&self, name: &str) -> Result<bool, RuntimeError> {
+        let config = self.config_snapshot();
+        let Some(stats_path) = stats_sqlite_path(&config) else {
+            return Ok(false);
+        };
+        let registry = fq_events::registry::Registry::open(&stats_path)
+            .map_err(fq_events::error::EventError::from)?;
+        let record = registry
+            .get_optional(name)
+            .map_err(fq_events::error::EventError::from)?;
+        Ok(record.is_some())
+    }
+
     /// Run one SQL statement and return its Arrow result under the query's
     /// user-visible column names. A leading EXPLAIN short-circuits to a textual
     /// plan WITHOUT executing. Materialized-view DDL dispatches to the store

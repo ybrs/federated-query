@@ -59,6 +59,36 @@ fn view_alias_in_from() {
 }
 
 #[test]
+fn a_cte_of_the_same_name_shadows_the_view() {
+    // SQL scoping: the WITH name is in scope, so `uv` is the CTE here and the
+    // view is not expanded. The reference becomes a CteRef, not a SubqueryScan.
+    let c = catalog_with_view("uv", "SELECT id, name FROM pg.public.users", None);
+    let plan = parse_with_catalog("WITH uv AS (SELECT id FROM pg.public.users) SELECT id FROM uv", &c)
+        .expect("parse");
+    let LogicalPlan::Cte(cte) = &plan else { panic!("expected Cte, got {plan:?}") };
+    let LogicalPlan::Projection(p) = cte.child.as_ref() else { panic!("expected Projection") };
+    assert!(
+        matches!(p.input.as_ref(), LogicalPlan::CteRef(_)),
+        "the CTE shadows the view, got {:?}",
+        p.input
+    );
+}
+
+#[test]
+fn a_qualified_name_is_never_a_view() {
+    // Views are unqualified names. `pg.public.uv` names a table in a datasource
+    // schema, so it stays a Scan of that (nonexistent) table for the binder to
+    // reject - it never expands into the view sharing the last component.
+    let c = catalog_with_view("uv", "SELECT id, name FROM pg.public.users", None);
+    let plan = parse_with_catalog("SELECT id FROM pg.public.uv", &c).expect("parse");
+    let LogicalPlan::Projection(p) = &plan else { panic!("expected Projection") };
+    let LogicalPlan::Scan(scan) = p.input.as_ref() else {
+        panic!("a qualified name must stay a Scan, got {:?}", p.input)
+    };
+    assert_eq!(scan.table_name, "uv");
+}
+
+#[test]
 fn self_referencing_view_raises() {
     let c = catalog_with_view("uv", "SELECT id FROM uv", None);
     let err = parse_with_catalog("SELECT id FROM uv", &c).unwrap_err();

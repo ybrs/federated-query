@@ -151,6 +151,10 @@ fn view_is_created_queried_listed_and_dropped() {
         .expect("names are Utf8");
     assert_eq!(listed.value(0), "buys");
 
+    // A qualified name is never a view reference: it names a table in that
+    // datasource's schema, and there is none, so it raises.
+    assert!(runtime.execute("SELECT count(*) FROM eva.main.buys").is_err());
+
     runtime.execute("DROP VIEW buys").expect("drop view");
     // Gone: the name no longer resolves.
     assert!(runtime.execute("SELECT count(*) FROM buys").is_err());
@@ -234,6 +238,99 @@ fn invalid_view_definitions_raise_at_create() {
     // None of the failures registered anything.
     let (_, batches) = runtime.execute("SHOW VIEWS").expect("show views");
     assert_eq!(batches[0].num_rows(), 0);
+}
+
+#[test]
+fn a_view_cannot_collide_with_any_other_relation_kind() {
+    let dir = sandbox("collide");
+    let events = dir.join("ev.parquet");
+    write_events(&events);
+    let config = config_for(&dir, &[("eva", &events)]);
+    let runtime = Runtime::from_config(&config).expect("from_config");
+
+    // A source table's name is taken.
+    assert!(runtime
+        .execute("CREATE VIEW eva AS SELECT user_id FROM eva.main.eva")
+        .is_err());
+
+    // A materialized view's name is taken.
+    runtime
+        .execute("CREATE MATERIALIZED VIEW mv AS SELECT user_id FROM eva.main.eva")
+        .expect("create materialized view");
+    assert!(runtime
+        .execute("CREATE VIEW mv AS SELECT user_id FROM eva.main.eva")
+        .is_err());
+
+    // An event dataset's name is taken.
+    runtime
+        .execute(
+            "CREATE EVENT DATASET evs AS ( SELECT created_at AS ts, event AS ev, \
+             user_id AS uid FROM eva.main.eva ) ACTOR uid TIME ts EVENT ev",
+        )
+        .expect("create event dataset");
+    assert!(runtime
+        .execute("CREATE VIEW evs AS SELECT user_id FROM eva.main.eva")
+        .is_err());
+}
+
+#[test]
+fn other_relation_kinds_cannot_collide_with_a_view() {
+    let dir = sandbox("collide_rev");
+    let events = dir.join("ev.parquet");
+    write_events(&events);
+    let config = config_for(&dir, &[("eva", &events)]);
+    let runtime = Runtime::from_config(&config).expect("from_config");
+
+    runtime
+        .execute("CREATE VIEW taken AS SELECT user_id, created_at, event FROM eva.main.eva")
+        .expect("create view");
+
+    // A materialized view under the view's name would be shadowed by the view
+    // at every reference - the reads would silently come from the wrong
+    // relation, so the create raises instead.
+    assert!(runtime
+        .execute("CREATE MATERIALIZED VIEW taken AS SELECT user_id FROM eva.main.eva")
+        .is_err());
+
+    // Same for an event dataset.
+    assert!(runtime
+        .execute(
+            "CREATE EVENT DATASET taken AS ( SELECT created_at AS ts, event AS ev, \
+             user_id AS uid FROM eva.main.eva ) ACTOR uid TIME ts EVENT ev",
+        )
+        .is_err());
+
+    // The view still resolves to its own definition.
+    let (_, batches) = runtime
+        .execute("SELECT count(*) AS n FROM taken")
+        .expect("view still resolves");
+    assert_eq!(one_count(&batches), 3);
+}
+
+#[test]
+fn a_cycle_through_a_second_view_raises() {
+    let dir = sandbox("cycle2");
+    let events = dir.join("ev.parquet");
+    write_events(&events);
+    let config = config_for(&dir, &[("eva", &events)]);
+    let runtime = Runtime::from_config(&config).expect("from_config");
+
+    runtime
+        .execute("CREATE VIEW a AS SELECT user_id FROM eva.main.eva")
+        .expect("create a");
+    runtime
+        .execute("CREATE VIEW b AS SELECT user_id FROM a")
+        .expect("create b over a");
+
+    // Redefining a in terms of b closes the loop a -> b -> a. It is caught at
+    // CREATE, and the failed redefinition leaves the working view in place.
+    assert!(runtime
+        .execute("CREATE OR REPLACE VIEW a AS SELECT user_id FROM b")
+        .is_err());
+    let (_, batches) = runtime
+        .execute("SELECT count(*) AS n FROM b")
+        .expect("b still resolves through the original a");
+    assert_eq!(one_count(&batches), 3);
 }
 
 #[test]

@@ -39,11 +39,12 @@ impl Runtime {
                 "view '{name}' already exists; use CREATE OR REPLACE VIEW to redefine it"
             )));
         }
-        if !exists && catalog.resolve_table(None, None, name).is_some() {
-            return Err(RuntimeError::EventStatement(format!(
-                "relation '{name}' already exists; a view cannot shadow a table or a \
-                 materialized view"
-            )));
+        if !exists {
+            if let Some(holder) = self.relation_name_holder(name)? {
+                return Err(RuntimeError::EventStatement(format!(
+                    "relation '{name}' already exists ({holder}); a view cannot shadow it"
+                )));
+            }
         }
         self.validate_view_definition(name, column_aliases.as_deref(), select_sql)?;
         // `created_at` is stamped by the catalog's clock on write; the value

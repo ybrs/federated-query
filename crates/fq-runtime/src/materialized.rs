@@ -89,9 +89,9 @@ impl Runtime {
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         let accel = self.accelerator()?;
         let catalog = self.catalog_snapshot();
-        if catalog.resolve_table(None, None, name).is_some() {
+        if let Some(holder) = self.relation_name_holder(name)? {
             return Err(RuntimeError::MaterializedView(format!(
-                "relation '{name}' already exists"
+                "relation '{name}' already exists ({holder})"
             )));
         }
         let plan = delta::classify(&catalog, &self.config_snapshot(), select_sql)?;

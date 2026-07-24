@@ -73,9 +73,9 @@ impl Runtime {
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         let store = self.event_store()?;
         let catalog = self.catalog_snapshot();
-        if catalog.resolve_table(None, None, &def.name).is_some() {
+        if let Some(holder) = self.relation_name_holder(&def.name)? {
             return Err(RuntimeError::EventStatement(format!(
-                "relation '{}' already exists",
+                "relation '{}' already exists ({holder})",
                 def.name
             )));
         }
