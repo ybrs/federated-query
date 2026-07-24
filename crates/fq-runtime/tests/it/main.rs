@@ -13,3 +13,4 @@ mod materialized_views;
 mod parquet_runtime;
 mod settings;
 mod substitution;
+mod views;

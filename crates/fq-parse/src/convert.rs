@@ -239,14 +239,19 @@ pub struct Converter<'a> {
     /// one becomes a `CteRef`; star expansion over it uses the recorded columns.
     /// Interior mutability so the `&self` descent can push/pop a WITH's names.
     ctes: RefCell<HashMap<String, Vec<String>>>,
+    /// The view names currently being expanded, outermost first. A reference to
+    /// a name already on this stack is a definition cycle and raises naming it,
+    /// so view expansion can never recurse forever.
+    expanding_views: RefCell<Vec<String>>,
 }
 
 impl<'a> Converter<'a> {
-    /// A converter over `catalog` (used for star expansion).
+    /// A converter over `catalog` (used for star expansion and view lookup).
     pub fn new(catalog: &'a Catalog) -> Self {
         Self {
             catalog,
             ctes: RefCell::new(HashMap::new()),
+            expanding_views: RefCell::new(Vec::new()),
         }
     }
 
@@ -811,6 +816,17 @@ impl<'a> Converter<'a> {
                     output_names: Some(columns),
                 }));
             }
+            // Not a CTE: an unqualified name may be a non-materialized view,
+            // which expands here into its defining query. A CTE of the same name
+            // shadows the view (checked first, above), matching SQL scoping.
+            if self.catalog.get_view(&table.name.name).is_some() {
+                if table.table_sample.is_some() {
+                    return Err(ParseError::Unsupported(
+                        "TABLESAMPLE on a view reference".to_string(),
+                    ));
+                }
+                return self.expand_view(&table.name.name, &key, tables);
+            }
         }
         tables.push(FromTable {
             key: key.clone(),
@@ -823,6 +839,88 @@ impl<'a> Converter<'a> {
         Ok(LogicalPlan::Scan(Box::new(
             self.scan_from_table(select, table, &key)?,
         )))
+    }
+
+    /// Expand a non-materialized view reference into its defining query, wrapped
+    /// in a `SubqueryScan` under the reference's alias (or the view name). The
+    /// result is structurally a derived table, so every later pass treats the
+    /// view exactly like an inline subquery and needs no view-specific handling.
+    ///
+    /// A view whose definition references itself, directly or through another
+    /// view, raises naming the cycle rather than recursing forever.
+    fn expand_view(
+        &self,
+        name: &str,
+        key: &str,
+        tables: &mut Vec<FromTable>,
+    ) -> Result<LogicalPlan, ParseError> {
+        let view = self
+            .catalog
+            .get_view(name)
+            .ok_or_else(|| ParseError::Parse(format!("view '{name}' is not registered")))?;
+        if let Some(position) = self
+            .expanding_views
+            .borrow()
+            .iter()
+            .position(|open| open == name)
+        {
+            let mut cycle: Vec<String> = self.expanding_views.borrow()[position..].to_vec();
+            cycle.push(name.to_string());
+            return Err(ParseError::Unsupported(format!(
+                "view '{name}' is defined in terms of itself ({})",
+                cycle.join(" -> ")
+            )));
+        }
+        self.expanding_views.borrow_mut().push(name.to_string());
+        let expanded = self.view_body(name, view);
+        self.expanding_views.borrow_mut().pop();
+        let (input, column_names) = expanded?;
+        tables.push(FromTable {
+            key: key.to_string(),
+            columns: ColumnSource::Explicit(column_names.clone()),
+        });
+        // Fresh boundary wrapping the expanded view so the outer query references
+        // it by one relation alias - no base to copy from. `column_names` is set
+        // only when the view declared an output rename; otherwise the body's own
+        // names stand.
+        Ok(LogicalPlan::SubqueryScan(SubqueryScan {
+            input: Box::new(input),
+            alias: key.to_string(),
+            column_names: view.column_aliases.clone(),
+        }))
+    }
+
+    /// Parse and convert a view's stored SQL, returning its plan and the output
+    /// column names the reference exposes (the declared rename when the view has
+    /// one, else the body's own names). A rename whose arity does not match the
+    /// body raises.
+    fn view_body(
+        &self,
+        name: &str,
+        view: &fq_catalog::ViewDef,
+    ) -> Result<(LogicalPlan, Vec<String>), ParseError> {
+        let statements = polyglot_sql::parse(&view.sql, polyglot_sql::DialectType::PostgreSQL)
+            .map_err(|error| {
+                ParseError::Parse(format!("view '{name}' has an unparsable definition: {error}"))
+            })?;
+        let [statement] = statements.as_slice() else {
+            return Err(ParseError::Parse(format!(
+                "view '{name}' definition must be exactly one statement"
+            )));
+        };
+        let plan = self.query(statement)?;
+        let body_names = plan.schema();
+        let Some(renames) = &view.column_aliases else {
+            return Ok((plan, body_names));
+        };
+        if renames.len() != body_names.len() {
+            return Err(ParseError::Parse(format!(
+                "view '{name}' declares {} column names but its query produces {}",
+                renames.len(),
+                body_names.len()
+            )));
+        }
+        Ok((plan, renames.clone()))
     }
 
     /// A derived table `(SELECT ...) AS alias`: convert the inner query and wrap

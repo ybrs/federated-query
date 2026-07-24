@@ -107,6 +107,27 @@ const DATASOURCE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS dynamic_datasources 
     updated_by    TEXT
 )";
 
+/// The non-materialized view registry, in the same durable SQLite file. A view
+/// stores only its defining SQL (and an optional output-rename list as a JSON
+/// array) - there is no stored result, so nothing here goes stale. The name is
+/// the PRIMARY KEY; `CREATE OR REPLACE VIEW` swaps the row after re-validating.
+const VIEWS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS views (
+    name           TEXT PRIMARY KEY,
+    definition_sql TEXT NOT NULL,
+    column_aliases TEXT,
+    created_at     TEXT NOT NULL
+)";
+
+/// One persisted non-materialized view: its name, defining SELECT, and the
+/// optional positional output rename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredView {
+    pub name: String,
+    pub definition_sql: String,
+    pub column_aliases: Option<Vec<String>>,
+    pub created_at: String,
+}
+
 /// One persisted dynamic datasource: its name, connector kind, and the JSON
 /// connection params as authored (all string scalars). The runtime rebuilds a
 /// `DataSourceConfig` from these to connect the source.
@@ -501,6 +522,67 @@ impl ViewCatalog {
         Ok(settings)
     }
 
+    /// Every persisted non-materialized view, name-ordered.
+    pub fn list_views(&self) -> Result<Vec<StoredView>, AccelError> {
+        let conn = self.conn.lock().expect("view catalog lock poisoned");
+        let mut statement = conn.prepare(
+            "SELECT name, definition_sql, column_aliases, created_at FROM views ORDER BY name",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut views = Vec::new();
+        for row in rows {
+            let (name, definition_sql, aliases_json, created_at) = row?;
+            let column_aliases = match aliases_json {
+                Some(text) => Some(serde_json::from_str(&text)?),
+                None => None,
+            };
+            views.push(StoredView {
+                name,
+                definition_sql,
+                column_aliases,
+                created_at,
+            });
+        }
+        Ok(views)
+    }
+
+    /// Persist a view, replacing any row of the same name (`CREATE OR REPLACE
+    /// VIEW`). The caller validates the definition BEFORE calling, so a stored
+    /// row is always one that parsed and bound.
+    pub fn upsert_view(&self, view: &StoredView) -> Result<(), AccelError> {
+        let aliases = match &view.column_aliases {
+            Some(names) => Some(serde_json::to_string(names)?),
+            None => None,
+        };
+        self.conn
+            .lock()
+            .expect("view catalog lock poisoned")
+            .execute(
+                "INSERT OR REPLACE INTO views (name, definition_sql, column_aliases, created_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![view.name, view.definition_sql, aliases, (self.clock)()],
+            )?;
+        Ok(())
+    }
+
+    /// Delete a persisted view. Returns whether a row was removed, so the caller
+    /// can raise on a missing name instead of silently succeeding.
+    pub fn delete_view(&self, name: &str) -> Result<bool, AccelError> {
+        let deleted = self
+            .conn
+            .lock()
+            .expect("view catalog lock poisoned")
+            .execute("DELETE FROM views WHERE name = ?1", params![name])?;
+        Ok(deleted > 0)
+    }
+
     /// Delete a persisted dynamic datasource. Returns whether a row was removed
     /// (so a caller can distinguish a real drop from a missing name).
     pub fn delete_datasource(&self, name: &str) -> Result<bool, AccelError> {
@@ -816,6 +898,7 @@ fn ensure_schema(conn: &Connection) -> Result<(), AccelError> {
     conn.execute(GRANTS_INDEX, [])?;
     conn.execute(ACL_META_SCHEMA, [])?;
     conn.execute(SETTINGS_SCHEMA, [])?;
+    conn.execute(VIEWS_SCHEMA, [])?;
     // Seed the single generation row at 0 on a fresh store; a pre-existing row
     // keeps its counter (INSERT OR IGNORE never rewinds a live generation).
     conn.execute(

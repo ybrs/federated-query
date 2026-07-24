@@ -20,6 +20,7 @@ mod introspect;
 mod materialized;
 mod settings;
 mod substitute;
+mod views;
 
 pub use acl::{import_bootstrap_users, require_a_superuser};
 
@@ -136,6 +137,9 @@ impl Runtime {
         // every view a previous session created.
         if let Some(accel) = &accelerator {
             materialized::register_store(session, &mut catalog, accel)?;
+            // Non-materialized views are metadata only: registering them needs no
+            // data plane, and their definitions expand at plan time.
+            views::install_persisted_views(&mut catalog, accel)?;
         }
         catalog.load_metadata()?;
         // Persisted dynamic sources are added post-deploy and may be transiently
@@ -257,6 +261,14 @@ impl Runtime {
             }
             Statement::RefreshMaterializedView { name } => self.refresh_materialized_view(&name),
             Statement::DropMaterializedView { name } => self.drop_materialized_view(&name),
+            Statement::CreateView {
+                name,
+                column_aliases,
+                select_sql,
+                or_replace,
+            } => self.create_view(&name, column_aliases, select_sql, or_replace),
+            Statement::DropView { name } => self.drop_view(&name),
+            Statement::ShowViews => self.show_views(),
             Statement::ShowSettings => self.show_settings(),
             Statement::ShowSetting { name } => self.show_setting(&name),
             Statement::ShowMaterializedViews => self.show_materialized_views(),
@@ -395,6 +407,9 @@ impl Runtime {
             }
             Statement::ShowMaterializedViews => {
                 return Ok(materialized::views_describe_columns());
+            }
+            Statement::ShowViews => {
+                return Ok(views::views_describe_columns());
             }
             Statement::ShowDatasources => {
                 return Ok(dynamic_catalog::datasources_describe_columns());

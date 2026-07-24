@@ -14,6 +14,16 @@ use crate::datasource::{DataSource, RenderDialect};
 use crate::error::CatalogError;
 use crate::schema::{Column, Schema, Table};
 
+/// A non-materialized view: a named SELECT that expands at plan time, so it
+/// always reflects the current source data (unlike a materialized view, which
+/// serves a stored result). `column_aliases` renames the SELECT's outputs
+/// positionally, like a derived table's alias list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewDef {
+    pub sql: String,
+    pub column_aliases: Option<Vec<String>>,
+}
+
 /// Central catalog managing metadata from all data sources.
 ///
 /// Clone is cheap-ish (datasource handles are shared `Arc`s; the schema tree
@@ -24,6 +34,9 @@ pub struct Catalog {
     datasources: BTreeMap<String, Arc<dyn DataSource>>,
     // Keyed by (datasource, schema_name), matching the Python tuple key.
     schemas: BTreeMap<(String, String), Schema>,
+    // Non-materialized views by name, expanded in place by the parser when an
+    // unqualified reference names one.
+    views: BTreeMap<String, ViewDef>,
     // Datasources that failed to connect/load at construction, mapped to the
     // real connector error. Not registered as sources (nothing resolves them
     // silently), but a QUALIFIED reference to one raises the stored error naming
@@ -48,6 +61,27 @@ impl Catalog {
     /// Get a data source by name.
     pub fn get_datasource(&self, name: &str) -> Option<Arc<dyn DataSource>> {
         self.datasources.get(name).cloned()
+    }
+
+    /// Register (or replace) a non-materialized view by name.
+    pub fn register_view(&mut self, name: impl Into<String>, view: ViewDef) {
+        self.views.insert(name.into(), view);
+    }
+
+    /// The view a name denotes, or None. Views are unqualified names only: a
+    /// `datasource.schema.table` reference never resolves to a view.
+    pub fn get_view(&self, name: &str) -> Option<&ViewDef> {
+        self.views.get(name)
+    }
+
+    /// Remove a view. Returns whether it was registered.
+    pub fn remove_view(&mut self, name: &str) -> bool {
+        self.views.remove(name).is_some()
+    }
+
+    /// Every registered view name, sorted.
+    pub fn view_names(&self) -> Vec<&str> {
+        self.views.keys().map(String::as_str).collect()
     }
 
     /// Remove a data source and every schema it owns (a `DROP DATASOURCE` swap).

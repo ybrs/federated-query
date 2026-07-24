@@ -286,11 +286,19 @@ impl Runtime {
             accel.datasource_name(),
             views,
         )));
+        self.swap_catalog(next);
+        Ok(())
+    }
+
+    /// Install `next` as the live catalog and rebuild the statistics collector
+    /// over it. Every metadata DDL (materialized views, plain views) lands
+    /// through here as a copy-and-swap, so an in-flight plan keeps the snapshot
+    /// it started with.
+    pub(crate) fn swap_catalog(&self, next: Catalog) {
         let next = Arc::new(next);
         *self.catalog.write().expect("catalog lock poisoned") = Arc::clone(&next);
         *self.stats.write().expect("stats lock poisoned") =
             Arc::new(StatisticsCollector::new(next, self.learned.clone(), None));
-        Ok(())
     }
 
     /// `SHOW MATERIALIZED VIEWS`: one row per live view - its name, stored row

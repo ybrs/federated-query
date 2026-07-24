@@ -21,7 +21,7 @@ pub mod error;
 pub mod schema;
 pub mod stats_catalog;
 
-pub use catalog::Catalog;
+pub use catalog::{Catalog, ViewDef};
 pub use datasource::{
     build_column_statistics, build_table_statistics, map_native_type_default,
     metadata_from_information_schema, ColumnMetadata, ColumnStatistics, DataSource,

@@ -489,6 +489,21 @@ impl Accelerator {
         self.catalog.delete_datasource(name)
     }
 
+    /// Every persisted non-materialized view, name-ordered.
+    pub fn list_views(&self) -> Result<Vec<crate::StoredView>, AccelError> {
+        self.catalog.list_views()
+    }
+
+    /// Persist a view, replacing any row of the same name.
+    pub fn upsert_view(&self, view: &crate::StoredView) -> Result<(), AccelError> {
+        self.catalog.upsert_view(view)
+    }
+
+    /// Remove a persisted view; returns whether a row was removed.
+    pub fn delete_view(&self, name: &str) -> Result<bool, AccelError> {
+        self.catalog.delete_view(name)
+    }
+
     /// Insert a user (INSERT OR IGNORE); false = the name already exists.
     pub fn create_user(
         &self,

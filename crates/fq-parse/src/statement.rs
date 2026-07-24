@@ -53,6 +53,19 @@ pub enum Statement<'a> {
     RefreshMaterializedView { name: String },
     /// `DROP MATERIALIZED VIEW <name>`.
     DropMaterializedView { name: String },
+    /// `CREATE [OR REPLACE] VIEW <name> [(col, ...)] AS <select>`: a
+    /// non-materialized view, expanded at plan time so it always reads current
+    /// data. `column_aliases` renames the SELECT's outputs positionally.
+    CreateView {
+        name: String,
+        column_aliases: Option<Vec<String>>,
+        select_sql: &'a str,
+        or_replace: bool,
+    },
+    /// `DROP VIEW <name>`.
+    DropView { name: String },
+    /// `SHOW VIEWS`: list every registered non-materialized view.
+    ShowViews,
     /// `SHOW SETTINGS`: list every engine setting.
     ShowSettings,
     /// `SHOW MATERIALIZED VIEWS`: list every registered materialized view with
@@ -211,6 +224,12 @@ pub fn classify_statement(sql: &str) -> Result<Statement<'_>, ParseError> {
         "SEGMENT" => crate::events::classify_segment(&mut tokens),
         "PATHS" => crate::events::classify_paths(&mut tokens),
         "CREATE" if second_word_is(sql, "MATERIALIZED") => classify_create(&mut tokens),
+        "CREATE" if second_word_is(sql, "VIEW") => classify_create_view(&mut tokens, false),
+        // `CREATE OR REPLACE VIEW` has `OR` as its second word, so it does not
+        // match the arm above. Unlike a datasource replace (which repoints live
+        // connections), swapping a view definition is a metadata-only change
+        // that is re-validated before it lands, so it is allowed.
+        "CREATE" if create_or_replace_view(sql) => classify_create_view(&mut tokens, true),
         "CREATE" if second_word_is(sql, "DATASOURCE") => classify_create_datasource(&mut tokens),
         "CREATE" if second_word_is(sql, "USER") => classify_create_user(&mut tokens),
         "ALTER" if second_word_is(sql, "USER") => classify_alter_user(&mut tokens),
@@ -227,6 +246,7 @@ pub fn classify_statement(sql: &str) -> Result<Statement<'_>, ParseError> {
                 .to_string(),
         )),
         "DROP" if second_word_is(sql, "MATERIALIZED") => classify_drop(&mut tokens),
+        "DROP" if second_word_is(sql, "VIEW") => classify_drop_view(&mut tokens),
         "DROP" if second_word_is(sql, "DATASOURCE") => classify_drop_datasource(&mut tokens),
         // ALTER exists in the engine only as a rejected datasource form: an
         // in-place repoint with partial-failure semantics has no atomic
@@ -242,6 +262,7 @@ pub fn classify_statement(sql: &str) -> Result<Statement<'_>, ParseError> {
             classify_show(&mut tokens)
         }
         "SHOW" if second_word_is(sql, "MATERIALIZED") => classify_show_materialized(&mut tokens),
+        "SHOW" if second_word_is(sql, "VIEWS") => classify_show_views(&mut tokens),
         "SHOW" if second_word_is(sql, "DATASOURCES") => classify_show_datasources(&mut tokens),
         "SHOW" if second_word_is(sql, "TABLES") => classify_show_tables(&mut tokens),
         "DESCRIBE" => classify_describe(&mut tokens),
@@ -278,6 +299,105 @@ fn classify_show_materialized<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statemen
     tokens.expect_keyword("VIEWS")?;
     expect_end(tokens, "SHOW MATERIALIZED VIEWS")?;
     Ok(Statement::ShowMaterializedViews)
+}
+
+/// Whether `sql` opens `CREATE OR REPLACE VIEW`.
+fn create_or_replace_view(sql: &str) -> bool {
+    let mut tokens = Tokenizer::new(sql);
+    tokens.next_token();
+    for expected in ["OR", "REPLACE", "VIEW"] {
+        match tokens.peek_word() {
+            Some(word) if word.eq_ignore_ascii_case(expected) => {
+                tokens.next_token();
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Parse `CREATE [OR REPLACE] VIEW <name> [(col, ...)] AS <select>`.
+fn classify_create_view<'a>(
+    tokens: &mut Tokenizer<'a>,
+    or_replace: bool,
+) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("CREATE")?;
+    if or_replace {
+        tokens.expect_keyword("OR")?;
+        tokens.expect_keyword("REPLACE")?;
+    }
+    tokens.expect_keyword("VIEW")?;
+    if tokens.peek_word_is("IF") {
+        return Err(ParseError::Unsupported(
+            "CREATE VIEW IF NOT EXISTS: a create that silently does nothing hides a \
+             name collision; create without IF NOT EXISTS, or use CREATE OR REPLACE VIEW"
+                .to_string(),
+        ));
+    }
+    let name = view_name(tokens, "view")?;
+    let column_aliases = parse_view_column_aliases(tokens)?;
+    tokens.expect_keyword("AS")?;
+    let select_sql = tokens.rest().trim();
+    if select_sql.is_empty() {
+        return Err(ParseError::Parse(
+            "CREATE VIEW has no defining SELECT after AS".to_string(),
+        ));
+    }
+    Ok(Statement::CreateView {
+        name,
+        column_aliases,
+        select_sql,
+        or_replace,
+    })
+}
+
+/// Parse the optional `( col, col, ... )` output-rename list after a view name.
+/// An empty list raises: it renames nothing and reads as a typo.
+fn parse_view_column_aliases(
+    tokens: &mut Tokenizer<'_>,
+) -> Result<Option<Vec<String>>, ParseError> {
+    if !consume_char(tokens, '(') {
+        return Ok(None);
+    }
+    let mut names = Vec::new();
+    loop {
+        names.push(view_name(tokens, "view column alias")?);
+        if consume_char(tokens, ',') {
+            continue;
+        }
+        expect_char(tokens, ')', "CREATE VIEW <name> ( <columns> )")?;
+        break;
+    }
+    if names.is_empty() {
+        return Err(ParseError::Parse(
+            "CREATE VIEW <name> () has an empty column list".to_string(),
+        ));
+    }
+    Ok(Some(names))
+}
+
+/// Parse `DROP VIEW <name>`.
+fn classify_drop_view<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("DROP")?;
+    tokens.expect_keyword("VIEW")?;
+    if tokens.peek_word_is("IF") {
+        return Err(ParseError::Unsupported(
+            "DROP VIEW IF EXISTS: a drop that silently does nothing hides a typo'd \
+             view name; drop without IF EXISTS"
+                .to_string(),
+        ));
+    }
+    let name = view_name(tokens, "view")?;
+    expect_end(tokens, "DROP VIEW")?;
+    Ok(Statement::DropView { name })
+}
+
+/// Parse `SHOW VIEWS`.
+fn classify_show_views<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("SHOW")?;
+    tokens.expect_keyword("VIEWS")?;
+    expect_end(tokens, "SHOW VIEWS")?;
+    Ok(Statement::ShowViews)
 }
 
 /// The connector kinds a `CREATE DATASOURCE` may name, the same set the runtime
