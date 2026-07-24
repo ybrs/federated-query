@@ -1652,6 +1652,8 @@ fn table_function(
         key: key.clone(),
         columns: ColumnSource::Explicit(output_names.clone()),
     });
+    // A leaf built from the parsed call - there is no base node to copy from.
+    // TableFunction's three fields are all set here: call, alias, output_names.
     Ok(LogicalPlan::TableFunction(TableFunction {
         call,
         alias: key,
@@ -2068,7 +2070,7 @@ fn build_paths_spec(args: &[Expression]) -> Result<PathsSpec, ParseError> {
     })
 }
 
-/// Apply one named `paths()` option to the spec-in-progress.
+/// Apply one named `paths()` option to the call fields being accumulated.
 fn apply_paths_named_arg(
     named: &NamedArgument,
     anchor: &mut Option<PathAnchor>,

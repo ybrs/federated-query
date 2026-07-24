@@ -1710,6 +1710,9 @@ class PhysicalHashAggregate(PhysicalPlanNode):
 
         if not _expression_contains_window(expr):
             # The stage-1 output passes through stage 2 unchanged, by name.
+            # A fresh reference to that output name - the stage-1 item is an
+            # arbitrary expression, not a ColumnRef to copy from. Both fields
+            # that carry meaning here (table, column) are listed.
             return ColumnRef.create(table=None, column=name)
         return self._materialize_window_operands(expr, stage1_exprs, stage1_names)
 

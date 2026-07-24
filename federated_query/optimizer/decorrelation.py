@@ -1444,6 +1444,9 @@ class Decorrelator:
         # key column carries no type (matching the flag path's conditions).
         key_type = outer_expr.get_type()
         # The one equality the SEMI join probes: outer key = domain key.
+        # Fresh nodes with no source to copy from - the equality and its right
+        # side are built here from the two key expressions, and every field of
+        # each (op/left/right; table/column/data_type) is listed.
         condition = BinaryOp.create(
             op=BinaryOpType.EQ,
             left=outer_expr,

@@ -636,6 +636,9 @@ class Binder:
         outputs = aggregate.output_names or []
         for index, expr in enumerate(aggregate.aggregates):
             if index < len(outputs) and expr == bound_key:
+                # A fresh reference to the aggregate's own output column: there
+                # is no ColumnRef to copy from (the match is an aggregate
+                # expression, not a reference). All three fields are listed.
                 return ColumnRef.create(
                     table=None, column=outputs[index], data_type=expr.get_type()
                 )
@@ -699,6 +702,9 @@ class Binder:
             return None
         for index, expr in enumerate(projection.expressions):
             if expr == bound_key:
+                # A fresh reference to the projection's output alias: the match
+                # is a computed expression, not a ColumnRef, so there is nothing
+                # to copy from. All three fields are listed.
                 return ColumnRef.create(
                     table=None,
                     column=projection.aliases[index],

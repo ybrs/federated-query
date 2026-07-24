@@ -1172,7 +1172,7 @@ mod tests {
             let length = rng.next(120) as usize;
             let mut codes: Vec<u32> = Vec::new();
             let mut ts: Vec<i64> = Vec::new();
-            let mut clock = 1_000 + rng.next(50) as i64;
+            let mut clock = 1_000 + i64::try_from(rng.next(50)).expect("start offset fits");
             for _ in 0..length {
                 let mut code = u32::try_from(rng.next(alphabet)).expect("code fits");
                 if codes.last() == Some(&code) {
@@ -1180,7 +1180,7 @@ mod tests {
                 }
                 codes.push(code);
                 ts.push(clock);
-                clock += 1 + rng.next(40) as i64;
+                clock += 1 + i64::try_from(rng.next(40)).expect("step fits");
             }
             streams.push((codes, ts));
         }

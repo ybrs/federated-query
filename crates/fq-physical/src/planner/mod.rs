@@ -335,6 +335,8 @@ impl PhysicalPlanner {
     /// to the physical node unchanged. The analysis runs (into in-memory batches)
     /// at execution, never at plan time - planning stays O(metadata).
     fn plan_table_function(node: &TableFunction) -> PhysicalPlan {
+        // Fresh PhysicalTableFunction lowered from the logical node: a type change
+        // with no physical base to copy, so all three fields are listed.
         PhysicalPlan::TableFunction(PhysicalTableFunction {
             call: node.call.clone(),
             alias: node.alias.clone(),
