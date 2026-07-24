@@ -255,10 +255,11 @@ fn event_dataset_over_a_view_of_a_cross_source_join() {
         )
         .expect("create cross-source view");
 
-    // The event dataset materializes from that view.
+    // The event dataset materializes from that view. `SELECT *` over the view
+    // expands to its declared output columns (the shape the tutorial shows).
     runtime
         .execute(
-            "CREATE EVENT DATASET web AS ( SELECT ts, ev, uid, country FROM enriched ) \
+            "CREATE EVENT DATASET web AS ( SELECT * FROM enriched ) \
              ACTOR uid TIME ts EVENT ev PROPERTIES (country)",
         )
         .expect("event dataset over the view");

@@ -111,6 +111,62 @@ events later. Declare ONLY the properties you need: every listed column is
 ingested and stored, so a wide string column you never filter on just makes
 the build slower.
 
+### Where the events can come from
+
+The parquet file above is one option. A dataset can be sourced four ways, and
+the analytics afterwards are identical in every case.
+
+**A single table, on any connector.** PostgreSQL, DuckDB, ClickHouse, MySQL, or
+parquet - the pull goes through the same connector layer as any query:
+
+```sql
+CREATE EVENT DATASET web FROM pg.public.events
+  ACTOR user_id TIME ts EVENT event_name PROPERTIES (device)
+  WITH (refresh_key = 'id');
+```
+
+**A defining SELECT, joining across datasources.** The SELECT runs through the
+full federated pipeline, so events in one source can be enriched from another
+and the joined columns become event properties:
+
+```sql
+CREATE EVENT DATASET web AS (
+  SELECT e.ts, e.event_name, e.user_id, u.country
+  FROM click.events e JOIN pg.public.users u ON e.user_id = u.id
+) ACTOR user_id TIME ts EVENT event_name PROPERTIES (country);
+```
+
+**A view.** Name that federated join once and build on it - the view stores
+nothing and expands at plan time, so it always reads current data:
+
+```sql
+CREATE VIEW enriched AS
+  SELECT e.ts, e.event_name, e.user_id, u.country
+  FROM click.events e JOIN pg.public.users u ON e.user_id = u.id;
+
+CREATE EVENT DATASET web AS ( SELECT * FROM enriched )
+  ACTOR user_id TIME ts EVENT event_name PROPERTIES (country);
+```
+
+`SHOW VIEWS` lists them, `DROP VIEW` removes them, and `CREATE OR REPLACE VIEW`
+redefines one. A view is validated when you create it, so a typo raises there
+rather than at first use.
+
+**A materialized view.** Same shape, but reading a stored result instead of the
+live sources - use it when the underlying join is expensive and you are willing
+to `REFRESH MATERIALIZED VIEW` to pick up new rows.
+
+Two things to know before choosing:
+
+- **Only a `FROM <table>` dataset can refresh incrementally.** `refresh_key`
+  needs a single monotonic source column, so a `AS ( SELECT ... )` dataset
+  rejects it; bring one forward with `REBUILD EVENT DATASET` instead of
+  `REFRESH`.
+- **Only single-file parquet streams into the build.** Every other connector,
+  and every defining SELECT, materializes its result in memory first. The build
+  itself is bounded and spills (section 10), but the input is not - so a very
+  large cross-source SELECT is the one shape to size carefully.
+
 ## 7. Run the analytics
 
 Four statements, four questions. All of them run over the same materialized
@@ -339,6 +395,13 @@ SHOW EVENT DATASETS;          -- rows, build info, freshness
 REBUILD EVENT DATASET web;    -- full rebuild from the source
 DROP EVENT DATASET web;       -- remove the dataset and its store
 ```
+
+`REFRESH` is the cheap path: it pulls only the rows past the stored watermark,
+so it needs the `refresh_key` that only a single-table dataset can declare. A
+dataset defined by a SELECT (a cross-source join, or a view) has no single
+monotonic column to watermark, so it raises on `REFRESH` and says to use
+`REBUILD`. A view-backed dataset therefore stays as fresh as its last `REBUILD` -
+the view itself is always live, but the materialized event store is a snapshot.
 
 ## 9. Requiring authentication (optional)
 
