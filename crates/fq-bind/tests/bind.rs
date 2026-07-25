@@ -804,3 +804,73 @@ fn paths_table_function_unknown_column_raises() {
         "got {error:?}"
     );
 }
+
+/// The `Filter` over an `Aggregate` anywhere in `plan`, or None. The binder
+/// hoists a HAVING aggregate into the Aggregate's output and re-projects the
+/// user's columns above the filter, so the pair is not at the root.
+fn having_filter_over_aggregate(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+    if let LogicalPlan::Filter(filter) = plan {
+        if matches!(filter.input.as_ref(), LogicalPlan::Aggregate(_)) {
+            return Some(plan);
+        }
+    }
+    for child in plan.children() {
+        if let Some(found) = having_filter_over_aggregate(child) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+#[test]
+fn having_without_group_by_is_an_aggregate_query() {
+    // HAVING groups on its own: with no GROUP BY the whole input is one group.
+    // The aggregate here lives ONLY in HAVING, which is the shape that pins the
+    // rule - the aggregate path is the only code that consumes select.having,
+    // so any gate not taking it for this query drops the clause and returns
+    // every row.
+    let plan = bind_sql("SELECT 1 AS one FROM pg.public.users HAVING count(*) > 0").unwrap();
+    let found = having_filter_over_aggregate(&plan)
+        .unwrap_or_else(|| panic!("HAVING must survive as a Filter over an Aggregate, got {plan:?}"));
+    let LogicalPlan::Filter(filter) = found else { unreachable!() };
+    let LogicalPlan::Aggregate(aggregate) = filter.input.as_ref() else { unreachable!() };
+    assert!(
+        aggregate.aggregates.iter().any(fq_plan::contains_aggregate),
+        "the count(*) from HAVING must be computed by the Aggregate, got {:?}",
+        aggregate.aggregates
+    );
+    assert!(
+        aggregate.group_by.is_empty(),
+        "no GROUP BY means one group over the whole input, got {:?}",
+        aggregate.group_by
+    );
+}
+
+#[test]
+fn having_shapes_that_already_worked_still_bind() {
+    // Pinned so widening the aggregate gate cannot regress them: HAVING with
+    // GROUP BY, HAVING whose aggregate is only in the HAVING, and HAVING with
+    // the aggregate in the SELECT list and no GROUP BY.
+    for sql in [
+        "SELECT name, count(*) FROM pg.public.users GROUP BY name HAVING count(*) > 0",
+        "SELECT name FROM pg.public.users GROUP BY name HAVING count(*) > 1",
+        "SELECT count(*) FROM pg.public.users HAVING count(*) > 0",
+    ] {
+        let plan = bind_sql(sql).unwrap_or_else(|error| panic!("{sql} failed to bind: {error}"));
+        assert!(
+            having_filter_over_aggregate(&plan).is_some(),
+            "{sql} must bind to a Filter over an Aggregate, got {plan:?}"
+        );
+    }
+}
+
+#[test]
+fn a_where_only_query_is_still_not_an_aggregate() {
+    // The negative side of the gate: no GROUP BY, no HAVING and no aggregate
+    // must NOT be turned into an aggregate query.
+    let plan = bind_sql("SELECT name FROM pg.public.users WHERE id > 0").unwrap();
+    assert!(
+        having_filter_over_aggregate(&plan).is_none(),
+        "a plain WHERE query must not gain an Aggregate, got {plan:?}"
+    );
+}

@@ -1068,7 +1068,15 @@ impl<'a> Converter<'a> {
                 "SELECT DISTINCT with window functions".to_string(),
             ));
         }
-        if select.group_by.is_some() || expressions.iter().any(fq_plan::contains_aggregate) {
+        // HAVING is itself grouping: with no GROUP BY it groups the whole input
+        // into one row. So its presence takes the aggregate path even when no
+        // aggregate appears in the SELECT list - build_aggregate is the ONLY
+        // place that consumes `select.having`, and any path that skips it drops
+        // the clause with no error at all.
+        if select.group_by.is_some()
+            || select.having.is_some()
+            || expressions.iter().any(fq_plan::contains_aggregate)
+        {
             if select.distinct {
                 return Err(ParseError::Unsupported(
                     "DISTINCT with GROUP BY".to_string(),
