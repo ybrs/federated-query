@@ -34,6 +34,17 @@ pub enum BindError {
     #[error("set operation branches have different column counts: {left} vs {right}")]
     SetOpArity { left: usize, right: usize },
 
+    /// A column in HAVING that the grouping does not produce: not a GROUP BY key
+    /// and not inside an aggregate. The query groups (a HAVING groups on its own
+    /// even with no GROUP BY), so the raw column does not survive the aggregate
+    /// and the predicate cannot be evaluated. Answering it would mean filtering
+    /// on a column that is not there.
+    #[error(
+        "column '{column}' in HAVING must appear in the GROUP BY clause or be used \
+         in an aggregate function"
+    )]
+    HavingColumnNotGrouped { column: String },
+
     /// A construct the binder does not handle; binding it raises.
     #[error("cannot bind: {0}")]
     Unsupported(String),

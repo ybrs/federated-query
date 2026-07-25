@@ -209,7 +209,14 @@ impl<'a> Binder<'a> {
         // reference (a call equal to an existing output references it; otherwise a
         // hidden __agg_N output is appended and a projection restores the schema).
         if let LogicalPlan::Aggregate(aggregate) = input {
-            return Ok(hoist_having_over_aggregate(aggregate, predicate));
+            // The relations THIS aggregate reads. A HAVING column qualified to one
+            // of them must be grouped or aggregated; a column qualified to anything
+            // else is an outer reference from a correlated subquery, which is legal
+            // and is resolved when the correlation is flattened.
+            let mut own = Scope::new();
+            self.collect_scope(&aggregate.input, &mut own)?;
+            let owned: Vec<String> = own.into_iter().map(|(alias, _)| alias).collect();
+            return hoist_having_over_aggregate(aggregate, predicate, &owned);
         }
         // In-place on the owned node: set the (rebound) input and predicate; any
         // other field the Filter grows is preserved rather than reset.
@@ -905,20 +912,25 @@ fn aggregate_overlay(plan: &LogicalPlan) -> Option<HashMap<String, fq_common::Da
 /// an existing output references that output; a call absent from the SELECT list is
 /// appended as a hidden `__agg_N` output and a projection above restores the declared
 /// schema (so the hidden output never widens the result).
-fn hoist_having_over_aggregate(aggregate: Aggregate, predicate: Expr) -> LogicalPlan {
+fn hoist_having_over_aggregate(
+    aggregate: Aggregate,
+    predicate: Expr,
+    owned_relations: &[String],
+) -> Result<LogicalPlan, BindError> {
     let original_names = aggregate.output_names.clone();
     let original_aggregates = aggregate.aggregates.clone();
     let mut aggregates = aggregate.aggregates.clone();
     let mut names = aggregate.output_names.clone();
     let rewritten = hoist_aggregate_calls(predicate, &mut aggregates, &mut names);
+    reject_ungrouped_having_columns(&rewritten, &aggregate.group_by, &names, owned_relations)?;
     if names.len() == original_names.len() {
         // No hidden output was appended: every call matched an existing output.
         // Fresh Filter over the unchanged aggregate with the rewritten predicate -
         // a genuine new node (the original Filter was consumed); field list complete.
-        return LogicalPlan::Filter(Filter {
+        return Ok(LogicalPlan::Filter(Filter {
             input: Box::new(LogicalPlan::Aggregate(aggregate)),
             predicate: rewritten,
-        });
+        }));
     }
     // Widen the aggregate with the hidden outputs the predicate now names, in place.
     let widened = update!(aggregate, { aggregates = aggregates, output_names = names });
@@ -938,13 +950,55 @@ fn hoist_having_over_aggregate(aggregate: Aggregate, predicate: Expr) -> Logical
     }
     // Restore the aggregate's declared schema above the hoisted filter, dropping the
     // hidden HAVING outputs - a genuine new Projection; field list complete.
-    LogicalPlan::Projection(Projection {
+    Ok(LogicalPlan::Projection(Projection {
         input: Box::new(filtered),
         expressions: restore,
         aliases: original_names,
         distinct: false,
         distinct_on: None,
-    })
+    }))
+}
+
+/// Raise on a column in a hoisted HAVING predicate that the grouping does not
+/// produce. After hoisting, every aggregate call in the predicate has become an
+/// output reference, so a surviving column is legitimate only if it is a GROUP
+/// BY key (matched structurally, as the key carries its qualifier) or names one
+/// of the aggregate's outputs. Anything else refers to a raw input column that
+/// does not exist above the aggregate: the predicate cannot be evaluated, and
+/// letting it through drops the filter and returns every row.
+fn reject_ungrouped_having_columns(
+    predicate: &Expr,
+    group_by: &[Expr],
+    output_names: &[String],
+    owned_relations: &[String],
+) -> Result<(), BindError> {
+    if let Expr::Column(reference) = predicate {
+        let grouped = group_by.iter().any(|key| key == predicate);
+        let is_output = reference.table.is_none() && output_names.contains(&reference.column);
+        // A qualifier naming a relation this aggregate does not read belongs to an
+        // enclosing query: a correlated HAVING may compare an inner aggregate to an
+        // outer column, and that column is resolved when the correlation flattens.
+        let is_outer = reference.table.as_ref().is_some_and(|table| {
+            !owned_relations
+                .iter()
+                .any(|owned| owned.eq_ignore_ascii_case(table))
+        });
+        if !grouped && !is_output && !is_outer {
+            return Err(BindError::HavingColumnNotGrouped {
+                column: reference.column.clone(),
+            });
+        }
+        return Ok(());
+    }
+    // A GROUP BY key can be a whole expression, so a compound node matching one
+    // is grouped and its children are not examined individually.
+    if group_by.iter().any(|key| key == predicate) {
+        return Ok(());
+    }
+    for child in predicate.children() {
+        reject_ungrouped_having_columns(child, group_by, output_names, owned_relations)?;
+    }
+    Ok(())
 }
 
 /// Whether a bound ORDER BY key contains an aggregate-scoped call (an aggregate

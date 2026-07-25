@@ -874,3 +874,29 @@ fn a_where_only_query_is_still_not_an_aggregate() {
         "a plain WHERE query must not gain an Aggregate, got {plan:?}"
     );
 }
+
+#[test]
+fn ungrouped_column_in_having_raises() {
+    // HAVING groups, so a bare column is neither a GROUP BY key nor inside an
+    // aggregate: it does not survive the aggregate and the predicate cannot be
+    // evaluated. Postgres rejects this query; answering it means returning
+    // every row while appearing to have filtered.
+    let error = bind_sql("SELECT 1 AS one FROM pg.public.users HAVING id > 0").unwrap_err();
+    assert!(
+        matches!(error, BindError::HavingColumnNotGrouped { ref column } if column == "id"),
+        "got {error:?}"
+    );
+}
+
+#[test]
+fn grouped_column_in_having_is_allowed() {
+    // The legitimate shapes a HAVING column can take: a GROUP BY key, and a
+    // key combined with an aggregate in the same predicate.
+    for sql in [
+        "SELECT name FROM pg.public.users GROUP BY name HAVING name > 'a'",
+        "SELECT name FROM pg.public.users GROUP BY name HAVING name > 'a' AND count(*) > 1",
+        "SELECT age, count(*) FROM pg.public.users GROUP BY age HAVING age > 30",
+    ] {
+        bind_sql(sql).unwrap_or_else(|error| panic!("{sql} must bind: {error}"));
+    }
+}
