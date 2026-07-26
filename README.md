@@ -78,8 +78,42 @@ SQL Query
 
 ## Project Structure
 
+The engine is a Rust workspace under `crates/`. Each crate is one stage of the
+pipeline or one front door; the leaf crate `fq-common` holds shared config and
+errors and everything else depends on it.
+
 ```
 federated-query/
+  crates/                   # Rust workspace
+    fq-common/              # Shared config, errors, and core types (leaf crate)
+    fq-parse/               # SQL text -> LogicalPlan
+    fq-bind/                # Name resolution and typing over a LogicalPlan
+    fq-catalog/             # Metadata model and datasource registry
+    fq-plan/                # Node model: expression, logical, and physical nodes
+    fq-optimize/            # Logical optimizer: rewrite rules and join ordering
+    fq-decorrelate/         # Rewrites correlated subquery expressions into joins
+    fq-physical/            # Optimized LogicalPlan -> PhysicalPlan
+    fq-emit/                # Expr + clause nodes -> canonical Postgres-form SQL
+    fq-connectors/          # PostgreSQL, DuckDB, ClickHouse, MySQL, Parquet
+    fq-exec/                # Federated execution engine
+    fq-runtime/             # Config-driven execute(sql) orchestration
+    fq-events/              # Materialized event-analytics store and analyses
+    fq-accel/               # Materialized-view store
+    fq-scram/               # SCRAM-SHA-256 auth (verifier + server proof)
+    fedq/                   # CLI front end
+    fedq-server/            # PostgreSQL wire-protocol server
+    fedq-py/                # Python extension module (pyo3)
+  benchmarks/               # TPC-H, TPC-DS, events, perf_compare, plan_compare
+  config/                   # Example configuration (example_config.yaml)
+  doc/                      # Tutorials and design notes
+  docker/                   # Docker configuration for test databases
+  example/                  # Standalone usage examples
+  fuzz/                     # Fuzz targets
+  scripts/                  # Setup and dev scripts (libduckdb fetch, hooks, pg)
+  tools/                    # fq-lint (workspace lint rules)
+  tests/                    # End-to-end suites (federated, pushdown, events, ...)
+  Cargo.toml                # Workspace manifest
+  Makefile                  # build / setup / test entry points
 ```
 
 ## Installation

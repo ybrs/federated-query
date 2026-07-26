@@ -23,12 +23,8 @@ engine.
 # BUILD TIME IS ONE NUMBER
 
 A build time is the wall clock from the statement being issued to the
-statement returning, everything included. There is no "base build", no
-"ingest vs index split", no stage arithmetic in any user-facing number,
-ticket, doc, or report. Stage timings exist ONLY inside status strings for
-engineering diagnosis; they are never quoted as the build time and never used
-to claim a goal is met. Reporting a stage as the build time is lying with a
-stopwatch.
+statement returning, everything included. For materialized views, or "create event dataset"
+the build time starts from when the statement is issued. There is no base build or some other bullshit. There is only one build time. 
 
 # One class of customers
 
