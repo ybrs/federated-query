@@ -1269,12 +1269,46 @@ impl<'a> Converter<'a> {
     /// EXCEPT drops columns, REPLACE substitutes a column's expression in place,
     /// RENAME renames the output column. Raises when a table's columns cannot be
     /// resolved - a star that cannot expand must fail loudly, never drop columns.
+    /// Raises as well when a modifier names a column the star does not expand, or
+    /// when EXCLUDE leaves no column at all.
     fn expand_star(
         &self,
         star: &polyglot_sql::expressions::Star,
         from_tables: &[FromTable],
     ) -> Result<Vec<(Expr, String)>, ParseError> {
+        let expanded = self.star_expansion_columns(star, from_tables)?;
+        if expanded.is_empty() {
+            return Err(ParseError::Unsupported(
+                "cannot expand * : no matching table".to_string(),
+            ));
+        }
+        reject_unknown_star_names(star, &expanded)?;
         let mut outputs = Vec::new();
+        for (key, column) in expanded {
+            if star_excludes(star, &column) {
+                continue;
+            }
+            outputs.push(self.star_output(star, &key, column)?);
+        }
+        if outputs.is_empty() {
+            return Err(ParseError::Unsupported(
+                "cannot expand * : EXCLUDE drops every column".to_string(),
+            ));
+        }
+        Ok(outputs)
+    }
+
+    /// The `(from key, column name)` pairs the star expands over, before any
+    /// modifier applies: every column of every FROM item the star names, which
+    /// is one item for `alias.*` and all of them for a bare `*`. This is the
+    /// column set the star's EXCLUDE / REPLACE / RENAME names are checked
+    /// against, so each star is judged against exactly what it expands to.
+    fn star_expansion_columns(
+        &self,
+        star: &polyglot_sql::expressions::Star,
+        from_tables: &[FromTable],
+    ) -> Result<Vec<(String, String)>, ParseError> {
+        let mut expanded = Vec::new();
         for table in from_tables {
             if star
                 .table
@@ -1284,18 +1318,10 @@ impl<'a> Converter<'a> {
                 continue;
             }
             for column in self.star_columns(table)? {
-                if star_excludes(star, &column) {
-                    continue;
-                }
-                outputs.push(self.star_output(star, &table.key, column)?);
+                expanded.push((table.key.clone(), column));
             }
         }
-        if outputs.is_empty() {
-            return Err(ParseError::Unsupported(
-                "cannot expand * : no matching table".to_string(),
-            ));
-        }
-        Ok(outputs)
+        Ok(expanded)
     }
 
     /// One expanded star column as (expression, output name). REPLACE swaps the
@@ -2369,6 +2395,57 @@ fn render_table_sample(sample: &Sample) -> Result<String, ParseError> {
         ));
     };
     Ok(format!("TABLESAMPLE {method} ({size})"))
+}
+
+/// Reject a star modifier that names a column the star does not expand to.
+/// EXCLUDE, REPLACE, and RENAME are applied per expanded column, so a name that
+/// matches nothing is indistinguishable from a modifier with no work to do: the
+/// column the user asked to drop or rename stays as it is and the answer is
+/// wrong with no error. `expanded` is the star's own `(from key, column)` set,
+/// so `alias.*` is judged against that alias alone and a bare `*` against the
+/// union of the FROM items.
+fn reject_unknown_star_names(
+    star: &polyglot_sql::expressions::Star,
+    expanded: &[(String, String)],
+) -> Result<(), ParseError> {
+    let mut unknown = Vec::new();
+    for name in star_modifier_names(star) {
+        let matched = expanded
+            .iter()
+            .any(|(_, column)| column.eq_ignore_ascii_case(name));
+        if !matched {
+            unknown.push(name);
+        }
+    }
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    Err(ParseError::Unsupported(format!(
+        "SELECT * EXCLUDE/REPLACE/RENAME names unknown column(s): {}",
+        unknown.join(", ")
+    )))
+}
+
+/// Every column name a star's modifiers name: the EXCLUDE/EXCEPT entries, the
+/// REPLACE targets, and the source side of each RENAME.
+fn star_modifier_names(star: &polyglot_sql::expressions::Star) -> Vec<&str> {
+    let mut names = Vec::new();
+    if let Some(excepts) = &star.except {
+        for ident in excepts {
+            names.push(ident.name.as_str());
+        }
+    }
+    if let Some(replacements) = &star.replace {
+        for replacement in replacements {
+            names.push(replacement.alias.name.as_str());
+        }
+    }
+    if let Some(renames) = &star.rename {
+        for (old, _) in renames {
+            names.push(old.name.as_str());
+        }
+    }
+    names
 }
 
 /// Whether a star's EXCLUDE/EXCEPT list drops `column`.

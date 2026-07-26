@@ -543,6 +543,139 @@ fn qualified_star_expands_one_table() {
     assert_eq!(projection.aliases, vec!["total"]);
 }
 
+/// A catalog with pg.public.users(id, name) and pg.public.orders(id, total),
+/// for the star-modifier tests.
+fn star_modifier_catalog() -> fq_catalog::Catalog {
+    use fq_catalog::{Catalog, Column, Schema, Table};
+    use fq_common::DataType;
+
+    let mut catalog = Catalog::new();
+    let users = Table::new(
+        "users",
+        vec![
+            Column::new("id", DataType::Integer, false),
+            Column::new("name", DataType::Varchar, true),
+        ],
+    );
+    let orders = Table::new(
+        "orders",
+        vec![
+            Column::new("id", DataType::Integer, false),
+            Column::new("total", DataType::Double, true),
+        ],
+    );
+    catalog.insert_schema(
+        "pg",
+        "public",
+        Schema::with_tables("public", "pg", vec![users, orders]),
+    );
+    catalog
+}
+
+/// The output names of a star query parsed against `star_modifier_catalog`.
+fn star_aliases(sql: &str) -> Vec<String> {
+    let catalog = star_modifier_catalog();
+    let LogicalPlan::Projection(projection) = fq_parse::parse_with_catalog(sql, &catalog).unwrap()
+    else {
+        panic!("expected Projection");
+    };
+    projection.aliases
+}
+
+/// The error message of a star query that must not parse.
+fn star_error(sql: &str) -> String {
+    let catalog = star_modifier_catalog();
+    let result = fq_parse::parse_with_catalog(sql, &catalog);
+    let Err(ParseError::Unsupported(message)) = result else {
+        panic!("expected Unsupported, got {result:?}");
+    };
+    message
+}
+
+#[test]
+fn star_exclude_unknown_column_raises() {
+    // The user asked to drop a column that does not exist: applying the modifier
+    // per column would drop nothing and answer with the full column list.
+    let message = star_error("SELECT * EXCLUDE (nope_typo) FROM pg.public.users");
+    assert!(message.contains("nope_typo"), "{message}");
+    // The spelled-right form still expands to the remaining column.
+    assert_eq!(
+        star_aliases("SELECT * EXCLUDE (name) FROM pg.public.users"),
+        vec!["id"]
+    );
+}
+
+#[test]
+fn star_rename_unknown_column_raises() {
+    let message = star_error("SELECT * RENAME (nope_typo AS x) FROM pg.public.users");
+    assert!(message.contains("nope_typo"), "{message}");
+    assert_eq!(
+        star_aliases("SELECT * RENAME (name AS who) FROM pg.public.users"),
+        vec!["id", "who"]
+    );
+}
+
+#[test]
+fn star_replace_unknown_column_raises() {
+    let message = star_error("SELECT * REPLACE (1 AS nope_typo) FROM pg.public.users");
+    assert!(message.contains("nope_typo"), "{message}");
+    assert_eq!(
+        star_aliases("SELECT * REPLACE (name || 'x' AS name) FROM pg.public.users"),
+        vec!["id", "name"]
+    );
+}
+
+#[test]
+fn star_modifier_matches_column_case_insensitively() {
+    // Modifier matching ignores case, so the validation must too.
+    assert_eq!(
+        star_aliases("SELECT * EXCLUDE (NAME) FROM pg.public.users"),
+        vec!["id"]
+    );
+}
+
+#[test]
+fn qualified_star_modifier_checked_against_its_own_table() {
+    // `u.*` expands to the users columns only, so a modifier naming an orders
+    // column matches nothing and raises.
+    let join = "FROM pg.public.users AS u JOIN pg.public.orders AS o ON u.id = o.id";
+    let message = star_error(&format!("SELECT u.* EXCLUDE (total) {join}"));
+    assert!(message.contains("total"), "{message}");
+    // The same modifier on the star that does expand that column is honored.
+    assert_eq!(
+        star_aliases(&format!("SELECT o.* EXCLUDE (total) {join}")),
+        vec!["id"]
+    );
+}
+
+#[test]
+fn each_star_carries_its_own_modifier_scope() {
+    // Each star is validated against what that star expands to: `u.*` sees the
+    // users columns, `o.*` the orders columns, and a bare `*` their union.
+    let join = "FROM pg.public.users AS u JOIN pg.public.orders AS o ON u.id = o.id";
+    assert_eq!(
+        star_aliases(&format!(
+            "SELECT u.* EXCLUDE (name), o.* EXCLUDE (total) {join}"
+        )),
+        vec!["id", "id"]
+    );
+    assert_eq!(
+        star_aliases(&format!("SELECT * EXCLUDE (name, total) {join}")),
+        vec!["id", "id"]
+    );
+    let message = star_error(&format!(
+        "SELECT u.* EXCLUDE (name), o.* EXCLUDE (name) {join}"
+    ));
+    assert!(message.contains("name"), "{message}");
+}
+
+#[test]
+fn star_excluding_every_column_raises() {
+    // An empty projection is not an answer; the query must fail loudly.
+    let message = star_error("SELECT * EXCLUDE (id, name) FROM pg.public.users");
+    assert!(message.contains("EXCLUDE"), "{message}");
+}
+
 #[test]
 fn distinct_sets_projection_flag() {
     let plan = parse("SELECT DISTINCT name FROM t").unwrap();
