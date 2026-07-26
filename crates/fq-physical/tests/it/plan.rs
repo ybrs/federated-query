@@ -779,3 +779,38 @@ fn coordinator_aggregate_is_stamped_with_a_group_observation() {
         .expect("a plain-column group key is stamped");
     assert_eq!(observation.columns, vec!["region".to_string()]);
 }
+
+#[test]
+fn recursive_cte_merge_sql_is_transpiled_for_the_merge_engine() {
+    // A recursive cross-source CTE runs wholly in the merge engine, so its SQL
+    // must carry that engine's dialect like every other merge-engine render.
+    // The `<>` in the body is the probe: canonical Postgres renders the operator
+    // as `!=`, and the DuckDB transpile normalizes it, so the spelling in the
+    // stored SQL says which side of the boundary the text came from.
+    let catalog = catalog();
+    let physical = plan_sql(
+        &catalog,
+        "WITH RECURSIVE seq(n) AS (\
+           SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n <> 3) \
+         SELECT o.id FROM seq \
+         JOIN pg.public.orders o ON o.id = seq.n \
+         JOIN duck.main.lineitem l ON l.l_orderkey = o.id",
+    );
+    let merges = find_all(&physical, &|node| {
+        matches!(node, PhysicalPlan::CteMergeQuery(_))
+    });
+    assert_eq!(merges.len(), 1, "one merge query in plan: {physical:?}");
+    let PhysicalPlan::CteMergeQuery(merge) = merges[0] else {
+        panic!("find_all returned a non-merge node")
+    };
+    assert!(
+        merge.sql.contains("<>"),
+        "the merge SQL carries the transpiled operator: {}",
+        merge.sql
+    );
+    assert!(
+        !merge.sql.contains("!="),
+        "no canonical-Postgres operator survives into the merge SQL: {}",
+        merge.sql
+    );
+}

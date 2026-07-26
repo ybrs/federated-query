@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use fq_emit::{to_source_sql, Dialect};
 use fq_plan::logical::{Cte, CteRef, LogicalPlan, Scan};
 use fq_plan::physical::{PhysicalCte, PhysicalCteMergeQuery, PhysicalCteScan, PhysicalPlan};
 
@@ -90,6 +91,12 @@ impl PhysicalPlanner {
                 name: cte.name.clone(),
             });
         };
+        // This WITH runs in the merge engine, so its canonical Postgres text
+        // crosses the transpile boundary into that engine's dialect - the same
+        // step every other merge-engine renderer in `steps::render_sql` takes.
+        // Without it one path into the merge engine would carry Postgres spellings
+        // while its siblings carry DuckDB ones.
+        let sql = to_source_sql(&sql, Dialect::DuckDb)?;
         // Fresh PhysicalCteMergeQuery built from the rendered WITH SQL and the
         // materialized base inputs: nothing to copy from, so every field is listed.
         Ok(PhysicalPlan::CteMergeQuery(PhysicalCteMergeQuery {
