@@ -408,3 +408,35 @@ fn describe_resolves_qualified_references_and_an_unknown_table_raises() {
         "unexpected error: {error}"
     );
 }
+
+#[test]
+fn an_aggregate_only_in_order_by_makes_the_query_grouped() {
+    // `ORDER BY count(*)` with no GROUP BY and no aggregate in the SELECT list is
+    // valid SQL: the aggregate groups the whole input into ONE row. The five
+    // fixture regions must therefore come back as a single row, not five - an
+    // aggregate sort key over an ungrouped scan is not an aggregate query.
+    let dir = temp_parquet_dir("order_by_agg");
+    write_region_parquet(&dir);
+    let runtime =
+        Runtime::from_config(&parquet_config(dir.to_str().unwrap())).expect("from_config");
+
+    for sql in [
+        "SELECT 1 AS one FROM pq.main.region ORDER BY count(*)",
+        "SELECT 1 AS one FROM pq.main.region ORDER BY count(*) + 1",
+        "SELECT 1 AS one FROM pq.main.region ORDER BY count(*) DESC",
+    ] {
+        let (_, batches) = runtime
+            .execute(sql)
+            .unwrap_or_else(|error| panic!("{sql} must run: {error}"));
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 1, "{sql} groups the whole input into one row");
+    }
+
+    // The five rows are still five when nothing groups them, so the aggregate
+    // gate did not start swallowing ordinary ORDER BY queries.
+    let (_, batches) = runtime
+        .execute("SELECT r_name FROM pq.main.region ORDER BY r_name")
+        .expect("plain order by");
+    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(rows, 5, "a plain ORDER BY still returns every row");
+}

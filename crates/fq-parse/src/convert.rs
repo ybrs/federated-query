@@ -1068,13 +1068,15 @@ impl<'a> Converter<'a> {
                 "SELECT DISTINCT with window functions".to_string(),
             ));
         }
-        // HAVING is itself grouping: with no GROUP BY it groups the whole input
-        // into one row. So its presence takes the aggregate path even when no
-        // aggregate appears in the SELECT list - build_aggregate is the ONLY
-        // place that consumes `select.having`, and any path that skips it drops
-        // the clause with no error at all.
+        // HAVING and an aggregate ORDER BY key are each themselves grouping: with
+        // no GROUP BY they group the whole input into one row. So either takes the
+        // aggregate path even when no aggregate appears in the SELECT list.
+        // build_aggregate is the ONLY place that consumes `select.having`, and a
+        // sort key holding an aggregate over a raw scan is not an aggregate at
+        // all - the grouping it implies has to exist before the Sort wraps it.
         if select.group_by.is_some()
             || select.having.is_some()
+            || order_by_aggregates(select)
             || expressions.iter().any(fq_plan::contains_aggregate)
         {
             if select.distinct {
@@ -2585,6 +2587,30 @@ fn aggregate_arguments(root: &Expression) -> Vec<&Expression> {
         }
     }
     args
+}
+
+/// Whether any ORDER BY key of `select` holds an aggregate call of THIS select,
+/// at the key's root or nested inside a larger key expression. Such a key cannot
+/// be computed over the ungrouped input, so it decides whether the select is an
+/// aggregate query - checked on the raw AST because the decision is made before
+/// the keys convert.
+fn order_by_aggregates(select: &Select) -> bool {
+    select.order_by.as_ref().is_some_and(|order_by| {
+        order_by
+            .expressions
+            .iter()
+            .any(|ordered| aggregate_in_own_scope(&ordered.this))
+    })
+}
+
+/// Whether `expr` contains an aggregate belonging to the query that OWNS it.
+/// `find_all_in_scope` stops at the nodes that open a child scope, which is the
+/// distinction that matters: `ORDER BY (SELECT max(x) FROM t)` sorts by a scalar
+/// the INNER query aggregates, and says nothing about whether the outer query
+/// groups. Descending into it would turn an ordinary sorted select into a
+/// one-row aggregate.
+fn aggregate_in_own_scope(expr: &Expression) -> bool {
+    is_aggregate(expr) || !polyglot_sql::find_all_in_scope(expr, is_aggregate, false).is_empty()
 }
 
 /// Whether an expression is one of the aggregate calls.

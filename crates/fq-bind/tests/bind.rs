@@ -900,3 +900,61 @@ fn grouped_column_in_having_is_allowed() {
         bind_sql(sql).unwrap_or_else(|error| panic!("{sql} must bind: {error}"));
     }
 }
+
+#[test]
+fn an_aggregate_order_by_key_is_an_aggregate_query() {
+    // Same rule as HAVING: a clause that can only be evaluated over groups makes
+    // the query grouped. A sort key holding an aggregate cannot be computed over
+    // the ungrouped rows, so the Aggregate has to exist beneath the Sort. Nested
+    // is covered too - the key need not BE the aggregate, only contain one.
+    for sql in [
+        "SELECT 1 AS one FROM pg.public.users ORDER BY count(*)",
+        "SELECT 1 AS one FROM pg.public.users ORDER BY count(*) + 1",
+        "SELECT 1 AS one FROM pg.public.users ORDER BY count(*) DESC",
+    ] {
+        let plan = bind_sql(sql).unwrap_or_else(|error| panic!("{sql} must bind: {error}"));
+        assert!(
+            plan_contains_aggregate(&plan),
+            "{sql} must bind to a plan containing an Aggregate, got {plan:?}"
+        );
+    }
+}
+
+#[test]
+fn a_plain_order_by_stays_ungrouped() {
+    // The negative side: no aggregate anywhere means no Aggregate node, so the
+    // widened gate cannot turn ordinary sorted queries into one-row aggregates.
+    for sql in [
+        "SELECT name FROM pg.public.users ORDER BY name",
+        "SELECT 1 AS one FROM pg.public.users ORDER BY id",
+    ] {
+        let plan = bind_sql(sql).unwrap_or_else(|error| panic!("{sql} must bind: {error}"));
+        assert!(
+            !plan_contains_aggregate(&plan),
+            "{sql} must stay ungrouped, got {plan:?}"
+        );
+    }
+}
+
+/// Whether any node in the bound plan is an Aggregate.
+fn plan_contains_aggregate(plan: &LogicalPlan) -> bool {
+    matches!(plan, LogicalPlan::Aggregate(_))
+        || plan.children().iter().any(|child| plan_contains_aggregate(child))
+}
+
+#[test]
+fn an_aggregate_inside_an_order_by_subquery_does_not_group_the_outer_query() {
+    // The sort key is a scalar subquery whose max() belongs to the INNER query.
+    // It says nothing about whether the outer select groups, so the outer plan
+    // must stay ungrouped - treating it as an outer aggregate would collapse
+    // every row into one.
+    let plan = bind_sql(
+        "SELECT id FROM pg.public.users ORDER BY \
+         (SELECT max(o.total) FROM pg.public.orders o WHERE o.user_id = users.id)",
+    )
+    .expect("bind");
+    assert!(
+        !plan_contains_aggregate(&plan),
+        "the inner aggregate must not group the outer query, got {plan:?}"
+    );
+}
