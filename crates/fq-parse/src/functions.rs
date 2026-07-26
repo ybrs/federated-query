@@ -14,6 +14,41 @@ use crate::convert::Converter;
 use crate::error::ParseError;
 use crate::expr::scalar_function_call;
 
+/// Scalar functions carried through by name: polyglot's variant name paired with
+/// the SQL name the engine renders. Their operands are read generically, so an
+/// entry is one line rather than an arm.
+///
+/// Only plain scalar functions whose operands are positional belong here. Kept
+/// out deliberately: aggregates (they need `is_aggregate`, which drives the
+/// grouping gates), functions with non-positional syntax such as `POSITION(x IN
+/// y)`, and non-deterministic ones such as `RANDOM()` whose result changes per
+/// evaluation, so pushing or re-evaluating a call changes the answer.
+const PASSTHROUGH_FUNCTIONS: &[(&str, &str)] = &[
+    ("sqrt", "SQRT"),
+    ("ln", "LN"),
+    ("exp", "EXP"),
+    ("initcap", "INITCAP"),
+    ("sin", "SIN"),
+    ("cos", "COS"),
+    ("tan", "TAN"),
+    ("degrees", "DEGREES"),
+    ("radians", "RADIANS"),
+    ("sign", "SIGN"),
+    ("cbrt", "CBRT"),
+    ("year", "YEAR"),
+    ("month", "MONTH"),
+    ("day", "DAY"),
+    ("hour", "HOUR"),
+    ("minute", "MINUTE"),
+    ("second", "SECOND"),
+    ("nvl", "NVL"),
+    ("starts_with", "STARTS_WITH"),
+    ("ends_with", "ENDS_WITH"),
+    ("contains", "CONTAINS"),
+    ("levenshtein", "LEVENSHTEIN"),
+    ("mod_func", "MOD"),
+];
+
 impl Converter<'_> {
     /// Convert a typed scalar-function expression. Handles the corpus set
     /// (COALESCE, SUBSTRING, ROUND, NULLIF, REPLACE, EXTRACT, UPPER/LOWER, ABS,
@@ -45,11 +80,50 @@ impl Converter<'_> {
             // The generic function node (name + args), for functions with no
             // dedicated variant.
             Expression::Function(func) => self.convert_generic_function(func),
-            other => Err(ParseError::Unsupported(format!(
-                "function `{}`",
-                other.variant_name()
-            ))),
+            other => self.passthrough_function(other),
         }
+    }
+
+    /// Convert a function polyglot gives a dedicated variant but this module has
+    /// no bespoke arm for, using the AST's generic operand accessors. The name is
+    /// looked up in `PASSTHROUGH_FUNCTIONS`; a variant absent from that table
+    /// raises as before.
+    ///
+    /// Membership is a table rather than a blanket fallback because this arm sees
+    /// EVERY expression variant the converter does not handle, not only functions.
+    /// `a IS TRUE` and `a & b` arrive here too, and rewriting either as a
+    /// `FUNCTION(a, b)` call would change what the query means without an error.
+    fn passthrough_function(&self, expr: &Expression) -> Result<Expr, ParseError> {
+        let variant = expr.variant_name();
+        let Some((_, sql_name)) = PASSTHROUGH_FUNCTIONS
+            .iter()
+            .find(|(known, _)| *known == variant)
+        else {
+            return Err(ParseError::Unsupported(format!("function `{variant}`")));
+        };
+        // Operands in call order: the primary operand, then a binary function's
+        // second, then any variadic tail. A variant carries only the ones its
+        // shape defines, so the concatenation is the argument list.
+        let mut args = Vec::new();
+        if let Some(this) = expr.get_this() {
+            args.push(self.expr(this)?);
+        }
+        if let Some(second) = expr.get_expression() {
+            args.push(self.expr(second)?);
+        }
+        for extra in expr.get_expressions() {
+            args.push(self.expr(extra)?);
+        }
+        // Every function in the table takes at least one operand, so an empty
+        // list means this variant keeps its operands in fields the generic
+        // accessors do not reach. Emitting the call anyway would render
+        // `NAME()` and silently drop what the user wrote.
+        if args.is_empty() {
+            return Err(ParseError::Unsupported(format!(
+                "function `{variant}`: operands are not reachable generically"
+            )));
+        }
+        Ok(scalar_function_call((*sql_name).to_string(), args))
     }
 
     /// Convert the generic `Function { name, args, distinct }` node into a

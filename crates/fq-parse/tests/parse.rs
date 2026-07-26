@@ -2396,3 +2396,98 @@ fn table_function_malformed_filter_raises() {
         parse("SELECT path_id FROM paths('web', filter => 'device')").unwrap_err();
     assert!(matches!(error, ParseError::Parse(_)), "got {error:?}");
 }
+
+// --------------------------------------------------------------------------
+// scalar functions carried through by name
+// --------------------------------------------------------------------------
+
+/// A catalog with pg.public.fn_t(name VARCHAR, age INT, price DOUBLE, d DATE).
+fn function_catalog() -> fq_catalog::Catalog {
+    let table = fq_catalog::Table::new(
+        "fn_t",
+        vec![
+            fq_catalog::Column::new("name", fq_common::DataType::Varchar, true),
+            fq_catalog::Column::new("age", fq_common::DataType::Integer, true),
+            fq_catalog::Column::new("price", fq_common::DataType::Double, true),
+            fq_catalog::Column::new("d", fq_common::DataType::Date, true),
+        ],
+    );
+    let mut catalog = fq_catalog::Catalog::new();
+    catalog.insert_schema(
+        "pg",
+        "public",
+        fq_catalog::Schema::with_tables("public", "pg", vec![table]),
+    );
+    catalog
+}
+
+/// The first SELECT-list expression of `SELECT <item> AS out FROM pg.public.fn_t`.
+fn function_expr(item: &str) -> Result<Expr, String> {
+    let catalog = function_catalog();
+    let sql = format!("SELECT {item} AS out FROM pg.public.fn_t");
+    let plan = fq_parse::parse_with_catalog(&sql, &catalog).map_err(|error| error.to_string())?;
+    let LogicalPlan::Projection(projection) = &plan else {
+        return Err(format!("expected Projection, got {plan:?}"));
+    };
+    Ok(projection.expressions[0].clone())
+}
+
+#[test]
+fn typed_scalar_functions_carry_through_with_their_operands() {
+    // polyglot gives each of these its own AST variant, so they reach the
+    // converter as typed nodes rather than the generic function node. Each must
+    // keep its SQL name AND every operand: a call that renders without its
+    // arguments computes something the query never asked for.
+    for (item, name, arity) in [
+        ("SQRT(price)", "SQRT", 1),
+        ("LN(price)", "LN", 1),
+        ("EXP(price)", "EXP", 1),
+        ("INITCAP(name)", "INITCAP", 1),
+        ("SIN(price)", "SIN", 1),
+        ("DEGREES(price)", "DEGREES", 1),
+        ("YEAR(d)", "YEAR", 1),
+        ("MONTH(d)", "MONTH", 1),
+        ("NVL(name, 'x')", "NVL", 2),
+        ("STARTS_WITH(name, 'a')", "STARTS_WITH", 2),
+        ("MOD(age, 2)", "MOD", 2),
+    ] {
+        let expr = function_expr(item).unwrap_or_else(|error| panic!("{item}: {error}"));
+        let Expr::FunctionCall {
+            function_name,
+            args,
+            is_aggregate,
+            ..
+        } = &expr
+        else {
+            panic!("{item} must convert to a FunctionCall, got {expr:?}");
+        };
+        assert_eq!(function_name, name, "{item} keeps its SQL name");
+        assert_eq!(args.len(), arity, "{item} keeps every operand: {args:?}");
+        assert!(!is_aggregate, "{item} is a scalar function");
+    }
+}
+
+#[test]
+fn a_function_whose_operands_are_unreachable_raises() {
+    // LAST_DAY holds its operand in a field the generic accessors do not reach,
+    // so carrying it through by name would render `LAST_DAY()` and drop the
+    // column. It raises instead, and the message says why.
+    let error = function_expr("LAST_DAY(d)").unwrap_err();
+    assert!(
+        error.contains("last_day"),
+        "the raise names the function: {error}"
+    );
+}
+
+#[test]
+fn non_function_variants_still_raise() {
+    // The passthrough arm sees every variant the converter does not handle, not
+    // only functions. These are operators and a non-deterministic call; turning
+    // any of them into a named function call would change what the query means.
+    for item in ["age & 1", "(age > 1) IS TRUE", "RANDOM()", "IF(age > 1, 1, 2)"] {
+        assert!(
+            function_expr(item).is_err(),
+            "{item} must still raise rather than become a function call"
+        );
+    }
+}
