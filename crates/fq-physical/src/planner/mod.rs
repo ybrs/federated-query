@@ -40,7 +40,7 @@ use crate::single_source::SingleSourcePushdown;
 /// Map a resolved datasource's render dialect to the plan-level `DatasourceKind`
 /// stamped on a scan, so step-building needs no catalog to pick the source dialect
 /// or gate the Postgres parallel path.
-fn datasource_kind_of(dialect: RenderDialect) -> DatasourceKind {
+pub(crate) fn datasource_kind_of(dialect: RenderDialect) -> DatasourceKind {
     match dialect {
         RenderDialect::Postgres => DatasourceKind::Postgres,
         RenderDialect::DuckDb => DatasourceKind::DuckDb,

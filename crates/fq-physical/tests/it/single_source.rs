@@ -6,13 +6,17 @@
 //! rendered `PhysicalRemoteQuery.sql` (and its estimate/alias/NDV fields). The
 //! end-to-end cases (aggregate, CTE, set-op-in-a-subquery) drive real SQL through
 //! parse -> bind -> decorrelate -> optimize -> plan and assert the produced remote
-//! query. This is the Rust analogue of the Python e2e_pushdown suites, which
-//! assert on the query the source receives (pre-transpile canonical Postgres).
+//! query. Both drivers assert on the query the SOURCE receives: `finish`
+//! transpiles the canonical Postgres text into the source's dialect, so a
+//! Postgres-source case reads as canonical Postgres and the dialect case
+//! (`pushed_island_is_transpiled_to_the_source_dialect`) pins the other targets.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use fq_catalog::datasource::{DataSource, DataSourceCapability, TableMetadata, TableStatistics};
+use fq_catalog::datasource::{
+    DataSource, DataSourceCapability, RenderDialect, TableMetadata, TableStatistics,
+};
 use fq_catalog::{Catalog, CatalogError, Column, Schema, Table};
 use fq_common::{CostConfig, DataType, OptimizerConfig};
 use fq_optimize::{build_optimizer, CostModel};
@@ -29,15 +33,19 @@ use fq_plan::physical::{PhysicalPlan, PhysicalRemoteQuery};
 // Catalog + mock datasource (mirrors tests/plan.rs)
 // --------------------------------------------------------------------------
 
-/// A metadata-only source with configurable capabilities.
+/// A metadata-only source with configurable capabilities and render dialect.
 struct MockSource {
     name: String,
     capabilities: Vec<DataSourceCapability>,
+    render_dialect: RenderDialect,
 }
 
 impl DataSource for MockSource {
     fn name(&self) -> &str {
         &self.name
+    }
+    fn render_dialect(&self) -> RenderDialect {
+        self.render_dialect
     }
     fn capabilities(&self) -> Vec<DataSourceCapability> {
         self.capabilities.clone()
@@ -110,10 +118,44 @@ fn catalog() -> Arc<Catalog> {
     catalog.register_datasource(Arc::new(MockSource {
         name: "pg".to_string(),
         capabilities: vec![DataSourceCapability::Joins],
+        render_dialect: RenderDialect::Postgres,
     }));
     catalog.register_datasource(Arc::new(MockSource {
         name: "duck".to_string(),
         capabilities: vec![DataSourceCapability::Joins],
+        render_dialect: RenderDialect::DuckDb,
+    }));
+    Arc::new(catalog)
+}
+
+/// A one-source catalog (`src.public` with orders + customer) whose datasource
+/// renders in `render_dialect` and supports JOINS, so a pushed island transpiles
+/// to that dialect.
+fn dialect_catalog(render_dialect: RenderDialect) -> Arc<Catalog> {
+    let orders = Table::new(
+        "orders",
+        vec![
+            Column::new("id", DataType::Integer, false),
+            Column::new("cust_id", DataType::Integer, true),
+        ],
+    );
+    let customer = Table::new(
+        "customer",
+        vec![
+            Column::new("id", DataType::Integer, false),
+            Column::new("nation", DataType::Varchar, true),
+        ],
+    );
+    let mut catalog = Catalog::new();
+    catalog.insert_schema(
+        "src",
+        "public",
+        Schema::with_tables("public", "src", vec![orders, customer]),
+    );
+    catalog.register_datasource(Arc::new(MockSource {
+        name: "src".to_string(),
+        capabilities: vec![DataSourceCapability::Joins],
+        render_dialect,
     }));
     Arc::new(catalog)
 }
@@ -379,7 +421,7 @@ fn left_join_filtered_right_rides_the_on_condition() {
     assert!(
         remote
             .sql
-            .contains("AND ((\"customer\".\"nation\" != 'x'))"),
+            .contains("AND ((\"customer\".\"nation\" <> 'x'))"),
         "the filter rides the ON: {}",
         remote.sql
     );
@@ -590,6 +632,7 @@ fn source_without_join_capability_declines() {
     cat.register_datasource(Arc::new(MockSource {
         name: "pg".to_string(),
         capabilities: vec![],
+        render_dialect: RenderDialect::Postgres,
     }));
     let catalog = Arc::new(cat);
     let node = project(
@@ -704,5 +747,74 @@ fn cte_with_a_union_body_pushes_whole() {
     assert!(
         sql.contains("FROM u"),
         "the child reads the CTE by name: {sql}"
+    );
+}
+
+// ==========================================================================
+// the pushed island crosses the transpile boundary into its source's dialect
+// ==========================================================================
+
+/// The subtree every dialect case pushes: a same-source join with a string
+/// predicate, projecting one column. Its canonical Postgres form double-quotes
+/// identifiers, which MySQL reads as string literals under the default sql_mode.
+fn dialect_probe_plan() -> LogicalPlan {
+    let mut customer = scan("src", "public", "customer", &["id", "nation"]);
+    customer.filters = Some(Expr::BinaryOp {
+        op: BinaryOpType::Neq,
+        left: Box::new(typed_col("customer", "nation", DataType::Varchar)),
+        right: Box::new(Expr::Literal {
+            value: LiteralValue::String("FRANCE".to_string()),
+            data_type: DataType::Varchar,
+        }),
+    });
+    project(
+        join(
+            LogicalPlan::Scan(Box::new(scan("src", "public", "orders", &["id", "cust_id"]))),
+            LogicalPlan::Scan(Box::new(customer)),
+            JoinType::Inner,
+            eq(col("orders", "cust_id"), col("customer", "id")),
+        ),
+        col("orders", "id"),
+        "id",
+    )
+}
+
+/// The island SQL a source of `render_dialect` receives.
+fn island_sql(render_dialect: RenderDialect) -> String {
+    try_build(&dialect_catalog(render_dialect), &dialect_probe_plan())
+        .expect("same-source join pushes")
+        .sql
+}
+
+#[test]
+fn pushed_island_is_transpiled_to_the_source_dialect() {
+    assert_eq!(
+        island_sql(RenderDialect::MySql),
+        "SELECT `orders`.`id` AS `id` FROM `public`.`orders` AS `orders` \
+         INNER JOIN `public`.`customer` AS `customer` \
+         ON (`orders`.`cust_id` = `customer`.`id`) \
+         WHERE (`customer`.`nation` <> 'FRANCE')",
+        "MySQL quotes identifiers with backticks"
+    );
+    assert_eq!(
+        island_sql(RenderDialect::Postgres),
+        "SELECT \"orders\".\"id\" AS \"id\" FROM \"public\".\"orders\" AS \"orders\" \
+         INNER JOIN \"public\".\"customer\" AS \"customer\" \
+         ON (\"orders\".\"cust_id\" = \"customer\".\"id\") \
+         WHERE (\"customer\".\"nation\" <> 'FRANCE')"
+    );
+    assert_eq!(
+        island_sql(RenderDialect::ClickHouse),
+        "SELECT \"orders\".\"id\" AS \"id\" FROM \"public\".\"orders\" AS \"orders\" \
+         INNER JOIN \"public\".\"customer\" AS \"customer\" \
+         ON (\"orders\".\"cust_id\" = \"customer\".\"id\") \
+         WHERE (\"customer\".\"nation\" <> 'FRANCE')"
+    );
+    assert_eq!(
+        island_sql(RenderDialect::DuckDb),
+        "SELECT \"orders\".\"id\" AS \"id\" FROM \"public\".\"orders\" AS \"orders\" \
+         INNER JOIN \"public\".\"customer\" AS \"customer\" \
+         ON (\"orders\".\"cust_id\" = \"customer\".\"id\") \
+         WHERE (\"customer\".\"nation\" <> 'FRANCE')"
     );
 }

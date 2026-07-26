@@ -7,7 +7,9 @@
 //! and eagerly-rendered `String` for the pieces that do not (FROM/JOIN/WHERE/
 //! HAVING/GROUP BY/ORDER BY, each CTE body, each set-op branch). fq-emit renders
 //! `Expr` + clause data to canonical Postgres TEXT; the FROM/JOIN/EXISTS/WITH text
-//! builders live in `relation_sql.rs` + `render`.
+//! builders live in `relation_sql.rs` + `render`. `finish` then carries that
+//! canonical text across the one transpile boundary (`to_source_sql`) into the
+//! resolved source's dialect, so `PhysicalRemoteQuery.sql` is source-ready SQL.
 //!
 //! Two things sqlglot did for free and this module builds explicitly: a SEMI/ANTI
 //! join becomes `WHERE [NOT] EXISTS(...)`, and the recursive-CTE base
@@ -24,7 +26,7 @@ use std::sync::Arc;
 use fq_catalog::datasource::DataSourceCapability;
 use fq_catalog::Catalog;
 use fq_emit::{
-    clauses, quote_ident, render_canonical, render_expr, EmitError, SelectPieces,
+    clauses, quote_ident, render_canonical, render_expr, to_source_sql, EmitError, SelectPieces,
     CANONICAL_SOURCE_RESOLVER,
 };
 use fq_plan::expr::{aggregate_output_map, split_where_having, ColumnRef, Expr};
@@ -34,7 +36,9 @@ use fq_plan::logical::{
 };
 use fq_plan::physical::{ColumnAliasMap, PhysicalRemoteQuery};
 
+use crate::planner::datasource_kind_of;
 use crate::relation_sql::{cte_ref_sql, derived_table, table_ref};
+use crate::steps::scan_dialect;
 
 /// Identity map from a base scan (keyed by its pointer, matching Python
 /// `id(scan)`) to the merge-engine relation name it renders as, instead of
@@ -735,7 +739,10 @@ impl SingleSourcePushdown {
         }
         let mut column_alias_map = ctx.column_aliases.clone();
         expose_computed_outputs(&mut column_alias_map, &ctx.output_names);
-        let sql = render(ctx)?;
+        // The island runs verbatim on `source`, so its canonical Postgres text
+        // crosses the one transpile boundary into that source's own dialect.
+        let dialect = scan_dialect(datasource_kind_of(source.render_dialect()));
+        let sql = to_source_sql(&render(ctx)?, dialect)?;
         // Fresh PhysicalRemoteQuery built from the rendered same-source SQL and the
         // push context: nothing of this type to copy from, so every field is listed
         // (the estimated_rows / output_estimated_rows / column_ndv stamps are
