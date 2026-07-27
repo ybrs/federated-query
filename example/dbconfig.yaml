@@ -12,7 +12,6 @@ datasources:
   local_duckdb:
     type: duckdb
     path: "products.duckdb"
-    read_only: false
     capabilities: [aggregations, joins]
 
 optimizer:

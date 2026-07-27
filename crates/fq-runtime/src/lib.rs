@@ -804,6 +804,7 @@ fn register_parquet(
     catalog: &mut Catalog,
     datasource: &DataSourceConfig,
 ) -> Result<(), RuntimeError> {
+    reject_unknown_keys(datasource, &["dir", "file"])?;
     let path = parquet_source_path(datasource)?;
     let source = ParquetSource::open(datasource.name.clone(), &path)?;
     catalog.register_datasource(Arc::new(source));
@@ -1026,6 +1027,7 @@ fn register_duckdb(
     catalog: &mut Catalog,
     datasource: &DataSourceConfig,
 ) -> Result<(), RuntimeError> {
+    reject_unknown_keys(datasource, &["path"])?;
     let path = require_str(datasource, "path")?;
     let source = DuckDbSource::open(datasource.name.clone(), &path)?;
     connectors::seed_duck_connection(session, path.clone(), source.clone_connection()?);
@@ -1042,6 +1044,19 @@ fn register_postgres(
     catalog: &mut Catalog,
     datasource: &DataSourceConfig,
 ) -> Result<(), RuntimeError> {
+    reject_unknown_keys(
+        datasource,
+        &[
+            "host",
+            "port",
+            "user",
+            "password",
+            "database",
+            "dbname",
+            "schemas",
+            "adbc_driver",
+        ],
+    )?;
     let source = PostgresSource::connect(
         datasource.name.clone(),
         &libpq_conn_str(datasource)?,

@@ -440,3 +440,71 @@ fn an_aggregate_only_in_order_by_makes_the_query_grouped() {
     let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
     assert_eq!(rows, 5, "a plain ORDER BY still returns every row");
 }
+
+#[test]
+fn an_unknown_datasource_parameter_raises() {
+    // A misspelled key must not be ignored. `host` falls back to localhost when
+    // absent, so accepting `hostt` silently points the engine at a different
+    // machine than the config names - a wrong answer sourced from the wrong
+    // database, with nothing to read in a log.
+    let mut params: BTreeMap<String, Value> = BTreeMap::new();
+    params.insert(
+        "hostt".to_string(),
+        Value::String("prod-db.invalid".to_string()),
+    );
+    params.insert("user".to_string(), Value::String("postgres".to_string()));
+    params.insert("database".to_string(), Value::String("test_db".to_string()));
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "pg".to_string(),
+        DataSourceConfig {
+            name: "pg".to_string(),
+            ty: "postgresql".to_string(),
+            config: params,
+            capabilities: Vec::new(),
+            change_keys: BTreeMap::new(),
+        },
+    );
+    let error = Runtime::from_config(&base_config(sources))
+        .err()
+        .expect("a misspelled postgres parameter must raise");
+    let message = error.to_string();
+    assert!(
+        message.contains("hostt"),
+        "the raise names the offending key: {message}"
+    );
+
+    // Same for a parquet source, whose real keys are `dir` and `file`.
+    let dir = temp_parquet_dir("unknown_key_raises");
+    write_region_parquet(&dir);
+    let mut pq = parquet_params(dir.to_str().unwrap());
+    pq.insert("cache_sizee".to_string(), Value::String("999".to_string()));
+    let mut sources2 = BTreeMap::new();
+    sources2.insert(
+        "pq".to_string(),
+        DataSourceConfig {
+            name: "pq".to_string(),
+            ty: "parquet".to_string(),
+            config: pq,
+            capabilities: Vec::new(),
+            change_keys: BTreeMap::new(),
+        },
+    );
+    let error = Runtime::from_config(&base_config(sources2))
+        .err()
+        .expect("an unknown parquet parameter must raise");
+    assert!(
+        error.to_string().contains("cache_sizee"),
+        "the raise names the offending key: {error}"
+    );
+}
+
+#[test]
+fn every_real_datasource_parameter_is_still_accepted() {
+    // The guard must not reject a legitimate config: the parquet source the
+    // other tests in this file use has to keep working.
+    let dir = temp_parquet_dir("known_keys_ok");
+    write_region_parquet(&dir);
+    Runtime::from_config(&parquet_config(dir.to_str().unwrap()))
+        .expect("a config using only real keys still builds");
+}

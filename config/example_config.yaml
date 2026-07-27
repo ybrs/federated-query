@@ -21,7 +21,6 @@ datasources:
   local_duckdb:
     type: duckdb
     path: /data/analytics.duckdb
-    read_only: true
     capabilities:
       - aggregations
       - joins
