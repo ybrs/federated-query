@@ -101,6 +101,30 @@ fn describe_into(
     Ok(())
 }
 
+/// Append the runtime IN filter a probe scan will receive, as a real predicate
+/// on the rendered SQL: `... WHERE col IN (...)`.
+///
+/// The value list stays `(...)`. The build-side keys exist only once the join
+/// has run, and fetching a sample of them would make EXPLAIN read data - which
+/// it does not do, and must not start doing. What matters for reading a plan is
+/// that the reduction fires and WHICH column it narrows; the values do not
+/// change that. Only single-column keys are annotated, because a composite key
+/// does not render as one IN list.
+fn annotate_dynamic_filter(scan: &fq_plan::physical::PhysicalScan, sql: String) -> String {
+    let Some(keys) = scan.dynamic_filter_keys.as_ref() else {
+        return sql;
+    };
+    let [key] = keys.as_slice() else {
+        return sql;
+    };
+    let predicate = format!("{} IN (...)", show_expr(key));
+    if sql.contains(" WHERE ") {
+        format!("{sql} AND {predicate}")
+    } else {
+        format!("{sql} WHERE {predicate}")
+    }
+}
+
 /// A join's equality keys and which side is built, e.g.
 /// ` keys=(o.id = l.orderkey) build=Right`. The keys decide whether the join is
 /// pushable and the build side decides which input is materialized, so both are
@@ -247,7 +271,8 @@ fn node_label(
                     format!("Scan [{}]", node.datasource)
                 }
             };
-            format!("{head} :: {}", one_line(&render_scan_sql(node)?))
+            let sql = one_line(&render_scan_sql(node)?);
+            format!("{head} :: {}", annotate_dynamic_filter(node, sql))
         }
         PhysicalPlan::RemoteQuery(node) => {
             format!(

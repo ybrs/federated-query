@@ -592,3 +592,40 @@ fn explain_shows_join_keys_build_side_and_grouping() {
         "the join type stays at the head of the label: {join}"
     );
 }
+
+#[test]
+fn explain_shows_the_runtime_in_filter_on_the_probe_scan() {
+    // A semi-join reduction narrows the probe scan at execution with the build
+    // side's real keys. EXPLAIN shows the predicate and the column it filters,
+    // with the value list left as `(...)`: those values exist only once the join
+    // has run, and fetching a sample would make EXPLAIN read data.
+    let (runtime, orders, customers) = two_source_runtime("explain_dynfilter");
+    let sql = format!(
+        "SELECT o.order_id FROM {orders}.main.orders o \
+         JOIN {customers}.main.customers c ON o.customer_id = c.customer_id \
+         WHERE c.segment = 'enterprise'"
+    );
+    let lines = explain_lines(&runtime, &sql);
+    let probe = lines
+        .iter()
+        .find(|line| line.contains("+inject("))
+        .unwrap_or_else(|| panic!("a reduced probe scan in:\n{lines:#?}"));
+    assert!(
+        probe.contains("IN (...)"),
+        "the probe scan shows the runtime filter: {probe}"
+    );
+    assert!(
+        probe.contains("customer_id"),
+        "the filter names the reduced column: {probe}"
+    );
+
+    // The build side is not reduced, so it gains no such predicate.
+    let build = lines
+        .iter()
+        .find(|line| line.contains("customers") && !line.contains("+inject("))
+        .unwrap_or_else(|| panic!("an unreduced build scan in:\n{lines:#?}"));
+    assert!(
+        !build.contains("IN (...)"),
+        "only the probe side carries the runtime filter: {build}"
+    );
+}
