@@ -671,3 +671,75 @@ fn explain_prices_the_nodes_that_cross_the_wire() {
         );
     }
 }
+
+#[test]
+fn explain_format_json_carries_the_same_plan_as_the_text_tree() {
+    // The JSON is a nested document, not a list of rendered lines: a consumer
+    // reads node kind, details, pushed SQL, cost and rows as fields instead of
+    // parsing a label. Both renderers derive from the same annotation code, so
+    // they cannot disagree about a node.
+    let (runtime, orders, customers) = two_source_runtime("explain_json");
+    let query = format!(
+        "SELECT c.segment FROM {orders}.main.orders o \
+         JOIN {customers}.main.customers c ON o.customer_id = c.customer_id"
+    );
+    let (schema, batches) = runtime
+        .execute(&format!("EXPLAIN (FORMAT JSON) {query}"))
+        .expect("explain json");
+    assert_eq!(schema.fields().len(), 1, "one plan column");
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        1,
+        "the whole document is ONE row, not one row per line"
+    );
+    let document: serde_json::Value =
+        serde_json::from_str(str_col(&batches[0], 0).value(0)).expect("valid JSON");
+
+    // The join sits somewhere in the tree with its keys and build side as a
+    // field, and both scans carry a priced cost with its provenance.
+    let text = document.to_string();
+    assert!(
+        text.contains("HashJoin [INNER]") && text.contains("build=Right"),
+        "the join and its build side are present: {text}"
+    );
+    assert!(
+        text.contains("\"cost_ms\":10") && text.contains("avg_width"),
+        "a priced scan carries cost and the default it rested on: {text}"
+    );
+    // An unknown is null, not absent: a consumer can tell "no estimate" from
+    // "estimate of zero".
+    assert!(
+        document["rows"].is_null() && document["cost_ms"].is_null(),
+        "a coordinator-local root reports nulls, not missing keys: {document}"
+    );
+
+    // FORMAT TEXT is the default and still renders one row per node.
+    let (_, text_batches) = runtime.execute(&format!("EXPLAIN {query}")).expect("explain");
+    assert!(
+        text_batches.iter().map(RecordBatch::num_rows).sum::<usize>() > 1,
+        "the text form stays a line per node"
+    );
+}
+
+#[test]
+fn an_unsupported_explain_option_raises() {
+    // ANALYZE asks to execute and measure. Returning an unmeasured plan would
+    // answer a different question than the one asked, so it raises.
+    let (runtime, orders, _) = two_source_runtime("explain_opts");
+    let query = format!("SELECT order_id FROM {orders}.main.orders");
+    for bad in [
+        format!("EXPLAIN (ANALYZE) {query}"),
+        format!("EXPLAIN (FORMAT XML) {query}"),
+        format!("EXPLAIN (VERBOSE) {query}"),
+    ] {
+        let error = runtime
+            .execute(&bad)
+            .err()
+            .unwrap_or_else(|| panic!("{bad} must raise"))
+            .to_string();
+        assert!(
+            error.contains("FORMAT TEXT, FORMAT JSON"),
+            "the raise names what IS supported: {error}"
+        );
+    }
+}

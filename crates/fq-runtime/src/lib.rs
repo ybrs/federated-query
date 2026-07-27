@@ -287,8 +287,9 @@ impl Runtime {
     /// plan WITHOUT executing. Materialized-view DDL dispatches to the store
     /// and returns a one-row `status` table (the pg command-tag convention).
     pub fn execute(&self, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-        if let Some(inner) = explain::strip_explain(sql) {
-            return self.explain(inner);
+        if let Some(explain) = explain::strip_explain(sql) {
+            let explain = explain?;
+            return self.explain(explain.inner, explain.format);
         }
         let statement = classify_statement(sql)?;
         // Admin DDL is superuser-gated BEFORE the handler runs: a non-superuser
@@ -609,7 +610,11 @@ impl Runtime {
     /// as a single `plan` text column, one row per line. Nothing executes.
     /// Only a query has a plan: EXPLAIN of a DDL, settings, or analysis
     /// statement raises naming the form instead of feeding it to the SQL parser.
-    fn explain(&self, inner: &str) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
+    fn explain(
+        &self,
+        inner: &str,
+        format: explain::ExplainFormat,
+    ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         if !matches!(classify_statement(inner)?, Statement::Query(_)) {
             return Err(RuntimeError::Parse(fq_parse::ParseError::Unsupported(
                 "EXPLAIN takes a query; DDL and settings statements have no \
@@ -618,7 +623,11 @@ impl Runtime {
             )));
         }
         let physical = self.plan(inner)?;
-        let lines = explain::describe(&physical, &self.config_snapshot().cost)?;
+        let cost = self.config_snapshot().cost;
+        let lines = match format {
+            explain::ExplainFormat::Text => explain::describe(&physical, &cost)?,
+            explain::ExplainFormat::Json => vec![explain::describe_json(&physical, &cost)?],
+        };
         let schema = Arc::new(Schema::new(vec![Field::new(
             "plan",
             ArrowDataType::Utf8,

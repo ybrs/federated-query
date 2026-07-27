@@ -14,13 +14,36 @@ use std::sync::Arc;
 use fq_physical::steps::planned_injections;
 use fq_physical::{render_remote_set_op, render_scan_sql, StepError};
 use fq_common::CostConfig;
+
+use crate::error::RuntimeError;
 use fq_plan::physical::{BuildSide, PhysicalPlan};
 use fq_plan::Expr;
 
-/// If `sql` begins with the `EXPLAIN` keyword (case-insensitive, followed by
-/// whitespace), return the inner statement text; otherwise `None`. The caller
-/// plans and describes the inner statement instead of executing it.
-pub fn strip_explain(sql: &str) -> Option<&str> {
+/// How an EXPLAIN result is rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplainFormat {
+    /// An indented tree, one plan row per node.
+    Text,
+    /// One row holding the whole plan as a JSON document.
+    Json,
+}
+
+/// A parsed EXPLAIN: how to render, and the statement to plan. Named
+/// `ExplainRequest` rather than `Explain` so it is not mistaken for the logical
+/// plan node of that name, which this path does not build.
+pub struct ExplainRequest<'a> {
+    pub format: ExplainFormat,
+    pub inner: &'a str,
+}
+
+/// Recognize a leading `EXPLAIN [(FORMAT {TEXT|JSON})]` and return the render
+/// format with the inner statement; `None` when `sql` is not an EXPLAIN.
+///
+/// An option list that is present but not understood RAISES rather than being
+/// ignored: `EXPLAIN (ANALYZE) SELECT ...` asks to execute and measure, and
+/// silently returning an unmeasured plan would answer a different question than
+/// the one asked.
+pub fn strip_explain(sql: &str) -> Option<Result<ExplainRequest<'_>, RuntimeError>> {
     let trimmed = sql.trim_start();
     let mut chars = trimmed.char_indices();
     for expected in "explain".chars() {
@@ -29,10 +52,55 @@ pub fn strip_explain(sql: &str) -> Option<&str> {
             _ => return None,
         }
     }
-    // The keyword must be followed by whitespace, not be a prefix of an identifier.
-    match chars.next() {
-        Some((index, next)) if next.is_whitespace() => Some(trimmed[index..].trim_start()),
-        _ => None,
+    // The keyword must be followed by whitespace or an option list, not be a
+    // prefix of an identifier.
+    let rest = match chars.next() {
+        Some((index, next)) if next.is_whitespace() => trimmed[index..].trim_start(),
+        Some((index, '(')) => trimmed[index..].trim_start(),
+        _ => return None,
+    };
+    Some(parse_explain_options(rest))
+}
+
+/// Split an optional `(...)` option list off the front of an EXPLAIN body.
+fn parse_explain_options(rest: &str) -> Result<ExplainRequest<'_>, RuntimeError> {
+    let Some(body) = rest.strip_prefix('(') else {
+        return Ok(ExplainRequest {
+            format: ExplainFormat::Text,
+            inner: rest,
+        });
+    };
+    let Some(close) = body.find(')') else {
+        return Err(RuntimeError::Parse(fq_parse::ParseError::Unsupported(
+            "EXPLAIN option list is missing its closing parenthesis".to_string(),
+        )));
+    };
+    let options = &body[..close];
+    let inner = body[close + 1..].trim_start();
+    let format = explain_format(options)?;
+    Ok(ExplainRequest { format, inner })
+}
+
+/// The render format named by an EXPLAIN option list. Only FORMAT is supported;
+/// any other option raises rather than being dropped.
+fn explain_format(options: &str) -> Result<ExplainFormat, RuntimeError> {
+    let trimmed = options.trim();
+    let unsupported = |what: &str| {
+        RuntimeError::Parse(fq_parse::ParseError::Unsupported(format!(
+            "EXPLAIN option `{what}`; supported: FORMAT TEXT, FORMAT JSON"
+        )))
+    };
+    let Some(value) = trimmed
+        .strip_prefix("format")
+        .or_else(|| trimmed.strip_prefix("FORMAT"))
+        .or_else(|| trimmed.strip_prefix("Format"))
+    else {
+        return Err(unsupported(trimmed));
+    };
+    match value.trim().to_ascii_uppercase().as_str() {
+        "TEXT" => Ok(ExplainFormat::Text),
+        "JSON" => Ok(ExplainFormat::Json),
+        other => Err(unsupported(other)),
     }
 }
 
@@ -90,7 +158,8 @@ fn describe_into(
     if let Some(column) = injections.get(&std::ptr::from_ref(plan)) {
         label = tag_injected(&label, column);
     }
-    lines.push(format!("{indent}{label}{}", annotations(plan, cost)));
+    let details = node_details(plan).unwrap_or_default();
+    lines.push(format!("{indent}{label}{details}{}", annotations(plan, cost)));
     // A same-source set operation renders its whole (possibly nested) combined SQL
     // in ONE round trip; its branch children are folded into that SQL and never
     // executed as separate reads, so the EXPLAIN treats it as a leaf.
@@ -101,6 +170,106 @@ fn describe_into(
         describe_into(child, depth + 1, injections, producer_ids, cost, lines)?;
     }
     Ok(())
+}
+
+/// The whole plan as one JSON document: a nested tree in which each node names
+/// its kind, the SQL it pushes when it has one, its priced network cost, its row
+/// estimate, and the defaults those numbers rested on.
+///
+/// The JSON carries the SAME facts as the text tree and is derived from the same
+/// annotation code, so the two cannot disagree. `cost_ms` and `rows` are `null`
+/// rather than absent when unknown, which is the JSON spelling of `rows=?` - a
+/// consumer can tell "no estimate" from "estimate of zero".
+pub fn describe_json(plan: &PhysicalPlan, cost: &CostConfig) -> Result<String, StepError> {
+    let injections = planned_injections(plan);
+    let producer_ids = cte_producer_ids(plan);
+    let document = json_node(plan, &injections, &producer_ids, cost)?;
+    // Every number in the document is finite (`network_cost_value` withholds a
+    // non-finite cost), and every map key is a string literal, which are the only
+    // two ways serializing a `Value` can fail.
+    Ok(serde_json::to_string_pretty(&document)
+        .expect("a finite JSON document with string keys always serializes"))
+}
+
+/// One plan node as a JSON object, recursing into its children.
+fn json_node(
+    plan: &PhysicalPlan,
+    injections: &HashMap<*const PhysicalPlan, String>,
+    producer_ids: &HashMap<*const PhysicalPlan, usize>,
+    cost: &CostConfig,
+) -> Result<serde_json::Value, StepError> {
+    let mut label = node_label(plan, producer_ids)?;
+    if let Some(column) = injections.get(&std::ptr::from_ref(plan)) {
+        label = tag_injected(&label, column);
+    }
+    // The label carries the pushed SQL after " :: " for a source leaf; split it
+    // so a consumer reads the SQL as a field instead of parsing the node name.
+    let (kind, sql) = match label.split_once(" :: ") {
+        Some((head, sql)) => (head.to_string(), Some(sql.to_string())),
+        None => (label, None),
+    };
+    let (cost_ms, cost_defaults) = network_cost_value(plan, cost);
+    let (rows, rows_defaults) = estimate_value(plan);
+    let mut defaults: Vec<&str> = rows_defaults;
+    defaults.extend(cost_defaults);
+
+    let mut children = Vec::new();
+    // A same-source set operation runs as ONE round trip with its branches folded
+    // into that SQL, so the text tree treats it as a leaf and so does the JSON.
+    if !matches!(plan, PhysicalPlan::RemoteSetOp(_)) {
+        for child in plan.children() {
+            children.push(json_node(child, injections, producer_ids, cost)?);
+        }
+    }
+    Ok(serde_json::json!({
+        "node": kind,
+        "details": node_details(plan),
+        "sql": sql,
+        "cost_ms": cost_ms,
+        "rows": rows,
+        "stats_defaulted": defaults,
+        "children": children,
+    }))
+}
+
+/// The priced network cost of a node as a number, with the defaults it rested
+/// on. `None` for a node that does not cross the wire OR whose row estimate is
+/// missing - the text form spells the latter `cost=?`.
+fn network_cost_value<'a>(plan: &'a PhysicalPlan, cost: &CostConfig) -> (Option<f64>, Vec<&'a str>) {
+    let rows = match plan {
+        PhysicalPlan::Scan(node) => node.estimated_rows,
+        PhysicalPlan::RemoteQuery(node) => node.output_estimated_rows.or(node.estimated_rows),
+        _ => return (None, Vec::new()),
+    };
+    let Some(rows) = rows else {
+        return (None, Vec::new());
+    };
+    let transfer = rows as f64 * placeholder_row_bytes(plan) * cost.network_byte_cost;
+    let total = cost.network_rtt_ms + transfer;
+    // A non-finite total means the configured weights are not usable arithmetic
+    // (an infinity or a NaN reached them). Reporting it as a cost would print
+    // `NaNms` and, in JSON, would not serialize at all - so it is an unknown.
+    if !total.is_finite() {
+        return (None, Vec::new());
+    }
+    (Some(total), vec!["avg_width"])
+}
+
+/// A node's row estimate as a number, with the defaults it rested on.
+fn estimate_value(plan: &PhysicalPlan) -> (Option<u64>, Vec<&str>) {
+    let (rows, defaults) = match plan {
+        PhysicalPlan::Scan(node) => (node.estimated_rows, None),
+        PhysicalPlan::HashJoin(node) => (node.estimated_rows, node.estimate_defaults.as_deref()),
+        PhysicalPlan::NestedLoopJoin(node) => {
+            (node.estimated_rows, node.estimate_defaults.as_deref())
+        }
+        PhysicalPlan::RemoteQuery(node) => (node.estimated_rows, None),
+        _ => (None, None),
+    };
+    let named = defaults.map_or_else(Vec::new, |names| {
+        names.iter().map(String::as_str).collect()
+    });
+    (rows, named)
 }
 
 /// Everything appended after a node's label: its network cost, its row estimate,
@@ -193,6 +362,22 @@ fn annotate_dynamic_filter(scan: &fq_plan::physical::PhysicalScan, sql: String) 
         format!("{sql} AND {predicate}")
     } else {
         format!("{sql} WHERE {predicate}")
+    }
+}
+
+/// The per-node detail string both renderers show: a join's keys and build side,
+/// an aggregate's grouping. `None` for a node with nothing extra to say. One
+/// accessor so the text tree and the JSON document cannot describe a node
+/// differently.
+fn node_details(plan: &PhysicalPlan) -> Option<String> {
+    match plan {
+        PhysicalPlan::HashJoin(node) => Some(join_details(
+            &node.left_keys,
+            &node.right_keys,
+            node.build_side,
+        )),
+        PhysicalPlan::HashAggregate(node) => Some(group_details(&node.group_by)),
+        _ => None,
     }
 }
 
@@ -387,16 +572,10 @@ fn node_label(
         PhysicalPlan::Filter(_) => "Filter".to_string(),
         // The join type is part of the label: a SEMI/ANTI vs INNER distinction
         // is plan shape, and tests pin it through the plan dump.
-        PhysicalPlan::HashJoin(node) => format!(
-            "HashJoin [{}]{}",
-            node.join_type.value(),
-            join_details(&node.left_keys, &node.right_keys, node.build_side)
-        ),
+        PhysicalPlan::HashJoin(node) => format!("HashJoin [{}]", node.join_type.value()),
         PhysicalPlan::RemoteJoin(_) => "RemoteJoin".to_string(),
         PhysicalPlan::NestedLoopJoin(_) => "NestedLoopJoin".to_string(),
-        PhysicalPlan::HashAggregate(node) => {
-            format!("HashAggregate{}", group_details(&node.group_by))
-        }
+        PhysicalPlan::HashAggregate(_) => "HashAggregate".to_string(),
         PhysicalPlan::Sort(_) => "Sort".to_string(),
         PhysicalPlan::Limit(_) => "Limit".to_string(),
         PhysicalPlan::Values(_) => "Values".to_string(),
