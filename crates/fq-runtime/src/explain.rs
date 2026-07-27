@@ -87,7 +87,7 @@ fn describe_into(
     if let Some(column) = injections.get(&std::ptr::from_ref(plan)) {
         label = tag_injected(&label, column);
     }
-    lines.push(format!("{indent}{label}"));
+    lines.push(format!("{indent}{label}{}", estimate_suffix(plan)));
     // A same-source set operation renders its whole (possibly nested) combined SQL
     // in ONE round trip; its branch children are folded into that SQL and never
     // executed as separate reads, so the EXPLAIN treats it as a leaf.
@@ -98,6 +98,47 @@ fn describe_into(
         describe_into(child, depth + 1, injections, producer_ids, lines)?;
     }
     Ok(())
+}
+
+/// The cardinality annotation for one node: ` rows=<n>` when the planner
+/// estimated it, ` rows=?` when the node carries an estimate slot the planner
+/// could not fill, and nothing at all for a node that has no slot.
+///
+/// `rows=?` is deliberate. An unfilled estimate is a MEASUREMENT THAT DOES NOT
+/// EXIST, and printing nothing there is indistinguishable from a node that was
+/// never meant to carry one - so a plan read for tuning would silently mistake
+/// a gap for a design. `stats=defaulted[...]` follows when the number rests on
+/// named default constants rather than real statistics: the row count may be
+/// present and still be a guess, and a gate reading it deserves to know which.
+fn estimate_suffix(plan: &PhysicalPlan) -> String {
+    let (rows, defaults) = match plan {
+        PhysicalPlan::Scan(node) => (Some(node.estimated_rows), None),
+        PhysicalPlan::HashJoin(node) => (
+            Some(node.estimated_rows),
+            node.estimate_defaults.as_deref(),
+        ),
+        PhysicalPlan::NestedLoopJoin(node) => (
+            Some(node.estimated_rows),
+            node.estimate_defaults.as_deref(),
+        ),
+        PhysicalPlan::RemoteQuery(node) => (Some(node.estimated_rows), None),
+        _ => (None, None),
+    };
+    let Some(estimate) = rows else {
+        return String::new();
+    };
+    let mut suffix = match estimate {
+        Some(count) => format!(" rows={count}"),
+        None => " rows=?".to_string(),
+    };
+    if let Some(names) = defaults {
+        if !names.is_empty() {
+            use std::fmt::Write;
+            write!(suffix, " stats=defaulted[{}]", names.join(", "))
+                .expect("writing to a String never fails");
+        }
+    }
+    suffix
 }
 
 /// The CTE name carried by a `CteScan`'s producer. The producer is always a

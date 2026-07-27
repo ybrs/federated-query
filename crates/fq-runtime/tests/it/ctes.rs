@@ -497,3 +497,54 @@ fn sorted_name_lvl_amount(batches: &[RecordBatch]) -> Vec<(String, i64, i64)> {
     out.sort();
     out
 }
+
+#[test]
+fn explain_annotates_nodes_with_their_row_estimates() {
+    // EXPLAIN is read to decide what to tune, so a node that carries a
+    // cardinality slot prints it: `rows=<n>` when the planner filled it,
+    // `rows=?` when it could not. Printing nothing for an unfilled estimate
+    // would read the same as a node that never had one, hiding the gap.
+    let (runtime, orders, customers) = two_source_runtime("explain_rows");
+    let sql = format!(
+        "SELECT o.order_id, c.segment FROM {orders}.main.orders o \
+         JOIN {customers}.main.customers c ON o.customer_id = c.customer_id"
+    );
+    let lines = explain_lines(&runtime, &sql);
+
+    // Both base scans know their size, from the source's own metadata.
+    let scans: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.starts_with("Scan ["))
+        .collect();
+    assert_eq!(scans.len(), 2, "two base scans in:\n{lines:#?}");
+    for scan in &scans {
+        assert!(
+            scan.contains(" rows="),
+            "every scan carries a row estimate: {scan}"
+        );
+        assert!(
+            !scan.contains(" rows=?"),
+            "a base scan's size comes from source metadata: {scan}"
+        );
+    }
+
+    // The join carries the slot too, so an unknown is visible rather than absent.
+    let join = lines
+        .iter()
+        .find(|line| line.starts_with("HashJoin"))
+        .unwrap_or_else(|| panic!("a HashJoin in:\n{lines:#?}"));
+    assert!(
+        join.contains(" rows="),
+        "the join reports its estimate, known or not: {join}"
+    );
+
+    // A node with no cardinality slot gains no annotation.
+    let projection = lines
+        .iter()
+        .find(|line| line.starts_with("Projection"))
+        .unwrap_or_else(|| panic!("a Projection in:\n{lines:#?}"));
+    assert!(
+        !projection.contains(" rows="),
+        "a node without an estimate slot stays unannotated: {projection}"
+    );
+}
