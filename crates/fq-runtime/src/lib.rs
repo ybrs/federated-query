@@ -618,7 +618,7 @@ impl Runtime {
             )));
         }
         let physical = self.plan(inner)?;
-        let lines = explain::describe(&physical)?;
+        let lines = explain::describe(&physical, &self.config_snapshot().cost)?;
         let schema = Arc::new(Schema::new(vec![Field::new(
             "plan",
             ArrowDataType::Utf8,

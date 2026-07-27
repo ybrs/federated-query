@@ -629,3 +629,45 @@ fn explain_shows_the_runtime_in_filter_on_the_probe_scan() {
         "only the probe side carries the runtime filter: {build}"
     );
 }
+
+#[test]
+fn explain_prices_the_nodes_that_cross_the_wire() {
+    // Cost is network time in milliseconds: one round trip plus the transfer of
+    // the node's estimated output. Only nodes that talk to a source are priced -
+    // in a federated engine the wire dominates, and mixing coordinator-local
+    // work into the same number would hide which is which.
+    let (runtime, orders, customers) = two_source_runtime("explain_cost");
+    let sql = format!(
+        "SELECT c.segment, count(*) AS n FROM {orders}.main.orders o \
+         JOIN {customers}.main.customers c ON o.customer_id = c.customer_id \
+         GROUP BY c.segment"
+    );
+    let lines = explain_lines(&runtime, &sql);
+
+    for scan in lines.iter().filter(|line| line.starts_with("Scan [")) {
+        assert!(scan.contains(" cost="), "a scan crosses the wire: {scan}");
+        // The byte term rests on a placeholder row width, so every priced node
+        // says so. A cost that looked measured would be tuned against.
+        assert!(
+            scan.contains("stats=defaulted[") && scan.contains("avg_width"),
+            "a priced node names the default its byte term rests on: {scan}"
+        );
+        // One merged provenance tag per line, never two competing ones.
+        assert_eq!(
+            scan.matches("stats=defaulted[").count(),
+            1,
+            "exactly one provenance tag per line: {scan}"
+        );
+    }
+
+    // Coordinator-local nodes are deliberately unpriced.
+    for local in lines
+        .iter()
+        .filter(|line| line.starts_with("HashAggregate") || line.starts_with("HashJoin"))
+    {
+        assert!(
+            !local.contains(" cost="),
+            "coordinator-local work carries no network cost: {local}"
+        );
+    }
+}

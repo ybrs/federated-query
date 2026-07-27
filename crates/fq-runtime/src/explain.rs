@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use fq_physical::steps::planned_injections;
 use fq_physical::{render_remote_set_op, render_scan_sql, StepError};
+use fq_common::CostConfig;
 use fq_plan::physical::{BuildSide, PhysicalPlan};
 use fq_plan::Expr;
 
@@ -40,7 +41,7 @@ pub fn strip_explain(sql: &str) -> Option<&str> {
 /// scan's label carries its effective pushed SQL (rendered from the same renderer
 /// that emits the execution SQL), so a render failure propagates rather than
 /// silently mislabeling the row.
-pub fn describe(plan: &PhysicalPlan) -> Result<Vec<String>, StepError> {
+pub fn describe(plan: &PhysicalPlan, cost: &CostConfig) -> Result<Vec<String>, StepError> {
     let mut lines = Vec::new();
     // The SAME winners pre-pass the step emitter runs: scans it will reduce get
     // a `+inject(<column>)` tag, so the semi-join reduction is visible in the
@@ -50,7 +51,7 @@ pub fn describe(plan: &PhysicalPlan) -> Result<Vec<String>, StepError> {
     // `Cte` producer line AND on every `CteScan` that reads it, so that a body
     // materialized ONCE and shared by many references is visible in the dump.
     let producer_ids = cte_producer_ids(plan);
-    describe_into(plan, 0, &injections, &producer_ids, &mut lines)?;
+    describe_into(plan, 0, &injections, &producer_ids, cost, &mut lines)?;
     Ok(lines)
 }
 
@@ -81,6 +82,7 @@ fn describe_into(
     depth: usize,
     injections: &HashMap<*const PhysicalPlan, String>,
     producer_ids: &HashMap<*const PhysicalPlan, usize>,
+    cost: &CostConfig,
     lines: &mut Vec<String>,
 ) -> Result<(), StepError> {
     let indent = "  ".repeat(depth);
@@ -88,7 +90,7 @@ fn describe_into(
     if let Some(column) = injections.get(&std::ptr::from_ref(plan)) {
         label = tag_injected(&label, column);
     }
-    lines.push(format!("{indent}{label}{}", estimate_suffix(plan)));
+    lines.push(format!("{indent}{label}{}", annotations(plan, cost)));
     // A same-source set operation renders its whole (possibly nested) combined SQL
     // in ONE round trip; its branch children are folded into that SQL and never
     // executed as separate reads, so the EXPLAIN treats it as a leaf.
@@ -96,9 +98,78 @@ fn describe_into(
         return Ok(());
     }
     for child in plan.children() {
-        describe_into(child, depth + 1, injections, producer_ids, lines)?;
+        describe_into(child, depth + 1, injections, producer_ids, cost, lines)?;
     }
     Ok(())
+}
+
+/// Everything appended after a node's label: its network cost, its row estimate,
+/// and ONE merged provenance tag naming every default those two rested on. The
+/// tag is merged deliberately - two `stats=defaulted[...]` groups on one line
+/// would leave a reader guessing which number each belonged to.
+fn annotations(plan: &PhysicalPlan, cost: &CostConfig) -> String {
+    let (cost_text, cost_defaults) = network_cost(plan, cost);
+    let (rows_text, rows_defaults) = estimate_annotation(plan);
+    let mut defaults: Vec<&str> = rows_defaults;
+    defaults.extend(cost_defaults);
+    let mut suffix = format!("{cost_text}{rows_text}");
+    if !defaults.is_empty() {
+        use std::fmt::Write;
+        write!(suffix, " stats=defaulted[{}]", defaults.join(", "))
+            .expect("writing to a String never fails");
+    }
+    suffix
+}
+
+/// The network cost of a node that crosses the wire, in milliseconds - one round
+/// trip plus the transfer of its estimated output - with the default inputs the
+/// number rested on. The formula is `network_rtt_ms + rows * row_bytes *
+/// network_byte_cost`, both weights read from the live `cost` settings.
+///
+/// Only nodes that TALK TO A SOURCE are priced. Coordinator-local work (join,
+/// aggregate, sort) is deliberately unpriced: this is a federated engine, the
+/// wire dominates, and one number mixing the two would hide which is which.
+///
+/// THE ROUND-TRIP TERM IS MEASURED; THE BYTE TERM IS NOT. Row width comes from
+/// `ColumnStatistics::avg_width`, which every source reports as a fixed
+/// placeholder ("sources expose no cheap width"), so any cost carrying a byte
+/// term is tagged `stats=defaulted[avg_width]`. It is real arithmetic over a
+/// placeholder input, and the tag says so rather than letting the number pass as
+/// a measurement. Real widths need per-source work (pg_stats, parquet column
+/// sizes) and would drop the tag without changing the formula.
+fn network_cost<'a>(plan: &'a PhysicalPlan, cost: &CostConfig) -> (String, Vec<&'a str>) {
+    let rows = match plan {
+        PhysicalPlan::Scan(node) => node.estimated_rows,
+        PhysicalPlan::RemoteQuery(node) => node.output_estimated_rows.or(node.estimated_rows),
+        _ => return (String::new(), Vec::new()),
+    };
+    let Some(rows) = rows else {
+        // The node crosses the wire, so it HAS a cost; the row estimate needed to
+        // price the transfer is missing. Reporting the round trip alone would
+        // understate it silently, so the whole number is withheld.
+        return (
+            format!(" cost=?(rtt {:.1}ms)", cost.network_rtt_ms),
+            Vec::new(),
+        );
+    };
+    let transfer = rows as f64 * placeholder_row_bytes(plan) * cost.network_byte_cost;
+    (
+        format!(" cost={:.2}ms", cost.network_rtt_ms + transfer),
+        vec!["avg_width"],
+    )
+}
+
+/// The per-row byte estimate: the node's projected column count times the
+/// placeholder width every source reports. Named `placeholder` because that is
+/// what it is - see `network_cost_suffix`.
+fn placeholder_row_bytes(plan: &PhysicalPlan) -> f64 {
+    const PLACEHOLDER_AVG_WIDTH: f64 = 8.0;
+    let columns = match plan {
+        PhysicalPlan::Scan(node) => node.columns.len(),
+        PhysicalPlan::RemoteQuery(node) => node.output_names.len(),
+        _ => 0,
+    };
+    columns as f64 * PLACEHOLDER_AVG_WIDTH
 }
 
 /// Append the runtime IN filter a probe scan will receive, as a real predicate
@@ -173,7 +244,7 @@ fn show_expr(expr: &Expr) -> String {
 /// a gap for a design. `stats=defaulted[...]` follows when the number rests on
 /// named default constants rather than real statistics: the row count may be
 /// present and still be a guess, and a gate reading it deserves to know which.
-fn estimate_suffix(plan: &PhysicalPlan) -> String {
+fn estimate_annotation(plan: &PhysicalPlan) -> (String, Vec<&str>) {
     let (rows, defaults) = match plan {
         PhysicalPlan::Scan(node) => (Some(node.estimated_rows), None),
         PhysicalPlan::HashJoin(node) => (
@@ -188,20 +259,16 @@ fn estimate_suffix(plan: &PhysicalPlan) -> String {
         _ => (None, None),
     };
     let Some(estimate) = rows else {
-        return String::new();
+        return (String::new(), Vec::new());
     };
-    let mut suffix = match estimate {
+    let text = match estimate {
         Some(count) => format!(" rows={count}"),
         None => " rows=?".to_string(),
     };
-    if let Some(names) = defaults {
-        if !names.is_empty() {
-            use std::fmt::Write;
-            write!(suffix, " stats=defaulted[{}]", names.join(", "))
-                .expect("writing to a String never fails");
-        }
-    }
-    suffix
+    let named = defaults.map_or_else(Vec::new, |names| {
+        names.iter().map(String::as_str).collect()
+    });
+    (text, named)
 }
 
 /// The CTE name carried by a `CteScan`'s producer. The producer is always a
