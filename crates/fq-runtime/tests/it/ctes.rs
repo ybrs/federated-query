@@ -548,3 +548,47 @@ fn explain_annotates_nodes_with_their_row_estimates() {
         "a node without an estimate slot stays unannotated: {projection}"
     );
 }
+
+#[test]
+fn explain_shows_join_keys_build_side_and_grouping() {
+    // The three things a plan is read for when tuning a cross-source join: which
+    // columns it joins on, which input gets built (that is the one materialized
+    // in memory), and what the aggregate above it groups by. All three were in
+    // the plan already and none of them reached the dump.
+    let (runtime, orders, customers) = two_source_runtime("explain_details");
+    let sql = format!(
+        "SELECT c.segment, count(*) AS n FROM {orders}.main.orders o \
+         JOIN {customers}.main.customers c ON o.customer_id = c.customer_id \
+         GROUP BY c.segment"
+    );
+    let lines = explain_lines(&runtime, &sql);
+
+    let join = lines
+        .iter()
+        .find(|line| line.starts_with("HashJoin"))
+        .unwrap_or_else(|| panic!("a HashJoin in:\n{lines:#?}"));
+    assert!(
+        join.contains("keys=(") && join.contains("customer_id"),
+        "the join names its equality keys: {join}"
+    );
+    assert!(
+        join.contains("build="),
+        "the join names which side is built: {join}"
+    );
+
+    let aggregate = lines
+        .iter()
+        .find(|line| line.starts_with("HashAggregate"))
+        .unwrap_or_else(|| panic!("a HashAggregate in:\n{lines:#?}"));
+    assert!(
+        aggregate.contains("group=[") && aggregate.contains("segment"),
+        "the aggregate names its grouping keys: {aggregate}"
+    );
+
+    // The join type stays first in the label, so the assertions elsewhere that
+    // match on `HashJoin [INNER]` keep working.
+    assert!(
+        join.starts_with("HashJoin [INNER]"),
+        "the join type stays at the head of the label: {join}"
+    );
+}

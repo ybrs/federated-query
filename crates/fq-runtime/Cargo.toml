@@ -20,6 +20,9 @@ fq-bind = { path = "../fq-bind" }
 fq-decorrelate = { path = "../fq-decorrelate" }
 fq-optimize = { path = "../fq-optimize" }
 fq-physical = { path = "../fq-physical" }
+# EXPLAIN renders join keys and grouping expressions with the SAME renderer the
+# emitter uses, so a plan dump cannot drift from the SQL the engine builds.
+fq-emit = { path = "../fq-emit" }
 fq-exec = { path = "../fq-exec" }
 # Materialized-view store: the DDL surface (CREATE/REFRESH/DROP MATERIALIZED
 # VIEW) executes here and persists through fq-accel.

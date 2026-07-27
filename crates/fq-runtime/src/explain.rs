@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use fq_physical::steps::planned_injections;
 use fq_physical::{render_remote_set_op, render_scan_sql, StepError};
-use fq_plan::physical::PhysicalPlan;
+use fq_plan::physical::{BuildSide, PhysicalPlan};
+use fq_plan::Expr;
 
 /// If `sql` begins with the `EXPLAIN` keyword (case-insensitive, followed by
 /// whitespace), return the inner statement text; otherwise `None`. The caller
@@ -98,6 +99,44 @@ fn describe_into(
         describe_into(child, depth + 1, injections, producer_ids, lines)?;
     }
     Ok(())
+}
+
+/// A join's equality keys and which side is built, e.g.
+/// ` keys=(o.id = l.orderkey) build=Right`. The keys decide whether the join is
+/// pushable and the build side decides which input is materialized, so both are
+/// read when a join is being tuned. Rendered with the emitter's own expression
+/// renderer, so the dump cannot drift from the SQL the engine builds.
+fn join_details(left_keys: &[Expr], right_keys: &[Expr], build: BuildSide) -> String {
+    let mut pairs = Vec::with_capacity(left_keys.len());
+    for (left, right) in left_keys.iter().zip(right_keys) {
+        pairs.push(format!("{} = {}", show_expr(left), show_expr(right)));
+    }
+    let keys = if pairs.is_empty() {
+        String::new()
+    } else {
+        format!(" keys=({})", pairs.join(", "))
+    };
+    format!("{keys} build={build:?}")
+}
+
+/// An aggregate's grouping expressions, e.g. ` group=[c.segment]`. A grouped
+/// aggregate and a whole-input one are different plans, and the key list is what
+/// the group-count estimate is drawn from.
+fn group_details(group_by: &[Expr]) -> String {
+    if group_by.is_empty() {
+        return " group=[] (whole input)".to_string();
+    }
+    let keys: Vec<String> = group_by.iter().map(show_expr).collect();
+    format!(" group=[{}]", keys.join(", "))
+}
+
+/// One expression as canonical text. A renderer failure falls back to the
+/// expression's node name rather than dropping the detail: EXPLAIN describes a
+/// plan and must not claim a join has no keys because one of them would not
+/// render.
+fn show_expr(expr: &Expr) -> String {
+    fq_emit::render_expr(expr, &fq_emit::CANONICAL_SOURCE_RESOLVER)
+        .unwrap_or_else(|_| "<unrenderable>".to_string())
 }
 
 /// The cardinality annotation for one node: ` rows=<n>` when the planner
@@ -256,10 +295,16 @@ fn node_label(
         PhysicalPlan::Filter(_) => "Filter".to_string(),
         // The join type is part of the label: a SEMI/ANTI vs INNER distinction
         // is plan shape, and tests pin it through the plan dump.
-        PhysicalPlan::HashJoin(node) => format!("HashJoin [{}]", node.join_type.value()),
+        PhysicalPlan::HashJoin(node) => format!(
+            "HashJoin [{}]{}",
+            node.join_type.value(),
+            join_details(&node.left_keys, &node.right_keys, node.build_side)
+        ),
         PhysicalPlan::RemoteJoin(_) => "RemoteJoin".to_string(),
         PhysicalPlan::NestedLoopJoin(_) => "NestedLoopJoin".to_string(),
-        PhysicalPlan::HashAggregate(_) => "HashAggregate".to_string(),
+        PhysicalPlan::HashAggregate(node) => {
+            format!("HashAggregate{}", group_details(&node.group_by))
+        }
         PhysicalPlan::Sort(_) => "Sort".to_string(),
         PhysicalPlan::Limit(_) => "Limit".to_string(),
         PhysicalPlan::Values(_) => "Values".to_string(),
