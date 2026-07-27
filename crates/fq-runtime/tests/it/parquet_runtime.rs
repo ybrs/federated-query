@@ -508,3 +508,31 @@ fn every_real_datasource_parameter_is_still_accepted() {
     Runtime::from_config(&parquet_config(dir.to_str().unwrap()))
         .expect("a config using only real keys still builds");
 }
+
+#[test]
+fn a_programmatic_config_can_be_given_a_learned_catalog() {
+    // A config built in memory has no file path, so no catalog path derives from
+    // it and every estimate falls back to default constants. FEDQ_STATS_CATALOG
+    // names one explicitly. Observable because opening the catalog CREATES the
+    // sqlite file at that path.
+    let dir = temp_parquet_dir("stats_override");
+    write_region_parquet(&dir);
+    let catalog_path = dir.join("explicit.stats.sqlite");
+    assert!(!catalog_path.exists(), "starts absent");
+
+    let mut config = parquet_config(dir.to_str().unwrap());
+    // A programmatic config: no file behind it.
+    config.source_path = None;
+
+    // SAFETY: set and restored within this test; no other test reads this var.
+    unsafe { std::env::set_var("FEDQ_STATS_CATALOG", &catalog_path) };
+    let built = Runtime::from_config(&config);
+    unsafe { std::env::remove_var("FEDQ_STATS_CATALOG") };
+    built.expect("runtime builds with an explicit catalog");
+
+    assert!(
+        catalog_path.exists(),
+        "the named catalog was opened at {}",
+        catalog_path.display()
+    );
+}

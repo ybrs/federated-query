@@ -579,6 +579,7 @@ impl Runtime {
             .with_ship_thresholds(ship_thresholds);
         let physical = planner.plan(&substituted)?;
         stages.finish("physical")?;
+        stages.emit_success();
         Ok((physical, applied))
     }
 
@@ -690,8 +691,25 @@ fn plan_uses_event_analysis(plan: &PhysicalPlan) -> bool {
             .any(|child| plan_uses_event_analysis(child))
 }
 
+/// Open the learned-statistics catalog: `$FEDQ_STATS_CATALOG` when set,
+/// otherwise the path derived from the config file.
+///
+/// A config built in memory has no file behind it and so no derived path. That
+/// case WARNS: a runtime with no catalog plans every query on default constants,
+/// and without the warning that state is indistinguishable from running with
+/// one. The override is how a programmatic config gets a catalog at all.
 fn open_stats_catalog(config: &Config) -> Result<Option<Arc<StatsCatalog>>, RuntimeError> {
+    if let Some(explicit) = std::env::var_os("FEDQ_STATS_CATALOG") {
+        let path = std::path::PathBuf::from(explicit);
+        let catalog = StatsCatalog::open(&path.to_string_lossy())?;
+        return Ok(Some(Arc::new(catalog)));
+    }
     let Some(stats_path) = stats_sqlite_path(config) else {
+        tracing::warn!(
+            "no learned-statistics catalog: this config has no file path to derive \
+             one from. Every estimate falls back to default constants. Set \
+             FEDQ_STATS_CATALOG to name one."
+        );
         return Ok(None);
     };
     let catalog = StatsCatalog::open(&stats_path.to_string_lossy())?;
@@ -764,6 +782,30 @@ impl StageLog {
             return Ok(());
         }
         Err(RuntimeError::PlanningBudget(self.report(stage)))
+    }
+
+    /// Report a plan that finished inside its budget, at debug level.
+    ///
+    /// The same per-stage timings the kill message carries, emitted when nothing
+    /// went wrong. Without this the numbers existed ONLY in the failure path, so
+    /// the one plan you could see a stage breakdown for was a plan that had
+    /// already been killed - useless for finding the stage that is merely slow.
+    fn emit_success(&self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let mut parts = Vec::with_capacity(self.entries.len());
+        for (stage, ms) in &self.entries {
+            parts.push(format!("{stage} {ms:.1}ms"));
+        }
+        tracing::debug!(
+            target: "fedq::planning",
+            total_ms = self.budget.elapsed_ms(),
+            budget_ms = self.budget.limit_ms(),
+            "planned in {} ({})",
+            format!("{:.1}ms", self.budget.elapsed_ms()),
+            parts.join(", ")
+        );
     }
 
     /// The kill message: total vs budget, the stage it died after, and every

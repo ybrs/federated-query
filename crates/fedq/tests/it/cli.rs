@@ -135,3 +135,90 @@ fn missing_config_exits_nonzero() {
         "the config failure must be reported to stderr"
     );
 }
+
+/// Run the binary with extra leading flags before `--command`.
+fn run_with_flags(config: &str, flags: &[&str], sql: &str) -> (bool, String, String) {
+    let mut args = vec!["--config", config];
+    args.extend_from_slice(flags);
+    args.extend_from_slice(&["--command", sql]);
+    let output = Command::new(env!("CARGO_BIN_EXE_fedq"))
+        .args(&args)
+        .output()
+        .expect("run fedq binary");
+    (
+        output.status.success(),
+        String::from_utf8(output.stdout).expect("stdout is utf-8"),
+        String::from_utf8(output.stderr).expect("stderr is utf-8"),
+    )
+}
+
+#[test]
+fn the_cli_installs_a_subscriber_so_audit_records_are_not_discarded() {
+    // fq-runtime writes an ACL audit record through tracing. Without a
+    // subscriber installed the CLI dropped every one of them, which for an audit
+    // trail is worse than having none: it looks like nothing happened.
+    let config = seeded_config();
+    let (ok, _, stderr) = run_with_flags(&config, &[], "CREATE USER alice WITH PASSWORD 'pw'");
+    assert!(ok, "statement failed:\n{stderr}");
+    assert!(
+        stderr.contains("fedq::audit") && stderr.contains("alice"),
+        "the audit record reaches the terminal:\n{stderr}"
+    );
+}
+
+#[test]
+fn log_level_and_json_control_the_engine_log() {
+    let config = seeded_config();
+    // A lower level silences the record without silencing the result.
+    let (ok, stdout, stderr) = run_with_flags(
+        &config,
+        &["--log-level", "error"],
+        "CREATE USER bob WITH PASSWORD 'pw'",
+    );
+    assert!(ok, "statement failed:\n{stderr}");
+    assert!(
+        !stderr.contains("fedq::audit"),
+        "--log-level error silences the audit line:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("CREATE USER"),
+        "the statement still reports its status:\n{stdout}"
+    );
+
+    // The structured form emits the same record as JSON.
+    let (ok, _, stderr) = run_with_flags(
+        &config,
+        &["--log-json"],
+        "CREATE USER carol WITH PASSWORD 'pw'",
+    );
+    assert!(ok, "statement failed:\n{stderr}");
+    assert!(
+        stderr.contains("\"target\":\"fedq::audit\"") && stderr.contains("carol"),
+        "the JSON form carries the audit record:\n{stderr}"
+    );
+}
+
+#[test]
+fn engine_logs_never_enter_the_result_stream() {
+    // stdout carries the result document; the CLI renders CSV and JSON for
+    // piping. A log line in that stream would corrupt what a caller parses, so
+    // logs go to stderr even at a level that emits them.
+    let config = seeded_config();
+    let (ok, stdout, stderr) = run_with_flags(
+        &config,
+        &["--format", "json"],
+        "CREATE USER frank WITH PASSWORD 'pw'",
+    );
+    assert!(ok, "statement failed:\n{stderr}");
+    assert!(
+        stderr.contains("fedq::audit"),
+        "the record was emitted at all:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("fedq::audit"),
+        "stdout stays free of log lines:\n{stdout}"
+    );
+    // What lands on stdout is still a parseable document.
+    serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .unwrap_or_else(|error| panic!("stdout is not valid JSON ({error}):\n{stdout}"));
+}

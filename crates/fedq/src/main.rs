@@ -40,6 +40,14 @@ struct Cli {
     /// The output format for results.
     #[arg(long, value_enum, default_value = "table")]
     format: OutputFormat,
+
+    /// Tracing level for engine logs: error, warn, info, debug, trace.
+    #[arg(long, value_name = "LEVEL", default_value = "info")]
+    log_level: String,
+
+    /// Emit engine logs as JSON objects instead of human-readable lines.
+    #[arg(long)]
+    log_json: bool,
 }
 
 /// Parse arguments, then run one-shot or interactive. Any failure prints to
@@ -55,6 +63,12 @@ fn main() {
 /// Build the runtime from the config and dispatch to one-shot or interactive
 /// execution. Every failure is returned as a message for `main` to print.
 fn run(cli: &Cli) -> Result<(), String> {
+    // Install the tracing subscriber BEFORE the runtime exists, so nothing the
+    // engine emits while starting up is dropped. Without this the CLI installs
+    // no subscriber at all and every engine log vanishes - including the ACL
+    // audit records fq-runtime writes for GRANT/REVOKE, which an audit trail
+    // that silently discards is worse than none.
+    fq_common::setup_logging(&cli.log_level, cli.log_json);
     let config_path = cli
         .config
         .to_str()
