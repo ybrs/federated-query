@@ -2491,3 +2491,50 @@ fn non_function_variants_still_raise() {
         );
     }
 }
+
+#[test]
+fn explain_parses_into_an_explain_node() {
+    // EXPLAIN is SQL syntax, so it is parsed here and becomes a plan node that
+    // travels the ordinary pipeline. The statement it describes is parsed by the
+    // same code that parses any statement, so it is bound, decorrelated,
+    // optimized and physically planned exactly as if it were being run.
+    let plan = parse("EXPLAIN SELECT id FROM pg.public.users").unwrap();
+    let LogicalPlan::Explain(node) = &plan else {
+        panic!("EXPLAIN must parse into an Explain node, got {plan:?}");
+    };
+    assert_eq!(node.format, fq_plan::logical::ExplainFormat::Text);
+    assert!(
+        matches!(node.input.as_ref(), LogicalPlan::Projection(_)),
+        "the described statement is a fully parsed plan, got {:?}",
+        node.input
+    );
+}
+
+#[test]
+fn explain_format_json_is_carried_on_the_node() {
+    // The format travels ON the node rather than beside it, so every stage that
+    // handles the plan handles the request as one thing.
+    let plan = parse("EXPLAIN (FORMAT JSON) SELECT id FROM pg.public.users").unwrap();
+    let LogicalPlan::Explain(node) = &plan else {
+        panic!("expected an Explain node, got {plan:?}");
+    };
+    assert_eq!(node.format, fq_plan::logical::ExplainFormat::Json);
+}
+
+#[test]
+fn an_unsupported_explain_option_raises_in_the_parser() {
+    // ANALYZE asks to execute and measure; answering with an unmeasured plan
+    // would answer a different question. The rejection belongs here, with the
+    // rest of the SQL surface, not in a caller scanning the text.
+    for sql in [
+        "EXPLAIN (ANALYZE) SELECT id FROM pg.public.users",
+        "EXPLAIN (VERBOSE) SELECT id FROM pg.public.users",
+        "EXPLAIN (FORMAT XML) SELECT id FROM pg.public.users",
+        "EXPLAIN (FORMAT JSON SELECT id FROM pg.public.users",
+    ] {
+        assert!(parse(sql).is_err(), "{sql} must raise");
+    }
+
+    // A statement merely starting with the letters is not an EXPLAIN.
+    assert!(parse("SELECT explained FROM pg.public.users").is_ok());
+}

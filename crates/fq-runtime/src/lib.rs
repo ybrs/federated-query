@@ -287,9 +287,18 @@ impl Runtime {
     /// plan WITHOUT executing. Materialized-view DDL dispatches to the store
     /// and returns a one-row `status` table (the pg command-tag convention).
     pub fn execute(&self, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-        if let Some(explain) = explain::strip_explain(sql) {
-            let explain = explain?;
-            return self.explain(explain.inner, explain.format);
+        // EXPLAIN is parsed by fq-parse into a LogicalPlan::Explain and flows the
+        // ordinary pipeline; only the statement it describes decides the route,
+        // so the classifier is asked about that statement rather than the wrapper.
+        if let Some((_, inner)) = fq_parse::explain::split(sql)? {
+            if !matches!(classify_statement(inner)?, Statement::Query(_)) {
+                return Err(RuntimeError::Parse(fq_parse::ParseError::Unsupported(
+                    "EXPLAIN takes a query; DDL and settings statements have no \
+                     plan to explain"
+                        .to_string(),
+                )));
+            }
+            return self.explain(sql);
         }
         let statement = classify_statement(sql)?;
         // Admin DDL is superuser-gated BEFORE the handler runs: a non-superuser
@@ -436,7 +445,7 @@ impl Runtime {
     /// type the wire layer maps both to (NUMERIC) is the same, so the row
     /// description stays consistent with the executed rows.
     pub fn describe(&self, sql: &str) -> Result<Vec<(String, DataType)>, RuntimeError> {
-        if explain::strip_explain(sql).is_some() {
+        if fq_parse::explain::split(sql)?.is_some() {
             return Ok(vec![("plan".to_owned(), DataType::Text)]);
         }
         // A non-query statement resolves to the columns its execution returns,
@@ -609,25 +618,24 @@ impl Runtime {
 
     /// Plan the inner statement of an EXPLAIN and return its physical plan tree
     /// as a single `plan` text column, one row per line. Nothing executes.
-    /// Only a query has a plan: EXPLAIN of a DDL, settings, or analysis
-    /// statement raises naming the form instead of feeding it to the SQL parser.
-    fn explain(
-        &self,
-        inner: &str,
-        format: explain::ExplainFormat,
-    ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-        if !matches!(classify_statement(inner)?, Statement::Query(_)) {
+    /// Render an EXPLAIN. The whole statement plans through the ordinary
+    /// pipeline, so what arrives is a `PhysicalExplain` wrapping the plan it
+    /// describes: the format travelled on the node rather than beside it, and
+    /// the described plan went through bind, decorrelate, optimize and physical
+    /// planning exactly as it would if it were being run.
+    fn explain(&self, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
+        let planned = self.plan(sql)?;
+        let PhysicalPlan::Explain(node) = &planned else {
             return Err(RuntimeError::Parse(fq_parse::ParseError::Unsupported(
-                "EXPLAIN takes a query; DDL and settings statements have no \
-                 plan to explain"
-                    .to_string(),
+                format!("EXPLAIN did not lower to an explain node, got {planned:?}"),
             )));
-        }
-        let physical = self.plan(inner)?;
+        };
         let cost = self.config_snapshot().cost;
-        let lines = match format {
-            explain::ExplainFormat::Text => explain::describe(&physical, &cost)?,
-            explain::ExplainFormat::Json => vec![explain::describe_json(&physical, &cost)?],
+        let lines = match node.format {
+            fq_plan::logical::ExplainFormat::Text => explain::describe(&node.child, &cost)?,
+            fq_plan::logical::ExplainFormat::Json => {
+                vec![explain::describe_json(&node.child, &cost)?]
+            }
         };
         let schema = Arc::new(Schema::new(vec![Field::new(
             "plan",
