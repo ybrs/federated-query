@@ -172,7 +172,10 @@ def main():
     for label, command in (
         ("Lint", ["make", "lint"]),
         ("Clippy", ["cargo", "clippy", "--workspace", "--all-targets"]),
-        ("Rust tests", ["cargo", "test", "--workspace"]),
+        (
+            "Rust tests",
+            ["cargo", "test", "--workspace", "--", "--test-threads=4"],
+        ),
         ("e2e suite", [_venv_python(root), "-m", "pytest", "-q", "-p", "no:cacheprovider"]),
     ):
         failure = _run(label, command, root, env)

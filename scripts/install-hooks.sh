@@ -101,7 +101,12 @@ make -C "$root" lint \
 cargo clippy --workspace --all-targets --manifest-path "$root/Cargo.toml" \
     || block "cargo clippy --workspace --all-targets" "Clippy errors above. Fix them."
 
-cargo test --workspace --manifest-path "$root/Cargo.toml" \
+# --test-threads caps the fan-out. Cargo runs the test binaries concurrently and
+# each one defaults to a thread per core, so an unbounded run saturates the
+# machine and the 100ms planning budget then kills plans that were never slow -
+# the budget measures wall clock. The limit costs wall time and buys a signal
+# that means what it says. The budget itself is not negotiable.
+cargo test --workspace --manifest-path "$root/Cargo.toml" -- --test-threads=4 \
     || block "cargo test --workspace" "Rust test failures above. Fix them."
 
 # `-p no:cacheprovider` keeps the hook from writing .pytest_cache mid-commit.
