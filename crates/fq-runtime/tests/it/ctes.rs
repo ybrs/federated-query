@@ -752,3 +752,55 @@ fn an_unsupported_explain_option_raises() {
         );
     }
 }
+
+#[test]
+fn a_computed_order_by_key_sorts_correctly_over_a_projection_that_drops_its_input() {
+    // Uses this module's two-source fixture. The shape is the one that looks
+    // wrong and is not: the Sort sits ABOVE a Projection exposing only the
+    // computed output, so the sort key names an expression over a column the
+    // projection no longer carries. The rows still come back in the right order.
+    //
+    // Asserting the ORDER is the point. A test that only checked the row count
+    // would pass just as happily on a plan that sorted by nothing.
+    let (runtime, orders, customers) = two_source_runtime("computed_sort");
+
+    // orders map to customers 1,2,3,4,5,1,2,3,4,5; segments are enterprise,
+    // enterprise, smb, consumer, consumer. So substr(segment,1,3) is ent x4,
+    // smb x2, con x4, and ascending order puts con first.
+    let expected = [
+        "con", "con", "con", "con", "ent", "ent", "ent", "ent", "smb", "smb",
+    ];
+
+    for order_by in ["substr(c.segment, 1, 3)", "s"] {
+        let sql = format!(
+            "SELECT substr(c.segment, 1, 3) AS s FROM {orders}.main.orders o \
+             JOIN {customers}.main.customers c ON o.customer_id = c.customer_id \
+             ORDER BY {order_by}"
+        );
+        let (_, batches) = runtime
+            .execute(&sql)
+            .unwrap_or_else(|error| panic!("ORDER BY {order_by} failed: {error}"));
+        let got = string_view_rows(&batches);
+        assert_eq!(
+            got, expected,
+            "ORDER BY {order_by} must sort by the computed value"
+        );
+    }
+}
+
+/// Every value of the first column, which a computed string expression yields as
+/// a StringView rather than a Utf8 array.
+fn string_view_rows(batches: &[RecordBatch]) -> Vec<String> {
+    let mut values = Vec::new();
+    for batch in batches {
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringViewArray>()
+            .expect("a computed string column is Utf8View");
+        for index in 0..array.len() {
+            values.push(array.value(index).to_string());
+        }
+    }
+    values
+}
