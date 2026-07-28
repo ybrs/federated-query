@@ -13,16 +13,6 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "jq -r \".tool_input.command\" | grep -q \"git commit\" && { export PATH=\"$HOME/.cargo/bin:$PATH\"; cd /workspace/federated-query && cargo fmt --all; } || true",
-            "statusMessage": "cargo fmt before commit"
-          }
-        ]
-      },
-      {
         "matcher": "mcp__taskq__set_task_status|mcp__taskq__create_task|mcp__taskq__update_task",
         "hooks": [
           {

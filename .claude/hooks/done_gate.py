@@ -1,8 +1,9 @@
 """PreToolUse hook: a ticket cannot reach `done` over a red tree.
 
 Fires on the taskq status tools. When the requested status is `done`, it runs
-every check this project has - `make lint`, `cargo clippy --workspace
---all-targets`, `cargo test --workspace`, then the full pytest e2e suite - and
+every check this project has - `cargo fmt --all --check`, `make lint`, `cargo
+clippy --workspace --all-targets`, `cargo test --workspace`, then the full
+pytest e2e suite - and
 DENIES the tool call if any of them fails, handing the failing output back so
 the model fixes the tree instead of closing the ticket over it. Any other
 status passes straight through, so `in_progress`/`blocked`/`todo` transitions
@@ -170,6 +171,7 @@ def main():
         )
     failures = []
     for label, command in (
+        ("Formatting", ["cargo", "fmt", "--all", "--check"]),
         ("Lint", ["make", "lint"]),
         ("Clippy", ["cargo", "clippy", "--workspace", "--all-targets"]),
         (

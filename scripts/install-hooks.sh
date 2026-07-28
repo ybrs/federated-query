@@ -95,6 +95,14 @@ else
     block "database check" "postgres-17/bin/pg_isready is missing, so the database state is UNKNOWN and the e2e suite cannot be trusted. Fix: make download_postgres"
 fi
 
+# --check only REPORTS; it never rewrites a file mid-commit. A hook that
+# reformats the working tree cannot fix the commit being made - the files are
+# already staged - so it would leave the tree dirty and the commit unformatted,
+# which is exactly how 105 violations accumulated behind a "cargo fmt before
+# commit" hook that appeared to be enforcing this.
+cargo fmt --all --check --manifest-path "$root/Cargo.toml" \
+    || block "cargo fmt --all --check" "Unformatted code above. Run: cargo fmt --all"
+
 make -C "$root" lint \
     || block "make lint" "Lint violations above. Fix them."
 
