@@ -179,16 +179,16 @@ impl Runtime {
                 let stats_path = stats_sqlite_path(config)
                     .expect("a config with a source path has a stats path");
                 let events_config = config.events.clone();
-                std::thread::spawn(move || {
-                    match fq_events::EventStore::open(&stats_path, &root) {
+                std::thread::spawn(
+                    move || match fq_events::EventStore::open(&stats_path, &root) {
                         Ok(store) => {
                             if let Err(error) = store.prewarm_paths(&events_config) {
                                 eprintln!("paths index prewarm: {error}");
                             }
                         }
                         Err(error) => eprintln!("paths index prewarm open: {error}"),
-                    }
-                });
+                    },
+                );
             }
         }
         Ok(Self {

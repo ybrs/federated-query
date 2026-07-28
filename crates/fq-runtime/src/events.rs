@@ -737,7 +737,6 @@ pub(crate) fn segment_describe_columns(spec: &SegmentSpec) -> Vec<(String, DataT
     owned_columns(fq_common::events::segment_output_columns(spec))
 }
 
-
 /// The paths describe columns.
 pub(crate) fn paths_describe_columns() -> Vec<(String, DataType)> {
     owned_columns(fq_common::events::paths_output_columns())

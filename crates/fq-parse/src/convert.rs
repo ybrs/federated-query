@@ -601,7 +601,10 @@ impl<'a> Converter<'a> {
                     &alias.column_aliases,
                     tables,
                 ),
-                other => Err(ParseError::Unsupported(format!("FROM/JOIN {}", other.variant_name()))),
+                other => Err(ParseError::Unsupported(format!(
+                    "FROM/JOIN {}",
+                    other.variant_name()
+                ))),
             },
             other => Err(ParseError::Unsupported(format!(
                 "FROM/JOIN {}",
@@ -901,7 +904,9 @@ impl<'a> Converter<'a> {
     ) -> Result<(LogicalPlan, Vec<String>), ParseError> {
         let statements = polyglot_sql::parse(&view.sql, polyglot_sql::DialectType::PostgreSQL)
             .map_err(|error| {
-                ParseError::Parse(format!("view '{name}' has an unparsable definition: {error}"))
+                ParseError::Parse(format!(
+                    "view '{name}' has an unparsable definition: {error}"
+                ))
             })?;
         let [statement] = statements.as_slice() else {
             return Err(ParseError::Parse(format!(
@@ -1702,7 +1707,9 @@ fn build_analysis_call(function: &Function) -> Result<AnalysisCall, ParseError> 
     match function.name.to_ascii_lowercase().as_str() {
         "paths" => Ok(AnalysisCall::Paths(build_paths_spec(&function.args)?)),
         "funnel" => Ok(AnalysisCall::Funnel(build_funnel_spec(&function.args)?)),
-        "retention" => Ok(AnalysisCall::Retention(build_retention_spec(&function.args)?)),
+        "retention" => Ok(AnalysisCall::Retention(build_retention_spec(
+            &function.args,
+        )?)),
         "segment" => Ok(AnalysisCall::Segment(build_segment_spec(&function.args)?)),
         other => Err(ParseError::Unsupported(format!(
             "table function {other}(...) in FROM"
@@ -1758,7 +1765,9 @@ fn build_funnel_spec(args: &[Expression]) -> Result<FunnelSpec, ParseError> {
                     return Err(deferred_analysis_option("funnel", name));
                 }
                 other => {
-                    return Err(ParseError::Parse(format!("unknown funnel() option '{other}'")));
+                    return Err(ParseError::Parse(format!(
+                        "unknown funnel() option '{other}'"
+                    )));
                 }
             },
             positional if index == 0 => {
@@ -1906,7 +1915,9 @@ fn build_segment_spec(args: &[Expression]) -> Result<SegmentSpec, ParseError> {
                     return Err(deferred_analysis_option("segment", name));
                 }
                 other => {
-                    return Err(ParseError::Parse(format!("unknown segment() option '{other}'")));
+                    return Err(ParseError::Parse(format!(
+                        "unknown segment() option '{other}'"
+                    )));
                 }
             },
             positional if index == 0 => {
@@ -1978,7 +1989,10 @@ fn interval_micros_arg(expr: &Expression, what: &str) -> Result<i64, ParseError>
 
 /// Read a funnel mode string argument.
 fn funnel_mode_arg(expr: &Expression) -> Result<FunnelMode, ParseError> {
-    match string_arg(expr, "funnel() mode")?.to_ascii_lowercase().as_str() {
+    match string_arg(expr, "funnel() mode")?
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "strict" | "strict_order" => Ok(FunnelMode::StrictOrder),
         "any" | "any_order" => Ok(FunnelMode::AnyOrder),
         other => Err(ParseError::Parse(format!(
@@ -2162,7 +2176,9 @@ fn string_arg(expr: &Expression, what: &str) -> Result<String, ParseError> {
             return Ok(text.clone());
         }
     }
-    Err(ParseError::Parse(format!("{what} must be a string literal")))
+    Err(ParseError::Parse(format!(
+        "{what} must be a string literal"
+    )))
 }
 
 /// Read a non-negative-integer-literal function argument, or raise naming it.
@@ -2172,7 +2188,9 @@ fn count_arg(expr: &Expression, what: &str) -> Result<u32, ParseError> {
     if let Expression::Literal(literal) = expr {
         if let Literal::Number(text) = literal.as_ref() {
             let value = text.parse::<u32>().map_err(|_| {
-                ParseError::Parse(format!("{what} must be a non-negative integer, found '{text}'"))
+                ParseError::Parse(format!(
+                    "{what} must be a non-negative integer, found '{text}'"
+                ))
             })?;
             return Ok(value);
         }

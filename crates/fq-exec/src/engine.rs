@@ -379,10 +379,7 @@ fn log_step(step: &Step, ir: &Ir, bindings: &HashMap<String, Binding>, elapsed_m
             format!("ship          ds={datasource:<6} table={table}")
         }
         Step::EventAnalysis { binding, .. } => {
-            format!(
-                "event_anlys   rows={}",
-                binding_rows(bindings, binding)
-            )
+            format!("event_anlys   rows={}", binding_rows(bindings, binding))
         }
         Step::Return { .. } => "return".to_string(),
     };
@@ -598,7 +595,8 @@ fn run_event_analysis(analysis: &EventAnalysisSpec) -> ExecResult<Batches> {
     let to_exec = |error: fq_events::error::EventError| ExecError::runtime(error.to_string());
     let (schema, batches) = match analysis {
         EventAnalysisSpec::Paths(spec) => {
-            let result = fq_events::run_paths(store.io(), &dataset, spec, &config).map_err(to_exec)?;
+            let result =
+                fq_events::run_paths(store.io(), &dataset, spec, &config).map_err(to_exec)?;
             fq_events::paths_to_batches(&result)
         }
         EventAnalysisSpec::Funnel(spec) => {

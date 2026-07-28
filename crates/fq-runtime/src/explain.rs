@@ -11,9 +11,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use fq_common::CostConfig;
 use fq_physical::steps::planned_injections;
 use fq_physical::{render_remote_set_op, render_scan_sql, StepError};
-use fq_common::CostConfig;
 use fq_plan::physical::{BuildSide, PhysicalPlan};
 use fq_plan::Expr;
 
@@ -157,7 +157,10 @@ fn json_node(
 /// The priced network cost of a node as a number, with the defaults it rested
 /// on. `None` for a node that does not cross the wire OR whose row estimate is
 /// missing - the text form spells the latter `cost=?`.
-fn network_cost_value<'a>(plan: &'a PhysicalPlan, cost: &CostConfig) -> (Option<f64>, Vec<&'a str>) {
+fn network_cost_value<'a>(
+    plan: &'a PhysicalPlan,
+    cost: &CostConfig,
+) -> (Option<f64>, Vec<&'a str>) {
     let rows = match plan {
         PhysicalPlan::Scan(node) => node.estimated_rows,
         PhysicalPlan::RemoteQuery(node) => node.output_estimated_rows.or(node.estimated_rows),
@@ -188,9 +191,7 @@ fn estimate_value(plan: &PhysicalPlan) -> (Option<u64>, Vec<&str>) {
         PhysicalPlan::RemoteQuery(node) => (node.estimated_rows, None),
         _ => (None, None),
     };
-    let named = defaults.map_or_else(Vec::new, |names| {
-        names.iter().map(String::as_str).collect()
-    });
+    let named = defaults.map_or_else(Vec::new, |names| names.iter().map(String::as_str).collect());
     (rows, named)
 }
 
@@ -355,14 +356,12 @@ fn show_expr(expr: &Expr) -> String {
 fn estimate_annotation(plan: &PhysicalPlan) -> (String, Vec<&str>) {
     let (rows, defaults) = match plan {
         PhysicalPlan::Scan(node) => (Some(node.estimated_rows), None),
-        PhysicalPlan::HashJoin(node) => (
-            Some(node.estimated_rows),
-            node.estimate_defaults.as_deref(),
-        ),
-        PhysicalPlan::NestedLoopJoin(node) => (
-            Some(node.estimated_rows),
-            node.estimate_defaults.as_deref(),
-        ),
+        PhysicalPlan::HashJoin(node) => {
+            (Some(node.estimated_rows), node.estimate_defaults.as_deref())
+        }
+        PhysicalPlan::NestedLoopJoin(node) => {
+            (Some(node.estimated_rows), node.estimate_defaults.as_deref())
+        }
         PhysicalPlan::RemoteQuery(node) => (Some(node.estimated_rows), None),
         _ => (None, None),
     };
@@ -373,9 +372,7 @@ fn estimate_annotation(plan: &PhysicalPlan) -> (String, Vec<&str>) {
         Some(count) => format!(" rows={count}"),
         None => " rows=?".to_string(),
     };
-    let named = defaults.map_or_else(Vec::new, |names| {
-        names.iter().map(String::as_str).collect()
-    });
+    let named = defaults.map_or_else(Vec::new, |names| names.iter().map(String::as_str).collect());
     (text, named)
 }
 

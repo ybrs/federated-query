@@ -750,8 +750,7 @@ fn paths_table_function_columns_bind_qualified_and_typed() {
     // The event dataset is NOT in the catalog (it lives in the event store,
     // resolved at execution); binding still qualifies and types the surfaced
     // columns under the alias.
-    let plan =
-        bind_sql("SELECT p.path_id, p.occurrences FROM paths('web') AS p").unwrap();
+    let plan = bind_sql("SELECT p.path_id, p.occurrences FROM paths('web') AS p").unwrap();
     assert_all_qualified(&plan);
     let LogicalPlan::Projection(projection) = &plan else {
         panic!("expected Projection");
@@ -785,10 +784,9 @@ fn paths_table_function_unaliased_qualifies_under_function_name() {
 #[test]
 fn paths_table_function_supports_outer_aggregation() {
     // The whole point: aggregate over the analysis output in plain SQL.
-    let plan = bind_sql(
-        "SELECT p.path_id, sum(p.occurrences) FROM paths('web') AS p GROUP BY p.path_id",
-    )
-    .unwrap();
+    let plan =
+        bind_sql("SELECT p.path_id, sum(p.occurrences) FROM paths('web') AS p GROUP BY p.path_id")
+            .unwrap();
     assert_all_qualified(&plan);
 }
 
@@ -830,10 +828,15 @@ fn having_without_group_by_is_an_aggregate_query() {
     // so any gate not taking it for this query drops the clause and returns
     // every row.
     let plan = bind_sql("SELECT 1 AS one FROM pg.public.users HAVING count(*) > 0").unwrap();
-    let found = having_filter_over_aggregate(&plan)
-        .unwrap_or_else(|| panic!("HAVING must survive as a Filter over an Aggregate, got {plan:?}"));
-    let LogicalPlan::Filter(filter) = found else { unreachable!() };
-    let LogicalPlan::Aggregate(aggregate) = filter.input.as_ref() else { unreachable!() };
+    let found = having_filter_over_aggregate(&plan).unwrap_or_else(|| {
+        panic!("HAVING must survive as a Filter over an Aggregate, got {plan:?}")
+    });
+    let LogicalPlan::Filter(filter) = found else {
+        unreachable!()
+    };
+    let LogicalPlan::Aggregate(aggregate) = filter.input.as_ref() else {
+        unreachable!()
+    };
     assert!(
         aggregate.aggregates.iter().any(fq_plan::contains_aggregate),
         "the count(*) from HAVING must be computed by the Aggregate, got {:?}",
@@ -939,7 +942,10 @@ fn a_plain_order_by_stays_ungrouped() {
 /// Whether any node in the bound plan is an Aggregate.
 fn plan_contains_aggregate(plan: &LogicalPlan) -> bool {
     matches!(plan, LogicalPlan::Aggregate(_))
-        || plan.children().iter().any(|child| plan_contains_aggregate(child))
+        || plan
+            .children()
+            .iter()
+            .any(|child| plan_contains_aggregate(child))
 }
 
 #[test]

@@ -8,7 +8,9 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
+use arrow::array::{
+    Array, ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, TimeUnit};
 use fq_common::{
     Config, CostConfig, DataSourceConfig, ExecutorConfig, OptimizerConfig, ServerConfig,
@@ -125,7 +127,9 @@ fn view_is_created_queried_listed_and_dropped() {
     let runtime = Runtime::from_config(&config).expect("from_config");
 
     runtime
-        .execute("CREATE VIEW buys AS SELECT user_id, created_at FROM eva.main.eva WHERE event = 'buy'")
+        .execute(
+            "CREATE VIEW buys AS SELECT user_id, created_at FROM eva.main.eva WHERE event = 'buy'",
+        )
         .expect("create view");
 
     // The view reads current data through its definition.
@@ -153,7 +157,9 @@ fn view_is_created_queried_listed_and_dropped() {
 
     // A qualified name is never a view reference: it names a table in that
     // datasource's schema, and there is none, so it raises.
-    assert!(runtime.execute("SELECT count(*) FROM eva.main.buys").is_err());
+    assert!(runtime
+        .execute("SELECT count(*) FROM eva.main.buys")
+        .is_err());
 
     runtime.execute("DROP VIEW buys").expect("drop view");
     // Gone: the name no longer resolves.
@@ -203,7 +209,9 @@ fn view_column_rename_and_or_replace() {
         .execute("CREATE VIEW ren AS SELECT user_id FROM eva.main.eva")
         .is_err());
     runtime
-        .execute("CREATE OR REPLACE VIEW ren AS SELECT user_id FROM eva.main.eva WHERE event = 'buy'")
+        .execute(
+            "CREATE OR REPLACE VIEW ren AS SELECT user_id FROM eva.main.eva WHERE event = 'buy'",
+        )
         .expect("or replace");
     let (_, batches) = runtime
         .execute("SELECT count(*) AS n FROM ren")

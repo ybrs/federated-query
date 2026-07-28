@@ -175,7 +175,11 @@ fn test_config() -> EventsConfig {
 }
 
 /// Build a dataset from rows and return it loaded.
-fn build_dataset(store: &EventStore, name: &str, rows: &[Row]) -> std::sync::Arc<fq_events::Dataset> {
+fn build_dataset(
+    store: &EventStore,
+    name: &str,
+    rows: &[Row],
+) -> std::sync::Arc<fq_events::Dataset> {
     let def = dataset_def(name);
     let info = SourceInfo {
         kind: "select".to_string(),
@@ -1012,7 +1016,10 @@ fn ranged_paths_serve_anchor_semantics_from_ts_lists_and_match_the_scan() {
                 let scanned =
                     fq_events::run_paths(store.io(), &dataset, &spec(Some(i64::MAX)), &cfg)
                         .unwrap();
-                assert_eq!(indexed, scanned, "anchor {anchor:?} depth {depth} {from:?}..{to:?}");
+                assert_eq!(
+                    indexed, scanned,
+                    "anchor {anchor:?} depth {depth} {from:?}..{to:?}"
+                );
             }
         }
     }
@@ -1073,7 +1080,10 @@ fn a_ranged_path_follows_its_anchor_past_the_range_end() {
         to: Some(2_500_000),
     };
     let result = fq_events::run_paths(store.io(), &dataset, &excluded, &cfg).unwrap();
-    assert!(result.rows.is_empty(), "anchor outside the range matches nothing");
+    assert!(
+        result.rows.is_empty(),
+        "anchor outside the range matches nothing"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1110,8 +1120,13 @@ fn indexable_paths_answer_from_the_index_without_touching_segments() {
         range,
         filter: None,
     };
-    let expected = fq_events::run_paths(store.io(), &dataset, &spec(None, TimeRange::default()), &cfg)
-        .expect("indexed paths");
+    let expected = fq_events::run_paths(
+        store.io(),
+        &dataset,
+        &spec(None, TimeRange::default()),
+        &cfg,
+    )
+    .expect("indexed paths");
     assert!(!expected.rows.is_empty());
 
     for rel in store.io().list(&dataset.record.location).unwrap() {
@@ -1120,9 +1135,13 @@ fn indexable_paths_answer_from_the_index_without_touching_segments() {
             store.io().delete(&rel).unwrap();
         }
     }
-    let from_index =
-        fq_events::run_paths(store.io(), &dataset, &spec(None, TimeRange::default()), &cfg)
-            .expect("index answers without segments");
+    let from_index = fq_events::run_paths(
+        store.io(),
+        &dataset,
+        &spec(None, TimeRange::default()),
+        &cfg,
+    )
+    .expect("index answers without segments");
     assert_eq!(from_index, expected);
     let ranged = fq_events::run_paths(
         store.io(),
@@ -1139,8 +1158,13 @@ fn indexable_paths_answer_from_the_index_without_touching_segments() {
     .expect("ts lists answer without segments");
     assert_eq!(ranged, expected);
     assert!(
-        fq_events::run_paths(store.io(), &dataset, &spec(Some(i64::MAX), TimeRange::default()), &cfg)
-            .is_err(),
+        fq_events::run_paths(
+            store.io(),
+            &dataset,
+            &spec(Some(i64::MAX), TimeRange::default()),
+            &cfg
+        )
+        .is_err(),
         "a scan-shaped query must fail once the segments are gone"
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -1189,7 +1213,9 @@ fn a_property_promoted_mid_build_reads_every_row_back_exactly() {
         dict_max_bytes: 2048,
         ..test_config()
     };
-    let report = store.create_dataset(&def, &info, &mut source, &cfg).unwrap();
+    let report = store
+        .create_dataset(&def, &info, &mut source, &cfg)
+        .unwrap();
     assert!(
         report.promoted.contains(&"device".to_string()),
         "the value flood must promote the property: {:?}",

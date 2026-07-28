@@ -346,20 +346,14 @@ fn show_tables_and_describe_surface_a_single_file_table() {
         .expect("from_config");
 
     let (schema, batches) = runtime.execute("SHOW TABLES").expect("show tables");
-    assert_eq!(
-        column_names(&schema),
-        vec!["datasource", "schema", "table"]
-    );
+    assert_eq!(column_names(&schema), vec!["datasource", "schema", "table"]);
     assert_eq!(string_rows_at(&batches, 0), vec!["evd"]);
     assert_eq!(string_rows_at(&batches, 1), vec!["main"]);
     assert_eq!(string_rows_at(&batches, 2), vec!["evd"]);
 
     let (schema, batches) = runtime.execute("DESCRIBE evd").expect("describe");
     assert_eq!(column_names(&schema), vec!["column", "type", "nullable"]);
-    assert_eq!(
-        string_rows_at(&batches, 0),
-        vec!["r_regionkey", "r_name"]
-    );
+    assert_eq!(string_rows_at(&batches, 0), vec!["r_regionkey", "r_name"]);
     assert_eq!(string_rows_at(&batches, 1), vec!["INTEGER", "VARCHAR"]);
 }
 
@@ -393,7 +387,11 @@ fn describe_resolves_qualified_references_and_an_unknown_table_raises() {
         Runtime::from_config(&parquet_config(dir.to_str().unwrap())).expect("from_config");
 
     // Every qualification level resolves to the same table.
-    for sql in ["DESCRIBE region", "DESCRIBE main.region", "DESCRIBE pq.main.region"] {
+    for sql in [
+        "DESCRIBE region",
+        "DESCRIBE main.region",
+        "DESCRIBE pq.main.region",
+    ] {
         let (_, batches) = runtime.execute(sql).expect(sql);
         assert_eq!(
             string_rows_at(&batches, 0),

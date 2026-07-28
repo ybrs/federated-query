@@ -303,7 +303,11 @@ impl BlockCache {
         // for the loader instead of duplicating a multi-gigabyte read.
         let gate = {
             let mut loading = self.loading.lock().expect("load gate map poisoned");
-            Arc::clone(loading.entry(key.clone()).or_insert_with(|| Arc::new(Mutex::new(()))))
+            Arc::clone(
+                loading
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
         };
         let _held = gate.lock().expect("load gate poisoned");
         {
@@ -314,7 +318,10 @@ impl BlockCache {
             }
         }
         let loaded = load();
-        self.loading.lock().expect("load gate map poisoned").remove(&key);
+        self.loading
+            .lock()
+            .expect("load gate map poisoned")
+            .remove(&key);
         let item = Arc::new(loaded?);
         let bytes = item.heap_bytes();
         let mut map = self.inner.lock().expect("event cache lock poisoned");

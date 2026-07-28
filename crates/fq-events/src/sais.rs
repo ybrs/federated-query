@@ -7,15 +7,30 @@
 use crate::error::EventBuildError;
 
 extern "C" {
-    fn libsais_omp(t: *const u8, sa: *mut i32, n: i32, fs: i32, freq: *mut i32, threads: i32)
-        -> i32;
+    fn libsais_omp(
+        t: *const u8,
+        sa: *mut i32,
+        n: i32,
+        fs: i32,
+        freq: *mut i32,
+        threads: i32,
+    ) -> i32;
     fn libsais_int_omp(t: *mut i32, sa: *mut i32, n: i32, k: i32, fs: i32, threads: i32) -> i32;
-    fn libsais_plcp_omp(t: *const u8, sa: *const i32, plcp: *mut i32, n: i32, threads: i32)
-        -> i32;
-    fn libsais_plcp_int_omp(t: *const i32, sa: *const i32, plcp: *mut i32, n: i32, threads: i32)
-        -> i32;
-    fn libsais_lcp_omp(plcp: *const i32, sa: *const i32, lcp: *mut i32, n: i32, threads: i32)
-        -> i32;
+    fn libsais_plcp_omp(t: *const u8, sa: *const i32, plcp: *mut i32, n: i32, threads: i32) -> i32;
+    fn libsais_plcp_int_omp(
+        t: *const i32,
+        sa: *const i32,
+        plcp: *mut i32,
+        n: i32,
+        threads: i32,
+    ) -> i32;
+    fn libsais_lcp_omp(
+        plcp: *const i32,
+        sa: *const i32,
+        lcp: *mut i32,
+        n: i32,
+        threads: i32,
+    ) -> i32;
 }
 
 /// The i32 length of a text, raising when it exceeds the 32-bit suffix-array
@@ -51,7 +66,14 @@ pub(crate) fn suffix_array_u8(text: &[u8], threads: i32) -> Result<Vec<i32>, Eve
     let mut sa = vec![0i32; text.len() + fs as usize];
     // The native call writes n entries and scratches the fs tail.
     checked(unsafe {
-        libsais_omp(text.as_ptr(), sa.as_mut_ptr(), n, fs, std::ptr::null_mut(), threads)
+        libsais_omp(
+            text.as_ptr(),
+            sa.as_mut_ptr(),
+            n,
+            fs,
+            std::ptr::null_mut(),
+            threads,
+        )
     })?;
     sa.truncate(text.len());
     Ok(sa)
@@ -74,9 +96,7 @@ pub(crate) fn suffix_array_i32(
     let fs = free_space(text.len());
     let mut sa = vec![0i32; text.len() + fs as usize];
     // The native call writes n entries and scratches the fs tail.
-    checked(unsafe {
-        libsais_int_omp(scratch.as_mut_ptr(), sa.as_mut_ptr(), n, k, fs, threads)
-    })?;
+    checked(unsafe { libsais_int_omp(scratch.as_mut_ptr(), sa.as_mut_ptr(), n, k, fs, threads) })?;
     sa.truncate(text.len());
     Ok(sa)
 }
@@ -94,7 +114,9 @@ pub(crate) fn lcp_array_u8(
     let n = checked_n(text.len())?;
     let mut plcp = vec![0i32; text.len()];
     // Both native calls read and write exactly n entries of sized buffers.
-    checked(unsafe { libsais_plcp_omp(text.as_ptr(), sa.as_ptr(), plcp.as_mut_ptr(), n, threads) })?;
+    checked(unsafe {
+        libsais_plcp_omp(text.as_ptr(), sa.as_ptr(), plcp.as_mut_ptr(), n, threads)
+    })?;
     let mut lcp = vec![0i32; text.len()];
     checked(unsafe { libsais_lcp_omp(plcp.as_ptr(), sa.as_ptr(), lcp.as_mut_ptr(), n, threads) })?;
     Ok(lcp)

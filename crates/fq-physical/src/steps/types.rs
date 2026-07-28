@@ -54,10 +54,7 @@ pub enum Step {
     /// relation: the engine executes the fq-events kernel against the session's
     /// event store and binds the resulting Arrow batches. `binding` names the
     /// produced relation.
-    EventAnalysis {
-        call: AnalysisCall,
-        binding: String,
-    },
+    EventAnalysis { call: AnalysisCall, binding: String },
     /// The final result binding.
     Return { input: String },
 }

@@ -48,9 +48,7 @@ fn event_schema() -> Arc<Schema> {
 
 /// Write `micros`/`events`/`users` rows as one parquet file at `path`.
 fn write_events(path: &Path, micros: Vec<i64>, events: Vec<&str>, users: Vec<&str>) {
-    let created: ArrayRef = Arc::new(
-        TimestampMicrosecondArray::from(micros).with_timezone("UTC"),
-    );
+    let created: ArrayRef = Arc::new(TimestampMicrosecondArray::from(micros).with_timezone("UTC"));
     let event: ArrayRef = Arc::new(StringArray::from(events));
     let user: ArrayRef = Arc::new(StringArray::from(users));
     let batch =
@@ -169,7 +167,10 @@ fn timestamp_refresh_key_builds_and_refreshes_past_the_watermark() {
         .execute("PATHS ON tsds DEPTH 2 TOP 5")
         .expect("paths");
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-    assert_eq!(names, vec!["path_id", "seq", "event", "occurrences", "share"]);
+    assert_eq!(
+        names,
+        vec!["path_id", "seq", "event", "occurrences", "share"]
+    );
     let events = batches[0]
         .column(2)
         .as_any()
@@ -245,7 +246,10 @@ fn paths_table_function_runs_and_aggregates() {
         )
         .expect("paths table function");
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-    assert_eq!(names, vec!["path_id", "seq", "event", "occurrences", "share"]);
+    assert_eq!(
+        names,
+        vec!["path_id", "seq", "event", "occurrences", "share"]
+    );
     let events = batches[0]
         .column(2)
         .as_any()
@@ -317,7 +321,9 @@ fn funnel_retention_segment_table_functions_run() {
 
     // Outer aggregation over the funnel output: 3 entered view + 2 reached buy.
     let (_, batches) = runtime
-        .execute("SELECT sum(entered) AS total FROM funnel('web', 'view', 'buy', window => '30 days')")
+        .execute(
+            "SELECT sum(entered) AS total FROM funnel('web', 'view', 'buy', window => '30 days')",
+        )
         .expect("sum over funnel");
     let total = batches[0]
         .column(0)
@@ -368,8 +374,9 @@ fn table_function_filter_narrows_the_analysis() {
         Field::new("device", ArrowDataType::Utf8, false),
     ]));
     let day = 86_400_000_000_i64;
-    let created: ArrayRef =
-        Arc::new(TimestampMicrosecondArray::from(vec![day, day, day, 2 * day]).with_timezone("UTC"));
+    let created: ArrayRef = Arc::new(
+        TimestampMicrosecondArray::from(vec![day, day, day, 2 * day]).with_timezone("UTC"),
+    );
     let event: ArrayRef = Arc::new(StringArray::from(vec!["view", "view", "view", "view"]));
     let user: ArrayRef = Arc::new(StringArray::from(vec!["u1", "u2", "u3", "u4"]));
     let device: ArrayRef = Arc::new(StringArray::from(vec!["ios", "android", "ios", "ios"]));
@@ -391,7 +398,9 @@ fn table_function_filter_narrows_the_analysis() {
 
     // Unfiltered: all four view events counted across the day buckets.
     let (_, batches) = runtime
-        .execute("SELECT sum(value) AS total FROM segment('web', measure => 'count', bucket => 'day')")
+        .execute(
+            "SELECT sum(value) AS total FROM segment('web', measure => 'count', bucket => 'day')",
+        )
         .expect("segment unfiltered");
     let total = batches[0]
         .column(0)

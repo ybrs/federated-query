@@ -2119,7 +2119,10 @@ fn table_function_of(plan: &LogicalPlan) -> &fq_plan::TableFunction {
         panic!("expected Projection, got {plan:?}");
     };
     let LogicalPlan::TableFunction(node) = projection.input.as_ref() else {
-        panic!("expected TableFunction under Projection, got {:?}", projection.input);
+        panic!(
+            "expected TableFunction under Projection, got {:?}",
+            projection.input
+        );
     };
     node
 }
@@ -2186,7 +2189,10 @@ fn paths_table_function_defaults_match_statement() {
     assert_eq!(spec.dataset, "web");
     assert_eq!(spec.depth, 5);
     assert_eq!(spec.top, 20);
-    assert!(matches!(spec.anchor, fq_common::events::PathAnchor::Unanchored));
+    assert!(matches!(
+        spec.anchor,
+        fq_common::events::PathAnchor::Unanchored
+    ));
 }
 
 #[test]
@@ -2227,8 +2233,8 @@ fn paths_table_function_maxgap_arg_not_yet_supported() {
 
 #[test]
 fn paths_table_function_two_anchors_raise() {
-    let error =
-        parse("SELECT path_id FROM paths('web', starting_at => 'a', ending_at => 'b')").unwrap_err();
+    let error = parse("SELECT path_id FROM paths('web', starting_at => 'a', ending_at => 'b')")
+        .unwrap_err();
     assert!(matches!(error, ParseError::Parse(_)), "got {error:?}");
 }
 
@@ -2282,7 +2288,10 @@ fn funnel_table_function_defaults_and_no_breakdown_schema() {
     // No breakdown: schema starts at step_index.
     assert_eq!(node.output_names[0], "step_index");
     let spec = funnel_spec(node);
-    assert!(matches!(spec.mode, fq_common::events::FunnelMode::StrictOrder));
+    assert!(matches!(
+        spec.mode,
+        fq_common::events::FunnelMode::StrictOrder
+    ));
     assert_eq!(spec.window_micros, 3_600_000_000);
     assert!(spec.breakdown.is_none());
 }
@@ -2318,9 +2327,15 @@ fn retention_table_function_maps_options() {
     let spec = retention_spec(table_function_of(&plan));
     assert_eq!(spec.dataset, "web");
     assert!(matches!(&spec.birth, fq_common::events::EventMatch::Named(n) if n == "signup"));
-    assert!(matches!(spec.return_event, fq_common::events::EventMatch::Any));
+    assert!(matches!(
+        spec.return_event,
+        fq_common::events::EventMatch::Any
+    ));
     assert!(matches!(spec.period, fq_common::events::PeriodGrain::Week));
-    assert!(matches!(spec.mode, fq_common::events::RetentionMode::Unbounded));
+    assert!(matches!(
+        spec.mode,
+        fq_common::events::RetentionMode::Unbounded
+    ));
     assert_eq!(spec.periods, Some(8));
     assert_eq!(spec.at, Some(3));
 }
@@ -2392,8 +2407,7 @@ fn segment_table_function_filter_arg_parses_compound_predicate() {
 fn table_function_malformed_filter_raises() {
     // A bare column with no operator is not a predicate; it raises rather than
     // being silently dropped.
-    let error =
-        parse("SELECT path_id FROM paths('web', filter => 'device')").unwrap_err();
+    let error = parse("SELECT path_id FROM paths('web', filter => 'device')").unwrap_err();
     assert!(matches!(error, ParseError::Parse(_)), "got {error:?}");
 }
 
@@ -2484,7 +2498,12 @@ fn non_function_variants_still_raise() {
     // The passthrough arm sees every variant the converter does not handle, not
     // only functions. These are operators and a non-deterministic call; turning
     // any of them into a named function call would change what the query means.
-    for item in ["age & 1", "(age > 1) IS TRUE", "RANDOM()", "IF(age > 1, 1, 2)"] {
+    for item in [
+        "age & 1",
+        "(age > 1) IS TRUE",
+        "RANDOM()",
+        "IF(age > 1, 1, 2)",
+    ] {
         assert!(
             function_expr(item).is_err(),
             "{item} must still raise rather than become a function call"

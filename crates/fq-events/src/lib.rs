@@ -18,8 +18,8 @@ pub mod exec;
 pub mod format;
 pub mod model;
 mod paths_sa;
-mod sais;
 pub mod registry;
+mod sais;
 pub mod store;
 
 use std::collections::HashMap;

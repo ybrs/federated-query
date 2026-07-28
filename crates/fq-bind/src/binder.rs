@@ -1289,7 +1289,8 @@ fn node_name(plan: &LogicalPlan) -> &'static str {
 /// parallel by construction (the parser enforces the count), so they zip.
 fn table_function_columns(node: &TableFunction) -> Vec<Column> {
     let mut columns = Vec::with_capacity(node.output_names.len());
-    for (name, (_default_name, data_type)) in node.output_names.iter().zip(node.call.output_columns())
+    for (name, (_default_name, data_type)) in
+        node.output_names.iter().zip(node.call.output_columns())
     {
         columns.push(Column::new(name.clone(), data_type, true));
     }

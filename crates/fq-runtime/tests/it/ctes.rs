@@ -723,9 +723,15 @@ fn explain_format_json_carries_the_same_plan_as_the_text_tree() {
     );
 
     // FORMAT TEXT is the default and still renders one row per node.
-    let (_, text_batches) = runtime.execute(&format!("EXPLAIN {query}")).expect("explain");
+    let (_, text_batches) = runtime
+        .execute(&format!("EXPLAIN {query}"))
+        .expect("explain");
     assert!(
-        text_batches.iter().map(RecordBatch::num_rows).sum::<usize>() > 1,
+        text_batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>()
+            > 1,
         "the text form stays a line per node"
     );
 }

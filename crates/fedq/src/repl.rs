@@ -194,7 +194,10 @@ mod tests {
     #[test]
     fn known_meta_commands_are_recognized() {
         assert!(matches!(meta_command("\\q"), Some(Meta::Quit)));
-        assert!(matches!(meta_command("  \\timing  "), Some(Meta::ToggleTiming)));
+        assert!(matches!(
+            meta_command("  \\timing  "),
+            Some(Meta::ToggleTiming)
+        ));
     }
 
     #[test]

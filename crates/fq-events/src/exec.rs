@@ -181,8 +181,11 @@ pub fn funnel_to_batches(
     let schema = Arc::new(Schema::new(fields));
     let mut columns: Vec<Arc<dyn Array>> = Vec::new();
     if result.has_breakdown {
-        let breakdowns: Vec<Option<String>> =
-            result.rows.iter().map(|row| row.breakdown.clone()).collect();
+        let breakdowns: Vec<Option<String>> = result
+            .rows
+            .iter()
+            .map(|row| row.breakdown.clone())
+            .collect();
         columns.push(Arc::new(StringArray::from(breakdowns)));
     }
     columns.push(Arc::new(Int32Array::from(
@@ -269,12 +272,19 @@ pub fn retention_to_batches(
     let schema = Arc::new(Schema::new(fields));
     let mut columns: Vec<Arc<dyn Array>> = Vec::new();
     if result.has_breakdown {
-        let breakdowns: Vec<Option<String>> =
-            result.rows.iter().map(|row| row.breakdown.clone()).collect();
+        let breakdowns: Vec<Option<String>> = result
+            .rows
+            .iter()
+            .map(|row| row.breakdown.clone())
+            .collect();
         columns.push(Arc::new(StringArray::from(breakdowns)));
     }
     columns.push(Arc::new(TimestampMicrosecondArray::from(
-        result.rows.iter().map(|row| row.cohort_start).collect::<Vec<_>>(),
+        result
+            .rows
+            .iter()
+            .map(|row| row.cohort_start)
+            .collect::<Vec<_>>(),
     )));
     columns.push(Arc::new(Int64Array::from(
         result
@@ -298,7 +308,11 @@ pub fn retention_to_batches(
             .collect::<Vec<_>>(),
     )));
     columns.push(Arc::new(Float64Array::from(
-        result.rows.iter().map(|row| row.retention_rate).collect::<Vec<_>>(),
+        result
+            .rows
+            .iter()
+            .map(|row| row.retention_rate)
+            .collect::<Vec<_>>(),
     )));
     let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
         .expect("retention batch columns match the schema");
@@ -340,8 +354,11 @@ pub fn segment_to_batches(
         result.rows.iter().map(|row| row.bucket).collect::<Vec<_>>(),
     ))];
     if result.has_breakdown {
-        let breakdowns: Vec<Option<String>> =
-            result.rows.iter().map(|row| row.breakdown.clone()).collect();
+        let breakdowns: Vec<Option<String>> = result
+            .rows
+            .iter()
+            .map(|row| row.breakdown.clone())
+            .collect();
         columns.push(Arc::new(StringArray::from(breakdowns)));
     }
     match result.measure {
@@ -2065,9 +2082,7 @@ fn run_paths_scan(
     for (_fingerprint, codes) in edge {
         candidates.push((threshold, codes));
     }
-    candidates.sort_unstable_by(|a, b| {
-        b.0.cmp(&a.0).then_with(|| code_order(&ranks, &a.1, &b.1))
-    });
+    candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| code_order(&ranks, &a.1, &b.1)));
     candidates.truncate(top);
     Ok(render_paths(dataset, candidates, total))
 }
@@ -2086,9 +2101,8 @@ fn sort_stripes(shards: &mut [ShardWindows]) -> Vec<Vec<u128>> {
         let handles: Vec<_> = (0..FP_STRIPES)
             .map(|stripe| {
                 scope.spawn(move || {
-                    let mut merged: Vec<u128> = Vec::with_capacity(
-                        donated.iter().map(|maps| maps[stripe].len()).sum(),
-                    );
+                    let mut merged: Vec<u128> =
+                        Vec::with_capacity(donated.iter().map(|maps| maps[stripe].len()).sum());
                     for maps in donated {
                         merged.extend_from_slice(&maps[stripe]);
                     }
@@ -2127,7 +2141,10 @@ fn threshold_and_over(sorted: &[Vec<u128>], top: usize) -> (u64, Vec<u128>, Vec<
                             smallest.pop();
                         }
                     });
-                    (distinct, smallest.into_iter().map(|r| r.0).collect::<Vec<u64>>())
+                    (
+                        distinct,
+                        smallest.into_iter().map(|r| r.0).collect::<Vec<u64>>(),
+                    )
                 })
             })
             .collect();
@@ -2234,7 +2251,10 @@ fn pick_candidates(
         let window = &shard.codes[*offset as usize..(*offset + *length) as usize];
         if over_set.contains(fingerprint) {
             if !over.iter().any(|(seen, _)| seen == fingerprint) {
-                over.push((*fingerprint, window.iter().map(|code| u64::from(*code)).collect()));
+                over.push((
+                    *fingerprint,
+                    window.iter().map(|code| u64::from(*code)).collect(),
+                ));
             }
             continue;
         }
@@ -2285,8 +2305,8 @@ fn window_vs_codes(ranks: &[u32], window: &[u32], codes: &[u64]) -> std::cmp::Or
 /// Event-name rank per code: the code's position in the dictionary's names
 /// sorted ascending, so count ties order by integer compares.
 fn code_ranks(names: &[String]) -> Vec<u32> {
-    let mut order: Vec<u32> = (0..u32::try_from(names.len()).expect("dictionary fits u32"))
-        .collect();
+    let mut order: Vec<u32> =
+        (0..u32::try_from(names.len()).expect("dictionary fits u32")).collect();
     order.sort_by(|a, b| names[*a as usize].cmp(&names[*b as usize]));
     let mut ranks = vec![0u32; names.len()];
     for (rank, code) in order.iter().enumerate() {
@@ -2374,16 +2394,22 @@ fn paths_shard_windows(
                 .codes
                 .push(u32::try_from(event.code).expect("dictionary code fits u32"));
         }
-        enumerate_windows(&stream, spec, anchor, &mut |window, start| {
-            let fingerprint = window_fingerprint(window, &mut scratch);
-            buffered.windows.push((
-                fingerprint,
-                base + u32::try_from(start).expect("stream offset fits u32"),
-                u32::try_from(window.len()).expect("window length fits u32"),
-            ));
-            buffered.stripes[stripe_of(fingerprint)].push(fingerprint);
-            Ok(())
-        }, &mut anchor_ok)?;
+        enumerate_windows(
+            &stream,
+            spec,
+            anchor,
+            &mut |window, start| {
+                let fingerprint = window_fingerprint(window, &mut scratch);
+                buffered.windows.push((
+                    fingerprint,
+                    base + u32::try_from(start).expect("stream offset fits u32"),
+                    u32::try_from(window.len()).expect("window length fits u32"),
+                ));
+                buffered.stripes[stripe_of(fingerprint)].push(fingerprint);
+                Ok(())
+            },
+            &mut anchor_ok,
+        )?;
     }
     Ok(buffered)
 }
@@ -2447,11 +2473,7 @@ fn enumerate_windows(
 /// Render ranked candidates: decode code sequences to names and compute
 /// shares against the pre-limit window total. The candidates arrive already
 /// sorted by (count desc, name order asc) and truncated to TOP.
-fn render_paths(
-    dataset: &Dataset,
-    candidates: Vec<(u64, Vec<u64>)>,
-    total: u64,
-) -> PathsResult {
+fn render_paths(dataset: &Dataset, candidates: Vec<(u64, Vec<u64>)>, total: u64) -> PathsResult {
     let rows = candidates
         .into_iter()
         .enumerate()

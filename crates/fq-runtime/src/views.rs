@@ -102,7 +102,10 @@ impl Runtime {
 
     /// `DROP VIEW <name>`: a missing name raises rather than silently
     /// succeeding.
-    pub(crate) fn drop_view(&self, name: &str) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
+    pub(crate) fn drop_view(
+        &self,
+        name: &str,
+    ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         let accel = self.accelerator()?;
         if !accel.delete_view(name)? {
             return Err(RuntimeError::EventStatement(format!(

@@ -112,10 +112,16 @@ pub mod explain {
             "format", "analyze", "verbose", "costs", "settings", "buffers", "wal", "timing",
             "summary",
         ];
-        let Some(word) = body.trim_start().split(|c: char| !c.is_alphanumeric()).next() else {
+        let Some(word) = body
+            .trim_start()
+            .split(|c: char| !c.is_alphanumeric())
+            .next()
+        else {
             return false;
         };
-        OPTIONS.iter().any(|option| word.eq_ignore_ascii_case(option))
+        OPTIONS
+            .iter()
+            .any(|option| word.eq_ignore_ascii_case(option))
     }
 
     /// The render format an option list names. FORMAT is the only option; any

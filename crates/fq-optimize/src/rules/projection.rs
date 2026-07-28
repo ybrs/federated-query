@@ -250,9 +250,10 @@ fn prune_columns(
         set_op @ (LogicalPlan::SetOperation(_) | LogicalPlan::Union(_)) => {
             prune_branches(set_op, required)
         }
-        leaf @ (LogicalPlan::Values(_)
-        | LogicalPlan::CteRef(_)
-        | LogicalPlan::TableFunction(_)) => Ok(leaf),
+        leaf
+        @ (LogicalPlan::Values(_) | LogicalPlan::CteRef(_) | LogicalPlan::TableFunction(_)) => {
+            Ok(leaf)
+        }
         other => prune_through(other, required),
     }
 }

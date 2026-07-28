@@ -26,11 +26,11 @@ use arrow::datatypes::{DataType as ArrowType, SchemaRef, TimeUnit as ArrowTimeUn
 use fq_common::events::TimeUnit;
 
 use crate::dict::BuildDicts;
-use crate::model::FastMap;
 use crate::error::{
     EventBuildError, EventError, EventSchemaError, EventStoreError, EventTypeError,
 };
 use crate::format::{encode_act, ActorSidecar, PropCell, SegEncoder};
+use crate::model::FastMap;
 use crate::model::{
     hash_key, push_binary_key, push_int_key, push_utf8_key, PropertyDef, PropertyEncoding,
     ShardFileEntry,
@@ -701,11 +701,10 @@ fn append_frame(
     }
     for _ in 0..rows {
         let actor = reader.varint().map_err(map_err)?;
-        columns
-            .actors
-            .push(u32::try_from(actor).map_err(|_| {
-                EventBuildError::Io("spill actor code exceeds u32".to_string())
-            })?);
+        columns.actors.push(
+            u32::try_from(actor)
+                .map_err(|_| EventBuildError::Io("spill actor code exceeds u32".to_string()))?,
+        );
     }
     for chunk in reader.take(rows * 8).map_err(map_err)?.chunks_exact(8) {
         let mut raw = [0u8; 8];
@@ -1145,15 +1144,14 @@ fn push_prop_row(
                 // mid-build); a raw-string or already-promoted row carries
                 // the raw bytes, with the code as a dead placeholder. Raw
                 // lengths spill shifted: 0 = absent, n + 1 = n bytes.
-                let carry_raw = if let Some((batch_codes, promoted)) =
-                    prop_codes[prop_index].as_ref()
-                {
-                    codes.push(batch_codes[row]);
-                    *promoted
-                } else {
-                    codes.push(0);
-                    true
-                };
+                let carry_raw =
+                    if let Some((batch_codes, promoted)) = prop_codes[prop_index].as_ref() {
+                        codes.push(batch_codes[row]);
+                        *promoted
+                    } else {
+                        codes.push(0);
+                        true
+                    };
                 if valid == 1 && carry_raw {
                     let value = string_value(array, row);
                     raw_lens.push(value.len() as u32 + 1);
@@ -1434,7 +1432,6 @@ impl<'a> TimeAccessor<'a> {
         }
         Ok(out)
     }
-
 }
 
 /// The declared tiebreak column accessor.

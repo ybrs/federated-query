@@ -769,7 +769,12 @@ fn dialect_probe_plan() -> LogicalPlan {
     });
     project(
         join(
-            LogicalPlan::Scan(Box::new(scan("src", "public", "orders", &["id", "cust_id"]))),
+            LogicalPlan::Scan(Box::new(scan(
+                "src",
+                "public",
+                "orders",
+                &["id", "cust_id"],
+            ))),
             LogicalPlan::Scan(Box::new(customer)),
             JoinType::Inner,
             eq(col("orders", "cust_id"), col("customer", "id")),

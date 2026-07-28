@@ -383,8 +383,8 @@ mod tests {
 
     #[test]
     fn utc_zoned_timestamps_carry_a_zoned_watermark() {
-        let array = TimestampMicrosecondArray::from(vec![5_000_000_i64, 9_000_000])
-            .with_timezone("UTC");
+        let array =
+            TimestampMicrosecondArray::from(vec![5_000_000_i64, 9_000_000]).with_timezone("UTC");
         let zoned = batch(Arc::new(array));
         assert_eq!(
             scan_watermark(std::slice::from_ref(&zoned), 0).expect("scan"),

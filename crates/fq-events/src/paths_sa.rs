@@ -316,9 +316,7 @@ fn assemble(streams: &[ShardStream], alphabet: u32) -> Result<PathsSa, EventBuil
                 if small {
                     text8.push(u8::try_from(stream.codes[offset] + 1).expect("code fits u8"));
                 } else {
-                    text32.push(
-                        i32::try_from(stream.codes[offset] + 1).expect("code fits i32"),
-                    );
+                    text32.push(i32::try_from(stream.codes[offset] + 1).expect("code fits i32"));
                 }
                 ts.push(stream.ts[offset]);
                 start.push(text_lo);
@@ -349,7 +347,10 @@ fn assemble(streams: &[ShardStream], alphabet: u32) -> Result<PathsSa, EventBuil
     // its origin position, whose availability runs back to the stream start.
     let last = ts.len().saturating_sub(1);
     let (avail_fwd, ts_fwd) = sa_companions(&sa_fwd, |pos| {
-        (end[pos] - u32::try_from(pos).expect("position fits u32"), ts[pos])
+        (
+            end[pos] - u32::try_from(pos).expect("position fits u32"),
+            ts[pos],
+        )
     });
     let (avail_bwd, ts_bwd) = sa_companions(&sa_bwd, |pos| {
         let origin = last - pos;
@@ -375,10 +376,7 @@ fn assemble(streams: &[ShardStream], alphabet: u32) -> Result<PathsSa, EventBuil
 
 /// Gather one direction's (availability, anchor ts) companions in suffix-array
 /// order, in parallel over output chunks.
-fn sa_companions(
-    sa: &[i32],
-    shape: impl Fn(usize) -> (u32, i64) + Sync,
-) -> (Vec<u32>, Vec<i64>) {
+fn sa_companions(sa: &[i32], shape: impl Fn(usize) -> (u32, i64) + Sync) -> (Vec<u32>, Vec<i64>) {
     let mut avail = vec![0u32; sa.len()];
     let mut ts = vec![0i64; sa.len()];
     let workers = std::thread::available_parallelism()
@@ -526,10 +524,7 @@ pub(crate) fn rebuild(
 fn raw_bytes<T>(values: &[T]) -> &[u8] {
     // A plain numeric slice is always viewable as its raw bytes.
     unsafe {
-        std::slice::from_raw_parts(
-            values.as_ptr().cast::<u8>(),
-            std::mem::size_of_val(values),
-        )
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
     }
 }
 
@@ -637,7 +632,9 @@ fn open_sections<'a>(
     }
     let version = sections.take(1)?[0];
     if version != VERSION {
-        return Err(corrupt(format!("paths index version {version}, expected {VERSION}")));
+        return Err(corrupt(format!(
+            "paths index version {version}, expected {VERSION}"
+        )));
     }
     let stored = u64::from_le_bytes(sections.take(8)?.try_into().expect("8 bytes"));
     if stored != expected {
@@ -670,7 +667,9 @@ fn decode(
     let (mut sections, n, alphabet, width) = open_sections(fwd_bytes, rel, expected)?;
     let (mut sections_b, n_b, alphabet_b, width_b) = open_sections(bwd_bytes, rel, expected)?;
     if n != n_b || alphabet != alphabet_b || width != width_b {
-        return Err(corrupt("paths index halves disagree on their header".to_string()));
+        return Err(corrupt(
+            "paths index halves disagree on their header".to_string(),
+        ));
     }
     // Every section's bytes are sliced up front, then all nine copy into
     // their typed vectors on concurrent threads - the copies dominate a cold
@@ -757,7 +756,10 @@ pub(crate) fn prewarm(
     cached_paths_sa(io, &rel, cfg.cache_bytes, || {
         let (fwd_bytes, bwd_bytes) = std::thread::scope(|scope| {
             let bwd = scope.spawn(|| io.get(&rel_b));
-            (io.get(&rel), bwd.join().expect("backward read thread panicked"))
+            (
+                io.get(&rel),
+                bwd.join().expect("backward read thread panicked"),
+            )
         });
         Ok(CachedItem::PathsSa(decode(
             &fwd_bytes?,
@@ -789,7 +791,10 @@ pub(crate) fn run_from_index(
         // Both halves read concurrently; each is roughly half the bytes.
         let (fwd_bytes, bwd_bytes) = std::thread::scope(|scope| {
             let bwd = scope.spawn(|| io.get(&rel_b));
-            (io.get(&rel), bwd.join().expect("backward read thread panicked"))
+            (
+                io.get(&rel),
+                bwd.join().expect("backward read thread panicked"),
+            )
         });
         Ok(CachedItem::PathsSa(decode(
             &fwd_bytes?,
@@ -902,8 +907,10 @@ fn sweep_chunk(sweep: &Sweep<'_>, lo: usize, hi: usize) -> ChunkSweep {
         0 => 0u32,
         above => u32::try_from(above - 1).expect("symbol fits u32"),
     };
-    let close = |group: Group, head: &mut Option<Group>, interior: &mut TopSet<'_, '_>,
-                     pending: &mut Option<Group>| {
+    let close = |group: Group,
+                 head: &mut Option<Group>,
+                 interior: &mut TopSet<'_, '_>,
+                 pending: &mut Option<Group>| {
         if head.is_none() {
             *head = Some(group);
         } else if let Some(previous) = pending.replace(group) {
@@ -1141,10 +1148,7 @@ fn answer(
 /// The half-open admission bounds of a time range (unbounded sides admit
 /// everything on that side).
 fn range_bounds(range: TimeRange) -> (i64, i64) {
-    (
-        range.from.unwrap_or(i64::MIN),
-        range.to.unwrap_or(i64::MAX),
-    )
+    (range.from.unwrap_or(i64::MIN), range.to.unwrap_or(i64::MAX))
 }
 
 #[cfg(test)]
@@ -1158,7 +1162,10 @@ mod tests {
     impl Lcg {
         /// The next value below `bound`.
         fn next(&mut self, bound: u64) -> u64 {
-            self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
             (self.0 >> 33) % bound
         }
     }
@@ -1218,7 +1225,8 @@ mod tests {
     ) -> PathsResult {
         let (from, to) = range_bounds(spec.range);
         let depth = spec.depth as usize;
-        let mut counts: std::collections::BTreeMap<Vec<u32>, u64> = std::collections::BTreeMap::new();
+        let mut counts: std::collections::BTreeMap<Vec<u32>, u64> =
+            std::collections::BTreeMap::new();
         let mut total = 0u64;
         for (codes, ts) in streams {
             let n = codes.len();
