@@ -14,8 +14,8 @@ and per engine:
 COLD means a fresh OS process AND a fresh runtime - a cached statistic or plan
 cannot leak in. The NEW engine's 100ms planning budget applies: a query whose
 planning blows it is reported as KILLED with the engine's own report. An engine
-that cannot build a source (e.g. NEW has no parquet connector yet) is reported
-as UNSUPPORTED. Nothing is skipped silently.
+that cannot build a source is reported as UNSUPPORTED. Nothing is skipped
+silently.
 
 Usage:
   /workspace/venv-fedq/bin/python compare.py --scale-factor 1 --label sf1

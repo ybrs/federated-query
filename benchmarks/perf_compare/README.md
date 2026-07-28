@@ -17,8 +17,8 @@ harness, it does not go in a report, a commit message, or a decision.
 - Engines never share a process (each links its own DuckDB).
 - The NEW engine's planning budget (default 100ms) applies: a blown budget is a
   KILLED row carrying the engine's own stage report. A source an engine cannot
-  build (NEW has no parquet connector yet) is UNSUPPORTED. Errors are ERROR with
-  the engine's message. Nothing is silently skipped.
+  build is UNSUPPORTED. Errors are ERROR with the engine's message. Nothing is
+  silently skipped.
 - Release build only; compare.py builds `--release` itself (use --skip-build to
   reuse the existing release build). DuckDB is prebuilt (scripts/setup-duckdb-lib.sh).
 
