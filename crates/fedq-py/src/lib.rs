@@ -79,12 +79,34 @@ fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Install the engine's log subscriber for THIS Python process, at `level`
+/// ("error", "warn", "info", "debug", "trace"), as JSON when `structured`.
+///
+/// Opt-in on purpose, and not called on import. The subscriber is
+/// process-global, so installing it at import time would seize logging
+/// configuration for the whole host program - an application with its own
+/// `logging` setup would find the engine had reconfigured things underneath it.
+/// That is the host's decision, so the host makes it.
+///
+/// Until it is called the engine's logs go nowhere, which includes the ACL audit
+/// records fq-runtime writes for GRANT/REVOKE and CREATE USER. A Python host
+/// that runs those statements and wants the audit trail has to call this.
+///
+/// Idempotent: a second call is a no-op rather than an error, matching
+/// `fq_common::setup_logging`.
+#[pyfunction]
+#[pyo3(signature = (level = "info", structured = false))]
+fn setup_logging(level: &str, structured: bool) {
+    fq_common::setup_logging(level, structured);
+}
+
 /// The `fedq` module: the `Runtime` session class, the Arrow stream export type,
-/// and a `version()` probe.
+/// a `version()` probe, and the opt-in `setup_logging()`.
 #[pymodule]
 fn fedq(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Runtime>()?;
     m.add_class::<ArrowStreamExport>()?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
+    m.add_function(wrap_pyfunction!(setup_logging, m)?)?;
     Ok(())
 }

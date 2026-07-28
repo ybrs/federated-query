@@ -71,8 +71,17 @@ fn describe_into(
     if let Some(column) = injections.get(&std::ptr::from_ref(plan)) {
         label = tag_injected(&label, column);
     }
+    // Annotations go BEFORE the pushed SQL, never after. A source leaf renders
+    // as `<label> :: <sql>`, and every reader - the tests here, and any tool
+    // reading a plan - takes everything past " :: " as the SQL. Appending after
+    // it would put `cost=...` inside what a caller parses as a query.
     let details = node_details(plan).unwrap_or_default();
-    lines.push(format!("{indent}{label}{details}{}", annotations(plan, cost)));
+    let annotation = annotations(plan, cost);
+    let line = match label.split_once(" :: ") {
+        Some((head, sql)) => format!("{head}{details}{annotation} :: {sql}"),
+        None => format!("{label}{details}{annotation}"),
+    };
+    lines.push(format!("{indent}{line}"));
     // A same-source set operation renders its whole (possibly nested) combined SQL
     // in ONE round trip; its branch children are folded into that SQL and never
     // executed as separate reads, so the EXPLAIN treats it as a leaf.
@@ -254,28 +263,29 @@ fn placeholder_row_bytes(plan: &PhysicalPlan) -> f64 {
     columns as f64 * PLACEHOLDER_AVG_WIDTH
 }
 
-/// Append the runtime IN filter a probe scan will receive, as a real predicate
-/// on the rendered SQL: `... WHERE col IN (...)`.
+/// The runtime IN filter a probe scan will receive, as an annotation:
+/// ` filter=(col IN (...))`.
 ///
-/// The value list stays `(...)`. The build-side keys exist only once the join
-/// has run, and fetching a sample of them would make EXPLAIN read data - which
-/// it does not do, and must not start doing. What matters for reading a plan is
-/// that the reduction fires and WHICH column it narrows; the values do not
-/// change that. Only single-column keys are annotated, because a composite key
-/// does not render as one IN list.
-fn annotate_dynamic_filter(scan: &fq_plan::physical::PhysicalScan, sql: String) -> String {
+/// The value list stays `(...)`: the build-side keys exist only once the join
+/// has run, and fetching a sample would make EXPLAIN read data, which it does
+/// not do. What a plan reader needs is that the reduction fires and WHICH column
+/// it narrows.
+///
+/// It is an annotation and NOT part of the rendered SQL, even though the filter
+/// really is a predicate on that query. `IN (...)` is not valid SQL, and the
+/// text after " :: " is parsed as SQL by the pushdown suites and by anything
+/// else reading a plan - putting it there makes the query unparseable.
+///
+/// Only single-column keys are annotated; a composite key does not render as one
+/// IN list.
+fn dynamic_filter_note(scan: &fq_plan::physical::PhysicalScan) -> String {
     let Some(keys) = scan.dynamic_filter_keys.as_ref() else {
-        return sql;
+        return String::new();
     };
     let [key] = keys.as_slice() else {
-        return sql;
+        return String::new();
     };
-    let predicate = format!("{} IN (...)", show_expr(key));
-    if sql.contains(" WHERE ") {
-        format!("{sql} AND {predicate}")
-    } else {
-        format!("{sql} WHERE {predicate}")
-    }
+    format!(" filter=({} IN (...))", show_expr(key))
 }
 
 /// The per-node detail string both renderers show: a join's keys and build side,
@@ -436,8 +446,11 @@ fn node_label(
                     format!("Scan [{}]", node.datasource)
                 }
             };
-            let sql = one_line(&render_scan_sql(node)?);
-            format!("{head} :: {}", annotate_dynamic_filter(node, sql))
+            format!(
+                "{head}{} :: {}",
+                dynamic_filter_note(node),
+                one_line(&render_scan_sql(node)?)
+            )
         }
         PhysicalPlan::RemoteQuery(node) => {
             format!(

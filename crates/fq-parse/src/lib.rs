@@ -86,6 +86,12 @@ pub mod explain {
         let Some(body) = rest.strip_prefix('(') else {
             return Ok(Some((ExplainFormat::Text, rest)));
         };
+        // `EXPLAIN (SELECT ...)` is a PARENTHESIZED QUERY, not an option list.
+        // Only a leading option keyword makes the parenthesis an option list;
+        // anything else belongs to the statement being explained.
+        if !starts_with_option_keyword(body) {
+            return Ok(Some((ExplainFormat::Text, rest)));
+        }
         let Some(close) = body.find(')') else {
             return Err(ParseError::Unsupported(
                 "EXPLAIN option list is missing its closing parenthesis".to_string(),
@@ -95,6 +101,21 @@ pub mod explain {
             format_of(&body[..close])?,
             body[close + 1..].trim_start(),
         )))
+    }
+
+    /// Whether a parenthesized body opens with an EXPLAIN option keyword. The
+    /// unsupported ones are listed too, so `EXPLAIN (ANALYZE) SELECT ...` is
+    /// recognized as an option list and rejected by name, rather than being read
+    /// as a query and failing with a confusing syntax error.
+    fn starts_with_option_keyword(body: &str) -> bool {
+        const OPTIONS: &[&str] = &[
+            "format", "analyze", "verbose", "costs", "settings", "buffers", "wal", "timing",
+            "summary",
+        ];
+        let Some(word) = body.trim_start().split(|c: char| !c.is_alphanumeric()).next() else {
+            return false;
+        };
+        OPTIONS.iter().any(|option| word.eq_ignore_ascii_case(option))
     }
 
     /// The render format an option list names. FORMAT is the only option; any

@@ -257,16 +257,26 @@ fn explain_scan_line_carries_the_effective_pushed_sql() {
         .expect("explain query");
     let lines = string_rows(&batches);
     let joined = lines.join("\n");
-    // A plain single-table scan renders as `Scan [<ds>] :: <SQL>`, carrying the
-    // effective source SELECT with the folded WHERE, so the pushdown suites can
-    // assert on the exact SQL sent to the source.
+    // A plain single-table scan renders as `Scan [<ds>] <annotations> :: <SQL>`,
+    // carrying the effective source SELECT with the folded WHERE, so the
+    // pushdown suites can assert on the exact SQL sent to the source. The SQL is
+    // always the trailing part after " :: "; annotations sit before it, never
+    // inside what a reader parses as a query.
     let scan_line = lines
         .iter()
         .find(|line| line.trim_start().starts_with("Scan ["))
         .unwrap_or_else(|| panic!("no `Scan [ds] :: SQL` line in EXPLAIN, got:\n{joined}"));
     assert!(
-        scan_line.contains("Scan [duck] ::"),
-        "scan line should tag the datasource, got:\n{scan_line}"
+        scan_line.trim_start().starts_with("Scan [duck]") && scan_line.contains(" :: "),
+        "scan line should tag the datasource and separate its SQL, got:\n{scan_line}"
+    );
+    let sql = scan_line
+        .split_once(" :: ")
+        .expect("a scan line carries its SQL after \" :: \"")
+        .1;
+    assert!(
+        !sql.contains("cost=") && !sql.contains("rows="),
+        "annotations must not leak into the SQL a caller parses, got:\n{sql}"
     );
     assert!(
         scan_line.contains("SELECT") && scan_line.contains("region"),

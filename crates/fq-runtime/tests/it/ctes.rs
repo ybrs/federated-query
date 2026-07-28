@@ -553,8 +553,7 @@ fn explain_annotates_nodes_with_their_row_estimates() {
 fn explain_shows_join_keys_build_side_and_grouping() {
     // The three things a plan is read for when tuning a cross-source join: which
     // columns it joins on, which input gets built (that is the one materialized
-    // in memory), and what the aggregate above it groups by. All three were in
-    // the plan already and none of them reached the dump.
+    // in memory), and what the aggregate above it groups by.
     let (runtime, orders, customers) = two_source_runtime("explain_details");
     let sql = format!(
         "SELECT c.segment, count(*) AS n FROM {orders}.main.orders o \
@@ -611,12 +610,22 @@ fn explain_shows_the_runtime_in_filter_on_the_probe_scan() {
         .find(|line| line.contains("+inject("))
         .unwrap_or_else(|| panic!("a reduced probe scan in:\n{lines:#?}"));
     assert!(
-        probe.contains("IN (...)"),
+        probe.contains("filter=(") && probe.contains("IN (...)"),
         "the probe scan shows the runtime filter: {probe}"
     );
     assert!(
         probe.contains("customer_id"),
         "the filter names the reduced column: {probe}"
+    );
+    // The annotation sits BEFORE the SQL; what follows " :: " stays a valid
+    // query, because the pushdown suites and any plan reader parse it as one.
+    let sql = probe
+        .split_once(" :: ")
+        .expect("a scan line carries its SQL after \" :: \"")
+        .1;
+    assert!(
+        !sql.contains("IN (...)"),
+        "the placeholder must not enter the SQL a caller parses: {sql}"
     );
 
     // The build side is not reduced, so it gains no such predicate.

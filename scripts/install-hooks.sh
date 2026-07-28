@@ -109,6 +109,14 @@ cargo clippy --workspace --all-targets --manifest-path "$root/Cargo.toml" \
 cargo test --workspace --manifest-path "$root/Cargo.toml" -- --test-threads=4 \
     || block "cargo test --workspace" "Rust test failures above. Fix them."
 
+# The e2e suite drives the engine through tests/fedq.so, a symlink to the
+# RELEASE build of fedq-py. Nothing else in this hook builds it, so without this
+# step pytest exercises whatever binary was last built by hand - it ran against a
+# six-commit-old engine before this was added, reporting green for code that was
+# never executed. A suite testing a stale binary is a check that did not run.
+cargo build --release -p fedq-py --manifest-path "$root/Cargo.toml" \
+    || block "cargo build --release -p fedq-py" "The extension the e2e suite imports could not be built, so the suite would test a STALE engine."
+
 # `-p no:cacheprovider` keeps the hook from writing .pytest_cache mid-commit.
 # Collection errors exit non-zero here, so a suite that dies at import BLOCKS
 # rather than reporting zero failures.
