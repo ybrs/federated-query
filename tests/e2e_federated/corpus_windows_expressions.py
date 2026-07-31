@@ -30,8 +30,10 @@ CASES = [
         "tables": ["orders", "customers"],
         "query": (
             "SELECT o.order_id, c.city, "
-            "DENSE_RANK() OVER (PARTITION BY c.city ORDER BY o.price DESC, o.order_id) "
-            "AS drnk FROM {orders} o JOIN {customers} c ON o.customer_id = c.customer_id"
+            "DENSE_RANK() OVER (PARTITION BY c.city ORDER BY o.price DESC, "
+            "o.order_id) "
+            "AS drnk FROM {orders} o JOIN {customers} c "
+            "ON o.customer_id = c.customer_id"
         ),
     },
     {
@@ -150,7 +152,8 @@ CASES = [
         "query": (
             "SELECT sale_id, dept, amount FROM ("
             "SELECT f.sale_id AS sale_id, di.dept AS dept, f.amount AS amount, "
-            "ROW_NUMBER() OVER (PARTITION BY di.dept ORDER BY f.amount DESC, f.sale_id) "
+            "ROW_NUMBER() OVER (PARTITION BY di.dept ORDER BY f.amount DESC, "
+            "f.sale_id) "
             "AS rn "
             "FROM {fact_sales} f JOIN {dim_item} di ON f.item_key = di.item_key"
             ") ranked WHERE rn = 1"

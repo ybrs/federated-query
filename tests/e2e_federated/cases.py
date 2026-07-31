@@ -119,7 +119,8 @@ def _validate_inline_spec(case, name, spec):
         )
     if not isinstance(spec["inserts"], list):
         raise ValueError(
-            "case '" + case["name"] + "' extra table '" + name + "' inserts must be a list"
+            "case '" + case["name"] + "' extra table '" + name
+            + "' inserts must be a list"
         )
 
 
@@ -161,7 +162,8 @@ def _validate_placeholders(case, extra_names):
     for field in _query_placeholders(case["query"]):
         if field not in declared:
             raise ValueError(
-                "case '" + case["name"] + "' query uses undeclared table '" + field + "'"
+                "case '" + case["name"] + "' query uses undeclared table '"
+                + field + "'"
             )
 
 

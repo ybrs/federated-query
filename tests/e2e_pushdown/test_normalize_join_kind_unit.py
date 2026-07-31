@@ -60,7 +60,8 @@ def test_normalize_join_kind_default_join():
 
 
 def test_normalize_join_kind_no_enum_string_pollution():
-    """Verify the function doesn't return enum string representation like 'JOINSIDE.LEFT'."""
+    """Verify the function doesn't return enum string representation like
+    'JOINSIDE.LEFT'."""
     sql = "SELECT * FROM t1 LEFT JOIN t2 ON t1.id = t2.id"
     ast = parse_one(sql)
     joins = ast.args.get("joins") or []

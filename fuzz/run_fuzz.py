@@ -302,7 +302,8 @@ def _report(ctx, artifact_dir):
 
 
 def _replay(ctx, base_seed, profile, target_index):
-    """Re-run the single deterministic work item at ``target_index`` with deep checks."""
+    """Re-run the single deterministic work item at ``target_index`` with deep
+    checks."""
     ctx.force_deep = True
     index = 0
     for kind, payload in iter_work(base_seed, profile):

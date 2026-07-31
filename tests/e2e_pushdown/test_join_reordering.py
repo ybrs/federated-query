@@ -1,191 +1,111 @@
-"""End-to-end differential tests for cost-based join reordering (M7).
+"""Differential tests for cost-based join reordering on the Rust engine.
 
-Every query runs twice through real DuckDB sources - once with join
-reordering enabled (the default) and once disabled - and both result sets
-must equal the single-connection DuckDB oracle. Reordering must never change
-WHAT a query returns, only how fast.
+Every query runs twice over the same DuckDB sources - once with join reordering
+enabled (the default) and once with ``enable_join_reordering: false`` - and both
+result sets must equal the single-connection DuckDB oracle. Reordering decides
+which shape the engine executes, never which rows come back, so a reordering
+rule that is wrong only when enabled shows up here as a mismatch between the two
+runs rather than as a silently different answer.
+
+The placement corpus in tests/e2e_federated proves the DEFAULT configuration
+against the same oracle, but it never toggles the rule, so it cannot separate
+"the answer is right" from "the answer is right because reordering happened to
+be a no-op". That separation is what these tests add.
 """
 
 import duckdb
 import pytest
 
-from federated_query.catalog import Catalog
-from federated_query.cli.fedq import FedQRuntime
-from federated_query.config import Config
-from federated_query.config.config import OptimizerConfig
-from federated_query.datasources.duckdb import DuckDBDataSource
 from tests.duckdb_tmp import duckdb_path
+from tests.rust_runtime import RustRuntime
+
+REORDER_OFF = {"enable_join_reordering": False}
+
+# Row counts differ by an order of magnitude per table so the cost model has a
+# genuinely preferable order to find; with equal-sized tables a reordering rule
+# that did nothing would still pass.
+_SEED_SQL = (
+    "CREATE TABLE dim_small (k INTEGER, label VARCHAR);"
+    "INSERT INTO dim_small SELECT g, 'l' || g FROM range(0, 8) t(g);"
+    "CREATE TABLE dim_mid (k INTEGER, grp INTEGER);"
+    "INSERT INTO dim_mid SELECT g, g % 5 FROM range(0, 200) t(g);"
+    "CREATE TABLE fact_big (k INTEGER, mid_k INTEGER, amount INTEGER);"
+    "INSERT INTO fact_big SELECT g % 8, g % 200, g FROM range(0, 4000) t(g);"
+)
+
+QUERIES = [
+    # Three-table join whose cheapest order starts from the smallest dimension.
+    "SELECT d.label, count(*) AS n, sum(f.amount) AS total "
+    "FROM {p}.fact_big f "
+    "JOIN {p}.dim_small d ON f.k = d.k "
+    "JOIN {p}.dim_mid m ON f.mid_k = m.k "
+    "GROUP BY d.label ORDER BY d.label",
+    # A selective filter on the small side: the reordered plan should drive from
+    # it, and the answer must not depend on whether it does.
+    "SELECT d.label, sum(f.amount) AS total "
+    "FROM {p}.fact_big f "
+    "JOIN {p}.dim_small d ON f.k = d.k "
+    "WHERE d.k < 3 "
+    "GROUP BY d.label ORDER BY d.label",
+    # Four-way join, where the search space is large enough that enabling and
+    # disabling the rule genuinely produce different shapes.
+    "SELECT m.grp, count(*) AS n "
+    "FROM {p}.fact_big f "
+    "JOIN {p}.dim_small d ON f.k = d.k "
+    "JOIN {p}.dim_mid m ON f.mid_k = m.k "
+    "JOIN {p}.dim_small d2 ON m.grp = d2.k "
+    "GROUP BY m.grp ORDER BY m.grp",
+]
 
 
-# Deterministic per-table seeds: the oracle runs all of them; each source
-# runs exactly the ones for its tables, so every copy is identical.
-_TABLE_SEEDS = {
-    "region": (
-        "CREATE TABLE region (r_id INTEGER, r_name VARCHAR);"
-        "INSERT INTO region SELECT g, 'R' || (g % 2) FROM range(0, 4) t(g);"
-    ),
-    "nation": (
-        "CREATE TABLE nation (n_id INTEGER, n_r INTEGER, n_name VARCHAR);"
-        "INSERT INTO nation SELECT g, g % 4, 'N' || g FROM range(0, 10) t(g);"
-    ),
-    "supplier": (
-        "CREATE TABLE supplier (s_id INTEGER, s_n INTEGER);"
-        "INSERT INTO supplier SELECT g, g % 10 FROM range(0, 100) t(g);"
-    ),
-    "customer": (
-        "CREATE TABLE customer (c_id INTEGER, c_n INTEGER);"
-        "INSERT INTO customer SELECT g, g % 10 FROM range(0, 200) t(g);"
-    ),
-    "orders": (
-        "CREATE TABLE orders (o_id INTEGER, o_c INTEGER);"
-        "INSERT INTO orders SELECT g, g % 200 FROM range(0, 1000) t(g);"
-    ),
-    "lineitem": (
-        "CREATE TABLE lineitem (l_o INTEGER, l_s INTEGER, l_qty INTEGER);"
-        "INSERT INTO lineitem SELECT g % 1000, g % 100, g % 7"
-        " FROM range(0, 5000) t(g);"
-    ),
-}
-
-# The dims/facts split: every fact-dimension join crosses sources, so the
-# reordered joins execute on the coordinator (the path under test).
-_DIMS = ("region", "nation", "supplier", "customer")
-_FACTS = ("orders", "lineitem")
+@pytest.fixture(scope="module")
+def reordering_env():
+    """One seeded DuckDB file plus a read-only oracle connection over it."""
+    path = duckdb_path()
+    writer = duckdb.connect(path)
+    writer.execute(_SEED_SQL)
+    writer.close()
+    oracle = duckdb.connect(path, read_only=True)
+    yield path, oracle
+    oracle.close()
 
 
-def _runtime(config) -> FedQRuntime:
-    """A two-DuckDB-source runtime over the seeded star schema."""
-    dims = _source_with("dims", _DIMS)
-    facts = _source_with("facts", _FACTS)
-    catalog = Catalog()
-    catalog.register_datasource(dims)
-    catalog.register_datasource(facts)
-    catalog.load_metadata()
-    return FedQRuntime(catalog, config)
-
-
-def _source_with(name, tables) -> DuckDBDataSource:
-    """A DuckDB source holding the named seeded tables."""
-    source = DuckDBDataSource(name, {"path": duckdb_path(), "read_only": False})
-    source.connect()
-    for table in tables:
-        source.connection.execute(_TABLE_SEEDS[table])
-    return source
-
-
-def _oracle():
-    """A single DuckDB connection holding every table (the truth)."""
-    connection = duckdb.connect()
-    for seed in _TABLE_SEEDS.values():
-        connection.execute(seed)
-    return connection
-
-
-def _qualify(sql: str) -> str:
-    """Qualify each bare table to the source that holds it."""
-    qualified = sql
-    for table in _DIMS:
-        qualified = qualified.replace(f" {table} ", f" dims.main.{table} ")
-    for table in _FACTS:
-        qualified = qualified.replace(f" {table} ", f" facts.main.{table} ")
-    return qualified
-
-
-def _rows(table) -> set:
-    """An Arrow table as a set of positional row tuples."""
-    rows = set()
-    for index in range(table.num_rows):
-        values = []
-        for column in table.columns:
-            values.append(column[index].as_py())
-        rows.add(tuple(values))
+def _rows(runtime, sql):
+    """Execute through the engine and return its rows as tuples, in order."""
+    table = runtime.execute(sql)
+    rows = []
+    for record in table.to_pylist():
+        rows.append(tuple(record.values()))
     return rows
 
 
-# Star and cyclic shapes in deliberately BAD FROM order (cross products and
-# big-tables-first), all with a deterministic aggregate output.
-_QUERIES = (
-    # q09 shape: supplier x customer share no predicate in FROM order.
-    "SELECT count(*) AS n FROM supplier , customer , lineitem , orders "
-    "WHERE l_s = s_id AND l_o = o_id AND o_c = c_id",
-    # Snowflake chain written facts-last.
-    "SELECT n_name, count(*) AS n FROM region , nation , supplier , lineitem "
-    "WHERE n_r = r_id AND s_n = n_id AND l_s = s_id AND r_name = 'R1' "
-    "GROUP BY n_name ORDER BY n_name",
-    # Cyclic (q05 shape): customer-supplier via shared nation AND via
-    # orders-lineitem.
-    "SELECT count(*) AS n FROM customer , orders , lineitem , supplier "
-    "WHERE c_id = o_c AND l_o = o_id AND l_s = s_id AND c_n = s_n",
-    # Aggregate over a 5-way join with a local filter.
-    "SELECT sum(l_qty) AS q FROM nation , supplier , customer , orders , lineitem "
-    "WHERE s_n = n_id AND c_n = n_id AND o_c = c_id AND l_o = o_id "
-    "AND l_s = s_id AND n_id = 3",
-)
+@pytest.mark.parametrize("template", QUERIES)
+def test_reordering_never_changes_the_answer(reordering_env, template):
+    """Enabled and disabled must both match the single-connection oracle."""
+    path, oracle = reordering_env
+    engine_sql = template.format(p="duckdb_primary.main")
+    oracle_sql = template.format(p="main")
+
+    expected = oracle.execute(oracle_sql).fetchall()
+
+    reordered = _rows(RustRuntime([("duckdb_primary", path)]), engine_sql)
+    assert reordered == expected
+
+    plain = _rows(RustRuntime([("duckdb_primary", path)], REORDER_OFF), engine_sql)
+    assert plain == expected
 
 
-@pytest.mark.parametrize("sql", _QUERIES)
-def test_reordering_preserves_results(sql):
-    """Reordered and FROM-order execution both match the DuckDB oracle."""
-    oracle_rows = set()
-    for row in _oracle().execute(sql).fetchall():
-        oracle_rows.add(tuple(row))
-    reordered = _runtime(Config()).execute(_qualify(sql))
-    kept = _runtime(
-        Config(optimizer=OptimizerConfig(enable_join_reordering=False))
-    ).execute(_qualify(sql))
-    assert _rows(reordered) == oracle_rows
-    assert _rows(kept) == oracle_rows
+def test_disabling_reordering_is_actually_wired(reordering_env):
+    """The flag must reach the engine, or the test above proves nothing.
 
+    Both runtimes answer the same four-way join; this asserts the two plans are
+    not textually identical, so `enable_join_reordering: false` demonstrably
+    changed planning rather than being accepted and ignored.
+    """
+    path, _oracle = reordering_env
+    sql = QUERIES[2].format(p="duckdb_primary.main")
 
-def test_reordered_cross_source_join_still_gets_dynamic_filter():
-    """Reordering must not lose the dynamic-filter marking on cross-source
-    hash joins (semi-join reduction rides on it)."""
-    runtime = _runtime(Config())
-    sql = _qualify(
-        "SELECT count(*) AS n FROM supplier , customer , lineitem , orders "
-        "WHERE l_s = s_id AND l_o = o_id AND o_c = c_id"
-    )
-    plan = runtime.query_executor._plan_pipeline(sql, profiler=None)
-    marked = []
-    _collect_dynamic_filters(plan, marked)
-    assert marked, "no scan carries dynamic_filter_keys after reordering"
+    reordered_plan = RustRuntime([("duckdb_primary", path)]).explain_text(sql)
+    plain_plan = RustRuntime([("duckdb_primary", path)], REORDER_OFF).explain_text(sql)
 
-
-def _collect_dynamic_filters(node, found):
-    """Collect every physical scan annotated with dynamic filter keys."""
-    keys = getattr(node, "dynamic_filter_keys", None)
-    if keys:
-        found.append(node)
-    for child in node.children():
-        _collect_dynamic_filters(child, found)
-
-
-def test_same_source_island_collapses_to_one_remote_query():
-    """The q05 pattern: a filter on one facts table makes the facts join
-    output far smaller than the raw tables, so the locality term keeps
-    orders and lineitem adjacent and the single-source collapse sends ONE
-    remote query joining them - instead of fetching each table whole.
-    (Without such a filter the island saves nothing and the model rightly
-    does not force it - that is the cost TERM, not a group-by-source rule.)"""
-    runtime = _runtime(Config())
-    sql = _qualify(
-        "SELECT count(*) AS n FROM region , nation , supplier , orders , lineitem "
-        "WHERE n_r = r_id AND s_n = n_id AND l_s = s_id AND l_o = o_id "
-        "AND r_name = 'R1' AND o_id < 50"
-    )
-    document = runtime.explain(sql)
-    facts_queries = []
-    for entry in document["queries"]:
-        if entry["datasource_name"] == "facts":
-            facts_queries.append(str(entry["query"]))
-    assert len(facts_queries) == 1, f"facts queries: {facts_queries}"
-    joined = facts_queries[0].upper()
-    assert "ORDERS" in joined and "LINEITEM" in joined and "JOIN" in joined
-    # And the reordered, collapsed plan still computes the right answer.
-    result = runtime.execute(sql)
-    expected = _oracle().execute(
-        "SELECT count(*) FROM region, nation, supplier, orders, lineitem "
-        "WHERE n_r = r_id AND s_n = n_id AND l_s = s_id AND l_o = o_id "
-        "AND r_name = 'R1' AND o_id < 50"
-    ).fetchone()[0]
-    assert result.column("n").to_pylist() == [expected]
+    assert reordered_plan != plain_plan

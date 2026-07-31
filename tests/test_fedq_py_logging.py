@@ -76,7 +76,9 @@ def test_setup_logging_defaults_and_json_form(config_path):
     assert default_level.returncode == 0, default_level.stderr
     assert "fedq::audit" in default_level.stderr
 
-    structured = _run(config_path, 'fedq.setup_logging("info", True)', user="structured")
+    structured = _run(
+        config_path, 'fedq.setup_logging("info", True)', user="structured"
+    )
     assert structured.returncode == 0, structured.stderr
     assert '"target":"fedq::audit"' in structured.stderr
 

@@ -13,7 +13,7 @@
 PYBIN  ?= $(if $(VIRTUAL_ENV),$(VIRTUAL_ENV)/bin/,)
 PYTHON ?= $(PYBIN)python3
 
-.PHONY: build dev-build check-python setup download_postgres pg-start pg-stop test test-no-db install lint lint-ascii lint-construction fq-lint duckdb-lib
+.PHONY: build dev-build check-python setup download_postgres pg-start pg-stop test test-no-db install lint lint-ascii lint-python fq-lint duckdb-lib
 
 # Download the prebuilt PostgreSQL binaries into ./postgres-17 (one-time).
 download_postgres:
@@ -68,32 +68,37 @@ duckdb-lib:
 hook-install:
 	./scripts/install-hooks.sh
 
-# Install the package and dependencies into the active environment.
+# Install the test suite's dependencies into the active environment. There is no
+# package to install any more: the engine is Rust, reached through the compiled
+# fedq extension, and these are what the harnesses themselves import.
 install:
-	$(PYTHON) -m pip install -r requirements.txt -e .
+	$(PYTHON) -m pip install -r requirements.txt
 
 # Run the full test suite (expects PostgreSQL running via `make pg-start`).
 test:
 	$(PYTHON) -m pytest -q
 
-# Run only the tests that do not require PostgreSQL.
+# Run only the tests that do not require PostgreSQL. The federated corpus reads
+# the flag itself and skips its PostgreSQL placements visibly, rather than the
+# suite being narrowed by path.
 test-no-db:
-	$(PYTHON) -m pytest -q --ignore=tests/e2e_decorrelation
+	FEDQ_E2E_SKIP_PG=1 $(PYTHON) -m pytest -q
 
 # Run all linters (same checks the PostToolUse hook runs per edited file).
-# fq-lint is the Rust construction linter (the rewrite's equivalent of the Python
-# lint-construction flake8 plugin).
-lint: lint-ascii lint-construction fq-lint
+# fq-lint is the Rust construction linter; lint-python is flake8 over every
+# Python file in the repository.
+lint: lint-ascii lint-python fq-lint
 
 # Codepoint rule: fail on any character above U+00FF anywhere in the repo.
 # --error makes semgrep exit non-zero when it finds a match.
 lint-ascii:
 	$(PYBIN)semgrep --config .semgrep.yml --error --quiet .
 
-# Construction rules: FQ001 (no unjustified bare init) and FQ002 (.create needs
-# >=2 comment lines) over the engine, via the flake8 plugin in lint/.
-lint-construction:
-	$(PYBIN)flake8 --select=FQ federated_query
+# flake8 over EVERY Python file in the repository. The target names no
+# directory on purpose: `.` plus the excludes in .flake8 is the whole rule, so a
+# folder added later is covered without anyone remembering to list it here.
+lint-python:
+	$(PYBIN)flake8 .
 
 # The engine construction linter (ports lint/flake8_fedq.py): forbids re-listing
 # every field to rebuild a plan/expr node (use `Node { field: new, ..base }` or

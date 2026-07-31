@@ -37,7 +37,9 @@ def _seed_pg(connection):
     cursor.execute("DROP SCHEMA IF EXISTS " + schema + " CASCADE")
     cursor.execute("CREATE SCHEMA " + schema)
     cursor.execute("CREATE TABLE " + schema + ".customers (id INT, name TEXT)")
-    cursor.execute("INSERT INTO " + schema + ".customers VALUES (1, 'alice'), (2, 'bob')")
+    cursor.execute(
+        "INSERT INTO " + schema + ".customers VALUES (1, 'alice'), (2, 'bob')"
+    )
     cursor.close()
     return schema
 
@@ -88,7 +90,9 @@ def _create_pg(runtime, schema):
 
 def _create_duck(runtime, duck_path):
     """Run CREATE DATASOURCE for the seeded DuckDB file."""
-    statement = "CREATE DATASOURCE duck_dyn TYPE duckdb WITH (path = '" + duck_path + "')"
+    statement = (
+        "CREATE DATASOURCE duck_dyn TYPE duckdb WITH (path = '" + duck_path + "')"
+    )
     runtime.execute(statement)
 
 
@@ -142,7 +146,9 @@ def _assert_drop_isolates(runtime, schema):
     runtime.execute("DROP DATASOURCE duck_dyn")
     with pytest.raises(Exception):
         _rows(runtime, "SELECT amount FROM duck_dyn.main.orders")
-    survivors = _rows(runtime, "SELECT name FROM pg_dyn." + schema + ".customers ORDER BY id")
+    survivors = _rows(
+        runtime, "SELECT name FROM pg_dyn." + schema + ".customers ORDER BY id"
+    )
     assert survivors == [{"name": "alice"}, {"name": "bob"}]
 
 

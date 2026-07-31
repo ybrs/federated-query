@@ -9,7 +9,6 @@ from sqlglot import exp
 from tests.e2e_pushdown.helpers import (
     build_runtime,
     explain_datasource_query,
-    explain_document,
     from_table_name,
     join_table_names,
 )

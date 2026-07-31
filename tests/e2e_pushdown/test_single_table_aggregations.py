@@ -1,6 +1,5 @@
 """Single-table aggregation pushdown tests."""
 
-import pytest
 from sqlglot import exp
 
 from tests.e2e_pushdown.helpers import (

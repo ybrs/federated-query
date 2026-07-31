@@ -8,7 +8,6 @@ from tests.e2e_pushdown.helpers import (
     is_func,
     build_runtime,
     explain_datasource_query,
-    join_table_names,
     select_column_names,
     unwrap_parens,
 )

@@ -2,9 +2,6 @@
 
 import duckdb
 import pyarrow as pa
-from federated_query.catalog import Catalog
-from federated_query.datasources.duckdb import DuckDBDataSource
-from federated_query.parser import Parser
 from tests.duckdb_tmp import duckdb_path
 from tests.rust_runtime import RustRuntime
 
@@ -53,24 +50,6 @@ def make_runtime():
     return RustRuntime([("testdb", path)])
 
 
-def setup_test_db():
-    """Create a file-backed DuckDB source populated with join test data."""
-    datasource = DuckDBDataSource(
-        name="testdb", config={"path": duckdb_path(), "read_only": False}
-    )
-    datasource.connect()
-    _seed_join_tables(datasource.connection)
-    return datasource
-
-
-def setup_catalog(datasource):
-    """Set up catalog with the given data source."""
-    catalog = Catalog()
-    catalog.register_datasource(datasource)
-    catalog.load_metadata()
-    return catalog
-
-
 def test_simple_inner_join():
     """Test simple INNER JOIN query."""
     runtime = make_runtime()
@@ -90,7 +69,6 @@ def test_simple_inner_join():
     assert "Alice" in names
     assert "Bob" in names
     assert "Charlie" in names
-
 
 
 def test_join_with_where():
@@ -113,7 +91,6 @@ def test_join_with_where():
     assert all(amt > 100 for amt in amounts)
 
 
-
 def test_join_specific_columns():
     """Test JOIN selecting specific columns."""
     runtime = make_runtime()
@@ -133,7 +110,6 @@ def test_join_specific_columns():
     assert result.schema.names == ["id", "name", "order_id"]
 
 
-
 def test_join_all_columns():
     """Test JOIN with SELECT *."""
     runtime = make_runtime()
@@ -149,28 +125,3 @@ def test_join_all_columns():
 
     assert result.num_rows == 4
     assert result.num_columns == 7
-
-
-
-def test_parser_creates_join_plan():
-    """Test that parser creates Join logical plan node."""
-    datasource = setup_test_db()
-    catalog = setup_catalog(datasource)
-
-    sql = """
-        SELECT c.name, o.amount
-        FROM testdb.main.customers c
-        JOIN testdb.main.orders o ON c.id = o.customer_id
-    """
-
-    parser = Parser()
-    logical_plan = parser.parse_to_logical_plan(sql, catalog)
-
-    from federated_query.plan.logical import Join, Projection
-
-    assert isinstance(logical_plan, Projection)
-    assert isinstance(logical_plan.input, Join)
-
-    join_node = logical_plan.input
-    assert join_node.condition is not None
-

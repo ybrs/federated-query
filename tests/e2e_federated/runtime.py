@@ -136,7 +136,9 @@ def build_environment(placement, specs, pg_connection):
     """
     used_slots, mapping = placement.assign(specs.keys())
     env_id = _env_id(placement.name, specs.keys())
-    sources = _build_sources(placement, used_slots, mapping, specs, env_id, pg_connection)
+    sources = _build_sources(
+        placement, used_slots, mapping, specs, env_id, pg_connection
+    )
     qualified_map = _qualified_map(sources)
     config_path = _write_config(sources)
     return Environment(sources, qualified_map, config_path)

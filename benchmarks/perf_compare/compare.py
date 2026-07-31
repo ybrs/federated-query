@@ -40,7 +40,8 @@ RELEASE_LIB = os.path.join(ROOT, "target", "release", "libfedq_py.so")
 def _all_queries():
     """Every TPC-H query name (q01..q22) from the queries directory."""
     names = []
-    for path in sorted(glob.glob(os.path.join(ROOT, "benchmarks", "tpch", "queries", "q*.sql"))):
+    query_glob = os.path.join(ROOT, "benchmarks", "tpch", "queries", "q*.sql")
+    for path in sorted(glob.glob(query_glob)):
         names.append(os.path.splitext(os.path.basename(path))[0])
     return names
 
@@ -145,7 +146,8 @@ def _report_source(source, by_engine, queries, lines):
     lines.append("")
     lines.append(
         "| query | plan cold old | plan cold new | plan warm old | plan warm new "
-        "| total cold old | total cold new | total warm old | total warm new | new status |"
+        "| total cold old | total cold new | total warm old | total warm new "
+        "| new status |"
     )
     lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for query in queries:
@@ -218,7 +220,8 @@ def _report_summary(by_engine, queries, lines):
 def _git_commit():
     """The current git commit id (for the report's reproducibility header)."""
     result = subprocess.run(
-        ["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, capture_output=True, text=True
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=ROOT, capture_output=True, text=True
     )
     return result.stdout.strip() if result.returncode == 0 else "unknown"
 
@@ -227,7 +230,9 @@ def main():
     """Run the full matrix and write results.json + REPORT.md."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scale-factor", default="1")
-    parser.add_argument("--label", default=None, help="results/<label>/ (default sf<sf>)")
+    parser.add_argument(
+        "--label", default=None, help="results/<label>/ (default sf<sf>)"
+    )
     parser.add_argument("--sources", default="duck,parquet")
     parser.add_argument("--engines", default="old,new")
     parser.add_argument("--queries", default="all")
@@ -249,7 +254,11 @@ def main():
     for source in sources:
         report[source] = {}
         for engine in engines:
-            print("== {0} engine on {1} (SF{2}) ==".format(engine, source, args.scale_factor))
+            print(
+                "== {0} engine on {1} (SF{2}) ==".format(
+                    engine, source, args.scale_factor
+                )
+            )
             records = _measure_cell(engine, source, queries, args)
             results["cells"]["{0}/{1}".format(engine, source)] = records
             report[source][engine] = _index(records)

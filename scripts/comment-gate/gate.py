@@ -18,7 +18,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-import extract
+import extract  # noqa: E402 - the sys.path insert above is what makes this resolvable
 
 # Characters of comment text per judge call. Well under the model's context
 # once the rubric and instruction framing are added.
@@ -96,12 +96,23 @@ def main():
     violations = []
     for index, chunk in enumerate(chunks):
         if len(chunks) > 1:
-            print("comment gate: judging chunk {0}/{1} ...".format(index + 1, len(chunks)))
+            print(
+                "comment gate: judging chunk {0}/{1} ...".format(
+                    index + 1, len(chunks)
+                )
+            )
         violations.extend(_judge(rubric, chunk))
     if not violations:
         sys.exit(0)
-    print("COMMENT GATE: {0} project-management comment(s) in staged files".format(len(violations)))
-    print("(a comment describes the code as it is today - see scripts/comment-gate/RUBRIC.md)")
+    print(
+        "COMMENT GATE: {0} project-management comment(s) in staged files".format(
+            len(violations)
+        )
+    )
+    print(
+        "(a comment describes the code as it is today - "
+        "see scripts/comment-gate/RUBRIC.md)"
+    )
     for violation in violations:
         print("  {0}:{1}: {2!r} - {3}".format(
             violation.get("file"), violation.get("line"),

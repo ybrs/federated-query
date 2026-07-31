@@ -372,7 +372,9 @@ def _git(*args):
 def _header(short, subject, dirty, scales):
     """Build the report preamble: commit, host, engines, scales, methodology."""
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    dirty_note = "  (working tree DIRTY - results not from a clean commit)" if dirty else ""
+    dirty_note = (
+        "  (working tree DIRTY - results not from a clean commit)" if dirty else ""
+    )
     lines = ["# TPC-H benchmark report", "",
              "Commit: `{0}` - {1}{2}".format(short, subject, dirty_note),
              "Generated: {0}".format(stamp), "Host: {0}".format(_host_line()),
@@ -387,7 +389,9 @@ def _scales_note(scales):
     """Render the scale factors with their lineitem row counts."""
     parts = []
     for scale in scales:
-        parts.append("SF{0} ({1} lineitem)".format(scale, LINEITEM_ROWS.get(scale, "?")))
+        parts.append(
+            "SF{0} ({1} lineitem)".format(scale, LINEITEM_ROWS.get(scale, "?"))
+        )
     return ", ".join(parts) + "."
 
 

@@ -155,7 +155,9 @@ def _spawn(worker, count):
     lock = threading.Lock()
     threads = []
     for index in range(count):
-        threads.append(threading.Thread(target=_guard, args=(worker, index, failures, lock)))
+        threads.append(
+            threading.Thread(target=_guard, args=(worker, index, failures, lock))
+        )
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -188,7 +190,8 @@ def test_concurrent_own_runtimes_stay_correct(concurrency_fixture):
 
 
 def _build_runtimes(config_path, count):
-    """Build ``count`` runtimes over one config sequentially (open is not concurrent)."""
+    """Build ``count`` runtimes over one config sequentially (open is not
+    concurrent)."""
     fedq = runtime_mod._import_fedq()
     runtimes = []
     for _ in range(count):

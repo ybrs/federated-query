@@ -108,7 +108,8 @@ def test_join_with_case_expression_and_limit(single_source_env):
     """Ensures CASE + SUM alias stays remote and limit remains pushed."""
     runtime = build_runtime(single_source_env)
     sql = (
-        "SELECT O.region, SUM(CASE WHEN P.category = 'clothing' THEN P.base_price ELSE 0 END) AS clothing_spend "
+        "SELECT O.region, SUM(CASE WHEN P.category = 'clothing' THEN P.base_price "
+        "ELSE 0 END) AS clothing_spend "
         "FROM duckdb_primary.main.orders O "
         "JOIN duckdb_primary.main.products P "
         "ON O.product_id = P.id "

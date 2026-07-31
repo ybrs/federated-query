@@ -21,17 +21,19 @@ import pyarrow as pa
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import fedq
+import fedq  # noqa: E402 - the sys.path insert above is what makes this resolvable
 
-from compare import compare_results
-from qualify import qualify_query
+from compare import compare_results  # noqa: E402 - see sys.path insert above
+from qualify import qualify_query  # noqa: E402 - see sys.path insert above
 
 
 ENGINE_DIALECT = "postgres"
 SOURCE = "tpch"
 SCHEMA = "main"
 DECIMALS = 2
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "tpch_sf0.01.duckdb")
+DB_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "tpch_sf0.01.duckdb"
+)
 QUERIES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queries")
 
 

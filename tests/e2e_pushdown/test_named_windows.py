@@ -43,7 +43,8 @@ def _ground_truth_rows(env, sql):
 
 # (federated SQL template, reference SQL template) keyed on {T}.
 NAMED_WINDOW_CASES = [
-    "SELECT order_id, SUM(price) OVER w AS s FROM {T} WINDOW w AS (PARTITION BY region)",
+    "SELECT order_id, SUM(price) OVER w AS s FROM {T} "
+    "WINDOW w AS (PARTITION BY region)",
     "SELECT order_id, region, "
     "ROW_NUMBER() OVER w AS rn FROM {T} "
     "WINDOW w AS (PARTITION BY region ORDER BY price)",

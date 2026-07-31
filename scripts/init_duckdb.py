@@ -101,7 +101,9 @@ def init_duckdb(db_path: str = "data/test.duckdb"):
 
     # Verify data
     customer_count = conn.execute("SELECT COUNT(*) FROM main.customers").fetchone()[0]
-    department_count = conn.execute("SELECT COUNT(*) FROM main.departments").fetchone()[0]
+    department_count = conn.execute(
+        "SELECT COUNT(*) FROM main.departments"
+    ).fetchone()[0]
     employee_count = conn.execute("SELECT COUNT(*) FROM main.employees").fetchone()[0]
 
     print(f"[OK] Created {customer_count} customers")

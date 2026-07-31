@@ -11,7 +11,6 @@ import os
 import tempfile
 
 import pyarrow as pa
-import sqlglot
 
 _TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 _SO_PATH = os.path.join(_TESTS_DIR, "fedq.so")

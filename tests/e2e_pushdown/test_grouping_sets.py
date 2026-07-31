@@ -70,7 +70,8 @@ GROUPING_CASES = [
     "FROM {T} GROUP BY ROLLUP (region)",
     "SELECT region, status, SUM(price) AS s FROM {T} GROUP BY region, ROLLUP (status)",
     # Regression: ORDER BY / WHERE pushdown must not drop the grouping sets
-    # (the optimizer's scan rebuilds must carry them, or super-aggregate rows are dropped).
+    # (the optimizer's scan rebuilds must carry them, or super-aggregate rows
+    # are dropped).
     "SELECT region, SUM(price) AS s FROM {T} GROUP BY ROLLUP (region) ORDER BY region",
     "SELECT region, SUM(price) AS s FROM {T} WHERE price > 30 GROUP BY ROLLUP (region)",
 ]
@@ -90,8 +91,10 @@ def test_single_source_grouping_sets(single_source_env, template):
 def test_grouping_sets_over_same_source_join(single_source_env):
     """ROLLUP over a same-source join pushes as one query without dropping sets.
 
-    Regression: this path (SingleSourcePushdown -> PhysicalRemoteQuery) rendered a
-    flat GROUP BY and lost the super-aggregate rows.
+    The SingleSourcePushdown -> PhysicalRemoteQuery path must render the grouping
+    sets themselves, never a flat GROUP BY: a flat one still returns rows, just
+    without the super-aggregate ones, so the loss shows up as a wrong answer
+    rather than an error.
     """
     runtime = build_runtime(single_source_env)
     federated_sql = (

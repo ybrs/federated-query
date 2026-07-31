@@ -95,17 +95,23 @@ def _semgrep_findings(root, rel_path):
     lines = []
     for result in results:
         start = result.get("start", {}).get("line", "?")
-        lines.append(f"{rel_path}:{start}: {result.get('check_id')}: non-ascii above U+00FF")
+        check = result.get("check_id")
+        lines.append(f"{rel_path}:{start}: {check}: non-ascii above U+00FF")
     return lines
 
 
 def _flake8_findings(root, rel_path):
-    """Return flake8 FQ (construction rule) findings for one engine file."""
+    """Return flake8 findings for one Python file, under the repo's .flake8.
+
+    Every Python file is checked, wherever it lives - no directory carve-outs,
+    so a file that moves keeps its coverage. The rules and the excluded
+    non-source trees are the ones .flake8 declares; nothing is selected here.
+    """
     binary = _tool("flake8")
     if binary is None:
-        return [f"flake8 not installed beside {_python()}; FQ001/FQ002 NOT checked"]
+        return [f"flake8 not installed beside {_python()}; Python rules NOT checked"]
     completed = subprocess.run(
-        [binary, "--select=FQ", rel_path],
+        [binary, rel_path],
         cwd=root, capture_output=True, text=True,
     )
     return [line for line in completed.stdout.splitlines() if line.strip()]
@@ -145,7 +151,9 @@ def _fq_lint_findings(root):
     """
     binary, env = _cargo_env(root)
     if binary is None:
-        return ["cargo not found; fq-lint (FQ-CONSTRUCT/FQ-CLONE/FQ-PMCOMMENT) NOT checked"]
+        return [
+            "cargo not found; fq-lint (FQ-CONSTRUCT/FQ-CLONE/FQ-PMCOMMENT) NOT checked"
+        ]
     completed = subprocess.run(
         [binary, "run", "-q", "-p", "fq-lint", "--", "."],
         cwd=root, env=env, capture_output=True, text=True,
@@ -172,7 +180,7 @@ def main():
         return 0
     rel_path = os.path.relpath(path, root)
     findings = _semgrep_findings(root, rel_path)
-    if rel_path.endswith(".py") and (os.sep + "federated_query" + os.sep) in (os.sep + rel_path):
+    if rel_path.endswith(".py"):
         findings += _flake8_findings(root, rel_path)
     if rel_path.endswith(".rs"):
         findings += _fq_lint_findings(root)

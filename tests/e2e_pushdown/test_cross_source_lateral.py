@@ -47,7 +47,8 @@ def test_cross_source_non_equi_scalar_aggregate(multi_source_env):
     )
     reference_sql = (
         "SELECT o.order_id, "
-        "  (SELECT MAX(p.base_price) FROM products p WHERE p.base_price < o.price) AS m "
+        "  (SELECT MAX(p.base_price) FROM products p WHERE p.base_price < o.price) "
+        "AS m "
         "FROM orders o"
     )
     _assert_cross_source_matches(multi_source_env, engine_sql, reference_sql)

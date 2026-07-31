@@ -58,7 +58,10 @@ def _first_differing_index(engine_norm, oracle_norm):
 def _describe_difference(index, engine_norm, oracle_norm):
     """Describe the first differing row, flagging an order-only difference."""
     if sorted(engine_norm) == sorted(oracle_norm):
-        template = "rows match as a set but order differs at row {0}: engine={1} oracle={2}"
+        template = (
+            "rows match as a set but order differs at row {0}: "
+            "engine={1} oracle={2}"
+        )
     else:
         template = "row {0} differs: engine={1} oracle={2}"
     return template.format(index, engine_norm[index], oracle_norm[index])

@@ -25,10 +25,14 @@ for _path in (REPO_ROOT, TPCH_DIR):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-from compare import compare_results
-from generate import DEFAULT_DATA_DIR, DEFAULT_QUERIES_DIR, _db_path
-from run import arrow_to_rows
-from run_federated import (
+from compare import compare_results  # noqa: E402 - see sys.path insert above
+from generate import (  # noqa: E402 - see sys.path insert above
+    DEFAULT_DATA_DIR,
+    DEFAULT_QUERIES_DIR,
+    _db_path,
+)
+from run import arrow_to_rows  # noqa: E402 - see sys.path insert above
+from run_federated import (  # noqa: E402 - see sys.path insert above
     ENGINE_DIALECT, FEDQ_SOURCES, ORACLE_SOURCES, PLACEMENTS,
     _median_ms, _qualify, build_fedq, build_oracle,
 )
@@ -101,7 +105,10 @@ def _print_row(record):
 
 def _detail_row(record):
     """One markdown table row for a query's before/after measurement."""
-    return "| {0} | {1:.1f} | {2:.1f} | {3:.1f}x | {4:.1f} | {5:.2f}x | {6:.2f}x | {7} |".format(
+    return (
+        "| {0} | {1:.1f} | {2:.1f} | {3:.1f}x | {4:.1f} | {5:.2f}x | {6:.2f}x "
+        "| {7} |"
+    ).format(
         record["name"], record["orig_ms"], record["reord_ms"], _speedup(record),
         record["duck_ms"], record["orig_ms"] / record["duck_ms"],
         record["reord_ms"] / record["duck_ms"], "yes" if record["correct"] else "NO")
@@ -136,7 +143,9 @@ def _report_lines(records, scale):
 def _write_report(records, scale):
     """Write the experiment report and return its path."""
     os.makedirs(REPORT_DIR, exist_ok=True)
-    path = os.path.join(REPORT_DIR, "joinorder-{0}-sf{1}.md".format(_git_short(), scale))
+    path = os.path.join(
+        REPORT_DIR, "joinorder-{0}-sf{1}.md".format(_git_short(), scale)
+    )
     with open(path, "w") as handle:
         handle.write("\n".join(_report_lines(records, scale)) + "\n")
     return path

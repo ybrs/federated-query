@@ -130,7 +130,10 @@ def test_current_date_in_select(single_source_env):
 
     today_expr = find_alias_expression(ast, "today")
     assert today_expr is not None
-    assert is_func(today_expr, "CURRENT_DATE") or is_func(today_expr, "CURRENT_TIMESTAMP")
+    assert (
+        is_func(today_expr, "CURRENT_DATE")
+        or is_func(today_expr, "CURRENT_TIMESTAMP")
+    )
 
 
 def test_extract_in_group_by(single_source_env):

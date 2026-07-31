@@ -73,7 +73,9 @@ def write_crafted_config(size):
     crafted_dir = os.path.join(DATA_DIR, "crafted", size)
     config = os.path.join(crafted_dir, "config.yaml")
     with open(config, "w") as handle:
-        handle.write("datasources:\n  ev:\n    type: parquet\n    dir: %s\n" % crafted_dir)
+        handle.write(
+            "datasources:\n  ev:\n    type: parquet\n    dir: %s\n" % crafted_dir
+        )
     return config
 
 
@@ -242,10 +244,10 @@ def retention_oracle(con, parquet, birth, ret, period, mode="bounded",
     if bounds[0] is None:
         return []
     first, last = bounds
+    interval_by_period = {"day": "1 DAY", "week": "7 DAY", "month": "1 MONTH"}
     cohorts = con.execute(
         "SELECT unnest(generate_series(TIMESTAMP '%s', TIMESTAMP '%s', "
-        "INTERVAL %s))" % (first, last, {"day": "1 DAY", "week": "7 DAY",
-                                          "month": "1 MONTH"}[period])
+        "INTERVAL %s))" % (first, last, interval_by_period[period])
     ).fetchall()
     sizes = dict(con.execute(
         "WITH %s, %s SELECT cohort, count(*) FROM births GROUP BY 1"

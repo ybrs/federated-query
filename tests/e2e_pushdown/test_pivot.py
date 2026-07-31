@@ -55,7 +55,8 @@ def _reference():
 # Each is compared against DuckDB's own native PIVOT over the same data.
 PIVOT_CASES = [
     "SELECT * FROM {T} PIVOT (SUM(price) FOR region IN ('NA', 'EU', 'APAC'))",
-    "SELECT * FROM {T} PIVOT (SUM(price) AS total FOR status IN ('processing', 'shipped'))",
+    "SELECT * FROM {T} PIVOT (SUM(price) AS total FOR status "
+    "IN ('processing', 'shipped'))",
     "SELECT * FROM {T} PIVOT (MAX(quantity) FOR region IN ('NA', 'EU'))",
 ]
 

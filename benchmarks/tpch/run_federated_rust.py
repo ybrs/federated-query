@@ -29,11 +29,15 @@ from sqlglot import exp
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import fedq
+import fedq  # noqa: E402 - the sys.path insert above is what makes this resolvable
 
-from compare import compare_results
-from generate import _db_path, DEFAULT_DATA_DIR, DEFAULT_QUERIES_DIR
-from qualify import TPCH_TABLES
+from compare import compare_results  # noqa: E402 - see sys.path insert above
+from generate import (  # noqa: E402 - see sys.path insert above
+    _db_path,
+    DEFAULT_DATA_DIR,
+    DEFAULT_QUERIES_DIR,
+)
+from qualify import TPCH_TABLES  # noqa: E402 - see sys.path insert above
 
 
 # Dimensions on PostgreSQL, fact tables on DuckDB: every fact-dimension join
@@ -49,6 +53,7 @@ ENGINE_DIALECT = "postgres"
 # The oracle reads pg tables through the attached "pgdb" and duck tables bare.
 FEDQ_SOURCES = {"pg": ("pg", "public"), "duck": ("duck", "main")}
 ORACLE_SOURCES = {"pg": ("pgdb", "public"), "duck": (None, "main")}
+
 
 def _adbc_driver_path():
     """Return the ADBC Postgres driver shipped with the installed package.
@@ -108,7 +113,9 @@ def build_oracle(db_path, options):
     """Open DuckDB over the dataset with PostgreSQL attached via the connector."""
     connection = duckdb.connect(db_path, read_only=True)
     connection.execute("LOAD postgres")
-    connection.execute(f"ATTACH '{_pg_dsn(options)}' AS pgdb (TYPE postgres, READ_ONLY)")
+    connection.execute(
+        f"ATTACH '{_pg_dsn(options)}' AS pgdb (TYPE postgres, READ_ONLY)"
+    )
     return connection
 
 
@@ -245,11 +252,18 @@ def _print_summary(results):
             ratios.append(result["ours_ms"] / result["duck_ms"])
     total_ratio = ours_total / duck_total if duck_total else float("nan")
     print("-" * 72)
-    print("[pg-dims] Total {0} | PASS {1} | MISMATCH {2} | ERROR {3} | cross-source {4}".format(
-        len(results), tally["PASS"], tally["MISMATCH"], tally["ERROR"], cross))
-    print("[pg-dims] ours {0:.0f}m  duckdb {1:.0f}m  ->  total {2:.2f}x  geomean {3:.2f}x  "
-          "(both federated over the same PG+DuckDB split)".format(
-              ours_total, duck_total, total_ratio, _geomean(ratios)))
+    print(
+        "[pg-dims] Total {0} | PASS {1} | MISMATCH {2} | ERROR {3} | "
+        "cross-source {4}".format(
+            len(results), tally["PASS"], tally["MISMATCH"], tally["ERROR"], cross
+        )
+    )
+    print(
+        "[pg-dims] ours {0:.0f}m  duckdb {1:.0f}m  ->  total {2:.2f}x  "
+        "geomean {3:.2f}x  (both federated over the same PG+DuckDB split)".format(
+            ours_total, duck_total, total_ratio, _geomean(ratios)
+        )
+    )
 
 
 def _select_query_files(queries_dir, only):
@@ -277,13 +291,18 @@ def run(options):
     config_path = write_config(db_path, options, adbc_driver)
     runtime = fedq.Runtime(config_path)
     oracle = build_oracle(db_path, options)
-    print("\n==== placement: pg-dims (ours=fedq-rust, duckdb=via postgres connector) ====")
+    print(
+        "\n==== placement: pg-dims "
+        "(ours=fedq-rust, duckdb=via postgres connector) ===="
+    )
     print("db={0} pg={1} adbc={2}".format(db_path, options.pg_database, adbc_driver))
     print("{0:5} {1:8} {2:6} {3:>10} {4:>9} {5:>7}".format(
         "query", "status", "span", "ours", "duckdb", "slower"))
     results = []
     for path in paths:
-        result = evaluate_query(runtime, oracle, path, options.decimals, options.warm_runs)
+        result = evaluate_query(
+            runtime, oracle, path, options.decimals, options.warm_runs
+        )
         results.append(result)
         _print_result(result)
     _print_summary(results)
@@ -292,7 +311,9 @@ def run(options):
 
 def _parse_args():
     """Parse command-line arguments for the federated Rust benchmark runner."""
-    parser = argparse.ArgumentParser(description="Run federated TPC-H on the Rust engine.")
+    parser = argparse.ArgumentParser(
+        description="Run federated TPC-H on the Rust engine."
+    )
     parser.add_argument("--scale-factor", default="0.01")
     parser.add_argument("--queries-dir", default=DEFAULT_QUERIES_DIR)
     parser.add_argument("--only", default=None)

@@ -1,7 +1,5 @@
 """Join pushdown combinations: aggregations, HAVING, order/limit."""
 
-from sqlglot import exp
-
 from tests.e2e_pushdown.helpers import (
     is_func,
     build_runtime,

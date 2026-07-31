@@ -5,7 +5,6 @@ from sqlglot import exp
 from tests.e2e_pushdown.helpers import (
     build_runtime,
     explain_datasource_query,
-    join_table_names,
     select_column_names,
     unwrap_parens,
 )

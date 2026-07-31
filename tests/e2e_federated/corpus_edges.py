@@ -263,12 +263,16 @@ CASES = [
     {
         "name": "edge_types_bigint_sum_precision",
         "tables": ["t_types"],
-        "query": "SELECT sum(t_big) AS total_big FROM {t_types} WHERE t_big IS NOT NULL",
+        "query": (
+            "SELECT sum(t_big) AS total_big FROM {t_types} WHERE t_big IS NOT NULL"
+        ),
     },
     {
         "name": "edge_types_decimal_exact_sum",
         "tables": ["t_types"],
-        "query": "SELECT sum(t_dec) AS total_dec FROM {t_types} WHERE t_dec IS NOT NULL",
+        "query": (
+            "SELECT sum(t_dec) AS total_dec FROM {t_types} WHERE t_dec IS NOT NULL"
+        ),
     },
     {
         "name": "edge_types_double_arithmetic_null",

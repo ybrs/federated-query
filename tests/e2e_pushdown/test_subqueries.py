@@ -12,7 +12,6 @@ no-subquery-expression invariant.
 """
 
 import duckdb
-import pytest
 
 from sqlglot import exp
 
@@ -21,7 +20,6 @@ from tests.e2e_pushdown.helpers import (
     build_runtime,
     explain_datasource_query,
     select_column_names,
-    unwrap_parens,
 )
 
 

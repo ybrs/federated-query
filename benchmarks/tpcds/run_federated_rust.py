@@ -290,7 +290,10 @@ def _first_differing_index(engine_rows, oracle_rows, decimals):
 def _describe_difference(index, engine_norm, oracle_norm):
     """Describe the first differing row, flagging an order-only difference."""
     if sorted(engine_norm) == sorted(oracle_norm):
-        template = "rows match as a set but order differs at row {0}: engine={1} oracle={2}"
+        template = (
+            "rows match as a set but order differs at row {0}: "
+            "engine={1} oracle={2}"
+        )
     else:
         template = "row {0} differs: engine={1} oracle={2}"
     return template.format(index, engine_norm[index], oracle_norm[index])
@@ -383,7 +386,6 @@ ENGINE_DIALECT = "postgres"
 # resolve against the local DuckDB file.
 FEDQ_SOURCES = {"pg": ("pg", "public"), "duck": ("duck", "main")}
 ORACLE_SOURCES = {"pg": ("pgdb", "public"), "duck": (None, "main")}
-
 
 
 def _pg_dims_placement():
@@ -638,7 +640,9 @@ def _error_result(name, error):
     }
 
 
-def _compared_result(name, engine_rows, truth_rows, decimals, cold_ms, warm_ms, duck_ms):
+def _compared_result(
+    name, engine_rows, truth_rows, decimals, cold_ms, warm_ms, duck_ms
+):
     """Compare engine rows against the reference truth, classify OK/WRONG, and
     attach the cold/warm engine timings, the DuckDB baseline, and the ratio."""
     match, reason = compare_results(engine_rows, truth_rows, decimals)

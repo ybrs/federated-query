@@ -68,7 +68,8 @@ def _dump_one(runtime, qualify, path, out_dir):
         body.extend(lines)
     with open(os.path.join(out_dir, name + ".txt"), "w") as handle:
         handle.write("\n".join(body))
-    return name, seconds, ("ERROR: " + error if error else "ok {0} lines".format(len(lines)))
+    status = "ERROR: " + error if error else "ok {0} lines".format(len(lines))
+    return name, seconds, status
 
 
 def _on_alarm(signum, frame):
@@ -106,7 +107,8 @@ def main():
             errors += 1
         print("{0:5} {1:7.3f}s  {2}{3}".format(name, seconds, status, flag), flush=True)
     print(
-        "\n[{0}] {1} queries, {2:.2f}s total, {3:.3f}s avg, {4} slow(>1s), {5} errors".format(
+        "\n[{0}] {1} queries, {2:.2f}s total, {3:.3f}s avg, {4} slow(>1s), "
+        "{5} errors".format(
             suite, len(paths), total, total / max(len(paths), 1), slow, errors
         )
     )

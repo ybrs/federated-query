@@ -110,7 +110,10 @@ def _classify_sql(sql):
 def _walk(node, islands, shipments, coord_ops):
     """Recurse the physical tree, sorting nodes into islands/shipments/coord."""
     cls = type(node).__name__
-    if cls in (ISLAND_PUSHDOWN, ISLAND_RAWSCAN, ISLAND_REMOTE_JOIN, ISLAND_REMOTE_SETOP):
+    island_classes = (
+        ISLAND_PUSHDOWN, ISLAND_RAWSCAN, ISLAND_REMOTE_JOIN, ISLAND_REMOTE_SETOP
+    )
+    if cls in island_classes:
         sql = _render_island_sql(node)
         islands.append((_island_datasource(node), _classify_sql(sql), sql))
         return

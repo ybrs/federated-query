@@ -621,7 +621,8 @@ CASES = [
         "query": (
             "SELECT c.customer_id, "
             "(SELECT ROW_NUMBER() OVER (ORDER BY o.price ASC) FROM {orders} o "
-            "WHERE o.customer_id = c.customer_id ORDER BY o.order_id DESC LIMIT 1) AS rnk "
+            "WHERE o.customer_id = c.customer_id ORDER BY o.order_id DESC "
+            "LIMIT 1) AS rnk "
             "FROM {customers} c"
         ),
     },

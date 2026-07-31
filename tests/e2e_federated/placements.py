@@ -116,7 +116,9 @@ def _build_placements():
         Placement("pg_duck", [Slot("a", PG), Slot("b", DUCK)], ROUND_ROBIN),
         Placement("duck_pg", [Slot("a", DUCK), Slot("b", PG)], ROUND_ROBIN),
         Placement("all_pg", [Slot("a", PG), Slot("b", PG)], ROUND_ROBIN),
-        Placement("parquet_duck", [Slot("a", PARQUET), Slot("b", DUCK)], FIRST_ISOLATED),
+        Placement(
+            "parquet_duck", [Slot("a", PARQUET), Slot("b", DUCK)], FIRST_ISOLATED
+        ),
         Placement("parquet_pg", [Slot("a", PARQUET), Slot("b", PG)], FIRST_ISOLATED),
     ]
     _add_multi_source_placements(placements)

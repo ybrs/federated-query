@@ -1,5 +1,30 @@
-[flake8:local-plugins]
-extension =
-    FQ = flake8_fedq:FedqConstructionChecker
-paths =
-    ./lint
+[flake8]
+# EVERY Python file in this repository is linted. There is deliberately no
+# per-directory allowlist: a list of directories silently stops covering a
+# folder somebody adds later, and files move between folders. `flake8 .` from
+# the repository root is the rule, and the excludes below are the boundary of
+# what counts as our source at all - third-party trees and build output, not
+# code of ours that is exempt.
+exclude =
+    .git,
+    __pycache__,
+    .pytest_cache,
+    .hypothesis,
+    venv,
+    venv32,
+    vendor,
+    target,
+    build,
+    dist,
+    postgres-17,
+    postgres-data,
+    .duckdb-lib
+
+# Black formats to 88 columns and CLAUDE.md states 88; flake8's own default of
+# 79 would flag every line black itself produced.
+max-line-length = 88
+
+# E203 (whitespace before ':') is the one rule black actively contradicts: it
+# emits `x[1 :]` for slices with complex bounds. Leaving it on makes the
+# formatter and the linter permanently disagree, so the formatter wins.
+extend-ignore = E203

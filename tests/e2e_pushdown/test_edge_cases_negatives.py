@@ -25,7 +25,8 @@ def test_window_function_pushes_down(single_source_env):
     """
     runtime = build_runtime(single_source_env)
     sql = (
-        "SELECT order_id, ROW_NUMBER() OVER (PARTITION BY region ORDER BY order_id) AS rn "
+        "SELECT order_id, ROW_NUMBER() OVER (PARTITION BY region ORDER BY "
+        "order_id) AS rn "
         "FROM duckdb_primary.main.orders"
     )
     ast = explain_datasource_query(runtime, sql)

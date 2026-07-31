@@ -130,16 +130,26 @@ def _build_old(source, args):
         from federated_query.datasources.duckdb import DuckDBDataSource
 
         db_path = _duck_path(args.scale_factor)
-        make = lambda: single(
-            DuckDBDataSource("duck", {"path": db_path, "read_only": True}), "duck"
-        )
+
+        def make():
+            """Build the OLD engine over a local DuckDB source."""
+            return single(
+                DuckDBDataSource("duck", {"path": db_path, "read_only": True}),
+                "duck",
+            )
     elif source == "parquet":
         from federated_query.datasources.parquet import ParquetDataSource
 
         pq_dir = _parquet_dir(args.scale_factor)
-        make = lambda: single(ParquetDataSource("pq", {"dir": pq_dir}), "pq")
+
+        def make():
+            """Build the OLD engine over a local Parquet source."""
+            return single(ParquetDataSource("pq", {"dir": pq_dir}), "pq")
     elif source == "pgduck":
-        make = lambda: _build_old_pgduck(args)
+
+        def make():
+            """Build the OLD engine's federated pg-dims runtime."""
+            return _build_old_pgduck(args)
     else:
         raise SystemExit("unknown source: " + source)
     return make
@@ -269,12 +279,18 @@ def _build_new(source, args):
             import run_federated as rf
 
             placement = rf.PLACEMENTS["pg-dims"]
-            qualify = lambda sql: rf._qualify(
-                sql, placement, rf.FEDQ_SOURCES, rf.ENGINE_DIALECT
-            )
+
+            def qualify(sql):
+                """Qualify sql for the pg-dims federated placement."""
+                return rf._qualify(
+                    sql, placement, rf.FEDQ_SOURCES, rf.ENGINE_DIALECT
+                )
         else:
             name = "duck" if source == "duck" else "pq"
-            qualify = lambda sql: _qualify_single(sql, name)
+
+            def qualify(sql):
+                """Qualify sql for the single-source placement."""
+                return _qualify_single(sql, name)
         return runtime, qualify
 
     return make
@@ -345,7 +361,9 @@ def _run_warm(make, fns, queries, warmups, runs):
     except Exception as error:
         status, message = _classify(error)
         for query in queries:
-            _emit({"query": query, "mode": "warm", "status": status, "message": message})
+            _emit(
+                {"query": query, "mode": "warm", "status": status, "message": message}
+            )
         return
     for query in queries:
         _emit(_warm_one(plan_only, execute, query, warmups, runs))
@@ -380,9 +398,15 @@ def main():
     """Parse arguments, build the engine adapter, run the requested mode."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", required=True, choices=["old", "new"])
-    parser.add_argument("--source", required=True, choices=["duck", "parquet", "pgduck"])
-    parser.add_argument("--mode", required=True, choices=["cold-plan", "cold-total", "warm"])
-    parser.add_argument("--queries", required=True, help="comma-separated, e.g. q01,q06")
+    parser.add_argument(
+        "--source", required=True, choices=["duck", "parquet", "pgduck"]
+    )
+    parser.add_argument(
+        "--mode", required=True, choices=["cold-plan", "cold-total", "warm"]
+    )
+    parser.add_argument(
+        "--queries", required=True, help="comma-separated, e.g. q01,q06"
+    )
     parser.add_argument("--scale-factor", default="1")
     parser.add_argument("--pg-database", default="duckpoc_sf1")
     parser.add_argument("--planning-budget-ms", type=int, default=None)

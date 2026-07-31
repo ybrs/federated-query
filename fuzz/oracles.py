@@ -82,7 +82,8 @@ VARIANTS = (
 # EXPLAIN plan (a variant that never changes any plan is a dead knob, logged).
 PROBE_QUERIES = (
     (
-        "SELECT o.order_id AS c0 FROM {orders} o WHERE o.price > 50 AND o.status = 'processing'",
+        "SELECT o.order_id AS c0 FROM {orders} o WHERE o.price > 50 "
+        "AND o.status = 'processing'",
         ["orders"],
     ),
     (
