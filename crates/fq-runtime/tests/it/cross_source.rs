@@ -2,11 +2,12 @@
 //! a Postgres source runs a JOIN ACROSS the two sources, exercising the engine's
 //! federated path (per-source reads merged and reduced by the coordinator).
 //!
-//! Gated three ways (all early-return, never fail the suite on absence):
-//!   * the DuckDB fixture must exist,
-//!   * Postgres must be reachable on :5432 (mirrors the fq-connectors gating),
-//!   * the ADBC Postgres driver shared library must be present (the exec-plane
-//!     Postgres reads go over ADBC).
+//! Postgres being unreachable on :5432 early-returns (mirrors the fq-connectors
+//! gating), because a database nobody started is a local condition rather than a
+//! defect. The ADBC Postgres driver is NOT gated that way: the exec plane reads
+//! Postgres over ADBC, so its absence is a panic. A skip there would report this
+//! test green while it exercised nothing, which is the coverage claim the suite
+//! must never make.
 //!
 //! The Postgres dimension fixture (`fq_rt_region`) is created by the test itself
 //! (via the connector's setup helper) BEFORE the runtime loads metadata, and
@@ -14,6 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::process::Command;
 
 use arrow::array::{RecordBatch, StringArray};
 use fq_common::{
@@ -65,20 +67,47 @@ fn pg_conn_str() -> String {
     "host=localhost port=5432 user=postgres dbname=postgres".to_string()
 }
 
-/// The first ADBC Postgres driver shared library found among known install
-/// locations, or `None` (the test then skips - the exec plane needs it).
-fn adbc_driver_path() -> Option<String> {
-    let candidates = [
-        "/workspace/federated-query/venv/lib/python3.12/site-packages/adbc_driver_postgresql/libadbc_driver_postgresql.so",
-        "/workspace/venv/lib/python3.12/site-packages/adbc_driver_postgresql/libadbc_driver_postgresql.so",
-        "/workspace/venv-fedq/lib/python3.13/site-packages/adbc_driver_postgresql/libadbc_driver_postgresql.so",
-    ];
-    for candidate in candidates {
-        if PathBuf::from(candidate).exists() {
-            return Some(candidate.to_string());
-        }
+/// Prints the directory holding the installed `adbc_driver_postgresql` package.
+const ADBC_PACKAGE_DIR_PROGRAM: &str =
+    "import adbc_driver_postgresql, os; print(os.path.dirname(adbc_driver_postgresql.__file__))";
+
+/// The interpreter owning the project's Python environment: an activated venv
+/// (VIRTUAL_ENV) when one is set, otherwise `python3` from PATH. No venv
+/// location or Python version is written down, so a venv that moves or is
+/// rebuilt keeps working.
+fn python_interpreter() -> String {
+    match std::env::var("VIRTUAL_ENV") {
+        Ok(venv) if !venv.is_empty() => format!("{venv}/bin/python"),
+        _ => "python3".to_string(),
     }
-    None
+}
+
+/// The ADBC Postgres driver shipped with the active Python environment.
+///
+/// Resolved by asking the interpreter where its `adbc_driver_postgresql`
+/// package lives. Every failure here panics rather than returning an absence
+/// for the caller to skip on: the exec plane reads Postgres over ADBC, so
+/// without the driver this test proves nothing, and a green result would claim
+/// cross-source coverage the run never had.
+fn adbc_driver_path() -> String {
+    let interpreter = python_interpreter();
+    let output = Command::new(&interpreter)
+        .args(["-c", ADBC_PACKAGE_DIR_PROGRAM])
+        .output()
+        .unwrap_or_else(|error| panic!("cannot run {interpreter} to locate ADBC: {error}"));
+    assert!(
+        output.status.success(),
+        "{interpreter} cannot import adbc_driver_postgresql: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let package_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let driver = PathBuf::from(package_dir).join("libadbc_driver_postgresql.so");
+    assert!(
+        driver.exists(),
+        "no ADBC driver library at {}",
+        driver.display()
+    );
+    driver.to_string_lossy().into_owned()
 }
 
 /// Build a duckdb string param map for one path.
@@ -184,10 +213,7 @@ fn create_pg_fixture(source: &PostgresSource) {
 #[test]
 fn joins_duckdb_nation_against_postgres_region() {
     let duck_path = seed_duck_fixture();
-    let Some(adbc_driver) = adbc_driver_path() else {
-        eprintln!("skipping cross_source: ADBC postgres driver not found");
-        return;
-    };
+    let adbc_driver = adbc_driver_path();
     // Connect for setup; if Postgres is unreachable, skip (mirrors fq-connectors).
     let Ok(setup) = PostgresSource::connect("pg", &pg_conn_str(), vec!["public".to_string()])
     else {

@@ -26,7 +26,7 @@ harness, it does not go in a report, a commit message, or a decision.
 
 ```
 cd benchmarks/perf_compare
-/workspace/venv-fedq/bin/python compare.py --scale-factor 1 --label sf1
+python compare.py --scale-factor 1 --label sf1
 ```
 
 Options: `--sources duck,parquet[,pgduck]` (pgduck needs the pg database loaded,

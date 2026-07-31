@@ -8,7 +8,7 @@ flags-only invocation keeps working.
 ## Run the benchmark (the only command you normally need)
 
 ```
-/workspace/venv-fedq/bin/python run_federated_rust.py run --scale-factor 1 --pg-database tpcds_sf1 --warm-runs 3
+python run_federated_rust.py run --scale-factor 1 --pg-database tpcds_sf1 --warm-runs 3
 ```
 
 (equivalently, with no subcommand: `run_federated_rust.py --scale-factor 1 ...`)
@@ -41,7 +41,7 @@ flags-only invocation keeps working.
 ## Build the cached references (per scale factor)
 
 ```
-/workspace/venv-fedq/bin/python run_federated_rust.py save-refs --scale-factor 1 --pg-database tpcds_sf1
+python run_federated_rust.py save-refs --scale-factor 1 --pg-database tpcds_sf1
 ```
 
 - Runs the pure-DuckDB truth + the federated DuckDB oracle ONCE and stores
@@ -55,9 +55,9 @@ flags-only invocation keeps working.
 ## One-time data setup (per scale factor)
 
 ```
-/workspace/venv-fedq/bin/python run_federated_rust.py generate --scale-factor 1
-/workspace/venv-fedq/bin/python run_federated_rust.py load-pg --scale-factor 1 --pg-database tpcds_sf1
-/workspace/venv-fedq/bin/python run_federated_rust.py save-refs --scale-factor 1 --pg-database tpcds_sf1
+python run_federated_rust.py generate --scale-factor 1
+python run_federated_rust.py load-pg --scale-factor 1 --pg-database tpcds_sf1
+python run_federated_rust.py save-refs --scale-factor 1 --pg-database tpcds_sf1
 ```
 
 - `generate` writes the DuckDB dataset file and dumps the 99 query texts.

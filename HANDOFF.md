@@ -154,7 +154,9 @@ Feature surface built on top of the core engine:
 - Perf numbers come ONLY from the suite runners: `benchmarks/perf_compare/`
   (cross-engine cold+warm) and each suite's single runner.
 - Test env: Postgres 17.4 on :5432 (binaries `postgres-17`, trust auth,
-  started via `scripts/run-postgres.sh`). Python: `/workspace/venv-fedq`.
+  started via `scripts/run-postgres.sh`). Python: any venv, activated - the
+  Makefile, the hooks, and every harness read `VIRTUAL_ENV` and otherwise fall
+  back to `python3` on PATH, so no venv location is written down anywhere.
 
 ## PERF ROUND (measured on the TPC-DS boards)
 
@@ -225,7 +227,7 @@ export PATH=$HOME/.cargo/bin:/tmp/.cargo/bin:$PATH
 export HOME=/tmp
 export CARGO_TARGET_DIR=/workspace/federated-query/target
 ```
-Python interpreter: `/workspace/venv-fedq/bin/python`.
+Python interpreter: whichever venv is activated (`VIRTUAL_ENV`), else `python3`.
 
 Build the engine for the benchmark harnesses (release; the benchmark symlinks
 `benchmarks/{tpch,tpcds}/fedq.so` point at

@@ -38,7 +38,7 @@ directory, and a PostgreSQL database. All are produced by committed scripts.
 
 ```bash
 cd benchmarks/tpch
-source /workspace/venv-fedq/bin/activate
+source <your-venv>/bin/activate
 export PYTHONPATH=/workspace/federated-query:/workspace/federated-query/benchmarks/tpch
 
 # --- scale factor 0.1 ---

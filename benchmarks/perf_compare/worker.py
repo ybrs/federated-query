@@ -34,10 +34,6 @@ sys.path.insert(0, HERE)
 
 ENGINE_DIALECT = "postgres"
 PROFILE_RE = re.compile(r"\[fedqrs\]\s+([0-9.]+)ms\s+source_scan\s+ds=(\w+)")
-ADBC_CANDIDATES = [
-    "/workspace/venv-fedq/lib/python3.13/site-packages/adbc_driver_postgresql/libadbc_driver_postgresql.so",
-    "/workspace/venv/lib/python3.12/site-packages/adbc_driver_postgresql/libadbc_driver_postgresql.so",
-]
 
 
 class UnsupportedSource(Exception):
@@ -190,11 +186,19 @@ def _old_fns(runtime, qualify):
 
 
 def _adbc_driver_path():
-    """First existing ADBC Postgres driver shared library."""
-    for candidate in ADBC_CANDIDATES:
-        if os.path.exists(candidate):
-            return candidate
-    raise SystemExit("ADBC Postgres driver not found")
+    """Return the ADBC Postgres driver shipped with the installed package.
+
+    Derived from the imported ``adbc_driver_postgresql`` so it follows whichever
+    interpreter runs this worker, rather than naming a venv path and Python
+    version that go stale the moment either changes.
+    """
+    import adbc_driver_postgresql
+
+    package_dir = os.path.dirname(adbc_driver_postgresql.__file__)
+    driver = os.path.join(package_dir, "libadbc_driver_postgresql.so")
+    if not os.path.exists(driver):
+        raise SystemExit("adbc_driver_postgresql has no driver library at " + driver)
+    return driver
 
 
 def _new_config(source, args):

@@ -69,12 +69,18 @@ def _cargo_env():
     return None
 
 
-def _venv_python(root):
-    """The interpreter that has pytest and the engine's test deps."""
-    base = os.environ.get("VIRTUAL_ENV") or os.path.join(
-        os.path.dirname(root), "venv-fedq"
-    )
-    return os.path.join(base, "bin", "python")
+def _venv_python():
+    """The interpreter that has pytest and the engine's test deps.
+
+    An activated venv (VIRTUAL_ENV) wins; otherwise the interpreter running this
+    hook is used. The venv's location is never written down, so moving it cannot
+    quietly point the gate at an environment without the test dependencies -
+    _preconditions proves pytest is importable before any suite runs.
+    """
+    venv = os.environ.get("VIRTUAL_ENV")
+    if venv:
+        return os.path.join(venv, "bin", "python")
+    return sys.executable
 
 
 def _preconditions(root):
@@ -84,9 +90,9 @@ def _preconditions(root):
     no-op or a wall of connection errors - the state that has to be reported as
     a failure rather than interpreted afterwards.
     """
-    python = _venv_python(root)
+    python = _venv_python()
     if not os.path.isfile(python):
-        return f"No python venv at {python}: the e2e suite CANNOT RUN."
+        return f"No python interpreter at {python}: the e2e suite CANNOT RUN."
     probe = subprocess.run(
         [python, "-c", "import pytest"], capture_output=True, text=True
     )
@@ -178,7 +184,7 @@ def main():
             "Rust tests",
             ["cargo", "test", "--workspace", "--", "--test-threads=4"],
         ),
-        ("e2e suite", [_venv_python(root), "-m", "pytest", "-q", "-p", "no:cacheprovider"]),
+        ("e2e suite", [_venv_python(), "-m", "pytest", "-q", "-p", "no:cacheprovider"]),
     ):
         failure = _run(label, command, root, env)
         if failure:

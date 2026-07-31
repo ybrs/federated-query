@@ -9,7 +9,7 @@ live on DuckDB, Parquet, and PostgreSQL sources in every combination.
 
 ```bash
 cd /workspace/federated-query
-/workspace/venv-fedq/bin/python -m pytest tests/e2e_federated -q
+python -m pytest tests/e2e_federated -q
 ```
 
 PostgreSQL must be reachable (see `README-test-harness-setup.md`; `make pg-start`).

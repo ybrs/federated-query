@@ -1,0 +1,13 @@
+enable_mouse: true
+
+style:
+  show_borders: false
+  show_scrollbar: false
+
+procs:
+  claude:
+    shell: "claude"
+    autostart: true
+  bash:
+    shell: "bash"
+    autostart: true

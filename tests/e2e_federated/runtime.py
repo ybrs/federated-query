@@ -22,11 +22,6 @@ from tests.e2e_federated import placements as placement_mod
 
 _TESTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-_ADBC_CANDIDATES = (
-    "/workspace/venv-fedq/lib/python3.13/site-packages/"
-    "adbc_driver_postgresql/libadbc_driver_postgresql.so",
-)
-
 DUCK_SCHEMA = "main"
 PARQUET_SCHEMA = "main"
 
@@ -46,11 +41,21 @@ def _import_fedq():
 
 
 def adbc_driver_path():
-    """Return the first ADBC PostgreSQL driver library that exists, or raise."""
-    for candidate in _ADBC_CANDIDATES:
-        if os.path.exists(candidate):
-            return candidate
-    raise RuntimeError("ADBC PostgreSQL driver not found in: " + str(_ADBC_CANDIDATES))
+    """Return the ADBC PostgreSQL driver shipped with the installed package.
+
+    The location is derived from the imported ``adbc_driver_postgresql``, so it
+    follows whichever interpreter is running the suite. Nothing records a venv
+    path or a Python version, which is what previously made the suite fail
+    wholesale whenever the venv moved. A missing package raises ImportError and
+    a package without its library raises here; neither is skipped.
+    """
+    import adbc_driver_postgresql
+
+    package_dir = os.path.dirname(adbc_driver_postgresql.__file__)
+    driver = os.path.join(package_dir, "libadbc_driver_postgresql.so")
+    if not os.path.exists(driver):
+        raise RuntimeError("adbc_driver_postgresql has no driver library at " + driver)
+    return driver
 
 
 def _env_id(placement_name, spec_names):

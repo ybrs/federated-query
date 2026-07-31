@@ -87,3 +87,15 @@ event-analytics/*.events/
 
 # The materialized event store of the repo-root config; runtime state, never tracked.
 event-analytics/
+
+# Per-machine agent settings: names this container's interpreter and PATH, which
+# is exactly the kind of absolute path the harnesses no longer hardcode.
+.claude/settings.local.json
+
+# Holds the taskq hub address and its shared token; a credential, never tracked.
+tq.conf
+
+# Vendored working copies of sibling repos (the frozen fedqrs engine and its
+# benchmark data), carrying their own .git and build trees - tens of GB of
+# artifacts that belong to those repos, not this one.
+vendor/

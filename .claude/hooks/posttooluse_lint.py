@@ -23,6 +23,7 @@ nothing checked.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -37,26 +38,35 @@ def _repo_root():
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def _tool(name):
-    """Resolve a venv tool (semgrep/flake8) without hardcoding an absolute path.
+def _python():
+    """Return the interpreter whose environment supplies the lint tools.
 
-    Prefers an activated venv (VIRTUAL_ENV), then the sibling ../venv-fedq or a
-    repo-local ./venv, then the interpreter running this hook; falls back to the
-    bare name on PATH. Mirrors the Makefile's venv resolution.
+    An activated venv (VIRTUAL_ENV) wins, so the tools follow whichever
+    environment the developer is working in; otherwise the interpreter running
+    this hook supplies its own. No venv location or Python version is written
+    down here, which is what let a moved venv silently disable the linters.
     """
-    root = _repo_root()
-    candidates = [
-        os.environ.get("VIRTUAL_ENV"),
-        os.path.join(os.path.dirname(root), "venv-fedq"),
-        os.path.join(root, "venv"),
-        os.path.dirname(os.path.dirname(sys.executable)),
-    ]
-    for base in candidates:
-        if base:
-            binary = os.path.join(base, "bin", name)
-            if os.path.isfile(binary):
-                return binary
-    return name
+    venv = os.environ.get("VIRTUAL_ENV")
+    if venv:
+        candidate = os.path.join(venv, "bin", "python")
+        if os.path.isfile(candidate):
+            return candidate
+    return sys.executable
+
+
+def _tool(name):
+    """Resolve a lint tool (semgrep/flake8), or None when it is not installed.
+
+    Looks beside the active interpreter first - a venv installs its tools into
+    the same bin directory as its python - then falls back to PATH. Returning
+    None rather than the bare name keeps a missing tool distinguishable from a
+    resolved one, so the caller reports it instead of silently passing.
+    """
+    interpreter = _python()
+    binary = os.path.join(os.path.dirname(interpreter), name)
+    if os.path.isfile(binary):
+        return binary
+    return shutil.which(name)
 
 
 def _edited_file(payload):
@@ -73,8 +83,8 @@ def _edited_file(payload):
 def _semgrep_findings(root, rel_path):
     """Return semgrep codepoint findings for one file as printable lines."""
     binary = _tool("semgrep")
-    if not os.path.isfile(binary):
-        return [f"semgrep not found (looked for {binary}); codepoint rule NOT checked"]
+    if binary is None:
+        return [f"semgrep not installed beside {_python()}; codepoint rule NOT checked"]
     completed = subprocess.run(
         [binary, "--config", ".semgrep.yml", rel_path, "--json", "--quiet"],
         cwd=root, capture_output=True, text=True,
@@ -92,8 +102,8 @@ def _semgrep_findings(root, rel_path):
 def _flake8_findings(root, rel_path):
     """Return flake8 FQ (construction rule) findings for one engine file."""
     binary = _tool("flake8")
-    if not os.path.isfile(binary):
-        return [f"flake8 not found (looked for {binary}); FQ001/FQ002 NOT checked"]
+    if binary is None:
+        return [f"flake8 not installed beside {_python()}; FQ001/FQ002 NOT checked"]
     completed = subprocess.run(
         [binary, "--select=FQ", rel_path],
         cwd=root, capture_output=True, text=True,

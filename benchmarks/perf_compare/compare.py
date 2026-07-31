@@ -18,7 +18,7 @@ that cannot build a source is reported as UNSUPPORTED. Nothing is skipped
 silently.
 
 Usage:
-  /workspace/venv-fedq/bin/python compare.py --scale-factor 1 --label sf1
+  python compare.py --scale-factor 1 --label sf1
   ... --sources duck,parquet --queries q01,q06,q12   (defaults: all 22)
   ... --planning-budget-ms 100000                    (lift the kill to measure)
 

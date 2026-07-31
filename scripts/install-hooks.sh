@@ -11,7 +11,7 @@
 # optimizer. There is no fast path and no skip.
 #
 # The rule the hook exists to enforce: a check that cannot RUN is a failure,
-# never a pass. Missing toolchain, missing venv, a database that is not up, a
+# never a pass. Missing toolchain, no usable interpreter, a database that is not up, a
 # suite that dies at import - each blocks the commit with a banner naming what
 # could not run. Silence is what let the linters sit red for 17 days and the
 # whole e2e suite sit dead for 2.
@@ -49,7 +49,12 @@ for base in "$HOME/.cargo" /home/node/.cargo /usr/local/cargo; do
     fi
 done
 
-venv="${VIRTUAL_ENV:-$root/../venv-fedq}"
+# The interpreter that runs the e2e suite. An activated venv (VIRTUAL_ENV)
+# supplies it; otherwise python3 on PATH. No venv location or Python version is
+# written down, so a venv that moves or is rebuilt keeps working; the pytest
+# probe below proves whatever was chosen can actually run the suite.
+python="${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python}"
+python="${python:-$(command -v python3 || true)}"
 
 # Print a banner naming what failed and why the commit is refused, then exit.
 block() {
@@ -78,10 +83,10 @@ block() {
 # suite silently not run.
 command -v cargo >/dev/null 2>&1 \
     || block "toolchain check" "cargo not found. The Rust test suite CANNOT RUN, so nothing is verified."
-[ -x "$venv/bin/python" ] \
-    || block "toolchain check" "no python venv at $venv. The e2e suite CANNOT RUN. Set VIRTUAL_ENV or create ../venv-fedq."
-"$venv/bin/python" -c "import pytest" >/dev/null 2>&1 \
-    || block "toolchain check" "pytest is not installed in $venv. The e2e suite CANNOT RUN."
+[ -n "$python" ] && [ -x "$python" ] \
+    || block "toolchain check" "no python interpreter found. The e2e suite CANNOT RUN. Activate a venv or install python3."
+"$python" -c "import pytest" >/dev/null 2>&1 \
+    || block "toolchain check" "pytest is not installed in $python. The e2e suite CANNOT RUN. Fix: make install"
 [ -f "$root/.duckdb-lib/current/libduckdb.so" ] \
     || block "toolchain check" "no libduckdb at .duckdb-lib/current. The engine cannot load and the e2e suite CANNOT RUN. Fix: make duckdb-lib"
 
@@ -128,7 +133,7 @@ cargo build --release -p fedq-py --manifest-path "$root/Cargo.toml" \
 # `-p no:cacheprovider` keeps the hook from writing .pytest_cache mid-commit.
 # Collection errors exit non-zero here, so a suite that dies at import BLOCKS
 # rather than reporting zero failures.
-( cd "$root" && "$venv/bin/python" -m pytest -q -p no:cacheprovider ) \
+( cd "$root" && "$python" -m pytest -q -p no:cacheprovider ) \
     || block "pytest e2e suite" "e2e failures or collection errors above. A collection error means the suite did not run - that is a failure, not a pass."
 
 exec "$root/scripts/comment-gate/gate.sh"

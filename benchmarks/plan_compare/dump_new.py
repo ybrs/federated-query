@@ -30,15 +30,19 @@ def _bench_dir(suite):
 
 
 def _adbc_driver_path():
-    """First existing ADBC Postgres driver shared library."""
-    candidates = [
-        "/workspace/venv-fedq/lib/python3.13/site-packages/adbc_driver_postgresql/libadbc_driver_postgresql.so",
-        "/workspace/venv/lib/python3.12/site-packages/adbc_driver_postgresql/libadbc_driver_postgresql.so",
-    ]
-    for candidate in candidates:
-        if os.path.exists(candidate):
-            return candidate
-    raise SystemExit("ADBC Postgres driver not found")
+    """Return the ADBC Postgres driver shipped with the installed package.
+
+    Derived from the imported ``adbc_driver_postgresql`` so it follows whichever
+    interpreter runs this script, rather than naming a venv path and Python
+    version that go stale the moment either changes.
+    """
+    import adbc_driver_postgresql
+
+    package_dir = os.path.dirname(adbc_driver_postgresql.__file__)
+    driver = os.path.join(package_dir, "libadbc_driver_postgresql.so")
+    if not os.path.exists(driver):
+        raise SystemExit("adbc_driver_postgresql has no driver library at " + driver)
+    return driver
 
 
 def _write_config(db_path, pg_database, adbc_driver):

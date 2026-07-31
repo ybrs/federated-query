@@ -384,11 +384,6 @@ ENGINE_DIALECT = "postgres"
 FEDQ_SOURCES = {"pg": ("pg", "public"), "duck": ("duck", "main")}
 ORACLE_SOURCES = {"pg": ("pgdb", "public"), "duck": (None, "main")}
 
-# ADBC Postgres driver locations searched in order; first existing path wins.
-ADBC_CANDIDATES = [
-    "/workspace/venv-fedq/lib/python3.13/site-packages/adbc_driver_postgresql/libadbc_driver_postgresql.so",
-    "/workspace/venv/lib/python3.12/site-packages/adbc_driver_postgresql/libadbc_driver_postgresql.so",
-]
 
 
 def _pg_dims_placement():
@@ -500,11 +495,19 @@ def _pg_database(options):
 
 
 def _adbc_driver_path():
-    """Return the first ADBC Postgres driver shared library that exists."""
-    for candidate in ADBC_CANDIDATES:
-        if os.path.exists(candidate):
-            return candidate
-    raise SystemExit("ADBC Postgres driver not found in: {0}".format(ADBC_CANDIDATES))
+    """Return the ADBC Postgres driver shipped with the installed package.
+
+    Derived from the imported ``adbc_driver_postgresql`` so it follows whichever
+    interpreter runs this script, rather than naming a venv path and Python
+    version that go stale the moment either changes.
+    """
+    import adbc_driver_postgresql
+
+    package_dir = os.path.dirname(adbc_driver_postgresql.__file__)
+    driver = os.path.join(package_dir, "libadbc_driver_postgresql.so")
+    if not os.path.exists(driver):
+        raise SystemExit("adbc_driver_postgresql has no driver library at " + driver)
+    return driver
 
 
 def _refs_path(scale_factor):
