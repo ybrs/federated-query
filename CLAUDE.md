@@ -116,8 +116,8 @@ a changelog. A comment states what the code does, its invariants, and why - as
 it is TODAY. Forbidden in code comments: TODO/FIXME/XXX/HACK markers,
 milestone/phase/stage labels, commit ids, dates, task/ticket references, punch
 lists, review notes, "deferred to X" scheduling, "landed/implemented in"
-history, references to spec/plan documents. Work tracking lives in HANDOFF.md
-and the plan docs; history lives in git. If behavior is intentionally missing,
+history, references to spec/plan documents. Work tracking lives in taskq;
+history lives in git. If behavior is intentionally missing,
 state the current behavior as a fact ("X is not supported; this raises Y"),
 never as a plan. Enforced twice: fq-lint FQ-PMCOMMENT catches the mechanical
 markers instantly (Rust), and the SEMANTIC pre-commit gate (scripts/
@@ -474,7 +474,8 @@ This project is in **Phase 0** (completed) with basic infrastructure:
 - Test infrastructure
 - Data source connectors (PostgreSQL, DuckDB)
 
-See `HANDOFF.md` for the current working state and roadmap.
+The current working state and roadmap live in taskq (project
+`federated-query`), not in a checked-in document.
 
 ## Testing Strategy
 
@@ -486,8 +487,9 @@ See `HANDOFF.md` for the current working state and roadmap.
 ## Resources
 
 - **Architecture details:** See `README-architecture.md`
-- **Working state and roadmap:** See `HANDOFF.md`; design history of removed
-  plan docs is digested in `historical-docs/design-history.md`
+- **Working state and roadmap:** taskq, project `federated-query`; design
+  history of removed plan docs is digested in
+  `historical-docs/design-history.md`
 - **Example config:** See `config/example_config.yaml`
 - **README:** See `README.md` for user-facing documentation
 

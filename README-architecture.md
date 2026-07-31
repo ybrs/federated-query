@@ -224,7 +224,8 @@ runtime and the crates below it.
 - `benchmarks/tpcds/README.md`, `benchmarks/tpch/README.md`,
   `benchmarks/perf_compare/README.md` - how to
   generate data, run each suite's single runner, and read the reports.
-- `HANDOFF.md` - the working state: what is built, the measured benchmark
-  boards, the current perf tail with root-caused diagnoses, and the next steps.
+- taskq, project `federated-query` - the working state: what is built, the
+  measured benchmark boards, the current perf tail with root-caused
+  diagnoses, and the next steps.
 - Each crate's `src/lib.rs` module doc is the authoritative description of that
   crate's responsibility and port notes.

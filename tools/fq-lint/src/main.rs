@@ -92,8 +92,7 @@ const PM_MARKERS: [&str; 8] = [
 
 /// FQ-PMCOMMENT: a code comment carrying project management (todo markers,
 /// milestones, punch lists, commit ids, spec-doc references). Work tracking
-/// belongs in HANDOFF.md / the plan docs; a comment states what the code does
-/// TODAY.
+/// belongs in taskq; a comment states what the code does TODAY.
 fn lint_pm_comments(root: &Path, violations: &mut Vec<Violation>) {
     for entry in WalkDir::new(root.join("crates"))
         .into_iter()
@@ -117,7 +116,7 @@ fn lint_pm_comments(root: &Path, violations: &mut Vec<Violation>) {
                     code: "FQ-PMCOMMENT",
                     message: format!(
                         "comment carries project management ({marker:?}); comments state \
-                         what the code does TODAY - track work in HANDOFF.md/plan docs"
+                         what the code does TODAY - track work in taskq"
                     ),
                 });
             }
