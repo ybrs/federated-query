@@ -65,15 +65,17 @@ Only ascii edits are allowed.
    sources shown as UNSUPPORTED). If a number was not produced by the harness it
    does not go in a report, commit message, or decision.
 
-4. NO STALE DEFERRALS. Deferring work is fine ONLY as: a comment/doc note that
-   names WHAT is deferred and the BLOCKER it waits on (a crate, a feature, a
-   measurement). When the blocker lands, the deferral MUST be swept in that same
-   milestone - re-read every deferral note whose blocker was just built and
-   either do the work or re-justify against the new state. A deferral whose
-   stated blocker already exists is a lie in the codebase (this happened:
-   `scan_planner_estimate` kept "fq-emit does not exist yet" for four milestones
-   after fq-emit landed, hiding an O(data) planning path). At every milestone
-   close, grep the workspace for `deferred`/`TODO(` and re-adjudicate.
+4. NO STALE DEFERRALS. Deferring work is fine ONLY as a taskq task naming WHAT
+   is deferred and the BLOCKER it waits on (a crate, a feature, a measurement).
+   It does NOT go in a code comment: the code states current behavior as a fact
+   ("X is not supported; this raises Y"), never as a plan. When the blocker
+   lands, the deferral MUST be swept in that same round - re-read every task
+   whose blocker was just built and either do the work or re-justify it against
+   the new state. A deferral whose stated blocker already exists is a lie
+   (this happened: `scan_planner_estimate` kept "fq-emit does not exist yet" for
+   four milestones after fq-emit landed, hiding an O(data) planning path). At
+   every round close, re-read the open tasks and grep the workspace for
+   `deferred`/`TODO(` - a deferral that reached the code is already a defect.
 
 5. ONE RUNNER PER BENCHMARK SUITE. Each benchmark directory has exactly ONE
    runner script (tpcds: run_federated_rust.py; tpch: run_federated_rust.py;
@@ -126,6 +128,33 @@ Python docstring against RUBRIC.md) catches what keyword lists cannot. The
 hook installs itself on session start (SessionStart hook -> scripts/
 install-hooks.sh; manual: `make hook-install`); a gate failure blocks the
 commit and prints each offending comment.
+
+# WORK TRACKING LIVES IN TASKQ
+
+There is no checked-in roadmap, handoff, or status document, and no new one is
+to be created. A file describing "where we are" has to be rewritten after every
+change, so it rots and then lies; HANDOFF.md was deleted for exactly that.
+Git holds what happened. taskq holds what we intend and what is still wrong.
+
+The MCP server is `taskq`; this repository is project `federated-query`.
+
+- START by looking it up, not by guessing: `project_status` for where the
+  project stands, `task_queue` for what to pick up next, `search_taskq` when the
+  work is described rather than named. CLAIM a task before working it, so a
+  second agent does not pick up the same thing.
+- A finding that is not the task in hand becomes its OWN task, immediately. A
+  gap nobody wrote down is a gap nobody fixes - and it will be rediscovered by
+  whoever it breaks, at the worst moment.
+- A task description carries the EVIDENCE: the reproduction, what was measured
+  and by which harness, and what is still unverified. State the evidence level
+  explicitly. "Confirmed by direct execution" and "reported by an agent sweep,
+  not reproduced" are different claims, and filing the second as the first
+  wastes the next person's day re-deriving it.
+- CLOSE a task with a comment saying what was done and how it was verified, in
+  numbers. "Green" is not a result; "3495 passed, 0 failed" is.
+- A task id, a status, or a roadmap NEVER appears in a code comment. Code says
+  what it does today; taskq says what we intend. The two are enforced
+  separately and must not leak into each other.
 
 This project is not a toy/homework project. Do real production quality software development. We need real-query-engine level behaviour.
 

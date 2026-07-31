@@ -28,7 +28,9 @@ VIOLATIONS (project management in a code comment):
 - Development history / changelog: "was moved from", "used to", "previously",
   "originally", "renamed from" - UNLESS it contrasts with the Python
   reference implementation (that is provenance, allowed).
-- References to plan/spec/handoff documents (SPEC-*.md, HANDOFF, plan docs).
+- References to plan/spec/handoff documents (SPEC-*.md, HANDOFF, plan docs), or
+  to taskq - task ids, task titles, "tracked in taskq", "see the ticket". Work
+  tracking lives in taskq precisely so it stays out of the code.
 
 Judge each comment BLOCK as a whole, semantically - do not keyword-match. A
 block that merely contains the word "pending" describing runtime state (e.g. a
