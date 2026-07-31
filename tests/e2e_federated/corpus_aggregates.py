@@ -16,11 +16,9 @@ aggregate-then-join shapes (a GROUP BY derived table joined to another source,
 and two aggregated derived tables from different sources joined together);
 MIN/MAX over text/date/timestamp/decimal columns; AVG over integers cast to
 double explicitly; and ORDER BY on an aggregate output with LIMIT for top-N
-groups, with a deterministic tie-break column.
-
-``SUSPECTED_ENGINE_BUGS`` documents a verified engine-vs-oracle mismatch found
-while authoring this corpus; it is not part of ``CASES`` so the suite stays
-green, and it names the placement and the exact expected/got values.
+groups, with a deterministic tie-break column; and MIN/MAX with GROUP BY over a
+BOOLEAN column, which PostgreSQL has no min/max for and the statistics probe
+must therefore handle without issuing them.
 """
 
 CASES = [
@@ -529,42 +527,14 @@ CASES = [
             "ON o.product_id = p.product_id GROUP BY p.category"
         ),
     },
-]
-
-SUSPECTED_ENGINE_BUGS = {
-    "agg_minmax_boolean_group_products": {
+    {
+        "name": "agg_minmax_boolean_group_products",
+        "tables": ["orders", "products"],
         "query": (
             "SELECT p.active AS active, MIN(o.price) AS min_price, "
             "MAX(o.price) AS max_price, count(*) AS n "
             "FROM {orders} o JOIN {products} p "
             "ON o.product_id = p.product_id GROUP BY p.active"
         ),
-        "tables": ["orders", "products"],
-        "finding": (
-            "Any query that GROUPs BY or filters on a BOOLEAN column of a "
-            "PostgreSQL-sourced table raises 'physical planning error: "
-            "datasource error: db error' at placements duck_pg, all_pg, and "
-            "parquet_pg (wherever the boolean-carrying table lands on "
-            "PostgreSQL); pg_duck, duck_duck, parquet_duck, and "
-            "oracle_single_duck are unaffected because there ``products`` "
-            "lands on DuckDB. Root cause, read from the PostgreSQL server log "
-            "at the moment of failure: the planner's column-statistics probe "
-            "unconditionally issues 'SELECT count(*) AS probe_rows, "
-            "count(DISTINCT col) AS ndv_0, count(col) AS nonnull_0, "
-            "min(col)::text AS min_0, max(col)::text AS max_0 FROM table' for "
-            "every column a query references in WHERE/GROUP BY, including "
-            "boolean columns. PostgreSQL raises 'ERROR: function min(boolean) "
-            "does not exist' (DuckDB defines min/max over boolean; PostgreSQL "
-            "does not), and the wrapped ADBC error surfaces to Python as the "
-            "generic 'db error'. A plain projection of the boolean column "
-            "(no WHERE/GROUP BY use) does not probe it and succeeds, which "
-            "isolates the bug to the statistics probe rather than to reading "
-            "boolean values from PostgreSQL. Reproduced directly against the "
-            "engine outside pytest with 'SELECT count(*) FROM products WHERE "
-            "active = TRUE' on a single PostgreSQL source (no join). Removed "
-            "from CASES so the suite stays green; re-add once the PostgreSQL "
-            "connector's statistics probe casts boolean columns (e.g. to "
-            "int) or skips min/max for them."
-        ),
     },
-}
+]

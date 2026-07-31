@@ -8,8 +8,8 @@ tracker note, and is promoted into ``CASES`` once the bug is fixed. A confirmed
 supported shape that merely lacked coverage lands directly in ``CASES``.
 
 This module is registered in ``tests/e2e_federated/cases.py`` as the
-``fuzz_findings`` corpus and starts empty, so ``FEDQ_E2E_CORPUS=fuzz_findings``
-collects it cleanly until the first finding is parked.
+``fuzz_findings`` corpus and starts empty. Like every other corpus module it is
+collected on every run; there is no way to ask for it alone.
 """
 
 CASES = [

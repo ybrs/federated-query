@@ -1,15 +1,22 @@
 """Ground-truth oracle: run a case query on a single all-tables DuckDB.
 
-The oracle seeds every table a case uses into one in-memory DuckDB connection and
-runs the case query there (placeholders filled with bare table names, since all
-tables live in that database's ``main`` schema). Its result is the correctness
-reference every placement's engine result is compared against. SELECT queries do
-not mutate, so one connection serves repeated runs for a table set.
+The oracle is one DuckDB file per distinct table set, carrying every table a case
+uses, built by ``build_test_harness.sh``. The case query runs there with its
+placeholders filled with bare table names, since all the tables live in that
+database's ``main`` schema. Its result is the correctness reference every
+placement's engine result is compared against.
+
+Like every other source the suite reads, it is OPENED read-only and never
+created here. The reference answer a test asserts against is therefore a file
+that can be opened and inspected after a failure, not state that existed only
+inside the run that failed.
 """
+
+import os
 
 import duckdb
 
-from tests.e2e_federated import runtime as runtime_mod
+from tests.e2e_federated import harness
 
 
 class Oracle:
@@ -31,19 +38,20 @@ class Oracle:
 
 
 def build_oracle(specs):
-    """Seed all of a case's tables into one DuckDB and return its Oracle."""
-    connection = duckdb.connect()
-    runtime_mod._run_specs(connection, _spec_list(specs))
+    """Open the pre-built ground-truth DuckDB for a table set and return its Oracle.
+
+    Creates nothing. A missing oracle raises naming it and the command that
+    builds it, rather than being silently reseeded into a file nobody inspects.
+    """
+    source = harness.oracle_source(specs)
+    if not os.path.exists(source.location):
+        raise RuntimeError(
+            "test harness is incomplete, oracle " + source.name + " is missing at "
+            + source.location + "  --  build it with ./build_test_harness.sh"
+        )
+    connection = duckdb.connect(source.location, read_only=True)
     mapping = _bare_mapping(specs)
     return Oracle(connection, mapping)
-
-
-def _spec_list(specs):
-    """Return the TableSpecs of a name -> spec map as a list."""
-    values = []
-    for name in specs:
-        values.append(specs[name])
-    return values
 
 
 def _bare_mapping(specs):

@@ -10,8 +10,9 @@ engine outcomes are a value-match or a known designed raise. Anything else - a
 mismatch, a panic, a hang, or an undocumented raise on oracle-accepted SQL - is a
 Finding.
 
-Environments and oracles are cached exactly as the e2e suite caches them, keyed by
-(table set, placement); the PostgreSQL environments reuse the shared connection.
+Engine runtimes and oracles are cached keyed by (table set, placement). The
+datasources themselves are the ones build_test_harness.sh built; the fuzzer opens
+them read-only and never creates data.
 """
 
 import threading
@@ -19,7 +20,6 @@ import threading
 from tests.e2e_federated import runtime as runtime_mod
 from tests.e2e_federated.cases import case_table_specs
 from tests.e2e_federated.compare import compare_tables
-from tests.e2e_federated.conftest import EnvCache
 from tests.e2e_federated.oracle import build_oracle
 from tests.e2e_federated.placements import PLACEMENTS, placement_uses_postgres
 
@@ -190,23 +190,17 @@ class FuzzStats:
 class OracleContext:
     """Everything the check stack shares across queries: caches, pg, config."""
 
-    def __init__(self, pg_connection, skip_pg, rng, watchdog_seconds, live_variants):
+    def __init__(self, pg_connection, rng, watchdog_seconds, live_variants):
         """Store the pg handle, RNG, watchdog budget, and active variant list."""
         self.pg_connection = pg_connection
-        self.skip_pg = skip_pg
         self.rng = rng
         self.watchdog_seconds = watchdog_seconds
         self.live_variants = live_variants
-        self.env_cache = EnvCache(_env_cap())
+        self.env_cache = {}
         self.oracle_cache = {}
         self.stats = FuzzStats()
         self.findings = {}
         self.force_deep = False
-
-
-def _env_cap():
-    """Return the environment-cache cap the fuzzer keeps live at once."""
-    return 16
 
 
 def _run_with_timeout(func, seconds):
@@ -239,12 +233,14 @@ def get_oracle(ctx, specs, tables):
 
 
 def get_env(ctx, placement, specs):
-    """Return the cached engine environment for (table set, placement)."""
+    """Return the engine environment for (table set, placement), opening it once.
+
+    The datasources are the ones build_test_harness.sh built; opening reads them
+    and raises if any is absent. The cache holds engine runtimes, not data.
+    """
     key = (frozenset(specs.keys()), placement.name)
     if key not in ctx.env_cache:
-        ctx.env_cache[key] = runtime_mod.build_environment(
-            placement, specs, ctx.pg_connection
-        )
+        ctx.env_cache[key] = runtime_mod.open_environment(placement, specs)
     return ctx.env_cache[key]
 
 
@@ -683,7 +679,6 @@ def _clone_for_recheck(ctx):
 
     sub = OracleContext(
         ctx.pg_connection,
-        ctx.skip_pg,
         random.Random(0),
         ctx.watchdog_seconds,
         ctx.live_variants,
@@ -723,8 +718,6 @@ def _applicable_placements(ctx, gen_query):
     result = []
     for placement in PLACEMENTS:
         if len(gen_query.tables) < placement.min_tables:
-            continue
-        if ctx.skip_pg and _uses_pg(placement):
             continue
         result.append(placement)
     return result
@@ -792,7 +785,7 @@ class VariantReport:
         self.evidence = evidence
 
 
-def verify_variants(pg_connection, skip_pg):
+def verify_variants():
     """Classify every VARIANT by whether it changes a probe query's EXPLAIN plan.
 
     Returns (live_variants, reports): ``live_variants`` are the (name, sets, role)
@@ -800,16 +793,16 @@ def verify_variants(pg_connection, skip_pg):
     least one probe plan, plus the control - and ``reports`` explains each,
     including the dead knobs that never changed a plan.
     """
-    placements = _probe_placements(skip_pg)
-    envs = _probe_environments(placements, pg_connection)
+    placements = _probe_placements()
+    envs = _probe_environments(placements)
     reports = _classify_variants(envs)
     live = _live_variant_defs(reports)
     return live, reports
 
 
-def _probe_placements(skip_pg):
-    """Return the placements used for plan probing (pg-bearing unless pg is off)."""
-    names = ("duck_duck",) if skip_pg else _PROBE_PLACEMENTS
+def _probe_placements():
+    """Return the pg-bearing placements used for plan probing."""
+    names = _PROBE_PLACEMENTS
     chosen = []
     for placement in PLACEMENTS:
         if placement.name in names:
@@ -817,19 +810,19 @@ def _probe_placements(skip_pg):
     return chosen
 
 
-def _probe_environments(placements, pg_connection):
-    """Build one engine environment per (placement, probe query) for comparison."""
+def _probe_environments(placements):
+    """Open one engine environment per (placement, probe query) for comparison."""
     envs = []
     for placement in placements:
-        _append_probe_envs(placement, pg_connection, envs)
+        _append_probe_envs(placement, envs)
     return envs
 
 
-def _append_probe_envs(placement, pg_connection, envs):
+def _append_probe_envs(placement, envs):
     """Append the probe environments for one placement to the env list."""
     for sql, tables in PROBE_QUERIES:
         specs = case_table_specs({"name": "probe", "tables": tables, "query": sql})
-        env = runtime_mod.build_environment(placement, specs, pg_connection)
+        env = runtime_mod.open_environment(placement, specs)
         envs.append((env, sql))
 
 

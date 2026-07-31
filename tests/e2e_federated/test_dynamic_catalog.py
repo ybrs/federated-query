@@ -30,6 +30,17 @@ def _pg_params():
     }
 
 
+def _drop_pg(connection, schema):
+    """Drop this test's own schema so a run leaves no schema behind.
+
+    Only ever called with the schema _seed_pg created. The harness's ``fed_%``
+    schemas hold the data the whole suite reads and are never touched here.
+    """
+    cursor = connection.cursor()
+    cursor.execute("DROP SCHEMA IF EXISTS " + schema + " CASCADE")
+    cursor.close()
+
+
 def _seed_pg(connection):
     """Seed a unique PostgreSQL schema with a customers table; return its name."""
     schema = "fed_dyncat_" + str(os.getpid())
@@ -162,17 +173,24 @@ def _assert_new_session_sees_persisted(config_path, schema):
     assert rows == [{"name": "alice"}, {"name": "bob"}]
 
 
-def test_dynamic_catalog_lifecycle(pg_state):
-    """Drive CREATE / cross-join / SHOW / DROP / new-session over the engine."""
-    if pg_state.skip_pg:
-        pytest.skip("PostgreSQL is disabled for this run")
-    schema = _seed_pg(pg_state.connection)
-    duck_path = _seed_duck()
-    config_path = _write_config()
-    runtime = _runtime(config_path)
-    _create_pg(runtime, schema)
-    _create_duck(runtime, duck_path)
-    _assert_join(runtime, schema)
-    _assert_show(runtime)
-    _assert_drop_isolates(runtime, schema)
-    _assert_new_session_sees_persisted(config_path, schema)
+def test_dynamic_catalog_lifecycle(pg_connection):
+    """Drive CREATE / cross-join / SHOW / DROP / new-session over the engine.
+
+    This test seeds its own schema rather than reading the pre-built harness,
+    which is right here: the subject under test is CREATE DATASOURCE pointing at
+    a schema, so a harness-built fixture would be the engine's own job done for
+    it. It drops that schema again so a run leaves the database as it found it.
+    """
+    schema = _seed_pg(pg_connection)
+    try:
+        duck_path = _seed_duck()
+        config_path = _write_config()
+        runtime = _runtime(config_path)
+        _create_pg(runtime, schema)
+        _create_duck(runtime, duck_path)
+        _assert_join(runtime, schema)
+        _assert_show(runtime)
+        _assert_drop_isolates(runtime, schema)
+        _assert_new_session_sees_persisted(config_path, schema)
+    finally:
+        _drop_pg(pg_connection, schema)

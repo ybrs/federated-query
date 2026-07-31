@@ -4,16 +4,14 @@
 # need a running PostgreSQL. The download/start/stop targets below provision a
 # self-contained instance with no system install. See README-test-harness-setup.md.
 
-# Where python and its installed tools come from. An activated venv
-# (VIRTUAL_ENV) supplies them; otherwise they resolve on PATH. No venv path or
-# Python version is written down here - a venv that moves or gets rebuilt on a
-# different interpreter keeps working, and there is no stale location to point
-# these targets at an environment missing the dependencies.
-# Override: make PYTHON=/path/to/python.
-PYBIN  ?= $(if $(VIRTUAL_ENV),$(VIRTUAL_ENV)/bin/,)
-PYTHON ?= $(PYBIN)python3
+# THE virtualenv is ./venv at the repository root. One location, always, so that
+# every target, script, and hook runs the same interpreter with the same
+# installed dependencies. Create it with `make venv`.
+VENV   := $(CURDIR)/venv
+PYBIN  := $(VENV)/bin/
+PYTHON := $(PYBIN)python3
 
-.PHONY: build dev-build check-python setup download_postgres pg-start pg-stop test test-no-db install lint lint-ascii lint-python fq-lint duckdb-lib
+.PHONY: build dev-build check-python setup download_postgres pg-start pg-stop test install venv lint lint-ascii lint-python fq-lint duckdb-lib
 
 # Download the prebuilt PostgreSQL binaries into ./postgres-17 (one-time).
 download_postgres:
@@ -31,27 +29,22 @@ pg-stop:
 # Python is usable (the fedq-py extension needs it), then compile everything.
 # `make build` = release, `make dev-build` = debug.
 build: duckdb-lib check-python
-	cargo build --release
+	PYO3_PYTHON=$(PYTHON) cargo build --release
 
 dev-build: duckdb-lib check-python
-	cargo build
+	PYO3_PYTHON=$(PYTHON) cargo build
 
-# Fail with a clear message if pyo3 (the fedq-py extension) has no usable Python
-# interpreter, checked in pyo3's own search order - instead of the cryptic
-# "failed to run the Python interpreter" error deep in the build.
+# Fail with a clear message if the fedq-py extension (pyo3) has no usable Python
+# interpreter, instead of the cryptic "failed to run the Python interpreter"
+# error deep in the build. The interpreter is ./venv's: the extension is loaded
+# by the suite from that venv, so it must be built against it.
 check-python:
-	@py=""; \
-	if [ -n "$$PYO3_PYTHON" ]; then py="$$PYO3_PYTHON"; \
-	elif [ -n "$$VIRTUAL_ENV" ]; then py="$$VIRTUAL_ENV/bin/python"; \
-	elif [ -n "$$CONDA_PREFIX" ]; then py="$$CONDA_PREFIX/bin/python"; \
-	else py="$$(command -v python3 || true)"; fi; \
-	if [ -z "$$py" ] || [ ! -x "$$py" ]; then \
-		echo "ERROR: no usable Python interpreter for the fedq-py extension (pyo3)." >&2; \
-		echo "  tried: $${py:-<none>}   (VIRTUAL_ENV=$${VIRTUAL_ENV:-<unset>})" >&2; \
-		echo "  fix: install python3, activate a real venv, or set PYO3_PYTHON=\$$(command -v python3)" >&2; \
+	@if [ ! -x "$(PYTHON)" ]; then \
+		echo "ERROR: no interpreter at $(PYTHON) for the fedq-py extension (pyo3)." >&2; \
+		echo "  fix: make venv" >&2; \
 		exit 1; \
 	fi; \
-	echo "pyo3 will use Python: $$py"
+	echo "pyo3 will use Python: $(PYTHON)"
 
 setup: duckdb-lib
 	@echo "Setup done. Build with: make build (release) or make dev-build (debug)."
@@ -68,21 +61,24 @@ duckdb-lib:
 hook-install:
 	./scripts/install-hooks.sh
 
-# Install the test suite's dependencies into the active environment. There is no
-# package to install any more: the engine is Rust, reached through the compiled
-# fedq extension, and these are what the harnesses themselves import.
+# Create ./venv and install the dependencies into it. Idempotent: an existing
+# venv is reused and its packages brought up to date.
+venv:
+	python3 -m venv $(VENV)
+	$(PYTHON) -m pip install --upgrade pip
+	$(PYTHON) -m pip install -r requirements.txt
+
+# Install the test suite's dependencies into ./venv. There is no package to
+# install any more: the engine is Rust, reached through the compiled fedq
+# extension, and these are what the harnesses themselves import.
 install:
 	$(PYTHON) -m pip install -r requirements.txt
 
-# Run the full test suite (expects PostgreSQL running via `make pg-start`).
+# Run the Python suite (expects PostgreSQL running via `make pg-start`). The
+# whole suite is the only suite; ./run_all_tests.sh runs it alongside the
+# linters and the Rust tests, which is what a change is judged by.
 test:
 	$(PYTHON) -m pytest -q
-
-# Run only the tests that do not require PostgreSQL. The federated corpus reads
-# the flag itself and skips its PostgreSQL placements visibly, rather than the
-# suite being narrowed by path.
-test-no-db:
-	FEDQ_E2E_SKIP_PG=1 $(PYTHON) -m pytest -q
 
 # Run all linters (same checks the PostToolUse hook runs per edited file).
 # fq-lint is the Rust construction linter; lint-python is flake8 over every

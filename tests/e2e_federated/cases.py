@@ -26,7 +26,6 @@ Optional keys:
 value, so a typo in a case fails at collection rather than as a wrong result.
 """
 
-import os
 import string
 
 from tests.e2e_federated import corpus_aggregates
@@ -196,27 +195,15 @@ def _add_extra_specs(case, specs):
         )
 
 
-def _selected_modules():
-    """Return the corpus modules named by FEDQ_E2E_CORPUS, or all of them.
-
-    FEDQ_E2E_CORPUS is a comma-separated list of CORPUS_MODULES keys; an
-    unknown name raises. Unset means every registered module is collected.
-    """
-    selection = os.environ.get("FEDQ_E2E_CORPUS")
-    if selection is None:
-        return list(CORPUS_MODULES.values())
-    modules = []
-    for name in selection.split(","):
-        if name not in CORPUS_MODULES:
-            raise ValueError("unknown corpus module '" + name + "'")
-        modules.append(CORPUS_MODULES[name])
-    return modules
-
-
 def all_cases():
-    """Return every validated corpus case, raising on a duplicate name."""
+    """Return every validated corpus case, raising on a duplicate name.
+
+    Every registered module is collected, always. There is no way to ask for a
+    subset: a run that silently covers less than the whole corpus reports the
+    same "passed" as one that covered all of it.
+    """
     cases = []
-    for module in _selected_modules():
+    for module in CORPUS_MODULES.values():
         for case in module.CASES:
             cases.append(case)
     seen = set()

@@ -21,10 +21,9 @@ python -m fuzz.run_fuzz --minutes 25 --seed 2 --profile deep   # longer
   deep 30s).
 - `--replay INDEX` re-runs the single deterministic work item at that index (with
   the deep oracles forced), reproducing a finding named in an artifact.
-- `FEDQ_E2E_SKIP_PG=1` runs without PostgreSQL (every PostgreSQL placement is
-  skipped, exactly as the e2e suite skips them).
-
-PostgreSQL must be reachable unless `FEDQ_E2E_SKIP_PG=1`. A live stat line prints
+PostgreSQL must be reachable; there is no switch that runs without it, because
+fuzzing only the DuckDB placements explores a fraction of the surface while
+reporting a clean run over all of it. A live stat line prints
 every 30 seconds; a final report lists stats, the settings-variant classification,
 and every finding.
 
@@ -93,8 +92,8 @@ greedily shrunk repro query, and the exact `--replay` command. Triage each:
   it from recurring.
 
 `fuzz/findings_corpus.py` is registered in `tests/e2e_federated/cases.py` as the
-`fuzz_findings` corpus, so `FEDQ_E2E_CORPUS=fuzz_findings pytest tests/e2e_federated`
-runs exactly the parked findings.
+`fuzz_findings` corpus, so its parked findings run with every other corpus module
+on every run of `tests/e2e_federated`.
 
 ## Known discard classes (kept out of the surface to avoid false findings)
 

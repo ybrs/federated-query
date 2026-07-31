@@ -16,7 +16,10 @@ import duckdb
 import psycopg2
 import pytest
 
-_ROOT = "/workspace/federated-query"
+# The repository root, derived from this file's location: tests/e2e_federated/ ->
+# two levels up. A written-down absolute path is wrong in every checkout but the
+# one it was written in.
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _SERVER = os.path.join(_ROOT, "target", "release", "fedq-server")
 _PASSWORD = "adminpw-Z7"
 _BOB_PASSWORD = "bobpw-Q2"
@@ -24,9 +27,16 @@ _PORT = 54417
 
 
 def _require_server():
-    """Skip the module when the release server binary is not built."""
+    """Raise when the release server binary is missing.
+
+    A missing binary is an unbuilt workspace, not a reason to pass: skipping here
+    reported success for access control that was never exercised.
+    """
     if not os.path.exists(_SERVER):
-        pytest.skip("fedq-server release binary is not built")
+        raise RuntimeError(
+            "fedq-server release binary is missing at " + _SERVER
+            + "; build it with `cargo build --release -p fedq-server`"
+        )
 
 
 def _seed_duck(directory):

@@ -17,9 +17,17 @@ import pytest
 TESTS_DIR = Path(__file__).parent
 SO_PATH = TESTS_DIR / "fedq.so"
 
-pytestmark = pytest.mark.skipif(
-    not SO_PATH.exists(), reason="fedq.so is not built; run `make build`"
-)
+
+def _require_extension():
+    """Raise when the fedq extension is not built.
+
+    An unbuilt extension is a broken workspace, not a passing run: skipping here
+    reported success for a contract nothing had checked.
+    """
+    if not SO_PATH.exists():
+        raise RuntimeError(
+            "fedq.so is missing at " + str(SO_PATH) + "; build it with `make build`"
+        )
 
 
 def _run(config_path, body, user="audited"):
@@ -29,6 +37,7 @@ def _run(config_path, body, user="audited"):
     persists across runs: reusing one name would fail the second CREATE USER
     with `already exists` and say nothing about logging.
     """
+    _require_extension()
     script = textwrap.dedent(
         f"""
         import sys

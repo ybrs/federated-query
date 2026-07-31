@@ -99,3 +99,7 @@ tq.conf
 # benchmark data), carrying their own .git and build trees - tens of GB of
 # artifacts that belong to those repos, not this one.
 vendor/
+
+# The datasources the e2e suite reads, created by build_test_harness.sh. It is
+# generated data, rebuilt in seconds from the corpus, and large.
+.test-harness/

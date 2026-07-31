@@ -47,21 +47,19 @@ def _iterations():
     return int(os.environ.get("FEDQ_CONC_ITERS", "3"))
 
 
-def _pick_placement(pg_state):
-    """Return a federated pg+duck placement, or duck+duck when pg is skipped."""
-    name = "duck_duck" if pg_state.skip_pg else "pg_duck"
+def _pick_placement():
+    """Return the federated pg+duck placement the concurrent mix runs on."""
     for placement in placement_mod.PLACEMENTS:
-        if placement.name == name:
+        if placement.name == "pg_duck":
             return placement
-    raise RuntimeError("placement '" + name + "' not found")
+    raise RuntimeError("placement 'pg_duck' not found")
 
 
 def _mix_cases():
     """Return the join cases used as the concurrent query mix, in a fixed order.
 
-    The mix is read from the sanity corpus module directly, not from the
-    FEDQ_E2E_CORPUS-filtered collection, so this file runs under any module
-    selection.
+    The mix is read from the sanity corpus module directly: this file needs these
+    four join shapes specifically, not whatever the corpus happens to contain.
     """
     by_name = {}
     for case in sanity_corpus.CASES:
@@ -118,12 +116,12 @@ def _engine_queries(environment, cases):
 
 
 @pytest.fixture(scope="module")
-def concurrency_fixture(pg_state):
-    """Seed one environment for the join mix and yield the concurrency fixture."""
+def concurrency_fixture():
+    """Open one environment for the join mix and yield the concurrency fixture."""
     cases = _mix_cases()
     specs = _union_specs(cases)
-    placement = _pick_placement(pg_state)
-    environment = runtime_mod.build_environment(placement, specs, pg_state.connection)
+    placement = _pick_placement()
+    environment = runtime_mod.open_environment(placement, specs)
     oracle = build_oracle(specs)
     fixture = ConcurrencyFixture(
         environment, _engine_queries(environment, cases), _oracle_answers(oracle, cases)

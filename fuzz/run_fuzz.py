@@ -115,9 +115,11 @@ def _safe_run_work(ctx, kind, payload):
 
 
 def _connect_pg():
-    """Open the shared PostgreSQL connection, or return None when pg is skipped."""
-    if os.environ.get("FEDQ_E2E_SKIP_PG") == "1":
-        return None
+    """Open the shared PostgreSQL connection, raising if pg is unreachable.
+
+    PostgreSQL is required: fuzzing only the DuckDB placements would explore a
+    fraction of the surface while reporting a clean run over all of it.
+    """
     import psycopg2
 
     connection = psycopg2.connect(
@@ -133,12 +135,11 @@ def _connect_pg():
 
 def _build_context(base_seed, profile, connection):
     """Verify the variants and build the shared oracle context."""
-    skip_pg = connection is None
-    live, reports = oracles.verify_variants(connection, skip_pg)
+    live, reports = oracles.verify_variants()
     _print_variant_reports(reports)
     rng = random.Random(base_seed + 7)
     ctx = oracles.OracleContext(
-        connection, skip_pg, rng, profile["watchdog_seconds"], live
+        connection, rng, profile["watchdog_seconds"], live
     )
     return ctx, reports
 

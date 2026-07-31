@@ -20,6 +20,39 @@ the query was invalid, so any result is wrong. Never describe this as
 acceptable, normal, or a minor issue. It is the most severe failure mode in the
 engine.
 
+# THERE IS ONE SUITE, AND IT ALWAYS RUNS WHOLE
+
+`./run_all_tests.sh` at the repository root runs EVERYTHING: linters, Rust
+tests, Python tests, e2e tests. There is no dev suite and no production suite,
+no quick mode, no smoke mode, no "core" subset.
+
+NEVER add a switch that makes a run cover less - not an environment variable,
+not a marker, not a make target, not a flag. This is the same rule as no silent
+fails, applied to the checks themselves: a narrowed run prints the same
+"passed" as a full one, so it reports a green build for code nothing executed.
+Every such switch that ever existed here (`FEDQ_E2E_CORPUS`, `FEDQ_E2E_SKIP_PG`,
+`make test-no-db`) was deleted for that reason.
+
+The same holds for linters: flake8, semgrep and fq-lint run over the whole
+repository. The only exclusions are trees that are not our source at all -
+build output, `vendor/`, `venv/`. There is no per-directory allowlist and no
+file exempted from a rule.
+
+A test may only decline to run when the combination it names does not exist
+(a placement needing more tables than the case has). It may NEVER decline
+because a dependency is missing: an absent PostgreSQL, an unbuilt `fedq.so`, an
+unbuilt `fedq-server` all RAISE. A skip for a missing dependency is a green
+build for untested code.
+
+# THE VIRTUALENV IS ./venv AT THE REPOSITORY ROOT
+
+One location, permanently: `./venv`. Not `/tmp`, not per-session, not
+`~/.virtualenvs`, not a second one beside it. `make venv` creates it and
+installs `requirements.txt`; every Makefile target, every script, and
+`run_all_tests.sh` use `./venv/bin/python3` explicitly rather than whatever is
+on PATH. Anything the suite or the linters need goes in `requirements.txt`, so
+the environment is reproducible from the repository alone.
+
 # BUILD TIME IS ONE NUMBER
 
 A build time is the wall clock from the statement being issued to the
@@ -323,41 +356,21 @@ federated-query/
 
 ## Installation and Setup
 
-### Install Dependencies
 ```bash
-pip install -r requirements.txt
-pip install -e .
-```
-
-### Install Development Tools
-```bash
-pip install pytest pytest-cov black mypy
+make venv          # creates ./venv and installs requirements.txt into it
+make duckdb-lib    # fetches the prebuilt libduckdb the workspace links
+make build         # release build of the whole workspace
 ```
 
 ## Running Tests
 
-### Run All Tests
 ```bash
-pytest
+./run_all_tests.sh
 ```
 
-### Run Tests with Coverage
-```bash
-pytest --cov=federated_query --cov-report=term-missing
-```
-
-### Run Specific Test File
-```bash
-pytest tests/test_parser.py -v
-```
-
-### Run Tests with PostgreSQL
-The tests automatically use the PostgreSQL service when available:
-```bash
-# Using docker-compose
-docker-compose up -d
-pytest tests/test_datasources.py
-```
+That is the command. It runs every check there is - preflight, release build,
+fmt, clippy, all three linters, the whole Rust workspace, and the whole Python
+suite including e2e - and stops at the first failure naming the stage.
 
 ## Code Formatting and Type Checking
 

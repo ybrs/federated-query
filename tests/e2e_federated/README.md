@@ -8,20 +8,20 @@ live on DuckDB, Parquet, and PostgreSQL sources in every combination.
 ## How to run
 
 ```bash
-cd /workspace/federated-query
-python -m pytest tests/e2e_federated -q
+./venv/bin/python -m pytest tests/e2e_federated -q
 ```
+
+from the repository root, or `./run_all_tests.sh` to run this suite alongside
+every other check.
 
 PostgreSQL must be reachable (see `README-test-harness-setup.md`; `make pg-start`).
 The suite connects once; if it cannot connect it raises loudly rather than
-skipping silently. To run without PostgreSQL, set `FEDQ_E2E_SKIP_PG=1`: every
-placement that would use a PostgreSQL source is then skipped explicitly and the
-skips appear in the pytest output.
+skipping silently. There is no way to run it without PostgreSQL: a run that
+dropped every PostgreSQL placement would report the same "passed" while having
+exercised none of the federation this suite exists to prove.
 
-`FEDQ_E2E_CORPUS` selects which corpus modules are collected (comma-separated
-keys of `cases.CORPUS_MODULES`, e.g. `FEDQ_E2E_CORPUS=sanity,corpus_joins`);
-unset collects all of them. A single command over all modules runs in one
-process and is the normal way to run the suite.
+Every corpus module is collected, every time. The suite cannot be narrowed to a
+subset of modules - it runs in one process over all of them.
 
 The engine's connector registry keys every datasource on the runtime's session,
 and a runtime releases its PostgreSQL connections when it drops. The environment
@@ -33,13 +33,15 @@ also emptied at session teardown. So a full single-process run holds at most
 ceiling. Lower `FEDQ_E2E_MAX_ENVS` to bound connections harder (more reseeding);
 raise it to keep more environments warm.
 
-Running one module at a time is still supported (`FEDQ_E2E_CORPUS=<module>`), for
-narrowing a failure to a single corpus.
+To narrow a failure while debugging, select it with pytest's own `-k` on the
+test id; the suite itself has no module switch.
 
-Each corpus module may carry a `SUSPECTED_ENGINE_BUGS` list: verified
-engine-vs-oracle mismatches parked out of `CASES` so the suite stays green,
-each with a `finding` description and a tracker ticket. Re-enable a parked
-case when its ticket is fixed.
+A corpus module may carry a `SUSPECTED_ENGINE_BUGS` map: a verified
+engine-vs-oracle mismatch held out of `CASES`, each with a `finding` describing
+the reproduction and a tracker ticket. A park is a debt, not a resting place -
+when its ticket closes, the case is promoted back into `CASES` in that same
+round. A park whose ticket is already fixed is reporting a green suite for
+coverage it is still withholding.
 
 Test ids read as `case_name[placement]`, e.g.
 `test_corpus[left_join[pg_duck]]`.

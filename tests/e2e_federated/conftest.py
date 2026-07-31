@@ -1,90 +1,26 @@
 """Pytest wiring for the federated e2e corpus: parametrization and caches.
 
-The test is parametrized over every (case x placement) pair. Seeded environments
-and their engine runtimes are cached at session scope keyed by
-(frozenset-of-tables, placement name), so cases sharing a table set and placement
-reuse one seeded environment and one runtime.
+The test is parametrized over every (case x placement) pair. The datasources
+themselves are built once by ``build_test_harness.sh`` and only read here; what
+this session holds is engine runtimes, keyed by (frozenset-of-tables, placement
+name), so cases reading the same sources under the same placement share one
+runtime instead of opening a second connection set for identical data.
 
-PostgreSQL reachability is checked once. When ``FEDQ_E2E_SKIP_PG=1`` the suite
-does not connect and marks every PostgreSQL placement as an explicit (visible)
-skip. Otherwise a live connection is required and a failure to connect raises
-loudly rather than silently skipping.
+PostgreSQL is required, unconditionally. There is no toggle that runs the suite
+without it: a live connection is opened once per session and a failure to connect
+raises loudly, because a run that quietly drops every PostgreSQL placement still
+reports "passed" while having tested none of the federation this suite exists to
+cover.
 """
 
-import collections
 import os
 
 import psycopg2
 import pytest
 
 from tests.e2e_federated.cases import all_cases
+from tests.e2e_federated.cases import case_table_specs
 from tests.e2e_federated.placements import PLACEMENTS
-
-
-def _max_envs():
-    """Return the environment-cache cap from FEDQ_E2E_MAX_ENVS (default 24)."""
-    raw = os.environ.get("FEDQ_E2E_MAX_ENVS", "24")
-    cap = int(raw)
-    if cap < 1:
-        raise ValueError("FEDQ_E2E_MAX_ENVS must be >= 1, got '" + raw + "'")
-    return cap
-
-
-class EnvCache:
-    """An LRU cache of built environments keyed by (tables, placement name).
-
-    Bounded at ``FEDQ_E2E_MAX_ENVS`` live environments so a single-process run
-    over the whole corpus does not accumulate one engine runtime (and its
-    PostgreSQL connections) per distinct (tables, placement) pair. Evicting an
-    environment closes it, dropping its runtime so the engine's Drop releases the
-    session's connections; a later miss rebuilds it, so eviction is safe.
-    """
-
-    def __init__(self, cap):
-        """Store the cap and the empty ordered item map."""
-        self._cap = cap
-        self._items = collections.OrderedDict()
-
-    def __contains__(self, key):
-        """Whether an environment is cached for ``key``."""
-        return key in self._items
-
-    def __getitem__(self, key):
-        """Return the environment for ``key``, marking it most-recently used."""
-        self._items.move_to_end(key)
-        return self._items[key]
-
-    def __setitem__(self, key, value):
-        """Cache ``value`` for ``key`` and evict the oldest beyond the cap."""
-        self._items[key] = value
-        self._items.move_to_end(key)
-        self._evict_over_cap()
-
-    def _evict_over_cap(self):
-        """Close and drop the least-recently-used environments beyond the cap."""
-        while len(self._items) > self._cap:
-            _key, evicted = self._items.popitem(last=False)
-            evicted.close()
-
-    def close_all(self):
-        """Close every cached environment (end-of-session teardown)."""
-        for environment in self._items.values():
-            environment.close()
-        self._items.clear()
-
-
-class PgState:
-    """Session PostgreSQL state: whether pg is skipped and the shared handle."""
-
-    def __init__(self, skip_pg, connection):
-        """Store the skip flag and the shared psycopg2 connection (or None)."""
-        self.skip_pg = skip_pg
-        self.connection = connection
-
-
-def _skip_pg_requested():
-    """Whether the FEDQ_E2E_SKIP_PG toggle is set to 1."""
-    return os.environ.get("FEDQ_E2E_SKIP_PG") == "1"
 
 
 def _connect_pg():
@@ -100,40 +36,32 @@ def _connect_pg():
     return connection
 
 
-def _reset_fed_schemas(connection):
-    """Drop every leftover ``fed_*`` schema so a run starts from a clean slate."""
-    cursor = connection.cursor()
-    cursor.execute("SELECT nspname FROM pg_namespace WHERE nspname LIKE 'fed_%'")
-    rows = cursor.fetchall()
-    for row in rows:
-        cursor.execute("DROP SCHEMA IF EXISTS " + row[0] + " CASCADE")
-    cursor.close()
-
-
 @pytest.fixture(scope="session")
-def pg_state():
-    """Provide the session PostgreSQL state, raising loudly if pg is required."""
-    if _skip_pg_requested():
-        yield PgState(skip_pg=True, connection=None)
-        return
+def pg_connection():
+    """Provide the shared PostgreSQL connection, raising if pg is unreachable.
+
+    This connection READS the harness. It must never drop a ``fed_%`` schema:
+    those hold the pre-built data every test in the suite depends on, so dropping
+    one leaves every later run asserting against data that is not there. Only
+    build_test_harness.sh removes harness data.
+    """
     connection = _connect_pg()
-    _reset_fed_schemas(connection)
-    yield PgState(skip_pg=False, connection=connection)
-    _reset_fed_schemas(connection)
+    yield connection
     connection.close()
 
 
 @pytest.fixture(scope="session")
-def env_registry():
-    """A session-scoped LRU cache of environments, closed at teardown.
+def open_environments():
+    """Track every environment opened this session and close them at teardown.
 
-    Bounding the cache (FEDQ_E2E_MAX_ENVS) keeps the number of live engine
-    runtimes - and therefore open PostgreSQL connections - bounded across a
-    single-process run of the whole corpus.
+    This holds engine runtimes, not data. Closing one drops its native runtime so
+    the session's PostgreSQL connections are released; the datasources it read
+    are untouched, because the suite never creates them.
     """
-    cache = EnvCache(_max_envs())
-    yield cache
-    cache.close_all()
+    opened = {}
+    yield opened
+    for environment in opened.values():
+        environment.close()
 
 
 @pytest.fixture(scope="session")
@@ -143,19 +71,33 @@ def oracle_registry():
 
 
 def _case_placement_params():
-    """Return (argvalues, ids) for the full case x placement parametrization."""
+    """Return (argvalues, ids) for the full case x placement parametrization.
+
+    Ordered so that every test reading one (table set, placement) environment runs
+    consecutively. That ordering is what keeps the suite's resource use flat: an
+    environment is opened once, used by all its tests, and closed before the next
+    one opens, so at most a couple of engine runtimes - and therefore a handful of
+    PostgreSQL connections - are ever live. Case-major order would instead force
+    every runtime to stay alive all run to be reused at all, which is hundreds of
+    connections held for no reason.
+    """
+    ordered = []
+    for case in all_cases():
+        for placement in PLACEMENTS:
+            ordered.append((_env_sort_key(case, placement), case, placement))
+    ordered.sort(key=lambda entry: entry[0])
     argvalues = []
     ids = []
-    for case in all_cases():
-        _extend_params_for_case(case, argvalues, ids)
+    for _key, case, placement in ordered:
+        argvalues.append((case, placement))
+        ids.append(case["name"] + "[" + placement.name + "]")
     return argvalues, ids
 
 
-def _extend_params_for_case(case, argvalues, ids):
-    """Append one (case, placement) param per placement for a single case."""
-    for placement in PLACEMENTS:
-        argvalues.append((case, placement))
-        ids.append(case["name"] + "[" + placement.name + "]")
+def _env_sort_key(case, placement):
+    """Return the sort key grouping tests by the environment they read."""
+    specs = case_table_specs(case)
+    return (",".join(sorted(specs.keys())), placement.name, case["name"])
 
 
 def pytest_generate_tests(metafunc):

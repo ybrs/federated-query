@@ -20,3 +20,9 @@ pytest-cov>=4.1.0
 black>=23.0.0
 mypy>=1.7.0
 pydantic>=2,<3
+
+# Linters run by `make lint` and run_all_tests.sh: flake8 over every Python file,
+# semgrep for the codepoint rule. They are listed here because the lint gate is
+# part of the suite, not an optional extra a developer installs by hand.
+flake8>=7.0.0
+semgrep>=1.60.0

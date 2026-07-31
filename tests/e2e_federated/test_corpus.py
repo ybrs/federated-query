@@ -1,10 +1,12 @@
 """Run every corpus case under every placement and check it against the oracle.
 
-For each (case, placement): skip explicitly when the placement uses PostgreSQL
-and pg is toggled off, or when the placement spreads the case's tables over fewer
-than the case's ``min_sources`` distinct sources. An ``expect_error`` case must
-raise in every non-skipped placement. Every other case runs through the engine
-and is compared, value by value, to the single-DuckDB oracle result.
+For each (case, placement): a cell is skipped only when the combination does not
+exist - the placement needs more tables than the case has, or it spreads the
+case's tables over fewer than the case's ``min_sources`` distinct sources. Those
+are properties of the matrix, not switches; nothing a run can be configured with
+removes a case. An ``expect_error`` case must raise in every placement it has.
+Every other case runs through the engine and is compared, value by value, to the
+single-DuckDB oracle result.
 """
 
 import pytest
@@ -13,42 +15,53 @@ from tests.e2e_federated import runtime as runtime_mod
 from tests.e2e_federated.cases import case_table_specs
 from tests.e2e_federated.compare import compare_tables
 from tests.e2e_federated.oracle import build_oracle
-from tests.e2e_federated.placements import placement_uses_postgres
 
 
-def test_corpus(case, placement, pg_state, env_registry, oracle_registry):
+def test_corpus(case, placement, open_environments, oracle_registry):
     """Execute one corpus case under one placement and assert correctness."""
     specs = case_table_specs(case)
-    _maybe_skip(case, placement, specs, pg_state)
-    environment = _get_env(env_registry, placement, specs, pg_state)
+    _skip_absent_cell(case, placement, specs)
+    environment = _get_env(open_environments, placement, specs)
     if "expect_error" in case:
         _run_expect_error(environment, case)
     else:
         _run_and_compare(environment, case, placement, oracle_registry, specs)
 
 
-def _maybe_skip(case, placement, specs, pg_state):
-    """Skip visibly for a toggled-off pg placement, few tables, or min_sources."""
+def _skip_absent_cell(case, placement, specs):
+    """Skip visibly when this (case, placement) cell does not exist.
+
+    A placement that needs more tables than the case declares, or that lands the
+    case's tables on fewer sources than it requires, has nothing to assert.
+    """
     if len(specs) < placement.min_tables:
         pytest.skip(
             "placement needs >= " + str(placement.min_tables) + " tables"
         )
     used_slots, _mapping = placement.assign(specs.keys())
-    if pg_state.skip_pg and placement_uses_postgres(placement, used_slots):
-        pytest.skip("FEDQ_E2E_SKIP_PG=1: PostgreSQL placement skipped")
     min_sources = case.get("min_sources", 1)
     if len(used_slots) < min_sources:
         pytest.skip("placement yields " + str(len(used_slots)) + " source(s)")
 
 
-def _get_env(env_registry, placement, specs, pg_state):
-    """Return the cached Environment for (tables, placement), building it once."""
+def _get_env(open_environments, placement, specs):
+    """Return the Environment for (tables, placement), opening it once.
+
+    Opening reads datasources build_test_harness.sh already created; it never
+    creates them, so what is held here is an engine runtime, not data.
+
+    Tests are ordered so every test reading one environment runs consecutively,
+    so when the key changes the previous environment is finished with and its
+    runtime is closed. That is what keeps PostgreSQL connections at a handful
+    instead of one set per environment held for the whole run.
+    """
     key = (frozenset(specs.keys()), placement.name)
-    if key not in env_registry:
-        env_registry[key] = runtime_mod.build_environment(
-            placement, specs, pg_state.connection
-        )
-    return env_registry[key]
+    if key in open_environments:
+        return open_environments[key]
+    for previous in list(open_environments):
+        open_environments.pop(previous).close()
+    open_environments[key] = runtime_mod.open_environment(placement, specs)
+    return open_environments[key]
 
 
 def _get_oracle(oracle_registry, specs):

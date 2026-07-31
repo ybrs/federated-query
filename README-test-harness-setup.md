@@ -57,11 +57,12 @@ The cluster is initialized with `trust` local authentication, so the password is
 ## 2. Run the tests
 
 ```bash
-make pg-start
-make test            # full suite
-make test-no-db      # skip the PostgreSQL-backed decorrelation suite
-make pg-stop
+./run_all_tests.sh   # everything; starts PostgreSQL itself if it is not up
 ```
+
+`run_all_tests.sh` is the whole story - there is no subset to run and no way to
+run the suite without PostgreSQL. `make pg-start` / `make pg-stop` control the
+server directly when you want it up outside a test run.
 
 In CI, PostgreSQL is provided by a service container on port 5432 with the same
 credentials (see `.github/workflows/`), so the same fixtures work unchanged.
