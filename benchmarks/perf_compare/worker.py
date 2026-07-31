@@ -28,7 +28,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 TPCH = os.path.join(ROOT, "benchmarks", "tpch")
 # HERE first: the fedq.so symlink in this directory points at the RELEASE
-# build (compare.py maintains it); TPCH provides qualify.py + run_federated.py.
+# build (compare.py maintains it); TPCH supplies qualify + run_federated_rust.
 sys.path.insert(0, TPCH)
 sys.path.insert(0, HERE)
 
@@ -112,89 +112,6 @@ def _median(values):
     return ordered[len(ordered) // 2]
 
 
-def _build_old(source, args):
-    """(build_runtime, qualify) for the OLD (Python) engine on a source."""
-    from federated_query.catalog.catalog import Catalog
-    from federated_query.config.config import Config
-    from federated_query.cli.fedq import FedQRuntime
-
-    def single(datasource, source_name):
-        datasource.connect()
-        catalog = Catalog()
-        catalog.register_datasource(datasource)
-        catalog.load_metadata()
-        runtime = FedQRuntime(catalog, Config())
-        return runtime, lambda sql: _qualify_single(sql, source_name)
-
-    if source == "duck":
-        from federated_query.datasources.duckdb import DuckDBDataSource
-
-        db_path = _duck_path(args.scale_factor)
-
-        def make():
-            """Build the OLD engine over a local DuckDB source."""
-            return single(
-                DuckDBDataSource("duck", {"path": db_path, "read_only": True}),
-                "duck",
-            )
-    elif source == "parquet":
-        from federated_query.datasources.parquet import ParquetDataSource
-
-        pq_dir = _parquet_dir(args.scale_factor)
-
-        def make():
-            """Build the OLD engine over a local Parquet source."""
-            return single(ParquetDataSource("pq", {"dir": pq_dir}), "pq")
-    elif source == "pgduck":
-
-        def make():
-            """Build the OLD engine's federated pg-dims runtime."""
-            return _build_old_pgduck(args)
-    else:
-        raise SystemExit("unknown source: " + source)
-    return make
-
-
-def _build_old_pgduck(args):
-    """The OLD engine's federated pg-dims runtime (dims on pg, facts on duck)."""
-    import types
-    import run_federated as rf
-
-    options = types.SimpleNamespace(
-        scale_factor=args.scale_factor,
-        pg_host="localhost",
-        pg_port="5432",
-        pg_user="postgres",
-        pg_password="postgres",
-        pg_database=args.pg_database,
-    )
-    runtime = rf.build_fedq(_duck_path(args.scale_factor), options)
-    placement = rf.PLACEMENTS["pg-dims"]
-
-    def qualify(sql):
-        return rf._qualify(sql, placement, rf.FEDQ_SOURCES, rf.ENGINE_DIALECT)
-
-    return runtime, qualify
-
-
-def _old_fns(runtime, qualify):
-    """(plan_only, execute) bound to an OLD-engine runtime."""
-    query_executor = runtime.query_executor
-
-    def plan_only(sql):
-        logical = query_executor._run_before_processors(qualify(sql))
-        logical = query_executor._parse_query(logical)
-        logical = query_executor._bind_plan(logical)
-        logical = query_executor._decorrelate_plan(logical)
-        logical = query_executor._optimize_plan(logical)
-        return query_executor._build_physical_plan(logical)
-
-    def execute(sql):
-        return runtime.execute(qualify(sql)).num_rows
-
-    return plan_only, execute
-
-
 def _adbc_driver_path():
     """Return the ADBC Postgres driver shipped with the installed package.
 
@@ -276,15 +193,15 @@ def _build_new(source, args):
                 raise UnsupportedSource(str(error)) from error
             raise
         if source == "pgduck":
-            import run_federated as rf
-
-            placement = rf.PLACEMENTS["pg-dims"]
+            import run_federated_rust as rf
 
             def qualify(sql):
-                """Qualify sql for the pg-dims federated placement."""
-                return rf._qualify(
-                    sql, placement, rf.FEDQ_SOURCES, rf.ENGINE_DIALECT
-                )
+                """Qualify sql for the pg-dims federated placement.
+
+                The runner carries the placement as its own PG_DIMS constant,
+                so the mapping is not passed in here.
+                """
+                return rf._qualify(sql, rf.FEDQ_SOURCES, rf.ENGINE_DIALECT)
         else:
             name = "duck" if source == "duck" else "pq"
 
@@ -397,7 +314,7 @@ def _warm_one(plan_only, execute, query, warmups, runs):
 def main():
     """Parse arguments, build the engine adapter, run the requested mode."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--engine", required=True, choices=["old", "new"])
+    parser.add_argument("--engine", required=True, choices=["new"])
     parser.add_argument(
         "--source", required=True, choices=["duck", "parquet", "pgduck"]
     )
@@ -416,10 +333,7 @@ def main():
 
     os.environ["FEDQRS_PROFILE"] = "1"
     queries = args.queries.split(",")
-    if args.engine == "old":
-        make, fns = _build_old(args.source, args), _old_fns
-    else:
-        make, fns = _build_new(args.source, args), _new_fns
+    make, fns = _build_new(args.source, args), _new_fns
     if args.mode == "warm":
         _run_warm(make, fns, queries, args.warmups, args.runs)
     else:

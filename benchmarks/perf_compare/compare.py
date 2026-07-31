@@ -29,12 +29,18 @@ import argparse
 import glob
 import json
 import os
+import shlex
 import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 RELEASE_LIB = os.path.join(ROOT, "target", "release", "libfedq_py.so")
+# Both engines read the TPC-H queries and generated data from here. The OLD
+# engine runs from its own checkout, so it is told this location explicitly with
+# --tpch-dir rather than deriving one of its own; measuring two engines against
+# different data would compare nothing.
+TPCH = os.path.join(ROOT, "benchmarks", "tpch")
 
 
 def _all_queries():
@@ -64,12 +70,47 @@ def _build_release():
     os.symlink(RELEASE_LIB, link)
 
 
+def _old_engine_cmd(args):
+    """The command that measures the OLD engine, or exit naming what is missing.
+
+    The OLD engine lives in the fedqrs repository and is installed in its OWN
+    virtualenv: it links its own DuckDB and pins its own dependencies, so it
+    cannot share a process or an interpreter with this one. It is therefore
+    reached as a command emitting the same JSON lines, never imported.
+
+    Its location is supplied per run through --old-engine-cmd or
+    FEDQ_OLD_ENGINE_CMD and is never recorded here. A checked-in path would name
+    one machine's layout, and every other machine would get a harness that fails
+    on a path it cannot change.
+    """
+    command = args.old_engine_cmd or os.environ.get("FEDQ_OLD_ENGINE_CMD")
+    if not command:
+        raise SystemExit(
+            "--engines includes 'old', but the old engine's command is not set.\n"
+            "It is the fedqrs-bench console script from an installed fedqrs "
+            "checkout, e.g.\n"
+            "  --old-engine-cmd /path/to/fedqrs-venv/bin/fedqrs-bench\n"
+            "or FEDQ_OLD_ENGINE_CMD=... . Run --engines new to skip it."
+        )
+    return shlex.split(command)
+
+
 def _worker_cmd(engine, source, mode, queries, args):
-    """The worker.py invocation for one (engine, source, mode) cell."""
-    cmd = [
-        sys.executable,
-        os.path.join(HERE, "worker.py"),
-        "--engine", engine,
+    """The command measuring one (engine, source, mode) cell.
+
+    Both engines answer on the same JSON-lines contract, so they differ only in
+    which process is asked: worker.py in this interpreter for NEW, the fedqrs
+    console script in its own for OLD.
+    """
+    if engine == "old":
+        cmd = _old_engine_cmd(args) + ["--tpch-dir", TPCH]
+    else:
+        cmd = [
+            sys.executable,
+            os.path.join(HERE, "worker.py"),
+            "--engine", engine,
+        ]
+    cmd += [
         "--source", source,
         "--mode", mode,
         "--queries", ",".join(queries),
@@ -78,7 +119,7 @@ def _worker_cmd(engine, source, mode, queries, args):
         "--warmups", str(args.warmups),
         "--runs", str(args.runs),
     ]
-    if args.planning_budget_ms is not None:
+    if engine != "old" and args.planning_budget_ms is not None:
         cmd += ["--planning-budget-ms", str(args.planning_budget_ms)]
     return cmd
 
@@ -241,6 +282,12 @@ def main():
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument(
+        "--old-engine-cmd",
+        default=None,
+        help="command measuring the OLD engine (fedqrs-bench from an installed "
+             "fedqrs checkout); also read from FEDQ_OLD_ENGINE_CMD",
+    )
     args = parser.parse_args()
 
     if not args.skip_build:

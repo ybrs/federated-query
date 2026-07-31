@@ -33,6 +33,29 @@ Options: `--sources duck,parquet[,pgduck]` (pgduck needs the pg database loaded,
 `--pg-database duckpoc_sf1`), `--queries q01,q06`, `--planning-budget-ms 100000`
 to lift the kill when you need the underlying number, `--warmups/--runs`.
 
+### Measuring the OLD engine
+
+The OLD engine lives in the fedqrs repository and is installed in its OWN
+virtualenv - it links its own DuckDB and pins its own dependencies, so it cannot
+share an interpreter with this one. It is reached as a COMMAND that emits the
+same JSON lines, never imported, and this harness records nothing about where it
+is installed:
+
+```
+python3 -m venv <fedqrs-venv> && source <fedqrs-venv>/bin/activate
+pip install maturin && (cd <fedqrs-checkout> && maturin develop --release)
+
+python compare.py --scale-factor 1 --label sf1 \
+    --old-engine-cmd <fedqrs-venv>/bin/fedqrs-bench
+```
+
+`FEDQ_OLD_ENGINE_CMD` works instead of the flag. Asking for `--engines old`
+without either exits naming what is missing rather than reporting a half table.
+`--engines new` needs none of this.
+
+The TPC-H queries and data stay in this repository either way; compare.py passes
+their location to that command with `--tpch-dir`.
+
 Data prerequisites (fail loudly if missing): `benchmarks/tpch/data/tpch_sf<sf>.duckdb`
 (generate.py), `benchmarks/tpch/data/parquet_sf<sf>/` (export_parquet.py), and for
 pgduck the pg database (load_postgres.py).
