@@ -10,12 +10,11 @@ read-only ground-truth connection coexists with the engine's handle.
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import duckdb
 import pytest
 
-from federated_query.datasources.duckdb import DuckDBDataSource
 from tests.duckdb_tmp import duckdb_path
 
 
@@ -36,32 +35,16 @@ class SeededSource:
         self.connection.close()
 
 
-class ProxyingDuckDBDataSource(DuckDBDataSource):
-    """A seeded DuckDB file built incrementally: connect, seed, then read.
-
-    Subclasses the real ``DuckDBDataSource`` so a Python ``Catalog`` can load its
-    metadata (``is_connected``/``list_schemas``/... come from the base). The write
-    connection opened by ``connect`` stays open for seeding; ``path`` is the file
-    the engine reads (the base names it ``db_path``, this exposes both).
-    """
-
-    @property
-    def path(self) -> str:
-        """The DuckDB file path (the runtime config is built from this)."""
-        return self.db_path
-
-
 class QueryEnvironment:
-    """Catalog-free wrapper carrying the seeded sources for a test.
+    """Wrapper carrying the seeded sources for a test.
 
     ``datasources`` is the list of seeded sources (each exposing ``name``,
     ``path``, and a ground-truth ``connection``). ``source_pairs`` are the
     ``(name, path)`` tuples the Rust runtime config is built from.
     """
 
-    def __init__(self, datasources, catalog=None):
+    def __init__(self, datasources):
         self.datasources = datasources
-        self.catalog = catalog
 
     def source_pairs(self) -> List[Tuple[str, str]]:
         """Return the (datasource_name, duckdb_file_path) pairs for the config."""
