@@ -13,7 +13,12 @@ against an aggregate over a JOIN of two inner tables; subqueries nested two
 levels deep and inside a derived table; OR-of-EXISTS and EXISTS-OR-IN
 disjunctions; a correlated comparison through a non-equi predicate, including
 one that forces the Neumann-Kemper dependent-join path; duplicate inner keys
-under EXISTS/IN (no outer fan-out); and two expect_error guards.
+under EXISTS/IN (no outer fan-out); = ALL against a matching and an empty inner
+set (the empty case is vacuously true); the SOME spelling of ANY; a correlated
+scalar wrapped in COALESCE; a null-safe IS NOT DISTINCT FROM against a scalar
+subquery; a correlated subquery whose body carries a window function; and three
+expect_error guards, one of which pins that a scalar subquery matching more than
+one row RAISES rather than picking a row.
 """
 
 _T_ORDER_FLAG = {
@@ -556,6 +561,68 @@ CASES = [
             "(SELECT c.customer_id, c.name FROM {customers} c "
             "WHERE c.customer_id = o.customer_id) AS bad "
             "FROM {orders} o"
+        ),
+    },
+    {
+        "name": "subq_eq_all_uncorrelated",
+        "tables": ["t_null_a", "t_null_b"],
+        "query": (
+            "SELECT a.id, a.val FROM {t_null_a} a "
+            "WHERE a.k = ALL (SELECT b.k FROM {t_null_b} b WHERE b.label = 'b-ten')"
+        ),
+    },
+    {
+        "name": "subq_eq_all_empty_inner",
+        "tables": ["t_null_a", "t_null_b"],
+        "query": (
+            "SELECT a.id, a.val FROM {t_null_a} a "
+            "WHERE a.k = ALL (SELECT b.k FROM {t_null_b} b WHERE b.label = 'nope')"
+        ),
+    },
+    {
+        "name": "subq_eq_some_uncorrelated",
+        "tables": ["t_null_a", "t_null_b"],
+        "query": (
+            "SELECT a.id, a.val FROM {t_null_a} a "
+            "WHERE a.k = SOME (SELECT b.k FROM {t_null_b} b)"
+        ),
+    },
+    {
+        "name": "subq_coalesce_over_correlated_scalar",
+        "tables": ["t_null_a", "t_null_b"],
+        "query": (
+            "SELECT a.id, "
+            "COALESCE((SELECT MAX(b.id) FROM {t_null_b} b WHERE b.k = a.k), -1) AS m "
+            "FROM {t_null_a} a"
+        ),
+    },
+    {
+        "name": "subq_null_safe_compare_to_scalar",
+        "tables": ["t_null_a", "t_null_b"],
+        "query": (
+            "SELECT a.id, a.val FROM {t_null_a} a "
+            "WHERE a.k IS NOT DISTINCT FROM "
+            "(SELECT b.k FROM {t_null_b} b WHERE b.label = 'b-null-one')"
+        ),
+    },
+    {
+        "name": "subq_error_scalar_more_than_one_row",
+        "tables": ["t_dup_a", "t_dup_b"],
+        "expect_error": "more than one row",
+        "query": (
+            "SELECT b.k, "
+            "(SELECT a.tag FROM {t_dup_a} a WHERE a.k = b.k) AS one_tag "
+            "FROM {t_dup_b} b"
+        ),
+    },
+    {
+        "name": "subq_correlated_window_top1",
+        "tables": ["customers", "orders"],
+        "query": (
+            "SELECT c.customer_id, "
+            "(SELECT ROW_NUMBER() OVER (ORDER BY o.price ASC) FROM {orders} o "
+            "WHERE o.customer_id = c.customer_id ORDER BY o.order_id DESC LIMIT 1) AS rnk "
+            "FROM {customers} c"
         ),
     },
 ]
