@@ -133,6 +133,37 @@ def _harness_fingerprint():
     return sorted(entries)
 
 
+def test_the_engine_config_is_pre_built_not_composed_per_test():
+    """The config the engine reads exists on disk before the run starts."""
+    specs = case_table_specs({"name": "x", "tables": ["orders", "customers"],
+                              "query": "SELECT 1 FROM {orders}, {customers}"})
+    placement = _placement("pg_duck")
+    path = harness.config_path(placement.name, specs.keys())
+    assert os.path.exists(path), "config was not built: " + path
+    environment = runtime_mod.open_environment(placement, specs)
+    assert environment.config_path == path
+
+
+def test_opening_with_a_missing_config_raises_and_names_it():
+    """A missing config raises naming the file; it is never written on the fly."""
+    specs = case_table_specs({"name": "x", "tables": ["orders", "customers"],
+                              "query": "SELECT 1 FROM {orders}, {customers}"})
+    placement = _placement("duck_pg")
+    path = harness.config_path(placement.name, specs.keys())
+    moved = path + ".absent"
+    existed = os.path.exists(path)
+    if existed:
+        os.rename(path, moved)
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            runtime_mod.open_environment(placement, specs)
+        assert "config" in str(raised.value)
+        assert "build_test_harness.sh" in str(raised.value)
+    finally:
+        if existed:
+            os.rename(moved, path)
+
+
 def test_expected_row_counts_come_from_the_specs():
     """Row counts the verifier compares against are computed, never written down."""
     specs = case_table_specs({"name": "x", "tables": ["orders"],

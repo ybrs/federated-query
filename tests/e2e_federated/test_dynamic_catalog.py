@@ -13,6 +13,7 @@ import tempfile
 import duckdb
 import pytest
 
+from tests.e2e_federated import harness
 from tests.e2e_federated import runtime as runtime_mod
 
 # A password distinct from every other connection field, so the redaction check
@@ -85,7 +86,7 @@ def _runtime(config_path):
 def _create_pg(runtime, schema):
     """Run CREATE DATASOURCE for the seeded PostgreSQL schema."""
     params = _pg_params()
-    driver = runtime_mod.adbc_driver_path()
+    driver = harness.adbc_driver_path()
     statement = (
         "CREATE DATASOURCE pg_dyn TYPE postgres WITH ("
         "host = '" + params["host"] + "', "

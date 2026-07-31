@@ -42,6 +42,7 @@ def clean(pg_connection):
         shutil.rmtree(harness.HARNESS_ROOT)
     os.makedirs(os.path.join(harness.HARNESS_ROOT, "duck"))
     os.makedirs(os.path.join(harness.HARNESS_ROOT, "parquet"))
+    os.makedirs(os.path.join(harness.HARNESS_ROOT, "configs"))
     cursor = pg_connection.cursor()
     cursor.execute("SELECT nspname FROM pg_namespace WHERE nspname LIKE 'fed_%'")
     rows = cursor.fetchall()
@@ -107,6 +108,25 @@ def _report(built, total, started):
     sys.stdout.flush()
 
 
+def build_configs():
+    """Write the engine config for every environment; return how many.
+
+    A config names the datasources one environment reads. Writing them here, from
+    the same manifest that created the data, is what lets a test open a config
+    instead of composing one: the file the engine reads is on disk before the run
+    starts and can be inspected after it.
+    """
+    written = 0
+    for specs, placement in harness.environment_keys():
+        sources = harness.sources_for(placement, specs)
+        path = harness.config_path(placement.name, specs.keys())
+        handle = open(path, "w")
+        handle.write(harness.config_text(sources))
+        handle.close()
+        written += 1
+    return written
+
+
 def main():
     """Build every source in the manifest, reporting what was created."""
     sources = harness.manifest()
@@ -124,7 +144,11 @@ def main():
         built += 1
         _report(built, total, started)
     pg_connection.close()
-    sys.stdout.write("built %d datasources in %.1fs\n" % (total, time.time() - started))
+    configs = build_configs()
+    sys.stdout.write(
+        "built %d datasources and %d configs in %.1fs\n"
+        % (total, configs, time.time() - started)
+    )
 
 
 if __name__ == "__main__":

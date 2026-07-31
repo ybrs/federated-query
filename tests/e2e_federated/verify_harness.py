@@ -118,6 +118,28 @@ def _note_count(problems, source, table, actual, wanted):
         )
 
 
+def check_configs():
+    """Return the problems with the pre-built engine configs.
+
+    A config is compared against what the manifest says it should contain, not
+    merely checked for existence: a config left over from an earlier corpus would
+    exist while naming datasources that no longer hold what the test expects.
+    """
+    problems = []
+    for specs, placement in harness.environment_keys():
+        path = harness.config_path(placement.name, specs.keys())
+        if not os.path.exists(path):
+            problems.append("missing config " + path)
+            continue
+        wanted = harness.config_text(harness.sources_for(placement, specs))
+        handle = open(path)
+        found = handle.read()
+        handle.close()
+        if found != wanted:
+            problems.append("stale config " + path + " (contents differ)")
+    return problems
+
+
 def verify_all():
     """Return every problem across the whole manifest, empty when all is well."""
     sources = harness.manifest()
@@ -126,6 +148,7 @@ def verify_all():
     for name in sorted(sources):
         problems.extend(check_source(sources[name], pg_connection))
     pg_connection.close()
+    problems.extend(check_configs())
     return len(sources), problems
 
 

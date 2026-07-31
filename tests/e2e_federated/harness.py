@@ -99,6 +99,84 @@ def pg_schema(letter, identifier):
     return "fed_" + letter + "_" + identifier
 
 
+def config_path(placement_name, table_names):
+    """Return the engine config file path for one (placement, table-set)."""
+    name = placement_name + "_" + env_id(placement_name, table_names)
+    return os.path.join(HARNESS_ROOT, "configs", name + ".yaml")
+
+
+def engine_state_paths():
+    """Return every path the engine derives from a config to store its own state.
+
+    The engine keeps its learned-statistics catalog and materialized-view chunks
+    beside the config it was launched from (``<stem>.stats.sqlite`` and
+    ``<stem>.mv/``); the location is not configurable. These are engine state,
+    not test data: a run that inherits statistics learned by an earlier run plans
+    differently from one that does not, so the suite clears them and every run
+    starts from the same state.
+    """
+    paths = []
+    directory = os.path.join(HARNESS_ROOT, "configs")
+    if not os.path.isdir(directory):
+        return paths
+    for entry in sorted(os.listdir(directory)):
+        if entry.endswith(".stats.sqlite") or entry.endswith(".mv"):
+            paths.append(os.path.join(directory, entry))
+    return paths
+
+
+def config_text(sources):
+    """Return the YAML config declaring every datasource of one environment."""
+    lines = ["datasources:"]
+    for source in sources:
+        _append_source_block(lines, source)
+    return "\n".join(lines) + "\n"
+
+
+def _append_source_block(lines, source):
+    """Append one datasource's YAML block for its kind to the config lines."""
+    lines.append("  " + source.name + ":")
+    if source.kind == placement_mod.DUCK:
+        lines.append("    type: duckdb")
+        lines.append("    path: " + source.location)
+        return
+    if source.kind == placement_mod.PARQUET:
+        lines.append("    type: parquet")
+        lines.append("    dir: " + source.location)
+        return
+    _append_pg_block(lines, source)
+
+
+def _append_pg_block(lines, source):
+    """Append a PostgreSQL datasource block (connection + schema + adbc driver)."""
+    lines.append("    type: postgres")
+    lines.append("    host: " + os.environ.get("POSTGRES_HOST", "localhost"))
+    lines.append("    port: " + os.environ.get("POSTGRES_PORT", "5432"))
+    lines.append("    user: " + os.environ.get("POSTGRES_USER", "postgres"))
+    lines.append("    password: " + os.environ.get("POSTGRES_PASSWORD", "postgres"))
+    lines.append("    database: " + pg_database())
+    lines.append("    schemas:")
+    lines.append("      - " + source.schema)
+    lines.append("    adbc_driver: " + adbc_driver_path())
+
+
+def adbc_driver_path():
+    """Return the ADBC PostgreSQL driver shipped with the installed package.
+
+    The location is derived from the imported ``adbc_driver_postgresql``, so it
+    follows whichever interpreter is running the suite; no venv path or Python
+    version is written down. A missing package raises ImportError and a package
+    without its library raises here; neither is skipped.
+    """
+    import adbc_driver_postgresql
+
+    package_dir = os.path.dirname(adbc_driver_postgresql.__file__)
+    driver = os.path.join(package_dir, "libadbc_driver_postgresql.so")
+    if not os.path.exists(driver):
+        raise RuntimeError("adbc_driver_postgresql has no driver library at " + driver)
+    return driver
+
+
 def pg_database():
     """Return the PostgreSQL database the suite's sources live in."""
     return os.environ.get("POSTGRES_DB", "test_db")

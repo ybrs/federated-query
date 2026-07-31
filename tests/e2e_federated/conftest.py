@@ -14,10 +14,12 @@ cover.
 """
 
 import os
+import shutil
 
 import psycopg2
 import pytest
 
+from tests.e2e_federated import harness
 from tests.e2e_federated.cases import all_cases
 from tests.e2e_federated.cases import case_table_specs
 from tests.e2e_federated.placements import PLACEMENTS
@@ -34,6 +36,29 @@ def _connect_pg():
     )
     connection.autocommit = True
     return connection
+
+
+@pytest.fixture(scope="session", autouse=True)
+def fresh_engine_state():
+    """Clear the engine's learned state so every run starts from the same place.
+
+    The engine writes its learned-statistics catalog and materialized-view chunks
+    beside the config it was launched from, and the configs are pre-built at a
+    stable location, so without this a run would plan using statistics learned by
+    the previous one. That makes a result depend on how many times the suite has
+    been run before, which is not a result. Testing the learning loop is a second
+    pass over a warmed harness, not the default.
+
+    This removes engine state only. The datasources and configs are untouched.
+    """
+    removed = 0
+    for path in harness.engine_state_paths():
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+        removed += 1
+    return removed
 
 
 @pytest.fixture(scope="session")
