@@ -566,8 +566,13 @@ impl Runtime {
         let config = self.config_snapshot();
         let mut stages = StageLog::start(config.optimizer.planning_budget_ms);
         // The SHARED collector carries this plan's budget so a statistics fetch
-        // that overruns it is killed at the fetch and named in the error.
-        self.stats_snapshot().set_plan_budget(stages.budget);
+        // that overruns it is killed at the fetch and named in the error, and
+        // this plan's learned-statistics gate: with the gate off, planning reads
+        // catalog metadata and source estimates only, so the plan does not
+        // depend on what earlier executions measured.
+        let stats = self.stats_snapshot();
+        stats.set_plan_budget(stages.budget);
+        stats.set_learned_enabled(config.optimizer.enable_learned_statistics);
         let optimized = self.optimize(&catalog, sql, &mut stages, &config)?;
         let cost_model = Rc::new(RefCell::new(self.cost_model(&config)));
         // Substitute matching materialized views for recomputed subtrees BEFORE

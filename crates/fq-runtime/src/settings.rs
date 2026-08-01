@@ -287,6 +287,22 @@ static SETTINGS: &[SettingDef] = &[
         }),
     },
     SettingDef {
+        name: "optimizer.enable_learned_statistics",
+        description: "Read the learned-statistics catalog while planning (measured \
+                      row counts, column NDVs, group counts, predicate \
+                      selectivities). Off, planning uses catalog metadata and \
+                      source estimates only, so a query plans the same whatever \
+                      has been executed before; observations are still written.",
+        mutability: Mutability::SessionMutable,
+        env_var: None,
+        default: || SettingValue::Bool(OptimizerConfig::default().enable_learned_statistics),
+        read: |c| SettingValue::Bool(c.optimizer.enable_learned_statistics),
+        apply: Some(|c, v| {
+            c.optimizer.enable_learned_statistics = v.as_bool()?;
+            Ok(())
+        }),
+    },
+    SettingDef {
         name: "optimizer.max_join_reorder_size",
         description: "Use the Selinger DP for at most this many tables; GOO greedy above it.",
         mutability: Mutability::SessionMutable,

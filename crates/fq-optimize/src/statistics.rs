@@ -13,6 +13,7 @@
 //! signature; the locks are uncontended (planning is single-threaded).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use fq_catalog::datasource::{ColumnStatistics, DataSource, RenderDialect, TableStatistics};
@@ -56,6 +57,11 @@ pub struct StatisticsCollector {
     catalog: Arc<Catalog>,
     stats_catalog: Option<Arc<fq_catalog::StatsCatalog>>,
     learned_ttl_seconds: Option<i64>,
+    /// Whether the learned catalog is READ for this plan, set per plan from
+    /// `optimizer.enable_learned_statistics`. False hides the catalog from
+    /// every reader through `stats_catalog`, so no learned value is fetched at
+    /// all; the write path does not go through the collector and is unaffected.
+    learned_enabled: AtomicBool,
     /// The planning wall-clock budget shared with the pipeline. Checked around
     /// every SOURCE fetch, so a plan-time data scan is killed at the fetch that
     /// broke the budget and named in the error, not discovered later at a stage
@@ -70,7 +76,8 @@ pub struct StatisticsCollector {
 impl StatisticsCollector {
     /// Wire the collector to the metadata catalog it resolves datasources
     /// through, and optionally a learned-stats catalog whose measured row counts
-    /// / NDVs OVERLAY the source's (`None` disables the read path).
+    /// / NDVs OVERLAY the source's (`None` disables the read path). The learned
+    /// read starts ENABLED; a planning pipeline sets it per plan from its config.
     pub fn new(
         catalog: Arc<Catalog>,
         stats_catalog: Option<Arc<fq_catalog::StatsCatalog>>,
@@ -80,14 +87,28 @@ impl StatisticsCollector {
             catalog,
             stats_catalog,
             learned_ttl_seconds,
+            learned_enabled: AtomicBool::new(true),
             plan_budget: Mutex::new(None),
             cache: Mutex::new(HashMap::new()),
             planner_estimates: Mutex::new(HashMap::new()),
         }
     }
 
-    /// The learned-stats catalog, or `None` when the read path is disabled.
+    /// Turn the learned-statistics READ path on or off for the plans that
+    /// follow. Off, `stats_catalog` reports no catalog, so the overlay and the
+    /// cost model's learned group-count / predicate lookups never run and the
+    /// sqlite is not opened for reading at all.
+    pub fn set_learned_enabled(&self, enabled: bool) {
+        self.learned_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// The learned-stats catalog, or `None` when the read path is disabled -
+    /// either because no catalog is wired or because
+    /// `optimizer.enable_learned_statistics` turned the read off.
     pub fn stats_catalog(&self) -> Option<&fq_catalog::StatsCatalog> {
+        if !self.learned_enabled.load(Ordering::Relaxed) {
+            return None;
+        }
         self.stats_catalog.as_deref()
     }
 
@@ -131,10 +152,10 @@ impl StatisticsCollector {
         columns: &[String],
     ) -> Result<Option<TableStatistics>> {
         let source_stats = self.source_statistics(datasource, schema, table, columns)?;
-        if self.stats_catalog.is_none() {
+        let Some(learned) = self.stats_catalog() else {
             return Ok(source_stats);
-        }
-        self.overlay_learned(datasource, schema, table, columns, source_stats)
+        };
+        self.overlay_learned(learned, datasource, schema, table, columns, source_stats)
     }
 
     /// The source's own statistics (cached), or `None` when it has none.
@@ -242,19 +263,17 @@ impl StatisticsCollector {
 
     /// FILL a table's missing statistics from the learned catalog (a row count or
     /// a column NDV the source does not provide) WITHOUT overriding present source
-    /// values. Returns the source stats unchanged when nothing was learned.
+    /// values. Returns the source stats unchanged when nothing was learned. Runs
+    /// only for a caller that already got a catalog out of `stats_catalog`.
     fn overlay_learned(
         &self,
+        catalog: &fq_catalog::StatsCatalog,
         datasource: &str,
         schema: &str,
         table: &str,
         columns: &[String],
         source_stats: Option<TableStatistics>,
     ) -> Result<Option<TableStatistics>> {
-        let catalog = self
-            .stats_catalog
-            .as_ref()
-            .expect("overlay_learned only runs when the learned catalog is present");
         let rows = catalog.table_rows(datasource, schema, table, self.learned_ttl_seconds)?;
         let mut ndvs = BTreeMap::new();
         for column in columns {
@@ -653,6 +672,49 @@ mod tests {
         // "a" kept the SOURCE value (fill-only, no override).
         assert_eq!(stats.column_stats["a"].num_distinct, Some(42));
         // "b" filled from learned.
+        assert_eq!(stats.column_stats["b"].num_distinct, Some(7));
+    }
+
+    #[test]
+    fn the_learned_read_gate_hides_the_catalog_entirely() {
+        use fq_catalog::StatsCatalog;
+        // Same fixture as the overlay test: the source knows nothing but "a",
+        // the learned catalog knows the row count and "b".
+        let source = Arc::new(FakeSource::new(None, &["a"]));
+        let mut catalog = Catalog::new();
+        catalog.register_datasource(source);
+        #[allow(clippy::arc_with_non_send_sync)]
+        let learned = Arc::new(StatsCatalog::open(":memory:").unwrap());
+        learned.record_table_rows("duck", "main", "t", 500).unwrap();
+        learned
+            .record_column_ndv("duck", "main", "t", "b", 7)
+            .unwrap();
+        let collector = StatisticsCollector::new(Arc::new(catalog), Some(learned), None);
+
+        collector.set_learned_enabled(false);
+        // Every learned read - the overlay here, the cost model's group-count
+        // and predicate lookups elsewhere - goes through `stats_catalog`, and
+        // it reports no catalog, so nothing is fetched to be discarded later.
+        assert!(collector.stats_catalog().is_none());
+        let stats = collector
+            .get_table_statistics("duck", "main", "t", &["a".to_string(), "b".to_string()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.row_count, None, "the learned row count is not read");
+        assert_eq!(stats.column_stats["a"].num_distinct, Some(42));
+        assert!(
+            !stats.column_stats.contains_key("b"),
+            "the learned NDV is not read"
+        );
+
+        // Turning the read back on restores the overlay on the next call: the
+        // gate is a per-plan switch, not a one-way teardown.
+        collector.set_learned_enabled(true);
+        let stats = collector
+            .get_table_statistics("duck", "main", "t", &["a".to_string(), "b".to_string()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.row_count, Some(500));
         assert_eq!(stats.column_stats["b"].num_distinct, Some(7));
     }
 

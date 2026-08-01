@@ -27,7 +27,7 @@ import threading
 import pyarrow as pa
 import pytest
 
-from tests.e2e_federated import placements as placement_mod
+from tests.e2e_federated import harness
 from tests.e2e_federated import runtime as runtime_mod
 from tests.e2e_federated.cases import case_table_specs
 from tests.e2e_federated.sanity import corpus as sanity_corpus
@@ -47,12 +47,17 @@ def _iterations():
     return int(os.environ.get("FEDQ_CONC_ITERS", "3"))
 
 
-def _pick_placement():
-    """Return the federated pg+duck placement the concurrent mix runs on."""
-    for placement in placement_mod.PLACEMENTS:
-        if placement.name == "pg_duck":
-            return placement
-    raise RuntimeError("placement 'pg_duck' not found")
+def _mixed_distribution(specs):
+    """Return a distribution splitting the mix's tables across PostgreSQL and DuckDB.
+
+    The point of this suite is concurrency over a FEDERATED query, so the tables
+    must land on more than one source; alternating them guarantees that whatever
+    the mix's table set turns out to be.
+    """
+    assignment = {}
+    for index, table in enumerate(sorted(specs)):
+        assignment[table] = "pg1" if index % 2 == 0 else "duck1"
+    return harness.Variation(assignment)
 
 
 def _mix_cases():
@@ -108,7 +113,7 @@ def _oracle_answers(oracle, cases):
 
 
 def _engine_queries(environment, cases):
-    """Return each case's engine SQL with the placement's qualified names filled."""
+    """Return each case's engine SQL with the distribution's qualified names filled."""
     queries = []
     for case in cases:
         queries.append(environment.render(case["query"]))
@@ -120,8 +125,7 @@ def concurrency_fixture(engine):
     """Open one environment for the join mix and yield the concurrency fixture."""
     cases = _mix_cases()
     specs = _union_specs(cases)
-    placement = _pick_placement()
-    environment = runtime_mod.open_environment(engine, placement, specs)
+    environment = runtime_mod.open_variation(engine, _mixed_distribution(specs))
     oracle = build_oracle(specs)
     return ConcurrencyFixture(
         environment, _engine_queries(environment, cases), _oracle_answers(oracle, cases)

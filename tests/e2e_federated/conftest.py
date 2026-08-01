@@ -19,9 +19,10 @@ import psycopg2
 import pytest
 
 from tests.e2e_federated import harness
+from tests.e2e_federated import known_failures
 from tests.e2e_federated import runtime as runtime_mod
 from tests.e2e_federated.cases import all_cases
-from tests.e2e_federated.placements import PLACEMENTS
+from tests.e2e_federated.cases import case_table_specs
 
 
 def _connect_pg():
@@ -76,14 +77,23 @@ def pg_connection():
 
 @pytest.fixture(scope="session")
 def engine(fresh_engine_state):
-    """The one native runtime the whole suite queries.
+    """The one native runtime the whole suite queries, planning without learned stats.
 
     Every placement reads the same datasources and differs only in the names its
     SQL uses, so one runtime serves them all. The engine's catalog is therefore
     built once per session instead of once per placement, and the suite holds one
     set of PostgreSQL connections rather than one per placement.
+
+    Learned statistics are turned OFF for this suite. The engine reads them on
+    every plan, so with them on a query plans according to what the engine has
+    executed before it and a verdict depends on the order tests happened to run
+    in - six of this corpus's failures disappear that way. Off, a query plans the
+    same however many queries preceded it, so a result is a property of the query.
+    Exercising the learning loop is a separate, deliberate pass over a warmed
+    catalog, not something this suite should inherit by accident.
     """
     built = runtime_mod.open_engine()
+    built.runtime().execute("SET optimizer.enable_learned_statistics = false")
     yield built
     built.close()
 
@@ -94,26 +104,65 @@ def oracle_registry():
     return {}
 
 
-def _case_placement_params():
-    """Return (argvalues, ids) for the full case x placement parametrization.
+def _case_variation_params():
+    """Return (argvalues, ids) for every case under every distribution it has.
 
-    Order carries no resource meaning: every test reads the same datasources
-    through the same runtime, so no ordering opens or closes anything.
+    Only distributions a case actually has are generated, so no test in this
+    suite is ever skipped: an arrangement that does not exist is absent from the
+    run rather than present and not executed.
     """
     argvalues = []
     ids = []
     for case in all_cases():
-        for placement in PLACEMENTS:
-            argvalues.append((case, placement))
-            ids.append(case["name"] + "[" + placement.name + "]")
+        specs = case_table_specs(case)
+        for variation in harness.variations(specs, case.get("min_sources", 1)):
+            argvalues.append(_param(case, variation))
+            ids.append(case["name"] + "[" + variation.name + "]")
     return argvalues, ids
 
 
+def _param(case, variation):
+    """Return the parametrize entry, marked xfail when it is a known failure.
+
+    A known failure is marked, never removed: the test still runs and its
+    failure is still reported, so a defect stays exercised instead of vanishing
+    from the suite.
+    """
+    reason = known_failures.lookup(case["name"], variation.name)
+    if reason is None:
+        return (case, variation)
+    return pytest.param(
+        case, variation, marks=pytest.mark.xfail(reason=reason, strict=True)
+    )
+
+
 def pytest_generate_tests(metafunc):
-    """Parametrize any test taking ``case`` and ``placement`` over the matrix."""
+    """Parametrize any test taking ``case`` and ``variation`` over the matrix."""
     if "case" not in metafunc.fixturenames:
         return
-    if "placement" not in metafunc.fixturenames:
+    if "variation" not in metafunc.fixturenames:
         return
-    argvalues, ids = _case_placement_params()
-    metafunc.parametrize("case,placement", argvalues, ids=ids)
+    argvalues, ids = _case_variation_params()
+    metafunc.parametrize("case,variation", argvalues, ids=ids)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Fail the run if any test was skipped.
+
+    A skip in this suite means a check silently did not happen while the run
+    still reported success. There is no legitimate skip here: a distribution a
+    case does not have is not generated, and a missing dependency raises.
+    """
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is None:
+        return
+    skipped = reporter.stats.get("skipped", [])
+    if not skipped:
+        return
+    reporter.write_line("")
+    reporter.write_line(
+        "SKIPS ARE NOT ALLOWED: %d test(s) were skipped" % len(skipped), red=True
+    )
+    for report in skipped[:20]:
+        reporter.write_line("  " + str(report.nodeid), red=True)
+    session.exitstatus = 1

@@ -156,8 +156,9 @@ def test_opening_an_environment_creates_nothing():
     """Opening leaves the harness directory byte-for-byte as it found it."""
     specs = _specs(["orders", "customers"])
     engine = runtime_mod.open_engine()
+    variation = harness.variations(specs, 1)[0]
     before = _harness_fingerprint()
-    runtime_mod.open_environment(engine, _placement("pg_duck"), specs)
+    runtime_mod.open_variation(engine, variation)
     assert _harness_fingerprint() == before
 
 

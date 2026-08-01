@@ -5,6 +5,11 @@
 # the repository root is the rule, and the excludes below are the boundary of
 # what counts as our source at all - third-party trees and build output, not
 # code of ours that is exempt.
+#
+# `.claude` holds git worktrees, each a full checkout of this repository at
+# whatever commit it was branched from. Linting them reports violations that
+# belong to another commit and that no edit here can fix, so they are outside
+# the boundary for the same reason `vendor` is.
 exclude =
     .git,
     __pycache__,
@@ -18,7 +23,8 @@ exclude =
     dist,
     postgres-17,
     postgres-data,
-    .duckdb-lib
+    .duckdb-lib,
+    .claude
 
 # Black formats to 88 columns and CLAUDE.md states 88; flake8's own default of
 # 79 would flag every line black itself produced.

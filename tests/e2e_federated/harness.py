@@ -208,6 +208,107 @@ def placement_sources(placement, specs):
     return sources
 
 
+class Variation:
+    """One distinct way to distribute a case's tables across datasources.
+
+    ``assignment`` maps each table to the datasource name it is read from. Two
+    tables sharing a name are co-located and the engine may push their join into
+    that source; two tables on different names must be brought together by the
+    coordinator. That distinction is the whole subject of this suite, so every
+    distinct assignment is a distinct test.
+    """
+
+    def __init__(self, assignment):
+        """Store the table -> datasource-name assignment."""
+        self.assignment = assignment
+        self.name = _variation_name(assignment)
+        self.source_count = len(set(assignment.values()))
+
+    def qualified_map(self):
+        """Return table -> three-part engine name for this distribution."""
+        names = {}
+        for table in self.assignment:
+            names[table] = _qualify(self.assignment[table], table)
+        return names
+
+
+def _variation_name(assignment):
+    """Return the id of a variation: its source per table, in table order."""
+    parts = []
+    for table in sorted(assignment):
+        parts.append(assignment[table])
+    return "-".join(parts)
+
+
+def _qualify(datasource, table):
+    """Return the three-part engine name of a table in a named datasource."""
+    if datasource.startswith("pg"):
+        return datasource + "." + pg_schema(int(datasource[2:])) + "." + table
+    return datasource + "." + DUCK_SCHEMA + "." + table
+
+
+def variations(specs, min_sources):
+    """Return every distinct distribution of a table set across datasources.
+
+    A distribution is a partition of the tables into groups - the groups are the
+    co-located sets - with each group placed on a source of one kind. Every
+    partition and every kind labelling is generated; nothing is sampled and
+    nothing is skipped, so a case is tested under every arrangement it has.
+
+    ``min_sources`` drops arrangements with fewer distinct sources than the case
+    requires. That is a property of the case, so those arrangements are never
+    generated rather than generated and skipped.
+    """
+    tables = sorted(specs.keys())
+    found = []
+    for blocks in _partitions(tables):
+        if len(blocks) < min_sources:
+            continue
+        _extend_with_labellings(found, blocks)
+    return found
+
+
+def _extend_with_labellings(found, blocks):
+    """Append one Variation per kind labelling of an ordered set of blocks."""
+    import itertools
+
+    ordered = sorted(blocks, key=lambda block: sorted(block)[0])
+    kinds = (placement_mod.DUCK, placement_mod.PG, placement_mod.PARQUET)
+    for labelling in itertools.product(kinds, repeat=len(ordered)):
+        found.append(Variation(_assign(ordered, labelling)))
+
+
+def _assign(ordered_blocks, labelling):
+    """Return table -> datasource name for one labelled partition.
+
+    Instances are numbered per kind in block order, so two DuckDB groups read
+    duck1 and duck2 - two separate databases - never one source twice.
+    """
+    counts = {}
+    assignment = {}
+    for index, block in enumerate(ordered_blocks):
+        kind = labelling[index]
+        counts[kind] = counts.get(kind, 0) + 1
+        name = source_name(kind, counts[kind])
+        for table in block:
+            assignment[table] = name
+    return assignment
+
+
+def _partitions(items):
+    """Yield every partition of ``items`` as a list of non-empty blocks."""
+    if not items:
+        yield []
+        return
+    first = items[0]
+    for smaller in _partitions(items[1:]):
+        for index in range(len(smaller)):
+            grown = list(smaller)
+            grown[index] = [first] + grown[index]
+            yield grown
+        yield [[first]] + smaller
+
+
 def placement_fits(case, specs, placement):
     """Whether this placement produces a real environment for this case.
 

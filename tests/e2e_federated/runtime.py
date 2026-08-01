@@ -68,20 +68,27 @@ def open_engine():
     return Engine(harness.CONFIG_PATH)
 
 
+def _datasource_of(qualified_name):
+    """Return the datasource part of a three-part engine name."""
+    return qualified_name.split(".")[0]
+
+
 class Environment:
-    """One placement of a case's tables, reading the shared engine.
+    """One distribution of a case's tables, reading the shared engine.
 
     ``qualified_map`` maps each table to the three-part name of the instance this
-    placement reads it from; ``source_count`` is how many distinct datasources
+    distribution reads it from; ``source_count`` is how many distinct datasources
     that spans.
     """
 
-    def __init__(self, engine, qualified_map, sources):
-        """Store the shared engine, the name map, and the sources read."""
+    def __init__(self, engine, qualified_map):
+        """Store the shared engine and the table -> qualified-name map."""
         self.engine = engine
         self.qualified_map = qualified_map
-        self.sources = sources
-        self.source_count = len(sources)
+        datasources = set()
+        for name in qualified_map.values():
+            datasources.add(_datasource_of(name))
+        self.source_count = len(datasources)
 
     def render(self, query):
         """Fill a case query's ``{table}`` placeholders with qualified names."""
@@ -93,13 +100,11 @@ class Environment:
         return pa.table(self.engine.runtime().execute(rendered))
 
 
-def open_environment(engine, placement, specs):
-    """Return the Environment for one placement of a case's tables.
+def open_variation(engine, variation):
+    """Return the Environment for one distribution of a case's tables.
 
     Creates nothing and opens nothing: the datasources already exist and the
     engine is already built, so this only decides which name each table is read
-    from.
+    from. That is why a distribution costs nothing to add.
     """
-    names = harness.qualified_map(placement, specs)
-    sources = harness.placement_sources(placement, specs)
-    return Environment(engine, names, sources)
+    return Environment(engine, variation.qualified_map())

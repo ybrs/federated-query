@@ -277,6 +277,136 @@ fn set_predicate_pushdown_changes_the_plan_text() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A star-join DuckDB fixture: a fact `f` and two equally sized dimensions, one
+/// joined on a wide key and one on a two-value key. Only the KEY CARDINALITIES
+/// tell the two edges apart, and DuckDB reports no per-column NDV, so the
+/// learned-statistics catalog is the only place a planner can learn them.
+const STAR_SEED: &str = "\
+    CREATE TABLE f AS SELECT i AS k1, i % 2 AS k2 FROM range(100000) t(i); \
+    CREATE TABLE d1 AS SELECT i AS k1 FROM range(50000) t(i); \
+    CREATE TABLE d2 AS SELECT i % 2 AS k2 FROM range(50000) t(i);";
+
+/// The star query, written d2-first so a reorder is visible in the pushed SQL.
+const STAR_QUERY: &str = "EXPLAIN SELECT f.k1 FROM duck.main.d2 d2 \
+     JOIN duck.main.f f ON d2.k2 = f.k2 \
+     JOIN duck.main.d1 d1 ON f.k1 = d1.k1";
+
+/// A store-backed config over a fresh DuckDB file seeded with the star fixture.
+/// Store-backed so the learned-statistics catalog exists on disk next to it.
+fn duck_star_config() -> Config {
+    let mut config = stored_config("learned");
+    let source_path = config
+        .source_path
+        .clone()
+        .expect("stored config has a path");
+    let duck_path = std::path::Path::new(&source_path)
+        .with_file_name("star.duckdb")
+        .to_string_lossy()
+        .to_string();
+    let source = DuckDbSource::open("duck", &duck_path).expect("open duck");
+    source.execute_batch(STAR_SEED).expect("seed star");
+    drop(source);
+
+    let mut params = BTreeMap::new();
+    params.insert("path".to_string(), Value::String(duck_path));
+    config.datasources.insert(
+        "duck".to_string(),
+        DataSourceConfig {
+            name: "duck".to_string(),
+            ty: "duckdb".to_string(),
+            config: params,
+            capabilities: Vec::new(),
+            change_keys: BTreeMap::new(),
+        },
+    );
+    config
+}
+
+/// Record the star fixture's measured key NDVs into the learned-statistics
+/// catalog the runtime reads, standing in for what executing the query writes.
+fn record_star_ndvs(config: &Config) {
+    let source_path = config
+        .source_path
+        .clone()
+        .expect("stored config has a path");
+    let stats_path = std::path::Path::new(&source_path).with_file_name("config.stats.sqlite");
+    let learned =
+        fq_catalog::StatsCatalog::open(&stats_path.to_string_lossy()).expect("open learned stats");
+    for (table, column, ndv) in [
+        ("f", "k1", 100_000_i64),
+        ("d1", "k1", 50_000),
+        ("f", "k2", 2),
+        ("d2", "k2", 2),
+    ] {
+        learned
+            .record_column_ndv("duck", "main", table, column, ndv)
+            .expect("record ndv");
+    }
+}
+
+#[test]
+fn learned_statistics_change_the_plan_and_the_setting_takes_that_dependency_away() {
+    // The engine's plan for the star query BEFORE anything has been learned.
+    let config = duck_star_config();
+    let runtime = Runtime::from_config(&config).expect("build runtime");
+    let unlearned_plan = explain_text(&runtime, STAR_QUERY);
+
+    // The gate is ON by default, so measured key NDVs reach the planner and the
+    // join order changes: which plan runs depends on execution history.
+    record_star_ndvs(&config);
+    let learned_plan = explain_text(&runtime, STAR_QUERY);
+    assert_ne!(
+        unlearned_plan, learned_plan,
+        "by default a learned NDV changes the plan"
+    );
+
+    // Turning the read off on the LIVE runtime restores the never-learned plan,
+    // with the learned rows still sitting in the catalog.
+    runtime
+        .execute("SET optimizer.enable_learned_statistics = false")
+        .expect("disable the learned read");
+    assert_eq!(
+        explain_text(&runtime, STAR_QUERY),
+        unlearned_plan,
+        "with the learned read off the plan no longer depends on the catalog"
+    );
+
+    // And a runtime built with the option off out of the YAML config plans the
+    // same way from its first query, over the same populated catalog.
+    let mut off_config = config.clone();
+    off_config.optimizer.enable_learned_statistics = false;
+    let off_runtime = Runtime::from_config(&off_config).expect("build runtime");
+    assert_eq!(explain_text(&off_runtime, STAR_QUERY), unlearned_plan);
+
+    // RESET puts the dependency back: the learned rows reach the planner again.
+    runtime
+        .execute("RESET optimizer.enable_learned_statistics")
+        .expect("reset the learned read");
+    assert_eq!(explain_text(&runtime, STAR_QUERY), learned_plan);
+}
+
+#[test]
+fn the_learned_statistics_setting_shows_as_a_session_boolean_defaulting_on() {
+    let runtime = Runtime::from_config(&empty_config()).expect("build runtime");
+    let (schema, batches) = runtime
+        .execute("SHOW SETTING optimizer.enable_learned_statistics")
+        .expect("show the setting");
+    let (value, default, source, mutable) =
+        show_index(&schema, &batches)["optimizer.enable_learned_statistics"].clone();
+    assert_eq!(
+        value, "true",
+        "learned statistics are read unless turned off"
+    );
+    assert_eq!(default, "true");
+    assert_eq!(source, "default");
+    assert_eq!(mutable, "session");
+
+    let error = runtime
+        .execute("SET optimizer.enable_learned_statistics = sometimes")
+        .expect_err("a non-boolean value is rejected");
+    assert!(error.to_string().contains("boolean"), "{error}");
+}
+
 /// A store-backed config in a fresh temp dir (persisted settings live in the
 /// store next to the config path).
 fn stored_config(tag: &str) -> Config {

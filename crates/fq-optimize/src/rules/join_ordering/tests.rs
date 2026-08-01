@@ -1049,3 +1049,127 @@ fn unqualified_region_predicate_raises() {
     let rule = JoinOrdering::new(shared(q09_model()), 10);
     assert!(matches!(rule.apply(tree), Err(OptimizeError::JoinGraph(_))));
 }
+
+// --------------------- the learned-statistics read gate ---------------------
+
+/// An in-memory learned-statistics catalog holding the given measured
+/// (table, column, NDV) rows over the fake `ds` source.
+fn learned_catalog(measured_ndvs: &[(&str, &str, i64)]) -> Arc<fq_catalog::StatsCatalog> {
+    // StatsCatalog holds a rusqlite Connection and is not Sync; the collector
+    // uses it single-threaded within one plan walk, and the Arc shape matches
+    // the collector's field type.
+    #[allow(clippy::arc_with_non_send_sync)]
+    let catalog = Arc::new(fq_catalog::StatsCatalog::open(":memory:").unwrap());
+    for &(table, column, ndv) in measured_ndvs {
+        catalog
+            .record_column_ndv("ds", "s", table, column, ndv)
+            .unwrap();
+    }
+    catalog
+}
+
+/// A cost model over a fake `ds` source that reports ROW COUNTS ONLY - no column
+/// NDVs, the shape a DuckDB source has - so every NDV the estimator sees comes
+/// from `learned`. `read_learned` is the planner's
+/// `optimizer.enable_learned_statistics` gate.
+fn rows_only_model(learned: Arc<fq_catalog::StatsCatalog>, read_learned: bool) -> CostModel {
+    let mut table_map = BTreeMap::new();
+    for &(name, rows) in &[("f", 100_000_i64), ("d1", 50_000), ("d2", 50_000)] {
+        table_map.insert(name.to_string(), (Some(rows), BTreeMap::new()));
+    }
+    let mut catalog = Catalog::new();
+    catalog.register_datasource(Arc::new(FakeSource {
+        source_name: "ds".to_string(),
+        tables: table_map,
+    }));
+    let stats = StatisticsCollector::new(Arc::new(catalog), Some(learned), None);
+    stats.set_learned_enabled(read_learned);
+    CostModel::new(CostConfig::default(), Some(stats))
+}
+
+/// The measured NDVs that make the `k2` edge far less selective than the `k1`
+/// edge, so an optimizer that reads them must join `d1` before `d2`.
+const MEASURED_NDVS: [(&str, &str, i64); 4] = [
+    ("f", "k1", 50_000),
+    ("d1", "k1", 50_000),
+    ("f", "k2", 2),
+    ("d2", "k2", 2),
+];
+
+/// FROM-order left-deep star: (d2 JOIN f ON k2) JOIN d1 ON k1.
+fn star_from_order_tree() -> LogicalPlan {
+    let d2_first = join(
+        scan("d2", "d2", &["k2"]),
+        scan("f", "f", &["k1", "k2"]),
+        JoinType::Inner,
+        Some(eq(col("d2", "k2"), col("f", "k2"))),
+    );
+    join(
+        d2_first,
+        scan("d1", "d1", &["k1"]),
+        JoinType::Inner,
+        Some(eq(col("f", "k1"), col("d1", "k1"))),
+    )
+}
+
+/// Reorder the star tree over a model whose only NDV source is the learned
+/// catalog, with the learned read gate in the given position.
+fn reordered_star(measured_ndvs: &[(&str, &str, i64)], read_learned: bool) -> LogicalPlan {
+    let model = rows_only_model(learned_catalog(measured_ndvs), read_learned);
+    JoinOrdering::new(shared(model), 10)
+        .apply(star_from_order_tree())
+        .unwrap()
+}
+
+/// The base tables of a tree in left-to-right leaf order: the join order the
+/// enumerator chose, free of the per-join estimate annotations.
+fn leaf_table_order(plan: &LogicalPlan) -> Vec<String> {
+    let mut order = Vec::new();
+    collect_leaf_tables(plan, &mut order);
+    order
+}
+
+/// Append every scan's table name in left-to-right tree order.
+fn collect_leaf_tables(plan: &LogicalPlan, order: &mut Vec<String>) {
+    if let LogicalPlan::Scan(scan) = plan {
+        order.push(scan.table_name.clone());
+        return;
+    }
+    for child in plan.children() {
+        collect_leaf_tables(child, order);
+    }
+}
+
+#[test]
+fn a_learned_ndv_changes_the_chosen_join_order() {
+    // The gate is ON (today's default). With an EMPTY learned catalog no NDV
+    // exists anywhere and the region prices one way; the same tables with
+    // measured NDVs make the k1 edge the cheap one and the order changes. This
+    // is the dependency on execution history the gate exists to remove. The
+    // assertion is on the leaf ORDER, so it cannot pass on estimate annotations
+    // alone - it is a different plan that runs.
+    let unlearned = leaf_table_order(&reordered_star(&[], true));
+    let learned = leaf_table_order(&reordered_star(&MEASURED_NDVS, true));
+    assert_ne!(
+        learned, unlearned,
+        "a learned NDV must change the chosen join order"
+    );
+}
+
+#[test]
+fn the_gate_off_plans_the_same_whatever_was_learned() {
+    // The gate is OFF: the same query over the same tables plans identically
+    // with an empty catalog and with a fully measured one, so the plan no
+    // longer depends on what earlier executions wrote.
+    assert_eq!(
+        reordered_star(&[], false),
+        reordered_star(&MEASURED_NDVS, false),
+        "with the learned read off the catalog cannot reach the plan"
+    );
+    // And that plan is the one the engine produces with no learning at all.
+    assert_eq!(
+        reordered_star(&MEASURED_NDVS, false),
+        reordered_star(&[], true),
+        "the gate reproduces the never-learned plan, it does not invent a third"
+    );
+}

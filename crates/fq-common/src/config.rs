@@ -91,6 +91,12 @@ pub struct OptimizerConfig {
     pub enable_projection_pushdown: bool,
     pub enable_join_reordering: bool,
     pub enable_decorrelation: bool,
+    /// Whether planning READS the learned-statistics catalog (the measured row
+    /// counts, column NDVs, group counts, and predicate selectivities written
+    /// after every executed query). False makes planning depend only on catalog
+    /// metadata and source estimates, so the same query plans identically
+    /// whatever has been executed before. Writing observations is unaffected.
+    pub enable_learned_statistics: bool,
     /// Use the Selinger DP for at most this many tables; GOO greedy above it.
     pub max_join_reorder_size: u32,
     /// Hard wall-clock budget for PLANNING one query, in milliseconds. Planning
@@ -122,13 +128,16 @@ impl Default for OptimizerConfig {
     /// Mirrors the Python defaults: every rule on, DP up to 10 tables. The
     /// planning budget is Rust-new: 100ms, far above a healthy metadata-only
     /// plan and far below any plan-time data scan. The ship gates carry the
-    /// values dim shipping was tuned against on TPC-DS.
+    /// values dim shipping was tuned against on TPC-DS. The learned-statistics
+    /// read is on: a measured statistic is the best estimate available, so
+    /// planning uses it unless a deployment turns it off.
     fn default() -> Self {
         Self {
             enable_predicate_pushdown: true,
             enable_projection_pushdown: true,
             enable_join_reordering: true,
             enable_decorrelation: true,
+            enable_learned_statistics: true,
             max_join_reorder_size: 10,
             planning_budget_ms: 100,
             ship_local_floor: 100_000,
