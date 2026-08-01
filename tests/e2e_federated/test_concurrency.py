@@ -96,7 +96,7 @@ class ConcurrencyFixture:
 
     def config_path(self):
         """Return the shared config path every worker builds its runtime from."""
-        return self.environment.config_path
+        return self.environment.engine.config_path
 
 
 def _oracle_answers(oracle, cases):
@@ -116,18 +116,16 @@ def _engine_queries(environment, cases):
 
 
 @pytest.fixture(scope="module")
-def concurrency_fixture():
+def concurrency_fixture(engine):
     """Open one environment for the join mix and yield the concurrency fixture."""
     cases = _mix_cases()
     specs = _union_specs(cases)
     placement = _pick_placement()
-    environment = runtime_mod.open_environment(placement, specs)
+    environment = runtime_mod.open_environment(engine, placement, specs)
     oracle = build_oracle(specs)
-    fixture = ConcurrencyFixture(
+    return ConcurrencyFixture(
         environment, _engine_queries(environment, cases), _oracle_answers(oracle, cases)
     )
-    yield fixture
-    environment.close()
 
 
 def _run_query(runtime, sql):

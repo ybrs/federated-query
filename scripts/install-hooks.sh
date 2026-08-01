@@ -49,12 +49,12 @@ for base in "$HOME/.cargo" /home/node/.cargo /usr/local/cargo; do
     fi
 done
 
-# The interpreter that runs the e2e suite. An activated venv (VIRTUAL_ENV)
-# supplies it; otherwise python3 on PATH. No venv location or Python version is
-# written down, so a venv that moves or is rebuilt keeps working; the pytest
-# probe below proves whatever was chosen can actually run the suite.
-python="${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python}"
-python="${python:-$(command -v python3 || true)}"
+# The interpreter that runs the e2e suite is THE repository's ./venv, always -
+# not $VIRTUAL_ENV and not python3 on PATH. Whatever a developer happens to have
+# activated is a different environment with different installed versions, so
+# honouring it means a commit is verified by an interpreter nobody else uses and
+# the test harness was not built with.
+python="$root/venv/bin/python3"
 
 # Print a banner naming what failed and why the commit is refused, then exit.
 block() {
@@ -83,8 +83,8 @@ block() {
 # suite silently not run.
 command -v cargo >/dev/null 2>&1 \
     || block "toolchain check" "cargo not found. The Rust test suite CANNOT RUN, so nothing is verified."
-[ -n "$python" ] && [ -x "$python" ] \
-    || block "toolchain check" "no python interpreter found. The e2e suite CANNOT RUN. Activate a venv or install python3."
+[ -x "$python" ] \
+    || block "toolchain check" "no interpreter at $python. The e2e suite CANNOT RUN. Fix: make venv"
 "$python" -c "import pytest" >/dev/null 2>&1 \
     || block "toolchain check" "pytest is not installed in $python. The e2e suite CANNOT RUN. Fix: make install"
 [ -f "$root/.duckdb-lib/current/libduckdb.so" ] \

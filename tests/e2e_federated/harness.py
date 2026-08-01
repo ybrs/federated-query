@@ -1,27 +1,36 @@
-"""The pre-built data every federated e2e test reads, and how it is named.
+"""The data every federated e2e test reads, and how it is named.
 
-This module is the single source of truth for what data the suite needs. Three
-callers read it and none of them disagree, because there is only one list:
+The whole suite reads ONE config declaring a fixed set of datasources: several
+independent instances of each kind (DuckDB, PostgreSQL, Parquet), and every
+instance holds EVERY table the corpus can reference.
 
-- ``build_test_harness.sh`` builds every source named here, and is the ONLY
-  thing in the repository that creates test data.
-- ``run_all_tests.sh`` verifies every source named here exists, and dies naming
-  what is missing.
-- the tests open these sources read-only. A test NEVER creates data. If a source
-  is absent the test raises; it does not seed it and it does not skip.
+That is what makes a placement a property of the QUERY rather than of the data.
+Putting ``orders`` on PostgreSQL and ``customers`` on DuckDB is not a different
+set of files, it is a different pair of names in the SQL::
 
-Every name and location is a pure function of (placement, table set), so the
-same source is found by the builder, the verifier, and the test without anything
-being passed between them. DuckDB files and Parquet directories live under
-``.test-harness/`` at the repository root; PostgreSQL sources are schemas in the
-test database.
+    SELECT ... FROM pg1.<schema>.orders  JOIN duck1.main.customers ...
+    SELECT ... FROM duck1.main.orders    JOIN pg1.<schema>.customers ...
+    SELECT ... FROM pg1.<schema>.orders  JOIN pg1.<schema>.customers ...
+
+The engine decides what it can push down from which datasource each REFERENCED
+table belongs to; the other tables sitting in that source are not part of the
+query and do not change the plan. So one config expresses every placement, and a
+new placement costs a string rather than a build.
+
+Several instances per kind exist because a placement may split tables across two
+separate databases of the SAME kind (two DuckDB files, two PostgreSQL schemas).
+``INSTANCES_PER_KIND`` is the largest number of tables any case declares, so
+every table of any case can land on an instance of its own.
+
+Three callers read this module and cannot disagree, because there is one list:
+``build_test_harness.sh`` builds it, ``run_all_tests.sh`` verifies it, and the
+tests open it read-only and raise if it is absent.
 """
 
 import hashlib
 import os
 
 from tests.e2e_federated import placements as placement_mod
-from tests.e2e_federated import tables as table_library
 from tests.e2e_federated.cases import all_cases
 from tests.e2e_federated.cases import case_table_specs
 
@@ -30,15 +39,28 @@ _REPO_ROOT = os.path.dirname(
 )
 
 HARNESS_ROOT = os.path.join(_REPO_ROOT, ".test-harness")
+CONFIG_PATH = os.path.join(HARNESS_ROOT, "config.yaml")
+
 DUCK_SCHEMA = "main"
 PARQUET_SCHEMA = "main"
 
+# One instance per table a case could split onto its own source. The corpus's
+# largest case declares six tables, so six instances of each kind can express
+# every way of scattering it, including all six onto separate sources.
+INSTANCES_PER_KIND = 6
+
+_NAME_PREFIX = {
+    placement_mod.DUCK: "duck",
+    placement_mod.PARQUET: "pq",
+    placement_mod.PG: "pg",
+}
+
 
 class RequiredSource:
-    """One datasource the suite needs: its name, kind, location, and tables.
+    """One datasource the suite reads: its name, kind, location, and tables.
 
-    ``specs`` are the TableSpecs whose DDL and inserts define the data, kept so
-    the builder can create it and the verifier can check what it should hold.
+    Every instance carries the same ``specs`` - every table the corpus can name -
+    because which source a table is READ from is chosen per query, not baked in.
     """
 
     def __init__(self, name, kind, schema, location, specs):
@@ -61,27 +83,51 @@ class RequiredSource:
         return self.name + "." + self.schema + "." + table
 
 
-def env_id(placement_name, table_names):
-    """Return the stable id identifying one (placement, table-set) environment.
+def all_table_specs():
+    """Return name -> TableSpec for every table any case can reference.
 
-    Hashing the pair keeps each environment's PostgreSQL schema and datasource
-    names globally unique, so two environments never share a schema and clobber
-    each other's tables.
+    Cases draw from the shared table library and may also declare inline
+    ``extra_tables``. Every instance holds all of them, so any case can be placed
+    on any source. Two cases defining one name differently raises: the sources
+    can only hold one of the two, so the other would silently read wrong data.
     """
-    joined = placement_name + "|" + ",".join(sorted(table_names))
-    return hashlib.md5(joined.encode("ascii")).hexdigest()[:8]
+    specs = {}
+    for case in all_cases():
+        for name, spec in case_table_specs(case).items():
+            _insert_spec(specs, name, spec)
+    return specs
 
 
-def source_name(kind, letter, identifier):
-    """Return the datasource name for one slot of one environment."""
-    return _NAME_PREFIX[kind] + letter + "_" + identifier
+def _insert_spec(specs, name, spec):
+    """Add one table spec, raising when a name is defined two different ways."""
+    existing = specs.get(name)
+    if existing is None:
+        specs[name] = spec
+        return
+    if existing.ddl != spec.ddl or existing.inserts != spec.inserts:
+        raise ValueError(
+            "table '" + name + "' is defined two different ways by different "
+            "cases; one set of sources cannot hold both"
+        )
 
 
-_NAME_PREFIX = {
-    placement_mod.DUCK: "duck_",
-    placement_mod.PARQUET: "pq_",
-    placement_mod.PG: "pg_",
-}
+def ordered_specs():
+    """Return every table spec, ordered by name so builds are reproducible."""
+    specs = all_table_specs()
+    ordered = []
+    for name in sorted(specs):
+        ordered.append(specs[name])
+    return ordered
+
+
+def source_name(kind, index):
+    """Return the datasource name of one instance of one kind (1-based)."""
+    return _NAME_PREFIX[kind] + str(index)
+
+
+def pg_schema(index):
+    """Return the PostgreSQL schema name backing one PostgreSQL instance."""
+    return "fed_pg" + str(index)
 
 
 def duck_path(name):
@@ -94,42 +140,102 @@ def parquet_dir(name):
     return os.path.join(HARNESS_ROOT, "parquet", name)
 
 
-def pg_schema(letter, identifier):
-    """Return the PostgreSQL schema name for one slot of one environment."""
-    return "fed_" + letter + "_" + identifier
+def pg_database():
+    """Return the PostgreSQL database the suite's sources live in."""
+    return os.environ.get("POSTGRES_DB", "test_db")
 
 
-def config_path(placement_name, table_names):
-    """Return the engine config file path for one (placement, table-set)."""
-    name = placement_name + "_" + env_id(placement_name, table_names)
-    return os.path.join(HARNESS_ROOT, "configs", name + ".yaml")
+def source_for(kind, index):
+    """Return the RequiredSource describing one instance of one kind."""
+    name = source_name(kind, index)
+    specs = ordered_specs()
+    if kind == placement_mod.DUCK:
+        return RequiredSource(name, kind, DUCK_SCHEMA, duck_path(name), specs)
+    if kind == placement_mod.PARQUET:
+        return RequiredSource(name, kind, PARQUET_SCHEMA, parquet_dir(name), specs)
+    schema = pg_schema(index)
+    return RequiredSource(name, kind, schema, schema, specs)
 
 
-def engine_state_paths():
-    """Return every path the engine derives from a config to store its own state.
+def manifest():
+    """Return every RequiredSource the suite reads, keyed by datasource name."""
+    sources = {}
+    for kind in (placement_mod.DUCK, placement_mod.PG, placement_mod.PARQUET):
+        for index in range(1, INSTANCES_PER_KIND + 1):
+            source = source_for(kind, index)
+            sources[source.name] = source
+    return sources
 
-    The engine keeps its learned-statistics catalog and materialized-view chunks
-    beside the config it was launched from (``<stem>.stats.sqlite`` and
-    ``<stem>.mv/``); the location is not configurable. These are engine state,
-    not test data: a run that inherits statistics learned by an earlier run plans
-    differently from one that does not, so the suite clears them and every run
-    starts from the same state.
+
+def instance_indexes(placement):
+    """Return slot letter -> instance index for one placement.
+
+    A slot takes the next free instance of ITS OWN kind, so a placement holding
+    two DuckDB slots reads duck1 and duck2 - two separate databases - while a
+    placement holding one DuckDB and one PostgreSQL slot reads duck1 and pg1.
     """
-    paths = []
-    directory = os.path.join(HARNESS_ROOT, "configs")
-    if not os.path.isdir(directory):
-        return paths
-    for entry in sorted(os.listdir(directory)):
-        if entry.endswith(".stats.sqlite") or entry.endswith(".mv"):
-            paths.append(os.path.join(directory, entry))
-    return paths
+    seen = {}
+    indexes = {}
+    for slot in placement.slots:
+        seen[slot.kind] = seen.get(slot.kind, 0) + 1
+        indexes[slot.letter] = seen[slot.kind]
+    return indexes
 
 
-def config_text(sources):
-    """Return the YAML config declaring every datasource of one environment."""
+def qualified_map(placement, specs):
+    """Return table -> three-part engine name for one placement of a table set.
+
+    This is where a placement becomes real: it picks, per table, which instance
+    the query reads it from. Nothing is built and nothing is moved.
+    """
+    _used_slots, mapping = placement.assign(specs.keys())
+    indexes = instance_indexes(placement)
+    names = {}
+    for table in sorted(specs.keys()):
+        slot = placement.slot_by_letter(mapping[table])
+        source = source_for(slot.kind, indexes[slot.letter])
+        names[table] = source.qualified(table)
+    return names
+
+
+def placement_sources(placement, specs):
+    """Return the RequiredSources a placement actually reads from."""
+    used_slots, _mapping = placement.assign(specs.keys())
+    indexes = instance_indexes(placement)
+    sources = []
+    for slot in used_slots:
+        sources.append(source_for(slot.kind, indexes[slot.letter]))
+    return sources
+
+
+def placement_fits(case, specs, placement):
+    """Whether this placement produces a real environment for this case.
+
+    A placement with more slots than the case has tables would leave slots empty,
+    and a case declaring ``min_sources`` needs its tables to land on at least that
+    many distinct sources.
+    """
+    if len(specs) < placement.min_tables:
+        return False
+    used_slots, _mapping = placement.assign(specs.keys())
+    return len(used_slots) >= case.get("min_sources", 1)
+
+
+def oracle_source():
+    """Return the source holding the single-DuckDB ground truth.
+
+    Every instance carries every table, so the first DuckDB instance already IS
+    the all-tables oracle database; there is nothing extra to build.
+    """
+    return source_for(placement_mod.DUCK, 1)
+
+
+def config_text():
+    """Return the YAML config declaring every datasource the suite reads."""
     lines = ["datasources:"]
-    for source in sources:
-        _append_source_block(lines, source)
+    sources = manifest()
+    for name in sorted(sources):
+        _append_source_block(lines, sources[name])
     return "\n".join(lines) + "\n"
 
 
@@ -177,151 +283,22 @@ def adbc_driver_path():
     return driver
 
 
-def pg_database():
-    """Return the PostgreSQL database the suite's sources live in."""
-    return os.environ.get("POSTGRES_DB", "test_db")
+def engine_state_paths():
+    """Return every path the engine derives from the config to store its state.
 
-
-def sources_for(placement, specs):
-    """Return the RequiredSources one (placement, table-set) environment reads.
-
-    This is the function the tests call to find their data, and the same one the
-    manifest calls to enumerate everything. A test and the builder therefore
-    cannot disagree about where a source is.
+    The engine keeps its learned-statistics catalog and materialized-view chunks
+    beside the config it was launched from (``<stem>.stats.sqlite`` and
+    ``<stem>.mv/``); the location is not configurable. These are engine state,
+    not test data: a run that inherits statistics learned by an earlier run plans
+    differently from one that does not, so the suite clears them and every run
+    starts from the same state.
     """
-    used_slots, mapping = placement.assign(specs.keys())
-    identifier = env_id(placement.name, specs.keys())
-    sources = []
-    for slot in used_slots:
-        slot_specs = _specs_for_slot(slot.letter, mapping, specs)
-        sources.append(_source_for_slot(slot, slot_specs, identifier))
-    return sources
-
-
-def _specs_for_slot(letter, mapping, specs):
-    """Return the TableSpecs assigned to one slot, ordered by table name."""
-    names = []
-    for table, slot_letter in mapping.items():
-        if slot_letter == letter:
-            names.append(table)
-    slot_specs = []
-    for name in sorted(names):
-        slot_specs.append(specs[name])
-    return slot_specs
-
-
-def _source_for_slot(slot, slot_specs, identifier):
-    """Return the RequiredSource describing one slot's datasource."""
-    name = source_name(slot.kind, slot.letter, identifier)
-    if slot.kind == placement_mod.DUCK:
-        return RequiredSource(
-            name, slot.kind, DUCK_SCHEMA, duck_path(name), slot_specs
-        )
-    if slot.kind == placement_mod.PARQUET:
-        return RequiredSource(
-            name, slot.kind, PARQUET_SCHEMA, parquet_dir(name), slot_specs
-        )
-    schema = pg_schema(slot.letter, identifier)
-    return RequiredSource(name, slot.kind, schema, schema, slot_specs)
-
-
-def oracle_name(table_names):
-    """Return the datasource name of the single-DuckDB oracle for a table set."""
-    return "oracle_" + env_id("oracle", table_names)
-
-
-def oracle_source(specs):
-    """Return the RequiredSource holding a table set's ground-truth DuckDB.
-
-    The oracle is one DuckDB carrying every table of a case, queried with bare
-    names. It is built by build_test_harness.sh like every other source, so the
-    reference answer a test compares against is data somebody can open and look
-    at, not something conjured inside the test run.
-    """
-    name = oracle_name(specs.keys())
-    ordered = []
-    for table in sorted(specs.keys()):
-        ordered.append(specs[table])
-    return RequiredSource(name, placement_mod.DUCK, DUCK_SCHEMA,
-                          duck_path(name), ordered)
-
-
-def environment_keys():
-    """Return every (case-tables, placement) environment the corpus needs.
-
-    Yielded as (specs, placement) pairs, deduplicated by (table-set, placement)
-    so an environment shared by many cases is described once.
-    """
-    seen = set()
-    keys = []
-    for case in all_cases():
-        specs = case_table_specs(case)
-        for placement in placement_mod.PLACEMENTS:
-            if not placement_fits(case, specs, placement):
-                continue
-            key = (frozenset(specs.keys()), placement.name)
-            if key in seen:
-                continue
-            seen.add(key)
-            keys.append((specs, placement))
-    return keys
-
-
-def placement_fits(case, specs, placement):
-    """Whether this placement produces a real environment for this case.
-
-    A placement with more slots than the case has tables would leave slots
-    empty, and a case declaring ``min_sources`` needs its tables to land on at
-    least that many distinct sources.
-    """
-    if len(specs) < placement.min_tables:
-        return False
-    used_slots, _mapping = placement.assign(specs.keys())
-    return len(used_slots) >= case.get("min_sources", 1)
-
-
-def manifest():
-    """Return every RequiredSource the whole suite needs, keyed by name.
-
-    Raises when two environments claim the same datasource name with different
-    table definitions: that would mean the builder created one of them and both
-    tests read it, so one of the two would silently run against the wrong data.
-    """
-    sources = {}
-    for specs, placement in environment_keys():
-        for source in sources_for(placement, specs):
-            _insert_unique(sources, source)
-    for specs in _oracle_table_sets():
-        _insert_unique(sources, oracle_source(specs))
-    return sources
-
-
-def _oracle_table_sets():
-    """Return one specs map per distinct table set the corpus compares against."""
-    seen = set()
-    sets = []
-    for case in all_cases():
-        specs = case_table_specs(case)
-        key = frozenset(specs.keys())
-        if key in seen:
-            continue
-        seen.add(key)
-        sets.append(specs)
-    return sets
-
-
-def _insert_unique(sources, source):
-    """Add a source to the manifest, raising on a name clash with other tables."""
-    existing = sources.get(source.name)
-    if existing is None:
-        sources[source.name] = source
-        return
-    if existing.table_names() != source.table_names():
-        raise ValueError(
-            "datasource '" + source.name + "' is claimed twice with different "
-            "tables: " + str(existing.table_names()) + " vs "
-            + str(source.table_names())
-        )
+    stem = os.path.splitext(CONFIG_PATH)[0]
+    paths = []
+    for candidate in (stem + ".stats.sqlite", stem + ".mv"):
+        if os.path.exists(candidate):
+            paths.append(candidate)
+    return paths
 
 
 def expected_row_counts(specs):
@@ -329,8 +306,7 @@ def expected_row_counts(specs):
 
     The count is derived by running each spec into an in-memory DuckDB, which is
     the same DDL and the same inserts the builder runs, so the verifier compares
-    against what the data is defined to be rather than against a written-down
-    number that can drift.
+    against what the data is defined to be rather than a written-down number.
     """
     import duckdb
 
@@ -346,6 +322,7 @@ def expected_row_counts(specs):
     return counts
 
 
-def library_table_names():
-    """Return every table name the shared table library defines."""
-    return sorted(table_library.TABLES.keys())
+def table_set_digest(table_names):
+    """Return a short stable digest of a table set, for cache keys and ids."""
+    joined = ",".join(sorted(table_names))
+    return hashlib.md5(joined.encode("ascii")).hexdigest()[:8]

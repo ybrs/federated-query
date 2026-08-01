@@ -17,11 +17,11 @@ from tests.e2e_federated.compare import compare_tables
 from tests.e2e_federated.oracle import build_oracle
 
 
-def test_corpus(case, placement, open_environments, oracle_registry):
+def test_corpus(case, placement, engine, oracle_registry):
     """Execute one corpus case under one placement and assert correctness."""
     specs = case_table_specs(case)
     _skip_absent_cell(case, placement, specs)
-    environment = _get_env(open_environments, placement, specs)
+    environment = runtime_mod.open_environment(engine, placement, specs)
     if "expect_error" in case:
         _run_expect_error(environment, case)
     else:
@@ -42,26 +42,6 @@ def _skip_absent_cell(case, placement, specs):
     min_sources = case.get("min_sources", 1)
     if len(used_slots) < min_sources:
         pytest.skip("placement yields " + str(len(used_slots)) + " source(s)")
-
-
-def _get_env(open_environments, placement, specs):
-    """Return the Environment for (tables, placement), opening it once.
-
-    Opening reads datasources build_test_harness.sh already created; it never
-    creates them, so what is held here is an engine runtime, not data.
-
-    Tests are ordered so every test reading one environment runs consecutively,
-    so when the key changes the previous environment is finished with and its
-    runtime is closed. That is what keeps PostgreSQL connections at a handful
-    instead of one set per environment held for the whole run.
-    """
-    key = (frozenset(specs.keys()), placement.name)
-    if key in open_environments:
-        return open_environments[key]
-    for previous in list(open_environments):
-        open_environments.pop(previous).close()
-    open_environments[key] = runtime_mod.open_environment(placement, specs)
-    return open_environments[key]
 
 
 def _get_oracle(oracle_registry, specs):

@@ -38,12 +38,13 @@ class Oracle:
 
 
 def build_oracle(specs):
-    """Open the pre-built ground-truth DuckDB for a table set and return its Oracle.
+    """Open the ground-truth DuckDB and return its Oracle for a table set.
 
-    Creates nothing. A missing oracle raises naming it and the command that
-    builds it, rather than being silently reseeded into a file nobody inspects.
+    Creates nothing. Every DuckDB instance already carries every table, so the
+    first one IS the all-tables reference database; a missing one raises naming
+    it and the command that builds it.
     """
-    source = harness.oracle_source(specs)
+    source = harness.oracle_source()
     if not os.path.exists(source.location):
         raise RuntimeError(
             "test harness is incomplete, oracle " + source.name + " is missing at "

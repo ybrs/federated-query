@@ -193,6 +193,7 @@ class OracleContext:
     def __init__(self, pg_connection, rng, watchdog_seconds, live_variants):
         """Store the pg handle, RNG, watchdog budget, and active variant list."""
         self.pg_connection = pg_connection
+        self.engine = runtime_mod.open_engine()
         self.rng = rng
         self.watchdog_seconds = watchdog_seconds
         self.live_variants = live_variants
@@ -240,7 +241,7 @@ def get_env(ctx, placement, specs):
     """
     key = (frozenset(specs.keys()), placement.name)
     if key not in ctx.env_cache:
-        ctx.env_cache[key] = runtime_mod.open_environment(placement, specs)
+        ctx.env_cache[key] = runtime_mod.open_environment(ctx.engine, placement, specs)
     return ctx.env_cache[key]
 
 
@@ -812,17 +813,18 @@ def _probe_placements():
 
 def _probe_environments(placements):
     """Open one engine environment per (placement, probe query) for comparison."""
+    engine = runtime_mod.open_engine()
     envs = []
     for placement in placements:
-        _append_probe_envs(placement, envs)
+        _append_probe_envs(placement, engine, envs)
     return envs
 
 
-def _append_probe_envs(placement, envs):
+def _append_probe_envs(placement, engine, envs):
     """Append the probe environments for one placement to the env list."""
     for sql, tables in PROBE_QUERIES:
         specs = case_table_specs({"name": "probe", "tables": tables, "query": sql})
-        env = runtime_mod.open_environment(placement, specs)
+        env = runtime_mod.open_environment(engine, placement, specs)
         envs.append((env, sql))
 
 

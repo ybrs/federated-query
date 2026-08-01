@@ -1,10 +1,9 @@
 """Pytest wiring for the federated e2e corpus: parametrization and caches.
 
-The test is parametrized over every (case x placement) pair. The datasources
-themselves are built once by ``build_test_harness.sh`` and only read here; what
-this session holds is engine runtimes, keyed by (frozenset-of-tables, placement
-name), so cases reading the same sources under the same placement share one
-runtime instead of opening a second connection set for identical data.
+The test is parametrized over every (case x placement) pair. The datasources are
+built once by ``build_test_harness.sh`` and only read here, and every placement
+reads the same ones - a placement is a choice of names in the SQL - so the whole
+session shares ONE engine runtime and one set of PostgreSQL connections.
 
 PostgreSQL is required, unconditionally. There is no toggle that runs the suite
 without it: a live connection is opened once per session and a failure to connect
@@ -20,8 +19,8 @@ import psycopg2
 import pytest
 
 from tests.e2e_federated import harness
+from tests.e2e_federated import runtime as runtime_mod
 from tests.e2e_federated.cases import all_cases
-from tests.e2e_federated.cases import case_table_specs
 from tests.e2e_federated.placements import PLACEMENTS
 
 
@@ -76,17 +75,17 @@ def pg_connection():
 
 
 @pytest.fixture(scope="session")
-def open_environments():
-    """Track every environment opened this session and close them at teardown.
+def engine(fresh_engine_state):
+    """The one native runtime the whole suite queries.
 
-    This holds engine runtimes, not data. Closing one drops its native runtime so
-    the session's PostgreSQL connections are released; the datasources it read
-    are untouched, because the suite never creates them.
+    Every placement reads the same datasources and differs only in the names its
+    SQL uses, so one runtime serves them all. The engine's catalog is therefore
+    built once per session instead of once per placement, and the suite holds one
+    set of PostgreSQL connections rather than one per placement.
     """
-    opened = {}
-    yield opened
-    for environment in opened.values():
-        environment.close()
+    built = runtime_mod.open_engine()
+    yield built
+    built.close()
 
 
 @pytest.fixture(scope="session")
@@ -98,31 +97,16 @@ def oracle_registry():
 def _case_placement_params():
     """Return (argvalues, ids) for the full case x placement parametrization.
 
-    Ordered so that every test reading one (table set, placement) environment runs
-    consecutively. That ordering is what keeps the suite's resource use flat: an
-    environment is opened once, used by all its tests, and closed before the next
-    one opens, so at most a couple of engine runtimes - and therefore a handful of
-    PostgreSQL connections - are ever live. Case-major order would instead force
-    every runtime to stay alive all run to be reused at all, which is hundreds of
-    connections held for no reason.
+    Order carries no resource meaning: every test reads the same datasources
+    through the same runtime, so no ordering opens or closes anything.
     """
-    ordered = []
-    for case in all_cases():
-        for placement in PLACEMENTS:
-            ordered.append((_env_sort_key(case, placement), case, placement))
-    ordered.sort(key=lambda entry: entry[0])
     argvalues = []
     ids = []
-    for _key, case, placement in ordered:
-        argvalues.append((case, placement))
-        ids.append(case["name"] + "[" + placement.name + "]")
+    for case in all_cases():
+        for placement in PLACEMENTS:
+            argvalues.append((case, placement))
+            ids.append(case["name"] + "[" + placement.name + "]")
     return argvalues, ids
-
-
-def _env_sort_key(case, placement):
-    """Return the sort key grouping tests by the environment they read."""
-    specs = case_table_specs(case)
-    return (",".join(sorted(specs.keys())), placement.name, case["name"])
 
 
 def pytest_generate_tests(metafunc):

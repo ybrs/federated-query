@@ -1,14 +1,17 @@
-"""Build every datasource the federated e2e suite reads. Run by build_test_harness.sh.
+"""Build every datasource the e2e suite reads. Run by build_test_harness.sh.
 
 This is the ONLY code in the repository that creates test data. The tests read
 what this builds and never seed anything themselves, so what a test runs against
-is decided here, once, and is the same for every test that reads it.
+is decided here, once, visibly, and is the same for every test that reads it.
+
+It builds a fixed set of datasources - several instances of each kind, each
+holding every table the corpus can name - plus the single config that declares
+them. Placements are then expressed in the queries, so adding one costs nothing
+here.
 
 The build is destructive and complete: it removes ``.test-harness`` and drops
-every ``fed_%`` schema first, then creates every source in ``harness.manifest``.
-A partial build is never left behind quietly - a failure raises with the source
-that failed, and the verifier run before the tests refuses a suite whose data is
-incomplete.
+every ``fed_%`` schema first. A failure raises naming the source that failed, and
+the verifier run before the tests refuses a suite whose data is incomplete.
 """
 
 import os
@@ -42,7 +45,6 @@ def clean(pg_connection):
         shutil.rmtree(harness.HARNESS_ROOT)
     os.makedirs(os.path.join(harness.HARNESS_ROOT, "duck"))
     os.makedirs(os.path.join(harness.HARNESS_ROOT, "parquet"))
-    os.makedirs(os.path.join(harness.HARNESS_ROOT, "configs"))
     cursor = pg_connection.cursor()
     cursor.execute("SELECT nspname FROM pg_namespace WHERE nspname LIKE 'fed_%'")
     rows = cursor.fetchall()
@@ -53,7 +55,7 @@ def clean(pg_connection):
 
 
 def build_source(source, pg_connection):
-    """Create one datasource with its tables, dispatching on its kind."""
+    """Create one datasource with every table, dispatching on its kind."""
     if source.kind == placement_mod.DUCK:
         _build_duck(source)
     elif source.kind == placement_mod.PARQUET:
@@ -97,57 +99,33 @@ def _run_specs(executor, specs):
             executor.execute(insert)
 
 
-def _report(built, total, started):
-    """Print progress every 50 sources so a long build is not a silent wait."""
-    if built % 50 and built != total:
-        return
-    elapsed = time.time() - started
-    sys.stdout.write(
-        "  built %d/%d sources (%.1fs)\n" % (built, total, elapsed)
-    )
-    sys.stdout.flush()
-
-
-def build_configs():
-    """Write the engine config for every environment; return how many.
-
-    A config names the datasources one environment reads. Writing them here, from
-    the same manifest that created the data, is what lets a test open a config
-    instead of composing one: the file the engine reads is on disk before the run
-    starts and can be inspected after it.
-    """
-    written = 0
-    for specs, placement in harness.environment_keys():
-        sources = harness.sources_for(placement, specs)
-        path = harness.config_path(placement.name, specs.keys())
-        handle = open(path, "w")
-        handle.write(harness.config_text(sources))
-        handle.close()
-        written += 1
-    return written
+def write_config():
+    """Write the single engine config declaring every datasource."""
+    handle = open(harness.CONFIG_PATH, "w")
+    handle.write(harness.config_text())
+    handle.close()
 
 
 def main():
     """Build every source in the manifest, reporting what was created."""
     sources = harness.manifest()
-    total = len(sources)
+    tables = len(harness.ordered_specs())
     sys.stdout.write(
-        "building %d datasources into %s\n" % (total, harness.HARNESS_ROOT)
+        "building %d datasources x %d tables into %s\n"
+        % (len(sources), tables, harness.HARNESS_ROOT)
     )
     pg_connection = connect_pg()
     dropped = clean(pg_connection)
     sys.stdout.write("  cleaned %d leftover PostgreSQL schemas\n" % dropped)
     started = time.time()
-    built = 0
     for name in sorted(sources):
         build_source(sources[name], pg_connection)
-        built += 1
-        _report(built, total, started)
+        sys.stdout.write("  built " + name + "\n")
     pg_connection.close()
-    configs = build_configs()
+    write_config()
     sys.stdout.write(
-        "built %d datasources and %d configs in %.1fs\n"
-        % (total, configs, time.time() - started)
+        "built %d datasources and 1 config in %.1fs\n"
+        % (len(sources), time.time() - started)
     )
 
 
