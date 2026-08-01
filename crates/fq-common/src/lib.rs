@@ -23,7 +23,8 @@ mod update;
 pub use budget::PlanBudget;
 pub use config::{
     load_config, AcceleratorConfig, CatalogConfig, ChangeKey, Config, CostConfig, DataSourceConfig,
-    ExecutorConfig, OptimizerConfig, Principal, ServerConfig, UserCredential, SCRAM_ITERATIONS,
+    DiagnosticsConfig, ExecutorConfig, OptimizerConfig, Principal, ServerConfig, UserCredential,
+    SCRAM_ITERATIONS,
 };
 pub use error::{ConfigError, UnsupportedSqlError};
 pub use events::EventsConfig;

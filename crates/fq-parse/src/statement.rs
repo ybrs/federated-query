@@ -68,6 +68,9 @@ pub enum Statement<'a> {
     ShowViews,
     /// `SHOW SETTINGS`: list every engine setting.
     ShowSettings,
+    /// `SHOW PUSHDOWN FRAGMENTS`: list every query the last statement handed to
+    /// a source.
+    ShowPushdownFragments,
     /// `SHOW MATERIALIZED VIEWS`: list every registered materialized view with
     /// its size, timestamps, and substitution benefit counters.
     ShowMaterializedViews,
@@ -256,11 +259,12 @@ pub fn classify_statement(sql: &str) -> Result<Statement<'_>, ParseError> {
              step; change a datasource with DROP DATASOURCE then CREATE DATASOURCE"
                 .to_string(),
         )),
-        // SHOW is ours only for SETTING(S) and MATERIALIZED VIEWS; any other
-        // SHOW passes through to the normal parser.
+        // SHOW is ours only for SETTING(S), PUSHDOWN FRAGMENTS and MATERIALIZED
+        // VIEWS; any other SHOW passes through to the normal parser.
         "SHOW" if second_word_is(sql, "SETTINGS") || second_word_is(sql, "SETTING") => {
             classify_show(&mut tokens)
         }
+        "SHOW" if second_word_is(sql, "PUSHDOWN") => classify_show(&mut tokens),
         "SHOW" if second_word_is(sql, "MATERIALIZED") => classify_show_materialized(&mut tokens),
         "SHOW" if second_word_is(sql, "VIEWS") => classify_show_views(&mut tokens),
         "SHOW" if second_word_is(sql, "DATASOURCES") => classify_show_datasources(&mut tokens),
@@ -276,14 +280,21 @@ pub fn classify_statement(sql: &str) -> Result<Statement<'_>, ParseError> {
     }
 }
 
-/// Parse `SHOW SETTINGS` (all settings) or `SHOW SETTING <name>` (one setting).
-/// A trailing token after `SETTINGS`, or a missing name after `SETTING`, raises.
+/// Parse `SHOW SETTINGS` (all settings), `SHOW PUSHDOWN FRAGMENTS` (what the
+/// last statement sent to sources), or `SHOW SETTING <name>` (one setting). A
+/// trailing token, or a missing name after `SETTING`, raises.
 fn classify_show<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
     tokens.expect_keyword("SHOW")?;
     if tokens.peek_word_is("SETTINGS") {
         tokens.expect_keyword("SETTINGS")?;
         expect_end(tokens, "SHOW SETTINGS")?;
         return Ok(Statement::ShowSettings);
+    }
+    if tokens.peek_word_is("PUSHDOWN") {
+        tokens.expect_keyword("PUSHDOWN")?;
+        tokens.expect_keyword("FRAGMENTS")?;
+        expect_end(tokens, "SHOW PUSHDOWN FRAGMENTS")?;
+        return Ok(Statement::ShowPushdownFragments);
     }
     tokens.expect_keyword("SETTING")?;
     let name = dotted_name(tokens)?;

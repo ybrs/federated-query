@@ -22,13 +22,21 @@ from tests.e2e_federated.compare import compare_tables
 from tests.e2e_federated.oracle import build_oracle
 
 
-def test_corpus(case, variation, engine, oracle_registry):
-    """Execute one corpus case under one distribution and assert correctness."""
+def test_corpus(case, variation, engine, oracle_registry, fragment_verifier):
+    """Execute one corpus case under one distribution and assert correctness.
+
+    Two things are asserted: the whole query's answer against the oracle, and -
+    for every query the engine pushed to a source that no earlier variation
+    already pushed - that the source answers its own pushed SQL the way the
+    oracle answers the same query. The second is a check of the pushdown boundary
+    itself, where the engine stops executing and trusts a foreign executor.
+    """
     environment = runtime_mod.open_variation(engine, variation)
     if "expect_error" in case:
         _run_expect_error(environment, case)
     else:
         _run_and_compare(environment, case, variation, oracle_registry)
+        fragment_verifier.observe()
 
 
 def _reference(oracle_registry, case):

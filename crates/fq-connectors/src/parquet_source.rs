@@ -139,7 +139,11 @@ impl DataSource for ParquetSource {
 
     /// Everything DataFusion executes over a single pushed relation, and nothing
     /// else: no JOIN (a file source has no server; cross-table joins run in the
-    /// coordinator) and no SHIP_TARGET (the files are read-only).
+    /// coordinator), no SHIP_TARGET (the files are read-only), and no
+    /// INTERSECT_EXCEPT_ALL - DataFusion lowers a bare INTERSECT ALL / EXCEPT ALL
+    /// to a semi / anti join, which keeps every matching / non-matching left row
+    /// instead of the per-row minimum / difference the multiset semantics
+    /// require, so those two operations stay in the coordinator.
     fn capabilities(&self) -> Vec<DataSourceCapability> {
         vec![
             DataSourceCapability::Aggregations,

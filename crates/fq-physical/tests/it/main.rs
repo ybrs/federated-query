@@ -3,6 +3,7 @@
 //! stack per `cargo test`, instead of one link per suite.
 
 mod dim_shipping;
+mod fragments;
 mod orient;
 mod plan;
 mod single_source;

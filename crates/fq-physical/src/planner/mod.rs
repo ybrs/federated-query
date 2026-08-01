@@ -11,7 +11,7 @@ mod cte;
 mod join;
 mod lateral;
 pub mod orient;
-mod set_op;
+pub(crate) mod set_op;
 
 use std::cell::RefCell;
 use std::collections::HashMap;

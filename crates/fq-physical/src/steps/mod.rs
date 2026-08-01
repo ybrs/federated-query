@@ -30,7 +30,9 @@ pub use error::StepError;
 /// The source-dialect picker the same-source pushdown rule shares with the scan
 /// renderer, so a pushed island and a plain scan on one source transpile alike.
 pub(crate) use render_sql::scan_dialect;
-pub use render_sql::{render_remote_set_op, render_scan_sql};
+pub use render_sql::{
+    render_remote_set_op, render_remote_set_op_canonical, render_scan_canonical, render_scan_sql,
+};
 pub use scan_spec::PARALLEL_SCAN_MIN_ROWS;
 pub use types::{
     AggCall, AggSelectItem, BuiltSteps, ExtraInjection, Fragment, JoinKind, Observation,

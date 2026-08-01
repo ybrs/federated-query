@@ -61,7 +61,9 @@ impl DataSource for MaterializedViewSource {
     // The store executes pushed SQL through DataFusion over local chunks, so
     // relational pushdown is supported; it is read-only (never a ship target)
     // and the coordinator keeps the constructs the skeleton does not push
-    // (CTEs, window functions, subqueries).
+    // (CTEs, window functions, subqueries). INTERSECT ALL / EXCEPT ALL are
+    // absent for the same reason they are absent on Parquet: DataFusion lowers
+    // them to a semi / anti join, which ignores duplicate multiplicity.
     fn capabilities(&self) -> Vec<DataSourceCapability> {
         vec![
             DataSourceCapability::Aggregations,

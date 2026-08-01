@@ -126,6 +126,12 @@ pub fn render_remote_set_op(set_op: &PhysicalRemoteSetOp) -> Result<String, Step
     Ok(to_source_sql(&canonical, set_op_dialect(set_op)?)?)
 }
 
+/// A remote set op's canonical Postgres text: the dialect-neutral form of what
+/// `render_remote_set_op` sends to the source.
+pub fn render_remote_set_op_canonical(set_op: &PhysicalRemoteSetOp) -> Result<String, StepError> {
+    remote_set_op_canonical(set_op)
+}
+
 /// A remote set op's canonical Postgres text (branches combined + outer
 /// ORDER BY/LIMIT/OFFSET wrapper), before transpile. Ports `build_remote_ast`.
 fn remote_set_op_canonical(set_op: &PhysicalRemoteSetOp) -> Result<String, StepError> {

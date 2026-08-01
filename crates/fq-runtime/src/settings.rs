@@ -31,8 +31,8 @@ use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
 
 use fq_common::{
-    AcceleratorConfig, CatalogConfig, Config, CostConfig, DataType, EventsConfig, ExecutorConfig,
-    OptimizerConfig,
+    AcceleratorConfig, CatalogConfig, Config, CostConfig, DataType, DiagnosticsConfig,
+    EventsConfig, ExecutorConfig, OptimizerConfig,
 };
 
 use crate::error::RuntimeError;
@@ -506,6 +506,23 @@ static SETTINGS: &[SettingDef] = &[
         read: |c| SettingValue::Bool(c.accelerator.enable_substitution),
         apply: Some(|c, v| {
             c.accelerator.enable_substitution = v.as_bool()?;
+            Ok(())
+        }),
+    },
+    // --- diagnostics: what the engine records about its own execution -------
+    SettingDef {
+        name: "diagnostics.record_pushdown_fragments",
+        description: "Keep every query the engine handed to a source while running \
+                      the last statement: the text sent, the same query in canonical \
+                      Postgres, and the columns the plan expected back. Read with \
+                      SHOW PUSHDOWN FRAGMENTS. Off, statements that run record \
+                      nothing and that view is empty for them.",
+        mutability: Mutability::SessionMutable,
+        env_var: None,
+        default: || SettingValue::Bool(DiagnosticsConfig::default().record_pushdown_fragments),
+        read: |c| SettingValue::Bool(c.diagnostics.record_pushdown_fragments),
+        apply: Some(|c, v| {
+            c.diagnostics.record_pushdown_fragments = v.as_bool()?;
             Ok(())
         }),
     },
@@ -1168,6 +1185,14 @@ mod tests {
     fn every_events_field_is_registered() {
         let mapping = serde_yaml::to_value(EventsConfig::default()).expect("serialize events");
         assert_fields_registered(&mapping, "events");
+    }
+
+    /// Every `DiagnosticsConfig` field is registered under `diagnostics.`.
+    #[test]
+    fn every_diagnostics_field_is_registered() {
+        let mapping =
+            serde_yaml::to_value(DiagnosticsConfig::default()).expect("serialize diagnostics");
+        assert_fields_registered(&mapping, "diagnostics");
     }
 
     /// Assert every key of a serialized config section appears in the registry

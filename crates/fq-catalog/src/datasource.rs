@@ -46,6 +46,15 @@ pub enum DataSourceCapability {
     /// The source can receive a shipped relation as a session TEMP TABLE (dim
     /// shipping). Writable sources support it; read-only ones do not.
     ShipTarget,
+    /// The source evaluates `INTERSECT ALL` and `EXCEPT ALL` with MULTISET
+    /// semantics: a row present `left` times on the left and `right` times on
+    /// the right comes back `min(left, right)` times from an INTERSECT ALL and
+    /// `max(left - right, 0)` times from an EXCEPT ALL. A source without this
+    /// answers those two with a semi / anti join, which ignores multiplicity and
+    /// returns the wrong rows, so the engine keeps them in the coordinator (whose
+    /// counted rewrite reproduces the multiset). UNION ALL is concatenation and
+    /// the DISTINCT variants collapse duplicates, so neither depends on this.
+    IntersectExceptAll,
 }
 
 /// A scalar min/max statistic value. Replaces Python's untyped `Any`; the cost

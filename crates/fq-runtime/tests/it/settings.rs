@@ -25,6 +25,7 @@ fn empty_config() -> Config {
         accelerator: fq_common::AcceleratorConfig::default(),
         catalog: fq_common::CatalogConfig::default(),
         events: fq_common::EventsConfig::default(),
+        diagnostics: fq_common::DiagnosticsConfig::default(),
         source_path: None,
     }
 }

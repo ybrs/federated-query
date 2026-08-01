@@ -19,7 +19,7 @@ use crate::events::EventsConfig;
 
 /// The top-level sections `load_config` recognizes. Anything else is a typo and
 /// raises (`config.py`'s `known_sections`).
-const KNOWN_SECTIONS: [&str; 8] = [
+const KNOWN_SECTIONS: [&str; 9] = [
     "datasources",
     "optimizer",
     "executor",
@@ -28,6 +28,7 @@ const KNOWN_SECTIONS: [&str; 8] = [
     "accelerator",
     "catalog",
     "events",
+    "diagnostics",
 ];
 
 /// Configuration for a single data source.
@@ -220,6 +221,33 @@ impl Default for AcceleratorConfig {
     }
 }
 
+/// Configuration for what the engine records about its own execution.
+///
+/// `record_pushdown_fragments` keeps, for the statement just run, every query the
+/// engine handed to a source: the text sent, the dialect-neutral form of the same
+/// query, and the columns the plan expected back. That boundary is where the
+/// engine stops executing and trusts a foreign executor, so it is where a plan
+/// that is not equivalent to its alternatives is introduced. Recording is ON by
+/// default and costs one already-rendered string per source read per statement;
+/// off, `SHOW PUSHDOWN FRAGMENTS` returns nothing for the statements that ran
+/// while it was off.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DiagnosticsConfig {
+    pub record_pushdown_fragments: bool,
+}
+
+impl Default for DiagnosticsConfig {
+    /// Fragment recording is on: a result that turns out to be wrong can be
+    /// traced to the exact SQL that produced it without first reproducing it
+    /// under a flag that was off when it mattered.
+    fn default() -> Self {
+        Self {
+            record_pushdown_fragments: true,
+        }
+    }
+}
+
 /// Configuration for the runtime datasource catalog: the bounds that govern
 /// creating a datasource through DDL at runtime.
 ///
@@ -354,6 +382,7 @@ pub struct Config {
     pub accelerator: AcceleratorConfig,
     pub catalog: CatalogConfig,
     pub events: EventsConfig,
+    pub diagnostics: DiagnosticsConfig,
     pub source_path: Option<String>,
 }
 
@@ -386,6 +415,7 @@ pub fn load_config(config_path: &str) -> Result<Config, ConfigError> {
         accelerator: parse_section(mapping, "accelerator")?,
         catalog: parse_section(mapping, "catalog")?,
         events: parse_section(mapping, "events")?,
+        diagnostics: parse_section(mapping, "diagnostics")?,
         source_path: Some(path.display().to_string()),
     })
 }

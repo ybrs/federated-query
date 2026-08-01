@@ -41,6 +41,7 @@ fn island(output_est: Option<u64>, est: Option<u64>) -> PhysicalPlan {
     PhysicalPlan::RemoteQuery(Box::new(PhysicalRemoteQuery {
         datasource: "duck".to_string(),
         sql: "SELECT 1".to_string(),
+        canonical_sql: "SELECT 1".to_string(),
         output_names: vec!["k".to_string()],
         column_alias_map: BTreeMap::new(),
         estimated_rows: est,

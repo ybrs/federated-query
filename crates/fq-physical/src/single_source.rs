@@ -37,6 +37,7 @@ use fq_plan::logical::{
 use fq_plan::physical::{ColumnAliasMap, PhysicalRemoteQuery};
 
 use crate::planner::datasource_kind_of;
+use crate::planner::set_op as set_op_planner;
 use crate::relation_sql::{cte_ref_sql, derived_table, table_ref};
 use crate::steps::scan_dialect;
 
@@ -90,6 +91,11 @@ struct PushContext<'a> {
     has_computed: bool,
     has_aggregate: bool,
     has_subquery_relation: bool,
+    /// Some relation in this context contributes columns that base-scan expansion
+    /// cannot see, because it is not a base scan: a derived table, a set
+    /// operation, a CTE reference or a LATERAL right side, on EITHER side of a
+    /// join. `expand_star_select` declines when it is set, since the SELECT list
+    /// it builds from `scans` would silently omit those columns.
     has_derived_columns: bool,
     has_cte: bool,
     has_recursive_cte: bool,
@@ -418,6 +424,7 @@ impl SingleSourcePushdown {
         };
         ctx.from_clause = Some(rendered);
         ctx.has_subquery_relation = true;
+        ctx.has_derived_columns = true;
         Ok(true)
     }
 
@@ -437,6 +444,7 @@ impl SingleSourcePushdown {
         };
         ctx.from_clause = Some(rendered);
         ctx.has_subquery_relation = true;
+        ctx.has_derived_columns = true;
         Ok(true)
     }
 
@@ -617,11 +625,29 @@ impl SingleSourcePushdown {
         let Some(right) = self.render_branch(&node.right, ctx, None)? else {
             return Ok(None);
         };
+        if !self.source_evaluates_set_op(node, ctx) {
+            return Ok(None);
+        }
         let alias = derived_alias(ctx);
         Ok(Some(derived_table(
             &set_op_sql(node, &left, &right),
             &alias,
         )))
+    }
+
+    /// Whether the source this context pushes to evaluates `node` the way its SQL
+    /// text reads. A source that answers `INTERSECT ALL` / `EXCEPT ALL` with a
+    /// semi/anti join ignores row multiplicity, so emitting the bare keyword into
+    /// its SQL would return a different multiset than the query means. The
+    /// context's source may not be claimed yet when a branch renders, so it is
+    /// passed through as an Option: the forms that need no capability admit
+    /// themselves without one.
+    fn source_evaluates_set_op(&self, node: &SetOperation, ctx: &PushContext) -> bool {
+        let resolved = ctx
+            .datasource
+            .as_ref()
+            .and_then(|name| self.catalog.get_datasource(name));
+        set_op_planner::source_evaluates_set_op(node, resolved.as_deref())
     }
 
     /// Build one set-operation branch as a standalone SELECT on the same source.
@@ -683,15 +709,19 @@ impl SingleSourcePushdown {
         let Some(right) = self.render_branch(&node.right, ctx, None)? else {
             return Ok(None);
         };
+        if !self.source_evaluates_set_op(node, ctx) {
+            return Ok(None);
+        }
         Ok(Some(set_op_sql(node, &left, &right)))
     }
 
     // ---- catalog-reading star expansion + finish -----------------------------
 
     /// Build a unique-aliased SELECT list from each interior scan's needed columns
-    /// (a bare `SELECT *` over a join). Declines when a column-contributing join
-    /// pulled in a derived relation (its synthetic columns escape base-scan
-    /// expansion). Cannot emit, so returns a plain bool.
+    /// (a bare `SELECT *` over a join). Declines whenever any relation in the
+    /// context is not a base scan, on either side of a join: its columns are not
+    /// in `scans`, so expanding from `scans` would emit a SELECT list that
+    /// silently omits them. Cannot emit, so returns a plain bool.
     fn expand_star_select(&self, ctx: &mut PushContext) -> bool {
         if ctx.has_derived_columns {
             return false;
@@ -742,7 +772,8 @@ impl SingleSourcePushdown {
         // The island runs verbatim on `source`, so its canonical Postgres text
         // crosses the one transpile boundary into that source's own dialect.
         let dialect = scan_dialect(datasource_kind_of(source.render_dialect()));
-        let sql = to_source_sql(&render(ctx)?, dialect)?;
+        let canonical_sql = render(ctx)?;
+        let sql = to_source_sql(&canonical_sql, dialect)?;
         // Fresh PhysicalRemoteQuery built from the rendered same-source SQL and the
         // push context: nothing of this type to copy from, so every field is listed
         // (the estimated_rows / output_estimated_rows / column_ndv stamps are
@@ -750,6 +781,7 @@ impl SingleSourcePushdown {
         Ok(Some(PhysicalRemoteQuery {
             datasource,
             sql,
+            canonical_sql,
             output_names: ctx.output_names.clone(),
             column_alias_map,
             estimated_rows,
@@ -864,6 +896,7 @@ fn absorb_cte_ref_base(node: &CteRef, ctx: &mut PushContext) -> bool {
         return false;
     }
     ctx.from_clause = Some(cte_ref_sql(node));
+    ctx.has_derived_columns = true;
     true
 }
 

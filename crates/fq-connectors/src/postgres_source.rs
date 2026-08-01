@@ -120,6 +120,7 @@ impl DataSource for PostgresSource {
             DataSourceCapability::Limit,
             DataSourceCapability::OrderBy,
             DataSourceCapability::ShipTarget,
+            DataSourceCapability::IntersectExceptAll,
         ]
     }
 

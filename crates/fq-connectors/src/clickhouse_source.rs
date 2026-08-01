@@ -106,8 +106,9 @@ impl DataSource for ClickHouseSource {
     }
 
     fn capabilities(&self) -> Vec<DataSourceCapability> {
-        // ClickHouse pushes aggregates/joins/windows/CTEs; it is NOT a ship
-        // target (the engine ships temp tables only into DuckDB and Postgres).
+        // ClickHouse pushes aggregates/joins/windows/CTEs and evaluates INTERSECT
+        // ALL / EXCEPT ALL with multiset semantics; it is NOT a ship target (the
+        // engine ships temp tables only into DuckDB and Postgres).
         vec![
             DataSourceCapability::Aggregations,
             DataSourceCapability::Joins,
@@ -117,6 +118,7 @@ impl DataSource for ClickHouseSource {
             DataSourceCapability::Distinct,
             DataSourceCapability::Limit,
             DataSourceCapability::OrderBy,
+            DataSourceCapability::IntersectExceptAll,
         ]
     }
 

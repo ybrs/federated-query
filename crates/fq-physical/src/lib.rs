@@ -6,6 +6,7 @@
 
 pub mod dim_shipping;
 pub mod error;
+pub mod fragments;
 pub mod planner;
 mod relation_sql;
 pub mod single_source;
@@ -13,6 +14,7 @@ pub mod steps;
 
 pub use dim_shipping::ShipThresholds;
 pub use error::PhysicalError;
+pub use fragments::{collect_pushdown_fragments, PushdownFragment};
 pub use planner::PhysicalPlanner;
 pub use steps::{
     build_steps, render_remote_set_op, render_scan_sql, BuiltSteps, Fragment, Observation,

@@ -124,6 +124,22 @@ fn catalog() -> Arc<Catalog> {
     Arc::new(catalog)
 }
 
+/// The shared catalog with `pg` re-registered as a source that also evaluates
+/// INTERSECT ALL / EXCEPT ALL with multiset semantics, so a test can drive both
+/// sides of the multiset-capability gate over the same tables.
+fn catalog_with_multiset_pg() -> Arc<Catalog> {
+    let shared = catalog();
+    let mut catalog = Arc::try_unwrap(shared).unwrap_or_else(|_| panic!("sole owner"));
+    catalog.register_datasource(Arc::new(MockSource {
+        name: "pg".to_string(),
+        capabilities: vec![
+            DataSourceCapability::Joins,
+            DataSourceCapability::IntersectExceptAll,
+        ],
+    }));
+    Arc::new(catalog)
+}
+
 /// Parse -> bind -> decorrelate -> optimize a query against the shared catalog.
 fn optimize(catalog: &Catalog, sql: &str) -> LogicalPlan {
     let parsed = parse_with_catalog(sql, catalog).expect("parse");
@@ -421,6 +437,66 @@ fn same_source_union_pushes_to_a_remote_set_op() {
     };
     assert_eq!(remote.kind, SetOpKind::Union);
     assert!(!remote.distinct, "UNION ALL is not distinct");
+}
+
+#[test]
+fn same_source_intersect_all_stays_local_without_the_multiset_capability() {
+    // INTERSECT ALL is multiset-valued, and a source that does not declare
+    // IntersectExceptAll answers it with a semi join (multiplicity ignored), so
+    // the operation is kept in the coordinator even though both branches read the
+    // same source.
+    let catalog = catalog();
+    let set_op = LogicalPlan::SetOperation(SetOperation {
+        left: Box::new(lscan("pg", "public", "orders", &["id"])),
+        right: Box::new(lscan("pg", "public", "customer", &["id"])),
+        kind: SetOpKind::Intersect,
+        distinct: false,
+    });
+    let physical = plan_logical(&catalog, &set_op).expect("plan");
+    assert!(
+        find_all(&physical, &|n| matches!(n, PhysicalPlan::RemoteSetOp(_))).is_empty(),
+        "INTERSECT ALL must not push into a source without IntersectExceptAll: {physical:?}"
+    );
+    let ops = find_all(&physical, &|n| matches!(n, PhysicalPlan::SetOperation(_)));
+    assert_eq!(ops.len(), 1, "it lowers to a local set operation");
+}
+
+#[test]
+fn same_source_intersect_all_pushes_when_the_source_has_the_multiset_capability() {
+    // The same shape pushes once the source declares it evaluates INTERSECT ALL /
+    // EXCEPT ALL with multiset semantics, so the gate is about the capability and
+    // not about the ALL keyword.
+    let catalog = catalog_with_multiset_pg();
+    let set_op = LogicalPlan::SetOperation(SetOperation {
+        left: Box::new(lscan("pg", "public", "orders", &["id"])),
+        right: Box::new(lscan("pg", "public", "customer", &["id"])),
+        kind: SetOpKind::Intersect,
+        distinct: false,
+    });
+    let physical = plan_logical(&catalog, &set_op).expect("plan");
+    let PhysicalPlan::RemoteSetOp(remote) = &physical else {
+        panic!("expected a pushed remote set op, got {physical:?}")
+    };
+    assert_eq!(remote.kind, SetOpKind::Intersect);
+    assert!(!remote.distinct);
+}
+
+#[test]
+fn same_source_intersect_distinct_pushes_without_the_multiset_capability() {
+    // The DISTINCT variants collapse duplicates, so they do not depend on the
+    // multiset capability and still push whole into their source.
+    let catalog = catalog();
+    let set_op = LogicalPlan::SetOperation(SetOperation {
+        left: Box::new(lscan("pg", "public", "orders", &["id"])),
+        right: Box::new(lscan("pg", "public", "customer", &["id"])),
+        kind: SetOpKind::Intersect,
+        distinct: true,
+    });
+    let physical = plan_logical(&catalog, &set_op).expect("plan");
+    let PhysicalPlan::RemoteSetOp(remote) = &physical else {
+        panic!("expected a pushed remote set op, got {physical:?}")
+    };
+    assert!(remote.distinct);
 }
 
 #[test]

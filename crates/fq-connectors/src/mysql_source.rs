@@ -76,8 +76,10 @@ impl DataSource for MySqlSource {
     }
 
     fn capabilities(&self) -> Vec<DataSourceCapability> {
-        // MySQL 8 pushes aggregates/joins/windows/CTEs; it is not a ship target
-        // (the engine ships temp tables only into DuckDB and Postgres).
+        // MySQL 8 pushes aggregates/joins/windows/CTEs and evaluates INTERSECT
+        // ALL / EXCEPT ALL with multiset semantics (8.0.31 and later); it is not
+        // a ship target (the engine ships temp tables only into DuckDB and
+        // Postgres).
         vec![
             DataSourceCapability::Aggregations,
             DataSourceCapability::Joins,
@@ -87,6 +89,7 @@ impl DataSource for MySqlSource {
             DataSourceCapability::Distinct,
             DataSourceCapability::Limit,
             DataSourceCapability::OrderBy,
+            DataSourceCapability::IntersectExceptAll,
         ]
     }
 

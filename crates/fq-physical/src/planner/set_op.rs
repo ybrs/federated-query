@@ -2,6 +2,7 @@
 //! both branches share it, else evaluate it locally. Ports `_plan_set_operation`
 //! and its helpers.
 
+use fq_catalog::{DataSource, DataSourceCapability};
 use fq_plan::expr::Expr;
 use fq_plan::logical::{SetOpKind, SetOperation};
 use fq_plan::physical::{
@@ -47,24 +48,58 @@ impl PhysicalPlanner {
         }
         // The source must resolve (Python checked the live connection; the node no
         // longer carries it, so validate against the catalog by name).
-        self.catalog().get_datasource(left_source)?;
+        let source = self.catalog().get_datasource(left_source)?;
+        if !source_evaluates_set_op(set_op, Some(source.as_ref())) {
+            return None;
+        }
         let datasource = left_source.to_string();
-        // Fresh PhysicalRemoteSetOp built from the logical SetOperation and the two
-        // pushable branches: no base to copy, so every field is listed (order_by /
-        // limit / offset start empty; a parent Sort or Limit folds them in later).
-        Some(PhysicalPlan::RemoteSetOp(Box::new(PhysicalRemoteSetOp {
-            left: Box::new(left_branch),
-            right: Box::new(right_branch),
-            kind: set_op.kind,
-            distinct: set_op.distinct,
-            datasource,
-            order_by_keys: None,
-            order_by_ascending: None,
-            order_by_nulls: None,
-            limit: None,
-            offset: 0,
-        })))
+        Some(remote_set_op(set_op, left_branch, right_branch, datasource))
     }
+}
+
+/// Whether `source` reproduces this set operation's semantics on its own. An ALL
+/// INTERSECT / EXCEPT is multiset-valued - it keeps the minimum, or the
+/// difference, of the two sides' duplicate counts - and only a source declaring
+/// `IntersectExceptAll` computes that; the rest answer with a semi / anti join,
+/// which ignores multiplicity. UNION ALL concatenates and the DISTINCT variants
+/// collapse duplicates, so both run on any source, and neither consults `source`
+/// at all - which is why an unresolved source (`None`) still admits them.
+pub(crate) fn source_evaluates_set_op(
+    set_op: &SetOperation,
+    source: Option<&dyn DataSource>,
+) -> bool {
+    if set_op.distinct || matches!(set_op.kind, SetOpKind::Union) {
+        return true;
+    }
+    match source {
+        Some(source) => source.supports_capability(DataSourceCapability::IntersectExceptAll),
+        None => false,
+    }
+}
+
+/// The pushed set operation over two branches of one source.
+fn remote_set_op(
+    set_op: &SetOperation,
+    left: PhysicalPlan,
+    right: PhysicalPlan,
+    datasource: String,
+) -> PhysicalPlan {
+    // Fresh PhysicalRemoteSetOp built from the logical SetOperation and the two
+    // pushable branches: there is no base node to copy from, so every field of
+    // PhysicalRemoteSetOp is listed here. The order_by / limit / offset fields
+    // start empty; a parent Sort or Limit folds them in later.
+    PhysicalPlan::RemoteSetOp(Box::new(PhysicalRemoteSetOp {
+        left: Box::new(left),
+        right: Box::new(right),
+        kind: set_op.kind,
+        distinct: set_op.distinct,
+        datasource,
+        order_by_keys: None,
+        order_by_ascending: None,
+        order_by_nulls: None,
+        limit: None,
+        offset: 0,
+    }))
 }
 
 /// The datasource name a pushable set branch reads from.

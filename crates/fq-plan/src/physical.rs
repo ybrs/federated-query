@@ -299,6 +299,11 @@ pub struct PhysicalTableFunction {
 pub struct PhysicalRemoteQuery {
     pub datasource: String,
     pub sql: String,
+    /// The same query in canonical Postgres, before transpiling to the source's
+    /// dialect. `sql` runs on one source only; this form is dialect-neutral, so a
+    /// reference engine can execute it over the same data and be compared against
+    /// what the source returned.
+    pub canonical_sql: String,
     pub output_names: Vec<String>,
     pub column_alias_map: ColumnAliasMap,
     pub estimated_rows: Option<u64>,
@@ -1343,6 +1348,7 @@ mod tests {
         let remote = PhysicalPlan::RemoteQuery(Box::new(PhysicalRemoteQuery {
             datasource: "duck".to_string(),
             sql: "SELECT ...".to_string(),
+            canonical_sql: "SELECT ...".to_string(),
             output_names: vec!["category".to_string(), "cnt".to_string()],
             column_alias_map: ColumnAliasMap::new(),
             estimated_rows: None,
@@ -1380,6 +1386,7 @@ mod tests {
         let remote = PhysicalPlan::RemoteQuery(Box::new(PhysicalRemoteQuery {
             datasource: "duck".to_string(),
             sql: "SELECT ...".to_string(),
+            canonical_sql: "SELECT ...".to_string(),
             output_names: vec!["a".to_string()],
             column_alias_map: ColumnAliasMap::new(),
             estimated_rows: None,
@@ -1517,6 +1524,7 @@ mod tests {
         let remote = PhysicalPlan::RemoteQuery(Box::new(PhysicalRemoteQuery {
             datasource: "duck".to_string(),
             sql: "SELECT ...".to_string(),
+            canonical_sql: "SELECT ...".to_string(),
             output_names: vec!["customer_id".to_string()],
             column_alias_map: map.clone(),
             estimated_rows: None,

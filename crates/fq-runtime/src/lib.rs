@@ -16,6 +16,7 @@ mod dynamic_catalog;
 pub mod error;
 mod events;
 mod explain;
+mod fragments;
 mod introspect;
 mod materialized;
 mod settings;
@@ -42,7 +43,7 @@ use fq_exec::{connectors, execute_plan};
 use fq_optimize::{build_optimizer, CostModel, StatisticsCollector};
 use fq_parse::{classify_statement, parse_with_catalog, Statement};
 use fq_physical::steps::Observation;
-use fq_physical::{PhysicalPlanner, ShipThresholds};
+use fq_physical::{PhysicalPlanner, PushdownFragment, ShipThresholds};
 use fq_plan::logical::LogicalPlan;
 use fq_plan::output_column_names;
 use fq_plan::physical::PhysicalPlan;
@@ -70,6 +71,11 @@ pub struct Runtime {
     /// The setting names changed by `SET` on this runtime (cleared per name by
     /// `RESET`). Drives the `source = set` column and `RESET ALL`.
     settings_overrides: RwLock<BTreeSet<String>>,
+    /// Every query the last statement handed to a source, in plan order, when
+    /// `diagnostics.record_pushdown_fragments` is on. Replaced per statement, so
+    /// it describes the statement just run and never accumulates across a
+    /// session.
+    pushdown_fragments: RwLock<Vec<PushdownFragment>>,
     /// ONE statistics collector for the whole session: its caches (source
     /// stats, planner estimates) persist across queries, and its learned
     /// overlay reads the stats catalog this runtime also WRITES after every
@@ -196,6 +202,7 @@ impl Runtime {
             catalog: RwLock::new(catalog),
             config: RwLock::new(config.clone()),
             settings_overrides: RwLock::new(persisted_overrides),
+            pushdown_fragments: RwLock::new(Vec::new()),
             stats: RwLock::new(stats),
             learned,
             accelerator,
@@ -322,6 +329,7 @@ impl Runtime {
             Statement::DropView { name } => self.drop_view(&name),
             Statement::ShowViews => self.show_views(),
             Statement::ShowSettings => self.show_settings(),
+            Statement::ShowPushdownFragments => self.show_pushdown_fragments(),
             Statement::ShowSetting { name } => self.show_setting(&name),
             Statement::ShowMaterializedViews => self.show_materialized_views(),
             Statement::SetSetting { name, value } => self.set_setting(&name, &value),
@@ -373,6 +381,7 @@ impl Runtime {
         let visible_names = output_column_names(&physical);
         self.ensure_event_analysis_ready(&physical)?;
         let execution = execute_plan(self.session, &physical)?;
+        self.record_pushdown_fragments(&physical)?;
         // The learned-stats WRITE path: each measured (binding, rows) whose
         // binding carries provenance lands in the stats catalog, AFTER the
         // result is materialized (off the query's critical path). The next
@@ -456,6 +465,9 @@ impl Runtime {
             Statement::Query(_) => {}
             Statement::ShowSettings | Statement::ShowSetting { .. } => {
                 return Ok(settings::describe_columns());
+            }
+            Statement::ShowPushdownFragments => {
+                return Ok(fragments::describe_columns());
             }
             Statement::ShowMaterializedViews => {
                 return Ok(materialized::views_describe_columns());

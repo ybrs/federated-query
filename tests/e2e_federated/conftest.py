@@ -15,9 +15,11 @@ cover.
 import os
 import shutil
 
+import duckdb
 import psycopg2
 import pytest
 
+from tests.e2e_federated import fragments
 from tests.e2e_federated import harness
 from tests.e2e_federated import known_failures
 from tests.e2e_federated import runtime as runtime_mod
@@ -102,6 +104,28 @@ def engine(fresh_engine_state):
 def oracle_registry():
     """A session cache: frozenset of table names -> Oracle."""
     return {}
+
+
+@pytest.fixture(scope="session")
+def fragment_verifier(engine):
+    """Check every distinct query the engine pushes to a source, once each.
+
+    The corpus already exercises the pushdown boundary from above: it asserts the
+    whole query's answer. This asserts the boundary itself - that each fragment
+    the engine sends is answered by its source the way the DuckDB oracle answers
+    the same query over the same data. That is a different question from the
+    corpus's, and a fragment can be wrong in ways a whole-query comparison
+    happens not to expose.
+
+    One verifier serves the session because fragments repeat across
+    distributions: the corpus emits each distinct fragment many times over and
+    this checks each one on first sight, so the cost is the number of DISTINCT
+    fragments rather than the number of variations.
+    """
+    connection = duckdb.connect(harness.oracle_source().location, read_only=True)
+    verifier = fragments.FragmentVerifier(engine.runtime(), connection)
+    yield verifier
+    connection.close()
 
 
 def _case_variation_params():

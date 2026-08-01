@@ -104,6 +104,7 @@ fn config_for(dir: &Path, sources: &[(&str, &Path)]) -> Config {
         accelerator: fq_common::AcceleratorConfig::default(),
         catalog: fq_common::CatalogConfig::default(),
         events: fq_common::EventsConfig::default(),
+        diagnostics: fq_common::DiagnosticsConfig::default(),
         source_path: Some(dir.join("config.yaml").to_string_lossy().to_string()),
     }
 }
