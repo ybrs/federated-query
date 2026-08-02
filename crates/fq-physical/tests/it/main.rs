@@ -2,6 +2,7 @@
 //! A single binary means a single link of the DataFusion/Arrow dependency
 //! stack per `cargo test`, instead of one link per suite.
 
+mod closure;
 mod dim_shipping;
 mod fragments;
 mod orient;

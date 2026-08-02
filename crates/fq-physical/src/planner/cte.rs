@@ -66,6 +66,7 @@ impl PhysicalPlanner {
         Ok(PhysicalPlan::CteScan(PhysicalCteScan {
             producer: Arc::clone(producer),
             alias: node.alias.clone(),
+            name: node.name.clone(),
         }))
     }
 

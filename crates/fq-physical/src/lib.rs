@@ -4,6 +4,7 @@
 //! `dim_shipping` pushdown rules the planner tries FIRST for every node. Ports
 //! `optimizer/{physical_planner,single_source_pushdown,dim_shipping}.py`.
 
+pub mod closure;
 pub mod dim_shipping;
 pub mod error;
 pub mod fragments;
@@ -12,6 +13,7 @@ mod relation_sql;
 pub mod single_source;
 pub mod steps;
 
+pub use closure::check_referential_closure;
 pub use dim_shipping::ShipThresholds;
 pub use error::PhysicalError;
 pub use fragments::{collect_pushdown_fragments, PushdownFragment};

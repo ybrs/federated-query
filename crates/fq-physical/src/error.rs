@@ -33,6 +33,20 @@ pub enum PhysicalError {
     #[error("CTE '{name}' is not in scope")]
     CteNotInScope { name: String },
 
+    /// A node references a qualified column no child produces. Side assignment,
+    /// join-key orientation and merge resolution all read the qualifier, so a
+    /// reference the subtree cannot answer yields wrong or empty results; the
+    /// planner fails loud instead, before anything executes.
+    #[error(
+        "plan node {node} references {reference}, which nothing beneath it \
+         produces; the subtree exposes [{}]", exposes.join(", ")
+    )]
+    UnproducibleColumn {
+        node: String,
+        reference: String,
+        exposes: Vec<String>,
+    },
+
     /// A recursive cross-source CTE the merge engine cannot render.
     #[error("recursive CTE '{name}' is not renderable for the merge engine")]
     RecursiveCteNotRenderable { name: String },

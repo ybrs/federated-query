@@ -33,7 +33,7 @@ pub(crate) use render_sql::scan_dialect;
 pub use render_sql::{
     render_remote_set_op, render_remote_set_op_canonical, render_scan_canonical, render_scan_sql,
 };
-pub use scan_spec::PARALLEL_SCAN_MIN_ROWS;
+pub use scan_spec::{variant_name, PARALLEL_SCAN_MIN_ROWS};
 pub use types::{
     AggCall, AggSelectItem, BuiltSteps, ExtraInjection, Fragment, JoinKind, Observation,
     Projection, ScanSpec, SortKey, Step, WithinGroup,

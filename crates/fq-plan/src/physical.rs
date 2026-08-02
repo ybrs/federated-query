@@ -103,6 +103,10 @@ pub struct PhysicalCte {
 pub struct PhysicalCteScan {
     pub producer: Arc<PhysicalPlan>,
     pub alias: Option<String>,
+    /// The CTE this reference resolves. A reference with no alias is written
+    /// against this name, so without it the node cannot say which relation its
+    /// columns are qualified by.
+    pub name: String,
 }
 
 /// Ships a foreign relation INTO a target source as a temp table, then runs the

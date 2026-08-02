@@ -43,7 +43,7 @@ use fq_exec::{connectors, execute_plan};
 use fq_optimize::{build_optimizer, CostModel, StatisticsCollector};
 use fq_parse::{classify_statement, parse_with_catalog, Statement};
 use fq_physical::steps::Observation;
-use fq_physical::{PhysicalPlanner, PushdownFragment, ShipThresholds};
+use fq_physical::{check_referential_closure, PhysicalPlanner, PushdownFragment, ShipThresholds};
 use fq_plan::logical::LogicalPlan;
 use fq_plan::output_column_names;
 use fq_plan::physical::PhysicalPlan;
@@ -604,6 +604,11 @@ impl Runtime {
         let mut planner = PhysicalPlanner::new(Arc::clone(&catalog), Some(Rc::clone(&cost_model)))
             .with_ship_thresholds(ship_thresholds);
         let physical = planner.plan(&substituted)?;
+        // Referential closure, before anything executes: a node referencing a
+        // qualified column no child produces would otherwise surface as an Arrow
+        // schema error naming neither the node nor the decision that dropped it.
+        // Reads only the plan, so it cannot threaten the planning budget.
+        check_referential_closure(&physical)?;
         stages.finish("physical")?;
         stages.emit_success();
         Ok((physical, applied))
