@@ -110,3 +110,8 @@ isolated-results*.jsonl
 # Per-process harness clones made by run_isolated_tests.sh.
 .test-harness-workers/
 run_all_tests.log
+.test-harness-parallel/
+run-e2e-logs/
+
+# The call-graph index and its log are build products of a run over a checkout.
+.fq-index/

@@ -128,10 +128,13 @@ cargo test --workspace -- --test-threads=4
 announce "Verify the test harness data is present"
 "${PYTHON}" -m tests.e2e_federated.verify_harness
 
-# The whole repository, collected from the root: pytest.ini's norecursedirs is
-# the only boundary and it excludes build output and vendored sibling repos, not
-# code of ours.
-announce "Python tests (whole repository, e2e included)"
-"${PYTHON}" -m pytest -q
+# The whole repository, collected from the root, as SEVERAL PROCESSES rather than
+# one: pytest.ini's norecursedirs is the only boundary and it excludes build
+# output and vendored sibling repos, not code of ours. Each process gets its own
+# copy-on-write harness clone and its own engine state, and the corpus is split
+# by position, so the processes partition the suite - every test runs exactly
+# once, none twice, none dropped. The same command the pre-commit hook runs.
+announce "Python tests (whole repository, e2e included, in parallel)"
+./run_e2e_parallel.sh
 
 printf '\n===== ALL %d STAGES PASSED =====\n' "${STAGE_NUMBER}"

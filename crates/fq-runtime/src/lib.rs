@@ -20,6 +20,7 @@ mod fragments;
 mod introspect;
 mod materialized;
 mod settings;
+mod state_store;
 mod substitute;
 mod views;
 
@@ -98,6 +99,11 @@ pub struct Runtime {
     /// (like the materialized-view store, it lives next to the config file;
     /// a path-less config raises).
     events: events::EventStoreSlot,
+    /// The guard over the SQLite file every one of those stores lives in. It is
+    /// checked at each call into the runtime; a store that vanished, was
+    /// replaced, or stopped being a database POISONS the runtime, which then
+    /// serves nothing further.
+    state_store: state_store::StateStore,
 }
 
 impl Runtime {
@@ -197,6 +203,9 @@ impl Runtime {
                 );
             }
         }
+        // Recorded LAST, so the identity every later statement is checked
+        // against is the file the subsystems above just opened (or created).
+        let state_store = state_store::StateStore::record(config)?;
         Ok(Self {
             session,
             catalog: RwLock::new(catalog),
@@ -208,6 +217,7 @@ impl Runtime {
             accelerator,
             authz: RwLock::new(acl::AclState::embedded()),
             events: std::sync::Mutex::new(None),
+            state_store,
         })
     }
 
@@ -290,10 +300,27 @@ impl Runtime {
     }
 
     /// Run one SQL statement and return its Arrow result under the query's
-    /// user-visible column names. A leading EXPLAIN short-circuits to a textual
-    /// plan WITHOUT executing. Materialized-view DDL dispatches to the store
-    /// and returns a one-row `status` table (the pg command-tag convention).
+    /// user-visible column names, with the state store checked around it.
+    ///
+    /// The check runs BEFORE the statement, so a runtime whose store is gone
+    /// refuses the work instead of failing somewhere inside it, and again after
+    /// a failure, so a statement that broke because the store vanished mid-flight
+    /// reports the fatal loss rather than whatever error the loss produced. Both
+    /// paths poison the runtime: every later call returns that same fatal error.
     pub fn execute(&self, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
+        self.state_store.check()?;
+        let result = self.run_statement(sql);
+        if result.is_err() {
+            self.state_store.check()?;
+        }
+        result
+    }
+
+    /// Route one SQL statement to its handler and return its Arrow result. A
+    /// leading EXPLAIN short-circuits to a textual plan WITHOUT executing.
+    /// Materialized-view DDL dispatches to the store and returns a one-row
+    /// `status` table (the pg command-tag convention).
+    fn run_statement(&self, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         // EXPLAIN is parsed by fq-parse into a LogicalPlan::Explain and flows the
         // ordinary pipeline; only the statement it describes decides the route,
         // so the classifier is asked about that statement rather than the wrapper.
@@ -453,7 +480,21 @@ impl Runtime {
     /// data-derived and may differ from the static DECIMAL here, but the Postgres
     /// type the wire layer maps both to (NUMERIC) is the same, so the row
     /// description stays consistent with the executed rows.
+    ///
+    /// The state store is checked around this exactly as it is around `execute`:
+    /// a lost store fails the call fatally instead of resolving a schema from
+    /// catalog state that is no longer backed by anything.
     pub fn describe(&self, sql: &str) -> Result<Vec<(String, DataType)>, RuntimeError> {
+        self.state_store.check()?;
+        let result = self.describe_statement(sql);
+        if result.is_err() {
+            self.state_store.check()?;
+        }
+        result
+    }
+
+    /// Resolve the result columns of `sql` by planning only, per `describe`.
+    fn describe_statement(&self, sql: &str) -> Result<Vec<(String, DataType)>, RuntimeError> {
         if fq_parse::explain::split(sql)?.is_some() {
             return Ok(vec![("plan".to_owned(), DataType::Text)]);
         }
@@ -730,12 +771,7 @@ fn plan_uses_event_analysis(plan: &PhysicalPlan) -> bool {
 /// and without the warning that state is indistinguishable from running with
 /// one. The override is how a programmatic config gets a catalog at all.
 fn open_stats_catalog(config: &Config) -> Result<Option<Arc<StatsCatalog>>, RuntimeError> {
-    if let Some(explicit) = std::env::var_os("FEDQ_STATS_CATALOG") {
-        let path = std::path::PathBuf::from(explicit);
-        let catalog = StatsCatalog::open(&path.to_string_lossy())?;
-        return Ok(Some(Arc::new(catalog)));
-    }
-    let Some(stats_path) = stats_sqlite_path(config) else {
+    let Some(path) = learned_catalog_path(config) else {
         tracing::warn!(
             "no learned-statistics catalog: this config has no file path to derive \
              one from. Every estimate falls back to default constants. Set \
@@ -743,8 +779,18 @@ fn open_stats_catalog(config: &Config) -> Result<Option<Arc<StatsCatalog>>, Runt
         );
         return Ok(None);
     };
-    let catalog = StatsCatalog::open(&stats_path.to_string_lossy())?;
+    let catalog = StatsCatalog::open(&path.to_string_lossy())?;
     Ok(Some(Arc::new(catalog)))
+}
+
+/// Where the learned-statistics catalog lives: the `$FEDQ_STATS_CATALOG`
+/// override when set, otherwise the stats SQLite derived from the config file.
+/// `None` for an in-memory config with neither.
+pub(crate) fn learned_catalog_path(config: &Config) -> Option<std::path::PathBuf> {
+    if let Some(explicit) = std::env::var_os("FEDQ_STATS_CATALOG") {
+        return Some(std::path::PathBuf::from(explicit));
+    }
+    stats_sqlite_path(config)
 }
 
 /// Dispatch one observation to its catalog table by provenance kind. The

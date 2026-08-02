@@ -31,8 +31,12 @@ if [ ! -d "${DATA_DIR}" ]; then
 fi
 
 echo "Starting PostgreSQL on port ${PORT} (background, log: ${LOG_FILE})"
+# max_connections is raised well above the default because the e2e suite runs as
+# many processes at once and the engine opens connections per query across six
+# PostgreSQL datasources. At the default the run dies with "sorry, too many
+# clients already", which reads like an engine failure and is not one.
 "${BIN}/pg_ctl" -D "${DATA_DIR}" -l "${LOG_FILE}" \
-  -o "-p ${PORT} -c log_statement=all -c log_min_duration_statement=0" \
+  -o "-p ${PORT} -c max_connections=2000 -c log_statement=all -c log_min_duration_statement=0" \
   -w start
 
 exists="$("${BIN}/psql" -h localhost -p "${PORT}" -U "${SUPERUSER}" -d postgres \

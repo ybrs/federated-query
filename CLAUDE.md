@@ -10,6 +10,23 @@ Never fail silently. Never fail silently. This is the most important thing we ca
 
 The code should be readable, self explained.Most of all the code should be defensive. We appreciate crashes more than silent fails.
 
+## VERIFY BEFORE YOU REPORT
+
+Reproduce a number in isolation before you explain it, and before you tell anyone
+about it. A single number from a loaded or contended run is a symptom, not a
+measurement. Ask "does this reproduce on an idle machine, on its own?" first. If
+it does not reproduce, there is nothing to explain.
+
+Do not build an explanation, a task, or an investigation on one unverified
+sample. Hours have gone into explaining numbers that were never happening again.
+
+## SAY IT SHORT
+
+Report in a few lines. State the number, what it means, what you did. No
+preamble, no restating the question, no narrating what you are about to do, no
+summary of the summary. If it takes ten paragraphs, you have not finished
+thinking. Detail belongs in taskq, not in a status message.
+
 ## TOP PRIORITY : an invalid query MUST raise. Answering one is an EPIC FAIL.
 
 Returning rows for an invalid query is an EPIC FAIL. It is WORSE than a silent

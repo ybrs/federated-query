@@ -38,7 +38,14 @@ _REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
 
-HARNESS_ROOT = os.path.join(_REPO_ROOT, ".test-harness")
+# The harness one process reads. FEDQ_HARNESS_ROOT points a process at a private
+# clone of it, which is what lets several test processes run at once: each gets
+# its own DuckDB files (the engine opens them read-write and DuckDB locks a file
+# exclusively) and its own engine state beside its own config. The PostgreSQL
+# schemas are read-only and stay shared. Unset, this is the one built harness.
+HARNESS_ROOT = os.environ.get(
+    "FEDQ_HARNESS_ROOT", os.path.join(_REPO_ROOT, ".test-harness")
+)
 CONFIG_PATH = os.path.join(HARNESS_ROOT, "config.yaml")
 
 DUCK_SCHEMA = "main"

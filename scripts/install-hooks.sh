@@ -130,11 +130,17 @@ cargo test --workspace --manifest-path "$root/Cargo.toml" -- --test-threads=4 \
 cargo build --release -p fedq-py --manifest-path "$root/Cargo.toml" \
     || block "cargo build --release -p fedq-py" "The extension the e2e suite imports could not be built, so the suite would test a STALE engine."
 
-# `-p no:cacheprovider` keeps the hook from writing .pytest_cache mid-commit.
-# Collection errors exit non-zero here, so a suite that dies at import BLOCKS
-# rather than reporting zero failures.
-( cd "$root" && "$python" -m pytest -q -p no:cacheprovider ) \
-    || block "pytest e2e suite" "e2e failures or collection errors above. A collection error means the suite did not run - that is a failure, not a pass."
+# The SAME suite run_all_tests.sh runs, as several processes instead of one. Each
+# gets its own copy-on-write harness clone and therefore its own engine state, and
+# the corpus is split by position, so the processes partition the suite rather
+# than sampling it - every test runs exactly once. Sequentially this is about 45
+# minutes and in parallel about 20, and it is paid on EVERY commit.
+#
+# A non-zero exit here means a real failure or a collection error; a collection
+# error means the suite did not run, which is a failure and not a pass. Each
+# process writes its whole output to run-e2e-logs/, so the detail survives.
+( cd "$root" && ./run_e2e_parallel.sh ) \
+    || block "pytest e2e suite" "e2e failures or collection errors. Read the per-process logs in run-e2e-logs/ - a collection error means the suite did not run, which is a failure, not a pass."
 
 exec "$root/scripts/comment-gate/gate.sh"
 EOF

@@ -1,0 +1,8 @@
+/target
+# The index and its log are build products of a run over a checkout, not source.
+fq-index*.sqlite
+fq-index*.sqlite-wal
+fq-index*.sqlite-shm
+fq-index*.log
+target/
+tests/fixture/target/

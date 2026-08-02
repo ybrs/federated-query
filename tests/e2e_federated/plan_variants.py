@@ -28,6 +28,9 @@ same work; the estimates that led there are not part of what is executed.
 
 import re
 
+import os
+import time
+
 import pyarrow as pa
 
 from tests.e2e_federated import known_plan_disagreements
@@ -109,6 +112,12 @@ class VariantRun:
         self.unplannable = 0
         self.known_disagreements = 0
         self.failures = []
+        self.started = time.time()
+        # Where the progress lines go. The runner points every process at its own
+        # log; unset, they go beside the suite so a single run is still visible.
+        self.progress_path = os.environ.get(
+            "FEDQ_PROGRESS_LOG", "plan-variant-progress.log"
+        )
 
     def __enter__(self):
         """Apply this variant's settings to the runtime."""
@@ -128,6 +137,7 @@ class VariantRun:
         produce, which the corpus has already executed and compared.
         """
         self.considered += 1
+        self._report_progress()
         shape = self._fingerprint(sql)
         if shape is None:
             return
@@ -139,6 +149,27 @@ class VariantRun:
             self.name, case_name, distribution_name
         )
         self._compare_one(sql, oracle_table, label, order_sensitive, reason)
+
+    def _report_progress(self):
+        """Append a progress line every few thousand queries.
+
+        A variant is ONE test that walks the whole corpus, so pytest prints
+        nothing at all until it finishes - for twenty minutes a running process
+        and a hung one look identical. This writes where it has got to, so the
+        log answers that.
+        """
+        if self.considered % 5000 != 0:
+            return
+        elapsed = time.time() - self.started
+        line = (
+            "%s progress: %d queries, %d plans executed, %d already covered, "
+            "%.0fs elapsed\n"
+            % (self.name, self.considered, self.executed, self.already_covered,
+               elapsed)
+        )
+        handle = open(self.progress_path, "a")
+        handle.write(line)
+        handle.close()
 
     def _fingerprint(self, sql):
         """This variant's plan shape, or None when it cannot plan the query.

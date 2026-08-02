@@ -184,6 +184,9 @@ impl Runtime {
     /// The superuser flag is resolved from the store (authoritative), never
     /// trusted from the wire.
     pub fn set_principal(&self, name: &str) -> Result<(), RuntimeError> {
+        // The superuser flag and grants are read from the state store, so a
+        // runtime whose store is gone cannot resolve a principal at all.
+        self.state_store.check()?;
         let auth_on = !self
             .config
             .read()

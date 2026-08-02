@@ -12,5 +12,6 @@ mod event_dataset;
 mod materialized_views;
 mod parquet_runtime;
 mod settings;
+mod state_store;
 mod substitution;
 mod views;

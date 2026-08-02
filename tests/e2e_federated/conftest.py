@@ -201,7 +201,30 @@ def pytest_generate_tests(metafunc):
     if "variation" not in metafunc.fixturenames:
         return
     argvalues, ids = _case_variation_params()
+    argvalues, ids = _this_shard(argvalues, ids)
     metafunc.parametrize("case,variation", argvalues, ids=ids)
+
+
+def _this_shard(argvalues, ids):
+    """Return the slice of the matrix this process owns.
+
+    Several processes run the corpus at once, each over its own harness clone.
+    FEDQ_SHARDS says how many there are and FEDQ_SHARD which this is; every
+    (case, distribution) belongs to exactly one, by position, so the shards
+    partition the matrix rather than sampling it. Unset, one process owns all of
+    it.
+    """
+    shards = int(os.environ.get("FEDQ_SHARDS") or "1")
+    shard = int(os.environ.get("FEDQ_SHARD") or "0")
+    if shards <= 1:
+        return argvalues, ids
+    kept_values = []
+    kept_ids = []
+    for index, value in enumerate(argvalues):
+        if index % shards == shard:
+            kept_values.append(value)
+            kept_ids.append(ids[index])
+    return kept_values, kept_ids
 
 
 def pytest_sessionfinish(session, exitstatus):

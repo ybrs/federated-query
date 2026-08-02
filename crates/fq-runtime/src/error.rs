@@ -68,6 +68,17 @@ pub enum RuntimeError {
     #[error("stats catalog error: {0}")]
     Stats(#[from] fq_catalog::StatsError),
 
+    /// The SQLite file this runtime keeps its engine state in vanished, was
+    /// replaced, or stopped being a database while the runtime held it open.
+    /// The learned statistics, persisted settings, registered datasources,
+    /// materialized views, users and event datasets it carried all steer plan
+    /// choice and access, so their loss puts the runtime in an unknown state:
+    /// it is poisoned and every later call returns this same error. Every other
+    /// variant describes ONE failed statement; this one says the runtime is
+    /// finished, which is how a caller tells the two apart.
+    #[error("{0}")]
+    StateStoreLost(String),
+
     /// Planning blew its wall-clock budget (`optimizer.planning_budget_ms`).
     /// Planning is O(metadata) by design; the message reports every completed
     /// stage's timing so the offender is visible. Deep kills inside statistics

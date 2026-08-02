@@ -1,0 +1,8 @@
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2021"
+
+# The crate the indexer test builds an index of. Its own workspace so neither
+# the engine workspace nor fq-index's picks it up as a member.
+[workspace]

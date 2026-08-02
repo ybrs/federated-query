@@ -5,6 +5,12 @@
 # until the Rust engine passes the full gate, then it is deleted.
 resolver = "2"
 members = ["crates/*", "tools/fq-lint"]
+# fq-index embeds rust-analyzer (the ra_ap_* crates, ~90 packages pinned to one
+# rustc release) to get real name resolution and type inference. Sharing this
+# workspace would share Cargo.lock, so an indexing tool could change which
+# versions the ENGINE compiles. It keeps its own workspace and its own lock;
+# the engine's dependency graph is unaffected by it.
+exclude = ["tools/fq-index"]
 
 [workspace.package]
 edition = "2021"

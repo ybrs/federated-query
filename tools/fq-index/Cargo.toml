@@ -1,0 +1,60 @@
+[package]
+name = "fq-index"
+version = "0.1.0"
+edition = "2021"
+
+# The workspace call-graph index. Loads this repository and its whole resolved
+# dependency graph - including the sysroot sources - into rust-analyzer as a
+# library, walks every function body, and writes the resolved call edges to a
+# SQLite database, so "what can reach X" is answered by an edge walk instead of
+# by a string search.
+#
+# rust-analyzer is used because it is the only Rust front end here that carries
+# real name resolution and type inference: it resolves `receiver.method()` to
+# the method that actually runs, follows trait impls, expands proc macros, and
+# reads dependency and std sources. A syntax-only walk would give a better grep
+# while implying a completeness it does not have.
+#
+# This is its own workspace on purpose. The ra_ap_* crates are ~90 packages
+# pinned to one rustc release; unifying them into the engine's Cargo.lock would
+# let an indexing tool change what the engine compiles.
+[workspace]
+
+[workspace.lints.rust]
+# Same house rule as the engine workspace: warnings are errors.
+warnings = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Every fallible function returns a typed error; an `# Errors` prose section
+# would only restate it.
+missing_errors_doc = "allow"
+# Same for `# Panics`: the invariants are asserted at the call site.
+missing_panics_doc = "allow"
+# Row counts and offsets move between i64 (what SQLite stores) and u32/usize
+# (what rust-analyzer hands out) throughout; the values are ids and line
+# numbers, far below any precision limit.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+
+[dependencies]
+# Pinned exactly: the ra_ap_* API changes between releases, so a floating
+# version would silently change what the index resolves.
+ra_ap_base_db = "=0.0.344"
+ra_ap_hir = "=0.0.344"
+ra_ap_ide_db = "=0.0.344"
+ra_ap_load-cargo = "=0.0.344"
+ra_ap_paths = "=0.0.344"
+ra_ap_project_model = "=0.0.344"
+ra_ap_syntax = "=0.0.344"
+ra_ap_vfs = "=0.0.344"
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
