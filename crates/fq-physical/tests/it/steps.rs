@@ -61,6 +61,22 @@ impl DataSource for MockSource {
     }
 }
 
+/// Everything a full SQL server evaluates: the relational constructs the pushdown
+/// may place in a pushed query. INTERSECT ALL / EXCEPT ALL and SHIP_TARGET are
+/// left out so a test names them exactly where it needs them.
+fn server_capabilities() -> Vec<DataSourceCapability> {
+    vec![
+        DataSourceCapability::Aggregations,
+        DataSourceCapability::Joins,
+        DataSourceCapability::WindowFunctions,
+        DataSourceCapability::Subqueries,
+        DataSourceCapability::Cte,
+        DataSourceCapability::Distinct,
+        DataSourceCapability::Limit,
+        DataSourceCapability::OrderBy,
+    ]
+}
+
 /// A two-source catalog: `pg.public` (orders, customer) and `duck.main`
 /// (lineitem, part). Both sources support JOINS.
 fn catalog() -> Arc<Catalog> {
@@ -107,11 +123,11 @@ fn catalog() -> Arc<Catalog> {
     );
     catalog.register_datasource(Arc::new(MockSource {
         name: "pg".to_string(),
-        capabilities: vec![DataSourceCapability::Joins],
+        capabilities: server_capabilities(),
     }));
     catalog.register_datasource(Arc::new(MockSource {
         name: "duck".to_string(),
-        capabilities: vec![DataSourceCapability::Joins],
+        capabilities: server_capabilities(),
     }));
     Arc::new(catalog)
 }

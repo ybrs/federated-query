@@ -83,6 +83,26 @@ Only ascii edits are allowed.
    case raises the configured budget explicitly and says why. Never "fix" a
    budget kill by raising the budget - fix the O(data) work it caught.
 
+   THE BUDGET IS A HARD REQUIREMENT AND A BUDGET KILL IS ALWAYS A PLANNING
+   DEFECT. Planning a query over the test fixtures - a few tables of a handful of
+   rows - must finish well inside 100ms on a 12-core machine, in a debug build,
+   with the test suite running alongside it. It is not close: a plan that spends
+   87ms in the optimizer over toy data is broken, and the budget catching it is
+   the budget doing its job.
+
+   So a budget kill is NEVER explained away as environment. Not "the machine was
+   loaded", not "it is a debug build", not "the tests run in parallel", not
+   flakiness to be re-run. Every one of those is a way of saying the planner is
+   too slow and declining to fix it. The permitted responses are to make planning
+   faster or to prove the work was O(data) and remove it. Measuring CPU time
+   instead of wall clock, raising the limit for tests, or marking the test flaky
+   are all the same forbidden move: they delete the signal rather than the cost.
+
+   The suite runs `cargo test` with `--test-threads=4` so the runner leaves
+   headroom on a 12-core box. That is a bound on the RUNNER, so the budget
+   measures the planner rather than the load. It is not licence to plan slowly up
+   to the new headroom.
+
 2. NEVER COMPILE DUCKDB IN CARGO. The `duckdb` crate's `bundled` feature compiles
    the C++ amalgamation at the active cargo profile's opt level: a dev build is an
    -O0 DuckDB (~10x slower execution) and a release build costs ~10min of C++ per
@@ -371,6 +391,23 @@ make build         # release build of the whole workspace
 That is the command. It runs every check there is - preflight, release build,
 fmt, clippy, all three linters, the whole Rust workspace, and the whole Python
 suite including e2e - and stops at the first failure naming the stage.
+
+## NEVER TRUNCATE A TEST RUN'S OUTPUT. READ THE LOG.
+
+`run_all_tests.sh` writes every line it produces to `run_all_tests.log`. Read
+that file. Do NOT pipe a test run through `tail`, `head`, or a grep that keeps
+only the summary, and do not do it to a pytest or cargo run either - redirect to
+a file and read the file.
+
+A run takes about twenty minutes. Truncating its output discards the failure
+detail at the moment it is produced, so the only way to learn what broke is to
+run the whole thing again and hope to keep the right lines next time. Two or
+three of those cycles is an hour spent re-deriving output that already existed.
+This has happened repeatedly and it is not a style preference: the run is
+expensive, so its output is evidence, and evidence is kept.
+
+The same applies to any long command whose failure you might need to explain: a
+corpus walk, a build, a benchmark. Send it to a file. Grep the file.
 
 ## Code Formatting and Type Checking
 

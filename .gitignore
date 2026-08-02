@@ -109,3 +109,4 @@ isolated-results*.jsonl
 
 # Per-process harness clones made by run_isolated_tests.sh.
 .test-harness-workers/
+run_all_tests.log

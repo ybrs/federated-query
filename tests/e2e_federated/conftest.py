@@ -22,6 +22,7 @@ import pytest
 from tests.e2e_federated import fragments
 from tests.e2e_federated import harness
 from tests.e2e_federated import known_failures
+from tests.e2e_federated import plan_variants
 from tests.e2e_federated import runtime as runtime_mod
 from tests.e2e_federated.cases import all_cases
 from tests.e2e_federated.cases import case_table_specs
@@ -126,6 +127,39 @@ def fragment_verifier(engine):
     verifier = fragments.FragmentVerifier(engine.runtime(), connection)
     yield verifier
     connection.close()
+
+
+@pytest.fixture(scope="session")
+def default_plan_shapes(engine):
+    """The plan every corpus query gets under the suite's own settings.
+
+    Taken once, before any variant changes a setting, and shared by every variant
+    test. A variant then decides whether it changed a query's plan by comparing
+    against this, which costs one EXPLAIN rather than the two `SET` statements
+    that toggling back and forth would cost - and a `SET` costs about what
+    executing a query costs, so doing it per query would dominate the run.
+    """
+    runtime = engine.runtime()
+    shapes = {}
+    for case in all_cases():
+        if "expect_error" in case:
+            continue
+        specs = case_table_specs(case)
+        for variation in harness.variations(specs, case.get("min_sources", 1)):
+            _record_shape(engine, runtime, case, variation, shapes)
+    return shapes
+
+
+def _record_shape(engine, runtime, case, variation, shapes):
+    """Record one query's default plan shape, or leave it out if it cannot plan."""
+    environment = runtime_mod.open_variation(engine, variation)
+    label = case["name"] + "[" + variation.name + "]"
+    try:
+        shapes[label] = plan_variants.fingerprint(
+            runtime, environment.render(case["query"])
+        )
+    except RuntimeError:
+        return
 
 
 def _case_variation_params():

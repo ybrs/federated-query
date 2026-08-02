@@ -23,7 +23,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use fq_catalog::datasource::DataSourceCapability;
+use fq_catalog::datasource::{DataSource, DataSourceCapability};
 use fq_catalog::Catalog;
 use fq_emit::{
     clauses, quote_ident, render_canonical, render_expr, to_source_sql, EmitError, SelectPieces,
@@ -36,8 +36,9 @@ use fq_plan::logical::{
 };
 use fq_plan::physical::{ColumnAliasMap, PhysicalRemoteQuery};
 
-use crate::planner::datasource_kind_of;
+use crate::capability::declares;
 use crate::planner::set_op as set_op_planner;
+use crate::planner::{datasource_kind_of, expression_has_window};
 use crate::relation_sql::{cte_ref_sql, derived_table, table_ref};
 use crate::steps::scan_dialect;
 
@@ -110,6 +111,13 @@ struct PushContext<'a> {
     // ---- CTE definitions ----
     ctes: Vec<CteDef>,
     visible_ctes: Vec<String>,
+
+    /// The capabilities the accumulated clauses ask of the target source. Filled
+    /// while absorbing - where the source is often still unclaimed - and checked
+    /// ONCE in `finish`, where the source is resolved. Collecting rather than
+    /// asking at absorb time is what keeps a clause absorbed before its base scan
+    /// from being declined against a source nobody has named yet.
+    required: Vec<DataSourceCapability>,
 }
 
 impl<'a> PushContext<'a> {
@@ -143,6 +151,22 @@ impl<'a> PushContext<'a> {
             scan_names: None,
             ctes: Vec::new(),
             visible_ctes: Vec::new(),
+            required: Vec::new(),
+        }
+    }
+
+    /// Record that the query being built needs `capability` from its source.
+    fn require(&mut self, capability: DataSourceCapability) {
+        if !self.required.contains(&capability) {
+            self.required.push(capability);
+        }
+    }
+
+    /// Adopt a sub-render's requirements: its text is embedded verbatim in this
+    /// query, so the one source that runs the query must satisfy both.
+    fn adopt_requirements(&mut self, inner: &PushContext) {
+        for capability in &inner.required {
+            self.require(*capability);
         }
     }
 
@@ -220,7 +244,8 @@ impl SingleSourcePushdown {
     /// Render a single-source subtree to canonical Postgres SQL with base scans
     /// named for the merge engine (the cross-source LATERAL / recursive-CTE path).
     /// Outer/correlation column refs are kept verbatim. `None` when the subtree is
-    /// not renderable as one query.
+    /// not renderable as one query. No capability is consulted: the text produced
+    /// here runs in the merge engine, not on a source.
     pub fn render_correlated_sql<'a>(
         &self,
         node: &'a LogicalPlan,
@@ -292,6 +317,7 @@ impl SingleSourcePushdown {
     ) -> Result<bool, EmitError> {
         ctx.limit = limit.limit.map(clamp_i64);
         ctx.offset = clamp_i64(limit.offset);
+        require_limit(ctx);
         self.absorb(&limit.input, ctx)
     }
 
@@ -308,6 +334,7 @@ impl SingleSourcePushdown {
             nulls,
             &CANONICAL_SOURCE_RESOLVER,
         )?;
+        require_order_by(ctx);
         self.absorb(&sort.input, ctx)
     }
 
@@ -329,6 +356,7 @@ impl SingleSourcePushdown {
         }
         ctx.distinct = projection.distinct;
         ctx.distinct_on.clone_from(&projection.distinct_on);
+        require_distinct(ctx);
         if has_star(&projection.expressions) {
             return Ok(false);
         }
@@ -359,6 +387,7 @@ impl SingleSourcePushdown {
         };
         ctx.distinct = outer.distinct || inner.distinct;
         ctx.distinct_on.clone_from(&inner.distinct_on);
+        require_distinct(ctx);
         set_select(&substituted, &outer.aliases, ctx)?;
         self.absorb(&inner.input, ctx)
     }
@@ -383,6 +412,7 @@ impl SingleSourcePushdown {
         ctx: &mut PushContext<'a>,
     ) -> Result<bool, EmitError> {
         ctx.has_aggregate = true;
+        ctx.require(DataSourceCapability::Aggregations);
         if ctx.select_exprs.is_empty() {
             set_select(&aggregate.aggregates, &aggregate.output_names, ctx)?;
         }
@@ -483,6 +513,7 @@ impl SingleSourcePushdown {
             ctx.where_terms
                 .push(format!("{keyword}(SELECT 1 FROM {right_ref} WHERE {cond})"));
             ctx.has_join = true;
+            ctx.require(DataSourceCapability::Subqueries);
             return Ok(true);
         }
         if contributes_columns(join) {
@@ -513,6 +544,7 @@ impl SingleSourcePushdown {
             .push(format!("{prefix} JOIN LATERAL {right_ref} ON TRUE"));
         ctx.has_join = true;
         ctx.has_derived_columns = true;
+        ctx.require(DataSourceCapability::Subqueries);
         Ok(true)
     }
 
@@ -531,6 +563,7 @@ impl SingleSourcePushdown {
             body_sql,
         });
         ctx.has_cte = true;
+        ctx.require(DataSourceCapability::Cte);
         if node.recursive {
             ctx.has_recursive_cte = true;
         }
@@ -559,6 +592,8 @@ impl SingleSourcePushdown {
             ctx.datasource.clone_from(&inner.datasource);
         }
         let body = render(&inner)?;
+        ctx.adopt_requirements(&inner);
+        ctx.require(DataSourceCapability::Subqueries);
         Ok(Some(derived_table(&body, &node.alias)))
     }
 
@@ -581,6 +616,8 @@ impl SingleSourcePushdown {
         }
         let alias = derived_alias(ctx);
         let body = render(&inner)?;
+        ctx.adopt_requirements(&inner);
+        ctx.require(DataSourceCapability::Subqueries);
         Ok(Some(derived_table(&body, &alias)))
     }
 
@@ -629,6 +666,7 @@ impl SingleSourcePushdown {
             return Ok(None);
         }
         let alias = derived_alias(ctx);
+        ctx.require(DataSourceCapability::Subqueries);
         Ok(Some(derived_table(
             &set_op_sql(node, &left, &right),
             &alias,
@@ -677,6 +715,7 @@ impl SingleSourcePushdown {
                 }
             }
         }
+        ctx.adopt_requirements(&inner);
         Ok(Some(render(&inner)?))
     }
 
@@ -751,7 +790,10 @@ impl SingleSourcePushdown {
     }
 
     /// Resolve the connection, render SQL, and build the physical node - or decline
-    /// (`Ok(None)`) when the source is unresolved or lacks JOIN capability.
+    /// (`Ok(None)`) when the source is unresolved, or does not declare every
+    /// capability the accumulated clauses ask of it. This is the ONE point where
+    /// the island's requirements are answered, because it is the first point where
+    /// the target source is known.
     fn finish(
         &self,
         ctx: &PushContext,
@@ -764,7 +806,7 @@ impl SingleSourcePushdown {
         let Some(source) = self.catalog.get_datasource(&datasource) else {
             return Ok(None);
         };
-        if !source.supports_capability(DataSourceCapability::Joins) {
+        if !source_accepts(source.as_ref(), &ctx.required) {
             return Ok(None);
         }
         let mut column_alias_map = ctx.column_aliases.clone();
@@ -811,6 +853,23 @@ impl SingleSourcePushdown {
             None
         }
     }
+}
+
+/// Whether `source` accepts this island. It must declare JOINS - the island is
+/// one server-side query and the pass has always demanded that of a push target -
+/// plus every capability the absorbed clauses collected. A capability the source
+/// does not name declines the island, so the subtree lowers in the coordinator
+/// rather than being handed a construct the source never claimed to run.
+fn source_accepts(source: &dyn DataSource, required: &[DataSourceCapability]) -> bool {
+    if !declares(Some(source), DataSourceCapability::Joins) {
+        return false;
+    }
+    for capability in required {
+        if !declares(Some(source), *capability) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Whether two datasource names identify the same source. A None name matches
@@ -860,6 +919,7 @@ fn absorb_aggregate_scan<'a>(scan: &'a Scan, ctx: &mut PushContext<'a>) -> Resul
     )?;
     ctx.from_clause = Some(scan_ref(scan, ctx));
     ctx.has_aggregate = true;
+    ctx.require(DataSourceCapability::Aggregations);
     Ok(true)
 }
 
@@ -988,6 +1048,7 @@ fn adopt_scan_order(scan: &Scan, ctx: &mut PushContext) {
     let nulls = scan.order_by_nulls.as_deref().unwrap_or(&[]);
     ctx.order_clause = clauses::order_by(keys, ascending, nulls, &CANONICAL_SOURCE_RESOLVER)
         .expect("folded scan ORDER BY keys render without a subquery");
+    require_order_by(ctx);
 }
 
 /// Adopt a scan's folded LIMIT unless a Limit node already set one.
@@ -997,6 +1058,7 @@ fn adopt_scan_limit(scan: &Scan, ctx: &mut PushContext) {
             ctx.limit = Some(clamp_i64(limit));
         }
     }
+    require_limit(ctx);
 }
 
 /// Adopt a scan's folded OFFSET unless a Limit node already set one.
@@ -1004,12 +1066,42 @@ fn adopt_scan_offset(scan: &Scan, ctx: &mut PushContext) {
     if scan.offset != 0 && ctx.offset == 0 {
         ctx.offset = clamp_i64(scan.offset);
     }
+    require_limit(ctx);
 }
 
 /// Adopt a scan's folded DISTINCT unless already set above.
 fn adopt_scan_distinct(scan: &Scan, ctx: &mut PushContext) {
     if scan.distinct && !ctx.distinct {
         ctx.distinct = true;
+    }
+    require_distinct(ctx);
+}
+
+/// Ask the source for LIMIT once the context carries a row bound or an offset.
+fn require_limit(ctx: &mut PushContext) {
+    if ctx.limit.is_some() || ctx.offset != 0 {
+        ctx.require(DataSourceCapability::Limit);
+    }
+}
+
+/// Ask the source for ORDER BY once the context carries an order clause.
+fn require_order_by(ctx: &mut PushContext) {
+    if ctx.order_clause.is_some() {
+        ctx.require(DataSourceCapability::OrderBy);
+    }
+}
+
+/// Ask the source for DISTINCT once the context carries either DISTINCT form.
+fn require_distinct(ctx: &mut PushContext) {
+    if ctx.distinct || ctx.distinct_on.is_some() {
+        ctx.require(DataSourceCapability::Distinct);
+    }
+}
+
+/// Ask the source for WINDOW FUNCTIONS when any SELECT item computes one.
+fn require_window(exprs: &[Expr], ctx: &mut PushContext) {
+    if exprs.iter().any(expression_has_window) {
+        ctx.require(DataSourceCapability::WindowFunctions);
     }
 }
 
@@ -1019,6 +1111,7 @@ fn adopt_scan_distinct(scan: &Scan, ctx: &mut PushContext) {
 /// (qualifier, column) -> output-name mapping. REPLACES the SELECT list wholesale
 /// (matching Python `context.select_items = items`).
 fn set_select(exprs: &[Expr], names: &[String], ctx: &mut PushContext) -> Result<(), EmitError> {
+    require_window(exprs, ctx);
     let mut seen: HashSet<String> = HashSet::new();
     let mut items = Vec::with_capacity(exprs.len());
     let mut output_names = Vec::with_capacity(exprs.len());

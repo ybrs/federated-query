@@ -602,7 +602,8 @@ impl Runtime {
         // governs whether a dimension ships.
         let ship_thresholds = ShipThresholds::from_config(&config.optimizer);
         let mut planner = PhysicalPlanner::new(Arc::clone(&catalog), Some(Rc::clone(&cost_model)))
-            .with_ship_thresholds(ship_thresholds);
+            .with_ship_thresholds(ship_thresholds)
+            .with_single_source_pushdown(config.optimizer.enable_single_source_pushdown);
         let physical = planner.plan(&substituted)?;
         // Referential closure, before anything executes: a node referencing a
         // qualified column no child produces would otherwise surface as an Arrow

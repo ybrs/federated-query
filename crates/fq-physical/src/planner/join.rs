@@ -15,6 +15,7 @@ use fq_plan::physical::{
 
 use super::orient::{larger_estimated_side, Side};
 use super::PhysicalPlanner;
+use crate::capability::source_declares;
 use crate::error::PhysicalError;
 use crate::single_source::same_source;
 
@@ -130,10 +131,11 @@ impl PhysicalPlanner {
         if !same_source(Some(&left_scan.datasource), Some(&right_scan.datasource)) {
             return false;
         }
-        let Some(datasource) = self.catalog().get_datasource(&left_scan.datasource) else {
-            return false;
-        };
-        if !datasource.supports_capability(DataSourceCapability::Joins) {
+        if !source_declares(
+            self.catalog(),
+            &left_scan.datasource,
+            DataSourceCapability::Joins,
+        ) {
             return false;
         }
         if left_scan.group_by.is_some() || left_scan.aggregates.is_some() {

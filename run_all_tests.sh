@@ -29,6 +29,21 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${ROOT}"
 
+# EVERY line this run produces goes to run_all_tests.log, in full.
+#
+# READ THE LOG. Do not pipe this script through `tail`, `head` or a grep that
+# keeps only the summary. A run takes about twenty minutes, and truncating its
+# output means the failure detail is thrown away at the exact moment it is
+# produced - so the only way to see what broke is to run it again, twenty
+# minutes later, and hope to keep the right lines that time. That has cost this
+# project multiple hours. The log is written for you; open it.
+#
+# The log is overwritten each run: it describes the run that just happened, not
+# a history. Copy it elsewhere if you need to compare two runs.
+RUN_LOG="${ROOT}/run_all_tests.log"
+exec > >(tee "${RUN_LOG}") 2>&1
+echo "full output of this run: ${RUN_LOG}"
+
 VENV="${ROOT}/venv"
 PYTHON="${VENV}/bin/python3"
 PG_ISREADY="${ROOT}/postgres-17/bin/pg_isready"
@@ -101,7 +116,11 @@ announce "Linters (codepoints, flake8, fq-lint)"
 make lint
 
 announce "Rust tests (whole workspace)"
-cargo test --workspace
+# FOUR test threads, not one per core. The planning budget is wall clock, so a
+# machine saturated by its own test runner measures the runner, not the planner.
+# Four leaves headroom on a 12-core box; a budget kill under this load is a
+# statement about the planner and must be fixed there.
+cargo test --workspace -- --test-threads=4
 
 # The suite READS its datasources; it never creates them. If the data the tests
 # are about to open is missing or short, this dies naming every source rather

@@ -11,6 +11,7 @@ use fq_plan::physical::{
 };
 
 use super::PhysicalPlanner;
+use crate::capability::declares;
 use crate::error::PhysicalError;
 use crate::single_source::same_source;
 
@@ -71,10 +72,7 @@ pub(crate) fn source_evaluates_set_op(
     if set_op.distinct || matches!(set_op.kind, SetOpKind::Union) {
         return true;
     }
-    match source {
-        Some(source) => source.supports_capability(DataSourceCapability::IntersectExceptAll),
-        None => false,
-    }
+    declares(source, DataSourceCapability::IntersectExceptAll)
 }
 
 /// The pushed set operation over two branches of one source.

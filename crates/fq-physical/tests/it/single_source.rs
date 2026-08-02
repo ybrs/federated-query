@@ -78,6 +78,22 @@ impl DataSource for MockSource {
     }
 }
 
+/// Everything a full SQL server evaluates: the relational constructs the pushdown
+/// may place in a pushed query. INTERSECT ALL / EXCEPT ALL and SHIP_TARGET are
+/// left out so a test names them exactly where it needs them.
+fn server_capabilities() -> Vec<DataSourceCapability> {
+    vec![
+        DataSourceCapability::Aggregations,
+        DataSourceCapability::Joins,
+        DataSourceCapability::WindowFunctions,
+        DataSourceCapability::Subqueries,
+        DataSourceCapability::Cte,
+        DataSourceCapability::Distinct,
+        DataSourceCapability::Limit,
+        DataSourceCapability::OrderBy,
+    ]
+}
+
 /// A two-source catalog: `pg.public` (orders, customer) and `duck.main`
 /// (lineitem). Both support JOINS.
 fn catalog() -> Arc<Catalog> {
@@ -117,12 +133,12 @@ fn catalog() -> Arc<Catalog> {
     );
     catalog.register_datasource(Arc::new(MockSource {
         name: "pg".to_string(),
-        capabilities: vec![DataSourceCapability::Joins],
+        capabilities: server_capabilities(),
         render_dialect: RenderDialect::Postgres,
     }));
     catalog.register_datasource(Arc::new(MockSource {
         name: "duck".to_string(),
-        capabilities: vec![DataSourceCapability::Joins],
+        capabilities: server_capabilities(),
         render_dialect: RenderDialect::DuckDb,
     }));
     Arc::new(catalog)
@@ -154,7 +170,7 @@ fn dialect_catalog(render_dialect: RenderDialect) -> Arc<Catalog> {
     );
     catalog.register_datasource(Arc::new(MockSource {
         name: "src".to_string(),
-        capabilities: vec![DataSourceCapability::Joins],
+        capabilities: server_capabilities(),
         render_dialect,
     }));
     Arc::new(catalog)
@@ -822,4 +838,184 @@ fn pushed_island_is_transpiled_to_the_source_dialect() {
          ON (\"orders\".\"cust_id\" = \"customer\".\"id\") \
          WHERE (\"customer\".\"nation\" <> 'FRANCE')"
     );
+}
+
+// ==========================================================================
+// per-capability gate: a construct only reaches a source that declares it
+//
+// Each case builds the SAME subtree twice - once against a `pg` declaring every
+// server capability, once against a `pg` missing exactly the one the construct
+// needs - and pins that the island is built in the first case and declined in
+// the second. A decline is structural: the planner lowers the subtree in the
+// coordinator instead.
+// ==========================================================================
+
+/// The `pg`/`duck` catalog with `pg` declaring every server capability EXCEPT
+/// `withheld`, so a construct needing it has nothing else to fail on.
+fn catalog_without(withheld: DataSourceCapability) -> Arc<Catalog> {
+    let mut capabilities = server_capabilities();
+    capabilities.retain(|capability| *capability != withheld);
+    let shared = catalog();
+    let mut catalog = Arc::try_unwrap(shared).unwrap_or_else(|_| panic!("sole owner"));
+    catalog.register_datasource(Arc::new(MockSource {
+        name: "pg".to_string(),
+        capabilities,
+        render_dialect: RenderDialect::Postgres,
+    }));
+    Arc::new(catalog)
+}
+
+/// A same-source join of orders and customer, the base every gate case pushes.
+fn orders_join_customer() -> LogicalPlan {
+    join(
+        LogicalPlan::Scan(Box::new(scan(
+            "pg",
+            "public",
+            "orders",
+            &["id", "cust_id", "region", "amount"],
+        ))),
+        LogicalPlan::Scan(Box::new(scan("pg", "public", "customer", &["id"]))),
+        JoinType::Inner,
+        eq(col("orders", "cust_id"), col("customer", "id")),
+    )
+}
+
+/// `COUNT(1)` as an aggregate call.
+fn count_star() -> Expr {
+    Expr::FunctionCall {
+        function_name: "COUNT".to_string(),
+        args: vec![Expr::Literal {
+            value: LiteralValue::Integer(1),
+            data_type: DataType::Integer,
+        }],
+        is_aggregate: true,
+        distinct: false,
+        within_group_key: None,
+        within_group_desc: false,
+        filter: None,
+    }
+}
+
+/// Assert `node` pushes against the full catalog and declines against a `pg`
+/// that withholds `capability`.
+fn assert_gated_on(node: &LogicalPlan, capability: DataSourceCapability, sql_marker: &str) {
+    let full = try_build(&catalog(), node).expect("a declaring source takes the construct");
+    assert!(
+        full.sql.contains(sql_marker),
+        "the pushed SQL carries the gated construct: {}",
+        full.sql
+    );
+    assert!(
+        try_build(&catalog_without(capability), node).is_none(),
+        "a source that does not declare {capability:?} must not receive the construct"
+    );
+}
+
+#[test]
+fn aggregations_gate_a_grouped_island() {
+    let node = LogicalPlan::Aggregate(Aggregate {
+        input: Box::new(orders_join_customer()),
+        group_by: vec![typed_col("orders", "region", DataType::Varchar)],
+        aggregates: vec![
+            typed_col("orders", "region", DataType::Varchar),
+            count_star(),
+        ],
+        output_names: vec!["region".to_string(), "cnt".to_string()],
+        grouping_sets: None,
+    });
+    assert_gated_on(&node, DataSourceCapability::Aggregations, "GROUP BY");
+}
+
+#[test]
+fn window_functions_gate_an_island_with_an_over_clause() {
+    let ranked = Expr::Window {
+        function: Box::new(count_star()),
+        partition_by: vec![typed_col("orders", "region", DataType::Varchar)],
+        order_keys: vec![col("orders", "id")],
+        order_ascending: vec![true],
+        order_nulls: vec![None],
+        frame: None,
+    };
+    let node = project(orders_join_customer(), ranked, "ranked");
+    assert_gated_on(&node, DataSourceCapability::WindowFunctions, "OVER");
+}
+
+#[test]
+fn subqueries_gate_a_semi_join_rendered_as_exists() {
+    let node = project(
+        join(
+            LogicalPlan::Scan(Box::new(scan("pg", "public", "orders", &["id", "cust_id"]))),
+            LogicalPlan::Scan(Box::new(scan("pg", "public", "customer", &["id"]))),
+            JoinType::Semi,
+            eq(col("orders", "cust_id"), col("customer", "id")),
+        ),
+        col("orders", "id"),
+        "id",
+    );
+    assert_gated_on(&node, DataSourceCapability::Subqueries, "EXISTS");
+}
+
+#[test]
+fn distinct_gates_an_island_with_distinct_on() {
+    let node = LogicalPlan::Projection(Projection {
+        input: Box::new(LogicalPlan::Scan(Box::new(scan(
+            "pg",
+            "public",
+            "orders",
+            &["id", "cust_id"],
+        )))),
+        expressions: vec![col("orders", "id")],
+        aliases: vec!["id".to_string()],
+        distinct: false,
+        distinct_on: Some(vec![col("orders", "cust_id")]),
+    });
+    assert_gated_on(&node, DataSourceCapability::Distinct, "DISTINCT ON");
+}
+
+#[test]
+fn order_by_gates_an_island_carrying_a_sort() {
+    let node = LogicalPlan::Sort(fq_plan::logical::Sort {
+        input: Box::new(project(orders_join_customer(), col("orders", "id"), "id")),
+        sort_keys: vec![col("orders", "id")],
+        ascending: vec![true],
+        nulls_order: None,
+    });
+    assert_gated_on(&node, DataSourceCapability::OrderBy, "ORDER BY");
+}
+
+#[test]
+fn limit_gates_an_island_carrying_a_row_bound() {
+    let node = LogicalPlan::Limit(fq_plan::logical::Limit {
+        input: Box::new(project(orders_join_customer(), col("orders", "id"), "id")),
+        limit: Some(10),
+        offset: 0,
+    });
+    assert_gated_on(&node, DataSourceCapability::Limit, "LIMIT 10");
+}
+
+#[test]
+fn cte_gates_an_island_carrying_a_with_statement() {
+    let sql = "WITH recent AS (SELECT orders.id AS id FROM pg.public.orders) \
+               SELECT r.id FROM recent AS r JOIN pg.public.customer ON r.id = customer.id";
+    let full = plan_sql(&catalog(), sql);
+    assert_eq!(
+        remote_queries(&full).len(),
+        1,
+        "a source declaring CTE takes the whole WITH"
+    );
+    let withheld = catalog_without(DataSourceCapability::Cte);
+    assert!(
+        remote_queries(&plan_sql(&withheld, sql)).is_empty(),
+        "a source that does not declare CTE never receives the WITH"
+    );
+}
+
+#[test]
+fn a_withheld_capability_only_blocks_the_construct_that_needs_it() {
+    // The plain join needs none of the seven; withholding CTE leaves it pushable,
+    // so the gate is not a blanket refusal.
+    let node = project(orders_join_customer(), col("orders", "id"), "id");
+    let withheld = catalog_without(DataSourceCapability::Cte);
+    let remote = try_build(&withheld, &node).expect("a join needs no CTE capability");
+    assert!(remote.sql.contains("INNER JOIN"), "{}", remote.sql);
 }

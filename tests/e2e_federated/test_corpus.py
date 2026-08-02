@@ -30,6 +30,10 @@ def test_corpus(case, variation, engine, oracle_registry, fragment_verifier):
     already pushed - that the source answers its own pushed SQL the way the
     oracle answers the same query. The second is a check of the pushdown boundary
     itself, where the engine stops executing and trusts a foreign executor.
+
+    The OTHER plans the optimizer can reach for this query are checked by
+    test_plan_variants, which walks the corpus once per variant so that changing
+    a setting is paid for once rather than once per query.
     """
     environment = runtime_mod.open_variation(engine, variation)
     if "expect_error" in case:

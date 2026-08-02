@@ -69,6 +69,30 @@ impl DataSource for MockSource {
     }
 }
 
+/// Everything a full SQL server evaluates: the relational constructs the pushdown
+/// may place in a pushed query. INTERSECT ALL / EXCEPT ALL and SHIP_TARGET are
+/// left out so a test names them exactly where it needs them.
+fn server_capabilities() -> Vec<DataSourceCapability> {
+    vec![
+        DataSourceCapability::Aggregations,
+        DataSourceCapability::Joins,
+        DataSourceCapability::WindowFunctions,
+        DataSourceCapability::Subqueries,
+        DataSourceCapability::Cte,
+        DataSourceCapability::Distinct,
+        DataSourceCapability::Limit,
+        DataSourceCapability::OrderBy,
+    ]
+}
+
+/// A server that ALSO evaluates INTERSECT ALL / EXCEPT ALL with multiset
+/// semantics.
+fn multiset_server_capabilities() -> Vec<DataSourceCapability> {
+    let mut capabilities = server_capabilities();
+    capabilities.push(DataSourceCapability::IntersectExceptAll);
+    capabilities
+}
+
 /// A two-source catalog: `pg.public` (orders, customer) and `duck.main`
 /// (lineitem, part). Both sources support JOINS.
 fn catalog() -> Arc<Catalog> {
@@ -115,11 +139,11 @@ fn catalog() -> Arc<Catalog> {
     );
     catalog.register_datasource(Arc::new(MockSource {
         name: "pg".to_string(),
-        capabilities: vec![DataSourceCapability::Joins],
+        capabilities: server_capabilities(),
     }));
     catalog.register_datasource(Arc::new(MockSource {
         name: "duck".to_string(),
-        capabilities: vec![DataSourceCapability::Joins],
+        capabilities: server_capabilities(),
     }));
     Arc::new(catalog)
 }
@@ -132,10 +156,7 @@ fn catalog_with_multiset_pg() -> Arc<Catalog> {
     let mut catalog = Arc::try_unwrap(shared).unwrap_or_else(|_| panic!("sole owner"));
     catalog.register_datasource(Arc::new(MockSource {
         name: "pg".to_string(),
-        capabilities: vec![
-            DataSourceCapability::Joins,
-            DataSourceCapability::IntersectExceptAll,
-        ],
+        capabilities: multiset_server_capabilities(),
     }));
     Arc::new(catalog)
 }
@@ -888,5 +909,92 @@ fn recursive_cte_merge_sql_is_transpiled_for_the_merge_engine() {
         !merge.sql.contains("!="),
         "no canonical-Postgres operator survives into the merge SQL: {}",
         merge.sql
+    );
+}
+
+// --------------------------------------------------------------------------
+// per-node clause folds ask the target source first
+// --------------------------------------------------------------------------
+
+/// The shared catalog with `pg` re-registered declaring every server capability
+/// EXCEPT `withheld`, so a fold that needs it has nothing else to fail on.
+fn catalog_without(withheld: DataSourceCapability) -> Arc<Catalog> {
+    let mut capabilities = server_capabilities();
+    capabilities.retain(|capability| *capability != withheld);
+    let shared = catalog();
+    let mut catalog = Arc::try_unwrap(shared).unwrap_or_else(|_| panic!("sole owner"));
+    catalog.register_datasource(Arc::new(MockSource {
+        name: "pg".to_string(),
+        capabilities,
+    }));
+    Arc::new(catalog)
+}
+
+#[test]
+fn sort_stays_local_when_the_source_does_not_declare_order_by() {
+    let catalog = catalog_without(DataSourceCapability::OrderBy);
+    let sort = LogicalPlan::Sort(Sort {
+        input: Box::new(lscan("pg", "public", "orders", &["id"])),
+        sort_keys: vec![col("orders", "id")],
+        ascending: vec![true],
+        nulls_order: None,
+    });
+    let physical = plan_logical(&catalog, &sort).expect("plan");
+    let PhysicalPlan::Sort(sort) = &physical else {
+        panic!("the sort must stay in the coordinator, got {physical:?}")
+    };
+    let PhysicalPlan::Scan(scan) = sort.input.as_ref() else {
+        panic!("the coordinator sort reads the scan directly")
+    };
+    assert_eq!(scan.order_by_keys, None, "no ORDER BY reaches the source");
+}
+
+#[test]
+fn limit_stays_local_when_the_source_does_not_declare_limit() {
+    let catalog = catalog_without(DataSourceCapability::Limit);
+    let set_op = LogicalPlan::SetOperation(SetOperation {
+        left: Box::new(lscan("pg", "public", "orders", &["id"])),
+        right: Box::new(lscan("pg", "public", "customer", &["id"])),
+        kind: SetOpKind::Union,
+        distinct: true,
+    });
+    let limited = LogicalPlan::Limit(Limit {
+        input: Box::new(set_op),
+        limit: Some(5),
+        offset: 0,
+    });
+    let physical = plan_logical(&catalog, &limited).expect("plan");
+    let PhysicalPlan::Limit(limit) = &physical else {
+        panic!("the limit must stay in the coordinator, got {physical:?}")
+    };
+    let PhysicalPlan::RemoteSetOp(remote) = limit.input.as_ref() else {
+        panic!("the coordinator limit reads the remote set op")
+    };
+    assert_eq!(remote.limit, None, "no LIMIT reaches the source");
+}
+
+#[test]
+fn distinct_stays_local_when_the_source_does_not_declare_distinct() {
+    let catalog = catalog_without(DataSourceCapability::Distinct);
+    let physical = plan_sql(
+        &catalog,
+        "SELECT DISTINCT orders.region FROM pg.public.orders",
+    );
+    let distinct_scans = find_all(
+        &physical,
+        &|node| matches!(node, PhysicalPlan::Scan(scan) if scan.distinct),
+    );
+    assert!(
+        distinct_scans.is_empty(),
+        "no DISTINCT reaches the source: {physical:?}"
+    );
+    let distinct_projections = find_all(
+        &physical,
+        &|node| matches!(node, PhysicalPlan::Projection(p) if p.distinct),
+    );
+    assert_eq!(
+        distinct_projections.len(),
+        1,
+        "the coordinator projection still collapses the duplicates"
     );
 }

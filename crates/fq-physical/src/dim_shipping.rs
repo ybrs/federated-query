@@ -31,6 +31,7 @@ use fq_plan::expr::Expr;
 use fq_plan::logical::{Aggregate, Join, JoinType, LogicalPlan, Scan};
 use fq_plan::physical::{GroupObservation, PhysicalPlan, PhysicalRemoteQuery, PhysicalShipment};
 
+use crate::capability::source_declares;
 use crate::error::PhysicalError;
 use crate::planner::PhysicalPlanner;
 
@@ -610,10 +611,7 @@ fn local_source(scans: &[&Scan], rows: &HashMap<ScanId, Option<u64>>) -> Option<
 /// The ship target (the fact source) must ACCEPT a shipped temp table - a physical
 /// capability, not a cost choice.
 fn local_is_ship_target(planner: &PhysicalPlanner, local: &str) -> bool {
-    match planner.catalog().get_datasource(local) {
-        Some(source) => source.supports_capability(DataSourceCapability::ShipTarget),
-        None => false,
-    }
+    source_declares(planner.catalog(), local, DataSourceCapability::ShipTarget)
 }
 
 /// The temp-table schema qualifier for the target: `pg_temp` for a Postgres fact

@@ -92,6 +92,11 @@ pub struct OptimizerConfig {
     pub enable_projection_pushdown: bool,
     pub enable_join_reordering: bool,
     pub enable_decorrelation: bool,
+    /// Collapse a subtree that lives on one source into a single query for that
+    /// source. Off, every operator runs in the coordinator over plain scans,
+    /// which is the same answer by a slower route and is how a plan that does
+    /// not depend on any pushdown decision is obtained.
+    pub enable_single_source_pushdown: bool,
     /// Whether planning READS the learned-statistics catalog (the measured row
     /// counts, column NDVs, group counts, and predicate selectivities written
     /// after every executed query). False makes planning depend only on catalog
@@ -138,6 +143,7 @@ impl Default for OptimizerConfig {
             enable_projection_pushdown: true,
             enable_join_reordering: true,
             enable_decorrelation: true,
+            enable_single_source_pushdown: true,
             enable_learned_statistics: true,
             max_join_reorder_size: 10,
             planning_budget_ms: 100,

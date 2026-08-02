@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use fq_catalog::{Catalog, RenderDialect, StatsCatalog};
+use fq_catalog::{Catalog, DataSourceCapability, RenderDialect, StatsCatalog};
 use fq_optimize::{group_column_names, subplan_signature, CostModel};
 use fq_plan::expr::Expr;
 use fq_plan::logical::{
@@ -33,6 +33,7 @@ use fq_plan::physical::{
     PhysicalValues, PhysicalWindow,
 };
 
+use crate::capability::{pushed_datasource, source_declares};
 use crate::dim_shipping::{DimShipping, ShipThresholds};
 use crate::error::PhysicalError;
 use crate::single_source::SingleSourcePushdown;
@@ -82,6 +83,9 @@ pub struct PhysicalPlanner {
     /// The dim-shipping size/cardinality gates (from `OptimizerConfig`). Defaults
     /// to the tuned constants; a runtime overrides them from its loaded config.
     ship_thresholds: ShipThresholds,
+    /// Whether a subtree living on one source may be collapsed into a single
+    /// query for it. Off, the planner lowers every operator locally.
+    single_source_enabled: bool,
 }
 
 impl PhysicalPlanner {
@@ -95,6 +99,7 @@ impl PhysicalPlanner {
             cost_model,
             single_source,
             shipping_enabled: true,
+            single_source_enabled: true,
             ship_counter: 0,
             cte_producers: HashMap::new(),
             stats_catalog: None,
@@ -109,6 +114,14 @@ impl PhysicalPlanner {
     #[must_use]
     pub fn with_ship_thresholds(mut self, ship_thresholds: ShipThresholds) -> Self {
         self.ship_thresholds = ship_thresholds;
+        self
+    }
+
+    /// Turn same-source pushdown on or off for this planner. Off, no subtree is
+    /// collapsed into a source query and every operator lowers locally.
+    #[must_use]
+    pub fn with_single_source_pushdown(mut self, enabled: bool) -> Self {
+        self.single_source_enabled = enabled;
         self
     }
 
@@ -139,8 +152,10 @@ impl PhysicalPlanner {
     /// Plan a single node: try same-source pushdown, then dim shipping, then lower
     /// by node type. Exhaustive over `LogicalPlan`.
     pub(crate) fn plan_node(&mut self, node: &LogicalPlan) -> Result<PhysicalPlan, PhysicalError> {
-        if let Some(remote) = self.single_source.try_build(node)? {
-            return Ok(PhysicalPlan::RemoteQuery(Box::new(remote)));
+        if self.single_source_enabled {
+            if let Some(remote) = self.single_source.try_build(node)? {
+                return Ok(PhysicalPlan::RemoteQuery(Box::new(remote)));
+            }
         }
         if self.shipping_enabled {
             if let Some(shipped) = DimShipping.try_ship(self, node)? {
@@ -222,6 +237,16 @@ impl PhysicalPlanner {
     /// The dim-shipping gates in force for this plan, for the shipping rule.
     pub(crate) fn ship_thresholds(&self) -> &ShipThresholds {
         &self.ship_thresholds
+    }
+
+    /// Whether a lowered node may take one more clause into the query it already
+    /// pushes: it must run on one source, and that source must declare
+    /// `capability`. A coordinator operator names no source and takes nothing.
+    fn pushed_node_accepts(&self, node: &PhysicalPlan, capability: DataSourceCapability) -> bool {
+        match pushed_datasource(node) {
+            Some(datasource) => source_declares(&self.catalog, datasource, capability),
+            None => false,
+        }
     }
 
     /// Collect every base `Scan` in a subtree (CTE references excluded, since a
@@ -423,7 +448,7 @@ impl PhysicalPlanner {
             }));
         }
         if projection.distinct {
-            propagate_distinct(&mut input);
+            propagate_distinct(&mut input, &self.catalog);
         }
         // Fresh PhysicalProjection lowered from the logical Projection: a type change
         // with no PhysicalProjection base to copy, so every field is listed.
@@ -438,13 +463,19 @@ impl PhysicalPlanner {
 
     // ---- limit + sort (fold into pushdown targets, else wrap) ----------------
 
-    /// Plan a limit node, folding it into a pushed-down set operation.
+    /// Plan a limit node, folding it into a pushed-down set operation whose source
+    /// declares LIMIT. A source that does not keeps the bound in the coordinator.
     fn plan_limit(
         &mut self,
         limit: &fq_plan::logical::Limit,
     ) -> Result<PhysicalPlan, PhysicalError> {
         let input = self.plan_node(&limit.input)?;
-        if let PhysicalPlan::RemoteSetOp(mut remote) = input {
+        if matches!(input, PhysicalPlan::RemoteSetOp(_))
+            && self.pushed_node_accepts(&input, DataSourceCapability::Limit)
+        {
+            let PhysicalPlan::RemoteSetOp(mut remote) = input else {
+                unreachable!("the arm above matched a RemoteSetOp");
+            };
             remote.limit = limit.limit;
             remote.offset = limit.offset;
             return Ok(PhysicalPlan::RemoteSetOp(remote));
@@ -459,9 +490,13 @@ impl PhysicalPlanner {
     }
 
     /// Plan a sort node, folding the ORDER BY onto a pushdown target (scan /
-    /// remote join / remote set op), else wrapping it in a `Sort`.
+    /// remote join / remote set op) whose source declares ORDER BY, else wrapping
+    /// it in a `Sort` the coordinator runs.
     fn plan_sort(&mut self, sort: &fq_plan::logical::Sort) -> Result<PhysicalPlan, PhysicalError> {
         let input = self.plan_node(&sort.input)?;
+        if !self.pushed_node_accepts(&input, DataSourceCapability::OrderBy) {
+            return Ok(local_sort(sort, input));
+        }
         match input {
             PhysicalPlan::Scan(mut scan) => {
                 scan.order_by_keys = Some(sort.sort_keys.clone());
@@ -481,43 +516,59 @@ impl PhysicalPlanner {
                 set_op.order_by_nulls.clone_from(&sort.nulls_order);
                 Ok(PhysicalPlan::RemoteSetOp(set_op))
             }
-            // Fresh PhysicalSort lowered from the logical Sort (the non-pushdown fall-
-            // through): a type change with no PhysicalSort base to copy, all fields listed.
-            other => Ok(PhysicalPlan::Sort(PhysicalSort {
-                input: Box::new(other),
-                sort_keys: sort.sort_keys.clone(),
-                ascending: sort.ascending.clone(),
-                nulls_order: sort.nulls_order.clone(),
-            })),
+            other => Ok(local_sort(sort, other)),
         }
     }
 
     // ---- aggregate -----------------------------------------------------------
 
-    /// Plan an aggregate node. A remote-join input folds the aggregate onto the
-    /// join (both push as one query); otherwise a coordinator hash aggregate,
-    /// stamped with its learned-stats group provenance.
+    /// Plan an aggregate node. A remote-join input whose source declares
+    /// AGGREGATIONS folds the aggregate onto the join (both push as one query);
+    /// otherwise a coordinator hash aggregate, stamped with its learned-stats
+    /// group provenance.
     fn plan_aggregate(&mut self, aggregate: &Aggregate) -> Result<PhysicalPlan, PhysicalError> {
         let input = self.plan_node(&aggregate.input)?;
-        if let PhysicalPlan::RemoteJoin(mut remote) = input {
-            remote.group_by = Some(aggregate.group_by.clone());
-            remote.grouping_sets.clone_from(&aggregate.grouping_sets);
-            remote.aggregates = Some(aggregate.aggregates.clone());
-            remote.output_names = Some(aggregate.output_names.clone());
-            return Ok(PhysicalPlan::RemoteJoin(remote));
+        if !matches!(input, PhysicalPlan::RemoteJoin(_))
+            || !self.pushed_node_accepts(&input, DataSourceCapability::Aggregations)
+        {
+            return Ok(local_hash_aggregate(aggregate, input));
         }
-        // Fresh PhysicalHashAggregate lowered from the logical Aggregate: a type change
-        // with no PhysicalHashAggregate base to copy, so every field is listed (the
-        // group_observation provenance is stamped deliberately).
-        Ok(PhysicalPlan::HashAggregate(PhysicalHashAggregate {
-            input: Box::new(input),
-            group_by: aggregate.group_by.clone(),
-            aggregates: aggregate.aggregates.clone(),
-            output_names: aggregate.output_names.clone(),
-            grouping_sets: aggregate.grouping_sets.clone(),
-            group_observation: group_observation(aggregate),
-        }))
+        let PhysicalPlan::RemoteJoin(mut remote) = input else {
+            unreachable!("the guard above matched a RemoteJoin");
+        };
+        remote.group_by = Some(aggregate.group_by.clone());
+        remote.grouping_sets.clone_from(&aggregate.grouping_sets);
+        remote.aggregates = Some(aggregate.aggregates.clone());
+        remote.output_names = Some(aggregate.output_names.clone());
+        Ok(PhysicalPlan::RemoteJoin(remote))
     }
+}
+
+/// The coordinator sort over an input the source will not order itself.
+fn local_sort(sort: &fq_plan::logical::Sort, input: PhysicalPlan) -> PhysicalPlan {
+    // Fresh PhysicalSort lowered from the logical Sort: a type change with no
+    // PhysicalSort base to copy, so every field is listed.
+    PhysicalPlan::Sort(PhysicalSort {
+        input: Box::new(input),
+        sort_keys: sort.sort_keys.clone(),
+        ascending: sort.ascending.clone(),
+        nulls_order: sort.nulls_order.clone(),
+    })
+}
+
+/// The coordinator hash aggregate over an input that does not absorb the grouping.
+fn local_hash_aggregate(aggregate: &Aggregate, input: PhysicalPlan) -> PhysicalPlan {
+    // Fresh PhysicalHashAggregate lowered from the logical Aggregate: a type change
+    // with no PhysicalHashAggregate base to copy, so every field is listed (the
+    // group_observation provenance is stamped deliberately).
+    PhysicalPlan::HashAggregate(PhysicalHashAggregate {
+        input: Box::new(input),
+        group_by: aggregate.group_by.clone(),
+        aggregates: aggregate.aggregates.clone(),
+        output_names: aggregate.output_names.clone(),
+        grouping_sets: aggregate.grouping_sets.clone(),
+        group_observation: group_observation(aggregate),
+    })
 }
 
 /// The learned-stats group provenance for a coordinator aggregate: the input's
@@ -549,31 +600,48 @@ fn projection_has_window(projection: &Projection) -> bool {
 /// Whether an expression tree contains a Window node at any depth. Uses
 /// `Expr::children` for descent (which does NOT descend into subqueries, matching
 /// Python `expression_children`).
-fn expression_has_window(expr: &Expr) -> bool {
+pub(crate) fn expression_has_window(expr: &Expr) -> bool {
     matches!(expr, Expr::Window { .. }) || expr.children().iter().any(|c| expression_has_window(c))
 }
 
 /// Mark the lowest scan-like node to emit DISTINCT (mutating descent through
 /// single-child wrappers). Ports `_propagate_distinct`.
-fn propagate_distinct(node: &mut PhysicalPlan) {
+fn propagate_distinct(node: &mut PhysicalPlan, catalog: &Catalog) {
     match node {
-        PhysicalPlan::Scan(scan) => scan.distinct = true,
-        PhysicalPlan::RemoteJoin(remote) => remote.distinct = true,
+        PhysicalPlan::Scan(_) | PhysicalPlan::RemoteJoin(_) => mark_distinct(node, catalog),
         // Single-child wrappers: descend into `.input`.
-        PhysicalPlan::Projection(n) => propagate_distinct(&mut n.input),
-        PhysicalPlan::Window(n) => propagate_distinct(&mut n.input),
-        PhysicalPlan::Filter(n) => propagate_distinct(&mut n.input),
-        PhysicalPlan::HashAggregate(n) => propagate_distinct(&mut n.input),
-        PhysicalPlan::Sort(n) => propagate_distinct(&mut n.input),
-        PhysicalPlan::Limit(n) => propagate_distinct(&mut n.input),
-        PhysicalPlan::AliasedRelation(n) => propagate_distinct(&mut n.input),
-        PhysicalPlan::SingleRowGuard(n) => propagate_distinct(&mut n.input),
-        PhysicalPlan::GroupedLimit(n) => propagate_distinct(&mut n.input),
-        PhysicalPlan::Explain(n) => propagate_distinct(&mut n.child),
+        PhysicalPlan::Projection(n) => propagate_distinct(&mut n.input, catalog),
+        PhysicalPlan::Window(n) => propagate_distinct(&mut n.input, catalog),
+        PhysicalPlan::Filter(n) => propagate_distinct(&mut n.input, catalog),
+        PhysicalPlan::HashAggregate(n) => propagate_distinct(&mut n.input, catalog),
+        PhysicalPlan::Sort(n) => propagate_distinct(&mut n.input, catalog),
+        PhysicalPlan::Limit(n) => propagate_distinct(&mut n.input, catalog),
+        PhysicalPlan::AliasedRelation(n) => propagate_distinct(&mut n.input, catalog),
+        PhysicalPlan::SingleRowGuard(n) => propagate_distinct(&mut n.input, catalog),
+        PhysicalPlan::GroupedLimit(n) => propagate_distinct(&mut n.input, catalog),
+        PhysicalPlan::Explain(n) => propagate_distinct(&mut n.child, catalog),
         // Everything else has no single `input` child -> stop the descent. This is
         // the ONE tolerated silent arm: it mirrors Python's "no `input` attribute
         // -> stop" (a scan/remote already marks; a binary/leaf has nowhere deeper
         // to mark). It is a DESCENT-STOP, not a node-handling gap.
         _ => {}
+    }
+}
+
+/// Set the DISTINCT flag on a pushable node when its source declares DISTINCT.
+/// An undeclared source leaves the flag off: the projection that started this
+/// descent still carries `distinct`, so the coordinator collapses the duplicates
+/// instead of the source.
+fn mark_distinct(node: &mut PhysicalPlan, catalog: &Catalog) {
+    let Some(datasource) = pushed_datasource(node).map(str::to_string) else {
+        return;
+    };
+    if !source_declares(catalog, &datasource, DataSourceCapability::Distinct) {
+        return;
+    }
+    match node {
+        PhysicalPlan::Scan(scan) => scan.distinct = true,
+        PhysicalPlan::RemoteJoin(remote) => remote.distinct = true,
+        _ => unreachable!("mark_distinct is reached for a Scan or a RemoteJoin"),
     }
 }

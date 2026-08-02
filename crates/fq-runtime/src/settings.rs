@@ -287,6 +287,21 @@ static SETTINGS: &[SettingDef] = &[
         }),
     },
     SettingDef {
+        name: "optimizer.enable_single_source_pushdown",
+        description: "Collapse a subtree living on one source into a single query \
+                      for that source. Off, every operator runs in the coordinator \
+                      over plain scans - the same answer by a slower route, and the \
+                      plan that depends on no pushdown decision.",
+        mutability: Mutability::SessionMutable,
+        env_var: None,
+        default: || SettingValue::Bool(OptimizerConfig::default().enable_single_source_pushdown),
+        read: |c| SettingValue::Bool(c.optimizer.enable_single_source_pushdown),
+        apply: Some(|c, v| {
+            c.optimizer.enable_single_source_pushdown = v.as_bool()?;
+            Ok(())
+        }),
+    },
+    SettingDef {
         name: "optimizer.enable_learned_statistics",
         description: "Read the learned-statistics catalog while planning (measured \
                       row counts, column NDVs, group counts, predicate \
