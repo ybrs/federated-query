@@ -33,7 +33,10 @@ import time
 
 import pyarrow as pa
 
+from tests.e2e_federated import harness
 from tests.e2e_federated import known_plan_disagreements
+from tests.e2e_federated.cases import all_cases
+from tests.e2e_federated.cases import case_table_specs
 
 # The estimate annotations EXPLAIN carries. They record how the planner got to a
 # plan, not what the plan does, so two plans that differ only here are the same
@@ -68,6 +71,32 @@ VARIANTS = (
 # panics at step-building because the column-alias map it needs is built by the
 # very pushdown that is switched off. The setting exists and works; the plan it
 # selects does not run.
+
+
+def owned_variant_pairs():
+    """Yield the (case, variation) pairs of the variant walk this process owns.
+
+    This is the ONE definition of the variant walk's order and of which pairs a
+    shard owns: the default-plan-shape fixture and every variant's corpus walk
+    both iterate it, so the shapes a process records are exactly the shapes its
+    walk looks up. Every (case, variation) belongs to exactly one shard by
+    position - the shards partition the walk, never sample it - so each pair
+    recorded as a known disagreement is strictly checked by whichever process
+    owns it. Cases expecting an error have no plan to compare and are not part
+    of the walk.
+    """
+    shards = int(os.environ.get("FEDQ_SHARDS") or "1")
+    shard = int(os.environ.get("FEDQ_SHARD") or "0")
+    position = 0
+    for case in all_cases():
+        if "expect_error" in case:
+            continue
+        specs = case_table_specs(case)
+        for variation in harness.variations(specs, case.get("min_sources", 1)):
+            owned = position % shards == shard
+            position += 1
+            if owned:
+                yield case, variation
 
 
 def fingerprint(runtime, sql):

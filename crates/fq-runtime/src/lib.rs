@@ -41,7 +41,7 @@ use fq_catalog::{Catalog, StatsCatalog};
 use fq_common::{Config, DataSourceConfig, DataType, PlanBudget};
 use fq_connectors::{ClickHouseSource, DuckDbSource, MySqlSource, ParquetSource, PostgresSource};
 use fq_exec::{connectors, execute_plan};
-use fq_optimize::{build_optimizer, CostModel, StatisticsCollector};
+use fq_optimize::{build_optimizer, CostModel, OptimizeError, StatisticsCollector};
 use fq_parse::{classify_statement, parse_with_catalog, Statement};
 use fq_physical::steps::Observation;
 use fq_physical::{check_referential_closure, PhysicalPlanner, PushdownFragment, ShipThresholds};
@@ -181,6 +181,12 @@ impl Runtime {
             learned.clone(),
             None,
         ));
+        // Statistics are fetched HERE, at construction, not at first plan.
+        // Construction already talks to every source to load metadata and runs
+        // under no planning budget, so after this the budget measures planning
+        // alone - a session-cold source round trip can never be billed to
+        // whichever query happened to plan over a table first.
+        prewarm_source_statistics(&catalog, &stats)?;
         // Prewarm the paths indexes on a background thread: the block cache
         // is process-global, so a throwaway store handle warms the same cache
         // the session's store reads later. A prewarm failure only prints; the
@@ -761,6 +767,43 @@ fn plan_uses_event_analysis(plan: &PhysicalPlan) -> bool {
             .children()
             .iter()
             .any(|child| plan_uses_event_analysis(child))
+}
+
+/// Fetch every cataloged table's source statistics into the session cache, so
+/// no query's planning window pays a source round trip for a table that existed
+/// at construction. A table registered later (dynamic catalog) is still fetched
+/// lazily at its first plan, under the planning budget, which kills loudly at
+/// the exact fetch. A source's statistics failure fails construction, exactly
+/// as its metadata failure does.
+fn prewarm_source_statistics(
+    catalog: &Catalog,
+    stats: &StatisticsCollector,
+) -> Result<(), RuntimeError> {
+    for (datasource, schema, table) in catalog.list_tables() {
+        let columns = table_column_names(catalog, &datasource, &schema, &table);
+        stats
+            .get_table_statistics(&datasource, &schema, &table, &columns)
+            .map_err(OptimizeError::from)?;
+    }
+    Ok(())
+}
+
+/// The column names of one cataloged table. The table came out of
+/// `list_tables`, so it is present by construction.
+fn table_column_names(
+    catalog: &Catalog,
+    datasource: &str,
+    schema: &str,
+    table: &str,
+) -> Vec<String> {
+    let found = catalog
+        .get_table(datasource, schema, table)
+        .expect("list_tables named a table the catalog no longer holds");
+    let mut names = Vec::with_capacity(found.columns.len());
+    for column in &found.columns {
+        names.push(column.name.clone());
+    }
+    names
 }
 
 /// Open the learned-statistics catalog: `$FEDQ_STATS_CATALOG` when set,

@@ -12,14 +12,11 @@ got wrong, not just the first, because knowing whether one plan is broken or
 hundreds are is the difference between a defect and a design fault.
 """
 
-import os
-
 import pytest
 
-from tests.e2e_federated import harness
 from tests.e2e_federated import plan_variants
 from tests.e2e_federated import runtime as runtime_mod
-from tests.e2e_federated.cases import all_cases, case_table_specs
+from tests.e2e_federated.cases import case_table_specs
 from tests.e2e_federated.compare import compare_tables
 from tests.e2e_federated.oracle import build_oracle
 
@@ -47,26 +44,14 @@ def _walk_corpus(engine, run, oracle_registry, default_plan_shapes):
     """Check the share of the corpus this process owns against this variant.
 
     Several processes may run one variant at once, each over its own harness
-    clone. Every (case, distribution) belongs to exactly one of them by position,
-    so they partition the walk rather than sampling it - including the pairs
-    recorded as known disagreements, each of which is checked by whichever
-    process owns it.
+    clone. ``plan_variants.owned_variant_pairs`` is the one definition of which
+    (case, distribution) pairs this process owns; the oracle for a case is built
+    on first need, so a case with no owned pair costs nothing here.
     """
-    shards = int(os.environ.get("FEDQ_SHARDS") or "1")
-    shard = int(os.environ.get("FEDQ_SHARD") or "0")
-    position = 0
-    for case in all_cases():
-        if "expect_error" in case:
-            continue
+    for case, variation in plan_variants.owned_variant_pairs():
         oracle_table = _reference(oracle_registry, case)
-        for variation in harness.variations(
-            case_table_specs(case), case.get("min_sources", 1)
-        ):
-            owned = position % shards == shard
-            position += 1
-            if owned:
-                _check_one(engine, run, case, variation, oracle_table,
-                           default_plan_shapes)
+        _check_one(engine, run, case, variation, oracle_table,
+                   default_plan_shapes)
 
 
 def _check_one(engine, run, case, variation, oracle_table, default_plan_shapes):

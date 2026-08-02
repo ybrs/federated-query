@@ -95,6 +95,73 @@ impl CostModel {
         Ok((filtered_rows(rows, selectivity), gaps))
     }
 
+    /// Whether `scan_filter_rows` will consult the source planner for this scan:
+    /// a plain scan whose predicate pricing leaves gaps that no learned template
+    /// covers. Mirrors the ladder above step for step - a probe fired for a scan
+    /// the ladder never asks about is wasted wall clock, and one skipped is a
+    /// sequential round trip the prewarm existed to avoid.
+    fn scan_probe_consulted(&self, scan: &Scan) -> Result<bool> {
+        if scan.filters.is_none() {
+            return Ok(false);
+        }
+        if non_empty(scan.group_by.as_deref())
+            || non_empty(scan.aggregates.as_deref())
+            || has_grouping_sets(scan)
+        {
+            return Ok(false);
+        }
+        let stats = self.scan_stats(scan)?;
+        let (rows, _defaults) = tracked_base_rows(scan, stats.as_ref());
+        if rows.is_none() {
+            return Ok(false);
+        }
+        let filters = scan.filters.as_ref().expect("checked above");
+        let (_selectivity, gaps) = tracked_selectivity(filters, stats.as_ref(), &scan_target(scan));
+        if gaps.is_empty() {
+            return Ok(false);
+        }
+        Ok(self.learned_predicate_rows(scan)?.is_none())
+    }
+
+    /// Fire the source-planner probes estimating these subtrees will consult,
+    /// CONCURRENTLY, so a plan's wall clock carries the slowest probe instead
+    /// of the sum of every scan's round trip. Purely a warm-up: the probes land
+    /// in the collector's memo and the sequential estimation reads them back,
+    /// so estimates are identical with or without it. A probe's result is
+    /// deliberately unread here - estimation re-probes on its own path, and
+    /// that path is the one that raises.
+    pub fn prewarm_plan_probes(&self, plans: &[&fq_plan::logical::LogicalPlan]) {
+        let mut scans = Vec::new();
+        for plan in plans {
+            collect_probe_scans(plan, &mut scans);
+        }
+        self.prewarm_scan_probes(&scans);
+    }
+
+    /// The concurrent fan-out behind `prewarm_plan_probes`, over the bare scans.
+    fn prewarm_scan_probes(&self, scans: &[&Scan]) {
+        let Some(stats) = self.stats.as_ref() else {
+            return;
+        };
+        let mut consulted = Vec::new();
+        for scan in scans {
+            if matches!(self.scan_probe_consulted(scan), Ok(true)) {
+                consulted.push(*scan);
+            }
+        }
+        if consulted.len() < 2 {
+            return;
+        }
+        std::thread::scope(|scope| {
+            for scan in consulted {
+                let collector = std::sync::Arc::clone(stats);
+                scope.spawn(move || {
+                    let _ = collector.scan_planner_estimate(scan);
+                });
+            }
+        });
+    }
+
     /// The catalog's MEASURED output rows for this scan's filter template, or
     /// `None`. Consulted only when the engine's own pricing left gaps (fill, never
     /// override) and BEFORE the source planner.
@@ -132,6 +199,16 @@ impl CostModel {
             return Ok(None);
         }
         stats.scan_planner_estimate(scan)
+    }
+}
+
+/// Every `Scan` node in a plan subtree, in walk order.
+fn collect_probe_scans<'a>(plan: &'a fq_plan::logical::LogicalPlan, scans: &mut Vec<&'a Scan>) {
+    if let fq_plan::logical::LogicalPlan::Scan(scan) = plan {
+        scans.push(scan);
+    }
+    for child in plan.children() {
+        collect_probe_scans(child, scans);
     }
 }
 

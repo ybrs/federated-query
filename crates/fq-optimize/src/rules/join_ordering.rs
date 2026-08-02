@@ -95,6 +95,21 @@ struct Candidate {
     island_source: Option<String>,
 }
 
+/// One costed single-atom extension of a candidate, before materialization.
+///
+/// Everything needed to compare the extension against a rival candidate lives
+/// here; the parent's `sequence` and `steps` are cloned only when the extension
+/// wins its subset slot (`materialized`), so a losing extension allocates
+/// nothing beyond its conjunct positions.
+struct Extension {
+    atom_index: usize,
+    cost: f64,
+    transfer: f64,
+    island_source: Option<String>,
+    estimate: CardinalityEstimate,
+    conjunct_positions: Vec<usize>,
+}
+
 // ------------------------------- the estimator ------------------------------
 
 /// The cardinality oracle the enumerator consults. Implementations answer from
@@ -129,6 +144,13 @@ trait RegionEstimator {
         right: &CardinalityEstimate,
         positions: &[usize],
     ) -> Result<CardinalityEstimate, OptimizeError>;
+
+    /// Fire whatever source round trips the atom walk will consult,
+    /// concurrently, so the walk's wall clock carries the slowest one rather
+    /// than their sum. Purely a warm-up: every estimate is identical with or
+    /// without it. The default does nothing (test estimators answer from
+    /// hand-fed tables and consult no source).
+    fn prewarm_atoms(&self, _atom_plans: &[LogicalPlan]) {}
 }
 
 /// A `RegionEstimator` answering from the `CostModel` and source statistics. The
@@ -220,6 +242,16 @@ impl RegionEstimator for CostModelRegionEstimator<'_> {
             (rows as u64).max(1),
             combine_defaults(&[left, right], &defaults),
         ))
+    }
+
+    /// The source-planner probes the atom walk will consult, fired concurrently
+    /// into the collector's memo (see the trait method).
+    fn prewarm_atoms(&self, atom_plans: &[LogicalPlan]) {
+        let mut plans = Vec::with_capacity(atom_plans.len());
+        for plan in atom_plans {
+            plans.push(plan);
+        }
+        self.cost_model.borrow().prewarm_plan_probes(&plans);
     }
 }
 
@@ -596,11 +628,13 @@ impl Enumerator<'_> {
     /// Selinger-style DP over connected subsets, left-deep, deterministic.
     fn dp_best(&self, component: &[usize]) -> Result<Candidate, OptimizeError> {
         let mut best: BTreeMap<u64, Candidate> = BTreeMap::new();
+        let mut layer: Vec<u64> = Vec::with_capacity(component.len());
         for &index in component {
             best.insert(1u64 << index, self.seed(index));
+            layer.push(1u64 << index);
         }
-        for size in 2..=component.len() {
-            self.dp_layer(component, &mut best, size)?;
+        for _size in 2..=component.len() {
+            layer = self.dp_layer(component, &mut best, &layer)?;
         }
         let full_mask = component
             .iter()
@@ -610,24 +644,32 @@ impl Enumerator<'_> {
         })
     }
 
-    /// Extend every (size-1)-subset by each connected atom, keeping the best
-    /// candidate per resulting subset.
+    /// Extend every subset of the previous layer by each connected atom, keeping
+    /// the best candidate per resulting subset; returns the new layer's subsets.
+    ///
+    /// The layer's masks arrive in ascending numeric order (they are collected
+    /// from a `BTreeMap`), and the enumeration order cannot affect any winner:
+    /// `extension_less` is a total order, so each subset keeps its unique
+    /// minimum whatever order the contenders arrive in.
     fn dp_layer(
         &self,
         component: &[usize],
         best: &mut BTreeMap<u64, Candidate>,
-        size: usize,
-    ) -> Result<(), OptimizeError> {
+        previous: &[u64],
+    ) -> Result<Vec<u64>, OptimizeError> {
         let mut additions: BTreeMap<u64, Candidate> = BTreeMap::new();
-        for subset in subsets_of_size(best, size - 1) {
-            let candidate = best[&subset].clone();
-            self.extend_subset(component, &candidate, subset, &mut additions)?;
+        for &subset in previous {
+            let candidate = &best[&subset];
+            self.extend_subset(component, candidate, subset, &mut additions)?;
         }
+        let created: Vec<u64> = additions.keys().copied().collect();
         best.extend(additions);
-        Ok(())
+        Ok(created)
     }
 
-    /// Try every connected single-atom extension of one candidate.
+    /// Try every connected single-atom extension of one candidate. Extensions
+    /// are costed first and materialized into full candidates only when they
+    /// win their subset slot, so a losing extension costs no clone.
     fn extend_subset(
         &self,
         component: &[usize],
@@ -639,23 +681,30 @@ impl Enumerator<'_> {
             if subset & (1u64 << atom_index) != 0 {
                 continue;
             }
-            if let Some(extended) = self.try_extend(candidate, subset, atom_index)? {
-                keep_better(additions, subset | (1u64 << atom_index), extended);
+            if let Some(extension) = self.evaluate_extension(candidate, subset, atom_index)? {
+                keep_better_extension(
+                    additions,
+                    subset | (1u64 << atom_index),
+                    candidate,
+                    extension,
+                );
             }
         }
         Ok(())
     }
 
-    /// The candidate extended by one atom, or None when no EQUI conjunct connects
-    /// the atom to the subset (a cross/nested-loop, never generated in a
-    /// component). The transfer charge is the atom's FULL rows, deliberately
-    /// ignoring the runtime key reduction (measured to mis-price island breaking).
-    fn try_extend(
+    /// The costed extension of a candidate by one atom, or None when no EQUI
+    /// conjunct connects the atom to the subset (a cross/nested-loop, never
+    /// generated in a component). The transfer charge is the atom's FULL rows,
+    /// deliberately ignoring the runtime key reduction (measured to mis-price
+    /// island breaking). Carries everything needed to cost and compare the
+    /// extension without cloning the parent's sequence or steps.
+    fn evaluate_extension(
         &self,
         candidate: &Candidate,
         subset: u64,
         atom_index: usize,
-    ) -> Result<Option<Candidate>, OptimizeError> {
+    ) -> Result<Option<Extension>, OptimizeError> {
         let positions = newly_covered(self.region, subset, atom_index);
         if !any_equi(self.region, &positions) {
             return Ok(None);
@@ -669,7 +718,9 @@ impl Enumerator<'_> {
             &positions,
         )?;
         let atom_rows = atom.rows.ok_or_else(|| {
-            OptimizeError::JoinOrder("try_extend over an UNKNOWN atom (post-gate)".to_string())
+            OptimizeError::JoinOrder(
+                "evaluate_extension over an UNKNOWN atom (post-gate)".to_string(),
+            )
         })?;
         let step_rows = estimate.rows.ok_or_else(|| {
             OptimizeError::JoinOrder("join_estimate returned UNKNOWN (post-gate)".to_string())
@@ -679,22 +730,28 @@ impl Enumerator<'_> {
             self.atom_sources[atom_index].as_deref(),
             atom_rows,
         );
-        let mut sequence = candidate.sequence.clone();
-        sequence.push(atom_index);
-        let mut steps = candidate.steps.clone();
-        steps.push(JoinStep {
+        Ok(Some(Extension {
             atom_index,
-            estimate: estimate.clone(),
-            conjunct_positions: positions,
-        });
-        Ok(Some(Candidate {
             cost: candidate.cost + step_rows as f64,
-            sequence,
-            steps,
-            estimate,
             transfer,
             island_source: island,
+            estimate,
+            conjunct_positions: positions,
         }))
+    }
+
+    /// The candidate extended by one atom, or None when no EQUI conjunct
+    /// connects the atom to the subset. The greedy paths use this directly;
+    /// the DP compares extensions before materializing them.
+    fn try_extend(
+        &self,
+        candidate: &Candidate,
+        subset: u64,
+        atom_index: usize,
+    ) -> Result<Option<Candidate>, OptimizeError> {
+        Ok(self
+            .evaluate_extension(candidate, subset, atom_index)?
+            .map(|extension| materialized(candidate, extension)))
     }
 
     /// GOO-style left-deep greedy for components beyond the DP limit.
@@ -792,38 +849,77 @@ impl Enumerator<'_> {
     }
 }
 
-/// The DP subsets of one size, in deterministic sorted order (by ascending
-/// member-index sequence, matching Python's `tuple(sorted(subset))`).
-fn subsets_of_size(best: &BTreeMap<u64, Candidate>, size: usize) -> Vec<u64> {
-    let mut found: Vec<u64> = best
-        .keys()
-        .copied()
-        .filter(|mask| mask.count_ones() as usize == size)
-        .collect();
-    found.sort_by_key(|mask| mask_members(*mask));
-    found
-}
-
-/// The set bits of a mask as an ascending index list.
-fn mask_members(mask: u64) -> Vec<usize> {
-    let mut members = Vec::new();
-    for index in 0..MAX_REGION_ATOMS {
-        if mask & (1u64 << index) != 0 {
-            members.push(index);
-        }
-    }
-    members
-}
-
-/// Keep the cheaper candidate per subset (ties: smaller atom sequence).
-fn keep_better(additions: &mut BTreeMap<u64, Candidate>, key: u64, candidate: Candidate) {
+/// Keep the cheaper candidate per subset (ties: smaller atom sequence). The
+/// comparison runs on the unmaterialized extension, so the losing side never
+/// clones the parent's sequence and steps.
+fn keep_better_extension(
+    additions: &mut BTreeMap<u64, Candidate>,
+    key: u64,
+    parent: &Candidate,
+    extension: Extension,
+) {
     let replace = match additions.get(&key) {
         None => true,
-        Some(current) => candidate_less(&candidate, current),
+        Some(current) => extension_less(parent, &extension, current),
     };
     if replace {
-        additions.insert(key, candidate);
+        additions.insert(key, materialized(parent, extension));
     }
+}
+
+/// A full candidate for a winning extension: the one place the parent's
+/// sequence and steps are cloned.
+fn materialized(parent: &Candidate, extension: Extension) -> Candidate {
+    let mut sequence = Vec::with_capacity(parent.sequence.len() + 1);
+    sequence.extend_from_slice(&parent.sequence);
+    sequence.push(extension.atom_index);
+    let mut steps = Vec::with_capacity(parent.steps.len() + 1);
+    steps.extend_from_slice(&parent.steps);
+    steps.push(JoinStep {
+        atom_index: extension.atom_index,
+        estimate: extension.estimate.clone(),
+        conjunct_positions: extension.conjunct_positions,
+    });
+    Candidate {
+        cost: extension.cost,
+        sequence,
+        steps,
+        estimate: extension.estimate,
+        transfer: extension.transfer,
+        island_source: extension.island_source,
+    }
+}
+
+/// Whether the extension of `parent` orders strictly before `current`: the same
+/// (cost + weighted transfer, sequence) order as `candidate_less`, with the
+/// extended sequence compared element-wise instead of built.
+fn extension_less(parent: &Candidate, extension: &Extension, current: &Candidate) -> bool {
+    let left_key = extension.cost + TRANSFER_WEIGHT * extension.transfer;
+    let right_key = current.cost + TRANSFER_WEIGHT * current.transfer;
+    match left_key.total_cmp(&right_key) {
+        Ordering::Less => true,
+        Ordering::Greater => false,
+        Ordering::Equal => {
+            extended_sequence_less(&parent.sequence, extension.atom_index, &current.sequence)
+        }
+    }
+}
+
+/// Whether `parent ++ [atom]` orders lexicographically before `current`. Both
+/// sides are orderings of one subset, so they have equal length and lexicographic
+/// order is decided by the first differing element.
+fn extended_sequence_less(parent: &[usize], atom: usize, current: &[usize]) -> bool {
+    for (index, &current_atom) in current.iter().enumerate() {
+        let new_atom = if index < parent.len() {
+            parent[index]
+        } else {
+            atom
+        };
+        if new_atom != current_atom {
+            return new_atom < current_atom;
+        }
+    }
+    false
 }
 
 /// The smaller candidate by (cost + weighted transfer, sequence); tolerates None.
@@ -915,6 +1011,16 @@ fn base_atom_estimates(
     region: &JoinRegion,
     estimator: &dyn RegionEstimator,
 ) -> Result<Vec<CardinalityEstimate>, OptimizeError> {
+    // The folded atom plans, built exactly as `atom_estimate` builds them, so
+    // the probes the prewarm fires are keyed identically to the ones the walk
+    // consults.
+    let mut atom_plans = Vec::with_capacity(region.atoms.len());
+    for atom in &region.atoms {
+        let positions = local_positions(region, atom.index);
+        let filters = local_exprs(region, &positions);
+        atom_plans.push(with_local_filters(atom.plan.clone(), &filters));
+    }
+    estimator.prewarm_atoms(&atom_plans);
     let mut estimates = Vec::with_capacity(region.atoms.len());
     for atom in &region.atoms {
         let positions = local_positions(region, atom.index);

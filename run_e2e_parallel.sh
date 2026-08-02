@@ -1,5 +1,6 @@
 #!/bin/bash
-# Run the Python suite as FIFTEEN processes at once, each on its own harness clone.
+# Run the Python suite as FIFTEEN processes, at most EIGHT at once, each on its
+# own harness clone.
 #
 # The suite is one process today and takes most of the gate's wall clock. It does
 # not have to be: the work divides cleanly along lines that already exist - the
@@ -13,10 +14,14 @@
 # reflinked. PostgreSQL schemas are READ-ONLY here and stay shared - nothing
 # writes them.
 #
-# Why not one process per test: the engine builds a tokio runtime per query with
-# a thread per core, so processes do contend. Measured on this 12-core machine,
-# five processes ran five times the work in 1.4 times the wall clock. Seven is a
-# balance struck against that measurement, not a limit derived from theory.
+# THE CONCURRENCY BOUND EXISTS FOR THE PLANNING BUDGET, not for throughput. The
+# budget is wall clock, and planning talks to the sources (statistics, planner
+# EXPLAIN probes), so a machine saturated by its own test runner measures the
+# runner: a query whose planning takes 2ms on an idle box was killed at 113ms
+# under a full-width run of fifteen processes on these 12 cores. Eight leaves
+# the sources and the coordinator headroom - the same reasoning as the Rust
+# suite's --test-threads=4. Raising the width back is only safe if a full gate
+# stays green repeatedly under the wider load.
 #
 # Every process writes its whole output to its own log under run-e2e-logs/, and
 # reports where it has got to in <name>.progress. Read those to see a run in
@@ -82,39 +87,69 @@ run_split() {
 
 STARTED=$(date +%s)
 
-# FIFTEEN processes. The engine opens PostgreSQL connections per query across six
-# datasources, so this needs max_connections well above the default - the fixture
-# sets 2000 in scripts/run-postgres.sh. At the default the run dies with "sorry,
-# too many clients already", which reads like an engine failure and is not one.
+# At most this many suite processes run at once; the header explains why.
+MAX_CONCURRENT=8
+
+# Set once a split has been seen to fail, so no further split is launched.
+ABORT=""
+
+# Note any failed split in ABORT, so launching and monitoring both stop.
+note_failures() {
+    for exit_file in "${LOGS}"/*.exit; do
+        [ -e "${exit_file}" ] || continue
+        if [ "$(cat "${exit_file}")" != "0" ]; then
+            ABORT="$(basename "${exit_file}" .exit)"
+            return
+        fi
+    done
+}
+
+# Start one split once a slot is free, unless a split already failed - more
+# work after a failure only delays reading it.
+launch() {
+    [ -n "${ABORT}" ] && return
+    while [ "$(jobs -rp | wc -l)" -ge "${MAX_CONCURRENT}" ]; do
+        note_failures
+        [ -n "${ABORT}" ] && return
+        sleep 1
+    done
+    run_split "$@" &
+}
+
+# FIFTEEN processes, longest splits first so the pool packs tight. The engine
+# opens PostgreSQL connections per query across six datasources, so this needs
+# max_connections well above the default - the fixture sets 2000 in
+# scripts/run-postgres.sh. At the default the run dies with "sorry, too many
+# clients already", which reads like an engine failure and is not one.
 #
 # The corpus is split six ways and the widest variant (projection pushdown
 # changes 95% of plans) three, because a variant walks the whole corpus itself
 # and was the bottleneck until it could be divided. Every (case, distribution)
 # belongs to exactly one process by position, in the corpus and in each variant
 # alike, so the set partitions rather than samples.
-run_split corpus_0 tests/e2e_federated/test_corpus.py "" 0 6 &
-run_split corpus_1 tests/e2e_federated/test_corpus.py "" 1 6 &
-run_split corpus_2 tests/e2e_federated/test_corpus.py "" 2 6 &
-run_split corpus_3 tests/e2e_federated/test_corpus.py "" 3 6 &
-run_split corpus_4 tests/e2e_federated/test_corpus.py "" 4 6 &
-run_split corpus_5 tests/e2e_federated/test_corpus.py "" 5 6 &
-run_split proj_0 tests/e2e_federated/test_plan_variants.py "projection_pushdown_off" 0 3 &
-run_split proj_1 tests/e2e_federated/test_plan_variants.py "projection_pushdown_off" 1 3 &
-run_split proj_2 tests/e2e_federated/test_plan_variants.py "projection_pushdown_off" 2 3 &
-run_split reorder_0 tests/e2e_federated/test_plan_variants.py "join_reordering_off" 0 2 &
-run_split reorder_1 tests/e2e_federated/test_plan_variants.py "join_reordering_off" 1 2 &
-run_split pred tests/e2e_federated/test_plan_variants.py "predicate_pushdown_off" 0 1 &
-run_split greedy tests/e2e_federated/test_plan_variants.py "join_order_greedy" 0 1 &
-run_split learned tests/e2e_federated/test_plan_variants.py \
-    "learned_statistics_on or accelerator_off" 0 1 &
-run_split rest tests/ \
-    "not test_corpus and not test_every_plan_this_variant_reaches" &
+launch proj_0 tests/e2e_federated/test_plan_variants.py "projection_pushdown_off" 0 3
+launch proj_1 tests/e2e_federated/test_plan_variants.py "projection_pushdown_off" 1 3
+launch proj_2 tests/e2e_federated/test_plan_variants.py "projection_pushdown_off" 2 3
+launch learned tests/e2e_federated/test_plan_variants.py \
+    "learned_statistics_on or accelerator_off" 0 1
+launch reorder_0 tests/e2e_federated/test_plan_variants.py "join_reordering_off" 0 2
+launch reorder_1 tests/e2e_federated/test_plan_variants.py "join_reordering_off" 1 2
+launch greedy tests/e2e_federated/test_plan_variants.py "join_order_greedy" 0 1
+launch corpus_0 tests/e2e_federated/test_corpus.py "" 0 6
+launch corpus_1 tests/e2e_federated/test_corpus.py "" 1 6
+launch corpus_2 tests/e2e_federated/test_corpus.py "" 2 6
+launch corpus_3 tests/e2e_federated/test_corpus.py "" 3 6
+launch corpus_4 tests/e2e_federated/test_corpus.py "" 4 6
+launch corpus_5 tests/e2e_federated/test_corpus.py "" 5 6
+launch pred tests/e2e_federated/test_plan_variants.py "predicate_pushdown_off" 0 1
+launch rest tests/ \
+    "not test_corpus and not test_every_plan_this_variant_reaches"
 
 # STOP AT THE FIRST FAILURE. A failing suite has said what it needed to say; the
 # remaining twenty minutes only delay reading it. Each process runs pytest with
 # -x so it stops at its own first failure, and the moment any process exits
 # non-zero the rest are killed. A green run is unaffected - every test still runs.
-FAILED_FIRST=""
+FAILED_FIRST="${ABORT}"
 while :; do
     for exit_file in "${LOGS}"/*.exit; do
         [ -e "${exit_file}" ] || continue

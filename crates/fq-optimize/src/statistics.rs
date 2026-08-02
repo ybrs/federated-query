@@ -41,12 +41,21 @@ struct TableStatsEntry {
 }
 
 impl TableStatsEntry {
-    /// The accumulated state as a `TableStatistics` snapshot.
-    fn merged_view(&self) -> TableStatistics {
+    /// The accumulated state filtered to the requested columns: a view carries
+    /// exactly what its caller asked for, so its content (and its clone cost)
+    /// is a function of the request, never of what the session happens to have
+    /// accumulated for other callers.
+    fn view_for(&self, columns: &[String]) -> TableStatistics {
+        let mut column_stats = BTreeMap::new();
+        for column in columns {
+            if let Some(stats) = self.column_stats.get(column) {
+                column_stats.insert(column.clone(), stats.clone());
+            }
+        }
         TableStatistics {
             row_count: self.row_count,
             total_size_bytes: self.total_size_bytes,
-            column_stats: self.column_stats.clone(),
+            column_stats,
         }
     }
 }
@@ -197,12 +206,7 @@ impl StatisticsCollector {
         if has_entry && missing.is_empty() {
             // An entry exists and covers every requested column (or nothing was
             // requested): return its snapshot without a round trip.
-            return Ok(self
-                .cache
-                .lock()
-                .expect("stats cache lock poisoned")
-                .get(&key)
-                .map(TableStatsEntry::merged_view));
+            return Ok(self.cached_view(&key, columns));
         }
         // Budget-check BOTH sides of the source round trip: before, so an
         // already-exhausted plan does not start another fetch; after, so the
@@ -213,14 +217,10 @@ impl StatisticsCollector {
         self.check_plan_budget(datasource, schema, table)?;
         let Some(fetched) = fetched else {
             // Source has nothing new; return the existing entry unchanged.
-            return Ok(self
-                .cache
-                .lock()
-                .expect("stats cache lock poisoned")
-                .get(&key)
-                .map(TableStatsEntry::merged_view));
+            return Ok(self.cached_view(&key, columns));
         };
-        Ok(Some(self.absorb(key, fetched, &missing)))
+        self.absorb(key.clone(), fetched, &missing);
+        Ok(self.cached_view(&key, columns))
     }
 
     /// The requested columns the entry has not attempted yet (all of them when no
@@ -237,14 +237,23 @@ impl StatisticsCollector {
         missing
     }
 
-    /// Merge one fetch into the cache entry (created from the fetch on the first
-    /// touch), mark every missing column attempted, and return the snapshot.
-    fn absorb(
+    /// The cached entry's view over the requested columns, or `None` when no
+    /// entry exists.
+    fn cached_view(
         &self,
-        key: (String, String, String),
-        fetched: TableStatistics,
-        missing: &[String],
-    ) -> TableStatistics {
+        key: &(String, String, String),
+        columns: &[String],
+    ) -> Option<TableStatistics> {
+        self.cache
+            .lock()
+            .expect("stats cache lock poisoned")
+            .get(key)
+            .map(|entry| entry.view_for(columns))
+    }
+
+    /// Merge one fetch into the cache entry (created from the fetch on the first
+    /// touch) and mark every missing column attempted.
+    fn absorb(&self, key: (String, String, String), fetched: TableStatistics, missing: &[String]) {
         let mut cache = self.cache.lock().expect("stats cache lock poisoned");
         let entry = cache.entry(key).or_insert_with(|| TableStatsEntry {
             row_count: fetched.row_count,
@@ -258,7 +267,6 @@ impl StatisticsCollector {
         for (name, stats) in fetched.column_stats {
             entry.column_stats.insert(name, stats);
         }
-        entry.merged_view()
     }
 
     /// FILL a table's missing statistics from the learned catalog (a row count or

@@ -146,6 +146,13 @@ impl PhysicalPlanner {
     /// counter, then dispatches from the root.
     pub fn plan(&mut self, logical_plan: &LogicalPlan) -> Result<PhysicalPlan, PhysicalError> {
         self.ship_counter = 0;
+        // Every source-planner probe this plan's estimates will consult fires
+        // concurrently up front, so the stage's wall clock carries the slowest
+        // round trip rather than one per scan in sequence. Estimates are
+        // identical with or without the warm-up.
+        if let Some(cost_model) = &self.cost_model {
+            cost_model.borrow().prewarm_plan_probes(&[logical_plan]);
+        }
         self.plan_node(logical_plan)
     }
 

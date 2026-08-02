@@ -131,22 +131,23 @@ def fragment_verifier(engine):
 
 @pytest.fixture(scope="session")
 def default_plan_shapes(engine):
-    """The plan every corpus query gets under the suite's own settings.
+    """The plan each owned corpus query gets under the suite's own settings.
 
     Taken once, before any variant changes a setting, and shared by every variant
     test. A variant then decides whether it changed a query's plan by comparing
     against this, which costs one EXPLAIN rather than the two `SET` statements
     that toggling back and forth would cost - and a `SET` costs about what
     executing a query costs, so doing it per query would dominate the run.
+
+    Only the (case, variation) pairs this process owns are recorded: the variant
+    walk looks up exactly those, and both sides iterate the ONE walk definition
+    (``plan_variants.owned_variant_pairs``), so recording the rest would be a
+    full-corpus EXPLAIN walk per process for shapes nothing reads.
     """
     runtime = engine.runtime()
     shapes = {}
-    for case in all_cases():
-        if "expect_error" in case:
-            continue
-        specs = case_table_specs(case)
-        for variation in harness.variations(specs, case.get("min_sources", 1)):
-            _record_shape(engine, runtime, case, variation, shapes)
+    for case, variation in plan_variants.owned_variant_pairs():
+        _record_shape(engine, runtime, case, variation, shapes)
     return shapes
 
 
