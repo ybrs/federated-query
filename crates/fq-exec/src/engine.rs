@@ -128,6 +128,10 @@ fn build_exec_runtime(max_threads: usize) -> (Runtime, usize) {
     let workers = resolved_workers(max_threads);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
+        // Workers execute DataFusion over composed plans whose recursion is
+        // as deep as the plan; the tokio default stack overflows on wide
+        // joins exactly like a spawn default would.
+        .thread_stack_size(fq_common::QUERY_THREAD_STACK_BYTES)
         .enable_all()
         .build()
         .expect("execution tokio runtime construction failed");

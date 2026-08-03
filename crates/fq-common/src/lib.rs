@@ -20,6 +20,15 @@ pub mod types;
 #[macro_use]
 mod update;
 
+/// The stack size for any thread that PLANS or EXECUTES queries. The plan
+/// passes (bind, decorrelate, optimize, physical, steps) recurse once per plan
+/// level, so a join over n tables costs ~n frames per pass; on the 2MiB
+/// default of a spawned thread, a 64-table star overflows in a debug build -
+/// a SIGSEGV, not an error. Sixteen MiB carries several hundred join levels
+/// in debug with margin. Query depth beyond what this stack carries dies by
+/// stack overflow: there is no plan-depth guard, so no loud error precedes it.
+pub const QUERY_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
+
 pub use budget::PlanBudget;
 pub use config::{
     load_config, AcceleratorConfig, CatalogConfig, ChangeKey, Config, CostConfig, DataSourceConfig,

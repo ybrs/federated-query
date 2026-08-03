@@ -69,7 +69,13 @@ impl Session {
     /// than blocking `accept`.
     pub fn spawn(config: Config) -> Session {
         let (jobs, receiver) = mpsc::unbounded_channel::<Job>();
-        std::thread::spawn(move || run_worker(&config, receiver));
+        // The worker plans queries, whose passes recurse once per plan level;
+        // the 2MiB spawn default overflows on wide joins, killing the process
+        // instead of erroring the query.
+        std::thread::Builder::new()
+            .stack_size(fq_common::QUERY_THREAD_STACK_BYTES)
+            .spawn(move || run_worker(&config, receiver))
+            .expect("session worker thread spawn failed");
         Session { jobs }
     }
 

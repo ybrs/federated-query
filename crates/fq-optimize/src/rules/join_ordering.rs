@@ -56,6 +56,17 @@ const MAX_REGION_ATOMS: usize = 64;
 /// the clock.
 const DP_WORK_CAP: u64 = 20_000;
 
+/// The GOO greedy's work bound, in the same units as `DP_WORK_CAP`. The greedy
+/// tries every starting pair and then every remaining atom per step - O(n^2)
+/// attempts, each a full `join_estimate` whose conjunct scan is itself
+/// O(conjuncts) - so on wide or dense components it blows the planning budget
+/// exactly as the uncapped DP did (measured: a 64-atom star's greedy at
+/// ~100ms and a 64-atom clique's at 265ms in release). A component above this
+/// cap is ordered by `cheap_connected`, which never estimates a candidate it
+/// does not place. The count is arithmetic over (atoms, conjuncts):
+/// deterministic and machine-independent.
+const GREEDY_WORK_CAP: u64 = 100_000;
+
 // ------------------------------- result types -------------------------------
 
 /// One left-deep join step: the atom joined, its estimate, and which region
@@ -614,12 +625,15 @@ impl Enumerator<'_> {
                 total: self.atom_estimates[component[0]].clone(),
             });
         }
+        let conjuncts = self.region.conjuncts.len().max(1) as u64;
         let candidate = if component.len() <= self.max_dp
             && dp_work_units(self.region, component) <= DP_WORK_CAP
         {
             self.dp_best(component)?
-        } else {
+        } else if greedy_work_units(component.len(), conjuncts) <= GREEDY_WORK_CAP {
             self.greedy(component)?
+        } else {
+            self.cheap_connected(component)?
         };
         Ok(to_component_order(candidate))
     }
@@ -762,6 +776,65 @@ impl Enumerator<'_> {
         Ok(candidate)
     }
 
+    /// The bottom of the ordering ladder, for components whose GREEDY work
+    /// exceeds its cap: seed at the smallest-estimated atom, then always
+    /// append the smallest-estimated atom an equi conjunct CONNECTS to the
+    /// prefix. Only base estimates steer the choice - one `join_estimate`
+    /// runs per PLACED step (the emitted steps carry estimates), never one
+    /// per considered candidate, so a component of any admissible width
+    /// orders in O(n^2) adjacency words plus n-1 estimates. The order is
+    /// small-first-connected rather than cost-ordered: at the widths that
+    /// reach this tier, that beats both a killed plan and the written order.
+    fn cheap_connected(&self, component: &[usize]) -> Result<Candidate, OptimizeError> {
+        let adjacency = equi_adjacency(self.region);
+        let first = self.smallest_base(component, |_| true)?;
+        let mut candidate = self.seed(first);
+        let mut subset = 1u64 << first;
+        while candidate.sequence.len() < component.len() {
+            let next = self.smallest_base(component, |atom| {
+                subset & (1u64 << atom) == 0
+                    && adjacency
+                        .get(&atom)
+                        .is_some_and(|neighbors| neighbors & subset != 0)
+            })?;
+            candidate = self.try_extend(&candidate, subset, next)?.ok_or_else(|| {
+                OptimizeError::JoinOrder(
+                    "cheap connected order picked an atom no equi conjunct connects".to_string(),
+                )
+            })?;
+            subset |= 1u64 << next;
+        }
+        Ok(candidate)
+    }
+
+    /// The admitted atom with the smallest base row estimate (ties: smallest
+    /// index, so the order is deterministic). Raises when nothing is admitted:
+    /// a connected component always has a connected continuation, so an empty
+    /// choice here is a broken component, never a decline.
+    fn smallest_base(
+        &self,
+        component: &[usize],
+        keep: impl Fn(usize) -> bool,
+    ) -> Result<usize, OptimizeError> {
+        component
+            .iter()
+            .copied()
+            .filter(|&atom| keep(atom))
+            .min_by_key(|&atom| {
+                let rows = self.atom_estimates[atom]
+                    .rows
+                    .expect("choose_order gates every atom estimate to KNOWN");
+                (rows, atom)
+            })
+            .ok_or_else(|| {
+                OptimizeError::JoinOrder(
+                    "no connected atom to continue the cheap order; the component \
+                     partition is broken"
+                        .to_string(),
+                )
+            })
+    }
+
     /// The cheapest connected starting pair of the component.
     fn best_pair(&self, component: &[usize]) -> Result<Candidate, OptimizeError> {
         let mut best = None;
@@ -846,6 +919,18 @@ impl Enumerator<'_> {
             cross_steps,
         })
     }
+}
+
+/// The GOO greedy's counted work for a component: `n * (n - 1)` starting-pair
+/// attempts plus at most `(n - 1) * (n - 2) / 2` step attempts, each scanning
+/// the region's conjuncts.
+fn greedy_work_units(atoms: usize, conjuncts: u64) -> u64 {
+    let n = atoms as u64;
+    let pair_attempts = n.saturating_mul(n.saturating_sub(1));
+    let step_attempts = n.saturating_sub(1).saturating_mul(n.saturating_sub(2)) / 2;
+    pair_attempts
+        .saturating_add(step_attempts)
+        .saturating_mul(conjuncts)
 }
 
 /// The exact work the Selinger DP would spend on a component, counted by a DRY
@@ -1093,10 +1178,13 @@ fn choose_order(
         ));
     }
     if region.atoms.len() > MAX_REGION_ATOMS {
-        // A valid but enormous region the bitmask DP cannot address: DECLINE (leave
-        // its written order) rather than fail the query. This returns before any
-        // `1 << index` shift, so the bitmask domain stays well-defined. No real
-        // query joins this many base tables in one connected region.
+        // A region past the bitmask domain: DECLINE here, before any
+        // `1 << index` shift. The rule's recursion then re-extracts the join's
+        // children - the same region one atom smaller per level - until a
+        // slice fits the domain, and THAT slice is ordered by whichever ladder
+        // tier its counted work admits (the cheap connected tier at these
+        // widths). Atoms past the domain keep their written position while the
+        // widest addressable inner slice is still ordered.
         return Ok(None);
     }
     let atom_estimates = base_atom_estimates(region, estimator)?;
