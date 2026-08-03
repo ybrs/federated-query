@@ -18,8 +18,8 @@
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/done_gate.py\"",
-            "timeout": 900,
-            "statusMessage": "done-gate: make lint + cargo test --workspace"
+            "timeout": 5400,
+            "statusMessage": "done-gate: full gate unless this exact tree is already verified green"
           }
         ]
       }

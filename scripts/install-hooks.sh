@@ -142,7 +142,48 @@ cargo build --release -p fedq-py --manifest-path "$root/Cargo.toml" \
 ( cd "$root" && ./run_e2e_parallel.sh ) \
     || block "pytest e2e suite" "e2e failures or collection errors. Read the per-process logs in run-e2e-logs/ - a collection error means the suite did not run, which is a failure, not a pass."
 
-exec "$root/scripts/comment-gate/gate.sh"
+"$root/scripts/comment-gate/gate.sh" \
+    || exit 1
+
+# Every check above ran on the WORKING TREE. When that tree is exactly the
+# content this commit is about to record - every porcelain line purely staged
+# (second column clean), nothing untracked - record the index's tree id as a
+# PENDING token. post-commit promotes it to the done-gate's green stamp only if
+# the created commit's tree matches, so the stamp always names content the full
+# gate actually verified. Any unstaged edit or untracked file means the
+# verified content differs from the commit, and no token is written.
+if ! git -C "$root" status --porcelain | grep -qvE '^[MTADRC] '; then
+    mkdir -p "$root/.git/fedq-gate"
+    git -C "$root" write-tree > "$root/.git/fedq-gate/pending-tree"
+fi
 EOF
 chmod +x "$hook_dir/pre-commit"
-echo "install-hooks: pre-commit -> lint + clippy + cargo test + pytest e2e + comment gate (no exceptions)"
+
+cat > "$hook_dir/post-commit" <<'EOF'
+#!/usr/bin/env bash
+# Installed by scripts/install-hooks.sh (re-run anytime; `make hook-install`).
+#
+# Promote the pre-commit gate's PENDING token to the done-gate's green stamp,
+# strictly by content: the token holds the tree id whose working-tree content
+# the full gate verified, and the stamp is written only when the commit just
+# created records exactly that tree. A commit made with --no-verify cannot be
+# stamped - it has no token unless a fully green gate verified identical
+# content, in which case the verification genuinely covers it.
+set -uo pipefail
+root="$(git rev-parse --show-toplevel)"
+token="$root/.git/fedq-gate/pending-tree"
+
+[ -f "$token" ] || exit 0
+verified_tree="$(cat "$token")"
+rm -f "$token"
+head_tree="$(git -C "$root" rev-parse 'HEAD^{tree}')"
+[ "$verified_tree" = "$head_tree" ] || exit 0
+
+commit="$(git -C "$root" rev-parse HEAD)"
+stamp="$root/.git/fedq-gate/green-tree"
+printf '{"tree": "%s", "commit": "%s", "verified_by": "pre-commit", "verified_at": "%s"}\n' \
+    "$verified_tree" "$commit" "$(date +%Y-%m-%dT%H:%M:%S%z)" > "$stamp.tmp"
+mv -f "$stamp.tmp" "$stamp"
+EOF
+chmod +x "$hook_dir/post-commit"
+echo "install-hooks: pre-commit -> lint + clippy + cargo test + pytest e2e + comment gate (no exceptions); post-commit -> green-tree stamp for the done-gate"

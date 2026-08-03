@@ -144,13 +144,6 @@ trait RegionEstimator {
         right: &CardinalityEstimate,
         positions: &[usize],
     ) -> Result<CardinalityEstimate, OptimizeError>;
-
-    /// Fire whatever source round trips the atom walk will consult,
-    /// concurrently, so the walk's wall clock carries the slowest one rather
-    /// than their sum. Purely a warm-up: every estimate is identical with or
-    /// without it. The default does nothing (test estimators answer from
-    /// hand-fed tables and consult no source).
-    fn prewarm_atoms(&self, _atom_plans: &[LogicalPlan]) {}
 }
 
 /// A `RegionEstimator` answering from the `CostModel` and source statistics. The
@@ -242,16 +235,6 @@ impl RegionEstimator for CostModelRegionEstimator<'_> {
             (rows as u64).max(1),
             combine_defaults(&[left, right], &defaults),
         ))
-    }
-
-    /// The source-planner probes the atom walk will consult, fired concurrently
-    /// into the collector's memo (see the trait method).
-    fn prewarm_atoms(&self, atom_plans: &[LogicalPlan]) {
-        let mut plans = Vec::with_capacity(atom_plans.len());
-        for plan in atom_plans {
-            plans.push(plan);
-        }
-        self.cost_model.borrow().prewarm_plan_probes(&plans);
     }
 }
 
@@ -1011,16 +994,6 @@ fn base_atom_estimates(
     region: &JoinRegion,
     estimator: &dyn RegionEstimator,
 ) -> Result<Vec<CardinalityEstimate>, OptimizeError> {
-    // The folded atom plans, built exactly as `atom_estimate` builds them, so
-    // the probes the prewarm fires are keyed identically to the ones the walk
-    // consults.
-    let mut atom_plans = Vec::with_capacity(region.atoms.len());
-    for atom in &region.atoms {
-        let positions = local_positions(region, atom.index);
-        let filters = local_exprs(region, &positions);
-        atom_plans.push(with_local_filters(atom.plan.clone(), &filters));
-    }
-    estimator.prewarm_atoms(&atom_plans);
     let mut estimates = Vec::with_capacity(region.atoms.len());
     for atom in &region.atoms {
         let positions = local_positions(region, atom.index);
