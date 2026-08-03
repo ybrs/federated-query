@@ -87,6 +87,71 @@ pub(crate) fn runtime_env() -> Arc<RuntimeEnv> {
     .clone()
 }
 
+/// The ONE tokio runtime every query in this process executes on, and the
+/// worker count it was built with.
+///
+/// Shared rather than per-query: building a multi-threaded runtime per query
+/// cost ~330us each and, worse, gave every in-flight query a thread per core,
+/// so concurrent queries oversubscribed the machine and their construction
+/// storms were billed to whichever query's wall-clock planning budget ran
+/// first. Every caller of `execute()` is on a plain OS thread (the server
+/// runs sessions on dedicated worker threads; the Python binding executes on
+/// GIL-released threads), so `block_on` here can never run inside an async
+/// context.
+static EXEC_RUNTIME: OnceLock<(Runtime, usize)> = OnceLock::new();
+
+/// `executor.max_threads` resolved to a real worker count: 0 is one per core.
+fn resolved_workers(max_threads: usize) -> usize {
+    if max_threads == 0 {
+        return std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    }
+    max_threads
+}
+
+/// Build (once) and return the process-wide execution runtime. The first call
+/// fixes the worker count; `ensure_exec_runtime` is how a configured bound
+/// gets in before any query runs.
+pub(crate) fn exec_runtime() -> &'static Runtime {
+    let (runtime, _workers) = EXEC_RUNTIME.get_or_init(|| build_exec_runtime(0));
+    runtime
+}
+
+/// The worker count of the process-wide execution runtime (building it with
+/// the per-core default if nothing configured one yet).
+pub(crate) fn exec_runtime_workers() -> usize {
+    let (_runtime, workers) = EXEC_RUNTIME.get_or_init(|| build_exec_runtime(0));
+    *workers
+}
+
+/// Construct the execution runtime with `max_threads` workers (0 = per core).
+fn build_exec_runtime(max_threads: usize) -> (Runtime, usize) {
+    let workers = resolved_workers(max_threads);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .expect("execution tokio runtime construction failed");
+    (runtime, workers)
+}
+
+/// Build the process-wide execution runtime with the configured
+/// `executor.max_threads` bound (0 = one worker per core), or verify that the
+/// already-built runtime honors it. The first configuration in a process wins;
+/// a later one asking for a DIFFERENT bound raises, because running under a
+/// bound the config did not choose would be a silent misconfiguration.
+pub fn ensure_exec_runtime(max_threads: usize) -> Result<(), String> {
+    let (_runtime, built) = EXEC_RUNTIME.get_or_init(|| build_exec_runtime(max_threads));
+    let requested = resolved_workers(max_threads);
+    if *built != requested {
+        return Err(format!(
+            "executor.max_threads asks for {requested} execution workers, but this \
+             process's execution runtime is already built with {built}; the worker \
+             count is fixed by the first configuration the process loads"
+        ));
+    }
+    Ok(())
+}
+
 /// A SessionContext wired to the shared memory-capped runtime.
 fn memory_capped_context() -> SessionContext {
     coordinator_context(SessionConfig::new())
@@ -112,6 +177,10 @@ fn coordinator_context(config: SessionConfig) -> SessionContext {
             rules.push(rule);
         }
     }
+    // Plan partitioning follows the execution runtime's worker count, so a
+    // bounded `executor.max_threads` bounds the plan's parallelism too instead
+    // of fanning out per-core partitions onto fewer workers.
+    let config = config.with_target_partitions(exec_runtime_workers());
     let state = SessionStateBuilder::new()
         .with_default_features()
         .with_config(config)
@@ -437,7 +506,7 @@ pub fn execute(ir: &Ir) -> ExecResult<(SchemaRef, Vec<RecordBatch>, Vec<(String,
     // by the guard below - this is the defensive backstop).
     connectors::clear_shipments();
     let _shipments = ShipmentGuard;
-    let runtime = Runtime::new().map_err(|e| ExecError::runtime(format!("tokio runtime: {e}")))?;
+    let runtime = exec_runtime();
     let mut bindings: HashMap<String, Binding> = HashMap::new();
     let mut remaining = binding_use_counts(ir);
     // (binding, measured rows) for every materialized step, returned to Python

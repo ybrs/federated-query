@@ -509,12 +509,12 @@ fn fetch_clickhouse(
     Ok((schema, batches))
 }
 
-// A DataFusion runtime for reading Parquet sources. Source reads run in the
-// engine's sync step loop (not inside a block_on), so a dedicated runtime here
-// is safe to block on.
+// Parquet reads run on the process-wide execution runtime: they happen on the
+// engine's sync step loop or on a prefetch worker - plain OS threads, never
+// inside an async context - so blocking on the shared runtime is safe, and one
+// runtime means one `executor.max_threads` bound governs all execution work.
 fn parquet_runtime() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| tokio::runtime::Runtime::new().expect("parquet tokio runtime"))
+    crate::engine::exec_runtime()
 }
 
 // Read a Parquet source by running the pushed SQL through DataFusion over the

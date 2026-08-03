@@ -26,5 +26,5 @@ pub mod engine;
 pub mod error;
 
 pub use bridge::{execute_plan, serialize_expr, to_ir, PlanExecution};
-pub use engine::execute;
+pub use engine::{ensure_exec_runtime, execute};
 pub use error::{ExecError, ExecResult};

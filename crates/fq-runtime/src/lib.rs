@@ -115,6 +115,12 @@ impl Runtime {
     /// and the exec read handle coexist on the same file for the whole session
     /// (DuckDB is single-writer per file per process).
     pub fn from_config(config: &Config) -> Result<Self, RuntimeError> {
+        // The process-wide execution runtime is built (or checked) FIRST, so
+        // `executor.max_threads` is honored before any query can run and a
+        // config whose bound disagrees with the already-built runtime fails
+        // construction loudly instead of executing under someone else's bound.
+        fq_exec::ensure_exec_runtime(config.executor.max_threads as usize)
+            .map_err(RuntimeError::Config)?;
         let session = connectors::open_session();
         // The materialized-view store also holds the persisted dynamic-datasource
         // registry (both live in the config's stats SQLite); open it first so the

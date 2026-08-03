@@ -157,6 +157,11 @@ impl Default for OptimizerConfig {
 }
 
 /// Configuration for the query executor.
+///
+/// `max_threads` bounds the worker threads of the PROCESS-WIDE execution
+/// runtime every query runs on; 0 means one worker per core. The first
+/// runtime built in a process fixes the count: a later config asking for a
+/// different bound raises rather than silently running under the first one's.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ExecutorConfig {
@@ -167,12 +172,14 @@ pub struct ExecutorConfig {
 }
 
 impl Default for ExecutorConfig {
-    /// Mirrors the Python defaults.
+    /// `max_threads` defaults to 0 (one execution worker per core), so an
+    /// unbounded deployment keeps whole-machine parallelism; a bound is an
+    /// explicit operator choice.
     fn default() -> Self {
         Self {
             max_memory_mb: 1024,
             batch_size: 10000,
-            max_threads: 4,
+            max_threads: 0,
             enable_parallel_fetch: true,
         }
     }

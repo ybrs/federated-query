@@ -16,11 +16,12 @@
 #   ./run_isolated_tests.sh [output.jsonl] [workers]
 #
 # It takes hours. That is the price of a number that means something. Workers
-# default to 1 because parallel workers oversubscribe the machine - the engine
-# builds a tokio runtime per query with one thread per core - and the planning
-# budget is wall clock, so a parallel run can kill plans a sequential one would
-# not. Those kills are recorded as the failures they are, with their error text,
-# so a run that produces them says so instead of hiding it.
+# default to 1 because parallel workers oversubscribe the machine - every
+# isolated variation is its own PROCESS, and each process's execution runtime
+# defaults to one worker thread per core - and the planning budget is wall
+# clock, so a parallel run can kill plans a sequential one would not. Those
+# kills are recorded as the failures they are, with their error text, so a run
+# that produces them says so instead of hiding it.
 
 set -euo pipefail
 

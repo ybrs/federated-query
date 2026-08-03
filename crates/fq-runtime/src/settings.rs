@@ -485,16 +485,15 @@ static SETTINGS: &[SettingDef] = &[
     },
     SettingDef {
         name: "executor.max_threads",
-        description: "Executor worker-thread count. Parsed from config; the Rust \
-                      executor does not read it today.",
-        mutability: Mutability::SessionMutable,
+        description: "Worker threads of the process-wide execution runtime \
+                      (0 = one per core). The first configuration the process \
+                      loads fixes the count, so this cannot change on a live \
+                      runtime.",
+        mutability: Mutability::Static,
         env_var: None,
         default: || SettingValue::U64(u64::from(ExecutorConfig::default().max_threads)),
         read: |c| SettingValue::U64(u64::from(c.executor.max_threads)),
-        apply: Some(|c, v| {
-            c.executor.max_threads = to_u32(v.as_u64()?)?;
-            Ok(())
-        }),
+        apply: None,
     },
     SettingDef {
         name: "executor.enable_parallel_fetch",
