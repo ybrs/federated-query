@@ -212,6 +212,26 @@ hook installs itself on session start (SessionStart hook -> scripts/
 install-hooks.sh; manual: `make hook-install`); a gate failure blocks the
 commit and prints each offending comment.
 
+# AGENT WORKTREES BUILD WARM, NEVER COLD
+
+A fresh git worktree pays a from-scratch build of ~3300 crates; measured, three
+concurrent cold builds sat at 14% of the graph after 54 minutes. Before any
+agent builds in a worktree, warm it:
+
+    ./scripts/warm-worktree-agent.sh <worktree-path>
+
+It hardlink-copies the main target/, pins the DUCKDB [env] paths in the
+worktree's .cargo/config.toml to the main root's ABSOLUTE path, symlinks
+.duckdb-lib, and creates ./venv. The pin matters because cargo hashes resolved
+[env] values into every unit's fingerprint: the repo's `relative = true`
+entries resolve differently per tree, so without the pin even a copied target
+rebuilds everything. Warmed, a build compiles only the workspace crates.
+
+The pinned .cargo/config.toml and the .duckdb-lib link are LOCAL throwaway
+state and must never be committed - in a worktree, stage files by explicit
+path, never `git add -A`. The full launch procedure (agent prompt warnings,
+concurrency ceiling, integration steps) is the `launch-worktree-agent` skill.
+
 # WORK TRACKING LIVES IN TASKQ
 
 There is no checked-in roadmap, handoff, or status document, and no new one is
