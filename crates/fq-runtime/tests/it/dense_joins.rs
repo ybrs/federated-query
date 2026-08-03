@@ -141,9 +141,11 @@ fn dense_join_graphs_plan_inside_the_budget() {
 
 #[test]
 fn wide_star_joins_plan_inside_the_budget() {
-    // Fifty tables is the contract this pins. Widths of 64-70 plan at
-    // 61-99ms in an idle debug build - inside the budget but without the
-    // headroom a loaded suite run needs - so this test does not assert them.
+    // Fifty tables is the contract this pins. Widths of 65-70 - past the DP
+    // bitmask domain, ordered by the set-based cheap tier - plan at 66-75ms
+    // in an idle debug build: inside the budget but without the headroom a
+    // loaded suite run needs, so this test does not assert them. That they
+    // ORDER at all is pinned width-exactly by the fq-optimize unit tests.
     plan_widths("star", star_sql, &[30, 50]);
 }
 

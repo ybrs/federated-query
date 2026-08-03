@@ -36,11 +36,12 @@ use crate::join_graph::{extract_region, is_region_join, JoinAtom, JoinConjunct, 
 
 use super::OptimizationRule;
 
-/// The largest region the DP bitmask (a `u64` over global atom indexes) can
-/// address. A larger region declines reordering (keeps its written order) rather
-/// than shift past the bitmask domain. No real query joins this many base tables
-/// in one connected region.
-const MAX_REGION_ATOMS: usize = 64;
+/// The largest region the DP's `u64` subset bitmask (over global atom indexes)
+/// can address. The DP tier is gated on the whole REGION fitting this domain -
+/// atom indexes are the atoms' dense positions, so a region of at most this
+/// many atoms shifts safely. A wider region still orders: the greedy and cheap
+/// tiers track subsets as index sets and carry no width bound.
+const MAX_DP_REGION_ATOMS: usize = 64;
 
 /// The DP work bound, in units of one conjunct inspected while costing one
 /// candidate extension - the enumeration inner loop's dominant term. The DP's
@@ -422,27 +423,47 @@ fn flood(
     component
 }
 
-/// The bitmask of an atom-index set (all indexes are `< MAX_REGION_ATOMS`).
-fn atoms_mask(atoms: &BTreeSet<usize>) -> u64 {
-    let mut mask = 0u64;
-    for &atom in atoms {
-        mask |= 1u64 << atom;
+/// An enumeration prefix's atom membership, answered without fixing the
+/// representation: the DP keys its table on `u64` bitmasks (bounded to
+/// `MAX_DP_REGION_ATOMS` global indexes), while the greedy and cheap tiers
+/// track a `BTreeSet` so a region of any width orders. Everything downstream
+/// of a subset - conjunct coverage, extension costing - asks only membership,
+/// so one implementation serves every tier.
+trait AtomSubset {
+    /// Whether the subset holds the atom at this global region index.
+    fn holds(&self, atom_index: usize) -> bool;
+}
+
+impl AtomSubset for u64 {
+    fn holds(&self, atom_index: usize) -> bool {
+        self & (1u64 << atom_index) != 0
     }
-    mask
+}
+
+impl AtomSubset for BTreeSet<usize> {
+    fn holds(&self, atom_index: usize) -> bool {
+        self.contains(&atom_index)
+    }
 }
 
 /// Positions of the multi-atom conjuncts covered by `subset | {atom_index}` but
 /// not by `subset` alone - the ones a step growing the subset must place (each
 /// conjunct placed exactly once, on the first step covering all its atoms).
-fn newly_covered(region: &JoinRegion, subset: u64, atom_index: usize) -> Vec<usize> {
-    let grown = subset | (1u64 << atom_index);
+fn newly_covered<S: AtomSubset>(region: &JoinRegion, subset: &S, atom_index: usize) -> Vec<usize> {
     let mut positions = Vec::new();
     for (position, conjunct) in region.conjuncts.iter().enumerate() {
         if conjunct.atom_indexes.len() < 2 {
             continue;
         }
-        let mask = atoms_mask(&conjunct.atom_indexes);
-        if mask & grown == mask && mask & subset != mask {
+        let in_grown = conjunct
+            .atom_indexes
+            .iter()
+            .all(|&atom| atom == atom_index || subset.holds(atom));
+        let outside_subset = conjunct
+            .atom_indexes
+            .iter()
+            .any(|&atom| !subset.holds(atom));
+        if in_grown && outside_subset {
             positions.push(position);
         }
     }
@@ -616,7 +637,10 @@ impl Enumerator<'_> {
         }
     }
 
-    /// One component's order: trivial, DP, or greedy by its size.
+    /// One component's order, by the ladder: trivial, then DP when the region
+    /// fits the mask domain and the DP's counted work fits its cap, then the
+    /// greedy under its own cap, then the cheap connected order - which has no
+    /// width bound, so every component orders at some tier.
     fn order_component(&self, component: &[usize]) -> Result<ComponentOrder, OptimizeError> {
         if component.len() == 1 {
             return Ok(ComponentOrder {
@@ -626,7 +650,8 @@ impl Enumerator<'_> {
             });
         }
         let conjuncts = self.region.conjuncts.len().max(1) as u64;
-        let candidate = if component.len() <= self.max_dp
+        let candidate = if self.region.atoms.len() <= MAX_DP_REGION_ATOMS
+            && component.len() <= self.max_dp
             && dp_work_units(self.region, component) <= DP_WORK_CAP
         {
             self.dp_best(component)?
@@ -694,7 +719,7 @@ impl Enumerator<'_> {
             if subset & (1u64 << atom_index) != 0 {
                 continue;
             }
-            if let Some(extension) = self.evaluate_extension(candidate, subset, atom_index)? {
+            if let Some(extension) = self.evaluate_extension(candidate, &subset, atom_index)? {
                 keep_better_extension(
                     additions,
                     subset | (1u64 << atom_index),
@@ -712,10 +737,10 @@ impl Enumerator<'_> {
     /// deliberately ignoring the runtime key reduction (measured to mis-price
     /// island breaking). Carries everything needed to cost and compare the
     /// extension without cloning the parent's sequence or steps.
-    fn evaluate_extension(
+    fn evaluate_extension<S: AtomSubset>(
         &self,
         candidate: &Candidate,
-        subset: u64,
+        subset: &S,
         atom_index: usize,
     ) -> Result<Option<Extension>, OptimizeError> {
         let positions = newly_covered(self.region, subset, atom_index);
@@ -756,10 +781,10 @@ impl Enumerator<'_> {
     /// The candidate extended by one atom, or None when no EQUI conjunct
     /// connects the atom to the subset. The greedy paths use this directly;
     /// the DP compares extensions before materializing them.
-    fn try_extend(
+    fn try_extend<S: AtomSubset>(
         &self,
         candidate: &Candidate,
-        subset: u64,
+        subset: &S,
         atom_index: usize,
     ) -> Result<Option<Candidate>, OptimizeError> {
         Ok(self
@@ -781,28 +806,29 @@ impl Enumerator<'_> {
     /// append the smallest-estimated atom an equi conjunct CONNECTS to the
     /// prefix. Only base estimates steer the choice - one `join_estimate`
     /// runs per PLACED step (the emitted steps carry estimates), never one
-    /// per considered candidate, so a component of any admissible width
-    /// orders in O(n^2) adjacency words plus n-1 estimates. The order is
-    /// small-first-connected rather than cost-ordered: at the widths that
-    /// reach this tier, that beats both a killed plan and the written order.
+    /// per considered candidate, so a component of ANY width - subsets are
+    /// index sets, not bitmasks - orders in O(n^2) adjacency probes plus n-1
+    /// estimates. The order is small-first-connected rather than cost-ordered:
+    /// at the widths that reach this tier, that beats both a killed plan and
+    /// the written order.
     fn cheap_connected(&self, component: &[usize]) -> Result<Candidate, OptimizeError> {
-        let adjacency = equi_adjacency(self.region);
+        let adjacency = equi_neighbors(self.region);
         let first = self.smallest_base(component, |_| true)?;
         let mut candidate = self.seed(first);
-        let mut subset = 1u64 << first;
+        let mut subset = BTreeSet::from([first]);
         while candidate.sequence.len() < component.len() {
             let next = self.smallest_base(component, |atom| {
-                subset & (1u64 << atom) == 0
+                !subset.contains(&atom)
                     && adjacency
                         .get(&atom)
-                        .is_some_and(|neighbors| neighbors & subset != 0)
+                        .is_some_and(|neighbors| !neighbors.is_disjoint(&subset))
             })?;
-            candidate = self.try_extend(&candidate, subset, next)?.ok_or_else(|| {
+            candidate = self.try_extend(&candidate, &subset, next)?.ok_or_else(|| {
                 OptimizeError::JoinOrder(
                     "cheap connected order picked an atom no equi conjunct connects".to_string(),
                 )
             })?;
-            subset |= 1u64 << next;
+            subset.insert(next);
         }
         Ok(candidate)
     }
@@ -856,11 +882,11 @@ impl Enumerator<'_> {
         first: usize,
     ) -> Result<Option<Candidate>, OptimizeError> {
         let start = self.seed(first);
-        let subset = 1u64 << first;
+        let subset = BTreeSet::from([first]);
         let mut best = None;
         for &second in component {
             if second != first {
-                let contender = self.try_extend(&start, subset, second)?;
+                let contender = self.try_extend(&start, &subset, second)?;
                 best = better(best, contender);
             }
         }
@@ -873,14 +899,11 @@ impl Enumerator<'_> {
         component: &[usize],
         candidate: &Candidate,
     ) -> Result<Candidate, OptimizeError> {
-        let subset = candidate
-            .sequence
-            .iter()
-            .fold(0u64, |mask, &index| mask | (1u64 << index));
+        let subset: BTreeSet<usize> = candidate.sequence.iter().copied().collect();
         let mut best = None;
         for &atom_index in component {
-            if subset & (1u64 << atom_index) == 0 {
-                let contender = self.try_extend(candidate, subset, atom_index)?;
+            if !subset.contains(&atom_index) {
+                let contender = self.try_extend(candidate, &subset, atom_index)?;
                 best = better(best, contender);
             }
         }
@@ -940,7 +963,7 @@ fn greedy_work_units(atoms: usize, conjuncts: u64) -> u64 {
 /// allocation per attempt - so counting a capped component costs microseconds,
 /// and the early return keeps even a pathological one bounded near the cap.
 fn dp_work_units(region: &JoinRegion, component: &[usize]) -> u64 {
-    let adjacency = equi_adjacency(region);
+    let adjacency = equi_adjacency_masks(region);
     let conjuncts = region.conjuncts.len().max(1) as u64;
     let mut seen: BTreeSet<u64> = BTreeSet::new();
     let mut layer: Vec<u64> = Vec::with_capacity(component.len());
@@ -998,11 +1021,12 @@ fn grow_layer(
     }
 }
 
-/// Each atom's equi-join neighbors as a bitmask, from the region's two-atom
-/// equi conjuncts - the same connectivity `newly_covered` + `any_equi` decide,
-/// reduced to one AND per attempt for the dry count.
-fn equi_adjacency(region: &JoinRegion) -> BTreeMap<usize, u64> {
-    let mut adjacency: BTreeMap<usize, u64> = BTreeMap::new();
+/// Each atom's equi-join neighbors as an index set, from the region's two-atom
+/// equi conjuncts - the same connectivity `newly_covered` + `any_equi` decide.
+/// Index sets carry no width bound, so the cheap tier reads this at any region
+/// size; the DP dry count reduces it to bitmasks once at entry.
+fn equi_neighbors(region: &JoinRegion) -> BTreeMap<usize, BTreeSet<usize>> {
+    let mut adjacency: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
     for conjunct in &region.conjuncts {
         if !conjunct.is_equi || conjunct.atom_indexes.len() != 2 {
             continue;
@@ -1010,10 +1034,25 @@ fn equi_adjacency(region: &JoinRegion) -> BTreeMap<usize, u64> {
         let mut pair = conjunct.atom_indexes.iter();
         let first = *pair.next().expect("two atoms");
         let second = *pair.next().expect("two atoms");
-        *adjacency.entry(first).or_insert(0) |= 1u64 << second;
-        *adjacency.entry(second).or_insert(0) |= 1u64 << first;
+        adjacency.entry(first).or_default().insert(second);
+        adjacency.entry(second).or_default().insert(first);
     }
     adjacency
+}
+
+/// The equi adjacency reduced to one bitmask word per atom, for the DP dry
+/// count's one-AND-per-attempt connectivity test. Only called for regions
+/// inside the DP mask domain, where every index shifts safely.
+fn equi_adjacency_masks(region: &JoinRegion) -> BTreeMap<usize, u64> {
+    let mut masks: BTreeMap<usize, u64> = BTreeMap::new();
+    for (atom, neighbors) in equi_neighbors(region) {
+        let mut mask = 0u64;
+        for neighbor in neighbors {
+            mask |= 1u64 << neighbor;
+        }
+        masks.insert(atom, mask);
+    }
+    masks
 }
 
 /// The order cache's key for a region: the region with every scan's column
@@ -1161,12 +1200,13 @@ fn to_component_order(candidate: Candidate) -> ComponentOrder {
     }
 }
 
-/// The chosen join order for a region: DP per connected component up to `max_dp`
-/// atoms, greedy above, components CROSSed smallest-first.
+/// The chosen join order for a region: each connected component ordered by the
+/// ladder (DP, greedy, cheap connected - each tier bounded by counted work, the
+/// bottom tier unbounded in width), components CROSSed smallest-first.
 ///
-/// `Ok(None)` when any atom's estimate is UNKNOWN: a DP over a mix of measured
-/// and unknown sizes is confidently wrong, and a DP over all-unknowns is noise -
-/// the caller keeps the written order instead.
+/// `Ok(None)` when any atom's estimate is UNKNOWN: an enumeration over a mix of
+/// measured and unknown sizes is confidently wrong, and one over all-unknowns is
+/// noise - the caller keeps the written order instead.
 fn choose_order(
     region: &JoinRegion,
     estimator: &dyn RegionEstimator,
@@ -1176,16 +1216,6 @@ fn choose_order(
         return Err(OptimizeError::JoinOrder(
             "choose_order over a region with no atoms".to_string(),
         ));
-    }
-    if region.atoms.len() > MAX_REGION_ATOMS {
-        // A region past the bitmask domain: DECLINE here, before any
-        // `1 << index` shift. The rule's recursion then re-extracts the join's
-        // children - the same region one atom smaller per level - until a
-        // slice fits the domain, and THAT slice is ordered by whichever ladder
-        // tier its counted work admits (the cheap connected tier at these
-        // widths). Atoms past the domain keep their written position while the
-        // widest addressable inner slice is still ordered.
-        return Ok(None);
     }
     let atom_estimates = base_atom_estimates(region, estimator)?;
     if atom_estimates

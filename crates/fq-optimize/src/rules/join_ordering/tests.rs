@@ -232,9 +232,12 @@ fn a_non_equi_only_pair_yields_two_singletons() {
 fn newly_covered_places_a_multi_atom_conjunct_once() {
     let region = region(&["a", "b", "c"], &[(0, 1), (1, 2)]);
     // Growing {0} by atom 1 covers the (0,1) edge (position 0) exactly.
-    assert_eq!(newly_covered(&region, 1 << 0, 1), vec![0]);
+    assert_eq!(newly_covered(&region, &(1u64 << 0), 1), vec![0]);
     // Growing {0,1} by atom 2 covers the (1,2) edge (position 1), not (0,1).
-    assert_eq!(newly_covered(&region, (1 << 0) | (1 << 1), 2), vec![1]);
+    assert_eq!(
+        newly_covered(&region, &((1u64 << 0) | (1u64 << 1)), 2),
+        vec![1]
+    );
 }
 
 #[test]
@@ -514,6 +517,62 @@ fn greedy_used_above_dp_limit_stays_fully_connected() {
     for step in &order.components[0].steps {
         assert!(!step.conjunct_positions.is_empty());
     }
+}
+
+#[test]
+fn a_star_wider_than_the_dp_mask_domain_still_orders() {
+    // 70 atoms, every one joined to the hub t0: wider than the DP's u64 mask
+    // domain, and past the greedy's work cap, so the cheap connected tier
+    // orders it - set-based subsets carry no width bound. Every atom is
+    // placed, in one component, every step on an equi key.
+    let count = 70usize;
+    let names: Vec<String> = (0..count).map(|index| format!("t{index}")).collect();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut edges = Vec::new();
+    let mut rows = vec![50u64];
+    let mut selectivity = Vec::new();
+    for index in 1..count {
+        rows.push(10 * (index as u64 + 1));
+        edges.push((0, index));
+        selectivity.push(((0, index), 0.01));
+    }
+    let region = region(&name_refs, &edges);
+    let order = choose_order(&region, &stub(&rows, &selectivity), 10)
+        .unwrap()
+        .unwrap();
+    let mut placed = sequence(&order);
+    placed.sort_unstable();
+    assert_eq!(placed, (0..count).collect::<Vec<_>>());
+    for step in &order.components[0].steps {
+        assert!(any_equi(&region, &step.conjunct_positions));
+    }
+}
+
+#[test]
+fn a_chain_wider_than_the_dp_mask_domain_still_orders() {
+    // 66 atoms in a chain, one past-the-mask-domain shape with sparse
+    // connectivity: the cheap tier must still walk it fully connected,
+    // never stranding an atom whose only neighbor is deep in the prefix.
+    let count = 66usize;
+    let names: Vec<String> = (0..count).map(|index| format!("t{index}")).collect();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut edges = Vec::new();
+    let mut rows = Vec::new();
+    let mut selectivity = Vec::new();
+    for index in 0..count {
+        rows.push(10 * (index as u64 + 1));
+        if index > 0 {
+            edges.push((index - 1, index));
+            selectivity.push(((index - 1, index), 0.01));
+        }
+    }
+    let region = region(&name_refs, &edges);
+    let order = choose_order(&region, &stub(&rows, &selectivity), 10)
+        .unwrap()
+        .unwrap();
+    let mut placed = sequence(&order);
+    placed.sort_unstable();
+    assert_eq!(placed, (0..count).collect::<Vec<_>>());
 }
 
 // ------------------------- component combination tests ----------------------
