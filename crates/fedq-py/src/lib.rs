@@ -56,9 +56,31 @@ impl Runtime {
     /// so the GIL is RELEASED for the run (`Python::detach`): holding it would
     /// freeze every other Python thread in the caller for the query's whole
     /// duration.
+    ///
+    /// The run gets the stack every query thread gets. The caller is whatever
+    /// Python thread called in - a main thread, or a `threading.Thread` whose
+    /// stack the host chose, which `threading.stack_size` can set to a few
+    /// hundred KiB - while the plan passes recurse once per plan level, so a
+    /// query deeper than the caller's stack would take the whole interpreter
+    /// down with a SIGSEGV. `maybe_grow` runs the query on the caller's own
+    /// thread when that thread already has the room and switches it onto a
+    /// freshly allocated `QUERY_THREAD_STACK_BYTES` stack when it does not.
+    ///
+    /// It is the caller's THREAD that must stay the same, which is why this is
+    /// not a worker thread: the data plane caches one live connection per
+    /// datasource in thread-local state, so moving the run to another thread
+    /// would rebuild every connection (measured: +2.8ms per trivial query with
+    /// a thread per statement, +0.4ms with a per-session worker thread; this
+    /// costs neither).
     fn execute(&self, py: Python<'_>, sql: &str) -> PyResult<ArrowStreamExport> {
         let (schema, batches) = py
-            .detach(|| self.inner.execute(sql))
+            .detach(|| {
+                stacker::maybe_grow(
+                    fq_common::QUERY_THREAD_STACK_BYTES,
+                    fq_common::QUERY_THREAD_STACK_BYTES,
+                    || self.inner.execute(sql),
+                )
+            })
             .map_err(|error| runtime_error_to_py(&error))?;
         Ok(stream_from_batches(schema, batches))
     }
