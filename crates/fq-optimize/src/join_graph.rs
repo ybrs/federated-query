@@ -9,7 +9,7 @@
 //! reference resolving to no atom or to more than one is a malformed plan and
 //! RAISES: silently mis-placing a predicate manufactures wrong results.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 
@@ -76,8 +76,9 @@ pub fn extract_region(root: &LogicalPlan) -> Result<Option<JoinRegion>, JoinGrap
     let mut expressions = Vec::new();
     descend(root, &mut atoms, &mut expressions);
     let mut conjuncts = Vec::with_capacity(expressions.len());
+    let owners = qualifier_owners(&atoms);
     for expression in expressions {
-        conjuncts.push(classify(expression, &atoms)?);
+        conjuncts.push(classify(expression, &owners)?);
     }
     Ok(Some(JoinRegion { atoms, conjuncts }))
 }
@@ -177,11 +178,35 @@ fn collect_qualifiers(node: &LogicalPlan, found: &mut BTreeSet<String>) {
     }
 }
 
+/// The atom indexes each visible qualifier resolves to, built ONCE per
+/// extraction. Resolving a reference by scanning every atom costs
+/// O(atoms) per column reference, and a dense region has a conjunct per atom
+/// PAIR, so the scan is the dominant cost of extracting one: a 70-atom clique
+/// carries 2415 conjuncts and resolving them cost ~338k atom probes, repeated
+/// at every level of the walk. The lookup answers the same question from the
+/// same data - a qualifier owned by exactly one atom resolves to it, and any
+/// other count is the ambiguity that raises - so it decides identically.
+fn qualifier_owners(atoms: &[JoinAtom]) -> BTreeMap<&str, Vec<usize>> {
+    let mut owners: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for atom in atoms {
+        for qualifier in &atom.qualifiers {
+            owners
+                .entry(qualifier.as_str())
+                .or_default()
+                .push(atom.index);
+        }
+    }
+    owners
+}
+
 /// Map one conjunct to the exact set of atoms it references.
-fn classify(expression: Expr, atoms: &[JoinAtom]) -> Result<JoinConjunct, JoinGraphError> {
+fn classify(
+    expression: Expr,
+    owners: &BTreeMap<&str, Vec<usize>>,
+) -> Result<JoinConjunct, JoinGraphError> {
     let mut atom_indexes = BTreeSet::new();
     for reference in column_refs(&expression) {
-        atom_indexes.insert(owning_atom(reference, atoms)?);
+        atom_indexes.insert(owning_atom(reference, owners)?);
     }
     let is_equi = is_equi_predicate(&expression);
     Ok(JoinConjunct {
@@ -194,25 +219,23 @@ fn classify(expression: Expr, atoms: &[JoinAtom]) -> Result<JoinConjunct, JoinGr
 /// The single atom a qualified reference resolves to; anything else raises.
 fn owning_atom(
     reference: &fq_plan::expr::ColumnRef,
-    atoms: &[JoinAtom],
+    owners: &BTreeMap<&str, Vec<usize>>,
 ) -> Result<usize, JoinGraphError> {
     let Some(qualifier) = reference.table.as_deref().filter(|table| !table.is_empty()) else {
         return Err(JoinGraphError::Unqualified(reference.column.clone()));
     };
-    let mut owners = Vec::new();
-    for atom in atoms {
-        if atom.qualifiers.contains(qualifier) {
-            owners.push(atom.index);
-        }
-    }
-    if owners.len() != 1 {
+    let matched: &[usize] = match owners.get(qualifier) {
+        Some(indexes) => indexes,
+        None => &[],
+    };
+    if matched.len() != 1 {
         return Err(JoinGraphError::AmbiguousReference {
             relation: qualifier.to_string(),
             column: reference.column.clone(),
-            atom_count: owners.len(),
+            atom_count: matched.len(),
         });
     }
-    Ok(owners[0])
+    Ok(matched[0])
 }
 
 #[cfg(test)]
