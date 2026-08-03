@@ -92,10 +92,20 @@ def test_a_status_other_than_done_is_allowed_with_no_decision(capsys):
     assert capsys.readouterr().out == ""
 
 
-def test_a_payload_that_is_not_json_is_allowed(capsys):
-    """Input that is not a tool call carries no status to gate, so it passes."""
+def test_a_payload_that_is_not_json_is_denied(capsys):
+    """An unparseable payload denies: the status it requests cannot be read.
+
+    The hook fires only on the taskq status tools, so every payload it sees is
+    a status change. One that cannot be parsed is a status change of unknown
+    status, and letting it through would close a ticket over nothing verified.
+    """
     assert done_gate._decide("not json at all") == 0
-    assert capsys.readouterr().out == ""
+    decision = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
+    assert decision["permissionDecision"] == "deny"
+    reason = decision["permissionDecisionReason"]
+    assert "could not parse its stdin payload" in reason
+    assert "15 bytes" in reason
+    assert "JSONDecodeError" in reason
 
 
 def test_a_crash_inside_the_gate_denies_and_reports_the_traceback(tmp_path):

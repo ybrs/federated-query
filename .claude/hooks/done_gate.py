@@ -23,6 +23,11 @@ with no matching stamp always runs the whole harness.
 FAIL-CLOSED, in every direction a check could silently vanish:
 - A suite that cannot RUN (missing toolchain, venv, libduckdb, database)
   denies, naming what was missing.
+- A stdin payload that cannot be parsed denies, naming the parse error. The
+  hook is wired to fire only on the taskq status tools, so every payload it
+  receives is a status change; one it cannot read is a status change whose
+  status is UNKNOWN, not some other call to wave through. The deny blocks that
+  single tool call and says why, which is the recoverable direction.
 - ANY exception inside the gate denies, carrying its traceback. The harness
   reads a nonzero exit as a non-blocking error and lets the tool call proceed,
   so a crash that merely propagated would pass the transition with nothing
@@ -103,9 +108,7 @@ def _gate_dir(root):
 
 def _git(root, *args):
     """One git query; its stripped stdout, or None on failure."""
-    completed = subprocess.run(
-        ["git", *args], cwd=root, capture_output=True, text=True
-    )
+    completed = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True)
     if completed.returncode != 0:
         return None
     return completed.stdout.strip()
@@ -396,12 +399,20 @@ def _decide(raw_payload):
     """Decide one tool call: 0 allows it, a deny decision blocks it.
 
     Only a done-transition is gated; every other status is a cheap transition
-    and passes straight through, as does a payload that is not JSON at all.
+    and passes straight through. A payload that is not JSON is DENIED instead:
+    the hook fires only on the taskq status tools, so an unreadable payload is
+    a status change whose status could not be read, and a gate that cannot run
+    is a failure rather than a pass.
     """
     try:
         payload = json.loads(raw_payload)
-    except json.JSONDecodeError:
-        return 0
+    except json.JSONDecodeError as parse_error:
+        return _deny(
+            "This tool call is refused: the done-gate could not parse its stdin "
+            f"payload ({len(raw_payload)} bytes), so the status being requested "
+            "is UNKNOWN and nothing could be gated.\n\n"
+            f"{type(parse_error).__name__}: {parse_error}"
+        )
     if _requested_status(payload) not in _GATED_STATUSES:
         return 0
     failure = _gate_done_transition(_repo_root())
