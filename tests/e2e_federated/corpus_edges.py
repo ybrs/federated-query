@@ -41,6 +41,33 @@ CASES = [
             "SELECT o.order_id FROM {orders} o WHERE o.quantity / 2 = 0.5"
         ),
     },
+    # Division whose integer operands hide behind aggregates, functions and
+    # CASE: the average via SUM/COUNT is 4.8 under the engine's semantics and
+    # 4 under a truncating source, and both other shapes have odd values that
+    # discriminate the same way.
+    {
+        "name": "edge_int_division_sum_over_count",
+        "tables": ["orders"],
+        "query": (
+            "SELECT SUM(o.quantity) / COUNT(*) AS avg_qty FROM {orders} o"
+        ),
+    },
+    {
+        "name": "edge_int_division_function_operand",
+        "tables": ["orders"],
+        "query": (
+            "SELECT o.order_id, length(o.status) / 2 AS half_len FROM {orders} o"
+        ),
+    },
+    {
+        "name": "edge_int_division_case_operand",
+        "tables": ["orders"],
+        "query": (
+            "SELECT o.order_id, "
+            "(CASE WHEN o.quantity > 5 THEN o.quantity ELSE 1 END) / 2 AS half "
+            "FROM {orders} o"
+        ),
+    },
     # NULL join keys: t_null_a/t_null_b, every join type plus null-safe
     # equality, arithmetic, and GROUP BY over a NULL key.
     {

@@ -1007,3 +1007,62 @@ fn non_integer_division_keeps_its_operands() {
         "a non-integer division must stay unrewritten, got {left:?}"
     );
 }
+
+#[test]
+fn division_sees_through_aggregates_functions_and_case() {
+    // The certainly-integer walk covers COUNT (always integer), SUM over an
+    // integer column, and a CASE whose branches are all integer, so each of
+    // these divisions binds to DOUBLE division.
+    let shapes = [
+        "SELECT SUM(o.id) / COUNT(*) AS r FROM pg.public.orders o",
+        "SELECT o.id / 2 AS r FROM pg.public.orders o WHERE o.id > 0",
+        "SELECT (CASE WHEN o.id > 5 THEN o.id ELSE 1 END) / 2 AS r FROM pg.public.orders o",
+    ];
+    for sql in shapes {
+        let plan = bind_sql(sql).expect("bind");
+        assert!(
+            plan_has_double_cast_division(&plan),
+            "{sql} must rewrite its division, got {plan:?}"
+        );
+    }
+}
+
+/// Whether any expression in the plan is a division whose left side is the
+/// synthesized DOUBLE cast.
+fn plan_has_double_cast_division(plan: &LogicalPlan) -> bool {
+    let mut found = false;
+    visit_exprs(plan, &mut |expr| {
+        if let Expr::BinaryOp { left, .. } = expr {
+            if matches!(left.as_ref(), Expr::Cast { target_type, .. } if target_type == "DOUBLE") {
+                found = true;
+            }
+        }
+    });
+    found
+}
+
+/// Walk every expression of every node (projections and aggregates cover the
+/// shapes these tests build).
+fn visit_exprs(plan: &LogicalPlan, visit: &mut impl FnMut(&Expr)) {
+    if let LogicalPlan::Projection(projection) = plan {
+        for expression in &projection.expressions {
+            visit_expr_tree(expression, visit);
+        }
+    }
+    if let LogicalPlan::Aggregate(aggregate) = plan {
+        for expression in &aggregate.aggregates {
+            visit_expr_tree(expression, visit);
+        }
+    }
+    for child in plan.children() {
+        visit_exprs(child, visit);
+    }
+}
+
+/// Depth-first walk of one expression tree.
+fn visit_expr_tree(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
+    visit(expr);
+    for child in expr.children() {
+        visit_expr_tree(child, visit);
+    }
+}

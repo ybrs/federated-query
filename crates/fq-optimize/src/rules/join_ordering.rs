@@ -1435,9 +1435,14 @@ impl JoinOrdering {
         let signature = cache_signature(region);
         if self.is_stable(&signature) {
             // This region is byte-for-byte a shape this rule itself emitted, so
-            // choosing and re-emitting would reproduce it. Only the atoms still
-            // need the walk (their nested regions answer from their own cache).
-            return root.try_map_children(|child| self.rewrite(child));
+            // choosing and re-emitting would reproduce it. Only the ATOM
+            // subtrees still need the walk; the region's interior joins are the
+            // settled output. Recursing plainly into the interior would
+            // re-extract the region's own prefixes as regions of their own, and
+            // at a ladder-tier boundary a prefix can then re-order under a
+            // DIFFERENT tier than the full region chose, churning the fixpoint
+            // (measured: an 11-atom mixed chain took 4 sweeps instead of 2).
+            return self.rewrite_region_atoms(root);
         }
         let order = self.cached_order(signature, region)?;
         let Some(order) = order else {
@@ -1448,6 +1453,18 @@ impl JoinOrdering {
         verify_placement(region.conjuncts.len(), &placed)?;
         self.record_stable(&rebuilt)?;
         Ok(rebuilt)
+    }
+
+    /// Rewrite only the ATOM subtrees under a stable region's root: region
+    /// joins (and the Filter a region root may sit under) pass through with
+    /// their children walked the same way, and everything else - an atom - is
+    /// rewritten normally, so nested regions inside atoms still order while
+    /// the stable interior is left exactly as emitted.
+    fn rewrite_region_atoms(&self, node: LogicalPlan) -> Result<LogicalPlan, OptimizeError> {
+        if is_region_join(&node) || matches!(node, LogicalPlan::Filter(_)) {
+            return node.try_map_children(|child| self.rewrite_region_atoms(child));
+        }
+        self.rewrite(node)
     }
 
     /// Whether this signature is one the rule already emitted (its fixpoint).

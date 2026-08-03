@@ -55,8 +55,9 @@ fn normalize_division(op: fq_plan::BinaryOpType, left: Expr, right: Expr) -> Exp
 
 /// Whether a BOUND expression is integer-typed beyond doubt. Conservative by
 /// construction: only shapes whose type is structurally certain count, so a
-/// shape this cannot see through (a subquery, a function call) keeps its
-/// written division instead of gaining a cast on a guess.
+/// shape this cannot see through (a subquery, a window, a function outside
+/// the known-integer set) keeps its written division instead of gaining a
+/// cast on a guess.
 fn certainly_integer(expr: &Expr) -> bool {
     match expr {
         Expr::Column(column) => integer_type(column.data_type),
@@ -69,8 +70,48 @@ fn certainly_integer(expr: &Expr) -> bool {
         Expr::BinaryOp { op, left, right } => {
             integer_arithmetic(*op) && certainly_integer(left) && certainly_integer(right)
         }
+        Expr::FunctionCall {
+            function_name,
+            args,
+            ..
+        } => integer_function(function_name, args),
+        Expr::Case {
+            when_clauses,
+            else_result,
+        } => integer_case(when_clauses, else_result.as_deref()),
         _ => false,
     }
+}
+
+/// Whether a function call is integer-typed beyond doubt: `count` always is,
+/// the string-measuring functions return integers in every dialect the engine
+/// renders to, and the aggregates/functions that carry their argument's type
+/// are integer when every argument certainly is.
+fn integer_function(function_name: &str, args: &[Expr]) -> bool {
+    let name = function_name.to_ascii_lowercase();
+    if matches!(
+        name.as_str(),
+        "count" | "length" | "char_length" | "character_length" | "strpos" | "position"
+    ) {
+        return true;
+    }
+    if matches!(name.as_str(), "sum" | "min" | "max" | "abs") {
+        return !args.is_empty() && args.iter().all(certainly_integer);
+    }
+    false
+}
+
+/// Whether every branch a CASE can produce is certainly integer. A missing
+/// ELSE produces NULL, which the division rewrite's cast carries unchanged, so
+/// it does not disqualify the CASE.
+fn integer_case(when_clauses: &[(Expr, Expr)], else_result: Option<&Expr>) -> bool {
+    if when_clauses.is_empty() {
+        return false;
+    }
+    let branches_integer = when_clauses
+        .iter()
+        .all(|(_when, then)| certainly_integer(then));
+    branches_integer && else_result.is_none_or(certainly_integer)
 }
 
 /// Whether this operator keeps integer operands integer.
