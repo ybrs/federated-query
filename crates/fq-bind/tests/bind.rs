@@ -964,3 +964,46 @@ fn an_aggregate_inside_an_order_by_subquery_does_not_group_the_outer_query() {
         "the inner aggregate must not group the outer query, got {plan:?}"
     );
 }
+
+/// The first expression of the top projection of a bound plan.
+fn first_projection_expr(plan: &LogicalPlan) -> &Expr {
+    let LogicalPlan::Projection(projection) = plan else {
+        panic!("expected a Projection root, got {plan:?}");
+    };
+    &projection.expressions[0]
+}
+
+#[test]
+fn integer_division_binds_to_double_division() {
+    // The engine's division semantics are DuckDB's: int / int is DOUBLE
+    // division everywhere, so the binder rewrites the left operand into an
+    // explicit DOUBLE cast - the one form with that meaning in every dialect.
+    let plan = bind_sql("SELECT o.id / 2 AS half FROM pg.public.orders o").expect("bind");
+    let Expr::BinaryOp { left, .. } = first_projection_expr(&plan) else {
+        panic!("expected a division at the projection root");
+    };
+    let Expr::Cast {
+        target_type,
+        data_type,
+        ..
+    } = left.as_ref()
+    else {
+        panic!("integer division must cast its left operand, got {left:?}");
+    };
+    assert_eq!(target_type, "DOUBLE");
+    assert_eq!(*data_type, Some(DataType::Double));
+}
+
+#[test]
+fn non_integer_division_keeps_its_operands() {
+    // total is DOUBLE: the division already means the same thing everywhere,
+    // so no cast is synthesized.
+    let plan = bind_sql("SELECT o.total / 2 AS half FROM pg.public.orders o").expect("bind");
+    let Expr::BinaryOp { left, .. } = first_projection_expr(&plan) else {
+        panic!("expected a division at the projection root");
+    };
+    assert!(
+        matches!(left.as_ref(), Expr::Column(_)),
+        "a non-integer division must stay unrewritten, got {left:?}"
+    );
+}

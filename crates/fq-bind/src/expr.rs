@@ -20,6 +20,75 @@ pub(crate) fn cast_target_type(target_type: &str) -> Result<DataType, BindError>
         .map_err(|_| BindError::Unsupported(format!("CAST target type '{target_type}'")))
 }
 
+/// The engine's division semantics are DuckDB's: `/` over two integers is
+/// DOUBLE division (1 / 2 = 0.5), on every source and on the coordinator.
+/// Most SQL dialects truncate instead, so a bound integer division is rewritten
+/// here - the one place every plan passes through - into
+/// `CAST(left AS DOUBLE) / right`, a form with the SAME meaning in every
+/// dialect the engine renders to. Any other operator, and any division whose
+/// operand types this cannot see through, is returned unchanged.
+fn normalize_division(op: fq_plan::BinaryOpType, left: Expr, right: Expr) -> Expr {
+    let rewrite = op == fq_plan::BinaryOpType::Divide
+        && certainly_integer(&left)
+        && certainly_integer(&right);
+    let left = if rewrite {
+        // A genuinely fresh Cast synthesized around the bound left operand -
+        // there is no base node to copy from. Field list
+        // (expr/target_type/data_type) is complete.
+        Expr::Cast {
+            expr: Box::new(left),
+            target_type: "DOUBLE".to_string(),
+            data_type: Some(DataType::Double),
+        }
+    } else {
+        left
+    };
+    // Fresh bound copy assembled from the already-bound operands the caller
+    // handed in (enum variants take no `..base`). Field list (op/left/right)
+    // is complete.
+    Expr::BinaryOp {
+        op,
+        left: Box::new(left),
+        right: Box::new(right),
+    }
+}
+
+/// Whether a BOUND expression is integer-typed beyond doubt. Conservative by
+/// construction: only shapes whose type is structurally certain count, so a
+/// shape this cannot see through (a subquery, a function call) keeps its
+/// written division instead of gaining a cast on a guess.
+fn certainly_integer(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column(column) => integer_type(column.data_type),
+        Expr::Literal { data_type, .. } => integer_type(Some(*data_type)),
+        Expr::Cast { data_type, .. } => integer_type(*data_type),
+        Expr::UnaryOp {
+            op: fq_plan::UnaryOpType::Negate,
+            operand,
+        } => certainly_integer(operand),
+        Expr::BinaryOp { op, left, right } => {
+            integer_arithmetic(*op) && certainly_integer(left) && certainly_integer(right)
+        }
+        _ => false,
+    }
+}
+
+/// Whether this operator keeps integer operands integer.
+fn integer_arithmetic(op: fq_plan::BinaryOpType) -> bool {
+    matches!(
+        op,
+        fq_plan::BinaryOpType::Add
+            | fq_plan::BinaryOpType::Subtract
+            | fq_plan::BinaryOpType::Multiply
+            | fq_plan::BinaryOpType::Modulo
+    )
+}
+
+/// Whether the resolved type is one of the integer types.
+fn integer_type(data_type: Option<DataType>) -> bool {
+    matches!(data_type, Some(DataType::Integer | DataType::BigInt))
+}
+
 impl Binder<'_> {
     /// Bind one expression against the current scope chain.
     pub(crate) fn bind_expr(&mut self, expr: &Expr) -> Result<Expr, BindError> {
@@ -42,11 +111,13 @@ impl Binder<'_> {
             // Fresh bound copy: the source is a `&Expr` borrow and an Expr enum variant
             // takes no `..base`/`update!`, so it is rebuilt from its rebound operands
             // with `op` copied from the source. Field list (op/left/right) is complete.
-            Expr::BinaryOp { op, left, right } => Ok(Expr::BinaryOp {
-                op: *op,
-                left: Box::new(self.bind_expr(left)?),
-                right: Box::new(self.bind_expr(right)?),
-            }),
+            // Division is then normalized to the engine's semantics (see
+            // `normalize_division`).
+            Expr::BinaryOp { op, left, right } => Ok(normalize_division(
+                *op,
+                self.bind_expr(left)?,
+                self.bind_expr(right)?,
+            )),
             // Fresh bound copy from the borrowed source (no `..base` on an enum variant):
             // rebound operand, `op` copied. Field list (op/operand) is complete.
             Expr::UnaryOp { op, operand } => Ok(Expr::UnaryOp {

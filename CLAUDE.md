@@ -76,6 +76,19 @@ A build time is the wall clock from the statement being issued to the
 statement returning, everything included. For materialized views, or "create event dataset"
 the build time starts from when the statement is issued. There is no base build or some other bullshit. There is only one build time. 
 
+# EXPRESSION SEMANTICS ARE DUCKDB'S
+
+The engine defines one meaning per expression - DuckDB's - on every source and
+on the coordinator. Placement is not part of a query, so where a table sits
+must NEVER change an answer or a result type. A source whose native evaluation
+diverges gets explicit rendering (the binder's integer-division rewrite is the
+pattern: normalize at one choke point into a form every dialect evaluates
+identically). A measured divergence that is not yet normalized is registered
+STRICTLY in `known_fragment_divergences.py` - never tolerated silently, and
+the entry dies in the commit that fixes it. The DuckDB oracle in the e2e suite
+is this rule made executable; see README-architecture.md "Expression
+semantics".
+
 # One class of customers
 
 There is exactly ONE class of customers. No tiers, no size classes, no

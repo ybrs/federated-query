@@ -146,6 +146,34 @@ collapses to a single island; whatever cannot be pushed is executed by the
 DataFusion coordinator over the Arrow results, with semi-join reductions and
 dynamic filters shrinking each source read.
 
+## Expression semantics
+
+The engine's expression semantics are DUCKDB'S, on every source and on the
+coordinator. A pushed expression must return what DuckDB returns for it;
+placement is not part of a query, so where a table happens to sit must never
+change an answer. Sources are each correct by their own rules and simply
+disagree (most dialects truncate `int / int`; DuckDB divides as DOUBLE), so
+rendering an expression verbatim into a source's dialect inherits that
+source's meaning - the exact defect this section exists to forbid.
+
+Enforcement is one construct at a time, at the narrowest choke point that
+covers every execution path:
+
+- Integer division: the binder rewrites a bound `int / int` into
+  `CAST(left AS DOUBLE) / right` (`fq-bind/src/expr.rs`,
+  `normalize_division`), a form with the same meaning in every dialect the
+  engine renders to and in the coordinator. A division whose operand types
+  the binder cannot see through keeps its written form.
+- Divergences that are measured but not yet normalized are held STRICTLY in
+  `tests/e2e_federated/known_fragment_divergences.py`: the fragment is still
+  sent and still compared, and a source that starts agreeing fails the run so
+  the entry dies with the fix. The registry is the work queue; currently it
+  holds decimal-AVG truncation on the DataFusion/Parquet path, and round()
+  half-to-even on PostgreSQL floats is measured but uncovered by the corpus.
+- The DuckDB oracle, the fragment oracle, and the plan-variant harness are
+  the definition made executable: every placement and every plan of every
+  corpus query is compared against DuckDB over the same data.
+
 ## The statement surface
 
 `fq-parse` classifies each statement before the query pipeline. Anything it

@@ -16,10 +16,31 @@ date/timestamp join keys, case-sensitive varchar equality, a boolean-column
 join key); cross-type joins through an explicit CAST; a ``||`` string
 concatenation over a CAST; a null-safe ``IS DISTINCT FROM`` WHERE predicate;
 and ``t_text`` edges (NULLIF/TRIM on blank-vs-space values, a quoted value,
-LIKE wildcard matches, and LIKE ... ESCAPE matching a literal wildcard).
+LIKE wildcard matches, and LIKE ... ESCAPE matching a literal wildcard); and
+integer-division semantics (the engine's division is DuckDB's DOUBLE division
+on every source, in a projection and in a WHERE that is empty under the
+truncating semantics most dialects give ``/``).
 """
 
 CASES = [
+    # Integer-division semantics: the engine's `/` over integers is DuckDB's
+    # DOUBLE division on EVERY source. The predicate case is discriminating by
+    # construction: quantity 1 gives 0.5 under the engine's semantics and 0
+    # under the truncating division most dialects evaluate natively.
+    {
+        "name": "edge_int_division_projection",
+        "tables": ["orders"],
+        "query": (
+            "SELECT o.order_id, o.quantity / 2 AS half FROM {orders} o"
+        ),
+    },
+    {
+        "name": "edge_int_division_predicate",
+        "tables": ["orders"],
+        "query": (
+            "SELECT o.order_id FROM {orders} o WHERE o.quantity / 2 = 0.5"
+        ),
+    },
     # NULL join keys: t_null_a/t_null_b, every join type plus null-safe
     # equality, arithmetic, and GROUP BY over a NULL key.
     {
