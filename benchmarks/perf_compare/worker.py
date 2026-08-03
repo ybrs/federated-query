@@ -217,14 +217,20 @@ def _new_fns(runtime, qualify):
     """(plan_only, execute) bound to a NEW-engine runtime.
 
     plan_only is EXPLAIN: the Rust runtime plans fully and never executes.
+    Both take ALREADY-QUALIFIED sql: qualification is Python-side sqlglot
+    work whose first touch in a fresh process costs ~140ms, so timing it
+    would report sqlglot as engine planning. The caller qualifies outside
+    the timed region.
     """
     import pyarrow as pa
 
+    del qualify
+
     def plan_only(sql):
-        return runtime.execute("EXPLAIN " + qualify(sql))
+        return runtime.execute("EXPLAIN " + sql)
 
     def execute(sql):
-        return pa.table(runtime.execute(qualify(sql))).num_rows
+        return pa.table(runtime.execute(sql)).num_rows
 
     return plan_only, execute
 
@@ -253,12 +259,16 @@ def _emit(record):
 
 
 def _run_cold(make, fns, mode, query):
-    """One cold measurement (this whole process exists for this one number)."""
-    sql = _read_query(query)
+    """One cold measurement (this whole process exists for this one number).
+
+    The query is qualified BEFORE the timed call: "plan" and "total" are the
+    engine's numbers, and qualification is harness-side text preparation.
+    """
     record = {"query": query, "mode": mode}
     try:
         runtime, qualify = make()
         plan_only, execute = fns(runtime, qualify)
+        sql = qualify(_read_query(query))
         if mode == "cold-plan":
             record["plan_ms"], _ = _timed(lambda: plan_only(sql))
         else:
@@ -283,12 +293,16 @@ def _run_warm(make, fns, queries, warmups, runs):
             )
         return
     for query in queries:
-        _emit(_warm_one(plan_only, execute, query, warmups, runs))
+        _emit(_warm_one(plan_only, execute, qualify, query, warmups, runs))
 
 
-def _warm_one(plan_only, execute, query, warmups, runs):
-    """Warm plan/execute medians for one query; failures classified per query."""
-    sql = _read_query(query)
+def _warm_one(plan_only, execute, qualify, query, warmups, runs):
+    """Warm plan/execute medians for one query; failures classified per query.
+
+    Qualification runs once, outside every timed call, for the same reason as
+    the cold path: the measurement is the engine's, not sqlglot's.
+    """
+    sql = qualify(_read_query(query))
     record = {"query": query, "mode": "warm"}
     try:
         for _ in range(warmups):

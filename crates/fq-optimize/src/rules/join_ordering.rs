@@ -832,6 +832,40 @@ impl Enumerator<'_> {
     }
 }
 
+/// The order cache's key for a region: the region with every scan's column
+/// read-set cleared. Projection pushdown prunes scan read-sets between the
+/// fixpoint sweeps, and pruning cannot change the chosen order - the estimates
+/// an order is chosen by read row counts, filters, group keys, join keys and
+/// sources, never the width of the read-set. The key exists only inside the
+/// cache: it is never installed in a plan, so the bound-scan rule that a
+/// scan's columns are always concrete is untouched.
+fn cache_signature(region: &JoinRegion) -> JoinRegion {
+    let mut atoms = Vec::with_capacity(region.atoms.len());
+    for atom in &region.atoms {
+        atoms.push(JoinAtom {
+            index: atom.index,
+            plan: clear_scan_columns(atom.plan.clone()),
+            qualifiers: atom.qualifiers.clone(),
+        });
+    }
+    JoinRegion {
+        atoms,
+        conjuncts: region.conjuncts.clone(),
+    }
+}
+
+/// The subtree with every `Scan`'s `columns` emptied (see `cache_signature`);
+/// everything else is structurally unchanged.
+fn clear_scan_columns(plan: LogicalPlan) -> LogicalPlan {
+    if let LogicalPlan::Scan(mut scan) = plan {
+        scan.columns = Vec::new();
+        return LogicalPlan::Scan(scan);
+    }
+    let rebuilt: Result<LogicalPlan, std::convert::Infallible> =
+        plan.try_map_children(|child| Ok(clear_scan_columns(child)));
+    rebuilt.expect("clearing scan columns cannot fail")
+}
+
 /// Keep the cheaper candidate per subset (ties: smaller atom sequence). The
 /// comparison runs on the unmaterialized extension, so the losing side never
 /// clones the parent's sequence and steps.
@@ -1157,6 +1191,21 @@ fn verify_placement(total: usize, placed: &[usize]) -> Result<(), OptimizeError>
 pub struct JoinOrdering {
     cost_model: Rc<RefCell<CostModel>>,
     max_join_reorder_size: usize,
+    /// The order chosen (or the decline) per region signature, for THIS
+    /// optimizer instance - one query, since the driver builds a fresh
+    /// optimizer per plan. A multi-referenced CTE repeats one region per
+    /// reference, and the estimation and enumeration behind a chosen order
+    /// are deterministic within one run, so re-deriving it buys nothing.
+    /// Keyed by the PRUNING-INSENSITIVE signature (`cache_signature`),
+    /// because projection pushdown prunes scan read-sets between sweeps
+    /// without changing anything the order depends on.
+    order_cache: RefCell<Vec<(JoinRegion, Option<RegionOrder>)>>,
+    /// The signatures of regions AS THIS RULE EMITTED THEM. A region arriving
+    /// in one of these shapes is already this rule's own fixpoint: running
+    /// choose_order and re-emitting would reproduce it byte for byte, which
+    /// is exactly what the driver's confirming sweep pays the whole DP to
+    /// learn. A stable region skips straight to recursing into its atoms.
+    stable_signatures: RefCell<Vec<JoinRegion>>,
 }
 
 impl JoinOrdering {
@@ -1167,6 +1216,8 @@ impl JoinOrdering {
         Self {
             cost_model,
             max_join_reorder_size,
+            order_cache: RefCell::new(Vec::new()),
+            stable_signatures: RefCell::new(Vec::new()),
         }
     }
 
@@ -1194,19 +1245,69 @@ impl JoinOrdering {
         if !worth_reordering(region, &root) {
             return root.try_map_children(|child| self.rewrite(child));
         }
-        let order = {
-            let estimator = CostModelRegionEstimator {
-                cost_model: &self.cost_model,
-            };
-            choose_order(region, &estimator, self.max_join_reorder_size)?
-        };
+        let signature = cache_signature(region);
+        if self.is_stable(&signature) {
+            // This region is byte-for-byte a shape this rule itself emitted, so
+            // choosing and re-emitting would reproduce it. Only the atoms still
+            // need the walk (their nested regions answer from their own cache).
+            return root.try_map_children(|child| self.rewrite(child));
+        }
+        let order = self.cached_order(signature, region)?;
         let Some(order) = order else {
             return root.try_map_children(|child| self.rewrite(child));
         };
         let mut placed = Vec::new();
         let rebuilt = self.emit(region, &order, &mut placed)?;
         verify_placement(region.conjuncts.len(), &placed)?;
+        self.record_stable(&rebuilt)?;
         Ok(rebuilt)
+    }
+
+    /// Whether this signature is one the rule already emitted (its fixpoint).
+    fn is_stable(&self, signature: &JoinRegion) -> bool {
+        self.stable_signatures
+            .borrow()
+            .iter()
+            .any(|stable| stable == signature)
+    }
+
+    /// Record the region a just-emitted subtree presents to the NEXT sweep, so
+    /// that sweep recognizes it as this rule's own output instead of paying the
+    /// estimation and enumeration again to learn nothing changed.
+    fn record_stable(&self, rebuilt: &LogicalPlan) -> Result<(), OptimizeError> {
+        let Some(region) = extract_region(rebuilt)? else {
+            return Ok(());
+        };
+        self.stable_signatures
+            .borrow_mut()
+            .push(cache_signature(&region));
+        Ok(())
+    }
+
+    /// The region's chosen order (or decline), derived once per signature and
+    /// answered from the cache thereafter. A None is cached too: a region
+    /// declined for an UNKNOWN atom estimate is declined identically for the
+    /// whole run, since statistics are pinned per session.
+    fn cached_order(
+        &self,
+        signature: JoinRegion,
+        region: &JoinRegion,
+    ) -> Result<Option<RegionOrder>, OptimizeError> {
+        for (cached_signature, order) in self.order_cache.borrow().iter() {
+            if *cached_signature == signature {
+                return Ok(order.clone());
+            }
+        }
+        let order = {
+            let estimator = CostModelRegionEstimator {
+                cost_model: &self.cost_model,
+            };
+            choose_order(region, &estimator, self.max_join_reorder_size)?
+        };
+        self.order_cache
+            .borrow_mut()
+            .push((signature, order.clone()));
+        Ok(order)
     }
 
     /// The re-emitted region: component subtrees CROSSed smallest-first, zero-atom
