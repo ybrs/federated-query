@@ -6,6 +6,7 @@ mod cross_source;
 mod cross_source_clickhouse;
 mod ctes;
 mod delta_refresh;
+mod dense_joins;
 mod duckdb_runtime;
 mod dynamic_catalog;
 mod event_dataset;

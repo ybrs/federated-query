@@ -42,6 +42,20 @@ use super::OptimizationRule;
 /// in one connected region.
 const MAX_REGION_ATOMS: usize = 64;
 
+/// The DP work bound, in units of one conjunct inspected while costing one
+/// candidate extension - the enumeration inner loop's dominant term. The DP's
+/// work is a function of the join GRAPH, not only the atom count: a 12-atom
+/// chain enumerates ~78 connected subsets while a 10-atom clique enumerates
+/// ~1000, so a size limit alone cannot bound it. A component whose counted
+/// work exceeds this cap is ordered by the GOO greedy walk instead, which
+/// completes in milliseconds on any shape. The value is calibrated against the
+/// measured unit cost (~2us in an unoptimized build on the reference machine),
+/// putting the largest DP this admits around 40ms in a debug build - well
+/// inside the 100ms planning budget with room for machine load. The count is
+/// exact and machine-independent, so which plan a query gets never depends on
+/// the clock.
+const DP_WORK_CAP: u64 = 20_000;
+
 // ------------------------------- result types -------------------------------
 
 /// One left-deep join step: the atom joined, its estimate, and which region
@@ -600,7 +614,9 @@ impl Enumerator<'_> {
                 total: self.atom_estimates[component[0]].clone(),
             });
         }
-        let candidate = if component.len() <= self.max_dp {
+        let candidate = if component.len() <= self.max_dp
+            && dp_work_units(self.region, component) <= DP_WORK_CAP
+        {
             self.dp_best(component)?
         } else {
             self.greedy(component)?
@@ -830,6 +846,89 @@ impl Enumerator<'_> {
             cross_steps,
         })
     }
+}
+
+/// The exact work the Selinger DP would spend on a component, counted by a DRY
+/// run of its connected-subset enumeration: per (subset, candidate atom)
+/// attempt, one unit per region conjunct (what `newly_covered` scans while
+/// costing an extension). Pure bitmask arithmetic - no estimates, no
+/// allocation per attempt - so counting a capped component costs microseconds,
+/// and the early return keeps even a pathological one bounded near the cap.
+fn dp_work_units(region: &JoinRegion, component: &[usize]) -> u64 {
+    let adjacency = equi_adjacency(region);
+    let conjuncts = region.conjuncts.len().max(1) as u64;
+    let mut seen: BTreeSet<u64> = BTreeSet::new();
+    let mut layer: Vec<u64> = Vec::with_capacity(component.len());
+    for &index in component {
+        layer.push(1u64 << index);
+        seen.insert(1u64 << index);
+    }
+    let mut units = 0u64;
+    while !layer.is_empty() {
+        let mut next: Vec<u64> = Vec::new();
+        for &subset in &layer {
+            units = units.saturating_add(attempt_units(component, subset, conjuncts));
+            if units > DP_WORK_CAP {
+                return units;
+            }
+            grow_layer(component, subset, &adjacency, &mut seen, &mut next);
+        }
+        layer = next;
+    }
+    units
+}
+
+/// The units one subset's extension attempts cost: every absent atom is tried,
+/// and each attempt scans the region's conjuncts.
+fn attempt_units(component: &[usize], subset: u64, conjuncts: u64) -> u64 {
+    let mut absent = 0u64;
+    for &atom_index in component {
+        if subset & (1u64 << atom_index) == 0 {
+            absent += 1;
+        }
+    }
+    absent * conjuncts
+}
+
+/// Insert every unseen CONNECTED single-atom extension of `subset` into the
+/// next layer, mirroring the DP's own growth.
+fn grow_layer(
+    component: &[usize],
+    subset: u64,
+    adjacency: &BTreeMap<usize, u64>,
+    seen: &mut BTreeSet<u64>,
+    next: &mut Vec<u64>,
+) {
+    for &atom_index in component {
+        let bit = 1u64 << atom_index;
+        if subset & bit != 0 {
+            continue;
+        }
+        let connected = adjacency
+            .get(&atom_index)
+            .is_some_and(|neighbors| neighbors & subset != 0);
+        if connected && seen.insert(subset | bit) {
+            next.push(subset | bit);
+        }
+    }
+}
+
+/// Each atom's equi-join neighbors as a bitmask, from the region's two-atom
+/// equi conjuncts - the same connectivity `newly_covered` + `any_equi` decide,
+/// reduced to one AND per attempt for the dry count.
+fn equi_adjacency(region: &JoinRegion) -> BTreeMap<usize, u64> {
+    let mut adjacency: BTreeMap<usize, u64> = BTreeMap::new();
+    for conjunct in &region.conjuncts {
+        if !conjunct.is_equi || conjunct.atom_indexes.len() != 2 {
+            continue;
+        }
+        let mut pair = conjunct.atom_indexes.iter();
+        let first = *pair.next().expect("two atoms");
+        let second = *pair.next().expect("two atoms");
+        *adjacency.entry(first).or_insert(0) |= 1u64 << second;
+        *adjacency.entry(second).or_insert(0) |= 1u64 << first;
+    }
+    adjacency
 }
 
 /// The order cache's key for a region: the region with every scan's column

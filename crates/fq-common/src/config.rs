@@ -104,6 +104,10 @@ pub struct OptimizerConfig {
     /// whatever has been executed before. Writing observations is unaffected.
     pub enable_learned_statistics: bool,
     /// Use the Selinger DP for at most this many tables; GOO greedy above it.
+    /// Below the limit, a region whose join graph makes the DP's counted work
+    /// exceed a fixed cap is also ordered greedily (see fq-optimize's
+    /// DP_WORK_CAP): the DP's cost is a function of the graph, not only the
+    /// table count.
     pub max_join_reorder_size: u32,
     /// Hard wall-clock budget for PLANNING one query, in milliseconds. Planning
     /// is O(metadata) by design; blowing this budget means something O(data)

@@ -319,7 +319,12 @@ static SETTINGS: &[SettingDef] = &[
     },
     SettingDef {
         name: "optimizer.max_join_reorder_size",
-        description: "Use the Selinger DP for at most this many tables; GOO greedy above it.",
+        description: "Use the Selinger DP for at most this many tables; GOO \
+                      greedy above it. Below the limit a region whose join \
+                      graph makes the DP's counted work exceed a fixed cap \
+                      (dense graphs reach it well before sparse ones) is also \
+                      ordered greedily, so planning stays inside its budget on \
+                      any graph shape.",
         mutability: Mutability::SessionMutable,
         env_var: None,
         default: || SettingValue::U64(u64::from(OptimizerConfig::default().max_join_reorder_size)),
