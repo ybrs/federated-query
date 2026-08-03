@@ -651,6 +651,49 @@ impl LogicalPlan {
             | LogicalPlan::TableFunction(_) => Vec::new(),
         }
     }
+
+    /// The longest chain of plan NODES from this node to a leaf, counting a
+    /// plan nested inside a subquery expression as continuing the chain (this
+    /// node alone is depth 1).
+    ///
+    /// Plan nodes are counted and expression nesting is not, because a plan
+    /// level is what the recursive passes pay for: every pass recurses once
+    /// per plan node, several frames deep each, while an expression level
+    /// costs a single small frame in the expression walks. Measured in a debug
+    /// build on a `QUERY_THREAD_STACK_BYTES` thread: a 400-level join chain
+    /// plans, a 425-level one overflows the stack, while an expression 2000
+    /// levels deep plans in half a second.
+    ///
+    /// The walk is ITERATIVE over an explicit work list. A recursive measure
+    /// would overflow on exactly the plans it exists to reject.
+    pub fn max_depth(&self) -> usize {
+        let mut deepest = 0;
+        let mut pending: Vec<(&LogicalPlan, usize)> = vec![(self, 1)];
+        while let Some((node, depth)) = pending.pop() {
+            deepest = deepest.max(depth);
+            for child in node.children() {
+                pending.push((child, depth + 1));
+            }
+            for nested in node.expression_plans() {
+                pending.push((nested, depth + 1));
+            }
+        }
+        deepest
+    }
+
+    /// The plans held inside this node's OWN expressions - a scalar subquery,
+    /// an EXISTS, an `IN (SELECT ...)`, a quantified comparison - found by
+    /// walking every sub-expression iteratively, subquery boundaries included.
+    fn expression_plans(&self) -> Vec<&LogicalPlan> {
+        let mut plans = Vec::new();
+        let mut pending: Vec<&Expr> = self.direct_expressions();
+        while let Some(expr) = pending.pop() {
+            let (children, nested) = expr.walk_children();
+            pending.extend(children);
+            plans.extend(nested);
+        }
+        plans
+    }
 }
 
 /// Append every expression of an optional expression vector to `exprs`.

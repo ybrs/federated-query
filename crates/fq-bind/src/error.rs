@@ -49,6 +49,13 @@ pub enum BindError {
     #[error("cannot bind: {0}")]
     Unsupported(String),
 
+    /// A plan nesting more levels than the query thread's stack carries. Every
+    /// pass after the binder recurses once per plan level, so planning this
+    /// would end in a stack overflow - a SIGSEGV with no message - rather than
+    /// in an answer.
+    #[error("query nests {depth} plan levels; the engine's limit is {limit}")]
+    PlanTooDeep { depth: usize, limit: usize },
+
     /// A reference to a datasource that failed to connect/load at construction:
     /// carries the real connector error naming the source, deferred here so an
     /// unreferenced unavailable source blocks nothing.

@@ -38,7 +38,31 @@ pub trait Authorizer {
 /// superuser): the embedded process and every test bind through here. The wire
 /// server uses [`bind_as`] with the authenticated principal.
 pub fn bind(catalog: &Catalog, plan: LogicalPlan) -> Result<LogicalPlan, BindError> {
-    Binder::new(catalog).bind(plan)
+    guard_depth(&plan)?;
+    let bound = Binder::new(catalog).bind(plan)?;
+    guard_depth(&bound)?;
+    Ok(bound)
+}
+
+/// Refuse a plan deeper than `fq_common::MAX_PLAN_DEPTH`.
+///
+/// Both entry points check the plan they are HANDED and the plan they RETURN.
+/// The input check is what protects the binder's own recursion, which runs one
+/// frame chain per plan level before any output exists; the output check
+/// protects every later pass, over the plan the binder actually produced -
+/// hoists and CTE inlining make it a different plan from the input.
+///
+/// The measure counts plan nodes and crosses subquery boundaries, and it walks
+/// iteratively: a recursive measure would overflow on the plans this rejects.
+fn guard_depth(plan: &LogicalPlan) -> Result<(), BindError> {
+    let depth = plan.max_depth();
+    if depth > fq_common::MAX_PLAN_DEPTH {
+        return Err(BindError::PlanTooDeep {
+            depth,
+            limit: fq_common::MAX_PLAN_DEPTH,
+        });
+    }
+    Ok(())
 }
 
 /// Bind a logical plan as `principal`, authorizing every base-table reference
@@ -51,5 +75,8 @@ pub fn bind_as(
     principal: &Principal,
     authorizer: &dyn Authorizer,
 ) -> Result<LogicalPlan, BindError> {
-    Binder::with_principal(catalog, principal.superuser, authorizer).bind(plan)
+    guard_depth(&plan)?;
+    let bound = Binder::with_principal(catalog, principal.superuser, authorizer).bind(plan)?;
+    guard_depth(&bound)?;
+    Ok(bound)
 }

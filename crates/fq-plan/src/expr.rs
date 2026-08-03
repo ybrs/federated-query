@@ -437,6 +437,45 @@ impl Expr {
         }
     }
 
+    /// Every direct child of this node, split into the sub-expressions a walk
+    /// continues through and the plans a subquery-bearing node holds.
+    ///
+    /// Where `children` stops at the subquery boundary, this crosses it: the
+    /// inner plan comes back as a plan, and the outer operand of an
+    /// `IN (SELECT ...)` or a quantified comparison comes back as an
+    /// expression, so a walk over the WHOLE tree misses neither. Exhaustive:
+    /// a new variant forces a new arm, and the non-subquery variants are
+    /// listed by name rather than caught by a wildcard, so a new
+    /// subquery-bearing variant cannot fall through to `children` (which
+    /// would hide its plan from every caller here).
+    pub fn walk_children(&self) -> (Vec<&Expr>, Vec<&LogicalPlan>) {
+        match self {
+            Expr::Subquery { subquery } | Expr::Exists { subquery, .. } => {
+                (Vec::new(), vec![subquery.as_ref()])
+            }
+            Expr::InSubquery {
+                value, subquery, ..
+            } => (vec![value.as_ref()], vec![subquery.as_ref()]),
+            Expr::QuantifiedComparison { left, subquery, .. } => {
+                (vec![left.as_ref()], vec![subquery.as_ref()])
+            }
+            Expr::Column(_)
+            | Expr::Literal { .. }
+            | Expr::Interval { .. }
+            | Expr::BinaryOp { .. }
+            | Expr::UnaryOp { .. }
+            | Expr::Cast { .. }
+            | Expr::Extract { .. }
+            | Expr::FunctionCall { .. }
+            | Expr::Case { .. }
+            | Expr::InList { .. }
+            | Expr::Between { .. }
+            | Expr::Like { .. }
+            | Expr::Tuple { .. }
+            | Expr::Window { .. } => (self.children(), Vec::new()),
+        }
+    }
+
     /// Rebuild this node with `f` applied to each direct child expression. Leaves
     /// and subquery-boundary nodes pass through unchanged. Mirrors Python
     /// `map_children`; exhaustive by construction.
