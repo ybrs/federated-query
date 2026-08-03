@@ -27,6 +27,7 @@ use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::PartitionStream;
 use datafusion::prelude::{col, lit, SessionConfig, SessionContext};
@@ -161,26 +162,56 @@ fn memory_capped_context() -> SessionContext {
     coordinator_context(SessionConfig::new())
 }
 
+/// The physical optimizer rules a coordinator context removes, by EXACT name:
+/// DataFusion 54 registers its filter pushdown twice, once per phase.
+const EXCLUDED_PHYSICAL_RULES: [&str; 2] = ["FilterPushdown", "FilterPushdown(Post)"];
+
+/// DataFusion's default physical optimizer rules with `EXCLUDED_PHYSICAL_RULES`
+/// removed - the rule set every coordinator context is built from.
+///
+/// Over the lazy fragment chain this engine composes (filter fragment -> view
+/// -> projected outer join), DataFusion 54's physical filter pushdown moves an
+/// above-join predicate below the join through the join-key equivalence, which
+/// is invalid for an outer join's null-supplying side: null-extended rows are
+/// manufactured AFTER the relocated filter and reach the output, returning rows
+/// a correct plan rejects. tests/df_right_join_filter.rs pins the composition
+/// against this rule set. The engine's own planner places filters deliberately
+/// (in source SQL or as explicit fragments), so losing DataFusion's relocation
+/// costs little.
+///
+/// The names removed must be exactly `EXCLUDED_PHYSICAL_RULES`; anything else
+/// PANICS here, at the first context construction. Matching by name is sound
+/// only while those names hold, and an exclusion that quietly matches nothing
+/// after an upstream rename reinstates the relocation and ships wrong rows.
+pub fn coordinator_physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
+    let mut kept = Vec::new();
+    let mut excluded = Vec::new();
+    for rule in PhysicalOptimizer::new().rules {
+        if EXCLUDED_PHYSICAL_RULES.contains(&rule.name()) {
+            excluded.push(rule.name().to_string());
+        } else {
+            kept.push(rule);
+        }
+    }
+    excluded.sort();
+    assert_eq!(
+        excluded, EXCLUDED_PHYSICAL_RULES,
+        "DataFusion's default physical optimizer rules no longer contain exactly \
+         {EXCLUDED_PHYSICAL_RULES:?}. The coordinator excludes those rules because \
+         their outer-join filter relocation returns null-extended rows a correct \
+         plan rejects (pinned by tests/df_right_join_filter.rs); a set that does \
+         not match means the exclusion no longer removes what it names. Identify \
+         the renamed or added filter-relocating rules and update \
+         EXCLUDED_PHYSICAL_RULES."
+    );
+    kept
+}
+
 /// The ONE constructor for every context that plans or executes coordinator
 /// fragments and composed regions, so no context can differ in the rules that
 /// decide result correctness.
-///
-/// DataFusion's physical FilterPushdown rules are EXCLUDED. Over the lazy
-/// fragment chain this engine composes (filter fragment -> view -> projected
-/// outer join), DataFusion 54's physical filter pushdown moves an above-join
-/// predicate below the join through the join-key equivalence, which is invalid
-/// for an outer join's null-supplying side: null-extended rows are manufactured
-/// AFTER the relocated filter and reach the output, returning rows a correct
-/// plan rejects. Pinned by tests/df_right_join_filter.rs. The engine's own
-/// planner places filters deliberately (in source SQL or as explicit
-/// fragments), so losing DataFusion's relocation costs little.
 fn coordinator_context(config: SessionConfig) -> SessionContext {
-    let mut rules = Vec::new();
-    for rule in PhysicalOptimizer::new().rules {
-        if !rule.name().starts_with("FilterPushdown") {
-            rules.push(rule);
-        }
-    }
+    let rules = coordinator_physical_rules();
     // Plan partitioning follows the execution runtime's worker count, so a
     // bounded `executor.max_threads` bounds the plan's parallelism too instead
     // of fanning out per-core partitions onto fewer workers.
@@ -1976,6 +2007,44 @@ fn render_agg_inner(agg: &AggCall) -> Result<String, DataFusionError> {
 /// Double-quote an identifier for a DataFusion SQL alias.
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+#[cfg(test)]
+mod coordinator_rule_tests {
+    use super::{coordinator_physical_rules, EXCLUDED_PHYSICAL_RULES};
+    use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+
+    #[test]
+    fn every_excluded_rule_name_exists_in_datafusions_defaults() {
+        let mut default_names = Vec::new();
+        for rule in PhysicalOptimizer::new().rules {
+            default_names.push(rule.name().to_string());
+        }
+        for name in EXCLUDED_PHYSICAL_RULES {
+            assert!(
+                default_names.contains(&name.to_string()),
+                "{name} is excluded from the coordinator's rules but DataFusion's \
+                 defaults are {default_names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn coordinator_rules_are_the_defaults_minus_the_excluded_ones() {
+        let kept = coordinator_physical_rules();
+        for rule in &kept {
+            assert!(
+                !EXCLUDED_PHYSICAL_RULES.contains(&rule.name()),
+                "{} survived the coordinator's exclusion",
+                rule.name()
+            );
+        }
+        assert_eq!(
+            kept.len() + EXCLUDED_PHYSICAL_RULES.len(),
+            PhysicalOptimizer::new().rules.len(),
+            "the coordinator's rule set must drop only the excluded rules"
+        );
+    }
 }
 
 #[cfg(test)]

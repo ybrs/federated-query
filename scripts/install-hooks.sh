@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Install the repo's git hooks into .git/hooks. Idempotent - safe to run on
-# every session/environment start (a SessionStart hook in .claude/settings.json
-# does exactly that), so a fresh checkout or rebuilt environment is always
-# gated without manual setup.
+# Install the repo's git hooks into the shared git directory's hooks/, which is
+# where git looks from the main checkout and from every linked worktree alike.
+# Idempotent - safe to run on every session/environment start (a SessionStart
+# hook in .claude/settings.json does exactly that), so a fresh checkout or
+# rebuilt environment is always gated without manual setup.
 #
 # pre-commit runs EVERY check this project has on EVERY commit, with no
 # file-type filter and no staged-file narrowing: lint, clippy, the Rust test
@@ -18,12 +19,21 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-hook_dir="$repo_root/.git/hooks"
 
-if [ ! -d "$repo_root/.git" ]; then
+# Hooks and the gate's state live in the git directory SHARED by the checkout
+# and every linked worktree, so a worktree runs the same gate and reads the same
+# green stamp. `.git` is a FILE in a worktree, never a directory, so the path is
+# asked of git rather than assumed: git prints it relative to the repository
+# root in a plain checkout and absolute in a worktree.
+if ! git_common_dir="$(git -C "$repo_root" rev-parse --git-common-dir)"; then
     echo "install-hooks: $repo_root is not a git checkout" >&2
     exit 1
 fi
+case "$git_common_dir" in
+    /*) ;;
+    *) git_common_dir="$repo_root/$git_common_dir" ;;
+esac
+hook_dir="$git_common_dir/hooks"
 
 mkdir -p "$hook_dir"
 cat > "$hook_dir/pre-commit" <<'EOF'
@@ -153,8 +163,17 @@ cargo build --release -p fedq-py --manifest-path "$root/Cargo.toml" \
 # gate actually verified. Any unstaged edit or untracked file means the
 # verified content differs from the commit, and no token is written.
 if ! git -C "$root" status --porcelain | grep -qvE '^[MTADRC] '; then
-    mkdir -p "$root/.git/fedq-gate"
-    git -C "$root" write-tree > "$root/.git/fedq-gate/pending-tree"
+    # The token lives in the git directory SHARED by the checkout and every
+    # linked worktree, where `.git` is a file rather than a directory. git
+    # prints that path relative to the repository root in a plain checkout and
+    # absolute in a worktree.
+    common_dir="$(git -C "$root" rev-parse --git-common-dir)"
+    case "$common_dir" in
+        /*) ;;
+        *) common_dir="$root/$common_dir" ;;
+    esac
+    mkdir -p "$common_dir/fedq-gate"
+    git -C "$root" write-tree > "$common_dir/fedq-gate/pending-tree"
 fi
 EOF
 chmod +x "$hook_dir/pre-commit"
@@ -171,7 +190,17 @@ cat > "$hook_dir/post-commit" <<'EOF'
 # content, in which case the verification genuinely covers it.
 set -uo pipefail
 root="$(git rev-parse --show-toplevel)"
-token="$root/.git/fedq-gate/pending-tree"
+
+# The token and the stamp live in the git directory SHARED by the checkout and
+# every linked worktree, where `.git` is a file rather than a directory. git
+# prints that path relative to the repository root in a plain checkout and
+# absolute in a worktree.
+common_dir="$(git rev-parse --git-common-dir)"
+case "$common_dir" in
+    /*) ;;
+    *) common_dir="$root/$common_dir" ;;
+esac
+token="$common_dir/fedq-gate/pending-tree"
 
 [ -f "$token" ] || exit 0
 verified_tree="$(cat "$token")"
@@ -180,7 +209,7 @@ head_tree="$(git -C "$root" rev-parse 'HEAD^{tree}')"
 [ "$verified_tree" = "$head_tree" ] || exit 0
 
 commit="$(git -C "$root" rev-parse HEAD)"
-stamp="$root/.git/fedq-gate/green-tree"
+stamp="$common_dir/fedq-gate/green-tree"
 printf '{"tree": "%s", "commit": "%s", "verified_by": "pre-commit", "verified_at": "%s"}\n' \
     "$verified_tree" "$commit" "$(date +%Y-%m-%dT%H:%M:%S%z)" > "$stamp.tmp"
 mv -f "$stamp.tmp" "$stamp"

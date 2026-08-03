@@ -26,21 +26,16 @@ use datafusion::catalog::MemTable;
 use datafusion::common::JoinType;
 use datafusion::datasource::view::ViewTable;
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::prelude::*;
+use fq_exec::engine::coordinator_physical_rules;
 
-/// A context whose physical optimizer has NO FilterPushdown rules, mirroring
-/// the engine's workaround for the DataFusion 54 defect this test pins.
+/// A context carrying the engine's own coordinator rule set, so this test runs
+/// against the exact exclusion `coordinator_context` applies rather than a copy
+/// of it that could drift.
 fn context_without_physical_filter_pushdown() -> SessionContext {
-    let mut rules = Vec::new();
-    for rule in PhysicalOptimizer::new().rules {
-        if !rule.name().starts_with("FilterPushdown") {
-            rules.push(rule);
-        }
-    }
     let state = SessionStateBuilder::new()
         .with_default_features()
-        .with_physical_optimizer_rules(rules)
+        .with_physical_optimizer_rules(coordinator_physical_rules())
         .build();
     SessionContext::new_with_state(state)
 }

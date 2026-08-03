@@ -8,13 +8,13 @@ Python suite, partitioned) - to have passed on EXACTLY the tree the ticket is
 being closed over, and DENIES the tool call otherwise.
 
 "Exactly the tree" is content-keyed, never time-keyed: a green run stamps the
-git TREE ID it verified into `.git/fedq-gate/green-tree` (written by this gate
-after its own green run, and by the post-commit hook for a commit whose
-pre-commit gate ran green on identical content). A done-transition skips the
-re-run only when the working tree is porcelain-clean AND `HEAD^{tree}` equals
-the stamped tree - the same bytes the suite already proved. Any edit, any
-untracked file, any commit of other content misses the stamp and the whole
-gate runs here, now.
+git TREE ID it verified into `fedq-gate/green-tree` under the repository's
+shared git directory (written by this gate after its own green run, and by the
+post-commit hook for a commit whose pre-commit gate ran green on identical
+content). A done-transition skips the re-run only when the working tree is
+porcelain-clean AND `HEAD^{tree}` equals the stamped tree - the same bytes the
+suite already proved. Any edit, any untracked file, any commit of other content
+misses the stamp and the whole gate runs here, now.
 
 There is NO override that skips VERIFICATION. The stamp is not an exception:
 it is the same verification, already performed on identical content. A tree
@@ -23,12 +23,20 @@ with no matching stamp always runs the whole harness.
 FAIL-CLOSED, in every direction a check could silently vanish:
 - A suite that cannot RUN (missing toolchain, venv, libduckdb, database)
   denies, naming what was missing.
+- ANY exception inside the gate denies, carrying its traceback. The harness
+  reads a nonzero exit as a non-blocking error and lets the tool call proceed,
+  so a crash that merely propagated would pass the transition with nothing
+  verified - here an unreported crash IS a silent pass.
 - The gate keeps an internal deadline BELOW the hook's own timeout and denies
   when it is exceeded, killing the step's whole process group - so the harness
   timeout can never expire the hook mid-suite and let the call through
   unverified, and no orphaned suite keeps running.
 - Concurrent done-transitions serialize on a lock; the loser re-checks the
   stamp after waiting, so one green run satisfies a batch of closes.
+- The tree a green run stamps is the tree that was present BEFORE the run, and
+  only if it is still present after: a commit landing mid-gate means the suite
+  executed over mixed content, which no single tree describes, so the run
+  stands and nothing is stamped.
 
 Exit 0 with a deny decision blocks the call; exit 0 with no output allows it.
 """
@@ -40,6 +48,7 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 
 # Statuses that close work out. Everything else is a cheap transition.
 _GATED_STATUSES = {"done"}
@@ -62,9 +71,32 @@ def _repo_root():
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def _git_common_dir(root):
+    """The git directory shared by the checkout and every linked worktree.
+
+    A linked worktree's `.git` is a FILE, and its own git dir holds only
+    per-worktree state, so neither is a place all checkouts can see. git answers
+    this relative to the repository root in a plain checkout and absolutely in a
+    worktree; joining against the root is correct for both.
+    """
+    common = _git(root, "rev-parse", "--git-common-dir")
+    if common is None:
+        raise RuntimeError(
+            f"`git rev-parse --git-common-dir` failed in {root}, so the gate's "
+            "state directory cannot be located and no verification can be recorded"
+        )
+    return os.path.join(root, common)
+
+
 def _gate_dir(root):
-    """The gate's state directory inside .git (never part of the tree)."""
-    path = os.path.join(root, ".git", "fedq-gate")
+    """The gate's state directory inside the shared git dir (never in the tree).
+
+    Every checkout of this repository - the main one and each linked worktree -
+    resolves to the SAME directory, so they share one stamp and one lock. That
+    matches what the stamp means: it names a tree's content, and that content is
+    identical whichever checkout observes it.
+    """
+    path = os.path.join(_git_common_dir(root), "fedq-gate")
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -120,14 +152,24 @@ def _write_stamp(root, tree, verified_by):
     os.replace(path + ".tmp", path)
 
 
+def _content_snapshot(root):
+    """The one tree the checkout currently IS, or None when it is not one tree.
+
+    A stamp names a single tree id, so content that no tree describes - a dirty
+    worktree, an untracked file, a checkout with no usable HEAD - collapses to
+    None and can neither satisfy a stamp nor be stamped.
+    """
+    if not _worktree_is_clean(root):
+        return None
+    return _head_tree(root)
+
+
 def _stamp_satisfies(root):
     """Whether the current content is exactly what a green run verified."""
-    if not _worktree_is_clean(root):
+    current = _content_snapshot(root)
+    if current is None:
         return False
-    head_tree = _head_tree(root)
-    if head_tree is None:
-        return False
-    return _stamped_tree(root) == head_tree
+    return _stamped_tree(root) == current
 
 
 def _cargo_env():
@@ -315,6 +357,22 @@ def _acquire_lock(root):
     return None
 
 
+def _stamp_if_content_unchanged(root, verified_tree):
+    """Record `verified_tree` as green, unless the checkout moved during the run.
+
+    The gate's lock serializes done-transitions, not commits: another session can
+    commit or edit while the suite runs. When that happens the suite executed
+    partly over one content and partly over another, so no single tree was
+    verified. The run itself still stands - it was green - but nothing is
+    stamped, and the next done-transition runs the whole gate again.
+    """
+    if verified_tree is None:
+        return
+    if _content_snapshot(root) != verified_tree:
+        return
+    _write_stamp(root, verified_tree, "done-gate")
+
+
 def _gate_done_transition(root):
     """Allow (None) or deny (reason) one done-transition, under the lock."""
     lock = _acquire_lock(root)
@@ -326,25 +384,27 @@ def _gate_done_transition(root):
     with lock:
         if _stamp_satisfies(root):
             return None
+        verified_tree = _content_snapshot(root)
         failure = _run_full_gate(root)
         if failure:
             return failure
-        head_tree = _head_tree(root)
-        if head_tree is not None and _worktree_is_clean(root):
-            _write_stamp(root, head_tree, "done-gate")
+        _stamp_if_content_unchanged(root, verified_tree)
         return None
 
 
-def main():
-    """Gate a done-transition on the verified tree; allow everything else."""
+def _decide(raw_payload):
+    """Decide one tool call: 0 allows it, a deny decision blocks it.
+
+    Only a done-transition is gated; every other status is a cheap transition
+    and passes straight through, as does a payload that is not JSON at all.
+    """
     try:
-        payload = json.load(sys.stdin)
+        payload = json.loads(raw_payload)
     except json.JSONDecodeError:
         return 0
     if _requested_status(payload) not in _GATED_STATUSES:
         return 0
-    root = _repo_root()
-    failure = _gate_done_transition(root)
+    failure = _gate_done_transition(_repo_root())
     if failure is None:
         return 0
     return _deny(
@@ -352,6 +412,24 @@ def main():
         + failure
         + "\n\nFix the failures above, then set the status again."
     )
+
+
+def main():
+    """Gate a done-transition on the verified tree; allow everything else.
+
+    Every exception the gate can raise is turned into a DENY carrying its
+    traceback. A hook denies only by exiting 0 with a deny decision; any other
+    nonzero exit is a non-blocking error the harness lets the tool call through,
+    so a propagating crash would close a ticket over nothing verified.
+    """
+    try:
+        return _decide(sys.stdin.read())
+    except Exception:
+        return _deny(
+            "This ticket cannot be marked done: the done-gate itself CRASHED, so "
+            "NOTHING was verified. The gate denies rather than let an unverified "
+            "close through.\n\n" + traceback.format_exc()
+        )
 
 
 if __name__ == "__main__":

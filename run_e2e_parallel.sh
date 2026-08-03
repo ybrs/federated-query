@@ -93,6 +93,15 @@ MAX_CONCURRENT=8
 # Set once a split has been seen to fail, so no further split is launched.
 ABORT=""
 
+# How many splits the suite is divided into. The tally below refuses a run that
+# launched fewer, so a split dropped from the list cannot pass as a whole run.
+EXPECTED_SPLITS=15
+
+# The names of the splits this run actually started, in launch order. The tally
+# is checked against this list rather than against the exit files that happen to
+# exist: a split whose subshell dies without writing one leaves no other trace.
+LAUNCHED=()
+
 # Note any failed split in ABORT, so launching and monitoring both stop.
 note_failures() {
     for exit_file in "${LOGS}"/*.exit; do
@@ -113,6 +122,7 @@ launch() {
         [ -n "${ABORT}" ] && return
         sleep 1
     done
+    LAUNCHED+=("$1")
     run_split "$@" &
 }
 
@@ -174,6 +184,32 @@ wait 2>/dev/null
 ELAPSED=$(( $(date +%s) - STARTED ))
 echo "e2e (parallel): ${ELAPSED}s across $(ls "${LOGS}"/*.exit | wc -l) processes"
 echo "logs: ${LOGS}/"
+
+# EVERY LAUNCHED SPLIT MUST HAVE REPORTED. run_split writes its exit file only
+# when pytest RETURNS, so a subshell killed outright - the OOM killer taking
+# bash instead of pytest, a shell crash, an external kill - leaves none at all.
+# Tallying the exit files that exist would then read the survivors' zeros and
+# exit 0 with a fifteenth of the suite never run, which is exactly a narrowed
+# run printing the same "passed" as a whole one.
+#
+# On the fail-fast path the surviving splits were killed on purpose, so their
+# missing exit files are expected and the run fails on the failure itself.
+if [ -z "${FAILED_FIRST}" ]; then
+    if [ "${#LAUNCHED[@]}" -ne "${EXPECTED_SPLITS}" ]; then
+        echo "FAILED: ${#LAUNCHED[@]} of ${EXPECTED_SPLITS} splits were launched," \
+            "so the suite did NOT run whole" >&2
+        exit 1
+    fi
+    UNREPORTED=""
+    for name in "${LAUNCHED[@]}"; do
+        [ -f "${LOGS}/${name}.exit" ] || UNREPORTED="${UNREPORTED} ${name}"
+    done
+    if [ -n "${UNREPORTED}" ]; then
+        echo "FAILED: launched splits that never reported an exit code:${UNREPORTED}" >&2
+        echo "Their processes died without finishing, so the suite did NOT run whole." >&2
+        exit 1
+    fi
+fi
 
 FAILED=0
 for exit_file in "${LOGS}"/*.exit; do
