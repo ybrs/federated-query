@@ -36,9 +36,39 @@ def _load_done_gate():
 done_gate = _load_done_gate()
 
 
+@pytest.fixture(autouse=True)
+def _scrub_git_environment(monkeypatch):
+    """Remove every GIT_* variable for the duration of each test.
+
+    This suite also runs inside the repository's own pre-commit hook, where
+    git exports GIT_DIR and GIT_INDEX_FILE; any git command the tests (or the
+    hook module they import) spawn would then act on the REAL repository
+    instead of the throwaway ones built under /tmp.
+    """
+    for name in list(os.environ):
+        if name.startswith("GIT_"):
+            monkeypatch.delenv(name, raising=False)
+
+
 def _git(repo, *args):
-    """Run one git command in `repo`; a failing command raises."""
-    subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    """Run one git command in `repo`; a failing command raises.
+
+    The environment is scrubbed of GIT_* variables: this suite also runs
+    inside the repository's own pre-commit hook, where git exports GIT_DIR
+    and friends, and inheriting them would point every command at the REAL
+    repository instead of the throwaway one under test.
+    """
+    environment = {}
+    for name, value in os.environ.items():
+        if not name.startswith("GIT_"):
+            environment[name] = value
+    subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        env=environment,
+    )
 
 
 def _write(path, text):
@@ -72,7 +102,10 @@ def _run_hook_rooted_at(directory, payload):
     os.makedirs(hooks_dir)
     copied_hook = os.path.join(hooks_dir, "done_gate.py")
     shutil.copyfile(HOOK_PATH, copied_hook)
-    environment = dict(os.environ)
+    environment = {}
+    for name, value in os.environ.items():
+        if not name.startswith("GIT_"):
+            environment[name] = value
     environment["GIT_CEILING_DIRECTORIES"] = directory
     completed = subprocess.run(
         [sys.executable, copied_hook],
