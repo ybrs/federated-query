@@ -22,9 +22,11 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::disk_manager::RefCountedTempFile;
 use datafusion::execution::memory_pool::{FairSpillPool, MemoryConsumer};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::PartitionStream;
 use datafusion::prelude::{col, lit, SessionConfig, SessionContext};
@@ -87,7 +89,36 @@ pub(crate) fn runtime_env() -> Arc<RuntimeEnv> {
 
 /// A SessionContext wired to the shared memory-capped runtime.
 fn memory_capped_context() -> SessionContext {
-    SessionContext::new_with_config_rt(SessionConfig::new(), runtime_env())
+    coordinator_context(SessionConfig::new())
+}
+
+/// The ONE constructor for every context that plans or executes coordinator
+/// fragments and composed regions, so no context can differ in the rules that
+/// decide result correctness.
+///
+/// DataFusion's physical FilterPushdown rules are EXCLUDED. Over the lazy
+/// fragment chain this engine composes (filter fragment -> view -> projected
+/// outer join), DataFusion 54's physical filter pushdown moves an above-join
+/// predicate below the join through the join-key equivalence, which is invalid
+/// for an outer join's null-supplying side: null-extended rows are manufactured
+/// AFTER the relocated filter and reach the output, returning rows a correct
+/// plan rejects. Pinned by tests/df_right_join_filter.rs. The engine's own
+/// planner places filters deliberately (in source SQL or as explicit
+/// fragments), so losing DataFusion's relocation costs little.
+fn coordinator_context(config: SessionConfig) -> SessionContext {
+    let mut rules = Vec::new();
+    for rule in PhysicalOptimizer::new().rules {
+        if !rule.name().starts_with("FilterPushdown") {
+            rules.push(rule);
+        }
+    }
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_config(config)
+        .with_runtime_env(runtime_env())
+        .with_physical_optimizer_rules(rules)
+        .build();
+    SessionContext::new_with_state(state)
 }
 
 /// Fully-read Arrow data with its schema. Clone is Arc-shallow (RecordBatch
@@ -1333,6 +1364,9 @@ async fn run_fragment(
         );
     }
 
+    if profile_enabled() {
+        eprintln!("[fedqrs-fragment] {fragment:?}");
+    }
     match fragment {
         Fragment::HashJoin {
             join_type,
@@ -1490,7 +1524,7 @@ async fn execute_region(
     if spillable_joins {
         config = config.set_bool("datafusion.optimizer.prefer_hash_join", false);
     }
-    let ctx = SessionContext::new_with_config_rt(config, runtime_env());
+    let ctx = coordinator_context(config);
     let frame = ctx.execute_logical_plan(plan).await?;
     collect_batches(frame).await
 }

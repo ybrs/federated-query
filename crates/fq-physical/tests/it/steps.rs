@@ -688,8 +688,8 @@ fn first_source_sql(steps: &[Step]) -> String {
 
 #[test]
 fn same_source_union_all_renders_a_remote_set_op_scan() {
-    // FINDING 1: a same-source UNION ALL plans to a PhysicalRemoteSetOp; its source
-    // SQL must render both branches joined by UNION ALL (previously NoSourceSql).
+    // A same-source UNION ALL plans to a PhysicalRemoteSetOp whose source SQL
+    // renders both branches joined by UNION ALL.
     let steps =
         steps_of("SELECT id FROM pg.public.orders UNION ALL SELECT id FROM pg.public.customer");
     let sql = first_source_sql(&steps).to_uppercase();
@@ -1190,5 +1190,103 @@ fn cte_consumed_twice_builds_its_body_fragments_once() {
         2,
         "steps: {:?}",
         built.steps
+    );
+}
+
+// --------------------------------------------------------------------------
+// Filter over an outer join: null-extended rows and the filter's column identity
+// --------------------------------------------------------------------------
+
+/// A two-source catalog whose tables share the column name `k` on both sides of
+/// a join, so a filter above the join must keep the two `k`s apart.
+fn null_join_catalog() -> Arc<Catalog> {
+    let t_null_a = Table::new(
+        "t_null_a",
+        vec![
+            Column::new("k", DataType::Integer, true),
+            Column::new("val", DataType::Varchar, true),
+        ],
+    );
+    let t_null_b = Table::new(
+        "t_null_b",
+        vec![
+            Column::new("id", DataType::Integer, false),
+            Column::new("k", DataType::Integer, true),
+        ],
+    );
+    let mut catalog = Catalog::new();
+    catalog.insert_schema(
+        "pg",
+        "public",
+        Schema::with_tables("public", "pg", vec![t_null_a]),
+    );
+    catalog.insert_schema(
+        "duck",
+        "main",
+        Schema::with_tables("main", "duck", vec![t_null_b]),
+    );
+    catalog.register_datasource(Arc::new(MockSource {
+        name: "pg".to_string(),
+        capabilities: server_capabilities(),
+    }));
+    catalog.register_datasource(Arc::new(MockSource {
+        name: "duck".to_string(),
+        capabilities: server_capabilities(),
+    }));
+    Arc::new(catalog)
+}
+
+/// Steps for a query with predicate pushdown OFF, so a WHERE above an outer
+/// join stays a coordinator Filter instead of converting the join.
+fn steps_without_predicate_pushdown(
+    catalog: &Arc<Catalog>,
+    sql: &str,
+) -> fq_physical::steps::BuiltSteps {
+    let parsed = parse_with_catalog(sql, catalog).expect("parse");
+    let bound = fq_bind::bind(catalog, parsed).expect("bind");
+    let decorrelated = fq_decorrelate::decorrelate(bound).expect("decorrelate");
+    let cost_model = CostModel::new(CostConfig::default(), None);
+    let config = OptimizerConfig {
+        enable_predicate_pushdown: false,
+        ..OptimizerConfig::default()
+    };
+    let optimizer = build_optimizer(&config, cost_model);
+    let logical = optimizer.optimize(decorrelated).expect("optimize");
+    let mut planner = PhysicalPlanner::new(Arc::clone(catalog), None);
+    let plan = planner.plan(&logical).expect("plan");
+    build_steps(&plan).expect("build_steps")
+}
+
+#[test]
+fn filter_over_right_join_reads_the_left_side_key() {
+    let catalog = null_join_catalog();
+    let built = steps_without_predicate_pushdown(
+        &catalog,
+        "SELECT r0.val AS c0, r0.k AS c1 \
+         FROM pg.public.t_null_a r0 RIGHT JOIN duck.main.t_null_b r1 ON r0.k = r1.k \
+         WHERE r0.k IS NOT NULL",
+    );
+    // The join fragment must give the LEFT `k` the bare output name the filter
+    // reads, with the right-side duplicate renamed away - a filter that
+    // resolves `r0.k` to the right side's key would pass the null-extended
+    // rows its predicate is false for.
+    let join = built
+        .fragments
+        .values()
+        .find_map(|fragment| match fragment {
+            Fragment::HashJoin { project, .. } => Some(project),
+            _ => None,
+        })
+        .expect("a HashJoin fragment");
+    let mut named_k = None;
+    for item in join {
+        if item.alias == "k" {
+            named_k = Some(format!("{:?}", item.expr));
+        }
+    }
+    let named_k = named_k.expect("the join projects an output column named k");
+    assert!(
+        named_k.contains("in_left"),
+        "the output column `k` must come from the join's LEFT side, got {named_k}"
     );
 }
