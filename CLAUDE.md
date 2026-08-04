@@ -220,14 +220,17 @@ agent builds in a worktree, warm it:
 
     ./scripts/warm-worktree-agent.sh <worktree-path>
 
-It hardlink-copies the main target/, pins the DUCKDB [env] paths in the
-worktree's .cargo/config.toml to the main root's ABSOLUTE path, symlinks
-.duckdb-lib, and creates ./venv. The pin matters because cargo hashes resolved
-[env] values into every unit's fingerprint: the repo's `relative = true`
-entries resolve differently per tree, so without the pin even a copied target
-rebuilds everything. Warmed, a build compiles only the workspace crates.
+It hardlink-copies the main target/, DELETES the worktree's checked-out
+.cargo/config.toml, symlinks .duckdb-lib, and creates ./venv. The deletion is
+the load-bearing step: a worktree under the main root sees BOTH config files
+(cargo config discovery walks up the directory tree), so the [build]
+rustflags apply twice, and the doubled flags change every unit's fingerprint
+- even a copied target then rebuilds everything. With only the main config
+in scope, flags and resolved [env] paths match the warmed artifacts exactly:
+a build compiles only the ~17 workspace crates (measured: 1m34s cold-cache,
+16 crates, zero registry recompiles).
 
-The pinned .cargo/config.toml and the .duckdb-lib link are LOCAL throwaway
+The deleted .cargo/config.toml and the .duckdb-lib link are LOCAL throwaway
 state and must never be committed - in a worktree, stage files by explicit
 path, never `git add -A`. The full launch procedure (agent prompt warnings,
 concurrency ceiling, integration steps) is the `launch-worktree-agent` skill.

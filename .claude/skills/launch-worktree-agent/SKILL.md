@@ -5,11 +5,14 @@ description: Launch a subagent in a git worktree WITHOUT paying an hour-long col
 
 # Launching a build-capable agent in a worktree
 
-A fresh worktree shares no build artifacts with the main workspace, and the
-repo's `.cargo/config.toml` declares DUCKDB env paths with `relative = true`.
-Cargo hashes resolved `[env]` values into every unit's fingerprint, so even a
-copied target directory rebuilds from scratch while those paths differ per
-tree. Both problems are fixed by warming the worktree before the agent starts.
+A fresh worktree shares no build artifacts with the main workspace, and a
+worktree under the main root sees TWO `.cargo/config.toml` files (its own
+checkout plus the main one - cargo config discovery walks up the directory
+tree), so the `[build]` rustflags apply twice and the doubled flags change
+every unit's fingerprint: even a copied target directory rebuilds from
+scratch. Both problems are fixed by warming the worktree before the agent
+starts - the warm script hardlink-copies the target and deletes the
+worktree's config copy so only the main one applies.
 
 ## Procedure
 
@@ -22,18 +25,18 @@ tree. Both problems are fixed by warming the worktree before the agent starts.
 
        ./scripts/warm-worktree-agent.sh <worktree-path>
 
-   This hardlink-copies `target/`, pins the worktree's `.cargo/config.toml`
-   [env] entries to the MAIN root's absolute `.duckdb-lib` path, symlinks
-   `.duckdb-lib`, and creates `./venv`. After this, `cargo build --release`
-   in the worktree compiles only the workspace crates.
+   This hardlink-copies `target/`, deletes the worktree's checked-out
+   `.cargo/config.toml`, symlinks `.duckdb-lib`, and creates `./venv`. After
+   this, `cargo build --release` in the worktree compiles only the ~17
+   workspace crates (measured: 1m34s, zero registry recompiles).
 
 3. The agent prompt MUST include these worktree-state warnings:
-   - `.cargo/config.toml` is intentionally locally modified and `.duckdb-lib`
-     is a symlink: NEVER commit either. Stage files by explicit path only -
-     no `git add -A`, no `git add .`.
+   - `.cargo/config.toml` is intentionally DELETED in the worktree and
+     `.duckdb-lib` is a symlink: never commit either state (no restoring the
+     config, no `git add -A`, no `git add .` - stage by explicit path only).
    - The target is pre-warmed: if a build starts recompiling thousands of
-     crates, something regressed - stop and check the config pin instead of
-     waiting.
+     crates, something regressed - stop and check that the worktree's
+     `.cargo/config.toml` is still absent instead of waiting.
    - `tests/fedq.so` resolves relative to the worktree, so it points at the
      worktree's own `target/release/libfedq_py.so` once built.
    - The e2e harness may need `./tests/e2e_federated/build_test_harness.sh`.
