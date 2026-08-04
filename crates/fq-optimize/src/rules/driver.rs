@@ -62,9 +62,24 @@ impl RuleBasedOptimizer {
             iteration += 1;
             let mut changed = false;
             for rule in &self.rules {
+                let profile = profiling_enabled();
+                let clone_started = std::time::Instant::now();
                 let before = current.clone();
+                let clone_ms = clone_started.elapsed().as_secs_f64() * 1000.0;
+                let apply_started = std::time::Instant::now();
                 let after = rule.apply(current)?;
-                if after != before {
+                let apply_ms = apply_started.elapsed().as_secs_f64() * 1000.0;
+                let eq_started = std::time::Instant::now();
+                let differs = after != before;
+                let eq_ms = eq_started.elapsed().as_secs_f64() * 1000.0;
+                if profile {
+                    eprintln!(
+                        "[fedqrs-rule] sweep={iteration} rule={} clone={clone_ms:.2}ms \
+                         apply={apply_ms:.2}ms eq={eq_ms:.2}ms changed={differs}",
+                        rule.name()
+                    );
+                }
+                if differs {
                     changed = true;
                     // The loud safety net: a rule that produced a mis-scoped plan
                     // fails HERE, at the rule that built it, not downstream.
@@ -78,6 +93,15 @@ impl RuleBasedOptimizer {
         }
         Ok(current)
     }
+}
+
+/// Whether FEDQRS_PROFILE is set, read once per process: the driver consults
+/// this per rule per sweep, and a repeated getenv from engine threads is both
+/// wasted work and unsafe against any host process that mutates its own
+/// environment concurrently.
+fn profiling_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("FEDQRS_PROFILE").is_ok())
 }
 
 /// The standard pushdown rule stack, honoring the optimizer configuration. Ports

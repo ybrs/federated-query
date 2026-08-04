@@ -232,10 +232,14 @@ fn a_non_equi_only_pair_yields_two_singletons() {
 fn newly_covered_places_a_multi_atom_conjunct_once() {
     let region = region(&["a", "b", "c"], &[(0, 1), (1, 2)]);
     // Growing {0} by atom 1 covers the (0,1) edge (position 0) exactly.
-    assert_eq!(newly_covered(&region, &(1u64 << 0), 1), vec![0]);
+    let touching = multi_conjuncts_by_atom(&region);
+    assert_eq!(
+        newly_covered(&region, &touching[1], &(1u64 << 0), 1),
+        vec![0]
+    );
     // Growing {0,1} by atom 2 covers the (1,2) edge (position 1), not (0,1).
     assert_eq!(
-        newly_covered(&region, &((1u64 << 0) | (1u64 << 1)), 2),
+        newly_covered(&region, &touching[2], &((1u64 << 0) | (1u64 << 1)), 2),
         vec![1]
     );
 }

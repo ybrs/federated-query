@@ -146,19 +146,26 @@ impl PhysicalPlanner {
     /// counter, then dispatches from the root.
     pub fn plan(&mut self, logical_plan: &LogicalPlan) -> Result<PhysicalPlan, PhysicalError> {
         self.ship_counter = 0;
-        self.plan_node(logical_plan)
+        phase_profile::reset();
+        let planned = self.plan_node(logical_plan);
+        phase_profile::report();
+        planned
     }
 
     /// Plan a single node: try same-source pushdown, then dim shipping, then lower
     /// by node type. Exhaustive over `LogicalPlan`.
     pub(crate) fn plan_node(&mut self, node: &LogicalPlan) -> Result<PhysicalPlan, PhysicalError> {
         if self.single_source_enabled {
-            if let Some(remote) = self.single_source.try_build(node)? {
+            if let Some(remote) =
+                phase_profile::timed("try_build", || self.single_source.try_build(node))?
+            {
                 return Ok(PhysicalPlan::RemoteQuery(Box::new(remote)));
             }
         }
         if self.shipping_enabled {
-            if let Some(shipped) = DimShipping.try_ship(self, node)? {
+            if let Some(shipped) =
+                phase_profile::timed("try_ship", || DimShipping.try_ship(self, node))?
+            {
                 return Ok(shipped);
             }
         }
@@ -643,5 +650,55 @@ fn mark_distinct(node: &mut PhysicalPlan, catalog: &Catalog) {
         PhysicalPlan::Scan(scan) => scan.distinct = true,
         PhysicalPlan::RemoteJoin(remote) => remote.distinct = true,
         _ => unreachable!("mark_distinct is reached for a Scan or a RemoteJoin"),
+    }
+}
+
+/// Planning diagnostics: accumulated wall time per physical planning phase
+/// across one plan(), printed to stderr when FEDQRS_PROFILE is set. The
+/// try_ship phase includes the nested planning of shipped subtrees, so its
+/// figure overlaps the others rather than adding to them.
+mod phase_profile {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+
+    thread_local! {
+        static PHASES: RefCell<BTreeMap<&'static str, (f64, u64)>> =
+            const { RefCell::new(BTreeMap::new()) };
+    }
+
+    /// Clear the accumulators at the start of one plan().
+    pub fn reset() {
+        PHASES.with(|phases| phases.borrow_mut().clear());
+    }
+
+    /// Run one phase closure, accumulating its wall time under `name`.
+    pub fn timed<T>(name: &'static str, work: impl FnOnce() -> T) -> T {
+        let started = Instant::now();
+        let result = work();
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        PHASES.with(|phases| {
+            let mut map = phases.borrow_mut();
+            let entry = map.entry(name).or_insert((0.0, 0));
+            entry.0 += ms;
+            entry.1 += 1;
+        });
+        result
+    }
+
+    /// Print the accumulated phases for this plan() when profiling is on.
+    pub fn report() {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // One getenv per process: report() runs per query on engine threads,
+        // and repeated getenv is unsafe against a host process mutating its
+        // own environment concurrently.
+        if !*ENABLED.get_or_init(|| std::env::var("FEDQRS_PROFILE").is_ok()) {
+            return;
+        }
+        PHASES.with(|phases| {
+            for (name, (ms, calls)) in phases.borrow().iter() {
+                eprintln!("[fedqrs-phys-phase] {name}: {ms:.2}ms over {calls} calls");
+            }
+        });
     }
 }

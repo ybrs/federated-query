@@ -449,12 +449,23 @@ impl AtomSubset for BTreeSet<usize> {
 /// Positions of the multi-atom conjuncts covered by `subset | {atom_index}` but
 /// not by `subset` alone - the ones a step growing the subset must place (each
 /// conjunct placed exactly once, on the first step covering all its atoms).
-fn newly_covered<S: AtomSubset>(region: &JoinRegion, subset: &S, atom_index: usize) -> Vec<usize> {
+///
+/// `touching` is the precomputed position list of the multi-atom conjuncts
+/// referencing `atom_index` (`multi_conjuncts_by_atom`). It loses nothing: a
+/// conjunct newly covered by growing the subset with `atom_index` has every
+/// atom in the grown set and at least one outside the subset, and the only
+/// atom the grown set adds is `atom_index` - so every newly covered conjunct
+/// references it. Scanning only those turns a dense region's per-step cost
+/// from O(all conjuncts) into O(the joining atom's own edges).
+fn newly_covered<S: AtomSubset>(
+    region: &JoinRegion,
+    touching: &[usize],
+    subset: &S,
+    atom_index: usize,
+) -> Vec<usize> {
     let mut positions = Vec::new();
-    for (position, conjunct) in region.conjuncts.iter().enumerate() {
-        if conjunct.atom_indexes.len() < 2 {
-            continue;
-        }
+    for &position in touching {
+        let conjunct = &region.conjuncts[position];
         let in_grown = conjunct
             .atom_indexes
             .iter()
@@ -468,6 +479,22 @@ fn newly_covered<S: AtomSubset>(region: &JoinRegion, subset: &S, atom_index: usi
         }
     }
     positions
+}
+
+/// Per atom, the positions of the multi-atom conjuncts referencing it - the
+/// only candidates `newly_covered` must inspect when that atom joins. Built
+/// once per region enumeration.
+fn multi_conjuncts_by_atom(region: &JoinRegion) -> Vec<Vec<usize>> {
+    let mut touching: Vec<Vec<usize>> = vec![Vec::new(); region.atoms.len()];
+    for (position, conjunct) in region.conjuncts.iter().enumerate() {
+        if conjunct.atom_indexes.len() < 2 {
+            continue;
+        }
+        for &atom in &conjunct.atom_indexes {
+            touching[atom].push(position);
+        }
+    }
+    touching
 }
 
 /// Whether any of the conjuncts at these positions is an equi edge.
@@ -621,6 +648,9 @@ struct Enumerator<'a> {
     estimator: &'a dyn RegionEstimator,
     atom_estimates: &'a [CardinalityEstimate],
     atom_sources: &'a [Option<String>],
+    /// Per atom, the multi-atom conjunct positions referencing it - the only
+    /// candidates an extension by that atom can newly cover.
+    touching: &'a [Vec<usize>],
     max_dp: usize,
 }
 
@@ -743,7 +773,7 @@ impl Enumerator<'_> {
         subset: &S,
         atom_index: usize,
     ) -> Result<Option<Extension>, OptimizeError> {
-        let positions = newly_covered(self.region, subset, atom_index);
+        let positions = newly_covered(self.region, &self.touching[atom_index], subset, atom_index);
         if !any_equi(self.region, &positions) {
             return Ok(None);
         }
@@ -1225,11 +1255,13 @@ fn choose_order(
         return Ok(None);
     }
     let atom_sources = atom_source_list(region);
+    let touching = multi_conjuncts_by_atom(region);
     let enumerator = Enumerator {
         region,
         estimator,
         atom_estimates: &atom_estimates,
         atom_sources: &atom_sources,
+        touching: &touching,
         max_dp,
     };
     let mut ordered = Vec::new();
@@ -1445,7 +1477,7 @@ impl JoinOrdering {
         if let LogicalPlan::Cte(cte) = &plan {
             self.cost_model.borrow_mut().register_cte(cte);
         }
-        match extract_region(&plan)? {
+        match phase_profile::timed("extract", || extract_region(&plan))? {
             None => plan.try_map_children(|child| self.rewrite(child)),
             Some(region) => self.reorder_region(plan, &region),
         }
@@ -1462,8 +1494,8 @@ impl JoinOrdering {
         if !worth_reordering(region, &root) {
             return root.try_map_children(|child| self.rewrite(child));
         }
-        let signature = cache_signature(region);
-        if self.is_stable(&signature) {
+        let signature = phase_profile::timed("signature", || cache_signature(region));
+        if phase_profile::timed("stable_check", || self.is_stable(&signature)) {
             // This region is byte-for-byte a shape this rule itself emitted, so
             // choosing and re-emitting would reproduce it. Only the ATOM
             // subtrees still need the walk; the region's interior joins are the
@@ -1474,14 +1506,14 @@ impl JoinOrdering {
             // (measured: an 11-atom mixed chain took 4 sweeps instead of 2).
             return self.rewrite_region_atoms(root);
         }
-        let order = self.cached_order(signature, region)?;
+        let order = phase_profile::timed("choose", || self.cached_order(signature, region))?;
         let Some(order) = order else {
             return root.try_map_children(|child| self.rewrite(child));
         };
         let mut placed = Vec::new();
-        let rebuilt = self.emit(region, &order, &mut placed)?;
+        let rebuilt = phase_profile::timed("emit", || self.emit(region, &order, &mut placed))?;
         verify_placement(region.conjuncts.len(), &placed)?;
-        self.record_stable(&rebuilt)?;
+        phase_profile::timed("record_stable", || self.record_stable(&rebuilt))?;
         Ok(rebuilt)
     }
 
@@ -1777,7 +1809,59 @@ impl OptimizationRule for JoinOrdering {
     /// estimates. The driver detects the (no-)change by structural equality.
     fn apply(&self, plan: LogicalPlan) -> Result<LogicalPlan, OptimizeError> {
         self.cost_model.borrow_mut().reset_cte_registry();
-        self.rewrite(plan)
+        phase_profile::reset();
+        let rewritten = self.rewrite(plan);
+        phase_profile::report();
+        rewritten
+    }
+}
+
+/// Planning diagnostics: accumulated wall time per JoinOrdering phase across
+/// one apply(), printed to stderr when FEDQRS_PROFILE is set (the same switch
+/// as the fragment diagnostics). Off, each phase costs two clock reads.
+mod phase_profile {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+
+    thread_local! {
+        static PHASES: RefCell<BTreeMap<&'static str, (f64, u64)>> =
+            const { RefCell::new(BTreeMap::new()) };
+    }
+
+    /// Clear the accumulators at the start of one apply().
+    pub fn reset() {
+        PHASES.with(|phases| phases.borrow_mut().clear());
+    }
+
+    /// Run one phase closure, accumulating its wall time under `name`.
+    pub fn timed<T>(name: &'static str, work: impl FnOnce() -> T) -> T {
+        let started = Instant::now();
+        let result = work();
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        PHASES.with(|phases| {
+            let mut map = phases.borrow_mut();
+            let entry = map.entry(name).or_insert((0.0, 0));
+            entry.0 += ms;
+            entry.1 += 1;
+        });
+        result
+    }
+
+    /// Print the accumulated phases for this apply() when profiling is on.
+    pub fn report() {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // One getenv per process: report() runs per query on engine threads,
+        // and repeated getenv is unsafe against a host process mutating its
+        // own environment concurrently.
+        if !*ENABLED.get_or_init(|| std::env::var("FEDQRS_PROFILE").is_ok()) {
+            return;
+        }
+        PHASES.with(|phases| {
+            for (name, (ms, calls)) in phases.borrow().iter() {
+                eprintln!("[fedqrs-jo-phase] {name}: {ms:.2}ms over {calls} calls");
+            }
+        });
     }
 }
 
