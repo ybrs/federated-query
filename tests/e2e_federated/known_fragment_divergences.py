@@ -17,28 +17,10 @@ The key is (source kind, canonical SQL): the same text sent to the same kind of
 source is the same disagreement, whichever instance it happened to be read from.
 """
 
-# A Parquet source's SQL is executed by DataFusion, which returns AVG over a
-# decimal column as a decimal truncated to six fractional digits, where the
-# reference keeps full double precision. The engine has not decided which
-# arithmetic it implements, so both answers are defensible and neither is the
-# engine's own; that decision is what this entry waits on.
-_PARQUET_DECIMAL_AVG = (
-    "a Parquet source computes AVG over a decimal column to six fractional "
-    "digits where the DuckDB reference keeps double precision"
-)
-
-_AVG_PRICE_BY_CUSTOMER = (
-    'SELECT AVG("o"."price") AS "__subq_0_v0", '
-    '"o"."customer_id" AS "__subq_0_g0" '
-    'FROM "main"."orders" AS "o" GROUP BY "o"."customer_id"'
-)
-
 
 def _entries():
     """Return (source kind, canonical SQL) -> reason for every known divergence."""
-    known = {}
-    known[("pq", _AVG_PRICE_BY_CUSTOMER)] = _PARQUET_DECIMAL_AVG
-    return known
+    return {}
 
 
 KNOWN_DIVERGENCES = _entries()

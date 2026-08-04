@@ -16,10 +16,14 @@ date/timestamp join keys, case-sensitive varchar equality, a boolean-column
 join key); cross-type joins through an explicit CAST; a ``||`` string
 concatenation over a CAST; a null-safe ``IS DISTINCT FROM`` WHERE predicate;
 and ``t_text`` edges (NULLIF/TRIM on blank-vs-space values, a quoted value,
-LIKE wildcard matches, and LIKE ... ESCAPE matching a literal wildcard); and
+LIKE wildcard matches, and LIKE ... ESCAPE matching a literal wildcard);
 integer-division semantics (the engine's division is DuckDB's DOUBLE division
 on every source, in a projection and in a WHERE that is empty under the
-truncating semantics most dialects give ``/``).
+truncating semantics most dialects give ``/``); decimal-average and
+decimal-division semantics (AVG and ``/`` over a DECIMAL column compute at
+double precision on every source, never at a source's own decimal scale);
+and round() semantics (half away from zero on every source, in a projection,
+a discriminating WHERE, and a scaled two-argument form).
 """
 
 CASES = [
@@ -65,6 +69,57 @@ CASES = [
         "query": (
             "SELECT o.order_id, "
             "(CASE WHEN o.quantity > 5 THEN o.quantity ELSE 1 END) / 2 AS half "
+            "FROM {orders} o"
+        ),
+    },
+    # Decimal-average and decimal-division semantics: AVG and `/` over a
+    # DECIMAL column compute at DOUBLE precision on EVERY source. Customer 2's
+    # average price is 125 / 3 = 41.666666666666664 under the engine's
+    # semantics and 41.666666 under a source that averages at a fixed decimal
+    # scale, so the projection, the HAVING threshold between those two values,
+    # and the division by 3 all discriminate.
+    {
+        "name": "edge_decimal_avg_group_projection",
+        "tables": ["orders"],
+        "query": (
+            "SELECT o.customer_id, avg(o.price) AS avg_price "
+            "FROM {orders} o GROUP BY o.customer_id"
+        ),
+    },
+    {
+        "name": "edge_decimal_avg_having_predicate",
+        "tables": ["orders"],
+        "query": (
+            "SELECT o.customer_id FROM {orders} o GROUP BY o.customer_id "
+            "HAVING avg(o.price) > 41.6666665"
+        ),
+    },
+    {
+        "name": "edge_decimal_division_projection",
+        "tables": ["orders"],
+        "query": "SELECT o.order_id, o.price / 3 AS third FROM {orders} o",
+    },
+    # round() semantics: the engine rounds half away from zero on EVERY
+    # source. t_dbl holds 2.5 and -0.5, which round to 3.0 and -1.0 under the
+    # engine's semantics and to 2.0 and -0.0 under the half-to-even rounding
+    # PostgreSQL gives a double; the predicate is empty under half-to-even.
+    # The scaled form rounds quantity / 4.0 at one decimal, where the odd
+    # quantities produce exact .x5 halves that discriminate the same way.
+    {
+        "name": "edge_round_half_away_projection",
+        "tables": ["t_types"],
+        "query": "SELECT t_int, round(t_dbl) AS rounded FROM {t_types}",
+    },
+    {
+        "name": "edge_round_half_away_predicate",
+        "tables": ["t_types"],
+        "query": "SELECT t_int FROM {t_types} WHERE round(t_dbl) = 3.0",
+    },
+    {
+        "name": "edge_round_scaled_half_away",
+        "tables": ["orders"],
+        "query": (
+            "SELECT o.order_id, round(o.quantity / 4.0, 1) AS quarter "
             "FROM {orders} o"
         ),
     },

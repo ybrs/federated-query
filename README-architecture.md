@@ -159,17 +159,32 @@ source's meaning - the exact defect this section exists to forbid.
 Enforcement is one construct at a time, at the narrowest choke point that
 covers every execution path:
 
-- Integer division: the binder rewrites a bound `int / int` into
-  `CAST(left AS DOUBLE) / right` (`fq-bind/src/expr.rs`,
+- Division: the binder rewrites a bound division over certainly-numeric
+  operands into `CAST(left AS DOUBLE) / right` (`fq-bind/src/expr.rs`,
   `normalize_division`), a form with the same meaning in every dialect the
-  engine renders to and in the coordinator. A division whose operand types
-  the binder cannot see through keeps its written form.
+  engine renders to and in the coordinator. The cast is not skipped for a
+  DOUBLE-typed dividend: a DECIMAL source column is modeled as DOUBLE, and
+  only the explicit cast stops DataFusion from dividing the stored decimal
+  at a fixed result scale that truncates the quotient. A division whose
+  operand types the binder cannot see through keeps its written form.
+- AVG: the binder wraps a certainly-double argument in the same DOUBLE cast
+  (`normalize_avg`), so a decimal-backed column is averaged at double
+  precision on every source instead of at DataFusion's decimal scale. The
+  coordinator's own lowering applies the equivalent cast to the avg calls it
+  executes itself (`fq-exec`), so both halves state one rule.
+- round(): the binder rewrites `round(x)` and `round(x, n)` over a
+  certainly-double `x` (n a literal in 0..=15) into guarded TRUNC arithmetic
+  (`normalize_round`) that every dialect evaluates bit-identically to
+  DuckDB's half-away-from-zero, because PostgreSQL rounds a double half to
+  even. Uncertain shapes keep their written call.
 - Divergences that are measured but not yet normalized are held STRICTLY in
   `tests/e2e_federated/known_fragment_divergences.py`: the fragment is still
   sent and still compared, and a source that starts agreeing fails the run so
-  the entry dies with the fix. The registry is the work queue; currently it
-  holds decimal-AVG truncation on the DataFusion/Parquet path, and round()
-  half-to-even on PostgreSQL floats is measured but uncovered by the corpus.
+  the entry dies with the fix. The registry is the work queue; it is
+  currently empty. Result-TYPE divergences with agreeing values (a source
+  declaring `decimal128(38,2)` where the oracle declares `decimal128(10,2)`,
+  PostgreSQL answering an integer avg as numeric) are recorded by the
+  fragment oracle's type-divergence count and are not yet normalized.
 - The DuckDB oracle, the fragment oracle, and the plan-variant harness are
   the definition made executable: every placement and every plan of every
   corpus query is compared against DuckDB over the same data.

@@ -6,7 +6,7 @@ use fq_bind::{bind, BindError};
 use fq_catalog::{Catalog, Column, Schema, Table};
 use fq_common::DataType;
 use fq_parse::parse_with_catalog;
-use fq_plan::{Expr, LogicalPlan};
+use fq_plan::{BinaryOpType, Expr, LogicalPlan};
 
 /// A catalog with pg.public.users(id INT, name VARCHAR, age INT) and
 /// pg.public.orders(id INT, user_id INT, total DOUBLE).
@@ -995,17 +995,133 @@ fn integer_division_binds_to_double_division() {
 }
 
 #[test]
-fn non_integer_division_keeps_its_operands() {
-    // total is DOUBLE: the division already means the same thing everywhere,
-    // so no cast is synthesized.
+fn double_division_gains_the_cast() {
+    // total is DOUBLE, but a DECIMAL source column is modeled as DOUBLE, so
+    // only the explicit cast guarantees the source divides as a double rather
+    // than at its own decimal scale. The cast is a no-op over a genuine double.
     let plan = bind_sql("SELECT o.total / 2 AS half FROM pg.public.orders o").expect("bind");
     let Expr::BinaryOp { left, .. } = first_projection_expr(&plan) else {
         panic!("expected a division at the projection root");
     };
     assert!(
-        matches!(left.as_ref(), Expr::Column(_)),
-        "a non-integer division must stay unrewritten, got {left:?}"
+        matches!(left.as_ref(), Expr::Cast { target_type, .. } if target_type == "DOUBLE"),
+        "a double division must cast its left operand, got {left:?}"
     );
+}
+
+#[test]
+fn division_of_uncertain_operands_keeps_its_form() {
+    // sqrt is outside the certainly-typed function set, so the binder cannot
+    // prove the dividend numeric and the division keeps its written form.
+    let plan = bind_sql("SELECT sqrt(o.total) / 2 AS r FROM pg.public.orders o").expect("bind");
+    let Expr::BinaryOp { left, .. } = first_projection_expr(&plan) else {
+        panic!("expected a division at the projection root");
+    };
+    assert!(
+        matches!(left.as_ref(), Expr::FunctionCall { .. }),
+        "an uncertain division must stay unrewritten, got {left:?}"
+    );
+}
+
+#[test]
+fn avg_over_double_casts_its_argument() {
+    // The engine's avg is DuckDB's: a double-precision average on every
+    // source. The binder wraps the argument so a decimal-backed column is
+    // averaged as a double instead of at the source's own decimal scale.
+    let plan = bind_sql("SELECT avg(o.total) AS a FROM pg.public.orders o").expect("bind");
+    let Expr::FunctionCall { args, .. } = first_aggregate_expr(&plan) else {
+        panic!("expected an aggregate call");
+    };
+    assert!(
+        matches!(&args[0], Expr::Cast { target_type, .. } if target_type == "DOUBLE"),
+        "avg over a double must cast its argument, got {:?}",
+        args[0]
+    );
+}
+
+#[test]
+fn avg_over_integer_keeps_its_argument() {
+    // An integer average is already computed as a double-valued result by
+    // every source the engine renders to, so no cast is synthesized.
+    let plan = bind_sql("SELECT avg(o.id) AS a FROM pg.public.orders o").expect("bind");
+    let Expr::FunctionCall { args, .. } = first_aggregate_expr(&plan) else {
+        panic!("expected an aggregate call");
+    };
+    assert!(
+        matches!(&args[0], Expr::Column(_)),
+        "avg over an integer must stay unrewritten, got {:?}",
+        args[0]
+    );
+}
+
+#[test]
+fn round_over_double_rewrites_to_half_away_arithmetic() {
+    // The engine's round is DuckDB's half-away-from-zero; PostgreSQL rounds a
+    // double half to even, so the binder rewrites the call into the guarded
+    // TRUNC arithmetic every dialect evaluates bit-identically.
+    let plan = bind_sql("SELECT round(o.total) AS r FROM pg.public.orders o").expect("bind");
+    let rewritten = first_projection_expr(&plan);
+    assert!(
+        matches!(rewritten, Expr::Case { .. }),
+        "round over a double must rewrite to the CASE form, got {rewritten:?}"
+    );
+}
+
+#[test]
+fn scaled_round_rewrites_and_divides_back() {
+    // round(x, n) over a double with a literal scale rounds x * 10^n and
+    // divides back down; the root of the rewritten form is that division.
+    let plan = bind_sql("SELECT round(o.total, 2) AS r FROM pg.public.orders o").expect("bind");
+    let rewritten = first_projection_expr(&plan);
+    let Expr::BinaryOp {
+        op: BinaryOpType::Divide,
+        left,
+        ..
+    } = rewritten
+    else {
+        panic!("expected the scaled form's closing division, got {rewritten:?}");
+    };
+    assert!(
+        matches!(left.as_ref(), Expr::Case { .. }),
+        "the scaled form must round the scaled value, got {left:?}"
+    );
+}
+
+#[test]
+fn round_keeps_uncertain_shapes() {
+    // An integer argument agrees natively everywhere, and a non-literal or
+    // negative scale is outside the structurally-certain range, so each of
+    // these keeps its written call.
+    let shapes = [
+        "SELECT round(o.id) AS r FROM pg.public.orders o",
+        "SELECT round(o.total, o.id) AS r FROM pg.public.orders o",
+        "SELECT round(o.total, -1) AS r FROM pg.public.orders o",
+    ];
+    for sql in shapes {
+        let plan = bind_sql(sql).expect("bind");
+        assert!(
+            matches!(first_projection_expr(&plan), Expr::FunctionCall { .. }),
+            "{sql} must keep its round call"
+        );
+    }
+}
+
+/// The first aggregate expression of the first Aggregate node in a bound plan.
+fn first_aggregate_expr(plan: &LogicalPlan) -> &Expr {
+    find_aggregate_expr(plan).expect("plan holds no aggregate call")
+}
+
+/// Depth-first search for the first Aggregate node's first aggregate.
+fn find_aggregate_expr(plan: &LogicalPlan) -> Option<&Expr> {
+    if let LogicalPlan::Aggregate(aggregate) = plan {
+        return aggregate.aggregates.first();
+    }
+    for child in plan.children() {
+        if let Some(found) = find_aggregate_expr(child) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 #[test]

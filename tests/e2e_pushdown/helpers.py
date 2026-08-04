@@ -104,6 +104,20 @@ def is_func(node, name: str) -> bool:
     return False
 
 
+def is_double_cast_of_column(node, column_name: str) -> bool:
+    """Whether a node is an explicit CAST to DOUBLE around the named column.
+
+    The binder renders a decimal-modeled operand of division and AVG in this
+    form, so pushed SQL carries the engine's DOUBLE semantics to every source.
+    """
+    if not isinstance(node, exp.Cast):
+        return False
+    if node.to.this != exp.DataType.Type.DOUBLE:
+        return False
+    operand = unwrap_parens(node.this)
+    return isinstance(operand, exp.Column) and operand.name.lower() == column_name
+
+
 def find_in_select(
     select_ast: exp.Select, predicate: Callable[[exp.Expression], bool]
 ) -> List[exp.Expression]:

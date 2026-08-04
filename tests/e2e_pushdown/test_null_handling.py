@@ -7,6 +7,7 @@ from tests.e2e_pushdown.helpers import (
     explain_datasource_query,
     find_in_select,
     group_column_names,
+    is_double_cast_of_column,
     select_column_names,
     unwrap_parens,
 )
@@ -115,7 +116,11 @@ def test_sum_with_nulls(single_source_env):
 
 
 def test_avg_with_nulls(single_source_env):
-    """Validates AVG ignores NULL values when computing average."""
+    """Validates AVG ignores NULL values when computing average.
+
+    price is decimal-modeled, so the pushed call averages the column through
+    an explicit CAST to DOUBLE - the engine's double-precision AVG semantics.
+    """
     runtime = build_runtime(single_source_env)
     sql = "SELECT AVG(price) FROM duckdb_primary.main.orders"
     ast = explain_datasource_query(runtime, sql)
@@ -124,8 +129,7 @@ def test_avg_with_nulls(single_source_env):
     matches = find_in_select(
         ast,
         lambda node: isinstance(node, exp.Avg)
-        and isinstance(node.this, exp.Column)
-        and node.this.name.lower() == "price",
+        and is_double_cast_of_column(node.this, "price"),
     )
     assert len(matches) == 1
 

@@ -91,7 +91,12 @@ def test_modulo_operator_in_predicate(single_source_env):
 
 
 def test_division_in_where_clause(single_source_env):
-    """Validates division expression pushes down correctly."""
+    """Validates division pushes down in the engine's normalized form.
+
+    The engine's division semantics are DuckDB's DOUBLE division, so the
+    binder renders the dividend wrapped in an explicit CAST to DOUBLE; the
+    pushed predicate must carry that cast around the price column.
+    """
     runtime = build_runtime(single_source_env)
     sql = (
         "SELECT order_id FROM duckdb_primary.main.orders " "WHERE price / quantity < 10"
@@ -107,9 +112,12 @@ def test_division_in_where_clause(single_source_env):
     assert isinstance(left, exp.Div)
     div_left = unwrap_parens(left.left)
     div_right = unwrap_parens(left.right)
-    assert isinstance(div_left, exp.Column)
+    assert isinstance(div_left, exp.Cast)
+    assert div_left.to.this == exp.DataType.Type.DOUBLE
+    cast_operand = unwrap_parens(div_left.this)
+    assert isinstance(cast_operand, exp.Column)
+    assert cast_operand.name.lower() == "price"
     assert isinstance(div_right, exp.Column)
-    assert div_left.name.lower() == "price"
     assert div_right.name.lower() == "quantity"
 
 
