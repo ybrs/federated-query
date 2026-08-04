@@ -404,6 +404,102 @@ fn anti_join_renders_where_not_exists() {
     );
 }
 
+#[test]
+fn unconditional_semi_join_renders_bare_exists() {
+    let catalog = catalog();
+    // Fresh conditionless SEMI join: the shape decorrelation produces for an
+    // uncorrelated EXISTS (the right side only gates whether any row exists).
+    // Field list is the complete Join struct; there is no base to copy from.
+    let node = project(
+        LogicalPlan::Join(Join {
+            left: Box::new(LogicalPlan::Scan(Box::new(scan(
+                "pg",
+                "public",
+                "orders",
+                &["id", "cust_id"],
+            )))),
+            right: Box::new(LogicalPlan::Scan(Box::new(scan(
+                "pg",
+                "public",
+                "customer",
+                &["id"],
+            )))),
+            join_type: JoinType::Semi,
+            condition: None,
+            natural: false,
+            using: None,
+            estimated_rows: None,
+            estimate_defaults: None,
+        }),
+        col("orders", "id"),
+        "id",
+    );
+    let remote = try_build(&catalog, &node).expect("conditionless SEMI pushes");
+    assert_eq!(
+        remote.sql,
+        "SELECT \"orders\".\"id\" AS \"id\" FROM \"public\".\"orders\" AS \"orders\" \
+         WHERE EXISTS(SELECT 1 FROM \"public\".\"customer\" AS \"customer\")"
+    );
+}
+
+#[test]
+fn unconditional_anti_join_renders_bare_not_exists() {
+    let catalog = catalog();
+    // Fresh conditionless ANTI join: the shape decorrelation produces for an
+    // uncorrelated NOT EXISTS (kept rows are those where the right is empty).
+    // Field list is the complete Join struct; there is no base to copy from.
+    let node = project(
+        LogicalPlan::Join(Join {
+            left: Box::new(LogicalPlan::Scan(Box::new(scan(
+                "pg",
+                "public",
+                "orders",
+                &["id", "cust_id"],
+            )))),
+            right: Box::new(LogicalPlan::Scan(Box::new(scan(
+                "pg",
+                "public",
+                "customer",
+                &["id"],
+            )))),
+            join_type: JoinType::Anti,
+            condition: None,
+            natural: false,
+            using: None,
+            estimated_rows: None,
+            estimate_defaults: None,
+        }),
+        col("orders", "id"),
+        "id",
+    );
+    let remote = try_build(&catalog, &node).expect("conditionless ANTI pushes");
+    assert_eq!(
+        remote.sql,
+        "SELECT \"orders\".\"id\" AS \"id\" FROM \"public\".\"orders\" AS \"orders\" \
+         WHERE NOT EXISTS(SELECT 1 FROM \"public\".\"customer\" AS \"customer\")"
+    );
+}
+
+#[test]
+fn uncorrelated_exists_sql_pushes_whole_to_one_source() {
+    let catalog = catalog();
+    let plan = plan_sql(
+        &catalog,
+        "SELECT o.id FROM pg.public.orders o WHERE EXISTS (SELECT 1 FROM pg.public.customer)",
+    );
+    let remotes = remote_queries(&plan);
+    assert_eq!(
+        remotes.len(),
+        1,
+        "the whole uncorrelated EXISTS collapses to one remote query: {plan:?}"
+    );
+    assert!(
+        remotes[0].sql.contains("EXISTS(SELECT 1 FROM"),
+        "the pushed SQL carries the existence test: {}",
+        remotes[0].sql
+    );
+}
+
 // ==========================================================================
 // nullable-right filter rides the JOIN CONDITION (the q13 differential)
 // ==========================================================================

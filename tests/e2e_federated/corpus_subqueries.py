@@ -4,6 +4,10 @@ Case names are prefixed ``subq_``. Every case references its tables as
 ``{table_name}`` placeholders; the harness qualifies them per placement.
 
 Coverage: EXISTS/NOT EXISTS correlated on one and on multiple outer columns;
+EXISTS/NOT EXISTS uncorrelated (all-or-nothing existence) over non-empty,
+empty, and filtered-to-empty inner sides, alone, ANDed and ORed with plain
+predicates, inside a derived table, and combined with a correlated EXISTS and
+a correlated scalar;
 IN/NOT IN uncorrelated and correlated, with a NULL-bearing inner side for the
 three-valued NOT IN case; quantified comparisons (> ANY, = ANY, < ALL, <> ALL)
 with empty and NULL-bearing inner sets, uncorrelated and correlated; scalar
@@ -128,6 +132,90 @@ CASES = [
             "JOIN {products} p ON o.product_id = p.product_id "
             "WHERE EXISTS (SELECT 1 FROM {customers} c "
             "WHERE c.customer_id = o.customer_id AND c.city = 'London')"
+        ),
+    },
+    {
+        "name": "subq_exists_uncorrelated",
+        "tables": ["orders", "products"],
+        "query": (
+            "SELECT o.order_id FROM {orders} o "
+            "WHERE EXISTS (SELECT 1 FROM {products})"
+        ),
+    },
+    {
+        "name": "subq_not_exists_uncorrelated",
+        "tables": ["orders", "products"],
+        "query": (
+            "SELECT o.order_id FROM {orders} o "
+            "WHERE NOT EXISTS (SELECT 1 FROM {products})"
+        ),
+    },
+    {
+        "name": "subq_exists_uncorrelated_empty_inner",
+        "tables": ["orders", "t_empty"],
+        "query": (
+            "SELECT o.order_id FROM {orders} o "
+            "WHERE EXISTS (SELECT 1 FROM {t_empty})"
+        ),
+    },
+    {
+        "name": "subq_not_exists_uncorrelated_empty_inner",
+        "tables": ["orders", "t_empty"],
+        "query": (
+            "SELECT o.order_id FROM {orders} o "
+            "WHERE NOT EXISTS (SELECT 1 FROM {t_empty})"
+        ),
+    },
+    {
+        "name": "subq_exists_uncorrelated_filtered_empty",
+        "tables": ["orders", "products"],
+        "query": (
+            "SELECT o.order_id FROM {orders} o "
+            "WHERE EXISTS (SELECT 1 FROM {products} p WHERE p.unit_price > 9999)"
+        ),
+    },
+    {
+        "name": "subq_exists_uncorrelated_and_plain_predicate",
+        "tables": ["orders", "products"],
+        "query": (
+            "SELECT o.order_id FROM {orders} o "
+            "WHERE EXISTS (SELECT 1 FROM {products}) AND o.status = 'shipped'"
+        ),
+    },
+    {
+        "name": "subq_exists_uncorrelated_or_plain_predicate",
+        "tables": ["orders", "t_empty"],
+        "query": (
+            "SELECT o.order_id FROM {orders} o "
+            "WHERE EXISTS (SELECT 1 FROM {t_empty}) OR o.status = 'shipped'"
+        ),
+    },
+    {
+        "name": "subq_exists_uncorrelated_in_derived_table",
+        "tables": ["orders", "products"],
+        "query": (
+            "SELECT d.order_id FROM (SELECT o.order_id FROM {orders} o "
+            "WHERE EXISTS (SELECT 1 FROM {products})) d"
+        ),
+    },
+    {
+        "name": "subq_exists_uncorrelated_and_correlated_exists",
+        "tables": ["orders", "products", "t_empty"],
+        "query": (
+            "SELECT o.order_id FROM {orders} o "
+            "WHERE EXISTS (SELECT 1 FROM {t_empty}) "
+            "AND EXISTS (SELECT 1 FROM {products} p "
+            "WHERE p.product_id = o.product_id)"
+        ),
+    },
+    {
+        "name": "subq_not_exists_uncorrelated_and_correlated_scalar",
+        "tables": ["orders", "products", "t_empty"],
+        "query": (
+            "SELECT o.order_id FROM {orders} o "
+            "WHERE NOT EXISTS (SELECT 1 FROM {t_empty}) "
+            "AND o.price < (SELECT MAX(p.unit_price) FROM {products} p "
+            "WHERE p.product_id = o.product_id)"
         ),
     },
     {

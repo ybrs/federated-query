@@ -2215,8 +2215,9 @@ async fn join_frame(
     left.join(right, datafusion_join_type(join_type), &lk, &rk, None)
 }
 
-/// Plan a non-equi (nested-loop) join on an arbitrary condition (`None` =
-/// cross join) of `in_left` and `in_right`.
+/// Plan a non-equi (nested-loop) join on an arbitrary condition of `in_left`
+/// and `in_right`. A `None` condition is a cross join for column-contributing
+/// kinds and a constant-TRUE match for SEMI/ANTI (see `conditionless_join_on`).
 async fn nested_loop_frame(
     ctx: &SessionContext,
     join_type: JoinKind,
@@ -2226,9 +2227,20 @@ async fn nested_loop_frame(
     let right = ctx.table("in_right").await?;
     let on_exprs = match condition {
         Some(expr) => vec![to_df_expr(expr)?],
-        None => Vec::new(),
+        None => conditionless_join_on(join_type),
     };
     left.join_on(right, datafusion_join_type(join_type), on_exprs)
+}
+
+/// The ON expressions for a join carrying no condition. A conditionless
+/// SEMI/ANTI is an uncorrelated existence test - every left row matches every
+/// right row - so it joins on constant TRUE (DataFusion rejects a non-inner
+/// join with an empty condition). Any other kind stays a plain cross join.
+fn conditionless_join_on(join_type: JoinKind) -> Vec<Expr> {
+    match join_type {
+        JoinKind::Semi | JoinKind::Anti => vec![lit(true)],
+        _ => Vec::new(),
+    }
 }
 
 /// Map the IR join kind to DataFusion's. A free function, not a `From` impl:

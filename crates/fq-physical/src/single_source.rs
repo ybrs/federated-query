@@ -29,7 +29,7 @@ use fq_emit::{
     clauses, quote_ident, render_canonical, render_expr, to_source_sql, EmitError, SelectPieces,
     CANONICAL_SOURCE_RESOLVER,
 };
-use fq_plan::expr::{aggregate_output_map, split_where_having, ColumnRef, Expr};
+use fq_plan::expr::{aggregate_output_map, column_refs, split_where_having, ColumnRef, Expr};
 use fq_plan::logical::{
     Aggregate, Cte, CteRef, Filter, Join, JoinType, LateralJoin, Limit, LogicalPlan, Projection,
     Scan, SetOperation, Sort, SubqueryScan, Values,
@@ -77,6 +77,11 @@ struct PushContext<'a> {
     from_clause: Option<String>,
     joins: Vec<String>,
     where_terms: Vec<String>,
+    /// The absorbed WHERE predicates at Expr level, kept alongside their
+    /// rendered `where_terms` texts so a SELECT list absorbed later can check
+    /// whether a predicate reads a name that list would compute (SQL evaluates
+    /// WHERE before the SELECT list, so such a merge is invalid).
+    filter_predicates: Vec<&'a Expr>,
     having_terms: Vec<String>,
     group_clause: Option<String>,
     order_clause: Option<String>,
@@ -130,6 +135,7 @@ impl<'a> PushContext<'a> {
             from_clause: None,
             joins: Vec::new(),
             where_terms: Vec::new(),
+            filter_predicates: Vec::new(),
             having_terms: Vec::new(),
             group_clause: None,
             order_clause: None,
@@ -366,6 +372,9 @@ impl SingleSourcePushdown {
         if has_computed_expression(&projection.expressions) {
             ctx.has_computed = true;
         }
+        if select_shadows_filter(&projection.expressions, &projection.aliases, ctx) {
+            return Ok(false);
+        }
         set_select(&projection.expressions, &projection.aliases, ctx)?;
         self.absorb(&projection.input, ctx)
     }
@@ -388,6 +397,9 @@ impl SingleSourcePushdown {
         ctx.distinct = outer.distinct || inner.distinct;
         ctx.distinct_on.clone_from(&inner.distinct_on);
         require_distinct(ctx);
+        if select_shadows_filter(&substituted, &outer.aliases, ctx) {
+            return Ok(false);
+        }
         set_select(&substituted, &outer.aliases, ctx)?;
         self.absorb(&inner.input, ctx)
     }
@@ -401,6 +413,9 @@ impl SingleSourcePushdown {
         ctx: &mut PushContext<'a>,
     ) -> Result<bool, EmitError> {
         let resolved = resolve_against_aggregate(&projection.expressions, &projection.input);
+        if select_shadows_filter(&resolved, &projection.aliases, ctx) {
+            return Ok(false);
+        }
         set_select(&resolved, &projection.aliases, ctx)?;
         self.absorb(&projection.input, ctx)
     }
@@ -414,6 +429,9 @@ impl SingleSourcePushdown {
         ctx.has_aggregate = true;
         ctx.require(DataSourceCapability::Aggregations);
         if ctx.select_exprs.is_empty() {
+            if select_shadows_filter(&aggregate.aggregates, &aggregate.output_names, ctx) {
+                return Ok(false);
+            }
             set_select(&aggregate.aggregates, &aggregate.output_names, ctx)?;
         }
         ctx.group_clause = clauses::group_by(
@@ -438,6 +456,7 @@ impl SingleSourcePushdown {
         }
         ctx.where_terms
             .push(render_expr(&filter.predicate, &CANONICAL_SOURCE_RESOLVER)?);
+        ctx.filter_predicates.push(&filter.predicate);
         self.absorb(&filter.input, ctx)
     }
 
@@ -500,18 +519,8 @@ impl SingleSourcePushdown {
             return Ok(false);
         };
         if matches!(join.join_type, JoinType::Semi | JoinType::Anti) {
-            let condition = join
-                .condition
-                .as_ref()
-                .expect("SEMI/ANTI join carries an ON condition");
-            let cond = render_expr(condition, &CANONICAL_SOURCE_RESOLVER)?;
-            let keyword = if join.join_type == JoinType::Anti {
-                "NOT EXISTS"
-            } else {
-                "EXISTS"
-            };
             ctx.where_terms
-                .push(format!("{keyword}(SELECT 1 FROM {right_ref} WHERE {cond})"));
+                .push(render_existence_term(join, &right_ref)?);
             ctx.has_join = true;
             ctx.require(DataSourceCapability::Subqueries);
             return Ok(true);
@@ -1305,9 +1314,32 @@ fn join_kind_supported(join_type: JoinType) -> bool {
     )
 }
 
-/// A join pushes when it has an ON condition, or is NATURAL/USING.
+/// A join pushes when it has an ON condition, is NATURAL/USING, or is a
+/// SEMI/ANTI existence test (which is complete without a condition: an
+/// uncorrelated EXISTS only asks whether the right side has any row).
 fn join_is_pushable(join: &Join) -> bool {
+    if matches!(join.join_type, JoinType::Semi | JoinType::Anti) {
+        return true;
+    }
     join.condition.is_some() || join.natural || join.using.is_some()
+}
+
+/// Render a SEMI/ANTI join as a `[NOT] EXISTS(SELECT 1 ...)` WHERE term. A
+/// conditionless join is an uncorrelated existence test, so its inner query
+/// carries no WHERE clause; a correlated one filters on the join condition.
+fn render_existence_term(join: &Join, right_ref: &str) -> Result<String, EmitError> {
+    let keyword = if join.join_type == JoinType::Anti {
+        "NOT EXISTS"
+    } else {
+        "EXISTS"
+    };
+    match &join.condition {
+        Some(condition) => {
+            let cond = render_expr(condition, &CANONICAL_SOURCE_RESOLVER)?;
+            Ok(format!("{keyword}(SELECT 1 FROM {right_ref} WHERE {cond})"))
+        }
+        None => Ok(format!("{keyword}(SELECT 1 FROM {right_ref})")),
+    }
 }
 
 /// The SQL JOIN prefix for a column-contributing join. SEMI/ANTI (existence
@@ -1674,6 +1706,38 @@ fn has_star(exprs: &[Expr]) -> bool {
 /// Whether any projection item is more than a bare column reference.
 fn has_computed_expression(exprs: &[Expr]) -> bool {
     exprs.iter().any(|expr| !matches!(expr, Expr::Column(_)))
+}
+
+/// Whether an already-absorbed WHERE predicate reads a name this SELECT list
+/// would COMPUTE. SQL evaluates WHERE before the SELECT list, so merging the
+/// two into one query would reference an alias that does not exist in the
+/// WHERE scope (the boolean flag columns manufactured by disjunctive
+/// decorrelation are the canonical case). The caller declines the merge and
+/// the filter runs above the pushed fragment instead.
+fn select_shadows_filter(exprs: &[Expr], aliases: &[String], ctx: &PushContext) -> bool {
+    for (expr, alias) in exprs.iter().zip(aliases.iter()) {
+        if matches!(expr, Expr::Column(_)) {
+            continue;
+        }
+        if filter_reads_name(ctx, alias) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether any absorbed WHERE predicate references `name` as a column.
+/// Matched on the bare column name regardless of qualifier: a coincidental
+/// match only declines a push, never changes an answer.
+fn filter_reads_name(ctx: &PushContext, name: &str) -> bool {
+    for predicate in &ctx.filter_predicates {
+        for reference in column_refs(predicate) {
+            if reference.column == name {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Clamp a `u64` row count/offset to `i64` for the SELECT skeleton; a value beyond
