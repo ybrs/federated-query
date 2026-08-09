@@ -539,11 +539,12 @@ fn a_refresh_over_new_actors_appends_a_segment_instead_of_rebuilding() {
 }
 
 /// A refresh whose delta touches an actor an existing segment already covers
-/// REBUILDS instead of appending. Two segments holding parts of one stream
-/// would each count their part, so the answer would be wrong; the index is
-/// rebuilt whole and the answer stays right.
+/// appends a segment PAIR - an addition owning the window forms the delta
+/// changed and a retraction cancelling the stale forms the base segment still
+/// counts - and never rewrites the base segment. The answer counts every
+/// window exactly once across the signed segments.
 #[test]
-fn a_refresh_over_a_returning_actor_rebuilds_the_index() {
+fn a_refresh_over_a_returning_actor_appends_a_pair() {
     let dir = sandbox("segrebuild");
     let file = dir.join("clicks.parquet");
     write_events(
@@ -561,8 +562,17 @@ fn a_refresh_over_a_returning_actor_rebuilds_the_index() {
         )
         .expect("create event dataset");
     assert_eq!(index_files(&dir, "paths_f_"), 1);
+    let base_segment = walk(&dir)
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("paths_f_"))
+        })
+        .expect("a segment file");
+    let before = std::fs::read(&base_segment).expect("read segment");
 
-    // u1 comes back: an actor the one existing segment already covers.
+    // u1 comes back: an actor the base segment already covers.
     write_events(
         &file,
         vec![1_000_000, 2_000_000, 3_000_000],
@@ -575,10 +585,12 @@ fn a_refresh_over_a_returning_actor_rebuilds_the_index() {
 
     assert_eq!(
         index_files(&dir, "paths_f_"),
-        1,
-        "a returning actor must rebuild, leaving one segment"
+        3,
+        "a returning actor appends an addition and a retraction"
     );
     assert_eq!(index_files(&dir, "paths_m_"), 1, "exactly one manifest");
+    let after = std::fs::read(&base_segment).expect("read segment again");
+    assert_eq!(before, after, "the base segment was rewritten");
 
     // u1's stream is one whole thing, counted once: three events, so the two
     // depth-2 windows open->close and close->purchase, each occurring once.

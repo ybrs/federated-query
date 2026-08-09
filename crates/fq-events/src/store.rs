@@ -207,7 +207,8 @@ pub enum CachedItem {
     Stats(Vec<ColumnStats>),
     Preagg(Preagg),
     Sidecar(crate::format::ActorSidecar),
-    PathsSa(crate::paths_sa::PathsSa),
+    /// Boxed: the paths index struct is far larger than every other variant.
+    PathsSa(Box<crate::paths_sa::PathsSa>),
 }
 
 impl CachedItem {

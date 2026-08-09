@@ -205,6 +205,13 @@ pub enum PathAnchor {
     EndingAt(String),
 }
 
+/// The window-length bound the paths index maintains incrementally: a
+/// refresh's stitch segments carry ownership and context only for windows of
+/// at most this many events, which is what keeps a refresh's index cost
+/// proportional to the delta instead of to the touched actors' histories.
+/// The index declines deeper sweeps and the exact scan serves them.
+pub const DEFAULT_MAX_PATHS_DEPTH: u32 = 32;
+
 /// `PATHS ON <dataset>` in typed form.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PathsSpec {

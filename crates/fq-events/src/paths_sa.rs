@@ -32,6 +32,7 @@ use crate::error::{EventBuildError, EventError, EventStoreError};
 use crate::exec::{run_sharded, PathsResult, PathsRow};
 use crate::format::fnv1a64;
 use crate::sais;
+use crate::stitch;
 use crate::store::{cached_paths_sa, CachedItem, StoreIo};
 use crate::Dataset;
 
@@ -44,7 +45,7 @@ compile_error!("the paths index stores little-endian arrays; big-endian is unsup
 const MAGIC: &[u8; 4] = b"FQPS";
 
 /// The serialization version this build writes and reads.
-const VERSION: u8 = 4;
+const VERSION: u8 = 5;
 
 /// The fingerprint stamped into a SEGMENT file.
 ///
@@ -111,6 +112,20 @@ pub struct PathsSa {
     /// suffixes whose first symbol is `s` occupy `buckets[s]..buckets[s + 1]`
     /// in BOTH arrays (the reversed text is a permutation of the text).
     buckets: Vec<u32>,
+    /// Per-direction ownership bitmaps in SUFFIX-ARRAY order, present only on
+    /// stitch segments (a refresh's addition or retraction). A sweep counts a
+    /// window only at a position its direction owns; `None` owns everything -
+    /// a base segment counts every window its text holds. Ownership is what
+    /// makes overlapping segment texts sound: the same stream position may
+    /// appear in several segments' texts, but exactly one segment's ownership
+    /// (net of retractions) counts each window form.
+    own_fwd: Option<Vec<u64>>,
+    own_bwd: Option<Vec<u64>>,
+    /// The window-length bound the segment's ownership was constructed for.
+    /// A stitch segment's text carries only `max_depth` context around what it
+    /// owns, so serving a deeper window would read into a neighboring region;
+    /// callers must not sweep it deeper. 0 on base segments (any depth).
+    max_depth: u32,
 }
 
 /// Which suffix array a sweep walks.
@@ -124,7 +139,9 @@ impl PathsSa {
     /// Approximate resident bytes, for the block cache's budget accounting.
     pub fn heap_bytes(&self) -> usize {
         let n = self.text.len();
-        n * (usize::from(self.text.width()) + 2 * (4 + 4 + 4 + 8)) + self.buckets.len() * 4
+        let own = self.own_fwd.as_ref().map_or(0, |bits| bits.len() * 8)
+            + self.own_bwd.as_ref().map_or(0, |bits| bits.len() * 8);
+        n * (usize::from(self.text.width()) + 2 * (4 + 4 + 4 + 8)) + self.buckets.len() * 4 + own
     }
 
     /// The sweep arrays of a direction: (sa, lcp, avail, anchor ts), all in
@@ -133,6 +150,19 @@ impl PathsSa {
         match dir {
             Direction::Forward => (&self.sa_fwd, &self.lcp_fwd, &self.avail_fwd, &self.ts_fwd),
             Direction::Backward => (&self.sa_bwd, &self.lcp_bwd, &self.avail_bwd, &self.ts_bwd),
+        }
+    }
+
+    /// Whether the direction owns suffix-array position `at`: bitmap bit, or
+    /// everything when the segment carries no bitmap.
+    fn owns(&self, dir: Direction, at: usize) -> bool {
+        let bits = match dir {
+            Direction::Forward => &self.own_fwd,
+            Direction::Backward => &self.own_bwd,
+        };
+        match bits {
+            None => true,
+            Some(words) => words[at / 64] & (1u64 << (at % 64)) != 0,
         }
     }
 
@@ -241,21 +271,17 @@ fn manifest_rel(dataset: &Dataset) -> String {
     )
 }
 
-/// Which actors one index segment covers, per shard.
+/// One segment of the index: its immutable file id and its sign.
 ///
-/// A segment holds WHOLE actor streams - that is what lets segment counts be
-/// summed - so this is the segment's identity, not an optimization: it says
-/// which actors are answered from here, and therefore which actors a later
-/// segment must NOT also answer for.
-struct SegmentCoverage {
-    shard: u32,
-    locals: Vec<u64>,
-}
-
-/// One segment of the index: its immutable file id and what it covers.
+/// A `negative` segment is a refresh's RETRACTION: it re-counts, with the
+/// PRE-REFRESH availability and timestamps, exactly the window forms that the
+/// refresh invalidated in older segments, and the merge subtracts it. The
+/// paired addition then counts the current forms. Ownership bitmaps inside
+/// the segment files say which positions count; the manifest only carries
+/// the sign.
 struct SegmentEntry {
     id: u32,
-    coverage: Vec<SegmentCoverage>,
+    negative: bool,
 }
 
 /// The index's manifest: the segments composing it, and the next free file id.
@@ -292,12 +318,21 @@ fn location_files_with_prefix(
     Ok(matched)
 }
 
+/// How one stored actor slice relates to the actor's TRUE stream: how many
+/// stream events precede and follow the slice, and which slice positions each
+/// direction owns (slice-relative half-open ranges). A whole-stream slice has
+/// zero before/after and owns everything.
+#[derive(Clone, Copy)]
+struct SliceMeta {
+    before: u32,
+    after: u32,
+    own_fwd: stitch::Span,
+    own_bwd: stitch::Span,
+}
+
 /// One shard's duplicate-collapsed streams: `codes[bounds[i]..bounds[i + 1]]`
 /// (and the aligned timestamps) is actor i's sequence.
 struct ShardStream {
-    /// The shard these streams came from; with `actors` it names every actor
-    /// the segment built from this stream covers.
-    shard: u32,
     codes: Vec<u32>,
     ts: Vec<i64>,
     bounds: Vec<u32>,
@@ -305,6 +340,10 @@ struct ShardStream {
     /// entry per `bounds` interval. A returning actor keeps its local id, so
     /// `(shard, local)` identifies an actor across refreshes.
     actors: Vec<u64>,
+    /// Per actor, aligned with `actors`: how the stored slice sits inside the
+    /// actor's true stream. `None` when every slice IS the whole stream (a
+    /// base segment).
+    slices: Option<Vec<SliceMeta>>,
 }
 
 /// The actors a set of segment files holds, as `(shard, local)` keys.
@@ -375,11 +414,11 @@ fn collect_streams(
                 actors.push(local);
             }
             Ok(ShardStream {
-                shard: scan.shard(),
                 codes,
                 ts,
                 bounds,
                 actors,
+                slices: None,
             })
         },
         |stream| {
@@ -390,11 +429,135 @@ fn collect_streams(
     Ok(streams)
 }
 
-/// Assemble the index from collapsed streams: lay out the separator-joined
-/// text with its per-position timestamp and actor-bound arrays, suffix-sort
-/// the text and its reversal concurrently, and derive both LCP arrays and the
-/// first-symbol buckets.
-fn assemble(streams: &[ShardStream], alphabet: u32) -> Result<PathsSa, EventBuildError> {
+/// The text-order per-position layout of a segment: symbols, anchor
+/// timestamps, slice bounds, availability shifts beyond the stored slice, and
+/// per-direction ownership flags (all empty when the segment owns everything).
+struct TextLayout {
+    text: Text,
+    ts: Vec<i64>,
+    start: Vec<u32>,
+    end: Vec<u32>,
+    after_of: Vec<u32>,
+    before_of: Vec<u32>,
+    own_fwd: Vec<u8>,
+    own_bwd: Vec<u8>,
+}
+
+/// Lay out one actor's slice into the text, pushing its symbols, timestamps,
+/// bounds, shifts, and ownership flags, then the trailing separator.
+fn layout_actor(layout: &mut TextLayout, stream: &ShardStream, actor: usize, stitched: bool) {
+    let lo = stream.bounds[actor] as usize;
+    let hi = stream.bounds[actor + 1] as usize;
+    let meta = stream.slices.as_ref().map(|slices| slices[actor]);
+    let text_lo = u32::try_from(layout.ts.len()).expect("text fits u32");
+    let text_hi = text_lo + u32::try_from(hi - lo).expect("stream fits u32");
+    for offset in lo..hi {
+        let rel = u32::try_from(offset - lo).expect("slice offset fits u32");
+        match &mut layout.text {
+            Text::Small(text) => {
+                text.push(u8::try_from(stream.codes[offset] + 1).expect("code fits u8"));
+            }
+            Text::Wide(text) => {
+                text.push(i32::try_from(stream.codes[offset] + 1).expect("code fits i32"));
+            }
+        }
+        layout.ts.push(stream.ts[offset]);
+        layout.start.push(text_lo);
+        layout.end.push(text_hi);
+        if stitched {
+            let (before, after, fwd, bwd) = match meta {
+                None => (0, 0, true, true),
+                Some(meta) => (
+                    meta.before,
+                    meta.after,
+                    meta.own_fwd.lo <= rel && rel < meta.own_fwd.hi,
+                    meta.own_bwd.lo <= rel && rel < meta.own_bwd.hi,
+                ),
+            };
+            layout.before_of.push(before);
+            layout.after_of.push(after);
+            layout.own_fwd.push(u8::from(fwd));
+            layout.own_bwd.push(u8::from(bwd));
+        }
+    }
+    // The separator after the stream: an out-of-alphabet symbol whose
+    // start == end == its own position keeps every window off it. Its
+    // shifts stay zero and it is never owned, so a slice's true-stream
+    // extension can never lift a separator into validity.
+    match &mut layout.text {
+        Text::Small(text) => text.push(0),
+        Text::Wide(text) => text.push(0),
+    }
+    layout.ts.push(0);
+    layout.start.push(text_hi);
+    layout.end.push(text_hi);
+    if stitched {
+        layout.before_of.push(0);
+        layout.after_of.push(0);
+        layout.own_fwd.push(0);
+        layout.own_bwd.push(0);
+    }
+}
+
+/// Check the stitch construction invariant for every owned position: a window
+/// of length up to `min(max_depth, availability)` must lie inside the stored
+/// slice, or the sweep would read a neighboring region's symbols as this
+/// actor's. A violation is a construction bug, never data-dependent, and it
+/// must stop the build rather than ship an index that answers wrongly.
+fn check_stitch_bounds(layout: &TextLayout, max_depth: u32) {
+    assert!(
+        max_depth >= 2,
+        "a stitched segment needs a window-length bound of at least 2"
+    );
+    for pos in 0..layout.ts.len() {
+        let here = u32::try_from(pos).expect("position fits u32");
+        let in_slice_fwd = layout.end[pos] - here;
+        let in_slice_bwd = here - layout.start[pos] + 1;
+        if layout.own_fwd[pos] != 0 {
+            let avail = in_slice_fwd + layout.after_of[pos];
+            assert!(
+                max_depth.min(avail) <= in_slice_fwd,
+                "stitch construction bug: forward-owned position lacks window text"
+            );
+        }
+        if layout.own_bwd[pos] != 0 {
+            let avail = in_slice_bwd + layout.before_of[pos];
+            assert!(
+                max_depth.min(avail) <= in_slice_bwd,
+                "stitch construction bug: backward-owned position lacks window text"
+            );
+        }
+    }
+}
+
+/// Scatter a text-order flag into a suffix-array-order bitmap.
+fn sa_bitmap(sa: &[i32], flag: impl Fn(usize) -> bool) -> Vec<u64> {
+    let mut words = vec![0u64; sa.len().div_ceil(64)];
+    for (slot, suffix) in sa.iter().enumerate() {
+        let pos = usize::try_from(*suffix).expect("suffix position fits usize");
+        if flag(pos) {
+            words[slot / 64] |= 1u64 << (slot % 64);
+        }
+    }
+    words
+}
+
+/// Assemble a segment from collapsed streams: lay out the separator-joined
+/// text with its per-position companions, suffix-sort the text and its
+/// reversal concurrently, derive both LCP arrays and the first-symbol
+/// buckets, and scatter availability, timestamps, and (for stitch segments)
+/// ownership into suffix-array order.
+///
+/// `max_depth` is the window-length bound a stitch segment was constructed
+/// for; a segment whose streams are all whole (no slices) passes 0 and owns
+/// everything at any depth. Availability counts TRUE stream events - the
+/// slice's span plus the events beyond its edges - so truncation semantics
+/// hold even where the stored text is only a slice.
+fn assemble(
+    streams: &[ShardStream],
+    alphabet: u32,
+    max_depth: u32,
+) -> Result<PathsSa, EventBuildError> {
     let events: usize = streams.iter().map(|stream| stream.codes.len()).sum();
     let actors: usize = streams.iter().map(|stream| stream.bounds.len() - 1).sum();
     let n = events + actors;
@@ -402,67 +565,78 @@ fn assemble(streams: &[ShardStream], alphabet: u32) -> Result<PathsSa, EventBuil
         return Err(EventBuildError::SuffixTextTooLong { positions: n });
     }
     let small = alphabet <= 254;
-    let mut text8: Vec<u8> = Vec::with_capacity(if small { n } else { 0 });
-    let mut text32: Vec<i32> = Vec::with_capacity(if small { 0 } else { n });
-    let mut ts: Vec<i64> = Vec::with_capacity(n);
-    let mut start: Vec<u32> = Vec::with_capacity(n);
-    let mut end: Vec<u32> = Vec::with_capacity(n);
+    let stitched = streams.iter().any(|stream| stream.slices.is_some());
+    let side = if stitched { n } else { 0 };
+    let mut layout = TextLayout {
+        text: if small {
+            Text::Small(Vec::with_capacity(n))
+        } else {
+            Text::Wide(Vec::with_capacity(n))
+        },
+        ts: Vec::with_capacity(n),
+        start: Vec::with_capacity(n),
+        end: Vec::with_capacity(n),
+        after_of: Vec::with_capacity(side),
+        before_of: Vec::with_capacity(side),
+        own_fwd: Vec::with_capacity(side),
+        own_bwd: Vec::with_capacity(side),
+    };
     for stream in streams {
         for actor in 0..stream.bounds.len() - 1 {
-            let lo = stream.bounds[actor] as usize;
-            let hi = stream.bounds[actor + 1] as usize;
-            let text_lo = u32::try_from(ts.len()).expect("text fits u32");
-            let text_hi = text_lo + u32::try_from(hi - lo).expect("stream fits u32");
-            for offset in lo..hi {
-                if small {
-                    text8.push(u8::try_from(stream.codes[offset] + 1).expect("code fits u8"));
-                } else {
-                    text32.push(i32::try_from(stream.codes[offset] + 1).expect("code fits i32"));
-                }
-                ts.push(stream.ts[offset]);
-                start.push(text_lo);
-                end.push(text_hi);
-            }
-            // The separator after the stream: an out-of-alphabet symbol whose
-            // start == end == its own position keeps every window off it.
-            if small {
-                text8.push(0);
-            } else {
-                text32.push(0);
-            }
-            ts.push(0);
-            start.push(text_hi);
-            end.push(text_hi);
+            layout_actor(&mut layout, stream, actor, stitched);
         }
     }
-    let text = if small {
-        Text::Small(text8)
-    } else {
-        Text::Wide(text32)
-    };
-    let (sa_fwd, lcp_fwd, sa_bwd, lcp_bwd) = sort_both_directions(&text, alphabet)?;
-    let buckets = bucket_offsets(&text, alphabet);
+    if stitched {
+        check_stitch_bounds(&layout, max_depth);
+    }
+    let (sa_fwd, lcp_fwd, sa_bwd, lcp_bwd) = sort_both_directions(&layout.text, alphabet)?;
+    let buckets = bucket_offsets(&layout.text, alphabet);
     // Scatter availability and anchor timestamps into SUFFIX-ARRAY order, so
     // the sweep never takes a random read: forward availability runs to the
-    // actor stream's end; a backward suffix (of the reversed text) maps onto
-    // its origin position, whose availability runs back to the stream start.
-    let last = ts.len().saturating_sub(1);
+    // actor stream's TRUE end (slice span plus the shift); a backward suffix
+    // (of the reversed text) maps onto its origin position, whose
+    // availability runs back to the TRUE stream start.
+    let last = layout.ts.len().saturating_sub(1);
+    let shift_after = |pos: usize| {
+        if layout.after_of.is_empty() {
+            0
+        } else {
+            layout.after_of[pos]
+        }
+    };
+    let shift_before = |pos: usize| {
+        if layout.before_of.is_empty() {
+            0
+        } else {
+            layout.before_of[pos]
+        }
+    };
     let (avail_fwd, ts_fwd) = sa_companions(&sa_fwd, |pos| {
         (
-            end[pos] - u32::try_from(pos).expect("position fits u32"),
-            ts[pos],
+            layout.end[pos] - u32::try_from(pos).expect("position fits u32") + shift_after(pos),
+            layout.ts[pos],
         )
     });
     let (avail_bwd, ts_bwd) = sa_companions(&sa_bwd, |pos| {
         let origin = last - pos;
         (
-            u32::try_from(origin).expect("position fits u32") - start[origin] + 1,
-            ts[origin],
+            u32::try_from(origin).expect("position fits u32") - layout.start[origin]
+                + 1
+                + shift_before(origin),
+            layout.ts[origin],
         )
     });
+    let (own_fwd, own_bwd) = if stitched {
+        (
+            Some(sa_bitmap(&sa_fwd, |pos| layout.own_fwd[pos] != 0)),
+            Some(sa_bitmap(&sa_bwd, |pos| layout.own_bwd[last - pos] != 0)),
+        )
+    } else {
+        (None, None)
+    };
     Ok(PathsSa {
         alphabet,
-        text,
+        text: layout.text,
         sa_fwd,
         lcp_fwd,
         avail_fwd,
@@ -472,6 +646,9 @@ fn assemble(streams: &[ShardStream], alphabet: u32) -> Result<PathsSa, EventBuil
         avail_bwd,
         ts_bwd,
         buckets,
+        own_fwd,
+        own_bwd,
+        max_depth: if stitched { max_depth } else { 0 },
     })
 }
 
@@ -572,62 +749,177 @@ fn bucket_offsets(text: &Text, alphabet: u32) -> Vec<u32> {
     buckets
 }
 
-/// Build the paths index over the dataset's current generation set, replacing
-/// any stale index files, and return the DDL status summary.
-/// Add ONE segment covering the actors a refresh touched, leaving every
-/// existing segment file untouched.
-///
-/// Returns `None` when the append cannot be done soundly, and the caller
-/// rebuilds instead. That is the case whenever the delta touched an actor some
-/// segment ALREADY covers: two segments would then hold overlapping parts of
-/// one stream, and their counts would both be added. Detecting that is the
-/// whole safety argument, so it is checked against the manifest rather than
-/// assumed from the shape of the delta.
-pub(crate) fn append_touched(
+/// Append one actor's stitch slice to a pair stream: the sliced codes and
+/// timestamps, the actor's local id, and the slice's relation to the true
+/// stream (ownership converted to slice-relative coordinates).
+fn push_slice(
+    stream: &mut ShardStream,
+    local: u64,
+    collapsed: &stitch::CollapsedStream,
+    slice: stitch::ActorStitch,
+) {
+    let lo = slice.text.lo as usize;
+    let hi = slice.text.hi as usize;
+    stream.codes.extend_from_slice(&collapsed.codes[lo..hi]);
+    stream.ts.extend_from_slice(&collapsed.ts[lo..hi]);
+    stream
+        .bounds
+        .push(u32::try_from(stream.codes.len()).expect("stream fits u32"));
+    stream.actors.push(local);
+    let stream_len = u32::try_from(collapsed.codes.len()).expect("stream fits u32");
+    let relative = |span: stitch::Span| stitch::Span {
+        lo: span.lo - slice.text.lo,
+        hi: span.hi - slice.text.lo,
+    };
+    stream
+        .slices
+        .as_mut()
+        .expect("pair streams carry slices")
+        .push(SliceMeta {
+            before: slice.text.lo,
+            after: stream_len - slice.text.hi,
+            own_fwd: relative(slice.own_fwd),
+            own_bwd: relative(slice.own_bwd),
+        });
+}
+
+/// An empty pair stream, ready for `push_slice`.
+fn empty_pair_stream() -> ShardStream {
+    ShardStream {
+        codes: Vec::new(),
+        ts: Vec::new(),
+        bounds: vec![0],
+        actors: Vec::new(),
+        slices: Some(Vec::new()),
+    }
+}
+
+/// Read the touched actors' streams once and cut both halves of a refresh's
+/// segment pair: per actor, the merged collapsed stream (delta included) and
+/// the old collapsed stream (delta excluded) are collapsed side by side, the
+/// changed envelope between them is computed, and the addition/retraction
+/// stitches are sliced out with their ownership. An actor whose collapsed
+/// stream did not change (the delta collapsed entirely into existing runs)
+/// contributes to neither.
+fn collect_pair_streams(
     io: &StoreIo,
     dataset: &Dataset,
     cfg: &fq_common::events::EventsConfig,
     touched: &std::collections::HashSet<(u32, u64)>,
+    delta_files: &std::collections::HashSet<String>,
+    max_depth: u32,
+) -> Result<(Vec<ShardStream>, Vec<ShardStream>), EventError> {
+    let mut additions = Vec::new();
+    let mut retractions = Vec::new();
+    run_sharded(
+        io,
+        dataset,
+        cfg,
+        |scan| {
+            let shard = scan.shard();
+            let mut addition = empty_pair_stream();
+            let mut retraction = empty_pair_stream();
+            let (locals, runs) = scan.actor_runs_with_locals();
+            for (local, run) in locals.into_iter().zip(runs) {
+                if !touched.contains(&(shard, local)) {
+                    continue;
+                }
+                let mut merged_events: Vec<(u32, i64)> = Vec::new();
+                let mut old_events: Vec<(u32, i64)> = Vec::new();
+                scan.for_each_event(&run, |file, row, code| {
+                    let when = scan.files[file].ts.i64_at(row)?;
+                    let code = u32::try_from(code).expect("dictionary code fits u32");
+                    merged_events.push((code, when));
+                    if !delta_files.contains(scan.files[file].seg.rel()) {
+                        old_events.push((code, when));
+                    }
+                    Ok(true)
+                })?;
+                let merged = stitch::collapse(&merged_events);
+                let old = stitch::collapse(&old_events);
+                let envelope = stitch::envelope(&old, &merged);
+                let merged_len = u32::try_from(merged.codes.len()).expect("stream fits u32");
+                let old_len = u32::try_from(old.codes.len()).expect("stream fits u32");
+                if let Some(slice) = stitch::addition_stitch(merged_len, envelope, max_depth) {
+                    push_slice(&mut addition, local, &merged, slice);
+                }
+                if let Some(slice) = stitch::retraction_stitch(old_len, envelope, max_depth) {
+                    push_slice(&mut retraction, local, &old, slice);
+                }
+            }
+            Ok((addition, retraction))
+        },
+        |(addition, retraction)| {
+            additions.push(addition);
+            retractions.push(retraction);
+            Ok(())
+        },
+    )?;
+    Ok((additions, retractions))
+}
+
+/// Whether any of a pair's shard streams holds an actor at all.
+fn pair_has_streams(streams: &[ShardStream]) -> bool {
+    streams.iter().any(|stream| !stream.actors.is_empty())
+}
+
+/// Extend the index for a refresh with one segment PAIR - an addition owning
+/// the changed window forms and a retraction cancelling the stale forms older
+/// segments still count - leaving every existing segment file untouched.
+///
+/// Returns `None` when there is no stored manifest to extend (never built, or
+/// a version older than this format), and the caller rebuilds instead. The
+/// pair's cost is proportional to the delta plus the touched actors' changed
+/// envelopes with `max_depth` context - never to their whole histories.
+pub(crate) fn append_pair(
+    io: &StoreIo,
+    dataset: &Dataset,
+    cfg: &fq_common::events::EventsConfig,
+    touched: &std::collections::HashSet<(u32, u64)>,
+    delta_files: &[(u32, String)],
+    max_depth: u32,
 ) -> Result<Option<String>, EventError> {
     let Some((manifest_path, manifest)) = read_stored_manifest(io, dataset)? else {
         return Ok(None);
     };
-    for segment in &manifest.segments {
-        for coverage in &segment.coverage {
-            for local in &coverage.locals {
-                if touched.contains(&(coverage.shard, *local)) {
-                    return Ok(None);
-                }
-            }
-        }
-    }
     let started = std::time::Instant::now();
-    let streams = collect_streams(io, dataset, cfg, Some(touched))?;
+    let mut delta_rels = std::collections::HashSet::new();
+    for (_, rel) in delta_files {
+        delta_rels.insert(rel.clone());
+    }
+    let (additions, retractions) =
+        collect_pair_streams(io, dataset, cfg, touched, &delta_rels, max_depth)?;
     let collected = started.elapsed().as_secs_f64();
     let alphabet = u32::try_from(dataset.event_dict.values.len()).expect("dictionary fits u32");
-    let index = assemble(&streams, alphabet)?;
-    let sorted = started.elapsed().as_secs_f64();
-    let positions = index.text.len();
-    let id = manifest.next_id;
-    let written = write_segment(io, dataset, &index, id, SEGMENT_STAMP)?;
     let mut segments = manifest.segments;
-    segments.push(SegmentEntry {
-        id,
-        coverage: coverage_of(&streams),
-    });
-    let next = IndexManifest {
-        next_id: id + 1,
-        segments,
-    };
+    let mut next_id = manifest.next_id;
+    let mut positions = 0usize;
+    let mut written = 0usize;
+    for (streams, negative) in [(&additions, false), (&retractions, true)] {
+        if !pair_has_streams(streams) {
+            continue;
+        }
+        let index = assemble(streams, alphabet, max_depth)?;
+        positions += index.text.len();
+        written += write_segment(io, dataset, &index, next_id, SEGMENT_STAMP)?;
+        segments.push(SegmentEntry {
+            id: next_id,
+            negative,
+        });
+        next_id += 1;
+    }
+    let next = IndexManifest { next_id, segments };
     let stamp = fingerprint(dataset);
-    io.put_verified(&manifest_rel(dataset), encode_manifest(&next, stamp))?;
-    io.delete(&manifest_path)?;
+    let next_path = manifest_rel(dataset);
+    io.put_verified(&next_path, encode_manifest(&next, stamp))?;
+    if manifest_path != next_path {
+        io.delete(&manifest_path)?;
+    }
     let total = started.elapsed().as_secs_f64();
     Ok(Some(format!(
-        "paths index: +1 segment, {positions} positions, {written} bytes, {total:.3}s \
-         (collect {collected:.3}s, sort {:.3}s, write {:.3}s)",
-        sorted - collected,
-        total - sorted
+        "paths index: +pair, {positions} positions, {written} bytes, {total:.3}s \
+         (collect {collected:.3}s, stitch {:.3}s)",
+        total - collected
     )))
 }
 
@@ -643,18 +935,20 @@ pub(crate) fn rebuild(
     let streams = collect_streams(io, dataset, cfg, None)?;
     let collected = started.elapsed().as_secs_f64();
     let alphabet = u32::try_from(dataset.event_dict.values.len()).expect("dictionary fits u32");
-    let index = assemble(&streams, alphabet)?;
-    let streams_coverage = streams;
+    let index = assemble(&streams, alphabet, 0)?;
+    drop(streams);
     let sorted = started.elapsed().as_secs_f64();
     let positions = index.text.len();
     let stamp = fingerprint(dataset);
-    let coverage = coverage_of(&streams_coverage);
     let written = write_segment(io, dataset, &index, 0, SEGMENT_STAMP)?;
     // The manifest goes last: until it exists there is no index, so a crash
     // between the segment files and here leaves a dataset that scans.
     let manifest = IndexManifest {
         next_id: 1,
-        segments: vec![SegmentEntry { id: 0, coverage }],
+        segments: vec![SegmentEntry {
+            id: 0,
+            negative: false,
+        }],
     };
     io.put_verified(&manifest_rel(dataset), encode_manifest(&manifest, stamp))?;
     let total = started.elapsed().as_secs_f64();
@@ -699,7 +993,7 @@ fn write_segment(
 }
 
 /// Serialize the manifest: magic, version, fingerprint, then per segment its
-/// per-shard actor coverage.
+/// id and sign.
 fn encode_manifest(manifest: &IndexManifest, fingerprint: u64) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
@@ -709,12 +1003,7 @@ fn encode_manifest(manifest: &IndexManifest, fingerprint: u64) -> Vec<u8> {
     out.extend_from_slice(&(manifest.segments.len() as u64).to_le_bytes());
     for segment in &manifest.segments {
         out.extend_from_slice(&segment.id.to_le_bytes());
-        out.extend_from_slice(&(segment.coverage.len() as u64).to_le_bytes());
-        for coverage in &segment.coverage {
-            out.extend_from_slice(&coverage.shard.to_le_bytes());
-            out.extend_from_slice(&(coverage.locals.len() as u64).to_le_bytes());
-            out.extend_from_slice(raw_bytes(&coverage.locals));
-        }
+        out.push(u8::from(segment.negative));
     }
     out
 }
@@ -759,18 +1048,14 @@ fn decode_manifest(
     let mut segments = Vec::new();
     for _ in 0..count {
         let id = u32::from_le_bytes(take(4)?.try_into().expect("four bytes"));
-        let shards = u64::from_le_bytes(take(8)?.try_into().expect("eight bytes"));
-        let mut coverage = Vec::new();
-        for _ in 0..shards {
-            let shard = u32::from_le_bytes(take(4)?.try_into().expect("four bytes"));
-            let actors = u64::from_le_bytes(take(8)?.try_into().expect("eight bytes"));
-            let locals_bytes = take(usize::try_from(actors).expect("actor count fits") * 8)?;
-            coverage.push(SegmentCoverage {
-                shard,
-                locals: copy_typed::<u64>(locals_bytes),
-            });
+        let sign = take(1)?[0];
+        if sign > 1 {
+            return Err(corrupt(format!("paths manifest segment sign {sign}")));
         }
-        segments.push(SegmentEntry { id, coverage });
+        segments.push(SegmentEntry {
+            id,
+            negative: sign == 1,
+        });
     }
     Ok(IndexManifest { next_id, segments })
 }
@@ -814,18 +1099,6 @@ fn read_stored_manifest(
     Ok(Some((path, manifest)))
 }
 
-/// The coverage of one segment, read off the streams it was built from.
-fn coverage_of(streams: &[ShardStream]) -> Vec<SegmentCoverage> {
-    let mut coverage = Vec::with_capacity(streams.len());
-    for stream in streams {
-        coverage.push(SegmentCoverage {
-            shard: stream.shard,
-            locals: stream.actors.clone(),
-        });
-    }
-    coverage
-}
-
 /// The little-endian byte view of a plain numeric slice.
 fn raw_bytes<T>(values: &[T]) -> &[u8] {
     // A plain numeric slice is always viewable as its raw bytes.
@@ -835,8 +1108,9 @@ fn raw_bytes<T>(values: &[T]) -> &[u8] {
 }
 
 /// The shared file header: magic, version, fingerprint, position count,
-/// alphabet, and symbol width.
-fn encode_header(index: &PathsSa, fingerprint: u64, capacity: usize) -> Vec<u8> {
+/// alphabet, symbol width, the stitch window-length bound (0 on a base
+/// segment), and whether the file carries an ownership bitmap.
+fn encode_header(index: &PathsSa, fingerprint: u64, capacity: usize, has_own: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(capacity);
     out.extend_from_slice(MAGIC);
     out.push(VERSION);
@@ -844,14 +1118,22 @@ fn encode_header(index: &PathsSa, fingerprint: u64, capacity: usize) -> Vec<u8> 
     out.extend_from_slice(&(index.text.len() as u64).to_le_bytes());
     out.extend_from_slice(&index.alphabet.to_le_bytes());
     out.push(index.text.width());
+    out.extend_from_slice(&index.max_depth.to_le_bytes());
+    out.push(u8::from(has_own));
     out
 }
 
-/// Encode the forward file: header, text, then the forward arrays.
+/// Encode the forward file: header, text, the forward arrays, then the
+/// forward ownership bitmap when the segment is a stitch.
 fn encode_fwd(index: &PathsSa, fingerprint: u64) -> Vec<u8> {
     let n = index.text.len();
     let width = usize::from(index.text.width());
-    let mut out = encode_header(index, fingerprint, 32 + n * (width + 20));
+    let mut out = encode_header(
+        index,
+        fingerprint,
+        40 + n * (width + 20),
+        index.own_fwd.is_some(),
+    );
     match &index.text {
         Text::Small(text) => out.extend_from_slice(text),
         Text::Wide(text) => out.extend_from_slice(raw_bytes(text)),
@@ -860,17 +1142,24 @@ fn encode_fwd(index: &PathsSa, fingerprint: u64) -> Vec<u8> {
     out.extend_from_slice(raw_bytes(&index.lcp_fwd));
     out.extend_from_slice(raw_bytes(&index.avail_fwd));
     out.extend_from_slice(raw_bytes(&index.ts_fwd));
+    if let Some(words) = &index.own_fwd {
+        out.extend_from_slice(raw_bytes(words));
+    }
     out
 }
 
-/// Encode the backward file: header, then the backward arrays.
+/// Encode the backward file: header, the backward arrays, then the backward
+/// ownership bitmap when the segment is a stitch.
 fn encode_bwd(index: &PathsSa, fingerprint: u64) -> Vec<u8> {
     let n = index.text.len();
-    let mut out = encode_header(index, fingerprint, 32 + n * 20);
+    let mut out = encode_header(index, fingerprint, 40 + n * 20, index.own_bwd.is_some());
     out.extend_from_slice(raw_bytes(&index.sa_bwd));
     out.extend_from_slice(raw_bytes(&index.lcp_bwd));
     out.extend_from_slice(raw_bytes(&index.avail_bwd));
     out.extend_from_slice(raw_bytes(&index.ts_bwd));
+    if let Some(words) = &index.own_bwd {
+        out.extend_from_slice(raw_bytes(words));
+    }
     out
 }
 
@@ -917,13 +1206,24 @@ fn copy_typed<T: Copy + Default>(bytes: &[u8]) -> Vec<T> {
     values
 }
 
+/// One parsed file header: the position count, alphabet, symbol width, the
+/// stitch window-length bound, and whether an ownership bitmap follows the
+/// arrays.
+struct FileHeader {
+    n: usize,
+    alphabet: u32,
+    width: u8,
+    max_depth: u32,
+    has_own: bool,
+}
+
 /// Parse and verify one file's header, returning its section cursor and the
-/// (position count, alphabet, symbol width) triple.
+/// parsed header.
 fn open_sections<'a>(
     bytes: &'a [u8],
     rel: &'a str,
     expected: u64,
-) -> Result<(Sections<'a>, usize, u32, u8), EventStoreError> {
+) -> Result<(Sections<'a>, FileHeader), EventStoreError> {
     let corrupt = |detail: String| EventStoreError::Corrupt {
         file: rel.to_string(),
         detail,
@@ -954,7 +1254,21 @@ fn open_sections<'a>(
     .map_err(|_| corrupt("paths index position count overflows usize".to_string()))?;
     let alphabet = u32::from_le_bytes(sections.take(4)?.try_into().expect("4 bytes"));
     let width = sections.take(1)?[0];
-    Ok((sections, n, alphabet, width))
+    let max_depth = u32::from_le_bytes(sections.take(4)?.try_into().expect("4 bytes"));
+    let own_flag = sections.take(1)?[0];
+    if own_flag > 1 {
+        return Err(corrupt(format!("paths index ownership flag {own_flag}")));
+    }
+    Ok((
+        sections,
+        FileHeader {
+            n,
+            alphabet,
+            width,
+            max_depth,
+            has_own: own_flag == 1,
+        },
+    ))
 }
 
 /// Decode the two index files, verifying magic, version, and fingerprint on
@@ -970,13 +1284,19 @@ fn decode(
         file: rel.to_string(),
         detail,
     };
-    let (mut sections, n, alphabet, width) = open_sections(fwd_bytes, rel, expected)?;
-    let (mut sections_b, n_b, alphabet_b, width_b) = open_sections(bwd_bytes, rel, expected)?;
-    if n != n_b || alphabet != alphabet_b || width != width_b {
+    let (mut sections, header) = open_sections(fwd_bytes, rel, expected)?;
+    let (mut sections_b, header_b) = open_sections(bwd_bytes, rel, expected)?;
+    if header.n != header_b.n
+        || header.alphabet != header_b.alphabet
+        || header.width != header_b.width
+        || header.max_depth != header_b.max_depth
+        || header.has_own != header_b.has_own
+    {
         return Err(corrupt(
             "paths index halves disagree on their header".to_string(),
         ));
     }
+    let (n, alphabet, width) = (header.n, header.alphabet, header.width);
     // Every section's bytes are sliced up front, then all nine copy into
     // their typed vectors on concurrent threads - the copies dominate a cold
     // load, and they are independent.
@@ -985,10 +1305,20 @@ fn decode(
     let lcp_fwd_bytes = sections.take(n * 4)?;
     let avail_fwd_bytes = sections.take(n * 4)?;
     let ts_fwd_bytes = sections.take(n * 8)?;
+    let own_fwd_bytes = if header.has_own {
+        Some(sections.take(n.div_ceil(64) * 8)?)
+    } else {
+        None
+    };
     let sa_bwd_bytes = sections_b.take(n * 4)?;
     let lcp_bwd_bytes = sections_b.take(n * 4)?;
     let avail_bwd_bytes = sections_b.take(n * 4)?;
     let ts_bwd_bytes = sections_b.take(n * 8)?;
+    let own_bwd_bytes = if header.has_own {
+        Some(sections_b.take(n.div_ceil(64) * 8)?)
+    } else {
+        None
+    };
     let (text, sa_fwd, lcp_fwd, avail_fwd, ts_fwd, sa_bwd, lcp_bwd, avail_bwd, ts_bwd) =
         std::thread::scope(|scope| {
             let text = scope.spawn(move || match width {
@@ -1030,6 +1360,9 @@ fn decode(
         avail_bwd,
         ts_bwd,
         buckets,
+        own_fwd: own_fwd_bytes.map(copy_typed::<u64>),
+        own_bwd: own_bwd_bytes.map(copy_typed::<u64>),
+        max_depth: header.max_depth,
     })
 }
 
@@ -1067,15 +1400,20 @@ pub(crate) fn run_from_index(
     anchor: Option<(u64, bool)>,
     cfg: &fq_common::events::EventsConfig,
 ) -> Result<Option<PathsResult>, EventError> {
+    if spec.depth > fq_common::events::DEFAULT_MAX_PATHS_DEPTH {
+        // Stitch segments only carry ownership and context for windows up to
+        // the bound, so the index cannot answer deeper sweeps; the scan does.
+        return Ok(None);
+    }
     let Some(held) = load_segments(io, dataset, cfg)? else {
         return Ok(None);
     };
-    let mut indexes: Vec<&PathsSa> = Vec::with_capacity(held.len());
-    for item in &held {
+    let mut indexes: Vec<(&PathsSa, bool)> = Vec::with_capacity(held.len());
+    for (item, negative) in &held {
         let CachedItem::PathsSa(ref index) = **item else {
             unreachable!("paths index cache slot holds a paths index");
         };
-        indexes.push(index);
+        indexes.push((index, *negative));
     }
     Ok(Some(answer_segments(
         &indexes,
@@ -1084,6 +1422,9 @@ pub(crate) fn run_from_index(
         anchor,
     )))
 }
+
+/// One loaded segment held out of the cache, with its manifest sign.
+type HeldSegment = (std::sync::Arc<CachedItem>, bool);
 
 /// Load every segment the manifest names, or `None` when the dataset has no
 /// current index at all.
@@ -1095,7 +1436,7 @@ fn load_segments(
     io: &StoreIo,
     dataset: &Dataset,
     cfg: &fq_common::events::EventsConfig,
-) -> Result<Option<Vec<std::sync::Arc<CachedItem>>>, EventError> {
+) -> Result<Option<Vec<HeldSegment>>, EventError> {
     let manifest_path = manifest_rel(dataset);
     if !io.exists(&manifest_path)? {
         return Ok(None);
@@ -1106,7 +1447,7 @@ fn load_segments(
     for segment in &manifest.segments {
         let rel = fwd_rel(dataset, segment.id);
         let rel_b = bwd_rel(dataset, segment.id);
-        held.push(cached_paths_sa(io, &rel, cfg.cache_bytes, || {
+        let item = cached_paths_sa(io, &rel, cfg.cache_bytes, || {
             // Both halves read concurrently; each is roughly half the bytes.
             let (fwd_bytes, bwd_bytes) = std::thread::scope(|scope| {
                 let bwd = scope.spawn(|| io.get(&rel_b));
@@ -1115,13 +1456,14 @@ fn load_segments(
                     bwd.join().expect("backward read thread panicked"),
                 )
             });
-            Ok(CachedItem::PathsSa(decode(
+            Ok(CachedItem::PathsSa(Box::new(decode(
                 &fwd_bytes?,
                 &bwd_bytes?,
                 &rel,
                 SEGMENT_STAMP,
-            )?))
-        })?);
+            )?)))
+        })?;
+        held.push((item, segment.negative));
     }
     Ok(Some(held))
 }
@@ -1247,7 +1589,7 @@ fn sweep_chunk(sweep: &Sweep<'_>, lo: usize, hi: usize) -> ChunkSweep {
         } else {
             (avail >= sweep.depth, sweep.depth)
         };
-        if !valid {
+        if !valid || !sweep.index.owns(sweep.dir, at) {
             continue;
         }
         let anchor_ts = ts_sa[at];
@@ -1444,32 +1786,36 @@ fn merged_order(ranks: &[u32], a: &(Vec<u64>, u64), b: &(Vec<u64>, u64)) -> Orde
     })
 }
 
-/// Answer one spec from several index segments, each covering a disjoint set
-/// of WHOLE actor streams.
+/// Answer one spec from several SIGNED index segments.
 ///
-/// Whole streams are what makes this sound: no window spans two segments, so
-/// a window's global count is the sum of its per-segment counts and the
-/// in-range totals add. Groups merge BY CONTENT, not by adjacency - the same
-/// window is a separate run of suffixes in every segment that holds it, and
-/// nothing puts those runs next to each other.
+/// Every window instance of the dataset is owned by exactly one positive
+/// segment net of retractions: base segments own everything they hold, a
+/// refresh's addition owns the window forms its envelope changed or created,
+/// and its retraction re-counts the stale forms older segments still hold so
+/// subtracting it cancels them. Counts and in-range totals therefore sum by
+/// window CONTENT across segments, signed. A net-negative window or total is
+/// arithmetically impossible when the invariant holds, so it stops the query
+/// rather than shipping an answer built on a broken index.
 pub(crate) fn answer_segments(
-    indexes: &[&PathsSa],
+    indexes: &[(&PathsSa, bool)],
     names: &[String],
     spec: &PathsSpec,
     anchor: Option<(u64, bool)>,
 ) -> PathsResult {
-    if let [only] = indexes {
-        return answer(only, names, spec, anchor);
+    if let [(only, false)] = indexes {
+        if only.own_fwd.is_none() {
+            return answer(only, names, spec, anchor);
+        }
     }
     let (from, to) = range_bounds(spec.range);
     let mut alphabet = 0;
-    for index in indexes {
+    for (index, _) in indexes {
         alphabet = alphabet.max(index.alphabet);
     }
     let ranks = name_ranks(names, alphabet);
-    let mut merged: std::collections::HashMap<Vec<u64>, u64> = std::collections::HashMap::new();
-    let mut total = 0u64;
-    for index in indexes {
+    let mut merged: std::collections::HashMap<Vec<u64>, i64> = std::collections::HashMap::new();
+    let mut total = 0i64;
+    for (index, negative) in indexes {
         let Some((dir, truncate, lo, hi)) = sweep_target(index, anchor) else {
             continue;
         };
@@ -1486,17 +1832,33 @@ pub(crate) fn answer_segments(
             top: usize::MAX,
         };
         let (finals, segment_total) = sweep_interval(&sweep, lo, hi);
-        total += segment_total;
+        let sign: i64 = if *negative { -1 } else { 1 };
+        total += sign * i64::try_from(segment_total).expect("window total fits i64");
         for group in finals {
             if group.count == 0 {
                 continue;
             }
-            *merged.entry(index.window_codes(dir, &group)).or_insert(0) += group.count;
+            let count = sign * i64::try_from(group.count).expect("window count fits i64");
+            *merged.entry(index.window_codes(dir, &group)).or_insert(0) += count;
         }
     }
-    let mut ordered: Vec<(Vec<u64>, u64)> = merged.into_iter().collect();
+    assert!(
+        total >= 0,
+        "paths index invariant broken: net in-range window total {total} is negative"
+    );
+    let mut ordered: Vec<(Vec<u64>, u64)> = Vec::with_capacity(merged.len());
+    for (codes, count) in merged {
+        assert!(
+            count >= 0,
+            "paths index invariant broken: window {codes:?} has net count {count}"
+        );
+        if count > 0 {
+            ordered.push((codes, u64::try_from(count).expect("checked non-negative")));
+        }
+    }
     ordered.sort_unstable_by(|a, b| merged_order(&ranks, a, b));
     ordered.truncate(spec.top as usize);
+    let total = u64::try_from(total).expect("checked non-negative");
     let rows = ordered
         .into_iter()
         .enumerate()
@@ -1621,12 +1983,12 @@ mod tests {
     /// Pack synthetic streams into shard form (three shards, round-robin).
     fn shard_streams(streams: &[(Vec<u32>, Vec<i64>)]) -> Vec<ShardStream> {
         let mut shards: Vec<ShardStream> = (0..3)
-            .map(|shard| ShardStream {
-                shard: u32::try_from(shard).expect("shard fits u32"),
+            .map(|_| ShardStream {
                 codes: Vec::new(),
                 ts: Vec::new(),
                 bounds: vec![0],
                 actors: Vec::new(),
+                slices: None,
             })
             .collect();
         for (at, (codes, ts)) in streams.iter().enumerate() {
@@ -1765,7 +2127,7 @@ mod tests {
         for seed in [7u64, 99, 1234] {
             let streams = synth_streams(40, u64::from(alphabet), seed);
             let shards = shard_streams(&streams);
-            let built = assemble(&shards, alphabet).expect("assemble");
+            let built = assemble(&shards, alphabet, 0).expect("assemble");
             let fwd = encode_fwd(&built, 42);
             let bwd = encode_bwd(&built, 42);
             let index = decode(&fwd, &bwd, "test.psax", 42).expect("decode");
@@ -1816,7 +2178,7 @@ mod tests {
         }
         groups
             .iter()
-            .map(|group| assemble(&shard_streams(group), alphabet).expect("assemble"))
+            .map(|group| assemble(&shard_streams(group), alphabet, 0).expect("assemble"))
             .collect()
     }
 
@@ -1852,7 +2214,8 @@ mod tests {
                         for anchor in &anchors {
                             for top in [1u32, 3, 10, 1000] {
                                 let spec = spec_of(depth, top, range);
-                                let refs: Vec<&PathsSa> = indexes.iter().collect();
+                                let refs: Vec<(&PathsSa, bool)> =
+                                    indexes.iter().map(|index| (index, false)).collect();
                                 let got = answer_segments(&refs, &names, &spec, *anchor);
                                 let want = brute(&streams, &names, &spec, *anchor);
                                 let what = format!(
@@ -1891,13 +2254,18 @@ mod tests {
                 (out_codes, out_ts)
             })
             .collect();
-        let wide = assemble(&shard_streams(&streams), 3).expect("assemble wide");
-        let narrow_index = assemble(&shard_streams(&narrow), 2).expect("assemble narrow");
+        let wide = assemble(&shard_streams(&streams), 3, 0).expect("assemble wide");
+        let narrow_index = assemble(&shard_streams(&narrow), 2, 0).expect("assemble narrow");
         let spec = spec_of(2, 10, TimeRange::default());
-        let both = answer_segments(&[&wide, &narrow_index], &names, &spec, Some((2, true)));
+        let both = answer_segments(
+            &[(&wide, false), (&narrow_index, false)],
+            &names,
+            &spec,
+            Some((2, true)),
+        );
         let alone = {
-            let wide_again = assemble(&shard_streams(&streams), 3).expect("assemble wide");
-            answer_segments(&[&wide_again], &names, &spec, Some((2, true)))
+            let wide_again = assemble(&shard_streams(&streams), 3, 0).expect("assemble wide");
+            answer_segments(&[(&wide_again, false)], &names, &spec, Some((2, true)))
         };
         assert_eq!(
             both.rows.len(),
@@ -1916,7 +2284,7 @@ mod tests {
         let names = vec!["a".to_string(), "b".to_string()];
         let streams = synth_streams(5, 2, 3);
         let shards = shard_streams(&streams);
-        let index = assemble(&shards, 2).expect("assemble");
+        let index = assemble(&shards, 2, 0).expect("assemble");
         let spec = spec_of(3, 10, TimeRange::default());
         let result = answer(&index, &names, &spec, Some((u64::MAX, true)));
         assert!(result.rows.is_empty());
@@ -1925,10 +2293,172 @@ mod tests {
     /// A dataset with no events yields an empty index and empty results.
     #[test]
     fn empty_dataset_is_empty() {
-        let index = assemble(&[], 4).expect("assemble empty");
+        let index = assemble(&[], 4, 0).expect("assemble empty");
         let names = vec!["a".to_string(); 4];
         let spec = spec_of(2, 10, TimeRange::default());
         let result = answer(&index, &names, &spec, None);
         assert!(result.rows.is_empty());
+    }
+
+    /// Merge delta events into a base event list by timestamp, a delta event
+    /// landing AFTER base events with the same timestamp (its arrival
+    /// tiebreak is later).
+    fn merge_events(base: &[(u32, i64)], delta: &[(u32, i64)]) -> Vec<(u32, i64)> {
+        let mut merged = Vec::with_capacity(base.len() + delta.len());
+        let mut from_delta = delta.iter().peekable();
+        for event in base {
+            while let Some(pending) = from_delta.peek() {
+                if pending.1 < event.1 {
+                    merged.push(**pending);
+                    from_delta.next();
+                } else {
+                    break;
+                }
+            }
+            merged.push(*event);
+        }
+        for pending in from_delta {
+            merged.push(*pending);
+        }
+        merged
+    }
+
+    /// Synthesize one refresh round's delta for an actor: appended events,
+    /// sometimes a late mid-stream insertion, sometimes a leading duplicate
+    /// of the actor's last event (exercising the boundary collapse).
+    fn synth_delta(rng: &mut Lcg, base: &[(u32, i64)], alphabet: u64) -> Vec<(u32, i64)> {
+        let mut delta: Vec<(u32, i64)> = Vec::new();
+        let last_ts = base.last().map_or(1_000, |event| event.1);
+        if !base.is_empty() && rng.next(4) == 0 {
+            let at = rng.next(base.len() as u64) as usize;
+            let code = u32::try_from(rng.next(alphabet)).expect("code fits");
+            delta.push((code, base[at].1));
+        }
+        let mut clock = last_ts;
+        let appended = 1 + rng.next(6);
+        for step in 0..appended {
+            clock += 1 + i64::try_from(rng.next(30)).expect("step fits");
+            let code = if step == 0 && rng.next(3) == 0 {
+                // Sometimes repeat the last base code, so the append
+                // collapses into the existing run.
+                base.last().map_or(0, |event| event.0)
+            } else {
+                u32::try_from(rng.next(alphabet)).expect("code fits")
+            };
+            delta.push((code, clock));
+        }
+        delta.sort_by_key(|event| event.1);
+        delta
+    }
+
+    /// Grow a dataset over several refresh rounds and answer every variant
+    /// from base + signed pairs, against brute force over the FINAL streams.
+    /// This is the correctness pin of the incremental index: additions own
+    /// the changed window forms, retractions cancel the stale ones, and the
+    /// signed sum must be EXACTLY the single-index answer at every depth up
+    /// to the bound, for every anchor, range, and top.
+    #[test]
+    fn incremental_pairs_match_brute_force() {
+        let names: Vec<String> = ["zeta", "alpha", "mid", "beta", "omega"]
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let alphabet = u32::try_from(names.len()).expect("alphabet fits");
+        for (seed, max_depth) in [(7u64, 4u32), (99, 8), (1234, 8)] {
+            let mut rng = Lcg(seed.wrapping_mul(0x9E37_79B9));
+            let base = synth_streams(30, u64::from(alphabet), seed);
+            let mut current: Vec<Vec<(u32, i64)>> = base
+                .iter()
+                .map(|(codes, ts)| codes.iter().copied().zip(ts.iter().copied()).collect())
+                .collect();
+            let mut indexes: Vec<(PathsSa, bool)> = vec![(
+                assemble(&shard_streams(&base), alphabet, 0).expect("base"),
+                false,
+            )];
+            for round in 0..2 {
+                let mut addition = empty_pair_stream();
+                let mut retraction = empty_pair_stream();
+                // A couple of brand-new actors join every round.
+                for _ in 0..2 {
+                    current.push(Vec::new());
+                }
+                for (actor, events) in current.iter_mut().enumerate() {
+                    let touched = rng.next(3) != 0;
+                    if !touched {
+                        continue;
+                    }
+                    let delta = synth_delta(&mut rng, events, u64::from(alphabet));
+                    let merged_events = merge_events(events, &delta);
+                    let old = stitch::collapse(events);
+                    let merged = stitch::collapse(&merged_events);
+                    let envelope = stitch::envelope(&old, &merged);
+                    let merged_len = u32::try_from(merged.codes.len()).expect("fits");
+                    let old_len = u32::try_from(old.codes.len()).expect("fits");
+                    let local = actor as u64;
+                    if let Some(slice) = stitch::addition_stitch(merged_len, envelope, max_depth) {
+                        push_slice(&mut addition, local, &merged, slice);
+                    }
+                    if let Some(slice) = stitch::retraction_stitch(old_len, envelope, max_depth) {
+                        push_slice(&mut retraction, local, &old, slice);
+                    }
+                    *events = merged_events;
+                }
+                if !addition.actors.is_empty() {
+                    indexes.push((
+                        assemble(&[addition], alphabet, max_depth).expect("addition"),
+                        false,
+                    ));
+                }
+                if !retraction.actors.is_empty() {
+                    indexes.push((
+                        assemble(&[retraction], alphabet, max_depth).expect("retraction"),
+                        true,
+                    ));
+                }
+                let finals: Vec<(Vec<u32>, Vec<i64>)> = current
+                    .iter()
+                    .map(|events| {
+                        let collapsed = stitch::collapse(events);
+                        (collapsed.codes, collapsed.ts)
+                    })
+                    .collect();
+                let refs: Vec<(&PathsSa, bool)> = indexes
+                    .iter()
+                    .map(|(index, negative)| (index, *negative))
+                    .collect();
+                let ranges = [
+                    TimeRange::default(),
+                    TimeRange {
+                        from: Some(1_100),
+                        to: Some(1_400),
+                    },
+                    TimeRange {
+                        from: Some(2_000),
+                        to: None,
+                    },
+                ];
+                let mut anchors: Vec<Option<(u64, bool)>> = vec![None];
+                for code in 0..u64::from(alphabet) {
+                    anchors.push(Some((code, true)));
+                    anchors.push(Some((code, false)));
+                }
+                for depth in 2..=max_depth {
+                    for range in ranges {
+                        for anchor in &anchors {
+                            for top in [1u32, 3, 10, 1000] {
+                                let spec = spec_of(depth, top, range);
+                                let got = answer_segments(&refs, &names, &spec, *anchor);
+                                let want = brute(&finals, &names, &spec, *anchor);
+                                let what = format!(
+                                    "seed {seed} max_depth {max_depth} round {round} \
+                                     depth {depth} top {top} range {range:?} anchor {anchor:?}"
+                                );
+                                assert_same(&got, &want, &what);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

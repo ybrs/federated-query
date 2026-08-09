@@ -20,6 +20,7 @@ pub mod model;
 mod paths_sa;
 pub mod registry;
 mod sais;
+mod stitch;
 pub mod store;
 
 use std::collections::HashMap;
@@ -342,20 +343,29 @@ impl EventStore {
 
     /// Extend the paths index for a refresh, falling back to a full rebuild.
     ///
-    /// Appending one segment over the touched actors is the cheap path, and it
-    /// is only sound when no segment already covers one of them: a segment
-    /// answers for whole streams, so an actor held by two segments would have
-    /// both their counts added. `append_touched` makes that judgement against
-    /// the manifest and returns None when it cannot, which is when this
-    /// rebuilds.
+    /// The cheap path appends one segment PAIR - an addition owning the
+    /// window forms the delta changed and a retraction cancelling the stale
+    /// forms older segments still count - so its cost tracks the delta plus
+    /// the touched actors' changed envelopes, never their whole histories.
+    /// `append_pair` returns None only when there is no manifest to extend
+    /// (never built, or an older index format), which is when this rebuilds.
     fn extend_paths_index(
         &self,
         name: &str,
         cfg: &EventsConfig,
         touched: &std::collections::HashSet<(u32, u64)>,
+        delta_files: &[(u32, String)],
     ) -> Result<String, EventError> {
         let dataset = self.dataset(name)?;
-        if let Some(report) = paths_sa::append_touched(&self.io, &dataset, cfg, touched)? {
+        let report = paths_sa::append_pair(
+            &self.io,
+            &dataset,
+            cfg,
+            touched,
+            delta_files,
+            fq_common::events::DEFAULT_MAX_PATHS_DEPTH,
+        )?;
+        if let Some(report) = report {
             return Ok(report);
         }
         paths_sa::rebuild(&self.io, &dataset, cfg)
@@ -620,7 +630,7 @@ impl EventStore {
         // and rebuild the whole index when it is not - see extend_paths_index.
         // On a failure of either, the append itself stays published and PATHS
         // scans (correct, slower); REBUILD EVENT DATASET restores the index.
-        self.extend_paths_index(name, cfg, &touched)?;
+        self.extend_paths_index(name, cfg, &touched, &written)?;
         Ok(outcome.events)
     }
 
