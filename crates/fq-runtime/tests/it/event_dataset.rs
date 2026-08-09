@@ -424,3 +424,180 @@ fn table_function_filter_narrows_the_analysis() {
         .expect("sum is Int64");
     assert_eq!(total.value(0), 3);
 }
+
+/// Count the paths index files of a dataset, by kind.
+fn index_files(dir: &Path, prefix: &str) -> usize {
+    let mut found = 0;
+    for entry in walk(dir) {
+        if entry
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(prefix))
+        {
+            found += 1;
+        }
+    }
+    found
+}
+
+/// Every file under a directory tree.
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(walk(&path));
+        } else {
+            found.push(path);
+        }
+    }
+    found
+}
+
+/// A refresh whose delta touches only actors the index has never seen ADDS a
+/// segment instead of rebuilding: the existing segment file is left alone, and
+/// PATHS answers across both.
+///
+/// This is the whole point of a segmented index, so the test asserts the
+/// mechanism (a second segment file appeared, the first one's bytes did not
+/// change) and not just that the answer is right - a full rebuild would give
+/// the same answer while doing all the work.
+#[test]
+fn a_refresh_over_new_actors_appends_a_segment_instead_of_rebuilding() {
+    let dir = sandbox("segappend");
+    let file = dir.join("clicks.parquet");
+    write_events(
+        &file,
+        vec![1_000_000, 2_000_000],
+        vec!["open", "close"],
+        vec!["u1", "u1"],
+    );
+    let runtime = Runtime::from_config(&event_config(&dir, "evta", &file)).expect("from_config");
+    runtime
+        .execute(
+            "CREATE EVENT DATASET segds FROM evta.main.evta \
+             ACTOR user_id TIME created_at EVENT event \
+             WITH (refresh_key = 'created_at')",
+        )
+        .expect("create event dataset");
+
+    assert_eq!(index_files(&dir, "paths_f_"), 1, "one segment after create");
+    assert_eq!(index_files(&dir, "paths_m_"), 1, "exactly one manifest");
+    let first_segment = walk(&dir)
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("paths_f_"))
+        })
+        .expect("a segment file");
+    let before = std::fs::read(&first_segment).expect("read segment");
+
+    // The delta belongs entirely to u2, an actor no segment covers.
+    write_events(
+        &file,
+        vec![1_000_000, 2_000_000, 3_000_000, 4_000_000],
+        vec!["open", "close", "signup", "purchase"],
+        vec!["u1", "u1", "u2", "u2"],
+    );
+    let (_, batches) = runtime
+        .execute("REFRESH EVENT DATASET segds")
+        .expect("refresh event dataset");
+    assert!(
+        status_text(&batches).contains("2 events appended"),
+        "unexpected status: {}",
+        status_text(&batches)
+    );
+
+    assert_eq!(
+        index_files(&dir, "paths_f_"),
+        2,
+        "the refresh should have ADDED a segment, not rebuilt one"
+    );
+    assert_eq!(
+        index_files(&dir, "paths_m_"),
+        1,
+        "still exactly one manifest"
+    );
+    let after = std::fs::read(&first_segment).expect("read segment again");
+    assert_eq!(before, after, "the existing segment was rewritten");
+
+    // Both actors' windows come back, from two different segments.
+    let (_, batches) = runtime
+        .execute("PATHS ON segds DEPTH 2 TOP 5")
+        .expect("paths");
+    let events = batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("event names are Utf8");
+    let steps: Vec<&str> = (0..events.len()).map(|row| events.value(row)).collect();
+    assert_eq!(steps, vec!["open", "close", "signup", "purchase"]);
+}
+
+/// A refresh whose delta touches an actor an existing segment already covers
+/// REBUILDS instead of appending. Two segments holding parts of one stream
+/// would each count their part, so the answer would be wrong; the index is
+/// rebuilt whole and the answer stays right.
+#[test]
+fn a_refresh_over_a_returning_actor_rebuilds_the_index() {
+    let dir = sandbox("segrebuild");
+    let file = dir.join("clicks.parquet");
+    write_events(
+        &file,
+        vec![1_000_000, 2_000_000],
+        vec!["open", "close"],
+        vec!["u1", "u1"],
+    );
+    let runtime = Runtime::from_config(&event_config(&dir, "evta", &file)).expect("from_config");
+    runtime
+        .execute(
+            "CREATE EVENT DATASET retds FROM evta.main.evta \
+             ACTOR user_id TIME created_at EVENT event \
+             WITH (refresh_key = 'created_at')",
+        )
+        .expect("create event dataset");
+    assert_eq!(index_files(&dir, "paths_f_"), 1);
+
+    // u1 comes back: an actor the one existing segment already covers.
+    write_events(
+        &file,
+        vec![1_000_000, 2_000_000, 3_000_000],
+        vec!["open", "close", "purchase"],
+        vec!["u1", "u1", "u1"],
+    );
+    runtime
+        .execute("REFRESH EVENT DATASET retds")
+        .expect("refresh event dataset");
+
+    assert_eq!(
+        index_files(&dir, "paths_f_"),
+        1,
+        "a returning actor must rebuild, leaving one segment"
+    );
+    assert_eq!(index_files(&dir, "paths_m_"), 1, "exactly one manifest");
+
+    // u1's stream is one whole thing, counted once: three events, so the two
+    // depth-2 windows open->close and close->purchase, each occurring once.
+    let (_, batches) = runtime
+        .execute("PATHS ON retds DEPTH 2 TOP 5")
+        .expect("paths");
+    let events = batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("event names are Utf8");
+    let steps: Vec<&str> = (0..events.len()).map(|row| events.value(row)).collect();
+    assert_eq!(steps, vec!["close", "purchase", "open", "close"]);
+    let counts = batches[0]
+        .column(3)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .expect("occurrences are i64");
+    for row in 0..counts.len() {
+        assert_eq!(counts.value(row), 1, "a window must not be double counted");
+    }
+}

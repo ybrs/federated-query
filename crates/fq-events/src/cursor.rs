@@ -186,9 +186,27 @@ impl<'a> ShardScan<'a> {
         Ok(Self { files: scans })
     }
 
+    /// The shard these files belong to, read from their header. Every file of
+    /// a shard scan carries the same shard number, so the first one answers.
+    pub fn shard(&self) -> u32 {
+        self.files
+            .first()
+            .map_or(0, |scan| scan.seg.meta.header.shard)
+    }
+
     /// Every actor's runs, in ascending local-id order, merged across the
     /// shard's generation files.
     pub fn actor_runs(&self) -> Vec<ActorRun> {
+        self.actor_runs_with_locals().1
+    }
+
+    /// The same runs, paired with each actor's LOCAL ID in the same order.
+    ///
+    /// The local id is a shard-stable actor identity - a returning actor keeps
+    /// the id it was first given - so `(shard, local)` names an actor across
+    /// refreshes. The paths index needs that to record which actors a segment
+    /// covers; the scan paths do not, and call `actor_runs`.
+    pub fn actor_runs_with_locals(&self) -> (Vec<u64>, Vec<ActorRun>) {
         if self.files.len() == 1 {
             let dir = self.files[0].directory();
             let mut runs = Vec::with_capacity(dir.locals.len());
@@ -200,16 +218,17 @@ impl<'a> ShardScan<'a> {
                     end,
                 });
             }
-            return runs;
+            return (dir.locals.clone(), runs);
         }
         self.merged_actor_runs()
     }
 
     /// The multi-generation merge of the actor directories.
-    fn merged_actor_runs(&self) -> Vec<ActorRun> {
+    fn merged_actor_runs(&self) -> (Vec<u64>, Vec<ActorRun>) {
         let dirs: Vec<&ActorDirectory> = self.files.iter().map(FileScan::directory).collect();
         let mut positions = vec![0usize; dirs.len()];
         let mut runs = Vec::new();
+        let mut locals = Vec::new();
         loop {
             let mut next_local: Option<u64> = None;
             for (dir, position) in dirs.iter().zip(&positions) {
@@ -218,8 +237,9 @@ impl<'a> ShardScan<'a> {
                 }
             }
             let Some(local) = next_local else {
-                return runs;
+                return (locals, runs);
             };
+            locals.push(local);
             let mut pieces: Vec<(usize, u64, u64)> = Vec::new();
             for (file, dir) in dirs.iter().enumerate() {
                 let position = &mut positions[file];

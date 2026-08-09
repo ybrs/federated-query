@@ -46,6 +46,14 @@ const MAGIC: &[u8; 4] = b"FQPS";
 /// The serialization version this build writes and reads.
 const VERSION: u8 = 4;
 
+/// The fingerprint stamped into a SEGMENT file.
+///
+/// A segment survives refreshes untouched, so it cannot carry the dataset's
+/// generation fingerprint - that changes under it. What binds segments to a
+/// dataset state is the manifest, which does carry the fingerprint and names
+/// exactly which segment ids compose the index.
+const SEGMENT_STAMP: u64 = 0;
+
 /// The concatenated collapsed text: symbol 0 separates actor streams, and an
 /// event with code `c` is the symbol `c + 1`. Byte symbols serve every
 /// dictionary of at most 254 events; anything larger widens to i32.
@@ -201,24 +209,63 @@ fn fingerprint(dataset: &Dataset) -> u64 {
     fnv1a64(names.as_bytes())
 }
 
-/// The forward index file's relative path for the current generation set
-/// (text and forward arrays).
-fn fwd_rel(dataset: &Dataset) -> String {
+/// A segment's forward index file (text and forward arrays).
+///
+/// The name carries the SEGMENT id, not the dataset fingerprint: a segment is
+/// immutable and survives a refresh untouched, and it is the manifest that
+/// binds a set of segments to one dataset state. Naming segments by
+/// fingerprint would mean rewriting every file whenever a generation is
+/// appended, which is the cost this whole design exists to avoid.
+fn fwd_rel(dataset: &Dataset, segment: u32) -> String {
+    format!("{}/paths_f_{segment:08}.psax", dataset.record.location)
+}
+
+/// A segment's backward index file (backward arrays only); split from the
+/// forward file so the two encode, write, and load on concurrent threads.
+fn bwd_rel(dataset: &Dataset, segment: u32) -> String {
+    format!("{}/paths_b_{segment:08}.psax", dataset.record.location)
+}
+
+/// The manifest's relative path: which segments compose the index, and which
+/// actors each one covers.
+///
+/// It is written LAST, after every segment file, and read FIRST. That order is
+/// what makes a partial write safe: without a manifest there is no index, so a
+/// crash mid-write leaves a dataset that scans until the next rebuild rather
+/// than one whose index silently covers only some of its actors.
+fn manifest_rel(dataset: &Dataset) -> String {
     format!(
-        "{}/paths_f_{:016x}.psax",
+        "{}/paths_m_{:016x}.psax",
         dataset.record.location,
         fingerprint(dataset)
     )
 }
 
-/// The backward index file's relative path (backward arrays only); split from
-/// the forward file so the two encode, write, and load on concurrent threads.
-fn bwd_rel(dataset: &Dataset) -> String {
-    format!(
-        "{}/paths_b_{:016x}.psax",
-        dataset.record.location,
-        fingerprint(dataset)
-    )
+/// Which actors one index segment covers, per shard.
+///
+/// A segment holds WHOLE actor streams - that is what lets segment counts be
+/// summed - so this is the segment's identity, not an optimization: it says
+/// which actors are answered from here, and therefore which actors a later
+/// segment must NOT also answer for.
+struct SegmentCoverage {
+    shard: u32,
+    locals: Vec<u64>,
+}
+
+/// One segment of the index: its immutable file id and what it covers.
+struct SegmentEntry {
+    id: u32,
+    coverage: Vec<SegmentCoverage>,
+}
+
+/// The index's manifest: the segments composing it, and the next free file id.
+///
+/// The manifest is the only mutable part of the index. A refresh writes a new
+/// segment file and a new manifest naming it alongside the existing ones; the
+/// existing files are never touched.
+struct IndexManifest {
+    next_id: u32,
+    segments: Vec<SegmentEntry>,
 }
 
 /// The files sitting DIRECTLY under the dataset location (not inside a
@@ -248,16 +295,55 @@ fn location_files_with_prefix(
 /// One shard's duplicate-collapsed streams: `codes[bounds[i]..bounds[i + 1]]`
 /// (and the aligned timestamps) is actor i's sequence.
 struct ShardStream {
+    /// The shard these streams came from; with `actors` it names every actor
+    /// the segment built from this stream covers.
+    shard: u32,
     codes: Vec<u32>,
     ts: Vec<i64>,
     bounds: Vec<u32>,
+    /// The local id of each actor, in the order its stream appears - one
+    /// entry per `bounds` interval. A returning actor keeps its local id, so
+    /// `(shard, local)` identifies an actor across refreshes.
+    actors: Vec<u64>,
+}
+
+/// The actors a set of segment files holds, as `(shard, local)` keys.
+///
+/// Used on the newest generation's files to learn which actors a refresh
+/// touched: the sidecar beside them lists only the actors that are NEW, and a
+/// returning actor's stream changing is exactly what makes an old segment's
+/// copy of it stale.
+pub(crate) fn actors_in_files(
+    io: &StoreIo,
+    dataset: &Dataset,
+    cfg: &fq_common::events::EventsConfig,
+    files: &[(u32, String)],
+) -> Result<std::collections::HashSet<(u32, u64)>, EventError> {
+    let mut touched = std::collections::HashSet::new();
+    for (shard, rel) in files {
+        let seg = crate::store::SegFile::open(io, rel, dataset.kinds.clone(), cfg.cache_bytes)?;
+        let directory = seg.directory(io)?;
+        let crate::store::CachedItem::Dir(ref dir) = *directory else {
+            unreachable!("an actor directory slot holds an actor directory");
+        };
+        for local in &dir.locals {
+            touched.insert((*shard, *local));
+        }
+    }
+    Ok(touched)
 }
 
 /// Read every shard's collapsed stream in one sharded dataset pass.
+///
+/// `keep` restricts the pass to a set of actors, which is what builds a
+/// segment over just the actors a refresh touched. Their streams are read in
+/// full, across every generation, because a segment answers only for actors
+/// whose WHOLE stream it holds.
 fn collect_streams(
     io: &StoreIo,
     dataset: &Dataset,
     cfg: &fq_common::events::EventsConfig,
+    keep: Option<&std::collections::HashSet<(u32, u64)>>,
 ) -> Result<Vec<ShardStream>, EventError> {
     let mut streams = Vec::new();
     run_sharded(
@@ -265,10 +351,18 @@ fn collect_streams(
         dataset,
         cfg,
         |scan| {
+            let shard = scan.shard();
             let mut codes: Vec<u32> = Vec::new();
             let mut ts: Vec<i64> = Vec::new();
             let mut bounds: Vec<u32> = vec![0];
-            for run in scan.actor_runs() {
+            let (locals, runs) = scan.actor_runs_with_locals();
+            let mut actors: Vec<u64> = Vec::with_capacity(locals.len());
+            for (local, run) in locals.into_iter().zip(runs) {
+                if let Some(wanted) = keep {
+                    if !wanted.contains(&(shard, local)) {
+                        continue;
+                    }
+                }
                 let start = codes.len();
                 scan.for_each_event(&run, |file, row, code| {
                     if codes.len() == start || u64::from(codes[codes.len() - 1]) != code {
@@ -278,8 +372,15 @@ fn collect_streams(
                     Ok(true)
                 })?;
                 bounds.push(u32::try_from(codes.len()).expect("shard stream fits u32"));
+                actors.push(local);
             }
-            Ok(ShardStream { codes, ts, bounds })
+            Ok(ShardStream {
+                shard: scan.shard(),
+                codes,
+                ts,
+                bounds,
+                actors,
+            })
         },
         |stream| {
             streams.push(stream);
@@ -473,6 +574,63 @@ fn bucket_offsets(text: &Text, alphabet: u32) -> Vec<u32> {
 
 /// Build the paths index over the dataset's current generation set, replacing
 /// any stale index files, and return the DDL status summary.
+/// Add ONE segment covering the actors a refresh touched, leaving every
+/// existing segment file untouched.
+///
+/// Returns `None` when the append cannot be done soundly, and the caller
+/// rebuilds instead. That is the case whenever the delta touched an actor some
+/// segment ALREADY covers: two segments would then hold overlapping parts of
+/// one stream, and their counts would both be added. Detecting that is the
+/// whole safety argument, so it is checked against the manifest rather than
+/// assumed from the shape of the delta.
+pub(crate) fn append_touched(
+    io: &StoreIo,
+    dataset: &Dataset,
+    cfg: &fq_common::events::EventsConfig,
+    touched: &std::collections::HashSet<(u32, u64)>,
+) -> Result<Option<String>, EventError> {
+    let Some((manifest_path, manifest)) = read_stored_manifest(io, dataset)? else {
+        return Ok(None);
+    };
+    for segment in &manifest.segments {
+        for coverage in &segment.coverage {
+            for local in &coverage.locals {
+                if touched.contains(&(coverage.shard, *local)) {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+    let started = std::time::Instant::now();
+    let streams = collect_streams(io, dataset, cfg, Some(touched))?;
+    let collected = started.elapsed().as_secs_f64();
+    let alphabet = u32::try_from(dataset.event_dict.values.len()).expect("dictionary fits u32");
+    let index = assemble(&streams, alphabet)?;
+    let sorted = started.elapsed().as_secs_f64();
+    let positions = index.text.len();
+    let id = manifest.next_id;
+    let written = write_segment(io, dataset, &index, id, SEGMENT_STAMP)?;
+    let mut segments = manifest.segments;
+    segments.push(SegmentEntry {
+        id,
+        coverage: coverage_of(&streams),
+    });
+    let next = IndexManifest {
+        next_id: id + 1,
+        segments,
+    };
+    let stamp = fingerprint(dataset);
+    io.put_verified(&manifest_rel(dataset), encode_manifest(&next, stamp))?;
+    io.delete(&manifest_path)?;
+    let total = started.elapsed().as_secs_f64();
+    Ok(Some(format!(
+        "paths index: +1 segment, {positions} positions, {written} bytes, {total:.3}s \
+         (collect {collected:.3}s, sort {:.3}s, write {:.3}s)",
+        sorted - collected,
+        total - sorted
+    )))
+}
+
 pub(crate) fn rebuild(
     io: &StoreIo,
     dataset: &Dataset,
@@ -482,31 +640,23 @@ pub(crate) fn rebuild(
         io.delete(&stale)?;
     }
     let started = std::time::Instant::now();
-    let streams = collect_streams(io, dataset, cfg)?;
+    let streams = collect_streams(io, dataset, cfg, None)?;
     let collected = started.elapsed().as_secs_f64();
     let alphabet = u32::try_from(dataset.event_dict.values.len()).expect("dictionary fits u32");
     let index = assemble(&streams, alphabet)?;
-    drop(streams);
+    let streams_coverage = streams;
     let sorted = started.elapsed().as_secs_f64();
     let positions = index.text.len();
     let stamp = fingerprint(dataset);
-    // The two files encode and write concurrently; each is roughly half the
-    // index's bytes.
-    let written = std::thread::scope(|scope| {
-        let fwd = scope.spawn(|| {
-            let bytes = encode_fwd(&index, stamp);
-            let len = bytes.len();
-            io.put_verified(&fwd_rel(dataset), bytes).map(|()| len)
-        });
-        let bwd = scope.spawn(|| {
-            let bytes = encode_bwd(&index, stamp);
-            let len = bytes.len();
-            io.put_verified(&bwd_rel(dataset), bytes).map(|()| len)
-        });
-        let fwd_len = fwd.join().expect("forward write thread panicked")?;
-        let bwd_len = bwd.join().expect("backward write thread panicked")?;
-        Ok::<usize, crate::error::EventStoreError>(fwd_len + bwd_len)
-    })?;
+    let coverage = coverage_of(&streams_coverage);
+    let written = write_segment(io, dataset, &index, 0, SEGMENT_STAMP)?;
+    // The manifest goes last: until it exists there is no index, so a crash
+    // between the segment files and here leaves a dataset that scans.
+    let manifest = IndexManifest {
+        next_id: 1,
+        segments: vec![SegmentEntry { id: 0, coverage }],
+    };
+    io.put_verified(&manifest_rel(dataset), encode_manifest(&manifest, stamp))?;
     let total = started.elapsed().as_secs_f64();
     Ok(format!(
         "paths index: {positions} positions, {written} bytes, {total:.3}s \
@@ -519,6 +669,162 @@ pub(crate) fn rebuild(
 // ---------------------------------------------------------------------------
 // Serialization
 // ---------------------------------------------------------------------------
+
+/// Encode and write one segment's two files, returning the bytes written.
+/// The halves encode and write concurrently; each is roughly half the bytes.
+fn write_segment(
+    io: &StoreIo,
+    dataset: &Dataset,
+    index: &PathsSa,
+    segment: u32,
+    stamp: u64,
+) -> Result<usize, EventStoreError> {
+    std::thread::scope(|scope| {
+        let fwd = scope.spawn(|| {
+            let bytes = encode_fwd(index, stamp);
+            let len = bytes.len();
+            io.put_verified(&fwd_rel(dataset, segment), bytes)
+                .map(|()| len)
+        });
+        let bwd = scope.spawn(|| {
+            let bytes = encode_bwd(index, stamp);
+            let len = bytes.len();
+            io.put_verified(&bwd_rel(dataset, segment), bytes)
+                .map(|()| len)
+        });
+        let fwd_len = fwd.join().expect("forward write thread panicked")?;
+        let bwd_len = bwd.join().expect("backward write thread panicked")?;
+        Ok(fwd_len + bwd_len)
+    })
+}
+
+/// Serialize the manifest: magic, version, fingerprint, then per segment its
+/// per-shard actor coverage.
+fn encode_manifest(manifest: &IndexManifest, fingerprint: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(MAGIC);
+    out.push(VERSION);
+    out.extend_from_slice(&fingerprint.to_le_bytes());
+    out.extend_from_slice(&manifest.next_id.to_le_bytes());
+    out.extend_from_slice(&(manifest.segments.len() as u64).to_le_bytes());
+    for segment in &manifest.segments {
+        out.extend_from_slice(&segment.id.to_le_bytes());
+        out.extend_from_slice(&(segment.coverage.len() as u64).to_le_bytes());
+        for coverage in &segment.coverage {
+            out.extend_from_slice(&coverage.shard.to_le_bytes());
+            out.extend_from_slice(&(coverage.locals.len() as u64).to_le_bytes());
+            out.extend_from_slice(raw_bytes(&coverage.locals));
+        }
+    }
+    out
+}
+
+/// Read a manifest back, raising rather than guessing on anything unexpected:
+/// a manifest that cannot be trusted must not produce a partial index.
+fn decode_manifest(
+    bytes: &[u8],
+    rel: &str,
+    expected: u64,
+) -> Result<IndexManifest, EventStoreError> {
+    let corrupt = |detail: String| EventStoreError::Corrupt {
+        file: rel.to_string(),
+        detail,
+    };
+    let mut at = 0usize;
+    let mut take = |count: usize| -> Result<&[u8], EventStoreError> {
+        let end = at + count;
+        if end > bytes.len() {
+            return Err(EventStoreError::Corrupt {
+                file: rel.to_string(),
+                detail: "paths manifest ends early".to_string(),
+            });
+        }
+        let slice = &bytes[at..end];
+        at = end;
+        Ok(slice)
+    };
+    if take(4)? != MAGIC {
+        return Err(corrupt("paths manifest magic".to_string()));
+    }
+    let version = take(1)?[0];
+    if version != VERSION {
+        return Err(corrupt(format!("paths manifest version {version}")));
+    }
+    let stamp = u64::from_le_bytes(take(8)?.try_into().expect("eight bytes"));
+    if stamp != expected {
+        return Err(corrupt("paths manifest fingerprint".to_string()));
+    }
+    let next_id = u32::from_le_bytes(take(4)?.try_into().expect("four bytes"));
+    let count = u64::from_le_bytes(take(8)?.try_into().expect("eight bytes"));
+    let mut segments = Vec::new();
+    for _ in 0..count {
+        let id = u32::from_le_bytes(take(4)?.try_into().expect("four bytes"));
+        let shards = u64::from_le_bytes(take(8)?.try_into().expect("eight bytes"));
+        let mut coverage = Vec::new();
+        for _ in 0..shards {
+            let shard = u32::from_le_bytes(take(4)?.try_into().expect("four bytes"));
+            let actors = u64::from_le_bytes(take(8)?.try_into().expect("eight bytes"));
+            let locals_bytes = take(usize::try_from(actors).expect("actor count fits") * 8)?;
+            coverage.push(SegmentCoverage {
+                shard,
+                locals: copy_typed::<u64>(locals_bytes),
+            });
+        }
+        segments.push(SegmentEntry { id, coverage });
+    }
+    Ok(IndexManifest { next_id, segments })
+}
+
+/// The manifest that is ON DISK, whatever dataset state it was written for,
+/// with the path it was read from.
+///
+/// The query path addresses the manifest by the CURRENT fingerprint, so a
+/// stale one is invisible and the dataset scans. The append path cannot: by
+/// the time it runs the record has already advanced to the new generation, and
+/// the manifest it must extend is the one written for the previous state. More
+/// than one manifest means a previous write was interrupted between publishing
+/// and cleaning up, and appending to either would be a guess - so it raises.
+fn read_stored_manifest(
+    io: &StoreIo,
+    dataset: &Dataset,
+) -> Result<Option<(String, IndexManifest)>, EventError> {
+    let mut found = location_files_with_prefix(io, &dataset.record.location, "paths_m_")?;
+    if found.is_empty() {
+        return Ok(None);
+    }
+    if found.len() > 1 {
+        found.sort();
+        return Err(EventStoreError::Corrupt {
+            file: found.join(", "),
+            detail: "several paths manifests in one dataset location".to_string(),
+        }
+        .into());
+    }
+    let path = found.remove(0);
+    let bytes = io.get(&path)?;
+    if bytes.len() < 13 {
+        return Err(EventStoreError::Corrupt {
+            file: path,
+            detail: "paths manifest ends early".to_string(),
+        }
+        .into());
+    }
+    let stamp = u64::from_le_bytes(bytes[5..13].try_into().expect("eight bytes"));
+    let manifest = decode_manifest(&bytes, &path, stamp)?;
+    Ok(Some((path, manifest)))
+}
+
+/// The coverage of one segment, read off the streams it was built from.
+fn coverage_of(streams: &[ShardStream]) -> Vec<SegmentCoverage> {
+    let mut coverage = Vec::with_capacity(streams.len());
+    for stream in streams {
+        coverage.push(SegmentCoverage {
+            shard: stream.shard,
+            locals: stream.actors.clone(),
+        });
+    }
+    coverage
+}
 
 /// The little-endian byte view of a plain numeric slice.
 fn raw_bytes<T>(values: &[T]) -> &[u8] {
@@ -747,27 +1053,7 @@ pub(crate) fn prewarm(
     dataset: &Dataset,
     cfg: &fq_common::events::EventsConfig,
 ) -> Result<(), EventError> {
-    let rel = fwd_rel(dataset);
-    let rel_b = bwd_rel(dataset);
-    if !io.exists(&rel)? || !io.exists(&rel_b)? {
-        return Ok(());
-    }
-    let expected = fingerprint(dataset);
-    cached_paths_sa(io, &rel, cfg.cache_bytes, || {
-        let (fwd_bytes, bwd_bytes) = std::thread::scope(|scope| {
-            let bwd = scope.spawn(|| io.get(&rel_b));
-            (
-                io.get(&rel),
-                bwd.join().expect("backward read thread panicked"),
-            )
-        });
-        Ok(CachedItem::PathsSa(decode(
-            &fwd_bytes?,
-            &bwd_bytes?,
-            &rel,
-            expected,
-        )?))
-    })?;
+    load_segments(io, dataset, cfg)?;
     Ok(())
 }
 
@@ -781,37 +1067,63 @@ pub(crate) fn run_from_index(
     anchor: Option<(u64, bool)>,
     cfg: &fq_common::events::EventsConfig,
 ) -> Result<Option<PathsResult>, EventError> {
-    let rel = fwd_rel(dataset);
-    let rel_b = bwd_rel(dataset);
-    if !io.exists(&rel)? || !io.exists(&rel_b)? {
+    let Some(held) = load_segments(io, dataset, cfg)? else {
         return Ok(None);
-    }
-    let expected = fingerprint(dataset);
-    let cached = cached_paths_sa(io, &rel, cfg.cache_bytes, || {
-        // Both halves read concurrently; each is roughly half the bytes.
-        let (fwd_bytes, bwd_bytes) = std::thread::scope(|scope| {
-            let bwd = scope.spawn(|| io.get(&rel_b));
-            (
-                io.get(&rel),
-                bwd.join().expect("backward read thread panicked"),
-            )
-        });
-        Ok(CachedItem::PathsSa(decode(
-            &fwd_bytes?,
-            &bwd_bytes?,
-            &rel,
-            expected,
-        )?))
-    })?;
-    let CachedItem::PathsSa(ref index) = *cached else {
-        unreachable!("paths index cache slot holds a paths index");
     };
-    Ok(Some(answer(
-        index,
+    let mut indexes: Vec<&PathsSa> = Vec::with_capacity(held.len());
+    for item in &held {
+        let CachedItem::PathsSa(ref index) = **item else {
+            unreachable!("paths index cache slot holds a paths index");
+        };
+        indexes.push(index);
+    }
+    Ok(Some(answer_segments(
+        &indexes,
         &dataset.event_dict.values,
         spec,
         anchor,
     )))
+}
+
+/// Load every segment the manifest names, or `None` when the dataset has no
+/// current index at all.
+///
+/// A manifest naming a segment whose files are missing RAISES rather than
+/// answering from the segments that happen to be there: a partial index
+/// undercounts, and an undercount looks exactly like a real answer.
+fn load_segments(
+    io: &StoreIo,
+    dataset: &Dataset,
+    cfg: &fq_common::events::EventsConfig,
+) -> Result<Option<Vec<std::sync::Arc<CachedItem>>>, EventError> {
+    let manifest_path = manifest_rel(dataset);
+    if !io.exists(&manifest_path)? {
+        return Ok(None);
+    }
+    let expected = fingerprint(dataset);
+    let manifest = decode_manifest(&io.get(&manifest_path)?, &manifest_path, expected)?;
+    let mut held = Vec::with_capacity(manifest.segments.len());
+    for segment in &manifest.segments {
+        let rel = fwd_rel(dataset, segment.id);
+        let rel_b = bwd_rel(dataset, segment.id);
+        held.push(cached_paths_sa(io, &rel, cfg.cache_bytes, || {
+            // Both halves read concurrently; each is roughly half the bytes.
+            let (fwd_bytes, bwd_bytes) = std::thread::scope(|scope| {
+                let bwd = scope.spawn(|| io.get(&rel_b));
+                (
+                    io.get(&rel),
+                    bwd.join().expect("backward read thread panicked"),
+                )
+            });
+            Ok(CachedItem::PathsSa(decode(
+                &fwd_bytes?,
+                &bwd_bytes?,
+                &rel,
+                SEGMENT_STAMP,
+            )?))
+        })?);
+    }
+    Ok(Some(held))
 }
 
 /// One distinct window met during a sweep: its representative suffix-array
@@ -868,6 +1180,14 @@ impl<'a, 'b> TopSet<'a, 'b> {
 
     /// Offer one closed group.
     fn offer(&mut self, group: Group) {
+        // A segmented sweep keeps every distinct window it meets. Pruning to
+        // `top` inside one segment would be wrong there: a window outside
+        // every segment's best `top` can still lead once the segments are
+        // summed, and its count in a segment that dropped it is unrecoverable.
+        if self.sweep.top == usize::MAX {
+            self.groups.push(group);
+            return;
+        }
         let order = |a: &Group, b: &Group| {
             self.sweep
                 .index
@@ -1071,6 +1391,132 @@ fn name_ranks(names: &[String], alphabet: u32) -> Vec<u32> {
     ranks
 }
 
+/// The array, direction and interval one variant sweeps in one segment, or
+/// `None` when the segment cannot hold the anchor at all - an event name it
+/// never saw, which is normal for a segment built before that name appeared.
+fn sweep_target(
+    index: &PathsSa,
+    anchor: Option<(u64, bool)>,
+) -> Option<(Direction, bool, usize, usize)> {
+    match anchor {
+        None => Some((
+            Direction::Forward,
+            false,
+            index.buckets[1] as usize,
+            index.text.len(),
+        )),
+        Some((code, forward)) => {
+            if code >= u64::from(index.alphabet) {
+                return None;
+            }
+            let symbol = usize::try_from(code + 1).expect("symbol fits usize");
+            let dir = if forward {
+                Direction::Forward
+            } else {
+                Direction::Backward
+            };
+            Some((
+                dir,
+                true,
+                index.buckets[symbol] as usize,
+                index.buckets[symbol + 1] as usize,
+            ))
+        }
+    }
+}
+
+/// Selection order over merged windows: count descending, then elementwise
+/// event-name rank ascending, then the shorter window first. The same order
+/// `selection_order` imposes on one segment's groups, expressed over the
+/// codes themselves because a merged window belongs to no single segment.
+fn merged_order(ranks: &[u32], a: &(Vec<u64>, u64), b: &(Vec<u64>, u64)) -> Ordering {
+    b.1.cmp(&a.1).then_with(|| {
+        let shared = a.0.len().min(b.0.len());
+        for offset in 0..shared {
+            let left = ranks[a.0[offset] as usize + 1];
+            let right = ranks[b.0[offset] as usize + 1];
+            match left.cmp(&right) {
+                Ordering::Equal => {}
+                unequal => return unequal,
+            }
+        }
+        a.0.len().cmp(&b.0.len())
+    })
+}
+
+/// Answer one spec from several index segments, each covering a disjoint set
+/// of WHOLE actor streams.
+///
+/// Whole streams are what makes this sound: no window spans two segments, so
+/// a window's global count is the sum of its per-segment counts and the
+/// in-range totals add. Groups merge BY CONTENT, not by adjacency - the same
+/// window is a separate run of suffixes in every segment that holds it, and
+/// nothing puts those runs next to each other.
+pub(crate) fn answer_segments(
+    indexes: &[&PathsSa],
+    names: &[String],
+    spec: &PathsSpec,
+    anchor: Option<(u64, bool)>,
+) -> PathsResult {
+    if let [only] = indexes {
+        return answer(only, names, spec, anchor);
+    }
+    let (from, to) = range_bounds(spec.range);
+    let mut alphabet = 0;
+    for index in indexes {
+        alphabet = alphabet.max(index.alphabet);
+    }
+    let ranks = name_ranks(names, alphabet);
+    let mut merged: std::collections::HashMap<Vec<u64>, u64> = std::collections::HashMap::new();
+    let mut total = 0u64;
+    for index in indexes {
+        let Some((dir, truncate, lo, hi)) = sweep_target(index, anchor) else {
+            continue;
+        };
+        let sweep = Sweep {
+            index,
+            dir,
+            truncate,
+            depth: spec.depth,
+            from,
+            to,
+            ranks: &ranks,
+            // Keep every window: see TopSet::offer for why a segment must not
+            // prune to `top`.
+            top: usize::MAX,
+        };
+        let (finals, segment_total) = sweep_interval(&sweep, lo, hi);
+        total += segment_total;
+        for group in finals {
+            if group.count == 0 {
+                continue;
+            }
+            *merged.entry(index.window_codes(dir, &group)).or_insert(0) += group.count;
+        }
+    }
+    let mut ordered: Vec<(Vec<u64>, u64)> = merged.into_iter().collect();
+    ordered.sort_unstable_by(|a, b| merged_order(&ranks, a, b));
+    ordered.truncate(spec.top as usize);
+    let rows = ordered
+        .into_iter()
+        .enumerate()
+        .map(|(at, (codes, count))| PathsRow {
+            rank: u32::try_from(at).expect("rank fits u32") + 1,
+            steps: codes
+                .iter()
+                .map(|code| names[usize::try_from(*code).expect("code fits usize")].clone())
+                .collect(),
+            occurrences: count,
+            share: if total == 0 {
+                0.0
+            } else {
+                count as f64 / total as f64
+            },
+        })
+        .collect();
+    PathsResult { rows }
+}
+
 /// Assemble the result: sweep the variant's interval, rank candidates by
 /// (count desc, names asc), and compute shares against the in-range window
 /// total - the same semantics the scan's enumeration yields.
@@ -1082,30 +1528,8 @@ fn answer(
 ) -> PathsResult {
     let (from, to) = range_bounds(spec.range);
     let ranks = name_ranks(names, index.alphabet);
-    let (dir, truncate, lo, hi) = match anchor {
-        None => (
-            Direction::Forward,
-            false,
-            index.buckets[1] as usize,
-            index.text.len(),
-        ),
-        Some((code, forward)) => {
-            if code >= u64::from(index.alphabet) {
-                return PathsResult { rows: Vec::new() };
-            }
-            let symbol = usize::try_from(code + 1).expect("symbol fits usize");
-            let dir = if forward {
-                Direction::Forward
-            } else {
-                Direction::Backward
-            };
-            (
-                dir,
-                true,
-                index.buckets[symbol] as usize,
-                index.buckets[symbol + 1] as usize,
-            )
-        }
+    let Some((dir, truncate, lo, hi)) = sweep_target(index, anchor) else {
+        return PathsResult { rows: Vec::new() };
     };
     let sweep = Sweep {
         index,
@@ -1197,19 +1621,23 @@ mod tests {
     /// Pack synthetic streams into shard form (three shards, round-robin).
     fn shard_streams(streams: &[(Vec<u32>, Vec<i64>)]) -> Vec<ShardStream> {
         let mut shards: Vec<ShardStream> = (0..3)
-            .map(|_| ShardStream {
+            .map(|shard| ShardStream {
+                shard: u32::try_from(shard).expect("shard fits u32"),
                 codes: Vec::new(),
                 ts: Vec::new(),
                 bounds: vec![0],
+                actors: Vec::new(),
             })
             .collect();
         for (at, (codes, ts)) in streams.iter().enumerate() {
-            let shard = &mut shards[at % 3];
+            let which = at % 3;
+            let shard = &mut shards[which];
             shard.codes.extend_from_slice(codes);
             shard.ts.extend_from_slice(ts);
             shard
                 .bounds
                 .push(u32::try_from(shard.codes.len()).expect("stream fits u32"));
+            shard.actors.push(at as u64);
         }
         shards
     }
@@ -1372,6 +1800,113 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Split the actors round-robin across `segments` indexes, each holding
+    /// whole streams - the partition a refresh produces, without the refresh.
+    fn segment_indexes(
+        streams: &[(Vec<u32>, Vec<i64>)],
+        alphabet: u32,
+        segments: usize,
+    ) -> Vec<PathsSa> {
+        let mut groups: Vec<Vec<(Vec<u32>, Vec<i64>)>> = vec![Vec::new(); segments];
+        for (at, stream) in streams.iter().enumerate() {
+            groups[at % segments].push(stream.clone());
+        }
+        groups
+            .iter()
+            .map(|group| assemble(&shard_streams(group), alphabet).expect("assemble"))
+            .collect()
+    }
+
+    /// Several segments answer exactly as one index does. The interesting
+    /// cases are the small `top` values: a window that no single segment
+    /// ranks highly can still lead once the segments are summed, so this
+    /// fails the moment a segment is allowed to prune to `top` on its own.
+    #[test]
+    fn segmented_sweeps_match_brute_force() {
+        let names: Vec<String> = ["zeta", "alpha", "mid", "beta", "omega"]
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let alphabet = u32::try_from(names.len()).expect("alphabet fits");
+        for seed in [7u64, 99, 1234] {
+            let streams = synth_streams(40, u64::from(alphabet), seed);
+            let ranges = [
+                TimeRange::default(),
+                TimeRange {
+                    from: Some(1_100),
+                    to: Some(1_400),
+                },
+            ];
+            let mut anchors: Vec<Option<(u64, bool)>> = vec![None];
+            for code in 0..u64::from(alphabet) {
+                anchors.push(Some((code, true)));
+                anchors.push(Some((code, false)));
+            }
+            for segments in [2usize, 3, 5, 17] {
+                let indexes = segment_indexes(&streams, alphabet, segments);
+                for depth in [2u32, 3, 5, 7, 29] {
+                    for range in ranges {
+                        for anchor in &anchors {
+                            for top in [1u32, 3, 10, 1000] {
+                                let spec = spec_of(depth, top, range);
+                                let refs: Vec<&PathsSa> = indexes.iter().collect();
+                                let got = answer_segments(&refs, &names, &spec, *anchor);
+                                let want = brute(&streams, &names, &spec, *anchor);
+                                let what = format!(
+                                    "seed {seed} segments {segments} depth {depth} top {top} \
+                                     range {range:?} anchor {anchor:?}"
+                                );
+                                assert_same(&got, &want, &what);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A segment that never saw the anchor's event contributes nothing rather
+    /// than emptying the answer - the case a segment built before an event
+    /// name first appeared lands in.
+    #[test]
+    fn segments_with_a_narrower_alphabet_contribute_nothing() {
+        let names: Vec<String> = ["a", "b", "c"].iter().map(|n| (*n).to_string()).collect();
+        let streams = synth_streams(12, 3, 5);
+        let narrow: Vec<(Vec<u32>, Vec<i64>)> = streams
+            .iter()
+            .map(|(codes, ts)| {
+                let kept: Vec<usize> = (0..codes.len()).filter(|at| codes[*at] < 2).collect();
+                let mut out_codes = Vec::new();
+                let mut out_ts = Vec::new();
+                for at in kept {
+                    if out_codes.last() == Some(&codes[at]) {
+                        continue;
+                    }
+                    out_codes.push(codes[at]);
+                    out_ts.push(ts[at]);
+                }
+                (out_codes, out_ts)
+            })
+            .collect();
+        let wide = assemble(&shard_streams(&streams), 3).expect("assemble wide");
+        let narrow_index = assemble(&shard_streams(&narrow), 2).expect("assemble narrow");
+        let spec = spec_of(2, 10, TimeRange::default());
+        let both = answer_segments(&[&wide, &narrow_index], &names, &spec, Some((2, true)));
+        let alone = {
+            let wide_again = assemble(&shard_streams(&streams), 3).expect("assemble wide");
+            answer_segments(&[&wide_again], &names, &spec, Some((2, true)))
+        };
+        assert_eq!(
+            both.rows.len(),
+            alone.rows.len(),
+            "narrow segment changed the row count"
+        );
+        for (left, right) in both.rows.iter().zip(&alone.rows) {
+            assert_eq!(left.steps, right.steps);
+            assert_eq!(left.occurrences, right.occurrences);
         }
     }
 

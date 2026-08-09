@@ -340,6 +340,27 @@ impl EventStore {
         paths_sa::rebuild(&self.io, &dataset, cfg)
     }
 
+    /// Extend the paths index for a refresh, falling back to a full rebuild.
+    ///
+    /// Appending one segment over the touched actors is the cheap path, and it
+    /// is only sound when no segment already covers one of them: a segment
+    /// answers for whole streams, so an actor held by two segments would have
+    /// both their counts added. `append_touched` makes that judgement against
+    /// the manifest and returns None when it cannot, which is when this
+    /// rebuilds.
+    fn extend_paths_index(
+        &self,
+        name: &str,
+        cfg: &EventsConfig,
+        touched: &std::collections::HashSet<(u32, u64)>,
+    ) -> Result<String, EventError> {
+        let dataset = self.dataset(name)?;
+        if let Some(report) = paths_sa::append_touched(&self.io, &dataset, cfg, touched)? {
+            return Ok(report);
+        }
+        paths_sa::rebuild(&self.io, &dataset, cfg)
+    }
+
     /// The build report of an outcome.
     fn report(
         outcome: &build::BuildOutcome,
@@ -581,12 +602,25 @@ impl EventStore {
         record.min_ts = build::merge_min(record.min_ts, outcome.min_ts);
         record.max_ts = build::merge_max(record.max_ts, outcome.max_ts);
         record.refreshed_at = Some(chrono::Utc::now().to_rfc3339());
+        // Which actors this delta touched, read from the generation just
+        // written. The sidecar beside it lists only the actors that are NEW,
+        // and a RETURNING actor's stream changing is exactly what makes an
+        // existing index segment's copy of it stale - so the segment files
+        // themselves are asked, before the record advances past them.
+        let written: Vec<(u32, String)> = outcome
+            .shard_entries
+            .iter()
+            .map(|entry| (entry.shard, entry.seg.clone()))
+            .collect();
+        let scanned = self.dataset(name)?;
+        let touched = paths_sa::actors_in_files(&self.io, &scanned, cfg, &written)?;
         self.registry.publish_update(&record)?;
-        // The appended generation invalidated the paths pre-aggregate (its
-        // fingerprint no longer matches); rebuild it over the merged stream.
-        // On a failure the append itself stays published and PATHS scans
-        // (correct, slower); REBUILD EVENT DATASET restores the index.
-        self.build_paths_index(name, cfg)?;
+        // The appended generation invalidated the paths index. Extend it with
+        // ONE segment over the actors this delta touched when that is sound,
+        // and rebuild the whole index when it is not - see extend_paths_index.
+        // On a failure of either, the append itself stays published and PATHS
+        // scans (correct, slower); REBUILD EVENT DATASET restores the index.
+        self.extend_paths_index(name, cfg, &touched)?;
         Ok(outcome.events)
     }
 
