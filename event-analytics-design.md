@@ -790,13 +790,23 @@ the merged per-actor stream).
 ### 6.2 Query-time generation merge and compaction
 
 A shard with generations `g0..gk` presents each actor as the k-way merge of
-its (at most k+1) sorted runs by `(ts, tiebreak)` - a binary heap over run
-cursors, O(log k) per event with k typically 1-8. The analyses in
+its (at most k+1) sorted runs by `(ts, tiebreak)` - O(log k) per event with k
+typically 1-8 as designed, O(k) as built. The analyses in
 section 7 consume an `ActorEvents` iterator that hides this merge; a
 single-generation shard uses a direct slice cursor (the common, fastest
 path).
 
-Compaction: when a shard's generation count exceeds
+NOT BUILT, and the numbers below say what that costs. `events.max_generations`
+exists as a setting with a default of 8 and is never read anywhere in
+fq-events; `events.compact_shards_per_refresh` does not exist in the code at
+all. There is no compaction: the only way to collapse generations is REBUILD.
+Measured 2026-08-09 on a 40,001,000-event dataset, same query text before and
+after a REBUILD collapsed its two generations into one: funnel 0.399 s -> 0.133 s,
+retention 0.320 s -> 0.094 s. Three times, for TWO generations, and every
+REFRESH adds one. The merge is also O(k) per event rather than the O(log k)
+claimed below - it is a linear scan over run cursors, not a heap.
+
+The design, for when it is built: when a shard's generation count exceeds
 `events.max_generations` (default 8), the NEXT refresh folds that shard:
 streams the merge of all its runs through the encoder into one
 `gen-<g+1>.seg` (+ merged `.act`), publishes, unlinks the old files.
@@ -804,6 +814,140 @@ Compaction is per shard and incremental - a refresh compacts at most
 `events.compact_shards_per_refresh` (default: all eligible; the knob
 exists to bound refresh latency on huge datasets). Merged output is
 byte-deterministic (same total order, same block boundaries).
+
+### 6.2a The paths index defeats incremental refresh - MEASURED
+
+Sections 6.1 and 6.2 describe an append that costs the delta. The paths
+index, which was added after this design was written and appears nowhere
+above, makes that false: `append_generation_with` ends by calling
+`build_paths_index` unconditionally, and `paths_sa::rebuild` deletes every
+existing index file, re-scans every generation of every shard, and runs the
+suffix-array construction over the WHOLE dataset again. The index file name
+is a fingerprint of the exact generation list, so appending a generation
+invalidates it by construction.
+
+Measured 2026-08-09, idle machine. A probe dataset with rows in arrival order
+(sorted by ts, `seq` reassigned), so `seq > watermark` means "everything since":
+
+| | events | wall clock |
+|---|---|---|
+| CREATE over month 1 | 20,000,000 | 10.7 s (index 3.4 s) |
+| REFRESH after month 2 arrived | +20,000,000 -> 40M | 15.1 s |
+| CREATE over the whole 40M from new | 40,000,000 | 22.1 s (index 6.6 s) |
+| REBUILD to the same 40M | 40,000,000 | 21.1 s |
+| **REFRESH with a 1,000-row delta** | 40,000,000 | **11.0 s** |
+| REFRESH with nothing new | (source token unchanged) | 0.0 s |
+
+Appending one thousand rows to a 40M dataset costs 11.0 s - more than building
+the first 20M from scratch. The floor is the index rebuild and it grows with
+TOTAL size, so REFRESH is O(total), not O(delta). The status line says only
+"N events appended" and never mentions the index, so the time has no owner.
+
+Two things that shape any fix:
+
+- Suffix-array construction is ALREADY LINEAR (vendored libsais, SA-IS, run
+  over the forward and reversed text with both LCP arrays). Measured 2.264 s at
+  20.1M positions and 11.306 s at 97.6M - 5.0x time for 4.85x positions. There
+  is no faster sort to switch to; the only saving is not re-touching data that
+  did not change.
+- Source order is irrelevant. The same 20,688,550 events built from the file as
+  written and from a copy `ORDER BY actor_id, ts, seq`: 8.7 s vs 8.8 s total,
+  finalize 2.854 s vs 2.804 s. Suffix order is determined by event-name
+  content, not row order, and the row sort in finalize is not the phase's
+  dominant cost.
+
+The unit that blocks incrementality LOOKS like the ACTOR rather than the
+generation - only actors that received new events have changed streams - and
+6.2b records what happened when that was built on. Actor boundaries are
+already enforced at sweep time by the per-position `avail` array rather than at
+sort time, so segmenting the index by actor cohort does not change any sweep's
+correctness within a segment. What it does cost: top-N can no longer be pruned
+per segment (a path outside every segment's top-N can be in the global one), so
+groups must be merged by path content; positions of actors re-indexed elsewhere
+stay dead in older segments until compaction.
+
+The scan fallback is the other half of the picture, and it is cheaper than a
+"scan 100M rows" reading suggests. Same 100,258,738-event dataset, index
+present, then with both `.psax` files moved aside:
+
+| query | with index | scan fallback |
+|---|---|---|
+| starting at, depth 3, top 8 | 0.013 s | 0.515 s |
+| starting at, depth 6, top 12 | 0.018 s | 0.529 s |
+| ending at, depth 4, top 8 | 0.002 s | 0.218 s |
+| unanchored, depth 4, top 10 | 0.085 s | 2.593 s |
+
+The index buys 30-100x; without it an anchored PATHS is half a second, not ten.
+The two paths agree exactly - 40 rows, every `path_id`, `seq`, `event`,
+`occurrences` and `share` identical - so serving from the scan is a slowdown
+and not a different answer.
+
+### 6.2b Incremental index building was BUILT, MEASURED, and FAILED
+
+Do not attempt the actor-cohort design again without reading this. It was
+implemented in full, it was correct, and its cost goes the wrong way.
+
+WHAT WAS BUILT: the paths index as SEGMENTS plus a manifest, each segment
+holding the WHOLE streams of a set of actors (whole streams are what make
+per-segment counts summable - no window spans two segments). A refresh appended
+one segment covering the actors the delta touched, and TOMBSTONED those actors
+in the segments holding older copies of their streams, so nothing was counted
+twice. Answers merged across segments by window CONTENT rather than by
+adjacency. Correctness was pinned by property tests against brute force over
+5,280 combinations of segment count, depth, range, anchor and top, and by
+integration tests for append, append-with-retire, and partial retire.
+
+MEASURED, release build, idle machine, one dataset grown in three steps:
+
+| step | events | total | of which INDEX | data |
+|---|---|---|---|---|
+| build | 60,000,000 | 76.8 s | 30.9 s | 45.9 s |
+| append | +20,000,000 -> 80M | 66.6 s | 48.7 s | 17.9 s |
+| append | +20,258,738 -> 100M | 87.7 s | 67.6 s | 20.1 s |
+
+The DATA half is flat at ~18-20 s per 20M appended, and it was already
+incremental before any of this: the source pull is `WHERE key > watermark` and
+generations are appended, per 6.1. The INDEX half is the subject, and it did
+this:
+
+    positions re-indexed per append:  63.3 M, then 75.0 M
+    dataset positions at the time:    78.2 M, then 97.6 M
+
+Each append re-indexed about 77% of the WHOLE dataset, and the share rose
+between the two. Index time grew 39% between two identical 20M appends. The
+cost converges on a full rebuild rather than away from it.
+
+WHY IT CANNOT BE TUNED OUT: a segment must hold whole actor streams, so a
+RETURNING actor drags its entire history into the new segment. 464,705 actors
+were retired on the first append and 529,173 on the second - all returning.
+A user coming back the next day is the normal case, not an edge case, so any
+scheme whose cost is proportional to the touched actors' HISTORY instead of to
+the delta degrades exactly as the dataset grows. That is this design, and no
+constant-factor work changes its shape.
+
+The only variant whose cost tracks the delta is to index the delta plus a
+BOUNDED TAIL of each touched actor - the last `depth - 1` events - so history
+length stops mattering. It is not built: it caps answerable depth at a
+build-time constant, which trades away the property 4's sweep exists for
+("depth changes neither the index's size nor the sweep's cost"). Its downside
+is smaller than it sounds, because a query past the cap falls back to the scan
+and the scan is 0.5 s anchored on 100M events, but the trade has not been
+taken.
+
+Three shapes remain for the CURRENT cost, none of them chosen and none of them
+this:
+
+1. Move the rebuild off the refresh path (async or on demand). Refresh stops
+   paying the fixed index cost; PATHS runs at fallback speed until the rebuild
+   lands. Smallest change.
+2. Serve the EXISTING index while the new one builds. It is not wrong, it is
+   incomplete - it covers every event up to the generation it was built from.
+   Impossible today by construction (the fingerprint check refuses a
+   non-matching file, which is a sound default), and it requires the index to
+   record which generations it covers and PATHS to say so in its result: an
+   answer that silently omits the last hour of events is the wrong-answer class
+   this engine does not ship.
+3. The bounded-tail variant above, with its stated cost.
 
 ### 6.3 Full rebuild - `REBUILD EVENT DATASET`
 

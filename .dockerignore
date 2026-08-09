@@ -1,0 +1,22 @@
+# The build context for docker/engine.Dockerfile (the fedq-server image the
+# game-analytics demo runs) is this repository root. Almost nothing here
+# belongs in that context: target/ alone is tens of gigabytes, and vendor/
+# holds a 179 MB generated parquet that must never enter an image.
+#
+# The rule is therefore inverted - everything is excluded, and the few trees
+# the engine build reads are named back in. A directory added later is outside
+# the context until someone deliberately lists it, which is the safe direction:
+# the failure mode is a build that cannot find a file, not an image that
+# silently ships one.
+*
+
+!Cargo.toml
+!Cargo.lock
+!.cargo
+!crates
+!scripts
+!tools
+
+# fq-index keeps its own workspace, its own lock and its own target directory
+# (gigabytes of rust-analyzer artifacts). The engine build never reads it.
+tools/fq-index

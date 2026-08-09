@@ -235,6 +235,46 @@ cost) is rewritten to read the view. It is off-switchable per session
 (`accelerator.enable_substitution`, read fresh per query) and tracks per-view
 benefit counters.
 
+## The event store
+
+Event analytics (fq-events) is a second store beside the materialized views,
+for the four product-analytics questions: funnels, retention, segmentation and
+paths. `CREATE EVENT DATASET <name> FROM <source table> ACTOR <c> TIME <c>
+EVENT <c> [TIEBREAK <c>] [PROPERTIES (...)] [WITH (...)]` reads a source table
+once and materializes it into an actor-partitioned columnar store under
+`<config>.events/`, registered in the same SQLite beside the learned stats.
+`FUNNEL`, `RETENTION`, `SEGMENT` and `PATHS` are statements over that store,
+each also usable as a table function in `FROM`; `REFRESH`, `REBUILD`, `DROP`
+and `SHOW EVENT DATASETS` complete the surface. There is no ATTACH, LOAD or
+WARM: a dataset is opened lazily on first use.
+
+Two properties of the store decide how it behaves in practice, and both are
+measured rather than assumed (numbers from an idle 12-core box, 2026-08-09):
+
+- A BUILD IS ONE NUMBER, and about 40% of it is the paths index. 20,688,550
+  events build in 8.7 s (index 3.5 s); 100,258,738 events in 41.2 s (index
+  17.2 s). The index is a suffix array with an LCP array over every actor's
+  duplicate-collapsed event stream, plus a second pair over the reversed text,
+  which is what lets a PATHS statement answer at ANY depth from one interval
+  sweep - depth changes neither the index's size nor the sweep's cost.
+  Construction is linear (vendored libsais): 2.3 s at 20.1M positions, 11.3 s
+  at 97.6M.
+
+- REFRESH IS NOT INCREMENTAL, despite pulling only the delta. The source read
+  is `WHERE <refresh_key> > <watermark>` and new generation files are appended
+  rather than existing shards rewritten, but the paths index is then rebuilt
+  over every event. Appending 1,000 rows to a 40M-event dataset costs 11.0 s -
+  more than building the first 20M from scratch. Generations also never
+  compact (`events.max_generations` is a setting nothing reads), and two
+  generations already cost 3x on funnel and retention against one.
+
+Without the index PATHS falls back to scanning the store, which is a slowdown
+and not a different answer: on 100M events an anchored PATHS is 0.5 s against
+0.013 s indexed, and both paths return byte-identical rows.
+
+`event-analytics-design.md` section 6.2a carries the full measurement table and
+the shapes a fix could take; taskq holds the open work.
+
 ## Front doors
 
 Three binaries expose one `fq_runtime::Runtime`; all engine logic lives in the
@@ -259,6 +299,10 @@ runtime and the crates below it.
 
 ## Deeper docs
 
+- `event-analytics-design.md` - the event store's design: storage format,
+  identity and dictionaries, indexes, the build pipeline, refresh mechanics
+  (section 6.2a is the measured cost of refresh and the paths index), and the
+  query algorithms behind the four analyses.
 - `accelerator-plan.md` - the materialized-view / fragment-cache design: chunk
   model, keying, invalidation, the refresh mechanics, substitution, and the
   phased roadmap (S3 backend and benefit-based eviction are Phase D).

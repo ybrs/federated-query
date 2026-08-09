@@ -11,7 +11,11 @@ VENV   := $(CURDIR)/venv
 PYBIN  := $(VENV)/bin/
 PYTHON := $(PYBIN)python3
 
-.PHONY: build dev-build check-python setup download_postgres pg-start pg-stop test install venv lint lint-ascii lint-python fq-lint duckdb-lib
+.PHONY: build dev-build check-python setup download_postgres pg-start pg-stop test install venv lint lint-ascii lint-python fq-lint duckdb-lib fedq-server-image
+
+# The container image the game-analytics demo's compose file runs. Overridable
+# so the same Dockerfile can produce a differently named or tagged image.
+FEDQ_SERVER_IMAGE ?= fedq-server:local
 
 # Download the prebuilt PostgreSQL binaries into ./postgres-17 (one-time).
 download_postgres:
@@ -53,6 +57,16 @@ setup: duckdb-lib
 # idempotent). DuckDB is NEVER compiled inside cargo - see .cargo/config.toml.
 duckdb-lib:
 	./scripts/setup-duckdb-lib.sh
+
+# Build the fedq-server image that vendor/game-analytics-demo runs under docker
+# compose. It is built HERE and not there: the image needs this whole workspace
+# as its context, while the demo's compose file must stay self-contained so the
+# demo can move to its own repository. Run this once before the demo's
+# `docker compose up`; without the image, compose stops at the engine service.
+fedq-server-image:
+	docker build \
+		-f vendor/game-analytics-demo/docker/engine.Dockerfile \
+		-t $(FEDQ_SERVER_IMAGE) .
 
 # Install the git hooks (idempotent; also runs automatically on session start
 # via the SessionStart hook in .claude/settings.json). pre-commit = the
