@@ -2,8 +2,15 @@
 
 Staged modes, mirroring the tpcds harness:
 
+- ``--mode gen``: synthesize the small/medium events datasets and write
+  ``data/events_<size>_parquet/events.parquet``. Rows are emitted sorted by
+  (ts, generation order) with ``seq`` renumbered 0..N-1 in that sorted order,
+  matching production: a source buffers events and compacts to parquet in
+  time order, so ``seq`` is never uncorrelated with ``ts`` in real data.
 - ``--mode gen-crafted``: write the crafted generality datasets as parquet
-  under ``data/crafted/`` (deterministic seeds).
+  under ``data/crafted/`` (deterministic seeds). These datasets deliberately
+  probe generality shapes (sparse/UUID actors, subsecond ties) and are
+  untouched by ``--mode gen``.
 - ``--mode save-refs``: compute every battery entry's ORACLE result via DuckDB
   SQL over the raw parquet and store results + oracle wall times in
   ``data/references_events_<size>.duckdb`` (results are a function of the
@@ -36,6 +43,11 @@ REPO_ROOT = os.path.abspath(
 PYTHON = sys.executable
 
 
+def _small_medium_parquet_path(size):
+    """The single Parquet file a small/medium dataset is exposed as."""
+    return os.path.join(DATA_DIR, "events_%s_parquet" % size, "events.parquet")
+
+
 def dataset_config(size):
     """The (config_path, parquet_path, dataset_name, create_sql) of a size."""
     if size == "100m":
@@ -54,7 +66,7 @@ def dataset_config(size):
         return config, parquet, "web", create
     if size in ("small", "medium"):
         config = os.path.join(DATA_DIR, "events_%s.config.yaml" % size)
-        parquet = os.path.join(DATA_DIR, "events_%s_parquet" % size, "events.parquet")
+        parquet = _small_medium_parquet_path(size)
         create = (
             "CREATE EVENT DATASET web FROM ev.main.events "
             "ACTOR entity_id TIME ts EVENT event_name TIEBREAK seq "
@@ -77,6 +89,205 @@ def write_crafted_config(size):
             "datasources:\n  ev:\n    type: parquet\n    dir: %s\n" % crafted_dir
         )
     return config
+
+
+# ---------------------------------------------------------------------------
+# gen: synthesize the small/medium events datasets
+# ---------------------------------------------------------------------------
+#
+# A gen scale fixes the event count and the distinct-entity target. Entities
+# are drawn from a bounded power law, floor(E * u^ENTITY_SKEW) with
+# u = hash(i)/max in [0, 1): the density goes as entity^(1/skew - 1), so a few
+# head entities carry many events and the tail is long - the real shape of
+# behavioural data - while the top entity stays a realistic fraction of the
+# log (~0.14% at skew 2), unlike a pure Zipf(s~=1) whose single head entity
+# would swallow ~5% of all events and make per-entity sequence work
+# pathological.
+GEN_ENTITY_SKEW = 2.0
+
+GEN_SCALES = {
+    "small": {"events": 1_000_000, "entities": 50_000},
+    "medium": {"events": 100_000_000, "entities": 500_000},
+}
+
+# Twenty event types, listed most-frequent first (rank 1 is the head). Event
+# rank is drawn Zipf over pow(21, u) -> 1..20, so `page_view` dominates and
+# `cancel_account` is the rare tail.
+GEN_EVENT_TYPES = (
+    (1, "page_view"), (2, "view_item"), (3, "search"), (4, "click_ad"),
+    (5, "scroll"), (6, "add_to_cart"), (7, "watch_video"), (8, "share"),
+    (9, "comment"), (10, "signup"), (11, "login"), (12, "begin_checkout"),
+    (13, "add_payment"), (14, "purchase"), (15, "refund"), (16, "rate_item"),
+    (17, "wishlist"), (18, "apply_coupon"), (19, "contact_support"),
+    (20, "cancel_account"),
+)
+
+# Property-column value pools (skewed by the same pow-draw so head values
+# dominate, like real device/geo mixes).
+GEN_DEVICES = ("ios", "android", "web", "desktop")
+GEN_COUNTRIES = ("US", "GB", "DE", "FR", "IN", "BR", "JP", "CA")
+
+# The event timeline spans GEN_WINDOW_DAYS; each entity's events cluster into
+# sessions of at most GEN_SESSION_SECONDS, whose base instants are a hash of
+# (entity, session) so all events of one session land in one burst.
+GEN_WINDOW_DAYS = 30
+GEN_SESSIONS_PER_ENTITY = 12
+GEN_SESSION_SECONDS = 3600
+GEN_START_TS = "2025-01-01"
+
+
+def _gen_unit(salt):
+    """A deterministic pseudo-random draw in [0, 1) from the row index `i` and
+    a salt: hash is a pure function of its arguments, so the value does not
+    depend on DuckDB's scan/thread order and the dataset is byte-reproducible.
+    The full 64-bit hash is divided by 2^64 (not a coarse modulus) so the
+    power-law tail is not aliased away. Each salt hashes a DISTINCT integer
+    (i * 11 + salt), not hash(i, salt): DuckDB's multi-argument hash only
+    shifts the base hash by the salt, which would tie an entity's events to
+    one event name and one session. Hashing distinct inputs decorrelates the
+    draws (measured correlation ~0)."""
+    return "(hash(i * 11 + {0})::DOUBLE / 18446744073709551616.0)".format(salt)
+
+
+def _gen_entity_expr(entities):
+    """The bounded power-law entity id in [1, entities], as a BIGINT column."""
+    return "least({0}, 1 + CAST(floor({0}.0 * pow({1}, {2})) AS BIGINT))".format(
+        entities, _gen_unit(1), GEN_ENTITY_SKEW
+    )
+
+
+def _gen_event_rank_expr():
+    """The Zipf event rank in [1, 20] (pow(21, u) reaches every rank)."""
+    return "least(20, CAST(floor(pow(21.0, {0})) AS INT))".format(_gen_unit(2))
+
+
+def _gen_timestamp_expr(entities):
+    """A sessionized timestamp: the session's base instant is a hash of
+    (entity, session) so all its events share one burst, plus a within-session
+    second offset. Sessions scatter across the GEN_WINDOW_DAYS span."""
+    session = "CAST(floor({0} * {1}) AS BIGINT)".format(
+        _gen_unit(3), GEN_SESSIONS_PER_ENTITY
+    )
+    base = "(hash({0}, {1}, 7) % ({2} * 86400))".format(
+        _gen_entity_expr(entities), session, GEN_WINDOW_DAYS
+    )
+    intra = "CAST(floor({0} * {1}) AS BIGINT)".format(
+        _gen_unit(4), GEN_SESSION_SECONDS
+    )
+    return "TIMESTAMP '{0}' + to_seconds({1} + {2})".format(GEN_START_TS, base, intra)
+
+
+def _gen_pool_expr(pool, salt):
+    """Pick from a small value pool with a skewed pow-draw, 1-based index."""
+    values = "', '".join(pool)
+    index = "CAST(floor(pow({0}.0, {1})) AS INT)".format(len(pool), _gen_unit(salt))
+    return "(ARRAY['{0}'])[least({1}, {2})]".format(values, len(pool), index)
+
+
+def _gen_names_values():
+    """The 20-row (rank, name) VALUES clause for the event-type join."""
+    rows = []
+    for rank, name in GEN_EVENT_TYPES:
+        rows.append("({0}, '{1}')".format(rank, name))
+    return ", ".join(rows)
+
+
+def _gen_raw_sql(events, entities):
+    """The CREATE TABLE AS SELECT that builds the raw (unsorted) events table.
+
+    Every column is a pure function of the range index `i`, joined to the
+    20-row event-name table on the drawn rank, so the result is deterministic
+    regardless of DuckDB's parallel scan order. `gen_order` carries `i`
+    itself: the row's place in a hypothetical single-writer arrival stream,
+    used as the sort tiebreak below (production ties within one timestamp
+    keep buffer-arrival order)."""
+    entity = _gen_entity_expr(entities)
+    timestamp = _gen_timestamp_expr(entities)
+    device = _gen_pool_expr(GEN_DEVICES, 5)
+    country = _gen_pool_expr(GEN_COUNTRIES, 6)
+    return (
+        "CREATE TABLE raw_events AS SELECT\n"
+        "  {entity} AS entity_id,\n"
+        "  {timestamp} AS ts,\n"
+        "  names.name AS event_name,\n"
+        "  CAST(i AS BIGINT) AS gen_order,\n"
+        "  {device} AS device,\n"
+        "  {country} AS country\n"
+        "FROM range({events}) t(i)\n"
+        "JOIN (SELECT * FROM (VALUES {names}) v(rank, name)) names\n"
+        "  ON names.rank = {event_rank}\n"
+    ).format(
+        entity=entity,
+        timestamp=timestamp,
+        device=device,
+        country=country,
+        events=events,
+        names=_gen_names_values(),
+        event_rank=_gen_event_rank_expr(),
+    )
+
+
+def _gen_export_sql(parquet_path):
+    """The COPY that sorts the raw table by (ts, gen_order) and renumbers
+    `seq` to 0..N-1 in that order - the ts-sorted, seq-ordered shape a
+    production compaction produces, matched here so seq is never uncorrelated
+    with ts the way an unordered synthetic generation would leave it."""
+    return (
+        "COPY (SELECT entity_id, ts, event_name, "
+        "CAST(row_number() OVER (ORDER BY ts, gen_order) - 1 AS BIGINT) AS seq, "
+        "device, country FROM raw_events ORDER BY ts, gen_order) "
+        "TO '{0}' (FORMAT PARQUET)"
+    ).format(parquet_path)
+
+
+def _report_gen_shape(connection):
+    """Print the raw generated table's headline shape before sort+export."""
+    counts = connection.execute(
+        "SELECT count(*), count(DISTINCT entity_id), count(DISTINCT event_name) "
+        "FROM raw_events"
+    ).fetchone()
+    print(
+        "rows=%d  distinct entities=%d  distinct event types=%d"
+        % (counts[0], counts[1], counts[2])
+    )
+
+
+def _human_bytes(path):
+    """A human-readable file size for the generated-dataset banner."""
+    size = float(os.path.getsize(path))
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024.0:
+            return "%.1f%s" % (size, unit)
+        size /= 1024.0
+    return "%.1fTB" % size
+
+
+def mode_gen(size):
+    """gen subcommand: synthesize a small/medium events dataset and write its
+    Parquet source file, sorted by (ts, generation order) with seq assigned
+    0..N-1 in that order - the shape production data always has (a buffer
+    compacts to parquet in time order), which the raw generation-order rows
+    do not until this sort+renumber step is applied."""
+    import duckdb
+
+    if size not in GEN_SCALES:
+        raise SystemExit("gen only supports --size small or --size medium")
+    shape = GEN_SCALES[size]
+    parquet_path = _small_medium_parquet_path(size)
+    os.makedirs(os.path.dirname(parquet_path), exist_ok=True)
+    print(
+        "generating scale=%s: %d events over ~%d entities -> %s"
+        % (size, shape["events"], shape["entities"], parquet_path)
+    )
+    started = time.time()
+    connection = duckdb.connect()
+    connection.execute("SET threads TO %d" % os.cpu_count())
+    connection.execute(_gen_raw_sql(shape["events"], shape["entities"]))
+    _report_gen_shape(connection)
+    connection.execute(_gen_export_sql(parquet_path))
+    connection.close()
+    elapsed = time.time() - started
+    print("generated in %.1fs (%s)" % (elapsed, _human_bytes(parquet_path)))
 
 
 # ---------------------------------------------------------------------------
@@ -902,31 +1113,11 @@ REFRESH_QUERIES = [
 ]
 
 
-def arrival_ordered(source):
-    """The arrival-ordered copy of `source`: rows sorted by (ts, seq) with seq
-    reassigned to that order, so a seq-cut is a TIME-cut and a staged refresh
-    is the daily append (a delta arriving after everything stored). Derived
-    once and cached beside the data; the raw medium parquet's seq is
-    uncorrelated with ts, which would make every staged delta a late-arrival
-    storm instead of the workload the scenario measures."""
-    import duckdb
-    ordered = os.path.join(DATA_DIR, "events_medium_arrival.parquet")
-    if os.path.exists(ordered):
-        return ordered
-    print("deriving arrival-ordered copy (once):", ordered)
-    con = duckdb.connect()
-    con.execute(
-        "COPY (SELECT * REPLACE(CAST(row_number() OVER (ORDER BY ts, seq) - 1 "
-        "AS BIGINT) AS seq) FROM read_parquet(?) ORDER BY ts, seq) "
-        "TO '%s' (FORMAT PARQUET)" % ordered,
-        [source],
-    )
-    con.close()
-    return ordered
-
-
 def stage_slice(source, staged, cut):
-    """Write the rows with seq < cut of `source` to `staged`, arrival order."""
+    """Write the rows with seq < cut of `source` to `staged`, arrival order.
+    `source` is the dataset's own parquet: `--mode gen` already emits it
+    sorted by (ts, tiebreak) with seq assigned 0..N-1 in that order, so a
+    seq-cut is already a time-cut - no derived copy is needed."""
     import duckdb
     con = duckdb.connect()
     con.execute(
@@ -987,8 +1178,7 @@ def mode_refresh_scenario(size):
     import fedq
     import pyarrow.parquet as pq
 
-    _, raw, _, _ = dataset_config(size)
-    source = arrival_ordered(raw)
+    _, source, _, _ = dataset_config(size)
     total = pq.ParquetFile(source).metadata.num_rows
     cuts = [int(total * 0.6), int(total * 0.8), total - 1000, total]
     stage_names = ["create_60m", "refresh_plus_20m", "refresh_to_n_minus_1k",
@@ -1051,8 +1241,8 @@ def main():
     """Parse arguments and dispatch the mode."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", required=True,
-                        choices=["gen-crafted", "save-refs", "engine", "compare",
-                                 "refresh-scenario"])
+                        choices=["gen", "gen-crafted", "save-refs", "engine",
+                                 "compare", "refresh-scenario"])
     parser.add_argument("--size", default="medium")
     parser.add_argument("--queries", default=None,
                         help="comma-separated battery entry names")
@@ -1060,7 +1250,9 @@ def main():
     parser.add_argument("--skip-cold", action="store_true")
     arguments = parser.parse_args()
     only = arguments.queries.split(",") if arguments.queries else None
-    if arguments.mode == "gen-crafted":
+    if arguments.mode == "gen":
+        mode_gen(arguments.size)
+    elif arguments.mode == "gen-crafted":
         mode_gen_crafted()
     elif arguments.mode == "save-refs":
         mode_save_refs(arguments.size, only)
