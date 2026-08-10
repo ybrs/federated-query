@@ -1237,12 +1237,109 @@ def mode_refresh_scenario(size):
     print("refresh scenario written to", out_path)
 
 
+# ---------------------------------------------------------------------------
+# Scan envelope: what a deep USING SCAN costs in resources
+# ---------------------------------------------------------------------------
+
+
+ENVELOPE_DRIVER = r"""
+import json, resource, sys, time
+sys.path.insert(0, %(tests_dir)r)
+import pyarrow as pa
+import fedq
+runtime = fedq.Runtime(%(config)r)
+started = time.time()
+rows = 0
+if %(sql)r:
+    table = pa.table(runtime.execute(%(sql)r))
+    rows = table.num_rows
+elapsed_ms = (time.time() - started) * 1000.0
+usage = resource.getrusage(resource.RUSAGE_SELF)
+print(json.dumps({
+    "ms": elapsed_ms,
+    "rows": rows,
+    "max_rss_kb": usage.ru_maxrss,
+    "user_s": usage.ru_utime,
+    "sys_s": usage.ru_stime,
+}))
+"""
+
+
+ENVELOPE_SHAPES = [
+    ("d8_unanchored", "PATHS ON web DEPTH 8 TOP 10 USING SCAN"),
+    ("d16_unanchored", "PATHS ON web DEPTH 16 TOP 10 USING SCAN"),
+    ("d16_forward",
+     "PATHS ON web STARTING AT 'page_view' DEPTH 16 TOP 10 USING SCAN"),
+    ("d16_backward",
+     "PATHS ON web ENDING AT 'purchase' DEPTH 16 TOP 10 USING SCAN"),
+    ("d8_ranged",
+     "PATHS ON web DEPTH 8 TOP 10 FROM '2026-06-15' TO '2026-06-22' USING SCAN"),
+]
+
+
+def envelope_run(config, sql):
+    """One fresh-process execution reporting wall, rows, and rusage."""
+    code = ENVELOPE_DRIVER % {
+        "tests_dir": os.path.join(REPO_ROOT, "tests"),
+        "config": config,
+        "sql": sql,
+    }
+    output = subprocess.run([PYTHON, "-c", code], capture_output=True,
+                            text=True, check=True)
+    return json.loads(output.stdout.strip().splitlines()[-1])
+
+
+def mode_scan_envelope(size):
+    """Measure the exact-scan escape hatch's RESOURCE envelope: per deep
+    USING SCAN shape, a fresh process's wall clock, peak RSS (against a
+    runtime-only baseline), and CPU seconds - then a 4-way concurrent burst
+    of the heaviest shape to see contention. Fresh processes isolate the
+    scan's footprint from the parent's history."""
+    config, _, _, _ = dataset_config(size)
+    executions = 1 + len(ENVELOPE_SHAPES) + 4
+    print("scan-envelope: about %d engine executions" % executions)
+    baseline = envelope_run(config, "")
+    print("baseline (runtime only): rss %.2f GiB" %
+          (baseline["max_rss_kb"] / 1048576.0))
+    results = {"size": size, "baseline_rss_kb": baseline["max_rss_kb"],
+               "shapes": {}, "burst": []}
+    for name, sql in ENVELOPE_SHAPES:
+        run = envelope_run(config, sql)
+        run["scan_rss_kb"] = run["max_rss_kb"] - baseline["max_rss_kb"]
+        results["shapes"][name] = run
+        print("  %-16s %9.1f ms  rss +%.2f GiB  cpu %.1fs  %d rows" % (
+            name, run["ms"], run["scan_rss_kb"] / 1048576.0,
+            run["user_s"] + run["sys_s"], run["rows"]))
+    burst_sql = dict(ENVELOPE_SHAPES)["d16_unanchored"]
+    code = ENVELOPE_DRIVER % {
+        "tests_dir": os.path.join(REPO_ROOT, "tests"),
+        "config": config,
+        "sql": burst_sql,
+    }
+    procs = []
+    for _ in range(4):
+        procs.append(subprocess.Popen([PYTHON, "-c", code],
+                                      stdout=subprocess.PIPE, text=True))
+    for proc in procs:
+        stdout, _ = proc.communicate()
+        if proc.returncode != 0:
+            raise SystemExit("burst runner failed with %d" % proc.returncode)
+        run = json.loads(stdout.strip().splitlines()[-1])
+        results["burst"].append(run)
+        print("  burst d16_unanchored %9.1f ms  rss %.2f GiB" % (
+            run["ms"], run["max_rss_kb"] / 1048576.0))
+    out_path = os.path.join(DATA_DIR, "scan_envelope_%s.json" % size)
+    with open(out_path, "w") as handle:
+        json.dump(results, handle)
+    print("scan envelope written to", out_path)
+
+
 def main():
     """Parse arguments and dispatch the mode."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", required=True,
                         choices=["gen", "gen-crafted", "save-refs", "engine",
-                                 "compare", "refresh-scenario"])
+                                 "compare", "refresh-scenario", "scan-envelope"])
     parser.add_argument("--size", default="medium")
     parser.add_argument("--queries", default=None,
                         help="comma-separated battery entry names")
@@ -1260,6 +1357,8 @@ def main():
         mode_engine(arguments.size, only, arguments.warm_runs, arguments.skip_cold)
     elif arguments.mode == "refresh-scenario":
         mode_refresh_scenario(arguments.size)
+    elif arguments.mode == "scan-envelope":
+        mode_scan_envelope(arguments.size)
     else:
         mode_compare(arguments.size, only)
 
