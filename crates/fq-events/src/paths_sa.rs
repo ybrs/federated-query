@@ -752,11 +752,17 @@ fn bucket_offsets(text: &Text, alphabet: u32) -> Vec<u32> {
 /// Append one actor's stitch slice to a pair stream: the sliced codes and
 /// timestamps, the actor's local id, and the slice's relation to the true
 /// stream (ownership converted to slice-relative coordinates).
+///
+/// `prefix` counts stream events BEFORE the collapsed slice this stitch was
+/// computed over (a bounded tail read passes its saturation stand-in; a
+/// whole-stream read passes 0). It shifts `before`, and through it the
+/// backward availability.
 fn push_slice(
     stream: &mut ShardStream,
     local: u64,
     collapsed: &stitch::CollapsedStream,
     slice: stitch::ActorStitch,
+    prefix: u32,
 ) {
     let lo = slice.text.lo as usize;
     let hi = slice.text.hi as usize;
@@ -776,7 +782,7 @@ fn push_slice(
         .as_mut()
         .expect("pair streams carry slices")
         .push(SliceMeta {
-            before: slice.text.lo,
+            before: slice.text.lo + prefix,
             after: stream_len - slice.text.hi,
             own_fwd: relative(slice.own_fwd),
             own_bwd: relative(slice.own_bwd),
@@ -794,13 +800,224 @@ fn empty_pair_stream() -> ShardStream {
     }
 }
 
-/// Read the touched actors' streams once and cut both halves of a refresh's
-/// segment pair: per actor, the merged collapsed stream (delta included) and
-/// the old collapsed stream (delta excluded) are collapsed side by side, the
-/// changed envelope between them is computed, and the addition/retraction
-/// stitches are sliced out with their ownership. An actor whose collapsed
-/// stream did not change (the delta collapsed entirely into existing runs)
-/// contributes to neither.
+/// One contiguous stored range of an actor's events:
+/// (file index, start row, end row).
+type Piece = (usize, u64, u64);
+
+/// One actor's stored event ranges, split into the pieces of the delta files
+/// and the pieces of every older generation.
+fn split_run(
+    scan: &crate::cursor::ShardScan<'_>,
+    run: &crate::cursor::ActorRun,
+    delta_files: &std::collections::HashSet<String>,
+) -> (Vec<Piece>, Vec<Piece>) {
+    let pieces: Vec<Piece> = match run {
+        crate::cursor::ActorRun::Single { file, start, end } => vec![(*file, *start, *end)],
+        crate::cursor::ActorRun::Multi(pieces) => pieces.clone(),
+    };
+    let mut old = Vec::new();
+    let mut delta = Vec::new();
+    for piece in pieces {
+        if delta_files.contains(scan.files[piece.0].seg.rel()) {
+            delta.push(piece);
+        } else {
+            old.push(piece);
+        }
+    }
+    (old, delta)
+}
+
+/// The `(ts, tiebreak)` of one stored row.
+fn row_key(
+    scan: &crate::cursor::ShardScan<'_>,
+    file: usize,
+    row: u64,
+) -> Result<(i64, i64), EventStoreError> {
+    let row = usize::try_from(row).expect("row fits usize");
+    Ok((
+        scan.files[file].ts.i64_at(row)?,
+        scan.files[file].tiebreak.i64_at(row)?,
+    ))
+}
+
+/// The largest `(ts, tiebreak)` across pieces (each piece is sorted, so its
+/// last row is its largest), or None when the pieces hold no event.
+fn last_key(
+    scan: &crate::cursor::ShardScan<'_>,
+    pieces: &[Piece],
+) -> Result<Option<(i64, i64)>, EventStoreError> {
+    let mut best: Option<(i64, i64)> = None;
+    for (file, start, end) in pieces {
+        if start < end {
+            let key = row_key(scan, *file, end - 1)?;
+            best = Some(best.map_or(key, |held| held.max(key)));
+        }
+    }
+    Ok(best)
+}
+
+/// The smallest `(ts, tiebreak)` across pieces (first rows).
+fn first_key(
+    scan: &crate::cursor::ShardScan<'_>,
+    pieces: &[Piece],
+) -> Result<Option<(i64, i64)>, EventStoreError> {
+    let mut best: Option<(i64, i64)> = None;
+    for (file, start, end) in pieces {
+        if start < end {
+            let key = row_key(scan, *file, *start)?;
+            best = Some(best.map_or(key, |held| held.min(key)));
+        }
+    }
+    Ok(best)
+}
+
+/// Read every event of the given pieces in `(ts, tiebreak)` order.
+fn read_events(
+    scan: &crate::cursor::ShardScan<'_>,
+    pieces: Vec<Piece>,
+) -> Result<Vec<(u32, i64)>, EventStoreError> {
+    let mut events = Vec::new();
+    let run = crate::cursor::ActorRun::Multi(pieces);
+    scan.for_each_event(&run, |file, row, code| {
+        let when = scan.files[file].ts.i64_at(row)?;
+        events.push((u32::try_from(code).expect("dictionary code fits u32"), when));
+        Ok(true)
+    })?;
+    Ok(events)
+}
+
+/// Read the TAIL of the merged stream over `pieces`, backward, until it holds
+/// `target_runs` collapsed runs or the stream start. Returns the tail in
+/// ascending order and whether the stream start was reached.
+///
+/// The earliest returned run may be cut mid-run, which leaves its kept
+/// timestamp later than the run's true first occurrence; callers only place
+/// that position in unowned context, where a sweep reads its code and never
+/// its timestamp.
+fn read_tail(
+    scan: &crate::cursor::ShardScan<'_>,
+    pieces: &[Piece],
+    target_runs: u32,
+) -> Result<(Vec<(u32, i64)>, bool), EventStoreError> {
+    // Cursor per piece, walking DOWN from the end: (file, next row + 1, start
+    // bound, key of row next).
+    let mut cursors: Vec<(usize, u64, u64, (i64, i64))> = Vec::new();
+    for (file, start, end) in pieces {
+        if start < end {
+            cursors.push((*file, *end, *start, row_key(scan, *file, end - 1)?));
+        }
+    }
+    let mut descending: Vec<(u32, i64)> = Vec::new();
+    let mut runs = 0u32;
+    let mut newer_code: Option<u32> = None;
+    while !cursors.is_empty() {
+        let mut best = 0usize;
+        for candidate in 1..cursors.len() {
+            if cursors[candidate].3 > cursors[best].3 {
+                best = candidate;
+            }
+        }
+        let (file, above, start, key) = cursors[best];
+        let row = above - 1;
+        let code = u32::try_from(
+            scan.files[file]
+                .event
+                .code_at(usize::try_from(row).expect("row fits usize"))?,
+        )
+        .expect("dictionary code fits u32");
+        if newer_code != Some(code) {
+            if runs == target_runs {
+                return Ok((reverse_tail(descending), false));
+            }
+            runs += 1;
+            newer_code = Some(code);
+        }
+        descending.push((code, key.0));
+        if row > start {
+            cursors[best] = (file, row, start, row_key(scan, file, row - 1)?);
+        } else {
+            cursors.swap_remove(best);
+        }
+    }
+    Ok((reverse_tail(descending), true))
+}
+
+/// Reverse a descending tail into ascending event order.
+fn reverse_tail(mut descending: Vec<(u32, i64)>) -> Vec<(u32, i64)> {
+    descending.reverse();
+    descending
+}
+
+/// The stand-in for the unread events before a bounded tail: any value at
+/// least `max_depth + 1` makes every backward availability in the slice
+/// exceed every legal depth, which is indistinguishable from the true (large)
+/// distance for validity and truncation alike - the two comparisons
+/// availability feeds are both against depths bounded by `max_depth`.
+fn saturated_prefix(max_depth: u32) -> u32 {
+    max_depth + 1
+}
+
+/// Cut one touched actor's stitches and push them onto the pair streams.
+///
+/// The common case reads only the delta and a bounded tail of the old stream
+/// (the last `2 * max_depth - 1` collapsed runs): a pure append's envelope
+/// sits at the boundary, so everything before the tail is common prefix by
+/// construction. An actor whose delta interleaves with stored events (a late
+/// arrival) falls back to reading its whole stream - the cost is that one
+/// actor's history, never the dataset.
+fn stitch_actor(
+    scan: &crate::cursor::ShardScan<'_>,
+    run: &crate::cursor::ActorRun,
+    delta_files: &std::collections::HashSet<String>,
+    max_depth: u32,
+    local: u64,
+    addition: &mut ShardStream,
+    retraction: &mut ShardStream,
+) -> Result<(), EventStoreError> {
+    let (old_pieces, delta_pieces) = split_run(scan, run, delta_files);
+    let old_last = last_key(scan, &old_pieces)?;
+    let delta_first = first_key(scan, &delta_pieces)?;
+    let pure_append = match (old_last, delta_first) {
+        (Some(last), Some(first)) => last < first,
+        _ => true,
+    };
+    let (old_events, prefix) = if pure_append {
+        let (tail, reached_start) = read_tail(scan, &old_pieces, 2 * max_depth - 1)?;
+        let prefix = if reached_start {
+            0
+        } else {
+            saturated_prefix(max_depth)
+        };
+        (tail, prefix)
+    } else {
+        (read_events(scan, old_pieces.clone())?, 0)
+    };
+    let merged_events = if pure_append {
+        let mut events = old_events.clone();
+        events.extend(read_events(scan, delta_pieces)?);
+        events
+    } else {
+        let mut all_pieces = old_pieces;
+        all_pieces.extend(delta_pieces);
+        read_events(scan, all_pieces)?
+    };
+    let merged = stitch::collapse(&merged_events);
+    let old = stitch::collapse(&old_events);
+    let envelope = stitch::envelope(&old, &merged);
+    let merged_len = u32::try_from(merged.codes.len()).expect("stream fits u32");
+    let old_len = u32::try_from(old.codes.len()).expect("stream fits u32");
+    if let Some(slice) = stitch::addition_stitch(merged_len, envelope, max_depth) {
+        push_slice(addition, local, &merged, slice, prefix);
+    }
+    if let Some(slice) = stitch::retraction_stitch(old_len, envelope, max_depth) {
+        push_slice(retraction, local, &old, slice, prefix);
+    }
+    Ok(())
+}
+
+/// Read the touched actors' changed regions and cut both halves of a
+/// refresh's segment pair. Cost tracks the delta plus a bounded tail per
+/// touched actor (`stitch_actor`), never the touched actors' histories.
 fn collect_pair_streams(
     io: &StoreIo,
     dataset: &Dataset,
@@ -824,28 +1041,15 @@ fn collect_pair_streams(
                 if !touched.contains(&(shard, local)) {
                     continue;
                 }
-                let mut merged_events: Vec<(u32, i64)> = Vec::new();
-                let mut old_events: Vec<(u32, i64)> = Vec::new();
-                scan.for_each_event(&run, |file, row, code| {
-                    let when = scan.files[file].ts.i64_at(row)?;
-                    let code = u32::try_from(code).expect("dictionary code fits u32");
-                    merged_events.push((code, when));
-                    if !delta_files.contains(scan.files[file].seg.rel()) {
-                        old_events.push((code, when));
-                    }
-                    Ok(true)
-                })?;
-                let merged = stitch::collapse(&merged_events);
-                let old = stitch::collapse(&old_events);
-                let envelope = stitch::envelope(&old, &merged);
-                let merged_len = u32::try_from(merged.codes.len()).expect("stream fits u32");
-                let old_len = u32::try_from(old.codes.len()).expect("stream fits u32");
-                if let Some(slice) = stitch::addition_stitch(merged_len, envelope, max_depth) {
-                    push_slice(&mut addition, local, &merged, slice);
-                }
-                if let Some(slice) = stitch::retraction_stitch(old_len, envelope, max_depth) {
-                    push_slice(&mut retraction, local, &old, slice);
-                }
+                stitch_actor(
+                    scan,
+                    &run,
+                    delta_files,
+                    max_depth,
+                    local,
+                    &mut addition,
+                    &mut retraction,
+                )?;
             }
             Ok((addition, retraction))
         },
@@ -863,14 +1067,29 @@ fn pair_has_streams(streams: &[ShardStream]) -> bool {
     streams.iter().any(|stream| !stream.actors.is_empty())
 }
 
+/// The suffix-text positions a pair would occupy: events plus one separator
+/// per actor slice, both halves.
+fn pair_positions(halves: [&[ShardStream]; 2]) -> usize {
+    let mut positions = 0usize;
+    for streams in halves {
+        for stream in streams {
+            positions += stream.codes.len() + stream.actors.len();
+        }
+    }
+    positions
+}
+
 /// Extend the index for a refresh with one segment PAIR - an addition owning
 /// the changed window forms and a retraction cancelling the stale forms older
 /// segments still count - leaving every existing segment file untouched.
 ///
-/// Returns `None` when there is no stored manifest to extend (never built, or
-/// a version older than this format), and the caller rebuilds instead. The
-/// pair's cost is proportional to the delta plus the touched actors' changed
-/// envelopes with `max_depth` context - never to their whole histories.
+/// Returns `None` when the caller should rebuild instead: there is no stored
+/// manifest to extend (never built, or a version older than this format), or
+/// the collected pair's positions reach half the dataset's - the crossover
+/// where one sort over the whole dataset is cheaper than one over the pair.
+/// Below the crossover the pair's cost is proportional to the delta plus the
+/// touched actors' changed envelopes with `max_depth` context - never to
+/// their whole histories.
 pub(crate) fn append_pair(
     io: &StoreIo,
     dataset: &Dataset,
@@ -890,6 +1109,19 @@ pub(crate) fn append_pair(
     let (additions, retractions) =
         collect_pair_streams(io, dataset, cfg, touched, &delta_rels, max_depth)?;
     let collected = started.elapsed().as_secs_f64();
+    // The pair costs one suffix sort over its positions; a whole rebuild
+    // costs one over the dataset's. A delta touching most actors carries a
+    // fixed tail-and-retraction context per actor that can exceed the
+    // dataset itself, at which point the rebuild is the CHEAPER way to make
+    // the index current - so the choice is by measured positions, not by
+    // delta size. Half the dataset's positions is the crossover, counting
+    // the pair's own separators against the dataset's events + actors.
+    let dataset_positions =
+        usize::try_from(dataset.record.measured_events + dataset.record.measured_actors)
+            .expect("dataset positions fit usize");
+    if pair_positions([&additions, &retractions]) * 2 >= dataset_positions {
+        return Ok(None);
+    }
     let alphabet = u32::try_from(dataset.event_dict.values.len()).expect("dictionary fits u32");
     let mut segments = manifest.segments;
     let mut next_id = manifest.next_id;
@@ -2398,10 +2630,10 @@ mod tests {
                     let old_len = u32::try_from(old.codes.len()).expect("fits");
                     let local = actor as u64;
                     if let Some(slice) = stitch::addition_stitch(merged_len, envelope, max_depth) {
-                        push_slice(&mut addition, local, &merged, slice);
+                        push_slice(&mut addition, local, &merged, slice, 0);
                     }
                     if let Some(slice) = stitch::retraction_stitch(old_len, envelope, max_depth) {
-                        push_slice(&mut retraction, local, &old, slice);
+                        push_slice(&mut retraction, local, &old, slice, 0);
                     }
                     *events = merged_events;
                 }

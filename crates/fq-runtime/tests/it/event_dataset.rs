@@ -457,6 +457,27 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// Ballast rows: `count` untouched actors with four events each, so a
+/// refresh's pair stays far below the pair-vs-rebuild crossover and the
+/// append mechanism (not the rebuild fallback) is what the test observes.
+fn ballast(micros: &mut Vec<i64>, events: &mut Vec<&'static str>, users: &mut Vec<String>) {
+    // Ballast timestamps sit BELOW every real event so the refresh-key
+    // watermark (max created_at) never filters a test's delta rows.
+    for actor in 0..40 {
+        for step in 0..4 {
+            micros.push(100_000 + actor * 10_000 + step * 1_000);
+            events.push("filler");
+            users.push(format!("ballast{actor}"));
+        }
+    }
+}
+
+/// Write events where user ids are owned strings (the ballast helper's).
+fn write_events_owned(path: &Path, micros: Vec<i64>, events: Vec<&str>, users: &[String]) {
+    let refs: Vec<&str> = users.iter().map(String::as_str).collect();
+    write_events(path, micros, events, refs);
+}
+
 /// A refresh whose delta touches only actors the index has never seen ADDS a
 /// segment instead of rebuilding: the existing segment file is left alone, and
 /// PATHS answers across both.
@@ -469,12 +490,11 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 fn a_refresh_over_new_actors_appends_a_segment_instead_of_rebuilding() {
     let dir = sandbox("segappend");
     let file = dir.join("clicks.parquet");
-    write_events(
-        &file,
-        vec![1_000_000, 2_000_000],
-        vec!["open", "close"],
-        vec!["u1", "u1"],
-    );
+    let mut micros = vec![1_000_000, 2_000_000];
+    let mut events = vec!["open", "close"];
+    let mut users: Vec<String> = vec!["u1".to_string(), "u1".to_string()];
+    ballast(&mut micros, &mut events, &mut users);
+    write_events_owned(&file, micros.clone(), events.clone(), &users);
     let runtime = Runtime::from_config(&event_config(&dir, "evta", &file)).expect("from_config");
     runtime
         .execute(
@@ -497,12 +517,10 @@ fn a_refresh_over_new_actors_appends_a_segment_instead_of_rebuilding() {
     let before = std::fs::read(&first_segment).expect("read segment");
 
     // The delta belongs entirely to u2, an actor no segment covers.
-    write_events(
-        &file,
-        vec![1_000_000, 2_000_000, 3_000_000, 4_000_000],
-        vec!["open", "close", "signup", "purchase"],
-        vec!["u1", "u1", "u2", "u2"],
-    );
+    micros.extend([3_000_000, 4_000_000]);
+    events.extend(["signup", "purchase"]);
+    users.extend(["u2".to_string(), "u2".to_string()]);
+    write_events_owned(&file, micros, events, &users);
     let (_, batches) = runtime
         .execute("REFRESH EVENT DATASET segds")
         .expect("refresh event dataset");
@@ -547,12 +565,11 @@ fn a_refresh_over_new_actors_appends_a_segment_instead_of_rebuilding() {
 fn a_refresh_over_a_returning_actor_appends_a_pair() {
     let dir = sandbox("segrebuild");
     let file = dir.join("clicks.parquet");
-    write_events(
-        &file,
-        vec![1_000_000, 2_000_000],
-        vec!["open", "close"],
-        vec!["u1", "u1"],
-    );
+    let mut micros = vec![1_000_000, 2_000_000];
+    let mut events = vec!["open", "close"];
+    let mut users: Vec<String> = vec!["u1".to_string(), "u1".to_string()];
+    ballast(&mut micros, &mut events, &mut users);
+    write_events_owned(&file, micros.clone(), events.clone(), &users);
     let runtime = Runtime::from_config(&event_config(&dir, "evta", &file)).expect("from_config");
     runtime
         .execute(
@@ -573,12 +590,10 @@ fn a_refresh_over_a_returning_actor_appends_a_pair() {
     let before = std::fs::read(&base_segment).expect("read segment");
 
     // u1 comes back: an actor the base segment already covers.
-    write_events(
-        &file,
-        vec![1_000_000, 2_000_000, 3_000_000],
-        vec!["open", "close", "purchase"],
-        vec!["u1", "u1", "u1"],
-    );
+    micros.push(3_000_000);
+    events.push("purchase");
+    users.push("u1".to_string());
+    write_events_owned(&file, micros, events, &users);
     runtime
         .execute("REFRESH EVENT DATASET retds")
         .expect("refresh event dataset");

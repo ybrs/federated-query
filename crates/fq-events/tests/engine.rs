@@ -898,6 +898,118 @@ fn refresh_appends_a_generation_and_merges_by_time() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Long streams grown by refreshes answer from the segment pairs exactly.
+///
+/// Streams longer than the bounded tail read (2 x 32 - 1 collapsed runs)
+/// force the SATURATED backward-availability path; short streams take the
+/// exact path; one actor's delta interleaves (the late-arrival full-read
+/// fallback) and one delta opens with the actor's last stored code (the
+/// boundary collapse). Two refresh rounds stack two pairs on the base, and
+/// every anchor/depth/range answer must equal the scan's.
+#[test]
+fn refreshed_long_streams_answer_from_pairs_exactly() {
+    let mut rng = Rng(0x5eed_cafe);
+    let names = ["a", "b", "c", "d"];
+    let mut tiebreak = 0_i64;
+    let mut row = |actor: i64, ts: i64, name: &str| {
+        tiebreak += 1;
+        Row {
+            actor: ActorId::Int(actor),
+            ts,
+            tiebreak,
+            name: name.to_string(),
+            device: None,
+        }
+    };
+    let mut base = Vec::new();
+    for actor in 0..12_i64 {
+        let length = if actor < 8 {
+            120
+        } else {
+            1 + rng.below(6) as i64
+        };
+        for position in 0..length {
+            let name = names[rng.below(names.len() as u64) as usize];
+            base.push(row(actor, position * 1_000_000, name));
+        }
+    }
+    let (store, dir) = open_store("pairlong");
+    build_dataset(&store, "pairlong", &base);
+    let cfg = test_config();
+    for round in 0..2_i64 {
+        let mut delta = Vec::new();
+        for actor in 0..12_i64 {
+            if actor % 3 == 2 {
+                continue;
+            }
+            let start_ts = 200_000_000 + round * 100_000_000 + actor * 1_000_000;
+            for position in 0..8_i64 {
+                let name = if actor == 0 && position == 0 {
+                    // The actor's stored streams end in varied codes; "a"
+                    // sometimes matches and collapses across the boundary.
+                    "a"
+                } else {
+                    names[rng.below(names.len() as u64) as usize]
+                };
+                delta.push(row(actor, start_ts + position * 1_000_000, name));
+            }
+            if actor == 3 {
+                // A LATE arrival: a timestamp far inside the stored stream.
+                delta.push(row(actor, 50_000_000, "b"));
+            }
+        }
+        // A brand-new actor every round.
+        delta.push(row(100 + round, 300_000_000, "c"));
+        delta.push(row(100 + round, 301_000_000, "d"));
+        let mut source = VecSource {
+            batches: vec![batch_of(&delta)].into_iter(),
+        };
+        store
+            .append_generation_with("pairlong", &mut source, None, &cfg)
+            .unwrap();
+    }
+    let dataset = store.dataset("pairlong").unwrap();
+    let anchors = [
+        PathAnchor::Unanchored,
+        PathAnchor::StartingAt("a".to_string()),
+        PathAnchor::EndingAt("c".to_string()),
+    ];
+    let ranges = [
+        TimeRange::default(),
+        TimeRange {
+            from: Some(40_000_000),
+            to: Some(250_000_000),
+        },
+    ];
+    for anchor in &anchors {
+        for depth in [2_u32, 3, 5, 8, 13, 32] {
+            for range in ranges {
+                let spec = |maxgap| PathsSpec {
+                    dataset: "pairlong".to_string(),
+                    anchor: anchor.clone(),
+                    depth,
+                    top: 1000,
+                    maxgap_micros: maxgap,
+                    range,
+                    filter: None,
+                    force_scan: false,
+                };
+                let indexed =
+                    fq_events::run_paths(store.io(), &dataset, &spec(None), &cfg).unwrap();
+                let scanned =
+                    fq_events::run_paths(store.io(), &dataset, &spec(Some(i64::MAX)), &cfg)
+                        .unwrap();
+                assert_eq!(
+                    indexed, scanned,
+                    "anchor {anchor:?} depth {depth} range {range:?}"
+                );
+            }
+        }
+    }
+    drop(dataset);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn paths_index_matches_the_scan_for_every_anchor_and_depth() {
     // Streams with short actors (truncated anchored windows), duplicates
