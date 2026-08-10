@@ -2255,16 +2255,174 @@ fn merged_order(ranks: &[u32], a: &(Vec<u64>, u64), b: &(Vec<u64>, u64)) -> Orde
     })
 }
 
-/// Answer one spec from several SIGNED index segments.
+/// The 128-bit fingerprint of a window's code sequence: xxh3 over the codes'
+/// little-endian bytes seeded by the length, the same convention as the scan
+/// path's window fingerprint. Distinct windows collide with probability about
+/// d^2 / 2^129 for d distinct windows.
+fn codes_fingerprint(codes: &[u64]) -> u128 {
+    let mut bytes = Vec::with_capacity(codes.len() * 8);
+    for code in codes {
+        bytes.extend_from_slice(&code.to_le_bytes());
+    }
+    xxhash_rust::xxh3::xxh3_128_with_seed(&bytes, codes.len() as u64)
+}
+
+/// The symbol at `pos` of the direction's text (the backward direction reads
+/// the reversed text without materializing it).
+fn dir_symbol(index: &PathsSa, dir: Direction, pos: usize) -> u32 {
+    match dir {
+        Direction::Forward => index.text.symbol(pos),
+        Direction::Backward => index.text.symbol(index.text.len() - 1 - pos),
+    }
+}
+
+/// The direction's search pattern of a window: its symbols in the order the
+/// direction's suffixes read them (backward suffixes read the window from its
+/// anchor back).
+fn dir_pattern(codes: &[u64], dir: Direction) -> Vec<u32> {
+    let mut pattern: Vec<u32> = Vec::with_capacity(codes.len());
+    for code in codes {
+        pattern.push(u32::try_from(*code).expect("code fits u32") + 1);
+    }
+    if dir == Direction::Backward {
+        pattern.reverse();
+    }
+    pattern
+}
+
+/// The suffix-array interval `[lo, hi)` of suffixes starting with `pattern`,
+/// by binary search over the direction's array.
+fn sa_interval(index: &PathsSa, dir: Direction, pattern: &[u32]) -> (usize, usize) {
+    let sa: &[i32] = match dir {
+        Direction::Forward => &index.sa_fwd,
+        Direction::Backward => &index.sa_bwd,
+    };
+    let n = index.text.len();
+    // Whether the suffix at position `pos` sorts strictly before every string
+    // starting with `pattern` (Less), starts with it (Equal), or after
+    // (Greater). A suffix that ends inside the pattern sorts before it.
+    let versus = |pos: usize| -> Ordering {
+        for (offset, want) in pattern.iter().enumerate() {
+            let at = pos + offset;
+            if at >= n {
+                return Ordering::Less;
+            }
+            match dir_symbol(index, dir, at).cmp(want) {
+                Ordering::Equal => {}
+                unequal => return unequal,
+            }
+        }
+        Ordering::Equal
+    };
+    let position = |suffix: &i32| usize::try_from(*suffix).expect("suffix position fits usize");
+    let lo = sa.partition_point(|suffix| versus(position(suffix)) == Ordering::Less);
+    let hi = lo + sa[lo..].partition_point(|suffix| versus(position(suffix)) == Ordering::Equal);
+    (lo, hi)
+}
+
+/// Count one view's in-range occurrences of a window over its suffix-array
+/// interval: valid, owned, exactly this window LENGTH (a truncated anchored
+/// window's identity includes its length), anchor timestamp admitted.
+#[allow(clippy::too_many_arguments)]
+fn targeted_count(
+    index: &PathsSa,
+    view: usize,
+    dir: Direction,
+    truncate: bool,
+    depth: u32,
+    from: i64,
+    to: i64,
+    codes: &[u64],
+) -> u64 {
+    let pattern = dir_pattern(codes, dir);
+    let (lo, hi) = sa_interval(index, dir, &pattern);
+    let (_, _, avail_sa, ts_sa) = index.arrays(view, dir);
+    let length = u32::try_from(codes.len()).expect("window length fits u32");
+    let mut count = 0u64;
+    for at in lo..hi {
+        let avail = avail_sa[at];
+        let (valid, w) = if truncate {
+            (avail >= 2, depth.min(avail))
+        } else {
+            (avail >= depth, depth)
+        };
+        if !valid || w != length || !index.owns(view, dir, at) {
+            continue;
+        }
+        let anchor_ts = ts_sa[at];
+        if anchor_ts >= from && anchor_ts < to {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// One view's in-range valid window total (its summand of the share
+/// denominator), as a plain pass with no grouping.
+#[allow(clippy::too_many_arguments)]
+fn view_total(
+    index: &PathsSa,
+    view: usize,
+    dir: Direction,
+    truncate: bool,
+    depth: u32,
+    from: i64,
+    to: i64,
+    lo: usize,
+    hi: usize,
+) -> u64 {
+    let (_, _, avail_sa, ts_sa) = index.arrays(view, dir);
+    let mut total = 0u64;
+    for at in lo..hi {
+        let avail = avail_sa[at];
+        let valid = if truncate { avail >= 2 } else { avail >= depth };
+        if !valid || !index.owns(view, dir, at) {
+            continue;
+        }
+        let anchor_ts = ts_sa[at];
+        if anchor_ts >= from && anchor_ts < to {
+            total += 1;
+        }
+    }
+    total
+}
+
+/// One signed sweep surface of the candidate merge: which segment and view,
+/// its sweep target, and (for positive views) the exact count of its K-th
+/// reported group - the bound no unreported window of that view can exceed.
+struct Slot<'a> {
+    index: &'a PathsSa,
+    view: usize,
+    negative: bool,
+    dir: Direction,
+    truncate: bool,
+    lo: usize,
+    hi: usize,
+}
+
+/// One merged window candidate: its codes, its exact signed net so far, and
+/// which slots have already contributed exactly.
+struct Candidate {
+    codes: Vec<u64>,
+    net: i64,
+    seen: Vec<bool>,
+}
+
+/// Answer one spec from several SIGNED index segments, exactly, without
+/// enumerating any view whole.
 ///
-/// Every window instance of the dataset is owned by exactly one positive
-/// segment net of retractions: base segments own everything they hold, a
-/// refresh's addition owns the window forms its envelope changed or created,
-/// and its retraction re-counts the stale forms older segments still hold so
-/// subtracting it cancels them. Counts and in-range totals therefore sum by
-/// window CONTENT across segments, signed. A net-negative window or total is
-/// arithmetically impossible when the invariant holds, so it stops the query
-/// rather than shipping an answer built on a broken index.
+/// Every positive view sweeps with EXACT top-K pruning and reports its K-th
+/// count as a bound; negative views (retractions) are never swept. Each
+/// candidate window any positive view reported gets its exact net by
+/// targeted counts (suffix-array binary search) in every other view, signed.
+/// A window no positive view reported has net at most the sum of the bounds
+/// (negatives only subtract), so once the answer's last row beats that sum,
+/// nothing unseen can displace it; a bound tie retries with a larger K, and
+/// a K past a view's group count drives its bound to zero, so the loop
+/// terminates. Share denominators sum each view's signed in-range totals. A
+/// net-negative candidate or total is arithmetically impossible when the
+/// index is sound, so it stops the query rather than shipping an answer
+/// built on a broken index.
 pub(crate) fn answer_segments(
     indexes: &[&PathsSa],
     names: &[String],
@@ -2284,54 +2442,44 @@ pub(crate) fn answer_segments(
         alphabet = alphabet.max(index.alphabet);
     }
     let ranks = name_ranks(names, alphabet);
-    let mut merged: std::collections::HashMap<Vec<u64>, i64> = std::collections::HashMap::new();
-    let mut total = 0i64;
+    let mut slots: Vec<Slot<'_>> = Vec::new();
     for index in indexes {
         let Some((dir, truncate, lo, hi)) = sweep_target(index, anchor) else {
             continue;
         };
-        for (which, view) in index.views.iter().enumerate() {
-            let sweep = Sweep {
+        for (view, held) in index.views.iter().enumerate() {
+            slots.push(Slot {
                 index,
-                view: which,
+                view,
+                negative: held.negative,
                 dir,
                 truncate,
-                depth: spec.depth,
-                from,
-                to,
-                ranks: &ranks,
-                // Keep every window: see TopSet::offer for why a view must
-                // not prune to `top`.
-                top: usize::MAX,
-            };
-            let (finals, view_total) = sweep_interval(&sweep, lo, hi);
-            let sign: i64 = if view.negative { -1 } else { 1 };
-            total += sign * i64::try_from(view_total).expect("window total fits i64");
-            for group in finals {
-                if group.count == 0 {
-                    continue;
-                }
-                let count = sign * i64::try_from(group.count).expect("window count fits i64");
-                *merged.entry(index.window_codes(dir, &group)).or_insert(0) += count;
-            }
+                lo,
+                hi,
+            });
         }
+    }
+    let mut total = 0i64;
+    for slot in &slots {
+        let summand = view_total(
+            slot.index,
+            slot.view,
+            slot.dir,
+            slot.truncate,
+            spec.depth,
+            from,
+            to,
+            slot.lo,
+            slot.hi,
+        );
+        let sign: i64 = if slot.negative { -1 } else { 1 };
+        total += sign * i64::try_from(summand).expect("window total fits i64");
     }
     assert!(
         total >= 0,
         "paths index invariant broken: net in-range window total {total} is negative"
     );
-    let mut ordered: Vec<(Vec<u64>, u64)> = Vec::with_capacity(merged.len());
-    for (codes, count) in merged {
-        assert!(
-            count >= 0,
-            "paths index invariant broken: window {codes:?} has net count {count}"
-        );
-        if count > 0 {
-            ordered.push((codes, u64::try_from(count).expect("checked non-negative")));
-        }
-    }
-    ordered.sort_unstable_by(|a, b| merged_order(&ranks, a, b));
-    ordered.truncate(spec.top as usize);
+    let ordered = ranked_candidates(&slots, spec, from, to, &ranks);
     let total = u64::try_from(total).expect("checked non-negative");
     let rows = ordered
         .into_iter()
@@ -2351,6 +2499,109 @@ pub(crate) fn answer_segments(
         })
         .collect();
     PathsResult { rows }
+}
+
+/// The exact top candidates across the slots: pruned positive sweeps,
+/// targeted fills, and the bound-checked retry described on
+/// `answer_segments`.
+fn ranked_candidates(
+    slots: &[Slot<'_>],
+    spec: &PathsSpec,
+    from: i64,
+    to: i64,
+    ranks: &[u32],
+) -> Vec<(Vec<u64>, u64)> {
+    let mut keep = (spec.top as usize).max(16);
+    loop {
+        let mut candidates: std::collections::HashMap<u128, Candidate> =
+            std::collections::HashMap::new();
+        let mut bound_sum = 0i64;
+        for (which, slot) in slots.iter().enumerate() {
+            if slot.negative {
+                continue;
+            }
+            let sweep = Sweep {
+                index: slot.index,
+                view: slot.view,
+                dir: slot.dir,
+                truncate: slot.truncate,
+                depth: spec.depth,
+                from,
+                to,
+                ranks,
+                top: keep,
+            };
+            let (mut finals, _) = sweep_interval(&sweep, slot.lo, slot.hi);
+            finals.retain(|group| group.count > 0);
+            finals.sort_unstable_by(|a, b| slot.index.selection_order(ranks, slot.dir, a, b));
+            // A sweep that returned K or more groups may have pruned
+            // in-chunk, so its K-th count bounds anything unreported; fewer
+            // than K means nothing anywhere was pruned and the view is
+            // exhaustive.
+            if finals.len() >= keep {
+                finals.truncate(keep);
+                bound_sum += i64::try_from(finals[keep - 1].count).expect("count fits i64");
+            }
+            for group in finals {
+                let codes = slot.index.window_codes(slot.dir, &group);
+                let entry = candidates
+                    .entry(codes_fingerprint(&codes))
+                    .or_insert_with(|| Candidate {
+                        codes,
+                        net: 0,
+                        seen: vec![false; slots.len()],
+                    });
+                entry.net += i64::try_from(group.count).expect("count fits i64");
+                entry.seen[which] = true;
+            }
+        }
+        for candidate in candidates.values_mut() {
+            for (which, slot) in slots.iter().enumerate() {
+                if candidate.seen[which] {
+                    continue;
+                }
+                let count = targeted_count(
+                    slot.index,
+                    slot.view,
+                    slot.dir,
+                    slot.truncate,
+                    spec.depth,
+                    from,
+                    to,
+                    &candidate.codes,
+                );
+                let sign: i64 = if slot.negative { -1 } else { 1 };
+                candidate.net += sign * i64::try_from(count).expect("count fits i64");
+                candidate.seen[which] = true;
+            }
+            assert!(
+                candidate.net >= 0,
+                "paths index invariant broken: window {:?} has net count {}",
+                candidate.codes,
+                candidate.net
+            );
+        }
+        let mut ranked: Vec<(Vec<u64>, u64)> = Vec::with_capacity(candidates.len());
+        for candidate in candidates.into_values() {
+            if candidate.net > 0 {
+                ranked.push((
+                    candidate.codes,
+                    u64::try_from(candidate.net).expect("checked non-negative"),
+                ));
+            }
+        }
+        ranked.sort_unstable_by(|a, b| merged_order(ranks, a, b));
+        ranked.truncate(spec.top as usize);
+        // An unseen window may hold up to bound_sum: the answer is final
+        // only when it is FULL and its weakest row strictly beats that (a
+        // tie could still lose by name order), or nothing was pruned at all.
+        let full = ranked.len() >= spec.top as usize;
+        let last = ranked.last().map_or(0, |(_, count)| *count);
+        if bound_sum == 0 || (full && i64::try_from(last).expect("count fits i64") > bound_sum) {
+            return ranked;
+        }
+        keep *= 4;
+    }
 }
 
 /// Assemble the result: sweep the variant's interval, rank candidates by
