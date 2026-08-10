@@ -48,11 +48,18 @@ pub enum Statement<'a> {
     Query(&'a str),
     /// `CREATE MATERIALIZED VIEW <name> AS <select>`: the view name and the
     /// defining SELECT text (stored verbatim as the view's definition).
-    CreateMaterializedView { name: String, select_sql: &'a str },
+    CreateMaterializedView {
+        name: String,
+        select_sql: &'a str,
+    },
     /// `REFRESH MATERIALIZED VIEW <name>`.
-    RefreshMaterializedView { name: String },
+    RefreshMaterializedView {
+        name: String,
+    },
     /// `DROP MATERIALIZED VIEW <name>`.
-    DropMaterializedView { name: String },
+    DropMaterializedView {
+        name: String,
+    },
     /// `CREATE [OR REPLACE] VIEW <name> [(col, ...)] AS <select>`: a
     /// non-materialized view, expanded at plan time so it always reads current
     /// data. `column_aliases` renames the SELECT's outputs positionally.
@@ -63,7 +70,9 @@ pub enum Statement<'a> {
         or_replace: bool,
     },
     /// `DROP VIEW <name>`.
-    DropView { name: String },
+    DropView {
+        name: String,
+    },
     /// `SHOW VIEWS`: list every registered non-materialized view.
     ShowViews,
     /// `SHOW SETTINGS`: list every engine setting.
@@ -76,14 +85,21 @@ pub enum Statement<'a> {
     ShowMaterializedViews,
     /// `SHOW SETTING <name>`: show the one setting named (dotted, e.g.
     /// `optimizer.planning_budget_ms`).
-    ShowSetting { name: String },
+    ShowSetting {
+        name: String,
+    },
     /// `SET <name> = <value>` (or `SET <name> TO <value>`): change one
     /// session-mutable setting on the live runtime. `value` is the raw text after
     /// the assignment (surrounding quotes stripped); the runtime type-checks it.
-    SetSetting { name: String, value: String },
+    SetSetting {
+        name: String,
+        value: String,
+    },
     /// `RESET <name>` restores one setting to its default; `RESET ALL`
     /// (`name` is `None`) restores every session override.
-    ResetSetting { name: Option<String> },
+    ResetSetting {
+        name: Option<String>,
+    },
     /// `CREATE DATASOURCE <name> TYPE <kind> WITH ( key = 'value', ... )`: the
     /// datasource name, its connector kind, and the ordered connection params.
     /// Values are strings (a bare integer is accepted for numeric params); the
@@ -94,12 +110,16 @@ pub enum Statement<'a> {
         params: Vec<(String, String)>,
     },
     /// `DROP DATASOURCE <name>`.
-    DropDatasource { name: String },
+    DropDatasource {
+        name: String,
+    },
     /// `SHOW DATASOURCES`: list every bootstrap and dynamic datasource.
     ShowDatasources,
     /// `SHOW TABLES [FROM <datasource>]`: list every catalog table as
     /// (datasource, schema, table) rows, narrowed to one datasource when named.
-    ShowTables { datasource: Option<String> },
+    ShowTables {
+        datasource: Option<String>,
+    },
     /// `DESCRIBE <table>` / `<schema>.<table>` / `<datasource>.<schema>.<table>`:
     /// the columns of one catalog table, resolved with the same semantics as a
     /// FROM reference (missing qualifiers search every registered schema).
@@ -116,11 +136,19 @@ pub enum Statement<'a> {
         superuser: bool,
     },
     /// `ALTER USER <name> WITH PASSWORD '<plaintext>'`.
-    AlterUserPassword { name: String, password: String },
+    AlterUserPassword {
+        name: String,
+        password: String,
+    },
     /// `ALTER USER <name> WITH [SUPERUSER | NOSUPERUSER]`.
-    AlterUserSuperuser { name: String, superuser: bool },
+    AlterUserSuperuser {
+        name: String,
+        superuser: bool,
+    },
     /// `DROP USER <name>`.
-    DropUser { name: String },
+    DropUser {
+        name: String,
+    },
     /// `GRANT SELECT ON <object> TO <grantee>`.
     Grant {
         object: GrantObject,
@@ -134,20 +162,33 @@ pub enum Statement<'a> {
     /// `SHOW USERS`: list every user (superuser-gated).
     ShowUsers,
     /// `SHOW GRANTS [FOR <grantee>]`.
-    ShowGrants { grantee: Option<String> },
+    ShowGrants {
+        grantee: Option<String>,
+    },
     /// `CREATE EVENT DATASET <name> FROM ... ACTOR ... TIME ... EVENT ...`.
     CreateEventDataset(fq_common::events::EventDatasetDef),
     /// `REFRESH EVENT DATASET <name>`: incremental append past the watermark.
-    RefreshEventDataset { name: String },
+    RefreshEventDataset {
+        name: String,
+    },
     /// `REBUILD EVENT DATASET <name>`: full re-ingest from the source.
-    RebuildEventDataset { name: String },
+    RebuildEventDataset {
+        name: String,
+    },
+    CompactEventDataset {
+        name: String,
+    },
     /// `DROP EVENT DATASET <name>`.
-    DropEventDataset { name: String },
+    DropEventDataset {
+        name: String,
+    },
     /// `SHOW EVENT DATASETS`: list every event dataset with its build state.
     ShowEventDatasets,
     /// `SHOW EVENTS FROM <dataset>`: the distinct event names of one dataset,
     /// read from its dictionary (no data scan).
-    ShowEvents { dataset: String },
+    ShowEvents {
+        dataset: String,
+    },
     /// `FUNNEL ( <event>, ... ) ON <dataset> WINDOW <interval> ...`.
     EventFunnel(fq_common::events::FunnelSpec),
     /// `RETENTION ON <dataset> BIRTH ... RETURN ... PERIOD ...`.
@@ -216,6 +257,7 @@ pub fn classify_statement(sql: &str) -> Result<Statement<'_>, ParseError> {
         }
         "REFRESH" => classify_refresh(&mut tokens),
         "REBUILD" => crate::events::classify_rebuild_event(&mut tokens),
+        "COMPACT" => crate::events::classify_compact_event(&mut tokens),
         "CREATE" if second_word_is(sql, "EVENT") => {
             crate::events::classify_create_event(&mut tokens)
         }

@@ -225,6 +225,20 @@ pub(crate) fn classify_rebuild_event<'a>(
     Ok(Statement::RebuildEventDataset { name })
 }
 
+/// Parse `COMPACT EVENT DATASET <name>`: fold the dataset's paths-index
+/// segments into one base. COMPACT exists for nothing but this family, so
+/// any other second word raises naming the form.
+pub(crate) fn classify_compact_event<'a>(
+    tokens: &mut Tokenizer<'a>,
+) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("COMPACT")?;
+    tokens.expect_keyword("EVENT")?;
+    tokens.expect_keyword("DATASET")?;
+    let name = view_name(tokens, "event dataset")?;
+    expect_end(tokens, "COMPACT EVENT DATASET")?;
+    Ok(Statement::CompactEventDataset { name })
+}
+
 /// Parse `DROP EVENT DATASET <name>`.
 pub(crate) fn classify_drop_event<'a>(
     tokens: &mut Tokenizer<'a>,
@@ -1160,6 +1174,22 @@ mod tests {
         assert!(!spec.force_scan);
 
         let error = classify_statement("PATHS ON web USING SCAN DEPTH 3").unwrap_err();
+        assert!(matches!(
+            error,
+            ParseError::Unsupported(_) | ParseError::Parse(_)
+        ));
+    }
+
+    /// COMPACT EVENT DATASET classifies like its lifecycle siblings.
+    #[test]
+    fn compact_event_dataset_parses() {
+        assert_eq!(
+            classify("COMPACT EVENT DATASET web"),
+            Statement::CompactEventDataset {
+                name: "web".to_string()
+            }
+        );
+        let error = classify_statement("COMPACT EVENT DATASET web extra").unwrap_err();
         assert!(matches!(
             error,
             ParseError::Unsupported(_) | ParseError::Parse(_)

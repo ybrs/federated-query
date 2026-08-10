@@ -403,6 +403,7 @@ impl Runtime {
             Statement::CreateEventDataset(def) => self.create_event_dataset(&def),
             Statement::RefreshEventDataset { name } => self.refresh_event_dataset(&name),
             Statement::RebuildEventDataset { name } => self.rebuild_event_dataset(&name),
+            Statement::CompactEventDataset { name } => self.compact_event_dataset(&name),
             Statement::DropEventDataset { name } => self.drop_event_dataset(&name),
             Statement::ShowEventDatasets => self.show_event_datasets(),
             Statement::ShowEvents { dataset } => self.show_events(&dataset),

@@ -345,6 +345,23 @@ impl EventStore {
         paths_sa::rebuild(&self.io, &dataset, cfg)
     }
 
+    /// `COMPACT EVENT DATASET`: fold the paths index's accumulated segments
+    /// into one base, online, returning the status summary.
+    pub fn compact_dataset(&self, name: &str, cfg: &EventsConfig) -> Result<String, EventError> {
+        let dataset = self.dataset(name)?;
+        paths_sa::compact(&self.io, &dataset, cfg)
+    }
+
+    /// Rebuild the paths index in place over the current generation set (an
+    /// operational repair; REBUILD EVENT DATASET re-pulls the data too).
+    pub fn rebuild_paths_index(
+        &self,
+        name: &str,
+        cfg: &EventsConfig,
+    ) -> Result<String, EventError> {
+        self.build_paths_index(name, cfg)
+    }
+
     /// Extend the paths index for a refresh, falling back to a full rebuild.
     ///
     /// The cheap path appends one segment PAIR - an addition owning the

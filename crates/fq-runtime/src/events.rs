@@ -326,6 +326,18 @@ impl Runtime {
 
     /// `REBUILD EVENT DATASET`: re-pull the whole source into a fresh tree
     /// and swap it in.
+    /// `COMPACT EVENT DATASET`: fold the paths index's segments into one
+    /// base, online.
+    pub(crate) fn compact_event_dataset(
+        &self,
+        name: &str,
+    ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
+        let store = self.event_store()?;
+        let config = self.config_snapshot();
+        let report = store.compact_dataset(name, &config.events)?;
+        status_result(&format!("COMPACT EVENT DATASET: {report}"))
+    }
+
     pub(crate) fn rebuild_event_dataset(
         &self,
         name: &str,

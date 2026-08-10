@@ -40,6 +40,7 @@ CREATE EVENT DATASET web FROM ev.main.events
 Lifecycle:
 ```
 REFRESH EVENT DATASET web      -- append events past the last refresh_key watermark
+COMPACT EVENT DATASET web      -- fold the paths index's refresh segments into one
 REBUILD EVENT DATASET web      -- full rebuild from the source
 DROP EVENT DATASET web         -- remove the dataset and its store
 SHOW EVENT DATASETS            -- list datasets, row counts, build info, watermark

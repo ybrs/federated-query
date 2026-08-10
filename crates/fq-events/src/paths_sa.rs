@@ -349,6 +349,10 @@ struct SliceMeta {
 /// One shard's duplicate-collapsed streams: `codes[bounds[i]..bounds[i + 1]]`
 /// (and the aligned timestamps) is actor i's sequence.
 struct ShardStream {
+    /// The shard the streams came from. Shard results arrive in completion
+    /// order; sorting on this before assembly is what makes every index
+    /// build a deterministic function of the store.
+    shard: u32,
     codes: Vec<u32>,
     ts: Vec<i64>,
     bounds: Vec<u32>,
@@ -437,6 +441,7 @@ fn collect_streams(
                 actors.push(local);
             }
             Ok(ShardStream {
+                shard,
                 codes,
                 ts,
                 bounds,
@@ -449,6 +454,7 @@ fn collect_streams(
             Ok(())
         },
     )?;
+    streams.sort_by_key(|stream| stream.shard);
     Ok(streams)
 }
 
@@ -885,8 +891,9 @@ struct ActorViewMeta {
 }
 
 /// An empty pair stream carrying the given view signs.
-fn empty_pair_stream(signs: Vec<bool>) -> ShardStream {
+fn empty_pair_stream(shard: u32, signs: Vec<bool>) -> ShardStream {
     ShardStream {
+        shard,
         codes: Vec::new(),
         ts: Vec::new(),
         bounds: vec![0],
@@ -1193,9 +1200,9 @@ fn collect_pair_streams(
         cfg,
         |scan| {
             let shard = scan.shard();
-            let mut dual = empty_pair_stream(vec![false, true]);
-            let mut late_addition = empty_pair_stream(vec![false]);
-            let mut late_retraction = empty_pair_stream(vec![true]);
+            let mut dual = empty_pair_stream(shard, vec![false, true]);
+            let mut late_addition = empty_pair_stream(shard, vec![false]);
+            let mut late_retraction = empty_pair_stream(shard, vec![true]);
             let (locals, runs) = scan.actor_runs_with_locals();
             for (local, run) in locals.into_iter().zip(runs) {
                 if !touched.contains(&(shard, local)) {
@@ -1221,6 +1228,9 @@ fn collect_pair_streams(
             Ok(())
         },
     )?;
+    duals.sort_by_key(|stream| stream.shard);
+    late_additions.sort_by_key(|stream| stream.shard);
+    late_retractions.sort_by_key(|stream| stream.shard);
     Ok((duals, late_additions, late_retractions))
 }
 
@@ -1328,6 +1338,72 @@ pub(crate) fn append_pair(
          (collect {collected:.3}s, stitch {:.3}s)",
         total - collected
     )))
+}
+
+/// Fold the index's segments into ONE base segment, ONLINE: queries keep
+/// answering from the current segment set until the folded base publishes.
+///
+/// The fold is a from-scratch base build over the dataset's current streams -
+/// every addition, retraction, and stale truncated form annihilates
+/// structurally because the collected streams ARE the net the signed views
+/// described - so the folded segment is byte-identical to what a rebuild
+/// would write. The ordering is what differs from rebuild: files first (at a
+/// never-used id), the manifest swap second (atomic overwrite; the manifest
+/// is re-read per query, never cached), the superseded segment files deleted
+/// last. A crash before the swap leaves the old index answering and an
+/// orphan file the next fold or rebuild deletes; a crash after it leaves
+/// superseded files the same cleanup collects.
+pub(crate) fn compact(
+    io: &StoreIo,
+    dataset: &Dataset,
+    cfg: &fq_common::events::EventsConfig,
+) -> Result<String, EventError> {
+    let Some((manifest_path, manifest)) = read_stored_manifest(io, dataset)? else {
+        return rebuild(io, dataset, cfg);
+    };
+    let folded = manifest.segments.len();
+    if folded <= 1 {
+        return Ok("paths index: already one segment, nothing to fold".to_string());
+    }
+    let started = std::time::Instant::now();
+    let streams = collect_streams(io, dataset, cfg, None)?;
+    let collected = started.elapsed().as_secs_f64();
+    let alphabet = u32::try_from(dataset.event_dict.values.len()).expect("dictionary fits u32");
+    let index = assemble(&streams, alphabet, 0)?;
+    drop(streams);
+    let sorted = started.elapsed().as_secs_f64();
+    let positions = index.text.len();
+    let base_id = manifest.next_id;
+    let written = write_segment(io, dataset, &index, base_id, SEGMENT_STAMP)?;
+    let stamp = fingerprint(dataset);
+    let next = IndexManifest {
+        next_id: base_id + 1,
+        segments: vec![SegmentEntry { id: base_id }],
+    };
+    let next_path = manifest_rel(dataset);
+    io.put_verified(&next_path, encode_manifest(&next, stamp))?;
+    if manifest_path != next_path {
+        io.delete(&manifest_path)?;
+    }
+    for rel in location_files_with_prefix(io, &dataset.record.location, "paths_f_")?
+        .into_iter()
+        .chain(location_files_with_prefix(
+            io,
+            &dataset.record.location,
+            "paths_b_",
+        )?)
+    {
+        if rel != fwd_rel(dataset, base_id) && rel != bwd_rel(dataset, base_id) {
+            io.delete(&rel)?;
+        }
+    }
+    let total = started.elapsed().as_secs_f64();
+    Ok(format!(
+        "paths index: {folded} segments folded into 1, {positions} positions, \
+         {written} bytes, {total:.3}s (collect {collected:.3}s, sort {:.3}s, write {:.3}s)",
+        sorted - collected,
+        total - sorted
+    ))
 }
 
 pub(crate) fn rebuild(
@@ -2709,7 +2785,8 @@ mod tests {
     /// Pack synthetic streams into shard form (three shards, round-robin).
     fn shard_streams(streams: &[(Vec<u32>, Vec<i64>)]) -> Vec<ShardStream> {
         let mut shards: Vec<ShardStream> = (0..3)
-            .map(|_| ShardStream {
+            .map(|shard| ShardStream {
+                shard: u32::try_from(shard).expect("shard fits u32"),
                 codes: Vec::new(),
                 ts: Vec::new(),
                 bounds: vec![0],
@@ -3096,9 +3173,9 @@ mod tests {
             let mut indexes: Vec<PathsSa> =
                 vec![assemble(&shard_streams(&base), alphabet, 0).expect("base")];
             for round in 0..2 {
-                let mut dual = empty_pair_stream(vec![false, true]);
-                let mut late_addition = empty_pair_stream(vec![false]);
-                let mut late_retraction = empty_pair_stream(vec![true]);
+                let mut dual = empty_pair_stream(0, vec![false, true]);
+                let mut late_addition = empty_pair_stream(0, vec![false]);
+                let mut late_retraction = empty_pair_stream(0, vec![true]);
                 // A couple of brand-new actors join every round.
                 for _ in 0..2 {
                     current.push(Vec::new());
@@ -3279,9 +3356,9 @@ mod tests {
             let mut indexes: Vec<PathsSa> =
                 vec![assemble(&shard_streams(&base), alphabet, 0).expect("base")];
             for _round in 0..2 {
-                let mut dual = empty_pair_stream(vec![false, true]);
-                let mut late_addition = empty_pair_stream(vec![false]);
-                let mut late_retraction = empty_pair_stream(vec![true]);
+                let mut dual = empty_pair_stream(0, vec![false, true]);
+                let mut late_addition = empty_pair_stream(0, vec![false]);
+                let mut late_retraction = empty_pair_stream(0, vec![true]);
                 for (actor, events) in current.iter_mut().enumerate() {
                     if rng.next(3) == 0 {
                         continue;
@@ -3411,9 +3488,9 @@ mod tests {
                 .collect();
             let mut indexes: Vec<PathsSa> =
                 vec![assemble(&shard_streams(&base), alphabet, 0).expect("base")];
-            let mut dual = empty_pair_stream(vec![false, true]);
-            let mut late_addition = empty_pair_stream(vec![false]);
-            let mut late_retraction = empty_pair_stream(vec![true]);
+            let mut dual = empty_pair_stream(0, vec![false, true]);
+            let mut late_addition = empty_pair_stream(0, vec![false]);
+            let mut late_retraction = empty_pair_stream(0, vec![true]);
             for (actor, events) in current.iter_mut().enumerate() {
                 let delta = synth_late_delta(&mut rng, events, u64::from(alphabet));
                 let merged_events = merge_events(events, &delta);

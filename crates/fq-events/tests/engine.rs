@@ -906,6 +906,85 @@ fn refresh_appends_a_generation_and_merges_by_time() {
 /// fallback) and one delta opens with the actor's last stored code (the
 /// boundary collapse). Two refresh rounds stack two pairs on the base, and
 /// every anchor/depth/range answer must equal the scan's.
+/// A fold writes byte-for-byte what a rebuild would: the collected streams
+/// ARE the net that the signed views described, so compaction and rebuild
+/// must be the same deterministic function of the store - only the file id
+/// in the NAME differs.
+#[test]
+fn compaction_is_byte_identical_to_a_rebuild() {
+    let mut rng = Rng(0x0dd_ba11);
+    let names = ["a", "b", "c"];
+    let mut tiebreak = 0_i64;
+    let mut row = |actor: i64, ts: i64, name: &str| {
+        tiebreak += 1;
+        Row {
+            actor: ActorId::Int(actor),
+            ts,
+            tiebreak,
+            name: name.to_string(),
+            device: None,
+        }
+    };
+    let mut base = Vec::new();
+    for actor in 0..20_i64 {
+        for position in 0..30_i64 {
+            let name = names[rng.below(names.len() as u64) as usize];
+            base.push(row(actor, position * 1_000_000, name));
+        }
+    }
+    let (store, dir) = open_store("bytecompact");
+    build_dataset(&store, "bytecompact", &base);
+    let cfg = test_config();
+    let mut delta = Vec::new();
+    for actor in 0..20_i64 {
+        let name = names[rng.below(names.len() as u64) as usize];
+        delta.push(row(actor, 100_000_000, name));
+    }
+    let mut source = VecSource {
+        batches: vec![batch_of(&delta)].into_iter(),
+    };
+    store
+        .append_generation_with("bytecompact", &mut source, None, &cfg)
+        .unwrap();
+    let index_bytes = |tag: &str| -> Vec<Vec<u8>> {
+        let mut found: Vec<std::path::PathBuf> = Vec::new();
+        for entry in std::fs::read_dir(
+            dir.join("events")
+                .join(&store.dataset("bytecompact").unwrap().record.location),
+        )
+        .unwrap()
+        {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if name.starts_with(tag) {
+                found.push(path);
+            }
+        }
+        found.sort();
+        found
+            .into_iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect()
+    };
+    let folded = store.compact_dataset("bytecompact", &cfg).unwrap();
+    assert!(folded.contains("folded into 1"), "{folded}");
+    let compacted_f = index_bytes("paths_f_");
+    let compacted_b = index_bytes("paths_b_");
+    store.rebuild_paths_index("bytecompact", &cfg).unwrap();
+    assert_eq!(
+        compacted_f,
+        index_bytes("paths_f_"),
+        "forward halves differ"
+    );
+    assert_eq!(
+        compacted_b,
+        index_bytes("paths_b_"),
+        "backward halves differ"
+    );
+    drop(store);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A refresh that rebuilds the index (the pair-vs-rebuild crossover) must
 /// not leave a warm process serving the PREVIOUS base segment. Segment files
 /// are cached by path under an immutability assumption, so the rebuilt base

@@ -630,6 +630,75 @@ fn a_refresh_over_a_returning_actor_appends_a_pair() {
     }
 }
 
+/// COMPACT folds accumulated index segments into one base, online, and the
+/// answers afterwards are scan-exact. The refresh before it appends a pair
+/// (three index file pairs incl. base), the fold leaves exactly one.
+#[test]
+fn compact_folds_the_index_to_one_segment() {
+    let dir = sandbox("compact");
+    let file = dir.join("clicks.parquet");
+    let mut micros = vec![1_000_000, 2_000_000];
+    let mut events = vec!["open", "close"];
+    let mut users: Vec<String> = vec!["u1".to_string(), "u1".to_string()];
+    ballast(&mut micros, &mut events, &mut users);
+    write_events_owned(&file, micros.clone(), events.clone(), &users);
+    let runtime = Runtime::from_config(&event_config(&dir, "evta", &file)).expect("from_config");
+    runtime
+        .execute(
+            "CREATE EVENT DATASET cds FROM evta.main.evta \
+             ACTOR user_id TIME created_at EVENT event \
+             WITH (refresh_key = 'created_at')",
+        )
+        .expect("create event dataset");
+    micros.push(3_000_000);
+    events.push("purchase");
+    users.push("u1".to_string());
+    write_events_owned(&file, micros, events, &users);
+    runtime
+        .execute("REFRESH EVENT DATASET cds")
+        .expect("refresh event dataset");
+    assert!(
+        index_files(&dir, "paths_f_") > 1,
+        "the refresh must stack a segment for the fold to be observable"
+    );
+    let (_, batches) = runtime
+        .execute("COMPACT EVENT DATASET cds")
+        .expect("compact event dataset");
+    assert!(
+        status_text(&batches).contains("folded into 1"),
+        "unexpected status: {}",
+        status_text(&batches)
+    );
+    assert_eq!(index_files(&dir, "paths_f_"), 1, "one base after the fold");
+    assert_eq!(index_files(&dir, "paths_m_"), 1, "exactly one manifest");
+    let (_, indexed) = runtime
+        .execute("PATHS ON cds DEPTH 3 TOP 10")
+        .expect("paths after compact");
+    let (_, scanned) = runtime
+        .execute("PATHS ON cds DEPTH 3 TOP 10 USING SCAN")
+        .expect("scan after compact");
+    let text = |batches: &[RecordBatch]| {
+        let events = batches[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("event names are Utf8");
+        (0..events.len())
+            .map(|row| events.value(row).to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(text(&indexed), text(&scanned), "fold changed an answer");
+    // A second COMPACT has nothing to fold and says so.
+    let (_, batches) = runtime
+        .execute("COMPACT EVENT DATASET cds")
+        .expect("second compact");
+    assert!(
+        status_text(&batches).contains("already one segment"),
+        "unexpected status: {}",
+        status_text(&batches)
+    );
+}
+
 /// The window-length contract: DEPTH above the dataset's max_paths_depth
 /// raises a typed error naming the bound and the escape hatch, USING SCAN
 /// serves the same statement exactly from the stream scan, and SHOW EVENT
