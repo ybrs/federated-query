@@ -1335,6 +1335,16 @@ pub(crate) fn rebuild(
     dataset: &Dataset,
     cfg: &fq_common::events::EventsConfig,
 ) -> Result<String, EventError> {
+    // The rebuilt base lands at a NEVER-USED file id. Segment files are
+    // cached by path under an immutability assumption, so writing new bytes
+    // at an old path would leave every warm process serving the previous
+    // base - subtly wrong counts, and the signed merge's invariant tripping
+    // on the next refresh's retractions. Ids continue from the stored
+    // manifest, whatever dataset state it was written for.
+    let base_id = match read_stored_manifest(io, dataset)? {
+        Some((_, manifest)) => manifest.next_id,
+        None => 0,
+    };
     for stale in location_files_with_prefix(io, &dataset.record.location, "paths_")? {
         io.delete(&stale)?;
     }
@@ -1347,12 +1357,12 @@ pub(crate) fn rebuild(
     let sorted = started.elapsed().as_secs_f64();
     let positions = index.text.len();
     let stamp = fingerprint(dataset);
-    let written = write_segment(io, dataset, &index, 0, SEGMENT_STAMP)?;
+    let written = write_segment(io, dataset, &index, base_id, SEGMENT_STAMP)?;
     // The manifest goes last: until it exists there is no index, so a crash
     // between the segment files and here leaves a dataset that scans.
     let manifest = IndexManifest {
-        next_id: 1,
-        segments: vec![SegmentEntry { id: 0 }],
+        next_id: base_id + 1,
+        segments: vec![SegmentEntry { id: base_id }],
     };
     io.put_verified(&manifest_rel(dataset), encode_manifest(&manifest, stamp))?;
     let total = started.elapsed().as_secs_f64();
@@ -2915,7 +2925,12 @@ mod tests {
                 }
                 for stream in [dual, late_addition, late_retraction] {
                     if !stream.actors.is_empty() {
-                        indexes.push(assemble(&[stream], alphabet, max_depth).expect("stitch"));
+                        let built = assemble(&[stream], alphabet, max_depth).expect("stitch");
+                        // Production segments live on disk: every stitch must
+                        // survive the encode/decode round trip exactly.
+                        let fwd = encode_fwd(&built, 42);
+                        let bwd = encode_bwd(&built, 42);
+                        indexes.push(decode(&fwd, &bwd, "stitch.psax", 42).expect("round trip"));
                     }
                 }
                 let finals: Vec<(Vec<u32>, Vec<i64>)> = current
@@ -2957,6 +2972,283 @@ mod tests {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// Synthesize a hostile LATE delta: several events whose timestamps land
+    /// UNIFORMLY inside the actor's existing range (multiple insertion
+    /// points), often colliding with stored timestamps (the arrival tiebreak
+    /// puts them after) and often duplicating the neighbor's code (collapse
+    /// churn at the insertion).
+    fn synth_late_delta(rng: &mut Lcg, base: &[(u32, i64)], alphabet: u64) -> Vec<(u32, i64)> {
+        let mut delta: Vec<(u32, i64)> = Vec::new();
+        let span = base.last().map_or(1_000, |event| event.1);
+        let count = 1 + rng.next(5);
+        for _ in 0..count {
+            let at = rng.next(base.len().max(1) as u64) as usize;
+            let ts = match rng.next(3) {
+                0 => base.get(at).map_or(500, |event| event.1),
+                1 => base.get(at).map_or(500, |event| event.1) + 1,
+                _ => 1 + i64::try_from(rng.next(span.max(1) as u64)).expect("ts fits"),
+            };
+            let code = match rng.next(3) {
+                0 => base.get(at).map_or(0, |event| event.0),
+                1 => base.get(at + 1).or(base.last()).map_or(0, |event| event.0),
+                _ => u32::try_from(rng.next(alphabet)).expect("code fits"),
+            };
+            delta.push((code, ts));
+        }
+        delta.sort_by_key(|event| event.1);
+        delta
+    }
+
+    /// The late-arrival geometry under hostile pressure: a tiny alphabet
+    /// (maximal collapse and adjacency effects), every delta landing INSIDE
+    /// the stored stream (multiple insertion points, timestamp ties,
+    /// neighbor-code duplicates), depths up to the bound, many seeds. Every
+    /// signed answer must equal brute force over the final streams.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn late_arrival_pairs_match_brute_force() {
+        let names: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let alphabet = u32::try_from(names.len()).expect("alphabet fits");
+        let max_depth = 16u32;
+        for seed in 0..24u64 {
+            let mut rng = Lcg(seed.wrapping_mul(0x9E37_79B9).wrapping_add(7));
+            let base = synth_streams(16, u64::from(alphabet), seed + 100);
+            let mut current: Vec<Vec<(u32, i64)>> = base
+                .iter()
+                .map(|(codes, ts)| codes.iter().copied().zip(ts.iter().copied()).collect())
+                .collect();
+            let mut indexes: Vec<PathsSa> =
+                vec![assemble(&shard_streams(&base), alphabet, 0).expect("base")];
+            for _round in 0..2 {
+                let mut dual = empty_pair_stream(vec![false, true]);
+                let mut late_addition = empty_pair_stream(vec![false]);
+                let mut late_retraction = empty_pair_stream(vec![true]);
+                for (actor, events) in current.iter_mut().enumerate() {
+                    if rng.next(3) == 0 {
+                        continue;
+                    }
+                    let delta = synth_late_delta(&mut rng, events, u64::from(alphabet));
+                    let merged_events = merge_events(events, &delta);
+                    let old = stitch::collapse(events);
+                    let merged = stitch::collapse(&merged_events);
+                    let envelope = stitch::envelope(&old, &merged);
+                    let merged_len = u32::try_from(merged.codes.len()).expect("fits");
+                    let old_len = u32::try_from(old.codes.len()).expect("fits");
+                    let local = actor as u64;
+                    let pure_append = match (events.last(), delta.first()) {
+                        (Some(last), Some(first)) => last.1 < first.1,
+                        _ => true,
+                    };
+                    if pure_append {
+                        if let Some(addition) =
+                            stitch::addition_stitch(merged_len, envelope, max_depth)
+                        {
+                            let hollow = stitch::Span {
+                                lo: envelope.start,
+                                hi: envelope.start,
+                            };
+                            let retraction_own =
+                                match stitch::retraction_stitch(old_len, envelope, max_depth) {
+                                    Some(slice) => slice.own_fwd,
+                                    None => hollow,
+                                };
+                            let metas = [
+                                ActorViewMeta {
+                                    slice: addition,
+                                    prefix: 0,
+                                    end: None,
+                                },
+                                ActorViewMeta {
+                                    slice: stitch::ActorStitch {
+                                        text: addition.text,
+                                        own_fwd: retraction_own,
+                                        own_bwd: hollow,
+                                    },
+                                    prefix: 0,
+                                    end: Some(envelope.start),
+                                },
+                            ];
+                            push_slice(&mut dual, local, &merged, &metas);
+                        }
+                    } else {
+                        if let Some(slice) =
+                            stitch::addition_stitch(merged_len, envelope, max_depth)
+                        {
+                            let meta = ActorViewMeta {
+                                slice,
+                                prefix: 0,
+                                end: None,
+                            };
+                            push_slice(&mut late_addition, local, &merged, &[meta]);
+                        }
+                        if let Some(slice) = stitch::retraction_stitch(old_len, envelope, max_depth)
+                        {
+                            let meta = ActorViewMeta {
+                                slice,
+                                prefix: 0,
+                                end: None,
+                            };
+                            push_slice(&mut late_retraction, local, &old, &[meta]);
+                        }
+                    }
+                    *events = merged_events;
+                }
+                for stream in [dual, late_addition, late_retraction] {
+                    if !stream.actors.is_empty() {
+                        let built = assemble(&[stream], alphabet, max_depth).expect("stitch");
+                        // Production segments live on disk: every stitch must
+                        // survive the encode/decode round trip exactly.
+                        let fwd = encode_fwd(&built, 42);
+                        let bwd = encode_bwd(&built, 42);
+                        indexes.push(decode(&fwd, &bwd, "stitch.psax", 42).expect("round trip"));
+                    }
+                }
+                let finals: Vec<(Vec<u32>, Vec<i64>)> = current
+                    .iter()
+                    .map(|events| {
+                        let collapsed = stitch::collapse(events);
+                        (collapsed.codes, collapsed.ts)
+                    })
+                    .collect();
+                let refs: Vec<&PathsSa> = indexes.iter().collect();
+                let mut anchors: Vec<Option<(u64, bool)>> = vec![None];
+                for code in 0..u64::from(alphabet) {
+                    anchors.push(Some((code, true)));
+                    anchors.push(Some((code, false)));
+                }
+                for depth in [2u32, 3, 5, 8, 13, 16] {
+                    for anchor in &anchors {
+                        let spec = spec_of(depth, 1000, TimeRange::default());
+                        let got = answer_segments(&refs, &names, &spec, *anchor);
+                        let want = brute(&finals, &names, &spec, *anchor);
+                        let what = format!("seed {seed} depth {depth} anchor {anchor:?}");
+                        assert_same(&got, &want, &what);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The late-arrival geometry at MULTI-CHUNK scale: enough positions that
+    /// sweep_interval splits into parallel chunks and the cross-chunk
+    /// boundary merge runs over stitch segments with sparse ownership - the
+    /// combination the small tests never reach (they sweep one chunk). Long
+    /// windows (depth 8+) make LCP groups span chunk boundaries.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn late_arrival_pairs_match_brute_force_across_chunks() {
+        let names: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let alphabet = u32::try_from(names.len()).expect("alphabet fits");
+        let max_depth = 16u32;
+        for seed in 0..2u64 {
+            let mut rng = Lcg(seed.wrapping_mul(0x0BAD_5EED).wrapping_add(3));
+            let base = synth_streams(3000, u64::from(alphabet), seed + 900);
+            let mut current: Vec<Vec<(u32, i64)>> = base
+                .iter()
+                .map(|(codes, ts)| codes.iter().copied().zip(ts.iter().copied()).collect())
+                .collect();
+            let mut indexes: Vec<PathsSa> =
+                vec![assemble(&shard_streams(&base), alphabet, 0).expect("base")];
+            let mut dual = empty_pair_stream(vec![false, true]);
+            let mut late_addition = empty_pair_stream(vec![false]);
+            let mut late_retraction = empty_pair_stream(vec![true]);
+            for (actor, events) in current.iter_mut().enumerate() {
+                let delta = synth_late_delta(&mut rng, events, u64::from(alphabet));
+                let merged_events = merge_events(events, &delta);
+                let old = stitch::collapse(events);
+                let merged = stitch::collapse(&merged_events);
+                let envelope = stitch::envelope(&old, &merged);
+                let merged_len = u32::try_from(merged.codes.len()).expect("fits");
+                let old_len = u32::try_from(old.codes.len()).expect("fits");
+                let local = actor as u64;
+                let pure_append = match (events.last(), delta.first()) {
+                    (Some(last), Some(first)) => last.1 < first.1,
+                    _ => true,
+                };
+                if pure_append {
+                    if let Some(addition) = stitch::addition_stitch(merged_len, envelope, max_depth)
+                    {
+                        let hollow = stitch::Span {
+                            lo: envelope.start,
+                            hi: envelope.start,
+                        };
+                        let retraction_own =
+                            match stitch::retraction_stitch(old_len, envelope, max_depth) {
+                                Some(slice) => slice.own_fwd,
+                                None => hollow,
+                            };
+                        let metas = [
+                            ActorViewMeta {
+                                slice: addition,
+                                prefix: 0,
+                                end: None,
+                            },
+                            ActorViewMeta {
+                                slice: stitch::ActorStitch {
+                                    text: addition.text,
+                                    own_fwd: retraction_own,
+                                    own_bwd: hollow,
+                                },
+                                prefix: 0,
+                                end: Some(envelope.start),
+                            },
+                        ];
+                        push_slice(&mut dual, local, &merged, &metas);
+                    }
+                } else {
+                    if let Some(slice) = stitch::addition_stitch(merged_len, envelope, max_depth) {
+                        let meta = ActorViewMeta {
+                            slice,
+                            prefix: 0,
+                            end: None,
+                        };
+                        push_slice(&mut late_addition, local, &merged, &[meta]);
+                    }
+                    if let Some(slice) = stitch::retraction_stitch(old_len, envelope, max_depth) {
+                        let meta = ActorViewMeta {
+                            slice,
+                            prefix: 0,
+                            end: None,
+                        };
+                        push_slice(&mut late_retraction, local, &old, &[meta]);
+                    }
+                }
+                *events = merged_events;
+            }
+            for stream in [dual, late_addition, late_retraction] {
+                if !stream.actors.is_empty() {
+                    let built = assemble(&[stream], alphabet, max_depth).expect("stitch");
+                    let fwd = encode_fwd(&built, 42);
+                    let bwd = encode_bwd(&built, 42);
+                    indexes.push(decode(&fwd, &bwd, "stitch.psax", 42).expect("round trip"));
+                }
+            }
+            let finals: Vec<(Vec<u32>, Vec<i64>)> = current
+                .iter()
+                .map(|events| {
+                    let collapsed = stitch::collapse(events);
+                    (collapsed.codes, collapsed.ts)
+                })
+                .collect();
+            let refs: Vec<&PathsSa> = indexes.iter().collect();
+            for depth in [4u32, 8, 16] {
+                for anchor in [None, Some((0u64, true)), Some((1u64, false))] {
+                    let spec = spec_of(depth, 1000, TimeRange::default());
+                    let got = answer_segments(&refs, &names, &spec, anchor);
+                    let want = brute(&finals, &names, &spec, anchor);
+                    let what = format!("seed {seed} depth {depth} anchor {anchor:?}");
+                    assert_same(&got, &want, &what);
                 }
             }
         }

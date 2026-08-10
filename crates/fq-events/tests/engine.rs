@@ -906,6 +906,91 @@ fn refresh_appends_a_generation_and_merges_by_time() {
 /// fallback) and one delta opens with the actor's last stored code (the
 /// boundary collapse). Two refresh rounds stack two pairs on the base, and
 /// every anchor/depth/range answer must equal the scan's.
+/// A refresh that rebuilds the index (the pair-vs-rebuild crossover) must
+/// not leave a warm process serving the PREVIOUS base segment. Segment files
+/// are cached by path under an immutability assumption, so the rebuilt base
+/// must land at a never-used path; if it reuses one, the first query after
+/// warming answers from the stale bytes - counts subtly wrong, or the signed
+/// merge's invariant tripping on a later refresh. This test warms the cache,
+/// forces the crossover rebuild, and demands scan-exact answers after.
+#[test]
+fn a_crossover_rebuild_is_visible_to_a_warm_process() {
+    let mut rng = Rng(0xcafe_f00d);
+    let names = ["a", "b", "c"];
+    let mut tiebreak = 0_i64;
+    let mut row = |actor: i64, ts: i64, name: &str| {
+        tiebreak += 1;
+        Row {
+            actor: ActorId::Int(actor),
+            ts,
+            tiebreak,
+            name: name.to_string(),
+            device: None,
+        }
+    };
+    let mut base = Vec::new();
+    for actor in 0..30_i64 {
+        for position in 0..20_i64 {
+            let name = names[rng.below(names.len() as u64) as usize];
+            base.push(row(actor, position * 1_000_000, name));
+        }
+    }
+    let (store, dir) = open_store("warmrebuild");
+    build_dataset(&store, "warmrebuild", &base);
+    // A REAL cache, unlike the suite default: staleness needs warmth.
+    let cfg = EventsConfig {
+        build_threads: 2,
+        cache_bytes: 64 * 1024 * 1024,
+        ..EventsConfig::default()
+    };
+    let dataset = store.dataset("warmrebuild").unwrap();
+    let warm = |dataset: &std::sync::Arc<fq_events::Dataset>, maxgap| {
+        let spec = PathsSpec {
+            dataset: "warmrebuild".to_string(),
+            anchor: PathAnchor::Unanchored,
+            depth: 8,
+            top: 1000,
+            maxgap_micros: maxgap,
+            range: TimeRange::default(),
+            filter: None,
+            force_scan: false,
+        };
+        fq_events::run_paths(store.io(), dataset, &spec, &cfg).unwrap()
+    };
+    // Warm the cache with the pre-refresh base segment.
+    let _ = warm(&dataset, None);
+    // A late-arrival storm touching EVERY actor mid-stream: the late path
+    // reads whole streams, the stitch outweighs the dataset, and the
+    // crossover rebuilds the index under this warm process.
+    let mut delta = Vec::new();
+    for actor in 0..30_i64 {
+        for position in 0..20_i64 {
+            let name = names[rng.below(names.len() as u64) as usize];
+            delta.push(row(actor, position * 1_000_000 + 500_000, name));
+        }
+    }
+    let mut source = VecSource {
+        batches: vec![batch_of(&delta)].into_iter(),
+    };
+    let (_, report) = store
+        .append_generation_with("warmrebuild", &mut source, None, &cfg)
+        .unwrap();
+    assert!(
+        report.contains("rebuilt instead"),
+        "the delta must trip the crossover for this test to bite: {report}"
+    );
+    // The same process, same cache: the index answer must match the scan.
+    let dataset = store.dataset("warmrebuild").unwrap();
+    let indexed = warm(&dataset, None);
+    let scanned = warm(&dataset, Some(i64::MAX));
+    assert_eq!(
+        indexed, scanned,
+        "a warm process answered from a stale base"
+    );
+    drop(dataset);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn refreshed_long_streams_answer_from_pairs_exactly() {
     let mut rng = Rng(0x5eed_cafe);
