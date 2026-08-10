@@ -870,10 +870,14 @@ fn refresh_appends_a_generation_and_merges_by_time() {
     let mut source = VecSource {
         batches: vec![batch_of(&second)].into_iter(),
     };
-    let appended = store
+    let (appended, paths_index) = store
         .append_generation_with("refresh", &mut source, None, &test_config())
         .unwrap();
     assert_eq!(appended, 2);
+    assert!(
+        paths_index.contains("paths index"),
+        "the refresh report must name its index work: {paths_index}"
+    );
     let dataset = store.dataset("refresh").unwrap();
     assert_eq!(dataset.record.measured_events, 4);
     assert_eq!(dataset.record.measured_actors, 3);

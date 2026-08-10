@@ -888,11 +888,146 @@ def mode_gen_crafted():
     write("crafted_subsecond", columns)
 
 
+# ---------------------------------------------------------------------------
+# Refresh scenario: the grown dataset
+# ---------------------------------------------------------------------------
+
+
+REFRESH_QUERIES = [
+    ("paths_d4_unanchored", "PATHS ON web DEPTH 4 TOP 10"),
+    ("paths_d4_forward", "PATHS ON web STARTING AT 'page_view' DEPTH 4 TOP 10"),
+    ("paths_d4_backward", "PATHS ON web ENDING AT 'purchase' DEPTH 4 TOP 10"),
+    ("paths_d8_unanchored", "PATHS ON web DEPTH 8 TOP 10"),
+]
+
+
+def stage_slice(source, staged, cut):
+    """Write the rows with seq < cut of `source` to `staged`, arrival order."""
+    import duckdb
+    con = duckdb.connect()
+    con.execute(
+        "COPY (SELECT * FROM read_parquet(?) WHERE seq < ? ORDER BY seq) "
+        "TO '%s' (FORMAT PARQUET)" % staged,
+        [source, cut],
+    )
+    con.close()
+
+
+def scenario_statement(runtime, sql):
+    """Run one DDL statement, returning (wall seconds, status line)."""
+    import pyarrow as pa
+    started = time.time()
+    status = pa.table(runtime.execute(sql)).to_pydict()
+    return time.time() - started, status["status"][0]
+
+
+def scenario_queries(runtime, results, stage_name):
+    """Median warm PATHS timings at the current segment-pair count."""
+    import pyarrow as pa
+    timings = {}
+    for name, sql in REFRESH_QUERIES:
+        warm = []
+        for _ in range(3):
+            started = time.time()
+            pa.table(runtime.execute(sql))
+            warm.append((time.time() - started) * 1000.0)
+        timings[name] = statistics.median(warm)
+        print("    %-22s %8.1f ms" % (name, timings[name]))
+    results["stages"][stage_name]["query_ms"] = timings
+
+
+def scenario_crosscheck(runtime):
+    """Index vs USING SCAN row-exact agreement on every query shape; a
+    mismatch is a wrong answer and fails the run."""
+    import pyarrow as pa
+    for name, sql in REFRESH_QUERIES:
+        indexed = pa.table(runtime.execute(sql)).to_pydict()
+        scanned = pa.table(runtime.execute(sql + " USING SCAN")).to_pydict()
+        if indexed != scanned:
+            raise SystemExit(
+                "index/scan mismatch on %s:\nindex: %s\nscan:  %s"
+                % (name, indexed, scanned))
+        print("    %-22s index == scan (%d rows)"
+              % (name, len(indexed.get("path_id", []))))
+
+
+def mode_refresh_scenario(size):
+    """Grow the dataset through staged refreshes and measure every statement:
+    CREATE over the first 60M events, REFRESH +20M, REFRESH to N-1000, then
+    the 1,000-row delta - each wall clock with the paths-index share the
+    status line now reports - plus per-stage PATHS medians as index pairs
+    accumulate, and a final index-vs-scan exactness cross-check."""
+    if size != "medium":
+        raise SystemExit("refresh-scenario runs on --size medium (100M rows)")
+    sys.path.insert(0, os.path.join(REPO_ROOT, "tests"))
+    import fedq
+    import pyarrow.parquet as pq
+
+    _, source, _, _ = dataset_config(size)
+    total = pq.ParquetFile(source).metadata.num_rows
+    cuts = [int(total * 0.6), int(total * 0.8), total - 1000, total]
+    stage_names = ["create_60m", "refresh_plus_20m", "refresh_to_n_minus_1k",
+                   "refresh_1k_delta"]
+    executions = 1 + len(cuts) + len(cuts) * len(REFRESH_QUERIES) * 3 \
+        + len(REFRESH_QUERIES) * 2
+    print("refresh-scenario: about %d engine executions, %d staged writes"
+          % (executions, len(cuts)))
+
+    stage_dir = os.path.join(DATA_DIR, "refresh_stage_%s" % size)
+    os.makedirs(stage_dir, exist_ok=True)
+    staged = os.path.join(stage_dir, "events.parquet")
+    config = os.path.join(stage_dir, "config.yaml")
+    with open(config, "w") as handle:
+        handle.write(
+            "datasources:\n  ev:\n    type: parquet\n    dir: %s\n" % stage_dir)
+    # A fresh store every run: the sibling state dirs the engine hangs off
+    # the config are cleared so the CREATE below is a real from-scratch build.
+    for suffix in (".events", ".mv", ".stats.sqlite", ".stats.sqlite-shm",
+                   ".stats.sqlite-wal"):
+        state = config[: -len(".yaml")] + suffix
+        if os.path.isdir(state):
+            import shutil
+            shutil.rmtree(state)
+        elif os.path.exists(state):
+            os.remove(state)
+
+    results = {"size": size, "total_rows": total, "cuts": cuts, "stages": {}}
+    out_path = os.path.join(DATA_DIR, "refresh_scenario_%s.json" % size)
+    runtime = None
+    for stage, (cut, stage_name) in enumerate(zip(cuts, stage_names)):
+        print("stage %d: staging %s rows" % (stage, format(cut, ",")))
+        started = time.time()
+        stage_slice(source, staged, cut)
+        staging_s = time.time() - started
+        if runtime is None:
+            runtime = fedq.Runtime(config)
+            sql = ("CREATE EVENT DATASET web FROM ev.main.events "
+                   "ACTOR entity_id TIME ts EVENT event_name TIEBREAK seq "
+                   "PROPERTIES (device, country) WITH (refresh_key = 'seq')")
+        else:
+            sql = "REFRESH EVENT DATASET web"
+        wall, status = scenario_statement(runtime, sql)
+        print("  %-22s %7.2fs  (staging %.1fs)  %s"
+              % (stage_name, wall, staging_s, status))
+        results["stages"][stage_name] = {
+            "rows": cut, "wall_s": wall, "status": status}
+        scenario_queries(runtime, results, stage_name)
+        with open(out_path, "w") as handle:
+            json.dump(results, handle)
+    print("cross-check: index vs USING SCAN")
+    scenario_crosscheck(runtime)
+    results["crosscheck"] = "index == scan on every query shape"
+    with open(out_path, "w") as handle:
+        json.dump(results, handle)
+    print("refresh scenario written to", out_path)
+
+
 def main():
     """Parse arguments and dispatch the mode."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", required=True,
-                        choices=["gen-crafted", "save-refs", "engine", "compare"])
+                        choices=["gen-crafted", "save-refs", "engine", "compare",
+                                 "refresh-scenario"])
     parser.add_argument("--size", default="medium")
     parser.add_argument("--queries", default=None,
                         help="comma-separated battery entry names")
@@ -906,6 +1041,8 @@ def main():
         mode_save_refs(arguments.size, only)
     elif arguments.mode == "engine":
         mode_engine(arguments.size, only, arguments.warm_runs, arguments.skip_cold)
+    elif arguments.mode == "refresh-scenario":
+        mode_refresh_scenario(arguments.size)
     else:
         mode_compare(arguments.size, only)
 

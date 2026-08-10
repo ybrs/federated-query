@@ -548,7 +548,7 @@ impl EventStore {
         source: &mut dyn BatchSource,
         source_token: Option<String>,
         cfg: &EventsConfig,
-    ) -> Result<u64, EventError> {
+    ) -> Result<(u64, String), EventError> {
         let mut record = self.registry.get(name)?;
         let dataset = self.dataset(name)?;
         let generation = record
@@ -636,8 +636,8 @@ impl EventStore {
         // and rebuild the whole index when it is not - see extend_paths_index.
         // On a failure of either, the append itself stays published and PATHS
         // scans (correct, slower); REBUILD EVENT DATASET restores the index.
-        self.extend_paths_index(name, cfg, &touched, &written)?;
-        Ok(outcome.events)
+        let paths_index = self.extend_paths_index(name, cfg, &touched, &written)?;
+        Ok((outcome.events, paths_index))
     }
 
     /// The dataset definition a stored record round-trips to (for re-running

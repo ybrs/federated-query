@@ -317,9 +317,10 @@ impl Runtime {
         let stream = connectors::fetch_stream(&datasource, &sql)?;
         let mut source = StreamSource::new(stream, Some((position, refresh_key)));
         source.seed_watermark(record.watermark.clone(), name)?;
-        let appended = store.append_generation_with(name, &mut source, token, &config.events)?;
+        let (appended, paths_index) =
+            store.append_generation_with(name, &mut source, token, &config.events)?;
         status_result(&format!(
-            "REFRESH EVENT DATASET: {appended} events appended"
+            "REFRESH EVENT DATASET: {appended} events appended; {paths_index}"
         ))
     }
 
