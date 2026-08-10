@@ -982,7 +982,7 @@ fn refreshed_long_streams_answer_from_pairs_exactly() {
         },
     ];
     for anchor in &anchors {
-        for depth in [2_u32, 3, 5, 8, 13, 32] {
+        for depth in [2_u32, 3, 5, 8, 13, 16] {
             for range in ranges {
                 let spec = |maxgap| PathsSpec {
                     dataset: "pairlong".to_string(),

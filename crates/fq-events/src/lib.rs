@@ -365,7 +365,7 @@ impl EventStore {
         let dataset = self.dataset(name)?;
         let max_paths_depth =
             u32::try_from(dataset.record.max_paths_depth).expect("stored bound fits u32");
-        let report = paths_sa::append_pair(
+        let outcome = paths_sa::append_pair(
             &self.io,
             &dataset,
             cfg,
@@ -373,10 +373,20 @@ impl EventStore {
             delta_files,
             max_paths_depth,
         )?;
-        if let Some(report) = report {
-            return Ok(report);
+        match outcome {
+            paths_sa::PairOutcome::Applied(report) => Ok(report),
+            paths_sa::PairOutcome::NoManifest => paths_sa::rebuild(&self.io, &dataset, cfg),
+            paths_sa::PairOutcome::Concede {
+                stitch_positions,
+                dataset_positions,
+            } => {
+                let report = paths_sa::rebuild(&self.io, &dataset, cfg)?;
+                Ok(format!(
+                    "stitch of {stitch_positions} positions would exceed the dataset's \
+                     {dataset_positions}, rebuilt instead; {report}"
+                ))
+            }
         }
-        paths_sa::rebuild(&self.io, &dataset, cfg)
     }
 
     /// The build report of an outcome.

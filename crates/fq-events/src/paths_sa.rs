@@ -45,7 +45,7 @@ compile_error!("the paths index stores little-endian arrays; big-endian is unsup
 const MAGIC: &[u8; 4] = b"FQPS";
 
 /// The serialization version this build writes and reads.
-const VERSION: u8 = 5;
+const VERSION: u8 = 6;
 
 /// The fingerprint stamped into a SEGMENT file.
 ///
@@ -102,30 +102,42 @@ pub struct PathsSa {
     /// loop is a random access.
     sa_fwd: Vec<i32>,
     lcp_fwd: Vec<i32>,
-    avail_fwd: Vec<u32>,
     ts_fwd: Vec<i64>,
     sa_bwd: Vec<i32>,
     lcp_bwd: Vec<i32>,
-    avail_bwd: Vec<u32>,
     ts_bwd: Vec<i64>,
     /// Suffix-array bucket offsets per first symbol (length `alphabet + 2`):
     /// suffixes whose first symbol is `s` occupy `buckets[s]..buckets[s + 1]`
     /// in BOTH arrays (the reversed text is a permutation of the text).
     buckets: Vec<u32>,
-    /// Per-direction ownership bitmaps in SUFFIX-ARRAY order, present only on
-    /// stitch segments (a refresh's addition or retraction). A sweep counts a
-    /// window only at a position its direction owns; `None` owns everything -
-    /// a base segment counts every window its text holds. Ownership is what
-    /// makes overlapping segment texts sound: the same stream position may
-    /// appear in several segments' texts, but exactly one segment's ownership
-    /// (net of retractions) counts each window form.
-    own_fwd: Option<Vec<u64>>,
-    own_bwd: Option<Vec<u64>>,
+    /// The signed sweeps this text serves. A base segment carries one
+    /// positive view owning everything. A refresh's stitch segment shares
+    /// ONE text between its views: the addition view (positive, availability
+    /// against the merged stream) and the retraction view (negative,
+    /// availability against the old stream, which is a prefix of the same
+    /// text for a pure append). Sharing the text is what keeps the pair's
+    /// positions - and its suffix sort - near the delta instead of twice it.
+    views: Vec<View>,
     /// The window-length bound the segment's ownership was constructed for.
     /// A stitch segment's text carries only `max_depth` context around what it
     /// owns, so serving a deeper window would read into a neighboring region;
     /// callers must not sweep it deeper. 0 on base segments (any depth).
     max_depth: u32,
+}
+
+/// One signed sweep over a segment's shared text: its per-direction
+/// availability (in suffix-array order) and ownership bitmaps, and whether
+/// the merge subtracts its counts.
+struct View {
+    negative: bool,
+    avail_fwd: Vec<u32>,
+    avail_bwd: Vec<u32>,
+    /// Ownership in SUFFIX-ARRAY order; `None` owns everything. A sweep
+    /// counts a window only at a position its direction owns, which is what
+    /// makes overlapping segment texts sound: exactly one view's ownership
+    /// (net of negatives) counts each window form.
+    own_fwd: Option<Vec<u64>>,
+    own_bwd: Option<Vec<u64>>,
 }
 
 /// Which suffix array a sweep walks.
@@ -139,26 +151,32 @@ impl PathsSa {
     /// Approximate resident bytes, for the block cache's budget accounting.
     pub fn heap_bytes(&self) -> usize {
         let n = self.text.len();
-        let own = self.own_fwd.as_ref().map_or(0, |bits| bits.len() * 8)
-            + self.own_bwd.as_ref().map_or(0, |bits| bits.len() * 8);
-        n * (usize::from(self.text.width()) + 2 * (4 + 4 + 4 + 8)) + self.buckets.len() * 4 + own
+        let mut views = 0usize;
+        for view in &self.views {
+            views += view.avail_fwd.len() * 4 + view.avail_bwd.len() * 4;
+            views += view.own_fwd.as_ref().map_or(0, |bits| bits.len() * 8);
+            views += view.own_bwd.as_ref().map_or(0, |bits| bits.len() * 8);
+        }
+        n * (usize::from(self.text.width()) + 2 * (4 + 8)) + self.buckets.len() * 4 + views
     }
 
-    /// The sweep arrays of a direction: (sa, lcp, avail, anchor ts), all in
-    /// suffix-array order.
-    fn arrays(&self, dir: Direction) -> (&[i32], &[i32], &[u32], &[i64]) {
+    /// The sweep arrays of one view's direction: (sa, lcp, avail, anchor ts),
+    /// all in suffix-array order.
+    fn arrays(&self, view: usize, dir: Direction) -> (&[i32], &[i32], &[u32], &[i64]) {
+        let held = &self.views[view];
         match dir {
-            Direction::Forward => (&self.sa_fwd, &self.lcp_fwd, &self.avail_fwd, &self.ts_fwd),
-            Direction::Backward => (&self.sa_bwd, &self.lcp_bwd, &self.avail_bwd, &self.ts_bwd),
+            Direction::Forward => (&self.sa_fwd, &self.lcp_fwd, &held.avail_fwd, &self.ts_fwd),
+            Direction::Backward => (&self.sa_bwd, &self.lcp_bwd, &held.avail_bwd, &self.ts_bwd),
         }
     }
 
-    /// Whether the direction owns suffix-array position `at`: bitmap bit, or
-    /// everything when the segment carries no bitmap.
-    fn owns(&self, dir: Direction, at: usize) -> bool {
+    /// Whether the view's direction owns suffix-array position `at`: bitmap
+    /// bit, or everything when the view carries no bitmap.
+    fn owns(&self, view: usize, dir: Direction, at: usize) -> bool {
+        let held = &self.views[view];
         let bits = match dir {
-            Direction::Forward => &self.own_fwd,
-            Direction::Backward => &self.own_bwd,
+            Direction::Forward => &held.own_fwd,
+            Direction::Backward => &held.own_bwd,
         };
         match bits {
             None => true,
@@ -271,17 +289,11 @@ fn manifest_rel(dataset: &Dataset) -> String {
     )
 }
 
-/// One segment of the index: its immutable file id and its sign.
-///
-/// A `negative` segment is a refresh's RETRACTION: it re-counts, with the
-/// PRE-REFRESH availability and timestamps, exactly the window forms that the
-/// refresh invalidated in older segments, and the merge subtracts it. The
-/// paired addition then counts the current forms. Ownership bitmaps inside
-/// the segment files say which positions count; the manifest only carries
-/// the sign.
+/// One segment of the index: its immutable file id. Everything else about a
+/// segment - its views, their signs, their ownership - lives inside its
+/// files; the manifest only names which files compose the index.
 struct SegmentEntry {
     id: u32,
-    negative: bool,
 }
 
 /// The index's manifest: the segments composing it, and the next free file id.
@@ -318,14 +330,18 @@ fn location_files_with_prefix(
     Ok(matched)
 }
 
-/// How one stored actor slice relates to the actor's TRUE stream: how many
-/// stream events precede and follow the slice, and which slice positions each
-/// direction owns (slice-relative half-open ranges). A whole-stream slice has
-/// zero before/after and owns everything.
+/// How one stored actor slice relates to ONE VIEW's true stream: how many of
+/// that stream's events precede and follow the slice, where the view's
+/// stream ENDS inside the slice (`end`; positions past it belong to other
+/// views' streams - a retraction's old stream ends where the delta begins),
+/// and which slice positions each direction owns (slice-relative half-open
+/// ranges). A whole-stream slice has zero before/after, `end` at the slice
+/// length, and owns everything.
 #[derive(Clone, Copy)]
 struct SliceMeta {
     before: u32,
     after: u32,
+    end: u32,
     own_fwd: stitch::Span,
     own_bwd: stitch::Span,
 }
@@ -340,10 +356,17 @@ struct ShardStream {
     /// entry per `bounds` interval. A returning actor keeps its local id, so
     /// `(shard, local)` identifies an actor across refreshes.
     actors: Vec<u64>,
-    /// Per actor, aligned with `actors`: how the stored slice sits inside the
-    /// actor's true stream. `None` when every slice IS the whole stream (a
-    /// base segment).
-    slices: Option<Vec<SliceMeta>>,
+    /// Per actor, aligned with `actors`: how the stored slice sits inside
+    /// each VIEW's stream - `metas[actor * views + view]`. `None` when every
+    /// slice IS the whole stream of a single positive view (a base segment).
+    slices: Option<SliceViews>,
+}
+
+/// The per-view slice metadata of a pair stream: `views` metas per actor
+/// (actor-major), plus each view's sign.
+struct SliceViews {
+    signs: Vec<bool>,
+    metas: Vec<SliceMeta>,
 }
 
 /// The actors a set of segment files holds, as `(shard, local)` keys.
@@ -430,11 +453,18 @@ fn collect_streams(
 }
 
 /// The text-order per-position layout of a segment: symbols, anchor
-/// timestamps, slice bounds, availability shifts beyond the stored slice, and
-/// per-direction ownership flags (all empty when the segment owns everything).
+/// timestamps, and PER VIEW the slice bounds, availability shifts, view-
+/// stream ends, and ownership flags (a single owns-all view for base
+/// segments).
 struct TextLayout {
     text: Text,
     ts: Vec<i64>,
+    views: Vec<ViewLayout>,
+}
+
+/// One view's text-order per-position companions while laying out.
+struct ViewLayout {
+    negative: bool,
     start: Vec<u32>,
     end: Vec<u32>,
     after_of: Vec<u32>,
@@ -443,16 +473,30 @@ struct TextLayout {
     own_bwd: Vec<u8>,
 }
 
-/// Lay out one actor's slice into the text, pushing its symbols, timestamps,
-/// bounds, shifts, and ownership flags, then the trailing separator.
-fn layout_actor(layout: &mut TextLayout, stream: &ShardStream, actor: usize, stitched: bool) {
+impl ViewLayout {
+    /// An empty view layout with the given sign.
+    fn new(negative: bool) -> Self {
+        Self {
+            negative,
+            start: Vec::new(),
+            end: Vec::new(),
+            after_of: Vec::new(),
+            before_of: Vec::new(),
+            own_fwd: Vec::new(),
+            own_bwd: Vec::new(),
+        }
+    }
+}
+
+/// Lay out one actor's slice into the text, pushing its symbols and
+/// timestamps once and each view's bounds, shifts, and ownership flags, then
+/// the trailing separator.
+fn layout_actor(layout: &mut TextLayout, stream: &ShardStream, actor: usize) {
     let lo = stream.bounds[actor] as usize;
     let hi = stream.bounds[actor + 1] as usize;
-    let meta = stream.slices.as_ref().map(|slices| slices[actor]);
     let text_lo = u32::try_from(layout.ts.len()).expect("text fits u32");
-    let text_hi = text_lo + u32::try_from(hi - lo).expect("stream fits u32");
+    let slice_len = u32::try_from(hi - lo).expect("stream fits u32");
     for offset in lo..hi {
-        let rel = u32::try_from(offset - lo).expect("slice offset fits u32");
         match &mut layout.text {
             Text::Small(text) => {
                 text.push(u8::try_from(stream.codes[offset] + 1).expect("code fits u8"));
@@ -462,70 +506,91 @@ fn layout_actor(layout: &mut TextLayout, stream: &ShardStream, actor: usize, sti
             }
         }
         layout.ts.push(stream.ts[offset]);
-        layout.start.push(text_lo);
-        layout.end.push(text_hi);
-        if stitched {
-            let (before, after, fwd, bwd) = match meta {
-                None => (0, 0, true, true),
-                Some(meta) => (
-                    meta.before,
-                    meta.after,
-                    meta.own_fwd.lo <= rel && rel < meta.own_fwd.hi,
-                    meta.own_bwd.lo <= rel && rel < meta.own_bwd.hi,
-                ),
-            };
-            layout.before_of.push(before);
-            layout.after_of.push(after);
-            layout.own_fwd.push(u8::from(fwd));
-            layout.own_bwd.push(u8::from(bwd));
-        }
     }
-    // The separator after the stream: an out-of-alphabet symbol whose
-    // start == end == its own position keeps every window off it. Its
-    // shifts stay zero and it is never owned, so a slice's true-stream
-    // extension can never lift a separator into validity.
+    // The separator after the stream: an out-of-alphabet symbol that no
+    // view's window may cover. Its availability stays zero in every view and
+    // it is never owned, so a slice's true-stream extension can never lift a
+    // separator into validity.
     match &mut layout.text {
         Text::Small(text) => text.push(0),
         Text::Wide(text) => text.push(0),
     }
     layout.ts.push(0);
-    layout.start.push(text_hi);
-    layout.end.push(text_hi);
-    if stitched {
-        layout.before_of.push(0);
-        layout.after_of.push(0);
-        layout.own_fwd.push(0);
-        layout.own_bwd.push(0);
+    let view_count = layout.views.len();
+    for (which, view) in layout.views.iter_mut().enumerate() {
+        let meta = stream.slices.as_ref().map_or(
+            SliceMeta {
+                before: 0,
+                after: 0,
+                end: slice_len,
+                own_fwd: stitch::Span {
+                    lo: 0,
+                    hi: slice_len,
+                },
+                own_bwd: stitch::Span {
+                    lo: 0,
+                    hi: slice_len,
+                },
+            },
+            |slices| slices.metas[actor * view_count + which],
+        );
+        // The view's stream ends `meta.end` events into the slice: positions
+        // past it belong to other views (a retraction's old stream stops
+        // where the delta begins), so their availability is zero and they
+        // are never owned in this view.
+        let view_hi = text_lo + meta.end;
+        for rel in 0..slice_len {
+            let inside = rel < meta.end;
+            view.start.push(text_lo);
+            view.end.push(if inside { view_hi } else { text_lo + rel });
+            view.before_of.push(if inside { meta.before } else { 0 });
+            view.after_of.push(if inside { meta.after } else { 0 });
+            let fwd = inside && meta.own_fwd.lo <= rel && rel < meta.own_fwd.hi;
+            let bwd = inside && meta.own_bwd.lo <= rel && rel < meta.own_bwd.hi;
+            view.own_fwd.push(u8::from(fwd));
+            view.own_bwd.push(u8::from(bwd));
+        }
+        // The separator.
+        let sep = text_lo + slice_len;
+        view.start.push(sep);
+        view.end.push(sep);
+        view.before_of.push(0);
+        view.after_of.push(0);
+        view.own_fwd.push(0);
+        view.own_bwd.push(0);
     }
 }
 
-/// Check the stitch construction invariant for every owned position: a window
-/// of length up to `min(max_depth, availability)` must lie inside the stored
-/// slice, or the sweep would read a neighboring region's symbols as this
-/// actor's. A violation is a construction bug, never data-dependent, and it
-/// must stop the build rather than ship an index that answers wrongly.
+/// Check the stitch construction invariant for every owned position of every
+/// view: a window of length up to `min(max_depth, availability)` must lie
+/// inside the view's stream text, or the sweep would read symbols past it as
+/// this stream's. A violation is a construction bug, never data-dependent,
+/// and it must stop the build rather than ship an index that answers
+/// wrongly.
 fn check_stitch_bounds(layout: &TextLayout, max_depth: u32) {
     assert!(
         max_depth >= 2,
         "a stitched segment needs a window-length bound of at least 2"
     );
-    for pos in 0..layout.ts.len() {
-        let here = u32::try_from(pos).expect("position fits u32");
-        let in_slice_fwd = layout.end[pos] - here;
-        let in_slice_bwd = here - layout.start[pos] + 1;
-        if layout.own_fwd[pos] != 0 {
-            let avail = in_slice_fwd + layout.after_of[pos];
-            assert!(
-                max_depth.min(avail) <= in_slice_fwd,
-                "stitch construction bug: forward-owned position lacks window text"
-            );
-        }
-        if layout.own_bwd[pos] != 0 {
-            let avail = in_slice_bwd + layout.before_of[pos];
-            assert!(
-                max_depth.min(avail) <= in_slice_bwd,
-                "stitch construction bug: backward-owned position lacks window text"
-            );
+    for view in &layout.views {
+        for pos in 0..layout.ts.len() {
+            let here = u32::try_from(pos).expect("position fits u32");
+            let in_slice_fwd = view.end[pos].saturating_sub(here);
+            let in_slice_bwd = here - view.start[pos] + 1;
+            if view.own_fwd[pos] != 0 {
+                let avail = in_slice_fwd + view.after_of[pos];
+                assert!(
+                    max_depth.min(avail) <= in_slice_fwd,
+                    "stitch construction bug: forward-owned position lacks window text"
+                );
+            }
+            if view.own_bwd[pos] != 0 {
+                let avail = in_slice_bwd + view.before_of[pos];
+                assert!(
+                    max_depth.min(avail) <= in_slice_bwd,
+                    "stitch construction bug: backward-owned position lacks window text"
+                );
+            }
         }
     }
 }
@@ -543,16 +608,17 @@ fn sa_bitmap(sa: &[i32], flag: impl Fn(usize) -> bool) -> Vec<u64> {
 }
 
 /// Assemble a segment from collapsed streams: lay out the separator-joined
-/// text with its per-position companions, suffix-sort the text and its
+/// text with its per-position companions once, suffix-sort the text and its
 /// reversal concurrently, derive both LCP arrays and the first-symbol
-/// buckets, and scatter availability, timestamps, and (for stitch segments)
-/// ownership into suffix-array order.
+/// buckets, and scatter each view's availability and ownership (plus the
+/// shared timestamps) into suffix-array order.
 ///
 /// `max_depth` is the window-length bound a stitch segment was constructed
 /// for; a segment whose streams are all whole (no slices) passes 0 and owns
-/// everything at any depth. Availability counts TRUE stream events - the
-/// slice's span plus the events beyond its edges - so truncation semantics
-/// hold even where the stored text is only a slice.
+/// everything at any depth in one positive view. Availability counts TRUE
+/// stream events of each view - the slice's span up to the view's stream end
+/// plus the events beyond its edges - so truncation semantics hold even
+/// where the stored text is only a slice.
 fn assemble(
     streams: &[ShardStream],
     alphabet: u32,
@@ -566,7 +632,10 @@ fn assemble(
     }
     let small = alphabet <= 254;
     let stitched = streams.iter().any(|stream| stream.slices.is_some());
-    let side = if stitched { n } else { 0 };
+    let signs: Vec<bool> = match streams.iter().find_map(|stream| stream.slices.as_ref()) {
+        None => vec![false],
+        Some(slices) => slices.signs.clone(),
+    };
     let mut layout = TextLayout {
         text: if small {
             Text::Small(Vec::with_capacity(n))
@@ -574,16 +643,14 @@ fn assemble(
             Text::Wide(Vec::with_capacity(n))
         },
         ts: Vec::with_capacity(n),
-        start: Vec::with_capacity(n),
-        end: Vec::with_capacity(n),
-        after_of: Vec::with_capacity(side),
-        before_of: Vec::with_capacity(side),
-        own_fwd: Vec::with_capacity(side),
-        own_bwd: Vec::with_capacity(side),
+        views: signs
+            .iter()
+            .map(|negative| ViewLayout::new(*negative))
+            .collect(),
     };
     for stream in streams {
         for actor in 0..stream.bounds.len() - 1 {
-            layout_actor(&mut layout, stream, actor, stitched);
+            layout_actor(&mut layout, stream, actor);
         }
     }
     if stitched {
@@ -591,63 +658,68 @@ fn assemble(
     }
     let (sa_fwd, lcp_fwd, sa_bwd, lcp_bwd) = sort_both_directions(&layout.text, alphabet)?;
     let buckets = bucket_offsets(&layout.text, alphabet);
-    // Scatter availability and anchor timestamps into SUFFIX-ARRAY order, so
-    // the sweep never takes a random read: forward availability runs to the
-    // actor stream's TRUE end (slice span plus the shift); a backward suffix
-    // (of the reversed text) maps onto its origin position, whose
-    // availability runs back to the TRUE stream start.
+    // Scatter shared timestamps and each view's availability into
+    // SUFFIX-ARRAY order, so the sweep never takes a random read: forward
+    // availability runs to the view's TRUE stream end (slice span plus the
+    // shift); a backward suffix (of the reversed text) maps onto its origin
+    // position, whose availability runs back to the TRUE stream start.
     let last = layout.ts.len().saturating_sub(1);
-    let shift_after = |pos: usize| {
-        if layout.after_of.is_empty() {
-            0
+    let ts_fwd = sa_companions(&sa_fwd, |pos| (0, layout.ts[pos])).1;
+    let ts_bwd = sa_companions(&sa_bwd, |pos| (0, layout.ts[last - pos])).1;
+    let mut views = Vec::with_capacity(layout.views.len());
+    for view in &layout.views {
+        let (avail_fwd, _) = sa_companions(&sa_fwd, |pos| {
+            let here = u32::try_from(pos).expect("position fits u32");
+            (
+                view.end[pos].saturating_sub(here)
+                    + if view.end[pos] > here {
+                        view.after_of[pos]
+                    } else {
+                        0
+                    },
+                0,
+            )
+        });
+        let (avail_bwd, _) = sa_companions(&sa_bwd, |pos| {
+            let origin = last - pos;
+            let here = u32::try_from(origin).expect("position fits u32");
+            let inside = view.end[origin] > here || view.start[origin] == view.end[origin];
+            (
+                if inside {
+                    here - view.start[origin] + 1 + view.before_of[origin]
+                } else {
+                    0
+                },
+                0,
+            )
+        });
+        let (own_fwd, own_bwd) = if stitched {
+            (
+                Some(sa_bitmap(&sa_fwd, |pos| view.own_fwd[pos] != 0)),
+                Some(sa_bitmap(&sa_bwd, |pos| view.own_bwd[last - pos] != 0)),
+            )
         } else {
-            layout.after_of[pos]
-        }
-    };
-    let shift_before = |pos: usize| {
-        if layout.before_of.is_empty() {
-            0
-        } else {
-            layout.before_of[pos]
-        }
-    };
-    let (avail_fwd, ts_fwd) = sa_companions(&sa_fwd, |pos| {
-        (
-            layout.end[pos] - u32::try_from(pos).expect("position fits u32") + shift_after(pos),
-            layout.ts[pos],
-        )
-    });
-    let (avail_bwd, ts_bwd) = sa_companions(&sa_bwd, |pos| {
-        let origin = last - pos;
-        (
-            u32::try_from(origin).expect("position fits u32") - layout.start[origin]
-                + 1
-                + shift_before(origin),
-            layout.ts[origin],
-        )
-    });
-    let (own_fwd, own_bwd) = if stitched {
-        (
-            Some(sa_bitmap(&sa_fwd, |pos| layout.own_fwd[pos] != 0)),
-            Some(sa_bitmap(&sa_bwd, |pos| layout.own_bwd[last - pos] != 0)),
-        )
-    } else {
-        (None, None)
-    };
+            (None, None)
+        };
+        views.push(View {
+            negative: view.negative,
+            avail_fwd,
+            avail_bwd,
+            own_fwd,
+            own_bwd,
+        });
+    }
     Ok(PathsSa {
         alphabet,
         text: layout.text,
         sa_fwd,
         lcp_fwd,
-        avail_fwd,
         ts_fwd,
         sa_bwd,
         lcp_bwd,
-        avail_bwd,
         ts_bwd,
         buckets,
-        own_fwd,
-        own_bwd,
+        views,
         max_depth: if stitched { max_depth } else { 0 },
     })
 }
@@ -761,11 +833,17 @@ fn push_slice(
     stream: &mut ShardStream,
     local: u64,
     collapsed: &stitch::CollapsedStream,
-    slice: stitch::ActorStitch,
-    prefix: u32,
+    metas: &[ActorViewMeta],
 ) {
-    let lo = slice.text.lo as usize;
-    let hi = slice.text.hi as usize;
+    let text = metas[0].slice.text;
+    for meta in metas {
+        assert!(
+            meta.slice.text == text,
+            "every view of one actor shares one text slice"
+        );
+    }
+    let lo = text.lo as usize;
+    let hi = text.hi as usize;
     stream.codes.extend_from_slice(&collapsed.codes[lo..hi]);
     stream.ts.extend_from_slice(&collapsed.ts[lo..hi]);
     stream
@@ -773,30 +851,50 @@ fn push_slice(
         .push(u32::try_from(stream.codes.len()).expect("stream fits u32"));
     stream.actors.push(local);
     let stream_len = u32::try_from(collapsed.codes.len()).expect("stream fits u32");
-    let relative = |span: stitch::Span| stitch::Span {
-        lo: span.lo - slice.text.lo,
-        hi: span.hi - slice.text.lo,
-    };
-    stream
-        .slices
-        .as_mut()
-        .expect("pair streams carry slices")
-        .push(SliceMeta {
-            before: slice.text.lo + prefix,
-            after: stream_len - slice.text.hi,
-            own_fwd: relative(slice.own_fwd),
-            own_bwd: relative(slice.own_bwd),
+    let slices = stream.slices.as_mut().expect("pair streams carry slices");
+    for meta in metas {
+        let relative = |span: stitch::Span| stitch::Span {
+            lo: span.lo - text.lo,
+            hi: span.hi - text.lo,
+        };
+        slices.metas.push(SliceMeta {
+            before: text.lo + meta.prefix,
+            after: match meta.end {
+                Some(_) => 0,
+                None => stream_len - text.hi,
+            },
+            end: match meta.end {
+                Some(end) => end - text.lo,
+                None => text.hi - text.lo,
+            },
+            own_fwd: relative(meta.slice.own_fwd),
+            own_bwd: relative(meta.slice.own_bwd),
         });
+    }
 }
 
-/// An empty pair stream, ready for `push_slice`.
-fn empty_pair_stream() -> ShardStream {
+/// One view's stitch geometry for one actor: the stitch (text slice shared
+/// across the actor's views, plus this view's ownership), the events before
+/// the slice in THIS view's stream (or its saturation stand-in), and where
+/// this view's stream ends inside the slice (`None` = the slice's end, with
+/// the events past it counted by `after`).
+struct ActorViewMeta {
+    slice: stitch::ActorStitch,
+    prefix: u32,
+    end: Option<u32>,
+}
+
+/// An empty pair stream carrying the given view signs.
+fn empty_pair_stream(signs: Vec<bool>) -> ShardStream {
     ShardStream {
         codes: Vec::new(),
         ts: Vec::new(),
         bounds: vec![0],
         actors: Vec::new(),
-        slices: Some(Vec::new()),
+        slices: Some(SliceViews {
+            signs,
+            metas: Vec::new(),
+        }),
     }
 }
 
@@ -971,8 +1069,9 @@ fn stitch_actor(
     delta_files: &std::collections::HashSet<String>,
     max_depth: u32,
     local: u64,
-    addition: &mut ShardStream,
-    retraction: &mut ShardStream,
+    dual: &mut ShardStream,
+    late_addition: &mut ShardStream,
+    late_retraction: &mut ShardStream,
 ) -> Result<(), EventStoreError> {
     let (old_pieces, delta_pieces) = split_run(scan, run, delta_files);
     let old_last = last_key(scan, &old_pieces)?;
@@ -981,7 +1080,44 @@ fn stitch_actor(
         (Some(last), Some(first)) => last < first,
         _ => true,
     };
-    let (old_events, prefix) = if pure_append {
+    if !pure_append {
+        // A late arrival: the old stream is NOT a prefix of the merged one,
+        // so the two views cannot share a text. Read the whole stream once
+        // and emit the classic separate pair - the cost is this one actor's
+        // history, never the dataset.
+        let old_events = read_events(scan, old_pieces.clone())?;
+        let mut all_pieces = old_pieces;
+        all_pieces.extend(delta_pieces);
+        let merged_events = read_events(scan, all_pieces)?;
+        let merged = stitch::collapse(&merged_events);
+        let old = stitch::collapse(&old_events);
+        let envelope = stitch::envelope(&old, &merged);
+        let merged_len = u32::try_from(merged.codes.len()).expect("stream fits u32");
+        let old_len = u32::try_from(old.codes.len()).expect("stream fits u32");
+        if let Some(slice) = stitch::addition_stitch(merged_len, envelope, max_depth) {
+            let meta = ActorViewMeta {
+                slice,
+                prefix: 0,
+                end: None,
+            };
+            push_slice(late_addition, local, &merged, &[meta]);
+        }
+        if let Some(slice) = stitch::retraction_stitch(old_len, envelope, max_depth) {
+            let meta = ActorViewMeta {
+                slice,
+                prefix: 0,
+                end: None,
+            };
+            push_slice(late_retraction, local, &old, &[meta]);
+        }
+        return Ok(());
+    }
+    // The pure append: the old stream is a PREFIX of the merged one, so both
+    // views share the merged text slice. The addition view owns the changed
+    // forms with merged availability; the retraction view owns the stale
+    // forward forms with its stream ENDING at the envelope, which reproduces
+    // exactly the availability older segments counted with.
+    let (old_events, prefix) = {
         let (tail, reached_start) = read_tail(scan, &old_pieces, 2 * max_depth - 1)?;
         let prefix = if reached_start {
             0
@@ -989,34 +1125,56 @@ fn stitch_actor(
             saturated_prefix(max_depth)
         };
         (tail, prefix)
-    } else {
-        (read_events(scan, old_pieces.clone())?, 0)
     };
-    let merged_events = if pure_append {
-        let mut events = old_events.clone();
-        events.extend(read_events(scan, delta_pieces)?);
-        events
-    } else {
-        let mut all_pieces = old_pieces;
-        all_pieces.extend(delta_pieces);
-        read_events(scan, all_pieces)?
-    };
+    let mut merged_events = old_events.clone();
+    merged_events.extend(read_events(scan, delta_pieces)?);
     let merged = stitch::collapse(&merged_events);
     let old = stitch::collapse(&old_events);
     let envelope = stitch::envelope(&old, &merged);
     let merged_len = u32::try_from(merged.codes.len()).expect("stream fits u32");
     let old_len = u32::try_from(old.codes.len()).expect("stream fits u32");
-    if let Some(slice) = stitch::addition_stitch(merged_len, envelope, max_depth) {
-        push_slice(addition, local, &merged, slice, prefix);
-    }
-    if let Some(slice) = stitch::retraction_stitch(old_len, envelope, max_depth) {
-        push_slice(retraction, local, &old, slice, prefix);
-    }
+    let Some(addition) = stitch::addition_stitch(merged_len, envelope, max_depth) else {
+        return Ok(());
+    };
+    let retraction_own = match stitch::retraction_stitch(old_len, envelope, max_depth) {
+        Some(slice) => slice.own_fwd,
+        None => stitch::Span {
+            lo: envelope.start,
+            hi: envelope.start,
+        },
+    };
+    let empty = stitch::Span {
+        lo: envelope.start,
+        hi: envelope.start,
+    };
+    let metas = [
+        ActorViewMeta {
+            slice: addition,
+            prefix,
+            end: None,
+        },
+        ActorViewMeta {
+            slice: stitch::ActorStitch {
+                text: addition.text,
+                own_fwd: retraction_own,
+                own_bwd: empty,
+            },
+            prefix,
+            end: Some(envelope.start),
+        },
+    ];
+    push_slice(dual, local, &merged, &metas);
     Ok(())
 }
 
-/// Read the touched actors' changed regions and cut both halves of a
-/// refresh's segment pair. Cost tracks the delta plus a bounded tail per
+/// The per-shard stitch streams of one refresh: the dual stream, then the
+/// late-arrival addition and retraction streams.
+type StitchStreams = (Vec<ShardStream>, Vec<ShardStream>, Vec<ShardStream>);
+
+/// Read the touched actors' changed regions and cut the refresh's stitch
+/// streams: the DUAL stream (pure-append actors, one shared text per actor
+/// with a positive addition view and a negative retraction view) and the
+/// separate late-arrival pair. Cost tracks the delta plus a bounded tail per
 /// touched actor (`stitch_actor`), never the touched actors' histories.
 fn collect_pair_streams(
     io: &StoreIo,
@@ -1025,17 +1183,19 @@ fn collect_pair_streams(
     touched: &std::collections::HashSet<(u32, u64)>,
     delta_files: &std::collections::HashSet<String>,
     max_depth: u32,
-) -> Result<(Vec<ShardStream>, Vec<ShardStream>), EventError> {
-    let mut additions = Vec::new();
-    let mut retractions = Vec::new();
+) -> Result<StitchStreams, EventError> {
+    let mut duals = Vec::new();
+    let mut late_additions = Vec::new();
+    let mut late_retractions = Vec::new();
     run_sharded(
         io,
         dataset,
         cfg,
         |scan| {
             let shard = scan.shard();
-            let mut addition = empty_pair_stream();
-            let mut retraction = empty_pair_stream();
+            let mut dual = empty_pair_stream(vec![false, true]);
+            let mut late_addition = empty_pair_stream(vec![false]);
+            let mut late_retraction = empty_pair_stream(vec![true]);
             let (locals, runs) = scan.actor_runs_with_locals();
             for (local, run) in locals.into_iter().zip(runs) {
                 if !touched.contains(&(shard, local)) {
@@ -1047,19 +1207,21 @@ fn collect_pair_streams(
                     delta_files,
                     max_depth,
                     local,
-                    &mut addition,
-                    &mut retraction,
+                    &mut dual,
+                    &mut late_addition,
+                    &mut late_retraction,
                 )?;
             }
-            Ok((addition, retraction))
+            Ok((dual, late_addition, late_retraction))
         },
-        |(addition, retraction)| {
-            additions.push(addition);
-            retractions.push(retraction);
+        |(dual, late_addition, late_retraction)| {
+            duals.push(dual);
+            late_additions.push(late_addition);
+            late_retractions.push(late_retraction);
             Ok(())
         },
     )?;
-    Ok((additions, retractions))
+    Ok((duals, late_additions, late_retractions))
 }
 
 /// Whether any of a pair's shard streams holds an actor at all.
@@ -1067,9 +1229,9 @@ fn pair_has_streams(streams: &[ShardStream]) -> bool {
     streams.iter().any(|stream| !stream.actors.is_empty())
 }
 
-/// The suffix-text positions a pair would occupy: events plus one separator
-/// per actor slice, both halves.
-fn pair_positions(halves: [&[ShardStream]; 2]) -> usize {
+/// The suffix-text positions a stitch would occupy: events plus one
+/// separator per actor slice, every emitted stream.
+fn pair_positions(halves: [&[ShardStream]; 3]) -> usize {
     let mut positions = 0usize;
     for streams in halves {
         for stream in streams {
@@ -1079,17 +1241,29 @@ fn pair_positions(halves: [&[ShardStream]; 2]) -> usize {
     positions
 }
 
-/// Extend the index for a refresh with one segment PAIR - an addition owning
-/// the changed window forms and a retraction cancelling the stale forms older
-/// segments still count - leaving every existing segment file untouched.
+/// What extending the index for one refresh did, or why it declined.
+pub(crate) enum PairOutcome {
+    /// The stitch segments were appended; the report is the status text.
+    Applied(String),
+    /// No stored manifest to extend (never built, or an older format).
+    NoManifest,
+    /// The collected stitch's positions reached the dataset's, so one sort
+    /// over the whole dataset is the cheaper way to make the index current.
+    Concede {
+        stitch_positions: usize,
+        dataset_positions: usize,
+    },
+}
+
+/// Extend the index for a refresh with one stitch - a dual segment whose
+/// addition view owns the changed window forms and whose retraction view
+/// cancels the stale forms older segments still count, plus the separate
+/// late-arrival pair - leaving every existing segment file untouched.
 ///
-/// Returns `None` when the caller should rebuild instead: there is no stored
-/// manifest to extend (never built, or a version older than this format), or
-/// the collected pair's positions reach half the dataset's - the crossover
-/// where one sort over the whole dataset is cheaper than one over the pair.
-/// Below the crossover the pair's cost is proportional to the delta plus the
-/// touched actors' changed envelopes with `max_depth` context - never to
-/// their whole histories.
+/// The caller rebuilds on `NoManifest` and `Concede`. Below the crossover
+/// the stitch's cost is proportional to the delta plus the touched actors'
+/// changed envelopes with `max_depth` context - never to their whole
+/// histories.
 pub(crate) fn append_pair(
     io: &StoreIo,
     dataset: &Dataset,
@@ -1097,47 +1271,48 @@ pub(crate) fn append_pair(
     touched: &std::collections::HashSet<(u32, u64)>,
     delta_files: &[(u32, String)],
     max_depth: u32,
-) -> Result<Option<String>, EventError> {
+) -> Result<PairOutcome, EventError> {
     let Some((manifest_path, manifest)) = read_stored_manifest(io, dataset)? else {
-        return Ok(None);
+        return Ok(PairOutcome::NoManifest);
     };
     let started = std::time::Instant::now();
     let mut delta_rels = std::collections::HashSet::new();
     for (_, rel) in delta_files {
         delta_rels.insert(rel.clone());
     }
-    let (additions, retractions) =
+    let (duals, late_additions, late_retractions) =
         collect_pair_streams(io, dataset, cfg, touched, &delta_rels, max_depth)?;
     let collected = started.elapsed().as_secs_f64();
-    // The pair costs one suffix sort over its positions; a whole rebuild
+    // The stitch costs one suffix sort over its positions; a whole rebuild
     // costs one over the dataset's. A delta touching most actors carries a
-    // fixed tail-and-retraction context per actor that can exceed the
-    // dataset itself, at which point the rebuild is the CHEAPER way to make
-    // the index current - so the choice is by measured positions, not by
-    // delta size. Half the dataset's positions is the crossover, counting
-    // the pair's own separators against the dataset's events + actors.
+    // fixed tail-context per actor that can rival the dataset itself, at
+    // which point the rebuild is the CHEAPER way to make the index current -
+    // so the choice is by measured positions, not by delta size: the stitch
+    // runs whenever its positions (its separators included) undercut the
+    // dataset's events + actors, and the rebuild takes over past that.
     let dataset_positions =
         usize::try_from(dataset.record.measured_events + dataset.record.measured_actors)
             .expect("dataset positions fit usize");
-    if pair_positions([&additions, &retractions]) * 2 >= dataset_positions {
-        return Ok(None);
+    let stitch_positions = pair_positions([&duals, &late_additions, &late_retractions]);
+    if stitch_positions >= dataset_positions {
+        return Ok(PairOutcome::Concede {
+            stitch_positions,
+            dataset_positions,
+        });
     }
     let alphabet = u32::try_from(dataset.event_dict.values.len()).expect("dictionary fits u32");
     let mut segments = manifest.segments;
     let mut next_id = manifest.next_id;
     let mut positions = 0usize;
     let mut written = 0usize;
-    for (streams, negative) in [(&additions, false), (&retractions, true)] {
+    for streams in [&duals, &late_additions, &late_retractions] {
         if !pair_has_streams(streams) {
             continue;
         }
         let index = assemble(streams, alphabet, max_depth)?;
         positions += index.text.len();
         written += write_segment(io, dataset, &index, next_id, SEGMENT_STAMP)?;
-        segments.push(SegmentEntry {
-            id: next_id,
-            negative,
-        });
+        segments.push(SegmentEntry { id: next_id });
         next_id += 1;
     }
     let next = IndexManifest { next_id, segments };
@@ -1148,7 +1323,7 @@ pub(crate) fn append_pair(
         io.delete(&manifest_path)?;
     }
     let total = started.elapsed().as_secs_f64();
-    Ok(Some(format!(
+    Ok(PairOutcome::Applied(format!(
         "paths index: +pair, {positions} positions, {written} bytes, {total:.3}s \
          (collect {collected:.3}s, stitch {:.3}s)",
         total - collected
@@ -1177,10 +1352,7 @@ pub(crate) fn rebuild(
     // between the segment files and here leaves a dataset that scans.
     let manifest = IndexManifest {
         next_id: 1,
-        segments: vec![SegmentEntry {
-            id: 0,
-            negative: false,
-        }],
+        segments: vec![SegmentEntry { id: 0 }],
     };
     io.put_verified(&manifest_rel(dataset), encode_manifest(&manifest, stamp))?;
     let total = started.elapsed().as_secs_f64();
@@ -1235,7 +1407,6 @@ fn encode_manifest(manifest: &IndexManifest, fingerprint: u64) -> Vec<u8> {
     out.extend_from_slice(&(manifest.segments.len() as u64).to_le_bytes());
     for segment in &manifest.segments {
         out.extend_from_slice(&segment.id.to_le_bytes());
-        out.push(u8::from(segment.negative));
     }
     out
 }
@@ -1280,14 +1451,7 @@ fn decode_manifest(
     let mut segments = Vec::new();
     for _ in 0..count {
         let id = u32::from_le_bytes(take(4)?.try_into().expect("four bytes"));
-        let sign = take(1)?[0];
-        if sign > 1 {
-            return Err(corrupt(format!("paths manifest segment sign {sign}")));
-        }
-        segments.push(SegmentEntry {
-            id,
-            negative: sign == 1,
-        });
+        segments.push(SegmentEntry { id });
     }
     Ok(IndexManifest { next_id, segments })
 }
@@ -1341,8 +1505,8 @@ fn raw_bytes<T>(values: &[T]) -> &[u8] {
 
 /// The shared file header: magic, version, fingerprint, position count,
 /// alphabet, symbol width, the stitch window-length bound (0 on a base
-/// segment), and whether the file carries an ownership bitmap.
-fn encode_header(index: &PathsSa, fingerprint: u64, capacity: usize, has_own: bool) -> Vec<u8> {
+/// segment), and how many signed views follow the shared arrays.
+fn encode_header(index: &PathsSa, fingerprint: u64, capacity: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(capacity);
     out.extend_from_slice(MAGIC);
     out.push(VERSION);
@@ -1351,46 +1515,63 @@ fn encode_header(index: &PathsSa, fingerprint: u64, capacity: usize, has_own: bo
     out.extend_from_slice(&index.alphabet.to_le_bytes());
     out.push(index.text.width());
     out.extend_from_slice(&index.max_depth.to_le_bytes());
-    out.push(u8::from(has_own));
+    out.push(u8::try_from(index.views.len()).expect("view count fits u8"));
     out
 }
 
-/// Encode the forward file: header, text, the forward arrays, then the
-/// forward ownership bitmap when the segment is a stitch.
+/// Append one view's per-direction sections: sign, availability, and the
+/// ownership bitmap (a zero flag means the view owns everything).
+fn encode_view(out: &mut Vec<u8>, negative: bool, avail: &[u32], own: Option<&[u64]>) {
+    out.push(u8::from(negative));
+    out.extend_from_slice(raw_bytes(avail));
+    match own {
+        None => out.push(0),
+        Some(words) => {
+            out.push(1);
+            out.extend_from_slice(raw_bytes(words));
+        }
+    }
+}
+
+/// Encode the forward file: header, text, the shared forward arrays, then
+/// each view's forward sections.
 fn encode_fwd(index: &PathsSa, fingerprint: u64) -> Vec<u8> {
     let n = index.text.len();
     let width = usize::from(index.text.width());
-    let mut out = encode_header(
-        index,
-        fingerprint,
-        40 + n * (width + 20),
-        index.own_fwd.is_some(),
-    );
+    let mut out = encode_header(index, fingerprint, 48 + n * (width + 20));
     match &index.text {
         Text::Small(text) => out.extend_from_slice(text),
         Text::Wide(text) => out.extend_from_slice(raw_bytes(text)),
     }
     out.extend_from_slice(raw_bytes(&index.sa_fwd));
     out.extend_from_slice(raw_bytes(&index.lcp_fwd));
-    out.extend_from_slice(raw_bytes(&index.avail_fwd));
     out.extend_from_slice(raw_bytes(&index.ts_fwd));
-    if let Some(words) = &index.own_fwd {
-        out.extend_from_slice(raw_bytes(words));
+    for view in &index.views {
+        encode_view(
+            &mut out,
+            view.negative,
+            &view.avail_fwd,
+            view.own_fwd.as_deref(),
+        );
     }
     out
 }
 
-/// Encode the backward file: header, the backward arrays, then the backward
-/// ownership bitmap when the segment is a stitch.
+/// Encode the backward file: header, the shared backward arrays, then each
+/// view's backward sections.
 fn encode_bwd(index: &PathsSa, fingerprint: u64) -> Vec<u8> {
     let n = index.text.len();
-    let mut out = encode_header(index, fingerprint, 40 + n * 20, index.own_bwd.is_some());
+    let mut out = encode_header(index, fingerprint, 48 + n * 20);
     out.extend_from_slice(raw_bytes(&index.sa_bwd));
     out.extend_from_slice(raw_bytes(&index.lcp_bwd));
-    out.extend_from_slice(raw_bytes(&index.avail_bwd));
     out.extend_from_slice(raw_bytes(&index.ts_bwd));
-    if let Some(words) = &index.own_bwd {
-        out.extend_from_slice(raw_bytes(words));
+    for view in &index.views {
+        encode_view(
+            &mut out,
+            view.negative,
+            &view.avail_bwd,
+            view.own_bwd.as_deref(),
+        );
     }
     out
 }
@@ -1446,7 +1627,7 @@ struct FileHeader {
     alphabet: u32,
     width: u8,
     max_depth: u32,
-    has_own: bool,
+    views: u8,
 }
 
 /// Parse and verify one file's header, returning its section cursor and the
@@ -1487,9 +1668,9 @@ fn open_sections<'a>(
     let alphabet = u32::from_le_bytes(sections.take(4)?.try_into().expect("4 bytes"));
     let width = sections.take(1)?[0];
     let max_depth = u32::from_le_bytes(sections.take(4)?.try_into().expect("4 bytes"));
-    let own_flag = sections.take(1)?[0];
-    if own_flag > 1 {
-        return Err(corrupt(format!("paths index ownership flag {own_flag}")));
+    let views = sections.take(1)?[0];
+    if views == 0 {
+        return Err(corrupt("paths index file declares zero views".to_string()));
     }
     Ok((
         sections,
@@ -1498,9 +1679,49 @@ fn open_sections<'a>(
             alphabet,
             width,
             max_depth,
-            has_own: own_flag == 1,
+            views,
         },
     ))
+}
+
+/// One view's decoded per-direction sections.
+struct ViewSections<'a> {
+    negative: bool,
+    avail: &'a [u8],
+    own: Option<&'a [u8]>,
+}
+
+/// Take one view's sections (sign, availability, optional ownership bitmap)
+/// off a file cursor.
+fn take_view<'a>(
+    sections: &mut Sections<'a>,
+    n: usize,
+    rel: &str,
+) -> Result<ViewSections<'a>, EventStoreError> {
+    let sign = sections.take(1)?[0];
+    if sign > 1 {
+        return Err(EventStoreError::Corrupt {
+            file: rel.to_string(),
+            detail: format!("paths index view sign {sign}"),
+        });
+    }
+    let avail = sections.take(n * 4)?;
+    let own_flag = sections.take(1)?[0];
+    let own = match own_flag {
+        0 => None,
+        1 => Some(sections.take(n.div_ceil(64) * 8)?),
+        other => {
+            return Err(EventStoreError::Corrupt {
+                file: rel.to_string(),
+                detail: format!("paths index ownership flag {other}"),
+            })
+        }
+    };
+    Ok(ViewSections {
+        negative: sign == 1,
+        avail,
+        own,
+    })
 }
 
 /// Decode the two index files, verifying magic, version, and fingerprint on
@@ -1522,78 +1743,81 @@ fn decode(
         || header.alphabet != header_b.alphabet
         || header.width != header_b.width
         || header.max_depth != header_b.max_depth
-        || header.has_own != header_b.has_own
+        || header.views != header_b.views
     {
         return Err(corrupt(
             "paths index halves disagree on their header".to_string(),
         ));
     }
     let (n, alphabet, width) = (header.n, header.alphabet, header.width);
-    // Every section's bytes are sliced up front, then all nine copy into
-    // their typed vectors on concurrent threads - the copies dominate a cold
-    // load, and they are independent.
+    // Every section's bytes are sliced up front, then the copies into typed
+    // vectors run on concurrent threads - they dominate a cold load, and
+    // they are independent.
     let text_bytes = sections.take(n * usize::from(width))?;
     let sa_fwd_bytes = sections.take(n * 4)?;
     let lcp_fwd_bytes = sections.take(n * 4)?;
-    let avail_fwd_bytes = sections.take(n * 4)?;
     let ts_fwd_bytes = sections.take(n * 8)?;
-    let own_fwd_bytes = if header.has_own {
-        Some(sections.take(n.div_ceil(64) * 8)?)
-    } else {
-        None
-    };
+    let mut fwd_views = Vec::with_capacity(usize::from(header.views));
+    for _ in 0..header.views {
+        fwd_views.push(take_view(&mut sections, n, rel)?);
+    }
     let sa_bwd_bytes = sections_b.take(n * 4)?;
     let lcp_bwd_bytes = sections_b.take(n * 4)?;
-    let avail_bwd_bytes = sections_b.take(n * 4)?;
     let ts_bwd_bytes = sections_b.take(n * 8)?;
-    let own_bwd_bytes = if header.has_own {
-        Some(sections_b.take(n.div_ceil(64) * 8)?)
-    } else {
-        None
-    };
-    let (text, sa_fwd, lcp_fwd, avail_fwd, ts_fwd, sa_bwd, lcp_bwd, avail_bwd, ts_bwd) =
-        std::thread::scope(|scope| {
-            let text = scope.spawn(move || match width {
-                1 => Ok(Text::Small(copy_typed::<u8>(text_bytes))),
-                4 => Ok(Text::Wide(copy_typed::<i32>(text_bytes))),
-                other => Err(format!("paths index symbol width {other}")),
-            });
-            let sa_f = scope.spawn(move || copy_typed::<i32>(sa_fwd_bytes));
-            let lcp_f = scope.spawn(move || copy_typed::<i32>(lcp_fwd_bytes));
-            let avail_f = scope.spawn(move || copy_typed::<u32>(avail_fwd_bytes));
-            let ts_f = scope.spawn(move || copy_typed::<i64>(ts_fwd_bytes));
-            let sa_b = scope.spawn(move || copy_typed::<i32>(sa_bwd_bytes));
-            let lcp_b = scope.spawn(move || copy_typed::<i32>(lcp_bwd_bytes));
-            let avail_b = scope.spawn(move || copy_typed::<u32>(avail_bwd_bytes));
-            let ts_b = scope.spawn(move || copy_typed::<i64>(ts_bwd_bytes));
-            (
-                text.join().expect("text copy thread panicked"),
-                sa_f.join().expect("copy thread panicked"),
-                lcp_f.join().expect("copy thread panicked"),
-                avail_f.join().expect("copy thread panicked"),
-                ts_f.join().expect("copy thread panicked"),
-                sa_b.join().expect("copy thread panicked"),
-                lcp_b.join().expect("copy thread panicked"),
-                avail_b.join().expect("copy thread panicked"),
-                ts_b.join().expect("copy thread panicked"),
-            )
+    let mut bwd_views = Vec::with_capacity(usize::from(header.views));
+    for _ in 0..header.views {
+        bwd_views.push(take_view(&mut sections_b, n, rel)?);
+    }
+    let (text, sa_fwd, lcp_fwd, ts_fwd, sa_bwd, lcp_bwd, ts_bwd) = std::thread::scope(|scope| {
+        let text = scope.spawn(move || match width {
+            1 => Ok(Text::Small(copy_typed::<u8>(text_bytes))),
+            4 => Ok(Text::Wide(copy_typed::<i32>(text_bytes))),
+            other => Err(format!("paths index symbol width {other}")),
         });
+        let sa_f = scope.spawn(move || copy_typed::<i32>(sa_fwd_bytes));
+        let lcp_f = scope.spawn(move || copy_typed::<i32>(lcp_fwd_bytes));
+        let ts_f = scope.spawn(move || copy_typed::<i64>(ts_fwd_bytes));
+        let sa_b = scope.spawn(move || copy_typed::<i32>(sa_bwd_bytes));
+        let lcp_b = scope.spawn(move || copy_typed::<i32>(lcp_bwd_bytes));
+        let ts_b = scope.spawn(move || copy_typed::<i64>(ts_bwd_bytes));
+        (
+            text.join().expect("text copy thread panicked"),
+            sa_f.join().expect("copy thread panicked"),
+            lcp_f.join().expect("copy thread panicked"),
+            ts_f.join().expect("copy thread panicked"),
+            sa_b.join().expect("copy thread panicked"),
+            lcp_b.join().expect("copy thread panicked"),
+            ts_b.join().expect("copy thread panicked"),
+        )
+    });
     let text = text.map_err(corrupt)?;
+    let mut views = Vec::with_capacity(fwd_views.len());
+    for (fwd, bwd) in fwd_views.into_iter().zip(bwd_views) {
+        if fwd.negative != bwd.negative {
+            return Err(corrupt(
+                "paths index halves disagree on a view's sign".to_string(),
+            ));
+        }
+        views.push(View {
+            negative: fwd.negative,
+            avail_fwd: copy_typed::<u32>(fwd.avail),
+            avail_bwd: copy_typed::<u32>(bwd.avail),
+            own_fwd: fwd.own.map(copy_typed::<u64>),
+            own_bwd: bwd.own.map(copy_typed::<u64>),
+        });
+    }
     let buckets = bucket_offsets(&text, alphabet);
     Ok(PathsSa {
         alphabet,
         text,
         sa_fwd,
         lcp_fwd,
-        avail_fwd,
         ts_fwd,
         sa_bwd,
         lcp_bwd,
-        avail_bwd,
         ts_bwd,
         buckets,
-        own_fwd: own_fwd_bytes.map(copy_typed::<u64>),
-        own_bwd: own_bwd_bytes.map(copy_typed::<u64>),
+        views,
         max_depth: header.max_depth,
     })
 }
@@ -1641,12 +1865,12 @@ pub(crate) fn run_from_index(
     let Some(held) = load_segments(io, dataset, cfg)? else {
         return Ok(None);
     };
-    let mut indexes: Vec<(&PathsSa, bool)> = Vec::with_capacity(held.len());
-    for (item, negative) in &held {
+    let mut indexes: Vec<&PathsSa> = Vec::with_capacity(held.len());
+    for item in &held {
         let CachedItem::PathsSa(ref index) = **item else {
             unreachable!("paths index cache slot holds a paths index");
         };
-        indexes.push((index, *negative));
+        indexes.push(index);
     }
     Ok(Some(answer_segments(
         &indexes,
@@ -1656,8 +1880,8 @@ pub(crate) fn run_from_index(
     )))
 }
 
-/// One loaded segment held out of the cache, with its manifest sign.
-type HeldSegment = (std::sync::Arc<CachedItem>, bool);
+/// One loaded segment held out of the cache.
+type HeldSegment = std::sync::Arc<CachedItem>;
 
 /// Load every segment the manifest names, or `None` when the dataset has no
 /// current index at all.
@@ -1696,7 +1920,7 @@ fn load_segments(
                 SEGMENT_STAMP,
             )?)))
         })?;
-        held.push((item, segment.negative));
+        held.push(item);
     }
     Ok(Some(held))
 }
@@ -1727,6 +1951,8 @@ struct ChunkSweep {
 /// The sweep parameters shared by every chunk of one statement.
 struct Sweep<'a> {
     index: &'a PathsSa,
+    /// Which of the segment's signed views this sweep counts with.
+    view: usize,
     dir: Direction,
     /// Anchored sweeps truncate windows at the stream boundary (length >= 2);
     /// unanchored sweeps admit full-length windows only.
@@ -1788,7 +2014,7 @@ impl<'a, 'b> TopSet<'a, 'b> {
 /// covering that length), and count each group's in-range members. Boundary
 /// groups are returned open for the cross-chunk merge.
 fn sweep_chunk(sweep: &Sweep<'_>, lo: usize, hi: usize) -> ChunkSweep {
-    let (sa, lcp, avail_sa, ts_sa) = sweep.index.arrays(sweep.dir);
+    let (sa, lcp, avail_sa, ts_sa) = sweep.index.arrays(sweep.view, sweep.dir);
     let buckets = &sweep.index.buckets;
     let mut total = 0u64;
     let mut head: Option<Group> = None;
@@ -1822,7 +2048,7 @@ fn sweep_chunk(sweep: &Sweep<'_>, lo: usize, hi: usize) -> ChunkSweep {
         } else {
             (avail >= sweep.depth, sweep.depth)
         };
-        if !valid || !sweep.index.owns(sweep.dir, at) {
+        if !valid || !sweep.index.owns(sweep.view, sweep.dir, at) {
             continue;
         }
         let anchor_ts = ts_sa[at];
@@ -2030,49 +2256,54 @@ fn merged_order(ranks: &[u32], a: &(Vec<u64>, u64), b: &(Vec<u64>, u64)) -> Orde
 /// arithmetically impossible when the invariant holds, so it stops the query
 /// rather than shipping an answer built on a broken index.
 pub(crate) fn answer_segments(
-    indexes: &[(&PathsSa, bool)],
+    indexes: &[&PathsSa],
     names: &[String],
     spec: &PathsSpec,
     anchor: Option<(u64, bool)>,
 ) -> PathsResult {
-    if let [(only, false)] = indexes {
-        if only.own_fwd.is_none() {
-            return answer(only, names, spec, anchor);
+    if let [only] = indexes {
+        if let [view] = only.views.as_slice() {
+            if !view.negative && view.own_fwd.is_none() {
+                return answer(only, names, spec, anchor);
+            }
         }
     }
     let (from, to) = range_bounds(spec.range);
     let mut alphabet = 0;
-    for (index, _) in indexes {
+    for index in indexes {
         alphabet = alphabet.max(index.alphabet);
     }
     let ranks = name_ranks(names, alphabet);
     let mut merged: std::collections::HashMap<Vec<u64>, i64> = std::collections::HashMap::new();
     let mut total = 0i64;
-    for (index, negative) in indexes {
+    for index in indexes {
         let Some((dir, truncate, lo, hi)) = sweep_target(index, anchor) else {
             continue;
         };
-        let sweep = Sweep {
-            index,
-            dir,
-            truncate,
-            depth: spec.depth,
-            from,
-            to,
-            ranks: &ranks,
-            // Keep every window: see TopSet::offer for why a segment must not
-            // prune to `top`.
-            top: usize::MAX,
-        };
-        let (finals, segment_total) = sweep_interval(&sweep, lo, hi);
-        let sign: i64 = if *negative { -1 } else { 1 };
-        total += sign * i64::try_from(segment_total).expect("window total fits i64");
-        for group in finals {
-            if group.count == 0 {
-                continue;
+        for (which, view) in index.views.iter().enumerate() {
+            let sweep = Sweep {
+                index,
+                view: which,
+                dir,
+                truncate,
+                depth: spec.depth,
+                from,
+                to,
+                ranks: &ranks,
+                // Keep every window: see TopSet::offer for why a view must
+                // not prune to `top`.
+                top: usize::MAX,
+            };
+            let (finals, view_total) = sweep_interval(&sweep, lo, hi);
+            let sign: i64 = if view.negative { -1 } else { 1 };
+            total += sign * i64::try_from(view_total).expect("window total fits i64");
+            for group in finals {
+                if group.count == 0 {
+                    continue;
+                }
+                let count = sign * i64::try_from(group.count).expect("window count fits i64");
+                *merged.entry(index.window_codes(dir, &group)).or_insert(0) += count;
             }
-            let count = sign * i64::try_from(group.count).expect("window count fits i64");
-            *merged.entry(index.window_codes(dir, &group)).or_insert(0) += count;
         }
     }
     assert!(
@@ -2128,6 +2359,7 @@ fn answer(
     };
     let sweep = Sweep {
         index,
+        view: 0,
         dir,
         truncate,
         depth: spec.depth,
@@ -2448,8 +2680,7 @@ mod tests {
                         for anchor in &anchors {
                             for top in [1u32, 3, 10, 1000] {
                                 let spec = spec_of(depth, top, range);
-                                let refs: Vec<(&PathsSa, bool)> =
-                                    indexes.iter().map(|index| (index, false)).collect();
+                                let refs: Vec<&PathsSa> = indexes.iter().collect();
                                 let got = answer_segments(&refs, &names, &spec, *anchor);
                                 let want = brute(&streams, &names, &spec, *anchor);
                                 let what = format!(
@@ -2491,15 +2722,10 @@ mod tests {
         let wide = assemble(&shard_streams(&streams), 3, 0).expect("assemble wide");
         let narrow_index = assemble(&shard_streams(&narrow), 2, 0).expect("assemble narrow");
         let spec = spec_of(2, 10, TimeRange::default());
-        let both = answer_segments(
-            &[(&wide, false), (&narrow_index, false)],
-            &names,
-            &spec,
-            Some((2, true)),
-        );
+        let both = answer_segments(&[&wide, &narrow_index], &names, &spec, Some((2, true)));
         let alone = {
             let wide_again = assemble(&shard_streams(&streams), 3, 0).expect("assemble wide");
-            answer_segments(&[(&wide_again, false)], &names, &spec, Some((2, true)))
+            answer_segments(&[&wide_again], &names, &spec, Some((2, true)))
         };
         assert_eq!(
             both.rows.len(),
@@ -2592,6 +2818,7 @@ mod tests {
     /// signed sum must be EXACTLY the single-index answer at every depth up
     /// to the bound, for every anchor, range, and top.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn incremental_pairs_match_brute_force() {
         let names: Vec<String> = ["zeta", "alpha", "mid", "beta", "omega"]
             .iter()
@@ -2605,13 +2832,12 @@ mod tests {
                 .iter()
                 .map(|(codes, ts)| codes.iter().copied().zip(ts.iter().copied()).collect())
                 .collect();
-            let mut indexes: Vec<(PathsSa, bool)> = vec![(
-                assemble(&shard_streams(&base), alphabet, 0).expect("base"),
-                false,
-            )];
+            let mut indexes: Vec<PathsSa> =
+                vec![assemble(&shard_streams(&base), alphabet, 0).expect("base")];
             for round in 0..2 {
-                let mut addition = empty_pair_stream();
-                let mut retraction = empty_pair_stream();
+                let mut dual = empty_pair_stream(vec![false, true]);
+                let mut late_addition = empty_pair_stream(vec![false]);
+                let mut late_retraction = empty_pair_stream(vec![true]);
                 // A couple of brand-new actors join every round.
                 for _ in 0..2 {
                     current.push(Vec::new());
@@ -2629,25 +2855,68 @@ mod tests {
                     let merged_len = u32::try_from(merged.codes.len()).expect("fits");
                     let old_len = u32::try_from(old.codes.len()).expect("fits");
                     let local = actor as u64;
-                    if let Some(slice) = stitch::addition_stitch(merged_len, envelope, max_depth) {
-                        push_slice(&mut addition, local, &merged, slice, 0);
-                    }
-                    if let Some(slice) = stitch::retraction_stitch(old_len, envelope, max_depth) {
-                        push_slice(&mut retraction, local, &old, slice, 0);
+                    let pure_append = match (events.last(), delta.first()) {
+                        (Some(last), Some(first)) => last.1 < first.1,
+                        _ => true,
+                    };
+                    if pure_append {
+                        if let Some(addition) =
+                            stitch::addition_stitch(merged_len, envelope, max_depth)
+                        {
+                            let hollow = stitch::Span {
+                                lo: envelope.start,
+                                hi: envelope.start,
+                            };
+                            let retraction_own =
+                                match stitch::retraction_stitch(old_len, envelope, max_depth) {
+                                    Some(slice) => slice.own_fwd,
+                                    None => hollow,
+                                };
+                            let metas = [
+                                ActorViewMeta {
+                                    slice: addition,
+                                    prefix: 0,
+                                    end: None,
+                                },
+                                ActorViewMeta {
+                                    slice: stitch::ActorStitch {
+                                        text: addition.text,
+                                        own_fwd: retraction_own,
+                                        own_bwd: hollow,
+                                    },
+                                    prefix: 0,
+                                    end: Some(envelope.start),
+                                },
+                            ];
+                            push_slice(&mut dual, local, &merged, &metas);
+                        }
+                    } else {
+                        if let Some(slice) =
+                            stitch::addition_stitch(merged_len, envelope, max_depth)
+                        {
+                            let meta = ActorViewMeta {
+                                slice,
+                                prefix: 0,
+                                end: None,
+                            };
+                            push_slice(&mut late_addition, local, &merged, &[meta]);
+                        }
+                        if let Some(slice) = stitch::retraction_stitch(old_len, envelope, max_depth)
+                        {
+                            let meta = ActorViewMeta {
+                                slice,
+                                prefix: 0,
+                                end: None,
+                            };
+                            push_slice(&mut late_retraction, local, &old, &[meta]);
+                        }
                     }
                     *events = merged_events;
                 }
-                if !addition.actors.is_empty() {
-                    indexes.push((
-                        assemble(&[addition], alphabet, max_depth).expect("addition"),
-                        false,
-                    ));
-                }
-                if !retraction.actors.is_empty() {
-                    indexes.push((
-                        assemble(&[retraction], alphabet, max_depth).expect("retraction"),
-                        true,
-                    ));
+                for stream in [dual, late_addition, late_retraction] {
+                    if !stream.actors.is_empty() {
+                        indexes.push(assemble(&[stream], alphabet, max_depth).expect("stitch"));
+                    }
                 }
                 let finals: Vec<(Vec<u32>, Vec<i64>)> = current
                     .iter()
@@ -2656,10 +2925,7 @@ mod tests {
                         (collapsed.codes, collapsed.ts)
                     })
                     .collect();
-                let refs: Vec<(&PathsSa, bool)> = indexes
-                    .iter()
-                    .map(|(index, negative)| (index, *negative))
-                    .collect();
+                let refs: Vec<&PathsSa> = indexes.iter().collect();
                 let ranges = [
                     TimeRange::default(),
                     TimeRange {

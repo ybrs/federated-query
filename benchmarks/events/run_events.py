@@ -438,7 +438,7 @@ def battery_100m(parquet):
         lambda con: paths_oracle(con, parquet, 6, 10, maxgap_minutes=30,
                                  columns=COLUMNS_100M))
     deep_pair("paths_d10_unanchored", "PATHS ON web DEPTH 10 TOP 10", 10, 10)
-    deep_pair("paths_d20_unanchored", "PATHS ON web DEPTH 20 TOP 10", 20, 10)
+    deep_pair("paths_d20_unanchored", "PATHS ON web DEPTH 20 TOP 10 USING SCAN", 20, 10)
     # Depth 50 exceeds the dataset's max_paths_depth (32): the statement must
     # opt into the exact scan, which is the semantics the oracle checks.
     deep_pair("paths_d50_unanchored", "PATHS ON web DEPTH 50 TOP 10 USING SCAN", 50, 10)
@@ -446,7 +446,8 @@ def battery_100m(parquet):
               "PATHS ON web STARTING AT 'game_opened' DEPTH 50 TOP 10 USING SCAN",
               50, 10)
     deep_pair("paths_d20_backward",
-              "PATHS ON web ENDING AT 'uninstalled' DEPTH 20 TOP 10", 20, 10)
+              "PATHS ON web ENDING AT 'uninstalled' DEPTH 20 TOP 10 USING SCAN",
+              20, 10)
     return entries
 
 
@@ -901,6 +902,29 @@ REFRESH_QUERIES = [
 ]
 
 
+def arrival_ordered(source):
+    """The arrival-ordered copy of `source`: rows sorted by (ts, seq) with seq
+    reassigned to that order, so a seq-cut is a TIME-cut and a staged refresh
+    is the daily append (a delta arriving after everything stored). Derived
+    once and cached beside the data; the raw medium parquet's seq is
+    uncorrelated with ts, which would make every staged delta a late-arrival
+    storm instead of the workload the scenario measures."""
+    import duckdb
+    ordered = os.path.join(DATA_DIR, "events_medium_arrival.parquet")
+    if os.path.exists(ordered):
+        return ordered
+    print("deriving arrival-ordered copy (once):", ordered)
+    con = duckdb.connect()
+    con.execute(
+        "COPY (SELECT * REPLACE(CAST(row_number() OVER (ORDER BY ts, seq) - 1 "
+        "AS BIGINT) AS seq) FROM read_parquet(?) ORDER BY ts, seq) "
+        "TO '%s' (FORMAT PARQUET)" % ordered,
+        [source],
+    )
+    con.close()
+    return ordered
+
+
 def stage_slice(source, staged, cut):
     """Write the rows with seq < cut of `source` to `staged`, arrival order."""
     import duckdb
@@ -963,7 +987,8 @@ def mode_refresh_scenario(size):
     import fedq
     import pyarrow.parquet as pq
 
-    _, source, _, _ = dataset_config(size)
+    _, raw, _, _ = dataset_config(size)
+    source = arrival_ordered(raw)
     total = pq.ParquetFile(source).metadata.num_rows
     cuts = [int(total * 0.6), int(total * 0.8), total - 1000, total]
     stage_names = ["create_60m", "refresh_plus_20m", "refresh_to_n_minus_1k",

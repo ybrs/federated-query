@@ -212,8 +212,12 @@ pub enum PathAnchor {
 /// refresh's stitch segments carry ownership and context only for windows of
 /// at most this many events, which is what keeps a refresh's index cost
 /// proportional to the delta instead of to the touched actors' histories.
-/// The index declines deeper sweeps and the exact scan serves them.
-pub const DEFAULT_MAX_PATHS_DEPTH: u32 = 32;
+/// The index declines deeper sweeps and the exact scan serves them. The
+/// default is sized against the refresh cost it buys: every touched actor
+/// pays a tail context proportional to the bound on every refresh, and
+/// measured path analyses live at depths 3-8; a dataset that needs more
+/// declares it at CREATE.
+pub const DEFAULT_MAX_PATHS_DEPTH: u32 = 16;
 
 /// `PATHS ON <dataset>` in typed form.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

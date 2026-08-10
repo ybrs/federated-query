@@ -600,8 +600,9 @@ fn a_refresh_over_a_returning_actor_appends_a_pair() {
 
     assert_eq!(
         index_files(&dir, "paths_f_"),
-        3,
-        "a returning actor appends an addition and a retraction"
+        2,
+        "a returning actor appends ONE dual segment: the addition and \
+         retraction views share its text"
     );
     assert_eq!(index_files(&dir, "paths_m_"), 1, "exactly one manifest");
     let after = std::fs::read(&base_segment).expect("read segment again");
