@@ -2085,10 +2085,18 @@ fn build_paths_spec(args: &[Expression]) -> Result<PathsSpec, ParseError> {
     let mut depth: u32 = 5;
     let mut top: u32 = 20;
     let mut filter: Option<EventPredicate> = None;
+    let mut force_scan = false;
     for (index, arg) in args.iter().enumerate() {
         match arg {
             Expression::NamedArgument(named) => {
-                apply_paths_named_arg(named, &mut anchor, &mut depth, &mut top, &mut filter)?;
+                apply_paths_named_arg(
+                    named,
+                    &mut anchor,
+                    &mut depth,
+                    &mut top,
+                    &mut filter,
+                    &mut force_scan,
+                )?;
             }
             positional => {
                 if index != 0 {
@@ -2117,6 +2125,7 @@ fn build_paths_spec(args: &[Expression]) -> Result<PathsSpec, ParseError> {
             to: None,
         },
         filter,
+        force_scan,
     })
 }
 
@@ -2127,6 +2136,7 @@ fn apply_paths_named_arg(
     depth: &mut u32,
     top: &mut u32,
     filter: &mut Option<EventPredicate>,
+    force_scan: &mut bool,
 ) -> Result<(), ParseError> {
     let name = named.name.name.to_ascii_lowercase();
     match name.as_str() {
@@ -2150,6 +2160,10 @@ fn apply_paths_named_arg(
             *filter = Some(filter_arg(&named.value, "paths() filter")?);
             Ok(())
         }
+        "scan" => {
+            *force_scan = bool_arg(&named.value, "paths() scan")?;
+            Ok(())
+        }
         "maxgap" | "from" | "to" => Err(ParseError::Unsupported(format!(
             "paths() option '{name}' is not a table-function argument; the PATHS statement carries maxgap and a time range"
         ))),
@@ -2167,6 +2181,14 @@ fn set_anchor(slot: &mut Option<PathAnchor>, value: PathAnchor) -> Result<(), Pa
     }
     *slot = Some(value);
     Ok(())
+}
+
+/// Read a boolean function argument, or raise naming the argument.
+fn bool_arg(expr: &Expression, what: &str) -> Result<bool, ParseError> {
+    if let Expression::Boolean(boolean) = expr {
+        return Ok(boolean.value);
+    }
+    Err(ParseError::Parse(format!("{what} must be true or false")))
 }
 
 /// Read a string-literal function argument, or raise naming the argument.

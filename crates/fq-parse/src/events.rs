@@ -52,7 +52,7 @@ pub(crate) fn classify_create_event<'a>(
         None
     };
     let properties = parse_properties(tokens)?;
-    let (shards, refresh_key, time_unit) = parse_create_with(tokens)?;
+    let (shards, refresh_key, time_unit, max_paths_depth) = parse_create_with(tokens)?;
     expect_end(tokens, "CREATE EVENT DATASET")?;
     Ok(Statement::CreateEventDataset(EventDatasetDef {
         name,
@@ -64,6 +64,7 @@ pub(crate) fn classify_create_event<'a>(
         properties,
         shards,
         refresh_key,
+        max_paths_depth,
         time_unit,
     }))
 }
@@ -124,7 +125,7 @@ fn parse_properties(tokens: &mut Tokenizer<'_>) -> Result<Option<Vec<String>>, P
 }
 
 /// The `WITH` keys a CREATE EVENT DATASET accepts.
-const CREATE_WITH_KEYS: [&str; 3] = ["shards", "refresh_key", "time_unit"];
+const CREATE_WITH_KEYS: [&str; 4] = ["shards", "refresh_key", "time_unit", "max_paths_depth"];
 
 /// Parse the optional `WITH ( key = 'value', ... )` clause of a CREATE EVENT
 /// DATASET against the allowlist; an unknown key raises listing the known
@@ -132,19 +133,21 @@ const CREATE_WITH_KEYS: [&str; 3] = ["shards", "refresh_key", "time_unit"];
 #[allow(clippy::type_complexity)]
 fn parse_create_with(
     tokens: &mut Tokenizer<'_>,
-) -> Result<(Option<u32>, Option<String>, TimeUnit), ParseError> {
+) -> Result<(Option<u32>, Option<String>, TimeUnit, Option<u32>), ParseError> {
     if !consume_keyword(tokens, "WITH") {
-        return Ok((None, None, TimeUnit::Micros));
+        return Ok((None, None, TimeUnit::Micros, None));
     }
     let params = parse_with_params(tokens)?;
     let mut shards = None;
     let mut refresh_key = None;
     let mut time_unit = TimeUnit::Micros;
+    let mut max_paths_depth = None;
     for (key, value) in params {
         match key.as_str() {
             "shards" => shards = Some(parse_shards(&value)?),
             "refresh_key" => refresh_key = Some(value),
             "time_unit" => time_unit = parse_time_unit(&value)?,
+            "max_paths_depth" => max_paths_depth = Some(parse_max_paths_depth(&value)?),
             other => {
                 return Err(ParseError::Unsupported(format!(
                     "CREATE EVENT DATASET WITH key '{other}' is not supported; known keys \
@@ -154,7 +157,23 @@ fn parse_create_with(
             }
         }
     }
-    Ok((shards, refresh_key, time_unit))
+    Ok((shards, refresh_key, time_unit, max_paths_depth))
+}
+
+/// Parse the `max_paths_depth` WITH value: the window-length bound the paths
+/// index maintains, an integer in 2..=254.
+fn parse_max_paths_depth(value: &str) -> Result<u32, ParseError> {
+    let depth: u32 = value.parse().map_err(|_| {
+        ParseError::Parse(format!(
+            "WITH max_paths_depth value '{value}' is not an integer"
+        ))
+    })?;
+    if !(2..=254).contains(&depth) {
+        return Err(ParseError::Parse(format!(
+            "WITH max_paths_depth value {depth} must be in 2..=254"
+        )));
+    }
+    Ok(depth)
 }
 
 /// Parse the `shards` WITH value: a power of two in 1..=65536.
@@ -474,7 +493,8 @@ fn parse_bucket_grain(tokens: &mut Tokenizer<'_>) -> Result<BucketGrain, ParseEr
 }
 
 /// Parse `PATHS ON <dataset> [STARTING AT <event> | ENDING AT <event>]
-/// [DEPTH <n>] [TOP <n>] [MAXGAP <interval>] [FROM ...] [TO ...] [WHERE ...]`.
+/// [DEPTH <n>] [TOP <n>] [MAXGAP <interval>] [FROM ...] [TO ...] [WHERE ...]
+/// [USING SCAN]`.
 pub(crate) fn classify_paths<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
     tokens.expect_keyword("PATHS")?;
     tokens.expect_keyword("ON")?;
@@ -489,6 +509,12 @@ pub(crate) fn classify_paths<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement
     };
     let range = parse_time_range(tokens)?;
     let filter = parse_where(tokens)?;
+    let force_scan = if consume_keyword(tokens, "USING") {
+        tokens.expect_keyword("SCAN")?;
+        true
+    } else {
+        false
+    };
     expect_end(tokens, "PATHS")?;
     Ok(Statement::EventPaths(PathsSpec {
         dataset,
@@ -498,6 +524,7 @@ pub(crate) fn classify_paths<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement
         maxgap_micros,
         range,
         filter,
+        force_scan,
     }))
 }
 
@@ -1093,6 +1120,49 @@ mod tests {
                 literal: PredicateLiteral::Int(-3),
                 ..
             }
+        ));
+    }
+
+    /// `WITH (max_paths_depth = N)` parses into the definition; values
+    /// outside 2..=254 raise naming the range; USING SCAN sets the spec's
+    /// force_scan and parses only in trailing position.
+    #[test]
+    fn max_paths_depth_and_using_scan_parse() {
+        let statement = classify(
+            "CREATE EVENT DATASET web FROM ev.main.events \
+             ACTOR entity_id TIME ts EVENT event_name \
+             WITH (refresh_key = 'seq', max_paths_depth = 40)",
+        );
+        let Statement::CreateEventDataset(def) = statement else {
+            panic!("expected CreateEventDataset");
+        };
+        assert_eq!(def.max_paths_depth, Some(40));
+
+        let error = classify_statement(
+            "CREATE EVENT DATASET web FROM ev.main.events \
+             ACTOR entity_id TIME ts EVENT event_name \
+             WITH (max_paths_depth = 1)",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("2..=254"), "{error}");
+
+        let statement = classify("PATHS ON web DEPTH 40 TOP 5 USING SCAN");
+        let Statement::EventPaths(spec) = statement else {
+            panic!("expected EventPaths");
+        };
+        assert!(spec.force_scan);
+        assert_eq!(spec.depth, 40);
+
+        let statement = classify("PATHS ON web DEPTH 3");
+        let Statement::EventPaths(spec) = statement else {
+            panic!("expected EventPaths");
+        };
+        assert!(!spec.force_scan);
+
+        let error = classify_statement("PATHS ON web USING SCAN DEPTH 3").unwrap_err();
+        assert!(matches!(
+            error,
+            ParseError::Unsupported(_) | ParseError::Parse(_)
         ));
     }
 

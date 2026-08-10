@@ -290,6 +290,10 @@ impl EventStore {
             },
             dict_state: outcome.dict_state.clone(),
             refresh_key: def.refresh_key.clone(),
+            max_paths_depth: i64::from(
+                def.max_paths_depth
+                    .unwrap_or(fq_common::events::DEFAULT_MAX_PATHS_DEPTH),
+            ),
             // The source tracker saw every pulled row; its maximum is the
             // initial watermark a later delta refresh filters past.
             watermark: source.watermark(),
@@ -357,13 +361,15 @@ impl EventStore {
         delta_files: &[(u32, String)],
     ) -> Result<String, EventError> {
         let dataset = self.dataset(name)?;
+        let max_paths_depth =
+            u32::try_from(dataset.record.max_paths_depth).expect("stored bound fits u32");
         let report = paths_sa::append_pair(
             &self.io,
             &dataset,
             cfg,
             touched,
             delta_files,
-            fq_common::events::DEFAULT_MAX_PATHS_DEPTH,
+            max_paths_depth,
         )?;
         if let Some(report) = report {
             return Ok(report);
@@ -652,6 +658,9 @@ impl EventStore {
                     .iter()
                     .map(|def| def.name.clone())
                     .collect(),
+            ),
+            max_paths_depth: Some(
+                u32::try_from(record.max_paths_depth).expect("stored bound fits u32"),
             ),
             shards: Some(record.shards),
             refresh_key: record.refresh_key.clone(),

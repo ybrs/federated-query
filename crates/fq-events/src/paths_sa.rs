@@ -1400,9 +1400,10 @@ pub(crate) fn run_from_index(
     anchor: Option<(u64, bool)>,
     cfg: &fq_common::events::EventsConfig,
 ) -> Result<Option<PathsResult>, EventError> {
-    if spec.depth > fq_common::events::DEFAULT_MAX_PATHS_DEPTH {
+    if i64::from(spec.depth) > dataset.record.max_paths_depth {
         // Stitch segments only carry ownership and context for windows up to
-        // the bound, so the index cannot answer deeper sweeps; the scan does.
+        // the dataset's bound, so the index cannot answer deeper sweeps; the
+        // scan does (run_paths raises first unless the spec forces the scan).
         return Ok(None);
     }
     let Some(held) = load_segments(io, dataset, cfg)? else {
@@ -2112,6 +2113,7 @@ mod tests {
             maxgap_micros: None,
             range,
             filter: None,
+            force_scan: false,
         }
     }
 

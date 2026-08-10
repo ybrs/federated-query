@@ -53,6 +53,7 @@ impl Registry {
                 file_list        TEXT NOT NULL,
                 dict_state       TEXT NOT NULL,
                 refresh_key      TEXT,
+                max_paths_depth  INTEGER NOT NULL DEFAULT 32,
                 watermark        TEXT,
                 source_token     TEXT,
                 measured_events  INTEGER NOT NULL,
@@ -67,6 +68,18 @@ impl Registry {
             );",
         )
         .map_err(|error| db_err(&error))?;
+        // A store created before max_paths_depth existed lacks the column;
+        // add it with the engine default so its records keep loading. The
+        // duplicate-column error from a current store is expected and
+        // everything else raises.
+        if let Err(error) = conn.execute(
+            "ALTER TABLE event_datasets ADD COLUMN max_paths_depth INTEGER NOT NULL DEFAULT 32",
+            [],
+        ) {
+            if !error.to_string().contains("duplicate column name") {
+                return Err(db_err(&error));
+            }
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -93,11 +106,11 @@ impl Registry {
             "INSERT OR REPLACE INTO event_datasets (
                 name, location, source_kind, source_ref, actor_column, time_column,
                 time_unit, event_column, tiebreak_column, property_schema, shards,
-                file_list, dict_state, refresh_key, watermark, source_token,
-                measured_events, measured_actors, byte_size, build_millis,
+                file_list, dict_state, refresh_key, max_paths_depth, watermark,
+                source_token, measured_events, measured_actors, byte_size, build_millis,
                 min_ts, max_ts, created_at, refreshed_at, deleted_at
              ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,
-                       ?19,?20,?21,?22,?23,?24,NULL)",
+                       ?19,?20,?21,?22,?23,?24,?25,NULL)",
             params![
                 record.name,
                 record.location,
@@ -113,6 +126,7 @@ impl Registry {
                 serde_json::to_string(&record.file_list).map_err(|error| json_err(&error))?,
                 serde_json::to_string(&record.dict_state).map_err(|error| json_err(&error))?,
                 record.refresh_key,
+                record.max_paths_depth,
                 record.watermark,
                 record.source_token,
                 record.measured_events,
@@ -251,9 +265,9 @@ impl Registry {
 /// order.
 const SELECT_COLUMNS: &str = "SELECT name, location, source_kind, source_ref, actor_column, \
      time_column, time_unit, event_column, tiebreak_column, property_schema, shards, \
-     file_list, dict_state, refresh_key, watermark, source_token, measured_events, \
-     measured_actors, byte_size, build_millis, min_ts, max_ts, created_at, refreshed_at \
-     FROM event_datasets";
+     file_list, dict_state, refresh_key, max_paths_depth, watermark, source_token, \
+     measured_events, measured_actors, byte_size, build_millis, min_ts, max_ts, \
+     created_at, refreshed_at FROM event_datasets";
 
 /// Deserialize one registry row.
 fn row_to_record(
@@ -284,16 +298,17 @@ fn row_to_record(
             file_list,
             dict_state,
             refresh_key: row.get(13).map_err(|error| db_err(&error))?,
-            watermark: row.get(14).map_err(|error| db_err(&error))?,
-            source_token: row.get(15).map_err(|error| db_err(&error))?,
-            measured_events: row.get(16).map_err(|error| db_err(&error))?,
-            measured_actors: row.get(17).map_err(|error| db_err(&error))?,
-            byte_size: row.get(18).map_err(|error| db_err(&error))?,
-            build_millis: row.get(19).map_err(|error| db_err(&error))?,
-            min_ts: row.get(20).map_err(|error| db_err(&error))?,
-            max_ts: row.get(21).map_err(|error| db_err(&error))?,
-            created_at: row.get(22).map_err(|error| db_err(&error))?,
-            refreshed_at: row.get(23).map_err(|error| db_err(&error))?,
+            max_paths_depth: row.get(14).map_err(|error| db_err(&error))?,
+            watermark: row.get(15).map_err(|error| db_err(&error))?,
+            source_token: row.get(16).map_err(|error| db_err(&error))?,
+            measured_events: row.get(17).map_err(|error| db_err(&error))?,
+            measured_actors: row.get(18).map_err(|error| db_err(&error))?,
+            byte_size: row.get(19).map_err(|error| db_err(&error))?,
+            build_millis: row.get(20).map_err(|error| db_err(&error))?,
+            min_ts: row.get(21).map_err(|error| db_err(&error))?,
+            max_ts: row.get(22).map_err(|error| db_err(&error))?,
+            created_at: row.get(23).map_err(|error| db_err(&error))?,
+            refreshed_at: row.get(24).map_err(|error| db_err(&error))?,
         })
     };
     Ok(parse())
@@ -355,6 +370,7 @@ mod tests {
             },
             dict_state: BTreeMap::from([("__event__".to_string(), 20u64)]),
             refresh_key: Some("seq".to_string()),
+            max_paths_depth: 32,
             watermark: None,
             source_token: None,
             measured_events: 10,

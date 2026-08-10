@@ -393,6 +393,7 @@ impl Runtime {
         let mut bytes = Vec::new();
         let mut shards = Vec::new();
         let mut generations = Vec::new();
+        let mut max_paths_depths = Vec::new();
         let mut tiebreaks = Vec::new();
         let mut promoted = Vec::new();
         let mut watermarks: Vec<Option<String>> = Vec::new();
@@ -407,6 +408,8 @@ impl Runtime {
             generations.push(
                 i32::try_from(record.file_list.generations.len()).expect("generations fit i32"),
             );
+            max_paths_depths
+                .push(i32::try_from(record.max_paths_depth).expect("depth bound fits i32"));
             tiebreaks.push(
                 record
                     .tiebreak_column
@@ -433,6 +436,7 @@ impl Runtime {
             Arc::new(Int64Array::from(bytes)),
             Arc::new(Int32Array::from(shards)),
             Arc::new(Int32Array::from(generations)),
+            Arc::new(Int32Array::from(max_paths_depths)),
             Arc::new(StringArray::from(tiebreaks)),
             Arc::new(StringArray::from(promoted)),
             Arc::new(StringArray::from(watermarks)),
@@ -697,6 +701,7 @@ fn show_event_datasets_schema() -> SchemaRef {
         Field::new("bytes", ArrowDataType::Int64, false),
         Field::new("shards", ArrowDataType::Int32, false),
         Field::new("generations", ArrowDataType::Int32, false),
+        Field::new("max_paths_depth", ArrowDataType::Int32, false),
         Field::new("tiebreak", ArrowDataType::Utf8, false),
         Field::new("promoted_props", ArrowDataType::Utf8, false),
         Field::new("watermark", ArrowDataType::Utf8, true),
@@ -714,6 +719,7 @@ pub(crate) fn show_event_datasets_columns() -> Vec<(String, DataType)> {
         ("bytes".to_owned(), DataType::BigInt),
         ("shards".to_owned(), DataType::Integer),
         ("generations".to_owned(), DataType::Integer),
+        ("max_paths_depth".to_owned(), DataType::Integer),
         ("tiebreak".to_owned(), DataType::Text),
         ("promoted_props".to_owned(), DataType::Text),
         ("watermark".to_owned(), DataType::Text),

@@ -302,6 +302,11 @@ pub struct DatasetRecord {
     /// Per dictionary column, the pinned total code count.
     pub dict_state: std::collections::BTreeMap<String, u64>,
     pub refresh_key: Option<String>,
+    /// The window-length bound the paths index maintains incrementally
+    /// (`WITH (max_paths_depth = ...)`, default DEFAULT_MAX_PATHS_DEPTH).
+    /// PATHS with DEPTH above it raises unless the statement opts into the
+    /// exact scan.
+    pub max_paths_depth: i64,
     /// The stored watermark JSON (opaque to the store; the runtime renders it
     /// into the delta predicate).
     pub watermark: Option<String>,

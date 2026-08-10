@@ -53,6 +53,9 @@ pub struct EventDatasetDef {
     pub refresh_key: Option<String>,
     /// `WITH (time_unit = ...)`; defaults to microseconds.
     pub time_unit: TimeUnit,
+    /// `WITH (max_paths_depth = ...)`: the window-length bound the paths
+    /// index maintains incrementally; None takes DEFAULT_MAX_PATHS_DEPTH.
+    pub max_paths_depth: Option<u32>,
 }
 
 /// A half-open `[from, to)` event-time interval in UTC microseconds. Absent
@@ -217,7 +220,9 @@ pub const DEFAULT_MAX_PATHS_DEPTH: u32 = 32;
 pub struct PathsSpec {
     pub dataset: String,
     pub anchor: PathAnchor,
-    /// Window length in events; at least 2, unbounded above.
+    /// Window length in events; at least 2. The index serves depths up to the
+    /// dataset's max_paths_depth; above that the engine raises unless
+    /// `force_scan` opts into the exact scan.
     pub depth: u32,
     /// How many top paths to return; the engine bounds it to 1..=1000.
     pub top: u32,
@@ -232,6 +237,10 @@ pub struct PathsSpec {
     /// ANCHOR semantics, like `range`: the predicate is tested on the
     /// window's anchor event only, never dropping events from the stream.
     pub filter: Option<EventPredicate>,
+    /// `USING SCAN` (statement) / `scan => true` (table function): serve this
+    /// query from the exact stream scan, bypassing the index. The only way to
+    /// run DEPTH above the dataset's max_paths_depth.
+    pub force_scan: bool,
 }
 
 /// The fixed output relation of a `PATHS` analysis, whether reported by the

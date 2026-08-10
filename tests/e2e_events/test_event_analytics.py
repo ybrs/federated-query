@@ -246,9 +246,12 @@ def test_invalid_statements_raise(engine):
         run(runtime, "FUNNEL ('signup', 'view') ON web WINDOW 1 DAY MODE ANY_ORDER")
     with pytest.raises(Exception, match="DEPTH"):
         run(runtime, "PATHS ON web DEPTH 1")
-    # DEPTH has no upper bound; a depth past every stream length is a valid
-    # statement with an empty answer, never an error.
-    deep = run(runtime, "PATHS ON web DEPTH 99").to_pydict()
+    # DEPTH above the dataset's max_paths_depth raises naming the bound and
+    # the escape hatch; with USING SCAN the same statement is valid and a
+    # depth past every stream length is an empty answer, never an error.
+    with pytest.raises(Exception, match="max_paths_depth"):
+        run(runtime, "PATHS ON web DEPTH 99")
+    deep = run(runtime, "PATHS ON web DEPTH 99 USING SCAN").to_pydict()
     assert deep["path_id"] == []
 
 

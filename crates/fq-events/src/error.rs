@@ -109,6 +109,17 @@ pub enum EventBindingError {
     StepCount { got: usize },
     #[error("PATHS DEPTH must be at least 2, got {got}")]
     PathDepth { got: u32 },
+    #[error(
+        "PATHS DEPTH {got} exceeds dataset '{dataset}' max_paths_depth {bound}; \
+         add USING SCAN (table function: scan => true) to run it from the exact \
+         stream scan, or REBUILD after DROP+CREATE with a larger \
+         WITH (max_paths_depth = ...)"
+    )]
+    PathDepthBeyondBound {
+        dataset: String,
+        got: u32,
+        bound: u32,
+    },
     #[error("PATHS TOP must be in 1..=1000, got {got}")]
     PathTop { got: u32 },
     #[error("FUNNEL WINDOW must be positive, got {got} microseconds")]

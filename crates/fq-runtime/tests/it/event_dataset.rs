@@ -613,3 +613,78 @@ fn a_refresh_over_a_returning_actor_appends_a_pair() {
         assert_eq!(counts.value(row), 1, "a window must not be double counted");
     }
 }
+
+/// The window-length contract: DEPTH above the dataset's max_paths_depth
+/// raises a typed error naming the bound and the escape hatch, USING SCAN
+/// serves the same statement exactly from the stream scan, and SHOW EVENT
+/// DATASETS reports the bound the CREATE declared.
+#[test]
+fn paths_depth_above_the_bound_raises_and_using_scan_serves_it() {
+    let dir = sandbox("depthbound");
+    let file = dir.join("clicks.parquet");
+    write_events(
+        &file,
+        vec![1_000_000, 2_000_000, 3_000_000, 4_000_000, 5_000_000],
+        vec!["a", "b", "c", "d", "e"],
+        vec!["u1", "u1", "u1", "u1", "u1"],
+    );
+    let runtime = Runtime::from_config(&event_config(&dir, "evta", &file)).expect("from_config");
+    runtime
+        .execute(
+            "CREATE EVENT DATASET boundds FROM evta.main.evta \
+             ACTOR user_id TIME created_at EVENT event \
+             WITH (refresh_key = 'created_at', max_paths_depth = 4)",
+        )
+        .expect("create event dataset");
+
+    let error = runtime
+        .execute("PATHS ON boundds DEPTH 5 TOP 5")
+        .expect_err("depth 5 must exceed the bound of 4");
+    let message = error.to_string();
+    assert!(
+        message.contains("max_paths_depth 4") && message.contains("USING SCAN"),
+        "error must name the bound and the escape hatch: {message}"
+    );
+
+    // The same statement with USING SCAN answers exactly: one depth-5 window.
+    let (_, batches) = runtime
+        .execute("PATHS ON boundds DEPTH 5 TOP 5 USING SCAN")
+        .expect("paths using scan");
+    let events = batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("event names are Utf8");
+    let steps: Vec<&str> = (0..events.len()).map(|row| events.value(row)).collect();
+    assert_eq!(steps, vec!["a", "b", "c", "d", "e"]);
+
+    // Depth AT the bound serves from the index, no opt-in needed.
+    let (_, batches) = runtime
+        .execute("PATHS ON boundds DEPTH 4 TOP 5")
+        .expect("paths at the bound");
+    assert!(batches[0].num_rows() > 0, "in-bound depth answers");
+
+    // SHOW reports the declared bound.
+    let (schema, batches) = runtime
+        .execute("SHOW EVENT DATASETS")
+        .expect("show event datasets");
+    let column = schema
+        .fields()
+        .iter()
+        .position(|field| field.name() == "max_paths_depth")
+        .expect("SHOW carries max_paths_depth");
+    let bounds = batches[0]
+        .column(column)
+        .as_any()
+        .downcast_ref::<arrow::array::Int32Array>()
+        .expect("max_paths_depth is Int32");
+    let names = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("names are Utf8");
+    let row = (0..names.len())
+        .find(|row| names.value(*row) == "boundds")
+        .expect("boundds listed");
+    assert_eq!(bounds.value(row), 4);
+}

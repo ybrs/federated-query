@@ -934,8 +934,7 @@ is smaller than it sounds, because a query past the cap falls back to the scan
 and the scan is 0.5 s anchored on 100M events, but the trade has not been
 taken.
 
-Three shapes remain for the CURRENT cost, none of them chosen and none of them
-this:
+Three shapes were considered before the chosen design in 6.2c:
 
 1. Move the rebuild off the refresh path (async or on demand). Refresh stops
    paying the fixed index cost; PATHS runs at fallback speed until the rebuild
@@ -948,6 +947,65 @@ this:
    answer that silently omits the last hour of events is the wrong-answer class
    this engine does not ship.
 3. The bounded-tail variant above, with its stated cost.
+
+### 6.2c The chosen design: signed segment pairs under a window-length bound
+
+The invariant that dooms every unbounded scheme: with window length unbounded,
+one appended event changes windows reaching arbitrarily far back into its
+actor's history, so any exact index update is Omega(touched history) - and 6.2b
+measured touched history at ~77% of the dataset and growing. Exactness,
+unbounded depth, O(delta) updates: pick two. The engine picks exactness and
+O(delta), and makes the window-length bound a declared contract:
+`DEFAULT_MAX_PATHS_DEPTH` (32, symmetric with the funnel step bound 2..=32).
+The index serves any DEPTH up to the bound exactly; deeper queries are served
+by the exact scan (0.5s anchored / 2.6s unanchored at 100M, byte-identical
+rows), behind an explicit statement-level opt-in.
+
+With the bound in place, a delta can only change windows overlapping the
+ENVELOPE of each touched actor - the region left after stripping the longest
+common prefix and suffix (by `(code, ts)`) between the old and merged collapsed
+streams - reaching at most `max_depth - 1` positions outward. The index is a
+set of immutable SIGNED segments plus a manifest of `(id, sign)`; a refresh
+appends one PAIR:
+
+- The ADDITION indexes, per touched actor, the envelope with `max_depth`
+  context per side, and OWNS per direction the window forms the envelope
+  changed or created: forward ownership (unanchored and STARTING AT, keyed by
+  window start) reaches `max_depth - 1` before the envelope; backward
+  ownership (ENDING AT, keyed by window end) reaches `max_depth - 1` after it.
+  A pure append owns nothing backward at old positions - a window ending at an
+  old position is unchanged by an append.
+- The RETRACTION indexes the same region of the OLD stream with its
+  PRE-refresh availability and timestamps, and the query-time merge SUBTRACTS
+  it, cancelling exactly what older segments still count for the re-owned
+  forms (the truncated STARTING AT windows at the old stream end, and every
+  perturbed form around a late arrival's insertion point).
+
+Ownership is a per-direction bitmap in suffix-array order inside the segment
+file (format v5); base segments carry none and own everything. Availability
+counts TRUE stream events - the stored slice plus the events beyond its edges -
+so truncation semantics survive slicing; separators are never shifted or
+owned; a construction-time guard refuses any owned window whose text would
+leave its slice. `answer_segments` sums counts and totals by window CONTENT
+across segments, signed, and asserts every net count and the net total
+non-negative: a broken index crashes rather than answers.
+
+Costs, by construction: a refresh's index work is O(delta + touched_actors x
+max_depth) in positions sorted, independent of history length; peak build RSS
+follows the pair, not the dataset; existing segment files are never rewritten,
+so an object-store push moves only the pair. Late arrivals widen one actor's
+envelope around the insertion; pathological lateness degrades toward that
+actor's history, never toward the dataset. Segments accumulate until
+compaction (a separate, online `COMPACT` statement; retraction/addition pairs
+annihilate structurally in the fold) - the k-segment query-time cost is the
+number that will size its trigger.
+
+Correctness is pinned by `incremental_pairs_match_brute_force`: base plus two
+refresh rounds of signed pairs against brute force over the final streams,
+~15k combinations of depth (2..=bound), range, anchor and top, covering late
+arrivals, boundary collapses, brand-new actors, and deltas that collapse away
+entirely - and the pin is verified able to fail (removing the retraction half
+breaks it).
 
 ### 6.3 Full rebuild - `REBUILD EVENT DATASET`
 

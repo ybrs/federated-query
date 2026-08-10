@@ -158,6 +158,7 @@ fn dataset_def(name: &str) -> EventDatasetDef {
         shards: Some(4),
         refresh_key: None,
         time_unit: TimeUnit::Micros,
+        max_paths_depth: None,
     }
 }
 
@@ -487,6 +488,7 @@ fn random_inputs_match_brute_force_across_all_analyses() {
             maxgap_micros: None,
             range: TimeRange::default(),
             filter: None,
+            force_scan: false,
         };
         let result = fq_events::run_paths(store.io(), &dataset, &spec, &cfg).unwrap();
         let expected = paths_bf(&rows, 3);
@@ -931,6 +933,7 @@ fn paths_index_matches_the_scan_for_every_anchor_and_depth() {
                 maxgap_micros: maxgap,
                 range: TimeRange::default(),
                 filter: None,
+                force_scan: false,
             };
             let indexed = fq_events::run_paths(store.io(), &dataset, &spec(None), &cfg).unwrap();
             let scanned =
@@ -954,6 +957,7 @@ fn paths_index_matches_the_scan_for_every_anchor_and_depth() {
         maxgap_micros: None,
         range: TimeRange::default(),
         filter: None,
+        force_scan: false,
     };
     let fallback = fq_events::run_paths(store.io(), &dataset, &spec, &cfg).unwrap();
     let mut gap_spec = spec;
@@ -1010,6 +1014,7 @@ fn ranged_paths_serve_anchor_semantics_from_ts_lists_and_match_the_scan() {
                         to: *to,
                     },
                     filter: None,
+                    force_scan: false,
                 };
                 let indexed =
                     fq_events::run_paths(store.io(), &dataset, &spec(None), &cfg).unwrap();
@@ -1067,6 +1072,7 @@ fn a_ranged_path_follows_its_anchor_past_the_range_end() {
             to: Some(1_500_000),
         },
         filter: None,
+        force_scan: false,
     };
     let result = fq_events::run_paths(store.io(), &dataset, &spec, &cfg).unwrap();
     assert_eq!(result.rows.len(), 1);
@@ -1119,6 +1125,7 @@ fn indexable_paths_answer_from_the_index_without_touching_segments() {
         maxgap_micros: maxgap,
         range,
         filter: None,
+        force_scan: false,
     };
     let expected = fq_events::run_paths(
         store.io(),

@@ -1941,6 +1941,15 @@ pub fn run_paths(
     if spec.depth < 2 {
         return Err(EventBindingError::PathDepth { got: spec.depth }.into());
     }
+    let depth_bound = u32::try_from(dataset.record.max_paths_depth).expect("stored bound fits u32");
+    if spec.depth > depth_bound && !spec.force_scan {
+        return Err(EventBindingError::PathDepthBeyondBound {
+            dataset: dataset.record.name.clone(),
+            got: spec.depth,
+            bound: depth_bound,
+        }
+        .into());
+    }
     if spec.top < 1 || spec.top > 1000 {
         return Err(EventBindingError::PathTop { got: spec.top }.into());
     }
@@ -1952,8 +1961,8 @@ pub fn run_paths(
     };
     // The index fast path: an indexable spec over a dataset whose
     // current-generation index exists is answered from interval sweeps;
-    // anything else (filter, MAXGAP, missing index) scans.
-    if crate::paths_sa::spec_is_indexable(spec) {
+    // anything else (filter, MAXGAP, USING SCAN, missing index) scans.
+    if !spec.force_scan && crate::paths_sa::spec_is_indexable(spec) {
         if let Some(result) = crate::paths_sa::run_from_index(io, dataset, spec, anchor, cfg)? {
             return Ok(result);
         }
