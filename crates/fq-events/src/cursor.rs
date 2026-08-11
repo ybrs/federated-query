@@ -191,7 +191,8 @@ impl<'a> ShardScan<'a> {
     pub fn shard(&self) -> u32 {
         self.files
             .first()
-            .map_or(0, |scan| scan.seg.meta.header.shard)
+            .map(|scan| scan.seg.meta.header.shard)
+            .expect("a shard scan holds at least one file")
     }
 
     /// Every actor's runs, in ascending local-id order, merged across the

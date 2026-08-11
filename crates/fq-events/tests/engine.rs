@@ -900,12 +900,106 @@ fn refresh_appends_a_generation_and_merges_by_time() {
 
 /// Long streams grown by refreshes answer from the segment pairs exactly.
 ///
-/// Streams longer than the bounded tail read (2 x 32 - 1 collapsed runs)
+/// Streams longer than the bounded tail read (2 x max_paths_depth - 1)
 /// force the SATURATED backward-availability path; short streams take the
 /// exact path; one actor's delta interleaves (the late-arrival full-read
 /// fallback) and one delta opens with the actor's last stored code (the
 /// boundary collapse). Two refresh rounds stack two pairs on the base, and
 /// every anchor/depth/range answer must equal the scan's.
+/// A crash between writing a new manifest and deleting the old one leaves
+/// TWO manifests. That state must heal through the ordinary statements: the
+/// append path declines to guess and the refresh falls through to a
+/// rebuild, which deletes every manifest and leaves exactly one - answers
+/// staying scan-exact throughout.
+#[test]
+fn a_crash_left_manifest_pair_heals_through_refresh() {
+    let mut rng = Rng(0x2b3a_11fe);
+    let names = ["a", "b", "c"];
+    let mut tiebreak = 0_i64;
+    let mut row = |actor: i64, ts: i64, name: &str| {
+        tiebreak += 1;
+        Row {
+            actor: ActorId::Int(actor),
+            ts,
+            tiebreak,
+            name: name.to_string(),
+            device: None,
+        }
+    };
+    let mut base = Vec::new();
+    for actor in 0..10_i64 {
+        for position in 0..12_i64 {
+            let name = names[rng.below(names.len() as u64) as usize];
+            base.push(row(actor, position * 1_000_000, name));
+        }
+    }
+    let (store, dir) = open_store("twomanifests");
+    build_dataset(&store, "twomanifests", &base);
+    let cfg = test_config();
+    let location = store
+        .dataset("twomanifests")
+        .unwrap()
+        .record
+        .location
+        .clone();
+    let root = dir.join("events").join(&location);
+    let manifest = std::fs::read_dir(&root)
+        .unwrap()
+        .find_map(|entry| {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            name.starts_with("paths_m_").then_some(path)
+        })
+        .expect("a manifest exists after create");
+    // The crash-left second manifest.
+    let stale = root.join("paths_m_deadbeefdeadbeef.psax");
+    std::fs::copy(&manifest, &stale).unwrap();
+    let mut delta = Vec::new();
+    for actor in 0..10_i64 {
+        let name = names[rng.below(names.len() as u64) as usize];
+        delta.push(row(actor, 100_000_000, name));
+    }
+    let mut source = VecSource {
+        batches: vec![batch_of(&delta)].into_iter(),
+    };
+    let (appended, report) = store
+        .append_generation_with("twomanifests", &mut source, None, &cfg)
+        .unwrap();
+    assert_eq!(appended, 10);
+    assert!(
+        report.contains("paths index"),
+        "the refresh must rebuild the index through the ambiguity: {report}"
+    );
+    let manifests = std::fs::read_dir(&root)
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("paths_m_")
+        })
+        .count();
+    assert_eq!(manifests, 1, "the ambiguity must heal to one manifest");
+    let dataset = store.dataset("twomanifests").unwrap();
+    let spec = |maxgap| PathsSpec {
+        dataset: "twomanifests".to_string(),
+        anchor: PathAnchor::Unanchored,
+        depth: 4,
+        top: 1000,
+        maxgap_micros: maxgap,
+        range: TimeRange::default(),
+        filter: None,
+        force_scan: false,
+    };
+    let indexed = fq_events::run_paths(store.io(), &dataset, &spec(None), &cfg).unwrap();
+    let scanned = fq_events::run_paths(store.io(), &dataset, &spec(Some(i64::MAX)), &cfg).unwrap();
+    assert_eq!(indexed, scanned, "healed index must answer scan-exact");
+    drop(dataset);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// The per-query memory ceiling stops a scan WHILE it allocates: a budget
 /// far below the buffered windows raises the typed QueryMemory error, and
 /// the index path (which buffers no scan windows) still answers under the

@@ -368,10 +368,11 @@ impl EventStore {
     /// window forms the delta changed and a retraction cancelling the stale
     /// forms older segments still count - so its cost tracks the delta plus
     /// the touched actors' changed envelopes, never their whole histories.
-    /// `append_pair` returns None when there is no manifest to extend (never
-    /// built, or an older index format) or when the pair would reach half
-    /// the dataset's positions - the point where one whole-dataset sort is
-    /// the cheaper way to make the index current - and this rebuilds.
+    /// `append_pair` declines when there is no single manifest to extend
+    /// (never built, an older format, or a crash-left ambiguity) or when the
+    /// stitch's positions reach the dataset's - the point where one
+    /// whole-dataset sort is the cheaper way to make the index current - and
+    /// this rebuilds.
     fn extend_paths_index(
         &self,
         name: &str,

@@ -650,7 +650,7 @@ def battery_100m(parquet):
                                  columns=COLUMNS_100M))
     deep_pair("paths_d10_unanchored", "PATHS ON web DEPTH 10 TOP 10", 10, 10)
     deep_pair("paths_d20_unanchored", "PATHS ON web DEPTH 20 TOP 10 USING SCAN", 20, 10)
-    # Depth 50 exceeds the dataset's max_paths_depth (32): the statement must
+    # Depth 20/50 exceed the dataset's max_paths_depth: the statement must
     # opt into the exact scan, which is the semantics the oracle checks.
     deep_pair("paths_d50_unanchored", "PATHS ON web DEPTH 50 TOP 10 USING SCAN", 50, 10)
     deep_pair("paths_d50_forward",
@@ -1273,7 +1273,7 @@ ENVELOPE_SHAPES = [
     ("d16_backward",
      "PATHS ON web ENDING AT 'purchase' DEPTH 16 TOP 10 USING SCAN"),
     ("d8_ranged",
-     "PATHS ON web DEPTH 8 TOP 10 FROM '2026-06-15' TO '2026-06-22' USING SCAN"),
+     "PATHS ON web DEPTH 8 TOP 10 FROM '2025-01-05' TO '2025-01-20' USING SCAN"),
 ]
 
 

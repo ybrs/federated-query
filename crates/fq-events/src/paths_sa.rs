@@ -45,7 +45,7 @@ compile_error!("the paths index stores little-endian arrays; big-endian is unsup
 const MAGIC: &[u8; 4] = b"FQPS";
 
 /// The serialization version this build writes and reads.
-const VERSION: u8 = 6;
+const VERSION: u8 = 7;
 
 /// The fingerprint stamped into a SEGMENT file.
 ///
@@ -264,14 +264,14 @@ fn fingerprint(dataset: &Dataset) -> u64 {
 /// binds a set of segments to one dataset state. Naming segments by
 /// fingerprint would mean rewriting every file whenever a generation is
 /// appended, which is the cost this whole design exists to avoid.
-fn fwd_rel(dataset: &Dataset, segment: u32) -> String {
-    format!("{}/paths_f_{segment:08}.psax", dataset.record.location)
+fn fwd_rel(dataset: &Dataset, segment: u64) -> String {
+    format!("{}/paths_f_{segment:016x}.psax", dataset.record.location)
 }
 
 /// A segment's backward index file (backward arrays only); split from the
 /// forward file so the two encode, write, and load on concurrent threads.
-fn bwd_rel(dataset: &Dataset, segment: u32) -> String {
-    format!("{}/paths_b_{segment:08}.psax", dataset.record.location)
+fn bwd_rel(dataset: &Dataset, segment: u64) -> String {
+    format!("{}/paths_b_{segment:016x}.psax", dataset.record.location)
 }
 
 /// The manifest's relative path: which segments compose the index, and which
@@ -289,21 +289,44 @@ fn manifest_rel(dataset: &Dataset) -> String {
     )
 }
 
-/// One segment of the index: its immutable file id. Everything else about a
-/// segment - its views, their signs, their ownership - lives inside its
-/// files; the manifest only names which files compose the index.
+/// One segment of the index: its immutable file id, minted as the UTC
+/// nanosecond of its creation. A nonce id needs no counter that a crash
+/// could lose, so no file path within a dataset's life can ever be issued
+/// twice - the invariant the path-keyed segment cache depends on.
+/// Everything else about a segment - its views, their signs, their
+/// ownership - lives inside its files; the manifest only names which files
+/// compose the index.
 struct SegmentEntry {
-    id: u32,
+    id: u64,
 }
 
-/// The index's manifest: the segments composing it, and the next free file id.
+/// Mint one segment id: the current UTC nanosecond plus an offset for
+/// sibling segments written by the same statement.
+fn mint_segment_id(offset: u64) -> u64 {
+    let nanos = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .expect("the current time is representable in nanoseconds");
+    u64::try_from(nanos).expect("the current time is past 1970") + offset
+}
+
+/// The index's manifest: the segments composing it.
 ///
-/// The manifest is the only mutable part of the index. A refresh writes a new
-/// segment file and a new manifest naming it alongside the existing ones; the
-/// existing files are never touched.
+/// The manifest is the only mutable part of the index. A refresh writes new
+/// segment files and a new manifest naming them alongside the existing ones;
+/// the existing files are never touched.
 struct IndexManifest {
-    next_id: u32,
     segments: Vec<SegmentEntry>,
+}
+
+/// How the stored manifests read back: none, exactly one, or an ambiguity a
+/// crash left behind (two manifests, the window between writing the new one
+/// and deleting the old). Ambiguity is NOT corruption: the append path
+/// declines to guess and the caller rebuilds, which deletes every manifest -
+/// so the state is self-healing through the ordinary statements.
+enum StoredManifest {
+    None,
+    One(String, IndexManifest),
+    Ambiguous,
 }
 
 /// The files sitting DIRECTLY under the dataset location (not inside a
@@ -995,10 +1018,9 @@ fn read_events(
 /// `target_runs` collapsed runs or the stream start. Returns the tail in
 /// ascending order and whether the stream start was reached.
 ///
-/// The earliest returned run may be cut mid-run, which leaves its kept
-/// timestamp later than the run's true first occurrence; callers only place
-/// that position in unowned context, where a sweep reads its code and never
-/// its timestamp.
+/// The tail stops on a run BOUNDARY (the early return fires when the code
+/// changes), so every returned run is complete and carries its true first
+/// occurrence's timestamp.
 fn read_tail(
     scan: &crate::cursor::ShardScan<'_>,
     pieces: &[Piece],
@@ -1018,7 +1040,13 @@ fn read_tail(
     while !cursors.is_empty() {
         let mut best = 0usize;
         for candidate in 1..cursors.len() {
-            if cursors[candidate].3 > cursors[best].3 {
+            // On an equal (ts, tiebreak) key the LATER cursor wins, so the
+            // reversed result puts the earlier file first - the same tie
+            // order the forward per-actor merge produces. A duplicate full
+            // key across generations must collapse and stitch in the same
+            // order the base segment was built from, or a retraction would
+            // cancel a form the base never counted.
+            if cursors[candidate].3 >= cursors[best].3 {
                 best = candidate;
             }
         }
@@ -1282,7 +1310,7 @@ pub(crate) fn append_pair(
     delta_files: &[(u32, String)],
     max_depth: u32,
 ) -> Result<PairOutcome, EventError> {
-    let Some((manifest_path, manifest)) = read_stored_manifest(io, dataset)? else {
+    let StoredManifest::One(manifest_path, manifest) = read_stored_manifest(io, dataset)? else {
         return Ok(PairOutcome::NoManifest);
     };
     let started = std::time::Instant::now();
@@ -1312,20 +1340,22 @@ pub(crate) fn append_pair(
     }
     let alphabet = u32::try_from(dataset.event_dict.values.len()).expect("dictionary fits u32");
     let mut segments = manifest.segments;
-    let mut next_id = manifest.next_id;
     let mut positions = 0usize;
     let mut written = 0usize;
-    for streams in [&duals, &late_additions, &late_retractions] {
+    for (offset, streams) in [&duals, &late_additions, &late_retractions]
+        .into_iter()
+        .enumerate()
+    {
         if !pair_has_streams(streams) {
             continue;
         }
+        let id = mint_segment_id(u64::try_from(offset).expect("offset fits u64"));
         let index = assemble(streams, alphabet, max_depth)?;
         positions += index.text.len();
-        written += write_segment(io, dataset, &index, next_id, SEGMENT_STAMP)?;
-        segments.push(SegmentEntry { id: next_id });
-        next_id += 1;
+        written += write_segment(io, dataset, &index, id, SEGMENT_STAMP)?;
+        segments.push(SegmentEntry { id });
     }
-    let next = IndexManifest { next_id, segments };
+    let next = IndexManifest { segments };
     let stamp = fingerprint(dataset);
     let next_path = manifest_rel(dataset);
     io.put_verified(&next_path, encode_manifest(&next, stamp))?;
@@ -1358,13 +1388,18 @@ pub(crate) fn compact(
     dataset: &Dataset,
     cfg: &fq_common::events::EventsConfig,
 ) -> Result<String, EventError> {
-    let Some((manifest_path, manifest)) = read_stored_manifest(io, dataset)? else {
-        return rebuild(io, dataset, cfg);
+    let folded = match read_stored_manifest(io, dataset)? {
+        StoredManifest::None => return rebuild(io, dataset, cfg),
+        // A crash between manifests left an ambiguity: fold everything into
+        // a fresh base, which is also what heals it.
+        StoredManifest::Ambiguous => 0,
+        StoredManifest::One(_, manifest) => {
+            if manifest.segments.len() <= 1 {
+                return Ok("paths index: already one segment, nothing to fold".to_string());
+            }
+            manifest.segments.len()
+        }
     };
-    let folded = manifest.segments.len();
-    if folded <= 1 {
-        return Ok("paths index: already one segment, nothing to fold".to_string());
-    }
     let started = std::time::Instant::now();
     let streams = collect_streams(io, dataset, cfg, None)?;
     let collected = started.elapsed().as_secs_f64();
@@ -1373,18 +1408,14 @@ pub(crate) fn compact(
     drop(streams);
     let sorted = started.elapsed().as_secs_f64();
     let positions = index.text.len();
-    let base_id = manifest.next_id;
+    let base_id = mint_segment_id(0);
     let written = write_segment(io, dataset, &index, base_id, SEGMENT_STAMP)?;
     let stamp = fingerprint(dataset);
     let next = IndexManifest {
-        next_id: base_id + 1,
         segments: vec![SegmentEntry { id: base_id }],
     };
     let next_path = manifest_rel(dataset);
     io.put_verified(&next_path, encode_manifest(&next, stamp))?;
-    if manifest_path != next_path {
-        io.delete(&manifest_path)?;
-    }
     for rel in location_files_with_prefix(io, &dataset.record.location, "paths_f_")?
         .into_iter()
         .chain(location_files_with_prefix(
@@ -1392,8 +1423,14 @@ pub(crate) fn compact(
             &dataset.record.location,
             "paths_b_",
         )?)
+        .chain(location_files_with_prefix(
+            io,
+            &dataset.record.location,
+            "paths_m_",
+        )?)
     {
-        if rel != fwd_rel(dataset, base_id) && rel != bwd_rel(dataset, base_id) {
+        if rel != fwd_rel(dataset, base_id) && rel != bwd_rel(dataset, base_id) && rel != next_path
+        {
             io.delete(&rel)?;
         }
     }
@@ -1411,16 +1448,15 @@ pub(crate) fn rebuild(
     dataset: &Dataset,
     cfg: &fq_common::events::EventsConfig,
 ) -> Result<String, EventError> {
-    // The rebuilt base lands at a NEVER-USED file id. Segment files are
+    // The rebuilt base lands at a NEVER-USED file id: segment files are
     // cached by path under an immutability assumption, so writing new bytes
     // at an old path would leave every warm process serving the previous
     // base - subtly wrong counts, and the signed merge's invariant tripping
-    // on the next refresh's retractions. Ids continue from the stored
-    // manifest, whatever dataset state it was written for.
-    let base_id = match read_stored_manifest(io, dataset)? {
-        Some((_, manifest)) => manifest.next_id,
-        None => 0,
-    };
+    // on the next refresh's retractions. The id is a creation-time nonce, so
+    // uniqueness survives any crash - there is no counter to lose - and a
+    // rebuild needs no manifest read at all: whatever manifests exist
+    // (including a crash-left pair) are deleted with the rest.
+    let base_id = mint_segment_id(0);
     for stale in location_files_with_prefix(io, &dataset.record.location, "paths_")? {
         io.delete(&stale)?;
     }
@@ -1437,7 +1473,6 @@ pub(crate) fn rebuild(
     // The manifest goes last: until it exists there is no index, so a crash
     // between the segment files and here leaves a dataset that scans.
     let manifest = IndexManifest {
-        next_id: base_id + 1,
         segments: vec![SegmentEntry { id: base_id }],
     };
     io.put_verified(&manifest_rel(dataset), encode_manifest(&manifest, stamp))?;
@@ -1460,7 +1495,7 @@ fn write_segment(
     io: &StoreIo,
     dataset: &Dataset,
     index: &PathsSa,
-    segment: u32,
+    segment: u64,
     stamp: u64,
 ) -> Result<usize, EventStoreError> {
     std::thread::scope(|scope| {
@@ -1489,7 +1524,6 @@ fn encode_manifest(manifest: &IndexManifest, fingerprint: u64) -> Vec<u8> {
     out.extend_from_slice(MAGIC);
     out.push(VERSION);
     out.extend_from_slice(&fingerprint.to_le_bytes());
-    out.extend_from_slice(&manifest.next_id.to_le_bytes());
     out.extend_from_slice(&(manifest.segments.len() as u64).to_le_bytes());
     for segment in &manifest.segments {
         out.extend_from_slice(&segment.id.to_le_bytes());
@@ -1532,14 +1566,13 @@ fn decode_manifest(
     if stamp != expected {
         return Err(corrupt("paths manifest fingerprint".to_string()));
     }
-    let next_id = u32::from_le_bytes(take(4)?.try_into().expect("four bytes"));
     let count = u64::from_le_bytes(take(8)?.try_into().expect("eight bytes"));
     let mut segments = Vec::new();
     for _ in 0..count {
-        let id = u32::from_le_bytes(take(4)?.try_into().expect("four bytes"));
+        let id = u64::from_le_bytes(take(8)?.try_into().expect("eight bytes"));
         segments.push(SegmentEntry { id });
     }
-    Ok(IndexManifest { next_id, segments })
+    Ok(IndexManifest { segments })
 }
 
 /// The manifest that is ON DISK, whatever dataset state it was written for,
@@ -1551,21 +1584,13 @@ fn decode_manifest(
 /// the manifest it must extend is the one written for the previous state. More
 /// than one manifest means a previous write was interrupted between publishing
 /// and cleaning up, and appending to either would be a guess - so it raises.
-fn read_stored_manifest(
-    io: &StoreIo,
-    dataset: &Dataset,
-) -> Result<Option<(String, IndexManifest)>, EventError> {
+fn read_stored_manifest(io: &StoreIo, dataset: &Dataset) -> Result<StoredManifest, EventError> {
     let mut found = location_files_with_prefix(io, &dataset.record.location, "paths_m_")?;
     if found.is_empty() {
-        return Ok(None);
+        return Ok(StoredManifest::None);
     }
     if found.len() > 1 {
-        found.sort();
-        return Err(EventStoreError::Corrupt {
-            file: found.join(", "),
-            detail: "several paths manifests in one dataset location".to_string(),
-        }
-        .into());
+        return Ok(StoredManifest::Ambiguous);
     }
     let path = found.remove(0);
     let bytes = io.get(&path)?;
@@ -1578,7 +1603,7 @@ fn read_stored_manifest(
     }
     let stamp = u64::from_le_bytes(bytes[5..13].try_into().expect("eight bytes"));
     let manifest = decode_manifest(&bytes, &path, stamp)?;
-    Ok(Some((path, manifest)))
+    Ok(StoredManifest::One(path, manifest))
 }
 
 /// The little-endian byte view of a plain numeric slice.

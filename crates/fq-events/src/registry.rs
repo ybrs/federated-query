@@ -37,7 +37,7 @@ impl Registry {
             .map_err(|error| db_err(&error))?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|error| db_err(&error))?;
-        conn.execute_batch(
+        conn.execute_batch(&format!(
             "CREATE TABLE IF NOT EXISTS event_datasets (
                 name             TEXT PRIMARY KEY,
                 location         TEXT NOT NULL,
@@ -53,7 +53,7 @@ impl Registry {
                 file_list        TEXT NOT NULL,
                 dict_state       TEXT NOT NULL,
                 refresh_key      TEXT,
-                max_paths_depth  INTEGER NOT NULL DEFAULT 32,
+                max_paths_depth  INTEGER NOT NULL DEFAULT {default_depth},
                 watermark        TEXT,
                 source_token     TEXT,
                 measured_events  INTEGER NOT NULL,
@@ -66,14 +66,19 @@ impl Registry {
                 refreshed_at     TEXT,
                 deleted_at       TEXT
             );",
-        )
+            default_depth = fq_common::events::DEFAULT_MAX_PATHS_DEPTH,
+        ))
         .map_err(|error| db_err(&error))?;
         // A store created before max_paths_depth existed lacks the column;
-        // add it with the engine default so its records keep loading. The
-        // duplicate-column error from a current store is expected and
-        // everything else raises.
+        // add it with the engine default so its records keep loading under
+        // the same contract a fresh CREATE would get. The duplicate-column
+        // error from a current store is expected and everything else raises.
         if let Err(error) = conn.execute(
-            "ALTER TABLE event_datasets ADD COLUMN max_paths_depth INTEGER NOT NULL DEFAULT 32",
+            &format!(
+                "ALTER TABLE event_datasets ADD COLUMN max_paths_depth \
+                 INTEGER NOT NULL DEFAULT {}",
+                fq_common::events::DEFAULT_MAX_PATHS_DEPTH
+            ),
             [],
         ) {
             if !error.to_string().contains("duplicate column name") {
@@ -370,7 +375,7 @@ mod tests {
             },
             dict_state: BTreeMap::from([("__event__".to_string(), 20u64)]),
             refresh_key: Some("seq".to_string()),
-            max_paths_depth: 32,
+            max_paths_depth: i64::from(fq_common::events::DEFAULT_MAX_PATHS_DEPTH),
             watermark: None,
             source_token: None,
             measured_events: 10,

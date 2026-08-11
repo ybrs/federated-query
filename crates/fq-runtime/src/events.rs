@@ -324,8 +324,6 @@ impl Runtime {
         ))
     }
 
-    /// `REBUILD EVENT DATASET`: re-pull the whole source into a fresh tree
-    /// and swap it in.
     /// `COMPACT EVENT DATASET`: fold the paths index's segments into one
     /// base, online.
     pub(crate) fn compact_event_dataset(
@@ -338,6 +336,8 @@ impl Runtime {
         status_result(&format!("COMPACT EVENT DATASET: {report}"))
     }
 
+    /// `REBUILD EVENT DATASET`: re-pull the whole source into a fresh tree
+    /// and swap it in.
     pub(crate) fn rebuild_event_dataset(
         &self,
         name: &str,
