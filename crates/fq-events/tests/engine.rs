@@ -906,6 +906,59 @@ fn refresh_appends_a_generation_and_merges_by_time() {
 /// fallback) and one delta opens with the actor's last stored code (the
 /// boundary collapse). Two refresh rounds stack two pairs on the base, and
 /// every anchor/depth/range answer must equal the scan's.
+/// The per-query memory ceiling stops a scan WHILE it allocates: a budget
+/// far below the buffered windows raises the typed QueryMemory error, and
+/// the index path (which buffers no scan windows) still answers under the
+/// same budget - the ceiling gates the scan, not the statement.
+#[test]
+fn the_scan_honors_the_query_memory_ceiling() {
+    let mut rng = Rng(0x5ca1_ab1e);
+    let names = ["a", "b", "c"];
+    let mut tiebreak = 0_i64;
+    let mut rows = Vec::new();
+    for actor in 0..40_i64 {
+        for position in 0..40_i64 {
+            tiebreak += 1;
+            rows.push(Row {
+                actor: ActorId::Int(actor),
+                ts: position * 1_000_000,
+                tiebreak,
+                name: names[rng.below(names.len() as u64) as usize].to_string(),
+                device: None,
+            });
+        }
+    }
+    let (store, dir) = open_store("ceiling");
+    let dataset = build_dataset(&store, "ceiling", &rows);
+    let tight = EventsConfig {
+        build_threads: 2,
+        cache_bytes: 1024,
+        query_memory_bytes: 1024,
+        ..EventsConfig::default()
+    };
+    let spec = |maxgap| PathsSpec {
+        dataset: "ceiling".to_string(),
+        anchor: PathAnchor::Unanchored,
+        depth: 4,
+        top: 10,
+        maxgap_micros: maxgap,
+        range: TimeRange::default(),
+        filter: None,
+        force_scan: false,
+    };
+    let error = fq_events::run_paths(store.io(), &dataset, &spec(Some(i64::MAX)), &tight)
+        .expect_err("a 1 KiB budget cannot hold the scan buffers");
+    assert!(
+        error.to_string().contains("query_memory_bytes"),
+        "the raise must name the setting: {error}"
+    );
+    let indexed = fq_events::run_paths(store.io(), &dataset, &spec(None), &tight)
+        .expect("the index path buffers no scan windows");
+    assert!(!indexed.rows.is_empty());
+    drop(dataset);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A fold writes byte-for-byte what a rebuild would: the collected streams
 /// ARE the net that the signed views described, so compaction and rebuild
 /// must be the same deterministic function of the store - only the file id

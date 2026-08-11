@@ -2012,11 +2012,18 @@ struct ShardWindows {
     stripes: Vec<Vec<u128>>,
 }
 
-/// Approximate resident bytes of the buffered windows of a scan, for the
-/// query memory budget: the window records, their striped fingerprint
-/// copies, and the code buffers.
-fn scan_buffer_bytes(windows: usize, codes: usize) -> u64 {
-    windows as u64 * (24 + 16) + codes as u64 * 4
+/// Resident bytes of one shard's scan buffers, for the query memory budget:
+/// the ALLOCATED capacities (vectors grow by doubling, and the doubled slack
+/// is resident whether used or not) at the true padded record sizes.
+fn scan_buffer_bytes(buffered: &ShardWindows) -> u64 {
+    let window_bytes = std::mem::size_of::<(u128, u32, u32)>() as u64;
+    let mut stripe_capacity = 0u64;
+    for stripe in &buffered.stripes {
+        stripe_capacity += stripe.capacity() as u64;
+    }
+    buffered.windows.capacity() as u64 * window_bytes
+        + stripe_capacity * 16
+        + buffered.codes.capacity() as u64 * 4
 }
 
 /// The filtered/gapped paths scan: ONE sharded enumeration pass buffers every
@@ -2032,21 +2039,25 @@ fn run_paths_scan(
     cfg: &EventsConfig,
 ) -> Result<PathsResult, EventError> {
     let mut shards: Vec<ShardWindows> = Vec::new();
-    let mut held = 0u64;
+    // Charged by every shard AS ITS BUFFERS GROW, so the ceiling stops the
+    // allocation instead of apologizing for it afterwards: the raise lands
+    // while resident memory is near the budget, not at a multiple of it.
+    let charged = std::sync::atomic::AtomicU64::new(0);
     run_sharded(
         io,
         dataset,
         cfg,
-        |scan| paths_shard_windows(scan, dataset, spec, anchor),
+        |scan| {
+            paths_shard_windows(
+                scan,
+                dataset,
+                spec,
+                anchor,
+                cfg.query_memory_bytes,
+                &charged,
+            )
+        },
         |shard| {
-            held += scan_buffer_bytes(shard.windows.len(), shard.codes.len());
-            if held > cfg.query_memory_bytes {
-                return Err(EventUnsupported::QueryMemory {
-                    analysis: "PATHS".to_string(),
-                    budget: cfg.query_memory_bytes,
-                }
-                .into());
-            }
             shards.push(shard);
             Ok(())
         },
@@ -2349,6 +2360,8 @@ fn paths_shard_windows(
     dataset: &Dataset,
     spec: &PathsSpec,
     anchor: Option<(u64, bool)>,
+    budget: u64,
+    charged: &std::sync::atomic::AtomicU64,
 ) -> Result<ShardWindows, EventError> {
     let context = ScanContext::new(dataset, spec.filter.as_ref(), spec.range)?;
     let mut buffered = ShardWindows {
@@ -2358,6 +2371,7 @@ fn paths_shard_windows(
     };
     let mut stream: Vec<StreamEvent> = Vec::new();
     let mut scratch: Vec<u8> = Vec::new();
+    let mut shard_charged = 0u64;
     let constrained =
         context.from != i64::MIN || context.to != i64::MAX || context.filter.is_some();
     for run in scan.actor_runs() {
@@ -2419,6 +2433,23 @@ fn paths_shard_windows(
             },
             &mut anchor_ok,
         )?;
+        // Charge this shard's buffer growth against the SHARED budget after
+        // every actor: concurrent shards see each other's charges, so the
+        // overshoot past the ceiling is bounded by the threads' single-actor
+        // growth, never by whole shards.
+        let now = scan_buffer_bytes(&buffered);
+        if now != shard_charged {
+            let grown = now - shard_charged;
+            shard_charged = now;
+            let held = charged.fetch_add(grown, std::sync::atomic::Ordering::Relaxed) + grown;
+            if held > budget {
+                return Err(EventUnsupported::QueryMemory {
+                    analysis: "PATHS".to_string(),
+                    budget,
+                }
+                .into());
+            }
+        }
     }
     Ok(buffered)
 }
