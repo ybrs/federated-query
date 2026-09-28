@@ -61,14 +61,13 @@ because a dependency is missing: an absent PostgreSQL, an unbuilt `fedq.so`, an
 unbuilt `fedq-server` all RAISE. A skip for a missing dependency is a green
 build for untested code.
 
-# THE VIRTUALENV IS ./venv AT THE REPOSITORY ROOT
+# USE THE ACTIVE PYTHON VIRTUALENV
 
-One location, permanently: `./venv`. Not `/tmp`, not per-session, not
-`~/.virtualenvs`, not a second one beside it. `make venv` creates it and
-installs `requirements.txt`; every Makefile target, every script, and
-`run_all_tests.sh` use `./venv/bin/python3` explicitly rather than whatever is
-on PATH. Anything the suite or the linters need goes in `requirements.txt`, so
-the environment is reproducible from the repository alone.
+Every Makefile target, test runner, and hook uses only the currently activated
+virtualenv at `$VIRTUAL_ENV/bin/python3`. There is no implicit fallback to a
+repository-local environment or to Python on PATH. Activate the intended
+environment before running project commands. `make install` installs
+`requirements.txt` into it, bootstrapping pip with `ensurepip` when needed.
 
 # BUILD TIME IS ONE NUMBER
 
@@ -206,8 +205,9 @@ history lives in git. If behavior is intentionally missing,
 state the current behavior as a fact ("X is not supported; this raises Y"),
 never as a plan. Enforced twice: fq-lint FQ-PMCOMMENT catches the mechanical
 markers instantly (Rust), and the SEMANTIC pre-commit gate (scripts/
-comment-gate: a haiku judge reviews every staged .rs/.py comment block and
-Python docstring against RUBRIC.md) catches what keyword lists cannot. The
+comment-gate: Codex gpt-6-luna at low reasoning effort reviews every staged
+.rs/.py comment block and Python docstring against RUBRIC.md) catches what
+keyword lists cannot. The
 hook installs itself on session start (SessionStart hook -> scripts/
 install-hooks.sh; manual: `make hook-install`); a gate failure blocks the
 commit and prints each offending comment.
@@ -221,7 +221,8 @@ agent builds in a worktree, warm it:
     ./scripts/warm-worktree-agent.sh <worktree-path>
 
 It hardlink-copies the main target/, DELETES the worktree's checked-out
-.cargo/config.toml, symlinks .duckdb-lib, and creates ./venv. The deletion is
+.cargo/config.toml, symlinks .duckdb-lib, and requires the active virtualenv.
+Activate that environment before warming the worktree. The deletion is
 the load-bearing step: a worktree under the main root sees BOTH config files
 (cargo config discovery walks up the directory tree), so the [build]
 rustflags apply twice, and the doubled flags change every unit's fingerprint
@@ -430,7 +431,7 @@ federated-query/
 ## Installation and Setup
 
 ```bash
-make venv          # creates ./venv and installs requirements.txt into it
+make venv          # installs requirements.txt into the active virtualenv
 make duckdb-lib    # fetches the prebuilt libduckdb the workspace links
 make build         # release build of the whole workspace
 ```

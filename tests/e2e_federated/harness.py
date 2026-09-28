@@ -152,6 +152,11 @@ def pg_database():
     return os.environ.get("POSTGRES_DB", "test_db")
 
 
+def pg_port():
+    """Return the port selected for the repository test PostgreSQL server."""
+    return int(os.environ["POSTGRES_PORT"])
+
+
 def source_for(kind, index):
     """Return the RequiredSource describing one instance of one kind."""
     name = source_name(kind, index)
@@ -365,7 +370,7 @@ def _append_pg_block(lines, source):
     """Append a PostgreSQL datasource block (connection + schema + adbc driver)."""
     lines.append("    type: postgres")
     lines.append("    host: " + os.environ.get("POSTGRES_HOST", "localhost"))
-    lines.append("    port: " + os.environ.get("POSTGRES_PORT", "5432"))
+    lines.append("    port: " + str(pg_port()))
     lines.append("    user: " + os.environ.get("POSTGRES_USER", "postgres"))
     lines.append("    password: " + os.environ.get("POSTGRES_PASSWORD", "postgres"))
     lines.append("    database: " + pg_database())

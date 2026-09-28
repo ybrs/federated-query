@@ -2,12 +2,9 @@
 //! a Postgres source runs a JOIN ACROSS the two sources, exercising the engine's
 //! federated path (per-source reads merged and reduced by the coordinator).
 //!
-//! Postgres being unreachable on :5432 early-returns (mirrors the fq-connectors
-//! gating), because a database nobody started is a local condition rather than a
-//! defect. The ADBC Postgres driver is NOT gated that way: the exec plane reads
-//! Postgres over ADBC, so its absence is a panic. A skip there would report this
-//! test green while it exercised nothing, which is the coverage claim the suite
-//! must never make.
+//! The test uses the repository test server selected by `PGPORT`; any connection
+//! failure fails the test. The ADBC Postgres driver is also required because the
+//! exec plane reads Postgres over ADBC.
 //!
 //! The Postgres dimension fixture (`fq_rt_region`) is created by the test itself
 //! (via the connector's setup helper) BEFORE the runtime loads metadata, and
@@ -62,24 +59,23 @@ fn seed_duck_fixture() -> PathBuf {
     path
 }
 
-/// The libpq connection string for the local trust-auth Postgres.
+/// The libpq connection string for the selected test PostgreSQL server.
 fn pg_conn_str() -> String {
-    "host=localhost port=5432 user=postgres dbname=postgres".to_string()
+    std::env::var("FQ_TEST_PG_URL").unwrap_or_else(|_| {
+        let port = std::env::var("PGPORT").expect("PGPORT must select test PostgreSQL");
+        format!("host=localhost port={port} user=postgres dbname=postgres")
+    })
 }
 
 /// Prints the directory holding the installed `adbc_driver_postgresql` package.
 const ADBC_PACKAGE_DIR_PROGRAM: &str =
     "import adbc_driver_postgresql, os; print(os.path.dirname(adbc_driver_postgresql.__file__))";
 
-/// The interpreter owning the project's Python environment: an activated venv
-/// (VIRTUAL_ENV) when one is set, otherwise `python3` from PATH. No venv
-/// location or Python version is written down, so a venv that moves or is
-/// rebuilt keeps working.
+/// Return the Python interpreter from the active virtual environment.
 fn python_interpreter() -> String {
-    match std::env::var("VIRTUAL_ENV") {
-        Ok(venv) if !venv.is_empty() => format!("{venv}/bin/python"),
-        _ => "python3".to_string(),
-    }
+    let venv = std::env::var("VIRTUAL_ENV").expect("VIRTUAL_ENV must select Python");
+    assert!(!venv.is_empty(), "VIRTUAL_ENV must not be empty");
+    format!("{venv}/bin/python3")
 }
 
 /// The ADBC Postgres driver shipped with the active Python environment.
@@ -122,7 +118,11 @@ fn duck_params(path: &str) -> BTreeMap<String, Value> {
 fn pg_params(adbc_driver: &str) -> BTreeMap<String, Value> {
     let mut params = BTreeMap::new();
     params.insert("host".to_string(), Value::String("localhost".to_string()));
-    params.insert("port".to_string(), Value::Number(5432.into()));
+    let port = std::env::var("PGPORT")
+        .expect("PGPORT must select test PostgreSQL")
+        .parse::<u16>()
+        .expect("PGPORT must be a valid port number");
+    params.insert("port".to_string(), Value::Number(port.into()));
     params.insert("user".to_string(), Value::String("postgres".to_string()));
     params.insert(
         "database".to_string(),
@@ -215,12 +215,9 @@ fn create_pg_fixture(source: &PostgresSource) {
 fn joins_duckdb_nation_against_postgres_region() {
     let duck_path = seed_duck_fixture();
     let adbc_driver = adbc_driver_path();
-    // Connect for setup; if Postgres is unreachable, skip (mirrors fq-connectors).
-    let Ok(setup) = PostgresSource::connect("pg", &pg_conn_str(), vec!["public".to_string()])
-    else {
-        eprintln!("skipping cross_source: postgres unreachable on :5432");
-        return;
-    };
+    // Connect to the required test service before creating its fixture.
+    let setup = PostgresSource::connect("pg", &pg_conn_str(), vec!["public".to_string()])
+        .expect("connect to test PostgreSQL");
     create_pg_fixture(&setup);
     drop(setup);
 
@@ -251,7 +248,9 @@ fn joins_duckdb_nation_against_postgres_region() {
     );
 
     // Clean up the fixture.
-    if let Ok(cleanup) = PostgresSource::connect("pg", &pg_conn_str(), vec!["public".to_string()]) {
-        let _ = cleanup.execute("DROP TABLE IF EXISTS fq_rt_region;");
-    }
+    let cleanup = PostgresSource::connect("pg", &pg_conn_str(), vec!["public".to_string()])
+        .expect("reconnect to test PostgreSQL for cleanup");
+    cleanup
+        .execute("DROP TABLE IF EXISTS fq_rt_region;")
+        .expect("drop PostgreSQL fixture");
 }

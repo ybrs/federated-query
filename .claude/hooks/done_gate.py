@@ -202,13 +202,12 @@ def _cargo_env():
     return None
 
 
-def _venv_python(root):
-    """The repository's one interpreter, `./venv/bin/python3`, always.
-
-    Not $VIRTUAL_ENV and not whatever python3 is on PATH: the gate verifies
-    with the environment the project defines, or reports that it cannot.
-    """
-    return os.path.join(root, "venv", "bin", "python3")
+def _venv_python():
+    """Return the active virtualenv interpreter, or None when none is active."""
+    active_venv = os.environ.get("VIRTUAL_ENV")
+    if not active_venv:
+        return None
+    return os.path.join(active_venv, "bin", "python3")
 
 
 def _preconditions(root):
@@ -218,9 +217,11 @@ def _preconditions(root):
     no-op or a wall of connection errors - the state that has to be reported as
     a failure rather than interpreted afterwards.
     """
-    python = _venv_python(root)
+    python = _venv_python()
+    if python is None:
+        return "No active Python virtualenv: the e2e suite CANNOT RUN."
     if not os.path.isfile(python):
-        return f"No interpreter at {python}: the e2e suite CANNOT RUN. Fix: make venv"
+        return f"No interpreter at {python}: the e2e suite CANNOT RUN."
     probe = subprocess.run(
         [python, "-c", "import pytest"], capture_output=True, text=True
     )
@@ -236,6 +237,11 @@ def _preconditions(root):
 
 def _postgres_blocker(root):
     """Why the PostgreSQL fixture is unusable, or None when it is up."""
+    port_file = os.path.join(root, ".fedq-test-postgres-port")
+    if not os.path.isfile(port_file):
+        return "The test PostgreSQL server has not started. Run make pg-start."
+    with open(port_file) as handle:
+        port = int(handle.read().strip())
     pg_ready = os.path.join(root, "postgres-17", "bin", "pg_isready")
     if not os.path.isfile(pg_ready):
         return (
@@ -243,12 +249,15 @@ def _postgres_blocker(root):
             "UNKNOWN and the e2e suite cannot be trusted. Fix: make download_postgres"
         )
     up = subprocess.run(
-        [pg_ready, "-h", "127.0.0.1", "-p", "5432"], capture_output=True, text=True
+        [pg_ready, "-h", "127.0.0.1", "-p", str(port)],
+        capture_output=True,
+        text=True,
     )
     if up.returncode != 0:
         return (
-            "PostgreSQL is not accepting connections: the e2e suite CANNOT RUN "
-            "against it. Fix: make pg-start"
+            "The test PostgreSQL server is not accepting connections on port "
+            + str(port)
+            + ". Run make pg-start."
         )
     return None
 

@@ -10,33 +10,27 @@
 # schema in the test database, then creates every datasource the corpus needs.
 # Re-run it whenever the corpus or the table library changes.
 #
-# Prerequisites: ./venv (make venv) and a running PostgreSQL (make pg-start).
+# Prerequisite: an active Python virtualenv. The script starts test PostgreSQL.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${ROOT}"
 
-PYTHON="${ROOT}/venv/bin/python3"
-PG_ISREADY="${ROOT}/postgres-17/bin/pg_isready"
-PGPORT="${PGPORT:-5432}"
-
+VENV="${VIRTUAL_ENV:-}"
+PYTHON="${VENV}/bin/python3"
+if [ -z "${VENV}" ]; then
+    echo "ERROR: no active Python virtualenv" >&2
+    echo "  fix: activate a virtualenv before running ./build_test_harness.sh" >&2
+    exit 1
+fi
 if [ ! -x "${PYTHON}" ]; then
-    echo "ERROR: no virtualenv at ${ROOT}/venv" >&2
-    echo "  fix: make venv" >&2
+    echo "ERROR: no interpreter at ${PYTHON}" >&2
     exit 1
 fi
 
-if [ ! -x "${PG_ISREADY}" ]; then
-    echo "ERROR: PostgreSQL binaries not found in ${ROOT}/postgres-17" >&2
-    echo "  fix: make download_postgres" >&2
-    exit 1
-fi
-
-if ! "${PG_ISREADY}" -h localhost -p "${PGPORT}" >/dev/null 2>&1; then
-    echo "PostgreSQL is not running; starting it"
-    make pg-start
-fi
+source "${ROOT}/scripts/test-postgres-env.sh"
+ensure_test_postgres "${ROOT}"
 
 "${PYTHON}" -m tests.e2e_federated.build_harness
 

@@ -1,384 +1,237 @@
-# Federated Query Engine (fedq)
+# Federated Query Engine
 
-A federated SQL query engine in Rust that runs queries across heterogeneous data
-sources (PostgreSQL, DuckDB, ClickHouse, MySQL, Parquet), pushing work down to
-each source and joining across them. On top of the engine sits a materialized
-event-analytics layer (Mixpanel/Amplitude-class: funnels, retention/cohorts,
-segmentation, flows/paths) and a dynamic catalog for adding sources at runtime.
+Federated Query Engine is a Rust SQL engine that queries heterogeneous data
+sources and combines the results over Apache Arrow. It supports PostgreSQL,
+DuckDB, ClickHouse, MySQL, and Parquet sources, with pushdown and federated
+execution across sources.
 
-Three front doors over one runtime: a Python extension (`fedq`), a PostgreSQL
-wire-protocol server (`fedq-server`), and a CLI (`fedq`).
+The engine has three front doors over one runtime:
 
-## Quick start (build and run locally)
+- fedq-server: a PostgreSQL wire-protocol server for psql and other
+  PostgreSQL clients.
+- fedq: a command-line client with one-shot and interactive modes.
+- fedq-py: a Python extension used by the Python integration and benchmark
+  harnesses.
 
-Prerequisites: a Rust toolchain (`cargo`), `curl` + `unzip` (to fetch the
-prebuilt DuckDB library), and a working `python3` - the `fedq-py` extension is
-built via pyo3. If a stale `VIRTUAL_ENV` points at a missing interpreter,
-`make build` stops with a clear error and the fix (set `PYO3_PYTHON` or activate
-a real venv) before compiling.
+## Quick start
 
-```
-# Build the whole workspace in ONE command. The first run downloads the
-# prebuilt libduckdb the engine links against (matching Cargo.lock, into
-# .duckdb-lib/ - DuckDB is never compiled inside cargo); after that it just
-# compiles. Needs internet access on the first run.
-make build            # release build
-# or:  make dev-build  # faster debug build
+Prerequisites are a Rust toolchain, Python 3, and curl plus unzip for the
+prebuilt DuckDB library. A PostgreSQL client such as psql is useful for the
+server example.
 
-# Run the PostgreSQL-wire server over a config (no static sources needed -
-# add them at runtime with the dynamic catalog).
-printf 'datasources: {}\n' > fedq.yaml
-target/release/fedq-server --config fedq.yaml --listen 127.0.0.1:5433
+Build the workspace from the repository root:
 
-# Connect with any PostgreSQL client and query.
-psql "host=127.0.0.1 port=5433 user=me dbname=fedq"
-```
+~~~bash
+make venv
+make build
+~~~
 
-(`make build` runs `make setup` for you; run `make setup` alone if you only
-want to fetch libduckdb without compiling.)
+make build prepares the pinned DuckDB library and builds the release
+artifacts. It does not compile DuckDB inside Cargo.
 
-Then, in the psql session, register a source and run analytics:
+Start a server with an empty bootstrap catalog:
 
-```sql
-CREATE DATASOURCE ev TYPE parquet WITH (dir = '/path/to/your/parquet_dir');
-CREATE EVENT DATASET web FROM ev.main.events
-  ACTOR user_id TIME ts EVENT event_name PROPERTIES (device, country);
-FUNNEL ('page_view', 'view_item', 'add_to_cart') ON web WINDOW 7 DAY;
-```
+~~~bash
+mkdir -p run
+printf 'datasources: {}\n' > run/fedq.yaml
+target/release/fedq-server --config run/fedq.yaml --listen 127.0.0.1:5433
+~~~
 
-A full walkthrough (funnels, retention, segmentation, paths, refresh, auth) is
-in `doc/event-analytics-tutorial.md`.
+Connect with any PostgreSQL client:
 
-The CLI runs one statement without a server:
-`target/release/fedq --config fedq.yaml --command "SHOW DATASOURCES"`.
+~~~bash
+psql "host=127.0.0.1 port=5433 user=analyst dbname=fedq"
+~~~
 
-## Features
+With no server.users section, the server uses trust authentication. See
+crates/fedq-server/README.md for SCRAM configuration and credential
+generation.
 
-- **Multi-source federation**: query across PostgreSQL, DuckDB, ClickHouse,
-  MySQL, and Parquet, with same-source subtrees pushed down as one remote query.
-- **Pushdown optimization**: predicate, projection, aggregate, order-by, limit,
-  and same-source joins/set-ops pushed to the source.
-- **Decorrelation**: correlated subqueries (EXISTS/IN/ANY/ALL/scalar) rewritten
-  to joins with exact three-valued NULL semantics.
-- **Dynamic catalog**: `CREATE / DROP / SHOW DATASOURCE` at runtime; the config
-  is just bootstrap.
-- **Event analytics**: materialized event datasets with funnel, retention,
-  segmentation, and path analyses (see `crates/fq-events/README.md`).
-- **Materialized views**, **users/ACLs (SCRAM)**, and native **EXPLAIN**.
-- **Fail-fast**: errors surface; invalid queries raise instead of returning
-  wrong rows.
+## Add sources at runtime
 
-## Architecture
+The YAML file can be empty. Sources can be registered, inspected, queried, and
+removed while the server is running:
 
-The engine follows a classic database architecture with several optimization phases:
+~~~sql
+CREATE DATASOURCE events TYPE parquet
+  WITH (dir = '/data/events');
 
-```
-SQL Query
-```
+SHOW DATASOURCES;
+SHOW TABLES FROM events;
 
-## Project Structure
+SELECT user_id, event_name, ts
+FROM events.main.events
+ORDER BY ts
+LIMIT 20;
 
-The engine is a Rust workspace under `crates/`. Each crate is one stage of the
-pipeline or one front door; the leaf crate `fq-common` holds shared config and
-errors and everything else depends on it.
+DROP DATASOURCE events;
+~~~
 
-```
-federated-query/
-  crates/                   # Rust workspace
-    fq-common/              # Shared config, errors, and core types (leaf crate)
-    fq-parse/               # SQL text -> LogicalPlan
-    fq-bind/                # Name resolution and typing over a LogicalPlan
-    fq-catalog/             # Metadata model and datasource registry
-    fq-plan/                # Node model: expression, logical, and physical nodes
-    fq-optimize/            # Logical optimizer: rewrite rules and join ordering
-    fq-decorrelate/         # Rewrites correlated subquery expressions into joins
-    fq-physical/            # Optimized LogicalPlan -> PhysicalPlan
-    fq-emit/                # Expr + clause nodes -> canonical Postgres-form SQL
-    fq-connectors/          # PostgreSQL, DuckDB, ClickHouse, MySQL, Parquet
-    fq-exec/                # Federated execution engine
-    fq-runtime/             # Config-driven execute(sql) orchestration
-    fq-events/              # Materialized event-analytics store and analyses
-    fq-accel/               # Materialized-view store
-    fq-scram/               # SCRAM-SHA-256 auth (verifier + server proof)
-    fedq/                   # CLI front end
-    fedq-server/            # PostgreSQL wire-protocol server
-    fedq-py/                # Python extension module (pyo3)
-  benchmarks/               # TPC-H, TPC-DS, events, perf_compare, plan_compare
-  config/                   # Example configuration (example_config.yaml)
-  doc/                      # Tutorials and design notes
-  docker/                   # Docker configuration for test databases
-  example/                  # Standalone usage examples
-  fuzz/                     # Fuzz targets
-  scripts/                  # Setup and dev scripts (libduckdb fetch, hooks, pg)
-  tools/                    # fq-lint (workspace lint rules)
-  tests/                    # End-to-end suites (federated, pushdown, events, ...)
-  Cargo.toml                # Workspace manifest
-  Makefile                  # build / setup / test entry points
-```
+CREATE DATASOURCE connects to the source and loads its metadata before the
+source is installed. A failed connection or metadata load raises and does not
+leave a partial catalog entry. Dynamic sources are persisted with the engine
+state associated with the config path and are restored when the server starts
+again. Bootstrap sources declared in YAML remain managed by the config file
+and cannot be dropped with SQL.
 
-## Installation
+The supported source kinds are postgres, postgresql, duckdb, clickhouse,
+mysql, and parquet. Connection parameters are validated for the selected
+source kind. See the event analytics tutorial for complete PostgreSQL and
+Parquet examples:
+doc/event-analytics-tutorial.md.
 
-```bash
-# Clone the repository
-git clone <repository-url>
-cd federated-query
+## Query features
 
-# Install dependencies
-pip install -r requirements.txt
+- Federated queries across multiple sources.
+- Predicate, projection, aggregate, ordering, limit, and same-source join
+  pushdown.
+- Hash and nested-loop joins, join ordering, dynamic filters, and semi-join
+  reductions.
+- Correlated subquery decorrelation with NULL-aware semantics.
+- Materialized views with explicit refresh and query substitution.
+- Event datasets with funnel, retention, segmentation, and path analyses.
+- EXPLAIN, catalog inspection, and runtime settings.
+- Fail-fast validation: invalid SQL, unknown tables, and unknown columns raise
+  errors instead of producing rows.
 
-# Install in development mode
-pip install -e .
-```
+Example federated query:
+
+~~~sql
+SELECT o.id, c.name, o.amount
+FROM postgres_prod.public.orders AS o
+JOIN local_duckdb.main.customers AS c ON o.customer_id = c.id
+WHERE o.amount > 1000;
+~~~
+
+For event analytics, start with:
+
+~~~sql
+CREATE EVENT DATASET web FROM events.main.events
+  ACTOR user_id TIME ts EVENT event_name
+  PROPERTIES (device, country);
+
+FUNNEL ('page_view', 'view_item', 'add_to_cart')
+  ON web WINDOW 7 DAY;
+~~~
+
+## CLI
+
+The CLI uses the same YAML config and runtime as the server:
+
+~~~bash
+# Run one statement.
+target/release/fedq --config run/fedq.yaml \
+  --command "SHOW DATASOURCES"
+
+# Run a SQL file as one statement.
+target/release/fedq --config run/fedq.yaml --file report.sql
+
+# Start the interactive shell.
+target/release/fedq --config run/fedq.yaml
+~~~
+
+Use --format table, --format csv, or --format json for one-shot output.
+Statements in the interactive shell end with a semicolon; \q exits and
+\timing toggles elapsed-time output. The full option reference is in
+crates/fedq/README.md.
 
 ## Configuration
 
-Create a YAML configuration file defining your data sources:
+The YAML config bootstraps data sources and runtime settings. A minimal config
+for runtime registration is:
 
-```yaml
+~~~yaml
+datasources: {}
+~~~
+
+Static sources can instead be declared under datasources:
+
+~~~yaml
 datasources:
-  postgres_prod:
+  warehouse:
     type: postgresql
     host: localhost
     port: 5432
     database: analytics
-    user: postgres
-    password: postgres
+    user: analyst
+    password: change-me
     schemas: [public]
-    capabilities: [aggregations, joins, window_functions]
 
-  local_duckdb:
+  local:
     type: duckdb
     path: /data/analytics.duckdb
-    read_only: true
-    capabilities: [aggregations, joins]
+~~~
 
-optimizer:
-  enable_predicate_pushdown: true
-  enable_join_reordering: true
+The complete example is in config/example_config.yaml. Unknown config fields
+are rejected. Secrets shown in examples should be replaced with real
+credentials and should not be committed.
 
-executor:
-  max_memory_mb: 2048
-  batch_size: 10000
-```
+## Architecture
 
-See `config/example_config.yaml` for a complete example.
+The workspace is organized as focused Rust crates:
 
-## Usage
+~~~text
+SQL text
+  -> fq-parse       parse and classify statements
+  -> fq-bind        resolve names and types
+  -> fq-decorrelate rewrite subqueries into joins
+  -> fq-optimize    optimize and estimate from metadata
+  -> fq-physical    choose execution and pushdown steps
+  -> fq-exec        execute source reads and coordinator work
+  -> Arrow results
+~~~
 
-```python
-from federated_query.config import load_config
-from federated_query.catalog import Catalog
-from federated_query.parser import Parser, Binder
-from federated_query.optimizer import RuleBasedOptimizer
-from federated_query.executor import Executor
+fq-runtime orchestrates the pipeline and owns statement dispatch, the live
+catalog, persisted dynamic sources, materialized views, event datasets,
+settings, and planning-budget enforcement. The connectors separate source
+metadata and statistics from the execution data plane.
 
-# Load configuration
-config = load_config("config.yaml")
+See README-architecture.md for crate boundaries, expression semantics,
+planning constraints, and storage details.
 
-# Initialize catalog
-catalog = Catalog()
-# ... register data sources and load metadata ...
+## Repository layout
 
-# Parse and execute query
-parser = Parser()
-binder = Binder(catalog)
-optimizer = RuleBasedOptimizer(catalog)
-executor = Executor(config.executor)
+~~~text
+crates/fq-parse/          SQL parsing and statement classification
+crates/fq-bind/           Binding and type resolution
+crates/fq-catalog/        Catalog and metadata model
+crates/fq-optimize/       Logical optimization and cost estimation
+crates/fq-physical/       Physical planning and pushdown
+crates/fq-exec/           Federated execution
+crates/fq-runtime/        Runtime orchestration and statement dispatch
+crates/fq-events/         Event dataset storage and analytics
+crates/fq-accel/          Materialized-view storage
+crates/fedq-server/       PostgreSQL wire-protocol server
+crates/fedq/              CLI
+crates/fedq-py/           Python extension
+tests/                    End-to-end suites
+doc/                      Tutorials and design documentation
+~~~
 
-sql = """
-    SELECT o.id, c.name, o.amount
-    FROM postgres_prod.public.orders o
-    JOIN local_duckdb.main.customers c ON o.customer_id = c.id
-    WHERE o.amount > 1000
-"""
+## Development
 
-logical_plan = parser.parse_to_logical_plan(sql, catalog)
-bound_plan = binder.bind(logical_plan)
-optimized_plan = optimizer.optimize(bound_plan)
-# ... generate physical plan ...
-results = executor.execute_to_table(physical_plan)
+The repository has one complete test command:
 
-print(results)
-```
+~~~bash
+./run_all_tests.sh
+~~~
 
-### Explain Plans
+It runs the preflight checks, linters, Rust tests, Python tests, and end-to-end
+tests. The complete output is written to run_all_tests.log.
 
-Use `EXPLAIN` to inspect how a query will run without touching the underlying data sources:
+Useful build commands are:
 
-```sql
-EXPLAIN SELECT id, name FROM duckdb.main.users WHERE age > 30;
-```
-
-
-### Interactive CLI (`fedq`)
-
-Install the package in editable mode to expose the `fedq` console script:
-
-```bash
-pip install -e .
-fedq  # starts an interactive shell
-```
-
-By default the CLI starts an in-memory DuckDB data source populated with a `demo_users` table so you can experiment immediately:
-
-```
-fedq> SELECT * FROM duckdb_mem.main.demo_users WHERE age > 30;
-```
-
-Pass `--config path/to/config.yaml` to point the CLI at your own catalog configuration. The shell accepts multi-line statements terminated by `;` and supports `\q` to exit.
-
-## Development Status
-
-This project is under active development. The roadmap lives in taskq,
-project `federated-query`.
-
-### Completed Phases
-
-**Phase 0: Foundation** (done)
-- Project structure and skeleton
-- Core abstractions (plans, expressions, data sources)
-- Configuration system
-- Basic catalog structure
-- Data source connectors (PostgreSQL, DuckDB)
-- Test infrastructure
-
-**Phase 1: Basic Query Execution** (done)
-- Parser: AST to logical plan conversion
-- Binder: Reference resolution with catalog integration
-- Physical operators: Scan, Filter, Projection, Limit
-- Basic executor: Single-table queries
-- End-to-end pipeline for simple SELECT queries
-
-**Query Example (Phase 1):**
-```sql
-SELECT col1, col2 FROM datasource.schema.table WHERE col1 > 10 LIMIT 100
-```
-
-**Phase 2: Joins and Multi-Table Queries** (done)
-- Logical Join plan node with all join types
-- Physical HashJoin implementation
-- Physical NestedLoopJoin implementation
-- Parser support for JOIN clauses
-- Binder support for multi-table column resolution
-- Physical planner join strategy selection
-- All 70 tests passing (including 5 join tests)
-- Federated join example working (DuckDB + PostgreSQL)
-
-**Query Example (Phase 2):**
-```sql
-SELECT c.name, o.order_id, o.amount
-FROM duckdb.customers c
-JOIN postgres.orders o ON c.id = o.customer_id
-WHERE o.amount > 1000
-```
-
-**Phase 3: Aggregations and Grouping** (done)
-- Aggregations and grouping
-- GROUP BY clause support (single and multiple columns)
-- Aggregate functions (COUNT, SUM, AVG, MIN, MAX)
-- HAVING clause support with expression rewriting
-- Global aggregations (without GROUP BY)
-- Federated aggregations across data sources
-
-**Query Example (Phase 3):**
-```sql
-SELECT c.name, COUNT(*) as order_count, SUM(o.amount) as total_spent
-FROM duckdb.customers c
-JOIN postgres.orders o ON c.id = o.customer_id
-GROUP BY c.name
-HAVING SUM(o.amount) > 2000
-```
-
-**Phase 7: Subquery Decorrelation** (done)
-- ANY / SOME / ALL quantified comparisons (incl. LIKE ALL)
-  runtime cardinality guards, per-key limits for correlated LIMIT
-- Boolean subqueries in SELECT lists (flag columns via SEMI/ANTI unions)
-- OR-of-subqueries via union expansion; nested subqueries innermost-first
-- Derived tables and subqueries in INNER join conditions
-- Scoped subquery binding (correlated references resolved by the binder)
-- All 116 decorrelation e2e tests passing against PostgreSQL
-
-**Query Example (Phase 7):**
-```sql
-SELECT u.id, u.name,
-       (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) AS order_count
-FROM users u
-WHERE u.country IN (SELECT code FROM countries WHERE enabled)
-  AND EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.amount > 100)
-```
-
-**Phase 7 Review + Phase 8 (in progress)**
-- Native `EXPLAIN (FORMAT ...)` via a custom sqlglot dialect (no more
-  Command-string fallback)
-- Operator/cast correctness: `||`/`CONCAT`/`ILIKE`/`CAST`, string escaping,
-  typed literals, OFFSET-without-LIMIT, NULL-aware comparisons
-- Decorrelation correctness fixes (self-join aliasing, `NOT (subquery)`
-  three-valued logic, EXISTS-over-global-aggregate, OR-expansion multiplicity,
-  COUNT(DISTINCT), hash-join key orientation)
-- Many pre-existing silent-fail / correctness fixes (DuckDB typed schemas,
-  remote-join side filters, predicate-pushdown recursion, WHERE/HAVING split,
-  NULLS FIRST/LAST, MIN/MAX type preservation)
-  bind, single-source pushdown, and local multiset execution
-- In progress (tracked in `TODO-phase7-review.md`, section G): broader
-  same-source join pushdown (G1), computed-projection pushdown (G2), CTEs (G3),
-  `CAST` target types (G5), date/time functions (G6), aggregate `FILTER` (G7)
-
-### Known Limitations
-  no dynamic filtering / semi-join reduction yet, so the probe side ships its
-  entire table over the network. This is the top usability gap, tracked as
-  **G9** in `TODO-phase7-review.md`.
-- A comma/cross join with a two-sided equality in `WHERE` currently plans to a
-  nested-loop (Cartesian) join + filter rather than a hash join (G9a).
-
-### Next Phases
-- **Phase 8**: Pushdown breadth (joins, projections), CTEs, date/time, and
-  cross-source dynamic filtering (semi-join reduction)
-- **Phase 9**: Parallel execution and memory management
-- **Phase 10**: Window functions and remaining advanced SQL
-
-## Testing
-
-```bash
-# Run all tests
-pytest
-
-# Run with coverage
-pytest --cov=federated_query
-
-# Run specific test file
-pytest tests/test_parser.py
-```
-
-## Documentation
-
-- **[README-architecture.md](README-architecture.md)**: Detailed architecture and design decisions
-
-## Key Design Principles
-
-1. **Immutable Plans**: All plan nodes are immutable for easier reasoning and thread safety
-2. **Push-Down First**: Always try to push computation to data sources to minimize data transfer
-3. **Arrow-Based**: Use Apache Arrow for efficient columnar data representation
-4. **Cost-Based**: Use statistics and cost models to choose optimal execution strategies
-5. **Extensible**: Easy to add new data sources, optimization rules, and operators
-
-## Performance Considerations
-
-Implemented today:
-- **Predicate Pushdown**: Filters are pushed to data sources whenever possible
-- **Projection Pushdown**: Only required columns are fetched from sources
-- **Same-Source Pushdown**: Single-source joins and set operations are sent to the source as one remote query
-- **Join Strategy Selection**: Chooses between hash and nested-loop joins (remote join when both sides share a source)
-
-Not yet implemented (roadmap):
-
-## Contributing
-
-Contributions are welcome. The roadmap lives in taskq, project
-`federated-query`; open tasks there name the areas that need work.
+~~~bash
+make setup       # fetch the pinned prebuilt DuckDB library
+make dev-build   # debug build
+make build       # release build
+make hook-install
+~~~
 
 ## License
 
 MIT License
+
 
 ## References
 
@@ -386,9 +239,4 @@ MIT License
 - "Volcano - An Extensible and Parallel Query Evaluation System" (Graefe, 1994)
 - "The Cascades Framework for Query Optimization" (Graefe, 1995)
 - "Unnesting Arbitrary Queries" (Neumann & Kemper, 2015)
-
-### Systems
-- PostgreSQL query planner
-- Apache Calcite (federated query framework)
-- DuckDB optimizer
-- Presto/Trino distributed query engine
+-

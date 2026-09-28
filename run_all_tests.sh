@@ -8,7 +8,7 @@
 # loud - the first failure stops the run and names itself.
 #
 # Prerequisites, each checked and reported rather than assumed:
-#   - ./venv           the one virtualenv (make venv)
+#   - active virtualenv with the test dependencies (make install)
 #   - .duckdb-lib      the prebuilt libduckdb the workspace links (make duckdb-lib)
 #   - PostgreSQL       started here if it is not already accepting connections
 #   - .test-harness    the datasources the tests read (./build_test_harness.sh)
@@ -44,10 +44,8 @@ RUN_LOG="${ROOT}/run_all_tests.log"
 exec > >(tee "${RUN_LOG}") 2>&1
 echo "full output of this run: ${RUN_LOG}"
 
-VENV="${ROOT}/venv"
+VENV="${VIRTUAL_ENV:-}"
 PYTHON="${VENV}/bin/python3"
-PG_ISREADY="${ROOT}/postgres-17/bin/pg_isready"
-PGPORT="${PGPORT:-5432}"
 
 STAGE_NUMBER=0
 
@@ -65,11 +63,16 @@ report_failure() {
 }
 trap report_failure ERR
 
-# Fail with the fix command when the one virtualenv is missing or incomplete.
+# Fail with the fix command when the selected virtualenv is missing or incomplete.
 require_venv() {
+    if [ -z "${VENV}" ]; then
+        echo "ERROR: no active Python virtualenv" >&2
+        echo "  fix: activate a virtualenv before running ./run_all_tests.sh" >&2
+        exit 1
+    fi
     if [ ! -x "${PYTHON}" ]; then
-        echo "ERROR: no virtualenv at ${VENV}" >&2
-        echo "  fix: make venv" >&2
+        echo "ERROR: no interpreter at ${PYTHON}" >&2
+        echo "  fix: activate the virtualenv containing this interpreter" >&2
         exit 1
     fi
     if ! "${PYTHON}" -c "import pytest, pyarrow, sqlglot, flake8" 2>/dev/null; then
@@ -79,20 +82,10 @@ require_venv() {
     fi
 }
 
-# Start PostgreSQL unless it is already accepting connections. The suite requires
-# it: there is no toggle that runs the tests without it.
+# Start the repository PostgreSQL server and export its selected port.
 require_postgres() {
-    if [ ! -x "${PG_ISREADY}" ]; then
-        echo "ERROR: PostgreSQL binaries not found in ${ROOT}/postgres-17" >&2
-        echo "  fix: make download_postgres" >&2
-        exit 1
-    fi
-    if "${PG_ISREADY}" -h localhost -p "${PGPORT}" >/dev/null 2>&1; then
-        echo "PostgreSQL already accepting connections on port ${PGPORT}"
-        return
-    fi
-    echo "PostgreSQL is not running; starting it"
-    make pg-start
+    source "${ROOT}/scripts/test-postgres-env.sh"
+    ensure_test_postgres "${ROOT}"
 }
 
 announce "Preflight: virtualenv, libduckdb, PostgreSQL"

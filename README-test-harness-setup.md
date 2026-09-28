@@ -35,19 +35,22 @@ make pg-start                   # or: ./scripts/run-postgres.sh
 make pg-stop                    # or: ./scripts/stop-postgres.sh
 ```
 
-`run-postgres.sh` starts the server detached via `pg_ctl`, waits until it accepts
-connections, and creates the `test_db` database. Server logs go to
-`./postgres-server.log`.
+`run-postgres.sh` starts the bundled server on an available local port, waits
+until it accepts connections, and creates the `test_db` database. It leaves any
+other PostgreSQL server alone and records its port in
+`.fedq-test-postgres-port`. Test commands read that port automatically. Server
+logs go to `./postgres-server.log`.
 
 ### Defaults and overrides
 
-The scripts and the test fixtures share the same defaults, which also match the
-CI workflow, so a fresh `make pg-start` needs no configuration:
+The local scripts and test fixtures share the selected port. If `PGPORT` is
+unset, `make pg-start` asks the operating system for an available port. The CI
+service uses its configured port 5432:
 
 | Setting  | Default     | Env override        |
 |----------|-------------|---------------------|
 | host     | `localhost` | `POSTGRES_HOST`     |
-| port     | `5432`      | `PGPORT` (scripts) / `POSTGRES_PORT` (tests) |
+| port     | available local port | `PGPORT` (scripts) / `POSTGRES_PORT` (tests) |
 | database | `test_db`   | `PGDATABASE` / `POSTGRES_DB` |
 | user     | `postgres`  | `PGUSER` / `POSTGRES_USER` |
 | password | `postgres`  | `PGPASSWORD` / `POSTGRES_PASSWORD` |

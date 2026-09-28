@@ -26,8 +26,9 @@ worktree's config copy so only the main one applies.
        ./scripts/warm-worktree-agent.sh <worktree-path>
 
    This hardlink-copies `target/`, deletes the worktree's checked-out
-   `.cargo/config.toml`, symlinks `.duckdb-lib`, and creates `./venv`. After
-   this, `cargo build --release` in the worktree compiles only the ~17
+   `.cargo/config.toml`, symlinks `.duckdb-lib`, and requires the caller's
+   active virtualenv. Activate that environment before warming the worktree.
+   After this, `cargo build --release` in the worktree compiles only the ~17
    workspace crates (measured: 1m34s, zero registry recompiles).
 
 3. The agent prompt MUST include these worktree-state warnings:

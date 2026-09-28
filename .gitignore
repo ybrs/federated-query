@@ -103,6 +103,7 @@ vendor/
 # The datasources the e2e suite reads, created by build_test_harness.sh. It is
 # generated data, rebuilt in seconds from the corpus, and large.
 .test-harness/
+.fedq-test-postgres-port
 
 # Output of run_isolated_tests.sh: one JSON line per variation.
 isolated-results*.jsonl

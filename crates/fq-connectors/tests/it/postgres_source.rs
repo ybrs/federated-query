@@ -2,10 +2,9 @@
 //! `tests/test_statistics_layer.py` plus the pg uuid `map_native_type` override
 //! (from `tests/test_catalog.py`).
 //!
-//! Runs against a live Postgres (the harness starts one on :5432). Each test owns
+//! Runs against the repository test Postgres selected by `PGPORT`. Each test owns
 //! a uniquely-named schema, dropped on `Drop`, so parallel tests never collide.
-//! If Postgres is unreachable the tests early-return (a no-op pass) rather than
-//! fail, so the suite still runs in a pg-less environment.
+//! If Postgres is unreachable, fixture construction fails the test.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -15,14 +14,16 @@ use fq_connectors::PostgresSource;
 
 /// The connection string (override with FQ_TEST_PG_URL); trust auth, no password.
 fn conn_str() -> String {
-    std::env::var("FQ_TEST_PG_URL")
-        .unwrap_or_else(|_| "host=localhost port=5432 user=postgres dbname=postgres".to_string())
+    std::env::var("FQ_TEST_PG_URL").unwrap_or_else(|_| {
+        let port = std::env::var("PGPORT").expect("PGPORT must select test PostgreSQL");
+        format!("host=localhost port={port} user=postgres dbname=postgres")
+    })
 }
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// A live-Postgres test fixture: a uniquely-named schema seeded with DDL, dropped
-/// (CASCADE) on `Drop`. `None` when Postgres is unreachable.
+/// (CASCADE) on `Drop`.
 struct PgFixture {
     source: PostgresSource,
     schema: String,
@@ -30,33 +31,38 @@ struct PgFixture {
 
 impl PgFixture {
     /// Connect, create a unique schema, run `ddl` (with `{s}` replaced by the
-    /// schema name), and return the fixture - or None if pg is unreachable.
-    fn new(ddl: &str) -> Option<Self> {
+    /// schema name), and return the fixture.
+    fn new(ddl: &str) -> Self {
         let schema = format!(
             "fq_test_{}_{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         );
-        let source = PostgresSource::connect("pg", &conn_str(), vec![schema.clone()]).ok()?;
+        let source = PostgresSource::connect("pg", &conn_str(), vec![schema.clone()])
+            .expect("connect to test PostgreSQL");
         source
             .execute(&format!("CREATE SCHEMA \"{schema}\""))
-            .ok()?;
-        source.execute(&ddl.replace("{s}", &schema)).ok()?;
-        Some(Self { source, schema })
+            .expect("create test schema");
+        source
+            .execute(&ddl.replace("{s}", &schema))
+            .expect("create PostgreSQL fixture");
+        Self { source, schema }
     }
 }
 
 impl Drop for PgFixture {
     fn drop(&mut self) {
-        let _ = self.source.execute(&format!(
-            "DROP SCHEMA IF EXISTS \"{}\" CASCADE",
-            self.schema
-        ));
+        self.source
+            .execute(&format!(
+                "DROP SCHEMA IF EXISTS \"{}\" CASCADE",
+                self.schema
+            ))
+            .expect("drop test schema");
     }
 }
 
 /// The people table, analyzed (3 distinct ids, a uuid column, no nulls).
-fn people_fixture() -> Option<PgFixture> {
+fn people_fixture() -> PgFixture {
     PgFixture::new(
         "CREATE TABLE {s}.people (id integer PRIMARY KEY, name varchar, \
              uid uuid, score double precision);
@@ -70,10 +76,7 @@ fn people_fixture() -> Option<PgFixture> {
 
 #[test]
 fn test_render_dialect_and_list_tables() {
-    let Some(fixture) = people_fixture() else {
-        eprintln!("postgres unreachable; skipping");
-        return;
-    };
+    let fixture = people_fixture();
     assert_eq!(fixture.source.render_dialect(), RenderDialect::Postgres);
     assert_eq!(
         fixture.source.list_tables(&fixture.schema).unwrap(),
@@ -88,10 +91,7 @@ fn test_render_dialect_and_list_tables() {
 
 #[test]
 fn test_metadata_and_uuid_type_mapping() {
-    let Some(fixture) = people_fixture() else {
-        eprintln!("postgres unreachable; skipping");
-        return;
-    };
+    let fixture = people_fixture();
     let metadata = fixture
         .source
         .get_table_metadata(&fixture.schema, "people")
@@ -118,10 +118,7 @@ fn test_metadata_and_uuid_type_mapping() {
 
 #[test]
 fn test_uuid_override_and_default_fallback() {
-    let Some(fixture) = people_fixture() else {
-        eprintln!("postgres unreachable; skipping");
-        return;
-    };
+    let fixture = people_fixture();
     // The override maps uuid to VARCHAR; the generic names fall through to the
     // shared default mapper.
     assert_eq!(
@@ -136,10 +133,7 @@ fn test_uuid_override_and_default_fallback() {
 
 #[test]
 fn test_statistics_from_pg_catalog_when_analyzed() {
-    let Some(fixture) = people_fixture() else {
-        eprintln!("postgres unreachable; skipping");
-        return;
-    };
+    let fixture = people_fixture();
     let stats = fixture
         .source
         .get_table_statistics(&fixture.schema, "people", &["id".to_string()])
@@ -157,10 +151,7 @@ fn test_statistics_from_pg_catalog_when_analyzed() {
 
 #[test]
 fn test_estimate_scan_rows_on_analyzed_table() {
-    let Some(fixture) = people_fixture() else {
-        eprintln!("postgres unreachable; skipping");
-        return;
-    };
+    let fixture = people_fixture();
     let sql = format!(
         "SELECT * FROM \"{}\".\"people\" WHERE id > 1",
         fixture.schema
@@ -177,13 +168,10 @@ fn test_estimate_scan_rows_on_analyzed_table() {
 fn test_probe_measures_statless_table() {
     // A table forced statless (reltuples = -1) is PROBED: an exact aggregate scan
     // measures the true row count rather than reporting unknown.
-    let Some(fixture) = PgFixture::new(
+    let fixture = PgFixture::new(
         "CREATE TABLE {s}.cold (id integer, grp varchar);
          INSERT INTO {s}.cold VALUES (1,'a'),(2,'a'),(3,'b'),(4,'b'),(5,'b');",
-    ) else {
-        eprintln!("postgres unreachable; skipping");
-        return;
-    };
+    );
     // Force the never-analyzed state (defend against autovacuum having run).
     fixture
         .source
@@ -206,10 +194,7 @@ fn test_probe_measures_statless_table() {
 
 #[test]
 fn test_source_token_is_stable_and_moves_on_a_rewrite() {
-    let Some(fixture) = people_fixture() else {
-        eprintln!("postgres unreachable; skipping");
-        return;
-    };
+    let fixture = people_fixture();
     let first = fixture
         .source
         .source_token(&fixture.schema, "people")
@@ -252,9 +237,7 @@ fn test_source_token_is_stable_and_moves_on_a_rewrite() {
 /// driver's generic "db error" Display.
 #[test]
 fn db_error_surfaces_message_and_sqlstate() {
-    let Some(fixture) = PgFixture::new("") else {
-        return;
-    };
+    let fixture = PgFixture::new("");
     let error = fixture
         .source
         .execute(&format!(
@@ -272,12 +255,10 @@ fn db_error_surfaces_message_and_sqlstate() {
 /// returns the exact distinct count (booleans compare for equality).
 #[test]
 fn probe_handles_boolean_column() {
-    let Some(fixture) = PgFixture::new(
+    let fixture = PgFixture::new(
         "CREATE TABLE {s}.flags (id int, active boolean); \
          INSERT INTO {s}.flags VALUES (1, true), (2, false), (3, true)",
-    ) else {
-        return;
-    };
+    );
     let stats = fixture
         .source
         .get_table_statistics(

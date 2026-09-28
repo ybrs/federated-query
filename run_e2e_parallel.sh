@@ -38,17 +38,25 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${ROOT}"
 
-PYTHON="${ROOT}/venv/bin/python3"
+VENV="${VIRTUAL_ENV:-}"
+PYTHON="${VENV}/bin/python3"
 HARNESS="${ROOT}/.test-harness"
 CLONES="${ROOT}/.test-harness-parallel"
 LOGS="${ROOT}/run-e2e-logs"
 
-if [ ! -x "${PYTHON}" ]; then
-    echo "ERROR: no virtualenv at ${ROOT}/venv (fix: make venv)" >&2
+if [ -z "${VENV}" ]; then
+    echo "The end-to-end tests need an active Python virtual environment." >&2
+    echo "Activate it before committing." >&2
     exit 1
 fi
+if [ ! -x "${PYTHON}" ]; then
+    echo "The active Python virtual environment has no interpreter at ${PYTHON}." >&2
+    exit 1
+fi
+source "${ROOT}/scripts/test-postgres-env.sh"
+ensure_test_postgres "${ROOT}"
 if [ ! -f "${HARNESS}/config.yaml" ]; then
-    echo "ERROR: no harness at ${HARNESS} (fix: ./build_test_harness.sh)" >&2
+    echo "The test harness is missing at ${HARNESS}. Run ./build_test_harness.sh." >&2
     exit 1
 fi
 
@@ -61,12 +69,14 @@ mkdir -p "${CLONES}" "${LOGS}"
 clone_harness() {
     local name="$1"
     local root="${CLONES}/${name}"
+    printf '[e2e] preparing harness clone: %s\n' "${name}" >&2
     mkdir -p "${root}"
     cp --reflink=auto -r "${HARNESS}/duck" "${root}/duck"
     cp --reflink=auto -r "${HARNESS}/parquet" "${root}/parquet"
     sed -e "s#${HARNESS}/duck#${root}/duck#g" \
         -e "s#${HARNESS}/parquet#${root}/parquet#g" \
         "${HARNESS}/config.yaml" > "${root}/config.yaml"
+    printf '[e2e] harness clone ready: %s\n' "${name}" >&2
     echo "${root}"
 }
 
@@ -79,10 +89,34 @@ run_split() {
     root="$(clone_harness "${name}")"
     local -a args=("${target}" -q --tb=short -x)
     [ -n "${filter}" ] && args+=(-k "${filter}")
+    printf '[e2e] starting %s: %s\n' "${name}" "${target}"
     FEDQ_HARNESS_ROOT="${root}" FEDQ_SHARD="${shard}" FEDQ_SHARDS="${shards}" \
         FEDQ_PROGRESS_LOG="${LOGS}/${name}.progress" \
         "${PYTHON}" -m pytest "${args[@]}" > "${LOGS}/${name}.log" 2>&1
-    echo "$?" > "${LOGS}/${name}.exit"
+    local exit_code="$?"
+    echo "${exit_code}" > "${LOGS}/${name}.exit"
+    printf '[e2e] finished %s with exit code %s\n' "${name}" "${exit_code}"
+}
+
+# Print each worker's latest progress when its progress file changes.
+report_progress() {
+    local progress_file="$1"
+    local worker_name="$2"
+    local progress
+    progress="$(cat "${progress_file}")"
+    printf '[e2e] %s: %s\n' "${worker_name}" "${progress}"
+}
+
+# Show the end of a failed process log in the commit output.
+show_failure_log() {
+    local name="$1"
+    local log_file="${LOGS}/${name}.log"
+    if [ -f "${log_file}" ]; then
+        printf 'Output from test process %s (final 80 lines):\n\n' "${name}"
+        tail -n 80 "${log_file}"
+    else
+        printf 'Test process %s did not create a log file: %s\n' "${name}" "${log_file}"
+    fi
 }
 
 STARTED=$(date +%s)
@@ -96,6 +130,7 @@ ABORT=""
 # How many splits the suite is divided into. The tally below refuses a run that
 # launched fewer, so a split dropped from the list cannot pass as a whole run.
 EXPECTED_SPLITS=15
+echo "[e2e] preparing ${EXPECTED_SPLITS} full-suite workers; logs: ${LOGS}"
 
 # The names of the splits this run actually started, in launch order. The tally
 # is checked against this list rather than against the exit files that happen to
@@ -160,7 +195,18 @@ launch rest tests/ \
 # -x so it stops at its own first failure, and the moment any process exits
 # non-zero the rest are killed. A green run is unaffected - every test still runs.
 FAILED_FIRST="${ABORT}"
+declare -A REPORTED_PROGRESS=()
+LAST_HEARTBEAT="${STARTED}"
 while :; do
+    for progress_file in "${LOGS}"/*.progress; do
+        [ -f "${progress_file}" ] || continue
+        worker_name="$(basename "${progress_file}" .progress)"
+        progress="$(cat "${progress_file}")"
+        if [ "${REPORTED_PROGRESS[${worker_name}]-}" != "${progress}" ]; then
+            REPORTED_PROGRESS["${worker_name}"]="${progress}"
+            report_progress "${progress_file}" "${worker_name}"
+        fi
+    done
     for exit_file in "${LOGS}"/*.exit; do
         [ -e "${exit_file}" ] || continue
         if [ "$(cat "${exit_file}")" != "0" ]; then
@@ -171,19 +217,45 @@ while :; do
     [ -n "${FAILED_FIRST}" ] && break
     jobs %% >/dev/null 2>&1 || break
     pgrep -P $$ >/dev/null 2>&1 || break
+    NOW="$(date +%s)"
+    if [ $((NOW - LAST_HEARTBEAT)) -ge 30 ]; then
+        RUNNING=0
+        for name in "${LAUNCHED[@]}"; do
+            [ -f "${LOGS}/${name}.exit" ] || RUNNING=$((RUNNING + 1))
+        done
+        printf '[e2e] still running: %s/%s workers; elapsed %ss\n' \
+            "${RUNNING}" "${EXPECTED_SPLITS}" "$((NOW - STARTED))"
+        LAST_HEARTBEAT="${NOW}"
+    fi
     sleep 2
 done
 
 if [ -n "${FAILED_FIRST}" ]; then
-    echo "FAILED FAST: ${FAILED_FIRST} failed; stopping the other processes"
+    echo "A test process failed. Stopping the remaining processes."
     pkill -P $$ >/dev/null 2>&1
     pkill -9 -f "FEDQ_HARNESS_ROOT=${CLONES}" >/dev/null 2>&1
 fi
 wait 2>/dev/null
 
+if [ -z "${FAILED_FIRST}" ]; then
+    for exit_file in "${LOGS}"/*.exit; do
+        [ -e "${exit_file}" ] || continue
+        if [ "$(cat "${exit_file}")" != "0" ]; then
+            FAILED_FIRST="$(basename "${exit_file}" .exit)"
+            break
+        fi
+    done
+fi
+
+if [ -n "${FAILED_FIRST}" ]; then
+    printf '\nThe first failing test process was %s.\n' "${FAILED_FIRST}"
+    show_failure_log "${FAILED_FIRST}"
+    printf '\nThe run stopped after this failure. Full logs are in %s.\n' "${LOGS}"
+    exit 1
+fi
+
 ELAPSED=$(( $(date +%s) - STARTED ))
-echo "e2e (parallel): ${ELAPSED}s across $(ls "${LOGS}"/*.exit | wc -l) processes"
-echo "logs: ${LOGS}/"
+echo "End-to-end tests completed in ${ELAPSED} seconds across $(ls "${LOGS}"/*.exit | wc -l) processes."
 
 # EVERY LAUNCHED SPLIT MUST HAVE REPORTED. run_split writes its exit file only
 # when pytest RETURNS, so a subshell killed outright - the OOM killer taking
@@ -196,8 +268,7 @@ echo "logs: ${LOGS}/"
 # missing exit files are expected and the run fails on the failure itself.
 if [ -z "${FAILED_FIRST}" ]; then
     if [ "${#LAUNCHED[@]}" -ne "${EXPECTED_SPLITS}" ]; then
-        echo "FAILED: ${#LAUNCHED[@]} of ${EXPECTED_SPLITS} splits were launched," \
-            "so the suite did NOT run whole" >&2
+        echo "The end-to-end suite did not start all ${EXPECTED_SPLITS} test processes." >&2
         exit 1
     fi
     UNREPORTED=""
@@ -205,22 +276,19 @@ if [ -z "${FAILED_FIRST}" ]; then
         [ -f "${LOGS}/${name}.exit" ] || UNREPORTED="${UNREPORTED} ${name}"
     done
     if [ -n "${UNREPORTED}" ]; then
-        echo "FAILED: launched splits that never reported an exit code:${UNREPORTED}" >&2
-        echo "Their processes died without finishing, so the suite did NOT run whole." >&2
+        echo "These test processes ended without reporting a result:${UNREPORTED}." >&2
+        echo "The end-to-end suite did not finish." >&2
+        first_unreported="${UNREPORTED# }"
+        show_failure_log "${first_unreported%% *}"
         exit 1
     fi
 fi
 
-FAILED=0
 for exit_file in "${LOGS}"/*.exit; do
     name="$(basename "${exit_file}" .exit)"
     code="$(cat "${exit_file}")"
     tail_line="$(grep -aE '[0-9]+ (passed|failed)' "${LOGS}/${name}.log" | tail -1)"
-    echo "  ${name}: exit ${code}  ${tail_line}"
-    [ "${code}" != "0" ] && FAILED=1
+    if [ "${code}" = "0" ]; then
+        printf '%s: passed (%s)\n' "${name}" "${tail_line}"
+    fi
 done
-
-if [ "${FAILED}" != "0" ]; then
-    echo "FAILED - read the logs in ${LOGS}/" >&2
-    exit 1
-fi

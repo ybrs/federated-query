@@ -13,9 +13,10 @@ sentence schedules work or states a fact.
   `scripts/install-hooks.sh`, which the SessionStart hook in
   `.claude/settings.json` runs automatically on every session, so a rebuilt
   environment is gated without manual setup; manual: `make hook-install`):
-  extracts the staged comments, has `claude -p --model haiku` judge them
-  against the rubric, and BLOCKS the commit listing each offending comment. A
-  judge/parse failure also blocks - a broken gate never waves a commit through.
+  extracts the staged comments and has Codex `gpt-6-luna` judge them against
+  the rubric at low reasoning effort in a read-only sandbox. The gate BLOCKS
+  the commit listing each offending comment. A Codex or JSON-parse failure
+  also blocks, with the command output printed in full.
 
 The fast mechanical layer (fq-lint FQ-PMCOMMENT: todo/fixme/milestone/commit-id
 markers) still runs in `make fq-lint`; this gate is the semantic layer above it.
@@ -26,5 +27,4 @@ Run it manually on arbitrary files:
 python3 scripts/comment-gate/extract.py crates/fq-bind/src/*.rs
 ```
 
-and pipe the blocks with RUBRIC.md into `claude -p --model haiku` (exactly what
-gate.sh does for the staged set).
+and run `scripts/comment-gate/gate.sh` to judge the staged set with Codex.

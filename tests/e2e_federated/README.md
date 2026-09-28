@@ -8,11 +8,11 @@ live on DuckDB, Parquet, and PostgreSQL sources in every combination.
 ## How to run
 
 ```bash
-./venv/bin/python -m pytest tests/e2e_federated -q
+"$VIRTUAL_ENV/bin/python3" -m pytest tests/e2e_federated -q
 ```
 
-from the repository root, or `./run_all_tests.sh` to run this suite alongside
-every other check.
+after activating the virtualenv, from the repository root. Or run
+`./run_all_tests.sh` to run this suite alongside every other check.
 
 PostgreSQL must be reachable (see `README-test-harness-setup.md`; `make pg-start`).
 The suite connects once; if it cannot connect it raises loudly rather than

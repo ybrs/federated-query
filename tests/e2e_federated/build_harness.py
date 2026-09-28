@@ -30,7 +30,7 @@ def connect_pg():
     """Open the autocommit PostgreSQL connection the build seeds through."""
     connection = psycopg2.connect(
         host=os.environ.get("POSTGRES_HOST", "localhost"),
-        port=int(os.environ.get("POSTGRES_PORT", "5432")),
+        port=harness.pg_port(),
         dbname=harness.pg_database(),
         user=os.environ.get("POSTGRES_USER", "postgres"),
         password=os.environ.get("POSTGRES_PASSWORD", "postgres"),

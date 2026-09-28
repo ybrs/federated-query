@@ -17,7 +17,7 @@
 #   3. Symlink .duckdb-lib to the main root's copy (binary rpaths are
 #      $ORIGIN-relative, so the library must be present under the worktree at
 #      run time).
-#   4. Create ./venv in the worktree if absent (the suite requires it).
+#   4. Require the active virtualenv used by the caller to run the suite.
 #
 # The deleted config and the .duckdb-lib link are LOCAL, throwaway state and
 # must NEVER be committed; agents stage files by explicit path only.
@@ -58,9 +58,10 @@ rm -f "$worktree/.cargo/config.toml"
 rm -rf "$worktree/.duckdb-lib"
 ln -s "$main_root/.duckdb-lib" "$worktree/.duckdb-lib"
 
-if [ ! -x "$worktree/venv/bin/python3" ]; then
-    make -C "$worktree" venv
+if [ -z "${VIRTUAL_ENV:-}" ] || [ ! -x "$VIRTUAL_ENV/bin/python3" ]; then
+    echo "error: activate the Python virtualenv before warming the worktree" >&2
+    exit 1
 fi
 
-echo "warmed: $(ls "$worktree"/target/release/deps/*.rlib | wc -l) release artifacts, worktree config removed, .duckdb-lib linked, venv ready"
+echo "warmed: $(ls "$worktree"/target/release/deps/*.rlib | wc -l) release artifacts, worktree config removed, .duckdb-lib linked, active virtualenv ready"
 echo "REMINDER: the removed .cargo/config.toml and the .duckdb-lib link must never be committed"

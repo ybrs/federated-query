@@ -28,15 +28,23 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${ROOT}"
 
-PYTHON="${ROOT}/venv/bin/python3"
+VENV="${VIRTUAL_ENV:-}"
+PYTHON="${VENV}/bin/python3"
 OUTPUT="${1:-${ROOT}/isolated-results.jsonl}"
 WORKERS="${2:-1}"
 
-if [ ! -x "${PYTHON}" ]; then
-    echo "ERROR: no virtualenv at ${ROOT}/venv" >&2
-    echo "  fix: make venv" >&2
+if [ -z "${VENV}" ]; then
+    echo "ERROR: no active Python virtualenv" >&2
+    echo "  fix: activate a virtualenv before running ./run_isolated_tests.sh" >&2
     exit 1
 fi
+if [ ! -x "${PYTHON}" ]; then
+    echo "ERROR: no interpreter at ${PYTHON}" >&2
+    exit 1
+fi
+
+source "${ROOT}/scripts/test-postgres-env.sh"
+ensure_test_postgres "${ROOT}"
 
 "${PYTHON}" -m tests.e2e_federated.verify_harness
 

@@ -25,7 +25,7 @@ def _pg_params():
     """Return the PostgreSQL connection params the suite seeds and connects to."""
     return {
         "host": os.environ.get("POSTGRES_HOST", "localhost"),
-        "port": os.environ.get("POSTGRES_PORT", "5432"),
+        "port": str(harness.pg_port()),
         "database": os.environ.get("POSTGRES_DB", "test_db"),
         "user": os.environ.get("POSTGRES_USER", "postgres"),
     }
