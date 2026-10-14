@@ -49,6 +49,7 @@ pub(super) fn emit<'p>(node: &'p PhysicalPlan, ctx: &mut Ctx<'p>) -> Result<Stri
         PhysicalPlan::HashJoin(join) => emit_join(node, join, ctx),
         PhysicalPlan::NestedLoopJoin(join) => emit_nested_loop_join(node, join, ctx),
         PhysicalPlan::Projection(projection) => emit_projection(projection, ctx),
+        PhysicalPlan::Unnest(node) => emit_unnest(node, ctx),
         PhysicalPlan::HashAggregate(aggregate) => emit_aggregate(aggregate, ctx),
         PhysicalPlan::Sort(sort) => emit_sort(sort, ctx),
         PhysicalPlan::Filter(filter) => emit_filter(filter, ctx),
@@ -317,10 +318,42 @@ fn emit_projection<'p>(
     }
     let child = emit(&node.input, ctx)?;
     let aliases = node.input.column_aliases();
-    let project = projection_items(&node.expressions, &node.output_names, &aliases, &node.input);
+    let project = projection_items(
+        &node.expressions,
+        &node.physical_names,
+        &aliases,
+        &node.input,
+    );
     let fragment = Fragment::Project {
         project,
         distinct: node.distinct,
+    };
+    let name = ctx.names.fragment();
+    ctx.fragments.insert(name.clone(), fragment);
+    Ok(merge_step(ctx, &name, single_input(child)))
+}
+
+/// Compose a list-expansion fragment over the parent's physical columns.
+fn emit_unnest<'p>(
+    node: &'p fq_plan::physical::PhysicalUnnest,
+    ctx: &mut Ctx<'p>,
+) -> Result<String, StepError> {
+    let child = emit(&node.input, ctx)?;
+    let aliases = node.input.column_aliases();
+    let arguments = projection_items(&node.arguments, &node.physical_names, &aliases, &node.input);
+    let ordinality = node
+        .ordinality
+        .as_ref()
+        .map(|_| node.physical_names.last().expect("ordinal output").clone());
+    let fragment = Fragment::Unnest {
+        arguments,
+        outer: node.outer,
+        ordinality,
+        retain_input: node.retain_input,
+        predicate: node
+            .predicate
+            .as_ref()
+            .map(|predicate| over_input(predicate, "in_0", &node.column_aliases())),
     };
     let name = ctx.names.fragment();
     ctx.fragments.insert(name.clone(), fragment);
@@ -542,7 +575,7 @@ fn emit_sort<'p>(node: &'p PhysicalSort, ctx: &mut Ctx<'p>) -> Result<String, St
     for (index, expr) in node.sort_keys.iter().enumerate() {
         let ascending = node.ascending[index];
         keys.push(SortKey {
-            expr: over_input(expr, "in_0", &aliases),
+            expr: sort_expression(expr, &node.input, &aliases),
             ascending,
             nulls_first: nulls_first(node.nulls_order.as_deref(), index, ascending),
         });
@@ -553,6 +586,28 @@ fn emit_sort<'p>(node: &'p PhysicalSort, ctx: &mut Ctx<'p>) -> Result<String, St
     let name = ctx.names.fragment();
     ctx.fragments.insert(name.clone(), fragment);
     Ok(merge_step(ctx, &name, single_input(child)))
+}
+
+/// Read a projected expression by its output name before resolving source columns.
+fn sort_expression(
+    expr: &Expr,
+    input: &PhysicalPlan,
+    aliases: &fq_plan::physical::ColumnAliasMap,
+) -> Expr {
+    if let PhysicalPlan::Projection(node) = input {
+        if let Some(index) = node
+            .expressions
+            .iter()
+            .position(|projected| projected == expr)
+        {
+            return Expr::Column(fq_plan::ColumnRef::new(
+                Some("in_0".to_string()),
+                node.physical_names[index].clone(),
+                Some(expr.get_type()),
+            ));
+        }
+    }
+    over_input(expr, "in_0", aliases)
 }
 
 /// NULL placement: explicit if given, else the SQL default (DESC first). Ports

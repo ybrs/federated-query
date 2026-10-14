@@ -69,6 +69,11 @@ fn check_node(plan: &PhysicalPlan) -> Result<(), PhysicalError> {
     for expression in own_expressions(plan) {
         check_expression(plan, expression, &exposed)?;
     }
+    if let PhysicalPlan::Unnest(node) = plan {
+        if let Some(predicate) = &node.predicate {
+            check_expression(plan, predicate, &exposure(plan))?;
+        }
+    }
     Ok(())
 }
 
@@ -141,8 +146,22 @@ fn exposure(plan: &PhysicalPlan) -> BTreeSet<QualifiedColumn> {
         PhysicalPlan::CteScan(scan) => cte_scan_exposure(scan),
         PhysicalPlan::Cte(cte) => cte_exposure(cte),
         PhysicalPlan::TableFunction(call) => table_function_exposure(call),
+        PhysicalPlan::Unnest(node) => unnest_exposure(node),
         other => children_exposure(other),
     }
+}
+
+/// Expansion arguments read parent columns; matching and consumers can read element outputs.
+fn unnest_exposure(node: &fq_plan::physical::PhysicalUnnest) -> BTreeSet<QualifiedColumn> {
+    let mut exposed = if node.retain_input {
+        exposure(&node.input)
+    } else {
+        BTreeSet::new()
+    };
+    for output in node.output_names.iter().chain(node.ordinality.iter()) {
+        exposed.insert((node.alias.clone(), output.clone()));
+    }
+    exposed
 }
 
 /// A scan exposes its read columns under its alias, or under its table name when
@@ -243,6 +262,7 @@ fn output_names(plan: &PhysicalPlan) -> Vec<String> {
         PhysicalPlan::RemoteQuery(node) => node.output_names.clone(),
         PhysicalPlan::Values(node) => node.output_names.clone(),
         PhysicalPlan::TableFunction(node) => node.output_names.clone(),
+        PhysicalPlan::Unnest(_) => fq_plan::output_column_names(plan),
         PhysicalPlan::CteMergeQuery(node) => node.output_names.clone(),
         PhysicalPlan::LateralJoin(node) => node.output_names.clone(),
         PhysicalPlan::Scan(node) => scan_output_names(node),
@@ -316,6 +336,7 @@ fn own_expressions(plan: &PhysicalPlan) -> Vec<&Expr> {
             with_optional(&node.expressions, node.distinct_on.as_ref())
         }
         PhysicalPlan::Window(node) => node.expressions.iter().collect(),
+        PhysicalPlan::Unnest(node) => node.arguments.iter().collect(),
         PhysicalPlan::Filter(node) => vec![&node.predicate],
         PhysicalPlan::HashJoin(node) => join_key_expressions(&node.left_keys, &node.right_keys),
         PhysicalPlan::NestedLoopJoin(node) => node.condition.iter().collect(),

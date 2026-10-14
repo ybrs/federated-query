@@ -330,11 +330,12 @@ impl Expr {
         match self {
             Expr::Column(col) => col
                 .data_type
+                .clone()
                 .expect("ColumnRef type must be set during binding"),
-            Expr::Cast { data_type, .. } => {
-                data_type.expect("Cast type must be set during binding")
-            }
-            Expr::Literal { data_type, .. } => *data_type,
+            Expr::Cast { data_type, .. } => data_type
+                .clone()
+                .expect("Cast type must be set during binding"),
+            Expr::Literal { data_type, .. } => data_type.clone(),
             Expr::BinaryOp { op, left, right } => binary_op_type(*op, left, right),
             Expr::UnaryOp { op, operand } => match op {
                 UnaryOpType::Not | UnaryOpType::IsNull | UnaryOpType::IsNotNull => {
@@ -936,7 +937,7 @@ fn binary_op_type(op: BinaryOpType, left: &Expr, right: &Expr) -> DataType {
 }
 
 /// Numeric widening rank for arithmetic result inference; None for non-numeric.
-fn numeric_rank(data_type: DataType) -> Option<u8> {
+fn numeric_rank(data_type: &DataType) -> Option<u8> {
     match data_type {
         DataType::Boolean => Some(0),
         DataType::Integer => Some(1),
@@ -951,7 +952,7 @@ fn numeric_rank(data_type: DataType) -> Option<u8> {
 /// The wider of two numeric operand types; falls back to `left` when either is
 /// non-numeric (date/interval arithmetic handled elsewhere).
 fn wider_numeric(left: DataType, right: DataType) -> DataType {
-    match (numeric_rank(left), numeric_rank(right)) {
+    match (numeric_rank(&left), numeric_rank(&right)) {
         (Some(l), Some(r)) if r > l => right,
         _ => left,
     }
@@ -963,6 +964,8 @@ fn wider_numeric(left: DataType, right: DataType) -> DataType {
 /// Anything else yields VARCHAR.
 fn function_call_type(function_name: &str, args: &[Expr]) -> DataType {
     match function_name.to_uppercase().as_str() {
+        "STRUCT_EXTRACT" => structured_field_type(args),
+        "MAKE_ARRAY" | "ARRAY_AGG" => array_result_type(args),
         "COUNT" | "SUM" | "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "NTILE" => DataType::BigInt,
         "AVG" | "VARIANCE" | "VAR_POP" | "VAR_SAMP" | "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP"
         | "PERCENTILE_CONT" => DataType::Double,
@@ -972,6 +975,53 @@ fn function_call_type(function_name: &str, args: &[Expr]) -> DataType {
             None => DataType::Varchar,
         },
         _ => DataType::Varchar,
+    }
+}
+
+/// Derive a validated field's type without executing structured value access.
+fn structured_field_type(args: &[Expr]) -> DataType {
+    let Expr::Literal {
+        value: LiteralValue::String(name),
+        ..
+    } = &args[1]
+    else {
+        panic!("bound structured field name must be a string literal");
+    };
+    args[0]
+        .get_type()
+        .struct_field(name)
+        .expect("bound struct field")
+        .1
+}
+
+/// Derive a list type from its arguments using numeric widening and null neutrality.
+fn array_result_type(args: &[Expr]) -> DataType {
+    let element = array_element_type(args);
+    DataType::Arrow(arrow_schema::DataType::List(std::sync::Arc::new(
+        arrow_schema::Field::new("item", element.to_arrow(), true),
+    )))
+}
+
+/// Infer the common element type of a validated array, using INTEGER for unknown elements.
+pub fn array_element_type(args: &[Expr]) -> DataType {
+    let mut element = DataType::Null;
+    for argument in args {
+        let candidate = argument.get_type();
+        element = wider_array_element(element, candidate);
+    }
+    if element == DataType::Null {
+        DataType::Integer
+    } else {
+        element
+    }
+}
+
+/// Null elements are neutral when choosing an array's numeric element type.
+fn wider_array_element(left: DataType, right: DataType) -> DataType {
+    match (left, right) {
+        (DataType::Null, right) => right,
+        (left, DataType::Null) => left,
+        (left, right) => wider_numeric(left, right),
     }
 }
 

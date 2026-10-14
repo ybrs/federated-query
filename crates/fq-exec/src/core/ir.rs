@@ -206,6 +206,14 @@ pub enum Fragment {
         #[serde(default)]
         distinct: bool,
     },
+    /// Expand typed list arguments through DataFusion's native operator.
+    Unnest {
+        arguments: Vec<Projection>,
+        outer: bool,
+        ordinality: Option<String>,
+        retain_input: bool,
+        predicate: Option<IrExpr>,
+    },
     /// A GROUP BY (or grand-total) aggregation over a single input (`in_0`).
     /// `select` is the output list (aggregate calls and grouping expressions);
     /// `group_by` is the grouping key list.
@@ -295,7 +303,7 @@ pub struct WithinGroup {
 }
 
 /// An output column of a fragment: an expression aliased to a result name.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Projection {
     pub expr: IrExpr,
     pub alias: String,
@@ -317,6 +325,11 @@ pub enum JoinKind {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "node", rename_all = "snake_case")]
 pub enum IrExpr {
+    /// A typed list constructor preserves the binder's element type during execution.
+    Array {
+        elements: Vec<IrExpr>,
+        element_type: arrow_schema::DataType,
+    },
     Column {
         #[serde(default)]
         relation: Option<String>,
@@ -387,6 +400,7 @@ pub struct WhenThen {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "lit", rename_all = "snake_case")]
 pub enum LiteralValue {
+    Int32 { value: i32 },
     Int { value: i64 },
     Float { value: f64 },
     Str { value: String },

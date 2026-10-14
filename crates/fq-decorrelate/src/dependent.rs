@@ -244,11 +244,14 @@ impl Decorrelator {
         let right = aliased(project_lateral_value(body, &value_name)?, &prefix);
         // The lateral body exposes exactly its single renamed value; its type is that
         // value column's, read off the body's derived output schema.
-        let value_type = *relation_output_types(&right)?.first().ok_or_else(|| {
-            DecorrelationError::Invariant(
-                "a lateral scalar body exposes no value column".to_string(),
-            )
-        })?;
+        let value_type = relation_output_types(&right)?
+            .first()
+            .ok_or_else(|| {
+                DecorrelationError::Invariant(
+                    "a lateral scalar body exposes no value column".to_string(),
+                )
+            })?
+            .clone();
         // Fresh lateral join wrapping the outer plan and the per-outer-row body - no
         // base to copy from. Field list (left/right/join_type) is complete.
         let joined = LogicalPlan::LateralJoin(LateralJoin {
@@ -505,6 +508,7 @@ fn build_domain(plan: LogicalPlan, free_vars: &[ColumnRef], prefix: &str) -> (Lo
         // outer column's type.
         let data_type = free_var
             .data_type
+            .clone()
             .expect("dependent-join free variable carries its bound type");
         dom_map.push((
             (free_var.table.clone(), free_var.column.clone()),
@@ -618,6 +622,7 @@ fn join_back_condition(
             })?;
         let domain_type = domain_ref
             .data_type
+            .clone()
             .expect("domain column carries its bound type");
         let dependent_ref = qualified_col(dep_prefix, &domain_ref.column, domain_type);
         equalities.push(binary(
@@ -772,12 +777,13 @@ fn project_domain_values(
     for (_, domain_ref) in dom_map {
         let domain_type = domain_ref
             .data_type
+            .clone()
             .expect("domain column carries its bound type");
         expressions.push(qualified_col(win_prefix, &domain_ref.column, domain_type));
         names.push(domain_ref.column.clone());
     }
     for (value_name, value_type) in value_names.iter().zip(value_types.iter()) {
-        expressions.push(qualified_col(win_prefix, value_name, *value_type));
+        expressions.push(qualified_col(win_prefix, value_name, value_type.clone()));
         names.push(value_name.clone());
     }
     // Fresh projection of (domain columns, values) dropping the rank - no base to

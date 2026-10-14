@@ -278,7 +278,7 @@ fn load_one_schema(
         let mut columns = Vec::with_capacity(metadata.columns.len());
         for column_meta in &metadata.columns {
             let data_type = source.map_native_type(&column_meta.data_type)?;
-            require_renderable(&column_meta.name, data_type)?;
+            require_renderable(&column_meta.name, &data_type)?;
             columns.push(Column::new(
                 column_meta.name.clone(),
                 data_type,
@@ -292,13 +292,13 @@ fn load_one_schema(
 
 /// Raise if a column's mapped `DataType` has no Arrow rendering (a connector
 /// bug), with the offending column, rather than crashing mid-query.
-fn require_renderable(column_name: &str, data_type: DataType) -> Result<(), CatalogError> {
+fn require_renderable(column_name: &str, data_type: &DataType) -> Result<(), CatalogError> {
     if data_type.is_renderable() {
         return Ok(());
     }
     Err(CatalogError::NonRenderableColumn {
         column: column_name.to_string(),
-        data_type: data_type.value().to_string(),
+        data_type: data_type.value(),
     })
 }
 

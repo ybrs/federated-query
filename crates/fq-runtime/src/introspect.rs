@@ -71,7 +71,7 @@ impl Runtime {
         let mut nullables = Vec::new();
         for column in &found.columns {
             columns.push(column.name.clone());
-            types.push(column.data_type.value().to_string());
+            types.push(column.data_type.value());
             nullables.push(nullable_word(column.nullable).to_string());
         }
         text_result(&DESCRIBE_COLUMNS, vec![columns, types, nullables])

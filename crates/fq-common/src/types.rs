@@ -11,9 +11,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// SQL data types the engine models. The serialized form and `value()` are the
-/// uppercase name (e.g. `BigInt` -> "BIGINT"), matching Python's `DataType.value`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// SQL types and native recursive Arrow metadata carried through the query pipeline.
+/// Scalar names serialize in uppercase; recursive values retain their complete schema.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum DataType {
     Integer,
@@ -28,13 +28,14 @@ pub enum DataType {
     Timestamp,
     Interval,
     Null,
+    /// Native Arrow metadata retains recursive fields and their nullability.
+    Arrow(arrow_schema::DataType),
 }
 
 impl DataType {
-    /// The canonical uppercase type name (the Python `DataType.value`), used in
-    /// EXPLAIN text, node repr, and anywhere the type name is rendered.
-    pub fn value(self) -> &'static str {
-        match self {
+    /// Return a canonical scalar name or a lossless serialized recursive type.
+    pub fn value(&self) -> String {
+        let name = match self {
             DataType::Integer => "INTEGER",
             DataType::BigInt => "BIGINT",
             DataType::Float => "FLOAT",
@@ -47,7 +48,11 @@ impl DataType {
             DataType::Timestamp => "TIMESTAMP",
             DataType::Interval => "INTERVAL",
             DataType::Null => "NULL",
-        }
+            DataType::Arrow(_) => {
+                return serde_json::to_string(self).expect("type metadata serializes")
+            }
+        };
+        name.to_string()
     }
 
     /// Whether this type has an Arrow rendering - the connector type contract
@@ -57,10 +62,8 @@ impl DataType {
     /// mapped type is not renderable, so a mistyped column fails loudly at load
     /// rather than crashing mid-query.
     ///
-    /// The DataType -> concrete Arrow type object (`arrow_type_for`) lives in
-    /// fq-exec, where the `arrow` crate is a dependency; only `is_renderable`
-    /// (a pure predicate) is needed this early, so only it lives here.
-    pub fn is_renderable(self) -> bool {
+    /// Recursive values validate their fields before admission to the catalog.
+    pub fn is_renderable(&self) -> bool {
         match self {
             DataType::Integer
             | DataType::BigInt
@@ -72,6 +75,7 @@ impl DataType {
             | DataType::Boolean
             | DataType::Date
             | DataType::Timestamp => true,
+            DataType::Arrow(data_type) => Self::validate_arrow(data_type).is_ok(),
             DataType::Interval | DataType::Null => false,
         }
     }
@@ -80,7 +84,7 @@ impl DataType {
 impl std::fmt::Display for DataType {
     // Render as the canonical uppercase name.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.value())
+        f.write_str(&self.value())
     }
 }
 

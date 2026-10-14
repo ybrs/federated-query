@@ -63,6 +63,7 @@ fn push_down(plan: LogicalPlan) -> Result<LogicalPlan, OptimizeError> {
         | LogicalPlan::SubqueryScan(_)
         | LogicalPlan::Cte(_)
         | LogicalPlan::Union(_)
+        | LogicalPlan::Unnest(_)
         | LogicalPlan::SingleRowGuard(_)) => recurse.try_map_children(push_down),
         other => Ok(other),
     }

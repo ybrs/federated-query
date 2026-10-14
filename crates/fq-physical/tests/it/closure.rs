@@ -77,6 +77,7 @@ fn project(input: PhysicalPlan, expressions: Vec<Expr>, names: &[&str]) -> Physi
     PhysicalPlan::Projection(PhysicalProjection {
         input: Box::new(input),
         expressions,
+        physical_names: output_names.clone(),
         output_names,
         distinct: false,
         distinct_on: None,

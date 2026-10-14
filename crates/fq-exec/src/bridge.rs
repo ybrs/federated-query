@@ -238,6 +238,19 @@ fn convert_fragment(fragment: steps::Fragment) -> ExecResult<ir::Fragment> {
             project: convert_projections(project)?,
             distinct,
         }),
+        steps::Fragment::Unnest {
+            arguments,
+            outer,
+            ordinality,
+            retain_input,
+            predicate,
+        } => Ok(ir::Fragment::Unnest {
+            arguments: convert_projections(arguments)?,
+            outer,
+            ordinality,
+            retain_input,
+            predicate: predicate.as_ref().map(serialize_expr).transpose()?,
+        }),
         steps::Fragment::Aggregate {
             select,
             group_by,
@@ -405,8 +418,8 @@ pub fn serialize_expr(expr: &Expr) -> ExecResult<ir::IrExpr> {
             relation: column.table.clone(),
             name: column.column.clone(),
         }),
-        Expr::Literal { value, .. } => Ok(ir::IrExpr::Literal {
-            value: literal_value(value),
+        Expr::Literal { value, data_type } => Ok(ir::IrExpr::Literal {
+            value: typed_literal_value(value, data_type)?,
         }),
         Expr::BinaryOp { op, left, right } => Ok(ir::IrExpr::Binary {
             op: binary_op_token(*op)?.to_string(),
@@ -420,7 +433,7 @@ pub fn serialize_expr(expr: &Expr) -> ExecResult<ir::IrExpr> {
             data_type,
         } => Ok(ir::IrExpr::Cast {
             expr: Box::new(serialize_expr(expr)?),
-            to: cast_arrow_type(*data_type, target_type)?.to_string(),
+            to: cast_arrow_type(data_type.as_ref(), target_type)?.to_string(),
         }),
         Expr::Case {
             when_clauses,
@@ -494,6 +507,12 @@ fn serialize_call(
     is_aggregate: bool,
 ) -> ExecResult<ir::IrExpr> {
     let name = function_name.to_lowercase();
+    if name == "make_array" {
+        return Ok(ir::IrExpr::Array {
+            elements: serialize_exprs(args)?,
+            element_type: fq_plan::expr::array_element_type(args).to_arrow(),
+        });
+    }
     if is_aggregate
         && name == "avg"
         && args.len() == 1
@@ -622,6 +641,19 @@ fn serialize_extract(field: &str, source: &Expr) -> ExecResult<ir::IrExpr> {
 }
 
 /// Map a typed literal onto the engine's typed-literal form.
+fn typed_literal_value(
+    value: &LiteralValue,
+    data_type: &fq_common::DataType,
+) -> ExecResult<ir::LiteralValue> {
+    if let (LiteralValue::Integer(value), fq_common::DataType::Integer) = (value, data_type) {
+        return Ok(ir::LiteralValue::Int32 {
+            value: i32::try_from(*value).map_err(|error| ExecError::runtime(error.to_string()))?,
+        });
+    }
+    Ok(literal_value(value))
+}
+
+/// Preserve literal values whose bound type does not require a narrower integer.
 fn literal_value(value: &LiteralValue) -> ir::LiteralValue {
     match value {
         LiteralValue::Null => ir::LiteralValue::Null,
@@ -666,7 +698,7 @@ fn binary_op_token(op: BinaryOpType) -> ExecResult<&'static str> {
 /// The Arrow type name for a CAST target, from the resolved `DataType`. Decimals
 /// map to `float64` (the engine treats them as float, matching the Python path).
 /// An unbound cast (no resolved type) or a non-castable type RAISES.
-fn cast_arrow_type(data_type: Option<DataType>, target_type: &str) -> ExecResult<&'static str> {
+fn cast_arrow_type(data_type: Option<&DataType>, target_type: &str) -> ExecResult<&'static str> {
     data_type.and_then(arrow_cast_name).ok_or_else(|| {
         ExecError::runtime(format!("cast to '{target_type}' has no execution IR form"))
     })
@@ -674,7 +706,7 @@ fn cast_arrow_type(data_type: Option<DataType>, target_type: &str) -> ExecResult
 
 /// The Arrow type name for a castable engine type, or None for a type with no
 /// cast form (TIMESTAMP / INTERVAL / NULL). Ports the Python `_CAST_TYPES` map.
-fn arrow_cast_name(data_type: DataType) -> Option<&'static str> {
+fn arrow_cast_name(data_type: &DataType) -> Option<&'static str> {
     match data_type {
         DataType::Integer => Some("int32"),
         DataType::BigInt => Some("int64"),
@@ -683,7 +715,7 @@ fn arrow_cast_name(data_type: DataType) -> Option<&'static str> {
         DataType::Varchar | DataType::Text => Some("utf8"),
         DataType::Boolean => Some("boolean"),
         DataType::Date => Some("date32"),
-        DataType::Timestamp | DataType::Interval | DataType::Null => None,
+        DataType::Timestamp | DataType::Interval | DataType::Null | DataType::Arrow(_) => None,
     }
 }
 

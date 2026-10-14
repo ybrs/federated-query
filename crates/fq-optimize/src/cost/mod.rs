@@ -104,6 +104,13 @@ impl CostModel {
                 )))
             }
             LogicalPlan::TableFunction(node) => Ok(estimate_table_function(node)),
+            LogicalPlan::Unnest(node) => {
+                let input = self.estimate(&node.input)?;
+                Ok(CardinalityEstimate::unknown(combine_defaults(
+                    &[&input],
+                    &["unnest_multiplicity".to_string()],
+                )))
+            }
             LogicalPlan::Explain(_) => Err(EstimateError::NoRule("Explain")),
         }
     }

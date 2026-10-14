@@ -143,7 +143,7 @@ pub(crate) fn typed_output_refs(
     }
     let mut refs = Vec::with_capacity(names.len());
     for (name, data_type) in names.iter().zip(types.iter()) {
-        refs.push(unqualified_col(name, *data_type));
+        refs.push(unqualified_col(name, data_type.clone()));
     }
     Ok(refs)
 }

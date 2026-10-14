@@ -141,6 +141,13 @@ pub enum Fragment {
         project: Vec<Projection>,
         distinct: bool,
     },
+    Unnest {
+        arguments: Vec<Projection>,
+        outer: bool,
+        ordinality: Option<String>,
+        retain_input: bool,
+        predicate: Option<Expr>,
+    },
     Aggregate {
         select: Vec<AggSelectItem>,
         group_by: Vec<Expr>,

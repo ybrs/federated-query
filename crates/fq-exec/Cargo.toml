@@ -10,6 +10,7 @@ edition.workspace = true
 # boundary that used to wrap it moves to the later fedq-py crate.
 
 [dependencies]
+async-trait = "0.1"
 # The step bridge: fq-physical produces BuiltSteps holding fq_plan::Expr; this
 # crate converts them into core::ir and runs the engine. fq-common carries the
 # DataType enum used by the cast lowering.

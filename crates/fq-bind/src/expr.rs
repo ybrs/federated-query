@@ -56,9 +56,9 @@ fn normalize_division(op: fq_plan::BinaryOpType, left: Expr, right: Expr) -> Exp
 /// cast on a guess.
 fn certainly_integer(expr: &Expr) -> bool {
     match expr {
-        Expr::Column(column) => integer_type(column.data_type),
-        Expr::Literal { data_type, .. } => integer_type(Some(*data_type)),
-        Expr::Cast { data_type, .. } => integer_type(*data_type),
+        Expr::Column(column) => integer_type(column.data_type.as_ref()),
+        Expr::Literal { data_type, .. } => integer_type(Some(data_type)),
+        Expr::Cast { data_type, .. } => integer_type(data_type.as_ref()),
         Expr::UnaryOp {
             op: fq_plan::UnaryOpType::Negate,
             operand,
@@ -122,7 +122,7 @@ fn integer_arithmetic(op: fq_plan::BinaryOpType) -> bool {
 }
 
 /// Whether the resolved type is one of the integer types.
-fn integer_type(data_type: Option<DataType>) -> bool {
+fn integer_type(data_type: Option<&DataType>) -> bool {
     matches!(data_type, Some(DataType::Integer | DataType::BigInt))
 }
 
@@ -140,9 +140,9 @@ fn certainly_numeric(expr: &Expr) -> bool {
 /// window, a function outside the known set) is not certain.
 fn certainly_double(expr: &Expr) -> bool {
     match expr {
-        Expr::Column(column) => double_type(column.data_type),
-        Expr::Literal { data_type, .. } => double_type(Some(*data_type)),
-        Expr::Cast { data_type, .. } => double_type(*data_type),
+        Expr::Column(column) => double_type(column.data_type.as_ref()),
+        Expr::Literal { data_type, .. } => double_type(Some(data_type)),
+        Expr::Cast { data_type, .. } => double_type(data_type.as_ref()),
         Expr::UnaryOp {
             op: fq_plan::UnaryOpType::Negate,
             operand,
@@ -205,7 +205,7 @@ fn double_arithmetic(op: fq_plan::BinaryOpType) -> bool {
 }
 
 /// Whether the resolved type is DOUBLE.
-fn double_type(data_type: Option<DataType>) -> bool {
+fn double_type(data_type: Option<&DataType>) -> bool {
     matches!(data_type, Some(DataType::Double))
 }
 
@@ -617,7 +617,8 @@ impl Binder<'_> {
         else {
             unreachable!("bind_function_call called on a non-FunctionCall expression");
         };
-        let bound_args = self.bind_expr_list(args)?;
+        let mut bound_args = self.bind_expr_list(args)?;
+        crate::nested::validate_nested_call(function_name, &mut bound_args)?;
         let bound_within_group = self.bind_opt(within_group_key.as_deref())?;
         let bound_filter = self.bind_opt(filter.as_deref())?;
         // Fresh bound copy from the borrowed source (no `..base` on an enum variant):

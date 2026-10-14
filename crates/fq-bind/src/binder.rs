@@ -110,6 +110,7 @@ impl<'a> Binder<'a> {
             LogicalPlan::Cte(node) => self.bind_cte(node),
             LogicalPlan::CteRef(node) => self.bind_cte_ref(node),
             LogicalPlan::Values(node) => self.bind_values(node),
+            LogicalPlan::Unnest(node) => self.bind_unnest(node),
             // A table-valued analysis call binds as a pass-through: its parameters
             // are baked into the spec (no coordinator expressions to resolve) and
             // its output schema is fixed by the analysis kind, so the surfaced
@@ -327,7 +328,7 @@ impl<'a> Binder<'a> {
         self.output_aliases
             .iter()
             .rev()
-            .find_map(|overlay| overlay.get(name).copied())
+            .find_map(|overlay| overlay.get(name).cloned())
     }
 
     /// Bind a Limit: only the input needs binding (LIMIT/OFFSET are constants).
@@ -476,7 +477,7 @@ impl<'a> Binder<'a> {
                 Expr::Column(fq_plan::ColumnRef::new(
                     None,
                     column.name.clone(),
-                    Some(column.data_type),
+                    Some(column.data_type.clone()),
                 ))
             })
             .collect();
@@ -647,6 +648,15 @@ impl<'a> Binder<'a> {
             }
             LogicalPlan::CteRef(node) => self.cte_ref_columns(node),
             LogicalPlan::TableFunction(node) => Ok(table_function_columns(node)),
+            LogicalPlan::Unnest(node) => {
+                let mut columns = if node.retain_input {
+                    self.plan_output_columns(&node.input)?
+                } else {
+                    Vec::new()
+                };
+                columns.extend(crate::nested::unnest_table(node).columns);
+                Ok(columns)
+            }
             LogicalPlan::SubqueryScan(node) => self.plan_output_columns(&node.input),
             other => match other.children().as_slice() {
                 [child] => self.plan_output_columns(child),
@@ -683,7 +693,7 @@ impl<'a> Binder<'a> {
     }
 
     /// Run `f` with the scope exposed by `plan` pushed, popping afterward.
-    fn with_scope<T>(
+    pub(crate) fn with_scope<T>(
         &mut self,
         plan: &LogicalPlan,
         f: impl FnOnce(&mut Self) -> Result<T, BindError>,
@@ -747,6 +757,14 @@ impl<'a> Binder<'a> {
                 scope.push((node.alias.clone(), Table::new(node.alias.clone(), columns)));
                 Ok(())
             }
+            LogicalPlan::Unnest(node) => {
+                if node.retain_input {
+                    self.collect_scope(&node.input, scope)?;
+                }
+                crate::nested::require_unique_alias(&node.alias, scope)?;
+                scope.push((node.alias.clone(), crate::nested::unnest_table(node)));
+                Ok(())
+            }
             other => {
                 for child in other.children() {
                     self.collect_scope(child, scope)?;
@@ -784,8 +802,13 @@ impl<'a> Binder<'a> {
             return Ok(Expr::Column(fq_plan::ColumnRef::new(
                 Some(alias.clone()),
                 found.name.clone(),
-                Some(found.data_type),
+                Some(found.data_type.clone()),
             )));
+        }
+        for scope in self.scopes.iter().rev() {
+            if let Some(source) = match_in_scope(scope, qualifier)? {
+                return crate::nested::field_access(source, column);
+            }
         }
         Err(BindError::TableNotInScope {
             table: qualifier.to_string(),
@@ -831,7 +854,7 @@ fn match_in_scope(scope: &Scope, column: &str) -> Result<Option<Expr>, BindError
             found = Some(Expr::Column(fq_plan::ColumnRef::new(
                 Some(alias.clone()),
                 catalog_column.name.clone(),
-                Some(catalog_column.data_type),
+                Some(catalog_column.data_type.clone()),
             )));
         }
     }
@@ -1186,7 +1209,7 @@ fn set_op_sort_key(key: &Expr, columns: &[Column]) -> Result<Expr, BindError> {
         return Ok(Expr::Column(fq_plan::ColumnRef::new(
             None,
             column.name.clone(),
-            Some(column.data_type),
+            Some(column.data_type.clone()),
         )));
     }
     let Expr::Column(reference) = key else {
@@ -1206,7 +1229,7 @@ fn set_op_sort_key(key: &Expr, columns: &[Column]) -> Result<Expr, BindError> {
         Some(column) => Ok(Expr::Column(fq_plan::ColumnRef::new(
             None,
             column.name.clone(),
-            Some(column.data_type),
+            Some(column.data_type.clone()),
         ))),
         None => Err(BindError::ColumnNotInScope(reference.column.clone())),
     }
@@ -1241,7 +1264,7 @@ fn rename_columns(names: &[String], columns: &[Column]) -> Result<Vec<Column>, B
     Ok(names
         .iter()
         .zip(columns.iter())
-        .map(|(name, column)| Column::new(name.clone(), column.data_type, true))
+        .map(|(name, column)| Column::new(name.clone(), column.data_type.clone(), true))
         .collect())
 }
 
@@ -1281,6 +1304,7 @@ fn node_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::GroupedLimit(_) => "GroupedLimit",
         LogicalPlan::LateralJoin(_) => "LateralJoin",
         LogicalPlan::TableFunction(_) => "TableFunction",
+        LogicalPlan::Unnest(_) => "Unnest",
     }
 }
 

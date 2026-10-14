@@ -515,6 +515,12 @@ fn node_label(
         PhysicalPlan::GroupedLimit(_) => "GroupedLimit".to_string(),
         PhysicalPlan::LateralJoin(_) => "LateralJoin".to_string(),
         PhysicalPlan::Explain(_) => "Explain".to_string(),
+        PhysicalPlan::Unnest(node) => format!(
+            "Unnest arguments={} outer={} ordinality={:?}",
+            node.arguments.len(),
+            node.outer,
+            node.ordinality
+        ),
     };
     Ok(label)
 }

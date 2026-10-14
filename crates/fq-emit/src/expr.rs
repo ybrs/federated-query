@@ -22,7 +22,7 @@ use crate::resolver::ColumnResolver;
 pub fn render_expr(expr: &Expr, resolver: &dyn ColumnResolver) -> Result<String, EmitError> {
     match expr {
         Expr::Column(col) => resolver.resolve(col.table.as_deref(), &col.column),
-        Expr::Literal { value, data_type } => render_literal(value, *data_type),
+        Expr::Literal { value, data_type } => render_literal(value, data_type),
         Expr::BinaryOp { op, left, right } => Ok(format!(
             "({} {} {})",
             render_expr(left, resolver)?,
@@ -124,8 +124,8 @@ fn canonical_type(target_type: &str) -> &str {
 /// Python `value is None OR data_type == NULL`); otherwise the LiteralValue shape
 /// decides the token. The enum is closed, so there is no unmapped-type raise; the
 /// one runtime raise is a non-finite float, which has no canonical SQL token.
-fn render_literal(value: &LiteralValue, data_type: DataType) -> Result<String, EmitError> {
-    if data_type == DataType::Null {
+fn render_literal(value: &LiteralValue, data_type: &DataType) -> Result<String, EmitError> {
+    if *data_type == DataType::Null {
         return Ok("NULL".to_string());
     }
     Ok(match value {
@@ -204,6 +204,11 @@ fn render_function(
     // A zero-argument SCALAR call (`now()`) keeps its empty parens. An ordered-set
     // aggregate (`MODE() WITHIN GROUP (...)`) is parameterless by definition and
     // takes empty parens, never the star form.
+    let name = if name.eq_ignore_ascii_case("STRUCT_EXTRACT") {
+        "get_field"
+    } else {
+        name
+    };
     let rendered = if is_aggregate && args.is_empty() && within_group_key.is_none() {
         "*".to_string()
     } else {
@@ -218,10 +223,8 @@ fn render_function(
         // Direction is emitted only for DESC; an explicit ASC inside WITHIN GROUP
         // defeats polyglot's ordered-set aggregate transpilation. No NULLS here.
         let direction = if within_group_desc { " DESC" } else { "" };
-        call = format!(
-            "{call} WITHIN GROUP (ORDER BY {}{direction})",
-            render_expr(key, resolver)?
-        );
+        let ordering = format!("{}{direction}", render_expr(key, resolver)?);
+        call = ordered_aggregate_call(name, &call, &ordering);
     }
     if let Some(predicate) = filter {
         // `agg(...) FILTER (WHERE predicate)`: standard SQL that Postgres, DuckDB,
@@ -235,10 +238,21 @@ fn render_function(
     Ok(call)
 }
 
+/// Render list aggregation ordering inside its argument list and ordered sets outside.
+fn ordered_aggregate_call(name: &str, call: &str, ordering: &str) -> String {
+    if name.eq_ignore_ascii_case("ARRAY_AGG") {
+        let arguments = call
+            .strip_suffix(')')
+            .expect("aggregate closing parenthesis");
+        return format!("{arguments} ORDER BY {ordering} NULLS LAST)");
+    }
+    format!("{call} WITHIN GROUP (ORDER BY {ordering})")
+}
+
 /// Render a string-valued literal. A temporal type keeps its keyword prefix
 /// (`DATE '...'`, `TIMESTAMP '...'`) so the value is compared as a date/timestamp
 /// rather than a bare string; every other type renders as a quoted string.
-fn render_string_literal(text: &str, data_type: DataType) -> String {
+fn render_string_literal(text: &str, data_type: &DataType) -> String {
     let quoted = format!("'{}'", text.replace('\'', "''"));
     match data_type {
         DataType::Date => format!("DATE {quoted}"),

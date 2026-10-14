@@ -8,6 +8,7 @@ edition.workspace = true
 # plan/arrow_types.py, plan/field_introspection.py.
 
 [dependencies]
+arrow-schema = "58"
 fq-common = { path = "../fq-common" }
 
 [lints]

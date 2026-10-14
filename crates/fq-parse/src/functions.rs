@@ -136,6 +136,12 @@ impl Converter<'_> {
         for arg in &func.args {
             args.push(self.expr(arg)?);
         }
+        if func.name.eq_ignore_ascii_case("unnest") {
+            if func.distinct {
+                return Err(ParseError::Unsupported("UNNEST DISTINCT".to_string()));
+            }
+            return Ok(scalar_function_call(func.name.clone(), args));
+        }
         // Fresh function call built from the parsed generic Function node - no base to
         // copy from. Field list (function_name/args/is_aggregate/distinct/
         // within_group_key/within_group_desc/filter) is the complete FunctionCall

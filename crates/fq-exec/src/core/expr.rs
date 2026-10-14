@@ -29,6 +29,10 @@ fn plan_err<T>(msg: impl Into<String>) -> Result<T, DataFusionError> {
 /// Build a DataFusion `Expr` from an IR expression.
 pub fn to_df_expr(e: &IrExpr) -> Result<Expr, DataFusionError> {
     match e {
+        IrExpr::Array {
+            elements,
+            element_type,
+        } => typed_array(elements, element_type),
         IrExpr::Column { relation, name } => {
             let rel = relation.as_ref().map(|r| TableReference::bare(r.clone()));
             Ok(Expr::Column(Column::new(rel, name.clone())))
@@ -125,10 +129,39 @@ pub fn to_df_expr(e: &IrExpr) -> Result<Expr, DataFusionError> {
     }
 }
 
+/// Construct a list with explicit element coercion and a typed empty-list value.
+fn typed_array(elements: &[IrExpr], element_type: &DataType) -> Result<Expr, DataFusionError> {
+    if elements.is_empty() {
+        return Ok(lit(ScalarValue::List(ScalarValue::new_list(
+            &[],
+            element_type,
+            true,
+        ))));
+    }
+    let mut arguments = Vec::new();
+    for element in elements {
+        arguments.push(Expr::Cast(Cast::new(
+            Box::new(to_df_expr(element)?),
+            element_type.clone(),
+        )));
+    }
+    scalar_function("make_array", arguments)
+}
+
 /// Build a scalar-or-aggregate function call by name. Scalars are tried first
 /// (`date_part`, `substr`, ...); an aggregate (`sum`, `avg`, ...) is allowed so
 /// an aggregate can appear inside a larger expression (e.g. `100 * sum(x) / sum(y)`).
+pub(crate) fn scalar_function(name: &str, args: Vec<Expr>) -> Result<Expr, DataFusionError> {
+    build_function(name, args)
+}
+
+/// Resolve typed scalar and aggregate calls against the coordinator's registries.
 fn build_function(name: &str, args: Vec<Expr>) -> Result<Expr, DataFusionError> {
+    let name = if name.eq_ignore_ascii_case("struct_extract") {
+        "get_field"
+    } else {
+        name
+    };
     if let Some(udf) = scalar_registry().get(name).cloned() {
         return Ok(Expr::ScalarFunction(ScalarFunction::new_udf(udf, args)));
     }
@@ -145,7 +178,9 @@ fn scalar_registry() -> &'static HashMap<String, Arc<ScalarUDF>> {
     static REGISTRY: OnceLock<HashMap<String, Arc<ScalarUDF>>> = OnceLock::new();
     REGISTRY.get_or_init(|| {
         let mut map = HashMap::new();
-        for udf in all_default_functions() {
+        let mut functions = all_default_functions();
+        functions.extend(datafusion::functions_nested::all_default_nested_functions());
+        for udf in functions {
             map.insert(udf.name().to_string(), udf.clone());
             for alias in udf.aliases() {
                 map.insert(alias.to_string(), udf.clone());
@@ -171,6 +206,7 @@ fn aggregate_registry() -> &'static HashMap<String, Arc<AggregateUDF>> {
 
 fn scalar(v: &LiteralValue) -> ScalarValue {
     match v {
+        LiteralValue::Int32 { value } => ScalarValue::Int32(Some(*value)),
         LiteralValue::Int { value } => ScalarValue::Int64(Some(*value)),
         LiteralValue::Float { value } => ScalarValue::Float64(Some(*value)),
         LiteralValue::Str { value } => ScalarValue::Utf8(Some(value.clone())),

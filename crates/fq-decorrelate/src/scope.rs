@@ -78,6 +78,15 @@ fn output_qualifiers(plan: &LogicalPlan) -> HashSet<String> {
         ),
         LogicalPlan::SubqueryScan(node) => single(node.alias.clone()),
         LogicalPlan::TableFunction(node) => single(node.alias.clone()),
+        LogicalPlan::Unnest(node) => {
+            let mut qualifiers = if node.retain_input {
+                output_qualifiers(&node.input)
+            } else {
+                HashSet::new()
+            };
+            qualifiers.insert(node.alias.clone());
+            qualifiers
+        }
         LogicalPlan::CteRef(node) => {
             single(node.alias.clone().unwrap_or_else(|| node.name.clone()))
         }
@@ -138,6 +147,7 @@ fn available_qualifiers(plan: &LogicalPlan) -> HashSet<String> {
             &output_qualifiers(&node.right),
         ),
         LogicalPlan::Filter(node) => output_qualifiers(&node.input),
+        LogicalPlan::Unnest(_) => output_qualifiers(plan),
         LogicalPlan::Projection(node) => output_qualifiers(&node.input),
         LogicalPlan::Aggregate(node) => output_qualifiers(&node.input),
         LogicalPlan::Sort(node) => output_qualifiers(&node.input),
@@ -223,6 +233,7 @@ fn plan_label(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::GroupedLimit(_) => "GroupedLimit",
         LogicalPlan::LateralJoin(_) => "LateralJoin",
         LogicalPlan::TableFunction(_) => "TableFunction",
+        LogicalPlan::Unnest(_) => "Unnest",
     }
 }
 

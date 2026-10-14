@@ -169,7 +169,7 @@ pub fn views_schema(datasource: &str, views: &[MaterializedView]) -> Schema {
         for column in &view.columns {
             columns.push(Column::new(
                 column.name.clone(),
-                column.data_type,
+                column.data_type.clone(),
                 column.nullable,
             ));
         }
@@ -222,7 +222,7 @@ mod tests {
             DataType::Timestamp,
         ] {
             assert_eq!(
-                source.map_native_type(data_type.value()).expect("maps"),
+                source.map_native_type(&data_type.value()).expect("maps"),
                 data_type
             );
         }

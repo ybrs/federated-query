@@ -387,6 +387,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f633dbfdf39c039ada1bf9e34c694816eb71fbb7dc78f613993b7245e078a1ed"
 dependencies = [
  "bitflags",
+ "serde",
  "serde_core",
  "serde_json",
 ]
@@ -1970,7 +1971,9 @@ dependencies = [
 name = "fq-common"
 version = "0.1.0"
 dependencies = [
+ "arrow-schema",
  "serde",
+ "serde_json",
  "serde_yaml",
  "thiserror 2.0.18",
  "tracing",
@@ -2045,6 +2048,7 @@ dependencies = [
  "arrow",
  "arrow-array",
  "arrow-schema",
+ "async-trait",
  "datafusion",
  "duckdb",
  "fq-bind",
@@ -2124,6 +2128,7 @@ dependencies = [
 name = "fq-plan"
 version = "0.1.0"
 dependencies = [
+ "arrow-schema",
  "fq-common",
 ]
 

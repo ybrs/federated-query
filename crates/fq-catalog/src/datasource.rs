@@ -202,6 +202,10 @@ pub trait DataSource: Send + Sync {
 /// rather than silently coercing to a string (a mistyped column is a wrong answer
 /// with no error).
 pub fn map_native_type_default(type_str: &str) -> Result<DataType, CatalogError> {
+    if type_str.starts_with('{') {
+        return serde_json::from_str(type_str)
+            .map_err(|error| CatalogError::UnsupportedColumnType(error.to_string()));
+    }
     let normalized = type_str
         .to_uppercase()
         .split('(')

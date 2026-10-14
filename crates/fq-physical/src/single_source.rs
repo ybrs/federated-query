@@ -54,6 +54,22 @@ use crate::steps::scan_dialect;
 /// to a structural key.
 pub type ScanNames = HashMap<*const Scan, String>;
 
+/// Structured access and array construction execute through typed coordinator kernels.
+fn coordinator_nested_expression(expression: &Expr) -> bool {
+    if let Expr::FunctionCall { function_name, .. } = expression {
+        if matches!(
+            function_name.to_uppercase().as_str(),
+            "STRUCT_EXTRACT" | "MAKE_ARRAY"
+        ) {
+            return true;
+        }
+    }
+    expression
+        .children()
+        .iter()
+        .any(|child| coordinator_nested_expression(child))
+}
+
 /// One WITH definition: `name [(cols)] AS (body_sql)`. `body_sql` is the fully
 /// rendered CTE body (canonical Postgres), with anchor-column aliasing already
 /// applied during body render.
@@ -275,6 +291,13 @@ impl SingleSourcePushdown {
         node: &'a LogicalPlan,
         ctx: &mut PushContext<'a>,
     ) -> Result<bool, EmitError> {
+        if node
+            .direct_expressions()
+            .iter()
+            .any(|expression| coordinator_nested_expression(expression))
+        {
+            return Ok(false);
+        }
         match node {
             LogicalPlan::Limit(n) => self.absorb_limit(n, ctx),
             LogicalPlan::Sort(n) => self.absorb_sort(n, ctx),
@@ -293,7 +316,8 @@ impl SingleSourcePushdown {
             | LogicalPlan::Explain(_)
             | LogicalPlan::SingleRowGuard(_)
             | LogicalPlan::GroupedLimit(_)
-            | LogicalPlan::TableFunction(_) => Ok(false),
+            | LogicalPlan::TableFunction(_)
+            | LogicalPlan::Unnest(_) => Ok(false),
         }
     }
 

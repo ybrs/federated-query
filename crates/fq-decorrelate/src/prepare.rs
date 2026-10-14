@@ -342,6 +342,7 @@ impl<'a> SubqueryPreparer<'a> {
             let key_name = format!("{}_g{}", self.prefix, start + offset);
             let key_type = inner_ref
                 .data_type
+                .clone()
                 .expect("widened correlation key column carries its bound type");
             aggregates.push(Expr::Column(inner_ref));
             names.push(key_name.clone());
@@ -532,6 +533,7 @@ impl<'a> SubqueryPreparer<'a> {
                 // inner physical name; the condition keeps the qualified ref.
                 let data_type = col
                     .data_type
+                    .clone()
                     .expect("widened correlation key carries its bound type");
                 exposures.push((unqualified_col(&col.column, data_type), col.column.clone()));
                 exposure_names.insert(key, Expr::Column(col.clone()));
@@ -550,6 +552,7 @@ impl<'a> SubqueryPreparer<'a> {
             let name = format!("{}_k{}", self.prefix, exposures.len());
             let data_type = col
                 .data_type
+                .clone()
                 .expect("exposed correlation key carries its bound type");
             exposures.push((Expr::Column(col.clone()), name.clone()));
             exposure_names.insert(key, qualified_col(&self.prefix, &name, data_type));
@@ -672,7 +675,7 @@ impl<'a> SubqueryPreparer<'a> {
         let mut keys = Vec::new();
         for (alias, data_type) in aliases.iter().zip(alias_types.iter()) {
             if !non_keys.contains(alias) {
-                keys.push(unqualified_col(alias, *data_type));
+                keys.push(unqualified_col(alias, data_type.clone()));
             }
         }
         if keys.is_empty() {
@@ -861,7 +864,7 @@ fn guard_scalar(prepared: PreparedSubquery, needs_guard: bool) -> Result<Logical
     let mut keys = Vec::new();
     for (name, data_type) in names.iter().zip(types.iter()) {
         if !prepared.values.contains(name) {
-            keys.push(unqualified_col(name, *data_type));
+            keys.push(unqualified_col(name, data_type.clone()));
         }
     }
     // Fresh cardinality guard wrapping the scalar side - no base to copy from. Field
@@ -1095,5 +1098,6 @@ fn plan_label(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::GroupedLimit(_) => "GroupedLimit",
         LogicalPlan::LateralJoin(_) => "LateralJoin",
         LogicalPlan::TableFunction(_) => "TableFunction",
+        LogicalPlan::Unnest(_) => "Unnest",
     }
 }

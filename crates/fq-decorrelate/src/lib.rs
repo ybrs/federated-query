@@ -82,6 +82,7 @@ impl Decorrelator {
             LogicalPlan::Sort(node) => self.rewrite_sort(node),
             LogicalPlan::Join(node) => self.rewrite_join(node),
             LogicalPlan::Values(node) => self.rewrite_values(node),
+            LogicalPlan::Unnest(node) => self.rewrite_unnest(node),
             LogicalPlan::LateralJoin(node) => self.rewrite_lateral_join(node),
             other => self.rewrite_rest(other),
         }
@@ -102,6 +103,20 @@ impl Decorrelator {
             right: Box::new(right),
             ..node
         }))
+    }
+
+    /// Thread any argument subqueries onto the expansion's input before expanding rows.
+    fn rewrite_unnest(&mut self, mut node: fq_plan::Unnest) -> Result<LogicalPlan> {
+        let mut input = self.rewrite_plan(*node.input)?;
+        let mut arguments = Vec::new();
+        for argument in node.arguments {
+            let (rewritten, next) = self.rewrite_value_expr(argument, input)?;
+            input = next;
+            arguments.push(rewritten);
+        }
+        node.input = Box::new(input);
+        node.arguments = arguments;
+        Ok(LogicalPlan::Unnest(node))
     }
 
     /// Rewrite remaining node types by recursing into children. An Aggregate first

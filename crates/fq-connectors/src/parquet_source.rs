@@ -252,9 +252,20 @@ fn column_metadata(field: &ArrowField) -> Result<ColumnMetadata, CatalogError> {
 }
 
 /// The canonical SQL type name for an Arrow type, in the vocabulary
-/// `map_native_type_default` understands. An Arrow type with no engine modeling
-/// (nested lists/structs/maps, raw binary) raises rather than being coerced.
+/// `map_native_type_default` understands. Recursive fields retain Arrow metadata;
+/// a type with no engine modeling raises rather than being coerced.
 fn arrow_type_native_name(data_type: &ArrowDataType) -> Result<String, CatalogError> {
+    if matches!(
+        data_type,
+        ArrowDataType::List(_)
+            | ArrowDataType::LargeList(_)
+            | ArrowDataType::FixedSizeList(_, _)
+            | ArrowDataType::Struct(_)
+            | ArrowDataType::Map(_, _)
+    ) {
+        DataType::validate_arrow(data_type).map_err(CatalogError::UnsupportedColumnType)?;
+        return Ok(DataType::Arrow(data_type.clone()).value());
+    }
     if let Some(name) = numeric_native_name(data_type) {
         return Ok(name.to_string());
     }

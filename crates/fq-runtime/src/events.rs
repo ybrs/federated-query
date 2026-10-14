@@ -229,7 +229,7 @@ impl Runtime {
                              '{datasource}.{schema}.{table}'"
                         ))
                     })?;
-                require_refresh_key_type(key, column.data_type)?;
+                require_refresh_key_type(key, &column.data_type)?;
                 Some((position, key.clone()))
             }
         };
@@ -573,7 +573,7 @@ fn ingest_columns(record: &DatasetRecord) -> Vec<String> {
 /// The engine types a refresh_key watermark can carry exactly. Anything else
 /// (floats, decimals, booleans, intervals) raises at CREATE, before any data
 /// is pulled: the declared key could never drive a delta refresh.
-fn require_refresh_key_type(key: &str, data_type: DataType) -> Result<(), RuntimeError> {
+fn require_refresh_key_type(key: &str, data_type: &DataType) -> Result<(), RuntimeError> {
     match data_type {
         DataType::Integer
         | DataType::BigInt
@@ -586,7 +586,8 @@ fn require_refresh_key_type(key: &str, data_type: DataType) -> Result<(), Runtim
         | DataType::Decimal
         | DataType::Boolean
         | DataType::Interval
-        | DataType::Null => Err(RuntimeError::EventStatement(format!(
+        | DataType::Null
+        | DataType::Arrow(_) => Err(RuntimeError::EventStatement(format!(
             "refresh_key '{key}' has type {}, which cannot carry an exact watermark; \
              use an integer, text, date, or timestamp column",
             data_type.value()

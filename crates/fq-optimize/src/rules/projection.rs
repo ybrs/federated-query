@@ -396,6 +396,7 @@ fn prune_through(
             | LogicalPlan::GroupedLimit(_)
             | LogicalPlan::SingleRowGuard(_)
             | LogicalPlan::LateralJoin(_)
+            | LogicalPlan::Unnest(_)
             | LogicalPlan::Explain(_)
     );
     if !modeled {

@@ -34,13 +34,14 @@ use polyglot_sql::expressions::{
 use polyglot_sql::traversal::ExpressionWalk;
 
 use crate::error::ParseError;
+use crate::nested::unnest_seed;
 
 /// The relation alias given to the subquery a QUALIFY clause wraps its input in,
 /// so the QUALIFY predicate's columns qualify to a real relation after binding.
 const QUALIFY_SUBQUERY_ALIAS: &str = "__qualify";
 
 /// Where a FROM item's columns come from, for star expansion.
-enum ColumnSource {
+pub(crate) enum ColumnSource {
     /// A base table: resolve the column list from the catalog.
     Catalog {
         datasource: Option<String>,
@@ -53,9 +54,9 @@ enum ColumnSource {
 
 /// One FROM/JOIN item, kept for star expansion: the qualifier a reference uses
 /// (`key` = alias or table name) and where its columns come from.
-struct FromTable {
-    key: String,
-    columns: ColumnSource,
+pub(crate) struct FromTable {
+    pub(crate) key: String,
+    pub(crate) columns: ColumnSource,
 }
 
 /// The clauses a parsed set-operation node carries for its ENTIRE combined
@@ -243,6 +244,7 @@ pub struct Converter<'a> {
     /// a name already on this stack is a definition cycle and raises naming it,
     /// so view expansion can never recurse forever.
     expanding_views: RefCell<Vec<String>>,
+    pub(crate) unnest_counter: std::cell::Cell<usize>,
 }
 
 impl<'a> Converter<'a> {
@@ -252,6 +254,7 @@ impl<'a> Converter<'a> {
             catalog,
             ctes: RefCell::new(HashMap::new()),
             expanding_views: RefCell::new(Vec::new()),
+            unnest_counter: std::cell::Cell::new(0),
         }
     }
 
@@ -418,30 +421,25 @@ impl<'a> Converter<'a> {
         apply_limit(sorted, select)
     }
 
-    /// A FROM-less SELECT (`SELECT 1 AS n`) is a single constant row, modelled as
-    /// a one-row `Values` relation over the converted projection expressions.
-    /// Clauses that require an input relation (WHERE / GROUP BY / HAVING / ORDER
-    /// BY / LIMIT / OFFSET / DISTINCT / QUALIFY / a star) have nothing to act on
-    /// and raise rather than being silently dropped.
+    /// Build constant rows or standalone expansion, retaining supported output clauses.
     fn values_select(&self, select: &Select) -> Result<LogicalPlan, ParseError> {
-        let has_limit = select.limit.is_some() || select.offset.is_some() || select.fetch.is_some();
-        let unsupported = [
-            (select.where_clause.is_some(), "WHERE"),
-            (select.group_by.is_some(), "GROUP BY"),
-            (select.having.is_some(), "HAVING"),
-            (select.order_by.is_some(), "ORDER BY"),
-            (has_limit, "LIMIT/OFFSET"),
-            (select.distinct || select.distinct_on.is_some(), "DISTINCT"),
-            (!select.joins.is_empty(), "JOIN"),
-            (select.qualify.is_some(), "QUALIFY"),
-        ];
-        for (present, name) in unsupported {
-            if present {
-                return Err(ParseError::Unsupported(format!(
-                    "FROM-less SELECT with {name}"
-                )));
-            }
+        let (row, names) = self.constant_items(select)?;
+        let expansion = row.iter().any(crate::nested::contains_unnest);
+        validate_constant_clauses(select, expansion)?;
+        if expansion {
+            let projected = self.fromless_unnest(row, names, select)?;
+            return apply_limit(self.apply_order_by(projected, select)?, select);
         }
+        // This is a new constant relation realizing a parsed FROM-less SELECT.
+        // Both Values fields retain its expression row and complete output names.
+        Ok(LogicalPlan::Values(Values {
+            rows: vec![row],
+            output_names: names,
+        }))
+    }
+
+    /// Convert constant SELECT items once and reject projections with no source schema.
+    fn constant_items(&self, select: &Select) -> Result<(Vec<Expr>, Vec<String>), ParseError> {
         let mut row = Vec::with_capacity(select.expressions.len());
         let mut names = Vec::with_capacity(select.expressions.len());
         for item in &select.expressions {
@@ -455,14 +453,48 @@ impl<'a> Converter<'a> {
                 names.push(name);
             }
         }
-        // Fresh VALUES node holding the one constant row - no base to copy from.
-        // Field list (rows/output_names) is the complete Values struct.
-        Ok(LogicalPlan::Values(Values {
-            rows: vec![row],
-            output_names: names,
-        }))
+        Ok((row, names))
     }
+}
 
+/// Reject clauses requiring a source relation; expansion supports output ordering and limits.
+fn validate_constant_clauses(select: &Select, expansion: bool) -> Result<(), ParseError> {
+    let mut unsupported = vec![
+        (select.where_clause.is_some(), "WHERE"),
+        (select.group_by.is_some(), "GROUP BY"),
+        (select.having.is_some(), "HAVING"),
+        (!select.joins.is_empty(), "JOIN"),
+        (select.qualify.is_some(), "QUALIFY"),
+    ];
+    if !expansion {
+        unsupported.extend(constant_output_clauses(select));
+    }
+    require_constant_clauses_absent(unsupported)
+}
+
+/// Identify output clauses that require row expansion in a source-free SELECT.
+fn constant_output_clauses(select: &Select) -> [(bool, &'static str); 3] {
+    let has_limit = select.limit.is_some() || select.offset.is_some() || select.fetch.is_some();
+    [
+        (select.order_by.is_some(), "ORDER BY"),
+        (has_limit, "LIMIT/OFFSET"),
+        (select.distinct || select.distinct_on.is_some(), "DISTINCT"),
+    ]
+}
+
+/// Raise on the first unsupported clause without discarding any parsed SQL.
+fn require_constant_clauses_absent(unsupported: Vec<(bool, &str)>) -> Result<(), ParseError> {
+    for (present, name) in unsupported {
+        if present {
+            return Err(ParseError::Unsupported(format!(
+                "FROM-less SELECT with {name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+impl Converter<'_> {
     /// Bind a WITH's CTEs into scope, build the body, and wrap it in nested `Cte`
     /// nodes (first CTE outermost). CTE names are pushed before any body is built
     /// so a CTE may reference an earlier one; they are popped afterward. A
@@ -559,6 +591,9 @@ impl<'a> Converter<'a> {
         item: &Expression,
         tables: &mut Vec<FromTable>,
     ) -> Result<LogicalPlan, ParseError> {
+        if crate::nested::unnest_item(item).is_some() {
+            return self.unnest_from(left, item, false, true, tables);
+        }
         if let Expression::Subquery(subquery) = item {
             if subquery.lateral {
                 let right = self.derived_table(subquery, tables)?;
@@ -589,6 +624,9 @@ impl<'a> Converter<'a> {
         item: &Expression,
         tables: &mut Vec<FromTable>,
     ) -> Result<LogicalPlan, ParseError> {
+        if crate::nested::unnest_item(item).is_some() {
+            return self.unnest_from(unnest_seed(), item, false, false, tables);
+        }
         match item {
             Expression::Table(table) => self.table_or_cte_ref(select, table, tables),
             Expression::Subquery(subquery) => self.derived_table(subquery, tables),
@@ -978,6 +1016,9 @@ impl<'a> Converter<'a> {
         join: &polyglot_sql::expressions::Join,
         tables: &mut Vec<FromTable>,
     ) -> Result<LogicalPlan, ParseError> {
+        if crate::nested::unnest_item(&join.this).is_some() {
+            return self.apply_unnest_join(left, join, tables);
+        }
         // Reject join modifiers the engine does not model rather than dropping
         // them silently (a trailing PIVOT / ASOF match condition changes results).
         if !join.pivots.is_empty() || join.match_condition.is_some() || join.join_hint.is_some() {
@@ -1089,8 +1130,12 @@ impl<'a> Converter<'a> {
                     "DISTINCT with GROUP BY".to_string(),
                 ));
             }
+            if expressions.iter().any(crate::nested::contains_unnest) {
+                return self.grouped_unnest(input, select, expressions, names);
+            }
             return self.build_aggregate(input, select, expressions, names);
         }
+        let (input, expressions) = self.expand_select_unnests(input, expressions)?;
         // Fresh projection realizing the SELECT list over the input, built from the
         // parsed items - no base to copy from. Field list (input/expressions/aliases/
         // distinct/distinct_on) is the complete Projection struct.
@@ -1104,7 +1149,7 @@ impl<'a> Converter<'a> {
     }
 
     /// Convert a DISTINCT ON key list, if present.
-    fn distinct_on(&self, select: &Select) -> Result<Option<Vec<Expr>>, ParseError> {
+    pub(crate) fn distinct_on(&self, select: &Select) -> Result<Option<Vec<Expr>>, ParseError> {
         let Some(keys) = &select.distinct_on else {
             return Ok(None);
         };
@@ -1197,7 +1242,7 @@ impl<'a> Converter<'a> {
     /// Build the `Aggregate` node (+ a HAVING `Filter` when present). The
     /// aggregate's `aggregates` list is the whole SELECT list, positionally
     /// aligned with `output_names`.
-    fn build_aggregate(
+    pub(crate) fn build_aggregate(
         &self,
         input: LogicalPlan,
         select: &Select,
@@ -2302,7 +2347,7 @@ fn require_trivial_lateral_on(join: &polyglot_sql::expressions::Join) -> Result<
 }
 
 /// Map a polyglot join kind to `(JoinType, natural)`; exotic kinds raise.
-fn map_join_kind(kind: JoinKind) -> Result<(JoinType, bool), ParseError> {
+pub(crate) fn map_join_kind(kind: JoinKind) -> Result<(JoinType, bool), ParseError> {
     let mapped = match kind {
         JoinKind::Inner => (JoinType::Inner, false),
         JoinKind::Left => (JoinType::Left, false),

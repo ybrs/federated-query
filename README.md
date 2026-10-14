@@ -80,6 +80,9 @@ source kind. See the event analytics tutorial for complete PostgreSQL and
 Parquet examples:
 doc/event-analytics-tutorial.md.
 
+For daily Firebase exports, nested fields, UNNEST, and event analyses, see
+[Firebase Parquet CLI workflow](doc/firebase-parquet.md).
+
 ## Query features
 
 - Federated queries across multiple sources.
@@ -90,6 +93,7 @@ doc/event-analytics-tutorial.md.
 - Correlated subquery decorrelation with NULL-aware semantics.
 - Materialized views with explicit refresh and query substitution.
 - Event datasets with funnel, retention, segmentation, and path analyses.
+- Nested Parquet schemas, struct field access, and list expansion with UNNEST.
 - EXPLAIN, catalog inspection, and runtime settings.
 - Fail-fast validation: invalid SQL, unknown tables, and unknown columns raise
   errors instead of producing rows.

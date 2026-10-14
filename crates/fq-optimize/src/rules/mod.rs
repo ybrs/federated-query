@@ -108,5 +108,6 @@ fn plan_node_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::GroupedLimit(_) => "GroupedLimit",
         LogicalPlan::LateralJoin(_) => "LateralJoin",
         LogicalPlan::TableFunction(_) => "TableFunction",
+        LogicalPlan::Unnest(_) => "Unnest",
     }
 }

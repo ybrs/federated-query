@@ -12,6 +12,7 @@ mod join;
 mod lateral;
 pub mod orient;
 pub(crate) mod set_op;
+mod unnest;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -188,6 +189,7 @@ impl PhysicalPlanner {
             LogicalPlan::SingleRowGuard(g) => self.plan_single_row_guard(g),
             LogicalPlan::GroupedLimit(gl) => self.plan_grouped_limit(gl),
             LogicalPlan::TableFunction(tf) => Ok(Self::plan_table_function(tf)),
+            LogicalPlan::Unnest(node) => self.plan_unnest(node),
         }
     }
 
@@ -463,6 +465,7 @@ impl PhysicalPlanner {
             input: Box::new(input),
             expressions: projection.expressions.clone(),
             output_names: projection.aliases.clone(),
+            physical_names: fq_plan::physical::unique_projection_names(&projection.aliases),
             distinct: projection.distinct,
             distinct_on: projection.distinct_on.clone(),
         }))

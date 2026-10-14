@@ -174,8 +174,35 @@ pub struct PhysicalProjection {
     pub input: Box<PhysicalPlan>,
     pub expressions: Vec<Expr>,
     pub output_names: Vec<String>,
+    /// The unique names the projection's binding columns actually carry. Equal
+    /// to `output_names` unless visible aliases collide, in which case the
+    /// colliding ones get `_N` suffixes: no relation in the coordinator may hold
+    /// two columns of one name, or every operator reading it (a Sort, a join)
+    /// dies in DataFusion's duplicate-qualified-name check. The visible names
+    /// still reach the user through `visible_output_names`.
+    pub physical_names: Vec<String>,
     pub distinct: bool,
     pub distinct_on: Option<Vec<Expr>>,
+}
+
+/// Allocate unique physical names while reserving every explicit visible alias.
+pub fn unique_projection_names(names: &[String]) -> Vec<String> {
+    let mut reserved: std::collections::HashSet<String> = names.iter().cloned().collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut physical = Vec::with_capacity(names.len());
+    for name in names {
+        let output = if seen.insert(name.clone()) {
+            name.clone()
+        } else {
+            (1..=names.len())
+                .map(|suffix| format!("{name}_{suffix}"))
+                .find(|candidate| !reserved.contains(candidate))
+                .expect("more candidates than duplicate outputs")
+        };
+        reserved.insert(output.clone());
+        physical.push(output);
+    }
+    physical
 }
 
 /// A projection carrying window functions, emitted as a SQL fragment for the
@@ -400,6 +427,60 @@ pub struct Gather {
     pub query: String,
 }
 
+/// Coordinator list expansion with collision-free physical output names.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalUnnest {
+    pub input: Box<PhysicalPlan>,
+    pub arguments: Vec<Expr>,
+    pub output_names: Vec<String>,
+    pub physical_names: Vec<String>,
+    pub alias: String,
+    pub outer: bool,
+    pub ordinality: Option<String>,
+    pub retain_input: bool,
+    pub predicate: Option<Expr>,
+}
+
+impl PhysicalUnnest {
+    /// Derive each element type from bound arguments and retain the parent schema.
+    pub fn schema(&self) -> Vec<(String, DataType)> {
+        let mut schema = if self.retain_input {
+            self.input.schema()
+        } else {
+            Vec::new()
+        };
+        for (argument, name) in self.arguments.iter().zip(&self.physical_names) {
+            let data_type = argument
+                .get_type()
+                .list_element()
+                .expect("bound UNNEST list");
+            schema.push((name.clone(), data_type));
+        }
+        if self.ordinality.is_some() {
+            schema.push((
+                self.physical_names.last().expect("ordinal output").clone(),
+                DataType::BigInt,
+            ));
+        }
+        schema
+    }
+
+    /// Associate each expansion column with its real relation qualifier.
+    pub fn column_aliases(&self) -> ColumnAliasMap {
+        let mut aliases = if self.retain_input {
+            self.input.column_aliases()
+        } else {
+            ColumnAliasMap::new()
+        };
+        let mut names = self.output_names.clone();
+        names.extend(self.ordinality.iter().cloned());
+        for (name, physical) in names.iter().zip(&self.physical_names) {
+            aliases.insert((Some(self.alias.clone()), name.clone()), physical.clone());
+        }
+        aliases
+    }
+}
+
 /// A physical plan node. One enum over the node structs above.
 ///
 /// The large-payload nodes (`Scan`, `RemoteQuery`, `RemoteJoin`, `RemoteSetOp`,
@@ -424,6 +505,7 @@ pub enum PhysicalPlan {
     Limit(PhysicalLimit),
     Values(PhysicalValues),
     TableFunction(PhysicalTableFunction),
+    Unnest(PhysicalUnnest),
     RemoteQuery(Box<PhysicalRemoteQuery>),
     Union(PhysicalUnion),
     RemoteSetOp(Box<PhysicalRemoteSetOp>),
@@ -450,6 +532,7 @@ impl PhysicalPlan {
             PhysicalPlan::AliasedRelation(node) => vec![&node.input],
             PhysicalPlan::CteMergeQuery(node) => node.inputs.values().collect(),
             PhysicalPlan::Projection(node) => vec![&node.input],
+            PhysicalPlan::Unnest(node) => vec![&node.input],
             PhysicalPlan::Window(node) => vec![&node.input],
             PhysicalPlan::Filter(node) => vec![&node.input],
             PhysicalPlan::HashJoin(node) => vec![&node.left, &node.right],
@@ -491,6 +574,7 @@ impl PhysicalPlan {
             PhysicalPlan::AliasedRelation(node) => node.input.schema(),
             PhysicalPlan::Scan(node) => seeded_schema(node.seeded_schema.as_ref(), "PhysicalScan"),
             PhysicalPlan::Projection(node) => projection_schema(node),
+            PhysicalPlan::Unnest(node) => node.schema(),
             PhysicalPlan::Window(node) => typed_outputs(&node.expressions, &node.output_names),
             PhysicalPlan::Filter(node) => node.input.schema(),
             PhysicalPlan::HashJoin(node) => join_schema(node.join_type, &node.left, &node.right),
@@ -624,7 +708,7 @@ fn projection_schema(node: &PhysicalProjection) -> Vec<(String, DataType)> {
                 continue;
             }
         }
-        fields.push((node.output_names[index].clone(), expr.get_type()));
+        fields.push((node.physical_names[index].clone(), expr.get_type()));
     }
     fields
 }
@@ -667,7 +751,7 @@ fn cte_schema(node: &PhysicalCte) -> Vec<(String, DataType)> {
     }
     let mut fields = Vec::with_capacity(names.len());
     for (index, name) in names.iter().enumerate() {
-        fields.push((name.clone(), base[index].1));
+        fields.push((name.clone(), base[index].1.clone()));
     }
     fields
 }
@@ -764,7 +848,6 @@ impl PhysicalPlan {
             // (LateralJoin overrides to the same empty map).
             PhysicalPlan::Cte(_)
             | PhysicalPlan::CteMergeQuery(_)
-            | PhysicalPlan::Limit(_)
             | PhysicalPlan::Values(_)
             | PhysicalPlan::RemoteSetOp(_)
             | PhysicalPlan::SetOperation(_)
@@ -773,6 +856,7 @@ impl PhysicalPlan {
             | PhysicalPlan::Gather(_) => ColumnAliasMap::new(),
             // Row-preserving wrappers resolve against their producing child.
             PhysicalPlan::Filter(node) => node.input.column_aliases(),
+            PhysicalPlan::Limit(node) => node.input.column_aliases(),
             PhysicalPlan::Sort(node) => node.input.column_aliases(),
             PhysicalPlan::SingleRowGuard(node) => node.input.column_aliases(),
             PhysicalPlan::GroupedLimit(node) => node.input.column_aliases(),
@@ -790,6 +874,7 @@ impl PhysicalPlan {
             PhysicalPlan::CteScan(node) => cte_scan_column_aliases(node),
             // Output-defining nodes.
             PhysicalPlan::Projection(node) => projection_column_aliases(node),
+            PhysicalPlan::Unnest(node) => node.column_aliases(),
             PhysicalPlan::HashAggregate(node) => aggregate_column_aliases(node),
             PhysicalPlan::Window(node) => output_name_aliases(&node.output_names),
             PhysicalPlan::Union(node) => {
@@ -860,18 +945,27 @@ fn cte_scan_column_aliases(node: &PhysicalCteScan) -> ColumnAliasMap {
     alias_column_map(Some(&relation), &output_column_names(&node.producer))
 }
 
-/// A projection's OUTPUT columns: each output reachable unqualified by its name,
-/// and a passthrough of a plain (non-star) source column also reachable by its
-/// source qualifier - so a renamed collision column resolves to the OUTPUT name.
-/// Ports `PhysicalProjection.column_aliases`.
+/// A projection's OUTPUT columns: each output reachable unqualified by its
+/// visible name, and a passthrough of a plain (non-star) source column also
+/// reachable by its source qualifier - so a renamed collision column resolves
+/// to the OUTPUT's physical name. When two outputs share a visible name the
+/// FIRST one wins the shared key, mirroring SQL name resolution to the first
+/// matching column; the later one stays reachable by its own source qualifier
+/// (or is simply shadowed, as it is in the query language).
 fn projection_column_aliases(node: &PhysicalProjection) -> ColumnAliasMap {
     let mut aliases = ColumnAliasMap::new();
     for (index, expr) in node.expressions.iter().enumerate() {
-        let name = &node.output_names[index];
-        aliases.insert((None, name.clone()), name.clone());
+        let visible = &node.output_names[index];
+        let physical = &node.physical_names[index];
+        aliases
+            .entry((None, visible.clone()))
+            .or_insert_with(|| physical.clone());
         if let Expr::Column(col) = expr {
             if col.column != "*" {
-                aliases.insert((col.table.clone(), col.column.clone()), name.clone());
+                let source_key = (col.table.clone(), col.column.clone());
+                aliases
+                    .entry(source_key)
+                    .or_insert_with(|| physical.clone());
             }
         }
     }
@@ -953,31 +1047,60 @@ fn remote_join_column_aliases(node: &PhysicalRemoteJoin) -> ColumnAliasMap {
 /// renderers need a node's output NAMES without probing a source or typing every
 /// column (which `schema()` would panic on for a non-seeded scan).
 pub fn output_column_names(plan: &PhysicalPlan) -> Vec<String> {
+    plan_output_names(plan, output_column_names, projection_output_names, false)
+}
+
+/// The user-VISIBLE column names of a plan's result: the same walk as
+/// `output_column_names`, except a projection's outputs are its visible aliases
+/// (which may repeat), because the runtime renames the executed result onto
+/// them. Binding-level consumers (star expansion, join output naming, the
+/// alias maps) must use `output_column_names`, which carries the unique
+/// physical names the bindings actually hold.
+pub fn visible_output_names(plan: &PhysicalPlan) -> Vec<String> {
+    plan_output_names(plan, visible_output_names, projection_visible_names, true)
+}
+
+/// The shared name walk. `names_for` names a child plan (binding-level or
+/// visible, per the public wrapper); `projection_names` names a Projection's
+/// own outputs, where the two flavors diverge.
+type OutputNameWalker = fn(&PhysicalPlan) -> Vec<String>;
+type ProjectionNameWalker = fn(&PhysicalProjection, OutputNameWalker) -> Vec<String>;
+
+/// Walk physical or visible names using the selected projection naming function.
+fn plan_output_names(
+    plan: &PhysicalPlan,
+    names_for: fn(&PhysicalPlan) -> Vec<String>,
+    projection_names: ProjectionNameWalker,
+    visible: bool,
+) -> Vec<String> {
     match plan {
-        PhysicalPlan::Cte(node) => cte_output_names(node),
-        PhysicalPlan::CteScan(node) => output_column_names(&node.producer),
-        PhysicalPlan::Shipment(node) => output_column_names(&node.child),
-        PhysicalPlan::AliasedRelation(node) => output_column_names(&node.input),
+        PhysicalPlan::Cte(node) => cte_output_names(node, names_for),
+        PhysicalPlan::CteScan(node) => names_for(&node.producer),
+        PhysicalPlan::Shipment(node) => names_for(&node.child),
+        PhysicalPlan::AliasedRelation(node) => names_for(&node.input),
         PhysicalPlan::CteMergeQuery(node) => node.output_names.clone(),
         PhysicalPlan::Scan(node) => scan_output_names(node),
-        PhysicalPlan::Projection(node) => projection_output_names(node),
+        PhysicalPlan::Projection(node) => projection_names(node, names_for),
+        PhysicalPlan::Unnest(node) => unnest_output_names(node, names_for, visible),
         PhysicalPlan::Window(node) => node.output_names.clone(),
-        PhysicalPlan::Filter(node) => output_column_names(&node.input),
-        PhysicalPlan::HashJoin(node) => join_output_names(node.join_type, &node.left, &node.right),
+        PhysicalPlan::Filter(node) => names_for(&node.input),
+        PhysicalPlan::HashJoin(node) => {
+            join_output_names(node.join_type, &node.left, &node.right, names_for)
+        }
         PhysicalPlan::NestedLoopJoin(node) => {
-            join_output_names(node.join_type, &node.left, &node.right)
+            join_output_names(node.join_type, &node.left, &node.right, names_for)
         }
         PhysicalPlan::HashAggregate(node) => node.output_names.clone(),
-        PhysicalPlan::Sort(node) => output_column_names(&node.input),
-        PhysicalPlan::Limit(node) => output_column_names(&node.input),
+        PhysicalPlan::Sort(node) => names_for(&node.input),
+        PhysicalPlan::Limit(node) => names_for(&node.input),
         PhysicalPlan::Values(node) => node.output_names.clone(),
         PhysicalPlan::TableFunction(node) => node.output_names.clone(),
         PhysicalPlan::RemoteQuery(node) => node.output_names.clone(),
-        PhysicalPlan::Union(node) => output_column_names(first_union_input(node)),
-        PhysicalPlan::SetOperation(node) => output_column_names(&node.left),
-        PhysicalPlan::RemoteSetOp(node) => output_column_names(&node.left),
-        PhysicalPlan::SingleRowGuard(node) => output_column_names(&node.input),
-        PhysicalPlan::GroupedLimit(node) => output_column_names(&node.input),
+        PhysicalPlan::Union(node) => names_for(first_union_input(node)),
+        PhysicalPlan::SetOperation(node) => names_for(&node.left),
+        PhysicalPlan::RemoteSetOp(node) => names_for(&node.left),
+        PhysicalPlan::SingleRowGuard(node) => names_for(&node.input),
+        PhysicalPlan::GroupedLimit(node) => names_for(&node.input),
         PhysicalPlan::LateralJoin(node) => node.output_names.clone(),
         PhysicalPlan::Explain(_) => vec!["plan".to_string()],
         PhysicalPlan::RemoteJoin(node) => remote_join_output_names(node),
@@ -986,6 +1109,28 @@ pub fn output_column_names(plan: &PhysicalPlan) -> Vec<String> {
              only the query string"
         ),
     }
+}
+
+/// Derive expansion names without requesting source types or reading any data.
+fn unnest_output_names(
+    node: &PhysicalUnnest,
+    names_for: fn(&PhysicalPlan) -> Vec<String>,
+    visible: bool,
+) -> Vec<String> {
+    let mut names = if node.retain_input {
+        names_for(&node.input)
+    } else {
+        Vec::new()
+    };
+    // Element outputs carry their visible names in the result and their
+    // physical names in the binding; pick per flavor.
+    if visible {
+        names.extend(node.output_names.iter().cloned());
+        names.extend(node.ordinality.iter().cloned());
+    } else {
+        names.extend(node.physical_names.iter().cloned());
+    }
+    names
 }
 
 /// A scan's output names without a source probe: its seeded names when a shipped
@@ -1004,14 +1149,36 @@ fn scan_output_names(scan: &PhysicalScan) -> Vec<String> {
         .unwrap_or_else(|| scan.columns.clone())
 }
 
-/// A projection's output names, splicing every input column in for a `*` column
-/// reference. The name side of `projection_schema`.
-fn projection_output_names(node: &PhysicalProjection) -> Vec<String> {
+/// A projection's binding-level output names, splicing every input column in
+/// for a `*` column reference. The name side of `projection_schema`.
+fn projection_output_names(
+    node: &PhysicalProjection,
+    names_for: fn(&PhysicalPlan) -> Vec<String>,
+) -> Vec<String> {
     let mut names = Vec::new();
     for (index, expr) in node.expressions.iter().enumerate() {
         if let Expr::Column(col) = expr {
             if col.column == "*" {
-                names.extend(output_column_names(&node.input));
+                names.extend(names_for(&node.input));
+                continue;
+            }
+        }
+        names.push(node.physical_names[index].clone());
+    }
+    names
+}
+
+/// A projection's VISIBLE output names, splicing every input column in for a
+/// `*` column reference. The user-facing side of `projection_schema`.
+fn projection_visible_names(
+    node: &PhysicalProjection,
+    names_for: fn(&PhysicalPlan) -> Vec<String>,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    for (index, expr) in node.expressions.iter().enumerate() {
+        if let Expr::Column(col) = expr {
+            if col.column == "*" {
+                names.extend(names_for(&node.input));
                 continue;
             }
         }
@@ -1022,8 +1189,11 @@ fn projection_output_names(node: &PhysicalProjection) -> Vec<String> {
 
 /// A CTE's output names: the body's, relabeled when a differing `column_names`
 /// rename list is set. The name side of `PhysicalCTE.schema`.
-fn cte_output_names(node: &PhysicalCte) -> Vec<String> {
-    let base = output_column_names(&node.body);
+fn cte_output_names(
+    node: &PhysicalCte,
+    names_for: fn(&PhysicalPlan) -> Vec<String>,
+) -> Vec<String> {
+    let base = names_for(&node.body);
     match &node.column_names {
         Some(names) if names != &base => names.clone(),
         _ => base,
@@ -1037,13 +1207,14 @@ fn join_output_names(
     join_type: JoinType,
     left: &PhysicalPlan,
     right: &PhysicalPlan,
+    names_for: fn(&PhysicalPlan) -> Vec<String>,
 ) -> Vec<String> {
-    let mut names = output_column_names(left);
+    let mut names = names_for(left);
     if matches!(join_type, JoinType::Semi | JoinType::Anti) {
         return names;
     }
     let left_names = names.clone();
-    for right_name in output_column_names(right) {
+    for right_name in names_for(right) {
         names.push(right_output_name(&right_name, &left_names));
     }
     names
@@ -1221,6 +1392,7 @@ mod tests {
             input: Box::new(scan()),
             expressions: vec![column("t", "region", DataType::Varchar), int_literal(1)],
             output_names: vec!["region".to_string(), "one".to_string()],
+            physical_names: vec!["region".to_string(), "one".to_string()],
             distinct: false,
             distinct_on: None,
         });
@@ -1239,6 +1411,7 @@ mod tests {
             input: Box::new(values("only")),
             expressions: vec![Expr::Column(ColumnRef::new(None, "*", None))],
             output_names: vec!["ignored".to_string()],
+            physical_names: vec!["ignored".to_string()],
             distinct: false,
             distinct_on: None,
         });
@@ -1275,7 +1448,7 @@ mod tests {
             let aggregate = PhysicalPlan::HashAggregate(PhysicalHashAggregate {
                 input: Box::new(scan()),
                 group_by: vec![],
-                aggregates: vec![agg(name, arg_type)],
+                aggregates: vec![agg(name, arg_type.clone())],
                 output_names: vec!["out".to_string()],
                 grouping_sets: None,
                 group_observation: None,
@@ -1443,6 +1616,7 @@ mod tests {
             input: Box::new(scan_with(Some("t"), &["region"])),
             expressions: vec![column("t", "region", DataType::Varchar), int_literal(1)],
             output_names: vec!["region".to_string(), "one".to_string()],
+            physical_names: vec!["region".to_string(), "one".to_string()],
             distinct: false,
             distinct_on: None,
         });
@@ -1541,15 +1715,15 @@ mod tests {
     }
 
     #[test]
-    fn limit_exposes_no_aliases() {
-        // A limit is one of the nodes that does NOT pass its child's aliases
-        // through (it returns the base empty map), unlike filter/sort.
+    fn limit_preserves_input_aliases() {
+        let input = scan_with(Some("o"), &["id"]);
+        let expected = input.column_aliases();
         let limit = PhysicalPlan::Limit(PhysicalLimit {
-            input: Box::new(scan_with(Some("o"), &["id"])),
+            input: Box::new(input),
             limit: Some(10),
             offset: 0,
         });
-        assert!(limit.column_aliases().is_empty());
+        assert_eq!(limit.column_aliases(), expected);
     }
 
     // ---- physical_column_name() --------------------------------------------

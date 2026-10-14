@@ -172,6 +172,7 @@ pub fn variant_name(node: &PhysicalPlan) -> &'static str {
         PhysicalPlan::CteMergeQuery(_) => "CteMergeQuery",
         PhysicalPlan::Scan(_) => "Scan",
         PhysicalPlan::TableFunction(_) => "TableFunction",
+        PhysicalPlan::Unnest(_) => "Unnest",
         PhysicalPlan::Projection(_) => "Projection",
         PhysicalPlan::Window(_) => "Window",
         PhysicalPlan::Filter(_) => "Filter",

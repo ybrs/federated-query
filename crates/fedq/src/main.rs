@@ -3,15 +3,17 @@
 //! One-shot: `fedq --config <yaml> --command "<sql>"` (or `--file <path.sql>`)
 //! runs a single statement, prints the result in the requested `--format`
 //! (table, csv, or json), and exits nonzero with the error on stderr if it
-//! fails. With neither `--command` nor `--file`, the same config opens an
-//! interactive REPL (see the `repl` module). Argument parsing is clap-derived so
-//! the flag surface and `--help` stay defined in one place.
+//! fails. `--timings` prints the execution time after a successful result. With
+//! neither `--command` nor `--file`, the same config opens an interactive REPL
+//! (see the `repl` module). Argument parsing is clap-derived so the flag
+//! surface and `--help` stay defined in one place.
 
 mod render;
 mod repl;
 
 use std::path::PathBuf;
 use std::process::exit;
+use std::time::Instant;
 
 use clap::Parser;
 use fq_common::load_config;
@@ -40,6 +42,10 @@ struct Cli {
     /// The output format for results.
     #[arg(long, value_enum, default_value = "table")]
     format: OutputFormat,
+
+    /// Print the query execution time after each result.
+    #[arg(long)]
+    timings: bool,
 
     /// Tracing level for engine logs: error, warn, info, debug, trace.
     #[arg(long, value_name = "LEVEL", default_value = "info")]
@@ -77,8 +83,8 @@ fn run(cli: &Cli) -> Result<(), String> {
         .map_err(|error| format!("failed to load config {config_path}: {error}"))?;
     let runtime = Runtime::from_config(&config).map_err(|error| error.to_string())?;
     match one_shot_sql(cli)? {
-        Some(sql) => run_once(&runtime, &sql, cli.format),
-        None => repl::run(&runtime, cli.format).map_err(|error| error.to_string()),
+        Some(sql) => run_once(&runtime, &sql, cli.format, cli.timings),
+        None => repl::run(&runtime, cli.format, cli.timings).map_err(|error| error.to_string()),
     }
 }
 
@@ -101,15 +107,26 @@ fn one_shot_sql(cli: &Cli) -> Result<Option<String>, String> {
 /// (an empty command or a file of only whitespace/`;`) is a usage error rather
 /// than a silent no-op. A trailing `;` is stripped; an interior one is left for
 /// the parser to reject loudly.
-fn run_once(runtime: &Runtime, sql: &str, format: OutputFormat) -> Result<(), String> {
+fn run_once(
+    runtime: &Runtime,
+    sql: &str,
+    format: OutputFormat,
+    timings: bool,
+) -> Result<(), String> {
     let statement = sql.trim().trim_end_matches(';').trim();
     if statement.is_empty() {
         return Err("no SQL statement to execute".to_owned());
     }
-    let (schema, batches) = runtime
+    let started = Instant::now();
+    let result = runtime
         .execute(statement)
         .map_err(|error| error.to_string())?;
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let (schema, batches) = result;
     let text = render(format, &schema, &batches).map_err(|error| error.to_string())?;
     println!("{text}");
+    if timings {
+        eprintln!("Time: {elapsed_ms:.2} ms");
+    }
     Ok(())
 }

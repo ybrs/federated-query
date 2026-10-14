@@ -418,7 +418,7 @@ impl Runtime {
     /// with view substitution enabled.
     fn execute_query(&self, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         let (physical, substitutions) = self.plan_inner(sql, true)?;
-        let visible_names = output_column_names(&physical);
+        let visible_names = fq_plan::physical::visible_output_names(&physical);
         self.ensure_event_analysis_ready(&physical)?;
         let execution = execute_plan(self.session, &physical)?;
         self.record_pushdown_fragments(&physical)?;
@@ -444,7 +444,7 @@ impl Runtime {
         sql: &str,
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         let (physical, _no_substitutions) = self.plan_inner(sql, false)?;
-        let visible_names = output_column_names(&physical);
+        let visible_names = fq_plan::physical::visible_output_names(&physical);
         self.ensure_event_analysis_ready(&physical)?;
         let execution = execute_plan(self.session, &physical)?;
         self.persist_observations(&execution.measurements, &execution.observations)?;

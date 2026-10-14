@@ -14,6 +14,7 @@
 pub mod binder;
 pub mod error;
 pub mod expr;
+mod nested;
 
 pub use binder::Binder;
 pub use error::BindError;

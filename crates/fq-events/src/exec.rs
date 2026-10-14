@@ -610,7 +610,7 @@ fn compile_compare(
     let mismatch = || {
         EventError::Binding(EventBindingError::LiteralType {
             property: property.to_string(),
-            data_type: def.data_type.value().to_string(),
+            data_type: def.data_type.value(),
             literal: literal_kind(literal).to_string(),
         })
     };
@@ -695,7 +695,7 @@ fn compile_in_list(
                 let PredicateLiteral::Str(value) = literal else {
                     return Err(EventBindingError::LiteralType {
                         property: property.to_string(),
-                        data_type: def.data_type.value().to_string(),
+                        data_type: def.data_type.value(),
                         literal: literal_kind(literal).to_string(),
                     }
                     .into());
@@ -718,7 +718,7 @@ fn compile_in_list(
                 let PredicateLiteral::Str(value) = literal else {
                     return Err(EventBindingError::LiteralType {
                         property: property.to_string(),
-                        data_type: def.data_type.value().to_string(),
+                        data_type: def.data_type.value(),
                         literal: literal_kind(literal).to_string(),
                     }
                     .into());
@@ -736,7 +736,7 @@ fn compile_in_list(
                     PredicateLiteral::Str(_) | PredicateLiteral::Bool(_) => {
                         return Err(EventBindingError::LiteralType {
                             property: property.to_string(),
-                            data_type: def.data_type.value().to_string(),
+                            data_type: def.data_type.value(),
                             literal: literal_kind(literal).to_string(),
                         }
                         .into())
@@ -747,7 +747,7 @@ fn compile_in_list(
         }
         PropertyEncoding::Bool => Err(EventBindingError::LiteralType {
             property: property.to_string(),
-            data_type: def.data_type.value().to_string(),
+            data_type: def.data_type.value(),
             literal: "list".to_string(),
         }
         .into()),

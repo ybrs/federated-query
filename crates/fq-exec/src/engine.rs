@@ -220,6 +220,7 @@ fn coordinator_context(config: SessionConfig) -> SessionContext {
         .with_default_features()
         .with_config(config)
         .with_runtime_env(runtime_env())
+        .with_query_planner(Arc::new(crate::list_expansion::ExpansionQueryPlanner))
         .with_physical_optimizer_rules(rules)
         .build();
     SessionContext::new_with_state(state)
@@ -448,6 +449,7 @@ fn fragment_kind(fragment: &Fragment) -> &'static str {
         Fragment::HashJoin { .. } => "hash_join",
         Fragment::NestedLoopJoin { .. } => "nested_loop_join",
         Fragment::Project { .. } => "project",
+        Fragment::Unnest { .. } => "unnest",
         Fragment::Aggregate { .. } => "aggregate",
         Fragment::Sort { .. } => "sort",
         Fragment::Filter { .. } => "filter",
@@ -1493,6 +1495,25 @@ async fn run_fragment(
             let frame = ctx.table("in_0").await?;
             projected_binding(frame, project, *distinct, input_bytes).await
         }
+        Fragment::Unnest {
+            arguments,
+            outer,
+            ordinality,
+            retain_input,
+            predicate,
+        } => {
+            let frame = ctx.table("in_0").await?;
+            let frame = crate::unnest::expand_lists(
+                frame,
+                arguments,
+                *outer,
+                ordinality.as_deref(),
+                *retain_input,
+                predicate.as_ref(),
+            )
+            .await?;
+            Ok(lazy(frame, input_bytes))
+        }
         Fragment::Aggregate {
             select,
             group_by,
@@ -1973,7 +1994,7 @@ fn render_agg(agg: &AggCall) -> Result<String, DataFusionError> {
     if let Some(wg) = &agg.within_group {
         let key = render_expr(&to_df_expr(&wg.key)?)?;
         let direction = if wg.desc { " DESC" } else { "" };
-        sql.push_str(&format!(" WITHIN GROUP (ORDER BY {key}{direction})"));
+        sql = ordered_aggregate_sql(&agg.func, &sql, &format!("{key}{direction}"));
     }
     if let Some(predicate) = &agg.filter {
         // DataFusion's SQL planner applies `agg(...) FILTER (WHERE predicate)` to the
@@ -1982,6 +2003,17 @@ fn render_agg(agg: &AggCall) -> Result<String, DataFusionError> {
         sql.push_str(&format!(" FILTER (WHERE {rendered})"));
     }
     Ok(sql)
+}
+
+/// Render list ordering as an aggregate argument and ordered-set ordering as a clause.
+fn ordered_aggregate_sql(name: &str, sql: &str, ordering: &str) -> String {
+    if name.eq_ignore_ascii_case("ARRAY_AGG") {
+        let arguments = sql
+            .strip_suffix(')')
+            .expect("aggregate closing parenthesis");
+        return format!("{arguments} ORDER BY {ordering} NULLS LAST)");
+    }
+    format!("{sql} WITHIN GROUP (ORDER BY {ordering})")
 }
 
 /// The parenthesized argument text of an aggregate call. `avg(x)` wraps its single

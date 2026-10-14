@@ -8,7 +8,7 @@ rendering, and the readline loop.
 ## Options
 
 ```
-fedq --config <YAML> [--command <SQL> | --file <PATH>] [--format table|csv|json]
+fedq --config <YAML> [--command <SQL> | --file <PATH>] [--format table|csv|json] [--timings]
 ```
 
 - `--config, -c <YAML>` (required): the YAML engine config (datasources,
@@ -17,6 +17,9 @@ fedq --config <YAML> [--command <SQL> | --file <PATH>] [--format table|csv|json]
   exclusive with `--file`.
 - `--file <PATH>`: run the file's contents as one statement, then exit.
 - `--format table|csv|json` (default `table`): the output format.
+- `--timings`: print `Time: <milliseconds> ms` to stderr after each successful
+  result. The duration covers query execution through `Runtime::execute` and
+  excludes result formatting, so CSV and JSON stay machine-readable on stdout.
 
 With neither `--command` nor `--file`, fedq opens the interactive shell.
 
@@ -54,6 +57,9 @@ fedq --config engine.yaml --format json --command "SELECT id, name FROM shop.mai
 
 # Run a statement from a file
 fedq --config engine.yaml --file report.sql
+
+# Print the query execution time after its result
+fedq --config engine.yaml --timings --command "SELECT count(*) FROM shop.main.items"
 ```
 
 `EXPLAIN` needs no special handling: `EXPLAIN <query>` renders as its single
@@ -84,5 +90,7 @@ fedq>
   buffer ending in `;`.
 - `\q` quits; Ctrl-D on an empty prompt also quits.
 - `\timing` toggles a per-statement elapsed-time line.
+- Starting fedq with `--timings` enables the same line for every statement;
+  `\timing` can still toggle it during the session.
 - Ctrl-C abandons the statement in progress and returns to a fresh prompt.
 - A statement that fails prints its error to stderr and the shell continues.

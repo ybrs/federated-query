@@ -67,8 +67,8 @@ pub fn to_response(
 pub fn describe_fields(columns: &[(String, EngineType)]) -> PgWireResult<Vec<FieldInfo>> {
     let mut fields = Vec::with_capacity(columns.len());
     for (name, engine_type) in columns {
-        let pg_type = engine_to_pg_type(*engine_type)
-            .ok_or_else(|| unsupported_engine_type(name, *engine_type))?;
+        let pg_type = engine_to_pg_type(engine_type)
+            .ok_or_else(|| unsupported_engine_type(name, engine_type))?;
         fields.push(FieldInfo::new(
             name.clone(),
             None,
@@ -173,7 +173,7 @@ fn arrow_to_pg_type(data_type: &DataType) -> Option<Type> {
 /// the executor can produce, so a described column and its executed rows carry
 /// the same Postgres type. Returns `None` for a type that never reaches a result
 /// column (INTERVAL, NULL).
-fn engine_to_pg_type(engine_type: EngineType) -> Option<Type> {
+fn engine_to_pg_type(engine_type: &EngineType) -> Option<Type> {
     Some(match engine_type {
         EngineType::Integer => Type::INT4,
         EngineType::BigInt => Type::INT8,
@@ -184,7 +184,7 @@ fn engine_to_pg_type(engine_type: EngineType) -> Option<Type> {
         EngineType::Boolean => Type::BOOL,
         EngineType::Date => Type::DATE,
         EngineType::Timestamp => Type::TIMESTAMP,
-        EngineType::Interval | EngineType::Null => return None,
+        EngineType::Interval | EngineType::Null | EngineType::Arrow(_) => return None,
     })
 }
 
@@ -273,7 +273,7 @@ fn unsupported_type(name: &str, data_type: &DataType) -> PgWireError {
 
 /// The error returned when a result column carries an engine type the server
 /// cannot map to a Postgres type (INTERVAL, NULL).
-fn unsupported_engine_type(name: &str, engine_type: EngineType) -> PgWireError {
+fn unsupported_engine_type(name: &str, engine_type: &EngineType) -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new(
         "ERROR".to_owned(),
         "0A000".to_owned(),

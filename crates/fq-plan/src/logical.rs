@@ -463,6 +463,34 @@ pub enum LogicalPlan {
     GroupedLimit(GroupedLimit),
     LateralJoin(LateralJoin),
     TableFunction(TableFunction),
+    Unnest(Unnest),
+}
+
+/// List expansion retains typed arguments and its explicit output relation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Unnest {
+    pub input: Box<LogicalPlan>,
+    pub arguments: Vec<Expr>,
+    pub output_names: Vec<String>,
+    pub alias: String,
+    pub outer: bool,
+    pub ordinality: Option<String>,
+    pub retain_input: bool,
+    pub predicate: Option<Expr>,
+}
+
+impl Unnest {
+    /// Expose parent columns when correlated, followed by expansion outputs.
+    pub fn schema(&self) -> Vec<String> {
+        let mut names = if self.retain_input {
+            self.input.schema()
+        } else {
+            Vec::new()
+        };
+        names.extend(self.output_names.iter().cloned());
+        names.extend(self.ordinality.iter().cloned());
+        names
+    }
 }
 
 impl LogicalPlan {
@@ -474,6 +502,7 @@ impl LogicalPlan {
             | LogicalPlan::Values(_)
             | LogicalPlan::TableFunction(_) => Vec::new(),
             LogicalPlan::Projection(node) => vec![&node.input],
+            LogicalPlan::Unnest(node) => vec![&node.input],
             LogicalPlan::Filter(node) => vec![&node.input],
             LogicalPlan::Aggregate(node) => vec![&node.input],
             LogicalPlan::Sort(node) => vec![&node.input],
@@ -495,6 +524,7 @@ impl LogicalPlan {
         match self {
             LogicalPlan::Scan(node) => node.schema(),
             LogicalPlan::Projection(node) => node.schema(),
+            LogicalPlan::Unnest(node) => node.schema(),
             LogicalPlan::Filter(node) => node.input.schema(),
             LogicalPlan::Join(node) => node.schema(),
             LogicalPlan::Aggregate(node) => node.output_names.clone(),
@@ -536,6 +566,10 @@ impl LogicalPlan {
             LogicalPlan::Projection(mut node) => {
                 node.input = Box::new(f(*node.input)?);
                 LogicalPlan::Projection(node)
+            }
+            LogicalPlan::Unnest(mut node) => {
+                node.input = Box::new(f(*node.input)?);
+                LogicalPlan::Unnest(node)
             }
             LogicalPlan::Filter(mut node) => {
                 node.input = Box::new(f(*node.input)?);
@@ -625,6 +659,9 @@ impl LogicalPlan {
                 exprs
             }
             LogicalPlan::Filter(node) => vec![&node.predicate],
+            LogicalPlan::Unnest(node) => {
+                node.arguments.iter().chain(node.predicate.iter()).collect()
+            }
             LogicalPlan::Join(node) => node.condition.iter().collect(),
             LogicalPlan::Aggregate(node) => {
                 let mut exprs: Vec<&Expr> = node.group_by.iter().collect();

@@ -24,6 +24,8 @@ pub mod connectors;
 pub mod core;
 pub mod engine;
 pub mod error;
+mod list_expansion;
+mod unnest;
 
 pub use bridge::{execute_plan, serialize_expr, to_ir, PlanExecution};
 pub use engine::{ensure_exec_runtime, execute};

@@ -21,9 +21,25 @@ use crate::convert::{nulls_of, Converter};
 use crate::error::ParseError;
 
 impl Converter<'_> {
+    /// Convert both parsed array constructors without losing any element expressions.
+    fn array_expression(&self, elements: &[Expression]) -> Result<Expr, ParseError> {
+        let mut items = Vec::new();
+        for element in elements {
+            items.push(self.expr(element)?);
+        }
+        Ok(scalar_function_call("MAKE_ARRAY".to_string(), items))
+    }
+
     /// Convert one polyglot expression into an engine expression.
     pub(crate) fn expr(&self, expr: &Expression) -> Result<Expr, ParseError> {
         match expr {
+            Expression::Unnest(function) => self.unnest_expression(function),
+            Expression::Array(array) => self.array_expression(&array.expressions),
+            Expression::ArrayFunc(array) => self.array_expression(&array.expressions),
+            Expression::Dot(access) => Ok(scalar_function_call(
+                "STRUCT_EXTRACT".to_string(),
+                vec![self.expr(&access.this)?, string_literal(&access.field.name)],
+            )),
             Expression::Column(column) => Ok(Expr::Column(ColumnRef::new(
                 column.table.as_ref().map(|ident| ident.name.clone()),
                 column.name.name.clone(),
@@ -514,6 +530,8 @@ impl Converter<'_> {
 
     /// Convert SUM/AVG/MIN/MAX(expr), carrying an optional FILTER (WHERE ...) clause.
     fn convert_aggregate(&self, name: &str, agg: &AggFunc) -> Result<Expr, ParseError> {
+        require_aggregate_modifiers(agg)?;
+        let (within_group_key, within_group_desc) = self.aggregate_order(name, &agg.order_by)?;
         // Fresh SUM/AVG/MIN/MAX call built from the parsed aggregate - no base to copy
         // from. Field list (function_name/args/is_aggregate/distinct/within_group_key/
         // within_group_desc/filter) is the complete FunctionCall variant.
@@ -522,10 +540,29 @@ impl Converter<'_> {
             args: vec![self.expr(&agg.this)?],
             is_aggregate: true,
             distinct: agg.distinct,
-            within_group_key: None,
-            within_group_desc: false,
+            within_group_key,
+            within_group_desc,
             filter: self.convert_agg_filter(agg.filter.as_ref())?,
         })
+    }
+
+    /// Preserve the single-key ordering represented by the aggregate expression model.
+    fn aggregate_order(
+        &self,
+        name: &str,
+        ordering: &[Ordered],
+    ) -> Result<(Option<Box<Expr>>, bool), ParseError> {
+        if ordering.is_empty() {
+            return Ok((None, false));
+        }
+        if name != "ARRAY_AGG" || ordering.len() != 1 {
+            return Err(ParseError::Unsupported(
+                "aggregate ORDER BY requires one ARRAY_AGG key".to_string(),
+            ));
+        }
+        let key = &ordering[0];
+        require_aggregate_order(key)?;
+        Ok((Some(Box::new(self.expr(&key.this)?)), key.desc))
     }
 
     /// Convert STRING_AGG(value, separator). The separator is a plain argument in
@@ -683,6 +720,11 @@ fn reject_ordered_set_filter(filter: Option<&Expression>) -> Result<(), ParseErr
 /// Build a scalar function-call expression from a name and converted args. A scalar
 /// call never carries a FILTER (that is an aggregate-only clause), so filter is None.
 pub(crate) fn scalar_function_call(name: String, args: Vec<Expr>) -> Expr {
+    let name = if name.eq_ignore_ascii_case("unnest") {
+        "__fedq_unnest".to_string()
+    } else {
+        name
+    };
     // Fresh scalar function call built from a name + converted args - no base to copy
     // from. Field list (function_name/args/is_aggregate/distinct/within_group_key/
     // within_group_desc/filter) is the complete FunctionCall variant.
@@ -694,6 +736,36 @@ pub(crate) fn scalar_function_call(name: String, args: Vec<Expr>) -> Expr {
         within_group_key: None,
         within_group_desc: false,
         filter: None,
+    }
+}
+
+/// Reject aggregate modifiers that cannot be preserved by the expression model.
+fn require_aggregate_modifiers(agg: &AggFunc) -> Result<(), ParseError> {
+    if agg.ignore_nulls.is_some() || agg.having_max.is_some() || agg.limit.is_some() {
+        return Err(ParseError::Unsupported(
+            "aggregate NULLS/HAVING/LIMIT modifiers".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Reject ordering options absent from the aggregate expression model.
+fn require_aggregate_order(key: &Ordered) -> Result<(), ParseError> {
+    if key.nulls_first == Some(true) || key.with_fill.is_some() {
+        return Err(ParseError::Unsupported(
+            "aggregate NULLS FIRST/WITH FILL".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Construct a literal field name for typed structured access.
+fn string_literal(value: &str) -> Expr {
+    // This is a new constant derived from a parsed field identifier.
+    // Both literal fields are supplied: the string value and its scalar type.
+    Expr::Literal {
+        value: LiteralValue::String(value.to_string()),
+        data_type: fq_common::DataType::Varchar,
     }
 }
 
@@ -1014,7 +1086,11 @@ fn convert_number(text: &str) -> Result<Expr, ParseError> {
         // from. Field list (value/data_type) is the complete Literal variant.
         return Ok(Expr::Literal {
             value: LiteralValue::Integer(integer),
-            data_type: fq_common::DataType::Integer,
+            data_type: if i32::try_from(integer).is_ok() {
+                fq_common::DataType::Integer
+            } else {
+                fq_common::DataType::BigInt
+            },
         });
     }
     let value = text

@@ -18,6 +18,7 @@ pub mod error;
 mod events;
 pub mod expr;
 pub mod functions;
+mod nested;
 pub mod statement;
 mod window;
 

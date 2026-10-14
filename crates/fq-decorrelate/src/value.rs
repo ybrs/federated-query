@@ -336,6 +336,15 @@ fn passthrough_columns(plan: &LogicalPlan) -> Result<Vec<Expr>> {
             let qualifier = node.alias.clone().unwrap_or_else(|| node.name.clone());
             Ok(relation_columns(&qualifier, &plan.schema()))
         }
+        LogicalPlan::Unnest(node) => {
+            let mut columns = if node.retain_input {
+                passthrough_columns(&node.input)?
+            } else {
+                Vec::new()
+            };
+            columns.extend(relation_columns(&node.alias, &unnest_output_names(node)));
+            Ok(columns)
+        }
         LogicalPlan::Filter(node) => passthrough_columns(&node.input),
         LogicalPlan::Sort(node) => passthrough_columns(&node.input),
         LogicalPlan::Limit(node) => passthrough_columns(&node.input),
@@ -509,4 +518,11 @@ fn equality_splits_join_sides(rewritten: &Expr, join: &Join) -> bool {
     };
     let right_names: HashSet<String> = join.right.schema().into_iter().collect();
     right_names.contains(&first.column) != right_names.contains(&second.column)
+}
+
+/// Name each qualified expansion output without including retained parent columns.
+fn unnest_output_names(node: &fq_plan::Unnest) -> Vec<String> {
+    let mut names = node.output_names.clone();
+    names.extend(node.ordinality.clone());
+    names
 }

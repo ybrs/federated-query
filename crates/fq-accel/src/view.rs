@@ -120,6 +120,14 @@ fn engine_type(arrow: &ArrowType) -> Result<DataType, AccelError> {
         ArrowType::Boolean => Ok(DataType::Boolean),
         ArrowType::Date32 | ArrowType::Date64 => Ok(DataType::Date),
         ArrowType::Timestamp(_, _) => Ok(DataType::Timestamp),
+        ArrowType::List(_)
+        | ArrowType::LargeList(_)
+        | ArrowType::FixedSizeList(_, _)
+        | ArrowType::Struct(_)
+        | ArrowType::Map(_, _) => {
+            DataType::validate_arrow(arrow).map_err(AccelError::InvalidSchema)?;
+            Ok(DataType::Arrow(arrow.clone()))
+        }
         other => Err(AccelError::InvalidSchema(format!(
             "output column type {other} has no engine type mapping"
         ))),
@@ -179,7 +187,7 @@ mod tests {
             ("dt", ArrowType::Date32),
         ]))
         .expect("all types map");
-        let types: Vec<DataType> = columns.iter().map(|c| c.data_type).collect();
+        let types: Vec<DataType> = columns.iter().map(|c| c.data_type.clone()).collect();
         assert_eq!(
             types,
             vec![

@@ -331,6 +331,7 @@ fn node_kind(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::GroupedLimit(_) => "GroupedLimit",
         LogicalPlan::LateralJoin(_) => "LateralJoin",
         LogicalPlan::TableFunction(_) => "TableFunction",
+        LogicalPlan::Unnest(_) => "Unnest",
     }
 }
 
@@ -453,7 +454,7 @@ fn validate_one_change_key(
             ))
         })?;
     if let ChangeKey::Monotonic { .. } = change_key {
-        require_watermark_type(datasource, table_key, column_name, column.data_type)?;
+        require_watermark_type(datasource, table_key, column_name, &column.data_type)?;
     }
     Ok(())
 }
@@ -466,7 +467,7 @@ fn require_watermark_type(
     datasource: &str,
     table_key: &str,
     column: &str,
-    data_type: DataType,
+    data_type: &DataType,
 ) -> Result<(), RuntimeError> {
     match data_type {
         DataType::Integer
@@ -480,7 +481,8 @@ fn require_watermark_type(
         | DataType::Decimal
         | DataType::Boolean
         | DataType::Interval
-        | DataType::Null => Err(RuntimeError::Config(format!(
+        | DataType::Null
+        | DataType::Arrow(_) => Err(RuntimeError::Config(format!(
             "change_keys of datasource '{datasource}': monotonic column '{column}' of \
              '{table_key}' has type {}, which cannot carry an exact watermark; declare \
              an integer, text, date, or timestamp column (or a primary_key for merge)",

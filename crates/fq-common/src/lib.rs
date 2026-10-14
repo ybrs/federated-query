@@ -16,6 +16,7 @@ pub mod config;
 pub mod error;
 pub mod events;
 pub mod logging;
+mod nested_types;
 pub mod types;
 #[macro_use]
 mod update;

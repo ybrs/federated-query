@@ -121,6 +121,7 @@ pub fn available_columns(plan: &LogicalPlan) -> HashSet<String> {
             cols
         }
         LogicalPlan::Projection(projection) => projection_columns(projection),
+        LogicalPlan::Unnest(node) => unnest_columns(node),
         LogicalPlan::Aggregate(aggregate) => aggregate.output_names.iter().cloned().collect(),
         LogicalPlan::Filter(filter) => available_columns(&filter.input),
         LogicalPlan::Limit(limit) => available_columns(&limit.input),
@@ -135,6 +136,19 @@ pub fn available_columns(plan: &LogicalPlan) -> HashSet<String> {
         LogicalPlan::Union(_) | LogicalPlan::SetOperation(_) => set_operation_columns(plan),
         _ => HashSet::new(),
     }
+}
+
+/// Retained parent columns and named expansion outputs remain available above UNNEST.
+fn unnest_columns(node: &fq_plan::Unnest) -> HashSet<String> {
+    let mut names = if node.retain_input {
+        available_columns(&node.input)
+    } else {
+        HashSet::new()
+    };
+    let mut outputs = node.output_names.clone();
+    outputs.extend(node.ordinality.clone());
+    names.extend(aliased_names(&outputs, &node.alias));
+    names
 }
 
 /// Columns usable above a set operation: those available in EVERY branch (the

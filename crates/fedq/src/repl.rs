@@ -22,7 +22,7 @@ use crate::render::{render, row_count, OutputFormat};
 /// Run the REPL against `runtime`, rendering every result in `format`, until the
 /// user quits (`\q`) or sends EOF. Returns an error only when the line editor
 /// itself fails; a failing statement is reported and the loop keeps going.
-pub fn run(runtime: &Runtime, format: OutputFormat) -> Result<(), ReadlineError> {
+pub fn run(runtime: &Runtime, format: OutputFormat, timings: bool) -> Result<(), ReadlineError> {
     let mut editor = DefaultEditor::new()?;
     let history = history_path();
     if let Some(path) = &history {
@@ -37,7 +37,7 @@ pub fn run(runtime: &Runtime, format: OutputFormat) -> Result<(), ReadlineError>
     }
     println!("fedq interactive shell. End statements with ';'. Type \\q to quit.");
     let mut buffer = String::new();
-    let mut timing = false;
+    let mut timing = timings;
     loop {
         let prompt = if buffer.is_empty() { "fedq> " } else { "...> " };
         match editor.readline(prompt) {
