@@ -12,7 +12,7 @@
 #![allow(clippy::cast_possible_wrap, clippy::too_many_lines)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 
 use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType as ArrowType, Field, Schema, TimeUnit as ArrowTimeUnit};
@@ -23,7 +23,7 @@ use fq_common::events::{
     TimeRange, TimeUnit, MICROS_PER_DAY,
 };
 use fq_events::build::BatchSource;
-use fq_events::error::EventError;
+use fq_events::error::{EventError, EventStoreError};
 use fq_events::{EventStore, SourceInfo};
 
 /// One generated event row.
@@ -196,6 +196,100 @@ fn build_dataset(
         .create_dataset(&def, &info, &mut source, &test_config())
         .unwrap();
     store.dataset(name).unwrap()
+}
+
+/// Start one same-name build after both callers reach the barrier.
+fn create_shared_dataset(
+    store: &EventStore,
+    barrier: &Barrier,
+    batch: &RecordBatch,
+) -> Result<fq_events::BuildReport, EventError> {
+    let info = SourceInfo {
+        kind: "select".to_string(),
+        reference: "test".to_string(),
+        estimated_rows: Some(batch.num_rows() as u64),
+        watermark: None,
+        source_token: None,
+    };
+    let mut source = VecSource {
+        batches: vec![batch.clone()].into_iter(),
+    };
+    barrier.wait();
+    store.create_dataset(&dataset_def("shared"), &info, &mut source, &test_config())
+}
+
+/// Count one event name in a created dataset through the stored pre-aggregate.
+fn stored_event_count(store: &EventStore, event: &str) -> u64 {
+    let dataset = store.dataset("shared").unwrap();
+    let spec = SegmentSpec {
+        dataset: "shared".to_string(),
+        measure: SegmentMeasure::Count,
+        event: Some(event.to_string()),
+        bucket: BucketGrain::Day,
+        range: TimeRange::default(),
+        filter: None,
+        breakdown: None,
+    };
+    let result = fq_events::run_segment(store.io(), &dataset, &spec, &test_config()).unwrap();
+    result.rows.iter().map(|row| row.count).sum()
+}
+
+/// Supply distinct event frequencies so a swapped dictionary is detectable.
+fn shared_rows() -> Vec<Row> {
+    (0..2_000)
+        .map(|ordinal| Row {
+            actor: ActorId::Int(ordinal % 100),
+            ts: ordinal,
+            tiebreak: ordinal,
+            name: if ordinal % 4 == 0 { "alpha" } else { "beta" }.to_string(),
+            device: None,
+        })
+        .collect()
+}
+
+/// Race two store handles against one registry and one file root.
+fn race_shared_builds(
+    first: &EventStore,
+    second: &EventStore,
+    batch: &RecordBatch,
+) -> (
+    Result<fq_events::BuildReport, EventError>,
+    Result<fq_events::BuildReport, EventError>,
+) {
+    let barrier = Barrier::new(2);
+    std::thread::scope(|scope| {
+        let left = scope.spawn(|| create_shared_dataset(first, &barrier, batch));
+        let right = scope.spawn(|| create_shared_dataset(second, &barrier, batch));
+        (left.join().unwrap(), right.join().unwrap())
+    })
+}
+
+/// A duplicate create raises before it can write shared files.
+fn assert_one_create_succeeded(
+    left: Result<fq_events::BuildReport, EventError>,
+    right: Result<fq_events::BuildReport, EventError>,
+) {
+    assert!(
+        left.is_ok() ^ right.is_ok(),
+        "exactly one build must succeed"
+    );
+    let loser = if left.is_err() { left } else { right };
+    assert!(matches!(
+        loser,
+        Err(EventError::Store(EventStoreError::NameTaken { .. }))
+    ));
+}
+
+#[test]
+fn concurrent_same_name_builds_keep_dictionary_and_segments_together() {
+    let (first, dir) = open_store("concurrent-create");
+    let second = EventStore::open(&dir.join("stats.sqlite"), &dir.join("events")).unwrap();
+    let batch = batch_of(&shared_rows());
+    let (left, right) = race_shared_builds(&first, &second, &batch);
+    assert_one_create_succeeded(left, right);
+    assert_eq!(stored_event_count(&first, "alpha"), 500);
+    assert_eq!(stored_event_count(&first, "beta"), 1_500);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// The stream order of a row set: `(actor, ts, tiebreak)`.

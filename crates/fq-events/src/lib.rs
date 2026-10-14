@@ -179,6 +179,26 @@ impl EventStore {
         Ok(())
     }
 
+    /// Hold a file lock across a build so peers cannot write the same files.
+    fn lock_dataset_build(&self, name: &str) -> Result<std::fs::File, EventStoreError> {
+        let lock_path = self.io.root().join(format!("{}.lock", location_for(name)));
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| EventStoreError::Io {
+                file: lock_path.display().to_string(),
+                detail: error.to_string(),
+            })?;
+        lock_file.lock().map_err(|error| EventStoreError::Io {
+            file: lock_path.display().to_string(),
+            detail: error.to_string(),
+        })?;
+        Ok(lock_file)
+    }
+
     /// Every live dataset record, name-ordered.
     pub fn list(&self) -> Result<Vec<DatasetRecord>, EventError> {
         Ok(self.registry.list()?)
@@ -232,6 +252,7 @@ impl EventStore {
         source: &mut dyn BatchSource,
         cfg: &EventsConfig,
     ) -> Result<BuildReport, EventError> {
+        let _build_lock = self.lock_dataset_build(&def.name)?;
         if self.exists(&def.name)? {
             return Err(EventStoreError::NameTaken {
                 name: def.name.clone(),
