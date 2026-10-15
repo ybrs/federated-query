@@ -1937,12 +1937,11 @@ fn decode(
 // Serving
 // ---------------------------------------------------------------------------
 
-/// Whether the spec's shape is answerable from the index: no property filter
-/// (anchor-property serving is not built) and no MAXGAP (fragmenting changes
-/// the counted stream). A time range IS indexable, at any precision, as is
-/// any DEPTH.
+/// Whether the spec's shape is answerable from the index: property predicates,
+/// MAXGAP, and event-type filtering change which windows count or which events
+/// make up a stream. A time range preserves the indexed stream.
 pub(crate) fn spec_is_indexable(spec: &PathsSpec) -> bool {
-    spec.filter.is_none() && spec.maxgap_micros.is_none()
+    spec.filter.is_none() && spec.maxgap_micros.is_none() && spec.filter_event_types.is_none()
 }
 
 /// Load the dataset's current index into the warm cache without answering
@@ -2935,6 +2934,7 @@ mod tests {
         PathsSpec {
             dataset: "t".to_string(),
             anchor: PathAnchor::Unanchored,
+            filter_event_types: None,
             depth,
             top,
             maxgap_micros: None,

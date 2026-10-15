@@ -282,6 +282,49 @@ fn paths_table_function_runs_and_aggregates() {
     assert_eq!(total_rows, 2);
 }
 
+/// SQL paths filtering counts the projected actor streams after dataset creation.
+#[test]
+fn paths_table_function_filters_event_types_before_path_counting() {
+    let dir = sandbox("filteredpathstvf");
+    let file = dir.join("events.parquet");
+    write_events(
+        &file,
+        vec![
+            1_000_000, 2_000_000, 3_000_000, 4_000_000, 5_000_000, 6_000_000, 7_000_000,
+        ],
+        vec!["start", "ignored", "begin", "end", "start", "begin", "end"],
+        vec!["u1", "u1", "u1", "u1", "u2", "u2", "u2"],
+    );
+    let runtime = Runtime::from_config(&event_config(&dir, "filteredtvf", &file)).unwrap();
+    runtime
+        .execute(
+            "CREATE EVENT DATASET web FROM filteredtvf.main.filteredtvf \
+             ACTOR user_id TIME created_at EVENT event",
+        )
+        .unwrap();
+    let (_, batches) = runtime
+        .execute(
+            "SELECT event, occurrences FROM paths('web', depth => 3, \
+             filter_event_types => ARRAY['start', 'begin', 'end']) ORDER BY seq",
+        )
+        .unwrap();
+    let events = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let counts = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(events.len(), 3);
+    for (index, name) in ["start", "begin", "end"].into_iter().enumerate() {
+        assert_eq!(events.value(index), name);
+        assert_eq!(counts.value(index), 2);
+    }
+}
+
 #[test]
 fn funnel_retention_segment_table_functions_run() {
     let dir = sandbox("analyticstvf");

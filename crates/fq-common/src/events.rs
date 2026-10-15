@@ -224,6 +224,9 @@ pub const DEFAULT_MAX_PATHS_DEPTH: u32 = 16;
 pub struct PathsSpec {
     pub dataset: String,
     pub anchor: PathAnchor,
+    /// Event names retained in each actor's stream before gaps, duplicate
+    /// collapse, and path windows are computed. None retains every event.
+    pub filter_event_types: Option<Vec<String>>,
     /// Window length in events; at least 2. The index serves depths up to the
     /// dataset's max_paths_depth; above that the engine raises unless
     /// `force_scan` opts into the exact scan.

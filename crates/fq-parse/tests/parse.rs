@@ -2180,6 +2180,40 @@ fn paths_table_function_named_args_map_onto_spec() {
     ));
 }
 
+/// The array argument carries every named event into the paths specification.
+#[test]
+fn paths_table_function_event_type_filter_maps_onto_spec() {
+    let plan = parse(
+        "SELECT event FROM paths('web', depth => 3, \
+         filter_event_types => ARRAY['session_start', 'tutorial_begin', 'tutorial_end'])",
+    )
+    .unwrap();
+    let spec = paths_spec(table_function_of(&plan));
+    assert_eq!(spec.depth, 3);
+    assert_eq!(
+        spec.filter_event_types.as_deref(),
+        Some(
+            ["session_start", "tutorial_begin", "tutorial_end"]
+                .map(String::from)
+                .as_slice()
+        )
+    );
+}
+
+/// Non-array, non-string, and repeated event filters fail during parsing.
+#[test]
+fn paths_table_function_event_type_filter_rejects_invalid_arguments() {
+    for argument in [
+        "'session_start'",
+        "ARRAY['session_start', 7]",
+        "ARRAY['session_start'], filter_event_types => ARRAY['tutorial_end']",
+    ] {
+        let sql = format!("SELECT event FROM paths('web', filter_event_types => {argument})");
+        let error = parse(&sql).unwrap_err();
+        assert!(matches!(error, ParseError::Parse(_)), "got {error:?}");
+    }
+}
+
 #[test]
 fn paths_table_function_defaults_match_statement() {
     // Only the dataset given: depth 5, top 20, unanchored - the PATHS statement's

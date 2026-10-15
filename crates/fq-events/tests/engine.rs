@@ -577,6 +577,7 @@ fn random_inputs_match_brute_force_across_all_analyses() {
         let spec = PathsSpec {
             dataset: name.clone(),
             anchor: PathAnchor::Unanchored,
+            filter_event_types: None,
             depth: 3,
             top: 1000,
             maxgap_micros: None,
@@ -1080,6 +1081,7 @@ fn a_crash_left_manifest_pair_heals_through_refresh() {
     let spec = |maxgap| PathsSpec {
         dataset: "twomanifests".to_string(),
         anchor: PathAnchor::Unanchored,
+        filter_event_types: None,
         depth: 4,
         top: 1000,
         maxgap_micros: maxgap,
@@ -1127,6 +1129,7 @@ fn the_scan_honors_the_query_memory_ceiling() {
     let spec = |maxgap| PathsSpec {
         dataset: "ceiling".to_string(),
         anchor: PathAnchor::Unanchored,
+        filter_event_types: None,
         depth: 4,
         top: 10,
         maxgap_micros: maxgap,
@@ -1268,6 +1271,7 @@ fn a_crossover_rebuild_is_visible_to_a_warm_process() {
         let spec = PathsSpec {
             dataset: "warmrebuild".to_string(),
             anchor: PathAnchor::Unanchored,
+            filter_event_types: None,
             depth: 8,
             top: 1000,
             maxgap_micros: maxgap,
@@ -1392,6 +1396,7 @@ fn refreshed_long_streams_answer_from_pairs_exactly() {
                 let spec = |maxgap| PathsSpec {
                     dataset: "pairlong".to_string(),
                     anchor: anchor.clone(),
+                    filter_event_types: None,
                     depth,
                     top: 1000,
                     maxgap_micros: maxgap,
@@ -1449,6 +1454,7 @@ fn paths_index_matches_the_scan_for_every_anchor_and_depth() {
             let spec = |maxgap| PathsSpec {
                 dataset: "pidx".to_string(),
                 anchor: anchor.clone(),
+                filter_event_types: None,
                 depth,
                 top: 1000,
                 maxgap_micros: maxgap,
@@ -1473,6 +1479,7 @@ fn paths_index_matches_the_scan_for_every_anchor_and_depth() {
     let spec = PathsSpec {
         dataset: "pidx".to_string(),
         anchor: PathAnchor::StartingAt("a".to_string()),
+        filter_event_types: None,
         depth: 4,
         top: 1000,
         maxgap_micros: None,
@@ -1527,6 +1534,7 @@ fn ranged_paths_serve_anchor_semantics_from_ts_lists_and_match_the_scan() {
                 let spec = |maxgap| PathsSpec {
                     dataset: "pidxts".to_string(),
                     anchor: anchor.clone(),
+                    filter_event_types: None,
                     depth,
                     top: 1000,
                     maxgap_micros: maxgap,
@@ -1585,6 +1593,7 @@ fn a_ranged_path_follows_its_anchor_past_the_range_end() {
     let spec = PathsSpec {
         dataset: "anchorsem".to_string(),
         anchor: PathAnchor::Unanchored,
+        filter_event_types: None,
         depth: 3,
         top: 10,
         maxgap_micros: None,
@@ -1614,6 +1623,59 @@ fn a_ranged_path_follows_its_anchor_past_the_range_end() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Filtering bridges omitted events before duplicate collapse and counts actors once.
+#[test]
+fn path_event_type_filter_precedes_duplicate_collapse_and_counting() {
+    let events = [
+        (1, "start"),
+        (1, "ignored"),
+        (1, "start"),
+        (1, "begin"),
+        (1, "ignored"),
+        (1, "end"),
+        (2, "start"),
+        (2, "begin"),
+        (2, "end"),
+        (3, "start"),
+        (3, "ignored"),
+        (3, "end"),
+    ];
+    let mut rows = Vec::new();
+    for (position, (actor, name)) in events.into_iter().enumerate() {
+        rows.push(Row {
+            actor: ActorId::Int(actor),
+            ts: position as i64 * 1_000_000,
+            tiebreak: position as i64,
+            name: name.to_string(),
+            device: None,
+        });
+    }
+    let (store, dir) = open_store("filteredpaths");
+    let dataset = build_dataset(&store, "filteredpaths", &rows);
+    let spec = PathsSpec {
+        dataset: "filteredpaths".to_string(),
+        anchor: PathAnchor::Unanchored,
+        filter_event_types: Some(vec!["start".into(), "begin".into(), "end".into()]),
+        depth: 3,
+        top: 10,
+        maxgap_micros: None,
+        range: TimeRange::default(),
+        filter: None,
+        force_scan: false,
+    };
+    let result = fq_events::run_paths(store.io(), &dataset, &spec, &test_config()).unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].steps, vec!["start", "begin", "end"]);
+    assert_eq!(result.rows[0].occurrences, 2);
+    assert!((result.rows[0].share - 1.0).abs() < f64::EPSILON);
+
+    let mut unknown = spec;
+    unknown.filter_event_types = Some(vec!["missing".into()]);
+    let error = fq_events::run_paths(store.io(), &dataset, &unknown, &test_config()).unwrap_err();
+    assert!(error.to_string().contains("missing"), "got {error}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn indexable_paths_answer_from_the_index_without_touching_segments() {
     // The PROOF that indexable queries are served from the index: delete
@@ -1641,6 +1703,7 @@ fn indexable_paths_answer_from_the_index_without_touching_segments() {
     let spec = |maxgap, range| PathsSpec {
         dataset: "pidxproof".to_string(),
         anchor: PathAnchor::Unanchored,
+        filter_event_types: None,
         depth: 3,
         top: 10,
         maxgap_micros: maxgap,

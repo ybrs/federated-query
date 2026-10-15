@@ -8,7 +8,7 @@
 //! actors. Every fast path here is an algebraic rewrite of the scan and is
 //! oracle-checked by the events benchmark battery.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::model::FastMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1959,15 +1959,25 @@ pub fn run_paths(
         PathAnchor::StartingAt(name) => Some((resolve_event_code(dataset, name, cfg)?, true)),
         PathAnchor::EndingAt(name) => Some((resolve_event_code(dataset, name, cfg)?, false)),
     };
+    let included_codes = match &spec.filter_event_types {
+        None => None,
+        Some(names) => {
+            let mut codes = HashSet::with_capacity(names.len());
+            for name in names {
+                codes.insert(resolve_event_code(dataset, name, cfg)?);
+            }
+            Some(codes)
+        }
+    };
     // The index fast path: an indexable spec over a dataset whose
     // current-generation index exists is answered from interval sweeps;
-    // anything else (filter, MAXGAP, USING SCAN, missing index) scans.
+    // anything else (filters, MAXGAP, USING SCAN, missing index) scans.
     if !spec.force_scan && crate::paths_sa::spec_is_indexable(spec) {
         if let Some(result) = crate::paths_sa::run_from_index(io, dataset, spec, anchor, cfg)? {
             return Ok(result);
         }
     }
-    run_paths_scan(io, dataset, spec, anchor, cfg)
+    run_paths_scan(io, dataset, spec, anchor, included_codes.as_ref(), cfg)
 }
 
 /// One event of an actor's collapsed path stream: its code, its MAXGAP
@@ -2036,6 +2046,7 @@ fn run_paths_scan(
     dataset: &Dataset,
     spec: &PathsSpec,
     anchor: Option<(u64, bool)>,
+    included_codes: Option<&HashSet<u64>>,
     cfg: &EventsConfig,
 ) -> Result<PathsResult, EventError> {
     let mut shards: Vec<ShardWindows> = Vec::new();
@@ -2053,6 +2064,7 @@ fn run_paths_scan(
                 dataset,
                 spec,
                 anchor,
+                included_codes,
                 cfg.query_memory_bytes,
                 &charged,
             )
@@ -2350,16 +2362,17 @@ fn code_order(ranks: &[u32], a: &[u64], b: &[u64]) -> std::cmp::Ordering {
     a.len().cmp(&b.len())
 }
 
-/// Enumerate one shard's windows into a [`ShardWindows`] buffer: build each
-/// actor's gap-fragmented, duplicate-collapsed stream, then walk it per the
-/// anchor variant. The range and WHERE filter are tested on each window's
-/// ANCHOR event only - its first event, or the ENDING AT anchor - so a window
-/// whose anchor qualifies is followed past the range end.
+/// Enumerate one shard's windows into a [`ShardWindows`] buffer: retain the
+/// selected event types, build each actor's gap-fragmented, duplicate-collapsed
+/// stream, then walk it per the anchor variant. The range and WHERE filter are
+/// tested on each window's ANCHOR event only - its first event, or the ENDING AT
+/// anchor - so a window whose anchor qualifies is followed past the range end.
 fn paths_shard_windows(
     scan: &ShardScan<'_>,
     dataset: &Dataset,
     spec: &PathsSpec,
     anchor: Option<(u64, bool)>,
+    included_codes: Option<&HashSet<u64>>,
     budget: u64,
     charged: &std::sync::atomic::AtomicU64,
 ) -> Result<ShardWindows, EventError> {
@@ -2379,6 +2392,9 @@ fn paths_shard_windows(
         let mut previous_ts: Option<i64> = None;
         let mut fragment = 0u32;
         scan.for_each_event(&run, |file, row, code| {
+            if included_codes.is_some_and(|codes| !codes.contains(&code)) {
+                return Ok(true);
+            }
             // A gap past MAXGAP between consecutive events breaks the stream
             // BEFORE collapsing: duplicates in different fragments stay
             // distinct.

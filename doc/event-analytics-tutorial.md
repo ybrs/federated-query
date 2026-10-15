@@ -331,6 +331,7 @@ PATHS ON web ENDING AT 'purchase' DEPTH 5 TOP 10;       -- what led INTO an even
 PATHS ON web DEPTH 50 TOP 10;                           -- depth is unbounded
 PATHS ON web DEPTH 10 TOP 10 FROM '2026-06-17' TO '2026-06-22';
 PATHS ON web DEPTH 6 TOP 10 MAXGAP 30 MINUTE;           -- session-break on gaps
+PATHS ON web DEPTH 3 TOP 10 FILTER EVENTS ('session_start', 'game_play');
 ```
 
 As a table function - dataset first, options named:
@@ -340,10 +341,18 @@ SELECT * FROM paths('web', depth => 3, top => 20);
 SELECT * FROM paths('web', starting_at => 'page_view', depth => 4, top => 10);
 SELECT * FROM paths('web', ending_at => 'purchase', depth => 5, top => 10);
 SELECT * FROM paths('web', depth => 6, top => 10, filter => 'device = ''ios''');
+SELECT * FROM paths('web', depth => 3, top => 10,
+                    filter_event_types => ARRAY['session_start', 'tutorial_begin',
+                                                'tutorial_end', 'game_play', 'level_up']);
 ```
 
-The range (`FROM`/`TO`) and `MAXGAP` are statement-only for now; the anchor,
-depth, top, and the property filter are available in both forms. Because it is a
+`FILTER EVENTS` in a PATHS statement and `filter_event_types` in the table
+function keep only the named events in each actor's stream before
+consecutive duplicates collapse and paths are counted. An empty array matches
+no paths. Unknown event names raise by default. These queries scan the stored
+dataset; they do not require rebuilding it. The range (`FROM`/`TO`) and `MAXGAP`
+are statement-only for now; the anchor, depth, top, and the property filter are
+available in both forms. Because it is a
 relation, SQL sits on top - e.g. how often each event appears across the top
 routes (grouping by `event`, not `path_id`, avoids the per-step repetition):
 

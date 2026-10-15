@@ -507,7 +507,8 @@ fn parse_bucket_grain(tokens: &mut Tokenizer<'_>) -> Result<BucketGrain, ParseEr
 }
 
 /// Parse `PATHS ON <dataset> [STARTING AT <event> | ENDING AT <event>]
-/// [DEPTH <n>] [TOP <n>] [MAXGAP <interval>] [FROM ...] [TO ...] [WHERE ...]
+/// [DEPTH <n>] [TOP <n>] [MAXGAP <interval>]
+/// [FILTER EVENTS (<event>, ...)] [FROM ...] [TO ...] [WHERE ...]
 /// [USING SCAN]`.
 pub(crate) fn classify_paths<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
     tokens.expect_keyword("PATHS")?;
@@ -518,6 +519,12 @@ pub(crate) fn classify_paths<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement
     let top = parse_optional_count(tokens, "TOP")?.unwrap_or(20);
     let maxgap_micros = if consume_keyword(tokens, "MAXGAP") {
         Some(parse_interval(tokens, "MAXGAP")?)
+    } else {
+        None
+    };
+    let filter_event_types = if consume_keyword(tokens, "FILTER") {
+        tokens.expect_keyword("EVENTS")?;
+        Some(parse_path_event_list(tokens)?)
     } else {
         None
     };
@@ -533,6 +540,7 @@ pub(crate) fn classify_paths<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement
     Ok(Statement::EventPaths(PathsSpec {
         dataset,
         anchor,
+        filter_event_types,
         depth,
         top,
         maxgap_micros,
@@ -540,6 +548,17 @@ pub(crate) fn classify_paths<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement
         filter,
         force_scan,
     }))
+}
+
+/// Parse the quoted event names retained in each actor's path stream.
+fn parse_path_event_list(tokens: &mut Tokenizer<'_>) -> Result<Vec<String>, ParseError> {
+    expect_char(tokens, '(', "FILTER EVENTS (<event>, ...)")?;
+    let mut events = vec![event_literal(tokens, "path filter event")?];
+    while consume_char(tokens, ',') {
+        events.push(event_literal(tokens, "path filter event")?);
+    }
+    expect_char(tokens, ')', "FILTER EVENTS (<event>, ...)")?;
+    Ok(events)
 }
 
 /// Parse the optional `STARTING AT <event>` / `ENDING AT <event>` anchor.

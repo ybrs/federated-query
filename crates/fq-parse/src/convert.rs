@@ -2122,11 +2122,12 @@ fn bucket_grain_arg(expr: &Expression) -> Result<BucketGrain, ParseError> {
 /// every option is named. Defaults match the `PATHS` statement (depth 5, top
 /// 20, unanchored). The accepted options are the anchor, depth, and top; a
 /// maxgap / from / to / where argument raises, and so does an unknown option.
-/// The `PATHS` statement is the form that carries maxgap, a time range, and a
-/// property filter.
+/// The `PATHS` statement carries maxgap and a time range; the table function
+/// also accepts a property filter and a literal event-name array.
 fn build_paths_spec(args: &[Expression]) -> Result<PathsSpec, ParseError> {
     let mut dataset: Option<String> = None;
     let mut anchor: Option<PathAnchor> = None;
+    let mut filter_event_types: Option<Vec<String>> = None;
     let mut depth: u32 = 5;
     let mut top: u32 = 20;
     let mut filter: Option<EventPredicate> = None;
@@ -2137,6 +2138,7 @@ fn build_paths_spec(args: &[Expression]) -> Result<PathsSpec, ParseError> {
                 apply_paths_named_arg(
                     named,
                     &mut anchor,
+                    &mut filter_event_types,
                     &mut depth,
                     &mut top,
                     &mut filter,
@@ -2162,6 +2164,7 @@ fn build_paths_spec(args: &[Expression]) -> Result<PathsSpec, ParseError> {
     Ok(PathsSpec {
         dataset,
         anchor: anchor.unwrap_or(PathAnchor::Unanchored),
+        filter_event_types,
         depth,
         top,
         maxgap_micros: None,
@@ -2178,6 +2181,7 @@ fn build_paths_spec(args: &[Expression]) -> Result<PathsSpec, ParseError> {
 fn apply_paths_named_arg(
     named: &NamedArgument,
     anchor: &mut Option<PathAnchor>,
+    filter_event_types: &mut Option<Vec<String>>,
     depth: &mut u32,
     top: &mut u32,
     filter: &mut Option<EventPredicate>,
@@ -2193,6 +2197,15 @@ fn apply_paths_named_arg(
             anchor,
             PathAnchor::EndingAt(string_arg(&named.value, "paths() ending_at")?),
         ),
+        "filter_event_types" => {
+            if filter_event_types.is_some() {
+                return Err(ParseError::Parse(
+                    "paths() filter_event_types may be supplied only once".to_string(),
+                ));
+            }
+            *filter_event_types = Some(event_types_arg(&named.value)?);
+            Ok(())
+        }
         "depth" => {
             *depth = count_arg(&named.value, "paths() depth")?;
             Ok(())
@@ -2214,6 +2227,24 @@ fn apply_paths_named_arg(
         ))),
         other => Err(ParseError::Parse(format!("unknown paths() option '{other}'"))),
     }
+}
+
+/// Read a literal array of event names for the paths stream filter.
+fn event_types_arg(expr: &Expression) -> Result<Vec<String>, ParseError> {
+    let entries = match expr {
+        Expression::Array(array) => &array.expressions,
+        Expression::ArrayFunc(array) => &array.expressions,
+        _ => {
+            return Err(ParseError::Parse(
+                "paths() filter_event_types must be an array of string literals".to_string(),
+            ))
+        }
+    };
+    let mut names = Vec::with_capacity(entries.len());
+    for entry in entries {
+        names.push(string_arg(entry, "paths() filter_event_types entry")?);
+    }
+    Ok(names)
 }
 
 /// Set the path anchor, raising if one was already given (starting_at and
