@@ -65,6 +65,9 @@ impl Registry {
                 created_at       TEXT NOT NULL,
                 refreshed_at     TEXT,
                 deleted_at       TEXT
+            );
+            CREATE TABLE IF NOT EXISTS event_dataset_creations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT
             );",
             default_depth = fq_common::events::DEFAULT_MAX_PATHS_DEPTH,
         ))
@@ -88,6 +91,22 @@ impl Registry {
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Reserve a directory identity that survives deletion and process restarts.
+    /// SQLite retains the committed AUTOINCREMENT sequence after row deletion,
+    /// so failed builds and dropped datasets cannot issue the same cache keys.
+    pub fn allocate_location(&self, name: &str) -> Result<String, EventStoreError> {
+        let conn = self.conn.lock().expect("registry lock poisoned");
+        conn.execute("INSERT INTO event_dataset_creations DEFAULT VALUES", [])
+            .map_err(|error| db_err(&error))?;
+        let creation = conn.last_insert_rowid();
+        conn.execute(
+            "DELETE FROM event_dataset_creations WHERE id = ?1",
+            params![creation],
+        )
+        .map_err(|error| db_err(&error))?;
+        Ok(format!("{}-create-{creation:016x}", location_for(name)))
     }
 
     /// Insert a fresh dataset row (the CREATE publish step). A live row under
@@ -319,10 +338,8 @@ fn row_to_record(
     Ok(parse())
 }
 
-/// The dataset directory name under the store root: the name sanitized to a
-/// filesystem-safe alphabet plus a 16-hex FNV-1a hash of the exact name (the
-/// same convention the materialized-view store uses), so distinct names never
-/// share a directory.
+/// The stable filesystem-safe name prefix and per-name build-lock identity.
+/// Dataset directories append a persistent creation id to this prefix.
 pub fn location_for(name: &str) -> String {
     let mut safe = String::with_capacity(name.len());
     for ch in name.chars() {
@@ -423,5 +440,23 @@ mod tests {
             Err(EventStoreError::UnknownDataset { .. })
         ));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Directory identities are consumed even without a published dataset row.
+    #[test]
+    fn creation_locations_survive_cleanup_and_registry_reopen() {
+        let dir = std::env::temp_dir().join(format!("fqev-creations-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.sqlite");
+        let registry = Registry::open(&path).unwrap();
+        let first = registry.allocate_location("web").unwrap();
+        let second = registry.allocate_location("web").unwrap();
+        assert_ne!(first, second);
+        drop(registry);
+        let registry = Registry::open(&path).unwrap();
+        let third = registry.allocate_location("web").unwrap();
+        assert_ne!(first, third);
+        assert_ne!(second, third);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

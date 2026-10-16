@@ -248,6 +248,12 @@ each also usable as a table function in `FROM`; `REFRESH`, `REBUILD`, `DROP`
 and `SHOW EVENT DATASETS` complete the surface. There is no ATTACH, LOAD or
 WARM: a dataset is opened lazily on first use.
 
+Each dataset creation reserves a persistent SQLite AUTOINCREMENT identity for
+its storage directory. DROP removes the dataset's files but does not reset that
+sequence. A same-name CREATE therefore writes to new paths, preserving the
+decoded-block cache's assumption that a file path always denotes the same
+contents. The per-name build lock remains stable across creations.
+
 Two properties of the store decide how it behaves in practice, and both are
 measured rather than assumed (numbers from an idle 12-core box, 2026-08-09):
 

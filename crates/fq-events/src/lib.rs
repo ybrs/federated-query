@@ -252,6 +252,7 @@ impl EventStore {
         source: &mut dyn BatchSource,
         cfg: &EventsConfig,
     ) -> Result<BuildReport, EventError> {
+        let started = std::time::Instant::now();
         let _build_lock = self.lock_dataset_build(&def.name)?;
         if self.exists(&def.name)? {
             return Err(EventStoreError::NameTaken {
@@ -259,7 +260,7 @@ impl EventStore {
             }
             .into());
         }
-        let location = location_for(&def.name);
+        let location = self.registry.allocate_location(&def.name)?;
         let shards = Self::derive_shards(def, info.estimated_rows, cfg);
         let params = BuildParams {
             shards,
@@ -270,7 +271,6 @@ impl EventStore {
             ordinal_start: 0,
         };
         let spec = Self::build_spec(def, None);
-        let started = std::time::Instant::now();
         let outcome = match run_build(
             &self.io,
             &location,
