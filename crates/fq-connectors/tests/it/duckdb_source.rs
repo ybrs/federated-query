@@ -26,6 +26,16 @@ fn seeded_source() -> DuckDbSource {
     source
 }
 
+/// The seeded source plus a user view over it, to exercise views as catalog
+/// tables.
+fn seeded_source_with_view() -> DuckDbSource {
+    let source = seeded_source();
+    source
+        .execute_batch("CREATE VIEW main.test_view AS SELECT id, name FROM main.test_table;")
+        .expect("seed view");
+    source
+}
+
 #[test]
 fn test_render_dialect_is_duckdb() {
     assert_eq!(seeded_source().render_dialect(), RenderDialect::DuckDb);
@@ -55,6 +65,50 @@ fn test_list_schemas_and_tables() {
         source.list_tables("main").unwrap(),
         vec!["test_table".to_string()]
     );
+}
+
+#[test]
+fn test_view_is_listed_as_a_table() {
+    // A user view is a catalog table; the internal duckdb_* views are not
+    // information_schema tables and stay hidden.
+    let source = seeded_source_with_view();
+    let tables = source.list_tables("main").unwrap();
+    assert!(tables.contains(&"test_table".to_string()));
+    assert!(tables.contains(&"test_view".to_string()));
+    for name in tables {
+        assert!(!name.starts_with("duckdb_"), "leaked internal view {name}");
+    }
+}
+
+#[test]
+fn test_view_metadata_and_statistics_abstain() {
+    let source = seeded_source_with_view();
+    let metadata = source
+        .get_table_metadata("main", "test_view")
+        .expect("view metadata");
+    let names: Vec<&str> = metadata.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, vec!["id", "name"]);
+    // A view has no duckdb_tables() row: the row count is an honest unknown,
+    // not a raise and not a fabricated zero.
+    let stats = source
+        .get_table_statistics("main", "test_view", &["id".to_string()])
+        .expect("view statistics must not raise")
+        .expect("some");
+    assert_eq!(stats.row_count, None);
+    assert!(stats.column_stats.is_empty());
+}
+
+#[test]
+fn test_load_view_metadata_through_catalog() {
+    // End-to-end: a registered view is bindable through the catalog schema.
+    let source = seeded_source_with_view();
+    let mut catalog = Catalog::new();
+    catalog.register_datasource(Arc::new(source));
+    catalog.load_metadata().expect("load");
+    let table = catalog
+        .get_table("test_duck", "main", "test_view")
+        .expect("view table");
+    assert_eq!(table.columns.len(), 2);
 }
 
 #[test]

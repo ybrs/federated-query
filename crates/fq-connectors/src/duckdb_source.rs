@@ -1,8 +1,10 @@
 //! The DuckDB connector (catalog/statistics tier). Ports the metadata/stats/
 //! estimate surface of `datasources/duckdb.py`.
 //!
-//! The data-plane `execute_query`/`get_query_schema` (Arrow) are deliberately not
-//! here - the native Rust fetch path lives with fq-exec.
+//! Views are catalog tables too: `list_tables` returns user views alongside base
+//! tables, and a view's statistics abstain on the row count DuckDB does not keep
+//! for one. The data-plane `execute_query`/`get_query_schema` (Arrow) are
+//! deliberately not here - the native Rust fetch path lives with fq-exec.
 
 use std::sync::Mutex;
 
@@ -116,10 +118,13 @@ impl DataSource for DuckDbSource {
         self.query_strings("SELECT schema_name FROM information_schema.schemata", &[])
     }
 
+    /// Base tables and user views in the schema. DuckDB's internal `duckdb_*`
+    /// views are not `information_schema` tables, so they are not listed here.
     fn list_tables(&self, schema: &str) -> Result<Vec<String>, CatalogError> {
         self.query_strings(
             "SELECT table_name FROM information_schema.tables \
-             WHERE table_schema = ? AND table_type = 'BASE TABLE' ORDER BY table_name",
+             WHERE table_schema = ? AND table_type IN ('BASE TABLE', 'VIEW') \
+             ORDER BY table_name",
             &[schema],
         )
     }
@@ -154,13 +159,21 @@ impl DataSource for DuckDbSource {
         table: &str,
         _columns: &[String],
     ) -> Result<Option<TableStatistics>, CatalogError> {
-        // METADATA ONLY - planning never scans data. The row count is a catalog
-        // read (`duckdb_tables()`); per-column statistics (NDV, nulls, min/max)
-        // are NOT measured here: DuckDB keeps no NDV in its catalog and any
-        // aggregate over the table would be a plan-time data scan, O(data) per
-        // plan. Column values come from the learned overlay (measured by real
-        // executions) and filtered-row estimates from `estimate_scan_rows`
+        // METADATA ONLY - planning never scans data. A base table's row count is
+        // a catalog read (`duckdb_tables()`); per-column statistics (NDV, nulls,
+        // min/max) are NOT measured here: DuckDB keeps no NDV in its catalog and
+        // any aggregate over the table would be a plan-time data scan, O(data)
+        // per plan. Column values come from the learned overlay (measured by
+        // real executions) and filtered-row estimates from `estimate_scan_rows`
         // (the source planner's EXPLAIN); absent values are honest unknowns.
+        if self.is_view(schema, table)? {
+            // DuckDB keeps no row count for a view, so it is an honest unknown
+            // rather than a fabricated number or a raise.
+            return Ok(Some(build_table_statistics(
+                None,
+                std::collections::BTreeMap::new(),
+            )));
+        }
         let row_count = self.catalog_row_count(schema, table)?;
         Ok(Some(build_table_statistics(
             Some(row_count),
@@ -259,6 +272,27 @@ impl DuckDbSource {
                 ))
             })?;
         Ok(row_count)
+    }
+
+    /// Whether the named object is a view. A view has no `duckdb_tables()` row,
+    /// so its statistics abstain instead of raising.
+    fn is_view(&self, schema: &str, table: &str) -> Result<bool, CatalogError> {
+        let guard = self.connection.lock().unwrap();
+        let mut statement = guard
+            .prepare(
+                "SELECT table_type FROM information_schema.tables \
+                 WHERE table_schema = ? AND table_name = ?",
+            )
+            .map_err(|error| to_source_err(&error))?;
+        let mut rows = statement
+            .query_map(duckdb::params![schema, table], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| to_source_err(&error))?;
+        let Some(table_type) = rows.next() else {
+            return Ok(false);
+        };
+        Ok(table_type.map_err(|error| to_source_err(&error))? == "VIEW")
     }
 }
 
