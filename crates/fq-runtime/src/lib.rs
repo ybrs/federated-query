@@ -973,44 +973,149 @@ pub(crate) fn register_datasource(
     }
 }
 
-/// Register a Parquet directory source: a footer-only catalog handle
-/// (schema/row-count/statistics) plus the exec-plane spec that points DataFusion
-/// at the same directory. Read-only: the catalog handle does not open the file
-/// data, and the exec plane reads the file bytes through DataFusion at fetch time.
+/// Register a Parquet source: a footer-only catalog handle (schema, row count,
+/// statistics) plus the exec-plane registration that points DataFusion at the
+/// SAME resolved file manifest. Read-only: the catalog handle reads footers, and
+/// the exec plane reads the file bytes through DataFusion at fetch time.
 fn register_parquet(
     session: connectors::SessionId,
     catalog: &mut Catalog,
     datasource: &DataSourceConfig,
 ) -> Result<(), RuntimeError> {
-    reject_unknown_keys(datasource, &["dir", "file"])?;
-    let path = parquet_source_path(datasource)?;
-    let source = ParquetSource::open(datasource.name.clone(), &path)?;
+    reject_unknown_keys(datasource, &["dir", "file", "glob", "files", "manifest"])?;
+    let source = parquet_source(datasource)?;
+    // Fold every file's footer ONCE here, before the first query, so planning
+    // reads cached metadata and stays inside its budget.
+    source.ensure_aggregates()?;
+    let tables = parquet_exec_tables(datasource, &source)?;
     catalog.register_datasource(Arc::new(source));
-    let spec = connectors::spec_from_kind("parquet", Some(path), None)?;
-    connectors::register(session, datasource.name.clone(), spec);
+    connectors::register_parquet_tables(session, datasource.name.clone(), tables)?;
     Ok(())
 }
 
-/// The filesystem path of a Parquet source: a directory (`dir`, every
-/// `<table>.parquet` in it is a table) or a single file (`file`, one table
-/// named after the datasource). Exactly one of the two must be given.
-fn parquet_source_path(datasource: &DataSourceConfig) -> Result<String, RuntimeError> {
-    match (
-        optional_str(datasource, "dir"),
-        optional_str(datasource, "file"),
-    ) {
-        (Some(dir), None) => Ok(dir),
-        (None, Some(file)) => Ok(file),
-        (Some(_), Some(_)) => Err(RuntimeError::Config(format!(
-            "parquet datasource '{}' has both 'dir' and 'file'; give exactly one",
+/// The one declared Parquet source shape.
+enum ParquetShape {
+    Dir(String),
+    File(String),
+    Glob(String),
+    Files(Vec<String>),
+    Manifest(String),
+}
+
+/// Build the Parquet source from its declared shape, raising when zero or more
+/// than one of `dir`, `file`, `glob`, `files`, `manifest` is given.
+fn parquet_source(datasource: &DataSourceConfig) -> Result<ParquetSource, RuntimeError> {
+    let name = datasource.name.clone();
+    let declared = [
+        optional_str(datasource, "dir").map(ParquetShape::Dir),
+        optional_str(datasource, "file").map(ParquetShape::File),
+        optional_str(datasource, "glob").map(ParquetShape::Glob),
+        parquet_files(datasource)?.map(ParquetShape::Files),
+        optional_str(datasource, "manifest").map(ParquetShape::Manifest),
+    ];
+    let mut chosen = declared.into_iter().flatten();
+    let Some(shape) = chosen.next() else {
+        return Err(missing_shape(&name, "needs"));
+    };
+    if chosen.next().is_some() {
+        return Err(missing_shape(&name, "declares more than one of"));
+    }
+    open_parquet_shape(&name, shape)
+}
+
+/// The error for a Parquet source with the wrong number of declared shapes.
+fn missing_shape(name: &str, problem: &str) -> RuntimeError {
+    RuntimeError::Config(format!(
+        "parquet datasource '{name}' {problem} 'dir', 'file', 'glob', 'files', \
+         or 'manifest'; give exactly one"
+    ))
+}
+
+/// Open the source for one declared shape.
+fn open_parquet_shape(name: &str, shape: ParquetShape) -> Result<ParquetSource, RuntimeError> {
+    let source = match shape {
+        ParquetShape::Dir(path) | ParquetShape::File(path) => {
+            ParquetSource::open(name.to_string(), &path)?
+        }
+        ParquetShape::Glob(pattern) => ParquetSource::open_glob(name.to_string(), &pattern)?,
+        ParquetShape::Files(files) => ParquetSource::open_files(name.to_string(), &files)?,
+        ParquetShape::Manifest(path) => ParquetSource::open_manifest(name.to_string(), &path)?,
+    };
+    Ok(source)
+}
+
+/// The exec-plane table set: each table's resolved files plus the merged schema
+/// the catalog computed, so DataFusion reads exactly those files and no others.
+fn parquet_exec_tables(
+    datasource: &DataSourceConfig,
+    source: &ParquetSource,
+) -> Result<Vec<connectors::ParquetExecTable>, RuntimeError> {
+    let mut tables = Vec::new();
+    for table in source.table_names() {
+        tables.push(connectors::ParquetExecTable {
+            table: table.clone(),
+            files: source.table_files(&table)?,
+            schema: source.table_arrow_schema(&table)?,
+        });
+    }
+    if tables.is_empty() {
+        return Err(RuntimeError::Config(format!(
+            "parquet datasource '{}' exposes no tables",
             datasource.name
-        ))),
-        (None, None) => Err(RuntimeError::Config(format!(
-            "parquet datasource '{}' needs a 'dir' (a directory of .parquet files) \
-             or a 'file' (a single .parquet file)",
+        )));
+    }
+    Ok(tables)
+}
+
+/// The declared `files` list: a YAML sequence of paths, or a DDL string that is
+/// either comma-separated or a JSON array. `None` when the key is absent.
+fn parquet_files(datasource: &DataSourceConfig) -> Result<Option<Vec<String>>, RuntimeError> {
+    let Some(value) = datasource.config.get("files") else {
+        return Ok(None);
+    };
+    match value {
+        Value::Sequence(entries) => string_sequence(&datasource.name, entries).map(Some),
+        Value::String(text) => Ok(Some(parse_files_string(&datasource.name, text)?)),
+        _ => Err(RuntimeError::Config(format!(
+            "parquet datasource '{}' has a 'files' value that is neither a list nor a string",
             datasource.name
         ))),
     }
+}
+
+/// The string entries of a YAML `files` sequence, raising on a non-string entry.
+fn string_sequence(name: &str, entries: &[Value]) -> Result<Vec<String>, RuntimeError> {
+    let mut paths = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(text) = entry.as_str() else {
+            return Err(RuntimeError::Config(format!(
+                "parquet datasource '{name}' has a non-string 'files' entry"
+            )));
+        };
+        paths.push(text.to_string());
+    }
+    Ok(paths)
+}
+
+/// Parse a DDL `files` string: a JSON array of paths when it starts with `[`,
+/// otherwise a comma-separated list with empty entries dropped.
+fn parse_files_string(name: &str, text: &str) -> Result<Vec<String>, RuntimeError> {
+    let trimmed = text.trim();
+    if trimmed.starts_with('[') {
+        return serde_json::from_str::<Vec<String>>(trimmed).map_err(|error| {
+            RuntimeError::Config(format!(
+                "parquet datasource '{name}' has invalid JSON 'files': {error}"
+            ))
+        });
+    }
+    let mut paths = Vec::new();
+    for part in trimmed.split(',') {
+        let entry = part.trim();
+        if !entry.is_empty() {
+            paths.push(entry.to_string());
+        }
+    }
+    Ok(paths)
 }
 
 /// Reject any connection-param key not in `allowed` for a datasource block, so a

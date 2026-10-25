@@ -467,7 +467,7 @@ pub fn fetch(name: &str, sql: &str) -> ExecResult<(SchemaRef, Vec<RecordBatch>)>
     match s.kind {
         DsKind::Postgres => fetch_postgres(name, &s, sql),
         DsKind::DuckDb => fetch_duckdb(&s, sql),
-        DsKind::Parquet => fetch_parquet(name, &s, sql),
+        DsKind::Parquet => fetch_parquet(name, sql),
         DsKind::ClickHouse => fetch_clickhouse(name, &s, sql),
         DsKind::MySql => fetch_mysql(&s, sql),
         DsKind::Materialized => fetch_materialized(name, sql),
@@ -521,9 +521,8 @@ fn parquet_runtime() -> &'static tokio::runtime::Runtime {
 // directory's `<table>.parquet` files (registered under a `main` schema). This
 // gives DataFusion's native projection / filter / row-group pushdown - the fair
 // comparison point against DuckDB's read_parquet.
-fn fetch_parquet(name: &str, s: &DsSpec, sql: &str) -> ExecResult<(SchemaRef, Vec<RecordBatch>)> {
-    let ctx = parquet_ctx(current_session(), name, &s.uri)
-        .map_err(|e| ExecError::runtime(format!("parquet: {e}")))?;
+fn fetch_parquet(name: &str, sql: &str) -> ExecResult<(SchemaRef, Vec<RecordBatch>)> {
+    let ctx = parquet_context(name)?;
     let sql = sql.to_string();
     let result = parquet_runtime().block_on(async move {
         let df = ctx.sql(&sql).await?;
@@ -534,32 +533,116 @@ fn fetch_parquet(name: &str, s: &DsSpec, sql: &str) -> ExecResult<(SchemaRef, Ve
     result.map_err(|e| ExecError::runtime(format!("parquet query: {e}")))
 }
 
-// A DataFusion context per Parquet datasource, built once (schema inference of
-// every file is not repeated per query) and reused - SessionContext is Arc-cheap
-// to clone.
-fn parquet_ctx(
+/// One logical Parquet table's read shape for the data plane: its name, its
+/// resolved files, and the merged schema the catalog reported. The registrar
+/// (the runtime) passes the CATALOG's manifest and schema, never a directory
+/// listing, so a glob cannot re-expand between metadata load and fetch.
+#[derive(Clone)]
+pub struct ParquetExecTable {
+    pub table: String,
+    pub files: Vec<String>,
+    pub schema: arrow_schema::SchemaRef,
+}
+
+/// The cached DataFusion context of a Parquet datasource. Every parquet source
+/// is registered at runtime setup, so a missing context is a registrar bug and
+/// raises rather than silently rebuilding from a directory.
+fn parquet_context(name: &str) -> ExecResult<datafusion::prelude::SessionContext> {
+    parquet_ctx_cache()
+        .lock()
+        .unwrap()
+        .get(&(current_session(), name.to_string()))
+        .cloned()
+        .ok_or_else(|| {
+            ExecError::runtime(format!("parquet source '{name}' has no registered context"))
+        })
+}
+
+/// Register (or replace) a Parquet datasource: the `DsSpec` under `name` plus a
+/// DataFusion context exposing each listed table as `main.<table>` over its
+/// explicit file list. Called at runtime setup with the catalog's manifest, so
+/// the files read here are exactly the files the catalog measured.
+pub fn register_parquet_tables(
     session: SessionId,
-    name: &str,
-    dir: &str,
+    name: String,
+    tables: Vec<ParquetExecTable>,
+) -> ExecResult<()> {
+    let ctx = parquet_tables_ctx(&tables)
+        .map_err(|e| ExecError::runtime(format!("parquet source '{name}': {e}")))?;
+    parquet_ctx_cache()
+        .lock()
+        .unwrap()
+        .insert((session, name.clone()), ctx);
+    register(
+        session,
+        name,
+        DsSpec {
+            kind: DsKind::Parquet,
+            uri: String::new(),
+            adbc_driver: None,
+        },
+    );
+    Ok(())
+}
+
+// Build a DataFusion context with every table registered once over its explicit
+// file list. Shares the parquet path's runtime env (same memory pool).
+fn parquet_tables_ctx(
+    tables: &[ParquetExecTable],
 ) -> Result<datafusion::prelude::SessionContext, datafusion::error::DataFusionError> {
-    let cache = parquet_ctx_cache();
-    let key = (session, name.to_string());
-    let mut map = cache.lock().unwrap();
-    if let Some(ctx) = map.get(&key) {
-        return Ok(ctx.clone());
-    }
     // Collect statistics from Parquet metadata so DataFusion's cost-based join
     // reordering has real cardinalities (otherwise multi-joins pick bad plans).
     let config = datafusion::execution::config::SessionConfig::new().with_collect_statistics(true);
-    // Same shared 32 GB memory pool as the merge fragments - the Parquet path
-    // executes DataFusion queries too and must be bounded by the same cap.
     let ctx = datafusion::prelude::SessionContext::new_with_config_rt(
         config,
         crate::engine::runtime_env(),
     );
-    parquet_runtime().block_on(register_parquet_dir(&ctx, name, dir))?;
-    map.insert(key, ctx.clone());
+    parquet_runtime().block_on(register_parquet_tables_async(&ctx, tables))?;
     Ok(ctx)
+}
+
+// Register each table as `main.<table>` over its explicit file list. The schema
+// is the catalog's merged schema, so DataFusion never re-globs or re-infers and
+// fills a column absent from a file with NULL at read time.
+async fn register_parquet_tables_async(
+    ctx: &datafusion::prelude::SessionContext,
+    tables: &[ParquetExecTable],
+) -> Result<(), datafusion::error::DataFusionError> {
+    use datafusion::catalog::SchemaProvider;
+    use datafusion::datasource::file_format::parquet::ParquetFormat;
+    use datafusion::datasource::listing::{
+        ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+    };
+    let schema = std::sync::Arc::new(datafusion::catalog::MemorySchemaProvider::new());
+    for table in tables {
+        if table.files.is_empty() {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "parquet table '{}' has no files",
+                table.table
+            )));
+        }
+        let mut urls = Vec::with_capacity(table.files.len());
+        for file in &table.files {
+            urls.push(ListingTableUrl::parse(file)?);
+        }
+        // String/binary columns stay Utf8/Binary, NOT the Utf8View/BinaryView
+        // DataFusion 54 defaults to: every other source yields plain Utf8, so a
+        // view-typed parquet column would not line up when the coordinator merges
+        // the two sides by Arrow type.
+        let format = ParquetFormat::default().with_force_view_types(false);
+        let options = ListingOptions::new(std::sync::Arc::new(format))
+            .with_file_extension(".parquet")
+            .with_collect_stat(true);
+        let config = ListingTableConfig::new_with_multi_paths(urls)
+            .with_listing_options(options)
+            .with_schema(std::sync::Arc::clone(&table.schema));
+        let listing = std::sync::Arc::new(ListingTable::try_new(config)?);
+        schema.register_table(table.table.clone(), listing)?;
+    }
+    ctx.catalog("datafusion")
+        .unwrap()
+        .register_schema("main", schema)?;
+    Ok(())
 }
 
 // A DataFusion context per (session, datasource name). Session-keyed so a
@@ -573,61 +656,6 @@ fn parquet_ctx_cache(
         Mutex<HashMap<(SessionId, String), datafusion::prelude::SessionContext>>,
     > = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-// Register every `<dir>/<table>.parquet` as `main.<table>` in `ctx`. A single
-// file registers as one table named after the datasource (`source_name`),
-// matching the catalog tier's naming so a rendered `FROM main.<name>` resolves.
-async fn register_parquet_dir(
-    ctx: &datafusion::prelude::SessionContext,
-    source_name: &str,
-    dir: &str,
-) -> Result<(), datafusion::error::DataFusionError> {
-    use datafusion::catalog::SchemaProvider;
-    use datafusion::datasource::file_format::parquet::ParquetFormat;
-    use datafusion::datasource::listing::{
-        ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
-    };
-    let schema = std::sync::Arc::new(datafusion::catalog::MemorySchemaProvider::new());
-    let root = std::path::Path::new(dir);
-    let tables: Vec<(String, std::path::PathBuf)> = if root.is_file() {
-        // A single `.parquet` file is one table named after the datasource.
-        vec![(source_name.to_string(), root.to_path_buf())]
-    } else {
-        let mut collected = Vec::new();
-        let entries = std::fs::read_dir(dir)
-            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
-        for entry in entries {
-            let path = entry
-                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
-                .path();
-            if path.extension().and_then(|e| e.to_str()) == Some("parquet") {
-                let stem = path.file_stem().unwrap().to_string_lossy().to_string();
-                collected.push((stem, path));
-            }
-        }
-        collected
-    };
-    for (name, path) in tables {
-        let url = ListingTableUrl::parse(path.to_string_lossy())?;
-        // Infer string/binary columns as Utf8/Binary, NOT the Utf8View/BinaryView
-        // DataFusion 54 defaults to: schema inference bakes the column types into
-        // the ListingTable, and every other source yields plain Utf8, so a
-        // view-typed parquet column would not line up when the coordinator merges
-        // the two sides by Arrow type.
-        let format = ParquetFormat::default().with_force_view_types(false);
-        let options = ListingOptions::new(std::sync::Arc::new(format)).with_collect_stat(true);
-        let file_schema = options.infer_schema(&ctx.state(), &url).await?;
-        let config = ListingTableConfig::new(url)
-            .with_listing_options(options)
-            .with_schema(file_schema);
-        let table = std::sync::Arc::new(ListingTable::try_new(config)?);
-        schema.register_table(name, table)?;
-    }
-    ctx.catalog("datafusion")
-        .unwrap()
-        .register_schema("main", schema)?;
-    Ok(())
 }
 
 /// One materialized view's read shape for the data plane: its table name and
@@ -1914,10 +1942,12 @@ fn duck_fraction(batches: &[RecordBatch], num_keys: usize) -> Option<f64> {
 
 /// Build a `DsSpec` from a datasource kind and its already-extracted
 /// parameters. `uri` is the source's location string (Postgres connection URI,
-/// DuckDB file path, or Parquet directory); `adbc_driver` is the ADBC driver
-/// path (Postgres only). Parameter extraction from the caller's config
-/// happens at the FFI boundary; this keeps the kind -> `DsKind` mapping and the
-/// loud validation in Rust.
+/// DuckDB file path, ClickHouse/MySQL endpoint); `adbc_driver` is the ADBC
+/// driver path (Postgres only). Parquet is absent: a Parquet source registers
+/// through `register_parquet_tables` with its resolved manifest, not a single
+/// URI. Parameter extraction from the caller's config happens at the FFI
+/// boundary; this keeps the kind -> `DsKind` mapping and the loud validation in
+/// Rust.
 pub fn spec_from_kind(
     kind: &str,
     uri: Option<String>,
@@ -1936,14 +1966,6 @@ pub fn spec_from_kind(
             let uri = uri.ok_or_else(|| ExecError::value("duckdb datasource needs 'path'"))?;
             Ok(DsSpec {
                 kind: DsKind::DuckDb,
-                uri,
-                adbc_driver: None,
-            })
-        }
-        "parquet" => {
-            let uri = uri.ok_or_else(|| ExecError::value("parquet datasource needs 'dir'"))?;
-            Ok(DsSpec {
-                kind: DsKind::Parquet,
                 uri,
                 adbc_driver: None,
             })
@@ -2180,8 +2202,7 @@ pub fn fetch_stream(name: &str, sql: &str) -> ExecResult<FetchStream> {
     let s = spec(name)?;
     match s.kind {
         DsKind::Parquet => {
-            let ctx = parquet_ctx(current_session(), name, &s.uri)
-                .map_err(|e| ExecError::runtime(format!("parquet: {e}")))?;
+            let ctx = parquet_context(name)?;
             let sql = sql.to_string();
             let (schema, stream) = parquet_runtime()
                 .block_on(async move {

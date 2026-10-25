@@ -4,6 +4,14 @@ A Parquet directory registers one table per file. A view combines the daily
 files with UNION ALL; the files stay in place. The event dataset is built from
 that view and supplies paths, funnels, and retention.
 
+An alternative with no view: register the matching daily files as ONE table,
+with `glob: '/data2/projects/joker-bigq-key/firebase-export/events_intraday_*.parquet'`
+or a `manifest` file listing one path per line. The engine merges the files'
+schemas by column name (a column absent from a file reads as NULL) and folds
+their footer row counts and statistics, so the event dataset reads one table.
+The file set is fixed at registration, so re-register the source to include a
+newly exported day.
+
 Run these commands from the repository root with the intended Python virtualenv
 activated. `make build` builds the CLI after installing the project dependencies.
 

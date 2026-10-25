@@ -284,3 +284,259 @@ fn a_single_file_source_names_its_table_after_the_datasource() {
     std::fs::write(&bogus, "x").expect("write bogus file");
     assert!(ParquetSource::open("ev", bogus.to_str().unwrap()).is_err());
 }
+
+/// A batch with an int key and an optional name column, for schema-evolution
+/// tests where one file lacks a column.
+fn key_batch(keys: Vec<i32>, names: Option<Vec<String>>) -> RecordBatch {
+    let key: ArrayRef = Arc::new(Int32Array::from(keys));
+    let mut fields = vec![Field::new("k", ArrowDataType::Int32, false)];
+    let mut arrays: Vec<ArrayRef> = vec![key];
+    if let Some(values) = names {
+        fields.push(Field::new("name", ArrowDataType::Utf8, true));
+        arrays.push(Arc::new(StringArray::from(values)));
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).expect("key batch")
+}
+
+#[test]
+fn a_glob_exposes_one_table_over_matching_files() {
+    let dir = temp_dir("glob");
+    write_parquet(&dir, "part-0", &region_batch());
+    write_parquet(&dir, "part-1", &region_batch());
+    let pattern = dir.join("part-*.parquet");
+    let source = ParquetSource::open_glob("events", pattern.to_str().unwrap()).expect("open");
+    // ONE table named after the datasource, not one table per file.
+    assert_eq!(
+        source.list_tables("main").unwrap(),
+        vec!["events".to_string()]
+    );
+    let metadata = source
+        .get_table_metadata("main", "events")
+        .expect("metadata");
+    // Ten rows across two five-row files, exact from the footers.
+    assert_eq!(metadata.row_count, Some(10));
+    assert_eq!(metadata.columns.len(), 3);
+}
+
+#[test]
+fn a_files_list_exposes_one_table_over_the_named_files() {
+    let dir = temp_dir("files");
+    write_parquet(&dir, "left", &region_batch());
+    write_parquet(&dir, "right", &region_batch());
+    let files = vec![
+        dir.join("left.parquet").to_string_lossy().to_string(),
+        dir.join("right.parquet").to_string_lossy().to_string(),
+    ];
+    let source = ParquetSource::open_files("both", &files).expect("open");
+    assert_eq!(
+        source.list_tables("main").unwrap(),
+        vec!["both".to_string()]
+    );
+    assert_eq!(
+        source
+            .get_table_metadata("main", "both")
+            .expect("metadata")
+            .row_count,
+        Some(10)
+    );
+}
+
+#[test]
+fn a_manifest_reads_relative_paths_and_ignores_comments() {
+    let dir = temp_dir("manifest");
+    write_parquet(&dir, "a", &region_batch());
+    write_parquet(&dir, "b", &region_batch());
+    let manifest = dir.join("list.txt");
+    std::fs::write(&manifest, "# comment\n\na.parquet\nb.parquet\n").expect("write manifest");
+    let source = ParquetSource::open_manifest("m", manifest.to_str().unwrap()).expect("open");
+    assert_eq!(
+        source
+            .get_table_metadata("main", "m")
+            .expect("metadata")
+            .row_count,
+        Some(10)
+    );
+}
+
+#[test]
+fn union_by_name_fills_a_missing_column_with_nulls() {
+    let dir = temp_dir("union");
+    write_parquet(
+        &dir,
+        "with_name",
+        &key_batch(vec![1, 2], Some(vec!["a".to_string(), "b".to_string()])),
+    );
+    write_parquet(&dir, "no_name", &key_batch(vec![3, 4, 5], None));
+    let files = vec![
+        dir.join("with_name.parquet").to_string_lossy().to_string(),
+        dir.join("no_name.parquet").to_string_lossy().to_string(),
+    ];
+    let source = ParquetSource::open_files("u", &files).expect("open");
+    let metadata = source.get_table_metadata("main", "u").expect("metadata");
+    let names: Vec<&str> = metadata.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, vec!["k", "name"]);
+    assert_eq!(metadata.row_count, Some(5));
+    // The 3 rows of the file without `name` are NULL there: 3 of 5 rows.
+    let stats = source
+        .get_table_statistics("main", "u", &["name".to_string()])
+        .expect("stats")
+        .expect("some stats");
+    let name = &stats.column_stats["name"];
+    assert!(
+        (name.null_fraction - 0.6).abs() < 1e-9,
+        "null fraction was {}",
+        name.null_fraction
+    );
+}
+
+#[test]
+fn incompatible_types_across_files_raise() {
+    let dir = temp_dir("badtype");
+    write_parquet(&dir, "int_key", &key_batch(vec![1], None));
+    // A Utf8 column named `k` cannot merge with the Int32 `k`.
+    let utf8: ArrayRef = Arc::new(StringArray::from(vec!["x"]));
+    let schema = Schema::new(vec![Field::new("k", ArrowDataType::Utf8, false)]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![utf8]).expect("utf8 batch");
+    write_parquet(&dir, "str_key", &batch);
+    let files = vec![
+        dir.join("int_key.parquet").to_string_lossy().to_string(),
+        dir.join("str_key.parquet").to_string_lossy().to_string(),
+    ];
+    let source = ParquetSource::open_files("bad", &files).expect("open");
+    let error = source
+        .get_table_metadata("main", "bad")
+        .expect_err("type conflict must raise");
+    assert!(format!("{error}").contains("merge"), "{error}");
+}
+
+#[test]
+fn a_missing_listed_file_raises_at_open() {
+    let dir = temp_dir("missing_listed");
+    let files = vec![dir.join("ghost.parquet").to_string_lossy().to_string()];
+    assert!(ParquetSource::open_files("m", &files).is_err());
+}
+
+#[test]
+fn a_duplicate_listed_file_raises() {
+    let dir = temp_dir("dup");
+    write_parquet(&dir, "a", &region_batch());
+    let path = dir.join("a.parquet").to_string_lossy().to_string();
+    let files = vec![path.clone(), path];
+    let error = ParquetSource::open_files("d", &files).expect_err("duplicate must raise");
+    assert!(format!("{error}").contains("twice"), "{error}");
+}
+
+#[test]
+fn a_glob_matching_nothing_raises() {
+    let dir = temp_dir("nomatch");
+    let pattern = dir.join("nothing-*.parquet");
+    assert!(ParquetSource::open_glob("g", pattern.to_str().unwrap()).is_err());
+}
+
+#[test]
+fn multi_file_statistics_fold_min_max_across_files() {
+    let dir = temp_dir("fold");
+    write_parquet(&dir, "lo", &region_batch());
+    // A second file with keys 10..14, so the fold's max is 14 from it.
+    let key: ArrayRef = Arc::new(Int32Array::from(vec![10, 11, 12, 13, 14]));
+    let name: ArrayRef = Arc::new(StringArray::from(vec!["A", "B", "C", "D", "E"]));
+    let measure: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0, 5.0]));
+    let schema = Schema::new(vec![
+        Field::new("r_regionkey", ArrowDataType::Int32, false),
+        Field::new("r_name", ArrowDataType::Utf8, false),
+        Field::new("r_measure", ArrowDataType::Float64, false),
+    ]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![key, name, measure]).expect("hi batch");
+    write_parquet(&dir, "hi", &batch);
+    let files = vec![
+        dir.join("lo.parquet").to_string_lossy().to_string(),
+        dir.join("hi.parquet").to_string_lossy().to_string(),
+    ];
+    let source = ParquetSource::open_files("fold", &files).expect("open");
+    let stats = source
+        .get_table_statistics("main", "fold", &["r_regionkey".to_string()])
+        .expect("stats")
+        .expect("some stats");
+    assert_eq!(stats.row_count, Some(10));
+    let key = &stats.column_stats["r_regionkey"];
+    assert_eq!(key.min_value, Some(StatValue::Integer(0)));
+    assert_eq!(key.max_value, Some(StatValue::Integer(14)));
+}
+
+#[test]
+fn a_multi_file_source_token_abstains() {
+    let dir = temp_dir("token_multi");
+    write_parquet(&dir, "a", &region_batch());
+    write_parquet(&dir, "b", &region_batch());
+    let files = vec![
+        dir.join("a.parquet").to_string_lossy().to_string(),
+        dir.join("b.parquet").to_string_lossy().to_string(),
+    ];
+    let source = ParquetSource::open_files("m", &files).expect("open");
+    // A multi-file table cannot name one stamp, so it abstains and REFRESH pulls.
+    assert!(source.source_token("main", "m").unwrap().is_none());
+}
+
+#[test]
+fn a_multi_file_table_loads_into_the_catalog() {
+    let dir = temp_dir("catalog_multi");
+    write_parquet(&dir, "a", &region_batch());
+    write_parquet(&dir, "b", &region_batch());
+    let pattern = dir.join("*.parquet");
+    let source = ParquetSource::open_glob("ev", pattern.to_str().unwrap()).expect("open");
+    let mut catalog = Catalog::new();
+    catalog.register_datasource(Arc::new(source));
+    catalog.load_metadata().expect("load metadata");
+    let table = catalog.get_table("ev", "main", "ev").expect("table");
+    assert_eq!(table.columns.len(), 3);
+}
+
+#[test]
+fn statistics_are_cached_and_do_not_reread_footers() {
+    let dir = temp_dir("cached");
+    write_parquet(&dir, "a", &region_batch());
+    write_parquet(&dir, "b", &region_batch());
+    let files = vec![
+        dir.join("a.parquet").to_string_lossy().to_string(),
+        dir.join("b.parquet").to_string_lossy().to_string(),
+    ];
+    let source = ParquetSource::open_files("c", &files).expect("open");
+    // Fold every footer once, as the runtime does at registration.
+    source.ensure_aggregates().expect("aggregate");
+
+    // Remove the files: a metadata/statistics read that re-opened a footer would
+    // now fail. Cached answers still come back, proving planning is O(cached
+    // metadata), not O(files) footer reads.
+    std::fs::remove_file(dir.join("a.parquet")).expect("remove a");
+    std::fs::remove_file(dir.join("b.parquet")).expect("remove b");
+
+    let metadata = source.get_table_metadata("main", "c").expect("metadata");
+    assert_eq!(metadata.row_count, Some(10));
+    let stats = source
+        .get_table_statistics("main", "c", &["r_regionkey".to_string()])
+        .expect("stats")
+        .expect("some stats");
+    assert_eq!(stats.row_count, Some(10));
+    assert_eq!(
+        stats.column_stats["r_regionkey"].min_value,
+        Some(StatValue::Integer(0))
+    );
+}
+
+#[test]
+fn a_hundred_and_twenty_eight_files_merge_into_one_table() {
+    // A long list must not expand into a plan: the manifest resolves to one
+    // table with one summed row count, not 128 tables or a UNION.
+    let dir = temp_dir("many");
+    for index in 0..128 {
+        write_parquet(&dir, &format!("part-{index:03}"), &region_batch());
+    }
+    let pattern = dir.join("part-*.parquet");
+    let source = ParquetSource::open_glob("many", pattern.to_str().unwrap()).expect("open");
+    let metadata = source.get_table_metadata("main", "many").expect("metadata");
+    assert_eq!(metadata.row_count, Some(128 * 5));
+    assert_eq!(
+        source.list_tables("main").unwrap(),
+        vec!["many".to_string()]
+    );
+}

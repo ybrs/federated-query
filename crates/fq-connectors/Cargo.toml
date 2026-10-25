@@ -33,6 +33,10 @@ mysql = { version = "28", default-features = false, features = ["minimal"] }
 # DataFusion scan.
 parquet = "58"
 arrow-schema = "58"
+# Expand a `glob = '.../*.parquet'` Parquet source at registration into an
+# explicit file manifest, so catalog metadata and the exec scan use the SAME
+# files (DataFusion never re-globs). Recursive `**` patterns are supported.
+glob = "0.3"
 
 [dev-dependencies]
 # The Parquet unit tests WRITE small real parquet files (via the parquet arrow

@@ -80,6 +80,16 @@ source kind. See the event analytics tutorial for complete PostgreSQL and
 Parquet examples:
 doc/event-analytics-tutorial.md.
 
+A `parquet` source declares exactly one shape: `dir` (one table per file),
+`file` (one file, one table named after the datasource), `glob` (one table over
+every match), `files` (one table over an explicit list), or `manifest` (one
+table over the paths listed in a text file, one per line). The last three
+expose ONE logical table over many files: their schemas are merged by column
+name (a column absent from a file reads as NULL) and their footer row counts
+and statistics are folded once. The file set is fixed at registration, so a
+newly added matching file is picked up by re-registering the source; a replaced
+listed file's contents are seen on the next query.
+
 For daily Firebase exports, nested fields, UNNEST, and event analyses, see
 [Firebase Parquet CLI workflow](doc/firebase-parquet.md).
 
@@ -94,6 +104,7 @@ For daily Firebase exports, nested fields, UNNEST, and event analyses, see
 - Materialized views with explicit refresh and query substitution.
 - Event datasets with funnel, retention, segmentation, and path analyses.
 - Nested Parquet schemas, struct field access, and list expansion with UNNEST.
+- Multi-file Parquet tables by glob, explicit file list, or manifest.
 - EXPLAIN, catalog inspection, and runtime settings.
 - Fail-fast validation: invalid SQL, unknown tables, and unknown columns raise
   errors instead of producing rows.

@@ -535,3 +535,253 @@ fn a_programmatic_config_can_be_given_a_learned_catalog() {
         catalog_path.display()
     );
 }
+
+/// Write `<dir>/<name>.parquet` with five rows whose `r_regionkey` starts at
+/// `base` and whose `r_name` is `R<key>`. Used to build multi-file fixtures.
+fn write_region_range(dir: &Path, name: &str, base: i32) {
+    let keys: Vec<i32> = (base..base + 5).collect();
+    let names: Vec<String> = keys.iter().map(|key| format!("R{key}")).collect();
+    let key: ArrayRef = Arc::new(Int32Array::from(keys));
+    let name_col: ArrayRef = Arc::new(StringArray::from(names));
+    let schema = Schema::new(vec![
+        Field::new("r_regionkey", ArrowDataType::Int32, false),
+        Field::new("r_name", ArrowDataType::Utf8, false),
+    ]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![key, name_col]).expect("range batch");
+    let file = File::create(dir.join(format!("{name}.parquet"))).expect("create range file");
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), None).expect("arrow writer");
+    writer.write(&batch).expect("write range");
+    writer.close().expect("close writer");
+}
+
+/// Write `<dir>/part-0.parquet` (keys 0..4) and `<dir>/part-1.parquet` (keys
+/// 5..9): two files, disjoint keys, one merged table.
+fn write_two_region_files(dir: &Path) {
+    write_region_range(dir, "part-0", 0);
+    write_region_range(dir, "part-1", 5);
+}
+
+/// Write part-0 WITH and part-1 WITHOUT `r_name`, for the union-by-name case: a
+/// glob over both yields a table whose `r_name` is NULL for part-1's five rows.
+fn write_schema_evolution_files(dir: &Path) {
+    write_region_range(dir, "part-0", 0);
+    let key: ArrayRef = Arc::new(Int32Array::from(vec![5, 6, 7, 8, 9]));
+    let schema = Schema::new(vec![Field::new("r_regionkey", ArrowDataType::Int32, false)]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![key]).expect("key batch");
+    let file = File::create(dir.join("part-1.parquet")).expect("create part-1");
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), None).expect("arrow writer");
+    writer.write(&batch).expect("write part-1");
+    writer.close().expect("close writer");
+}
+
+/// A parquet-source `Config` with one shape parameter under `key` (a directory
+/// with just that source).
+fn parquet_shape_config(name: &str, key: &str, value: Value) -> Config {
+    let mut params = BTreeMap::new();
+    params.insert(key.to_string(), value);
+    let mut datasources = BTreeMap::new();
+    datasources.insert(
+        name.to_string(),
+        DataSourceConfig {
+            name: name.to_string(),
+            ty: "parquet".to_string(),
+            config: params,
+            capabilities: Vec::new(),
+            change_keys: BTreeMap::new(),
+        },
+    );
+    base_config(datasources)
+}
+
+/// Flatten one Int32 column (by index) across batches.
+fn int32_values(batches: &[RecordBatch], index: usize) -> Vec<i32> {
+    let mut values = Vec::new();
+    for batch in batches {
+        let column = batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("column is Int32");
+        for row in 0..batch.num_rows() {
+            values.push(column.value(row));
+        }
+    }
+    values
+}
+
+/// The single i64 count of a one-row result.
+fn count_value(batches: &[RecordBatch]) -> i64 {
+    batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count is Int64")
+        .value(0)
+}
+
+#[test]
+fn a_glob_source_exposes_one_table_over_every_match() {
+    let dir = temp_parquet_dir("glob");
+    write_two_region_files(&dir);
+    let pattern = dir.join("part-*.parquet");
+    let config = parquet_shape_config(
+        "ge",
+        "glob",
+        Value::String(pattern.to_string_lossy().to_string()),
+    );
+    let runtime = Runtime::from_config(&config).expect("from_config");
+
+    // One table named after the datasource, ten rows across the two files.
+    let (_, batches) = runtime
+        .execute("SELECT count(*) AS c FROM ge")
+        .expect("count");
+    assert_eq!(count_value(&batches), 10);
+
+    // A pushed filter + ORDER BY runs across both files.
+    let (_, batches) = runtime
+        .execute("SELECT r_regionkey FROM ge WHERE r_regionkey >= 8 ORDER BY r_regionkey")
+        .expect("filtered");
+    assert_eq!(int32_values(&batches, 0), vec![8, 9]);
+}
+
+#[test]
+fn a_files_list_source_exposes_one_table() {
+    let dir = temp_parquet_dir("files");
+    write_two_region_files(&dir);
+    let list = vec![
+        Value::String(dir.join("part-0.parquet").to_string_lossy().to_string()),
+        Value::String(dir.join("part-1.parquet").to_string_lossy().to_string()),
+    ];
+    let runtime = Runtime::from_config(&parquet_shape_config("fl", "files", Value::Sequence(list)))
+        .expect("from_config");
+    let (_, batches) = runtime
+        .execute("SELECT count(*) AS c FROM fl")
+        .expect("count");
+    assert_eq!(count_value(&batches), 10);
+}
+
+#[test]
+fn a_manifest_source_exposes_one_table() {
+    let dir = temp_parquet_dir("manifest");
+    write_two_region_files(&dir);
+    let manifest = dir.join("files.txt");
+    std::fs::write(&manifest, "# files\npart-0.parquet\npart-1.parquet\n").expect("manifest");
+    let config = parquet_shape_config(
+        "mf",
+        "manifest",
+        Value::String(manifest.to_string_lossy().to_string()),
+    );
+    let runtime = Runtime::from_config(&config).expect("from_config");
+    let (_, batches) = runtime
+        .execute("SELECT count(*) AS c FROM mf")
+        .expect("count");
+    assert_eq!(count_value(&batches), 10);
+}
+
+#[test]
+fn a_column_absent_from_one_file_reads_as_null() {
+    let dir = temp_parquet_dir("union_null");
+    write_schema_evolution_files(&dir);
+    let pattern = dir.join("part-*.parquet");
+    let config = parquet_shape_config(
+        "se",
+        "glob",
+        Value::String(pattern.to_string_lossy().to_string()),
+    );
+    let runtime = Runtime::from_config(&config).expect("from_config");
+
+    // part-0 has r_name, part-1 does not: its five rows read as NULL.
+    let (_, batches) = runtime
+        .execute("SELECT count(*) AS c FROM se WHERE r_name IS NULL")
+        .expect("null count");
+    assert_eq!(count_value(&batches), 5);
+    let (_, batches) = runtime
+        .execute("SELECT count(*) AS c FROM se WHERE r_name IS NOT NULL")
+        .expect("not-null count");
+    assert_eq!(count_value(&batches), 5);
+}
+
+#[test]
+fn zero_or_two_parquet_shapes_raise() {
+    let dir = temp_parquet_dir("shape_err");
+    write_region_parquet(&dir);
+
+    // Two shapes: `dir` and `glob` together.
+    let mut params = parquet_params(dir.to_str().unwrap());
+    params.insert(
+        "glob".to_string(),
+        Value::String(dir.join("*.parquet").to_string_lossy().to_string()),
+    );
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "two".to_string(),
+        DataSourceConfig {
+            name: "two".to_string(),
+            ty: "parquet".to_string(),
+            config: params,
+            capabilities: Vec::new(),
+            change_keys: BTreeMap::new(),
+        },
+    );
+    let error = Runtime::from_config(&base_config(sources))
+        .err()
+        .expect("two shapes must raise");
+    assert!(error.to_string().contains("exactly one"), "{error}");
+
+    // Zero shapes: an empty parquet block.
+    let empty = parquet_shape_config("zero", "dir", Value::String(String::new()));
+    let mut config = empty;
+    if let Some(source) = config.datasources.get_mut("zero") {
+        source.config.clear();
+    }
+    let error = Runtime::from_config(&config)
+        .err()
+        .expect("zero shapes must raise");
+    assert!(error.to_string().contains("exactly one"), "{error}");
+}
+
+#[test]
+fn ddl_registers_parquet_sources_by_glob_manifest_and_files() {
+    let dir = temp_parquet_dir("ddl_multi");
+    write_two_region_files(&dir);
+    let manifest = dir.join("m.txt");
+    std::fs::write(&manifest, "part-0.parquet\npart-1.parquet\n").expect("manifest");
+
+    // A config with a source path so dynamic sources can persist.
+    let mut config = base_config(BTreeMap::new());
+    config.source_path = Some(dir.join("config.yaml").to_string_lossy().to_string());
+    let runtime = Runtime::from_config(&config).expect("from_config");
+
+    let glob_sql = format!(
+        "CREATE DATASOURCE dg TYPE parquet WITH (glob = '{}')",
+        dir.join("part-*.parquet").display()
+    );
+    runtime.execute(&glob_sql).expect("create glob");
+    let (_, batches) = runtime
+        .execute("SELECT count(*) AS c FROM dg")
+        .expect("count dg");
+    assert_eq!(count_value(&batches), 10);
+
+    let manifest_sql = format!(
+        "CREATE DATASOURCE dm TYPE parquet WITH (manifest = '{}')",
+        manifest.display()
+    );
+    runtime.execute(&manifest_sql).expect("create manifest");
+    let (_, batches) = runtime
+        .execute("SELECT count(*) AS c FROM dm")
+        .expect("count dm");
+    assert_eq!(count_value(&batches), 10);
+
+    // The DDL `files` form: a JSON array of paths.
+    let json = format!(
+        "[\"{}\",\"{}\"]",
+        dir.join("part-0.parquet").display(),
+        dir.join("part-1.parquet").display()
+    );
+    let files_sql = format!("CREATE DATASOURCE df TYPE parquet WITH (files = '{json}')");
+    runtime.execute(&files_sql).expect("create files json");
+    let (_, batches) = runtime
+        .execute("SELECT count(*) AS c FROM df")
+        .expect("count df");
+    assert_eq!(count_value(&batches), 10);
+}
